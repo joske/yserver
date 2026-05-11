@@ -33,5 +33,5 @@ mio = { version = "1", features = ["os-poll", "net", "os-ext"] }
 freetype-rs = "0.38"
 xkbcommon = "0.9"
 ash = "0.38"
-gpu-allocator = { version = "0.27", default-features = false, features = ["vulkan"] }
+gpu-allocator = { version = "0.28", default-features = false, features = ["vulkan"] }
 thiserror = "2"
