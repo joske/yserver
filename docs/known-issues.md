@@ -124,22 +124,6 @@ from.
       upstream. Until then, downgrade priority — MATE is the
       validated desktop, Cinnamon's click activation works on the
       wire and the next step is process-side diagnosis.
-- [x] **GTK file-manager right-click popup offset + rubber-band
-      anchor wrong (Caja + Thunar).** Fixed 2026-05-15 in commit
-      `ea7c186`: the XIQueryPointer reply encoder placed the BOOL
-      `same_screen` field in byte 1 (pad0) instead of byte 32 per
-      the XI2 spec, and stuffed an extra `mask` u16 where
-      `buttons_len` belongs. Every XI2 client read
-      `same_screen=false`, which routes GTK's popup-placement
-      through the "pointer on a different screen" branch — that
-      branch treats pointer-root coords as window-local input to
-      `XTranslateCoordinates`, double-adding the window's root
-      origin. Pinpointed via x11trace capture (see
-      `just yserver-xfce-hw-trace`). The earlier "X-only by 640"
-      observation from the partial 2026-05-15 diagnosis was a
-      coincidence of single-output 1920×1080 geometry where the
-      panel was at the top; in dual-output 5120×1440 both axes
-      were misplaced.
 - [ ] **`UnmapNotify.from_configure = true` never wired.** Encoder
       accepts the byte for wire correctness; every call site currently
       passes `false`. The `true` path fires when a parent's
@@ -241,28 +225,6 @@ from.
       current frame. Fix is almost certainly in that accumulation, not
       in the input/protocol layer.
 
-- [x] **wezterm/Firefox transparent (see-through) client content —
-      FIXED (2026-06-03).** On the no-AMD laptops (eiger/air/yoga;
-      Turnip/Adreno + Apple) wezterm rendered only partway, with large
-      regions transparent and the desktop showing through; the holes
-      shifted on typing/hover. Same family as the older "wezterm blank
-      after heavy drag" note. **Root cause:** GPU clients
-      (`PresentPixmap` of a DRI3-imported dma-buf, `wait_fence=0`)
-      rely on *implicit* dma-buf sync. yserver's present copy runs
-      immediately at request-parse time (`wait_fence` only gates
-      completion, not the read), so on GPU stacks that don't honour
-      implicit sync for our read queue (Turnip/Adreno, Apple — AMD does)
-      the copy raced the client's still-pending render and captured a
-      partly-rendered (α=0) frame. Confirmed: the copy itself is full +
-      unclipped (`present_dbg` instrumentation); the source was simply
-      not ready. **Fix:** before the present copy, wait for the source's
-      producer writes via the buffer's read fence
-      (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE` → `poll()`,
-      `dri3::wait_dmabuf_read_ready`, bounded 50 ms → never a hang;
-      no-op for server-owned sources). HW-verified on the laptops
-      (wezterm + Firefox/YouTube). The clip-by-children commit
-      (`e7a1ba0`) was NOT involved — wezterm issues zero RENDER/fills.
-
 - [ ] **Follow-up: replace the present-source CPU wait with a GPU
       acquire-semaphore (perf).** `wait_present_source_ready`
       (backend.rs) CPU-`poll()`s the source dma-buf's read fence before
@@ -279,24 +241,29 @@ from.
       only ever wait when `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` returns a real
       fd, else no-op, to avoid a never-signalled-wait hang.
 
-- [ ] **Stage 4c follow-up: multi-output coord-space for
-      scene-structure damage rects.** `SceneCompositor::
-      mark_scene_structure_damage_rects` (4c.1, scene.rs:410)
-      clips each input rect by `output_extent` only, assuming
-      every output starts at origin (0, 0). Stage 4c.4 feeds it
-      screen-absolute rects from `window_absolute_rect`
-      (backend.rs:558). Under single-output (layout_x0 = layout_y0
-      = 0) screen-absolute ≡ output-local, so the clip is correct.
-      Under multi-output deployments with non-(0,0) layouts the
-      helper would clip in the wrong frame and a damage rect on
-      output 2+ would either be dropped (rect outside its
-      extent-from-origin) or land at the wrong screen offset.
-      Either: (a) add `layout_origin: vk::Offset2D` to
-      `OutputSceneState` and threading through `SceneCompositor::
-      new`, or (b) translate at the call site in
-      `set_window_scene_participation`. Not a regression vs the
-      4c.1 stub (same shape), but undocumented before this entry
-      and tracked here to surface when multi-output work begins.
+- [ ] **Stage 4c follow-up: scene-structure damage rects clip in
+      the wrong frame on non-origin outputs (low impact).**
+      `SceneCompositor::mark_scene_structure_damage_rects`
+      (scene.rs:653 → `dispatch_clip_rects_to_outputs`) clips each
+      screen-absolute input rect by `output_extent` measured from
+      (0,0), ignoring the output's layout origin. The rest of the
+      pipeline IS layout-aware (`build_scene` per-output
+      `layout_x0/y0` translation, cursor placement,
+      `add_projected_damage` projection), so multi-output itself
+      works — confirmed by weeks of dual-screen daily use on
+      silence (2026-06-12). Blast radius is confined to the
+      helper's sole call site, `set_window_scene_participation`
+      (backend.rs:9742): when a window's COMPOSITE redirect
+      participation flips (compositor start/stop, redirect
+      toggle), the precise damage rect for a window on a
+      non-origin output is dropped or misplaced. Worst case is a
+      transient stale rect there, normally masked because all
+      other structure changes use the full-output
+      `mark_scene_structure_dirty` and later content damage
+      repaints the area. Fix: (a) add `layout_origin:
+      vk::Offset2D` to `OutputSceneState` and clip in the right
+      frame, or (b) translate at the call site. Low priority; no
+      user-visible repro to date.
 
 - [ ] **Stage 4c follow-up: `src_size = [1, 1]` after redirected W
       resizes past B's extent.** `build_scene`'s redirect-aware
@@ -345,32 +312,9 @@ from.
       persists outside the tray region it's a separate scene-damage
       issue.
 
-- [x] **Systray damage storm + invisible tray icons — FIXED
-      (2026-06-01, branch `clip-by-children`).** mate-panel's
-      notification area drove a per-vsync loop (~485 FillRectangles per
-      tray socket; 1486 DamageNotify vs Xorg's 29) and tray icons never
-      rendered, on every machine. Single root cause: yserver never
-      applied `ClipByChildren` to RENDER paint or its damage. A tray
-      socket is fully covered by its mapped XEMBED icon child, so the
-      applet's `FillRectangles op=Clear` on the socket is a no-op in
-      Xorg (empty composite clip → no paint, no damage). yserver painted
-      + damaged the full socket → wiped the icon backing (invisible
-      icons) and fired the socket's own damage object → panel
-      recomposites → clears → loop. Fixed at the RENDER FillRectangles
-      site (`process_request.rs` opcode 26): clip both the paint
-      (`clip_fill_rects_by_children`, subtract mapped InputOutput
-      children, empty → skip op) and the damage
-      (`accumulate_damage_clip_by_children_to_state`); shared
-      `mapped_child_clip_rects` helper in `damage_fanout.rs`.
-      HW-verified on silence: icons visible, loop dead, ~half the
-      session's protocol traffic eliminated. **Follow-up:** the same
-      ClipByChildren gap remains on the other RENDER paint sites
-      (Composite, CompositeGlyphs, Trapezoids/Triangles) — not
-      tray-exercised, but the same latent class. See `status.md`
-      "Systray applet loop — RESOLVED".
-
 - [ ] **Tray icons intermittently blank / bottom-sliver — manual-redirect
-      paint-routing race (2026-06-01, open).** Distinct from the storm fix
+      paint-routing race (2026-06-01, open; still reproducing as of
+      2026-06-12).** Distinct from the storm fix
       above: after `e7a1ba0` icons *can* render, but intermittently come
       up blank or as a thin bottom line; varies run-to-run (1–3 icons
       affected). `YSERVER_TRAY_DEBUG=1` proved it's NOT geometry/clip —
@@ -427,50 +371,6 @@ from.
       `Bilinear` for picture-source scaling see Nearest output.
       Stage 3 status quo per the Stage 3 plan §"Non-goals" #8.
 
-- [ ] **Compositor shadow margins render as opaque bars
-      (NameWindowPixmap → BadAlloc).** Diagnosed 2026-05-15 from
-      a fresh `xfce.xtrace`. Visible as thin perpendicular dark
-      bars to the right and below xfce pop-up menus (any GTK
-      Client-Side-Decoration popup with alpha-shadow margins).
-      Same gap will affect every Manual-mode compositor: xfwm4,
-      picom's xrender backend, xcompmgr, compton.
-
-      **Five-step fault chain:**
-
-      1. xfwm4 issues `RedirectSubwindows update=Manual(0x01)` on
-         root. Accepted by the 2026-05-14 fix
-         (`feedback_composite_manual_redirect_trap`).
-      2. That fix registered the redirect *record* but **skipped**
-         `activate_redirect_backing_for`, so
-         `host_window_to_backing` stays empty for every redirected
-         window.
-      3. xfwm4 issues `NameWindowPixmap` for the menu (depth-32,
-         override-redirect).
-      4. yserver's `name_window_pixmap`
-         (`kms::backend::KmsBackend`, `backend.rs:10506`) looks up
-         `host_window_to_backing`, finds nothing → returns
-         `Err(NotFound)` → wire-level **BadAlloc** on
-         `Composite-Request(144, 6)`.
-      5. xfwm4 falls back to `CreatePicture` directly on the
-         **live window** instead of its offscreen pixmap, then
-         composites from that picture. The live window only
-         carries visible RGB; the GTK CSD shadow-alpha that lives
-         in the offscreen backing is unreachable, so xfwm4 emits
-         opaque shadow-color pixels where the alpha gradient
-         should fade.
-
-      **Status:** the 2026-05-15 attempt to fix this in the
-      current rendering model (the abandoned
-      `render-convolution-filter` branch, T1-T4 of the Manual-
-      redirect plan) made the BadAlloc go away at the protocol
-      level but exposed the deeper structural mismatch — yserver's
-      scanout walks per-window mirrors and never displays root's
-      mirror, so the compositor's RENDER paint to root is
-      invisible. **Deferred** to the v2 rendering-model rewrite,
-      where COMPOSITE redirect collapses to "this window's storage
-      target moves" and the compositor's paint to root is
-      naturally what `SceneCompositor` consumes. See
-      `docs/superpowers/specs/rendering-model-v2.md` (TBD).
 - [ ] **KMS: `MapSubwindows` doesn't re-Expose deep descendants
       promoted by the map_window viewable cascade.** After commit
       `304858f` (`fix(resources): propagate Viewable down through
@@ -508,159 +408,25 @@ from.
       not guaranteed. Marked candidate "Stage 4e" in earlier
       planning; not on the Stage 5 perf path.
 
-      **2026-05-22 investigation status — UNRESOLVED yserver bug:**
-      gtk3-demo + tooltip CSD shadows render visibly different on
-      yserver than on Xorg-native (denser dark band at the window
-      edge). Setup: **same machine, same MATE installation, same
-      theme/wallpaper files, same GTK/Cairo binaries** — only the
-      X server differs. Pixel diff against the Xorg reference:
-      inner-shadow RGB `(31,59,48)` on yserver vs `(42,81,68)`
-      on Xorg over wallpaper RGB `(75,144,117)` vs
-      `(75,144,121)` — implied stored α ≈ 151 on yserver vs
-      ≈ 112 on Xorg. **Even the wallpaper green channel differs
-      by 4 LSB despite identical wallpaper file**, indicating a
-      color-pixel-rendering divergence in addition to the shadow
-      one. Per `AGENTS.md`: yserver must match Xorg, this is a
-      real yserver bug, root cause not yet identified.
-
-      Ruled out so far:
-      1. Pixel-level compose math: marco's `XRenderComposite(Over,
-         src=ARGB32_window_picture, mask=None, dst=offscreen_d24)`
-         produces `result.rgb = src.rgb + (1-src.a)*dst.rgb`
-         exactly — scanout = marco offscreen bit-for-bit. So the
-         divergence is upstream of marco's compose.
-      2. Force-opaque intent: `picture_pict_format` returns
-         `RENDER_FMT_ARGB32` for the GTK CSD picture →
-         `resolve_force_opaque_pict_format` returns false → α
-         is not stomped to 1.0. Not an ARGB-vs-xRGB picture
-         intent bug.
-      3. Marco shadow plugin: `window_has_shadow()`
-         (`compositor-xrender.c:1013-1088`) returns FALSE for
-         `cw->mode == WINDOW_ARGB` with no marco frame on either
-         Xorg or yserver — neither adds a Gaussian soft halo
-         around CSD windows. Asymmetry vs SSD MATE apps is
-         marco's intentional policy, identical on both servers.
-      4. RANDR / SETUP physical-mm dimensions: confirmed
-         bit-identical GTK CSD backing alpha before and after
-         fixing SETUP mm (38-DPI → 96-DPI synth) and per-output
-         mm (96-DPI synth → real EDID via `drmModeConnector.size()`).
-         GTK does not read RANDR or SETUP mm to compute CSD
-         shadow density on this path. Both fixes shipped
-         2026-05-22 as a separate correctness win, see
-         [feedback_dpi_hardcoded_matters.md].
-
-      **2026-06-04 RESOLVED (HW-verified) — branch
-      `fix/render-trapezoids-src-origin`.** Three stacked fixes landed:
-      (1) honor `xSrc`/`ySrc` in Trapezoids/Triangles source sampling
-      (`e806f6e`); (2) subtract the first trap origin from `xSrc`/`ySrc`
-      like Xorg `fbTrapezoids` (`24ba53b`); and (3) the final piece — for
-      `op=Src`/full-dst trap ops, clear the **whole** `mask_scratch`, not
-      just the bbox. The two-stage GPU trap path reuses a power-of-two-grown
-      `mask_scratch`; a full-dst composite samples the coverage mask across
-      the entire destination (offset by `-bbox`), so texels OUTSIDE the
-      (bbox-only-cleared) region returned **stale coverage from a prior
-      trap-op**. The GTK CSD base shadow is an `op=Src` solid (α=`0x2e2e`=46)
-      rounded-rect; stale margin coverage (~50%) leaked through as
-      `46×0.5 = 23` → a 2px α≈23 line at the tooltip's low-coordinate
-      (left/top) edges. Clearing the full scratch (draw still scissored to
-      the bbox) zeroes the margin; HW-verified the line is gone on both
-      edges and the shadow is otherwise intact. (Historical diagnosis was in
-      `docs/wip-tooltip-shadow-trapezoid-src-origin-2026-06-03.md`, now
-      removed.)
-      The "denser dark band / α too high" *is* a yserver render bug,
-      reproduced as an opaque **black bar below the yellow MATE
-      tooltip** (over the dark desktop). Confirmed yserver-side:
-      the bar is baked into the redirect backing (not the composite),
-      absent under Xorg, while marco's protocol (`NameWindowPixmap`
-      → `CreatePicture format=ARGB32` → `Composite Over, mask=None`)
-      is byte-identical on both servers.
-
-      Mechanism: GTK builds the CSD drop-shadow in an offscreen ARGB
-      pixmap, then `CopyArea`s it to the window. The shadow is a
-      `CreateSolidFill` 50%-black source (`α=0x80` — the source of the
-      observed α≈128/151 plateau) feathered *only* by A8 blur-mask
-      gradients built via `RENDER Trapezoids op=Src
-      src=<1×92 blur-ramp picture, repeat> ySrc=23/25`. yserver's
-      `render_trapezoids`/`render_triangles_op` took `_src_x`/`_src_y`
-      **unused** and the trap composite emit hardcoded
-      `src_x/src_y = 0`, so the ramp was sampled from the wrong row →
-      the gradient collapsed toward solid → near-uniform 50%-black
-      slab instead of a feathered shadow. (This is why "ruled out
-      item 1" held — marco's compose *was* correct; the corruption
-      was upstream, in how yserver rasterized the app's own
-      shadow-mask Trapezoids into the backing.)
-
-      Fix: thread the client `xSrc`/`ySrc` (shifted by the same
-      redirect/`x_off` pixel delta as the primitive coords) through
-      `render_traps_or_tris` → the `RecordedTrap` payload → the emit,
-      applied via `trap_composite_src_origin_axis(base, bbox,
-      needs_full_dst)` (mirrors Xorg `miTrapezoids`: src at
-      `xSrc + dst_px`). Confined to `Drawable` sources (`Solid` is a
-      constant colour, `Gradient` positions via its intrinsic
-      transform). Unit-tested; needs HW smoke (`just yserver-mate-hw`,
-      hover tooltip, dump the backing, confirm the bottom shadow
-      feathers). Once verified, close this entry and the
-      NameWindowPixmap→BadAlloc entry above (both stale — v2 allocates
-      the backing and the bar was never a NameWindowPixmap failure).
-
-      Candidates not yet ruled out — where the divergence likely
-      lives in yserver:
-      - **Visual / PictFormat advertisement shape** — yserver
-        advertises ~5 visuals vs Xorg's ~272 (visible in
-        `xdpyinfo`). GTK may pick a different visual for the
-        CSD pixmap or root window based on what's listed, and
-        the chosen visual's bit/mask layout drives Cairo's
-        rendering path.
-      - **`PutImage` byte-order / depth-32 handling** — the
-        wallpaper RGB `B` channel differs by 4 LSB
-        (`75,144,117` vs `75,144,121`) despite the same source
-        file. This is a real color divergence in something
-        upstream of the CSD shadow problem. Could be wire-byte
-        permutation in `put_image` for depth-24/32, a swizzle
-        in DRI3 import, or the root storage's interpretation
-        of client-uploaded bytes.
-      - **Cairo Xlib surface selection** — GTK calls
-        `cairo_xlib_surface_create_with_xrender_format` which
-        picks a format based on the server's `QueryPictFormats`
-        reply shape. yserver's format-list ordering or content
-        could be steering Cairo into a different rendering
-        path.
-      - **`RENDER QueryFilters` reply** — affects which Cairo
-        filtering paths GTK uses (Nearest/Bilinear/Convolution).
-        Need to confirm yserver advertises identical filter set
-        to Xorg.
-      - **XSETTINGS** — `mate-settings-daemon` is the same
-        binary on both servers, but its initial-write may
-        depend on what it reads from the server first. Compare
-        the `_XSETTINGS_SETTINGS` property between sessions.
-      - **`gdk-window-scaling-factor` setting source** — could
-        yserver end up reporting something that makes GdkWindow
-        compute a different scale?
-
-      Next concrete diagnostic step: capture a side-by-side
-      gtk3-demo run on Xwayland (96-DPI synth, no real EDID,
-      same as yserver's fallback path) versus yserver, same
-      session, same theme, same wallpaper file. If Xwayland's
-      gtk3-demo matches Xorg-native, the divergence is yserver-
-      specific (and not "Xwayland-style 96-DPI" causing it). If
-      Xwayland matches yserver, the divergence is in something
-      yserver-and-Xwayland both lack vs Xorg-native (likely
-      something EDID-derived beyond mm dimensions, or color/
-      gamma path).
-
-      Marked candidate "Stage 4e" in earlier planning; not on
-      the Stage 5 perf path.
-- [ ] **KmsCore.pictures disconnect cleanup.** Stale Picture
-      records from disconnected clients (e.g.
-      mate-session-check) can persist in v2's `KmsCore.pictures`,
-      causing `render_composite gap` noise lines.
-      `yserver-core/src/core_loop/process_disconnect.rs:261`
-      already loops `removed.freed_pictures` calling
-      `backend.render_free_picture`; verify v2's impl actually
-      evicts from `KmsCore.pictures` and add the missing eviction
-      if it doesn't. ~50 LoC. Surfaced from Stage 4d open items
-      (now in
-      [`status-archive-2026-05-21.md`](status-archive-2026-05-21.md)).
+      **Resolved sub-investigation (2026-05-22 → 2026-06-04):**
+      the gtk3-demo / MATE-tooltip CSD shadow divergence vs Xorg
+      (denser dark band, opaque black bar under the tooltip) that
+      was tracked here turned out to be a Trapezoids source-origin
+      bug, not a PictFormat issue: `render_trapezoids` /
+      `render_triangles_op` ignored `xSrc`/`ySrc` and the two-stage
+      GPU trap path reused a stale, bbox-only-cleared
+      `mask_scratch`, collapsing GTK's blur-ramp shadow mask
+      toward a solid 50%-black slab. Fixed (HW-verified) by
+      threading the client src origin through the trap path
+      Xorg-style and clearing the full scratch for `op=Src` /
+      full-dst trap ops — merged to master (`b0a5084`).
+      One residual observation from that investigation remains
+      unexplained: the wallpaper green channel differed by 4 LSB
+      vs Xorg despite an identical wallpaper file (suspects:
+      `PutImage` depth-24/32 byte handling, visual / PictFormat
+      advertisement steering Cairo into a different path —
+      yserver advertises ~5 visuals vs Xorg's ~272).
+      Re-investigate if a visible colour divergence resurfaces.
 - [ ] **MATE Control Center yellow group-header labels missing
       (mate-no-comp).** Group headers in the Control Center
       sidebar ("Filter", "Groups", "Common Tasks") render
@@ -743,42 +509,6 @@ Surfaced while bringing up xeyes / xterm / xclock and fvwm3 against
 instead of a host X server, so gaps in our rasterisation surface here
 that the host hides for us.
 
-- [ ] **`poly_arc` / `poly_fill_arc` partial-angle clipping.** Both
-      treat any arc as a full ellipse regardless of `angle1`/`angle2`.
-      Fine for xeyes (full circles) but anything that draws actual
-      pie slices renders as full discs. Add an angular mask: for each
-      candidate pixel, check `atan2(py - cy, px - cx)` against
-      `[angle1, angle1 + angle2)` (with X11's "0 = 3 o'clock,
-      counter-clockwise" convention).
-- [ ] **`poly_arc` outline only handles full ellipses.** Same root
-      cause as above — the cap/connector logic doesn't know about
-      partial arcs. Once angle clipping is in, the outline algorithm
-      needs the same treatment plus proper arc endpoints (so a
-      half-arc outline doesn't close itself across the chord).
-- [ ] **`poly_line` thick lines.** GC `line_width` ignored; we always
-      rasterise as 1-pixel Bresenham. Most clients use line_width=0
-      (server-discretion thin) but anything wanting a 3- or 5-px line
-      would render too thin.
-- [ ] **Opcode 58 (SetDashes) unsupported.** Logged as
-      `unsupported opcode 58` from fvwm modules; means dashed lines
-      aren't honoured.  Cosmetic — dashes fall back to solid.
-- [ ] **Opcode 81 (InstallColormap) unsupported.** fvwm3 calls it once.
-      Safe to ignore on a TrueColor backend; could just reply "did it"
-      to silence the unsupported-opcode log.
-- [ ] **Can't switch VT while yserver is running.** The startup
-      `KDSKBMODE=K_OFF` blocks the kernel from interpreting
-      Ctrl+Alt+Fn as a VT switch — it's the same mechanism that
-      stops keystrokes from leaking to the underlying TTY. yserver
-      currently doesn't implement the standard
-      `VT_PROCESS` / `VT_RELDISP` cooperative-VT-switch protocol
-      (Xorg's `xf86OpenConsole` / `xf86VTSwitch`), so even if the
-      keys reached us we'd have nowhere to dispatch them. Workaround
-      from a remote shell: `sudo chvt N`, or `sudo systemctl restart
-      display-manager` to land back in the original session.
-      Fix: install a SIGUSR1/SIGUSR2 handler bound via
-      `VT_SETMODE` and release/acquire the DRM master in lock-step
-      with the kernel-driven switch. Mostly cosmetic until the
-      multi-server use case (X+yserver in parallel) becomes real.
 - [ ] **Crash before `console::Drop` leaves the host TTY unusable.**
       yserver's startup grabs the VT with `KDSKBMODE=K_OFF +
       KD_GRAPHICS` (kernel keystroke→TTY translation suppressed) and
@@ -826,21 +556,6 @@ that the host hides for us.
       is impractical and the only recovery is `sudo systemctl
       reboot` from SSH. Distinct from the SIGSEGV / SIGABRT
       case above — this is a *clean* session-end, not a crash.
-- [x] **~~P0: KMS teardown leaves DRM state that breaks Wayland host
-      sessions.~~ FIXED via failure-path disarm (2026-05-13).**
-      Diagnosis was correct: yserver's `disable_output` left
-      framebuffers bound to CRTCs that the host Wayland compositor
-      (labwc/dms/Sway) then couldn't recover. Fix landed via the KMS
-      teardown plan
-      (`docs/superpowers/plans/2026-05-13-kms-teardown-fix.md`,
-      results at
-      `docs/superpowers/plans/2026-05-13-kms-teardown-fix-results.md`):
-      6-step shutdown sequence + per-output `disarm` paths on
-      `ScanoutBo` and `drm::buffer::Buffer` so failed atomic disables
-      no longer cascade into `destroy_framebuffer` on KMS-held FBs.
-      Hardware-validated: dms+labwc session recovers cleanly when
-      user switches back to F1 after running yserver on F3. Kernel
-      `atomic remove_fb failed with -22` WARN is gone.
 - [ ] **Atomic `disable_output` returns EINVAL on AMD Polaris
       (residual bug after the P0 fix).**
       `crates/yserver/src/drm/modeset.rs:387` builds a single atomic
@@ -940,89 +655,6 @@ that the host hides for us.
       log a warning + fall back to a non-demoting shader variant
       when not. User has a WIP stash with this work already in
       progress on `feature/frame-builder-submit-rate`.
-- [x] **~~1471 leaked Vulkan objects on yserver shutdown.~~ FIXED
-      2026-05-31 across three commits on `master`.** Bee/MATE
-      vkDestroyDevice warning went from 1471 → 0 across the chain:
-      `6464ef7` retained `Arc<VkContext>` on `FenceTicketInner` so
-      its fallback Drop destroys the fence handle directly when
-      the pool is already gone (root cause: `KmsBackendV2`'s field
-      declaration ran `platform`'s `fence_pool` drop before
-      `store` / `engine` / `scene` released their tickets, so the
-      `Weak::upgrade() == None` branch leaked every fence — 523
-      VkFence leaks); `288a6aa` added `DrawableStore::
-      shutdown_destroy_all` called from lib.rs's explicit shutdown
-      block so resident drawables' VkImage / VkImageView /
-      VkDeviceMemory are destroyed via `Storage::destroy` (58 more
-      leaks gone); `a517c0e` drained `RenderEngine::drawable_view_cache`
-      in `Drop` (890 leaks gone — the bulk). Verified across four
-      vkdebug recipe runs: 1471 → 948 (after fence) → 890 (after
-      store) → 0 (after engine cache).
-- [ ] **`vkCmdBeginRendering()` READ_AFTER_WRITE hazard on
-      `pColorAttachments[0]` with `LOAD_OP_LOAD`.** Validation
-      reports the LoadOp read of the attachment view races a
-      preceding `vkCmdPipelineBarrier2` layout transition: the
-      barrier's `dst_stage_mask`/`dst_access_mask` doesn't cover
-      `COLOR_ATTACHMENT_OUTPUT` + `COLOR_ATTACHMENT_READ`, so the
-      LoadOp read happens before the layout transition's write is
-      visible. Observed 2026-05-31 on bee/MATE in 6 distinct
-      image views during the saver-smoke run. No visible
-      rendering glitches reported, but synchronisation-layer
-      validation flags it; under a stricter driver the load
-      could return undefined data. Fix shape: at any
-      `vkCmdBeginRendering` that uses `LOAD_OP_LOAD`, ensure the
-      preceding barrier into the colour-attachment-optimal layout
-      includes `dst_stage_mask=COLOR_ATTACHMENT_OUTPUT` and
-      `dst_access_mask=COLOR_ATTACHMENT_READ|COLOR_ATTACHMENT_WRITE`
-      (currently it's likely WRITE-only). Investigate
-      `crates/yserver/src/kms/v2/store.rs::transition_layout_for_dynamic_rendering`
-      and the LoadOp-emitting sites in `engine.rs` /
-      `scene.rs`.
-- [ ] **`vkQueueSubmit2()` reads VkImage in `UNDEFINED` layout
-      where shader expects `SHADER_READ_ONLY_OPTIMAL`.** Observed
-      2026-05-31 on bee/MATE: `command buffer ... expects VkImage
-      ... (aspectMask = COLOR, mip = 0, layer = 0) to be in layout
-      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL — instead, current
-      layout is VK_IMAGE_LAYOUT_UNDEFINED`. First-use-before-
-      transition: a fresh allocation (likely from a pool-take or
-      freshly-allocated drawable) is bound as a sampler input
-      before any barrier transitions it from the initial
-      UNDEFINED. Possibly related to the
-      READ_AFTER_WRITE hazard above (same code path).
-      Fix shape: walk the sampler-binding sites in `engine.rs`
-      / `scene.rs`; ensure every sampler bind is preceded by a
-      layout-transition barrier to `SHADER_READ_ONLY_OPTIMAL`
-      from `current_layout` (tracked on `Storage`).
-- [ ] **`vkGetImageSubresourceLayout()` uses wrong aspect mask
-      for DRM-format-modifier images.** Validation: `pSubresource
-      ->aspectMask (VK_IMAGE_ASPECT_COLOR_BIT) must be
-      VK_IMAGE_ASPECT_MEMORY_PLANE_i_BIT_EXT.` Observed
-      2026-05-31. Per the Vulkan DRM-format-modifier ext spec,
-      queries against an image created with a DRM format modifier
-      must use the per-memory-plane aspect masks
-      (`MEMORY_PLANE_{0,1,2,3}_BIT_EXT`), not the generic colour
-      aspect. yserver's call site (likely the DRI3-import /
-      scanout-BO query path in `kms/vk/target.rs` or `kms/vk/
-      scanout.rs`) needs to detect the modifier and switch aspect
-      mask. Functionally probably fine on RADV (returns plausible
-      layout for COLOR aspect on single-plane modifiers) but
-      formally non-conforming and could break on other ICDs or
-      multi-plane formats.
-- [ ] **`RenderEngine::notify_drawable_retired` is defined but
-      never called.** `engine.rs:2507` exposes a per-drawable
-      cache-invalidation hook for `drawable_view_cache`, but a
-      tree-wide grep shows zero callers. The shutdown leak
-      (`a517c0e` above) only drained the cache at SIGTERM; at
-      runtime every `DestroyPixmap` / `DestroyWindow` leaves the
-      drawable's cached views (one per `(SamplerConfig,
-      SwizzleClass)` triple) in the cache, referencing the
-      destroyed image. Long sessions accumulate dead entries
-      until process exit. Not a kernel leak (cleanup at exit),
-      but unbounded growth and the cached views point at freed
-      images. Fix shape: call `engine.notify_drawable_retired(id)`
-      from `DrawableStore::destroy_now` (which already owns the
-      destroy moment), threaded through `KmsBackendV2`'s
-      destroy-window / destroy-pixmap entry points. Touches the
-      runtime path so worth small TDD coverage.
 
 ## WM-specific behaviour
 
@@ -1165,7 +797,7 @@ that the host hides for us.
       initialize GL on yserver; it worked 2026-05-29 (status.md dogfood),
       broke after a rolling-Arch Mesa+chromium update — **not a yserver
       regression** (see memory `project_chromium_glx_pbuffer_gap`). Two
-      GLX gaps were found and FIXED on branch `fix/glx-pbuffer-attributes`
+      GLX gaps were found and FIXED, merged to master
       (`225037a` server-string extension list + `082a5b5`
       GetDrawableAttributes geometry / pbuffer parse), both verified
       byte-for-byte against an Xorg xtrace of the same launch. Those advance Chrome past the GLX-attribute stage but it
