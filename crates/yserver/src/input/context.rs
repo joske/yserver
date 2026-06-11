@@ -23,7 +23,7 @@ use std::{
 use crate::seat::{DeviceKind, LibseatInner};
 
 use input::{
-    Device, Event, Libinput, LibinputInterface,
+    Device, DeviceCapability, Event, Led, Libinput, LibinputInterface,
     event::{
         EventTrait,
         keyboard::{KeyState, KeyboardEvent, KeyboardEventTrait},
@@ -85,6 +85,17 @@ pub struct Context {
     /// drops its borrow, and the entry's eventual `remove(...)` drops
     /// the last ref.
     touchpad_devices: HashMap<String, Device>,
+    /// Live handles for keyboard-capability devices, same keying and
+    /// refcount semantics as `touchpad_devices`. Consumed by
+    /// [`Context::update_leds`] — the XKB lock state (Caps/Num/Scroll)
+    /// lives in the server core, so the server must push LED changes
+    /// down to the hardware via `libinput_device_led_update`; nothing
+    /// else will (this is the KMS server, there is no other driver).
+    keyboard_devices: HashMap<String, Device>,
+    /// Last LED mask applied — re-applied to keyboards that appear
+    /// later (hotplug, VT-switch re-acquire re-adds devices with their
+    /// LEDs reset).
+    last_leds: Led,
 }
 
 /// Newtype wrapper around `Context` that implements `Send`.
@@ -104,6 +115,10 @@ impl SendContext {
 
     pub fn dispatch(&mut self) -> io::Result<Vec<InputEvent>> {
         self.0.dispatch()
+    }
+
+    pub fn update_leds(&mut self, leds: Led) {
+        self.0.update_leds(leds);
     }
 }
 
@@ -126,6 +141,8 @@ impl Context {
         Ok(Self {
             libinput,
             touchpad_devices: HashMap::new(),
+            keyboard_devices: HashMap::new(),
+            last_leds: Led::empty(),
         })
     }
 
@@ -190,6 +207,23 @@ impl Context {
                         self.touchpad_devices
                             .insert(device_node.clone(), dev.clone());
                     }
+                    // Keyboard-capability devices are stashed for LED
+                    // writes (update_leds). Re-apply the current lock-
+                    // LED mask to a newly-appearing keyboard: hotplug
+                    // and VT-switch re-acquire re-add devices with
+                    // their LEDs reset, but the X-side lock state
+                    // persists.
+                    if dev.has_capability(DeviceCapability::Keyboard) {
+                        // Force the device to the current lock state
+                        // unconditionally — including all-off — so a
+                        // keyboard that appears with a stale firmware
+                        // LED (e.g. a BIOS-lit NumLock) is corrected to
+                        // match the server, not just keyboards added
+                        // while a lock happens to be active.
+                        dev.led_update(self.last_leds);
+                        self.keyboard_devices
+                            .insert(device_node.clone(), dev.clone());
+                    }
                     let info = DeviceInfo {
                         name,
                         device_node,
@@ -214,6 +248,7 @@ impl Context {
                     // T4: drop the stashed handle (libinput unref via Drop).
                     // No-op if the device wasn't a touchpad (never inserted).
                     self.touchpad_devices.remove(&device_node);
+                    self.keyboard_devices.remove(&device_node);
                     out.push(InputEvent::DeviceRemoved { device_node });
                 }
                 _ => {}
@@ -223,6 +258,19 @@ impl Context {
             }
         }
         Ok(out)
+    }
+
+    /// Push the X-side lock-LED state (Caps/Num/Scroll) to every
+    /// keyboard device. Called on lock-state transitions — directly by
+    /// the libseat-mode backend (context lives on the core thread), or
+    /// from the input thread after a [`crate::input::LedRelay`] wakeup
+    /// in Direct mode. Also remembered for keyboards that appear later
+    /// (see the DeviceAdded arm).
+    pub fn update_leds(&mut self, leds: Led) {
+        self.last_leds = leds;
+        for dev in self.keyboard_devices.values_mut() {
+            dev.led_update(leds);
+        }
     }
 
     /// Route a decoded `xinput set-prop` write through to the live
@@ -335,6 +383,8 @@ impl Context {
         Ok(Self {
             libinput,
             touchpad_devices: HashMap::new(),
+            keyboard_devices: HashMap::new(),
+            last_leds: Led::empty(),
         })
     }
 

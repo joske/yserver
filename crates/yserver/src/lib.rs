@@ -282,13 +282,22 @@ pub fn run(display: u16) -> io::Result<()> {
         log::info!("yserver: libseat mode — libinput on core thread, no input thread spawned");
     } else if let Some(input_ctx) = backend.take_input_ctx() {
         let input_sender = sender.clone_handle();
+        // Lock-LED relay: the core thread owns the XKB lock state, the
+        // input thread owns the libinput devices; LED transitions
+        // cross via this eventfd-backed mask.
+        let led_relay = std::sync::Arc::new(crate::input::LedRelay::new()?);
+        backend.set_led_relay(std::sync::Arc::clone(&led_relay));
         log::info!("yserver: Direct mode — spawning libinput sender thread");
         thread::Builder::new()
             .name("yserver-libinput".into())
             .spawn(move || {
-                if let Err(err) =
-                    input_thread::run(input_ctx, input_sender, u32::from(fb_w), u32::from(fb_h))
-                {
+                if let Err(err) = input_thread::run(
+                    input_ctx,
+                    input_sender,
+                    u32::from(fb_w),
+                    u32::from(fb_h),
+                    led_relay,
+                ) {
                     log::warn!("yserver: libinput thread exited: {err}");
                 }
             })?;

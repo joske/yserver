@@ -313,12 +313,24 @@ pub fn process_batch(
 /// and flushes any leftover pending motion at the end of each batch so
 /// the core never sees stale "latest motion" sitting in the channel.
 ///
+/// `led_relay` carries lock-LED updates from the core thread (which
+/// owns the XKB lock state) into this thread (which owns the libinput
+/// devices); its eventfd sits in the same epoll set as the libinput fd.
+///
 /// Returns only on a fatal send error (channel closed = core gone).
-pub fn run(input_ctx: SendContext, sender: CoreSender, fb_w: u32, fb_h: u32) -> io::Result<()> {
+pub fn run(
+    input_ctx: SendContext,
+    sender: CoreSender,
+    fb_w: u32,
+    fb_h: u32,
+    led_relay: std::sync::Arc<crate::input::LedRelay>,
+) -> io::Result<()> {
     let mut input_ctx = input_ctx;
     let mut state = LibinputThreadState::new(fb_w, fb_h);
     let mut pending_motion: Option<HostInputEvent> = None;
 
+    const EPOLL_DATA_LIBINPUT: u64 = 0;
+    const EPOLL_DATA_LEDS: u64 = 1;
     let input_epoll = Epoll::new(EpollCreateFlags::empty())
         .map_err(|err| io::Error::other(format!("input thread epoll_create: {err}")))?;
     let fd = input_ctx.fd();
@@ -326,8 +338,20 @@ pub fn run(input_ctx: SendContext, sender: CoreSender, fb_w: u32, fb_h: u32) -> 
     // the duration of `run`.
     let borrow = unsafe { BorrowedFd::borrow_raw(fd) };
     input_epoll
-        .add(borrow, EpollEvent::new(EpollFlags::EPOLLIN, 0))
+        .add(
+            borrow,
+            EpollEvent::new(EpollFlags::EPOLLIN, EPOLL_DATA_LIBINPUT),
+        )
         .map_err(|err| io::Error::other(format!("input thread epoll_add: {err}")))?;
+    // SAFETY: `led_relay` (Arc) outlives this borrow — held for the
+    // duration of `run`.
+    let led_borrow = unsafe { BorrowedFd::borrow_raw(led_relay.fd()) };
+    input_epoll
+        .add(
+            led_borrow,
+            EpollEvent::new(EpollFlags::EPOLLIN, EPOLL_DATA_LEDS),
+        )
+        .map_err(|err| io::Error::other(format!("input thread epoll_add (leds): {err}")))?;
 
     // Drain udev's initial device enumeration before waiting on
     // epoll. udev_assign_seat queues DeviceAdded events synchronously
@@ -355,7 +379,17 @@ pub fn run(input_ctx: SendContext, sender: CoreSender, fb_w: u32, fb_h: u32) -> 
     let mut buf = [EpollEvent::empty(); 4];
     loop {
         match input_epoll.wait(&mut buf, EpollTimeout::NONE) {
-            Ok(_) => {}
+            Ok(n) => {
+                // Core-thread lock-LED update: drain the eventfd and
+                // push the mask to every keyboard device. Falls through
+                // to the libinput dispatch below (harmless when the
+                // libinput fd wasn't the waker — dispatch just returns
+                // no events).
+                if buf[..n].iter().any(|e| e.data() == EPOLL_DATA_LEDS) {
+                    let leds = input::Led::from_bits_truncate(led_relay.drain());
+                    input_ctx.update_leds(leds);
+                }
+            }
             Err(nix::errno::Errno::EINTR) => continue,
             Err(err) => {
                 log::warn!("input thread: epoll_wait: {err}");

@@ -348,6 +348,14 @@ pub struct KmsBackendV2 {
     /// Cached on-core libinput fd for `poll_fds` (`&self`). `-1` in
     /// Direct mode (the input thread owns the fd there).
     core_libinput_fd: std::os::fd::RawFd,
+    /// Direct-mode lock-LED sink: the input thread owns the libinput
+    /// devices, so LED changes cross via this relay (mask + eventfd in
+    /// the thread's epoll). `None` in libseat mode (LEDs go straight
+    /// through `core_libinput`) and on test fixtures.
+    led_relay: Option<std::sync::Arc<crate::input::LedRelay>>,
+    /// Last `input::Led` bits pushed — dedup so only lock-state
+    /// TRANSITIONS reach the hardware, not every key event.
+    leds_sent: u32,
     /// Core-channel sender for emitting Shutdown/Dump messages from the
     /// on-core hotkey path (libseat mode). Handed in via `set_input_sender`
     /// after the channel is created in `lib.rs`.
@@ -739,6 +747,8 @@ impl KmsBackendV2 {
             core_input_state: None,
             seat_fd: -1,
             core_libinput_fd: -1,
+            led_relay: None,
+            leds_sent: 0,
             input_sender: None,
             hotkey: crate::input::hotkey::HotkeyDetector::new(),
             exported_dmabufs: HashMap::new(),
@@ -867,6 +877,8 @@ impl KmsBackendV2 {
             )),
             seat_fd,
             core_libinput_fd,
+            led_relay: None,
+            leds_sent: 0,
             input_sender: None,
             hotkey: crate::input::hotkey::HotkeyDetector::new(),
             exported_dmabufs: HashMap::new(),
@@ -1651,6 +1663,8 @@ impl KmsBackendV2 {
             core_input_state: None,
             seat_fd: -1,
             core_libinput_fd: -1,
+            led_relay: None,
+            leds_sent: 0,
             input_sender: None,
             hotkey: crate::input::hotkey::HotkeyDetector::new(),
             exported_dmabufs: HashMap::new(),
@@ -4223,6 +4237,52 @@ impl KmsBackendV2 {
         mask
     }
 
+    /// Direct-mode wiring: hand over the relay the input thread ends
+    /// of which `input_thread::run` polls. Called from `lib.rs` when
+    /// spawning the libinput thread.
+    pub fn set_led_relay(&mut self, relay: std::sync::Arc<crate::input::LedRelay>) {
+        self.led_relay = Some(relay);
+    }
+
+    /// Current lock-LED state derived from `xkb_state`, as
+    /// `input::Led` bits. Split from [`Self::sync_keyboard_leds`] so
+    /// the no-Vk test fixture can pin the XKB→LED mapping without a
+    /// libinput device.
+    fn current_led_bits(&self) -> u32 {
+        let state = &self.core.xkb_state.0;
+        let mut leds = input::Led::empty();
+        if state.led_name_is_active(xkbcommon::xkb::LED_NAME_CAPS) {
+            leds |= input::Led::CAPSLOCK;
+        }
+        if state.led_name_is_active(xkbcommon::xkb::LED_NAME_NUM) {
+            leds |= input::Led::NUMLOCK;
+        }
+        if state.led_name_is_active(xkbcommon::xkb::LED_NAME_SCROLL) {
+            leds |= input::Led::SCROLLLOCK;
+        }
+        leds.bits()
+    }
+
+    /// Push the XKB lock-LED state (Caps/Num/Scroll) to the keyboards
+    /// when it changed. On a KMS server nothing else drives the LEDs —
+    /// Xorg's keyboard driver does this via the XKB indicator state;
+    /// we do it via `libinput_device_led_update`. Libseat mode calls
+    /// the on-core libinput context directly; Direct mode crosses to
+    /// the input thread via the `LedRelay` eventfd.
+    fn sync_keyboard_leds(&mut self) {
+        let bits = self.current_led_bits();
+        if bits == self.leds_sent {
+            return;
+        }
+        self.leds_sent = bits;
+        let leds = input::Led::from_bits_truncate(bits);
+        if let Some(ctx) = self.core_libinput.as_mut() {
+            ctx.update_leds(leds);
+        } else if let Some(relay) = self.led_relay.as_ref() {
+            relay.set(bits);
+        }
+    }
+
     /// Update xkb_state for `raw` then return a cooked
     /// `HostKeyEvent` with the post-update modifier state +
     /// cursor coords pre-filled. Direct v1 port.
@@ -4234,6 +4294,7 @@ impl KmsBackendV2 {
             xkbcommon::xkb::KeyDirection::Up
         };
         self.core.xkb_state.0.update_key(xkb_keycode, direction);
+        self.sync_keyboard_leds();
         HostKeyEvent {
             state: self.serialize_modifiers(),
             root_x: self.core.cursor_x as i16,
@@ -17901,6 +17962,40 @@ mod tests {
         // disagrees, lower this to >0 — the load-bearing check is
         // that `state` reflects the update, not zero.
         assert_ne!(cooked.state, 0, "Shift press must update mod state");
+    }
+
+    /// Lock-LED mask tracks the XKB lock state: a Caps Lock toggle
+    /// (press + release through `cook_host_key`) raises the CAPSLOCK
+    /// LED bit; a second toggle clears it. This mask is what
+    /// `sync_keyboard_leds` pushes to the keyboards via libinput —
+    /// the caps-LED-never-lights bug (typed the lock-screen password
+    /// wrong repeatedly because the LED gave no feedback).
+    #[test]
+    fn caps_lock_toggle_drives_led_bits() {
+        use yserver_core::host_x11::HostKeyEvent;
+        let mut b = KmsBackendV2::for_tests();
+        assert_eq!(b.current_led_bits(), 0, "fresh state: all lock LEDs off");
+        // 66 == X keycode for Caps Lock (evdev KEY_CAPSLOCK 58 + 8).
+        let key = |pressed| HostKeyEvent {
+            keycode: 66,
+            pressed,
+            state: 0,
+            root_x: 0,
+            root_y: 0,
+            event_x: 0,
+            event_y: 0,
+            time: 0,
+        };
+        let _ = b.cook_host_key(key(true));
+        let _ = b.cook_host_key(key(false));
+        assert_eq!(
+            b.current_led_bits(),
+            input::Led::CAPSLOCK.bits(),
+            "caps toggle must raise the CAPSLOCK LED bit",
+        );
+        let _ = b.cook_host_key(key(true));
+        let _ = b.cook_host_key(key(false));
+        assert_eq!(b.current_led_bits(), 0, "second toggle clears the LED bit");
     }
 
     /// Cinnamon alt-tab regression (2026-06-10): `query_pointer`'s
