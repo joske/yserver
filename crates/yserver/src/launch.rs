@@ -389,7 +389,8 @@ pub fn bind_explicit(socket_dir: &Path, display: u16) -> io::Result<(UnixListene
             ));
         }
     }
-    let listener = UnixListener::bind(&path)?;
+    let listener = UnixListener::bind(&path)
+        .map_err(|e| io::Error::new(e.kind(), format!("bind({}): {e}", path.display())))?;
     if let Err(e) = chmod_socket(&path) {
         let _ = fs::remove_file(&path);
         return Err(e);
@@ -435,6 +436,76 @@ pub fn autopick(socket_dir: &Path) -> io::Result<(u16, UnixListener, PathBuf)> {
         ErrorKind::AddrInUse,
         "no free X display in 0..256",
     ))
+}
+
+/// Write `"<display>\n"` (Xorg's `-displayfd` format) to `fd`, then close
+/// it. Used only when `-displayfd N` was given. Close errors are ignored:
+/// the fd is single-use and there is nothing actionable after the payload
+/// was written.
+pub fn write_displayfd(fd: RawFd, display: u16) -> io::Result<()> {
+    let s = format!("{display}\n");
+    let bytes = s.as_bytes();
+    let mut written = 0usize;
+    while written < bytes.len() {
+        // SAFETY: writing `bytes[written..]` to a caller-owned fd.
+        let r = unsafe { libc::write(fd, bytes[written..].as_ptr().cast(), bytes.len() - written) };
+        if r < 0 {
+            let err = io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(err);
+        }
+        if r == 0 {
+            // A zero-length write would loop forever — fail instead.
+            unsafe { libc::close(fd) };
+            return Err(io::Error::new(
+                ErrorKind::WriteZero,
+                "displayfd write returned 0",
+            ));
+        }
+        written += r as usize;
+    }
+    unsafe { libc::close(fd) };
+    Ok(())
+}
+
+/// True if SIGUSR1's *inherited disposition* is `SIG_IGN` — the signal
+/// the DM (lightdm/Xorg convention) uses to request "signal me when
+/// ready". Querying via `sigaction(…, NULL, &old)` does not mutate the
+/// disposition; signalfd masking (done later) only blocks delivery, so
+/// the two are independent — call this any time before installing a
+/// `sigaction` handler (yserver never does; it uses signalfd).
+#[must_use]
+pub fn sigusr1_is_ignored() -> bool {
+    // SAFETY: zeroed sigaction is a valid "read current" target.
+    let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::sigaction(libc::SIGUSR1, std::ptr::null(), &mut old) };
+    rc == 0 && old.sa_sigaction == libc::SIG_IGN
+}
+
+/// Send SIGUSR1 to the parent (the DM), matching Xorg's `NotifyParentProcess`
+/// (`ParentProcess = getppid()`). Skips PID 1 — if we were reparented to
+/// init there is no DM to notify.
+pub fn signal_ready_to_parent() {
+    let ppid = unsafe { libc::getppid() };
+    if ppid > 1 {
+        unsafe { libc::kill(ppid, libc::SIGUSR1) };
+    }
+}
+
+/// Perform the readiness handshake: report the chosen display on
+/// `-displayfd` (if given) and signal the parent (if SIGUSR1 was inherited
+/// ignored). Call once, just before entering the core loop.
+#[allow(clippy::collapsible_if)]
+pub fn signal_ready(opts: &LaunchOptions, display: u16, sigusr1_was_ignored: bool) {
+    if let Some(fd) = opts.displayfd {
+        if let Err(e) = write_displayfd(fd, display) {
+            log::warn!("yserver: failed to write -displayfd {fd}: {e}");
+        }
+    }
+    if sigusr1_was_ignored {
+        log::info!("yserver: signaling readiness to parent (SIGUSR1)");
+        signal_ready_to_parent();
+    }
 }
 
 #[cfg(test)]
@@ -741,5 +812,34 @@ mod tests {
         assert!(res.is_err());
         assert!(!lock_path(&dir, 11).exists());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_displayfd_writes_ascii_and_closes() {
+        // libc pipe: write end gets the display number, read end verifies.
+        let mut fds = [0 as RawFd; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+
+        write_displayfd(write_fd, 12).unwrap();
+
+        let mut buf = [0u8; 8];
+        let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
+        assert!(n > 0);
+        assert_eq!(&buf[..n as usize], b"12\n");
+        unsafe { libc::close(read_fd) };
+    }
+
+    #[test]
+    fn sigusr1_disposition_roundtrip() {
+        // Process-global: save the prior disposition and restore it at
+        // the end (SIG_DFL is not necessarily what we started with). No
+        // other unit test in this crate touches SIGUSR1 disposition —
+        // keep it that way (tests share one process).
+        let prev = unsafe { libc::signal(libc::SIGUSR1, libc::SIG_IGN) };
+        assert!(sigusr1_is_ignored());
+        unsafe { libc::signal(libc::SIGUSR1, libc::SIG_DFL) };
+        assert!(!sigusr1_is_ignored());
+        unsafe { libc::signal(libc::SIGUSR1, prev) };
     }
 }
