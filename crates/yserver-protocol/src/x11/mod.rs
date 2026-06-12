@@ -5599,6 +5599,8 @@ pub fn write_render_query_version_reply(
 
 /// XC-MISC GetVersion reply — fixed 32 bytes, version 1.1 (Xorg
 /// echoes its own version regardless of the client's ask).
+/// `major`/`minor` are u16 on the wire (unlike RENDER QueryVersion's
+/// u32).
 pub fn write_xcmisc_get_version_reply(
     writer: &mut impl Write,
     byte_order: ClientByteOrder,
@@ -5609,7 +5611,7 @@ pub fn write_xcmisc_get_version_reply(
     write_u32(byte_order, &mut out, 0); // reply length
     write_u16(byte_order, &mut out, 1); // major
     write_u16(byte_order, &mut out, 1); // minor
-    out.extend_from_slice(&[0u8; 20]);
+    out.extend_from_slice(&[0u8; 20]); // pad to 32 bytes
     writer.write_all(&out)
 }
 
