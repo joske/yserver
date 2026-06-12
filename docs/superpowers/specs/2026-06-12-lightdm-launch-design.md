@@ -151,14 +151,22 @@ is preserved:
 
 | `display` | `displayfd` | Effective display | Lockfile? |
 |-----------|-------------|-------------------|-----------|
-| `Some(n)` | any | `n` (explicit `:N`/bare `N` always wins — **this is the lightdm path**) | yes |
-| `None` | `Some(_)` | **auto-pick** lowest free in `0..256` (gdm-style `-displayfd`, *not* stock lightdm) | no (matches Xorg `nolock`) |
-| `None` | `None` | `DEFAULT_DISPLAY` (7) — back-compat for bare/legacy invocation | yes |
+| `Some(n)` | `None` | `n` (explicit `:N`/bare `N` — **this is the lightdm path**) | **yes** |
+| `Some(n)` | `Some(_)` | `n` (explicit display wins; `-displayfd` still reported) | no |
+| `None` | `Some(_)` | **auto-pick** lowest free in `0..256` (gdm-style `-displayfd`, *not* stock lightdm) | no |
+| `None` | `None` | `DEFAULT_DISPLAY` (7) — back-compat for bare/legacy invocation | **yes** |
+
+The lockfile rule is exactly Xorg's: **lock the display iff `-displayfd`
+is absent.** Xorg sets `nolock = TRUE` whenever it parses `-displayfd`
+(`os/utils.c:764`), *before* `LockServer()` runs (`dix/main.c:138`) —
+i.e. presence of `-displayfd` suppresses the lock even when the display is
+explicit. We match that intentionally rather than diverging. Stock lightdm
+passes `:N` with no `-displayfd`, so it lands in the locked row, which is
+what matters: lightdm checks `/tmp/.X<N>-lock`, not the socket.
 
 `DEFAULT_DISPLAY` stays at 7 (the existing convention that avoids clashing
 with a real Xorg on `:0`); the bare-invocation behavior is unchanged. The
-lockfile column is implemented by component 2b below; it matters because
-lightdm hands us an explicit `:N` and checks `/tmp/.X<N>-lock`.
+lockfile column is implemented by component 2b below.
 
 Binding per case:
 
@@ -179,31 +187,49 @@ Binding per case:
   `nolock = TRUE` for the `-displayfd` path.
 
 Factored as a function taking the socket-directory path so it can be unit
-tested against a tempdir. Cap of 256 chosen as "plenty" (real X allows
-far more; 256 covers any realistic seat count).
+tested against a tempdir. The `0..256` cap is an **intentional bound** —
+narrower than Xorg's dynamic `-displayfd` scan (`os/connection.c:249`),
+which ranges much higher — chosen because 256 covers any realistic seat
+count; documented here so it isn't mistaken for parity with Xorg.
 
 ### 2b. Display lockfile (`/tmp/.X<N>-lock`)
 
 **Required for interop** — lightdm (and other launchers) test
 `/tmp/.X<N>-lock`, not the socket, to decide whether a display is free.
-For the explicit-`:N` and back-compat-default cases (the lightdm path), we
-must implement the standard Xorg lock protocol before binding the socket:
+For the locked cases (`-displayfd` absent — see the table above), we
+implement Xorg's exact lock protocol (`os/utils.c:258-380`) **before**
+binding the socket. Create is done via a temp file + atomic `link()`, not
+a direct `O_EXCL`, so a partially-written or empty final lock is never
+observable by a concurrent launcher:
 
-1. Create `/tmp/.X<N>-lock` with `O_CREAT | O_EXCL`, mode `0444`, and write
-   the owning PID as Xorg does (`"%10d\n"`, 11 bytes).
-2. If `O_EXCL` fails with `EEXIST`: read the PID from the existing lock.
-   - If `kill(pid, 0)` succeeds (process alive) ⇒ display genuinely in use
-     ⇒ for explicit `:N`, hard error; (auto-pick never reaches here — it
-     takes no lock).
-   - If it fails with `ESRCH` (stale lock from a dead server) ⇒ remove the
-     lock and retry the create once.
-3. On clean shutdown, remove our own lockfile (alongside the existing
-   socket cleanup at `lib.rs:387`).
+1. Write PID `"%10d\n"` (11 bytes) into `/tmp/.tX<N>-lock`, `chmod 0444`,
+   then `link()` it to `/tmp/.X<N>-lock` and `unlink` the temp file. A
+   successful `link()` is the atomic "we won" signal.
+2. If `link()` fails with `EEXIST`, inspect the existing lock — opened
+   `O_RDONLY | O_NOFOLLOW` (refuse to follow a symlink):
+   - **Malformed / short / non-numeric** contents ⇒ treat as bogus ⇒
+     remove and retry the link once.
+   - Parse the PID and `kill(pid, 0)`:
+     - success **or `EPERM`** ⇒ process alive (a live server owned by
+       another user still counts) ⇒ display in use ⇒ for explicit `:N`,
+       hard error.
+     - `ESRCH` ⇒ stale lock from a dead server ⇒ remove and retry once.
+3. **Error-path release:** if anything after lock acquisition fails
+   (socket bind/listen/chmod), remove our lockfile before returning the
+   error — never leave a lock we don't back with a live socket.
+4. **Clean shutdown ordering:** remove the **socket first, then the lock
+   last** (extend the cleanup at `lib.rs:387`). The lock is the
+   authoritative occupancy marker, so dropping it before the socket would
+   open a brief false-"free" window for a racing launcher.
+
+Auto-pick (and any `-displayfd` case) takes **no** lock, matching Xorg's
+`nolock = TRUE`.
 
 Factored to take the lock-directory path (`/tmp` by default) so the
-create / stale-detection / collision logic is unit-testable against a
-tempdir. This is the fix for codex's interop **blocker**: a socket-only
-server gets misclassified as "free" by lightdm's `display_number_in_use()`.
+create / temp+link / stale-detection / malformed / collision logic is
+unit-testable against a tempdir. This is the fix for codex's interop
+**blocker**: a socket-only server gets misclassified as "free" by
+lightdm's `display_number_in_use()`.
 
 ### 3. Readiness signaling (in `run()`)
 
@@ -278,9 +304,13 @@ build options → call `run`.
   live-socket logic plus the `EADDRINUSE` bind-race retry and the
   "non-`ECONNREFUSED` ⇒ skip, don't delete" branch (create dummy socket
   files and a live listener).
-- **Lockfile protocol:** tempdir-based test of `O_EXCL` create, the
-  stale-lock (`kill(pid,0)` → `ESRCH`) remove-and-retry path, and the
-  live-lock collision (hard error for explicit `:N`).
+- **Lockfile protocol:** tempdir-based test of the temp-file + atomic
+  `link()` create; the stale-lock (`kill(pid,0)` → `ESRCH`)
+  remove-and-retry path; the live-lock collision (hard error for explicit
+  `:N`); malformed/short lock contents treated as bogus + reclaimed; and
+  the error-path release (lock removed when a simulated bind failure
+  follows acquisition). Cleanup ordering (socket-then-lock) is asserted by
+  checking the lock outlives the socket during teardown.
 - **`write_displayfd`:** unit-test via a `pipe()` — write to the write
   end, assert `"<N>\n"` on the read end.
 - **SIGUSR1-disposition path:** not unit-testable (process-global signal
