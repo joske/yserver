@@ -23369,7 +23369,56 @@ fn handle_xcmisc_request(
             };
             Ok(write_to_client(client, client_id, &buf))
         }
-        // GetXIDList — Task 5.
+        // GetXIDList — req 8 bytes: count(4).
+        2 => {
+            if body.len() != 4 {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            }
+            let want = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+            let Some((base, mask)) = state
+                .clients
+                .get(&client_id.0)
+                .map(|c| (c.resource_id_base, c.resource_id_mask))
+            else {
+                return Ok(RequestOutcome::Handled);
+            };
+            // Clamp to the range size — never allocate
+            // client-controlled gigabytes (explicit Xorg deviation,
+            // spec "Edge cases"; Xorg would BadAlloc instead).
+            let limit = u64::from(want).min(u64::from(mask) + 1);
+            let mut ids: Vec<u32> = Vec::new();
+            let lo = base.max(1);
+            let hi = base | mask;
+            let mut id = lo;
+            while ids.len() < limit as usize {
+                if !state.xid_occupied(id) {
+                    ids.push(id);
+                }
+                if id == hi {
+                    break;
+                }
+                id += 1;
+            }
+            log::info!(
+                "client {} XC-MISC GetXIDList want={want} → {} ids",
+                client_id.0,
+                ids.len(),
+            );
+            let mut buf: Vec<u8> = Vec::with_capacity(32 + ids.len() * 4);
+            x11::write_xcmisc_get_xid_list_reply(&mut buf, byte_order, sequence, &ids)?;
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            Ok(write_to_client(client, client_id, &buf))
+        }
         other => emit_x11_error_with_minor(
             state,
             client_id,
@@ -41146,6 +41195,55 @@ mod tests {
         assert_eq!(count, 0x000F_FFFF - 4 + 1);
         // Wrong length → BadLength.
         send_xcmisc(&mut state, &mut backend, 2, 1, &[0u8; 4]);
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[1], x11::error::BAD_LENGTH);
+    }
+
+    #[test]
+    fn xcmisc_get_xid_list_returns_free_ids() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        {
+            let c = state.clients.get_mut(&1).unwrap();
+            c.resource_id_base = 0x0010_0000;
+            c.resource_id_mask = 0x000F_FFFF;
+        }
+        // Occupy ids 0,2 in the range; ask for 4 ids.
+        state
+            .resources
+            .create_cursor(ClientId(1), ResourceId(0x0010_0000));
+        state
+            .resources
+            .create_cursor(ClientId(1), ResourceId(0x0010_0002));
+        send_xcmisc(&mut state, &mut backend, 1, 2, &4u32.to_le_bytes());
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 32 + 16, "32 header + 4 ids");
+        let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        assert_eq!(count, 4);
+        let length = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        assert_eq!(length, 4, "reply length in words = id count");
+        let ids: Vec<u32> = bytes[32..]
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![0x0010_0001, 0x0010_0003, 0x0010_0004, 0x0010_0005],
+            "skips occupied 0x...0 and 0x...2"
+        );
+        // Huge count is clamped to the RANGE size, not allocated. Shrink
+        // the client's range first so the reply stays ~1 KiB — a 1M-id
+        // reply would block the test's unread socketpair (write_or_buffer
+        // does a synchronous write; OUTBOUND_CAP would trip the
+        // disconnect path).
+        state.clients.get_mut(&1).unwrap().resource_id_mask = 0xFF;
+        send_xcmisc(&mut state, &mut backend, 2, 2, &u32::MAX.to_le_bytes());
+        let bytes = read_all_available(&mut peer);
+        let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        assert_eq!(count, 0x100 - 2, "256-id range minus 2 occupied");
+        // BadLength on wrong size.
+        send_xcmisc(&mut state, &mut backend, 3, 2, &[]);
         let bytes = read_all_available(&mut peer);
         assert_eq!(bytes[1], x11::error::BAD_LENGTH);
     }
