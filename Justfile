@@ -1,5 +1,12 @@
 KERNEL := "/boot/vmlinuz-linux-cachyos"
 
+# Build a release yserver and install it to /usr/local/bin (needs sudo).
+# Pair with the lightdm setup in the README to use it as your graphical login.
+install:
+    cargo build --release --bin yserver
+    sudo install -m755 target/release/yserver /usr/local/bin/yserver
+    @echo "installed /usr/local/bin/yserver — see README 'Use with a display manager' to enable it"
+
 # Run yserver in virtme-ng with virtio-gpu DRM device and a QEMU window.
 yserver:
     cargo build --bin yserver

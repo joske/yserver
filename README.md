@@ -106,6 +106,30 @@ Some convenience keybinds are available:
 - Ctrl-Alt-Enter: create a screenshot/scanout of the framebuffer in CWD
 - Ctrl-Alt-F12: dump all drawables as PPM files to CWD
 
+## Use with a display manager (lightdm)
+
+`lightdm` can launch yserver as its X server for a graphical login (its
+X-server command is configurable, unlike gdm/sddm). yserver understands
+X-style argv (`:N`, `vtN`, `-seat`, `-auth`, `-nolisten`, `-displayfd`) and the
+SIGUSR1/`-displayfd` readiness handshake, so the greeter and your session start
+normally.
+
+1. Install the binary: `just install` (puts it at `/usr/local/bin/yserver`).
+2. Point lightdm at it — create `/etc/lightdm/lightdm.conf.d/99-yserver.conf`:
+
+   ```ini
+   [Seat:*]
+   xserver-command=/usr/local/bin/yserver
+   ```
+3. From a free TTY, restart lightdm: `sudo systemctl restart lightdm`.
+
+The greeter appears, you log in, and (unlike the `startx` path) the login
+keyring is unlocked by lightdm's PAM stack.
+
+Known limitation: **VT switching does not work** in a lightdm-launched session
+yet — yserver runs rootful without a logind session there, so it can't use
+libseat for VT control ([#10](https://github.com/joske/yserver/issues/10)).
+
 ## Regression coverage with xts5 and rendercheck
 
 We run the X.Org X Test Suite (xts5) against `yserver` to gauge protocol completeness.
