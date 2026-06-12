@@ -119,6 +119,14 @@ Cross-cutting bugs and followups that don't fit a stage live in
   node, remove the missing-parent reparent fallback, and make Manual
   redirects suppress direct scanout unconditionally. Further
   `cow_authoritative` surgery is no longer the primary path.
+- **2026-06-12 XINERAMA landed in-tree**: yserver now advertises the
+  `XINERAMA` extension and serves all six PanoramiX/Xinerama requests
+  from the same shared monitor list as RANDR `GetMonitors`. That keeps
+  the Xinerama screen count and the RANDR monitor count identical by
+  construction, which is the compatibility invariant needed for
+  dual-head mutter/muffin. Wire encoder unit tests are in
+  `yserver-protocol`; core wiring/build validation is green. Hardware
+  Cinnamon smoke on real dual-head is still the remaining proof gate.
 - **Bugfixing kicked off 2026-05-26 PM** with Cinnamon validation.
   First live issue: clicks inside `cinnamon-settings` were not
   taking effect even though XI2 ButtonPress/Release reached the

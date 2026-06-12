@@ -358,6 +358,7 @@ pub fn process_request(
         137 => handle_xi2_request(state, backend, origin, client_id, sequence, header, body),
         // ── PRESENT extension dispatcher ──
         145 => handle_present_request(state, backend, origin, client_id, sequence, header, body),
+        151 => handle_xinerama_request(state, client_id, sequence, header, body), // XINERAMA
         // ── DAMAGE extension dispatcher ──
         143 => handle_damage_request(state, client_id, sequence, header, body),
         // ── MIT-SHM extension dispatcher ──
@@ -2063,6 +2064,54 @@ fn handle_render_request(
     Ok(RequestOutcome::Handled)
 }
 
+/// One monitor as reported by both RANDR `GetMonitors` and the XINERAMA
+/// extension. This is the single source of truth so their counts/order cannot
+/// diverge.
+#[derive(Clone)]
+pub(crate) struct ActiveMonitor {
+    pub name: String,
+    pub output_id: u32,
+    pub primary: bool,
+    pub x: i16,
+    pub y: i16,
+    pub width: u16,
+    pub height: u16,
+    pub width_mm: u32,
+    pub height_mm: u32,
+}
+
+fn active_monitors(state: &ServerState) -> Vec<ActiveMonitor> {
+    state
+        .randr
+        .outputs
+        .iter()
+        .enumerate()
+        .map(|(i, output)| {
+            let width_mm = if output.mm_width > 0 {
+                output.mm_width
+            } else {
+                ((u32::from(output.width) * 254 + 480) / 960).max(1)
+            };
+            let height_mm = if output.mm_height > 0 {
+                output.mm_height
+            } else {
+                ((u32::from(output.height) * 254 + 480) / 960).max(1)
+            };
+            ActiveMonitor {
+                name: output.name.clone(),
+                output_id: output.output_id,
+                primary: i == 0,
+                x: output.x,
+                y: output.y,
+                width: output.width,
+                height: output.height,
+                width_mm,
+                height_mm,
+            }
+        })
+        .collect()
+}
+
 fn handle_randr_request(
     state: &mut ServerState,
     client_id: ClientId,
@@ -2289,8 +2338,6 @@ fn handle_randr_request(
         }
         x11randr::RR_GET_MONITORS => {
             let t = state.randr.timestamp;
-            // Pre-resolve per-monitor name atom + output-id storage so
-            // the borrow inside MonitorInfo points at stable memory.
             struct MonitorRow {
                 name_atom: u32,
                 primary: bool,
@@ -2303,43 +2350,20 @@ fn handle_randr_request(
                 height_mm: u32,
                 outputs: Vec<u32>,
             }
-            let rows: Vec<MonitorRow> = state
-                .randr
-                .outputs
+            let monitors_list = active_monitors(state);
+            let rows: Vec<MonitorRow> = monitors_list
                 .iter()
-                .enumerate()
-                .map(|(i, o)| {
-                    let name_atom = state.atoms.intern(&o.name, false).0;
-                    // Prefer the EDID-reported physical size from the
-                    // DRM connector; fall back to a 96-DPI synthesis
-                    // (`mm = (px*254 + 480) / 960`) when the connector
-                    // didn't report a size (virtio-gpu, ynest nested,
-                    // displays without EDID). The previous unconditional
-                    // 96-DPI synthesis was off from real EDID by 10-15 %
-                    // on typical 109-DPI panels, causing GTK CSD shadows
-                    // to render denser than on Xorg-native.
-                    let width_mm = if o.mm_width > 0 {
-                        o.mm_width
-                    } else {
-                        ((u32::from(o.width) * 254 + 480) / 960).max(1)
-                    };
-                    let height_mm = if o.mm_height > 0 {
-                        o.mm_height
-                    } else {
-                        ((u32::from(o.height) * 254 + 480) / 960).max(1)
-                    };
-                    MonitorRow {
-                        name_atom,
-                        primary: i == 0,
-                        automatic: true,
-                        x: o.x,
-                        y: o.y,
-                        width: o.width,
-                        height: o.height,
-                        width_mm,
-                        height_mm,
-                        outputs: vec![o.output_id],
-                    }
+                .map(|monitor| MonitorRow {
+                    name_atom: state.atoms.intern(&monitor.name, false).0,
+                    primary: monitor.primary,
+                    automatic: true,
+                    x: monitor.x,
+                    y: monitor.y,
+                    width: monitor.width,
+                    height: monitor.height,
+                    width_mm: monitor.width_mm,
+                    height_mm: monitor.height_mm,
+                    outputs: vec![monitor.output_id],
                 })
                 .collect();
             let monitors: Vec<x11randr::MonitorInfo<'_>> = rows
@@ -2920,6 +2944,139 @@ fn apply_alarm_attributes(
             value
         };
     }
+}
+
+fn handle_xinerama_request(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    use yserver_protocol::x11::{ClientByteOrder, error, read_u32, xinerama as xin};
+
+    const XINERAMA_MAJOR_OPCODE: u8 = 151;
+
+    let byte_order = state
+        .clients
+        .get(&client_id.0)
+        .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
+    let minor = header.data;
+
+    let screens: Vec<xin::ScreenInfo> = active_monitors(state)
+        .into_iter()
+        .map(|monitor| xin::ScreenInfo {
+            x_org: monitor.x,
+            y_org: monitor.y,
+            width: monitor.width,
+            height: monitor.height,
+        })
+        .collect();
+
+    macro_rules! require_len {
+        ($n:expr) => {
+            if body.len() != $n {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    XINERAMA_MAJOR_OPCODE,
+                );
+            }
+        };
+    }
+
+    let buf = match minor {
+        xin::QUERY_VERSION => {
+            require_len!(4);
+            xin::encode_query_version_reply(byte_order, sequence)
+        }
+        xin::IS_ACTIVE => {
+            require_len!(0);
+            xin::encode_is_active_reply(byte_order, sequence, !screens.is_empty())
+        }
+        xin::QUERY_SCREENS => {
+            require_len!(0);
+            xin::encode_query_screens_reply(byte_order, sequence, &screens)
+        }
+        xin::GET_STATE => {
+            require_len!(4);
+            let window = read_u32(byte_order, body);
+            if state.resources.window(ResourceId(window)).is_none() {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    error::BAD_WINDOW,
+                    window,
+                    u16::from(minor),
+                    XINERAMA_MAJOR_OPCODE,
+                );
+            }
+            xin::encode_get_state_reply(byte_order, sequence, true, window)
+        }
+        xin::GET_SCREEN_COUNT => {
+            require_len!(4);
+            let window = read_u32(byte_order, body);
+            if state.resources.window(ResourceId(window)).is_none() {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    error::BAD_WINDOW,
+                    window,
+                    u16::from(minor),
+                    XINERAMA_MAJOR_OPCODE,
+                );
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let count = screens.len() as u8;
+            xin::encode_get_screen_count_reply(byte_order, sequence, count, window)
+        }
+        xin::GET_SCREEN_SIZE => {
+            require_len!(8);
+            let window = read_u32(byte_order, body);
+            let screen = read_u32(byte_order, &body[4..]);
+            if state.resources.window(ResourceId(window)).is_none() {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    error::BAD_WINDOW,
+                    window,
+                    u16::from(minor),
+                    XINERAMA_MAJOR_OPCODE,
+                );
+            }
+            xin::encode_get_screen_size_reply(
+                byte_order,
+                sequence,
+                u32::from(state.randr.screen_width),
+                u32::from(state.randr.screen_height),
+                window,
+                screen,
+            )
+        }
+        _ => {
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                error::BAD_REQUEST,
+                0,
+                u16::from(minor),
+                XINERAMA_MAJOR_OPCODE,
+            );
+        }
+    };
+
+    let Some(client) = state.clients.get_mut(&client_id.0) else {
+        return Ok(RequestOutcome::Handled);
+    };
+    Ok(write_to_client(client, client_id, &buf))
 }
 
 /// Evaluate every active alarm watching `counter` after it moved from
@@ -23151,6 +23308,46 @@ mod tests {
 
     fn free_pixmap_body(pixmap: u32) -> Vec<u8> {
         pixmap.to_le_bytes().to_vec()
+    }
+
+    #[test]
+    fn active_monitors_matches_outputs_and_order() {
+        let mut state = ServerState::new();
+        state.randr.outputs = vec![
+            crate::randr::RandrOutput {
+                name: "DP-1".into(),
+                output_id: 1,
+                crtc_id: 1,
+                mode_id: 1,
+                x: 0,
+                y: 0,
+                width: 2560,
+                height: 1440,
+                vrefresh: 60,
+                mm_width: 0,
+                mm_height: 0,
+            },
+            crate::randr::RandrOutput {
+                name: "HDMI-A-1".into(),
+                output_id: 2,
+                crtc_id: 2,
+                mode_id: 1,
+                x: 2560,
+                y: 0,
+                width: 2560,
+                height: 1440,
+                vrefresh: 60,
+                mm_width: 0,
+                mm_height: 0,
+            },
+        ];
+
+        let monitors = active_monitors(&state);
+        assert_eq!(monitors.len(), state.randr.outputs.len());
+        assert_eq!(monitors.len(), 2);
+        assert!(monitors[0].primary);
+        assert!(!monitors[1].primary);
+        assert_eq!(monitors[1].x, 2560);
     }
 
     #[test]

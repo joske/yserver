@@ -87,6 +87,7 @@ const PRESENT_FIRST_ERROR: u8 = 0; // Present defines no errors
 pub(crate) const DPMS_MAJOR_OPCODE: u8 = 134;
 
 pub(crate) const MIT_SCREEN_SAVER_MAJOR_OPCODE: u8 = 150;
+pub(crate) const XINERAMA_MAJOR_OPCODE: u8 = 151;
 // MUST be <= 127: X event codes are 7-bit (2..=127); bit 0x80 is the
 // SendEvent/synthetic flag, so a base first_event with the high bit set is
 // illegal and strict clients (Google Chrome's X11 layer) abort on it. 92 is
@@ -174,6 +175,15 @@ pub(crate) const EXTENSIONS: &[ExtensionMetadata] = &[
         first_event: BIG_REQUESTS_FIRST_EVENT,
         event_count: 0,
         first_error: BIG_REQUESTS_FIRST_ERROR,
+        availability: ExtensionAvailability::Always,
+        unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
+    },
+    ExtensionMetadata {
+        name: "XINERAMA",
+        major_opcode: XINERAMA_MAJOR_OPCODE,
+        first_event: 0,
+        event_count: 0,
+        first_error: 0,
         availability: ExtensionAvailability::Always,
         unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
     },
@@ -979,6 +989,17 @@ mod tests {
             non_zero_error_bases.len(),
             "error base collision"
         );
+    }
+
+    #[test]
+    fn xinerama_is_advertised() {
+        let ext = EXTENSIONS
+            .iter()
+            .find(|ext| ext.name == "XINERAMA")
+            .expect("XINERAMA in EXTENSIONS");
+        assert_eq!(ext.major_opcode, 151);
+        assert_eq!(ext.first_event, 0);
+        assert_eq!(ext.first_error, 0);
     }
 
     mod render {
