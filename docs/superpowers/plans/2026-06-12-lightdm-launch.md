@@ -482,6 +482,11 @@ pub fn acquire_lock(lock_dir: &Path, display: u16) -> io::Result<LockGuard> {
             .open(&tmp_path)?;
         tmp.write_all(pid_line.as_bytes())?;
     }
+    // Create-time mode is masked by the process umask (a DM/systemd unit
+    // may set e.g. UMask=0077 → 0400, unreadable to foreign launchers —
+    // Xorg's LockServer READS existing locks). Force 0444 umask-immune,
+    // like Xorg's fchmod after create (os/utils.c:312).
+    fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o444))?;
 
     // At most two attempts: acquire, or reclaim-once-then-acquire.
     for _ in 0..2 {
