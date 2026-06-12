@@ -197,8 +197,8 @@ count; documented here so it isn't mistaken for parity with Xorg.
 **Required for interop** — lightdm (and other launchers) test
 `/tmp/.X<N>-lock`, not the socket, to decide whether a display is free.
 For the locked cases (`-displayfd` absent — see the table above), we
-implement Xorg's exact lock protocol (`os/utils.c:258-380`) **before**
-binding the socket. Create is done via a temp file + atomic `link()`, not
+implement Xorg's lock protocol (`os/utils.c:258-380`), with minor
+cleanups, **before** binding the socket. Create is done via a temp file + atomic `link()`, not
 a direct `O_EXCL`, so a partially-written or empty final lock is never
 observable by a concurrent launcher:
 
