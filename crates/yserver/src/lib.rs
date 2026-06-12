@@ -7,13 +7,7 @@ pub mod launch;
 pub mod present;
 mod seat;
 
-use std::{
-    fs,
-    io::{self, ErrorKind},
-    os::unix::{fs::PermissionsExt, net::UnixListener},
-    path::PathBuf,
-    thread,
-};
+use std::{fs, io, path::PathBuf, thread};
 
 use nix::sys::{
     signal::{SigSet, SigmaskHow, Signal, sigprocmask},
@@ -46,11 +40,15 @@ fn install_backend_root_bindings(state: &mut ServerState, backend: &dyn Backend)
     }
 }
 
-pub fn run(display: u16) -> io::Result<()> {
+pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     #[cfg(not(target_os = "linux"))]
     panic!("yserver only supports Linux (DRM/KMS, libinput, evdev, virtual consoles)");
 
     log::info!("yserver: Phase 6.4 KMS bootstrap — startup (single-threaded core)");
+
+    // Capture the inherited SIGUSR1 disposition before signalfd masking.
+    // If the DM started us with SIGUSR1 ignored, we signal it when ready.
+    let sigusr1_was_ignored = launch::sigusr1_is_ignored();
 
     // Vulkan-call-rate telemetry: emit a per-second snapshot of
     // call counters from `kms::vk::call_stats::VK_CALLS`. Gated on
@@ -233,31 +231,29 @@ pub fn run(display: u16) -> io::Result<()> {
             format!("create_dir_all({}): {e}", socket_dir.display()),
         )
     })?;
-    let socket_path = socket_dir.join(format!("X{display}"));
-    match fs::remove_file(&socket_path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(io::Error::new(
-                err.kind(),
-                format!("remove_file({}): {err}", socket_path.display()),
-            ));
+    let lock_dir = PathBuf::from("/tmp");
+
+    // Resolve the effective display, acquire the lock (when -displayfd is
+    // absent), and bind the socket. `_lock_guard` is held for the server's
+    // lifetime; it drops at the end of `run()` — after the socket file is
+    // removed at shutdown — so the lock (the authoritative occupancy
+    // marker) outlives the socket. On any error after lock acquisition the
+    // `?` unwinds and drops the guard, releasing the lock.
+    let (display, listener, _lock_guard, socket_path) = match launch::resolve(&opts) {
+        launch::Resolution::Explicit { display, lock } => {
+            let guard = if lock {
+                Some(launch::acquire_lock(&lock_dir, display)?)
+            } else {
+                None
+            };
+            let (listener, socket_path) = launch::bind_explicit(&socket_dir, display)?;
+            (display, listener, guard, socket_path)
         }
-    }
-    let listener = UnixListener::bind(&socket_path).map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!("UnixListener::bind({}): {e}", socket_path.display()),
-        )
-    })?;
-    // X clients connect as the invoking user; the socket needs world write
-    // (connect() on AF_UNIX requires `w`). Xorg sets 0777 on /tmp/.X11-unix/X*.
-    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o777)).map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!("set_permissions({}, 0o777): {e}", socket_path.display()),
-        )
-    })?;
+        launch::Resolution::AutoPick => {
+            let (display, listener, socket_path) = launch::autopick(&socket_dir)?;
+            (display, listener, None, socket_path)
+        }
+    };
     log::info!("yserver: listening on unix socket DISPLAY=:{display}");
 
     // Initial composite+flip so the screen has a known frame before any
@@ -347,6 +343,12 @@ pub fn run(display: u16) -> io::Result<()> {
                 }
             }
         })?;
+
+    // Readiness handshake: ServerState is fully constructed, the socket is
+    // bound + chmod'd, and the lock is held — we can complete an initial X
+    // connection setup now. This is the analog of Xorg signaling after
+    // CreateConnectionBlock() and before Dispatch().
+    launch::signal_ready(&opts, display, sigusr1_was_ignored);
 
     let alloc = ClientIdAllocator::new();
     log::info!("yserver: entering single-threaded core loop");
