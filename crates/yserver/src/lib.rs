@@ -3,6 +3,7 @@ pub mod drm;
 pub mod input;
 pub mod input_thread;
 pub mod kms;
+pub mod launch;
 pub mod present;
 mod seat;
 
