@@ -1,0 +1,44 @@
+#!/bin/sh
+# Launch yserver on a display/VT, wait for it to come up, then run the
+# configured X session. Used by yserver@.service; mirrors `just startx`.
+#
+#   $1                — display/VT number (the systemd instance %i)
+#   YSERVER_SESSION   — command to run as the X client session
+#                       (default: the system xinitrc)
+#   YSERVER_ARGS      — extra arguments passed to yserver
+#
+# When the session command exits, yserver is torn down.
+
+set -eu
+
+display="${1:-7}"
+: "${YSERVER_SESSION:=/etc/X11/xinit/xinitrc}"
+: "${YSERVER_ARGS:=}"
+
+# Start the server on :N / vtN.
+# shellcheck disable=SC2086  # YSERVER_ARGS is intentionally word-split.
+/usr/bin/yserver ":${display}" "vt${display}" ${YSERVER_ARGS} &
+ypid=$!
+
+# Wait (up to 30s) for the X socket to appear before launching clients.
+i=0
+while [ ! -S "/tmp/.X11-unix/X${display}" ]; do
+    if ! kill -0 "$ypid" 2>/dev/null; then
+        echo "yserver-session: yserver exited before the display was ready" >&2
+        wait "$ypid" 2>/dev/null || true
+        exit 1
+    fi
+    i=$((i + 1))
+    [ "$i" -ge 30 ] && break
+    sleep 1
+done
+
+# Run the session as an ordinary X client. Strip any inherited Wayland
+# environment so toolkits pick the X11 backend.
+env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
+    XDG_SESSION_TYPE=x11 DISPLAY=":${display}" \
+    sh -c "${YSERVER_SESSION}"
+
+# Session ended — bring the server down.
+kill -TERM "$ypid" 2>/dev/null || true
+wait "$ypid" 2>/dev/null || true

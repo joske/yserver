@@ -1,0 +1,12 @@
+# Configuration for yserver@.service (sourced by /usr/libexec/yserver-session).
+
+# Command run as the X session once yserver is up. Point this at your window
+# manager, desktop session, or a custom script. Defaults to the system xinitrc.
+#YSERVER_SESSION=/etc/X11/xinit/xinitrc
+#YSERVER_SESSION=startxfce4
+#YSERVER_SESSION=mate-session
+
+# Extra arguments passed to the yserver binary, e.g.:
+#   -nolisten tcp        disable the TCP listener
+#   -auth /path/Xauth    use an MIT-MAGIC-COOKIE-1 authority file
+#YSERVER_ARGS=

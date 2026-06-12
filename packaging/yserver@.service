@@ -1,0 +1,47 @@
+# yserver standalone X11 server — systemd template unit.
+#
+# Starts yserver on display/VT %i in direct DRM/KMS mode and then runs the
+# configured X session (a window manager / desktop / xinitrc). This is the
+# "kiosk / headless box" deployment; for an interactive graphical *login*,
+# prefer launching yserver from lightdm instead — see
+# /usr/share/yserver/lightdm-99-yserver.conf.
+#
+# Enable on, e.g., VT 7:
+#   sudo systemctl enable --now yserver@7.service
+#
+# Configure the session command and extra args in /etc/sysconfig/yserver.
+#
+# NOTE: started this way yserver runs OUTSIDE a logind session, so libseat has
+# no seat to manage and yserver falls back to driving KMS/input directly. That
+# requires device access (granted below via SupplementaryGroups) and means VT
+# switching is unavailable while it runs (see the README's known limitations).
+
+[Unit]
+Description=yserver standalone X11 server on display %i
+Documentation=https://github.com/joske/yserver
+After=systemd-user-sessions.service systemd-logind.service plymouth-quit.service
+After=getty@tty%i.service
+Conflicts=getty@tty%i.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/sysconfig/yserver
+ExecStart=/usr/libexec/yserver-session %i
+
+# Direct DRM/KMS + libinput need access to the GPU and input devices.
+SupplementaryGroups=video render input
+
+# Own the target VT for the lifetime of the server.
+TTYPath=/dev/tty%i
+TTYReset=yes
+TTYVHangup=yes
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=yserver
+
+# Don't respawn on a clean exit (e.g. user logs out / zaps the server).
+Restart=no
+
+[Install]
+WantedBy=graphical.target
