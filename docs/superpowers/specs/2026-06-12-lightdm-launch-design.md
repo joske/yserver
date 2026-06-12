@@ -299,10 +299,16 @@ Both mechanisms run if configured:
   `write_displayfd(fd, display)` so it can be unit-tested through a pipe.
 - **SIGUSR1-to-parent**: at startup, query SIGUSR1's inherited disposition
   with `sigaction(SIGUSR1, NULL, &old)`. If `old.sa_handler == SIG_IGN`
-  (the DM started us that way — the classic X convention), record a flag
-  and `kill(getppid(), SIGUSR1)` once ready. `getppid()` is correct:
-  Xorg captures `ParentProcess = getppid()` in `InitParentProcess()` and
-  signals that PID (`os/connection.c:175`).
+  (the DM started us that way — the classic X convention), record a flag,
+  and **also capture the parent PID once at startup** (`getppid()`, stored
+  as `Option<i32>` — `None` if already orphaned). Once ready,
+  `kill(parent_pid, SIGUSR1)`. Capturing the PID at startup rather than at
+  readiness is deliberate and matches Xorg: it stores
+  `ParentProcess = getppid()` in `InitParentProcess()` (`os/connection.c`)
+  and signals that captured PID in `NotifyParentProcess()` — reading
+  `getppid()` at readiness instead would, if the DM died during yserver's
+  init and we were reparented, point at a subreaper or PID 1 and either
+  misfire or silently skip the signal.
 
   *Note on ordering:* blocking SIGUSR1 for the signalfd (via
   `sigprocmask`) only suppresses **delivery** — it does **not** change the
