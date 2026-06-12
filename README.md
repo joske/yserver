@@ -114,17 +114,17 @@ X-style argv (`:N`, `vtN`, `-seat`, `-auth`, `-nolisten`, `-displayfd`) and the
 SIGUSR1/`-displayfd` readiness handshake, so the greeter and your session start
 normally.
 
-1. Install the binary: `just install` (puts it at `/usr/local/bin/yserver`).
-2. Point lightdm at it — create `/etc/lightdm/lightdm.conf.d/99-yserver.conf`:
+1. `just install-lightdm` — installs the binary to `/usr/local/bin/yserver` and
+   writes `/etc/lightdm/lightdm.conf.d/99-yserver.conf`. This makes yserver your
+   graphical login, so if it fails to start you'll need a text TTY to recover.
+2. From a free TTY, restart lightdm: `sudo systemctl restart lightdm`.
 
-   ```ini
-   [Seat:*]
-   xserver-command=/usr/local/bin/yserver
-   ```
-3. From a free TTY, restart lightdm: `sudo systemctl restart lightdm`.
+(Or by hand: `just install` for just the binary, then create the conf yourself —
+`[Seat:*]` with `xserver-command=/usr/local/bin/yserver`.)
 
-The greeter appears, you log in, and (unlike the `startx` path) the login
-keyring is unlocked by lightdm's PAM stack.
+The greeter appears, you log in, and the login keyring is unlocked by lightdm's PAM stack.
+
+To undo: `sudo rm /etc/lightdm/lightdm.conf.d/99-yserver.conf && sudo systemctl restart lightdm`.
 
 Known limitation: **VT switching does not work** in a lightdm-launched session
 yet — yserver runs rootful without a logind session there, so it can't use

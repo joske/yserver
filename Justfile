@@ -1,11 +1,20 @@
 KERNEL := "/boot/vmlinuz-linux-cachyos"
 
 # Build a release yserver and install it to /usr/local/bin (needs sudo).
-# Pair with the lightdm setup in the README to use it as your graphical login.
+# Safe + reversible: just the binary, no login changes.
 install:
     cargo build --release --bin yserver
     sudo install -m755 target/release/yserver /usr/local/bin/yserver
-    @echo "installed /usr/local/bin/yserver — see README 'Use with a display manager' to enable it"
+    @echo "installed /usr/local/bin/yserver — 'just install-lightdm' to make it your graphical login"
+
+# Install the binary AND point lightdm at it (your graphical login for all
+# seats). CHANGES YOUR LOGIN: if yserver fails to start you'll need a text TTY
+# to recover. Undo: sudo rm /etc/lightdm/lightdm.conf.d/99-yserver.conf
+install-lightdm: install
+    sudo mkdir -p /etc/lightdm/lightdm.conf.d
+    printf '[Seat:*]\nxserver-command=/usr/local/bin/yserver\n' | sudo tee /etc/lightdm/lightdm.conf.d/99-yserver.conf >/dev/null
+    @echo "lightdm will launch yserver on next start (sudo systemctl restart lightdm)."
+    @echo "Undo: sudo rm /etc/lightdm/lightdm.conf.d/99-yserver.conf && sudo systemctl restart lightdm"
 
 # Run yserver in virtme-ng with virtio-gpu DRM device and a QEMU window.
 yserver:
