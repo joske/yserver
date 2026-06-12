@@ -133,6 +133,19 @@ impl Drop for LockGuard {
     }
 }
 
+/// Removes the temp lock file when `acquire_lock` exits by ANY path —
+/// including `?` error propagation. The success path's hard link
+/// survives the temp's unlink, so unconditional cleanup is safe.
+struct TmpGuard {
+    path: PathBuf,
+}
+
+impl Drop for TmpGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 /// `/tmp/.X<N>-lock` path for a display.
 #[must_use]
 pub fn lock_path(lock_dir: &Path, display: u16) -> PathBuf {
@@ -221,12 +234,14 @@ pub fn acquire_lock(lock_dir: &Path, display: u16) -> io::Result<LockGuard> {
     // Xorg's LockServer READS existing locks). Force 0444 umask-immune,
     // like Xorg's fchmod after create (os/utils.c:312).
     fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o444))?;
+    let _tmp_guard = TmpGuard {
+        path: tmp_path.clone(),
+    };
 
     // At most two attempts: acquire, or reclaim-once-then-acquire.
     for _ in 0..2 {
         match fs::hard_link(&tmp_path, &final_path) {
             Ok(()) => {
-                let _ = fs::remove_file(&tmp_path);
                 return Ok(LockGuard { path: final_path });
             }
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {
@@ -256,7 +271,6 @@ pub fn acquire_lock(lock_dir: &Path, display: u16) -> io::Result<LockGuard> {
                         // (typically Alive → AddrInUse).
                     }
                     LockState::Alive => {
-                        let _ = fs::remove_file(&tmp_path);
                         return Err(io::Error::new(
                             ErrorKind::AddrInUse,
                             format!(
@@ -268,12 +282,10 @@ pub fn acquire_lock(lock_dir: &Path, display: u16) -> io::Result<LockGuard> {
                 }
             }
             Err(e) => {
-                let _ = fs::remove_file(&tmp_path);
                 return Err(e);
             }
         }
     }
-    let _ = fs::remove_file(&tmp_path);
     Err(io::Error::new(
         ErrorKind::AddrInUse,
         format!("could not acquire display lock {}", final_path.display()),
@@ -399,11 +411,12 @@ mod tests {
 
     #[test]
     fn lock_fresh_acquire_creates_file() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = unique_tmp_dir("lock-fresh");
         let guard = acquire_lock(&dir, 5).unwrap();
         let p = lock_path(&dir, 5);
         assert!(p.exists());
+        let tmp = dir.join(format!(".tX5-lock.{}", std::process::id()));
+        assert!(!tmp.exists());
         // Xorg publishes the lock read-only (0444).
         let mode = std::fs::metadata(&p).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o444);
@@ -430,6 +443,8 @@ mod tests {
         let _guard = acquire_lock(&dir, 7).unwrap();
         let err = acquire_lock(&dir, 7).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+        let tmp = dir.join(format!(".tX7-lock.{}", std::process::id()));
+        assert!(!tmp.exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 
