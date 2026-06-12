@@ -127,6 +127,16 @@ Cross-cutting bugs and followups that don't fit a stage live in
   dual-head mutter/muffin. Wire encoder unit tests are in
   `yserver-protocol`; core wiring/build validation is green. Hardware
   Cinnamon smoke on real dual-head is still the remaining proof gate.
+- **2026-06-12 HW text-cursor offset diagnosed/fixed**: `silence` was
+  selecting text above the visible I-beam only with
+  `YSERVER_V2_HW_CURSOR=1`; `eiger`/Asahi looked correct because the
+  driver disables the HW cursor path and falls back to SW composition.
+  Root cause: the steady-state `cursor_plane_move` fast path advanced
+  the DRM cursor plane in root/CRTC coordinates without subtracting the
+  active cursor hotspot, while the SW path and HW bind/rearm paths did.
+  Fixed by threading hotspot-aware root→CRTC translation through show,
+  move, rebind, and pending-move retry so the logical pointer and
+  visible cursor stay aligned.
 - **Bugfixing kicked off 2026-05-26 PM** with Cinnamon validation.
   First live issue: clicks inside `cinnamon-settings` were not
   taking effect even though XI2 ButtonPress/Release reached the

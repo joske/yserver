@@ -588,14 +588,14 @@ pub(crate) struct PlatformBackend {
     /// fixture. The shared dumb buffer + per-CRTC visibility map
     /// live inside `CursorPlane` itself.
     pub(crate) cursor_plane: Option<crate::kms::cursor_plane::CursorPlane>,
-    /// Latest root-space cursor position that the kernel rejected with
-    /// `EBUSY` on at least one CRTC. Re-issued at the next page-flip
-    /// completion (`cursor_plane_drain_pending_move`). Single slot,
-    /// latest-wins — new motion events overwrite stale pending entries
-    /// since X11 motion semantics are "where the cursor IS", not "by
-    /// how much it moved". Cleared on full commit success or on
+    /// Latest root-space cursor position + hotspot that the kernel
+    /// rejected with `EBUSY` on at least one CRTC. Re-issued at the next
+    /// page-flip completion (`cursor_plane_drain_pending_move`). Single
+    /// slot, latest-wins — new motion events overwrite stale pending
+    /// entries since X11 motion semantics are "where the cursor IS", not
+    /// "by how much it moved". Cleared on full commit success or on
     /// `cursor_plane_hide_all` (VT-leave).
-    cursor_pending_move: Option<(i32, i32)>,
+    cursor_pending_move: Option<(i32, i32, u16, u16)>,
     /// Auto-fallback latch: set when a cursor-plane bind ioctl fails
     /// with an errno that means the driver doesn't implement the
     /// (legacy) cursor ioctls at all (Apple DCP / Asahi returns
@@ -1042,8 +1042,7 @@ impl PlatformBackend {
         let crtc = layout.output.crtc;
         let layout_x = layout.x;
         let layout_y = layout.y;
-        let cx = x - layout_x - i32::from(hot_x);
-        let cy = y - layout_y - i32::from(hot_y);
+        let (cx, cy) = cursor_root_to_crtc_local(x, y, layout_x, layout_y, hot_x, hot_y);
         let result = {
             let Some(plane) = self.cursor_plane.as_mut() else {
                 return Err(io::Error::other("cursor plane unavailable"));
@@ -1089,8 +1088,7 @@ impl PlatformBackend {
             if !plane.is_visible_on(crtc) {
                 continue;
             }
-            let cx = x - layout_x - i32::from(hot_x);
-            let cy = y - layout_y - i32::from(hot_y);
+            let (cx, cy) = cursor_root_to_crtc_local(x, y, layout_x, layout_y, hot_x, hot_y);
             if let Err(e) = plane.show(crtc, (i32::from(hot_x), i32::from(hot_y)), cx, cy) {
                 log::warn!("v2 cursor rebind: show on {crtc:?} failed: {e}");
             }
@@ -1112,8 +1110,14 @@ impl PlatformBackend {
     /// # Errors
     /// `Err` only when the plane is unavailable; per-CRTC ioctl
     /// failures are logged + counted (EBUSY) or logged (other).
-    pub(crate) fn cursor_plane_move(&mut self, x: i32, y: i32) -> io::Result<u32> {
-        let ebusy_count = self.try_cursor_plane_move_inner(x, y)?;
+    pub(crate) fn cursor_plane_move(
+        &mut self,
+        x: i32,
+        y: i32,
+        hot_x: u16,
+        hot_y: u16,
+    ) -> io::Result<u32> {
+        let ebusy_count = self.try_cursor_plane_move_inner(x, y, hot_x, hot_y)?;
         // Latest-wins pending slot: if any CRTC EBUSY'd, queue THIS
         // position for retry on the next page-flip-complete. Drop any
         // stale pending — a fresh motion event invalidates older
@@ -1121,7 +1125,7 @@ impl PlatformBackend {
         // path you took"). On full success, clear pending so we don't
         // re-issue a position the kernel already accepted.
         if ebusy_count > 0 {
-            self.cursor_pending_move = Some((x, y));
+            self.cursor_pending_move = Some((x, y, hot_x, hot_y));
         } else {
             self.cursor_pending_move = None;
         }
@@ -1143,10 +1147,10 @@ impl PlatformBackend {
     /// # Errors
     /// `Err` only when the plane is unavailable.
     pub(crate) fn cursor_plane_drain_pending_move(&mut self) -> io::Result<u32> {
-        let Some((x, y)) = self.cursor_pending_move else {
+        let Some((x, y, hot_x, hot_y)) = self.cursor_pending_move else {
             return Ok(0);
         };
-        let ebusy_count = self.try_cursor_plane_move_inner(x, y)?;
+        let ebusy_count = self.try_cursor_plane_move_inner(x, y, hot_x, hot_y)?;
         if ebusy_count == 0 {
             self.cursor_pending_move = None;
         }
@@ -1157,7 +1161,13 @@ impl PlatformBackend {
     /// number of CRTCs whose atomic commit returned `EBUSY`. Shared by
     /// `cursor_plane_move` (first-attempt path) and
     /// `cursor_plane_drain_pending_move` (retry path).
-    fn try_cursor_plane_move_inner(&mut self, x: i32, y: i32) -> io::Result<u32> {
+    fn try_cursor_plane_move_inner(
+        &mut self,
+        x: i32,
+        y: i32,
+        hot_x: u16,
+        hot_y: u16,
+    ) -> io::Result<u32> {
         // Snapshot first (see `cursor_plane_rebind_visible_crtcs`).
         let layouts: Vec<(::drm::control::crtc::Handle, i32, i32)> = self
             .outputs
@@ -1172,8 +1182,7 @@ impl PlatformBackend {
             if !plane.is_visible_on(crtc) {
                 continue;
             }
-            let cx = x - layout_x;
-            let cy = y - layout_y;
+            let (cx, cy) = cursor_root_to_crtc_local(x, y, layout_x, layout_y, hot_x, hot_y);
             if let Err(e) = plane.move_to(crtc, cx, cy) {
                 if e.raw_os_error() == Some(libc::EBUSY) {
                     ebusy_count = ebusy_count.saturating_add(1);
@@ -2493,8 +2502,7 @@ impl PlatformBackend {
                 log::info!("v2 resume rearm_cursor: CRTC={crtc:?} skipped (is_visible_on=false)");
                 continue;
             }
-            let cx = x - layout_x - i32::from(hot_x);
-            let cy = y - layout_y - i32::from(hot_y);
+            let (cx, cy) = cursor_root_to_crtc_local(x, y, layout_x, layout_y, hot_x, hot_y);
             log::info!(
                 "v2 resume rearm_cursor: CRTC={crtc:?} calling plane.show pos=({cx},{cy}) hot=({hot_x},{hot_y})"
             );
@@ -2532,6 +2540,20 @@ impl PlatformBackend {
         // for the scene part. It IS the right place to clear any
         // platform-level inhibit flags on resume.)
     }
+}
+
+fn cursor_root_to_crtc_local(
+    x: i32,
+    y: i32,
+    layout_x: i32,
+    layout_y: i32,
+    hot_x: u16,
+    hot_y: u16,
+) -> (i32, i32) {
+    (
+        x - layout_x - i32::from(hot_x),
+        y - layout_y - i32::from(hot_y),
+    )
 }
 
 #[cfg(test)]
@@ -2631,7 +2653,7 @@ mod tests {
         let mut p = PlatformBackend::for_tests();
         assert_eq!(p.cursor_pending_move, None);
         // Unavailable plane → Err return → pending stays None.
-        assert!(p.cursor_plane_move(100, 200).is_err());
+        assert!(p.cursor_plane_move(100, 200, 0, 0).is_err());
         assert_eq!(p.cursor_pending_move, None);
         // Drain on empty slot is Ok(0) (early-exit before any
         // plane access). The path that returns Err is only the
@@ -2645,7 +2667,7 @@ mod tests {
     #[test]
     fn cursor_plane_hide_all_clears_pending_move() {
         let mut p = PlatformBackend::for_tests();
-        p.cursor_pending_move = Some((123, 456));
+        p.cursor_pending_move = Some((123, 456, 7, 9));
         // hide_all returns Err on the unavailable fixture, but the
         // pending-clear MUST happen before the early-return so a
         // hide-failure mid-recovery leaves no stale pending.
@@ -2661,14 +2683,22 @@ mod tests {
     #[test]
     fn cursor_pending_move_is_latest_wins() {
         let mut p = PlatformBackend::for_tests();
-        p.cursor_pending_move = Some((100, 100));
-        p.cursor_pending_move = Some((200, 250));
-        assert_eq!(p.cursor_pending_move, Some((200, 250)));
+        p.cursor_pending_move = Some((100, 100, 1, 2));
+        p.cursor_pending_move = Some((200, 250, 7, 9));
+        assert_eq!(p.cursor_pending_move, Some((200, 250, 7, 9)));
         // Drain consumes; on the unavailable fixture this errors but
         // the test's invariant is the slot mechanics, not the drain.
         let _ = p.cursor_plane_drain_pending_move();
         // Slot still holds because drain Err'd before clearing.
-        assert_eq!(p.cursor_pending_move, Some((200, 250)));
+        assert_eq!(p.cursor_pending_move, Some((200, 250, 7, 9)));
+    }
+
+    #[test]
+    fn cursor_root_to_crtc_local_subtracts_hotspot() {
+        assert_eq!(
+            cursor_root_to_crtc_local(200, 300, 10, 20, 7, 9),
+            (183, 271)
+        );
     }
 
     /// `invalidate_bo` on a missing entry is a no-op (doesn't

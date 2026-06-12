@@ -5096,7 +5096,12 @@ impl KmsBackendV2 {
                 let cx = new_x as i32;
                 #[allow(clippy::cast_possible_truncation)]
                 let cy = new_y as i32;
-                match self.platform.cursor_plane_move(cx, cy) {
+                let (hot_x, hot_y) = self
+                    .effective_cursor_xid
+                    .and_then(|xid| self.cursor_records.get(&xid))
+                    .map(|rec| (rec.hot_x, rec.hot_y))
+                    .unwrap_or((0, 0));
+                match self.platform.cursor_plane_move(cx, cy, hot_x, hot_y) {
                     Ok(0) => {}
                     Ok(n) => self.telemetry.record_cursor_move_ebusy(u64::from(n)),
                     Err(e) => log::debug!("v2 cursor fast path: move failed: {e}"),

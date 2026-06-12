@@ -438,7 +438,7 @@ mod tests {
         );
         assert!(p.cursor_plane_show_on_crtc(0, 0, 0, 0, 0).is_err());
         assert!(p.cursor_plane_rebind_visible_crtcs(0, 0, 0, 0).is_err());
-        assert!(p.cursor_plane_move(0, 0).is_err());
+        assert!(p.cursor_plane_move(0, 0, 0, 0).is_err());
         assert!(p.cursor_plane_hide_on_crtc(0).is_err());
         assert!(p.cursor_plane_hide_all().is_err());
         assert!(p.cursor_plane_uploaded_version().is_none());
