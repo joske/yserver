@@ -294,9 +294,14 @@ Append to the `tests` module in `crates/yserver/src/launch.rs`:
 
     #[test]
     fn lock_fresh_acquire_creates_file() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = unique_tmp_dir("lock-fresh");
         let guard = acquire_lock(&dir, 5).unwrap();
-        assert!(lock_path(&dir, 5).exists());
+        let p = lock_path(&dir, 5);
+        assert!(p.exists());
+        // Xorg publishes the lock read-only (0444).
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o444);
         drop(guard);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -461,17 +466,25 @@ pub fn acquire_lock(lock_dir: &Path, display: u16) -> io::Result<LockGuard> {
     let tmp_path = lock_dir.join(format!(".tX{display}-lock.{}", std::process::id()));
     let pid_line = format!("{:>10}\n", std::process::id());
 
+    // Create the temp ONCE, outside the retry loop: its content never
+    // changes between attempts, and a 0444 file cannot be re-opened for
+    // write on a second iteration (mode applies at create time; reopening
+    // a read-only file for write is EACCES). The pre-unlink handles a
+    // stale 0444 temp left by a crashed earlier server that had our
+    // (reused) PID.
+    let _ = fs::remove_file(&tmp_path);
+    {
+        let mut tmp = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o444)
+            .open(&tmp_path)?;
+        tmp.write_all(pid_line.as_bytes())?;
+    }
+
     // At most two attempts: acquire, or reclaim-once-then-acquire.
     for _ in 0..2 {
-        {
-            let mut tmp = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o444)
-                .open(&tmp_path)?;
-            tmp.write_all(pid_line.as_bytes())?;
-        }
         match fs::hard_link(&tmp_path, &final_path) {
             Ok(()) => {
                 let _ = fs::remove_file(&tmp_path);
