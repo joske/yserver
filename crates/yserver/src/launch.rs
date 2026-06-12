@@ -8,7 +8,10 @@ use std::{
     io::{self, ErrorKind, Read, Write},
     os::{
         fd::RawFd,
-        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        unix::{
+            fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+            net::{UnixListener, UnixStream},
+        },
     },
     path::{Path, PathBuf},
 };
@@ -292,6 +295,97 @@ pub fn acquire_lock(lock_dir: &Path, display: u16) -> io::Result<LockGuard> {
     ))
 }
 
+fn chmod_socket(path: &Path) -> io::Result<()> {
+    // X clients connect as the invoking user; the socket needs world
+    // write (connect() on AF_UNIX requires `w`). Xorg sets 0777.
+    fs::set_permissions(path, fs::Permissions::from_mode(0o777))
+}
+
+/// Bind `<socket_dir>/X<display>` for the explicit-`:N` and
+/// back-compat-default cases. Probes an existing socket before removing
+/// it: a live server's socket is NEVER stolen (old yservers take no
+/// lock, so holding the lock alone doesn't prove the display is free).
+pub fn bind_explicit(socket_dir: &Path, display: u16) -> io::Result<(UnixListener, PathBuf)> {
+    let path = socket_dir.join(format!("X{display}"));
+    // File-type check FIRST: connect(AF_UNIX) to a non-socket inode
+    // returns ECONNREFUSED on Linux (same errno as a stale socket!), so
+    // errno alone cannot distinguish "dead server's socket" from "some
+    // file that happens to be named X<n>". Never delete a non-socket.
+    // symlink_metadata also refuses symlinks (is_socket() is false).
+    if let Ok(meta) = fs::symlink_metadata(&path) {
+        if !meta.file_type().is_socket() {
+            return Err(io::Error::new(
+                ErrorKind::AddrInUse,
+                format!(
+                    "{} exists and is not a socket — refusing to replace it",
+                    path.display()
+                ),
+            ));
+        }
+        match UnixStream::connect(&path) {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    ErrorKind::AddrInUse,
+                    format!("display :{display} in use (live socket {})", path.display()),
+                ));
+            }
+            Err(e) if e.kind() == ErrorKind::ConnectionRefused => {
+                // Stale socket from a dead server — reclaim it.
+                let _ = fs::remove_file(&path);
+            }
+            Err(_) => {
+                // Occupied/unknown (e.g. EACCES). Be conservative:
+                // refuse rather than delete what we can't identify.
+                return Err(io::Error::new(
+                    ErrorKind::AddrInUse,
+                    format!("cannot probe {} — refusing to replace it", path.display()),
+                ));
+            }
+        }
+    }
+    let listener = UnixListener::bind(&path)?;
+    chmod_socket(&path)?;
+    Ok((listener, path))
+}
+
+/// Scan `0..256` for the lowest free display and bind it. Disambiguates an
+/// existing socket file via `connect()`: refused ⇒ stale ⇒ reclaim;
+/// connected ⇒ live ⇒ skip; other error ⇒ occupied ⇒ skip. Retries on a
+/// `bind()` `EADDRINUSE` race. Takes no lock (matches Xorg `nolock`).
+pub fn autopick(socket_dir: &Path) -> io::Result<(u16, UnixListener, PathBuf)> {
+    for n in 0u16..256 {
+        let path = socket_dir.join(format!("X{n}"));
+        // Same file-type-first rule as bind_explicit: ECONNREFUSED can't
+        // distinguish a stale socket from a non-socket file, and we must
+        // never delete the latter. Non-socket / unreadable ⇒ skip.
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if !meta.file_type().is_socket() => continue,
+            Ok(_) => match UnixStream::connect(&path) {
+                Ok(_) => continue, // live server
+                Err(e) if e.kind() == ErrorKind::ConnectionRefused => {
+                    // Stale socket node — reclaim it.
+                    let _ = fs::remove_file(&path);
+                }
+                Err(_) => continue, // occupied/unknown — leave it alone
+            },
+            Err(e) if e.kind() == ErrorKind::NotFound => {} // free — bind below
+            Err(_) => continue,                             // unreadable — not ours to touch
+        }
+        match UnixListener::bind(&path) {
+            Ok(listener) => {
+                chmod_socket(&path)?;
+                return Ok((n, listener, path));
+            }
+            Err(e) if e.kind() == ErrorKind::AddrInUse => continue, // lost a race
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        ErrorKind::AddrInUse,
+        "no free X display in 0..256",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,6 +572,123 @@ mod tests {
         let guard = acquire_lock(&dir, 10).unwrap();
         assert!(lock_path(&dir, 10).exists());
         drop(guard);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    use std::os::unix::net::UnixListener as TestListener;
+
+    #[test]
+    fn bind_explicit_binds_and_chmods() {
+        let dir = unique_tmp_dir("bind-explicit");
+        let (listener, path) = bind_explicit(&dir, 3).unwrap();
+        assert_eq!(path, dir.join("X3"));
+        assert!(path.exists());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o777);
+        drop(listener);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn autopick_empty_dir_picks_zero() {
+        let dir = unique_tmp_dir("autopick-empty");
+        let (n, listener, path) = autopick(&dir).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(path, dir.join("X0"));
+        drop(listener);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn autopick_skips_live_socket() {
+        let dir = unique_tmp_dir("autopick-live");
+        // A live listener on X0 — keep it bound for the duration.
+        let live = TestListener::bind(dir.join("X0")).unwrap();
+        let (n, listener, _path) = autopick(&dir).unwrap();
+        assert_eq!(n, 1);
+        drop(listener);
+        drop(live);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn autopick_reclaims_stale_socket() {
+        let dir = unique_tmp_dir("autopick-stale");
+        // Bind then drop: the socket node remains on disk with no
+        // listener (Rust does not unlink on drop) → a faithful stale
+        // socket. connect() → ECONNREFUSED → reclaim.
+        let stale = TestListener::bind(dir.join("X0")).unwrap();
+        drop(stale);
+        assert!(dir.join("X0").exists());
+        let (n, listener, _path) = autopick(&dir).unwrap();
+        assert_eq!(n, 0);
+        drop(listener);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn autopick_skips_non_socket_file() {
+        // A regular file named X0: the file-type check skips it without
+        // deleting. (connect() to a non-socket gives ECONNREFUSED on
+        // Linux — same errno as a stale socket — so the type check, not
+        // errno, is what protects the file.)
+        let dir = unique_tmp_dir("autopick-notsock");
+        std::fs::write(dir.join("X0"), b"junk").unwrap();
+        let (n, listener, _path) = autopick(&dir).unwrap();
+        assert_eq!(n, 1);
+        assert!(dir.join("X0").exists()); // untouched
+        drop(listener);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bind_explicit_refuses_non_socket_file() {
+        let dir = unique_tmp_dir("bind-notsock");
+        std::fs::write(dir.join("X6"), b"junk").unwrap();
+        let err = bind_explicit(&dir, 6).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+        assert!(dir.join("X6").exists()); // untouched
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bind_explicit_refuses_live_socket() {
+        // Explicit bind must never steal a live server's socket — probe
+        // first, error AddrInUse if something is listening.
+        let dir = unique_tmp_dir("bind-live");
+        let live = TestListener::bind(dir.join("X4")).unwrap();
+        let err = bind_explicit(&dir, 4).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+        drop(live);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bind_explicit_reclaims_stale_socket() {
+        let dir = unique_tmp_dir("bind-stale");
+        let stale = TestListener::bind(dir.join("X5")).unwrap();
+        drop(stale);
+        assert!(dir.join("X5").exists());
+        let (listener, path) = bind_explicit(&dir, 5).unwrap();
+        assert_eq!(path, dir.join("X5"));
+        drop(listener);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn lock_released_when_bind_fails() {
+        // Mimics run()'s error path: `?` after acquire_lock drops the
+        // guard, which must remove the lock — never leave a lock we
+        // don't back with a live socket.
+        let dir = unique_tmp_dir("lock-bind-fail");
+        let res: std::io::Result<()> = (|| {
+            let _guard = acquire_lock(&dir, 11)?;
+            let missing = dir.join("no-such-subdir");
+            let _ = bind_explicit(&missing, 11)?; // fails: dir doesn't exist
+            Ok(())
+        })();
+        assert!(res.is_err());
+        assert!(!lock_path(&dir, 11).exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 }
