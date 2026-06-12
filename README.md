@@ -1,6 +1,6 @@
 # yserver
 
-A modern X11 server written from scratch in Rust.
+A modern X11 server slop-coded from other people's laundered code in Rust.
 
 The goal is not to clone Xorg. It is to provide a practical X11 server that
 runs real desktop environments, window managers, and applications on modern
