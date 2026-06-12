@@ -344,6 +344,18 @@ Append to the `tests` module in `crates/yserver/src/launch.rs`:
         drop(guard);
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn lock_short_numeric_contents_are_bogus() {
+        // Xorg reads exactly 11 bytes ("%10d\n"); a short numeric file is
+        // not a valid lock and must be reclaimed, not trusted.
+        let dir = unique_tmp_dir("lock-short");
+        std::fs::write(lock_path(&dir, 10), b"123\n").unwrap();
+        let guard = acquire_lock(&dir, 10).unwrap();
+        assert!(lock_path(&dir, 10).exists());
+        drop(guard);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -405,9 +417,16 @@ fn inspect_lock(path: &Path) -> io::Result<LockState> {
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(LockState::Stale),
         Err(e) => return Err(e),
     };
-    let mut buf = [0u8; 11];
-    let n = f.read(&mut buf).unwrap_or(0);
-    let text = std::str::from_utf8(&buf[..n]).unwrap_or("").trim();
+    // Xorg's lock format is exactly "%10d\n" = 11 bytes. Read into a
+    // 12-byte buffer so an over-long file is detectable (n == 12). A
+    // genuine I/O error propagates — never classify an unreadable lock
+    // as bogus (that would delete a lock we couldn't actually inspect).
+    let mut buf = [0u8; 12];
+    let n = f.read(&mut buf)?;
+    if n != 11 || buf[10] != b'\n' {
+        return Ok(LockState::Bogus);
+    }
+    let text = std::str::from_utf8(&buf[..11]).unwrap_or("").trim();
     let pid: i32 = match text.parse() {
         Ok(p) if p > 0 => p,
         _ => return Ok(LockState::Bogus),
@@ -429,7 +448,14 @@ fn inspect_lock(path: &Path) -> io::Result<LockState> {
 /// Errors with `AddrInUse` if a live server owns the display.
 pub fn acquire_lock(lock_dir: &Path, display: u16) -> io::Result<LockGuard> {
     let final_path = lock_path(lock_dir, display);
-    let tmp_path = lock_dir.join(format!(".tX{display}-lock"));
+    // PID-suffixed temp name: each starter owns a unique temp file, so two
+    // concurrent starters can never clobber each other's temp before the
+    // atomic link() (a fixed name would let the winner link a file holding
+    // the LOSER's pid, corrupting later stale/live detection). Deviation
+    // from Xorg's fixed ".tX<N>-lock": race-free without Xorg's
+    // O_EXCL+retry dance; a crash can orphan one 11-byte temp file, which
+    // is harmless (nothing inspects temp names).
+    let tmp_path = lock_dir.join(format!(".tX{display}-lock.{}", std::process::id()));
     let pid_line = format!("{:>10}\n", std::process::id());
 
     // At most two attempts: acquire, or reclaim-once-then-acquire.
@@ -556,6 +582,61 @@ Append to the `tests` module:
         drop(listener);
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn autopick_skips_non_socket_file() {
+        // A regular file named X0: connect() fails with something other
+        // than ECONNREFUSED (ENOTSOCK) → "occupied/unknown" → skip, do
+        // NOT delete.
+        let dir = unique_tmp_dir("autopick-notsock");
+        std::fs::write(dir.join("X0"), b"junk").unwrap();
+        let (n, listener, _path) = autopick(&dir).unwrap();
+        assert_eq!(n, 1);
+        assert!(dir.join("X0").exists()); // untouched
+        drop(listener);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bind_explicit_refuses_live_socket() {
+        // Explicit bind must never steal a live server's socket — probe
+        // first, error AddrInUse if something is listening.
+        let dir = unique_tmp_dir("bind-live");
+        let live = TestListener::bind(dir.join("X4")).unwrap();
+        let err = bind_explicit(&dir, 4).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+        drop(live);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bind_explicit_reclaims_stale_socket() {
+        let dir = unique_tmp_dir("bind-stale");
+        let stale = TestListener::bind(dir.join("X5")).unwrap();
+        drop(stale);
+        assert!(dir.join("X5").exists());
+        let (listener, path) = bind_explicit(&dir, 5).unwrap();
+        assert_eq!(path, dir.join("X5"));
+        drop(listener);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn lock_released_when_bind_fails() {
+        // Mimics run()'s error path: `?` after acquire_lock drops the
+        // guard, which must remove the lock — never leave a lock we
+        // don't back with a live socket.
+        let dir = unique_tmp_dir("lock-bind-fail");
+        let res: std::io::Result<()> = (|| {
+            let _guard = acquire_lock(&dir, 11)?;
+            let missing = dir.join("no-such-subdir");
+            let _ = bind_explicit(&missing, 11)?; // fails: dir doesn't exist
+            Ok(())
+        })();
+        assert!(res.is_err());
+        assert!(!lock_path(&dir, 11).exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -581,17 +662,37 @@ fn chmod_socket(path: &Path) -> io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o777))
 }
 
-/// Bind `<socket_dir>/X<display>`, removing a stale socket file first.
-/// Used for the explicit-`:N` and back-compat-default cases.
+/// Bind `<socket_dir>/X<display>` for the explicit-`:N` and
+/// back-compat-default cases. Probes an existing socket before removing
+/// it: a live server's socket is NEVER stolen (old yservers take no
+/// lock, so holding the lock alone doesn't prove the display is free).
 pub fn bind_explicit(
     socket_dir: &Path,
     display: u16,
 ) -> io::Result<(UnixListener, PathBuf)> {
     let path = socket_dir.join(format!("X{display}"));
-    match fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
+    if path.exists() {
+        match UnixStream::connect(&path) {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    ErrorKind::AddrInUse,
+                    format!("display :{display} in use (live socket {})", path.display()),
+                ));
+            }
+            Err(e) if e.kind() == ErrorKind::ConnectionRefused => {
+                // Stale node from a dead server — reclaim it.
+                let _ = fs::remove_file(&path);
+            }
+            Err(_) => {
+                // Occupied/unknown (e.g. ENOTSOCK, EACCES). Be
+                // conservative: refuse rather than delete what we can't
+                // identify.
+                return Err(io::Error::new(
+                    ErrorKind::AddrInUse,
+                    format!("cannot probe {} — refusing to replace it", path.display()),
+                ));
+            }
+        }
     }
     let listener = UnixListener::bind(&path)?;
     chmod_socket(&path)?;
@@ -679,12 +780,15 @@ Append to the `tests` module:
 
     #[test]
     fn sigusr1_disposition_roundtrip() {
-        // Process-global: set IGN, observe true, restore DFL, observe
-        // false. No other unit test touches SIGUSR1 disposition.
-        unsafe { libc::signal(libc::SIGUSR1, libc::SIG_IGN) };
+        // Process-global: save the prior disposition and restore it at
+        // the end (SIG_DFL is not necessarily what we started with). No
+        // other unit test in this crate touches SIGUSR1 disposition —
+        // keep it that way (tests share one process).
+        let prev = unsafe { libc::signal(libc::SIGUSR1, libc::SIG_IGN) };
         assert!(sigusr1_is_ignored());
         unsafe { libc::signal(libc::SIGUSR1, libc::SIG_DFL) };
         assert!(!sigusr1_is_ignored());
+        unsafe { libc::signal(libc::SIGUSR1, prev) };
     }
 ```
 
@@ -699,7 +803,9 @@ Add (after `autopick`):
 
 ```rust
 /// Write `"<display>\n"` (Xorg's `-displayfd` format) to `fd`, then close
-/// it. Used only when `-displayfd N` was given.
+/// it. Used only when `-displayfd N` was given. Close errors are ignored:
+/// the fd is single-use and there is nothing actionable after the payload
+/// was written.
 pub fn write_displayfd(fd: RawFd, display: u16) -> io::Result<()> {
     let s = format!("{display}\n");
     let bytes = s.as_bytes();
@@ -717,6 +823,14 @@ pub fn write_displayfd(fd: RawFd, display: u16) -> io::Result<()> {
             let err = io::Error::last_os_error();
             unsafe { libc::close(fd) };
             return Err(err);
+        }
+        if r == 0 {
+            // A zero-length write would loop forever — fail instead.
+            unsafe { libc::close(fd) };
+            return Err(io::Error::new(
+                ErrorKind::WriteZero,
+                "displayfd write returned 0",
+            ));
         }
         written += r as usize;
     }
@@ -883,6 +997,12 @@ with:
 
 > Note: this removes the only uses of the bare `UnixListener` import in `lib.rs`. After editing, if `cargo clippy` flags `unused_import` for `std::os::unix::net::UnixListener` or `std::os::unix::fs::PermissionsExt`, remove them from the top-of-file `use` block (Step 6 lint will catch this).
 
+> Behavior change vs. today: the old inline code unconditionally removed
+> `X{display}` before binding; `bind_explicit` probes first and refuses a
+> live socket with `AddrInUse`. Intentional — never steal a running
+> server's display. A genuinely stale socket (crashed server) still
+> reclaims exactly as before (`ECONNREFUSED` → remove).
+
 - [ ] **Step 3: Signal readiness just before entering the core loop**
 
 In `lib.rs`, immediately before the `let result = core_loop::run_core(` line (≈ 352), insert:
@@ -1036,8 +1156,8 @@ Note the machine, date, and outcome (greeter shown? lock created? clean cycle?) 
 **Spec coverage:**
 - Item 1 (argv) → Task 1 (`parse_args`, all documented tokens + tolerance/error rules).
 - Display resolution table → Task 1 (`resolve`, all four rows tested).
-- Display auto-selection + stale/live/race handling → Task 3 (`autopick`).
-- Lockfile protocol (temp+link, O_NOFOLLOW, stale/bogus reclaim, EPERM=alive, error-path release, socket-then-lock ordering) → Task 2 (`acquire_lock`/`inspect_lock`/`LockGuard`) + Task 5 Step 2 (guard lifetime/ordering).
+- Display auto-selection + stale/live/non-socket handling → Task 3 (`autopick`); the `EADDRINUSE` bind-race `continue` branch is straight-line code that cannot be hit deterministically in a unit test — verified by inspection.
+- Lockfile protocol (PID-suffixed temp + atomic link, O_NOFOLLOW, strict 11-byte format, stale/bogus reclaim, EPERM=alive, error-path release tested in `lock_released_when_bind_fails`, socket-then-lock ordering by code structure + HW smoke Task 6 Step 4) → Task 2 (`acquire_lock`/`inspect_lock`/`LockGuard`) + Task 3 + Task 5 Step 2 (guard lifetime/ordering).
 - Item 2 readiness (`-displayfd` format, SIGUSR1 disposition query, kill(getppid)) → Task 4; timing (before core loop) → Task 5 Step 3.
 - `run()` signature change + thin shim → Task 5 Steps 1/4.
 - First light (unauthenticated; tolerate presented cookie) → already true in existing code (spec Key facts); verified by Task 6 Step 3.

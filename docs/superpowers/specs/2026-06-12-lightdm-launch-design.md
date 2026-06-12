@@ -171,8 +171,14 @@ lockfile column is implemented by component 2b below.
 Binding per case:
 
 - **Explicit display** and **back-compat default**: acquire the lockfile
-  (component 2b), then keep the current "remove stale socket, then bind"
-  behavior.
+  (component 2b, when the table says so), then **probe** any existing
+  socket before removing it: `connect()` succeeds ⇒ a live server owns the
+  display ⇒ hard error (`AddrInUse`) — never steal it (old yservers take
+  no lock, so holding the lock alone doesn't prove the display free);
+  `ECONNREFUSED` ⇒ stale ⇒ remove + bind; any other probe error ⇒ refuse
+  conservatively rather than delete something unidentified. (Behavior
+  change vs. the old inline code, which removed the socket
+  unconditionally.)
 - **Auto-pick**: scan `/tmp/.X11-unix/Xk` for `k` in `0..256` and bind the
   lowest free one. For an existing socket file, `connect()` first to
   disambiguate:
@@ -202,13 +208,20 @@ cleanups, **before** binding the socket. Create is done via a temp file + atomic
 a direct `O_EXCL`, so a partially-written or empty final lock is never
 observable by a concurrent launcher:
 
-1. Write PID `"%10d\n"` (11 bytes) into `/tmp/.tX<N>-lock`, `chmod 0444`,
-   then `link()` it to `/tmp/.X<N>-lock` and `unlink` the temp file. A
-   successful `link()` is the atomic "we won" signal.
+1. Write PID `"%10d\n"` (11 bytes) into a **PID-suffixed** temp file
+   `/tmp/.tX<N>-lock.<pid>`, `chmod 0444`, then `link()` it to
+   `/tmp/.X<N>-lock` and `unlink` the temp file. A successful `link()` is
+   the atomic "we won" signal. (Deviation from Xorg's fixed `.tX<N>-lock`
+   temp name: with a fixed name two concurrent starters can clobber each
+   other's temp before the `link()`, letting the winner publish a lock
+   holding the *loser's* PID; the PID suffix makes each starter's temp
+   unique. A crash can orphan one 11-byte temp file — harmless.)
 2. If `link()` fails with `EEXIST`, inspect the existing lock — opened
    `O_RDONLY | O_NOFOLLOW` (refuse to follow a symlink):
-   - **Malformed / short / non-numeric** contents ⇒ treat as bogus ⇒
-     remove and retry the link once.
+   - **Malformed contents** (not exactly 11 bytes ending in `\n`, or a
+     non-positive/non-numeric PID field) ⇒ treat as bogus ⇒ remove and
+     retry the link once. A genuine *read error* propagates instead —
+     never delete a lock that couldn't actually be inspected.
    - Parse the PID and `kill(pid, 0)`:
      - success **or `EPERM`** ⇒ process alive (a live server owned by
        another user still counts) ⇒ display in use ⇒ for explicit `:N`,
@@ -301,16 +314,22 @@ build options → call `run`.
   unknown-flag tolerance; arg-consuming flags; malformed-explicit errors;
   missing-value errors.
 - **Display auto-pick:** tempdir-based test of the scan / stale-socket /
-  live-socket logic plus the `EADDRINUSE` bind-race retry and the
-  "non-`ECONNREFUSED` ⇒ skip, don't delete" branch (create dummy socket
-  files and a live listener).
+  live-socket logic and the "non-`ECONNREFUSED` ⇒ skip, don't delete"
+  branch (a regular file named `Xk` exercises it via `ENOTSOCK`). The
+  `EADDRINUSE` bind-race `continue` branch cannot be hit deterministically
+  in a unit test (it needs a socket to appear between the existence check
+  and the `bind()`) — verified by inspection.
+- **Explicit bind:** live socket refused (`AddrInUse`), stale socket
+  reclaimed, chmod 0777 applied.
 - **Lockfile protocol:** tempdir-based test of the temp-file + atomic
   `link()` create; the stale-lock (`kill(pid,0)` → `ESRCH`)
   remove-and-retry path; the live-lock collision (hard error for explicit
-  `:N`); malformed/short lock contents treated as bogus + reclaimed; and
-  the error-path release (lock removed when a simulated bind failure
-  follows acquisition). Cleanup ordering (socket-then-lock) is asserted by
-  checking the lock outlives the socket during teardown.
+  `:N`); malformed (non-11-byte / short-numeric / non-numeric) lock
+  contents treated as bogus + reclaimed; and the error-path release (lock
+  removed when a bind failure follows acquisition — `?` drops the guard).
+  Cleanup ordering (socket-then-lock) follows from code structure (the
+  guard is dropped at end-of-`run()`, after the socket `remove_file`) and
+  is observed in the HW smoke's restart-cycle check.
 - **`write_displayfd`:** unit-test via a `pipe()` — write to the write
   end, assert `"<N>\n"` on the read end.
 - **SIGUSR1-disposition path:** not unit-testable (process-global signal
