@@ -5625,7 +5625,7 @@ pub fn write_xcmisc_get_xid_range_reply(
 ) -> io::Result<()> {
     let mut out = vec![1u8, 0];
     write_u16(byte_order, &mut out, sequence.0);
-    write_u32(byte_order, &mut out, 0);
+    write_u32(byte_order, &mut out, 0); // reply length
     write_u32(byte_order, &mut out, start_id);
     write_u32(byte_order, &mut out, count);
     out.extend_from_slice(&[0u8; 16]); // pad to 32 bytes

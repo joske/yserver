@@ -23265,7 +23265,7 @@ fn largest_free_xid_gap(base: u32, mask: u32, used_sorted: &[u32]) -> (u32, u32)
         (0, 1)
     } else {
         #[allow(clippy::cast_possible_truncation)]
-        (best_start, best_len as u32) // len ≤ mask+1 ≤ u32 range
+        (best_start, best_len as u32) // len ≤ hi - lo + 1 ≤ hi ≤ u32::MAX
     }
 }
 
