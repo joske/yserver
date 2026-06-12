@@ -464,29 +464,49 @@ pub fn sigusr1_is_ignored() -> bool {
     rc == 0 && old.sa_sigaction == libc::SIG_IGN
 }
 
-/// Send SIGUSR1 to the parent (the DM), matching Xorg's `NotifyParentProcess`
-/// (`ParentProcess = getppid()`). Skips PID 1 — if we were reparented to
-/// init there is no DM to notify.
-pub fn signal_ready_to_parent() {
+/// Capture the parent PID once at startup — Xorg's `InitParentProcess`
+/// (`os/connection.c`). Returns `None` if already orphaned (`ppid <= 1`,
+/// no DM to signal). MUST be called early, before long init during which
+/// the parent could die and reparent us to a subreaper or PID 1.
+#[must_use]
+pub fn startup_parent_pid() -> Option<i32> {
     let ppid = unsafe { libc::getppid() };
-    if ppid > 1 {
-        unsafe { libc::kill(ppid, libc::SIGUSR1) };
-    }
+    if ppid > 1 { Some(ppid) } else { None }
+}
+
+/// Send SIGUSR1 to the parent (the DM) captured at startup, matching
+/// Xorg's `NotifyParentProcess` (`ParentProcess` set in
+/// `InitParentProcess`). `parent_pid` comes from [`startup_parent_pid`].
+pub fn signal_ready_to_parent(parent_pid: i32) {
+    // SAFETY: kill to a captured PID; harmless if it's since exited.
+    unsafe { libc::kill(parent_pid, libc::SIGUSR1) };
 }
 
 /// Perform the readiness handshake: report the chosen display on
-/// `-displayfd` (if given) and signal the parent (if SIGUSR1 was inherited
-/// ignored). Call once, just before entering the core loop.
+/// `-displayfd` (if given) and signal the startup-captured parent (if
+/// SIGUSR1 was inherited ignored). Call once, just before the core loop.
 #[allow(clippy::collapsible_if)]
-pub fn signal_ready(opts: &LaunchOptions, display: u16, sigusr1_was_ignored: bool) {
+pub fn signal_ready(
+    opts: &LaunchOptions,
+    display: u16,
+    sigusr1_was_ignored: bool,
+    parent_pid: Option<i32>,
+) {
     if let Some(fd) = opts.displayfd {
         if let Err(e) = write_displayfd(fd, display) {
             log::warn!("yserver: failed to write -displayfd {fd}: {e}");
         }
     }
     if sigusr1_was_ignored {
-        log::info!("yserver: signaling readiness to parent (SIGUSR1)");
-        signal_ready_to_parent();
+        match parent_pid {
+            Some(pid) => {
+                log::info!("yserver: signaling readiness to parent {pid} (SIGUSR1)");
+                signal_ready_to_parent(pid);
+            }
+            None => log::warn!(
+                "yserver: SIGUSR1 inherited-ignored but orphaned at startup — no parent to signal"
+            ),
+        }
     }
 }
 
@@ -831,5 +851,11 @@ mod tests {
         assert!(sigusr1_is_ignored());
         unsafe { libc::signal(libc::SIGUSR1, libc::SIG_DFL) };
         assert!(!sigusr1_is_ignored());
+    }
+
+    #[test]
+    fn startup_parent_pid_is_some_under_test_runner() {
+        // The test process always has a real parent (the harness), ppid > 1.
+        assert!(startup_parent_pid().is_some());
     }
 }

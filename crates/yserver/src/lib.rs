@@ -50,6 +50,11 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // If the DM started us with SIGUSR1 ignored, we signal it when ready.
     let sigusr1_was_ignored = launch::sigusr1_is_ignored();
 
+    // Capture the parent (DM) PID now, before long init — if the parent
+    // dies during startup and we get reparented, getppid() at readiness
+    // would point at a subreaper or PID 1. Xorg captures it the same way.
+    let parent_pid = launch::startup_parent_pid();
+
     // Vulkan-call-rate telemetry: emit a per-second snapshot of
     // call counters from `kms::vk::call_stats::VK_CALLS`. Gated on
     // the same `YSERVER_LOOP_TELEMETRY` env var the core-loop
@@ -356,7 +361,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // bound + chmod'd, and the lock is held — we can complete an initial X
     // connection setup now. This is the analog of Xorg signaling after
     // CreateConnectionBlock() and before Dispatch().
-    launch::signal_ready(&opts, display, sigusr1_was_ignored);
+    launch::signal_ready(&opts, display, sigusr1_was_ignored, parent_pid);
 
     let alloc = ClientIdAllocator::new();
     log::info!("yserver: entering single-threaded core loop");
