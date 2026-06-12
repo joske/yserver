@@ -4569,3 +4569,26 @@ Main fixes that moved the case:
 
 The remaining `UNSUPPORTED` TP is the existing non-actionable XTS
 bucket rather than a live KMS regression in `XFillRectangle`.
+
+## XC-MISC 1.1 (branch `feat/xcmisc`, 2026-06-12)
+
+**Status: IMPLEMENTED and probe-verified.** XC-MISC (major opcode 152,
+minor version 1.1) is fully wired: `GetVersion` (opcode 0), `GetXIDRange`
+(opcode 1), and `GetXIDList` (opcode 2). This fixes the silent WM/client
+death caused by XID-range exhaustion — libxcb calls `xcb_generate_id`
+which, with no XC-MISC extension present, wraps at 2^20 (1 048 576) ids
+and returns `0xffffffff` for every subsequent allocation. Clients hit
+`BadIDChoice` on those ids; GDK-based clients (muffin, marco, most GTK
+apps) treat the first `BadIDChoice` as fatal and exit, silently killing
+the window manager and eventually the entire session after roughly two
+hours of desktop use. With XC-MISC, the server hands the client a fresh
+XID range on demand via `GetXIDRange` and individual ids via
+`GetXIDList`; libxcb's exhaustion path calls these automatically and
+recycling proceeds transparently.
+
+Verified by `tools/xid-exhaust-probe`: **RED pre-fix** — exhausted at
+exactly 1 048 576 ids with no recycling; **GREEN post-fix** — 1 310 718
+ids allocated across the range wrap under ynest, server log confirms
+`GetXIDRange` firing at the wrap boundary. Wire encoder unit tests are
+in `yserver-protocol`; core wiring is in `yserver-core`. `cargo test
+--locked` workspace-green; plain clippy + nightly fmt clean.
