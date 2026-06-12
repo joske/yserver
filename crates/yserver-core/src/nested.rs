@@ -88,6 +88,7 @@ pub(crate) const DPMS_MAJOR_OPCODE: u8 = 134;
 
 pub(crate) const MIT_SCREEN_SAVER_MAJOR_OPCODE: u8 = 150;
 pub(crate) const XINERAMA_MAJOR_OPCODE: u8 = 151;
+pub(crate) const XCMISC_MAJOR_OPCODE: u8 = 152;
 // MUST be <= 127: X event codes are 7-bit (2..=127); bit 0x80 is the
 // SendEvent/synthetic flag, so a base first_event with the high bit set is
 // illegal and strict clients (Google Chrome's X11 layer) abort on it. 92 is
@@ -316,6 +317,15 @@ pub(crate) const EXTENSIONS: &[ExtensionMetadata] = &[
     ExtensionMetadata {
         name: "X-Resource",
         major_opcode: X_RESOURCE_MAJOR_OPCODE,
+        first_event: 0,
+        event_count: 0,
+        first_error: 0,
+        availability: ExtensionAvailability::Always,
+        unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
+    },
+    ExtensionMetadata {
+        name: "XC-MISC",
+        major_opcode: XCMISC_MAJOR_OPCODE,
         first_event: 0,
         event_count: 0,
         first_error: 0,

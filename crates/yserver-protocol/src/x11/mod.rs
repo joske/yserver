@@ -5597,6 +5597,22 @@ pub fn write_render_query_version_reply(
     writer.write_all(&out)
 }
 
+/// XC-MISC GetVersion reply — fixed 32 bytes, version 1.1 (Xorg
+/// echoes its own version regardless of the client's ask).
+pub fn write_xcmisc_get_version_reply(
+    writer: &mut impl Write,
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+) -> io::Result<()> {
+    let mut out = vec![1u8, 0];
+    write_u16(byte_order, &mut out, sequence.0);
+    write_u32(byte_order, &mut out, 0); // reply length
+    write_u16(byte_order, &mut out, 1); // major
+    write_u16(byte_order, &mut out, 1); // minor
+    out.extend_from_slice(&[0u8; 20]);
+    writer.write_all(&out)
+}
+
 pub mod error {
     pub const BAD_REQUEST: u8 = 1;
     pub const BAD_VALUE: u8 = 2;

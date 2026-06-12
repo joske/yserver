@@ -404,6 +404,8 @@ pub fn process_request(
         149 => handle_x_resource_request(state, client_id, sequence, header, body),
         // ── MIT-SCREEN-SAVER extension dispatcher ──
         150 => handle_screen_saver_request(state, backend, client_id, sequence, header, body),
+        // ── XC-MISC extension dispatcher ──
+        152 => handle_xcmisc_request(state, client_id, sequence, header, body),
         opcode => {
             debug!(
                 "client {} #{} unsupported opcode {} ({} bytes)",
@@ -23223,6 +23225,57 @@ fn emit_xi2_device_changed_bootstrap(
     Ok(())
 }
 
+/// XC-MISC (major opcode 152) — XID recycling for long-lived clients.
+/// Spec docs/superpowers/specs/2026-06-12-xcmisc-design.md; Xorg ref
+/// Xext/xcmisc.c. Length validation lives here because the top-level
+/// exact-length table is core-opcode-only.
+fn handle_xcmisc_request(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    use yserver_protocol::x11::ClientByteOrder;
+    let byte_order = state
+        .clients
+        .get(&client_id.0)
+        .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
+    let minor = header.data;
+    match minor {
+        // GetVersion — req 8 bytes (client version, ignored).
+        0 => {
+            if body.len() != 4 {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    header.opcode,
+                );
+            }
+            let mut buf: Vec<u8> = Vec::with_capacity(32);
+            x11::write_xcmisc_get_version_reply(&mut buf, byte_order, sequence)?;
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            Ok(write_to_client(client, client_id, &buf))
+        }
+        // GetXIDRange / GetXIDList — Tasks 4 and 5.
+        other => emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_REQUEST,
+            0,
+            u16::from(other),
+            header.opcode,
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -40885,5 +40938,77 @@ mod tests {
             s.contains("GLX_SGIX_fbconfig"),
             "glx_extension_string must contain GLX_SGIX_fbconfig when supported"
         );
+    }
+
+    // NOTE: the 3rd argument is the SEQUENCE number, not a client id —
+    // every request in these tests comes from ClientId(1).
+    fn send_xcmisc(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        seq: u16,
+        minor: u8,
+        body: &[u8],
+    ) {
+        process_request(
+            state,
+            backend,
+            ClientId(1),
+            SequenceNumber(seq),
+            RequestHeader {
+                opcode: 152,
+                data: minor,
+                length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+            },
+            body,
+            None,
+        )
+        .expect("process_request");
+    }
+
+    #[test]
+    fn xcmisc_get_version_replies_1_1() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // GetVersion body: client major(2), minor(2) — values ignored.
+        let body = [0u8, 0, 0, 0];
+        send_xcmisc(&mut state, &mut backend, 1, 0, &body);
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 32, "fixed 32-byte reply, got {bytes:02x?}");
+        assert_eq!(bytes[0], 1, "X_Reply");
+        assert_eq!(&bytes[2..4], &1u16.to_le_bytes(), "sequence");
+        assert_eq!(&bytes[8..10], &1u16.to_le_bytes(), "major=1");
+        assert_eq!(&bytes[10..12], &1u16.to_le_bytes(), "minor=1");
+    }
+
+    #[test]
+    fn xcmisc_bad_length_and_unknown_minor() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // GetVersion with wrong body size → BadLength.
+        send_xcmisc(&mut state, &mut backend, 1, 0, &[0u8; 8]);
+        let bytes = read_all_available(&mut peer);
+        assert!(bytes.len() >= 32);
+        assert_eq!(bytes[1], x11::error::BAD_LENGTH);
+        assert_eq!(bytes[10], 152, "major opcode");
+        assert_eq!(&bytes[8..10], &0u16.to_le_bytes(), "minor 0 echoed");
+        // Unknown minor 3 → BadRequest (Xorg dispatcher default).
+        send_xcmisc(&mut state, &mut backend, 2, 3, &[]);
+        let bytes = read_all_available(&mut peer);
+        assert!(bytes.len() >= 32);
+        assert_eq!(bytes[1], x11::error::BAD_REQUEST);
+        assert_eq!(&bytes[8..10], &3u16.to_le_bytes(), "minor 3 echoed");
+    }
+
+    #[test]
+    fn xcmisc_advertised_in_query_and_list_extensions() {
+        // QueryExtension "XC-MISC" → present with major 152; covered via
+        // extension_query_reply + advertised_extension_names directly
+        // (cheaper than wire round-trips; they are what the handlers use).
+        let mut backend = RecordingBackend::new();
+        let reply = extension_query_reply("XC-MISC", &mut backend);
+        assert_eq!(reply, Some((152, 0, 0)));
+        assert!(advertised_extension_names(&mut backend).contains(&"XC-MISC"));
     }
 }
