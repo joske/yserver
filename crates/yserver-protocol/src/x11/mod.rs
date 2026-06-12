@@ -5615,6 +5615,23 @@ pub fn write_xcmisc_get_version_reply(
     writer.write_all(&out)
 }
 
+/// XC-MISC GetXIDRange reply — fixed 32 bytes.
+pub fn write_xcmisc_get_xid_range_reply(
+    writer: &mut impl Write,
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    start_id: u32,
+    count: u32,
+) -> io::Result<()> {
+    let mut out = vec![1u8, 0];
+    write_u16(byte_order, &mut out, sequence.0);
+    write_u32(byte_order, &mut out, 0);
+    write_u32(byte_order, &mut out, start_id);
+    write_u32(byte_order, &mut out, count);
+    out.extend_from_slice(&[0u8; 16]); // pad to 32 bytes
+    writer.write_all(&out)
+}
+
 pub mod error {
     pub const BAD_REQUEST: u8 = 1;
     pub const BAD_VALUE: u8 = 2;
