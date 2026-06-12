@@ -371,7 +371,7 @@ Add to the top-of-file `use` block in `crates/yserver/src/launch.rs`:
 use std::fs::{self, OpenOptions};
 use std::io::{self, ErrorKind, Read, Write};
 use std::os::fd::RawFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 ```
 
@@ -407,7 +407,7 @@ enum LockState {
 }
 
 fn inspect_lock(path: &Path) -> io::Result<LockState> {
-    let mut f = match OpenOptions::new()
+    let f = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
@@ -417,13 +417,16 @@ fn inspect_lock(path: &Path) -> io::Result<LockState> {
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(LockState::Stale),
         Err(e) => return Err(e),
     };
-    // Xorg's lock format is exactly "%10d\n" = 11 bytes. Read into a
-    // 12-byte buffer so an over-long file is detectable (n == 12). A
-    // genuine I/O error propagates — never classify an unreadable lock
-    // as bogus (that would delete a lock we couldn't actually inspect).
-    let mut buf = [0u8; 12];
-    let n = f.read(&mut buf)?;
-    if n != 11 || buf[10] != b'\n' {
+    // Xorg's lock format is exactly "%10d\n" = 11 bytes. read_to_end
+    // (capped at 12 via `take`) loops over short reads — a single
+    // read() may legally return fewer bytes; this is lock-DELETION
+    // logic, so don't risk it. The 12th byte makes an over-long file
+    // detectable (len == 12 ⇒ bogus). A genuine I/O error propagates —
+    // never classify an unreadable lock as bogus (that would delete a
+    // lock we couldn't actually inspect).
+    let mut buf = Vec::with_capacity(12);
+    f.take(12).read_to_end(&mut buf)?;
+    if buf.len() != 11 || buf[10] != b'\n' {
         return Ok(LockState::Bogus);
     }
     let text = std::str::from_utf8(&buf[..11]).unwrap_or("").trim();
@@ -474,22 +477,44 @@ pub fn acquire_lock(lock_dir: &Path, display: u16) -> io::Result<LockGuard> {
                 let _ = fs::remove_file(&tmp_path);
                 return Ok(LockGuard { path: final_path });
             }
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => match inspect_lock(&final_path)? {
-                LockState::Stale | LockState::Bogus => {
-                    let _ = fs::remove_file(&final_path);
-                    // loop and retry the link
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                // Identity-bracketed reclaim: note the lock's (dev, ino)
+                // before inspecting, and only unlink if the path still
+                // names that same inode afterwards. Narrows the race
+                // where a concurrent starter reclaims the stale lock and
+                // links its own fresh one between our inspect and our
+                // unlink. Xorg has the full-width version of this race
+                // (LockServer: read → kill(pid,0) → unlink, no identity
+                // check); Linux has no unlink-by-fd, so a tiny
+                // lstat→unlink window remains — and same-display
+                // concurrent starts are DM-serialized in practice.
+                let seen = fs::symlink_metadata(&final_path)
+                    .ok()
+                    .map(|m| (m.dev(), m.ino()));
+                match inspect_lock(&final_path)? {
+                    LockState::Stale | LockState::Bogus => {
+                        let now = fs::symlink_metadata(&final_path)
+                            .ok()
+                            .map(|m| (m.dev(), m.ino()));
+                        if seen.is_some() && now == seen {
+                            let _ = fs::remove_file(&final_path);
+                        }
+                        // else: replaced under us — the retry link will
+                        // hit EEXIST again and inspect the NEW lock
+                        // (typically Alive → AddrInUse).
+                    }
+                    LockState::Alive => {
+                        let _ = fs::remove_file(&tmp_path);
+                        return Err(io::Error::new(
+                            ErrorKind::AddrInUse,
+                            format!(
+                                "display :{display} already in use (lock {})",
+                                final_path.display()
+                            ),
+                        ));
+                    }
                 }
-                LockState::Alive => {
-                    let _ = fs::remove_file(&tmp_path);
-                    return Err(io::Error::new(
-                        ErrorKind::AddrInUse,
-                        format!(
-                            "display :{display} already in use (lock {})",
-                            final_path.display()
-                        ),
-                    ));
-                }
-            },
+            }
             Err(e) => {
                 let _ = fs::remove_file(&tmp_path);
                 return Err(e);
@@ -507,7 +532,7 @@ pub fn acquire_lock(lock_dir: &Path, display: u16) -> io::Result<LockGuard> {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p yserver --lib launch::tests::lock`
-Expected: PASS (5 lock tests).
+Expected: PASS (6 lock tests: fresh, drop, live, stale, bogus, short-numeric).
 
 - [ ] **Step 5: Format, lint, commit**
 
@@ -585,15 +610,26 @@ Append to the `tests` module:
 
     #[test]
     fn autopick_skips_non_socket_file() {
-        // A regular file named X0: connect() fails with something other
-        // than ECONNREFUSED (ENOTSOCK) → "occupied/unknown" → skip, do
-        // NOT delete.
+        // A regular file named X0: the file-type check skips it without
+        // deleting. (connect() to a non-socket gives ECONNREFUSED on
+        // Linux — same errno as a stale socket — so the type check, not
+        // errno, is what protects the file.)
         let dir = unique_tmp_dir("autopick-notsock");
         std::fs::write(dir.join("X0"), b"junk").unwrap();
         let (n, listener, _path) = autopick(&dir).unwrap();
         assert_eq!(n, 1);
         assert!(dir.join("X0").exists()); // untouched
         drop(listener);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bind_explicit_refuses_non_socket_file() {
+        let dir = unique_tmp_dir("bind-notsock");
+        std::fs::write(dir.join("X6"), b"junk").unwrap();
+        let err = bind_explicit(&dir, 6).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+        assert!(dir.join("X6").exists()); // untouched
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -641,7 +677,7 @@ Append to the `tests` module:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p yserver --lib launch::tests::bind launch::tests::autopick`
+Run: `cargo test -p yserver --lib launch::tests`
 Expected: FAIL to compile — `bind_explicit` / `autopick` not defined.
 
 - [ ] **Step 3: Implement the binding helpers**
@@ -649,7 +685,7 @@ Expected: FAIL to compile — `bind_explicit` / `autopick` not defined.
 Extend the `use` block at the top of `launch.rs` to add the net + permissions imports (merge into the existing `use std::os::unix::...` lines):
 
 ```rust
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 ```
 
@@ -671,7 +707,21 @@ pub fn bind_explicit(
     display: u16,
 ) -> io::Result<(UnixListener, PathBuf)> {
     let path = socket_dir.join(format!("X{display}"));
-    if path.exists() {
+    // File-type check FIRST: connect(AF_UNIX) to a non-socket inode
+    // returns ECONNREFUSED on Linux (same errno as a stale socket!), so
+    // errno alone cannot distinguish "dead server's socket" from "some
+    // file that happens to be named X<n>". Never delete a non-socket.
+    // symlink_metadata also refuses symlinks (is_socket() is false).
+    if let Ok(meta) = fs::symlink_metadata(&path) {
+        if !meta.file_type().is_socket() {
+            return Err(io::Error::new(
+                ErrorKind::AddrInUse,
+                format!(
+                    "{} exists and is not a socket — refusing to replace it",
+                    path.display()
+                ),
+            ));
+        }
         match UnixStream::connect(&path) {
             Ok(_) => {
                 return Err(io::Error::new(
@@ -680,13 +730,12 @@ pub fn bind_explicit(
                 ));
             }
             Err(e) if e.kind() == ErrorKind::ConnectionRefused => {
-                // Stale node from a dead server — reclaim it.
+                // Stale socket from a dead server — reclaim it.
                 let _ = fs::remove_file(&path);
             }
             Err(_) => {
-                // Occupied/unknown (e.g. ENOTSOCK, EACCES). Be
-                // conservative: refuse rather than delete what we can't
-                // identify.
+                // Occupied/unknown (e.g. EACCES). Be conservative:
+                // refuse rather than delete what we can't identify.
                 return Err(io::Error::new(
                     ErrorKind::AddrInUse,
                     format!("cannot probe {} — refusing to replace it", path.display()),
@@ -706,15 +755,21 @@ pub fn bind_explicit(
 pub fn autopick(socket_dir: &Path) -> io::Result<(u16, UnixListener, PathBuf)> {
     for n in 0u16..256 {
         let path = socket_dir.join(format!("X{n}"));
-        if path.exists() {
-            match UnixStream::connect(&path) {
+        // Same file-type-first rule as bind_explicit: ECONNREFUSED can't
+        // distinguish a stale socket from a non-socket file, and we must
+        // never delete the latter. Non-socket / unreadable ⇒ skip.
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if !meta.file_type().is_socket() => continue,
+            Ok(_) => match UnixStream::connect(&path) {
                 Ok(_) => continue, // live server
                 Err(e) if e.kind() == ErrorKind::ConnectionRefused => {
                     // Stale socket node — reclaim it.
                     let _ = fs::remove_file(&path);
                 }
                 Err(_) => continue, // occupied/unknown — leave it alone
-            }
+            },
+            Err(e) if e.kind() == ErrorKind::NotFound => {} // free — bind below
+            Err(_) => continue, // unreadable — not ours to touch
         }
         match UnixListener::bind(&path) {
             Ok(listener) => {
@@ -734,8 +789,8 @@ pub fn autopick(socket_dir: &Path) -> io::Result<(u16, UnixListener, PathBuf)> {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p yserver --lib launch::tests::bind launch::tests::autopick`
-Expected: PASS (4 tests).
+Run: `cargo test -p yserver --lib launch::tests`
+Expected: PASS — all `launch::tests` green, including the 9 added in this task (explicit bind ×4, autopick ×4, lock-release-on-bind-failure).
 
 - [ ] **Step 5: Format, lint, commit**
 
@@ -794,7 +849,7 @@ Append to the `tests` module:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p yserver --lib launch::tests::write_displayfd launch::tests::sigusr1`
+Run: `cargo test -p yserver --lib launch::tests`
 Expected: FAIL to compile — `write_displayfd` / `sigusr1_is_ignored` not defined.
 
 - [ ] **Step 3: Implement the readiness helpers**
@@ -880,14 +935,14 @@ pub fn signal_ready(opts: &LaunchOptions, display: u16, sigusr1_was_ignored: boo
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p yserver --lib launch::tests::write_displayfd launch::tests::sigusr1`
-Expected: PASS (2 tests).
+Run: `cargo test -p yserver --lib launch::tests`
+Expected: PASS — all `launch::tests` green, including the 2 added in this task (displayfd pipe, SIGUSR1 disposition).
 
 - [ ] **Step 5: Run the full launch suite, format, lint, commit**
 
 Run:
 ```bash
-cargo test -p yserver --lib launch::
+cargo test -p yserver --lib launch::tests
 cargo +nightly fmt
 cargo clippy -p yserver --lib
 git add crates/yserver/src/launch.rs

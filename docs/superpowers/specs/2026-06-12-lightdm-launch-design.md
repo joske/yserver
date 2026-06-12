@@ -170,9 +170,18 @@ lockfile column is implemented by component 2b below.
 
 Binding per case:
 
+A shared probe rule for both cases below — **file type first**: on Linux,
+`connect(AF_UNIX)` to a *non-socket* inode fails with `ECONNREFUSED`, the
+**same errno as a stale socket**, so errno alone cannot tell "dead
+server's socket" from "some file named `X<n>`". Check
+`symlink_metadata(..).file_type().is_socket()` before any connect-probe;
+a non-socket path is **never deleted** (explicit ⇒ refuse with
+`AddrInUse`; auto-pick ⇒ skip to the next `k`). This also refuses
+symlinks.
+
 - **Explicit display** and **back-compat default**: acquire the lockfile
-  (component 2b, when the table says so), then **probe** any existing
-  socket before removing it: `connect()` succeeds ⇒ a live server owns the
+  (component 2b, when the table says so), then probe any existing path:
+  non-socket ⇒ refuse; `connect()` succeeds ⇒ a live server owns the
   display ⇒ hard error (`AddrInUse`) — never steal it (old yservers take
   no lock, so holding the lock alone doesn't prove the display free);
   `ECONNREFUSED` ⇒ stale ⇒ remove + bind; any other probe error ⇒ refuse
@@ -180,12 +189,13 @@ Binding per case:
   change vs. the old inline code, which removed the socket
   unconditionally.)
 - **Auto-pick**: scan `/tmp/.X11-unix/Xk` for `k` in `0..256` and bind the
-  lowest free one. For an existing socket file, `connect()` first to
-  disambiguate:
+  lowest free one. For an existing path:
+  - not a socket (or unreadable metadata) ⇒ skip to the next `k`, do
+    **not** delete;
   - connect refused (`ECONNREFUSED`) ⇒ stale ⇒ remove + bind it;
   - connect succeeds ⇒ a live server ⇒ try the next `k`;
-  - **any other `connect()` error** (e.g. `EACCES`, `ETIMEDOUT`) ⇒ treat
-    as occupied/unknown ⇒ try the next `k`, do **not** delete the socket;
+  - **any other `connect()` error** (e.g. `EACCES`) ⇒ treat as
+    occupied/unknown ⇒ try the next `k`, do **not** delete the socket;
   - **`bind()` returns `EADDRINUSE`** (lost a race to a concurrent
     starter between the scan and the bind) ⇒ try the next `k`.
   - Exhausting `0..256` is a hard error.
@@ -227,6 +237,15 @@ observable by a concurrent launcher:
        another user still counts) ⇒ display in use ⇒ for explicit `:N`,
        hard error.
      - `ESRCH` ⇒ stale lock from a dead server ⇒ remove and retry once.
+   Stale/bogus removal is **identity-bracketed**: record the lock's
+   `(dev, ino)` before inspecting and unlink only if the path still names
+   that inode — this narrows the race where a concurrent starter reclaims
+   the same stale lock and publishes its own fresh one between our inspect
+   and our unlink. Xorg has the full-width version of this race
+   (`LockServer`: read → `kill(pid,0)` → `unlink`, no identity check);
+   Linux has no unlink-by-fd, so a tiny lstat→unlink window remains —
+   acceptable, since same-display concurrent starts are DM-serialized in
+   practice.
 3. **Error-path release:** if anything after lock acquisition fails
    (socket bind/listen/chmod), remove our lockfile before returning the
    error — never leave a lock we don't back with a live socket.
@@ -314,13 +333,13 @@ build options → call `run`.
   unknown-flag tolerance; arg-consuming flags; malformed-explicit errors;
   missing-value errors.
 - **Display auto-pick:** tempdir-based test of the scan / stale-socket /
-  live-socket logic and the "non-`ECONNREFUSED` ⇒ skip, don't delete"
-  branch (a regular file named `Xk` exercises it via `ENOTSOCK`). The
-  `EADDRINUSE` bind-race `continue` branch cannot be hit deterministically
-  in a unit test (it needs a socket to appear between the existence check
-  and the `bind()`) — verified by inspection.
+  live-socket logic and the "non-socket ⇒ skip, don't delete" branch (a
+  regular file named `Xk` exercises the file-type check). The `EADDRINUSE`
+  bind-race `continue` branch cannot be hit deterministically in a unit
+  test (it needs a socket to appear between the existence check and the
+  `bind()`) — verified by inspection.
 - **Explicit bind:** live socket refused (`AddrInUse`), stale socket
-  reclaimed, chmod 0777 applied.
+  reclaimed, non-socket path refused without deletion, chmod 0777 applied.
 - **Lockfile protocol:** tempdir-based test of the temp-file + atomic
   `link()` create; the stale-lock (`kill(pid,0)` → `ESRCH`)
   remove-and-retry path; the live-lock collision (hard error for explicit
