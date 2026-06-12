@@ -336,6 +336,10 @@ impl ResourceTable {
     /// (window, pixmap, gc, font, cursor, colormap, picture, or
     /// glyphset). Used by `CreateXxx` opcodes to detect a
     /// `BadIDChoice` violation when a client tries to reuse an ID.
+    ///
+    /// NOTE: covers ResourceTable namespaces only; XC-MISC's
+    /// `ServerState::xid_occupied` additionally covers the extension
+    /// maps — extend BOTH when adding an XID namespace.
     pub fn xid_in_use(&self, id: ResourceId) -> bool {
         let id = id.0;
         self.windows.contains_key(&id)
@@ -346,6 +350,45 @@ impl ResourceTable {
             || self.colormaps.contains_key(&id)
             || self.pictures.contains_key(&id)
             || self.glyphsets.contains_key(&id)
+    }
+
+    /// Append all table-owned XIDs within `base..=base|mask` to `out`
+    /// (the 8 ResourceTable namespaces; extension-map namespaces are
+    /// appended by `ServerState::used_xids_in`). XC-MISC GetXIDRange
+    /// support.
+    pub fn collect_xids_in(&self, base: u32, mask: u32, out: &mut Vec<u32>) {
+        let in_range = |id: &&u32| (**id & !mask) == base;
+        out.extend(self.windows.keys().filter(in_range));
+        out.extend(self.pixmaps.keys().filter(in_range));
+        out.extend(self.gcs.keys().filter(in_range));
+        out.extend(self.fonts.keys().filter(in_range));
+        out.extend(self.cursors.keys().filter(in_range));
+        out.extend(self.colormaps.keys().filter(in_range));
+        out.extend(self.pictures.keys().filter(in_range));
+        out.extend(self.glyphsets.keys().filter(in_range));
+    }
+
+    /// Seed a minimal GC into the resource table. For use in tests only.
+    #[cfg(test)]
+    pub fn seed_gc_for_test(&mut self, owner: ClientId, id: ResourceId) {
+        self.gcs
+            .insert(id.0, Gc::with_defaults(id, ROOT_WINDOW, owner));
+    }
+
+    /// Seed a minimal Font into the resource table. For use in tests only.
+    #[cfg(test)]
+    pub fn seed_font_for_test(&mut self, owner: ClientId, id: ResourceId) {
+        use crate::backend::FontHandle;
+        self.fonts.insert(
+            id.0,
+            Font {
+                id,
+                name: String::new(),
+                host_xid: FontHandle::from_raw_for_test(1),
+                metrics: FontMetrics::default(),
+                owner,
+            },
+        );
     }
 
     pub fn visuals_iter(&self) -> impl Iterator<Item = &Visual> {

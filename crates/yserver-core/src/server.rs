@@ -1403,6 +1403,50 @@ impl ServerState {
         }
         self.screensaver.next_cycle
     }
+
+    /// True iff `id` designates ANY live resource in ANY client-XID
+    /// namespace: the 8 ResourceTable maps (via
+    /// `resources.xid_in_use`) plus the 9 extension maps that
+    /// `xid_in_use` does NOT cover. XC-MISC must never report an
+    /// occupied id as free — extend this (and the
+    /// `xid_occupied_covers_every_namespace` test) when adding an
+    /// XID-keyed map. Maps keyed by client ids / host xids /
+    /// internal handles do NOT belong here.
+    #[must_use]
+    pub fn xid_occupied(&self, id: u32) -> bool {
+        self.resources.xid_in_use(ResourceId(id))
+            || self.xfixes_regions.contains_key(&id)
+            || self.sync_counters.contains_key(&id)
+            || self.sync_alarms.contains_key(&id)
+            || self.sync_fences.contains_key(&id)
+            || self.damage_objects.contains_key(&id)
+            || self.mit_shm_segments.contains_key(&id)
+            || self.glx_contexts.contains_key(&id)
+            || self.glx_drawables.contains_key(&id)
+            || self.present_event_selections.contains_key(&id)
+    }
+
+    /// Sorted, deduped list of occupied XIDs in `base..=base|mask`
+    /// across all 17 namespaces. O(total live resources) — called
+    /// only on the rare XC-MISC GetXIDRange path.
+    #[must_use]
+    pub fn used_xids_in(&self, base: u32, mask: u32) -> Vec<u32> {
+        let mut out = Vec::new();
+        self.resources.collect_xids_in(base, mask, &mut out);
+        let in_range = |id: &&u32| (**id & !mask) == base;
+        out.extend(self.xfixes_regions.keys().filter(in_range));
+        out.extend(self.sync_counters.keys().filter(in_range));
+        out.extend(self.sync_alarms.keys().filter(in_range));
+        out.extend(self.sync_fences.keys().filter(in_range));
+        out.extend(self.damage_objects.keys().filter(in_range));
+        out.extend(self.mit_shm_segments.keys().filter(in_range));
+        out.extend(self.glx_contexts.keys().filter(in_range));
+        out.extend(self.glx_drawables.keys().filter(in_range));
+        out.extend(self.present_event_selections.keys().filter(in_range));
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
 }
 
 impl Default for ServerState {
@@ -4764,5 +4808,236 @@ mod tests {
             },
         );
         assert!(state.idletime_alarm_deadline().is_none());
+    }
+
+    /// XC-MISC guard test: every client-XID namespace must register in
+    /// xid_occupied. Seeds ONE resource per namespace at a distinct id.
+    /// A future XID-keyed map added without xid_occupied coverage should
+    /// be caught by review against this pattern (spec
+    /// 2026-06-12-xcmisc-design.md "maintenance hazard").
+    #[test]
+    fn xid_occupied_covers_every_namespace() {
+        use crate::{
+            backend::{GlyphSetHandle, PictureHandle},
+            resources::{GlyphSetState, PictureKind, PictureState, ROOT_VISUAL},
+        };
+        use yserver_protocol::x11::{CreatePixmapRequest, CreateWindowRequest};
+
+        let mut state = ServerState::new();
+        let owner = ClientId(1);
+        let base = 0x0010_0000u32;
+        let mut expect = Vec::new();
+
+        // ── 8 ResourceTable namespaces ──
+
+        // 1. window
+        let id_window = base + 1;
+        state.resources.create_window(
+            owner,
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(id_window),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        expect.push(id_window);
+
+        // 2. pixmap
+        let id_pixmap = base + 2;
+        state.resources.create_pixmap(
+            owner,
+            CreatePixmapRequest {
+                depth: 24,
+                pixmap: ResourceId(id_pixmap),
+                drawable: ROOT_WINDOW,
+                width: 1,
+                height: 1,
+            },
+        );
+        expect.push(id_pixmap);
+
+        // 3. gc
+        let id_gc = base + 3;
+        state.resources.seed_gc_for_test(owner, ResourceId(id_gc));
+        expect.push(id_gc);
+
+        // 4. font
+        let id_font = base + 4;
+        state
+            .resources
+            .seed_font_for_test(owner, ResourceId(id_font));
+        expect.push(id_font);
+
+        // 5. cursor
+        let id_cursor = base + 5;
+        state.resources.create_cursor(owner, ResourceId(id_cursor));
+        expect.push(id_cursor);
+
+        // 6. colormap
+        let id_colormap = base + 6;
+        state
+            .resources
+            .create_colormap(owner, ResourceId(id_colormap), ROOT_VISUAL);
+        expect.push(id_colormap);
+
+        // 7. picture (pub map — insert literal directly)
+        let id_picture = base + 7;
+        state.resources.pictures.insert(
+            id_picture,
+            PictureState {
+                client: owner,
+                host_picture_xid: PictureHandle::from_raw_for_test(1),
+                host_owned_pixmap: None,
+                kind: PictureKind::Sourceless,
+                drawable: None,
+            },
+        );
+        expect.push(id_picture);
+
+        // 8. glyphset (pub map — insert literal directly)
+        let id_glyphset = base + 8;
+        state.resources.glyphsets.insert(
+            id_glyphset,
+            GlyphSetState {
+                client: owner,
+                host_glyphset_xid: GlyphSetHandle::from_raw_for_test(1),
+            },
+        );
+        expect.push(id_glyphset);
+
+        // ── 9 ServerState extension namespaces ──
+
+        // 9. xfixes_regions
+        let id_xfixes = base + 9;
+        state.xfixes_regions.insert(
+            id_xfixes,
+            XFixesRegion {
+                owner,
+                rects: vec![],
+            },
+        );
+        expect.push(id_xfixes);
+
+        // 10. sync_counters
+        let id_sync_counter = base + 10;
+        state
+            .sync_counters
+            .insert(id_sync_counter, SyncCounter { owner, value: 0 });
+        expect.push(id_sync_counter);
+
+        // 11. sync_alarms
+        let id_sync_alarm = base + 11;
+        state.sync_alarms.insert(
+            id_sync_alarm,
+            SyncAlarm {
+                owner,
+                ..SyncAlarm::default()
+            },
+        );
+        expect.push(id_sync_alarm);
+
+        // 12. sync_fences
+        let id_sync_fence = base + 12;
+        state.sync_fences.insert(
+            id_sync_fence,
+            SyncFence {
+                owner,
+                triggered: false,
+            },
+        );
+        expect.push(id_sync_fence);
+
+        // 13. damage_objects
+        let id_damage = base + 13;
+        state.damage_objects.insert(
+            id_damage,
+            DamageObject {
+                owner,
+                drawable: ROOT_WINDOW,
+                level: 0,
+                rects: vec![],
+                pending_notify_fired: false,
+                last_reported_geometry: None,
+            },
+        );
+        expect.push(id_damage);
+
+        // 14. mit_shm_segments — requires a real fd; use memfd_create
+        let id_shm = base + 14;
+        let fd = unsafe { libc::memfd_create(c"xcmisc-test-shm".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0, "memfd_create failed");
+        let rc = unsafe { libc::ftruncate(fd, 4096) };
+        assert_eq!(rc, 0, "ftruncate failed");
+        let shm_seg = MitShmSegment::from_fd(owner, fd, false).expect("MitShmSegment::from_fd");
+        state.mit_shm_segments.insert(id_shm, shm_seg);
+        expect.push(id_shm);
+
+        // 15. glx_contexts
+        let id_glx_ctx = base + 15;
+        state.glx_contexts.insert(
+            id_glx_ctx,
+            GlxContext {
+                owner,
+                fbconfig: 0,
+                render_type: 0,
+            },
+        );
+        expect.push(id_glx_ctx);
+
+        // 16. glx_drawables
+        let id_glx_draw = base + 16;
+        state.glx_drawables.insert(
+            id_glx_draw,
+            GlxDrawable {
+                owner,
+                x_drawable: 0,
+                fbconfig: 0,
+                width: 0,
+                height: 0,
+                attributes: vec![],
+                glx_export_host_xid: None,
+            },
+        );
+        expect.push(id_glx_draw);
+
+        // 17. present_event_selections
+        let id_present = base + 17;
+        state.present_event_selections.insert(
+            id_present,
+            PresentEventSelection {
+                owner,
+                window: ROOT_WINDOW,
+                event_mask: 0,
+            },
+        );
+        expect.push(id_present);
+
+        // ── assertions ──
+
+        for id in &expect {
+            assert!(state.xid_occupied(*id), "id 0x{id:x} must be occupied");
+        }
+        assert_eq!(
+            expect.len(),
+            17,
+            "one seed per namespace — update when adding namespaces"
+        );
+        assert!(!state.xid_occupied(base + 100), "unseeded id must be free");
+
+        // used_xids_in returns exactly the seeded set, sorted
+        let used = state.used_xids_in(base, 0x000F_FFFF);
+        let mut sorted = expect.clone();
+        sorted.sort_unstable();
+        assert_eq!(used, sorted);
+        // out-of-range base sees none of them
+        assert!(state.used_xids_in(0x0020_0000, 0x000F_FFFF).is_empty());
     }
 }
