@@ -7,10 +7,10 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, ErrorKind, Read, Write},
     os::{
-        fd::RawFd,
+        fd::{AsRawFd, RawFd},
         unix::{
             fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
-            net::{UnixListener, UnixStream},
+            net::UnixListener,
         },
     },
     path::{Path, PathBuf},
@@ -295,6 +295,60 @@ pub fn acquire_lock(lock_dir: &Path, display: u16) -> io::Result<LockGuard> {
     ))
 }
 
+/// Occupancy classification for a path in the socket directory.
+enum Occupancy {
+    /// Nothing there — free to bind.
+    Free,
+    /// A server is listening (or its backlog is full — still occupied).
+    Live,
+    /// Socket node with no listener (`ECONNREFUSED`) — reclaimable.
+    Stale,
+    /// Exists but is not a socket — never delete.
+    NonSocket,
+    /// Unreadable/unidentifiable — never delete.
+    Opaque,
+}
+
+/// Probe a socket-dir path. The connect is NONBLOCKING: a blocking
+/// connect to a live-but-backlogged AF_UNIX listener waits for accept —
+/// potentially forever (a wedged server, or a hostile local user's
+/// never-accepting listener in the world-writable socket dir, must not
+/// hang the launch). EAGAIN ⇒ backlog full ⇒ the display IS occupied.
+fn probe(path: &Path) -> Occupancy {
+    use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
+
+    let meta = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Occupancy::Free,
+        Err(_) => return Occupancy::Opaque,
+    };
+    if !meta.file_type().is_socket() {
+        return Occupancy::NonSocket;
+    }
+    let fd = match socket(
+        AddressFamily::Unix,
+        SockType::Stream,
+        SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
+        None,
+    ) {
+        Ok(fd) => fd,
+        Err(_) => return Occupancy::Opaque,
+    };
+    let addr = match UnixAddr::new(path) {
+        Ok(a) => a,
+        Err(_) => return Occupancy::Opaque,
+    };
+    match connect(fd.as_raw_fd(), &addr) {
+        Ok(()) => Occupancy::Live,
+        // Nonblocking AF_UNIX connect outcomes:
+        Err(nix::errno::Errno::EAGAIN) => Occupancy::Live, // backlog full
+        Err(nix::errno::Errno::EINPROGRESS) => Occupancy::Live,
+        Err(nix::errno::Errno::ECONNREFUSED) => Occupancy::Stale,
+        Err(_) => Occupancy::Opaque,
+    }
+    // fd is an OwnedFd — closed on drop.
+}
+
 fn chmod_socket(path: &Path) -> io::Result<()> {
     // X clients connect as the invoking user; the socket needs world
     // write (connect() on AF_UNIX requires `w`). Xorg sets 0777.
@@ -307,13 +361,19 @@ fn chmod_socket(path: &Path) -> io::Result<()> {
 /// lock, so holding the lock alone doesn't prove the display is free).
 pub fn bind_explicit(socket_dir: &Path, display: u16) -> io::Result<(UnixListener, PathBuf)> {
     let path = socket_dir.join(format!("X{display}"));
-    // File-type check FIRST: connect(AF_UNIX) to a non-socket inode
-    // returns ECONNREFUSED on Linux (same errno as a stale socket!), so
-    // errno alone cannot distinguish "dead server's socket" from "some
-    // file that happens to be named X<n>". Never delete a non-socket.
-    // symlink_metadata also refuses symlinks (is_socket() is false).
-    if let Ok(meta) = fs::symlink_metadata(&path) {
-        if !meta.file_type().is_socket() {
+    match probe(&path) {
+        Occupancy::Free => {}
+        Occupancy::Stale => {
+            // Stale socket from a dead server — reclaim it.
+            let _ = fs::remove_file(&path);
+        }
+        Occupancy::Live => {
+            return Err(io::Error::new(
+                ErrorKind::AddrInUse,
+                format!("display :{display} in use (live socket {})", path.display()),
+            ));
+        }
+        Occupancy::NonSocket => {
             return Err(io::Error::new(
                 ErrorKind::AddrInUse,
                 format!(
@@ -322,62 +382,53 @@ pub fn bind_explicit(socket_dir: &Path, display: u16) -> io::Result<(UnixListene
                 ),
             ));
         }
-        match UnixStream::connect(&path) {
-            Ok(_) => {
-                return Err(io::Error::new(
-                    ErrorKind::AddrInUse,
-                    format!("display :{display} in use (live socket {})", path.display()),
-                ));
-            }
-            Err(e) if e.kind() == ErrorKind::ConnectionRefused => {
-                // Stale socket from a dead server — reclaim it.
-                let _ = fs::remove_file(&path);
-            }
-            Err(_) => {
-                // Occupied/unknown (e.g. EACCES). Be conservative:
-                // refuse rather than delete what we can't identify.
-                return Err(io::Error::new(
-                    ErrorKind::AddrInUse,
-                    format!("cannot probe {} — refusing to replace it", path.display()),
-                ));
-            }
+        Occupancy::Opaque => {
+            return Err(io::Error::new(
+                ErrorKind::AddrInUse,
+                format!("cannot probe {} — refusing to replace it", path.display()),
+            ));
         }
     }
     let listener = UnixListener::bind(&path)?;
-    chmod_socket(&path)?;
+    if let Err(e) = chmod_socket(&path) {
+        let _ = fs::remove_file(&path);
+        return Err(e);
+    }
     Ok((listener, path))
 }
 
 /// Scan `0..256` for the lowest free display and bind it. Disambiguates an
 /// existing socket file via `connect()`: refused ⇒ stale ⇒ reclaim;
-/// connected ⇒ live ⇒ skip; other error ⇒ occupied ⇒ skip. Retries on a
-/// `bind()` `EADDRINUSE` race. Takes no lock (matches Xorg `nolock`).
+/// connected ⇒ live ⇒ skip; other error ⇒ occupied ⇒ skip. Moves on to the
+/// next display on a `bind()` `EADDRINUSE` race. Takes no lock (matches
+/// Xorg `nolock`).
 pub fn autopick(socket_dir: &Path) -> io::Result<(u16, UnixListener, PathBuf)> {
     for n in 0u16..256 {
         let path = socket_dir.join(format!("X{n}"));
-        // Same file-type-first rule as bind_explicit: ECONNREFUSED can't
-        // distinguish a stale socket from a non-socket file, and we must
-        // never delete the latter. Non-socket / unreadable ⇒ skip.
-        match fs::symlink_metadata(&path) {
-            Ok(meta) if !meta.file_type().is_socket() => continue,
-            Ok(_) => match UnixStream::connect(&path) {
-                Ok(_) => continue, // live server
-                Err(e) if e.kind() == ErrorKind::ConnectionRefused => {
-                    // Stale socket node — reclaim it.
-                    let _ = fs::remove_file(&path);
-                }
-                Err(_) => continue, // occupied/unknown — leave it alone
-            },
-            Err(e) if e.kind() == ErrorKind::NotFound => {} // free — bind below
-            Err(_) => continue,                             // unreadable — not ours to touch
+        match probe(&path) {
+            Occupancy::Free => {}
+            Occupancy::Stale => {
+                // Stale socket node — reclaim it.
+                let _ = fs::remove_file(&path);
+            }
+            // Live, non-socket, or unidentifiable: not ours — next k.
+            Occupancy::Live | Occupancy::NonSocket | Occupancy::Opaque => continue,
         }
         match UnixListener::bind(&path) {
             Ok(listener) => {
-                chmod_socket(&path)?;
+                if let Err(e) = chmod_socket(&path) {
+                    let _ = fs::remove_file(&path);
+                    return Err(e);
+                }
                 return Ok((n, listener, path));
             }
             Err(e) if e.kind() == ErrorKind::AddrInUse => continue, // lost a race
-            Err(e) => return Err(e),
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("bind({}): {e}", path.display()),
+                ));
+            }
         }
     }
     Err(io::Error::new(
@@ -389,6 +440,8 @@ pub fn autopick(socket_dir: &Path) -> io::Result<(u16, UnixListener, PathBuf)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::os::unix::net::UnixListener as TestListener;
 
     fn parse(args: &[&str]) -> Result<LaunchOptions, String> {
         parse_args(args.iter().map(|s| (*s).to_string()))
@@ -574,8 +627,6 @@ mod tests {
         drop(guard);
         std::fs::remove_dir_all(&dir).ok();
     }
-
-    use std::os::unix::net::UnixListener as TestListener;
 
     #[test]
     fn bind_explicit_binds_and_chmods() {

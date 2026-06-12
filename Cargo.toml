@@ -33,6 +33,7 @@ nix = { version = "0.31", features = [
   "mman",
   "poll",
   "signal",
+  "socket",
   "term"
 ] }
 signal-hook = "0.4"
