@@ -69,8 +69,8 @@ client's `byte_order` — same as every other reply encoder.
   bug-compatibility beats prettiness (libxcb's exhaustion check is
   `start == 0`).
 - GetXIDList with huge `count`: **explicit Xorg deviation.** Xorg
-  pre-rejects `count > u32::MAX/8` with BadAlloc, then allocates
-  `count × 8` bytes (multi-GB for hostile counts) and returns
+  pre-rejects `count > u32::MAX/4` with BadAlloc, then allocates
+  `count × 4` bytes (multi-GB for hostile counts) and returns
   BadAlloc on allocation failure (`xcmisc.c:101-106`). We instead
   clamp the scan to the client's range size — the reply can never
   exceed `min(count, mask+1)` entries (≤ ~4 MiB of reply), so no
