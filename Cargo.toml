@@ -10,7 +10,7 @@ members = [
 version = "1.0.0"
 edition = "2024"
 repository = ""
-license = "GPL-3.0-only"
+license = "MIT"
 
 [workspace.dependencies]
 ash = "0.38"
