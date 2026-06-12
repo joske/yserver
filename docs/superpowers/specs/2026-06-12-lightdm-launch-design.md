@@ -179,6 +179,18 @@ a non-socket path is **never deleted** (explicit ⇒ refuse with
 `AddrInUse`; auto-pick ⇒ skip to the next `k`). This also refuses
 symlinks.
 
+The connect-probe itself must be **nonblocking**: a blocking
+`connect(AF_UNIX)` to a live listener whose accept backlog is full waits
+for an `accept()` — potentially forever. A wedged X server (precisely the
+case where the DM restarts us), or a hostile local user's never-accepting
+listener in the world-writable socket dir, must not hang the launch.
+Nonblocking errno mapping: success/`EINPROGRESS` ⇒ live; **`EAGAIN` ⇒
+backlog full ⇒ live** (the display *is* occupied); `ECONNREFUSED` ⇒
+stale; anything else ⇒ opaque/refuse-to-touch. Implemented as one shared
+`probe()` classifier returning {Free, Live, Stale, NonSocket, Opaque} so
+the explicit (refuse) and auto-pick (skip) policies stay visibly separate
+while the errno subtleties exist once.
+
 - **Explicit display** and **back-compat default**: acquire the lockfile
   (component 2b, when the table says so), then probe any existing path:
   non-socket ⇒ refuse; `connect()` succeeds ⇒ a live server owns the
