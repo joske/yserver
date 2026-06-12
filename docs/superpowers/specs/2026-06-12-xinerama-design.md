@@ -2,7 +2,14 @@
 
 **Date:** 2026-06-12
 **Branch:** `feat/lightdm-launch` (XINERAMA is a ship-blocker for usable multi-head DM sessions)
-**Reference:** `/usr/include/X11/extensions/panoramiXproto.h`; Xorg `Xext/panoramiX.c` / `Xext/xvmc`… (PanoramiX/Xinerama dispatch)
+**Reference:** `/usr/include/X11/extensions/panoramiXproto.h` (wire format); Xorg
+`randr/rrxinerama.c` (the **RANDR-backed** Xinerama implementation — registered
+by `RRXineramaExtensionInit`, `randr/randr.c:449`). Mirror *that*, not the
+legacy full-PanoramiX path (`Xext/panoramiX.c`), since yserver is RANDR-backed:
+`ProcRRXineramaIsActive` reports active when monitor count > 0
+(`rrxinerama.c:159`), `QueryScreens` returns RANDR monitor rects
+(`rrxinerama.c:274`), and all requests use `REQUEST_SIZE_MATCH` + validate the
+window via `dixLookupWindow`.
 
 ## Goal
 
@@ -126,32 +133,66 @@ XINERAMA_MAJOR_OPCODE => handle_xinerama_request(state, client_id, sequence, hea
 ### 4. `handle_xinerama_request`
 
 Matches `header.data` (the minor opcode) over the six requests. Builds the
-screen list **from the same `state.randr.outputs` the RANDR monitor path uses**
-(same order, primary first), mapping each to `ScreenInfo { x_org: o.x, y_org:
-o.y, width: o.width, height: o.height }`.
+screen list from the **shared monitor-list helper** (see below), mapping each to
+`ScreenInfo { x_org: o.x, y_org: o.y, width: o.width, height: o.height }`.
 
-- `QueryVersion` → `encode_query_version_reply`.
-- `GetState` → `encode_get_state_reply(active = !screens.is_empty(), window = req.window)`.
-- `GetScreenCount` → `encode_get_screen_count_reply(count = screens.len(), window = req.window)`.
-- `GetScreenSize` → if `req.screen < screens.len()`: reply with that screen's
-  width/height (+ echoed window/screen); else **BadValue** (Xorg behavior).
+All six requests are fixed-size: validate length with `REQUEST_SIZE_MATCH`
+semantics — **any** size mismatch (too short *or* too long) → `BadLength`
+(`rrxinerama.c` uses `REQUEST_SIZE_MATCH` for all six). The three windowed
+requests (`GetState`, `GetScreenCount`, `GetScreenSize`) carry a `window` and
+must **validate it** (`dixLookupWindow` equivalent — yserver's window lookup);
+an invalid window → `BadWindow` (`rrxinerama.c:124,172,202`).
+
+- `QueryVersion` → `encode_query_version_reply` (major=1, minor=1).
+- `GetState` → validate `window`; `encode_get_state_reply(active = !screens.is_empty(), window)`.
+- `GetScreenCount` → validate `window`; `encode_get_screen_count_reply(count = screens.len(), window)`.
+- `GetScreenSize` → validate `window`; reply with the **root/virtual-screen**
+  width/height (the full bounding size, not the per-monitor size), echoing the
+  requested `window` and `screen`. **No bounds-check on `screen`** — Xorg's
+  RANDR-backed path returns the root drawable size regardless of the screen
+  index and does *not* error (`rrxinerama.c:202,210`). (This is a deliberate
+  match to `rrxinerama.c`, replacing an earlier draft that wrongly returned
+  per-screen size + `BadValue` — that was legacy full-PanoramiX behavior, not
+  the RANDR path yserver mirrors.)
 - `IsActive` → `encode_is_active_reply(active = !screens.is_empty())`.
 - `QueryScreens` → `encode_query_screens_reply(&screens)`.
 - Unknown minor opcode → **BadRequest** (X convention for an extension's
   unknown minor).
 
-**IsActive / GetState `active` = true whenever ≥1 output** — so clients use
-`QueryScreens` (the matching-count path) rather than the single-screen fallback
-that crashes. Single-head → 1 screen, active=true, harmless (the one screen is
-the whole display).
+**IsActive / GetState `active` = true whenever ≥1 monitor** (`rrxinerama.c:159`
+reports active when monitor count > 0) — so clients use `QueryScreens` (the
+matching-count path) rather than the single-screen fallback that crashes.
+Single-head → 1 screen, active=true, harmless (the one screen is the whole
+display).
+
+### 5. Shared monitor-list helper (enforces the invariant mechanically)
+
+To make the load-bearing invariant (XINERAMA screen count == RANDR monitor
+count) **impossible to break by future drift**, extract the monitor-list
+construction `RR_GET_MONITORS` currently does inline (`process_request.rs:2290`)
+into one helper, and have **both** `RR_GET_MONITORS` and XINERAMA `QueryScreens`
+/ `GetScreenCount` call it:
+
+```rust
+/// The active monitor list — the single source of truth for both
+/// RANDR GetMonitors and XINERAMA. Order: primary first (index 0).
+fn active_monitors(state: &ServerState) -> Vec<MonitorRect> { /* from state.randr.outputs */ }
+```
+
+Xorg does exactly this: `RRGetMonitors` and `RRXineramaQueryScreens` share
+`RRMonitorMakeList` (`rrmonitor.c:600`, `rrxinerama.c:284`). If any
+enabled/disconnected filtering is later added, it lands in the one helper and
+both sides stay consistent — the crash can't silently return.
 
 ## Error handling
 
 | Condition | Response |
 |-----------|----------|
-| `GetScreenSize` screen index ≥ N | `BadValue` |
+| Request size mismatch (short *or* long) — all 6 are fixed-size | `BadLength` (`REQUEST_SIZE_MATCH`) |
+| Invalid `window` on `GetState`/`GetScreenCount`/`GetScreenSize` | `BadWindow` |
 | Unknown minor opcode | `BadRequest` |
-| Truncated request body | `BadLength` (consistent with other handlers) |
+
+(`GetScreenSize` does **not** bounds-check the screen index — see component 4.)
 
 ## Testing
 
@@ -159,11 +200,15 @@ the whole display).
   `panoramiXproto.h`. Critically a **2-screen `QueryScreens`**: `length == 4`
   (N*2), `number == 2`, and the two 8-byte `ScreenInfo` records for DP-1 @ (0,0)
   2560×1440 and HDMI-A-1 @ (2560,0) 2560×1440.
-- **Invariant test:** for a given `state.randr.outputs`, the XINERAMA screen
-  count equals the `RR_GET_MONITORS` monitor count (guards the load-bearing
-  property against future drift).
-- **`GetScreenSize` bounds:** in-range returns the right size; out-of-range →
-  `BadValue`.
+- **Invariant test:** XINERAMA `QueryScreens` and `RR_GET_MONITORS` both call
+  the shared `active_monitors` helper, so their counts are equal *by
+  construction*; a test asserts both reply with the same N for a multi-output
+  `state.randr.outputs` (guards against any future one-sided filtering).
+- **`GetScreenSize`:** returns the root/virtual-screen size and echoes the
+  requested `window`/`screen` for any in-bounds-or-not screen index (no
+  `BadValue`); an invalid `window` → `BadWindow`.
+- **Length/window validation:** an over-long or truncated request → `BadLength`;
+  `GetState`/`GetScreenCount`/`GetScreenSize` with a bogus window → `BadWindow`.
 - **Dispatch/QueryExtension:** `QueryExtension("XINERAMA")` reports present with
   the major opcode; an unknown minor → `BadRequest`.
 - **HW smoke (the real gate):** dual-head Cinnamon under lightdm on silence —
