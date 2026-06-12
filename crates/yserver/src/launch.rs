@@ -3,7 +3,15 @@
 //! readiness handshake. See
 //! `docs/superpowers/specs/2026-06-12-lightdm-launch-design.md`.
 
-use std::{os::fd::RawFd, path::PathBuf};
+use std::{
+    fs::{self, OpenOptions},
+    io::{self, ErrorKind, Read, Write},
+    os::{
+        fd::RawFd,
+        unix::fs::{MetadataExt, OpenOptionsExt},
+    },
+    path::{Path, PathBuf},
+};
 
 /// Display yserver uses when neither an explicit display nor `-displayfd`
 /// is given. 7 avoids clashing with a real Xorg on `:0` (existing
@@ -110,12 +118,168 @@ pub fn resolve(opts: &LaunchOptions) -> Resolution {
     }
 }
 
+/// RAII handle for an acquired display lock. Dropping removes the lock
+/// file. `run()` holds this for the server's lifetime and lets it drop
+/// *after* the socket is removed at shutdown (the lock is the
+/// authoritative occupancy marker, so it must outlive the socket).
+#[derive(Debug)]
+pub struct LockGuard {
+    path: PathBuf,
+}
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// `/tmp/.X<N>-lock` path for a display.
+#[must_use]
+pub fn lock_path(lock_dir: &Path, display: u16) -> PathBuf {
+    lock_dir.join(format!(".X{display}-lock"))
+}
+
+enum LockState {
+    Alive,
+    Stale,
+    Bogus,
+}
+
+fn inspect_lock(path: &Path) -> io::Result<LockState> {
+    let f = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(f) => f,
+        // Vanished between link-failure and open → treat as stale (retry).
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(LockState::Stale),
+        Err(e) => return Err(e),
+    };
+    // Xorg's lock format is exactly "%10d\n" = 11 bytes. read_to_end
+    // (capped at 12 via `take`) loops over short reads — a single
+    // read() may legally return fewer bytes; this is lock-DELETION
+    // logic, so don't risk it. The 12th byte makes an over-long file
+    // detectable (len == 12 ⇒ bogus). A genuine I/O error propagates —
+    // never classify an unreadable lock as bogus (that would delete a
+    // lock we couldn't actually inspect).
+    let mut buf = Vec::with_capacity(12);
+    f.take(12).read_to_end(&mut buf)?;
+    if buf.len() != 11 || buf[10] != b'\n' {
+        return Ok(LockState::Bogus);
+    }
+    let text = std::str::from_utf8(&buf[..11]).unwrap_or("").trim();
+    let pid: i32 = match text.parse() {
+        Ok(p) if p > 0 => p,
+        _ => return Ok(LockState::Bogus),
+    };
+    // SAFETY: kill with signal 0 only probes existence/permissions.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return Ok(LockState::Alive);
+    }
+    match io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => Ok(LockState::Stale),
+        // EPERM ⇒ a live process we may not signal (e.g. another user).
+        // Anything else ⇒ be conservative and treat as occupied.
+        _ => Ok(LockState::Alive),
+    }
+}
+
+/// Acquire the `/tmp/.X<N>-lock` display lock using Xorg's temp-file +
+/// atomic `link()` protocol (`os/utils.c`), reclaiming stale/bogus locks.
+/// Errors with `AddrInUse` if a live server owns the display.
+pub fn acquire_lock(lock_dir: &Path, display: u16) -> io::Result<LockGuard> {
+    let final_path = lock_path(lock_dir, display);
+    // PID-suffixed temp name: each starter owns a unique temp file, so two
+    // concurrent starters can never clobber each other's temp before the
+    // atomic link() (a fixed name would let the winner link a file holding
+    // the LOSER's pid, corrupting later stale/live detection). Deviation
+    // from Xorg's fixed ".tX<N>-lock": race-free without Xorg's
+    // O_EXCL+retry dance; a crash can orphan one 11-byte temp file, which
+    // is harmless (nothing inspects temp names).
+    let tmp_path = lock_dir.join(format!(".tX{display}-lock.{}", std::process::id()));
+    let pid_line = format!("{:>10}\n", std::process::id());
+
+    // At most two attempts: acquire, or reclaim-once-then-acquire.
+    for _ in 0..2 {
+        {
+            let mut tmp = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            tmp.write_all(pid_line.as_bytes())?;
+        }
+        match fs::hard_link(&tmp_path, &final_path) {
+            Ok(()) => {
+                let _ = fs::remove_file(&tmp_path);
+                return Ok(LockGuard { path: final_path });
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                // Identity-bracketed reclaim: note the lock's (dev, ino)
+                // before inspecting, and only unlink if the path still
+                // names that same inode afterwards. Narrows the race
+                // where a concurrent starter reclaims the stale lock and
+                // links its own fresh one between our inspect and our
+                // unlink. Xorg has the full-width version of this race
+                // (LockServer: read → kill(pid,0) → unlink, no identity
+                // check); Linux has no unlink-by-fd, so a tiny
+                // lstat→unlink window remains — and same-display
+                // concurrent starts are DM-serialized in practice.
+                let seen = fs::symlink_metadata(&final_path)
+                    .ok()
+                    .map(|m| (m.dev(), m.ino()));
+                match inspect_lock(&final_path)? {
+                    LockState::Stale | LockState::Bogus => {
+                        let now = fs::symlink_metadata(&final_path)
+                            .ok()
+                            .map(|m| (m.dev(), m.ino()));
+                        if seen.is_some() && now == seen {
+                            let _ = fs::remove_file(&final_path);
+                        }
+                        // else: replaced under us — the retry link will
+                        // hit EEXIST again and inspect the NEW lock
+                        // (typically Alive → AddrInUse).
+                    }
+                    LockState::Alive => {
+                        let _ = fs::remove_file(&tmp_path);
+                        return Err(io::Error::new(
+                            ErrorKind::AddrInUse,
+                            format!(
+                                "display :{display} already in use (lock {})",
+                                final_path.display()
+                            ),
+                        ));
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(e);
+            }
+        }
+    }
+    let _ = fs::remove_file(&tmp_path);
+    Err(io::Error::new(
+        ErrorKind::AddrInUse,
+        format!("could not acquire display lock {}", final_path.display()),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn parse(args: &[&str]) -> Result<LaunchOptions, String> {
         parse_args(args.iter().map(|s| (*s).to_string()))
+    }
+
+    fn unique_tmp_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("yserver-launch-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[test]
@@ -206,5 +370,80 @@ mod tests {
                 lock: true
             }
         );
+    }
+
+    #[test]
+    fn unknown_flag_does_not_consume_next_arg() {
+        assert_eq!(parse(&["-bogus", ":1"]).unwrap().display, Some(1));
+    }
+
+    #[test]
+    fn duplicate_display_args_last_wins() {
+        assert_eq!(parse(&[":0", ":1"]).unwrap().display, Some(1));
+        assert_eq!(parse(&["7", ":3"]).unwrap().display, Some(3));
+    }
+
+    #[test]
+    fn lock_fresh_acquire_creates_file() {
+        let dir = unique_tmp_dir("lock-fresh");
+        let guard = acquire_lock(&dir, 5).unwrap();
+        assert!(lock_path(&dir, 5).exists());
+        drop(guard);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn lock_guard_drop_removes_file() {
+        let dir = unique_tmp_dir("lock-drop");
+        let guard = acquire_lock(&dir, 6).unwrap();
+        let p = lock_path(&dir, 6);
+        assert!(p.exists());
+        drop(guard);
+        assert!(!p.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn lock_live_pid_is_rejected() {
+        let dir = unique_tmp_dir("lock-live");
+        // First acquire writes OUR pid into the lock; the second sees a
+        // live owner (us) and must refuse.
+        let _guard = acquire_lock(&dir, 7).unwrap();
+        let err = acquire_lock(&dir, 7).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn lock_stale_pid_is_reclaimed() {
+        let dir = unique_tmp_dir("lock-stale");
+        // A pid far above any real one → kill(pid,0) == ESRCH → stale.
+        std::fs::write(lock_path(&dir, 8), format!("{:>10}\n", 2_147_483_646i32)).unwrap();
+        let guard = acquire_lock(&dir, 8).unwrap();
+        assert!(lock_path(&dir, 8).exists());
+        drop(guard);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn lock_bogus_contents_are_reclaimed() {
+        let dir = unique_tmp_dir("lock-bogus");
+        std::fs::write(lock_path(&dir, 9), b"not a pid").unwrap();
+        let guard = acquire_lock(&dir, 9).unwrap();
+        assert!(lock_path(&dir, 9).exists());
+        drop(guard);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn lock_short_numeric_contents_are_bogus() {
+        // Xorg reads exactly 11 bytes ("%10d\n"); a short numeric file is
+        // not a valid lock and must be reclaimed, not trusted.
+        let dir = unique_tmp_dir("lock-short");
+        std::fs::write(lock_path(&dir, 10), b"123\n").unwrap();
+        let guard = acquire_lock(&dir, 10).unwrap();
+        assert!(lock_path(&dir, 10).exists());
+        drop(guard);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
