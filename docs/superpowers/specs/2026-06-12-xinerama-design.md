@@ -55,7 +55,7 @@ may use it):
 | 0 | `PanoramiXQueryVersion` | server version (1.1) |
 | 1 | `PanoramiXGetState` | active flag + echoed window |
 | 2 | `PanoramiXGetScreenCount` | N + echoed window |
-| 3 | `PanoramiXGetScreenSize` | width/height of screen *i* + echoed window/screen |
+| 3 | `PanoramiXGetScreenSize` | root/virtual-screen width/height + echoed window/screen |
 | 4 | `XineramaIsActive` | active flag (CARD32) |
 | 5 | `XineramaQueryScreens` | N screen rects |
 
@@ -144,7 +144,11 @@ must **validate it** (`dixLookupWindow` equivalent — yserver's window lookup);
 an invalid window → `BadWindow` (`rrxinerama.c:124,172,202`).
 
 - `QueryVersion` → `encode_query_version_reply` (major=1, minor=1).
-- `GetState` → validate `window`; `encode_get_state_reply(active = !screens.is_empty(), window)`.
+- `GetState` → validate `window`; `encode_get_state_reply(active = true, window)`.
+  Xorg's `PanoramiXGetState` returns true whenever the RANDR screen-private
+  exists — i.e. **independent of monitor count** (`rrxinerama.c:129-134`) — and
+  yserver always has RANDR, so this is unconditionally `true`. (Distinct from
+  `IsActive` below, which *is* the monitor-count path.)
 - `GetScreenCount` → validate `window`; `encode_get_screen_count_reply(count = screens.len(), window)`.
 - `GetScreenSize` → validate `window`; reply with the **root/virtual-screen**
   width/height (the full bounding size, not the per-monitor size), echoing the
@@ -159,11 +163,11 @@ an invalid window → `BadWindow` (`rrxinerama.c:124,172,202`).
 - Unknown minor opcode → **BadRequest** (X convention for an extension's
   unknown minor).
 
-**IsActive / GetState `active` = true whenever ≥1 monitor** (`rrxinerama.c:159`
-reports active when monitor count > 0) — so clients use `QueryScreens` (the
-matching-count path) rather than the single-screen fallback that crashes.
-Single-head → 1 screen, active=true, harmless (the one screen is the whole
-display).
+**`IsActive` = true whenever ≥1 monitor** (`rrxinerama.c:238` reports active
+when monitor count > 0) — so clients use `QueryScreens` (the matching-count
+path) rather than the single-screen fallback that crashes. Single-head → 1
+screen, IsActive=true, harmless (the one screen is the whole display).
+(`GetState` is the separate "RANDR present?" flag above — always true here.)
 
 ### 5. Shared monitor-list helper (enforces the invariant mechanically)
 
