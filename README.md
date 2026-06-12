@@ -88,7 +88,29 @@ sudo pacman -S just gcc libseat libxshmfence libxkbcommon libinput glslc systemd
 ```sh
 sudo apt install just gcc libseat-dev libxshmfence-dev libxkbcommon-dev libinput-dev glslc libudev-dev libfontconfig-dev
 ```
-The [`Justfile`](Justfile) wraps the recipes:
+
+## Use with a display manager (lightdm)
+
+`lightdm` can launch yserver as its X server for a graphical login (its
+        X-server command is configurable, unlike gdm/sddm). 
+
+1. Install the binary (requires sudo): `just install` (installs it at `/usr/local/bin/yserver`).
+2. Point lightdm at it — create `/etc/lightdm/lightdm.conf.d/99-yserver.conf`:
+
+```ini
+[Seat:*]
+xserver-command=/usr/local/bin/yserver
+```
+
+3. From a free TTY, restart lightdm: `sudo systemctl restart lightdm`.
+
+The greeter appears, you log in, and the login keyring is unlocked by lightdm's PAM stack.
+
+Known limitation: **VT switching does not work** in a lightdm-launched session
+yet — yserver runs rootful without a logind session there, so it can't use
+libseat for VT control ([#10](https://github.com/joske/yserver/issues/10)).
+
+## Use directly on TTY
 
 ```sh
 ## switch to a free TTY, then run:
@@ -105,30 +127,6 @@ Some convenience keybinds are available:
 - Ctrl-Alt-Backspace: zap the server, return to console
 - Ctrl-Alt-Enter: create a screenshot/scanout of the framebuffer in CWD
 - Ctrl-Alt-F12: dump all drawables as PPM files to CWD
-
-## Use with a display manager (lightdm)
-
-`lightdm` can launch yserver as its X server for a graphical login (its
-X-server command is configurable, unlike gdm/sddm). yserver understands
-X-style argv (`:N`, `vtN`, `-seat`, `-auth`, `-nolisten`, `-displayfd`) and the
-SIGUSR1/`-displayfd` readiness handshake, so the greeter and your session start
-normally.
-
-1. `just install-lightdm` — installs the binary to `/usr/local/bin/yserver` and
-   writes `/etc/lightdm/lightdm.conf.d/99-yserver.conf`. This makes yserver your
-   graphical login, so if it fails to start you'll need a text TTY to recover.
-2. From a free TTY, restart lightdm: `sudo systemctl restart lightdm`.
-
-(Or by hand: `just install` for just the binary, then create the conf yourself —
-`[Seat:*]` with `xserver-command=/usr/local/bin/yserver`.)
-
-The greeter appears, you log in, and the login keyring is unlocked by lightdm's PAM stack.
-
-To undo: `sudo rm /etc/lightdm/lightdm.conf.d/99-yserver.conf && sudo systemctl restart lightdm`.
-
-Known limitation: **VT switching does not work** in a lightdm-launched session
-yet — yserver runs rootful without a logind session there, so it can't use
-libseat for VT control ([#10](https://github.com/joske/yserver/issues/10)).
 
 ## Regression coverage with xts5 and rendercheck
 
