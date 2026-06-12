@@ -48,9 +48,8 @@ Extension name: `"XC-MISC"`. No events, no errors. Version 1.1.
   Semantics: a contiguous range of `count` XIDs starting at
   `start_id`, all inside the requesting client's `base..base|mask`
   space and none currently designating a live resource. Exhausted →
-  `start_id = 0, count = 0` (Xorg `dix/resource.c:733-734` — wait,
-  `id > maxid → id = maxid = 0` then `count = max-min+1 = 1`; see
-  "Edge cases" below).
+  wire shape `start_id = 0, count = 1` (see "Edge cases" — this is
+  Xorg's exact encoding, not a typo).
 - **GetXIDList (minor 2)**: req 8 bytes (`count(4)` after header);
   reply: variable — `length = count_found` (each XID is one 4-byte
   word), `count_found(4)` at bytes 8..12, pad to 32, then
@@ -69,16 +68,29 @@ client's `byte_order` — same as every other reply encoder.
   (`start_id=0, count=1`) rather than inventing `count=0` —
   bug-compatibility beats prettiness (libxcb's exhaustion check is
   `start == 0`).
-- GetXIDList with huge `count`: Xorg returns BadAlloc only on
-  overflowing alloc; we instead clamp the scan to the client's range
-  size (`mask + 1` IDs max) — the reply can never exceed
-  `min(count, mask+1)` entries. No BadAlloc path needed (no
-  unbounded allocation exists). Deviation note: a client asking for
-  >2M IDs gets a shorter list than Xorg's theoretical (but equally
-  range-bounded) answer — observably identical in practice.
-- Length validation: GetVersion req must be 2 units, GetXIDRange 1
-  unit, GetXIDList 2 units — mismatch → BadLength via
-  `emit_x11_error_with_minor` (match the RENDER arm pattern).
+- GetXIDList with huge `count`: **explicit Xorg deviation.** Xorg
+  pre-rejects `count > u32::MAX/8` with BadAlloc, then allocates
+  `count × 8` bytes (multi-GB for hostile counts) and returns
+  BadAlloc on allocation failure (`xcmisc.c:101-106`). We instead
+  clamp the scan to the client's range size — the reply can never
+  exceed `min(count, mask+1)` entries (≤ ~4 MiB of reply), so no
+  unbounded allocation exists and no BadAlloc path is reachable by
+  construction (Rust `Vec` growth of ≤4 MiB aborts only on true
+  OOM, same as every other reply buffer in the server). Observable
+  difference vs Xorg: a request for more IDs than the range holds
+  gets `min(count, free-in-range)` instead of Xorg's identical-
+  in-practice range-bounded answer, and absurd counts get a short
+  list instead of BadAlloc. Rationale: never let a client make the
+  server allocate gigabytes.
+- Unknown minor opcode → **BadRequest** via
+  `emit_x11_error_with_minor` (Xorg's dispatcher default,
+  `xcmisc.c:129-141`) — NOT silently ignored.
+- Length validation: the top-level exact-length table
+  (`request_lengths`) is core-opcode-only, so XC-MISC validates
+  inside `handle_xcmisc_request`: GetVersion req must be 2 units
+  (8 bytes), GetXIDRange 1 unit (4 bytes), GetXIDList 2 units
+  (8 bytes) — mismatch → BadLength via `emit_x11_error_with_minor`
+  (match the RENDER arm pattern).
 
 ## Design
 
@@ -121,7 +133,13 @@ Maintenance hazard: a future extension adding a 10th XID-keyed map
 must extend this. Mitigation: doc comments on `xid_occupied` AND on
 `xid_in_use` cross-referencing each other, plus a test that seeds one
 resource of EVERY namespace and asserts occupancy (a new map without
-coverage shows up in review against that test's pattern).
+coverage shows up in review against that test's pattern). When
+auditing, note that not every `HashMap<u32, ..>` is an XID namespace:
+maps keyed by client ids, host xids, or internal handles
+(`zombie_clients`, `host_glyphset_refcounts`, host-side caches) are
+NOT client-XID-keyed and don't belong in `xid_occupied` — the test
+seeds only maps whose keys arrive from client `CARD32` resource-id
+fields on the wire.
 
 Zombie clients (RetainPermanent/Temporary) need no special handling:
 their bases are never released by `IdAllocator`, so a live client's
@@ -131,9 +149,14 @@ ownership filtering is unnecessary; occupancy is sufficient.
 
 ### GetXIDRange algorithm
 
-Xorg shrinks a `[id..maxid]` window around live resources via
-`AvailableID` probes. Equivalent and simpler given our map-based
-table: collect the client's used IDs once, sort, and scan gaps:
+Xorg walks the client's own resource buckets and shrinks a
+`[id..maxid]` window via `AvailableID` probes
+(`dix/resource.c:707-737`). We deliberately use a DIFFERENT,
+protocol-conformant implementation (the spec promises only "a
+contiguous range of unused IDs", not a particular one): collect the
+client's used IDs once, sort, and scan gaps. Not the same algorithm
+or cost profile as Xorg — an implementation choice, traded for
+simplicity against our map-based table:
 
 ```rust
 fn free_xid_range(state: &ServerState, base: u32, mask: u32) -> (u32, u32) {
@@ -164,7 +187,8 @@ once `count` is found, which for libxcb is always small.
 
 `handle_xcmisc_request` in `process_request.rs`, modeled on
 `handle_render_request`: `match header.data { 0 => .., 1 => .., 2 => ..,
-other => log::debug + Handled }`. Reply encoders
+other => BadRequest via emit_x11_error_with_minor }` (Xorg dispatcher
+default — see Edge cases). Reply encoders
 `write_xcmisc_get_version_reply` / `..get_xid_range_reply` /
 `..get_xid_list_reply` in `yserver-protocol/src/x11/mod.rs` next to
 the other fixed-size encoders, using `write_u16`/`write_u32`.
@@ -192,6 +216,7 @@ table is the single source of truth on both.
    - GetXIDRange fully-exhausted edge → wire shape `start_id=0,
      count=1`.
    - BadLength for malformed request sizes (all three minors).
+   - Unknown minor (e.g. 3) → BadRequest with minor echoed.
    - QueryExtension "XC-MISC" → present, opcode 152; ListExtensions
      contains it.
 2. **Exhaustion smoke (`tools/xid-exhaust-probe.c`):** xcb client
