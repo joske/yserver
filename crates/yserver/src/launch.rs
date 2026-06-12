@@ -7,7 +7,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, ErrorKind, Read, Write},
     os::{
-        fd::{AsRawFd, RawFd},
+        fd::{AsRawFd, FromRawFd, RawFd},
         unix::{
             fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
             net::UnixListener,
@@ -439,33 +439,15 @@ pub fn autopick(socket_dir: &Path) -> io::Result<(u16, UnixListener, PathBuf)> {
 }
 
 /// Write `"<display>\n"` (Xorg's `-displayfd` format) to `fd`, then close
-/// it. Used only when `-displayfd N` was given. Close errors are ignored:
-/// the fd is single-use and there is nothing actionable after the payload
-/// was written.
+/// it. Takes ownership of the fd (closed on every exit path via drop).
+/// Close errors are ignored: the fd is single-use and there is nothing
+/// actionable after the payload was written.
 pub fn write_displayfd(fd: RawFd, display: u16) -> io::Result<()> {
-    let s = format!("{display}\n");
-    let bytes = s.as_bytes();
-    let mut written = 0usize;
-    while written < bytes.len() {
-        // SAFETY: writing `bytes[written..]` to a caller-owned fd.
-        let r = unsafe { libc::write(fd, bytes[written..].as_ptr().cast(), bytes.len() - written) };
-        if r < 0 {
-            let err = io::Error::last_os_error();
-            unsafe { libc::close(fd) };
-            return Err(err);
-        }
-        if r == 0 {
-            // A zero-length write would loop forever — fail instead.
-            unsafe { libc::close(fd) };
-            return Err(io::Error::new(
-                ErrorKind::WriteZero,
-                "displayfd write returned 0",
-            ));
-        }
-        written += r as usize;
-    }
-    unsafe { libc::close(fd) };
-    Ok(())
+    // SAFETY: ownership transfer — the caller hands us the `-displayfd`
+    // fd precisely so we consume it; no other owner exists. From here,
+    // `File` closes it on drop (success and error paths alike).
+    let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+    f.write_all(format!("{display}\n").as_bytes())
 }
 
 /// True if SIGUSR1's *inherited disposition* is `SIG_IGN` — the signal
@@ -827,19 +809,27 @@ mod tests {
         let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
         assert!(n > 0);
         assert_eq!(&buf[..n as usize], b"12\n");
+        // EOF proves the write end was closed by write_displayfd.
+        let n2 = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
+        assert_eq!(n2, 0);
         unsafe { libc::close(read_fd) };
     }
 
     #[test]
     fn sigusr1_disposition_roundtrip() {
-        // Process-global: save the prior disposition and restore it at
-        // the end (SIG_DFL is not necessarily what we started with). No
-        // other unit test in this crate touches SIGUSR1 disposition —
+        // Process-global: restore the prior disposition even on panic.
+        // No other unit test in this crate touches SIGUSR1 disposition —
         // keep it that way (tests share one process).
+        struct Restore(libc::sighandler_t);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                unsafe { libc::signal(libc::SIGUSR1, self.0) };
+            }
+        }
         let prev = unsafe { libc::signal(libc::SIGUSR1, libc::SIG_IGN) };
+        let _restore = Restore(prev);
         assert!(sigusr1_is_ignored());
         unsafe { libc::signal(libc::SIGUSR1, libc::SIG_DFL) };
         assert!(!sigusr1_is_ignored());
-        unsafe { libc::signal(libc::SIGUSR1, prev) };
     }
 }
