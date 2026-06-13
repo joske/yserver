@@ -63,7 +63,7 @@ On `SIGUSR1` (release):
 
 On `SIGUSR2` (acquire). **Order matches Xorg `xf86VTEnter` — ACK first, then reacquire master**, because by the time the kernel sends acqsig it has *already* switched the VT to us; we cannot decline it.
 1. **`ioctl(VT_RELDISP, VT_ACKACQ)`** — acknowledge the acquire first.
-2. **`drmSetMaster`** on the DRM fd. The outgoing server got its release signal and dropped master before our acqsig, so this normally succeeds. If it returns `EBUSY` (outgoing server slow to drop): since we already own the VT, we cannot back out — **keep retrying `drmSetMaster` on the core loop's frame timer** (not a one-shot give-up) and defer the resume modeset until it succeeds. The screen stays blank for that brief window, then `run_resume` runs once master is held.
+2. **`drmSetMaster`** on the DRM fd. The kernel serializes VT switches, so the outgoing server already received its release signal and dropped master before our acqsig — this normally succeeds on the first try. If it returns `EBUSY` (outgoing server slow to drop), do a **bounded inline retry**: a small fixed number of attempts (e.g. ~10) spaced a few ms apart, *synchronously* in the acquire handler. The acquire is a rare, isolated event (we're resuming — no clients being serviced mid-switch), so a brief synchronous wait is acceptable and keeps the handler self-contained — no `next_wakeup`/`SeatState` "waiting-for-master" substate, and no lingering window for a second VT event to land in. If all retries fail (a genuinely misbehaving other server holding master), log an error and let `run_resume` proceed best-effort (its modeset will likely fail too, leaving us suspended-blank until the next switch) — a degenerate case, not our bug.
 3. `drive_seat_event(Enable)` → `run_resume` (re-modeset on existing device, rearm cursor, resume input, deferred full repaint) — run once `drmSetMaster` succeeds.
 
 ### Teardown
@@ -93,20 +93,20 @@ release: Ctrl-Alt-F2 (kernel) ── SIGUSR1 ─▶ signalfd ─▶ direct VT ha
    [screen → console / other graphical server]
 
 acquire: switch back (kernel) ── SIGUSR2 ─▶ signalfd ─▶ direct VT handler
-   VT_RELDISP(VT_ACKACQ) → drmSetMaster (retry on frame timer until held)
+   VT_RELDISP(VT_ACKACQ) → drmSetMaster (bounded inline retry on EBUSY)
    → drive_seat_event(Enable)=run_resume + resume input thread   [screen restored]
 ```
 
 ## Error handling
 
 - **`drmDropMaster` fails:** log; still `VT_RELDISP(1)` (don't wedge the kernel) — worst case the next server's `SetMaster` fails and it handles its own retry.
-- **`drmSetMaster` `EBUSY`:** we already own the VT (post-ACK), so retry on the frame timer until it succeeds; defer the resume modeset until then (brief blank, not a give-up).
+- **`drmSetMaster` `EBUSY`:** bounded inline retry (small fixed count, few-ms spacing) in the acquire handler; on exhaustion, log + best-effort proceed. No `next_wakeup`/seat-substate dependency.
 - **`run_resume` modeset fails (card gone):** existing behaviour (log + stay; Risk #4 in 2026-05-27).
 - **Not on a real VT** (e.g. dev run, no console): `ConsoleGuard` already returns `None`; VT_PROCESS is simply not armed and the handler keeps the legacy dump behaviour.
 
 ## Testing
 
-- **Unit:** signal→event mapping (`SIGUSR1`→`Disable`, `SIGUSR2`→`Enable`, fed to `drive_seat_event`); `drmSetMaster` `EBUSY`→retry-on-frame-timer logic (mock the ioctl result); input-thread pause/resume control toggling the thread's dispatch state.
+- **Unit:** signal→event mapping (`SIGUSR1`→`Disable`, `SIGUSR2`→`Enable`, fed to `drive_seat_event`); `drmSetMaster` `EBUSY`→bounded-inline-retry logic (mock the ioctl result; assert N attempts then best-effort proceed); input-thread pause/resume control toggling the thread's dispatch state.
 - **Reused coverage:** the suspend/resume state-machine tests from 2026-05-27 still apply.
 - **HW smoke (the real gate — user-driven):** from a lightdm/direct `yserver :0`:
   - `Ctrl-Alt-F<n>` to a text console and back → screen restores, clients alive, no stuck keys.
