@@ -24,31 +24,28 @@ The cap exists to disconnect a client that isn't *draining* (accumulating backlo
 - Modify: `crates/yserver-core/src/core_loop/client_io.rs` (`buffer_or_disconnect`)
 - Test: same file (`#[cfg(test)]`)
 
-- [ ] **Step 1: Write the failing test.** A single write larger than `OUTBOUND_CAP` onto an empty `outbound` must buffer in full and return `WouldBlock` (not `Disconnect`). A second write that pushes an *already non-empty* `outbound` past the cap must still return `Disconnect`.
+- [ ] **Step 1: Write the failing test.** Call `buffer_or_disconnect` **directly** (it's private to the module; the `#[cfg(test)]` mod can call it) so the cap logic is exercised deterministically — going through `write_or_buffer` over a socketpair is flaky because a partial direct write would hit the remainder path instead. A single write larger than `OUTBOUND_CAP` onto an empty `outbound` must buffer in full and return `WouldBlock`; a write that pushes an *already non-empty* `outbound` past the cap must still return `Disconnect`.
 
 ```rust
 #[test]
 fn single_oversized_reply_buffers_when_outbound_empty() {
-    let mut client = test_client_nonblocking(); // peer not reading
+    let mut client = test_client(); // existing test ClientState ctor; outbound empty
     let big = vec![0u8; OUTBOUND_CAP + 1_000_000];
-    // First write: fresh reply, outbound empty -> must buffer, not disconnect.
-    let outcome = write_or_buffer(&mut client, &big).unwrap();
+    let outcome = buffer_or_disconnect(&mut client, &big);
     assert_eq!(outcome, WriteOutcome::WouldBlock);
-    assert!(!client.outbound.is_empty());
+    assert_eq!(client.outbound.len(), big.len()); // buffered in full
 }
 
 #[test]
 fn accumulation_past_cap_still_disconnects() {
-    let mut client = test_client_nonblocking();
-    // Prime outbound so it's non-empty and near the cap.
+    let mut client = test_client();
     client.outbound.extend(std::iter::repeat_n(0u8, OUTBOUND_CAP - 10));
-    let more = vec![0u8; 1000];
-    let outcome = write_or_buffer(&mut client, &more).unwrap();
+    let outcome = buffer_or_disconnect(&mut client, &[0u8; 1000]);
     assert_eq!(outcome, WriteOutcome::Disconnect);
 }
 ```
 
-(If a non-blocking socket-pair test helper doesn't already exist near the `reconcile_writable_interest_tracks_outbound_state` test in `run.rs`, add a small one: `socketpair`, set the local end non-blocking, leave the peer unread so writes back up.)
+(Reuse the existing test `ClientState` constructor already used by the test at `client_io.rs:160`.)
 
 - [ ] **Step 2: Run, verify failure.** `cargo test -p yserver-core single_oversized_reply_buffers_when_outbound_empty -- --nocapture` → FAIL (currently returns `Disconnect`).
 
@@ -147,7 +144,7 @@ fn get_image_reply_header_honors_big_endian_client() {
 
 - [ ] **Step 2: Run, verify failure.** FAILs (current patch is `to_le_bytes`, and length isn't patched at all).
 
-- [ ] **Step 3: Implement.** Replace the LE patches in the `Some(bytes)` branch with byte-order-aware writes for sequence, **length** (recomputed from the payload so it always matches), and visual. Factor into a small `patch_get_image_header` helper so it's testable:
+- [ ] **Step 3: Implement.** Replace the LE patches in the `Some(bytes)` branch with byte-order-aware writes for sequence, **length** (recomputed from the payload so it always matches), and visual. Factor into a small `patch_get_image_header` helper so it's testable. Note: `yserver_protocol`'s `write_u16`/`write_u32` *append* to a `Vec` — they don't write in place at an offset — so patch with `copy_from_slice` of `to_le_bytes`/`to_be_bytes` selected by `order`:
 
 ```rust
 fn patch_get_image_header(
@@ -158,15 +155,23 @@ fn patch_get_image_header(
 ) -> Vec<u8> {
     if bytes.len() >= 32 {
         let len_words = ((bytes.len() - 32) / 4) as u32;
-        write_u16_at(order, &mut bytes, 2, sequence.0);
-        write_u32_at(order, &mut bytes, 4, len_words);
-        write_u32_at(order, &mut bytes, 8, visual);
+        let (seq, len, vis) = match order {
+            ClientByteOrder::LittleEndian => (
+                sequence.0.to_le_bytes(), len_words.to_le_bytes(), visual.to_le_bytes(),
+            ),
+            ClientByteOrder::BigEndian => (
+                sequence.0.to_be_bytes(), len_words.to_be_bytes(), visual.to_be_bytes(),
+            ),
+        };
+        bytes[2..4].copy_from_slice(&seq);
+        bytes[4..8].copy_from_slice(&len);
+        bytes[8..12].copy_from_slice(&vis);
     }
     bytes
 }
 ```
 
-(`write_u16_at`/`write_u32_at` = small helpers that store at an offset in the requested order; or reuse the existing `write_u16`/`write_u32` against a slice. Pixel data is untouched — ZPixmap bytes stay in the server's advertised image-byte-order, which the client accounts for.)
+(Pixel data is untouched — ZPixmap bytes stay in the server's advertised image-byte-order, which the client accounts for.)
 
 - [ ] **Step 4: Run, verify pass.** Test green; `cargo test -p yserver-core handle_get_image` green.
 
@@ -202,7 +207,7 @@ Extract the GPU→staging→CPU core of `do_dump_scanout_v2` into a function tha
 - Modify: `crates/yserver/src/kms/v2/backend.rs` (`do_dump_scanout_v2` ~7328; add `read_scanout_region`)
 - Test: same file `#[cfg(test)]`
 
-- [ ] **Step 1: Write the failing test.** With a Vk fixture, fill an OnScreen scanout BO with a known pattern; `read_scanout_region` of a sub-rect returns exactly that rect's bytes (packed `width*4` rows, BGRX). A second test: with no OnScreen BO present, OnScreen-only mode returns `Err`.
+- [ ] **Step 1: Write the failing test.** **Fixture note:** `for_tests_with_vk` has no scanout pools, and there is no synthetic multi-output fixture in-tree — so unit coverage here is limited to what `for_tests_with_vk_live_scene` provides (a single OnScreen BO). Write the feasible test: on the live-scene fixture, fill the OnScreen scanout BO with a known pattern; `read_scanout_region` of a sub-rect returns exactly that rect's bytes (packed `width*4` rows, BGRX). The "no OnScreen BO → `Err`" case is also unit-testable on a fixture with pools but no presented frame. The **multi-output spanning-rect → `Err`** case has no fixture without new plumbing — cover it in the HW smoke step (Task 7), or, only if unit coverage is required, add a minimal synthetic 2-pool fixture as a prerequisite sub-step. Do not block the implementer on a fixture that doesn't exist.
 
 - [ ] **Step 2: Run, verify failure** (function doesn't exist yet).
 
@@ -238,11 +243,11 @@ Then rewrite `do_dump_scanout_v2` to call `read_scanout_region(.., PermissiveDum
 - Modify: `crates/yserver/src/kms/v2/backend.rs` (`KmsBackendV2::get_image` ~11601)
 - Test: same file
 
-- [ ] **Step 1: Write the failing test.** A `get_image` whose resolved target is the root/screen returns the scanout pixels (known pattern) rather than the background-only root storage. A rect spanning more than one `scanout_pool` returns `Ok(None)` (→ handler degrades) rather than silently sampling one pool.
+- [ ] **Step 1: Write the failing test.** On the live-scene fixture, a `get_image` whose original target is the root returns the scanout pixels (known pattern) rather than the background-only root storage. (Same fixture caveat as Task 5: the multi-output spanning-rect → `Ok(None)` assertion needs new fixture plumbing or HW gating — cover it in Task 7 rather than blocking here.)
 
 - [ ] **Step 2: Run, verify failure.**
 
-- [ ] **Step 3: Implement.** In `get_image`, when the resolved target is the root/screen, source from `read_scanout_region(rect, OnScreenOnly)` instead of `engine.get_image`; run the bytes through the existing shared tail (`z_to_xy_planes`, `apply_z_plane_mask`, `wrap_get_image_reply`). On `Err` (no OnScreen BO, or multi-output spanning rect) return `Ok(None)` so the handler falls back to the existing reply. Single-output rects are served normally.
+- [ ] **Step 3: Implement.** Detect the root/screen target from the **original** drawable *before* `resolve_paint_target` — check the store entry for the incoming `host_xid` is `DrawableKind::Root` (equivalently, `host_xid == self.core.window_id`). Do **not** classify from the resolved `PaintTarget`: `resolve_paint_target` can return a redirected *backing* when the root is redirected, which would misclassify a redirected root. When it's the root, source from `read_scanout_region(rect, OnScreenOnly)` instead of `engine.get_image`; run the bytes through the existing shared tail (`z_to_xy_planes`, `apply_z_plane_mask`, `wrap_get_image_reply`). On `Err` (no OnScreen BO, or multi-output spanning rect) return `Ok(None)` so the handler falls back to the existing reply. Single-output rects are served normally.
 
 - [ ] **Step 4: Run, verify pass.**
 
