@@ -113,10 +113,6 @@ xserver-command=/usr/local/bin/yserver
 
 The greeter appears, you log in, and the login keyring is unlocked by lightdm's PAM stack.
 
-Known limitation: VT switching in a lightdm-launched session now works in
-direct mode when yserver has a real controlling console; libseat/logind mode
-still handles VT handoff through the seat manager ([#10](https://github.com/joske/yserver/issues/10)).
-
 ## Use directly on TTY
 
 ```sh
@@ -125,12 +121,6 @@ just startx
 ```
 
 which will start yserver and then execute your `~/.xinitrc` (or fall back to `/etc/X11/xinit/xinitrc`)
-
-    If you are using libseat, you can switch VT, and if you use direct on a
-    real console you can switch VT as well. In a non-console shell (pty,
-    terminal emulator) VT switching is not available; zap the server or log
-    out of your session otherwise.
-
 
 Some convenience keybinds are available:
 
