@@ -1,7 +1,7 @@
 # Root-window GetImage (screenshot support) — design
 
 **Date:** 2026-06-13
-**Status:** draft (rev 2 — premise corrected after live diagnosis)
+**Status:** draft (rev 3 — codex review folded in)
 **Branch:** `feat/root-getimage-screenshot` (worktree `yserver-master`)
 **Issue:** [#21 — Are screendumps supported?](https://github.com/joske/yserver/issues/21)
 
@@ -70,14 +70,23 @@ The write path (`core_loop/client_io.rs`):
 `GetImage`. **A single legitimate reply exceeds the cap, so it can never
 be delivered.**
 
-### Secondary observation (to verify, not yet root-caused)
+### Secondary root cause (confirmed by codex review): Disconnect leaves a half-open socket
 
 The handler returns `Disconnect`, yet `xwd` *hung* rather than receiving
-an immediate EOF. That implies the request-level `Disconnect` may not be
-promptly closing the client fd (suspect: the `Arc<Mutex<UnixStream>>`
-writer keeping the fd alive after teardown). Minor relative to the cap,
-but the Part 1 fix must not leave half-open sockets — verify the
-`Disconnect` teardown path actually closes the fd.
+an immediate EOF. Root-caused: the disconnect path sends
+`ReaderControl::Shutdown` and drops `ClientState`
+(`core_loop/process_disconnect.rs:96,173`), but the per-client **reader
+thread** is blocked in `read_request` holding a *cloned* `UnixStream`
+(`core_loop/client_reader.rs:19`). Dropping `ClientState` drops the
+*writer* `Arc<Mutex<UnixStream>>`, but the reader's clone keeps the fd
+open, so the kernel never tears the connection down — the client blocks
+forever on `read()`. This is the actual reason the observed symptom was a
+hang and not an EOF.
+
+This is a **real, independent bug**: with Part 1 in place, legitimate
+replies no longer trigger a cap-disconnect, but a *genuine* slow-client
+disconnect would still leave a half-open socket. So Part 1 must fix the
+teardown, not merely "verify" it.
 
 ## Goal
 
@@ -90,6 +99,10 @@ sub-region, and window grabs — matching Xorg `GetImage` semantics.
 - **Multi-head / XINERAMA rect stitching** — a single root `GetImage`
   rect spanning more than one output. Deferred to a follow-up. The test
   machine is single-output; single-output rects are fully supported now.
+  **Interim behaviour must be explicit, not silent:** a root rect that
+  spans more than one `scanout_pool` must `Err` (→ degrade to the existing
+  reply), NOT silently capture one pool and present it as the whole root.
+  A rect contained within a single output is served normally.
 - **Hardware cursor in the capture** — separate DRM plane, not in the
   scanout BO; Xorg's `GetImage` also omits it. Correct to exclude.
 - **Access-control / security model** — per the issue owner, match Xorg:
@@ -129,9 +142,35 @@ Arbitrary, still fails on 8K (~132 MiB), and weakens accumulation
 protection without addressing the conflation of "one big reply" with
 "slow client".
 
-**Also in Part 1:** verify the `RequestOutcome::Disconnect` teardown
-closes the client fd (secondary observation above), so a future genuine
-cap-exceed disconnects cleanly instead of leaving a half-open socket.
+**Also in Part 1 (required, not "verify") — close the socket on
+disconnect.** The disconnect teardown
+(`core_loop/process_disconnect.rs`) must perform an explicit
+`UnixStream::shutdown(Shutdown::Both)` on the live socket before/at
+`ClientState` removal, so a reader thread blocked in `read_request`
+unblocks and the fd is actually released. Without this, a genuine
+cap-exceed disconnect (or any disconnect of a client whose reader is
+mid-`read`) leaves a half-open socket and the client hangs — exactly the
+observed `xwd` symptom. (The writer `Arc<Mutex<UnixStream>>` and the
+reader's cloned stream share the fd; closing one handle is not enough —
+`shutdown(Both)` acts on the kernel socket regardless of how many
+descriptors reference it.)
+
+**Also in Part 1 — byte-order-correct reply header.** The GetImage reply
+header fields (sequence, reply length, visual) are currently written
+little-endian unconditionally: `wrap_get_image_reply`
+(`kms/v2/backend.rs:8158`) uses `to_le_bytes` for the length, and
+`handle_get_image` patches sequence `[2..4]` and visual `[8..12]` with
+`to_le_bytes` (`process_request.rs:18816`). This is wrong for big-endian
+clients — and **XTS connects big-endian clients**, which is the
+validation gate. Fix: write these header fields in the client's byte
+order (`handle_get_image` already resolves `byte_order` at line 18791;
+thread it into `wrap_get_image_reply` and the patch sites, mirroring the
+already-correct `write_get_image_reply` fallback which takes
+`ClientByteOrder`). This is a pre-existing bug in the **shared** GetImage
+reply path, so the fix benefits window GetImage too. **Pixel data is
+unchanged** — ZPixmap bytes are emitted in the server's advertised
+image-byte-order, which the client already accounts for; only the
+fixed header words need per-client ordering.
 
 ### Part 2 — return the composited image (content)
 
@@ -156,10 +195,18 @@ Part 1 is built we run `xwd -root` once:
    GPU→staging→CPU core out of `do_dump_scanout_v2`
    (`kms/v2/backend.rs:7328`) into a reusable function taking a
    root-relative rect: sub-rect `BufferImageCopy` (offset/extent), staging
-   sized to the rect, `COPY`-scoped barriers (not `ALL_COMMANDS`), reusing
-   the `BoPhase::OnScreen`-preferred BO selection. `do_dump_scanout_v2`
-   becomes one caller (full-BO rect + its PPM tail); root `GetImage`
-   becomes the other.
+   sized to the rect, `COPY`-scoped barriers (not `ALL_COMMANDS`).
+   `do_dump_scanout_v2` becomes one caller (full-BO rect + its PPM tail);
+   root `GetImage` becomes the other.
+   **BO selection differs from the dump.** The diagnostic dump falls back
+   `OnScreen → Pending → Submitted → Recording` (`backend.rs:7341`); a
+   user-visible screenshot must NOT — a `Pending`/`Recording` BO can be a
+   not-yet-presented or half-composited (torn) frame. `read_scanout_region`
+   for `GetImage` uses the **`OnScreen` BO only**; if there is no `OnScreen`
+   BO (e.g. very early boot, before the first flip), it returns `Err`, and
+   the handler degrades to the existing self-consistent reply rather than
+   capturing an in-progress frame. The dump caller keeps its permissive
+   fallback via a parameter.
 2. **Hook in `KmsBackendV2::get_image`** (`kms/v2/backend.rs:11601`) —
    when the resolved target is the root/screen, source from
    `read_scanout_region(rect)` instead of `engine.get_image`, then run the
@@ -207,17 +254,34 @@ client GetImage(root, x,y,w,h, ZPixmap, plane_mask)
   existing self-consistent zeroed reply (degrade, don't crash).
 - **Rect clamping** — clamp to BO bounds before copy (handler already
   rejects off-screen rects with `BadMatch`; mirror `engine::clamp_rect`).
-- **Empty rect after clamp** → empty bytes (matches `engine.get_image`).
+- **Zero-size / fully-clamped rect** — note the handler currently forces
+  `req.width.max(1)` / `req.height.max(1)` before the backend sees the
+  request (`process_request.rs:18803`), so a 0×0 `GetImage` yields a 1×1
+  pixel, not a zero-length reply. This is pre-existing and immaterial to
+  screenshots (never 0-size). The scanout path inherits the same
+  `max(1)` input; we do **not** special-case zero here (keep behaviour
+  identical to the existing window path rather than diverge). If strict
+  zero-length-reply conformance is later wanted, fix it once at the
+  handler for all GetImage paths.
 - **Genuine slow client** (accumulating backlog past the cap) → still
   `Disconnect`, now via a teardown verified to close the fd.
 
 ## Testing
 
-- **Unit (Part 1)** — `write_or_buffer`/`buffer_or_disconnect`: a single
-  reply larger than `OUTBOUND_CAP` with `outbound` empty buffers in full
-  and returns `WouldBlock` (currently returns `Disconnect` — this is the
-  failing test written first). Accumulation past the cap onto a
+- **Unit (Part 1 — cap)** — `write_or_buffer`/`buffer_or_disconnect`: a
+  single reply larger than `OUTBOUND_CAP` with `outbound` empty buffers in
+  full and returns `WouldBlock` (currently returns `Disconnect` — this is
+  the failing test written first). Accumulation past the cap onto a
   non-empty buffer still returns `Disconnect`.
+- **Unit/integration (Part 1 — socket close)** — disconnecting a client
+  whose reader is blocked in `read_request` releases the fd: after
+  teardown, a `read()` on the peer end returns EOF (0), not a block.
+  Failing first: assert the peer sees EOF; pre-fix it would hang.
+- **Unit (Part 1 — byte order)** — `wrap_get_image_reply` with a
+  big-endian client writes the reply length big-endian; `handle_get_image`
+  patches sequence/visual big-endian. Round-trip: a BE client's GetImage
+  reply header decodes to the correct sequence/length/visual. (XTS BE
+  GetImage is the on-HW gate.)
 - **Unit (Part 2, if implemented)** — `read_scanout_region` rect-clamp /
   packed-stride math; sub-rect copy equals the matching window of a
   full-BO copy.
