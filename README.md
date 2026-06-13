@@ -80,7 +80,7 @@ It requires a recent stable Rust toolchain and the following dependencies:
 #### Arch
 
 ```sh
-sudo pacman -S just gcc libseat libxshmfence libxkbcommon libinput glslc systemd-libs fontconfig
+sudo pacman -S just gcc seatd libxshmfence libxkbcommon libinput shaderc systemd-libs fontconfig
 ```
 
 #### Ubuntu
