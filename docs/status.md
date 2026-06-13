@@ -127,6 +127,16 @@ Cross-cutting bugs and followups that don't fit a stage live in
   dual-head mutter/muffin. Wire encoder unit tests are in
   `yserver-protocol`; core wiring/build validation is green. Hardware
   Cinnamon smoke on real dual-head is still the remaining proof gate.
+- **2026-06-13 root-window GetImage screenshot support**: the root
+  `GetImage` hang is fixed end-to-end for the generic screenshot path.
+  The outbound cap now allows a single large reply to buffer when the
+  queue is empty, disconnect teardown actively `shutdown(Both)`s the
+  socket so peers see EOF, `GetImage` reply headers are patched in the
+  client byte order, and the v2 backend routes root-window `GetImage`
+  through on-screen scanout readback instead of root storage. The new
+  root screenshot path is covered by unit tests and a backend
+  compile-time smoke; live `xwd -root` desktop smoke still needs a real
+  KMS session.
 - **2026-06-12 HW text-cursor offset diagnosed/fixed**: `silence` was
   selecting text above the visible I-beam only with
   `YSERVER_V2_HW_CURSOR=1`; `eiger`/Asahi looked correct because the

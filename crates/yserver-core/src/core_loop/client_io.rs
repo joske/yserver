@@ -77,7 +77,7 @@ pub fn write_or_buffer(client: &mut ClientState, bytes: &[u8]) -> io::Result<Wri
 /// Push `bytes` onto `client.outbound`, or return `Disconnect` if
 /// doing so would exceed `OUTBOUND_CAP`.
 fn buffer_or_disconnect(client: &mut ClientState, bytes: &[u8]) -> WriteOutcome {
-    if client.outbound.len() + bytes.len() > OUTBOUND_CAP {
+    if !client.outbound.is_empty() && client.outbound.len() + bytes.len() > OUTBOUND_CAP {
         log::warn!(
             "client_io: outbound cap exceeded — outbound={} bytes pending, +{} new ⇒ Disconnect",
             client.outbound.len(),
@@ -230,6 +230,26 @@ mod tests {
         // Now hand it more than OUTBOUND_CAP — must Disconnect.
         let huge = vec![0u8; OUTBOUND_CAP + 1];
         let outcome = write_or_buffer(&mut c, &huge).unwrap();
+        assert_eq!(outcome, WriteOutcome::Disconnect);
+    }
+
+    #[test]
+    fn single_oversized_reply_buffers_when_outbound_empty() {
+        let (a, _b) = pair_with_small_sndbuf();
+        let mut c = make_client(a);
+        let big = vec![0u8; OUTBOUND_CAP + 1_000_000];
+        let outcome = buffer_or_disconnect(&mut c, &big);
+        assert_eq!(outcome, WriteOutcome::WouldBlock);
+        assert_eq!(c.outbound.len(), big.len());
+    }
+
+    #[test]
+    fn accumulation_past_cap_still_disconnects() {
+        let (a, _b) = pair_with_small_sndbuf();
+        let mut c = make_client(a);
+        c.outbound
+            .extend(std::iter::repeat_n(0u8, OUTBOUND_CAP - 10));
+        let outcome = buffer_or_disconnect(&mut c, &[0u8; 1000]);
         assert_eq!(outcome, WriteOutcome::Disconnect);
     }
 

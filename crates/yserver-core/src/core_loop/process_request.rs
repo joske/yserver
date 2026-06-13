@@ -18794,10 +18794,14 @@ fn handle_get_image(
         .map_or(yserver_protocol::x11::ClientByteOrder::LittleEndian, |c| {
             c.byte_order
         });
-    let host_xid = state
-        .resources
-        .host_drawable_target(req.drawable)
-        .map(|t| t.host_xid());
+    let host_xid = if req.drawable == ROOT_WINDOW {
+        Some(backend.window_id())
+    } else {
+        state
+            .resources
+            .host_drawable_target(req.drawable)
+            .map(|t| t.host_xid())
+    };
     let host_reply = host_xid.and_then(|xid| {
         backend
             .get_image(
@@ -18813,20 +18817,8 @@ fn handle_get_image(
             .ok()
             .flatten()
     });
-    let buf: Vec<u8> = if let Some(mut bytes) = host_reply {
-        if bytes.len() >= 4 {
-            let s = sequence.0.to_le_bytes();
-            bytes[2] = s[0];
-            bytes[3] = s[1];
-        }
-        if bytes.len() >= 12 {
-            let v = crate::resources::ROOT_VISUAL.0.to_le_bytes();
-            bytes[8] = v[0];
-            bytes[9] = v[1];
-            bytes[10] = v[2];
-            bytes[11] = v[3];
-        }
-        bytes
+    let buf: Vec<u8> = if let Some(bytes) = host_reply {
+        patch_get_image_reply_header(bytes, byte_order, sequence, crate::resources::ROOT_VISUAL.0)
     } else {
         let mut buf: Vec<u8> = Vec::with_capacity(64);
         x11::write_get_image_reply(
@@ -18843,6 +18835,54 @@ fn handle_get_image(
     };
     let _byte_order = client.byte_order;
     Ok(write_to_client(client, client_id, &buf))
+}
+
+fn patch_get_image_reply_header(
+    mut bytes: Vec<u8>,
+    byte_order: x11::ClientByteOrder,
+    sequence: SequenceNumber,
+    visual: u32,
+) -> Vec<u8> {
+    if bytes.len() < 32 {
+        return bytes;
+    }
+    let seq = match byte_order {
+        x11::ClientByteOrder::LittleEndian => sequence.0.to_le_bytes(),
+        x11::ClientByteOrder::BigEndian => sequence.0.to_be_bytes(),
+    };
+    let len_words = u32::try_from((bytes.len() - 32) / 4).unwrap_or(u32::MAX);
+    let len = match byte_order {
+        x11::ClientByteOrder::LittleEndian => len_words.to_le_bytes(),
+        x11::ClientByteOrder::BigEndian => len_words.to_be_bytes(),
+    };
+    let vis = match byte_order {
+        x11::ClientByteOrder::LittleEndian => visual.to_le_bytes(),
+        x11::ClientByteOrder::BigEndian => visual.to_be_bytes(),
+    };
+    bytes[2..4].copy_from_slice(&seq);
+    bytes[4..8].copy_from_slice(&len);
+    bytes[8..12].copy_from_slice(&vis);
+    bytes
+}
+
+#[cfg(test)]
+mod get_image_reply_tests {
+    use super::patch_get_image_reply_header;
+    use yserver_protocol::x11::{ClientByteOrder, SequenceNumber};
+
+    #[test]
+    fn patch_get_image_reply_header_honors_big_endian() {
+        let bytes = vec![0u8; 40];
+        let patched = patch_get_image_reply_header(
+            bytes,
+            ClientByteOrder::BigEndian,
+            SequenceNumber(0x0102),
+            0xA1B2_C3D4,
+        );
+        assert_eq!(&patched[2..4], &0x0102u16.to_be_bytes());
+        assert_eq!(&patched[4..8], &2u32.to_be_bytes());
+        assert_eq!(&patched[8..12], &0xA1B2_C3D4u32.to_be_bytes());
+    }
 }
 
 /// Rewrite PolyText8/16 embedded font-change items (len == 255):

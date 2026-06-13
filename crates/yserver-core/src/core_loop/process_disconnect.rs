@@ -93,12 +93,15 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
         client_id.0,
         close_mode
     );
-    // Send the reader thread (if any) a Shutdown so it exits cleanly
-    // before we drop the client entry.
-    if let Some(client) = state.clients.get(&client_id.0)
-        && let Some(ctrl) = &client.reader_control
-    {
-        let _ = ctrl.send(crate::server::ReaderControl::Shutdown);
+    // Force the kernel socket closed so a blocked reader thread and the
+    // peer both observe EOF even if other UnixStream clones still exist.
+    if let Some(client) = state.clients.get(&client_id.0) {
+        if let Ok(writer) = client.writer.lock() {
+            let _ = writer.shutdown(std::net::Shutdown::Both);
+        }
+        if let Some(ctrl) = &client.reader_control {
+            let _ = ctrl.send(crate::server::ReaderControl::Shutdown);
+        }
     }
 
     // Audit #9 (docs/protocol-audit-2026-05-19.md) — before the
@@ -526,6 +529,7 @@ pub fn destroy_zombie_resources(
 mod tests {
     use std::{
         collections::{HashMap, HashSet, VecDeque},
+        io::Read,
         os::unix::net::UnixStream,
         sync::{Arc, Mutex, atomic::AtomicU16},
     };
@@ -547,6 +551,29 @@ mod tests {
             id,
             ClientState {
                 writer: Arc::new(Mutex::new(a)),
+                byte_order: ClientByteOrder::LittleEndian,
+                last_sequence: Arc::new(AtomicU16::new(0)),
+                resource_id_base: id << 20,
+                resource_id_mask: 0x000F_FFFF,
+                event_masks: HashMap::new(),
+                save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::new(),
+                xi1_event_classes: HashSet::new(),
+                xi1_window_event_classes: HashMap::new(),
+                outbound: VecDeque::new(),
+                watching_writable: false,
+                focused_window: ROOT_WINDOW,
+                reader_control: None,
+            },
+        );
+    }
+
+    fn install_client_with_writer(state: &mut ServerState, id: u32, writer: UnixStream) {
+        state.clients.insert(
+            id,
+            ClientState {
+                writer: Arc::new(Mutex::new(writer)),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
                 resource_id_base: id << 20,
@@ -704,6 +731,21 @@ mod tests {
             state.resources.resource_owner(ResourceId(0x0210_0001)),
             Some(ClientId(33)),
         );
+    }
+
+    #[test]
+    fn disconnect_shuts_down_socket_peer_sees_eof() {
+        let (local, peer) = UnixStream::pair().expect("socketpair");
+        peer.set_nonblocking(true).expect("peer nonblocking");
+        let mut state = ServerState::new();
+        install_client_with_writer(&mut state, 7, local);
+        let mut backend = RecordingBackend::new();
+
+        process_disconnect(&mut state, &mut backend, ClientId(7));
+
+        let mut buf = [0u8; 1];
+        let read = (&peer).read(&mut buf).expect("peer read");
+        assert_eq!(read, 0, "peer must observe EOF after disconnect");
     }
 
     #[test]

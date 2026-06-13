@@ -22,6 +22,7 @@ use std::{
     io,
 };
 
+use ash::vk;
 use yserver_core::{
     backend::{
         AnyHandle, Backend, BackendFdKind, ClipState, CursorHandle, DrawState, Dri3Caps,
@@ -7325,10 +7326,83 @@ fn dump_cursor_record_to_ppm(
     Ok(())
 }
 
-fn do_dump_scanout_v2(backend: &mut KmsBackendV2) -> io::Result<()> {
-    use std::sync::atomic::{AtomicU32, Ordering};
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ScanoutReadSelection {
+    OnScreenOnly,
+    PermissiveDump,
+}
 
-    use crate::kms::vk::{ops::run_one_shot_op, scanout::BoPhase};
+fn scanout_selection_phases(
+    selection: ScanoutReadSelection,
+) -> &'static [crate::kms::vk::scanout::BoPhase] {
+    match selection {
+        ScanoutReadSelection::OnScreenOnly => &[crate::kms::vk::scanout::BoPhase::OnScreen],
+        ScanoutReadSelection::PermissiveDump => &[
+            crate::kms::vk::scanout::BoPhase::OnScreen,
+            crate::kms::vk::scanout::BoPhase::Pending,
+            crate::kms::vk::scanout::BoPhase::Submitted,
+            crate::kms::vk::scanout::BoPhase::Recording,
+        ],
+    }
+}
+
+fn select_scanout_bo_for_rect(
+    backend: &KmsBackendV2,
+    rect: vk::Rect2D,
+    selection: ScanoutReadSelection,
+) -> io::Result<(usize, usize, vk::Rect2D)> {
+    let rx0 = i64::from(rect.offset.x);
+    let ry0 = i64::from(rect.offset.y);
+    let rx1 = rx0 + i64::from(rect.extent.width);
+    let ry1 = ry0 + i64::from(rect.extent.height);
+    let phases = scanout_selection_phases(selection);
+
+    for (pool_idx, layout) in backend.platform.outputs.iter().enumerate() {
+        let lx0 = i64::from(layout.x);
+        let ly0 = i64::from(layout.y);
+        let lx1 = lx0 + i64::from(layout.width);
+        let ly1 = ly0 + i64::from(layout.height);
+        if rx0 < lx0 || ry0 < ly0 || rx1 > lx1 || ry1 > ly1 {
+            continue;
+        }
+        let Some(pool) = backend
+            .platform
+            .scanout_pools
+            .get(pool_idx)
+            .and_then(|p| p.as_ref())
+        else {
+            continue;
+        };
+        for phase in phases {
+            if let Some(bo_idx) = pool.bos.iter().position(|bo| bo.state.phase == *phase) {
+                let local = vk::Rect2D {
+                    offset: vk::Offset2D {
+                        x: i32::try_from(rx0 - lx0).unwrap_or(i32::MAX),
+                        y: i32::try_from(ry0 - ly0).unwrap_or(i32::MAX),
+                    },
+                    extent: rect.extent,
+                };
+                return Ok((pool_idx, bo_idx, local));
+            }
+        }
+    }
+
+    Err(io::Error::other(match selection {
+        ScanoutReadSelection::OnScreenOnly => "root screenshot rect has no on-screen scanout bo",
+        ScanoutReadSelection::PermissiveDump => "scanout rect is not covered by any pool",
+    }))
+}
+
+fn read_scanout_region(
+    backend: &KmsBackendV2,
+    rect: vk::Rect2D,
+    selection: ScanoutReadSelection,
+) -> io::Result<Vec<u8>> {
+    use crate::kms::vk::ops::run_one_shot_op;
+
+    if rect.extent.width == 0 || rect.extent.height == 0 {
+        return Ok(Vec::new());
+    }
 
     let Some(vk) = backend.platform.vk.as_ref().cloned() else {
         return Err(io::Error::other("no vulkan context"));
@@ -7337,136 +7411,151 @@ fn do_dump_scanout_v2(backend: &mut KmsBackendV2) -> io::Result<()> {
         return Err(io::Error::other("no ops command pool"));
     };
 
-    let preferred = [
-        BoPhase::OnScreen,
-        BoPhase::Pending,
-        BoPhase::Submitted,
-        BoPhase::Recording,
-    ];
-    let mut chosen: Vec<(usize, usize)> = Vec::new();
-    for (pool_idx, pool) in backend.platform.scanout_pools.iter().enumerate() {
-        let Some(pool) = pool.as_ref() else {
-            continue;
-        };
-        for phase in preferred {
-            if let Some(bo_idx) = pool.bos.iter().position(|bo| bo.state.phase == phase) {
-                chosen.push((pool_idx, bo_idx));
-                break;
-            }
-        }
-    }
-    if chosen.is_empty() {
-        return Err(io::Error::other("no non-Free scanout bo found"));
+    let (pool_idx, bo_idx, local_rect) = select_scanout_bo_for_rect(backend, rect, selection)?;
+    let Some(pool) = backend
+        .platform
+        .scanout_pools
+        .get(pool_idx)
+        .and_then(|p| p.as_ref())
+    else {
+        return Err(io::Error::other("scanout pool vanished"));
+    };
+    let Some(bo) = pool.bos.get(bo_idx) else {
+        return Err(io::Error::other("scanout bo vanished"));
+    };
+    let image = bo.vk_image;
+    let staging_buffer = bo.vk_transfer.staging_buffer;
+    let staging_mapped = bo.vk_transfer.staging_mapped;
+    let staging_size = bo.vk_transfer.staging_size;
+    let copy_width = local_rect.extent.width;
+    let copy_height = local_rect.extent.height;
+    let needed_bytes = usize::try_from(copy_width)
+        .ok()
+        .and_then(|w| {
+            usize::try_from(copy_height)
+                .ok()
+                .and_then(move |h| w.checked_mul(h))
+        })
+        .and_then(|px| px.checked_mul(4))
+        .ok_or_else(|| io::Error::other("scanout copy size overflow"))?;
+    if needed_bytes > staging_size as usize {
+        return Err(io::Error::other("scanout staging buffer too small"));
     }
 
-    static DUMP_COUNT: AtomicU32 = AtomicU32::new(0);
-    let run = DUMP_COUNT.fetch_add(1, Ordering::Relaxed);
+    let run_result = run_one_shot_op(&vk, pool_handle, |vk, cb| {
+        let pre = [ash::vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(ash::vk::PipelineStageFlags2::ALL_COMMANDS)
+            .src_access_mask(ash::vk::AccessFlags2::MEMORY_WRITE)
+            .dst_stage_mask(ash::vk::PipelineStageFlags2::COPY)
+            .dst_access_mask(ash::vk::AccessFlags2::TRANSFER_READ)
+            .old_layout(ash::vk::ImageLayout::GENERAL)
+            .new_layout(ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .image(image)
+            .subresource_range(
+                ash::vk::ImageSubresourceRange::default()
+                    .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
+                    .level_count(1)
+                    .layer_count(1),
+            )];
+        let pre_dep = ash::vk::DependencyInfo::default().image_memory_barriers(&pre);
+        crate::vk_count!(cmd_pipeline_barrier2);
+        unsafe { vk.device.cmd_pipeline_barrier2(cb, &pre_dep) };
+
+        let region = [ash::vk::BufferImageCopy::default()
+            .buffer_offset(0)
+            .buffer_row_length(0)
+            .buffer_image_height(0)
+            .image_subresource(
+                ash::vk::ImageSubresourceLayers::default()
+                    .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
+                    .layer_count(1),
+            )
+            .image_offset(ash::vk::Offset3D {
+                x: local_rect.offset.x,
+                y: local_rect.offset.y,
+                z: 0,
+            })
+            .image_extent(ash::vk::Extent3D {
+                width: copy_width,
+                height: copy_height,
+                depth: 1,
+            })];
+        unsafe {
+            crate::vk_count!(cmd_copy_image_to_buffer);
+            vk.device.cmd_copy_image_to_buffer(
+                cb,
+                image,
+                ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                staging_buffer,
+                &region,
+            );
+        }
+
+        let post = [ash::vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(ash::vk::PipelineStageFlags2::COPY)
+            .src_access_mask(ash::vk::AccessFlags2::TRANSFER_READ)
+            .dst_stage_mask(ash::vk::PipelineStageFlags2::ALL_COMMANDS)
+            .dst_access_mask(ash::vk::AccessFlags2::MEMORY_WRITE)
+            .old_layout(ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .new_layout(ash::vk::ImageLayout::GENERAL)
+            .image(image)
+            .subresource_range(
+                ash::vk::ImageSubresourceRange::default()
+                    .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
+                    .level_count(1)
+                    .layer_count(1),
+            )];
+        let post_dep = ash::vk::DependencyInfo::default().image_memory_barriers(&post);
+        crate::vk_count!(cmd_pipeline_barrier2);
+        unsafe { vk.device.cmd_pipeline_barrier2(cb, &post_dep) };
+        Ok(())
+    });
+
+    if let Err(e) = run_result {
+        return Err(io::Error::other(format!("scanout copy submit: {e:?}")));
+    }
+
+    let raw = unsafe { std::slice::from_raw_parts(staging_mapped.as_ptr(), needed_bytes) };
+    Ok(raw.to_vec())
+}
+
+fn do_dump_scanout_v2(backend: &mut KmsBackendV2) -> io::Result<()> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
     let mut wrote_any = false;
     let mut last_err: Option<io::Error> = None;
 
-    for (pool_idx, bo_idx) in chosen {
-        let Some(pool) = backend
-            .platform
-            .scanout_pools
-            .get_mut(pool_idx)
-            .and_then(|p| p.as_mut())
-        else {
-            continue;
-        };
-        let Some(bo) = pool.bos.get_mut(bo_idx) else {
-            continue;
-        };
-        let width = bo.width;
-        let height = bo.height;
-        let pitch = bo.pitch;
-        let image = bo.vk_image;
-        let staging_buffer = bo.vk_transfer.staging_buffer;
-        let staging_mapped = bo.vk_transfer.staging_mapped;
-        let staging_size = bo.vk_transfer.staging_size;
+    static DUMP_COUNT: AtomicU32 = AtomicU32::new(0);
+    let run = DUMP_COUNT.fetch_add(1, Ordering::Relaxed);
 
-        let run_result = run_one_shot_op(&vk, pool_handle, |vk, cb| {
-            let pre = [ash::vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(ash::vk::PipelineStageFlags2::ALL_COMMANDS)
-                .src_access_mask(ash::vk::AccessFlags2::MEMORY_WRITE)
-                .dst_stage_mask(ash::vk::PipelineStageFlags2::COPY)
-                .dst_access_mask(ash::vk::AccessFlags2::TRANSFER_READ)
-                .old_layout(ash::vk::ImageLayout::GENERAL)
-                .new_layout(ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                .image(image)
-                .subresource_range(
-                    ash::vk::ImageSubresourceRange::default()
-                        .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
-                        .level_count(1)
-                        .layer_count(1),
-                )];
-            let pre_dep = ash::vk::DependencyInfo::default().image_memory_barriers(&pre);
-            crate::vk_count!(cmd_pipeline_barrier2);
-            unsafe { vk.device.cmd_pipeline_barrier2(cb, &pre_dep) };
-
-            let region = [ash::vk::BufferImageCopy::default()
-                .buffer_offset(0)
-                .buffer_row_length(0)
-                .buffer_image_height(0)
-                .image_subresource(
-                    ash::vk::ImageSubresourceLayers::default()
-                        .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
-                        .layer_count(1),
-                )
-                .image_offset(ash::vk::Offset3D::default())
-                .image_extent(ash::vk::Extent3D {
-                    width,
-                    height,
-                    depth: 1,
-                })];
-            unsafe {
-                crate::vk_count!(cmd_copy_image_to_buffer);
-                vk.device.cmd_copy_image_to_buffer(
-                    cb,
-                    image,
-                    ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    staging_buffer,
-                    &region,
-                );
+    for (pool_idx, layout) in backend.platform.outputs.iter().enumerate() {
+        let rect = vk::Rect2D {
+            offset: vk::Offset2D {
+                x: layout.x,
+                y: layout.y,
+            },
+            extent: vk::Extent2D {
+                width: u32::from(layout.width),
+                height: u32::from(layout.height),
+            },
+        };
+        let raw = match read_scanout_region(backend, rect, ScanoutReadSelection::PermissiveDump) {
+            Ok(raw) => raw,
+            Err(err) => {
+                log::warn!("v2 do_dump_scanout: output {pool_idx} failed: {err}");
+                last_err = Some(err);
+                continue;
             }
-
-            let post = [ash::vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(ash::vk::PipelineStageFlags2::COPY)
-                .src_access_mask(ash::vk::AccessFlags2::TRANSFER_READ)
-                .dst_stage_mask(ash::vk::PipelineStageFlags2::ALL_COMMANDS)
-                .dst_access_mask(ash::vk::AccessFlags2::MEMORY_WRITE)
-                .old_layout(ash::vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                .new_layout(ash::vk::ImageLayout::GENERAL)
-                .image(image)
-                .subresource_range(
-                    ash::vk::ImageSubresourceRange::default()
-                        .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
-                        .level_count(1)
-                        .layer_count(1),
-                )];
-            let post_dep = ash::vk::DependencyInfo::default().image_memory_barriers(&post);
-            crate::vk_count!(cmd_pipeline_barrier2);
-            unsafe { vk.device.cmd_pipeline_barrier2(cb, &post_dep) };
-            Ok(())
-        });
-
-        if let Err(e) = run_result {
-            backend.platform.renderer_failed = true;
-            let err = io::Error::other(format!("scanout copy submit: {e:?}"));
-            log::warn!("v2 do_dump_scanout: output {pool_idx} failed: {err}");
-            last_err = Some(err);
-            continue;
-        }
+        };
 
         let path = format!("./yserver-v2-scanout-{run}-out{pool_idx}.ppm");
-        let raw =
-            unsafe { std::slice::from_raw_parts(staging_mapped.as_ptr(), staging_size as usize) };
         use std::io::Write;
         let mut file = std::fs::File::create(&path)?;
-        file.write_all(format!("P6\n{width} {height}\n255\n").as_bytes())?;
-        let mut row_buf = vec![0u8; (width * 3) as usize];
-        for y in 0..height as usize {
-            let row_start = y * pitch as usize;
-            for x in 0..width as usize {
+        file.write_all(format!("P6\n{} {}\n255\n", layout.width, layout.height).as_bytes())?;
+        let mut row_buf = vec![0u8; usize::from(layout.width) * 3];
+        for y in 0..usize::from(layout.height) {
+            let row_start = y * usize::from(layout.width) * 4;
+            for x in 0..usize::from(layout.width) {
                 let pi = row_start + x * 4;
                 let dst = x * 3;
                 row_buf[dst] = raw[pi + 2];
@@ -7475,7 +7564,11 @@ fn do_dump_scanout_v2(backend: &mut KmsBackendV2) -> io::Result<()> {
             }
             file.write_all(&row_buf)?;
         }
-        log::info!("v2 do_dump_scanout: wrote {path} ({width}x{height})");
+        log::info!(
+            "v2 do_dump_scanout: wrote {path} ({}x{})",
+            layout.width,
+            layout.height
+        );
         wrote_any = true;
     }
 
@@ -11614,6 +11707,61 @@ impl Backend for KmsBackendV2 {
         // which under redirect is B"). Depth comes from the
         // resolved target's drawable (backing is allocated to match
         // W's depth, so v1 / v2 see the same wire shape).
+        if host_xid == self.core.window_id {
+            let Some(root_id) = self.store.lookup(self.core.window_id) else {
+                self.log_v2_gap("get_image_root_unknown_root");
+                return Ok(None);
+            };
+            let (depth, storage_extent) = match self.store.get(root_id) {
+                Some(d) => (d.depth, d.storage.extent),
+                None => return Ok(None),
+            };
+            let mask = plane_mask & depth_plane_mask(depth);
+            if format == GET_IMAGE_FORMAT_XY_PIXMAP && mask == 0 {
+                return Ok(Some(wrap_get_image_reply(depth, Vec::new())));
+            }
+            let rect = ash::vk::Rect2D {
+                offset: ash::vk::Offset2D {
+                    x: i32::from(x),
+                    y: i32::from(y),
+                },
+                extent: ash::vk::Extent2D {
+                    width: u32::from(width),
+                    height: u32::from(height),
+                },
+            };
+            let clipped = crate::kms::v2::engine::clamp_rect(rect, storage_extent);
+            let start = std::time::Instant::now();
+            let result = match read_scanout_region(self, rect, ScanoutReadSelection::OnScreenOnly) {
+                Ok(mut pixel_bytes) => {
+                    if format == GET_IMAGE_FORMAT_XY_PIXMAP {
+                        pixel_bytes = z_to_xy_planes(
+                            &pixel_bytes,
+                            clipped.extent.width,
+                            clipped.extent.height,
+                            depth,
+                            mask,
+                        );
+                    } else if mask != depth_plane_mask(depth) {
+                        apply_z_plane_mask(&mut pixel_bytes, depth, mask);
+                    }
+                    let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    self.telemetry.record_one_shot_submit();
+                    self.telemetry.record_fence_wait(ns);
+                    self.trace_simple(SubmitKind::GetImage, root_id, 1);
+                    Ok(Some(wrap_get_image_reply(depth, pixel_bytes)))
+                }
+                Err(e) => {
+                    log::warn!(
+                        "v2 get_image: root scanout readback failed for host_xid \
+                         {host_xid:#x}: {e:?}",
+                    );
+                    Ok(None)
+                }
+            };
+            self.drain_frame_builder_telemetry();
+            return result;
+        }
         let Some(target) = self.resolve_paint_target(host_xid) else {
             self.log_v2_gap("get_image_unknown_xid");
             return Ok(None);
@@ -21153,6 +21301,94 @@ mod tests {
             .expect("root-path get_image")
             .expect("root-path bytes");
         assert_eq!(root_out, expected);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn root_get_image_reads_scanout_pixels_not_root_storage() {
+        use ash::vk;
+        use yserver_core::{resources::ROOT_WINDOW, server::ServerState};
+        use yserver_protocol::x11::ResourceId;
+
+        let mut state = ServerState::new();
+        let mut backend = match KmsBackendV2::for_tests_with_vk_live_scene() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        install_client_for_v2(&mut state, 14);
+        state
+            .resources
+            .window_mut(ROOT_WINDOW)
+            .expect("root")
+            .host_xid = yserver_core::backend::WindowHandle::from_raw(backend.core.window_id);
+
+        let (root_w, root_h) = {
+            let root = state.resources.window(ROOT_WINDOW).expect("root window");
+            (root.width, root.height)
+        };
+        let window = ResourceId(0x2002);
+        let window_host = create_live_v2_window(
+            &mut state,
+            &mut backend,
+            window,
+            ROOT_WINDOW,
+            32,
+            24,
+            16,
+            16,
+        );
+
+        let root_color = 0x0011_2233;
+        let window_color = 0x00aa_55ff;
+        backend
+            .fill_rectangle(
+                None,
+                backend.core.window_id,
+                root_color,
+                0,
+                0,
+                root_w,
+                root_h,
+            )
+            .expect("fill root");
+        backend
+            .fill_rectangle(None, window_host.as_raw(), window_color, 0, 0, 16, 16)
+            .expect("fill window");
+        backend.tick_maybe_composite_for_tests();
+
+        let scan_rect = vk::Rect2D {
+            offset: vk::Offset2D { x: 32, y: 24 },
+            extent: vk::Extent2D {
+                width: 16,
+                height: 16,
+            },
+        };
+        let scanout = super::read_scanout_region(
+            &backend,
+            scan_rect,
+            super::ScanoutReadSelection::OnScreenOnly,
+        )
+        .expect("scanout readback");
+        let root_out = backend
+            .get_image_pixels_for_tests(backend.core.window_id, 2, 32, 24, 16, 16, !0)
+            .expect("root get_image")
+            .expect("root bytes");
+        let window_out = backend
+            .get_image_pixels_for_tests(window_host.as_raw(), 2, 0, 0, 16, 16, !0)
+            .expect("window get_image")
+            .expect("window bytes");
+
+        assert_eq!(
+            root_out, scanout,
+            "root GetImage must read the on-screen scanout"
+        );
+        assert_eq!(
+            root_out, window_out,
+            "root GetImage must match the visible window pixels"
+        );
     }
 
     /// Register a client in `state.clients` so `process_request`'s
