@@ -89,6 +89,13 @@ sudo pacman -S just gcc seatd libxshmfence libxkbcommon libinput shaderc systemd
 sudo apt install just gcc libseat-dev libxshmfence-dev libxkbcommon-dev libinput-dev glslc libudev-dev libfontconfig-dev
 ```
 
+#### Alpine
+
+```sh
+export RUSTFLAGS="-C target-feature=-crt-static"
+apk add gcc musl-dev fontconfig-dev freetype-dev libxshmfence-dev libxkbcommon-dev libinput-dev libseat-dev shaderc
+```
+
 ## Use with a display manager (lightdm)
 
 `lightdm` can launch yserver as its X server for a graphical login (its

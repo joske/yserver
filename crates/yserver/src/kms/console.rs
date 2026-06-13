@@ -29,10 +29,14 @@ use nix::sys::termios::{
 };
 
 // linux/kd.h
-const KDGKBMODE: libc::c_ulong = 0x4B44;
-const KDSKBMODE: libc::c_ulong = 0x4B45;
-const KDGETMODE: libc::c_ulong = 0x4B3B;
-const KDSETMODE: libc::c_ulong = 0x4B3A;
+//
+// `libc::Ioctl` is the request type for `libc::ioctl`: `c_ulong` on glibc,
+// `c_int` on musl/Android. Use it directly so the crate builds on musl
+// (issue #15). These constants are all small and fit either width.
+const KDGKBMODE: libc::Ioctl = 0x4B44;
+const KDSKBMODE: libc::Ioctl = 0x4B45;
+const KDGETMODE: libc::Ioctl = 0x4B3B;
+const KDSETMODE: libc::Ioctl = 0x4B3A;
 
 const K_RAW: libc::c_long = 0x00;
 const K_OFF: libc::c_long = 0x04;
