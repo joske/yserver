@@ -161,6 +161,17 @@ pub enum Message {
     PageFlipReady,
     /// signalfd readable.
     Shutdown,
+    /// SIGUSR1 / VT release on direct-mode backends; diagnostic scanout
+    /// dump fallback on backends that have not armed VT switching.
+    VtRelease,
+    /// SIGUSR2 / VT acquire on direct-mode backends; diagnostic drawable
+    /// dump fallback on backends that have not armed VT switching.
+    VtAcquire,
+    /// `Ctrl+Alt+F<n>` detected by the input thread → request a switch to
+    /// VT `n`. The backend calls `VT_ACTIVATE` on the core thread (we run
+    /// the keyboard in K_OFF, so the kernel won't switch on its own — the
+    /// server must initiate, like Xorg). No-op if VT switching isn't armed.
+    SwitchVt(u32),
     /// SIGUSR1 received — the backend should dump the current scanout
     /// buffer to a file in cwd for offline inspection. Diagnostic-only;
     /// no-op for backends that don't drive their own composite.

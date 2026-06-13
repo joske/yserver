@@ -16,9 +16,16 @@
 //! Spec: `docs/superpowers/specs/2026-05-05-single-threaded-core-design.md`
 //! Plan: `docs/superpowers/plans/2026-05-06-single-threaded-core.md` §E2.
 
-use std::{io, os::fd::BorrowedFd};
+use std::{
+    io,
+    os::fd::{AsFd, AsRawFd, BorrowedFd},
+    sync::atomic::{AtomicU8, Ordering},
+};
 
-use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
+use nix::sys::{
+    epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout},
+    eventfd::{EfdFlags, EventFd},
+};
 use yserver_core::{
     core_loop::{
         CoreSender, HostInputEvent, Message, SYNTH_SCROLL_DOWN, SYNTH_SCROLL_LEFT,
@@ -183,6 +190,72 @@ impl LibinputThreadState {
     }
 }
 
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InputThreadCommand {
+    Pause = 1,
+    Resume = 2,
+}
+
+impl InputThreadCommand {
+    fn from_raw(raw: u8) -> Option<Self> {
+        match raw {
+            1 => Some(Self::Pause),
+            2 => Some(Self::Resume),
+            _ => None,
+        }
+    }
+}
+
+/// Direct-mode input-thread control channel.
+#[derive(Debug)]
+pub(crate) struct InputThreadControl {
+    command: AtomicU8,
+    efd: EventFd,
+}
+
+impl InputThreadControl {
+    pub(crate) fn new() -> io::Result<Self> {
+        let efd = EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK | EfdFlags::EFD_CLOEXEC)
+            .map_err(|e| io::Error::other(format!("InputThreadControl eventfd: {e}")))?;
+        Ok(Self {
+            command: AtomicU8::new(0),
+            efd,
+        })
+    }
+
+    pub(crate) fn pause(&self) {
+        self.publish(InputThreadCommand::Pause);
+    }
+
+    pub(crate) fn resume(&self) {
+        self.publish(InputThreadCommand::Resume);
+    }
+
+    pub(crate) fn fd(&self) -> std::os::fd::RawFd {
+        self.efd.as_fd().as_raw_fd()
+    }
+
+    pub(crate) fn drain(&self) -> Option<InputThreadCommand> {
+        let _ = self.efd.read();
+        InputThreadCommand::from_raw(self.command.swap(0, Ordering::AcqRel))
+    }
+
+    fn publish(&self, command: InputThreadCommand) {
+        self.command.store(command as u8, Ordering::Release);
+        loop {
+            match self.efd.write(1) {
+                Ok(_) => break,
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(e) => {
+                    log::warn!("InputThreadControl: eventfd wakeup write failed: {e}");
+                    break;
+                }
+            }
+        }
+    }
+}
+
 fn push_button_click(out: &mut Vec<HostInputEvent>, button: u16, time_ms: u32) {
     out.push(HostInputEvent::PointerButton {
         button,
@@ -240,20 +313,27 @@ pub fn process_batch(
             }
             Some(Hotkey::DumpDrawables) => {
                 // Mirror DumpScanout: flush queued motion, drop the
-                // F12 keypress itself, ask the core to dump
+                // D keypress itself, ask the core to dump
                 // per-drawable storage (same code path as SIGUSR2).
                 if let Some(m) = pending_motion.take() {
                     sender.send(Message::HostInput(m))?;
                 }
-                log::info!("yserver: Ctrl-Alt-F12 pressed — dumping drawables");
+                log::info!("yserver: Ctrl-Alt-D pressed — dumping drawables");
                 sender.send(Message::DumpDrawables)?;
                 continue;
             }
             Some(Hotkey::SwitchVt(vt)) => {
-                // Direct mode (no libseat): VT switching is disabled.
-                // Log and swallow the keypress so it doesn't leak to
-                // a client.
-                log::debug!("input: Ctrl-Alt-F{vt} ignored (Direct mode, no libseat)");
+                // Flush queued motion, drop the F-key press itself, and ask
+                // the core thread to initiate the switch via VT_ACTIVATE.
+                // (We can't ioctl the VT fd from here — the ConsoleGuard
+                // lives on the backend/core thread.) The kernel won't switch
+                // on its own because we hold the keyboard in K_OFF, so the
+                // server must request it, exactly like Xorg's xf86_vt_switch.
+                if let Some(m) = pending_motion.take() {
+                    sender.send(Message::HostInput(m))?;
+                }
+                log::info!("yserver: Ctrl-Alt-F{vt} pressed — requesting VT switch");
+                sender.send(Message::SwitchVt(vt))?;
                 continue;
             }
             None => {}
@@ -318,19 +398,22 @@ pub fn process_batch(
 /// devices); its eventfd sits in the same epoll set as the libinput fd.
 ///
 /// Returns only on a fatal send error (channel closed = core gone).
-pub fn run(
+pub(crate) fn run(
     input_ctx: SendContext,
     sender: CoreSender,
     fb_w: u32,
     fb_h: u32,
+    control: std::sync::Arc<InputThreadControl>,
     led_relay: std::sync::Arc<crate::input::LedRelay>,
 ) -> io::Result<()> {
     let mut input_ctx = input_ctx;
     let mut state = LibinputThreadState::new(fb_w, fb_h);
     let mut pending_motion: Option<HostInputEvent> = None;
+    let mut paused = false;
 
     const EPOLL_DATA_LIBINPUT: u64 = 0;
-    const EPOLL_DATA_LEDS: u64 = 1;
+    const EPOLL_DATA_CONTROL: u64 = 1;
+    const EPOLL_DATA_LEDS: u64 = 2;
     let input_epoll = Epoll::new(EpollCreateFlags::empty())
         .map_err(|err| io::Error::other(format!("input thread epoll_create: {err}")))?;
     let fd = input_ctx.fd();
@@ -343,6 +426,15 @@ pub fn run(
             EpollEvent::new(EpollFlags::EPOLLIN, EPOLL_DATA_LIBINPUT),
         )
         .map_err(|err| io::Error::other(format!("input thread epoll_add: {err}")))?;
+    // SAFETY: `control` (Arc) outlives this borrow — held for the
+    // duration of `run`.
+    let control_borrow = unsafe { BorrowedFd::borrow_raw(control.fd()) };
+    input_epoll
+        .add(
+            control_borrow,
+            EpollEvent::new(EpollFlags::EPOLLIN, EPOLL_DATA_CONTROL),
+        )
+        .map_err(|err| io::Error::other(format!("input thread epoll_add (control): {err}")))?;
     // SAFETY: `led_relay` (Arc) outlives this borrow — held for the
     // duration of `run`.
     let led_borrow = unsafe { BorrowedFd::borrow_raw(led_relay.fd()) };
@@ -380,6 +472,60 @@ pub fn run(
     loop {
         match input_epoll.wait(&mut buf, EpollTimeout::NONE) {
             Ok(n) => {
+                if buf[..n].iter().any(|e| e.data() == EPOLL_DATA_CONTROL)
+                    && let Some(command) = control.drain()
+                {
+                    paused = match command {
+                        InputThreadCommand::Pause if !paused => {
+                            input_ctx.suspend();
+                            pending_motion = None;
+                            // Forget held modifiers: their release events go
+                            // to whoever owns the keyboard after the switch,
+                            // not us, so the flags would otherwise stay stuck.
+                            state.hotkey.reset();
+                            true
+                        }
+                        InputThreadCommand::Resume if paused => match input_ctx.resume() {
+                            Ok(()) => {
+                                // Start clean on the VT we just acquired —
+                                // any modifiers held during the switch were
+                                // released while we weren't reading.
+                                state.hotkey.reset();
+                                // Drain any libinput resume-replay first so our
+                                // synthetic releases land AFTER, not before.
+                                let _ = input_ctx.dispatch();
+                                // Forget held modifiers on VT-enter (Xorg-style):
+                                // emit a KeyRelease for each modifier X-keycode so
+                                // a modifier whose release was lost across the
+                                // switch is cleared in xkb_state. Harmless when not
+                                // held (release of an up key is a no-op); a still-
+                                // held modifier re-presses on its next event.
+                                // X keycodes (evdev+8): LCtrl37 RCtrl105 LAlt64
+                                // RAlt108 LShift50 RShift62 LSuper133 RSuper134.
+                                for kc in [37u8, 105, 64, 108, 50, 62, 133, 134] {
+                                    let _ = sender.send(Message::HostInput(HostInputEvent::Key(
+                                        HostKeyEvent {
+                                            pressed: false,
+                                            keycode: kc,
+                                            time: current_time_ms(),
+                                            root_x: state.cursor_x as i16,
+                                            root_y: state.cursor_y as i16,
+                                            event_x: state.cursor_x as i16,
+                                            event_y: state.cursor_y as i16,
+                                            state: 0,
+                                        },
+                                    )));
+                                }
+                                false
+                            }
+                            Err(err) => {
+                                log::warn!("input thread: libinput resume failed: {err}");
+                                true
+                            }
+                        },
+                        _ => paused,
+                    };
+                }
                 // Core-thread lock-LED update: drain the eventfd and
                 // push the mask to every keyboard device. Falls through
                 // to the libinput dispatch below (harmless when the
@@ -395,6 +541,11 @@ pub fn run(
                 log::warn!("input thread: epoll_wait: {err}");
                 continue;
             }
+        }
+
+        if !should_dispatch_batch(paused) {
+            let _ = input_ctx.dispatch();
+            continue;
         }
 
         let events = match input_ctx.dispatch() {
@@ -417,6 +568,10 @@ pub fn run(
     }
 }
 
+fn should_dispatch_batch(paused: bool) -> bool {
+    !paused
+}
+
 fn current_time_ms() -> u32 {
     crate::clock::server_time_ms()
 }
@@ -425,7 +580,7 @@ fn current_time_ms() -> u32 {
 mod tests {
     use super::*;
     use crate::input::hotkey::{
-        LINUX_KEY_BACKSPACE, LINUX_KEY_ENTER, LINUX_KEY_F12, LINUX_KEY_LEFTALT, LINUX_KEY_LEFTCTRL,
+        LINUX_KEY_BACKSPACE, LINUX_KEY_D, LINUX_KEY_ENTER, LINUX_KEY_LEFTALT, LINUX_KEY_LEFTCTRL,
         LINUX_KEY_RIGHTALT, LINUX_KEY_RIGHTCTRL,
     };
     use yserver_core::core_loop::channel;
@@ -797,9 +952,9 @@ mod tests {
     }
 
     /// Mirror of `ctrl_alt_enter_emits_dump_scanout_and_drops_keypress`
-    /// for the per-drawable storage dump (Ctrl-Alt-F12 → SIGUSR2 path).
+    /// for the per-drawable storage dump (Ctrl-Alt-D → SIGUSR2 path).
     #[test]
-    fn ctrl_alt_f12_emits_dump_drawables_and_drops_keypress() {
+    fn ctrl_alt_d_emits_dump_drawables_and_drops_keypress() {
         let (poll, sender, rx) = channel().expect("channel");
         let mut state = LibinputThreadState::new(800, 600);
         let mut pending: Option<HostInputEvent> = None;
@@ -815,7 +970,7 @@ mod tests {
                     keycode: LINUX_KEY_LEFTALT,
                 },
                 InputEvent::KeyPress {
-                    keycode: LINUX_KEY_F12,
+                    keycode: LINUX_KEY_D,
                 },
             ],
             0,
@@ -832,11 +987,26 @@ mod tests {
         assert!(
             !collected.iter().any(|m| matches!(
                 m,
-                Message::HostInput(HostInputEvent::Key(ev)) if ev.pressed && u32::from(ev.keycode) == LINUX_KEY_F12 + 8
+                Message::HostInput(HostInputEvent::Key(ev)) if ev.pressed && u32::from(ev.keycode) == LINUX_KEY_D + 8
             )),
-            "F12 keypress must not be forwarded after dump-drawables hotkey, got {collected:?}",
+            "D keypress must not be forwarded after dump-drawables hotkey, got {collected:?}",
         );
         drop(poll);
+    }
+
+    #[test]
+    fn decode_input_thread_command_and_batch_gate() {
+        assert!(matches!(
+            InputThreadCommand::from_raw(1),
+            Some(InputThreadCommand::Pause)
+        ));
+        assert!(matches!(
+            InputThreadCommand::from_raw(2),
+            Some(InputThreadCommand::Resume)
+        ));
+        assert!(InputThreadCommand::from_raw(0).is_none());
+        assert!(!should_dispatch_batch(true));
+        assert!(should_dispatch_batch(false));
     }
 
     #[test]

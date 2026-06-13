@@ -196,7 +196,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // inside an X client. Skipped silently when not on a Linux VC (pty
     // under SSH or a graphical terminal emulator).
     #[cfg(target_os = "linux")]
-    let _console_guard = crate::kms::console::ConsoleGuard::acquire()?;
+    let console_guard = crate::kms::console::ConsoleGuard::acquire(opts.vt)?;
     let device_path = resolve_drm_device()?;
     log::info!("yserver: opening DRM device {device_path}");
 
@@ -208,7 +208,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // Build the backend in seat-aware fashion. In libseat mode the DRM
     // card is opened through the seat and libinput lives on the core
     // thread. In Direct mode today's behaviour is preserved exactly.
-    let mut backend = build_kms_backend_v2(seat, &device_path)?;
+    let mut backend = build_kms_backend_v2(seat, &device_path, console_guard)?;
     let (fb_w, fb_h) = backend.fb_dimensions();
     log::info!("yserver: scanout {fb_w}x{fb_h}");
 
@@ -284,10 +284,12 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
         log::info!("yserver: libseat mode — libinput on core thread, no input thread spawned");
     } else if let Some(input_ctx) = backend.take_input_ctx() {
         let input_sender = sender.clone_handle();
+        let input_control = std::sync::Arc::new(crate::input_thread::InputThreadControl::new()?);
         // Lock-LED relay: the core thread owns the XKB lock state, the
         // input thread owns the libinput devices; LED transitions
         // cross via this eventfd-backed mask.
         let led_relay = std::sync::Arc::new(crate::input::LedRelay::new()?);
+        backend.set_input_thread_control(std::sync::Arc::clone(&input_control));
         backend.set_led_relay(std::sync::Arc::clone(&led_relay));
         log::info!("yserver: Direct mode — spawning libinput sender thread");
         thread::Builder::new()
@@ -298,6 +300,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
                     input_sender,
                     u32::from(fb_w),
                     u32::from(fb_h),
+                    input_control,
                     led_relay,
                 ) {
                     log::warn!("yserver: libinput thread exited: {err}");
@@ -308,8 +311,9 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // signalfd → Message bridge. yserver-core deliberately doesn't
     // depend on nix; a tiny thread wraps the SignalFd read so run_core
     // only sees channel-side messages. SIGINT/SIGTERM map to
-    // `Shutdown`; SIGUSR1 maps to `DumpScanout` (diagnostic — backend
-    // dumps the current scanout BO to a file in cwd).
+    // `Shutdown`; SIGUSR1/SIGUSR2 map to VT release/acquire messages,
+    // which fall back to diagnostic dumps when VT switching is not
+    // armed.
     //
     // SIGUSR1 carries three distinct, non-conflicting meanings here:
     // (1) the *inherited disposition* read once at startup
@@ -328,16 +332,16 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
                     Ok(Some(siginfo)) => {
                         let signo = siginfo.ssi_signo as i32;
                         if signo == nix::libc::SIGUSR1 {
-                            log::info!("yserver: received SIGUSR1, dumping scanout");
-                            if signal_sender.send(Message::DumpScanout).is_err() {
+                            log::info!("yserver: received SIGUSR1, forwarding VT release");
+                            if signal_sender.send(Message::VtRelease).is_err() {
                                 return;
                             }
                             // Stay alive — SIGUSR1 isn't fatal.
                             continue;
                         }
                         if signo == nix::libc::SIGUSR2 {
-                            log::info!("yserver: received SIGUSR2, dumping drawables");
-                            if signal_sender.send(Message::DumpDrawables).is_err() {
+                            log::info!("yserver: received SIGUSR2, forwarding VT acquire");
+                            if signal_sender.send(Message::VtAcquire).is_err() {
                                 return;
                             }
                             // Stay alive — SIGUSR2 isn't fatal.
@@ -416,11 +420,14 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
 /// - Returns a `KmsBackendV2` with `is_libseat_mode() == true`.
 ///
 /// **Direct mode** (`seat == Seat::Direct`):
-/// - Calls `KmsBackendV2::open(device_path)` — today's code path.
+/// - Calls `KmsBackendV2::open(device_path, console_guard)` — the
+///   direct-device path, with optional VT_PROCESS arming when a real
+///   controlling console is present.
 /// - Returns a `KmsBackendV2` with `is_libseat_mode() == false`.
 fn build_kms_backend_v2(
     seat: crate::seat::Seat,
     device_path: &str,
+    console_guard: Option<crate::kms::console::ConsoleGuard>,
 ) -> io::Result<crate::kms::v2::KmsBackendV2> {
     match seat {
         crate::seat::Seat::Libseat { ref inner, .. } => {
@@ -440,14 +447,16 @@ fn build_kms_backend_v2(
             crate::kms::v2::KmsBackendV2::open_libseat(
                 seat,
                 device_path,
+                console_guard,
                 core_libinput,
                 seat_fd,
                 core_libinput_fd,
             )
         }
         crate::seat::Seat::Direct => {
-            // Today's path: open DRM + libinput directly.
-            crate::kms::v2::KmsBackendV2::open(device_path)
+            // Direct path: open DRM + libinput directly, optionally
+            // arming VT_PROCESS if we have a controlling console.
+            crate::kms::v2::KmsBackendV2::open(device_path, console_guard)
         }
     }
 }

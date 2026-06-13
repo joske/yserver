@@ -660,6 +660,25 @@ pub fn run_core(
                                 }
                                 backend.on_page_flip_ready(state);
                             }
+                            Message::VtRelease => {
+                                if backend.vt_switching_armed() {
+                                    backend.on_vt_release(state);
+                                } else {
+                                    backend.dump_scanout();
+                                }
+                            }
+                            Message::VtAcquire => {
+                                if backend.vt_switching_armed() {
+                                    backend.on_vt_acquire(state);
+                                } else {
+                                    backend.dump_drawables();
+                                }
+                            }
+                            Message::SwitchVt(vt) => {
+                                if backend.vt_switching_armed() {
+                                    backend.request_vt_switch(vt);
+                                }
+                            }
                             Message::DumpScanout => backend.dump_scanout(),
                             Message::DumpDrawables => backend.dump_drawables(),
                         }

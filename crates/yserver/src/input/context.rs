@@ -120,6 +120,14 @@ impl SendContext {
     pub fn update_leds(&mut self, leds: Led) {
         self.0.update_leds(leds);
     }
+
+    pub fn suspend(&mut self) {
+        self.0.suspend();
+    }
+
+    pub fn resume(&mut self) -> io::Result<()> {
+        self.0.resume()
+    }
 }
 
 impl AsFd for SendContext {

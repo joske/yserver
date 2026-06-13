@@ -316,6 +316,22 @@ pub trait Backend: Send {
     /// (ynest, host-X11, recording have no seat).
     fn on_seat_ready(&mut self, _state: &mut ServerState) {}
 
+    /// Whether the backend has armed VT switching in direct mode.
+    /// Default: false.
+    fn vt_switching_armed(&self) -> bool {
+        false
+    }
+
+    /// Direct-mode VT release signal. Default no-op.
+    fn on_vt_release(&mut self, _state: &mut ServerState) {}
+
+    /// Direct-mode VT acquire signal. Default no-op.
+    fn on_vt_acquire(&mut self, _state: &mut ServerState) {}
+
+    /// Request a switch to VT `n` (from a `Ctrl+Alt+F<n>` hotkey), via
+    /// `VT_ACTIVATE`. Default no-op (only direct-mode KMS acts on it).
+    fn request_vt_switch(&mut self, _vt: u32) {}
+
     /// The libinput fd is readable AND libinput is owned by the core
     /// loop (libseat mode). Dispatch libinput inline. Default: no-op —
     /// in Direct mode the dedicated input thread owns the fd and this is

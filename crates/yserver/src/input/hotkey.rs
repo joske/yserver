@@ -11,7 +11,7 @@ pub(crate) const LINUX_KEY_LEFTCTRL: u32 = 29;
 pub(crate) const LINUX_KEY_LEFTALT: u32 = 56;
 pub(crate) const LINUX_KEY_RIGHTCTRL: u32 = 97;
 pub(crate) const LINUX_KEY_RIGHTALT: u32 = 100;
-pub(crate) const LINUX_KEY_F12: u32 = 88;
+pub(crate) const LINUX_KEY_D: u32 = 32;
 // F1..F10 are contiguous 59..=68. F11=87, F12=88.
 const LINUX_KEY_F1: u32 = 59;
 const LINUX_KEY_F10: u32 = 68;
@@ -23,10 +23,10 @@ pub enum Hotkey {
     Zap,
     /// Ctrl+Alt+Enter — diagnostic scanout dump (SIGUSR1 path).
     DumpScanout,
-    /// Ctrl+Alt+F12 — diagnostic per-drawable storage dump (SIGUSR2).
+    /// Ctrl+Alt+D — diagnostic per-drawable storage dump (SIGUSR2).
     DumpDrawables,
-    /// Ctrl+Alt+F<N> — VT switch to VT N (1-based). Note F12 is claimed
-    /// by DumpDrawables, so SwitchVt covers F1..F11 → VT1..VT11.
+    /// Ctrl+Alt+F<N> — VT switch to VT N (1-based). F12 is still a VT
+    /// key, so SwitchVt covers F1..F11 → VT1..VT11.
     SwitchVt(u32),
 }
 
@@ -45,6 +45,17 @@ impl HotkeyDetector {
         Self::default()
     }
 
+    /// Clear tracked modifier state. Called across a VT-switch
+    /// suspend/resume: the modifier *release* events land on whatever
+    /// owns the keyboard after the switch, not us, so without this the
+    /// flags stay stuck-`true` and a bare `F<n>` would fire `SwitchVt`
+    /// (observed: at the greeter, plain F6 → TTY6). Mirrors Xorg's
+    /// VT-enter "forget held keys" resync.
+    pub fn reset(&mut self) {
+        self.ctrl_pressed = false;
+        self.alt_pressed = false;
+    }
+
     /// Update modifier state for `ev`; return the hotkey it fires, if any.
     /// Only key *presses* fire; releases just update modifier state.
     pub fn check(&mut self, ev: &InputEvent) -> Option<Hotkey> {
@@ -60,7 +71,7 @@ impl HotkeyDetector {
                 }
                 _ if !(self.ctrl_pressed && self.alt_pressed) => None,
                 LINUX_KEY_BACKSPACE => Some(Hotkey::Zap),
-                LINUX_KEY_F12 => Some(Hotkey::DumpDrawables),
+                LINUX_KEY_D => Some(Hotkey::DumpDrawables),
                 LINUX_KEY_ENTER => Some(Hotkey::DumpScanout),
                 LINUX_KEY_F1..=LINUX_KEY_F10 => Some(Hotkey::SwitchVt(keycode - LINUX_KEY_F1 + 1)),
                 LINUX_KEY_F11 => Some(Hotkey::SwitchVt(11)),
@@ -122,20 +133,33 @@ mod tests {
     }
 
     #[test]
+    fn reset_clears_stuck_modifiers_after_vt_switch() {
+        // Ctrl+Alt held when a VT switch fires; the releases land on the
+        // VT we switched to, so the detector never sees them. Without
+        // reset() on the suspend/resume boundary, a bare F6 would fire
+        // SwitchVt(6) (observed: at the greeter, plain F6 → TTY6).
+        let mut d = HotkeyDetector::new();
+        press(&mut d, LINUX_KEY_LEFTCTRL);
+        press(&mut d, LINUX_KEY_LEFTALT);
+        d.reset();
+        assert_eq!(press(&mut d, 64 /* F6 */), None);
+    }
+
+    #[test]
     fn zap_and_dumps_still_fire() {
         let mut d = HotkeyDetector::new();
         press(&mut d, LINUX_KEY_LEFTCTRL);
         press(&mut d, LINUX_KEY_LEFTALT);
         assert_eq!(press(&mut d, LINUX_KEY_BACKSPACE), Some(Hotkey::Zap));
-        assert_eq!(press(&mut d, LINUX_KEY_F12), Some(Hotkey::DumpDrawables));
+        assert_eq!(press(&mut d, LINUX_KEY_D), Some(Hotkey::DumpDrawables));
         assert_eq!(press(&mut d, LINUX_KEY_ENTER), Some(Hotkey::DumpScanout));
     }
 
     #[test]
-    fn f12_is_dump_not_vt12() {
+    fn ctrl_alt_d_is_dump_not_text() {
         let mut d = HotkeyDetector::new();
         press(&mut d, LINUX_KEY_LEFTCTRL);
         press(&mut d, LINUX_KEY_LEFTALT);
-        assert_eq!(press(&mut d, LINUX_KEY_F12), Some(Hotkey::DumpDrawables));
+        assert_eq!(press(&mut d, LINUX_KEY_D), Some(Hotkey::DumpDrawables));
     }
 }

@@ -2,7 +2,8 @@
 //!
 //! Libseat mode: this owns `libseat::Seat` and the list of devices we
 //! opened through it. Lives entirely on the core-loop thread (libseat
-//! is `!Send`). Direct mode is a marker — no libseat, VT switching off.
+//! is `!Send`). Direct mode is a marker — no libseat, VT switching is
+//! handled separately by the console guard on the direct-mode path.
 //!
 //! Spec: docs/superpowers/specs/2026-05-27-vt-switching-design.md
 
@@ -188,10 +189,7 @@ impl Seat {
                 }
             }
             Err(e) => {
-                log::info!(
-                    "yserver: libseat unavailable ({e}); VT switching disabled, \
-                     opening devices directly"
-                );
+                log::info!("yserver: libseat unavailable ({e}); opening devices directly");
                 Seat::Direct
             }
         }

@@ -372,9 +372,10 @@ succeeds:
   (`BackendFdKind::Seat`). libinput moves onto the core loop (the
   reserved `LIBINPUT_TOKEN` hook) and opens its evdev fds through
   `seat.open_device`; VT switching is enabled.
-- **Direct mode** (no seat manager — e.g. the bwrap sandbox): today's
-  behaviour exactly — separate libinput thread, direct device opens,
-  VT switching disabled. The fallback is silent.
+- **Direct mode** (no seat manager — e.g. the bwrap sandbox): separate
+  libinput thread, direct device opens, and `VT_PROCESS` arming on a
+  real controlling console so `Ctrl-Alt-F<n>` switching works there too.
+  When no real console is present the VT fallback stays silent.
 
 **What's implemented + unit-tested (no hardware):** the `SeatState`
 machine (`seat/state.rs`, exhaustive); Ctrl-Alt-F<N> detection via the

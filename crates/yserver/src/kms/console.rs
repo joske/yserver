@@ -14,8 +14,9 @@
 //! mode for the lifetime of the server. State is saved on acquire and
 //! restored on drop (graceful exit, panic, or signalfd-driven shutdown).
 //!
-//! VT switching (`VT_PROCESS`/`VT_SETMODE`) is intentionally out of scope
-//! for now; the immediate goal is to stop kernel keystroke translation.
+//! VT switching is handled separately: the direct-mode path can arm
+//! `VT_PROCESS` on the controlling VT so Ctrl-Alt-F<n> switch signals
+//! are delivered through the core loop.
 
 use std::{
     fs::{File, OpenOptions},
@@ -27,6 +28,15 @@ use nix::sys::termios::{
     ControlFlags, InputFlags, LocalFlags, OutputFlags, SetArg, SpecialCharacterIndices, Termios,
     tcgetattr, tcsetattr,
 };
+
+// linux/vt.h
+const VT_ACTIVATE: libc::Ioctl = 0x5606;
+const VT_SETMODE: libc::Ioctl = 0x5602;
+const VT_RELDISP: libc::Ioctl = 0x5605;
+
+const VT_AUTO: libc::c_char = 0;
+const VT_PROCESS: libc::c_char = 1;
+pub(crate) const VT_ACKACQ: libc::c_long = 2;
 
 // linux/kd.h
 //
@@ -42,6 +52,19 @@ const K_RAW: libc::c_long = 0x00;
 const K_OFF: libc::c_long = 0x04;
 
 const KD_GRAPHICS: libc::c_long = 0x01;
+
+/// Kernel `vt_mode` layout for `VT_SETMODE`.
+///
+/// `#[repr(C)]` is required: the kernel reads a fixed C layout.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VtMode {
+    mode: libc::c_char,
+    waitv: libc::c_char,
+    relsig: libc::c_short,
+    acqsig: libc::c_short,
+    frsig: libc::c_short,
+}
 
 /// RAII guard for the console TTY. Restores keyboard mode, console mode,
 /// and termios on drop. `None` means we're not on a console TTY (e.g. a
@@ -66,12 +89,21 @@ impl ConsoleGuard {
     /// — i.e. we identified ourselves as on a console but couldn't actually
     /// take it over. Non-VC TTYs (ptys, redirected stdin) are reported via
     /// `Ok(None)` and a log line, not an error.
-    pub fn acquire() -> io::Result<Option<Self>> {
-        let fd = match OpenOptions::new().read(true).write(true).open("/dev/tty") {
+    pub fn acquire(vt: Option<u32>) -> io::Result<Option<Self>> {
+        // Prefer the explicit VT device (`/dev/ttyN`, from the `vtN` launch
+        // arg) over `/dev/tty`. A display-manager-launched server (lightdm)
+        // has NO controlling terminal, so `/dev/tty` fails with ENXIO and we
+        // never take over the console or arm VT switching. `/dev/ttyN` is the
+        // real VT device and opens regardless of controlling-terminal status —
+        // matching Xorg's `xf86OpenConsole`, which opens the VT by number.
+        // Falls back to `/dev/tty` when no VT was given (shell-launched, e.g.
+        // `just startx`, where the controlling tty IS the VT).
+        let path = vt.map_or_else(|| "/dev/tty".to_string(), |n| format!("/dev/tty{n}"));
+        let fd = match OpenOptions::new().read(true).write(true).open(&path) {
             Ok(f) => f,
             Err(err) => {
                 log::info!(
-                    "yserver: console takeover skipped (open /dev/tty: {err}); \
+                    "yserver: console takeover skipped (open {path}: {err}); \
                      kernel keystroke→TTY translation not suppressed"
                 );
                 return Ok(None);
@@ -152,11 +184,74 @@ impl ConsoleGuard {
             saved_termios,
         }))
     }
+
+    /// Arm `VT_PROCESS` on the controlling VT so release/acquire signals
+    /// are delivered to this process.
+    pub fn arm_vt_process(&self, relsig: libc::c_int, acqsig: libc::c_int) -> io::Result<()> {
+        self.set_vt_mode(VtMode {
+            mode: VT_PROCESS,
+            waitv: 0,
+            relsig: relsig as libc::c_short,
+            acqsig: acqsig as libc::c_short,
+            frsig: 0,
+        })
+    }
+
+    /// Restore `VT_AUTO` on the controlling VT.
+    pub fn disarm_vt_process(&self) -> io::Result<()> {
+        self.set_vt_mode(VtMode {
+            mode: VT_AUTO,
+            waitv: 0,
+            relsig: 0,
+            acqsig: 0,
+            frsig: 0,
+        })
+    }
+
+    /// Request a switch to VT `n` via `VT_ACTIVATE`. Non-blocking: the
+    /// kernel marks the switch pending and (since we armed `VT_PROCESS`)
+    /// sends us the release signal; we must NOT `VT_WAITACTIVE` here or we
+    /// would block the core loop that has to run the release handshake.
+    /// Mirrors Xorg's `xf86_vt_switch` → `ioctl(VT_ACTIVATE)`.
+    pub fn vt_activate(&self, n: u32) -> io::Result<()> {
+        let raw_fd = self.fd.as_raw_fd();
+        // SAFETY: ioctl with a valid fd, no userspace pointer.
+        let rc = unsafe { libc::ioctl(raw_fd, VT_ACTIVATE, libc::c_long::from(n)) };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Acknowledge a VT release/acquire event via `VT_RELDISP`.
+    pub fn vt_reldisp(&self, arg: libc::c_long) -> io::Result<()> {
+        let raw_fd = self.fd.as_raw_fd();
+        // SAFETY: ioctl with a valid fd, no userspace pointer.
+        let rc = unsafe { libc::ioctl(raw_fd, VT_RELDISP, arg) };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn set_vt_mode(&self, mode: VtMode) -> io::Result<()> {
+        let raw_fd = self.fd.as_raw_fd();
+        // SAFETY: ioctl with a valid fd and a kernel-defined C struct.
+        let rc = unsafe { libc::ioctl(raw_fd, VT_SETMODE, &mode) };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
 }
 
 impl Drop for ConsoleGuard {
     fn drop(&mut self) {
         let raw_fd = self.fd.as_raw_fd();
+
+        if let Err(err) = self.disarm_vt_process() {
+            log::warn!("yserver: VT_AUTO restore failed: {err}");
+        }
 
         // Restore in reverse order. Failures here are logged but not
         // surfaced — there's nothing the caller can do at this point.
@@ -195,5 +290,21 @@ impl Drop for ConsoleGuard {
         }
 
         log::info!("yserver: console state restored");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VtMode;
+    use std::mem::{offset_of, size_of};
+
+    #[test]
+    fn vt_mode_matches_kernel_layout() {
+        assert_eq!(size_of::<VtMode>(), 8);
+        assert_eq!(offset_of!(VtMode, mode), 0);
+        assert_eq!(offset_of!(VtMode, waitv), 1);
+        assert_eq!(offset_of!(VtMode, relsig), 2);
+        assert_eq!(offset_of!(VtMode, acqsig), 4);
+        assert_eq!(offset_of!(VtMode, frsig), 6);
     }
 }

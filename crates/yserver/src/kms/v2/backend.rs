@@ -349,6 +349,12 @@ pub struct KmsBackendV2 {
     /// Cached on-core libinput fd for `poll_fds` (`&self`). `-1` in
     /// Direct mode (the input thread owns the fd there).
     core_libinput_fd: std::os::fd::RawFd,
+    /// Controlling console TTY guard. Present in direct mode when the
+    /// process is launched on a real VT; `None` when no controlling
+    /// console exists (pty / graphical terminal / test harness).
+    console_guard: Option<crate::kms::console::ConsoleGuard>,
+    /// Whether VT switching has been armed in direct mode.
+    vt_switching_armed: bool,
     /// Direct-mode lock-LED sink: the input thread owns the libinput
     /// devices, so LED changes cross via this relay (mask + eventfd in
     /// the thread's epoll). `None` in libseat mode (LEDs go straight
@@ -361,6 +367,9 @@ pub struct KmsBackendV2 {
     /// on-core hotkey path (libseat mode). Handed in via `set_input_sender`
     /// after the channel is created in `lib.rs`.
     input_sender: Option<yserver_core::core_loop::CoreSender>,
+    /// Direct-mode input-thread control channel. Used by VT release /
+    /// acquire to pause and resume the dedicated input thread.
+    input_thread_control: Option<std::sync::Arc<crate::input_thread::InputThreadControl>>,
     /// Hotkey detector — used on the core thread in libseat mode
     /// (`on_libinput_ready`).
     hotkey: crate::input::hotkey::HotkeyDetector,
@@ -447,6 +456,26 @@ fn probe_dmabuf_export_support(vk: &std::sync::Arc<crate::kms::vk::device::VkCon
     };
     export_backing(vk, &img).is_ok()
     // `img` drops here → `ExportableImage::Drop` frees VkImage + VkDeviceMemory.
+}
+
+fn try_acquire_master_bounded<F>(
+    mut attempt: F,
+    attempts: usize,
+    delay: std::time::Duration,
+) -> io::Result<()>
+where
+    F: FnMut() -> io::Result<()>,
+{
+    for idx in 0..attempts {
+        match attempt() {
+            Ok(()) => return Ok(()),
+            Err(err) if err.raw_os_error() == Some(libc::EBUSY) && idx + 1 < attempts => {
+                std::thread::sleep(delay);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(io::Error::from_raw_os_error(libc::EBUSY))
 }
 
 impl KmsBackendV2 {
@@ -678,12 +707,16 @@ impl KmsBackendV2 {
     /// Propagates DRM / Vk / libinput init failures from
     /// `PlatformBackend::open_with_commit`, plus FontLoader / XKB
     /// init failures from `KmsCore::new`.
-    pub fn open(device_path: &str) -> io::Result<Self> {
-        Self::open_with_commit(device_path, drm::modeset::commit_modeset)
+    pub fn open(
+        device_path: &str,
+        console_guard: Option<crate::kms::console::ConsoleGuard>,
+    ) -> io::Result<Self> {
+        Self::open_with_commit(device_path, console_guard, drm::modeset::commit_modeset)
     }
 
     fn open_with_commit(
         device_path: &str,
+        console_guard: Option<crate::kms::console::ConsoleGuard>,
         commit: fn(
             &crate::drm::Device,
             &crate::drm::modeset::Output,
@@ -748,9 +781,12 @@ impl KmsBackendV2 {
             core_input_state: None,
             seat_fd: -1,
             core_libinput_fd: -1,
+            console_guard,
+            vt_switching_armed: false,
             led_relay: None,
             leds_sent: 0,
             input_sender: None,
+            input_thread_control: None,
             hotkey: crate::input::hotkey::HotkeyDetector::new(),
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported,
@@ -762,6 +798,7 @@ impl KmsBackendV2 {
         if let Err(e) = b.init_cursor_sprite() {
             log::warn!("v2: software cursor init failed: {e:?} — no visible cursor");
         }
+        b.arm_direct_vt_switching();
         Ok(b)
     }
 
@@ -778,6 +815,7 @@ impl KmsBackendV2 {
     pub fn open_libseat(
         seat: crate::seat::Seat,
         device_path: &str,
+        console_guard: Option<crate::kms::console::ConsoleGuard>,
         core_libinput: crate::input::Context,
         seat_fd: std::os::fd::RawFd,
         core_libinput_fd: std::os::fd::RawFd,
@@ -785,6 +823,7 @@ impl KmsBackendV2 {
         Self::open_libseat_with_commit(
             seat,
             device_path,
+            console_guard,
             core_libinput,
             seat_fd,
             core_libinput_fd,
@@ -795,6 +834,7 @@ impl KmsBackendV2 {
     fn open_libseat_with_commit(
         seat: crate::seat::Seat,
         device_path: &str,
+        console_guard: Option<crate::kms::console::ConsoleGuard>,
         core_libinput: crate::input::Context,
         seat_fd: std::os::fd::RawFd,
         core_libinput_fd: std::os::fd::RawFd,
@@ -878,9 +918,12 @@ impl KmsBackendV2 {
             )),
             seat_fd,
             core_libinput_fd,
+            console_guard,
+            vt_switching_armed: false,
             led_relay: None,
             leds_sent: 0,
             input_sender: None,
+            input_thread_control: None,
             hotkey: crate::input::hotkey::HotkeyDetector::new(),
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported,
@@ -924,6 +967,27 @@ impl KmsBackendV2 {
         self.refresh_effective_cursor();
         log::info!("v2: default cursor sprite registered (xid 0x{xid:x})");
         Ok(())
+    }
+
+    fn arm_direct_vt_switching(&mut self) {
+        if !matches!(self.seat, crate::seat::Seat::Direct) {
+            return;
+        }
+        let Some(console_guard) = self.console_guard.as_ref() else {
+            return;
+        };
+        if self.vt_switching_armed {
+            return;
+        }
+        match console_guard.arm_vt_process(nix::libc::SIGUSR1, nix::libc::SIGUSR2) {
+            Ok(()) => {
+                self.vt_switching_armed = true;
+                log::info!("kms: direct-mode VT_PROCESS armed (SIGUSR1/SIGUSR2)");
+            }
+            Err(err) => {
+                log::warn!("kms: arm VT_PROCESS failed: {err}");
+            }
+        }
     }
 
     // ── Stage 5 Phase A — cursor record helpers ────────────────────
@@ -1664,9 +1728,12 @@ impl KmsBackendV2 {
             core_input_state: None,
             seat_fd: -1,
             core_libinput_fd: -1,
+            console_guard: None,
+            vt_switching_armed: false,
             led_relay: None,
             leds_sent: 0,
             input_sender: None,
+            input_thread_control: None,
             hotkey: crate::input::hotkey::HotkeyDetector::new(),
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported: false,
@@ -4080,6 +4147,34 @@ impl KmsBackendV2 {
         self.platform.take_input_ctx()
     }
 
+    /// Whether direct-mode VT switching has been armed on the
+    /// controlling console.
+    #[must_use]
+    pub fn vt_switching_armed(&self) -> bool {
+        self.vt_switching_armed
+    }
+
+    /// Direct-mode input-thread control handle, set when the separate
+    /// libinput thread is spawned.
+    pub(crate) fn set_input_thread_control(
+        &mut self,
+        control: std::sync::Arc<crate::input_thread::InputThreadControl>,
+    ) {
+        self.input_thread_control = Some(control);
+    }
+
+    fn pause_input_thread(&self) {
+        if let Some(control) = self.input_thread_control.as_ref() {
+            control.pause();
+        }
+    }
+
+    fn resume_input_thread(&self) {
+        if let Some(control) = self.input_thread_control.as_ref() {
+            control.resume();
+        }
+    }
+
     /// Returns `true` when the backend is in libseat mode (VT switching
     /// enabled). `false` in Direct mode (no libseat, today's behaviour).
     #[must_use]
@@ -4326,6 +4421,16 @@ impl KmsBackendV2 {
         // Keys: drain down_keys, emit a synthetic KeyRelease for each.
         let keys: Vec<u8> = self.core.down_keys.drain().collect();
         for keycode in keys {
+            // Release it in xkb_state too, not just to clients. Without
+            // this, down_keys empties but the xkbcommon modifier state keeps
+            // Ctrl/Alt depressed — so after a VT switch (where the switch
+            // combo's releases are lost) every subsequent key is stamped
+            // with a stale 0x0c and the greeter can't be typed into. This
+            // is the divergence the key_fanout.rs comment warns about.
+            self.core.xkb_state.0.update_key(
+                xkbcommon::xkb::Keycode::new(u32::from(keycode)),
+                xkbcommon::xkb::KeyDirection::Up,
+            );
             let ev = HostKeyEvent {
                 pressed: false,
                 keycode,
@@ -7650,7 +7755,7 @@ fn describe_resolved_source(
 }
 
 /// Per-drawable storage dump triggered by SIGUSR2 (or
-/// `Ctrl-Alt-F12` via the input thread, mirroring
+/// `Ctrl-Alt-D` via the input thread, mirroring
 /// `Ctrl-Alt-Enter` for scanout). Walks a fixed-known set of
 /// "interesting" drawables — root, COW, every redirected backing —
 /// and writes each storage's content to a `yserver-v2-drawable-…`
@@ -8522,7 +8627,7 @@ impl KmsBackendV2 {
                 }
             }
             Hotkey::DumpDrawables => {
-                log::info!("kms: Ctrl-Alt-F12 — dumping drawables");
+                log::info!("kms: Ctrl-Alt-D — dumping drawables");
                 if let Some(s) = &self.input_sender {
                     let _ = s.send(Message::DumpDrawables);
                 }
@@ -8971,7 +9076,7 @@ impl Backend for KmsBackendV2 {
         // (the moment of interest is the first COW-targeted
         // Present after caja paints, which moves on every frame).
         // Pair the scanout dump with the drawable dump so a single
-        // Ctrl+Alt+F12 captures all three artifacts atomically.
+        // Ctrl+Alt+D captures all three artifacts atomically.
         if let Err(e) = do_dump_scanout_v2(self) {
             log::warn!("v2 dump_drawables: scanout side: {e}");
         }
@@ -9062,8 +9167,100 @@ impl Backend for KmsBackendV2 {
         fds
     }
 
+    fn vt_switching_armed(&self) -> bool {
+        self.vt_switching_armed
+    }
+
     fn set_input_sender(&mut self, sender: yserver_core::core_loop::CoreSender) {
         self.input_sender = Some(sender);
+    }
+
+    fn request_vt_switch(&mut self, vt: u32) {
+        let Some(console_guard) = self.console_guard.as_ref() else {
+            log::warn!("kms: request_vt_switch({vt}) — no console guard; ignoring");
+            return;
+        };
+        log::info!("kms: VT_ACTIVATE({vt}) — requesting switch");
+        if let Err(err) = console_guard.vt_activate(vt) {
+            log::warn!("kms: VT_ACTIVATE({vt}) failed: {err}");
+        }
+        // No VT_WAITACTIVE: the kernel now sends us the release signal,
+        // which the core loop services next (on_vt_release). Blocking here
+        // would deadlock that handshake.
+    }
+
+    fn on_vt_release(&mut self, state: &mut ServerState) {
+        use crate::seat::state::SeatEventKind;
+        use ::drm::Device as _;
+
+        // Step logging is load-bearing: if a switch wedges, the last line
+        // printed pinpoints which step stalled (kernel blocks the VT switch
+        // until VT_RELDISP, so a stall here freezes the whole session).
+        log::info!("kms: VT release — begin (pause input)");
+        self.pause_input_thread();
+        log::info!("kms: VT release — input paused; run_suspend");
+        self.drive_seat_event(state, SeatEventKind::Disable);
+        log::info!("kms: VT release — suspended; drmDropMaster");
+        if let Err(err) = self.platform.device.release_master_lock() {
+            log::warn!("kms: drmDropMaster failed: {err}");
+        }
+        log::info!("kms: VT release — master dropped; VT_RELDISP(1)");
+        if let Some(console_guard) = self.console_guard.as_ref()
+            && let Err(err) = console_guard.vt_reldisp(1)
+        {
+            log::warn!("kms: VT_RELDISP(1) failed: {err}");
+        }
+        log::info!("kms: VT release — done (switch should complete now)");
+    }
+
+    fn on_vt_acquire(&mut self, state: &mut ServerState) {
+        use crate::seat::state::SeatEventKind;
+        use ::drm::Device as _;
+
+        log::info!("kms: VT acquire — begin; VT_RELDISP(VT_ACKACQ)");
+        if let Some(console_guard) = self.console_guard.as_ref()
+            && let Err(err) = console_guard.vt_reldisp(crate::kms::console::VT_ACKACQ)
+        {
+            log::warn!("kms: VT_ACKACQ failed: {err}");
+        }
+        log::info!("kms: VT acquire — acked; drmSetMaster");
+
+        let acquired = match try_acquire_master_bounded(
+            || self.platform.device.acquire_master_lock(),
+            10,
+            std::time::Duration::from_millis(5),
+        ) {
+            Ok(()) => true,
+            Err(err) => {
+                log::error!("kms: drmSetMaster failed after retries: {err}");
+                false
+            }
+        };
+        if !acquired {
+            log::warn!("kms: proceeding with best-effort resume after SetMaster failure");
+        }
+
+        log::info!("kms: VT acquire — master held={acquired}; run_resume");
+        self.drive_seat_event(state, SeatEventKind::Enable);
+        log::info!("kms: VT acquire — resumed; resume input");
+        self.resume_input_thread();
+
+        // Xorg VT-enter resync: forget all held keys/modifiers. Keys held
+        // across the switch (e.g. the Ctrl+Alt of the switch combo) were
+        // released while we weren't reading, so xkb_state would keep them
+        // depressed and stamp every subsequent key with stale modifiers
+        // ("can't type at the greeter after a switch"). Rebuild a fresh
+        // state from the keymap; new key events repopulate it cleanly.
+        // The before-mask log proves whether the latch was actually stuck.
+        let mods_before = self.serialize_modifiers();
+        self.core.down_keys.clear();
+        self.core.xkb_state =
+            crate::kms::core::XkbState(xkbcommon::xkb::State::new(&self.core.xkb_keymap.0));
+        log::info!(
+            "kms: VT acquire — xkb resync: modifiers were 0x{mods_before:04x}, now 0x{:04x}",
+            self.serialize_modifiers()
+        );
+        log::info!("kms: VT acquire — done");
     }
 
     fn on_seat_ready(&mut self, state: &mut ServerState) {
