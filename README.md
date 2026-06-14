@@ -38,6 +38,7 @@ We support the following extensions:
 - X-Resource
 - XFIXES
 - XInputExtension
+- XC-MISC
 - XKEYBOARD
 - XTEST
 
