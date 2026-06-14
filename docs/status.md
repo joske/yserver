@@ -32,10 +32,12 @@ Cross-cutting bugs and followups that don't fit a stage live in
   abandoned `render-convolution-filter` branch: QueryFilters
   standard list, NameWindowPixmap diagnosis docs, Justfile xtrace
   `rm`, picom validation harness.
-- Active dev branch: `master`. All v2 work (Stages 1–4 + Stage 5
-  Task 3 + Task 4 layer 1) has been fast-forwarded from
-  `rendering-model-v2` → `cow-authoritative-mode` → `perf` into
-  `master`. **v1 retired 2026-05-26** after Phase B.3 closed
+- Active dev branch: `fix/idle-compositor` (off `master`). All v2
+  work (Stages 1–4 + Stage 5 Task 3 + Task 4 layer 1) has been
+  fast-forwarded from `rendering-model-v2` →
+  `cow-authoritative-mode` → `perf` into `master`; `master`
+  remains the integration branch. **v1 retired 2026-05-26** after
+  Phase B.3 closed
   across the hardware matrix (bee/yoga/silence/air/M2-Asahi/nvidia). The
   v1 `KmsBackend` struct + all its impl blocks, the `KmsBackendKind`
   dispatcher, the `YSERVER_RENDER_MODEL` env knob, and the
@@ -137,6 +139,22 @@ Cross-cutting bugs and followups that don't fit a stage live in
   root screenshot path is covered by unit tests and a backend
   compile-time smoke; live `xwd -root` desktop smoke still needs a real
   KMS session.
+- **2026-06-14 idle compositor / VT-away wake suppression fix**:
+  implementation is on `fix/idle-compositor`, following
+  `docs/superpowers/specs/2026-06-14-idle-compositor-cursor-damage.md`.
+  `build_scene` now reports cursor footprint facts instead of
+  unconditionally dirtying the frame; `tick_one_output` gates cursor
+  damage on actual footprint/mode/sprite changes using transactional
+  `last_present_cursor_{rect,version}` state; `scene_structure_dirty`
+  clears after all-empty ticks instead of hot-spinning on bare wakes;
+  and `next_wakeup()` suppresses KMS-only scene/cursor-anim timers
+  while scanout is disallowed or DPMS is off, while preserving
+  `PresentBatchWait::Poll` wakeups. Coverage includes stationary HW/SW
+  cursor idle, moved SW cursor old∪new damage, stationary sprite swaps,
+  pure HW hide pokes, dirty-clear gating, present-poll survival under
+  DPMS-off, and scanout-disallowed timer suppression. Validation:
+  `cargo test -p yserver --lib`, `cargo clippy -p yserver --lib --tests`,
+  `cargo +nightly fmt`.
 - **2026-06-12 HW text-cursor offset diagnosed/fixed**: `silence` was
   selecting text above the visible I-beam only with
   `YSERVER_V2_HW_CURSOR=1`; `eiger`/Asahi looked correct because the

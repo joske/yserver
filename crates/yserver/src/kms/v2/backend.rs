@@ -8878,14 +8878,19 @@ impl Backend for KmsBackendV2 {
 
     fn next_wakeup(&self) -> Option<std::time::Instant> {
         let now = std::time::Instant::now();
-        let scene_deadline = if self.scene.scene_structure_dirty {
-            if self.scene.has_output_ready_for_submit() {
-                Some(now)
+        let allow_kms_timers = self.scanout_allowed() && self.kms_outputs_active;
+        let scene_deadline = if allow_kms_timers {
+            if self.scene.scene_structure_dirty {
+                if self.scene.has_output_ready_for_submit() {
+                    Some(now)
+                } else {
+                    self.scene.earliest_retry_deadline()
+                }
             } else {
                 self.scene.earliest_retry_deadline()
             }
         } else {
-            self.scene.earliest_retry_deadline()
+            None
         };
         let needs_present_poll = self.pending_present_batches.iter().any(|batch| {
             matches!(
@@ -8901,7 +8906,11 @@ impl Backend for KmsBackendV2 {
         scene_deadline
             .into_iter()
             .chain(present_deadline)
-            .chain(self.cursor_anim_deadline())
+            .chain(
+                allow_kms_timers
+                    .then(|| self.cursor_anim_deadline())
+                    .flatten(),
+            )
             .min()
     }
 
@@ -15818,6 +15827,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn next_wakeup_suppresses_scene_deadline_when_scanout_disallowed() {
+        use crate::seat::state::SeatState;
+
+        let mut b = KmsBackendV2::for_tests();
+        b.scene.scene_structure_dirty = true;
+        assert!(
+            b.next_wakeup()
+                .is_some_and(|wake| wake <= std::time::Instant::now()),
+            "dirty scene should wake immediately while scanout is allowed",
+        );
+
+        b.seat_state = SeatState::Suspended;
+        assert!(
+            b.next_wakeup().is_none(),
+            "dirty scene must not busy-wake while scanout is disallowed",
+        );
+    }
+
+    #[test]
+    fn present_poll_deadline_survives_outputs_off() {
+        let mut b = KmsBackendV2::for_tests();
+        b.kms_outputs_active = false;
+        b.scene.scene_structure_dirty = true;
+
+        b.enqueue_present_completion(
+            yserver_core::backend::CompletedPresentEvent {
+                client_id: yserver_protocol::x11::ClientId(0),
+                serial: 1,
+                host_xid: 0x1000,
+                dst_host_xid: 0x1001,
+                options: 0,
+                wake: yserver_core::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
+            },
+            0x1001,
+        );
+
+        let deadline = b
+            .next_wakeup()
+            .expect("present poll deadline must survive DPMS-off gating");
+        assert!(
+            deadline <= std::time::Instant::now() + std::time::Duration::from_millis(2),
+            "pending PRESENT deadline should still be near-term with outputs off",
+        );
+    }
+
     /// Spec: "boots far enough to service GetGeometry / InternAtom".
     /// Backend::xid_map reflects KmsCore's root xid seed via
     /// for_tests — empty xid map is fine for this test since the
@@ -22316,6 +22371,7 @@ mod tests {
     /// active and scanout is allowed (EINVAL-storm discipline).
     #[test]
     fn anim_deadline_gated_on_outputs_active() {
+        use crate::seat::state::SeatState;
         use std::time::{Duration, Instant};
         use yserver_core::backend::{Backend, PixmapHandle};
 
@@ -22364,6 +22420,21 @@ mod tests {
         assert!(
             b.active_cursor_anim.as_ref().unwrap().next_frame > Instant::now(),
             "re-armed from now: next_frame must be a future instant after DPMS restore tick",
+        );
+
+        // VT-away / master-drop uses the same scheduler suppression.
+        b.seat_state = SeatState::Suspended;
+        b.active_cursor_anim.as_mut().unwrap().next_frame =
+            Instant::now() - Duration::from_millis(1);
+        assert!(
+            b.next_wakeup().is_none_or(|w| w > Instant::now()),
+            "stale anim deadline must not be reported while scanout is disallowed",
+        );
+        b.tick_cursor_animation();
+        assert_eq!(
+            b.active_cursor_anim.as_ref().unwrap().frame,
+            frame,
+            "tick must not advance while scanout is disallowed",
         );
     }
 

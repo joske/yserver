@@ -441,6 +441,36 @@ yserver-wmaker-xterm-hw-trace log="debug":
         kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;'
 
+# DPMS / device-loss leak repro (the overnight "screen on but dead" bug,
+# 2026-06-14). Launches yserver-hw with YSERVER_LOOP_TELEMETRY=1 (per-second
+# PixmapPool stats — the leak detector) + targeted DPMS/scanout/device-loss
+# logging, and stays alive so you can drive the workload and watch.
+#
+# Then, from an ssh shell, reproduce + observe:
+#   # leak: does the PixmapPool count climb while the display is off?
+#   tail -f target/yserver-telemetry.log | grep -iE 'pool|pixmap|DEVICE_LOST|dpms|disable_output'
+#   # hotplug: does the connector drop the link on standby?
+#   watch -n1 'cat /sys/class/drm/card1-HDMI-A-2/status /sys/class/drm/card1-HDMI-A-2/dpms'
+#   dmesg -w | grep -iE 'hdmi|connector|hpd|amdgpu|reset'
+# Drive it: start a continuous full-screen renderer (the real trigger was
+# cinnamon-screensaver doing MIT-SHM PutImage), then `DISPLAY=:7 xset dpms
+# force off` and leave it. Watch for pool growth + the device-loss cascade.
+# Ctrl-C to stop.
+yserver-dpms-telemetry log="info,yserver::kms::v2::backend=debug,yserver::kms::v2::platform=debug,yserver::kms::v2::scene=debug,yserver::kms::vk::scanout=debug,yserver::drm=debug":
+    cargo build --bin yserver
+    bash -c '\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11 XDG_SESSION_TYPE=x11;\
+        RUST_LOG="{{log}}" YSERVER_LOOP_TELEMETRY=1 RUST_BACKTRACE=1 \
+            target/debug/yserver > target/yserver-telemetry.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        DISPLAY=:7 e16 > target/e16-dpms.log 2>&1 &\
+        echo "yserver up on :7 (pid $yserver_pid); telemetry+log -> target/yserver-telemetry.log";\
+        echo "drive: DISPLAY=:7 <full-screen renderer>, then DISPLAY=:7 xset dpms force off";\
+        echo "watch: pool growth in the log; /sys/class/drm/.../status for hotplug. Ctrl-C to stop.";\
+        wait $yserver_pid 2>/dev/null;'
+
 # Run picom against yserver as a RENDER smoke test. picom v13's
 # `xrender` backend exercises a wider RENDER surface than xfwm4 /
 # marco do — useful for shaking out RENDER coverage gaps once the

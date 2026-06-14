@@ -125,6 +125,14 @@ struct PendingAck {
     /// committed to the screen after this flip. Failed submit
     /// → mode stays as-is.
     cursor_mode_after_retire: OutputCursorMode,
+    /// Cursor footprint that this output actually presented in the
+    /// submitted frame. Applied only on retire so a failed submit
+    /// leaves the old footprint in place for the next re-poke.
+    last_present_cursor_rect_after_retire: Option<vk::Rect2D>,
+    /// Cursor sprite version that this output actually presented in
+    /// the submitted frame. `None` when the cursor is hidden on
+    /// this output.
+    last_present_cursor_version_after_retire: Option<u64>,
 }
 
 /// Stage 5 Phase C — pure result of the cursor-plane strategy
@@ -133,9 +141,9 @@ struct PendingAck {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CursorAssignment {
     /// HW plane should display the sprite at this position. The
-    /// SW cursor draw is omitted from `scene.draws`; the SW prev
-    /// rect is still damaged so the buffer-age clipped/LOAD path
-    /// clears any prior pixels off the underlying scanout BO.
+    /// SW cursor draw is omitted from `scene.draws`. Damage is
+    /// decided later in `tick_one_output` from the transactional
+    /// presented-footprint state, not here.
     Hw {
         x: i32,
         y: i32,
@@ -144,15 +152,15 @@ pub(crate) enum CursorAssignment {
         hot_y: u16,
     },
     /// SW path — sprite drawn into the scanout BO via composite.
-    /// `scene.draws` carries the cursor entry; prev + new rect
-    /// added to projected damage. `pos` is the output-local
-    /// top-left of the cursor draw (`cursor.xy − hot − layout`)
-    /// — propagates into `OutputSceneState.cursor_prev_pos` on
-    /// successful retire so the next tick damages this rect to
-    /// clear the SW trail.
+    /// `scene.draws` carries the cursor entry. `pos` is the
+    /// output-local top-left of the cursor draw
+    /// (`cursor.xy − hot − layout`) — it propagates into
+    /// `OutputSceneState.cursor_prev_pos` on successful retire so
+    /// the next tick can clear the SW trail if the cursor moves.
     Sw { pos: (i32, i32) },
-    /// Cursor off-output / unregistered / clipped. SW path damages
-    /// the prev rect (if any) so trails clear; nothing is drawn.
+    /// Cursor off-output / unregistered / clipped. Nothing is drawn;
+    /// tick-level cursor-damage gating decides whether the last
+    /// presented footprint needs clearing.
     Hidden,
 }
 
@@ -362,6 +370,14 @@ struct OutputSceneState {
     /// successfully — a failed submit must leave the OLD prev rect
     /// in place so the next frame still clears the trail.
     cursor_prev_pos: Option<(i32, i32)>,
+    /// Cursor footprint from the last successfully presented frame
+    /// on this output. Used to decide whether the current frame
+    /// needs cursor damage and to re-poke pure HW hide/show cases.
+    last_present_cursor_rect: Option<vk::Rect2D>,
+    /// Cursor sprite version from the last successfully presented
+    /// frame on this output. Lets a stationary sprite swap damage
+    /// once, then return to idle.
+    last_present_cursor_version: Option<u64>,
     /// Diagnostic: last reason `tick_one_output` skipped a tick for
     /// this output. Logged at INFO on transition (skip→different-skip,
     /// no-skip→skip, skip→no-skip). Tracks the freeze-debug
@@ -369,9 +385,9 @@ struct OutputSceneState {
     last_skip_reason: Option<TickSkipReason>,
 }
 
-/// Diagnostic: why `tick_one_output` returned `Ok(false)` for an
-/// output. Used to identify which gate is stuck when an output
-/// stops getting page-flips. See `record_tick_skip`.
+/// Diagnostic: why `tick_one_output` skipped an output. Used to
+/// identify which gate is stuck when an output stops getting
+/// page-flips. See `record_tick_skip`.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 enum TickSkipReason {
     /// `pending_acks` non-empty — flip in flight, KMS would EBUSY.
@@ -384,6 +400,21 @@ enum TickSkipReason {
     NoBO,
     /// `pool_ring.acquire` returned None — descriptor-pool ring exhausted.
     NoPool,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+enum TickOutcome {
+    Composed,
+    Skipped(TickSkipReason),
+}
+
+impl TickOutcome {
+    fn clears_scene_structure_dirty(self) -> bool {
+        matches!(
+            self,
+            Self::Composed | Self::Skipped(TickSkipReason::EmptyDamage)
+        )
+    }
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -491,6 +522,13 @@ struct SceneBuild {
     /// tick consumes this to derive the per-output transition
     /// + new `cursor_prev_pos` and queue them on the PendingAck.
     cursor_assignment: CursorAssignment,
+    /// Clipped cursor footprint for the current frame on this
+    /// output, regardless of whether the cursor will present via
+    /// SW composite or the HW plane.
+    new_cursor_rect: Option<vk::Rect2D>,
+    /// Version of the cursor sprite contributing `new_cursor_rect`.
+    /// `None` when the cursor is hidden on this output.
+    cursor_record_version: Option<u64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -554,6 +592,8 @@ impl SceneCompositor {
                 next_submit_retry_at: None,
                 last_frame_cursor_mode: OutputCursorMode::Hidden,
                 cursor_prev_pos: None,
+                last_present_cursor_rect: None,
+                last_present_cursor_version: None,
                 last_skip_reason: None,
             });
         }
@@ -822,6 +862,8 @@ impl SceneCompositor {
             // next frame doesn't damage a stale trail rect.
             o.last_frame_cursor_mode = OutputCursorMode::Hidden;
             o.cursor_prev_pos = None;
+            o.last_present_cursor_rect = None;
+            o.last_present_cursor_version = None;
         }
         // Phase D' — drop the deferred-upload slot WITHOUT firing
         // it (the kernel may be taking the device away; ioctl
@@ -862,6 +904,7 @@ impl SceneCompositor {
         }
         let n_outputs = inner.outputs.len();
         let mut composed = 0usize;
+        let mut clear_dirty = true;
         for output_idx in 0..n_outputs {
             match tick_one_output(
                 inner,
@@ -874,16 +917,19 @@ impl SceneCompositor {
                 hw_strategy,
                 cow_host_xid,
             ) {
-                Ok(true) => composed += 1,
-                Ok(false) => {} // skipped (no BO / empty scene)
+                Ok(TickOutcome::Composed) => composed += 1,
+                Ok(outcome) => {
+                    clear_dirty &= outcome.clears_scene_structure_dirty();
+                }
                 Err(e) => {
+                    clear_dirty = false;
                     log::warn!(
                         "v2 scene tick: output {output_idx} compose failed: {e}; continuing",
                     );
                 }
             }
         }
-        if composed > 0 {
+        if clear_dirty {
             self.scene_structure_dirty = false;
         }
         Ok(composed)
@@ -970,6 +1016,8 @@ impl SceneCompositor {
                 state.cursor_prev_pos = new_prev;
             }
             state.last_frame_cursor_mode = ack.cursor_mode_after_retire;
+            state.last_present_cursor_rect = ack.last_present_cursor_rect_after_retire;
+            state.last_present_cursor_version = ack.last_present_cursor_version_after_retire;
             // Apply the cursor transition via the platform (the
             // mode update above describes what we want; the
             // ioctl actually performs it). Per-CRTC ioctl failures
@@ -1273,6 +1321,31 @@ fn record_tick_success(state: &mut OutputSceneState, output_idx: usize) {
     }
 }
 
+fn cursor_damage_for_frame(
+    last_present_cursor_rect: Option<vk::Rect2D>,
+    last_present_cursor_version: Option<u64>,
+    new_cursor_rect: Option<vk::Rect2D>,
+    new_cursor_version: Option<u64>,
+    cursor_transition: Option<CursorTransition>,
+) -> RegionSet {
+    let mut damage = RegionSet::new();
+    let cursor_changed = new_cursor_rect != last_present_cursor_rect
+        || cursor_transition.is_some()
+        || new_cursor_version != last_present_cursor_version;
+    if !cursor_changed {
+        return damage;
+    }
+    if let Some(rect) = last_present_cursor_rect {
+        damage.add(rect);
+    }
+    if let Some(rect) = new_cursor_rect
+        && Some(rect) != last_present_cursor_rect
+    {
+        damage.add(rect);
+    }
+    damage
+}
+
 #[allow(clippy::too_many_lines)]
 fn tick_one_output(
     inner: &mut SceneCompositorInner,
@@ -1284,7 +1357,7 @@ fn tick_one_output(
     telemetry: &mut Telemetry,
     hw_strategy_enabled: bool,
     cow_host_xid: Option<u32>,
-) -> Result<bool, SceneError> {
+) -> Result<TickOutcome, SceneError> {
     // 0. **Per-output flip-pending gate.** KMS only allows one
     //    pending atomic commit per CRTC at a time; a second
     //    `drmModeAtomicCommit` while the first hasn't fired
@@ -1316,13 +1389,13 @@ fn tick_one_output(
         drain_pending_pool_releases(s, vk.as_ref());
         if !s.pending_acks.is_empty() {
             record_tick_skip(s, output_idx, TickSkipReason::PendingAcks, 0);
-            return Ok(false);
+            return Ok(TickOutcome::Skipped(TickSkipReason::PendingAcks));
         }
         if let Some(deadline) = s.next_submit_retry_at
             && std::time::Instant::now() < deadline
         {
             record_tick_skip(s, output_idx, TickSkipReason::RetryDeadline, 0);
-            return Ok(false);
+            return Ok(TickOutcome::Skipped(TickSkipReason::RetryDeadline));
         }
     }
 
@@ -1345,6 +1418,8 @@ fn tick_one_output(
     //    `cursor_prev_pos` advance happens transactionally below
     //    AFTER the per-output commit succeeds.
     let cursor_prev_pos_before = inner.outputs[output_idx].cursor_prev_pos;
+    let last_present_cursor_rect = inner.outputs[output_idx].last_present_cursor_rect;
+    let last_present_cursor_version = inner.outputs[output_idx].last_present_cursor_version;
     let hw_available = platform.cursor_plane_available();
     let hw_can_run = hw_strategy_enabled && hw_available;
     let prev_mode = inner.outputs[output_idx].last_frame_cursor_mode;
@@ -1374,6 +1449,18 @@ fn tick_one_output(
         derive_cursor_transition(prev_mode, built.cursor_assignment);
 
     let mut output_damage = built.projected_damage;
+    output_damage.union_with(&cursor_damage_for_frame(
+        last_present_cursor_rect,
+        last_present_cursor_version,
+        built.new_cursor_rect,
+        built.cursor_record_version,
+        cursor_transition_to_queue,
+    ));
+    // Always-Full repaint makes stationary SW cursors safe even when
+    // cursor_damage is empty and some unrelated damage triggers a
+    // frame. If `Repaint::Clipped` is ever re-enabled, the current SW
+    // cursor rect must also be folded into the repaint region even
+    // when it did not itself trigger the compose.
     output_damage.union_with(&scene_structure_snap);
     output_damage.union_with(&failed_repaint_snap);
     telemetry.record_scene_entries(
@@ -1385,7 +1472,7 @@ fn tick_one_output(
     if output_damage.is_empty() && !first_frame {
         let s = inner.outputs.get_mut(output_idx).expect("range");
         record_tick_skip(s, output_idx, TickSkipReason::EmptyDamage, 0);
-        return Ok(false);
+        return Ok(TickOutcome::Skipped(TickSkipReason::EmptyDamage));
     }
 
     // 4. Acquire BO.
@@ -1399,7 +1486,7 @@ fn tick_one_output(
                 TickSkipReason::NoBO,
                 output_damage.rects().len(),
             );
-            return Ok(false);
+            return Ok(TickOutcome::Skipped(TickSkipReason::NoBO));
         }
     };
 
@@ -1457,7 +1544,7 @@ fn tick_one_output(
                 TickSkipReason::NoPool,
                 output_damage.rects().len(),
             );
-            return Ok(false);
+            return Ok(TickOutcome::Skipped(TickSkipReason::NoPool));
         }
     };
     let descriptor_pool = state.pool_ring.pool_at(slot);
@@ -1511,10 +1598,12 @@ fn tick_one_output(
                 cursor_transition: cursor_transition_to_queue,
                 cursor_prev_pos_after_retire,
                 cursor_mode_after_retire,
+                last_present_cursor_rect_after_retire: built.new_cursor_rect,
+                last_present_cursor_version_after_retire: built.cursor_record_version,
             });
             state.current_generation = frame_gen;
             record_tick_success(state, output_idx);
-            Ok(true)
+            Ok(TickOutcome::Composed)
         }
         Err(e) => {
             match &e {
@@ -1684,6 +1773,30 @@ fn scene_walk_debug_enabled_for(host_xid: u32) -> bool {
     debug_scene_walk_all() || debug_scene_walk_xids().contains(&host_xid)
 }
 
+fn cursor_footprint_rect(
+    dx: i32,
+    dy: i32,
+    cursor_w: i32,
+    cursor_h: i32,
+    layout_w: i32,
+    layout_h: i32,
+) -> Option<vk::Rect2D> {
+    let x0 = dx.max(0);
+    let y0 = dy.max(0);
+    let x1 = (dx + cursor_w).min(layout_w);
+    let y1 = (dy + cursor_h).min(layout_h);
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    Some(vk::Rect2D {
+        offset: vk::Offset2D { x: x0, y: y0 },
+        extent: vk::Extent2D {
+            width: u32::try_from(x1 - x0).unwrap_or(0),
+            height: u32::try_from(y1 - y0).unwrap_or(0),
+        },
+    })
+}
+
 /// Walk window tree, build the per-output scene + collect damage
 /// snapshots.
 ///
@@ -1716,7 +1829,7 @@ fn build_scene(
     output_idx: usize,
     platform: &PlatformBackend,
     cursor: Option<CursorEntry>,
-    cursor_prev_pos: Option<(i32, i32)>,
+    _cursor_prev_pos: Option<(i32, i32)>,
     // Phase 2.6 — host xid of the materialized Composite Overlay
     // Window, if any. The top-level walk uses this to mark the COW
     // top-level (and its descendants by recursion) with
@@ -1842,16 +1955,17 @@ fn build_scene(
         n_sampled = sampled_ids.len(),
     );
 
-    // Stage 5 Phase C: pure cursor strategy decision. Produces a
-    // `CursorAssignment`; the SW draw is appended only when the
-    // strategy picks `Sw` (HW assignment omits the draw entirely
-    // since the kernel overlay covers it). Trail elimination
-    // damage for the PRIOR SW rect runs unconditionally — even
-    // after a Sw → Hw transition, the next frame must clear stale
-    // SW pixels off the scanout BO (the prior SW position is the
-    // bottom of the now-vacated SW area).
+    // Stage 5 Phase C: pure cursor strategy decision. `build_scene`
+    // decides visibility + HW/SW assignment and reports the current
+    // clipped footprint, but it does NOT emit cursor damage. The
+    // tick owns that decision because it also owns the transactional
+    // "last successfully presented cursor footprint/version" state.
     #[allow(clippy::cast_possible_truncation)]
-    let cursor_assignment: CursorAssignment = if let Some(cur) = cursor
+    let (cursor_assignment, new_cursor_rect, cursor_record_version): (
+        CursorAssignment,
+        Option<vk::Rect2D>,
+        Option<u64>,
+    ) = if let Some(cur) = cursor
         && let Some(drawable) = store.get(cur.id)
         && drawable.storage.image_view != vk::ImageView::null()
     {
@@ -1859,42 +1973,13 @@ fn build_scene(
         let ch = i32::try_from(cur.extent.height).unwrap_or(i32::MAX);
         let layout_w_i = i32::try_from(layout_w).unwrap_or(i32::MAX);
         let layout_h_i = i32::try_from(layout_h).unwrap_or(i32::MAX);
-
-        let add_cursor_damage = |projected: &mut RegionSet, dx: i32, dy: i32| {
-            let x0 = dx.max(0);
-            let y0 = dy.max(0);
-            let x1 = (dx + cw).min(layout_w_i);
-            let y1 = (dy + ch).min(layout_h_i);
-            if x1 <= x0 || y1 <= y0 {
-                return;
-            }
-            projected.add(vk::Rect2D {
-                offset: vk::Offset2D { x: x0, y: y0 },
-                extent: vk::Extent2D {
-                    width: u32::try_from(x1 - x0).unwrap_or(0),
-                    height: u32::try_from(y1 - y0).unwrap_or(0),
-                },
-            });
-        };
-
-        // Damage the previous SW rect unconditionally — even a
-        // pure-HW frame needs to clear stale SW pixels off the
-        // scanout BO. Phase D's `cursor_prev_pos_after_retire`
-        // advances `OutputSceneState.cursor_prev_pos` only when
-        // the matching commit retires; failed commits leave the
-        // OLD prev rect in place so the trail is still cleared.
-        if let Some((prev_x, prev_y)) = cursor_prev_pos {
-            add_cursor_damage(&mut projected, prev_x, prev_y);
-        }
-
         let dx = (core.cursor_x as i32) - i32::from(cur.hot_x) - layout_x0;
         let dy = (core.cursor_y as i32) - i32::from(cur.hot_y) - layout_y0;
-        let visible = !(dx + cw <= 0 || dy + ch <= 0 || dx >= layout_w_i || dy >= layout_h_i);
-        if !visible {
+        let new_rect = cursor_footprint_rect(dx, dy, cw, ch, layout_w_i, layout_h_i);
+        if new_rect.is_none() {
             // Off-output / fully-clipped — the cursor isn't on this
-            // output this frame. Phase D treats this as `Hidden`;
-            // the prev-rect damage above still clears the trail.
-            CursorAssignment::Hidden
+            // output this frame. Phase D treats this as `Hidden`.
+            (CursorAssignment::Hidden, None, None)
         } else {
             // Phase C strategy gates (codex v6-pass — pure data, no
             // DRM side effects). Hand off to HW only when the
@@ -1902,14 +1987,17 @@ fn build_scene(
             // 64×64 hardware minimum).
             let hw_fits = cur.extent.width <= 64 && cur.extent.height <= 64;
             if hw_strategy_active && hw_fits {
-                add_cursor_damage(&mut projected, dx, dy);
-                CursorAssignment::Hw {
-                    x: core.cursor_x as i32,
-                    y: core.cursor_y as i32,
-                    record_version: cur.record_version,
-                    hot_x: u16::try_from(cur.hot_x.max(0)).unwrap_or(0),
-                    hot_y: u16::try_from(cur.hot_y.max(0)).unwrap_or(0),
-                }
+                (
+                    CursorAssignment::Hw {
+                        x: core.cursor_x as i32,
+                        y: core.cursor_y as i32,
+                        record_version: cur.record_version,
+                        hot_x: u16::try_from(cur.hot_x.max(0)).unwrap_or(0),
+                        hot_y: u16::try_from(cur.hot_y.max(0)).unwrap_or(0),
+                    },
+                    new_rect,
+                    Some(cur.record_version),
+                )
             } else {
                 draws.push(CompositeDraw {
                     image_view: drawable.storage.sample_view,
@@ -1922,12 +2010,15 @@ fn build_scene(
                     alpha_passthrough: true,
                 });
                 sampled_ids.push(cur.id);
-                add_cursor_damage(&mut projected, dx, dy);
-                CursorAssignment::Sw { pos: (dx, dy) }
+                (
+                    CursorAssignment::Sw { pos: (dx, dy) },
+                    new_rect,
+                    Some(cur.record_version),
+                )
             }
         }
     } else {
-        CursorAssignment::Hidden
+        (CursorAssignment::Hidden, None, None)
     };
 
     let scene = CompositeScene {
@@ -1940,6 +2031,8 @@ fn build_scene(
         sampled_ids,
         projected_damage: projected,
         cursor_assignment,
+        new_cursor_rect,
+        cursor_record_version,
     }
 }
 
@@ -2895,6 +2988,63 @@ mod tests {
         assert_eq!(mode_after, OutputCursorMode::Hidden);
     }
 
+    #[test]
+    fn stationary_cursor_same_rect_mode_and_version_adds_no_damage() {
+        let damage = cursor_damage_for_frame(
+            Some(rect(10, 20, 16, 16)),
+            Some(7),
+            Some(rect(10, 20, 16, 16)),
+            Some(7),
+            None,
+        );
+        assert!(
+            damage.is_empty(),
+            "stationary cursor must not keep the output dirty"
+        );
+    }
+
+    #[test]
+    fn moved_sw_cursor_damages_old_and_new_rects() {
+        let old = rect(10, 20, 16, 16);
+        let new = rect(30, 40, 16, 16);
+        let damage = cursor_damage_for_frame(Some(old), Some(7), Some(new), Some(7), None);
+        let rects = damage.rects();
+        assert!(rects.contains(&old), "old rect must be cleared");
+        assert!(rects.contains(&new), "new rect must be painted");
+    }
+
+    #[test]
+    fn sprite_swap_on_stationary_cursor_damages_once() {
+        let rect = rect(10, 20, 16, 16);
+        let damage = cursor_damage_for_frame(Some(rect), Some(7), Some(rect), Some(8), None);
+        assert_eq!(damage.rects(), &[rect]);
+    }
+
+    #[test]
+    fn pure_hw_hide_still_damages_last_present_rect() {
+        let rect = rect(10, 20, 16, 16);
+        let damage = cursor_damage_for_frame(
+            Some(rect),
+            Some(7),
+            None,
+            None,
+            Some(CursorTransition::HideOnRetire),
+        );
+        assert_eq!(damage.rects(), &[rect]);
+    }
+
+    #[test]
+    fn tick_outcome_only_clears_dirty_for_compose_or_empty_skip() {
+        assert!(TickOutcome::Composed.clears_scene_structure_dirty());
+        assert!(TickOutcome::Skipped(TickSkipReason::EmptyDamage).clears_scene_structure_dirty());
+        assert!(!TickOutcome::Skipped(TickSkipReason::PendingAcks).clears_scene_structure_dirty());
+        assert!(
+            !TickOutcome::Skipped(TickSkipReason::RetryDeadline).clears_scene_structure_dirty()
+        );
+        assert!(!TickOutcome::Skipped(TickSkipReason::NoBO).clears_scene_structure_dirty());
+        assert!(!TickOutcome::Skipped(TickSkipReason::NoPool).clears_scene_structure_dirty());
+    }
+
     /// Steady-state HW: no transition queued (the bytes path
     /// flows through the synchronous `queue_steady_state_cursor_upload`
     /// instead, since v2's empty-damage skip would starve a
@@ -3330,6 +3480,16 @@ mod tests {
         let empty = RegionSet::new();
         let p = pick_repaint_region(Some(2), false, 3, &empty, &history, extent(800, 600));
         assert!(matches!(p, Repaint::Full(_)));
+    }
+
+    /// Placeholder for the eventual `Repaint::Clipped` re-enable:
+    /// a compose triggered by unrelated damage must still repaint the
+    /// current SW cursor rect, even when the cursor itself did not
+    /// trigger the frame.
+    #[test]
+    #[ignore = "Clipped repaint path is intentionally disabled"]
+    fn clipped_repaint_must_include_stationary_sw_cursor_rect() {
+        panic!("enable this when Repaint::Clipped returns again");
     }
 
     // ── Stage 3f.6: subwindow scene traversal ─────────────────────
