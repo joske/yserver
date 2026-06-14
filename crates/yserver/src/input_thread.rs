@@ -17,9 +17,13 @@
 //! Plan: `docs/superpowers/plans/2026-05-06-single-threaded-core.md` §E2.
 
 use std::{
+    collections::VecDeque,
     io,
     os::fd::{AsFd, AsRawFd, BorrowedFd},
-    sync::atomic::{AtomicU8, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicU8, Ordering},
+    },
 };
 
 use nix::sys::{
@@ -32,6 +36,7 @@ use yserver_core::{
         SYNTH_SCROLL_RIGHT, SYNTH_SCROLL_UP,
     },
     host_x11::HostKeyEvent,
+    xinput::libinput_props::DeviceConfigChange,
 };
 
 use crate::input::{
@@ -208,9 +213,17 @@ impl InputThreadCommand {
 }
 
 /// Direct-mode input-thread control channel.
+///
+/// Carries two kinds of message to the input thread, multiplexed on a
+/// single `eventfd` wakeup: the latched pause/resume `command` (for
+/// VT-switch suspend/resume) and a queue of `configs` — client
+/// `xinput set-prop` device-config writes that, in direct mode, must be
+/// applied on the thread that owns the libinput handles (libseat mode
+/// routes these straight through the on-core context instead).
 #[derive(Debug)]
 pub(crate) struct InputThreadControl {
     command: AtomicU8,
+    configs: Mutex<VecDeque<(String, DeviceConfigChange)>>,
     efd: EventFd,
 }
 
@@ -220,16 +233,32 @@ impl InputThreadControl {
             .map_err(|e| io::Error::other(format!("InputThreadControl eventfd: {e}")))?;
         Ok(Self {
             command: AtomicU8::new(0),
+            configs: Mutex::new(VecDeque::new()),
             efd,
         })
     }
 
     pub(crate) fn pause(&self) {
-        self.publish(InputThreadCommand::Pause);
+        self.command
+            .store(InputThreadCommand::Pause as u8, Ordering::Release);
+        self.wake();
     }
 
     pub(crate) fn resume(&self) {
-        self.publish(InputThreadCommand::Resume);
+        self.command
+            .store(InputThreadCommand::Resume as u8, Ordering::Release);
+        self.wake();
+    }
+
+    /// Enqueue a device-config write for the input thread to apply to its
+    /// own libinput device map. Async by nature: the apply (and any
+    /// libinput rejection) happens on the next thread wakeup, so callers
+    /// cannot observe the result here.
+    pub(crate) fn push_config(&self, device_node: String, change: DeviceConfigChange) {
+        if let Ok(mut q) = self.configs.lock() {
+            q.push_back((device_node, change));
+        }
+        self.wake();
     }
 
     pub(crate) fn fd(&self) -> std::os::fd::RawFd {
@@ -241,8 +270,18 @@ impl InputThreadControl {
         InputThreadCommand::from_raw(self.command.swap(0, Ordering::AcqRel))
     }
 
-    fn publish(&self, command: InputThreadCommand) {
-        self.command.store(command as u8, Ordering::Release);
+    /// Drain all queued device-config writes. The eventfd is consumed by
+    /// [`drain`]; this only empties the config queue, so the caller must
+    /// invoke it on every control wakeup (a config-only push latches no
+    /// `command`, so `drain` alone would skip it).
+    pub(crate) fn take_configs(&self) -> Vec<(String, DeviceConfigChange)> {
+        self.configs
+            .lock()
+            .map(|mut q| q.drain(..).collect())
+            .unwrap_or_default()
+    }
+
+    fn wake(&self) {
         loop {
             match self.efd.write(1) {
                 Ok(_) => break,
@@ -495,59 +534,71 @@ pub(crate) fn run(
         };
         match input_epoll.wait(&mut buf, timeout) {
             Ok(n) => {
-                if buf[..n].iter().any(|e| e.data() == EPOLL_DATA_CONTROL)
-                    && let Some(command) = control.drain()
-                {
-                    paused = match command {
-                        InputThreadCommand::Pause if !paused => {
-                            input_ctx.suspend();
-                            pending_motion = None;
-                            // Forget held modifiers: their release events go
-                            // to whoever owns the keyboard after the switch,
-                            // not us, so the flags would otherwise stay stuck.
-                            state.hotkey.reset();
-                            true
+                if buf[..n].iter().any(|e| e.data() == EPOLL_DATA_CONTROL) {
+                    // Read the eventfd + latched command first, then drain the
+                    // config queue unconditionally — a config-only push latches
+                    // no command, so `drain` alone would never apply it.
+                    let command = control.drain();
+                    for (node, change) in control.take_configs() {
+                        if let Err(err) = input_ctx.apply_device_config(&node, change) {
+                            log::debug!(
+                                "input thread: apply_device_config({node}) rejected by \
+                                 libinput: {err:?}"
+                            );
                         }
-                        InputThreadCommand::Resume if paused => match input_ctx.resume() {
-                            Ok(()) => {
-                                // Start clean on the VT we just acquired —
-                                // any modifiers held during the switch were
-                                // released while we weren't reading.
+                    }
+                    if let Some(command) = command {
+                        paused = match command {
+                            InputThreadCommand::Pause if !paused => {
+                                input_ctx.suspend();
+                                pending_motion = None;
+                                // Forget held modifiers: their release events go
+                                // to whoever owns the keyboard after the switch,
+                                // not us, so the flags would otherwise stay stuck.
                                 state.hotkey.reset();
-                                // Drain any libinput resume-replay first so our
-                                // synthetic releases land AFTER, not before.
-                                let _ = input_ctx.dispatch();
-                                // Forget held modifiers on VT-enter (Xorg-style):
-                                // emit a KeyRelease for each modifier X-keycode so
-                                // a modifier whose release was lost across the
-                                // switch is cleared in xkb_state. Harmless when not
-                                // held (release of an up key is a no-op); a still-
-                                // held modifier re-presses on its next event.
-                                // X keycodes (evdev+8): LCtrl37 RCtrl105 LAlt64
-                                // RAlt108 LShift50 RShift62 LSuper133 RSuper134.
-                                for kc in [37u8, 105, 64, 108, 50, 62, 133, 134] {
-                                    let _ = sender.send(Message::HostInput(HostInputEvent::Key(
-                                        HostKeyEvent {
-                                            pressed: false,
-                                            keycode: kc,
-                                            time: current_time_ms(),
-                                            root_x: state.cursor_x as i16,
-                                            root_y: state.cursor_y as i16,
-                                            event_x: state.cursor_x as i16,
-                                            event_y: state.cursor_y as i16,
-                                            state: 0,
-                                        },
-                                    )));
-                                }
-                                false
-                            }
-                            Err(err) => {
-                                log::warn!("input thread: libinput resume failed: {err}");
                                 true
                             }
-                        },
-                        _ => paused,
-                    };
+                            InputThreadCommand::Resume if paused => match input_ctx.resume() {
+                                Ok(()) => {
+                                    // Start clean on the VT we just acquired —
+                                    // any modifiers held during the switch were
+                                    // released while we weren't reading.
+                                    state.hotkey.reset();
+                                    // Drain any libinput resume-replay first so our
+                                    // synthetic releases land AFTER, not before.
+                                    let _ = input_ctx.dispatch();
+                                    // Forget held modifiers on VT-enter (Xorg-style):
+                                    // emit a KeyRelease for each modifier X-keycode so
+                                    // a modifier whose release was lost across the
+                                    // switch is cleared in xkb_state. Harmless when not
+                                    // held (release of an up key is a no-op); a still-
+                                    // held modifier re-presses on its next event.
+                                    // X keycodes (evdev+8): LCtrl37 RCtrl105 LAlt64
+                                    // RAlt108 LShift50 RShift62 LSuper133 RSuper134.
+                                    for kc in [37u8, 105, 64, 108, 50, 62, 133, 134] {
+                                        let _ = sender.send(Message::HostInput(
+                                            HostInputEvent::Key(HostKeyEvent {
+                                                pressed: false,
+                                                keycode: kc,
+                                                time: current_time_ms(),
+                                                root_x: state.cursor_x as i16,
+                                                root_y: state.cursor_y as i16,
+                                                event_x: state.cursor_x as i16,
+                                                event_y: state.cursor_y as i16,
+                                                state: 0,
+                                            }),
+                                        ));
+                                    }
+                                    false
+                                }
+                                Err(err) => {
+                                    log::warn!("input thread: libinput resume failed: {err}");
+                                    true
+                                }
+                            },
+                            _ => paused,
+                        };
+                    }
                 }
                 // Core-thread lock-LED update: drain the eventfd and
                 // push the mask to every keyboard device. Falls through
@@ -1196,5 +1247,52 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// A config-only push latches no pause/resume command, so `drain`
+    /// (which the loop calls first) returns `None` — but `take_configs`
+    /// must still surface the queued write. This is the exact path the
+    /// direct-mode `xinput set-prop` fix relies on: regression-guards
+    /// against re-coupling config delivery to the command latch.
+    #[test]
+    fn config_push_survives_command_drain() {
+        let control = InputThreadControl::new().expect("control");
+        control.push_config(
+            "/dev/input/event2".into(),
+            DeviceConfigChange::NaturalScroll(false),
+        );
+        // No pause/resume was published, so the latched command is empty.
+        assert_eq!(control.drain(), None);
+        // The config write is still pending and drains FIFO.
+        let configs = control.take_configs();
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].0, "/dev/input/event2");
+        assert!(matches!(
+            configs[0].1,
+            DeviceConfigChange::NaturalScroll(false)
+        ));
+        // Queue is emptied by the take.
+        assert!(control.take_configs().is_empty());
+    }
+
+    /// Config writes and a pause/resume command can ride the same wakeup;
+    /// both must be observable, and configs preserve enqueue order.
+    #[test]
+    fn config_queue_is_fifo_and_independent_of_command() {
+        let control = InputThreadControl::new().expect("control");
+        control.push_config(
+            "/dev/input/event2".into(),
+            DeviceConfigChange::NaturalScroll(true),
+        );
+        control.push_config("/dev/input/event2".into(), DeviceConfigChange::Tap(false));
+        control.pause();
+        assert_eq!(control.drain(), Some(InputThreadCommand::Pause));
+        let configs = control.take_configs();
+        assert_eq!(configs.len(), 2);
+        assert!(matches!(
+            configs[0].1,
+            DeviceConfigChange::NaturalScroll(true)
+        ));
+        assert!(matches!(configs[1].1, DeviceConfigChange::Tap(false)));
     }
 }

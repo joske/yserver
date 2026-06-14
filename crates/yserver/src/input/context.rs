@@ -128,6 +128,23 @@ impl SendContext {
     pub fn resume(&mut self) -> io::Result<()> {
         self.0.resume()
     }
+
+    /// Route a `xinput set-prop` write to the wrapped libinput context.
+    /// Direct-mode counterpart of the libseat path: the input thread
+    /// owns the live device map here, so client device-config writes
+    /// (forwarded over `InputThreadControl`) land via this forward.
+    ///
+    /// # Errors
+    ///
+    /// Propagates libinput's [`DeviceConfigError`] (Unsupported / Invalid)
+    /// from the inner [`Context::apply_device_config`].
+    pub fn apply_device_config(
+        &mut self,
+        device_node: &str,
+        change: DeviceConfigChange,
+    ) -> Result<(), DeviceConfigError> {
+        self.0.apply_device_config(device_node, change)
+    }
 }
 
 impl AsFd for SendContext {

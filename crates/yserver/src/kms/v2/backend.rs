@@ -9503,14 +9503,22 @@ impl Backend for KmsBackendV2 {
         change: yserver_core::xinput::libinput_props::DeviceConfigChange,
     ) -> Result<(), yserver_core::xinput::libinput_props::DeviceConfigError> {
         // Libseat mode: route through the on-core libinput context's
-        // device map, where `DeviceAdded` stashed the live handle. Direct
-        // mode doesn't reach this backend variant (KmsBackendV1 path); if
-        // `core_libinput` is None we have nowhere to write, so silently
-        // succeed — the trait's default contract.
-        let Some(ctx) = self.core_libinput.as_mut() else {
-            return Ok(());
-        };
-        ctx.apply_device_config(device_node, change)
+        // device map, where `DeviceAdded` stashed the live handle.
+        if let Some(ctx) = self.core_libinput.as_mut() {
+            return ctx.apply_device_config(device_node, change);
+        }
+        // Direct mode (lightdm/startx): libinput lives on the separate
+        // input thread, so forward the write over the control channel —
+        // the thread applies it to its own device map on the next wakeup.
+        // The apply is async, so libinput's Unsupported/Invalid can't be
+        // surfaced here; report success and let the input thread log any
+        // rejection. Without this the write would be silently dropped and
+        // every client device-config knob (natural scroll, tap, accel…)
+        // would be a no-op under lightdm.
+        if let Some(control) = self.input_thread_control.as_ref() {
+            control.push_config(device_node.to_owned(), change);
+        }
+        Ok(())
     }
 
     fn probe_input_devices(&mut self, state: &mut ServerState) -> usize {
