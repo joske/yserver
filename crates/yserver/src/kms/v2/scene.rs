@@ -3482,14 +3482,27 @@ mod tests {
         assert!(matches!(p, Repaint::Full(_)));
     }
 
-    /// Placeholder for the eventual `Repaint::Clipped` re-enable:
-    /// a compose triggered by unrelated damage must still repaint the
-    /// current SW cursor rect, even when the cursor itself did not
-    /// trigger the frame.
+    /// Tripwire for the idle-compose cursor-damage gating
+    /// (project_idle_compose_cursor_damage): gating the cursor out of
+    /// `output_damage` is only safe because `pick_repaint_region` returns
+    /// `Repaint::Full` unconditionally today, so every compose repaints the
+    /// whole BO (cursor included). If `Repaint::Clipped` is re-enabled, the
+    /// current SW cursor rect must be folded into the repaint region even when
+    /// the cursor did not itself trigger the frame — else a fresh/older-age BO
+    /// shows a stale/missing cursor (see the gating-site comment in
+    /// `tick_one_output`). Passes today; fails the day Full stops being
+    /// unconditional, forcing that revisit. (Not `#[ignore]` + `panic!`: that
+    /// pattern breaks `cargo test --include-ignored`.)
     #[test]
-    #[ignore = "Clipped repaint path is intentionally disabled"]
-    fn clipped_repaint_must_include_stationary_sw_cursor_rect() {
-        panic!("enable this when Repaint::Clipped returns again");
+    fn clipped_reenable_must_fold_in_stationary_sw_cursor_rect() {
+        let history = BufferAgeRing::new(4);
+        let damage = RegionSet::new();
+        let p = pick_repaint_region(Some(2), false, 5, &damage, &history, extent(800, 600));
+        assert!(
+            matches!(p, Repaint::Full(_)),
+            "Repaint::Clipped re-enabled — fold the stationary SW cursor rect \
+             into the repaint region (project_idle_compose_cursor_damage)",
+        );
     }
 
     // ── Stage 3f.6: subwindow scene traversal ─────────────────────
