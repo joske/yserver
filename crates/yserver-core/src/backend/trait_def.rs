@@ -338,6 +338,15 @@ pub trait Backend: Send {
     /// never registered.
     fn on_libinput_ready(&mut self, _state: &mut ServerState) {}
 
+    /// Called once per core-loop iteration (with `state`) so a backend can
+    /// service time-based input work that isn't tied to an fd readiness edge —
+    /// specifically, retry a libseat device open that was DEFERRED by a lagging
+    /// udev ACL on a freshly re-enumerated device (the "mouse stuck after
+    /// monitor off→on" bug). The backend gates its own work on a retry deadline
+    /// (and reports that deadline via [`Backend::next_wakeup`] so the loop wakes
+    /// for it). Default: no-op. project_mouse_hotplug_lost_wakeup.
+    fn poll_deferred_input(&mut self, _state: &mut ServerState) {}
+
     /// Drain libinput's INITIAL device enumeration and seed the XI2
     /// device registry (`state.xi_devices`) BEFORE the core serves any
     /// client — the Xorg model of probing input at startup.

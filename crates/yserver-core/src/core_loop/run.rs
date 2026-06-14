@@ -752,6 +752,14 @@ pub fn run_core(
             crate::core_loop::process_disconnect::process_disconnect(state, backend, disc_id);
         }
 
+        // Service time-based input work that isn't tied to an fd edge —
+        // specifically, retry a libseat device open that a lagging udev ACL
+        // deferred after a monitor-hub hot-add (the "mouse stuck after monitor
+        // off→on until a keypress" bug). No-op unless a retry window is armed;
+        // the backend reports its retry cadence via `next_wakeup`.
+        // project_mouse_hotplug_lost_wakeup.
+        backend.poll_deferred_input(state);
+
         // Wake the composite path back up if the backend went dormant
         // after the previous pageflip-complete (because nothing was
         // dirty) and fresh damage has since arrived. No-op for

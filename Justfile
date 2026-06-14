@@ -402,6 +402,133 @@ yserver-e16-xterm-hw-trace log="debug":
         kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;'
 
+# Capture the e16 IDLE protocol loop (no wezterm, no interaction) — for the
+# 2026-06-14 "idle never idles" investigation. Starts yserver + x11trace + e16
+# ALONE, lets it settle, then traces `secs` seconds of steady idle into
+# e16-idle.xtrace and tears down cleanly (self-terminating — no zap needed).
+# e16's pager redraws a live desktop miniature by sampling the root (~96
+# CopyArea/rebuild). On yserver this NEVER settles (~970 CopyArea/s for minutes);
+# on Xorg the pager draws once and STOPS. Compare against xorg-e16-idle-trace.
+# Keep `secs` small — the file grows fast at ~1000 req/s.
+#     just yserver-e16-idle-trace          # 5s steady-idle capture
+#     just yserver-e16-idle-trace secs=3
+yserver-e16-idle-trace secs="6" log="warn":
+    cargo build --bin yserver
+    rm -f e16-idle.xtrace
+    bash -c '\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11 XDG_SESSION_TYPE=x11;\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-e16.log 2>&1 &\
+        yserver_pid=$!;\
+        for i in $(seq 100); do [ -S /tmp/.X11-unix/X7 ] && break; sleep 0.1; done;\
+        x11trace -d :7 -D :8 -n -o e16-idle.xtrace >x11trace-idle.err 2>&1 &\
+        xtrace_pid=$!;\
+        for i in $(seq 50); do [ -S /tmp/.X11-unix/X8 ] && break; sleep 0.1; done;\
+        echo "starting e16 through trace; capturing ~{{secs}}s (incl startup). DO NOT touch input.";\
+        DISPLAY=:8 e16 > e16-hw.log 2>&1 &\
+        e16_pid=$!;\
+        sleep {{secs}};\
+        kill -TERM $e16_pid $xtrace_pid $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        echo "done: $(wc -l < e16-idle.xtrace 2>/dev/null) trace lines in e16-idle.xtrace";'
+
+# REFERENCE: same e16 + pager on real Xorg, traced — the de-facto-spec compare
+# for the "idle never idles" bug. Run from a free text VT (Xorg.wrap lets a
+# console user start it). WATCH the screen: e16's pager draws its desktop
+# miniature column-by-column, then on Xorg it should STOP within a few seconds.
+# Longer default window than the yserver recipe so we confirm it settles to 0
+# CopyArea (if the pager finishes, the trace stays small).
+#     just xorg-e16-idle-trace           # 20s capture
+#     just xorg-e16-idle-trace secs=30
+xorg-e16-idle-trace secs="20":
+    rm -f e16-xorg.xtrace
+    bash -c '\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11 XDG_SESSION_TYPE=x11;\
+        Xorg :9 -keeptty > xorg9.log 2>&1 &\
+        xorg_pid=$!;\
+        for i in $(seq 150); do [ -S /tmp/.X11-unix/X9 ] && break; sleep 0.1; done;\
+        if [ ! -S /tmp/.X11-unix/X9 ]; then echo "FAIL: Xorg :9 did not start"; tail -20 xorg9.log; kill $xorg_pid 2>/dev/null; exit 1; fi;\
+        x11trace -d :9 -D :10 -n -o e16-xorg.xtrace >x11trace-xorg.err 2>&1 &\
+        xtrace_pid=$!;\
+        for i in $(seq 50); do [ -S /tmp/.X11-unix/X10 ] && break; sleep 0.1; done;\
+        echo "e16 on Xorg :9 via trace; capturing {{secs}}s. WATCH: does the pager stop drawing?";\
+        DISPLAY=:10 e16 > e16-xorg.log 2>&1 &\
+        e16_pid=$!;\
+        sleep {{secs}};\
+        kill -TERM $e16_pid $xtrace_pid $xorg_pid 2>/dev/null;\
+        wait $xorg_pid 2>/dev/null;\
+        echo "done: $(wc -l < e16-xorg.xtrace 2>/dev/null) trace lines; CopyArea=$(grep -c CopyArea e16-xorg.xtrace 2>/dev/null)";'
+
+# Idle-rate check under fvwm3 (a quiet, non-polling WM — unlike e16's pager).
+# Brings up yserver + fvwm3 with YSERVER_LOOP_TELEMETRY=1, telemetry -> the same
+# target/yserver-telemetry.log we watch. Leave it idle (don't touch input) and
+# the per-second "vk call rate" / "loop telemetry" lines should show
+# compose=0 / req/s=0 once settled — the decisive "yserver reaches 0/s" gate
+# (the cursor-damage idle fix). Zap or Ctrl-C to stop.
+yserver-fvwm3-idle log="info":
+    cargo build --bin yserver
+    bash -c '\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11 XDG_SESSION_TYPE=x11;\
+        RUST_LOG="{{log}}" YSERVER_LOOP_TELEMETRY=1 RUST_BACKTRACE=1 target/debug/yserver > target/yserver-telemetry.log 2>&1 &\
+        yserver_pid=$!;\
+        for i in $(seq 100); do [ -S /tmp/.X11-unix/X7 ] && break; sleep 0.1; done;\
+        DISPLAY=:7 fvwm3 > target/fvwm3-idle.log 2>&1 &\
+        echo "fvwm3 up on :7; telemetry -> target/yserver-telemetry.log. Leave idle; watch compose rate. Zap/Ctrl-C to stop.";\
+        wait $yserver_pid 2>/dev/null;'
+
+# Input-device hotplug probe for the "mouse doesn't return after monitor
+# off->on" issue (2026-06-14, vs GNOME-Wayland which recovers it). Runs yserver
+# + fvwm3 AND a UTC-timestamped `udevadm monitor` of the input subsystem, so we
+# can correlate WHEN the kernel re-creates the mouse node vs WHEN yserver picks
+# it up. Procedure: run from a VT, then physically power the monitor OFF, wait
+# ~5s, power ON, move the mouse; then zap/Ctrl-C. Compare:
+#   target/yserver-hotplug.log  — yserver `xi-device`/`libinput` add/remove
+#   target/udev-input.log       — kernel/udev input device add/remove
+# kernel-add at screen-on but yserver-add only later => yserver hotplug bug.
+yserver-input-hotplug-probe log="info":
+    cargo build --bin yserver
+    rm -f target/udev-input.log target/yserver-hotplug.log
+    bash -c '\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11 XDG_SESSION_TYPE=x11;\
+        ( stdbuf -oL udevadm monitor --udev --kernel --subsystem-match=input 2>&1 | while IFS= read -r l; do printf "%s %s\n" "$(date -u +%H:%M:%S.%3N)" "$l"; done > target/udev-input.log ) &\
+        udev_pid=$!;\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/debug/yserver > target/yserver-hotplug.log 2>&1 &\
+        yserver_pid=$!;\
+        for i in $(seq 100); do [ -S /tmp/.X11-unix/X7 ] && break; sleep 0.1; done;\
+        DISPLAY=:7 fvwm3 > target/fvwm3-hotplug.log 2>&1 &\
+        echo "up. NOW: power monitor OFF, wait ~5s, power ON, move mouse. Then zap/Ctrl-C.";\
+        echo "logs: target/yserver-hotplug.log + target/udev-input.log";\
+        wait $yserver_pid 2>/dev/null;\
+        kill $udev_pid 2>/dev/null;'
+
+# Same probe under a full Cinnamon session (the DE the original freeze + storm
+# repros used). Release build + YSERVER_LOOP_TELEMETRY (compose rate) + xi-device
+# logging + udev input monitor. Lets us check, in one run: (a) does Cinnamon idle
+# to compose=0, (b) does the mouse re-acquire on monitor off->on, (c) does the
+# storm recur. Let Cinnamon FULLY settle (~20s) before judging idle; then power
+# the monitor OFF ~5s / ON / move mouse; then log out or zap.
+#   watch: target/yserver-cinnamon-probe.log (RATE + xi-device) + target/udev-input.log
+yserver-cinnamon-hotplug-probe log="info":
+    cargo build --release --bin yserver
+    rm -f target/udev-input.log target/yserver-cinnamon-probe.log
+    bash -c '\
+        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
+        ( stdbuf -oL udevadm monitor --udev --kernel --subsystem-match=input 2>&1 | while IFS= read -r l; do printf "%s %s\n" "$(date -u +%H:%M:%S.%3N)" "$l"; done > target/udev-input.log ) &\
+        udev_pid=$!;\
+        YSERVER_LOOP_TELEMETRY=1 RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > target/yserver-cinnamon-probe.log 2>&1 &\
+        yserver_pid=$!;\
+        for i in $(seq 100); do [ -S /tmp/.X11-unix/X7 ] && break; sleep 0.1; done;\
+        echo "yserver up; starting Cinnamon. Let it settle ~20s, check idle, then power-cycle the monitor + move mouse. Log out / zap to stop.";\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
+            dbus-run-session cinnamon-session > cinnamon.log 2>&1;\
+        kill -TERM $yserver_pid $udev_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        rm -rf "$xdg_rd" 2>/dev/null;'
+
 yserver-wmaker-xterm-hw log="debug":
     cargo build --bin yserver
     bash -c '\

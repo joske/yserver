@@ -469,8 +469,31 @@ pub(crate) fn run(
     }
 
     let mut buf = [EpollEvent::empty(); 4];
+    // Mouse-hotplug retry window (project_mouse_hotplug_lost_wakeup). After a
+    // device add/remove, a re-enumerated sibling device's open can be DEFERRED
+    // by a lagging udev uaccess ACL; the level-triggered libinput fd does NOT
+    // re-wake once that udev event is consumed, so without a timeout the thread
+    // would block until unrelated input arrives (the "mouse stuck after monitor
+    // off→on until a keypress" bug, also seen in direct/lightdm mode). While
+    // armed, give epoll_wait a ~250ms timeout so we re-dispatch and complete
+    // the deferred open; the window only extends on further device churn, so it
+    // converges and the thread returns to a blocking wait once devices settle.
+    let mut hotplug_retry_until: Option<std::time::Instant> = None;
     loop {
-        match input_epoll.wait(&mut buf, EpollTimeout::NONE) {
+        let timeout = match hotplug_retry_until {
+            Some(until) => {
+                let now = std::time::Instant::now();
+                if now >= until {
+                    hotplug_retry_until = None;
+                    EpollTimeout::NONE
+                } else {
+                    let ms = u16::try_from((until - now).as_millis().min(250)).unwrap_or(250);
+                    EpollTimeout::from(ms.max(1))
+                }
+            }
+            None => EpollTimeout::NONE,
+        };
+        match input_epoll.wait(&mut buf, timeout) {
             Ok(n) => {
                 if buf[..n].iter().any(|e| e.data() == EPOLL_DATA_CONTROL)
                     && let Some(command) = control.drain()
@@ -556,8 +579,22 @@ pub(crate) fn run(
             }
         };
 
+        // Arm the hotplug retry window on a device add/remove so a deferred
+        // sibling-device open gets retried via the epoll timeout above (the
+        // level-triggered fd won't re-wake on its own once the udev event is
+        // consumed). project_mouse_hotplug_lost_wakeup.
+        let device_change = events.iter().any(|e| {
+            matches!(
+                e,
+                InputEvent::DeviceAdded(_) | InputEvent::DeviceRemoved { .. }
+            )
+        });
         let time_ms = current_time_ms();
         process_batch(&mut state, &sender, &mut pending_motion, events, time_ms)?;
+        if device_change {
+            hotplug_retry_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(2500));
+        }
         // Flush any pending motion before the next epoll_wait so the
         // core sees end-of-burst movement promptly. A subsequent batch
         // whose first event is another motion just starts coalescing

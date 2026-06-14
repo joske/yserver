@@ -373,6 +373,15 @@ pub struct KmsBackendV2 {
     /// Hotkey detector — used on the core thread in libseat mode
     /// (`on_libinput_ready`).
     hotkey: crate::input::hotkey::HotkeyDetector,
+    /// Mouse-hotplug retry window (project_mouse_hotplug_lost_wakeup). When a
+    /// libinput device add/remove — or an empty wake during device churn — is
+    /// seen on the on-core (libseat) path, the libseat open of a freshly
+    /// re-enumerated device can be deferred by a lagging udev uaccess ACL, so
+    /// libinput surfaces no `DeviceAdded` and the idle loop would otherwise
+    /// sleep without retrying. While `Some` and not yet elapsed, the core loop
+    /// re-dispatches libinput (`poll_deferred_input`) to retry the deferred
+    /// open, then clears the window — preserving the idle-sleep once settled.
+    libinput_hotplug_retry_until: Option<std::time::Instant>,
 
     /// GLX-TFP (Tasks 2.3 + 2.4): per-`DrawableId` export tracking for
     /// pixmaps shared with a GL consumer via `GLX_EXT_texture_from_pixmap`.
@@ -788,6 +797,7 @@ impl KmsBackendV2 {
             input_sender: None,
             input_thread_control: None,
             hotkey: crate::input::hotkey::HotkeyDetector::new(),
+            libinput_hotplug_retry_until: None,
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported,
         };
@@ -925,6 +935,7 @@ impl KmsBackendV2 {
             input_sender: None,
             input_thread_control: None,
             hotkey: crate::input::hotkey::HotkeyDetector::new(),
+            libinput_hotplug_retry_until: None,
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported,
         };
@@ -1735,6 +1746,7 @@ impl KmsBackendV2 {
             input_sender: None,
             input_thread_control: None,
             hotkey: crate::input::hotkey::HotkeyDetector::new(),
+            libinput_hotplug_retry_until: None,
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported: false,
         }
@@ -8903,9 +8915,22 @@ impl Backend for KmsBackendV2 {
         } else {
             None
         };
+        // Mouse-hotplug retry cadence: while the window is armed, wake at most
+        // ~250 ms out (capped at the window end) so an idle loop still
+        // re-dispatches libinput to retry a deferred device open. Not gated on
+        // `allow_kms_timers` — input recovery must run regardless of scanout
+        // state. project_mouse_hotplug_lost_wakeup.
+        let hotplug_retry_deadline = self.libinput_hotplug_retry_until.map(|until| {
+            if now >= until {
+                now
+            } else {
+                (now + std::time::Duration::from_millis(250)).min(until)
+            }
+        });
         scene_deadline
             .into_iter()
             .chain(present_deadline)
+            .chain(hotplug_retry_deadline)
             .chain(
                 allow_kms_timers
                     .then(|| self.cursor_anim_deadline())
@@ -9346,6 +9371,10 @@ impl Backend for KmsBackendV2 {
         let time_ms = crate::clock::server_time_ms();
         let mut scroll_buf: Vec<yserver_core::core_loop::HostInputEvent> = Vec::new();
         let mut pending_motion: Option<yserver_core::core_loop::HostInputEvent> = None;
+        // Did libinput surface a device add/remove this service? If so, a
+        // sibling device's libseat open may be DEFERRED by a lagging udev ACL
+        // — arm a bounded retry window below. project_mouse_hotplug_lost_wakeup.
+        let mut device_change = false;
         // Route via `core_loop::handle_host_input` (not `self.on_host_input`
         // directly) so `update_repeat_state` arms the core's auto-repeat
         // timer for real input. The off-thread input_thread path goes
@@ -9366,6 +9395,7 @@ impl Backend for KmsBackendV2 {
             // Device add/remove — forward directly, flushing pending
             // motion first to preserve chronological order.
             if let crate::input::InputEvent::DeviceAdded(info) = ev {
+                device_change = true;
                 if let Some(m) = pending_motion.take() {
                     yserver_core::core_loop::handle_host_input(state, self, m);
                 }
@@ -9377,6 +9407,7 @@ impl Backend for KmsBackendV2 {
                 continue;
             }
             if let crate::input::InputEvent::DeviceRemoved { device_node } = ev {
+                device_change = true;
                 if let Some(m) = pending_motion.take() {
                     yserver_core::core_loop::handle_host_input(state, self, m);
                 }
@@ -9429,6 +9460,41 @@ impl Backend for KmsBackendV2 {
         if let Some(m) = pending_motion.take() {
             yserver_core::core_loop::handle_host_input(state, self, m);
         }
+        if device_change {
+            // A device add/remove just landed. The libseat open of a freshly
+            // re-enumerated sibling device can be DEFERRED by a lagging udev
+            // uaccess ACL — libinput surfaces no `DeviceAdded` for it and the
+            // idle loop would sleep without retrying until unrelated input
+            // arrives (the "mouse stuck after monitor off→on, fixed by a
+            // keypress" bug). Arm a bounded retry window so `poll_deferred_input`
+            // re-dispatches libinput and completes the open on its own. The
+            // window only extends on further device churn, so once devices
+            // settle it elapses and the idle-sleep is preserved.
+            // project_mouse_hotplug_lost_wakeup.
+            self.libinput_hotplug_retry_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(2500));
+        }
+    }
+
+    fn poll_deferred_input(&mut self, state: &mut ServerState) {
+        // Service the mouse-hotplug retry window. While armed and unexpired,
+        // re-dispatch the on-core libinput so a libseat open that was DEFERRED
+        // by a lagging udev ACL (on a device re-enumerated by a monitor-hub
+        // power-cycle) is retried and completes on its own — no unrelated
+        // keypress needed. `next_wakeup` returns the ~250 ms retry cadence so
+        // the loop wakes even when otherwise idle. project_mouse_hotplug_lost_wakeup.
+        let Some(until) = self.libinput_hotplug_retry_until else {
+            return;
+        };
+        if std::time::Instant::now() >= until {
+            // Window elapsed: stop retrying and let the loop idle again.
+            self.libinput_hotplug_retry_until = None;
+            return;
+        }
+        // `on_libinput_ready` re-arms/extends the window only if it surfaces a
+        // further device add/remove; a retry that finds nothing new does not,
+        // so the window converges and elapses once devices settle.
+        self.on_libinput_ready(state);
     }
 
     fn apply_device_config(
@@ -15870,6 +15936,51 @@ mod tests {
         assert!(
             deadline <= std::time::Instant::now() + std::time::Duration::from_millis(2),
             "pending PRESENT deadline should still be near-term with outputs off",
+        );
+    }
+
+    // project_mouse_hotplug_lost_wakeup: an armed hotplug-retry window makes
+    // the idle loop wake on the ~250ms retry cadence; an elapsed window is
+    // cleared so the loop returns to true idle.
+    #[test]
+    fn hotplug_retry_window_arms_next_wakeup_cadence() {
+        let mut b = KmsBackendV2::for_tests();
+        assert!(
+            b.next_wakeup().is_none(),
+            "idle backend with no retry window must not schedule a wakeup",
+        );
+        let now = std::time::Instant::now();
+        b.libinput_hotplug_retry_until = Some(now + std::time::Duration::from_secs(2));
+        let wake = b
+            .next_wakeup()
+            .expect("an armed hotplug-retry window must produce a wakeup");
+        assert!(
+            wake <= now + std::time::Duration::from_millis(260),
+            "retry cadence should be ~250ms; got {:?} out",
+            wake.saturating_duration_since(now),
+        );
+    }
+
+    #[test]
+    fn poll_deferred_input_clears_expired_hotplug_window() {
+        let mut b = KmsBackendV2::for_tests();
+        let mut state = ServerState::new();
+        // Elapsed window → cleared, so next_wakeup can fall back to None (idle).
+        b.libinput_hotplug_retry_until =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+        b.poll_deferred_input(&mut state);
+        assert!(
+            b.libinput_hotplug_retry_until.is_none(),
+            "an elapsed retry window must be cleared so the loop can idle",
+        );
+        // Unexpired window → stays armed. (core_libinput is None in the
+        // fixture, so the re-dispatch is a no-op and cannot re-arm/clear it.)
+        b.libinput_hotplug_retry_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+        b.poll_deferred_input(&mut state);
+        assert!(
+            b.libinput_hotplug_retry_until.is_some(),
+            "an unexpired retry window must stay armed until it elapses",
         );
     }
 
