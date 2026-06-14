@@ -29,7 +29,7 @@ use std::{
 };
 
 use crossbeam_channel::bounded;
-use log::{info, warn};
+use log::{debug, warn};
 
 use yserver_protocol::x11::{self, ClientId};
 
@@ -125,7 +125,7 @@ fn run_setup(id: ClientId, mut stream: UnixStream, sender: &CoreSender) -> io::R
     stream.set_write_timeout(Some(SETUP_TIMEOUT))?;
 
     let setup = x11::read_setup_request(&mut stream)?;
-    info!(
+    debug!(
         "client {} setup: byte_order={:?} protocol {}.{}",
         id.0, setup.byte_order, setup.protocol_major, setup.protocol_minor
     );
@@ -149,7 +149,7 @@ fn run_setup(id: ClientId, mut stream: UnixStream, sender: &CoreSender) -> io::R
         return Ok(());
     }
 
-    info!(
+    debug!(
         "client {} setup: protocol {}.{}, base=0x{:x}",
         id.0, setup.protocol_major, setup.protocol_minor, resp.resource_id_base
     );

@@ -2656,7 +2656,7 @@ fn handle_sync_request(
                     .get(&client_id.0)
                     .map(String::as_str)
                     .unwrap_or("<unknown>");
-                log::info!(
+                log::trace!(
                     "sync: client {}/{class:?} CreateAlarm 0x{alarm:x} \
                      counter={cname}(0x{counter:x}) test={test} \
                      wait_value={wait} delta={delta} events={events}",
@@ -2698,7 +2698,7 @@ fn handle_sync_request(
                     .get(&client_id.0)
                     .map(String::as_str)
                     .unwrap_or("<unknown>");
-                log::info!(
+                log::trace!(
                     "sync: client {}/{class:?} ChangeAlarm 0x{alarm:x} \
                      counter={cname}(0x{counter:x}) test={test} \
                      wait_value={wait} delta={delta} events={events}",
@@ -5116,7 +5116,7 @@ fn handle_mit_shm_put_image(
             .get(&client_id.0)
             .map(String::as_str)
             .unwrap_or("<unknown>");
-        log::info!(
+        log::debug!(
             "MIT-SHM PutImage perf: total={total_us}us \
              [extract={ext_us}us clear_clip+={cc_us}us put_image+={pi_us}us] \
              {w}x{h} depth={depth} bytes={bytes} borrowed={borrowed} \
@@ -21717,7 +21717,7 @@ fn handle_change_property(
         if prop_name == "WM_CLASS" && req.format == 8 {
             let s = String::from_utf8_lossy(&req.data).replace('\0', " | ");
             let trimmed = s.trim_end_matches(" | ").to_string();
-            log::info!(
+            log::debug!(
                 "client {} WM_CLASS on 0x{:x}: {}",
                 client_id.0,
                 req.window.0,
@@ -21730,7 +21730,7 @@ fn handle_change_property(
             state.client_wm_class.entry(client_id.0).or_insert(trimmed);
         } else if prop_name == "_NET_WM_PID" && req.format == 32 && req.data.len() >= 4 {
             let pid = u32::from_le_bytes([req.data[0], req.data[1], req.data[2], req.data[3]]);
-            log::info!(
+            log::debug!(
                 "client {} _NET_WM_PID on 0x{:x}: {}",
                 client_id.0,
                 req.window.0,

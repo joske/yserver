@@ -52,7 +52,7 @@ impl LibinputInterface for Interface {
             .open(path);
         match result {
             Ok(file) => {
-                log::info!("libinput: open_restricted ok: {}", path.display());
+                log::debug!("libinput: open_restricted ok: {}", path.display());
                 Ok(file.into())
             }
             Err(err) => {
@@ -451,7 +451,7 @@ fn log_input_devnodes() {
         }
         let path = entry.path();
         match OpenOptions::new().read(true).open(&path) {
-            Ok(_f) => log::info!("/dev/input/{name_str}: open(O_RDONLY) ok"),
+            Ok(_f) => log::debug!("/dev/input/{name_str}: open(O_RDONLY) ok"),
             Err(err) => log::warn!("/dev/input/{name_str}: open(O_RDONLY) failed: {err}"),
         }
     }
