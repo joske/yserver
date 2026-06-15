@@ -101,7 +101,7 @@ apk add gcc musl-dev fontconfig-dev freetype-dev libxshmfence-dev libxkbcommon-d
 
 
 ```sh
-doas pkg install -y shaderc seatd fontconfig libudev-devd udev
+doas pkg install -y shaderc seatd fontconfig libudev-devd GhostBSD-bzip2-dev GhostBSD-zlib-dev
 ```
 
 ## Use with a display manager (lightdm)
