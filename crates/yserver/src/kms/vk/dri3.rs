@@ -422,7 +422,10 @@ struct DmaBufExportSyncFile {
 // `libc::Ioctl` is `c_ulong` on glibc, `c_int` on musl (issue #15). This
 // request has the high bit set (dir=READ|WRITE), so it overflows a signed
 // 32-bit `Ioctl`; cast from the unsigned literal to preserve the bit pattern.
+#[cfg(target_os = "linux")]
 const DMA_BUF_IOCTL_EXPORT_SYNC_FILE: libc::Ioctl = 0xc008_6202_u32 as libc::Ioctl;
+#[cfg(not(target_os = "linux"))]
+const DMA_BUF_IOCTL_EXPORT_SYNC_FILE: libc::c_ulong = 0xc008_6202;
 const DMA_BUF_SYNC_READ: u32 = 1 << 0;
 const DMA_BUF_SYNC_WRITE: u32 = 1 << 1;
 
@@ -524,7 +527,10 @@ struct DmaBufImportSyncFile {
 // `_IOW(DMA_BUF_BASE='b', 3, struct dma_buf_import_sync_file)` where the struct
 // is 8 bytes. dir=WRITE(1), size=8, type='b'(0x62), nr=3:
 //   (1<<30) | (8<<16) | (0x62<<8) | 3 = 0x4008_6203
+#[cfg(target_os = "linux")]
 const DMA_BUF_IOCTL_IMPORT_SYNC_FILE: libc::Ioctl = 0x4008_6203_u32 as libc::Ioctl;
+#[cfg(not(target_os = "linux"))]
+const DMA_BUF_IOCTL_IMPORT_SYNC_FILE: libc::c_ulong = 0x4008_6203;
 
 /// Attach `sync_fd` (a sync_file representing yserver's completed Vulkan write)
 /// onto the dmabuf's reservation object as a WRITE fence.  Mesa's implicit-sync

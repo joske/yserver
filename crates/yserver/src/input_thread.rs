@@ -19,17 +19,18 @@
 use std::{
     collections::VecDeque,
     io,
-    os::fd::{AsFd, AsRawFd, BorrowedFd},
+    os::fd::{AsFd, AsRawFd},
     sync::{
         Mutex,
         atomic::{AtomicU8, Ordering},
     },
 };
 
-use nix::sys::{
-    epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout},
-    eventfd::{EfdFlags, EventFd},
-};
+#[cfg(target_os = "linux")]
+use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
+#[cfg(target_os = "freebsd")]
+use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
+use nix::sys::eventfd::{EfdFlags, EventFd};
 use yserver_core::{
     core_loop::{
         CoreSender, HostInputEvent, Message, SYNTH_SCROLL_DOWN, SYNTH_SCROLL_LEFT,
@@ -450,39 +451,79 @@ pub(crate) fn run(
     let mut pending_motion: Option<HostInputEvent> = None;
     let mut paused = false;
 
-    const EPOLL_DATA_LIBINPUT: u64 = 0;
-    const EPOLL_DATA_CONTROL: u64 = 1;
-    const EPOLL_DATA_LEDS: u64 = 2;
-    let input_epoll = Epoll::new(EpollCreateFlags::empty())
-        .map_err(|err| io::Error::other(format!("input thread epoll_create: {err}")))?;
-    let fd = input_ctx.fd();
-    // SAFETY: `input_ctx` outlives this borrow because both live for
-    // the duration of `run`.
-    let borrow = unsafe { BorrowedFd::borrow_raw(fd) };
-    input_epoll
-        .add(
-            borrow,
-            EpollEvent::new(EpollFlags::EPOLLIN, EPOLL_DATA_LIBINPUT),
+    const TOKEN_LIBINPUT: u64 = 0;
+    const TOKEN_CONTROL: u64 = 1;
+    const TOKEN_LEDS: u64 = 2;
+
+    // --- epoll setup (Linux) ---
+    #[cfg(target_os = "linux")]
+    let input_poller = {
+        use std::os::fd::BorrowedFd;
+        let epoll = Epoll::new(EpollCreateFlags::empty())
+            .map_err(|err| io::Error::other(format!("input thread epoll_create: {err}")))?;
+        let fd = input_ctx.fd();
+        let borrow = unsafe { BorrowedFd::borrow_raw(fd) };
+        epoll
+            .add(borrow, EpollEvent::new(EpollFlags::EPOLLIN, TOKEN_LIBINPUT))
+            .map_err(|err| io::Error::other(format!("input thread epoll_add: {err}")))?;
+        let control_borrow = unsafe { BorrowedFd::borrow_raw(control.fd()) };
+        epoll
+            .add(
+                control_borrow,
+                EpollEvent::new(EpollFlags::EPOLLIN, TOKEN_CONTROL),
+            )
+            .map_err(|err| io::Error::other(format!("input thread epoll_add (control): {err}")))?;
+        let led_borrow = unsafe { BorrowedFd::borrow_raw(led_relay.fd()) };
+        epoll
+            .add(led_borrow, EpollEvent::new(EpollFlags::EPOLLIN, TOKEN_LEDS))
+            .map_err(|err| io::Error::other(format!("input thread epoll_add (leds): {err}")))?;
+        epoll
+    };
+
+    // --- kqueue setup (FreeBSD) ---
+    #[cfg(target_os = "freebsd")]
+    let input_poller = {
+        let kq =
+            Kqueue::new().map_err(|err| io::Error::other(format!("input thread kqueue: {err}")))?;
+        let fd = input_ctx.fd();
+        let changes = [
+            KEvent::new(
+                fd as usize,
+                EventFilter::EVFILT_READ,
+                EvFlags::EV_ADD,
+                FilterFlag::empty(),
+                0,
+                TOKEN_LIBINPUT as isize,
+            ),
+            KEvent::new(
+                control.fd() as usize,
+                EventFilter::EVFILT_READ,
+                EvFlags::EV_ADD,
+                FilterFlag::empty(),
+                0,
+                TOKEN_CONTROL as isize,
+            ),
+            KEvent::new(
+                led_relay.fd() as usize,
+                EventFilter::EVFILT_READ,
+                EvFlags::EV_ADD,
+                FilterFlag::empty(),
+                0,
+                TOKEN_LEDS as isize,
+            ),
+        ];
+        let mut out = Vec::new();
+        kq.kevent(
+            &changes,
+            &mut out,
+            Some(libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            }),
         )
-        .map_err(|err| io::Error::other(format!("input thread epoll_add: {err}")))?;
-    // SAFETY: `control` (Arc) outlives this borrow — held for the
-    // duration of `run`.
-    let control_borrow = unsafe { BorrowedFd::borrow_raw(control.fd()) };
-    input_epoll
-        .add(
-            control_borrow,
-            EpollEvent::new(EpollFlags::EPOLLIN, EPOLL_DATA_CONTROL),
-        )
-        .map_err(|err| io::Error::other(format!("input thread epoll_add (control): {err}")))?;
-    // SAFETY: `led_relay` (Arc) outlives this borrow — held for the
-    // duration of `run`.
-    let led_borrow = unsafe { BorrowedFd::borrow_raw(led_relay.fd()) };
-    input_epoll
-        .add(
-            led_borrow,
-            EpollEvent::new(EpollFlags::EPOLLIN, EPOLL_DATA_LEDS),
-        )
-        .map_err(|err| io::Error::other(format!("input thread epoll_add (leds): {err}")))?;
+        .map_err(|err| io::Error::other(format!("input thread kevent register: {err}")))?;
+        kq
+    };
 
     // Drain udev's initial device enumeration before waiting on
     // epoll. udev_assign_seat queues DeviceAdded events synchronously
@@ -507,114 +548,147 @@ pub(crate) fn run(
         }
     }
 
-    let mut buf = [EpollEvent::empty(); 4];
     // Mouse-hotplug retry window (project_mouse_hotplug_lost_wakeup). After a
     // device add/remove, a re-enumerated sibling device's open can be DEFERRED
     // by a lagging udev uaccess ACL; the level-triggered libinput fd does NOT
     // re-wake once that udev event is consumed, so without a timeout the thread
-    // would block until unrelated input arrives (the "mouse stuck after monitor
-    // off→on until a keypress" bug, also seen in direct/lightdm mode). While
-    // armed, give epoll_wait a ~250ms timeout so we re-dispatch and complete
-    // the deferred open; the window only extends on further device churn, so it
-    // converges and the thread returns to a blocking wait once devices settle.
+    // would block until unrelated input arrives. While armed, give the poller
+    // a ~250ms timeout so we re-dispatch and complete the deferred open.
     let mut hotplug_retry_until: Option<std::time::Instant> = None;
+
+    // Platform-specific event buffer.
+    #[cfg(target_os = "linux")]
+    let mut buf = [EpollEvent::empty(); 4];
+    #[cfg(target_os = "freebsd")]
+    let mut kq_buf: Vec<KEvent> = vec![
+        KEvent::new(
+            0,
+            EventFilter::EVFILT_READ,
+            EvFlags::empty(),
+            FilterFlag::empty(),
+            0,
+            0isize
+        );
+        4
+    ];
+
     loop {
-        let timeout = match hotplug_retry_until {
-            Some(until) => {
-                let now = std::time::Instant::now();
-                if now >= until {
-                    hotplug_retry_until = None;
-                    EpollTimeout::NONE
-                } else {
-                    let ms = u16::try_from((until - now).as_millis().min(250)).unwrap_or(250);
-                    EpollTimeout::from(ms.max(1))
+        // --- poll wait ---
+        let (got_control, got_leds);
+
+        #[cfg(target_os = "linux")]
+        {
+            let timeout = match hotplug_retry_until {
+                Some(until) => {
+                    let now = std::time::Instant::now();
+                    if now >= until {
+                        hotplug_retry_until = None;
+                        EpollTimeout::NONE
+                    } else {
+                        let ms = u16::try_from((until - now).as_millis().min(250)).unwrap_or(250);
+                        EpollTimeout::from(ms.max(1))
+                    }
+                }
+                None => EpollTimeout::NONE,
+            };
+            match input_poller.wait(&mut buf, timeout) {
+                Ok(n) => {
+                    got_control = buf[..n].iter().any(|e| e.data() == TOKEN_CONTROL);
+                    got_leds = buf[..n].iter().any(|e| e.data() == TOKEN_LEDS);
+                }
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(err) => {
+                    log::warn!("input thread: epoll_wait: {err}");
+                    continue;
                 }
             }
-            None => EpollTimeout::NONE,
-        };
-        match input_epoll.wait(&mut buf, timeout) {
-            Ok(n) => {
-                if buf[..n].iter().any(|e| e.data() == EPOLL_DATA_CONTROL) {
-                    // Read the eventfd + latched command first, then drain the
-                    // config queue unconditionally — a config-only push latches
-                    // no command, so `drain` alone would never apply it.
-                    let command = control.drain();
-                    for (node, change) in control.take_configs() {
-                        if let Err(err) = input_ctx.apply_device_config(&node, change) {
-                            log::debug!(
-                                "input thread: apply_device_config({node}) rejected by \
-                                 libinput: {err:?}"
-                            );
-                        }
+        }
+
+        #[cfg(target_os = "freebsd")]
+        {
+            let timeout = match hotplug_retry_until {
+                Some(until) => {
+                    let now = std::time::Instant::now();
+                    if now >= until {
+                        hotplug_retry_until = None;
+                        None
+                    } else {
+                        let dur = until - now;
+                        let ms = dur.as_millis().min(250) as i64;
+                        Some(libc::timespec {
+                            tv_sec: ms / 1000,
+                            tv_nsec: (ms % 1000) * 1_000_000,
+                        })
                     }
-                    if let Some(command) = command {
-                        paused = match command {
-                            InputThreadCommand::Pause if !paused => {
-                                input_ctx.suspend();
-                                pending_motion = None;
-                                // Forget held modifiers: their release events go
-                                // to whoever owns the keyboard after the switch,
-                                // not us, so the flags would otherwise stay stuck.
-                                state.hotkey.reset();
-                                true
+                }
+                None => None,
+            };
+            match input_poller.kevent(&[], &mut kq_buf, timeout) {
+                Ok(n) => {
+                    got_control = kq_buf[..n]
+                        .iter()
+                        .any(|e| e.udata() == TOKEN_CONTROL as isize);
+                    got_leds = kq_buf[..n].iter().any(|e| e.udata() == TOKEN_LEDS as isize);
+                }
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(err) => {
+                    log::warn!("input thread: kevent: {err}");
+                    continue;
+                }
+            }
+        }
+
+        // --- common dispatch (platform-independent) ---
+        if got_control {
+            let command = control.drain();
+            for (node, change) in control.take_configs() {
+                if let Err(err) = input_ctx.apply_device_config(&node, change) {
+                    log::debug!(
+                        "input thread: apply_device_config({node}) rejected by \
+                         libinput: {err:?}"
+                    );
+                }
+            }
+            if let Some(command) = command {
+                paused = match command {
+                    InputThreadCommand::Pause if !paused => {
+                        input_ctx.suspend();
+                        pending_motion = None;
+                        state.hotkey.reset();
+                        true
+                    }
+                    InputThreadCommand::Resume if paused => match input_ctx.resume() {
+                        Ok(()) => {
+                            state.hotkey.reset();
+                            let _ = input_ctx.dispatch();
+                            for kc in [37u8, 105, 64, 108, 50, 62, 133, 134] {
+                                let _ = sender.send(Message::HostInput(HostInputEvent::Key(
+                                    HostKeyEvent {
+                                        pressed: false,
+                                        keycode: kc,
+                                        time: current_time_ms(),
+                                        root_x: state.cursor_x as i16,
+                                        root_y: state.cursor_y as i16,
+                                        event_x: state.cursor_x as i16,
+                                        event_y: state.cursor_y as i16,
+                                        state: 0,
+                                    },
+                                )));
                             }
-                            InputThreadCommand::Resume if paused => match input_ctx.resume() {
-                                Ok(()) => {
-                                    // Start clean on the VT we just acquired —
-                                    // any modifiers held during the switch were
-                                    // released while we weren't reading.
-                                    state.hotkey.reset();
-                                    // Drain any libinput resume-replay first so our
-                                    // synthetic releases land AFTER, not before.
-                                    let _ = input_ctx.dispatch();
-                                    // Forget held modifiers on VT-enter (Xorg-style):
-                                    // emit a KeyRelease for each modifier X-keycode so
-                                    // a modifier whose release was lost across the
-                                    // switch is cleared in xkb_state. Harmless when not
-                                    // held (release of an up key is a no-op); a still-
-                                    // held modifier re-presses on its next event.
-                                    // X keycodes (evdev+8): LCtrl37 RCtrl105 LAlt64
-                                    // RAlt108 LShift50 RShift62 LSuper133 RSuper134.
-                                    for kc in [37u8, 105, 64, 108, 50, 62, 133, 134] {
-                                        let _ = sender.send(Message::HostInput(
-                                            HostInputEvent::Key(HostKeyEvent {
-                                                pressed: false,
-                                                keycode: kc,
-                                                time: current_time_ms(),
-                                                root_x: state.cursor_x as i16,
-                                                root_y: state.cursor_y as i16,
-                                                event_x: state.cursor_x as i16,
-                                                event_y: state.cursor_y as i16,
-                                                state: 0,
-                                            }),
-                                        ));
-                                    }
-                                    false
-                                }
-                                Err(err) => {
-                                    log::warn!("input thread: libinput resume failed: {err}");
-                                    true
-                                }
-                            },
-                            _ => paused,
-                        };
-                    }
-                }
-                // Core-thread lock-LED update: drain the eventfd and
-                // push the mask to every keyboard device. Falls through
-                // to the libinput dispatch below (harmless when the
-                // libinput fd wasn't the waker — dispatch just returns
-                // no events).
-                if buf[..n].iter().any(|e| e.data() == EPOLL_DATA_LEDS) {
-                    let leds = input::Led::from_bits_truncate(led_relay.drain());
-                    input_ctx.update_leds(leds);
-                }
+                            false
+                        }
+                        Err(err) => {
+                            log::warn!("input thread: libinput resume failed: {err}");
+                            true
+                        }
+                    },
+                    _ => paused,
+                };
             }
-            Err(nix::errno::Errno::EINTR) => continue,
-            Err(err) => {
-                log::warn!("input thread: epoll_wait: {err}");
-                continue;
-            }
+        }
+        if got_leds {
+            let leds = input::Led::from_bits_truncate(led_relay.drain());
+            input_ctx.update_leds(leds);
         }
 
         if !should_dispatch_batch(paused) {
@@ -630,10 +704,6 @@ pub(crate) fn run(
             }
         };
 
-        // Arm the hotplug retry window on a device add/remove so a deferred
-        // sibling-device open gets retried via the epoll timeout above (the
-        // level-triggered fd won't re-wake on its own once the udev event is
-        // consumed). project_mouse_hotplug_lost_wakeup.
         let device_change = events.iter().any(|e| {
             matches!(
                 e,
@@ -646,10 +716,6 @@ pub(crate) fn run(
             hotplug_retry_until =
                 Some(std::time::Instant::now() + std::time::Duration::from_millis(2500));
         }
-        // Flush any pending motion before the next epoll_wait so the
-        // core sees end-of-burst movement promptly. A subsequent batch
-        // whose first event is another motion just starts coalescing
-        // fresh.
         if let Some(m) = pending_motion.take() {
             sender.send(Message::HostInput(m))?;
         }

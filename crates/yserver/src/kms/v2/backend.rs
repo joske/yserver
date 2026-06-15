@@ -352,7 +352,9 @@ pub struct KmsBackendV2 {
     /// Controlling console TTY guard. Present in direct mode when the
     /// process is launched on a real VT; `None` when no controlling
     /// console exists (pty / graphical terminal / test harness).
-    console_guard: Option<crate::kms::console::ConsoleGuard>,
+    /// On non-Linux platforms this is a unit placeholder (unused).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    console_guard: crate::kms::ConsoleGuardOpt,
     /// Whether VT switching has been armed in direct mode.
     vt_switching_armed: bool,
     /// Direct-mode lock-LED sink: the input thread owns the libinput
@@ -716,16 +718,13 @@ impl KmsBackendV2 {
     /// Propagates DRM / Vk / libinput init failures from
     /// `PlatformBackend::open_with_commit`, plus FontLoader / XKB
     /// init failures from `KmsCore::new`.
-    pub fn open(
-        device_path: &str,
-        console_guard: Option<crate::kms::console::ConsoleGuard>,
-    ) -> io::Result<Self> {
+    pub fn open(device_path: &str, console_guard: crate::kms::ConsoleGuardOpt) -> io::Result<Self> {
         Self::open_with_commit(device_path, console_guard, drm::modeset::commit_modeset)
     }
 
     fn open_with_commit(
         device_path: &str,
-        console_guard: Option<crate::kms::console::ConsoleGuard>,
+        console_guard: crate::kms::ConsoleGuardOpt,
         commit: fn(
             &crate::drm::Device,
             &crate::drm::modeset::Output,
@@ -825,7 +824,7 @@ impl KmsBackendV2 {
     pub fn open_libseat(
         seat: crate::seat::Seat,
         device_path: &str,
-        console_guard: Option<crate::kms::console::ConsoleGuard>,
+        console_guard: crate::kms::ConsoleGuardOpt,
         core_libinput: crate::input::Context,
         seat_fd: std::os::fd::RawFd,
         core_libinput_fd: std::os::fd::RawFd,
@@ -844,7 +843,7 @@ impl KmsBackendV2 {
     fn open_libseat_with_commit(
         seat: crate::seat::Seat,
         device_path: &str,
-        console_guard: Option<crate::kms::console::ConsoleGuard>,
+        console_guard: crate::kms::ConsoleGuardOpt,
         core_libinput: crate::input::Context,
         seat_fd: std::os::fd::RawFd,
         core_libinput_fd: std::os::fd::RawFd,
@@ -981,22 +980,25 @@ impl KmsBackendV2 {
     }
 
     fn arm_direct_vt_switching(&mut self) {
-        if !matches!(self.seat, crate::seat::Seat::Direct) {
-            return;
-        }
-        let Some(console_guard) = self.console_guard.as_ref() else {
-            return;
-        };
-        if self.vt_switching_armed {
-            return;
-        }
-        match console_guard.arm_vt_process(nix::libc::SIGUSR1, nix::libc::SIGUSR2) {
-            Ok(()) => {
-                self.vt_switching_armed = true;
-                log::info!("kms: direct-mode VT_PROCESS armed (SIGUSR1/SIGUSR2)");
+        #[cfg(target_os = "linux")]
+        {
+            if !matches!(self.seat, crate::seat::Seat::Direct) {
+                return;
             }
-            Err(err) => {
-                log::warn!("kms: arm VT_PROCESS failed: {err}");
+            let Some(console_guard) = self.console_guard.as_ref() else {
+                return;
+            };
+            if self.vt_switching_armed {
+                return;
+            }
+            match console_guard.arm_vt_process(nix::libc::SIGUSR1, nix::libc::SIGUSR2) {
+                Ok(()) => {
+                    self.vt_switching_armed = true;
+                    log::info!("kms: direct-mode VT_PROCESS armed (SIGUSR1/SIGUSR2)");
+                }
+                Err(err) => {
+                    log::warn!("kms: arm VT_PROCESS failed: {err}");
+                }
             }
         }
     }
@@ -3958,8 +3960,6 @@ impl KmsBackendV2 {
         &mut self,
         mut batch: crate::kms::v2::present_completion::PendingPresentBatch,
     ) {
-        use std::os::fd::{AsFd, AsRawFd};
-
         use crate::kms::v2::present_completion::PresentBatchWait;
 
         if batch.events.is_empty() {
@@ -3968,15 +3968,45 @@ impl KmsBackendV2 {
 
         let should_wake = match &batch.wait {
             PresentBatchWait::Fd(fd) => {
-                let event = nix::sys::epoll::EpollEvent::new(
-                    nix::sys::epoll::EpollFlags::EPOLLIN,
-                    u64::try_from(fd.as_raw_fd()).unwrap_or_default(),
-                );
-                match self.platform.present_completion_epfd.add(fd.as_fd(), event) {
+                #[cfg(target_os = "linux")]
+                let add_result = {
+                    use std::os::fd::{AsFd, AsRawFd};
+                    let event = nix::sys::epoll::EpollEvent::new(
+                        nix::sys::epoll::EpollFlags::EPOLLIN,
+                        u64::try_from(fd.as_raw_fd()).unwrap_or_default(),
+                    );
+                    self.platform.present_completion_epfd.add(fd.as_fd(), event)
+                };
+                #[cfg(target_os = "freebsd")]
+                let add_result = {
+                    use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
+                    use std::os::fd::AsRawFd;
+                    let changes = [KEvent::new(
+                        fd.as_raw_fd() as usize,
+                        EventFilter::EVFILT_READ,
+                        EvFlags::EV_ADD,
+                        FilterFlag::empty(),
+                        0,
+                        fd.as_raw_fd() as isize,
+                    )];
+                    let mut out = Vec::new();
+                    self.platform
+                        .present_completion_epfd
+                        .kevent(
+                            &changes,
+                            &mut out,
+                            Some(libc::timespec {
+                                tv_sec: 0,
+                                tv_nsec: 0,
+                            }),
+                        )
+                        .map(|_| ())
+                };
+                match add_result {
                     Ok(()) => false,
                     Err(e) => {
                         log::warn!(
-                            "deferred PRESENT: epoll_ctl ADD sync_file fd failed: {e}; \
+                            "deferred PRESENT: poll ADD sync_file fd failed: {e}; \
                              using immediate drain fallback"
                         );
                         batch.wait = PresentBatchWait::Ready;
@@ -4052,15 +4082,41 @@ impl KmsBackendV2 {
         &mut self,
         batch: &crate::kms::v2::present_completion::PendingPresentBatch,
     ) {
-        use std::os::fd::AsFd;
-
         use crate::kms::v2::present_completion::PresentBatchWait;
 
         let _keep_export_semaphore_alive_until_batch_drop = batch.signal.as_ref();
-        if let PresentBatchWait::Fd(fd) = &batch.wait
-            && let Err(e) = self.platform.present_completion_epfd.delete(fd.as_fd())
-        {
-            log::warn!("epoll_ctl DEL PRESENT sync_file fd: {e}");
+        if let PresentBatchWait::Fd(fd) = &batch.wait {
+            #[cfg(target_os = "linux")]
+            if let Err(e) = {
+                use std::os::fd::AsFd;
+                self.platform.present_completion_epfd.delete(fd.as_fd())
+            } {
+                log::warn!("epoll_ctl DEL PRESENT sync_file fd: {e}");
+            }
+            #[cfg(target_os = "freebsd")]
+            {
+                use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
+                use std::os::fd::AsRawFd;
+                let changes = [KEvent::new(
+                    fd.as_raw_fd() as usize,
+                    EventFilter::EVFILT_READ,
+                    EvFlags::EV_DELETE,
+                    FilterFlag::empty(),
+                    0,
+                    0isize,
+                )];
+                let mut out = Vec::new();
+                if let Err(e) = self.platform.present_completion_epfd.kevent(
+                    &changes,
+                    &mut out,
+                    Some(libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: 0,
+                    }),
+                ) {
+                    log::warn!("kevent DEL PRESENT sync_file fd: {e}");
+                }
+            }
         }
     }
 
@@ -9218,13 +9274,20 @@ impl Backend for KmsBackendV2 {
     }
 
     fn request_vt_switch(&mut self, vt: u32) {
-        let Some(console_guard) = self.console_guard.as_ref() else {
-            log::warn!("kms: request_vt_switch({vt}) — no console guard; ignoring");
-            return;
-        };
-        log::info!("kms: VT_ACTIVATE({vt}) — requesting switch");
-        if let Err(err) = console_guard.vt_activate(vt) {
-            log::warn!("kms: VT_ACTIVATE({vt}) failed: {err}");
+        #[cfg(target_os = "linux")]
+        {
+            let Some(console_guard) = self.console_guard.as_ref() else {
+                log::warn!("kms: request_vt_switch({vt}) — no console guard; ignoring");
+                return;
+            };
+            log::info!("kms: VT_ACTIVATE({vt}) — requesting switch");
+            if let Err(err) = console_guard.vt_activate(vt) {
+                log::warn!("kms: VT_ACTIVATE({vt}) failed: {err}");
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            log::warn!("kms: request_vt_switch({vt}) — not supported on this platform");
         }
         // No VT_WAITACTIVE: the kernel now sends us the release signal,
         // which the core loop services next (on_vt_release). Blocking here
@@ -9247,6 +9310,7 @@ impl Backend for KmsBackendV2 {
             log::warn!("kms: drmDropMaster failed: {err}");
         }
         log::info!("kms: VT release — master dropped; VT_RELDISP(1)");
+        #[cfg(target_os = "linux")]
         if let Some(console_guard) = self.console_guard.as_ref()
             && let Err(err) = console_guard.vt_reldisp(1)
         {
@@ -9260,6 +9324,7 @@ impl Backend for KmsBackendV2 {
         use ::drm::Device as _;
 
         log::info!("kms: VT acquire — begin; VT_RELDISP(VT_ACKACQ)");
+        #[cfg(target_os = "linux")]
         if let Some(console_guard) = self.console_guard.as_ref()
             && let Err(err) = console_guard.vt_reldisp(crate::kms::console::VT_ACKACQ)
         {
@@ -20733,13 +20798,16 @@ mod tests {
         // and let `FenceMapping::map` mmap it — libxshmfence's
         // map_shm only requires the fd be at least one page.
         use std::os::fd::{FromRawFd, OwnedFd};
-        let raw =
+        #[cfg(target_os = "linux")]
+        let raw_result =
             unsafe { libc::syscall(libc::SYS_memfd_create, c"yserver_dri3_test".as_ptr(), 0u32) };
-        if raw < 0 {
+        #[cfg(not(target_os = "linux"))]
+        let raw_result = i64::from(unsafe { libc::memfd_create(c"yserver_dri3_test".as_ptr(), 0) });
+        if raw_result < 0 {
             eprintln!("skip: memfd_create unavailable");
             return;
         }
-        let raw = i32::try_from(raw).expect("fd fits i32");
+        let raw = i32::try_from(raw_result).expect("fd fits i32");
         // Size the memfd to one page so map_shm succeeds.
         let page_raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         let page: libc::off_t = if page_raw > 0 {

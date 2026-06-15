@@ -9,10 +9,9 @@ mod seat;
 
 use std::{fs, io, path::PathBuf, thread};
 
-use nix::sys::{
-    signal::{SigSet, SigmaskHow, Signal, sigprocmask},
-    signalfd::SignalFd,
-};
+use nix::sys::signal::{SigSet, SigmaskHow, Signal, sigprocmask};
+#[cfg(target_os = "linux")]
+use nix::sys::signalfd::SignalFd;
 
 use yserver_core::{
     backend::Backend,
@@ -41,8 +40,8 @@ fn install_backend_root_bindings(state: &mut ServerState, backend: &dyn Backend)
 }
 
 pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
-    #[cfg(not(target_os = "linux"))]
-    panic!("yserver only supports Linux (DRM/KMS, libinput, evdev, virtual consoles)");
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    panic!("yserver only supports Linux and FreeBSD (DRM/KMS, libinput, evdev)");
 
     log::info!("yserver: Phase 6.4 KMS bootstrap — startup (single-threaded core)");
 
@@ -197,6 +196,8 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // under SSH or a graphical terminal emulator).
     #[cfg(target_os = "linux")]
     let console_guard = crate::kms::console::ConsoleGuard::acquire(opts.vt)?;
+    #[cfg(not(target_os = "linux"))]
+    let console_guard: Option<()> = None;
     let device_path = resolve_drm_device()?;
     log::info!("yserver: opening DRM device {device_path}");
 
@@ -327,6 +328,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
         .name("yserver-signalfd".into())
         .spawn(move || {
             let signal_fd = signal_fd;
+            #[cfg(target_os = "linux")]
             loop {
                 match signal_fd.read_signal() {
                     Ok(Some(siginfo)) => {
@@ -336,7 +338,6 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
                             if signal_sender.send(Message::VtRelease).is_err() {
                                 return;
                             }
-                            // Stay alive — SIGUSR1 isn't fatal.
                             continue;
                         }
                         if signo == nix::libc::SIGUSR2 {
@@ -344,7 +345,6 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
                             if signal_sender.send(Message::VtAcquire).is_err() {
                                 return;
                             }
-                            // Stay alive — SIGUSR2 isn't fatal.
                             continue;
                         }
                         log::info!("yserver: received signal {signo}, requesting shutdown");
@@ -354,6 +354,49 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
                     Ok(None) => {}
                     Err(err) => {
                         log::warn!("yserver: signalfd read error: {err}");
+                        let _ = signal_sender.send(Message::Shutdown);
+                        return;
+                    }
+                }
+            }
+            #[cfg(target_os = "freebsd")]
+            {
+                use nix::sys::event::KEvent;
+                let mut events = [KEvent::new(
+                    0,
+                    nix::sys::event::EventFilter::EVFILT_SIGNAL,
+                    nix::sys::event::EvFlags::empty(),
+                    nix::sys::event::FilterFlag::empty(),
+                    0,
+                    0isize,
+                ); 4];
+                loop {
+                    let n = match signal_fd.kevent(&[], &mut events, None) {
+                        Ok(n) => n,
+                        Err(nix::errno::Errno::EINTR) => continue,
+                        Err(err) => {
+                            log::warn!("yserver: kevent signal read error: {err}");
+                            let _ = signal_sender.send(Message::Shutdown);
+                            return;
+                        }
+                    };
+                    for ev in &events[..n] {
+                        let signo = ev.ident() as i32;
+                        if signo == nix::libc::SIGUSR1 {
+                            log::info!("yserver: received SIGUSR1, forwarding VT release");
+                            if signal_sender.send(Message::VtRelease).is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+                        if signo == nix::libc::SIGUSR2 {
+                            log::info!("yserver: received SIGUSR2, forwarding VT acquire");
+                            if signal_sender.send(Message::VtAcquire).is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+                        log::info!("yserver: received signal {signo}, requesting shutdown");
                         let _ = signal_sender.send(Message::Shutdown);
                         return;
                     }
@@ -427,7 +470,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
 fn build_kms_backend_v2(
     seat: crate::seat::Seat,
     device_path: &str,
-    console_guard: Option<crate::kms::console::ConsoleGuard>,
+    console_guard: crate::kms::ConsoleGuardOpt,
 ) -> io::Result<crate::kms::v2::KmsBackendV2> {
     match seat {
         crate::seat::Seat::Libseat { ref inner, .. } => {
@@ -531,6 +574,7 @@ fn resolve_drm_device() -> io::Result<String> {
     )))
 }
 
+#[cfg(target_os = "linux")]
 fn block_termination_signals() -> io::Result<SignalFd> {
     let mut mask = SigSet::empty();
     mask.add(Signal::SIGINT);
@@ -544,6 +588,61 @@ fn block_termination_signals() -> io::Result<SignalFd> {
     sigprocmask(SigmaskHow::SIG_BLOCK, Some(&mask), None)
         .map_err(|err| io::Error::other(format!("sigprocmask SIG_BLOCK: {err}")))?;
     SignalFd::new(&mask).map_err(|err| io::Error::other(format!("signalfd: {err}")))
+}
+
+/// FreeBSD: block the same signals and return a kqueue fd with
+/// EVFILT_SIGNAL filters registered.
+#[cfg(target_os = "freebsd")]
+fn block_termination_signals() -> io::Result<nix::sys::event::Kqueue> {
+    use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
+
+    let mut mask = SigSet::empty();
+    mask.add(Signal::SIGINT);
+    mask.add(Signal::SIGTERM);
+    mask.add(Signal::SIGUSR1);
+    mask.add(Signal::SIGUSR2);
+    sigprocmask(SigmaskHow::SIG_BLOCK, Some(&mask), None)
+        .map_err(|err| io::Error::other(format!("sigprocmask SIG_BLOCK: {err}")))?;
+
+    let kq = Kqueue::new().map_err(|err| io::Error::other(format!("kqueue: {err}")))?;
+    let changes = [
+        KEvent::new(
+            libc::SIGINT as usize,
+            EventFilter::EVFILT_SIGNAL,
+            EvFlags::EV_ADD,
+            FilterFlag::empty(),
+            0,
+            0isize,
+        ),
+        KEvent::new(
+            libc::SIGTERM as usize,
+            EventFilter::EVFILT_SIGNAL,
+            EvFlags::EV_ADD,
+            FilterFlag::empty(),
+            0,
+            0isize,
+        ),
+        KEvent::new(
+            libc::SIGUSR1 as usize,
+            EventFilter::EVFILT_SIGNAL,
+            EvFlags::EV_ADD,
+            FilterFlag::empty(),
+            0,
+            0isize,
+        ),
+        KEvent::new(
+            libc::SIGUSR2 as usize,
+            EventFilter::EVFILT_SIGNAL,
+            EvFlags::EV_ADD,
+            FilterFlag::empty(),
+            0,
+            0isize,
+        ),
+    ];
+    let mut out = Vec::new();
+    kq.kevent(&changes, &mut out, None)
+        .map_err(|err| io::Error::other(format!("kevent register signals: {err}")))?;
+    Ok(kq)
 }
 
 #[cfg(test)]
