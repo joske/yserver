@@ -516,10 +516,7 @@ pub(crate) struct PlatformBackend {
     /// sync_file FDs for deferred PRESENT completion. Exposed via
     /// `poll_fds()` under `BackendFdKind::PresentCompletion`. Spec
     /// `2026-05-23-deferred-present-completion-design.md`.
-    #[cfg(target_os = "linux")]
-    pub(crate) present_completion_epfd: nix::sys::epoll::Epoll,
-    #[cfg(target_os = "freebsd")]
-    pub(crate) present_completion_epfd: nix::sys::event::Kqueue,
+    pub(crate) present_completion_epfd: crate::kms::v2::completion_poller::CompletionPoller,
 
     /// Stage 5 Task 6.1: eventfd used to wake the main loop when a
     /// PRESENT completion is enqueued. Registered with
@@ -797,47 +794,11 @@ impl PlatformBackend {
         )
         .map_err(|e| io::Error::other(format!("eventfd: {e}")))?;
 
-        #[cfg(target_os = "linux")]
-        let present_completion_epfd = {
-            let epfd =
-                nix::sys::epoll::Epoll::new(nix::sys::epoll::EpollCreateFlags::EPOLL_CLOEXEC)
-                    .map_err(|e| io::Error::other(format!("epoll_create1: {e}")))?;
-            epfd.add(
-                &wakeup_eventfd,
-                nix::sys::epoll::EpollEvent::new(
-                    nix::sys::epoll::EpollFlags::EPOLLIN,
-                    WAKEUP_EVENTFD_TOKEN,
-                ),
-            )
-            .map_err(|e| io::Error::other(format!("epoll_ctl ADD wakeup_eventfd: {e}")))?;
-            epfd
-        };
-
-        #[cfg(target_os = "freebsd")]
-        let present_completion_epfd = {
-            use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
-            use std::os::fd::AsRawFd;
-            let kq = Kqueue::new().map_err(|e| io::Error::other(format!("kqueue: {e}")))?;
-            let changes = [KEvent::new(
-                wakeup_eventfd.as_fd().as_raw_fd() as usize,
-                EventFilter::EVFILT_READ,
-                EvFlags::EV_ADD,
-                FilterFlag::empty(),
-                0,
-                WAKEUP_EVENTFD_TOKEN as isize,
-            )];
-            let mut out = Vec::new();
-            kq.kevent(
-                &changes,
-                &mut out,
-                Some(libc::timespec {
-                    tv_sec: 0,
-                    tv_nsec: 0,
-                }),
-            )
-            .map_err(|e| io::Error::other(format!("kevent ADD wakeup_eventfd: {e}")))?;
-            kq
-        };
+        // Backend-internal readiness set (epoll/kqueue). The wakeup
+        // eventfd joins it under WAKEUP_EVENTFD_TOKEN; per-batch
+        // sync_file FDs are added later via the enqueue path.
+        let present_completion_epfd = crate::kms::v2::completion_poller::CompletionPoller::new()?;
+        present_completion_epfd.register(wakeup_eventfd.as_fd(), WAKEUP_EVENTFD_TOKEN)?;
 
         let submit_group = SubmitGroup::new();
 
@@ -889,47 +850,11 @@ impl PlatformBackend {
         )
         .expect("test eventfd");
 
-        #[cfg(target_os = "linux")]
-        let present_completion_epfd = {
-            let epfd =
-                nix::sys::epoll::Epoll::new(nix::sys::epoll::EpollCreateFlags::EPOLL_CLOEXEC)
-                    .expect("test epoll");
-            epfd.add(
-                &wakeup_eventfd,
-                nix::sys::epoll::EpollEvent::new(
-                    nix::sys::epoll::EpollFlags::EPOLLIN,
-                    WAKEUP_EVENTFD_TOKEN,
-                ),
-            )
-            .expect("test epoll_ctl");
-            epfd
-        };
-
-        #[cfg(target_os = "freebsd")]
-        let present_completion_epfd = {
-            use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
-            use std::os::fd::AsRawFd;
-            let kq = Kqueue::new().expect("test kqueue");
-            let changes = [KEvent::new(
-                wakeup_eventfd.as_fd().as_raw_fd() as usize,
-                EventFilter::EVFILT_READ,
-                EvFlags::EV_ADD,
-                FilterFlag::empty(),
-                0,
-                WAKEUP_EVENTFD_TOKEN as isize,
-            )];
-            let mut out = Vec::new();
-            kq.kevent(
-                &changes,
-                &mut out,
-                Some(libc::timespec {
-                    tv_sec: 0,
-                    tv_nsec: 0,
-                }),
-            )
-            .expect("test kevent");
-            kq
-        };
+        let present_completion_epfd =
+            crate::kms::v2::completion_poller::CompletionPoller::new().expect("test poller");
+        present_completion_epfd
+            .register(wakeup_eventfd.as_fd(), WAKEUP_EVENTFD_TOKEN)
+            .expect("test poller register");
         Self {
             device: Arc::new(drm::Device::for_tests().expect("test drm device")),
             render_node_fd: None,
@@ -1335,7 +1260,7 @@ impl PlatformBackend {
         // Stage 5 Task 6.1: stable inner epfd for deferred PRESENT
         // completion. Always present.
         fds.push((
-            self.present_completion_epfd.0.as_fd().as_raw_fd(),
+            self.present_completion_epfd.as_raw_fd(),
             BackendFdKind::PresentCompletion,
         ));
         fds

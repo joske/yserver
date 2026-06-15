@@ -3968,40 +3968,14 @@ impl KmsBackendV2 {
 
         let should_wake = match &batch.wait {
             PresentBatchWait::Fd(fd) => {
-                #[cfg(target_os = "linux")]
-                let add_result = {
-                    use std::os::fd::{AsFd, AsRawFd};
-                    let event = nix::sys::epoll::EpollEvent::new(
-                        nix::sys::epoll::EpollFlags::EPOLLIN,
-                        u64::try_from(fd.as_raw_fd()).unwrap_or_default(),
-                    );
-                    self.platform.present_completion_epfd.add(fd.as_fd(), event)
-                };
-                #[cfg(target_os = "freebsd")]
-                let add_result = {
-                    use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
-                    use std::os::fd::AsRawFd;
-                    let changes = [KEvent::new(
-                        fd.as_raw_fd() as usize,
-                        EventFilter::EVFILT_READ,
-                        EvFlags::EV_ADD,
-                        FilterFlag::empty(),
-                        0,
-                        fd.as_raw_fd() as isize,
-                    )];
-                    let mut out = Vec::new();
-                    self.platform
-                        .present_completion_epfd
-                        .kevent(
-                            &changes,
-                            &mut out,
-                            Some(libc::timespec {
-                                tv_sec: 0,
-                                tv_nsec: 0,
-                            }),
-                        )
-                        .map(|_| ())
-                };
+                use std::os::fd::{AsFd, AsRawFd};
+                // Token mirrors the fd's raw value (matches the native
+                // epoll-data / kqueue-udata the inline code used).
+                let token = u64::try_from(fd.as_raw_fd()).unwrap_or_default();
+                let add_result = self
+                    .platform
+                    .present_completion_epfd
+                    .register(fd.as_fd(), token);
                 match add_result {
                     Ok(()) => false,
                     Err(e) => {
@@ -4086,36 +4060,9 @@ impl KmsBackendV2 {
 
         let _keep_export_semaphore_alive_until_batch_drop = batch.signal.as_ref();
         if let PresentBatchWait::Fd(fd) = &batch.wait {
-            #[cfg(target_os = "linux")]
-            if let Err(e) = {
-                use std::os::fd::AsFd;
-                self.platform.present_completion_epfd.delete(fd.as_fd())
-            } {
-                log::warn!("epoll_ctl DEL PRESENT sync_file fd: {e}");
-            }
-            #[cfg(target_os = "freebsd")]
-            {
-                use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent};
-                use std::os::fd::AsRawFd;
-                let changes = [KEvent::new(
-                    fd.as_raw_fd() as usize,
-                    EventFilter::EVFILT_READ,
-                    EvFlags::EV_DELETE,
-                    FilterFlag::empty(),
-                    0,
-                    0isize,
-                )];
-                let mut out = Vec::new();
-                if let Err(e) = self.platform.present_completion_epfd.kevent(
-                    &changes,
-                    &mut out,
-                    Some(libc::timespec {
-                        tv_sec: 0,
-                        tv_nsec: 0,
-                    }),
-                ) {
-                    log::warn!("kevent DEL PRESENT sync_file fd: {e}");
-                }
+            use std::os::fd::AsFd;
+            if let Err(e) = self.platform.present_completion_epfd.unregister(fd.as_fd()) {
+                log::warn!("deferred PRESENT: poll DEL sync_file fd failed: {e}");
             }
         }
     }
