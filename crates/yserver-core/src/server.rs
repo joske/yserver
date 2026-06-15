@@ -1778,27 +1778,6 @@ pub struct EventTarget {
 }
 
 impl ServerState {
-    /// Stage 4e — set the COW's input shape to empty (click-through) at
-    /// materialization. Mirrors Xorg's compositor convention where the
-    /// COW's default input region passes pointer events through to
-    /// underlying root children, with descendants like the compositor's
-    /// stage receiving input directly.
-    ///
-    /// Pairs with `ResourceTable::materialize_cow_resource` — both run
-    /// from the `GetOverlayWindow` handler on the 0→1 transition.
-    pub fn materialize_cow_input_shape(&mut self) {
-        self.shape_windows
-            .entry(COMPOSITE_OVERLAY_WINDOW)
-            .or_default()
-            .input = Some(Vec::<xfixes::RegionRect>::new());
-    }
-
-    /// Symmetric teardown for [`Self::materialize_cow_input_shape`]. Called
-    /// from the `ReleaseOverlayWindow` handler on the 1→0 transition.
-    pub fn destroy_cow_input_shape(&mut self) {
-        self.shape_windows.remove(&COMPOSITE_OVERLAY_WINDOW);
-    }
-
     fn event_target_for_client(client: &ClientState) -> EventTarget {
         EventTarget {
             writer: client.writer.clone(),
@@ -4324,7 +4303,7 @@ mod tests {
     #[test]
     fn cow_with_empty_input_shape_passes_clicks_to_sibling_below() {
         use crate::resources::{ROOT_VISUAL, ROOT_WINDOW};
-        use yserver_protocol::x11::CreateWindowRequest;
+        use yserver_protocol::x11::{CreateWindowRequest, xfixes};
 
         let mut state = ServerState::new();
 
@@ -4348,10 +4327,14 @@ mod tests {
         );
         let _ = state.resources.map_window(sib);
 
-        // Materialize COW (full-screen, empty input shape per Task 2.8).
+        // Materialize COW, then make the empty input shape EXPLICIT.
         let host_xid = crate::backend::WindowHandle::from_raw_panicking(0x4000_0103);
         state.resources.materialize_cow_resource(host_xid);
-        state.materialize_cow_input_shape();
+        state
+            .shape_windows
+            .entry(crate::resources::COMPOSITE_OVERLAY_WINDOW)
+            .or_default()
+            .input = Some(Vec::<xfixes::RegionRect>::new());
 
         // Click at (50, 50): inside both sibling and COW geometry. COW's
         // empty input shape → hit_test_child(COW) = None → iteration
@@ -4366,25 +4349,14 @@ mod tests {
     }
 
     #[test]
-    fn cow_with_non_empty_input_shape_descends_into_stage() {
+    fn cow_default_input_shape_descends_into_stage() {
         use crate::resources::{COMPOSITE_OVERLAY_WINDOW, ROOT_VISUAL};
-        use yserver_protocol::x11::{CreateWindowRequest, xfixes};
+        use yserver_protocol::x11::CreateWindowRequest;
 
         let mut state = ServerState::new();
 
         let host_xid = crate::backend::WindowHandle::from_raw_panicking(0x4000_0103);
         state.resources.materialize_cow_resource(host_xid);
-        // Compositor populates COW input shape covering the stage region.
-        state
-            .shape_windows
-            .entry(COMPOSITE_OVERLAY_WINDOW)
-            .or_default()
-            .input = Some(vec![xfixes::RegionRect {
-            x: 0,
-            y: 0,
-            width: 800,
-            height: 600,
-        }]);
 
         let stage = ResourceId(0x0010_0050);
         state.resources.create_window(
@@ -4408,31 +4380,20 @@ mod tests {
         let (target, _, _) = state.root_pointer_target_at(50, 50).expect("hit");
         assert_eq!(
             target, stage,
-            "non-empty COW input shape lets the trace descend to stage"
+            "default COW input semantics must still let the trace descend to stage"
         );
     }
 
     #[test]
-    fn cow_default_input_shape_is_empty() {
+    fn cow_materialization_does_not_install_special_input_shape() {
         use crate::resources::COMPOSITE_OVERLAY_WINDOW;
 
         let mut state = ServerState::new();
         let host_xid = crate::backend::WindowHandle::from_raw_panicking(0x4000_0103);
         state.resources.materialize_cow_resource(host_xid);
-        state.materialize_cow_input_shape();
-
-        let shape = state
-            .shape_windows
-            .get(&COMPOSITE_OVERLAY_WINDOW)
-            .expect("COW must have a shape_windows entry after materialization");
         assert!(
-            shape.input.is_some(),
-            "COW must have a non-default input shape (set, but empty)"
-        );
-        assert_eq!(
-            shape.input.as_ref().unwrap().len(),
-            0,
-            "COW's default input shape rects are empty (click-through)"
+            !state.shape_windows.contains_key(&COMPOSITE_OVERLAY_WINDOW),
+            "COW materialization must not inject a synthetic input shape"
         );
     }
 

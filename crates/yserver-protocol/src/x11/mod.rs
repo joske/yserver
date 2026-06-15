@@ -2473,7 +2473,11 @@ pub fn encode_xi2_crossing_event(
     write_u32(byte_order, out, (i32::from(event_y) << 16) as u32);
 
     out.push(1); // same_screen
-    out.push(u8::from(matches!(evtype, 9 | 10))); // focus
+    // XI2 FocusIn/FocusOut share the xXIEnterEvent layout, but Xorg
+    // still clears the wire `focus` flag on those events. Only actual
+    // XI2 Enter/Leave crossings carry focus=true when the pointer is in
+    // the focus window.
+    out.push(0); // focus
     write_u16(byte_order, out, 1); // buttons_len
 
     // mods: base, latched, locked, effective — KEYBOARD modifier bits
@@ -3910,6 +3914,31 @@ mod tests {
         assert_eq!(out.len(), 76);
         assert_eq!(&out[0..4], &[35, 137, 8, 0]);
         assert_eq!(u32::from_le_bytes(out[4..8].try_into().unwrap()), 11);
+    }
+
+    #[test]
+    fn xi2_focus_event_clears_focus_flag_like_xorg() {
+        let mut out = Vec::new();
+        encode_xi2_focus_event(
+            &mut out,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(9),
+            137,
+            9,
+            3,
+            123,
+            ResourceId(0x200),
+            1,
+            2,
+            3,
+            4,
+            0,
+            3,
+        );
+
+        assert_eq!(out.len(), 76);
+        assert_eq!(out[48], 1, "same_screen");
+        assert_eq!(out[49], 0, "focus flag must stay clear on XI2 FocusIn/Out");
     }
 
     mod change_property_tests {

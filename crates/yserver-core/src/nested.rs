@@ -793,11 +793,14 @@ pub(crate) fn shape_rects_for(
     window: ResourceId,
     kind: u8,
 ) -> Vec<x11xfixes::RegionRect> {
-    server
+    if let Some(rects) = server
         .shape_windows
         .get(&window)
         .and_then(|state| state.rects(kind).cloned())
-        .unwrap_or_else(|| normalize_region_rects(vec![default_shape_rect(server, window, kind)]))
+    {
+        return rects;
+    }
+    normalize_region_rects(vec![default_shape_rect(server, window, kind)])
 }
 
 pub(crate) fn shape_mask_source_rects(
@@ -1324,6 +1327,30 @@ mod tests {
             assert!(!shape_kind_is_set(&server, window, shape::KIND_BOUNDING));
             assert_eq!(
                 shape_rects_for(&server, window, shape::KIND_BOUNDING),
+                vec![r(0, 0, 800, 600)]
+            );
+        }
+
+        #[test]
+        fn cow_input_shape_defaults_to_full_extent_like_xorg() {
+            use crate::resources::COMPOSITE_OVERLAY_WINDOW as COW;
+            let mut server = ServerState::new();
+            let host_xid = crate::backend::WindowHandle::from_raw_panicking(0x4000_0103);
+            server.resources.materialize_cow_resource(host_xid);
+
+            assert_eq!(
+                shape_rects_for(&server, COW, shape::KIND_INPUT),
+                vec![r(0, 0, 800, 600)]
+            );
+
+            server.shape_windows.entry(COW).or_default().input = Some(vec![r(0, 0, 2560, 28)]);
+            assert_eq!(
+                shape_rects_for(&server, COW, shape::KIND_INPUT),
+                vec![r(0, 0, 2560, 28)]
+            );
+
+            assert_eq!(
+                shape_rects_for(&server, ROOT_WINDOW, shape::KIND_INPUT),
                 vec![r(0, 0, 800, 600)]
             );
         }

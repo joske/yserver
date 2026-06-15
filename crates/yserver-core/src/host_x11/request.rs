@@ -814,6 +814,7 @@ impl HostX11Backend {
             win_x: read_i16(&reply[20..22]),
             win_y: read_i16(&reply[22..24]),
             mask: read_u16(&reply[24..26]),
+            host_xid: None,
         })
     }
 

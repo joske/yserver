@@ -172,6 +172,12 @@ pub struct RecordingBackend {
     /// pointer button — e.g. `Button1Mask = 0x0100` — so the
     /// XIQueryPointer reply's button state can be asserted).
     pub query_pointer_mask: u16,
+    /// Root-absolute cursor position returned by `query_pointer`.
+    pub query_pointer_x: i16,
+    pub query_pointer_y: i16,
+    /// Optional backend-side window-under-cursor host XID returned by
+    /// `query_pointer`.
+    pub query_pointer_host_xid: Option<u32>,
     /// Toggled by tests that want to exercise the ynest path
     /// (kms_capable=false) — default true.
     pub dpms_capable: bool,
@@ -211,6 +217,9 @@ impl RecordingBackend {
             cow_materialized: false,
             redirect_activation_supported: false,
             query_pointer_mask: 0,
+            query_pointer_x: 0,
+            query_pointer_y: 0,
+            query_pointer_host_xid: None,
             dpms_capable: true,
             dpms_set_returns_err: false,
             probe_rounds: std::collections::VecDeque::new(),
@@ -1181,9 +1190,10 @@ impl Backend for RecordingBackend {
     fn query_pointer(&mut self, _origin: Option<OriginContext>) -> io::Result<PointerPosition> {
         Ok(PointerPosition {
             same_screen: true,
-            win_x: 0,
-            win_y: 0,
+            win_x: self.query_pointer_x,
+            win_y: self.query_pointer_y,
             mask: self.query_pointer_mask,
+            host_xid: self.query_pointer_host_xid,
         })
     }
 

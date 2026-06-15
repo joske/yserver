@@ -246,22 +246,13 @@ pub fn pointer_event_fanout_to_state(
     // Resolve the actual hit window (deepest mapped child under cursor)
     // up front. We need it for both the core-event paths below (passive
     // grab matching, normal propagation) and for the XI2 fanout.
-    let root_hit = state.root_pointer_target_at(event.root_x, event.root_y);
-    let top_level_id_opt = root_hit
+    let natural_hit = natural_pointer_target(state, xid_map, event);
+    let top_level_id_opt = natural_hit
         .map(|(target, _, _)| state.top_level_for_target(target))
         .or_else(|| xid_map.get(&event.host_xid).copied());
     let top_level_id = top_level_id_opt.unwrap_or(ROOT_WINDOW);
-    let (target, target_x, target_y) = root_hit.unwrap_or_else(|| {
-        xid_map
-            .get(&event.host_xid)
-            .copied()
-            .and_then(|tl| {
-                state
-                    .pointer_target_at(tl, event.event_x, event.event_y)
-                    .or(Some((tl, event.event_x, event.event_y)))
-            })
-            .unwrap_or((ROOT_WINDOW, event.event_x, event.event_y))
-    });
+    let (target, target_x, target_y) =
+        natural_hit.unwrap_or((ROOT_WINDOW, event.event_x, event.event_y));
 
     // ── Core fanout ─────────────────────────────────────────────────
     let mut handled_core_via_grab = false;
@@ -530,15 +521,26 @@ pub fn pointer_event_fanout_to_state(
             }
         }
 
+        // Log button delivery (always) and crossing delivery (low-frequency,
+        // only on window change — safe at debug). Crossing delivery is the
+        // boundary that distinguishes "Enter never reached the WM client"
+        // from "Enter delivered fine → focus bug is WM-side / a wire field
+        // muffin rejects". `detail` carries the button number for
+        // ButtonPress/Release and the NotifyDetail (Ancestor/Virtual/
+        // Nonlinear/Inferior) for crossings.
         if matches!(
             event.kind,
-            PointerEventKind::ButtonPress | PointerEventKind::ButtonRelease
+            PointerEventKind::ButtonPress
+                | PointerEventKind::ButtonRelease
+                | PointerEventKind::EnterNotify
+                | PointerEventKind::LeaveNotify
         ) {
             log::debug!(
-                "pointer_fanout: kind={:?} button={} host_xid=0x{:x} top_level=0x{:x} target=0x{:x} \
+                "pointer_fanout: kind={:?} detail={} mode={} host_xid=0x{:x} top_level=0x{:x} target=0x{:x} \
                  propagation_window=0x{:x} child=0x{:x} core_targets={:?} root=({},{}) event_xy=({},{})",
                 event.kind,
                 event.detail,
+                event.crossing_mode,
                 event.host_xid,
                 top_level_id.0,
                 target.0,
@@ -716,14 +718,26 @@ pub fn pointer_event_fanout_to_state(
 
     if matches!(
         event.kind,
-        PointerEventKind::ButtonPress | PointerEventKind::ButtonRelease
+        PointerEventKind::ButtonPress
+            | PointerEventKind::ButtonRelease
+            | PointerEventKind::EnterNotify
+            | PointerEventKind::LeaveNotify
     ) {
+        // `event_window` (nested_id) is what the XI2 crossing carries as
+        // its `event` field — i.e. the window muffin sees the pointer
+        // enter. It is resolved from cursor COORDINATES (root_pointer_
+        // target_at), NOT from this crossing's intrinsic host_xid, so it
+        // can diverge from the producer's window_under_cursor decision.
+        // Compare against host_xid + the `upw:` producer trace to spot
+        // the dual-hit-test divergence behind flaky focus-follows-mouse.
         log::debug!(
-            "pointer_fanout XI2: kind={:?} button={} time={} target=0x{:x} top_level=0x{:x} \
+            "pointer_fanout XI2: kind={:?} detail={} time={} host_xid=0x{:x} event_window=0x{:x} target=0x{:x} top_level=0x{:x} \
              xi2_targets={:?} xi2_raw_targets={:?} root=({},{}) event_xy=({},{}) state=0x{:x}",
             event.kind,
             event.detail,
             event.time,
+            event.host_xid,
+            nested_id.0,
             target.0,
             top_level_id.0,
             xi2_targets.iter().map(|c| c.0).collect::<Vec<_>>(),
@@ -1499,6 +1513,31 @@ fn translate_host_event(
     }
 }
 
+fn host_pointer_target(
+    state: &ServerState,
+    xid_map: &HostXidMap,
+    event: HostPointerEvent,
+) -> Option<(ResourceId, i16, i16)> {
+    let mapped_id = xid_map.get(&event.host_xid).copied()?;
+    state
+        .pointer_target_at(mapped_id, event.event_x, event.event_y)
+        .or(Some((mapped_id, event.event_x, event.event_y)))
+}
+
+fn natural_pointer_target(
+    state: &ServerState,
+    xid_map: &HostXidMap,
+    event: HostPointerEvent,
+) -> Option<(ResourceId, i16, i16)> {
+    // Prefer the backend's host-xid routing. When the protocol tree
+    // temporarily lags behind the real host window stack or shape state,
+    // a pure root hit-test can fall through to an unrelated sibling
+    // (e.g. Cinnamon's full-screen InputOnly guard window) even though
+    // the backend is already dispatching against the correct host child.
+    host_pointer_target(state, xid_map, event)
+        .or_else(|| state.root_pointer_target_at(event.root_x, event.root_y))
+}
+
 fn active_grab_target(
     state: &ServerState,
 ) -> Option<(
@@ -1609,14 +1648,7 @@ fn try_match_passive_grab(
     crate::server::PassiveButtonGrab,
     yserver_protocol::x11::ResourceId,
 )> {
-    let (hit_window, _, _) = state
-        .root_pointer_target_at(event.root_x, event.root_y)
-        .or_else(|| {
-            let top_level_id = xid_map.get(&event.host_xid).copied()?;
-            state
-                .pointer_target_at(top_level_id, event.event_x, event.event_y)
-                .or(Some((top_level_id, event.event_x, event.event_y)))
-        })?;
+    let (hit_window, _, _) = natural_pointer_target(state, xid_map, event)?;
     let grab = state.find_passive_grab(hit_window, event.detail, event.state)?;
     Some((grab, hit_window))
 }
@@ -1948,6 +1980,113 @@ mod tests {
             crossing_mode: 0,
             child: 0,
         }
+    }
+
+    #[test]
+    fn pointer_fanout_prefers_host_target_over_guard_window_root_hit() {
+        use crate::resources::{COMPOSITE_OVERLAY_WINDOW, ROOT_VISUAL, ROOT_WINDOW};
+        use yserver_protocol::x11::{CreateWindowRequest, ResourceId, xfixes};
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+
+        let cow_host_xid = crate::backend::WindowHandle::from_raw_panicking(0x4000_0103);
+        state.resources.materialize_cow_resource(cow_host_xid);
+
+        let stage = ResourceId(0x0010_0050);
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: stage,
+                parent: COMPOSITE_OVERLAY_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(stage);
+
+        let guard = ResourceId(0x0010_0060);
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: guard,
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 2,
+                visual: ROOT_VISUAL,
+                override_redirect: Some(true),
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(guard);
+
+        state
+            .shape_windows
+            .entry(COMPOSITE_OVERLAY_WINDOW)
+            .or_default()
+            .input = Some(Vec::<xfixes::RegionRect>::new());
+        state.shape_windows.entry(stage).or_default().input =
+            Some(Vec::<xfixes::RegionRect>::new());
+
+        state
+            .clients
+            .get_mut(&1)
+            .unwrap()
+            .event_masks
+            .insert(stage, 0x0000_0040);
+
+        let event = HostPointerEvent {
+            host_xid: 0x4000_0009,
+            root_x: 50,
+            root_y: 50,
+            event_x: 50,
+            event_y: 50,
+            ..motion_event()
+        };
+
+        let (protocol_hit, _, _) = state.root_pointer_target_at(50, 50).expect("root hit");
+        assert_eq!(
+            protocol_hit, guard,
+            "empty-input COW should let the protocol root hit-test fall through to the guard",
+        );
+
+        let mut xid_map = HostXidMap::new();
+        xid_map.insert(0x4000_0009, stage);
+        let (natural_hit, _, _) =
+            natural_pointer_target(&state, &xid_map, event).expect("natural hit");
+        assert_eq!(
+            natural_hit, stage,
+            "host-backed pointer targeting must stay on the stage even while the protocol root hit-test sees the guard",
+        );
+
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+        let _ =
+            pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, event, true, false);
+
+        let bytes = read_all_available(&mut peer);
+        assert!(
+            bytes.len() >= 32,
+            "expected a MotionNotify event for the stage subscriber; got {} bytes",
+            bytes.len(),
+        );
+        assert_eq!(bytes[0], 6, "core delivery should be MotionNotify");
+        assert_eq!(
+            &bytes[12..16],
+            &stage.0.to_le_bytes(),
+            "MotionNotify must report the stage window, not the guard window",
+        );
     }
 
     /// wmaker wedge regression (2026-06-04, silence HW): a WM places a

@@ -293,6 +293,11 @@ pub struct PointerPosition {
     pub win_x: i16,
     pub win_y: i16,
     pub mask: u16,
+    /// Backend-side event window under the cursor when known. KMS can
+    /// answer this from its live window-under-cursor walk; host-X11
+    /// leaves it unset because the proxied `QueryPointer` path only
+    /// snapshots coordinates and mask today.
+    pub host_xid: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

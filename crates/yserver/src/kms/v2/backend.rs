@@ -4996,14 +4996,22 @@ impl KmsBackendV2 {
     /// single window. `local_x`/`local_y` are the pointer position
     /// in the window's own coordinate space (origin = window's top-
     /// left). Returns `true` when no SHAPE is set or the cursor lies
-    /// inside at least one rectangle; an empty rect list means the
-    /// window is unhittable.
+    /// inside at least one rectangle.
+    ///
+    /// Xorg does not drop the pointer-window selection to root just
+    /// because a stage / COW window temporarily carries an explicit
+    /// empty Input region: Cinnamon's `XIQueryPointer(root)` keeps
+    /// reporting the overlay child while the protocol-layer trace
+    /// still uses the empty Input shape to route actual clicks
+    /// through. Mirror that split here by treating an empty Input
+    /// region as "fall back to Bounding (or no shape)", rather than
+    /// as an unconditional backend hit-test miss.
     fn cursor_inside_shape(&self, window_id: u32, local_x: f64, local_y: f64) -> bool {
-        let shape = self
-            .core
-            .shape_input
-            .get(&window_id)
-            .or_else(|| self.core.shape_bounding.get(&window_id));
+        let shape = match self.core.shape_input.get(&window_id) {
+            Some(rects) if !rects.is_empty() => Some(rects),
+            Some(_) => self.core.shape_bounding.get(&window_id),
+            None => self.core.shape_bounding.get(&window_id),
+        };
         let Some(rects) = shape else {
             return true;
         };
@@ -15030,11 +15038,18 @@ impl Backend for KmsBackendV2 {
                 return Ok(());
             }
         };
-        if rects.is_empty() {
-            dst.remove(&host_xid);
-        } else {
-            dst.insert(host_xid, rects.to_vec());
-        }
+        // An empty rect list is a real, explicit "click-through" input
+        // shape (XFixes empty region) — NOT the absence of a shape. Store
+        // it as an empty Vec so `cursor_inside_shape` returns false (the
+        // window catches no pointer input there); removing the entry would
+        // make `cursor_inside_shape` fall back to "no shape => hittable"
+        // (fully opaque), inverting click-through into input-capture. This
+        // is the bug that let cinnamon's cleared Composite Overlay Window
+        // swallow pointer input over apps (broken sloppy focus). The
+        // core-side `shape_rects_for` already distinguishes "shape cleared
+        // to None" (reverts to the default/full extent) from "shape set to
+        // empty" before mirroring here.
+        dst.insert(host_xid, rects.to_vec());
         Ok(())
     }
 
@@ -15082,6 +15097,7 @@ impl Backend for KmsBackendV2 {
             #[allow(clippy::cast_possible_truncation)]
             win_y: self.core.cursor_y as i16,
             mask: self.core.button_mask | self.serialize_modifiers(),
+            host_xid: Some(self.window_under_cursor().unwrap_or(self.core.window_id)),
         })
     }
 
@@ -18857,6 +18873,60 @@ mod tests {
         // Unmap the topmost overlap entry — sibling beneath wins.
         b.windows_v2.get_mut(&0x1003).unwrap().mapped = false;
         assert_eq!(b.window_under_cursor(), Some(0x1001));
+    }
+
+    /// Xorg keeps the pointer window on Cinnamon's overlay/stage even
+    /// while they temporarily carry an explicit empty Input region.
+    /// Backend hit-testing must therefore fall back to Bounding/no-
+    /// shape for empty Input instead of treating the window as
+    /// unhittable.
+    #[test]
+    fn window_under_cursor_falls_back_when_input_shape_is_explicitly_empty() {
+        use yserver_protocol::x11::xfixes::RegionRect;
+
+        let mut b = KmsBackendV2::for_tests();
+        b.windows_v2.insert(
+            0x1000,
+            super::WindowGeometryV2 {
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 100,
+                depth: 32,
+                mapped: true,
+                parent: None,
+                stack_rank: 0,
+                bg_pixel: None,
+                bg_pixmap: None,
+                cursor: None,
+            },
+        );
+        b.core.top_level_order.push(0x1000);
+        b.core.shape_input.insert(0x1000, Vec::new());
+        b.core.cursor_x = 50.0;
+        b.core.cursor_y = 25.0;
+        assert_eq!(
+            b.window_under_cursor(),
+            Some(0x1000),
+            "empty Input shape must not force the backend pointer window to root",
+        );
+
+        b.core.shape_bounding.insert(
+            0x1000,
+            vec![RegionRect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 20,
+            }],
+        );
+        b.core.cursor_x = 50.0;
+        b.core.cursor_y = 25.0;
+        assert_eq!(
+            b.window_under_cursor(),
+            None,
+            "after empty Input falls back, Bounding still constrains the hit",
+        );
     }
 
     /// `on_host_input` no longer logs the `v2: on_host_input not
