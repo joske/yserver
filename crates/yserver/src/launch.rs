@@ -36,6 +36,9 @@ pub struct LaunchOptions {
     pub seat: Option<String>,
     /// `-auth FILE` — stashed for item 4, unused now.
     pub auth_file: Option<PathBuf>,
+    /// `--version` / `-version` — print version + git commit and exit
+    /// (handled by the binary before `run()`).
+    pub show_version: bool,
 }
 
 fn next_value(it: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
@@ -80,6 +83,10 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchOption
             }
         } else if arg == "-novtswitch" {
             // Known no-arg no-op (lightdm passes it).
+        } else if matches!(arg.as_str(), "--version" | "-version") {
+            // Print-and-exit; the binary acts on this before `run()`.
+            // Keep scanning so it works regardless of position.
+            o.show_version = true;
         } else if let Ok(n) = arg.parse::<u16>() {
             // Bare number → display. Keeps `yserver 7` (Justfile) working.
             o.display = Some(n);
@@ -571,6 +578,28 @@ mod tests {
     fn unknown_flags_are_tolerated() {
         let o = parse(&["-bogus", "--whatever", ":1"]).unwrap();
         assert_eq!(o.display, Some(1));
+    }
+
+    #[test]
+    fn version_flag_sets_show_version() {
+        assert!(parse(&["--version"]).unwrap().show_version);
+        assert!(parse(&["-version"]).unwrap().show_version);
+        // Default is off, and it doesn't disturb normal parsing.
+        assert!(!parse(&[":0"]).unwrap().show_version);
+        // Works regardless of position alongside other args.
+        let o = parse(&[":3", "--version", "-seat", "seat0"]).unwrap();
+        assert!(o.show_version);
+        assert_eq!(o.display, Some(3));
+    }
+
+    #[test]
+    fn version_line_contains_crate_version_and_commit() {
+        let line = crate::version::line();
+        assert!(line.starts_with("yserver "));
+        assert!(line.contains(env!("CARGO_PKG_VERSION")));
+        // build.rs always sets the commit env (at worst "unknown").
+        assert!(line.contains(crate::version::GIT_COMMIT));
+        assert!(!crate::version::GIT_COMMIT.is_empty());
     }
 
     #[test]

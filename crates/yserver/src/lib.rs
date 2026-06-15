@@ -6,6 +6,7 @@ pub mod kms;
 pub mod launch;
 pub mod present;
 mod seat;
+pub mod version;
 
 use std::{fs, io, path::PathBuf, thread};
 

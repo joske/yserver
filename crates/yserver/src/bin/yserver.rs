@@ -9,11 +9,16 @@ fn main() -> ExitCode {
             eprintln!("yserver: {err}");
             eprintln!(
                 "usage: yserver [:N | N] [vtN] [-seat NAME] [-auth FILE] \
-                 [-displayfd N] [-nolisten PROTO] [-novtswitch]"
+                 [-displayfd N] [-nolisten PROTO] [-novtswitch] [--version]"
             );
             return ExitCode::FAILURE;
         }
     };
+
+    if opts.show_version {
+        println!("{}", yserver::version::line());
+        return ExitCode::SUCCESS;
+    }
 
     match yserver::run(opts) {
         Ok(()) => ExitCode::SUCCESS,
