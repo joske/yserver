@@ -9,9 +9,7 @@ Linux (with planned FreeBSD support).
 - Run real X11 desktop environments and window managers.
 - Support modern graphics hardware through DRM/KMS and Vulkan,
   with no driver ABI for third-party hardware modules. Primary
-  target is Linux; FreeBSD (incl. GhostBSD) is a planned secondary
-  target that reuses the same DRM/libinput/Mesa stack — see
-  [`bsd-support.md`](bsd-support.md).
+  target is Linux; FreeBSD (incl. GhostBSD) support landed in 11d87ba.
 - Compositor-native architecture with tear-free presentation by
   default.
 - Per-output presentation (refresh rate, modes) with multiple
@@ -106,18 +104,8 @@ happens. KMS bring-up, libseat sessions, libinput config, hotkeys
 (Ctrl-Alt-F#, Ctrl-Alt-Backspace), and VT acquisition all assume
 Linux semantics today.
 
-**FreeBSD / GhostBSD** is a planned secondary target. The plumbing
-the standalone backend depends on — DRM/KMS (drm-kmod), libinput,
-Mesa/Vulkan, seatd — all have FreeBSD ports. The OS-specific
-surface in yserver is small (signalfd → kqueue
-`EVFILT_SIGNAL`, VT switching via `vt(4)` ioctls, optional devd
-hotplug) and lives in three files inside `crates/yserver/src/`.
-The intended shape is a small `Platform` trait
-(`crates/yserver/src/platform/`) with `linux.rs` and `freebsd.rs`
-arms — see [`bsd-support.md`](bsd-support.md) for the survey,
-risk list, and dumb-build recipe. Not started; gated on having
-GhostBSD hardware ready and a willingness to absorb the testing
-cost.
+**FreeBSD / GhostBSD** support landed in 11d87ba. This was possible
+as FreeBSD has linux API support for DRM, udev, seatd and libinput.
 
 **Windows / macOS** are out of scope. They lack DRM/KMS and
 libinput; the display stack is completely different. yserver would

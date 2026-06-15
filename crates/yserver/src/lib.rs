@@ -43,7 +43,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     panic!("yserver only supports Linux and FreeBSD (DRM/KMS, libinput, evdev)");
 
-    log::info!("yserver: Phase 6.4 KMS bootstrap — startup (single-threaded core)");
+    log::info!("yserver: startup");
 
     // Capture the inherited SIGUSR1 disposition before signalfd masking.
     // If the DM started us with SIGUSR1 ignored, we signal it when ready.

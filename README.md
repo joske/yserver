@@ -71,6 +71,8 @@ MATE / xfce4 / Cinnamon desktop on:
 - **Apple** M1 MBA, M2 MBP on Asahi Linux (apple-drm KMS + asahi GPU, Mesa AGX-V).
 - **Virtual** — virtio-gpu inside `virtme-ng` (Venus passthrough).
 
+FreeBSD was tested on the i9 (GhostBSD).
+
 ## Running the standalone DRM/KMS server
 
 `yserver` uses libseat for seat management if available.
