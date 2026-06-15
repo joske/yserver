@@ -1335,7 +1335,7 @@ impl PlatformBackend {
         // Stage 5 Task 6.1: stable inner epfd for deferred PRESENT
         // completion. Always present.
         fds.push((
-            self.present_completion_epfd.as_fd().as_raw_fd(),
+            self.present_completion_epfd.0.as_fd().as_raw_fd(),
             BackendFdKind::PresentCompletion,
         ));
         fds
