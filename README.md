@@ -97,6 +97,13 @@ export RUSTFLAGS="-C target-feature=-crt-static"
 apk add gcc musl-dev fontconfig-dev freetype-dev libxshmfence-dev libxkbcommon-dev libinput-dev libseat-dev shaderc
 ```
 
+#### FreeBSD
+
+
+```sh
+doas pkg install -y shaderc seatd fontconfig libudev-devd udev
+```
+
 ## Use with a display manager (lightdm)
 
 `lightdm` can launch yserver as its X server for a graphical login (its
