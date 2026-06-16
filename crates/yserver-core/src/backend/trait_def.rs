@@ -347,6 +347,22 @@ pub trait Backend: Send {
     /// for it). Default: no-op. project_mouse_hotplug_lost_wakeup.
     fn poll_deferred_input(&mut self, _state: &mut ServerState) {}
 
+    /// Called once per core-loop iteration, immediately before the loop
+    /// blocks in `poll`. This is the BlockHandler analog (cf. Xorg
+    /// `glamor_block_handler` → `glamor_flush`): the backend reaps GPU
+    /// render-op resources whose fences have signaled, INDEPENDENT of the
+    /// page-flip cadence. Default: no-op.
+    ///
+    /// Why this exists: the KMS v2 backend's per-op command buffers /
+    /// retired images live in an engine `submitted` queue drained only by
+    /// `poll_retired`, which was driven solely by `on_page_flip_ready`.
+    /// While the display is dark (DPMS-off / monitor standby / VT-away)
+    /// page-flips stop, but clients keep submitting render ops — so the
+    /// queue grew unbounded until the GPU ran out of command-submission
+    /// memory and the device was lost (project_reclamation_starvation_leak).
+    /// Reclamation must therefore ride the dispatch loop, not scanout.
+    fn before_block(&mut self) {}
+
     /// Drain libinput's INITIAL device enumeration and seed the XI2
     /// device registry (`state.xi_devices`) BEFORE the core serves any
     /// client — the Xorg model of probing input at startup.

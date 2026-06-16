@@ -145,6 +145,10 @@ pub struct RecordingBackend {
     /// PageFlipReady dispatches do not get suppressed by the run_core
     /// dispatch loop.
     pub page_flip_count: std::sync::atomic::AtomicU32,
+    /// Counter — incremented every time `before_block` is invoked. Tests
+    /// assert the core loop drives per-iteration reclamation even when no
+    /// page-flip ever occurs (project_reclamation_starvation_leak).
+    pub before_block_count: std::sync::atomic::AtomicU32,
     /// Stage 4d COW: lets tests pretend this backend tracks COW
     /// lifecycle. When true, the next `release_overlay_window` call
     /// returns `Ok(true)` (final release, COW destroyed); otherwise
@@ -207,6 +211,7 @@ impl RecordingBackend {
             fake_root_visual_xid: 0x0000_0021,
             xid_map: HostXidMap::new(),
             page_flip_count: std::sync::atomic::AtomicU32::new(0),
+            before_block_count: std::sync::atomic::AtomicU32::new(0),
             cow_next_release_is_final: false,
             cow_materialized: false,
             redirect_activation_supported: false,
@@ -303,6 +308,11 @@ impl Backend for RecordingBackend {
 
     fn on_page_flip_ready(&mut self, _state: &mut crate::server::ServerState) {
         self.page_flip_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn before_block(&mut self) {
+        self.before_block_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 

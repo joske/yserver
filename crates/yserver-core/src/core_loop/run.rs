@@ -434,6 +434,14 @@ pub fn run_core(
                         .unwrap_or(Duration::ZERO)
                 })
         };
+        // BlockHandler analog (cf. Xorg glamor_block_handler → glamor_flush):
+        // reap GPU render-op resources whose fences have signaled right
+        // before we block. Driving this here — not from on_page_flip_ready —
+        // is what keeps the KMS backend's engine `submitted` queue bounded
+        // while the display is dark and clients keep drawing
+        // (project_reclamation_starvation_leak). No-op for backends without
+        // GPU resources to reap.
+        backend.before_block();
         poll.poll(&mut events, poll_timeout)?;
         let iter_start = if telemetry.enabled {
             Some(Instant::now())
@@ -1526,6 +1534,61 @@ mod tests {
             backend.page_flip_count.load(Ordering::Relaxed),
             3,
             "expected 3 on_page_flip_ready dispatches",
+        );
+    }
+
+    /// Regression (project_reclamation_starvation_leak): the core loop
+    /// must drive backend GPU-resource reclamation (`before_block`) every
+    /// iteration, INDEPENDENT of page-flips. The KMS v2 backend reaped
+    /// per-op command buffers only from `on_page_flip_ready`; while the
+    /// display was dark (DPMS-off / standby / VT-away) no flips occurred,
+    /// so a client that kept drawing grew the engine `submitted` queue
+    /// without bound until the GPU lost its device. Here we run the loop
+    /// with ZERO `PageFlipReady` messages and assert `before_block` still
+    /// fired — i.e. reclamation rides the dispatch loop, not scanout.
+    #[test]
+    fn before_block_runs_without_any_page_flip() {
+        use crate::backend::recording::RecordingBackend;
+        use std::sync::atomic::Ordering;
+
+        let (poll, sender, rx) = channel().unwrap();
+        let sender_for_core = sender.clone_handle();
+        let mut backend = RecordingBackend::new();
+        let handle = std::thread::spawn(move || {
+            let mut state = ServerState::new();
+            let alloc = ClientIdAllocator::new();
+            let result = run_core(
+                poll,
+                rx,
+                sender_for_core,
+                &mut state,
+                &mut backend,
+                None,
+                &alloc,
+            );
+            (result, backend)
+        });
+        // No PageFlipReady — only a Shutdown. The loop must still run at
+        // least one iteration, calling before_block before it blocks.
+        sender.send(Message::Shutdown).unwrap();
+        for _ in 0..50 {
+            if handle.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(handle.is_finished(), "run_core did not return");
+        let (result, backend) = handle.join().unwrap();
+        result.unwrap();
+        assert_eq!(
+            backend.page_flip_count.load(Ordering::Relaxed),
+            0,
+            "test must exercise the no-page-flip path",
+        );
+        assert!(
+            backend.before_block_count.load(Ordering::Relaxed) >= 1,
+            "before_block must run each iteration even with no page-flips \
+             (reclamation must not be gated on scanout)",
         );
     }
 

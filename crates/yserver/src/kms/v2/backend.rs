@@ -8884,6 +8884,39 @@ impl Backend for KmsBackendV2 {
         }
     }
 
+    fn before_block(&mut self) {
+        // BlockHandler analog (cf. Xorg glamor_block_handler → glamor_flush):
+        // every dispatch-loop iteration, just before the core loop blocks,
+        // reap render-op resources whose fences have signaled. This is the
+        // reclaim half of `on_page_flip_ready` (the scanout / compose / flush
+        // half stays page-flip-driven), lifted onto the dispatch loop so it
+        // runs even when no page-flip occurs.
+        //
+        // Without this, the engine `submitted` queue (one per-op command
+        // buffer + any displaced images each) is drained ONLY on page-flip.
+        // While the display is dark (DPMS-off / monitor standby / VT-away)
+        // page-flips stop, but clients keep submitting render ops, so the
+        // queue grows without bound until amdgpu can't allocate command-
+        // submission memory and the device is lost
+        // (project_reclamation_starvation_leak). poll_retired only frees
+        // ops whose fence has signaled and is a cheap no-op on an empty
+        // queue, so running it every iteration costs nothing at idle.
+        self.engine.poll_retired(&self.platform);
+        self.poll_pending_retire_with_invalidate();
+        // Diagnostic: publish the `submitted`-queue depth and drive the
+        // 1Hz telemetry emit from here too. maybe_emit() self-gates to 1Hz
+        // and is a no-op below threshold, but running it every dispatch
+        // iteration means the `v2_telemetry:` line (and the submit-trace
+        // flush) keep ticking even while the display is dark — exactly
+        // when `submitted_queue_depth` is the number worth watching
+        // (project_reclamation_starvation_leak). Without this, the only
+        // other maybe_emit caller is on the compose path, which is gated
+        // off when dark, so telemetry went silent in the leak window.
+        self.telemetry
+            .record_submitted_depth(self.engine.pending_count());
+        self.telemetry.maybe_emit();
+    }
+
     fn mark_dirty(&mut self) {
         // Wake the compositor without inventing full-output damage.
         // Paint paths already record per-drawable presentation
