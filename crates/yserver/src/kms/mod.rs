@@ -11,6 +11,7 @@ pub(crate) type ConsoleGuardOpt = Option<console::ConsoleGuard>;
 #[cfg(not(target_os = "linux"))]
 pub(crate) type ConsoleGuardOpt = Option<()>;
 pub(crate) mod cursor_plane;
+pub(crate) mod hotplug;
 pub(crate) mod render_node;
 pub mod v2;
 pub mod vk;

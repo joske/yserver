@@ -113,6 +113,13 @@ Cross-cutting bugs and followups that don't fit a stage live in
   `0c08568`; merged into master 2026-05-26. Next phase is B.4
   / B.5 work to retire SubmitGroup entirely and fold scene
   compose into the frame builder.
+- **2026-06-16 DRM display hotplug**: `feat/drm-hotplug`
+  implements udev-backed DRM hotplug monitoring for KMS, debounced
+  output reprobe on connect/remove/change events, stable RANDR
+  output/mode ids across disconnect/reconnect, and RANDR screen
+  change fanout on topology updates. Validation so far:
+  `cargo test -p yserver-core --locked randr` and
+  `cargo check -p yserver --locked`.
 - **2026-06-08 COW architectural reset**: the active Cinnamon blocker
   is now treated as a structural COW/model bug, not another
   scene-assembly edge case. Replacement design doc:

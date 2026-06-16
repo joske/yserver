@@ -563,39 +563,8 @@ impl SceneCompositor {
         let pipeline = CompositorPipeline::new(Arc::clone(&vk), vk::Format::B8G8R8A8_UNORM)
             .map_err(SceneError::PipelineInit)?;
         let mut outputs = Vec::with_capacity(platform.outputs.len());
-        for (i, layout) in platform.outputs.iter().enumerate() {
-            let ring = CompositePoolRing::new(Arc::clone(&vk), MAX_DESCRIPTOR_SETS_PER_FRAME)
-                .map_err(SceneError::Vk)?;
-            // Ring depth = max BO count + 1. Scanout pools are
-            // 3 deep (matches v1); +1 buys edge safety per Stage 2
-            // plan cross-cutting §"BufferAgeRing".
-            let bo_depth = platform
-                .scanout_pools
-                .get(i)
-                .and_then(|p| p.as_ref().map(|pp| pp.bos.len()))
-                .unwrap_or(3);
-            outputs.push(OutputSceneState {
-                output_idx: i,
-                pool_ring: ring,
-                pool_slots: VecDeque::with_capacity(4),
-                pending_pool_releases: VecDeque::with_capacity(4),
-                pending_acks: VecDeque::with_capacity(4),
-                failed_submit_bos: VecDeque::with_capacity(4),
-                damage_history: BufferAgeRing::new(bo_depth + 1),
-                current_generation: 0,
-                scene_structure_damage: RegionSet::new(),
-                pending_repaint_after_failed_submit: RegionSet::new(),
-                output_extent: vk::Extent2D {
-                    width: u32::from(layout.width),
-                    height: u32::from(layout.height),
-                },
-                next_submit_retry_at: None,
-                last_frame_cursor_mode: OutputCursorMode::Hidden,
-                cursor_prev_pos: None,
-                last_present_cursor_rect: None,
-                last_present_cursor_version: None,
-                last_skip_reason: None,
-            });
+        for i in 0..platform.outputs.len() {
+            outputs.push(Self::build_output_state(&vk, platform, i)?);
         }
         Ok(Self {
             inner: Some(SceneCompositorInner {
@@ -609,6 +578,58 @@ impl SceneCompositor {
             scene_structure_dirty: true,
             hw_cursor_strategy_enabled: hw_cursor_strategy_enabled(),
         })
+    }
+
+    fn build_output_state(
+        vk: &Arc<crate::kms::vk::device::VkContext>,
+        platform: &PlatformBackend,
+        i: usize,
+    ) -> Result<OutputSceneState, SceneError> {
+        let layout = &platform.outputs[i];
+        let ring = CompositePoolRing::new(Arc::clone(vk), MAX_DESCRIPTOR_SETS_PER_FRAME)
+            .map_err(SceneError::Vk)?;
+        let bo_depth = platform
+            .scanout_pools
+            .get(i)
+            .and_then(|p| p.as_ref().map(|pp| pp.bos.len()))
+            .unwrap_or(3);
+        Ok(OutputSceneState {
+            output_idx: i,
+            pool_ring: ring,
+            pool_slots: VecDeque::with_capacity(4),
+            pending_pool_releases: VecDeque::with_capacity(4),
+            pending_acks: VecDeque::with_capacity(4),
+            failed_submit_bos: VecDeque::with_capacity(4),
+            damage_history: BufferAgeRing::new(bo_depth + 1),
+            current_generation: 0,
+            scene_structure_damage: RegionSet::new(),
+            pending_repaint_after_failed_submit: RegionSet::new(),
+            output_extent: vk::Extent2D {
+                width: u32::from(layout.width),
+                height: u32::from(layout.height),
+            },
+            next_submit_retry_at: None,
+            last_frame_cursor_mode: OutputCursorMode::Hidden,
+            cursor_prev_pos: None,
+            last_present_cursor_rect: None,
+            last_present_cursor_version: None,
+            last_skip_reason: None,
+        })
+    }
+
+    pub(crate) fn rebuild_outputs(&mut self, platform: &PlatformBackend) -> Result<(), SceneError> {
+        let Some(inner) = self.inner.as_mut() else {
+            return Ok(());
+        };
+        let vk = inner.vk.clone();
+        let mut outputs = Vec::with_capacity(platform.outputs.len());
+        for i in 0..platform.outputs.len() {
+            outputs.push(Self::build_output_state(&vk, platform, i)?);
+        }
+        inner.outputs = outputs;
+        inner.deferred_upload_wait_set.clear();
+        self.scene_structure_dirty = true;
+        Ok(())
     }
 
     /// Stage 3f.8: register the software cursor sprite after the
@@ -902,6 +923,11 @@ impl SceneCompositor {
         if platform.renderer_failed {
             return Ok(0);
         }
+        debug_assert_eq!(
+            inner.outputs.len(),
+            platform.outputs.len(),
+            "scene/platform output vectors must stay in lockstep",
+        );
         let n_outputs = inner.outputs.len();
         let mut composed = 0usize;
         let mut clear_dirty = true;

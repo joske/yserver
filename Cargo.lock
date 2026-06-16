@@ -1253,6 +1253,7 @@ dependencies = [
  "nix",
  "signal-hook",
  "thiserror",
+ "udev",
  "xkbcommon",
  "yserver-core",
  "yserver-protocol",

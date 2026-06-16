@@ -48,6 +48,9 @@ pub enum BackendFdKind {
     /// libseat connection fd (KMS + libseat mode only). Readiness
     /// drives `Backend::on_seat_ready` → `seat.dispatch()`.
     Seat,
+    /// udev monitor fd for DRM hotplug (KMS/Linux). Readiness drives
+    /// `Backend::on_display_hotplug`.
+    DrmHotplug,
 }
 
 /// Outcome of a single `Backend::drain_host_socket` pass. Re-exported
@@ -315,6 +318,9 @@ pub trait Backend: Send {
     /// and runs any resulting suspend/resume sequence. Default: no-op
     /// (ynest, host-X11, recording have no seat).
     fn on_seat_ready(&mut self, _state: &mut ServerState) {}
+
+    /// The DRM hotplug monitor is readable. Default: no-op.
+    fn on_display_hotplug(&mut self, _state: &mut ServerState) {}
 
     /// Whether the backend has armed VT switching in direct mode.
     /// Default: false.
@@ -1900,6 +1906,11 @@ mod tests {
         assert_ne!(BackendFdKind::Seat, BackendFdKind::Drm);
         assert_ne!(BackendFdKind::Seat, BackendFdKind::HostX11);
         assert_ne!(BackendFdKind::Seat, BackendFdKind::PresentCompletion);
+        assert_ne!(BackendFdKind::DrmHotplug, BackendFdKind::Drm);
+        assert_ne!(BackendFdKind::DrmHotplug, BackendFdKind::Libinput);
+        assert_ne!(BackendFdKind::DrmHotplug, BackendFdKind::HostX11);
+        assert_ne!(BackendFdKind::DrmHotplug, BackendFdKind::PresentCompletion);
+        assert_ne!(BackendFdKind::DrmHotplug, BackendFdKind::Seat);
     }
 }
 

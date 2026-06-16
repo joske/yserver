@@ -34,6 +34,7 @@
 )]
 
 use std::{
+    collections::{HashMap, HashSet},
     io,
     os::fd::{AsFd, AsRawFd, OwnedFd, RawFd},
     path::PathBuf,
@@ -511,6 +512,8 @@ pub(crate) struct PlatformBackend {
 
     // Input side
     input_ctx: Option<crate::input::SendContext>,
+    #[cfg(target_os = "linux")]
+    pub(crate) hotplug_monitor: Option<crate::kms::hotplug::DrmHotplugMonitor>,
 
     /// Stage 5 Task 6.1: inner poll FD aggregating per-batch
     /// sync_file FDs for deferred PRESENT completion. Exposed via
@@ -605,6 +608,27 @@ pub(crate) struct PlatformBackend {
     /// that rejects the cursor ioctl on the first bind will reject it
     /// forever, so there's no point re-probing every frame.
     hw_cursor_disabled: bool,
+}
+
+/// Outcome of a connector rescan.
+#[derive(Debug, Default)]
+pub(crate) struct RescanResult {
+    pub added_names: Vec<String>,
+    pub dropped_names: Vec<String>,
+    pub dropped_old_indices: Vec<usize>,
+    pub added_count: usize,
+}
+
+/// Pure recompute of the virtual-screen extent from `(x, width, height)`.
+pub(crate) fn recompute_fb_extent_from(layouts: &[(i32, u16, u16)]) -> (u16, u16) {
+    let fb_w = layouts
+        .iter()
+        .map(|(x, w, _)| x.saturating_add(i32::from(*w)))
+        .map(|v| u16::try_from(v.max(0)).unwrap_or(u16::MAX))
+        .max()
+        .unwrap_or(0);
+    let fb_h = layouts.iter().map(|(_, _, h)| *h).max().unwrap_or(0);
+    (fb_w, fb_h)
 }
 
 impl PlatformBackend {
@@ -801,6 +825,8 @@ impl PlatformBackend {
         present_completion_epfd.register(wakeup_eventfd.as_fd(), WAKEUP_EVENTFD_TOKEN)?;
 
         let submit_group = SubmitGroup::new();
+        #[cfg(target_os = "linux")]
+        let hotplug_monitor = crate::kms::hotplug::DrmHotplugMonitor::new().unwrap_or(None);
 
         log::info!(
             "v2 PlatformBackend: ready — {} outputs, fb {}x{}, {} scanout pools live",
@@ -818,6 +844,8 @@ impl PlatformBackend {
             fb_w,
             fb_h,
             input_ctx,
+            #[cfg(target_os = "linux")]
+            hotplug_monitor,
             present_completion_epfd,
             wakeup_eventfd,
             vk: Some(vk),
@@ -855,6 +883,8 @@ impl PlatformBackend {
         present_completion_epfd
             .register(wakeup_eventfd.as_fd(), WAKEUP_EVENTFD_TOKEN)
             .expect("test poller register");
+        #[cfg(target_os = "linux")]
+        let hotplug_monitor = None;
         Self {
             device: Arc::new(drm::Device::for_tests().expect("test drm device")),
             render_node_fd: None,
@@ -891,6 +921,8 @@ impl PlatformBackend {
             fb_w: 800,
             fb_h: 600,
             input_ctx: None,
+            #[cfg(target_os = "linux")]
+            hotplug_monitor,
             present_completion_epfd,
             wakeup_eventfd,
             vk: None,
@@ -1252,11 +1284,15 @@ impl PlatformBackend {
     }
 
     pub(crate) fn poll_fds(&self) -> Vec<(RawFd, BackendFdKind)> {
-        let mut fds = Vec::with_capacity(3);
+        let mut fds = Vec::with_capacity(4);
         if let Some(ctx) = self.input_ctx.as_ref() {
             fds.push((ctx.fd(), BackendFdKind::Libinput));
         }
         fds.push((self.device.as_fd().as_raw_fd(), BackendFdKind::Drm));
+        #[cfg(target_os = "linux")]
+        if let Some(mon) = self.hotplug_monitor.as_ref() {
+            fds.push((mon.raw_fd(), BackendFdKind::DrmHotplug));
+        }
         // Stage 5 Task 6.1: stable inner epfd for deferred PRESENT
         // completion. Always present.
         fds.push((
@@ -2312,103 +2348,54 @@ impl PlatformBackend {
     // called (Deviation #5 of the plan; mirrors wlroots
     // `handle_session_active` which only re-scans connectors).
 
-    /// Re-scan connectors on the existing device, drop outputs that
-    /// disappeared, and redo modeset on survivors.
-    ///
-    /// Returns the names of outputs that were dropped (the caller logs
-    /// them; full dynamic-RandR change events are a non-goal for MVP
-    /// because hot-unplug-while-suspended is an edge case). Returns
-    /// `Err` only when every surviving modeset commit fails (card gone
-    /// → caller exits, Risk #4 in the plan).
-    pub(crate) fn requery_outputs_and_modeset(&mut self) -> io::Result<Vec<String>> {
-        // Re-discover which connectors are now live.
+    fn recompact_horizontal_layout(&mut self) {
+        let mut next_x: i32 = 0;
+        for layout in &mut self.outputs {
+            layout.x = next_x;
+            layout.y = 0;
+            next_x = next_x.saturating_add(i32::from(layout.width));
+        }
+    }
+
+    /// Re-scan connectors on the existing device, dropping missing
+    /// outputs, refreshing surviving output metadata, and adding newly
+    /// connected outputs.
+    pub(crate) fn requery_outputs_and_modeset(&mut self) -> io::Result<RescanResult> {
         let discovered = crate::drm::modeset::discover_outputs(&self.device)?;
-
-        // Match by connector name so outputs survive across the
-        // suspend/resume boundary even if CRTC assignment changes.
-        // Collect surviving layouts (matching connector name in both
-        // the old and new lists) and dropped names.
-        let mut dropped_names: Vec<String> = Vec::new();
-        let mut survivors: Vec<usize> = Vec::new(); // indices into self.outputs
-
-        for (old_idx, old_layout) in self.outputs.iter().enumerate() {
-            if discovered
-                .iter()
-                .any(|d| d.connector_name == old_layout.output.connector_name)
-            {
-                survivors.push(old_idx);
-            } else {
-                log::warn!(
-                    "v2 resume: output {} disappeared while suspended — dropping",
-                    old_layout.output.connector_name,
-                );
-                dropped_names.push(old_layout.output.connector_name.clone());
-            }
-        }
-
-        // Re-commit modeset on survivors. We use the per-output scanout
-        // pool to find a framebuffer we already own. Prefer the OnScreen
-        // BO (the last-presented frame); fall back to the first BO in
-        // the pool whose fb_handle is registered. If no fb is available
-        // for an output, skip it (the next composite tick will submit
-        // a proper frame).
-        let mut any_commit_ok = false;
-        for &old_idx in &survivors {
-            let layout = &self.outputs[old_idx];
-            // Find a framebuffer we can pass to commit_modeset. The
-            // OnScreen BO is the safest choice: it was on-screen before
-            // the suspend and its DRM framebuffer registration survived
-            // the VT switch (the kernel keeps framebuffer registrations
-            // across master drops unless explicitly destroyed).
-            let fb = self
-                .scanout_pools
-                .get(old_idx)
-                .and_then(|p| p.as_ref())
-                .and_then(|pool| {
-                    use crate::kms::vk::scanout::BoPhase;
-                    // Prefer OnScreen, then any registered fb.
-                    pool.bos
-                        .iter()
-                        .find(|bo| bo.state.phase == BoPhase::OnScreen)
-                        .and_then(|bo| bo.fb_handle)
-                        .or_else(|| pool.bos.iter().find_map(|bo| bo.fb_handle))
-                });
-            let Some(fb_id) = fb else {
-                log::warn!(
-                    "v2 resume: no framebuffer available for output {} — skipping modeset",
-                    layout.output.connector_name,
-                );
-                any_commit_ok = true; // not a failure; next frame will set it
-                continue;
-            };
-            match crate::drm::modeset::commit_modeset(&self.device, &layout.output, fb_id) {
-                Ok(()) => {
-                    log::info!(
-                        "v2 resume: modeset committed for output {}",
-                        layout.output.connector_name,
-                    );
-                    any_commit_ok = true;
-                }
-                Err(e) => {
-                    log::warn!(
-                        "v2 resume: modeset commit failed for output {}: {e}",
-                        layout.output.connector_name,
-                    );
-                }
-            }
-        }
-
-        // Remove dropped outputs from the platform's output + pool
-        // vectors (reverse order so indices stay valid).
-        let mut dropped_indices: Vec<usize> = self
+        let discovered_order: Vec<String> = discovered
+            .iter()
+            .map(|o| o.connector_name.clone())
+            .collect();
+        let discovered_names: HashSet<String> = discovered
+            .iter()
+            .map(|o| o.connector_name.clone())
+            .collect();
+        let current_names: HashSet<String> = self
             .outputs
             .iter()
-            .enumerate()
-            .filter(|(_, l)| dropped_names.contains(&l.output.connector_name))
-            .map(|(i, _)| i)
+            .map(|l| l.output.connector_name.clone())
             .collect();
-        dropped_indices.sort_unstable_by(|a, b| b.cmp(a)); // descending
-        for idx in dropped_indices {
+        let mut discovered_by_name: HashMap<String, crate::drm::modeset::Output> = discovered
+            .into_iter()
+            .map(|o| (o.connector_name.clone(), o))
+            .collect();
+
+        let mut rescan = RescanResult::default();
+        for (idx, layout) in self.outputs.iter().enumerate() {
+            if discovered_names.contains(&layout.output.connector_name) {
+                continue;
+            }
+            log::warn!(
+                "v2 rescan: output {} disappeared — dropping",
+                layout.output.connector_name,
+            );
+            rescan.dropped_old_indices.push(idx);
+            rescan
+                .dropped_names
+                .push(layout.output.connector_name.clone());
+        }
+        rescan.dropped_old_indices.sort_unstable_by(|a, b| b.cmp(a));
+        for idx in rescan.dropped_old_indices.iter().copied() {
             self.outputs.remove(idx);
             if idx < self.scanout_pools.len() {
                 self.scanout_pools.remove(idx);
@@ -2421,22 +2408,129 @@ impl PlatformBackend {
             }
         }
 
-        // If there are no surviving outputs at all after dropped ones
-        // are removed, that's the "card gone" scenario (Risk #4).
-        if self.outputs.is_empty() && !discovered.is_empty() {
-            return Err(io::Error::other(
-                "v2 resume: all outputs disappeared — card likely hot-unplugged while suspended",
-            ));
-        }
-        // All survivors attempted: if none committed (all failed), card
-        // is gone.
-        if !any_commit_ok && !survivors.is_empty() {
-            return Err(io::Error::other(
-                "v2 resume: all modeset commits failed — card likely lost",
-            ));
+        for layout in &mut self.outputs {
+            if let Some(output) = discovered_by_name.remove(&layout.output.connector_name) {
+                layout.width = output.picked.width;
+                layout.height = output.picked.height;
+                layout.output = output;
+            }
         }
 
-        Ok(dropped_names)
+        let live_vk = self.vk.as_ref().cloned();
+        for name in discovered_order {
+            if current_names.contains(&name) {
+                continue;
+            }
+            let Some(output) = discovered_by_name.remove(&name) else {
+                continue;
+            };
+            let w = output.picked.width;
+            let h = output.picked.height;
+            let mut pool = None;
+            if let Some(vk) = live_vk.as_ref() {
+                match ScanoutBoPool::allocate(
+                    Arc::clone(vk),
+                    Arc::clone(&self.device),
+                    u32::from(w),
+                    u32::from(h),
+                    3,
+                    &output.scanout_modifiers,
+                ) {
+                    Ok(allocated) => {
+                        pool = Some(allocated);
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "v2 rescan: scanout pool allocate failed for new output {} ({}x{}): {e:?}",
+                            output.connector_name,
+                            w,
+                            h
+                        );
+                    }
+                }
+            }
+
+            let mut buffers = Vec::with_capacity(2);
+            let mut buffer_err: Option<io::Error> = None;
+            for _ in 0..2 {
+                match drm::Buffer::new(Arc::clone(&self.device), w, h) {
+                    Ok(b) => buffers.push(b),
+                    Err(e) => {
+                        buffer_err = Some(e);
+                        break;
+                    }
+                }
+            }
+            if let Some(e) = buffer_err {
+                log::warn!(
+                    "v2 rescan: failed to allocate initial buffers for new output {} ({}x{}): {e}",
+                    output.connector_name,
+                    w,
+                    h
+                );
+            } else {
+                let initial_fb = buffers[0].fb_id();
+                if let Err(e) =
+                    crate::drm::modeset::commit_modeset(&self.device, &output, initial_fb)
+                {
+                    log::warn!(
+                        "v2 rescan: initial modeset failed for new output {}: {e}",
+                        output.connector_name,
+                    );
+                }
+                let swapchain = drm::Swapchain::with_initial_scanout(buffers, 0);
+                self.outputs.push(OutputLayout {
+                    output,
+                    swapchain,
+                    x: 0,
+                    y: 0,
+                    width: w,
+                    height: h,
+                });
+                self.scanout_pools.push(pool);
+                if let Some(p) = self.scanout_pools.last() {
+                    if let Some(pool) = p.as_ref() {
+                        self.bo_generations
+                            .push(vec![BoGenerationEntry::default(); pool.bos.len()]);
+                    } else {
+                        self.bo_generations.push(Vec::new());
+                    }
+                }
+                self.first_pageflip_logged.push(false);
+                rescan
+                    .added_names
+                    .push(self.outputs.last().unwrap().output.connector_name.clone());
+                rescan.added_count += 1;
+                continue;
+            }
+
+            self.outputs.push(OutputLayout {
+                output,
+                swapchain: drm::Swapchain::empty_for_tests(),
+                x: 0,
+                y: 0,
+                width: w,
+                height: h,
+            });
+            self.scanout_pools.push(pool);
+            self.bo_generations.push(Vec::new());
+            self.first_pageflip_logged.push(false);
+            rescan
+                .added_names
+                .push(self.outputs.last().unwrap().output.connector_name.clone());
+            rescan.added_count += 1;
+        }
+
+        self.recompact_horizontal_layout();
+        let layouts: Vec<(i32, u16, u16)> = self
+            .outputs
+            .iter()
+            .map(|layout| (layout.x, layout.width, layout.height))
+            .collect();
+        let (fb_w, fb_h) = recompute_fb_extent_from(&layouts);
+        self.fb_w = fb_w;
+        self.fb_h = fb_h;
+        Ok(rescan)
     }
 
     /// Re-arm the hardware cursor plane on every CRTC that was
@@ -2608,6 +2702,12 @@ mod tests {
         let fds = p.poll_fds();
         // No input_ctx, one DRM fd.
         assert!(fds.iter().any(|(_, k)| matches!(k, BackendFdKind::Drm)));
+    }
+
+    #[test]
+    fn recompute_fb_extent_matches_issue9_dual_2560x1440() {
+        let layouts = &[(0i32, 2560u16, 1440u16), (2560i32, 2560u16, 1440u16)];
+        assert_eq!(super::recompute_fb_extent_from(layouts), (5120, 1440));
     }
 
     /// Fence acquire on a no-Vk fixture returns the

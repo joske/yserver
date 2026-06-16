@@ -38,6 +38,7 @@ nix = { version = "0.31", features = [
 ] }
 signal-hook = "0.4"
 thiserror = "2"
+udev = "0.9"
 xkbcommon = "0.9"
 yserver-core = { path = "crates/yserver-core" }
 yserver-protocol = { path = "crates/yserver-protocol" }

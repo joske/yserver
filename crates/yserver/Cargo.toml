@@ -21,6 +21,7 @@ input.workspace = true
 nix.workspace = true
 signal-hook.workspace = true
 freetype-rs.workspace = true
+udev.workspace = true
 xkbcommon.workspace = true
 fontconfig = "0.10.1"
 ash.workspace = true

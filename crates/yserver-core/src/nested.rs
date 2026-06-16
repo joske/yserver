@@ -380,6 +380,7 @@ pub fn run(display: u16, width: u16, height: u16) -> io::Result<()> {
         output_id: 1,
         crtc_id: 2,
         mode_id: 3,
+        connected: true,
         x: 0,
         y: 0,
         width,

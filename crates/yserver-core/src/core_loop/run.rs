@@ -24,8 +24,9 @@ use super::{
     client_io::{self, WriteOutcome},
     message::{HostInputEvent, Message, SetupAllocateResponse},
     poll_tokens::{
-        ClientIdAllocator, DRM_TOKEN, HOST_X11_TOKEN, LIBINPUT_TOKEN, LISTENER_TOKEN, NOTIFY_TOKEN,
-        PRESENT_COMPLETION_TOKEN, SEAT_TOKEN, client_token, token_to_client,
+        ClientIdAllocator, DRM_HOTPLUG_TOKEN, DRM_TOKEN, HOST_X11_TOKEN, LIBINPUT_TOKEN,
+        LISTENER_TOKEN, NOTIFY_TOKEN, PRESENT_COMPLETION_TOKEN, SEAT_TOKEN, client_token,
+        token_to_client,
     },
     process_request::{RequestOutcome, process_request},
     sender::{CoreReceiver, CoreSender},
@@ -359,6 +360,7 @@ pub fn run_core(
     for (fd, kind) in backend.poll_fds() {
         let token = match kind {
             BackendFdKind::Drm => DRM_TOKEN,
+            BackendFdKind::DrmHotplug => DRM_HOTPLUG_TOKEN,
             BackendFdKind::Libinput => LIBINPUT_TOKEN,
             BackendFdKind::HostX11 => HOST_X11_TOKEN,
             BackendFdKind::PresentCompletion => PRESENT_COMPLETION_TOKEN,
@@ -503,6 +505,9 @@ pub fn run_core(
                         telemetry.page_flip_count += 1;
                     }
                     backend.on_page_flip_ready(state);
+                }
+                DRM_HOTPLUG_TOKEN => {
+                    backend.on_display_hotplug(state);
                 }
                 LIBINPUT_TOKEN => {
                     // Libseat mode: the backend owns libinput on the
@@ -855,10 +860,7 @@ pub(crate) fn handle_host_container_resize(
     state: &mut ServerState,
     ev: crate::host_x11::HostConfigureEvent,
 ) {
-    use std::sync::atomic::Ordering;
-    use yserver_protocol::x11::{self, SequenceNumber, randr as x11randr};
-
-    const RANDR_FIRST_EVENT: u8 = 89;
+    use yserver_protocol::x11;
 
     if ev.width == 0
         || ev.height == 0
@@ -881,8 +883,6 @@ pub(crate) fn handle_host_container_resize(
     }
     let width = ev.width;
     let height = ev.height;
-    let width_mm = u16::try_from(state.randr.width_mm).unwrap_or(u16::MAX);
-    let height_mm = u16::try_from(state.randr.height_mm).unwrap_or(u16::MAX);
 
     // Core ConfigureNotify on root for non-RANDR-aware clients
     // selecting StructureNotifyMask. Spec-correct ordering: emit this
@@ -915,22 +915,40 @@ pub(crate) fn handle_host_container_resize(
         },
     );
 
-    // RANDR ScreenChangeNotify / CrtcChangeNotify / OutputChangeNotify
-    // fanout. Snapshot the subscribers first so the per-client mut
-    // borrow on `state.clients` in the inner loop doesn't conflict.
+    let changed: Vec<(u32, u32, u32)> = state
+        .randr
+        .outputs
+        .first()
+        .map(|o| (o.output_id, o.crtc_id, o.mode_id))
+        .into_iter()
+        .collect();
+    emit_randr_change_notifications(state, &changed);
+}
+
+/// Fan out RANDR change notifications for a topology/geometry change.
+pub fn emit_randr_change_notifications(state: &mut ServerState, changed: &[(u32, u32, u32)]) {
+    use std::sync::atomic::Ordering;
+    use yserver_protocol::x11::{SequenceNumber, randr as x11randr};
+
+    const RANDR_FIRST_EVENT: u8 = 89;
+
+    let timestamp = state.randr.timestamp;
+    let width = state.randr.screen_width;
+    let height = state.randr.screen_height;
+    let width_mm = u16::try_from(state.randr.width_mm).unwrap_or(u16::MAX);
+    let height_mm = u16::try_from(state.randr.height_mm).unwrap_or(u16::MAX);
+    let crtc_positions: std::collections::HashMap<u32, (i16, i16)> = state
+        .randr
+        .outputs
+        .iter()
+        .map(|o| (o.crtc_id, (o.x, o.y)))
+        .collect();
+
     let subscribers: Vec<(u32, yserver_protocol::x11::ResourceId, u16)> = state
         .randr_select_masks
         .iter()
         .map(|((owner, window), mask)| (*owner, *window, *mask))
         .collect();
-    // Capture the IDs *after* `state.randr.resize` (above) so the
-    // fanout uses the current values. Defensive defaults for the
-    // (unreachable post-init) empty-outputs case.
-    let (output, crtc, mode) = state
-        .randr
-        .outputs
-        .first()
-        .map_or((0, 0, 0), |o| (o.output_id, o.crtc_id, o.mode_id));
     for (owner, request_window, mask) in subscribers {
         let Some(client) = state.clients.get_mut(&owner) else {
             continue;
@@ -954,39 +972,42 @@ pub(crate) fn handle_host_container_resize(
             );
             let _ = client_io::write_or_buffer(client, &event);
         }
-        if mask & x11randr::NOTIFY_MASK_CRTC_CHANGE != 0 {
-            let event = x11randr::encode_crtc_change_notify_event(
-                client.byte_order,
-                RANDR_FIRST_EVENT,
-                sequence,
-                x11randr::CrtcChangeNotify {
-                    timestamp,
-                    request_window: request_window.0,
-                    crtc,
-                    mode,
-                    x: ev.x,
-                    y: ev.y,
-                    width,
-                    height,
-                },
-            );
-            let _ = client_io::write_or_buffer(client, &event);
-        }
-        if mask & x11randr::NOTIFY_MASK_OUTPUT_CHANGE != 0 {
-            let event = x11randr::encode_output_change_notify_event(
-                client.byte_order,
-                RANDR_FIRST_EVENT,
-                sequence,
-                x11randr::OutputChangeNotify {
-                    timestamp,
-                    config_timestamp: timestamp,
-                    request_window: request_window.0,
-                    output,
-                    crtc,
-                    mode,
-                },
-            );
-            let _ = client_io::write_or_buffer(client, &event);
+        for &(output, crtc, mode) in changed {
+            let (x, y) = crtc_positions.get(&crtc).copied().unwrap_or((0, 0));
+            if mask & x11randr::NOTIFY_MASK_CRTC_CHANGE != 0 {
+                let event = x11randr::encode_crtc_change_notify_event(
+                    client.byte_order,
+                    RANDR_FIRST_EVENT,
+                    sequence,
+                    x11randr::CrtcChangeNotify {
+                        timestamp,
+                        request_window: request_window.0,
+                        crtc,
+                        mode,
+                        x,
+                        y,
+                        width,
+                        height,
+                    },
+                );
+                let _ = client_io::write_or_buffer(client, &event);
+            }
+            if mask & x11randr::NOTIFY_MASK_OUTPUT_CHANGE != 0 {
+                let event = x11randr::encode_output_change_notify_event(
+                    client.byte_order,
+                    RANDR_FIRST_EVENT,
+                    sequence,
+                    x11randr::OutputChangeNotify {
+                        timestamp,
+                        config_timestamp: timestamp,
+                        request_window: request_window.0,
+                        output,
+                        crtc,
+                        mode,
+                    },
+                );
+                let _ = client_io::write_or_buffer(client, &event);
+            }
         }
     }
 }

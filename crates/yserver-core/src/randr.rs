@@ -9,6 +9,7 @@ pub struct RandrOutput {
     pub output_id: u32,
     pub crtc_id: u32,
     pub mode_id: u32,
+    pub connected: bool,
     /// Position in the virtual screen (placed horizontally in the
     /// current phase).
     pub x: i16,
@@ -92,7 +93,7 @@ impl RandrState {
         // Collect unique modes preserving caller-allocated mode_ids.
         let mut modes: Vec<RandrMode> = Vec::new();
         let mut seen: HashSet<u32> = HashSet::new();
-        for out in &outputs {
+        for out in outputs.iter().filter(|o| o.connected) {
             if seen.insert(out.mode_id) {
                 modes.push(RandrMode {
                     mode_id: out.mode_id,
@@ -103,7 +104,11 @@ impl RandrState {
             }
         }
 
-        let primary_output = outputs.first().map_or(0, |o| o.output_id);
+        let primary_output = outputs
+            .iter()
+            .find(|o| o.connected)
+            .or_else(|| outputs.first())
+            .map_or(0, |o| o.output_id);
 
         Self {
             timestamp,
@@ -130,6 +135,7 @@ impl RandrState {
             output_id: 1,
             crtc_id: 2,
             mode_id: 3,
+            connected: true,
             x: 0,
             y: 0,
             width,
@@ -219,28 +225,33 @@ impl RandrState {
     ) -> Option<OutputInfoReplyData> {
         let _ = config_timestamp; // accepted but not used
         let out = self.outputs.iter().find(|o| o.output_id == output_id)?;
-        // Prefer the EDID-reported physical size (passed through from
-        // the DRM connector); fall back to a 96-DPI synthesis from
-        // pixel dimensions when the connector reports 0 (virtio-gpu,
-        // ynest nested, displays without EDID). Integer 96-DPI math:
-        // mm = (px*254 + 480) / 960.
-        let width_mm = if out.mm_width > 0 {
-            out.mm_width
+        let (width_mm, height_mm) = if out.connected {
+            // Prefer the EDID-reported physical size (passed through
+            // from the DRM connector); fall back to a 96-DPI synthesis
+            // from pixel dimensions when the connector reports 0
+            // (virtio-gpu, ynest nested, displays without EDID).
+            let width_mm = if out.mm_width > 0 {
+                out.mm_width
+            } else {
+                ((u32::from(out.width) * 254 + 480) / 960).max(1)
+            };
+            let height_mm = if out.mm_height > 0 {
+                out.mm_height
+            } else {
+                ((u32::from(out.height) * 254 + 480) / 960).max(1)
+            };
+            (width_mm, height_mm)
         } else {
-            ((u32::from(out.width) * 254 + 480) / 960).max(1)
-        };
-        let height_mm = if out.mm_height > 0 {
-            out.mm_height
-        } else {
-            ((u32::from(out.height) * 254 + 480) / 960).max(1)
+            (0, 0)
         };
         Some(OutputInfoReplyData {
             timestamp: self.timestamp,
-            crtc: out.crtc_id,
+            crtc: if out.connected { out.crtc_id } else { 0 },
             mode_id: out.mode_id,
             width_mm,
             height_mm,
             name: out.name.clone(),
+            connection: if out.connected { 0 } else { 1 },
         })
     }
 
@@ -269,6 +280,7 @@ pub struct OutputInfoReplyData {
     pub width_mm: u32,
     pub height_mm: u32,
     pub name: String,
+    pub connection: u8,
 }
 
 /// Data returned by [`RandrState::crtc_info`].
@@ -353,6 +365,7 @@ mod tests {
                 output_id: 1,
                 crtc_id: 3,
                 mode_id: 5,
+                connected: true,
                 x: 0,
                 y: 0,
                 width: 1024,
@@ -366,6 +379,7 @@ mod tests {
                 output_id: 2,
                 crtc_id: 4,
                 mode_id: 6,
+                connected: true,
                 x: 1024,
                 y: 0,
                 width: 1280,
@@ -393,6 +407,7 @@ mod tests {
                 output_id: 1,
                 crtc_id: 3,
                 mode_id: 5,
+                connected: true,
                 x: 0,
                 y: 0,
                 width: 1024,
@@ -406,6 +421,7 @@ mod tests {
                 output_id: 2,
                 crtc_id: 4,
                 mode_id: 5,
+                connected: true,
                 x: 1024,
                 y: 0,
                 width: 1024,
@@ -427,6 +443,7 @@ mod tests {
                 output_id: 1,
                 crtc_id: 3,
                 mode_id: 5,
+                connected: true,
                 x: 0,
                 y: 0,
                 width: 1024,
@@ -440,6 +457,7 @@ mod tests {
                 output_id: 2,
                 crtc_id: 4,
                 mode_id: 6,
+                connected: true,
                 x: 1024,
                 y: 0,
                 width: 1920,
@@ -460,6 +478,7 @@ mod tests {
             output_id: 1,
             crtc_id: 2,
             mode_id: 3,
+            connected: true,
             x: 0,
             y: 0,
             width: 2560,
@@ -483,6 +502,7 @@ mod tests {
             output_id: 1,
             crtc_id: 2,
             mode_id: 3,
+            connected: true,
             x: 0,
             y: 0,
             width: 2560,
@@ -506,6 +526,7 @@ mod tests {
                 output_id: 1,
                 crtc_id: 3,
                 mode_id: 5,
+                connected: true,
                 x: 0,
                 y: 0,
                 width: 1024,
@@ -519,6 +540,7 @@ mod tests {
                 output_id: 2,
                 crtc_id: 4,
                 mode_id: 5,
+                connected: true,
                 x: 1024,
                 y: 0,
                 width: 1024,
@@ -530,5 +552,81 @@ mod tests {
         ];
         let st = RandrState::from_outputs(0, outs);
         assert_eq!(st.primary_output, 1);
+    }
+
+    #[test]
+    fn disconnected_output_is_still_queryable() {
+        let mut outs = vec![RandrOutput {
+            name: "DP-1".into(),
+            output_id: 1,
+            crtc_id: 2,
+            mode_id: 3,
+            connected: true,
+            x: 0,
+            y: 0,
+            width: 2560,
+            height: 1440,
+            vrefresh: 60,
+            mm_width: 0,
+            mm_height: 0,
+        }];
+        outs.push(RandrOutput {
+            name: "HDMI-A-1".into(),
+            output_id: 4,
+            crtc_id: 5,
+            mode_id: 0,
+            connected: false,
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+            vrefresh: 0,
+            mm_width: 0,
+            mm_height: 0,
+        });
+        let st = RandrState::from_outputs(1, outs);
+        let info = st
+            .output_info(4, 0)
+            .expect("disconnected output still queryable");
+        assert_eq!(info.crtc, 0);
+        assert_eq!(info.connection, 1);
+        assert_eq!(st.screen_width, 2560);
+        assert_eq!(st.modes.len(), 1);
+        assert_eq!(st.primary_output, 1);
+    }
+
+    #[test]
+    fn primary_prefers_connected_when_lower_id_is_disconnected() {
+        let outs = vec![
+            RandrOutput {
+                name: "DP-1".into(),
+                output_id: 1,
+                crtc_id: 2,
+                mode_id: 0,
+                connected: false,
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+                vrefresh: 0,
+                mm_width: 0,
+                mm_height: 0,
+            },
+            RandrOutput {
+                name: "HDMI-A-1".into(),
+                output_id: 4,
+                crtc_id: 5,
+                mode_id: 6,
+                connected: true,
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                vrefresh: 60,
+                mm_width: 0,
+                mm_height: 0,
+            },
+        ];
+        assert_eq!(RandrState::from_outputs(1, outs).primary_output, 4);
     }
 }

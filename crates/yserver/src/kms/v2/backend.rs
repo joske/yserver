@@ -135,6 +135,55 @@ struct SeedInferiorDraw {
     height: u32,
 }
 
+/// Monotonic connector-keyed RANDR id allocator.
+#[derive(Debug, Default)]
+pub(crate) struct RandrIdAllocator {
+    next: u32,
+    outputs: HashMap<String, ConnectorIds>,
+    modes: HashMap<(u16, u16, u32), u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConnectorIds {
+    pub output_id: u32,
+    pub crtc_id: u32,
+}
+
+impl RandrIdAllocator {
+    fn fresh(&mut self) -> u32 {
+        self.next = self.next.saturating_add(1);
+        self.next
+    }
+
+    pub(crate) fn ids_for(&mut self, connector_name: &str) -> ConnectorIds {
+        if let Some(ids) = self.outputs.get(connector_name) {
+            return *ids;
+        }
+        let ids = ConnectorIds {
+            output_id: self.fresh(),
+            crtc_id: self.fresh(),
+        };
+        self.outputs.insert(connector_name.to_string(), ids);
+        ids
+    }
+
+    pub(crate) fn mode_id(&mut self, w: u16, h: u16, vrefresh: u32) -> u32 {
+        if let Some(id) = self.modes.get(&(w, h, vrefresh)) {
+            return *id;
+        }
+        let id = self.fresh();
+        self.modes.insert((w, h, vrefresh), id);
+        id
+    }
+
+    pub(crate) fn known_connectors(&self) -> Vec<(String, ConnectorIds)> {
+        self.outputs
+            .iter()
+            .map(|(name, ids)| (name.clone(), *ids))
+            .collect()
+    }
+}
+
 /// v2 sibling backend. Shares `KmsCore` with `KmsBackend`;
 /// owns `PlatformBackend` (real DRM/Vk/libinput per Stage 2a)
 /// plus stub `DrawableStore` / `RenderEngine` / `SceneCompositor`
@@ -384,6 +433,8 @@ pub struct KmsBackendV2 {
     /// re-dispatches libinput (`poll_deferred_input`) to retry the deferred
     /// open, then clears the window — preserving the idle-sleep once settled.
     libinput_hotplug_retry_until: Option<std::time::Instant>,
+    randr_id_alloc: RandrIdAllocator,
+    hotplug_rescan_deadline: Option<std::time::Instant>,
 
     /// GLX-TFP (Tasks 2.3 + 2.4): per-`DrawableId` export tracking for
     /// pixmaps shared with a GL consumer via `GLX_EXT_texture_from_pixmap`.
@@ -797,6 +848,8 @@ impl KmsBackendV2 {
             input_thread_control: None,
             hotkey: crate::input::hotkey::HotkeyDetector::new(),
             libinput_hotplug_retry_until: None,
+            randr_id_alloc: RandrIdAllocator::default(),
+            hotplug_rescan_deadline: None,
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported,
         };
@@ -935,6 +988,8 @@ impl KmsBackendV2 {
             input_thread_control: None,
             hotkey: crate::input::hotkey::HotkeyDetector::new(),
             libinput_hotplug_retry_until: None,
+            randr_id_alloc: RandrIdAllocator::default(),
+            hotplug_rescan_deadline: None,
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported,
         };
@@ -1749,6 +1804,8 @@ impl KmsBackendV2 {
             input_thread_control: None,
             hotkey: crate::input::hotkey::HotkeyDetector::new(),
             libinput_hotplug_retry_until: None,
+            randr_id_alloc: RandrIdAllocator::default(),
+            hotplug_rescan_deadline: None,
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported: false,
         }
@@ -2356,44 +2413,60 @@ impl KmsBackendV2 {
 
     /// RandR output list — mirrors `KmsBackend::randr_outputs`.
     #[must_use]
-    pub fn randr_outputs(&self) -> Vec<yserver_core::randr::RandrOutput> {
-        use std::collections::HashMap;
+    pub fn randr_outputs(&mut self) -> Vec<yserver_core::randr::RandrOutput> {
         use yserver_core::randr::RandrOutput;
-        let n = self.platform.outputs.len();
-        let mut mode_ids: HashMap<(u16, u16, u32), u32> = HashMap::new();
-        #[allow(clippy::cast_possible_truncation)]
-        let mut next_mode_id: u32 = (2 * n + 1) as u32;
-        self.platform
+        let live_names: HashSet<String> = self
+            .platform
             .outputs
             .iter()
-            .enumerate()
-            .map(|(i, layout)| {
-                let vrefresh = layout.output.picked.vrefresh;
-                let key = (layout.width, layout.height, vrefresh);
-                let mode_id = *mode_ids.entry(key).or_insert_with(|| {
-                    let id = next_mode_id;
-                    next_mode_id += 1;
-                    id
-                });
-                #[allow(clippy::cast_possible_truncation)]
-                let output_id = (i + 1) as u32;
-                #[allow(clippy::cast_possible_truncation)]
-                let crtc_id = (n + i + 1) as u32;
-                RandrOutput {
-                    name: layout.output.connector_name.clone(),
-                    output_id,
-                    crtc_id,
-                    mode_id,
-                    x: i16::try_from(layout.x).unwrap_or(i16::MAX),
-                    y: i16::try_from(layout.y).unwrap_or(i16::MAX),
-                    width: layout.width,
-                    height: layout.height,
-                    vrefresh,
-                    mm_width: layout.output.mm_width,
-                    mm_height: layout.output.mm_height,
-                }
-            })
-            .collect()
+            .map(|layout| layout.output.connector_name.clone())
+            .collect();
+        let mut outs: Vec<RandrOutput> = Vec::with_capacity(
+            self.platform.outputs.len() + self.randr_id_alloc.known_connectors().len(),
+        );
+        for layout in &self.platform.outputs {
+            let vrefresh = layout.output.picked.vrefresh;
+            let ids = self.randr_id_alloc.ids_for(&layout.output.connector_name);
+            let mode_id = self
+                .randr_id_alloc
+                .mode_id(layout.width, layout.height, vrefresh);
+            outs.push(RandrOutput {
+                name: layout.output.connector_name.clone(),
+                output_id: ids.output_id,
+                crtc_id: ids.crtc_id,
+                mode_id,
+                connected: true,
+                x: i16::try_from(layout.x).unwrap_or(i16::MAX),
+                y: i16::try_from(layout.y).unwrap_or(i16::MAX),
+                width: layout.width,
+                height: layout.height,
+                vrefresh,
+                mm_width: layout.output.mm_width,
+                mm_height: layout.output.mm_height,
+            });
+        }
+
+        for (name, ids) in self.randr_id_alloc.known_connectors() {
+            if live_names.contains(&name) {
+                continue;
+            }
+            outs.push(RandrOutput {
+                name,
+                output_id: ids.output_id,
+                crtc_id: ids.crtc_id,
+                mode_id: 0,
+                connected: false,
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+                vrefresh: 0,
+                mm_width: 0,
+                mm_height: 0,
+            });
+        }
+        outs.sort_by_key(|o| o.output_id);
+        outs
     }
 
     /// Telemetry accessor — used by the acceptance harness to
@@ -4711,18 +4784,9 @@ impl KmsBackendV2 {
         // 2. Re-query connectors + redo modeset on existing device.
         log::info!("kms: run_resume step 2 — requery_outputs_and_modeset");
         match self.platform.requery_outputs_and_modeset() {
-            Ok(dropped) => {
-                if !dropped.is_empty() {
-                    // MVP: log dropped outputs; dynamic RandR change events
-                    // require infra not yet built (see report: DONE_WITH_CONCERNS
-                    // — hot-unplug-while-suspended is an MVP non-goal edge).
-                    for name in &dropped {
-                        log::warn!(
-                            "kms: resume: output {name} was disconnected while suspended \
-                             (RandR change event not yet fired — MVP limitation)"
-                        );
-                    }
-                    self.fire_randr_changes(state, dropped);
+            Ok(rescan) => {
+                if rescan.added_count != 0 || !rescan.dropped_names.is_empty() {
+                    self.fire_randr_changes(state, rescan);
                 }
             }
             Err(e) => {
@@ -4800,17 +4864,77 @@ impl KmsBackendV2 {
         }
     }
 
-    /// Notify the backend about dropped outputs (RandR). MVP: logs
-    /// each dropped output name. Full RandR change-event infra is not
-    /// yet built (DONE_WITH_CONCERNS — hot-unplug-while-suspended is
-    /// an MVP non-goal).
-    fn fire_randr_changes(&mut self, _state: &mut ServerState, dropped: Vec<String>) {
-        for name in dropped {
-            log::warn!(
-                "kms: RandR output-gone for {name}: dynamic RandR change events are an \
-                 MVP non-goal (hot-unplug-while-suspended); clients will see the output \
-                 gone on the next configuration query"
-            );
+    /// Reconcile scene, RANDR state, and client notifications after a
+    /// connector topology change.
+    fn fire_randr_changes(
+        &mut self,
+        state: &mut ServerState,
+        rescan: crate::kms::v2::platform::RescanResult,
+    ) {
+        for name in &rescan.added_names {
+            log::info!("kms: RandR output connected: {name}");
+        }
+        for name in &rescan.dropped_names {
+            log::info!("kms: RandR output disconnected: {name}");
+        }
+
+        self.platform.wait_idle_bounded();
+        self.scene.drain_all(&mut self.platform);
+        if let Err(e) = self.scene.rebuild_outputs(&self.platform) {
+            log::error!("kms: scene rebuild after topology change failed: {e:?}; exiting");
+            self.request_exit();
+            return;
+        }
+
+        let timestamp = state.timestamp_now();
+        let outputs = self.randr_outputs();
+        state.randr = yserver_core::randr::RandrState::from_outputs(timestamp, outputs);
+
+        if state.dpms.power_level == 0 {
+            self.kms_outputs_active = true;
+        }
+
+        let (w, h) = (state.randr.screen_width, state.randr.screen_height);
+        if let Some(root) = state
+            .resources
+            .window_mut(yserver_core::resources::ROOT_WINDOW)
+        {
+            root.width = w;
+            root.height = h;
+        }
+        if let Some(overlay) = state
+            .resources
+            .window_mut(yserver_core::resources::COMPOSITE_OVERLAY_WINDOW)
+        {
+            overlay.width = w;
+            overlay.height = h;
+        }
+
+        let changed: Vec<(u32, u32, u32)> = state
+            .randr
+            .outputs
+            .iter()
+            .map(|o| (o.output_id, o.crtc_id, o.mode_id))
+            .collect();
+        yserver_core::core_loop::run::emit_randr_change_notifications(state, &changed);
+        self.scene.wake_for_damage();
+    }
+
+    fn run_display_rescan(&mut self, state: &mut ServerState) {
+        if self.core_libinput.is_some() && self.seat_state != crate::seat::state::SeatState::Active
+        {
+            log::debug!("kms: display rescan skipped (seat not Active)");
+            return;
+        }
+        match self.platform.requery_outputs_and_modeset() {
+            Ok(rescan) => {
+                if rescan.added_count == 0 && rescan.dropped_names.is_empty() {
+                    log::debug!("kms: display rescan found no topology change");
+                    return;
+                }
+                self.fire_randr_changes(state, rescan);
+            }
+            Err(e) => log::error!("kms: display rescan failed: {e}"),
         }
     }
 
@@ -8961,10 +9085,14 @@ impl Backend for KmsBackendV2 {
                 (now + std::time::Duration::from_millis(250)).min(until)
             }
         });
+        let rescan_deadline = self
+            .hotplug_rescan_deadline
+            .map(|until| if now >= until { now } else { until });
         scene_deadline
             .into_iter()
             .chain(present_deadline)
             .chain(hotplug_retry_deadline)
+            .chain(rescan_deadline)
             .chain(
                 allow_kms_timers
                     .then(|| self.cursor_anim_deadline())
@@ -9383,6 +9511,23 @@ impl Backend for KmsBackendV2 {
         );
     }
 
+    fn on_display_hotplug(&mut self, _state: &mut ServerState) {
+        #[cfg(target_os = "linux")]
+        {
+            let saw_change = self
+                .platform
+                .hotplug_monitor
+                .as_mut()
+                .map(|monitor| monitor.drain())
+                .unwrap_or(false);
+            if saw_change {
+                self.hotplug_rescan_deadline =
+                    Some(std::time::Instant::now() + std::time::Duration::from_millis(150));
+                log::debug!("kms: display hotplug edge — rescan armed (+150ms)");
+            }
+        }
+    }
+
     fn on_libinput_ready(&mut self, state: &mut ServerState) {
         // Libseat mode: dispatch the on-core libinput context, then map each
         // event through the same fanout that Direct mode uses. Hotkeys are
@@ -9520,6 +9665,12 @@ impl Backend for KmsBackendV2 {
     }
 
     fn poll_deferred_input(&mut self, state: &mut ServerState) {
+        if let Some(deadline) = self.hotplug_rescan_deadline
+            && std::time::Instant::now() >= deadline
+        {
+            self.hotplug_rescan_deadline = None;
+            self.run_display_rescan(state);
+        }
         // Service the mouse-hotplug retry window. While armed and unexpired,
         // re-dispatch the on-core libinput so a libseat open that was DEFERRED
         // by a lagging udev ACL (on a device re-enumerated by a monitor-hub
@@ -15723,8 +15874,8 @@ fn subtract_one_rect_clip(outer: ash::vk::Rect2D, inner: ash::vk::Rect2D) -> Vec
 #[cfg(test)]
 mod tests {
     use super::{
-        KmsBackendV2, PictureRecord, compute_copy_area_dst_rects, compute_render_composite_clip,
-        intersect_rect_with_clip, resolve_picture_for_render,
+        KmsBackendV2, PictureRecord, RandrIdAllocator, compute_copy_area_dst_rects,
+        compute_render_composite_clip, intersect_rect_with_clip, resolve_picture_for_render,
     };
     use crate::kms::{
         cpu_types::{Rectangle16, Repeat},
@@ -16013,9 +16164,30 @@ mod tests {
     }
 
     #[test]
+    fn display_hotplug_arms_rescan_deadline_and_next_wakeup() {
+        let mut b = KmsBackendV2::for_tests();
+        let now = std::time::Instant::now();
+        b.hotplug_rescan_deadline = Some(now + std::time::Duration::from_millis(150));
+        let wake = b
+            .next_wakeup()
+            .expect("an armed hotplug rescan deadline must wake polling");
+        assert!(
+            wake <= now + std::time::Duration::from_millis(160),
+            "hotplug rescan deadline should be near-term"
+        );
+    }
+
+    #[test]
     fn poll_deferred_input_clears_expired_hotplug_window() {
         let mut b = KmsBackendV2::for_tests();
         let mut state = ServerState::new();
+        b.hotplug_rescan_deadline =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+        b.poll_deferred_input(&mut state);
+        assert!(
+            b.hotplug_rescan_deadline.is_none(),
+            "an elapsed hotplug rescan deadline must be cleared so the loop can idle",
+        );
         // Elapsed window → cleared, so next_wakeup can fall back to None (idle).
         b.libinput_hotplug_retry_until =
             Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
@@ -16033,6 +16205,30 @@ mod tests {
             b.libinput_hotplug_retry_until.is_some(),
             "an unexpired retry window must stay armed until it elapses",
         );
+    }
+
+    #[test]
+    fn randr_ids_are_stable_across_drop() {
+        let mut alloc = RandrIdAllocator::default();
+        let a = alloc.ids_for("DP-1");
+        let b = alloc.ids_for("HDMI-A-1");
+        assert_ne!(a.output_id, b.output_id);
+        let a2 = alloc.ids_for("DP-1");
+        assert_eq!(a, a2, "a surviving/returning connector keeps its IDs");
+        let c = alloc.ids_for("DP-2");
+        assert_ne!(c.output_id, a.output_id);
+        assert_ne!(c.output_id, b.output_id);
+        assert_ne!(c.crtc_id, a.crtc_id);
+    }
+
+    #[test]
+    fn randr_mode_ids_dedup_by_resolution() {
+        let mut alloc = RandrIdAllocator::default();
+        let m1 = alloc.mode_id(2560, 1440, 60);
+        let m2 = alloc.mode_id(2560, 1440, 60);
+        let m3 = alloc.mode_id(1920, 1080, 60);
+        assert_eq!(m1, m2);
+        assert_ne!(m1, m3);
     }
 
     /// Spec: "boots far enough to service GetGeometry / InternAtom".
