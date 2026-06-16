@@ -4796,12 +4796,32 @@ impl KmsBackendV2 {
             }
         }
 
-        // 2b. DPMS: requery_outputs_and_modeset just re-lit every
-        //     output, so reconcile the backend cache. state.dpms.power_level
-        //     was reset to On in run_suspend; this brings the binary
-        //     cache into agreement so a later DPMS Off request actually
-        //     fires the modeset commit instead of no-opping through the
-        //     same-binary-state guard.
+        // 2a. Re-light every live output. `requery_outputs_and_modeset`
+        //     only re-commits modeset on NEWLY-added connectors (so the
+        //     hotplug path doesn't flicker already-lit survivors); on a
+        //     VT/seat resume the kernel dropped the mode when another VT
+        //     took DRM master, so the surviving CRTCs are dark until we
+        //     re-commit. The steady-state flip path (`submit_flip`) only
+        //     sets FB_ID — it can't re-establish the mode. Drive the same
+        //     re-light the DPMS-on path uses; it's a no-op-cost full
+        //     modeset on outputs that are already active.
+        //     `dpms_set_outputs_active` attempts every output and returns
+        //     the FIRST per-output failure after trying the rest, so a
+        //     single connector that won't re-light must NOT tear down the
+        //     session when the others came back. Card-gone is already
+        //     caught above by the requery step (`discover_outputs` fails →
+        //     we exit there), so a failure here is per-output: log it and
+        //     let the next composite retry, matching how the DPMS-on path
+        //     (`set_dpms_power`) handles the same call.
+        if let Err(e) = self.platform.dpms_set_outputs_active(true) {
+            log::warn!("kms: resume: re-light modeset failed for an output: {e}; continuing");
+        }
+
+        // 2b. DPMS: every output was just re-lit, so reconcile the backend
+        //     cache. state.dpms.power_level was reset to On in run_suspend;
+        //     this brings the binary cache into agreement so a later DPMS
+        //     Off request actually fires the modeset commit instead of
+        //     no-opping through the same-binary-state guard.
         self.kms_outputs_active = true;
 
         // 3. Re-arm the hardware cursor plane. Use the current cursor
