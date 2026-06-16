@@ -8903,18 +8903,16 @@ impl Backend for KmsBackendV2 {
         // queue, so running it every iteration costs nothing at idle.
         self.engine.poll_retired(&self.platform);
         self.poll_pending_retire_with_invalidate();
-        // Diagnostic: publish the `submitted`-queue depth and drive the
-        // 1Hz telemetry emit from here too. maybe_emit() self-gates to 1Hz
-        // and is a no-op below threshold, but running it every dispatch
-        // iteration means the `v2_telemetry:` line (and the submit-trace
-        // flush) keep ticking even while the display is dark — exactly
-        // when `submitted_queue_depth` is the number worth watching
-        // (project_reclamation_starvation_leak). Without this, the only
-        // other maybe_emit caller is on the compose path, which is gated
-        // off when dark, so telemetry went silent in the leak window.
-        self.telemetry
-            .record_submitted_depth(self.engine.pending_count());
-        self.telemetry.maybe_emit();
+        // Diagnostic: drive the 1Hz telemetry emit from here too,
+        // publishing the live `submitted`-queue depth. maybe_emit()
+        // self-gates to 1Hz and is a no-op below threshold, but running
+        // it every dispatch iteration means the `v2_telemetry:` line (and
+        // the submit-trace flush) keep ticking even while the display is
+        // dark — exactly when `submitted_queue_depth` is the number worth
+        // watching (project_reclamation_starvation_leak). Without this,
+        // the only other maybe_emit caller is on the compose path, which
+        // is gated off when dark, so telemetry went silent in the window.
+        self.telemetry.maybe_emit(self.engine.pending_count());
     }
 
     fn mark_dirty(&mut self) {
@@ -9127,7 +9125,7 @@ impl Backend for KmsBackendV2 {
         // Phase B.1 Task 21: drain frame-builder close events into telemetry.
         self.drain_frame_builder_telemetry();
         // Per-second telemetry summary emission.
-        self.telemetry.maybe_emit();
+        self.telemetry.maybe_emit(self.engine.pending_count());
         result
     }
 

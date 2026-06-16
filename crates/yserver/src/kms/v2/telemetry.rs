@@ -191,15 +191,6 @@ pub struct Telemetry {
     /// current value, so paint events recorded between ticks
     /// share the surrounding tick's id.
     frame_id: u64,
-    /// Instantaneous gauge (not a per-second rate): depth of the
-    /// engine's `submitted` queue at the last `maybe_emit`. This is
-    /// the reclamation-starvation leak gauge — it climbs without
-    /// bound on a build that drains `submitted` only on page-flip
-    /// once the display goes dark while clients keep drawing
-    /// (project_reclamation_starvation_leak). With the `before_block`
-    /// reclaim drive it stays flat. Set via `record_submitted_depth`
-    /// right before each emit.
-    submitted_depth: usize,
 }
 
 impl Telemetry {
@@ -223,17 +214,7 @@ impl Telemetry {
             lifetime: Bucket::default(),
             submit_trace: SubmitTrace::from_env(),
             frame_id: 0,
-            submitted_depth: 0,
         }
-    }
-
-    /// Record the engine `submitted`-queue depth (an instantaneous
-    /// gauge) so the next `v2_telemetry:` line reports it. Called from
-    /// `before_block`, i.e. every dispatch iteration — including while
-    /// the display is dark — so the leak gauge stays observable when
-    /// no page-flips occur. project_reclamation_starvation_leak.
-    pub(crate) fn record_submitted_depth(&mut self, depth: usize) {
-        self.submitted_depth = depth;
     }
 
     /// Stage 5 Task 3 diagnostic: log one submit event to the
@@ -273,7 +254,15 @@ impl Telemetry {
     /// hard reboot) to ≤ 1s and lets `tail -f` work during a live
     /// capture. The cost is one `write(2)` syscall per second when
     /// tracing — negligible.
-    pub(crate) fn maybe_emit(&mut self) {
+    /// `submitted_depth` is the engine's `submitted`-queue depth at
+    /// call time (an instantaneous gauge, not a per-second rate),
+    /// passed in by every caller so it can't go stale or be forgotten:
+    /// it's the reclamation-starvation leak gauge, which climbs without
+    /// bound on a build that drains `submitted` only on page-flip once
+    /// the display goes dark while clients keep drawing, and stays flat
+    /// with the `before_block` reclaim drive
+    /// (project_reclamation_starvation_leak).
+    pub(crate) fn maybe_emit(&mut self, submitted_depth: usize) {
         let now = Instant::now();
         let dt = now.duration_since(self.last_emit);
         if dt < std::time::Duration::from_secs(1) {
@@ -380,7 +369,7 @@ impl Telemetry {
             self.lifetime.active_scratch_bytes_high_water,
             b.cursor_move_ebusy,
             self.lifetime.cursor_move_ebusy,
-            self.submitted_depth,
+            submitted_depth,
         );
         #[allow(clippy::cast_precision_loss)]
         let fb_ops_avg =
@@ -918,7 +907,7 @@ mod tests {
         // (logging is suppressed when env var unset, but bucket
         // reset still happens).
         t.enabled = true;
-        t.maybe_emit();
+        t.maybe_emit(0);
         assert_eq!(t.bucket.paint_submits, 0);
         assert_eq!(t.bucket.compose_cb_record_ns, 0);
         // Lifetime preserved.

@@ -1571,10 +1571,11 @@ mod tests {
         // No PageFlipReady — only a Shutdown. The loop must still run at
         // least one iteration, calling before_block before it blocks.
         sender.send(Message::Shutdown).unwrap();
-        for _ in 0..50 {
-            if handle.is_finished() {
-                break;
-            }
+        // Generous deadline so a slow/loaded CI box can't spuriously fail:
+        // the loop breaks the instant the thread finishes, so this only
+        // bounds the pathological-hang case.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !handle.is_finished() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(handle.is_finished(), "run_core did not return");
