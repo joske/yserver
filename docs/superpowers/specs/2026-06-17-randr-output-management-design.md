@@ -23,6 +23,8 @@ Key rules:
 - **`RRSetCrtcConfig` is synchronous**: validate → DDX modeset → reply `status` (`RRSetConfigSuccess`/`RRSetConfigFailed`) → fire notifies (`rrcrtc.c:1291–1502`, notify via `RRTellChanged`).
 - **"Off" = `mode=None, outputs=[]`** on a still-connected output (how MATE disables the laptop panel when docked) — distinct from disconnected.
 - **Mode lists**: `GetOutputInfo` returns the output's full mode list, preferred modes first, with `nPreferred` (`rroutput.c:461–593`). `GetScreenResources` returns the deduped union of all outputs' modes (`rrscreen.c:482–638`, `rrmode.c`). CRTC/output arrays are the full set regardless of connection.
+- **`GetScreenResources` forces a re-probe; `GetScreenResourcesCurrent` is cached.** `GetScreenResources` calls `RRGetInfo(force_query=TRUE)` to re-query the driver before replying and bumps `lastConfigTime`; `GetScreenResourcesCurrent` returns the cached view (`rrscreen.c:482`, `rrinfo.c:173`). They are NOT interchangeable.
+- **`RRSetScreenSize` does more than resize.** `RRScreenSizeSet` emits a root `ConfigureNotify`, fires `RRScreenChangeNotify`, bumps the changed/config timestamps via `RRTellChanged`, and re-fixes pointer bounds (`RRPointerScreenConfigured` / `ScreenRestructured`) (`rrscreen.c:136,152,167`).
 
 ## Architecture & layering
 
@@ -47,6 +49,7 @@ Xorg separates outputs (which may have `crtc=None`) from CRTCs. yserver runs str
 - `drm::modeset::Output`: add `modes: Vec<Mode>` — the connector's full local mode list (already computed as `local_modes` in `discover_outputs`, currently discarded), preferred-first. `picked` stays as the boot default.
 - `RandrOutput` (core): add `mode_ids: Vec<u32>` (available, preferred-first) and `num_preferred: u16`; `mode_id` becomes the *current* mode (0 = off); keep `connected`, `crtc_id`, `x`, `y`. State derives: `connected=false` ⇒ disconnected; `connected=true, mode_id=0` ⇒ off; else enabled.
 - `RandrState`: `screen_width`/`screen_height` become the **logical** screen size — set by `RRSetScreenSize`, defaulting to the auto bounding box at boot and after hotplug. Mode list (`modes`) becomes the deduped union of all registry connectors' mode lists.
+- **Bounding-box math must be 2-D.** `RandrState::from_outputs` currently computes `screen_height = max(height)` (`randr.rs:67`) and `recompute_fb_extent_from` ignores `y` (`platform.rs`); `recompact_horizontal_layout` forces `y=0`. With client-driven layout a CRTC can sit at any `(x,y)` (vertical stacking — external monitor above the laptop is common), so both must become `screen_width = max(x+width)`, `screen_height = max(y+height)`. `recompact_horizontal_layout` is the **boot/default** extend-right helper only; once a client drives layout, positions come verbatim from `SetCrtcConfig`. (The compose path is already 2-D correct — it offsets each output by `-layout.x/-layout.y` before sampling, `scene.rs:1903` + `composite.vert.glsl:35` — so only the extent/backing math needs the fix.)
 - Connector registry struct (in `yserver` backend; the core sees only the resulting `Vec<RandrOutput>` via `randr_outputs()`): name → { ids, modes, connection, current config }.
 
 ## Request handlers (`process_request`, core)
@@ -54,7 +57,9 @@ Xorg separates outputs (which may have `crtc=None`) from CRTCs. yserver runs str
 - **`GetScreenResources` / `GetScreenResourcesCurrent`**: emit the deduped union mode list; all crtcs/outputs from the registry.
 - **`GetOutputInfo`**: full mode-id list preferred-first + `nPreferred`; `crtc = 0` when off; `connection` from registry; possible-crtcs = the single stable crtc id (1:1).
 - **`GetCrtcInfo`**: enabled ⇒ `x,y,mode,width,height` + the one output; off ⇒ `x=y=w=h=0, mode=0`.
-- **`RRSetScreenSize`**: validate width/height against `screen_size_range`; **reject `BadMatch` if it would crop any enabled output** (`x+w` / `y+h` beyond new size); reject `BadValue` for zero mm; call backend `set_logical_screen_size(w,h)`; on success update `RandrState` logical size + root/overlay window records; fire `ScreenChangeNotify`.
+- **`GetScreenResources`** forces a connector re-probe via a new backend hook `reprobe_connectors()` (updates the registry + bumps `config_timestamp` on change) before building the reply; **`GetScreenResourcesCurrent`** uses the cached registry snapshot. (yserver's udev hotplug normally keeps the registry fresh, but matching the force-probe covers a missed uevent and the timestamp contract.)
+- **`GetMonitors` (RANDR 1.5) / XINERAMA** (`active_monitors`, `process_request.rs:2085/2341`): build the active monitor list from **enabled** outputs only — each enabled output is one monitor at its client-set `(x,y,width,height)`; off and disconnected outputs (zero area) are **excluded** (Xorg `RRMonitorMakeList(get_active)` filters zero-area, `rrmonitor.c:309,578`). Honor the request's `get_active` flag. This is what MATE/marco read for per-monitor window placement, maximize, and panel geometry, so it must track the client-set layout, not the raw output records.
+- **`RRSetScreenSize`**: validate width/height against `screen_size_range` (`BadValue` out of range); **reject `BadMatch` if it would crop any enabled output** (`x+w` / `y+h` beyond new size, `rrscreen.c:266`); `BadValue` for zero physical mm; call backend `set_logical_screen_size(w,h)`; on success, matching `RRScreenSizeSet`: update `RandrState` logical size + root/overlay records, **emit a root `ConfigureNotify`** to `StructureNotify` selectors, fire `ScreenChangeNotify`, bump changed/config timestamps, and **re-clamp the pointer into the new bounds** (cursor warps in if the screen shrank). Reuse the existing `handle_host_container_resize` machinery, which already emits the root `ConfigureNotify` + RANDR fanout for the ynest resize path.
 - **`RRSetCrtcConfig`**: replace the no-op. Validation order matching `rrcrtc.c`:
   1. `mode == None` ⇒ `numOutputs == 0` else `BadMatch`; `mode != None` ⇒ `numOutputs >= 1` else `BadMatch`.
   2. output(s) resolve to known connectors; the addressed crtc is the output's crtc (1:1) else `BadMatch`.
@@ -69,6 +74,7 @@ Xorg separates outputs (which may have `crtc=None`) from CRTCs. yserver runs str
   - `mode = None` (disable): `disable_output` on its CRTC; free/disarm its scanout pool; remove from `platform.outputs` (+ scene state) via the wait_idle+drain+rebuild path; registry → Off. Keeps the connector known.
   - `mode = Some` (enable/change): map `ModeSpec` → the connector's DRM mode; if not currently enabled or the resolution changed, (re)allocate the scanout pool at the new size; `commit_modeset` at the mode; set `OutputLayout` `{x,y,width,height}`; add to / update `platform.outputs`; scene rebuild. Registry → Enabled.
 - `set_logical_screen_size(&mut self, w: u16, h: u16) -> io::Result<()>` — reallocate root + COW backing storage to `w×h`; update `platform.fb_w/fb_h` (pointer clamp + logical extent follow). (Root/COW storage currently allocated once at `fb_w×fb_h`; this is its resize path.)
+- `reprobe_connectors(&mut self) -> io::Result<()>` — re-run `discover_outputs` and reconcile the registry (connection state + mode lists), without changing any enabled output's config. Called by the `GetScreenResources` (force-query) handler. Idempotent; reuses the hotplug rescan's discover/diff logic minus the auto-enable.
 
 `ModeSpec` carries the resolved `(width, height, vrefresh)` so the backend can find the exact DRM mode without a core→DRM type leak.
 
@@ -104,6 +110,9 @@ A `RRSetConfigFailed` (or screen-resize alloc failure) must leave the server in 
 - `SetScreenSize` crop-rejection (`BadMatch`) and range (`BadValue`).
 - registry transitions: connected→enabled→off→disconnected, and that off/disconnected stay queryable (`crtc=0,mode=0`), primary stays on an enabled output, no phantom 0-modes.
 - `RandrState` rebuild from a registry with mixed states yields correct `screen_resources` / `output_info` / `crtc_info`.
+- 2-D bounding box: an output at `(0, 1080)` (stacked below) yields `screen_height = 1080 + its height`, not `max(height)`.
+- XINERAMA/`GetMonitors`: off and disconnected outputs are absent from the active monitor list; enabled outputs appear at their client-set `(x,y,w,h)`.
+- `GetScreenResources` bumps `config_timestamp` after a reprobe that changed connection state; `GetScreenResourcesCurrent` does not reprobe.
 
 **Backend (DRM/Vk)** — HW-only; covered by the acceptance gate.
 
@@ -116,9 +125,9 @@ A `RRSetConfigFailed` (or screen-resize alloc failure) must leave the server in 
 
 ## Implementation phasing (for the plan; lands as one stacked set on `feat/drm-hotplug`)
 
-1. `Output.modes` + connector registry + `randr_outputs()` rebuild from registry (full mode list, preferred-first).
-2. `GetScreenResources`/`GetOutputInfo`/`GetCrtcInfo` advertise full modes + correct off/disconnected reporting.
-3. `set_logical_screen_size` backend method + `RRSetScreenSize` handler (with crop check).
+1. `Output.modes` + connector registry + `randr_outputs()` rebuild from registry (full mode list, preferred-first); fix the 2-D bounding-box math (`max(y+height)`).
+2. `GetScreenResources` (force re-probe via `reprobe_connectors`) vs `GetScreenResourcesCurrent` (cached) + `GetOutputInfo`/`GetCrtcInfo` full modes + correct off/disconnected reporting; `GetMonitors`/XINERAMA from enabled outputs only.
+3. `set_logical_screen_size` backend method + `RRSetScreenSize` handler (crop check + root `ConfigureNotify` + pointer re-clamp + timestamps, via the `handle_host_container_resize` machinery).
 4. `apply_crtc_config` backend method + `RRSetCrtcConfig` handler (validation matrix + enable/disable/mode-change).
 5. Revise hotplug add-path to off-until-configured.
 6. HW acceptance on fuji.
