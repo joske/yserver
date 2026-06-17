@@ -20892,17 +20892,15 @@ fn handle_alloc_named_color(
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let name = x11::alloc_named_color_name(body);
-    let color = x11::lookup_color_name(&name).unwrap_or_else(|| {
+    let Some(color) = x11::lookup_color_name(&name) else {
+        // Unknown color name → BadName (Xorg), not a silent gray
+        // fallback that hands the client the wrong pixel.
         debug!(
-            "client {} #{} AllocNamedColor unknown name {:?} -> fallback gray",
+            "client {} #{} AllocNamedColor unknown name {:?} -> BadName",
             client_id.0, sequence.0, name
         );
-        x11::Rgb16 {
-            red: 0xc0c0,
-            green: 0xc0c0,
-            blue: 0xc0c0,
-        }
-    });
+        return emit_x11_error(state, client_id, sequence, x11::error::BAD_NAME, 0, 85);
+    };
     debug!(
         "client {} #{} AllocNamedColor {:?}",
         client_id.0, sequence.0, name
@@ -20945,17 +20943,14 @@ fn handle_lookup_color(
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let name = x11::alloc_named_color_name(body);
-    let color = x11::lookup_color_name(&name).unwrap_or_else(|| {
+    let Some(color) = x11::lookup_color_name(&name) else {
+        // Unknown color name → BadName (Xorg), not a silent gray fallback.
         debug!(
-            "client {} #{} LookupColor unknown name {:?} -> fallback gray",
+            "client {} #{} LookupColor unknown name {:?} -> BadName",
             client_id.0, sequence.0, name
         );
-        x11::Rgb16 {
-            red: 0xc0c0,
-            green: 0xc0c0,
-            blue: 0xc0c0,
-        }
-    });
+        return emit_x11_error(state, client_id, sequence, x11::error::BAD_NAME, 0, 92);
+    };
     debug!(
         "client {} #{} LookupColor {:?}",
         client_id.0, sequence.0, name
@@ -22287,10 +22282,17 @@ fn handle_query_font(
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     debug!("client {} #{} QueryFont", client_id.0, sequence.0);
-    let metrics = x11::drawable_request_id(body)
+    let font_id = x11::drawable_request_id(body);
+    let Some(metrics) = font_id
         .and_then(|id| state.resources.fontable(id))
         .map(|font| font.metrics.clone())
-        .unwrap_or_default();
+    else {
+        // Unknown/invalid fontable → BadFont (Xorg), not a zeroed
+        // metrics reply that misleads the client into thinking the
+        // font loaded.
+        let bad = font_id.map_or(0, |id| id.0);
+        return emit_x11_error(state, client_id, sequence, x11::error::BAD_FONT, bad, 47);
+    };
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
@@ -22308,14 +22310,18 @@ fn handle_query_text_extents(
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     debug!("client {} #{} QueryTextExtents", client_id.0, sequence.0);
-    let extents = x11::query_text_extents_request(header.data, body)
-        .and_then(|req| {
-            state
-                .resources
-                .fontable(req.fontable)
-                .map(|font| font.metrics.text_extents(&req.chars))
-        })
-        .unwrap_or_default();
+    let req = x11::query_text_extents_request(header.data, body);
+    let extents = req.as_ref().and_then(|req| {
+        state
+            .resources
+            .fontable(req.fontable)
+            .map(|font| font.metrics.text_extents(&req.chars))
+    });
+    let Some(extents) = extents else {
+        // Unknown/invalid fontable → BadFont (Xorg), not zeroed extents.
+        let bad = req.map_or(0, |r| r.fontable.0);
+        return emit_x11_error(state, client_id, sequence, x11::error::BAD_FONT, bad, 48);
+    };
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
@@ -24069,6 +24075,127 @@ mod tests {
         let buf = &bytes[..32];
         assert_eq!(buf[1], x11::error::BAD_DRAWABLE);
         assert_eq!(buf[10], 70);
+    }
+
+    #[test]
+    fn query_font_invalid_fontable_returns_bad_font() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // QueryFont (op 47) body = FONTABLE(4). 0xdeadbeef is unregistered.
+        let body = 0xdead_beefu32.to_le_bytes();
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 47,
+                data: 0,
+                length_units: 2,
+            },
+            &body,
+            None,
+        )
+        .expect("process_request");
+        let bytes = read_all_available(&mut peer);
+        assert!(bytes.len() >= 32, "expected error reply, got {bytes:02x?}");
+        assert_eq!(bytes[1], x11::error::BAD_FONT, "code");
+        assert_eq!(bytes[10], 47, "major opcode");
+        assert_eq!(&bytes[4..8], &0xdead_beefu32.to_le_bytes(), "bad font id");
+    }
+
+    #[test]
+    fn query_text_extents_invalid_fontable_returns_bad_font() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // QueryTextExtents (op 48) body = FONTABLE(4) + STRING16 (zero chars).
+        let body = 0xdead_beefu32.to_le_bytes();
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 48,
+                data: 0,
+                length_units: 2,
+            },
+            &body,
+            None,
+        )
+        .expect("process_request");
+        let bytes = read_all_available(&mut peer);
+        assert!(bytes.len() >= 32, "expected error reply, got {bytes:02x?}");
+        assert_eq!(bytes[1], x11::error::BAD_FONT, "code");
+        assert_eq!(bytes[10], 48, "major opcode");
+        assert_eq!(
+            &bytes[4..8],
+            &0xdead_beefu32.to_le_bytes(),
+            "bad fontable id"
+        );
+    }
+
+    fn named_color_body(name: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x2000_0001u32.to_le_bytes()); // cmap
+        body.extend_from_slice(&u16::try_from(name.len()).unwrap().to_le_bytes());
+        body.extend_from_slice(&[0, 0]); // pad
+        body.extend_from_slice(name);
+        body
+    }
+
+    #[test]
+    fn alloc_named_color_unknown_name_returns_bad_name() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let body = named_color_body(b"definitelynotacolor");
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 85,
+                data: 0,
+                length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .expect("process_request");
+        let bytes = read_all_available(&mut peer);
+        assert!(bytes.len() >= 32, "expected error reply, got {bytes:02x?}");
+        assert_eq!(bytes[1], x11::error::BAD_NAME, "code");
+        assert_eq!(bytes[10], 85, "major opcode");
+    }
+
+    #[test]
+    fn lookup_color_unknown_name_returns_bad_name() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let body = named_color_body(b"definitelynotacolor");
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 92,
+                data: 0,
+                length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .expect("process_request");
+        let bytes = read_all_available(&mut peer);
+        assert!(bytes.len() >= 32, "expected error reply, got {bytes:02x?}");
+        assert_eq!(bytes[1], x11::error::BAD_NAME, "code");
+        assert_eq!(bytes[10], 92, "major opcode");
     }
 
     #[test]

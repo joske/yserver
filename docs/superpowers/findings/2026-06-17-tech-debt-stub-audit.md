@@ -34,11 +34,11 @@ Capabilities announced in version/extension replies but not implemented:
 
 - [ ] **GrabServer / UngrabServer** (core 36/37) — `process_request.rs:202–203`, pure no-ops, **zero backing state** (no `server_grab` anywhere). Test asserts it does nothing (`grab_server_is_log_only_no_op:27769`). WM/toolkit server-grab atomicity (menu grabs, screensaver) silently broken. Highest-impact *core* gap.
 - [ ] **XKB read-only façade** (`kms/xkb.rs`) — every `Set*` (SetMap `:15896→None`, SetControls/SetNames/SetCompatMap/indicators) silently swallowed; `GetState` (`xkb.rs:786`) all-zero; `GetMap` (`xkb.rs:301`) drops AltGr/secondary groups; `GetNames` (`xkb.rs:651`) hardcoded "evdev+aliases(qwerty)" not RMLVO-derived. Client keyboard reconfig = success-shaped silence.
-- [ ] **QueryFont / QueryTextExtents** (core 47/48) — `process_request.rs:22283/22303`. Invalid font → `unwrap_or_default()` zeroed reply instead of `BadFont`.
+- [x] **QueryFont / QueryTextExtents** (core 47/48) — FIXED: invalid fontable now → `BadFont` (was `unwrap_or_default()` zeroed reply). Tests `query_font_invalid_fontable_returns_bad_font`, `query_text_extents_invalid_fontable_returns_bad_font`.
 - [ ] **SYNC Await / AwaitFence** (`:2947`/`:3144`) — counters/alarms/fences work, but blocking-await never suspends the client stream (self-described "known gap" `:3179`).
 - [ ] **XTEST CompareCursor** always `same=true` (`:5934`); **GrabControl** no-op (`:5964`).
 - [ ] **RecolorCursor** (core 96) — `process_request.rs:204`, accepted-and-dropped no-op.
-- [ ] **AllocNamedColor / LookupColor** (core 85/92) — unknown name → hardcoded gray `0xc0c0` (`:20900/:20953`) instead of `BadName`.
+- [x] **AllocNamedColor / LookupColor** (core 85/92) — FIXED: unknown name now → `BadName` (was hardcoded gray `0xc0c0`). Tests `alloc_named_color_unknown_name_returns_bad_name`, `lookup_color_unknown_name_returns_bad_name`.
 
 ## Tier 4 — Faked / partial data (works enough today, fidelity invented)
 
@@ -68,7 +68,7 @@ Capabilities announced in version/extension replies but not implemented:
 
 ## Verify — possible live regression
 
-- [ ] **XC-MISC namespace coverage** — agent found `server.rs:1429`'s XID-occupancy checker covers **10** namespaces, but memory `project_xcmisc_xid_exhaustion` records a **17-namespace** checker (fix #17). If a XID-allocating namespace was dropped, `GetXIDRange` could hand out an in-use XID — the exact bug #17 closed. **Check whether namespaces were lost.**
+- [x] **XC-MISC namespace coverage** — VERIFIED CLEAN, false alarm. `xid_occupied` (`server.rs:1429`) covers 17 namespaces = 8 ResourceTables inside `resources.xid_in_use()` (`resources.rs:343`) + 9 explicit extension maps. The agent counted the 10 call-lines, missing that `xid_in_use` covers 8. Cross-checked every `HashMap<u32,_>` field in `ServerState`: the other u32 maps (`clients`, `idletime_last_evaluated`, `client_wm_class`, `close_down_modes`, `zombie_clients`) are keyed by client-id / system-counter, NOT allocatable XIDs → correctly excluded. Guarded by `xid_occupied_covers_every_namespace` test (`server.rs:4832`). No regression.
 
 ## Clean (no stubs found)
 
