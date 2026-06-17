@@ -14014,22 +14014,35 @@ fn handle_xi2_request(
             buf.extend_from_slice(&reply);
         }
         50 => {
-            // TODO(unimplemented): XIGetFocus is NOT actually implemented.
-            // This BadImplementation is a STOPGAP to stop the client
-            // hanging on a reply that never comes (the silent `Handled`
-            // below). It is NOT protocol-correct: Xorg returns the real
-            // per-device focus window, and the focus state already exists
-            // here (see GetDeviceFocus / XI1 minor 20). Replace with a real
-            // XIGetFocusReply.
-            return emit_x11_error_with_minor(
-                state,
-                client_id,
-                sequence,
-                x11::error::BAD_IMPLEMENTATION,
-                0,
-                50,
-                XI2_MAJOR_OPCODE,
+            // XIGetFocus { deviceid:CARD16 } -> xXIGetFocusReply
+            // { focus:WINDOW @8, 20 bytes pad }. Returns the raw stored
+            // per-device focus (None=0 / PointerRoot=1 / window), the same
+            // source XI1 GetDeviceFocus (minor 20) reads; Xorg
+            // (Xi/xifocus.c) doesn't resolve the sentinel here either.
+            let dev = if body.len() >= 2 {
+                u16::from_le_bytes([body[0], body[1]])
+            } else {
+                0
+            };
+            if !xi1_device_valid(dev) {
+                return xi1_error(
+                    state,
+                    client_id,
+                    sequence,
+                    XI1_ERROR_BAD_DEVICE,
+                    u32::from(dev),
+                    minor,
+                );
+            }
+            let f = crate::core_loop::xi1_focus::device_focus(state, dev);
+            let mut reply = x11::fixed_reply(byte_order, sequence, 0, 0);
+            x11::write_u32(byte_order, &mut reply, f.focus); // bytes 8-11
+            reply.extend_from_slice(&[0u8; 20]); // bytes 12-31 pad
+            debug!(
+                "client {} #{} XIGetFocus device={dev} -> focus=0x{:x}",
+                client_id.0, sequence.0, f.focus
             );
+            buf.extend_from_slice(&reply);
         }
         _ => {
             debug!(
@@ -24239,12 +24252,21 @@ mod tests {
     }
 
     #[test]
-    fn xi_get_focus_unimplemented_returns_error_not_hang() {
+    fn xi_get_focus_returns_real_focus_window() {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
-        // XIGetFocus (XI2 minor 50) is reply-bearing but unimplemented;
-        // it must return an X error, not silently drop the reply (hang).
+        // Master keyboard (device 3) focused on a real window.
+        let win = 0x4000_0005u32;
+        state.xi1_device_focus.insert(
+            3,
+            crate::server::Xi1DeviceFocus {
+                focus: win,
+                revert_to: 0,
+                time: 0,
+            },
+        );
+        // XIGetFocus { deviceid:CARD16=3 } + pad.
         let header = RequestHeader {
             opcode: 137,
             data: 50,
@@ -24257,18 +24279,45 @@ mod tests {
             ClientId(1),
             SequenceNumber(1),
             header,
-            &[0u8; 4],
+            &[3u8, 0, 0, 0],
         )
         .expect("process");
         let bytes = read_all_available(&mut peer);
-        assert!(
-            bytes.len() >= 32,
-            "expected error reply, not a hang: {bytes:02x?}"
+        assert_eq!(
+            bytes.len(),
+            32,
+            "XIGetFocus reply is 32 bytes: {bytes:02x?}"
         );
+        assert_eq!(bytes[0], 1, "X_Reply");
+        assert_eq!(&bytes[8..12], &win.to_le_bytes(), "focus window @ byte 8");
+    }
+
+    #[test]
+    fn xi_get_focus_invalid_device_returns_bad_device() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // deviceid 0 = XIAllDevices: not a specific device → BadDevice.
+        let header = RequestHeader {
+            opcode: 137,
+            data: 50,
+            length_units: 2,
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &[0u8, 0, 0, 0],
+        )
+        .expect("process");
+        let bytes = read_all_available(&mut peer);
+        assert!(bytes.len() >= 32, "expected error reply: {bytes:02x?}");
         assert_eq!(bytes[0], 0, "error packet");
-        assert_eq!(bytes[1], x11::error::BAD_IMPLEMENTATION, "code");
-        assert_eq!(&bytes[8..10], &50u16.to_le_bytes(), "minor");
-        assert_eq!(bytes[10], 137, "major = XInput");
+        assert_eq!(bytes[1], XI1_ERROR_BAD_DEVICE, "BadDevice");
+        assert_eq!(&bytes[8..10], &50u16.to_le_bytes(), "minor echoed");
     }
 
     fn randr_unimplemented_reply_bearing(minor: u8) -> Vec<u8> {

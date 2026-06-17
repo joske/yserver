@@ -18,11 +18,11 @@ Highest impact: the client blocks forever, not just gets a wrong answer. Root ca
 
 **HANG fixed (stopgap), FEATURE still unimplemented.** These now return `BadImplementation` instead of hanging — but that is NOT protocol-correct (Xorg implements all of them and returns real data). Each site is marked `TODO(unimplemented)` in code so a future pass can grep them and replace the stopgap with a real implementation. Don't mistake the error reply for done.
 
-- [x] **XI2 XIGetFocus** (minor 50) — hang→`BadImplementation` stopgap + `TODO(unimplemented)`. Test `xi_get_focus_unimplemented_returns_error_not_hang`. *(Feasible to implement for real: focus state exists, see GetDeviceFocus.)*
+- [x] **XI2 XIGetFocus** (minor 50) — **REAL implementation** (upgraded from stopgap): returns the real per-device focus window, plus `BadDevice` for an invalid device, reusing XI1 GetDeviceFocus's focus state. No longer a `TODO`. Tests `xi_get_focus_returns_real_focus_window`, `xi_get_focus_invalid_device_returns_bad_device`.
 - [x] **RANDR CreateMode** (minor 16) — hang→`BadImplementation` stopgap + `TODO(unimplemented)`. Test `randr_create_mode_unimplemented_returns_error_not_hang`.
 - [x] **RANDR CreateLease** (minor 45) — hang→`BadImplementation` stopgap + `TODO(unimplemented)`. Test `randr_create_lease_unimplemented_returns_error_not_hang`.
 - [x] **RANDR SetPanning** (minor 29) — hang→`BadImplementation` stopgap + `TODO(unimplemented)` (sibling reply-bearing hang the audit missed). Test `randr_set_panning_unimplemented_returns_error_not_hang`.
-- [ ] **Real implementations** (the actual features behind the stopgaps): XIGetFocus reply, RRCreateMode (custom modes), RRSetPanning (panning), RRCreateLease (DRM lease). Grep `TODO(unimplemented)`.
+- [ ] **Real implementations** still owed for the remaining stopgaps: RRCreateMode (custom modes), RRSetPanning (panning), RRCreateLease (DRM lease). Grep `TODO(unimplemented)`. *(XIGetFocus now done for real — see above.)*
 - [x] **Fix approach (decided): SURGICAL, not blanket.** Added explicit arms only for *reply-bearing* unimplemented requests (the hang class). VOID unimplemented requests stay silently accepted via the catch-all — Xorg implements those as success, so erroring them would introduce a NEW Xorg-divergence (vs. the "any divergence is our bug" rule); a missing *reply* is the only client-hanging case. RANDR provider-property reply-bearing requests are unreachable (`GetProviders` returns 0 providers) so left to the catch-all.
 
 ## Tier 2 — Advertised but can't deliver (cardinal "no protocol stubs" sin)
