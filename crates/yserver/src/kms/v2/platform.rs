@@ -2790,13 +2790,18 @@ impl PlatformBackend {
                 // not re-modeset a surviving (enabled) output, so its
                 // current mode — which may be a client `RRSetCrtcConfig`
                 // mode, NOT the connector's preferred — must survive.
-                // `discover_outputs` always sets `picked` to the preferred
-                // mode, so taking it wholesale would silently reset an
-                // enabled output's mode in the platform metadata + RANDR
-                // state (and desync the fb extent from the live scanout).
-                // Refresh only the metadata that legitimately changes:
-                // advertised mode list, EDID dims, connector handles.
+                // `discover_outputs` always sets `picked`/`mode` to the
+                // preferred mode, so taking them wholesale would silently
+                // reset an enabled output's mode. Both representations must
+                // be preserved together: RANDR state reads `picked`, while
+                // the VT-resume re-light (`dpms_set_outputs_active` →
+                // `commit_modeset`) re-blobs `mode` (the DrmMode). Keeping
+                // only `picked` made state report e.g. 70 Hz while the
+                // hardware came back at the preferred 60 Hz. Refresh only
+                // the metadata that legitimately changes: advertised mode
+                // list, EDID dims, connector handles.
                 output.picked = layout.output.picked.clone();
+                output.mode = layout.output.mode; // DrmMode: Copy
                 layout.output = output;
                 // width/height already reflect the live mode — leave them.
             }
