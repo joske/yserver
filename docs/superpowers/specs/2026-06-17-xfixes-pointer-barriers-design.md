@@ -54,7 +54,7 @@ Invariants from Xorg: `event_id` starts at 1 and `release_event_id` at 0, so the
 - **Create:** XID supplied by the client (like Xorg). Reject if already in use (`state.xid_occupied(id)` → `BadAlloc`).
 - **Free:** on `DeletePointerBarrier` and on client disconnect — `pointer_barriers.retain(|_, b| b.owner != client_id)` added to `crates/yserver-core/src/core_loop/process_disconnect.rs` (beside the `xfixes_regions` sweep). On free, if the barrier is currently `hit`, synthesize a `BarrierLeave` with `XIBarrierPointerReleased` first (Xorg `BarrierFreeBarrier`).
 - **XID namespace registration (MANDATORY — XC-MISC time-bomb guard, see `project_xcmisc_missing_wm_death`):** add `pointer_barriers` to `xid_occupied` (`server.rs:1429`), `used_xids_in` (`server.rs:1444`), and extend the `xid_occupied_covers_every_namespace` test (`server.rs:4832`).
-- **Window destroy:** the barrier's `window` is a *reference* for screen selection + event routing, not an owner — the barrier is its own resource and is NOT freed when the window dies (matches Xorg; in practice the window is almost always the root, which never dies). Rule: on the window's destruction, if the barrier is currently `hit`, force a `BarrierLeave` (clear `hit`, bump `event_id`) so no client is stranded mid-sequence; the barrier itself persists until `DeletePointerBarrier` or owner disconnect. Event routing for an orphaned-window barrier falls back to the root (clients select barrier events on the root anyway).
+- **Window destroy:** the barrier's `window` is a *reference* for screen selection + event routing, not an owner — the barrier is its own resource and is NOT freed when the window dies (matches Xorg; in practice the window is almost always the root, which never dies). **Confinement is independent of the window** and keeps working. Event delivery mirrors Xorg `ProcessBarrierEvent` (`Xi/exevents.c:1724`): it does `dixLookupWindow(be->window)` and **returns on failure with NO root fallback** — so while the barrier's window is absent, `BarrierHit`/`BarrierLeave` events are simply **dropped** (not rerouted to root). The barrier itself persists until `DeletePointerBarrier` or owner disconnect. (Do not invent a forced-leave or root-fallback on window destroy — that would diverge from upstream.)
 - **Screen / RANDR geometry change:** barrier coordinates are absolute root coords and are not rescaled. After a geometry change a barrier may fall partly or wholly outside the new bounds — it simply stops being hit there (the segment-intersection test naturally returns no crossing). If the pointer was resting on a barrier that geometry-change moved out from under it, the next motion's hit-box test emits the `BarrierLeave`. No special rescale logic; document that barriers do not migrate with outputs.
 
 ## Wire protocol
@@ -96,7 +96,7 @@ A barrier must be axis-aligned: horizontal (`y1 == y2`) or vertical (`x1 == x2`)
 
 ### Events: XI_BarrierHit (25) / XI_BarrierLeave (26)
 
-`xXIBarrierEvent` (`XI2proto.h:1068`), a GenericEvent (type 35). 32-byte header + 32-byte tail:
+`xXIBarrierEvent` (`XI2proto.h:1068`), a GenericEvent (type 35): the 32-byte GenericEvent base + a **36-byte tail** = **68 bytes total** (the tail is 36, not 32, because `dx`/`dy` are `FP3232` = 8 bytes each):
 
 | off | field | notes |
 |----|-------|-------|
@@ -215,7 +215,9 @@ ynest: `warp_pointer_root` is a no-op (`trait_def.rs:1911`); the clamp only adju
 - **Hit:** in the constrain loop, build `xXIBarrierEvent` (evtype 25). `new_sequence = !barrier.hit`; `dtime = new_sequence ? 0 : now - last_timestamp`; `dx/dy = proposed - old` in FP3232; `root_x/root_y` patched with the final clamped position (FP1616). Deliver to clients selecting `XI_BarrierHit` on `barrier.window` for the master pointer.
 - **Leave:** when a hit barrier's final position leaves the hit box, evtype 26, then `event_id += 1`.
 - **XIBarrierReleasePointer:** for each `{deviceid, barrier, eventid}`: owner check (`BadAccess` otherwise); if `barrier.event_id == eventid` set `barrier.release_event_id = eventid`. Effect realized by the loop's short-circuit above.
-- **Grab semantics (Xorg `ProcessBarrierEvent` / `exevents.c`):** when the master pointer is actively grabbed, set the `XIBarrierDeviceIsGrabbed` flag (1<<1) in the emitted event, and route delivery on the **grabbed path** — i.e. the event goes to the grabbing client per the grab's XI2 mask, *not* a plain `xi2_masks[(window, device)]` window-mask match. yserver already tracks the active pointer grab + its XI2 mask in the fanout (the same machinery core button/motion events use for grab routing); reuse it so a grab-holding client (e.g. a WM mid-drag) still receives barrier events. Without this, clients that branch on the grab flag, or expect barrier events while grabbing, diverge from Xorg.
+- **Grab semantics (Xorg `ProcessBarrierEvent`, `Xi/exevents.c:1724-1744`):** two *separate* rules — do not conflate them:
+  1. **Flag:** whenever the master pointer is actively grabbed, set `XIBarrierDeviceIsGrabbed` (1<<1) in the emitted event — unconditionally, regardless of who holds the grab.
+  2. **Grabbed-path delivery (narrowly gated):** route via the grab (`DeliverGrabbedEvent`) **only when BOTH** `CLIENT_ID(barrier) == CLIENT_ID(grab)` (the barrier's creating client owns the grab) **AND** `grab.window == barrier.window`. Otherwise — including for *unrelated* grabs held by other clients — fall through to **normal** window-mask delivery (`xi2_masks[(barrier.window, device)]`), with the flag still set. A blanket "any grab → grabbed-path" rule is wrong: it would suppress/misroute barrier events whenever any client holds an unrelated pointer grab.
 
 ## Module / file plan
 
@@ -239,8 +241,8 @@ Per `feedback_vng_pass_not_hw_pass`: vng is the iteration signal; **bee multi-mo
 3. **Encode (unit):** `xXIBarrierEvent` byte layout asserted field-by-field against `XI2proto.h:1068`.
 4. **Validation (integration):** every error row above.
 5. **Release state machine (integration):** Hit → ReleasePointer(eventid) → cross succeeds → leave hit box → re-arms; stale eventid release is a no-op.
-6. **Lifetime:** disconnect frees barriers; free-while-hit synthesizes `BarrierLeave`+released flag; **window-destroy-while-hit** forces a `BarrierLeave` and the barrier survives; geometry-shrink makes an out-of-bounds barrier un-hittable; XID namespace test extended.
-7. **Grab flag:** a `BarrierHit` emitted while the master pointer is grabbed carries `XIBarrierDeviceIsGrabbed` and routes to the grabbing client.
+6. **Lifetime:** disconnect frees barriers; `DeletePointerBarrier`-while-hit synthesizes `BarrierLeave`+released flag; **window-destroy** — confinement keeps holding but barrier events are *dropped* (no root fallback, matching `ProcessBarrierEvent`), and the barrier survives; geometry-shrink makes an out-of-bounds barrier un-hittable; XID namespace test extended.
+7. **Grab routing:** (a) any active grab sets `XIBarrierDeviceIsGrabbed`; (b) grabbed-path delivery only when the barrier's owner holds the grab AND grab.window == barrier.window — an *unrelated* client's grab still gets normal window-mask delivery (with the flag set).
 8. **`pending_motion` invalidation (KMS, the race):** simulate rapid relative motion straight into a barrier; assert the post-clamp position holds and no stale coalesced delta replays the cursor across (regression guard for the subtlest race).
 9. **HW smoke (gate):** bee dual-head GNOME — pointer holds at monitor seam, firm push crosses (release path), no trap; `xinput` barrier test app sanity. Capture an xtrace from a real Xorg barrier session to validate wire/events against (`feedback_xorg_is_the_de_facto_spec`).
 
