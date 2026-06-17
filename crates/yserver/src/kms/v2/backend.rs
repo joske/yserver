@@ -9800,6 +9800,179 @@ impl Backend for KmsBackendV2 {
         Ok(())
     }
 
+    fn set_logical_screen_size(&mut self, w: u16, h: u16) -> io::Result<()> {
+        let w = w.max(1);
+        let h = h.max(1);
+
+        // ── 1. Update the platform's logical extent ───────────────────────
+        self.platform.fb_w = w;
+        self.platform.fb_h = h;
+
+        // ── 2. Resize root backing storage ────────────────────────────────
+        // The root drawable is always allocated (init_root_storage runs at
+        // boot). Resize it with the same detach→decref→allocate→fill
+        // pattern used by configure_subwindow.
+        let root_xid = self.core.window_id;
+        if let Some(old_id) = self.store.lookup(root_xid) {
+            self.store.detach_xid(root_xid);
+            self.store_decref_with_invalidate(old_id);
+            match self.platform.allocate_drawable_storage(w, h, 32) {
+                Ok(storage) => {
+                    self.telemetry.record_storage_allocation();
+                    self.telemetry.record_image_view_create();
+                    match self
+                        .store
+                        .allocate(root_xid, DrawableKind::Root, 32, true, storage)
+                    {
+                        Ok(new_id) => {
+                            let rect = ash::vk::Rect2D {
+                                offset: ash::vk::Offset2D::default(),
+                                extent: ash::vk::Extent2D {
+                                    width: u32::from(w),
+                                    height: u32::from(h),
+                                },
+                            };
+                            if let Err(e) = self.engine.fill_rect(
+                                &mut self.store,
+                                &mut self.platform,
+                                new_id,
+                                rect,
+                                decode_x11_pixel_for_storage(
+                                    self.core.bg_pixel.unwrap_or(0x0050_5050),
+                                    24,
+                                    PlatformBackend::format_for_depth(24),
+                                ),
+                            ) && self.platform.vk.is_some()
+                            {
+                                log::warn!("v2 set_logical_screen_size: root fill failed: {e:?}");
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "v2 set_logical_screen_size: root store.allocate failed: {e:?}"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    // No Vk (test fixture): allocate a null-view stub so the
+                    // xid remains live and tests can continue.
+                    log::debug!("v2 set_logical_screen_size: no Vk, stub root storage: {e:?}");
+                    let storage = Storage::for_tests_null(
+                        ash::vk::Extent2D {
+                            width: u32::from(w),
+                            height: u32::from(h),
+                        },
+                        PlatformBackend::format_for_depth(32),
+                    );
+                    if let Err(e) =
+                        self.store
+                            .allocate(root_xid, DrawableKind::Root, 32, true, storage)
+                    {
+                        log::warn!("v2 set_logical_screen_size: root stub alloc failed: {e:?}");
+                    }
+                }
+            }
+        }
+
+        // ── 3. Resize COW backing storage (if materialised) ──────────────
+        // The COW is lazily allocated on the first CompositeGetOverlayWindow
+        // call. If it hasn't been created yet, fb_w/fb_h are already updated
+        // above so the first allocation will use the new dimensions.
+        if let Some(old_cow_id) = self.cow_id.take() {
+            let cow_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+            self.store.detach_xid(cow_xid);
+            self.store_decref_with_invalidate(old_cow_id);
+            match self.platform.allocate_drawable_storage(w, h, 24) {
+                Ok(storage) => {
+                    self.telemetry.record_storage_allocation();
+                    self.telemetry.record_image_view_create();
+                    match self
+                        .store
+                        .allocate(cow_xid, DrawableKind::Window, 24, true, storage)
+                    {
+                        Ok(new_cow_id) => {
+                            // Zero-fill so the compositor doesn't see
+                            // recycled GPU content on its next paint.
+                            let rect = ash::vk::Rect2D {
+                                offset: ash::vk::Offset2D::default(),
+                                extent: ash::vk::Extent2D {
+                                    width: u32::from(w),
+                                    height: u32::from(h),
+                                },
+                            };
+                            if let Err(e) = self.engine.fill_rect(
+                                &mut self.store,
+                                &mut self.platform,
+                                new_cow_id,
+                                rect,
+                                [0.0; 4],
+                            ) && self.platform.vk.is_some()
+                            {
+                                log::warn!(
+                                    "v2 set_logical_screen_size: COW zero-fill failed: {e:?}"
+                                );
+                            }
+                            self.cow_id = Some(new_cow_id);
+                            // Update the windows_v2 geometry so scene assembly
+                            // uses the new dimensions.
+                            if let Some(geom) = self.windows_v2.get_mut(&cow_xid) {
+                                geom.width = w;
+                                geom.height = h;
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "v2 set_logical_screen_size: COW store.allocate failed: {e:?}"
+                            );
+                            // cow_id stays None (taken above); the COW will be
+                            // re-materialised on the next CompositeGetOverlayWindow.
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::debug!("v2 set_logical_screen_size: no Vk, stub COW storage: {e:?}");
+                    let storage = crate::kms::v2::store::Storage::for_tests_null(
+                        ash::vk::Extent2D {
+                            width: u32::from(w),
+                            height: u32::from(h),
+                        },
+                        PlatformBackend::format_for_depth(24),
+                    );
+                    match self
+                        .store
+                        .allocate(cow_xid, DrawableKind::Window, 24, true, storage)
+                    {
+                        Ok(new_cow_id) => {
+                            self.cow_id = Some(new_cow_id);
+                            if let Some(geom) = self.windows_v2.get_mut(&cow_xid) {
+                                geom.width = w;
+                                geom.height = h;
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("v2 set_logical_screen_size: COW stub alloc failed: {e:?}");
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── 4. Quiesce GPU + rebuild scene topology ────────────────────────
+        // The root and COW are the scene's primary sampling sources.
+        // Draining flushes all in-flight GPU work so the old images
+        // are no longer referenced before their storage is freed;
+        // rebuild_outputs re-derives output offsets / scanout layout.
+        self.platform.wait_idle_bounded();
+        self.scene.drain_all(&mut self.platform);
+        self.scene
+            .rebuild_outputs(&self.platform)
+            .map_err(|e| io::Error::other(format!("scene rebuild after screen resize: {e:?}")))?;
+
+        log::info!("v2 set_logical_screen_size: resized virtual screen to {w}×{h}");
+        Ok(())
+    }
+
     fn on_libinput_ready(&mut self, state: &mut ServerState) {
         // Libseat mode: dispatch the on-core libinput context, then map each
         // event through the same fanout that Direct mode uses. Hotkeys are

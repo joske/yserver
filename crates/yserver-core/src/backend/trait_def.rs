@@ -334,6 +334,14 @@ pub trait Backend: Send {
         Ok(())
     }
 
+    /// Resize the logical (virtual) screen to `w`×`h`: reallocate the
+    /// root + Composite-overlay backing storage and update the pointer
+    /// clamp / logical extent. Default no-op `Ok(())` for nested
+    /// backends (ynest follows its host window size instead).
+    fn set_logical_screen_size(&mut self, _w: u16, _h: u16) -> io::Result<()> {
+        Ok(())
+    }
+
     /// Whether the backend has armed VT switching in direct mode.
     /// Default: false.
     fn vt_switching_armed(&self) -> bool {
