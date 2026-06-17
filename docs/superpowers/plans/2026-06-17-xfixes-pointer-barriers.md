@@ -899,7 +899,7 @@ Expected: FAIL — no clamp; `pointer_root` is (110,50). Also a compile error fo
      - `host_x11/trait_impl.rs:89` — `{ x, y, time }` → add `, ..` (ynest path; doesn't need the bit).
      - `input_thread.rs:933` — test `{ x, y, time }` → add `, ..`.
      - Sites already using `..` (`input_thread.rs:468,811,860,1015,1027,1072`, `backend.rs:10372`) compile unchanged.
-  4. **`crates/yserver/src/kms/v2/backend.rs` `process_pointer_absolute` (~:5597)** — gains the `relative: bool` parameter (passed from the :9175 caller); wrap the `dispatch_motion_event(server_state)` call so non-relative motion bypasses the barrier clamp:
+  4. **`crates/yserver/src/kms/v2/backend.rs` `process_pointer_absolute` (~:5597)** — gains the `relative: bool` parameter. Update ALL callers: the runtime forwarder at `:9176` passes the bound `relative`; the four direct unit-test callers (`:19663`, `:19667`, `:19697`, `:19706`) pass `true` (those tests assert FB-extent clamping, not barriers, so the value is immaterial — `true` keeps them on the normal path). Then wrap the `dispatch_motion_event(server_state)` call so non-relative motion bypasses the barrier clamp:
      ```rust
      let prev = server_state.barrier_bypass;
      server_state.barrier_bypass = prev || !relative;
