@@ -2785,10 +2785,20 @@ impl PlatformBackend {
         }
 
         for layout in &mut self.outputs {
-            if let Some(output) = discovered_by_name.remove(&layout.output.connector_name) {
-                layout.width = output.picked.width;
-                layout.height = output.picked.height;
+            if let Some(mut output) = discovered_by_name.remove(&layout.output.connector_name) {
+                // Preserve the live ACTIVE mode. A rescan / VT-resume does
+                // not re-modeset a surviving (enabled) output, so its
+                // current mode — which may be a client `RRSetCrtcConfig`
+                // mode, NOT the connector's preferred — must survive.
+                // `discover_outputs` always sets `picked` to the preferred
+                // mode, so taking it wholesale would silently reset an
+                // enabled output's mode in the platform metadata + RANDR
+                // state (and desync the fb extent from the live scanout).
+                // Refresh only the metadata that legitimately changes:
+                // advertised mode list, EDID dims, connector handles.
+                output.picked = layout.output.picked.clone();
                 layout.output = output;
+                // width/height already reflect the live mode — leave them.
             }
         }
 

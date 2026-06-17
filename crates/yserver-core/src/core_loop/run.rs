@@ -964,11 +964,15 @@ pub fn emit_randr_change_notifications(state: &mut ServerState, changed: &[(u32,
     let height = state.randr.screen_height;
     let width_mm = u16::try_from(state.randr.width_mm).unwrap_or(u16::MAX);
     let height_mm = u16::try_from(state.randr.height_mm).unwrap_or(u16::MAX);
-    let crtc_positions: std::collections::HashMap<u32, (i16, i16)> = state
+    // Per-CRTC geometry (position AND mode size). CrtcChangeNotify must
+    // report each CRTC's own mode dimensions — NOT the logical screen
+    // size — or a multi-monitor client sees every CRTC as e.g. 5120×1440
+    // instead of its real 2560×1440. An off CRTC (no mode) reports 0×0.
+    let crtc_geom: std::collections::HashMap<u32, (i16, i16, u16, u16)> = state
         .randr
         .outputs
         .iter()
-        .map(|o| (o.crtc_id, (o.x, o.y)))
+        .map(|o| (o.crtc_id, (o.x, o.y, o.width, o.height)))
         .collect();
 
     let subscribers: Vec<(u32, yserver_protocol::x11::ResourceId, u16)> = state
@@ -1000,7 +1004,7 @@ pub fn emit_randr_change_notifications(state: &mut ServerState, changed: &[(u32,
             let _ = client_io::write_or_buffer(client, &event);
         }
         for &(output, crtc, mode) in changed {
-            let (x, y) = crtc_positions.get(&crtc).copied().unwrap_or((0, 0));
+            let (x, y, crtc_w, crtc_h) = crtc_geom.get(&crtc).copied().unwrap_or((0, 0, 0, 0));
             if mask & x11randr::NOTIFY_MASK_CRTC_CHANGE != 0 {
                 let event = x11randr::encode_crtc_change_notify_event(
                     client.byte_order,
@@ -1013,8 +1017,8 @@ pub fn emit_randr_change_notifications(state: &mut ServerState, changed: &[(u32,
                         mode,
                         x,
                         y,
-                        width,
-                        height,
+                        width: crtc_w,
+                        height: crtc_h,
                     },
                 );
                 let _ = client_io::write_or_buffer(client, &event);
