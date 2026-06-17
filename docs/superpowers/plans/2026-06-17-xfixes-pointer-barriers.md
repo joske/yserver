@@ -887,16 +887,26 @@ Expected: FAIL — no clamp; `pointer_root` is (110,50). Also a compile error fo
 
 - [ ] **Step 3c: Tag motion source (relative vs absolute) — the real "Relative-only" gate.** Xorg constrains `mode == Relative` motion only. yserver collapses BOTH relative mouse motion (`InputEvent::PointerMotion{dx,dy}`) and absolute touch/tablet motion (`InputEvent::PointerMotionAbsolute`) into the same `HostInputEvent::PointerMotion{x,y,time}` at `input_thread.rs:132/141` — losing the distinction. There IS a live absolute path (libinput `MotionAbsolute` → `process_pointer_absolute` → fanout), so the clamp must NOT fire on it. Thread a `relative` bit and convert it to `barrier_bypass` at the KMS dispatch. This also covers warps for free (warp-injected motion is non-relative), so no separate per-warp-site helper is needed.
 
-  1. **`crates/yserver-core/src/core_loop/message.rs:190`** — add a field to the `PointerMotion` variant: `PointerMotion { x: i32, y: i32, time: u32, relative: bool }`.
-  2. **`crates/yserver/src/input_thread.rs`** — set the bit at the two producers: the `InputEvent::PointerMotion{dx,dy}` arm (~:132) → `relative: true`; the `InputEvent::PointerMotionAbsolute` arm (~:141) → `relative: false`. The warp-injection producer (the synthetic `PointerMotion` that `warp_pointer_root` feeds via `on_host_input`, `backend.rs` ~:15987) → `relative: false`. Fix the test constructors at `input_thread.rs:803+` to pass `relative`.
-  3. **`crates/yserver/src/kms/v2/backend.rs` `process_pointer_absolute` (~:5597)** — it receives the `relative` bit; wrap the `dispatch_motion_event(server_state)` call so non-relative motion bypasses the barrier clamp:
+  1. **`crates/yserver-core/src/core_loop/message.rs:191`** — add a field to the `PointerMotion` variant: `PointerMotion { x: i32, y: i32, time: u32, relative: bool }`.
+  2. **Set `relative` at EVERY construction site** (grep `HostInputEvent::PointerMotion` to confirm none missed — these are the complete set as of 2026-06-17):
+     - `input_thread.rs:132` — `InputEvent::PointerMotion{dx,dy}` (relative mouse) → **`relative: true`**.
+     - `input_thread.rs:141` — `InputEvent::PointerMotionAbsolute` (touch/tablet) → **`relative: false`**.
+     - `kms/v2/backend.rs:15994` — the warp-injection `PointerMotion` fed by `warp_pointer_root` via `on_host_input` → **`relative: false`**.
+     - `process_request.rs:6206` — the XTEST `FakeInput` synthetic motion (absolute) → **`relative: false`**.
+     - `kms/v2/backend.rs:19896` — KMS unit-test constructor → **`relative: false`** (test).
+  3. **Fix EVERY exact-match consumer that will stop compiling** (patterns without `..` break on the new field):
+     - `kms/v2/backend.rs:9175` — `HostInputEvent::PointerMotion { x, y, time: _ }`. **This is the consumer that routes to `process_pointer_absolute`** — bind the bit: `{ x, y, time: _, relative }`, and forward `relative` into the `process_pointer_absolute(...)` call (add it as a parameter).
+     - `host_x11/trait_impl.rs:89` — `{ x, y, time }` → add `, ..` (ynest path; doesn't need the bit).
+     - `input_thread.rs:933` — test `{ x, y, time }` → add `, ..`.
+     - Sites already using `..` (`input_thread.rs:468,811,860,1015,1027,1072`, `backend.rs:10372`) compile unchanged.
+  4. **`crates/yserver/src/kms/v2/backend.rs` `process_pointer_absolute` (~:5597)** — gains the `relative: bool` parameter (passed from the :9175 caller); wrap the `dispatch_motion_event(server_state)` call so non-relative motion bypasses the barrier clamp:
      ```rust
      let prev = server_state.barrier_bypass;
      server_state.barrier_bypass = prev || !relative;
      self.dispatch_motion_event(server_state);
      server_state.barrier_bypass = prev;
      ```
-  This makes the Step-3b gate (`!barrier_bypass && !confine_warp_active`) fire for relative mouse motion only. Absolute touch/tablet and every KMS warp (which re-injects `relative:false`) skip the clamp — matching Xorg. ynest motion does not pass through `process_pointer_absolute`, so it still clamps (the spec's documented "advisory on ynest" behavior — host owns the real sprite).
+  This makes the Step-3b gate (`!barrier_bypass && !confine_warp_active`) fire for relative mouse motion only. Absolute touch/tablet, XTEST FakeInput, and every KMS warp (which re-injects `relative:false`) skip the clamp — matching Xorg. ynest motion does not pass through `process_pointer_absolute`, so it still clamps (the spec's documented "advisory on ynest" behavior — host owns the real sprite).
 
   > Why no `warp_root_no_barrier` helper: every server warp on KMS re-enters via `process_pointer_absolute` with `relative:false`, so it's already gated here. The core-level warp sites (WarpPointer `process_request.rs:22029/22043`, RANDR-shrink `run.rs:951`, `confine_pointer_now :22810`) need no change. The barrier's own corrective warp in Step 3b additionally sets `barrier_bypass` directly as a re-entrancy guard.
 
