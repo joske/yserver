@@ -102,6 +102,12 @@ pub struct Output {
     pub mm_width: u32,
     /// EDID-derived physical height; see [`Self::mm_width`].
     pub mm_height: u32,
+    /// The connector's full local mode list, preferred-first, as
+    /// reported by the kernel/EDID. `picked` is the boot default and
+    /// is always present in this list. Used by RANDR to advertise the
+    /// selectable mode set (`GetOutputInfo` / `GetScreenResources`) and
+    /// by `apply_crtc_config` to resolve a client-requested mode.
+    pub modes: Vec<Mode>,
 }
 
 /// One connected connector along with its candidate CRTCs and primary planes.
@@ -341,6 +347,13 @@ fn finalize_output(
 
     let (mm_width, mm_height) = connector_info.size().unwrap_or((0, 0));
 
+    // Full advertised mode list, sorted preferred-first (matching Xorg
+    // GetOutputInfo's nPreferred prefix). `local_modes` is kept in kernel
+    // order above for the `picked_idx` -> DRM-mode mapping; we only
+    // reorder this owned copy now that `drm_mode` is resolved.
+    let mut modes = local_modes;
+    modes.sort_by_key(|m| !m.preferred);
+
     Ok(Output {
         connector: asg.connector,
         connector_name: asg.connector_name,
@@ -355,6 +368,7 @@ fn finalize_output(
         scanout_modifiers,
         mm_width,
         mm_height,
+        modes,
     })
 }
 

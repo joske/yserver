@@ -911,6 +911,13 @@ impl PlatformBackend {
                     scanout_modifiers: Vec::new(),
                     mm_width: 0,
                     mm_height: 0,
+                    modes: vec![drm::modeset::Mode {
+                        name: "test".to_string(),
+                        width: 800,
+                        height: 600,
+                        vrefresh: 60,
+                        preferred: true,
+                    }],
                 },
                 swapchain: drm::Swapchain::empty_for_tests(),
                 x: 0,
