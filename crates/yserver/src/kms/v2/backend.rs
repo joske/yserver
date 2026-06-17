@@ -226,6 +226,17 @@ impl RandrIdAllocator {
         id
     }
 
+    /// Connector names whose layout a client has explicitly configured
+    /// (SetCrtcConfig/SetScreenSize). The auto-layout recompact must
+    /// leave these where the client placed them — see Task 5.1.
+    pub(crate) fn client_configured_names(&self) -> HashSet<String> {
+        self.connectors
+            .iter()
+            .filter(|(_, e)| e.client_configured)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
     pub(crate) fn known_connectors(&self) -> Vec<(String, ConnectorIds)> {
         self.connectors
             .iter()
@@ -2573,19 +2584,30 @@ impl KmsBackendV2 {
             }
         }
 
-        // Disconnected (registered but not live) connectors. Retain the
-        // last-known advertised mode list from the registry so
-        // GetOutputInfo on a dark output stays consistent with the
-        // GetScreenResources union (both advertise the same modes).
+        // Not-live (registered but not in `platform.outputs`) connectors.
+        // Two sub-states, distinguished by the registry `connected` flag:
+        //   - connected=true  → hotplugged but not yet enabled (Task 5.2):
+        //     report RR_Connected with mode=0/crtc-unassigned so a client
+        //     can enable it (GetOutputInfo offers the advertised modes).
+        //   - connected=false → physically disconnected: RR_Disconnected.
+        // Either way the last-known advertised mode list is retained so
+        // GetOutputInfo stays consistent with the GetScreenResources union.
         // Collect owned first to release the &self borrow before the
         // &mut self mode_id() allocations below.
-        let disconnected: Vec<(String, ConnectorIds, Vec<(u16, u16, u32, bool)>)> = self
+        let not_live: Vec<(String, ConnectorIds, bool, Vec<(u16, u16, u32, bool)>)> = self
             .randr_id_alloc
             .entries()
             .filter(|(name, _)| !live_names.contains(name.as_str()))
-            .map(|(name, entry)| (name.clone(), entry.ids, entry.modes.clone()))
+            .map(|(name, entry)| {
+                (
+                    name.clone(),
+                    entry.ids,
+                    entry.connected,
+                    entry.modes.clone(),
+                )
+            })
             .collect();
-        for (name, ids, conn_modes) in disconnected {
+        for (name, ids, connected, conn_modes) in not_live {
             let mut mode_ids = Vec::with_capacity(conn_modes.len());
             let mut num_preferred: u16 = 0;
             for (w, h, vrefresh, preferred) in conn_modes {
@@ -2599,7 +2621,7 @@ impl KmsBackendV2 {
                 output_id: ids.output_id,
                 crtc_id: ids.crtc_id,
                 mode_id: 0,
-                connected: false,
+                connected,
                 x: 0,
                 y: 0,
                 width: 0,
@@ -4994,7 +5016,8 @@ impl KmsBackendV2 {
         );
         // 2. Re-query connectors + redo modeset on existing device.
         log::info!("kms: run_resume step 2 — requery_outputs_and_modeset");
-        match self.platform.requery_outputs_and_modeset() {
+        let configured = self.randr_id_alloc.client_configured_names();
+        match self.platform.requery_outputs_and_modeset(&configured) {
             Ok(rescan) => {
                 if rescan.added_count != 0 || !rescan.dropped_names.is_empty() {
                     self.fire_randr_changes(state, rescan);
@@ -5109,6 +5132,28 @@ impl KmsBackendV2 {
             log::info!("kms: RandR output disconnected: {name}");
         }
 
+        // Task 5.2: reconcile the connector registry with the topology
+        // change BEFORE rebuilding `state.randr` below. Dropped connectors
+        // go disconnected; newly-connected ones register OFF (connected,
+        // config=Off, advertised modes recorded) — they are NOT in
+        // `platform.outputs`, so `randr_outputs_and_modes` reports them
+        // connected-but-dark (mode=0, crtc unassigned) until a client
+        // enables them via RRSetCrtcConfig.
+        for name in &rescan.dropped_names {
+            self.randr_id_alloc.entry_mut(name).connected = false;
+        }
+        for output in &rescan.added_outputs {
+            let modes: Vec<(u16, u16, u32, bool)> = output
+                .modes
+                .iter()
+                .map(|m| (m.width, m.height, m.vrefresh, m.preferred))
+                .collect();
+            let entry = self.randr_id_alloc.entry_mut(&output.connector_name);
+            entry.connected = true;
+            entry.config = ConnectorConfig::Off;
+            entry.modes = modes;
+        }
+
         self.platform.wait_idle_bounded();
         self.scene.drain_all(&mut self.platform);
         if let Err(e) = self.scene.rebuild_outputs(&self.platform) {
@@ -5166,7 +5211,8 @@ impl KmsBackendV2 {
             log::debug!("kms: display rescan skipped (seat not Active)");
             return;
         }
-        match self.platform.requery_outputs_and_modeset() {
+        let configured = self.randr_id_alloc.client_configured_names();
+        match self.platform.requery_outputs_and_modeset(&configured) {
             Ok(rescan) => {
                 if rescan.added_count == 0 && rescan.dropped_names.is_empty() {
                     log::debug!("kms: display rescan found no topology change");
@@ -16915,6 +16961,52 @@ mod tests {
         let m3 = alloc.mode_id(1920, 1080, 60);
         assert_eq!(m1, m2);
         assert_ne!(m1, m3);
+    }
+
+    // Task 5.2: a hotplugged-but-not-yet-enabled output (registry
+    // connected=true, config=Off, NOT in platform.outputs) must report
+    // RR_Connected with mode=0 — "connected, dark" — so a client can
+    // enable it, NOT RR_Connected+enabled (the old auto-enable bug that
+    // made Display settings show it "on") and NOT RR_Disconnected. A
+    // physically-absent connector still reports RR_Disconnected.
+    #[test]
+    fn not_live_output_reports_connected_off_vs_disconnected() {
+        let mut b = KmsBackendV2::for_tests();
+
+        // Hotplugged, registered OFF (the Task 5.2 add-path outcome).
+        {
+            let e = b.randr_id_alloc.entry_mut("HDMI-A-1");
+            e.connected = true;
+            e.config = super::ConnectorConfig::Off;
+            e.modes = vec![(1920, 1080, 60, true)];
+        }
+        // Physically disconnected (default connected=false).
+        let _ = b.randr_id_alloc.entry_mut("DP-3");
+
+        let (outs, _modes) = b.randr_outputs_and_modes();
+
+        let hdmi = outs
+            .iter()
+            .find(|o| o.name == "HDMI-A-1")
+            .expect("HDMI-A-1 present");
+        assert!(
+            hdmi.connected,
+            "hotplugged-off output must report RR_Connected",
+        );
+        assert_eq!(hdmi.mode_id, 0, "off output has no current mode");
+        assert!(
+            !hdmi.mode_ids.is_empty(),
+            "off output still advertises its modes so a client can enable it",
+        );
+
+        let dp = outs
+            .iter()
+            .find(|o| o.name == "DP-3")
+            .expect("DP-3 present");
+        assert!(
+            !dp.connected,
+            "physically-absent connector reports RR_Disconnected",
+        );
     }
 
     /// Spec: "boots far enough to service GetGeometry / InternAtom".

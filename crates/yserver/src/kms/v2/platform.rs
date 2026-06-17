@@ -617,6 +617,11 @@ pub(crate) struct RescanResult {
     pub dropped_names: Vec<String>,
     pub dropped_old_indices: Vec<usize>,
     pub added_count: usize,
+    /// Task 5.2: newly-connected connectors discovered by a *runtime*
+    /// rescan are NOT auto-enabled — they're surfaced here (with their
+    /// advertised modes/dimensions) so the backend can register them
+    /// off in the connector registry and fire `OutputChangeNotify`.
+    pub added_outputs: Vec<crate::drm::modeset::Output>,
 }
 
 /// Pure recompute of the virtual-screen extent from `(x, y, width, height)`.
@@ -2691,9 +2696,22 @@ impl PlatformBackend {
     // called (Deviation #5 of the plan; mirrors wlroots
     // `handle_session_active` which only re-scans connectors).
 
-    fn recompact_horizontal_layout(&mut self) {
+    /// Pack outputs left-to-right, but leave client-configured outputs
+    /// where the client placed them (Task 5.1). A client SetCrtcConfig/
+    /// SetScreenSize "pins" an output's `(x, y)`; the auto-layout must not
+    /// flatten it back to the boot extend-right arrangement on a rescan or
+    /// VT-resume. Auto (unpinned) outputs still pack sequentially, advancing
+    /// past any pinned output's extent so the common left-to-right case
+    /// doesn't overlap. (Mixed pinned+auto with gaps is refined later if a
+    /// real workload needs it; the common case is all-auto at boot or
+    /// all-pinned after the desktop configures the layout.)
+    fn recompact_horizontal_layout(&mut self, client_configured: &HashSet<String>) {
         let mut next_x: i32 = 0;
         for layout in &mut self.outputs {
+            if client_configured.contains(&layout.output.connector_name) {
+                next_x = next_x.max(layout.x.saturating_add(i32::from(layout.width)));
+                continue;
+            }
             layout.x = next_x;
             layout.y = 0;
             next_x = next_x.saturating_add(i32::from(layout.width));
@@ -2703,7 +2721,10 @@ impl PlatformBackend {
     /// Re-scan connectors on the existing device, dropping missing
     /// outputs, refreshing surviving output metadata, and adding newly
     /// connected outputs.
-    pub(crate) fn requery_outputs_and_modeset(&mut self) -> io::Result<RescanResult> {
+    pub(crate) fn requery_outputs_and_modeset(
+        &mut self,
+        client_configured: &HashSet<String>,
+    ) -> io::Result<RescanResult> {
         let discovered = crate::drm::modeset::discover_outputs(&self.device)?;
         let discovered_order: Vec<String> = discovered
             .iter()
@@ -2759,7 +2780,16 @@ impl PlatformBackend {
             }
         }
 
-        let live_vk = self.vk.as_ref().cloned();
+        // Task 5.2: a *runtime* rescan (hotplug / VT-resume) does NOT
+        // auto-enable a newly-connected connector. Xorg leaves
+        // `output->crtc = NULL` until a client configures it; we mirror
+        // that — no scanout pool, no modeset, not added to
+        // `self.outputs`, so it contributes nothing to the virtual
+        // extent and stays dark. The connector is surfaced in
+        // `added_outputs` so the backend registers it off (connected,
+        // no CRTC) and fires `OutputChangeNotify`. Boot auto-enable lives
+        // in `open_with_commit`, a distinct entry point that never calls
+        // this runtime-rescan path.
         for name in discovered_order {
             if current_names.contains(&name) {
                 continue;
@@ -2767,104 +2797,16 @@ impl PlatformBackend {
             let Some(output) = discovered_by_name.remove(&name) else {
                 continue;
             };
-            let w = output.picked.width;
-            let h = output.picked.height;
-            let mut pool = None;
-            if let Some(vk) = live_vk.as_ref() {
-                match ScanoutBoPool::allocate(
-                    Arc::clone(vk),
-                    Arc::clone(&self.device),
-                    u32::from(w),
-                    u32::from(h),
-                    3,
-                    &output.scanout_modifiers,
-                ) {
-                    Ok(allocated) => {
-                        pool = Some(allocated);
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "v2 rescan: scanout pool allocate failed for new output {} ({}x{}): {e:?}",
-                            output.connector_name,
-                            w,
-                            h
-                        );
-                    }
-                }
-            }
-
-            let mut buffers = Vec::with_capacity(2);
-            let mut buffer_err: Option<io::Error> = None;
-            for _ in 0..2 {
-                match drm::Buffer::new(Arc::clone(&self.device), w, h) {
-                    Ok(b) => buffers.push(b),
-                    Err(e) => {
-                        buffer_err = Some(e);
-                        break;
-                    }
-                }
-            }
-            if let Some(e) = buffer_err {
-                log::warn!(
-                    "v2 rescan: failed to allocate initial buffers for new output {} ({}x{}): {e}",
-                    output.connector_name,
-                    w,
-                    h
-                );
-            } else {
-                let initial_fb = buffers[0].fb_id();
-                if let Err(e) =
-                    crate::drm::modeset::commit_modeset(&self.device, &output, initial_fb)
-                {
-                    log::warn!(
-                        "v2 rescan: initial modeset failed for new output {}: {e}",
-                        output.connector_name,
-                    );
-                }
-                let swapchain = drm::Swapchain::with_initial_scanout(buffers, 0);
-                self.outputs.push(OutputLayout {
-                    output,
-                    swapchain,
-                    x: 0,
-                    y: 0,
-                    width: w,
-                    height: h,
-                });
-                self.scanout_pools.push(pool);
-                if let Some(p) = self.scanout_pools.last() {
-                    if let Some(pool) = p.as_ref() {
-                        self.bo_generations
-                            .push(vec![BoGenerationEntry::default(); pool.bos.len()]);
-                    } else {
-                        self.bo_generations.push(Vec::new());
-                    }
-                }
-                self.first_pageflip_logged.push(false);
-                rescan
-                    .added_names
-                    .push(self.outputs.last().unwrap().output.connector_name.clone());
-                rescan.added_count += 1;
-                continue;
-            }
-
-            self.outputs.push(OutputLayout {
-                output,
-                swapchain: drm::Swapchain::empty_for_tests(),
-                x: 0,
-                y: 0,
-                width: w,
-                height: h,
-            });
-            self.scanout_pools.push(pool);
-            self.bo_generations.push(Vec::new());
-            self.first_pageflip_logged.push(false);
-            rescan
-                .added_names
-                .push(self.outputs.last().unwrap().output.connector_name.clone());
+            log::info!(
+                "v2 rescan: new connector {} discovered — registering OFF (client must enable)",
+                output.connector_name,
+            );
+            rescan.added_names.push(name);
+            rescan.added_outputs.push(output);
             rescan.added_count += 1;
         }
 
-        self.recompact_horizontal_layout();
+        self.recompact_horizontal_layout(client_configured);
         let layouts: Vec<(i32, i32, u16, u16)> = self
             .outputs
             .iter()

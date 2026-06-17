@@ -921,6 +921,39 @@ mod tests {
     }
 
     #[test]
+    fn from_outputs_preserves_nonzero_y_position() {
+        // Task 5.1 layout-preservation contract (core half): the core
+        // RANDR state faithfully reflects whatever (x, y) the backend
+        // bridge supplies — it must NOT flatten a client-configured
+        // non-zero position. (The backend recompact now skips
+        // client-configured outputs; this guards the core side that
+        // would otherwise mask a regression.)
+        let outs = vec![RandrOutput {
+            name: "HDMI-A-1".into(),
+            output_id: 1,
+            crtc_id: 2,
+            mode_id: 3,
+            connected: true,
+            x: 0,
+            y: 1080,
+            width: 1920,
+            height: 1080,
+            vrefresh: 60,
+            mm_width: 0,
+            mm_height: 0,
+            mode_ids: vec![3],
+            num_preferred: 1,
+        }];
+        let st = RandrState::from_outputs(0, outs);
+        assert_eq!(st.outputs[0].y, 1080, "y must not be flattened");
+        assert_eq!(
+            st.crtc_info(2, 0).expect("crtc present").y,
+            1080,
+            "crtc_info must report the preserved y",
+        );
+    }
+
+    #[test]
     fn mode_info_refresh_backcomputes_to_vrefresh() {
         // Clients derive refresh = dot_clock / (htotal * vtotal). For a
         // 1920x1080@60 mode that division must yield exactly 60, not the
