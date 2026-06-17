@@ -26,6 +26,15 @@ use crate::{
 
 use yserver_protocol::x11::ResourceId;
 
+/// A resolved display mode passed from core RANDR to the backend so it
+/// can find the exact DRM mode without a core→DRM type leak.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModeSpec {
+    pub width: u16,
+    pub height: u16,
+    pub vrefresh: u32,
+}
+
 /// Categorises the raw fds a backend wants the core's mio poller to
 /// watch on its behalf (returned by `Backend::poll_fds`).
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -331,6 +340,23 @@ pub trait Backend: Send {
     /// `Err` is surfaced by the handler as `BadAlloc`. Default
     /// `Ok(())` no-op for fixed-topology backends (ynest, recording).
     fn reprobe_connectors(&mut self, _state: &mut ServerState) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Apply a client-driven CRTC configuration to `connector`.
+    /// `mode = None` disables the output (frees its scanout, removes it
+    /// from the active set, registry → Off, connector stays known).
+    /// `mode = Some` enables/changes it at `(x, y)` (reallocating the
+    /// scanout pool on a resolution change), registry → Enabled. On
+    /// DDX/alloc failure returns Err and leaves the server in its prior
+    /// consistent state (no partial enable). Default no-op for nested.
+    fn apply_crtc_config(
+        &mut self,
+        _connector: &str,
+        _mode: Option<ModeSpec>,
+        _x: i32,
+        _y: i32,
+    ) -> io::Result<()> {
         Ok(())
     }
 

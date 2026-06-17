@@ -2104,6 +2104,333 @@ impl PlatformBackend {
         }
     }
 
+    /// Disable a single connector: issue a DRM `disable_output` for the
+    /// matching `OutputLayout`, free/drop its scanout pool entry, and
+    /// remove it from `self.outputs` / parallel vecs.  Recomputes
+    /// `fb_w`/`fb_h` from the remaining outputs (2-D, no recompact —
+    /// client-driven layouts are preserved). Does NOT touch the
+    /// `RandrIdAllocator` registry; callers update it after we return.
+    ///
+    /// Returns `Ok(true)` when the connector was found and disabled,
+    /// `Ok(false)` when it was not currently in the active output list
+    /// (already off — no-op), or `Err` on a DRM-level failure.
+    pub(crate) fn disable_connector(&mut self, connector: &str) -> io::Result<bool> {
+        let idx = match self
+            .outputs
+            .iter()
+            .position(|l| l.output.connector_name == connector)
+        {
+            Some(i) => i,
+            None => return Ok(false),
+        };
+
+        // DRM disable (ALLOW_MODESET atomic commit zeroing the CRTC).
+        if let Err(e) = crate::drm::modeset::disable_output(&self.device, &self.outputs[idx].output)
+        {
+            log::error!("v2 disable_connector: disable_output({connector}) failed: {e}");
+            return Err(e);
+        }
+
+        // Drop the scanout pool for this output so its VkImages are freed.
+        if idx < self.scanout_pools.len() {
+            self.scanout_pools.remove(idx);
+        }
+        if idx < self.bo_generations.len() {
+            self.bo_generations.remove(idx);
+        }
+        if idx < self.first_pageflip_logged.len() {
+            self.first_pageflip_logged.remove(idx);
+        }
+        self.outputs.remove(idx);
+
+        // Recompute the virtual framebuffer extent from surviving outputs.
+        // Do NOT recompact — other outputs may be client-positioned.
+        let layouts: Vec<(i32, i32, u16, u16)> = self
+            .outputs
+            .iter()
+            .map(|l| (l.x, l.y, l.width, l.height))
+            .collect();
+        let (fb_w, fb_h) = recompute_fb_extent_from(&layouts);
+        self.fb_w = fb_w;
+        self.fb_h = fb_h;
+
+        log::info!(
+            "v2 disable_connector: {connector} disabled; fb now {}×{}",
+            fb_w,
+            fb_h
+        );
+        Ok(true)
+    }
+
+    /// Enable (or reconfigure) a single connector at `(x, y)` with
+    /// the given `ModeSpec`.  Resolves the `ModeSpec` against the
+    /// connector's discovered `Output::modes` list, (re)allocates the
+    /// `ScanoutBoPool` when the resolution changes or the output was
+    /// previously off, commits the modeset, and adds/updates the
+    /// `OutputLayout` in `self.outputs` and the parallel vecs.
+    ///
+    /// The `Output` for `connector` must be pre-discovered via
+    /// `discover_outputs`; pass the **full** `Vec<Output>` from a
+    /// fresh discovery call.  The selected `Output` is consumed.
+    ///
+    /// On any failure after pool allocation, the pool is freed and the
+    /// output stays off (no partial enable), leaving `self` consistent.
+    ///
+    /// Returns `Ok(())` on success.
+    pub(crate) fn enable_connector(
+        &mut self,
+        mut output: crate::drm::modeset::Output,
+        mode_spec: yserver_core::backend::ModeSpec,
+        x: i32,
+        y: i32,
+    ) -> io::Result<()> {
+        let connector = output.connector_name.clone();
+
+        // Resolve ModeSpec → the DRM mode on the output.
+        // `Output::modes` is the full advertised list (preferred-first).
+        let matched = output
+            .modes
+            .iter()
+            .find(|m| {
+                m.width == mode_spec.width
+                    && m.height == mode_spec.height
+                    && m.vrefresh == mode_spec.vrefresh
+            })
+            .cloned();
+        let mode_local = matched.ok_or_else(|| {
+            io::Error::other(format!(
+                "connector {connector}: mode {}×{}@{} not in advertised list",
+                mode_spec.width, mode_spec.height, mode_spec.vrefresh
+            ))
+        })?;
+
+        // Find the matching DRM mode by index (modes / drm_mode are
+        // co-indexed in finalize_output).  We need `output.mode` to be
+        // the DRM-level blob for commit_modeset.
+        // `Output.modes` was sorted preferred-first by discover_outputs,
+        // so we need the raw connector_info modes.  Instead, we search
+        // by name+size+vrefresh in the already-set `output.picked` /
+        // `output.modes` list with the picked index trick reused from
+        // finalize_output: find mode_local by (name,w,h,vrefresh).
+        //
+        // The simplest reliable approach: the DRM mode is exactly the
+        // one that was stored in `output.mode` when `discover_outputs`
+        // called `finalize_output`, which selects via `pick_mode`.
+        // For a client-requested mode that differs from the picked one,
+        // we must force the mode.  `Output` doesn't carry the full
+        // DrmMode list — it only carries `mode` (the picked one) and
+        // `modes` (the logical Mode structs).
+        //
+        // Strategy: set `output.picked = mode_local` and reconstruct
+        // the DRM mode from the `output.mode` field ONLY when it matches,
+        // otherwise we need a DRM-level lookup.  Since we hold the raw
+        // `Output` returned by `discover_outputs` (which runs
+        // `get_connector` under the hood), and `Output::mode` is the
+        // DRM mode for `picked`, we detect the match:
+        if output.picked.width != mode_spec.width
+            || output.picked.height != mode_spec.height
+            || output.picked.vrefresh != mode_spec.vrefresh
+        {
+            // Client requested a non-picked mode.  We need to re-derive
+            // the DRM mode for it.  The cleanest safe path: re-run
+            // discover_outputs limited to this connector is expensive;
+            // instead we call get_connector inline to fetch the full
+            // DRM mode list, then match by (width, height, vrefresh).
+            use ::drm::control::Device as ControlDevice;
+            let resources = self.device.resource_handles().map_err(|e| {
+                io::Error::other(format!("enable_connector: resource_handles failed: {e}"))
+            })?;
+            let mut drm_mode_opt: Option<::drm::control::Mode> = None;
+            'outer: for &handle in resources.connectors() {
+                let info = match self.device.get_connector(handle, false) {
+                    Ok(i) => i,
+                    Err(_) => continue,
+                };
+                if format!("{info}") != connector {
+                    continue;
+                }
+                for m in info.modes() {
+                    let (w, h) = m.size();
+                    if w == mode_spec.width
+                        && h == mode_spec.height
+                        && m.vrefresh() == mode_spec.vrefresh
+                    {
+                        drm_mode_opt = Some(*m);
+                        break 'outer;
+                    }
+                }
+            }
+            let drm_mode = drm_mode_opt.ok_or_else(|| {
+                io::Error::other(format!(
+                    "connector {connector}: DRM mode {}×{}@{} not found via kernel",
+                    mode_spec.width, mode_spec.height, mode_spec.vrefresh
+                ))
+            })?;
+            output.mode = drm_mode;
+            output.picked = mode_local;
+        }
+        // At this point output.mode is the DRM mode for the requested spec.
+
+        let w = mode_spec.width;
+        let h = mode_spec.height;
+
+        // Check whether this connector is already in the active set and
+        // whether its resolution matches.
+        let existing_idx = self
+            .outputs
+            .iter()
+            .position(|l| l.output.connector_name == connector);
+        let needs_pool_realloc = match existing_idx {
+            Some(idx) => self.outputs[idx].width != w || self.outputs[idx].height != h,
+            None => true,
+        };
+
+        // (Re)allocate the scanout pool if needed.
+        let new_pool = if needs_pool_realloc {
+            if let Some(vk) = self.vk.as_ref().cloned() {
+                match ScanoutBoPool::allocate(
+                    Arc::clone(&vk),
+                    Arc::clone(&self.device),
+                    u32::from(w),
+                    u32::from(h),
+                    3,
+                    &output.scanout_modifiers,
+                ) {
+                    Ok(pool) => Some(Some(pool)),
+                    Err(e) => {
+                        log::warn!(
+                            "v2 enable_connector: scanout pool alloc failed for {connector} ({}×{}): {e:?}",
+                            w,
+                            h
+                        );
+                        // Pool allocation failed — leave output off,
+                        // return error to caller.
+                        return Err(io::Error::other(format!(
+                            "enable_connector {connector}: scanout pool alloc failed: {e:?}"
+                        )));
+                    }
+                }
+            } else {
+                // Test fixture: no Vk; pool stays None.
+                Some(None)
+            }
+        } else {
+            None // keep existing pool
+        };
+
+        // Build an initial fb for the modeset commit.  Pick the
+        // OnScreen BO from the existing pool (if unchanged), or the
+        // first BO in the new pool.  Fall back to a legacy dumb buffer
+        // if nothing is available.
+        let fb_id = {
+            let pool_ref: Option<&ScanoutBoPool> = if needs_pool_realloc {
+                new_pool.as_ref().and_then(|p| p.as_ref())
+            } else {
+                existing_idx
+                    .and_then(|i| self.scanout_pools.get(i))
+                    .and_then(|p| p.as_ref())
+            };
+            pool_ref.and_then(|pool| {
+                use crate::kms::vk::scanout::BoPhase;
+                pool.bos
+                    .iter()
+                    .find(|bo| bo.state.phase == BoPhase::OnScreen)
+                    .and_then(|bo| bo.fb_handle)
+                    .or_else(|| pool.bos.iter().find_map(|bo| bo.fb_handle))
+            })
+        };
+
+        let fb_for_commit = fb_id.ok_or_else(|| {
+            // Free the newly-allocated pool before returning error.
+            // (new_pool would be dropped by going out of scope, which
+            //  is the desired free.)
+            io::Error::other(format!(
+                "enable_connector {connector}: no fb handle available for initial modeset"
+            ))
+        });
+
+        let fb_for_commit = match fb_for_commit {
+            Ok(fb) => fb,
+            Err(e) => {
+                // new_pool dropped here (freed).
+                return Err(e);
+            }
+        };
+
+        // Commit the modeset.  On failure, pool is freed (dropped below).
+        if let Err(e) = crate::drm::modeset::commit_modeset(&self.device, &output, fb_for_commit) {
+            log::error!(
+                "v2 enable_connector: commit_modeset for {connector} ({}×{}@{}) at ({x},{y}) failed: {e}",
+                mode_spec.width,
+                mode_spec.height,
+                mode_spec.vrefresh
+            );
+            // new_pool dropped here (freed on stack unwind).
+            return Err(e);
+        }
+
+        // Commit succeeded — install the output into the active set.
+        if let Some(idx) = existing_idx {
+            // Update in-place.
+            self.outputs[idx].output = output;
+            self.outputs[idx].x = x;
+            self.outputs[idx].y = y;
+            self.outputs[idx].width = w;
+            self.outputs[idx].height = h;
+            if let Some(pool) = new_pool {
+                if idx < self.scanout_pools.len() {
+                    self.scanout_pools[idx] = pool;
+                }
+                if idx < self.bo_generations.len() {
+                    self.bo_generations[idx] = self
+                        .scanout_pools
+                        .get(idx)
+                        .and_then(|p| p.as_ref())
+                        .map(|p| vec![BoGenerationEntry::default(); p.bos.len()])
+                        .unwrap_or_default();
+                }
+            }
+        } else {
+            // New output — push to end.
+            self.outputs.push(OutputLayout {
+                output,
+                swapchain: drm::Swapchain::empty_for_tests(),
+                x,
+                y,
+                width: w,
+                height: h,
+            });
+            let pool = new_pool.unwrap_or(None);
+            let gens = pool
+                .as_ref()
+                .map(|p| vec![BoGenerationEntry::default(); p.bos.len()])
+                .unwrap_or_default();
+            self.scanout_pools.push(pool);
+            self.bo_generations.push(gens);
+            self.first_pageflip_logged.push(false);
+        }
+
+        // Recompute virtual framebuffer extent (2-D, no recompact).
+        let layouts: Vec<(i32, i32, u16, u16)> = self
+            .outputs
+            .iter()
+            .map(|l| (l.x, l.y, l.width, l.height))
+            .collect();
+        let (fb_w, fb_h) = recompute_fb_extent_from(&layouts);
+        self.fb_w = fb_w;
+        self.fb_h = fb_h;
+
+        log::info!(
+            "v2 enable_connector: {connector} enabled {}×{}@{} at ({x},{y}); fb now {}×{}",
+            mode_spec.width,
+            mode_spec.height,
+            mode_spec.vrefresh,
+            fb_w,
+            fb_h
+        );
+        Ok(())
+    }
+
     /// Called by the SceneCompositor's tick after `present_scanout`
     /// returns Ok. Records that `bo_idx` is now pending the next
     /// page-flip-complete event for `output_idx`, and assigns the

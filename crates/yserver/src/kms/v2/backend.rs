@@ -158,7 +158,6 @@ pub(crate) struct ConnectorIds {
 /// Per-connector current configuration in the registry.
 // Consumed by the SetCrtcConfig apply path + rescan/resume layout
 // preservation (later RANDR output-management tasks); storage only here.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConnectorConfig {
     /// Connected but not scanning out (mode=None, no CRTC).
@@ -176,7 +175,6 @@ pub(crate) enum ConnectorConfig {
 /// One connector the backend has ever seen.
 // Fields consumed by later RANDR output-management tasks (reprobe,
 // SetCrtcConfig apply, layout preservation); storage only here.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct ConnectorEntry {
     pub ids: ConnectorIds,
@@ -238,8 +236,6 @@ impl RandrIdAllocator {
     /// Get or create the registry entry for a connector, allocating
     /// stable ids on first sight. New entries default to disconnected,
     /// Off, not-client-configured, empty mode list.
-    // Consumed by later RANDR output-management tasks; storage only here.
-    #[allow(dead_code)]
     pub(crate) fn entry_mut(&mut self, name: &str) -> &mut ConnectorEntry {
         if !self.connectors.contains_key(name) {
             // Allocate ids (also inserts the default entry).
@@ -253,7 +249,6 @@ impl RandrIdAllocator {
         self.connectors.get(name)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn entries(&self) -> impl Iterator<Item = (&String, &ConnectorEntry)> {
         self.connectors.iter()
     }
@@ -9823,6 +9818,148 @@ impl Backend for KmsBackendV2 {
         // probe leaves both timestamps + the client-set screen size
         // intact (Xorg RRGetInfo force_query semantics).
         self.rebuild_randr_state(state, None, changed);
+        Ok(())
+    }
+
+    fn apply_crtc_config(
+        &mut self,
+        connector: &str,
+        mode: Option<yserver_core::backend::ModeSpec>,
+        x: i32,
+        y: i32,
+    ) -> io::Result<()> {
+        // ── Flip-safety: quiesce exactly like fire_randr_changes ──────────
+        //
+        // Both enable and disable modify `platform.outputs` (topology),
+        // so we need `drain_all` + `rebuild_outputs` — the same path
+        // `fire_randr_changes` uses for hotplug.  The sequence below:
+        //
+        //   wait_idle_bounded — ensures in-flight GPU CBs have retired
+        //                       before we free/reallocate scanout pools.
+        //   scene.drain_all   — clears `pending_acks` (the per-output
+        //                       "flip in flight" gate) and releases pool
+        //                       slots.  The GPU is already idle so compose-
+        //                       fence waits return immediately.
+        //   reset_scanout_bos_for_suspend — resets BO phase tracking so
+        //                       the new topology starts clean.
+        //   platform mutate   — disable_connector / enable_connector
+        //   rebuild_outputs   — re-arms the scene for the new topology.
+        //
+        // The `commit_modeset` / `disable_output` calls in the platform
+        // helpers are ALLOW_MODESET atomic commits (not page-flips), so
+        // they are always legal after drain_all.  After rebuild_outputs
+        // the scene's `pending_acks` is fresh-empty for every output, so
+        // the subsequent `wake_for_damage` tick is EBUSY-safe.
+        self.platform.wait_idle_bounded();
+        self.scene.drain_all(&mut self.platform);
+        self.platform.reset_scanout_bos_for_suspend();
+
+        match mode {
+            None => {
+                // ── Disable path ─────────────────────────────────────────
+                match self.platform.disable_connector(connector) {
+                    Ok(true) => {
+                        log::info!("apply_crtc_config: disabled {connector}");
+                    }
+                    Ok(false) => {
+                        // Already off — still update the registry.
+                        log::debug!("apply_crtc_config: {connector} was already off");
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "apply_crtc_config: disable_connector({connector}) failed: {e}"
+                        );
+                        // Attempt to restore the scene with whatever state
+                        // platform.outputs is in now.
+                        let _ = self.scene.rebuild_outputs(&self.platform);
+                        return Err(e);
+                    }
+                }
+                // Update registry: connector stays known, config → Off.
+                {
+                    let entry = self.randr_id_alloc.entry_mut(connector);
+                    entry.config = ConnectorConfig::Off;
+                    // client_configured is set to record that a client
+                    // explicitly disabled this output (not an auto-layout op).
+                    entry.client_configured = true;
+                }
+            }
+            Some(mode_spec) => {
+                // ── Enable / mode-change path ────────────────────────────
+                //
+                // Re-discover all outputs to get a fresh Output with the
+                // correct CRTC/plane/property assignments. We filter to
+                // the one matching `connector`.
+                let discovered = match crate::drm::modeset::discover_outputs(&self.platform.device)
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log::error!("apply_crtc_config: discover_outputs failed: {e}");
+                        let _ = self.scene.rebuild_outputs(&self.platform);
+                        return Err(e);
+                    }
+                };
+                let output = match discovered
+                    .into_iter()
+                    .find(|o| o.connector_name == connector)
+                {
+                    Some(o) => o,
+                    None => {
+                        let e = io::Error::other(format!(
+                            "apply_crtc_config: connector {connector} not found in \
+                             discover_outputs (disconnected?)"
+                        ));
+                        log::error!("{e}");
+                        let _ = self.scene.rebuild_outputs(&self.platform);
+                        return Err(e);
+                    }
+                };
+
+                // enable_connector handles: mode resolution, pool
+                // (re)alloc, commit_modeset, OutputLayout update,
+                // fb extent recompute.
+                if let Err(e) = self.platform.enable_connector(output, mode_spec, x, y) {
+                    log::error!("apply_crtc_config: enable_connector({connector}) failed: {e}");
+                    let _ = self.scene.rebuild_outputs(&self.platform);
+                    return Err(e);
+                }
+
+                // Update registry.
+                {
+                    let entry = self.randr_id_alloc.entry_mut(connector);
+                    entry.config = ConnectorConfig::Enabled {
+                        mode_w: mode_spec.width,
+                        mode_h: mode_spec.height,
+                        vrefresh: mode_spec.vrefresh,
+                        x,
+                        y,
+                    };
+                    entry.client_configured = true;
+                    entry.connected = true;
+                }
+
+                log::info!(
+                    "apply_crtc_config: enabled {connector} {}×{}@{} at ({x},{y})",
+                    mode_spec.width,
+                    mode_spec.height,
+                    mode_spec.vrefresh
+                );
+            }
+        }
+
+        // ── Scene + RANDR rebuild ─────────────────────────────────────────
+        if let Err(e) = self.scene.rebuild_outputs(&self.platform) {
+            log::error!("apply_crtc_config: scene rebuild failed after topology change: {e:?}");
+            return Err(io::Error::other(format!(
+                "apply_crtc_config: scene rebuild failed: {e:?}"
+            )));
+        }
+
+        // Update input extent (cursor clamp) to reflect new fb size.
+        let (new_fb_w, new_fb_h) = (self.platform.fb_w, self.platform.fb_h);
+        self.update_input_extent(new_fb_w, new_fb_h);
+
+        self.scene.wake_for_damage();
         Ok(())
     }
 
