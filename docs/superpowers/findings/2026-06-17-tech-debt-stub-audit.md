@@ -30,7 +30,7 @@ Highest impact: the client blocks forever, not just gets a wrong answer. Root ca
 Capabilities announced in version/extension replies but not implemented:
 
 - [ ] **XFIXES pointer barriers** CreatePointerBarrier/DeletePointerBarrier (minor 31/32) — not handled, **not even defined** in `xfixes.rs:58`; default arm `process_request.rs:4514` silently no-ops. XFIXES advertises **v5.0, forced for Mutter** (`xfixes.rs:54`). GNOME edge-resistance / pointer confinement silently break. **HIGH.**
-- [ ] **X-Resource v1.2** — all 5 data queries return zeros: QueryClients `:8773`, QueryClientResources `:8780`, QueryClientPixmapBytes `:8787`, QueryClientIds `:8794`, QueryResourceBytes `:8801`. Backing data exists in `ServerState` → fillable. `xrestop`/resource monitors see nothing.
+- [~] **X-Resource v1.2** — **QueryClients now REAL** (returns the connected clients' XID ranges, sorted; what `xrestop` enumerates). New encoder `encode_query_clients_reply` + tests `query_clients_reply_lists_clients`, `x_resource_query_clients_lists_connected_clients`. The other 4 queries (QueryClientResources/PixmapBytes/Ids/ResourceBytes) still zero-stub + `TODO(unimplemented)` — need per-client resource accounting yserver doesn't yet keep.
 - [ ] **GLX `GLX_EXT_texture_from_pixmap`** — advertised, but `BindTexImageEXT` (`:9288`) binds and never updates content (`TODO(glx-tfp)`). (Matches parked TFP work / `2026-06-09-glx-tfp-radv-export-rootcause.md`.)
 - [ ] **RENDER QueryFilters** (`:1818`) advertises `convolution`/`bilinear` that `SetPictureFilter` (`:1827`)/backend won't apply (only `nearest` honored). (Matches parked render-convolution work.)
 

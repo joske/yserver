@@ -8762,12 +8762,13 @@ fn synthesise_glx_fb_configs(tfp_supported: bool) -> Vec<Vec<(u32, u32)>> {
     out
 }
 
-/// X-Resource (`Res`) extension — minimal stub. Replies are
-/// well-formed but report zero clients / zero resources / zero
-/// bytes everywhere. Real per-client accounting is out of scope;
-/// the extension exists so xfwm4 and similar WMs that probe via
-/// `XResQueryExtension` + `XResQueryVersion` proceed instead of
-/// logging "the display does not support XRes".
+/// X-Resource (`Res`) extension. `QueryClients` returns the real list
+/// of connected clients (their XID ranges) — what `xrestop` enumerates.
+/// The per-client resource-accounting queries (`QueryClientResources`,
+/// `QueryClientPixmapBytes`, `QueryClientIds`, `QueryResourceBytes`)
+/// remain zero-stubs: yserver keeps no per-client resource tallies yet,
+/// so those report empty. TODO(unimplemented): wire them to real
+/// per-client accounting.
 fn handle_x_resource_request(
     state: &mut ServerState,
     client_id: ClientId,
@@ -8793,11 +8794,27 @@ fn handle_x_resource_request(
             x11xres::encode_query_version_reply(byte_order, sequence, major, minor_ver)
         }
         x11xres::QUERY_CLIENTS => {
+            // Every connected client by its XID resource range
+            // (resource_base, resource_mask), sorted by client id for a
+            // deterministic reply. This is exactly what xrestop and other
+            // resource monitors read.
+            let mut entries: Vec<(u32, u32, u32)> = state
+                .clients
+                .iter()
+                .map(|(id, c)| (*id, c.resource_id_base, c.resource_id_mask))
+                .collect();
+            entries.sort_by_key(|(id, _, _)| *id);
+            let clients: Vec<(u32, u32)> = entries
+                .iter()
+                .map(|(_, base, mask)| (*base, *mask))
+                .collect();
             debug!(
-                "client {} #{} X-Resource::QueryClients -> 0 clients (stub)",
-                client_id.0, sequence.0
+                "client {} #{} X-Resource::QueryClients -> {} clients",
+                client_id.0,
+                sequence.0,
+                clients.len()
             );
-            x11xres::encode_query_clients_empty_reply(byte_order, sequence)
+            x11xres::encode_query_clients_reply(byte_order, sequence, &clients)
         }
         x11xres::QUERY_CLIENT_RESOURCES => {
             debug!(
@@ -24378,6 +24395,49 @@ mod tests {
         assert_eq!(bytes[1], x11::error::BAD_IMPLEMENTATION, "code");
         assert_eq!(&bytes[8..10], &45u16.to_le_bytes(), "minor");
         assert_eq!(bytes[10], 128, "major = RANDR");
+    }
+
+    #[test]
+    fn x_resource_query_clients_lists_connected_clients() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let _peer2 = install_client(&mut state, 2);
+        {
+            let c = state.clients.get_mut(&1).unwrap();
+            c.resource_id_base = 0x0040_0000;
+            c.resource_id_mask = 0x001f_ffff;
+        }
+        {
+            let c = state.clients.get_mut(&2).unwrap();
+            c.resource_id_base = 0x0080_0000;
+            c.resource_id_mask = 0x001f_ffff;
+        }
+        let mut backend = RecordingBackend::new();
+        // X-Resource major op 149, QueryClients minor 1.
+        let header = RequestHeader {
+            opcode: 149,
+            data: 1,
+            length_units: 1,
+        };
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &[],
+            None,
+        )
+        .expect("process_request");
+        let bytes = read_all_available(&mut peer);
+        // 32-byte header + 2 clients × 8 bytes.
+        assert_eq!(bytes.len(), 48, "two clients listed: {bytes:02x?}");
+        assert_eq!(&bytes[8..12], &2u32.to_le_bytes(), "num_clients");
+        // Sorted by client id: client 1 then client 2.
+        assert_eq!(&bytes[32..36], &0x0040_0000u32.to_le_bytes(), "c1 base");
+        assert_eq!(&bytes[36..40], &0x001f_ffffu32.to_le_bytes(), "c1 mask");
+        assert_eq!(&bytes[40..44], &0x0080_0000u32.to_le_bytes(), "c2 base");
+        assert_eq!(&bytes[44..48], &0x001f_ffffu32.to_le_bytes(), "c2 mask");
     }
 
     #[test]

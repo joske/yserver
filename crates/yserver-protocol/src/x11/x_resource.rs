@@ -77,6 +77,31 @@ pub fn encode_query_clients_empty_reply(
     encode_count_reply_32_byte(byte_order, sequence, 0)
 }
 
+/// `QueryClients` reply listing every connected client by its XID
+/// resource range. Layout per `res.xml`: pad(1) reply_length(4 = 2·n)
+/// num_clients(4) pad(20), then `n` × { resource_base:CARD32,
+/// resource_mask:CARD32 }. Each `Client` is 8 bytes = 2 reply units.
+#[must_use]
+pub fn encode_query_clients_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    clients: &[(u32, u32)],
+) -> Vec<u8> {
+    let n = u32::try_from(clients.len()).unwrap_or(0);
+    let mut out = Vec::with_capacity(32 + clients.len() * 8);
+    out.push(1);
+    out.push(0);
+    write_u16(byte_order, &mut out, sequence.0);
+    write_u32(byte_order, &mut out, n.saturating_mul(2)); // reply_length (units)
+    write_u32(byte_order, &mut out, n); // num_clients @8
+    out.extend_from_slice(&[0u8; 20]); // pad @12..32
+    for (base, mask) in clients {
+        write_u32(byte_order, &mut out, *base);
+        write_u32(byte_order, &mut out, *mask);
+    }
+    out
+}
+
 /// Empty `QueryClientResources` reply: `num_types = 0`.
 /// Layout: pad(1) num_types(4) pad(20) types[].
 #[must_use]
@@ -177,6 +202,28 @@ mod tests {
         assert_eq!(reply[10], 2, "server_minor low byte");
         // reply_length must be 0 — fixed-size reply.
         assert_eq!(&reply[4..8], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn query_clients_reply_lists_clients() {
+        let clients = [
+            (0x0040_0000u32, 0x001f_ffffu32),
+            (0x0080_0000u32, 0x001f_ffffu32),
+        ];
+        let reply =
+            encode_query_clients_reply(ClientByteOrder::LittleEndian, SequenceNumber(5), &clients);
+        // 32-byte header + 2 clients * 8 bytes.
+        assert_eq!(reply.len(), 48);
+        assert_eq!(reply[0], 1, "reply");
+        assert_eq!(&reply[2..4], &5u16.to_le_bytes(), "sequence");
+        // reply_length = 2 units/client * 2 = 4.
+        assert_eq!(&reply[4..8], &4u32.to_le_bytes(), "reply_length");
+        assert_eq!(&reply[8..12], &2u32.to_le_bytes(), "num_clients @8");
+        // Client list begins at offset 32: { resource_base, resource_mask }.
+        assert_eq!(&reply[32..36], &0x0040_0000u32.to_le_bytes());
+        assert_eq!(&reply[36..40], &0x001f_ffffu32.to_le_bytes());
+        assert_eq!(&reply[40..44], &0x0080_0000u32.to_le_bytes());
+        assert_eq!(&reply[44..48], &0x001f_ffffu32.to_le_bytes());
     }
 
     #[test]
