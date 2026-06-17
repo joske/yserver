@@ -98,6 +98,21 @@ impl LibinputThreadState {
         self.fb_h = fb_h;
     }
 
+    /// Overwrite the cursor accumulator with an absolute position the core
+    /// thread has authoritatively decided (a `WarpPointer`, a confine
+    /// reclamp, or a pointer-barrier clamp). Clamped to the current extent.
+    ///
+    /// Without this, the input thread keeps accumulating relative deltas
+    /// from its own stale position, so a barrier/confine correction in the
+    /// core would not physically hold — the next delta would march the
+    /// cursor straight back past the wall. The caller MUST also drop any
+    /// coalesced `pending_motion` (see the control-wakeup handler) so a
+    /// stale pre-correction delta isn't replayed after the resync.
+    pub fn set_position(&mut self, x: i32, y: i32) {
+        self.cursor_x = f64::from(x).clamp(0.0, f64::from(self.fb_w).max(1.0) - 1.0);
+        self.cursor_y = f64::from(y).clamp(0.0, f64::from(self.fb_h).max(1.0) - 1.0);
+    }
+
     /// Translate one libinput event into a `HostInputEvent`.
     ///
     /// `time_ms` lets tests pin the timestamp; production callers pass
@@ -250,6 +265,13 @@ pub(crate) struct InputThreadControl {
     /// against a wrong extent. The resize path is rare (resize/hotplug),
     /// so the lock cost is irrelevant.
     pending_resize: Mutex<Option<(u32, u32)>>,
+    /// Latched pending absolute cursor position. Written by the core
+    /// thread via `push_position` after a `WarpPointer` / confine reclamp /
+    /// pointer-barrier clamp; read+cleared by the input thread via
+    /// `take_position`, which overwrites its cursor accumulator and drops
+    /// the coalesced motion. `Mutex<Option<(i32,i32)>>` mirrors
+    /// `pending_resize`: only the newest position matters.
+    pending_position: Mutex<Option<(i32, i32)>>,
 }
 
 impl InputThreadControl {
@@ -261,6 +283,7 @@ impl InputThreadControl {
             configs: Mutex::new(VecDeque::new()),
             efd,
             pending_resize: Mutex::new(None),
+            pending_position: Mutex::new(None),
         })
     }
 
@@ -330,6 +353,25 @@ impl InputThreadControl {
     /// handler.
     pub(crate) fn take_resize(&self) -> Option<(u32, u32)> {
         self.pending_resize
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+    }
+
+    /// Push an absolute cursor position to the input thread so its
+    /// accumulator resyncs after a core-side `WarpPointer` / confine
+    /// reclamp / pointer-barrier clamp. Only the latest value matters.
+    pub(crate) fn push_position(&self, x: i32, y: i32) {
+        if let Ok(mut slot) = self.pending_position.lock() {
+            *slot = Some((x, y));
+        }
+        self.wake();
+    }
+
+    /// Read and clear any pending position pushed by [`push_position`].
+    /// Called on the input thread inside the control-wakeup handler.
+    pub(crate) fn take_position(&self) -> Option<(i32, i32)> {
+        self.pending_position
             .lock()
             .ok()
             .and_then(|mut slot| slot.take())
@@ -706,6 +748,15 @@ pub(crate) fn run(
                 log::debug!("input thread: updating cursor extent to {fw}×{fh}");
                 state.set_extent(fw, fh);
             }
+            if let Some((px, py)) = control.take_position() {
+                // Core-authoritative resync (warp / confine / barrier clamp).
+                // Overwrite the accumulator AND drop any coalesced motion —
+                // otherwise a stale pre-clamp delta replays after the
+                // correction and drives the cursor back across the barrier.
+                log::debug!("input thread: resync cursor to ({px}, {py})");
+                state.set_position(px, py);
+                pending_motion = None;
+            }
             if let Some(command) = command {
                 paused = match command {
                     InputThreadCommand::Pause if !paused => {
@@ -906,6 +957,48 @@ mod tests {
             None,
             "extent must be consumed after take"
         );
+    }
+
+    /// `push_position` / `take_position` round-trip (T12 barrier/confine
+    /// resync): deliver the latest position, consume it, latest wins.
+    #[test]
+    fn push_position_take_position_round_trip() {
+        let ctrl = InputThreadControl::new().expect("control");
+        assert_eq!(ctrl.take_position(), None, "no pending position initially");
+        ctrl.push_position(100, 50);
+        ctrl.push_position(99, 50); // a later clamp overwrites
+        assert_eq!(
+            ctrl.take_position(),
+            Some((99, 50)),
+            "take_position returns the latest pushed position"
+        );
+        assert_eq!(ctrl.take_position(), None, "position consumed after take");
+    }
+
+    /// `set_position` overwrites the accumulator and clamps to the extent,
+    /// so a subsequent relative delta integrates from the corrected base
+    /// (this is what makes a barrier/confine clamp physically hold).
+    #[test]
+    fn set_position_overwrites_and_clamps_accumulator() {
+        let mut s = LibinputThreadState::new(800, 600);
+        s.set_position(99, 50);
+        assert_eq!(s.cursor(), (99.0, 50.0), "accumulator overwritten");
+        // Out-of-range request clamps to the extent (799×599).
+        s.set_position(10_000, 10_000);
+        assert_eq!(s.cursor(), (799.0, 599.0), "clamped to extent");
+        // A relative delta now integrates from the corrected base, not a
+        // stale position.
+        let ev = s.map(
+            InputEvent::PointerMotion {
+                dx: -100.0,
+                dy: 0.0,
+            },
+            0,
+        );
+        match ev {
+            HostInputEvent::PointerMotion { x, .. } => assert_eq!(x, 699),
+            other => panic!("expected PointerMotion, got {other:?}"),
+        }
     }
 
     /// Only the latest push_resize survives — older values are overwritten.

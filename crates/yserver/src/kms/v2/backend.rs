@@ -16012,6 +16012,16 @@ impl Backend for KmsBackendV2 {
                 relative: false,
             },
         );
+        // Resync the direct-mode input thread's cursor accumulator to the
+        // warped position (and drop any coalesced delta). Without this the
+        // libinput thread keeps integrating from its stale position, so a
+        // pointer-barrier / confine clamp would not physically hold — the
+        // next relative delta marches the cursor back past the wall. Also
+        // closes the pre-existing confine-drift gap. No-op in libseat mode
+        // (no separate input thread; `input_thread_control` is None).
+        if let Some(ctrl) = &self.input_thread_control {
+            ctrl.push_position(x, y);
+        }
     }
 
     fn query_pointer(&mut self, _origin: Option<OriginContext>) -> io::Result<PointerPosition> {
