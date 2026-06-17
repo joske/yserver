@@ -4460,6 +4460,25 @@ impl KmsBackendV2 {
         }
     }
 
+    /// Notify both input paths of a new virtual framebuffer extent so the
+    /// cursor accumulator clamps to the correct range after a resize or
+    /// hotplug.
+    ///
+    /// - **Libseat mode**: `core_input_state` lives on the core thread;
+    ///   update it directly.
+    /// - **Direct mode**: the accumulator lives on a separate input thread;
+    ///   send the new extent via `InputThreadControl::push_resize`.
+    fn update_input_extent(&mut self, fb_w: u16, fb_h: u16) {
+        let w = u32::from(fb_w);
+        let h = u32::from(fb_h);
+        if let Some(s) = self.core_input_state.as_mut() {
+            s.set_extent(w, h);
+        }
+        if let Some(ctrl) = self.input_thread_control.as_ref() {
+            ctrl.push_resize(w, h);
+        }
+    }
+
     /// Returns `true` when the backend is in libseat mode (VT switching
     /// enabled). `false` in Direct mode (no libseat, today's behaviour).
     #[must_use]
@@ -5108,6 +5127,13 @@ impl KmsBackendV2 {
         // via the single consolidated rebuild path.
         let ts = state.timestamp_now();
         self.rebuild_randr_state(state, Some(ts), true);
+
+        // Propagate the new virtual extent (set by requery_outputs_and_modeset
+        // before we were called) to the cursor accumulator on both input paths.
+        // This allows the pointer to reach the full multi-monitor span after a
+        // hotplug.
+        let (new_fb_w, new_fb_h) = (self.platform.fb_w, self.platform.fb_h);
+        self.update_input_extent(new_fb_w, new_fb_h);
 
         if state.dpms.power_level == 0 {
             self.kms_outputs_active = true;
@@ -9807,6 +9833,11 @@ impl Backend for KmsBackendV2 {
         // ── 1. Update the platform's logical extent ───────────────────────
         self.platform.fb_w = w;
         self.platform.fb_h = h;
+
+        // Propagate the new extent to the cursor accumulator on both the
+        // libseat (on-core) and direct-mode (off-core) input paths so the
+        // pointer can reach the full virtual screen after a resize.
+        self.update_input_extent(w, h);
 
         // ── 2. Resize root backing storage ────────────────────────────────
         // The root drawable is always allocated (init_root_storage runs at

@@ -22,7 +22,7 @@ use std::{
     os::fd::{AsFd, AsRawFd},
     sync::{
         Mutex,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicU8, AtomicU32, Ordering},
     },
 };
 
@@ -86,6 +86,16 @@ impl LibinputThreadState {
     #[must_use]
     pub fn cursor(&self) -> (f64, f64) {
         (self.cursor_x, self.cursor_y)
+    }
+
+    /// Update the virtual framebuffer extent used for pointer clamping.
+    ///
+    /// Called whenever the logical screen size changes (hotplug or
+    /// `RRSetScreenSize`).  The cursor position is NOT re-clamped here;
+    /// it will be clamped to the new extent on the next motion event.
+    pub fn set_extent(&mut self, fb_w: u32, fb_h: u32) {
+        self.fb_w = fb_w;
+        self.fb_h = fb_h;
     }
 
     /// Translate one libinput event into a `HostInputEvent`.
@@ -215,17 +225,29 @@ impl InputThreadCommand {
 
 /// Direct-mode input-thread control channel.
 ///
-/// Carries two kinds of message to the input thread, multiplexed on a
+/// Carries three kinds of message to the input thread, multiplexed on a
 /// single `eventfd` wakeup: the latched pause/resume `command` (for
-/// VT-switch suspend/resume) and a queue of `configs` — client
+/// VT-switch suspend/resume), a queue of `configs` — client
 /// `xinput set-prop` device-config writes that, in direct mode, must be
 /// applied on the thread that owns the libinput handles (libseat mode
-/// routes these straight through the on-core context instead).
+/// routes these straight through the on-core context instead), and a
+/// latched `pending_resize` — the latest virtual framebuffer extent to
+/// apply to the cursor accumulator (only the newest value matters, so
+/// this uses a pair of atomics rather than a queue).
 #[derive(Debug)]
 pub(crate) struct InputThreadControl {
     command: AtomicU8,
     configs: Mutex<VecDeque<(String, DeviceConfigChange)>>,
     efd: EventFd,
+    /// Latched pending resize. Written by the core thread via
+    /// `push_resize`; read+cleared by the input thread via `take_resize`.
+    /// Width packed into the high 32 bits, height into the low 32 bits of
+    /// a single `AtomicU64` would be cleaner, but two separate `AtomicU32`
+    /// avoid pulling in `AtomicU64` (not available on all targets) and are
+    /// readable without extra masking.  A zero width signals "no pending
+    /// resize" (zero is never a valid extent).
+    pending_resize_w: AtomicU32,
+    pending_resize_h: AtomicU32,
 }
 
 impl InputThreadControl {
@@ -236,6 +258,8 @@ impl InputThreadControl {
             command: AtomicU8::new(0),
             configs: Mutex::new(VecDeque::new()),
             efd,
+            pending_resize_w: AtomicU32::new(0),
+            pending_resize_h: AtomicU32::new(0),
         })
     }
 
@@ -280,6 +304,35 @@ impl InputThreadControl {
             .lock()
             .map(|mut q| q.drain(..).collect())
             .unwrap_or_default()
+    }
+
+    /// Push a new virtual framebuffer extent to the input thread so its
+    /// cursor accumulator clamps to the correct range after a resize or
+    /// hotplug.  Only the latest value matters; subsequent calls before
+    /// the thread drains the event overwrite the previous value.
+    ///
+    /// A zero `fb_w` is a no-op (zero is the sentinel for "no pending
+    /// resize").
+    pub(crate) fn push_resize(&self, fb_w: u32, fb_h: u32) {
+        if fb_w == 0 {
+            return;
+        }
+        self.pending_resize_w.store(fb_w, Ordering::Relaxed);
+        self.pending_resize_h.store(fb_h, Ordering::Relaxed);
+        self.wake();
+    }
+
+    /// Read and clear any pending resize pushed by [`push_resize`].
+    /// Returns `Some((fb_w, fb_h))` if a resize is pending, `None`
+    /// otherwise.  Called on the input thread inside the control-wakeup
+    /// handler.
+    pub(crate) fn take_resize(&self) -> Option<(u32, u32)> {
+        let w = self.pending_resize_w.swap(0, Ordering::Relaxed);
+        if w == 0 {
+            return None;
+        }
+        let h = self.pending_resize_h.load(Ordering::Relaxed);
+        Some((w, h))
     }
 
     fn wake(&self) {
@@ -649,6 +702,10 @@ pub(crate) fn run(
                     );
                 }
             }
+            if let Some((fw, fh)) = control.take_resize() {
+                log::debug!("input thread: updating cursor extent to {fw}×{fh}");
+                state.set_extent(fw, fh);
+            }
             if let Some(command) = command {
                 paused = match command {
                     InputThreadCommand::Pause if !paused => {
@@ -765,6 +822,103 @@ mod tests {
         );
         let (cx, _) = s.cursor();
         assert!((cx - 799.0).abs() < 0.5, "cursor_x = {cx}");
+    }
+
+    /// After `set_extent` is called with the new virtual screen size, the
+    /// cursor accumulator must allow motion past the *old* right edge.
+    /// Regression guard for the 2-monitor hotplug bug: boot on a single
+    /// 2560-wide screen, plug in a second screen → virtual width becomes
+    /// 5120; cursor was stuck at x=2559 until the server restarted.
+    #[test]
+    fn set_extent_allows_motion_past_old_right_edge() {
+        // Boot on a single 2560×1440 display.
+        let mut s = LibinputThreadState::new(2560, 1440);
+        // Walk cursor to the right edge of the single-monitor boot extent.
+        let _ = s.map(
+            InputEvent::PointerMotion {
+                dx: 10000.0,
+                dy: 0.0,
+            },
+            0,
+        );
+        let (cx_before, _) = s.cursor();
+        assert!(
+            (cx_before - 2559.0).abs() < 0.5,
+            "cursor should be clamped to 2559 before resize, got {cx_before}"
+        );
+
+        // Second monitor plugged in → virtual screen grows to 5120×1440.
+        s.set_extent(5120, 1440);
+
+        // Move right: must now cross 2560 and reach the new far edge.
+        let ev = s.map(
+            InputEvent::PointerMotion {
+                dx: 1000.0,
+                dy: 0.0,
+            },
+            0,
+        );
+        match ev {
+            HostInputEvent::PointerMotion { x, .. } => {
+                assert!(
+                    x > 2559,
+                    "cursor must cross old right edge after set_extent; got x={x}"
+                );
+                assert!(
+                    x <= 5119,
+                    "cursor must not exceed new right edge (5119); got x={x}"
+                );
+            }
+            other => panic!("expected PointerMotion, got {other:?}"),
+        }
+
+        // Walk all the way to the new right edge.
+        let _ = s.map(
+            InputEvent::PointerMotion {
+                dx: 10000.0,
+                dy: 0.0,
+            },
+            0,
+        );
+        let (cx_after, _) = s.cursor();
+        assert!(
+            (cx_after - 5119.0).abs() < 0.5,
+            "cursor should clamp to new right edge 5119, got {cx_after}"
+        );
+    }
+
+    /// `take_resize` / `push_resize` round-trip: the input thread's control
+    /// channel must deliver the latest extent and return `None` on a
+    /// subsequent drain.
+    #[test]
+    fn push_resize_take_resize_round_trip() {
+        let ctrl = InputThreadControl::new().expect("control");
+        assert_eq!(ctrl.take_resize(), None, "no pending resize initially");
+        ctrl.push_resize(5120, 1440);
+        assert_eq!(
+            ctrl.take_resize(),
+            Some((5120, 1440)),
+            "take_resize must return the pushed extent"
+        );
+        // Second take returns None: resize was consumed.
+        assert_eq!(
+            ctrl.take_resize(),
+            None,
+            "extent must be consumed after take"
+        );
+    }
+
+    /// Only the latest push_resize survives — older values are overwritten.
+    #[test]
+    fn push_resize_overwrites_stale_extent() {
+        let ctrl = InputThreadControl::new().expect("control");
+        ctrl.push_resize(3840, 2160);
+        ctrl.push_resize(5120, 1440);
+        assert_eq!(
+            ctrl.take_resize(),
+            Some((5120, 1440)),
+            "latest resize must win"
+        );
     }
 
     #[test]
