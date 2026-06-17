@@ -291,28 +291,39 @@ impl RandrState {
     ) -> Option<OutputInfoReplyData> {
         let _ = config_timestamp; // accepted but not used
         let out = self.outputs.iter().find(|o| o.output_id == output_id)?;
-        let (width_mm, height_mm) = if out.connected {
-            // Prefer the EDID-reported physical size (passed through
-            // from the DRM connector); fall back to a 96-DPI synthesis
-            // from pixel dimensions when the connector reports 0
-            // (virtio-gpu, ynest nested, displays without EDID).
-            let width_mm = if out.mm_width > 0 {
-                out.mm_width
-            } else {
-                ((u32::from(out.width) * 254 + 480) / 960).max(1)
-            };
-            let height_mm = if out.mm_height > 0 {
-                out.mm_height
-            } else {
-                ((u32::from(out.height) * 254 + 480) / 960).max(1)
-            };
-            (width_mm, height_mm)
+        // A connected-but-OFF output (`mode_id == 0`) has no active mode,
+        // so `width`/`height` are 0. Only the EDID-reported physical size
+        // is meaningful then — the 96-DPI synthesis from pixel dimensions
+        // would fabricate a 1mm×1mm size (→ nonsense DPI for a client that
+        // queries GetOutputInfo before enabling the output). Synthesize
+        // only when an active mode gives real pixel dimensions; otherwise
+        // report the EDID size if present, else 0 (unknown).
+        let enabled = out.connected && out.mode_id != 0;
+        let synth_mm = |px: u16| ((u32::from(px) * 254 + 480) / 960).max(1);
+        let width_mm = if out.mm_width > 0 {
+            out.mm_width
+        } else if enabled {
+            synth_mm(out.width)
         } else {
-            (0, 0)
+            0
+        };
+        let height_mm = if out.mm_height > 0 {
+            out.mm_height
+        } else if enabled {
+            synth_mm(out.height)
+        } else {
+            0
         };
         Some(OutputInfoReplyData {
             timestamp: self.timestamp,
-            crtc: if out.connected { out.crtc_id } else { 0 },
+            // Currently-assigned CRTC: 0 (unassigned) unless the output is
+            // actually enabled. A connected-but-off output reports crtc=0.
+            crtc: if enabled { out.crtc_id } else { 0 },
+            // The set of CRTCs this output *can* be driven by (Xorg
+            // `crtcs`), independent of whether one is currently assigned.
+            // Our model is a stable 1:1 output↔crtc allocation, so the
+            // possible list is always this output's own crtc id.
+            possible_crtcs: vec![out.crtc_id],
             mode_id: out.mode_id,
             width_mm,
             height_mm,
@@ -395,7 +406,9 @@ impl RandrState {
     fn current_mode_table(outputs: &[RandrOutput]) -> Vec<RandrMode> {
         let mut modes: Vec<RandrMode> = Vec::new();
         let mut seen: HashSet<u32> = HashSet::new();
-        for out in outputs.iter().filter(|o| o.connected) {
+        // Skip connected-but-OFF outputs: their `mode_id` is 0, which is
+        // reserved for `None` and must never appear in the mode table.
+        for out in outputs.iter().filter(|o| o.connected && o.mode_id != 0) {
             if seen.insert(out.mode_id) {
                 modes.push(RandrMode {
                     mode_id: out.mode_id,
@@ -428,7 +441,11 @@ impl RandrState {
 /// Data returned by [`RandrState::output_info`].
 pub struct OutputInfoReplyData {
     pub timestamp: u32,
+    /// Currently-assigned CRTC (0 = unassigned / output off).
     pub crtc: u32,
+    /// CRTCs this output can be driven by (the RANDR `crtcs` array — the
+    /// *possible* set, not the assigned one).
+    pub possible_crtcs: Vec<u32>,
     pub mode_id: u32,
     pub width_mm: u32,
     pub height_mm: u32,
@@ -918,6 +935,53 @@ mod tests {
         let st = RandrState::from_outputs(0, outs);
         assert_eq!(st.screen_width, 1920);
         assert_eq!(st.screen_height, 2160, "screen must encompass y+height");
+    }
+
+    #[test]
+    fn connected_off_output_reports_unassigned_crtc_and_no_synth_mm() {
+        // A hotplugged-but-not-yet-enabled output (connected, mode_id=0,
+        // 0×0 geometry, no EDID). GetOutputInfo must report it as
+        // RR_Connected but UNASSIGNED: crtc=0, no fabricated mm size, and
+        // its possible-CRTCs list still advertises the stable crtc it can
+        // drive. The mode table must not pick up the reserved mode id 0.
+        let outs = vec![RandrOutput {
+            name: "HDMI-A-1".into(),
+            output_id: 10,
+            crtc_id: 11,
+            mode_id: 0,
+            connected: true,
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+            vrefresh: 0,
+            mm_width: 0,
+            mm_height: 0,
+            mode_ids: vec![12, 13],
+            num_preferred: 1,
+        }];
+        let st = RandrState::from_outputs(0, outs);
+
+        // current_mode_table (via from_outputs) must skip mode_id 0.
+        assert!(
+            !st.modes.iter().any(|m| m.mode_id == 0),
+            "reserved mode id 0 must never appear in the mode table",
+        );
+
+        let info = st.output_info(10, 0).expect("output present");
+        assert_eq!(info.connection, 0, "output is RR_Connected");
+        assert_eq!(info.crtc, 0, "off output has no assigned crtc");
+        assert_eq!(
+            info.possible_crtcs,
+            vec![11],
+            "possible-CRTCs still advertises the output's stable crtc",
+        );
+        assert_eq!(info.width_mm, 0, "no synthesized mm for an off output");
+        assert_eq!(info.height_mm, 0);
+        assert_eq!(info.mode_id, 0);
+
+        // crtc_info on the (unassigned) crtc reports the off geometry.
+        assert_eq!(st.crtc_info(11, 0).expect("crtc present").mode_id, 0);
     }
 
     #[test]

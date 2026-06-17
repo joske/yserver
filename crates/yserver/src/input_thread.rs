@@ -22,7 +22,7 @@ use std::{
     os::fd::{AsFd, AsRawFd},
     sync::{
         Mutex,
-        atomic::{AtomicU8, AtomicU32, Ordering},
+        atomic::{AtomicU8, Ordering},
     },
 };
 
@@ -241,13 +241,13 @@ pub(crate) struct InputThreadControl {
     efd: EventFd,
     /// Latched pending resize. Written by the core thread via
     /// `push_resize`; read+cleared by the input thread via `take_resize`.
-    /// Width packed into the high 32 bits, height into the low 32 bits of
-    /// a single `AtomicU64` would be cleaner, but two separate `AtomicU32`
-    /// avoid pulling in `AtomicU64` (not available on all targets) and are
-    /// readable without extra masking.  A zero width signals "no pending
-    /// resize" (zero is never a valid extent).
-    pending_resize_w: AtomicU32,
-    pending_resize_h: AtomicU32,
+    /// Latest pending virtual-framebuffer extent, or `None` when no
+    /// resize is pending. A `Mutex` (not a pair of atomics) so the `(w, h)`
+    /// pair is read/written atomically — two independent atomics let
+    /// `take_resize` observe a torn `(new_w, old_h)` and clamp the cursor
+    /// against a wrong extent. The resize path is rare (resize/hotplug),
+    /// so the lock cost is irrelevant.
+    pending_resize: Mutex<Option<(u32, u32)>>,
 }
 
 impl InputThreadControl {
@@ -258,8 +258,7 @@ impl InputThreadControl {
             command: AtomicU8::new(0),
             configs: Mutex::new(VecDeque::new()),
             efd,
-            pending_resize_w: AtomicU32::new(0),
-            pending_resize_h: AtomicU32::new(0),
+            pending_resize: Mutex::new(None),
         })
     }
 
@@ -317,8 +316,9 @@ impl InputThreadControl {
         if fb_w == 0 {
             return;
         }
-        self.pending_resize_w.store(fb_w, Ordering::Relaxed);
-        self.pending_resize_h.store(fb_h, Ordering::Relaxed);
+        if let Ok(mut slot) = self.pending_resize.lock() {
+            *slot = Some((fb_w, fb_h));
+        }
         self.wake();
     }
 
@@ -327,12 +327,10 @@ impl InputThreadControl {
     /// otherwise.  Called on the input thread inside the control-wakeup
     /// handler.
     pub(crate) fn take_resize(&self) -> Option<(u32, u32)> {
-        let w = self.pending_resize_w.swap(0, Ordering::Relaxed);
-        if w == 0 {
-            return None;
-        }
-        let h = self.pending_resize_h.load(Ordering::Relaxed);
-        Some((w, h))
+        self.pending_resize
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
     }
 
     fn wake(&self) {

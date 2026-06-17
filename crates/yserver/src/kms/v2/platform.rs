@@ -840,7 +840,19 @@ impl PlatformBackend {
 
         let submit_group = SubmitGroup::new();
         #[cfg(target_os = "linux")]
-        let hotplug_monitor = crate::kms::hotplug::DrmHotplugMonitor::new().unwrap_or(None);
+        let hotplug_monitor = match crate::kms::hotplug::DrmHotplugMonitor::new() {
+            Ok(monitor) => monitor,
+            Err(e) => {
+                // Don't fail bring-up — yserver runs fine without runtime
+                // hotplug — but surface WHY (udev/netlink/permission) so a
+                // silently-disabled monitor is diagnosable.
+                log::warn!(
+                    "v2 PlatformBackend: DRM hotplug monitor unavailable ({e}); \
+                     runtime display hotplug disabled"
+                );
+                None
+            }
+        };
 
         log::info!(
             "v2 PlatformBackend: ready — {} outputs, fb {}x{}, {} scanout pools live",

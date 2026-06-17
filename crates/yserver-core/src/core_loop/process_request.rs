@@ -2252,7 +2252,10 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             };
-            let crtc_ids = [info_data.crtc];
+            // The `crtcs` array is the output's *possible* CRTCs, not the
+            // currently-assigned one (which is 0 for a connected-but-off
+            // output and would advertise an invalid crtcs=[0]).
+            let crtc_ids = info_data.possible_crtcs.as_slice();
             let mode_ids = info_data.mode_ids.as_slice();
             let name_bytes = info_data.name.as_bytes();
             let buf = x11randr::encode_get_output_info_reply(
@@ -2265,7 +2268,7 @@ fn handle_randr_request(
                     height_mm: info_data.height_mm,
                     connection: info_data.connection,
                     subpixel_order: 0,
-                    crtcs: &crtc_ids,
+                    crtcs: crtc_ids,
                     modes: mode_ids,
                     num_preferred: info_data.num_preferred,
                     clones: &[],
