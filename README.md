@@ -4,7 +4,7 @@ A modern X11 server written from scratch in Rust.
 
 The goal is not to clone Xorg. It is to provide a practical X11 server that
 runs real desktop environments, window managers, and applications on modern
-Linux while dropping legacy baggage (multiple screens, non-TrueColor visuals,
+Linux while dropping legacy baggage (non-TrueColor visuals,
 indirect GLX, the DDX driver ABI, endian-swapped clients, and so on).
 
 See [`docs/high-level-design.md`](docs/high-level-design.md) for the full design and scope.
@@ -47,6 +47,10 @@ We support the following extensions:
 Implemented and tested on AMD, intel, Asahi and Qualcomm. It can NOT (read: NEVER) work on nvidia proprietary driver, and on
 the only nvidia card I have (GTX 1050), the nouveau driver can not even bring up Xorg. Nouveau may work on other
 cards, but untested.
+
+### Recent work
+- FreeBSD now works
+- Display hotplug now works
 
 ## Demo
 
