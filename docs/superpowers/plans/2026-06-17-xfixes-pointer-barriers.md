@@ -314,7 +314,7 @@ Helper context: `x11xfixes` is the import alias for `yserver_protocol::x11::xfix
     fn create_pointer_barrier_stores_resource() {
         let mut state = ServerState::new();
         let _peer = install_client(&mut state, 1);
-        let bid = first_free_client_xid(&state, ClientId(1)); // see helper note below
+        let bid = 0x0040_0001u32; // any non-zero xid (install_client range is 0/u32::MAX)
         xfixes_create_barrier(&mut state, ClientId(1), bid, ROOT_WINDOW.0, 100, 0, 100, 200, 0, &[]).unwrap();
         let b = state.pointer_barriers.get(&bid).expect("stored");
         assert_eq!((b.x1, b.y1, b.x2, b.y2), (100, 0, 100, 200));
@@ -326,7 +326,7 @@ Helper context: `x11xfixes` is the import alias for `yserver_protocol::x11::xfix
     fn create_pointer_barrier_diagonal_is_bad_value() {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
-        let bid = first_free_client_xid(&state, ClientId(1));
+        let bid = 0x0040_0001u32;
         xfixes_create_barrier(&mut state, ClientId(1), bid, ROOT_WINDOW.0, 0, 0, 50, 80, 0, &[]).unwrap();
         let bytes = read_all_available(&mut peer);
         assert_eq!(bytes[0], 0, "error");
@@ -338,7 +338,7 @@ Helper context: `x11xfixes` is the import alias for `yserver_protocol::x11::xfix
     fn create_pointer_barrier_bad_window() {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
-        let bid = first_free_client_xid(&state, ClientId(1));
+        let bid = 0x0040_0001u32;
         xfixes_create_barrier(&mut state, ClientId(1), bid, 0x9999, 100, 0, 100, 200, 0, &[]).unwrap();
         let bytes = read_all_available(&mut peer);
         assert_eq!(bytes[1], x11::error::BAD_WINDOW);
@@ -349,7 +349,7 @@ Helper context: `x11xfixes` is the import alias for `yserver_protocol::x11::xfix
         // vertical barrier (x1==x2) with negative x → BadValue.
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
-        let bid = first_free_client_xid(&state, ClientId(1));
+        let bid = 0x0040_0001u32;
         xfixes_create_barrier(&mut state, ClientId(1), bid, ROOT_WINDOW.0, -1, 0, -1, 200, 0, &[]).unwrap();
         let bytes = read_all_available(&mut peer);
         assert_eq!(bytes[1], x11::error::BAD_VALUE);
@@ -360,7 +360,7 @@ Helper context: `x11xfixes` is the import alias for `yserver_protocol::x11::xfix
         // device 3 = keyboard, not a master pointer → BadDevice.
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
-        let bid = first_free_client_xid(&state, ClientId(1));
+        let bid = 0x0040_0001u32;
         xfixes_create_barrier(&mut state, ClientId(1), bid, ROOT_WINDOW.0, 100, 0, 100, 200, 0, &[3]).unwrap();
         let bytes = read_all_available(&mut peer);
         assert_eq!(bytes[1], XI1_ERROR_BAD_DEVICE);
@@ -371,7 +371,7 @@ Helper context: `x11xfixes` is the import alias for `yserver_protocol::x11::xfix
         let mut state = ServerState::new();
         let mut peer1 = install_client(&mut state, 1);
         let _peer2 = install_client(&mut state, 2);
-        let bid = first_free_client_xid(&state, ClientId(1));
+        let bid = 0x0040_0001u32;
         xfixes_create_barrier(&mut state, ClientId(1), bid, ROOT_WINDOW.0, 100, 0, 100, 200, 0, &[]).unwrap();
         let _ = read_all_available(&mut peer1);
         // wrong client → BadAccess, not freed
@@ -385,7 +385,7 @@ Helper context: `x11xfixes` is the import alias for `yserver_protocol::x11::xfix
     }
 ```
 
-> Helper note: if no `first_free_client_xid` helper exists, compute a valid client XID inline — clients in tests use a known base; reuse the same id-allocation the other XID tests use (grep the test module for how `CREATE_REGION` tests pick a region id and copy that). The exact helper isn't load-bearing; any in-range, unused client XID works.
+> Test-XID note: `install_client` sets `resource_id_base: 0, resource_id_mask: u32::MAX`, so any non-zero, currently-unused XID is in range — hence the `0x0040_0001` literal. No helper needed.
 
 - [ ] **Step 2: Run, verify fail.** Run: `cargo test -p yserver-core create_pointer_barrier`
 Expected: FAIL — barriers not dispatched (no error emitted / not stored).
@@ -424,7 +424,10 @@ Expected: FAIL — barriers not dispatched (no error emitted / not stored).
                 if state.xid_occupied(req.barrier)
                     || xid_out_of_client_range(state, client_id, req.barrier)
                 {
-                    return emit_x11_error(state, client_id, sequence, x11::error::BAD_ID_CHOICE, req.barrier, XFIXES_MAJOR_OPCODE);
+                    // Xorg XICreatePointerBarrier returns BadAlloc on the
+                    // AddResource failure for an in-use XID (xibarriers.c:827);
+                    // match it (the spec's errors table agrees).
+                    return emit_x11_error(state, client_id, sequence, x11::error::BAD_ALLOC, req.barrier, XFIXES_MAJOR_OPCODE);
                 }
                 // Normalize x1<=x2, y1<=y2 (Xorg sort_min_max) — but skip if any
                 // endpoint negative (ray convention). Devices are pre-validated.
@@ -489,19 +492,21 @@ git commit -m "feat(barriers): dispatch CreatePointerBarrier/DeletePointerBarrie
     #[test]
     fn disconnect_frees_pointer_barriers() {
         let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
         let _peer = install_client(&mut state, 1);
-        let bid = first_free_client_xid(&state, ClientId(1));
+        let bid = 0x0040_0001u32; // any non-zero xid; install_client range is 0/u32::MAX
         state.pointer_barriers.insert(bid, crate::server::PointerBarrier {
             owner: ClientId(1), window: ROOT_WINDOW, x1: 0, y1: 0, x2: 0, y2: 10,
             directions: 0, devices: Vec::new(), hit: false, seen: false,
             event_id: 1, release_event_id: 0, last_timestamp: 0,
         });
-        process_client_disconnect(&mut state, ClientId(1)); // use the real disconnect entry point
+        process_disconnect(&mut state, &mut backend, ClientId(1));
         assert!(state.pointer_barriers.is_empty());
     }
 ```
 
-> Use the actual disconnect function name/signature from `process_disconnect.rs` (grep for `pub fn`); the assertion is the point.
+> Real signature: `process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, client_id: ClientId)` (`process_disconnect.rs:81`).
+> NOTE: emitting a released `BarrierLeave` when a *hit* barrier is freed at disconnect (Xorg `BarrierFreeBarrier`) is added in **Task 11** (Phase 3), once the event encoder exists. Phase 1 only frees the resource — correct, because no barrier can be `hit` until Phase 2/3 wire up the clamp + hit-state.
 
 - [ ] **Step 2: Run, verify fail.** Run: `cargo test -p yserver-core disconnect_frees_pointer_barriers`
 Expected: FAIL — barrier survives disconnect.
@@ -603,7 +608,11 @@ pub fn is_blocking(b: &BarrierGeom, x1: i32, y1: i32, x2: i32, y2: i32) -> Optio
         if !(0.0..=1.0).contains(&t) { return None; }
         if x2 > x1 && t == 0.0 { return None; } // sitting on barrier, moving +X away
         let y = t * (y1 - y2) + y1;
-        if !inside_segment(y.round() as i32, b.y1, b.y2) { return None; }
+        // Xorg passes the float `y` to `inside_segment(int v, ...)`,
+        // relying on C float→int TRUNCATION toward zero. `as i32`
+        // matches; do NOT round (changes fractional-crossing hits).
+        #[allow(clippy::cast_possible_truncation)]
+        if !inside_segment(y as i32, b.y1, b.y2) { return None; }
         Some(((y - y1).powi(2) + (bx - x1).powi(2)).sqrt())
     } else {
         // horizontal: mirror image
@@ -613,7 +622,8 @@ pub fn is_blocking(b: &BarrierGeom, x1: i32, y1: i32, x2: i32, y2: i32) -> Optio
         if !(0.0..=1.0).contains(&t) { return None; }
         if y2 > y1 && t == 0.0 { return None; }
         let x = t * (x1 - x2) + x1;
-        if !inside_segment(x.round() as i32, b.x1, b.x2) { return None; }
+        #[allow(clippy::cast_possible_truncation)]
+        if !inside_segment(x as i32, b.x1, b.x2) { return None; } // truncate, not round (Xorg float→int)
         Some(((x - x1).powi(2) + (by - y1).powi(2)).sqrt())
     }
 }
@@ -764,8 +774,8 @@ The clamp runs only for genuine relative motion: skip when `is_replay`, when `ba
         });
         state.pointer_root = (90, 50); // currently left of the barrier
         // motion to (110,50): should clamp to (99,50)
-        let ev = motion_event_at(110, 50); // helper: build HostPointerEvent motion
-        pointer_event_fanout_to_state(&mut state, &mut backend, &HostXidMap::default(), ev, true, false);
+        let mut ev = motion_event(); ev.root_x = 110; ev.root_y = 50;
+        pointer_event_fanout_to_state(&mut state, &mut backend, &HostXidMap::new(), ev, true, false);
         assert_eq!(state.pointer_root, (99, 50), "clamped to x1-1");
     }
 
@@ -780,13 +790,13 @@ The clamp runs only for genuine relative motion: skip when `is_replay`, when `ba
         });
         state.pointer_root = (90, 50);
         state.barrier_bypass = true; // simulate WarpPointer
-        let ev = motion_event_at(110, 50);
-        pointer_event_fanout_to_state(&mut state, &mut backend, &HostXidMap::default(), ev, true, false);
+        let mut ev = motion_event(); ev.root_x = 110; ev.root_y = 50;
+        pointer_event_fanout_to_state(&mut state, &mut backend, &HostXidMap::new(), ev, true, false);
         assert_eq!(state.pointer_root, (110, 50), "warp not clamped");
     }
 ```
 
-> `motion_event_at` / `HostXidMap::default()`: use whatever constructor the existing fanout tests use to build a motion `HostPointerEvent` with `root_x/root_y`. Grep the test module; reuse it.
+> `motion_event()` (`pointer_fanout.rs:1937`) returns a `MotionNotify` `HostPointerEvent`; override `.root_x`/`.root_y` for the test. `HostXidMap::new()` (`host_x11/mod.rs:1383`) is the empty map. Both are already used by sibling fanout tests.
 
 - [ ] **Step 2: Run, verify fail.** Run: `cargo test -p yserver-core motion_clamps_against_solid_barrier`
 Expected: FAIL — no clamp; `pointer_root` is (110,50). Also a compile error for the missing `barrier_bypass` field — add it in Step 3.
@@ -806,16 +816,24 @@ Expected: FAIL — no clamp; `pointer_root` is (110,50). Also a compile error fo
         let mut ny = i32::from(event.root_y);
         if (nx, ny) != (ox, oy) {
             use crate::core_loop::barriers::{BarrierGeom, direction_of, find_nearest, clamp_to_barrier};
-            // Snapshot candidate geoms (index = stable iteration order).
-            let candidates: Vec<(usize, BarrierGeom)> = state
-                .pointer_barriers
-                .values()
+            // Snapshot candidate geoms WITH their barrier XID key. `idx`
+            // (the find_nearest index) maps back to `keys[idx]` so the
+            // loop — and the Phase-3 release short-circuit (Task 10) —
+            // can `state.pointer_barriers.get_mut(&keys[idx])`. Snapshot
+            // up front so we don't borrow `state.pointer_barriers` across
+            // the `backend.warp_pointer_root(state, …)` call below.
+            let keys: Vec<u32> = state.pointer_barriers.keys().copied().collect();
+            let candidates: Vec<(usize, BarrierGeom)> = keys
+                .iter()
                 .enumerate()
-                .map(|(i, b)| (i, BarrierGeom {
-                    x1: i32::from(b.x1), y1: i32::from(b.y1),
-                    x2: i32::from(b.x2), y2: i32::from(b.y2),
-                    directions: b.directions,
-                }))
+                .map(|(i, k)| {
+                    let b = &state.pointer_barriers[k];
+                    (i, BarrierGeom {
+                        x1: i32::from(b.x1), y1: i32::from(b.y1),
+                        x2: i32::from(b.x2), y2: i32::from(b.y2),
+                        directions: b.directions,
+                    })
+                })
                 .collect();
             let (mut cx, mut cy) = (ox, oy);
             let mut seen: Vec<usize> = Vec::new();
@@ -823,11 +841,15 @@ Expected: FAIL — no clamp; `pointer_root` is (110,50). Also a compile error fo
             while dir != 0 {
                 let Some((idx, _dist, geom)) = find_nearest(&candidates, &seen, dir, cx, cy, nx, ny) else { break; };
                 seen.push(idx);
+                let key = keys[idx];
+                // Phase 3 / Task 10: the release short-circuit lives here —
+                //   if let Some(b) = state.pointer_barriers.get(&key)
+                //       && b.event_id == b.release_event_id { continue; }
                 clamp_to_barrier(&geom, dir, &mut nx, &mut ny);
                 // resolve one axis per pass
                 if geom.x1 == geom.x2 { dir &= !(crate::core_loop::barriers::POSITIVE_X | crate::core_loop::barriers::NEGATIVE_X); cx = nx; }
                 else { dir &= !(crate::core_loop::barriers::POSITIVE_Y | crate::core_loop::barriers::NEGATIVE_Y); cy = ny; }
-                // (Phase 3: mark hit + emit BarrierHit here.)
+                // (Phase 3 / Task 9: state.pointer_barriers.get_mut(&key) → mark hit + emit BarrierHit.)
             }
             #[allow(clippy::cast_possible_truncation)]
             {
@@ -933,11 +955,15 @@ pub fn write_xi_barrier_event(
     dy: f64,
 ) {
     fn fp1616(v: i32) -> i32 { v << 16 }
+    // Port of Xorg dix/inpututils.c `double_to_fp3232`: integral = floor(in),
+    // frac = (in - integral) * 2^32. floor (NOT trunc) so negative deltas
+    // encode correctly: -1.5 → integral -2, frac 0.5*2^32.
     fn fp3232(v: f64) -> (i32, u32) {
+        let integral_f = v.floor();
         #[allow(clippy::cast_possible_truncation)]
-        let integral = v.trunc() as i32;
+        let integral = integral_f as i32;
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let frac = (v.fract().abs() * f64::from(u32::MAX)) as u32;
+        let frac = ((v - integral_f) * 4_294_967_296.0_f64) as u32; // 1<<32
         (integral, frac)
     }
     let mut out = Vec::with_capacity(68);
@@ -1005,8 +1031,8 @@ Delivery rule (Xorg `ProcessBarrierEvent`, `exevents.c:1724`): look up `barrier.
             event_id: 1, release_event_id: 0, last_timestamp: 0,
         });
         state.pointer_root = (90, 50);
-        let ev = motion_event_at(110, 50);
-        pointer_event_fanout_to_state(&mut state, &mut backend, &HostXidMap::default(), ev, true, false);
+        let mut ev = motion_event(); ev.root_x = 110; ev.root_y = 50;
+        pointer_event_fanout_to_state(&mut state, &mut backend, &HostXidMap::new(), ev, true, false);
         let bytes = read_all_available(&mut peer);
         // find the GenericEvent (type 35, evtype 25) in the stream
         assert!(bytes.windows(2).any(|w| w[0] == 35), "GenericEvent present");
@@ -1102,7 +1128,15 @@ pub fn parse_xi_barrier_release(body: &[u8]) -> Option<Vec<(u16, u32, u32)>> {
 ```rust
         61 => {
             if let Some(entries) = x11::parse_xi_barrier_release(body) {
-                for (_dev, bid, eid) in entries {
+                for (dev, bid, eid) in entries {
+                    // Xorg ProcXIBarrierReleasePointer validates the device
+                    // (dixLookupDevice) and that the barrier applies to it
+                    // (GetBarrierDevice) → BadDevice (xibarriers.c:902,921,925).
+                    // yserver's master pointer is device 2; the wildcards
+                    // 0/1 also resolve to it. Anything else → BadDevice.
+                    if !(dev == 0 || dev == 1 || dev == 2) {
+                        return emit_x11_error_with_minor(state, client_id, sequence, XI1_ERROR_BAD_DEVICE, u32::from(dev), 61, XI2_MAJOR_OPCODE);
+                    }
                     match state.pointer_barriers.get_mut(&bid) {
                         None => {
                             return emit_x11_error_with_minor(state, client_id, sequence, x11::error::BAD_VALUE, bid, 61, XI2_MAJOR_OPCODE);
@@ -1121,7 +1155,7 @@ pub fn parse_xi_barrier_release(body: &[u8]) -> Option<Vec<(u16, u32, u32)>> {
         }
 ```
 
-- [ ] **Step 3c: Add the release short-circuit** in the Task-7 clamp loop, right after `find_nearest` resolves a barrier `idx`: look up the real barrier behind `idx`; if `event_id == release_event_id`, `continue` (mark `seen` first so the loop advances) instead of clamping. (Map `idx` back to the barrier key — keep a parallel `Vec<u32>` of keys alongside `candidates`.)
+- [ ] **Step 3c: Add the release short-circuit** in the Task-7 clamp loop, at the marked spot right after `let key = keys[idx];` (Task 7 already snapshots `keys`): if `state.pointer_barriers.get(&key)` has `event_id == release_event_id`, `continue` (the `seen.push(idx)` above already advanced the loop) so this barrier is not clamped for the released crossing.
 
 - [ ] **Step 4: Run, verify pass.** Run: `cargo test -p yserver-protocol parse_xi_barrier_release` and `cargo test -p yserver-core release_lets_pointer_cross`
 Expected: PASS.
@@ -1152,7 +1186,9 @@ git add -A && git commit -m "feat(barriers): XIBarrierReleasePointer one-shot re
 - [ ] **Step 2: Run, verify fail.** Run: `cargo test -p yserver-core delete_while_hit_emits_released_leave`
 Expected: FAIL — no leave emitted.
 
-- [ ] **Step 3: Implement.** In the `DELETE_POINTER_BARRIER` `Some(_)` branch, before `remove`: if `b.hit`, build a `BarrierLeave` via `write_xi_barrier_event` with `evtype = 26`, `flags = 1` (`XIBarrierPointerReleased`), `sourceid = 0`, `dx = dy = 0.0`, preserving `root`/`event_window`/`event_id`, and deliver (same delivery helper as Task 9). Then `remove`.
+- [ ] **Step 3: Implement.** Factor a helper `synthesize_released_leave(state, barrier_xid)` that, if the barrier is `hit`, builds a `BarrierLeave` via `write_xi_barrier_event` with `evtype = 26`, `flags = 1` (`XIBarrierPointerReleased`), `sourceid = 0`, `dx = dy = 0.0`, preserving `root`/`event_window`/`event_id`, and delivers it (same delivery helper as Task 9). Call it:
+  - in the `DELETE_POINTER_BARRIER` `Some(_)` branch **before** `remove`;
+  - in `process_disconnect` (`process_disconnect.rs`) for each `hit` barrier owned by the disconnecting client, **before** the `pointer_barriers.retain(...)` from Task 5 (Xorg `BarrierFreeBarrier` fires on the resource teardown that disconnect triggers).
 
 > Window-destroy: no code change needed beyond what Task 9 already does — delivery looks up `barrier.window` and drops the event if absent. Add a regression test confirming a hit barrier whose window was destroyed still confines but emits no event (drive a motion after destroying the window; assert `pointer_root` clamps and `read_all_available` yields no GenericEvent).
 
@@ -1210,5 +1246,5 @@ git add -A && git commit -m "feat(barriers): KMS input-thread SetPosition resync
 - **Spec coverage:** resource model (T1), XID namespace (T2), wire parse (T3), create/delete + all 6 validation errors (T4), disconnect free (T5), clamp math (T6), motion hook + bypass (T7), event encode (T8), Hit/Leave + grab (T9), release one-shot (T10), delete-leave + window-destroy (T11), KMS resync (T12), HW gate (T13). The Xinerama-style multi-CRTC `window→screen` mapping is single-root-space per the spec non-goals.
 - **Type consistency:** `PointerBarrier` field names are identical across T1/T2/T4/T5/T7/T9/T10/T11. `write_xi_barrier_event` signature defined in T8 is reused verbatim in T9/T11. `barriers::{BarrierGeom, direction_of, find_nearest, clamp_to_barrier, POSITIVE_X, NEGATIVE_X, ...}` defined in T6, used in T7/T10.
 - **Known coarse steps:** T9 Step 3 is explicitly split into (a)(b)(c) sub-commits; T12 needs the executor to read the current input-thread channel first (Step 1) before the test, because the exact slot mechanism depends on what's there.
-- **BadIdChoice vs BadAlloc:** T4 uses `BAD_ID_CHOICE` for an in-use/out-of-range client XID, matching yserver's existing `CREATE_REGION` sibling (the spec's "BadAlloc" note refers to Xorg's `AddResource` failure; intra-server consistency wins here — note kept in the dispatch comment).
+- **XID error = BadAlloc:** T4 uses `BAD_ALLOC` for an in-use/out-of-range barrier XID, matching Xorg `XICreatePointerBarrier`'s `AddResource` failure (xibarriers.c:827) and the spec's errors table. (This differs from the `CREATE_REGION` sibling, which uses `BadIdChoice` — barriers follow Xorg's barrier-specific behavior.)
 ```
