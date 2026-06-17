@@ -2803,14 +2803,17 @@ fn handle_randr_request(
             }
         }
         16 | 29 | 45 => {
-            // RRCreateMode (16) / RRSetPanning (29) / RRCreateLease (45):
-            // reply-bearing requests we don't implement. Return
-            // BadImplementation so the client gets an error instead of
-            // hanging forever on a reply that never comes. Void
-            // unimplemented RANDR requests stay silent via `other` below —
-            // Xorg implements those as success, so erroring them would be a
-            // new behavioural divergence; a missing *reply* is the only
-            // client-hanging case and the only one converted here.
+            // TODO(unimplemented): RRCreateMode (16) / RRSetPanning (29) /
+            // RRCreateLease (45) are NOT actually implemented. This
+            // BadImplementation is a STOPGAP to stop the client hanging on a
+            // reply that never comes — it is NOT protocol-correct: Xorg
+            // implements all three and returns real data. Replace with real
+            // implementations (custom modes / panning / DRM lease).
+            //
+            // Void unimplemented RANDR requests deliberately stay silent via
+            // `other` below — Xorg implements those as success, so erroring
+            // them would be a new Xorg-divergence; only the reply-bearing
+            // hang cases are converted here.
             return emit_x11_error_with_minor(
                 state,
                 client_id,
@@ -14011,9 +14014,13 @@ fn handle_xi2_request(
             buf.extend_from_slice(&reply);
         }
         50 => {
-            // XIGetFocus: reply-bearing but unimplemented. Return
-            // BadImplementation rather than the silent `Handled` below,
-            // which writes no reply and hangs the client forever.
+            // TODO(unimplemented): XIGetFocus is NOT actually implemented.
+            // This BadImplementation is a STOPGAP to stop the client
+            // hanging on a reply that never comes (the silent `Handled`
+            // below). It is NOT protocol-correct: Xorg returns the real
+            // per-device focus window, and the focus state already exists
+            // here (see GetDeviceFocus / XI1 minor 20). Replace with a real
+            // XIGetFocusReply.
             return emit_x11_error_with_minor(
                 state,
                 client_id,
