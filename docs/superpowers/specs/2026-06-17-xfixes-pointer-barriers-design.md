@@ -36,7 +36,12 @@ pub struct PointerBarrier {
     pub x1: i16, pub y1: i16, // normalized so x1<=x2, y1<=y2 EXCEPT when an endpoint
     pub x2: i16, pub y2: i16, // is negative (ray/line convention — see clamp algorithm)
     pub directions: u32,      // stuff->directions & 0x0f, with axis-irrelevant bits stripped
-    pub devices: Vec<u16>,    // empty = all master pointers
+    pub devices: Vec<u16>,    // empty = all master pointers. Wildcards
+                              // XIAllDevices(0)/XIAllMasterDevices(1) also
+                              // mean "all" (Xorg barrier_blocks_device,
+                              // xibarriers.c:301). yserver has one master
+                              // pointer (2), so {empty, [0], [1], [2]} are
+                              // all equivalent.
 
     // --- runtime hit-state for the single master pointer (XI device 2) ---
     pub hit: bool,            // pointer is currently resting on this barrier
@@ -52,7 +57,7 @@ Invariants from Xorg: `event_id` starts at 1 and `release_event_id` at 0, so the
 ### Lifetime & XID namespace
 
 - **Create:** XID supplied by the client (like Xorg). Reject if already in use (`state.xid_occupied(id)` → `BadAlloc`).
-- **Free:** on `DeletePointerBarrier` and on client disconnect — `pointer_barriers.retain(|_, b| b.owner != client_id)` added to `crates/yserver-core/src/core_loop/process_disconnect.rs` (beside the `xfixes_regions` sweep). On free, if the barrier is currently `hit`, synthesize a `BarrierLeave` with `XIBarrierPointerReleased` first (Xorg `BarrierFreeBarrier`).
+- **Free:** on `DeletePointerBarrier` and on client disconnect — `pointer_barriers.retain(|_, b| b.owner != client_id)` added to `crates/yserver-core/src/core_loop/process_disconnect.rs` (beside the `xfixes_regions` sweep). On free, if the barrier is currently `hit`, synthesize a `BarrierLeave` first (Xorg `BarrierFreeBarrier`, xibarriers.c:655). This non-motion leave has a specific payload: `flags = XIBarrierPointerReleased`, `sourceid = 0`, `dx = dy = 0` (FP3232 zero), and preserves the barrier's current `root`/`event` window and `event_id`/`dtime`. Don't emit a generic zeroed event — sourceid and the released flag are load-bearing for clients tracking the sequence.
 - **XID namespace registration (MANDATORY — XC-MISC time-bomb guard, see `project_xcmisc_missing_wm_death`):** add `pointer_barriers` to `xid_occupied` (`server.rs:1429`), `used_xids_in` (`server.rs:1444`), and extend the `xid_occupied_covers_every_namespace` test (`server.rs:4832`).
 - **Window destroy:** the barrier's `window` is a *reference* for screen selection + event routing, not an owner — the barrier is its own resource and is NOT freed when the window dies (matches Xorg; in practice the window is almost always the root, which never dies). **Confinement is independent of the window** and keeps working. Event delivery mirrors Xorg `ProcessBarrierEvent` (`Xi/exevents.c:1724`): it does `dixLookupWindow(be->window)` and **returns on failure with NO root fallback** — so while the barrier's window is absent, `BarrierHit`/`BarrierLeave` events are simply **dropped** (not rerouted to root). The barrier itself persists until `DeletePointerBarrier` or owner disconnect. (Do not invent a forced-leave or root-fallback on window destroy — that would diverge from upstream.)
 - **Screen / RANDR geometry change:** barrier coordinates are absolute root coords and are not rescaled. After a geometry change a barrier may fall partly or wholly outside the new bounds — it simply stops being hit there (the segment-intersection test naturally returns no crossing). If the pointer was resting on a barrier that geometry-change moved out from under it, the next motion's hit-box test emits the `BarrierLeave`. No special rescale logic; document that barriers do not migrate with outputs.
@@ -131,7 +136,7 @@ Delivery: a client receives the event if its `xi2_masks[(barrier.window, master_
 | horizontal with `y1<0\|\|y2<0`, or vertical with `x1<0\|\|x2<0` | `BadValue` | negative reserved for ray convention, xibarriers.c:817 |
 | bad `window` | `BadWindow` (errorValue=window) | dixLookupWindow |
 | new barrier XID already in use | `BadAlloc` | |
-| device id in list not a valid master pointer | `BadDevice` (errorValue=device_id) | |
+| device id in list is neither a wildcard (`XIAllDevices`=0 / `XIAllMasterDevices`=1) nor the master pointer (2) — e.g. a keyboard or slave id | `BadDevice` (errorValue=device_id) | wildcards + master are accepted (xibarriers.c:301); only genuinely non-applicable ids error |
 | DeletePointerBarrier: unknown XID | `BadValue` (errorValue=barrier) | |
 | Delete / Release by non-creating client | `BadAccess` | only the owner may destroy/release |
 | Release: bad device | `BadDevice` | |
