@@ -2083,12 +2083,16 @@ pub(crate) struct ActiveMonitor {
 }
 
 fn active_monitors(state: &ServerState) -> Vec<ActiveMonitor> {
+    // One automatic monitor per ENABLED output (Xorg builds an automatic
+    // monitor only for an output with an active CRTC). Off and
+    // disconnected outputs are absent. `primary` is the RANDR primary
+    // output, which itself prefers an enabled output — the first output
+    // in the list may now be off/disconnected, so `i == 0` is wrong.
+    let primary = state.randr.primary_output;
     state
         .randr
-        .outputs
-        .iter()
-        .enumerate()
-        .map(|(i, output)| {
+        .enabled_outputs()
+        .map(|output| {
             let width_mm = if output.mm_width > 0 {
                 output.mm_width
             } else {
@@ -2102,7 +2106,7 @@ fn active_monitors(state: &ServerState) -> Vec<ActiveMonitor> {
             ActiveMonitor {
                 name: output.name.clone(),
                 output_id: output.output_id,
-                primary: i == 0,
+                primary: output.output_id == primary,
                 x: output.x,
                 y: output.y,
                 width: output.width,

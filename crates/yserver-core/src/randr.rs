@@ -123,7 +123,8 @@ impl RandrState {
 
         let primary_output = outputs
             .iter()
-            .find(|o| o.connected)
+            .find(|o| o.connected && o.mode_id != 0)
+            .or_else(|| outputs.iter().find(|o| o.connected))
             .or_else(|| outputs.first())
             .map_or(0, |o| o.output_id);
 
@@ -194,6 +195,16 @@ impl RandrState {
         } else {
             *self = Self::nested(timestamp, width, height);
         }
+    }
+
+    /// Monitors for RANDR `GetMonitors` / XINERAMA: one per ENABLED
+    /// output (connected with a non-zero mode), at its `(x,y,w,h)`.
+    /// Off and disconnected outputs are absent (Xorg builds an
+    /// automatic monitor only for an output with an active CRTC).
+    pub fn enabled_outputs(&self) -> impl Iterator<Item = &RandrOutput> {
+        self.outputs
+            .iter()
+            .filter(|o| o.connected && o.mode_id != 0)
     }
 
     /// Build a `ScreenResources` reply describing every output / CRTC /
@@ -803,5 +814,68 @@ mod tests {
         let st = RandrState::from_outputs(0, outs);
         assert_eq!(st.screen_width, 1920);
         assert_eq!(st.screen_height, 2160, "screen must encompass y+height");
+    }
+
+    #[test]
+    fn enabled_outputs_excludes_off_and_disconnected() {
+        let outs = vec![
+            RandrOutput {
+                // enabled
+                name: "eDP-1".into(),
+                output_id: 1,
+                crtc_id: 2,
+                mode_id: 3,
+                connected: true,
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                vrefresh: 60,
+                mm_width: 0,
+                mm_height: 0,
+                mode_ids: vec![3],
+                num_preferred: 1,
+            },
+            RandrOutput {
+                // connected but OFF (mode_id 0)
+                name: "HDMI-A-1".into(),
+                output_id: 4,
+                crtc_id: 5,
+                mode_id: 0,
+                connected: true,
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+                vrefresh: 0,
+                mm_width: 0,
+                mm_height: 0,
+                mode_ids: vec![6],
+                num_preferred: 1,
+            },
+            RandrOutput {
+                // disconnected
+                name: "DP-2".into(),
+                output_id: 7,
+                crtc_id: 8,
+                mode_id: 0,
+                connected: false,
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+                vrefresh: 0,
+                mm_width: 0,
+                mm_height: 0,
+                mode_ids: vec![],
+                num_preferred: 0,
+            },
+        ];
+        let st = RandrState::from_outputs(0, outs);
+        let names: Vec<&str> = st.enabled_outputs().map(|o| o.name.as_str()).collect();
+        assert_eq!(names, vec!["eDP-1"]);
+        // The off output (output_id 4) must not be primary; the enabled
+        // one (output_id 1) is.
+        assert_eq!(st.primary_output, 1);
     }
 }
