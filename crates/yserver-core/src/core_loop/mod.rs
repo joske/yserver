@@ -5,6 +5,7 @@
 //! current form (Phase B) it only exposes the message types; the
 //! sender/receiver pair and `run_core` come online in B2/B4.
 
+pub mod barriers;
 pub mod client_io;
 pub mod client_reader;
 pub mod damage_fanout;
