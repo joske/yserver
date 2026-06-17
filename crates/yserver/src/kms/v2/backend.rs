@@ -135,11 +135,17 @@ struct SeedInferiorDraw {
     height: u32,
 }
 
-/// Monotonic connector-keyed RANDR id allocator.
+/// Monotonic connector-keyed RANDR connector registry.
+///
+/// Authoritative store for every connector yserver has ever seen:
+/// stable ids, connection state, current config, the persistent
+/// `client_configured` bit, and the last-known advertised mode list.
+/// The rescan/resume layout-preservation rule and `apply_crtc_config`
+/// key off this; the core only sees the resulting `Vec<RandrOutput>`.
 #[derive(Debug, Default)]
 pub(crate) struct RandrIdAllocator {
     next: u32,
-    outputs: HashMap<String, ConnectorIds>,
+    connectors: HashMap<String, ConnectorEntry>,
     modes: HashMap<(u16, u16, u32), u32>,
 }
 
@@ -149,6 +155,43 @@ pub(crate) struct ConnectorIds {
     pub crtc_id: u32,
 }
 
+/// Per-connector current configuration in the registry.
+// Consumed by the SetCrtcConfig apply path + rescan/resume layout
+// preservation (later RANDR output-management tasks); storage only here.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnectorConfig {
+    /// Connected but not scanning out (mode=None, no CRTC).
+    Off,
+    /// Scanning out at `(mode_w, mode_h, vrefresh)` placed at `(x, y)`.
+    Enabled {
+        mode_w: u16,
+        mode_h: u16,
+        vrefresh: u32,
+        x: i32,
+        y: i32,
+    },
+}
+
+/// One connector the backend has ever seen.
+// Fields consumed by later RANDR output-management tasks (reprobe,
+// SetCrtcConfig apply, layout preservation); storage only here.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct ConnectorEntry {
+    pub ids: ConnectorIds,
+    pub connected: bool,
+    pub config: ConnectorConfig,
+    /// `true` once a client SetCrtcConfig/SetScreenSize touched this
+    /// output. The auto-layout (recompact / boot extend-right) only
+    /// ever touches `!client_configured` outputs; cleared on disconnect.
+    pub client_configured: bool,
+    /// Last-known advertised mode list `(w, h, vrefresh, preferred)`,
+    /// preferred-first. Retained across disconnect so a momentarily-gone
+    /// monitor keeps reporting its modes until reconnect refreshes them.
+    pub modes: Vec<(u16, u16, u32, bool)>,
+}
+
 impl RandrIdAllocator {
     fn fresh(&mut self) -> u32 {
         self.next = self.next.saturating_add(1);
@@ -156,14 +199,23 @@ impl RandrIdAllocator {
     }
 
     pub(crate) fn ids_for(&mut self, connector_name: &str) -> ConnectorIds {
-        if let Some(ids) = self.outputs.get(connector_name) {
-            return *ids;
+        if let Some(entry) = self.connectors.get(connector_name) {
+            return entry.ids;
         }
         let ids = ConnectorIds {
             output_id: self.fresh(),
             crtc_id: self.fresh(),
         };
-        self.outputs.insert(connector_name.to_string(), ids);
+        self.connectors.insert(
+            connector_name.to_string(),
+            ConnectorEntry {
+                ids,
+                connected: false,
+                config: ConnectorConfig::Off,
+                client_configured: false,
+                modes: Vec::new(),
+            },
+        );
         ids
     }
 
@@ -177,10 +229,33 @@ impl RandrIdAllocator {
     }
 
     pub(crate) fn known_connectors(&self) -> Vec<(String, ConnectorIds)> {
-        self.outputs
+        self.connectors
             .iter()
-            .map(|(name, ids)| (name.clone(), *ids))
+            .map(|(name, entry)| (name.clone(), entry.ids))
             .collect()
+    }
+
+    /// Get or create the registry entry for a connector, allocating
+    /// stable ids on first sight. New entries default to disconnected,
+    /// Off, not-client-configured, empty mode list.
+    // Consumed by later RANDR output-management tasks; storage only here.
+    #[allow(dead_code)]
+    pub(crate) fn entry_mut(&mut self, name: &str) -> &mut ConnectorEntry {
+        if !self.connectors.contains_key(name) {
+            // Allocate ids (also inserts the default entry).
+            let _ = self.ids_for(name);
+        }
+        self.connectors.get_mut(name).expect("just inserted")
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn entry(&self, name: &str) -> Option<&ConnectorEntry> {
+        self.connectors.get(name)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (&String, &ConnectorEntry)> {
+        self.connectors.iter()
     }
 }
 
