@@ -390,6 +390,8 @@ pub fn run(display: u16, width: u16, height: u16) -> io::Result<()> {
         // back to 96-DPI synthesis from pixel dims.
         mm_width: 0,
         mm_height: 0,
+        mode_ids: vec![3],
+        num_preferred: 1,
     };
     let mut state = ServerState::with_randr_outputs(width, height, vec![synthetic]);
     // Snapshot the backend's DPMS capability into the state. host-X11

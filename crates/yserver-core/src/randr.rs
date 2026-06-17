@@ -23,10 +23,16 @@ pub struct RandrOutput {
     /// `width`/`height` in that case.
     pub mm_width: u32,
     pub mm_height: u32,
+    /// Available mode ids for this output, preferred-first. Empty for a
+    /// disconnected output. The current mode is `mode_id` (0 = off).
+    pub mode_ids: Vec<u32>,
+    /// Count of leading entries in `mode_ids` that are preferred modes
+    /// (Xorg `GetOutputInfo` `nPreferred`).
+    pub num_preferred: u16,
 }
 
 /// One unique mode (deduped by `(width, height, vrefresh)`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RandrMode {
     pub mode_id: u32,
     pub width: u16,
@@ -63,10 +69,11 @@ impl RandrState {
     /// unique `(mode_id, w, h, vrefresh)` tuples for the `modes`
     /// vector.
     ///
-    /// Aggregation:
+    /// Aggregation (boot default; `RRSetScreenSize` later overrides the
+    /// reported `screen_width`/`screen_height`):
     /// - `screen_width = max(output.x + output.width)`
-    /// - `screen_height = max(output.height)` (outputs are placed
-    ///   horizontally in this phase, so y is 0)
+    /// - `screen_height = max(output.y + output.height)` (2-D: a CRTC
+    ///   may sit at any `(x, y)`, e.g. a monitor stacked below)
     /// - `*_mm` derived from screen_* at 96 DPI
     /// - `primary_output = outputs[0].output_id` (0 if empty)
     #[must_use]
@@ -84,7 +91,14 @@ impl RandrState {
             })
             .max()
             .unwrap_or(0);
-        let screen_height: u16 = outputs.iter().map(|o| o.height).max().unwrap_or(0);
+        let screen_height: u16 = outputs
+            .iter()
+            .map(|o| {
+                let r = i32::from(o.y).saturating_add(i32::from(o.height));
+                u16::try_from(r.max(0)).unwrap_or(u16::MAX)
+            })
+            .max()
+            .unwrap_or(0);
         // mm = px * 25.4 / 96; integer form: (px*254 + 480) / 960. Previous
         // divisor was off by 10× and made GTK auto-scale at extreme factors.
         let width_mm = ((u32::from(screen_width) * 254 + 480) / 960).max(1);
@@ -145,6 +159,8 @@ impl RandrState {
             // 96-DPI synthesis from pixel dimensions.
             mm_width: 0,
             mm_height: 0,
+            mode_ids: vec![3],
+            num_preferred: 1,
         };
         Self::from_outputs(timestamp, vec![synthetic])
     }
@@ -373,6 +389,8 @@ mod tests {
                 vrefresh: 60,
                 mm_width: 0,
                 mm_height: 0,
+                mode_ids: vec![5],
+                num_preferred: 1,
             },
             RandrOutput {
                 name: "HDMI-2".into(),
@@ -387,6 +405,8 @@ mod tests {
                 vrefresh: 60,
                 mm_width: 0,
                 mm_height: 0,
+                mode_ids: vec![6],
+                num_preferred: 1,
             },
         ];
         let st = RandrState::from_outputs(0, outs);
@@ -415,6 +435,8 @@ mod tests {
                 vrefresh: 60,
                 mm_width: 0,
                 mm_height: 0,
+                mode_ids: vec![5],
+                num_preferred: 1,
             },
             RandrOutput {
                 name: "B".into(),
@@ -429,6 +451,8 @@ mod tests {
                 vrefresh: 60,
                 mm_width: 0,
                 mm_height: 0,
+                mode_ids: vec![5],
+                num_preferred: 1,
             },
         ];
         let st = RandrState::from_outputs(0, outs);
@@ -451,6 +475,8 @@ mod tests {
                 vrefresh: 60,
                 mm_width: 0,
                 mm_height: 0,
+                mode_ids: vec![5],
+                num_preferred: 1,
             },
             RandrOutput {
                 name: "B".into(),
@@ -465,6 +491,8 @@ mod tests {
                 vrefresh: 60,
                 mm_width: 0,
                 mm_height: 0,
+                mode_ids: vec![6],
+                num_preferred: 1,
             },
         ];
         let st = RandrState::from_outputs(0, outs);
@@ -488,6 +516,8 @@ mod tests {
             // for the user's monitors).
             mm_width: 597,
             mm_height: 336,
+            mode_ids: vec![3],
+            num_preferred: 1,
         }];
         let st = RandrState::from_outputs(0, outs);
         let info = st.output_info(1, 0).expect("output 1 exists");
@@ -510,6 +540,8 @@ mod tests {
             vrefresh: 60,
             mm_width: 0,
             mm_height: 0,
+            mode_ids: vec![3],
+            num_preferred: 1,
         }];
         let st = RandrState::from_outputs(0, outs);
         let info = st.output_info(1, 0).expect("output 1 exists");
@@ -534,6 +566,8 @@ mod tests {
                 vrefresh: 60,
                 mm_width: 0,
                 mm_height: 0,
+                mode_ids: vec![5],
+                num_preferred: 1,
             },
             RandrOutput {
                 name: "B".into(),
@@ -548,6 +582,8 @@ mod tests {
                 vrefresh: 60,
                 mm_width: 0,
                 mm_height: 0,
+                mode_ids: vec![5],
+                num_preferred: 1,
             },
         ];
         let st = RandrState::from_outputs(0, outs);
@@ -569,6 +605,8 @@ mod tests {
             vrefresh: 60,
             mm_width: 0,
             mm_height: 0,
+            mode_ids: vec![3],
+            num_preferred: 1,
         }];
         outs.push(RandrOutput {
             name: "HDMI-A-1".into(),
@@ -583,6 +621,8 @@ mod tests {
             vrefresh: 0,
             mm_width: 0,
             mm_height: 0,
+            mode_ids: vec![],
+            num_preferred: 0,
         });
         let st = RandrState::from_outputs(1, outs);
         let info = st
@@ -611,6 +651,8 @@ mod tests {
                 vrefresh: 0,
                 mm_width: 0,
                 mm_height: 0,
+                mode_ids: vec![],
+                num_preferred: 0,
             },
             RandrOutput {
                 name: "HDMI-A-1".into(),
@@ -625,8 +667,54 @@ mod tests {
                 vrefresh: 60,
                 mm_width: 0,
                 mm_height: 0,
+                mode_ids: vec![6],
+                num_preferred: 1,
             },
         ];
         assert_eq!(RandrState::from_outputs(1, outs).primary_output, 4);
+    }
+
+    #[test]
+    fn from_outputs_screen_height_is_2d_for_vertical_stack() {
+        // External monitor stacked BELOW the laptop panel: second
+        // output at y=1080. screen_height must be 1080+1080=2160, not
+        // max(height)=1080. (Spec: screen_height = max(y+height).)
+        let outs = vec![
+            RandrOutput {
+                name: "eDP-1".into(),
+                output_id: 1,
+                crtc_id: 2,
+                mode_id: 3,
+                connected: true,
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                vrefresh: 60,
+                mm_width: 0,
+                mm_height: 0,
+                mode_ids: vec![3],
+                num_preferred: 1,
+            },
+            RandrOutput {
+                name: "HDMI-A-1".into(),
+                output_id: 4,
+                crtc_id: 5,
+                mode_id: 6,
+                connected: true,
+                x: 0,
+                y: 1080,
+                width: 1920,
+                height: 1080,
+                vrefresh: 60,
+                mm_width: 0,
+                mm_height: 0,
+                mode_ids: vec![6],
+                num_preferred: 1,
+            },
+        ];
+        let st = RandrState::from_outputs(0, outs);
+        assert_eq!(st.screen_width, 1920);
+        assert_eq!(st.screen_height, 2160, "screen must encompass y+height");
     }
 }

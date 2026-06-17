@@ -23575,6 +23575,8 @@ mod tests {
                 vrefresh: 60,
                 mm_width: 0,
                 mm_height: 0,
+                mode_ids: vec![1],
+                num_preferred: 1,
             },
             crate::randr::RandrOutput {
                 name: "HDMI-A-1".into(),
@@ -23589,6 +23591,8 @@ mod tests {
                 vrefresh: 60,
                 mm_width: 0,
                 mm_height: 0,
+                mode_ids: vec![1],
+                num_preferred: 1,
             },
         ];
 
@@ -32943,6 +32947,8 @@ mod tests {
             vrefresh: 60,
             mm_width: 0,
             mm_height: 0,
+            mode_ids: vec![3],
+            num_preferred: 1,
         }];
         let mut state = ServerState::new();
         state.randr = RandrState::from_outputs(0, outputs);

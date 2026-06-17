@@ -2430,6 +2430,16 @@ impl KmsBackendV2 {
             let mode_id = self
                 .randr_id_alloc
                 .mode_id(layout.width, layout.height, vrefresh);
+            // Full advertised list, preferred-first (Output.modes is
+            // already sorted preferred-first by discover_outputs).
+            let mut mode_ids = Vec::with_capacity(layout.output.modes.len());
+            let mut num_preferred: u16 = 0;
+            for m in &layout.output.modes {
+                mode_ids.push(self.randr_id_alloc.mode_id(m.width, m.height, m.vrefresh));
+                if m.preferred {
+                    num_preferred = num_preferred.saturating_add(1);
+                }
+            }
             outs.push(RandrOutput {
                 name: layout.output.connector_name.clone(),
                 output_id: ids.output_id,
@@ -2443,6 +2453,8 @@ impl KmsBackendV2 {
                 vrefresh,
                 mm_width: layout.output.mm_width,
                 mm_height: layout.output.mm_height,
+                mode_ids,
+                num_preferred,
             });
         }
 
@@ -2463,6 +2475,8 @@ impl KmsBackendV2 {
                 vrefresh: 0,
                 mm_width: 0,
                 mm_height: 0,
+                mode_ids: vec![],
+                num_preferred: 0,
             });
         }
         outs.sort_by_key(|o| o.output_id);
