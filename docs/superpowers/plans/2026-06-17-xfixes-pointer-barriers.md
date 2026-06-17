@@ -30,6 +30,8 @@
 | `crates/yserver-core/src/core_loop/mod.rs` | `mod barriers;` |
 | `crates/yserver-core/src/core_loop/process_request.rs` | XFIXES 31/32 arms; XI2 61 arm; WarpPointer bypass flag |
 | `crates/yserver-core/src/core_loop/pointer_fanout.rs` | constrain hook + event emission |
+| `crates/yserver-core/src/core_loop/message.rs` | `relative` bit on `HostInputEvent::PointerMotion` (T7) |
+| `crates/yserver/src/input_thread.rs` + `kms/v2/backend.rs` | set `relative`; `process_pointer_absolute` → `barrier_bypass` for absolute/warp motion (T7) |
 | `crates/yserver-core/src/core_loop/process_disconnect.rs` | owner sweep |
 | `crates/yserver/src/input_thread.rs` (+ command enum) | `SetPosition` resync (Phase 4) |
 
@@ -813,18 +815,15 @@ Expected: FAIL — no clamp; `pointer_root` is (110,50). Also a compile error fo
 
 ```rust
     // Pointer barriers (Xorg input_constrain_cursor): clamp genuine
-    // relative device motion against active barriers. Xorg constrains
-    // Relative motion only; yserver's HostPointerEvent carries no
-    // relative/absolute source bit, but the ONLY absolute pointer motion
-    // reaching this fanout is server-initiated warps (real KMS input is
-    // relative-accumulated; ynest is advisory per the spec; no absolute
-    // touch/tablet device is routed to the core pointer here). So
-    // "relative-only" == "not a warp": every server warp sets
-    // `barrier_bypass` (see `warp_root_no_barrier` in Step 3c) and the
-    // confine path sets `confine_warp_active`; both are exempt here.
-    // Replays are exempt too. (If an absolute pointer device is ever
-    // added, it must set `barrier_bypass` or HostPointerEvent must gain
-    // a source field — flagged in the spec Risks.)
+    // RELATIVE device motion only (Xorg `mode == Relative`). `barrier_bypass`
+    // is the "this motion is absolute/synthetic, don't clamp" signal:
+    // Step 3c sets it in `process_pointer_absolute` for libinput
+    // `MotionAbsolute` (touch/tablet) AND for warp-injected motion;
+    // `confine_warp_active` covers the confine reclamp; the barrier's own
+    // corrective warp sets `barrier_bypass` too. Relative mouse motion
+    // leaves both clear → clamps. ynest motion (advisory) doesn't pass
+    // through process_pointer_absolute, so it clamps the reported coords.
+    // Replays are exempt.
     if !is_replay
         && !state.barrier_bypass
         && !state.confine_warp_active
@@ -886,38 +885,25 @@ Expected: FAIL — no clamp; `pointer_root` is (110,50). Also a compile error fo
     }
 ```
 
-- [ ] **Step 3c: Centralize warp bypass — route EVERY server warp through one helper.** A barrier must never clamp a server-initiated warp, and there are several warp sites that re-enter the fanout. Don't sprinkle the flag per-site (fragile — codex pass-2 caught two missed sites). Add a helper next to the fanout:
+- [ ] **Step 3c: Tag motion source (relative vs absolute) — the real "Relative-only" gate.** Xorg constrains `mode == Relative` motion only. yserver collapses BOTH relative mouse motion (`InputEvent::PointerMotion{dx,dy}`) and absolute touch/tablet motion (`InputEvent::PointerMotionAbsolute`) into the same `HostInputEvent::PointerMotion{x,y,time}` at `input_thread.rs:132/141` — losing the distinction. There IS a live absolute path (libinput `MotionAbsolute` → `process_pointer_absolute` → fanout), so the clamp must NOT fire on it. Thread a `relative` bit and convert it to `barrier_bypass` at the KMS dispatch. This also covers warps for free (warp-injected motion is non-relative), so no separate per-warp-site helper is needed.
 
-```rust
-/// Warp the root pointer WITHOUT triggering barrier clamping. Every
-/// server-initiated warp (WarpPointer request, RANDR-shrink reclamp,
-/// confine reclamp) must go through here so the barrier hook in
-/// `pointer_event_fanout_to_state` treats the re-entrant motion as
-/// synthetic (absolute), per Xorg's "Relative motion only" rule.
-pub(crate) fn warp_root_no_barrier(
-    state: &mut ServerState,
-    backend: &mut dyn crate::backend::Backend,
-    x: i32,
-    y: i32,
-) {
-    let prev = state.barrier_bypass;
-    state.barrier_bypass = true;
-    backend.warp_pointer_root(state, x, y);
-    state.barrier_bypass = prev;
-}
-```
+  1. **`crates/yserver-core/src/core_loop/message.rs:190`** — add a field to the `PointerMotion` variant: `PointerMotion { x: i32, y: i32, time: u32, relative: bool }`.
+  2. **`crates/yserver/src/input_thread.rs`** — set the bit at the two producers: the `InputEvent::PointerMotion{dx,dy}` arm (~:132) → `relative: true`; the `InputEvent::PointerMotionAbsolute` arm (~:141) → `relative: false`. The warp-injection producer (the synthetic `PointerMotion` that `warp_pointer_root` feeds via `on_host_input`, `backend.rs` ~:15987) → `relative: false`. Fix the test constructors at `input_thread.rs:803+` to pass `relative`.
+  3. **`crates/yserver/src/kms/v2/backend.rs` `process_pointer_absolute` (~:5597)** — it receives the `relative` bit; wrap the `dispatch_motion_event(server_state)` call so non-relative motion bypasses the barrier clamp:
+     ```rust
+     let prev = server_state.barrier_bypass;
+     server_state.barrier_bypass = prev || !relative;
+     self.dispatch_motion_event(server_state);
+     server_state.barrier_bypass = prev;
+     ```
+  This makes the Step-3b gate (`!barrier_bypass && !confine_warp_active`) fire for relative mouse motion only. Absolute touch/tablet and every KMS warp (which re-injects `relative:false`) skip the clamp — matching Xorg. ynest motion does not pass through `process_pointer_absolute`, so it still clamps (the spec's documented "advisory on ynest" behavior — host owns the real sprite).
 
-Then replace the direct `backend.warp_pointer_root(state, …)` calls at these sites with `warp_root_no_barrier(state, backend, …)`:
-  - `process_request.rs:22029` and `:22043` — `handle_warp_pointer` (WarpPointer request).
-  - `run.rs:951` — RANDR screen-shrink reclamp.
-  - `process_request.rs:22810` — `confine_pointer_now`.
-  - The confine block in `pointer_fanout.rs:115` already sets `confine_warp_active` (which the barrier gate now also checks), so it needs no change — but converting it for uniformity is fine.
-  - The barrier's own corrective warp in Step 3b already sets `barrier_bypass`; leave as-is (or call the helper).
+  > Why no `warp_root_no_barrier` helper: every server warp on KMS re-enters via `process_pointer_absolute` with `relative:false`, so it's already gated here. The core-level warp sites (WarpPointer `process_request.rs:22029/22043`, RANDR-shrink `run.rs:951`, `confine_pointer_now :22810`) need no change. The barrier's own corrective warp in Step 3b additionally sets `barrier_bypass` directly as a re-entrancy guard.
 
-> The barrier gate added in Step 3b checks BOTH `!barrier_bypass && !confine_warp_active`, so any warp routed through either guard is exempt.
+- [ ] **Step 3d: Add the absolute-not-clamped regression note.** A pure-core unit test can't exercise `process_pointer_absolute` (it's in the `yserver` KMS crate). Cover the gate two ways: (a) the `barrier_bypass_skips_clamp` core test above proves the gate; (b) add a `yserver`-crate test that drives `process_pointer_absolute` with `relative:false` while a barrier is active and asserts the position is NOT clamped (mirror an existing `process_pointer_absolute` test). If no such harness exists, record this as a HW-smoke check in Task 13 (touchscreen drag across a barrier must pass through).
 
-- [ ] **Step 4: Run, verify pass.** Run: `cargo test -p yserver-core motion_clamps_against_solid_barrier barrier_bypass_skips_clamp`
-Expected: PASS.
+- [ ] **Step 4: Run, verify pass.** Run: `cargo test -p yserver-core motion_clamps_against_solid_barrier barrier_bypass_skips_clamp` and `cargo build -p yserver` (the `relative` field touches the KMS crate).
+Expected: PASS / clean build.
 
 - [ ] **Step 5: fmt + clippy + full test + commit.**
 
