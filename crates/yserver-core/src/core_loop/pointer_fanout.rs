@@ -142,6 +142,14 @@ pub fn pointer_event_fanout_to_state(
                 direction_of, find_nearest, inside_hit_box,
             };
 
+            // NB: every barrier is treated as applying to the (single)
+            // master pointer — `barrier.devices` is intentionally not
+            // filtered here. Xorg's barrier_blocks_device matters only
+            // with multiple master pointers; create-validation already
+            // restricts the device list to {0,1,2} (wildcards + the lone
+            // master pointer), so every creatable barrier applies to it.
+            // Add the device filter here if yserver ever gains a second
+            // master pointer (a spec non-goal today).
             let keys: Vec<u32> = state.pointer_barriers.keys().copied().collect();
             let candidates: Vec<(usize, BarrierGeom)> = keys
                 .iter()
@@ -2377,7 +2385,11 @@ mod tests {
             false,
         );
         assert!(dropped.is_empty());
-        assert_eq!(state.pointer_root, (100, 50), "re-armed barrier clamps again");
+        assert_eq!(
+            state.pointer_root,
+            (100, 50),
+            "re-armed barrier clamps again"
+        );
     }
 
     /// wmaker wedge regression (2026-06-04, silence HW): a WM places a

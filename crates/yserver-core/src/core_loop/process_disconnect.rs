@@ -122,6 +122,11 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
         .filter(|(_, barrier)| barrier.owner == client_id && barrier.hit)
         .map(|(barrier_xid, barrier)| (*barrier_xid, barrier.clone()))
         .collect();
+    // Xorg BarrierFreeBarrier emits the released leave with the CURRENT
+    // time + sprite position (xibarriers.c:668/760), not the last-hit
+    // values. Capture once; they don't change across the loop.
+    let leave_time = state.timestamp_now();
+    let (leave_rx, leave_ry) = state.pointer_root;
     for (barrier_xid, barrier) in hit_barriers {
         let _dropped = crate::core_loop::pointer_fanout::emit_barrier_event(
             state,
@@ -129,13 +134,13 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
             barrier.owner,
             barrier.window,
             26,
-            barrier.last_timestamp,
+            leave_time,
             barrier.event_id,
             0,
             1,
             0,
-            0,
-            0,
+            i32::from(leave_rx),
+            i32::from(leave_ry),
             0.0,
             0.0,
         );

@@ -4117,19 +4117,27 @@ fn handle_xfixes_request(
                     }
                     Some(barrier) => {
                         if barrier.hit {
+                            // Xorg BarrierFreeBarrier emits the released leave
+                            // with the CURRENT time + sprite position (not the
+                            // last-hit values), xibarriers.c:668. Copy the
+                            // barrier fields out first to release the borrow.
+                            let (owner, window, eid) =
+                                (barrier.owner, barrier.window, barrier.event_id);
+                            let time = state.timestamp_now();
+                            let (rx, ry) = state.pointer_root;
                             let _dropped = crate::core_loop::pointer_fanout::emit_barrier_event(
                                 state,
                                 bid,
-                                barrier.owner,
-                                barrier.window,
+                                owner,
+                                window,
                                 26,
-                                barrier.last_timestamp,
-                                barrier.event_id,
+                                time,
+                                eid,
                                 0,
                                 1,
                                 0,
-                                0,
-                                0,
+                                i32::from(rx),
+                                i32::from(ry),
                                 0.0,
                                 0.0,
                             );
@@ -34481,6 +34489,9 @@ mod tests {
             barrier.event_id = 1;
             barrier.last_timestamp = 10;
         }
+        // Sprite resting on the barrier. The released leave must carry the
+        // CURRENT position (not 0,0 — the pre-fix bug).
+        state.pointer_root = (100, 50);
 
         xfixes_delete_barrier(&mut state, ClientId(1), bid).expect("owner delete handled");
         let bytes = read_all_available(&mut peer);
@@ -34494,6 +34505,14 @@ mod tests {
             "XIBarrierPointerReleased"
         );
         assert_eq!(&bytes[40..42], &0u16.to_le_bytes(), "sourceid = 0");
+        // root_x/root_y carry the current sprite position as FP1616 (v<<16),
+        // not the pre-fix 0,0.
+        assert_eq!(
+            &bytes[44..48],
+            &(100i32 << 16).to_le_bytes(),
+            "root_x = 100"
+        );
+        assert_eq!(&bytes[48..52], &(50i32 << 16).to_le_bytes(), "root_y = 50");
         assert!(!state.pointer_barriers.contains_key(&bid));
     }
 
