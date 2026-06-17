@@ -136,7 +136,7 @@ Some convenience keybinds are available:
 
 - Ctrl-Alt-Backspace: zap the server, return to console
 - Ctrl-Alt-Enter: create a screenshot/scanout of the framebuffer in CWD
-- Ctrl-Alt-D: dump all drawables as PPM files to CWD
+- Ctrl-Alt-F12: dump all drawables as PPM files to CWD
 
 ## Regression coverage with xts5 and rendercheck
 

@@ -11,11 +11,11 @@ pub(crate) const LINUX_KEY_LEFTCTRL: u32 = 29;
 pub(crate) const LINUX_KEY_LEFTALT: u32 = 56;
 pub(crate) const LINUX_KEY_RIGHTCTRL: u32 = 97;
 pub(crate) const LINUX_KEY_RIGHTALT: u32 = 100;
-pub(crate) const LINUX_KEY_D: u32 = 32;
 // F1..F10 are contiguous 59..=68. F11=87, F12=88.
 const LINUX_KEY_F1: u32 = 59;
 const LINUX_KEY_F10: u32 = 68;
 const LINUX_KEY_F11: u32 = 87;
+pub(crate) const LINUX_KEY_F12: u32 = 88;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hotkey {
@@ -23,10 +23,11 @@ pub enum Hotkey {
     Zap,
     /// Ctrl+Alt+Enter — diagnostic scanout dump (SIGUSR1 path).
     DumpScanout,
-    /// Ctrl+Alt+D — diagnostic per-drawable storage dump (SIGUSR2).
+    /// Ctrl+Alt+F12 — diagnostic per-drawable storage dump (SIGUSR2).
     DumpDrawables,
-    /// Ctrl+Alt+F<N> — VT switch to VT N (1-based). F12 is still a VT
-    /// key, so SwitchVt covers F1..F11 → VT1..VT11.
+    /// Ctrl+Alt+F<N> — VT switch to VT N (1-based). SwitchVt covers
+    /// F1..F11 → VT1..VT11; F12 is reserved for the drawable dump
+    /// (VT12 typically doesn't exist).
     SwitchVt(u32),
 }
 
@@ -71,10 +72,12 @@ impl HotkeyDetector {
                 }
                 _ if !(self.ctrl_pressed && self.alt_pressed) => None,
                 LINUX_KEY_BACKSPACE => Some(Hotkey::Zap),
-                LINUX_KEY_D => Some(Hotkey::DumpDrawables),
                 LINUX_KEY_ENTER => Some(Hotkey::DumpScanout),
                 LINUX_KEY_F1..=LINUX_KEY_F10 => Some(Hotkey::SwitchVt(keycode - LINUX_KEY_F1 + 1)),
                 LINUX_KEY_F11 => Some(Hotkey::SwitchVt(11)),
+                // F12 is not a VT key (VT12 typically doesn't exist), so
+                // it's a free slot for the per-drawable storage dump.
+                LINUX_KEY_F12 => Some(Hotkey::DumpDrawables),
                 _ => None,
             },
             InputEvent::KeyRelease { keycode } => {
@@ -151,15 +154,15 @@ mod tests {
         press(&mut d, LINUX_KEY_LEFTCTRL);
         press(&mut d, LINUX_KEY_LEFTALT);
         assert_eq!(press(&mut d, LINUX_KEY_BACKSPACE), Some(Hotkey::Zap));
-        assert_eq!(press(&mut d, LINUX_KEY_D), Some(Hotkey::DumpDrawables));
+        assert_eq!(press(&mut d, LINUX_KEY_F12), Some(Hotkey::DumpDrawables));
         assert_eq!(press(&mut d, LINUX_KEY_ENTER), Some(Hotkey::DumpScanout));
     }
 
     #[test]
-    fn ctrl_alt_d_is_dump_not_text() {
+    fn ctrl_alt_f12_is_dump_not_vt_switch() {
         let mut d = HotkeyDetector::new();
         press(&mut d, LINUX_KEY_LEFTCTRL);
         press(&mut d, LINUX_KEY_LEFTALT);
-        assert_eq!(press(&mut d, LINUX_KEY_D), Some(Hotkey::DumpDrawables));
+        assert_eq!(press(&mut d, LINUX_KEY_F12), Some(Hotkey::DumpDrawables));
     }
 }

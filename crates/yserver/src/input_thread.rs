@@ -791,7 +791,7 @@ fn current_time_ms() -> u32 {
 mod tests {
     use super::*;
     use crate::input::hotkey::{
-        LINUX_KEY_BACKSPACE, LINUX_KEY_D, LINUX_KEY_ENTER, LINUX_KEY_LEFTALT, LINUX_KEY_LEFTCTRL,
+        LINUX_KEY_BACKSPACE, LINUX_KEY_ENTER, LINUX_KEY_F12, LINUX_KEY_LEFTALT, LINUX_KEY_LEFTCTRL,
         LINUX_KEY_RIGHTALT, LINUX_KEY_RIGHTCTRL,
     };
     use yserver_core::core_loop::channel;
@@ -1260,9 +1260,9 @@ mod tests {
     }
 
     /// Mirror of `ctrl_alt_enter_emits_dump_scanout_and_drops_keypress`
-    /// for the per-drawable storage dump (Ctrl-Alt-D → SIGUSR2 path).
+    /// for the per-drawable storage dump (Ctrl-Alt-F12 → SIGUSR2 path).
     #[test]
-    fn ctrl_alt_d_emits_dump_drawables_and_drops_keypress() {
+    fn ctrl_alt_f12_emits_dump_drawables_and_drops_keypress() {
         let (poll, sender, rx) = channel().expect("channel");
         let mut state = LibinputThreadState::new(800, 600);
         let mut pending: Option<HostInputEvent> = None;
@@ -1278,7 +1278,7 @@ mod tests {
                     keycode: LINUX_KEY_LEFTALT,
                 },
                 InputEvent::KeyPress {
-                    keycode: LINUX_KEY_D,
+                    keycode: LINUX_KEY_F12,
                 },
             ],
             0,
@@ -1295,9 +1295,9 @@ mod tests {
         assert!(
             !collected.iter().any(|m| matches!(
                 m,
-                Message::HostInput(HostInputEvent::Key(ev)) if ev.pressed && u32::from(ev.keycode) == LINUX_KEY_D + 8
+                Message::HostInput(HostInputEvent::Key(ev)) if ev.pressed && u32::from(ev.keycode) == LINUX_KEY_F12 + 8
             )),
-            "D keypress must not be forwarded after dump-drawables hotkey, got {collected:?}",
+            "F12 keypress must not be forwarded after dump-drawables hotkey, got {collected:?}",
         );
         drop(poll);
     }

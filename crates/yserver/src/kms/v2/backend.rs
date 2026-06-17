@@ -9006,7 +9006,7 @@ impl KmsBackendV2 {
                 }
             }
             Hotkey::DumpDrawables => {
-                log::info!("kms: Ctrl-Alt-D — dumping drawables");
+                log::info!("kms: Ctrl-Alt-F12 — dumping drawables");
                 if let Some(s) = &self.input_sender {
                     let _ = s.send(Message::DumpDrawables);
                 }
