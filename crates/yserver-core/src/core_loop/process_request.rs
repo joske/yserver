@@ -13096,7 +13096,13 @@ fn handle_xi2_request(
                 client_id.0, sequence.0
             );
         }
-        // GetFeedbackControl: { deviceid }.
+        // GetFeedbackControl: { deviceid }. yserver models one keyboard
+        // control + one pointer control (the same state core
+        // GetKeyboardControl/GetPointerControl expose). Report the device
+        // class's single default feedback (id 0): a KbdFeedbackState for
+        // key devices, a PtrFeedbackState for pointer devices — mirroring
+        // Xorg Xi/getfctl.c, where the KbdFeedback ctrl *is* the keyboard
+        // control.
         22 => {
             let dev = u16::from(*body.first().unwrap_or(&0));
             if !xi1_device_valid(dev) {
@@ -13109,7 +13115,30 @@ fn handle_xi2_request(
                     minor,
                 );
             }
-            buf.extend_from_slice(&xi1_zero_reply(byte_order, sequence));
+            let feedbacks = if xi1_device_has_keys(dev) {
+                let kc = &state.keyboard_control;
+                x11::encode_kbd_feedback_state(
+                    byte_order,
+                    0,
+                    kc.bell_pitch,
+                    kc.bell_duration,
+                    kc.led_mask,
+                    kc.global_auto_repeat,
+                    kc.key_click_percent,
+                    kc.bell_percent,
+                    &kc.auto_repeats,
+                )
+            } else {
+                let pc = &state.pointer_control;
+                x11::encode_ptr_feedback_state(
+                    byte_order,
+                    0,
+                    pc.accel_numerator,
+                    pc.accel_denominator,
+                    pc.threshold,
+                )
+            };
+            x11::write_get_feedback_control_reply(&mut buf, byte_order, sequence, 1, &feedbacks)?;
         }
         // ChangeFeedbackControl (void): { mask, deviceid, feedbackid }.
         23 => {
@@ -24542,6 +24571,87 @@ mod tests {
         let bytes = read_all_available(&mut peer);
         assert_eq!(bytes[0], 0, "error packet");
         assert_eq!(bytes[1], x11::error::BAD_MATCH, "BadMatch");
+    }
+
+    #[test]
+    fn xi_get_feedback_control_kbd_mirrors_keyboard_control() {
+        // The XI1 KbdFeedbackState must carry the same bell/click/LED
+        // state as core GetKeyboardControl (Xorg: the KbdFeedback ctrl
+        // *is* the keyboard control).
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.keyboard_control.bell_pitch = 0x0321;
+        state.keyboard_control.bell_duration = 0x0654;
+        state.keyboard_control.bell_percent = 77;
+        state.keyboard_control.key_click_percent = 42;
+        state.keyboard_control.led_mask = 0x0000_0003;
+        state.keyboard_control.global_auto_repeat = true;
+
+        // GetFeedbackControl { deviceid=3 } (master keyboard).
+        let header = RequestHeader {
+            opcode: 137,
+            data: 22,
+            length_units: 2,
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &[3u8, 0, 0, 0],
+        )
+        .expect("process");
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[0], 1, "X_Reply");
+        assert_eq!(bytes[1], 22, "RepType");
+        assert_eq!(&bytes[8..10], &1u16.to_le_bytes(), "num_feedbacks");
+        // KbdFeedbackState begins at byte 32.
+        let kbd = &bytes[32..];
+        assert_eq!(kbd[0], 0, "KbdFeedbackClass");
+        assert_eq!(&kbd[4..6], &0x0321u16.to_le_bytes(), "pitch == bell_pitch");
+        assert_eq!(&kbd[6..8], &0x0654u16.to_le_bytes(), "duration");
+        assert_eq!(&kbd[8..12], &0x0000_0003u32.to_le_bytes(), "led_mask");
+        assert_eq!(kbd[16], 1, "global_auto_repeat");
+        assert_eq!(kbd[17], 42, "click == key_click_percent");
+        assert_eq!(kbd[18], 77, "percent == bell_percent");
+    }
+
+    #[test]
+    fn xi_get_feedback_control_ptr_mirrors_pointer_control() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.pointer_control.accel_numerator = 5;
+        state.pointer_control.accel_denominator = 3;
+        state.pointer_control.threshold = 9;
+
+        // GetFeedbackControl { deviceid=2 } (master pointer).
+        let header = RequestHeader {
+            opcode: 137,
+            data: 22,
+            length_units: 2,
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &[2u8, 0, 0, 0],
+        )
+        .expect("process");
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[1], 22, "RepType");
+        assert_eq!(&bytes[8..10], &1u16.to_le_bytes(), "num_feedbacks");
+        let ptr = &bytes[32..];
+        assert_eq!(ptr[0], 1, "PtrFeedbackClass");
+        assert_eq!(&ptr[6..8], &5u16.to_le_bytes(), "accelNum");
+        assert_eq!(&ptr[8..10], &3u16.to_le_bytes(), "accelDenom");
+        assert_eq!(&ptr[10..12], &9u16.to_le_bytes(), "threshold");
     }
 
     fn randr_unimplemented_reply_bearing(minor: u8) -> Vec<u8> {

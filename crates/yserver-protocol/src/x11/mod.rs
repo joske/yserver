@@ -3500,6 +3500,88 @@ pub fn write_get_device_motion_events_reply(
     writer.write_all(&reply)
 }
 
+/// Encode an XI1 `xKbdFeedbackState` (52 bytes, XIproto.h). Mirrors
+/// Xorg `Xi/getfctl.c::CopySwapKbdFeedback`: `led_values` duplicates
+/// `led_mask` (Xorg sets both to `ctrl.leds`).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_kbd_feedback_state(
+    byte_order: ClientByteOrder,
+    id: u8,
+    pitch: u16,
+    duration: u16,
+    led_mask: u32,
+    global_auto_repeat: bool,
+    click: u8,
+    percent: u8,
+    auto_repeats: &[u8; 32],
+) -> Vec<u8> {
+    const KBD_FEEDBACK_CLASS: u8 = 0;
+    let mut b = Vec::with_capacity(52);
+    b.push(KBD_FEEDBACK_CLASS); // class
+    b.push(id); // id
+    write_u16(byte_order, &mut b, 52); // length
+    write_u16(byte_order, &mut b, pitch);
+    write_u16(byte_order, &mut b, duration);
+    write_u32(byte_order, &mut b, led_mask);
+    write_u32(byte_order, &mut b, led_mask); // led_values = led_mask (Xorg)
+    b.push(u8::from(global_auto_repeat));
+    b.push(click);
+    b.push(percent);
+    b.push(0); // pad
+    b.extend_from_slice(auto_repeats);
+    debug_assert_eq!(b.len(), 52);
+    b
+}
+
+/// Encode an XI1 `xPtrFeedbackState` (12 bytes, XIproto.h). Mirrors
+/// Xorg `Xi/getfctl.c::CopySwapPtrFeedback`.
+pub fn encode_ptr_feedback_state(
+    byte_order: ClientByteOrder,
+    id: u8,
+    accel_num: u16,
+    accel_denom: u16,
+    threshold: u16,
+) -> Vec<u8> {
+    const PTR_FEEDBACK_CLASS: u8 = 1;
+    let mut b = Vec::with_capacity(12);
+    b.push(PTR_FEEDBACK_CLASS); // class
+    b.push(id); // id
+    write_u16(byte_order, &mut b, 12); // length
+    b.push(0); // pad1
+    b.push(0); // pad2
+    write_u16(byte_order, &mut b, accel_num);
+    write_u16(byte_order, &mut b, accel_denom);
+    write_u16(byte_order, &mut b, threshold);
+    debug_assert_eq!(b.len(), 12);
+    b
+}
+
+/// XI1 `GetFeedbackControl` reply (minor 22). Header from
+/// `xGetFeedbackControlReply` (XIproto.h): `num_feedbacks`@8, then the
+/// concatenated feedback-class structures. `length` is the trailing
+/// payload in 4-byte words. Mirrors Xorg `Xi/getfctl.c`.
+pub fn write_get_feedback_control_reply(
+    writer: &mut impl Write,
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    num_feedbacks: u16,
+    feedbacks: &[u8],
+) -> io::Result<()> {
+    const X_GET_FEEDBACK_CONTROL: u8 = 22;
+    debug_assert!(feedbacks.len().is_multiple_of(4));
+    let length_words = u32::try_from(feedbacks.len() / 4).unwrap_or(0);
+    let mut reply = Vec::with_capacity(32 + feedbacks.len());
+    reply.push(1); // repType = X_Reply
+    reply.push(X_GET_FEEDBACK_CONTROL); // RepType
+    write_u16(byte_order, &mut reply, sequence.0);
+    write_u32(byte_order, &mut reply, length_words);
+    write_u16(byte_order, &mut reply, num_feedbacks);
+    reply.extend_from_slice(&[0u8; 22]); // pad01..pad06
+    debug_assert_eq!(reply.len(), 32);
+    reply.extend_from_slice(feedbacks);
+    writer.write_all(&reply)
+}
+
 pub fn write_get_modifier_mapping_reply_with_keycodes(
     writer: &mut impl Write,
     byte_order: ClientByteOrder,
@@ -3555,6 +3637,71 @@ mod tests {
             let off = 32 + i * 4;
             assert_eq!(&buf[off..off + 4], &k.to_le_bytes(), "keysym {i}");
         }
+    }
+
+    /// XI1 `GetFeedbackControl` keyboard reply, asserted against
+    /// `xGetFeedbackControlReply` + `xKbdFeedbackState` (XIproto.h).
+    #[test]
+    fn get_feedback_control_kbd_reply_layout() {
+        let auto_repeats = [0xAAu8; 32];
+        let kbd = encode_kbd_feedback_state(
+            ClientByteOrder::LittleEndian,
+            0,
+            0x1234, // pitch
+            0x5678, // duration
+            0x0000_000F,
+            true,
+            0x11, // click
+            0x22, // percent
+            &auto_repeats,
+        );
+        assert_eq!(kbd.len(), 52);
+        assert_eq!(kbd[0], 0, "KbdFeedbackClass");
+        assert_eq!(kbd[1], 0, "id");
+        assert_eq!(&kbd[2..4], &52u16.to_le_bytes(), "length = 52");
+        assert_eq!(&kbd[4..6], &0x1234u16.to_le_bytes(), "pitch");
+        assert_eq!(&kbd[6..8], &0x5678u16.to_le_bytes(), "duration");
+        assert_eq!(&kbd[8..12], &0x0000_000Fu32.to_le_bytes(), "led_mask");
+        assert_eq!(
+            &kbd[12..16],
+            &0x0000_000Fu32.to_le_bytes(),
+            "led_values=led_mask"
+        );
+        assert_eq!(kbd[16], 1, "global_auto_repeat");
+        assert_eq!(kbd[17], 0x11, "click");
+        assert_eq!(kbd[18], 0x22, "percent");
+        assert_eq!(kbd[19], 0, "pad");
+        assert_eq!(&kbd[20..52], &auto_repeats, "auto_repeats[32]");
+
+        let mut buf = Vec::new();
+        write_get_feedback_control_reply(
+            &mut buf,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(9),
+            1,
+            &kbd,
+        )
+        .unwrap();
+        assert_eq!(buf.len(), 32 + 52);
+        assert_eq!(buf[0], 1, "X_Reply");
+        assert_eq!(buf[1], 22, "RepType = X_GetFeedbackControl");
+        assert_eq!(&buf[4..8], &13u32.to_le_bytes(), "length = 52/4 words");
+        assert_eq!(&buf[8..10], &1u16.to_le_bytes(), "num_feedbacks");
+        assert_eq!(&buf[32..], &kbd[..], "feedback payload");
+    }
+
+    /// XI1 `GetFeedbackControl` pointer reply (`xPtrFeedbackState`).
+    #[test]
+    fn get_feedback_control_ptr_state_layout() {
+        let ptr = encode_ptr_feedback_state(ClientByteOrder::LittleEndian, 0, 2, 1, 4);
+        assert_eq!(ptr.len(), 12);
+        assert_eq!(ptr[0], 1, "PtrFeedbackClass");
+        assert_eq!(ptr[1], 0, "id");
+        assert_eq!(&ptr[2..4], &12u16.to_le_bytes(), "length = 12");
+        assert_eq!(&ptr[4..6], &[0u8, 0], "pad1, pad2");
+        assert_eq!(&ptr[6..8], &2u16.to_le_bytes(), "accelNum");
+        assert_eq!(&ptr[8..10], &1u16.to_le_bytes(), "accelDenom");
+        assert_eq!(&ptr[10..12], &4u16.to_le_bytes(), "threshold");
     }
 
     /// XI1 `GetDeviceMotionEvents` empty-history reply, asserted against
