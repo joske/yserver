@@ -13157,7 +13157,13 @@ fn handle_xi2_request(
                     minor,
                 );
             }
-            buf.extend_from_slice(&xi1_zero_reply(byte_order, sequence));
+            // The XI1 keyboard devices (3 master, 5 slave) share the
+            // server's single physical keymap — Xorg's XkbGetCoreMap is
+            // per-device, but yserver models one keyboard. Reuse the core
+            // GetKeyboardMapping path so the device map matches what the
+            // client sees via opcode 101.
+            let (kpc, keysyms) = fetch_merged_keymap(state, backend, origin, first, count);
+            x11::write_get_device_key_mapping_reply(&mut buf, byte_order, sequence, kpc, &keysyms)?;
         }
         // ChangeDeviceKeyMapping (void): { deviceid, firstKeyCode,
         // keySymsPerKeyCode, keyCodes }.
@@ -20872,44 +20878,25 @@ fn handle_change_keyboard_mapping(
     Ok(RequestOutcome::Handled)
 }
 
-fn handle_get_keyboard_mapping(
-    state: &mut ServerState,
+/// Fetch the merged keyboard mapping for keycodes `[first_keycode,
+/// first_keycode + keycode_count)`: the backend (host/KMS) keymap with
+/// any `ChangeKeyboardMapping` rows layered on top. Returns
+/// `(keysyms_per_keycode, keysyms)` where `keysyms.len() ==
+/// keycode_count * keysyms_per_keycode`. Shared by core
+/// `GetKeyboardMapping` (opcode 101) and XI1 `GetDeviceKeyMapping`
+/// (minor 24) — Xorg derives both from the same `XkbGetCoreMap`.
+fn fetch_merged_keymap(
+    state: &ServerState,
     backend: &mut dyn Backend,
     origin: Option<OriginContext>,
-    client_id: ClientId,
-    sequence: SequenceNumber,
-    body: &[u8],
-) -> io::Result<RequestOutcome> {
-    debug!("client {} #{} GetKeyboardMapping", client_id.0, sequence.0);
-    let first_keycode = body.first().copied().unwrap_or(8);
-    let keycode_count = body.get(1).copied().unwrap_or(0);
-    // Xorg ProcGetKeyboardMapping: first < min_keycode or first +
-    // count - 1 > max_keycode → BadValue.
-    if first_keycode < 8 {
-        return emit_x11_error(
-            state,
-            client_id,
-            sequence,
-            x11::error::BAD_VALUE,
-            u32::from(first_keycode),
-            101,
-        );
-    }
-    if u32::from(first_keycode) + u32::from(keycode_count) > 256 {
-        return emit_x11_error(
-            state,
-            client_id,
-            sequence,
-            x11::error::BAD_VALUE,
-            u32::from(first_keycode) + u32::from(keycode_count) - 1,
-            101,
-        );
-    }
+    first_keycode: u8,
+    keycode_count: u8,
+) -> (u8, Vec<u32>) {
     let proxied = backend
         .get_keyboard_mapping(origin, first_keycode, keycode_count)
         .ok();
     // Merge ChangeKeyboardMapping rows over the backend keymap.
-    let merged = {
+    {
         let (mut kpc, mut keysyms) = proxied.unwrap_or((4, Vec::new()));
         if keysyms.is_empty() {
             keysyms = vec![0u32; usize::from(keycode_count) * usize::from(kpc)];
@@ -20948,7 +20935,43 @@ fn handle_get_keyboard_mapping(
             }
         }
         (kpc, keysyms)
-    };
+    }
+}
+
+fn handle_get_keyboard_mapping(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    debug!("client {} #{} GetKeyboardMapping", client_id.0, sequence.0);
+    let first_keycode = body.first().copied().unwrap_or(8);
+    let keycode_count = body.get(1).copied().unwrap_or(0);
+    // Xorg ProcGetKeyboardMapping: first < min_keycode or first +
+    // count - 1 > max_keycode → BadValue.
+    if first_keycode < 8 {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            u32::from(first_keycode),
+            101,
+        );
+    }
+    if u32::from(first_keycode) + u32::from(keycode_count) > 256 {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            u32::from(first_keycode) + u32::from(keycode_count) - 1,
+            101,
+        );
+    }
+    let merged = fetch_merged_keymap(state, backend, origin, first_keycode, keycode_count);
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
@@ -24357,6 +24380,98 @@ mod tests {
         assert_eq!(bytes[0], 0, "error packet");
         assert_eq!(bytes[1], XI1_ERROR_BAD_DEVICE, "BadDevice");
         assert_eq!(&bytes[8..10], &50u16.to_le_bytes(), "minor echoed");
+    }
+
+    #[test]
+    fn xi_get_device_key_mapping_matches_core_keyboard_mapping() {
+        // yserver models a single keyboard, so XI1 GetDeviceKeyMapping on
+        // a key-class device must surface the same keysyms a client reads
+        // via core GetKeyboardMapping (Xorg drives both from
+        // XkbGetCoreMap). Inject deterministic ChangeKeyboardMapping rows
+        // and assert the two replies carry identical map data.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // RecordingBackend reports keysyms-per-keycode = 2; match it.
+        state.keymap_overrides.insert(10, vec![0x0061, 0x0041]);
+        state.keymap_overrides.insert(11, vec![0x0062, 0x0042]);
+
+        // Core GetKeyboardMapping { first=10, count=2 }.
+        handle_get_keyboard_mapping(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            &[10u8, 2],
+        )
+        .expect("core");
+        let core = read_all_available(&mut peer);
+        // byte[1] = keysyms-per-keycode; payload from byte 32.
+        let core_kpc = core[1];
+        let core_syms = core[32..].to_vec();
+
+        // XI1 GetDeviceKeyMapping on master keyboard (device 3),
+        // { deviceid=3, first=10, count=2 }.
+        let header = RequestHeader {
+            opcode: 137,
+            data: 24,
+            length_units: 2,
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            header,
+            &[3u8, 10, 2, 0],
+        )
+        .expect("xi1");
+        let xi = read_all_available(&mut peer);
+
+        assert_eq!(xi[0], 1, "X_Reply");
+        assert_eq!(xi[1], 24, "RepType = X_GetDeviceKeyMapping");
+        // byte[8] = keysyms-per-keycode for XI1 (vs byte[1] for core).
+        assert_eq!(xi[8], core_kpc, "XI1 kpc matches core kpc");
+        assert_eq!(
+            &xi[32..],
+            &core_syms[..],
+            "XI1 device keymap payload matches core keyboard mapping"
+        );
+        // And the injected keysyms actually came through.
+        let expect: Vec<u8> = [0x0061u32, 0x0041, 0x0062, 0x0042]
+            .iter()
+            .flat_map(|k| k.to_le_bytes())
+            .collect();
+        assert_eq!(&xi[32..], &expect[..], "injected keysyms surfaced");
+    }
+
+    #[test]
+    fn xi_get_device_key_mapping_on_pointer_device_is_bad_match() {
+        // Device 2 is the master pointer — no key class → BadMatch
+        // (Xorg getkmap.c: dev->key == NULL → BadMatch).
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let header = RequestHeader {
+            opcode: 137,
+            data: 24,
+            length_units: 2,
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &[2u8, 8, 1, 0],
+        )
+        .expect("process");
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[0], 0, "error packet");
+        assert_eq!(bytes[1], x11::error::BAD_MATCH, "BadMatch");
     }
 
     fn randr_unimplemented_reply_bearing(minor: u8) -> Vec<u8> {

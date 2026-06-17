@@ -3441,6 +3441,36 @@ pub fn write_get_keyboard_mapping_reply_from_keysyms(
     writer.write_all(&reply)
 }
 
+/// XInput 1.x `GetDeviceKeyMapping` reply (minor 24). Layout from
+/// `xGetDeviceKeyMappingReply` (XIproto.h): like core
+/// `GetKeyboardMapping` but `byte[1]` carries the minor opcode
+/// (`X_GetDeviceKeyMapping` = 24) and `keySymsPerKeyCode` moves to
+/// `byte[8]` (after the length word) rather than `byte[1]`.
+/// `length` = `keysyms_per_keycode * count` keysym words. Mirrors
+/// Xorg `Xi/getkmap.c::ProcXGetDeviceKeyMapping`.
+pub fn write_get_device_key_mapping_reply(
+    writer: &mut impl Write,
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    keysyms_per_keycode: u8,
+    keysyms: &[u32],
+) -> io::Result<()> {
+    const X_GET_DEVICE_KEY_MAPPING: u8 = 24;
+    let length_words = u32::try_from(keysyms.len()).unwrap_or(0);
+    let mut reply = Vec::with_capacity(32 + keysyms.len() * 4);
+    reply.push(1); // repType = X_Reply
+    reply.push(X_GET_DEVICE_KEY_MAPPING); // RepType
+    write_u16(byte_order, &mut reply, sequence.0);
+    write_u32(byte_order, &mut reply, length_words);
+    reply.push(keysyms_per_keycode);
+    reply.extend_from_slice(&[0u8; 23]); // pad0..pad6
+    debug_assert_eq!(reply.len(), 32);
+    for k in keysyms {
+        write_u32(byte_order, &mut reply, *k);
+    }
+    writer.write_all(&reply)
+}
+
 pub fn write_get_modifier_mapping_reply_with_keycodes(
     writer: &mut impl Write,
     byte_order: ClientByteOrder,
@@ -3465,6 +3495,58 @@ pub fn write_get_modifier_mapping_reply_with_keycodes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// XI1 `GetDeviceKeyMapping` reply wire layout, asserted against the
+    /// `xGetDeviceKeyMappingReply` struct in XIproto.h:
+    ///   byte 0 = X_Reply (1); byte 1 = X_GetDeviceKeyMapping (24);
+    ///   bytes 2..4 = sequence; bytes 4..8 = length (= count*kpc words);
+    ///   byte 8 = keySymsPerKeyCode; bytes 9..32 = pad; then keysyms.
+    #[test]
+    fn get_device_key_mapping_reply_matches_xiproto_layout() {
+        // 2 keycodes, keysyms-per-keycode = 3 → 6 keysym words.
+        let keysyms: [u32; 6] = [0x61, 0x41, 0, 0x62, 0x42, 0];
+        let mut buf = Vec::new();
+        write_get_device_key_mapping_reply(
+            &mut buf,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(0x1234),
+            3,
+            &keysyms,
+        )
+        .unwrap();
+
+        assert_eq!(buf.len(), 32 + 6 * 4);
+        assert_eq!(buf[0], 1, "repType = X_Reply");
+        assert_eq!(buf[1], 24, "RepType = X_GetDeviceKeyMapping");
+        assert_eq!(&buf[2..4], &0x1234u16.to_le_bytes(), "sequenceNumber");
+        assert_eq!(&buf[4..8], &6u32.to_le_bytes(), "length = count*kpc words");
+        assert_eq!(buf[8], 3, "keySymsPerKeyCode");
+        assert_eq!(&buf[9..32], &[0u8; 23], "pad0..pad6");
+        for (i, k) in keysyms.iter().enumerate() {
+            let off = 32 + i * 4;
+            assert_eq!(&buf[off..off + 4], &k.to_le_bytes(), "keysym {i}");
+        }
+    }
+
+    /// Empty range (count=0) → header only, length 0, still 32 bytes.
+    #[test]
+    fn get_device_key_mapping_reply_empty_is_header_only() {
+        let mut buf = Vec::new();
+        write_get_device_key_mapping_reply(
+            &mut buf,
+            ClientByteOrder::BigEndian,
+            SequenceNumber(7),
+            4,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(buf.len(), 32);
+        assert_eq!(buf[0], 1);
+        assert_eq!(buf[1], 24);
+        assert_eq!(&buf[2..4], &7u16.to_be_bytes());
+        assert_eq!(&buf[4..8], &0u32.to_be_bytes());
+        assert_eq!(buf[8], 4);
+    }
 
     /// The fallback GetImage reply must keep its length field and
     /// payload consistent with the requested format + plane_mask:
