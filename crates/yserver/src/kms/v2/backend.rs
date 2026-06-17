@@ -9827,7 +9827,52 @@ impl Backend for KmsBackendV2 {
         mode: Option<yserver_core::backend::ModeSpec>,
         x: i32,
         y: i32,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
+        // ── Idempotency guard (CRITICAL) ──────────────────────────────────
+        //
+        // MATE / mate-settings-daemon re-assert the SAME SetCrtcConfig many
+        // times in a row (bursts of identical requests). Every call here used
+        // to run a full quiesce + modeset + scene rebuild + repaint, which on
+        // a steady-state desktop hammers the CRTC back-to-back → constant
+        // flicker/tearing (observed single-screen, immediate zap). Compare the
+        // request against the ACTUAL current scanout state (`platform.outputs`
+        // is the source of truth) and no-op when nothing changed, so only a
+        // genuine mode/position/on-off change pays the modeset cost.
+        let requested = match mode {
+            None => ConnectorConfig::Off,
+            Some(m) => ConnectorConfig::Enabled {
+                mode_w: m.width,
+                mode_h: m.height,
+                vrefresh: m.vrefresh,
+                x,
+                y,
+            },
+        };
+        let current = self
+            .platform
+            .outputs
+            .iter()
+            .find(|l| l.output.connector_name == connector)
+            .map_or(ConnectorConfig::Off, |l| ConnectorConfig::Enabled {
+                mode_w: l.width,
+                mode_h: l.height,
+                vrefresh: l.output.picked.vrefresh,
+                x: l.x,
+                y: l.y,
+            });
+        if current == requested {
+            log::debug!(
+                "apply_crtc_config: {connector} already at requested config ({requested:?}); no-op"
+            );
+            // Keep the registry's current-config view in sync (cheap) without
+            // touching the hardware. Return `false` = nothing changed, so the
+            // handler skips the change-notify (Xorg RRTellChanged only fires
+            // on a real change) — this is what breaks MATE's re-assert loop.
+            let entry = self.randr_id_alloc.entry_mut(connector);
+            entry.config = requested;
+            return Ok(false);
+        }
+
         // ── Flip-safety: quiesce exactly like fire_randr_changes ──────────
         //
         // Both enable and disable modify `platform.outputs` (topology),
@@ -9960,7 +10005,7 @@ impl Backend for KmsBackendV2 {
         self.update_input_extent(new_fb_w, new_fb_h);
 
         self.scene.wake_for_damage();
-        Ok(())
+        Ok(true)
     }
 
     fn refresh_randr_state_set_time(

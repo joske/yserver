@@ -349,15 +349,21 @@ pub trait Backend: Send {
     /// `mode = Some` enables/changes it at `(x, y)` (reallocating the
     /// scanout pool on a resolution change), registry → Enabled. On
     /// DDX/alloc failure returns Err and leaves the server in its prior
-    /// consistent state (no partial enable). Default no-op for nested.
+    /// consistent state (no partial enable). Returns `Ok(true)` when the
+    /// config actually changed (handler then fires change-notifies),
+    /// `Ok(false)` when the request matched the current config and was a
+    /// no-op (handler must NOT notify — matches Xorg `RRTellChanged`,
+    /// which only fires on a real change; notifying on a redundant
+    /// re-assert makes RANDR clients re-apply in a loop). Default
+    /// `Ok(false)` no-op for nested/recording backends.
     fn apply_crtc_config(
         &mut self,
         _connector: &str,
         _mode: Option<ModeSpec>,
         _x: i32,
         _y: i32,
-    ) -> io::Result<()> {
-        Ok(())
+    ) -> io::Result<bool> {
+        Ok(false)
     }
 
     /// Refresh RANDR state after a successful `RRSetCrtcConfig`, setting

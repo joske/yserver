@@ -2722,9 +2722,10 @@ fn handle_randr_request(
                 req_timestamp
             };
             match backend.apply_crtc_config(&connector, mode_spec, i32::from(x), i32::from(y)) {
-                Ok(()) => {
-                    // Single rebuild path: CRTC set bumps lastSetTime
-                    // (to the client timestamp) but NOT lastConfigTime.
+                Ok(true) => {
+                    // Something actually changed. Single rebuild path: a CRTC
+                    // set bumps lastSetTime (to the client timestamp) but NOT
+                    // lastConfigTime.
                     backend.refresh_randr_state_set_time(state, set_time);
                     let changed: Vec<(u32, u32, u32)> = state
                         .randr
@@ -2737,6 +2738,21 @@ fn handle_randr_request(
                     // Fire Crtc/Output change (+ ScreenChangeNotify via
                     // RRTellChanged) → emit_randr_change_notifications.
                     super::run::emit_randr_change_notifications(state, &changed);
+                    return reply_set_crtc_config(
+                        state,
+                        client_id,
+                        sequence,
+                        byte_order,
+                        0,
+                        state.randr.timestamp,
+                    );
+                }
+                Ok(false) => {
+                    // No-op: the request matched the current config. Reply
+                    // success WITHOUT a rebuild or any change-notify. Xorg's
+                    // RRTellChanged only fires on a real change; firing on a
+                    // redundant re-assert makes mate-settings-daemon re-apply
+                    // on the notify → feedback loop → constant modeset/flicker.
                     return reply_set_crtc_config(
                         state,
                         client_id,
