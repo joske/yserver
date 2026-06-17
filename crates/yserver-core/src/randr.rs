@@ -220,18 +220,27 @@ impl RandrState {
             let name = format!("{}x{}", m.width, m.height).into_bytes();
             #[allow(clippy::cast_possible_truncation)]
             let name_len = name.len() as u16;
+            // Synthetic blanking. dot_clock MUST be consistent with the
+            // htotal/vtotal we emit: clients (xrandr, mate-settings)
+            // compute refresh as dot_clock / (htotal * vtotal), so
+            // setting dot_clock = htotal * vtotal * vrefresh makes that
+            // back-compute to exactly `vrefresh`. (Using width*height
+            // instead reported vrefresh * active/total ≈ 51–53 Hz.)
+            let htotal = m.width.saturating_add(264);
+            let vtotal = m.height.saturating_add(28);
+            let dot_clock = u32::from(htotal) * u32::from(vtotal) * m.vrefresh;
             mode_infos.push(proto::ModeInfo {
                 id: m.mode_id,
                 width: m.width,
                 height: m.height,
-                dot_clock: u32::from(m.width) * u32::from(m.height) * m.vrefresh,
+                dot_clock,
                 hsync_start: m.width + 40,
                 hsync_end: m.width + 168,
-                htotal: m.width + 264,
+                htotal,
                 hskew: 0,
                 vsync_start: m.height + 1,
                 vsync_end: m.height + 4,
-                vtotal: m.height + 28,
+                vtotal,
                 name_len,
                 mode_flags: 0,
             });
@@ -814,6 +823,40 @@ mod tests {
         let st = RandrState::from_outputs(0, outs);
         assert_eq!(st.screen_width, 1920);
         assert_eq!(st.screen_height, 2160, "screen must encompass y+height");
+    }
+
+    #[test]
+    fn mode_info_refresh_backcomputes_to_vrefresh() {
+        // Clients derive refresh = dot_clock / (htotal * vtotal). For a
+        // 1920x1080@60 mode that division must yield exactly 60, not the
+        // ~51 Hz that width*height*vrefresh produced.
+        let out = RandrOutput {
+            name: "DP-1".into(),
+            output_id: 1,
+            crtc_id: 2,
+            mode_id: 7,
+            connected: true,
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            vrefresh: 60,
+            mm_width: 0,
+            mm_height: 0,
+            mode_ids: vec![7],
+            num_preferred: 1,
+        };
+        let mode_table = vec![RandrMode {
+            mode_id: 7,
+            width: 1920,
+            height: 1080,
+            vrefresh: 60,
+        }];
+        let st = RandrState::from_outputs_with_modes(0, vec![out], mode_table);
+        let res = st.screen_resources_current();
+        let mi = res.modes.iter().find(|m| m.id == 7).expect("mode 7");
+        let refresh = mi.dot_clock / (u32::from(mi.htotal) * u32::from(mi.vtotal));
+        assert_eq!(refresh, 60, "xrandr-formula refresh must equal vrefresh");
     }
 
     #[test]
