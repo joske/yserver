@@ -155,6 +155,11 @@ pub(crate) struct ConnectorIds {
     pub crtc_id: u32,
 }
 
+/// `(connector_name, ids, connected, advertised_modes)` snapshot for a
+/// not-live connector, materialized in `randr_outputs_and_modes` to
+/// release the `&self` borrow before the `&mut self` `mode_id()` calls.
+type NotLiveConnector = (String, ConnectorIds, bool, Vec<(u16, u16, u32, bool)>);
+
 /// Per-connector current configuration in the registry.
 // Consumed by the SetCrtcConfig apply path + rescan/resume layout
 // preservation (later RANDR output-management tasks); storage only here.
@@ -2594,7 +2599,7 @@ impl KmsBackendV2 {
         // GetOutputInfo stays consistent with the GetScreenResources union.
         // Collect owned first to release the &self borrow before the
         // &mut self mode_id() allocations below.
-        let not_live: Vec<(String, ConnectorIds, bool, Vec<(u16, u16, u32, bool)>)> = self
+        let not_live: Vec<NotLiveConnector> = self
             .randr_id_alloc
             .entries()
             .filter(|(name, _)| !live_names.contains(name.as_str()))
@@ -2649,7 +2654,7 @@ impl KmsBackendV2 {
     ///   changed — i.e. hotplug/reprobe-with-change, NOT a CRTC set.
     ///
     /// The current logical screen size (`screen_width`/`screen_height`
-    /// + `*_mm`) is OWNED by `RRSetScreenSize` once set and is carried
+    /// and `*_mm`) is OWNED by `RRSetScreenSize` once set and is carried
     /// forward across every rebuild — a re-probe or CRTC set never
     /// collapses a client-resized screen back to the bounding box
     /// (Xorg keeps `pScreen->width/height` until the client resizes).
