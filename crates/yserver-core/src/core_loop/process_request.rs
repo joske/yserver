@@ -8762,13 +8762,13 @@ fn synthesise_glx_fb_configs(tfp_supported: bool) -> Vec<Vec<(u32, u32)>> {
     out
 }
 
-/// X-Resource (`Res`) extension. `QueryClients` returns the real list
-/// of connected clients (their XID ranges) — what `xrestop` enumerates.
-/// The per-client resource-accounting queries (`QueryClientResources`,
-/// `QueryClientPixmapBytes`, `QueryClientIds`, `QueryResourceBytes`)
-/// remain zero-stubs: yserver keeps no per-client resource tallies yet,
-/// so those report empty. TODO(unimplemented): wire them to real
-/// per-client accounting.
+/// X-Resource (`Res`) extension. `QueryClients` returns the real list of
+/// connected clients (their XID ranges); `QueryClientResources` returns
+/// real per-type resource counts for a client (the two queries `xrestop`
+/// leans on). `QueryClientPixmapBytes`, `QueryClientIds`, and
+/// `QueryResourceBytes` remain zero-stubs — yserver keeps no per-client
+/// byte tallies / PID map yet. TODO(unimplemented): wire those three to
+/// real accounting.
 fn handle_x_resource_request(
     state: &mut ServerState,
     client_id: ClientId,
@@ -8817,11 +8817,33 @@ fn handle_x_resource_request(
             x11xres::encode_query_clients_reply(byte_order, sequence, &clients)
         }
         x11xres::QUERY_CLIENT_RESOURCES => {
+            // body: xid(4). X-Resource identifies the target client by the
+            // xid's resource range (Xorg CLIENT_ID()), not by it being a
+            // live resource — xrestop passes the client's resource_base.
+            let xid = if body.len() >= 4 {
+                u32::from_le_bytes([body[0], body[1], body[2], body[3]])
+            } else {
+                0
+            };
+            let target = state
+                .clients
+                .iter()
+                .find(|(_, c)| (xid & !c.resource_id_mask) == c.resource_id_base)
+                .map(|(id, _)| *id);
+            let pairs = target
+                .map(|id| state.resources.resource_counts_by_owner(ClientId(id)))
+                .unwrap_or_default();
+            let types: Vec<(u32, u32)> = pairs
+                .iter()
+                .map(|(name, count)| (state.atoms.intern(name, false).0, *count))
+                .collect();
             debug!(
-                "client {} #{} X-Resource::QueryClientResources -> 0 types (stub)",
-                client_id.0, sequence.0
+                "client {} #{} X-Resource::QueryClientResources xid=0x{xid:x} -> {} types",
+                client_id.0,
+                sequence.0,
+                types.len()
             );
-            x11xres::encode_query_client_resources_empty_reply(byte_order, sequence)
+            x11xres::encode_query_client_resources_reply(byte_order, sequence, &types)
         }
         x11xres::QUERY_CLIENT_PIXMAP_BYTES => {
             debug!(
@@ -24438,6 +24460,74 @@ mod tests {
         assert_eq!(&bytes[36..40], &0x001f_ffffu32.to_le_bytes(), "c1 mask");
         assert_eq!(&bytes[40..44], &0x0080_0000u32.to_le_bytes(), "c2 base");
         assert_eq!(&bytes[44..48], &0x001f_ffffu32.to_le_bytes(), "c2 mask");
+    }
+
+    #[test]
+    fn x_resource_query_client_resources_counts_by_type() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        {
+            let c = state.clients.get_mut(&1).unwrap();
+            c.resource_id_base = 0x0040_0000;
+            c.resource_id_mask = 0x001f_ffff;
+        }
+        // Client 1 owns 2 GCs + 1 font.
+        state
+            .resources
+            .seed_gc_for_test(ClientId(1), ResourceId(0x0040_0001));
+        state
+            .resources
+            .seed_gc_for_test(ClientId(1), ResourceId(0x0040_0002));
+        state
+            .resources
+            .seed_font_for_test(ClientId(1), ResourceId(0x0040_0003));
+
+        let mut backend = RecordingBackend::new();
+        // QueryClientResources (minor 2), xid = the client's resource base.
+        let xid = 0x0040_0000u32;
+        let header = RequestHeader {
+            opcode: 149,
+            data: 2,
+            length_units: 2,
+        };
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &xid.to_le_bytes(),
+            None,
+        )
+        .expect("process_request");
+        let bytes = read_all_available(&mut peer);
+        assert!(bytes.len() >= 32, "got {bytes:02x?}");
+        let num_types = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        assert_eq!(
+            bytes.len(),
+            32 + num_types * 8,
+            "reply size matches num_types"
+        );
+        // Resolve each returned type atom back to its name — proves the
+        // canonical strings, not just the counts.
+        let mut found = std::collections::HashMap::new();
+        for i in 0..num_types {
+            let off = 32 + i * 8;
+            let atom = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+            let count = u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap());
+            let name = state
+                .atoms
+                .name(x11::AtomId(atom))
+                .unwrap_or("?")
+                .to_string();
+            found.insert(name, count);
+        }
+        assert_eq!(found.get("GC"), Some(&2), "GC count; found={found:?}");
+        assert_eq!(found.get("FONT"), Some(&1), "FONT count; found={found:?}");
+        assert!(
+            !found.contains_key("WINDOW"),
+            "zero-count types omitted; found={found:?}"
+        );
     }
 
     #[test]

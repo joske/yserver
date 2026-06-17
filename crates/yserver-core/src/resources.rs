@@ -1170,6 +1170,39 @@ impl ResourceTable {
         self.windows.get(&id.0).map(|w| w.owner)
     }
 
+    /// Per-type resource counts owned by `owner`, for X-Resource
+    /// `QueryClientResources`. Returns `(type_name, count)` only for
+    /// types with a non-zero count.
+    ///
+    /// Core type names (`WINDOW`/`PIXMAP`/`GC`/`FONT`/`CURSOR`/
+    /// `COLORMAP`) are the canonical strings Xorg registers in
+    /// `dix/registry.c`. `PICTURE`/`GLYPHSET` use descriptive names
+    /// yserver chooses: Xorg does NOT register names for RENDER resource
+    /// types (it returns the synthetic `"Unregistered resource N"` whose
+    /// `N` is an Xorg-internal RESTYPE index we can't reproduce), so
+    /// there is no canonical string to match. The X-Resource type name is
+    /// a server-registered atom that clients resolve via `GetAtomName`,
+    /// so a descriptive name is spec-legal and strictly more useful.
+    #[must_use]
+    pub fn resource_counts_by_owner(&self, owner: ClientId) -> Vec<(&'static str, u32)> {
+        fn tally<V>(m: &HashMap<u32, V>, owner: ClientId, get: impl Fn(&V) -> ClientId) -> u32 {
+            u32::try_from(m.values().filter(|v| get(v) == owner).count()).unwrap_or(u32::MAX)
+        }
+        [
+            ("WINDOW", tally(&self.windows, owner, |w| w.owner)),
+            ("PIXMAP", tally(&self.pixmaps, owner, |p| p.owner)),
+            ("GC", tally(&self.gcs, owner, |g| g.owner)),
+            ("FONT", tally(&self.fonts, owner, |f| f.owner)),
+            ("CURSOR", tally(&self.cursors, owner, |c| c.owner)),
+            ("COLORMAP", tally(&self.colormaps, owner, |c| c.owner)),
+            ("PICTURE", tally(&self.pictures, owner, |p| p.client)),
+            ("GLYPHSET", tally(&self.glyphsets, owner, |g| g.client)),
+        ]
+        .into_iter()
+        .filter(|(_, n)| *n > 0)
+        .collect()
+    }
+
     pub fn parent_of(&self, id: ResourceId) -> Option<ResourceId> {
         self.windows.get(&id.0).map(|w| w.parent)
     }
@@ -2948,6 +2981,55 @@ mod tests {
     /// be accompanied by a new line in this test + cleanup logic in
     /// `remove_non_window_resources_owned_by`; without that the test
     /// stays passing for the existing maps but a new leak ships silent.
+    #[test]
+    fn resource_counts_by_owner_tallies_per_type_and_skips_zero() {
+        use crate::backend::PixmapHandle;
+        let mut table = ResourceTable::new();
+        let owner = ClientId(7);
+        let other = ClientId(8);
+
+        // owner: 2 GCs + 1 pixmap. other: 1 GC.
+        table.gcs.insert(
+            0x0700_0001,
+            Gc::with_defaults(ResourceId(0x0700_0001), ROOT_WINDOW, owner),
+        );
+        table.gcs.insert(
+            0x0700_0002,
+            Gc::with_defaults(ResourceId(0x0700_0002), ROOT_WINDOW, owner),
+        );
+        table.gcs.insert(
+            0x0800_0001,
+            Gc::with_defaults(ResourceId(0x0800_0001), ROOT_WINDOW, other),
+        );
+        table.pixmaps.insert(
+            0x0700_0010,
+            Pixmap {
+                id: ResourceId(0x0700_0010),
+                drawable: ROOT_WINDOW,
+                width: 1,
+                height: 1,
+                depth: 24,
+                owner,
+                host_xid: Some(PixmapHandle::from_raw_for_test(0xb01)),
+            },
+        );
+
+        let counts = table.resource_counts_by_owner(owner);
+        assert!(counts.contains(&("GC", 2)), "GC count: {counts:?}");
+        assert!(counts.contains(&("PIXMAP", 1)), "PIXMAP count: {counts:?}");
+        // Zero-count types are omitted entirely.
+        assert!(
+            !counts.iter().any(|(n, _)| *n == "WINDOW" || *n == "FONT"),
+            "zero types omitted: {counts:?}"
+        );
+        // Counts are per-owner: `other`'s GC is not attributed to `owner`.
+        let other_counts = table.resource_counts_by_owner(other);
+        assert!(
+            other_counts.contains(&("GC", 1)),
+            "other GC: {other_counts:?}"
+        );
+    }
+
     #[test]
     fn disconnect_cleanup_drains_every_xid_in_use_map_for_owner() {
         use crate::backend::{

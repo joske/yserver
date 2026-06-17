@@ -1,13 +1,12 @@
-//! X-Resource extension (`Res`) — minimal stub.
+//! X-Resource extension (`Res`).
 //!
-//! Phase 2 add-on. Surfaces enough to make clients (xfwm4, lxqt-panel,
-//! KDE plasma-applet-systemload) that probe `XResQueryExtension` /
-//! `XResQueryVersion` proceed without warnings. All query replies
-//! return empty / zero — no actual resource accounting is performed.
-//! When a tool like `xrestop` actually wants real counts, the stubs
-//! return "no clients" / "no resources" and the tool displays a blank
-//! table; that's the same observable behaviour as on an X server with
-//! XRes disabled, just without the protocol-level absent reply.
+//! `QueryClients` (the connected-client list) and `QueryClientResources`
+//! (per-type resource counts for a client) return real data — the two
+//! queries `xrestop` leans on. The remaining queries
+//! (`QueryClientPixmapBytes`, `QueryClientIds`, `QueryResourceBytes`)
+//! are still empty/zero stubs: yserver keeps no per-client byte tallies
+//! or PID map yet, so those report empty (same observable behaviour as
+//! an X server with those features unavailable).
 //!
 //! Canonical layout: `/usr/share/xcb/res.xml`, version 1.2.
 
@@ -98,6 +97,31 @@ pub fn encode_query_clients_reply(
     for (base, mask) in clients {
         write_u32(byte_order, &mut out, *base);
         write_u32(byte_order, &mut out, *mask);
+    }
+    out
+}
+
+/// `QueryClientResources` reply: per-type resource counts for one
+/// client. Layout per `res.xml`: pad(1) reply_length(4 = 2·n)
+/// num_types(4) pad(20), then `n` × `Type { resource_type:ATOM,
+/// count:CARD32 }`. Each `Type` is 8 bytes = 2 reply units.
+#[must_use]
+pub fn encode_query_client_resources_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    types: &[(u32, u32)],
+) -> Vec<u8> {
+    let n = u32::try_from(types.len()).unwrap_or(0);
+    let mut out = Vec::with_capacity(32 + types.len() * 8);
+    out.push(1);
+    out.push(0);
+    write_u16(byte_order, &mut out, sequence.0);
+    write_u32(byte_order, &mut out, n.saturating_mul(2)); // reply_length (units)
+    write_u32(byte_order, &mut out, n); // num_types @8
+    out.extend_from_slice(&[0u8; 20]); // pad @12..32
+    for (resource_type, count) in types {
+        write_u32(byte_order, &mut out, *resource_type);
+        write_u32(byte_order, &mut out, *count);
     }
     out
 }
@@ -224,6 +248,31 @@ mod tests {
         assert_eq!(&reply[36..40], &0x001f_ffffu32.to_le_bytes());
         assert_eq!(&reply[40..44], &0x0080_0000u32.to_le_bytes());
         assert_eq!(&reply[44..48], &0x001f_ffffu32.to_le_bytes());
+    }
+
+    #[test]
+    fn query_client_resources_reply_lists_types() {
+        // (resource_type ATOM, count) pairs.
+        let types = [(0x0000_0123u32, 5u32), (0x0000_0456u32, 2u32)];
+        let reply = encode_query_client_resources_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(9),
+            &types,
+        );
+        assert_eq!(reply.len(), 48, "32 header + 2 Type × 8");
+        assert_eq!(reply[0], 1, "reply");
+        assert_eq!(&reply[2..4], &9u16.to_le_bytes(), "sequence");
+        assert_eq!(
+            &reply[4..8],
+            &4u32.to_le_bytes(),
+            "reply_length = 2·num_types"
+        );
+        assert_eq!(&reply[8..12], &2u32.to_le_bytes(), "num_types @8");
+        // Type list at offset 32: { resource_type:ATOM, count:CARD32 }.
+        assert_eq!(&reply[32..36], &0x0000_0123u32.to_le_bytes(), "type0 atom");
+        assert_eq!(&reply[36..40], &5u32.to_le_bytes(), "type0 count");
+        assert_eq!(&reply[40..44], &0x0000_0456u32.to_le_bytes(), "type1 atom");
+        assert_eq!(&reply[44..48], &2u32.to_le_bytes(), "type1 count");
     }
 
     #[test]
