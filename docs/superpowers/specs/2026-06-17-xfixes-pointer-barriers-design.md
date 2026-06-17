@@ -54,6 +54,8 @@ Invariants from Xorg: `event_id` starts at 1 and `release_event_id` at 0, so the
 - **Create:** XID supplied by the client (like Xorg). Reject if already in use (`state.xid_occupied(id)` → `BadAlloc`).
 - **Free:** on `DeletePointerBarrier` and on client disconnect — `pointer_barriers.retain(|_, b| b.owner != client_id)` added to `crates/yserver-core/src/core_loop/process_disconnect.rs` (beside the `xfixes_regions` sweep). On free, if the barrier is currently `hit`, synthesize a `BarrierLeave` with `XIBarrierPointerReleased` first (Xorg `BarrierFreeBarrier`).
 - **XID namespace registration (MANDATORY — XC-MISC time-bomb guard, see `project_xcmisc_missing_wm_death`):** add `pointer_barriers` to `xid_occupied` (`server.rs:1429`), `used_xids_in` (`server.rs:1444`), and extend the `xid_occupied_covers_every_namespace` test (`server.rs:4832`).
+- **Window destroy:** the barrier's `window` is a *reference* for screen selection + event routing, not an owner — the barrier is its own resource and is NOT freed when the window dies (matches Xorg; in practice the window is almost always the root, which never dies). Rule: on the window's destruction, if the barrier is currently `hit`, force a `BarrierLeave` (clear `hit`, bump `event_id`) so no client is stranded mid-sequence; the barrier itself persists until `DeletePointerBarrier` or owner disconnect. Event routing for an orphaned-window barrier falls back to the root (clients select barrier events on the root anyway).
+- **Screen / RANDR geometry change:** barrier coordinates are absolute root coords and are not rescaled. After a geometry change a barrier may fall partly or wholly outside the new bounds — it simply stops being hit there (the segment-intersection test naturally returns no crossing). If the pointer was resting on a barrier that geometry-change moved out from under it, the next motion's hit-box test emits the `BarrierLeave`. No special rescale logic; document that barriers do not migrate with outputs.
 
 ## Wire protocol
 
@@ -101,7 +103,7 @@ A barrier must be axis-aligned: horizontal (`y1 == y2`) or vertical (`x1 == x2`)
 | 0 | type=35 | GenericEvent |
 | 1 | extension | XI major opcode (137) |
 | 2 | sequenceNumber | u16 |
-| 4 | length | u32 = 6 (24 extra bytes / 4) |
+| 4 | length | u32 = **9** — `(sizeof(xXIBarrierEvent) − 32)/4` = `(68 − 32)/4`. The event is 68 bytes because `dx`/`dy` are `FP3232` (8 bytes each), so 36 extra bytes past the 32-byte GenericEvent base = 9 words. (NOT 6, and NOT 8 — a count that treats `FP3232` as 4 bytes is wrong.) |
 | 8 | evtype | u16: 25 Hit / 26 Leave |
 | 10 | deviceid | u16: master pointer (2) |
 | 12 | time | Time |
@@ -165,9 +167,11 @@ barrier_is_blocking(b, x1,y1,x2,y2) -> Option<f32 distance>:
     # horizontal: mirror image (swap X/Y roles; edge case y2>y1 && t==0)
 
 barrier_find_nearest(barriers, dir, x1,y1,x2,y2) -> nearest blocking barrier:
-    among barriers that (a) block one of `dir`'s bits
-    (barrier_is_blocking_direction: (b.directions & d) != d), (b) apply to the
-    device, (c) geometrically block — pick min distance.
+    among barriers that (a) are NOT already marked `seen` this pass
+    (else the same barrier is re-selected every iteration and the loop spins),
+    (b) block one of `dir`'s bits
+    (barrier_is_blocking_direction: (b.directions & d) != d), (c) apply to the
+    device, (d) geometrically block — pick min distance.
 
 barrier_clamp_to_barrier(b, dir, &mut x, &mut y):
     # vertical:
@@ -179,7 +183,7 @@ barrier_clamp_to_barrier(b, dir, &mut x, &mut y):
     # only the blocking axis is modified; the cursor slides ALONG the barrier
 ```
 
-**Iterative constrain** (Xorg `input_constrain_cursor`): loop while `dir != 0`: find nearest blocking barrier; mark `seen`/`hit`; clamp; remove the now-resolved axis from `dir` (vertical clears X bits, horizontal clears Y bits) and advance the current coord on that axis; emit a `BarrierHit`. A diagonal move that crosses both a vertical and a horizontal barrier resolves in two passes. After the loop, clear `seen`; any barrier still `hit` whose final position left its hit box (`barrier_inside_hit_box`, `HIT_EDGE_EXTENTS = 2`) emits `BarrierLeave` and increments `event_id`.
+**Iterative constrain** (Xorg `input_constrain_cursor`): loop while `dir != 0`: find nearest *unseen* blocking barrier; mark it `seen` and `hit`; clamp; remove the now-resolved axis from `dir` (vertical clears X bits, horizontal clears Y bits) and advance the current coord on that axis; emit a `BarrierHit`. A diagonal move that crosses both a vertical and a horizontal barrier resolves in two passes. After the loop, in a second sweep clear every barrier's `seen`; for any barrier still flagged `hit` whose final position left its hit box (`barrier_inside_hit_box`, `HIT_EDGE_EXTENTS = 2`), **clear `hit`**, emit `BarrierLeave`, and increment `event_id`. Clearing `hit` is load-bearing: `new_sequence = !hit`, so a barrier that stays `hit` forever never re-arms a fresh Hit sequence (Xorg xibarriers.c:509).
 
 The `release_event_id` short-circuit (Xorg xibarriers.c:460): in the loop, `if barrier.event_id == barrier.release_event_id { continue; }` — skip clamping this barrier for the released crossing. Once the pointer leaves the hit box, `event_id` increments past `release_event_id`, so it re-arms (one-shot release).
 
@@ -199,8 +203,10 @@ On bare metal the cursor position has **two authorities**:
 
 Clamping only in core lets the input-thread accumulator march past the barrier, so the wall won't physically hold (the next relative delta is measured from the un-clamped accumulator). The existing **confinement feature has this same latent drift** (flagged during research). Fix, shared by both features:
 
-- Extend `InputThreadCommand` with `SetPosition { x, y }`. After a barrier (or confine) clamp on KMS, the core sends the corrected absolute position so the input thread's accumulator is resynced.
+- Extend the input-thread control channel with a `SetPosition { x, y }` command. The current channel is a **one-byte Pause/Resume latch** — it cannot carry coordinates, so `SetPosition` needs its own synchronized slot (e.g. an `AtomicU64` packing `x:i32|y:i32` plus a "position-dirty" flag the thread checks each iteration, or a small `mpsc`/`ArrayQueue`). After a barrier/confine clamp on KMS, the core publishes the corrected absolute position; the input thread overwrites its `cursor_x/y` accumulator with it on the next iteration.
+- **Invalidate coalesced motion.** The input thread coalesces motion into a `pending_motion` before emitting. A `SetPosition` MUST drop/replace any in-flight `pending_motion`, otherwise a stale pre-clamp delta is replayed *after* the correction and drives the cursor straight back through the barrier. This is the subtlest race in the feature — call it out explicitly in the impl and test it (rapid motion into a barrier must not jitter across).
 - Continue to pull the HW cursor plane via `backend.warp_pointer_root` (`backend.rs:15987`), guarded against re-entrancy by the existing `confine_warp_active`-style flag (warp_pointer_root re-enters the fanout).
+- **Ordering:** because the input thread runs concurrently and keeps accumulating, treat the core's clamped position as authoritative and the input thread's accumulator as a cache that the core overwrites — never the reverse. A `SetPosition` that races a just-emitted motion is harmless as long as `pending_motion` is cleared, since the next real delta is applied to the corrected base.
 
 ynest: `warp_pointer_root` is a no-op (`trait_def.rs:1911`); the clamp only adjusts reported coordinates. Documented advisory behavior.
 
@@ -209,6 +215,7 @@ ynest: `warp_pointer_root` is a no-op (`trait_def.rs:1911`); the clamp only adju
 - **Hit:** in the constrain loop, build `xXIBarrierEvent` (evtype 25). `new_sequence = !barrier.hit`; `dtime = new_sequence ? 0 : now - last_timestamp`; `dx/dy = proposed - old` in FP3232; `root_x/root_y` patched with the final clamped position (FP1616). Deliver to clients selecting `XI_BarrierHit` on `barrier.window` for the master pointer.
 - **Leave:** when a hit barrier's final position leaves the hit box, evtype 26, then `event_id += 1`.
 - **XIBarrierReleasePointer:** for each `{deviceid, barrier, eventid}`: owner check (`BadAccess` otherwise); if `barrier.event_id == eventid` set `barrier.release_event_id = eventid`. Effect realized by the loop's short-circuit above.
+- **Grab semantics (Xorg `ProcessBarrierEvent` / `exevents.c`):** when the master pointer is actively grabbed, set the `XIBarrierDeviceIsGrabbed` flag (1<<1) in the emitted event, and route delivery on the **grabbed path** — i.e. the event goes to the grabbing client per the grab's XI2 mask, *not* a plain `xi2_masks[(window, device)]` window-mask match. yserver already tracks the active pointer grab + its XI2 mask in the fanout (the same machinery core button/motion events use for grab routing); reuse it so a grab-holding client (e.g. a WM mid-drag) still receives barrier events. Without this, clients that branch on the grab flag, or expect barrier events while grabbing, diverge from Xorg.
 
 ## Module / file plan
 
@@ -221,7 +228,7 @@ ynest: `warp_pointer_root` is a no-op (`trait_def.rs:1911`); the clamp only adju
 | `crates/yserver-core/src/core_loop/process_request.rs` | XFIXES 31/32 arms; XI2 61 arm; barrier-bypass on WarpPointer |
 | `crates/yserver-core/src/core_loop/pointer_fanout.rs` | constrain hook + event emission + warp-back resync |
 | `crates/yserver-core/src/core_loop/process_disconnect.rs` | owner sweep |
-| `crates/yserver/src/input_thread.rs` + command enum | `SetPosition` resync |
+| `crates/yserver/src/input_thread.rs` + control channel | `SetPosition` resync — **not** a trivial enum add: the channel is a one-byte Pause/Resume latch, so this needs a coordinate-carrying slot/queue + `pending_motion` invalidation (see KMS section) |
 
 ## Testing
 
@@ -232,8 +239,10 @@ Per `feedback_vng_pass_not_hw_pass`: vng is the iteration signal; **bee multi-mo
 3. **Encode (unit):** `xXIBarrierEvent` byte layout asserted field-by-field against `XI2proto.h:1068`.
 4. **Validation (integration):** every error row above.
 5. **Release state machine (integration):** Hit → ReleasePointer(eventid) → cross succeeds → leave hit box → re-arms; stale eventid release is a no-op.
-6. **Lifetime:** disconnect frees barriers; free-while-hit synthesizes `BarrierLeave`+released flag; XID namespace test extended.
-7. **HW smoke (gate):** bee dual-head GNOME — pointer holds at monitor seam, firm push crosses (release path), no trap; `xinput` barrier test app sanity. Capture an xtrace from a real Xorg barrier session to validate wire/events against (`feedback_xorg_is_the_de_facto_spec`).
+6. **Lifetime:** disconnect frees barriers; free-while-hit synthesizes `BarrierLeave`+released flag; **window-destroy-while-hit** forces a `BarrierLeave` and the barrier survives; geometry-shrink makes an out-of-bounds barrier un-hittable; XID namespace test extended.
+7. **Grab flag:** a `BarrierHit` emitted while the master pointer is grabbed carries `XIBarrierDeviceIsGrabbed` and routes to the grabbing client.
+8. **`pending_motion` invalidation (KMS, the race):** simulate rapid relative motion straight into a barrier; assert the post-clamp position holds and no stale coalesced delta replays the cursor across (regression guard for the subtlest race).
+9. **HW smoke (gate):** bee dual-head GNOME — pointer holds at monitor seam, firm push crosses (release path), no trap; `xinput` barrier test app sanity. Capture an xtrace from a real Xorg barrier session to validate wire/events against (`feedback_xorg_is_the_de_facto_spec`).
 
 ## Risks
 
