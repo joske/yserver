@@ -127,6 +127,14 @@ pub enum RecordedCall {
     /// GLX-TFP Task 3.5: `promote_pixmap_exportable(host_xid)` called
     /// (the lightweight bind hook — does NOT touch the lifetime refcount).
     PromotePixmapExportable(u32),
+    /// `set_shape_rectangles(host_xid, kind, rects)` called. `rect_count`
+    /// captures the list length so tests can distinguish a concrete shape
+    /// (>0) from a cleared/unset one (0 → backend drops the entry).
+    SetShapeRectangles {
+        host_xid: u32,
+        kind: u8,
+        rect_count: usize,
+    },
 }
 
 /// Test double for `Backend`. Auto-allocates host xids from a private
@@ -1175,10 +1183,18 @@ impl Backend for RecordingBackend {
     fn set_shape_rectangles(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_xid: u32,
-        _kind: u8,
-        _rects: &[xfixes::RegionRect],
+        host_xid: u32,
+        kind: u8,
+        rects: &[xfixes::RegionRect],
     ) -> io::Result<()> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(RecordedCall::SetShapeRectangles {
+                host_xid,
+                kind,
+                rect_count: rects.len(),
+            });
         Ok(())
     }
 

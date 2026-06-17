@@ -454,6 +454,28 @@ fn mirror_shape_to_host_state(
     let Some(host_xid) = w.host_xid else {
         return;
     };
+    // Multi-monitor Bug A: a window with NO explicitly-set Bounding shape
+    // is unshaped — its effective bounding region is the *live* window
+    // geometry, which the backend scene already honors via the full-window
+    // emit path. `shape_rects_for` would instead materialize
+    // `default_shape_rect` (the geometry at THIS instant) into a concrete
+    // rect; mirroring that freezes a fixed extent into the backend's
+    // `shape_bounding` that goes stale when the window is later resized.
+    // The Composite Overlay Window is the load-bearing case: marco resets
+    // its Bounding shape to None while the screen is single-head, we froze
+    // (0,0 2560x1440), then RANDR grew the COW to 5120 on apply — the scene
+    // kept clipping the now-5120 COW to the stale 2560 rect, so the 2nd
+    // output sampled the wrong (left) half placed off-screen and screen 2
+    // went dark. For an unset Bounding shape, mirror EMPTY rects so the
+    // backend drops the entry and the scene tracks live geometry (Xorg
+    // parity: a None bounding region is never materialized into a rect).
+    // Clip/Input keep mirroring the default rect — the scene's compose clip
+    // only consults Bounding, and Input drives the cursor hit-test which
+    // wants the concrete region.
+    if kind == x11shape::KIND_BOUNDING && !crate::nested::shape_kind_is_set(state, window, kind) {
+        let _ = backend.set_shape_rectangles(origin, host_xid.as_raw(), kind, &[]);
+        return;
+    }
     let rects = crate::nested::shape_rects_for(state, window, kind);
     let _ = backend.set_shape_rectangles(origin, host_xid.as_raw(), kind, &rects);
 }
@@ -41791,5 +41813,95 @@ mod tests {
         .unwrap();
         let bytes = read_all_available(&mut peer);
         assert_eq!(bytes[1], x11::error::BAD_VALUE, "mm_width=0 → BadValue");
+    }
+
+    // Multi-monitor Bug A regression: an unset Bounding shape must mirror
+    // EMPTY rects to the backend (so it drops the entry and the scene
+    // tracks live geometry), NOT the materialized default geometry rect
+    // that would freeze a stale extent and clip a later-resized window.
+    #[test]
+    fn unset_bounding_shape_mirrors_empty_not_default_geometry() {
+        use yserver_protocol::x11::shape as x11shape;
+
+        const WINDOW_XID: u32 = 0x0010_0001;
+        const HOST_XID: u32 = 0x0040_0001;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(1),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WINDOW_XID),
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 2560,
+                height: 1440,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state
+            .resources
+            .window_mut(ResourceId(WINDOW_XID))
+            .expect("window installed")
+            .host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(HOST_XID));
+
+        // No explicit Bounding shape set → mirror must push empty rects.
+        mirror_shape_to_host_state(
+            &state,
+            &mut backend,
+            None,
+            ResourceId(WINDOW_XID),
+            x11shape::KIND_BOUNDING,
+        );
+        assert_eq!(
+            backend.calls().last(),
+            Some(
+                &crate::backend::recording::RecordedCall::SetShapeRectangles {
+                    host_xid: HOST_XID,
+                    kind: x11shape::KIND_BOUNDING,
+                    rect_count: 0,
+                }
+            ),
+            "unset Bounding shape must mirror EMPTY rects (drop backend entry), \
+             not the materialized 2560x1440 default geometry rect",
+        );
+
+        // After an explicit Bounding shape, mirror the concrete rect(s).
+        crate::nested::set_shape_rects(
+            &mut state,
+            ResourceId(WINDOW_XID),
+            x11shape::KIND_BOUNDING,
+            vec![yserver_protocol::x11::xfixes::RegionRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            }],
+        );
+        mirror_shape_to_host_state(
+            &state,
+            &mut backend,
+            None,
+            ResourceId(WINDOW_XID),
+            x11shape::KIND_BOUNDING,
+        );
+        assert_eq!(
+            backend.calls().last(),
+            Some(
+                &crate::backend::recording::RecordedCall::SetShapeRectangles {
+                    host_xid: HOST_XID,
+                    kind: x11shape::KIND_BOUNDING,
+                    rect_count: 1,
+                }
+            ),
+            "explicitly-set Bounding shape must mirror the concrete rect",
+        );
     }
 }
