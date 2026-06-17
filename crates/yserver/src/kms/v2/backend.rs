@@ -9958,16 +9958,34 @@ impl Backend for KmsBackendV2 {
             }
         }
 
-        // ── 4. Quiesce GPU + rebuild scene topology ────────────────────────
-        // The root and COW are the scene's primary sampling sources.
-        // Draining flushes all in-flight GPU work so the old images
-        // are no longer referenced before their storage is freed;
-        // rebuild_outputs re-derives output offsets / scanout layout.
-        self.platform.wait_idle_bounded();
-        self.scene.drain_all(&mut self.platform);
-        self.scene
-            .rebuild_outputs(&self.platform)
-            .map_err(|e| io::Error::other(format!("scene rebuild after screen resize: {e:?}")))?;
+        // ── 4. Mark scene dirty — no drain/rebuild needed ─────────────────
+        // A logical resize (RRSetScreenSize) does NOT change per-output
+        // scanout pool geometry or output positions; only the root/COW
+        // *source* dimensions change.  The scene resolves root and COW
+        // storage by xid on every frame (see `build_scene` → `store.lookup(
+        // core.window_id)`), so the reallocated storage above will be picked
+        // up automatically on the next compose tick.
+        //
+        // Crucially, we must NOT call `drain_all` + `rebuild_outputs` here.
+        // Those paths clear the scene's `pending_acks` queue (the per-output
+        // "flip in flight" gate) but do NOT drain the kernel's DRM event
+        // queue.  If output N has a pending atomic flip when we call
+        // drain_all, the scene thinks the CRTC is free and immediately
+        // attempts a new commit on the next tick — but the kernel still has
+        // the old flip pending, returning EBUSY.  This is what caused the
+        // observed "output 1 freezes black after RRSetScreenSize" on a live
+        // 2-monitor session.
+        //
+        // The existing per-output flip-pending gate (`pending_acks.is_empty()`
+        // in `tick_one_output`) already prevents EBUSY: if a flip is in
+        // flight the tick skips that output until the page-flip-complete event
+        // arrives.  So the correct fix is simply to defer to that gate.
+        //
+        // Old storage (root/COW) is released safely: `store_decref_with_
+        // invalidate` parks the DrawableId in `pending_retire` if the GPU
+        // fence has not yet signaled, deferring the VkImage destroy until the
+        // compose CB finishes — no `wait_idle_bounded` needed.
+        self.scene.wake_for_damage();
 
         log::info!("v2 set_logical_screen_size: resized virtual screen to {w}×{h}");
         Ok(())
@@ -23115,6 +23133,81 @@ mod tests {
             b.cow_host_xid().is_none(),
             "cow_host_xid getter returns None after final release"
         );
+    }
+
+    /// `set_logical_screen_size` updates `fb_w`/`fb_h`, reallocates root
+    /// storage to the new dimensions, and leaves the scene dirty without
+    /// calling `drain_all` or `rebuild_outputs` (which would clear
+    /// `pending_acks` and expose a kernel-level EBUSY if a flip was in
+    /// flight).  On the no-Vk test fixture, the root storage is a null-view
+    /// stub; the test verifies the observable contract:
+    ///
+    /// - `platform.fb_w` / `fb_h` carry the new size.
+    /// - Root xid is still live in the store with the new extent.
+    /// - The scene is marked dirty (next tick will repaint).
+    /// - A second call to the same dimensions is idempotent.
+    #[test]
+    fn set_logical_screen_size_updates_fb_and_root_storage() {
+        use yserver_core::backend::Backend;
+
+        let mut b = KmsBackendV2::for_tests();
+        let initial_w = b.platform.fb_w;
+        let initial_h = b.platform.fb_h;
+
+        // Sanity: root storage allocated at boot dimensions.
+        let root_xid = b.core.window_id;
+        let id_before = b
+            .store
+            .lookup(root_xid)
+            .expect("root must be live before resize");
+        let extent_before = b.store.get(id_before).unwrap().storage.extent;
+        assert_eq!(extent_before.width, u32::from(initial_w));
+        assert_eq!(extent_before.height, u32::from(initial_h));
+
+        // Perform resize.
+        let new_w: u16 = initial_w.saturating_add(1280);
+        let new_h: u16 = initial_h.saturating_add(0); // height unchanged
+        b.set_logical_screen_size(new_w, new_h)
+            .expect("set_logical_screen_size must not fail on test fixture");
+
+        // Platform extent updated.
+        assert_eq!(b.platform.fb_w, new_w, "fb_w must reflect new width");
+        assert_eq!(b.platform.fb_h, new_h, "fb_h must reflect new height");
+
+        // Root xid is live with the new extent.
+        let id_after = b
+            .store
+            .lookup(root_xid)
+            .expect("root must still be live after resize");
+        let extent_after = b.store.get(id_after).unwrap().storage.extent;
+        assert_eq!(
+            extent_after.width,
+            u32::from(new_w),
+            "root extent.width must match new_w"
+        );
+        assert_eq!(
+            extent_after.height,
+            u32::from(new_h),
+            "root extent.height must match new_h"
+        );
+
+        // DrawableId changes (new allocation) — old storage freed/parked.
+        assert_ne!(
+            id_before, id_after,
+            "resize must produce a fresh DrawableId for root"
+        );
+
+        // Scene is dirty — next tick will compose with new dimensions.
+        assert!(
+            b.scene.scene_structure_dirty,
+            "scene must be marked dirty after resize so next tick repaints"
+        );
+
+        // Idempotent: same dimensions again must succeed without panic.
+        b.set_logical_screen_size(new_w, new_h)
+            .expect("repeat call to same dimensions must succeed");
+        assert_eq!(b.platform.fb_w, new_w);
+        assert_eq!(b.platform.fb_h, new_h);
     }
 
     /// Frame tick: advances mod n, re-arms relative, mints strictly
