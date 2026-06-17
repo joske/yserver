@@ -842,7 +842,7 @@ fn dispatch_pending_host_events(state: &mut ServerState, backend: &mut dyn Backe
             }
             HostEvent::Configure(ev) => {
                 if backend.window_id() == ev.host_xid {
-                    handle_host_container_resize(state, ev);
+                    handle_host_container_resize(state, backend, ev);
                 }
             }
             HostEvent::Closed => {
@@ -858,10 +858,9 @@ fn dispatch_pending_host_events(state: &mut ServerState, backend: &mut dyn Backe
 
 pub(crate) fn handle_host_container_resize(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
     ev: crate::host_x11::HostConfigureEvent,
 ) {
-    use yserver_protocol::x11;
-
     if ev.width == 0
         || ev.height == 0
         || (state.randr.screen_width == ev.width && state.randr.screen_height == ev.height)
@@ -870,19 +869,43 @@ pub(crate) fn handle_host_container_resize(
     }
     let timestamp = state.timestamp_now();
     state.randr.resize(timestamp, ev.width, ev.height);
+
+    // The nested path resizes the single output, so it genuinely changes
+    // CRTC geometry — pass the output as changed so CrtcChangeNotify fires.
+    let changed: Vec<(u32, u32, u32)> = state
+        .randr
+        .outputs
+        .first()
+        .map(|o| (o.output_id, o.crtc_id, o.mode_id))
+        .into_iter()
+        .collect();
+    apply_screen_size_side_effects(state, backend, ev.width, ev.height, &changed);
+}
+
+/// Common side-effects of a logical-screen-size change: update root +
+/// overlay window records, emit root ConfigureNotify, fan out RANDR
+/// notifies (ScreenChange always; Crtc/Output only for entries in
+/// `changed`), and re-clamp/warp the pointer. `changed` is empty for a
+/// pure RRSetScreenSize (CRTCs unchanged).
+pub(crate) fn apply_screen_size_side_effects(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    width: u16,
+    height: u16,
+    changed: &[(u32, u32, u32)],
+) {
+    use yserver_protocol::x11;
     if let Some(root) = state.resources.window_mut(crate::resources::ROOT_WINDOW) {
-        root.width = ev.width;
-        root.height = ev.height;
+        root.width = width;
+        root.height = height;
     }
     if let Some(overlay) = state
         .resources
         .window_mut(crate::resources::COMPOSITE_OVERLAY_WINDOW)
     {
-        overlay.width = ev.width;
-        overlay.height = ev.height;
+        overlay.width = width;
+        overlay.height = height;
     }
-    let width = ev.width;
-    let height = ev.height;
 
     // Core ConfigureNotify on root for non-RANDR-aware clients
     // selecting StructureNotifyMask. Spec-correct ordering: emit this
@@ -914,15 +937,19 @@ pub(crate) fn handle_host_container_resize(
             );
         },
     );
+    emit_randr_change_notifications(state, changed);
 
-    let changed: Vec<(u32, u32, u32)> = state
-        .randr
-        .outputs
-        .first()
-        .map(|o| (o.output_id, o.crtc_id, o.mode_id))
-        .into_iter()
-        .collect();
-    emit_randr_change_notifications(state, &changed);
+    // Pointer: clamp into [0,w)×[0,h); if the screen shrank below the
+    // current cursor position, warp it inside (Xorg
+    // RRPointerScreenConfigured / ScreenRestructured). The KMS motion
+    // clamp only applies on the NEXT motion, so the explicit warp is
+    // required to avoid a stranded off-screen cursor.
+    let (px, py) = state.pointer_root;
+    let cx = i32::from(px).clamp(0, i32::from(width.saturating_sub(1)));
+    let cy = i32::from(py).clamp(0, i32::from(height.saturating_sub(1)));
+    if cx != i32::from(px) || cy != i32::from(py) {
+        backend.warp_pointer_root(state, cx, cy);
+    }
 }
 
 /// Fan out RANDR change notifications for a topology/geometry change.

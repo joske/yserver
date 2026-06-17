@@ -194,6 +194,9 @@ pub struct RecordingBackend {
     /// lets tests assert the bounded loop terminated rather than
     /// spinning to the ceiling.
     pub probe_rounds_run: std::cell::Cell<usize>,
+    /// Last `warp_pointer_root` call target; `None` if never called.
+    /// Tests assert a screen shrink warps a stranded cursor into bounds.
+    pub warped_to: Option<(i32, i32)>,
 }
 
 impl Default for RecordingBackend {
@@ -220,6 +223,7 @@ impl RecordingBackend {
             dpms_set_returns_err: false,
             probe_rounds: std::collections::VecDeque::new(),
             probe_rounds_run: std::cell::Cell::new(0),
+            warped_to: None,
         }
     }
 
@@ -1186,6 +1190,10 @@ impl Backend for RecordingBackend {
         _dst_y: i16,
     ) -> io::Result<()> {
         Ok(())
+    }
+
+    fn warp_pointer_root(&mut self, _state: &mut crate::server::ServerState, x: i32, y: i32) {
+        self.warped_to = Some((x, y));
     }
 
     fn query_pointer(&mut self, _origin: Option<OriginContext>) -> io::Result<PointerPosition> {

@@ -2484,6 +2484,95 @@ fn handle_randr_request(
             let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &buf));
         }
+        x11randr::RR_SET_SCREEN_SIZE => {
+            let Some(req) = x11randr::parse_set_screen_size_request(body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    0,
+                    u16::from(header.data),
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            // Validation order matches rrscreen.c: width range →
+            // height range → crop → zero-mm. errorValue is the
+            // offending dimension (width vs height reported
+            // separately), not always width.
+            let (min_w, min_h, max_w, max_h) = state.randr.screen_size_range();
+            if req.width < min_w || req.width > max_w {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    u32::from(req.width),
+                    u16::from(header.data),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            if req.height < min_h || req.height > max_h {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    u32::from(req.height),
+                    u16::from(header.data),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            if state.randr.screen_size_would_crop(req.width, req.height) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_MATCH,
+                    0,
+                    u16::from(header.data),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            if req.mm_width == 0 || req.mm_height == 0 {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    0,
+                    u16::from(header.data),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            if let Err(e) = backend.set_logical_screen_size(req.width, req.height) {
+                log::warn!("RRSetScreenSize: backend resize failed: {e}");
+                // Xorg ProcRRSetScreenSize returns BadMatch when
+                // RRScreenSizeSet fails (rrscreen.c). Silently
+                // succeeding would make the client believe the
+                // resize took. Leave prior state intact + report.
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_MATCH,
+                    0,
+                    u16::from(header.data),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            let ts = state.timestamp_now();
+            state
+                .randr
+                .set_logical_size(ts, req.width, req.height, req.mm_width, req.mm_height);
+            // Pure screen-size change: fire root ConfigureNotify +
+            // ScreenChangeNotify ONLY — no per-CRTC/Output change
+            // (CRTC positions are unchanged). Pass an empty changed
+            // list so only ScreenChangeNotify + root ConfigureNotify fire.
+            super::run::apply_screen_size_side_effects(state, backend, req.width, req.height, &[]);
+            // RRSetScreenSize has NO reply (it is a void request).
+            return Ok(RequestOutcome::Handled);
+        }
         x11randr::RR_SET_SCREEN_CONFIG | x11randr::RR_SET_CRTC_CONFIG => {
             // yserver runs at the KMS-set mode and doesn't reconfigure
             // outputs/CRTCs on demand. Returning BadValue here makes
@@ -41332,5 +41421,184 @@ mod tests {
         send_xcmisc(&mut state, &mut backend, 3, 2, &[]);
         let bytes = read_all_available(&mut peer);
         assert_eq!(bytes[1], x11::error::BAD_LENGTH);
+    }
+
+    /// `RRSetScreenSize` with the cursor stranded off the shrunken screen
+    /// must trigger a `warp_pointer_root` call that clamps it inside.
+    /// Also verifies the basic success path and per-dimension errorValue.
+    #[test]
+    fn screen_shrink_warps_stranded_cursor_inside() {
+        use crate::randr::{RandrOutput, RandrState};
+
+        const CLIENT_ID: u32 = 1;
+        // One enabled 1920×1080 output at (0,0).
+        let outputs = vec![RandrOutput {
+            name: "eDP-1".into(),
+            output_id: 1,
+            crtc_id: 2,
+            mode_id: 3,
+            connected: true,
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            vrefresh: 60,
+            mm_width: 0,
+            mm_height: 0,
+            mode_ids: vec![3],
+            num_preferred: 1,
+        }];
+        let mut state = ServerState::new();
+        state.randr = RandrState::from_outputs(0, outputs);
+        // Park the cursor at (2000, 1500) — valid under the old larger screen.
+        state.pointer_root = (2000, 1500);
+        let mut backend = RecordingBackend::new();
+        let _peer = install_client(&mut state, CLIENT_ID);
+
+        // Build a SetScreenSize body: window(4) width(2) height(2)
+        // mm_width(4) mm_height(4).
+        fn build_body(width: u16, height: u16, mm_w: u32, mm_h: u32) -> Vec<u8> {
+            let mut b = Vec::with_capacity(16);
+            b.extend_from_slice(&1u32.to_le_bytes()); // window (ROOT_WINDOW placeholder)
+            b.extend_from_slice(&width.to_le_bytes());
+            b.extend_from_slice(&height.to_le_bytes());
+            b.extend_from_slice(&mm_w.to_le_bytes());
+            b.extend_from_slice(&mm_h.to_le_bytes());
+            b
+        }
+
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 128, // RANDR major opcode
+            data: yserver_protocol::x11::randr::RR_SET_SCREEN_SIZE,
+            length_units: 5,
+        };
+
+        // Shrink to 1920×1080 (same as output — no crop) with real mm values.
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT_ID),
+            SequenceNumber(1),
+            header,
+            &build_body(1920, 1080, 527, 296),
+        )
+        .expect("valid shrink");
+
+        // RRSetScreenSize is void — no reply on the wire.
+        // The cursor at (2000, 1500) is outside 1920×1080, so a warp must fire.
+        assert_eq!(
+            backend.warped_to,
+            Some((1919, 1079)),
+            "cursor must be warped to (w-1, h-1) when stranded off-screen"
+        );
+        // RandrState must reflect the new logical size.
+        assert_eq!(state.randr.screen_width, 1920);
+        assert_eq!(state.randr.screen_height, 1080);
+        assert_eq!(state.randr.width_mm, 527, "mm verbatim from client");
+        assert_eq!(state.randr.height_mm, 296, "mm verbatim from client");
+    }
+
+    /// `RRSetScreenSize` validation: crop check returns BadMatch; zero-mm
+    /// returns BadValue; out-of-range width/height each report the offending
+    /// dimension as errorValue.
+    #[test]
+    fn screen_set_size_validation_errors() {
+        use crate::randr::{RandrOutput, RandrState};
+        use yserver_protocol::x11::randr as x11randr;
+
+        const CLIENT_ID: u32 = 1;
+        let outputs = vec![RandrOutput {
+            name: "eDP-1".into(),
+            output_id: 1,
+            crtc_id: 2,
+            mode_id: 3,
+            connected: true,
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            vrefresh: 60,
+            mm_width: 0,
+            mm_height: 0,
+            mode_ids: vec![3],
+            num_preferred: 1,
+        }];
+        let mut state = ServerState::new();
+        state.randr = RandrState::from_outputs(0, outputs);
+        let mut backend = RecordingBackend::new();
+        let mut peer = install_client(&mut state, CLIENT_ID);
+
+        fn build_body(width: u16, height: u16, mm_w: u32, mm_h: u32) -> Vec<u8> {
+            let mut b = Vec::with_capacity(16);
+            b.extend_from_slice(&1u32.to_le_bytes());
+            b.extend_from_slice(&width.to_le_bytes());
+            b.extend_from_slice(&height.to_le_bytes());
+            b.extend_from_slice(&mm_w.to_le_bytes());
+            b.extend_from_slice(&mm_h.to_le_bytes());
+            b
+        }
+
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 128,
+            data: x11randr::RR_SET_SCREEN_SIZE,
+            length_units: 5,
+        };
+
+        // width=0 → out-of-range (< min=1) → BadValue with errorValue=0.
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT_ID),
+            SequenceNumber(1),
+            header,
+            &build_body(0, 1080, 527, 296),
+        )
+        .unwrap();
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[1], x11::error::BAD_VALUE, "width=0 → BadValue");
+        // errorValue for the offending width is 0 (the bad width).
+        let ev = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        assert_eq!(ev, 0u32, "errorValue = offending width");
+
+        // height=0 → out-of-range → BadValue with errorValue=height.
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT_ID),
+            SequenceNumber(2),
+            header,
+            &build_body(1920, 0, 527, 296),
+        )
+        .unwrap();
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[1], x11::error::BAD_VALUE, "height=0 → BadValue");
+        let ev = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        assert_eq!(ev, 0u32, "errorValue = offending height");
+
+        // Crop: 1280×720 crops the 1920×1080 output → BadMatch.
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT_ID),
+            SequenceNumber(3),
+            header,
+            &build_body(1280, 720, 527, 296),
+        )
+        .unwrap();
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[1], x11::error::BAD_MATCH, "crop → BadMatch");
+
+        // mm_width=0 → BadValue.
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT_ID),
+            SequenceNumber(4),
+            header,
+            &build_body(1920, 1080, 0, 296),
+        )
+        .unwrap();
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[1], x11::error::BAD_VALUE, "mm_width=0 → BadValue");
     }
 }

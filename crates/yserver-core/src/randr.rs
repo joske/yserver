@@ -197,6 +197,32 @@ impl RandrState {
         }
     }
 
+    /// Would shrinking the logical screen to `w`×`h` crop any enabled
+    /// output? (Xorg `RRSetScreenSize` BadMatch, rrscreen.c:266.)
+    #[must_use]
+    pub fn screen_size_would_crop(&self, w: u16, h: u16) -> bool {
+        self.outputs
+            .iter()
+            .filter(|o| o.connected && o.mode_id != 0)
+            .any(|o| {
+                i32::from(o.x) + i32::from(o.width) > i32::from(w)
+                    || i32::from(o.y) + i32::from(o.height) > i32::from(h)
+            })
+    }
+
+    /// Set the logical (reported) screen size after validation. Uses
+    /// the CLIENT-supplied physical mm verbatim (Xorg `RRScreenSizeSet`
+    /// passes `stuff->widthInMillimeters`/`heightInMillimeters` — it does
+    /// NOT recompute from pixels). Does not touch outputs.
+    pub fn set_logical_size(&mut self, timestamp: u32, w: u16, h: u16, mm_w: u32, mm_h: u32) {
+        self.screen_width = w;
+        self.screen_height = h;
+        self.width_mm = mm_w;
+        self.height_mm = mm_h;
+        self.timestamp = timestamp.max(1);
+        self.config_timestamp = self.timestamp;
+    }
+
     /// Monitors for RANDR `GetMonitors` / XINERAMA: one per ENABLED
     /// output (connected with a non-zero mode), at its `(x,y,w,h)`.
     /// Off and disconnected outputs are absent (Xorg builds an
@@ -920,5 +946,51 @@ mod tests {
         // The off output (output_id 4) must not be primary; the enabled
         // one (output_id 1) is.
         assert_eq!(st.primary_output, 1);
+    }
+
+    #[test]
+    fn set_screen_size_rejects_crop_of_enabled_output() {
+        // eDP at (0,0) 1920x1080 enabled. Shrinking the screen to
+        // 1280x720 would crop it → BadMatch (caller maps Err to the
+        // protocol error).
+        let outs = vec![RandrOutput {
+            name: "eDP-1".into(),
+            output_id: 1,
+            crtc_id: 2,
+            mode_id: 3,
+            connected: true,
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            vrefresh: 60,
+            mm_width: 0,
+            mm_height: 0,
+            mode_ids: vec![3],
+            num_preferred: 1,
+        }];
+        let st = RandrState::from_outputs(0, outs);
+        assert!(
+            st.screen_size_would_crop(1280, 720),
+            "1280x720 crops 1920x1080"
+        );
+        assert!(
+            !st.screen_size_would_crop(2560, 1440),
+            "larger does not crop"
+        );
+    }
+
+    #[test]
+    fn set_logical_size_stores_client_mm_verbatim() {
+        let mut st = RandrState::nested(1, 1920, 1080);
+        // Caller passes client-supplied mm values; the impl must NOT
+        // recompute them from pixels.
+        st.set_logical_size(42, 2560, 1440, 597, 336);
+        assert_eq!(st.screen_width, 2560);
+        assert_eq!(st.screen_height, 1440);
+        assert_eq!(st.width_mm, 597, "mm verbatim from client");
+        assert_eq!(st.height_mm, 336, "mm verbatim from client");
+        assert_eq!(st.timestamp, 42);
+        assert_eq!(st.config_timestamp, 42);
     }
 }

@@ -1344,6 +1344,7 @@ mod tests {
         };
 
         use crate::{
+            backend::recording::RecordingBackend,
             core_loop::run::handle_host_container_resize,
             host_x11::HostConfigureEvent,
             resources::ROOT_WINDOW,
@@ -1382,8 +1383,10 @@ mod tests {
         #[test]
         fn resize_updates_state_and_root_geometry() {
             let (mut state, _reader) = server_with_root_listener();
+            let mut backend = RecordingBackend::new();
             handle_host_container_resize(
                 &mut state,
+                &mut backend,
                 HostConfigureEvent {
                     host_xid: 0xdead_beef,
                     x: 0,
@@ -1402,9 +1405,11 @@ mod tests {
         #[test]
         fn structure_notify_listener_gets_configure_notify() {
             let (mut state, mut reader) = server_with_root_listener();
+            let mut backend = RecordingBackend::new();
 
             handle_host_container_resize(
                 &mut state,
+                &mut backend,
                 HostConfigureEvent {
                     host_xid: 0xdead_beef,
                     x: 0,
