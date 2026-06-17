@@ -86,7 +86,7 @@ impl Backend for HostX11Backend {
                     state: raw.state,
                 }));
             }
-            HostInputEvent::PointerMotion { x, y, time } => {
+            HostInputEvent::PointerMotion { x, y, time, .. } => {
                 self.push_pending_host_event(HostEvent::Pointer(HostPointerEvent {
                     kind: PointerEventKind::MotionNotify,
                     host_xid: container,

@@ -948,7 +948,10 @@ pub(crate) fn apply_screen_size_side_effects(
     let cx = i32::from(px).clamp(0, i32::from(width.saturating_sub(1)));
     let cy = i32::from(py).clamp(0, i32::from(height.saturating_sub(1)));
     if cx != i32::from(px) || cy != i32::from(py) {
+        let prev = state.barrier_bypass;
+        state.barrier_bypass = true;
         backend.warp_pointer_root(state, cx, cy);
+        state.barrier_bypass = prev;
     }
 }
 

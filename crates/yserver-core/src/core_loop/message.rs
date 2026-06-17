@@ -192,6 +192,7 @@ pub enum HostInputEvent {
         x: i32,
         y: i32,
         time: u32,
+        relative: bool,
     },
     PointerButton {
         /// Linux input button code (`BTN_LEFT = 0x110`, `BTN_RIGHT = 0x111`,

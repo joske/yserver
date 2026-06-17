@@ -5594,7 +5594,13 @@ impl KmsBackendV2 {
         self.emit_motion_only(host_xid, mask);
     }
 
-    fn process_pointer_absolute(&mut self, server_state: &ServerState, x: f32, y: f32) {
+    fn process_pointer_absolute(
+        &mut self,
+        server_state: &mut ServerState,
+        x: f32,
+        y: f32,
+        relative: bool,
+    ) {
         // Clamp to the UNION framebuffer extent (`fb_w`/`fb_h`),
         // not the first output's box. `core_platform_init`
         // (`kms/backend.rs:1063-1072`) computes this as
@@ -5646,7 +5652,10 @@ impl KmsBackendV2 {
                 self.scene.wake_for_damage();
             }
         }
+        let prev = server_state.barrier_bypass;
+        server_state.barrier_bypass = prev || !relative;
         self.dispatch_motion_event(server_state);
+        server_state.barrier_bypass = prev;
     }
 
     fn process_pointer_button(&mut self, code: u32, pressed: bool, server_state: &ServerState) {
@@ -9172,8 +9181,13 @@ impl Backend for KmsBackendV2 {
         };
 
         match ev {
-            HostInputEvent::PointerMotion { x, y, time: _ } => {
-                self.process_pointer_absolute(state, x as f32, y as f32);
+            HostInputEvent::PointerMotion {
+                x,
+                y,
+                time: _,
+                relative,
+            } => {
+                self.process_pointer_absolute(state, x as f32, y as f32, relative);
             }
             HostInputEvent::PointerButton {
                 button,
@@ -15991,7 +16005,12 @@ impl Backend for KmsBackendV2 {
         // ("as if the user had instantaneously moved the pointer").
         self.on_host_input(
             state,
-            yserver_core::core_loop::HostInputEvent::PointerMotion { x, y, time: 0 },
+            yserver_core::core_loop::HostInputEvent::PointerMotion {
+                x,
+                y,
+                time: 0,
+                relative: false,
+            },
         );
     }
 
@@ -19658,13 +19677,13 @@ mod tests {
     fn process_pointer_absolute_clamps_to_output() {
         use yserver_core::server::ServerState;
         let mut b = KmsBackendV2::for_tests();
-        let state = ServerState::new();
+        let mut state = ServerState::new();
         // Inside extent.
-        b.process_pointer_absolute(&state, 100.0, 200.0);
+        b.process_pointer_absolute(&mut state, 100.0, 200.0, true);
         assert_eq!(b.core.cursor_x, 100.0);
         assert_eq!(b.core.cursor_y, 200.0);
         // Past extent → clamped to (extent - 1).
-        b.process_pointer_absolute(&state, 5000.0, 5000.0);
+        b.process_pointer_absolute(&mut state, 5000.0, 5000.0, true);
         assert_eq!(b.core.cursor_x, 799.0);
         assert_eq!(b.core.cursor_y, 599.0);
     }
@@ -19691,10 +19710,10 @@ mod tests {
         let mut b = KmsBackendV2::for_tests();
         b.platform.fb_w = 5120;
         b.platform.fb_h = 1440;
-        let state = ServerState::new();
+        let mut state = ServerState::new();
         // Point on monitor 1 (x=4000 is past output[0]'s 800-wide
         // fixture extent but well within the 5120 union extent).
-        b.process_pointer_absolute(&state, 4000.0, 1000.0);
+        b.process_pointer_absolute(&mut state, 4000.0, 1000.0, true);
         assert_eq!(
             b.core.cursor_x, 4000.0,
             "pointer must be able to cross past the first output's \
@@ -19703,9 +19722,58 @@ mod tests {
         );
         assert_eq!(b.core.cursor_y, 1000.0);
         // Past the union extent → clamped to (union - 1).
-        b.process_pointer_absolute(&state, 9999.0, 9999.0);
+        b.process_pointer_absolute(&mut state, 9999.0, 9999.0, true);
         assert_eq!(b.core.cursor_x, 5119.0);
         assert_eq!(b.core.cursor_y, 1439.0);
+    }
+
+    /// Absolute motion must bypass pointer barriers. This mirrors the
+    /// touch/tablet path: the backend delivers the motion with
+    /// `relative=false`, so the core motion fanout keeps the absolute
+    /// coordinates untouched even when a solid barrier sits in the path.
+    #[test]
+    fn process_pointer_absolute_skips_pointer_barriers_when_absolute() {
+        use yserver_core::{
+            core_loop::HostInputEvent,
+            server::{PointerBarrier, ServerState},
+        };
+        use yserver_protocol::x11::ClientId;
+
+        let mut b = KmsBackendV2::for_tests();
+        let mut state = ServerState::new();
+        state.pointer_root = (90, 50);
+        state.pointer_barriers.insert(
+            0x0050_0001,
+            PointerBarrier {
+                owner: ClientId(1),
+                window: yserver_core::resources::ROOT_WINDOW,
+                x1: 100,
+                y1: 0,
+                x2: 100,
+                y2: 200,
+                directions: 0,
+                devices: Vec::new(),
+                hit: false,
+                seen: false,
+                event_id: 1,
+                release_event_id: 0,
+                last_timestamp: 0,
+            },
+        );
+
+        b.on_host_input(
+            &mut state,
+            HostInputEvent::PointerMotion {
+                x: 110,
+                y: 50,
+                time: 0,
+                relative: false,
+            },
+        );
+
+        assert_eq!(b.core.cursor_x, 110.0);
+        assert_eq!(b.core.cursor_y, 50.0);
+        assert_eq!(state.pointer_root, (110, 50));
     }
 
     /// `window_under_cursor` returns the topmost mapped top-level
@@ -19897,6 +19965,7 @@ mod tests {
                 x: 10,
                 y: 20,
                 time: 0,
+                relative: false,
             },
         );
         assert!(

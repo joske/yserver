@@ -112,7 +112,86 @@ pub fn pointer_event_fanout_to_state(
             }
             if !state.confine_warp_active {
                 state.confine_warp_active = true;
+                let prev = state.barrier_bypass;
+                state.barrier_bypass = true;
                 backend.warp_pointer_root(state, cx, cy);
+                state.barrier_bypass = prev;
+                state.confine_warp_active = false;
+            }
+        }
+    }
+    // Pointer barriers only constrain genuine relative motion. The
+    // motion source is already encoded in the event kind/producer:
+    // absolute device motion and warps are marked non-relative and
+    // skip this block via `barrier_bypass`.
+    if !is_replay
+        && matches!(event.kind, PointerEventKind::MotionNotify)
+        && !state.barrier_bypass
+        && !state.confine_warp_active
+        && !state.pointer_barriers.is_empty()
+    {
+        let (ox, oy) = (
+            i32::from(state.pointer_root.0),
+            i32::from(state.pointer_root.1),
+        );
+        let mut nx = i32::from(event.root_x);
+        let mut ny = i32::from(event.root_y);
+        if (nx, ny) != (ox, oy) {
+            use crate::core_loop::barriers::{
+                BarrierGeom, NEGATIVE_X, NEGATIVE_Y, POSITIVE_X, POSITIVE_Y, clamp_to_barrier,
+                direction_of, find_nearest,
+            };
+
+            let keys: Vec<u32> = state.pointer_barriers.keys().copied().collect();
+            let candidates: Vec<(usize, BarrierGeom)> = keys
+                .iter()
+                .enumerate()
+                .map(|(i, k)| {
+                    let b = &state.pointer_barriers[k];
+                    (
+                        i,
+                        BarrierGeom {
+                            x1: i32::from(b.x1),
+                            y1: i32::from(b.y1),
+                            x2: i32::from(b.x2),
+                            y2: i32::from(b.y2),
+                            directions: b.directions,
+                        },
+                    )
+                })
+                .collect();
+            let mut seen: Vec<usize> = Vec::new();
+            let mut cx = ox;
+            let mut cy = oy;
+            let mut dir = direction_of(cx, cy, nx, ny);
+            while dir != 0 {
+                let Some((idx, _dist, geom)) =
+                    find_nearest(&candidates, &seen, dir, cx, cy, nx, ny)
+                else {
+                    break;
+                };
+                seen.push(idx);
+                clamp_to_barrier(&geom, dir, &mut nx, &mut ny);
+                if geom.x1 == geom.x2 {
+                    dir &= !(POSITIVE_X | NEGATIVE_X);
+                    cx = nx;
+                } else {
+                    dir &= !(POSITIVE_Y | NEGATIVE_Y);
+                    cy = ny;
+                }
+            }
+
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                event.root_x = nx as i16;
+                event.root_y = ny as i16;
+            }
+            if (nx, ny) != (ox, oy) && !state.confine_warp_active {
+                state.confine_warp_active = true;
+                let prev = state.barrier_bypass;
+                state.barrier_bypass = true;
+                backend.warp_pointer_root(state, nx, ny);
+                state.barrier_bypass = prev;
                 state.confine_warp_active = false;
             }
         }
@@ -1812,7 +1891,11 @@ fn merge_dropped(into: &mut Vec<ClientId>, more: Vec<ClientId>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::{ScreenSaverActive, ServerState};
+    use crate::{
+        host_x11::HostXidMap,
+        resources::ROOT_WINDOW,
+        server::{ScreenSaverActive, ServerState},
+    };
     use yserver_protocol::x11::ClientId;
 
     /// AllowSome state machine pins (Xorg dix/events.c semantics):
@@ -1948,6 +2031,85 @@ mod tests {
             crossing_mode: 0,
             child: 0,
         }
+    }
+
+    #[test]
+    fn motion_clamps_against_solid_barrier() {
+        let mut state = ServerState::new();
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        state.pointer_barriers.insert(
+            0x0050_0001,
+            crate::server::PointerBarrier {
+                owner: ClientId(1),
+                window: ROOT_WINDOW,
+                x1: 100,
+                y1: 0,
+                x2: 100,
+                y2: 200,
+                directions: 0,
+                devices: Vec::new(),
+                hit: false,
+                seen: false,
+                event_id: 1,
+                release_event_id: 0,
+                last_timestamp: 0,
+            },
+        );
+        state.pointer_root = (90, 50);
+        let mut ev = motion_event();
+        ev.root_x = 110;
+        ev.root_y = 50;
+        let dropped = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &HostXidMap::new(),
+            ev,
+            true,
+            false,
+        );
+        assert!(dropped.is_empty());
+        assert_eq!(state.pointer_root, (99, 50));
+        assert_eq!(backend.warped_to, Some((99, 50)));
+    }
+
+    #[test]
+    fn barrier_bypass_skips_clamp() {
+        let mut state = ServerState::new();
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        state.pointer_barriers.insert(
+            0x0050_0001,
+            crate::server::PointerBarrier {
+                owner: ClientId(1),
+                window: ROOT_WINDOW,
+                x1: 100,
+                y1: 0,
+                x2: 100,
+                y2: 200,
+                directions: 0,
+                devices: Vec::new(),
+                hit: false,
+                seen: false,
+                event_id: 1,
+                release_event_id: 0,
+                last_timestamp: 0,
+            },
+        );
+        state.pointer_root = (90, 50);
+        state.barrier_bypass = true;
+        let mut ev = motion_event();
+        ev.root_x = 110;
+        ev.root_y = 50;
+        let dropped = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &HostXidMap::new(),
+            ev,
+            true,
+            false,
+        );
+        assert!(dropped.is_empty());
+        assert_eq!(state.pointer_root, (110, 50));
+        assert_eq!(backend.warped_to, None);
     }
 
     /// wmaker wedge regression (2026-06-04, silence HW): a WM places a

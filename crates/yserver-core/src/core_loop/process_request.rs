@@ -6340,6 +6340,7 @@ fn dispatch_fake_input_with_body(
                     x: i32::from(fi.root_x),
                     y: i32::from(fi.root_y),
                     time: fi.time,
+                    relative: false,
                 },
             );
         }
@@ -22159,7 +22160,10 @@ fn handle_warp_pointer(
             if let Ok(p) = backend.query_pointer(origin) {
                 let abs_x = i32::from(p.win_x) + i32::from(dst_x);
                 let abs_y = i32::from(p.win_y) + i32::from(dst_y);
+                let prev = state.barrier_bypass;
+                state.barrier_bypass = true;
                 backend.warp_pointer_root(state, abs_x, abs_y);
+                state.barrier_bypass = prev;
             }
         } else {
             let host_target = state
@@ -22173,7 +22177,10 @@ fn handle_warp_pointer(
             // self-contained backends (KMS) — see
             // `Backend::warp_pointer_root`. No-op for proxy backends.
             let (wx, wy) = state.resources.window_absolute_position(dst_window);
+            let prev = state.barrier_bypass;
+            state.barrier_bypass = true;
             backend.warp_pointer_root(state, wx + i32::from(dst_x), wy + i32::from(dst_y));
+            state.barrier_bypass = prev;
         }
     }
     debug!("client {} #{} WarpPointer", client_id.0, sequence.0);

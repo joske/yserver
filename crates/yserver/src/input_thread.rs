@@ -133,6 +133,7 @@ impl LibinputThreadState {
                     x: self.cursor_x as i32,
                     y: self.cursor_y as i32,
                     time: time_ms,
+                    relative: true,
                 }
             }
             InputEvent::PointerMotionAbsolute { x_norm, y_norm } => {
@@ -142,6 +143,7 @@ impl LibinputThreadState {
                     x: self.cursor_x as i32,
                     y: self.cursor_y as i32,
                     time: time_ms,
+                    relative: false,
                 }
             }
             InputEvent::Button { code, pressed } => HostInputEvent::PointerButton {
@@ -930,7 +932,7 @@ mod tests {
             42,
         );
         match ev {
-            HostInputEvent::PointerMotion { x, y, time } => {
+            HostInputEvent::PointerMotion { x, y, time, .. } => {
                 assert_eq!(time, 42);
                 // 0.5 * 799 ≈ 399.5 → 399 (truncation when cast to i32)
                 assert!((x - 399).abs() <= 1, "x = {x}");

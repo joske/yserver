@@ -830,6 +830,9 @@ pub struct ServerState {
     /// motion; a coordinate mismatch between the clamp target and the
     /// re-derived event must not warp again (stack overflow).
     pub confine_warp_active: bool,
+    /// Re-entrancy / bypass guard for synthetic pointer motion used
+    /// by warps and barrier corrective warps.
+    pub barrier_bypass: bool,
     /// Most recent input event timestamp seen by either fanout —
     /// stands in for "current server time" in XI1 grab time checks.
     pub xi1_last_input_time: u32,
@@ -1134,6 +1137,7 @@ impl ServerState {
             pointer_confine_to: ResourceId(0),
             buttons_down: 0,
             confine_warp_active: false,
+            barrier_bypass: false,
             xi1_last_input_time: 0,
             xi1_frozen: HashMap::new(),
             xi1_device_focus: HashMap::new(),
