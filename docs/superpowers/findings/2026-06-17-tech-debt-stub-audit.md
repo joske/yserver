@@ -16,10 +16,11 @@ Convention being violated throughout: *"no protocol stubs"* — empty/zero repli
 
 Highest impact: the client blocks forever, not just gets a wrong answer. Root cause: extension dispatchers' catch-all arms `return Ok(Handled)` without writing reply bytes.
 
-- [ ] **XI2 XIGetFocus** (minor 50) — `process_request.rs:13994` (catch-all). XInput2 focus query hangs.
-- [ ] **RANDR CreateMode** (minor 16) — `process_request.rs:2805`. `xrandr --newmode`/`--addmode` hangs.
-- [ ] **RANDR CreateLease** (minor 45) — same catch-all. VR/DRM-lease client hangs (niche).
-- [ ] **Cheap blanket fix:** make extension catch-all arms return `BadRequest`/`BadImplementation` instead of silently swallowing reply-bearing requests — converts every latent hang of this class into an honest error.
+- [x] **XI2 XIGetFocus** (minor 50) — FIXED: now returns `BadImplementation` (was catch-all hang). Test `xi_get_focus_unimplemented_returns_error_not_hang`.
+- [x] **RANDR CreateMode** (minor 16) — FIXED: now `BadImplementation`; `xrandr --newmode` errors instead of hanging. Test `randr_create_mode_unimplemented_returns_error_not_hang`.
+- [x] **RANDR CreateLease** (minor 45) — FIXED: now `BadImplementation`. Test `randr_create_lease_unimplemented_returns_error_not_hang`.
+- [x] **RANDR SetPanning** (minor 29) — FIXED (sibling reply-bearing hang the audit missed). Now `BadImplementation`. Test `randr_set_panning_unimplemented_returns_error_not_hang`.
+- [x] **Fix approach (decided): SURGICAL, not blanket.** Added explicit `BadImplementation` arms only for *reply-bearing* unimplemented requests (the hang class). VOID unimplemented requests stay silently accepted via the catch-all — Xorg implements those as success, so erroring them would introduce a NEW Xorg-divergence (vs. the "any divergence is our bug" rule); a missing *reply* is the only client-hanging case. RANDR provider-property reply-bearing requests are unreachable (`GetProviders` returns 0 providers) so left to the catch-all.
 
 ## Tier 2 — Advertised but can't deliver (cardinal "no protocol stubs" sin)
 

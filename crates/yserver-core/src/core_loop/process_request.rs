@@ -2802,6 +2802,25 @@ fn handle_randr_request(
                 }
             }
         }
+        16 | 29 | 45 => {
+            // RRCreateMode (16) / RRSetPanning (29) / RRCreateLease (45):
+            // reply-bearing requests we don't implement. Return
+            // BadImplementation so the client gets an error instead of
+            // hanging forever on a reply that never comes. Void
+            // unimplemented RANDR requests stay silent via `other` below —
+            // Xorg implements those as success, so erroring them would be a
+            // new behavioural divergence; a missing *reply* is the only
+            // client-hanging case and the only one converted here.
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_IMPLEMENTATION,
+                0,
+                u16::from(minor),
+                RANDR_MAJOR_OPCODE,
+            );
+        }
         other => {
             debug!(
                 "client {} #{} RANDR::unknown minor={}",
@@ -13991,6 +14010,20 @@ fn handle_xi2_request(
             reply.extend_from_slice(&[0u8; 23]);
             buf.extend_from_slice(&reply);
         }
+        50 => {
+            // XIGetFocus: reply-bearing but unimplemented. Return
+            // BadImplementation rather than the silent `Handled` below,
+            // which writes no reply and hangs the client forever.
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_IMPLEMENTATION,
+                0,
+                50,
+                XI2_MAJOR_OPCODE,
+            );
+        }
         _ => {
             debug!(
                 "client {} #{} unhandled XI2 request minor={}",
@@ -24196,6 +24229,99 @@ mod tests {
         assert!(bytes.len() >= 32, "expected error reply, got {bytes:02x?}");
         assert_eq!(bytes[1], x11::error::BAD_NAME, "code");
         assert_eq!(bytes[10], 92, "major opcode");
+    }
+
+    #[test]
+    fn xi_get_focus_unimplemented_returns_error_not_hang() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        // XIGetFocus (XI2 minor 50) is reply-bearing but unimplemented;
+        // it must return an X error, not silently drop the reply (hang).
+        let header = RequestHeader {
+            opcode: 137,
+            data: 50,
+            length_units: 2,
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &[0u8; 4],
+        )
+        .expect("process");
+        let bytes = read_all_available(&mut peer);
+        assert!(
+            bytes.len() >= 32,
+            "expected error reply, not a hang: {bytes:02x?}"
+        );
+        assert_eq!(bytes[0], 0, "error packet");
+        assert_eq!(bytes[1], x11::error::BAD_IMPLEMENTATION, "code");
+        assert_eq!(&bytes[8..10], &50u16.to_le_bytes(), "minor");
+        assert_eq!(bytes[10], 137, "major = XInput");
+    }
+
+    fn randr_unimplemented_reply_bearing(minor: u8) -> Vec<u8> {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let header = RequestHeader {
+            opcode: 128,
+            data: minor,
+            length_units: 1,
+        };
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &[],
+        )
+        .expect("process");
+        read_all_available(&mut peer)
+    }
+
+    #[test]
+    fn randr_create_mode_unimplemented_returns_error_not_hang() {
+        // RRCreateMode (minor 16): reply-bearing, unimplemented → error.
+        let bytes = randr_unimplemented_reply_bearing(16);
+        assert!(
+            bytes.len() >= 32,
+            "expected error, not a hang: {bytes:02x?}"
+        );
+        assert_eq!(bytes[1], x11::error::BAD_IMPLEMENTATION, "code");
+        assert_eq!(&bytes[8..10], &16u16.to_le_bytes(), "minor");
+        assert_eq!(bytes[10], 128, "major = RANDR");
+    }
+
+    #[test]
+    fn randr_set_panning_unimplemented_returns_error_not_hang() {
+        // RRSetPanning (minor 29): reply-bearing, unimplemented → error.
+        let bytes = randr_unimplemented_reply_bearing(29);
+        assert!(
+            bytes.len() >= 32,
+            "expected error, not a hang: {bytes:02x?}"
+        );
+        assert_eq!(bytes[1], x11::error::BAD_IMPLEMENTATION, "code");
+        assert_eq!(&bytes[8..10], &29u16.to_le_bytes(), "minor");
+        assert_eq!(bytes[10], 128, "major = RANDR");
+    }
+
+    #[test]
+    fn randr_create_lease_unimplemented_returns_error_not_hang() {
+        // RRCreateLease (minor 45): reply-bearing, unimplemented → error.
+        let bytes = randr_unimplemented_reply_bearing(45);
+        assert!(
+            bytes.len() >= 32,
+            "expected error, not a hang: {bytes:02x?}"
+        );
+        assert_eq!(bytes[1], x11::error::BAD_IMPLEMENTATION, "code");
+        assert_eq!(&bytes[8..10], &45u16.to_le_bytes(), "minor");
+        assert_eq!(bytes[10], 128, "major = RANDR");
     }
 
     #[test]
