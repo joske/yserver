@@ -47,6 +47,8 @@ pub struct RandrState {
     pub outputs: Vec<RandrOutput>,
     /// Deduped modes referenced by `outputs[i].mode_id`.
     pub modes: Vec<RandrMode>,
+    /// Full deduped advertised mode union for `GetScreenResources`.
+    pub mode_table: Vec<RandrMode>,
     /// First output's `output_id` (or 0 if outputs is empty — should
     /// not happen post-init).
     pub primary_output: u32,
@@ -78,11 +80,26 @@ impl RandrState {
     /// - `primary_output = outputs[0].output_id` (0 if empty)
     #[must_use]
     pub fn from_outputs(timestamp: u32, outputs: Vec<RandrOutput>) -> Self {
+        let mode_table = Self::current_mode_table(&outputs);
+        Self::from_outputs_with_modes(timestamp, outputs, mode_table)
+    }
+
+    /// Build a `RandrState` from pre-allocated outputs plus an explicit
+    /// deduped mode table. The caller owns the table shape; `modes`
+    /// remains the current-mode-only compatibility vector used by a few
+    /// legacy call sites.
+    #[must_use]
+    pub fn from_outputs_with_modes(
+        timestamp: u32,
+        outputs: Vec<RandrOutput>,
+        mode_table: Vec<RandrMode>,
+    ) -> Self {
         // Some compositors compare the first RANDR resource timestamp with
         // their own "last SetCrtcConfig" timestamp, which starts at zero.
         // Advertising zero here makes the initial server state look like a
         // completed client-side reconfiguration.
         let timestamp = timestamp.max(1);
+        let modes = Self::current_mode_table(&outputs);
         let screen_width: u16 = outputs
             .iter()
             .map(|o| {
@@ -104,20 +121,6 @@ impl RandrState {
         let width_mm = ((u32::from(screen_width) * 254 + 480) / 960).max(1);
         let height_mm = ((u32::from(screen_height) * 254 + 480) / 960).max(1);
 
-        // Collect unique modes preserving caller-allocated mode_ids.
-        let mut modes: Vec<RandrMode> = Vec::new();
-        let mut seen: HashSet<u32> = HashSet::new();
-        for out in outputs.iter().filter(|o| o.connected) {
-            if seen.insert(out.mode_id) {
-                modes.push(RandrMode {
-                    mode_id: out.mode_id,
-                    width: out.width,
-                    height: out.height,
-                    vrefresh: out.vrefresh,
-                });
-            }
-        }
-
         let primary_output = outputs
             .iter()
             .find(|o| o.connected)
@@ -129,6 +132,7 @@ impl RandrState {
             config_timestamp: timestamp,
             outputs,
             modes,
+            mode_table,
             primary_output,
             screen_width,
             screen_height,
@@ -200,8 +204,8 @@ impl RandrState {
         let outputs: Vec<u32> = self.outputs.iter().map(|o| o.output_id).collect();
 
         let mut mode_names: Vec<u8> = Vec::new();
-        let mut mode_infos: Vec<proto::ModeInfo> = Vec::with_capacity(self.modes.len());
-        for m in &self.modes {
+        let mut mode_infos: Vec<proto::ModeInfo> = Vec::with_capacity(self.mode_table.len());
+        for m in &self.mode_table {
             let name = format!("{}x{}", m.width, m.height).into_bytes();
             #[allow(clippy::cast_possible_truncation)]
             let name_len = name.len() as u16;
@@ -268,7 +272,25 @@ impl RandrState {
             height_mm,
             name: out.name.clone(),
             connection: if out.connected { 0 } else { 1 },
+            mode_ids: out.mode_ids.clone(),
+            num_preferred: out.num_preferred,
         })
+    }
+
+    fn current_mode_table(outputs: &[RandrOutput]) -> Vec<RandrMode> {
+        let mut modes: Vec<RandrMode> = Vec::new();
+        let mut seen: HashSet<u32> = HashSet::new();
+        for out in outputs.iter().filter(|o| o.connected) {
+            if seen.insert(out.mode_id) {
+                modes.push(RandrMode {
+                    mode_id: out.mode_id,
+                    width: out.width,
+                    height: out.height,
+                    vrefresh: out.vrefresh,
+                });
+            }
+        }
+        modes
     }
 
     /// Look up CRTC info by `crtc_id`.
@@ -297,6 +319,8 @@ pub struct OutputInfoReplyData {
     pub height_mm: u32,
     pub name: String,
     pub connection: u8,
+    pub mode_ids: Vec<u32>,
+    pub num_preferred: u16,
 }
 
 /// Data returned by [`RandrState::crtc_info`].
@@ -374,6 +398,31 @@ mod tests {
     }
 
     #[test]
+    fn output_info_reports_full_mode_list_preferred_first() {
+        let outs = vec![RandrOutput {
+            name: "HDMI-A-1".into(),
+            output_id: 1,
+            crtc_id: 2,
+            mode_id: 7,
+            connected: true,
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            vrefresh: 60,
+            mm_width: 0,
+            mm_height: 0,
+            mode_ids: vec![7, 8, 9],
+            num_preferred: 2,
+        }];
+        let st = RandrState::from_outputs(0, outs);
+        let info = st.output_info(1, 0).expect("output 1");
+        assert_eq!(info.mode_ids, vec![7, 8, 9]);
+        assert_eq!(info.num_preferred, 2);
+        assert_eq!(info.mode_id, 7);
+    }
+
+    #[test]
     fn from_outputs_aggregates_screen_extent() {
         let outs = vec![
             RandrOutput {
@@ -416,6 +465,44 @@ mod tests {
         let expect_h = (1024u32 * 254 + 480) / 960;
         assert_eq!(st.width_mm, expect_w);
         assert_eq!(st.height_mm, expect_h);
+    }
+
+    #[test]
+    fn screen_resources_emits_full_deduped_mode_union() {
+        let outs = vec![RandrOutput {
+            name: "HDMI-A-1".into(),
+            output_id: 1,
+            crtc_id: 2,
+            mode_id: 7,
+            connected: true,
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            vrefresh: 60,
+            mm_width: 0,
+            mm_height: 0,
+            mode_ids: vec![7, 8],
+            num_preferred: 1,
+        }];
+        let mode_table = vec![
+            RandrMode {
+                mode_id: 7,
+                width: 1920,
+                height: 1080,
+                vrefresh: 60,
+            },
+            RandrMode {
+                mode_id: 8,
+                width: 1280,
+                height: 720,
+                vrefresh: 60,
+            },
+        ];
+        let st = RandrState::from_outputs_with_modes(0, outs, mode_table);
+        let res = st.screen_resources_current();
+        assert_eq!(res.modes.len(), 2);
+        assert!(res.modes.iter().any(|m| m.id == 8 && m.width == 1280));
     }
 
     #[test]

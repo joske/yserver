@@ -404,6 +404,7 @@ pub struct OutputInfoReply<'a> {
     pub subpixel_order: u8,
     pub crtcs: &'a [u32],
     pub modes: &'a [u32],
+    pub num_preferred: u16,
     pub clones: &'a [u32],
     pub name: &'a [u8],
 }
@@ -422,6 +423,7 @@ pub fn encode_get_output_info_reply(
     let subpixel_order = info.subpixel_order;
     let crtcs = info.crtcs;
     let modes = info.modes;
+    let num_preferred = info.num_preferred;
     let clones = info.clones;
     let name = info.name;
     let num_crtcs = crtcs.len();
@@ -458,9 +460,9 @@ pub fn encode_get_output_info_reply(
     // bytes 28-29: num_modes
     #[allow(clippy::cast_possible_truncation)]
     put(byte_order, &mut out, num_modes as u16);
-    // bytes 30-31: num_preferred (all modes are preferred in this stub)
+    // bytes 30-31: num_preferred (Xorg nPreferred prefix count)
     #[allow(clippy::cast_possible_truncation)]
-    put(byte_order, &mut out, num_modes as u16);
+    put(byte_order, &mut out, num_preferred);
     // bytes 32-33: num_clones  (extra word read by _XReply with extra=1)
     #[allow(clippy::cast_possible_truncation)]
     put(byte_order, &mut out, num_clones as u16);
@@ -1000,6 +1002,7 @@ mod tests {
                 subpixel_order: 0,
                 crtcs: &crtcs,
                 modes: &modes,
+                num_preferred: 1,
                 clones: &[],
                 name,
             },
@@ -1017,6 +1020,10 @@ mod tests {
         assert_eq!(buf[25], 0u8); // subpixel Unknown
         // num_crtcs at bytes 26-27
         assert_eq!(&buf[26..28], &1u16.to_le_bytes());
+        // num_modes at bytes 28-29
+        assert_eq!(&buf[28..30], &1u16.to_le_bytes());
+        // num_preferred at bytes 30-31
+        assert_eq!(&buf[30..32], &1u16.to_le_bytes());
         // num_clones at bytes 32-33
         assert_eq!(&buf[32..34], &0u16.to_le_bytes());
         // name_len at bytes 34-35

@@ -1184,8 +1184,21 @@ impl ServerState {
     /// `height` for the root window when non-zero.
     #[must_use]
     pub fn with_randr_outputs(width: u16, height: u16, outputs: Vec<RandrOutput>) -> Self {
+        let mode_table = RandrState::from_outputs(0, outputs.clone()).mode_table;
+        Self::with_randr_outputs_and_modes(width, height, outputs, mode_table)
+    }
+
+    /// Build a `ServerState` seeded with a caller-supplied set of
+    /// RANDR outputs and explicit mode table.
+    #[must_use]
+    pub fn with_randr_outputs_and_modes(
+        width: u16,
+        height: u16,
+        outputs: Vec<RandrOutput>,
+        mode_table: Vec<crate::randr::RandrMode>,
+    ) -> Self {
         let mut s = Self::with_geometry(width, height);
-        s.randr = RandrState::from_outputs(0, outputs);
+        s.randr = RandrState::from_outputs_with_modes(0, outputs, mode_table);
         // Re-apply aggregated screen extent to root window if outputs
         // imply a different size than the (width, height) args.
         if let Some(root) = s.resources.window_mut(ROOT_WINDOW) {

@@ -2199,7 +2199,7 @@ fn handle_randr_request(
                 );
             };
             let crtc_ids = [info_data.crtc];
-            let mode_ids = [info_data.mode_id];
+            let mode_ids = info_data.mode_ids.as_slice();
             let name_bytes = info_data.name.as_bytes();
             let buf = x11randr::encode_get_output_info_reply(
                 byte_order,
@@ -2212,7 +2212,8 @@ fn handle_randr_request(
                     connection: info_data.connection,
                     subpixel_order: 0,
                     crtcs: &crtc_ids,
-                    modes: &mode_ids,
+                    modes: mode_ids,
+                    num_preferred: info_data.num_preferred,
                     clones: &[],
                     name: name_bytes,
                 },

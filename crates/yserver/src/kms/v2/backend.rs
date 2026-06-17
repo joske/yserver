@@ -2489,7 +2489,18 @@ impl KmsBackendV2 {
     /// RandR output list — mirrors `KmsBackend::randr_outputs`.
     #[must_use]
     pub fn randr_outputs(&mut self) -> Vec<yserver_core::randr::RandrOutput> {
-        use yserver_core::randr::RandrOutput;
+        self.randr_outputs_and_modes().0
+    }
+
+    /// RandR outputs plus the full deduped mode table.
+    #[must_use]
+    pub fn randr_outputs_and_modes(
+        &mut self,
+    ) -> (
+        Vec<yserver_core::randr::RandrOutput>,
+        Vec<yserver_core::randr::RandrMode>,
+    ) {
+        use yserver_core::randr::{RandrMode, RandrOutput};
         let live_names: HashSet<String> = self
             .platform
             .outputs
@@ -2510,11 +2521,20 @@ impl KmsBackendV2 {
             let mut mode_ids = Vec::with_capacity(layout.output.modes.len());
             let mut num_preferred: u16 = 0;
             for m in &layout.output.modes {
-                mode_ids.push(self.randr_id_alloc.mode_id(m.width, m.height, m.vrefresh));
+                let mode_id = self.randr_id_alloc.mode_id(m.width, m.height, m.vrefresh);
+                mode_ids.push(mode_id);
                 if m.preferred {
                     num_preferred = num_preferred.saturating_add(1);
                 }
             }
+            self.randr_id_alloc
+                .entry_mut(&layout.output.connector_name)
+                .modes = layout
+                .output
+                .modes
+                .iter()
+                .map(|m| (m.width, m.height, m.vrefresh, m.preferred))
+                .collect();
             outs.push(RandrOutput {
                 name: layout.output.connector_name.clone(),
                 output_id: ids.output_id,
@@ -2533,9 +2553,51 @@ impl KmsBackendV2 {
             });
         }
 
-        for (name, ids) in self.randr_id_alloc.known_connectors() {
-            if live_names.contains(&name) {
-                continue;
+        let advertised_modes: Vec<(u16, u16, u32)> = self
+            .randr_id_alloc
+            .entries()
+            .flat_map(|(_, entry)| {
+                entry
+                    .modes
+                    .iter()
+                    .map(|&(w, h, vrefresh, _)| (w, h, vrefresh))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let mut modes: Vec<RandrMode> = Vec::new();
+        let mut mode_map: HashMap<(u16, u16, u32), u32> = HashMap::new();
+        for (w, h, vrefresh) in advertised_modes {
+            let mode_id = self.randr_id_alloc.mode_id(w, h, vrefresh);
+            if mode_map.insert((w, h, vrefresh), mode_id).is_none() {
+                modes.push(RandrMode {
+                    mode_id,
+                    width: w,
+                    height: h,
+                    vrefresh,
+                });
+            }
+        }
+
+        // Disconnected (registered but not live) connectors. Retain the
+        // last-known advertised mode list from the registry so
+        // GetOutputInfo on a dark output stays consistent with the
+        // GetScreenResources union (both advertise the same modes).
+        // Collect owned first to release the &self borrow before the
+        // &mut self mode_id() allocations below.
+        let disconnected: Vec<(String, ConnectorIds, Vec<(u16, u16, u32, bool)>)> = self
+            .randr_id_alloc
+            .entries()
+            .filter(|(name, _)| !live_names.contains(name.as_str()))
+            .map(|(name, entry)| (name.clone(), entry.ids, entry.modes.clone()))
+            .collect();
+        for (name, ids, conn_modes) in disconnected {
+            let mut mode_ids = Vec::with_capacity(conn_modes.len());
+            let mut num_preferred: u16 = 0;
+            for (w, h, vrefresh, preferred) in conn_modes {
+                mode_ids.push(self.randr_id_alloc.mode_id(w, h, vrefresh));
+                if preferred {
+                    num_preferred = num_preferred.saturating_add(1);
+                }
             }
             outs.push(RandrOutput {
                 name,
@@ -2550,12 +2612,13 @@ impl KmsBackendV2 {
                 vrefresh: 0,
                 mm_width: 0,
                 mm_height: 0,
-                mode_ids: vec![],
-                num_preferred: 0,
+                mode_ids,
+                num_preferred,
             });
         }
         outs.sort_by_key(|o| o.output_id);
-        outs
+        modes.sort_by_key(|m| m.mode_id);
+        (outs, modes)
     }
 
     /// Telemetry accessor — used by the acceptance harness to
@@ -4996,8 +5059,10 @@ impl KmsBackendV2 {
         }
 
         let timestamp = state.timestamp_now();
-        let outputs = self.randr_outputs();
-        state.randr = yserver_core::randr::RandrState::from_outputs(timestamp, outputs);
+        let (outputs, mode_table) = self.randr_outputs_and_modes();
+        state.randr = yserver_core::randr::RandrState::from_outputs_with_modes(
+            timestamp, outputs, mode_table,
+        );
 
         if state.dpms.power_level == 0 {
             self.kms_outputs_active = true;

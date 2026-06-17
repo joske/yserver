@@ -214,8 +214,9 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     let (fb_w, fb_h) = backend.fb_dimensions();
     log::info!("yserver: scanout {fb_w}x{fb_h}");
 
-    let randr_outputs = backend.randr_outputs();
-    let mut state = ServerState::with_randr_outputs(fb_w, fb_h, randr_outputs);
+    let (randr_outputs, randr_mode_table) = backend.randr_outputs_and_modes();
+    let mut state =
+        ServerState::with_randr_outputs_and_modes(fb_w, fb_h, randr_outputs, randr_mode_table);
     // Tie the libinput thread's `clock::server_time_ms()` baseline
     // to ServerState's `start_instant` so the input-event timestamps
     // and the `state.timestamp_now()` clock used by the
