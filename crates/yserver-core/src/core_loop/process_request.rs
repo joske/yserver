@@ -3988,6 +3988,139 @@ fn handle_xfixes_request(
                 );
             }
         }
+        x11xfixes::CREATE_POINTER_BARRIER => {
+            if let Some(req) = x11xfixes::parse_create_pointer_barrier(body) {
+                // Xorg XICreatePointerBarrier validation order:
+                // geometry -> negative-on-own-axis -> window -> devices -> xid.
+                let horizontal = req.y1 == req.y2;
+                let vertical = req.x1 == req.x2;
+                if horizontal == vertical {
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_VALUE,
+                        req.barrier,
+                        XFIXES_MAJOR_OPCODE,
+                    );
+                }
+                if (horizontal && (req.y1 < 0 || req.y2 < 0))
+                    || (vertical && (req.x1 < 0 || req.x2 < 0))
+                {
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_VALUE,
+                        req.barrier,
+                        XFIXES_MAJOR_OPCODE,
+                    );
+                }
+                if state.resources.window(ResourceId(req.window)).is_none() {
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_WINDOW,
+                        req.window,
+                        XFIXES_MAJOR_OPCODE,
+                    );
+                }
+                for &d in &req.devices {
+                    if !(d == 0 || d == 1 || d == 2) {
+                        return emit_x11_error_with_minor(
+                            state,
+                            client_id,
+                            sequence,
+                            XI2_FIRST_ERROR,
+                            u32::from(d),
+                            u16::from(x11xfixes::CREATE_POINTER_BARRIER),
+                            XFIXES_MAJOR_OPCODE,
+                        );
+                    }
+                }
+                if state.xid_occupied(req.barrier) {
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_ALLOC,
+                        req.barrier,
+                        XFIXES_MAJOR_OPCODE,
+                    );
+                }
+                if xid_out_of_client_range(state, client_id, req.barrier) {
+                    return emit_x11_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_ID_CHOICE,
+                        req.barrier,
+                        XFIXES_MAJOR_OPCODE,
+                    );
+                }
+                let (mut x1, mut x2) = (req.x1, req.x2);
+                let (mut y1, mut y2) = (req.y1, req.y2);
+                if x1 >= 0 && x2 >= 0 && x1 > x2 {
+                    std::mem::swap(&mut x1, &mut x2);
+                }
+                if y1 >= 0 && y2 >= 0 && y1 > y2 {
+                    std::mem::swap(&mut y1, &mut y2);
+                }
+                let directions = if horizontal {
+                    req.directions & !(1 | 4)
+                } else {
+                    req.directions & !(2 | 8)
+                };
+                state.pointer_barriers.insert(
+                    req.barrier,
+                    crate::server::PointerBarrier {
+                        owner: client_id,
+                        window: ResourceId(req.window),
+                        x1,
+                        y1,
+                        x2,
+                        y2,
+                        directions,
+                        devices: req.devices,
+                        hit: false,
+                        seen: false,
+                        event_id: 1,
+                        release_event_id: 0,
+                        last_timestamp: 0,
+                    },
+                );
+            }
+        }
+        x11xfixes::DELETE_POINTER_BARRIER => {
+            if let Some(bid) = x11xfixes::parse_delete_pointer_barrier(body) {
+                match state.pointer_barriers.get(&bid) {
+                    None => {
+                        return emit_x11_error(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_VALUE,
+                            bid,
+                            XFIXES_MAJOR_OPCODE,
+                        );
+                    }
+                    Some(b) if b.owner != client_id => {
+                        return emit_x11_error(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_ACCESS,
+                            bid,
+                            XFIXES_MAJOR_OPCODE,
+                        );
+                    }
+                    Some(_) => {
+                        state.pointer_barriers.remove(&bid);
+                    }
+                }
+            }
+        }
         x11xfixes::CREATE_REGION_FROM_BITMAP | x11xfixes::CREATE_REGION_FROM_GC => {
             if let Some((region, source)) = x11xfixes::parse_u32_pair(body) {
                 if xfixes_region_xid_already_taken(state, region)
@@ -33981,6 +34114,226 @@ mod tests {
         let reply_nbytes = u16::from_le_bytes(wire2[12..14].try_into().unwrap()) as usize;
         assert_eq!(reply_atom, 0, "unnamed cursor reports atom=0 (None)");
         assert_eq!(reply_nbytes, 0, "unnamed cursor reports empty name");
+    }
+
+    fn xfixes_create_barrier(
+        state: &mut ServerState,
+        client: ClientId,
+        barrier: u32,
+        window: u32,
+        x1: i16,
+        y1: i16,
+        x2: i16,
+        y2: i16,
+        directions: u32,
+        devices: &[u16],
+    ) -> io::Result<RequestOutcome> {
+        use yserver_protocol::x11::xfixes as x11xfixes;
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&barrier.to_le_bytes());
+        body.extend_from_slice(&window.to_le_bytes());
+        body.extend_from_slice(&x1.to_le_bytes());
+        body.extend_from_slice(&y1.to_le_bytes());
+        body.extend_from_slice(&x2.to_le_bytes());
+        body.extend_from_slice(&y2.to_le_bytes());
+        body.extend_from_slice(&directions.to_le_bytes());
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&(devices.len() as u16).to_le_bytes());
+        for &device in devices {
+            body.extend_from_slice(&device.to_le_bytes());
+        }
+
+        let header = RequestHeader {
+            opcode: 140,
+            data: x11xfixes::CREATE_POINTER_BARRIER,
+            length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+        };
+        handle_xfixes_request(
+            state,
+            &mut RecordingBackend::new(),
+            None,
+            client,
+            SequenceNumber(1),
+            header,
+            &body,
+        )
+    }
+
+    fn xfixes_delete_barrier(
+        state: &mut ServerState,
+        client: ClientId,
+        barrier: u32,
+    ) -> io::Result<RequestOutcome> {
+        use yserver_protocol::x11::xfixes as x11xfixes;
+        let body = barrier.to_le_bytes();
+        let header = RequestHeader {
+            opcode: 140,
+            data: x11xfixes::DELETE_POINTER_BARRIER,
+            length_units: 2,
+        };
+        handle_xfixes_request(
+            state,
+            &mut RecordingBackend::new(),
+            None,
+            client,
+            SequenceNumber(1),
+            header,
+            &body,
+        )
+    }
+
+    #[test]
+    fn create_pointer_barrier_stores_resource() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let bid = 0x0040_0001u32;
+
+        xfixes_create_barrier(
+            &mut state,
+            ClientId(1),
+            bid,
+            ROOT_WINDOW.0,
+            100,
+            0,
+            100,
+            200,
+            0,
+            &[],
+        )
+        .expect("create barrier");
+
+        let b = state.pointer_barriers.get(&bid).expect("stored");
+        assert_eq!((b.x1, b.y1, b.x2, b.y2), (100, 0, 100, 200));
+        assert_eq!(b.event_id, 1);
+        assert_eq!(b.release_event_id, 0);
+        assert!(read_all_available(&mut peer).is_empty());
+    }
+
+    #[test]
+    fn create_pointer_barrier_diagonal_is_bad_value() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let bid = 0x0040_0001u32;
+
+        xfixes_create_barrier(
+            &mut state,
+            ClientId(1),
+            bid,
+            ROOT_WINDOW.0,
+            0,
+            0,
+            50,
+            80,
+            0,
+            &[],
+        )
+        .expect("request handled");
+
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[0], 0);
+        assert_eq!(bytes[1], x11::error::BAD_VALUE);
+        assert!(!state.pointer_barriers.contains_key(&bid));
+    }
+
+    #[test]
+    fn create_pointer_barrier_bad_window() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+
+        xfixes_create_barrier(
+            &mut state,
+            ClientId(1),
+            0x0040_0001,
+            0x9999,
+            100,
+            0,
+            100,
+            200,
+            0,
+            &[],
+        )
+        .expect("request handled");
+
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[1], x11::error::BAD_WINDOW);
+    }
+
+    #[test]
+    fn create_pointer_barrier_negative_on_fixed_axis_is_bad_value() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+
+        xfixes_create_barrier(
+            &mut state,
+            ClientId(1),
+            0x0040_0001,
+            ROOT_WINDOW.0,
+            -1,
+            0,
+            -1,
+            200,
+            0,
+            &[],
+        )
+        .expect("request handled");
+
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[1], x11::error::BAD_VALUE);
+    }
+
+    #[test]
+    fn create_pointer_barrier_bad_device() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+
+        xfixes_create_barrier(
+            &mut state,
+            ClientId(1),
+            0x0040_0001,
+            ROOT_WINDOW.0,
+            100,
+            0,
+            100,
+            200,
+            0,
+            &[3],
+        )
+        .expect("request handled");
+
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[1], XI2_FIRST_ERROR);
+    }
+
+    #[test]
+    fn delete_pointer_barrier_frees_and_owner_checks() {
+        let mut state = ServerState::new();
+        let mut peer1 = install_client(&mut state, 1);
+        let mut peer2 = install_client(&mut state, 2);
+        let bid = 0x0040_0001u32;
+
+        xfixes_create_barrier(
+            &mut state,
+            ClientId(1),
+            bid,
+            ROOT_WINDOW.0,
+            100,
+            0,
+            100,
+            200,
+            0,
+            &[],
+        )
+        .expect("create barrier");
+        assert!(read_all_available(&mut peer1).is_empty());
+
+        xfixes_delete_barrier(&mut state, ClientId(2), bid).expect("wrong-client delete handled");
+        let bytes = read_all_available(&mut peer2);
+        assert_eq!(bytes[1], x11::error::BAD_ACCESS);
+        assert!(state.pointer_barriers.contains_key(&bid));
+
+        xfixes_delete_barrier(&mut state, ClientId(1), bid).expect("owner delete handled");
+        assert!(!state.pointer_barriers.contains_key(&bid));
     }
 
     /// `RRSetCrtcConfig` real handler — validates mode/output/rotation and

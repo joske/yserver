@@ -184,6 +184,9 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
         .xfixes_regions
         .retain(|_, region| region.owner != client_id);
     state
+        .pointer_barriers
+        .retain(|_, barrier| barrier.owner != client_id);
+    state
         .xfixes_selection_masks
         .retain(|(owner, _, _), _| *owner != client_id.0);
     state
@@ -871,5 +874,32 @@ mod tests {
             release_idx < restore_idx,
             "release must precede participation restore; calls={calls:#?}",
         );
+    }
+
+    #[test]
+    fn disconnect_frees_pointer_barriers() {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        install_client(&mut state, 1);
+        state.pointer_barriers.insert(
+            0x0040_0001,
+            crate::server::PointerBarrier {
+                owner: ClientId(1),
+                window: ROOT_WINDOW,
+                x1: 0,
+                y1: 0,
+                x2: 0,
+                y2: 10,
+                directions: 0,
+                devices: Vec::new(),
+                hit: false,
+                seen: false,
+                event_id: 1,
+                release_event_id: 0,
+                last_timestamp: 0,
+            },
+        );
+        process_disconnect(&mut state, &mut backend, ClientId(1));
+        assert!(state.pointer_barriers.is_empty());
     }
 }

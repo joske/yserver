@@ -32,6 +32,8 @@ pub const GET_CURSOR_IMAGE_AND_NAME: u8 = 25;
 pub const CHANGE_CURSOR_BY_NAME: u8 = 27;
 pub const HIDE_CURSOR: u8 = 29;
 pub const SHOW_CURSOR: u8 = 30;
+pub const CREATE_POINTER_BARRIER: u8 = 31;
+pub const DELETE_POINTER_BARRIER: u8 = 32;
 
 // XFixesSelectionNotify subtypes (Xorg `xfixes/select.c`).
 pub const SELECTION_NOTIFY_SET_OWNER: u8 = 0;
@@ -126,6 +128,18 @@ pub struct SetPictureClipRegionRequest {
     pub region: u32,
     pub x_origin: i16,
     pub y_origin: i16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreatePointerBarrierRequest {
+    pub barrier: u32,
+    pub window: u32,
+    pub x1: i16,
+    pub y1: i16,
+    pub x2: i16,
+    pub y2: i16,
+    pub directions: u32,
+    pub devices: Vec<u16>,
 }
 
 fn read_u16_le(bytes: &[u8]) -> u16 {
@@ -320,6 +334,39 @@ pub fn parse_change_cursor_by_name(body: &[u8]) -> Option<(u32, &[u8])> {
 #[must_use]
 pub fn parse_set_cursor_name(body: &[u8]) -> Option<(u32, &[u8])> {
     parse_change_cursor_by_name(body)
+}
+
+#[must_use]
+pub fn parse_create_pointer_barrier(body: &[u8]) -> Option<CreatePointerBarrierRequest> {
+    if body.len() < 24 {
+        return None;
+    }
+    let num_devices = read_u16_le(&body[22..]) as usize;
+    let need = 24 + num_devices * 2;
+    if body.len() < need {
+        return None;
+    }
+    let devices = (0..num_devices)
+        .map(|i| read_u16_le(&body[24 + i * 2..]))
+        .collect();
+    Some(CreatePointerBarrierRequest {
+        barrier: read_u32_le(body),
+        window: read_u32_le(&body[4..]),
+        x1: read_i16_le(&body[8..]),
+        y1: read_i16_le(&body[10..]),
+        x2: read_i16_le(&body[12..]),
+        y2: read_i16_le(&body[14..]),
+        directions: read_u32_le(&body[16..]) & 0x0f,
+        devices,
+    })
+}
+
+#[must_use]
+pub fn parse_delete_pointer_barrier(body: &[u8]) -> Option<u32> {
+    if body.len() < 4 {
+        return None;
+    }
+    Some(read_u32_le(body))
 }
 
 /// Encode the XFIXES `GetCursorName` reply (minor 24). Per Xorg
@@ -759,6 +806,47 @@ mod tests {
         assert_eq!(CHANGE_CURSOR_BY_NAME, 27);
         assert_eq!(HIDE_CURSOR, 29);
         assert_eq!(SHOW_CURSOR, 30);
+    }
+
+    #[test]
+    fn parse_create_pointer_barrier_basic() {
+        // body (after generic header): barrier@0, window@4, x1@8,y1@10,
+        // x2@12,y2@14, directions@16, pad@20, num_devices@22, devices@24.
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x00aa_bbccu32.to_le_bytes()); // barrier
+        body.extend_from_slice(&0x0000_0001u32.to_le_bytes()); // window (root)
+        body.extend_from_slice(&100i16.to_le_bytes()); // x1
+        body.extend_from_slice(&0i16.to_le_bytes()); // y1
+        body.extend_from_slice(&100i16.to_le_bytes()); // x2 (vertical)
+        body.extend_from_slice(&200i16.to_le_bytes()); // y2
+        body.extend_from_slice(&0x0000_00FFu32.to_le_bytes()); // directions (only low 4 kept)
+        body.extend_from_slice(&0u16.to_le_bytes()); // pad
+        body.extend_from_slice(&2u16.to_le_bytes()); // num_devices
+        body.extend_from_slice(&2u16.to_le_bytes()); // device 2
+        body.extend_from_slice(&0u16.to_le_bytes()); // device 0 (XIAllDevices)
+
+        let b = parse_create_pointer_barrier(&body).expect("parse");
+        assert_eq!(b.barrier, 0x00aa_bbcc);
+        assert_eq!(b.window, 1);
+        assert_eq!((b.x1, b.y1, b.x2, b.y2), (100, 0, 100, 200));
+        assert_eq!(b.directions, 0x0f, "only low 4 bits kept");
+        assert_eq!(b.devices, vec![2u16, 0]);
+    }
+
+    #[test]
+    fn parse_create_pointer_barrier_truncated_is_none() {
+        assert!(parse_create_pointer_barrier(&[0u8; 10]).is_none());
+        // num_devices says 3 but body has only 1 device worth of bytes
+        let mut body = vec![0u8; 24];
+        body[22] = 3; // num_devices = 3
+        assert!(parse_create_pointer_barrier(&body).is_none());
+    }
+
+    #[test]
+    fn parse_delete_pointer_barrier_reads_xid() {
+        let body = 0xdead_beefu32.to_le_bytes();
+        assert_eq!(parse_delete_pointer_barrier(&body), Some(0xdead_beef));
+        assert_eq!(parse_delete_pointer_barrier(&[0u8; 2]), None);
     }
 
     #[test]

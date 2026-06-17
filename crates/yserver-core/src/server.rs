@@ -881,6 +881,8 @@ pub struct ServerState {
     pub frozen_keyboard_event: Option<crate::host_x11::HostKeyEvent>,
     /// XFIXES regions owned by clients.
     pub xfixes_regions: HashMap<u32, XFixesRegion>,
+    /// XFIXES/XInput pointer barriers owned by clients.
+    pub pointer_barriers: HashMap<u32, PointerBarrier>,
     /// XFIXES selection event masks: (client, window, selection atom) -> mask.
     pub xfixes_selection_masks: HashMap<(u32, ResourceId, AtomId), u32>,
     /// XFIXES cursor event masks: (client, window) -> mask.
@@ -1143,6 +1145,7 @@ impl ServerState {
             active_keyboard_grab: None,
             frozen_keyboard_event: None,
             xfixes_regions: HashMap::new(),
+            pointer_barriers: HashMap::new(),
             xfixes_selection_masks: HashMap::new(),
             xfixes_cursor_masks: HashMap::new(),
             shape_windows: HashMap::new(),
@@ -1419,7 +1422,7 @@ impl ServerState {
 
     /// True iff `id` designates ANY live resource in ANY client-XID
     /// namespace: the 8 ResourceTable maps (via
-    /// `resources.xid_in_use`) plus the 9 extension maps that
+    /// `resources.xid_in_use`) plus the 10 extension maps that
     /// `xid_in_use` does NOT cover. XC-MISC must never report an
     /// occupied id as free — extend this (and the
     /// `xid_occupied_covers_every_namespace` test) when adding an
@@ -1429,6 +1432,7 @@ impl ServerState {
     pub fn xid_occupied(&self, id: u32) -> bool {
         self.resources.xid_in_use(ResourceId(id))
             || self.xfixes_regions.contains_key(&id)
+            || self.pointer_barriers.contains_key(&id)
             || self.sync_counters.contains_key(&id)
             || self.sync_alarms.contains_key(&id)
             || self.sync_fences.contains_key(&id)
@@ -1440,7 +1444,7 @@ impl ServerState {
     }
 
     /// Sorted, deduped list of occupied XIDs in `base..=base|mask`
-    /// across all 17 namespaces. O(total live resources) — called
+    /// across all 18 namespaces. O(total live resources) — called
     /// only on the rare XC-MISC GetXIDRange path.
     #[must_use]
     pub fn used_xids_in(&self, base: u32, mask: u32) -> Vec<u32> {
@@ -1448,6 +1452,7 @@ impl ServerState {
         self.resources.collect_xids_in(base, mask, &mut out);
         let in_range = |id: &&u32| (**id & !mask) == base;
         out.extend(self.xfixes_regions.keys().filter(in_range));
+        out.extend(self.pointer_barriers.keys().filter(in_range));
         out.extend(self.sync_counters.keys().filter(in_range));
         out.extend(self.sync_alarms.keys().filter(in_range));
         out.extend(self.sync_fences.keys().filter(in_range));
@@ -1472,6 +1477,32 @@ impl Default for ServerState {
 pub struct XFixesRegion {
     pub owner: ClientId,
     pub rects: Vec<xfixes::RegionRect>,
+}
+
+/// XFIXES/XInput pointer barrier (XID resource, client-owned).
+/// Mirrors Xorg `struct PointerBarrier` + `PointerBarrierClient` +
+/// the single-master-pointer slice of `PointerBarrierDevice`
+/// (`Xi/xibarriers.c`). yserver models one master pointer (device 2),
+/// so per-device hit state collapses to these scalar fields.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PointerBarrier {
+    pub owner: ClientId,
+    /// `window` arg: selects screen, echoed as events' `event` window.
+    pub window: ResourceId,
+    pub x1: i16,
+    pub y1: i16,
+    pub x2: i16,
+    pub y2: i16,
+    /// Permitted-direction bitmask (& 0x0f, axis-irrelevant bits stripped).
+    pub directions: u32,
+    /// Device-id list (empty = all; wildcards 0/1 also = all).
+    pub devices: Vec<u16>,
+    // runtime hit-state for the master pointer:
+    pub hit: bool,
+    pub seen: bool,
+    pub event_id: u32,
+    pub release_event_id: u32,
+    pub last_timestamp: u32,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -4939,15 +4970,37 @@ mod tests {
         );
         expect.push(id_xfixes);
 
-        // 10. sync_counters
-        let id_sync_counter = base + 10;
+        // 10. pointer_barriers
+        let id_barrier = base + 10;
+        state.pointer_barriers.insert(
+            id_barrier,
+            PointerBarrier {
+                owner,
+                window: ROOT_WINDOW,
+                x1: 0,
+                y1: 0,
+                x2: 0,
+                y2: 10,
+                directions: 0,
+                devices: Vec::new(),
+                hit: false,
+                seen: false,
+                event_id: 1,
+                release_event_id: 0,
+                last_timestamp: 0,
+            },
+        );
+        expect.push(id_barrier);
+
+        // 11. sync_counters
+        let id_sync_counter = base + 11;
         state
             .sync_counters
             .insert(id_sync_counter, SyncCounter { owner, value: 0 });
         expect.push(id_sync_counter);
 
-        // 11. sync_alarms
-        let id_sync_alarm = base + 11;
+        // 12. sync_alarms
+        let id_sync_alarm = base + 12;
         state.sync_alarms.insert(
             id_sync_alarm,
             SyncAlarm {
@@ -4957,8 +5010,8 @@ mod tests {
         );
         expect.push(id_sync_alarm);
 
-        // 12. sync_fences
-        let id_sync_fence = base + 12;
+        // 13. sync_fences
+        let id_sync_fence = base + 13;
         state.sync_fences.insert(
             id_sync_fence,
             SyncFence {
@@ -4968,8 +5021,8 @@ mod tests {
         );
         expect.push(id_sync_fence);
 
-        // 13. damage_objects
-        let id_damage = base + 13;
+        // 14. damage_objects
+        let id_damage = base + 14;
         state.damage_objects.insert(
             id_damage,
             DamageObject {
@@ -4983,8 +5036,8 @@ mod tests {
         );
         expect.push(id_damage);
 
-        // 14. mit_shm_segments — requires a real fd; use memfd_create
-        let id_shm = base + 14;
+        // 15. mit_shm_segments — requires a real fd; use memfd_create
+        let id_shm = base + 15;
         let fd = unsafe { libc::memfd_create(c"xcmisc-test-shm".as_ptr(), libc::MFD_CLOEXEC) };
         assert!(fd >= 0, "memfd_create failed");
         let rc = unsafe { libc::ftruncate(fd, 4096) };
@@ -4993,8 +5046,8 @@ mod tests {
         state.mit_shm_segments.insert(id_shm, shm_seg);
         expect.push(id_shm);
 
-        // 15. glx_contexts
-        let id_glx_ctx = base + 15;
+        // 16. glx_contexts
+        let id_glx_ctx = base + 16;
         state.glx_contexts.insert(
             id_glx_ctx,
             GlxContext {
@@ -5005,8 +5058,8 @@ mod tests {
         );
         expect.push(id_glx_ctx);
 
-        // 16. glx_drawables
-        let id_glx_draw = base + 16;
+        // 17. glx_drawables
+        let id_glx_draw = base + 17;
         state.glx_drawables.insert(
             id_glx_draw,
             GlxDrawable {
@@ -5021,8 +5074,8 @@ mod tests {
         );
         expect.push(id_glx_draw);
 
-        // 17. present_event_selections
-        let id_present = base + 17;
+        // 18. present_event_selections
+        let id_present = base + 18;
         state.present_event_selections.insert(
             id_present,
             PresentEventSelection {
@@ -5040,7 +5093,7 @@ mod tests {
         }
         assert_eq!(
             expect.len(),
-            17,
+            18,
             "one seed per namespace — update when adding namespaces"
         );
         assert!(!state.xid_occupied(base + 100), "unseeded id must be free");

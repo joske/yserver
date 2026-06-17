@@ -51,6 +51,12 @@ Cross-cutting bugs and followups that don't fit a stage live in
   `OutputLayout`) and `paint_batch::BatchResource` (the v2 frame
   builder's retire-pin trait); a follow-up cleanup can fold those
   into v2 proper.
+- **2026-06-17 XFIXES pointer barriers phase 1**: `PointerBarrier`
+  storage, XFIXES barrier wire parsing, `CreatePointerBarrier` /
+  `DeletePointerBarrier` dispatch, client-disconnect cleanup, and
+  XID-namespace coverage are now in-tree in `yserver-core` and
+  `yserver-protocol`. Motion confinement and XI2 barrier events are
+  still pending in later phases.
 - Abandoned branch: `render-convolution-filter`. Left untouched
   as historical reference for T1-T4 of the Manual-redirect work,
   convolution Phase 1+2, the rotate fix, and the
