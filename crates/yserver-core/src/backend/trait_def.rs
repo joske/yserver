@@ -360,6 +360,13 @@ pub trait Backend: Send {
         Ok(())
     }
 
+    /// Refresh RANDR state after a successful `RRSetCrtcConfig`, setting
+    /// `lastSetTime` to the client's request timestamp (0/CurrentTime
+    /// already resolved to `now` by the caller). A CRTC set bumps
+    /// `lastSetTime` but NOT `lastConfigTime` (the available config did
+    /// not change). Default no-op for nested/recording backends.
+    fn refresh_randr_state_set_time(&mut self, _state: &mut ServerState, _set_time: u32) {}
+
     /// Resize the logical (virtual) screen to `w`×`h`: reallocate the
     /// root + Composite-overlay backing storage and update the pointer
     /// clamp / logical extent. Default no-op `Ok(())` for nested

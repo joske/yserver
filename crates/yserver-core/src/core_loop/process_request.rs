@@ -25,7 +25,7 @@ use log::{debug, trace};
 use yserver_protocol::x11::{self, AtomId, ClientId, RequestHeader, ResourceId, SequenceNumber};
 
 use crate::{
-    backend::{Backend, OriginContext, params::FillState},
+    backend::{Backend, ModeSpec, OriginContext, params::FillState},
     core_loop::{
         client_io::{self, WriteOutcome},
         damage_fanout::{
@@ -2573,77 +2573,193 @@ fn handle_randr_request(
             // RRSetScreenSize has NO reply (it is a void request).
             return Ok(RequestOutcome::Handled);
         }
-        x11randr::RR_SET_SCREEN_CONFIG | x11randr::RR_SET_CRTC_CONFIG => {
-            // yserver runs at the KMS-set mode and doesn't reconfigure
-            // outputs/CRTCs on demand. Returning BadValue here makes
-            // mate-settings-daemon (and any other RANDR-using "restore
-            // last session" client) fail and warn the user about
-            // unsaved display settings every login. Accept the request
-            // as a no-op when the client asks for a config we can
-            // honour (mode=0 disables a CRTC, or mode matches one of
-            // our advertised modes); reject with status=Failed(3)
-            // when the client asks for something we genuinely cannot
-            // provide.
+        x11randr::RR_SET_SCREEN_CONFIG => {
+            // Legacy RANDR 1.0 form: SizeID + Rotation. yserver has a
+            // single screen size. mate's restore path passes the size
+            // we advertised, so accept across the board (no-op accept).
             //
             // SetScreenConfig reply (32 bytes): status (in data byte) +
             // length=0 + new_timestamp(4) + config_timestamp(4) +
-            // root(4) + subpixel_order(2) + pad(10). SetCrtcConfig
-            // reply (32 bytes): status (in data byte) + length=0 +
-            // new_timestamp(4) + pad(20).
+            // root(4) + subpixel_order(2) + pad(10).
             let ts = state.timestamp_now();
-            // For SetCrtcConfig, body layout (post-header) is:
-            //   crtc(4) timestamp(4) config_timestamp(4) x(2) y(2)
-            //   mode(4) rotation(2) pad(2) outputs(4n)
-            // Status codes (per RandR 1.5): Success=0, InvalidConfigTime=1,
-            // InvalidTime=2, Failed=3.
-            let status: u8 = if minor == x11randr::RR_SET_CRTC_CONFIG {
-                let mode = body
-                    .get(16..20)
-                    .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
-                    .unwrap_or(0);
-                if mode == 0 || state.randr.modes.iter().any(|m| m.mode_id == mode) {
-                    0
-                } else {
-                    3
-                }
-            } else {
-                // SetScreenConfig: legacy RandR 1.0 form taking
-                // SizeID + Rotation. yserver has a single screen size,
-                // so any SizeID != 0 is out of range — but mate's
-                // restore path passes the size we advertised, so
-                // accept across the board. A spec-strict
-                // implementation would validate against the advertised
-                // SizeID list.
-                0
-            };
-            let mut reply = x11::fixed_reply(byte_order, sequence, status, 0);
+            let mut reply = x11::fixed_reply(byte_order, sequence, 0u8, 0);
             x11::write_u32(byte_order, &mut reply, ts);
-            if minor == x11randr::RR_SET_SCREEN_CONFIG {
-                x11::write_u32(byte_order, &mut reply, state.randr.timestamp);
-                x11::write_u32(byte_order, &mut reply, ROOT_WINDOW.0);
-                x11::write_u16(byte_order, &mut reply, 0); // SubPixelUnknown
-                reply.extend_from_slice(&[0u8; 10]);
-            } else {
-                reply.extend_from_slice(&[0u8; 20]);
-            }
+            x11::write_u32(byte_order, &mut reply, state.randr.timestamp);
+            x11::write_u32(byte_order, &mut reply, ROOT_WINDOW.0);
+            x11::write_u16(byte_order, &mut reply, 0); // SubPixelUnknown
+            reply.extend_from_slice(&[0u8; 10]);
             debug_assert_eq!(reply.len(), 32);
             debug!(
-                "client {} #{} RANDR::{} -> status={} timestamp={} (no-op accept; \
-                 yserver runs at the KMS-set mode and does not reconfigure outputs)",
-                client_id.0,
-                sequence.0,
-                if minor == x11randr::RR_SET_SCREEN_CONFIG {
-                    "SetScreenConfig"
-                } else {
-                    "SetCrtcConfig"
-                },
-                status,
-                ts,
+                "client {} #{} RANDR::SetScreenConfig -> status=0 timestamp={} (no-op accept)",
+                client_id.0, sequence.0, ts,
             );
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
             return Ok(write_to_client(client, client_id, &reply));
+        }
+        x11randr::RR_SET_CRTC_CONFIG => {
+            // Body layout (post-header):
+            //   crtc(4) timestamp(4) config_timestamp(4) x(2) y(2)
+            //   mode(4) rotation(2) pad(2) outputs(4*N)
+            // config_timestamp is parsed but NOT validated — rrcrtc.c
+            // does not gate SetCrtcConfig on it (only the 1.0
+            // SetScreenConfig uses InvalidConfigTime/InvalidTime).
+            let Some(crtc_bytes) = body.get(0..4) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            let crtc = u32::from_le_bytes(crtc_bytes.try_into().unwrap());
+            let req_timestamp = body
+                .get(4..8)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                .unwrap_or(0);
+            let x = body
+                .get(12..14)
+                .map(|b| i16::from_le_bytes(b.try_into().unwrap()))
+                .unwrap_or(0);
+            let y = body
+                .get(14..16)
+                .map(|b| i16::from_le_bytes(b.try_into().unwrap()))
+                .unwrap_or(0);
+            let mode = body
+                .get(16..20)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                .unwrap_or(0);
+            let rotation = body
+                .get(20..22)
+                .map(|b| u16::from_le_bytes(b.try_into().unwrap()))
+                .unwrap_or(1);
+            let outputs: Vec<u32> = body
+                .get(24..)
+                .map(|tail| {
+                    tail.chunks_exact(4)
+                        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // (1) arity + output + mode resolution FIRST (Xorg rrcrtc.c order).
+            let resolved = match state.randr.validate_set_crtc_config(crtc, mode, &outputs) {
+                Err((code, error_value)) => {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        code,
+                        error_value,
+                        u16::from(header.data),
+                        RANDR_MAJOR_OPCODE,
+                    );
+                }
+                Ok(r) => r,
+            };
+            // (2)+(3) rotation + bounds only when enabling.
+            if let Some(ref m) = resolved {
+                if !matches!(rotation & 0xf, 1 | 2 | 4 | 8) {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_VALUE,
+                        u32::from(rotation),
+                        u16::from(header.data),
+                        RANDR_MAJOR_OPCODE,
+                    );
+                }
+                if rotation != 1 {
+                    // RR_Rotate_0 only — our CRTC is identity-only.
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_MATCH,
+                        u32::from(rotation),
+                        u16::from(header.data),
+                        RANDR_MAJOR_OPCODE,
+                    );
+                }
+                if let Err((code, error_value)) = state.randr.screen_encompasses(m, x, y) {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        code,
+                        error_value,
+                        u16::from(header.data),
+                        RANDR_MAJOR_OPCODE,
+                    );
+                }
+            }
+
+            // Resolve connector name from crtc_id (validated above →
+            // guaranteed to exist).
+            let connector = state
+                .randr
+                .outputs
+                .iter()
+                .find(|o| o.crtc_id == crtc)
+                .map(|o| o.name.clone());
+            let Some(connector) = connector else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_MATCH,
+                    crtc,
+                    u16::from(header.data),
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            let mode_spec = resolved.map(|m| ModeSpec {
+                width: m.width,
+                height: m.height,
+                vrefresh: m.vrefresh,
+            });
+            // lastSetTime = client timestamp (0/CurrentTime ⇒ server now).
+            let set_time = if req_timestamp == 0 {
+                state.timestamp_now()
+            } else {
+                req_timestamp
+            };
+            match backend.apply_crtc_config(&connector, mode_spec, i32::from(x), i32::from(y)) {
+                Ok(()) => {
+                    // Single rebuild path: CRTC set bumps lastSetTime
+                    // (to the client timestamp) but NOT lastConfigTime.
+                    backend.refresh_randr_state_set_time(state, set_time);
+                    let changed: Vec<(u32, u32, u32)> = state
+                        .randr
+                        .outputs
+                        .iter()
+                        .find(|o| o.name == connector)
+                        .map(|o| (o.output_id, o.crtc_id, o.mode_id))
+                        .into_iter()
+                        .collect();
+                    // Fire Crtc/Output change (+ ScreenChangeNotify via
+                    // RRTellChanged) → emit_randr_change_notifications.
+                    super::run::emit_randr_change_notifications(state, &changed);
+                    return reply_set_crtc_config(
+                        state,
+                        client_id,
+                        sequence,
+                        byte_order,
+                        0,
+                        state.randr.timestamp,
+                    );
+                }
+                Err(e) => {
+                    log::warn!("RRSetCrtcConfig apply failed: {e}");
+                    // RRSetConfigFailed=3 (status reply, not a protocol
+                    // error). lastSetTime unchanged → reply existing value.
+                    return reply_set_crtc_config(
+                        state,
+                        client_id,
+                        sequence,
+                        byte_order,
+                        3,
+                        state.randr.timestamp,
+                    );
+                }
+            }
         }
         other => {
             debug!(
@@ -2653,6 +2769,33 @@ fn handle_randr_request(
         }
     }
     Ok(RequestOutcome::Handled)
+}
+
+/// Build and send the 32-byte `SetCrtcConfig` reply.
+///
+/// Wire format: `status` (data byte) + length=0 + `new_timestamp`(4) +
+/// pad(20). On success `new_timestamp` is the post-set `state.randr.timestamp`;
+/// on failure it is the unmodified existing value (caller resolves which).
+fn reply_set_crtc_config(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    byte_order: yserver_protocol::x11::ClientByteOrder,
+    status: u8,
+    new_timestamp: u32,
+) -> io::Result<RequestOutcome> {
+    let mut reply = x11::fixed_reply(byte_order, sequence, status, 0);
+    x11::write_u32(byte_order, &mut reply, new_timestamp);
+    reply.extend_from_slice(&[0u8; 20]);
+    debug_assert_eq!(reply.len(), 32);
+    debug!(
+        "client {} #{} RANDR::SetCrtcConfig -> status={} new_timestamp={}",
+        client_id.0, sequence.0, status, new_timestamp,
+    );
+    let Some(client) = state.clients.get_mut(&client_id.0) else {
+        return Ok(RequestOutcome::Handled);
+    };
+    Ok(write_to_client(client, client_id, &reply))
 }
 
 fn handle_sync_request(
@@ -33045,17 +33188,29 @@ mod tests {
         assert_eq!(reply_nbytes, 0, "unnamed cursor reports empty name");
     }
 
-    /// RANDR `SetCrtcConfig` with a mode that yserver advertises
-    /// (the KMS-set one) replies status=0 (Success); with a mode
-    /// not in `state.randr.modes`, replies status=3 (Failed). The
-    /// "disable CRTC" form (mode=0) is always accepted. yserver
-    /// itself does not reconfigure outputs — this is just the
-    /// protocol-side answer.
+    /// `RRSetCrtcConfig` real handler — validates mode/output/rotation and
+    /// calls `apply_crtc_config`. Replaces the old no-op-accept test.
+    ///
+    /// Cases:
+    /// 1. valid enable (mode=3, crtc=2, outputs=[1], rotation=RR_Rotate_0)
+    ///    → reply status=0 (Success).
+    /// 2. disable (mode=0, crtc=2, no outputs)
+    ///    → reply status=0.
+    /// 3. bad mode (555 not in output's mode_ids)
+    ///    → X11 error BadMatch (type byte = 0).
+    /// 4. bad rotation (rotation=2, i.e. RR_Rotate_90 which we don't support)
+    ///    → X11 error BadMatch (type byte = 0; rotation valid but not identity).
     #[test]
     fn randr_set_crtc_config_validates_mode_id() {
-        use crate::randr::{RandrOutput, RandrState};
+        use crate::randr::{RandrMode, RandrOutput, RandrState};
 
         const CLIENT_ID: u32 = 1;
+        let mode_table = vec![RandrMode {
+            mode_id: 3,
+            width: 1920,
+            height: 1080,
+            vrefresh: 60,
+        }];
         let outputs = vec![RandrOutput {
             name: "test-0".to_string(),
             output_id: 1,
@@ -33073,60 +33228,79 @@ mod tests {
             num_preferred: 1,
         }];
         let mut state = ServerState::new();
-        state.randr = RandrState::from_outputs(0, outputs);
+        state.randr = RandrState::from_outputs_with_modes(1, outputs, mode_table);
         let mut backend = RecordingBackend::new();
         let mut peer = install_client(&mut state, CLIENT_ID);
 
-        // Build a SetCrtcConfig body: crtc(4) ts(4) cts(4) x(2) y(2)
-        // mode(4) rotation(2) pad(2) outputs(4*N).
-        fn build_body(mode: u32) -> Vec<u8> {
-            let mut b = Vec::with_capacity(28);
-            b.extend_from_slice(&2u32.to_le_bytes()); // crtc
+        // Body layout: crtc(4) ts(4) cts(4) x(2) y(2) mode(4) rotation(2)
+        // pad(2) outputs(4*N).
+        fn build_body(mode: u32, rotation: u16, output_ids: &[u32]) -> Vec<u8> {
+            let mut b = Vec::with_capacity(24 + output_ids.len() * 4);
+            b.extend_from_slice(&2u32.to_le_bytes()); // crtc = 2
             b.extend_from_slice(&0u32.to_le_bytes()); // timestamp
             b.extend_from_slice(&0u32.to_le_bytes()); // config_timestamp
             b.extend_from_slice(&0i16.to_le_bytes()); // x
             b.extend_from_slice(&0i16.to_le_bytes()); // y
             b.extend_from_slice(&mode.to_le_bytes()); // mode
-            b.extend_from_slice(&1u16.to_le_bytes()); // rotation
+            b.extend_from_slice(&rotation.to_le_bytes()); // rotation
             b.extend_from_slice(&[0u8; 2]); // pad
+            for &oid in output_ids {
+                b.extend_from_slice(&oid.to_le_bytes());
+            }
             b
         }
         let header = yserver_protocol::x11::RequestHeader {
-            opcode: 140, // RANDR major (placeholder; dispatcher reads minor from header.data)
-            data: 21,    // RR_SET_CRTC_CONFIG
+            opcode: 140,
+            data: 21, // RR_SET_CRTC_CONFIG
             length_units: 7,
         };
 
-        // Known mode → status=0 (Success).
+        // (1) Valid enable: mode=3, rotation=RR_Rotate_0(1), outputs=[1] → Success reply.
         handle_randr_request(
             &mut state,
             &mut backend,
             ClientId(CLIENT_ID),
             SequenceNumber(1),
             header,
-            &build_body(3),
+            &build_body(3, 1, &[1]),
         )
-        .expect("known mode");
-        // mode=0 (disable) → status=0.
+        .expect("valid enable");
+
+        // (2) Disable: mode=0, no outputs → Success reply.
         handle_randr_request(
             &mut state,
             &mut backend,
             ClientId(CLIENT_ID),
             SequenceNumber(2),
             header,
-            &build_body(0),
+            &build_body(0, 1, &[]),
         )
         .expect("disable");
-        // Unknown mode → status=3 (Failed).
+
+        // (3) Bad mode: mode=555 not in output's mode_ids → BadMatch error.
         handle_randr_request(
             &mut state,
             &mut backend,
             ClientId(CLIENT_ID),
             SequenceNumber(3),
             header,
-            &build_body(0xdead_beef),
+            &build_body(555, 1, &[1]),
         )
-        .expect("unknown mode");
+        .expect("bad mode → error");
+
+        // (4) Bad rotation (valid code but not RR_Rotate_0):
+        // rotation=2 (RR_Rotate_90) is valid but our CRTC is identity-only.
+        // validate_set_crtc_config succeeds (mode 3 known), then rotation check
+        // fires BadMatch.
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT_ID),
+            SequenceNumber(4),
+            header,
+            &build_body(3, 2, &[1]),
+        )
+        .expect("bad rotation → error");
 
         use std::io::Read;
         peer.set_nonblocking(true).unwrap();
@@ -33140,17 +33314,18 @@ mod tests {
                 Err(_) => break,
             }
         }
-        // Each reply is 32 bytes. status byte is at offset 1.
-        let statuses: Vec<u8> = wire.chunks_exact(32).map(|c| c[1]).collect();
-        assert_eq!(
-            statuses,
-            vec![0, 0, 3],
-            "SetCrtcConfig must return Success(0) for advertised modes \
-             and mode=0 (disable), Failed(3) for modes yserver does not \
-             know about. Pre-fix every call returned 0 unconditionally, \
-             so a client could `Success`-fully request a mode that was \
-             never honoured.",
-        );
+        // All 4 responses are 32 bytes. type byte at offset 0:
+        // 1 = reply, 0 = error.
+        assert_eq!(wire.len(), 128, "4 × 32-byte packets");
+        let type_bytes: Vec<u8> = wire.chunks_exact(32).map(|c| c[0]).collect();
+        assert_eq!(type_bytes[0], 1, "valid enable → reply");
+        let status_enable = wire[1]; // data byte of first reply
+        assert_eq!(status_enable, 0, "valid enable → status=0 (Success)");
+        assert_eq!(type_bytes[1], 1, "disable → reply");
+        let status_disable = wire[32 + 1];
+        assert_eq!(status_disable, 0, "disable → status=0");
+        assert_eq!(type_bytes[2], 0, "bad mode → X11 error (type=0)");
+        assert_eq!(type_bytes[3], 0, "bad rotation → X11 error (type=0)");
     }
 
     #[test]

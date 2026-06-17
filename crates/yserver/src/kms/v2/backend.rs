@@ -9963,6 +9963,16 @@ impl Backend for KmsBackendV2 {
         Ok(())
     }
 
+    fn refresh_randr_state_set_time(
+        &mut self,
+        state: &mut yserver_core::server::ServerState,
+        set_time: u32,
+    ) {
+        // A CRTC set bumps lastSetTime (to the client timestamp) but NOT
+        // lastConfigTime (the available configuration didn't change).
+        self.rebuild_randr_state(state, Some(set_time), false);
+    }
+
     fn set_logical_screen_size(&mut self, w: u16, h: u16) -> io::Result<()> {
         let w = w.max(1);
         let h = h.max(1);

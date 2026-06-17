@@ -323,6 +323,75 @@ impl RandrState {
         })
     }
 
+    /// Validate arity + output/mode resolution for `SetCrtcConfig` (Xorg
+    /// `rrcrtc.c` order, EXCLUDING rotation + bounds — the handler does
+    /// those after, in that order). `Ok(None)` = disable;
+    /// `Ok(Some(mode))` = enable with this resolved mode;
+    /// `Err((code, error_value))` = protocol error + field-specific
+    /// `errorValue`.
+    pub fn validate_set_crtc_config(
+        &self,
+        crtc_id: u32,
+        mode_id: u32,
+        outputs: &[u32],
+    ) -> Result<Option<RandrMode>, (u8, u32)> {
+        use yserver_protocol::x11::error;
+        // 1. mode/outputs arity. errorValue = the addressed crtc.
+        if mode_id == 0 {
+            if !outputs.is_empty() {
+                return Err((error::BAD_MATCH, crtc_id));
+            }
+            return Ok(None); // disable
+        }
+        if outputs.is_empty() {
+            return Err((error::BAD_MATCH, crtc_id));
+        }
+        // 2. outputs resolve to known connectors AND drive this crtc (1:1).
+        for &oid in outputs {
+            let Some(out) = self.outputs.iter().find(|o| o.output_id == oid) else {
+                return Err((error::BAD_MATCH, oid)); // unknown output
+            };
+            if out.crtc_id != crtc_id {
+                return Err((error::BAD_MATCH, crtc_id)); // output doesn't drive crtc
+            }
+        }
+        // The addressed crtc must belong to one of the named outputs.
+        let out = self
+            .outputs
+            .iter()
+            .find(|o| o.crtc_id == crtc_id && outputs.contains(&o.output_id))
+            .ok_or((error::BAD_MATCH, crtc_id))?;
+        // 3. mode ∈ this output's advertised list. errorValue = bad mode.
+        if !out.mode_ids.contains(&mode_id) {
+            return Err((error::BAD_MATCH, mode_id));
+        }
+        let mode = self
+            .mode_table
+            .iter()
+            .find(|m| m.mode_id == mode_id)
+            .copied()
+            .ok_or((error::BAD_MATCH, mode_id))?;
+        Ok(Some(mode))
+    }
+
+    /// Bounds check: does `mode` placed at `(x, y)` fit the current
+    /// (logical) screen? Xorg `rrcrtc.c`: `x + width > screen.width` ⇒
+    /// `BadValue(errorValue=x)`; then `y + height > screen.height` ⇒
+    /// `BadValue(errorValue=y)`.
+    pub fn screen_encompasses(&self, mode: &RandrMode, x: i16, y: i16) -> Result<(), (u8, u32)> {
+        use yserver_protocol::x11::error;
+        // Xorg rrcrtc.c: `x + width > screen.width` ⇒ BadValue(x), then
+        // `y + height > screen.height` ⇒ BadValue(y). errorValue carries
+        // the raw INT16 sign-extended into the CARD32 field.
+        if i32::from(x) + i32::from(mode.width) > i32::from(self.screen_width) {
+            return Err((error::BAD_VALUE, i32::from(x) as u32));
+        }
+        if i32::from(y) + i32::from(mode.height) > i32::from(self.screen_height) {
+            return Err((error::BAD_VALUE, i32::from(y) as u32));
+        }
+        Ok(())
+    }
+
     fn current_mode_table(outputs: &[RandrOutput]) -> Vec<RandrMode> {
         let mut modes: Vec<RandrMode> = Vec::new();
         let mut seen: HashSet<u32> = HashSet::new();
@@ -992,5 +1061,120 @@ mod tests {
         assert_eq!(st.height_mm, 336, "mm verbatim from client");
         assert_eq!(st.timestamp, 42);
         assert_eq!(st.config_timestamp, 42);
+    }
+
+    use yserver_protocol::x11::error as x11_err;
+
+    fn one_output_state() -> RandrState {
+        RandrState::from_outputs_with_modes(
+            1,
+            vec![RandrOutput {
+                name: "eDP-1".into(),
+                output_id: 1,
+                crtc_id: 2,
+                mode_id: 7,
+                connected: true,
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                vrefresh: 60,
+                mm_width: 0,
+                mm_height: 0,
+                mode_ids: vec![7, 8],
+                num_preferred: 1,
+            }],
+            vec![
+                RandrMode {
+                    mode_id: 7,
+                    width: 1920,
+                    height: 1080,
+                    vrefresh: 60,
+                },
+                RandrMode {
+                    mode_id: 8,
+                    width: 1280,
+                    height: 720,
+                    vrefresh: 60,
+                },
+            ],
+        )
+    }
+
+    #[test]
+    fn set_crtc_config_mode_none_with_outputs_is_badmatch() {
+        let st = one_output_state();
+        assert_eq!(
+            st.validate_set_crtc_config(2, 0, &[1]),
+            Err((x11_err::BAD_MATCH, 2))
+        );
+    }
+
+    #[test]
+    fn set_crtc_config_mode_set_with_no_outputs_is_badmatch() {
+        let st = one_output_state();
+        assert_eq!(
+            st.validate_set_crtc_config(2, 7, &[]),
+            Err((x11_err::BAD_MATCH, 2))
+        );
+    }
+
+    #[test]
+    fn set_crtc_config_output_not_driving_crtc_is_badmatch() {
+        let st = one_output_state();
+        // crtc 999 isn't this output's crtc → errorValue = the bad crtc.
+        assert_eq!(
+            st.validate_set_crtc_config(999, 7, &[1]),
+            Err((x11_err::BAD_MATCH, 999))
+        );
+    }
+
+    #[test]
+    fn set_crtc_config_mode_not_in_output_list_is_badmatch() {
+        let st = one_output_state();
+        // bad mode → errorValue = the bad mode id.
+        assert_eq!(
+            st.validate_set_crtc_config(2, 555, &[1]),
+            Err((x11_err::BAD_MATCH, 555))
+        );
+    }
+
+    #[test]
+    fn screen_encompasses_rejects_overflow_x_then_y() {
+        let st = one_output_state(); // screen 1920x1080
+        let m1080 = RandrMode {
+            mode_id: 7,
+            width: 1920,
+            height: 1080,
+            vrefresh: 60,
+        };
+        // Place 1920x1080 at x=100 → 2020 > 1920. errorValue = x.
+        assert_eq!(
+            st.screen_encompasses(&m1080, 100, 0),
+            Err((x11_err::BAD_VALUE, 100))
+        );
+        // x ok, y overflow: at y=100 → 1180 > 1080. errorValue = y.
+        assert_eq!(
+            st.screen_encompasses(&m1080, 0, 100),
+            Err((x11_err::BAD_VALUE, 100))
+        );
+        // exact fit (x+w == screen.width) is allowed (Xorg uses `>`).
+        assert_eq!(st.screen_encompasses(&m1080, 0, 0), Ok(()));
+    }
+
+    #[test]
+    fn set_crtc_config_valid_enable_resolves_mode() {
+        let st = one_output_state();
+        let mode = st
+            .validate_set_crtc_config(2, 8, &[1])
+            .expect("valid")
+            .expect("enable");
+        assert_eq!((mode.width, mode.height), (1280, 720));
+    }
+
+    #[test]
+    fn set_crtc_config_valid_disable() {
+        let st = one_output_state();
+        assert_eq!(st.validate_set_crtc_config(2, 0, &[]), Ok(None));
     }
 }
