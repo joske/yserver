@@ -2621,6 +2621,51 @@ impl KmsBackendV2 {
         (outs, modes)
     }
 
+    /// The one place `state.randr` is rebuilt from the backend's
+    /// registry/outputs.
+    /// - `set_time`: `Some(t)` sets `timestamp` (lastSetTime) to `t`
+    ///   (SetCrtcConfig uses the client-provided request timestamp;
+    ///   hotplug uses `timestamp_now()`); `None` preserves the prior
+    ///   value (a no-op re-probe must not advance lastSetTime).
+    /// - `config_changed`: advances `config_timestamp` (lastConfigTime)
+    ///   only when the available config (outputs/modes/connection)
+    ///   changed — i.e. hotplug/reprobe-with-change, NOT a CRTC set.
+    ///
+    /// The current logical screen size (`screen_width`/`screen_height`
+    /// + `*_mm`) is OWNED by `RRSetScreenSize` once set and is carried
+    /// forward across every rebuild — a re-probe or CRTC set never
+    /// collapses a client-resized screen back to the bounding box
+    /// (Xorg keeps `pScreen->width/height` until the client resizes).
+    fn rebuild_randr_state(
+        &mut self,
+        state: &mut ServerState,
+        set_time: Option<u32>,
+        config_changed: bool,
+    ) {
+        let prev_ts = state.randr.timestamp;
+        let prev_ct = state.randr.config_timestamp;
+        // Snapshot the client-owned logical screen size to carry forward.
+        let prev_screen = (
+            state.randr.screen_width,
+            state.randr.screen_height,
+            state.randr.width_mm,
+            state.randr.height_mm,
+        );
+        let (outputs, mode_table) = self.randr_outputs_and_modes();
+        let new_ts = set_time.unwrap_or(prev_ts);
+        let ts_now = state.timestamp_now();
+        state.randr =
+            yserver_core::randr::RandrState::from_outputs_with_modes(new_ts, outputs, mode_table);
+        // Carry forward the client-set logical size (from_outputs reseeds
+        // it to the bbox; that is only correct at boot, where prev_screen
+        // already equals the bbox).
+        state.randr.screen_width = prev_screen.0;
+        state.randr.screen_height = prev_screen.1;
+        state.randr.width_mm = prev_screen.2;
+        state.randr.height_mm = prev_screen.3;
+        state.randr.config_timestamp = if config_changed { ts_now } else { prev_ct };
+    }
+
     /// Telemetry accessor — used by the acceptance harness to
     /// read lifetime counters after driving a test sequence.
     #[must_use]
@@ -5058,11 +5103,11 @@ impl KmsBackendV2 {
             return;
         }
 
-        let timestamp = state.timestamp_now();
-        let (outputs, mode_table) = self.randr_outputs_and_modes();
-        state.randr = yserver_core::randr::RandrState::from_outputs_with_modes(
-            timestamp, outputs, mode_table,
-        );
+        // Hotplug add/remove changes the available config AND the
+        // current scanout set: bump both lastSetTime and lastConfigTime
+        // via the single consolidated rebuild path.
+        let ts = state.timestamp_now();
+        self.rebuild_randr_state(state, Some(ts), true);
 
         if state.dpms.power_level == 0 {
             self.kms_outputs_active = true;
@@ -9700,6 +9745,59 @@ impl Backend for KmsBackendV2 {
                 log::debug!("kms: display hotplug edge — rescan armed (+150ms)");
             }
         }
+    }
+
+    fn reprobe_connectors(&mut self, state: &mut ServerState) -> io::Result<()> {
+        // Reconcile the connector registry with the hardware WITHOUT
+        // disturbing any enabled output (no auto-enable, no recompact,
+        // no modeset). Mirrors requery's discover/diff minus the apply.
+        // discover_outputs reads connector/mode/property state and
+        // computes a hypothetical CRTC/plane assignment but commits
+        // nothing, so it is safe to call while outputs are live.
+        let discovered = crate::drm::modeset::discover_outputs(&self.platform.device)?;
+        let mut changed = false;
+        let mut seen: HashSet<String> = HashSet::new();
+        for out in &discovered {
+            seen.insert(out.connector_name.clone());
+            let new_modes: Vec<(u16, u16, u32, bool)> = out
+                .modes
+                .iter()
+                .map(|m| (m.width, m.height, m.vrefresh, m.preferred))
+                .collect();
+            let entry = self.randr_id_alloc.entry_mut(&out.connector_name);
+            if !entry.connected {
+                entry.connected = true;
+                changed = true;
+            }
+            if entry.modes != new_modes {
+                entry.modes = new_modes;
+                changed = true;
+            }
+        }
+        // Connectors the registry knows but the probe no longer sees are
+        // disconnected. Their mode lists are retained (so GetOutputInfo
+        // stays consistent with the union) — only the flag flips.
+        let known: Vec<String> = self
+            .randr_id_alloc
+            .known_connectors()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        for name in known {
+            if !seen.contains(&name) {
+                let entry = self.randr_id_alloc.entry_mut(&name);
+                if entry.connected {
+                    entry.connected = false;
+                    changed = true;
+                }
+            }
+        }
+        // Pure re-probe: never bumps lastSetTime (set_time = None); bumps
+        // lastConfigTime only when something actually changed. A no-op
+        // probe leaves both timestamps + the client-set screen size
+        // intact (Xorg RRGetInfo force_query semantics).
+        self.rebuild_randr_state(state, None, changed);
+        Ok(())
     }
 
     fn on_libinput_ready(&mut self, state: &mut ServerState) {

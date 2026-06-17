@@ -381,7 +381,7 @@ pub fn process_request(
         // ── SYNC extension dispatcher ──
         142 => handle_sync_request(state, backend, client_id, sequence, header, body),
         // ── RANDR extension dispatcher ──
-        128 => handle_randr_request(state, client_id, sequence, header, body),
+        128 => handle_randr_request(state, backend, client_id, sequence, header, body),
         // ── RENDER extension dispatcher ──
         133 => handle_render_request(state, backend, origin, client_id, sequence, header, body),
         // ── DPMS extension dispatcher ──
@@ -2116,6 +2116,7 @@ fn active_monitors(state: &ServerState) -> Vec<ActiveMonitor> {
 
 fn handle_randr_request(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
     client_id: ClientId,
     sequence: SequenceNumber,
     header: RequestHeader,
@@ -2164,7 +2165,34 @@ fn handle_randr_request(
             let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &buf));
         }
-        x11randr::RR_GET_SCREEN_RESOURCES | x11randr::RR_GET_SCREEN_RESOURCES_CURRENT => {
+        x11randr::RR_GET_SCREEN_RESOURCES => {
+            // Force a connector re-probe before replying (Xorg
+            // RRGetInfo force_query=TRUE). A probe failure surfaces as
+            // BadAlloc, matching Xorg. GetScreenResourcesCurrent below
+            // skips this and serves the cached view.
+            if let Err(e) = backend.reprobe_connectors(state) {
+                log::warn!("RRGetScreenResources reprobe failed: {e}");
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_ALLOC,
+                    0,
+                    u16::from(header.data),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            let resources = state.randr.screen_resources_current();
+            let buf = x11randr::encode_get_screen_resources_current_reply(
+                byte_order, sequence, &resources,
+            );
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            let _byte_order = client.byte_order;
+            return Ok(write_to_client(client, client_id, &buf));
+        }
+        x11randr::RR_GET_SCREEN_RESOURCES_CURRENT => {
             let resources = state.randr.screen_resources_current();
             let buf = x11randr::encode_get_screen_resources_current_reply(
                 byte_order, sequence, &resources,
@@ -32953,6 +32981,7 @@ mod tests {
         }];
         let mut state = ServerState::new();
         state.randr = RandrState::from_outputs(0, outputs);
+        let mut backend = RecordingBackend::new();
         let mut peer = install_client(&mut state, CLIENT_ID);
 
         // Build a SetCrtcConfig body: crtc(4) ts(4) cts(4) x(2) y(2)
@@ -32978,6 +33007,7 @@ mod tests {
         // Known mode → status=0 (Success).
         handle_randr_request(
             &mut state,
+            &mut backend,
             ClientId(CLIENT_ID),
             SequenceNumber(1),
             header,
@@ -32987,6 +33017,7 @@ mod tests {
         // mode=0 (disable) → status=0.
         handle_randr_request(
             &mut state,
+            &mut backend,
             ClientId(CLIENT_ID),
             SequenceNumber(2),
             header,
@@ -32996,6 +33027,7 @@ mod tests {
         // Unknown mode → status=3 (Failed).
         handle_randr_request(
             &mut state,
+            &mut backend,
             ClientId(CLIENT_ID),
             SequenceNumber(3),
             header,

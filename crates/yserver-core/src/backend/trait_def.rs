@@ -322,6 +322,18 @@ pub trait Backend: Send {
     /// The DRM hotplug monitor is readable. Default: no-op.
     fn on_display_hotplug(&mut self, _state: &mut ServerState) {}
 
+    /// Force a connector re-probe (RANDR `GetScreenResources`,
+    /// `force_query=TRUE` in Xorg `RRGetInfo`). Re-reads connection
+    /// state + mode lists into the registry WITHOUT changing any
+    /// enabled output's config, and rebuilds `state.randr`. Bumps
+    /// `config_timestamp` ONLY when connection state / mode lists
+    /// changed; leaves both timestamps untouched on a no-op probe.
+    /// `Err` is surfaced by the handler as `BadAlloc`. Default
+    /// `Ok(())` no-op for fixed-topology backends (ynest, recording).
+    fn reprobe_connectors(&mut self, _state: &mut ServerState) -> io::Result<()> {
+        Ok(())
+    }
+
     /// Whether the backend has armed VT switching in direct mode.
     /// Default: false.
     fn vt_switching_armed(&self) -> bool {
