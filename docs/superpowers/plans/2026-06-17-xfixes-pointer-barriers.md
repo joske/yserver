@@ -421,13 +421,19 @@ Expected: FAIL — barriers not dispatched (no error emitted / not stored).
                         );
                     }
                 }
-                if state.xid_occupied(req.barrier)
-                    || xid_out_of_client_range(state, client_id, req.barrier)
-                {
-                    // Xorg XICreatePointerBarrier returns BadAlloc on the
-                    // AddResource failure for an in-use XID (xibarriers.c:827);
-                    // match it (the spec's errors table agrees).
+                // In-use XID → BadAlloc, matching Xorg XICreatePointerBarrier's
+                // AddResource failure (xibarriers.c:827) + the spec's errors table.
+                if state.xid_occupied(req.barrier) {
                     return emit_x11_error(state, client_id, sequence, x11::error::BAD_ALLOC, req.barrier, XFIXES_MAJOR_OPCODE);
+                }
+                // Out-of-client-range XID → BadIdChoice. Xorg enforces the
+                // client owns the XID range inside its resource DB; yserver
+                // does it explicitly here, uniformly with every other
+                // resource-create (e.g. CreateColormap, CREATE_REGION). This
+                // is intentional yserver behavior, not a divergence — a
+                // client may only name XIDs in its assigned range.
+                if xid_out_of_client_range(state, client_id, req.barrier) {
+                    return emit_x11_error(state, client_id, sequence, x11::error::BAD_ID_CHOICE, req.barrier, XFIXES_MAJOR_OPCODE);
                 }
                 // Normalize x1<=x2, y1<=y2 (Xorg sort_min_max) — but skip if any
                 // endpoint negative (ray convention). Devices are pre-validated.
@@ -807,10 +813,23 @@ Expected: FAIL — no clamp; `pointer_root` is (110,50). Also a compile error fo
 
 ```rust
     // Pointer barriers (Xorg input_constrain_cursor): clamp genuine
-    // relative device motion against active barriers. WarpPointer and
-    // our own corrective warps set `barrier_bypass` and are exempt
-    // (Xorg constrains Relative motion only). Replays are exempt too.
-    if !is_replay && !state.barrier_bypass && !state.pointer_barriers.is_empty() {
+    // relative device motion against active barriers. Xorg constrains
+    // Relative motion only; yserver's HostPointerEvent carries no
+    // relative/absolute source bit, but the ONLY absolute pointer motion
+    // reaching this fanout is server-initiated warps (real KMS input is
+    // relative-accumulated; ynest is advisory per the spec; no absolute
+    // touch/tablet device is routed to the core pointer here). So
+    // "relative-only" == "not a warp": every server warp sets
+    // `barrier_bypass` (see `warp_root_no_barrier` in Step 3c) and the
+    // confine path sets `confine_warp_active`; both are exempt here.
+    // Replays are exempt too. (If an absolute pointer device is ever
+    // added, it must set `barrier_bypass` or HostPointerEvent must gain
+    // a source field — flagged in the spec Risks.)
+    if !is_replay
+        && !state.barrier_bypass
+        && !state.confine_warp_active
+        && !state.pointer_barriers.is_empty()
+    {
         let (ox, oy) = (i32::from(state.pointer_root.0), i32::from(state.pointer_root.1));
         let mut nx = i32::from(event.root_x);
         let mut ny = i32::from(event.root_y);
@@ -867,7 +886,35 @@ Expected: FAIL — no clamp; `pointer_root` is (110,50). Also a compile error fo
     }
 ```
 
-- [ ] **Step 3c: Set the bypass in WarpPointer.** In `handle_warp_pointer` (`process_request.rs` ~21953), wrap the `backend.warp_pointer_root(...)` call(s) with `state.barrier_bypass = true; ... ; state.barrier_bypass = false;`.
+- [ ] **Step 3c: Centralize warp bypass — route EVERY server warp through one helper.** A barrier must never clamp a server-initiated warp, and there are several warp sites that re-enter the fanout. Don't sprinkle the flag per-site (fragile — codex pass-2 caught two missed sites). Add a helper next to the fanout:
+
+```rust
+/// Warp the root pointer WITHOUT triggering barrier clamping. Every
+/// server-initiated warp (WarpPointer request, RANDR-shrink reclamp,
+/// confine reclamp) must go through here so the barrier hook in
+/// `pointer_event_fanout_to_state` treats the re-entrant motion as
+/// synthetic (absolute), per Xorg's "Relative motion only" rule.
+pub(crate) fn warp_root_no_barrier(
+    state: &mut ServerState,
+    backend: &mut dyn crate::backend::Backend,
+    x: i32,
+    y: i32,
+) {
+    let prev = state.barrier_bypass;
+    state.barrier_bypass = true;
+    backend.warp_pointer_root(state, x, y);
+    state.barrier_bypass = prev;
+}
+```
+
+Then replace the direct `backend.warp_pointer_root(state, …)` calls at these sites with `warp_root_no_barrier(state, backend, …)`:
+  - `process_request.rs:22029` and `:22043` — `handle_warp_pointer` (WarpPointer request).
+  - `run.rs:951` — RANDR screen-shrink reclamp.
+  - `process_request.rs:22810` — `confine_pointer_now`.
+  - The confine block in `pointer_fanout.rs:115` already sets `confine_warp_active` (which the barrier gate now also checks), so it needs no change — but converting it for uniformity is fine.
+  - The barrier's own corrective warp in Step 3b already sets `barrier_bypass`; leave as-is (or call the helper).
+
+> The barrier gate added in Step 3b checks BOTH `!barrier_bypass && !confine_warp_active`, so any warp routed through either guard is exempt.
 
 - [ ] **Step 4: Run, verify pass.** Run: `cargo test -p yserver-core motion_clamps_against_solid_barrier barrier_bypass_skips_clamp`
 Expected: PASS.

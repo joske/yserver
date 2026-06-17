@@ -254,6 +254,6 @@ Per `feedback_vng_pass_not_hw_pass`: vng is the iteration signal; **bee multi-mo
 ## Risks
 
 - **Input-thread `SetPosition` resync (KMS)** — the part most likely to need HW iteration; touches the existing confinement path. Mitigation: land it as its own commit and verify confinement still holds before adding barriers on top.
-- **Relative vs absolute gating** — getting `WarpPointer` to reliably bypass while real motion clamps; the bypass flag must cover the warp-back re-entry.
+- **Relative vs absolute gating** — Xorg constrains Relative motion only, but `HostPointerEvent` carries no relative/absolute source bit. Resolution: in yserver the only absolute pointer motion reaching the fanout is *server-initiated warps* (real KMS input is relative-accumulated; ynest is advisory; no absolute touch/tablet device routes to the core pointer). So "relative-only" reduces to "not a warp" — every server warp (WarpPointer, RANDR-shrink reclamp, `confine_pointer_now`, the barrier's own corrective warp) must route through a single `warp_root_no_barrier` helper that sets `barrier_bypass`, and the barrier hook skips when `barrier_bypass || confine_warp_active`. Centralizing avoids the "missed a warp site" fragility. If an absolute pointer device is ever added, it must set `barrier_bypass` or `HostPointerEvent` must gain a source field.
 - **Per-screen barrier scoping** — yserver's single root-coordinate space simplifies this vs Xorg's per-`ScreenPtr` lists, but the `window`→screen mapping must be correct for multi-CRTC.
 ```
