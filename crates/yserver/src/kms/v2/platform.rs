@@ -619,15 +619,24 @@ pub(crate) struct RescanResult {
     pub added_count: usize,
 }
 
-/// Pure recompute of the virtual-screen extent from `(x, width, height)`.
-pub(crate) fn recompute_fb_extent_from(layouts: &[(i32, u16, u16)]) -> (u16, u16) {
+/// Pure recompute of the virtual-screen extent from `(x, y, width, height)`.
+///
+/// 2-D: `fb_w = max(x + width)`, `fb_h = max(y + height)`. A client may
+/// place a CRTC at any `(x, y)` (e.g. a monitor stacked below), so the
+/// framebuffer must encompass `y + height`, not just `max(height)`.
+pub(crate) fn recompute_fb_extent_from(layouts: &[(i32, i32, u16, u16)]) -> (u16, u16) {
     let fb_w = layouts
         .iter()
-        .map(|(x, w, _)| x.saturating_add(i32::from(*w)))
+        .map(|(x, _, w, _)| x.saturating_add(i32::from(*w)))
         .map(|v| u16::try_from(v.max(0)).unwrap_or(u16::MAX))
         .max()
         .unwrap_or(0);
-    let fb_h = layouts.iter().map(|(_, _, h)| *h).max().unwrap_or(0);
+    let fb_h = layouts
+        .iter()
+        .map(|(_, y, _, h)| y.saturating_add(i32::from(*h)))
+        .map(|v| u16::try_from(v.max(0)).unwrap_or(u16::MAX))
+        .max()
+        .unwrap_or(0);
     (fb_w, fb_h)
 }
 
@@ -2529,10 +2538,10 @@ impl PlatformBackend {
         }
 
         self.recompact_horizontal_layout();
-        let layouts: Vec<(i32, u16, u16)> = self
+        let layouts: Vec<(i32, i32, u16, u16)> = self
             .outputs
             .iter()
-            .map(|layout| (layout.x, layout.width, layout.height))
+            .map(|layout| (layout.x, layout.y, layout.width, layout.height))
             .collect();
         let (fb_w, fb_h) = recompute_fb_extent_from(&layouts);
         self.fb_w = fb_w;
@@ -2713,8 +2722,22 @@ mod tests {
 
     #[test]
     fn recompute_fb_extent_matches_issue9_dual_2560x1440() {
-        let layouts = &[(0i32, 2560u16, 1440u16), (2560i32, 2560u16, 1440u16)];
+        // Side-by-side (y=0): fb = 5120x1440.
+        let layouts = &[
+            (0i32, 0i32, 2560u16, 1440u16),
+            (2560i32, 0i32, 2560u16, 1440u16),
+        ];
         assert_eq!(super::recompute_fb_extent_from(layouts), (5120, 1440));
+    }
+
+    #[test]
+    fn recompute_fb_extent_2d_vertical_stack() {
+        // Stacked (second monitor below at y=1440): fb = 2560x2880.
+        let layouts = &[
+            (0i32, 0i32, 2560u16, 1440u16),
+            (0i32, 1440i32, 2560u16, 1440u16),
+        ];
+        assert_eq!(super::recompute_fb_extent_from(layouts), (2560, 2880));
     }
 
     /// Fence acquire on a no-Vk fixture returns the
