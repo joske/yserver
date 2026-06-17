@@ -2202,6 +2202,70 @@ pub fn encode_xi2_raw_event(
     debug_assert_eq!(out.len(), 68);
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn write_xi_barrier_event(
+    writer: &mut impl Write,
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    xi_major: u8,
+    evtype: u16,
+    deviceid: u16,
+    time: u32,
+    eventid: u32,
+    root: u32,
+    event_window: u32,
+    barrier: u32,
+    dtime: u32,
+    flags: u32,
+    sourceid: u16,
+    root_x: i32,
+    root_y: i32,
+    dx: f64,
+    dy: f64,
+) -> io::Result<()> {
+    fn fp1616(v: i32) -> i32 {
+        v << 16
+    }
+
+    fn fp3232(v: f64) -> (i32, u32) {
+        let integral_f = v.floor();
+        #[allow(clippy::cast_possible_truncation)]
+        let integral = integral_f as i32;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let frac = ((v - integral_f) * 4_294_967_296.0_f64) as u32;
+        (integral, frac)
+    }
+
+    let mut buf = Vec::with_capacity(68);
+    buf.push(35); // GenericEvent
+    buf.push(xi_major);
+    write_u16(byte_order, &mut buf, sequence.0);
+    write_u32(byte_order, &mut buf, 9);
+
+    write_u16(byte_order, &mut buf, evtype);
+    write_u16(byte_order, &mut buf, deviceid);
+    write_u32(byte_order, &mut buf, time);
+    write_u32(byte_order, &mut buf, eventid);
+    write_u32(byte_order, &mut buf, root);
+    write_u32(byte_order, &mut buf, event_window);
+    write_u32(byte_order, &mut buf, barrier);
+    write_u32(byte_order, &mut buf, dtime);
+    write_u32(byte_order, &mut buf, flags);
+    write_u16(byte_order, &mut buf, sourceid);
+    write_u16(byte_order, &mut buf, 0);
+    write_u32(byte_order, &mut buf, fp1616(root_x) as u32);
+    write_u32(byte_order, &mut buf, fp1616(root_y) as u32);
+    let (dxi, dxf) = fp3232(dx);
+    let (dyi, dyf) = fp3232(dy);
+    write_u32(byte_order, &mut buf, dxi as u32);
+    write_u32(byte_order, &mut buf, dxf);
+    write_u32(byte_order, &mut buf, dyi as u32);
+    write_u32(byte_order, &mut buf, dyf);
+
+    debug_assert_eq!(buf.len(), 68);
+    writer.write_all(&buf)
+}
+
 /// XInput 1.x `ListInputDevices` (opcode minor 2) reply.
 ///
 /// Real clients call `XListInputDevices` (XI 1.x) AND `XIQueryDevice`
@@ -3357,6 +3421,32 @@ pub fn parse_ungrab_key(body: &[u8], keycode_in_header_data: u8) -> Option<Ungra
     })
 }
 
+/// Parse XI2 `XIBarrierReleasePointer` (minor 61).
+///
+/// Records are `(deviceid:u16, pad:u16, barrier:u32, eventid:u32)`.
+#[must_use]
+pub fn parse_xi_barrier_release(body: &[u8]) -> Option<Vec<(u16, u32, u32)>> {
+    if body.len() < 4 {
+        return None;
+    }
+    let num_barriers = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
+    let need = 4 + num_barriers * 12;
+    if body.len() < need {
+        return None;
+    }
+    let mut out = Vec::with_capacity(num_barriers);
+    for i in 0..num_barriers {
+        let off = 4 + i * 12;
+        let deviceid = u16::from_le_bytes([body[off], body[off + 1]]);
+        let barrier =
+            u32::from_le_bytes([body[off + 4], body[off + 5], body[off + 6], body[off + 7]]);
+        let eventid =
+            u32::from_le_bytes([body[off + 8], body[off + 9], body[off + 10], body[off + 11]]);
+        out.push((deviceid, barrier, eventid));
+    }
+    Some(out)
+}
+
 pub fn write_mapping_notify_event(
     writer: &mut impl Write,
     byte_order: ClientByteOrder,
@@ -3606,6 +3696,57 @@ pub fn write_get_modifier_mapping_reply_with_keycodes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xi_barrier_event_layout() {
+        let mut buf = Vec::new();
+        write_xi_barrier_event(
+            &mut buf,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(3),
+            137,
+            25,
+            2,
+            1234,
+            7,
+            0x01,
+            0x10,
+            0x55,
+            0,
+            0,
+            2,
+            99,
+            50,
+            20.0,
+            0.0,
+        )
+        .unwrap();
+        assert_eq!(buf.len(), 68);
+        assert_eq!(buf[0], 35, "GenericEvent");
+        assert_eq!(buf[1], 137, "extension");
+        assert_eq!(&buf[4..8], &9u32.to_le_bytes(), "length");
+        assert_eq!(&buf[8..10], &25u16.to_le_bytes(), "evtype");
+        assert_eq!(&buf[10..12], &2u16.to_le_bytes(), "deviceid");
+        assert_eq!(&buf[16..20], &7u32.to_le_bytes(), "eventid");
+        assert_eq!(&buf[28..32], &0x55u32.to_le_bytes(), "barrier");
+        assert_eq!(&buf[44..48], &(99i32 << 16).to_le_bytes(), "root_x");
+        assert_eq!(&buf[52..56], &20i32.to_le_bytes(), "dx integral");
+        assert_eq!(&buf[56..60], &0u32.to_le_bytes(), "dx frac");
+    }
+
+    #[test]
+    fn parse_xi_barrier_release_entries() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&2u32.to_le_bytes());
+        for (dev, bar, eid) in [(2u16, 0x55u32, 7u32), (2, 0x66, 9)] {
+            body.extend_from_slice(&dev.to_le_bytes());
+            body.extend_from_slice(&0u16.to_le_bytes());
+            body.extend_from_slice(&bar.to_le_bytes());
+            body.extend_from_slice(&eid.to_le_bytes());
+        }
+        let entries = parse_xi_barrier_release(&body).expect("parse");
+        assert_eq!(entries, vec![(2, 0x55, 7), (2, 0x66, 9)]);
+    }
 
     /// XI1 `GetDeviceKeyMapping` reply wire layout, asserted against the
     /// `xGetDeviceKeyMappingReply` struct in XIproto.h:

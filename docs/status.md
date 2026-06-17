@@ -54,10 +54,10 @@ Cross-cutting bugs and followups that don't fit a stage live in
 - **2026-06-17 XFIXES pointer barriers**: `PointerBarrier` storage,
   XFIXES barrier wire parsing, `CreatePointerBarrier` /
   `DeletePointerBarrier` dispatch, client-disconnect cleanup, XID
-  namespace coverage, and the phase-2 motion clamp / bypass gate are
-  now in-tree in `yserver-core` and `yserver-protocol`. XI2
-  `BarrierHit` / `BarrierLeave` events and release semantics are still
-  pending in later phases.
+  namespace coverage, the phase-2 motion clamp / bypass gate, and the
+  phase-3 XI2 `BarrierHit` / `BarrierLeave` / `XIBarrierReleasePointer`
+  path are now in-tree in `yserver-core` and `yserver-protocol`. Phase
+  4 KMS input-thread resync is still pending.
 - Abandoned branch: `render-convolution-filter`. Left untouched
   as historical reference for T1-T4 of the Manual-redirect work,
   convolution Phase 1+2, the rotate fix, and the

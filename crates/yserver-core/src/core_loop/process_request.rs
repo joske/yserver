@@ -4115,7 +4115,25 @@ fn handle_xfixes_request(
                             XFIXES_MAJOR_OPCODE,
                         );
                     }
-                    Some(_) => {
+                    Some(barrier) => {
+                        if barrier.hit {
+                            let _dropped = crate::core_loop::pointer_fanout::emit_barrier_event(
+                                state,
+                                bid,
+                                barrier.owner,
+                                barrier.window,
+                                26,
+                                barrier.last_timestamp,
+                                barrier.event_id,
+                                0,
+                                1,
+                                0,
+                                0,
+                                0,
+                                0.0,
+                                0.0,
+                            );
+                        }
                         state.pointer_barriers.remove(&bid);
                     }
                 }
@@ -14262,6 +14280,48 @@ fn handle_xi2_request(
                 client_id.0, sequence.0, f.focus
             );
             buf.extend_from_slice(&reply);
+        }
+        61 => {
+            if let Some(entries) = x11::parse_xi_barrier_release(body) {
+                for (deviceid, barrier_id, event_id) in entries {
+                    if !(deviceid == 0 || deviceid == 1 || deviceid == 2) {
+                        return emit_x11_error_with_minor(
+                            state,
+                            client_id,
+                            sequence,
+                            XI1_ERROR_BAD_DEVICE,
+                            u32::from(deviceid),
+                            61,
+                            XI2_MAJOR_OPCODE,
+                        );
+                    }
+                    let Some(barrier) = state.pointer_barriers.get_mut(&barrier_id) else {
+                        return emit_x11_error_with_minor(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_VALUE,
+                            barrier_id,
+                            61,
+                            XI2_MAJOR_OPCODE,
+                        );
+                    };
+                    if barrier.owner != client_id {
+                        return emit_x11_error_with_minor(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_ACCESS,
+                            barrier_id,
+                            61,
+                            XI2_MAJOR_OPCODE,
+                        );
+                    }
+                    if barrier.event_id == event_id {
+                        barrier.release_event_id = event_id;
+                    }
+                }
+            }
         }
         _ => {
             debug!(
@@ -34190,6 +34250,30 @@ mod tests {
         )
     }
 
+    fn xi2_barrier_release(
+        state: &mut ServerState,
+        client: ClientId,
+        entries: &[(u16, u32, u32)],
+    ) -> io::Result<RequestOutcome> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for &(deviceid, barrier, eventid) in entries {
+            body.extend_from_slice(&deviceid.to_le_bytes());
+            body.extend_from_slice(&0u16.to_le_bytes());
+            body.extend_from_slice(&barrier.to_le_bytes());
+            body.extend_from_slice(&eventid.to_le_bytes());
+        }
+        handle_xi2_request(
+            state,
+            &mut RecordingBackend::new(),
+            None,
+            client,
+            SequenceNumber(1),
+            xi2_header_for_body(61, &body),
+            &body,
+        )
+    }
+
     #[test]
     fn create_pointer_barrier_stores_resource() {
         let mut state = ServerState::new();
@@ -34340,6 +34424,76 @@ mod tests {
         assert!(state.pointer_barriers.contains_key(&bid));
 
         xfixes_delete_barrier(&mut state, ClientId(1), bid).expect("owner delete handled");
+        assert!(!state.pointer_barriers.contains_key(&bid));
+    }
+
+    #[test]
+    fn xi2_barrier_release_arms_matching_barrier() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let bid = 0x0040_0002u32;
+
+        xfixes_create_barrier(
+            &mut state,
+            ClientId(1),
+            bid,
+            ROOT_WINDOW.0,
+            100,
+            0,
+            100,
+            200,
+            0,
+            &[],
+        )
+        .expect("create barrier");
+
+        xi2_barrier_release(&mut state, ClientId(1), &[(2, bid, 1)]).expect("release handled");
+
+        let barrier = state.pointer_barriers.get(&bid).expect("barrier");
+        assert_eq!(barrier.release_event_id, 1);
+    }
+
+    #[test]
+    fn delete_while_hit_emits_released_leave() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        if let Some(client) = state.clients.get_mut(&1) {
+            client.xi2_masks.insert((ROOT_WINDOW, 2), 1 << 26);
+        }
+        let bid = 0x0040_0003u32;
+
+        xfixes_create_barrier(
+            &mut state,
+            ClientId(1),
+            bid,
+            ROOT_WINDOW.0,
+            100,
+            0,
+            100,
+            200,
+            0,
+            &[],
+        )
+        .expect("create barrier");
+        {
+            let barrier = state.pointer_barriers.get_mut(&bid).expect("barrier");
+            barrier.hit = true;
+            barrier.event_id = 1;
+            barrier.last_timestamp = 10;
+        }
+
+        xfixes_delete_barrier(&mut state, ClientId(1), bid).expect("owner delete handled");
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 68);
+        assert_eq!(bytes[0], 35, "GenericEvent");
+        assert_eq!(bytes[1], XI2_MAJOR_OPCODE, "XI2 major opcode");
+        assert_eq!(&bytes[8..10], &26u16.to_le_bytes(), "BarrierLeave");
+        assert_eq!(
+            &bytes[36..40],
+            &1u32.to_le_bytes(),
+            "XIBarrierPointerReleased"
+        );
+        assert_eq!(&bytes[40..42], &0u16.to_le_bytes(), "sourceid = 0");
         assert!(!state.pointer_barriers.contains_key(&bid));
     }
 

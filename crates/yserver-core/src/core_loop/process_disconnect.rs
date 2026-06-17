@@ -116,6 +116,31 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
         state, client_id,
     );
 
+    let hit_barriers: Vec<(u32, crate::server::PointerBarrier)> = state
+        .pointer_barriers
+        .iter()
+        .filter(|(_, barrier)| barrier.owner == client_id && barrier.hit)
+        .map(|(barrier_xid, barrier)| (*barrier_xid, barrier.clone()))
+        .collect();
+    for (barrier_xid, barrier) in hit_barriers {
+        let _dropped = crate::core_loop::pointer_fanout::emit_barrier_event(
+            state,
+            barrier_xid,
+            barrier.owner,
+            barrier.window,
+            26,
+            barrier.last_timestamp,
+            barrier.event_id,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0.0,
+            0.0,
+        );
+    }
+
     let mut owned_roots: Vec<ResourceId> = Vec::new();
     state
         .resources

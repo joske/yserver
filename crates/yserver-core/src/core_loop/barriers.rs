@@ -131,6 +131,37 @@ pub fn clamp_to_barrier(b: &BarrierGeom, dir: u32, x: &mut i32, y: &mut i32) {
     }
 }
 
+/// Xorg `barrier_inside_hit_box`: hit-state stays armed until the
+/// pointer leaves a small padded box around the barrier segment.
+#[must_use]
+pub fn inside_hit_box(b: &BarrierGeom, x: i32, y: i32) -> bool {
+    const HIT_EDGE_EXTENTS: i32 = 2;
+    let mut x1 = b.x1;
+    let mut x2 = b.x2;
+    let mut y1 = b.y1;
+    let mut y2 = b.y2;
+    let dir = !b.directions;
+
+    if b.is_vertical() {
+        if dir & POSITIVE_X != 0 {
+            x1 -= HIT_EDGE_EXTENTS;
+        }
+        if dir & NEGATIVE_X != 0 {
+            x2 += HIT_EDGE_EXTENTS;
+        }
+    }
+    if b.is_horizontal() {
+        if dir & POSITIVE_Y != 0 {
+            y1 -= HIT_EDGE_EXTENTS;
+        }
+        if dir & NEGATIVE_Y != 0 {
+            y2 += HIT_EDGE_EXTENTS;
+        }
+    }
+
+    x >= x1 && x <= x2 && y >= y1 && y <= y2
+}
+
 /// Find the nearest barrier that blocks at least one direction in `dir`.
 #[must_use]
 pub fn find_nearest(
@@ -223,5 +254,14 @@ mod tests {
         assert!(inside_segment(500, 0, -1));
         assert!(!inside_segment(-5, 0, -1));
         assert!(inside_segment(123, -1, -1));
+    }
+
+    #[test]
+    fn hit_box_extends_only_blocked_sides() {
+        let b = vbar(100, 0, 200, 0);
+        assert!(inside_hit_box(&b, 102, 50));
+        assert!(inside_hit_box(&b, 98, 50));
+        assert!(!inside_hit_box(&b, 103, 50));
+        assert!(!inside_hit_box(&b, 97, 50));
     }
 }
