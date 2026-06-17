@@ -3471,6 +3471,35 @@ pub fn write_get_device_key_mapping_reply(
     writer.write_all(&reply)
 }
 
+/// XInput 1.x `GetDeviceMotionEvents` reply (minor 10) for a device
+/// with no buffered motion history. Layout from
+/// `xGetDeviceMotionEventsReply` (XIproto.h): `nEvents`@8 (4),
+/// `axes`@12, `mode`@13, then pads. yserver keeps no per-device motion
+/// buffer (same posture as core `GetMotionEvents`), so `nEvents` and
+/// `length` are 0 — but `axes`/`mode` report the device's true class,
+/// exactly as Xorg `Xi/gtmotion.c` does on the empty-history path
+/// (`mode = Absolute`).
+pub fn write_get_device_motion_events_reply(
+    writer: &mut impl Write,
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    axes: u8,
+    mode: u8,
+) -> io::Result<()> {
+    const X_GET_DEVICE_MOTION_EVENTS: u8 = 10;
+    let mut reply = Vec::with_capacity(32);
+    reply.push(1); // repType = X_Reply
+    reply.push(X_GET_DEVICE_MOTION_EVENTS); // RepType
+    write_u16(byte_order, &mut reply, sequence.0);
+    write_u32(byte_order, &mut reply, 0); // length
+    write_u32(byte_order, &mut reply, 0); // nEvents
+    reply.push(axes);
+    reply.push(mode);
+    reply.extend_from_slice(&[0u8; 18]); // pad1, pad2, pad01..pad04
+    debug_assert_eq!(reply.len(), 32);
+    writer.write_all(&reply)
+}
+
 pub fn write_get_modifier_mapping_reply_with_keycodes(
     writer: &mut impl Write,
     byte_order: ClientByteOrder,
@@ -3526,6 +3555,31 @@ mod tests {
             let off = 32 + i * 4;
             assert_eq!(&buf[off..off + 4], &k.to_le_bytes(), "keysym {i}");
         }
+    }
+
+    /// XI1 `GetDeviceMotionEvents` empty-history reply, asserted against
+    /// `xGetDeviceMotionEventsReply` in XIproto.h: RepType=10@1,
+    /// nEvents=0@8, axes@12, mode@13, length=0.
+    #[test]
+    fn get_device_motion_events_reply_empty_history_layout() {
+        let mut buf = Vec::new();
+        write_get_device_motion_events_reply(
+            &mut buf,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(0x55),
+            4,
+            1,
+        )
+        .unwrap();
+        assert_eq!(buf.len(), 32);
+        assert_eq!(buf[0], 1, "repType = X_Reply");
+        assert_eq!(buf[1], 10, "RepType = X_GetDeviceMotionEvents");
+        assert_eq!(&buf[2..4], &0x55u16.to_le_bytes(), "sequenceNumber");
+        assert_eq!(&buf[4..8], &0u32.to_le_bytes(), "length = 0 (no history)");
+        assert_eq!(&buf[8..12], &0u32.to_le_bytes(), "nEvents = 0");
+        assert_eq!(buf[12], 4, "axes");
+        assert_eq!(buf[13], 1, "mode = Absolute");
+        assert_eq!(&buf[14..32], &[0u8; 18], "pads");
     }
 
     /// Empty range (count=0) → header only, length 0, still 32 bytes.

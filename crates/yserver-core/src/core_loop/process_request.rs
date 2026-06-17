@@ -12089,7 +12089,18 @@ fn handle_xi2_request(
             if !xi1_device_has_valuators(dev) {
                 return xi1_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, minor);
             }
-            buf.extend_from_slice(&xi1_zero_reply(byte_order, sequence));
+            // yserver keeps no per-device motion history (same as core
+            // GetMotionEvents). Report the device's true axis count with
+            // an empty history and Absolute mode, matching Xorg
+            // Xi/gtmotion.c's empty-history path — not a zeroed stub.
+            const XI_ABSOLUTE: u8 = 1;
+            x11::write_get_device_motion_events_reply(
+                &mut buf,
+                byte_order,
+                sequence,
+                XI1_POINTER_AXES,
+                XI_ABSOLUTE,
+            )?;
         }
         // ChangeKeyboardDevice: { deviceid }. Needs a device with keys
         // (Xorg Xi/chgkbd.c). xts5 expects:
@@ -24467,6 +24478,65 @@ mod tests {
             SequenceNumber(1),
             header,
             &[2u8, 8, 1, 0],
+        )
+        .expect("process");
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes[0], 0, "error packet");
+        assert_eq!(bytes[1], x11::error::BAD_MATCH, "BadMatch");
+    }
+
+    #[test]
+    fn xi_get_device_motion_events_pointer_returns_empty_history() {
+        // Device 2 = master pointer (has valuators) → faithful
+        // empty-history reply: RepType=10, nEvents=0, axes=4, mode=1.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let header = RequestHeader {
+            opcode: 137,
+            data: 10,
+            length_units: 4,
+        };
+        // { start:CARD32, stop:CARD32, deviceid@8 }.
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &[0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0],
+        )
+        .expect("process");
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 32, "fixed 32-byte reply: {bytes:02x?}");
+        assert_eq!(bytes[0], 1, "X_Reply");
+        assert_eq!(bytes[1], 10, "RepType = X_GetDeviceMotionEvents");
+        assert_eq!(&bytes[8..12], &0u32.to_le_bytes(), "nEvents = 0");
+        assert_eq!(bytes[12], XI1_POINTER_AXES, "axes = device valuator count");
+        assert_eq!(bytes[13], 1, "mode = Absolute");
+    }
+
+    #[test]
+    fn xi_get_device_motion_events_keyboard_is_bad_match() {
+        // Device 3 = master keyboard (no valuators) → BadMatch
+        // (Xorg gtmotion.c: v == NULL → BadMatch).
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let header = RequestHeader {
+            opcode: 137,
+            data: 10,
+            length_units: 4,
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &[0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0],
         )
         .expect("process");
         let bytes = read_all_available(&mut peer);
