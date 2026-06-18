@@ -804,7 +804,7 @@ yserver-mate-hw-trace log="debug,yserver_core::core_loop::damage_fanout=trace,ys
         wait $yserver_pid 2>/dev/null;\
         rm -rf "$xdg_rd" 2>/dev/null;'
 
-yserver-cinnamon-hw-trace log="debug,yserver::kms::v2::scene=trace,yserver::kms::v2::render=trace,yserver::kms::v2::fill=trace,yserver::kms::v2::store=trace,yserver::kms::v2::paint=trace,yserver::diag::configure_notify=debug":
+yserver-cinnamon-hw-trace log="info,yserver::kms::v2::pointer=trace":
     cargo build --bin yserver
     rm -f cinnamon.xtrace
     bash -c '\

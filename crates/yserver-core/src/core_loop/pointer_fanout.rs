@@ -864,8 +864,46 @@ pub fn pointer_event_fanout_to_state(
     // original (untranslated) coords relative to the hit target.
     let (mut event_x, mut event_y) = (target_x, target_y);
     let mut nested_id = target;
-    let (mut xi2_targets, xi2_raw_targets) =
-        compute_xi2_targets(state, target, top_level_id, xi2_evtype, xi2_raw_evtype);
+    // XI2 crossings carry a *per-window* endpoint, not a single hit. The
+    // producer (update_pointer_window → normal_mode_crossings) emits one
+    // Enter/Leave per window on the sprite-trace path, each tagged with
+    // that window's host_xid + detail (Ancestor/Virtual/Inferior). The
+    // generic resolution above collapses every chain event onto the
+    // deepest hit (`target`), so a client that selected XI_Enter on an
+    // *intermediate* ancestor never matches — XI2 selection is strictly
+    // per-window with no upward propagation, and `xi2_mask_for_client`
+    // only checks {target, top-level}. That is exactly muffin's
+    // focus-follows-mouse: it selects XI_Enter on the managed client
+    // window, which for an app with its own content child (wezterm) sits
+    // *between* the leaf the pointer is over and the top-level frame, so
+    // the crossing fell through the {leaf, top-level} crack and wezterm
+    // never focused on hover (Caja, whose content is the managed window,
+    // worked). Resolve crossings against the producer's own window
+    // (host_xid → resource) — matching Xorg, which delivers a crossing to
+    // every path window that selected it. Coalesce-safe: for the common
+    // case the producer's window IS the deepest hit, so this is a no-op.
+    let (mut xi2_targets, xi2_raw_targets) = if matches!(
+        event.kind,
+        PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify
+    ) && let Some(crossing_win) =
+        xid_map.get(&event.host_xid).copied()
+    {
+        nested_id = crossing_win;
+        // event.event_x/y are relative to host_xid's window (the
+        // producer's endpoint); translate_host_event only re-derives
+        // root_x/y, leaving these untouched.
+        event_x = event.event_x;
+        event_y = event.event_y;
+        compute_xi2_targets(
+            state,
+            crossing_win,
+            state.top_level_for_target(crossing_win),
+            xi2_evtype,
+            xi2_raw_evtype,
+        )
+    } else {
+        compute_xi2_targets(state, target, top_level_id, xi2_evtype, xi2_raw_evtype)
+    };
 
     // Synchronous passive XI2 button grabs freeze the device event at
     // the grab owner until XIAllowEvents(ReplayDevice) replays it.
