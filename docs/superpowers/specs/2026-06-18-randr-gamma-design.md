@@ -1,6 +1,6 @@
 # RANDR CRTC gamma — design
 
-**Date:** 2026-06-18 · **Status:** approved, pre-plan · **Scope:** RANDR `GetCrtcGammaSize` / `GetCrtcGamma` / `SetCrtcGamma` (CRTC color LUT), KMS-backed, persisted across modeset/VT-switch/DPMS.
+**Date:** 2026-06-18 · **Status:** approved, codex-reviewed (1 pass), pre-plan · **Scope:** RANDR `GetCrtcGammaSize` / `GetCrtcGamma` / `SetCrtcGamma` (CRTC color LUT), KMS-backed, persisted across modeset/VT-switch/DPMS.
 
 ## Motivation
 
@@ -10,7 +10,9 @@
 
 ## Approach
 
-Apply the LUT to hardware with the **legacy `drmModeCrtcSetGamma` ioctl**, not the atomic `GAMMA_LUT` property. Rationale: atomic commits on a CRTC EBUSY-collide with scanout pageflips — the exact hazard that drove the HW cursor to legacy ioctls (`drmModeMoveCursor`/`SetCursor2`, landed `0b3fd0c`, memory `feedback-hw-cursor-legacy-ioctls`). Gamma shares the hazard and gains nothing from atomic here.
+Apply the LUT through the **legacy `drmModeCrtcSetGamma` ioctl** — the same userspace API `redshift`/`gammastep` use against Xorg, and consistent with the HW cursor's legacy-ioctl path (`drmModeMoveCursor`/`SetCursor2`, landed `0b3fd0c`, memory `feedback-hw-cursor-legacy-ioctls`). The point is that we do **not** add our own separate atomic `GAMMA_LUT` commit — a second atomic commit on a CRTC EBUSY-collides with our scanout pageflips (the hazard that drove the cursor to legacy ioctls).
+
+**Caveat (codex review, verified against kernel headers):** on atomic-only drivers like amdgpu the legacy gamma ioctl is itself implemented via `drm_atomic_helper_legacy_gamma_set()` (`drm_crtc.h:507`), so it *may* internally route through the atomic color-management path. Whether that re-introduces an EBUSY/serialisation interaction with in-flight pageflips is **not proven** and is a genuine risk to the approach — it MUST be validated on target HW (see Open Questions / HW smoke). The legacy ioctl is still the right first choice: it's what redshift drives on Xorg, and the cursor uses the analogous legacy path successfully today.
 
 ## Architecture
 
@@ -45,28 +47,30 @@ The connector string is the same identifier `apply_crtc_config` already takes; c
 
 ### 2. KMS implementation (`crates/yserver/src/kms/v2/{backend,platform}.rs`)
 
-- **Cache:** the backend owns a `HashMap<crtc_id, GammaLut>` (`GammaLut = { red: Vec<u16>, green: Vec<u16>, blue: Vec<u16> }`). Hardware state lives with the backend, alongside the cursor sprite cache — not in core. This is a cold path (gamma changes are human-paced), so the extra backend round-trip for `GetCrtcGamma` is irrelevant.
+- **Cache (keyed by CONNECTOR, not crtc_id):** the backend owns a `HashMap<connector, GammaLut>` (`GammaLut = { red: Vec<u16>, green: Vec<u16>, blue: Vec<u16> }`). **Codex caught this:** yserver's stable identity is the *connector*; the DRM `Output.crtc` a connector lands on can change across re-enable/rediscovery (`backend.rs:204`, `platform.rs:2835`), so a `crtc_id`-keyed cache would orphan a connector's LUT or reapply it to the wrong monitor. Cache by connector; resolve connector → current `crtc_id` at apply/reapply time. Hardware state lives with the backend, alongside the cursor sprite cache — not in core. Cold path (gamma changes are human-paced), so the extra backend round-trip for `GetCrtcGamma` is irrelevant.
 - **`crtc_gamma_size`:** report the CRTC's real DRM `gamma_size` (the `drm` crate's CRTC info / `Crtc::gamma_length`). amdgpu legacy is typically 256; report whatever the kernel says so the client allocates the right array.
 - **`set_crtc_gamma`:** call the `drm` crate's legacy `set_gamma(crtc, &red, &green, &blue)`. On success, store the LUT in the cache keyed by the resolved `crtc_id`.
 - **`get_crtc_gamma`:** return the cached LUT (clone).
-- **Seed:** on connector enable, if no cache entry exists, seed a linear identity ramp of length `gamma_size` (`entry[i] = (i * 65535 / (size-1))`), so a `GetCrtcGamma` before any `SetCrtcGamma` returns Xorg-like identity rather than empty.
-- **Reapply:** after each transition that resets the hardware LUT, re-issue `set_gamma` from the cache for every CRTC with an entry. Hook sites (the same three the cursor rebind uses):
-  - `enable_connector` → `commit_modeset` (`platform.rs:2426`)
-  - `run_resume` (VT-switch return, `backend.rs:5010`)
-  - `dpms_set_outputs_active(true)` (DPMS wake, `platform.rs:2721`)
+- **Seed:** seed a linear identity ramp of length `gamma_size` (`entry[i] = i * 65535 / (size-1)`) the first time a connector's gamma is queried/set, so `GetCrtcGamma` before any `SetCrtcGamma` returns Xorg-like identity rather than empty. **Inactive/unassigned connectors:** yserver keeps a stable per-connector CRTC id even when the output is off (`backend.rs:2592`); `GetCrtcGammaSize`/`GetCrtcGamma`/`SetCrtcGamma` must still answer for those — report the connector's nominal gamma size (fall back to 256 when no live CRTC to query), cache the ramp, and apply lazily when the connector next lights up. If a connector lands on a hardware CRTC whose `gamma_size` differs from the cached ramp's length, **resample** the cached ramp to the new size on reapply (don't discard the client's intent).
+- **Reapply — single invariant:** *re-issue `set_gamma` from the cache (resolving connector → current crtc) immediately after every successful `commit_modeset`.* **Codex caught the redundancy:** `run_resume` already re-lights outputs via `dpms_set_outputs_active(true)` (`backend.rs:5038`), which itself commits a modeset — so there is no separate top-level resume hook. The two real `commit_modeset` sites are `enable_connector` (`platform.rs:2426`, covers RANDR modeset) and DPMS wake (`platform.rs:2721`, covers DPMS-wake *and* VT-switch resume). Ordering: reapply strictly **after** the commit succeeds (a pre-commit apply would be wiped by the modeset).
 
 ### 3. RANDR protocol handlers (`crates/yserver-core/src/core_loop/process_request.rs`)
 
 - **`RR_GET_CRTC_GAMMA_SIZE`** (`:2451`): resolve crtc → connector, return `backend.crtc_gamma_size(connector)` (replaces hardcoded `0`). Invalid CRTC → `BadCrtc`.
-- **`RR_GET_CRTC_GAMMA`** (`:2459`): return `backend.get_crtc_gamma(connector)` as the reply ramp (replaces hardcoded empty). Invalid CRTC → `BadCrtc`.
-- **`RR_SET_CRTC_GAMMA`** (new dispatch arm): parse `crtc(4) size(2) pad(2)` then `3 × size` `u16` entries. Validate `size == backend.crtc_gamma_size` → else `BadValue` (matches Xorg `rrcrtc.c ProcRRSetCrtcGamma`); invalid CRTC → `BadCrtc`. On success call `backend.set_crtc_gamma`. Void request (no reply).
+- **`RR_GET_CRTC_GAMMA`** (`:2459`): return `backend.get_crtc_gamma(connector)` as the reply ramp (replaces hardcoded empty). Invalid CRTC → `BadCrtc`. **Reply layout** (Xorg `rrcrtc.c:1693`): 32-byte reply header with `size`@byte 8, then one contiguous `3 × size` `u16` block (red, then green, then blue), zero-padded to a 4-byte boundary. `reply.length` (32-bit units) = `(3 × size × 2 + 3) >> 2` — spell this out exactly in the encoder.
+- **`RR_SET_CRTC_GAMMA`** (new dispatch arm): parse `crtc(4) size(2) pad(2)` then `3 × size` `u16` entries. **Error order must match Xorg `ProcRRSetCrtcGamma` (rrcrtc.c:1723) exactly** — codex corrected my earlier `BadValue`:
+  1. invalid CRTC → `BadCrtc` (`VERIFY_RR_CRTC`).
+  2. CRTC is RANDR-leased → `BadAccess` (`RRCrtcIsLeased`). yserver has no lease support yet (RRCreateLease is a stopgap), so this is effectively never true today, but encode the check for parity.
+  3. body too short: `req_len - fixed < (size*3 + 1) >> 1` (32-bit units) → `BadLength`.
+  4. `size != crtc gamma_size` → `BadMatch` (**not** `BadValue`).
+
+  On success call `backend.set_crtc_gamma`. Void request (no reply).
 - **Wire plumbing:** add the `RR_SET_CRTC_GAMMA` request-length entry to `request_lengths.rs` (fixed `crtc(4) size(2) pad(2)` + the `3 × size` `u16` data array, padded to 32-bit units — exact unit accounting to be derived against the existing RANDR entries in the plan, not hand-computed here) and the `request_swap.rs` entry (the `3 × size` array byte-swaps as `u16`).
 
 ## Error handling
 
-- Invalid CRTC id → `BadCrtc` (RANDR error base).
-- `SetCrtcGamma` size mismatch → `BadValue` (Xorg parity).
-- KMS `set_gamma` ioctl failure → log a warning, leave the cache unchanged, and (for the protocol) still succeed-or-error per Xorg (Xorg returns Success once validation passes; a kernel failure is logged). We follow: validation errors are protocol errors; a post-validation ioctl failure is logged, not surfaced as a protocol error (no Xorg error code exists for it).
+- Error codes/order per Xorg `ProcRRSetCrtcGamma` (see §3): `BadCrtc` → `BadAccess` (leased) → `BadLength` (short body) → `BadMatch` (size ≠ `gammaSize`). `Get*` invalid CRTC → `BadCrtc`.
+- **Cache-before-apply (codex, Xorg parity):** on a valid `SetCrtcGamma`, update the connector's cached ramp to the client's requested values *first* (Xorg `RRCrtcGammaSet` copies into `crtc->gammaRed/Green/Blue` before invoking the driver hook, `rrcrtc.c:932`), *then* attempt the KMS `set_gamma`. A transient ioctl failure is logged (no Xorg protocol error exists for it) but the cache keeps the requested ramp, so the next reapply (or modeset) retries it. Returning Success after validation matches Xorg.
 - Non-KMS backends report size 0 → clients that check `GetCrtcGammaSize` see "unsupported" and skip, which is honest.
 
 ## Testing
@@ -74,13 +78,19 @@ The connector string is the same identifier `apply_crtc_config` already takes; c
 **Unit (`RecordingBackend`, in-memory ramp, size 256):**
 - `GetCrtcGammaSize` returns the backend's size.
 - `SetCrtcGamma` at the correct size stores; `GetCrtcGamma` round-trips the same ramp.
-- `SetCrtcGamma` with `size != gamma_size` → `BadValue`.
+- `SetCrtcGamma` with `size != gamma_size` → `BadMatch`; with a body shorter than `size` implies → `BadLength`.
 - `GetCrtcGammaSize` / `GetCrtcGamma` / `SetCrtcGamma` on an invalid CRTC → `BadCrtc`.
 - Seed: `GetCrtcGamma` before any `Set` returns a linear identity ramp.
+- Reapply: after a simulated `commit_modeset`, the backend re-issues the cached ramp (assert via the `RecordingBackend` call log).
 
 **HW smoke (release gate — user-run on silence/RX580, per the no-commit-before-smoke rule):**
 - `redshift -O 3000` → screen visibly warms; `redshift -x` → resets.
 - Set gamma, switch to another VT and back → gamma persists (proves the reapply hook).
+
+## Open questions (codex)
+
+- **Legacy gamma under active pageflips (must validate on HW):** does `redshift` reliably apply while normal scanout pageflips are running, or does `drm_atomic_helper_legacy_gamma_set` serialise/EBUSY against in-flight flips on amdgpu? This is the make-or-break for the legacy approach — it's the first thing the HW smoke checks. If it collides, fall back to scheduling the gamma apply on the next idle/vblank (still legacy ioctl, just sequenced), not to a separate atomic commit.
+- **gamma_size change on CRTC remap:** resolved above — resample the cached ramp to the new size. Called out so the plan implements resampling, not silent truncation.
 
 ## Out of scope
 
