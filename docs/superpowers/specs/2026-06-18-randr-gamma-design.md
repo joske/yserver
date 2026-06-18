@@ -1,6 +1,6 @@
 # RANDR CRTC gamma — design
 
-**Date:** 2026-06-18 · **Status:** approved, codex-reviewed (1 pass), pre-plan · **Scope:** RANDR `GetCrtcGammaSize` / `GetCrtcGamma` / `SetCrtcGamma` (CRTC color LUT), KMS-backed, persisted across modeset/VT-switch/DPMS.
+**Date:** 2026-06-18 · **Status:** approved, codex-reviewed (2 passes), pre-plan · **Scope:** RANDR `GetCrtcGammaSize` / `GetCrtcGamma` / `SetCrtcGamma` (CRTC color LUT), KMS-backed, persisted across modeset/VT-switch/DPMS.
 
 ## Motivation
 
@@ -36,8 +36,8 @@ fn set_crtc_gamma(
     blue: &[u16],
 ) -> std::io::Result<()> { Ok(()) }
 
-/// The CRTC's current cached gamma LUT (seeded with a linear identity
-/// ramp on first connector enable). Default: empty.
+/// The CRTC's current cached gamma LUT (lazily seeded with a linear
+/// identity ramp on the connector's first gamma query/set). Default: empty.
 fn get_crtc_gamma(&self, connector: &str) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
     (Vec::new(), Vec::new(), Vec::new())
 }
@@ -49,9 +49,9 @@ The connector string is the same identifier `apply_crtc_config` already takes; c
 
 - **Cache (keyed by CONNECTOR, not crtc_id):** the backend owns a `HashMap<connector, GammaLut>` (`GammaLut = { red: Vec<u16>, green: Vec<u16>, blue: Vec<u16> }`). **Codex caught this:** yserver's stable identity is the *connector*; the DRM `Output.crtc` a connector lands on can change across re-enable/rediscovery (`backend.rs:204`, `platform.rs:2835`), so a `crtc_id`-keyed cache would orphan a connector's LUT or reapply it to the wrong monitor. Cache by connector; resolve connector → current `crtc_id` at apply/reapply time. Hardware state lives with the backend, alongside the cursor sprite cache — not in core. Cold path (gamma changes are human-paced), so the extra backend round-trip for `GetCrtcGamma` is irrelevant.
 - **`crtc_gamma_size`:** report the CRTC's real DRM `gamma_size` (the `drm` crate's CRTC info / `Crtc::gamma_length`). amdgpu legacy is typically 256; report whatever the kernel says so the client allocates the right array.
-- **`set_crtc_gamma`:** call the `drm` crate's legacy `set_gamma(crtc, &red, &green, &blue)`. On success, store the LUT in the cache keyed by the resolved `crtc_id`.
+- **`set_crtc_gamma`:** store the LUT in the cache **keyed by connector** (see cache-before-apply in Error handling — the cache update precedes the ioctl), then resolve connector → current `crtc_id` and call the `drm` crate's legacy `set_gamma(crtc, &red, &green, &blue)`. The cache is connector-keyed throughout; `crtc_id` is only a transient lookup at apply time.
 - **`get_crtc_gamma`:** return the cached LUT (clone).
-- **Seed:** seed a linear identity ramp of length `gamma_size` (`entry[i] = i * 65535 / (size-1)`) the first time a connector's gamma is queried/set, so `GetCrtcGamma` before any `SetCrtcGamma` returns Xorg-like identity rather than empty. **Inactive/unassigned connectors:** yserver keeps a stable per-connector CRTC id even when the output is off (`backend.rs:2592`); `GetCrtcGammaSize`/`GetCrtcGamma`/`SetCrtcGamma` must still answer for those — report the connector's nominal gamma size (fall back to 256 when no live CRTC to query), cache the ramp, and apply lazily when the connector next lights up. If a connector lands on a hardware CRTC whose `gamma_size` differs from the cached ramp's length, **resample** the cached ramp to the new size on reapply (don't discard the client's intent).
+- **Seed:** seed a linear identity ramp of length `gamma_size` (`entry[i] = i * 65535 / (size-1)`) the first time a connector's gamma is queried/set, so `GetCrtcGamma` before any `SetCrtcGamma` returns Xorg-like identity rather than empty. **Inactive/unassigned connectors:** yserver keeps a stable per-connector CRTC id even when the output is off (`backend.rs:2592`); `GetCrtcGammaSize`/`GetCrtcGamma`/`SetCrtcGamma` must still answer for those — report the connector's nominal gamma size (fall back to 256 when no live CRTC to query), cache the ramp, and apply lazily when the connector next lights up. If a connector lands on a hardware CRTC whose `gamma_size` differs from the cached ramp's length, **resample** the cached ramp to the new size on reapply (don't discard the client's intent). *Resample algorithm:* per channel, linear interpolation from `src_len` to `dst_len`, endpoints preserved (`dst[0]=src[0]`, `dst[dst_len-1]=src[src_len-1]`); for interior `i`, `pos = i * (src_len-1) / (dst_len-1)` (real), interpolate between `src[floor(pos)]` and `src[ceil(pos)]`, round to nearest `u16`. Degenerate cases: `dst_len==1` → `[src[0]]`; `src_len==1` → fill `dst` with `src[0]`.
 - **Reapply — single invariant:** *re-issue `set_gamma` from the cache (resolving connector → current crtc) immediately after every successful `commit_modeset`.* **Codex caught the redundancy:** `run_resume` already re-lights outputs via `dpms_set_outputs_active(true)` (`backend.rs:5038`), which itself commits a modeset — so there is no separate top-level resume hook. The two real `commit_modeset` sites are `enable_connector` (`platform.rs:2426`, covers RANDR modeset) and DPMS wake (`platform.rs:2721`, covers DPMS-wake *and* VT-switch resume). Ordering: reapply strictly **after** the commit succeeds (a pre-commit apply would be wiped by the modeset).
 
 ### 3. RANDR protocol handlers (`crates/yserver-core/src/core_loop/process_request.rs`)
@@ -60,12 +60,14 @@ The connector string is the same identifier `apply_crtc_config` already takes; c
 - **`RR_GET_CRTC_GAMMA`** (`:2459`): return `backend.get_crtc_gamma(connector)` as the reply ramp (replaces hardcoded empty). Invalid CRTC → `BadCrtc`. **Reply layout** (Xorg `rrcrtc.c:1693`): 32-byte reply header with `size`@byte 8, then one contiguous `3 × size` `u16` block (red, then green, then blue), zero-padded to a 4-byte boundary. `reply.length` (32-bit units) = `(3 × size × 2 + 3) >> 2` — spell this out exactly in the encoder.
 - **`RR_SET_CRTC_GAMMA`** (new dispatch arm): parse `crtc(4) size(2) pad(2)` then `3 × size` `u16` entries. **Error order must match Xorg `ProcRRSetCrtcGamma` (rrcrtc.c:1723) exactly** — codex corrected my earlier `BadValue`:
   1. invalid CRTC → `BadCrtc` (`VERIFY_RR_CRTC`).
-  2. CRTC is RANDR-leased → `BadAccess` (`RRCrtcIsLeased`). yserver has no lease support yet (RRCreateLease is a stopgap), so this is effectively never true today, but encode the check for parity.
-  3. body too short: `req_len - fixed < (size*3 + 1) >> 1` (32-bit units) → `BadLength`.
+  2. CRTC is RANDR-leased → `BadAccess` (`RRCrtcIsLeased`). yserver has no lease state yet (RRCreateLease is a stopgap), so back this with an explicit `crtc_is_leased(crtc) -> bool` helper that returns `false` today — a named seam to fill when real leases land, not an omitted check.
+  3. body too short → `BadLength`: `length_units - 3 < ((3 * size + 1) >> 1)` (the request's fixed part is 3 32-bit units — generic header + `crtc` + `size`/pad; this matches Xorg's `req_len - bytes_to_int32(sizeof(req))` check, rrcrtc.c:1736).
   4. `size != crtc gamma_size` → `BadMatch` (**not** `BadValue`).
 
   On success call `backend.set_crtc_gamma`. Void request (no reply).
-- **Wire plumbing:** add the `RR_SET_CRTC_GAMMA` request-length entry to `request_lengths.rs` (fixed `crtc(4) size(2) pad(2)` + the `3 × size` `u16` data array, padded to 32-bit units — exact unit accounting to be derived against the existing RANDR entries in the plan, not hand-computed here) and the `request_swap.rs` entry (the `3 × size` array byte-swaps as `u16`).
+- **Wire plumbing (codex corrected the location):**
+  - The `BadLength` size check belongs **inside this handler**, in the order above — *not* in `request_lengths.rs`. That core gate runs *before* extension dispatch (`process_request.rs:111`) and intentionally passes majors ≥128 through unchecked (`validate_core_request_length(128, …) == true`); putting the check there would fire `BadLength` before `BadCrtc`/`BadAccess`, diverging from Xorg's order. So: no `request_lengths.rs` change.
+  - **Byte-swap:** `request_swap.rs` currently has no RANDR table (only XI; `extension_request_swap_table` at `:51`). Add a RANDR (major **128**) entry for `RR_SET_CRTC_GAMMA`: `u32` at body offset 0 (`crtc`), `u16` at 4 (`size`), then a `u16[]` tail from offset 8. (Mirrors Xorg `rrsdispatch.c:325`, which swaps `crtc`, `size`, then the `CARD16` array.)
 
 ## Error handling
 
