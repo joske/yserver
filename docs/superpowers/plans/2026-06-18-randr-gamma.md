@@ -73,21 +73,21 @@ pub fn resample_channel(src: &[u16], dst_len: usize) -> Vec<u16> {
         return vec![src[0]; dst_len];
     }
     let src_max = src.len() - 1;
+    let denom = (dst_len - 1) as u64;
     (0..dst_len)
         .map(|i| {
-            // pos in [0, src_max], exact at the endpoints.
-            let num = i * src_max;
-            let lo = num / (dst_len - 1);
-            let rem = num % (dst_len - 1);
+            // pos in [0, src_max], exact at the endpoints. All-u64 so an
+            // arbitrary (not just gamma-domain) size can't overflow.
+            let num = i as u64 * src_max as u64;
+            let lo = (num / denom) as usize;
+            let rem = num % denom;
             if rem == 0 || lo >= src_max {
                 return src[lo.min(src_max)];
             }
             let a = u64::from(src[lo]);
             let b = u64::from(src[lo + 1]);
-            // a + (b-a) * rem/(dst_len-1), rounded to nearest. u64 intermediates.
-            let span = (dst_len - 1) as u64;
-            let rem = rem as u64;
-            let interp = (a * (span - rem) + b * rem + span / 2) / span;
+            // a + (b-a) * rem/(dst_len-1), rounded to nearest.
+            let interp = (a * (denom - rem) + b * rem + denom / 2) / denom;
             u16::try_from(interp).unwrap_or(u16::MAX)
         })
         .collect()
@@ -376,16 +376,18 @@ In `request_swap.rs` tests, add:
 ```rust
 #[test]
 fn randr_set_crtc_gamma_swaps_crtc_size_and_array() {
-    // body: crtc(4)=0x01020304, size(2)=0x0003, pad(2), then 3 u16 = 1,2,3
-    let mut body = vec![0x04, 0x03, 0x02, 0x01, 0x03, 0x00, 0x00, 0x00,
-                        0x01, 0x00, 0x02, 0x00, 0x03, 0x00];
+    // The swap layer converts an inbound BIG-ENDIAN client body into
+    // native (LE) form. So start with BE bytes (what a BE client sends:
+    // crtc=0x01020304, size=3, then 3 u16 = 1,2,3) and assert LE after.
+    let mut body = vec![0x01, 0x02, 0x03, 0x04, 0x00, 0x03, 0x00, 0x00,
+                        0x00, 0x01, 0x00, 0x02, 0x00, 0x03];
     swap_request_body(128, super::super::randr::RR_SET_CRTC_GAMMA, ClientByteOrder::BigEndian, &mut body);
-    // crtc swapped to BE
-    assert_eq!(&body[0..4], &[0x01, 0x02, 0x03, 0x04]);
-    // size swapped
-    assert_eq!(&body[4..6], &[0x00, 0x03]);
-    // array u16s swapped
-    assert_eq!(&body[8..14], &[0x00, 0x01, 0x00, 0x02, 0x00, 0x03]);
+    // crtc now native LE (0x01020304)
+    assert_eq!(&body[0..4], &[0x04, 0x03, 0x02, 0x01]);
+    // size now native LE (3)
+    assert_eq!(&body[4..6], &[0x03, 0x00]);
+    // array u16s now native LE (1,2,3)
+    assert_eq!(&body[8..14], &[0x01, 0x00, 0x02, 0x00, 0x03, 0x00]);
 }
 ```
 
@@ -475,6 +477,11 @@ fn rr_gamma_invalid_crtc_is_bad_value() {
     // GetCrtcGammaSize/GetCrtcGamma/SetCrtcGamma { crtc = 999 } -> BadValue
     // (matches sibling GetCrtcInfo convention).
 }
+#[test]
+fn rr_get_crtc_gamma_short_body_is_bad_length() {
+    // GetCrtcGammaSize / GetCrtcGamma with body shorter than crtc(4) ->
+    // BadLength (Xorg REQUEST_SIZE_MATCH), not BadValue.
+}
 ```
 
 Fill each test body using the same dispatch harness the existing RANDR tests use (construct the `RequestHeader { opcode: RANDR_MAJOR_OPCODE, data: <RR minor>, length_units }`, byte body, call the dispatcher, read the client buffer). For the error tests assert `bytes[0]==0` and `bytes[1]==x11::error::BAD_MATCH` / `BAD_LENGTH` / `BAD_VALUE`.
@@ -490,6 +497,12 @@ Replace the `RR_GET_CRTC_GAMMA_SIZE` arm (`:2451`):
 
 ```rust
         x11randr::RR_GET_CRTC_GAMMA_SIZE => {
+            // Xorg REQUEST_SIZE_MATCH: fixed body crtc(4) must be present
+            // → short request is BadLength, not BadValue (codex).
+            if body.len() < 4 {
+                return emit_x11_error_with_minor(state, client_id, sequence,
+                    x11::error::BAD_LENGTH, 0, u16::from(header.data), RANDR_MAJOR_OPCODE);
+            }
             let crtc = body
                 .get(0..4)
                 .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
@@ -512,6 +525,12 @@ Replace the `RR_GET_CRTC_GAMMA` arm (`:2459`):
 
 ```rust
         x11randr::RR_GET_CRTC_GAMMA => {
+            // Xorg REQUEST_SIZE_MATCH: fixed body crtc(4) must be present
+            // → short request is BadLength, not BadValue (codex).
+            if body.len() < 4 {
+                return emit_x11_error_with_minor(state, client_id, sequence,
+                    x11::error::BAD_LENGTH, 0, u16::from(header.data), RANDR_MAJOR_OPCODE);
+            }
             let crtc = body
                 .get(0..4)
                 .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
@@ -816,6 +835,7 @@ While a normal composited desktop is actively repainting (e.g. play a video or d
 
 - **Spec coverage:** trait methods (T2), KMS apply+cache+reapply (T6), connector-keyed cache (T6), error order BadValue/BadAccess/BadLength/BadMatch (T5 — BadCrtc→BadValue reconciliation documented in header), reply length formula (T3), swap entry (T4), identity seed + resample (T1/T6), persistence after commit_modeset (T6), redshift+VT-switch+pageflip smoke (T7). All covered.
 - **Type consistency:** `crtc_gamma_size`/`set_crtc_gamma`/`get_crtc_gamma` signatures identical across trait (T2), RecordingBackend (T2), KMS (T6); `identity_ramp`/`resample_channel` names consistent (T1) and consumed unchanged in T2/T6; `encode_get_crtc_gamma_reply(byte_order, sequence, &red,&green,&blue)` consistent T3↔T5.
-- **Codex plan review (1 pass) folded in:** u64 intermediates in the gamma math (T1); `fixed_reply(byte_order, sequence, 0, length_units)` arg order + `ClientByteOrder::LittleEndian`/`BigEndian` (T3/T4); Task 3 held back to commit with Task 5 so no non-building commit; fixed-size `BadLength` guard *before* reading crtc (T5); `crtc_gamma_size` returns a live CRTC's `0` honestly (T6); the three exact reapply call sites + run-on-Err (T6 S4); reconciliation rationale corrected (RANDR *does* have a `first_error`; we match the sibling-handler `BAD_VALUE` convention).
+- **Codex plan review pass 2 folded in:** added the fixed-size `BadLength` guard to both GET handlers (Xorg `REQUEST_SIZE_MATCH`; the generic gate doesn't cover extensions, so the in-handler guard is the only one); flipped the Task-4 swap test to the correct direction (BE-client input → native-LE output, since the swap layer converts inbound client bytes to native); made the resample `num`/`lo`/`rem` fully `u64` so the math is overflow-proof for any size, not just the gamma domain. Codex confirmed the pass-1 fixes are all real (fixed_reply arg order, commit-boundary, SetCrtcGamma fixed-body guard, live-`0` policy, the three reapply sites, key-clone borrow safety).
+- **Codex plan review (pass 1) folded in:** u64 intermediates in the gamma math (T1); `fixed_reply(byte_order, sequence, 0, length_units)` arg order + `ClientByteOrder::LittleEndian`/`BigEndian` (T3/T4); Task 3 held back to commit with Task 5 so no non-building commit; fixed-size `BadLength` guard *before* reading crtc (T5); `crtc_gamma_size` returns a live CRTC's `0` honestly (T6); the three exact reapply call sites + run-on-Err (T6 S4); reconciliation rationale corrected (RANDR *does* have a `first_error`; we match the sibling-handler `BAD_VALUE` convention).
 - **Confirmed real by codex:** `output.crtc` (`kms/backend.rs:390` / `drm/modeset.rs:77`), `self.platform.device` (`platform.rs:504`), `emit_x11_error_with_minor` (`process_request.rs:16065`), the error constants, `FieldEntry`/`FieldKind` variants, and the drm 0.15 `get_crtc`/`gamma_length()`/`set_gamma` APIs. `connector_gamma_target`/`gamma_cache`/`reapply_all_gamma` are intentionally new names this plan introduces.
 - **HW-verified (not unit-tested), flagged for the executor:** the resample-on-`gamma_size`-change *integration* (the pure resample is unit-tested in T1) and the partial-success DPMS-wake reapply — both exercised by the Task 7 smoke, not by `RecordingBackend`.
