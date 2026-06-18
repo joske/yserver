@@ -5358,6 +5358,56 @@ impl KmsBackendV2 {
     /// arrow over xfwm4 frame edges. Matches Xorg `dix/events.c`'s
     /// `XYToWindow` descent. The depth bound mirrors the cursor
     /// walk's 64.
+    /// Resolve the window under the cursor through the **same authority
+    /// the event fanout uses for delivery** — the core resource-tree
+    /// hit-test (`root_pointer_target_at`) over `shape_windows` — and map
+    /// it to a host XID for the existing crossing/motion emit machinery.
+    ///
+    /// This replaces the backend's parallel host-space hit-test
+    /// (`window_under_cursor` over `top_level_order`/`windows_v2` +
+    /// `core.shape_input`) as the crossing/motion *producer*. The two
+    /// disagreed on Cinnamon's Composite Overlay Window: the backend store
+    /// cannot represent an empty input region (`set_shape_rectangles`
+    /// removes the entry, which `cursor_inside_shape` reads as opaque),
+    /// while the core store keeps `Some([])` = click-through. So the
+    /// producer emitted Enter/Leave into the COW/stage subtree while
+    /// delivery (`root_pointer_target_at`) resolved the app beneath →
+    /// sloppy focus silently failed. Resolving the producer through the
+    /// same tree+coords as delivery makes the two agree by construction
+    /// (Xorg's single-sprite-trace model).
+    ///
+    /// `cursor_x`/`cursor_y` are cast to `i16` exactly as the emit path
+    /// stamps `root_x`/`root_y`, so the producer and the fanout's
+    /// `root_pointer_target_at(event.root_x, event.root_y)` see identical
+    /// inputs. Falls back to the root container when the cursor resolves to
+    /// the root window or the hit window has no host backing.
+    #[allow(clippy::cast_possible_truncation)]
+    fn resource_pointer_host_xid(&self, server_state: &ServerState) -> u32 {
+        let Some((mut resid, _, _)) = server_state
+            .root_pointer_target_at(self.core.cursor_x as i16, self.core.cursor_y as i16)
+        else {
+            return self.core.window_id;
+        };
+        // Walk up to the nearest host-backed window so a non-hosted
+        // sub-window resolves to the deepest *hosted* ancestor — matching
+        // the granularity of the host walk this replaces, rather than
+        // collapsing straight to the root container.
+        for _ in 0..256 {
+            if resid == yserver_core::resources::ROOT_WINDOW {
+                break;
+            }
+            let Some(w) = server_state.resources.window(resid) else {
+                break;
+            };
+            if let Some(h) = w.host_xid {
+                return h.as_raw();
+            }
+            resid = w.parent;
+        }
+        self.core.window_id
+    }
+
+    #[allow(dead_code)] // retained for A/B comparison vs the resource-tree producer + unit tests
     fn window_under_cursor(&self) -> Option<u32> {
         let cx = f64::from(self.core.cursor_x);
         let cy = f64::from(self.core.cursor_y);
@@ -5619,7 +5669,7 @@ impl KmsBackendV2 {
         // Fall back to the root container so root-window subscribers
         // (e16's right-click-desktop menu, fvwm3's root bindings) can
         // see motion when the cursor is over the wallpaper.
-        let host_xid = self.window_under_cursor().unwrap_or(self.core.window_id);
+        let host_xid = self.resource_pointer_host_xid(server_state);
         let mask = self.serialize_modifiers() | self.core.button_mask;
         log::trace!(
             target: "yserver::kms::v2::pointer",
@@ -5736,7 +5786,7 @@ impl KmsBackendV2 {
                 return;
             }
         };
-        let host_xid = self.window_under_cursor().unwrap_or(self.core.window_id);
+        let host_xid = self.resource_pointer_host_xid(server_state);
         let (event_x, event_y) = self.event_relative_coords(host_xid);
         let button_bit: u16 = match detail {
             1 => 0x0100,
