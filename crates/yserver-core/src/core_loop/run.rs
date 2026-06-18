@@ -444,7 +444,19 @@ pub fn run_core(
         // (project_reclamation_starvation_leak). No-op for backends without
         // GPU resources to reap.
         backend.before_block();
-        poll.poll(&mut events, poll_timeout)?;
+        // Retry on EINTR. A signal delivered while we're blocked in poll()
+        // surfaces as `ErrorKind::Interrupted` — notably SIGCONT and the
+        // VT/seat signals on resume-from-suspend. That is NOT fatal: re-poll.
+        // Propagating it `?` crashed yserver on wake from sleep (run_core
+        // returned EINTR → exit → drop to the display manager). Mirrors the
+        // Interrupted handling in `client_reader.rs`.
+        loop {
+            match poll.poll(&mut events, poll_timeout) {
+                Ok(()) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
         let iter_start = if telemetry.enabled {
             Some(Instant::now())
         } else {
