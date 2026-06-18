@@ -729,6 +729,32 @@ yserver-tfp-probe-hw log="warn":
         wait $yserver_pid 2>/dev/null;\
         rm -rf "$xdg_rd" 2>/dev/null'
 
+# Bring up yserver ALONE on :7 and run the XFIXES pointer-barrier smoke
+# client (tools/barrier-smoke.c) as the SOLE client. With no args it puts
+# a vertical barrier down the middle of the root window — on a symmetric
+# dual-head box that IS the monitor seam. Push the physical mouse against
+# the line: it should HOLD, BarrierHit events stream to stdout, and a firm
+# push past {{release}} px of pressure auto-releases (pointer crosses). Set
+# release=0 to test the pure trap (pointer never crosses). Pass explicit
+# geometry via args="X1 Y1 X2 Y2" or args="--horizontal". Run from a TTY
+# with DRM master. Diff stdout against the same binary under Xorg.
+# Release gate for the pointer-barriers feature (audit T13).
+yserver-barrier-smoke-hw log="info,yserver_core::barriers=trace" release="600" args="":
+    cargo build --release --bin yserver
+    gcc tools/barrier-smoke.c -lX11 -lXfixes -lXi -o ./barrier-smoke
+    bash -c '\
+        xdg_rd=$(mktemp -d -t yserver-run.XXXXXX); chmod 700 "$xdg_rd";\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-barrier.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        echo "=== barrier smoke (sole client) — push the mouse at the line ===";\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 \
+            XDG_RUNTIME_DIR="$xdg_rd" RELEASE="{{release}}" \
+            ./barrier-smoke {{args}} 2>&1 | tee barrier-smoke.out;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        rm -rf "$xdg_rd" 2>/dev/null'
+
 # xfce on yserver with x11trace recording the full X11 wire
 # protocol between clients and yserver. xfce-session connects to
 # the fake display `:8`; x11trace tunnels everything to yserver

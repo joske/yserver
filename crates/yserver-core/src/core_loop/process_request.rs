@@ -4090,6 +4090,13 @@ fn handle_xfixes_request(
                         last_timestamp: 0,
                     },
                 );
+                log::trace!(
+                    target: "yserver_core::barriers",
+                    "create barrier xid=0x{:x} window=0x{:x} ({x1},{y1})-({x2},{y2}) dirs={directions} -> {} active",
+                    req.barrier,
+                    req.window,
+                    state.pointer_barriers.len(),
+                );
             }
         }
         x11xfixes::DELETE_POINTER_BARRIER => {

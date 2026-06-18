@@ -124,6 +124,20 @@ pub fn pointer_event_fanout_to_state(
     // motion source is already encoded in the event kind/producer:
     // absolute device motion and warps are marked non-relative and
     // skip this block via `barrier_bypass`.
+    if !state.pointer_barriers.is_empty() && matches!(event.kind, PointerEventKind::MotionNotify) {
+        log::trace!(
+            target: "yserver_core::barriers",
+            "motion gate: barriers={} bypass={} confine_warp={} replay={} prev=({},{}) new=({},{})",
+            state.pointer_barriers.len(),
+            state.barrier_bypass,
+            state.confine_warp_active,
+            is_replay,
+            state.pointer_root.0,
+            state.pointer_root.1,
+            event.root_x,
+            event.root_y,
+        );
+    }
     if !is_replay
         && matches!(event.kind, PointerEventKind::MotionNotify)
         && !state.barrier_bypass
@@ -172,12 +186,25 @@ pub fn pointer_event_fanout_to_state(
             let mut cx = ox;
             let mut cy = oy;
             let mut dir = direction_of(cx, cy, nx, ny);
+            log::trace!(
+                target: "yserver_core::barriers",
+                "clamp scan: prev=({ox},{oy}) new=({nx},{ny}) dir={dir} candidates={}",
+                candidates.len(),
+            );
             while dir != 0 {
                 let Some((idx, _dist, geom)) =
                     find_nearest(&candidates, &seen, dir, cx, cy, nx, ny)
                 else {
+                    log::trace!(
+                        target: "yserver_core::barriers",
+                        "clamp scan: no blocking barrier for dir={dir} at ({cx},{cy})->({nx},{ny})",
+                    );
                     break;
                 };
+                log::trace!(
+                    target: "yserver_core::barriers",
+                    "clamp: barrier idx={idx} matched dir={dir}, clamping ({nx},{ny})",
+                );
                 seen.push(idx);
                 let barrier_xid = keys[idx];
                 let Some((barrier_window, barrier_owner, event_id, dtime)) =
@@ -232,12 +259,30 @@ pub fn pointer_event_fanout_to_state(
                 );
             }
 
+            // A clamp occurred iff the scan moved (nx,ny) off the raw
+            // post-motion position. Compare against the *incoming*
+            // event coords (still un-clamped here) — NOT (ox,oy), which
+            // is the previous position and so would be "different" on
+            // every ordinary motion, warping needlessly each frame.
+            let clamped = (nx, ny) != (i32::from(event.root_x), i32::from(event.root_y));
             #[allow(clippy::cast_possible_truncation)]
             {
+                // Shift the window-relative coords by the same delta the
+                // clamp applied to root. `translate_host_event` (run
+                // later, at the tail of this fn) re-derives
+                // `root = window.x + event_x`, so without shifting
+                // `event_x` it would overwrite the clamped root with the
+                // un-clamped value — leaving `pointer_root` past the
+                // wall, so the next motion segment never re-crosses the
+                // barrier (porous barrier; HW-observed 2026-06-18).
+                let ddx = nx - i32::from(event.root_x);
+                let ddy = ny - i32::from(event.root_y);
+                event.event_x = (i32::from(event.event_x) + ddx) as i16;
+                event.event_y = (i32::from(event.event_y) + ddy) as i16;
                 event.root_x = nx as i16;
                 event.root_y = ny as i16;
             }
-            if (nx, ny) != (ox, oy) && !state.confine_warp_active {
+            if clamped && !state.confine_warp_active {
                 state.confine_warp_active = true;
                 let prev = state.barrier_bypass;
                 state.barrier_bypass = true;
@@ -2228,6 +2273,58 @@ mod tests {
         );
         assert!(dropped.is_empty());
         assert_eq!(state.pointer_root, (99, 50));
+        assert_eq!(backend.warped_to, Some((99, 50)));
+    }
+
+    /// Regression (HW-observed 2026-06-18): the clamp moved only
+    /// `root_x`, but `translate_host_event` later re-derives
+    /// `root = window.x + event_x`. With the host window in `xid_map`
+    /// (the real path — the empty-map case above can't exercise it)
+    /// that overwrote the clamped root with the un-clamped value, so
+    /// `pointer_root` ended up *past* the wall and the next motion never
+    /// re-crossed it — a porous barrier. The clamp must shift `event_x`
+    /// by the same delta so the wall holds across translate.
+    #[test]
+    fn clamp_shifts_event_x_so_pointer_root_holds_across_translate() {
+        let mut state = ServerState::new();
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        state.pointer_barriers.insert(
+            0x0050_0001,
+            crate::server::PointerBarrier {
+                owner: ClientId(1),
+                window: ROOT_WINDOW,
+                x1: 100,
+                y1: 0,
+                x2: 100,
+                y2: 200,
+                directions: 0,
+                devices: Vec::new(),
+                hit: false,
+                seen: false,
+                event_id: 1,
+                release_event_id: 0,
+                last_timestamp: 0,
+            },
+        );
+        state.pointer_root = (90, 50);
+        // Map the host window so `translate_host_event` re-derives root
+        // from `event_x` — ROOT_WINDOW is at (0,0), so root == event_x.
+        let host_xid = 0x1234_u32;
+        let mut xid_map = HostXidMap::new();
+        xid_map.insert(host_xid, ROOT_WINDOW);
+        let mut ev = motion_event();
+        ev.host_xid = host_xid;
+        ev.root_x = 110;
+        ev.root_y = 50;
+        ev.event_x = 110;
+        ev.event_y = 50;
+        let _ = pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, ev, true, false);
+        // Pre-fix this was (110, 50): translate clobbered the clamp.
+        assert_eq!(
+            state.pointer_root,
+            (99, 50),
+            "pointer_root must hold at the wall (x1-1), not snap back past it"
+        );
         assert_eq!(backend.warped_to, Some((99, 50)));
     }
 

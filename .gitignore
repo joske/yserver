@@ -58,3 +58,5 @@ yserver-v2-*.txt
 # GLX TFP probe artifacts (tools/glx-tfp-probe.c build + run output)
 /tfp-probe
 /tfp-probe.out
+/barrier-smoke
+/barrier-smoke.out
