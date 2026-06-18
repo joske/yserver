@@ -13398,6 +13398,14 @@ fn handle_xi2_request(
                     minor,
                 );
             }
+            // Write the keysym rows into the shared override store the
+            // read paths (minor 24 / core opcode 101) merge over the
+            // backend keymap. Body: deviceid(1) firstKeyCode(1)
+            // keySymsPerKeyCode(1) keyCodes(1) then keyCodes×kpk CARD32s.
+            // Without this the round-trip silently dropped the change
+            // (XTS XChangeDeviceKeyMapping-3).
+            let kpk = *body.get(2).unwrap_or(&0);
+            store_keymap_overrides(state, first, kpk, count, &body[4.min(body.len())..]);
             // ChangeDeviceKeyMapping is void (no reply), so the event
             // ordering question is moot: send to originator + others.
             // request_kind=1 = MappingKeyboard.
@@ -21098,7 +21106,35 @@ fn handle_change_keyboard_mapping(
     // Store the keysym rows: body = first_keycode(1)
     // keysyms_per_keycode(1) pad(2) then count × kpk CARD32 keysyms.
     let kpk = body.get(1).copied().unwrap_or(0);
-    let syms = &body[4.min(body.len())..];
+    store_keymap_overrides(state, first_keycode, kpk, count, &body[4.min(body.len())..]);
+    // Server-wide MappingNotify fanout: every connected client sees the
+    // same keymap change. We collect ids first to avoid an &/&mut overlap
+    // through `state.clients`.
+    let targets: Vec<ClientId> = state.clients.keys().map(|id| ClientId(*id)).collect();
+    let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
+        let _ = x11::write_mapping_notify_event(buf, order, seq, 1, first_keycode, count);
+    });
+    debug!(
+        "client {} #{} ChangeKeyboardMapping",
+        client_id.0, sequence.0
+    );
+    Ok(RequestOutcome::Handled)
+}
+
+/// Install `count` keysym rows starting at `first_keycode` into
+/// `state.keymap_overrides`, each row `kpk` keysyms wide, read from
+/// `syms` as little-endian CARD32s (the wire is normalised to native
+/// byte order before reaching here). Shared by core `ChangeKeyboardMapping`
+/// (opcode 100) and XI1 `ChangeDeviceKeyMapping` (minor 25) — Xorg drives
+/// both through the same `XkbApplyMappingChange`, so the device map and the
+/// core map must stay one store.
+fn store_keymap_overrides(
+    state: &mut ServerState,
+    first_keycode: u8,
+    kpk: u8,
+    count: u8,
+    syms: &[u8],
+) {
     for i in 0..usize::from(count) {
         let mut row: Vec<u32> = Vec::with_capacity(usize::from(kpk));
         for j in 0..usize::from(kpk) {
@@ -21113,18 +21149,6 @@ fn handle_change_keyboard_mapping(
             .keymap_overrides
             .insert(first_keycode.wrapping_add(i as u8), row);
     }
-    // Server-wide MappingNotify fanout: every connected client sees the
-    // same keymap change. We collect ids first to avoid an &/&mut overlap
-    // through `state.clients`.
-    let targets: Vec<ClientId> = state.clients.keys().map(|id| ClientId(*id)).collect();
-    let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
-        let _ = x11::write_mapping_notify_event(buf, order, seq, 1, first_keycode, count);
-    });
-    debug!(
-        "client {} #{} ChangeKeyboardMapping",
-        client_id.0, sequence.0
-    );
-    Ok(RequestOutcome::Handled)
 }
 
 /// Fetch the merged keyboard mapping for keycodes `[first_keycode,
@@ -24727,6 +24751,82 @@ mod tests {
         let bytes = read_all_available(&mut peer);
         assert_eq!(bytes[0], 0, "error packet");
         assert_eq!(bytes[1], x11::error::BAD_MATCH, "BadMatch");
+    }
+
+    #[test]
+    fn xi_change_device_key_mapping_round_trips_via_get() {
+        // XI1 ChangeDeviceKeyMapping (minor 25) must write the same
+        // `keymap_overrides` rows that GetDeviceKeyMapping (minor 24) /
+        // core GetKeyboardMapping read back — Xorg drives both off the
+        // shared XkbGetCoreMap. Regression for the XTS
+        // `XChangeDeviceKeyMapping-3` round-trip that used to fail
+        // because minor 25 emitted MappingNotify but never stored.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        // ChangeDeviceKeyMapping { deviceid=3, first=10, kpk=2, count=2 }
+        // with fresh keysyms (distinct from any read-path defaults).
+        let mut body: Vec<u8> = vec![3, 10, 2, 2];
+        for k in [0x0078u32, 0x0058, 0x0079, 0x0059] {
+            body.extend_from_slice(&k.to_le_bytes());
+        }
+        let header = RequestHeader {
+            opcode: 137,
+            data: 25,
+            length_units: 2 + 2 * 2,
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &body,
+        )
+        .expect("change");
+        // Drain the MappingNotify the change fans out.
+        let _ = read_all_available(&mut peer);
+
+        // The override store now reflects the write.
+        assert_eq!(
+            state.keymap_overrides.get(&10),
+            Some(&vec![0x0078u32, 0x0058])
+        );
+        assert_eq!(
+            state.keymap_overrides.get(&11),
+            Some(&vec![0x0079u32, 0x0059])
+        );
+
+        // GetDeviceKeyMapping { deviceid=3, first=10, count=2 } surfaces it.
+        let header = RequestHeader {
+            opcode: 137,
+            data: 24,
+            length_units: 2,
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            header,
+            &[3u8, 10, 2, 0],
+        )
+        .expect("get");
+        let xi = read_all_available(&mut peer);
+        assert_eq!(xi[0], 1, "X_Reply");
+        assert_eq!(xi[1], 24, "RepType = X_GetDeviceKeyMapping");
+        let expect: Vec<u8> = [0x0078u32, 0x0058, 0x0079, 0x0059]
+            .iter()
+            .flat_map(|k| k.to_le_bytes())
+            .collect();
+        assert_eq!(
+            &xi[32..32 + expect.len()],
+            &expect[..],
+            "written keysyms read back"
+        );
     }
 
     #[test]
