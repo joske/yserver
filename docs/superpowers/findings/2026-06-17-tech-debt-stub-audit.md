@@ -88,3 +88,48 @@ SHAPE (all 0–8), DAMAGE (all 0–4), DPMS (all 0–7 + SelectInput), BIG-REQUE
 3. XFIXES barriers (you *advertise* v5 for Mutter).
 4. GrabServer (core contract).
 5. X-Resource queries (data exists, easy win for tooling).
+
+## Re-prioritised under the Xorg-baseline lens (2026-06-18)
+
+**New constraint (learned the hard way):** real Xorg on a TTY does NOT pass
+XTS 100% — the XI suite alone fails ~47/316 cases on stock Xorg, the same
+cases yserver "fails" (64-bit `KeySym` marshalling, deprecated XI 1.x).
+See [[reference_xorg_not_100pct_on_xts_xi]]. So the target is *matching Xorg's
+real-client behaviour*, NOT an XTS pass count. Before touching anything an
+XTS case flags, diff against an Xorg baseline (`tools/xts-vs-baseline.py`) to
+confirm it's winnable. Verify fixes with a real app / against Xorg, not xts.
+
+**Where we CAN make a difference (real client breaks today, verifiable, backend can deliver, self-contained):**
+
+1. **RANDR gamma** (Tier 4) — *standout.* `redshift` / `gammastep` / GNOME
+   Night Light are flatly broken (`GetCrtcGammaSize`=0). Self-contained:
+   report a real LUT size, read current gamma, apply `SetCrtcGamma` via KMS
+   (`drmModeCrtcSetGamma` / atomic `GAMMA_LUT`). Verify: run redshift, screen
+   warms. Highest impact-to-effort of the lot.
+2. **GrabServer / UngrabServer** (Tier 3) — real WM menu / screensaver
+   atomicity. yserver is single-core, so a server grab = stop dispatching
+   *other* clients' requests until ungrab (+ auto-ungrab on grab-client
+   disconnect). Tractable, core-correct. Verify: WM menu behaviour vs Xorg.
+3. **RANDR output properties — EDID** (Tier 4) — `autorandr`, `arandr`, colour
+   tools read EDID; the KMS backend already has the blob. Exposing the EDID
+   property is concrete; backlight/scaling-mode can follow.
+4. **RENDER CreateConicalGradient + AddTraps** (Tier 4) — register the picture
+   XID (downstream Composite currently fails the lookup silently) and
+   rasterise. Real cairo/GTK content. The v2 Vulkan backend already does
+   trapezoids/gradients, so AddTraps/conical are incremental.
+
+**Real but bigger / parked:** XKB `Set*` (runtime layout switch — large XKB
+surface), MIT-SHM live shared pixmaps (OBS XSHM), SYNC blocking Await, PRESENT
+flip path, DRI3 multi-plane, GLX TFP / RENDER convolution (no consumer reaches
+them yet).
+
+**Robustness track (separate):** a focused pass on the `.unwrap()/.expect()`
+sites *reachable from client-controlled input* (Tier 5) — a buggy/hostile
+client crashing the server is itself an Xorg divergence (Xorg is hardened).
+Scope to the client-input-reachable subset, not all 2,381.
+
+**Do NOT chase (XTS-only where Xorg also fails, or needs a model decision):**
+XINERAMA `GetScreenSize`, XI1 `GetSelectedExtensionEvents`, XTEST
+`CompareCursor`/`GrabControl`, the faked XI device topology (deliberately
+non-zero to dodge the VSCode `ndevices=0` crash), `GetMotionEvents`
+empty-history (Xorg-compatible by design), MIT-SCREEN-SAVER `SetAttributes`.
