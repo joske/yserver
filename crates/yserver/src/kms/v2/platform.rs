@@ -1247,6 +1247,54 @@ impl PlatformBackend {
         Ok(ebusy_count)
     }
 
+    /// True iff the set of CRTCs whose region the cursor footprint
+    /// intersects differs from the set the plane is currently bound on
+    /// (`is_visible_on`).
+    ///
+    /// The pointer fast path (`cursor_plane_move`) only *repositions*
+    /// the cursor on already-bound CRTCs — it never shows the plane on
+    /// a CRTC the pointer newly crosses into, nor hides it on one it
+    /// leaves. Cross-CRTC show/hide is decided by the scene's
+    /// `CursorAssignment` during compose. While an idle desktop
+    /// composited every frame (pre-#30) that reassignment happened for
+    /// free; now that idle desktops stop compositing, the fast path
+    /// must detect a boundary crossing and route it through one compose
+    /// tick. This predicate is that detector, using the same footprint
+    /// intersection rule as `cursor_footprint_rect` so its membership
+    /// decision matches the scene's exactly.
+    ///
+    /// `(x, y)` is the root-space cursor position, `(hot_x, hot_y)` the
+    /// sprite hotspot, `(cw, ch)` the sprite extent.
+    pub(crate) fn cursor_crtc_membership_dirty(
+        &self,
+        x: i32,
+        y: i32,
+        hot_x: u16,
+        hot_y: u16,
+        cw: i32,
+        ch: i32,
+    ) -> bool {
+        let Some(plane) = self.cursor_plane.as_ref() else {
+            return false;
+        };
+        for l in &self.outputs {
+            let dx = x - i32::from(hot_x) - l.x;
+            let dy = y - i32::from(hot_y) - l.y;
+            let intersects = cursor_footprint_intersects_output(
+                dx,
+                dy,
+                cw,
+                ch,
+                i32::from(l.width),
+                i32::from(l.height),
+            );
+            if intersects != plane.is_visible_on(l.output.crtc) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Detach the plane on a single CRTC. Output-local recovery
     /// (Phase D') uses this; the per-CRTC visibility map updates
     /// so subsequent rebind / move calls skip the CRTC cleanly.
@@ -2950,6 +2998,15 @@ fn cursor_root_to_crtc_local(
     )
 }
 
+/// Whether the cursor footprint `[dx, dx+cw) × [dy, dy+ch)` (in
+/// output-local coordinates) overlaps the output's `[0, w) × [0, h)`
+/// region. This is the boolean form of `cursor_footprint_rect`'s
+/// non-empty condition, kept in sync so `cursor_crtc_membership_dirty`
+/// decides on-output membership exactly as the scene does.
+fn cursor_footprint_intersects_output(dx: i32, dy: i32, cw: i32, ch: i32, w: i32, h: i32) -> bool {
+    dx < w && dx + cw > 0 && dy < h && dy + ch > 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3113,6 +3170,39 @@ mod tests {
             cursor_root_to_crtc_local(200, 300, 10, 20, 7, 9),
             (183, 271)
         );
+    }
+
+    /// `cursor_footprint_intersects_output` is the membership rule the
+    /// pointer fast path uses to detect a CRTC-boundary crossing
+    /// (regression: cursor stayed frozen on screen 1, invisible on
+    /// screen 2, once the idle compositor stopped reassigning it).
+    /// Modelled on a side-by-side dual-head layout: left [0,0,2560,1440],
+    /// right [2560,0,2560,1440], a 64×64 sprite, hotspot (0,0).
+    #[test]
+    fn cursor_footprint_intersects_output_dual_head_seam() {
+        // root-space x relative to each output's origin (hotspot 0).
+        let on_left =
+            |rx: i32, ry: i32| cursor_footprint_intersects_output(rx, ry, 64, 64, 2560, 1440);
+        let on_right = |rx: i32, ry: i32| {
+            cursor_footprint_intersects_output(rx - 2560, ry, 64, 64, 2560, 1440)
+        };
+
+        // Fully on the left screen.
+        assert!(on_left(100, 100));
+        assert!(!on_right(100, 100));
+
+        // Fully on the right screen.
+        assert!(!on_left(3000, 100));
+        assert!(on_right(3000, 100));
+
+        // Straddling the seam — present on BOTH screens (matches the
+        // scene clipping a 64px sprite onto both outputs).
+        assert!(on_left(2540, 100));
+        assert!(on_right(2540, 100));
+
+        // Below both outputs (y past height) — on neither.
+        assert!(!on_left(100, 2000));
+        assert!(!on_right(3000, 2000));
     }
 
     /// `invalidate_bo` on a missing entry is a no-op (doesn't

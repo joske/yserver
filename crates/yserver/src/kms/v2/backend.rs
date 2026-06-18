@@ -5638,15 +5638,41 @@ impl KmsBackendV2 {
                 let cx = new_x as i32;
                 #[allow(clippy::cast_possible_truncation)]
                 let cy = new_y as i32;
-                let (hot_x, hot_y) = self
+                let (hot_x, hot_y, cw, ch) = self
                     .effective_cursor_xid
                     .and_then(|xid| self.cursor_records.get(&xid))
-                    .map(|rec| (rec.hot_x, rec.hot_y))
-                    .unwrap_or((0, 0));
-                match self.platform.cursor_plane_move(cx, cy, hot_x, hot_y) {
-                    Ok(0) => {}
-                    Ok(n) => self.telemetry.record_cursor_move_ebusy(u64::from(n)),
-                    Err(e) => log::debug!("v2 cursor fast path: move failed: {e}"),
+                    .map(|rec| {
+                        (
+                            rec.hot_x,
+                            rec.hot_y,
+                            i32::from(rec.width),
+                            i32::from(rec.height),
+                        )
+                    })
+                    .unwrap_or((0, 0, 0, 0));
+                if cw > 0
+                    && ch > 0
+                    && self
+                        .platform
+                        .cursor_crtc_membership_dirty(cx, cy, hot_x, hot_y, cw, ch)
+                {
+                    // The cursor footprint crossed onto/off a CRTC the
+                    // plane isn't bound to. The move-only fast path
+                    // can't rebind across CRTCs, so route this motion
+                    // through one compose tick — the scene's
+                    // `CursorAssignment` then issues the show/hide on
+                    // retire. Pre-#30 the continuous idle redraw loop
+                    // masked this; idle desktops now stop compositing,
+                    // so the seam crossing must be detected here or the
+                    // cursor stays frozen on the CRTC it was last bound
+                    // to (invisible on the screen it moved onto).
+                    self.scene.wake_for_damage();
+                } else {
+                    match self.platform.cursor_plane_move(cx, cy, hot_x, hot_y) {
+                        Ok(0) => {}
+                        Ok(n) => self.telemetry.record_cursor_move_ebusy(u64::from(n)),
+                        Err(e) => log::debug!("v2 cursor fast path: move failed: {e}"),
+                    }
                 }
             } else {
                 self.scene.wake_for_damage();
