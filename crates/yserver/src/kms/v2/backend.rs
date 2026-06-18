@@ -27,7 +27,7 @@ use yserver_core::{
     backend::{
         AnyHandle, Backend, BackendFdKind, ClipState, CursorHandle, DrawState, Dri3Caps,
         Dri3PixmapExport, FillState, FontHandle, GlyphSetHandle, OriginContext, PictureHandle,
-        PixmapHandle, PresentCaps, WindowHandle,
+        PixmapHandle, PresentCaps, WindowHandle, identity_ramp, resample_channel,
     },
     core_loop::HostInputEvent,
     host_x11::{
@@ -193,6 +193,37 @@ pub(crate) struct ConnectorEntry {
     /// preferred-first. Retained across disconnect so a momentarily-gone
     /// monitor keeps reporting its modes until reconnect refreshes them.
     pub modes: Vec<(u16, u16, u32, bool)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GammaLut {
+    red: Vec<u16>,
+    green: Vec<u16>,
+    blue: Vec<u16>,
+}
+
+impl GammaLut {
+    fn identity(size: u16) -> Self {
+        let ramp = identity_ramp(size);
+        Self {
+            red: ramp.clone(),
+            green: ramp.clone(),
+            blue: ramp,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.red.len()
+    }
+
+    fn resampled(&self, size: u16) -> Self {
+        let dst_len = usize::from(size);
+        Self {
+            red: resample_channel(&self.red, dst_len),
+            green: resample_channel(&self.green, dst_len),
+            blue: resample_channel(&self.blue, dst_len),
+        }
+    }
 }
 
 impl RandrIdAllocator {
@@ -521,6 +552,7 @@ pub struct KmsBackendV2 {
     libinput_hotplug_retry_until: Option<std::time::Instant>,
     randr_id_alloc: RandrIdAllocator,
     hotplug_rescan_deadline: Option<std::time::Instant>,
+    gamma_luts: RefCell<HashMap<String, GammaLut>>,
 
     /// GLX-TFP (Tasks 2.3 + 2.4): per-`DrawableId` export tracking for
     /// pixmaps shared with a GL consumer via `GLX_EXT_texture_from_pixmap`.
@@ -936,6 +968,7 @@ impl KmsBackendV2 {
             libinput_hotplug_retry_until: None,
             randr_id_alloc: RandrIdAllocator::default(),
             hotplug_rescan_deadline: None,
+            gamma_luts: RefCell::new(HashMap::new()),
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported,
         };
@@ -1076,6 +1109,7 @@ impl KmsBackendV2 {
             libinput_hotplug_retry_until: None,
             randr_id_alloc: RandrIdAllocator::default(),
             hotplug_rescan_deadline: None,
+            gamma_luts: RefCell::new(HashMap::new()),
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported,
         };
@@ -1892,6 +1926,7 @@ impl KmsBackendV2 {
             libinput_hotplug_retry_until: None,
             randr_id_alloc: RandrIdAllocator::default(),
             hotplug_rescan_deadline: None,
+            gamma_luts: RefCell::new(HashMap::new()),
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported: false,
         }
@@ -5055,6 +5090,7 @@ impl KmsBackendV2 {
         if let Err(e) = self.platform.dpms_set_outputs_active(true) {
             log::warn!("kms: resume: re-light modeset failed for an output: {e}; continuing");
         }
+        self.reapply_gamma_for_live_outputs();
 
         // 2b. DPMS: every output was just re-lit, so reconcile the backend
         //     cache. state.dpms.power_level was reset to On in run_suspend;
@@ -9119,6 +9155,105 @@ impl KmsBackendV2 {
             }
         }
     }
+
+    fn live_crtc_and_gamma_size(
+        &self,
+        connector: &str,
+    ) -> io::Result<Option<(::drm::control::crtc::Handle, u16)>> {
+        use ::drm::control::Device as ControlDevice;
+
+        let Some(layout) = self
+            .platform
+            .outputs
+            .iter()
+            .find(|layout| layout.output.connector_name == connector)
+        else {
+            return Ok(None);
+        };
+        let crtc = layout.output.crtc;
+        let info = self.platform.device.get_crtc(crtc).map_err(|e| {
+            io::Error::other(format!("get_crtc gamma size for {connector} failed: {e}"))
+        })?;
+        let size = u16::try_from(info.gamma_length()).unwrap_or(u16::MAX);
+        Ok(Some((crtc, size)))
+    }
+
+    fn nominal_gamma_size(&self, connector: &str) -> u16 {
+        match self.live_crtc_and_gamma_size(connector) {
+            Ok(Some((_, size))) => size,
+            Ok(None) => self
+                .gamma_luts
+                .borrow()
+                .get(connector)
+                .map(|lut| u16::try_from(lut.len()).unwrap_or(u16::MAX))
+                .unwrap_or(256),
+            Err(e) => {
+                log::warn!("kms gamma: {connector} gamma-size query failed: {e}");
+                self.gamma_luts
+                    .borrow()
+                    .get(connector)
+                    .map(|lut| u16::try_from(lut.len()).unwrap_or(u16::MAX))
+                    .unwrap_or(0)
+            }
+        }
+    }
+
+    fn cached_gamma(&self, connector: &str) -> GammaLut {
+        if let Some(lut) = self.gamma_luts.borrow().get(connector).cloned() {
+            return lut;
+        }
+        let lut = GammaLut::identity(self.nominal_gamma_size(connector));
+        self.gamma_luts
+            .borrow_mut()
+            .insert(connector.to_string(), lut.clone());
+        lut
+    }
+
+    fn cached_gamma_for_current_size(&self, connector: &str, size: u16) -> GammaLut {
+        let lut = self.cached_gamma(connector);
+        if lut.len() == usize::from(size) {
+            return lut;
+        }
+        let resampled = lut.resampled(size);
+        self.gamma_luts
+            .borrow_mut()
+            .insert(connector.to_string(), resampled.clone());
+        resampled
+    }
+
+    fn apply_gamma_to_live_connector(&self, connector: &str) -> io::Result<()> {
+        use ::drm::control::Device as ControlDevice;
+
+        let Some((crtc, gamma_size)) = self.live_crtc_and_gamma_size(connector)? else {
+            return Ok(());
+        };
+        if gamma_size == 0 {
+            return Ok(());
+        }
+        let lut = self.cached_gamma_for_current_size(connector, gamma_size);
+        self.platform
+            .device
+            .set_gamma(crtc, &lut.red, &lut.green, &lut.blue)
+            .map_err(|e| io::Error::other(format!("set_gamma for {connector} failed: {e}")))
+    }
+
+    fn reapply_gamma_for_connector(&self, connector: &str) {
+        if let Err(e) = self.apply_gamma_to_live_connector(connector) {
+            log::warn!("kms gamma: reapply for {connector} failed: {e}");
+        }
+    }
+
+    fn reapply_gamma_for_live_outputs(&self) {
+        let connectors: Vec<String> = self
+            .platform
+            .outputs
+            .iter()
+            .map(|layout| layout.output.connector_name.clone())
+            .collect();
+        for connector in connectors {
+            self.reapply_gamma_for_connector(&connector);
+        }
+    }
 }
 
 impl Backend for KmsBackendV2 {
@@ -9154,6 +9289,52 @@ impl Backend for KmsBackendV2 {
 
     fn composite_opcode(&self) -> Option<u8> {
         Some(144)
+    }
+
+    fn crtc_gamma_size(&self, connector: &str) -> u16 {
+        self.nominal_gamma_size(connector)
+    }
+
+    fn set_crtc_gamma(
+        &mut self,
+        connector: &str,
+        red: &[u16],
+        green: &[u16],
+        blue: &[u16],
+    ) -> io::Result<()> {
+        let expected = usize::from(self.crtc_gamma_size(connector));
+        if red.len() != expected || green.len() != expected || blue.len() != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "connector {connector}: gamma length mismatch (expected {expected}, got {}/{}/{})",
+                    red.len(),
+                    green.len(),
+                    blue.len(),
+                ),
+            ));
+        }
+        self.gamma_luts.borrow_mut().insert(
+            connector.to_string(),
+            GammaLut {
+                red: red.to_vec(),
+                green: green.to_vec(),
+                blue: blue.to_vec(),
+            },
+        );
+        self.apply_gamma_to_live_connector(connector)
+    }
+
+    fn get_crtc_gamma(&self, connector: &str) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+        let lut = match self.live_crtc_and_gamma_size(connector) {
+            Ok(Some((_, size))) => self.cached_gamma_for_current_size(connector, size),
+            Ok(None) => self.cached_gamma(connector),
+            Err(e) => {
+                log::warn!("kms gamma: {connector} get gamma size failed: {e}");
+                self.cached_gamma(connector)
+            }
+        };
+        (lut.red, lut.green, lut.blue)
     }
 
     fn render_format_for_ynest_id(&self, ynest_fmt: u32) -> Option<u32> {
@@ -10059,6 +10240,7 @@ impl Backend for KmsBackendV2 {
                     let _ = self.scene.rebuild_outputs(&self.platform);
                     return Err(e);
                 }
+                self.reapply_gamma_for_connector(connector);
 
                 // Update registry.
                 {
@@ -16339,6 +16521,7 @@ impl Backend for KmsBackendV2 {
             // kms_outputs_active=false and re-attempts (idempotent on
             // the outputs that already came up).
             let res = self.platform.dpms_set_outputs_active(true);
+            self.reapply_gamma_for_live_outputs();
             let (hot_x, hot_y) = self
                 .effective_cursor_xid
                 .and_then(|xid| self.cursor_records.get(&xid))
@@ -16828,6 +17011,28 @@ mod tests {
         // server-local ARGB ids so CreateWindow can preserve depth 32.
         assert_eq!(b.argb_visual_xid(), Some(0x103));
         assert_eq!(b.argb_colormap_xid(), Some(0x104));
+    }
+
+    #[test]
+    fn kms_gamma_off_connector_seeds_identity_ramp_at_256() {
+        let b = KmsBackendV2::for_tests();
+        assert_eq!(b.crtc_gamma_size("DP-1"), 256);
+        let (red, green, blue) = b.get_crtc_gamma("DP-1");
+        assert_eq!(red.len(), 256);
+        assert_eq!(red[0], 0);
+        assert_eq!(red[255], 65535);
+        assert_eq!((green[255], blue[255]), (65535, 65535));
+    }
+
+    #[test]
+    fn kms_gamma_off_connector_set_roundtrips_cached_values() {
+        let mut b = KmsBackendV2::for_tests();
+        let red = vec![1u16; 256];
+        let green = vec![2u16; 256];
+        let blue = vec![3u16; 256];
+        b.set_crtc_gamma("DP-1", &red, &green, &blue)
+            .expect("set gamma cache");
+        assert_eq!(b.get_crtc_gamma("DP-1"), (red, green, blue));
     }
 
     /// Spec: "the first paint op produces a logged 'v2 not yet

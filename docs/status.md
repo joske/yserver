@@ -127,6 +127,16 @@ Cross-cutting bugs and followups that don't fit a stage live in
   change fanout on topology updates. Validation so far:
   `cargo test -p yserver-core --locked randr` and
   `cargo check -p yserver --locked`.
+- **2026-06-18 RANDR CRTC gamma**: `GetCrtcGammaSize`,
+  `GetCrtcGamma`, and `SetCrtcGamma` are now wired through
+  `yserver-core` into new `Backend` gamma hooks, the protocol crate
+  emits full RGB LUT replies and swaps `RR_SET_CRTC_GAMMA` for
+  big-endian clients, and the KMS backend now keeps a connector-keyed
+  gamma cache applied through the legacy DRM `set_gamma` ioctl and
+  re-applied after output re-light / modeset paths. `RecordingBackend`
+  and KMS unit coverage exercise identity seeding, round-trip cache
+  updates, and RANDR request validation. Hardware smoke for
+  `redshift`/VT-switch persistence is still pending.
 - **2026-06-08 COW architectural reset**: the active Cinnamon blocker
   is now treated as a structural COW/model bug, not another
   scene-assembly edge case. Replacement design doc:

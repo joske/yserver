@@ -137,6 +137,8 @@ pub enum RecordedCall {
     },
 }
 
+type GammaTriplet = (Vec<u16>, Vec<u16>, Vec<u16>);
+
 /// Test double for `Backend`. Auto-allocates host xids from a private
 /// counter so create-then-destroy round trips read back the same xid.
 pub struct RecordingBackend {
@@ -205,6 +207,8 @@ pub struct RecordingBackend {
     /// Last `warp_pointer_root` call target; `None` if never called.
     /// Tests assert a screen shrink warps a stranded cursor into bounds.
     pub warped_to: Option<(i32, i32)>,
+    /// In-memory per-connector gamma LUT for unit tests (size 256).
+    pub gamma: std::cell::RefCell<std::collections::HashMap<String, GammaTriplet>>,
 }
 
 impl Default for RecordingBackend {
@@ -232,6 +236,7 @@ impl RecordingBackend {
             probe_rounds: std::collections::VecDeque::new(),
             probe_rounds_run: std::cell::Cell::new(0),
             warped_to: None,
+            gamma: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -326,6 +331,32 @@ impl Backend for RecordingBackend {
     fn before_block(&mut self) {
         self.before_block_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn crtc_gamma_size(&self, _connector: &str) -> u16 {
+        256
+    }
+
+    fn set_crtc_gamma(
+        &mut self,
+        connector: &str,
+        red: &[u16],
+        green: &[u16],
+        blue: &[u16],
+    ) -> io::Result<()> {
+        self.gamma.borrow_mut().insert(
+            connector.to_string(),
+            (red.to_vec(), green.to_vec(), blue.to_vec()),
+        );
+        Ok(())
+    }
+
+    fn get_crtc_gamma(&self, connector: &str) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+        if let Some(lut) = self.gamma.borrow().get(connector) {
+            return lut.clone();
+        }
+        let ramp = crate::backend::gamma::identity_ramp(256);
+        (ramp.clone(), ramp.clone(), ramp)
     }
 
     fn probe_input_devices(&mut self, state: &mut crate::server::ServerState) -> usize {
@@ -1510,5 +1541,25 @@ mod tests {
             calls.last().unwrap(),
             RecordedCall::UnregisterHostWindow(h) if *h == host_xid
         ));
+    }
+
+    #[test]
+    fn recording_backend_gamma_roundtrip_and_seed() {
+        let mut backend = RecordingBackend::new();
+        assert_eq!(backend.crtc_gamma_size("DP-1"), 256);
+
+        let (red, green, blue) = backend.get_crtc_gamma("DP-1");
+        assert_eq!(red.len(), 256);
+        assert_eq!(red[0], 0);
+        assert_eq!(red[255], 65535);
+        assert_eq!((green[255], blue[255]), (65535, 65535));
+
+        let red = vec![1u16; 256];
+        let green = vec![2u16; 256];
+        let blue = vec![3u16; 256];
+        backend
+            .set_crtc_gamma("DP-1", &red, &green, &blue)
+            .expect("set_crtc_gamma");
+        assert_eq!(backend.get_crtc_gamma("DP-1"), (red, green, blue));
     }
 }

@@ -50,11 +50,43 @@ pub fn swap_request_body(major: u8, minor: u8, byte_order: ClientByteOrder, body
 /// that no xts5 BE-byte-sex tests exercise yet).
 const fn extension_request_swap_table(major: u8, minor: u8) -> Option<&'static [FieldEntry]> {
     match major {
+        // RANDR extension (major fixed at 128 in
+        // `process_request::RANDR_MAJOR_OPCODE`).
+        128 => randr_request_swap_table(minor),
         // XInput extension (major fixed at 137 in
         // `process_request::XI2_MAJOR_OPCODE`).
         137 => xi_request_swap_table(minor),
         _ => None,
     }
+}
+
+const fn randr_request_swap_table(minor: u8) -> Option<&'static [FieldEntry]> {
+    use FieldEntry::{ElementArrayTail, Fixed};
+    use FieldKind::{U16, U32};
+
+    macro_rules! u32f {
+        ($off:expr) => {
+            Fixed {
+                offset: $off,
+                kind: U32,
+            }
+        };
+    }
+    macro_rules! u16f {
+        ($off:expr) => {
+            Fixed {
+                offset: $off,
+                kind: U16,
+            }
+        };
+    }
+
+    Some(match minor {
+        super::randr::RR_SET_CRTC_GAMMA => {
+            &[u32f!(0), u16f!(4), ElementArrayTail { from: 8, kind: U16 }]
+        }
+        _ => return None,
+    })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -729,5 +761,27 @@ mod tests {
         let original = body.clone();
         swap_request_body(140, 0, ClientByteOrder::BigEndian, &mut body);
         assert_eq!(body, original);
+    }
+
+    #[test]
+    fn randr_set_crtc_gamma_swaps_crtc_size_and_tail() {
+        let mut body = vec![
+            0x00, 0x00, 0x00, 0x02, // crtc = 2 in BE
+            0x00, 0x02, // size = 2 in BE
+            0x00, 0x00, // pad
+            0x00, 0x01, 0x00, 0x02, // red
+            0x00, 0x03, 0x00, 0x04, // green
+            0x00, 0x05, 0x00, 0x06, // blue
+        ];
+        swap_request_body(
+            128,
+            crate::x11::randr::RR_SET_CRTC_GAMMA,
+            ClientByteOrder::BigEndian,
+            &mut body,
+        );
+        assert_eq!(u32::from_le_bytes([body[0], body[1], body[2], body[3]]), 2);
+        assert_eq!(u16::from_le_bytes([body[4], body[5]]), 2);
+        assert_eq!(u16::from_le_bytes([body[8], body[9]]), 1);
+        assert_eq!(u16::from_le_bytes([body[18], body[19]]), 6);
     }
 }

@@ -1,6 +1,7 @@
 //! Backend abstraction. Currently `HostX11Backend` is the sole impl;
 //! Phase 6.3+ will add a KMS backend.
 
+pub mod gamma;
 pub mod handles;
 pub mod params;
 mod trait_def;
@@ -8,6 +9,7 @@ mod trait_def;
 #[cfg(test)]
 pub mod recording;
 
+pub use gamma::{identity_ramp, resample_channel};
 pub use handles::{
     AnyHandle, ColormapHandle, CursorHandle, FontHandle, GlyphSetHandle, HandleKind, PictureHandle,
     PixmapHandle, VisualHandle, WindowHandle,

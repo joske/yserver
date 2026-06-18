@@ -50,6 +50,7 @@ pub const RR_GET_CRTC_INFO: u8 = 20;
 pub const RR_SET_CRTC_CONFIG: u8 = 21;
 pub const RR_GET_CRTC_GAMMA_SIZE: u8 = 22;
 pub const RR_GET_CRTC_GAMMA: u8 = 23;
+pub const RR_SET_CRTC_GAMMA: u8 = 24;
 pub const RR_GET_SCREEN_RESOURCES_CURRENT: u8 = 25;
 pub const RR_GET_CRTC_TRANSFORM: u8 = 27;
 pub const RR_GET_PANNING: u8 = 28;
@@ -138,6 +139,11 @@ pub struct CrtcRequest {
     pub config_timestamp: u32,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct CrtcIdRequest {
+    pub crtc: u32,
+}
+
 #[derive(Debug, PartialEq)]
 pub struct SelectInputRequest {
     pub window: u32,
@@ -201,6 +207,15 @@ pub fn parse_crtc_request(body: &[u8]) -> Option<CrtcRequest> {
     Some(CrtcRequest {
         crtc: read_u32_le(body),
         config_timestamp: read_u32_le(&body[4..]),
+    })
+}
+
+pub fn parse_crtc_id_request(body: &[u8]) -> Option<CrtcIdRequest> {
+    if body.len() < 4 {
+        return None;
+    }
+    Some(CrtcIdRequest {
+        crtc: read_u32_le(body),
     })
 }
 
@@ -764,18 +779,29 @@ pub fn encode_get_crtc_gamma_size_reply(
     out
 }
 
-/// Encodes a `GetCrtcGamma` reply (32 bytes when `size` = 0; no gamma arrays).
+/// Encodes a `GetCrtcGamma` reply as a 32-byte fixed header followed by
+/// `red`, `green`, then `blue` `CARD16` arrays, padded to 4 bytes.
 pub fn encode_get_crtc_gamma_reply(
     byte_order: ClientByteOrder,
     sequence: SequenceNumber,
-    size: u16,
+    red: &[u16],
+    green: &[u16],
+    blue: &[u16],
 ) -> Vec<u8> {
-    // When size=0 the three channel arrays are empty, so length=0.
-    // Xlib reads the size field from the fixed header to know array length.
-    let mut out = fixed_reply(byte_order, sequence, 0, 0);
+    debug_assert_eq!(red.len(), green.len());
+    debug_assert_eq!(red.len(), blue.len());
+    let size = u16::try_from(red.len()).unwrap_or(u16::MAX);
+    let payload_bytes = red.len().saturating_mul(3).saturating_mul(2);
+    let length = u32::try_from((payload_bytes + 3) >> 2).unwrap_or(u32::MAX);
+    let mut out = fixed_reply(byte_order, sequence, 0, length);
     put(byte_order, &mut out, size); // bytes 8-9: size
     out.extend_from_slice(&[0u8; 22]); // bytes 10-31: pad
-    debug_assert_eq!(out.len(), 32);
+    for channel in [red, green, blue] {
+        for &entry in channel {
+            put(byte_order, &mut out, entry);
+        }
+    }
+    pad_vec4(&mut out);
     out
 }
 
@@ -1109,6 +1135,36 @@ mod tests {
         let req = parse_output_property_request(&body).unwrap();
         assert_eq!(req.output, 1);
         assert_eq!(req.property, 2);
+    }
+
+    #[test]
+    fn parse_crtc_id_request_reads_crtc_only() {
+        let body = [0x02, 0x00, 0x00, 0x00];
+        let req = parse_crtc_id_request(&body).expect("crtc id request");
+        assert_eq!(req.crtc, 2);
+    }
+
+    #[test]
+    fn encode_get_crtc_gamma_reply_layout() {
+        let red = [1u16, 2];
+        let green = [3u16, 4];
+        let blue = [5u16, 6];
+        let buf = encode_get_crtc_gamma_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(8),
+            &red,
+            &green,
+            &blue,
+        );
+
+        assert_eq!(buf.len(), 44);
+        assert_eq!(buf[0], 1);
+        assert_eq!(&buf[2..4], &8u16.to_le_bytes());
+        assert_eq!(&buf[4..8], &3u32.to_le_bytes());
+        assert_eq!(&buf[8..10], &2u16.to_le_bytes());
+        assert_eq!(&buf[32..36], &[1, 0, 2, 0]);
+        assert_eq!(&buf[36..40], &[3, 0, 4, 0]);
+        assert_eq!(&buf[40..44], &[5, 0, 6, 0]);
     }
 
     #[test]

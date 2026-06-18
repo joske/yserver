@@ -2150,6 +2150,17 @@ fn handle_randr_request(
 ) -> io::Result<RequestOutcome> {
     use yserver_protocol::x11::{ClientByteOrder, randr as x11randr};
     const RANDR_MAJOR_OPCODE: u8 = 128;
+    fn connector_name_for_crtc(state: &ServerState, crtc: u32) -> Option<String> {
+        state
+            .randr
+            .outputs
+            .iter()
+            .find(|output| output.crtc_id == crtc)
+            .map(|output| output.name.clone())
+    }
+    fn crtc_is_leased(_state: &ServerState, _crtc: u32) -> bool {
+        false
+    }
     let byte_order = state
         .clients
         .get(&client_id.0)
@@ -2449,7 +2460,33 @@ fn handle_randr_request(
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_GET_CRTC_GAMMA_SIZE => {
-            let buf = x11randr::encode_get_crtc_gamma_size_reply(byte_order, sequence, 0);
+            let Some(req) = x11randr::parse_crtc_id_request(body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    0,
+                    u16::from(header.data),
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            let Some(connector) = connector_name_for_crtc(state, req.crtc) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    req.crtc,
+                    u16::from(header.data),
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            let buf = x11randr::encode_get_crtc_gamma_size_reply(
+                byte_order,
+                sequence,
+                backend.crtc_gamma_size(&connector),
+            );
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
@@ -2457,12 +2494,131 @@ fn handle_randr_request(
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_GET_CRTC_GAMMA => {
-            let buf = x11randr::encode_get_crtc_gamma_reply(byte_order, sequence, 0);
+            let Some(req) = x11randr::parse_crtc_id_request(body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    0,
+                    u16::from(header.data),
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            let Some(connector) = connector_name_for_crtc(state, req.crtc) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    req.crtc,
+                    u16::from(header.data),
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            let (red, green, blue) = backend.get_crtc_gamma(&connector);
+            let buf =
+                x11randr::encode_get_crtc_gamma_reply(byte_order, sequence, &red, &green, &blue);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
             let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &buf));
+        }
+        x11randr::RR_SET_CRTC_GAMMA => {
+            let Some(crtc_bytes) = body.get(0..4) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    0,
+                    u16::from(header.data),
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            let crtc = u32::from_le_bytes(crtc_bytes.try_into().unwrap());
+            let Some(connector) = connector_name_for_crtc(state, crtc) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    crtc,
+                    u16::from(header.data),
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            if crtc_is_leased(state, crtc) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_ACCESS,
+                    crtc,
+                    u16::from(header.data),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            let Some(size_bytes) = body.get(4..6) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(header.data),
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            let size = u16::from_le_bytes(size_bytes.try_into().unwrap());
+            let expected_units = (3 * u32::from(size) + 1) >> 1;
+            let expected_bytes = 8usize.saturating_add(usize::from(size).saturating_mul(6));
+            if header.length_units.saturating_sub(3) < expected_units || body.len() < expected_bytes
+            {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(header.data),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            let gamma_size = backend.crtc_gamma_size(&connector);
+            if size != gamma_size {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_MATCH,
+                    0,
+                    u16::from(header.data),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+
+            let channel_bytes = usize::from(size) * 2;
+            let red: Vec<u16> = body[8..8 + channel_bytes]
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes(chunk.try_into().unwrap()))
+                .collect();
+            let green_start = 8 + channel_bytes;
+            let green_end = green_start + channel_bytes;
+            let green: Vec<u16> = body[green_start..green_end]
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes(chunk.try_into().unwrap()))
+                .collect();
+            let blue: Vec<u16> = body[green_end..green_end + channel_bytes]
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes(chunk.try_into().unwrap()))
+                .collect();
+
+            if let Err(e) = backend.set_crtc_gamma(&connector, &red, &green, &blue) {
+                log::warn!("RRSetCrtcGamma apply failed for {connector}: {e}");
+            }
+            return Ok(RequestOutcome::Handled);
         }
         x11randr::RR_GET_OUTPUT_PROPERTY => {
             let buf = x11randr::encode_get_output_property_reply(byte_order, sequence);
@@ -34761,6 +34917,274 @@ mod tests {
         assert_eq!(status_disable, 0, "disable → status=0");
         assert_eq!(type_bytes[2], 0, "bad mode → X11 error (type=0)");
         assert_eq!(type_bytes[3], 0, "bad rotation → X11 error (type=0)");
+    }
+
+    #[test]
+    fn randr_get_crtc_gamma_size_uses_backend_and_invalid_crtc_is_bad_value() {
+        use crate::randr::{RandrOutput, RandrState};
+        use yserver_protocol::x11::randr as x11randr;
+
+        const CLIENT_ID: u32 = 1;
+        let outputs = vec![RandrOutput {
+            name: "DP-1".to_string(),
+            output_id: 1,
+            crtc_id: 2,
+            mode_id: 3,
+            connected: true,
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            vrefresh: 60,
+            mm_width: 0,
+            mm_height: 0,
+            mode_ids: vec![3],
+            num_preferred: 1,
+        }];
+        let mut state = ServerState::new();
+        state.randr = RandrState::from_outputs(1, outputs);
+        let mut backend = RecordingBackend::new();
+        let mut peer = install_client(&mut state, CLIENT_ID);
+
+        let header = RequestHeader {
+            opcode: 128,
+            data: x11randr::RR_GET_CRTC_GAMMA_SIZE,
+            length_units: 2,
+        };
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT_ID),
+            SequenceNumber(1),
+            header,
+            &2u32.to_le_bytes(),
+        )
+        .expect("valid get gamma size");
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT_ID),
+            SequenceNumber(2),
+            header,
+            &999u32.to_le_bytes(),
+        )
+        .expect("invalid get gamma size");
+
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 64, "reply + error");
+        assert_eq!(bytes[0], 1, "valid query replies");
+        assert_eq!(&bytes[8..10], &256u16.to_le_bytes(), "gamma size");
+        assert_eq!(bytes[32], 0, "invalid crtc emits error packet");
+        assert_eq!(bytes[33], x11::error::BAD_VALUE);
+    }
+
+    #[test]
+    fn randr_get_crtc_gamma_reports_seeded_identity_ramp() {
+        use crate::randr::{RandrOutput, RandrState};
+        use yserver_protocol::x11::randr as x11randr;
+
+        const CLIENT_ID: u32 = 1;
+        let outputs = vec![RandrOutput {
+            name: "DP-1".to_string(),
+            output_id: 1,
+            crtc_id: 2,
+            mode_id: 3,
+            connected: true,
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            vrefresh: 60,
+            mm_width: 0,
+            mm_height: 0,
+            mode_ids: vec![3],
+            num_preferred: 1,
+        }];
+        let mut state = ServerState::new();
+        state.randr = RandrState::from_outputs(1, outputs);
+        let mut backend = RecordingBackend::new();
+        let mut peer = install_client(&mut state, CLIENT_ID);
+
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT_ID),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 128,
+                data: x11randr::RR_GET_CRTC_GAMMA,
+                length_units: 2,
+            },
+            &2u32.to_le_bytes(),
+        )
+        .expect("get gamma");
+
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 32 + 256 * 3 * 2);
+        assert_eq!(bytes[0], 1);
+        assert_eq!(&bytes[8..10], &256u16.to_le_bytes());
+        assert_eq!(&bytes[32..34], &0u16.to_le_bytes(), "red[0]");
+        assert_eq!(
+            &bytes[32 + 510..32 + 512],
+            &65535u16.to_le_bytes(),
+            "red[last]"
+        );
+        assert_eq!(&bytes[32 + 512..32 + 514], &0u16.to_le_bytes(), "green[0]");
+        assert_eq!(
+            &bytes[32 + 1022..32 + 1024],
+            &65535u16.to_le_bytes(),
+            "green[last]"
+        );
+        assert_eq!(&bytes[32 + 1024..32 + 1026], &0u16.to_le_bytes(), "blue[0]");
+        assert_eq!(
+            &bytes[32 + 1534..32 + 1536],
+            &65535u16.to_le_bytes(),
+            "blue[last]"
+        );
+    }
+
+    #[test]
+    fn randr_set_crtc_gamma_validates_and_roundtrips() {
+        use crate::randr::{RandrOutput, RandrState};
+        use yserver_protocol::x11::randr as x11randr;
+
+        fn set_gamma_body(crtc: u32, red: &[u16], green: &[u16], blue: &[u16]) -> Vec<u8> {
+            let size = u16::try_from(red.len()).unwrap();
+            let mut body = Vec::with_capacity(8 + red.len() * 6);
+            body.extend_from_slice(&crtc.to_le_bytes());
+            body.extend_from_slice(&size.to_le_bytes());
+            body.extend_from_slice(&[0u8; 2]);
+            for channel in [red, green, blue] {
+                for &entry in channel {
+                    body.extend_from_slice(&entry.to_le_bytes());
+                }
+            }
+            body
+        }
+
+        const CLIENT_ID: u32 = 1;
+        let outputs = vec![RandrOutput {
+            name: "DP-1".to_string(),
+            output_id: 1,
+            crtc_id: 2,
+            mode_id: 3,
+            connected: true,
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            vrefresh: 60,
+            mm_width: 0,
+            mm_height: 0,
+            mode_ids: vec![3],
+            num_preferred: 1,
+        }];
+        let mut state = ServerState::new();
+        state.randr = RandrState::from_outputs(1, outputs);
+        let mut backend = RecordingBackend::new();
+        let mut peer = install_client(&mut state, CLIENT_ID);
+
+        let red = vec![1u16; 256];
+        let green = vec![2u16; 256];
+        let blue = vec![3u16; 256];
+        let body = set_gamma_body(2, &red, &green, &blue);
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT_ID),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 128,
+                data: x11randr::RR_SET_CRTC_GAMMA,
+                length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+            },
+            &body,
+        )
+        .expect("set gamma");
+        assert_eq!(backend.get_crtc_gamma("DP-1"), (red, green, blue));
+
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT_ID),
+            SequenceNumber(2),
+            RequestHeader {
+                opcode: 128,
+                data: x11randr::RR_GET_CRTC_GAMMA,
+                length_units: 2,
+            },
+            &2u32.to_le_bytes(),
+        )
+        .expect("get gamma");
+
+        let short_body = {
+            let mut b = Vec::new();
+            b.extend_from_slice(&2u32.to_le_bytes());
+            b.extend_from_slice(&256u16.to_le_bytes());
+            b.extend_from_slice(&[0u8; 2]);
+            b
+        };
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT_ID),
+            SequenceNumber(3),
+            RequestHeader {
+                opcode: 128,
+                data: x11randr::RR_SET_CRTC_GAMMA,
+                length_units: 3,
+            },
+            &short_body,
+        )
+        .expect("short set gamma");
+
+        let red_small = vec![9u16; 128];
+        let green_small = vec![8u16; 128];
+        let blue_small = vec![7u16; 128];
+        let mismatch_body = set_gamma_body(2, &red_small, &green_small, &blue_small);
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT_ID),
+            SequenceNumber(4),
+            RequestHeader {
+                opcode: 128,
+                data: x11randr::RR_SET_CRTC_GAMMA,
+                length_units: u32::try_from(1 + mismatch_body.len().div_ceil(4)).unwrap(),
+            },
+            &mismatch_body,
+        )
+        .expect("size mismatch set gamma");
+
+        let invalid_body = set_gamma_body(999, &[0u16; 256], &[0u16; 256], &[0u16; 256]);
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT_ID),
+            SequenceNumber(5),
+            RequestHeader {
+                opcode: 128,
+                data: x11randr::RR_SET_CRTC_GAMMA,
+                length_units: u32::try_from(1 + invalid_body.len().div_ceil(4)).unwrap(),
+            },
+            &invalid_body,
+        )
+        .expect("invalid crtc set gamma");
+
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(
+            bytes.len(),
+            (32 + 256 * 3 * 2) + (32 * 3),
+            "one gamma reply + three errors"
+        );
+        let gamma_reply_len = 32 + 256 * 3 * 2;
+        assert_eq!(bytes[0], 1, "get reply");
+        assert_eq!(bytes[gamma_reply_len], 0, "short body => error");
+        assert_eq!(bytes[gamma_reply_len + 1], x11::error::BAD_LENGTH);
+        assert_eq!(bytes[gamma_reply_len + 32], 0, "size mismatch => error");
+        assert_eq!(bytes[gamma_reply_len + 33], x11::error::BAD_MATCH);
+        assert_eq!(bytes[gamma_reply_len + 64], 0, "invalid crtc => error");
+        assert_eq!(bytes[gamma_reply_len + 65], x11::error::BAD_VALUE);
     }
 
     #[test]

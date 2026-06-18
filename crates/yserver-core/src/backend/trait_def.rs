@@ -366,6 +366,33 @@ pub trait Backend: Send {
         Ok(false)
     }
 
+    /// Number of entries in the connector's CRTC hardware gamma LUT
+    /// (`0` = gamma unsupported on this backend/connector). Default: 0.
+    fn crtc_gamma_size(&self, _connector: &str) -> u16 {
+        0
+    }
+
+    /// Cache the gamma LUT for `connector` (cache-before-apply: store
+    /// the requested ramp first), then apply it to the live CRTC. Each
+    /// of `red`/`green`/`blue` has `crtc_gamma_size` entries. A transient
+    /// apply failure keeps the cached ramp so a later reapply retries it.
+    /// Default: Ok(()) no-op.
+    fn set_crtc_gamma(
+        &mut self,
+        _connector: &str,
+        _red: &[u16],
+        _green: &[u16],
+        _blue: &[u16],
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// The connector's current cached gamma LUT (lazily seeded with a
+    /// linear identity ramp on first query/set). Default: empty triple.
+    fn get_crtc_gamma(&self, _connector: &str) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+        (Vec::new(), Vec::new(), Vec::new())
+    }
+
     /// Refresh RANDR state after a successful `RRSetCrtcConfig`, setting
     /// `lastSetTime` to the client's request timestamp (0/CurrentTime
     /// already resolved to `now` by the caller). A CRTC set bumps
