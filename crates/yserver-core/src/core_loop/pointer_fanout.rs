@@ -1932,7 +1932,24 @@ fn barrier_xi2_targets(state: &ServerState, window: ResourceId, evtype: u16) -> 
         .clients
         .iter()
         .filter_map(|(id, client)| {
-            let mask = xi2_mask_for_client(client, window, window, &[XI2_MASTER_POINTER_DEVICE_ID]);
+            // Match the device-candidate order the normal pointer fanout
+            // uses: a client may have selected under the concrete master
+            // pointer OR the `XIAllMasterDevices` (1) / `XIAllDevices` (0)
+            // wildcards. Querying only the concrete master id missed
+            // wildcard selections (e.g. libXi's `XIAllMasterDevices`), so
+            // BarrierHit/Leave never reached the client — leaving the
+            // pointer pinned at the wall with no way to release it.
+            let mask = xi2_mask_for_client(
+                client,
+                window,
+                window,
+                &[
+                    XI2_SLAVE_POINTER_DEVICE_ID,
+                    XI2_MASTER_POINTER_DEVICE_ID,
+                    1,
+                    0,
+                ],
+            );
             ((mask & (1 << evtype)) != 0).then_some(ClientId(*id))
         })
         .collect()
@@ -2425,6 +2442,67 @@ mod tests {
             &(99i32 << 16).to_le_bytes(),
             "root_x FP1616"
         );
+    }
+
+    /// Regression (HW-observed 2026-06-18): a client that selected
+    /// BarrierHit under the `XIAllMasterDevices` wildcard (deviceid 1) —
+    /// what libXi's `XISelectEvents(XIAllMasterDevices, …)` stores —
+    /// received NO barrier events, because `barrier_xi2_targets` only
+    /// queried the concrete master-pointer id (2). With no HIT events the
+    /// client could never call `XIBarrierReleasePointer`, so the pointer
+    /// was pinned at the wall forever. Selection under the wildcard must
+    /// deliver.
+    #[test]
+    fn barrier_hit_delivered_for_xiallmasterdevices_selection() {
+        let mut state = ServerState::new();
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        let mut peer = install_client(&mut state, 1);
+        // Wildcard device 1 (XIAllMasterDevices), NOT the concrete id 2.
+        state
+            .clients
+            .get_mut(&1)
+            .expect("client")
+            .xi2_masks
+            .insert((ROOT_WINDOW, 1), 1 << 25);
+        let bid = 0x0050_0004;
+        state.pointer_barriers.insert(
+            bid,
+            crate::server::PointerBarrier {
+                owner: ClientId(1),
+                window: ROOT_WINDOW,
+                x1: 100,
+                y1: 0,
+                x2: 100,
+                y2: 200,
+                directions: 0,
+                devices: Vec::new(),
+                hit: false,
+                seen: false,
+                event_id: 1,
+                release_event_id: 0,
+                last_timestamp: 0,
+            },
+        );
+        state.pointer_root = (90, 50);
+        let mut ev = motion_event();
+        ev.root_x = 110;
+        ev.root_y = 50;
+        let _ = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &HostXidMap::new(),
+            ev,
+            true,
+            false,
+        );
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(
+            bytes.len(),
+            68,
+            "BarrierHit must be delivered to the wildcard selector"
+        );
+        assert_eq!(&bytes[8..10], &25u16.to_le_bytes(), "BarrierHit");
+        assert_eq!(&bytes[28..32], &bid.to_le_bytes(), "barrier xid");
     }
 
     #[test]
