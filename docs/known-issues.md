@@ -182,6 +182,58 @@ from.
       descendants via walk-up). This is non-spec-compliant but
       practically works for xfce/mate/marco. Re-do as deepest-target
       tracking if a real client surfaces a bug here.
+- [ ] **Pointer-barrier / confine: cursor runs to the far edge under a
+      sustained hard push into the wall (2026-06-18, open).** The XFixes
+      pointer-barrier feature works for normal use — three bugs found and
+      fixed on `fix/hw-cursor-and-barriers` (HW-verified on silence):
+      (1) HW cursor not rebound across CRTCs on the pointer fast path so
+      it went invisible on the second monitor once the idle compositor
+      stopped ticking (`fix(kms): rebind HW cursor across CRTCs`);
+      (2) clamp was a porous wall because it adjusted only `root_x` while
+      `translate_host_event` re-derived root from the un-shifted
+      `event_x`, so `pointer_root` ended up past the wall and the next
+      segment never re-crossed (`fix(barriers): …porous wall`);
+      (3) `BarrierHit`/`Leave` weren't delivered to clients selecting
+      under the `XIAllMasterDevices` wildcard (libXi's default), so no
+      release was ever possible (`fix(barriers): deliver …XIAllMasterDevices`).
+      **Residual, unfixed:** while a barrier holds, if you push fast and
+      sustained *into* it, the cursor jumps to the far screen edge on
+      release (or, with `release=0` confinement, the sprite drifts to the
+      edge behind the wall while the protocol position correctly holds).
+      Root cause is the core ↔ input-thread cursor model, not the barrier
+      code: the input thread owns the cursor accumulator and integrates
+      relative libinput deltas independently, with no knowledge of
+      barriers. The core's clamp + `InputThreadControl::push_position`
+      resync is an async correction that can't constrain a fast
+      continuous push — the accumulator runs ahead and emits a backlog of
+      ever-larger positions (logged as `new=` climbing 2864→…→5119 while
+      `prev` stays pinned at the wall), all of which the core dutifully
+      clamps; when the release fires mid-stream the pointer lands at
+      whatever runaway value was current. Severity scales with push
+      speed × hold duration: the degenerate smoke (`release=600` + a hard
+      shove) sends it to the 5119 edge; a realistic pressure barrier
+      (quick/low-pressure release, e.g. `just yserver-barrier-smoke-hw
+      release=60`) should only overshoot a few px — likely unnoticeable.
+      The original heavy consumer (Mutter `MetaPressureBarrier` hot
+      corner) is gone from X11 (GNOME 49 dropped the X11 session), which
+      is why this is low priority. Fix options (all in input/core, not
+      barriers): (a) **core-side motion coalescing** — when draining
+      queued motion, process only the newest position and drop stale ones
+      (X11 does motion compression anyway), so the runaway backlog never
+      gets processed (recommended, localized); (b) **core-authoritative
+      accumulation** — input thread sends relative deltas, core
+      accumulates+clamps (matches Xorg's single source of truth, biggest
+      change). Validation idea, not yet done: run an **old GNOME**
+      (pre-49, still has the X11 session) in a **Linux VM** — virtio-gpu
+      gives a real DRM/KMS driver (unlike FreeBSD-in-a-VM), software
+      Vulkan via `YSERVER_ALLOW_SOFTWARE_VULKAN=1` (lavapipe) or Venus is
+      enough since barriers aren't GPU-heavy — and push Mutter's overview
+      hot corner; that's the only real `MetaPressureBarrier` test left and
+      would also show whether the runaway is perceptible with a realistic
+      release. Smoke harness: `tools/barrier-smoke.c` /
+      `just yserver-barrier-smoke-hw`; barrier trace logging under
+      `yserver_core::barriers`.
+
 ## Drawing / rendering artifacts
 
 - [ ] **nemo desktop rubber-band selection renders a stepped
