@@ -83,7 +83,8 @@ The connector string is the same identifier `apply_crtc_config` already takes; c
 - `SetCrtcGamma` with `size != gamma_size` → `BadMatch`; with a body shorter than `size` implies → `BadLength`.
 - `GetCrtcGammaSize` / `GetCrtcGamma` / `SetCrtcGamma` on an invalid CRTC → `BadCrtc`.
 - Seed: `GetCrtcGamma` before any `Set` returns a linear identity ramp.
-- Reapply: after a simulated `commit_modeset`, the backend re-issues the cached ramp (assert via the `RecordingBackend` call log).
+- Resample: covered by the pure `resample_channel` unit tests (no live CRTC needed).
+- Reapply-after-`commit_modeset` is **KMS-only** (RecordingBackend has no modeset/commit hook to drive it), so it is **HW-verified** (VT-switch smoke), not unit-tested.
 
 **HW smoke (release gate — user-run on silence/RX580, per the no-commit-before-smoke rule):**
 - `redshift -O 3000` → screen visibly warms; `redshift -x` → resets.

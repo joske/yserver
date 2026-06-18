@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-06-18-randr-gamma-design.md` (approved, codex-reviewed ×2).
 
-**Reconciliation vs spec (discovered during planning):** the spec says invalid CRTC → `BadCrtc`. yserver's RANDR layer has **no RR `first_error` wiring** and its sibling handler `GetCrtcInfo` (`process_request.rs:2293`) returns `x11::error::BAD_VALUE` for an invalid CRTC. To stay consistent with the existing RANDR error model (and avoid scope creep into RR error bases), this plan uses **`BAD_VALUE`** for invalid CRTC in all three gamma handlers, matching `GetCrtcInfo`. The SetCrtcGamma-specific codes (`BadLength`, `BadMatch`) and the leased-CRTC `BadAccess` seam are kept per spec. A real client (redshift) never sends an invalid CRTC, so this is invisible to the target app; the Xorg `RRBadCrtc` divergence is a pre-existing RANDR-error-model gap, not this feature's job.
+**Reconciliation vs spec (discovered during planning, codex-corrected):** the spec says invalid CRTC → `BadCrtc`. yserver *does* publish a nonzero RANDR `first_error` (`nested.rs:35`/`:145`), so a real `RRBadCrtc` (= `first_error + 1`) is technically available. **But** every existing RANDR handler — notably the sibling `GetCrtcInfo` (`process_request.rs:2293/2304`) — returns core `x11::error::BAD_VALUE` for an invalid CRTC. To stay internally consistent with the established RANDR handler behaviour (and avoid a one-off divergence), this plan uses **`BAD_VALUE`** for invalid CRTC in all three gamma handlers, matching `GetCrtcInfo`. The SetCrtcGamma-specific codes (`BadLength`, `BadMatch`) and the leased-CRTC `BadAccess` seam are kept per spec. A real client (redshift) never sends an invalid CRTC, so this is invisible to the target app. Converting *all* RANDR handlers to real `RRBadCrtc` is a separate, deliberate cleanup — not this feature's job.
 
 ---
 
@@ -54,7 +54,7 @@ pub fn identity_ramp(size: u16) -> Vec<u16> {
         return vec![0];
     }
     (0..n)
-        .map(|i| u16::try_from(i * 65535 / (n - 1)).unwrap_or(u16::MAX))
+        .map(|i| u16::try_from(i as u64 * 65535 / (n as u64 - 1)).unwrap_or(u16::MAX))
         .collect()
 }
 
@@ -82,11 +82,12 @@ pub fn resample_channel(src: &[u16], dst_len: usize) -> Vec<u16> {
             if rem == 0 || lo >= src_max {
                 return src[lo.min(src_max)];
             }
-            let a = u32::from(src[lo]);
-            let b = u32::from(src[lo + 1]);
-            // a + (b-a) * rem/(dst_len-1), rounded to nearest.
-            let span = (dst_len - 1) as u32;
-            let interp = (a * (span - rem as u32) + b * rem as u32 + span / 2) / span;
+            let a = u64::from(src[lo]);
+            let b = u64::from(src[lo + 1]);
+            // a + (b-a) * rem/(dst_len-1), rounded to nearest. u64 intermediates.
+            let span = (dst_len - 1) as u64;
+            let rem = rem as u64;
+            let interp = (a * (span - rem) + b * rem + span / 2) / span;
             u16::try_from(interp).unwrap_or(u16::MAX)
         })
         .collect()
@@ -287,7 +288,7 @@ fn get_crtc_gamma_reply_emits_arrays_and_length() {
     let red = vec![10u16, 20, 30];
     let green = vec![40u16, 50, 60];
     let blue = vec![70u16, 80, 90];
-    let out = encode_get_crtc_gamma_reply(ClientByteOrder::Lsb, SequenceNumber(7), &red, &green, &blue);
+    let out = encode_get_crtc_gamma_reply(ClientByteOrder::LittleEndian, SequenceNumber(7), &red, &green, &blue);
     // size@8
     assert_eq!(u16::from_le_bytes([out[8], out[9]]), 3);
     // length (32-bit units) = (3*3*2 + 3) >> 2 = (18+3)>>2 = 5
@@ -336,7 +337,9 @@ pub fn encode_get_crtc_gamma_reply(
     let size = u16::try_from(red.len()).unwrap_or(0);
     let payload_bytes = usize::from(size) * 3 * 2;
     let length_units = u32::try_from((payload_bytes + 3) >> 2).unwrap_or(0);
-    let mut out = fixed_reply(byte_order, sequence, length_units, 0);
+    // fixed_reply(byte_order, sequence, data: u8, length: u32) writes the
+    // 8-byte reply prefix only (data@byte1, length@4..8); caller pads to 32.
+    let mut out = fixed_reply(byte_order, sequence, 0, length_units);
     put(byte_order, &mut out, size); // bytes 8-9: size
     out.extend_from_slice(&[0u8; 22]); // bytes 10-31: pad
     debug_assert_eq!(out.len(), 32);
@@ -352,19 +355,12 @@ pub fn encode_get_crtc_gamma_reply(
 }
 ```
 
-- [ ] **Step 4: Fix the existing callsite (compile)**
-
-The old callsite `process_request.rs:2460` passes `0`. It is rewritten in Task 5; for now make Task-3 compile by temporarily leaving the core crate — `yserver-protocol` builds independently, so run the protocol test in isolation:
+- [ ] **Step 4: Run the protocol test in isolation**
 
 Run: `cargo test -p yserver-protocol get_crtc_gamma_reply_emits_arrays_and_length`
-Expected: PASS. (The `yserver-core` crate will not compile until Task 5; that is expected and sequenced.)
+Expected: PASS.
 
-- [ ] **Step 5: Commit**
-
-```bash
-git add crates/yserver-protocol/src/x11/randr.rs
-git commit -m "feat(randr-gamma): RR_SET_CRTC_GAMMA const + real GetCrtcGamma reply encoder"
-```
+- [ ] **Step 5: DO NOT COMMIT YET — this changes `encode_get_crtc_gamma_reply`'s signature, which breaks the existing core callsite at `process_request.rs:2460`. The workspace stays uncompilable until Task 5 updates that callsite. Proceed to Task 4 (independent) then Task 5, and commit the encoder + handlers together in Task 5's commit.** (codex review: don't leave a non-building commit.)
 
 ---
 
@@ -383,7 +379,7 @@ fn randr_set_crtc_gamma_swaps_crtc_size_and_array() {
     // body: crtc(4)=0x01020304, size(2)=0x0003, pad(2), then 3 u16 = 1,2,3
     let mut body = vec![0x04, 0x03, 0x02, 0x01, 0x03, 0x00, 0x00, 0x00,
                         0x01, 0x00, 0x02, 0x00, 0x03, 0x00];
-    swap_request_body(128, super::super::randr::RR_SET_CRTC_GAMMA, ClientByteOrder::Msb, &mut body);
+    swap_request_body(128, super::super::randr::RR_SET_CRTC_GAMMA, ClientByteOrder::BigEndian, &mut body);
     // crtc swapped to BE
     assert_eq!(&body[0..4], &[0x01, 0x02, 0x03, 0x04]);
     // size swapped
@@ -539,6 +535,15 @@ Add a new arm (place it next to the two above):
 ```rust
         x11randr::RR_SET_CRTC_GAMMA => {
             // Body: crtc(4) size(2) pad(2) red|green|blue (u16[size]).
+            // (0) fixed body must be present FIRST — Xorg's
+            // REQUEST_AT_LEAST_SIZE(xRRSetCrtcGammaReq) runs before
+            // VERIFY_RR_CRTC, so a grossly short request is BadLength, not
+            // BadValue. crtc(4)+size(2)+pad(2)=8 body bytes ⇒ length_units≥3.
+            // (Required because we read crtc/size with unwrap_or(0) below.)
+            if header.length_units < 3 || body.len() < 8 {
+                return emit_x11_error_with_minor(state, client_id, sequence,
+                    x11::error::BAD_LENGTH, 0, u16::from(header.data), RANDR_MAJOR_OPCODE);
+            }
             let crtc = body
                 .get(0..4)
                 .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
@@ -614,8 +619,9 @@ Expected: clean.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/yserver-core/src/core_loop/process_request.rs
-git commit -m "feat(randr-gamma): wire GetCrtcGammaSize/Gamma + SetCrtcGamma handlers"
+# Includes Task 3's encoder + const (held back so the tree builds).
+git add crates/yserver-protocol/src/x11/randr.rs crates/yserver-core/src/core_loop/process_request.rs
+git commit -m "feat(randr-gamma): GetCrtcGamma reply encoder + wire all three handlers"
 ```
 
 ---
@@ -666,11 +672,15 @@ Mirror the existing connector lookup (`apply_crtc_config` uses `self.platform.ou
 
 ```rust
     fn crtc_gamma_size(&self, connector: &str) -> u16 {
-        // Live CRTC's reported legacy gamma size, else the conventional 256
-        // for a known-but-unlit connector (so redshift can still allocate).
-        self.platform
-            .connector_gamma_target(connector)
-            .map_or(256, |(_, len)| if len == 0 { 256 } else { len })
+        // A LIVE CRTC's reported size is authoritative — including 0, which
+        // honestly means "gamma unsupported on this CRTC" (do NOT mask 0 as
+        // 256, codex caught that). Only an unlit/known connector (no CRTC to
+        // query → None) falls back to the conventional 256 so redshift can
+        // allocate before the output lights up.
+        match self.platform.connector_gamma_target(connector) {
+            Some((_, len)) => len,
+            None => 256,
+        }
     }
 
     fn set_crtc_gamma(
@@ -748,7 +758,12 @@ Add a backend method:
     }
 ```
 
-Call `reapply_all_gamma()` immediately after each successful `commit_modeset` return — the two sites are `enable_connector` (`platform.rs:2426`) and the DPMS-wake path (`platform.rs:2721`). Since `commit_modeset` lives on `platform` but `gamma_cache` lives on the backend, route the reapply at the backend-method level that wraps these (the same level `apply_crtc_config` and the DPMS/resume handlers run at), calling `self.reapply_all_gamma()` after the platform modeset call returns `Ok`. Verify the wrapping method boundaries while implementing; the invariant is "after commit_modeset succeeds, before the next pageflip is scheduled."
+Call `self.reapply_all_gamma()` at the **backend** boundary (only `KmsBackendV2` owns `gamma_cache`; `PlatformBackend` cannot). Codex pinned the three exact sites in `backend.rs`:
+- **After `self.platform.enable_connector(...)` succeeds** (`backend.rs:10057`), before the scene rebuild/wake at `:10086` — covers RANDR modeset.
+- **After `self.platform.dpms_set_outputs_active(true)` returns in resume** (`backend.rs:5055`), before cursor rearm — covers VT-switch resume.
+- **After `let res = self.platform.dpms_set_outputs_active(true);` in DPMS wake** (`backend.rs:16341`), before `rearm_cursor` — covers DPMS-on.
+
+On the two DPMS paths, run `reapply_all_gamma()` **even if the helper returned `Err`** — `dpms_set_outputs_active` is best-effort and may partially light outputs (`platform.rs:2693`). The invariant: after any path that (re)commits a modeset, before the next pageflip is scheduled. (These are three distinct sites — note the first codex review's "resume goes through dpms" was an over-simplification; resume at `:5055` and DPMS-wake at `:16341` are separate call sites and both need the hook.)
 
 - [ ] **Step 5: Build**
 
@@ -801,4 +816,6 @@ While a normal composited desktop is actively repainting (e.g. play a video or d
 
 - **Spec coverage:** trait methods (T2), KMS apply+cache+reapply (T6), connector-keyed cache (T6), error order BadValue/BadAccess/BadLength/BadMatch (T5 — BadCrtc→BadValue reconciliation documented in header), reply length formula (T3), swap entry (T4), identity seed + resample (T1/T6), persistence after commit_modeset (T6), redshift+VT-switch+pageflip smoke (T7). All covered.
 - **Type consistency:** `crtc_gamma_size`/`set_crtc_gamma`/`get_crtc_gamma` signatures identical across trait (T2), RecordingBackend (T2), KMS (T6); `identity_ramp`/`resample_channel` names consistent (T1) and consumed unchanged in T2/T6; `encode_get_crtc_gamma_reply(byte_order, sequence, &red,&green,&blue)` consistent T3↔T5.
-- **Known soft spots for the executor:** the exact KMS `output.crtc` handle field and the `device` accessor (T6 S2/S4) must be confirmed against the cursor code at `platform.rs:1049–1160`; the reapply call-site wrapping (T6 S4) needs the backend/platform method boundary verified. Both are flagged inline, not hand-waved.
+- **Codex plan review (1 pass) folded in:** u64 intermediates in the gamma math (T1); `fixed_reply(byte_order, sequence, 0, length_units)` arg order + `ClientByteOrder::LittleEndian`/`BigEndian` (T3/T4); Task 3 held back to commit with Task 5 so no non-building commit; fixed-size `BadLength` guard *before* reading crtc (T5); `crtc_gamma_size` returns a live CRTC's `0` honestly (T6); the three exact reapply call sites + run-on-Err (T6 S4); reconciliation rationale corrected (RANDR *does* have a `first_error`; we match the sibling-handler `BAD_VALUE` convention).
+- **Confirmed real by codex:** `output.crtc` (`kms/backend.rs:390` / `drm/modeset.rs:77`), `self.platform.device` (`platform.rs:504`), `emit_x11_error_with_minor` (`process_request.rs:16065`), the error constants, `FieldEntry`/`FieldKind` variants, and the drm 0.15 `get_crtc`/`gamma_length()`/`set_gamma` APIs. `connector_gamma_target`/`gamma_cache`/`reapply_all_gamma` are intentionally new names this plan introduces.
+- **HW-verified (not unit-tested), flagged for the executor:** the resample-on-`gamma_size`-change *integration* (the pure resample is unit-tested in T1) and the partial-success DPMS-wake reapply — both exercised by the Task 7 smoke, not by `RecordingBackend`.
