@@ -51,6 +51,31 @@ Cross-cutting bugs and followups that don't fit a stage live in
   `OutputLayout`) and `paint_batch::BatchResource` (the v2 frame
   builder's retire-pin trait); a follow-up cleanup can fold those
   into v2 proper.
+- 2026-06-19 gitk/Cinnamon follow-up: the remaining title-strip /
+  grey-window investigation produced a concrete v2 resolver fix.
+  `resolve_paint_target` now keeps walking the window hierarchy
+  even when a descendant window has temporarily lost its
+  xid→DrawableId mapping, so paint can still route into the
+  nearest redirected ancestor backing. This matches the observed
+  `CompositeGlyphs` + `PolyFillRectangle` failures on gitk's
+  frame-child window `0x400637`. A second follow-up from the same
+  day fixed a distinct lifetime bug in Drawable-backed RENDER
+  Pictures: `render_free_picture` now releases the exact
+  `DrawableId` retained at `CreatePicture` time instead of
+  re-looking it up by host xid after a window storage rebind. The
+  new regression covers the observed Cinnamon hover/blanking
+  pattern on host window `0x400230`; HW revalidation is still
+  pending.
+- 2026-06-19 later gitk/Cinnamon follow-up: the remaining
+  bottom-right diff-pane blanking narrowed to sibling overlap in a
+  shared redirected backing, not whole-window loss. Tk repaints a
+  lower sibling window and then `CopyArea`s that full rect into the
+  shared backing even while higher sibling panes still occupy part
+  of that space; v2 now subtracts mapped higher siblings that
+  resolve to the same paint target before dispatching `copy_area`.
+  Regression `copy_area_into_lower_sibling_excludes_higher_sibling_
+  in_shared_backing` pins the two-band split that matches the live
+  hover trace. HW revalidation is still pending.
 - **2026-06-17 XFIXES pointer barriers**: `PointerBarrier` storage,
   XFIXES barrier wire parsing, `CreatePointerBarrier` /
   `DeletePointerBarrier` dispatch, client-disconnect cleanup, XID

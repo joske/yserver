@@ -2862,19 +2862,6 @@ impl RenderEngine {
         let dst_pre_layout = inner.current_layout_for_drawable(store, target);
         let prior_dst_ticket = drawable.last_render_ticket.clone();
 
-        // Diagnostic trace (preserved from legacy body — useful for the
-        // "opaque black backing" investigation). Logs every fill_rect_batch
-        // with target id + color + caller-side rects.
-        if log::log_enabled!(target: "yserver::kms::v2::fill", log::Level::Trace) {
-            let depth = drawable.depth;
-            log::trace!(
-                target: "yserver::kms::v2::fill",
-                "fill_rect_batch target={target:?} depth={depth} color={color:?} n_rects={} first_rect={:?}",
-                rects.len(),
-                rects.first(),
-            );
-        }
-
         // Clamp + drop empties up front. Doing this before any frame
         // mutation means an all-empty batch short-circuits cleanly.
         let clamped: Vec<vk::Rect2D> = rects

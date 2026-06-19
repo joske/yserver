@@ -413,6 +413,14 @@ pub struct KmsBackendV2 {
     /// previous pair.
     pub(crate) recent_present_pixmaps: std::collections::VecDeque<(u32, u32)>,
 
+    /// Exact drawable instance retained by each Drawable-backed
+    /// Picture. `render_create_picture` may incref an old window
+    /// storage instance that later gets detached from `by_xid`
+    /// during an internal reconfigure/reallocate; `render_free_picture`
+    /// must drop that same `DrawableId` rather than whatever the
+    /// host xid resolves to at free time.
+    picture_drawable_ids: HashMap<u32, DrawableId>,
+
     /// DRI3 `FenceFromFD` xshmfence-backed fences keyed by the
     /// client's xid. Mesa's loader_dri3 uses xshmfence (memfd +
     /// futex) for idle/sync fences; the mmap'd mapping lets us
@@ -937,6 +945,7 @@ impl KmsBackendV2 {
             clear_window_area_calls: 0,
             engine_copy_area_calls: 0,
             recent_present_pixmaps: std::collections::VecDeque::with_capacity(32),
+            picture_drawable_ids: HashMap::new(),
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
             pending_present_batches: std::collections::VecDeque::new(),
@@ -1077,6 +1086,7 @@ impl KmsBackendV2 {
             clear_window_area_calls: 0,
             engine_copy_area_calls: 0,
             recent_present_pixmaps: std::collections::VecDeque::with_capacity(32),
+            picture_drawable_ids: HashMap::new(),
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
             pending_present_batches: std::collections::VecDeque::new(),
@@ -1896,6 +1906,7 @@ impl KmsBackendV2 {
             clear_window_area_calls: 0,
             engine_copy_area_calls: 0,
             recent_present_pixmaps: std::collections::VecDeque::with_capacity(32),
+            picture_drawable_ids: HashMap::new(),
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
             pending_present_batches: std::collections::VecDeque::new(),
@@ -2009,75 +2020,55 @@ impl KmsBackendV2 {
     /// real apps). Cached-ancestry alternative deferred to
     /// Stage 5 if profiling shows it.
     pub(crate) fn resolve_paint_target(&self, host_xid: u32) -> Option<PaintTarget> {
-        let leaf_id = self.store.lookup(host_xid)?;
-        let result = self.resolve_paint_target_inner(host_xid, leaf_id);
-        // Diagnostic trace (TEMP — Stage 4d "opaque black backing"
-        // investigation). Only fires when the resolve returned the
-        // LEAF id (no redirect found in the ancestor chain) for a
-        // *window* xid. That's the "paint to a window that didn't
-        // route via a redirected ancestor" case — exactly what we
-        // need to see if marco's CC client paints stop routing to B
-        // after a drag. Pixmaps and root paints don't trip this gate
-        // (root has no `windows_v2` entry), so volume stays bounded
-        // to window paints that ought to have hit a redirect.
-        if log::log_enabled!(target: "yserver::kms::v2::paint", log::Level::Trace)
-            && let Some(t) = result.as_ref()
-            && self.windows_v2.contains_key(&host_xid)
-        {
-            if t.id == leaf_id {
-                log::trace!(
-                    target: "yserver::kms::v2::paint",
-                    "resolve_paint_target NO_REDIRECT_FOUND xid=0x{host_xid:x} leaf_id={leaf_id:?}",
-                );
-            } else {
-                log::trace!(
-                    target: "yserver::kms::v2::paint",
-                    "resolve_paint_target REDIRECT_FOUND xid=0x{host_xid:x} leaf_id={leaf_id:?} \
-                     backing_id={:?} offset=({},{})",
-                    t.id,
-                    t.offset.0,
-                    t.offset.1,
-                );
-            }
+        let leaf_id = self.store.lookup(host_xid);
+        if self.windows_v2.contains_key(&host_xid) {
+            self.resolve_window_paint_target(host_xid, leaf_id)
+        } else {
+            let leaf_id = leaf_id?;
+            self.resolve_non_window_paint_target(leaf_id)
         }
-        result
     }
 
-    fn resolve_paint_target_inner(
+    fn resolve_non_window_paint_target(
         &self,
-        host_xid: u32,
         leaf_id: super::store::DrawableId,
     ) -> Option<PaintTarget> {
-        if !self.windows_v2.contains_key(&host_xid) {
-            if let Some(b_id) = self.store.redirected_target(leaf_id) {
-                return Some(PaintTarget {
-                    id: b_id,
-                    offset: (0, 0),
-                });
-            }
+        if let Some(b_id) = self.store.redirected_target(leaf_id) {
             return Some(PaintTarget {
-                id: leaf_id,
+                id: b_id,
                 offset: (0, 0),
             });
         }
+        Some(PaintTarget {
+            id: leaf_id,
+            offset: (0, 0),
+        })
+    }
+
+    fn resolve_window_paint_target(
+        &self,
+        host_xid: u32,
+        leaf_id: Option<super::store::DrawableId>,
+    ) -> Option<PaintTarget> {
         let mut cur_xid = host_xid;
-        let mut cur_id = leaf_id;
         let mut offset = (0_i32, 0_i32);
         loop {
-            if let Some(b_id) = self.store.redirected_target(cur_id) {
+            if let Some(cur_id) = self.store.lookup(cur_xid)
+                && let Some(b_id) = self.store.redirected_target(cur_id)
+            {
                 return Some(PaintTarget { id: b_id, offset });
             }
             // No `windows_v2` entry means we've stepped onto root
             // (parent = `core.window_id`, not tracked) or onto an
             // unparented orphan. In both cases there's no parent
             // chain left to walk; return identity at the leaf.
-            // (Root's own redirect was already checked on the
-            // prior loop iteration when `cur_id` became root_id.)
+            // if it still has live storage. If the leaf drawable
+            // has already detached from the xid map (e.g. a
+            // redirected descendant whose paints should route only
+            // via an ancestor backing), keep the redirected-ancestor
+            // miss as `None`.
             let Some(geom) = self.windows_v2.get(&cur_xid) else {
-                return Some(PaintTarget {
-                    id: leaf_id,
-                    offset: (0, 0),
-                });
+                return leaf_id.map(|id| PaintTarget { id, offset: (0, 0) });
             };
             match geom.parent {
                 None => {
@@ -2100,29 +2091,64 @@ impl KmsBackendV2 {
                         return Some(PaintTarget { id: b_id, offset });
                     }
                     // No root redirect: paint stays on the leaf
-                    // at its own origin. Explicit match (not `?`)
-                    // so we don't poison the outer Option.
-                    return Some(PaintTarget {
-                        id: leaf_id,
-                        offset: (0, 0),
-                    });
+                    // at its own origin if the leaf storage is
+                    // still live. Explicit match (not `?`) so we
+                    // don't poison the outer Option.
+                    return leaf_id.map(|id| PaintTarget { id, offset: (0, 0) });
                 }
                 Some(parent_xid) => {
                     offset.0 += i32::from(geom.x);
                     offset.1 += i32::from(geom.y);
                     cur_xid = parent_xid;
-                    // Parent xid not in the store means a
-                    // dangling reparent: fall back to identity.
-                    let Some(next_id) = self.store.lookup(parent_xid) else {
-                        return Some(PaintTarget {
-                            id: leaf_id,
-                            offset: (0, 0),
-                        });
-                    };
-                    cur_id = next_id;
                 }
             }
         }
+    }
+
+    /// When sibling windows share one redirected backing, painting the
+    /// lower sibling must not overwrite the higher siblings' visible
+    /// pixels in that backing. Return the mapped higher-sibling rects
+    /// in `dst_host_xid` local coordinates so `copy_area` can subtract
+    /// them from the destination rects before dispatch.
+    fn copy_area_higher_sibling_occluders(
+        &self,
+        dst_host_xid: u32,
+        dst_target_id: super::store::DrawableId,
+    ) -> Vec<ash::vk::Rect2D> {
+        let Some(dst_geom) = self.windows_v2.get(&dst_host_xid) else {
+            return Vec::new();
+        };
+        let mut occluders: Vec<(u64, ash::vk::Rect2D)> = self
+            .windows_v2
+            .iter()
+            .filter_map(|(sib_host_xid, sib_geom)| {
+                if *sib_host_xid == dst_host_xid
+                    || !sib_geom.mapped
+                    || sib_geom.parent != dst_geom.parent
+                    || sib_geom.stack_rank <= dst_geom.stack_rank
+                    || sib_geom.width == 0
+                    || sib_geom.height == 0
+                {
+                    return None;
+                }
+                let sib_target = self.resolve_paint_target(*sib_host_xid)?;
+                (sib_target.id == dst_target_id).then_some((
+                    sib_geom.stack_rank,
+                    ash::vk::Rect2D {
+                        offset: ash::vk::Offset2D {
+                            x: i32::from(sib_geom.x) - i32::from(dst_geom.x),
+                            y: i32::from(sib_geom.y) - i32::from(dst_geom.y),
+                        },
+                        extent: ash::vk::Extent2D {
+                            width: u32::from(sib_geom.width),
+                            height: u32::from(sib_geom.height),
+                        },
+                    },
+                ))
+            })
+            .collect();
+        occluders.sort_by_key(|(rank, _)| *rank);
+        occluders.into_iter().map(|(_, rect)| rect).collect()
     }
 
     /// Stage 4c.2 — compute the screen-absolute rect for a window's
@@ -8234,27 +8260,6 @@ fn picture_pict_format(core: &crate::kms::core::KmsCore, host_pic: u32) -> u32 {
     }
 }
 
-/// Describe a `ResolvedSource` for the diagnostic
-/// `render_composite` trace. Returns `(kind_name, depth)` —
-/// depth is `0` for non-Drawable sources where the concept
-/// doesn't apply. Used only from the trace path; not on hot
-/// paint paths.
-fn describe_resolved_source(
-    store: &super::store::DrawableStore,
-    src: &crate::kms::v2::engine::ResolvedSource,
-) -> (&'static str, u8) {
-    use crate::kms::v2::engine::ResolvedSource;
-    match src {
-        ResolvedSource::Drawable(id) => {
-            let depth = store.get(*id).map_or(0, |d| d.depth);
-            ("drawable", depth)
-        }
-        ResolvedSource::Solid(_) => ("solid", 0),
-        ResolvedSource::Gradient(_) => ("gradient", 0),
-        ResolvedSource::None => ("none", 0),
-    }
-}
-
 /// Per-drawable storage dump triggered by SIGUSR2 (or
 /// `Ctrl-Alt-D` via the input thread, mirroring
 /// `Ctrl-Alt-Enter` for scanout). Walks a fixed-known set of
@@ -8368,7 +8373,7 @@ fn do_dump_drawables_v2(backend: &mut KmsBackendV2) -> io::Result<()> {
         for (host_xid, geom) in windows {
             let leaf_id = backend.store.lookup(host_xid);
             let redirected_target = leaf_id.and_then(|id| backend.store.redirected_target(id));
-            let resolved = leaf_id.and_then(|id| backend.resolve_paint_target_inner(host_xid, id));
+            let resolved = backend.resolve_window_paint_target(host_xid, leaf_id);
             let is_top_level = backend.core.top_level_order.contains(&host_xid);
             use std::fmt::Write as _;
             let _ = writeln!(
@@ -8818,30 +8823,6 @@ fn picture_client_clip(core: &KmsCore, host_pic: u32) -> Option<Vec<Rectangle16>
         PictureRecord::SolidFill { .. }
         | PictureRecord::LinearGradient { .. }
         | PictureRecord::RadialGradient { .. } => None,
-    }
-}
-
-fn format_clip_rects(rects: Option<&[Rectangle16]>) -> String {
-    use std::fmt::Write as _;
-
-    match rects {
-        None => "<None>".to_string(),
-        Some([]) => "<empty>".to_string(),
-        Some(rects) => {
-            let mut out = String::from("[");
-            for (i, rect) in rects.iter().enumerate() {
-                if i > 0 {
-                    out.push(' ');
-                }
-                let _ = write!(
-                    out,
-                    "({},{} {}x{})",
-                    rect.x, rect.y, rect.width, rect.height
-                );
-            }
-            out.push(']');
-            out
-        }
     }
 }
 
@@ -11364,16 +11345,6 @@ impl Backend for KmsBackendV2 {
             .get(&host_window.as_raw())
             .copied()
         {
-            // Diagnostic trace (TEMP) — idempotent re-allocate.
-            // Important to know because callers may *expect* a
-            // fresh backing (and a re-seed) but get the existing
-            // one. Stage 4d.5 `rotate_redirected_backing_on_resize`
-            // works around this by release-then-allocate.
-            log::debug!(
-                "v2 allocate_redirected_backing W=0x{w:x}: idempotent return existing B=0x{b:x} ({width}x{height}, depth={depth})",
-                w = host_window.as_raw(),
-                b = existing.as_raw(),
-            );
             return Ok(existing);
         }
         let w_xid = host_window.as_raw();
@@ -11382,14 +11353,6 @@ impl Backend for KmsBackendV2 {
         // `create_pixmap` path (3f.10 pool + 3f.14 zero-fill).
         let backing = self.create_pixmap(origin, depth, width, height)?;
         let backing_xid = backing.as_raw();
-        // Diagnostic trace (TEMP) — fresh allocation. Cross-correlate
-        // against `set_redirected_target` and the "B is all-black"
-        // dump to see whether a fresh-allocated B explains a black
-        // backing (no client paint since the alloc) vs an
-        // unexpectedly-reset existing backing.
-        log::debug!(
-            "v2 allocate_redirected_backing W=0x{w_xid:x}: fresh B=0x{backing_xid:x} ({width}x{height}, depth={depth})",
-        );
 
         // Seed-copy: parent → B at W's position, BEFORE the route
         // flip. Audit #6 (2026-05-19) flipped this from "W → B (+
@@ -12510,20 +12473,51 @@ impl Backend for KmsBackendV2 {
         width: u16,
         height: u16,
     ) -> io::Result<()> {
-        let Some(src) = self.store.lookup(src_host_xid) else {
-            log::warn!(
-                "v2 copy_area dropped — src unknown: src=0x{src_host_xid:x} dst=0x{dst_host_xid:x} \
-                 src_xy=({src_x},{src_y}) dst_xy=({dst_x},{dst_y}) {width}x{height}",
-            );
-            self.log_v2_gap("copy_area_unknown_xid");
-            return Ok(());
+        // Resolve the SOURCE the same way as the destination when it
+        // is a window. A window that is Composite-redirected (or whose
+        // ancestor is) has its pixels in the redirect *backing*; its
+        // own leaf storage is never painted into. So a window→window
+        // self-copy — exactly what a Tk text widget does to scroll its
+        // diff pane — MUST read from the backing. Reading the raw leaf
+        // storage copies blank/background pixels over the live content,
+        // progressively blanking the widget (gitk diff-pane bug).
+        // `src_off` is the source window's offset within its backing;
+        // it converts the wire window-local src coords into backing
+        // coords. Pixmap sources keep the raw store lookup with a zero
+        // offset — the compositor's offscreen-pixmap CopyArea path
+        // (e.g. marco's CC buffer → COW) depends on reading the pixmap
+        // as the client sees it.
+        let (src, src_off): (super::store::DrawableId, (i32, i32)) = if self
+            .windows_v2
+            .contains_key(&src_host_xid)
+        {
+            match self.resolve_paint_target(src_host_xid) {
+                Some(t) => (t.id, t.offset),
+                None => {
+                    log::warn!(
+                        "v2 copy_area dropped — src window unresolvable: src=0x{src_host_xid:x} \
+                             dst=0x{dst_host_xid:x} src_xy=({src_x},{src_y}) dst_xy=({dst_x},{dst_y}) {width}x{height}",
+                    );
+                    self.log_v2_gap("copy_area_unknown_xid");
+                    return Ok(());
+                }
+            }
+        } else {
+            match self.store.lookup(src_host_xid) {
+                Some(s) => (s, (0, 0)),
+                None => {
+                    log::warn!(
+                        "v2 copy_area dropped — src unknown: src=0x{src_host_xid:x} dst=0x{dst_host_xid:x} \
+                             src_xy=({src_x},{src_y}) dst_xy=({dst_x},{dst_y}) {width}x{height}",
+                    );
+                    self.log_v2_gap("copy_area_unknown_xid");
+                    return Ok(());
+                }
+            }
         };
         // Stage 4a — dst resolves through `resolve_paint_target` so
         // copy_area into a redirected window lands in the backing
-        // with the descendant offset applied. Source stays at the
-        // raw store lookup per spec § "render_composite separates
-        // src/dst resolution" — the X11 client reads from the
-        // drawable as it sees it.
+        // with the descendant offset applied.
         let Some(dst_target) = self.resolve_paint_target(dst_host_xid) else {
             log::warn!(
                 "v2 copy_area dropped — dst unresolvable: src=0x{src_host_xid:x} dst=0x{dst_host_xid:x} \
@@ -12532,23 +12526,6 @@ impl Backend for KmsBackendV2 {
             self.log_v2_gap("copy_area_unknown_xid");
             return Ok(());
         };
-        // Diagnostic trace (TEMP — Stage 4d "top-left-only CC" investigation).
-        // Pins where each CopyArea lands: src store id, dst's resolved
-        // PaintTarget (id + offset), and the wire src/dst coords + size.
-        // Gated on `RUST_LOG=yserver::kms::v2::paint=trace`. Codex round
-        // of 2026-05-18: needed because the symptom narrowed to "B has
-        // CC content only in the top-left 177x80" — we need to see
-        // whether marco's many 975x600 CopyArea(src=CC_offscreen,
-        // dst=CC_window) calls resolve to the frame backing's
-        // DrawableId or get lost en route.
-        log::trace!(
-            target: "yserver::kms::v2::paint",
-            "copy_area src=0x{src_host_xid:x}->id={src:?} dst=0x{dst_host_xid:x}->id={dst_id:?}+off=({off_x},{off_y}) \
-             src_xy=({src_x},{src_y}) dst_xy=({dst_x},{dst_y}) {width}x{height}",
-            dst_id = dst_target.id,
-            off_x = dst_target.offset.0,
-            off_y = dst_target.offset.1,
-        );
         // Stage 4d Manual-redirect fix: split the copy by
         // `subwindow_mode = ClipByChildren` rules when dst is a
         // window. Each surviving sub-rect is in dst-window-local
@@ -12600,8 +12577,8 @@ impl Backend for KmsBackendV2 {
             for run in runs {
                 let sub_src = ash::vk::Rect2D {
                     offset: ash::vk::Offset2D {
-                        x: i32::from(src_x) + (i32::from(run.x) - i32::from(dst_x)),
-                        y: i32::from(src_y) + (i32::from(run.y) - i32::from(dst_y)),
+                        x: i32::from(src_x) + src_off.0 + (i32::from(run.x) - i32::from(dst_x)),
+                        y: i32::from(src_y) + src_off.1 + (i32::from(run.y) - i32::from(dst_y)),
                     },
                     extent: ash::vk::Extent2D {
                         width: u32::from(run.width),
@@ -12664,69 +12641,84 @@ impl Backend for KmsBackendV2 {
         // rect from each post-GC-clip rect. IncludeInferiors (mode=1)
         // keeps each post-GC-clip rect as-is. Pixmap destinations
         // (not in `windows_v2`) also bypass child subtraction.
-        let sub_rects: Vec<ash::vk::Rect2D> = if matches!(
-            self.core.current_subwindow_mode,
-            yserver_core::backend::SubwindowMode::ClipByChildren,
-        ) && self.windows_v2.contains_key(&dst_host_xid)
-        {
-            let child_rects: Vec<ash::vk::Rect2D> = self
-                .windows_v2
-                .iter()
-                .filter_map(|(child_host_xid, geom)| {
-                    if !(geom.parent == Some(dst_host_xid) && geom.mapped) {
-                        return None;
-                    }
-                    // Manually-redirected children don't claim the
-                    // parent's pixmap real estate — the redirecting
-                    // compositor (which may BE the parent's own
-                    // client, e.g. notification-area-applet over
-                    // its tray sockets) places the children's pixels
-                    // explicitly via subsequent ops. Subtracting them
-                    // strips the compositor's own composite-target
-                    // rect to empty. Same shape as the protocol-layer
-                    // fix at process_request.rs:copy_area_effective_dst_rects.
-                    //
-                    // Detect via v2's `scene_participating` flag: it
-                    // is set to `false` when redirect mode is Manual
-                    // (the X server stops auto-painting the window
-                    // into the scene/parent). Automatic redirect
-                    // keeps it `true`, so Automatic children still
-                    // clip — protecting the marco/CC frame test from
-                    // regression.
-                    let is_manually_redirected = self
-                        .store
-                        .lookup(*child_host_xid)
-                        .and_then(|id| self.store.get(id))
-                        .is_some_and(|d| !d.scene_participating);
-                    if is_manually_redirected {
-                        return None;
-                    }
-                    Some(ash::vk::Rect2D {
-                        offset: ash::vk::Offset2D {
-                            x: i32::from(geom.x),
-                            y: i32::from(geom.y),
-                        },
-                        extent: ash::vk::Extent2D {
-                            width: u32::from(geom.width.max(1)),
-                            height: u32::from(geom.height.max(1)),
-                        },
+        let child_clipped_rects: Vec<ash::vk::Rect2D> =
+            if matches!(
+                self.core.current_subwindow_mode,
+                yserver_core::backend::SubwindowMode::ClipByChildren,
+            ) && self.windows_v2.contains_key(&dst_host_xid)
+            {
+                let child_rects: Vec<ash::vk::Rect2D> = self
+                    .windows_v2
+                    .iter()
+                    .filter_map(|(child_host_xid, geom)| {
+                        if !(geom.parent == Some(dst_host_xid) && geom.mapped) {
+                            return None;
+                        }
+                        // Manually-redirected children don't claim the
+                        // parent's pixmap real estate — the redirecting
+                        // compositor (which may BE the parent's own
+                        // client, e.g. notification-area-applet over
+                        // its tray sockets) places the children's pixels
+                        // explicitly via subsequent ops. Subtracting them
+                        // strips the compositor's own composite-target
+                        // rect to empty. Same shape as the protocol-layer
+                        // fix at process_request.rs:copy_area_effective_dst_rects.
+                        //
+                        // Detect via v2's `scene_participating` flag: it
+                        // is set to `false` when redirect mode is Manual
+                        // (the X server stops auto-painting the window
+                        // into the scene/parent). Automatic redirect
+                        // keeps it `true`, so Automatic children still
+                        // clip — protecting the marco/CC frame test from
+                        // regression.
+                        let is_manually_redirected = self
+                            .store
+                            .lookup(*child_host_xid)
+                            .and_then(|id| self.store.get(id))
+                            .is_some_and(|d| !d.scene_participating);
+                        if is_manually_redirected {
+                            return None;
+                        }
+                        Some(ash::vk::Rect2D {
+                            offset: ash::vk::Offset2D {
+                                x: i32::from(geom.x),
+                                y: i32::from(geom.y),
+                            },
+                            extent: ash::vk::Extent2D {
+                                width: u32::from(geom.width.max(1)),
+                                height: u32::from(geom.height.max(1)),
+                            },
+                        })
                     })
-                })
-                .collect();
-            if child_rects.is_empty() {
-                post_gc_clip
+                    .collect();
+                if child_rects.is_empty() {
+                    post_gc_clip
+                } else {
+                    post_gc_clip
+                        .into_iter()
+                        .flat_map(|r| compute_copy_area_dst_rects(r, &child_rects))
+                        .collect()
+                }
             } else {
                 post_gc_clip
+            };
+        let sub_rects: Vec<ash::vk::Rect2D> = if self.windows_v2.contains_key(&dst_host_xid) {
+            let sibling_rects =
+                self.copy_area_higher_sibling_occluders(dst_host_xid, dst_target.id);
+            if sibling_rects.is_empty() {
+                child_clipped_rects
+            } else {
+                child_clipped_rects
                     .into_iter()
-                    .flat_map(|r| compute_copy_area_dst_rects(r, &child_rects))
+                    .flat_map(|r| compute_copy_area_dst_rects(r, &sibling_rects))
                     .collect()
             }
         } else {
-            post_gc_clip
+            child_clipped_rects
         };
         if sub_rects.is_empty() {
-            // Whole copy fully covered by mapped children — nothing
-            // to paint. Spec-correct under ClipByChildren.
+            // Whole copy is fully clipped away by mapped children
+            // and/or higher siblings sharing the redirected backing.
             return Ok(());
         }
         // GC function + plane-mask on copies (X11 §CopyArea uses the
@@ -12749,8 +12741,8 @@ impl Backend for KmsBackendV2 {
                 for sub in &sub_rects {
                     let sub_src = ash::vk::Rect2D {
                         offset: ash::vk::Offset2D {
-                            x: i32::from(src_x) + (sub.offset.x - i32::from(dst_x)),
-                            y: i32::from(src_y) + (sub.offset.y - i32::from(dst_y)),
+                            x: i32::from(src_x) + src_off.0 + (sub.offset.x - i32::from(dst_x)),
+                            y: i32::from(src_y) + src_off.1 + (sub.offset.y - i32::from(dst_y)),
                         },
                         extent: sub.extent,
                     };
@@ -12783,9 +12775,10 @@ impl Backend for KmsBackendV2 {
             let sub_dst_x = sub.offset.x;
             let sub_dst_y = sub.offset.y;
             // src coords shift by the same delta the dst sub-rect
-            // shifted from the original dst_xy.
-            let sub_src_x = i32::from(src_x) + (sub_dst_x - i32::from(dst_x));
-            let sub_src_y = i32::from(src_y) + (sub_dst_y - i32::from(dst_y));
+            // shifted from the original dst_xy, plus the source
+            // window's offset within its backing (`src_off`).
+            let sub_src_x = i32::from(src_x) + src_off.0 + (sub_dst_x - i32::from(dst_x));
+            let sub_src_y = i32::from(src_y) + src_off.1 + (sub_dst_y - i32::from(dst_y));
             let src_sub_rect = ash::vk::Rect2D {
                 offset: ash::vk::Offset2D {
                     x: sub_src_x,
@@ -13888,25 +13881,13 @@ impl Backend for KmsBackendV2 {
         // the value-mask body.
         let drawable_xid = host_drawable.as_raw();
         let picture_xid = self.core.next_host_xid();
-        // Diagnostic trace (TEMP — Stage 4d "shadow only"
-        // investigation). v2's PictureRecord doesn't store the
-        // requested PictFormat; capturing it here so a downstream
-        // analysis can see which format marco asked for when
-        // wrapping a redirected backing's alias. Enable with
-        // `RUST_LOG=yserver::kms::v2::render=trace`.
-        log::trace!(
-            target: "yserver::kms::v2::render",
-            "render_create_picture pic=0x{picture_xid:x} drawable=0x{drawable_xid:x} \
-             ynest_format=0x{ynest_format:x} value_mask=0x{value_mask:x} \
-             value_bytes={n}",
-            n = values.len(),
-        );
         self.core.pictures.insert(
             picture_xid,
             PictureRecord::drawable_default(drawable_xid, ynest_format),
         );
         if let Some(id) = self.store.lookup(drawable_xid) {
             self.store.incref(id);
+            self.picture_drawable_ids.insert(picture_xid, id);
         }
         if value_mask != 0 {
             // Recompose the body shape that render_change_picture
@@ -13926,41 +13907,7 @@ impl Backend for KmsBackendV2 {
         host_pic: u32,
         body: &[u8],
     ) -> io::Result<()> {
-        // Diagnostic trace (TEMP — Stage 4d "shadow only"
-        // investigation). Body shape: picture(4) + value_mask(4) +
-        // values. We log the mask bits + post-call clip state so a
-        // grep across the log can see whether CPClipMask=None
-        // cleared the dst picture's clip between marco's last
-        // SetPictureClipRectangles and the next render_composite.
-        if log::log_enabled!(target: "yserver::kms::v2::render", log::Level::Trace)
-            && body.len() >= 8
-        {
-            let mask = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
-            log::trace!(
-                target: "yserver::kms::v2::render",
-                "render_change_picture pic=0x{host_pic:x} mask=0x{mask:x} body_len={}",
-                body.len(),
-            );
-        }
         change_picture_apply_mask(&mut self.core, host_pic, body);
-        // After applying — log clip state if pic is a Drawable.
-        if log::log_enabled!(target: "yserver::kms::v2::render", log::Level::Trace)
-            && let Some(PictureRecord::Drawable {
-                clip,
-                clip_x,
-                clip_y,
-                ..
-            }) = self.core.pictures.get(&host_pic)
-        {
-            log::trace!(
-                target: "yserver::kms::v2::render",
-                "render_change_picture post pic=0x{host_pic:x} clip={} clip_origin=({clip_x},{clip_y})",
-                match clip {
-                    None => "None".to_string(),
-                    Some(rects) => format!("Some(n={})", rects.len()),
-                },
-            );
-        }
         Ok(())
     }
 
@@ -14033,9 +13980,10 @@ impl Backend for KmsBackendV2 {
         // backing drawable in the store. SolidFill / Gradient
         // variants have no backing drawable — they own only the
         // GPU-side state on RenderEngine.picture_paint (Stage 3c).
+        let retained_drawable_id = self.picture_drawable_ids.remove(&host_pic);
         if let Some(record) = self.core.pictures.remove(&host_pic)
-            && let Some(drawable_xid) = record.drawable_host_xid()
-            && let Some(id) = self.store.lookup(drawable_xid)
+            && record.drawable_host_xid().is_some()
+            && let Some(id) = retained_drawable_id
         {
             self.store_decref_with_invalidate(id);
         }
@@ -14212,53 +14160,6 @@ impl Backend for KmsBackendV2 {
             width: u32::from(width),
             height: u32::from(height),
         };
-        // Diagnostic trace (TEMP — Stage 4d "shadow only"
-        // investigation). Enable with
-        // `RUST_LOG=yserver::kms::v2::render=trace`.
-        // Logs every render_composite at the backend boundary
-        // with resolved source/mask/dst kinds + depths, the dst
-        // drawable id (to bisect "marco's compose onto its own
-        // offscreen" vs "compose onto a redirected backing"), the
-        // composite op, coords, repeat / transform / component-
-        // alpha state, and (after the engine call) the engine
-        // stats (recorded_draws, used_src_alias_scratch,
-        // used_dst_readback). Removed once we land or rule out
-        // the next RENDER-side fix.
-        if log::log_enabled!(target: "yserver::kms::v2::render", log::Level::Trace) {
-            let (src_kind, src_depth) = describe_resolved_source(&self.store, &src_resolved);
-            let (mask_kind, mask_depth) = describe_resolved_source(&self.store, &mask_resolved);
-            let dst_depth = self.store.get(dst_target.id).map_or(0, |d| d.depth);
-            // Picture-format IDs as declared at CreatePicture —
-            // captures marco's sampling intent which can differ
-            // from the drawable's depth-derived format.
-            let src_pict_format = picture_pict_format(&self.core, host_src);
-            let mask_pict_format = picture_pict_format(&self.core, host_mask);
-            let dst_pict_format = picture_pict_format(&self.core, host_dst);
-            let dst_picture_clip =
-                resolve_dst_picture_for_render(&self.core, host_dst).and_then(|(_, clip)| clip);
-            let dst_picture_clip_dump = format_clip_rects(dst_picture_clip.as_deref());
-            let src_clip_dump = format_clip_rects(src_clip.as_deref());
-            let mask_clip_dump = format_clip_rects(mask_clip.as_deref());
-            let final_clip_dump = format_clip_rects(dst_clip.as_deref());
-            log::trace!(
-                target: "yserver::kms::v2::render",
-                "render_composite op={op} src=0x{host_src:x}({src_kind},d={src_depth},fmt=0x{src_pict_format:x},repeat={src_repeat:?},xform={src_xform}) \
-                 mask=0x{host_mask:x}({mask_kind},d={mask_depth},fmt=0x{mask_pict_format:x},repeat={mask_repeat:?},xform={mask_xform},ca={mask_component_alpha}) \
-                 dst=0x{host_dst:x}->id={dst_id:?},d={dst_depth},fmt=0x{dst_pict_format:x} \
-                 src_xy=({src_x},{src_y}) mask_xy=({mask_x},{mask_y}) dst_xy=({dst_x},{dst_y})+off=({off_x},{off_y}) {width}x{height} \
-                 src_clip={src_clip_dump} src_t=({src_tx},{src_ty}) mask_clip={mask_clip_dump} mask_t=({mask_tx},{mask_ty}) \
-                 dst_picture_clip={dst_picture_clip_dump} final_clip={final_clip_dump}",
-                src_xform = src_transform.is_some(),
-                mask_xform = mask_transform.is_some(),
-                dst_id = dst_target.id,
-                off_x = dst_target.offset.0,
-                off_y = dst_target.offset.1,
-                src_tx = src_translation.0,
-                src_ty = src_translation.1,
-                mask_tx = mask_translation.0,
-                mask_ty = mask_translation.1,
-            );
-        }
         // Audit #4 (2026-05-19) — thread src/mask/dst PictFormat IDs
         // through to the engine so an xRGB32 picture wrapping a
         // depth-32 storage picks a no-alpha sample swizzle +
@@ -15426,27 +15327,6 @@ impl Backend for KmsBackendV2 {
             ..
         }) = self.core.pictures.get_mut(&host_pic)
         {
-            // Diagnostic trace (TEMP — Stage 4d "shadow only"
-            // investigation). Logs marco's incoming clip rect
-            // list at SetPictureClipRectangles time, post-origin
-            // shift. Compare against the per-call clip dump in
-            // the render_composite trace to verify v2 carries
-            // marco's clip through unchanged.
-            if log::log_enabled!(target: "yserver::kms::v2::render", log::Level::Trace) {
-                use std::fmt::Write as _;
-                let mut s = String::new();
-                for (i, r) in rects.iter().enumerate() {
-                    if i > 0 {
-                        s.push(' ');
-                    }
-                    let _ = write!(s, "({},{} {}x{})", r.x, r.y, r.width, r.height);
-                }
-                log::trace!(
-                    target: "yserver::kms::v2::render",
-                    "set_picture_clip_rectangles pic=0x{host_pic:x} origin=({x_origin},{y_origin}) n={n} rects[{s}]",
-                    n = rects.len(),
-                );
-            }
             // X11 RENDER spec semantics:
             //   - `SetPictureClipRectangles` with EMPTY rect list =
             //     empty clip region = composites paint **nothing**.
@@ -17648,6 +17528,103 @@ mod tests {
         assert!(b.store.get(pix_id).is_none(), "entry destroyed on last ref");
     }
 
+    /// A Drawable-backed Picture must release the exact drawable
+    /// instance it retained at create time, even if the same host
+    /// xid has since been detached and rebound to fresh storage by
+    /// an internal window reconfigure. Pre-fix `render_free_picture`
+    /// looked up by xid again and could drop the new live drawable
+    /// instead, blanking the window while leaking the old storage.
+    #[test]
+    fn v2_picture_free_uses_retained_drawable_after_xid_rebind() {
+        use ash::vk;
+
+        use crate::kms::v2::store::{DrawableKind, Storage};
+        use yserver_core::backend::{AnyHandle, WindowHandle};
+
+        let mut b = KmsBackendV2::for_tests();
+        let window_xid = 0x400230;
+        let old_id = b
+            .store
+            .allocate(
+                window_xid,
+                DrawableKind::Window,
+                24,
+                true,
+                Storage::for_tests_null(
+                    vk::Extent2D {
+                        width: 64,
+                        height: 32,
+                    },
+                    vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("allocate old window storage");
+
+        let picture = b
+            .render_create_picture(
+                None,
+                AnyHandle::Window(WindowHandle::from_raw(window_xid).expect("WindowHandle")),
+                0,
+                0,
+                &[],
+            )
+            .expect("create_picture")
+            .expect("Some(handle)");
+        let pic_xid = picture.as_raw();
+        assert_eq!(b.store.get(old_id).expect("old entry").refcount, 2);
+
+        // Mirror configure_subwindow's detach + owner decref before
+        // the replacement storage is allocated under the same xid.
+        b.store.detach_xid(window_xid);
+        b.store_decref_with_invalidate(old_id);
+        assert_eq!(
+            b.store
+                .get(old_id)
+                .expect("old entry kept alive by picture")
+                .refcount,
+            1,
+        );
+        assert!(
+            b.store.lookup(window_xid).is_none(),
+            "detach removes the xid binding before re-allocation",
+        );
+
+        let new_id = b
+            .store
+            .allocate(
+                window_xid,
+                DrawableKind::Window,
+                24,
+                true,
+                Storage::for_tests_null(
+                    vk::Extent2D {
+                        width: 1565,
+                        height: 32,
+                    },
+                    vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("allocate replacement window storage");
+        assert_eq!(b.store.lookup(window_xid), Some(new_id));
+
+        b.render_free_picture(None, pic_xid).expect("free_picture");
+
+        assert!(
+            b.store.get(old_id).is_none(),
+            "free_picture must drop the old retained drawable",
+        );
+        assert_eq!(
+            b.store.lookup(window_xid),
+            Some(new_id),
+            "free_picture must not detach the replacement xid binding",
+        );
+        assert_eq!(
+            b.store.get(new_id).expect("replacement entry").refcount,
+            1,
+            "replacement window storage must keep its owner ref",
+        );
+    }
+
     /// `picture_solid_fill_premul_correct` per plan §3b. NB: the
     /// X RENDER wire colour is **already premultiplied** per the
     /// protocol + rendercheck (`main.c:337-345`), so v2 stores the
@@ -19671,6 +19648,169 @@ mod tests {
         );
     }
 
+    /// Tk/gitk hover regression under Cinnamon (2026-06-19): a
+    /// lower sibling's CopyArea routed into a shared redirected
+    /// backing must not clobber the higher sibling's visible rect.
+    /// With a middle vertical overlap the surviving paint is two
+    /// disjoint side bands, so the dispatch loop must run twice.
+    #[test]
+    fn copy_area_into_lower_sibling_excludes_higher_sibling_in_shared_backing() {
+        use crate::kms::v2::store::{DrawableKind, Storage};
+        use yserver_core::backend::Backend;
+
+        let mut b = KmsBackendV2::for_tests();
+
+        let parent_xid: u32 = 0x300_0001;
+        let lower_xid: u32 = 0x300_0002;
+        let upper_xid: u32 = 0x300_0003;
+        let backing_xid: u32 = 0x300_0004;
+        let src_pixmap_xid: u32 = 0x300_0005;
+
+        let parent_rank = b.alloc_window_stack_rank();
+        b.windows_v2.insert(
+            parent_xid,
+            super::WindowGeometryV2 {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 80,
+                depth: 24,
+                mapped: true,
+                parent: None,
+                bg_pixel: None,
+                bg_pixmap: None,
+                stack_rank: parent_rank,
+                cursor: None,
+            },
+        );
+        b.store
+            .allocate(
+                parent_xid,
+                DrawableKind::Window,
+                24,
+                true,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 80,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("alloc parent");
+        b.store
+            .allocate(
+                backing_xid,
+                DrawableKind::Pixmap,
+                24,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 80,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("alloc parent backing");
+        assert!(b.test_set_redirected_target(parent_xid, backing_xid));
+
+        let lower_rank = b.alloc_window_stack_rank();
+        b.windows_v2.insert(
+            lower_xid,
+            super::WindowGeometryV2 {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 80,
+                depth: 24,
+                mapped: true,
+                parent: Some(parent_xid),
+                bg_pixel: None,
+                bg_pixmap: None,
+                stack_rank: lower_rank,
+                cursor: None,
+            },
+        );
+        b.store
+            .allocate(
+                lower_xid,
+                DrawableKind::Window,
+                24,
+                true,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 80,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("alloc lower sibling");
+
+        let upper_rank = b.alloc_window_stack_rank();
+        b.windows_v2.insert(
+            upper_xid,
+            super::WindowGeometryV2 {
+                x: 25,
+                y: 0,
+                width: 50,
+                height: 80,
+                depth: 24,
+                mapped: true,
+                parent: Some(parent_xid),
+                bg_pixel: None,
+                bg_pixmap: None,
+                stack_rank: upper_rank,
+                cursor: None,
+            },
+        );
+        b.store
+            .allocate(
+                upper_xid,
+                DrawableKind::Window,
+                24,
+                true,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 50,
+                        height: 80,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("alloc upper sibling");
+
+        b.store
+            .allocate(
+                src_pixmap_xid,
+                DrawableKind::Pixmap,
+                24,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 100,
+                        height: 80,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("alloc src pixmap");
+
+        let calls_before = b.engine_copy_area_calls;
+
+        b.copy_area(None, src_pixmap_xid, lower_xid, 0, 0, 0, 0, 100, 80)
+            .expect("copy_area must not return Err");
+
+        assert_eq!(
+            b.engine_copy_area_calls,
+            calls_before + 2,
+            "a higher sibling overlapping the middle of the lower sibling \
+             must split the copy into the two uncovered side bands; pre-fix \
+             v2 emitted one full unsplit copy into the shared redirected backing"
+        );
+    }
+
     /// Stage 3f.6 close: `change_subwindow_attributes` stores
     /// `bg_pixel` + `bg_pixmap` into the v2 window record instead of
     /// logging a gap. value_mask=0x03 (CWBackPixmap + CWBackPixel)
@@ -20780,9 +20920,9 @@ mod tests {
         );
     }
 
-    /// Unknown xid → `None`. The resolver's first step is
-    /// `store.lookup`, which fails for an xid that was never
-    /// allocated.
+    /// Unknown xid → `None`. Neither the drawable store nor
+    /// `windows_v2` knows about it, so there is no leaf identity
+    /// target and no ancestor chain to walk.
     #[test]
     fn resolve_paint_target_unknown_xid_returns_none() {
         let b = KmsBackendV2::for_tests();
@@ -21106,6 +21246,46 @@ mod tests {
             super::PaintTarget {
                 id: bc_id,
                 offset: (3, 4)
+            }
+        );
+    }
+
+    /// A descendant window can temporarily lose its xid→DrawableId
+    /// mapping while its geometry remains live (e.g. resize /
+    /// reparent churn). Paint should still route into the nearest
+    /// redirected ancestor backing using the window-tree offsets,
+    /// rather than failing the leaf lookup and dropping the op.
+    #[test]
+    fn resolve_paint_target_detached_leaf_still_routes_to_redirected_ancestor() {
+        use crate::kms::v2::store::{DrawableKind, Storage};
+        let mut b = KmsBackendV2::for_tests();
+        let w_id = seed_window(&mut b, 0x100, None, 0, 0);
+        let _c_id = seed_window(&mut b, 0x200, Some(0x100), 10, 20);
+        let backing_id = b
+            .store
+            .allocate(
+                0x900,
+                DrawableKind::RedirectedBacking,
+                32,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 200,
+                        height: 200,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("backing allocate");
+        b.store.set_redirected_target(w_id, Some(backing_id));
+        b.store.detach_xid(0x200);
+
+        let pt = b.resolve_paint_target(0x200).expect("resolve");
+        assert_eq!(
+            pt,
+            super::PaintTarget {
+                id: backing_id,
+                offset: (10, 20)
             }
         );
     }
