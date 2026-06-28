@@ -18,7 +18,13 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: clippy, rustfmt
-          toolchain: stable, nightly
+          # setup-rust-toolchain makes the LAST listed toolchain the default,
+          # so list stable last: clippy/build/test run on stable (matching
+          # rust-toolchain.toml). nightly is installed only for `cargo
+          # +nightly fmt`, which needs unstable rustfmt options. Do NOT
+          # reorder — a nightly default makes clippy flag nightly-only lints
+          # the pinned stable build never sees.
+          toolchain: nightly, stable
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
       - name: Check formatting
