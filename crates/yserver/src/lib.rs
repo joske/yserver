@@ -40,6 +40,23 @@ fn install_backend_root_bindings(state: &mut ServerState, backend: &dyn Backend)
     }
 }
 
+/// Refuse to start when libinput's initial seat enumeration opened zero input
+/// devices. A display server with no keyboard or mouse is unusable — the only
+/// escape is to VT-switch and zap — so we fail fast with an actionable error
+/// pointing at the usual cause (issue #64) instead of coming up dead. `opened`
+/// is the count of `DeviceAdded` events from the initial dispatch.
+fn ensure_input_devices_opened(opened: usize) -> io::Result<()> {
+    if opened == 0 {
+        return Err(io::Error::other(
+            "no input devices could be opened under /dev/input.\n\
+             This usually means the user is not in the 'input' group or not \
+             active on seat0.\n\
+             See `loginctl seat-status seat0`, or add the user to the 'input' group.",
+        ));
+    }
+    Ok(())
+}
+
 pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     panic!("yserver only supports Linux and FreeBSD (DRM/KMS, libinput, evdev)");
@@ -328,7 +345,28 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     if backend.is_libseat_mode() {
         backend.set_input_sender(sender.clone_handle());
         log::info!("yserver: libseat mode — libinput on core thread, no input thread spawned");
-    } else if let Some(input_ctx) = backend.take_input_ctx() {
+    } else if let Some(mut input_ctx) = backend.take_input_ctx() {
+        // Drain libinput's initial seat enumeration here, on the main thread,
+        // BEFORE signalling readiness — so we can refuse to start when no input
+        // device could be opened (issue #64) rather than coming up with a dead
+        // keyboard and mouse. `udev_assign_seat` queues `DeviceAdded`
+        // synchronously and a single dispatch consumes the initial enumeration
+        // (the same contract the input thread relied on). The drained events
+        // are handed to the thread so device registration is unchanged.
+        let initial_events = match input_ctx.dispatch() {
+            Ok(evs) => evs,
+            Err(err) => {
+                log::warn!("yserver: initial libinput dispatch: {err}");
+                Vec::new()
+            }
+        };
+        let opened = initial_events
+            .iter()
+            .filter(|e| matches!(e, crate::input::InputEvent::DeviceAdded(_)))
+            .count();
+        ensure_input_devices_opened(opened)?;
+        log::info!("yserver: {opened} input device(s) opened at startup");
+
         let input_sender = sender.clone_handle();
         let input_control = std::sync::Arc::new(crate::input_thread::InputThreadControl::new()?);
         // Lock-LED relay: the core thread owns the XKB lock state, the
@@ -346,6 +384,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
             .spawn(move || {
                 if let Err(err) = input_thread::run(
                     input_ctx,
+                    initial_events,
                     input_sender,
                     u32::from(fb_w),
                     u32::from(fb_h),
@@ -709,7 +748,7 @@ fn block_termination_signals() -> io::Result<nix::sys::event::Kqueue> {
 
 #[cfg(test)]
 mod tests {
-    use super::install_backend_root_bindings;
+    use super::{ensure_input_devices_opened, install_backend_root_bindings};
     use yserver_core::{
         backend::Backend,
         resources::{ARGB_COLORMAP, ARGB_VISUAL, ROOT_VISUAL, ROOT_WINDOW},
@@ -743,5 +782,24 @@ mod tests {
             argb_colormap.host_colormap_xid.map(|c| c.as_raw()),
             backend.argb_colormap_xid()
         );
+    }
+
+    #[test]
+    fn ensure_input_devices_opened_rejects_zero_with_actionable_message() {
+        let err = ensure_input_devices_opened(0).expect_err("zero devices must abort startup");
+        let msg = err.to_string();
+        // The message must steer the user to the real cause, not just fail.
+        assert!(msg.contains("/dev/input"), "missing device path: {msg}");
+        assert!(
+            msg.contains("'input' group"),
+            "missing input-group hint: {msg}"
+        );
+        assert!(msg.contains("seat0"), "missing seat0 hint: {msg}");
+    }
+
+    #[test]
+    fn ensure_input_devices_opened_accepts_one_or_more() {
+        assert!(ensure_input_devices_opened(1).is_ok());
+        assert!(ensure_input_devices_opened(8).is_ok());
     }
 }

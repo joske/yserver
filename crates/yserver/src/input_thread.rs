@@ -535,6 +535,7 @@ pub fn process_batch(
 /// Returns only on a fatal send error (channel closed = core gone).
 pub(crate) fn run(
     input_ctx: SendContext,
+    initial_events: Vec<InputEvent>,
     sender: CoreSender,
     fb_w: u32,
     fb_h: u32,
@@ -628,26 +629,21 @@ pub(crate) fn run(
         kq
     };
 
-    // Drain udev's initial device enumeration before waiting on
-    // epoll. udev_assign_seat queues DeviceAdded events synchronously
-    // but dispatch() must be called once to consume them. Without this
-    // first dispatch, the very first epoll_wait blocks until any input
-    // arrives, and the seat enumeration is silently held back. This is
+    // The initial seat enumeration was drained by the caller on the main
+    // thread (so it could verify at least one input device opened before
+    // signalling readiness — issue #64); process those events here. This is
     // also where `libinput: device added` first lands in the log.
-    {
-        let initial = match input_ctx.dispatch() {
-            Ok(evs) => evs,
-            Err(err) => {
-                log::warn!("input thread: initial libinput dispatch: {err}");
-                Vec::new()
-            }
-        };
-        if !initial.is_empty() {
-            let time_ms = current_time_ms();
-            process_batch(&mut state, &sender, &mut pending_motion, initial, time_ms)?;
-            if let Some(m) = pending_motion.take() {
-                sender.send(Message::HostInput(m))?;
-            }
+    if !initial_events.is_empty() {
+        let time_ms = current_time_ms();
+        process_batch(
+            &mut state,
+            &sender,
+            &mut pending_motion,
+            initial_events,
+            time_ms,
+        )?;
+        if let Some(m) = pending_motion.take() {
+            sender.send(Message::HostInput(m))?;
         }
     }
 
