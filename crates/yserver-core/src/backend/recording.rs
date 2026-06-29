@@ -17,8 +17,6 @@
 //! `nested::handle_request`'s ChangeWindowAttributes path on
 //! ROOT_WINDOW pokes the container).
 
-#![cfg(test)]
-
 use std::{io, sync::Mutex};
 
 use yserver_protocol::x11::{ClipRectangles, FontMetrics, ResourceId, xfixes};
