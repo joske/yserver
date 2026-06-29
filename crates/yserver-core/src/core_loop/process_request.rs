@@ -14954,10 +14954,14 @@ fn handle_xkb_request(
     // LatchLockState is a void request (no reply), so this runs in the
     // pre-proxy region; the backend's xkb_proxy minor-5 returns None.
     if minor == 5
-        && let Some(g) = crate::core_loop::xkb_layout::parse_latch_lock_group(body)
-        && g != backend.current_group()
+        && let Some(requested_group) = crate::core_loop::xkb_layout::parse_latch_lock_group(body)
     {
-        backend.set_locked_group(g);
+        let old_group = backend.current_group();
+        backend.set_locked_group(requested_group);
+        let group = backend.current_group();
+        if group == old_group {
+            return Ok(RequestOutcome::Handled);
+        }
         let base = backend.xkb_info().map_or(0, |(_maj, ev, _err)| ev);
         let (eff_mods, base_mods, latched_mods, locked_mods) = backend.current_xkb_mods();
         let subs = crate::core_loop::xkb_layout::subscribers(state, 0x0004);
@@ -14967,8 +14971,8 @@ fn handle_xkb_request(
             base_mods,
             latched_mods,
             locked_mods,
-            group: g,
-            locked_group: g,
+            group,
+            locked_group: group,
             changed: 0x0090, // XkbGroupStateMask | XkbGroupLockMask
             keycode: 0,
             event_type: 0, // caused by an XKB request, not a key
@@ -14983,7 +14987,7 @@ fn handle_xkb_request(
         // compiled-`grp:`-key-action path in `key_event_fanout_to_state`
         // (Driver 2) doesn't re-emit a redundant StateNotify on the
         // next key. (Driver 2 sets the same field after its own emit.)
-        state.last_xkb_group = g;
+        state.last_xkb_group = group;
     }
     // XkbGetKbdByName (minor 23): a real keymap load + reply, NOT the
     // minimal stub. The backend owns the keymap/rmlvo/atom-resolution, so it

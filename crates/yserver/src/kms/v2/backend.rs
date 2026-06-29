@@ -5396,8 +5396,22 @@ impl KmsBackendV2 {
         // XkbGroupForCoreState: active group in bits 13-14. Sourced from the
         // authoritative locked_group (NOT xkb_state) — see plan, the group lock
         // is tracked server-side, not pushed into the master xkb_state.
-        mask |= (u16::from(self.core.locked_group) & 0x3) << 13;
+        mask |= (u16::from(self.effective_locked_group()) & 0x3) << 13;
         mask
+    }
+
+    fn keymap_group_count(&self) -> u8 {
+        u8::try_from(self.core.xkb_keymap.0.num_layouts())
+            .unwrap_or(1)
+            .clamp(1, 4)
+    }
+
+    fn clamp_group_to_keymap(&self, group: u8) -> u8 {
+        group.min(self.keymap_group_count().saturating_sub(1))
+    }
+
+    fn effective_locked_group(&self) -> u8 {
+        self.clamp_group_to_keymap(self.core.locked_group)
     }
 
     /// Direct-mode wiring: hand over the relay the input thread ends
@@ -5489,7 +5503,8 @@ impl KmsBackendV2 {
             .serialize_layout(xkbcommon::xkb::STATE_LAYOUT_EFFECTIVE);
         if group_after != group_before {
             // LayoutIndex (u32) -> group (0..=3). Out-of-range clamps to 0.
-            self.core.locked_group = u8::try_from(group_after).unwrap_or(0);
+            let group = u8::try_from(group_after).unwrap_or(0);
+            self.core.locked_group = self.clamp_group_to_keymap(group);
         }
         self.sync_keyboard_leds();
         // Modifier bits (0..=7) come from the PRE-update snapshot; the
@@ -10461,11 +10476,11 @@ impl Backend for KmsBackendV2 {
     }
 
     fn set_locked_group(&mut self, group: u8) {
-        self.core.locked_group = group;
+        self.core.locked_group = self.clamp_group_to_keymap(group);
     }
 
     fn current_group(&self) -> u8 {
-        self.core.locked_group
+        self.effective_locked_group()
     }
 
     fn current_xkb_mods(&self) -> (u8, u8, u8, u8) {
@@ -17426,7 +17441,7 @@ impl Backend for KmsBackendV2 {
             0 => Some(xkb_replies::reply_use_extension()),
             4 => Some(xkb_replies::reply_get_state(
                 &self.core.xkb_state.0,
-                self.core.locked_group,
+                self.effective_locked_group(),
             )),
             6 => Some(xkb_replies::reply_get_controls(&self.core.xkb_keymap.0)),
             8 => Some(xkb_replies::reply_get_map(&self.core.xkb_keymap.0)),
@@ -22012,9 +22027,41 @@ mod tests {
         let mut backend = KmsBackendV2::for_tests();
         // group 0 -> no group bits
         assert_eq!(backend.serialize_modifiers() & 0x6000, 0x0000);
+        let changed = backend.core.recompile_keymap(&crate::kms::core::XkbRmlvo {
+            rules: "evdev".into(),
+            model: "pc105".into(),
+            layout: "us,be".into(),
+            variant: String::new(),
+            options: None,
+        });
+        assert!(changed.is_some(), "us,be keymap must compile");
         backend.core.locked_group = 1;
         // group 1 -> bits 13-14 == 1 (XkbGroupForCoreState)
         assert_eq!(backend.serialize_modifiers() & 0x6000, 0x2000);
+    }
+
+    /// A stale or invalid locked group must not leak into core key-event
+    /// state when the active keymap only has group 0. Awesome treats the
+    /// group bits as part of the modifier state when matching global
+    /// keybindings, so a bogus `0x2000` makes every Mod4 binding miss.
+    #[test]
+    fn locked_group_is_clamped_to_keymap_group_count() {
+        use yserver_core::backend::Backend;
+
+        let mut backend = KmsBackendV2::for_tests();
+        backend.core.locked_group = 1;
+        assert_eq!(
+            backend.serialize_modifiers() & 0x6000,
+            0x0000,
+            "single-layout keymap must not stamp stale group 1 into core state",
+        );
+
+        Backend::set_locked_group(&mut backend, 1);
+        assert_eq!(
+            Backend::current_group(&backend),
+            0,
+            "set_locked_group must clamp invalid group 1 to group 0",
+        );
     }
 
     /// `cook_host_key` fills root + event coords from cursor and
@@ -22069,6 +22116,74 @@ mod tests {
             0x01,
             "a modifier key's own release must report pre-release state (Shift still set)"
         );
+    }
+
+    /// Regression guard for WM keybindings: direct-mode raw key input
+    /// must be cooked before core passive-grab routing, so a held
+    /// Super_L (Mod4) makes the following Return press match a
+    /// `GrabKey(Mod4+Return)` on the root window.
+    #[test]
+    fn on_host_input_super_return_activates_mod4_passive_grab() {
+        use yserver_core::{
+            core_loop::HostInputEvent,
+            host_x11::HostKeyEvent,
+            resources::ROOT_WINDOW,
+            server::{ActiveKeyboardGrabSource, KeyGrab, ServerState},
+        };
+        use yserver_protocol::x11::ClientId;
+
+        const WM: ClientId = ClientId(7);
+        const SUPER_L: u8 = 133;
+        const RETURN: u8 = 36;
+        const MOD4: u16 = 0x40;
+
+        let mut b = KmsBackendV2::for_tests();
+        let mut state = ServerState::new();
+        state.key_grabs.push(KeyGrab {
+            owner: WM,
+            grab_window: ROOT_WINDOW,
+            keycode: RETURN,
+            modifiers: MOD4,
+            owner_events: false,
+            pointer_mode: 1,
+            keyboard_mode: 1,
+            via_xi2: false,
+        });
+
+        let key = |keycode, pressed| {
+            HostInputEvent::Key(HostKeyEvent {
+                keycode,
+                pressed,
+                state: 0,
+                root_x: 0,
+                root_y: 0,
+                event_x: 0,
+                event_y: 0,
+                time: 0,
+            })
+        };
+
+        b.on_host_input(&mut state, key(SUPER_L, true));
+        assert_eq!(
+            b.serialize_modifiers() & MOD4,
+            MOD4,
+            "Super_L press must set the backend's effective Mod4 bit"
+        );
+
+        b.on_host_input(&mut state, key(RETURN, true));
+        match state.active_keyboard_grab {
+            Some(grab) => {
+                assert_eq!(grab.owner, WM);
+                assert_eq!(grab.grab_window, ROOT_WINDOW);
+                match grab.source {
+                    ActiveKeyboardGrabSource::PassiveKey { keycode } => {
+                        assert_eq!(keycode, RETURN);
+                    }
+                    other => panic!("expected PassiveKey grab source, got {other:?}"),
+                }
+            }
+            None => panic!("Mod4+Return must activate the WM passive key grab"),
+        }
     }
 
     /// Test A: a compiled `grp:alt_shift_toggle` option makes the
