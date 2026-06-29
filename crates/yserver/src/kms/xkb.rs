@@ -106,6 +106,24 @@ const XKB_NUM_VIRTUAL_MODS: usize = 16;
 /// entry's `kt_index` is a fixed `[u8; 4]`, one type per group.
 const XKB_NUM_KBD_GROUPS: u8 = 4;
 
+const XKB_MAP_PART_KEY_TYPES: u16 = 1 << 0;
+const XKB_MAP_PART_KEY_SYMS: u16 = 1 << 1;
+const XKB_MAP_PART_MODIFIER_MAP: u16 = 1 << 2;
+const XKB_MAP_PART_EXPLICIT_COMPONENTS: u16 = 1 << 3;
+const XKB_MAP_PART_KEY_ACTIONS: u16 = 1 << 4;
+const XKB_MAP_PART_VIRTUAL_MODS: u16 = 1 << 6;
+const XKB_MAP_PART_VIRTUAL_MOD_MAP: u16 = 1 << 7;
+
+/// Map components this backend can actually serialize into GetMap.
+/// KeyBehaviors (bit 5) is intentionally absent.
+const XKB_MAP_PARTS_EMITTED: u16 = XKB_MAP_PART_KEY_TYPES
+    | XKB_MAP_PART_KEY_SYMS
+    | XKB_MAP_PART_MODIFIER_MAP
+    | XKB_MAP_PART_EXPLICIT_COMPONENTS
+    | XKB_MAP_PART_KEY_ACTIONS
+    | XKB_MAP_PART_VIRTUAL_MODS
+    | XKB_MAP_PART_VIRTUAL_MOD_MAP;
+
 /// Virtual-modifier description derived from the live keymap.
 ///
 /// Mutter/GDK devirtualize keybinding modifiers (`<Super>`, `<Alt>`)
@@ -292,7 +310,23 @@ pub(super) fn reply_get_controls(keymap: &Keymap) -> Vec<u8> {
     r
 }
 
-/// XKB GetMap reply (minor=8). Builds a wire-correct reply from
+fn get_map_requested_parts(body: &[u8]) -> u16 {
+    // Request body after the core X11 4-byte header:
+    // deviceSpec:CARD16, full:MASK, partial:MASK, ...
+    if body.len() < 6 {
+        return XKB_MAP_PARTS_EMITTED;
+    }
+
+    let full = u16::from_le_bytes([body[2], body[3]]);
+    let partial = u16::from_le_bytes([body[4], body[5]]);
+    (full | partial) & XKB_MAP_PARTS_EMITTED
+}
+
+pub(super) fn reply_get_map_for_request(keymap: &Keymap, body: &[u8]) -> Vec<u8> {
+    reply_get_map_for_parts(keymap, get_map_requested_parts(body))
+}
+
+/// XKB GetMap reply (minor=8). Builds a wire-correct full reply from
 /// `xkbcommon::Keymap` — real key types, per-key syms, and a
 /// modifier map — so xkbcommon-x11 clients (wezterm via xkbcommon-rs,
 /// every modern toolkit using libxkbcommon) get a usable keymap
@@ -325,6 +359,19 @@ pub(super) fn reply_get_controls(keymap: &Keymap) -> Vec<u8> {
 ///   KeyTypes → KeySyms → KeyActions → KeyBehaviors → VirtualMods
 ///   → ExplicitComponents → ModifierMap → VirtualModMap.
 pub(super) fn reply_get_map(keymap: &Keymap) -> Vec<u8> {
+    reply_get_map_for_parts(keymap, XKB_MAP_PARTS_EMITTED)
+}
+
+fn reply_get_map_for_parts(keymap: &Keymap, requested_parts: u16) -> Vec<u8> {
+    let present = requested_parts & XKB_MAP_PARTS_EMITTED;
+    let include_key_types = present & XKB_MAP_PART_KEY_TYPES != 0;
+    let include_key_syms = present & XKB_MAP_PART_KEY_SYMS != 0;
+    let include_key_actions = present & XKB_MAP_PART_KEY_ACTIONS != 0;
+    let include_virtual_mods = present & XKB_MAP_PART_VIRTUAL_MODS != 0;
+    let include_explicit = present & XKB_MAP_PART_EXPLICIT_COMPONENTS != 0;
+    let include_modifier_map = present & XKB_MAP_PART_MODIFIER_MAP != 0;
+    let include_virtual_mod_map = present & XKB_MAP_PART_VIRTUAL_MOD_MAP != 0;
+
     // X11 keycodes are CARD8 — xkbcommon's keymap can carry a wider
     // range (min=9, max=709 for the default us layout). Clamp into
     // [8, 255] so wire counts fit in u8 and ensure min <= max.
@@ -441,12 +488,18 @@ pub(super) fn reply_get_map(keymap: &Keymap) -> Vec<u8> {
         .iter()
         .map(|t| 8 + 8 * t.map_entries.len())
         .sum();
+    let key_types_bytes = if include_key_types {
+        key_types_bytes
+    } else {
+        0
+    };
 
     // KeySyms: 8-byte header + nSyms * 4 per key.
     let key_syms_bytes: usize = keys
         .iter()
         .map(|k| 8 + 4 * usize::from(k.width) * usize::from(k.num_groups))
         .sum();
+    let key_syms_bytes = if include_key_syms { key_syms_bytes } else { 0 };
 
     // KeyActions: nKeyActions CARD8 counts + pad to 4-byte align +
     // `totalActs` × 8-byte action structs. A modifier key carries one
@@ -462,20 +515,36 @@ pub(super) fn reply_get_map(keymap: &Keymap) -> Vec<u8> {
         .map(|k| u32::from(k.width) * u32::from(k.num_groups))
         .sum();
     let key_actions_bytes: usize = nk + actions_count_pad + (total_acts as usize) * 8;
+    let key_actions_bytes = if include_key_actions {
+        key_actions_bytes
+    } else {
+        0
+    };
 
     // ModifierMap: 2 bytes per entry + pad to 4-byte align.
     let modmap_raw_bytes: usize = usize::from(total_modmap) * 2;
     let modmap_pad = (4 - modmap_raw_bytes % 4) % 4;
     let modmap_bytes: usize = modmap_raw_bytes + modmap_pad;
+    let modmap_bytes = if include_modifier_map {
+        modmap_bytes
+    } else {
+        0
+    };
 
     // VirtualMods: one CARD8 binding per present vmod, padded to a
     // 4-byte boundary (Xorg `XkbPaddedSize`).
     let vmod_count: usize = vmod.present_mask.count_ones() as usize;
     let vmod_pad = (4 - vmod_count % 4) % 4;
     let vmod_bytes: usize = vmod_count + vmod_pad;
+    let vmod_bytes = if include_virtual_mods { vmod_bytes } else { 0 };
     // VirtualModMap: `xkbVModMapWireDesc` { key(1) pad(1) vmods(2) } per
     // entry — already 4-byte sized, no extra pad.
     let vmodmap_bytes: usize = vmod.vmodmap.len() * 4;
+    let vmodmap_bytes = if include_virtual_mod_map {
+        vmodmap_bytes
+    } else {
+        0
+    };
     // ExplicitComponents stays empty (0 bytes).
 
     let extra = key_types_bytes
@@ -494,31 +563,39 @@ pub(super) fn reply_get_map(keymap: &Keymap) -> Vec<u8> {
     r[4..8].copy_from_slice(&length_words.to_le_bytes());
     r[10] = min_kc;
     r[11] = max_kc;
-    // present: KeyTypes|KeySyms|ModifierMap|ExplicitComponents
-    //         |KeyActions|VirtualMods|VirtualModMap = 0xDF.
-    r[12..14].copy_from_slice(&0x00DF_u16.to_le_bytes());
-    // [14] firstType=0
-    r[15] = n_types; // nTypes — derived table size (≥ 4)
-    r[16] = n_types; // totalTypes
-    r[17] = min_kc; // firstKeySym
-    r[18..20].copy_from_slice(&u16::try_from(total_syms).unwrap_or(u16::MAX).to_le_bytes());
-    r[20] = n_keys; // nKeySyms — covers full range
-    r[21] = min_kc; // firstKeyAction
-    r[22..24].copy_from_slice(&u16::try_from(total_acts).unwrap_or(u16::MAX).to_le_bytes());
-    r[24] = n_keys; // nKeyActions — covers full range
-    r[25] = min_kc; // firstKeyBehavior (bit 5 unset → empty)
-    // [26..28] nKeyBehaviors=0, totalKeyBehaviors=0
-    r[28] = min_kc; // firstKeyExplicit
-    // [29..31] nKeyExplicit=0, totalKeyExplicit=0
-    r[31] = min_kc; // firstModMapKey
-    r[32] = n_keys; // nModMapKeys (range; totalModMapKeys is the
-    //                              actual list length, set next)
-    r[33] = total_modmap;
-    r[34] = min_kc; // firstVModMapKey
-    r[35] = n_keys; // nVModMapKeys — covers full range
-    r[36] = u8::try_from(vmod.vmodmap.len()).unwrap_or(u8::MAX); // totalVModMapKeys
-    // [37] pad
-    r[38..40].copy_from_slice(&vmod.present_mask.to_le_bytes()); // virtualMods
+    r[12..14].copy_from_slice(&present.to_le_bytes());
+    if include_key_types {
+        // [14] firstType=0
+        r[15] = n_types; // nTypes — derived table size (≥ 4)
+        r[16] = n_types; // totalTypes
+    }
+    if include_key_syms {
+        r[17] = min_kc; // firstKeySym
+        r[18..20].copy_from_slice(&u16::try_from(total_syms).unwrap_or(u16::MAX).to_le_bytes());
+        r[20] = n_keys; // nKeySyms — covers full range
+    }
+    if include_key_actions {
+        r[21] = min_kc; // firstKeyAction
+        r[22..24].copy_from_slice(&u16::try_from(total_acts).unwrap_or(u16::MAX).to_le_bytes());
+        r[24] = n_keys; // nKeyActions — covers full range
+    }
+    // KeyBehaviors are not implemented and bit 5 is never set in `present`.
+    if include_explicit {
+        r[28] = min_kc; // firstKeyExplicit; empty section
+    }
+    if include_modifier_map {
+        r[31] = min_kc; // firstModMapKey
+        r[32] = n_keys; // nModMapKeys (range; totalModMapKeys is actual list length)
+        r[33] = total_modmap;
+    }
+    if include_virtual_mod_map {
+        r[34] = min_kc; // firstVModMapKey
+        r[35] = n_keys; // nVModMapKeys — covers full range
+        r[36] = u8::try_from(vmod.vmodmap.len()).unwrap_or(u8::MAX); // totalVModMapKeys
+    }
+    if include_virtual_mods {
+        r[38..40].copy_from_slice(&vmod.present_mask.to_le_bytes()); // virtualMods
+    }
 
     // -- Section bodies ------------------------------------------
     let mut off = 40;
@@ -532,104 +609,116 @@ pub(super) fn reply_get_map(keymap: &Keymap) -> Vec<u8> {
     // state against entry `mask` to pick the level (e.g. 0x80 matches
     // the `{mask:0x80 → 2}` entry → € at level 2). ONE_LEVEL is an
     // 8-byte header with no entries.
-    for t in &key_types.types {
-        let or_mods: u8 = t.map_entries.iter().fold(0u8, |acc, e| acc | e.real_mods);
-        r[off] = or_mods; // mods_mask
-        r[off + 1] = or_mods; // mods_mods (realMods)
-        // [off+2..off+4] mods_vmods = 0
-        r[off + 4] = t.num_levels; // numLevels
-        r[off + 5] = u8::try_from(t.map_entries.len()).unwrap_or(u8::MAX); // nMapEntries
-        // [off+6] hasPreserve=0, [off+7] pad
-        let mut eoff = off + 8;
-        for e in &t.map_entries {
-            r[eoff] = 1; // active = true
-            r[eoff + 1] = e.real_mods; // mask
-            r[eoff + 2] = e.level; // level
-            r[eoff + 3] = e.real_mods; // realMods
-            // [eoff+4..+6] virtualMods=0, [eoff+6..+8] pad
-            eoff += 8;
+    if include_key_types {
+        for t in &key_types.types {
+            let or_mods: u8 = t.map_entries.iter().fold(0u8, |acc, e| acc | e.real_mods);
+            r[off] = or_mods; // mods_mask
+            r[off + 1] = or_mods; // mods_mods (realMods)
+            // [off+2..off+4] mods_vmods = 0
+            r[off + 4] = t.num_levels; // numLevels
+            r[off + 5] = u8::try_from(t.map_entries.len()).unwrap_or(u8::MAX); // nMapEntries
+            // [off+6] hasPreserve=0, [off+7] pad
+            let mut eoff = off + 8;
+            for e in &t.map_entries {
+                r[eoff] = 1; // active = true
+                r[eoff + 1] = e.real_mods; // mask
+                r[eoff + 2] = e.level; // level
+                r[eoff + 3] = e.real_mods; // realMods
+                // [eoff+4..+6] virtualMods=0, [eoff+6..+8] pad
+                eoff += 8;
+            }
+            off = eoff;
         }
-        off = eoff;
     }
 
     // KeySyms: per-key KeySymMap.
-    for k in &keys {
-        // [off..off+4] kt_index[4] — one KeyTypes index per group;
-        // groups beyond num_groups stay 0 (ONE_LEVEL), within nTypes.
-        r[off..off + 4].copy_from_slice(&k.kt_index);
-        // [off+4] groupInfo: low 4 bits = num_groups
-        r[off + 4] = k.num_groups & 0x0F;
-        r[off + 5] = k.width;
-        let nsyms = u16::try_from(k.syms.len()).unwrap_or(u16::MAX);
-        r[off + 6..off + 8].copy_from_slice(&nsyms.to_le_bytes());
-        let mut sym_off = off + 8;
-        for sym in &k.syms {
-            r[sym_off..sym_off + 4].copy_from_slice(&sym.to_le_bytes());
-            sym_off += 4;
+    if include_key_syms {
+        for k in &keys {
+            // [off..off+4] kt_index[4] — one KeyTypes index per group;
+            // groups beyond num_groups stay 0 (ONE_LEVEL), within nTypes.
+            r[off..off + 4].copy_from_slice(&k.kt_index);
+            // [off+4] groupInfo: low 4 bits = num_groups
+            r[off + 4] = k.num_groups & 0x0F;
+            r[off + 5] = k.width;
+            let nsyms = u16::try_from(k.syms.len()).unwrap_or(u16::MAX);
+            r[off + 6..off + 8].copy_from_slice(&nsyms.to_le_bytes());
+            let mut sym_off = off + 8;
+            for sym in &k.syms {
+                r[sym_off..sym_off + 4].copy_from_slice(&sym.to_le_bytes());
+                sym_off += 4;
+            }
+            off = sym_off;
         }
-        off = sym_off;
     }
 
     // KeyActions: per-key action count (modifier keys = nSyms, else 0),
     // padded to a 4-byte boundary, then the action structs in key order.
-    for k in &keys {
-        r[off] = if k.mod_bit != 0 {
-            u8::try_from(usize::from(k.width) * usize::from(k.num_groups)).unwrap_or(u8::MAX)
-        } else {
-            0
-        };
-        off += 1;
-    }
-    off += actions_count_pad;
-    // One XkbModAction per sym slot of each modifier key: SetMods
-    // (type 1) for plain modifiers, LockMods (type 3) for Caps/Num lock.
-    // mask = realMods = the key's real-mod bit; flags = 0; vmods = 0.
-    // (8-byte action: type, flags, mask, realMods, vmods1, vmods2, pad,
-    // pad.) This is what tells xkbcommon "this key sets/clears Mod4".
-    for k in &keys {
-        if k.mod_bit == 0 {
-            continue;
+    if include_key_actions {
+        for k in &keys {
+            r[off] = if k.mod_bit != 0 {
+                u8::try_from(usize::from(k.width) * usize::from(k.num_groups)).unwrap_or(u8::MAX)
+            } else {
+                0
+            };
+            off += 1;
         }
-        let act_type: u8 = if k.mod_lock { 3 } else { 1 };
-        let n_acts = usize::from(k.width) * usize::from(k.num_groups);
-        for _ in 0..n_acts {
-            r[off] = act_type; // type
-            // [off + 1] flags = 0
-            r[off + 2] = k.mod_bit; // mask
-            r[off + 3] = k.mod_bit; // realMods
-            // [off + 4 ..= off + 7] vmods (2) + pad (2) = 0
-            off += 8;
+        off += actions_count_pad;
+        // One XkbModAction per sym slot of each modifier key: SetMods
+        // (type 1) for plain modifiers, LockMods (type 3) for Caps/Num lock.
+        // mask = realMods = the key's real-mod bit; flags = 0; vmods = 0.
+        // (8-byte action: type, flags, mask, realMods, vmods1, vmods2, pad,
+        // pad.) This is what tells xkbcommon "this key sets/clears Mod4".
+        for k in &keys {
+            if k.mod_bit == 0 {
+                continue;
+            }
+            let act_type: u8 = if k.mod_lock { 3 } else { 1 };
+            let n_acts = usize::from(k.width) * usize::from(k.num_groups);
+            for _ in 0..n_acts {
+                r[off] = act_type; // type
+                // [off + 1] flags = 0
+                r[off + 2] = k.mod_bit; // mask
+                r[off + 3] = k.mod_bit; // realMods
+                // [off + 4 ..= off + 7] vmods (2) + pad (2) = 0
+                off += 8;
+            }
         }
     }
 
     // VirtualMods: one CARD8 real-mod binding per present vmod, in
     // ascending bit order, then pad to a 4-byte boundary. Matches
     // Xorg `XkbSendMap` (xkb.c:1430-1438).
-    for i in 0..XKB_NUM_VIRTUAL_MODS {
-        if vmod.present_mask & (1 << i) != 0 {
-            r[off] = vmod.bindings[i];
-            off += 1;
+    if include_virtual_mods {
+        for i in 0..XKB_NUM_VIRTUAL_MODS {
+            if vmod.present_mask & (1 << i) != 0 {
+                r[off] = vmod.bindings[i];
+                off += 1;
+            }
         }
+        off += vmod_pad;
     }
-    off += vmod_pad;
     // ExplicitComponents empty (0 entries, 0 pad).
 
     // ModifierMap: 2 bytes per entry, then pad.
-    for entry in &modmap {
-        r[off] = entry.keycode;
-        r[off + 1] = entry.mods;
-        off += 2;
+    if include_modifier_map {
+        for entry in &modmap {
+            r[off] = entry.keycode;
+            r[off + 1] = entry.mods;
+            off += 2;
+        }
+        off += modmap_pad;
     }
-    off += modmap_pad;
 
     // VirtualModMap: `xkbVModMapWireDesc` { key, pad, vmods(CARD16) }
     // per entry. Combined with the ModifierMap, lets clients resolve
     // each vmod to its real modifier (`XkbVirtualModsToReal`).
-    for (key, vmods) in &vmod.vmodmap {
-        r[off] = *key;
-        // r[off + 1] pad = 0
-        r[off + 2..off + 4].copy_from_slice(&vmods.to_le_bytes());
-        off += 4;
+    if include_virtual_mod_map {
+        for (key, vmods) in &vmod.vmodmap {
+            r[off] = *key;
+            // r[off + 1] pad = 0
+            r[off + 2..off + 4].copy_from_slice(&vmods.to_le_bytes());
+            off += 4;
+        }
     }
 
     debug_assert_eq!(off, total, "GetMap reply body length matches total");
@@ -2268,6 +2357,14 @@ mod tests {
         .expect("test xkb keymap")
     }
 
+    fn get_map_request_body(full: u16, partial: u16) -> [u8; 20] {
+        let mut body = [0u8; 20];
+        body[0..2].copy_from_slice(&0x0100_u16.to_le_bytes()); // UseCoreKbd
+        body[2..4].copy_from_slice(&full.to_le_bytes());
+        body[4..6].copy_from_slice(&partial.to_le_bytes());
+        body
+    }
+
     /// Parsed `KeySymMap` entry for one keycode, pulled out of a
     /// `reply_get_map` byte stream by walking the KeySyms section.
     struct ParsedKeySymMap {
@@ -2601,6 +2698,58 @@ mod tests {
         assert_eq!(r[31], min_kc, "firstModMapKey = min_kc");
         assert_eq!(r[32], n_keys, "nModMapKeys = full range");
         assert!(r[33] <= r[32], "totalModMapKeys ≤ nModMapKeys");
+    }
+
+    #[test]
+    fn get_map_request_only_advertises_requested_parts() {
+        let km = test_keymap();
+        let body = get_map_request_body(XKB_MAP_PART_KEY_TYPES | XKB_MAP_PART_KEY_SYMS, 0);
+        let r = reply_get_map_for_request(&km, &body);
+
+        let present = u16::from_le_bytes([r[12], r[13]]);
+        assert_eq!(
+            present,
+            XKB_MAP_PART_KEY_TYPES | XKB_MAP_PART_KEY_SYMS,
+            "GetMap present must not include sections absent from full|partial"
+        );
+
+        let length_words = u32::from_le_bytes([r[4], r[5], r[6], r[7]]) as usize;
+        assert_eq!(length_words * 4 + 32, r.len());
+        assert!(r.len().is_multiple_of(4));
+
+        assert!(r[15] >= 4, "requested KeyTypes are present");
+        assert_eq!(r[17], r[10], "requested KeySyms firstKeySym = minKeyCode");
+        assert_eq!(r[20], r[11] - r[10] + 1, "requested KeySyms cover range");
+
+        assert_eq!(r[21], 0, "unrequested KeyActions first key is zero");
+        assert_eq!(
+            u16::from_le_bytes([r[22], r[23]]),
+            0,
+            "unrequested KeyActions totalActions is zero"
+        );
+        assert_eq!(r[24], 0, "unrequested KeyActions nKeyActions is zero");
+        assert_eq!(r[31], 0, "unrequested ModifierMap first key is zero");
+        assert_eq!(r[32], 0, "unrequested ModifierMap n keys is zero");
+        assert_eq!(r[33], 0, "unrequested ModifierMap total keys is zero");
+        assert_eq!(r[34], 0, "unrequested VirtualModMap first key is zero");
+        assert_eq!(r[35], 0, "unrequested VirtualModMap n keys is zero");
+        assert_eq!(r[36], 0, "unrequested VirtualModMap total keys is zero");
+        assert_eq!(
+            u16::from_le_bytes([r[38], r[39]]),
+            0,
+            "unrequested VirtualMods mask is zero"
+        );
+
+        let (_types, mut off) = parse_key_types(&r);
+        for _ in 0..r[20] {
+            let nsyms = u16::from_le_bytes([r[off + 6], r[off + 7]]) as usize;
+            off += 8 + nsyms * 4;
+        }
+        assert_eq!(
+            off,
+            r.len(),
+            "reply body must stop after requested KeyTypes and KeySyms"
+        );
     }
 
     #[test]

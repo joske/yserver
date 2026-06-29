@@ -17427,7 +17427,7 @@ impl Backend for KmsBackendV2 {
         &mut self,
         _origin: Option<OriginContext>,
         minor: u8,
-        _body: &[u8],
+        body: &[u8],
         intern_atom: &mut dyn FnMut(&str) -> u32,
     ) -> io::Result<Option<Vec<u8>>> {
         // Mirror v1's xkb_proxy verbatim — pure protocol
@@ -17444,7 +17444,10 @@ impl Backend for KmsBackendV2 {
                 self.effective_locked_group(),
             )),
             6 => Some(xkb_replies::reply_get_controls(&self.core.xkb_keymap.0)),
-            8 => Some(xkb_replies::reply_get_map(&self.core.xkb_keymap.0)),
+            8 => Some(xkb_replies::reply_get_map_for_request(
+                &self.core.xkb_keymap.0,
+                body,
+            )),
             10 => Some(xkb_replies::reply_get_compat_map()),
             // minor 13 is GetIndicatorMap (clients send it 8×); minor 22 is
             // ListComponents, which clients don't send — a minimal reply is
@@ -17455,7 +17458,7 @@ impl Backend for KmsBackendV2 {
             15 => Some(xkb_replies::reply_get_named_indicator(
                 &self.core.xkb_keymap.0,
                 &self.core.xkb_state.0,
-                _body,
+                body,
                 intern_atom,
             )),
             17 => Some(xkb_replies::reply_get_names(
@@ -17463,7 +17466,7 @@ impl Backend for KmsBackendV2 {
                 &self.core.xkb_rmlvo,
                 intern_atom,
             )),
-            21 => Some(xkb_replies::reply_per_client_flags(_body)),
+            21 => Some(xkb_replies::reply_per_client_flags(body)),
             22 => Some(xkb_replies::reply_minimal(22)),
             24 => Some(xkb_replies::reply_get_device_info()),
             12 | 19 | 23 | 101 => Some(xkb_replies::reply_minimal(minor)),
@@ -18477,6 +18480,34 @@ mod tests {
             r22.as_ref().map(Vec::len),
             Some(416),
             "minor 22 (ListComponents) must not be the IndicatorMap reply"
+        );
+    }
+
+    #[test]
+    fn xkb_proxy_get_map_respects_client_requested_parts() {
+        let mut backend = KmsBackendV2::for_tests();
+        let mut intern = |_name: &str| 1u32;
+        let mut body = [0u8; 20];
+        body[0..2].copy_from_slice(&0x0100_u16.to_le_bytes()); // UseCoreKbd
+        body[2..4].copy_from_slice(&0x0003_u16.to_le_bytes()); // KeyTypes|KeySyms
+
+        let reply = backend
+            .xkb_proxy(None, 8, &body, &mut intern)
+            .expect("xkb_proxy ok")
+            .expect("minor 8 returns a GetMap reply");
+
+        assert_eq!(
+            u16::from_le_bytes([reply[12], reply[13]]),
+            0x0003,
+            "GetMap present must be limited to the requested KeyTypes|KeySyms"
+        );
+        assert_eq!(u16::from_le_bytes([reply[22], reply[23]]), 0);
+        assert_eq!(reply[24], 0, "unrequested KeyActions must be absent");
+        assert_eq!(reply[33], 0, "unrequested ModifierMap must be absent");
+        assert_eq!(
+            u16::from_le_bytes([reply[38], reply[39]]),
+            0,
+            "unrequested VirtualMods must be absent"
         );
     }
 
