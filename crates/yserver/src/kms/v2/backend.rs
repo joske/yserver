@@ -132,6 +132,20 @@ struct SeedInferiorDraw {
     height: u32,
 }
 
+/// One visible window-storage draw when a root-window `CopyArea`
+/// source uses `IncludeInferiors`. Coordinates are root-local; the
+/// `src_*` fields are local to the sampled drawable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceInferiorDraw {
+    source_id: crate::kms::v2::store::DrawableId,
+    src_x: i32,
+    src_y: i32,
+    root_x: i32,
+    root_y: i32,
+    width: u32,
+    height: u32,
+}
+
 /// Monotonic connector-keyed RANDR connector registry.
 ///
 /// Authoritative store for every connector yserver has ever seen:
@@ -2559,6 +2573,257 @@ impl KmsBackendV2 {
         } else {
             child_clipped_rects
         }
+    }
+
+    /// Plan source-side inferiors for `CopyArea(src=root, ...)` when
+    /// the GC's subwindow-mode is `IncludeInferiors`. The ordinary
+    /// root storage copy only contains the background/root layer; this
+    /// adds the visible top-level windows and descendants in the same
+    /// bottom-to-top traversal order as scene composition.
+    fn plan_root_include_inferiors_source_draws(&self) -> Vec<SourceInferiorDraw> {
+        let mut out = Vec::new();
+        for &xid in &self.core.top_level_order {
+            self.collect_root_include_inferior_window(xid, 0, 0, false, &mut out);
+        }
+        out
+    }
+
+    fn collect_root_include_inferior_window(
+        &self,
+        host_xid: u32,
+        parent_abs_x: i32,
+        parent_abs_y: i32,
+        under_redirected_ancestor: bool,
+        out: &mut Vec<SourceInferiorDraw>,
+    ) {
+        let Some(geom) = self.windows_v2.get(&host_xid).copied() else {
+            return;
+        };
+        if !geom.mapped {
+            return;
+        }
+
+        let abs_x = parent_abs_x + i32::from(geom.x);
+        let abs_y = parent_abs_y + i32::from(geom.y);
+        let mut child_under_redirected_ancestor = under_redirected_ancestor;
+
+        if let Some(id) = self.store.lookup(host_xid)
+            && let Some(d) = self.store.get(id)
+        {
+            let source_id = self.store.redirected_target(id).unwrap_or(id);
+            let has_own_redirected_target = source_id != id;
+            let is_manual_redirected = has_own_redirected_target && !d.scene_participating;
+            let paint_target_is_self = !is_manual_redirected
+                && (has_own_redirected_target
+                    || (d.scene_participating && !under_redirected_ancestor));
+
+            if matches!(d.kind, crate::kms::v2::store::DrawableKind::Window)
+                && paint_target_is_self
+                && let Some(source) = self.store.get(source_id)
+            {
+                let w = u32::from(geom.width).min(source.storage.extent.width);
+                let h = u32::from(geom.height).min(source.storage.extent.height);
+                self.push_source_inferior_rects(host_xid, source_id, abs_x, abs_y, w, h, out);
+            }
+
+            child_under_redirected_ancestor =
+                under_redirected_ancestor || has_own_redirected_target;
+        }
+
+        let mut children: Vec<(u32, u64)> = self
+            .windows_v2
+            .iter()
+            .filter_map(|(child_xid, child_geom)| {
+                (child_geom.parent == Some(host_xid)).then_some((*child_xid, child_geom.stack_rank))
+            })
+            .collect();
+        children.sort_by_key(|(_, rank)| *rank);
+        for (child_xid, _) in children {
+            self.collect_root_include_inferior_window(
+                child_xid,
+                abs_x,
+                abs_y,
+                child_under_redirected_ancestor,
+                out,
+            );
+        }
+    }
+
+    fn push_source_inferior_rects(
+        &self,
+        host_xid: u32,
+        source_id: crate::kms::v2::store::DrawableId,
+        root_x: i32,
+        root_y: i32,
+        w: u32,
+        h: u32,
+        out: &mut Vec<SourceInferiorDraw>,
+    ) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        let mut emit = |src_x: i32, src_y: i32, root_x: i32, root_y: i32, w: i32, h: i32| {
+            if w <= 0 || h <= 0 {
+                return;
+            }
+            #[allow(clippy::cast_sign_loss)]
+            out.push(SourceInferiorDraw {
+                source_id,
+                src_x,
+                src_y,
+                root_x,
+                root_y,
+                width: w as u32,
+                height: h as u32,
+            });
+        };
+        if let Some(rects) = self.core.shape_bounding.get(&host_xid) {
+            for r in rects {
+                let rx = i32::from(r.x);
+                let ry = i32::from(r.y);
+                let rw = i32::from(r.width);
+                let rh = i32::from(r.height);
+                let cx = rx.max(0);
+                let cy = ry.max(0);
+                #[allow(clippy::cast_possible_wrap)]
+                let cw = (rx + rw).min(w as i32) - cx;
+                #[allow(clippy::cast_possible_wrap)]
+                let ch = (ry + rh).min(h as i32) - cy;
+                if cw > 0 && ch > 0 {
+                    emit(cx, cy, root_x + cx, root_y + cy, cw, ch);
+                }
+            }
+        } else {
+            #[allow(clippy::cast_possible_wrap)]
+            emit(0, 0, root_x, root_y, w as i32, h as i32);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_copy_area_blit(
+        &mut self,
+        src: crate::kms::v2::store::DrawableId,
+        dst: crate::kms::v2::store::DrawableId,
+        src_rect: ash::vk::Rect2D,
+        dst_pos: ash::vk::Offset2D,
+        routes_to_cow: bool,
+        log_context: &'static str,
+    ) -> bool {
+        self.engine_copy_area_calls = self.engine_copy_area_calls.wrapping_add(1);
+        self.telemetry.record_copy_area_gpu_subrect_at(false);
+        let res = if routes_to_cow {
+            self.engine.cow_copy_area(
+                &mut self.store,
+                &mut self.platform,
+                dst,
+                src,
+                src_rect,
+                dst_pos,
+            )
+        } else {
+            self.engine.copy_area(
+                &mut self.store,
+                &mut self.platform,
+                src,
+                dst,
+                src_rect,
+                dst_pos,
+            )
+        };
+        if let Err(e) = res {
+            log::warn!("v2 copy_area {log_context}: engine copy failed: {e:?}");
+            false
+        } else {
+            true
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn copy_area_root_include_inferiors(
+        &mut self,
+        root_id: crate::kms::v2::store::DrawableId,
+        dst_id: crate::kms::v2::store::DrawableId,
+        src_x: i16,
+        src_y: i16,
+        dst_x: i16,
+        dst_y: i16,
+        dst_target_offset: (i32, i32),
+        sub_rects: &[ash::vk::Rect2D],
+        routes_to_cow: bool,
+    ) -> bool {
+        let mut all_ok = true;
+        let visible_inferiors = self.plan_root_include_inferiors_source_draws();
+        let dst_format = self.store.get(dst_id).map(|d| d.storage.format);
+
+        for sub in sub_rects {
+            let source_rect = ash::vk::Rect2D {
+                offset: ash::vk::Offset2D {
+                    x: i32::from(src_x) + (sub.offset.x - i32::from(dst_x)),
+                    y: i32::from(src_y) + (sub.offset.y - i32::from(dst_y)),
+                },
+                extent: sub.extent,
+            };
+            let dst_pos = ash::vk::Offset2D {
+                x: sub.offset.x + dst_target_offset.0,
+                y: sub.offset.y + dst_target_offset.1,
+            };
+            all_ok &= self.submit_copy_area_blit(
+                root_id,
+                dst_id,
+                source_rect,
+                dst_pos,
+                routes_to_cow,
+                "root-include-inferiors/base",
+            );
+
+            for draw in &visible_inferiors {
+                let src_format = self.store.get(draw.source_id).map(|d| d.storage.format);
+                if src_format != dst_format {
+                    continue;
+                }
+                let draw_root_rect = ash::vk::Rect2D {
+                    offset: ash::vk::Offset2D {
+                        x: draw.root_x,
+                        y: draw.root_y,
+                    },
+                    extent: ash::vk::Extent2D {
+                        width: draw.width,
+                        height: draw.height,
+                    },
+                };
+                let Some(overlap) = intersect_rect_with_clip(source_rect, &[draw_root_rect])
+                    .into_iter()
+                    .next()
+                else {
+                    continue;
+                };
+                let leaf_src_rect = ash::vk::Rect2D {
+                    offset: ash::vk::Offset2D {
+                        x: draw.src_x + (overlap.offset.x - draw.root_x),
+                        y: draw.src_y + (overlap.offset.y - draw.root_y),
+                    },
+                    extent: overlap.extent,
+                };
+                let leaf_dst_pos = ash::vk::Offset2D {
+                    x: sub.offset.x
+                        + (overlap.offset.x - source_rect.offset.x)
+                        + dst_target_offset.0,
+                    y: sub.offset.y
+                        + (overlap.offset.y - source_rect.offset.y)
+                        + dst_target_offset.1,
+                };
+                all_ok &= self.submit_copy_area_blit(
+                    draw.source_id,
+                    dst_id,
+                    leaf_src_rect,
+                    leaf_dst_pos,
+                    routes_to_cow,
+                    "root-include-inferiors/window",
+                );
+            }
+        }
+
+        all_ok
     }
 
     /// Stage 4c.2 — compute the screen-absolute rect for a window's
@@ -14034,11 +14299,39 @@ impl Backend for KmsBackendV2 {
                 return Ok(());
             }
         }
+        let routes_to_cow = self.cow_id == Some(dst_target.id) && src != dst_target.id;
+        if src_host_xid == self.core.window_id
+            && dst_host_xid != self.core.window_id
+            && !self.windows_v2.contains_key(&dst_host_xid)
+            && matches!(
+                self.core.current_subwindow_mode,
+                yserver_core::backend::SubwindowMode::IncludeInferiors,
+            )
+        {
+            let all_ok = self.copy_area_root_include_inferiors(
+                src,
+                dst_target.id,
+                src_x,
+                src_y,
+                dst_x,
+                dst_y,
+                dst_target.offset,
+                &sub_rects,
+                routes_to_cow,
+            );
+            if all_ok {
+                if !routes_to_cow {
+                    self.telemetry.record_paint_submit();
+                    self.trace_simple(SubmitKind::CopyArea, dst_target.id, 1);
+                }
+                self.scene.wake_for_damage();
+            }
+            return Ok(());
+        }
         // Stage 5 Task 3 POC: route copy_area to COW through the
         // frame-builder path. Marco's compositor pump is the hot
         // workload (silence trace: 47k of 62k copy_areas target
         // COW). Telemetry for cow-routed copies is deferred.
-        let routes_to_cow = self.cow_id == Some(dst_target.id) && src != dst_target.id;
 
         let mut all_ok = true;
         for sub in &sub_rects {
@@ -23014,6 +23307,46 @@ mod tests {
     }
 
     #[test]
+    fn plan_root_include_inferiors_source_draws_walks_top_levels_and_descendants() {
+        let mut b = KmsBackendV2::for_tests();
+        let below_id = seed_window(&mut b, 0x100, None, 20, 30);
+        let child_id = seed_window(&mut b, 0x101, Some(0x100), 5, 7);
+        let above_id = seed_window(&mut b, 0x200, None, 60, 70);
+        b.core.top_level_order = vec![0x100, 0x200];
+        b.windows_v2.get_mut(&0x100).unwrap().stack_rank = 1;
+        b.windows_v2.get_mut(&0x101).unwrap().stack_rank = 2;
+        b.windows_v2.get_mut(&0x200).unwrap().stack_rank = 3;
+
+        let got: Vec<_> = b
+            .plan_root_include_inferiors_source_draws()
+            .into_iter()
+            .map(|d| {
+                (
+                    d.source_id,
+                    d.src_x,
+                    d.src_y,
+                    d.root_x,
+                    d.root_y,
+                    d.width,
+                    d.height,
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            got,
+            vec![
+                (below_id, 0, 0, 20, 30, 100, 100),
+                (child_id, 0, 0, 25, 37, 100, 100),
+                (above_id, 0, 0, 60, 70, 100, 100),
+            ],
+            "root IncludeInferiors source planning must mirror scene order: \
+             root base first via the caller, then top-levels and descendants \
+             bottom-to-top in root coordinates",
+        );
+    }
+
+    #[test]
     fn clip_fill_rects_by_subwindow_mode_subtracts_mapped_child() {
         let mut b = KmsBackendV2::for_tests();
         let _parent = seed_window(&mut b, 0x100, None, 0, 0);
@@ -26225,6 +26558,88 @@ mod tests {
             .expect("root-path get_image")
             .expect("root-path bytes");
         assert_eq!(root_out, expected);
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn root_copy_area_include_inferiors_copies_mapped_child_to_pixmap() {
+        use yserver_core::{
+            backend::{DrawState, SubwindowMode, WindowHandle},
+            host_x11::HostSubwindowVisual,
+        };
+
+        let mut backend = match KmsBackendV2::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        let root = WindowHandle::from_raw(backend.core.window_id).expect("root handle");
+        let root_xid = root.as_raw();
+        let root_color = 0xFF00_00FF;
+        let child_color = 0xFFFF_0000;
+
+        backend
+            .fill_rectangle(None, root_xid, root_color, 0, 0, 64, 64)
+            .expect("fill root");
+        let child = backend
+            .create_subwindow(
+                None,
+                root,
+                8,
+                6,
+                16,
+                16,
+                0,
+                HostSubwindowVisual::Explicit {
+                    depth: 32,
+                    visual_xid: 0,
+                    colormap_xid: 0,
+                },
+                None,
+                None,
+            )
+            .expect("create child");
+        let child_xid = child.as_raw();
+        backend.core.top_level_order = vec![child_xid];
+        backend.map_subwindow(None, child_xid).expect("map child");
+        backend
+            .fill_rectangle(None, child_xid, child_color, 0, 0, 16, 16)
+            .expect("fill child");
+
+        let dst = backend
+            .create_pixmap(None, 32, 64, 64)
+            .expect("create destination pixmap");
+        backend
+            .apply_draw_state(
+                None,
+                &DrawState {
+                    subwindow_mode: SubwindowMode::IncludeInferiors,
+                    ..DrawState::default()
+                },
+            )
+            .expect("apply IncludeInferiors");
+        backend
+            .copy_area(None, root_xid, dst.as_raw(), 0, 0, 0, 0, 64, 64)
+            .expect("copy root to pixmap");
+
+        let out = backend
+            .get_image_pixels_for_tests(dst.as_raw(), 2, 0, 0, 64, 64, !0)
+            .expect("dst get_image")
+            .expect("dst bytes");
+        let bg_off = 4;
+        assert_eq!(
+            &out[bg_off..bg_off + 4],
+            &[0xFF, 0x00, 0x00, 0xFF],
+            "root background must still be copied into the destination",
+        );
+        let child_off = (10 * 64 + 12) * 4;
+        assert_eq!(
+            &out[child_off..child_off + 4],
+            &[0x00, 0x00, 0xFF, 0xFF],
+            "root CopyArea with IncludeInferiors must include mapped child pixels",
+        );
     }
 
     #[test]

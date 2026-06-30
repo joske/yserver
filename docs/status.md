@@ -201,6 +201,16 @@ Cross-cutting bugs and followups that don't fit a stage live in
   root screenshot path is covered by unit tests and a backend
   compile-time smoke; live `xwd -root` desktop smoke still needs a real
   KMS session.
+- **2026-06-30 root-window CopyArea screenshot support**: Qt and
+  Flameshot use `CopyArea(src=root, dst=pixmap)` with a GC whose
+  subwindow-mode is `IncludeInferiors`. v2 previously only applied
+  subwindow-mode on the destination side, so the source resolved to
+  root storage and copied only the wallpaper/background. The KMS v2
+  backend now handles the root-source `IncludeInferiors` screenshot
+  path by copying the root base and then overlaying mapped top-levels
+  and descendants in scene order into the destination pixmap. Coverage
+  pins the no-Vulkan planner for root-source inferior traversal; live
+  Flameshot/Qt smoke still needs a real KMS session.
 - **2026-06-14 idle compositor / VT-away wake suppression fix**:
   implementation is on `fix/idle-compositor`, following
   `docs/superpowers/specs/2026-06-14-idle-compositor-cursor-damage.md`.
