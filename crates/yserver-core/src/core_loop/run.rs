@@ -584,8 +584,7 @@ pub fn run_core(
                 SEAT_TOKEN => {
                     backend.on_seat_ready(state);
                 }
-                tok if token_to_client(tok).is_some() => {
-                    let client_id = token_to_client(tok).expect("guard checked token_to_client");
+                tok if let Some(client_id) = token_to_client(tok) => {
                     // I3: WRITABLE-readiness on a client writer fd.
                     // Drain the outbound buffer; if it empties, the
                     // post-loop interest reconciliation drops
