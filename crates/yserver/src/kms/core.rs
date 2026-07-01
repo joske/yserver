@@ -149,6 +149,7 @@ pub(crate) struct FontState {
     pub(crate) face: RefCell<FreetypeFace>,
     pub(crate) metrics: FontMetrics,
     pub(crate) char_info_cache: HashMap<char, ProtocolCharInfo>,
+    pub(crate) glyph_span_cache: RefCell<HashMap<char, Vec<Rectangle16>>>,
 }
 
 /// Resolves X11 font names (aliases like `fixed`, XLFDs like
@@ -1537,6 +1538,22 @@ impl AliasRegistry {
     #[must_use]
     pub fn get(&self, host_pixmap: PixmapHandle) -> Option<&AliasEntry> {
         self.entries.get(&host_pixmap.as_raw())
+    }
+
+    /// Update the logical geometry metadata for a live backing
+    /// without touching its refcount.
+    pub fn update_geometry(
+        &mut self,
+        host_pixmap: PixmapHandle,
+        width: u16,
+        height: u16,
+        depth: u8,
+    ) {
+        if let Some(e) = self.entries.get_mut(&host_pixmap.as_raw()) {
+            e.width = width;
+            e.height = height;
+            e.depth = depth;
+        }
     }
 
     /// Bump the refcount. Silently no-ops on an unknown handle — the

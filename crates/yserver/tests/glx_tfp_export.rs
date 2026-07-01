@@ -125,12 +125,19 @@ fn test_engine_harness() -> Option<PromoteHarness> {
     Some(PromoteHarness { backend, vk })
 }
 
-/// Read the first BGRA pixel (as 0xRRGGBB, alpha dropped) out of the
-/// exported dma-buf. Re-imports the fd through the production
+/// Read one BGRA pixel (as 0xRRGGBB, alpha dropped) out of the exported
+/// dma-buf. Re-imports the fd through the production
 /// `DrawableImage::from_dmabuf` path, then `vkCmdCopyImageToBuffer`s
 /// into a HOST_VISIBLE staging buffer — DEVICE_LOCAL exported memory
 /// is not CPU-mappable on a dGPU, so a raw mmap of the fd is not used.
-fn read_dmabuf_pixel0(vk: &Arc<VkContext>, exported: &DmabufExport, w: u32, h: u32) -> u32 {
+fn read_dmabuf_pixel(
+    vk: &Arc<VkContext>,
+    exported: &DmabufExport,
+    w: u32,
+    h: u32,
+    x: u32,
+    y: u32,
+) -> u32 {
     use std::os::fd::AsFd;
     use yserver::kms::vk::target::{DrawableImage, EXPORT_FORMAT_BGRA8};
 
@@ -143,8 +150,8 @@ fn read_dmabuf_pixel0(vk: &Arc<VkContext>, exported: &DmabufExport, w: u32, h: u
         w,
         h,
         EXPORT_FORMAT_BGRA8,
-        0, // DRM_FORMAT_MOD_LINEAR
-        &[0],
+        exported.modifier,
+        &[u64::from(exported.offset)],
         &[exported.stride],
     )
     .expect("from_dmabuf re-import");
@@ -231,9 +238,10 @@ fn read_dmabuf_pixel0(vk: &Arc<VkContext>, exported: &DmabufExport, w: u32, h: u
             .device
             .map_memory(memory, 0, buf_size, vk::MemoryMapFlags::empty())
             .expect("map_memory") as *const u8;
-        let b = u32::from(*ptr);
-        let g = u32::from(*ptr.add(1));
-        let r = u32::from(*ptr.add(2));
+        let off = usize::try_from((y * w + x) * 4).expect("pixel offset fits usize");
+        let b = u32::from(*ptr.add(off));
+        let g = u32::from(*ptr.add(off + 1));
+        let r = u32::from(*ptr.add(off + 2));
         vk.device.unmap_memory(memory);
         (r << 16) | (g << 8) | b
     };
@@ -244,6 +252,10 @@ fn read_dmabuf_pixel0(vk: &Arc<VkContext>, exported: &DmabufExport, w: u32, h: u
         vk.device.free_memory(memory, None);
     }
     pixel
+}
+
+fn read_dmabuf_pixel0(vk: &Arc<VkContext>, exported: &DmabufExport, w: u32, h: u32) -> u32 {
+    read_dmabuf_pixel(vk, exported, w, h, 0, 0)
 }
 
 #[test]
@@ -271,6 +283,118 @@ fn promotion_preserves_content_and_is_live() {
     assert_eq!(
         pixel2, 0x00_FF_00,
         "post-promotion write not visible in dmabuf — not live"
+    );
+}
+
+#[test]
+#[ignore = "requires a Vulkan device"]
+fn exported_depth24_fill_batch_reaches_bottom_rows() {
+    let Some(mut h) = test_engine_harness() else {
+        return;
+    };
+
+    let w = 484u16;
+    let h_px = 340u16;
+    let pix = h.create_pixmap(w, h_px, 24);
+
+    // Seed white so stale pixels are easy to spot in the exported readback.
+    h.fill_solid(pix, 0xFF_FF_FF, w, h_px);
+    h.flush_and_wait();
+
+    let exported = h.promote_and_export(pix).expect("promote + export");
+    let vk = Arc::clone(&h.vk);
+
+    // Build a large span-style batch: thin black runs near the top and the
+    // bottom of the drawable. This matches xterm's text path more closely
+    // than a single full-rect fill and exercises `fill_rect_batch` with many
+    // `ClearRect`s on an exported depth-24 backing.
+    let mut rects = Vec::new();
+    for y in [8u16, 25, 42, 59, 280, 297, 314] {
+        rects.extend_from_slice(&i16::to_le_bytes(0));
+        rects.extend_from_slice(&i16::to_le_bytes(i16::try_from(y).expect("y fits i16")));
+        rects.extend_from_slice(&u16::to_le_bytes(w));
+        rects.extend_from_slice(&u16::to_le_bytes(8));
+    }
+    h.backend
+        .poly_fill_rectangle(None, pix, 0x00_00_00, &rects)
+        .expect("poly_fill_rectangle");
+    h.flush_and_wait();
+
+    let top = read_dmabuf_pixel(&vk, &exported, u32::from(w), u32::from(h_px), 20, 12);
+    let bottom = read_dmabuf_pixel(&vk, &exported, u32::from(w), u32::from(h_px), 20, 318);
+    assert_eq!(top, 0x00_00_00, "top span missing from exported backing");
+    assert_eq!(
+        bottom, 0x00_00_00,
+        "bottom span missing from exported backing while top span is present"
+    );
+}
+
+#[test]
+#[ignore = "requires a Vulkan device"]
+fn exported_depth24_copy_area_scroll_stays_live_across_full_height() {
+    let Some(mut h) = test_engine_harness() else {
+        return;
+    };
+
+    let w = 160u16;
+    let h_px = 170u16;
+    let pix = h.create_pixmap(w, h_px, 24);
+
+    // Seed five horizontal bands with distinct colors.
+    let bands = [
+        (0u16, 34u16, 0xFF_00_00),
+        (34, 34, 0x00_FF_00),
+        (68, 34, 0x00_00_FF),
+        (102, 34, 0xFF_FF_00),
+        (136, 34, 0xFF_00_FF),
+    ];
+    for (y, height, rgb) in bands {
+        let mut rect = Vec::new();
+        rect.extend_from_slice(&i16::to_le_bytes(0));
+        rect.extend_from_slice(&i16::to_le_bytes(i16::try_from(y).expect("y fits i16")));
+        rect.extend_from_slice(&u16::to_le_bytes(w));
+        rect.extend_from_slice(&u16::to_le_bytes(height));
+        h.backend
+            .poly_fill_rectangle(None, pix, rgb, &rect)
+            .expect("poly_fill_rectangle");
+    }
+    h.flush_and_wait();
+
+    let exported = h.promote_and_export(pix).expect("promote + export");
+    let vk = Arc::clone(&h.vk);
+
+    // Scroll up by one band height and repaint the newly exposed bottom band.
+    h.backend
+        .copy_area(None, pix, pix, 0, 34, 0, 0, w, h_px - 34)
+        .expect("copy_area");
+    let mut bottom_rect = Vec::new();
+    bottom_rect.extend_from_slice(&i16::to_le_bytes(0));
+    bottom_rect.extend_from_slice(&i16::to_le_bytes(136));
+    bottom_rect.extend_from_slice(&u16::to_le_bytes(w));
+    bottom_rect.extend_from_slice(&u16::to_le_bytes(34));
+    h.backend
+        .poly_fill_rectangle(None, pix, 0x00_FF_FF, &bottom_rect)
+        .expect("bottom repaint");
+    h.flush_and_wait();
+
+    // After the scroll:
+    // - old green band moved to y=0..33
+    // - old yellow band moved to y=68..101
+    // - new cyan band occupies the bottom.
+    assert_eq!(
+        read_dmabuf_pixel(&vk, &exported, u32::from(w), u32::from(h_px), 10, 10),
+        0x00_FF_00,
+        "top region did not reflect CopyArea scroll"
+    );
+    assert_eq!(
+        read_dmabuf_pixel(&vk, &exported, u32::from(w), u32::from(h_px), 10, 85),
+        0xFF_FF_00,
+        "middle region did not reflect CopyArea scroll"
+    );
+    assert_eq!(
+        read_dmabuf_pixel(&vk, &exported, u32::from(w), u32::from(h_px), 10, 150),
+        0x00_FF_FF,
+        "bottom repaint after CopyArea did not reach exported backing"
     );
 }
 

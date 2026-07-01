@@ -111,6 +111,10 @@ pub(crate) type WindowsV2Map = HashMap<u32, WindowGeometryV2>;
 pub(crate) struct PaintTarget {
     pub(crate) id: crate::kms::v2::store::DrawableId,
     pub(crate) offset: (i32, i32),
+    /// The logical X11 drawable depth of the ORIGINAL draw target.
+    /// This can differ from the backing storage depth when a depth-24
+    /// child paints into a depth-32 redirected frame backing.
+    pub(crate) x11_depth: u8,
 }
 
 /// One leaf→backing composite emitted by
@@ -355,6 +359,28 @@ pub struct KmsBackendV2 {
     /// refcount lives on `core.cow_refcount` per the v2 plan
     /// §"`KmsCore` scope — narrowly drawn" split.
     pub(crate) cow_id: Option<crate::kms::v2::store::DrawableId>,
+
+    /// Per-CRTC armed absolute MSC for idle vblank pacing. Keyed by the
+    /// stable `crtc::Handle`; presence means "a `DRM_CRTC_SEQUENCE` is
+    /// queued on this CRTC and we are waiting for it" (value `0` is the
+    /// relative-next-vblank sentinel this spike uses). A per-CRTC map
+    /// rather than a single bool so arming CRTC A can't suppress arming
+    /// CRTC B (the dual-monitor permanent-stall class).
+    ///
+    /// **Invariant (load-bearing):** every code path that drops or
+    /// completes an armed sequence MUST clear the matching entry —
+    /// `on_crtc_sequence_event` (unconditional clear-arm before
+    /// validating), `!scanout_allowed()` in `arm_idle_vblanks_with`,
+    /// `run_suspend` / DPMS-off (master loss drops queued sequences), and
+    /// output removal (`prune_armed_targets_to_live_outputs`). A stuck
+    /// entry = a permanent ~0 fps stall on that CRTC.
+    pub(crate) armed_vblank_targets: std::collections::HashMap<::drm::control::crtc::Handle, u64>,
+
+    /// Latches true the first time `DRM_IOCTL_CRTC_QUEUE_SEQUENCE` returns
+    /// EOPNOTSUPP/ENOTTY (pre-4.14 kernels lack the ioctl). Once set we stop
+    /// attempting idle arming and degrade to flip-driven MSC only. Logged
+    /// once on transition; never resets within a process lifetime.
+    pub(crate) crtc_queue_sequence_unsupported: bool,
 
     /// CPU-side clip-mask cache for the current GC clip pixmap
     /// (depth-1 or depth-8). Install keeps identity/origin metadata
@@ -722,6 +748,106 @@ impl KmsBackendV2 {
         rank
     }
 
+    fn sync_window_leaf_storage_to_geometry(&mut self, host_xid: u32) {
+        let Some(geom) = self.windows_v2.get(&host_xid).copied() else {
+            return;
+        };
+        let Some(old_id) = self.store.lookup(host_xid) else {
+            return;
+        };
+        let new_w = geom.width.max(1);
+        let new_h = geom.height.max(1);
+        if let Some(drawable) = self.store.get(old_id)
+            && drawable.storage.extent.width == u32::from(new_w)
+            && drawable.storage.extent.height == u32::from(new_h)
+            && drawable.depth == geom.depth
+        {
+            return;
+        }
+
+        // Keep the leaf xid stable while replacing the hidden storage.
+        // Redirected windows paint through their backing, so resize-time
+        // callers can defer this work until unredirect without affecting
+        // the compositor-visible pixels.
+        self.store.detach_xid(host_xid);
+        self.store_decref_with_invalidate(old_id);
+        let storage = match self
+            .platform
+            .allocate_drawable_storage(new_w, new_h, geom.depth)
+        {
+            Ok(storage) => storage,
+            Err(_e) if self.platform.vk.is_none() => {
+                crate::kms::v2::store::Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: u32::from(new_w),
+                        height: u32::from(new_h),
+                    },
+                    PlatformBackend::format_for_depth(geom.depth),
+                )
+            }
+            Err(e) => {
+                log::warn!(
+                    "v2 sync_window_leaf_storage_to_geometry: alloc storage failed for xid {host_xid:#x}: {e:?}",
+                );
+                return;
+            }
+        };
+        if let Err(e) = self.store.allocate(
+            host_xid,
+            DrawableKind::Window,
+            geom.depth,
+            geom.mapped,
+            storage,
+        ) {
+            log::warn!(
+                "v2 sync_window_leaf_storage_to_geometry: store.allocate failed for xid {host_xid:#x}: {e:?}",
+            );
+        } else if let Some(id) = self.store.lookup(host_xid) {
+            if let Some(bg_pixmap_host_xid) = geom.bg_pixmap {
+                if let Err(e) = self.clear_window_area_with_background(
+                    host_xid,
+                    geom.bg_pixel.unwrap_or(0),
+                    Some(bg_pixmap_host_xid),
+                    0,
+                    0,
+                    new_w,
+                    new_h,
+                    (0, 0),
+                ) {
+                    log::debug!(
+                        "v2 sync_window_leaf_storage_to_geometry: bg_pixmap init failed for xid {host_xid:#x}: {e:?}"
+                    );
+                }
+            } else {
+                let color = geom.bg_pixel.map_or_else(
+                    || default_window_init_color(geom.depth),
+                    |pixel| {
+                        decode_x11_pixel_for_storage(
+                            pixel,
+                            geom.depth,
+                            PlatformBackend::format_for_depth(geom.depth),
+                        )
+                    },
+                );
+                let rect = ash::vk::Rect2D {
+                    offset: ash::vk::Offset2D::default(),
+                    extent: ash::vk::Extent2D {
+                        width: u32::from(new_w),
+                        height: u32::from(new_h),
+                    },
+                };
+                if let Err(e) =
+                    self.engine
+                        .fill_rect(&mut self.store, &mut self.platform, id, rect, color)
+                {
+                    log::debug!(
+                        "v2 sync_window_leaf_storage_to_geometry: init fill failed for xid {host_xid:#x}: {e:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn clear_window_area_with_background(
         &mut self,
@@ -1022,6 +1148,8 @@ impl KmsBackendV2 {
             last_observed_pool_creates: 0,
             last_observed_pool_resets: 0,
             cow_id: None,
+            armed_vblank_targets: std::collections::HashMap::new(),
+            crtc_queue_sequence_unsupported: false,
             clip_mask_cache: None,
             clip_mask_snapshot: None,
             fill_pattern_cache: None,
@@ -1174,6 +1302,8 @@ impl KmsBackendV2 {
             last_observed_pool_creates: 0,
             last_observed_pool_resets: 0,
             cow_id: None,
+            armed_vblank_targets: std::collections::HashMap::new(),
+            crtc_queue_sequence_unsupported: false,
             clip_mask_cache: None,
             clip_mask_snapshot: None,
             fill_pattern_cache: None,
@@ -1999,6 +2129,8 @@ impl KmsBackendV2 {
             last_observed_pool_creates: 0,
             last_observed_pool_resets: 0,
             cow_id: None,
+            armed_vblank_targets: std::collections::HashMap::new(),
+            crtc_queue_sequence_unsupported: false,
             clip_mask_cache: None,
             clip_mask_snapshot: None,
             fill_pattern_cache: None,
@@ -2121,27 +2253,35 @@ impl KmsBackendV2 {
     /// Stage 5 if profiling shows it.
     pub(crate) fn resolve_paint_target(&self, host_xid: u32) -> Option<PaintTarget> {
         let leaf_id = self.store.lookup(host_xid);
+        let leaf_depth = self
+            .windows_v2
+            .get(&host_xid)
+            .map(|w| w.depth)
+            .or_else(|| leaf_id.and_then(|id| self.store.get(id).map(|d| d.depth)))?;
         if self.windows_v2.contains_key(&host_xid) {
-            self.resolve_window_paint_target(host_xid, leaf_id)
+            self.resolve_window_paint_target(host_xid, leaf_id, leaf_depth)
         } else {
             let leaf_id = leaf_id?;
-            self.resolve_non_window_paint_target(leaf_id)
+            self.resolve_non_window_paint_target(leaf_id, leaf_depth)
         }
     }
 
     fn resolve_non_window_paint_target(
         &self,
         leaf_id: super::store::DrawableId,
+        leaf_depth: u8,
     ) -> Option<PaintTarget> {
         if let Some(b_id) = self.store.redirected_target(leaf_id) {
             return Some(PaintTarget {
                 id: b_id,
                 offset: (0, 0),
+                x11_depth: leaf_depth,
             });
         }
         Some(PaintTarget {
             id: leaf_id,
             offset: (0, 0),
+            x11_depth: leaf_depth,
         })
     }
 
@@ -2149,6 +2289,7 @@ impl KmsBackendV2 {
         &self,
         host_xid: u32,
         leaf_id: Option<super::store::DrawableId>,
+        leaf_depth: u8,
     ) -> Option<PaintTarget> {
         let mut cur_xid = host_xid;
         let mut offset = (0_i32, 0_i32);
@@ -2156,7 +2297,11 @@ impl KmsBackendV2 {
             if let Some(cur_id) = self.store.lookup(cur_xid)
                 && let Some(b_id) = self.store.redirected_target(cur_id)
             {
-                return Some(PaintTarget { id: b_id, offset });
+                return Some(PaintTarget {
+                    id: b_id,
+                    offset,
+                    x11_depth: leaf_depth,
+                });
             }
             // No `windows_v2` entry means we've stepped onto root
             // (parent = `core.window_id`, not tracked) or onto an
@@ -2168,7 +2313,11 @@ impl KmsBackendV2 {
             // via an ancestor backing), keep the redirected-ancestor
             // miss as `None`.
             let Some(geom) = self.windows_v2.get(&cur_xid) else {
-                return leaf_id.map(|id| PaintTarget { id, offset: (0, 0) });
+                return leaf_id.map(|id| PaintTarget {
+                    id,
+                    offset: (0, 0),
+                    x11_depth: leaf_depth,
+                });
             };
             match geom.parent {
                 None => {
@@ -2188,13 +2337,21 @@ impl KmsBackendV2 {
                     if let Some(root_id) = self.store.lookup(self.core.window_id)
                         && let Some(b_id) = self.store.redirected_target(root_id)
                     {
-                        return Some(PaintTarget { id: b_id, offset });
+                        return Some(PaintTarget {
+                            id: b_id,
+                            offset,
+                            x11_depth: leaf_depth,
+                        });
                     }
                     // No root redirect: paint stays on the leaf
                     // at its own origin if the leaf storage is
                     // still live. Explicit match (not `?`) so we
                     // don't poison the outer Option.
-                    return leaf_id.map(|id| PaintTarget { id, offset: (0, 0) });
+                    return leaf_id.map(|id| PaintTarget {
+                        id,
+                        offset: (0, 0),
+                        x11_depth: leaf_depth,
+                    });
                 }
                 Some(parent_xid) => {
                     offset.0 += i32::from(geom.x);
@@ -3329,7 +3486,8 @@ impl KmsBackendV2 {
         let Some(backing) = PixmapHandle::from_raw(host_xid) else {
             return;
         };
-        self.ensure_exported_entry(id, backing).glx_refs += 1;
+        let entry = self.ensure_exported_entry(id, backing);
+        entry.glx_refs += 1;
     }
 
     /// GLX-TFP (Task 3.4 callers): a GLXPixmap referencing the export of
@@ -5394,6 +5552,135 @@ impl KmsBackendV2 {
         self.seat_state.allows_scanout()
     }
 
+    /// Clear the entire armed-target map.
+    ///
+    /// Called at lifecycle edges where the kernel has already dropped all
+    /// queued CRTC sequences: VT suspend (`run_suspend`) and DPMS-off
+    /// (`set_dpms_power` sleep side). An in-flight `DRM_CRTC_SEQUENCE` will
+    /// never arrive once DRM master is released or the CRTC is disabled, so
+    /// any surviving entry would permanently stall the per-CRTC arm cycle.
+    pub(crate) fn clear_all_armed_vblank_targets(&mut self) {
+        if !self.armed_vblank_targets.is_empty() {
+            self.armed_vblank_targets.clear();
+        }
+    }
+
+    /// Drop armed-target entries for CRTCs no longer owned by any live
+    /// output. Called after `requery_outputs_and_modeset` retires a
+    /// disconnected connector. (A new sequence event for a stale CRTC is
+    /// already dropped by `on_crtc_sequence_event`, but the map must not
+    /// retain dead entries — they would mis-dedup a CRTC id reused by a
+    /// later hotplug.)
+    pub(crate) fn prune_armed_targets_to_live_outputs(&mut self) {
+        if self.armed_vblank_targets.is_empty() {
+            return;
+        }
+        let live: std::collections::HashSet<::drm::control::crtc::Handle> = self
+            .platform
+            .outputs
+            .iter()
+            .map(|o| o.output.crtc)
+            .collect();
+        self.armed_vblank_targets.retain(|h, _| live.contains(h));
+    }
+
+    /// Side-effect-free `DRM_CRTC_SEQUENCE` event handler.
+    ///
+    /// **Invariant** (clear-arm before any drop):
+    /// 1. If `crtc_id_raw` is a valid handle, immediately remove its
+    ///    armed-target entry — ANY received sequence event proves the
+    ///    kernel's clock advanced on that pipe, so the arm is spent
+    ///    (whether or not the output is still live).
+    /// 2. Resolve `crtc_id_raw` to a live output index; drop if stale.
+    /// 3. Validate `time_ns >= 0`; negative/malformed → log + drop.
+    /// 4. Record `(sequence /*msc*/, ust_micros)` into the per-output
+    ///    `ust_msc` map so `present_get_ust_msc` reflects the advance.
+    ///
+    /// NEVER mutates scanout BO state, scene state, or triggers a flip
+    /// (black-scanout-regression guard).
+    pub(crate) fn on_crtc_sequence_event(&mut self, crtc_id_raw: u32, time_ns: i64, sequence: u64) {
+        // (1) Clear-arm by Handle, BEFORE any validity check.
+        let crtc_handle = ::drm::control::from_u32(crtc_id_raw);
+        if let Some(h) = crtc_handle {
+            self.armed_vblank_targets.remove(&h);
+        }
+        let Some(handle) = crtc_handle else {
+            log::warn!("PRESENT-DBG: CrtcSequence bogus crtc_id={crtc_id_raw} — dropped");
+            return;
+        };
+        // (2) Stale CRTC → drop (arm already cleared above).
+        let Some(output_idx) = self
+            .platform
+            .outputs
+            .iter()
+            .position(|o| o.output.crtc == handle)
+        else {
+            log::warn!(
+                "PRESENT-DBG: CrtcSequence for unknown crtc_id={crtc_id_raw} \
+                 (output removed?) — dropped"
+            );
+            return;
+        };
+        // (3) time_ns validity → microseconds (ust_msc stores micros).
+        let Ok(ns) = u64::try_from(time_ns) else {
+            log::warn!(
+                "PRESENT-DBG: CrtcSequence negative time_ns={time_ns} \
+                 crtc_id={crtc_id_raw} — dropped"
+            );
+            return;
+        };
+        // (4) Advance the per-output Present clock.
+        self.platform
+            .ust_msc
+            .insert(output_idx, (sequence, ns / 1000));
+    }
+
+    /// Testable seam for `arm_idle_vblanks`: `armer` performs the actual
+    /// ioctl (or a stub in tests). Arms a single one-shot vblank on the
+    /// **primary output** (index 0) — this spike has no per-window CRTC
+    /// routing, so all parked `NotifyMSC` waiters pace off the primary
+    /// pipe's clock. One in-flight sequence per CRTC: if already armed, the
+    /// parked notifies fire when it retires and the next iteration re-arms.
+    pub(crate) fn arm_idle_vblanks_with<F>(
+        &mut self,
+        target_mscs: &[u64],
+        mut armer: F,
+    ) -> std::io::Result<usize>
+    where
+        F: FnMut(u32 /*crtc_id*/) -> std::io::Result<()>,
+    {
+        if target_mscs.is_empty() {
+            return Ok(0);
+        }
+        // Master loss / DPMS off / VT suspend: the kernel discarded any
+        // queued sequences; drop our bookkeeping and skip arming.
+        if !self.scanout_allowed() {
+            self.clear_all_armed_vblank_targets();
+            return Ok(0);
+        }
+        // Arm EVERY output (not just the primary): a full-screen compositor on
+        // a secondary output flips only that CRTC, so arming output 0 alone
+        // would leave its clock — and frame loop — stalled. Each output dedups
+        // against armed_vblank_targets independently.
+        let handles: Vec<_> = self
+            .platform
+            .outputs
+            .iter()
+            .map(|o| o.output.crtc)
+            .collect();
+        let mut armed = 0;
+        for handle in handles {
+            if self.armed_vblank_targets.contains_key(&handle) {
+                continue;
+            }
+            let crtc_id = u32::from(handle);
+            armer(crtc_id)?;
+            self.armed_vblank_targets.insert(handle, 0);
+            armed += 1;
+        }
+        Ok(armed)
+    }
+
     /// Suspend sequence — called by Task 12's `on_seat_ready` driver when
     /// the state machine decides `BeginSuspend`. `seat_state` is already
     /// `Suspending` at entry; the scanout gate is already closed.
@@ -5529,6 +5816,15 @@ impl KmsBackendV2 {
         //     re-renders (content marked invalidated).
         self.platform.reset_scanout_bos_for_suspend();
 
+        // 4d. Clear the per-CRTC armed-vblank-target map. The kernel drops
+        //     all queued `DRM_CRTC_SEQUENCE` events when DRM master is
+        //     revoked (step 6). A surviving entry would permanently block
+        //     the next re-arm on resume (the dedup gate would see the stale
+        //     arm and skip) → permanent ~0 fps stall. Clear unconditionally
+        //     here (GPU idle, scene drained) so resume re-arms on the first
+        //     idle tick.
+        self.clear_all_armed_vblank_targets();
+
         // 5. Suspend libinput — closes input device fds via close_restricted
         //    → seat.close_device for each input device. MUST NOT hold a
         //    LibseatInner borrow across this call (re-entrancy contract:
@@ -5596,6 +5892,11 @@ impl KmsBackendV2 {
                 if rescan.added_count != 0 || !rescan.dropped_names.is_empty() {
                     self.fire_randr_changes(state, rescan);
                 }
+                // Drop armed-target entries for CRTCs retired while suspended
+                // (disconnected connectors). The kernel already dropped their
+                // queued sequences; a stale entry would block re-arm on that
+                // handle or mis-dedup a reused CRTC id from a later hotplug.
+                self.prune_armed_targets_to_live_outputs();
             }
             Err(e) => {
                 log::error!("kms: resume: modeset failed (card gone?): {e}; exiting");
@@ -5794,6 +6095,9 @@ impl KmsBackendV2 {
                     return;
                 }
                 self.fire_randr_changes(state, rescan);
+                // A retired connector's CRTC is gone; drop any stale armed
+                // entry so it can't block re-arm or mis-dedup a reused id.
+                self.prune_armed_targets_to_live_outputs();
             }
             Err(e) => log::error!("kms: display rescan failed: {e}"),
         }
@@ -7022,14 +7326,15 @@ impl KmsBackendV2 {
         }
         let (dx, dy) = target.offset;
         let id = target.id;
-        let Some((depth, format, extent)) = self
+        let logical_depth = target.x11_depth;
+        let Some((_storage_depth, format, extent)) = self
             .store
             .get(id)
             .map(|d| (d.depth, d.storage.format, d.storage.extent))
         else {
             return;
         };
-        let full_mask = depth_plane_mask(depth);
+        let full_mask = depth_plane_mask(logical_depth);
         let plane_mask = self.core.current_plane_mask & full_mask;
         if plane_mask == 0 {
             return;
@@ -7042,8 +7347,8 @@ impl KmsBackendV2 {
         //   - pack_from_storage packs any nonzero R8 byte as the set bit (LSB)
         // depth-1 non-Copy (boolean-logic hazard in R8 byte-wise logic ops) and
         // depth-4 (no equivalence proof) stay on the CPU fallback path.
-        if depth == 1 && plane_mask == full_mask && matches!(function, GcFunction::Copy) {
-            let opaque_alpha = depth != 32; // true for depth-1
+        if logical_depth == 1 && plane_mask == full_mask && matches!(function, GcFunction::Copy) {
+            let opaque_alpha = logical_depth != 32; // true for depth-1
             match self.engine.logic_fill(
                 &mut self.store,
                 &mut self.platform,
@@ -7067,17 +7372,17 @@ impl KmsBackendV2 {
             }
             return;
         }
-        if depth < 8 || plane_mask != full_mask {
+        if logical_depth < 8 || plane_mask != full_mask {
             // Round-2/3 disambiguation: depth<8 short-circuits the `||`, so it
             // is the reason whenever it holds; otherwise the partial plane
             // mask is. The GXcopy split (depth<8 only) decides whether the
             // depth-1 GPU fill (FIX B) is B1-only or also needs B2.
             self.telemetry
-                .record_cpufill_fallback(depth < 8, matches!(function, GcFunction::Copy));
+                .record_cpufill_fallback(logical_depth < 8, matches!(function, GcFunction::Copy));
             self.fill_solid_rects_cpu_fallback(
                 id,
                 extent,
-                depth,
+                logical_depth,
                 function,
                 plane_mask,
                 fg & full_mask,
@@ -7091,7 +7396,7 @@ impl KmsBackendV2 {
             // channels; depth-24/8/1 are server-owned-α so the
             // pipeline's write mask drops alpha to keep the dst byte
             // intact. Depth lookup via the drawable record.
-            let opaque_alpha = depth != 32;
+            let opaque_alpha = logical_depth != 32;
             match self.engine.logic_fill(
                 &mut self.store,
                 &mut self.platform,
@@ -7134,7 +7439,7 @@ impl KmsBackendV2 {
         // back α=0 (X-padding) and the window blends transparent —
         // the layer underneath leaks through, panel renders white
         // not teal. Matches v1's `try_vk_solid_fill` (kms/backend.rs:3512).
-        let color = decode_x11_pixel_for_storage(fg & full_mask, depth, format);
+        let color = decode_x11_pixel_for_storage(fg & full_mask, logical_depth, format);
         // Stage 3f.15: coalesce N stroke rects into one CB + one
         // submit via engine.fill_rect_batch. PolySegment / PolyLine
         // / PolyRectangle fan-outs now pay O(1) submits per protocol
@@ -7976,7 +8281,6 @@ impl KmsBackendV2 {
             let Some(fs) = self.core.fonts.get(&font_xid) else {
                 return Ok(());
             };
-            let face = fs.face.borrow();
             let default_ch = char::from_u32(u32::from(fs.metrics.default_char));
             for &ch in text {
                 // Nonexistent chars draw the font's default_char; if
@@ -7991,17 +8295,17 @@ impl KmsBackendV2 {
                         }
                     }
                 };
-                let _ = face.0.load_char(
-                    ch as usize,
-                    freetype::face::LoadFlag::RENDER | freetype::face::LoadFlag::TARGET_MONO,
-                );
-                let glyph = face.0.glyph();
-                glyph_mono_spans(
-                    &glyph.bitmap(),
-                    cursor_x + glyph.bitmap_left(),
-                    y - glyph.bitmap_top(),
-                    &mut spans,
-                );
+                let glyph_spans = {
+                    let cache = fs.glyph_span_cache.borrow();
+                    cache.get(&ch).cloned()
+                }
+                .unwrap_or_else(|| {
+                    let mut face = fs.face.borrow_mut();
+                    let cached = rasterize_glyph_mono_spans(&mut face.0, ch);
+                    fs.glyph_span_cache.borrow_mut().insert(ch, cached.clone());
+                    cached
+                });
+                translate_glyph_spans(&glyph_spans, cursor_x, y, &mut spans);
                 cursor_x = cursor_x.saturating_add(ci.character_width as i32);
             }
         }
@@ -8268,6 +8572,51 @@ fn text_advance(fs: &crate::kms::core::FontState, chars: &[char]) -> i32 {
                 .map_or(0, |ci| i32::from(ci.character_width))
         })
         .sum()
+}
+
+/// Rasterize one glyph into monochrome horizontal spans positioned
+/// relative to the text baseline origin `(0, 0)`.
+fn rasterize_glyph_mono_spans(face: &mut freetype::Face, ch: char) -> Vec<Rectangle16> {
+    let _ = face.load_char(
+        ch as usize,
+        freetype::face::LoadFlag::RENDER | freetype::face::LoadFlag::TARGET_MONO,
+    );
+    let glyph = face.glyph();
+    let mut spans = Vec::new();
+    glyph_mono_spans(
+        &glyph.bitmap(),
+        glyph.bitmap_left(),
+        -glyph.bitmap_top(),
+        &mut spans,
+    );
+    spans
+}
+
+/// Translate cached glyph-local spans into a concrete text run at the
+/// baseline origin `(base_x, base_y)`.
+fn translate_glyph_spans(
+    glyph_spans: &[Rectangle16],
+    base_x: i32,
+    base_y: i32,
+    out: &mut Vec<Rectangle16>,
+) {
+    for span in glyph_spans {
+        let x = base_x + i32::from(span.x);
+        let y = base_y + i32::from(span.y);
+        if x < i32::from(i16::MIN)
+            || x > i32::from(i16::MAX)
+            || y < i32::from(i16::MIN)
+            || y > i32::from(i16::MAX)
+        {
+            continue;
+        }
+        out.push(Rectangle16 {
+            x: x as i16,
+            y: y as i16,
+            width: span.width,
+            height: span.height,
+        });
+    }
 }
 
 /// Convert one rasterized glyph bitmap into horizontal pixel-run
@@ -8988,7 +9337,7 @@ fn do_dump_drawables_v2(backend: &mut KmsBackendV2) -> io::Result<()> {
         for (host_xid, geom) in windows {
             let leaf_id = backend.store.lookup(host_xid);
             let redirected_target = leaf_id.and_then(|id| backend.store.redirected_target(id));
-            let resolved = backend.resolve_window_paint_target(host_xid, leaf_id);
+            let resolved = backend.resolve_window_paint_target(host_xid, leaf_id, geom.depth);
             let is_top_level = backend.core.top_level_order.contains(&host_xid);
             use std::fmt::Write as _;
             let _ = writeln!(
@@ -10139,13 +10488,20 @@ impl Backend for KmsBackendV2 {
         // or flush_submit_group runs. In Direct mode this is always false
         // → no behaviour change.
         if !self.scanout_allowed() {
-            // Drain to clear the DRM fd's readiness; discard results.
-            let _ = self.platform.drain_page_flip_events();
+            // Discard page-flip retires (no DRM master → don't touch scanout
+            // state) but STILL run the sequence handler so the armed-target
+            // map clears — leaving a stuck entry across suspend is exactly
+            // the permanent-stall failure mode this guards against.
+            if let Ok((_flips, sequences)) = self.platform.drain_page_flip_events() {
+                for seq in sequences {
+                    self.on_crtc_sequence_event(seq.crtc_id_raw, seq.time_ns, seq.sequence);
+                }
+            }
             log::debug!("v2 on_page_flip_ready: skipped (seat not Active)");
             return;
         }
-        let flipped = match self.platform.drain_page_flip_events() {
-            Ok(flipped) => flipped,
+        let (flipped, sequences) = match self.platform.drain_page_flip_events() {
+            Ok(pair) => pair,
             Err(e) => {
                 log::warn!("v2: drain_page_flip_events failed: {e}");
                 return;
@@ -10158,6 +10514,13 @@ impl Backend for KmsBackendV2 {
             {
                 self.telemetry.record_frame_present();
             }
+        }
+        // Idle vblank arming: clear the arm + advance the Present clock for
+        // each CRTC sequence the kernel delivered. The run loop reads the
+        // updated `(msc, ust)` via `present_get_ust_msc` and fires parked
+        // NotifyMSC, then re-arms if any remain.
+        for seq in sequences {
+            self.on_crtc_sequence_event(seq.crtc_id_raw, seq.time_ns, seq.sequence);
         }
         // The just-retired flip(s) freed up the primary atomic-commit
         // queue on at least one CRTC; retry any cursor move that lost
@@ -11570,108 +11933,11 @@ impl Backend for KmsBackendV2 {
             geom.height = h;
             size_changed = true;
         }
-        let new_w = geom.width.max(1);
-        let new_h = geom.height.max(1);
-        let depth = geom.depth;
-        let scene_participating = geom.mapped;
-        let bg_pixel = geom.bg_pixel;
-        let bg_pixmap = geom.bg_pixmap;
-        if size_changed && let Some(old_id) = self.store.lookup(host_xid) {
-            // Replace window storage. Stage 2d doesn't preserve
-            // content across resize — clients are expected to
-            // repaint after configure (X11 semantics).
-            //
-            // Detach `by_xid[host_xid]` BEFORE decref + allocate.
-            // Any Picture wrapping this window (e.g. marco's frame
-            // compositing) holds an extra refcount on the old
-            // drawable; without the explicit detach, `decref`
-            // returns `StillReferenced` and leaves the xid map
-            // pointing at the old drawable → `store.allocate(xid)`
-            // below fails with `XidInUse` → the window silently
-            // stays at the old storage. xeyes resize regression
-            // observed on bee + fuji.
-            //
-            // The old drawable stays alive in `entries` until its
-            // last refcount drops; its in-flight ticket still
-            // retires correctly. Picture's next `lookup(xid)`
-            // returns the NEW DrawableId, which matches X11 RENDER
-            // semantics (a Picture on a window references the
-            // window's *current* storage).
-            self.store.detach_xid(host_xid);
-            self.store_decref_with_invalidate(old_id);
-            match self.platform.allocate_drawable_storage(new_w, new_h, depth) {
-                Ok(storage) => {
-                    if let Err(e) = self.store.allocate(
-                        host_xid,
-                        DrawableKind::Window,
-                        depth,
-                        scene_participating,
-                        storage,
-                    ) {
-                        log::warn!(
-                            "v2 configure_subwindow: store.allocate failed for xid {host_xid:#x}: {e:?}",
-                        );
-                    } else if let Some(id) = self.store.lookup(host_xid) {
-                        if let Some(bg_pixmap_host_xid) = bg_pixmap {
-                            if let Err(e) = self.clear_window_area_with_background(
-                                host_xid,
-                                bg_pixel.unwrap_or(0),
-                                Some(bg_pixmap_host_xid),
-                                0,
-                                0,
-                                new_w,
-                                new_h,
-                                (0, 0),
-                            ) {
-                                log::debug!(
-                                    "v2 configure_subwindow: bg_pixmap resize init failed for xid {host_xid:#x}: {e:?}"
-                                );
-                            }
-                        } else {
-                            // Stage 3f.6 + 3f.14: clear the fresh
-                            // storage so resize doesn't leave pool-
-                            // returner content (or Vk-undefined bytes)
-                            // visible until the client's next repaint.
-                            // Bg_pixel-set: paint that colour;
-                            // otherwise depth-appropriate safe default
-                            // (matches `allocate_window_storage`).
-                            let color = bg_pixel.map_or_else(
-                                || default_window_init_color(depth),
-                                |pixel| {
-                                    decode_x11_pixel_for_storage(
-                                        pixel,
-                                        depth,
-                                        PlatformBackend::format_for_depth(depth),
-                                    )
-                                },
-                            );
-                            let rect = ash::vk::Rect2D {
-                                offset: ash::vk::Offset2D::default(),
-                                extent: ash::vk::Extent2D {
-                                    width: u32::from(new_w),
-                                    height: u32::from(new_h),
-                                },
-                            };
-                            if let Err(e) = self.engine.fill_rect(
-                                &mut self.store,
-                                &mut self.platform,
-                                id,
-                                rect,
-                                color,
-                            ) {
-                                log::debug!(
-                                    "v2 configure_subwindow: storage init fill failed for xid {host_xid:#x}: {e:?}"
-                                );
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::warn!(
-                        "v2 configure_subwindow: alloc storage failed for xid {host_xid:#x}: {e:?}",
-                    );
-                }
-            }
+        if size_changed
+            && let Some(old_id) = self.store.lookup(host_xid)
+            && self.store.redirected_target(old_id).is_none()
+        {
+            self.sync_window_leaf_storage_to_geometry(host_xid);
         }
         if let Some(stack_mode) = config.stack_mode {
             // Top-level z-order is no longer mutated here: it is a pure
@@ -12147,6 +12413,38 @@ impl Backend for KmsBackendV2 {
         Ok(())
     }
 
+    fn redirected_backing_can_fit(
+        &self,
+        backing: PixmapHandle,
+        width: u16,
+        height: u16,
+        depth: u8,
+    ) -> bool {
+        let Some(id) = self.store.lookup(backing.as_raw()) else {
+            return false;
+        };
+        let Some(drawable) = self.store.get(id) else {
+            return false;
+        };
+        drawable.depth == depth
+            && drawable.storage.extent.width >= u32::from(width)
+            && drawable.storage.extent.height >= u32::from(height)
+    }
+
+    fn update_redirected_backing_geometry(
+        &mut self,
+        _origin: Option<OriginContext>,
+        backing: PixmapHandle,
+        width: u16,
+        height: u16,
+        depth: u8,
+    ) -> io::Result<()> {
+        self.core
+            .alias_registry
+            .update_geometry(backing, width, height, depth);
+        Ok(())
+    }
+
     fn drop_backing_storage(
         &mut self,
         origin: Option<OriginContext>,
@@ -12196,6 +12494,7 @@ impl Backend for KmsBackendV2 {
                 if let Some(w_id) = self.store.lookup(w_xid) {
                     self.store.set_redirected_target(w_id, None);
                 }
+                self.sync_window_leaf_storage_to_geometry(w_xid);
             }
             // Stage 4c.4 round-3 finding: drop B's scene_participating
             // flag here so the protocol handler doesn't need a
@@ -12557,6 +12856,7 @@ impl Backend for KmsBackendV2 {
                 face: RefCell::new(FreetypeFace(face)),
                 metrics: metrics.clone(),
                 char_info_cache: char_cache,
+                glyph_span_cache: RefCell::new(HashMap::new()),
             },
         );
         Ok((handle, metrics))
@@ -13505,7 +13805,7 @@ impl Backend for KmsBackendV2 {
             if matches!(function, GcFunction::NoOp) {
                 return Ok(());
             }
-            let dst_depth = self.store.get(dst_target.id).map_or(24, |d| d.depth);
+            let dst_depth = dst_target.x11_depth;
             let full_mask = depth_plane_mask(dst_depth);
             let plane_mask = self.core.current_plane_mask & full_mask;
             if plane_mask == 0 {
@@ -13804,7 +14104,7 @@ impl Backend for KmsBackendV2 {
             if matches!(function, GcFunction::NoOp) {
                 return Ok(());
             }
-            let dst_depth = self.store.get(target.id).map_or(depth, |d| d.depth);
+            let dst_depth = target.x11_depth;
             let full_mask = depth_plane_mask(dst_depth);
             let plane_mask = self.core.current_plane_mask & full_mask;
             if plane_mask == 0 {
@@ -16405,9 +16705,18 @@ impl Backend for KmsBackendV2 {
             io::Error::other(format!("DRI3 export: store entry missing 0x{host_xid:x}"))
         })?;
 
-        let depth = drawable.depth;
-        let width = u16::try_from(drawable.storage.extent.width).unwrap_or(u16::MAX);
-        let height = u16::try_from(drawable.storage.extent.height).unwrap_or(u16::MAX);
+        let (depth, width, height) = self
+            .core
+            .alias_registry
+            .get(PixmapHandle::from_raw_panicking(host_xid))
+            .map(|alias| (alias.depth, alias.width, alias.height))
+            .unwrap_or_else(|| {
+                (
+                    drawable.depth,
+                    u16::try_from(drawable.storage.extent.width).unwrap_or(u16::MAX),
+                    u16::try_from(drawable.storage.extent.height).unwrap_or(u16::MAX),
+                )
+            });
         let bpp: u8 = match depth {
             24 | 32 => 32,
             4 | 8 => 8,
@@ -16740,6 +17049,56 @@ impl Backend for KmsBackendV2 {
         &mut self,
     ) -> Vec<yserver_core::backend::CompletedPresentEvent> {
         self.drain_completed_present_events_impl()
+    }
+
+    fn present_get_ust_msc(&self) -> (u64, u64) {
+        self.platform.present_get_ust_msc()
+    }
+
+    fn arm_idle_vblanks(&mut self, target_mscs: &[u64]) -> std::io::Result<usize> {
+        // Pre-4.14 kernels lack DRM_IOCTL_CRTC_QUEUE_SEQUENCE; once we've
+        // latched that, stay flip-driven (no idle arming) for the rest of
+        // this process — the ioctl won't reappear within one master grab.
+        if self.crtc_queue_sequence_unsupported {
+            return Ok(0);
+        }
+        // Arc<Device> clone sidesteps the simultaneous &self.platform /
+        // &mut self.armed_vblank_targets borrow inside arm_idle_vblanks_with.
+        let device = self.platform.device.clone();
+        let mut newly_unsupported = false;
+        // Always arm relative=1 (next vblank). For picom's target=current+1
+        // pacing this IS the requested target; for skip-ahead targets the
+        // clock keeps ticking each vblank until `notify_msc_satisfied` passes.
+        let result = self.arm_idle_vblanks_with(target_mscs, |crtc_id| {
+            match crate::drm::page_flip::queue_crtc_sequence(
+                &device,
+                crtc_id,
+                /* relative */ true,
+                /* sequence */ 1,
+                /* user_data */ u64::from(crtc_id),
+            ) {
+                Ok(_) => Ok(()),
+                Err(e)
+                    if e.raw_os_error() == Some(libc::EOPNOTSUPP)
+                        || e.raw_os_error() == Some(libc::ENOTTY) =>
+                {
+                    newly_unsupported = true;
+                    Err(e)
+                }
+                Err(e) => Err(e),
+            }
+        });
+        if newly_unsupported {
+            log::warn!(
+                "DRM_IOCTL_CRTC_QUEUE_SEQUENCE returned EOPNOTSUPP — disabling \
+                 idle vblank arming (flip-driven MSC only) for the rest of this \
+                 DRM master grab"
+            );
+            self.crtc_queue_sequence_unsupported = true;
+            // Not a hard error for the run loop — degrade gracefully.
+            return Ok(0);
+        }
+        result
     }
 
     fn present_capabilities(&self, _window: u32) -> PresentCaps {
@@ -17415,6 +17774,12 @@ impl Backend for KmsBackendV2 {
             self.scene.drain_all(&mut self.platform);
             log::info!("kms: dpms sleep — reset_scanout_bos_for_suspend");
             self.platform.reset_scanout_bos_for_suspend();
+            // Clear the per-CRTC armed-vblank-target map. The kernel stops
+            // generating vblank events for disabled CRTCs, so any queued
+            // `DRM_CRTC_SEQUENCE` will never fire; a stale entry would block
+            // re-arm on DPMS wake. Global off transition → clear-all.
+            log::info!("kms: dpms sleep — clear_all_armed_vblank_targets");
+            self.clear_all_armed_vblank_targets();
             log::info!("kms: dpms sleep — disable_output per output");
             let res = self.platform.dpms_set_outputs_active(false);
             // Only flip the cache on success. On Err, leave it where it was
@@ -17706,7 +18071,7 @@ fn subtract_one_rect_clip(outer: ash::vk::Rect2D, inner: ash::vk::Rect2D) -> Vec
 #[cfg(test)]
 mod tests {
     use super::{
-        KmsBackendV2, PictureRecord, RandrIdAllocator, compute_copy_area_dst_rects,
+        KmsBackendV2, PaintTarget, PictureRecord, RandrIdAllocator, compute_copy_area_dst_rects,
         compute_render_composite_clip, intersect_rect_with_clip, resolve_picture_for_render,
     };
     use crate::kms::{
@@ -22186,7 +22551,10 @@ mod tests {
                 y,
                 width: 100,
                 height: 100,
-                depth: 32,
+                // Normal (non-ARGB) X windows are depth 24; the redirect-routing
+                // tests rely on resolve_paint_target reporting this logical depth
+                // even when routed into a depth-32 backing (the picom/xterm shape).
+                depth: 24,
                 mapped: true,
                 parent,
                 stack_rank: 0,
@@ -22199,7 +22567,7 @@ mod tests {
             .allocate(
                 xid,
                 DrawableKind::Window,
-                32,
+                24,
                 true,
                 Storage::for_tests_null(
                     ash::vk::Extent2D {
@@ -22324,7 +22692,8 @@ mod tests {
             pt,
             super::PaintTarget {
                 id: pix_id,
-                offset: (0, 0)
+                offset: (0, 0),
+                x11_depth: 32,
             }
         );
     }
@@ -22342,7 +22711,8 @@ mod tests {
             pt,
             super::PaintTarget {
                 id: w_id,
-                offset: (0, 0)
+                offset: (0, 0),
+                x11_depth: 24,
             }
         );
     }
@@ -22377,7 +22747,8 @@ mod tests {
             pt,
             super::PaintTarget {
                 id: b_id,
-                offset: (0, 0)
+                offset: (0, 0),
+                x11_depth: 24,
             }
         );
     }
@@ -22416,7 +22787,8 @@ mod tests {
             pt,
             super::PaintTarget {
                 id: b_id,
-                offset: (13, 24)
+                offset: (13, 24),
+                x11_depth: 24,
             }
         );
     }
@@ -22442,7 +22814,8 @@ mod tests {
             pt,
             super::PaintTarget {
                 id: w_id,
-                offset: (0, 0)
+                offset: (0, 0),
+                x11_depth: 24,
             }
         );
     }
@@ -22495,7 +22868,10 @@ mod tests {
             pt_root,
             super::PaintTarget {
                 id: backing_id,
-                offset: (0, 0)
+                offset: (0, 0),
+                // Painting directly on root reports ROOT's logical depth (32,
+                // the framebuffer depth), not a child window's 24.
+                x11_depth: 32,
             }
         );
         // Top-level (parent=None production rep) must walk into
@@ -22505,7 +22881,8 @@ mod tests {
             pt_w,
             super::PaintTarget {
                 id: backing_id,
-                offset: (50, 60)
+                offset: (50, 60),
+                x11_depth: 24,
             }
         );
         // Descendant of a top-level: accumulates C-in-W (3, 4)
@@ -22515,7 +22892,8 @@ mod tests {
             pt_c,
             super::PaintTarget {
                 id: backing_id,
-                offset: (53, 64)
+                offset: (53, 64),
+                x11_depth: 24,
             }
         );
     }
@@ -22556,7 +22934,8 @@ mod tests {
             pt,
             super::PaintTarget {
                 id: w_id,
-                offset: (0, 0)
+                offset: (0, 0),
+                x11_depth: 24,
             },
             "cleared redirect must fall through to leaf identity",
         );
@@ -22612,7 +22991,8 @@ mod tests {
             pt,
             super::PaintTarget {
                 id: bc_id,
-                offset: (3, 4)
+                offset: (3, 4),
+                x11_depth: 24,
             }
         );
     }
@@ -22652,8 +23032,78 @@ mod tests {
             pt,
             super::PaintTarget {
                 id: backing_id,
-                offset: (10, 20)
+                offset: (10, 20),
+                x11_depth: 24,
             }
+        );
+    }
+
+    /// A depth-24 child painting into a depth-32 redirected backing must keep
+    /// depth-24 X11 semantics: plane-mask `0x00ff_ffff` is the full mask and
+    /// the stored alpha must be forced opaque. Regression for the picom+xterm
+    /// bug where redirected depth-24 text drew transparent rows into the
+    /// depth-32 frame backing.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn redirected_depth24_fill_into_depth32_backing_forces_opaque_alpha() {
+        use yserver_core::backend::DrawState;
+
+        let mut b = match KmsBackendV2::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+
+        let host_xid = b
+            .allocate_test_pixmap_bgra(8, 8)
+            .expect("allocate_test_pixmap_bgra");
+        let target_id = b.store.lookup(host_xid).expect("target id");
+
+        let draw_state = DrawState {
+            plane_mask: 0x00ff_ffff,
+            ..DrawState::default()
+        };
+        b.apply_draw_state(None, &draw_state)
+            .expect("apply_draw_state");
+        b.fill_solid_rects(
+            PaintTarget {
+                id: target_id,
+                offset: (0, 0),
+                x11_depth: 24,
+            },
+            0x00ff_0000,
+            &[Rectangle16 {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 8,
+            }],
+        );
+        b.engine_close_open_frame_for_timeout_for_tests()
+            .expect("close open frame");
+        b.engine_drain_all_for_tests();
+
+        let bytes = b
+            .engine
+            .get_image(
+                &mut b.store,
+                &mut b.platform,
+                target_id,
+                ash::vk::Rect2D {
+                    offset: ash::vk::Offset2D::default(),
+                    extent: ash::vk::Extent2D {
+                        width: 8,
+                        height: 8,
+                    },
+                },
+                32,
+            )
+            .expect("get_image");
+        assert_eq!(
+            bytes[3], 0xff,
+            "depth-24 paint routed into a depth-32 backing must store opaque alpha"
         );
     }
 
@@ -23023,6 +23473,140 @@ mod tests {
             b.test_host_window_to_backing(0x100).is_none(),
             "host_window_to_backing must be cleared after release",
         );
+    }
+
+    #[test]
+    fn configure_subwindow_redirected_resize_skips_leaf_realloc() {
+        use yserver_core::{backend::Backend, host_x11::HostSubwindowConfig};
+
+        let mut b = KmsBackendV2::for_tests();
+        let _w_id = seed_window(&mut b, 0x100, None, 30, 40);
+        let leaf_before = b.store.lookup(0x100).expect("leaf before");
+        let extent_before = b.store.get(leaf_before).unwrap().storage.extent;
+        let backing_id = seed_backing_drawable(&mut b, 0x900);
+        b.store.set_redirected_target(leaf_before, Some(backing_id));
+        b.configure_subwindow(
+            None,
+            0x100,
+            HostSubwindowConfig {
+                x: None,
+                y: None,
+                width: Some(180),
+                height: Some(140),
+                border_width: None,
+                sibling: None,
+                stack_mode: None,
+            },
+        )
+        .expect("configure_subwindow");
+
+        let leaf_after = b.store.lookup(0x100).expect("leaf after");
+        let extent_after = b.store.get(leaf_after).unwrap().storage.extent;
+        assert_eq!(
+            leaf_after, leaf_before,
+            "redirected resize must not churn the hidden leaf DrawableId",
+        );
+        assert_eq!(
+            extent_after, extent_before,
+            "redirected resize must leave hidden leaf storage untouched",
+        );
+        assert_eq!(b.windows_v2.get(&0x100).unwrap().width, 180);
+        assert_eq!(b.windows_v2.get(&0x100).unwrap().height, 140);
+    }
+
+    #[test]
+    fn unredirect_reconciles_leaf_storage_after_deferred_redirected_resize() {
+        use yserver_core::{
+            backend::{Backend, WindowHandle},
+            host_x11::HostSubwindowConfig,
+        };
+
+        let mut b = KmsBackendV2::for_tests();
+        let _w_id = seed_window(&mut b, 0x100, None, 30, 40);
+        let w = WindowHandle::from_raw(0x100).expect("WindowHandle");
+
+        let backing = b
+            .allocate_redirected_backing(None, w, 100, 100, 32)
+            .expect("allocate_redirected_backing");
+        let leaf_id = b.store.lookup(0x100).expect("leaf id");
+        let backing_id = seed_backing_drawable(&mut b, backing.as_raw());
+        b.store.set_redirected_target(leaf_id, Some(backing_id));
+        b.configure_subwindow(
+            None,
+            0x100,
+            HostSubwindowConfig {
+                x: None,
+                y: None,
+                width: Some(180),
+                height: Some(140),
+                border_width: None,
+                sibling: None,
+                stack_mode: None,
+            },
+        )
+        .expect("configure_subwindow");
+
+        let leaf_during_redirect = b.store.lookup(0x100).expect("leaf during redirect");
+        let extent_during_redirect = b.store.get(leaf_during_redirect).unwrap().storage.extent;
+        assert_eq!(extent_during_redirect.width, 100);
+        assert_eq!(extent_during_redirect.height, 100);
+
+        b.release_redirected_backing(None, backing)
+            .expect("release_redirected_backing");
+
+        let leaf_after = b.store.lookup(0x100).expect("leaf after unredirect");
+        let extent_after = b.store.get(leaf_after).unwrap().storage.extent;
+        assert_eq!(extent_after.width, 180);
+        assert_eq!(extent_after.height, 140);
+    }
+
+    #[test]
+    fn redirected_backing_reuse_tracks_logical_geometry_separately_from_storage() {
+        use crate::kms::{
+            core::AliasEntry,
+            v2::store::{DrawableKind, Storage},
+        };
+        use yserver_core::backend::{Backend, PixmapHandle};
+
+        let mut b = KmsBackendV2::for_tests();
+        let backing = PixmapHandle::from_raw_panicking(0x9000_0001);
+        let _id = b
+            .store
+            .allocate(
+                backing.as_raw(),
+                DrawableKind::RedirectedBacking,
+                32,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 200,
+                        height: 150,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("backing allocate");
+        b.core.alias_registry.insert(
+            backing,
+            AliasEntry {
+                refcount: 1,
+                width: 100,
+                height: 100,
+                depth: 32,
+            },
+        );
+
+        assert!(b.redirected_backing_can_fit(backing, 180, 140, 32));
+        assert!(!b.redirected_backing_can_fit(backing, 220, 140, 32));
+
+        b.update_redirected_backing_geometry(None, backing, 180, 140, 32)
+            .expect("update logical geometry");
+        let alias = b
+            .test_alias_registry_get(backing.as_raw())
+            .expect("alias entry");
+        assert_eq!(alias.width, 180);
+        assert_eq!(alias.height, 140);
+        assert_eq!(alias.depth, 32);
     }
 
     // ────────────────────────────────────────────────────────────────
@@ -26171,6 +26755,162 @@ mod tests {
         assert!(
             notify2.is_none(),
             "unchanged reload must not broadcast NewKeyboardNotify"
+        );
+    }
+
+    // ── Idle vblank arming (DRM_CRTC_QUEUE_SEQUENCE) ───────────────────────
+
+    #[test]
+    fn armed_vblank_targets_starts_empty() {
+        let b = super::KmsBackendV2::for_tests();
+        assert!(b.armed_vblank_targets.is_empty());
+        assert!(!b.crtc_queue_sequence_unsupported);
+    }
+
+    #[test]
+    fn clear_all_armed_vblank_targets_empties_map() {
+        let mut b = super::KmsBackendV2::for_tests();
+        let h = ::drm::control::from_u32(7).unwrap();
+        b.armed_vblank_targets.insert(h, 0);
+        b.clear_all_armed_vblank_targets();
+        assert!(b.armed_vblank_targets.is_empty());
+    }
+
+    #[test]
+    fn prune_armed_targets_drops_stale_keeps_live() {
+        let mut b = super::KmsBackendV2::for_tests();
+        let live = b.platform.outputs[0].output.crtc;
+        let stale = ::drm::control::from_u32(999).unwrap();
+        b.armed_vblank_targets.insert(live, 0);
+        b.armed_vblank_targets.insert(stale, 0);
+        b.prune_armed_targets_to_live_outputs();
+        assert!(b.armed_vblank_targets.contains_key(&live));
+        assert!(!b.armed_vblank_targets.contains_key(&stale));
+    }
+
+    #[test]
+    fn on_crtc_sequence_event_happy_path_records_msc_and_clears_arm() {
+        let mut b = super::KmsBackendV2::for_tests();
+        let crtc = b.platform.outputs[0].output.crtc;
+        b.armed_vblank_targets.insert(crtc, 0);
+
+        b.on_crtc_sequence_event(u32::from(crtc), 1_500_000 /* 1.5ms */, 7);
+
+        assert!(b.armed_vblank_targets.is_empty(), "arm must be cleared");
+        // ust_msc stores microseconds; primary output is index 0.
+        assert_eq!(b.platform.present_get_ust_msc(), (7, 1_500));
+    }
+
+    #[test]
+    fn on_crtc_sequence_event_negative_time_clears_arm_and_drops() {
+        let mut b = super::KmsBackendV2::for_tests();
+        let crtc = b.platform.outputs[0].output.crtc;
+        b.armed_vblank_targets.insert(crtc, 0);
+
+        b.on_crtc_sequence_event(u32::from(crtc), -1, 7);
+
+        assert!(
+            b.armed_vblank_targets.is_empty(),
+            "arm cleared even on drop"
+        );
+        assert_eq!(
+            b.platform.present_get_ust_msc(),
+            (0, 0),
+            "negative time_ns must not advance the clock"
+        );
+    }
+
+    #[test]
+    fn on_crtc_sequence_event_stale_crtc_clears_arm_and_drops() {
+        let mut b = super::KmsBackendV2::for_tests();
+        let stale = ::drm::control::from_u32(999).unwrap();
+        b.armed_vblank_targets.insert(stale, 0);
+
+        b.on_crtc_sequence_event(999, 1_000_000, 5);
+
+        assert!(
+            b.armed_vblank_targets.is_empty(),
+            "stale arm cleared so the CRTC can't strand"
+        );
+        assert_eq!(b.platform.present_get_ust_msc(), (0, 0));
+    }
+
+    #[test]
+    fn present_get_ust_msc_returns_most_advanced_output() {
+        // Multi-monitor: a full-screen compositor on a secondary output flips
+        // only that CRTC. Keying on output 0 would leave the global clock at 0
+        // and park its NotifyMSC forever; the max across outputs keeps it live.
+        let mut b = super::KmsBackendV2::for_tests();
+        b.platform.ust_msc.insert(0, (10, 100)); // primary, idle-ish
+        b.platform.ust_msc.insert(1, (42, 424)); // secondary, flipping ahead
+        assert_eq!(
+            b.platform.present_get_ust_msc(),
+            (42, 424),
+            "picks the most-advanced output's (msc, ust)"
+        );
+    }
+
+    #[test]
+    fn arm_idle_vblanks_with_empty_targets_is_noop() {
+        let mut b = super::KmsBackendV2::for_tests();
+        let mut calls = 0u32;
+        let armed = b
+            .arm_idle_vblanks_with(&[], |_| {
+                calls += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(armed, 0);
+        assert_eq!(calls, 0);
+        assert!(b.armed_vblank_targets.is_empty());
+    }
+
+    #[test]
+    fn arm_idle_vblanks_with_arms_primary_once_then_dedups() {
+        let mut b = super::KmsBackendV2::for_tests();
+        let primary = b.platform.outputs[0].output.crtc;
+        let mut calls = 0u32;
+
+        let armed = b
+            .arm_idle_vblanks_with(&[100], |_| {
+                calls += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(armed, 1);
+        assert_eq!(calls, 1);
+        assert!(b.armed_vblank_targets.contains_key(&primary));
+
+        // Already armed → no second ioctl while the sequence is in flight.
+        let armed2 = b
+            .arm_idle_vblanks_with(&[200], |_| {
+                calls += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(armed2, 0);
+        assert_eq!(calls, 1, "no re-arm while a sequence is queued");
+    }
+
+    #[test]
+    fn arm_idle_vblanks_with_scanout_disallowed_clears_and_returns_zero() {
+        let mut b = super::KmsBackendV2::for_tests();
+        let primary = b.platform.outputs[0].output.crtc;
+        b.armed_vblank_targets.insert(primary, 0);
+        b.seat_state = crate::seat::state::SeatState::Suspended;
+
+        let mut calls = 0u32;
+        let armed = b
+            .arm_idle_vblanks_with(&[100], |_| {
+                calls += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(armed, 0);
+        assert_eq!(calls, 0, "no arming without DRM master");
+        assert!(
+            b.armed_vblank_targets.is_empty(),
+            "master loss drops queued sequences → clear bookkeeping"
         );
     }
 }

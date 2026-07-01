@@ -512,29 +512,94 @@ yserver-e27-xterm-hw-trace log="debug":
         kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;'
 
-# Bring up yserver + e16 + wezterm under vng. wezterm exercises the
-# GLX → DRI3 → Present path that was the original motivation for the
-# zink override: vng's default Mesa driver is virgl, which rejects
-# wezterm's GL command stream on the host (`vrend_decode_ctx_submit_cmd:
-# Illegal command buffer`). Forcing `MESA_LOADER_DRIVER_OVERRIDE=zink`
-# routes GL through Mesa's zink (GL→Vulkan) which then goes via Venus,
-# bypassing virglrenderer entirely. wezterm under bare-metal works
-# without this override because the bare-metal stack uses radeonsi/anv
-# directly, not virgl.
-yserver-e16-wezterm mode="1024x768" log="info":
+# ============================== openbox ==============================
+
+yserver-openbox-hw log="info":
     cargo build --bin yserver
-    vng -r {{KERNEL}} --disable-microvm --rw \
-        --qemu-opts="-display gtk,gl=on -vga none -device virtio-vga-gl,hostmem=4G,blob=true,venus=true,xres=1024,yres=768 -device virtio-tablet-pci -device virtio-keyboard-pci" \
-        -- bash -c '\
-            export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/virtio_icd.json;\
-            export MESA_LOADER_DRIVER_OVERRIDE=zink;\
-            RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_MODE={{mode}} target/debug/yserver > yserver.log 2>&1 &\
-            yserver_pid=$!;\
-            for i in $(seq 30); do if [ -e /tmp/.X11-unix/X7 ]; then break; fi; sleep 1; done;\
-            DISPLAY=:7 e16 > e16.log 2>&1 &\
-            sleep 4;\
-            DISPLAY=:7 wezterm &\
-            wait $yserver_pid'
+    bash -c '\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-openbox.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        DISPLAY=:7 openbox > openbox.log 2>&1 ;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;'
+
+yserver-openbox-picom-hw log="info":
+    cargo build --bin yserver
+    bash -c '\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-openbox-picom.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        DISPLAY=:7 openbox > openbox-picom.log 2>&1 &\
+        sleep 2;\
+        DISPLAY=:7 picom --backend glx --log-level debug --log-file picom.log > picom.out 2>&1;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;'
+
+# ============================== awesome ==============================
+
+yserver-awesome-hw log="info":
+    cargo build --bin yserver
+    bash -c '\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-awesome.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        DISPLAY=:7 awesome > awesome.log 2>&1 &\
+        sleep 2;\
+        DISPLAY=:7 wezterm ;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;'
+
+yserver-awesome-picom-hw log="yserver_core::core_loop::process_request=debug":
+    cargo build --bin yserver
+    bash -c '\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-awesome.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        DISPLAY=:7 awesome > awesome.log 2>&1 &\
+        sleep 2;\
+        DISPLAY=:7 picom --backend glx --log-level debug --log-file picom.log > picom.out 2>&1 &\
+        picom_pid=$!;\
+        sleep 1;\
+        DISPLAY=:7 xterm;\
+        kill -TERM $picom_pid 2>/dev/null;\
+        wait $picom_pid 2>/dev/null;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;'
+
+yserver-awesome-picom-hw-trace log="debug":
+    cargo build --bin yserver
+    bash -c '\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 YSERVER_OPS_SAFE=1 target/debug/yserver > yserver-hw-awesome.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        x11trace -k -d :7 -D :8 -n -o awesome-picom-xorg.xtrace &\
+        xtrace_pid=$!;\
+        DISPLAY=:7 awesome > awesome.log 2>&1 &\
+        sleep 2;\
+        DISPLAY=:8 picom --backend glx --log-level debug --log-file picom.log > picom.out 2>&1 &\
+        picom_pid=$!;\
+        sleep 1;\
+        DISPLAY=:8 xterm;\
+        kill -TERM $picom_pid $xtrace_pid 2>/dev/null;\
+        wait $picom_pid 2>/dev/null;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;'
 
 # ============================== FVWM3 ==============================
 

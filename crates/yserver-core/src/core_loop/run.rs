@@ -245,6 +245,39 @@ struct DeferredRequest {
     attached_fd: Option<OwnedFd>,
 }
 
+fn process_one_request(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    telemetry: &mut LoopTelemetry,
+    requests_this_iter: &mut u32,
+    request_budget: &mut usize,
+    req: DeferredRequest,
+) {
+    let req_opcode = req.header.opcode;
+    let req_start = if telemetry.enabled {
+        Some(Instant::now())
+    } else {
+        None
+    };
+    let disc = process_request_inline(
+        state,
+        backend,
+        req.id,
+        req.sequence,
+        req.header,
+        &req.body,
+        req.attached_fd,
+    );
+    if let Some(start) = req_start {
+        telemetry.record_request(req_opcode, start.elapsed());
+    }
+    *requests_this_iter += 1;
+    *request_budget -= 1;
+    if let Some(disc_id) = disc {
+        crate::core_loop::process_disconnect::process_disconnect(state, backend, disc_id);
+    }
+}
+
 /// Process one X protocol request and run its post-handler bookkeeping
 /// (mark_dirty + disconnect-on-error). Factored so the two drain paths
 /// in `run_core` (the deferred queue at the top of each iteration and
@@ -483,29 +516,14 @@ pub fn run_core(
             let Some(req) = deferred_requests.pop_front() else {
                 break;
             };
-            let req_opcode = req.header.opcode;
-            let req_start = if telemetry.enabled {
-                Some(Instant::now())
-            } else {
-                None
-            };
-            let disc = process_request_inline(
+            process_one_request(
                 state,
                 backend,
-                req.id,
-                req.sequence,
-                req.header,
-                &req.body,
-                req.attached_fd,
+                &mut telemetry,
+                &mut requests_this_iter,
+                &mut request_budget,
+                req,
             );
-            if let Some(start) = req_start {
-                telemetry.record_request(req_opcode, start.elapsed());
-            }
-            requests_this_iter += 1;
-            request_budget -= 1;
-            if let Some(disc_id) = disc {
-                crate::core_loop::process_disconnect::process_disconnect(state, backend, disc_id);
-            }
         }
         for ev in events.iter() {
             match ev.token() {
@@ -608,16 +626,6 @@ pub fn run_core(
                                 attached_fd,
                             } => {
                                 if request_budget == 0 {
-                                    // Hit the fairness cap. Buffer the
-                                    // request locally and stop pulling
-                                    // more Request messages this
-                                    // iteration. Priorities (HostInput,
-                                    // PageFlipReady, Shutdown, etc.)
-                                    // arriving LATER in the channel
-                                    // still get processed because we
-                                    // continue the `try_recv_all`
-                                    // iteration — only the Request arm
-                                    // defers.
                                     deferred_requests.push_back(DeferredRequest {
                                         id,
                                         sequence,
@@ -626,31 +634,20 @@ pub fn run_core(
                                         attached_fd,
                                     });
                                 } else {
-                                    let req_opcode = header.opcode;
-                                    let req_start = if telemetry.enabled {
-                                        Some(Instant::now())
-                                    } else {
-                                        None
-                                    };
-                                    let disc = process_request_inline(
+                                    process_one_request(
                                         state,
                                         backend,
-                                        id,
-                                        sequence,
-                                        header,
-                                        &body,
-                                        attached_fd,
+                                        &mut telemetry,
+                                        &mut requests_this_iter,
+                                        &mut request_budget,
+                                        DeferredRequest {
+                                            id,
+                                            sequence,
+                                            header,
+                                            body,
+                                            attached_fd,
+                                        },
                                     );
-                                    if let Some(start) = req_start {
-                                        telemetry.record_request(req_opcode, start.elapsed());
-                                    }
-                                    requests_this_iter += 1;
-                                    request_budget -= 1;
-                                    if let Some(disc_id) = disc {
-                                        crate::core_loop::process_disconnect::process_disconnect(
-                                            state, backend, disc_id,
-                                        );
-                                    }
                                 }
                             }
                             Message::SetupAllocate { id, response_tx } => {
@@ -832,6 +829,48 @@ fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend)
         // the Arc-pinned handle; we only do X11-side event fan-out
         // here.
         crate::core_loop::process_request::fire_present_completion_events(state, &entry);
+    }
+
+    // Vblank-paced Present clock: mirror the backend's latest kernel
+    // (msc, ust) from the most recent pageflip and fire any parked
+    // NotifyMSC whose target is now satisfied. Keeps a compositor's
+    // `present` frame clock (picom) advancing at the display refresh rate —
+    // without it an unsatisfied NotifyMSC was dropped and the clock froze
+    // after one frame.
+    let (msc, ust) = backend.present_get_ust_msc();
+    if msc > 0 {
+        state.present_kernel_msc = msc;
+        state.present_kernel_ust = ust;
+        crate::core_loop::process_request::fire_due_present_notify_msc(state, msc, ust);
+    }
+
+    // Idle vblank arming: if NotifyMSC requests remain parked, ask the
+    // backend to schedule a kernel vblank so the clock keeps advancing even
+    // when nothing is flipping. A full-screen compositor redirects every
+    // window → the scene is a static overlay → no pageflips → MSC never
+    // advances → the compositor's `present` clock deadlocks. The backend
+    // dedups against its per-CRTC armed-target map, so calling every
+    // iteration is safe (no refire storm).
+    if !state.present_pending_msc.is_empty() {
+        let targets: Vec<u64> = state
+            .present_pending_msc
+            .iter()
+            .map(|p| p.target_msc)
+            .collect();
+        match backend.arm_idle_vblanks(&targets) {
+            Ok(armed) => {
+                if armed > 0 {
+                    log::debug!(
+                        "PRESENT-DBG: arm_idle_vblanks pending={} -> armed={armed}",
+                        targets.len()
+                    );
+                }
+            }
+            Err(e) => log::warn!(
+                "PRESENT-DBG: arm_idle_vblanks pending={} -> ERR {e}",
+                targets.len()
+            ),
+        }
     }
 }
 

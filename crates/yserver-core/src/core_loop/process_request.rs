@@ -755,6 +755,24 @@ fn activate_redirect_backing_for(
                     host_pixmap.as_raw()
                 );
             }
+            // Redirecting an already-viewable window hands the compositor a
+            // valid NameWindowPixmap source immediately, but the backing seed
+            // above happened before any later client paint. If we don't emit an
+            // initial full-window damage wakeup here, compositors such as picom
+            // can leave the freshly-redirected window absent from the COW until
+            // some unrelated later event (click, move, resize) dirties it.
+            //
+            // This mirrors the "first viewable contents need one wakeup" rule
+            // on MapWindow: once the redirected backing exists and participation
+            // flips are installed, wake DAMAGE subscribers so they pull the
+            // seeded pixels into their own composite output immediately.
+            if state
+                .resources
+                .window(window)
+                .is_some_and(|w| w.map_state == MapState::Viewable)
+            {
+                let _dropped = accumulate_damage_full_to_state(state, window);
+            }
         }
         Err(err) => {
             log::warn!(
@@ -910,11 +928,19 @@ fn reapply_redirect_mode_after_map(
     }
 }
 
-/// Resize-time bookkeeping for COMPOSITE-redirected windows. Per
-/// the spec, `NameWindowPixmap` aliases freeze with the pre-resize
-/// content of the window's backing; the next paint on the window
-/// must land on a freshly-allocated backing matching the new
-/// geometry. L2 plan B.6d.
+/// Resize-time bookkeeping for COMPOSITE-redirected windows. yserver
+/// rotates the redirected backing to fresh storage sized to the new
+/// geometry. Existing `NameWindowPixmap` aliases are also retargeted
+/// onto the new backing as a compatibility measure for picom/openbox:
+/// in hardware repros picom kept sampling the pre-resize backing for
+/// many seconds after ConfigureNotify, leaving white right/bottom
+/// strips and frozen content. Following Xorg compatibility here is
+/// more important than the earlier frozen-alias theory.
+///
+/// On pure moves, `force_reallocate=true` routes through the same
+/// rotate path even when the size is unchanged. That hands the
+/// compositor a fresh backing object at the window's new position
+/// instead of reusing the original named pixmap indefinitely.
 ///
 /// Sequence when the window is redirected (release-then-allocate
 /// order is load-bearing — see below):
@@ -942,11 +968,10 @@ fn reapply_redirect_mode_after_map(
 /// `NameWindowPixmap` returned `NotFound` because the backing had
 /// been freed under it.
 ///
-/// `composite_named_pixmaps` is **not** touched here — the aliases
-/// remain valid X protocol resources, pointing at the old (frozen)
-/// backing's host XID. Their `host_pixmap` was set at
-/// `NameWindowPixmap` time and stays valid until the client's
-/// `FreePixmap` (or the disconnect cleanup).
+/// `composite_named_pixmaps` is updated to point at the new backing
+/// and new geometry. Each alias drops one hold on OLD and takes one
+/// hold on NEW in the backend alias registry so the lifetime model
+/// stays balanced.
 ///
 /// When the window is **not** redirected (no backing), this is a
 /// no-op — `composite_named_pixmaps` should be empty by
@@ -959,6 +984,7 @@ fn rotate_redirected_backing_on_resize(
     window: ResourceId,
     new_width: u16,
     new_height: u16,
+    force_reallocate: bool,
 ) {
     let snapshot = state.resources.window(window).and_then(|w| {
         w.redirected_backing
@@ -971,6 +997,45 @@ fn rotate_redirected_backing_on_resize(
     let Some(host_window) = host_window else {
         return;
     };
+
+    if !force_reallocate
+        && backend.redirected_backing_can_fit(old_backing, new_width, new_height, depth)
+    {
+        if let Some(w) = state.resources.window_mut(window)
+            && let Some(backing) = &mut w.redirected_backing
+        {
+            backing.width = new_width;
+            backing.height = new_height;
+            backing.depth = depth;
+        }
+        let _ = backend.update_redirected_backing_geometry(
+            origin,
+            old_backing,
+            new_width,
+            new_height,
+            depth,
+        );
+        let aliases_to_retarget = state
+            .resources
+            .window(window)
+            .map(|w| w.composite_named_pixmaps.clone())
+            .unwrap_or_default();
+        for alias in &aliases_to_retarget {
+            let _ = state.resources.update_pixmap_geometry(
+                alias.client_pixmap,
+                new_width,
+                new_height,
+                depth,
+            );
+        }
+        if let Some(w) = state.resources.window_mut(window) {
+            for alias in &mut w.composite_named_pixmaps {
+                alias.width = new_width;
+                alias.height = new_height;
+            }
+        }
+        return;
+    }
 
     // Take a rotate-scoped retain on OLD's storage BEFORE the
     // release. Without it, the no-alias case (no NameWindowPixmap
@@ -1039,6 +1104,55 @@ fn rotate_redirected_backing_on_resize(
             height: new_height,
             depth,
         });
+    }
+    // Compatibility retarget: existing NameWindowPixmap aliases on this
+    // window must follow the new backing + geometry, or compositors can
+    // keep sampling the pre-resize backing for seconds after the frame
+    // has already resized (observed with picom under openbox: white
+    // right/bottom strip and frozen btop content). Keep the backend
+    // alias-registry balanced by moving one hold per alias from OLD to
+    // NEW.
+    let aliases_to_retarget = state
+        .resources
+        .window(window)
+        .map(|w| w.composite_named_pixmaps.clone())
+        .unwrap_or_default();
+    for alias in &aliases_to_retarget {
+        if let Err(err) = backend.retain_backing_storage(origin, new_backing) {
+            log::warn!(
+                "rotate_redirected_backing_on_resize(0x{:x}): retain NEW alias backing 0x{:x} failed: {err}",
+                window.0,
+                new_backing.as_raw(),
+            );
+        }
+        if let Err(err) = backend.drop_backing_storage(origin, alias.host_pixmap) {
+            log::warn!(
+                "rotate_redirected_backing_on_resize(0x{:x}): drop OLD alias backing 0x{:x} failed: {err}",
+                window.0,
+                alias.host_pixmap.as_raw(),
+            );
+        }
+        let _ = state
+            .resources
+            .set_pixmap_host_xid(alias.client_pixmap, new_backing);
+        let _ = state.resources.update_pixmap_geometry(
+            alias.client_pixmap,
+            new_width,
+            new_height,
+            depth,
+        );
+        for drawable in state.glx_drawables.values_mut() {
+            if drawable.x_drawable == alias.client_pixmap.0 {
+                drawable.glx_export_host_xid = Some(new_backing.as_raw());
+            }
+        }
+    }
+    if let Some(w) = state.resources.window_mut(window) {
+        for alias in &mut w.composite_named_pixmaps {
+            alias.host_pixmap = new_backing;
+            alias.width = new_width;
+            alias.height = new_height;
+        }
     }
 
     // compCopyWindow analog: carry pre-resize bits from OLD into NEW
@@ -6141,7 +6255,12 @@ fn handle_damage_request(
                 let seed_initial_damage = state
                     .resources
                     .window(drawable_id)
-                    .is_some_and(|w| w.map_state == crate::resources::MapState::Viewable);
+                    .is_some_and(|w| w.map_state == crate::resources::MapState::Viewable)
+                    || state
+                        .resources
+                        .composite_named_pixmap_owner_window(drawable_id)
+                        .and_then(|window_id| state.resources.window(window_id))
+                        .is_some_and(|w| w.map_state == crate::resources::MapState::Viewable);
                 if seed_initial_damage {
                     log::trace!(
                         target: "yserver_core::core_loop::damage_fanout",
@@ -7672,11 +7791,6 @@ fn handle_present_request(
                     dst.host_xid(),
                 );
             }
-            state
-                .present_msc
-                .entry(ResourceId(req.window))
-                .and_modify(|msc| *msc = msc.saturating_add(1))
-                .or_insert(1);
             // Phase 4.2.3 scheduler enqueue. We mirror the request
             // onto the scheduler queue so a follow-up vblank-driven
             // submission path can pick it up; today the enqueued
@@ -7724,12 +7838,36 @@ fn handle_present_request(
         }
         x11present::NOTIFY_MSC => {
             if let Some(req) = x11present::parse_notify_msc(body) {
-                let current_msc = state
-                    .present_msc
-                    .get(&ResourceId(req.window))
-                    .copied()
-                    .unwrap_or(0);
-                if notify_msc_satisfied(current_msc, req.target_msc, req.divisor, req.remainder) {
+                // Xorg rejects remainder >= divisor with BadValue: current_msc %
+                // divisor is always < divisor, so the request could never be
+                // satisfied and would park forever (unbounded pending growth).
+                if req.divisor != 0 && req.remainder >= req.divisor {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_VALUE,
+                        u32::try_from(req.remainder).unwrap_or(u32::MAX),
+                        u16::from(header.data),
+                        PRESENT_MAJOR_OPCODE,
+                    );
+                }
+                // Vblank-paced clock: the current MSC is the real kernel
+                // value from the last pageflip (mirrored into ServerState).
+                // If already satisfied (and we have a real flip to time
+                // against), complete now; otherwise PARK the request and let
+                // a future pageflip fire it (drain_present_completions). On
+                // master these were dropped when unsatisfied, which froze a
+                // compositor's `present` frame clock after one frame.
+                let current_msc = state.present_kernel_msc;
+                let satisfied = current_msc > 0
+                    && notify_msc_satisfied(
+                        current_msc,
+                        req.target_msc,
+                        req.divisor,
+                        req.remainder,
+                    );
+                if satisfied {
                     fire_present_notify_msc_complete_events(
                         state,
                         byte_order,
@@ -7737,13 +7875,21 @@ fn handle_present_request(
                         req.window,
                         req.serial,
                         current_msc,
+                        state.present_kernel_ust,
                     );
+                } else {
+                    state
+                        .present_pending_msc
+                        .push(crate::server::PendingNotifyMsc {
+                            owner: client_id,
+                            window: req.window,
+                            serial: req.serial,
+                            target_msc: req.target_msc,
+                            divisor: req.divisor,
+                            remainder: req.remainder,
+                            byte_order,
+                        });
                 }
-                state
-                    .present_msc
-                    .entry(ResourceId(req.window))
-                    .and_modify(|msc| *msc = (*msc).max(req.target_msc).saturating_add(1))
-                    .or_insert(req.target_msc.saturating_add(1));
             }
             debug!("client {} #{} PRESENT::NotifyMSC", client_id.0, sequence.0);
         }
@@ -7915,11 +8061,6 @@ fn handle_present_request(
                 );
             }
             state
-                .present_msc
-                .entry(ResourceId(req.window))
-                .and_modify(|msc| *msc = msc.saturating_add(1))
-                .or_insert(1);
-            state
                 .present_scheduler
                 .enqueue(crate::present_scheduler::QueuedPresent {
                     serial: req.serial,
@@ -8074,7 +8215,11 @@ pub fn fire_present_completion_events(
     const IDLE_NOTIFY_MASK: u32 = 0x4;
 
     let window = ResourceId(event.dst_host_xid);
-    let current_msc = state.present_msc.get(&window).copied().unwrap_or(0);
+    // Report the real kernel vblank (msc, ust) — the same clock NotifyMSC
+    // completes against — so a compositor mixing PresentPixmap and NotifyMSC
+    // sees one monotonic sequence. (Was: a per-window software counter + ust=0,
+    // which picom rejects as "Invalid PresentCompleteNotify event".)
+    let current_msc = state.present_kernel_msc;
     let pixmap_xid = event.host_xid;
     let idle_fence = match event.wake {
         PresentWake::Pixmap { idle_fence_xid } => idle_fence_xid,
@@ -8154,7 +8299,7 @@ pub fn fire_present_completion_events(
                 event.serial,
                 x11present::COMPLETE_KIND_PIXMAP,
                 x11present::COMPLETE_MODE_COPY,
-                0, // ust unknown without a real vblank timestamp
+                state.present_kernel_ust,
                 current_msc,
             );
             debug!(
@@ -8232,6 +8377,7 @@ fn fire_present_notify_msc_complete_events(
     window: u32,
     serial: u32,
     current_msc: u64,
+    ust: u64,
 ) {
     use yserver_protocol::x11::present as x11present;
     const COMPLETE_NOTIFY_MASK: u32 = 0x2;
@@ -8265,16 +8411,45 @@ fn fire_present_notify_msc_complete_events(
             serial,
             x11present::COMPLETE_KIND_NOTIFY_MSC,
             x11present::COMPLETE_MODE_COPY,
-            0,
+            ust,
             current_msc,
         );
         debug!(
-            "PRESENT NotifyMSC CompleteNotify -> client {} eid=0x{eid:x} ({} bytes)",
+            "PRESENT NotifyMSC CompleteNotify -> client {} eid=0x{eid:x} msc={current_msc} ust={ust} ({} bytes)",
             owner.0,
             ev.len()
         );
         let _ = write_to_client(client, owner, &ev);
     }
+}
+
+/// Fire every parked `NotifyMSC` (NOTIFY_MSC handler) whose target MSC is now
+/// satisfied by the real kernel `(msc, ust)` from the latest pageflip.
+/// Called from `drain_present_completions` after the backend advances the
+/// vblank clock — this is what keeps a compositor's `present` frame clock
+/// running at the display refresh rate.
+pub(crate) fn fire_due_present_notify_msc(state: &mut ServerState, msc: u64, ust: u64) {
+    if msc == 0 || state.present_pending_msc.is_empty() {
+        return;
+    }
+    const PRESENT_MAJOR_OPCODE: u8 = 145;
+    let mut still_pending = Vec::new();
+    for p in std::mem::take(&mut state.present_pending_msc) {
+        if notify_msc_satisfied(msc, p.target_msc, p.divisor, p.remainder) {
+            fire_present_notify_msc_complete_events(
+                state,
+                p.byte_order,
+                PRESENT_MAJOR_OPCODE,
+                p.window,
+                p.serial,
+                msc,
+                ust,
+            );
+        } else {
+            still_pending.push(p);
+        }
+    }
+    state.present_pending_msc = still_pending;
 }
 
 fn handle_dri3_request(
@@ -9742,6 +9917,19 @@ fn handle_glx_request(
                         client_id.0, sequence.0
                     );
                     if let Some(d) = state.glx_drawables.get(&glx_drawable) {
+                        let x_drawable = d.x_drawable;
+                        let stored_host_xid = d.glx_export_host_xid;
+                        let current_host_xid = state
+                            .resources
+                            .pixmap(yserver_protocol::x11::ResourceId(x_drawable))
+                            .and_then(|p| p.host_xid.map(|h| h.as_raw()));
+                        let host_xid_for_export = current_host_xid.or(stored_host_xid);
+                        if let Some(current_host_xid) = current_host_xid
+                            && stored_host_xid != Some(current_host_xid)
+                            && let Some(d_mut) = state.glx_drawables.get_mut(&glx_drawable)
+                        {
+                            d_mut.glx_export_host_xid = Some(current_host_xid);
+                        }
                         // Ensure the backing is promoted to exportable storage so
                         // indirect GL texture sampling can read live content.
                         //
@@ -9763,7 +9951,7 @@ fn handle_glx_request(
                         // do not receive a protocol error, but the texture
                         // content will not be updated until indirect GL sampling
                         // is wired up.
-                        if let Some(host_xid) = d.glx_export_host_xid {
+                        if let Some(host_xid) = host_xid_for_export {
                             let _ = backend.promote_pixmap_exportable(host_xid);
                         }
                         // No reply for VENDOR_PRIVATE; for VENDOR_PRIVATE_WITH_REPLY
@@ -14853,7 +15041,7 @@ fn handle_reparent_window(
         subscribers_by_id(state, result.new_parent, 0x0008_0000)
     };
     debug!(
-        "client {} #{} ReparentWindow 0x{:x}: 0x{:x}->0x{:x} pos=({},{}) host_xid={:?}",
+        "client {} #{} ReparentWindow 0x{:x}: 0x{:x}->0x{:x} pos=({},{}) host_xid={:?} map_state={:?}->{:?}",
         client_id.0,
         sequence.0,
         result.window.0,
@@ -14861,7 +15049,9 @@ fn handle_reparent_window(
         result.new_parent.0,
         result.x,
         result.y,
-        result.host_xid
+        result.host_xid,
+        result.old_map_state,
+        result.new_map_state,
     );
     if let Some(xid) = result.host_xid {
         let new_host_parent = if result.new_parent == ROOT_WINDOW {
@@ -15078,7 +15268,6 @@ fn handle_reparent_window(
     Ok(RequestOutcome::Handled)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn handle_create_window(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -15584,6 +15773,23 @@ fn window_host_xid(state: &ServerState, window: ResourceId) -> u32 {
         .unwrap_or(window.0)
 }
 
+fn reset_damage_notify_cycle_for_drawable(state: &mut ServerState, drawable: ResourceId) {
+    let mut drawables = vec![drawable];
+    if let Some(window) = state.resources.window(drawable) {
+        drawables.extend(
+            window
+                .composite_named_pixmaps
+                .iter()
+                .map(|p| p.client_pixmap),
+        );
+    }
+    for damage in state.damage_objects.values_mut() {
+        if drawables.contains(&damage.drawable) {
+            damage.pending_notify_fired = false;
+        }
+    }
+}
+
 fn handle_configure_window(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -15807,24 +16013,6 @@ fn handle_configure_window(
             .map(|w| (w.x, w.y, w.width, w.height, w.border_width));
         let configure_changed = before_geom != after_geom || before_above != above_sibling;
         if configure_changed {
-            // TEMP STAGE-4D DIAG: log who actually receives ConfigureNotify
-            // for this move, so we can verify marco gets dirty-region
-            // triggers for CC frame drags. Remove after compositor-dirty
-            // investigation closes.
-            let struct_recipients = subscribers_by_id(state, window_id, 0x0002_0000);
-            let subst_recipients = parent
-                .map(|p| subscribers_by_id(state, p, 0x0008_0000))
-                .unwrap_or_default();
-            log::debug!(
-                target: "yserver::diag::configure_notify",
-                "ConfigureNotify emit window=0x{:x} parent={:?} geom=({},{} {}x{}) override_redirect={} STRUCTURE_NOTIFY_to={:?} SUBSTRUCTURE_NOTIFY_to={:?}",
-                window_id.0,
-                parent.map(|p| format!("0x{:x}", p.0)),
-                geometry.x, geometry.y, geometry.width, geometry.height,
-                override_redirect,
-                struct_recipients.iter().map(|c| c.0).collect::<Vec<_>>(),
-                subst_recipients.iter().map(|c| c.0).collect::<Vec<_>>(),
-            );
             let _dropped =
                 emit_window_event_to_state(state, window_id, 0x0002_0000, |buf, seq, order| {
                     x11::encode_configure_notify_event(
@@ -15864,6 +16052,7 @@ fn handle_configure_window(
                 window_id,
                 geometry.width,
                 geometry.height,
+                false,
             );
             // Present::ConfigureNotify. Tells DRI3+Present consumers
             // (Mesa's loader_dri3_helper) that the window resized and
@@ -15884,6 +16073,14 @@ fn handle_configure_window(
             // event closes.
             fire_present_configure_notify_for_window(state, window_id, geometry);
         }
+        // NOTE (Issue 2 — 2026-07-01): a pure move MUST NOT rotate the
+        // redirected backing. picom glx holds a one-time `NameWindowPixmap`
+        // alias to the original backing (its GLX texture never re-binds
+        // on move), so any swap breaks the alias: the live client content
+        // starts landing in a new backing picom never samples, and the
+        // frame visually freezes ("btop stops animating when dragged").
+        // The WIP `else if moved { rotate(..., true) }` that briefly lived
+        // here in commit bb3cc70d was this regression — reverted.
         // X11 Composite + DAMAGE interaction: configuring a redirected
         // window (move / resize / border / stack-order) changes its
         // screen-space presentation. The pixel content of the
@@ -17922,8 +18119,11 @@ fn handle_query_tree(
     sequence: SequenceNumber,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    debug!("client {} #{} QueryTree", client_id.0, sequence.0);
     let window = x11::drawable_request_id(body).unwrap_or(ROOT_WINDOW);
+    debug!(
+        "client {} #{} QueryTree 0x{:x}",
+        client_id.0, sequence.0, window.0
+    );
     let Some(window_state) = state.resources.window(window) else {
         return emit_x11_error(
             state,
@@ -17946,6 +18146,14 @@ fn handle_query_tree(
         window_state.parent
     };
     let children = window_state.children.clone();
+    debug!(
+        "client {} #{} QueryTree reply 0x{:x}: parent=0x{:x} children={}",
+        client_id.0,
+        sequence.0,
+        window.0,
+        parent.0,
+        children.len(),
+    );
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
@@ -18533,7 +18741,8 @@ fn handle_map_window(
         return Ok(RequestOutcome::Handled);
     }
 
-    let was_unmapped = state.resources.map_window(window);
+    let (was_unmapped, promoted_descendants) =
+        state.resources.map_window_with_promoted_descendants(window);
     debug_assert!(
         was_unmapped,
         "current_map_state == Unmapped guard above was checked; \
@@ -18628,6 +18837,9 @@ fn handle_map_window(
     // mate-xorg.xtrace lines 5164→5173.
     if host_xid.is_some() {
         let _dropped = accumulate_damage_full_to_state(state, window);
+        for promoted in &promoted_descendants {
+            reset_damage_notify_cycle_for_drawable(state, *promoted);
+        }
         accumulate_damage_viewable_descendants_to_state(state, window);
     }
     debug!(
@@ -18640,10 +18852,8 @@ fn handle_map_window(
 fn accumulate_damage_viewable_descendants_to_state(state: &mut ServerState, root: ResourceId) {
     let children: Vec<ResourceId> = state.resources.children(root).to_vec();
     for child in children {
-        let viewable = state
-            .resources
-            .window(child)
-            .is_some_and(|w| w.map_state == MapState::Viewable);
+        let child_window = state.resources.window(child);
+        let viewable = child_window.is_some_and(|w| w.map_state == MapState::Viewable);
         if !viewable {
             continue;
         }
@@ -18925,8 +19135,11 @@ fn handle_get_window_attributes(
     sequence: SequenceNumber,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
-    debug!("client {} #{} GetWindowAttributes", client_id.0, sequence.0);
     let id = x11::drawable_request_id(body).unwrap_or(ROOT_WINDOW);
+    debug!(
+        "client {} #{} GetWindowAttributes 0x{:x}",
+        client_id.0, sequence.0, id.0,
+    );
     // Spec: BadWindow on unknown window ID. Don't silently fall back to
     // ROOT_WINDOW — xts probes stale/destroyed XIDs and expects the
     // protocol error.
@@ -18949,6 +19162,17 @@ fn handle_get_window_attributes(
         all_event_masks,
         your_event_mask,
     );
+    if let Some(window) = state.resources.window(target) {
+        debug!(
+            "client {} #{} GetWindowAttributes reply 0x{:x}: parent=0x{:x} map_state={} override_redirect={}",
+            client_id.0,
+            sequence.0,
+            target.0,
+            window.parent.0,
+            attrs.map_state,
+            attrs.override_redirect,
+        );
+    }
     let Some(client) = state.clients.get_mut(&client_id.0) else {
         return Ok(RequestOutcome::Handled);
     };
@@ -29959,7 +30183,7 @@ mod tests {
     }
 
     #[test]
-    fn present_notify_msc_immediate_sends_complete_notify() {
+    fn present_notify_msc_parks_then_fires_on_vblank_advance() {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
         let mut backend = RecordingBackend::new();
@@ -30009,6 +30233,26 @@ mod tests {
         )
         .expect("Present NotifyMSC");
 
+        // Vblank-paced clock: with no pageflip yet (present_kernel_msc == 0)
+        // the request is PARKED rather than completed immediately — emitting
+        // ust=0 would be rejected by a `present`-scheduler compositor (picom).
+        assert_eq!(
+            state.present_pending_msc.len(),
+            1,
+            "NotifyMSC parks until a real (msc, ust) is available"
+        );
+
+        // Simulate a pageflip / armed-vblank advancing the kernel clock. This
+        // is what `drain_present_completions` does after the backend reports a
+        // retirement; it drains every parked request whose target is satisfied.
+        const FIRED_MSC: u64 = 100;
+        const FIRED_UST: u64 = 0x1234_5678;
+        fire_due_present_notify_msc(&mut state, FIRED_MSC, FIRED_UST);
+        assert!(
+            state.present_pending_msc.is_empty(),
+            "satisfied parked request is removed after firing"
+        );
+
         let mut event = [0u8; 40];
         peer.read_exact(&mut event).expect("CompleteNotify event");
         assert_eq!(event[0], 35, "GenericEvent");
@@ -30032,6 +30276,106 @@ mod tests {
         assert_eq!(
             u32::from_le_bytes([event[20], event[21], event[22], event[23]]),
             SERIAL
+        );
+        // UST (offset 24) and MSC (offset 32) carry the real kernel values.
+        assert_eq!(
+            u64::from_le_bytes([
+                event[24], event[25], event[26], event[27], event[28], event[29], event[30],
+                event[31],
+            ]),
+            FIRED_UST,
+            "CompleteNotify reports the real UST from the vblank advance"
+        );
+        assert_eq!(
+            u64::from_le_bytes([
+                event[32], event[33], event[34], event[35], event[36], event[37], event[38],
+                event[39],
+            ]),
+            FIRED_MSC,
+            "CompleteNotify reports the real MSC from the vblank advance"
+        );
+    }
+
+    #[test]
+    fn present_notify_msc_remainder_ge_divisor_is_rejected_not_parked() {
+        // Xorg rejects remainder >= divisor with BadValue. Pre-fix, such a
+        // request parked forever: current_msc % divisor is always < divisor, so
+        // it could never equal a remainder >= divisor, growing the parked list
+        // unbounded and re-scanning it every vblank.
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        const WINDOW: u32 = 0x100;
+
+        let mut notify_body = Vec::new();
+        notify_body.extend_from_slice(&WINDOW.to_le_bytes());
+        notify_body.extend_from_slice(&1_u32.to_le_bytes()); // serial
+        notify_body.extend_from_slice(&0_u32.to_le_bytes()); // pad
+        notify_body.extend_from_slice(&0_u64.to_le_bytes()); // target_msc
+        notify_body.extend_from_slice(&2_u64.to_le_bytes()); // divisor
+        notify_body.extend_from_slice(&5_u64.to_le_bytes()); // remainder >= divisor
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 145,
+                data: yserver_protocol::x11::present::NOTIFY_MSC,
+                length_units: 10,
+            },
+            &notify_body,
+            None,
+        )
+        .expect("Present NotifyMSC (invalid divisor/remainder)");
+
+        assert!(
+            state.present_pending_msc.is_empty(),
+            "remainder >= divisor must be rejected, not parked forever"
+        );
+    }
+
+    #[test]
+    fn present_pending_msc_purged_on_client_disconnect() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        const WINDOW: u32 = 0x100;
+
+        // Park a NotifyMSC (present_kernel_msc == 0 → always parks).
+        let mut notify_body = Vec::new();
+        notify_body.extend_from_slice(&WINDOW.to_le_bytes());
+        notify_body.extend_from_slice(&1_u32.to_le_bytes()); // serial
+        notify_body.extend_from_slice(&0_u32.to_le_bytes()); // pad
+        notify_body.extend_from_slice(&1_u64.to_le_bytes()); // target_msc
+        notify_body.extend_from_slice(&0_u64.to_le_bytes()); // divisor
+        notify_body.extend_from_slice(&0_u64.to_le_bytes()); // remainder
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 145,
+                data: yserver_protocol::x11::present::NOTIFY_MSC,
+                length_units: 10,
+            },
+            &notify_body,
+            None,
+        )
+        .expect("Present NotifyMSC");
+        assert_eq!(state.present_pending_msc.len(), 1, "request parked");
+
+        // Client disconnects → its parked requests must be purged, else they
+        // are re-scanned every vblank forever with no client to satisfy them.
+        crate::core_loop::process_disconnect::process_disconnect(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+        );
+        assert!(
+            state.present_pending_msc.is_empty(),
+            "parked NotifyMSC purged when its owning client disconnects"
         );
     }
 
@@ -30972,6 +31316,7 @@ mod tests {
             ResourceId(WINDOW_XID),
             100,
             75,
+            false,
         );
 
         let calls = backend.calls();
@@ -31085,6 +31430,7 @@ mod tests {
             ResourceId(WINDOW_XID),
             NEW_W,
             NEW_H,
+            false,
         );
 
         // NEW handle is whatever the RecordingBackend's allocate
@@ -31194,6 +31540,7 @@ mod tests {
             ResourceId(WINDOW_XID),
             NEW_W,
             NEW_H,
+            true,
         );
 
         let calls = backend.calls();
@@ -31245,6 +31592,92 @@ mod tests {
             c < d,
             "Copy(idx={c}) must precede Drop(idx={d}) — dropping the retain before the copy \
              defeats the purpose of taking it. Calls: {calls:?}",
+        );
+    }
+
+    #[test]
+    fn rotate_redirected_backing_on_move_forces_reallocate_even_when_size_matches() {
+        use crate::backend::recording::RecordedCall;
+
+        const WINDOW_XID: u32 = 0x0010_0001;
+        const HOST_XID: u32 = 0x0040_0001;
+        const OLD_BACKING: u32 = 0x0050_0001;
+        const W: u16 = 100;
+        const H: u16 = 50;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(1),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 32,
+                window: ResourceId(WINDOW_XID),
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: W,
+                height: H,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        {
+            let w = state
+                .resources
+                .window_mut(ResourceId(WINDOW_XID))
+                .expect("window installed");
+            w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(HOST_XID));
+            w.redirected_backing = Some(crate::resources::RedirectedBacking {
+                host_pixmap: crate::backend::PixmapHandle::from_raw_for_test(OLD_BACKING),
+                width: W,
+                height: H,
+                depth: 32,
+            });
+        }
+
+        rotate_redirected_backing_on_resize(
+            &mut state,
+            &mut backend,
+            None,
+            ResourceId(WINDOW_XID),
+            W,
+            H,
+            true,
+        );
+
+        let calls = backend.calls();
+        assert!(
+            calls.iter().any(|c| matches!(
+                c,
+                RecordedCall::ReleaseRedirectedBacking(x) if *x == OLD_BACKING
+            )),
+            "forced move-rotate must release OLD even when size matches; got {calls:?}",
+        );
+        assert!(
+            calls.iter().any(|c| matches!(
+                c,
+                RecordedCall::AllocateRedirectedBacking {
+                    host_window,
+                    width,
+                    height,
+                    depth: 32,
+                } if *host_window == HOST_XID && *width == W && *height == H
+            )),
+            "forced move-rotate must allocate a fresh backing at the same size; got {calls:?}",
+        );
+        let new_backing = state
+            .resources
+            .window(ResourceId(WINDOW_XID))
+            .and_then(|w| w.redirected_backing)
+            .expect("redirected_backing repointed after forced rotate");
+        assert_ne!(
+            new_backing.host_pixmap.as_raw(),
+            OLD_BACKING,
+            "forced move-rotate must repoint to a fresh backing even at identical size",
         );
     }
 
@@ -31467,6 +31900,203 @@ mod tests {
             )),
             "expected SetBackingSceneParticipation(B, true) for Manual mode so the \
              scene's redirected_target damage-peek sees paints; got {calls:?}",
+        );
+    }
+
+    /// Redirecting an already-mapped window must emit one initial full
+    /// DamageNotify wakeup so a compositor that subscribes after map
+    /// can pull the seeded backing into the COW immediately. Without
+    /// this, the backing contains the correct pixels but the COW keeps
+    /// showing the root/background until some unrelated later event
+    /// (click, move, resize) dirties the window.
+    #[test]
+    fn activate_redirect_on_mapped_window_emits_initial_damage() {
+        use crate::server::{DamageObject, RedirectRecord};
+
+        const CLIENT_ID: u32 = 1;
+        const WINDOW_XID: u32 = 0x0010_0010;
+        const HOST_XID: u32 = 0x0040_0010;
+        const DAMAGE_XID: u32 = 0x0010_0011;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WINDOW_XID),
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 50,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(WINDOW_XID));
+        {
+            let w = state
+                .resources
+                .window_mut(ResourceId(WINDOW_XID))
+                .expect("window installed");
+            w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(HOST_XID));
+        }
+        state.composite_redirects.insert(
+            (ResourceId(WINDOW_XID), false),
+            RedirectRecord {
+                mode: crate::server::CompositeRedirectMode::Manual,
+                owner: yserver_protocol::x11::ClientId(CLIENT_ID),
+            },
+        );
+        state.damage_objects.insert(
+            DAMAGE_XID,
+            DamageObject {
+                owner: ClientId(CLIENT_ID),
+                drawable: ResourceId(WINDOW_XID),
+                level: 3,
+                rects: Vec::new(),
+                pending_notify_fired: false,
+                last_reported_geometry: None,
+            },
+        );
+
+        activate_redirect_backing_for(
+            &mut state,
+            &mut backend,
+            None,
+            ResourceId(WINDOW_XID),
+            crate::server::CompositeRedirectMode::Manual,
+        );
+
+        let damage = state
+            .damage_objects
+            .get(&DAMAGE_XID)
+            .expect("damage object after redirect activation");
+        assert!(
+            !damage.rects.is_empty(),
+            "redirect activation on an already-mapped window must emit an initial \
+             full damage wakeup so compositors pull the seeded backing immediately",
+        );
+    }
+
+    /// A compositor subscribes to DAMAGE on the `NameWindowPixmap`
+    /// pixmap, not the original window. That pixmap must receive the
+    /// same initial seed as a plain viewable window, otherwise the
+    /// first composite after redirect can stay blank until some later
+    /// client paint lands.
+    #[test]
+    fn damage_create_on_named_pixmap_alias_seeds_initial_damage() {
+        use yserver_protocol::x11::damage as x11damage;
+
+        const CLIENT_ID: u32 = 1;
+        const WINDOW_XID: u32 = 0x0010_0012;
+        const HOST_WINDOW_XID: u32 = 0x0040_0012;
+        const PIXMAP_XID: u32 = 0x0020_0012;
+        const DAMAGE_ID: u32 = 0x0080_0012;
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(WINDOW_XID),
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 50,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        {
+            let w = state
+                .resources
+                .window_mut(ResourceId(WINDOW_XID))
+                .expect("window installed");
+            w.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(
+                HOST_WINDOW_XID,
+            ));
+            w.map_state = crate::resources::MapState::Viewable;
+        }
+        activate_redirect_backing_for(
+            &mut state,
+            &mut backend,
+            None,
+            ResourceId(WINDOW_XID),
+            crate::server::CompositeRedirectMode::Manual,
+        );
+        let host_pixmap = state
+            .resources
+            .window(ResourceId(WINDOW_XID))
+            .and_then(|w| w.redirected_backing.as_ref())
+            .map(|b| b.host_pixmap)
+            .expect("redirected backing");
+        state.resources.create_pixmap(
+            yserver_protocol::x11::ClientId(CLIENT_ID),
+            yserver_protocol::x11::CreatePixmapRequest {
+                pixmap: ResourceId(PIXMAP_XID),
+                drawable: ResourceId(WINDOW_XID),
+                width: 100,
+                height: 50,
+                depth: 24,
+            },
+        );
+        let _ = state
+            .resources
+            .set_pixmap_host_xid(ResourceId(PIXMAP_XID), host_pixmap);
+        {
+            let w = state
+                .resources
+                .window_mut(ResourceId(WINDOW_XID))
+                .expect("window installed");
+            w.composite_named_pixmaps
+                .push(crate::resources::NamedCompositePixmap {
+                    client_pixmap: ResourceId(PIXMAP_XID),
+                    host_pixmap,
+                    width: 100,
+                    height: 50,
+                });
+        }
+
+        let mut body = Vec::with_capacity(12);
+        body.extend_from_slice(&DAMAGE_ID.to_le_bytes());
+        body.extend_from_slice(&PIXMAP_XID.to_le_bytes());
+        body.push(x11damage::report_level::NON_EMPTY);
+        body.extend_from_slice(&[0, 0, 0]);
+
+        let header = RequestHeader {
+            opcode: 0,
+            data: x11damage::CREATE,
+            length_units: 0,
+        };
+        handle_damage_request(
+            &mut state,
+            ClientId(CLIENT_ID),
+            SequenceNumber(1),
+            header,
+            &body,
+        )
+        .expect("damage create handled");
+
+        let damage = state
+            .damage_objects
+            .get(&DAMAGE_ID)
+            .expect("damage object created");
+        assert!(
+            !damage.rects.is_empty(),
+            "creating DAMAGE on a named pixmap alias of a viewable window must seed \
+             initial damage so picom sees the current backing immediately",
         );
     }
 
@@ -36287,6 +36917,128 @@ mod tests {
     }
 
     #[test]
+    fn map_window_rereports_nonempty_damage_for_newly_viewable_descendant() {
+        use crate::{nested::DAMAGE_FIRST_EVENT, server::DamageObject};
+        use std::io::Read;
+        use yserver_protocol::x11::{damage as x11damage, xfixes::RegionRect};
+
+        const CLIENT_ID: u32 = 1;
+        const PARENT_XID: u32 = 0x0010_0022;
+        const PARENT_HOST_XID: u32 = 0x0040_0022;
+        const CHILD_XID: u32 = 0x0010_0023;
+        const CHILD_HOST_XID: u32 = 0x0040_0023;
+        const CHILD_DAMAGE_ID: u32 = 0x0080_0023;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(PARENT_XID),
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 400,
+                height: 300,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(CHILD_XID),
+                parent: ResourceId(PARENT_XID),
+                x: 20,
+                y: 30,
+                width: 200,
+                height: 80,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        {
+            let parent = state
+                .resources
+                .window_mut(ResourceId(PARENT_XID))
+                .expect("parent installed");
+            parent.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(
+                PARENT_HOST_XID,
+            ));
+            parent.map_state = crate::resources::MapState::Unmapped;
+        }
+        {
+            let child = state
+                .resources
+                .window_mut(ResourceId(CHILD_XID))
+                .expect("child installed");
+            child.host_xid = Some(crate::backend::WindowHandle::from_raw_for_test(
+                CHILD_HOST_XID,
+            ));
+            child.map_state = crate::resources::MapState::Unviewable;
+        }
+
+        state.damage_objects.insert(
+            CHILD_DAMAGE_ID,
+            DamageObject {
+                owner: ClientId(CLIENT_ID),
+                drawable: ResourceId(CHILD_XID),
+                level: x11damage::report_level::NON_EMPTY,
+                rects: vec![RegionRect {
+                    x: 0,
+                    y: 0,
+                    width: 200,
+                    height: 80,
+                }],
+                pending_notify_fired: true,
+                last_reported_geometry: Some(x11damage::Rectangle {
+                    x: 20,
+                    y: 30,
+                    width: 200,
+                    height: 80,
+                }),
+            },
+        );
+
+        let mut body = Vec::with_capacity(4);
+        body.extend_from_slice(&PARENT_XID.to_le_bytes());
+        handle_map_window(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT_ID),
+            SequenceNumber(1),
+            &body,
+        )
+        .expect("handle_map_window");
+
+        peer.set_nonblocking(true).expect("set nonblocking");
+        let mut all = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match peer.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => all.extend_from_slice(&chunk[..n]),
+                Err(_) => break,
+            }
+        }
+
+        assert!(
+            all.chunks_exact(32).any(|evt| evt[0] == DAMAGE_FIRST_EVENT),
+            "mapping a parent must re-report NON_EMPTY damage for descendants promoted \
+             from Unviewable to Viewable even when they already fired before becoming viewable"
+        );
+    }
+
+    #[test]
     fn damage_create_on_viewable_window_seeds_full_damage() {
         use yserver_protocol::x11::{RequestHeader, damage as x11damage};
 
@@ -36626,6 +37378,7 @@ mod tests {
             ResourceId(WINDOW_XID),
             100,
             75,
+            false,
         );
 
         let calls = backend.calls();

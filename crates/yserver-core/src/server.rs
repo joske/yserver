@@ -733,6 +733,23 @@ pub struct RedirectRecord {
     pub owner: ClientId,
 }
 
+/// A `PresentNotifyMSC` request whose target MSC was not yet satisfied at
+/// request time. Parked here (instead of dropped) and fired when a pageflip
+/// advances the real MSC past the target — see `drain_present_completions`.
+/// This is what lets a compositor's `present`-scheduler frame clock (picom)
+/// advance at the display refresh rate.
+#[derive(Debug, Clone)]
+pub struct PendingNotifyMsc {
+    /// Owning client — parked requests are purged when it disconnects.
+    pub owner: ClientId,
+    pub window: u32,
+    pub serial: u32,
+    pub target_msc: u64,
+    pub divisor: u64,
+    pub remainder: u64,
+    pub byte_order: ClientByteOrder,
+}
+
 #[derive(Debug)]
 pub struct ServerState {
     pub atoms: AtomTable,
@@ -942,7 +959,16 @@ pub struct ServerState {
     pub damage_objects: HashMap<u32, DamageObject>,
     pub composite_redirects: HashMap<(ResourceId, bool), RedirectRecord>,
     pub present_event_selections: HashMap<u32, PresentEventSelection>,
-    pub present_msc: HashMap<ResourceId, u64>,
+    /// `PresentNotifyMSC` requests parked for a future MSC, fired when a
+    /// pageflip advances past their target (`drain_present_completions`).
+    pub present_pending_msc: Vec<PendingNotifyMsc>,
+    /// Latest kernel `(msc, ust_micros)` from the most recent pageflip
+    /// retirement (primary output), mirrored from the backend each loop.
+    /// The Present vblank clock: `NotifyMSC` completes report these so a
+    /// compositor (picom) paces its frame clock on real vblanks. `(0, 0)`
+    /// until the first flip.
+    pub present_kernel_msc: u64,
+    pub present_kernel_ust: u64,
     /// Diagnostic side-table: client_id → first WM_CLASS string the
     /// client set on any of its windows. Used by perf logs to attribute
     /// hot-path activity (e.g. SHM PutImage bursts) to a recognisable
@@ -1186,7 +1212,9 @@ impl ServerState {
             damage_objects: HashMap::new(),
             composite_redirects: HashMap::new(),
             present_event_selections: HashMap::new(),
-            present_msc: HashMap::new(),
+            present_pending_msc: Vec::new(),
+            present_kernel_msc: 0,
+            present_kernel_ust: 0,
             client_wm_class: HashMap::new(),
             mit_shm_segments: HashMap::new(),
             glx_contexts: HashMap::new(),

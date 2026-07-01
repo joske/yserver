@@ -894,6 +894,40 @@ pub trait Backend: Send {
         Ok(())
     }
 
+    /// Returns whether the existing redirected backing storage can
+    /// satisfy a resize to `(width, height, depth)` without
+    /// reallocating the underlying pixmap. Backends that track a
+    /// larger storage extent than the current logical alias size can
+    /// use this to fast-path shrink/re-grow cycles.
+    #[must_use]
+    fn redirected_backing_can_fit(
+        &self,
+        backing: PixmapHandle,
+        width: u16,
+        height: u16,
+        depth: u8,
+    ) -> bool {
+        let _ = (backing, width, height, depth);
+        false
+    }
+
+    /// Update the logical geometry metadata for an existing
+    /// redirected backing without reallocating its underlying
+    /// storage. Used together with [`Self::redirected_backing_can_fit`]
+    /// to keep COMPOSITE/DRI3-visible size in sync when the storage
+    /// is already large enough.
+    fn update_redirected_backing_geometry(
+        &mut self,
+        origin: Option<OriginContext>,
+        backing: PixmapHandle,
+        width: u16,
+        height: u16,
+        depth: u8,
+    ) -> io::Result<()> {
+        let _ = (origin, backing, width, height, depth);
+        Ok(())
+    }
+
     /// Stage 4b — capability flag: returns `true` when the backend
     /// implements the full COMPOSITE-redirect activation path
     /// (`allocate_redirected_backing` + `release_redirected_backing` +
@@ -1900,6 +1934,36 @@ pub trait Backend: Send {
     /// backends opt out.
     fn drain_completed_present_events(&mut self) -> Vec<CompletedPresentEvent> {
         Vec::new()
+    }
+
+    /// Latest kernel `(msc, ust_micros)` for the primary output, updated on
+    /// each pageflip retirement. Drives Present vblank pacing: deferred
+    /// `PresentNotifyMSC` completions fire with these real values so a
+    /// compositor's frame clock advances at the display refresh rate.
+    /// Default `(0, 0)` for backends without real vblanks.
+    fn present_get_ust_msc(&self) -> (u64, u64) {
+        (0, 0)
+    }
+
+    /// Arm a one-shot kernel vblank event so the run loop's Present clock
+    /// keeps advancing while `PresentNotifyMSC` requests are parked but
+    /// nothing is flipping (a full-screen compositor produces no pageflips
+    /// when idle → MSC never advances → its frame clock deadlocks). Mirrors
+    /// Xorg `ms_present_queue_vblank`.
+    ///
+    /// `target_mscs` are the parked requests' target MSC values (from
+    /// `present_pending_msc`). KMS backends dedup against an internal
+    /// per-CRTC armed-target map so calling this every run-loop iteration is
+    /// safe (no refire storm), pre-gate on scanout permission, and clear the
+    /// armed map when scanout is disallowed (master loss drops queued
+    /// sequences). Returns the count of CRTCs newly armed; `0` covers the
+    /// "nothing pending" / "scanout disallowed" / "already armed" /
+    /// "unsupported kernel" cases — callers must not treat zero as an error.
+    ///
+    /// Default `Ok(0)` keeps backends without real vblanks (`HostX11`,
+    /// `Recording`) opted out — they flush parked notifies synchronously.
+    fn arm_idle_vblanks(&mut self, _target_mscs: &[u64]) -> std::io::Result<usize> {
+        Ok(0)
     }
 
     // ──────────────────────────────────────────────────────────────

@@ -543,32 +543,47 @@ pub fn pointer_event_fanout_to_state(
         && let Some((grab_window, grab_client, gx, gy, owner_events, via_xi2)) =
             active_grab_target(state)
     {
-        // With `owner_events=true`, pointer events on windows owned
-        // by the grab client are reported normally (to the deepest
-        // natural window) rather than redirected to `grab_window`.
-        // The grab itself is just an exclusivity mechanism — other
-        // clients can't see the events. GTK3 menus rely on this:
-        // motion fires on the panel button until the user actually
-        // crosses into the popup, at which point natural
-        // Enter/Leave fire and GTK3 transitions menu state. With
-        // `owner_events=false`, all events report against grab_window.
-        // Step-2 active-grab redirect — `owner_events=true` semantics
-        // per X11 spec: deliver normally if the natural target's
-        // window is OWNED BY the grab client, in addition to the
-        // topological "within grab subtree" case. The earlier check
-        // used pure topology, which worked for Cinnamon's muffin
-        // (grab window = the same window the menu sub-widgets are
-        // descendants of) but failed on MATE's mate-panel pattern
-        // where menu items are SEPARATE TOP-LEVEL override-redirect
-        // windows OWNED BY mate-panel — siblings of the panel main
-        // window, not descendants. Pre-fix this redirected hover
-        // motion to the panel main window with grab-relative coords,
-        // GTK couldn't localise the hover, submenus stopped opening.
-        // No-op when owner_events=false (Cinnamon's pattern).
-        let target_qualifies_for_natural = target == grab_window
-            || state.resources.is_descendant_of(target, grab_window)
-            || state.resources.window_owner(target) == Some(grab_client);
-        let redirect_to_grab = !owner_events || !target_qualifies_for_natural;
+        // Xorg DeliverGrabbedEvent's owner_events=true rule is NOT
+        // "the immediate hit window is owned by the grab client".
+        // It is "the event would normally be reported to the grab
+        // client" — i.e. the usual propagation walk, filtered to the
+        // grab client. This matters for WMs that grab on a tiny hidden
+        // helper window but select motion on a visible ancestor/frame:
+        // once the pointer moves over a foreign app child, the event
+        // should still propagate naturally to the WM's selected frame
+        // window, not snap over to the helper grab_window with huge
+        // grab-relative coordinates.
+        let mask_bit = pointer_mask_bit(event.kind, event.state);
+        let natural_for_grab_client = (!matches!(
+            event.kind,
+            PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify
+        ) && owner_events)
+            .then(|| {
+                grabbed_natural_target(state, target, target_x, target_y, mask_bit, grab_client)
+            })
+            .flatten();
+        let redirect_to_grab = !owner_events || natural_for_grab_client.is_none();
+        if let Some((natural_window, natural_x, natural_y, child)) = natural_for_grab_client {
+            if !via_xi2 {
+                let extras = fanout_event_to_clients(state, &[grab_client], |buf, seq, order| {
+                    encode_pointer_event(
+                        buf,
+                        order,
+                        event.kind,
+                        seq,
+                        event.detail,
+                        event.time,
+                        natural_window,
+                        child,
+                        event,
+                        natural_x,
+                        natural_y,
+                    );
+                });
+                merge_dropped(&mut dropped, extras);
+            }
+            handled_core_via_grab = true;
+        }
         if !matches!(
             event.kind,
             PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify
@@ -615,9 +630,6 @@ pub fn pointer_event_fanout_to_state(
                 merge_dropped(&mut dropped, extras);
             }
             handled_core_via_grab = true;
-            // Else (owner_events=true and target owned by grab client):
-            // fall through to normal propagation so the event fires on
-            // the natural window via the usual subscriber-walk path.
         }
         // For Enter/Leave (natural pointer crossings between windows),
         // never mark handled_core_via_grab — let them fall through to
@@ -2347,6 +2359,7 @@ fn merge_dropped(into: &mut Vec<ClientId>, more: Vec<ClientId>) {
 mod tests {
     use super::*;
     use crate::{
+        backend::recording::RecordingBackend,
         host_x11::HostXidMap,
         resources::ROOT_WINDOW,
         server::{ScreenSaverActive, ServerState},
@@ -3054,6 +3067,140 @@ mod tests {
             state.pointer_grab,
             Some((ClientId(1), grab_window)),
             "passive grab must be active for client 1",
+        );
+    }
+
+    /// openbox resize regression: an active core grab can live on a
+    /// tiny hidden helper window while the WM selects motion on a
+    /// visible frame window containing a foreign app child. With
+    /// `owner_events=true`, motion over that foreign child must still
+    /// propagate naturally to the WM's frame window, not redirect to
+    /// the helper grab window.
+    #[test]
+    fn active_grab_owner_events_uses_grab_client_filtered_propagation() {
+        use crate::{backend::Backend, resources::ROOT_VISUAL, server::ActivePointerGrab};
+
+        const WM_CLIENT_ID: u32 = 1;
+        const APP_CLIENT_ID: u32 = 2;
+        const GRAB_WIN: u32 = 0x0010_0080;
+        const FRAME_WIN: u32 = 0x0010_0081;
+        const APP_CHILD_WIN: u32 = 0x0020_0082;
+        const HOST_FRAME_XID: u32 = 0xCAFE_0081;
+
+        let mut state = ServerState::new();
+        let mut wm_peer = install_client(&mut state, WM_CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+        wm_peer.set_nonblocking(true).expect("nonblocking");
+
+        state.resources.create_window(
+            ClientId(WM_CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(GRAB_WIN),
+                parent: ROOT_WINDOW,
+                x: -100,
+                y: -100,
+                width: 1,
+                height: 1,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state.resources.create_window(
+            ClientId(WM_CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(FRAME_WIN),
+                parent: ROOT_WINDOW,
+                x: 500,
+                y: 300,
+                width: 200,
+                height: 150,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state.resources.create_window(
+            ClientId(APP_CLIENT_ID),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(APP_CHILD_WIN),
+                parent: ResourceId(FRAME_WIN),
+                x: 20,
+                y: 20,
+                width: 100,
+                height: 80,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ResourceId(GRAB_WIN));
+        let _ = state.resources.map_window(ResourceId(FRAME_WIN));
+        let _ = state.resources.map_window(ResourceId(APP_CHILD_WIN));
+
+        state
+            .clients
+            .get_mut(&WM_CLIENT_ID)
+            .expect("wm client")
+            .event_masks
+            .insert(ResourceId(FRAME_WIN), 0x0000_0040);
+
+        Backend::register_top_level(&mut backend, None, ResourceId(FRAME_WIN), HOST_FRAME_XID)
+            .expect("register frame host xid");
+
+        state.pointer_grab = Some((ClientId(WM_CLIENT_ID), ResourceId(GRAB_WIN)));
+        state.active_pointer_grab = Some(ActivePointerGrab {
+            owner: ClientId(WM_CLIENT_ID),
+            grab_window: ResourceId(GRAB_WIN),
+            event_mask: 0x0000_0040,
+            cursor: ResourceId(0),
+            time: 0,
+            owner_events: true,
+            via_xi2: false,
+        });
+
+        let motion = HostPointerEvent {
+            kind: PointerEventKind::MotionNotify,
+            host_xid: HOST_FRAME_XID,
+            detail: 0,
+            time: 0x2000,
+            root_x: 545,
+            root_y: 345,
+            event_x: 45,
+            event_y: 45,
+            state: 0,
+            crossing_mode: 0,
+            child: 0,
+        };
+        let xid_map = backend.xid_map().clone();
+        let dropped =
+            pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, motion, true, false);
+        assert!(dropped.is_empty());
+
+        let mut buf = [0u8; 32];
+        let n = wm_peer.read(&mut buf).expect("wm got motion");
+        assert_eq!(n, 32, "expected one core MotionNotify");
+        assert_eq!(buf[0], 6, "event type should be MotionNotify");
+        assert_eq!(
+            &buf[12..16],
+            &FRAME_WIN.to_le_bytes(),
+            "motion must report against the WM-selected frame window, not the hidden grab helper",
+        );
+        assert_eq!(
+            i16::from_le_bytes([buf[24], buf[25]]),
+            45,
+            "event_x must stay frame-relative",
+        );
+        assert_eq!(
+            i16::from_le_bytes([buf[26], buf[27]]),
+            45,
+            "event_y must stay frame-relative",
         );
     }
 

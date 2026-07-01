@@ -499,6 +499,16 @@ fn cursor_err_disables_hw(e: &io::Error) -> bool {
     )
 }
 
+/// Returned by `drain_page_flip_events` per `DRM_CRTC_SEQUENCE` event.
+/// Fields are raw kernel values; validation (time_ns sign, crtc_id
+/// resolution) happens in `KmsBackendV2::on_crtc_sequence_event`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SequenceCompletion {
+    pub(crate) crtc_id_raw: u32,
+    pub(crate) time_ns: i64,
+    pub(crate) sequence: u64,
+}
+
 /// v2's real DRM/Vk/libinput owner. Replaces the flat field set
 /// that Stage 1b's `KmsBackendV2` carried.
 pub(crate) struct PlatformBackend {
@@ -509,6 +519,30 @@ pub(crate) struct PlatformBackend {
     pub(crate) outputs: Vec<OutputLayout>,
     pub(crate) fb_w: u16,
     pub(crate) fb_h: u16,
+    /// Latest kernel `(msc, ust_micros)` per output index, updated on each
+    /// pageflip retirement in `drain_page_flip_events`. Drives Present
+    /// vblank pacing (`present_get_ust_msc`): a compositor's
+    /// `PresentNotifyMSC` completes with these real values so its frame
+    /// clock advances at the display refresh rate. Empty until the first
+    /// flip retires.
+    pub(crate) ust_msc: std::collections::HashMap<usize, (u64, u64)>,
+
+    /// Per-output software MSC fallback. Some KMS drivers (notably
+    /// apple_drm on Asahi) report `frame == 0` in every page-flip
+    /// completion event — the kernel does not maintain a CRTC
+    /// sequence counter — AND reject `DRM_IOCTL_CRTC_QUEUE_SEQUENCE`
+    /// with `EOPNOTSUPP`, so the idle-vblank arming path can't
+    /// advance the clock either. Without a non-zero MSC, every
+    /// `msc > 0` gate in the Present NotifyMSC path deadlocks a
+    /// compositor's vblank scheduler (picom presents frame 0 then
+    /// blocks forever).
+    ///
+    /// This counter increments on every pageflip retirement where
+    /// the kernel reports `frame == 0`, giving Present a monotonically
+    /// advancing MSC at the actual pageflip cadence. On drivers that
+    /// report a real `frame > 0` this map stays empty (the real value
+    /// is used directly).
+    pub(crate) software_msc: std::collections::HashMap<usize, u64>,
 
     // Input side
     input_ctx: Option<crate::input::SendContext>,
@@ -869,6 +903,8 @@ impl PlatformBackend {
             outputs: layouts,
             fb_w,
             fb_h,
+            ust_msc: std::collections::HashMap::new(),
+            software_msc: std::collections::HashMap::new(),
             input_ctx,
             #[cfg(target_os = "linux")]
             hotplug_monitor,
@@ -953,6 +989,8 @@ impl PlatformBackend {
             }],
             fb_w: 800,
             fb_h: 600,
+            ust_msc: std::collections::HashMap::new(),
+            software_msc: std::collections::HashMap::new(),
             input_ctx: None,
             #[cfg(target_os = "linux")]
             hotplug_monitor,
@@ -1383,21 +1421,91 @@ impl PlatformBackend {
         fds
     }
 
-    pub(crate) fn drain_page_flip_events(&self) -> io::Result<Vec<usize>> {
+    pub(crate) fn drain_page_flip_events(
+        &mut self,
+    ) -> io::Result<(Vec<usize>, Vec<SequenceCompletion>)> {
         use ::drm::control::crtc;
 
-        let mut flipped: Vec<crtc::Handle> = Vec::new();
-        crate::drm::page_flip::drain_events(&self.device, |c| flipped.push(c))?;
+        // Capture the kernel vblank (msc=frame, ust=duration) alongside the
+        // CRTC so Present pacing can complete NotifyMSC with real values.
+        let mut flipped: Vec<(crtc::Handle, u32, std::time::Duration)> = Vec::new();
+        let mut sequenced: Vec<SequenceCompletion> = Vec::new();
+        crate::drm::page_flip::drain_events(
+            &self.device,
+            |c, frame, dur| {
+                flipped.push((c, frame, dur));
+            },
+            |crtc_id_raw, time_ns, sequence| {
+                // Raw kernel values; validation (time_ns sign, crtc_id
+                // resolution) happens in `on_crtc_sequence_event`.
+                sequenced.push(SequenceCompletion {
+                    crtc_id_raw,
+                    time_ns,
+                    sequence,
+                });
+            },
+        )?;
 
         let mut output_indices = Vec::with_capacity(flipped.len());
-        for crtc in flipped {
+        for (crtc, frame, dur) in flipped {
             let Some(output_idx) = self.outputs.iter().position(|o| o.output.crtc == crtc) else {
                 log::warn!("v2: pageflip-complete for unknown CRTC {crtc:?}");
                 continue;
             };
+            // u32 frame → u64 MSC (kernel wraps at 2^32; monotonic enough
+            // for a frame clock within a session). UST in microseconds.
+            let ust = u64::try_from(dur.as_micros()).unwrap_or(u64::MAX);
+            // apple_drm (Asahi) reports `frame == 0` on every page-flip
+            // completion — the kernel does not maintain a CRTC sequence
+            // counter — and rejects `DRM_IOCTL_CRTC_QUEUE_SEQUENCE` with
+            // `EOPNOTSUPP`, so the idle-vblank arming path can't advance
+            // the clock either. Without a non-zero MSC the Present
+            // NotifyMSC path deadlocks (picom presents frame 0 then blocks
+            // forever). Fall back to a per-output software counter that
+            // increments on every flip when the kernel reports 0; on
+            // drivers that report a real frame this stays untouched.
+            let msc = if frame == 0 {
+                let next = self
+                    .software_msc
+                    .get(&output_idx)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                self.software_msc.insert(output_idx, next);
+                log::debug!(
+                    target: "yserver::kms::v2::platform",
+                    "v2 pageflip software-msc fallback output={output_idx} msc={next} \
+                     ust={ust} (kernel reports frame=0)"
+                );
+                next
+            } else {
+                u64::from(frame)
+            };
+            log::debug!(
+                target: "yserver::kms::v2::platform",
+                "v2 pageflip ust_msc output={output_idx} msc={msc} kernel_frame={frame} kernel_ust_micros={ust}"
+            );
+            self.ust_msc.insert(output_idx, (msc, ust));
             output_indices.push(output_idx);
         }
-        Ok(output_indices)
+        Ok((output_indices, sequenced))
+    }
+
+    /// Latest kernel `(msc, ust_micros)` across all outputs — the most
+    /// advanced output's pair — or `(0, 0)` before the first pageflip retires.
+    /// Consumed by the Present vblank-pacing path to complete
+    /// `PresentNotifyMSC`.
+    ///
+    /// Taking the max (rather than keying on output 0) matters for
+    /// multi-monitor: a full-screen compositor on a *secondary* output flips
+    /// only that CRTC, so an output-0 reading would leave the global clock
+    /// stuck at 0 and that compositor's NotifyMSC parked forever.
+    pub(crate) fn present_get_ust_msc(&self) -> (u64, u64) {
+        self.ust_msc
+            .values()
+            .copied()
+            .max_by_key(|(msc, _)| *msc)
+            .unwrap_or((0, 0))
     }
 
     /// VkContext accessor for the engine. Returns `None` on the
@@ -2004,10 +2112,10 @@ impl PlatformBackend {
             }
         };
         for fd in exported_writes {
-            if let Err(e) = crate::kms::vk::dri3::import_dmabuf_write_fence(*fd, sync_fd.as_fd())
-                && e.kind() != io::ErrorKind::Unsupported
-            {
-                log::warn!("glx-tfp: import write fence failed: {e}");
+            match crate::kms::vk::dri3::import_dmabuf_write_fence(*fd, sync_fd.as_fd()) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::Unsupported => {}
+                Err(e) => log::warn!("glx-tfp: import write fence failed: {e}"),
             }
         }
     }

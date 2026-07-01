@@ -95,7 +95,12 @@ pub fn run_loop(
                 }
                 DRM_TOKEN => {
                     let mut handled = 0u32;
-                    drm::page_flip::drain_events(device, |_crtc| handled += 1)?;
+                    drm::page_flip::drain_events(
+                        device,
+                        |_crtc, _frame, _dur| handled += 1,
+                        // No idle vblank arming on this path → drop sequences.
+                        |_cid, _t, _s| {},
+                    )?;
                     for _ in 0..handled {
                         if let Some(idx) = swapchain.submitted_idx() {
                             swapchain.complete(idx).map_err(|e| {
@@ -238,7 +243,12 @@ pub fn run_loop(
                 }
                 DRM_TOKEN => {
                     let mut handled = 0u32;
-                    drm::page_flip::drain_events(device, |_crtc| handled += 1)?;
+                    drm::page_flip::drain_events(
+                        device,
+                        |_crtc, _frame, _dur| handled += 1,
+                        // No idle vblank arming on this path → drop sequences.
+                        |_cid, _t, _s| {},
+                    )?;
                     for _ in 0..handled {
                         if let Some(idx) = swapchain.submitted_idx() {
                             swapchain.complete(idx).map_err(|e| {

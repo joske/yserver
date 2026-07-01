@@ -291,9 +291,9 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
     state.present_event_selections.retain(|_, selection| {
         selection.owner != client_id && !dead_windows.contains(&selection.window)
     });
-    state
-        .present_msc
-        .retain(|window, _| !dead_windows.contains(window));
+    // Parked NotifyMSC requests from this client would otherwise be re-scanned
+    // every vblank forever (the client is gone and can never be satisfied-away).
+    state.present_pending_msc.retain(|p| p.owner != client_id);
     state
         .mit_shm_segments
         .retain(|_, seg| seg.owner != client_id);

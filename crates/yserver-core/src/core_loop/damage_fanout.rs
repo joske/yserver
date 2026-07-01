@@ -483,13 +483,39 @@ fn accumulate_at_level(
     rh: i32,
     pending: &mut Vec<PendingNotify>,
 ) {
+    // Resolve `level_drawable` through the NameWindowPixmap alias
+    // indirection. Compositors such as picom subscribe DAMAGE on the
+    // pixmap returned by `NameWindowPixmap`, not on the window itself.
+    // When damage is accumulated for a redirected window (either a
+    // ConfigureWindow-move emits `accumulate_damage_full(state, W)` or
+    // a descendant paint walks up to W as a redirected ancestor), the
+    // damage objects subscribed on W's `composite_named_pixmaps[*]`
+    // alias pixmaps MUST also fire here — otherwise the compositor
+    // never receives `DamageNotify` for redirected-window content
+    // (move: stale composite; child repaint: blank in the composited
+    // frame).
+    //
+    // Xorg's `getDrawableDamageRef(&pWin->drawable)` resolves this
+    // automatically via `GetWindowPixmap(pWin)` → backing pixmap →
+    // that pixmap's damage list (miext/damage/damage.c:90-110). The
+    // alias pixmap and the window share the backing pixmap's damage
+    // list, so a single `DamageDamageRegion(&pWin->drawable, ...)` hits
+    // every alias subscription. yserver's per-xid `damage_objects` map
+    // has no such indirection, so we mirror it inline here.
+    let mut drawables = vec![level_drawable];
+    if let Some(window) = state.resources.window(level_drawable)
+        && !window.composite_named_pixmaps.is_empty()
+    {
+        for alias in &window.composite_named_pixmaps {
+            drawables.push(alias.client_pixmap);
+        }
+    }
     let damage_ids: Vec<u32> = state
         .damage_objects
         .iter()
-        .filter(|(_, dmg)| dmg.drawable == level_drawable)
+        .filter(|(_, dmg)| drawables.contains(&dmg.drawable))
         .map(|(id, _)| *id)
         .collect();
-
     // Stage 4d shadow-hunt diagnostic: surface every accumulate call
     // with its target drawable + how many DAMAGE subscriptions matched
     // + how many of those have `pending_notify_fired=true` (i.e. would
@@ -1405,5 +1431,89 @@ mod tests {
         );
         let r = dmg.rects[0];
         assert_eq!((r.x, r.y, r.width, r.height), (0, 0, 26, 27));
+    }
+
+    /// Issue-2 (2026-07-01): accumulating damage on a redirected window
+    /// MUST fire DAMAGE objects subscribed on the window's
+    /// `NameWindowPixmap` alias pixmap, not only those subscribed on
+    /// the window itself. picom binds its GLX texture to the named
+    /// pixmap and subscribes `XDamageCreate` on that pixmap xid; if
+    /// `accumulate_at_level` matches only `dmg.drawable == window_xid`
+    /// the compositor never receives `DamageNotify` for a ConfigureWindow
+    /// move (or for repaints of descendants routed through the
+    /// redirect), so the composited frame visually freezes at its
+    /// pre-move position. Xorg resolves this indirection automatically
+    /// via `getDrawableDamageRef(&pWin->drawable)` → `GetWindowPixmap`
+    /// → the backing pixmap's shared damage list
+    /// (miext/damage/damage.c:90-110); yserver's per-xid damage map
+    /// has no such indirection, so it is mirrored inline here.
+    #[test]
+    fn accumulate_on_window_fires_damage_subscribed_on_named_pixmap_alias() {
+        const CLIENT_ID: u32 = 1;
+        const WINDOW_XID: u32 = 0x0010_0014;
+        const ALIAS_PIXMAP_XID: u32 = 0x0020_0014;
+        const DAMAGE_ID: u32 = 0x0080_0014;
+
+        let mut state = ServerState::new();
+        add_client(&mut state, CLIENT_ID, 0);
+        let window = add_window(
+            &mut state,
+            CLIENT_ID,
+            WINDOW_XID,
+            ROOT_WINDOW,
+            10,
+            20,
+            100,
+            50,
+        );
+
+        // Install the NameWindowPixmap alias on the window. The host
+        // pixmap handle is irrelevant to the damage-fanout path; only
+        // the alias xid matters.
+        {
+            let w = state
+                .resources
+                .window_mut(window)
+                .expect("window installed");
+            w.composite_named_pixmaps
+                .push(crate::resources::NamedCompositePixmap {
+                    client_pixmap: ResourceId(ALIAS_PIXMAP_XID),
+                    host_pixmap: crate::backend::PixmapHandle::from_raw_for_test(0xDEAD_BEEF),
+                    width: 100,
+                    height: 50,
+                });
+        }
+
+        // picom creates the DAMAGE subscription on the alias pixmap,
+        // NOT on the window.
+        add_damage_on(
+            &mut state,
+            CLIENT_ID,
+            DAMAGE_ID,
+            ResourceId(ALIAS_PIXMAP_XID),
+        );
+
+        // ConfigureWindow on the redirected window fires
+        // `accumulate_damage_full_to_state(state, window)` (the
+        // steady-state move-damage path). Pre-fix this matched zero
+        // damage objects (picom subscribed on the alias, not the
+        // window), so the compositor never received a DamageNotify.
+        let _ = accumulate_damage_full_to_state(&mut state, window);
+
+        let dmg = state
+            .damage_objects
+            .get(&DAMAGE_ID)
+            .expect("alias-pixmap damage object");
+        assert!(
+            !dmg.rects.is_empty(),
+            "accumulating damage on a redirected window MUST also fire \
+             DAMAGE objects subscribed on its NameWindowPixmap alias \
+             pixmap (picom's subscription model)",
+        );
+        // The damage rect is in the window's coordinate space (the
+        // alias pixmap has the same dimensions as the window's
+        // backing), so the full-window rect is (0,0)–(100,50).
+        let r = dmg.rects[0];
+        assert_eq!((r.x, r.y, r.width, r.height), (0, 0, 100, 50));
     }
 }
