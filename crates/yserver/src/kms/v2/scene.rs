@@ -2018,6 +2018,15 @@ fn build_scene(
             // descendants, propagated by recursion) so emitted
             // draws inherit `alpha_passthrough = true`.
             Some(top_xid) == cow_host_xid,
+            // Parent-clipping: top-levels are clipped by the root =
+            // the screen, which the output-extent gate already
+            // enforces. Pass effectively-unbounded ancestor bounds so
+            // this is a no-op for top-levels; descendants are still
+            // clipped to their top-level via the recursion.
+            i32::MIN / 2,
+            i32::MIN / 2,
+            i32::MAX / 2,
+            i32::MAX / 2,
         );
     }
     log::trace!(
@@ -2160,6 +2169,20 @@ fn emit_window_subtree(
     // opaque (`alpha_passthrough = false`). Mirrors the threading of
     // `under_redirected_ancestor` above.
     under_cow_subtree: bool,
+    // X11 parent-clipping: a window's visible region is the
+    // intersection of its own rectangle with EVERY ancestor's
+    // rectangle. These are the accumulated ancestor bounds in absolute
+    // screen coords (half-open [x0,x1) × [y0,y1)); this window's draw
+    // and its descendants' clips are intersected against them. The
+    // top-level call passes effectively-unbounded bounds (top-levels
+    // are screen-clipped by the output-extent gate), so this is a
+    // no-op for the common case where children fit inside their
+    // parents — it only bites a child that extends beyond its parent,
+    // e.g. an fvwm frame decoration parked in a tiny holding window.
+    clip_x0: i32,
+    clip_y0: i32,
+    clip_x1: i32,
+    clip_y1: i32,
 ) {
     let debug_focus = scene_walk_debug_enabled_for(host_xid);
     // Stage 4 diagnostic: trace-level scene-walk decision per window.
@@ -2203,6 +2226,24 @@ fn emit_window_subtree(
     }
     let abs_x = parent_abs_x + i32::from(geom.x);
     let abs_y = parent_abs_y + i32::from(geom.y);
+
+    // X11 parent-clipping. This window's visible box in its OWN local
+    // coords = its rect [0,own_w)×[0,own_h) intersected with the
+    // accumulated ancestor clip (translated into local coords). Draws
+    // are restricted to this box; descendants inherit the intersection
+    // (in absolute coords) as their clip. `vis_*` empty ⇒ nothing of
+    // this window is visible (fully clipped by an ancestor).
+    let own_w = i32::from(geom.width);
+    let own_h = i32::from(geom.height);
+    let vis_lx0 = (clip_x0 - abs_x).max(0);
+    let vis_ly0 = (clip_y0 - abs_y).max(0);
+    let vis_lx1 = (clip_x1 - abs_x).min(own_w);
+    let vis_ly1 = (clip_y1 - abs_y).min(own_h);
+    // Absolute clip passed down to children = ancestor clip ∩ own rect.
+    let child_clip_x0 = clip_x0.max(abs_x);
+    let child_clip_y0 = clip_y0.max(abs_y);
+    let child_clip_x1 = clip_x1.min(abs_x + own_w);
+    let child_clip_y1 = clip_y1.min(abs_y + own_h);
 
     // Manual-redirect subtree boundary. When a window is
     // `scene_participating=false` here, the compositor owns the
@@ -2470,10 +2511,12 @@ fn emit_window_subtree(
                         let ry = i32::from(rect.y);
                         let rw = i32::from(rect.width);
                         let rh = i32::from(rect.height);
-                        let cx = rx.max(0);
-                        let cy = ry.max(0);
-                        let cw = (rx + rw).min(win_w) - cx;
-                        let ch = (ry + rh).min(win_h) - cy;
+                        // Clamp to the window extent AND the ancestor
+                        // visible box (parent-clipping).
+                        let cx = rx.max(0).max(vis_lx0);
+                        let cy = ry.max(0).max(vis_ly0);
+                        let cw = (rx + rw).min(win_w).min(vis_lx1) - cx;
+                        let ch = (ry + rh).min(win_h).min(vis_ly1) - cy;
                         if cw <= 0 || ch <= 0 {
                             continue;
                         }
@@ -2500,14 +2543,20 @@ fn emit_window_subtree(
                         });
                         emitted_any = true;
                     }
-                } else {
+                } else if vis_lx1 > vis_lx0 && vis_ly1 > vis_ly0 {
+                    // Unshaped: emit the window rect clipped to the
+                    // ancestor visible box. Common case (child fits
+                    // inside its parent) → box == full window, so this
+                    // is the full-window draw with src [0,0]-[1,1].
+                    let cw = vis_lx1 - vis_lx0;
+                    let ch = vis_ly1 - vis_ly0;
+                    #[allow(clippy::cast_precision_loss)]
                     draws.push(CompositeDraw {
                         image_view,
-                        #[allow(clippy::cast_precision_loss)]
-                        dst_origin: [dx as f32, dy as f32],
-                        dst_size: [win_w_f, win_h_f],
-                        src_origin: [0.0, 0.0],
-                        src_size: [1.0, 1.0],
+                        dst_origin: [(dx + vis_lx0) as f32, (dy + vis_ly0) as f32],
+                        dst_size: [cw as f32, ch as f32],
+                        src_origin: [vis_lx0 as f32 / win_w_f, vis_ly0 as f32 / win_h_f],
+                        src_size: [cw as f32 / win_w_f, ch as f32 / win_h_f],
                         // Phase 2.6 — alpha-passthrough is inherited
                         // from the COW subtree flag (set on the COW
                         // top-level + descendants). Outside the COW
@@ -2601,6 +2650,12 @@ fn emit_window_subtree(
             // Once we entered the COW top-level, every descendant
             // emits with alpha_passthrough=true.
             under_cow_subtree,
+            // Parent-clipping: children are clipped to this window's
+            // rect intersected with the inherited ancestor clip.
+            child_clip_x0,
+            child_clip_y0,
+            child_clip_x1,
+            child_clip_y1,
         );
     }
 }
@@ -3696,6 +3751,93 @@ mod tests {
             .find(|d| d.dst_size[0] == 40.0 && d.dst_size[1] == 30.0)
             .expect("child draw present");
         assert_eq!(child.dst_origin, [60.0, 80.0]);
+    }
+
+    /// X11 parent-clipping: a child window is clipped to its parent's
+    /// rectangle. fvwm (and other WMs) park oversized frame-decoration
+    /// windows in a tiny off-screen holding window so they're invisible;
+    /// yserver must not paint the whole child. Regression: fvwm's 1146×23
+    /// title bar, parked in a 10×10 holding window at (-10,-10), leaked a
+    /// ~1136×13 white strip onto the top-left of the screen because the
+    /// scene drew the child at full size (air/silence HW 2026-07-02).
+    #[test]
+    fn build_scene_clips_child_to_parent_bounds() {
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows_v2 = super::super::backend::WindowsV2Map::new();
+
+        // Small parent @ (100, 100), 10×10 (the holding window).
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            0x100,
+            100,
+            100,
+            10,
+            10,
+            None,
+            true,
+        );
+        core.top_level_order.push(0x100);
+
+        // Oversized child @ (2, 3) relative, 100×50 — far larger than the
+        // 10×10 parent. Only the intersection with the parent may show.
+        alloc_stub_window(
+            &mut store,
+            &mut windows_v2,
+            0x101,
+            2,
+            3,
+            100,
+            50,
+            Some(0x100),
+            true,
+        );
+
+        let built = build_scene(
+            &core,
+            &mut store,
+            &windows_v2,
+            0,
+            &platform,
+            None,
+            None,
+            None,
+            false,
+        );
+        let scene = built.scene;
+
+        // The child draw must be clipped to the parent's rect, NOT the
+        // full 100×50. Child abs (102,103) ∩ parent (100,100,110,110)
+        // = (102,103)-(110,110) → 8×7.
+        let child = scene
+            .draws
+            .iter()
+            .find(|d| d.dst_origin == [102.0, 103.0])
+            .expect("child draw present at its absolute origin");
+        assert_eq!(
+            child.dst_size,
+            [8.0, 7.0],
+            "child must be clipped to the parent's 10×10 bounds, not drawn \
+             at full 100×50 (parent-clipping); got {:?}",
+            child.dst_size,
+        );
+        assert!(
+            (child.src_size[0] - 8.0 / 100.0).abs() < 1e-5
+                && (child.src_size[1] - 7.0 / 50.0).abs() < 1e-5,
+            "src_size must sample only the visible sub-region, got {:?}",
+            child.src_size,
+        );
+        // No draw may exceed the parent's footprint.
+        assert!(
+            !scene
+                .draws
+                .iter()
+                .any(|d| d.dst_size[0] > 10.0 || d.dst_size[1] > 10.0),
+            "no draw may exceed the 10×10 parent, got {:?}",
+            scene.draws,
+        );
     }
 
     /// SHAPE bounding region clips the window's scene draw. Marco
