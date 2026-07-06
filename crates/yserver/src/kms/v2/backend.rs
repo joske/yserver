@@ -13687,48 +13687,27 @@ impl Backend for KmsBackendV2 {
         height: u16,
     ) -> io::Result<()> {
         self.telemetry.record_copy_area_call();
-        // Resolve the SOURCE the same way as the destination when it
-        // is a window. A window that is Composite-redirected (or whose
-        // ancestor is) has its pixels in the redirect *backing*; its
-        // own leaf storage is never painted into. So a window→window
-        // self-copy — exactly what a Tk text widget does to scroll its
-        // diff pane — MUST read from the backing. Reading the raw leaf
-        // storage copies blank/background pixels over the live content,
-        // progressively blanking the widget (gitk diff-pane bug).
+        // Resolve the SOURCE the same way as the destination. A window
+        // that is Composite-redirected (or whose ancestor is) has its
+        // pixels in the redirect *backing*; its own leaf storage is
+        // never painted into. So a window→window self-copy — exactly
+        // what a Tk text widget does to scroll its diff pane — MUST
+        // read from the backing. Reading the raw leaf storage copies
+        // blank/background pixels over the live content, progressively
+        // blanking the widget (gitk diff-pane bug).
         // `src_off` is the source window's offset within its backing;
         // it converts the wire window-local src coords into backing
-        // coords. Pixmap sources keep the raw store lookup with a zero
-        // offset — the compositor's offscreen-pixmap CopyArea path
-        // (e.g. marco's CC buffer → COW) depends on reading the pixmap
-        // as the client sees it.
-        let (src, src_off): (super::store::DrawableId, (i32, i32)) = if self
-            .windows_v2
-            .contains_key(&src_host_xid)
-        {
-            match self.resolve_paint_target(src_host_xid) {
-                Some(t) => (t.id, t.offset),
-                None => {
-                    log::warn!(
-                        "v2 copy_area dropped — src window unresolvable: src=0x{src_host_xid:x} \
-                             dst=0x{dst_host_xid:x} src_xy=({src_x},{src_y}) dst_xy=({dst_x},{dst_y}) {width}x{height}",
-                    );
-                    self.log_v2_gap("copy_area_unknown_xid");
-                    return Ok(());
-                }
-            }
-        } else {
-            match self.store.lookup(src_host_xid) {
-                Some(s) => (s, (0, 0)),
-                None => {
-                    log::warn!(
-                        "v2 copy_area dropped — src unknown: src=0x{src_host_xid:x} dst=0x{dst_host_xid:x} \
-                             src_xy=({src_x},{src_y}) dst_xy=({dst_x},{dst_y}) {width}x{height}",
-                    );
-                    self.log_v2_gap("copy_area_unknown_xid");
-                    return Ok(());
-                }
-            }
+        // coords.
+        let Some(src_target) = self.resolve_paint_target(src_host_xid) else {
+            log::warn!(
+                "v2 copy_area dropped — src unresolvable: src=0x{src_host_xid:x} \
+                     dst=0x{dst_host_xid:x} src_xy=({src_x},{src_y}) dst_xy=({dst_x},{dst_y}) {width}x{height}",
+            );
+            self.log_v2_gap("copy_area_unknown_xid");
+            return Ok(());
         };
+        let (src, src_off): (super::store::DrawableId, (i32, i32)) =
+            (src_target.id, src_target.offset);
         // Stage 4a — dst resolves through `resolve_paint_target` so
         // copy_area into a redirected window lands in the backing
         // with the descendant offset applied.
