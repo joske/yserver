@@ -2439,6 +2439,118 @@ impl KmsBackendV2 {
         occluders.into_iter().map(|(_, rect)| rect).collect()
     }
 
+    /// Screenshot fast-path for `CopyArea(src=root, …)` with the GC's
+    /// subwindow-mode set to `IncludeInferiors` (Qt5 `QScreen::grabWindow`,
+    /// e.g. flameshot). The root window's own storage holds only the
+    /// background, so the ordinary copy would capture just the wallpaper. Read
+    /// the COMPOSITED scanout instead — the same source `get_image` uses for
+    /// the root — and upload it into the destination. This keeps composition in
+    /// one place (the scene compositor) rather than re-walking the window tree.
+    ///
+    /// Returns `Ok(true)` when it handled the copy, `Ok(false)` to fall through
+    /// to the normal path: for non-root sources, `ClipByChildren` (root storage
+    /// is the correct background-only source there), non-plain GC state
+    /// (non-`GXcopy`, partial plane-mask, or a bitmap clip-mask — whose
+    /// semantics a raw upload can't preserve), or when there are no live
+    /// outputs to read.
+    fn try_copy_area_root_scanout(
+        &mut self,
+        src_host_xid: u32,
+        dst_host_xid: u32,
+        dst_target: &PaintTarget,
+        src_x: i16,
+        src_y: i16,
+        dst_x: i16,
+        dst_y: i16,
+        width: u16,
+        height: u16,
+    ) -> io::Result<bool> {
+        use yserver_core::backend::{ClipState, GcFunction, SubwindowMode};
+        if src_host_xid != self.core.window_id
+            || !matches!(
+                self.core.current_subwindow_mode,
+                SubwindowMode::IncludeInferiors
+            )
+        {
+            return Ok(false);
+        }
+        // Only the plain GXcopy / full-plane-mask / no-bitmap-clip case reads
+        // the scanout; exotic ROP/plane/clip-mask combos fall through so their
+        // semantics aren't silently reduced to a raw upload. (GC rectangle
+        // clips ARE honoured — via `compute_copy_area_scissors` below.)
+        let dst_depth = dst_target.x11_depth;
+        let full_mask = depth_plane_mask(dst_depth);
+        let plane_mask = self.core.current_plane_mask & full_mask;
+        let plain = matches!(self.core.current_function, GcFunction::Copy)
+            && plane_mask == full_mask
+            && !matches!(self.core.current_clip, ClipState::Pixmap { .. });
+        if !plain {
+            return Ok(false);
+        }
+        let outputs: Vec<(i32, i32, u32, u32)> = self
+            .platform
+            .outputs
+            .iter()
+            .map(|o| (o.x, o.y, u32::from(o.width), u32::from(o.height)))
+            .collect();
+        if outputs.is_empty() {
+            return Ok(false);
+        }
+        // Destination sub-rects honour the GC rectangle clip (and, for window
+        // destinations, child/occluder subtraction). Pixmap destinations get
+        // the whole rect. Empty = fully clipped away (spec-correct no-op).
+        let sub_rects =
+            self.compute_copy_area_scissors(dst_host_xid, dst_target, dst_x, dst_y, width, height);
+        if sub_rects.is_empty() {
+            return Ok(true);
+        }
+        let dst_id = dst_target.id;
+        let (off_x, off_y) = dst_target.offset;
+        let mut any = false;
+        for sub in &sub_rects {
+            for piece in split_root_scanout_reads(*sub, src_x, src_y, dst_x, dst_y, &outputs) {
+                let bytes =
+                    match read_scanout_region(self, piece.read, ScanoutReadSelection::OnScreenOnly)
+                    {
+                        Ok(b) => b,
+                        Err(e) => {
+                            log::warn!(
+                                "v2 copy_area root-scanout: readback failed \
+                             (dst=0x{dst_host_xid:x} read={:?}): {e:?}",
+                                piece.read,
+                            );
+                            continue;
+                        }
+                    };
+                let dst_pos = ash::vk::Offset2D {
+                    x: piece.dst_local.x + off_x,
+                    y: piece.dst_local.y + off_y,
+                };
+                match self.engine.put_image(
+                    &mut self.store,
+                    &mut self.platform,
+                    dst_id,
+                    dst_pos,
+                    piece.read.extent,
+                    &bytes,
+                    dst_depth,
+                ) {
+                    Ok(()) => any = true,
+                    Err(e) => log::warn!(
+                        "v2 copy_area root-scanout: upload failed \
+                         (dst=0x{dst_host_xid:x} pos={dst_pos:?}): {e:?}"
+                    ),
+                }
+            }
+        }
+        if any {
+            self.telemetry.record_paint_submit();
+            self.trace_simple(SubmitKind::CopyArea, dst_id, 1);
+            self.scene.wake_for_damage();
+        }
+        Ok(true)
+    }
+
     /// Compute the surviving destination scissor rects for a CopyArea, in
     /// drawable-LOCAL space (before `dst_target.offset` is added). This is the
     /// EXACT non-mask clip machinery the run-based path uses, in order: GC
@@ -9217,6 +9329,72 @@ fn select_scanout_bo_for_rect(
     }))
 }
 
+/// One scanout read for a root-source `CopyArea(IncludeInferiors)` screenshot:
+/// which root-absolute region to read from the composited scanout, and where
+/// (destination-local) to write it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RootScanoutRead {
+    /// Root-absolute rect to hand to `read_scanout_region`. Guaranteed to sit
+    /// fully inside one output, so `OnScreenOnly` selection succeeds.
+    read: vk::Rect2D,
+    /// Destination-LOCAL offset for the read pixels (before `dst_target.offset`).
+    dst_local: vk::Offset2D,
+}
+
+/// Split one surviving destination sub-rect (destination-LOCAL coords) of a
+/// root-source `CopyArea` into per-output scanout reads.
+///
+/// `read_scanout_region(OnScreenOnly)` rejects any rect that is partially
+/// off-screen or spans two outputs (`select_scanout_bo_for_rect` requires the
+/// rect to sit fully inside one output BO). So for each output we intersect the
+/// requested root-absolute source region with the output's bounds and emit one
+/// read per non-empty piece. Source area not covered by any output is dropped
+/// (X11 leaves off-screen root pixels undefined).
+///
+/// `outputs` entries are `(x, y, width, height)` in root-absolute coordinates.
+fn split_root_scanout_reads(
+    dst_local: vk::Rect2D,
+    src_x: i16,
+    src_y: i16,
+    dst_x: i16,
+    dst_y: i16,
+    outputs: &[(i32, i32, u32, u32)],
+) -> Vec<RootScanoutRead> {
+    // Root-absolute source origin for this destination sub-rect: shift the
+    // wire src origin by the same delta the sub-rect shifted from the wire dst
+    // origin (mirrors copy_area's `src = src_xy + (sub - dst_xy)` arithmetic).
+    let src_ox = i32::from(src_x) + (dst_local.offset.x - i32::from(dst_x));
+    let src_oy = i32::from(src_y) + (dst_local.offset.y - i32::from(dst_y));
+    let src_x1 = src_ox.saturating_add_unsigned(dst_local.extent.width);
+    let src_y1 = src_oy.saturating_add_unsigned(dst_local.extent.height);
+    let mut reads = Vec::new();
+    for &(ox, oy, ow, oh) in outputs {
+        let ix0 = src_ox.max(ox);
+        let iy0 = src_oy.max(oy);
+        let ix1 = src_x1.min(ox.saturating_add_unsigned(ow));
+        let iy1 = src_y1.min(oy.saturating_add_unsigned(oh));
+        if ix1 <= ix0 || iy1 <= iy0 {
+            continue;
+        }
+        reads.push(RootScanoutRead {
+            read: vk::Rect2D {
+                offset: vk::Offset2D { x: ix0, y: iy0 },
+                extent: vk::Extent2D {
+                    width: (ix1 - ix0).unsigned_abs(),
+                    height: (iy1 - iy0).unsigned_abs(),
+                },
+            },
+            // Destination-local: the piece's offset within the requested
+            // source region, added back onto the sub-rect's dst origin.
+            dst_local: vk::Offset2D {
+                x: dst_local.offset.x + (ix0 - src_ox),
+                y: dst_local.offset.y + (iy0 - src_oy),
+            },
+        });
+    }
+    reads
+}
+
 fn read_scanout_region(
     backend: &KmsBackendV2,
     rect: vk::Rect2D,
@@ -13777,6 +13955,25 @@ impl Backend for KmsBackendV2 {
             self.log_v2_gap("copy_area_unknown_xid");
             return Ok(());
         };
+        // Screenshot fast-path: `CopyArea(src=root, …, IncludeInferiors)` must
+        // copy the COMPOSITED desktop (all mapped windows), not the root's own
+        // storage (background only). Handled by reading the on-screen scanout,
+        // mirroring `get_image`'s root special-case. Returns `true` when it took
+        // the copy; `false` falls through to the ordinary root-storage path
+        // (non-plain GC state, or no live outputs).
+        if self.try_copy_area_root_scanout(
+            src_host_xid,
+            dst_host_xid,
+            &dst_target,
+            src_x,
+            src_y,
+            dst_x,
+            dst_y,
+            width,
+            height,
+        )? {
+            return Ok(());
+        }
         // Stage 4d Manual-redirect fix: split the copy by
         // `subwindow_mode = ClipByChildren` rules when dst is a
         // window. Each surviving sub-rect is in dst-window-local
@@ -26544,6 +26741,217 @@ mod tests {
             root_out, window_out,
             "root GetImage must match the visible window pixels"
         );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn root_copy_area_include_inferiors_captures_window_into_pixmap() {
+        use yserver_core::{backend::SubwindowMode, resources::ROOT_WINDOW, server::ServerState};
+        use yserver_protocol::x11::ResourceId;
+
+        let mut state = ServerState::new();
+        let mut backend = match KmsBackendV2::for_tests_with_vk_live_scene() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        install_client_for_v2(&mut state, 14);
+        state
+            .resources
+            .window_mut(ROOT_WINDOW)
+            .expect("root")
+            .host_xid = yserver_core::backend::WindowHandle::from_raw(backend.core.window_id);
+
+        let (root_w, root_h) = {
+            let root = state.resources.window(ROOT_WINDOW).expect("root window");
+            (root.width, root.height)
+        };
+        let window = ResourceId(0x2002);
+        let window_host = create_live_v2_window(
+            &mut state,
+            &mut backend,
+            window,
+            ROOT_WINDOW,
+            32,
+            24,
+            16,
+            16,
+        );
+
+        let root_color = 0x0011_2233;
+        let window_color = 0x00aa_55ff;
+        backend
+            .fill_rectangle(
+                None,
+                backend.core.window_id,
+                root_color,
+                0,
+                0,
+                root_w,
+                root_h,
+            )
+            .expect("fill root");
+        backend
+            .fill_rectangle(None, window_host.as_raw(), window_color, 0, 0, 16, 16)
+            .expect("fill window");
+        backend.tick_maybe_composite_for_tests();
+
+        // Screenshot path: CopyArea(src=root, dst=pixmap) with a GC whose
+        // subwindow-mode is IncludeInferiors (Qt5 QScreen::grabWindow).
+        let dst = backend
+            .create_pixmap(None, 24, root_w, root_h)
+            .expect("create destination pixmap");
+        backend.core.current_subwindow_mode = SubwindowMode::IncludeInferiors;
+        backend
+            .copy_area(
+                None,
+                backend.core.window_id,
+                dst.as_raw(),
+                0,
+                0,
+                0,
+                0,
+                root_w,
+                root_h,
+            )
+            .expect("copy root to pixmap");
+
+        // The mapped window's region in the destination must carry the
+        // composited WINDOW pixels, not the root background. On the buggy
+        // path copy_area reads root STORAGE (background), so this region
+        // comes back as root_color and the assert fails.
+        let win_region = backend
+            .get_image_pixels_for_tests(dst.as_raw(), 2, 32, 24, 16, 16, !0)
+            .expect("dst get_image window region")
+            .expect("dst window bytes");
+        let scanout_win = super::read_scanout_region(
+            &backend,
+            ash::vk::Rect2D {
+                offset: ash::vk::Offset2D { x: 32, y: 24 },
+                extent: ash::vk::Extent2D {
+                    width: 16,
+                    height: 16,
+                },
+            },
+            super::ScanoutReadSelection::OnScreenOnly,
+        )
+        .expect("scanout readback");
+        assert_eq!(
+            win_region, scanout_win,
+            "root CopyArea(IncludeInferiors) must copy the composited desktop \
+             (window pixels), not the root background"
+        );
+
+        // A region with no window on top must still carry the root background.
+        let bg_region = backend
+            .get_image_pixels_for_tests(dst.as_raw(), 2, 0, 0, 8, 8, !0)
+            .expect("dst get_image bg region")
+            .expect("dst bg bytes");
+        let scanout_bg = super::read_scanout_region(
+            &backend,
+            ash::vk::Rect2D {
+                offset: ash::vk::Offset2D { x: 0, y: 0 },
+                extent: ash::vk::Extent2D {
+                    width: 8,
+                    height: 8,
+                },
+            },
+            super::ScanoutReadSelection::OnScreenOnly,
+        )
+        .expect("scanout bg readback");
+        assert_eq!(
+            bg_region, scanout_bg,
+            "root CopyArea(IncludeInferiors) must copy the background where no window covers"
+        );
+    }
+
+    fn r(x: i32, y: i32, w: u32, h: u32) -> ash::vk::Rect2D {
+        ash::vk::Rect2D {
+            offset: ash::vk::Offset2D { x, y },
+            extent: ash::vk::Extent2D {
+                width: w,
+                height: h,
+            },
+        }
+    }
+
+    #[test]
+    fn split_root_scanout_reads_single_output_whole_rect() {
+        let got =
+            super::split_root_scanout_reads(r(0, 0, 100, 50), 0, 0, 0, 0, &[(0, 0, 200, 200)]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].read, r(0, 0, 100, 50));
+        assert_eq!(got[0].dst_local, ash::vk::Offset2D { x: 0, y: 0 });
+    }
+
+    #[test]
+    fn split_root_scanout_reads_honors_src_origin() {
+        // Copy from root (32,24) into dst (0,0): read root-absolute (32,24),
+        // write to dst-local (0,0).
+        let got =
+            super::split_root_scanout_reads(r(0, 0, 16, 16), 32, 24, 0, 0, &[(0, 0, 800, 600)]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].read, r(32, 24, 16, 16));
+        assert_eq!(got[0].dst_local, ash::vk::Offset2D { x: 0, y: 0 });
+    }
+
+    #[test]
+    fn split_root_scanout_reads_spanning_two_outputs() {
+        // Full 200x100 grab across two 100-wide side-by-side outputs → two reads.
+        let got = super::split_root_scanout_reads(
+            r(0, 0, 200, 100),
+            0,
+            0,
+            0,
+            0,
+            &[(0, 0, 100, 100), (100, 0, 100, 100)],
+        );
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].read, r(0, 0, 100, 100));
+        assert_eq!(got[0].dst_local, ash::vk::Offset2D { x: 0, y: 0 });
+        assert_eq!(got[1].read, r(100, 0, 100, 100));
+        assert_eq!(got[1].dst_local, ash::vk::Offset2D { x: 100, y: 0 });
+    }
+
+    #[test]
+    fn split_root_scanout_reads_clips_partially_offscreen() {
+        // Requested 200x200 but output is only 150x120: read the covered piece.
+        let got =
+            super::split_root_scanout_reads(r(0, 0, 200, 200), 0, 0, 0, 0, &[(0, 0, 150, 120)]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].read, r(0, 0, 150, 120));
+        assert_eq!(got[0].dst_local, ash::vk::Offset2D { x: 0, y: 0 });
+    }
+
+    #[test]
+    fn split_root_scanout_reads_fully_offscreen_is_empty() {
+        let got =
+            super::split_root_scanout_reads(r(0, 0, 50, 50), 500, 500, 0, 0, &[(0, 0, 100, 100)]);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn split_root_scanout_reads_output_offset_shifts_dst_local() {
+        // Output starts at x=50: the left half (root x 0..50) is off-screen and
+        // dropped; the right half reads root x50.. and writes to dst-local x50.
+        let got =
+            super::split_root_scanout_reads(r(0, 0, 100, 100), 0, 0, 0, 0, &[(50, 0, 800, 600)]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].read, r(50, 0, 50, 100));
+        assert_eq!(got[0].dst_local, ash::vk::Offset2D { x: 50, y: 0 });
+    }
+
+    #[test]
+    fn split_root_scanout_reads_carries_subrect_dst_offset() {
+        // A GC-clip sub-rect at dst-local (20,10): source tracks it, dst-local
+        // offset is preserved.
+        let got =
+            super::split_root_scanout_reads(r(20, 10, 30, 30), 0, 0, 0, 0, &[(0, 0, 800, 600)]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].read, r(20, 10, 30, 30));
+        assert_eq!(got[0].dst_local, ash::vk::Offset2D { x: 20, y: 10 });
     }
 
     /// Register a client in `state.clients` so `process_request`'s

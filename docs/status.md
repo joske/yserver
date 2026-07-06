@@ -89,6 +89,21 @@ Cross-cutting bugs and followups that don't fit a stage live in
   disappears. New coverage pins "install does not read clip bytes" and
   the previously-missing "free before first CPU clip use still gates
   fill" case.
+- **2026-07-06 root-window CopyArea screenshot support**: Qt5
+  `QScreen::grabWindow` screenshots (e.g. flameshot 0.10) do
+  `CopyArea(src=root, dst=pixmap)` with a GC whose subwindow-mode is
+  `IncludeInferiors`. v2 `copy_area` had no root special-case, so the
+  source resolved to root storage (background only) and captures came
+  back as wallpaper-only. `copy_area` now mirrors the root `GetImage`
+  path: for a root source under `IncludeInferiors` it reads the
+  composited on-screen scanout and uploads it into the destination
+  (splitting each surviving sub-rect per output so partially off-screen
+  / cross-output reads succeed), instead of re-walking the window tree.
+  `ClipByChildren` root sources keep the background-only path. Coverage
+  pins the per-output rect splitting with unit tests; the composited
+  end-to-end path has a live-Vulkan integration test and is confirmed
+  by flameshot smoke on real KMS. Supersedes the tree-re-walk approach
+  in PR #76.
 - **2026-06-17 XFIXES pointer barriers**: `PointerBarrier` storage,
   XFIXES barrier wire parsing, `CreatePointerBarrier` /
   `DeletePointerBarrier` dispatch, client-disconnect cleanup, XID
