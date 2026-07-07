@@ -584,33 +584,6 @@ pub fn run_core(
                 SEAT_TOKEN => {
                     backend.on_seat_ready(state);
                 }
-                tok if let Some(client_id) = token_to_client(tok) => {
-                    // I3: WRITABLE-readiness on a client writer fd.
-                    // Drain the outbound buffer; if it empties, the
-                    // post-loop interest reconciliation drops
-                    // WRITABLE. If the peer disappeared, mark the
-                    // client for disconnect.
-                    if !ev.is_writable() {
-                        // mio always reports both READABLE+WRITABLE
-                        // as readiness even when only one was asked
-                        // for; the writer fd's READABLE wakeups are
-                        // ignored — the reader thread owns reads.
-                        continue;
-                    }
-                    let Some(client) = state.clients.get_mut(&client_id.0) else {
-                        // Already removed by a prior disconnect; the
-                        // poller will be deregistered after.
-                        continue;
-                    };
-                    match client_io::drain_outbound(client) {
-                        Ok(WriteOutcome::Done | WriteOutcome::WouldBlock) => {}
-                        Ok(WriteOutcome::Disconnect) | Err(_) => {
-                            crate::core_loop::process_disconnect::process_disconnect(
-                                state, backend, client_id,
-                            );
-                        }
-                    }
-                }
                 NOTIFY_TOKEN => {
                     for msg in rx.try_recv_all() {
                         match msg {
@@ -720,7 +693,36 @@ pub fn run_core(
                     }
                 }
                 tok => {
-                    warn!("core_loop::run: unhandled poll token {tok:?}");
+                    let Some(client_id) = token_to_client(tok) else {
+                        warn!("core_loop::run: unhandled poll token {tok:?}");
+                        continue;
+                    };
+
+                    // I3: WRITABLE-readiness on a client writer fd.
+                    // Drain the outbound buffer; if it empties, the
+                    // post-loop interest reconciliation drops
+                    // WRITABLE. If the peer disappeared, mark the
+                    // client for disconnect.
+                    if !ev.is_writable() {
+                        // mio always reports both READABLE+WRITABLE
+                        // as readiness even when only one was asked
+                        // for; the writer fd's READABLE wakeups are
+                        // ignored — the reader thread owns reads.
+                        continue;
+                    }
+                    let Some(client) = state.clients.get_mut(&client_id.0) else {
+                        // Already removed by a prior disconnect; the
+                        // poller will be deregistered after.
+                        continue;
+                    };
+                    match client_io::drain_outbound(client) {
+                        Ok(WriteOutcome::Done | WriteOutcome::WouldBlock) => {}
+                        Ok(WriteOutcome::Disconnect) | Err(_) => {
+                            crate::core_loop::process_disconnect::process_disconnect(
+                                state, backend, client_id,
+                            );
+                        }
+                    }
                 }
             }
         }

@@ -1719,7 +1719,7 @@ impl MitShmSegment {
             unsafe { libc::shmdt(addr) };
             return Err(err);
         }
-        let size = info.shm_segsz as usize;
+        let size = info.shm_segsz;
         if size == 0 {
             unsafe { libc::shmdt(addr) };
             return Err(std::io::Error::new(
