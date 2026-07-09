@@ -34,14 +34,13 @@
 )]
 
 use std::{
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     io,
     os::fd::{AsFd, AsRawFd, OwnedFd, RawFd},
     path::PathBuf,
-    sync::{
-        Arc, Mutex, Weak,
-        atomic::{AtomicBool, Ordering},
-    },
+    rc::{Rc, Weak},
+    sync::Arc,
 };
 
 use ash::vk;
@@ -83,28 +82,24 @@ use crate::{
 /// `vk::Fence` is returned to the platform's pool on the
 /// final-drop iff it has been observed signaled.
 ///
-/// `Arc<FenceTicketInner>` (rather than `Rc`) keeps the type
-/// `Send`, which the `Backend` trait requires (KmsBackend:
-/// Backend; Backend: Send). The single-threaded core invariant
-/// means there's no real cross-thread access; the `Arc` is
-/// paying a trivial atomic for type-system uniformity.
+/// Backend ownership is single-threaded, so this uses `Rc`/`Cell`/
+/// `RefCell` rather than thread-safe refcounting, atomics, and mutexes.
 #[derive(Clone, Debug)]
 pub(crate) struct FenceTicket {
-    inner: Arc<FenceTicketInner>,
+    inner: Rc<FenceTicketInner>,
 }
 
 struct FenceTicketInner {
     fence: vk::Fence,
     /// Set on the first `poll_signaled` that observes
     /// `vk::SUCCESS`. After this, `poll_signaled` short-circuits
-    /// without calling the driver. `AtomicBool` avoids a Mutex
-    /// for this hot field.
-    signaled_cache: AtomicBool,
+    /// without calling the driver.
+    signaled_cache: Cell<bool>,
     /// Weak handle to the platform's fence pool. On `Drop`, if
     /// the fence is signaled AND the pool still exists, return
     /// the fence handle to the pool. If not signaled, leak the
     /// fence handle and set `renderer_failed` on the platform.
-    pool: Weak<Mutex<FencePoolInner>>,
+    pool: Weak<RefCell<FencePoolInner>>,
     /// Strong ref to the `VkContext` so the `Drop` fallback path
     /// can call `destroy_fence` directly when the pool is already
     /// gone. Mirrors [`PresentCompletionSignal`]'s pattern. The
@@ -125,7 +120,7 @@ struct FenceTicketInner {
     /// Vulkan requires each semaphore handle to remain alive until the
     /// queue operation retires, so these share the submission fence's
     /// lifetime rather than being destroyed immediately after submit.
-    imported_wait_semaphores: Mutex<Vec<vk::Semaphore>>,
+    imported_wait_semaphores: RefCell<Vec<vk::Semaphore>>,
 }
 
 impl std::fmt::Debug for FenceTicketInner {
@@ -135,14 +130,14 @@ impl std::fmt::Debug for FenceTicketInner {
         // a Debug derive through the whole device chain.
         f.debug_struct("FenceTicketInner")
             .field("fence", &self.fence)
-            .field("signaled_cache", &self.signaled_cache)
+            .field("signaled_cache", &self.signaled_cache.get())
             .field("pool", &"<weak>")
             .field("vk", &self.vk.as_ref().map(|_| "<Arc<VkContext>>"))
             .field(
                 "imported_wait_semaphores",
                 &self
                     .imported_wait_semaphores
-                    .lock()
+                    .try_borrow()
                     .map(|waits| waits.len())
                     .unwrap_or_default(),
             )
@@ -154,7 +149,7 @@ impl FenceTicket {
     /// Non-blocking signaled check. Caches `true` once observed
     /// so subsequent calls don't hit the driver.
     pub(crate) fn poll_signaled(&self, vk: &VkContext) -> bool {
-        if self.inner.signaled_cache.load(Ordering::Acquire) {
+        if self.inner.signaled_cache.get() {
             return true;
         }
         // ash's `get_fence_status` returns `Result<bool, vk::Result>`
@@ -163,7 +158,7 @@ impl FenceTicket {
         // driver failures.
         match unsafe { vk.device.get_fence_status(self.inner.fence) } {
             Ok(true) => {
-                self.inner.signaled_cache.store(true, Ordering::Release);
+                self.inner.signaled_cache.set(true);
                 true
             }
             Ok(false) => false,
@@ -177,7 +172,7 @@ impl FenceTicket {
     /// Synchronous wait. **Off the hot path** — used by
     /// `get_image` readback and shutdown teardown.
     pub(crate) fn wait(&self, vk: &VkContext) -> Result<(), vk::Result> {
-        if self.inner.signaled_cache.load(Ordering::Acquire) {
+        if self.inner.signaled_cache.get() {
             return Ok(());
         }
         // 5 second timeout — long enough to cover any realistic
@@ -187,7 +182,7 @@ impl FenceTicket {
                 .wait_for_fences(&[self.inner.fence], true, 5_000_000_000)
         } {
             Ok(()) => {
-                self.inner.signaled_cache.store(true, Ordering::Release);
+                self.inner.signaled_cache.set(true);
                 Ok(())
             }
             Err(e) => Err(e),
@@ -207,16 +202,10 @@ impl FenceTicket {
         if semaphores.is_empty() {
             return;
         }
-        match self.inner.imported_wait_semaphores.lock() {
-            Ok(mut retained) => retained.extend(semaphores),
-            Err(_) => {
-                // A poisoned mutex means the lifetime invariant cannot be
-                // maintained safely. Raw handles intentionally leak here;
-                // destroying a semaphore still named by the queue would be
-                // invalid Vulkan usage.
-                log::error!("FenceTicket: imported-wait semaphore mutex poisoned; leaking handles");
-            }
-        }
+        self.inner
+            .imported_wait_semaphores
+            .borrow_mut()
+            .extend(semaphores);
     }
 
     /// Test-only constructor: returns a ticket whose `poll_signaled`
@@ -228,12 +217,12 @@ impl FenceTicket {
     #[cfg(test)]
     pub(crate) fn for_tests_stub() -> Self {
         Self {
-            inner: Arc::new(FenceTicketInner {
+            inner: Rc::new(FenceTicketInner {
                 fence: vk::Fence::null(),
-                signaled_cache: AtomicBool::new(true),
-                pool: Weak::<Mutex<FencePoolInner>>::new(),
+                signaled_cache: Cell::new(true),
+                pool: Weak::<RefCell<FencePoolInner>>::new(),
                 vk: None,
-                imported_wait_semaphores: Mutex::new(Vec::new()),
+                imported_wait_semaphores: RefCell::new(Vec::new()),
             }),
         }
     }
@@ -256,24 +245,19 @@ impl Drop for FenceTicketInner {
                 && self.fence != vk::Fence::null()
             {
                 unsafe {
-                    if let Ok(waits) = self.imported_wait_semaphores.get_mut() {
-                        for semaphore in waits.drain(..) {
-                            vk.device.destroy_semaphore(semaphore, None);
-                        }
+                    for semaphore in self.imported_wait_semaphores.get_mut().drain(..) {
+                        vk.device.destroy_semaphore(semaphore, None);
                     }
                     vk.device.destroy_fence(self.fence, None);
                 }
             }
             return;
         };
-        let Ok(mut pool) = pool.lock() else {
-            log::error!("FenceTicketInner::drop: fence-pool mutex poisoned");
-            return;
-        };
-        let signaled = self.signaled_cache.load(Ordering::Acquire)
+        let mut pool = pool.borrow_mut();
+        let signaled = self.signaled_cache.get()
             || match unsafe { pool.vk.device.get_fence_status(self.fence) } {
                 Ok(true) => {
-                    self.signaled_cache.store(true, Ordering::Release);
+                    self.signaled_cache.set(true);
                     true
                 }
                 Ok(false) => false,
@@ -283,11 +267,9 @@ impl Drop for FenceTicketInner {
                 }
             };
         if signaled {
-            if let Ok(waits) = self.imported_wait_semaphores.get_mut() {
-                unsafe {
-                    for semaphore in waits.drain(..) {
-                        pool.vk.device.destroy_semaphore(semaphore, None);
-                    }
+            unsafe {
+                for semaphore in self.imported_wait_semaphores.get_mut().drain(..) {
+                    pool.vk.device.destroy_semaphore(semaphore, None);
                 }
             }
             pool.recycle(self.fence);
@@ -364,7 +346,7 @@ impl Drop for PresentCompletionSignal {
 // ────────────────────────────────────────────────────────────────
 
 pub(crate) struct FencePool {
-    inner: Arc<Mutex<FencePoolInner>>,
+    inner: Rc<RefCell<FencePoolInner>>,
 }
 
 struct FencePoolInner {
@@ -398,7 +380,7 @@ impl FencePoolInner {
 impl FencePool {
     pub(crate) fn new(vk: Arc<VkContext>) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(FencePoolInner {
+            inner: Rc::new(RefCell::new(FencePoolInner {
                 vk,
                 free: Vec::with_capacity(8),
                 leaked_fences: Vec::new(),
@@ -408,10 +390,7 @@ impl FencePool {
     }
 
     fn acquire(&self) -> Result<FenceTicket, vk::Result> {
-        let mut pool = self
-            .inner
-            .lock()
-            .map_err(|_| vk::Result::ERROR_INITIALIZATION_FAILED)?;
+        let mut pool = self.inner.borrow_mut();
         let fence = if let Some(f) = pool.free.pop() {
             f
         } else {
@@ -421,26 +400,27 @@ impl FencePool {
         let vk = Arc::clone(&pool.vk);
         drop(pool);
         Ok(FenceTicket {
-            inner: Arc::new(FenceTicketInner {
+            inner: Rc::new(FenceTicketInner {
                 fence,
-                signaled_cache: AtomicBool::new(false),
-                pool: Arc::downgrade(&self.inner),
+                signaled_cache: Cell::new(false),
+                pool: Rc::downgrade(&self.inner),
                 vk: Some(vk),
-                imported_wait_semaphores: Mutex::new(Vec::new()),
+                imported_wait_semaphores: RefCell::new(Vec::new()),
             }),
         })
     }
 
     pub(crate) fn renderer_failed(&self) -> bool {
-        self.inner.lock().map(|p| p.renderer_failed).unwrap_or(true)
+        self.inner
+            .try_borrow()
+            .map(|p| p.renderer_failed)
+            .unwrap_or(true)
     }
 }
 
 impl Drop for FencePool {
     fn drop(&mut self) {
-        let Ok(pool) = self.inner.lock() else {
-            return;
-        };
+        let pool = self.inner.borrow();
         // Best-effort wait so any still-in-flight fence
         // (shouldn't happen but be defensive) is safe to
         // destroy.
@@ -561,7 +541,7 @@ pub(crate) struct SequenceCompletion {
 /// that Stage 1b's `KmsBackend` carried.
 pub(crate) struct PlatformBackend {
     // DRM / output side
-    pub(crate) device: Arc<drm::Device>,
+    pub(crate) device: Rc<drm::Device>,
     pub(crate) render_node_fd: Option<std::os::fd::OwnedFd>,
     /// The DRM device over the render node, retained so every DRI3 syncobj
     /// ioctl and the `DRM_CAP_SYNCOBJ_TIMELINE` query issue on the SAME fd
@@ -874,7 +854,7 @@ impl PlatformBackend {
             let h = u32::from(layout.height);
             match ScanoutBoPool::allocate(
                 Arc::clone(&vk),
-                Arc::clone(&device),
+                Rc::clone(&device),
                 w,
                 h,
                 3,
@@ -915,7 +895,7 @@ impl PlatformBackend {
         let crtc_handles: Vec<::drm::control::crtc::Handle> =
             layouts.iter().map(|l| l.output.crtc).collect();
         let cursor_plane = match crate::kms::cursor_plane::CursorPlane::new(
-            Arc::clone(&device),
+            Rc::clone(&device),
             &crtc_handles,
         ) {
             Ok(plane) => {
@@ -1036,7 +1016,7 @@ impl PlatformBackend {
         #[cfg(target_os = "linux")]
         let hotplug_monitor = None;
         Self {
-            device: Arc::new(drm::Device::for_tests().expect("test drm device")),
+            device: Rc::new(drm::Device::for_tests().expect("test drm device")),
             render_node_fd: None,
             render_node_device: None,
             syncobj_timeline: false,
@@ -2703,7 +2683,7 @@ impl PlatformBackend {
             if let Some(vk) = self.vk.as_ref().cloned() {
                 match ScanoutBoPool::allocate(
                     Arc::clone(&vk),
-                    Arc::clone(&self.device),
+                    Rc::clone(&self.device),
                     u32::from(w),
                     u32::from(h),
                     3,
@@ -3782,14 +3762,6 @@ mod tests {
         let ticket = FenceTicket::for_tests_stub();
         let clone = ticket.clone();
         ticket.retain_imported_wait_semaphores(vec![vk::Semaphore::null()]);
-        assert_eq!(
-            clone
-                .inner
-                .imported_wait_semaphores
-                .lock()
-                .expect("wait semaphore pins")
-                .len(),
-            1
-        );
+        assert_eq!(clone.inner.imported_wait_semaphores.borrow().len(), 1);
     }
 }

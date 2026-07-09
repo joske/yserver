@@ -56,6 +56,7 @@
 use std::{
     io,
     os::fd::{AsFd, FromRawFd, IntoRawFd, OwnedFd},
+    rc::Rc,
     sync::{Arc, OnceLock},
 };
 
@@ -69,7 +70,7 @@ use drm::{
 /// the KMS DRM device the pool was constructed against — allocations
 /// go through this driver-side allocator so the resulting BO gets the
 /// scanout-correct layout the display engine expects.
-type GbmDevice = gbm::Device<Arc<crate::drm::Device>>;
+type GbmDevice = gbm::Device<Rc<crate::drm::Device>>;
 
 use super::device::VkContext;
 
@@ -264,7 +265,7 @@ pub struct ScanoutBo {
     pub vk_transfer: TransferResources,
     /// Shared DRM device handle (for un-registering the framebuffer
     /// + closing the GEM handle in Drop).
-    drm: Arc<crate::drm::Device>,
+    drm: Rc<crate::drm::Device>,
     /// Held to keep image+memory destructors anchored to a live
     /// device. Cloned per bo from the pool's Arc so individual bos
     /// can be moved/dropped independently.
@@ -312,11 +313,8 @@ pub struct TransferResources {
     pub timestamp_pool: vk::QueryPool,
 }
 
-// `NonNull<u8>` isn't `Send` by default. ScanoutBo is single-thread
-// (KmsBackend is single-thread; Backend trait is used from one
-// thread). Once 4.1.3+ adds threading, revisit.
-unsafe impl Send for TransferResources {}
-unsafe impl Sync for TransferResources {}
+// Intentionally `!Send + !Sync`: the mapped staging pointer and every
+// scanout resource stay on the single core/backend thread.
 
 /// One pool per CRTC; holds N bos that rotate through the state
 /// machine. Three is the documented sweet spot (design §2): one
@@ -337,7 +335,7 @@ pub struct ScanoutBoPool {
     /// dying first would still be a lifetime foot-gun in future
     /// refactors.
     #[allow(dead_code)]
-    gbm_device: Option<Arc<GbmDevice>>,
+    gbm_device: Option<Rc<GbmDevice>>,
 }
 
 impl ScanoutBo {
@@ -347,8 +345,8 @@ impl ScanoutBo {
     /// no resources leaked.
     pub fn allocate(
         vk: Arc<VkContext>,
-        drm: Arc<crate::drm::Device>,
-        gbm: Option<Arc<GbmDevice>>,
+        drm: Rc<crate::drm::Device>,
+        gbm: Option<Rc<GbmDevice>>,
         width: u32,
         height: u32,
         scanout_modifiers: &[u64],
@@ -360,8 +358,8 @@ impl ScanoutBo {
         for plan in plans {
             match Self::allocate_with_plan(
                 Arc::clone(&vk),
-                Arc::clone(&drm),
-                gbm.as_ref().map(Arc::clone),
+                Rc::clone(&drm),
+                gbm.as_ref().map(Rc::clone),
                 width,
                 height,
                 plan,
@@ -400,8 +398,8 @@ impl ScanoutBo {
 
     fn allocate_with_plan(
         vk: Arc<VkContext>,
-        drm: Arc<crate::drm::Device>,
-        gbm: Option<Arc<GbmDevice>>,
+        drm: Rc<crate::drm::Device>,
+        gbm: Option<Rc<GbmDevice>>,
         width: u32,
         height: u32,
         plan: ScanoutAllocationPlan,
@@ -759,14 +757,14 @@ impl ScanoutBoPool {
     /// `ScanoutBo::Drop`).
     pub fn allocate(
         vk: Arc<VkContext>,
-        drm: Arc<crate::drm::Device>,
+        drm: Rc<crate::drm::Device>,
         width: u32,
         height: u32,
         count: usize,
         scanout_modifiers: &[u64],
     ) -> io::Result<Self> {
-        let gbm_device = match GbmDevice::new(Arc::clone(&drm)) {
-            Ok(g) => Some(Arc::new(g)),
+        let gbm_device = match GbmDevice::new(Rc::clone(&drm)) {
+            Ok(g) => Some(Rc::new(g)),
             Err(e) => {
                 log::warn!(
                     "gbm_create_device failed on KMS fd ({e}); scanout allocation will \
@@ -781,8 +779,8 @@ impl ScanoutBoPool {
         for _ in 0..count {
             bos.push(ScanoutBo::allocate(
                 Arc::clone(&vk),
-                Arc::clone(&drm),
-                gbm_device.as_ref().map(Arc::clone),
+                Rc::clone(&drm),
+                gbm_device.as_ref().map(Rc::clone),
                 width,
                 height,
                 scanout_modifiers,
@@ -1613,7 +1611,7 @@ fn allocate_vk_scanout_image(
 /// impl has released the derived resources.
 fn allocate_gbm_scanout_image(
     vk: &VkContext,
-    gbm: &Arc<GbmDevice>,
+    gbm: &Rc<GbmDevice>,
     width: u32,
     height: u32,
     modifier: u64,

@@ -1,4 +1,4 @@
-use std::{io, mem, ptr::NonNull, sync::Arc};
+use std::{io, mem, ptr::NonNull, rc::Rc};
 
 use drm::{
     buffer::{Buffer as _, DrmFourcc},
@@ -8,7 +8,7 @@ use drm::{
 use crate::drm::Device;
 
 pub struct Buffer {
-    device: Arc<Device>,
+    device: Rc<Device>,
     dumb: DumbBuffer,
     fb_id: framebuffer::Handle,
     ptr: NonNull<u8>,
@@ -26,16 +26,17 @@ pub struct Buffer {
     ///
     /// **ONLY safe to use at final process exit.** This Drop
     /// short-circuit bypasses fb/dumb cleanup but does NOT prevent
-    /// Rust from dropping other fields (like the `Arc<Device>`).
+    /// Rust from dropping other fields (like the `Rc<Device>`).
     /// Using disarm at runtime (hotplug, modeset recovery) could
     /// produce a zombie handle when the Device's refcount expires.
     disarmed: bool,
 }
 
-unsafe impl Send for Buffer {}
+// Intentionally `!Send`: the `Rc<Device>` and every clone of it stay on
+// the single core/backend thread.
 
 impl Buffer {
-    pub fn new(device: Arc<Device>, width: u16, height: u16) -> io::Result<Self> {
+    pub fn new(device: Rc<Device>, width: u16, height: u16) -> io::Result<Self> {
         let mut dumb = device.create_dumb_buffer(
             (u32::from(width), u32::from(height)),
             DrmFourcc::Xrgb8888,

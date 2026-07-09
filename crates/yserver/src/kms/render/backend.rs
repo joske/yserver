@@ -17,10 +17,11 @@
 
 use std::{
     any::Any,
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     io,
     os::fd::AsFd,
+    rc::Rc,
 };
 
 use ash::vk;
@@ -836,9 +837,9 @@ pub struct KmsBackend {
     /// not the behaviour — `ExportedSyncFile::Unsupported` conflates "no such
     /// ioctl" with "this buffer failed", and copying immediately is correct
     /// either way, so suppressing the attempt could disable a working path.
-    /// `AtomicBool` because the source site records it while still holding a
-    /// `&self` borrow of `self.store`.
-    dmabuf_sync_file_warned: std::sync::atomic::AtomicBool,
+    /// `Cell` permits the source site to record it while still holding a
+    /// `&self` borrow of `self.store`; the backend remains on the core thread.
+    dmabuf_sync_file_warned: Cell<bool>,
 
     /// Stage 5 Task 6.1: queue of in-flight deferred PRESENT
     /// completion batches. Drained by `drain_completed_present_events`
@@ -1034,15 +1035,6 @@ struct ClipMaskSnapshot {
     width: u32,
     height: u32,
 }
-
-// SAFETY: `KmsBackend` lives entirely on the core-loop thread. The
-// `!Send` fields (`crate::vt::Seat` with `Rc<RefCell<...>>`, and
-// `crate::input::Context` with `*mut libinput`) are only accessed from
-// that single thread. `run_core` requires `Backend: Send` because it is
-// generic over `dyn Backend`, but the backend is never actually moved
-// between threads after construction — the same pattern used by the
-// existing `!Send` KMS fields (`XkbContext`, `XkbState`, etc.).
-unsafe impl Send for KmsBackend {}
 
 /// Probe whether this Vulkan context can allocate and export a BGRA8
 /// dma-buf image.  Called ONCE at backend construction; result is cached
@@ -1601,7 +1593,7 @@ impl KmsBackend {
             })
             .collect();
         let result = crate::drm::modeset::probe_direct_scanout_test_only(
-            self.platform.device.clone(),
+            Rc::clone(&self.platform.device),
             fd.as_fd(),
             u32::from(width),
             u32::from(height),
@@ -2369,7 +2361,7 @@ impl KmsBackend {
             dri3_sync_resources: HashMap::new(),
             dri3_syncobjs: HashMap::new(),
             syncobj_eventfd_supported: None,
-            dmabuf_sync_file_warned: std::sync::atomic::AtomicBool::new(false),
+            dmabuf_sync_file_warned: Cell::new(false),
             pending_present_batches: std::collections::VecDeque::new(),
             retained_present_wakes: std::collections::HashMap::new(),
             pending_present_source_waits: HashMap::new(),
@@ -3031,7 +3023,7 @@ impl KmsBackend {
         for (i, layout) in base.platform.outputs.iter().enumerate() {
             let pool = crate::kms::vk::scanout::ScanoutBoPool::allocate(
                 Arc::clone(&vk),
-                Arc::clone(&base.platform.device),
+                Rc::clone(&base.platform.device),
                 u32::from(layout.width),
                 u32::from(layout.height),
                 3,
@@ -3260,7 +3252,7 @@ impl KmsBackend {
             dri3_sync_resources: HashMap::new(),
             dri3_syncobjs: HashMap::new(),
             syncobj_eventfd_supported: None,
-            dmabuf_sync_file_warned: std::sync::atomic::AtomicBool::new(false),
+            dmabuf_sync_file_warned: Cell::new(false),
             pending_present_batches: std::collections::VecDeque::new(),
             retained_present_wakes: std::collections::HashMap::new(),
             pending_present_source_waits: HashMap::new(),
@@ -13125,10 +13117,7 @@ impl Backend for KmsBackend {
             match export_dmabuf_read_access_sync_file(fd) {
                 ExportedSyncFile::Idle => {}
                 ExportedSyncFile::Unsupported => {
-                    if self
-                        .dmabuf_sync_file_warned
-                        .swap(true, std::sync::atomic::Ordering::Relaxed)
-                    {
+                    if self.dmabuf_sync_file_warned.replace(true) {
                         log::debug!(
                             target: "yserver::kms::render::present",
                             "present source 0x{src_pixmap_host_xid:x}: dma-buf sync-file export unsupported; copying immediately",
@@ -13159,10 +13148,7 @@ impl Backend for KmsBackend {
             match export_dmabuf_write_access_sync_file(fd.as_fd()) {
                 ExportedSyncFile::Idle => {}
                 ExportedSyncFile::Unsupported => {
-                    if self
-                        .dmabuf_sync_file_warned
-                        .swap(true, std::sync::atomic::Ordering::Relaxed)
-                    {
+                    if self.dmabuf_sync_file_warned.replace(true) {
                         log::debug!(
                             target: "yserver::kms::render::present",
                             "present destination 0x{dst_window_host_xid:x}: dma-buf sync-file export unsupported; copying immediately",
@@ -13314,10 +13300,7 @@ impl Backend for KmsBackend {
             match export_dmabuf_write_access_sync_file(fd.as_fd()) {
                 ExportedSyncFile::Idle => {}
                 ExportedSyncFile::Unsupported => {
-                    if self
-                        .dmabuf_sync_file_warned
-                        .swap(true, std::sync::atomic::Ordering::Relaxed)
-                    {
+                    if self.dmabuf_sync_file_warned.replace(true) {
                         log::debug!(
                             target: "yserver::kms::render::present",
                             "PresentPixmapSynced destination 0x{dst_window_host_xid:x}: dma-buf sync-file export unsupported; copying immediately",

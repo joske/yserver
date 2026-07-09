@@ -39,21 +39,20 @@ use yserver_protocol::x11::{
 use crate::kms::cpu_types::{PictTransform, Rectangle16, Repeat};
 
 // ───────────────────────────────────────────────────────────────
-// `Send` newtype wrappers around `!Send` third-party types.
-// The kms backend is driven from a single core thread, so manual
-// `Send` impls are sound — but the wrapper makes that explicit.
+// Newtype wrappers around `!Send` third-party types.
+// The KMS backend is driven from the single core thread. `FreetypeFace`
+// stays `!Send`; the older XKB wrappers below retain their existing
+// manual `Send` implementations pending a broader cleanup.
 // ───────────────────────────────────────────────────────────────
 
 /// Newtype wrapper around `freetype::Face`.
 /// `repr(transparent)` is required so `RefCell::as_ptr` can be safely cast
 /// from `*mut FreetypeFace` to `*mut freetype::Face` in `render_text_string`.
-/// SAFETY: All access is on the single-threaded core thread.
-/// Single-threaded context makes this sound. `Face` contains raw pointers
-/// and `Rc<Vec<u8>>` by default, both `!Send`.
+/// All access is on the single-threaded core thread. `Face` contains raw
+/// pointers and `Rc<Vec<u8>>` by default, both `!Send`, so the wrapper
+/// deliberately remains `!Send` too.
 #[repr(transparent)]
 pub struct FreetypeFace(#[allow(dead_code)] pub freetype::Face);
-// SAFETY: see doc comment above.
-unsafe impl Send for FreetypeFace {}
 
 /// Newtype wrapper around `xkb::Context`.
 /// SAFETY: All access is on the single-threaded core thread.

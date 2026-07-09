@@ -25,7 +25,7 @@
 //! haven't retired the transition yet (the multi-output double-cursor
 //! hazard).
 
-use std::{collections::HashMap, io, mem, ptr::NonNull, sync::Arc};
+use std::{collections::HashMap, io, mem, ptr::NonNull, rc::Rc};
 
 use drm::{
     Device as DrmDevice, DriverCapability,
@@ -58,7 +58,7 @@ pub const HW_CURSOR_FALLBACK_H: u32 = 64;
 /// the multi-output double-cursor hazard when one output retired a
 /// Sw→Hw transition before another.
 pub struct CursorPlane {
-    device: Arc<Device>,
+    device: Rc<Device>,
     dumb: Option<DumbBuffer>,
     ptr: NonNull<u8>,
     len: usize,
@@ -79,11 +79,6 @@ pub struct CursorPlane {
     uploaded_version: Option<u64>,
 }
 
-// SAFETY: ptr is an mmap'd kernel buffer that lives as long as
-// `dumb`; no thread does interior mutation through the raw pointer
-// without exclusive `&mut self`.
-unsafe impl Send for CursorPlane {}
-
 impl CursorPlane {
     /// Allocate the cursor dumb buffer + mmap it. Discovers cursor
     /// planes for `crtcs` and creates a DRM framebuffer for the atomic
@@ -92,7 +87,7 @@ impl CursorPlane {
     ///
     /// # Errors
     /// `create_dumb_buffer` or `map_dumb_buffer` ioctl failures.
-    pub fn new(device: Arc<Device>, crtcs: &[crtc::Handle]) -> io::Result<Self> {
+    pub fn new(device: Rc<Device>, crtcs: &[crtc::Handle]) -> io::Result<Self> {
         // Query the driver's preferred cursor dimensions. amdgpu commonly
         // reports 128×128 or 256×256; i915 typically 64×64. We MUST use
         // the reported size — see [`HW_CURSOR_FALLBACK_W`] for the

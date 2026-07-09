@@ -27,7 +27,7 @@
 //! v1; a future rename to something like `kms::raster` is fine but
 //! not load-bearing.
 
-use std::{io, sync::Arc};
+use std::{io, rc::Rc};
 
 use crate::{
     drm,
@@ -572,7 +572,7 @@ pub(crate) fn primary_output_center(outputs: &[OutputLayout], fb_w: u16, fb_h: u
 }
 
 pub(crate) struct PlatformInit {
-    pub(crate) device: Arc<drm::Device>,
+    pub(crate) device: Rc<drm::Device>,
     pub(crate) render_node_fd: Option<std::os::fd::OwnedFd>,
     pub(crate) render_node_path: Option<std::path::PathBuf>,
     pub(crate) layouts: Vec<OutputLayout>,
@@ -604,7 +604,7 @@ pub(crate) fn platform_init(
         ::drm::control::framebuffer::Handle,
     ) -> io::Result<()>,
 ) -> io::Result<PlatformInit> {
-    let device = Arc::new(drm::Device::open(device_path)?);
+    let device = Rc::new(drm::Device::open(device_path)?);
     let (render_node_fd, render_node_path) = match crate::kms::render_node::open_for_card(&*device)
     {
         Ok((fd, path)) => {
@@ -647,7 +647,7 @@ pub(crate) fn platform_init(
         let mut buffers = Vec::with_capacity(2);
         let mut buffer_err: Option<io::Error> = None;
         for _ in 0..2 {
-            match drm::Buffer::new(Arc::clone(&device), w, h) {
+            match drm::Buffer::new(Rc::clone(&device), w, h) {
                 Ok(b) => buffers.push(b),
                 Err(e) => {
                     buffer_err = Some(e);

@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     io,
     os::fd::BorrowedFd,
-    sync::Arc,
+    rc::Rc,
 };
 
 use drm::{
@@ -852,7 +852,7 @@ pub(crate) struct ComposedScanoutPlaneState<'a> {
 /// It is never installed on hardware. Owning the DRM device makes teardown
 /// reliable during backend shutdown regardless of struct-field drop order.
 pub(crate) struct DirectScanoutProbeFramebuffer {
-    device: Arc<Device>,
+    device: Rc<Device>,
     fb: framebuffer::Handle,
     gem: DrmBufferHandle,
 }
@@ -924,7 +924,7 @@ fn should_retry_direct_scanout_addfb_legacy(modifier: u64, error: &io::Error) ->
 /// live scanout or generate page-flip events.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn probe_direct_scanout_test_only(
-    device: Arc<Device>,
+    device: Rc<Device>,
     dma_buf: BorrowedFd<'_>,
     width: u32,
     height: u32,

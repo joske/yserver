@@ -153,8 +153,8 @@ pub(crate) struct GlyphAtlas {
     last_render_ticket: Option<super::platform::FenceTicket>,
 }
 
-unsafe impl Send for GlyphAtlas {}
-unsafe impl Sync for GlyphAtlas {}
+// Intentionally `!Send + !Sync`: `last_render_ticket` is backed by
+// `Rc`/`Cell` state shared with other core-thread-owned render records.
 
 #[derive(Debug, Clone, Copy)]
 struct Shelf {
