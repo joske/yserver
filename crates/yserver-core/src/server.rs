@@ -885,11 +885,20 @@ pub struct ServerState {
     pub randr: RandrState,
     /// RANDR event masks selected via RRSelectInput: (client, window) -> mask.
     pub randr_select_masks: HashMap<(u32, ResourceId), u16>,
+    /// Whether `randr.primary_output` was explicitly chosen by a client via
+    /// `RRSetOutputPrimary`, rather than automatically seeded from topology.
+    /// Rebuilds preserve only explicit choices; automatic defaults may follow
+    /// the best currently connected output.
+    pub randr_primary_output_explicit: bool,
     /// Client-set RANDR output properties (`RRChangeOutputProperty` /
     /// `RRConfigureOutputProperty`), keyed by output id then property atom.
     /// See [`RandrOutputProperty`] for why this lives beside `randr` rather
     /// than inside `RandrState`.
     pub randr_output_properties: HashMap<u32, Vec<(AtomId, RandrOutputProperty)>>,
+    /// One bit per RANDR minor opcode whose unsupported behavior has already
+    /// produced a warning. Repeated requests remain visible at debug level
+    /// without flooding ordinary desktop layout reapplication logs.
+    pub(crate) randr_unsupported_warned_mask: u64,
     /// XKB SelectEvents masks: (client, device spec) -> selected event mask.
     pub xkb_select_event_masks: HashMap<(u32, u16), u16>,
     /// Selection ownership: maps selection atom → (owning window,
@@ -1317,7 +1326,9 @@ impl ServerState {
             start_instant: Instant::now(),
             randr: RandrState::nested(0, width, height),
             randr_select_masks: HashMap::new(),
+            randr_primary_output_explicit: false,
             randr_output_properties: HashMap::new(),
+            randr_unsupported_warned_mask: 0,
             xkb_select_event_masks: HashMap::new(),
             selections: HashMap::new(),
             pointer_root: (0, 0),

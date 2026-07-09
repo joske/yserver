@@ -2385,6 +2385,41 @@ fn active_monitors(state: &ServerState) -> Vec<ActiveMonitor> {
         .collect()
 }
 
+/// Record an unsupported RANDR minor and report whether this is the first
+/// occurrence for this server instance.
+fn mark_randr_unsupported_warned(state: &mut ServerState, minor: u8) -> bool {
+    let Some(bit) = 1u64.checked_shl(u32::from(minor)) else {
+        return true;
+    };
+    let first = state.randr_unsupported_warned_mask & bit == 0;
+    state.randr_unsupported_warned_mask |= bit;
+    first
+}
+
+fn warn_randr_unsupported_once(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    minor: u8,
+    request_name: &str,
+    action: &str,
+) {
+    if mark_randr_unsupported_warned(state, minor) {
+        log::warn!(
+            "client {} #{} RANDR::{} is unsupported; {}",
+            client_id.0,
+            sequence.0,
+            request_name,
+            action,
+        );
+    } else {
+        debug!(
+            "client {} #{} RANDR::{} remains unsupported; {}",
+            client_id.0, sequence.0, request_name, action,
+        );
+    }
+}
+
 fn handle_randr_request(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -2665,6 +2700,65 @@ fn handle_randr_request(
             };
             let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &buf));
+        }
+        x11randr::RR_SET_CRTC_TRANSFORM => {
+            let Some(req) = x11randr::parse_set_crtc_transform_request(body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            if !crtc_exists(state, req.crtc) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    RANDR_BAD_CRTC,
+                    req.crtc,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            if !req.is_identity_transform() {
+                // Arbitrary projective transforms need an internal
+                // composition path; they cannot be represented as direct
+                // KMS CRTC state.
+                warn_randr_unsupported_once(
+                    state,
+                    client_id,
+                    sequence,
+                    minor,
+                    "SetCrtcTransform",
+                    "rejecting non-identity transform with BadMatch",
+                );
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_MATCH,
+                    req.crtc,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            if req.filter_name_len != 0 || req.filter_param_count != 0 {
+                // The filter has no observable effect for an identity
+                // transform, but yserver does not retain it for GetCrtcTransform.
+                warn_randr_unsupported_once(
+                    state,
+                    client_id,
+                    sequence,
+                    minor,
+                    "SetCrtcTransform",
+                    "accepting identity transform but not retaining its filter",
+                );
+            }
+            return Ok(RequestOutcome::Handled);
         }
         x11randr::RR_GET_CRTC_TRANSFORM => {
             let crtc = request_xid(body);
@@ -3126,7 +3220,57 @@ fn handle_randr_request(
             let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &buf));
         }
-        30 => {
+        x11randr::RR_SET_PANNING => {
+            let Some(req) = x11randr::parse_set_panning_request(body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            if !crtc_exists(state, req.crtc) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    RANDR_BAD_CRTC,
+                    req.crtc,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            let status = if req.is_disabled() {
+                x11randr::SET_CONFIG_SUCCESS
+            } else {
+                // A live panning viewport needs transformed/composited
+                // scanout. Report a RANDR configuration failure rather than
+                // claiming the requested geometry was installed.
+                warn_randr_unsupported_once(
+                    state,
+                    client_id,
+                    sequence,
+                    minor,
+                    "SetPanning",
+                    "returning SetConfigFailed for active panning",
+                );
+                x11randr::SET_CONFIG_FAILED
+            };
+            let buf = x11randr::encode_set_panning_reply(
+                byte_order,
+                sequence,
+                status,
+                state.randr.timestamp,
+            );
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            return Ok(write_to_client(client, client_id, &buf));
+        }
+        x11randr::RR_SET_OUTPUT_PRIMARY => {
             let window = request_xid(body);
             if state.resources.window(ResourceId(window)).is_none() {
                 return emit_x11_error_with_minor(
@@ -3158,6 +3302,9 @@ fn handle_randr_request(
             // validated above; yserver has one screen and no leased outputs,
             // so Xorg's remaining cross-screen/lease checks are vacuous.
             let previous = state.randr.primary_output;
+            // Even an idempotent request turns the topology-derived default
+            // into an explicit client choice that must survive rebuilds.
+            state.randr_primary_output_explicit = true;
             if previous == output {
                 // Xorg's RRSetPrimaryOutput returns early when nothing moves,
                 // so no notify storm from an idempotent set.
@@ -4001,18 +4148,18 @@ fn handle_randr_request(
                 }
             }
         }
-        16 | 29 | 45 => {
-            // TODO(unimplemented): RRCreateMode (16) / RRSetPanning (29) /
-            // RRCreateLease (45) are NOT actually implemented. This
+        16 | 45 => {
+            // TODO(unimplemented): RRCreateMode (16) / RRCreateLease (45)
+            // are NOT actually implemented. This
             // BadImplementation is a STOPGAP to stop the client hanging on a
             // reply that never comes — it is NOT protocol-correct: Xorg
-            // implements all three and returns real data. Replace with real
-            // implementations (custom modes / panning / DRM lease).
+            // implements both and returns real data. Replace with real
+            // implementations (custom modes / DRM lease).
             //
-            // Void unimplemented RANDR requests deliberately stay silent via
-            // `other` below — Xorg implements those as success, so erroring
-            // them would be a new Xorg-divergence; only the reply-bearing
-            // hang cases are converted here.
+            // Void unimplemented RANDR requests remain wire-success no-ops
+            // via `other` below — Xorg implements those as success, so
+            // erroring them would be a new Xorg-divergence. Their first use
+            // is nevertheless warned so the unsupported behavior is visible.
             return emit_x11_error_with_minor(
                 state,
                 client_id,
@@ -4099,9 +4246,21 @@ fn handle_randr_request(
             );
         }
         other => {
-            debug!(
-                "client {} #{} RANDR::known unsupported minor={}",
-                client_id.0, sequence.0, other
+            let request_name = match other {
+                17 => "DestroyMode",
+                18 => "AddOutputMode",
+                19 => "DeleteOutputMode",
+                43 => "SetMonitor",
+                44 => "DeleteMonitor",
+                _ => "known request",
+            };
+            warn_randr_unsupported_once(
+                state,
+                client_id,
+                sequence,
+                other,
+                request_name,
+                "accepting void request as a compatibility no-op",
             );
         }
     }
@@ -30695,6 +30854,27 @@ mod tests {
         read_all_available(&mut peer)
     }
 
+    fn randr_transform_body(crtc: u32, matrix: [i32; 9], filter_name: &[u8]) -> Vec<u8> {
+        let mut body = Vec::with_capacity(44 + filter_name.len().next_multiple_of(4));
+        body.extend_from_slice(&crtc.to_le_bytes());
+        for cell in matrix {
+            body.extend_from_slice(&cell.to_le_bytes());
+        }
+        body.extend_from_slice(&(filter_name.len() as u16).to_le_bytes());
+        body.extend_from_slice(&[0u8; 2]);
+        body.extend_from_slice(filter_name);
+        body.resize(body.len().next_multiple_of(4), 0);
+        body
+    }
+
+    fn randr_panning_body(crtc: u32, width: u16, height: u16) -> Vec<u8> {
+        let mut body = vec![0u8; 32];
+        body[0..4].copy_from_slice(&crtc.to_le_bytes());
+        body[12..14].copy_from_slice(&width.to_le_bytes());
+        body[14..16].copy_from_slice(&height.to_le_bytes());
+        body
+    }
+
     #[test]
     fn randr_create_mode_unimplemented_returns_error_not_hang() {
         // RRCreateMode (minor 16): reply-bearing, unimplemented → error.
@@ -30709,16 +30889,17 @@ mod tests {
     }
 
     #[test]
-    fn randr_set_panning_unimplemented_returns_error_not_hang() {
-        // RRSetPanning (minor 29): reply-bearing, unimplemented → error.
-        let bytes = randr_unimplemented_reply_bearing(29);
-        assert!(
-            bytes.len() >= 32,
-            "expected error, not a hang: {bytes:02x?}"
-        );
-        assert_eq!(bytes[1], x11::error::BAD_IMPLEMENTATION, "code");
-        assert_eq!(&bytes[8..10], &29u16.to_le_bytes(), "minor");
-        assert_eq!(bytes[10], 128, "major = RANDR");
+    fn randr_crtc_setters_reject_short_bodies_with_bad_length() {
+        for minor in [
+            yserver_protocol::x11::randr::RR_SET_CRTC_TRANSFORM,
+            yserver_protocol::x11::randr::RR_SET_PANNING,
+        ] {
+            let bytes = randr_unimplemented_reply_bearing(minor);
+            assert_eq!(bytes.len(), 32, "minor {minor} must return an error");
+            assert_eq!(bytes[1], x11::error::BAD_LENGTH, "minor {minor} code");
+            assert_eq!(&bytes[8..10], &u16::from(minor).to_le_bytes());
+            assert_eq!(bytes[10], 128, "major = RANDR");
+        }
     }
 
     #[test]
@@ -30732,6 +30913,155 @@ mod tests {
         assert_eq!(bytes[1], x11::error::BAD_IMPLEMENTATION, "code");
         assert_eq!(&bytes[8..10], &45u16.to_le_bytes(), "minor");
         assert_eq!(bytes[10], 128, "major = RANDR");
+    }
+
+    #[test]
+    fn randr_unsupported_warning_latch_is_per_minor() {
+        let mut state = ServerState::new();
+        assert!(mark_randr_unsupported_warned(&mut state, 18));
+        assert!(!mark_randr_unsupported_warned(&mut state, 18));
+        assert!(mark_randr_unsupported_warned(&mut state, 19));
+    }
+
+    #[test]
+    fn randr_set_crtc_transform_accepts_only_direct_identity_state() {
+        use yserver_protocol::x11::randr as x11randr;
+
+        let mut state = ServerState::new();
+        let crtc = state.randr.outputs[0].crtc_id;
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let identity = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x0001_0000];
+        let header = RequestHeader {
+            opcode: 128,
+            data: x11randr::RR_SET_CRTC_TRANSFORM,
+            length_units: 12,
+        };
+
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &randr_transform_body(crtc, identity, &[]),
+        )
+        .expect("identity transform");
+        assert!(read_all_available(&mut peer).is_empty(), "void no-op");
+        assert_eq!(
+            state.randr_unsupported_warned_mask & (1 << x11randr::RR_SET_CRTC_TRANSFORM),
+            0,
+        );
+
+        // An identity filter is harmless and remains a wire-success no-op,
+        // but its parameters are not retained for GetCrtcTransform, so even
+        // an empty filter name with a parameter tail must warn.
+        let mut parameter_only = randr_transform_body(crtc, identity, &[]);
+        parameter_only.extend_from_slice(&0x0001_0000i32.to_le_bytes());
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(2),
+            RequestHeader {
+                length_units: 13,
+                ..header
+            },
+            &parameter_only,
+        )
+        .expect("identity transform with filter parameter");
+        assert!(read_all_available(&mut peer).is_empty(), "void no-op");
+        assert_ne!(
+            state.randr_unsupported_warned_mask & (1 << x11randr::RR_SET_CRTC_TRANSFORM),
+            0,
+        );
+
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(3),
+            RequestHeader {
+                length_units: 13,
+                ..header
+            },
+            &randr_transform_body(crtc, identity, b"box"),
+        )
+        .expect("identity transform with named filter");
+        assert!(read_all_available(&mut peer).is_empty(), "void no-op");
+
+        let mut projective = identity;
+        projective[6] = 1;
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(4),
+            header,
+            &randr_transform_body(crtc, projective, &[]),
+        )
+        .expect("reject non-identity transform");
+        let error = read_all_available(&mut peer);
+        assert_eq!(error.len(), 32);
+        assert_eq!(error[0], 0);
+        assert_eq!(error[1], x11::error::BAD_MATCH);
+        assert_eq!(u32::from_le_bytes(error[4..8].try_into().unwrap()), crtc);
+        assert_eq!(&error[8..10], &u16::from(header.data).to_le_bytes());
+        assert_eq!(error[10], 128);
+    }
+
+    #[test]
+    fn randr_set_panning_accepts_disabled_and_refuses_active_viewport() {
+        use yserver_protocol::x11::randr as x11randr;
+
+        let mut state = ServerState::new();
+        let crtc = state.randr.outputs[0].crtc_id;
+        let timestamp = state.randr.timestamp;
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let header = RequestHeader {
+            opcode: 128,
+            data: x11randr::RR_SET_PANNING,
+            length_units: 9,
+        };
+
+        let mut disabled = randr_panning_body(crtc, 0, 0);
+        disabled[8..10].copy_from_slice(&15u16.to_le_bytes());
+        disabled[24..26].copy_from_slice(&(-3i16).to_le_bytes());
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &disabled,
+        )
+        .expect("disabled panning");
+
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(2),
+            header,
+            &randr_panning_body(crtc, 1920, 1080),
+        )
+        .expect("active panning refusal");
+
+        let replies = read_all_available(&mut peer);
+        assert_eq!(replies.len(), 64);
+        assert_eq!(replies[0], 1);
+        assert_eq!(replies[1], x11randr::SET_CONFIG_SUCCESS);
+        assert_eq!(
+            u32::from_le_bytes(replies[8..12].try_into().unwrap()),
+            timestamp
+        );
+        assert_eq!(replies[32], 1);
+        assert_eq!(replies[33], x11randr::SET_CONFIG_FAILED);
+        assert_ne!(
+            state.randr_unsupported_warned_mask & (1 << x11randr::RR_SET_PANNING),
+            0,
+        );
     }
 
     #[test]
@@ -30904,8 +31234,10 @@ mod tests {
             (22, 4, RANDR_BAD_CRTC),
             (23, 4, RANDR_BAD_CRTC),
             (24, 8, RANDR_BAD_CRTC),
+            (26, 44, RANDR_BAD_CRTC),
             (27, 4, RANDR_BAD_CRTC),
             (28, 4, RANDR_BAD_CRTC),
+            (29, 32, RANDR_BAD_CRTC),
         ];
 
         for (minor, body_len, expected_error) in cases {
@@ -30972,6 +31304,21 @@ mod tests {
             data: x11randr::RR_SET_OUTPUT_PRIMARY,
             length_units: 3,
         };
+
+        // Re-selecting the topology-derived default is wire-idempotent, but
+        // records that the client now owns this primary choice.
+        assert!(!state.randr_primary_output_explicit);
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(0),
+            header,
+            &request(output),
+        )
+        .expect("make default primary explicit");
+        assert!(state.randr_primary_output_explicit);
+        assert!(read_all_available(&mut peer).is_empty());
 
         // The first output is primary by default, so clear it first to make the
         // set below a real change. (The clear is itself a change and notifies —

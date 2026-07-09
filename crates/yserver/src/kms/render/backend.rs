@@ -1155,6 +1155,25 @@ fn absolute_seq_user_data(crtc_id: u32) -> u64 {
     ABSOLUTE_SEQ_TAG | u64::from(crtc_id)
 }
 
+fn restore_primary_output_after_rebuild(
+    previous: u32,
+    was_explicit: bool,
+    randr: &mut yserver_core::randr::RandrState,
+) -> bool {
+    if was_explicit
+        && (previous == 0
+            || randr
+                .outputs
+                .iter()
+                .any(|output| output.output_id == previous))
+    {
+        randr.primary_output = previous;
+        true
+    } else {
+        false
+    }
+}
+
 impl KmsBackend {
     fn request_direct_unflip(&mut self) {
         if !self.scanout_m2.active() {
@@ -4424,6 +4443,8 @@ impl KmsBackend {
     ) {
         let prev_ts = state.randr.timestamp;
         let prev_ct = state.randr.config_timestamp;
+        let prev_primary = state.randr.primary_output;
+        let prev_primary_explicit = state.randr_primary_output_explicit;
         // Snapshot the client-owned logical screen size to carry forward.
         let prev_screen = (
             state.randr.screen_width,
@@ -4443,6 +4464,15 @@ impl KmsBackend {
         state.randr.screen_height = prev_screen.1;
         state.randr.width_mm = prev_screen.2;
         state.randr.height_mm = prev_screen.3;
+        // SetOutputPrimary is client-owned metadata. Keep it across a
+        // topology rebuild while the output resource still exists, including
+        // a temporarily disconnected output. If it vanished entirely, retain
+        // from_outputs' best available fallback instead.
+        state.randr_primary_output_explicit = restore_primary_output_after_rebuild(
+            prev_primary,
+            prev_primary_explicit,
+            &mut state.randr,
+        );
         state.randr.config_timestamp = if config_changed { ts_now } else { prev_ct };
     }
 
@@ -20785,6 +20815,7 @@ mod tests {
         compute_render_composite_clip, dri3_version_for, dst_picture_clip_by_children,
         glx_vendor_names_for_driver, intersect_rect_with_clip, mode_timing,
         reconcile_connector_probe, resolve_picture_for_render,
+        restore_primary_output_after_rebuild,
     };
     use crate::kms::{
         cpu_types::{Rectangle16, Repeat},
@@ -20792,6 +20823,52 @@ mod tests {
     };
     use std::collections::HashMap;
     use yserver_core::{backend::Backend, server::ServerState};
+
+    #[test]
+    fn randr_rebuild_preserves_primary_while_output_resource_exists() {
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].output_id;
+
+        // An untouched topology-derived primary is not sticky. Leave the
+        // freshly rebuilt fallback in place when no client selected it.
+        state.randr.primary_output = 0;
+        assert!(!restore_primary_output_after_rebuild(
+            output,
+            false,
+            &mut state.randr,
+        ));
+        assert_eq!(state.randr.primary_output, 0);
+
+        // Disconnection does not retire the RANDR output resource, so a
+        // client-selected primary remains meaningful and must survive.
+        state.randr.outputs[0].connected = false;
+        state.randr.primary_output = 0;
+        assert!(restore_primary_output_after_rebuild(
+            output,
+            true,
+            &mut state.randr,
+        ));
+        assert_eq!(state.randr.primary_output, output);
+
+        // An explicit None primary is likewise client-owned state.
+        state.randr.primary_output = output;
+        assert!(restore_primary_output_after_rebuild(
+            0,
+            true,
+            &mut state.randr,
+        ));
+        assert_eq!(state.randr.primary_output, 0);
+
+        // Once the old resource is absent, keep the freshly rebuilt state's
+        // fallback instead of restoring a dangling xid.
+        state.randr.primary_output = output;
+        assert!(!restore_primary_output_after_rebuild(
+            0x00de_ad01,
+            true,
+            &mut state.randr,
+        ));
+        assert_eq!(state.randr.primary_output, output);
+    }
 
     #[test]
     fn mode_timing_passes_kernel_timing_and_masks_drm_only_flags() {

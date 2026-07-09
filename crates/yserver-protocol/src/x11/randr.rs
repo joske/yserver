@@ -55,8 +55,10 @@ pub const RR_GET_CRTC_GAMMA_SIZE: u8 = 22;
 pub const RR_GET_CRTC_GAMMA: u8 = 23;
 pub const RR_SET_CRTC_GAMMA: u8 = 24;
 pub const RR_GET_SCREEN_RESOURCES_CURRENT: u8 = 25;
+pub const RR_SET_CRTC_TRANSFORM: u8 = 26;
 pub const RR_GET_CRTC_TRANSFORM: u8 = 27;
 pub const RR_GET_PANNING: u8 = 28;
+pub const RR_SET_PANNING: u8 = 29;
 pub const RR_SET_OUTPUT_PRIMARY: u8 = 30;
 pub const RR_GET_OUTPUT_PRIMARY: u8 = 31;
 pub const RR_GET_PROVIDERS: u8 = 32;
@@ -73,6 +75,8 @@ pub const NOTIFY_CRTC_CHANGE: u8 = 0;
 pub const NOTIFY_OUTPUT_CHANGE: u8 = 1;
 pub const NOTIFY_OUTPUT_PROPERTY: u8 = 2;
 pub const ROTATION_ROTATE_0: u16 = 1;
+pub const SET_CONFIG_SUCCESS: u8 = 0;
+pub const SET_CONFIG_FAILED: u8 = 3;
 pub const SUBPIXEL_UNKNOWN: u16 = 0;
 pub const CONNECTION_CONNECTED: u8 = 0;
 /// `xRROutputPropertyNotifyEvent.state`: the property gained a new value.
@@ -186,6 +190,50 @@ pub struct SetScreenSizeRequest {
     pub height: u16,
     pub mm_width: u32,
     pub mm_height: u32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct SetCrtcTransformRequest {
+    pub crtc: u32,
+    pub transform: [i32; 9],
+    pub filter_name_len: u16,
+    pub filter_param_count: usize,
+}
+
+impl SetCrtcTransformRequest {
+    #[must_use]
+    pub fn is_identity_transform(&self) -> bool {
+        self.transform == [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x0001_0000]
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct SetPanningRequest {
+    pub crtc: u32,
+    pub timestamp: u32,
+    pub left: u16,
+    pub top: u16,
+    pub width: u16,
+    pub height: u16,
+    pub track_left: u16,
+    pub track_top: u16,
+    pub track_width: u16,
+    pub track_height: u16,
+    pub border_left: i16,
+    pub border_top: i16,
+    pub border_right: i16,
+    pub border_bottom: i16,
+}
+
+impl SetPanningRequest {
+    #[must_use]
+    pub fn is_disabled(&self) -> bool {
+        // A zero total width disables horizontal panning and a zero total
+        // height disables vertical panning. Both zero therefore represent
+        // fully-disabled panning even if a client leaves stale tracking or
+        // border values in the otherwise-inactive fields.
+        self.width == 0 && self.height == 0
+    }
 }
 
 // ── Request parsers ───────────────────────────────────────────────────────────
@@ -376,6 +424,55 @@ pub fn parse_set_screen_size_request(body: &[u8]) -> Option<SetScreenSizeRequest
         height: read_u16_le(&body[6..]),
         mm_width: read_u32_le(&body[8..]),
         mm_height: read_u32_le(&body[12..]),
+    })
+}
+
+/// Parse `RRSetCrtcTransform`'s fixed matrix and variable filter section.
+///
+/// Bytes after the padded filter name are zero or more 16.16 `FIXED`
+/// filter parameters. Their count is implicit in the X11 request length.
+pub fn parse_set_crtc_transform_request(body: &[u8]) -> Option<SetCrtcTransformRequest> {
+    if body.len() < 44 {
+        return None;
+    }
+    let mut transform = [0i32; 9];
+    for (idx, cell) in transform.iter_mut().enumerate() {
+        let offset = 4 + idx * 4;
+        *cell = i32::from_le_bytes(body[offset..offset + 4].try_into().ok()?);
+    }
+    let filter_name_len = read_u16_le(&body[40..]);
+    let filter_end = 44usize.checked_add(pad4(usize::from(filter_name_len)))?;
+    if filter_end > body.len() || !(body.len() - filter_end).is_multiple_of(4) {
+        return None;
+    }
+    Some(SetCrtcTransformRequest {
+        crtc: read_u32_le(body),
+        transform,
+        filter_name_len,
+        filter_param_count: (body.len() - filter_end) / 4,
+    })
+}
+
+/// Parse the fixed-size `RRSetPanning` request body.
+pub fn parse_set_panning_request(body: &[u8]) -> Option<SetPanningRequest> {
+    if body.len() != 32 {
+        return None;
+    }
+    Some(SetPanningRequest {
+        crtc: read_u32_le(body),
+        timestamp: read_u32_le(&body[4..]),
+        left: read_u16_le(&body[8..]),
+        top: read_u16_le(&body[10..]),
+        width: read_u16_le(&body[12..]),
+        height: read_u16_le(&body[14..]),
+        track_left: read_u16_le(&body[16..]),
+        track_top: read_u16_le(&body[18..]),
+        track_width: read_u16_le(&body[20..]),
+        track_height: read_u16_le(&body[22..]),
+        border_left: i16::from_le_bytes(body[24..26].try_into().ok()?),
+        border_top: i16::from_le_bytes(body[26..28].try_into().ok()?),
+        border_right: i16::from_le_bytes(body[28..30].try_into().ok()?),
+        border_bottom: i16::from_le_bytes(body[30..32].try_into().ok()?),
     })
 }
 
@@ -855,6 +952,20 @@ pub fn encode_get_panning_reply(
     out
 }
 
+/// Encode the fixed-size `RRSetPanning` status reply.
+pub fn encode_set_panning_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    status: u8,
+    timestamp: u32,
+) -> Vec<u8> {
+    let mut out = fixed_reply(byte_order, sequence, status, 0);
+    put(byte_order, &mut out, timestamp);
+    out.extend_from_slice(&[0u8; 20]);
+    debug_assert_eq!(out.len(), 32);
+    out
+}
+
 /// Encodes a `GetOutputPrimary` reply (32 bytes), returning no primary output.
 pub fn encode_get_output_primary_reply(
     byte_order: ClientByteOrder,
@@ -1168,6 +1279,102 @@ mod tests {
         );
         // Short body rejected.
         assert!(parse_set_screen_size_request(&body[..15]).is_none());
+    }
+
+    #[test]
+    fn parse_set_crtc_transform_accepts_padded_filter_and_fixed_parameters() {
+        let matrix = [0x0001_0000i32, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x0001_0000];
+        let mut body = Vec::new();
+        body.extend_from_slice(&2u32.to_le_bytes());
+        for cell in matrix {
+            body.extend_from_slice(&cell.to_le_bytes());
+        }
+        body.extend_from_slice(&3u16.to_le_bytes());
+        body.extend_from_slice(&[0u8; 2]);
+        body.extend_from_slice(b"box\0");
+        body.extend_from_slice(&(-0x0000_8000i32).to_le_bytes());
+
+        let request = parse_set_crtc_transform_request(&body).expect("valid transform");
+        assert_eq!(request.crtc, 2);
+        assert_eq!(request.filter_name_len, 3);
+        assert_eq!(request.filter_param_count, 1);
+        assert!(request.is_identity_transform());
+
+        let mut nonidentity = body.clone();
+        nonidentity[4..8].copy_from_slice(&0x0002_0000i32.to_le_bytes());
+        assert!(
+            !parse_set_crtc_transform_request(&nonidentity)
+                .unwrap()
+                .is_identity_transform()
+        );
+    }
+
+    #[test]
+    fn parse_set_crtc_transform_rejects_malformed_variable_tail() {
+        assert!(parse_set_crtc_transform_request(&[0u8; 43]).is_none());
+
+        let mut missing_filter = vec![0u8; 44];
+        missing_filter[40..42].copy_from_slice(&4u16.to_le_bytes());
+        assert!(parse_set_crtc_transform_request(&missing_filter).is_none());
+
+        let mut partial_parameter = vec![0u8; 45];
+        partial_parameter[40..42].copy_from_slice(&0u16.to_le_bytes());
+        assert!(parse_set_crtc_transform_request(&partial_parameter).is_none());
+    }
+
+    #[test]
+    fn parse_set_panning_requires_fixed_size_and_detects_disabled_axes() {
+        let mut body = vec![0u8; 32];
+        body[0..4].copy_from_slice(&2u32.to_le_bytes());
+        body[4..8].copy_from_slice(&99u32.to_le_bytes());
+        body[8..10].copy_from_slice(&15u16.to_le_bytes());
+        body[16..18].copy_from_slice(&20u16.to_le_bytes());
+        body[24..26].copy_from_slice(&(-3i16).to_le_bytes());
+
+        let request = parse_set_panning_request(&body).expect("disabled panning");
+        assert_eq!(request.crtc, 2);
+        assert_eq!(request.timestamp, 99);
+        assert_eq!(request.left, 15);
+        assert_eq!(request.track_left, 20);
+        assert_eq!(request.border_left, -3);
+        assert!(
+            request.is_disabled(),
+            "zero width and height disable both axes"
+        );
+
+        body[12..14].copy_from_slice(&1920u16.to_le_bytes());
+        assert!(!parse_set_panning_request(&body).unwrap().is_disabled());
+        assert!(parse_set_panning_request(&body[..31]).is_none());
+        body.push(0);
+        assert!(parse_set_panning_request(&body).is_none());
+    }
+
+    #[test]
+    fn encode_set_panning_reply_honours_client_byte_order() {
+        for byte_order in [ClientByteOrder::LittleEndian, ClientByteOrder::BigEndian] {
+            let reply = encode_set_panning_reply(
+                byte_order,
+                SequenceNumber(0x1234),
+                SET_CONFIG_FAILED,
+                0x0102_0304,
+            );
+            assert_eq!(reply.len(), 32);
+            assert_eq!(reply[0], 1);
+            assert_eq!(reply[1], SET_CONFIG_FAILED);
+            match byte_order {
+                ClientByteOrder::LittleEndian => {
+                    assert_eq!(&reply[2..4], &0x1234u16.to_le_bytes());
+                    assert_eq!(&reply[4..8], &0u32.to_le_bytes());
+                    assert_eq!(&reply[8..12], &0x0102_0304u32.to_le_bytes());
+                }
+                ClientByteOrder::BigEndian => {
+                    assert_eq!(&reply[2..4], &0x1234u16.to_be_bytes());
+                    assert_eq!(&reply[4..8], &0u32.to_be_bytes());
+                    assert_eq!(&reply[8..12], &0x0102_0304u32.to_be_bytes());
+                }
+            }
+            assert!(reply[12..].iter().all(|byte| *byte == 0));
+        }
     }
 
     #[test]

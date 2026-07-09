@@ -122,6 +122,36 @@ fn swap_change_output_property_tail(byte_order: ClientByteOrder, body: &mut [u8]
     swap_in_place(entries, byte_order, body);
 }
 
+/// Swap the variable `FIXED[]` parameter tail of `RRSetCrtcTransform`.
+///
+/// The fixed swap entries run first, so `nbytesFilter` at offset 40 is
+/// already in little-endian form here. The filter name and its padding stay
+/// opaque; every remaining four-byte filter parameter is byte-swapped.
+fn swap_set_crtc_transform_tail(byte_order: ClientByteOrder, body: &mut [u8]) {
+    if matches!(byte_order, ClientByteOrder::LittleEndian) {
+        return;
+    }
+    let Some(filter_len) = body
+        .get(40..42)
+        .map(|bytes| u16::from_le_bytes(bytes.try_into().unwrap()))
+    else {
+        return;
+    };
+    let padded_filter_len = (usize::from(filter_len) + 3) & !3;
+    let Some(params_start) = 44usize.checked_add(padded_filter_len) else {
+        return;
+    };
+    let Some(params) = body.get_mut(params_start..) else {
+        return;
+    };
+    if !params.len().is_multiple_of(4) {
+        return;
+    }
+    for param in params.chunks_exact_mut(4) {
+        param.reverse();
+    }
+}
+
 fn swap_xi_change_device_control(byte_order: ClientByteOrder, body: &mut [u8]) {
     use FieldEntry::{ElementArrayTail, Fixed};
     use FieldKind::{U16, U32};
@@ -301,6 +331,40 @@ const fn randr_request_swap_table(minor: u8) -> Option<&'static [FieldEntry]> {
         ],
         // DestroyMode: a lone RRMode. FreeLease: RRLease + terminate byte.
         17 | 46 => &[u32f!(0)],
+        // SetCrtcTransform: crtc, nine 16.16 matrix cells, filter-name
+        // length, padded opaque filter name, then a variable FIXED[] tail.
+        super::randr::RR_SET_CRTC_TRANSFORM => &[
+            u32f!(0),
+            u32f!(4),
+            u32f!(8),
+            u32f!(12),
+            u32f!(16),
+            u32f!(20),
+            u32f!(24),
+            u32f!(28),
+            u32f!(32),
+            u32f!(36),
+            u16f!(40),
+            Custom(swap_set_crtc_transform_tail),
+        ],
+        // SetPanning: crtc, timestamp, eight viewport/track CARD16s,
+        // then four signed border widths.
+        super::randr::RR_SET_PANNING => &[
+            u32f!(0),
+            u32f!(4),
+            u16f!(8),
+            u16f!(10),
+            u16f!(12),
+            u16f!(14),
+            u16f!(16),
+            u16f!(18),
+            u16f!(20),
+            u16f!(22),
+            i16f!(24),
+            i16f!(26),
+            i16f!(28),
+            i16f!(30),
+        ],
         // SetCrtcConfig: crtc, timestamp, configTimestamp, x, y, mode,
         // rotation, then a trailing RROutput array.
         21 => &[
@@ -1128,6 +1192,96 @@ mod tests {
     }
 
     #[test]
+    fn randr_set_crtc_transform_swaps_fixed_fields_and_dynamic_parameter_tail() {
+        let mut body = vec![0u8; 56];
+        body[0..4].copy_from_slice(&0x00de_ad01u32.to_be_bytes());
+        let matrix = [0x0001_0000i32, -1, 2, 3, 0x0001_0000, 5, 6, 7, 0x0001_0000];
+        for (idx, cell) in matrix.into_iter().enumerate() {
+            let offset = 4 + idx * 4;
+            body[offset..offset + 4].copy_from_slice(&cell.to_be_bytes());
+        }
+        body[40..42].copy_from_slice(&3u16.to_be_bytes());
+        body[44..47].copy_from_slice(b"box");
+        body[47] = 0; // filter-name padding stays opaque
+        body[48..52].copy_from_slice(&(-0x0000_8000i32).to_be_bytes());
+        body[52..56].copy_from_slice(&0x0002_0000i32.to_be_bytes());
+
+        swap_request_body(
+            128,
+            crate::x11::randr::RR_SET_CRTC_TRANSFORM,
+            ClientByteOrder::BigEndian,
+            &mut body,
+        );
+
+        assert_eq!(
+            u32::from_le_bytes(body[0..4].try_into().unwrap()),
+            0x00de_ad01
+        );
+        for (idx, expected) in matrix.into_iter().enumerate() {
+            let offset = 4 + idx * 4;
+            assert_eq!(
+                i32::from_le_bytes(body[offset..offset + 4].try_into().unwrap()),
+                expected,
+            );
+        }
+        assert_eq!(u16::from_le_bytes(body[40..42].try_into().unwrap()), 3);
+        assert_eq!(&body[44..48], b"box\0");
+        assert_eq!(
+            i32::from_le_bytes(body[48..52].try_into().unwrap()),
+            -0x0000_8000
+        );
+        assert_eq!(
+            i32::from_le_bytes(body[52..56].try_into().unwrap()),
+            0x0002_0000
+        );
+    }
+
+    #[test]
+    fn randr_set_panning_swaps_every_numeric_field() {
+        let mut body = vec![0u8; 32];
+        body[0..4].copy_from_slice(&0x00de_ad01u32.to_be_bytes());
+        body[4..8].copy_from_slice(&0x0102_0304u32.to_be_bytes());
+        for (idx, value) in (1u16..=8).enumerate() {
+            let offset = 8 + idx * 2;
+            body[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
+        }
+        for (idx, value) in [-1i16, -2, 3, 4].into_iter().enumerate() {
+            let offset = 24 + idx * 2;
+            body[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
+        }
+
+        swap_request_body(
+            128,
+            crate::x11::randr::RR_SET_PANNING,
+            ClientByteOrder::BigEndian,
+            &mut body,
+        );
+
+        assert_eq!(
+            u32::from_le_bytes(body[0..4].try_into().unwrap()),
+            0x00de_ad01
+        );
+        assert_eq!(
+            u32::from_le_bytes(body[4..8].try_into().unwrap()),
+            0x0102_0304
+        );
+        for (idx, expected) in (1u16..=8).enumerate() {
+            let offset = 8 + idx * 2;
+            assert_eq!(
+                u16::from_le_bytes(body[offset..offset + 2].try_into().unwrap()),
+                expected
+            );
+        }
+        for (idx, expected) in [-1i16, -2, 3, 4].into_iter().enumerate() {
+            let offset = 24 + idx * 2;
+            assert_eq!(
+                i16::from_le_bytes(body[offset..offset + 2].try_into().unwrap()),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn randr_configure_output_property_swaps_header_and_tail_int32_array() {
         let mut body = vec![
             0x00, 0x00, 0x00, 0x02, // output = 2 in BE
@@ -1200,8 +1354,8 @@ mod tests {
     fn randr_leading_resource_id_is_swapped_for_every_validating_minor() {
         const XID: u32 = 0x00de_ad01;
         for minor in [
-            2u8, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 20, 21, 22, 23, 25, 27, 28, 30, 31, 32,
-            33, 42, 46,
+            2u8, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 20, 21, 22, 23, 25, 26, 27, 28, 29, 30,
+            31, 32, 33, 42, 46,
         ] {
             let mut body = vec![0u8; 32];
             body[0..4].copy_from_slice(&XID.to_be_bytes());
@@ -1218,7 +1372,7 @@ mod tests {
     /// new entries cannot corrupt the common path.
     #[test]
     fn randr_little_endian_bodies_are_untouched() {
-        for minor in [2u8, 4, 7, 12, 13, 15, 21, 30, 42, 46] {
+        for minor in [2u8, 4, 7, 12, 13, 15, 21, 26, 29, 30, 42, 46] {
             let mut body: Vec<u8> = (0..32u8).collect();
             let original = body.clone();
             swap_request_body(128, minor, ClientByteOrder::LittleEndian, &mut body);
