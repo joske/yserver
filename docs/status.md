@@ -112,6 +112,28 @@ Cross-cutting bugs and followups that don't fit a stage live in
   end-to-end path has a live-Vulkan integration test and is confirmed
   by flameshot smoke on real KMS. Supersedes the tree-re-walk approach
   in PR #76.
+- **2026-07-07 RandR COW resize notifications**: Plasma/KWin on real
+  KMS exposed a shrink-then-grow failure where RandR/input returned to
+  the full screen but the composited desktop stayed at the smaller size
+  in the upper-left corner. `RRSetScreenSize` already resized root/COW
+  storage, but it bypassed the normal `ConfigureWindow` path and did
+  not emit core `ConfigureNotify` or `Present::ConfigureNotify` for a
+  materialized Composite Overlay Window. The resize side-effects now
+  notify both root and COW, including Present configure events so
+  DRI3/Present compositors reallocate full-size swap buffers; the same
+  notify is re-emitted after a real `RRSetCrtcConfig` once the output bbox
+  matches the logical screen, covering Plasma's SetScreenSize-before-
+  SetCrtcConfig grow order. Regression
+  `screen_resize_notifies_materialized_cow_present_subscriber` pins the COW
+  wire events.
+- **2026-07-13 RENDER ARGB visual mapping**: real-KMS testing with KiCad/GTK
+  exposed opaque black rectangles around otherwise correct popup menus. The
+  server advertised the same depth-32 ARGB visual twice in
+  `QueryPictFormats`, first as ARGB32 and then as XRGB32. Xorg maps each
+  VisualID once; clients retaining the last association consequently treated
+  transparent popup pixels as opaque. The visual now maps only to ARGB32,
+  while XRGB32 remains in the global format list for explicit Picture use. A
+  wire-reply regression test pins the format counts and depth associations.
 - **2026-06-17 XFIXES pointer barriers**: `PointerBarrier` storage,
   XFIXES barrier wire parsing, `CreatePointerBarrier` /
   `DeletePointerBarrier` dispatch, client-disconnect cleanup, XID

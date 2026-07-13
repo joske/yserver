@@ -78,7 +78,9 @@ Active 4d shadow/CSD ARGB-vs-xRGB mismatch. Real fix is Stage 4e PictFormat trac
 
 **Resolution:** added `RENDER_FMT_XRGB32` (id=5, depth=32, alpha_mask=0) — mirrors
 Xorg's `PICT_x8r8g8b8`; `write_render_query_pict_formats_reply` now advertises 5
-formats and lists the depth-32 visual with both ARGB32 + XRGB32 pairs. New engine
+formats. XRGB32 remains available for explicit Picture creation, while the depth-32
+ARGB visual is associated only with ARGB32, matching Xorg's one-format-per-visual
+screen mapping. New engine
 helpers `resolve_force_opaque_pict_format` / `swizzle_class_for_pict_format` /
 `dst_has_alpha_for_pict_format` consult `pict_format` first, falling back to the
 legacy depth heuristic when `pict_format=0` (engine-internal callers without Picture

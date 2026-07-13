@@ -3156,6 +3156,7 @@ fn handle_randr_request(
                     // Fire Crtc/Output change (+ ScreenChangeNotify via
                     // RRTellChanged) → emit_randr_change_notifications.
                     super::run::emit_randr_change_notifications(state, &changed);
+                    super::run::emit_screen_resize_window_notifications_if_outputs_match(state);
                     return reply_set_crtc_config(
                         state,
                         client_id,
@@ -8513,7 +8514,7 @@ pub fn fire_present_completion_events(
 /// (size primarily — Mesa keys buffer reallocation on
 /// `pixmap_{width,height}` here). Mirrors the iteration shape of
 /// `fire_present_completion_events`.
-fn fire_present_configure_notify_for_window(
+pub(crate) fn fire_present_configure_notify_for_window(
     state: &mut ServerState,
     window_id: ResourceId,
     geometry: yserver_protocol::x11::Geometry,
@@ -46223,6 +46224,226 @@ mod tests {
         assert_eq!(state.randr.screen_height, 1080);
         assert_eq!(state.randr.width_mm, 527, "mm verbatim from client");
         assert_eq!(state.randr.height_mm, 296, "mm verbatim from client");
+    }
+
+    /// A compositor that renders through the Composite Overlay Window
+    /// typically backs it with DRI3/Present buffers. `RRSetScreenSize`
+    /// resizes the root and COW outside the normal `ConfigureWindow` path,
+    /// so it must still emit both core ConfigureNotify and
+    /// Present::ConfigureNotify for the materialized COW. Otherwise the
+    /// compositor can keep presenting its old smaller swap buffers after a
+    /// shrink-grow cycle, leaving the desktop in the upper-left corner while
+    /// input/RandR already use the full screen.
+    #[test]
+    fn screen_resize_notifies_materialized_cow_present_subscriber() {
+        use crate::{
+            backend::WindowHandle,
+            randr::{RandrOutput, RandrState},
+            resources::COMPOSITE_OVERLAY_WINDOW,
+            server::PresentEventSelection,
+        };
+        use yserver_protocol::x11::present as x11present;
+
+        const CLIENT_ID: u32 = 1;
+        const PRESENT_EID: u32 = 0x0010_0042;
+
+        let outputs = vec![RandrOutput {
+            name: "DP-4".into(),
+            output_id: 1,
+            crtc_id: 2,
+            mode_id: 3,
+            connected: true,
+            x: 0,
+            y: 0,
+            width: 1680,
+            height: 1050,
+            vrefresh: 100,
+            timing: None,
+            mm_width: 0,
+            mm_height: 0,
+            mode_ids: vec![3],
+            num_preferred: 1,
+        }];
+        let mut state = ServerState::new();
+        state.randr = RandrState::from_outputs(0, outputs);
+        let mut peer = install_client(&mut state, CLIENT_ID);
+        let mut backend = RecordingBackend::new();
+
+        state
+            .resources
+            .materialize_cow_resource(WindowHandle::from_raw_for_test(COMPOSITE_OVERLAY_WINDOW.0));
+        state.materialize_cow_input_shape();
+        state
+            .clients
+            .get_mut(&CLIENT_ID)
+            .unwrap()
+            .event_masks
+            .insert(COMPOSITE_OVERLAY_WINDOW, 0x0002_0000);
+        state.present_event_selections.insert(
+            PRESENT_EID,
+            PresentEventSelection {
+                owner: ClientId(CLIENT_ID),
+                window: COMPOSITE_OVERLAY_WINDOW,
+                event_mask: x11present::EVENT_MASK_CONFIGURE_NOTIFY,
+            },
+        );
+        assert_eq!(
+            crate::core_loop::fanout::subscribers_by_id(
+                &state,
+                COMPOSITE_OVERLAY_WINDOW,
+                0x0002_0000,
+            ),
+            vec![ClientId(CLIENT_ID)],
+            "COW StructureNotify subscription visible before resize",
+        );
+        assert_eq!(
+            state
+                .present_event_selections
+                .get(&PRESENT_EID)
+                .unwrap()
+                .window,
+            COMPOSITE_OVERLAY_WINDOW,
+            "Present Configure subscription visible before resize",
+        );
+
+        let mut body = Vec::with_capacity(16);
+        body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        body.extend_from_slice(&3440u16.to_le_bytes());
+        body.extend_from_slice(&1440u16.to_le_bytes());
+        body.extend_from_slice(&910u32.to_le_bytes());
+        body.extend_from_slice(&381u32.to_le_bytes());
+
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 128,
+            data: yserver_protocol::x11::randr::RR_SET_SCREEN_SIZE,
+            length_units: 5,
+        };
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT_ID),
+            SequenceNumber(1),
+            header,
+            &body,
+        )
+        .expect("RRSetScreenSize grow");
+
+        assert_eq!(state.randr.screen_width, 3440, "RandR width updated");
+        assert_eq!(state.randr.screen_height, 1440, "RandR height updated");
+        let cow = state
+            .resources
+            .window(COMPOSITE_OVERLAY_WINDOW)
+            .expect("COW still materialized");
+        assert_eq!(cow.width, 3440, "COW width updated");
+        assert_eq!(cow.height, 1440, "COW height updated");
+        assert_eq!(
+            crate::core_loop::fanout::subscribers_by_id(
+                &state,
+                COMPOSITE_OVERLAY_WINDOW,
+                0x0002_0000,
+            ),
+            vec![ClientId(CLIENT_ID)],
+            "COW StructureNotify subscription still visible after resize",
+        );
+        assert_eq!(
+            state
+                .present_event_selections
+                .get(&PRESENT_EID)
+                .unwrap()
+                .window,
+            COMPOSITE_OVERLAY_WINDOW,
+            "Present Configure subscription still visible after resize",
+        );
+        assert_eq!(
+            state.clients.get(&CLIENT_ID).unwrap().outbound.len(),
+            0,
+            "small COW resize notifications should not be stuck in outbound",
+        );
+
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(
+            bytes.len(),
+            32 + 40,
+            "COW subscriber should receive core ConfigureNotify plus \
+             Present::ConfigureNotify only; got {bytes:?}",
+        );
+
+        let core = &bytes[..32];
+        assert_eq!(core[0] & 0x7f, 22, "first event must be ConfigureNotify");
+        assert_eq!(
+            u32::from_le_bytes(core[4..8].try_into().unwrap()),
+            COMPOSITE_OVERLAY_WINDOW.0,
+            "ConfigureNotify event window must be COW",
+        );
+        assert_eq!(
+            u32::from_le_bytes(core[8..12].try_into().unwrap()),
+            COMPOSITE_OVERLAY_WINDOW.0,
+            "ConfigureNotify target window must be COW",
+        );
+        assert_eq!(u16::from_le_bytes(core[20..22].try_into().unwrap()), 3440);
+        assert_eq!(u16::from_le_bytes(core[22..24].try_into().unwrap()), 1440);
+
+        let present = &bytes[32..];
+        assert_eq!(present[0], 35, "second event must be GenericEvent");
+        assert_eq!(present[1], 145, "GenericEvent extension must be PRESENT");
+        assert_eq!(
+            u16::from_le_bytes(present[8..10].try_into().unwrap()),
+            u16::from(x11present::EVENT_CONFIGURE_NOTIFY),
+        );
+        assert_eq!(
+            u32::from_le_bytes(present[12..16].try_into().unwrap()),
+            PRESENT_EID,
+        );
+        assert_eq!(
+            u32::from_le_bytes(present[16..20].try_into().unwrap()),
+            COMPOSITE_OVERLAY_WINDOW.0,
+        );
+        assert_eq!(
+            u16::from_le_bytes(present[24..26].try_into().unwrap()),
+            3440,
+            "Present ConfigureNotify width must track the grown COW",
+        );
+        assert_eq!(
+            u16::from_le_bytes(present[26..28].try_into().unwrap()),
+            1440,
+            "Present ConfigureNotify height must track the grown COW",
+        );
+        assert_eq!(
+            u16::from_le_bytes(present[32..34].try_into().unwrap()),
+            3440,
+            "Present pixmap width must ask Mesa/KWin to reallocate full-size buffers",
+        );
+        assert_eq!(
+            u16::from_le_bytes(present[34..36].try_into().unwrap()),
+            1440,
+            "Present pixmap height must ask Mesa/KWin to reallocate full-size buffers",
+        );
+
+        super::super::run::emit_screen_resize_window_notifications_if_outputs_match(&mut state);
+        assert!(
+            read_all_available(&mut peer).is_empty(),
+            "a stale output bbox must not re-emit full-size configure notifications",
+        );
+
+        state.randr.outputs[0].width = 3440;
+        state.randr.outputs[0].height = 1440;
+        super::super::run::emit_screen_resize_window_notifications_if_outputs_match(&mut state);
+        let caught_up = read_all_available(&mut peer);
+        assert_eq!(
+            caught_up.len(),
+            32 + 40,
+            "matching output bbox must re-emit core and Present COW configure notifications",
+        );
+        assert_eq!(caught_up[0] & 0x7f, 22);
+        assert_eq!(caught_up[32], 35);
+        assert_eq!(
+            u16::from_le_bytes(caught_up[32 + 32..32 + 34].try_into().unwrap()),
+            3440,
+        );
+        assert_eq!(
+            u16::from_le_bytes(caught_up[32 + 34..32 + 36].try_into().unwrap()),
+            1440,
+        );
     }
 
     /// `RRSetScreenSize` validation: crop check returns BadMatch; zero-mm

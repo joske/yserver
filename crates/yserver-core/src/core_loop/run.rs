@@ -29,7 +29,7 @@ use super::{
         ClientIdAllocator, DRM_HOTPLUG_TOKEN, DRM_TOKEN, HOST_X11_TOKEN, LIBINPUT_TOKEN,
         LISTENER_TOKEN, NOTIFY_TOKEN, PRESENT_COMPLETION_TOKEN, client_token, token_to_client,
     },
-    process_request::{RequestOutcome, process_request},
+    process_request::{RequestOutcome, fire_present_configure_notify_for_window, process_request},
     sender::{CoreReceiver, CoreSender},
     setup_thread::{self, SetupRegistry},
 };
@@ -938,10 +938,10 @@ pub(crate) fn handle_host_container_resize(
 }
 
 /// Common side-effects of a logical-screen-size change: update root +
-/// overlay window records, emit root ConfigureNotify, fan out RANDR
-/// notifies (ScreenChange always; Crtc/Output only for entries in
-/// `changed`), and re-clamp/warp the pointer. `changed` is empty for a
-/// pure RRSetScreenSize (CRTCs unchanged).
+/// overlay window records, emit ConfigureNotify / Present ConfigureNotify,
+/// fan out RANDR notifies (ScreenChange always; Crtc/Output only for entries
+/// in `changed`), and re-clamp/warp the pointer. `changed` is empty for a pure
+/// RRSetScreenSize (CRTCs unchanged).
 pub(crate) fn apply_screen_size_side_effects(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -949,7 +949,6 @@ pub(crate) fn apply_screen_size_side_effects(
     height: u16,
     changed: &[(u32, u32, u32)],
 ) {
-    use yserver_protocol::x11;
     if let Some(root) = state.resources.window_mut(crate::resources::ROOT_WINDOW) {
         root.width = width;
         root.height = height;
@@ -961,6 +960,47 @@ pub(crate) fn apply_screen_size_side_effects(
         overlay.width = width;
         overlay.height = height;
     }
+
+    emit_screen_resize_window_notifications(state, width, height);
+    emit_randr_change_notifications(state, changed);
+
+    // Pointer: clamp into [0,w)×[0,h); if the screen shrank below the
+    // current cursor position, warp it inside (Xorg
+    // RRPointerScreenConfigured / ScreenRestructured). The KMS motion
+    // clamp only applies on the NEXT motion, so the explicit warp is
+    // required to avoid a stranded off-screen cursor.
+    let (px, py) = state.pointer_root;
+    let cx = i32::from(px).clamp(0, i32::from(width.saturating_sub(1)));
+    let cy = i32::from(py).clamp(0, i32::from(height.saturating_sub(1)));
+    if cx != i32::from(px) || cy != i32::from(py) {
+        let prev = state.barrier_bypass;
+        state.barrier_bypass = true;
+        backend.warp_pointer_root(state, cx, cy);
+        state.barrier_bypass = prev;
+    }
+}
+
+/// Emit the window-size notifications that clients normally get from
+/// `ConfigureWindow`, for screen-sized server windows that RandR resizes
+/// out-of-band. This intentionally does not mutate the resource geometry:
+/// callers must update root/COW first, then use this to wake clients that
+/// cache drawable or Present buffer sizes.
+pub(crate) fn emit_screen_resize_window_notifications(
+    state: &mut ServerState,
+    width: u16,
+    height: u16,
+) {
+    use yserver_protocol::x11;
+
+    let root_geometry = x11::Geometry {
+        root: crate::resources::ROOT_WINDOW,
+        x: 0,
+        y: 0,
+        width,
+        height,
+        border_width: 0,
+        depth: 24,
+    };
 
     // Core ConfigureNotify on root for non-RANDR-aware clients
     // selecting StructureNotifyMask. Spec-correct ordering: emit this
@@ -979,35 +1019,111 @@ pub(crate) fn apply_screen_size_side_effects(
                 crate::resources::ROOT_WINDOW,
                 crate::resources::ROOT_WINDOW,
                 None,
-                x11::Geometry {
-                    root: crate::resources::ROOT_WINDOW,
-                    x: 0,
-                    y: 0,
-                    width,
-                    height,
-                    border_width: 0,
-                    depth: 24,
-                },
+                root_geometry,
                 false,
             );
         },
     );
-    emit_randr_change_notifications(state, changed);
+    fire_present_configure_notify_for_window(state, crate::resources::ROOT_WINDOW, root_geometry);
 
-    // Pointer: clamp into [0,w)×[0,h); if the screen shrank below the
-    // current cursor position, warp it inside (Xorg
-    // RRPointerScreenConfigured / ScreenRestructured). The KMS motion
-    // clamp only applies on the NEXT motion, so the explicit warp is
-    // required to avoid a stranded off-screen cursor.
-    let (px, py) = state.pointer_root;
-    let cx = i32::from(px).clamp(0, i32::from(width.saturating_sub(1)));
-    let cy = i32::from(py).clamp(0, i32::from(height.saturating_sub(1)));
-    if cx != i32::from(px) || cy != i32::from(py) {
-        let prev = state.barrier_bypass;
-        state.barrier_bypass = true;
-        backend.warp_pointer_root(state, cx, cy);
-        state.barrier_bypass = prev;
+    if let Some((parent, geometry, override_redirect)) = state
+        .resources
+        .window(crate::resources::COMPOSITE_OVERLAY_WINDOW)
+        .map(|overlay| {
+            (
+                overlay.parent,
+                x11::Geometry {
+                    root: crate::resources::ROOT_WINDOW,
+                    x: overlay.x,
+                    y: overlay.y,
+                    width: overlay.width,
+                    height: overlay.height,
+                    border_width: overlay.border_width,
+                    depth: overlay.depth,
+                },
+                overlay.override_redirect,
+            )
+        })
+    {
+        let above_sibling = state
+            .resources
+            .configure_notify_above_sibling(crate::resources::COMPOSITE_OVERLAY_WINDOW);
+        let _dropped = crate::core_loop::fanout::emit_window_event_to_state(
+            state,
+            crate::resources::COMPOSITE_OVERLAY_WINDOW,
+            0x0002_0000, // StructureNotifyMask
+            |buf, seq, order| {
+                x11::encode_configure_notify_event(
+                    buf,
+                    seq,
+                    order,
+                    crate::resources::COMPOSITE_OVERLAY_WINDOW,
+                    crate::resources::COMPOSITE_OVERLAY_WINDOW,
+                    above_sibling,
+                    geometry,
+                    override_redirect,
+                );
+            },
+        );
+        let _dropped = crate::core_loop::fanout::emit_window_event_to_state(
+            state,
+            parent,
+            0x0008_0000, // SubstructureNotifyMask
+            |buf, seq, order| {
+                x11::encode_configure_notify_event(
+                    buf,
+                    seq,
+                    order,
+                    parent,
+                    crate::resources::COMPOSITE_OVERLAY_WINDOW,
+                    above_sibling,
+                    geometry,
+                    override_redirect,
+                );
+            },
+        );
+        fire_present_configure_notify_for_window(
+            state,
+            crate::resources::COMPOSITE_OVERLAY_WINDOW,
+            geometry,
+        );
     }
+}
+
+/// `RRSetCrtcConfig` can complete the physical modeset after a compositor
+/// already issued `RRSetScreenSize`. Re-emit root/COW configure notifications
+/// only when the active-output bbox has caught up with the logical screen,
+/// avoiding a premature full-size notify during the shrink half of a
+/// shrink-grow sequence.
+pub(crate) fn emit_screen_resize_window_notifications_if_outputs_match(state: &mut ServerState) {
+    let Some((bbox_w, bbox_h)) = enabled_output_bbox(state) else {
+        return;
+    };
+    if bbox_w == state.randr.screen_width && bbox_h == state.randr.screen_height {
+        emit_screen_resize_window_notifications(state, bbox_w, bbox_h);
+    }
+}
+
+fn enabled_output_bbox(state: &ServerState) -> Option<(u16, u16)> {
+    let mut any = false;
+    let mut max_x = 0i32;
+    let mut max_y = 0i32;
+    for output in state
+        .randr
+        .outputs
+        .iter()
+        .filter(|o| o.connected && o.mode_id != 0)
+    {
+        any = true;
+        max_x = max_x.max(i32::from(output.x).saturating_add(i32::from(output.width)));
+        max_y = max_y.max(i32::from(output.y).saturating_add(i32::from(output.height)));
+    }
+    any.then(|| {
+        (
+            u16::try_from(max_x.max(0)).unwrap_or(u16::MAX),
+            u16::try_from(max_y.max(0)).unwrap_or(u16::MAX),
+        )
+    })
 }
 
 /// Fan out RANDR change notifications for a topology/geometry change.
