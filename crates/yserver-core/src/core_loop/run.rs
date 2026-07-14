@@ -1091,20 +1091,27 @@ pub(crate) fn emit_screen_resize_window_notifications(
 }
 
 /// `RRSetCrtcConfig` can complete the physical modeset after a compositor
-/// already issued `RRSetScreenSize`. Re-emit root/COW configure notifications
-/// only when the active-output bbox has caught up with the logical screen,
-/// avoiding a premature full-size notify during the shrink half of a
-/// shrink-grow sequence.
-pub(crate) fn emit_screen_resize_window_notifications_if_outputs_match(state: &mut ServerState) {
+/// already issued `RRSetScreenSize` and received its immediate configure
+/// notifications. When the active-output bbox then changes and catches up
+/// with the logical screen, re-emit root/COW notifications so clients observe
+/// the size again after the modeset. An unchanged bbox (for example, a
+/// refresh-rate-only change) needs no window-size notification.
+pub(crate) fn emit_screen_resize_window_notifications_if_outputs_caught_up(
+    state: &mut ServerState,
+    previous_bbox: Option<(u16, u16)>,
+) {
     let Some((bbox_w, bbox_h)) = enabled_output_bbox(state) else {
         return;
     };
-    if bbox_w == state.randr.screen_width && bbox_h == state.randr.screen_height {
+    if previous_bbox != Some((bbox_w, bbox_h))
+        && bbox_w == state.randr.screen_width
+        && bbox_h == state.randr.screen_height
+    {
         emit_screen_resize_window_notifications(state, bbox_w, bbox_h);
     }
 }
 
-fn enabled_output_bbox(state: &ServerState) -> Option<(u16, u16)> {
+pub(crate) fn enabled_output_bbox(state: &ServerState) -> Option<(u16, u16)> {
     let mut any = false;
     let mut max_x = 0i32;
     let mut max_y = 0i32;

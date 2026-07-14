@@ -3139,6 +3139,7 @@ fn handle_randr_request(
             } else {
                 req_timestamp
             };
+            let output_bbox_before = super::run::enabled_output_bbox(state);
             match backend.apply_crtc_config(&connector, mode_spec, i32::from(x), i32::from(y)) {
                 Ok(true) => {
                     // Something actually changed. Single rebuild path: a CRTC
@@ -3156,7 +3157,10 @@ fn handle_randr_request(
                     // Fire Crtc/Output change (+ ScreenChangeNotify via
                     // RRTellChanged) → emit_randr_change_notifications.
                     super::run::emit_randr_change_notifications(state, &changed);
-                    super::run::emit_screen_resize_window_notifications_if_outputs_match(state);
+                    super::run::emit_screen_resize_window_notifications_if_outputs_caught_up(
+                        state,
+                        output_bbox_before,
+                    );
                     return reply_set_crtc_config(
                         state,
                         client_id,
@@ -46419,7 +46423,10 @@ mod tests {
             "Present pixmap height must ask Mesa/KWin to reallocate full-size buffers",
         );
 
-        super::super::run::emit_screen_resize_window_notifications_if_outputs_match(&mut state);
+        super::super::run::emit_screen_resize_window_notifications_if_outputs_caught_up(
+            &mut state,
+            Some((1680, 1050)),
+        );
         assert!(
             read_all_available(&mut peer).is_empty(),
             "a stale output bbox must not re-emit full-size configure notifications",
@@ -46427,7 +46434,10 @@ mod tests {
 
         state.randr.outputs[0].width = 3440;
         state.randr.outputs[0].height = 1440;
-        super::super::run::emit_screen_resize_window_notifications_if_outputs_match(&mut state);
+        super::super::run::emit_screen_resize_window_notifications_if_outputs_caught_up(
+            &mut state,
+            Some((1680, 1050)),
+        );
         let caught_up = read_all_available(&mut peer);
         assert_eq!(
             caught_up.len(),
@@ -46443,6 +46453,15 @@ mod tests {
         assert_eq!(
             u16::from_le_bytes(caught_up[32 + 34..32 + 36].try_into().unwrap()),
             1440,
+        );
+
+        super::super::run::emit_screen_resize_window_notifications_if_outputs_caught_up(
+            &mut state,
+            Some((3440, 1440)),
+        );
+        assert!(
+            read_all_available(&mut peer).is_empty(),
+            "an unchanged output bbox must not re-emit configure notifications",
         );
     }
 

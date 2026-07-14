@@ -6256,8 +6256,8 @@ pub fn write_render_query_pict_formats_reply(
     argb_visual: ResourceId,
 ) -> io::Result<()> {
     // 5 formats × 28 bytes = 140 bytes
-    // 1 screen: nDepth(4) + fallback(4) + 2 depth sections (8 + 8 each)
-    //   = 40 bytes
+    // 1 screen: 8-byte prelude + 2 depth sections (8-byte header +
+    //   one 8-byte visual-format pair each) = 40 bytes
     // Total body = 180 bytes = 45 × 4-byte units
     let num_formats: u32 = 5;
     let num_screens: u32 = 1;
