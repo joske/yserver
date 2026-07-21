@@ -174,6 +174,8 @@ We run the X.Org X Test Suite (xts5) against `yserver` to gauge protocol complet
 
 Latest pass numbers per scenario live in [`docs/test-status.md`](docs/test-status.md).
 
+Known bugs, limitations, and dev-loop friction are tracked in [`docs/known-issues.md`](docs/known-issues.md).
+
 To run XTS yourself, you need to install the following extra packages:
 ```bash 
 sudo pacman -S --needed autogen automake autoconf make xtrans xterm xorg-xset xorg-fonts-misc xorg-xdpyinfo xorg-bdftopcf xorg-mkfontscale xorg-util-macros
