@@ -119,6 +119,16 @@ pub fn apply_rules_names_change(state: &mut ServerState, backend: &mut dyn Backe
     let xkb_event_base = backend.xkb_info().map_or(0, |(_maj, ev, _err)| ev);
     let count = max_kc.saturating_sub(min_kc).saturating_add(1);
 
+    // A full RMLVO reload replaces the whole key-symbol table in Xorg
+    // (XkbGetKeyboardByName), so any keycodes previously overridden by
+    // `ChangeKeyboardMapping` must NOT keep shadowing the new backend
+    // keymap — otherwise those keycodes stay stuck on the pre-switch
+    // layout forever, while every other key correctly reflects the new
+    // one. Without this, `fetch_merged_keymap` (GetKeyboardMapping)
+    // keeps layering the stale rows on top of the freshly recompiled
+    // keymap for any keycode an app ever remapped.
+    state.keymap_overrides.clear();
+
     // 1. Core MappingNotify(Keyboard) + MappingNotify(Modifier) to ALL
     //    clients — mirrors Xorg's XkbSendLegacyMapNotify on a keymap reload.
     let all: Vec<ClientId> = state.clients.keys().map(|id| ClientId(*id)).collect();
@@ -288,6 +298,32 @@ mod tests {
         assert!(
             state.resources.window_property(ROOT_WINDOW, atom).is_none(),
             "no property published when the backend has no keymap"
+        );
+    }
+
+    #[test]
+    fn apply_rules_names_change_clears_stale_keymap_overrides() {
+        // A client (e.g. xmodmap) had previously overridden keycode 38
+        // via ChangeKeyboardMapping. Model that directly on `keymap_overrides`
+        // rather than going through the request handler — this test only
+        // needs to prove the recompile path clears it.
+        let mut state = ServerState::new();
+        state.keymap_overrides.insert(38, vec![0x0071]); // stale 'q' row
+        assert!(
+            !state.keymap_overrides.is_empty(),
+            "precondition: an override is staged before the layout switch"
+        );
+
+        let mut backend = RecordingBackend::new().with_keymap_rmlvo_result((8, 255));
+
+        apply_rules_names_change(&mut state, &mut backend, b"evdev\0pc105\0us\0dvorak\0\0");
+
+        assert!(
+            state.keymap_overrides.is_empty(),
+            "a full RMLVO reload must drop stale ChangeKeyboardMapping rows, \
+             the way Xorg's XkbGetKeyboardByName replaces the whole key-symbol \
+             table — otherwise keycode 38 stays stuck on the pre-switch layout \
+             forever while every other key correctly reflects the new one"
         );
     }
 

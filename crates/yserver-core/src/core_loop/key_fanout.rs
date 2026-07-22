@@ -12,6 +12,7 @@
 //! mirrors it across clients), so the helper picks the first non-ROOT
 //! focus it sees. When every client is rooted, the event is dropped.
 
+use log::debug;
 use yserver_protocol::x11::{self, ClientId, ResourceId};
 
 use crate::{
@@ -470,6 +471,13 @@ enum KeyRoute {
 /// Apply X11 keyboard routing rules. May activate a passive grab or
 /// auto-release one on the matching key release.
 fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
+    debug!(
+        "key_route keycode={} pressed={} state=0x{:x} active_grab={:?}",
+        event.keycode,
+        event.pressed,
+        event.state,
+        state.active_keyboard_grab.map(|g| (g.owner, g.grab_window))
+    );
     // Active grab in effect.
     if let Some(g) = state.active_keyboard_grab {
         let passive = matches!(g.source, ActiveKeyboardGrabSource::PassiveKey { .. });
@@ -502,6 +510,10 @@ fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
             );
         }
         if passive {
+            debug!(
+                "key_route -> active passive-key grab owner={:?} window={:?}",
+                g.owner, g.grab_window
+            );
             return KeyRoute::PassiveGrabOwner {
                 owner: g.owner,
                 grab_window: g.grab_window,
@@ -517,6 +529,10 @@ fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
         // (xterm secure-keyboard, XTS AllowDeviceEvents iskfrozen
         // probes). Window delivery here silently dropped keys when
         // the grabber had no KeyPressMask on the grab window.
+        debug!(
+            "key_route -> explicit GrabKeyboard owner={:?} window={:?}",
+            g.owner, g.grab_window
+        );
         return KeyRoute::PassiveGrabOwner {
             owner: g.owner,
             grab_window: g.grab_window,
@@ -551,6 +567,10 @@ fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
                     )
                 })
     {
+        debug!(
+            "key_route -> new passive grab match owner={owner:?} window={grab_window:?} \
+             keyboard_mode={keyboard_mode} (0=Sync freeze, 1=Async)"
+        );
         state.active_keyboard_grab = Some(ActiveKeyboardGrab {
             owner,
             grab_window,
@@ -594,8 +614,10 @@ fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
     // Focus None: keys are discarded (only grabs see them) — Xorg
     // DeliverFocusedEvent with focus->win == NoneWin.
     if focus == ResourceId(0) {
+        debug!("key_route -> dropped, no focus and no matching grab");
         return KeyRoute::Drop;
     }
+    debug!("key_route -> focused window {focus:?}, no grab involved");
     KeyRoute::Window(focus)
 }
 
