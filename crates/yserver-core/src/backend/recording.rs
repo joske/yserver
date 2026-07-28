@@ -220,6 +220,15 @@ pub struct RecordingBackend {
     /// without a real keymap; tests that exercise `_XKB_RULES_NAMES`
     /// publishing set it via `with_xkb_rules_names`.
     pub xkb_rules_names: Option<[String; 5]>,
+    /// Return value for `set_keymap_rmlvo`. `None` (the default) models
+    /// a backend without a real keymap (matches the trait default);
+    /// tests that need `apply_rules_names_change` to take its recompile
+    /// branch set it via `with_keymap_rmlvo_result`.
+    pub keymap_rmlvo_result: Option<(u8, u8)>,
+    /// Return value for `xkb_get_kbd_by_name`, seeded via
+    /// `with_kbd_by_name_result`. `None` (the default) matches the trait
+    /// default for backends without a real keymap.
+    pub kbd_by_name_result: Option<(Vec<u8>, Option<crate::backend::XkbNewKeyboardInfo>)>,
     /// Modifier state `(effective, base, latched, locked)` returned by
     /// `current_xkb_mods`. Tests set it to drive `XkbStateNotify` emission.
     pub xkb_mods: (u8, u8, u8, u8),
@@ -270,6 +279,8 @@ impl RecordingBackend {
             warped_to: None,
             gamma: std::cell::RefCell::new(std::collections::HashMap::new()),
             xkb_rules_names: None,
+            keymap_rmlvo_result: None,
+            kbd_by_name_result: None,
             xkb_mods: (0, 0, 0, 0),
             render_return_region: Vec::new(),
             present_source_wait: PresentSourceWait::Ready,
@@ -288,6 +299,28 @@ impl RecordingBackend {
     #[must_use]
     pub fn with_xkb_rules_names(mut self, names: [String; 5]) -> Self {
         self.xkb_rules_names = Some(names);
+        self
+    }
+
+    /// Seed the value `set_keymap_rmlvo` returns, so a test can drive
+    /// `apply_rules_names_change` through its recompile branch without a
+    /// real keymap backend.
+    #[must_use]
+    pub fn with_keymap_rmlvo_result(mut self, result: (u8, u8)) -> Self {
+        self.keymap_rmlvo_result = Some(result);
+        self
+    }
+
+    /// Seed the value `xkb_get_kbd_by_name` returns, so a test can drive
+    /// `handle_xkb_request`'s minor==23 (XkbGetKbdByName) branch through
+    /// its notify-fanout path without a real keymap backend.
+    #[must_use]
+    pub fn with_kbd_by_name_result(
+        mut self,
+        bytes: Vec<u8>,
+        notify: Option<crate::backend::XkbNewKeyboardInfo>,
+    ) -> Self {
+        self.kbd_by_name_result = Some((bytes, notify));
         self
     }
 
@@ -398,6 +431,25 @@ impl Backend for RecordingBackend {
 
     fn current_xkb_rules_names(&self) -> Option<[String; 5]> {
         self.xkb_rules_names.clone()
+    }
+
+    fn set_keymap_rmlvo(
+        &mut self,
+        _rules: &str,
+        _model: &str,
+        _layout: &str,
+        _variant: &str,
+        _options: Option<&str>,
+    ) -> Option<(u8, u8)> {
+        self.keymap_rmlvo_result
+    }
+
+    fn xkb_get_kbd_by_name(
+        &mut self,
+        _body: &[u8],
+        _intern_atom: &mut dyn FnMut(&str) -> u32,
+    ) -> Option<(Vec<u8>, Option<crate::backend::XkbNewKeyboardInfo>)> {
+        self.kbd_by_name_result.clone()
     }
 
     fn composite_opcode(&self) -> Option<u8> {

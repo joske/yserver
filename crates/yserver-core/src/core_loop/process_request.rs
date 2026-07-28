@@ -16947,6 +16947,42 @@ fn handle_xkb_request(
             if let Some(info) = notify {
                 let base = backend.xkb_info().map_or(0, |(_maj, ev, _err)| ev);
                 let all: Vec<ClientId> = state.clients.keys().map(|id| ClientId(*id)).collect();
+                // A full XkbGetKeyboardByName load replaces the whole
+                // key-symbol table in Xorg, so stale ChangeKeyboardMapping
+                // overrides must not keep shadowing it (see the identical
+                // fix + rationale in `apply_rules_names_change`).
+                state.keymap_overrides.clear();
+                // Legacy core MappingNotify(Keyboard) + MappingNotify(Modifier)
+                // to ALL clients, mirroring Xorg's XkbSendLegacyMapNotify
+                // companion to XkbSendNewKeyboardNotify. XKB-unaware clients
+                // (any plain-X11 WM that never calls XkbSelectEvents — e.g.
+                // one that resolves keybinds via XKeysymToKeycode once at
+                // startup) never see XkbNewKeyboardNotify, so without this
+                // they keep grabbing the pre-switch keycodes forever: typing
+                // reflects the new layout (translation is per-keystroke) but
+                // WM keyboard shortcuts stay stuck on the old one, because
+                // nothing ever told the WM to re-resolve keysym→keycode and
+                // re-`GrabKey`. This is the same pair `apply_rules_names_change`
+                // sends for the `_XKB_RULES_NAMES`-ChangeProperty path; real
+                // `setxkbmap` goes through *this* XkbGetKbdByName path instead,
+                // so it needs the same legacy fanout here.
+                let count = info
+                    .max_keycode
+                    .saturating_sub(info.min_keycode)
+                    .saturating_add(1);
+                let _dropped = fanout_event_to_clients(state, &all, |buf, seq, order| {
+                    let _ = x11::write_mapping_notify_event(
+                        buf,
+                        order,
+                        seq,
+                        1,
+                        info.min_keycode,
+                        count,
+                    );
+                });
+                let _dropped = fanout_event_to_clients(state, &all, |buf, seq, order| {
+                    let _ = x11::write_mapping_notify_event(buf, order, seq, 0, 0, 0);
+                });
                 let _dropped = fanout_event_to_clients(state, &all, |buf, seq, order| {
                     let _ = x11::write_xkb_new_keyboard_notify(
                         buf,
@@ -53750,5 +53786,76 @@ mod tests {
         // Stripping AsyncMayTear must NOT strip Suboptimal (0x8) or Async (0x1).
         let opts = 0x1 | 0x8 | 0x10;
         assert_eq!(opts & !0x10u32, 0x1 | 0x8);
+    }
+
+    #[test]
+    fn xkb_get_kbd_by_name_also_broadcasts_legacy_mapping_notify() {
+        // Real `setxkbmap` loads a layout via XkbGetKeyboardByName (minor
+        // 23), not by writing `_XKB_RULES_NAMES`. A plain-X11 client (any
+        // WM that never calls XkbSelectEvents and only understands core
+        // events — e.g. one resolving keybinds via XKeysymToKeycode once
+        // at startup) relies on the legacy MappingNotify event to know
+        // when to re-resolve its keysym-based key grabs. Without it, the
+        // WM's shortcuts stay bound to the pre-switch keycodes forever
+        // even though per-keystroke translation (and thus typing) already
+        // reflects the new layout.
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        // Stale ChangeKeyboardMapping row from before the switch — must
+        // not keep shadowing the freshly loaded keymap either.
+        state.keymap_overrides.insert(38, vec![0x0071]);
+
+        let mut reply = vec![0u8; 32];
+        reply[0] = 1; // X_Reply
+        let mut backend = RecordingBackend::new().with_kbd_by_name_result(
+            reply,
+            Some(crate::backend::XkbNewKeyboardInfo {
+                min_keycode: 8,
+                max_keycode: 255,
+                old_min_keycode: 8,
+                old_max_keycode: 255,
+                changed: 0x0001,
+            }),
+        );
+
+        handle_xkb_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 136,
+                data: 23,
+                length_units: 2,
+            },
+            &[],
+        )
+        .expect("XkbGetKbdByName");
+
+        assert!(
+            state.keymap_overrides.is_empty(),
+            "a full XkbGetKeyboardByName load must drop stale ChangeKeyboardMapping rows too"
+        );
+
+        let bytes = read_all_available(&mut peer);
+        let mapping_notify_count = bytes
+            .chunks(32)
+            .filter(
+                |chunk| chunk.len() == 32 && chunk[0] == 34, /* MappingNotify */
+            )
+            .count();
+        assert!(
+            mapping_notify_count >= 2,
+            "expected legacy MappingNotify(Keyboard) + MappingNotify(Modifier) \
+             alongside XkbNewKeyboardNotify, got {mapping_notify_count} in {bytes:02x?}"
+        );
+        let keyboard_mapping_notify = bytes
+            .chunks(32)
+            .find(|chunk| chunk.len() == 32 && chunk[0] == 34 && chunk[4] == 1);
+        assert!(
+            keyboard_mapping_notify.is_some(),
+            "expected a MappingNotify with request=Keyboard(1): {bytes:02x?}"
+        );
     }
 }
