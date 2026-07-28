@@ -423,6 +423,8 @@ pub fn process_request(
         150 => handle_screen_saver_request(state, backend, client_id, sequence, header, body),
         // ── XC-MISC extension dispatcher ──
         152 => handle_xcmisc_request(state, client_id, sequence, header, body),
+        // ── XFree86-VidModeExtension dispatcher ──
+        153 => handle_xf86vidmode_request(state, client_id, sequence, header, body),
         opcode => {
             debug!(
                 "client {} #{} unknown opcode {} ({} bytes) -> BadRequest",
@@ -11059,6 +11061,197 @@ fn handle_x_resource_request(
         return Ok(RequestOutcome::Handled);
     };
     Ok(write_to_client(client, client_id, &reply))
+}
+
+fn current_vidmode_mode_line(
+    state: &ServerState,
+) -> Option<yserver_protocol::x11::xf86vidmode::ModeLine> {
+    use yserver_protocol::x11::xf86vidmode::ModeLine;
+
+    // Xwayland's VidMode shim uses its fixed output, or otherwise the first
+    // output. Yserver's configured primary is the closest equivalent; if it
+    // is off, fall back to the first enabled output.
+    let output = state
+        .randr
+        .outputs
+        .iter()
+        .find(|output| {
+            output.output_id == state.randr.primary_output
+                && output.connected
+                && output.mode_id != 0
+        })
+        .or_else(|| {
+            state
+                .randr
+                .outputs
+                .iter()
+                .find(|output| output.connected && output.mode_id != 0)
+        })?;
+
+    if let Some(timing) = output.timing {
+        return Some(ModeLine {
+            dot_clock: timing.clock_khz,
+            hdisplay: output.width,
+            hsync_start: timing.hsync_start,
+            hsync_end: timing.hsync_end,
+            htotal: timing.htotal,
+            hskew: 0,
+            vdisplay: output.height,
+            vsync_start: timing.vsync_start,
+            vsync_end: timing.vsync_end,
+            vtotal: timing.vtotal,
+            flags: timing.mode_flags,
+        });
+    }
+
+    // Keep the no-kernel-timing fallback consistent with RandrState's
+    // synthetic ModeInfo. VidMode carries the pixel clock in whole kHz, so
+    // round the exact synthetic Hz value to the nearest representable kHz.
+    if output.vrefresh == 0 {
+        return None;
+    }
+    let htotal = output.width.saturating_add(264);
+    let vtotal = output.height.saturating_add(28);
+    let clock_hz = u64::from(htotal) * u64::from(vtotal) * u64::from(output.vrefresh);
+    let dot_clock = u32::try_from((clock_hz + 500) / 1000).unwrap_or(u32::MAX);
+    Some(ModeLine {
+        dot_clock,
+        hdisplay: output.width,
+        hsync_start: output.width.saturating_add(40),
+        hsync_end: output.width.saturating_add(168),
+        htotal,
+        hskew: 0,
+        vdisplay: output.height,
+        vsync_start: output.height.saturating_add(1),
+        vsync_end: output.height.saturating_add(4),
+        vtotal,
+        flags: 0,
+    })
+}
+
+fn handle_xf86vidmode_request(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    header: RequestHeader,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    use crate::nested::XF86VIDMODE_MAJOR_OPCODE;
+    use yserver_protocol::x11::{ClientByteOrder, xf86vidmode as x11vm};
+
+    let byte_order = state
+        .clients
+        .get(&client_id.0)
+        .map_or(ClientByteOrder::LittleEndian, |client| client.byte_order);
+
+    match header.data {
+        x11vm::QUERY_VERSION => {
+            if !body.is_empty() {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(header.data),
+                    XF86VIDMODE_MAJOR_OPCODE,
+                );
+            }
+            let reply = x11vm::encode_query_version_reply(byte_order, sequence);
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            return Ok(write_to_client(client, client_id, &reply));
+        }
+        x11vm::SET_CLIENT_VERSION => {
+            let Some(version) = x11vm::parse_client_version(body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(header.data),
+                    XF86VIDMODE_MAJOR_OPCODE,
+                );
+            };
+            state
+                .vidmode_client_versions
+                .insert(client_id, (version.major, version.minor));
+            debug!(
+                "client {} #{} XFree86-VidMode::SetClientVersion {}.{}",
+                client_id.0, sequence.0, version.major, version.minor
+            );
+        }
+        x11vm::GET_MODE_LINE => {
+            let Some(screen) = x11vm::parse_screen(body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(header.data),
+                    XF86VIDMODE_MAJOR_OPCODE,
+                );
+            };
+            if screen != 0 {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    u32::from(screen),
+                    u16::from(header.data),
+                    XF86VIDMODE_MAJOR_OPCODE,
+                );
+            }
+            let Some(mode) = current_vidmode_mode_line(state) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_VALUE,
+                    u32::from(screen),
+                    u16::from(header.data),
+                    XF86VIDMODE_MAJOR_OPCODE,
+                );
+            };
+            let version_2 = state
+                .vidmode_client_versions
+                .get(&client_id)
+                .is_some_and(|(major, _)| *major >= 2);
+            let reply = x11vm::encode_get_mode_line_reply(byte_order, sequence, mode, version_2);
+            debug!(
+                "client {} #{} XFree86-VidMode::GetModeLine \
+                 {}x{} clock={}kHz totals={}x{} flags=0x{:x}",
+                client_id.0,
+                sequence.0,
+                mode.hdisplay,
+                mode.vdisplay,
+                mode.dot_clock,
+                mode.htotal,
+                mode.vtotal,
+                mode.flags
+            );
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            return Ok(write_to_client(client, client_id, &reply));
+        }
+        _ => {
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_REQUEST,
+                0,
+                u16::from(header.data),
+                XF86VIDMODE_MAJOR_OPCODE,
+            );
+        }
+    }
+    Ok(RequestOutcome::Handled)
 }
 
 fn handle_glx_request(
@@ -27357,6 +27550,17 @@ mod tests {
         out
     }
 
+    fn read_all_or_buffered(
+        state: &mut ServerState,
+        client_id: u32,
+        peer: &mut UnixStream,
+    ) -> Vec<u8> {
+        let mut out = read_all_available(peer);
+        let client = state.clients.get_mut(&client_id).expect("test client");
+        out.extend(client.outbound.drain(..));
+        out
+    }
+
     fn poly_fill_rectangle_body(drawable: u32, gc: u32) -> Vec<u8> {
         let mut body = Vec::with_capacity(16);
         body.extend_from_slice(&drawable.to_le_bytes());
@@ -34984,6 +35188,7 @@ mod tests {
             (150, "MIT-SCREEN-SAVER"),
             (151, "XINERAMA"),
             (152, "XC-MISC"),
+            (153, "XFree86-VidModeExtension"),
         ];
 
         for (opcode, name) in extensions {
@@ -35023,6 +35228,195 @@ mod tests {
             );
             assert_eq!(error[10], opcode, "{name}: major opcode");
         }
+    }
+
+    #[test]
+    fn xf86vidmode_v2_mode_line_round_trips_current_randr_timing() {
+        use crate::randr::{ModeTiming, RandrOutput, RandrState};
+        use yserver_protocol::x11::xf86vidmode as x11vm;
+
+        let mut state = ServerState::new();
+        state.randr = RandrState::from_outputs(
+            1,
+            vec![RandrOutput {
+                name: "DP-1".to_string(),
+                output_id: 1,
+                crtc_id: 2,
+                mode_id: 3,
+                connected: true,
+                x: 0,
+                y: 0,
+                width: 2560,
+                height: 1440,
+                vrefresh: 60,
+                timing: Some(ModeTiming {
+                    clock_khz: 241_500,
+                    hsync_start: 2608,
+                    hsync_end: 2640,
+                    htotal: 2720,
+                    vsync_start: 1443,
+                    vsync_end: 1448,
+                    vtotal: 1481,
+                    mode_flags: 5,
+                }),
+                mm_width: 600,
+                mm_height: 340,
+                mode_ids: vec![3],
+                num_preferred: 1,
+            }],
+        );
+        let expected = current_vidmode_mode_line(&state).expect("active RandR mode");
+        assert_eq!(
+            expected,
+            x11vm::ModeLine {
+                dot_clock: 241_500,
+                hdisplay: 2560,
+                hsync_start: 2608,
+                hsync_end: 2640,
+                htotal: 2720,
+                hskew: 0,
+                vdisplay: 1440,
+                vsync_start: 1443,
+                vsync_end: 1448,
+                vtotal: 1481,
+                flags: 5,
+            }
+        );
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: crate::nested::XF86VIDMODE_MAJOR_OPCODE,
+                data: x11vm::QUERY_VERSION,
+                length_units: 1,
+            },
+            &[],
+            None,
+        )
+        .expect("QueryVersion");
+        let version = read_all_or_buffered(&mut state, 1, &mut peer);
+        assert_eq!(version.len(), 32);
+        assert_eq!(&version[8..12], &[2, 0, 2, 0]);
+
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(2),
+            RequestHeader {
+                opcode: crate::nested::XF86VIDMODE_MAJOR_OPCODE,
+                data: x11vm::SET_CLIENT_VERSION,
+                length_units: 2,
+            },
+            &[2, 0, 2, 0],
+            None,
+        )
+        .expect("SetClientVersion");
+        assert!(read_all_or_buffered(&mut state, 1, &mut peer).is_empty());
+        assert_eq!(
+            state.vidmode_client_versions.get(&ClientId(1)),
+            Some(&(2, 2))
+        );
+
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(3),
+            RequestHeader {
+                opcode: crate::nested::XF86VIDMODE_MAJOR_OPCODE,
+                data: x11vm::GET_MODE_LINE,
+                length_units: 2,
+            },
+            &[0; 4],
+            None,
+        )
+        .expect("GetModeLine");
+        let mode = read_all_or_buffered(&mut state, 1, &mut peer);
+        assert_eq!(mode.len(), 52);
+        assert_eq!(u32::from_le_bytes(mode[4..8].try_into().unwrap()), 5);
+        assert_eq!(
+            u32::from_le_bytes(mode[8..12].try_into().unwrap()),
+            expected.dot_clock
+        );
+        assert_eq!(
+            u16::from_le_bytes(mode[12..14].try_into().unwrap()),
+            expected.hdisplay
+        );
+        assert_eq!(
+            u16::from_le_bytes(mode[18..20].try_into().unwrap()),
+            expected.htotal
+        );
+        assert_eq!(
+            u16::from_le_bytes(mode[22..24].try_into().unwrap()),
+            expected.vdisplay
+        );
+        assert_eq!(
+            u16::from_le_bytes(mode[28..30].try_into().unwrap()),
+            expected.vtotal
+        );
+        assert_eq!(
+            u32::from_le_bytes(mode[32..36].try_into().unwrap()),
+            expected.flags
+        );
+        assert_eq!(&mode[36..52], &[0; 16]);
+    }
+
+    #[test]
+    fn xf86vidmode_defaults_to_legacy_reply_and_rejects_unknown_screen() {
+        use yserver_protocol::x11::xf86vidmode as x11vm;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: crate::nested::XF86VIDMODE_MAJOR_OPCODE,
+                data: x11vm::GET_MODE_LINE,
+                length_units: 2,
+            },
+            &[0; 4],
+            None,
+        )
+        .expect("legacy GetModeLine");
+        let legacy = read_all_or_buffered(&mut state, 1, &mut peer);
+        assert_eq!(legacy.len(), 36);
+        assert_eq!(u32::from_le_bytes(legacy[4..8].try_into().unwrap()), 1);
+
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(2),
+            RequestHeader {
+                opcode: crate::nested::XF86VIDMODE_MAJOR_OPCODE,
+                data: x11vm::GET_MODE_LINE,
+                length_units: 2,
+            },
+            &[1, 0, 0, 0],
+            None,
+        )
+        .expect("bad-screen GetModeLine");
+        let error = read_all_or_buffered(&mut state, 1, &mut peer);
+        assert_eq!(error.len(), 32);
+        assert_eq!(error[0], 0);
+        assert_eq!(error[1], x11::error::BAD_VALUE);
+        assert_eq!(u32::from_le_bytes(error[4..8].try_into().unwrap()), 1);
+        assert_eq!(
+            u16::from_le_bytes(error[8..10].try_into().unwrap()),
+            u16::from(x11vm::GET_MODE_LINE)
+        );
+        assert_eq!(error[10], crate::nested::XF86VIDMODE_MAJOR_OPCODE);
     }
 
     // ---- L2 plan B.1: COMPOSITE redirect dispatch policy --------

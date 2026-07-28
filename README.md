@@ -40,8 +40,18 @@ We support the following extensions:
 - XINERAMA
 - XInputExtension
 - XC-MISC
+- XFree86-VidModeExtension
 - XKEYBOARD
 - XTEST
+
+### GLX_OML_sync_control
+
+Mesa implements `glXGetMscRateOML()` on the client side by reading the current
+mode through `XFree86-VidModeExtension`. Yserver implements the read-only
+`QueryVersion` and `GetModeLine` requests, plus `SetClientVersion`, with the
+Xorg wire layouts and real DRM/RANDR mode timings. This lets Mesa and
+ANGLE-based Flatpak clients derive the display MSC rate without exposing the
+legacy mode-setting operations of VidMode.
 
 ### GLX_EXT_texture_from_pixmap
 

@@ -331,6 +331,7 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
     state
         .mit_shm_segments
         .retain(|_, seg| seg.owner != client_id);
+    state.vidmode_client_versions.remove(&client_id);
     state
         .randr_select_masks
         .retain(|(owner, window), _| *owner != client_id.0 && !dead_windows.contains(window));

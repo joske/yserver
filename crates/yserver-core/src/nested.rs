@@ -29,7 +29,8 @@ use crate::{
 // Current allocation (error counts in parens):
 //   RANDR 147 (5) · RENDER 152 (5) · XInput 157 (5) · [host XKB 162 (1)]
 //   · XFIXES 163 (1) · SYNC 164 (3) · DAMAGE 167 (1) · MIT-SHM 168 (1)
-//   · GLX 169 (13, →181). SHAPE/Composite/Present/DPMS/screensaver: 0.
+//   · GLX 169 (13, →181) · XFree86-VidMode 182 (7, →188).
+//   SHAPE/Composite/Present/DPMS/screensaver: 0.
 // Do NOT pack these 1 apart — a multi-error extension (RENDER=5, GLX=13)
 // would then overlap its neighbours.
 const RANDR_MAJOR_OPCODE: u8 = 128;
@@ -110,6 +111,8 @@ pub(crate) const GLX_FIRST_EVENT: u8 = 95; // matches Xorg: Pbuffer=95, BufferSw
 pub(crate) const GLX_FIRST_ERROR: u8 = 169; // 13 errors (169-181); routed past host XKB error base 162
 
 pub(crate) const X_RESOURCE_MAJOR_OPCODE: u8 = 149;
+pub(crate) const XF86VIDMODE_MAJOR_OPCODE: u8 = 153;
+const XF86VIDMODE_FIRST_ERROR: u8 = 182;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExtensionAvailability {
@@ -329,6 +332,15 @@ pub(crate) const EXTENSIONS: &[ExtensionMetadata] = &[
         first_event: 0,
         event_count: 0,
         first_error: 0,
+        availability: ExtensionAvailability::Always,
+        unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
+    },
+    ExtensionMetadata {
+        name: "XFree86-VidModeExtension",
+        major_opcode: XF86VIDMODE_MAJOR_OPCODE,
+        first_event: 0,
+        event_count: 0,
+        first_error: XF86VIDMODE_FIRST_ERROR,
         availability: ExtensionAvailability::Always,
         unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
     },
@@ -1035,6 +1047,17 @@ mod tests {
         assert_eq!(ext.major_opcode, 151);
         assert_eq!(ext.first_event, 0);
         assert_eq!(ext.first_error, 0);
+    }
+
+    #[test]
+    fn xf86vidmode_is_advertised_with_xorg_error_range() {
+        let ext = EXTENSIONS
+            .iter()
+            .find(|ext| ext.name == "XFree86-VidModeExtension")
+            .expect("XFree86-VidModeExtension in EXTENSIONS");
+        assert_eq!(ext.major_opcode, 153);
+        assert_eq!(ext.first_event, 0);
+        assert_eq!(ext.first_error, 182);
     }
 
     mod render {

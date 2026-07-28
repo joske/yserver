@@ -73,6 +73,22 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   rather than completion-clock provenance, as the playback cause on
   bee/Plasma. Design:
   [`2026-07-28-present-completion-clock-provenance-design.md`](superpowers/specs/2026-07-28-present-completion-clock-provenance-design.md).
+- **2026-07-28 Flatpak/ANGLE `GLX_OML_sync_control`:** session logs showed
+  `eglGetMscRateANGLE` failing specifically because Mesa's
+  `glXGetMscRateOML()` could not query the missing
+  `XFree86-VidModeExtension`. Mesa performs this operation client-side rather
+  than through a GLX vendor-private request. Yserver now advertises a
+  read-only, Xorg-compatible VidMode 2.2 surface: `QueryVersion`,
+  `GetModeLine`, and `SetClientVersion`, including legacy/v2 reply layouts,
+  swapped-client request handling, screen validation, and per-client version
+  lifetime. `GetModeLine` returns the selected active output's real DRM/RANDR
+  pixel clock, totals, sync ranges, and flags, with the existing nested-mode
+  synthesis as fallback. Protocol encoders and end-to-end dispatcher
+  regressions cover both reply layouts and errors; legacy mode-setting
+  requests remain unsupported and return `BadRequest`.
+  Live validation against a freshly built ynest confirmed the advertised
+  opcode/error base, a valid `xvidtune -show` modeline, and a successful Mesa
+  `glXGetMscRateOML()` call returning the derived refresh fraction.
 - **2026-07-26 protocol silent-success audit:** the first two phases and the
   core-request classification portion of Phase 3 are complete on
   `quality/protocol-stub-audit`. Reserved/unknown major opcodes and unknown

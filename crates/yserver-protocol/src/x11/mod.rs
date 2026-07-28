@@ -27,6 +27,7 @@ pub mod shape;
 pub mod sync;
 pub mod wire_swap;
 pub mod x_resource;
+pub mod xf86vidmode;
 pub mod xfixes;
 pub mod xinerama;
 pub mod xtest;
