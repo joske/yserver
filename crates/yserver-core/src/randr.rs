@@ -95,8 +95,15 @@ pub struct ModeTiming {
     pub vsync_start: u16,
     pub vsync_end: u16,
     pub vtotal: u16,
-    /// RANDR mode flags (already mapped from DRM sync/interlace bits;
-    /// the low 7 bits of `DRM_MODE_FLAG_*` coincide with `RR_*`).
+    /// RANDR mode flags. The backend masks the kernel value to the low 6
+    /// bits (`& 0x3F`), where `DRM_MODE_FLAG_*`, `RR_*` and VidMode's
+    /// `V_*` all agree: P/N HSync, P/N VSync, Interlace, DoubleScan.
+    ///
+    /// The three namespaces diverge above bit 10 (`V_PIXMUX` is 0x1000
+    /// while `RR_PixelMultiplex` is 0x800), so widening that mask would
+    /// need a real DRM→`V_*` mapping before VidMode's `GetModeLine` may
+    /// keep forwarding this field verbatim. Mesa reads `V_INTERLACE`
+    /// (0x10) and `V_DBLSCAN` (0x20) from it to scale the MSC rate.
     pub mode_flags: u32,
 }
 
@@ -109,6 +116,99 @@ pub struct RandrMode {
     pub vrefresh: u32,
     /// Real kernel timing; `None` => synthesise (see [`ModeTiming`]).
     pub timing: Option<ModeTiming>,
+}
+
+/// A mode's timing after the `Option<ModeTiming>` fallback has been
+/// resolved: either the real kernel numbers or the historical synthesis.
+///
+/// Single source of truth for both consumers — RANDR `GetScreenResources`
+/// (`ModeInfo`) and XFree86-VidMode `GetModeLine`/`GetAllModeLines`. They
+/// describe the same hardware mode, so they must never disagree; deriving
+/// blanking twice is how they would drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectiveTiming {
+    /// Pixel clock in **Hz**. RANDR `ModeInfo.dot_clock` reports this
+    /// verbatim; VidMode carries whole kHz and rounds it.
+    pub dot_clock_hz: u32,
+    pub hsync_start: u16,
+    pub hsync_end: u16,
+    pub htotal: u16,
+    /// Always 0: neither the kernel mode nor the synthesis carries a sync
+    /// skew, and both replies have historically hardcoded it here.
+    pub hskew: u16,
+    pub vsync_start: u16,
+    pub vsync_end: u16,
+    pub vtotal: u16,
+    pub mode_flags: u32,
+}
+
+impl EffectiveTiming {
+    /// Resolve `timing`, falling back to the synthetic blanking.
+    ///
+    /// Real timing (Xorg `drmmode_ConvertFromKMode` + `xf86RandR12`):
+    /// `dot_clock = Clock*1000`, blanking verbatim. Clients compute
+    /// `refresh = dot_clock / (htotal*vtotal)`, reproducing the exact
+    /// fractional rate (e.g. 59.95) the hardware mode carries and that
+    /// GNOME/MATE stored in `monitors.xml`.
+    ///
+    /// Fallback (nested/virtio: no real timing). The synthetic blanking is
+    /// kept consistent with `dot_clock` so that same formula back-computes
+    /// to exactly the integer `vrefresh`. (Using `width*height` instead
+    /// reported ≈ 51–53 Hz.)
+    #[must_use]
+    pub fn resolve(width: u16, height: u16, vrefresh: u32, timing: Option<ModeTiming>) -> Self {
+        if let Some(t) = timing {
+            return Self {
+                dot_clock_hz: t.clock_khz.saturating_mul(1000),
+                hsync_start: t.hsync_start,
+                hsync_end: t.hsync_end,
+                htotal: t.htotal,
+                hskew: 0,
+                vsync_start: t.vsync_start,
+                vsync_end: t.vsync_end,
+                vtotal: t.vtotal,
+                mode_flags: t.mode_flags,
+            };
+        }
+        let htotal = width.saturating_add(264);
+        let vtotal = height.saturating_add(28);
+        // u64 intermediate: 8K@240 overflows a u32 product.
+        let dot_clock_hz = u64::from(htotal) * u64::from(vtotal) * u64::from(vrefresh);
+        Self {
+            dot_clock_hz: u32::try_from(dot_clock_hz).unwrap_or(u32::MAX),
+            hsync_start: width.saturating_add(40),
+            hsync_end: width.saturating_add(168),
+            htotal,
+            hskew: 0,
+            vsync_start: height.saturating_add(1),
+            vsync_end: height.saturating_add(4),
+            vtotal,
+            mode_flags: 0,
+        }
+    }
+
+    /// Pixel clock rounded to whole kHz, the unit
+    /// `xXF86VidModeGetModeLineReply` carries.
+    #[must_use]
+    pub fn dot_clock_khz(&self) -> u32 {
+        self.dot_clock_hz.saturating_add(500) / 1000
+    }
+}
+
+impl RandrMode {
+    /// This mode's timing, real or synthesised.
+    #[must_use]
+    pub fn effective_timing(&self) -> EffectiveTiming {
+        EffectiveTiming::resolve(self.width, self.height, self.vrefresh, self.timing)
+    }
+}
+
+impl RandrOutput {
+    /// The timing of this output's *current* mode, real or synthesised.
+    #[must_use]
+    pub fn effective_timing(&self) -> EffectiveTiming {
+        EffectiveTiming::resolve(self.width, self.height, self.vrefresh, self.timing)
+    }
 }
 
 #[derive(Debug)]
@@ -320,52 +420,23 @@ impl RandrState {
             let name = format!("{}x{}", m.width, m.height).into_bytes();
             #[allow(clippy::cast_possible_truncation)]
             let name_len = name.len() as u16;
-            let info = if let Some(t) = m.timing {
-                // Real kernel timing (Xorg drmmode_ConvertFromKMode +
-                // xf86RandR12): dot_clock = Clock*1000, blanking verbatim.
-                // Clients compute refresh = dot_clock / (htotal*vtotal),
-                // reproducing the exact fractional rate (e.g. 59.95) the
-                // hardware mode carries and GNOME/MATE stored.
-                proto::ModeInfo {
-                    id: m.mode_id,
-                    width: m.width,
-                    height: m.height,
-                    dot_clock: t.clock_khz.saturating_mul(1000),
-                    hsync_start: t.hsync_start,
-                    hsync_end: t.hsync_end,
-                    htotal: t.htotal,
-                    hskew: 0,
-                    vsync_start: t.vsync_start,
-                    vsync_end: t.vsync_end,
-                    vtotal: t.vtotal,
-                    name_len,
-                    mode_flags: t.mode_flags,
-                }
-            } else {
-                // Fallback (nested/virtio: no real timing). Synthetic
-                // blanking kept consistent with dot_clock so the same
-                // formula back-computes to exactly the integer `vrefresh`.
-                // (Using width*height instead reported ≈ 51–53 Hz.)
-                let htotal = m.width.saturating_add(264);
-                let vtotal = m.height.saturating_add(28);
-                let dot_clock = u32::from(htotal) * u32::from(vtotal) * m.vrefresh;
-                proto::ModeInfo {
-                    id: m.mode_id,
-                    width: m.width,
-                    height: m.height,
-                    dot_clock,
-                    hsync_start: m.width + 40,
-                    hsync_end: m.width + 168,
-                    htotal,
-                    hskew: 0,
-                    vsync_start: m.height + 1,
-                    vsync_end: m.height + 4,
-                    vtotal,
-                    name_len,
-                    mode_flags: 0,
-                }
-            };
-            mode_infos.push(info);
+            // Shared with VidMode's GetModeLine — see `EffectiveTiming`.
+            let t = m.effective_timing();
+            mode_infos.push(proto::ModeInfo {
+                id: m.mode_id,
+                width: m.width,
+                height: m.height,
+                dot_clock: t.dot_clock_hz,
+                hsync_start: t.hsync_start,
+                hsync_end: t.hsync_end,
+                htotal: t.htotal,
+                hskew: t.hskew,
+                vsync_start: t.vsync_start,
+                vsync_end: t.vsync_end,
+                vtotal: t.vtotal,
+                name_len,
+                mode_flags: t.mode_flags,
+            });
             mode_names.extend_from_slice(&name);
         }
         proto::ScreenResources {
@@ -1176,6 +1247,14 @@ mod tests {
         let mi = res.modes.iter().find(|m| m.id == 7).expect("mode 7");
         let refresh = mi.dot_clock / (u32::from(mi.htotal) * u32::from(mi.vtotal));
         assert_eq!(refresh, 60, "xrandr-formula refresh must equal vrefresh");
+    }
+
+    #[test]
+    fn effective_timing_rounds_saturated_dot_clock_without_overflow() {
+        let timing = EffectiveTiming::resolve(u16::MAX, u16::MAX, u32::MAX, None);
+
+        assert_eq!(timing.dot_clock_hz, u32::MAX);
+        assert_eq!(timing.dot_clock_khz(), 4_294_967);
     }
 
     #[test]

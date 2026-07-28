@@ -83,9 +83,20 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   swapped-client request handling, screen validation, and per-client version
   lifetime. `GetModeLine` returns the selected active output's real DRM/RANDR
   pixel clock, totals, sync ranges, and flags, with the existing nested-mode
-  synthesis as fallback. Protocol encoders and end-to-end dispatcher
-  regressions cover both reply layouts and errors; legacy mode-setting
-  requests remain unsupported and return `BadRequest`.
+  synthesis as fallback. Because advertising the extension makes non-Mesa
+  clients take the VidMode path, the read-only stubs `GetAllModeLines` (the
+  single active mode), `GetGammaRampSize` (0) and `GetPermissions`
+  (`XF86VM_READ_PERMISSION` only) are answered as well, so such a client gets
+  an honest "no" instead of a `BadRequest` it never expected. Every other
+  minor — mode setting, gamma, viewport and the remaining monitor/dot-clock
+  queries — stays unimplemented and returns `BadRequest`, which a regression
+  asserts opcode by opcode.
+  RANDR's `ModeInfo` and VidMode's mode line now resolve their blanking
+  through one shared `EffectiveTiming` helper, so the two extensions cannot
+  drift into describing the same hardware mode differently. Protocol encoders
+  and end-to-end dispatcher regressions cover both reply layouts, the
+  `BadLength`/`BadValue`/`BadRequest` paths, big-endian clients, and
+  per-client version cleanup on disconnect.
   Live validation against a freshly built ynest confirmed the advertised
   opcode/error base, a valid `xvidtune -show` modeline, and a successful Mesa
   `glXGetMscRateOML()` call returning the derived refresh fraction.

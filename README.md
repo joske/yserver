@@ -53,6 +53,14 @@ Xorg wire layouts and real DRM/RANDR mode timings. This lets Mesa and
 ANGLE-based Flatpak clients derive the display MSC rate without exposing the
 legacy mode-setting operations of VidMode.
 
+`GetAllModeLines`, `GetGammaRampSize` and `GetPermissions` are answered too, so
+a client that probes VidMode for something other than the MSC rate gets a
+truthful read-only picture — one mode, no gamma ramp, `XF86VM_READ_PERMISSION`
+without write — rather than an unexpected `BadRequest` from an extension it
+just saw advertised. Everything else — mode setting, gamma, viewport and the
+remaining monitor queries — is deliberately not implemented and returns
+`BadRequest`; RANDR is the supported way to change modes.
+
 ### GLX_EXT_texture_from_pixmap
 
 Implemented and tested on AMD, intel, Asahi and Qualcomm. It can NOT (read: NEVER) work on nvidia proprietary driver, and on

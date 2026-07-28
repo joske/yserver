@@ -172,12 +172,18 @@ const fn xf86vidmode_request_swap_table(minor: u8) -> Option<&'static [FieldEntr
     use FieldEntry::Fixed;
     use FieldKind::U16;
 
+    // `screen(u16) + pad(u16)`, shared by GetModeLine, GetAllModeLines,
+    // GetGammaRampSize and GetPermissions.
+    const SCREEN: &[FieldEntry] = &[Fixed {
+        offset: 0,
+        kind: U16,
+    }];
+
     Some(match minor {
-        0 => &[],
-        1 => &[Fixed {
-            offset: 0,
-            kind: U16,
-        }],
+        // QueryVersion (0) has an empty body; every unimplemented minor is
+        // rejected before its body is read. Both are left to the `None`
+        // no-op arm.
+        1 | 6 | 19 | 20 => SCREEN,
         14 => &[
             Fixed {
                 offset: 0,
@@ -1028,6 +1034,24 @@ mod tests {
         let mut version = [0, 2, 0, 1];
         swap_request_body(153, 14, ClientByteOrder::BigEndian, &mut version);
         assert_eq!(version, [2, 0, 1, 0]);
+    }
+
+    #[test]
+    fn every_screen_taking_xf86vidmode_request_swaps_its_screen_field() {
+        // GetAllModeLines, GetGammaRampSize, GetPermissions share
+        // GetModeLine's `screen(u16) + pad(u16)` body.
+        for minor in [1, 6, 19, 20] {
+            let mut body = [0x12, 0x34, 0, 0];
+            swap_request_body(153, minor, ClientByteOrder::BigEndian, &mut body);
+            assert_eq!(body, [0x34, 0x12, 0, 0], "minor {minor}");
+        }
+    }
+
+    #[test]
+    fn xf86vidmode_little_endian_client_body_is_untouched() {
+        let mut body = [0x12, 0x34, 0, 0];
+        swap_request_body(153, 1, ClientByteOrder::LittleEndian, &mut body);
+        assert_eq!(body, [0x12, 0x34, 0, 0]);
     }
 
     #[test]
