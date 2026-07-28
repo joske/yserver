@@ -2299,6 +2299,9 @@ fn build_scene(
             i32::MIN / 2,
             i32::MAX / 2,
             i32::MAX / 2,
+            // The root is never shaped, so a top-level starts with no
+            // inherited Bounding region.
+            None,
         );
     }
     log::trace!(
@@ -2389,6 +2392,120 @@ fn build_scene(
     }
 }
 
+/// Return the exclusive end of the YX band starting at `start`.
+///
+/// KMS canonicalizes SHAPE regions when it stores them, and intersections
+/// produced below preserve that representation: rectangles are ordered by
+/// `(y0, y1, x0)`, rectangles in one band share their Y interval, and their
+/// X spans neither overlap nor touch.
+fn abs_region_band_end(region: &[[i32; 4]], start: usize) -> usize {
+    let y0 = region[start][1];
+    let y1 = region[start][3];
+    let mut end = start + 1;
+    while end < region.len() && region[end][1] == y0 && region[end][3] == y1 {
+        end += 1;
+    }
+    end
+}
+
+/// Coalesce a newly appended band vertically with the previous band when
+/// their X spans are identical and their Y intervals touch.
+fn coalesce_abs_band(
+    out: &mut Vec<[i32; 4]>,
+    band_start: usize,
+    previous_band_start: &mut Option<usize>,
+) {
+    if band_start == out.len() {
+        return;
+    }
+    if let Some(previous_start) = *previous_band_start {
+        let previous_len = band_start - previous_start;
+        let current_len = out.len() - band_start;
+        let bands_touch = out[previous_start][3] == out[band_start][1];
+        let same_x_spans = previous_len == current_len
+            && (0..previous_len).all(|offset| {
+                out[previous_start + offset][0] == out[band_start + offset][0]
+                    && out[previous_start + offset][2] == out[band_start + offset][2]
+            });
+        if bands_touch && same_x_spans {
+            let new_y1 = out[band_start][3];
+            for rect in &mut out[previous_start..band_start] {
+                rect[3] = new_y1;
+            }
+            out.truncate(band_start);
+            return;
+        }
+    }
+    *previous_band_start = Some(band_start);
+}
+
+/// Exact intersection of two canonical YX-banded regions, each a list of
+/// absolute half-open `[x0, y0, x1, y1]` rectangles.
+///
+/// The sweep only compares horizontally within vertically-overlapping bands
+/// and preserves canonical ordering/coalescing in the output. It deliberately
+/// has no rectangle cap or bounding-box fallback: a legitimate exact region
+/// can contain the Cartesian product of the input rectangle counts (vertical
+/// stripes intersecting horizontal stripes), and replacing that output with
+/// its extents violates SHAPE by painting holes.
+fn intersect_abs_regions(a: &[[i32; 4]], b: &[[i32; 4]]) -> Vec<[i32; 4]> {
+    if a.is_empty() || b.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let mut previous_band_start = None;
+    let mut a_start = 0;
+    let mut b_start = 0;
+    let mut a_end = abs_region_band_end(a, a_start);
+    let mut b_end = abs_region_band_end(b, b_start);
+
+    while a_start < a.len() && b_start < b.len() {
+        let ay0 = a[a_start][1];
+        let ay1 = a[a_start][3];
+        let by0 = b[b_start][1];
+        let by1 = b[b_start][3];
+        let y0 = ay0.max(by0);
+        let y1 = ay1.min(by1);
+
+        if y1 > y0 {
+            let band_start = out.len();
+            let mut ai = a_start;
+            let mut bi = b_start;
+            while ai < a_end && bi < b_end {
+                let [ax0, _, ax1, _] = a[ai];
+                let [bx0, _, bx1, _] = b[bi];
+                let x0 = ax0.max(bx0);
+                let x1 = ax1.min(bx1);
+                if x1 > x0 {
+                    out.push([x0, y0, x1, y1]);
+                }
+                if ax1 <= bx1 {
+                    ai += 1;
+                }
+                if bx1 <= ax1 {
+                    bi += 1;
+                }
+            }
+            coalesce_abs_band(&mut out, band_start, &mut previous_band_start);
+        }
+
+        if ay1 <= by1 {
+            a_start = a_end;
+            if a_start < a.len() {
+                a_end = abs_region_band_end(a, a_start);
+            }
+        }
+        if by1 <= ay1 {
+            b_start = b_end;
+            if b_start < b.len() {
+                b_end = abs_region_band_end(b, b_start);
+            }
+        }
+    }
+    out
+}
+
 /// Stage 3f.6 recurse: emit a CompositeDraw entry for `host_xid` if
 /// it's mapped + scene-participating + has live storage, then recurse
 /// into mapped descendants with accumulated parent offsets.
@@ -2455,6 +2572,13 @@ fn emit_window_subtree(
     clip_y0: i32,
     clip_x1: i32,
     clip_y1: i32,
+    // Every ancestor's SHAPE Bounding region, already intersected, as
+    // absolute half-open `[x0, y0, x1, y1]` rects. `None` = no ancestor
+    // is shaped, the common case, and no region test runs at all.
+    // `Some(&[])` = the intersection came out empty, so nothing in this
+    // subtree is drawn. Kept as a rect list rather than a bounding box
+    // so a rounded-corner mask clips its corners exactly.
+    ancestor_shape: Option<&[[i32; 4]]>,
 ) {
     let debug_focus = scene_walk_debug_enabled_for(host_xid);
     // Stage 4 diagnostic: trace-level scene-walk decision per window.
@@ -2516,6 +2640,65 @@ fn emit_window_subtree(
     let child_clip_y0 = clip_y0.max(abs_y);
     let child_clip_x1 = clip_x1.min(abs_x + own_w);
     let child_clip_y1 = clip_y1.min(abs_y + own_h);
+
+    // Gather descendants before deriving the inherited SHAPE region. The
+    // scene walk already needs this stable list for recursion; doing it here
+    // also lets a shaped leaf with no shaped ancestor draw directly from its
+    // local RegionRects without allocating an absolute copy that nobody will
+    // inherit.
+    let mut children: Vec<(u32, u64)> = windows
+        .iter()
+        .filter_map(|(xid, g)| {
+            if g.parent == Some(host_xid) {
+                Some((*xid, g.stack_rank))
+            } else {
+                None
+            }
+        })
+        .collect();
+    children.sort_by_key(|(_, rank)| *rank);
+
+    // SHAPE §"Bounding region": the region clips the window AND every
+    // descendant — "the window's border and contents ... and those of
+    // its inferiors are clipped to the bounding region". `clip_*` above
+    // carries ancestor *geometry* only; this carries their Bounding
+    // regions, which is a separate constraint.
+    //
+    // Load-bearing case: KWin reparents a Plasma panel into
+    // frame → wrapper → client and shapes the FRAME (rounded band, e.g.
+    // 3422x1+9+8 / 3424x22+8+9 / 3422x1+9+31 inside a 3440x40 frame) so
+    // the margin the bar slides through shows the wallpaper when nothing
+    // composites. The wrapper in between is unshaped and full-height;
+    // without this it is emitted whole and its background paints an
+    // opaque band over the margin.
+    let own_shape = shape_bounding.get(&host_xid);
+    let own_shape_abs: Option<Vec<[i32; 4]>> = match own_shape {
+        Some(rects) if !children.is_empty() || ancestor_shape.is_some() => Some(
+            rects
+                .iter()
+                .map(|r| {
+                    let x0 = abs_x + i32::from(r.x);
+                    let y0 = abs_y + i32::from(r.y);
+                    [x0, y0, x0 + i32::from(r.width), y0 + i32::from(r.height)]
+                })
+                .collect(),
+        ),
+        _ => None,
+    };
+    // Intersect only when both sides exist. No shaped ancestor means the
+    // window can draw its own RegionRects directly; a shaped leaf therefore
+    // avoids the absolute copy too.
+    let intersected_shape: Option<Vec<[i32; 4]>> = match (ancestor_shape, own_shape_abs.as_deref())
+    {
+        (Some(anc), Some(own)) => Some(intersect_abs_regions(anc, own)),
+        _ => None,
+    };
+    let child_shape: Option<&[[i32; 4]]> = match (ancestor_shape, own_shape_abs.as_deref()) {
+        (Some(_), Some(_)) => intersected_shape.as_deref(),
+        (Some(anc), None) => Some(anc),
+        (None, own @ Some(_)) => own,
+        (None, None) => None,
+    };
 
     // Manual-redirect subtree boundary. When a window is
     // `scene_participating=false` here, the compositor owns the
@@ -2776,59 +2959,34 @@ fn emit_window_subtree(
                 let win_w_f = win_w as f32;
                 #[allow(clippy::cast_precision_loss)]
                 let win_h_f = win_h as f32;
+
                 let mut emitted_any = false;
-                if let Some(rects) = shape_bounding.get(&host_xid) {
-                    for rect in rects {
-                        let rx = i32::from(rect.x);
-                        let ry = i32::from(rect.y);
-                        let rw = i32::from(rect.width);
-                        let rh = i32::from(rect.height);
-                        // Clamp to the window extent AND the ancestor
-                        // visible box (parent-clipping).
-                        let cx = rx.max(0).max(vis_lx0);
-                        let cy = ry.max(0).max(vis_ly0);
-                        let cw = (rx + rw).min(win_w).min(vis_lx1) - cx;
-                        let ch = (ry + rh).min(win_h).min(vis_ly1) - cy;
-                        if cw <= 0 || ch <= 0 {
-                            continue;
-                        }
-                        #[allow(clippy::cast_precision_loss)]
-                        let cw_f = cw as f32;
-                        #[allow(clippy::cast_precision_loss)]
-                        let ch_f = ch as f32;
-                        #[allow(clippy::cast_precision_loss)]
-                        let cx_f = cx as f32;
-                        #[allow(clippy::cast_precision_loss)]
-                        let cy_f = cy as f32;
-                        draws.push(CompositeDraw {
-                            image_view,
-                            #[allow(clippy::cast_precision_loss)]
-                            dst_origin: [(dx + cx) as f32, (dy + cy) as f32],
-                            dst_size: [cw_f, ch_f],
-                            src_origin: [cx_f / win_w_f, cy_f / win_h_f],
-                            src_size: [cw_f / win_w_f, ch_f / win_h_f],
-                            // Phase 2.6 — alpha-passthrough is inherited
-                            // from the COW subtree flag (set on the COW
-                            // top-level + descendants). Outside the COW
-                            // subtree, draws stay opaque.
-                            alpha_passthrough: under_cow_subtree,
-                        });
-                        emitted_any = true;
+                let mut push_clipped_draw = |lx0: i32, ly0: i32, lx1: i32, ly1: i32| -> bool {
+                    // Restrict every piece to the window extent and the
+                    // inherited geometry clip. The shape coordinates may
+                    // be negative or extend beyond the window.
+                    let lx0 = lx0.max(0).max(vis_lx0);
+                    let ly0 = ly0.max(0).max(vis_ly0);
+                    let lx1 = lx1.min(win_w).min(vis_lx1);
+                    let ly1 = ly1.min(win_h).min(vis_ly1);
+                    if lx1 <= lx0 || ly1 <= ly0 {
+                        return false;
                     }
-                } else if vis_lx1 > vis_lx0 && vis_ly1 > vis_ly0 {
-                    // Unshaped: emit the window rect clipped to the
-                    // ancestor visible box. Common case (child fits
-                    // inside its parent) → box == full window, so this
-                    // is the full-window draw with src [0,0]-[1,1].
-                    let cw = vis_lx1 - vis_lx0;
-                    let ch = vis_ly1 - vis_ly0;
                     #[allow(clippy::cast_precision_loss)]
+                    let cw_f = (lx1 - lx0) as f32;
+                    #[allow(clippy::cast_precision_loss)]
+                    let ch_f = (ly1 - ly0) as f32;
+                    #[allow(clippy::cast_precision_loss)]
+                    let cx_f = lx0 as f32;
+                    #[allow(clippy::cast_precision_loss)]
+                    let cy_f = ly0 as f32;
                     draws.push(CompositeDraw {
                         image_view,
-                        dst_origin: [(dx + vis_lx0) as f32, (dy + vis_ly0) as f32],
-                        dst_size: [cw as f32, ch as f32],
-                        src_origin: [vis_lx0 as f32 / win_w_f, vis_ly0 as f32 / win_h_f],
-                        src_size: [cw as f32 / win_w_f, ch as f32 / win_h_f],
+                        #[allow(clippy::cast_precision_loss)]
+                        dst_origin: [(dx + lx0) as f32, (dy + ly0) as f32],
+                        dst_size: [cw_f, ch_f],
+                        src_origin: [cx_f / win_w_f, cy_f / win_h_f],
+                        src_size: [cw_f / win_w_f, ch_f / win_h_f],
                         // Phase 2.6 — alpha-passthrough is inherited
                         // from the COW subtree flag (set on the COW
                         // top-level + descendants). Outside the COW
@@ -2838,7 +2996,47 @@ fn emit_window_subtree(
                         // blend over whatever lies below.
                         alpha_passthrough: under_cow_subtree,
                     });
-                    emitted_any = true;
+                    true
+                };
+
+                match (own_shape, ancestor_shape) {
+                    // Common case: one direct full-window draw, with no
+                    // candidate Vec and no SHAPE-region allocation.
+                    (None, None) => {
+                        emitted_any = push_clipped_draw(vis_lx0, vis_ly0, vis_lx1, vis_ly1);
+                    }
+                    // A shaped window with no shaped ancestor can consume
+                    // its canonical local RegionRects directly. In
+                    // particular, a shaped leaf allocates no absolute copy.
+                    (Some(rects), None) => {
+                        for rect in rects {
+                            let x0 = i32::from(rect.x);
+                            let y0 = i32::from(rect.y);
+                            emitted_any |= push_clipped_draw(
+                                x0,
+                                y0,
+                                x0 + i32::from(rect.width),
+                                y0 + i32::from(rect.height),
+                            );
+                        }
+                    }
+                    // With only an inherited shape, its already-canonical
+                    // absolute pieces are the exact visible region.
+                    (None, Some(region)) => {
+                        for &[x0, y0, x1, y1] in region {
+                            emitted_any |=
+                                push_clipped_draw(x0 - abs_x, y0 - abs_y, x1 - abs_x, y1 - abs_y);
+                        }
+                    }
+                    // Both sides shaped: consume the exact canonical
+                    // intersection once. This replaces the old
+                    // candidates × ancestor nested emission loop.
+                    (Some(_), Some(_)) => {
+                        for &[x0, y0, x1, y1] in intersected_shape.as_deref().unwrap_or_default() {
+                            emitted_any |=
+                                push_clipped_draw(x0 - abs_x, y0 - abs_y, x1 - abs_x, y1 - abs_y);
+                        }
+                    }
                 }
                 if emitted_any {
                     sampled_ids.push(source_id);
@@ -2890,17 +3088,6 @@ fn emit_window_subtree(
     let child_under_redirected_ancestor = under_redirected_ancestor || self_owns_redirected_target;
 
     // Recurse into mapped descendants in stable sibling stack order.
-    let mut children: Vec<(u32, u64)> = windows
-        .iter()
-        .filter_map(|(xid, g)| {
-            if g.parent == Some(host_xid) {
-                Some((*xid, g.stack_rank))
-            } else {
-                None
-            }
-        })
-        .collect();
-    children.sort_by_key(|(_, rank)| *rank);
     for (child_xid, _) in children {
         emit_window_subtree(
             child_xid,
@@ -2928,6 +3115,7 @@ fn emit_window_subtree(
             child_clip_y0,
             child_clip_x1,
             child_clip_y1,
+            child_shape,
         );
     }
 }
@@ -4247,6 +4435,526 @@ mod tests {
         );
     }
 
+    #[test]
+    fn intersect_abs_regions_preserves_large_exact_stripe_product() {
+        // Both inputs are canonical, non-overlapping YX-banded regions.
+        // Their exact intersection contains 65×65 disjoint pixels, well
+        // beyond the removed 64-rect fallback. Collapsing to extents would
+        // incorrectly fill every one-pixel gap.
+        let vertical: Vec<[i32; 4]> = (0..65)
+            .map(|i| {
+                let x = i * 2;
+                [x, 0, x + 1, 129]
+            })
+            .collect();
+        let horizontal: Vec<[i32; 4]> = (0..65)
+            .map(|i| {
+                let y = i * 2;
+                [0, y, 129, y + 1]
+            })
+            .collect();
+
+        let intersection = intersect_abs_regions(&vertical, &horizontal);
+        assert_eq!(
+            intersection.len(),
+            65 * 65,
+            "every vertical/horizontal stripe crossing is a real output rect",
+        );
+        assert!(
+            intersection
+                .iter()
+                .all(|[x0, y0, x1, y1]| x1 - x0 == 1 && y1 - y0 == 1),
+            "the exact result must retain the one-pixel crossings: {intersection:?}",
+        );
+        assert!(
+            !intersection
+                .iter()
+                .any(|[x0, y0, x1, y1]| *x0 <= 1 && 1 < *x1 && *y0 <= 1 && 1 < *y1),
+            "the hole at (1,1) must not be painted by a bounding-box fallback",
+        );
+    }
+
+    #[test]
+    fn intersect_abs_regions_coalesces_identical_output_bands() {
+        let a = [[0, 0, 10, 10]];
+        // B cannot coalesce its two Y bands because only the first has the
+        // disjoint 20..30 span. Intersecting with A removes that difference,
+        // so the two resulting 0..10 spans must coalesce vertically.
+        let b = [[0, 0, 10, 5], [20, 0, 30, 5], [0, 5, 10, 10]];
+
+        assert_eq!(intersect_abs_regions(&a, &b), vec![[0, 0, 10, 10]]);
+    }
+
+    /// SHAPE bounding region clips DESCENDANTS too, not just the
+    /// shaped window itself — "the window's border and contents ...
+    /// and those of its inferiors are clipped to the bounding region".
+    ///
+    /// Regression: KWin reparents a Plasma panel into
+    /// frame → wrapper → client and puts the floating panel's shape on
+    /// the FRAME (3440x24+0+16 inside a 3440x40 frame) so the margin it
+    /// slides through shows the wallpaper when nothing composites. The
+    /// wrapper in between is unshaped and full-height; the scene folded
+    /// only ancestor *geometry* into the child clip, so the wrapper was
+    /// emitted whole and its opaque background painted a white band
+    /// across the margin — Strix Halo / amdgpu, non-composited Plasma
+    /// 6.6, 2026-07-28. Enabling a compositor masked it (KWin then
+    /// samples the window as a texture and the alpha carries the
+    /// cut-out), which is why it only showed with compositing off.
+    #[test]
+    fn build_scene_clips_descendants_to_ancestor_shape_bounding() {
+        use yserver_protocol::x11::xfixes::RegionRect;
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows = super::super::backend::WindowsMap::new();
+
+        // Frame @ (0, 100), 400×40 — the shaped ancestor.
+        alloc_stub_window(&mut store, &mut windows, 0x100, 0, 100, 400, 40, None, true);
+        core.top_level_order.push(0x100);
+        // Panel band: only rows 16..40 of the frame are in the region.
+        core.shape_bounding.insert(
+            0x100,
+            vec![RegionRect {
+                x: 0,
+                y: 16,
+                width: 400,
+                height: 24,
+            }],
+        );
+
+        // Wrapper: fills the frame, NO shape of its own.
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0x101,
+            0,
+            0,
+            400,
+            40,
+            Some(0x100),
+            true,
+        );
+
+        let built = build_scene(
+            &core, &mut store, &windows, 0, &platform, None, None, None, false,
+        );
+        let scene = built.scene;
+
+        // Nothing may be painted above the band's top edge (abs y 116).
+        assert!(
+            !scene.draws.iter().any(|d| d.dst_origin[1] < 116.0),
+            "no draw may land above the ancestor's bounding band at y=116 \
+             (the margin must stay clear); got {:?}",
+            scene.draws,
+        );
+        // The unshaped wrapper inherits the band: y 116, height 24.
+        let wrapper = scene
+            .draws
+            .iter()
+            .find(|d| (d.dst_origin[1] - 116.0).abs() < 1e-5 && d.dst_size[1] == 24.0)
+            .unwrap_or_else(|| {
+                panic!(
+                    "wrapper must be clipped to the ancestor band, got {:?}",
+                    scene.draws
+                )
+            });
+        assert_eq!(
+            wrapper.dst_size,
+            [400.0, 24.0],
+            "wrapper must be clipped to 400×24, not drawn at its full 400×40",
+        );
+        // It must sample the matching sub-region of its own storage,
+        // otherwise the band shows the wrong 24 rows of the wrapper.
+        assert!(
+            (wrapper.src_origin[1] - 16.0 / 40.0).abs() < 1e-5
+                && (wrapper.src_size[1] - 24.0 / 40.0).abs() < 1e-5,
+            "wrapper must sample rows 16..40 of its storage, got origin {:?} size {:?}",
+            wrapper.src_origin,
+            wrapper.src_size,
+        );
+    }
+
+    /// A multi-rect ancestor region must clip descendants to the region
+    /// itself, not to its bounding box. Plasma's panel frame carries a
+    /// rounded mask — three rects, a 1px cap inset one pixel further
+    /// than the body — and clipping the unshaped wrapper to the extents
+    /// instead left one lit pixel in each of the four corners
+    /// (measured on Strix Halo: `(8,8)`, `(8,3431)`, `(31,8)`,
+    /// `(31,3431)` still `#FFFFFF` over the wallpaper).
+    #[test]
+    fn build_scene_clips_descendants_to_multi_rect_ancestor_shape() {
+        use yserver_protocol::x11::xfixes::RegionRect;
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows = super::super::backend::WindowsMap::new();
+
+        // Frame @ (0, 0), 100×40.
+        alloc_stub_window(&mut store, &mut windows, 0x100, 0, 0, 100, 40, None, true);
+        core.top_level_order.push(0x100);
+        // Rounded band: 1px caps inset one further than the body, so
+        // the four corner pixels are inside the bounding box (8..32 ×
+        // 8..92) but outside the region.
+        core.shape_bounding.insert(
+            0x100,
+            vec![
+                RegionRect {
+                    x: 9,
+                    y: 8,
+                    width: 82,
+                    height: 1,
+                },
+                RegionRect {
+                    x: 8,
+                    y: 9,
+                    width: 84,
+                    height: 22,
+                },
+                RegionRect {
+                    x: 9,
+                    y: 31,
+                    width: 82,
+                    height: 1,
+                },
+            ],
+        );
+
+        // Unshaped wrapper filling the frame.
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0x101,
+            0,
+            0,
+            100,
+            40,
+            Some(0x100),
+            true,
+        );
+
+        let built = build_scene(
+            &core, &mut store, &windows, 0, &platform, None, None, None, false,
+        );
+        let scene = built.scene;
+
+        // Every corner pixel of the bounding box lies outside the true
+        // region and must be covered by no draw at all.
+        for (px, py) in [(8.0_f32, 8.0_f32), (91.0, 8.0), (8.0, 31.0), (91.0, 31.0)] {
+            let covering: Vec<_> = scene
+                .draws
+                .iter()
+                .filter(|d| {
+                    px >= d.dst_origin[0]
+                        && px < d.dst_origin[0] + d.dst_size[0]
+                        && py >= d.dst_origin[1]
+                        && py < d.dst_origin[1] + d.dst_size[1]
+                })
+                .collect();
+            assert!(
+                covering.is_empty(),
+                "corner pixel ({px}, {py}) is outside the rounded region but \
+                 {} draw(s) cover it — the ancestor region was flattened to \
+                 its bounding box: {:?}",
+                covering.len(),
+                covering,
+            );
+        }
+
+        // The body interior must still be painted, twice over: once by
+        // the shaped frame and once by the wrapper it clips.
+        let mid = scene
+            .draws
+            .iter()
+            .filter(|d| {
+                50.0 >= d.dst_origin[0]
+                    && 50.0 < d.dst_origin[0] + d.dst_size[0]
+                    && 20.0 >= d.dst_origin[1]
+                    && 20.0 < d.dst_origin[1] + d.dst_size[1]
+            })
+            .count();
+        assert_eq!(
+            mid, 2,
+            "the band interior must still be drawn by both frame and wrapper, \
+             got {mid} draw(s): {:?}",
+            scene.draws,
+        );
+    }
+
+    #[test]
+    fn build_scene_intersects_shaped_ancestor_and_offset_shaped_child() {
+        use yserver_protocol::x11::xfixes::RegionRect;
+
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows = super::super::backend::WindowsMap::new();
+
+        // Parent absolute box (50,50)-(150,150), with an inset shape
+        // (60,60)-(140,140).
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0x100,
+            50,
+            50,
+            100,
+            100,
+            None,
+            true,
+        );
+        core.top_level_order.push(0x100);
+        core.shape_bounding.insert(
+            0x100,
+            vec![RegionRect {
+                x: 10,
+                y: 10,
+                width: 80,
+                height: 80,
+            }],
+        );
+
+        // Child origin is (40,70): negative X relative to its parent.
+        // Its own shape also starts above the child. Own shape absolute
+        // (70,65)-(130,115), ancestor shape (60,60)-(140,140), and
+        // parent geometry together leave (70,70)-(130,115).
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0x101,
+            -10,
+            20,
+            100,
+            100,
+            Some(0x100),
+            true,
+        );
+        core.shape_bounding.insert(
+            0x101,
+            vec![RegionRect {
+                x: 30,
+                y: -5,
+                width: 60,
+                height: 50,
+            }],
+        );
+        let child_id = store.lookup(0x101).expect("child id");
+        let child_view = store.get(child_id).expect("child").storage.sample_view;
+
+        let built = build_scene(
+            &core, &mut store, &windows, 0, &platform, None, None, None, false,
+        );
+        let child_draws: Vec<_> = built
+            .scene
+            .draws
+            .iter()
+            .filter(|draw| draw.image_view == child_view)
+            .collect();
+        assert_eq!(
+            child_draws.len(),
+            1,
+            "the shaped child intersection must emit exactly one piece: {:?}",
+            built.scene.draws,
+        );
+        let child = child_draws[0];
+        assert_eq!(child.dst_origin, [70.0, 70.0]);
+        assert_eq!(child.dst_size, [60.0, 45.0]);
+        assert!(
+            (child.src_origin[0] - 0.3).abs() < 1e-5 && child.src_origin[1].abs() < 1e-5,
+            "negative/local offsets must map to the matching child texture area: {:?}",
+            child.src_origin,
+        );
+    }
+
+    #[test]
+    fn build_scene_intersects_two_shaped_ancestors_for_grandchild() {
+        use yserver_protocol::x11::xfixes::RegionRect;
+
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows = super::super::backend::WindowsMap::new();
+
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0x100,
+            100,
+            100,
+            100,
+            100,
+            None,
+            true,
+        );
+        core.top_level_order.push(0x100);
+        core.shape_bounding.insert(
+            0x100,
+            vec![RegionRect {
+                x: 20,
+                y: 0,
+                width: 60,
+                height: 100,
+            }],
+        );
+
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0x101,
+            10,
+            10,
+            100,
+            100,
+            Some(0x100),
+            true,
+        );
+        core.shape_bounding.insert(
+            0x101,
+            vec![RegionRect {
+                x: 0,
+                y: 20,
+                width: 100,
+                height: 40,
+            }],
+        );
+
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0x102,
+            5,
+            5,
+            90,
+            80,
+            Some(0x101),
+            true,
+        );
+        let grandchild_id = store.lookup(0x102).expect("grandchild id");
+        let grandchild_view = store
+            .get(grandchild_id)
+            .expect("grandchild")
+            .storage
+            .sample_view;
+
+        let built = build_scene(
+            &core, &mut store, &windows, 0, &platform, None, None, None, false,
+        );
+        let grandchild_draws: Vec<_> = built
+            .scene
+            .draws
+            .iter()
+            .filter(|draw| draw.image_view == grandchild_view)
+            .collect();
+        assert_eq!(
+            grandchild_draws.len(),
+            1,
+            "the grandchild must inherit the exact intersection of both shapes",
+        );
+        assert_eq!(grandchild_draws[0].dst_origin, [120.0, 130.0]);
+        assert_eq!(grandchild_draws[0].dst_size, [60.0, 40.0]);
+    }
+
+    #[test]
+    fn build_scene_propagates_empty_nested_shape_intersection() {
+        use yserver_protocol::x11::xfixes::RegionRect;
+
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows = super::super::backend::WindowsMap::new();
+
+        alloc_stub_window(&mut store, &mut windows, 0x100, 0, 0, 100, 100, None, true);
+        core.top_level_order.push(0x100);
+        core.shape_bounding.insert(
+            0x100,
+            vec![RegionRect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 100,
+            }],
+        );
+
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0x101,
+            0,
+            0,
+            100,
+            100,
+            Some(0x100),
+            true,
+        );
+        core.shape_bounding.insert(
+            0x101,
+            vec![RegionRect {
+                x: 20,
+                y: 0,
+                width: 10,
+                height: 100,
+            }],
+        );
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0x102,
+            0,
+            0,
+            100,
+            100,
+            Some(0x101),
+            true,
+        );
+        let child_id = store.lookup(0x101).expect("child id");
+        let grandchild_id = store.lookup(0x102).expect("grandchild id");
+
+        let built = build_scene(
+            &core, &mut store, &windows, 0, &platform, None, None, None, false,
+        );
+        assert!(
+            !built.sampled_ids.contains(&child_id) && !built.sampled_ids.contains(&grandchild_id),
+            "Some([]) from the empty nested intersection must suppress the \
+             child and its entire subtree: {:?}",
+            built.scene.draws,
+        );
+        assert_eq!(
+            built.scene.draws.len(),
+            1,
+            "only the shaped parent remains visible after the empty intersection",
+        );
+    }
+
+    #[test]
+    fn build_scene_explicit_empty_ancestor_shape_suppresses_child() {
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows = super::super::backend::WindowsMap::new();
+
+        alloc_stub_window(&mut store, &mut windows, 0x100, 0, 0, 100, 100, None, true);
+        core.top_level_order.push(0x100);
+        core.shape_bounding.insert(0x100, Vec::new());
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0x101,
+            0,
+            0,
+            100,
+            100,
+            Some(0x100),
+            true,
+        );
+
+        let built = build_scene(
+            &core, &mut store, &windows, 0, &platform, None, None, None, false,
+        );
+        assert!(
+            built.scene.draws.is_empty() && built.sampled_ids.is_empty(),
+            "an explicit empty Bounding shape must clip the window and inferiors",
+        );
+    }
+
     /// SHAPE bounding region clips the window's scene draw. Marco
     /// uses `SHAPE-Request: Rectangles destination=Bounding` to set
     /// a rounded-corner mask on frame windows; without honouring it
@@ -5259,6 +5967,102 @@ mod tests {
                 d,
             );
         }
+    }
+
+    #[test]
+    fn cow_multi_piece_shape_samples_and_snapshots_each_window_once() {
+        use yserver_protocol::x11::xfixes::RegionRect;
+
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows = super::super::backend::WindowsMap::new();
+
+        let cow_xid: u32 = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+        alloc_stub_window(&mut store, &mut windows, cow_xid, 0, 0, 100, 40, None, true);
+        core.top_level_order.push(cow_xid);
+        core.shape_bounding.insert(
+            cow_xid,
+            vec![
+                RegionRect {
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 10,
+                },
+                RegionRect {
+                    x: 0,
+                    y: 20,
+                    width: 100,
+                    height: 10,
+                },
+                RegionRect {
+                    x: 0,
+                    y: 35,
+                    width: 100,
+                    height: 5,
+                },
+            ],
+        );
+
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0xB1,
+            0,
+            0,
+            100,
+            40,
+            Some(cow_xid),
+            true,
+        );
+        let stage_id = store.lookup(0xB1).expect("stage id");
+        let stage_view = store.get(stage_id).expect("stage").storage.sample_view;
+
+        let built = build_scene(
+            &core,
+            &mut store,
+            &windows,
+            0,
+            &platform,
+            None,
+            None,
+            Some(cow_xid),
+            false,
+        );
+        let stage_draws: Vec<_> = built
+            .scene
+            .draws
+            .iter()
+            .filter(|draw| draw.image_view == stage_view)
+            .collect();
+        assert_eq!(
+            stage_draws.len(),
+            3,
+            "the unshaped COW child must inherit all three ancestor pieces",
+        );
+        assert!(
+            stage_draws.iter().all(|draw| draw.alpha_passthrough),
+            "every inherited piece in the COW subtree must retain SrcOver blending",
+        );
+        assert_eq!(
+            built
+                .sampled_ids
+                .iter()
+                .filter(|&&id| id == stage_id)
+                .count(),
+            1,
+            "multi-piece emission must sample-key the drawable once",
+        );
+        assert_eq!(
+            built
+                .snapshots
+                .iter()
+                .filter(|snapshot| snapshot.id == stage_id)
+                .count(),
+            1,
+            "multi-piece emission must capture presentation damage once",
+        );
     }
 
     /// Phase 2.7 — the COW must emit via the normal `top_level_order`

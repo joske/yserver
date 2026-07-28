@@ -505,9 +505,12 @@ where
     Some(out)
 }
 
-pub(crate) fn normalize_region_rects(
-    mut rects: Vec<x11xfixes::RegionRect>,
-) -> Vec<x11xfixes::RegionRect> {
+/// Return the exact union of `rects` as sorted, non-overlapping YX bands.
+///
+/// Backends may call this at their storage boundary rather than relying on
+/// every `Backend` caller to preserve the core's region representation.
+#[must_use]
+pub fn normalize_region_rects(mut rects: Vec<x11xfixes::RegionRect>) -> Vec<x11xfixes::RegionRect> {
     rects.retain(|rect| !rect.is_empty());
     if rects.is_empty() {
         return rects;
