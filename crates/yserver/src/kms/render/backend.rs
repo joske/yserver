@@ -18117,10 +18117,17 @@ impl Backend for KmsBackend {
         // projection of the core resource tree. The `Option` preserves
         // the empty-vs-absent distinction (DRIFT 1): `None` removes the
         // entry (unset → full window / live geometry); `Some(rects)`
-        // stores the region verbatim, INCLUDING `Some([])` (explicit
-        // empty → click-through for input, drawn-as-nothing for bounding).
+        // stores the exact region, INCLUDING `Some([])` (explicit empty →
+        // click-through for input, drawn-as-nothing for bounding).
         // `cursor_inside_shape` and the scene's bounding clip already read
         // `Some([])` correctly; the old API deleted on empty and lost it.
+        //
+        // Canonicalize once at this backend boundary. Core protocol paths
+        // already provide normalized regions, but the Backend contract does
+        // not require that; keeping the KMS maps YX-banded lets scene
+        // intersection skip vertically-disjoint bands and guarantees that
+        // overlapping client rectangles never become overlapping SrcOver
+        // draws in a COW subtree.
         let dst = match kind {
             0 => &mut self.core.shape_bounding,
             1 => &mut self.core.shape_clip,
@@ -18135,7 +18142,10 @@ impl Backend for KmsBackend {
                 dst.remove(&host_xid);
             }
             Some(rects) => {
-                dst.insert(host_xid, rects.to_vec());
+                dst.insert(
+                    host_xid,
+                    yserver_core::nested::normalize_region_rects(rects.to_vec()),
+                );
             }
         }
         // Bounding (0) and clip (1) shapes change what the scene draws,
@@ -18871,6 +18881,71 @@ mod tests {
     };
     use std::collections::HashMap;
     use yserver_core::{backend::Backend, server::ServerState};
+    use yserver_protocol::x11::xfixes::RegionRect;
+
+    #[test]
+    fn set_shape_rectangles_canonicalizes_and_preserves_empty_presence() {
+        let mut backend = KmsBackend::for_tests();
+        let overlapping = [
+            RegionRect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
+            RegionRect {
+                x: 5,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
+            RegionRect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
+        ];
+
+        backend
+            .set_shape_rectangles(None, 0x100, 0, Some(&overlapping))
+            .expect("store bounding shape");
+        let stored = backend
+            .core
+            .shape_bounding
+            .get(&0x100)
+            .expect("shape entry");
+        assert_eq!(
+            stored.as_slice(),
+            &[RegionRect {
+                x: 0,
+                y: 0,
+                width: 15,
+                height: 10,
+            }],
+            "the KMS storage boundary must merge overlaps and duplicates",
+        );
+
+        backend
+            .set_shape_rectangles(None, 0x100, 0, Some(&[]))
+            .expect("store explicit empty shape");
+        assert!(
+            backend
+                .core
+                .shape_bounding
+                .get(&0x100)
+                .is_some_and(Vec::is_empty),
+            "an explicit empty shape remains present and distinct from unset",
+        );
+
+        backend
+            .set_shape_rectangles(None, 0x100, 0, None)
+            .expect("unset shape");
+        assert!(
+            !backend.core.shape_bounding.contains_key(&0x100),
+            "None removes the shape entry",
+        );
+    }
 
     #[test]
     fn mode_timing_passes_kernel_timing_and_masks_drm_only_flags() {

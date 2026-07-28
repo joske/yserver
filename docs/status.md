@@ -35,6 +35,42 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ## Where we are
 
+- **2026-07-28 SHAPE bounding regions now clip descendants:** the scene walk
+  folded only ancestor *geometry* into the clip it hands to children, so a
+  shaped window's Bounding region constrained its own draws but nothing
+  below it in the tree. The SHAPE spec is explicit that the region clips the
+  window *and its inferiors*. Found on non-composited Plasma 6.6 (Strix Halo
+  / amdgpu): KWin reparents a panel into frame → wrapper → client and puts
+  the floating panel's shape on the **frame** (`3440x24+0+16` inside a
+  `3440x40` frame) so the margin the bar slides through shows the wallpaper.
+  The wrapper in between is unshaped and full-height, so it was emitted whole
+  and its opaque background painted a white band across the margin — pure
+  `#FFFFFF`, all 3440 px wide, boundary exactly at the shape's y offset.
+  Running a compositor masked it entirely (KWin then samples the window as a
+  texture and the alpha carries the cut-out), which is why it only ever
+  showed with compositing off, and why Xorg — which honours the region — was
+  fine. `emit_window_subtree` now threads the accumulated ancestor Bounding
+  region — a list of absolute rects, not a bounding box — alongside the
+  existing geometry clip, and intersects every emitted draw against it. The
+  rect list matters: Plasma's frame mask is three rects (1px caps inset one
+  pixel further than the body), and an extents-based first cut left one lit
+  pixel in each of the four panel corners on hardware. KMS canonicalizes
+  backend SHAPE updates once into non-overlapping YX bands, then intersects
+  nested shapes exactly with a band sweep. There is deliberately no rect cap
+  or bounding-box fallback: legitimate bitmap masks can exceed 64 rects, and
+  vertical stripes intersecting horizontal stripes can produce the full
+  Cartesian product as real, disjoint output. The draw path consumes that
+  canonical intersection once, preventing overlapping SrcOver pieces in COW
+  subtrees; the unshaped case emits its single draw directly without a
+  candidate allocation, and a shaped leaf with no shaped ancestor does not
+  build an unused absolute region. Regression coverage includes
+  `build_scene_clips_descendants_to_ancestor_shape_bounding` for the
+  frame/wrapper pair and
+  `build_scene_clips_descendants_to_multi_rect_ancestor_shape` for the
+  rounded corners, plus nested shaped ancestors, negative/local offsets,
+  empty intersections, high-complexity stripe intersections, and COW
+  multi-piece sampling/damage bookkeeping.
+
 - **2026-07-28 PresentPixmapSynced acquire wait (bee + silence passed):**
   yserver now follows Xorg's non-blocking Copy-path ordering: it does not copy
   or damage a synced Present source until `acquire_syncobj@acquire_value`
