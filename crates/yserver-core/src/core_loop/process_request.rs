@@ -296,6 +296,7 @@ pub fn process_request(
         85 => handle_alloc_named_color(state, client_id, sequence, body),
         86 => handle_alloc_color_cells(state, client_id, sequence, body),
         87 => handle_alloc_color_planes(state, client_id, sequence, body),
+        88 => handle_free_colors(state, client_id, sequence, body),
         89 => handle_store_colors(state, client_id, sequence),
         90 => handle_store_named_color(state, client_id, sequence),
         91 => handle_query_colors(state, client_id, sequence, body),
@@ -24184,6 +24185,80 @@ fn handle_alloc_color(
     Ok(write_to_client(client, client_id, &buf))
 }
 
+/// FreeColors (88): release a client's color allocations.
+///
+/// yserver currently exposes only fixed TrueColor visuals and does not retain
+/// per-client references for the read-only colors returned by AllocColor /
+/// AllocNamedColor. Validate the colormap and the Xorg-detectable BadValue
+/// cases, then complete without a reply. Xorg additionally returns BadAccess
+/// for unallocated or already-freed pixels; without allocation accounting,
+/// yserver deliberately accepts those frees as a permissive no-op.
+fn handle_free_colors(
+    state: &mut ServerState,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    body: &[u8],
+) -> io::Result<RequestOutcome> {
+    let Some(prefix) = body.get(..8) else {
+        return Ok(RequestOutcome::Handled);
+    };
+    let cmap = ResourceId(u32::from_le_bytes(
+        prefix[..4].try_into().expect("four-byte colormap id"),
+    ));
+    let plane_mask = u32::from_le_bytes(prefix[4..8].try_into().expect("four-byte plane mask"));
+    let mut pixels = body[8..]
+        .chunks_exact(4)
+        .map(|pixel| u32::from_le_bytes(pixel.try_into().expect("four-byte pixel")));
+    let pixel_count = pixels.len();
+    debug!(
+        "client {} #{} FreeColors cmap=0x{:x} plane_mask=0x{:08x} pixels={}",
+        client_id.0, sequence.0, cmap.0, plane_mask, pixel_count
+    );
+    let Some(colormap) = state.resources.colormap(cmap) else {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_COLORMAP,
+            cmap.0,
+            88,
+        );
+    };
+    let Some(visual) = state.resources.visual(colormap.visual) else {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_COLORMAP,
+            cmap.0,
+            88,
+        );
+    };
+    let valid_mask = visual.red_mask | visual.green_mask | visual.blue_mask | visual.alpha_mask;
+    if pixel_count != 0 && plane_mask & !valid_mask != 0 {
+        let first_pixel = pixels.clone().next().expect("non-empty pixel list");
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            first_pixel | plane_mask,
+            88,
+        );
+    }
+    if let Some(invalid_pixel) = pixels.find(|pixel| pixel & !valid_mask != 0) {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            invalid_pixel,
+            88,
+        );
+    }
+    Ok(RequestOutcome::Handled)
+}
+
 fn handle_alloc_named_color(
     state: &mut ServerState,
     client_id: ClientId,
@@ -27966,6 +28041,109 @@ mod tests {
         body.extend_from_slice(&[0, 0]); // pad
         body.extend_from_slice(name);
         body
+    }
+
+    fn free_colors_body(cmap: u32, plane_mask: u32, pixels: &[u32]) -> Vec<u8> {
+        let mut body = Vec::with_capacity(8 + pixels.len() * 4);
+        body.extend_from_slice(&cmap.to_le_bytes());
+        body.extend_from_slice(&plane_mask.to_le_bytes());
+        for pixel in pixels {
+            body.extend_from_slice(&pixel.to_le_bytes());
+        }
+        body
+    }
+
+    fn dispatch_free_colors(cmap: u32, plane_mask: u32, pixels: &[u32]) -> Vec<u8> {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let body = free_colors_body(cmap, plane_mask, pixels);
+        let outcome = process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(0x1234),
+            RequestHeader {
+                opcode: 88,
+                data: 0,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .expect("process_request");
+        assert!(
+            matches!(outcome, RequestOutcome::Handled),
+            "unexpected outcome: {outcome:?}"
+        );
+        read_all_available(&mut peer)
+    }
+
+    fn assert_free_colors_error(error: &[u8], code: u8, bad_value: u32) {
+        assert_eq!(error.len(), 32, "one fixed-size X11 error");
+        assert_eq!(error[0], 0, "Error");
+        assert_eq!(error[1], code);
+        assert_eq!(&error[2..4], &0x1234u16.to_le_bytes());
+        assert_eq!(&error[4..8], &bad_value.to_le_bytes());
+        assert_eq!(error[10], 88, "major opcode");
+    }
+
+    #[test]
+    fn free_colors_is_dispatched_as_a_successful_core_request() {
+        let output = dispatch_free_colors(
+            crate::resources::ROOT_COLORMAP.0,
+            0,
+            &[0x00aa_bbcc, 0x0011_2233],
+        );
+        assert!(output.is_empty(), "successful FreeColors is a void request");
+    }
+
+    #[test]
+    fn free_colors_accepts_valid_nonzero_plane_mask() {
+        let output = dispatch_free_colors(
+            crate::resources::ROOT_COLORMAP.0,
+            0x0000_000f,
+            &[0x0011_2230],
+        );
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn free_colors_empty_pixel_list_ignores_outside_plane_mask() {
+        let output = dispatch_free_colors(crate::resources::ROOT_COLORMAP.0, 0xff00_0000, &[]);
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn free_colors_argb_visual_accepts_alpha_bits() {
+        let output = dispatch_free_colors(
+            crate::resources::ARGB_COLORMAP.0,
+            0x0f00_0000,
+            &[0xf011_2233],
+        );
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn free_colors_outside_plane_mask_returns_bad_value() {
+        let error = dispatch_free_colors(
+            crate::resources::ROOT_COLORMAP.0,
+            0xff00_0000,
+            &[0x0011_2233],
+        );
+        assert_free_colors_error(&error, x11::error::BAD_VALUE, 0xff11_2233);
+    }
+
+    #[test]
+    fn free_colors_outside_pixel_bits_return_bad_value() {
+        let error = dispatch_free_colors(crate::resources::ROOT_COLORMAP.0, 0, &[0x8011_2233]);
+        assert_free_colors_error(&error, x11::error::BAD_VALUE, 0x8011_2233);
+    }
+
+    #[test]
+    fn free_colors_unknown_colormap_returns_bad_colormap() {
+        let error = dispatch_free_colors(0xdead_beef, 0, &[0]);
+        assert_free_colors_error(&error, x11::error::BAD_COLORMAP, 0xdead_beef);
     }
 
     #[test]

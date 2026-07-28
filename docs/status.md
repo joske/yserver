@@ -35,6 +35,14 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ## Where we are
 
+- **2026-07-28 Tk `FreeColors` compatibility:** core opcode 88 is now
+  dispatched instead of falling through to `BadRequest`. The handler validates
+  the colormap plus Xorg's statelessly detectable `BadValue` cases for pixels
+  and plane masks, including the depth-32 alpha mask. yserver's fixed TrueColor
+  model does not yet retain per-client read-only color allocation references,
+  so unallocated and repeated frees are deliberately accepted instead of
+  returning Xorg's `BadAccess`. Wire regressions cover successful Tk-style and
+  masked requests, the zero-pixel edge, ARGB, `BadValue`, and `BadColormap`.
 - **2026-07-28 PresentPixmapSynced acquire wait (bee + silence passed):**
   yserver now follows Xorg's non-blocking Copy-path ordering: it does not copy
   or damage a synced Present source until `acquire_syncobj@acquire_value`
