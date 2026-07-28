@@ -590,6 +590,22 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ## Where we are
 
+- **2026-09-09 PR #112, exact descendant SHAPE clipping and descriptor capacity:**
+  rebased onto `origin/master` at `64d4b6e`. The current visibility walker
+  carries exact ancestor `winSize` separately from capped occlusion/damage
+  regions, preserving Bounding/Clip masks and border/content coordinates.
+  Empty intersections remain empty even when the occlusion region collapses.
+  Composite descriptor pools grow only on free slots to cover the complete
+  frame; descriptor sets allocate in one batch and allocation failure returns
+  before recording/submission, preserving the existing retry/damage path.
+  Software tests cover both visibility modes, two outputs, 4225-piece masks,
+  pixel readback including alpha/holes, pool-growth/reset failure and retry,
+  and injected Vulkan allocation errors at the real submit boundary. Exact
+  CI Clippy passes on Rust 1.98.0; 2871 default tests and seven focused software
+  tests pass, with no Vulkan validation errors in the latter. The RX580
+  crash is not claimed reproduced or fixed; no hardware/KMS tests were run.
+  See [`pr112-descriptor-fix.md`](pr112-descriptor-fix.md) for validation.
+
 - **2026-08-24 direct-scanout fallback-target fix:** a `CowDescendant` root
   Present's pinned redirected paint target need not be the Composite Overlay
   Window itself. Lazy fallback now copies into that exact pinned paint target

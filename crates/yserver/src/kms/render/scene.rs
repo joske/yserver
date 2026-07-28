@@ -89,7 +89,7 @@ use crate::kms::{
     vk::{
         compositor::{CompositeDraw, CompositeScene, PresentError},
         damage_audit_compare::{DamageAuditComparePipeline, DamageAuditTileSummary},
-        pipeline::{CompositePushConsts, CompositorPipeline, MAX_DESCRIPTOR_SETS_PER_FRAME},
+        pipeline::{CompositePushConsts, CompositorPipeline, INITIAL_DESCRIPTOR_SETS_PER_FRAME},
         scanout::{
             BoPhase, BoState, CopiedRenderSource, CopiedTransportPreparation, OutputScanout,
             ScanoutBo,
@@ -1302,7 +1302,7 @@ impl SceneCompositor {
         i: usize,
     ) -> Result<OutputSceneState, SceneError> {
         let layout = &platform.outputs[i];
-        let ring = CompositePoolRing::new(Arc::clone(vk), MAX_DESCRIPTOR_SETS_PER_FRAME)
+        let ring = CompositePoolRing::new(Arc::clone(vk), INITIAL_DESCRIPTOR_SETS_PER_FRAME)
             .map_err(SceneError::Vk)?;
         let bo_depth = platform
             .scanout_pools
@@ -4530,7 +4530,11 @@ fn tick_one_output(
 
     // 6. Acquire descriptor-pool slot.
     let state = inner.outputs.get_mut(output_idx).expect("range");
-    let slot = match state.pool_ring.acquire() {
+    let slot = match state
+        .pool_ring
+        .acquire(render_scene.draws.len())
+        .map_err(|e| SceneError::Present(PresentError::Vk(e)))?
+    {
         Some(s) => s,
         None => {
             log::debug!(
@@ -4591,11 +4595,9 @@ fn tick_one_output(
         (pl, inner.overlay_xor_cache.pipeline_layout())
     };
     let mut gpu_submitted = false;
-    // Step 1 — whether every draw of `render_scene` was actually recorded.
-    // Descriptor allocation `break`s on pool exhaustion and the recorder draws
-    // only the allocated prefix; on the clipped path a frame that painted less
-    // than it claims must not be staged as `painted`. The copied route renders
-    // Full and re-clears every frame, so only the shared path reports it.
+    // Successful allocation/recording covers every draw; failed batches
+    // return before queue submission. Retain the completion check as a
+    // defensive damage-staging invariant.
     let mut compose_complete = true;
     let record_start = std::time::Instant::now();
     let (render_result, previous_gpu_ns, copied_prepare_failed) = match pool {
@@ -4733,14 +4735,8 @@ fn tick_one_output(
                     let bit = 1u32 << (output_idx % 32);
                     if WARNED.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0 {
                         log::warn!(
-                            "render scene: output {output_idx} composed {} of {} draws \
-                             (descriptor pool exhausted); BO state invalidated, next \
-                             frame repaints in full",
-                            render_scene
-                                .draws
-                                .len()
-                                .min(MAX_DESCRIPTOR_SETS_PER_FRAME as usize),
-                            render_scene.draws.len(),
+                            "render scene: output {output_idx} failed composite coverage \
+                             check; BO state invalidated, next frame repaints in full",
                         );
                     }
                 }
@@ -5536,6 +5532,7 @@ fn build_scene_with(
             i32::MIN / 2,
             i32::MAX / 2,
             i32::MAX / 2,
+            None,
         );
     }
     // The root is the last node in computation order — the bottom of the
@@ -6225,6 +6222,149 @@ struct NodeDecision {
     child_under_redirected_ancestor: bool,
 }
 
+/// Return the exclusive end of the YX band starting at `start`.
+///
+/// KMS canonicalizes SHAPE regions when it stores them, and intersections
+/// produced below preserve that representation: rectangles are ordered by
+/// `(y0, y1, x0)`, rectangles in one band share their Y interval, and their
+/// X spans neither overlap nor touch.
+fn abs_region_band_end(region: &[[i32; 4]], start: usize) -> usize {
+    let y0 = region[start][1];
+    let y1 = region[start][3];
+    let mut end = start + 1;
+    while end < region.len() && region[end][1] == y0 && region[end][3] == y1 {
+        end += 1;
+    }
+    end
+}
+
+/// Coalesce a newly appended band vertically with the previous band when
+/// their X spans are identical and their Y intervals touch.
+fn coalesce_abs_band(
+    out: &mut Vec<[i32; 4]>,
+    band_start: usize,
+    previous_band_start: &mut Option<usize>,
+) {
+    if band_start == out.len() {
+        return;
+    }
+    if let Some(previous_start) = *previous_band_start {
+        let previous_len = band_start - previous_start;
+        let current_len = out.len() - band_start;
+        let bands_touch = out[previous_start][3] == out[band_start][1];
+        let same_x_spans = previous_len == current_len
+            && (0..previous_len).all(|offset| {
+                out[previous_start + offset][0] == out[band_start + offset][0]
+                    && out[previous_start + offset][2] == out[band_start + offset][2]
+            });
+        if bands_touch && same_x_spans {
+            let new_y1 = out[band_start][3];
+            for rect in &mut out[previous_start..band_start] {
+                rect[3] = new_y1;
+            }
+            out.truncate(band_start);
+            return;
+        }
+    }
+    *previous_band_start = Some(band_start);
+}
+
+/// Exact intersection of two canonical YX-banded regions, each a list of
+/// absolute half-open `[x0, y0, x1, y1]` rectangles.
+///
+/// The sweep only compares horizontally within vertically-overlapping bands
+/// and preserves canonical ordering/coalescing in the output. It deliberately
+/// has no rectangle cap or bounding-box fallback: a legitimate exact region
+/// can contain the Cartesian product of the input rectangle counts (vertical
+/// stripes intersecting horizontal stripes), and replacing that output with
+/// its extents violates SHAPE by painting holes.
+fn intersect_abs_regions(a: &[[i32; 4]], b: &[[i32; 4]]) -> Vec<[i32; 4]> {
+    if a.is_empty() || b.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let mut previous_band_start = None;
+    let mut a_start = 0;
+    let mut b_start = 0;
+    let mut a_end = abs_region_band_end(a, a_start);
+    let mut b_end = abs_region_band_end(b, b_start);
+
+    while a_start < a.len() && b_start < b.len() {
+        let ay0 = a[a_start][1];
+        let ay1 = a[a_start][3];
+        let by0 = b[b_start][1];
+        let by1 = b[b_start][3];
+        let y0 = ay0.max(by0);
+        let y1 = ay1.min(by1);
+
+        if y1 > y0 {
+            let band_start = out.len();
+            let mut ai = a_start;
+            let mut bi = b_start;
+            while ai < a_end && bi < b_end {
+                let [ax0, _, ax1, _] = a[ai];
+                let [bx0, _, bx1, _] = b[bi];
+                let x0 = ax0.max(bx0);
+                let x1 = ax1.min(bx1);
+                if x1 > x0 {
+                    out.push([x0, y0, x1, y1]);
+                }
+                if ax1 <= bx1 {
+                    ai += 1;
+                }
+                if bx1 <= ax1 {
+                    bi += 1;
+                }
+            }
+            coalesce_abs_band(&mut out, band_start, &mut previous_band_start);
+        }
+
+        if ay1 <= by1 {
+            a_start = a_end;
+            if a_start < a.len() {
+                a_end = abs_region_band_end(a, a_start);
+            }
+        }
+        if by1 <= ay1 {
+            b_start = b_end;
+            if b_start < b.len() {
+                b_end = abs_region_band_end(b, b_start);
+            }
+        }
+    }
+    out
+}
+
+/// Exact SHAPE clipping, independent of the capped occlusion/damage Region.
+fn clip_shape_place(place: &[vk::Rect2D], ancestor: &[[i32; 4]]) -> Vec<vk::Rect2D> {
+    let own = shape_place_boxes(place);
+    intersect_abs_regions(&own, ancestor)
+        .into_iter()
+        .map(|[x0, y0, x1, y1]| vk::Rect2D {
+            offset: vk::Offset2D { x: x0, y: y0 },
+            extent: vk::Extent2D {
+                width: (x1 - x0) as u32,
+                height: (y1 - y0) as u32,
+            },
+        })
+        .collect()
+}
+
+fn shape_place_boxes(place: &[vk::Rect2D]) -> Vec<[i32; 4]> {
+    place
+        .iter()
+        .map(|r| {
+            [
+                r.offset.x,
+                r.offset.y,
+                r.offset.x.saturating_add_unsigned(r.extent.width),
+                r.offset.y.saturating_add_unsigned(r.extent.height),
+            ]
+        })
+        .collect()
+}
+
 /// #133 step 5 (5.2 / 5.3) — a node's INNER region as output-local rects:
 /// Xorg's `winSize` (`SetWinSize`, `dix/window.c:1713`).
 ///
@@ -6259,37 +6399,30 @@ fn inner_place_rects(
     // The content box in storage-local coords, clamped to the ancestor
     // visible box. At `co == 0` this is the window rect — the same box
     // `place` starts from.
-    let mut boxes: Vec<(i32, i32, i32, i32)> = Vec::new();
+    let mut boxes: Vec<[i32; 4]> = Vec::new();
     let bx0 = co.max(vis_lx0);
     let by0 = co.max(vis_ly0);
     let bx1 = (co + own_w).min(vis_lx1);
     let by1 = (co + own_h).min(vis_ly1);
     if bx1 > bx0 && by1 > by0 {
-        boxes.push((bx0, by0, bx1, by1));
+        boxes.push([bx0, by0, bx1, by1]);
     }
     for list in [bounding, clip].into_iter().flatten() {
-        let mut next: Vec<(i32, i32, i32, i32)> = Vec::new();
-        for &(ax0, ay0, ax1, ay1) in &boxes {
-            for r in list {
-                let sx0 = i32::from(r.x) + co;
-                let sy0 = i32::from(r.y) + co;
-                let sx1 = sx0 + i32::from(r.width);
-                let sy1 = sy0 + i32::from(r.height);
-                let ix0 = ax0.max(sx0);
-                let iy0 = ay0.max(sy0);
-                let ix1 = ax1.min(sx1);
-                let iy1 = ay1.min(sy1);
-                if ix1 > ix0 && iy1 > iy0 {
-                    next.push((ix0, iy0, ix1, iy1));
-                }
-            }
-        }
-        boxes = next;
+        let shape: Vec<_> = list
+            .iter()
+            .filter(|r| r.width != 0 && r.height != 0)
+            .map(|r| {
+                let x = i32::from(r.x) + co;
+                let y = i32::from(r.y) + co;
+                [x, y, x + i32::from(r.width), y + i32::from(r.height)]
+            })
+            .collect();
+        boxes = intersect_abs_regions(&boxes, &shape);
         if boxes.is_empty() {
             break;
         }
     }
-    let out = boxes.into_iter().map(|(x0, y0, x1, y1)| vk::Rect2D {
+    let out = boxes.into_iter().map(|[x0, y0, x1, y1]| vk::Rect2D {
         offset: vk::Offset2D {
             x: dx + x0,
             y: dy + y0,
@@ -6733,8 +6866,8 @@ fn visit_window_subtree(
     // Per-window SHAPE bounding regions (`KmsCore::shape_bounding`).
     // When a host xid has an entry the window's scene draw is
     // clipped to those rects — marco's rounded-corner frame masks
-    // depend on this. Empty / missing entry → unshaped, single
-    // full-window draw.
+    // depend on this. A missing entry is unshaped; an explicit empty
+    // entry produces no visible pixels.
     shape_bounding: &HashMap<u32, Vec<xfixes::RegionRect>>,
     // Per-window SHAPE CLIP regions (`KmsCore::shape_clip`). #133 step 5
     // (5.3): the clip shape narrows `winSize` — the region DESCENDANTS are
@@ -6785,6 +6918,9 @@ fn visit_window_subtree(
     clip_y0: i32,
     clip_x1: i32,
     clip_y1: i32,
+    // Exact accumulated ancestor winSize, output-local. None means no shaped
+    // ancestor; Some([]) suppresses the subtree. Never use capped Region here.
+    ancestor_shape: Option<&[[i32; 4]]>,
 ) {
     let debug_focus = scene_walk_debug_enabled_for(host_xid);
     // Stage 4 diagnostic: trace-level scene-walk decision per window.
@@ -6827,7 +6963,7 @@ fn visit_window_subtree(
         return;
     }
 
-    let node = decide_node(
+    let mut node = decide_node(
         host_xid,
         geom,
         parent_content_abs_x,
@@ -6847,6 +6983,13 @@ fn visit_window_subtree(
         clip_x1,
         clip_y1,
     );
+    if let Some(ancestor) = ancestor_shape {
+        node.place = clip_shape_place(&node.place, ancestor);
+        if let Some(inner) = &mut node.child_place {
+            *inner = clip_shape_place(inner, ancestor);
+        }
+    }
+
     sink.stats.nodes_visited += 1;
     // OUTER absolute — what the node samples and occludes with.
     let abs_x = node.abs_x;
@@ -7017,8 +7160,9 @@ fn visit_window_subtree(
     // children to the parent's PLACE (rect ∩ ancestors ∩ shape), not its
     // bounding box, is the parent-bounding-shape fix: Xorg's child universe is
     // `∩ borderSize`, and `borderSize` is shape-clipped. This is the one union
-    // in the walk; a collapse degrades to "children clipped to the parent's
-    // bbox", which is exactly the pre-step-1 behaviour.
+    // in the walk; it may conservatively collapse for occlusion, while the
+    // independent ancestor_shape constraint still clips every child's place
+    // exactly before emission.
     //
     // Leaf fast path: a node with no children needs no `mine` at all. Its
     // pieces are `universe ∩ r` per place rect (which is exactly `mine ∩ r`,
@@ -7037,6 +7181,16 @@ fn visit_window_subtree(
     // ARE the same rect list — the `bw == 0` path reads exactly the vector it
     // read before, through the same code below.
     let child_region_rects: &[vk::Rect2D] = node.child_place.as_deref().unwrap_or(&node.place);
+    let child_shape = if !is_leaf
+        && (ancestor_shape.is_some()
+            || shape_bounding.contains_key(&host_xid)
+            || shape_clip.contains_key(&host_xid))
+    {
+        Some(shape_place_boxes(child_region_rects))
+    } else {
+        None
+    };
+
     let mut mine = Region::new();
     // #133 step 5 (5.2) — this node's OWN region that lies outside its inner
     // region: the border ring. Xorg keeps the same two things apart —
@@ -7116,6 +7270,7 @@ fn visit_window_subtree(
                 node.child_clip_y0,
                 node.child_clip_x1,
                 node.child_clip_y1,
+                child_shape.as_deref(),
             );
         }
     }
@@ -7768,6 +7923,58 @@ fn submit_copied_scanout_render(
         .map_err(|error| CopiedRenderSubmitError::Present(PresentError::Vk(error)))
 }
 
+/// Allocate the complete draw list before any recording/submission. The
+/// callback is the Vulkan batch allocator in production; tests inject its
+/// failures without depending on an ICD enforcing pool capacity.
+fn allocate_composite_descriptors(
+    scene: &CompositeScene,
+    allocate: impl FnOnce(usize) -> Result<Vec<vk::DescriptorSet>, vk::Result>,
+) -> Result<Vec<vk::DescriptorSet>, PresentError> {
+    if scene.draws.is_empty() {
+        return Ok(Vec::new());
+    }
+    u32::try_from(scene.draws.len()).map_err(|_| vk::Result::ERROR_OUT_OF_POOL_MEMORY)?;
+    let descriptors = allocate(scene.draws.len())?;
+    // A successful Vulkan batch has exactly the requested size. Keep this
+    // guard at the recorder boundary so no caller can submit a prefix.
+    if descriptors.len() != scene.draws.len() {
+        return Err(PresentError::Vk(vk::Result::ERROR_OUT_OF_POOL_MEMORY));
+    }
+    Ok(descriptors)
+}
+
+fn prepare_composite_descriptors(
+    vk: &crate::kms::vk::device::VkContext,
+    pipeline: &CompositorPipeline,
+    descriptor_pool: vk::DescriptorPool,
+    scene: &CompositeScene,
+) -> Result<Vec<vk::DescriptorSet>, PresentError> {
+    // All-or-nothing allocation: never record or acknowledge a partial
+    // frame. Vulkan rolls back a failed batch; the caller releases the slot
+    // and retains damage through the existing unsubmitted-error path.
+    let descriptors = allocate_composite_descriptors(scene, |count| {
+        let layouts = vec![pipeline.descriptor_set_layout; count];
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(descriptor_pool)
+            .set_layouts(&layouts);
+        unsafe { vk.device.allocate_descriptor_sets(&alloc_info) }
+    })?;
+    for (draw, &set) in scene.draws.iter().zip(&descriptors) {
+        let image_info = [vk::DescriptorImageInfo::default()
+            .image_view(draw.image_view)
+            .sampler(pipeline.sampler)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let writes = [vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(&image_info)];
+        unsafe { vk.device.update_descriptor_sets(&writes, &[]) };
+    }
+
+    Ok(descriptors)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_and_submit_render(
     vk: &crate::kms::vk::device::VkContext,
@@ -7815,36 +8022,7 @@ fn record_and_submit_render(
     };
     target.set_last_gpu_render_ns(last_gpu_render_ns);
 
-    // Allocate descriptor sets — same shape as v1.
-    let mut descriptors: Vec<vk::DescriptorSet> = Vec::with_capacity(scene.draws.len());
-    for draw in &scene.draws {
-        let layouts = [pipeline.descriptor_set_layout];
-        let alloc_info = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(descriptor_pool)
-            .set_layouts(&layouts);
-        let set = match unsafe { vk.device.allocate_descriptor_sets(&alloc_info) } {
-            Ok(sets) => sets[0],
-            Err(e) => {
-                log::warn!(
-                    "render compose: descriptor allocation failed ({e:?}) at draw {} of {}",
-                    descriptors.len(),
-                    scene.draws.len(),
-                );
-                break;
-            }
-        };
-        let image_info = [vk::DescriptorImageInfo::default()
-            .image_view(draw.image_view)
-            .sampler(pipeline.sampler)
-            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-        let writes = [vk::WriteDescriptorSet::default()
-            .dst_set(set)
-            .dst_binding(0)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .image_info(&image_info)];
-        unsafe { vk.device.update_descriptor_sets(&writes, &[]) };
-        descriptors.push(set);
-    }
+    let descriptors = prepare_composite_descriptors(vk, pipeline, descriptor_pool, scene)?;
 
     // Record.
     record_command_buffer(
@@ -7905,6 +8083,9 @@ fn record_command_buffer<T: ComposeRenderTarget + ?Sized>(
     xor_pipeline: vk::Pipeline,
     xor_layout: vk::PipelineLayout,
 ) -> Result<(), PresentError> {
+    if descriptors.len() != scene.draws.len() {
+        return Err(PresentError::Vk(vk::Result::ERROR_OUT_OF_POOL_MEMORY));
+    }
     let device = &vk.device;
     let cb = bo.command_buffer();
     // Mirror the timestamp gate `record_and_submit_render` uses so we can bracket the
@@ -8055,7 +8236,7 @@ fn record_command_buffer<T: ComposeRenderTarget + ?Sized>(
         for scissor in scissors {
             crate::vk_count!(cmd_set_scissor);
             device.cmd_set_scissor(cb, 0, std::slice::from_ref(scissor));
-            for (i, draw) in scene.draws.iter().enumerate().take(descriptors.len()) {
+            for (draw, &descriptor) in scene.draws.iter().zip(descriptors) {
                 if scissors.len() > 1
                     && draw_dst_rect_inward(draw).is_some_and(|dst| !rects_intersect(dst, *scissor))
                 {
@@ -8067,7 +8248,7 @@ fn record_command_buffer<T: ComposeRenderTarget + ?Sized>(
                     device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pl);
                     last_pipeline = Some(pl);
                 }
-                let sets = [descriptors[i]];
+                let sets = [descriptor];
                 crate::vk_count!(cmd_bind_descriptor_sets);
                 device.cmd_bind_descriptor_sets(
                     cb,
@@ -9943,6 +10124,793 @@ mod tests {
         );
     }
 
+    #[test]
+    fn intersect_abs_regions_preserves_large_exact_stripe_product() {
+        // Both inputs are canonical, non-overlapping YX-banded regions.
+        // Their exact intersection contains 65×65 disjoint pixels, well
+        // beyond the removed 64-rect fallback. Collapsing to extents would
+        // incorrectly fill every one-pixel gap.
+        let vertical: Vec<[i32; 4]> = (0..65)
+            .map(|i| {
+                let x = i * 2;
+                [x, 0, x + 1, 129]
+            })
+            .collect();
+        let horizontal: Vec<[i32; 4]> = (0..65)
+            .map(|i| {
+                let y = i * 2;
+                [0, y, 129, y + 1]
+            })
+            .collect();
+
+        let intersection = intersect_abs_regions(&vertical, &horizontal);
+        assert_eq!(
+            intersection.len(),
+            65 * 65,
+            "every vertical/horizontal stripe crossing is a real output rect",
+        );
+        assert!(
+            intersection
+                .iter()
+                .all(|[x0, y0, x1, y1]| x1 - x0 == 1 && y1 - y0 == 1),
+            "the exact result must retain the one-pixel crossings: {intersection:?}",
+        );
+        assert!(
+            !intersection
+                .iter()
+                .any(|[x0, y0, x1, y1]| *x0 <= 1 && 1 < *x1 && *y0 <= 1 && 1 < *y1),
+            "the hole at (1,1) must not be painted by a bounding-box fallback",
+        );
+    }
+
+    #[test]
+    fn pr112_full_frame_cow_shape_does_not_amplify_draws_on_either_output() {
+        pr112_full_frame_cow_shape_does_not_amplify_draws_on_either_output_with_mode(
+            Visibility::Off,
+        );
+        pr112_full_frame_cow_shape_does_not_amplify_draws_on_either_output_with_mode(
+            Visibility::On,
+        );
+    }
+
+    fn pr112_full_frame_cow_shape_does_not_amplify_draws_on_either_output_with_mode(
+        mode: Visibility,
+    ) {
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let mut platform = PlatformBackend::for_tests();
+        let mut windows = super::super::backend::WindowsMap::new();
+        let cow = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+        alloc_stub_window(&mut store, &mut windows, cow, 0, 0, 5120, 1440, None, true);
+        core.top_level_order.push(cow);
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0xB1,
+            0,
+            0,
+            5120,
+            1440,
+            Some(cow),
+            true,
+        );
+        // Many restored descendants across the virtual desktop. This tests
+        // the reported full-frame COW rectangle, not a complex synthetic mask.
+        for i in 0..100u32 {
+            let xid = 0x1000 + i;
+            alloc_stub_window(
+                &mut store,
+                &mut windows,
+                xid,
+                i16::try_from((i % 20) * 250).unwrap(),
+                i16::try_from((i / 20) * 250).unwrap(),
+                200,
+                200,
+                Some(0xB1),
+                true,
+            );
+            windows.get_mut(&xid).unwrap().stack_rank = u64::from(i);
+        }
+        for output_x in [0, 2560] {
+            platform.outputs[0].x = output_x;
+            platform.outputs[0].width = 2560;
+            platform.outputs[0].height = 1440;
+            core.shape_bounding.remove(&cow);
+            let plain = build_scene(
+                &core,
+                &mut store,
+                &windows,
+                0,
+                &platform,
+                None,
+                None,
+                Some(cow),
+                false,
+                mode,
+            );
+            core.shape_bounding.insert(
+                cow,
+                vec![xfixes::RegionRect {
+                    x: 0,
+                    y: 0,
+                    width: 5120,
+                    height: 1440,
+                }],
+            );
+            let shaped = build_scene(
+                &core,
+                &mut store,
+                &windows,
+                0,
+                &platform,
+                None,
+                None,
+                Some(cow),
+                false,
+                mode,
+            );
+            assert!(!plain.scene.draws.is_empty());
+            assert_eq!(plain.scene.draws.len(), shaped.scene.draws.len());
+            assert_eq!(plain.sampled_ids, shaped.sampled_ids);
+            assert_eq!(plain.snapshots.len(), shaped.snapshots.len());
+            for (a, b) in plain.scene.draws.iter().zip(&shaped.scene.draws) {
+                assert_eq!(a.image_view, b.image_view);
+                assert_eq!(a.dst_origin, b.dst_origin);
+                assert_eq!(a.dst_size, b.dst_size);
+                assert_eq!(a.src_origin, b.src_origin);
+                assert_eq!(a.src_size, b.src_size);
+                assert_eq!(a.alpha_passthrough, b.alpha_passthrough);
+            }
+            eprintln!(
+                "PR112 output_x={output_x} plain={} shaped={}",
+                plain.scene.draws.len(),
+                shaped.scene.draws.len()
+            );
+        }
+    }
+
+    #[test]
+    fn pr112_nested_stripes_exceed_pool_budget_in_real_scene_walk() {
+        pr112_nested_stripes_exceed_pool_budget_in_real_scene_walk_with_mode(Visibility::Off);
+        pr112_nested_stripes_exceed_pool_budget_in_real_scene_walk_with_mode(Visibility::On);
+    }
+
+    fn pr112_nested_stripes_exceed_pool_budget_in_real_scene_walk_with_mode(mode: Visibility) {
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows = super::super::backend::WindowsMap::new();
+        let cow = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+        alloc_stub_window(&mut store, &mut windows, cow, 0, 0, 129, 129, None, true);
+        core.top_level_order.push(cow);
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0xB1,
+            0,
+            0,
+            129,
+            129,
+            Some(cow),
+            true,
+        );
+        core.shape_bounding.insert(
+            cow,
+            (0..65)
+                .map(|i| xfixes::RegionRect {
+                    x: i * 2,
+                    y: 0,
+                    width: 1,
+                    height: 129,
+                })
+                .collect(),
+        );
+        core.shape_bounding.insert(
+            0xB1,
+            (0..65)
+                .map(|i| xfixes::RegionRect {
+                    x: 0,
+                    y: i * 2,
+                    width: 129,
+                    height: 1,
+                })
+                .collect(),
+        );
+        let id = store.lookup(0xB1).unwrap();
+        let view = store.get(id).unwrap().storage.sample_view;
+        let built = build_scene(
+            &core,
+            &mut store,
+            &windows,
+            0,
+            &platform,
+            None,
+            None,
+            Some(cow),
+            false,
+            mode,
+        );
+        let pieces: Vec<_> = built
+            .scene
+            .draws
+            .iter()
+            .filter(|draw| draw.image_view == view)
+            .collect();
+        assert_eq!(pieces.len(), 4225);
+        assert!(built.scene.draws.len() > INITIAL_DESCRIPTOR_SETS_PER_FRAME as usize);
+        // Raster oracle: no missing pixels, painted holes, or repeated
+        // SrcOver blends. Check the scene output, not just region arithmetic.
+        let mut coverage = vec![0u8; 129 * 129];
+        for draw in pieces {
+            assert!(draw.alpha_passthrough);
+            assert_eq!(draw.dst_size, [1.0, 1.0]);
+            let x = draw.dst_origin[0] as usize;
+            let y = draw.dst_origin[1] as usize;
+            assert!(x < 129 && y < 129);
+            coverage[y * 129 + x] += 1;
+        }
+        for (offset, count) in coverage.into_iter().enumerate() {
+            let (x, y) = (offset % 129, offset / 129);
+            assert_eq!(count, u8::from(x % 2 == 0 && y % 2 == 0), "pixel ({x},{y})");
+        }
+        assert_eq!(
+            built
+                .sampled_ids
+                .iter()
+                .filter(|&&sample| sample == id)
+                .count(),
+            1
+        );
+        assert_eq!(
+            built
+                .snapshots
+                .iter()
+                .filter(|snapshot| snapshot.id == id)
+                .count(),
+            1
+        );
+        eprintln!(
+            "PR112 nested stripes total_draws={} child_draws=4225 capacity={}",
+            built.scene.draws.len(),
+            INITIAL_DESCRIPTOR_SETS_PER_FRAME
+        );
+    }
+
+    #[test]
+    fn intersect_abs_regions_coalesces_identical_output_bands() {
+        let a = [[0, 0, 10, 10]];
+        // B cannot coalesce its two Y bands because only the first has the
+        // disjoint 20..30 span. Intersecting with A removes that difference,
+        // so the two resulting 0..10 spans must coalesce vertically.
+        let b = [[0, 0, 10, 5], [20, 0, 30, 5], [0, 5, 10, 10]];
+
+        assert_eq!(intersect_abs_regions(&a, &b), vec![[0, 0, 10, 10]]);
+    }
+
+    /// SHAPE bounding region clips DESCENDANTS too, not just the
+    /// shaped window itself — "the window's border and contents ...
+    /// and those of its inferiors are clipped to the bounding region".
+    ///
+    /// Regression: KWin reparents a Plasma panel into
+    /// frame → wrapper → client and puts the floating panel's shape on
+    /// the FRAME (3440x24+0+16 inside a 3440x40 frame) so the margin it
+    /// slides through shows the wallpaper when nothing composites. The
+    /// wrapper in between is unshaped and full-height; the scene folded
+    /// only ancestor *geometry* into the child clip, so the wrapper was
+    /// emitted whole and its opaque background painted a white band
+    /// across the margin — Strix Halo / amdgpu, non-composited Plasma
+    /// 6.6, 2026-07-28. Enabling a compositor masked it (KWin then
+    /// samples the window as a texture and the alpha carries the
+    /// cut-out), which is why it only showed with compositing off.
+    #[test]
+    fn build_scene_clips_descendants_to_ancestor_shape_bounding() {
+        use yserver_protocol::x11::xfixes::RegionRect;
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows = super::super::backend::WindowsMap::new();
+
+        // Frame @ (0, 100), 400×40 — the shaped ancestor.
+        alloc_stub_window(&mut store, &mut windows, 0x100, 0, 100, 400, 40, None, true);
+        core.top_level_order.push(0x100);
+        // Panel band: only rows 16..40 of the frame are in the region.
+        core.shape_bounding.insert(
+            0x100,
+            vec![RegionRect {
+                x: 0,
+                y: 16,
+                width: 400,
+                height: 24,
+            }],
+        );
+
+        // Wrapper: fills the frame, NO shape of its own.
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0x101,
+            0,
+            0,
+            400,
+            40,
+            Some(0x100),
+            true,
+        );
+
+        let built = build_scene(
+            &core,
+            &mut store,
+            &windows,
+            0,
+            &platform,
+            None,
+            None,
+            None,
+            false,
+            Visibility::Off,
+        );
+        let scene = built.scene;
+
+        // Nothing may be painted above the band's top edge (abs y 116).
+        assert!(
+            !scene.draws.iter().any(|d| d.dst_origin[1] < 116.0),
+            "no draw may land above the ancestor's bounding band at y=116 \
+             (the margin must stay clear); got {:?}",
+            scene.draws,
+        );
+        // The unshaped wrapper inherits the band: y 116, height 24.
+        let wrapper = scene
+            .draws
+            .iter()
+            .find(|d| (d.dst_origin[1] - 116.0).abs() < 1e-5 && d.dst_size[1] == 24.0)
+            .unwrap_or_else(|| {
+                panic!(
+                    "wrapper must be clipped to the ancestor band, got {:?}",
+                    scene.draws
+                )
+            });
+        assert_eq!(
+            wrapper.dst_size,
+            [400.0, 24.0],
+            "wrapper must be clipped to 400×24, not drawn at its full 400×40",
+        );
+        // It must sample the matching sub-region of its own storage,
+        // otherwise the band shows the wrong 24 rows of the wrapper.
+        assert!(
+            (wrapper.src_origin[1] - 16.0 / 40.0).abs() < 1e-5
+                && (wrapper.src_size[1] - 24.0 / 40.0).abs() < 1e-5,
+            "wrapper must sample rows 16..40 of its storage, got origin {:?} size {:?}",
+            wrapper.src_origin,
+            wrapper.src_size,
+        );
+    }
+
+    /// A multi-rect ancestor region must clip descendants to the region
+    /// itself, not to its bounding box. Plasma's panel frame carries a
+    /// rounded mask — three rects, a 1px cap inset one pixel further
+    /// than the body — and clipping the unshaped wrapper to the extents
+    /// instead left one lit pixel in each of the four corners
+    /// (measured on Strix Halo: `(8,8)`, `(8,3431)`, `(31,8)`,
+    /// `(31,3431)` still `#FFFFFF` over the wallpaper).
+    #[test]
+    fn build_scene_clips_descendants_to_multi_rect_ancestor_shape() {
+        use yserver_protocol::x11::xfixes::RegionRect;
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows = super::super::backend::WindowsMap::new();
+
+        // Frame @ (0, 0), 100×40.
+        alloc_stub_window(&mut store, &mut windows, 0x100, 0, 0, 100, 40, None, true);
+        core.top_level_order.push(0x100);
+        // Rounded band: 1px caps inset one further than the body, so
+        // the four corner pixels are inside the bounding box (8..32 ×
+        // 8..92) but outside the region.
+        core.shape_bounding.insert(
+            0x100,
+            vec![
+                RegionRect {
+                    x: 9,
+                    y: 8,
+                    width: 82,
+                    height: 1,
+                },
+                RegionRect {
+                    x: 8,
+                    y: 9,
+                    width: 84,
+                    height: 22,
+                },
+                RegionRect {
+                    x: 9,
+                    y: 31,
+                    width: 82,
+                    height: 1,
+                },
+            ],
+        );
+
+        // Unshaped wrapper filling the frame.
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0x101,
+            0,
+            0,
+            100,
+            40,
+            Some(0x100),
+            true,
+        );
+
+        let built = build_scene(
+            &core,
+            &mut store,
+            &windows,
+            0,
+            &platform,
+            None,
+            None,
+            None,
+            false,
+            Visibility::Off,
+        );
+        let scene = built.scene;
+
+        // Every corner pixel of the bounding box lies outside the true
+        // region and must be covered by no draw at all.
+        for (px, py) in [(8.0_f32, 8.0_f32), (91.0, 8.0), (8.0, 31.0), (91.0, 31.0)] {
+            let covering: Vec<_> = scene
+                .draws
+                .iter()
+                .filter(|d| {
+                    px >= d.dst_origin[0]
+                        && px < d.dst_origin[0] + d.dst_size[0]
+                        && py >= d.dst_origin[1]
+                        && py < d.dst_origin[1] + d.dst_size[1]
+                })
+                .collect();
+            assert!(
+                covering.is_empty(),
+                "corner pixel ({px}, {py}) is outside the rounded region but \
+                 {} draw(s) cover it — the ancestor region was flattened to \
+                 its bounding box: {:?}",
+                covering.len(),
+                covering,
+            );
+        }
+
+        // The body interior must still be painted, twice over: once by
+        // the shaped frame and once by the wrapper it clips.
+        let mid = scene
+            .draws
+            .iter()
+            .filter(|d| {
+                50.0 >= d.dst_origin[0]
+                    && 50.0 < d.dst_origin[0] + d.dst_size[0]
+                    && 20.0 >= d.dst_origin[1]
+                    && 20.0 < d.dst_origin[1] + d.dst_size[1]
+            })
+            .count();
+        assert_eq!(
+            mid, 2,
+            "the band interior must still be drawn by both frame and wrapper, \
+             got {mid} draw(s): {:?}",
+            scene.draws,
+        );
+    }
+
+    #[test]
+    fn build_scene_intersects_shaped_ancestor_and_offset_shaped_child() {
+        use yserver_protocol::x11::xfixes::RegionRect;
+
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows = super::super::backend::WindowsMap::new();
+
+        // Parent absolute box (50,50)-(150,150), with an inset shape
+        // (60,60)-(140,140).
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0x100,
+            50,
+            50,
+            100,
+            100,
+            None,
+            true,
+        );
+        core.top_level_order.push(0x100);
+        core.shape_bounding.insert(
+            0x100,
+            vec![RegionRect {
+                x: 10,
+                y: 10,
+                width: 80,
+                height: 80,
+            }],
+        );
+
+        // Child origin is (40,70): negative X relative to its parent.
+        // Its own shape also starts above the child. Own shape absolute
+        // (70,65)-(130,115), ancestor shape (60,60)-(140,140), and
+        // parent geometry together leave (70,70)-(130,115).
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0x101,
+            -10,
+            20,
+            100,
+            100,
+            Some(0x100),
+            true,
+        );
+        core.shape_bounding.insert(
+            0x101,
+            vec![RegionRect {
+                x: 30,
+                y: -5,
+                width: 60,
+                height: 50,
+            }],
+        );
+        let child_id = store.lookup(0x101).expect("child id");
+        let child_view = store.get(child_id).expect("child").storage.sample_view;
+
+        let built = build_scene(
+            &core,
+            &mut store,
+            &windows,
+            0,
+            &platform,
+            None,
+            None,
+            None,
+            false,
+            Visibility::Off,
+        );
+        let child_draws: Vec<_> = built
+            .scene
+            .draws
+            .iter()
+            .filter(|draw| draw.image_view == child_view)
+            .collect();
+        assert_eq!(
+            child_draws.len(),
+            1,
+            "the shaped child intersection must emit exactly one piece: {:?}",
+            built.scene.draws,
+        );
+        let child = child_draws[0];
+        assert_eq!(child.dst_origin, [70.0, 70.0]);
+        assert_eq!(child.dst_size, [60.0, 45.0]);
+        assert!(
+            (child.src_origin[0] - 0.3).abs() < 1e-5 && child.src_origin[1].abs() < 1e-5,
+            "negative/local offsets must map to the matching child texture area: {:?}",
+            child.src_origin,
+        );
+    }
+
+    #[test]
+    fn build_scene_intersects_two_shaped_ancestors_for_grandchild() {
+        use yserver_protocol::x11::xfixes::RegionRect;
+
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows = super::super::backend::WindowsMap::new();
+
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0x100,
+            100,
+            100,
+            100,
+            100,
+            None,
+            true,
+        );
+        core.top_level_order.push(0x100);
+        core.shape_bounding.insert(
+            0x100,
+            vec![RegionRect {
+                x: 20,
+                y: 0,
+                width: 60,
+                height: 100,
+            }],
+        );
+
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0x101,
+            10,
+            10,
+            100,
+            100,
+            Some(0x100),
+            true,
+        );
+        core.shape_bounding.insert(
+            0x101,
+            vec![RegionRect {
+                x: 0,
+                y: 20,
+                width: 100,
+                height: 40,
+            }],
+        );
+
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0x102,
+            5,
+            5,
+            90,
+            80,
+            Some(0x101),
+            true,
+        );
+        let grandchild_id = store.lookup(0x102).expect("grandchild id");
+        let grandchild_view = store
+            .get(grandchild_id)
+            .expect("grandchild")
+            .storage
+            .sample_view;
+
+        let built = build_scene(
+            &core,
+            &mut store,
+            &windows,
+            0,
+            &platform,
+            None,
+            None,
+            None,
+            false,
+            Visibility::Off,
+        );
+        let grandchild_draws: Vec<_> = built
+            .scene
+            .draws
+            .iter()
+            .filter(|draw| draw.image_view == grandchild_view)
+            .collect();
+        assert_eq!(
+            grandchild_draws.len(),
+            1,
+            "the grandchild must inherit the exact intersection of both shapes",
+        );
+        assert_eq!(grandchild_draws[0].dst_origin, [120.0, 130.0]);
+        assert_eq!(grandchild_draws[0].dst_size, [60.0, 40.0]);
+    }
+
+    #[test]
+    fn build_scene_propagates_empty_nested_shape_intersection() {
+        use yserver_protocol::x11::xfixes::RegionRect;
+
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows = super::super::backend::WindowsMap::new();
+
+        alloc_stub_window(&mut store, &mut windows, 0x100, 0, 0, 100, 100, None, true);
+        core.top_level_order.push(0x100);
+        core.shape_bounding.insert(
+            0x100,
+            vec![RegionRect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 100,
+            }],
+        );
+
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0x101,
+            0,
+            0,
+            100,
+            100,
+            Some(0x100),
+            true,
+        );
+        core.shape_bounding.insert(
+            0x101,
+            vec![RegionRect {
+                x: 20,
+                y: 0,
+                width: 10,
+                height: 100,
+            }],
+        );
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0x102,
+            0,
+            0,
+            100,
+            100,
+            Some(0x101),
+            true,
+        );
+        let child_id = store.lookup(0x101).expect("child id");
+        let grandchild_id = store.lookup(0x102).expect("grandchild id");
+
+        let built = build_scene(
+            &core,
+            &mut store,
+            &windows,
+            0,
+            &platform,
+            None,
+            None,
+            None,
+            false,
+            Visibility::Off,
+        );
+        assert!(
+            !built.pieces_ids.contains(&child_id) && !built.pieces_ids.contains(&grandchild_id),
+            "Some([]) from the empty nested intersection must suppress the \
+             child and its entire subtree: {:?}",
+            built.scene.draws,
+        );
+        assert_eq!(
+            built.scene.draws.len(),
+            1,
+            "only the shaped parent remains visible after the empty intersection",
+        );
+    }
+
+    #[test]
+    fn build_scene_explicit_empty_ancestor_shape_suppresses_child() {
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows = super::super::backend::WindowsMap::new();
+
+        alloc_stub_window(&mut store, &mut windows, 0x100, 0, 0, 100, 100, None, true);
+        core.top_level_order.push(0x100);
+        core.shape_bounding.insert(0x100, Vec::new());
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0x101,
+            0,
+            0,
+            100,
+            100,
+            Some(0x100),
+            true,
+        );
+
+        let built = build_scene(
+            &core,
+            &mut store,
+            &windows,
+            0,
+            &platform,
+            None,
+            None,
+            None,
+            false,
+            Visibility::Off,
+        );
+        assert!(
+            built.scene.draws.is_empty() && built.pieces_ids.is_empty(),
+            "an explicit empty Bounding shape must clip the window and inferiors",
+        );
+    }
+
     /// SHAPE bounding region clips the window's scene draw. Marco
     /// uses `SHAPE-Request: Rectangles destination=Bounding` to set
     /// a rounded-corner mask on frame windows; without honouring it
@@ -11037,6 +12005,103 @@ mod tests {
                 d,
             );
         }
+    }
+
+    #[test]
+    fn cow_multi_piece_shape_samples_and_snapshots_each_window_once() {
+        use yserver_protocol::x11::xfixes::RegionRect;
+
+        let mut core = KmsCore::for_tests();
+        let mut store = DrawableStore::new();
+        let platform = PlatformBackend::for_tests();
+        let mut windows = super::super::backend::WindowsMap::new();
+
+        let cow_xid: u32 = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+        alloc_stub_window(&mut store, &mut windows, cow_xid, 0, 0, 100, 40, None, true);
+        core.top_level_order.push(cow_xid);
+        core.shape_bounding.insert(
+            cow_xid,
+            vec![
+                RegionRect {
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 10,
+                },
+                RegionRect {
+                    x: 0,
+                    y: 20,
+                    width: 100,
+                    height: 10,
+                },
+                RegionRect {
+                    x: 0,
+                    y: 35,
+                    width: 100,
+                    height: 5,
+                },
+            ],
+        );
+
+        alloc_stub_window(
+            &mut store,
+            &mut windows,
+            0xB1,
+            0,
+            0,
+            100,
+            40,
+            Some(cow_xid),
+            true,
+        );
+        let stage_id = store.lookup(0xB1).expect("stage id");
+        let stage_view = store.get(stage_id).expect("stage").storage.sample_view;
+
+        let built = build_scene(
+            &core,
+            &mut store,
+            &windows,
+            0,
+            &platform,
+            None,
+            None,
+            Some(cow_xid),
+            false,
+            Visibility::Off,
+        );
+        let stage_draws: Vec<_> = built
+            .scene
+            .draws
+            .iter()
+            .filter(|draw| draw.image_view == stage_view)
+            .collect();
+        assert_eq!(
+            stage_draws.len(),
+            3,
+            "the unshaped COW child must inherit all three ancestor pieces",
+        );
+        assert!(
+            stage_draws.iter().all(|draw| draw.alpha_passthrough),
+            "every inherited piece in the COW subtree must retain SrcOver blending",
+        );
+        assert_eq!(
+            built
+                .sampled_ids
+                .iter()
+                .filter(|&&id| id == stage_id)
+                .count(),
+            1,
+            "multi-piece emission must sample-key the drawable once",
+        );
+        assert_eq!(
+            built
+                .snapshots
+                .iter()
+                .filter(|snapshot| snapshot.id == stage_id)
+                .count(),
+            1,
+            "multi-piece emission must capture presentation damage once",
+        );
     }
 
     /// Phase 2.7 — the COW must emit via the normal `top_level_order`
@@ -15660,3 +16725,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "scene_software_tests.rs"]
+mod software_tests;

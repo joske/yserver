@@ -112,11 +112,9 @@ pub struct CompositorPipeline {
     pub color_format: vk::Format,
 }
 
-/// Soft cap on per-frame draws per output. Used by `CompositePoolRing`
-/// to size each per-output descriptor pool. Resized only if real
-/// sessions show it's not enough — e.g. a complex WM with hundreds of
-/// subwindows + decorations. Most fvwm/wmaker sessions stay well under 256.
-pub const MAX_DESCRIPTOR_SETS_PER_FRAME: u32 = 1024;
+/// Initial per-slot descriptor capacity. Complex SHAPE regions are unbounded;
+/// `CompositePoolRing` grows a free slot to the complete frame's demand.
+pub const INITIAL_DESCRIPTOR_SETS_PER_FRAME: u32 = 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PipelineError {
