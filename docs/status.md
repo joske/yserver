@@ -79,24 +79,30 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   `XFree86-VidModeExtension`. Mesa performs this operation client-side rather
   than through a GLX vendor-private request. Yserver now advertises a
   read-only, Xorg-compatible VidMode 2.2 surface: `QueryVersion`,
-  `GetModeLine`, and `SetClientVersion`, including legacy/v2 reply layouts,
-  swapped-client request handling, screen validation, and per-client version
-  lifetime. `GetModeLine` returns the selected active output's real DRM/RANDR
-  pixel clock, totals, sync ranges, and flags, with the existing nested-mode
-  synthesis as fallback. Because advertising the extension makes non-Mesa
-  clients take the VidMode path, the read-only stubs `GetAllModeLines` (the
-  single active mode), `GetGammaRampSize` (0) and `GetPermissions`
-  (`XF86VM_READ_PERMISSION` only) are answered as well, so such a client gets
-  an honest "no" instead of a `BadRequest` it never expected. Every other
-  minor — mode setting, gamma, viewport and the remaining monitor/dot-clock
-  queries — stays unimplemented and returns `BadRequest`, which a regression
-  asserts opcode by opcode.
+  `SetClientVersion`, `GetModeLine`, `GetMonitor`, `GetAllModeLines`,
+  `ValidateModeLine`, `GetViewPort`, `GetDotClocks`, `GetGamma`,
+  `GetGammaRamp`, `GetGammaRampSize` and `GetPermissions`, including
+  legacy/v2 reply layouts, swapped-client request handling, screen validation,
+  and per-client version lifetime. The mode, monitor ranges and dot clock all
+  come from the same selected active output and effective DRM/RANDR timing;
+  `GetMonitor` also uses its EDID identity when available. VidMode gamma-ramp
+  reads resolve the same connector and backend LUT as RANDR, while the
+  independent per-screen `GetGamma` scalar stays at the unmodified Xorg
+  default of 1.0.
+  RANDR remains the only display-configuration interface:
+  `GetPermissions` reports `XF86VM_READ_PERMISSION` without WRITE, and every
+  known mode/gamma write returns VidMode `ClientNotLocal`, matching Xorg's
+  coherent non-local/read-only branch instead of returning `BadRequest`.
+  Yserver is Unix-socket-only, so this deliberately applies a read-only product
+  policy to physically local clients rather than fully emulating Xorg's local
+  WRITE permission.
   RANDR's `ModeInfo` and VidMode's mode line now resolve their blanking
   through one shared `EffectiveTiming` helper, so the two extensions cannot
   drift into describing the same hardware mode differently. Protocol encoders
-  and end-to-end dispatcher regressions cover both reply layouts, the
-  `BadLength`/`BadValue`/`BadRequest` paths, big-endian clients, and
-  per-client version cleanup on disconnect.
+  and end-to-end dispatcher regressions cover both mode layouts, every read
+  family, real gamma data, `ClientNotLocal`, the
+  `BadLength`/`BadValue`/`BadRequest` paths, big-endian clients, and per-client
+  version cleanup on disconnect.
   Live validation against a freshly built ynest confirmed the advertised
   opcode/error base, a valid `xvidtune -show` modeline, and a successful Mesa
   `glXGetMscRateOML()` call returning the derived refresh fraction.

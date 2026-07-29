@@ -47,19 +47,19 @@ We support the following extensions:
 ### GLX_OML_sync_control
 
 Mesa implements `glXGetMscRateOML()` on the client side by reading the current
-mode through `XFree86-VidModeExtension`. Yserver implements the read-only
-`QueryVersion` and `GetModeLine` requests, plus `SetClientVersion`, with the
-Xorg wire layouts and real DRM/RANDR mode timings. This lets Mesa and
-ANGLE-based Flatpak clients derive the display MSC rate without exposing the
-legacy mode-setting operations of VidMode.
+mode through `XFree86-VidModeExtension`. Yserver implements Xorg's read surface
+with the correct legacy/v2 wire layouts and the selected output's real
+DRM/RANDR timing, monitor identity, dot clock, viewport and gamma ramp. This
+lets Mesa and ANGLE-based Flatpak clients derive the display MSC rate while
+other VidMode readers see data consistent with RANDR instead of unexpected
+`BadRequest` errors.
 
-`GetAllModeLines`, `GetGammaRampSize` and `GetPermissions` are answered too, so
-a client that probes VidMode for something other than the MSC rate gets a
-truthful read-only picture — one mode, no gamma ramp, `XF86VM_READ_PERMISSION`
-without write — rather than an unexpected `BadRequest` from an extension it
-just saw advertised. Everything else — mode setting, gamma, viewport and the
-remaining monitor queries — is deliberately not implemented and returns
-`BadRequest`; RANDR is the supported way to change modes.
+VidMode remains deliberately read-only because RANDR owns display
+configuration. `GetPermissions` advertises only `XF86VM_READ_PERMISSION`, and
+known mode/gamma writes fail with VidMode's `ClientNotLocal` error — the same
+coherent fallback branch Xorg exposes to a client without write permission.
+Yserver clients are physically local Unix-socket peers, so this is an explicit
+server policy rather than a claim that they are remote.
 
 ### GLX_EXT_texture_from_pixmap
 

@@ -112,7 +112,7 @@ pub(crate) const GLX_FIRST_ERROR: u8 = 169; // 13 errors (169-181); routed past 
 
 pub(crate) const X_RESOURCE_MAJOR_OPCODE: u8 = 149;
 pub(crate) const XF86VIDMODE_MAJOR_OPCODE: u8 = 153;
-const XF86VIDMODE_FIRST_ERROR: u8 = 182;
+pub(crate) const XF86VIDMODE_FIRST_ERROR: u8 = 182;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExtensionAvailability {
