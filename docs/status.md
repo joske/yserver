@@ -87,9 +87,11 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   same selected active output and effective DRM/RANDR timing; `GetMonitor`
   also uses its EDID identity when available. `GetDotClocks` mirrors Xorg's
   KMS modesetting driver by advertising a programmable clock rather than a
-  legacy fixed-clock table. VidMode gamma-ramp reads resolve the same
-  connector and backend LUT as RANDR, while the independent per-screen
-  `GetGamma` scalar stays at the unmodified Xorg default of 1.0.
+  legacy fixed-clock table. `ValidateModeLine` returns `MODE_OK` only for that
+  advertised active timing and `MODE_BAD` for invalid or other modes. VidMode
+  gamma-ramp reads resolve the same connector and backend LUT as RANDR, while
+  the independent per-screen `GetGamma` scalar stays at the unmodified Xorg
+  default of 1.0.
   RANDR remains the only display-configuration interface:
   `GetPermissions` reports `XF86VM_READ_PERMISSION` without WRITE, and every
   known mode/gamma write returns VidMode `ClientNotLocal`, matching Xorg's

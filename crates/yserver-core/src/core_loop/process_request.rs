@@ -11128,6 +11128,15 @@ fn current_vidmode_mode_line(
     current_vidmode_output(state).map(|output| output.mode)
 }
 
+fn vidmode_timing_order_is_valid(mode: yserver_protocol::x11::xf86vidmode::ModeLine) -> bool {
+    mode.hdisplay <= mode.hsync_start
+        && mode.hsync_start <= mode.hsync_end
+        && mode.hsync_end <= mode.htotal
+        && mode.vdisplay <= mode.vsync_start
+        && mode.vsync_start <= mode.vsync_end
+        && mode.vsync_end <= mode.vtotal
+}
+
 /// Derive VidMode's old monitor strings from the same raw EDID RANDR exposes.
 /// A missing/invalid EDID leaves the vendor empty and uses the connector name
 /// as the model, which is more useful than inventing an identity.
@@ -11285,7 +11294,8 @@ fn handle_xf86vidmode_request(
             );
         }
         x11vm::VALIDATE_MODE_LINE => {
-            let Some(screen) = x11vm::parse_validate_mode_line_screen(byte_order, body, version_2)
+            let Some(request) =
+                x11vm::parse_validate_mode_line_request(byte_order, body, version_2)
             else {
                 return emit_x11_error_with_minor(
                     state,
@@ -11297,7 +11307,7 @@ fn handle_xf86vidmode_request(
                     XF86VIDMODE_MAJOR_OPCODE,
                 );
             };
-            if let Err((code, bad_value)) = vidmode_screen_number(screen) {
+            if let Err((code, bad_value)) = vidmode_screen_number(request.screen) {
                 return emit_x11_error_with_minor(
                     state,
                     client_id,
@@ -11308,10 +11318,7 @@ fn handle_xf86vidmode_request(
                     XF86VIDMODE_MAJOR_OPCODE,
                 );
             }
-            // Xorg asks the active driver's mode validator. Yserver advertises
-            // only the already-active hardware mode and has no separate
-            // VidMode mode-setting path, so a well-formed line is acceptable.
-            if current_vidmode_output(state).is_none() {
+            let Some(current) = current_vidmode_output(state) else {
                 return emit_x11_error_with_minor(
                     state,
                     client_id,
@@ -11321,9 +11328,24 @@ fn handle_xf86vidmode_request(
                     u16::from(header.data),
                     XF86VIDMODE_MAJOR_OPCODE,
                 );
+            };
+
+            // Xorg rejects inverted timing order before invoking the monitor
+            // and driver validators. Yserver exposes only the active mode, so
+            // that exact advertised line is the only one its read-only
+            // VidMode surface can truthfully validate. Legacy clients cannot
+            // carry hskew, matching the legacy GetModeLine reply.
+            let mut advertised = current.mode;
+            if !version_2 {
+                advertised.hskew = 0;
             }
-            let reply =
-                x11vm::encode_validate_mode_line_reply(byte_order, sequence, x11vm::MODE_OK);
+            let status =
+                if vidmode_timing_order_is_valid(request.mode) && request.mode == advertised {
+                    x11vm::MODE_OK
+                } else {
+                    x11vm::MODE_BAD
+                };
+            let reply = x11vm::encode_validate_mode_line_reply(byte_order, sequence, status);
             return write_vidmode_reply(state, client_id, &reply);
         }
         x11vm::GET_GAMMA => {
@@ -35763,6 +35785,50 @@ mod tests {
         assert_eq!(reply[10], crate::nested::XF86VIDMODE_MAJOR_OPCODE);
     }
 
+    fn validate_mode_line_body(
+        mode: yserver_protocol::x11::xf86vidmode::ModeLine,
+        version_2: bool,
+        byte_order: ClientByteOrder,
+    ) -> Vec<u8> {
+        fn put_u16(body: &mut [u8], offset: usize, value: u16, order: ClientByteOrder) {
+            let bytes = match order {
+                ClientByteOrder::LittleEndian => value.to_le_bytes(),
+                ClientByteOrder::BigEndian => value.to_be_bytes(),
+            };
+            body[offset..offset + 2].copy_from_slice(&bytes);
+        }
+
+        fn put_u32(body: &mut [u8], offset: usize, value: u32, order: ClientByteOrder) {
+            let bytes = match order {
+                ClientByteOrder::LittleEndian => value.to_le_bytes(),
+                ClientByteOrder::BigEndian => value.to_be_bytes(),
+            };
+            body[offset..offset + 4].copy_from_slice(&bytes);
+        }
+
+        let mut body = vec![0; if version_2 { 48 } else { 32 }];
+        put_u32(&mut body, 4, mode.dot_clock, byte_order);
+        put_u16(&mut body, 8, mode.hdisplay, byte_order);
+        put_u16(&mut body, 10, mode.hsync_start, byte_order);
+        put_u16(&mut body, 12, mode.hsync_end, byte_order);
+        put_u16(&mut body, 14, mode.htotal, byte_order);
+        if version_2 {
+            put_u16(&mut body, 16, mode.hskew, byte_order);
+            put_u16(&mut body, 18, mode.vdisplay, byte_order);
+            put_u16(&mut body, 20, mode.vsync_start, byte_order);
+            put_u16(&mut body, 22, mode.vsync_end, byte_order);
+            put_u16(&mut body, 24, mode.vtotal, byte_order);
+            put_u32(&mut body, 28, mode.flags, byte_order);
+        } else {
+            put_u16(&mut body, 16, mode.vdisplay, byte_order);
+            put_u16(&mut body, 18, mode.vsync_start, byte_order);
+            put_u16(&mut body, 20, mode.vsync_end, byte_order);
+            put_u16(&mut body, 22, mode.vtotal, byte_order);
+            put_u32(&mut body, 24, mode.flags, byte_order);
+        }
+        body
+    }
+
     /// Known writes must use the same Xorg non-local branch advertised by
     /// GetPermissions; truly unknown minors remain BadRequest.
     #[test]
@@ -35991,12 +36057,14 @@ mod tests {
             x11vm::MAX_CLOCKS
         );
 
+        let legacy_body =
+            validate_mode_line_body(current.mode, false, ClientByteOrder::LittleEndian);
         let legacy_validate = dispatch_vidmode(
             &mut state,
             &mut peer,
             4,
             x11vm::VALIDATE_MODE_LINE,
-            &[0; 32],
+            &legacy_body,
         );
         assert_eq!(legacy_validate.len(), 32);
         assert_eq!(
@@ -36004,24 +36072,68 @@ mod tests {
             x11vm::MODE_OK
         );
 
-        dispatch_vidmode(
+        let invalid_validate = dispatch_vidmode(
             &mut state,
             &mut peer,
             5,
-            x11vm::SET_CLIENT_VERSION,
-            &[2, 0, 2, 0],
+            x11vm::VALIDATE_MODE_LINE,
+            &[0; 32],
         );
-        let v2_validate = dispatch_vidmode(
+        assert_eq!(
+            u32::from_le_bytes(invalid_validate[8..12].try_into().unwrap()),
+            x11vm::MODE_BAD
+        );
+
+        let mut inverted_mode = current.mode;
+        inverted_mode.hsync_start = inverted_mode.hdisplay - 1;
+        let inverted_body =
+            validate_mode_line_body(inverted_mode, false, ClientByteOrder::LittleEndian);
+        let inverted_validate = dispatch_vidmode(
             &mut state,
             &mut peer,
             6,
             x11vm::VALIDATE_MODE_LINE,
-            &[0; 48],
+            &inverted_body,
+        );
+        assert_eq!(
+            u32::from_le_bytes(inverted_validate[8..12].try_into().unwrap()),
+            x11vm::MODE_BAD
+        );
+
+        dispatch_vidmode(
+            &mut state,
+            &mut peer,
+            7,
+            x11vm::SET_CLIENT_VERSION,
+            &[2, 0, 2, 0],
+        );
+        let v2_body = validate_mode_line_body(current.mode, true, ClientByteOrder::LittleEndian);
+        let v2_validate = dispatch_vidmode(
+            &mut state,
+            &mut peer,
+            8,
+            x11vm::VALIDATE_MODE_LINE,
+            &v2_body,
         );
         assert_eq!(v2_validate.len(), 32);
         assert_eq!(
             u32::from_le_bytes(v2_validate[8..12].try_into().unwrap()),
             x11vm::MODE_OK
+        );
+
+        let mut other_mode = current.mode;
+        other_mode.dot_clock += 1;
+        let other_body = validate_mode_line_body(other_mode, true, ClientByteOrder::LittleEndian);
+        let other_validate = dispatch_vidmode(
+            &mut state,
+            &mut peer,
+            9,
+            x11vm::VALIDATE_MODE_LINE,
+            &other_body,
+        );
+        assert_eq!(
+            u32::from_le_bytes(other_validate[8..12].try_into().unwrap()),
+            x11vm::MODE_BAD
         );
     }
 
@@ -36220,9 +36332,7 @@ mod tests {
         assert_eq!(error[1], x11::error::BAD_VALUE);
         assert_eq!(&error[4..8], &1_u32.to_be_bytes());
 
-        let mut validate = vec![0u8; 48];
-        validate[0..4].copy_from_slice(&0u32.to_be_bytes());
-        validate[44..48].copy_from_slice(&0u32.to_be_bytes());
+        let validate = validate_mode_line_body(expected, true, ClientByteOrder::BigEndian);
         let validated = dispatch_vidmode(
             &mut state,
             &mut peer,

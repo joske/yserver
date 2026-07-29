@@ -23,7 +23,7 @@
 
 use super::{
     ClientByteOrder, SequenceNumber,
-    wire::{pad_vec4, read_u32, write_u16, write_u32},
+    wire::{pad_vec4, read_u16, read_u32, write_u16, write_u32},
 };
 
 pub const MAJOR_VERSION: u16 = 2;
@@ -55,6 +55,8 @@ pub const GET_PERMISSIONS: u8 = 20;
 pub const CLIENT_NOT_LOCAL: u8 = 5;
 /// Xorg `ModeStatus::MODE_OK`.
 pub const MODE_OK: u32 = 0;
+/// Xorg `ModeStatus::MODE_BAD` (`-2` on the CARD32 wire).
+pub const MODE_BAD: u32 = 0xffff_fffe;
 /// Xorg's `CLKFLAG_PROGRAMABLE` (historical spelling).
 pub const CLOCK_FLAG_PROGRAMMABLE: u32 = 1;
 /// Xorg's fixed upper bound for a legacy hardware clock table.
@@ -74,6 +76,12 @@ pub struct ClientVersion {
 pub struct GammaRampRequest {
     pub screen: u16,
     pub size: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ValidateModeLineRequest {
+    pub screen: u32,
+    pub mode: ModeLine,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -119,19 +127,18 @@ pub fn parse_gamma_ramp_request(body: &[u8]) -> Option<GammaRampRequest> {
     })
 }
 
-/// Validate the version-dependent `ValidateModeLine` size and return its
-/// screen number.
+/// Parse the version-dependent `ValidateModeLine` request.
 ///
 /// The fixed request is 52 bytes for protocol v2 and 36 bytes for the legacy
 /// layout, including the 4-byte X request header. `privsize` counts trailing
 /// `CARD32`s. Unlike other parsers, `body` has deliberately not passed through
 /// the generic byte-swap table; see the module-level note.
 #[must_use]
-pub fn parse_validate_mode_line_screen(
+pub fn parse_validate_mode_line_request(
     byte_order: ClientByteOrder,
     body: &[u8],
     version_2: bool,
-) -> Option<u32> {
+) -> Option<ValidateModeLineRequest> {
     let (fixed_body_len, privsize_offset) = if version_2 { (48, 44) } else { (32, 28) };
     if body.len() < fixed_body_len {
         return None;
@@ -142,7 +149,31 @@ pub fn parse_validate_mode_line_screen(
     ))
     .ok()?;
     let expected_len = fixed_body_len.checked_add(privsize.checked_mul(4)?)?;
-    (body.len() == expected_len).then(|| read_u32(byte_order, body))
+    if body.len() != expected_len {
+        return None;
+    }
+
+    let mode = ModeLine {
+        dot_clock: read_u32(byte_order, &body[4..8]),
+        hdisplay: read_u16(byte_order, &body[8..10]),
+        hsync_start: read_u16(byte_order, &body[10..12]),
+        hsync_end: read_u16(byte_order, &body[12..14]),
+        htotal: read_u16(byte_order, &body[14..16]),
+        hskew: if version_2 {
+            read_u16(byte_order, &body[16..18])
+        } else {
+            0
+        },
+        vdisplay: read_u16(byte_order, &body[if version_2 { 18..20 } else { 16..18 }]),
+        vsync_start: read_u16(byte_order, &body[if version_2 { 20..22 } else { 18..20 }]),
+        vsync_end: read_u16(byte_order, &body[if version_2 { 22..24 } else { 20..22 }]),
+        vtotal: read_u16(byte_order, &body[if version_2 { 24..26 } else { 22..24 }]),
+        flags: read_u32(byte_order, &body[if version_2 { 28..32 } else { 24..28 }]),
+    };
+    Some(ValidateModeLineRequest {
+        screen: read_u32(byte_order, body),
+        mode,
+    })
 }
 
 fn reply_prefix(byte_order: ClientByteOrder, sequence: SequenceNumber, length: u32) -> Vec<u8> {
@@ -650,11 +681,26 @@ mod tests {
         legacy_validate[0..4].copy_from_slice(&1u32.to_be_bytes());
         legacy_validate[28..32].copy_from_slice(&1u32.to_be_bytes());
         assert_eq!(
-            parse_validate_mode_line_screen(ClientByteOrder::BigEndian, &legacy_validate, false),
-            Some(1)
+            parse_validate_mode_line_request(ClientByteOrder::BigEndian, &legacy_validate, false),
+            Some(ValidateModeLineRequest {
+                screen: 1,
+                mode: ModeLine {
+                    dot_clock: 0,
+                    hdisplay: 0,
+                    hsync_start: 0,
+                    hsync_end: 0,
+                    htotal: 0,
+                    hskew: 0,
+                    vdisplay: 0,
+                    vsync_start: 0,
+                    vsync_end: 0,
+                    vtotal: 0,
+                    flags: 0,
+                },
+            })
         );
         assert_eq!(
-            parse_validate_mode_line_screen(
+            parse_validate_mode_line_request(
                 ClientByteOrder::BigEndian,
                 &legacy_validate[..32],
                 false
@@ -666,8 +712,23 @@ mod tests {
         let mut v2_validate = [0u8; 48];
         v2_validate[0..4].copy_from_slice(&0u32.to_le_bytes());
         assert_eq!(
-            parse_validate_mode_line_screen(ClientByteOrder::LittleEndian, &v2_validate, true),
-            Some(0)
+            parse_validate_mode_line_request(ClientByteOrder::LittleEndian, &v2_validate, true),
+            Some(ValidateModeLineRequest {
+                screen: 0,
+                mode: ModeLine {
+                    dot_clock: 0,
+                    hdisplay: 0,
+                    hsync_start: 0,
+                    hsync_end: 0,
+                    htotal: 0,
+                    hskew: 0,
+                    vdisplay: 0,
+                    vsync_start: 0,
+                    vsync_end: 0,
+                    vtotal: 0,
+                    flags: 0,
+                },
+            })
         );
     }
 }
