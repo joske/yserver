@@ -83,12 +83,13 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   `ValidateModeLine`, `GetViewPort`, `GetDotClocks`, `GetGamma`,
   `GetGammaRamp`, `GetGammaRampSize` and `GetPermissions`, including
   legacy/v2 reply layouts, swapped-client request handling, screen validation,
-  and per-client version lifetime. The mode, monitor ranges and dot clock all
-  come from the same selected active output and effective DRM/RANDR timing;
-  `GetMonitor` also uses its EDID identity when available. VidMode gamma-ramp
-  reads resolve the same connector and backend LUT as RANDR, while the
-  independent per-screen `GetGamma` scalar stays at the unmodified Xorg
-  default of 1.0.
+  and per-client version lifetime. The mode and monitor ranges come from the
+  same selected active output and effective DRM/RANDR timing; `GetMonitor`
+  also uses its EDID identity when available. `GetDotClocks` mirrors Xorg's
+  KMS modesetting driver by advertising a programmable clock rather than a
+  legacy fixed-clock table. VidMode gamma-ramp reads resolve the same
+  connector and backend LUT as RANDR, while the independent per-screen
+  `GetGamma` scalar stays at the unmodified Xorg default of 1.0.
   RANDR remains the only display-configuration interface:
   `GetPermissions` reports `XF86VM_READ_PERMISSION` without WRITE, and every
   known mode/gamma write returns VidMode `ClientNotLocal`, matching Xorg's

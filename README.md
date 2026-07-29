@@ -49,7 +49,8 @@ We support the following extensions:
 Mesa implements `glXGetMscRateOML()` on the client side by reading the current
 mode through `XFree86-VidModeExtension`. Yserver implements Xorg's read surface
 with the correct legacy/v2 wire layouts and the selected output's real
-DRM/RANDR timing, monitor identity, dot clock, viewport and gamma ramp. This
+DRM/RANDR timing, monitor identity, programmable clock capability, viewport
+and gamma ramp. This
 lets Mesa and ANGLE-based Flatpak clients derive the display MSC rate while
 other VidMode readers see data consistent with RANDR instead of unexpected
 `BadRequest` errors.

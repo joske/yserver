@@ -55,6 +55,10 @@ pub const GET_PERMISSIONS: u8 = 20;
 pub const CLIENT_NOT_LOCAL: u8 = 5;
 /// Xorg `ModeStatus::MODE_OK`.
 pub const MODE_OK: u32 = 0;
+/// Xorg's `CLKFLAG_PROGRAMABLE` (historical spelling).
+pub const CLOCK_FLAG_PROGRAMMABLE: u32 = 1;
+/// Xorg's fixed upper bound for a legacy hardware clock table.
+pub const MAX_CLOCKS: u32 = 128;
 
 /// `XF86VM_READ_PERMISSION`. Yserver never grants
 /// `XF86VM_WRITE_PERMISSION` (2): no VidMode mode-setting request exists.
@@ -209,23 +213,21 @@ pub fn encode_get_view_port_reply(
     out
 }
 
-/// Encode one or more fixed clocks in kHz. Yserver reports only its selected
-/// output's active clock, so `maxclocks` truthfully equals the returned count.
+/// Encode Xorg's `GetDotClocks` reply for a programmable-clock driver.
+///
+/// Xorg's KMS modesetting driver sets `progClock`, so the reply advertises
+/// that capability and carries no legacy fixed-clock table. The active mode's
+/// actual dot clock is reported by `GetModeLine`.
 #[must_use]
 pub fn encode_get_dot_clocks_reply(
     byte_order: ClientByteOrder,
     sequence: SequenceNumber,
-    clocks: &[u32],
 ) -> Vec<u8> {
-    let count = u32::try_from(clocks.len()).unwrap_or(u32::MAX);
-    let mut out = reply_prefix(byte_order, sequence, count);
-    write_u32(byte_order, &mut out, 0); // flags: fixed, not programmable
-    write_u32(byte_order, &mut out, count);
-    write_u32(byte_order, &mut out, count); // maxclocks
+    let mut out = reply_prefix(byte_order, sequence, 0);
+    write_u32(byte_order, &mut out, CLOCK_FLAG_PROGRAMMABLE);
+    write_u32(byte_order, &mut out, 0); // no fixed clocks
+    write_u32(byte_order, &mut out, MAX_CLOCKS);
     out.resize(32, 0);
-    for &clock in clocks {
-        write_u32(byte_order, &mut out, clock);
-    }
     out
 }
 
@@ -579,19 +581,17 @@ mod tests {
         assert_eq!(viewport.len(), 32);
         assert_eq!(&viewport[8..16], &[0; 8]);
 
-        let clocks = encode_get_dot_clocks_reply(
-            ClientByteOrder::LittleEndian,
-            SequenceNumber(5),
-            &[241_500],
-        );
-        assert_eq!(clocks.len(), 36);
-        assert_eq!(u32::from_le_bytes(clocks[4..8].try_into().unwrap()), 1);
-        assert_eq!(u32::from_le_bytes(clocks[8..12].try_into().unwrap()), 0);
-        assert_eq!(u32::from_le_bytes(clocks[12..16].try_into().unwrap()), 1);
-        assert_eq!(u32::from_le_bytes(clocks[16..20].try_into().unwrap()), 1);
+        let clocks = encode_get_dot_clocks_reply(ClientByteOrder::LittleEndian, SequenceNumber(5));
+        assert_eq!(clocks.len(), 32);
+        assert_eq!(u32::from_le_bytes(clocks[4..8].try_into().unwrap()), 0);
         assert_eq!(
-            u32::from_le_bytes(clocks[32..36].try_into().unwrap()),
-            241_500
+            u32::from_le_bytes(clocks[8..12].try_into().unwrap()),
+            CLOCK_FLAG_PROGRAMMABLE
+        );
+        assert_eq!(u32::from_le_bytes(clocks[12..16].try_into().unwrap()), 0);
+        assert_eq!(
+            u32::from_le_bytes(clocks[16..20].try_into().unwrap()),
+            MAX_CLOCKS
         );
 
         let gamma = encode_get_gamma_reply(ClientByteOrder::LittleEndian, SequenceNumber(6));

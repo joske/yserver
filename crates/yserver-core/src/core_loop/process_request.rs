@@ -11440,6 +11440,7 @@ fn handle_xf86vidmode_request(
                 x11vm::GET_VIEW_PORT => {
                     x11vm::encode_get_view_port_reply(byte_order, sequence, 0, 0)
                 }
+                x11vm::GET_DOT_CLOCKS => x11vm::encode_get_dot_clocks_reply(byte_order, sequence),
                 _ => {
                     let Some(current) = current_vidmode_output(state) else {
                         // Xorg: VidModeGetCurrentModeline failure => BadValue.
@@ -11470,11 +11471,6 @@ fn handle_xf86vidmode_request(
                                 byte_order, sequence, &vendor, &model, &hsync, &vsync,
                             )
                         }
-                        x11vm::GET_DOT_CLOCKS => x11vm::encode_get_dot_clocks_reply(
-                            byte_order,
-                            sequence,
-                            &[current.mode.dot_clock],
-                        ),
                         x11vm::GET_MODE_LINE | x11vm::GET_ALL_MODE_LINES => {
                             debug!(
                                 "client {} #{} XFree86-VidMode::{} \
@@ -35984,12 +35980,15 @@ mod tests {
         assert_eq!(&viewport[8..16], &[0; 8]);
 
         let clocks = dispatch_vidmode(&mut state, &mut peer, 3, x11vm::GET_DOT_CLOCKS, &[0; 4]);
-        assert_eq!(clocks.len(), 36);
-        assert_eq!(u32::from_le_bytes(clocks[12..16].try_into().unwrap()), 1);
-        assert_eq!(u32::from_le_bytes(clocks[16..20].try_into().unwrap()), 1);
+        assert_eq!(clocks.len(), 32);
         assert_eq!(
-            u32::from_le_bytes(clocks[32..36].try_into().unwrap()),
-            current.mode.dot_clock
+            u32::from_le_bytes(clocks[8..12].try_into().unwrap()),
+            x11vm::CLOCK_FLAG_PROGRAMMABLE
+        );
+        assert_eq!(u32::from_le_bytes(clocks[12..16].try_into().unwrap()), 0);
+        assert_eq!(
+            u32::from_le_bytes(clocks[16..20].try_into().unwrap()),
+            x11vm::MAX_CLOCKS
         );
 
         let legacy_validate = dispatch_vidmode(
@@ -36023,6 +36022,30 @@ mod tests {
         assert_eq!(
             u32::from_le_bytes(v2_validate[8..12].try_into().unwrap()),
             x11vm::MODE_OK
+        );
+    }
+
+    #[test]
+    fn xf86vidmode_dotclocks_reports_programmable_clock_when_headless() {
+        use yserver_protocol::x11::xf86vidmode as x11vm;
+
+        let mut state = ServerState::new();
+        state.randr.outputs.clear();
+        let mut peer = install_client(&mut state, 1);
+
+        // Xorg's modesetting driver advertises a programmable clock even
+        // without an active output; the active dot clock belongs to
+        // GetModeLine rather than the legacy fixed-clock table.
+        let clocks = dispatch_vidmode(&mut state, &mut peer, 1, x11vm::GET_DOT_CLOCKS, &[0; 4]);
+        assert_eq!(clocks.len(), 32);
+        assert_eq!(
+            u32::from_le_bytes(clocks[8..12].try_into().unwrap()),
+            x11vm::CLOCK_FLAG_PROGRAMMABLE
+        );
+        assert_eq!(u32::from_le_bytes(clocks[12..16].try_into().unwrap()), 0);
+        assert_eq!(
+            u32::from_le_bytes(clocks[16..20].try_into().unwrap()),
+            x11vm::MAX_CLOCKS
         );
     }
 
