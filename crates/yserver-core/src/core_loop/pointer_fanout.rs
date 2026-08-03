@@ -606,6 +606,9 @@ fn pointer_event_fanout_to_state_inner(
                 event: crate::server::QueuedInputEvent::HostPointer(canonical),
             });
         info.queued = true;
+        // Queue-while-frozen: the wedge signature is this line repeating
+        // with `pending` climbing and no `grab clear` between.
+        state.log_grab_state("queued");
         return dropped;
     }
 
@@ -3494,6 +3497,120 @@ mod tests {
         );
     }
 
+    /// Core-protocol counterpart of
+    /// [`xi2_grabbed_button_release_reaches_grab_owner_via_grab_window`].
+    ///
+    /// MATE stuck-grab lockup (silence HW, 2026-08-03): clicking a
+    /// notification's "dismiss" leaves the button visually stuck and every
+    /// subsequent click is dead — cannot select another item, cannot hit
+    /// marco's own close button. `mate.xtrace` for that session shows
+    /// **40 core ButtonPress delivered against 3 core ButtonRelease**,
+    /// while XI2 is balanced 14/14, alongside 48 `GrabButton` with
+    /// `pointer-mode=Synchronous` and 13 `AllowEvents`, all
+    /// `ReplayPointer`. Toolkits act on release, so a press that never
+    /// completes leaves the widget armed and the implicit grab up.
+    ///
+    /// `201ced67` gave the XI2 path Xorg `DeliverGrabbedEvent`'s
+    /// grab-window fallback, but the variable is `xi2_grab_window_target`
+    /// and it is consulted only on the XI2 branch. The core branch states
+    /// the same rule in prose ("no natural delivery → report to the grab
+    /// client on the grab window") without sharing the code. This test
+    /// pins the core half: an owner_events grab owner that selected no
+    /// core mask anywhere must still receive the grabbed ButtonRelease,
+    /// reported on the grab window.
+    #[test]
+    fn core_grabbed_button_release_reaches_grab_owner_via_grab_window() {
+        use crate::server::ActivePointerGrab;
+        use yserver_protocol::x11::{CreateWindowRequest, ResourceId};
+        const GC: u32 = 2; // grab owner (marco-like)
+        let grab_win = ResourceId(0x0020_0001);
+        let hit_win = ResourceId(0x0020_0002); // child, no core mask selected
+
+        let mut state = ServerState::new();
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+        let mut gc_peer = install_client(&mut state, GC);
+
+        for (window, parent, x, y, w, h) in [
+            (grab_win, crate::resources::ROOT_WINDOW, 0, 0, 100, 100),
+            (hit_win, grab_win, 10, 10, 40, 40),
+        ] {
+            state.resources.create_window(
+                ClientId(GC),
+                CreateWindowRequest {
+                    depth: 24,
+                    window,
+                    parent,
+                    x,
+                    y,
+                    width: w,
+                    height: h,
+                    border_width: 0,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+        }
+        let _ = state.resources.map_window(grab_win);
+        let _ = state.resources.map_window(hit_win);
+
+        // Core active grab, owner_events=true, NO core event mask selected
+        // on either window — the owner holds the pointer purely via the
+        // grab, exactly as marco does across a frame-button click.
+        state.active_pointer_grab = Some(ActivePointerGrab {
+            owner: ClientId(GC),
+            grab_window: grab_win,
+            event_mask: 0xFFFF,
+            cursor: ResourceId(0),
+            time: 0,
+            owner_events: true,
+            via_xi2: false,
+            implicit: false,
+            passive: false,
+            xi2_mask: 0,
+        });
+
+        let mut xid_map = HostXidMap::new();
+        xid_map.insert(0xCAFE_u32, grab_win);
+
+        let mut rel = motion_event();
+        rel.kind = PointerEventKind::ButtonRelease;
+        rel.host_xid = 0xCAFE;
+        rel.detail = 1;
+        rel.root_x = 20;
+        rel.root_y = 20;
+        rel.event_x = 20;
+        rel.event_y = 20;
+
+        let _ = pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, rel, true, false);
+
+        // Core ButtonRelease is event code 5; the `event` window sits at
+        // bytes 12..16 (code 1 + detail 1 + sequence 2 + time 4 + root 4)
+        // per `encode_pointer_event` in yserver-protocol.
+        let bytes = read_all_available(&mut gc_peer);
+        let mut found = None;
+        let mut off = 0usize;
+        while off + 32 <= bytes.len() {
+            if bytes[off] & 0x7F == 5 {
+                found = Some(u32::from_le_bytes(
+                    bytes[off + 12..off + 16].try_into().unwrap(),
+                ));
+                break;
+            }
+            off += 32;
+        }
+        assert!(
+            found.is_some(),
+            "grab owner must receive the grabbed core ButtonRelease \
+             (Xorg DeliverGrabbedEvent grab-window fallback); got none",
+        );
+        assert_eq!(
+            found.unwrap(),
+            grab_win.0,
+            "grabbed release must be reported on the grab window",
+        );
+    }
+
     /// Issue #94 follow-up (Steam menu/Library input-wedge, HW-confirmed
     /// 2026-07-15): the QUEUE-WHILE-FROZEN gate must key on the UNIFIED
     /// device freeze state alone — `xi1_frozen[PTR].frozen()`, i.e. Xorg's
@@ -3821,6 +3938,109 @@ mod tests {
         assert!(
             !evtypes.contains(&15),
             "XI_RawButtonPress describes physical input and must not be replayed"
+        );
+    }
+
+    /// MATE stuck-grab lockup (silence HW, 2026-08-03): after
+    /// `AllowEvents(ReplayPointer)` thaws a sync passive grab, the replayed
+    /// press reaches the natural target but the matching **ButtonRelease
+    /// never reaches anyone**.
+    ///
+    /// `mate.xtrace` shows the cycle four times, identically:
+    ///
+    /// ```text
+    /// :>: Event ButtonPress  event=0x01c00007 child=None        (marco's sync grab)
+    /// :<: AllowEvents mode=ReplayPointer
+    /// :>: Event ButtonPress  event=0x00401c2b child=0x01c00007  (replay lands)
+    ///     ...no ButtonRelease
+    /// ```
+    ///
+    /// Session totals: 40 core ButtonPress delivered against 3 core
+    /// ButtonRelease, while XI2 stays balanced at 14/14. The one
+    /// interaction that did get its release used a plain `GrabPointer`
+    /// with no replay. Toolkits act on release, so the dismiss button
+    /// stays visually stuck and the unreleased implicit grab swallows
+    /// every later click — including marco's own close button.
+    ///
+    /// Xorg's `ReplayPointerEvent` re-runs delivery *and* re-arms the
+    /// implicit grab on whatever the replay lands on
+    /// (`ActivateImplicitGrab`, dix/events.c:2150), which is what routes
+    /// the release to the same client.
+    #[test]
+    fn replayed_press_still_routes_its_button_release() {
+        use crate::resources::{ROOT_VISUAL, ROOT_WINDOW};
+        use yserver_protocol::x11::CreateWindowRequest;
+
+        const APP: u32 = 1;
+        let app_win = ResourceId(0x0010_0001);
+
+        let mut state = ServerState::new();
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        let mut app_peer = install_client(&mut state, APP);
+
+        state.resources.create_window(
+            ClientId(APP),
+            CreateWindowRequest {
+                depth: 24,
+                window: app_win,
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 400,
+                height: 400,
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(app_win);
+
+        // ButtonPressMask | ButtonReleaseMask — the app wants both halves.
+        state
+            .clients
+            .get_mut(&APP)
+            .unwrap()
+            .event_masks
+            .insert(app_win, 0x0000_0004 | 0x0000_0008);
+
+        let mut xid_map = HostXidMap::new();
+        xid_map.insert(0xCAFE_u32, app_win);
+
+        // The WM's sync grab already withheld this press; AllowEvents
+        // (ReplayPointer) now hands it to the natural target.
+        let mut press = motion_event();
+        press.kind = PointerEventKind::ButtonPress;
+        press.detail = 1;
+        press.host_xid = 0xCAFE;
+        let _ = replay_frozen_pointer_event_to_state(&mut state, &mut backend, &xid_map, press);
+
+        // The physical release that follows, delivered normally.
+        let mut release = motion_event();
+        release.kind = PointerEventKind::ButtonRelease;
+        release.detail = 1;
+        release.host_xid = 0xCAFE;
+        let _ =
+            pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, release, true, false);
+
+        // Core pointer events are 32 bytes; code is byte 0 masked with
+        // 0x7F (bit 7 marks SendEvent). 4 = ButtonPress, 5 = ButtonRelease.
+        let bytes = read_all_available(&mut app_peer);
+        let mut codes = Vec::new();
+        let mut off = 0usize;
+        while off + 32 <= bytes.len() {
+            codes.push(bytes[off] & 0x7F);
+            off += 32;
+        }
+        assert!(
+            codes.contains(&4),
+            "replayed press must reach the natural target; got codes {codes:?}",
+        );
+        assert!(
+            codes.contains(&5),
+            "the release after a replayed press must reach the same client — \
+             without it the widget stays stuck and the grab never lifts \
+             (MATE dismiss-button lockup); got codes {codes:?}",
         );
     }
 

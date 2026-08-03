@@ -22668,6 +22668,11 @@ fn apply_allow_events(
     // AllowSome for both protocols).
     let xid_map = backend.xid_map().clone();
     crate::core_loop::pointer_fanout::xi1_compute_freezes(state, backend, &xid_map);
+    // Post-thaw snapshot. Mode 2 is ReplayPointer — marco sends 13 of
+    // them in the wedged MATE session. If `pending` is still non-zero
+    // here, ComputeFreezes did not drain the queue and the next events
+    // will pile onto it.
+    state.log_grab_state(&format!("allow_events(mode={mode})"));
     Ok(RequestOutcome::Handled)
 }
 
@@ -33468,6 +33473,336 @@ mod tests {
     /// Accepting a short `Scroll Method Enabled` and zero-padding it
     /// would silently commit "two-finger on, edge off, button off" — a
     /// configuration the client never expressed, and BadMatch on Xorg.
+    /// MATE stuck-grab lockup (silence HW, 2026-08-03) — root cause.
+    ///
+    /// Xorg deactivates any grab held on a window when that window goes
+    /// away, in `DeleteWindowFromAnyEvents` (dix/events.c:5864):
+    ///
+    /// ```c
+    /// /* Deactivate any grabs performed on this window, before making any
+    ///    input focus changes. */
+    /// grab = mouse->deviceGrab.grab;
+    /// if (grab && ((grab->window == pWin) || (grab->confineTo == pWin)))
+    ///     (*mouse->deviceGrab.DeactivateGrab) (mouse);
+    /// ```
+    ///
+    /// called from both the destroy path (dix/window.c:1000) and the
+    /// unmap path (dix/window.c:2806). yserver has no equivalent — nothing
+    /// anywhere touches `active_pointer_grab` when a window dies.
+    ///
+    /// `mate.xtrace` for the wedged session: **16 `XIGrabDevice` against 8
+    /// `XIUngrabDevice`** — eight grabs never released. GTK menus are
+    /// override-redirect windows that grab pointer and keyboard on open;
+    /// when one goes away without a matching ungrab, the grab outlives its
+    /// window and swallows every later event. That is why the dismiss
+    /// button stays stuck and nothing responds afterwards, including
+    /// marco's own close button.
+    #[test]
+    fn destroying_a_grab_window_releases_the_pointer_grab() {
+        use crate::server::ActivePointerGrab;
+        use yserver_protocol::x11::CreateWindowRequest;
+
+        const OWNER: u32 = 1;
+        let menu_win = ResourceId(0x0010_0001);
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let _peer = install_client(&mut state, OWNER);
+
+        state.resources.create_window(
+            ClientId(OWNER),
+            CreateWindowRequest {
+                depth: 24,
+                window: menu_win,
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(menu_win);
+
+        // A GTK menu's device grab, held on the menu window.
+        state.active_pointer_grab = Some(ActivePointerGrab {
+            owner: ClientId(OWNER),
+            grab_window: menu_win,
+            event_mask: 0xFFFF,
+            cursor: ResourceId(0),
+            time: 0,
+            owner_events: true,
+            via_xi2: true,
+            implicit: false,
+            passive: false,
+            xi2_mask: u32::MAX,
+        });
+
+        // The menu closes: DestroyWindow, with no matching ungrab.
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(OWNER),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 4, // DestroyWindow
+                data: 0,
+                length_units: 2,
+            },
+            &menu_win.0.to_le_bytes(),
+            None,
+        )
+        .expect("DestroyWindow");
+
+        assert!(
+            state.resources.window(menu_win).is_none(),
+            "precondition: the grab window is really gone",
+        );
+        assert!(
+            state.active_pointer_grab.is_none(),
+            "destroying the grab window must deactivate the grab (Xorg \
+             DeleteWindowFromAnyEvents); a grab outliving its window \
+             swallows all later input — the MATE dismiss lockup",
+        );
+    }
+
+    /// Same rule, the UNMAP path — which is the one a GTK menu actually
+    /// takes. Xorg calls `DeleteWindowFromAnyEvents(pChild, FALSE)` from
+    /// `UnrealizeTree` (dix/window.c:2806) as well as from the destroy
+    /// path, so a grab held on a window that is merely hidden is
+    /// deactivated too. Menus are reused widgets: they unmap on close and
+    /// are not destroyed until the whole menu shell goes, which is why
+    /// the destroy-path test above passes while the session still wedges.
+    #[test]
+    fn unmapping_a_grab_window_releases_the_pointer_grab() {
+        use crate::server::ActivePointerGrab;
+        use yserver_protocol::x11::CreateWindowRequest;
+
+        const OWNER: u32 = 1;
+        let menu_win = ResourceId(0x0010_0001);
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let _peer = install_client(&mut state, OWNER);
+
+        state.resources.create_window(
+            ClientId(OWNER),
+            CreateWindowRequest {
+                depth: 24,
+                window: menu_win,
+                parent: crate::resources::ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+                border_width: 0,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(menu_win);
+
+        state.active_pointer_grab = Some(ActivePointerGrab {
+            owner: ClientId(OWNER),
+            grab_window: menu_win,
+            event_mask: 0xFFFF,
+            cursor: ResourceId(0),
+            time: 0,
+            owner_events: true,
+            via_xi2: true,
+            implicit: false,
+            passive: false,
+            xi2_mask: u32::MAX,
+        });
+
+        // The menu closes by hiding, with no matching ungrab.
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(OWNER),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 10, // UnmapWindow
+                data: 0,
+                length_units: 2,
+            },
+            &menu_win.0.to_le_bytes(),
+            None,
+        )
+        .expect("UnmapWindow");
+
+        assert!(
+            state.active_pointer_grab.is_none(),
+            "unmapping the grab window must deactivate the grab (Xorg \
+             UnrealizeTree -> DeleteWindowFromAnyEvents, window.c:2806); \
+             a grab surviving its hidden menu swallows all later input",
+        );
+    }
+
+    /// MATE stuck-grab lockup (silence HW, 2026-08-03) — the full traced
+    /// sequence, driven through the real `AllowEvents` handler so the
+    /// freeze state machine actually runs.
+    ///
+    /// `mate.xtrace` shows this cycle four times and never once a release:
+    ///
+    /// ```text
+    /// :>: Event ButtonPress  event=0x01c00007 child=None        marco's sync grab
+    /// :<: AllowEvents mode=ReplayPointer
+    /// :>: Event ButtonPress  event=0x00401c2b child=0x01c00007  replay lands
+    ///     (no ButtonRelease)
+    /// ```
+    ///
+    /// Session totals: 40 core ButtonPress delivered, 3 ButtonRelease;
+    /// XI2 balanced 14/14. The only interaction that got its release used
+    /// a plain `GrabPointer` with no replay.
+    ///
+    /// Two narrower tests in `pointer_fanout` already pass — the core
+    /// grab-window fallback is present, and replay-then-release works when
+    /// the replay entry point is called directly. The difference here is
+    /// that the press goes through the normal fanout first, so the sync
+    /// grab **freezes** the pointer, and the thaw runs through
+    /// `apply_allow_events` → `xi1_compute_freezes` exactly as the request
+    /// path does. That is the part `pointer_fanout.rs:869-878` records as
+    /// having wedged before.
+    #[test]
+    fn release_after_sync_grab_replay_reaches_the_app() {
+        use crate::{
+            core_loop::pointer_fanout::pointer_event_fanout_to_state,
+            host_x11::{HostPointerEvent, PointerEventKind},
+            server::PassiveButtonGrab,
+        };
+        use yserver_protocol::x11::CreateWindowRequest;
+
+        const WM: u32 = 1;
+        const APP: u32 = 2;
+        let grab_window = ResourceId(0x0010_0001); // marco's frame
+        let child_window = ResourceId(0x0020_0001); // the app's window
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let _wm_peer = install_client(&mut state, WM);
+        let mut app_peer = install_client(&mut state, APP);
+
+        for (owner, window, parent) in [
+            (WM, grab_window, crate::resources::ROOT_WINDOW),
+            (APP, child_window, grab_window),
+        ] {
+            state.resources.create_window(
+                ClientId(owner),
+                CreateWindowRequest {
+                    depth: 24,
+                    window,
+                    parent,
+                    x: 0,
+                    y: 0,
+                    width: 200,
+                    height: 200,
+                    border_width: 0,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+            let _ = state.resources.map_window(window);
+        }
+
+        // The app wants both halves of the click.
+        state
+            .clients
+            .get_mut(&APP)
+            .unwrap()
+            .event_masks
+            .insert(child_window, 0x0000_0004 | 0x0000_0008);
+
+        // marco's click-to-focus grab: sync pointer mode, press only.
+        state.button_grabs.push(PassiveButtonGrab {
+            owner: ClientId(WM),
+            grab_window,
+            button: 0,
+            modifiers: 0x8000,
+            owner_events: true,
+            event_mask: 0x0000_0004,
+            pointer_mode: 0, // GrabModeSync — freezes on activation
+            keyboard_mode: 1,
+            confine_to: ResourceId(0),
+            via_xi2: false,
+        });
+
+        let mut xid_map = crate::host_x11::HostXidMap::new();
+        xid_map.insert(0xCAFE_u32, child_window);
+
+        let ev = |kind| HostPointerEvent {
+            kind,
+            host_xid: 0xCAFE,
+            detail: 1,
+            time: 100,
+            root_x: 50,
+            root_y: 50,
+            event_x: 50,
+            event_y: 50,
+            state: 0,
+            crossing_mode: 0,
+            child: 0,
+            raw_dx: 0,
+            raw_dy: 0,
+        };
+
+        // 1. Press — activates the sync grab and freezes the pointer.
+        let _ = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &xid_map,
+            ev(PointerEventKind::ButtonPress),
+            true,
+            false,
+        );
+
+        // 2. marco decides the click isn't for the frame and replays it.
+        apply_allow_events(
+            &mut state,
+            &mut backend,
+            ClientId(WM),
+            SequenceNumber(1),
+            2, // ReplayPointer
+            0,
+        )
+        .expect("AllowEvents(ReplayPointer)");
+
+        // 3. The physical release.
+        let _ = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &xid_map,
+            ev(PointerEventKind::ButtonRelease),
+            true,
+            false,
+        );
+
+        // Core pointer events are 32 bytes; byte 0 masked with 0x7F is the
+        // code (bit 7 marks SendEvent). 4 = ButtonPress, 5 = ButtonRelease.
+        let bytes = read_all_available(&mut app_peer);
+        let mut codes = Vec::new();
+        let mut off = 0usize;
+        while off + 32 <= bytes.len() {
+            codes.push(bytes[off] & 0x7F);
+            off += 32;
+        }
+        assert!(
+            codes.contains(&4),
+            "replayed press must reach the app; got {codes:?}",
+        );
+        assert!(
+            codes.contains(&5),
+            "the release must follow the replayed press to the same client — \
+             without it the widget stays visually stuck and the grab never \
+             lifts (MATE dismiss lockup); got {codes:?}",
+        );
+    }
+
     #[test]
     fn short_write_accepted_only_for_the_ranged_accel_profile_descriptor() {
         let mut state = ServerState::new();

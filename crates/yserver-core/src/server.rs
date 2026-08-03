@@ -1209,11 +1209,58 @@ impl ServerState {
     /// Install the complete active pointer-grab snapshot.
     pub fn set_pointer_grab(&mut self, grab: ActivePointerGrab) {
         self.active_pointer_grab = Some(grab);
+        self.log_grab_state("set");
     }
 
     /// Tear down the active pointer grab.
     pub fn clear_pointer_grab(&mut self) {
         self.active_pointer_grab = None;
+        self.log_grab_state("clear");
+    }
+
+    /// One-line snapshot of pointer-grab + freeze state, for the
+    /// `yserver_core::grab` diagnostic target.
+    ///
+    /// MATE stuck-grab lockup (silence HW, 2026-08-03): clicking a
+    /// notification's dismiss leaves the button visually stuck and every
+    /// later click dead. `mate.xtrace` shows 40 core ButtonPress delivered
+    /// against 3 ButtonRelease, and 16 `XIGrabDevice` against 8
+    /// `XIUngrabDevice` — but six separate unit tests confirm each
+    /// individual mechanism (grab-window fallback, replay, sync-grab
+    /// freeze/thaw, grab teardown on destroy AND unmap) is Xorg-faithful in
+    /// isolation. So the wedge is a combination, and nothing in the
+    /// existing logs reports grab *lifetime* at all — the same blind spot
+    /// #115 had for resource population.
+    ///
+    /// Enable with
+    /// `RUST_LOG=warn,yserver_core::grab=debug`; silent at the default
+    /// level, and one short line per transition rather than per event, so
+    /// it will not starve the render loop the way a blanket `debug` does.
+    ///
+    /// Read it as: a `set` with no matching `clear`, and `pending` growing
+    /// afterwards, is the wedge.
+    pub(crate) fn log_grab_state(&self, what: &str) {
+        if !log::log_enabled!(target: "yserver_core::grab", log::Level::Debug) {
+            return;
+        }
+        let grab = self.active_pointer_grab.as_ref().map_or_else(
+            || "none".to_owned(),
+            |g| {
+                format!(
+                    "owner=c{} win=0x{:x} xi2={} implicit={} passive={} owner_events={}",
+                    g.owner.0, g.grab_window.0, g.via_xi2, g.implicit, g.passive, g.owner_events,
+                )
+            },
+        );
+        let ptr = self.xi1_frozen.get(&crate::xinput::DEVICEID_SLAVE_POINTER);
+        log::debug!(
+            target: "yserver_core::grab",
+            "grab {what}: [{grab}] frozen[ptr]={:?} other={:?} stored={} pending={}",
+            ptr.map(|f| f.state),
+            ptr.and_then(|f| f.other).map(|c| c.0),
+            ptr.is_some_and(|f| f.stored.is_some()),
+            self.sync_pending.len(),
+        );
     }
 
     #[must_use]
