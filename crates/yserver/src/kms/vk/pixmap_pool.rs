@@ -65,6 +65,15 @@ pub const PIXMAP_POOL_BUCKET_CAP_MIN: usize = 32;
 /// `VecDeque` growth, which this bounds.
 pub const PIXMAP_POOL_BUCKET_CAP_MAX: usize = 256;
 
+/// Global entry ceiling across every `(width, height, format)` bucket.
+///
+/// The per-bucket budget alone is not a global bound: games create thousands
+/// of distinct extents over a long session, and each new key can claim another
+/// bucket. Issue #115 reached 5,421 pooled Vulkan images after one hour. A
+/// 2,048-entry ceiling preserves the measured 178-entry MATE menu-row working
+/// set while bounding image/view/allocation handle count across stale keys.
+pub const PIXMAP_POOL_GLOBAL_ENTRY_CAP: usize = 2_048;
+
 /// Pixmaps with `width > MAX_POOLED_DIM || height > MAX_POOLED_DIM`
 /// skip the pool. Above this size reuse rates drop and per-entry
 /// memory grows quadratically.
@@ -118,6 +127,13 @@ pub struct PixmapPoolStats {
     pub total_returns_rejected_bucket_full: u64,
     pub total_returns_rejected_oversize: u64,
     pub total_returns_rejected_oversize_by_bucket: [u64; 4],
+    pub total_global_evictions: u64,
+    /// Live gauges, updated with every take/return/drain.
+    pub live_entries: usize,
+    pub live_buckets: usize,
+    /// Extent × format bytes-per-pixel. Vulkan allocation padding is not
+    /// included, so this is a stable nominal gauge rather than exact VRAM.
+    pub live_nominal_bytes: u64,
 }
 
 /// Upper bound of each oversize-reject bin, indexed in lockstep
@@ -180,8 +196,39 @@ pub struct PixmapPool {
     // satisfies BatchResource's Send bound. Single-threaded core
     // loop means contention is zero; Mutex is the cheapest Send-safe
     // option (one atomic CAS per pool op).
-    buckets: Mutex<HashMap<PixmapPoolKey, VecDeque<PooledPixmapImage>>>,
+    buckets: Mutex<PixmapPoolBuckets>,
     stats: Mutex<PixmapPoolStats>,
+}
+
+#[derive(Default)]
+struct PixmapPoolBuckets {
+    by_key: HashMap<PixmapPoolKey, VecDeque<PooledPixmapImage>>,
+    entries: usize,
+    nominal_bytes: u64,
+}
+
+impl PixmapPoolBuckets {
+    /// Evict one pooled entry, preferring a stale key over the incoming key.
+    /// HashMap iteration deliberately supplies approximate rather than strict
+    /// LRU eviction: this runs only after a cache miss at the global ceiling,
+    /// is O(number of live keys), and carries no unbounded recency queue.
+    fn evict_one_for(&mut self, incoming_key: PixmapPoolKey) -> Option<PooledPixmapImage> {
+        let evict_key = self
+            .by_key
+            .keys()
+            .copied()
+            .find(|candidate| *candidate != incoming_key)
+            .or_else(|| self.by_key.keys().next().copied())?;
+        let old = self.by_key.get_mut(&evict_key)?.pop_front()?;
+        self.entries -= 1;
+        self.nominal_bytes = self
+            .nominal_bytes
+            .saturating_sub(PixmapPool::nominal_bytes(evict_key));
+        if self.by_key.get(&evict_key).is_some_and(VecDeque::is_empty) {
+            self.by_key.remove(&evict_key);
+        }
+        Some(old)
+    }
 }
 
 impl std::fmt::Debug for PixmapPool {
@@ -189,7 +236,11 @@ impl std::fmt::Debug for PixmapPool {
         // VkContext does not implement Debug; show bucket count +
         // stats so logs are still useful without trying to print
         // raw Vulkan handles.
-        let buckets_len = self.buckets.lock().map(|b| b.len()).unwrap_or(usize::MAX);
+        let buckets_len = self
+            .buckets
+            .lock()
+            .map(|b| b.by_key.len())
+            .unwrap_or(usize::MAX);
         f.debug_struct("PixmapPool")
             .field("buckets", &buckets_len)
             .field("stats", &self.stats())
@@ -201,9 +252,21 @@ impl PixmapPool {
     pub fn new(vk: Arc<VkContext>) -> Self {
         Self {
             vk,
-            buckets: Mutex::new(HashMap::new()),
+            buckets: Mutex::new(PixmapPoolBuckets::default()),
             stats: Mutex::new(PixmapPoolStats::default()),
         }
+    }
+
+    fn nominal_bytes(key: PixmapPoolKey) -> u64 {
+        u64::from(key.width)
+            .saturating_mul(u64::from(key.height))
+            .saturating_mul(u64::from(format_bytes_per_pixel(key.format)))
+    }
+
+    fn publish_live_gauges(stats: &mut PixmapPoolStats, buckets: &PixmapPoolBuckets) {
+        stats.live_entries = buckets.entries;
+        stats.live_buckets = buckets.by_key.len();
+        stats.live_nominal_bytes = buckets.nominal_bytes;
     }
 
     /// True if the pool would accept an entry for `key`. Used by
@@ -245,12 +308,20 @@ impl PixmapPool {
             .lock()
             .expect("pixmap pool buckets mutex poisoned");
         let mut stats = self.stats.lock().expect("pixmap pool stats mutex poisoned");
-        let entry = buckets.get_mut(&key).and_then(VecDeque::pop_front);
+        let entry = buckets.by_key.get_mut(&key).and_then(VecDeque::pop_front);
         if entry.is_some() {
+            buckets.entries -= 1;
+            buckets.nominal_bytes = buckets
+                .nominal_bytes
+                .saturating_sub(Self::nominal_bytes(key));
+            if buckets.by_key.get(&key).is_some_and(VecDeque::is_empty) {
+                buckets.by_key.remove(&key);
+            }
             stats.total_takes_hit += 1;
         } else {
             stats.total_takes_miss += 1;
         }
+        Self::publish_live_gauges(&mut stats, &buckets);
         entry
     }
 
@@ -275,19 +346,46 @@ impl PixmapPool {
             .lock()
             .expect("pixmap pool buckets mutex poisoned");
         let cap = Self::bucket_cap(key);
-        let bucket = buckets.entry(key).or_default();
-        if bucket.len() >= cap {
+        if buckets
+            .by_key
+            .get(&key)
+            .is_some_and(|bucket| bucket.len() >= cap)
+        {
             self.stats
                 .lock()
                 .expect("pixmap pool stats mutex poisoned")
                 .total_returns_rejected_bucket_full += 1;
             return Err(entry);
         }
-        bucket.push_back(entry);
-        self.stats
-            .lock()
-            .expect("pixmap pool stats mutex poisoned")
-            .total_returns_accepted += 1;
+
+        // A hit temporarily lowers `entries`, so returning the same working
+        // image fits without eviction. Only a miss/new allocation at the
+        // global ceiling displaces an older pooled entry, which lets the
+        // bounded cache adapt as applications introduce new size keys.
+        let mut evicted = Vec::new();
+        while buckets.entries >= PIXMAP_POOL_GLOBAL_ENTRY_CAP {
+            let Some(old) = buckets.evict_one_for(key) else {
+                break;
+            };
+            evicted.push(old);
+        }
+
+        buckets.by_key.entry(key).or_default().push_back(entry);
+        buckets.entries += 1;
+        buckets.nominal_bytes = buckets
+            .nominal_bytes
+            .saturating_add(Self::nominal_bytes(key));
+        let mut stats = self.stats.lock().expect("pixmap pool stats mutex poisoned");
+        stats.total_returns_accepted += 1;
+        stats.total_global_evictions = stats
+            .total_global_evictions
+            .saturating_add(u64::try_from(evicted.len()).unwrap_or(u64::MAX));
+        Self::publish_live_gauges(&mut stats, &buckets);
+        drop(stats);
+        drop(buckets);
+        for old in evicted {
+            self.destroy_entry(old);
+        }
         Ok(())
     }
 
@@ -299,11 +397,15 @@ impl PixmapPool {
             .buckets
             .lock()
             .expect("pixmap pool buckets mutex poisoned");
-        for (_, bucket) in buckets.drain() {
+        for (_, bucket) in buckets.by_key.drain() {
             for entry in bucket {
                 self.destroy_entry(entry);
             }
         }
+        buckets.entries = 0;
+        buckets.nominal_bytes = 0;
+        let mut stats = self.stats.lock().expect("pixmap pool stats mutex poisoned");
+        Self::publish_live_gauges(&mut stats, &buckets);
     }
 
     fn destroy_entry(&self, entry: PooledPixmapImage) {
@@ -334,6 +436,7 @@ impl Drop for PixmapPool {
             .buckets
             .lock()
             .expect("pixmap pool buckets mutex poisoned")
+            .by_key
             .drain()
             .flat_map(|(_, bucket)| bucket.into_iter())
             .collect();
@@ -373,6 +476,60 @@ mod tests {
     // unit-testable without a real Vulkan device. Pure-decision
     // logic (eligible, bucket-cap check, key hashing) is testable
     // standalone via these helpers.
+
+    fn null_entry() -> PooledPixmapImage {
+        PooledPixmapImage {
+            image: vk::Image::null(),
+            view: vk::ImageView::null(),
+            memory: vk::DeviceMemory::null(),
+            current_layout: vk::ImageLayout::UNDEFINED,
+        }
+    }
+
+    #[test]
+    fn global_eviction_prefers_a_stale_key_and_updates_population() {
+        let incoming = PixmapPoolKey {
+            width: 230,
+            height: 51,
+            format: vk::Format::B8G8R8A8_UNORM,
+        };
+        let stale = PixmapPoolKey {
+            width: 17,
+            height: 19,
+            format: vk::Format::B8G8R8A8_UNORM,
+        };
+        let mut buckets = PixmapPoolBuckets::default();
+        buckets
+            .by_key
+            .entry(incoming)
+            .or_default()
+            .push_back(null_entry());
+        buckets
+            .by_key
+            .entry(stale)
+            .or_default()
+            .push_back(null_entry());
+        buckets.entries = 2;
+        buckets.nominal_bytes =
+            PixmapPool::nominal_bytes(incoming) + PixmapPool::nominal_bytes(stale);
+
+        assert!(buckets.evict_one_for(incoming).is_some());
+        assert_eq!(buckets.entries, 1);
+        assert_eq!(buckets.by_key.len(), 1);
+        assert!(buckets.by_key.contains_key(&incoming));
+        assert!(!buckets.by_key.contains_key(&stale));
+        assert_eq!(buckets.nominal_bytes, PixmapPool::nominal_bytes(incoming));
+    }
+
+    #[test]
+    fn global_cap_preserves_the_measured_single_bucket_working_set() {
+        let menu_row = PixmapPoolKey {
+            width: 230,
+            height: 51,
+            format: vk::Format::B8G8R8A8_UNORM,
+        };
+        assert!(PIXMAP_POOL_GLOBAL_ENTRY_CAP > PixmapPool::bucket_cap(menu_row));
+    }
 
     #[test]
     fn eligible_under_max_dim() {

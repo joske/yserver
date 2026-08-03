@@ -435,6 +435,22 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   cycles and requires cursor maps and the drawable store to return to
   baseline, plus retained window/grab and animated-frame lifetimes.
 
+  **Post-fix follow-up:** Victor reproduced the performance decay again in
+  a 61-minute run. Cursor retirement is working (`cursor_records` peaked at
+  245 and fell to 171), so the cursor leak was real but not the whole issue.
+  The remaining unbounded population is the Vulkan pixmap pool: cumulative
+  `returns_accepted - takes_hit` grew from 0 to 5,421 live pooled images
+  (2,284 after five minutes, 4,578 after fifty), on top of ~5,000 live store
+  drawables. The pool had an 8 MiB budget *per extent/format key* but no
+  global limit, so applications introducing new sizes could grow total
+  Vulkan images/views/allocations for the lifetime of the server. It now has
+  a 2,048-entry global ceiling. Hit/return churn temporarily opens a slot and
+  remains cached; a miss at the ceiling evicts an entry from another stale
+  key before admitting the new size, keeping the bounded cache adaptive.
+  Pool telemetry now reports `global_evictions`, `live_entries`,
+  `live_buckets`, and `live_nominal_bytes` so the next HW run can verify the
+  cap and show its memory footprint.
+
   The diagnostic branch keeps the `population[...]` group on the 1Hz
   `render_telemetry:` line reporting live `len()` of the long-lived maps:
   store
@@ -442,8 +458,9 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   `core.pictures`, `picture_drawable_ids`, `drawable_view_cache`,
   `exported_dmabufs`, `cursor_records`, `cursor_pixmaps`. All O(1),
   sampled every dispatch tick next to the existing
-  `record_active_*_high_water` gauges. A bounded cursor population over a
-  long session verifies the fix. Recipe `just yserver-cinnamon-hw-leak` runs
+  `record_active_*_high_water` gauges. Bounded cursor and pixmap-pool
+  populations over a long session verify both fixes. Recipe
+  `just yserver-cinnamon-hw-leak` runs
   1Hz rollups with the submit trace off (and
   `YSERVER_SUBMIT_TRACE` explicitly unset), writing to
   `yserver-leak-cinnamon.log` so it cannot clobber a trace run.

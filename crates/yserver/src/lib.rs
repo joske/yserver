@@ -271,6 +271,9 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
                     let d_over = cur
                         .total_returns_rejected_oversize
                         .wrapping_sub(prev_pool.total_returns_rejected_oversize);
+                    let d_evict = cur
+                        .total_global_evictions
+                        .wrapping_sub(prev_pool.total_global_evictions);
                     // Per-bin oversize-reject breakdown by max(width, height).
                     // Bins match `pixmap_pool::OVERSIZE_BIN_THRESHOLDS`:
                     // `<=256`, `<=512`, `<=1024`, `>1024`.
@@ -281,13 +284,18 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
                     log::info!(
                         "pixmap pool [1s]: takes_hit={} takes_miss={} \
                          returns_accepted={} returns_rejected_bucket_full={} \
-                         returns_rejected_oversize={} \
+                         returns_rejected_oversize={} global_evictions={} \
+                         live_entries={} live_buckets={} live_nominal_bytes={} \
                          returns_rejected_oversize_by_bin[<=256,<=512,<=1024,>1024]=[{},{},{},{}]",
                         d_hit,
                         d_miss,
                         d_acc,
                         d_full,
                         d_over,
+                        d_evict,
+                        cur.live_entries,
+                        cur.live_buckets,
+                        cur.live_nominal_bytes,
                         d_over_bins[0],
                         d_over_bins[1],
                         d_over_bins[2],
