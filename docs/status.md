@@ -399,6 +399,48 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   (:4596). xserver's generic `XIPropToInt`/`XIPropToFloat` helpers split
   those differently (`BadValue` for format), but this driver does not use
   them for these properties.
+- **2026-08-03 issue #115 resource-population telemetry (diagnostic only):**
+  VictorVoltzz reports performance decaying over a long session
+  (RX 9070 XT, Cinnamon, 3440x1440@165 + 1920x1080@60). His 42-minute
+  telemetry log confirms it, and narrows it: comparing the first and
+  second halves of the session at *matched call rates*, RENDER
+  (`op133`) went 23–52 µs/call → 48–100 µs/call and `CreatePixmap`
+  (`op53`) went 53–100 µs/call → 116–179 µs/call, while `PresentPixmap`
+  (`op145`) stayed flat at 24–33 µs/call. `req_time` share of the core
+  loop rose 0.5% → 13%. Every rate counter held steady across the same
+  window — batch size ~6, one pipeline, `zero_draws=0`, flat
+  storage/view/descriptor allocation rates, `avg_gpu_render_ns` pinned
+  at ~62 µs, pixmap pool at near-100% hit rate. Same work, same
+  allocation volume, twice the CPU time.
+  RENDER and `CreatePixmap` both allocate/look up drawables in
+  `DrawableStore`; Present only touches already-imported ones. That
+  points at a container growing without bound, but the existing
+  telemetry reports only *rates*, so nothing in a log could confirm
+  it. Added a `population[...]` group to the 1Hz `render_telemetry:`
+  line reporting live `len()` of the long-lived maps: store
+  `entries`/`by_xid`/`pending_retire`/`exported_sync`/`exported_writes`,
+  `core.pictures`, `picture_drawable_ids`, `drawable_view_cache`,
+  `exported_dmabufs`, `cursor_records`, `cursor_pixmaps`. All O(1),
+  sampled every dispatch tick next to the existing
+  `record_active_*_high_water` gauges. A linear climb over a long
+  session names the leak; a climb in `entries` *is* the leak.
+  Not itself a fix. New recipe `just yserver-cinnamon-hw-leak` for the
+  follow-up run: 1Hz rollups with the submit trace off (and
+  `YSERVER_SUBMIT_TRACE` explicitly unset), writing to
+  `yserver-leak-cinnamon.log` so it cannot clobber a trace run.
+  `yserver-cinnamon-hw-telemetry` hardcodes *both* env vars, which is
+  exactly why the reported session has no control — his artifact
+  filenames match that recipe, so he is using it as-is.
+  Two open confounds for the next run: the
+  measurement includes `YSERVER_SUBMIT_TRACE` overhead (constant per
+  row, so it cannot produce the trend, but it was on for the whole
+  session and there is no control run), and `damage_fraction` was
+  1.000 for all 2484 samples — every frame a full redraw of both
+  outputs, which is the known buffer-age gap, not new.
+  Also from the same log, and separately: one 675 ms `GetImage`
+  (`op73`) at game start — a genuine one-off, the only `op73` in the
+  entire session.
+
 - **2026-07-30 issue #99 KMS pointer-confinement ordering (HW confirmed):**
   vkQuake's SDL3 X11 backend correctly requests a successful core
   pointer grab with `confine_to` set to the game window. On dwm, motion past

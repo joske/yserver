@@ -3011,6 +3011,17 @@ impl RenderEngine {
             .map_or(0, |i| i.descriptor_pool_ring.pool_count())
     }
 
+    /// Live size of `drawable_view_cache`, for the 1Hz
+    /// `population[...]` telemetry gauge. Entries are pruned by
+    /// `notify_drawable_retired`, so this should track the store's
+    /// drawable count; a cache that keeps climbing while `drawables`
+    /// is flat means the prune hook is being missed.
+    pub(crate) fn drawable_view_cache_count(&self) -> usize {
+        self.inner
+            .as_ref()
+            .map_or(0, |i| i.drawable_view_cache.len())
+    }
+
     /// Phase B.2 Task 3 test introspection: maximum `high_water_generation`
     /// across the descriptor pool ring's resident pools. The Mechanism 2
     /// integration test reads this to assert that every `acquire_set`

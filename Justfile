@@ -272,6 +272,36 @@ yserver-cinnamon-hw-telemetry log="info":
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;'
 
+# Long-session leak hunt (issue #115). 1Hz `render_telemetry:` rollups —
+# including the `population[...]` gauge — with the submit trace deliberately
+# OFF.
+#
+# `yserver-cinnamon-hw-telemetry` sets YSERVER_SUBMIT_TRACE too, which writes
+# a row per submit: ~100 MB over 40 minutes, and a constant per-op cost baked
+# into every timing that run reports. For the population series that cost is a
+# confound rather than a measurement, and it makes the archive painful to
+# upload — so this recipe drops it and unsets the var explicitly in case the
+# caller exported it. Distinct output filename so a leak run can't overwrite a
+# trace run's log.
+#
+# Needs a LONG session (40+ min) with the desktop actually exercised; the
+# question is whether the `population[...]` counts climb monotonically. A
+# linear climb names the container that leaks; a climb in `drawables` IS the
+# leak.
+yserver-cinnamon-hw-leak log="info":
+    cargo build --release --bin yserver
+    bash -c '\
+        env -u YSERVER_SUBMIT_TRACE YSERVER_LOOP_TELEMETRY=1 \
+            RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
+            target/release/yserver > yserver-leak-cinnamon.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:7 GDK_BACKEND=x11 \
+            XDG_SESSION_TYPE=x11 \
+            dbus-run-session cinnamon-session > cinnamon.log 2>&1;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;'
+
 yserver-cinnamon-hw-trace log="trace":
     cargo build --bin yserver
     rm -f cinnamon.xtrace

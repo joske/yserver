@@ -4569,6 +4569,35 @@ impl KmsBackend {
     /// The drain is idempotent: calling it multiple times in a row is
     /// harmless (the event queue and delta are both empty after the
     /// first call).
+    /// Publish the 1Hz `population[...]` gauge: live sizes of every
+    /// map/list whose entries outlive a single request.
+    ///
+    /// Issue #115 needed this. A 42-minute session showed RENDER and
+    /// `CreatePixmap` doubling in CPU cost per call while
+    /// `PresentPixmap` stayed flat and every rate counter held
+    /// steady — the shape of a container growing without bound. The
+    /// existing telemetry reports only rates, so there was no way to
+    /// tell a leak from a slow path in a log. These are all `len()`
+    /// calls, so sampling every tick is free.
+    fn sample_resource_population(&mut self) {
+        let (by_xid, exported_sync, exported_writes) = self.store.population_counts();
+        self.telemetry.record_resource_population(
+            crate::kms::render::telemetry::ResourcePopulation {
+                drawables: self.store.len(),
+                by_xid,
+                pending_retire: self.store.pending_retire_count(),
+                exported_sync,
+                exported_writes,
+                pictures: self.core.pictures.len(),
+                picture_drawables: self.picture_drawable_ids.len(),
+                view_cache: self.engine.drawable_view_cache_count(),
+                exported_dmabufs: self.exported_dmabufs.len(),
+                cursor_records: self.cursor_records.len(),
+                cursor_pixmaps: self.cursor_pixmaps.len(),
+            },
+        );
+    }
+
     fn drain_frame_builder_telemetry(&mut self) {
         // Delta-track opens (FrameBuilder doesn't queue open events;
         // we infer them from the monotonic lifetime counter).
@@ -12545,6 +12574,7 @@ impl Backend for KmsBackend {
         // watching (project_reclamation_starvation_leak). Without this,
         // the only other maybe_emit caller is on the compose path, which
         // is gated off when dark, so telemetry went silent in the window.
+        self.sample_resource_population();
         self.telemetry.maybe_emit(self.engine.pending_count());
     }
 
@@ -12827,6 +12857,7 @@ impl Backend for KmsBackend {
             .record_active_scratch_high_water(scratch_bytes);
         // Phase B.1 Task 21: drain frame-builder close events into telemetry.
         self.drain_frame_builder_telemetry();
+        self.sample_resource_population();
         // Per-second telemetry summary emission.
         self.telemetry.maybe_emit(self.engine.pending_count());
         result

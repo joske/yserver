@@ -348,6 +348,59 @@ pub struct Telemetry {
     /// current value, so paint events recorded between ticks
     /// share the surrounding tick's id.
     frame_id: u64,
+    /// Live population of the long-lived resource maps, sampled
+    /// each tick. A gauge, not a rate — see [`ResourcePopulation`].
+    population: ResourcePopulation,
+}
+
+/// Live sizes of the maps and lists whose entries outlive a single
+/// request. Sampled once per tick and printed verbatim (no delta, no
+/// high-water) because the question they answer is "does this grow
+/// without bound over a long session".
+///
+/// Motivating measurement (issue #115, 42-minute Cinnamon session on
+/// RX 9070 XT): `RenderComposite`/`RenderFill` and `CreatePixmap`
+/// both roughly doubled in CPU cost per call between the first and
+/// second half of the session, at matched call rates, while
+/// `PresentPixmap` — which only touches already-imported drawables —
+/// stayed flat. Same work, same batch sizes, same allocation rates,
+/// twice the time. That is the signature of a container that keeps
+/// growing, but nothing in the existing telemetry reports population,
+/// only rates, so the leak could not be localised from a log.
+///
+/// Every field is a `len()` on a `HashMap`/`Vec`, so sampling is O(1)
+/// per field and safe to do unconditionally.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ResourcePopulation {
+    /// `DrawableStore::entries` — live drawables. Monotonic growth
+    /// here IS the leak.
+    pub(crate) drawables: usize,
+    /// `DrawableStore::by_xid`. Should track `drawables`; a gap
+    /// means xid mappings are outliving their entries or vice versa.
+    pub(crate) by_xid: usize,
+    /// `DrawableStore::pending_retire`. Swept by
+    /// `poll_pending_retire`, which is O(n) and allocates two
+    /// `Vec`s per call — so a standing backlog is both a leak and a
+    /// per-tick cost.
+    pub(crate) pending_retire: usize,
+    /// `DrawableStore::exported_sync` (GLX-TFP dma-buf fds).
+    pub(crate) exported_sync: usize,
+    /// `DrawableStore::exported_writes`. Drained at flush;
+    /// `remove_export` scans it linearly, so growth is quadratic.
+    pub(crate) exported_writes: usize,
+    /// `CoreState::pictures` — RENDER Picture records.
+    pub(crate) pictures: usize,
+    /// `KmsBackend::picture_drawable_ids`.
+    pub(crate) picture_drawables: usize,
+    /// `RenderEngine::drawable_view_cache`. Pruned on drawable
+    /// retire, so it should follow `drawables` down.
+    pub(crate) view_cache: usize,
+    /// `KmsBackend::exported_dmabufs`.
+    pub(crate) exported_dmabufs: usize,
+    /// `KmsBackend::cursor_records`.
+    pub(crate) cursor_records: usize,
+    /// `KmsBackend::cursor_pixmaps`.
+    pub(crate) cursor_pixmaps: usize,
 }
 
 impl Telemetry {
@@ -371,7 +424,23 @@ impl Telemetry {
             lifetime: Bucket::default(),
             submit_trace: SubmitTrace::from_env(),
             frame_id: 0,
+            population: ResourcePopulation::default(),
         }
+    }
+
+    /// Publish the current [`ResourcePopulation`] gauge. Called from
+    /// the backend just before [`Self::maybe_emit`], alongside the
+    /// other live gauges (`record_active_*_high_water`). Last write
+    /// wins — there is nothing to accumulate or reset.
+    pub(crate) fn record_resource_population(&mut self, population: ResourcePopulation) {
+        self.population = population;
+    }
+
+    /// The last sampled resource population. Test/acceptance
+    /// introspection.
+    #[must_use]
+    pub(crate) fn resource_population(&self) -> ResourcePopulation {
+        self.population
     }
 
     /// Stage 5 Task 3 diagnostic: log one submit event to the
@@ -453,6 +522,19 @@ impl Telemetry {
         } else {
             0.0
         };
+        let ResourcePopulation {
+            drawables: pop_drawables,
+            by_xid: pop_by_xid,
+            pending_retire: pop_pending_retire,
+            exported_sync: pop_exported_sync,
+            exported_writes: pop_exported_writes,
+            pictures: pop_pictures,
+            picture_drawables: pop_picture_drawables,
+            view_cache: pop_view_cache,
+            exported_dmabufs: pop_exported_dmabufs,
+            cursor_records: pop_cursor_records,
+            cursor_pixmaps: pop_cursor_pixmaps,
+        } = self.population;
         log::info!(
             "render_telemetry: paint_submits/s={} composite_submits/s={} \
              one_shot_submits/s={} queue_submit2/s={} \
@@ -497,7 +579,13 @@ impl Telemetry {
              active_staging_bytes_high_water={} \
              active_scratch_bytes_high_water={} \
              cursor_move_ebusy/s={} cursor_move_ebusy(lifetime)={} \
-             submitted_queue_depth={}",
+             submitted_queue_depth={} \
+             population[drawables={pop_drawables} by_xid={pop_by_xid} \
+             pending_retire={pop_pending_retire} exported_sync={pop_exported_sync} \
+             exported_writes={pop_exported_writes} pictures={pop_pictures} \
+             picture_drawables={pop_picture_drawables} view_cache={pop_view_cache} \
+             exported_dmabufs={pop_exported_dmabufs} cursor_records={pop_cursor_records} \
+             cursor_pixmaps={pop_cursor_pixmaps}]",
             b.paint_submits,
             b.composite_submits,
             b.one_shot_submits,
@@ -1297,6 +1385,39 @@ mod tests {
         // The ClipMask site also feeds the legacy clip_mask_reads counter;
         // no other site does.
         assert_eq!(t.lifetime.clip_mask_reads, 2);
+    }
+
+    /// The population gauge is a snapshot, not an accumulator: the
+    /// last sample wins and a shrinking population must be able to
+    /// report a *lower* number. A high-water or saturating-add
+    /// implementation would hide exactly the case issue #115 needs
+    /// to distinguish — a map that grows and never comes back down.
+    #[test]
+    fn resource_population_is_a_gauge_not_a_high_water_mark() {
+        let mut t = Telemetry::new();
+        assert_eq!(t.resource_population(), ResourcePopulation::default());
+
+        t.record_resource_population(ResourcePopulation {
+            drawables: 400,
+            by_xid: 400,
+            pending_retire: 12,
+            pictures: 90,
+            view_cache: 380,
+            ..ResourcePopulation::default()
+        });
+        assert_eq!(t.resource_population().drawables, 400);
+        assert_eq!(t.resource_population().pending_retire, 12);
+
+        // Population drops after a client disconnects — the gauge
+        // must follow it down, not latch at the peak.
+        t.record_resource_population(ResourcePopulation {
+            drawables: 25,
+            by_xid: 25,
+            ..ResourcePopulation::default()
+        });
+        assert_eq!(t.resource_population().drawables, 25);
+        assert_eq!(t.resource_population().pending_retire, 0);
+        assert_eq!(t.resource_population().view_cache, 0);
     }
 
     #[test]

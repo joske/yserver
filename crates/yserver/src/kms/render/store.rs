@@ -1292,6 +1292,21 @@ impl DrawableStore {
         self.pending_retire.len()
     }
 
+    /// Live sizes of the store's long-lived maps and lists, for the
+    /// 1Hz `population[...]` telemetry gauge. All `len()`, so O(1).
+    ///
+    /// Returned as a tuple rather than the telemetry struct so
+    /// `store` stays independent of the telemetry module:
+    /// `(by_xid, exported_sync, exported_writes)`. `entries` and
+    /// `pending_retire` already have their own accessors.
+    pub(crate) fn population_counts(&self) -> (usize, usize, usize) {
+        (
+            self.by_xid.len(),
+            self.exported_sync.len(),
+            self.exported_writes.len(),
+        )
+    }
+
     /// Bump a drawable's `content_version` (saturating). Call on every
     /// successful pixel write. No-op for an unknown id.
     pub(crate) fn mark_contents_modified(&mut self, id: DrawableId) {
@@ -1589,6 +1604,32 @@ mod tests {
         let d = s.get(id).unwrap();
         assert!(d.presentation_damage.is_empty());
         assert!(!d.scene_participating);
+    }
+
+    /// `population_counts` must report the live map sizes, and
+    /// `by_xid` must fall back to zero once the entries are
+    /// destroyed. Issue #115: a `by_xid` that stays high while
+    /// `len()` drops is the signature of orphaned xid mappings, so
+    /// the two have to be independently observable.
+    #[test]
+    fn population_counts_track_live_map_sizes() {
+        let mut s = DrawableStore::new();
+        let mut platform = PlatformBackend::for_tests();
+        assert_eq!(s.population_counts(), (0, 0, 0));
+
+        let a = s
+            .allocate(0x1, DrawableKind::Pixmap, 32, false, stub_storage())
+            .expect("allocate a");
+        s.allocate(0x2, DrawableKind::Pixmap, 32, false, stub_storage())
+            .expect("allocate b");
+        let (by_xid, exported_sync, exported_writes) = s.population_counts();
+        assert_eq!(by_xid, 2);
+        assert_eq!((exported_sync, exported_writes), (0, 0));
+        assert_eq!(s.len(), 2);
+
+        s.destroy_now(&mut platform, a);
+        assert_eq!(s.population_counts().0, 1);
+        assert_eq!(s.len(), 1);
     }
 
     #[test]
