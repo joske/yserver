@@ -49,6 +49,33 @@ pub fn pointer_event_fanout_to_state(
     handle_grabs: bool,
     is_replay: bool,
 ) -> Vec<ClientId> {
+    // Ingress trace for the `yserver_core::grab` target. MotionNotify is
+    // excluded on purpose — it is the high-rate kind, and logging it would
+    // reintroduce exactly the render-loop starvation this target avoids.
+    //
+    // MATE stuck-grab lockup (silence HW, 2026-08-03): the grab snapshot
+    // proved the wedge is NOT a stuck grab — at the moment input dies there
+    // is no active grab, nothing frozen and an empty queue. So the question
+    // moved upstream: does the ButtonRelease reach the core loop at all?
+    // Presses clearly do (the button visibly depresses) and the cursor still
+    // moves. If presses appear here and releases do not, the loss is below
+    // us in the input thread or libinput; if both appear and only the
+    // release goes undelivered, it is the fanout walk.
+    let trace_ingress = !matches!(event.kind, PointerEventKind::MotionNotify)
+        && log::log_enabled!(target: "yserver_core::grab", log::Level::Debug);
+    if trace_ingress {
+        log::debug!(
+            target: "yserver_core::grab",
+            "ingress {:?} detail={} host_xid=0x{:x} root=({},{}) handle_grabs={} replay={}",
+            event.kind,
+            event.detail,
+            event.host_xid,
+            event.root_x,
+            event.root_y,
+            handle_grabs,
+            is_replay,
+        );
+    }
     let mut info = ImplicitGrabFanoutInfo::default();
     let dropped = pointer_event_fanout_to_state_inner(
         state,
@@ -63,6 +90,20 @@ pub fn pointer_event_fanout_to_state(
     implicit_pointer_grab_lifecycle(state, &event, &info);
     if !info.queued {
         release_passive_grab_on_button_release(state, event.kind);
+    }
+    if trace_ingress {
+        log::debug!(
+            target: "yserver_core::grab",
+            "  -> {:?} queued={} dropped_clients={} pending={} grab={}",
+            event.kind,
+            info.queued,
+            dropped.len(),
+            state.sync_pending.len(),
+            state
+                .active_pointer_grab
+                .as_ref()
+                .map_or_else(|| "none".to_owned(), |g| format!("c{}", g.owner.0)),
+        );
     }
     dropped
 }
@@ -1940,6 +1981,7 @@ pub(crate) fn xi1_route_device_event(
                 device: q.deviceid,
                 event: crate::server::QueuedInputEvent::Xi1Routed(q),
             });
+        state.log_grab_state("queued(xi1_route)");
         log::debug!(
             "xi1_route: device {} frozen — queued evcode={} detail={}",
             q.deviceid,

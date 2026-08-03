@@ -290,7 +290,7 @@ yserver-cinnamon-hw-trace log="trace":
 
 # ============================== MATE ==============================
 
-yserver-mate-hw log="warn":
+yserver-mate-hw log="warn,yserver_core::grab=debug":
     cargo build --release --bin yserver
     bash -c '\
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-mate.log 2>&1 &\

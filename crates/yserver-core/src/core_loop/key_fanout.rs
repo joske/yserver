@@ -139,6 +139,7 @@ pub fn key_event_fanout_to_state(
                 device: crate::xinput::DEVICEID_SLAVE_KEYBOARD,
                 event: crate::server::QueuedInputEvent::HostKey(event),
             });
+        state.log_grab_state("queued(key)");
         return Vec::new();
     }
 
