@@ -72,6 +72,11 @@ pub(crate) enum CloseReason {
     /// 2026-07-13). Ordinary composites stay batched. See
     /// `RenderEngine::render_composite`.
     RedirectSourceBoundary,
+    /// Deferred DamageNotify delivery needs every recorded write to an
+    /// exported backing submitted + fence-published before the events
+    /// go out; an open frame would otherwise keep those writes out of
+    /// the submit group (`Backend::flush_exported_render_writes`).
+    DamagePublish,
 }
 
 /// `FrameBuilder` lifecycle. `Closed` is the hot path for X11 traffic
@@ -398,7 +403,7 @@ mod state_tests {
     }
 
     #[test]
-    fn close_reason_has_ten_variants() {
+    fn close_reason_has_eleven_variants() {
         fn _exhaustive(r: CloseReason) -> &'static str {
             match r {
                 CloseReason::SceneCompose => "scene_compose",
@@ -411,6 +416,7 @@ mod state_tests {
                 CloseReason::PinCeiling => "pin_ceiling",
                 CloseReason::ScratchGrow => "scratch_grow",
                 CloseReason::RedirectSourceBoundary => "redirect_source_boundary",
+                CloseReason::DamagePublish => "damage_publish",
             }
         }
         assert_eq!(_exhaustive(CloseReason::SceneCompose), "scene_compose");

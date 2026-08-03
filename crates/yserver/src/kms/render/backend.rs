@@ -11219,6 +11219,46 @@ impl Backend for KmsBackend {
         }
     }
 
+    fn flush_exported_render_writes(&mut self) {
+        // Fast path: nothing written to an exported (DRI3/GLX-TFP)
+        // backing since the last flush — no fence to publish, don't
+        // break the submit-group batching.
+        if !self.store.has_pending_exported_writes() {
+            return;
+        }
+        // Same triple as `enqueue_present_completion`: drain any open
+        // render batch, close the open frame, then flush the submit
+        // group. The flush's export path (flush_submit_group_with_exports
+        // via engine::flush_submit_group) publishes the submit's
+        // completion sync-file onto each written exported dma-buf as a
+        // WRITE fence — which is the entire point: the core is about to
+        // release the DamageNotify bytes describing these writes, and an
+        // implicit-sync GL compositor must find the fence on the
+        // reservation when it samples (discussion #100).
+        if let Err(e) = self.engine.flush_render_batch(
+            &mut self.store,
+            &mut self.platform,
+            crate::kms::render::engine::RenderFlushReason::Other,
+        ) {
+            log::warn!("damage-publish: flush_render_batch failed: {e:?}");
+        }
+        if let Err(e) = self.engine.close_open_frame(
+            &mut self.store,
+            &mut self.platform,
+            crate::kms::render::frame_builder::CloseReason::DamagePublish,
+        ) {
+            log::warn!("damage-publish: close_open_frame failed: {e:?}");
+        }
+        self.drain_frame_builder_telemetry();
+        if let Err(e) = self.engine.flush_submit_group(
+            &mut self.store,
+            &mut self.platform,
+            crate::kms::render::submit_group::FlushReason::DamagePublish,
+        ) {
+            log::warn!("damage-publish: flush_submit_group failed: {e:?}");
+        }
+    }
+
     fn before_block(&mut self) {
         // BlockHandler analog (cf. Xorg glamor_block_handler → glamor_flush):
         // every dispatch-loop iteration, just before the core loop blocks,

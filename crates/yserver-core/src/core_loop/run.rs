@@ -925,13 +925,25 @@ pub fn run_core(
                         .unwrap_or(Duration::ZERO)
                 })
         };
-        // BlockHandler analog (cf. Xorg glamor_block_handler → glamor_flush):
-        // reap GPU render-op resources whose fences have signaled right
-        // before we block. Driving this here — not from on_page_flip_ready —
-        // is what keeps the KMS backend's engine `submitted` queue bounded
-        // while the display is dark and clients keep drawing
-        // (project_reclamation_starvation_leak). No-op for backends without
-        // GPU resources to reap.
+        // BlockHandler analog part 1 (cf. Xorg glamor_block_handler →
+        // glamor_flush → FlushAllOutput): DamageNotify events accumulated
+        // this iteration were parked, not sent — transmit them only AFTER
+        // the backend has submitted and fence-published the GPU writes
+        // they advertise. Otherwise an implicit-sync GL compositor (KWin)
+        // wakes on Damage and samples the exported backing while its
+        // reservation object still has no write fence, reading stale
+        // pixels (discussion #100: konsole redraw corruption on i915,
+        // Dolphin hover-trail flicker on Polaris).
+        if !state.deferred_damage_notifies.is_empty() {
+            backend.flush_exported_render_writes();
+            let _dropped = crate::core_loop::damage_fanout::flush_deferred_damage_notifies(state);
+        }
+        // BlockHandler analog part 2: reap GPU render-op resources whose
+        // fences have signaled right before we block. Driving this here —
+        // not from on_page_flip_ready — is what keeps the KMS backend's
+        // engine `submitted` queue bounded while the display is dark and
+        // clients keep drawing (project_reclamation_starvation_leak).
+        // No-op for backends without GPU resources to reap.
         backend.before_block();
         // Retry on EINTR. A signal delivered while we're blocked in poll()
         // surfaces as `ErrorKind::Interrupted` — notably SIGCONT and the

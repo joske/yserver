@@ -793,6 +793,14 @@ impl DrawableStore {
     /// flush chokepoint so the platform can wait/publish around the
     /// `vkQueueSubmit2`. Entries whose fd was cleared between stamp and
     /// flush are skipped.
+    /// True when at least one write to an exported backing has been
+    /// recorded since the last flush drained `exported_writes` — i.e.
+    /// a flush is needed before DamageNotify delivery so the write
+    /// fence gets published (`Backend::flush_exported_render_writes`).
+    pub(crate) fn has_pending_exported_writes(&self) -> bool {
+        !self.exported_writes.is_empty()
+    }
+
     pub(crate) fn take_exported_writes(&mut self) -> Vec<Arc<OwnedFd>> {
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();

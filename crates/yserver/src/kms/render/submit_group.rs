@@ -29,6 +29,11 @@ pub(crate) enum FlushReason {
     /// `CloseReason`; the close-reason histogram is reported
     /// separately under `frame_builder_close_reason_*`.
     FrameBuilder,
+    /// Deferred DamageNotify delivery is about to run and recorded
+    /// writes to exported (DRI3/GLX-TFP) backings must be submitted so
+    /// their dma-buf WRITE fences exist before the event bytes depart
+    /// (`Backend::flush_exported_render_writes`, discussion #100).
+    DamagePublish,
 }
 
 /// Single buffered command-buffer entry. Mirrors the inputs to the

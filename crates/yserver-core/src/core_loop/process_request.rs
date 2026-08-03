@@ -44553,6 +44553,7 @@ mod tests {
             &body,
         )
         .expect("handle_map_window");
+        let _ = crate::core_loop::damage_fanout::flush_deferred_damage_notifies(&mut state);
 
         peer.set_nonblocking(true).expect("set nonblocking");
         let mut all = Vec::new();
@@ -44873,6 +44874,7 @@ mod tests {
         .expect("handle_map_window");
 
         // Drain everything emitted to the client. Each X11 event is
+        let _ = crate::core_loop::damage_fanout::flush_deferred_damage_notifies(&mut state);
         // 32 bytes — read until WouldBlock and walk event-by-event.
         peer.set_nonblocking(true).unwrap();
         let mut wire = Vec::new();
@@ -45601,6 +45603,7 @@ mod tests {
         )
         .unwrap();
 
+        let _ = crate::core_loop::damage_fanout::flush_deferred_damage_notifies(&mut state);
         // Drain marco's socket. Look for a DamageNotify event:
         // event_code = DAMAGE_FIRST_EVENT + 0.
         peer.set_nonblocking(true).unwrap();
@@ -45738,6 +45741,7 @@ mod tests {
             None,
         )
         .unwrap();
+        let _ = crate::core_loop::damage_fanout::flush_deferred_damage_notifies(&mut state);
 
         peer.set_nonblocking(true).unwrap();
         let mut all = Vec::new();

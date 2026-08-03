@@ -5560,3 +5560,101 @@ map-state asymmetry rather than just the damage symptom.
 
 HW-verified on bee: the #97 repro is fixed, and MATE systray applets, xfce
 submenus and xfce windows are all unaffected.
+
+## #100 Plasma stale-sample flicker — Damage-before-fence race (branch `fix/100-plasma-flicker-clean-baseline`, 2026-07-31)
+
+The Dolphin hover-trail flicker (and, by the same mechanism, the reporter's
+konsole redraw corruption under KWin compositing on i915) is hypothesised to
+be an event/fence ordering race in yserver, not a driver coherency problem.
+The prior branch `fix/plasma-present-import-coherency` (preserved at
+`b3edc71e`, see `docs/handoff-plasma-dolphin-flicker.md` there) attacked the
+import direction — waiting harder on KWin's producer fences before our Present
+copy — and three successive fence schemes changed nothing, because the stale
+rows were already baked into KWin's backbuffer content before we read it.
+
+The actual race is on the export side and is driver-independent, which
+matters because the reporter reproduces on i915/ANV where the (real, also
+pending) Polaris no-modifier import defect cannot apply:
+
+1. A client's paint lands in the window backing as a RECORDED but
+   UNSUBMITTED op in the render submit group.
+2. `accumulate_damage_to_state` transmitted DamageNotify synchronously via
+   `client_io::write_or_buffer` during request processing.
+3. Only at the next flush trigger (compose, get_image, Present signal, …)
+   did `queue_submit2` run and `publish_export_write_fences` import the
+   completion sync-file onto the exported dma-buf as a WRITE fence.
+
+Between 2 and 3, KWin wakes on Damage, GLX-TFP-samples the exported backing,
+and its GL driver's implicit sync finds NO fence on the reservation object —
+so it reads stale pixels without waiting and bakes them into whichever
+backbuffer it is compositing. Its two alternating backbuffers each freeze a
+different stale hover state, which is exactly the observed persistent
+stationary flicker, and why every dump showed internally-consistent sources
+that differed from each other. Xorg's ordering is the inverse:
+glamor_block_handler flushes GL before FlushAllOutput releases event bytes.
+
+The fix restores that invariant: DamageNotify events now park on
+`ServerState::deferred_damage_notifies` (both the accumulate path and the
+DamageSubtract re-report path), and the run loop drains them at the
+pre-block chokepoint AFTER calling the new
+`Backend::flush_exported_render_writes()` — a KMS hook that no-ops unless an
+exported backing was written since the last flush, and otherwise runs the
+same flush-render-batch → close-open-frame → flush-submit-group triple as
+`enqueue_present_completion`, whose submit-group flush publishes the write
+fences. Notifies whose damage object died between accumulate and drain are
+dropped. New `FlushReason::DamagePublish` / `CloseReason::DamagePublish`
+telemetry attributes the extra flushes; deferring also coalesces damage
+delivery per iteration instead of per-op socket writes.
+
+Validation: workspace tests green (1030 core + 745 yserver), nightly fmt,
+clippy clean. New red-first test
+`damage_notify_transmission_is_deferred_until_flush` pins the deferral and
+the dead-object filter. NOT hardware-tested yet — the bug is a timing race,
+so only the Plasma/Dolphin repro on silence (and ideally a konsole retest by
+the reporter) can confirm. If the flicker survives, the next discriminator is
+a CPU-mmap hash of the source dma-buf alongside the Vulkan readback hash at
+copy time (bytes fresh on CPU but stale via Vulkan ⇒ the Polaris UB import;
+stale in both ⇒ more export-side timing). The invalid no-modifier LINEAR
+import on Polaris (RADV rejects the format/tiling/usage/handle combination)
+still needs fixing for a clean Vulkan baseline regardless — it is UB and
+plausibly implicated in the two GPU faults the reverted experiments hit.
+
+### 2026-07-31 first HW smoke of the deferral fix — flicker gone, wezterm fault
+
+Result of `just yserver-plasma-hw` on silence (run 14:10:52--14:12:02 UTC):
+
+- **The Dolphin hover flicker did not reproduce** during sustained hover
+  testing — the first negative repro since the investigation began. Weak
+  positive (timing bug), needs a longer clean run to call fixed.
+- CPU load was slightly elevated (gkrellm) before the crash — possibly the
+  per-iteration DamagePublish flush cost; check
+  `submit_group_flush_reason_damage_publish/s` telemetry next run.
+- At 14:11:55 a new window mapped (`_NET_FRAME_EXTENTS` on 0x2200003 —
+  wezterm starting); at 14:12:00 GLX-TFP write-waits began timing out (30
+  total) and at 14:12:02 `ERROR_DEVICE_LOST`. User had to SAK to recover.
+
+**Pattern discovered: the fault trigger is wezterm startup, not the
+experiments.** The 09:38 fault was assigned to wezterm-gui PASID 558 and
+"started one second after" wezterm activity; this fault fired seconds after
+wezterm's window mapped; the 11:30 "clean reboot" fault at t+11s is
+session-restore territory (KDE restarts wezterm automatically). wezterm has
+no `front_end` override so it defaults to WebGpu → wgpu → Vulkan → RADV —
+making it the only RADV-native client in the session (KWin/plasma are
+radeonsi GL, Dolphin is Qt). Hypothesis: a Vulkan client Presenting through
+our DRI3/Present explicit-sync path (no implicit sync on RADV BOs) hits a
+yserver buffer-lifecycle bug GL clients never touch and VM-faults in its own
+context. Master likely carries the same bug — wezterm just isn't started
+during ordinary master smokes.
+
+Next discriminators (after reboot — GPU state on the faulted boot is
+untrustworthy, cf. the recurring latched-corruption pattern):
+1. `journalctl -k -b -1` to recover the fault's PASID/ring from the crashed
+   boot.
+2. **Master + Plasma + start wezterm several times.** Faults on master ⇒ the
+   "experiments cause GPU faults" narrative collapses (including for the
+   reverted semaphore-wait experiment) and we have a clean repro:
+   RADV-client Present faults on Polaris.
+3. Same with `front_end = "OpenGL"` in wezterm — stability there pins it to
+   the RADV/explicit-sync client path.
+4. Only then re-smoke the deferral fix for the flicker verdict, ideally with
+   the invalid no-modifier import fixed first for a legal baseline.

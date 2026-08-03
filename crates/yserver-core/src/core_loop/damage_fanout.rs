@@ -19,7 +19,7 @@ use crate::nested::DAMAGE_FIRST_EVENT;
 /// "committed" against `state.damage_objects` (rect pushed, fired
 /// flag set). The caller drains this list to actually transmit.
 #[derive(Debug, Clone)]
-struct PendingNotify {
+pub(crate) struct PendingNotify {
     owner: ClientId,
     damage_id: u32,
     level: u8,
@@ -31,6 +31,28 @@ struct PendingNotify {
     /// For ancestor matches this is the ancestor's extent, not the
     /// originating leaf's — per X11 DAMAGE spec.
     geometry: x11damage::Rectangle,
+}
+
+/// A `PendingNotify` parked on `ServerState::deferred_damage_notifies`
+/// until the end-of-iteration drain, with the DAMAGE timestamp captured
+/// at accumulate time.
+///
+/// Why deferred at all: the GPU write a DamageNotify advertises is
+/// recorded into the render backend's submit group but often not yet
+/// SUBMITTED when the damage accumulates — and the dma-buf write fence
+/// is only published after `vkQueueSubmit2`. Transmitting the event
+/// inline let an implicit-sync GL compositor (KWin) sample the exported
+/// backing before any fence existed on its reservation object, reading
+/// stale pixels (discussion #100: konsole redraw corruption on i915,
+/// Dolphin hover-trail flicker on Polaris). Xorg's ordering is the
+/// inverse: glamor's block handler flushes GL before `FlushAllOutput`
+/// releases event bytes. The drain in `run.rs` restores that invariant:
+/// `Backend::flush_exported_render_writes()` first, then
+/// [`flush_deferred_damage_notifies`].
+#[derive(Debug, Clone)]
+pub(crate) struct DeferredDamageNotify {
+    notify: PendingNotify,
+    timestamp: u32,
 }
 
 /// Maximum tree depth to walk when propagating damage to ancestors.
@@ -333,24 +355,16 @@ pub fn accumulate_damage_to_state(
         accumulate_at_level(state, parent, rx, ry, rw, rh, &mut pending);
     }
 
-    if pending.is_empty() {
-        return Vec::new();
-    }
-
-    let mut dropped: Vec<ClientId> = Vec::new();
+    // Defer transmission to the end-of-iteration drain (see
+    // `DeferredDamageNotify`) so the render backend can submit + publish
+    // the write fences the event advertises BEFORE the bytes depart.
     for n in pending {
-        let geometry = n.geometry;
-        let area = n.area;
-        let extras = fanout_event_to_clients(state, &[n.owner], |buf, seq, order| {
-            encode_damage_notify(buf, order, seq, &n, timestamp, area, geometry);
+        state.deferred_damage_notifies.push(DeferredDamageNotify {
+            notify: n,
+            timestamp,
         });
-        for cid in extras {
-            if !dropped.contains(&cid) {
-                dropped.push(cid);
-            }
-        }
     }
-    dropped
+    Vec::new()
 }
 
 /// Re-report an already-accumulated damage object without appending a
@@ -469,8 +483,41 @@ pub fn report_existing_damage_to_state(state: &mut ServerState, damage_id: u32) 
     }
 
     let timestamp = state.timestamp_now();
-    let mut dropped: Vec<ClientId> = Vec::new();
+    // Deferred like accumulate_damage_to_state's notifies — same fence
+    // ordering invariant, same drain point.
     for n in pending {
+        state.deferred_damage_notifies.push(DeferredDamageNotify {
+            notify: n,
+            timestamp,
+        });
+    }
+    Vec::new()
+}
+
+/// Drain `state.deferred_damage_notifies` and transmit each
+/// DamageNotify. Call ONLY after the backend has flushed + fence-published
+/// any GPU writes to exported backings this iteration
+/// (`Backend::flush_exported_render_writes`) — that ordering is the whole
+/// point of the deferral (see [`DeferredDamageNotify`]).
+///
+/// Notifies whose damage object was destroyed between accumulate and
+/// drain are dropped: emitting events for a dead XID is exactly the
+/// bad-reply class KDE clients spin on.
+///
+/// Returns clients whose socket write failed (same contract the inline
+/// emission path had).
+pub fn flush_deferred_damage_notifies(state: &mut ServerState) -> Vec<ClientId> {
+    if state.deferred_damage_notifies.is_empty() {
+        return Vec::new();
+    }
+    let deferred = std::mem::take(&mut state.deferred_damage_notifies);
+    let mut dropped: Vec<ClientId> = Vec::new();
+    for entry in deferred {
+        let n = entry.notify;
+        if !state.damage_objects.contains_key(&n.damage_id) {
+            continue;
+        }
+        let timestamp = entry.timestamp;
         let geometry = n.geometry;
         let area = n.area;
         let extras = fanout_event_to_clients(state, &[n.owner], |buf, seq, order| {
@@ -1088,6 +1135,7 @@ mod tests {
         );
 
         let _ = accumulate_damage_to_state(&mut state, w_id, 5, 5, 30, 40);
+        let _ = flush_deferred_damage_notifies(&mut state);
         assert_eq!(
             count_damage_notify_events(&mut reader, &state, 1),
             1,
@@ -1095,6 +1143,7 @@ mod tests {
         );
 
         let _ = accumulate_damage_to_state(&mut state, w_id, 50, 50, 30, 40);
+        let _ = flush_deferred_damage_notifies(&mut state);
         assert_eq!(
             count_damage_notify_events(&mut reader, &state, 1),
             1,
@@ -1105,6 +1154,56 @@ mod tests {
              count is 0 because the gate applies NonEmpty's one-shot \
              semantics to all levels — that's the cinnamon scroll-\
              stale regression.",
+        );
+    }
+
+    /// The deferral invariant itself (discussion #100): accumulate
+    /// must NOT put DamageNotify bytes on the wire — only
+    /// `flush_deferred_damage_notifies` may, because the run loop
+    /// calls `Backend::flush_exported_render_writes` first so the
+    /// dma-buf write fence exists before a compositor can react to
+    /// the event. Also: notifies for a damage object destroyed
+    /// between accumulate and drain are dropped, not transmitted.
+    #[test]
+    fn damage_notify_transmission_is_deferred_until_flush() {
+        let mut state = ServerState::new();
+        let mut reader = add_client_with_reader(&mut state, 1, 0x0010_0000);
+        let w_id = add_window(&mut state, 1, 0x0010_0001, ROOT_WINDOW, 0, 0, 500, 400);
+        add_damage_on(&mut state, 1, 0xe000_0001, w_id);
+
+        let _ = accumulate_damage_to_state(&mut state, w_id, 5, 5, 30, 40);
+        assert_eq!(
+            count_damage_notify_events(&mut reader, &state, 1),
+            0,
+            "accumulate alone must not transmit — the event is parked \
+             until the backend has fence-published the write",
+        );
+        assert_eq!(state.deferred_damage_notifies.len(), 1);
+
+        let _ = flush_deferred_damage_notifies(&mut state);
+        assert_eq!(
+            count_damage_notify_events(&mut reader, &state, 1),
+            1,
+            "drain transmits the parked notify",
+        );
+        assert!(state.deferred_damage_notifies.is_empty());
+
+        // Destroy-before-drain: park another notify, then drop the
+        // damage object. The drain must skip it (events for dead XIDs
+        // are the bad-reply class KDE clients spin on).
+        state
+            .damage_objects
+            .get_mut(&0xe000_0001)
+            .expect("damage object")
+            .pending_notify_fired = false;
+        let _ = accumulate_damage_to_state(&mut state, w_id, 60, 60, 10, 10);
+        assert_eq!(state.deferred_damage_notifies.len(), 1);
+        state.damage_objects.remove(&0xe000_0001);
+        let _ = flush_deferred_damage_notifies(&mut state);
+        assert_eq!(
+            count_damage_notify_events(&mut reader, &state, 1),
+            0,
+            "notify parked for a destroyed damage object must be dropped",
         );
     }
 
@@ -1125,6 +1224,7 @@ mod tests {
         );
 
         let _ = accumulate_damage_to_state(&mut state, w_id, 5, 5, 30, 40);
+        let _ = flush_deferred_damage_notifies(&mut state);
         assert_eq!(
             count_damage_notify_events(&mut reader, &state, 1),
             1,
@@ -1132,6 +1232,7 @@ mod tests {
         );
 
         let _ = accumulate_damage_to_state(&mut state, w_id, 50, 50, 30, 40);
+        let _ = flush_deferred_damage_notifies(&mut state);
         assert_eq!(
             count_damage_notify_events(&mut reader, &state, 1),
             0,
@@ -1365,6 +1466,7 @@ mod tests {
         // Small paint at (50, 100) 20×30 — the "post-first-frame
         // tooltip update" shape that exposed the bug on CC.
         let _ = accumulate_damage_to_state(&mut state, w_id, 50, 100, 20, 30);
+        let _ = flush_deferred_damage_notifies(&mut state);
 
         // Read the encoded DamageNotify off the socket. 32 bytes.
         let mut buf = [0u8; 32];

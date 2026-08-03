@@ -254,6 +254,7 @@ pub struct Bucket {
     /// rising rate indicates oversized scratches or workload churn.
     pub(crate) frame_builder_close_reason_scratch_grow: u64,
     pub(crate) frame_builder_close_reason_redirect_source_boundary: u64,
+    pub(crate) frame_builder_close_reason_damage_publish: u64,
     /// Sum of `ops_in_frame` across all closes in the window.
     pub(crate) frame_builder_ops_per_frame_total: u64,
     /// Max `ops_in_frame` seen in the current bucket window.
@@ -300,6 +301,7 @@ pub struct Bucket {
     pub(crate) submit_group_flush_reason_max_size: u64,
     pub(crate) submit_group_flush_reason_shutdown: u64,
     pub(crate) submit_group_flush_reason_frame_builder: u64,
+    pub(crate) submit_group_flush_reason_damage_publish: u64,
     // ── Phase A: retention high-water gauges ─────────────────────
     /// High-water mark of descriptor pool ring pool count sampled
     /// each tick.
@@ -487,6 +489,7 @@ impl Telemetry {
              submit_group_flush_reason_max_size/s={} \
              submit_group_flush_reason_shutdown/s={} \
              submit_group_flush_reason_frame_builder/s={} \
+             submit_group_flush_reason_damage_publish/s={} \
              active_descriptor_pool_count_high_water={} \
              active_staging_bytes_high_water={} \
              active_scratch_bytes_high_water={} \
@@ -562,6 +565,7 @@ impl Telemetry {
             b.submit_group_flush_reason_max_size,
             b.submit_group_flush_reason_shutdown,
             b.submit_group_flush_reason_frame_builder,
+            b.submit_group_flush_reason_damage_publish,
             self.lifetime.active_descriptor_pool_count_high_water,
             self.lifetime.active_staging_bytes_high_water,
             self.lifetime.active_scratch_bytes_high_water,
@@ -585,7 +589,7 @@ impl Telemetry {
              renders/frame_avg={fb_renders_avg:.1} max={} active_pins_hw={} \
              close_reasons[scene_compose={} non_ported={} legacy_sc={} \
              present_completion={} sync_wait={} timeout={} shutdown={} pin_ceiling={} \
-             scratch_grow={} redirect_source_boundary={}]",
+             scratch_grow={} redirect_source_boundary={} damage_publish={}]",
             b.frame_builder_opens,
             b.frame_builder_closes,
             b.frame_builder_aborts,
@@ -604,6 +608,7 @@ impl Telemetry {
             b.frame_builder_close_reason_pin_ceiling,
             b.frame_builder_close_reason_scratch_grow,
             b.frame_builder_close_reason_redirect_source_boundary,
+            b.frame_builder_close_reason_damage_publish,
         );
         self.bucket = Bucket::default();
         self.last_emit = now;
@@ -1057,6 +1062,10 @@ impl Telemetry {
                     .lifetime
                     .frame_builder_close_reason_redirect_source_boundary,
             ),
+            R::DamagePublish => (
+                &mut self.bucket.frame_builder_close_reason_damage_publish,
+                &mut self.lifetime.frame_builder_close_reason_damage_publish,
+            ),
         };
         *b += 1;
         *l += 1;
@@ -1144,6 +1153,10 @@ impl Telemetry {
             R::FrameBuilder => (
                 &mut self.bucket.submit_group_flush_reason_frame_builder,
                 &mut self.lifetime.submit_group_flush_reason_frame_builder,
+            ),
+            R::DamagePublish => (
+                &mut self.bucket.submit_group_flush_reason_damage_publish,
+                &mut self.lifetime.submit_group_flush_reason_damage_publish,
             ),
         };
         *b += 1;

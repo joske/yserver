@@ -526,6 +526,20 @@ pub trait Backend {
     /// Reclamation must therefore ride the dispatch loop, not scanout.
     fn before_block(&mut self) {}
 
+    /// Submit any recorded-but-unsubmitted GPU writes to exported
+    /// (DRI3/GLX-TFP) backings and publish their dma-buf WRITE fences.
+    ///
+    /// Called by the core loop right before deferred DamageNotify
+    /// delivery, so an implicit-sync GL compositor that samples an
+    /// exported texture in response to Damage finds the write fence on
+    /// the dma-buf's reservation object and waits for our copy instead
+    /// of reading stale pixels (Xorg analog: glamor_block_handler
+    /// flushes GL before FlushAllOutput; discussion #100).
+    ///
+    /// Must be cheap when there is nothing to publish — the core calls
+    /// it once per iteration whenever damage events are pending.
+    fn flush_exported_render_writes(&mut self) {}
+
     /// Drain libinput's INITIAL device enumeration and seed the XI2
     /// device registry (`state.xi_devices`) BEFORE the core serves any
     /// client — the Xorg model of probing input at startup.

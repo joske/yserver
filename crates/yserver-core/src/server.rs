@@ -1029,6 +1029,13 @@ pub struct ServerState {
     /// (Task 19) lives on the KMS backend's `dri3_sync_resources` map.
     pub sync_fences: HashMap<u32, SyncFence>,
     pub damage_objects: HashMap<u32, DamageObject>,
+    /// DamageNotify events accumulated this core-loop iteration, parked
+    /// until the render backend has submitted + fence-published the GPU
+    /// writes they advertise. Drained by
+    /// `damage_fanout::flush_deferred_damage_notifies` right before the
+    /// loop blocks (Xorg analog: glamor block handler flushes GL before
+    /// `FlushAllOutput` releases event bytes).
+    pub(crate) deferred_damage_notifies: Vec<crate::core_loop::damage_fanout::DeferredDamageNotify>,
     pub composite_redirects: HashMap<(ResourceId, bool), RedirectRecord>,
     pub present_event_selections: HashMap<u32, PresentEventSelection>,
     /// `PresentNotifyMSC` requests parked for a future MSC, fired when a
@@ -1303,6 +1310,7 @@ impl ServerState {
             idletime_last_evaluated: HashMap::new(),
             sync_fences: HashMap::new(),
             damage_objects: HashMap::new(),
+            deferred_damage_notifies: Vec::new(),
             composite_redirects: HashMap::new(),
             present_event_selections: HashMap::new(),
             present_pending_msc: Vec::new(),
