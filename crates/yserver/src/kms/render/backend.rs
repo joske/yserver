@@ -858,6 +858,11 @@ pub struct KmsBackend {
     /// through this. Lifetime is the same as the matching entry in
     /// `cursor_records`; both maps share the same xid keys.
     pub(crate) cursor_pixmaps: HashMap<u32, crate::kms::render::store::DrawableId>,
+    /// Strong references to each cursor object. Creation contributes the
+    /// client resource reference; windows, active grabs, and the sticky root
+    /// fallback contribute additional references. `FreeCursor` drops only the
+    /// client reference, matching Xorg's `CursorRec::refcnt` lifetime.
+    pub(crate) cursor_refcounts: HashMap<u32, usize>,
     /// Monotonically-increasing version counter for new
     /// `CursorRecord` allocations. Compared by VALUE in the Phase B/C
     /// upload-dedup paths.
@@ -880,9 +885,9 @@ pub struct KmsBackend {
 
     /// Animated-cursor frame lists, keyed by the anim cursor's host
     /// handle. Same key-space discipline as `cursor_records` /
-    /// `cursor_pixmaps` (see comment at `cursor_records`); entries
-    /// are never removed (status-quo no-op `free_cursor` — spec
-    /// "Frame lifetime").
+    /// `cursor_pixmaps` (see comment at `cursor_records`). Each frame
+    /// drawable is retained until the animated cursor's final reference is
+    /// released, matching Xorg's frame lifetime.
     pub(crate) anim_cursor_records: HashMap<u32, crate::kms::render::cursor::AnimCursorRecord>,
     /// The one running animation (the effective cursor is animated),
     /// or `None`.
@@ -2341,6 +2346,7 @@ impl KmsBackend {
             pending_completed_events_on_shutdown: Vec::new(),
             cursor_records: HashMap::new(),
             cursor_pixmaps: HashMap::new(),
+            cursor_refcounts: HashMap::new(),
             next_cursor_version: 1,
             default_cursor_xid: None,
             effective_cursor_xid: None,
@@ -2433,6 +2439,50 @@ impl KmsBackend {
 
     // ── Stage 5 Phase A — cursor record helpers ────────────────────
 
+    fn retain_cursor(&mut self, xid: u32) {
+        if let Some(refcount) = self.cursor_refcounts.get_mut(&xid) {
+            *refcount = refcount.checked_add(1).expect("cursor refcount overflow");
+        }
+    }
+
+    /// Drop one strong cursor reference and retire its sprite storage when
+    /// the last owner disappears. Animated cursors own one store reference
+    /// per snapshotted frame; their canonical `cursor_pixmaps` entry merely
+    /// aliases the current frame and therefore is not an additional owner.
+    fn release_cursor(&mut self, xid: u32) {
+        let Some(refcount) = self.cursor_refcounts.get_mut(&xid) else {
+            return;
+        };
+        if *refcount > 1 {
+            *refcount -= 1;
+            return;
+        }
+
+        self.cursor_refcounts.remove(&xid);
+        self.cursor_records.remove(&xid);
+        let canonical_pixmap = self.cursor_pixmaps.remove(&xid);
+        if let Some(anim) = self.anim_cursor_records.remove(&xid) {
+            for frame in anim.frames {
+                if let Some(pixmap_id) = frame.pixmap {
+                    self.store_decref_with_invalidate(pixmap_id);
+                }
+            }
+        } else if let Some(pixmap_id) = canonical_pixmap {
+            self.store_decref_with_invalidate(pixmap_id);
+        }
+        if self.active_cursor_anim.as_ref().map(|anim| anim.handle) == Some(xid) {
+            self.active_cursor_anim = None;
+        }
+    }
+
+    fn remove_window_geometry(&mut self, host_xid: u32) {
+        if let Some(geometry) = self.windows.remove(&host_xid)
+            && let Some(cursor_xid) = geometry.cursor
+        {
+            self.release_cursor(cursor_xid);
+        }
+    }
+
     /// Allocate a fresh CursorRecord + sprite Pixmap and register
     /// both in the canonical xid maps. Bumps `next_cursor_version`,
     /// uploads the BGRA bytes to a v2 store Pixmap (so the SW scene
@@ -2464,6 +2514,7 @@ impl KmsBackend {
             self.cursor_pixmaps.insert(xid, pixmap_id);
         }
         self.cursor_records.insert(xid, record);
+        self.cursor_refcounts.insert(xid, 1);
         self.refresh_effective_cursor();
     }
 
@@ -2492,6 +2543,7 @@ impl KmsBackend {
             self.cursor_pixmaps.insert(xid, pixmap_id);
         }
         self.cursor_records.insert(xid, record);
+        self.cursor_refcounts.insert(xid, 1);
         self.refresh_effective_cursor();
     }
 
@@ -3229,6 +3281,7 @@ impl KmsBackend {
             pending_completed_events_on_shutdown: Vec::new(),
             cursor_records: HashMap::new(),
             cursor_pixmaps: HashMap::new(),
+            cursor_refcounts: HashMap::new(),
             next_cursor_version: 1,
             default_cursor_xid: None,
             effective_cursor_xid: None,
@@ -14059,7 +14112,8 @@ impl Backend for KmsBackend {
         if let Some(id) = self.store.lookup(host_xid) {
             self.store_decref_with_invalidate(id);
         }
-        self.windows.remove(&host_xid);
+        self.remove_window_geometry(host_xid);
+        self.refresh_effective_cursor();
         // Step 2 (DRIFT 2): top_level_order is no longer mutated here — it
         // is a projection of core children, reprojected by the destroy
         // core handler via `sync_top_level_order` after the resource child
@@ -14885,7 +14939,8 @@ impl Backend for KmsBackend {
             // ReleaseOverlayWindow core handler reprojects from core via
             // `sync_top_level_order` after destroy_cow_resource.
             let cow_host_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
-            self.windows.remove(&cow_host_xid);
+            self.remove_window_geometry(cow_host_xid);
+            self.refresh_effective_cursor();
             self.scene.mark_scene_structure_dirty();
 
             self.drain_engine_present_batches();
@@ -15281,6 +15336,15 @@ impl Backend for KmsBackend {
         Ok(handle)
     }
 
+    fn free_cursor(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
+        // FreeCursor removes the client's resource ID, but cursor objects can
+        // remain referenced by window attributes, a pointer grab, or an
+        // animated cursor. `release_cursor` performs the actual backend and
+        // drawable teardown only when the final strong reference disappears.
+        self.release_cursor(host_xid);
+        Ok(())
+    }
+
     fn recolor_cursor(
         &mut self,
         _origin: Option<OriginContext>,
@@ -15367,6 +15431,15 @@ impl Backend for KmsBackend {
         let xid = self.core.next_host_xid();
         let handle = CursorHandle::from_raw(xid)
             .ok_or_else(|| io::Error::other("create_anim_cursor: xid was 0"))?;
+        // The snapshots keep their source sprites alive independently of the
+        // constituent cursor XIDs. Clients commonly FreeCursor every frame
+        // immediately after CreateAnimCursor; Xorg retains those frame
+        // cursors, while we retain the equivalent drawable references.
+        for frame in &snap {
+            if let Some(pixmap_id) = frame.pixmap {
+                self.store.incref(pixmap_id);
+            }
+        }
         // Alias frame 0 in the canonical maps so every static-cursor
         // code path (effective walk, XFixes, scene) works untouched.
         self.cursor_records
@@ -15378,6 +15451,7 @@ impl Backend for KmsBackend {
             xid,
             crate::kms::render::cursor::AnimCursorRecord { frames: snap },
         );
+        self.cursor_refcounts.insert(xid, 1);
         Ok(Some(handle))
     }
 
@@ -15402,11 +15476,30 @@ impl Backend for KmsBackend {
         } else {
             Some(cursor_host_xid)
         };
-        if let Some(geom) = self.windows.get_mut(&host_window_xid) {
-            geom.cursor = nested;
+        let old_window_cursor = self
+            .windows
+            .get(&host_window_xid)
+            .and_then(|geom| geom.cursor);
+        if old_window_cursor != nested {
+            if let Some(new_cursor) = nested {
+                self.retain_cursor(new_cursor);
+            }
+            if let Some(geom) = self.windows.get_mut(&host_window_xid) {
+                geom.cursor = nested;
+            }
+            if let Some(old_cursor) = old_window_cursor {
+                self.release_cursor(old_cursor);
+            }
         }
-        if cursor_host_xid != 0 && host_window_xid == self.core.window_id {
-            self.core.active_cursor = Some(cursor_host_xid);
+        if cursor_host_xid != 0
+            && host_window_xid == self.core.window_id
+            && self.core.active_cursor != Some(cursor_host_xid)
+        {
+            self.retain_cursor(cursor_host_xid);
+            let old_active = self.core.active_cursor.replace(cursor_host_xid);
+            if let Some(old_cursor) = old_active {
+                self.release_cursor(old_cursor);
+            }
         }
         self.refresh_effective_cursor();
         Ok(())
@@ -15422,7 +15515,15 @@ impl Backend for KmsBackend {
         // it when the grab ends. `refresh_effective_cursor` re-evaluates
         // the chain (now short-circuited by the override) and swaps the
         // scene `CursorEntry` when the displayed cursor changed.
-        self.grab_cursor_override = cursor_host_xid;
+        if self.grab_cursor_override != cursor_host_xid {
+            if let Some(new_cursor) = cursor_host_xid {
+                self.retain_cursor(new_cursor);
+            }
+            let old_cursor = std::mem::replace(&mut self.grab_cursor_override, cursor_host_xid);
+            if let Some(old_cursor) = old_cursor {
+                self.release_cursor(old_cursor);
+            }
+        }
         self.refresh_effective_cursor();
         Ok(())
     }
@@ -23639,6 +23740,146 @@ mod tests {
         // UngrabPointer (None) → reverts to the window's cursor.
         b.set_grab_cursor(None, None).expect("clear grab cursor");
         assert_eq!(b.effective_cursor_xid, Some(win_cur.as_raw()));
+    }
+
+    /// Issue #115: ordinary toolkit cursor churn must not grow the canonical
+    /// maps forever. Before KMS implemented `free_cursor`, every iteration
+    /// left both a `CursorRecord` and (with live Vulkan) a sprite drawable.
+    #[test]
+    fn freed_cursors_do_not_accumulate() {
+        use crate::kms::render::store::{DrawableKind, Storage};
+        use yserver_core::backend::Backend;
+
+        let mut b = KmsBackend::for_tests();
+        let baseline_records = b.cursor_records.len();
+        let baseline_refcounts = b.cursor_refcounts.len();
+        let baseline_drawables = b.store.len();
+
+        for _ in 0..512 {
+            let xid = b.core.next_host_xid();
+            b.insert_cursor_record(xid, 1, 1, 0, 0, vec![0, 0, 0, 0]);
+            // Vk-less fixtures skip the production sprite allocation, so
+            // attach equivalent null storage explicitly to exercise the
+            // drawable-retirement half of FreeCursor too.
+            let sprite_xid = b.core.next_host_xid();
+            let sprite_id = b
+                .store
+                .allocate(
+                    sprite_xid,
+                    DrawableKind::Pixmap,
+                    32,
+                    false,
+                    Storage::for_tests_null(
+                        ash::vk::Extent2D {
+                            width: 1,
+                            height: 1,
+                        },
+                        ash::vk::Format::B8G8R8A8_UNORM,
+                    ),
+                )
+                .expect("sprite drawable");
+            b.cursor_pixmaps.insert(xid, sprite_id);
+            b.free_cursor(None, xid).expect("free cursor");
+        }
+
+        assert_eq!(b.cursor_records.len(), baseline_records);
+        assert_eq!(b.cursor_refcounts.len(), baseline_refcounts);
+        assert_eq!(b.store.len(), baseline_drawables);
+    }
+
+    /// FreeCursor drops the client's resource reference, not references held
+    /// by window attributes or an active pointer grab. Replacing those owners
+    /// must release the final reference and retire the canonical record.
+    #[test]
+    fn window_and_grab_references_keep_freed_cursor_alive() {
+        use yserver_core::backend::Backend;
+
+        let mut b = KmsBackend::for_tests();
+        let xid = b.core.next_host_xid();
+        b.insert_cursor_record(xid, 1, 1, 0, 0, vec![0, 0, 0, 0]);
+        let window = 0xABCD_1001;
+        let rank = b.alloc_window_stack_rank();
+        b.windows.insert(
+            window,
+            super::WindowGeometry {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 8,
+                depth: 24,
+                mapped: true,
+                parent: None,
+                stack_rank: rank,
+                bg_pixel: None,
+                bg_pixmap: None,
+                cursor: None,
+            },
+        );
+
+        b.define_cursor(None, window, xid).expect("window cursor");
+        b.set_grab_cursor(None, Some(xid)).expect("grab cursor");
+        assert_eq!(b.cursor_refcounts.get(&xid), Some(&3));
+
+        b.free_cursor(None, xid).expect("client FreeCursor");
+        assert!(b.cursor_records.contains_key(&xid));
+        assert_eq!(b.cursor_refcounts.get(&xid), Some(&2));
+
+        b.set_grab_cursor(None, None).expect("release grab cursor");
+        b.destroy_subwindow(None, window)
+            .expect("destroy cursor-owning window");
+        assert!(!b.cursor_records.contains_key(&xid));
+        assert!(!b.cursor_refcounts.contains_key(&xid));
+    }
+
+    /// Animated cursors snapshot frame records and retain their sprite
+    /// drawables. Freeing the constituent cursor must leave that sprite live;
+    /// freeing the animation wrapper then releases the final store refs.
+    #[test]
+    fn animated_cursor_retains_and_releases_frame_sprite() {
+        use crate::kms::render::store::{DrawableKind, Storage};
+        use yserver_core::backend::{Backend, CursorHandle};
+
+        let mut b = KmsBackend::for_tests();
+        let cursor_xid = b.core.next_host_xid();
+        b.insert_cursor_record(cursor_xid, 1, 1, 0, 0, vec![0, 0, 0, 0]);
+        let sprite_xid = b.core.next_host_xid();
+        let sprite_id = b
+            .store
+            .allocate(
+                sprite_xid,
+                DrawableKind::Pixmap,
+                32,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 1,
+                        height: 1,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("sprite drawable");
+        b.cursor_pixmaps.insert(cursor_xid, sprite_id);
+        let cursor = CursorHandle::from_raw(cursor_xid).expect("cursor handle");
+
+        let anim = b
+            .create_anim_cursor(None, &[(cursor, 16), (cursor, 16)])
+            .expect("create animation")
+            .expect("animation handle");
+        b.free_cursor(None, cursor_xid)
+            .expect("free constituent cursor");
+        assert!(
+            b.store.get(sprite_id).is_some(),
+            "animation owns both frame refs"
+        );
+
+        b.free_cursor(None, anim.as_raw())
+            .expect("free animation cursor");
+        assert!(
+            b.store.get(sprite_id).is_none(),
+            "final frame ref retires sprite"
+        );
+        assert!(!b.anim_cursor_records.contains_key(&anim.as_raw()));
     }
 
     /// Effective-cursor walk: a child without its own cursor inherits

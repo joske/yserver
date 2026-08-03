@@ -399,7 +399,8 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   (:4596). xserver's generic `XIPropToInt`/`XIPropToFloat` helpers split
   those differently (`BadValue` for format), but this driver does not use
   them for these properties.
-- **2026-08-03 issue #115 resource-population telemetry (diagnostic only):**
+
+- **2026-08-03 issue #115 cursor-resource leak (fix pending HW verification):**
   VictorVoltzz reports performance decaying over a long session
   (RX 9070 XT, Cinnamon, 3440x1440@165 + 1920x1080@60). His 42-minute
   telemetry log confirms it, and narrows it: comparing the first and
@@ -412,34 +413,43 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   storage/view/descriptor allocation rates, `avg_gpu_render_ns` pinned
   at ~62 µs, pixmap pool at near-100% hit rate. Same work, same
   allocation volume, twice the CPU time.
-  RENDER and `CreatePixmap` both allocate/look up drawables in
-  `DrawableStore`; Present only touches already-imported ones. That
-  points at a container growing without bound, but the existing
-  telemetry reports only *rates*, so nothing in a log could confirm
-  it. Added a `population[...]` group to the 1Hz `render_telemetry:`
-  line reporting live `len()` of the long-lived maps: store
+  The follow-up population run identified the container conclusively:
+  over 36m12s, `cursor_records` and `cursor_pixmaps` rose from 1 to
+  11,918 and never decreased, while `drawables` followed them to 11,809.
+  Other populations cleaned up normally (`pictures` peaked at 1,336 and
+  ended at 65; `view_cache` peaked at 297 and ended at 8), and
+  `pending_retire` was normally zero. One one-second window contained
+  exactly 190 `FreeCursor` requests and grew the cursor maps by exactly
+  190 entries. KMS inherited the backend trait's no-op `free_cursor`, so
+  every ordinary toolkit cursor lifetime retained its CPU record and
+  Vulkan sprite drawable; the games merely made the global leak extreme.
+
+  KMS now gives cursor objects Xorg-style strong-reference lifetime.
+  Creation owns one client-resource reference; window attributes, the
+  sticky root fallback, and the active grab retain additional references.
+  `FreeCursor` drops only the client reference, and window/grab teardown
+  retires the record and sprite drawable on the final release. Animated
+  cursors retain each snapshotted frame's drawable independently, so
+  freeing constituent cursor XIDs remains safe and freeing the wrapper
+  releases all frame holds. Regression coverage runs 512 create/free
+  cycles and requires cursor maps and the drawable store to return to
+  baseline, plus retained window/grab and animated-frame lifetimes.
+
+  The diagnostic branch keeps the `population[...]` group on the 1Hz
+  `render_telemetry:` line reporting live `len()` of the long-lived maps:
+  store
   `entries`/`by_xid`/`pending_retire`/`exported_sync`/`exported_writes`,
   `core.pictures`, `picture_drawable_ids`, `drawable_view_cache`,
   `exported_dmabufs`, `cursor_records`, `cursor_pixmaps`. All O(1),
   sampled every dispatch tick next to the existing
-  `record_active_*_high_water` gauges. A linear climb over a long
-  session names the leak; a climb in `entries` *is* the leak.
-  Not itself a fix. New recipe `just yserver-cinnamon-hw-leak` for the
-  follow-up run: 1Hz rollups with the submit trace off (and
+  `record_active_*_high_water` gauges. A bounded cursor population over a
+  long session verifies the fix. Recipe `just yserver-cinnamon-hw-leak` runs
+  1Hz rollups with the submit trace off (and
   `YSERVER_SUBMIT_TRACE` explicitly unset), writing to
   `yserver-leak-cinnamon.log` so it cannot clobber a trace run.
-  `yserver-cinnamon-hw-telemetry` hardcodes *both* env vars, which is
-  exactly why the reported session has no control — his artifact
-  filenames match that recipe, so he is using it as-is.
-  Two open confounds for the next run: the
-  measurement includes `YSERVER_SUBMIT_TRACE` overhead (constant per
-  row, so it cannot produce the trend, but it was on for the whole
-  session and there is no control run), and `damage_fraction` was
-  1.000 for all 2484 samples — every frame a full redraw of both
-  outputs, which is the known buffer-age gap, not new.
-  Also from the same log, and separately: one 675 ms `GetImage`
-  (`op73`) at game start — a genuine one-off, the only `op73` in the
-  entire session.
+  The earlier run also had `damage_fraction=1.000` for every sample —
+  the known buffer-age gap, separate from this leak — and one isolated
+  675 ms `GetImage` (`op73`) at game start.
 
 - **2026-07-30 issue #99 KMS pointer-confinement ordering (HW confirmed):**
   vkQuake's SDL3 X11 backend correctly requests a successful core

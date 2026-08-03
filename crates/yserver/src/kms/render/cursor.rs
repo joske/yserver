@@ -177,8 +177,9 @@ pub(crate) fn color_roles_to_bgra(
 
 /// One frame of a RENDER animated cursor (spec
 /// `2026-06-10-animated-cursors-design.md`). Snapshotted at
-/// `create_anim_cursor` time so constituent-cursor lifetime is a
-/// non-issue (Xorg refcounts; we snapshot).
+/// `create_anim_cursor` time. The record is held by `Arc` and the backing
+/// sprite drawable receives a matching store reference, equivalent to
+/// Xorg retaining each constituent cursor.
 pub(crate) struct AnimFrame {
     pub(crate) record: Arc<CursorRecord>,
     /// Sprite pixmap the SW scene path samples. `None` when the
