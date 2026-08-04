@@ -451,6 +451,16 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   `live_buckets`, and `live_nominal_bytes` so the next HW run can verify the
   cap and show its memory footprint.
 
+  **Post-cap follow-up:** the ceiling worked on Victor's 70-minute rerun
+  (`live_entries` never exceeded 2,048; peak nominal storage was 31 MiB), and
+  the degradation developed more slowly. The initial arbitrary-key eviction
+  policy nevertheless caused 128,000 evictions and 135,596 misses after the
+  pool saturated, over ten times the misses in the earlier unbounded run.
+  Global eviction now chooses the least-recently-used extent/format bucket.
+  Recency metadata is bounded by the 2,048-entry ceiling, and recently used
+  game extents stay resident instead of being replaced according to
+  `HashMap` iteration order.
+
   The diagnostic branch keeps the `population[...]` group on the 1Hz
   `render_telemetry:` line reporting live `len()` of the long-lived maps:
   store

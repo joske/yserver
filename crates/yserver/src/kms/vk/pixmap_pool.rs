@@ -203,21 +203,33 @@ pub struct PixmapPool {
 #[derive(Default)]
 struct PixmapPoolBuckets {
     by_key: HashMap<PixmapPoolKey, VecDeque<PooledPixmapImage>>,
+    /// Last successful take/return generation for each live bucket. This map
+    /// is bounded by `by_key` and lets global eviction retain the game's hot
+    /// extent set instead of depending on arbitrary `HashMap` iteration.
+    last_used: HashMap<PixmapPoolKey, u64>,
+    use_generation: u64,
     entries: usize,
     nominal_bytes: u64,
 }
 
 impl PixmapPoolBuckets {
-    /// Evict one pooled entry, preferring a stale key over the incoming key.
-    /// HashMap iteration deliberately supplies approximate rather than strict
-    /// LRU eviction: this runs only after a cache miss at the global ceiling,
-    /// is O(number of live keys), and carries no unbounded recency queue.
+    fn touch(&mut self, key: PixmapPoolKey) {
+        self.use_generation = self.use_generation.saturating_add(1);
+        self.last_used.insert(key, self.use_generation);
+    }
+
+    /// Evict one entry from the least-recently-used bucket other than the
+    /// incoming key. The scan is O(live buckets), but only runs after a cache
+    /// miss at the global ceiling and its metadata is bounded by the entry
+    /// cap. Keeping hot extent buckets resident avoids turning the hard cap
+    /// into sustained Vulkan image-allocation churn.
     fn evict_one_for(&mut self, incoming_key: PixmapPoolKey) -> Option<PooledPixmapImage> {
         let evict_key = self
             .by_key
             .keys()
             .copied()
-            .find(|candidate| *candidate != incoming_key)
+            .filter(|candidate| *candidate != incoming_key)
+            .min_by_key(|candidate| self.last_used.get(candidate).copied().unwrap_or(0))
             .or_else(|| self.by_key.keys().next().copied())?;
         let old = self.by_key.get_mut(&evict_key)?.pop_front()?;
         self.entries -= 1;
@@ -226,6 +238,7 @@ impl PixmapPoolBuckets {
             .saturating_sub(PixmapPool::nominal_bytes(evict_key));
         if self.by_key.get(&evict_key).is_some_and(VecDeque::is_empty) {
             self.by_key.remove(&evict_key);
+            self.last_used.remove(&evict_key);
         }
         Some(old)
     }
@@ -316,6 +329,9 @@ impl PixmapPool {
                 .saturating_sub(Self::nominal_bytes(key));
             if buckets.by_key.get(&key).is_some_and(VecDeque::is_empty) {
                 buckets.by_key.remove(&key);
+                buckets.last_used.remove(&key);
+            } else {
+                buckets.touch(key);
             }
             stats.total_takes_hit += 1;
         } else {
@@ -371,6 +387,7 @@ impl PixmapPool {
         }
 
         buckets.by_key.entry(key).or_default().push_back(entry);
+        buckets.touch(key);
         buckets.entries += 1;
         buckets.nominal_bytes = buckets
             .nominal_bytes
@@ -402,6 +419,8 @@ impl PixmapPool {
                 self.destroy_entry(entry);
             }
         }
+        buckets.last_used.clear();
+        buckets.use_generation = 0;
         buckets.entries = 0;
         buckets.nominal_bytes = 0;
         let mut stats = self.stats.lock().expect("pixmap pool stats mutex poisoned");
@@ -509,6 +528,8 @@ mod tests {
             .entry(stale)
             .or_default()
             .push_back(null_entry());
+        buckets.touch(stale);
+        buckets.touch(incoming);
         buckets.entries = 2;
         buckets.nominal_bytes =
             PixmapPool::nominal_bytes(incoming) + PixmapPool::nominal_bytes(stale);
@@ -519,6 +540,44 @@ mod tests {
         assert!(buckets.by_key.contains_key(&incoming));
         assert!(!buckets.by_key.contains_key(&stale));
         assert_eq!(buckets.nominal_bytes, PixmapPool::nominal_bytes(incoming));
+    }
+
+    #[test]
+    fn global_eviction_uses_bucket_lru_instead_of_hash_order() {
+        let stale = PixmapPoolKey {
+            width: 17,
+            height: 19,
+            format: vk::Format::B8G8R8A8_UNORM,
+        };
+        let hot = PixmapPoolKey {
+            width: 230,
+            height: 51,
+            format: vk::Format::B8G8R8A8_UNORM,
+        };
+        let incoming = PixmapPoolKey {
+            width: 64,
+            height: 64,
+            format: vk::Format::B8G8R8A8_UNORM,
+        };
+        let mut buckets = PixmapPoolBuckets::default();
+        for key in [stale, hot, incoming] {
+            buckets
+                .by_key
+                .entry(key)
+                .or_default()
+                .push_back(null_entry());
+            buckets.entries += 1;
+            buckets.nominal_bytes += PixmapPool::nominal_bytes(key);
+        }
+        buckets.touch(stale);
+        buckets.touch(hot);
+        buckets.touch(incoming);
+
+        assert!(buckets.evict_one_for(incoming).is_some());
+        assert!(!buckets.by_key.contains_key(&stale));
+        assert!(buckets.by_key.contains_key(&hot));
+        assert!(buckets.by_key.contains_key(&incoming));
+        assert!(!buckets.last_used.contains_key(&stale));
     }
 
     #[test]
