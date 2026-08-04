@@ -629,7 +629,8 @@ mod tests {
     };
 
     use yserver_protocol::x11::{
-        ClientByteOrder, ClientId, CreatePixmapRequest, CreateWindowRequest, ResourceId,
+        ClientByteOrder, ClientId, CreateGcRequest, CreatePixmapRequest, CreateWindowRequest,
+        ResourceId,
     };
 
     use super::{destroy_zombie_resources, process_disconnect};
@@ -661,6 +662,36 @@ mod tests {
                 reader_control: None,
             },
         );
+    }
+
+    fn gc_with_tile(gc: ResourceId, pixmap: ResourceId) -> CreateGcRequest {
+        CreateGcRequest {
+            gc,
+            drawable: ROOT_WINDOW,
+            function: None,
+            plane_mask: None,
+            foreground: None,
+            background: None,
+            line_width: None,
+            line_style: None,
+            cap_style: None,
+            join_style: None,
+            fill_style: None,
+            fill_rule: None,
+            tile: Some(pixmap),
+            stipple: None,
+            tile_x_origin: None,
+            tile_y_origin: None,
+            font: None,
+            subwindow_mode: None,
+            graphics_exposures: None,
+            clip_x_origin: None,
+            clip_y_origin: None,
+            clip_mask: None,
+            dash_offset: None,
+            dashes: None,
+            arc_mode: None,
+        }
     }
 
     fn install_client_with_writer(state: &mut ServerState, id: u32, writer: UnixStream) {
@@ -885,6 +916,43 @@ mod tests {
                 .is_none()
         );
         assert!(!state.zombie_clients.contains_key(&7));
+    }
+
+    #[test]
+    fn disconnect_releases_pixmap_retained_only_by_owned_gc() {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        install_client(&mut state, 7);
+        let pixmap = ResourceId(0x0070_0001);
+        state.resources.create_pixmap(
+            ClientId(7),
+            CreatePixmapRequest {
+                pixmap,
+                drawable: ROOT_WINDOW,
+                width: 16,
+                height: 16,
+                depth: 24,
+            },
+        );
+        assert!(state.resources.set_pixmap_host_xid(
+            pixmap,
+            crate::backend::PixmapHandle::from_raw_for_test(0xcafe),
+        ));
+        state
+            .resources
+            .create_gc(ClientId(7), gc_with_tile(ResourceId(0x0070_0002), pixmap));
+        let _ = state.resources.free_pixmap(pixmap);
+
+        process_disconnect(&mut state, &mut backend, ClientId(7));
+
+        let calls = backend.calls.lock().expect("calls");
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| matches!(call, RecordedCall::FreePixmap(0xcafe)))
+                .count(),
+            1
+        );
     }
 
     #[test]

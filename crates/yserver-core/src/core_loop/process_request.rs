@@ -319,10 +319,10 @@ pub fn process_request(
         50 => handle_list_fonts_with_info(state, backend, origin, client_id, sequence, body),
         // ── GContext (pure state mutation) ──
         55 => handle_create_gc(state, client_id, sequence, body),
-        56 => handle_change_gc(state, client_id, sequence, body),
-        57 => handle_copy_gc(state, client_id, sequence, body),
-        59 => handle_set_clip_rectangles(state, client_id, sequence, header, body),
-        60 => handle_free_gc(state, client_id, sequence, body),
+        56 => handle_change_gc(state, backend, origin, client_id, sequence, body),
+        57 => handle_copy_gc(state, backend, origin, client_id, sequence, body),
+        59 => handle_set_clip_rectangles(state, backend, origin, client_id, sequence, header, body),
+        60 => handle_free_gc(state, backend, origin, client_id, sequence, body),
         // ── drawing (state read + backend RPC + damage) ──
         61 => handle_clear_area(state, backend, origin, client_id, sequence, header, body),
         62 => handle_copy_area(state, backend, origin, client_id, sequence, body),
@@ -5888,7 +5888,8 @@ fn handle_xfixes_request(
             if let Some(req) = x11xfixes::parse_set_gc_clip_region(body) {
                 let gc_id = ResourceId(req.gc);
                 if req.region == 0 {
-                    state.resources.clear_gc_clip(gc_id);
+                    let released = state.resources.clear_gc_clip(gc_id);
+                    release_orphaned_host_pixmaps(backend, origin, released)?;
                 } else {
                     let rects = state
                         .xfixes_regions
@@ -5902,7 +5903,7 @@ fn handle_xfixes_request(
                         rectangles.extend_from_slice(&rect.width.to_le_bytes());
                         rectangles.extend_from_slice(&rect.height.to_le_bytes());
                     }
-                    state.resources.set_clip_rectangles(
+                    let released = state.resources.set_clip_rectangles(
                         client_id,
                         yserver_protocol::x11::SetClipRectanglesRequest {
                             gc: gc_id,
@@ -5914,6 +5915,7 @@ fn handle_xfixes_request(
                             },
                         },
                     );
+                    release_orphaned_host_pixmaps(backend, origin, released)?;
                 }
             }
         }
@@ -25355,6 +25357,8 @@ fn handle_create_gc(
 
 fn handle_change_gc(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
     body: &[u8],
@@ -25363,7 +25367,8 @@ fn handle_change_gc(
         if let Err((code, bad_value)) = validate_gc_only(state, request.gc) {
             return emit_x11_error(state, client_id, sequence, code, bad_value, 56);
         }
-        state.resources.change_gc(client_id, request);
+        let released = state.resources.change_gc(client_id, request);
+        release_orphaned_host_pixmaps(backend, origin, released)?;
     }
     debug!("client {} #{} ChangeGC", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
@@ -25371,6 +25376,8 @@ fn handle_change_gc(
 
 fn handle_copy_gc(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
     body: &[u8],
@@ -25379,7 +25386,8 @@ fn handle_copy_gc(
         let src_gc = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
         let dst_gc = ResourceId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
         let value_mask = u32::from_le_bytes([body[8], body[9], body[10], body[11]]);
-        state.resources.copy_gc(src_gc, dst_gc, value_mask);
+        let released = state.resources.copy_gc(src_gc, dst_gc, value_mask);
+        release_orphaned_host_pixmaps(backend, origin, released)?;
     }
     debug!("client {} #{} CopyGC", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
@@ -25387,6 +25395,8 @@ fn handle_copy_gc(
 
 fn handle_set_clip_rectangles(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
     header: RequestHeader,
@@ -25396,7 +25406,8 @@ fn handle_set_clip_rectangles(
         if let Err((code, bad_value)) = validate_gc_only(state, request.gc) {
             return emit_x11_error(state, client_id, sequence, code, bad_value, 59);
         }
-        state.resources.set_clip_rectangles(client_id, request);
+        let released = state.resources.set_clip_rectangles(client_id, request);
+        release_orphaned_host_pixmaps(backend, origin, released)?;
     }
     debug!("client {} #{} SetClipRectangles", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
@@ -25404,15 +25415,29 @@ fn handle_set_clip_rectangles(
 
 fn handle_free_gc(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     if let Some(gc) = x11::free_resource_id(body) {
-        state.resources.free_gc(gc);
+        let released = state.resources.free_gc(gc);
+        release_orphaned_host_pixmaps(backend, origin, released)?;
     }
     debug!("client {} #{} FreeGC", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
+}
+
+fn release_orphaned_host_pixmaps(
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    host_xids: impl IntoIterator<Item = u32>,
+) -> io::Result<()> {
+    for host_xid in host_xids {
+        backend.free_pixmap(origin, host_xid)?;
+    }
+    Ok(())
 }
 
 fn handle_change_save_set(
@@ -32611,6 +32636,86 @@ mod tests {
                 .iter()
                 .any(|call| matches!(call, RecordedCall::FreePixmap(0xbeef))),
             "host pixmap must stay alive while retained by GC tile"
+        );
+    }
+
+    #[test]
+    fn free_gc_releases_pixmap_retained_after_free_pixmap() {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+
+        state.resources.create_pixmap(
+            ClientId(1),
+            CreatePixmapRequest {
+                depth: 1,
+                pixmap: ResourceId(0x3000),
+                drawable: ROOT_WINDOW,
+                width: 8,
+                height: 8,
+            },
+        );
+        assert!(state.resources.set_pixmap_host_xid(
+            ResourceId(0x3000),
+            crate::backend::PixmapHandle::from_raw(0xcafe).unwrap(),
+        ));
+        state.resources.create_gc(
+            ClientId(1),
+            CreateGcRequest {
+                gc: ResourceId(0x2000),
+                drawable: ROOT_WINDOW,
+                function: None,
+                plane_mask: None,
+                foreground: None,
+                background: None,
+                line_width: None,
+                line_style: None,
+                cap_style: None,
+                join_style: None,
+                fill_style: None,
+                fill_rule: None,
+                tile: None,
+                stipple: None,
+                tile_x_origin: None,
+                tile_y_origin: None,
+                font: None,
+                subwindow_mode: None,
+                graphics_exposures: None,
+                clip_x_origin: None,
+                clip_y_origin: None,
+                clip_mask: Some(Some(ResourceId(0x3000))),
+                dash_offset: None,
+                dashes: None,
+                arc_mode: None,
+            },
+        );
+
+        handle_free_pixmap(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            &free_pixmap_body(0x3000),
+        )
+        .expect("free pixmap");
+        handle_free_gc(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            &free_pixmap_body(0x2000),
+        )
+        .expect("free gc");
+
+        let calls = backend.calls.lock().expect("calls");
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| matches!(call, RecordedCall::FreePixmap(0xcafe)))
+                .count(),
+            1,
+            "the final GC reference must release the retained host pixmap exactly once"
         );
     }
 
@@ -52498,7 +52603,7 @@ mod tests {
         rect_bytes.extend_from_slice(&0i16.to_le_bytes());
         rect_bytes.extend_from_slice(&5u16.to_le_bytes());
         rect_bytes.extend_from_slice(&5u16.to_le_bytes());
-        state.resources.set_clip_rectangles(
+        let _ = state.resources.set_clip_rectangles(
             yserver_protocol::x11::ClientId(1),
             SetClipRectanglesRequest {
                 gc: ResourceId(GC_XID),
@@ -52639,7 +52744,7 @@ mod tests {
         rect_bytes.extend_from_slice(&RECT_Y.to_le_bytes());
         rect_bytes.extend_from_slice(&RECT_W.to_le_bytes());
         rect_bytes.extend_from_slice(&RECT_H.to_le_bytes());
-        state.resources.set_clip_rectangles(
+        let _ = state.resources.set_clip_rectangles(
             yserver_protocol::x11::ClientId(1),
             SetClipRectanglesRequest {
                 gc: ResourceId(GC_XID),

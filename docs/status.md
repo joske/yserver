@@ -473,6 +473,27 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   next capture can distinguish an O(live-drawables) loop-thread cost from
   degradation in thousands of dedicated `VkDeviceMemory` allocations.
 
+  **Store-scan/allocation follow-up:** Victor's 57-minute `856f0593` run
+  ruled out both remaining diagnostic hypotheses. The pool stayed within its
+  2,048-entry cap (27.4 MiB peak), with 470,053 hits against 6,861 misses.
+  The two whole-store scheduler scans consumed 11.96 seconds over 3,447
+  seconds of wall time (~0.35%), so their O(live-drawables) walks are not the
+  visible degradation. The store nevertheless peaked at 3,631 drawables,
+  including 3,300 pixmaps, while cursor records remained bounded (142 peak,
+  114 at end). Fresh Vulkan allocation latency rose from ~59 us in the first
+  ten minutes to ~113 us in the last eight, matching the retained-allocation
+  shape.
+
+  The next lifetime asymmetry was in GC-held pixmaps. `FreePixmap` correctly
+  retained a pixmap used as a GC clip mask, tile, or stipple, but `ChangeGC`,
+  `CopyGC`, `SetClipRectangles`, XFixes `SetGCClipRegion`, `FreeGC`, and
+  client/zombie teardown discarded those GC references without releasing the
+  backend pixmap when the final reference disappeared. The resource layer now
+  returns deduplicated orphan candidates from every GC mutation and frees only
+  when no live pixmap resource, window background, or other GC still retains
+  the host handle. This mirrors Xorg's pixmap refcount release on GC replacement
+  and destruction while preserving cross-GC and cross-client sharing.
+
   The diagnostic branch keeps the `population[...]` group on the 1Hz
   `render_telemetry:` line reporting live `len()` of the long-lived maps:
   store
