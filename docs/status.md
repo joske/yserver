@@ -461,6 +461,18 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   game extents stay resident instead of being replaced according to
   `HashMap` iteration order.
 
+  **LRU follow-up:** Victor's 61-minute `74781f79` rerun cut pool misses
+  from 135,596 to 11,073 and global evictions from 128,000 to 3,296, but
+  produced the same visible degradation. Pool churn is therefore not the
+  primary #115 cause. The remaining run again held ~5,200 live drawables.
+  Diagnostics now split those drawables by kind and report the calls,
+  entries visited, and CPU nanoseconds for the two whole-store scheduler
+  scans (`has_pending_presentation_damage` and
+  `reconcile_offscreen_no_draw`). Pixmap-pool telemetry also reports fresh
+  Vulkan allocation count/bytes/time and image destruction count/time. The
+  next capture can distinguish an O(live-drawables) loop-thread cost from
+  degradation in thousands of dedicated `VkDeviceMemory` allocations.
+
   The diagnostic branch keeps the `population[...]` group on the 1Hz
   `render_telemetry:` line reporting live `len()` of the long-lived maps:
   store

@@ -4634,6 +4634,9 @@ impl KmsBackend {
     /// calls, so sampling every tick is free.
     fn sample_resource_population(&mut self) {
         let (by_xid, exported_sync, exported_writes) = self.store.population_counts();
+        let kinds = self.store.drawable_kind_population();
+        self.telemetry
+            .record_store_scans(self.store.take_scan_counters());
         self.telemetry.record_resource_population(
             crate::kms::render::telemetry::ResourcePopulation {
                 drawables: self.store.len(),
@@ -4647,6 +4650,11 @@ impl KmsBackend {
                 exported_dmabufs: self.exported_dmabufs.len(),
                 cursor_records: self.cursor_records.len(),
                 cursor_pixmaps: self.cursor_pixmaps.len(),
+                drawable_roots: kinds.root,
+                drawable_windows: kinds.window,
+                drawable_pixmaps: kinds.pixmap,
+                drawable_cursors: kinds.cursor,
+                drawable_redirected_backings: kinds.redirected_backing,
             },
         );
     }

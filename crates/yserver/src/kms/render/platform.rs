@@ -42,6 +42,7 @@ use std::{
         Arc, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
     },
+    time::Instant,
 };
 
 use ash::vk;
@@ -1873,6 +1874,8 @@ impl PlatformBackend {
             }
         }
 
+        let allocation_started = Instant::now();
+
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(format)
@@ -1969,15 +1972,12 @@ impl PlatformBackend {
             }
         };
 
-        Ok(Storage::new_server_owned(
-            image,
-            memory,
-            view,
-            sample_view,
-            extent,
-            format,
-            depth,
-        ))
+        let storage =
+            Storage::new_server_owned(image, memory, view, sample_view, extent, format, depth);
+        if let Some(pool) = self.pixmap_pool.as_ref() {
+            pool.record_fresh_allocation(mem_reqs.size, allocation_started.elapsed());
+        }
+        Ok(storage)
     }
 
     /// Phase A: append a paint CB to the open submit group. Returns

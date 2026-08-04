@@ -26,9 +26,11 @@
 )]
 
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet},
     os::fd::OwnedFd,
     sync::Arc,
+    time::Instant,
 };
 
 use ash::vk;
@@ -102,6 +104,37 @@ pub(crate) struct ImportedDmabufMetadata {
 pub(crate) struct ImportedDmabufPlane {
     pub(crate) offset: u64,
     pub(crate) pitch: u32,
+}
+
+impl DrawableKind {
+    const fn population_index(self) -> usize {
+        match self {
+            Self::Root => 0,
+            Self::Window => 1,
+            Self::Pixmap => 2,
+            Self::Cursor => 3,
+            Self::RedirectedBacking => 4,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DrawableKindPopulation {
+    pub(crate) root: usize,
+    pub(crate) window: usize,
+    pub(crate) pixmap: usize,
+    pub(crate) cursor: usize,
+    pub(crate) redirected_backing: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StoreScanCounters {
+    pub(crate) pending_calls: u64,
+    pub(crate) pending_entries: u64,
+    pub(crate) pending_ns: u64,
+    pub(crate) reconcile_calls: u64,
+    pub(crate) reconcile_entries: u64,
+    pub(crate) reconcile_ns: u64,
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -471,6 +504,7 @@ impl Storage {
             }
         }
         unsafe {
+            let destroy_started = Instant::now();
             if self.image_view != vk::ImageView::null() {
                 vk.device.destroy_image_view(self.image_view, None);
             }
@@ -479,6 +513,9 @@ impl Storage {
             }
             if self.memory != vk::DeviceMemory::null() {
                 vk.device.free_memory(self.memory, None);
+            }
+            if let Some(pool) = platform.pixmap_pool.as_ref() {
+                pool.record_destroy(destroy_started.elapsed());
             }
         }
     }
@@ -763,6 +800,11 @@ pub(crate) struct DrawableStore {
     next_id: u64,
     entries: HashMap<DrawableId, Drawable>,
     by_xid: HashMap<u32, DrawableId>,
+    kind_population: [usize; 5],
+    /// Hot scheduler scans are called through `&self`, so use interior
+    /// mutability to accumulate their cost until the backend samples it.
+    /// `DrawableStore` is single-threaded; `Cell` avoids atomic overhead.
+    scan_counters: Cell<StoreScanCounters>,
     /// Drawables that hit refcount-zero but whose ticket isn't
     /// signaled yet. `poll_pending_retire` drains.
     pending_retire: Vec<DrawableId>,
@@ -791,6 +833,8 @@ impl DrawableStore {
             next_id: 1,
             entries: HashMap::new(),
             by_xid: HashMap::new(),
+            kind_population: [0; 5],
+            scan_counters: Cell::new(StoreScanCounters::default()),
             pending_retire: Vec::new(),
             exported_sync: HashMap::new(),
             exported_writes: Vec::new(),
@@ -898,6 +942,7 @@ impl DrawableStore {
         };
         self.entries.insert(id, drawable);
         self.by_xid.insert(xid, id);
+        self.kind_population[kind.population_index()] += 1;
         Ok(id)
     }
 
@@ -930,6 +975,7 @@ impl DrawableStore {
     pub(crate) fn shutdown_destroy_all(&mut self, platform: &PlatformBackend) {
         self.by_xid.clear();
         self.pending_retire.clear();
+        self.kind_population = [0; 5];
         for (_, mut drawable) in self.entries.drain() {
             drawable.storage.destroy(platform);
         }
@@ -1055,6 +1101,8 @@ impl DrawableStore {
         if self.by_xid.get(&drawable.xid).copied() == Some(id) {
             self.by_xid.remove(&drawable.xid);
         }
+        self.kind_population[drawable.kind.population_index()] =
+            self.kind_population[drawable.kind.population_index()].saturating_sub(1);
         drawable.storage.destroy(platform);
         // last_render_ticket drops here; its Rc inner refcount
         // ensures the underlying fence handle stays alive until
@@ -1109,9 +1157,24 @@ impl DrawableStore {
     /// event pokes the loop (the xfce submenu bug). Cheap: short-
     /// circuits on the first match, no allocation.
     pub(crate) fn has_pending_presentation_damage(&self) -> bool {
-        self.entries.values().any(|d| {
-            d.scene_participating && !d.presentation_damage.is_empty() && !d.offscreen_no_draw
-        })
+        let started = Instant::now();
+        let mut visited = 0_u64;
+        let mut found = false;
+        for d in self.entries.values() {
+            visited = visited.saturating_add(1);
+            if d.scene_participating && !d.presentation_damage.is_empty() && !d.offscreen_no_draw {
+                found = true;
+                break;
+            }
+        }
+        let mut counters = self.scan_counters.get();
+        counters.pending_calls = counters.pending_calls.saturating_add(1);
+        counters.pending_entries = counters.pending_entries.saturating_add(visited);
+        counters.pending_ns = counters
+            .pending_ns
+            .saturating_add(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        self.scan_counters.set(counters);
+        found
     }
 
     /// Idle free-run fix (cut 2b): reconcile the `offscreen_no_draw`
@@ -1127,6 +1190,8 @@ impl DrawableStore {
     /// `drawn` holds *sampled source* ids (a redirected Automatic
     /// window is sampled via its backing id, not its own).
     pub(crate) fn reconcile_offscreen_no_draw(&mut self, drawn: &HashSet<DrawableId>) {
+        let started = Instant::now();
+        let visited = u64::try_from(self.entries.len()).unwrap_or(u64::MAX);
         for (id, d) in &mut self.entries {
             if !d.scene_participating || d.presentation_damage.is_empty() {
                 d.offscreen_no_draw = false;
@@ -1134,6 +1199,13 @@ impl DrawableStore {
             }
             d.offscreen_no_draw = !drawn.contains(id);
         }
+        let mut counters = self.scan_counters.get();
+        counters.reconcile_calls = counters.reconcile_calls.saturating_add(1);
+        counters.reconcile_entries = counters.reconcile_entries.saturating_add(visited);
+        counters.reconcile_ns = counters
+            .reconcile_ns
+            .saturating_add(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        self.scan_counters.set(counters);
     }
 
     /// Snapshot for the SceneCompositor to ack later.
@@ -1307,6 +1379,23 @@ impl DrawableStore {
         )
     }
 
+    /// O(1) live drawable breakdown maintained at allocate/destroy sites.
+    pub(crate) fn drawable_kind_population(&self) -> DrawableKindPopulation {
+        DrawableKindPopulation {
+            root: self.kind_population[DrawableKind::Root.population_index()],
+            window: self.kind_population[DrawableKind::Window.population_index()],
+            pixmap: self.kind_population[DrawableKind::Pixmap.population_index()],
+            cursor: self.kind_population[DrawableKind::Cursor.population_index()],
+            redirected_backing: self.kind_population
+                [DrawableKind::RedirectedBacking.population_index()],
+        }
+    }
+
+    /// Drain scheduler-scan counters accumulated since the previous sample.
+    pub(crate) fn take_scan_counters(&self) -> StoreScanCounters {
+        self.scan_counters.replace(StoreScanCounters::default())
+    }
+
     /// Bump a drawable's `content_version` (saturating). Call on every
     /// successful pixel write. No-op for an unknown id.
     pub(crate) fn mark_contents_modified(&mut self, id: DrawableId) {
@@ -1457,6 +1546,71 @@ mod tests {
         );
         assert!(s.lookup(0x1).is_none());
         assert_eq!(s.len(), 0);
+    }
+
+    #[test]
+    fn drawable_kind_population_tracks_allocate_and_destroy() {
+        let mut s = DrawableStore::new();
+        let mut platform = PlatformBackend::for_tests();
+        let kinds = [
+            DrawableKind::Root,
+            DrawableKind::Window,
+            DrawableKind::Pixmap,
+            DrawableKind::Cursor,
+            DrawableKind::RedirectedBacking,
+        ];
+        let ids: Vec<_> = kinds
+            .into_iter()
+            .enumerate()
+            .map(|(i, kind)| {
+                s.allocate(
+                    u32::try_from(i + 1).unwrap(),
+                    kind,
+                    32,
+                    false,
+                    stub_storage(),
+                )
+                .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            s.drawable_kind_population(),
+            DrawableKindPopulation {
+                root: 1,
+                window: 1,
+                pixmap: 1,
+                cursor: 1,
+                redirected_backing: 1,
+            }
+        );
+        for id in ids {
+            assert_eq!(
+                s.decref(&mut platform, id, |_| {}),
+                RetireDecision::Destroyed
+            );
+        }
+        assert_eq!(
+            s.drawable_kind_population(),
+            DrawableKindPopulation::default()
+        );
+    }
+
+    #[test]
+    fn scheduler_scan_counters_measure_and_drain_full_store_walks() {
+        let mut s = DrawableStore::new();
+        for xid in 1..=3 {
+            s.allocate(xid, DrawableKind::Pixmap, 32, false, stub_storage())
+                .unwrap();
+        }
+        assert!(!s.has_pending_presentation_damage());
+        s.reconcile_offscreen_no_draw(&HashSet::new());
+
+        let counters = s.take_scan_counters();
+        assert_eq!(counters.pending_calls, 1);
+        assert_eq!(counters.pending_entries, 3);
+        assert_eq!(counters.reconcile_calls, 1);
+        assert_eq!(counters.reconcile_entries, 3);
+        assert_eq!(s.take_scan_counters(), StoreScanCounters::default());
     }
 
     #[test]

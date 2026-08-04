@@ -29,6 +29,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, Mutex, Weak},
+    time::Instant,
 };
 
 use ash::vk;
@@ -128,6 +129,11 @@ pub struct PixmapPoolStats {
     pub total_returns_rejected_oversize: u64,
     pub total_returns_rejected_oversize_by_bucket: [u64; 4],
     pub total_global_evictions: u64,
+    pub total_fresh_allocations: u64,
+    pub total_fresh_allocation_bytes: u64,
+    pub total_fresh_allocation_ns: u64,
+    pub total_destroyed_images: u64,
+    pub total_destroy_ns: u64,
     /// Live gauges, updated with every take/return/drain.
     pub live_entries: usize,
     pub live_buckets: usize,
@@ -428,11 +434,36 @@ impl PixmapPool {
     }
 
     fn destroy_entry(&self, entry: PooledPixmapImage) {
+        let started = Instant::now();
         unsafe {
             self.vk.device.destroy_image_view(entry.view, None);
             self.vk.device.destroy_image(entry.image, None);
             self.vk.device.free_memory(entry.memory, None);
         }
+        self.record_destroy(started.elapsed());
+    }
+
+    pub(crate) fn record_fresh_allocation(
+        &self,
+        allocation_bytes: u64,
+        elapsed: std::time::Duration,
+    ) {
+        let mut stats = self.stats.lock().expect("pixmap pool stats mutex poisoned");
+        stats.total_fresh_allocations = stats.total_fresh_allocations.saturating_add(1);
+        stats.total_fresh_allocation_bytes = stats
+            .total_fresh_allocation_bytes
+            .saturating_add(allocation_bytes);
+        stats.total_fresh_allocation_ns = stats
+            .total_fresh_allocation_ns
+            .saturating_add(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
+    }
+
+    pub(crate) fn record_destroy(&self, elapsed: std::time::Duration) {
+        let mut stats = self.stats.lock().expect("pixmap pool stats mutex poisoned");
+        stats.total_destroyed_images = stats.total_destroyed_images.saturating_add(1);
+        stats.total_destroy_ns = stats
+            .total_destroy_ns
+            .saturating_add(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
     }
 
     #[must_use]

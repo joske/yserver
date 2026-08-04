@@ -274,6 +274,21 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
                     let d_evict = cur
                         .total_global_evictions
                         .wrapping_sub(prev_pool.total_global_evictions);
+                    let d_fresh = cur
+                        .total_fresh_allocations
+                        .wrapping_sub(prev_pool.total_fresh_allocations);
+                    let d_fresh_bytes = cur
+                        .total_fresh_allocation_bytes
+                        .wrapping_sub(prev_pool.total_fresh_allocation_bytes);
+                    let d_fresh_ns = cur
+                        .total_fresh_allocation_ns
+                        .wrapping_sub(prev_pool.total_fresh_allocation_ns);
+                    let d_destroyed = cur
+                        .total_destroyed_images
+                        .wrapping_sub(prev_pool.total_destroyed_images);
+                    let d_destroy_ns = cur
+                        .total_destroy_ns
+                        .wrapping_sub(prev_pool.total_destroy_ns);
                     // Per-bin oversize-reject breakdown by max(width, height).
                     // Bins match `pixmap_pool::OVERSIZE_BIN_THRESHOLDS`:
                     // `<=256`, `<=512`, `<=1024`, `>1024`.
@@ -285,6 +300,8 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
                         "pixmap pool [1s]: takes_hit={} takes_miss={} \
                          returns_accepted={} returns_rejected_bucket_full={} \
                          returns_rejected_oversize={} global_evictions={} \
+                         fresh_allocations={} fresh_allocation_bytes={} fresh_allocation_ns={} \
+                         destroyed_images={} destroy_ns={} \
                          live_entries={} live_buckets={} live_nominal_bytes={} \
                          returns_rejected_oversize_by_bin[<=256,<=512,<=1024,>1024]=[{},{},{},{}]",
                         d_hit,
@@ -293,6 +310,11 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
                         d_full,
                         d_over,
                         d_evict,
+                        d_fresh,
+                        d_fresh_bytes,
+                        d_fresh_ns,
+                        d_destroyed,
+                        d_destroy_ns,
                         cur.live_entries,
                         cur.live_buckets,
                         cur.live_nominal_bytes,

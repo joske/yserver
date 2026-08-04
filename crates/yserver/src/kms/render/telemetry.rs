@@ -107,6 +107,12 @@ pub struct Bucket {
     pub output_pixels: u64,
     pub scene_entries_visited: u64,
     pub scene_entries_drawn: u64,
+    pub store_pending_scan_calls: u64,
+    pub store_pending_scan_entries: u64,
+    pub store_pending_scan_ns: u64,
+    pub store_reconcile_scan_calls: u64,
+    pub store_reconcile_scan_entries: u64,
+    pub store_reconcile_scan_ns: u64,
     pub full_redraw_fallback: u64,
     pub storage_allocations: u64,
     pub descriptor_allocations: u64,
@@ -401,6 +407,12 @@ pub(crate) struct ResourcePopulation {
     pub(crate) cursor_records: usize,
     /// `KmsBackend::cursor_pixmaps`.
     pub(crate) cursor_pixmaps: usize,
+    /// O(1) `DrawableStore` breakdown, maintained on allocate/destroy.
+    pub(crate) drawable_roots: usize,
+    pub(crate) drawable_windows: usize,
+    pub(crate) drawable_pixmaps: usize,
+    pub(crate) drawable_cursors: usize,
+    pub(crate) drawable_redirected_backings: usize,
 }
 
 impl Telemetry {
@@ -534,6 +546,7 @@ impl Telemetry {
             exported_dmabufs: pop_exported_dmabufs,
             cursor_records: pop_cursor_records,
             cursor_pixmaps: pop_cursor_pixmaps,
+            ..
         } = self.population;
         log::info!(
             "render_telemetry: paint_submits/s={} composite_submits/s={} \
@@ -663,6 +676,23 @@ impl Telemetry {
             b.cursor_move_ebusy,
             self.lifetime.cursor_move_ebusy,
             submitted_depth,
+        );
+        log::info!(
+            "store diagnostics [1s]: pending_scan_calls={} pending_scan_entries={} \
+             pending_scan_ns={} reconcile_scan_calls={} reconcile_scan_entries={} \
+             reconcile_scan_ns={} drawable_kind[root={} window={} pixmap={} cursor={} \
+             redirected_backing={}]",
+            b.store_pending_scan_calls,
+            b.store_pending_scan_entries,
+            b.store_pending_scan_ns,
+            b.store_reconcile_scan_calls,
+            b.store_reconcile_scan_entries,
+            b.store_reconcile_scan_ns,
+            self.population.drawable_roots,
+            self.population.drawable_windows,
+            self.population.drawable_pixmaps,
+            self.population.drawable_cursors,
+            self.population.drawable_redirected_backings,
         );
         #[allow(clippy::cast_precision_loss)]
         let fb_ops_avg =
@@ -917,6 +947,61 @@ impl Telemetry {
         self.lifetime.scene_entries_visited =
             self.lifetime.scene_entries_visited.saturating_add(visited);
         self.lifetime.scene_entries_drawn = self.lifetime.scene_entries_drawn.saturating_add(drawn);
+    }
+
+    pub(crate) fn record_store_scans(
+        &mut self,
+        scans: crate::kms::render::store::StoreScanCounters,
+    ) {
+        self.bucket.store_pending_scan_calls = self
+            .bucket
+            .store_pending_scan_calls
+            .saturating_add(scans.pending_calls);
+        self.bucket.store_pending_scan_entries = self
+            .bucket
+            .store_pending_scan_entries
+            .saturating_add(scans.pending_entries);
+        self.bucket.store_pending_scan_ns = self
+            .bucket
+            .store_pending_scan_ns
+            .saturating_add(scans.pending_ns);
+        self.bucket.store_reconcile_scan_calls = self
+            .bucket
+            .store_reconcile_scan_calls
+            .saturating_add(scans.reconcile_calls);
+        self.bucket.store_reconcile_scan_entries = self
+            .bucket
+            .store_reconcile_scan_entries
+            .saturating_add(scans.reconcile_entries);
+        self.bucket.store_reconcile_scan_ns = self
+            .bucket
+            .store_reconcile_scan_ns
+            .saturating_add(scans.reconcile_ns);
+
+        self.lifetime.store_pending_scan_calls = self
+            .lifetime
+            .store_pending_scan_calls
+            .saturating_add(scans.pending_calls);
+        self.lifetime.store_pending_scan_entries = self
+            .lifetime
+            .store_pending_scan_entries
+            .saturating_add(scans.pending_entries);
+        self.lifetime.store_pending_scan_ns = self
+            .lifetime
+            .store_pending_scan_ns
+            .saturating_add(scans.pending_ns);
+        self.lifetime.store_reconcile_scan_calls = self
+            .lifetime
+            .store_reconcile_scan_calls
+            .saturating_add(scans.reconcile_calls);
+        self.lifetime.store_reconcile_scan_entries = self
+            .lifetime
+            .store_reconcile_scan_entries
+            .saturating_add(scans.reconcile_entries);
+        self.lifetime.store_reconcile_scan_ns = self
+            .lifetime
+            .store_reconcile_scan_ns
+            .saturating_add(scans.reconcile_ns);
     }
 
     pub(crate) fn record_full_redraw_fallback(&mut self) {
@@ -1347,6 +1432,24 @@ mod tests {
         // All three increment queue_submit2 too.
         assert_eq!(t.lifetime.queue_submit2, 4);
         assert_eq!(t.bucket.queue_submit2, 4);
+    }
+
+    #[test]
+    fn store_scan_counters_accumulate_in_bucket_and_lifetime() {
+        let mut t = Telemetry::new();
+        let scans = crate::kms::render::store::StoreScanCounters {
+            pending_calls: 2,
+            pending_entries: 10,
+            pending_ns: 30,
+            reconcile_calls: 1,
+            reconcile_entries: 5,
+            reconcile_ns: 20,
+        };
+        t.record_store_scans(scans);
+        assert_eq!(t.bucket.store_pending_scan_entries, 10);
+        assert_eq!(t.bucket.store_reconcile_scan_ns, 20);
+        assert_eq!(t.lifetime.store_pending_scan_calls, 2);
+        assert_eq!(t.lifetime.store_reconcile_scan_entries, 5);
     }
 
     #[test]
