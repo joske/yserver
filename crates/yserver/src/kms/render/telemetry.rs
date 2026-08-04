@@ -74,6 +74,7 @@ pub struct Bucket {
     pub vk_queue_wait_idle: u64,
     pub cpu_fence_wait_ns: u64,
     pub cpu_fence_wait_count: u64,
+    pub cpu_fence_wait_ns_max: u64,
     /// GetImage cost, split at the readback boundary so the async-readback
     /// question can be sized before it is implemented.
     ///
@@ -85,6 +86,8 @@ pub struct Bucket {
     /// the deferred-reply machinery.
     pub get_image_readback_ns: u64,
     pub get_image_pack_ns: u64,
+    pub get_image_readback_ns_max: u64,
+    pub get_image_pack_ns_max: u64,
     /// `get_image_readback_ns` broken down further, from the phase instants
     /// `Engine::get_image` already stamps (it logged them only on the
     /// `GET_IMAGE_SLOW_MS` tail; these aggregate every call).
@@ -127,7 +130,29 @@ pub struct Bucket {
     pub present_skips: u64,
     pub gpu_render_ns: u64,
     pub compose_cb_record_ns: u64,
+    pub gpu_render_ns_max: u64,
+    pub compose_cb_record_ns_max: u64,
     pub frames_with_compose: u64,
+    pub present_completion_count: u64,
+    pub present_completion_ns: u64,
+    pub present_completion_ns_max: u64,
+    pub present_completion_over_16ms: u64,
+    pub present_completion_over_33ms: u64,
+    pub present_completion_over_100ms: u64,
+    pub page_flip_interval_count: u64,
+    pub page_flip_interval_ns: u64,
+    pub page_flip_interval_ns_max: u64,
+    pub page_flip_interval_over_20ms: u64,
+    pub page_flip_interval_over_40ms: u64,
+    pub page_flip_interval_over_100ms: u64,
+    pub page_flip_handler_count: u64,
+    pub page_flip_handler_ns: u64,
+    pub page_flip_handler_ns_max: u64,
+    pub composite_tick_count: u64,
+    pub composite_tick_ns: u64,
+    pub composite_tick_ns_max: u64,
+    pub composite_tick_over_16ms: u64,
+    pub composite_tick_over_33ms: u64,
     // ── Stage 3a glyph/text counters ─────────────────────────
     /// Glyphs successfully interned into the atlas during the
     /// window. One `intern` call that returns `Some(entry)`
@@ -413,6 +438,15 @@ pub(crate) struct ResourcePopulation {
     pub(crate) drawable_pixmaps: usize,
     pub(crate) drawable_cursors: usize,
     pub(crate) drawable_redirected_backings: usize,
+    pub(crate) pixmap_refcount_zero: usize,
+    pub(crate) pixmap_refcount_one: usize,
+    pub(crate) pixmap_refcount_multi: usize,
+    pub(crate) pixmap_xid_bound: usize,
+    pub(crate) pixmap_ticketed: usize,
+    pub(crate) pixmap_scene_participating: usize,
+    pub(crate) pixmap_imported: usize,
+    pub(crate) pixmap_promoted_exportable: usize,
+    pub(crate) pixmap_nominal_bytes: u64,
 }
 
 impl Telemetry {
@@ -552,8 +586,9 @@ impl Telemetry {
             "render_telemetry: paint_submits/s={} composite_submits/s={} \
              one_shot_submits/s={} queue_submit2/s={} \
              vk_queue_wait_idle/s={} cpu_fence_wait_ns/s={} \
-             cpu_fence_wait_count/s={} \
-             get_image_readback_ns/s={} get_image_pack_ns/s={} \
+             cpu_fence_wait_count/s={} cpu_fence_wait_ns_max={} \
+             get_image_readback_ns/s={} get_image_readback_ns_max={} \
+             get_image_pack_ns/s={} get_image_pack_ns_max={} \
              get_image_drain_ns/s={} get_image_wait_ns/s={} get_image_copyout_ns/s={} \
              damage_fraction={damage_fraction:.3} \
              scene_entries_visited={} scene_entries_drawn={} \
@@ -575,8 +610,8 @@ impl Telemetry {
              clip_cache/s[hit={} miss_other_xid={} miss_no_entry={}] \
              descriptor_pool_creates/s={} descriptor_pool_resets/s={} \
              render_batches_flushed/s={} render_composites_coalesced/s={} \
-             avg_gpu_render_ns={avg_gpu_render_ns} \
-             avg_compose_cb_record_ns={avg_compose_cb_ns} \
+             avg_gpu_render_ns={avg_gpu_render_ns} max_gpu_render_ns={} \
+             avg_compose_cb_record_ns={avg_compose_cb_ns} max_compose_cb_record_ns={} \
              submit_group_flushes/s={} submit_group_aborts/s={} \
              submit_group_size_avg={group_avg:.2} \
              submit_group_size_max_in_window={} \
@@ -606,8 +641,11 @@ impl Telemetry {
             b.vk_queue_wait_idle,
             b.cpu_fence_wait_ns,
             b.cpu_fence_wait_count,
+            b.cpu_fence_wait_ns_max,
             b.get_image_readback_ns,
+            b.get_image_readback_ns_max,
             b.get_image_pack_ns,
+            b.get_image_pack_ns_max,
             b.get_image_drain_ns,
             b.get_image_wait_ns,
             b.get_image_copyout_ns,
@@ -659,6 +697,8 @@ impl Telemetry {
             b.descriptor_pool_resets,
             b.render_batches_flushed,
             b.render_composites_coalesced,
+            b.gpu_render_ns_max,
+            b.compose_cb_record_ns_max,
             b.submit_group_flushes,
             b.submit_group_aborts,
             b.submit_group_size_max_in_window,
@@ -693,6 +733,51 @@ impl Telemetry {
             self.population.drawable_pixmaps,
             self.population.drawable_cursors,
             self.population.drawable_redirected_backings,
+        );
+        log::info!(
+            "pixmap retention [1s]: refcount[zero={} one={} multi={}] xid_bound={} \
+             ticketed={} scene_participating={} imported={} promoted_exportable={} \
+             nominal_bytes={}",
+            self.population.pixmap_refcount_zero,
+            self.population.pixmap_refcount_one,
+            self.population.pixmap_refcount_multi,
+            self.population.pixmap_xid_bound,
+            self.population.pixmap_ticketed,
+            self.population.pixmap_scene_participating,
+            self.population.pixmap_imported,
+            self.population.pixmap_promoted_exportable,
+            self.population.pixmap_nominal_bytes,
+        );
+        let present_completion_avg_ns = b.present_completion_ns / b.present_completion_count.max(1);
+        let page_flip_interval_avg_ns = b.page_flip_interval_ns / b.page_flip_interval_count.max(1);
+        let page_flip_handler_avg_ns = b.page_flip_handler_ns / b.page_flip_handler_count.max(1);
+        let composite_tick_avg_ns = b.composite_tick_ns / b.composite_tick_count.max(1);
+        log::info!(
+            "pacing diagnostics [1s]: present_enqueue_completion[count={} avg_ns={} max_ns={} \
+             over_16ms={} over_33ms={} over_100ms={}] \
+             page_flip_interval[count={} avg_ns={} max_ns={} over_20ms={} over_40ms={} \
+             over_100ms={}] page_flip_handler[count={} avg_ns={} max_ns={}] \
+             composite_tick[count={} avg_ns={} max_ns={} over_16ms={} over_33ms={}]",
+            b.present_completion_count,
+            present_completion_avg_ns,
+            b.present_completion_ns_max,
+            b.present_completion_over_16ms,
+            b.present_completion_over_33ms,
+            b.present_completion_over_100ms,
+            b.page_flip_interval_count,
+            page_flip_interval_avg_ns,
+            b.page_flip_interval_ns_max,
+            b.page_flip_interval_over_20ms,
+            b.page_flip_interval_over_40ms,
+            b.page_flip_interval_over_100ms,
+            b.page_flip_handler_count,
+            page_flip_handler_avg_ns,
+            b.page_flip_handler_ns_max,
+            b.composite_tick_count,
+            composite_tick_avg_ns,
+            b.composite_tick_ns_max,
+            b.composite_tick_over_16ms,
+            b.composite_tick_over_33ms,
         );
         #[allow(clippy::cast_precision_loss)]
         let fb_ops_avg =
@@ -898,8 +983,10 @@ impl Telemetry {
     pub(crate) fn record_fence_wait(&mut self, ns: u64) {
         self.bucket.cpu_fence_wait_ns = self.bucket.cpu_fence_wait_ns.saturating_add(ns);
         self.bucket.cpu_fence_wait_count += 1;
+        self.bucket.cpu_fence_wait_ns_max = self.bucket.cpu_fence_wait_ns_max.max(ns);
         self.lifetime.cpu_fence_wait_ns = self.lifetime.cpu_fence_wait_ns.saturating_add(ns);
         self.lifetime.cpu_fence_wait_count += 1;
+        self.lifetime.cpu_fence_wait_ns_max = self.lifetime.cpu_fence_wait_ns_max.max(ns);
     }
 
     /// Record one GetImage readback split into its recoverable (pipeline
@@ -911,11 +998,17 @@ impl Telemetry {
             .get_image_readback_ns
             .saturating_add(readback_ns);
         self.bucket.get_image_pack_ns = self.bucket.get_image_pack_ns.saturating_add(pack_ns);
+        self.bucket.get_image_readback_ns_max =
+            self.bucket.get_image_readback_ns_max.max(readback_ns);
+        self.bucket.get_image_pack_ns_max = self.bucket.get_image_pack_ns_max.max(pack_ns);
         self.lifetime.get_image_readback_ns = self
             .lifetime
             .get_image_readback_ns
             .saturating_add(readback_ns);
         self.lifetime.get_image_pack_ns = self.lifetime.get_image_pack_ns.saturating_add(pack_ns);
+        self.lifetime.get_image_readback_ns_max =
+            self.lifetime.get_image_readback_ns_max.max(readback_ns);
+        self.lifetime.get_image_pack_ns_max = self.lifetime.get_image_pack_ns_max.max(pack_ns);
     }
 
     /// Record one readback's engine-internal phase split. See
@@ -1045,7 +1138,9 @@ impl Telemetry {
 
     pub(crate) fn record_compose_cb_record_ns(&mut self, ns: u64) {
         self.bucket.compose_cb_record_ns = self.bucket.compose_cb_record_ns.saturating_add(ns);
+        self.bucket.compose_cb_record_ns_max = self.bucket.compose_cb_record_ns_max.max(ns);
         self.lifetime.compose_cb_record_ns = self.lifetime.compose_cb_record_ns.saturating_add(ns);
+        self.lifetime.compose_cb_record_ns_max = self.lifetime.compose_cb_record_ns_max.max(ns);
     }
 
     /// Compose GPU-render time (ns) from the per-bo timestamp pool.
@@ -1053,7 +1148,53 @@ impl Telemetry {
     /// `avg_gpu_render_ns`. Was hard-0 until timestamps were wired.
     pub(crate) fn record_gpu_render_ns(&mut self, ns: u64) {
         self.bucket.gpu_render_ns = self.bucket.gpu_render_ns.saturating_add(ns);
+        self.bucket.gpu_render_ns_max = self.bucket.gpu_render_ns_max.max(ns);
         self.lifetime.gpu_render_ns = self.lifetime.gpu_render_ns.saturating_add(ns);
+        self.lifetime.gpu_render_ns_max = self.lifetime.gpu_render_ns_max.max(ns);
+    }
+
+    pub(crate) fn record_present_completion_latency(&mut self, elapsed: std::time::Duration) {
+        let ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        for bucket in [&mut self.bucket, &mut self.lifetime] {
+            bucket.present_completion_count = bucket.present_completion_count.saturating_add(1);
+            bucket.present_completion_ns = bucket.present_completion_ns.saturating_add(ns);
+            bucket.present_completion_ns_max = bucket.present_completion_ns_max.max(ns);
+            bucket.present_completion_over_16ms += u64::from(ns > 16_666_667);
+            bucket.present_completion_over_33ms += u64::from(ns > 33_333_333);
+            bucket.present_completion_over_100ms += u64::from(ns > 100_000_000);
+        }
+    }
+
+    pub(crate) fn record_page_flip_interval(&mut self, elapsed: std::time::Duration) {
+        let ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        for bucket in [&mut self.bucket, &mut self.lifetime] {
+            bucket.page_flip_interval_count = bucket.page_flip_interval_count.saturating_add(1);
+            bucket.page_flip_interval_ns = bucket.page_flip_interval_ns.saturating_add(ns);
+            bucket.page_flip_interval_ns_max = bucket.page_flip_interval_ns_max.max(ns);
+            bucket.page_flip_interval_over_20ms += u64::from(ns > 20_000_000);
+            bucket.page_flip_interval_over_40ms += u64::from(ns > 40_000_000);
+            bucket.page_flip_interval_over_100ms += u64::from(ns > 100_000_000);
+        }
+    }
+
+    pub(crate) fn record_page_flip_handler(&mut self, elapsed: std::time::Duration) {
+        let ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        for bucket in [&mut self.bucket, &mut self.lifetime] {
+            bucket.page_flip_handler_count = bucket.page_flip_handler_count.saturating_add(1);
+            bucket.page_flip_handler_ns = bucket.page_flip_handler_ns.saturating_add(ns);
+            bucket.page_flip_handler_ns_max = bucket.page_flip_handler_ns_max.max(ns);
+        }
+    }
+
+    pub(crate) fn record_composite_tick(&mut self, elapsed: std::time::Duration) {
+        let ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        for bucket in [&mut self.bucket, &mut self.lifetime] {
+            bucket.composite_tick_count = bucket.composite_tick_count.saturating_add(1);
+            bucket.composite_tick_ns = bucket.composite_tick_ns.saturating_add(ns);
+            bucket.composite_tick_ns_max = bucket.composite_tick_ns_max.max(ns);
+            bucket.composite_tick_over_16ms += u64::from(ns > 16_666_667);
+            bucket.composite_tick_over_33ms += u64::from(ns > 33_333_333);
+        }
     }
 
     // ── Stage 3a counter sites ──────────────────────────────────
@@ -1722,5 +1863,27 @@ mod tests {
         assert_eq!(t.lifetime.submit_group_hist[3], 1); // 8
         assert_eq!(t.lifetime.submit_group_hist[4], 1); // 12
         assert_eq!(t.lifetime.submit_group_hist[5], 2); // 16, 32
+    }
+
+    #[test]
+    fn pacing_tail_metrics_track_maxima_and_frame_budget_thresholds() {
+        let mut telemetry = Telemetry::new();
+        telemetry.record_present_completion_latency(std::time::Duration::from_millis(40));
+        telemetry.record_page_flip_interval(std::time::Duration::from_millis(120));
+        telemetry.record_page_flip_handler(std::time::Duration::from_millis(3));
+        telemetry.record_composite_tick(std::time::Duration::from_millis(20));
+
+        assert_eq!(telemetry.bucket.present_completion_count, 1);
+        assert_eq!(telemetry.bucket.present_completion_over_16ms, 1);
+        assert_eq!(telemetry.bucket.present_completion_over_33ms, 1);
+        assert_eq!(telemetry.bucket.present_completion_over_100ms, 0);
+        assert_eq!(telemetry.bucket.page_flip_interval_over_100ms, 1);
+        assert_eq!(telemetry.bucket.page_flip_handler_ns_max, 3_000_000);
+        assert_eq!(telemetry.bucket.composite_tick_over_16ms, 1);
+        assert_eq!(telemetry.bucket.composite_tick_over_33ms, 0);
+        assert_eq!(
+            telemetry.lifetime.present_completion_ns_max,
+            telemetry.bucket.present_completion_ns_max
+        );
     }
 }

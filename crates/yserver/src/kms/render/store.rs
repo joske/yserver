@@ -127,6 +127,23 @@ pub(crate) struct DrawableKindPopulation {
     pub(crate) redirected_backing: usize,
 }
 
+/// Once-per-second diagnostic breakdown of Pixmap-kind store entries.  Unlike
+/// `DrawableKindPopulation`, this intentionally walks the store: it identifies
+/// which lifetime mechanism owns retained pixmaps and estimates their resident
+/// image payload, rather than merely proving that the map grew.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PixmapRetentionPopulation {
+    pub(crate) refcount_zero: usize,
+    pub(crate) refcount_one: usize,
+    pub(crate) refcount_multi: usize,
+    pub(crate) xid_bound: usize,
+    pub(crate) ticketed: usize,
+    pub(crate) scene_participating: usize,
+    pub(crate) imported: usize,
+    pub(crate) promoted_exportable: usize,
+    pub(crate) nominal_bytes: u64,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct StoreScanCounters {
     pub(crate) pending_calls: u64,
@@ -1391,6 +1408,32 @@ impl DrawableStore {
         }
     }
 
+    pub(crate) fn pixmap_retention_population(&self) -> PixmapRetentionPopulation {
+        let mut population = PixmapRetentionPopulation::default();
+        for (&id, drawable) in &self.entries {
+            if drawable.kind != DrawableKind::Pixmap {
+                continue;
+            }
+            match drawable.refcount {
+                0 => population.refcount_zero += 1,
+                1 => population.refcount_one += 1,
+                _ => population.refcount_multi += 1,
+            }
+            population.xid_bound += usize::from(self.by_xid.get(&drawable.xid) == Some(&id));
+            population.ticketed += usize::from(drawable.last_render_ticket.is_some());
+            population.scene_participating += usize::from(drawable.scene_participating);
+            population.imported += usize::from(drawable.storage.imported_drawable.is_some());
+            population.promoted_exportable += usize::from(drawable.storage.promoted_exportable);
+            let bytes_per_pixel = if drawable.depth <= 8 { 1 } else { 4 };
+            population.nominal_bytes = population.nominal_bytes.saturating_add(
+                u64::from(drawable.storage.extent.width)
+                    .saturating_mul(u64::from(drawable.storage.extent.height))
+                    .saturating_mul(bytes_per_pixel),
+            );
+        }
+        population
+    }
+
     /// Drain scheduler-scan counters accumulated since the previous sample.
     pub(crate) fn take_scan_counters(&self) -> StoreScanCounters {
         self.scan_counters.replace(StoreScanCounters::default())
@@ -1520,6 +1563,24 @@ mod tests {
         let second = s.take_exported_writes();
         assert_eq!(second.len(), 1);
         assert!(!second[0].1, "an earlier pending write cannot be covered");
+    }
+
+    #[test]
+    fn pixmap_retention_population_reports_ownership_and_nominal_bytes() {
+        let mut s = DrawableStore::new();
+        let id = s
+            .allocate(0x1234, DrawableKind::Pixmap, 32, false, stub_storage())
+            .expect("allocate");
+        s.incref(id);
+
+        let population = s.pixmap_retention_population();
+        assert_eq!(population.refcount_zero, 0);
+        assert_eq!(population.refcount_one, 0);
+        assert_eq!(population.refcount_multi, 1);
+        assert_eq!(population.xid_bound, 1);
+        assert_eq!(population.ticketed, 0);
+        assert_eq!(population.scene_participating, 0);
+        assert_eq!(population.nominal_bytes, 1024);
     }
 
     #[test]

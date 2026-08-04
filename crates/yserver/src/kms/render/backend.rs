@@ -674,6 +674,14 @@ pub struct KmsBackend {
     /// refcount lives on `core.cow_refcount` per the v2 plan
     /// §"`KmsCore` scope — narrowly drawn" split.
     pub(crate) cow_id: Option<crate::kms::render::store::DrawableId>,
+    /// Per-output timestamp of the previous completed page flip. Used only by
+    /// 1 Hz pacing diagnostics to expose missed frame budgets and long tails.
+    last_page_flip_at: HashMap<usize, std::time::Instant>,
+    /// Cached result of the diagnostic Pixmap ownership walk.  Population
+    /// sampling runs on every compositor/dispatch tick, so the O(n) walk must
+    /// self-gate to avoid becoming part of the performance problem it measures.
+    pixmap_retention_population: crate::kms::render::store::PixmapRetentionPopulation,
+    last_pixmap_retention_sample: Option<std::time::Instant>,
 
     /// M0 direct-scanout telemetry. Purely observational: it never owns a
     /// drawable pin, submits DRM work, or affects Present capabilities.
@@ -2323,6 +2331,9 @@ impl KmsBackend {
             scanout_m0: ScanoutM0Telemetry::default(),
             scanout_m1: ScanoutM1ProbeCache::new(),
             scanout_m2: ScanoutM2State::new(),
+            last_page_flip_at: HashMap::new(),
+            pixmap_retention_population: Default::default(),
+            last_pixmap_retention_sample: None,
             armed_vblank_targets: std::collections::HashMap::new(),
             absolute_vblank_targets: std::collections::HashMap::new(),
             crtc_queue_sequence_unsupported: false,
@@ -3258,6 +3269,9 @@ impl KmsBackend {
             scanout_m0: ScanoutM0Telemetry::default(),
             scanout_m1: ScanoutM1ProbeCache::new(),
             scanout_m2: ScanoutM2State::new(),
+            last_page_flip_at: HashMap::new(),
+            pixmap_retention_population: Default::default(),
+            last_pixmap_retention_sample: None,
             armed_vblank_targets: std::collections::HashMap::new(),
             absolute_vblank_targets: std::collections::HashMap::new(),
             crtc_queue_sequence_unsupported: false,
@@ -4630,11 +4644,19 @@ impl KmsBackend {
     /// `PresentPixmap` stayed flat and every rate counter held
     /// steady — the shape of a container growing without bound. The
     /// existing telemetry reports only rates, so there was no way to
-    /// tell a leak from a slow path in a log. These are all `len()`
-    /// calls, so sampling every tick is free.
+    /// tell a leak from a slow path in a log. The ordinary gauges are
+    /// `len()` calls; the detailed Pixmap ownership walk is gated to 1 Hz.
     fn sample_resource_population(&mut self) {
         let (by_xid, exported_sync, exported_writes) = self.store.population_counts();
         let kinds = self.store.drawable_kind_population();
+        let now = std::time::Instant::now();
+        if self.last_pixmap_retention_sample.is_none_or(|last| {
+            now.saturating_duration_since(last) >= std::time::Duration::from_secs(1)
+        }) {
+            self.pixmap_retention_population = self.store.pixmap_retention_population();
+            self.last_pixmap_retention_sample = Some(now);
+        }
+        let pixmaps = self.pixmap_retention_population;
         self.telemetry
             .record_store_scans(self.store.take_scan_counters());
         self.telemetry.record_resource_population(
@@ -4655,6 +4677,15 @@ impl KmsBackend {
                 drawable_pixmaps: kinds.pixmap,
                 drawable_cursors: kinds.cursor,
                 drawable_redirected_backings: kinds.redirected_backing,
+                pixmap_refcount_zero: pixmaps.refcount_zero,
+                pixmap_refcount_one: pixmaps.refcount_one,
+                pixmap_refcount_multi: pixmaps.refcount_multi,
+                pixmap_xid_bound: pixmaps.xid_bound,
+                pixmap_ticketed: pixmaps.ticketed,
+                pixmap_scene_participating: pixmaps.scene_participating,
+                pixmap_imported: pixmaps.imported,
+                pixmap_promoted_exportable: pixmaps.promoted_exportable,
+                pixmap_nominal_bytes: pixmaps.nominal_bytes,
             },
         );
     }
@@ -5938,6 +5969,7 @@ impl KmsBackend {
             return false;
         };
         let entry = PendingPresentEntry {
+            queued_at: std::time::Instant::now(),
             wake_pin: PinnedWake::None,
             event: CompletedPresentEvent {
                 client_id: ClientId(0),
@@ -6151,6 +6183,7 @@ impl KmsBackend {
             None => return false,
         };
         let entry = PendingPresentEntry {
+            queued_at: std::time::Instant::now(),
             wake_pin: PinnedWake::None,
             event: CompletedPresentEvent {
                 client_id: ClientId(0),
@@ -6303,7 +6336,13 @@ impl KmsBackend {
         // Copy — a `matches!(entry.wake_pin, ..)` guard would move it first and
         // fail to compile).
         use crate::kms::render::present_completion::{PendingPresentEntry, PinnedWake};
-        let PendingPresentEntry { wake_pin, event } = entry;
+        let PendingPresentEntry {
+            queued_at,
+            wake_pin,
+            event,
+        } = entry;
+        self.telemetry
+            .record_present_completion_latency(queued_at.elapsed());
         if !matches!(wake_pin, PinnedWake::None) {
             self.retained_present_wakes
                 .insert(event.present_id, wake_pin);
@@ -7275,6 +7314,7 @@ impl KmsBackend {
             self.core.down_keys.len(),
             self.core.button_mask,
         );
+        self.last_page_flip_at.clear();
         // 3. Synthesize held-key / held-button releases.
         self.synthesize_held_releases(state);
 
@@ -12523,6 +12563,7 @@ impl Backend for KmsBackend {
     }
 
     fn on_page_flip_ready(&mut self, _state: &mut ServerState) {
+        let handler_started = std::time::Instant::now();
         // Gate: when not Active we have no DRM master; page-flip events
         // are drained (so the fd doesn't stay readable) but no resubmit
         // or flush_submit_group runs. In Direct mode this is always false
@@ -12537,6 +12578,8 @@ impl Backend for KmsBackend {
                     self.on_crtc_sequence_event(seq.user_data, seq.time_ns, seq.sequence);
                 }
             }
+            self.telemetry
+                .record_page_flip_handler(handler_started.elapsed());
             log::debug!("render on_page_flip_ready: skipped (seat not Active)");
             return;
         }
@@ -12547,7 +12590,15 @@ impl Backend for KmsBackend {
                 return;
             }
         };
+        let flip_now = std::time::Instant::now();
         for output_idx in flipped {
+            // Pacing is sampled for EVERY flip, before the direct-scanout
+            // short-circuit below — putting it after the `continue` would
+            // silently omit exactly the flips whose cadence we are measuring.
+            if let Some(previous) = self.last_page_flip_at.insert(output_idx, flip_now) {
+                self.telemetry
+                    .record_page_flip_interval(flip_now.saturating_duration_since(previous));
+            }
             if self.retire_direct_output(output_idx) {
                 self.telemetry.record_frame_present();
                 continue;
@@ -12605,6 +12656,8 @@ impl Backend for KmsBackend {
         ) {
             log::warn!("render on_page_flip_ready: flush_submit_group failed: {e:?}");
         }
+        self.telemetry
+            .record_page_flip_handler(handler_started.elapsed());
     }
 
     fn before_block(&mut self) {
@@ -12754,6 +12807,7 @@ impl Backend for KmsBackend {
         if !self.kms_outputs_active {
             return Ok(());
         }
+        let tick_started = std::time::Instant::now();
         // Animated-cursor frame advance — after both gates above so
         // DPMS-off / VT-away never uploads (spec "DPMS / VT gating").
         self.tick_cursor_animation();
@@ -12919,6 +12973,7 @@ impl Backend for KmsBackend {
         // Phase B.1 Task 21: drain frame-builder close events into telemetry.
         self.drain_frame_builder_telemetry();
         self.sample_resource_population();
+        self.telemetry.record_composite_tick(tick_started.elapsed());
         // Per-second telemetry summary emission.
         self.telemetry.maybe_emit(self.engine.pending_count());
         result
@@ -19571,7 +19626,11 @@ impl Backend for KmsBackend {
             _ => PinnedWake::None,
         };
 
-        let mut entry = PendingPresentEntry { wake_pin, event };
+        let mut entry = PendingPresentEntry {
+            queued_at: std::time::Instant::now(),
+            wake_pin,
+            event,
+        };
 
         if let Some(cow_id) = self.cow_id
             && self.store.lookup(dst_host_xid) == Some(cow_id)
@@ -20492,6 +20551,7 @@ impl Backend for KmsBackend {
             // through the same-binary-state guard above.
             if res.is_ok() {
                 self.kms_outputs_active = false;
+                self.last_page_flip_at.clear();
             }
             res
         }

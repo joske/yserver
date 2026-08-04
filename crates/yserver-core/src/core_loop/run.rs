@@ -227,7 +227,7 @@ impl LoopTelemetry {
         }
     }
 
-    fn maybe_emit(&mut self, now: Instant) {
+    fn maybe_emit(&mut self, now: Instant, state: &ServerState) {
         if !self.enabled {
             return;
         }
@@ -364,6 +364,7 @@ impl LoopTelemetry {
             })
             .collect();
 
+        let resources = state.resources.population();
         log::info!(
             "loop telemetry [{:.2}s]: iter/s={:.0} req/s={:.0} drain_max={} \
              req_time={:.1}ms ({:.1}%) longest=op{}:{:.2}ms \
@@ -372,7 +373,9 @@ impl LoopTelemetry {
              channel_batch_max={} channel_client_max=c{}:{} seq_boundary[ffff={} zero={}] \
              deferred_clients=[{}] age_clients=[{}] \
              request_clients=[{}] outbound_clients=[{}] \
-             top_by_time=[{}] top_by_count=[{}]",
+             top_by_time=[{}] top_by_count=[{}] \
+             core_population[clients={} windows={} pixmaps={} gcs={} fonts={} cursors={} \
+             pictures={} glyphsets={}]",
             secs,
             self.iter_count as f64 / secs,
             self.requests_total as f64 / secs,
@@ -398,6 +401,14 @@ impl LoopTelemetry {
             outbound_client_mix.join(","),
             top_time.join(","),
             top_count.join(","),
+            state.clients.len(),
+            resources.windows,
+            resources.pixmaps,
+            resources.gcs,
+            resources.fonts,
+            resources.cursors,
+            resources.pictures,
+            resources.glyphsets,
         );
 
         // Reset accumulators for next window. Keep `enabled` /
@@ -1271,7 +1282,7 @@ pub fn run_core(
             let now = Instant::now();
             let wall = now.saturating_duration_since(start);
             telemetry.record_iteration(requests_this_iter, wall);
-            telemetry.maybe_emit(now);
+            telemetry.maybe_emit(now, state);
         }
     }
 }

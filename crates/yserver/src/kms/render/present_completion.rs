@@ -7,7 +7,7 @@
 //!
 //! Spec: `docs/superpowers/specs/2026-05-23-deferred-present-completion-design.md`.
 
-use std::{os::fd::OwnedFd, sync::Arc};
+use std::{os::fd::OwnedFd, sync::Arc, time::Instant};
 
 use yserver_core::backend::{CompletedPresentEvent, SyncobjHandle, XshmfenceHandle};
 
@@ -18,6 +18,9 @@ use crate::kms::render::platform::{FenceTicket, PresentCompletionSignal};
 /// main loop.
 #[derive(Debug)]
 pub(crate) struct PendingPresentEntry {
+    /// Backend-enqueue-to-GPU-completion age. This is the latency that determines
+    /// when the client receives its idle signal and can recycle the buffer.
+    pub(crate) queued_at: Instant,
     /// Lifetime pin on the underlying wake primitive. Survives a
     /// mid-flight `XFixesDestroyFence` / `FreeSyncobj`.
     pub(crate) wake_pin: PinnedWake,

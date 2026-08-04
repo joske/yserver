@@ -494,6 +494,27 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   the host handle. This mirrors Xorg's pixmap refcount release on GC replacement
   and destruction while preserving cross-GC and cross-client sharing.
 
+  Victor's follow-up on the GC fix (`24d97cd6`, 55.7 minutes) still grew the
+  backend store from 80 to roughly 2,400 pixmaps. Request averages did not
+  expose a frame-budget-scale slowdown: RENDER and FreePixmap stayed flat,
+  while the two whole-store scans together consumed only 7.79 seconds
+  (~0.23% wall time). The log did capture three discrete core-loop freezes of
+  520--775 ms. Each was a client GetImage request and its matching telemetry
+  attributed essentially the entire pause to the synchronous GPU readback
+  fence wait. Those explain isolated freezes, not a sustained 30 FPS mode.
+
+  The diagnostic branch now measures tails and ownership instead of inferring
+  causation from microsecond averages. The core-loop line reports exact live X
+  resource counts; comparing its pixmap count with the backend store shows
+  which layer owns growth. Backend pixmap diagnostics report refcount classes,
+  XID binding, tickets, imports/exports, scene participation, and nominal image
+  bytes. Pacing telemetry reports max and frame-budget threshold counts for
+  Present backend-enqueue-to-GPU-completion latency, per-output pageflip intervals,
+  pageflip-handler time, composite-tick time, GPU compose time, and synchronous
+  readbacks. A follow-up run can therefore name a sustained pacing failure or
+  memory owner directly rather than treating retained population as proof of
+  the performance cause.
+
   The diagnostic branch keeps the `population[...]` group on the 1Hz
   `render_telemetry:` line reporting live `len()` of the long-lived maps:
   store

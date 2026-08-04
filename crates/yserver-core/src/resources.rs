@@ -192,6 +192,21 @@ pub struct ResourceTable {
     colormaps: HashMap<u32, Colormap>,
 }
 
+/// Exact live core-protocol resource counts for diagnostics.  These are kept
+/// separate from the render backend's drawable population: comparing the two
+/// tells us whether growth originates in client-visible X resources or in a
+/// backend lifetime hold after the protocol resource disappeared.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ResourcePopulation {
+    pub windows: usize,
+    pub pixmaps: usize,
+    pub gcs: usize,
+    pub fonts: usize,
+    pub cursors: usize,
+    pub pictures: usize,
+    pub glyphsets: usize,
+}
+
 impl Default for ResourceTable {
     fn default() -> Self {
         let mut windows = HashMap::new();
@@ -346,6 +361,19 @@ pub(crate) fn win_gravity_delta(gravity: u8, dw: i32, dh: i32) -> (i32, i32) {
 }
 
 impl ResourceTable {
+    #[must_use]
+    pub fn population(&self) -> ResourcePopulation {
+        ResourcePopulation {
+            windows: self.windows.len(),
+            pixmaps: self.pixmaps.len(),
+            gcs: self.gcs.len(),
+            fonts: self.fonts.len(),
+            cursors: self.cursors.len(),
+            pictures: self.pictures.len(),
+            glyphsets: self.glyphsets.len(),
+        }
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -5777,5 +5805,29 @@ mod tests {
         // After free, the cursor is gone; cursor_is_anim must not return true.
         table.free_cursor(id);
         assert!(!table.cursor_is_anim(id), "freed cursor must not be anim");
+    }
+
+    #[test]
+    fn resource_population_reports_exact_core_table_sizes() {
+        let mut table = ResourceTable::new();
+        let before = table.population();
+        table.create_cursor(ClientId(1), ResourceId(0x500));
+        table.create_pixmap(
+            ClientId(1),
+            CreatePixmapRequest {
+                pixmap: ResourceId(0x501),
+                drawable: ROOT_WINDOW,
+                width: 8,
+                height: 8,
+                depth: 24,
+            },
+        );
+
+        let after = table.population();
+        assert_eq!(after.windows, before.windows);
+        assert_eq!(after.pixmaps, before.pixmaps + 1);
+        assert_eq!(after.cursors, before.cursors + 1);
+        assert_eq!(after.gcs, before.gcs);
+        assert_eq!(after.pictures, before.pictures);
     }
 }
