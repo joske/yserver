@@ -58,11 +58,40 @@ pub(crate) enum GetImageSite {
     CursorDepth1 = 10,
     /// `read_cursor_bgra_pixmap` — ARGB cursor read.
     CursorBgra = 11,
+    /// `get_image` request handler, ROOT window — a client screen-capture.
+    /// Split from [`Self::ClientGetImage`] because it reads the COMPOSITED
+    /// SCANOUT rather than a drawable's own storage: it must wait for the
+    /// compose fence and pull a full-screen region back from VRAM, which on
+    /// a discrete GPU measured 497-768 ms per call on an RX 9070 XT (#115).
+    /// That path recorded `cpu_fence_wait` but NO site, so the stalls showed
+    /// up as unattributed fence waits with `get_image_calls/s = 0` and were
+    /// misread as internal cursor readbacks.
+    ClientGetImageRoot = 12,
 }
 
 /// Number of [`GetImageSite`] variants — width of the
 /// `get_image_by_site` attribution array.
-pub(crate) const GET_IMAGE_SITE_COUNT: usize = 12;
+pub(crate) const GET_IMAGE_SITE_COUNT: usize = 13;
+
+/// Per-client GetImage attribution for one emission window: client id →
+/// (calls, total fence-wait ns, root-window calls). Kept out of [`Bucket`]
+/// so that stays `Copy`.
+///
+/// Exists because three separate reporters (ariel, Peter, VictorVoltzz) have
+/// all shown client GetImage blocking the single-threaded loop on a discrete
+/// GPU, and none of them could be told WHICH client was doing it.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct GetImageClients {
+    pub(crate) by_client: std::collections::HashMap<u32, GetImageClientStat>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct GetImageClientStat {
+    pub(crate) calls: u64,
+    pub(crate) fence_ns: u64,
+    pub(crate) root_calls: u64,
+    pub(crate) worst_ns: u64,
+}
 
 /// Single-second accumulator. Reset on every emission tick.
 #[derive(Debug, Default, Clone, Copy)]
@@ -370,6 +399,9 @@ pub struct Telemetry {
     /// for the acceptance harness which compares totals after
     /// driving a test sequence.
     pub lifetime: Bucket,
+    /// Per-client GetImage attribution for the current window. Reset with
+    /// the bucket; reported as a top-N group on the render telemetry line.
+    getimage_clients: GetImageClients,
     /// Stage 5 Task 3 diagnostic: per-submit event log,
     /// enabled by `YSERVER_SUBMIT_TRACE=<path>`. `None` in the
     /// default off case (zero hot-path cost).
@@ -471,6 +503,7 @@ impl Telemetry {
             submit_trace: SubmitTrace::from_env(),
             frame_id: 0,
             population: ResourcePopulation::default(),
+            getimage_clients: GetImageClients::default(),
         }
     }
 
@@ -605,7 +638,8 @@ impl Telemetry {
              copy_area_cpu_pixmap_clip/s={} copy_area_cpu_rop/s={} \
              get_image_calls/s={} promote_exportable_runs/s={} clip_mask_reads/s={} \
              get_image_by_site/s[clip={} client={} fillpat={} cpufill={} cpupat={} \
-             copyrop={} putrop={} imgtext={} copyplane={} rdepth1={} curs1={} cursbgra={}] \
+             copyrop={} putrop={} imgtext={} copyplane={} rdepth1={} curs1={} cursbgra={} \
+             client_root={}] getimage_clients=[{}] \
              cpufill_reason/s[depth_lt8={} partial_planemask={} d1_gxcopy={} d1_noncopy={}] \
              clip_cache/s[hit={} miss_other_xid={} miss_no_entry={}] \
              descriptor_pool_creates/s={} descriptor_pool_resets/s={} \
@@ -686,6 +720,8 @@ impl Telemetry {
             b.get_image_by_site[GetImageSite::ReadDepth1 as usize],
             b.get_image_by_site[GetImageSite::CursorDepth1 as usize],
             b.get_image_by_site[GetImageSite::CursorBgra as usize],
+            b.get_image_by_site[GetImageSite::ClientGetImageRoot as usize],
+            self.getimage_clients_summary(),
             b.cpufill_depth_lt8,
             b.cpufill_partial_planemask,
             b.cpufill_depth1_gxcopy,
@@ -816,6 +852,7 @@ impl Telemetry {
             b.frame_builder_close_reason_redirect_source_boundary,
         );
         self.bucket = Bucket::default();
+        self.getimage_clients.by_client.clear();
         self.last_emit = now;
     }
 
@@ -978,6 +1015,45 @@ impl Telemetry {
     pub(crate) fn record_vk_queue_wait_idle(&mut self) {
         self.bucket.vk_queue_wait_idle += 1;
         self.lifetime.vk_queue_wait_idle += 1;
+    }
+
+    /// Attribute one client-issued `GetImage` to its client, with the fence
+    /// wait it cost. `root` marks a screen-capture of the composited scanout,
+    /// which is the expensive variant.
+    pub(crate) fn record_getimage_client(&mut self, client_id: u32, ns: u64, root: bool) {
+        let e = self
+            .getimage_clients
+            .by_client
+            .entry(client_id)
+            .or_default();
+        e.calls += 1;
+        e.fence_ns = e.fence_ns.saturating_add(ns);
+        if root {
+            e.root_calls += 1;
+        }
+        if ns > e.worst_ns {
+            e.worst_ns = ns;
+        }
+    }
+
+    /// Top clients by total fence wait this window, formatted for the
+    /// telemetry line. Empty string when no client issued a GetImage.
+    fn getimage_clients_summary(&self) -> String {
+        let mut v: Vec<_> = self.getimage_clients.by_client.iter().collect();
+        v.sort_by_key(|(_, s)| std::cmp::Reverse(s.fence_ns));
+        v.iter()
+            .take(3)
+            .map(|(id, s)| {
+                format!(
+                    "c{id}:n={}/root={}/fence={:.1}ms/worst={:.1}ms",
+                    s.calls,
+                    s.root_calls,
+                    s.fence_ns as f64 / 1e6,
+                    s.worst_ns as f64 / 1e6
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     pub(crate) fn record_fence_wait(&mut self, ns: u64) {

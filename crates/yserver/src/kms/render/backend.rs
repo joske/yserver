@@ -16680,7 +16680,7 @@ impl Backend for KmsBackend {
 
     fn get_image(
         &mut self,
-        _origin: Option<OriginContext>,
+        origin: Option<OriginContext>,
         host_xid: u32,
         format: u8,
         x: i16,
@@ -16749,6 +16749,18 @@ impl Backend for KmsBackend {
                     let ns = readback_ns.saturating_add(pack_ns);
                     self.telemetry.record_one_shot_submit();
                     self.telemetry.record_fence_wait(ns);
+                    // This ROOT path recorded a fence wait but never a site,
+                    // so screen-capture stalls showed up as unattributed
+                    // waits with `get_image_calls/s = 0` — which is how the
+                    // 497-768 ms stalls in #115 got misread as internal
+                    // cursor readbacks. Attribute it.
+                    self.telemetry.record_get_image_site(
+                        crate::kms::render::telemetry::GetImageSite::ClientGetImageRoot,
+                    );
+                    if let Some(o) = origin {
+                        self.telemetry
+                            .record_getimage_client(o.client_id.0, ns, true);
+                    }
                     self.telemetry.record_get_image_phases(readback_ns, pack_ns);
                     self.trace_simple(SubmitKind::GetImage, root_id, 1);
                     Ok(Some(wrap_get_image_reply(depth, pixel_bytes)))
@@ -16818,6 +16830,10 @@ impl Backend for KmsBackend {
                 let ns = readback_ns.saturating_add(pack_ns);
                 self.telemetry.record_one_shot_submit();
                 self.telemetry.record_fence_wait(ns);
+                if let Some(o) = origin {
+                    self.telemetry
+                        .record_getimage_client(o.client_id.0, ns, false);
+                }
                 self.telemetry.record_get_image_phases(readback_ns, pack_ns);
                 self.trace_simple(SubmitKind::GetImage, target.id, 1);
                 // X11 GetImage reply: 32-byte header + pixel rows.
