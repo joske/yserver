@@ -33,10 +33,12 @@ log.workspace = true
 nix.workspace = true
 signal-hook.workspace = true
 thiserror.workspace = true
-udev.workspace = true
 xkbcommon.workspace = true
 yserver-core.workspace = true
 yserver-protocol.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+udev.workspace = true
 
 [lints]
 workspace = true
