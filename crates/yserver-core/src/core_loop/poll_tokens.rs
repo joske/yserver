@@ -1,11 +1,14 @@
 //! Token assignment for the core's mio poller, plus monotonic
 //! `ClientId` allocation.
 //!
-//! The poller's tokens fall into two ranges:
+//! The poller's tokens fall into three ranges:
 //!
-//! - Fixed system tokens at the bottom: notify-channel, listener,
-//!   DRM, signalfd, libinput, host-X11. These never change at
-//!   runtime.
+//! - Fixed system tokens at the bottom: notify-channel, listener, and
+//!   signalfd. These never change at runtime.
+//! - Backend-owned fds, allocated densely from `0x100` in the order returned
+//!   by `Backend::poll_fds`. Every fd gets its own token so readiness can be
+//!   routed back to that exact source, even when a backend exposes multiple
+//!   fds of the same kind (for example one DRM fd per KMS device).
 //! - Per-client writer tokens, allocated densely from `0x1000`
 //!   upwards using each client's `ClientId`. The mapping is bijective
 //!   so the poller can decode a `WRITABLE`-readiness token straight
@@ -30,26 +33,35 @@ pub use super::sender::NOTIFY_TOKEN;
 
 /// `UnixListener` accepting connections from clients.
 pub const LISTENER_TOKEN: Token = Token(1);
-/// DRM device fd; readiness drives `Backend::on_page_flip_ready`.
-pub const DRM_TOKEN: Token = Token(2);
 /// signalfd; readiness causes the core to issue `Message::Shutdown`.
 pub const SIGNAL_TOKEN: Token = Token(3);
-/// libinput epoll fd; readiness drives the libinput thread (KMS) or
-/// the core directly (per phase).
-pub const LIBINPUT_TOKEN: Token = Token(4);
-/// Host X11 connection fd; F2 reroutes host I/O onto the core poller.
-pub const HOST_X11_TOKEN: Token = Token(5);
-/// Stage 5 Task 6.1: backend-internal epoll FD aggregating per-entry
-/// sync_file FDs for deferred PRESENT completion. Readiness drives
-/// `Backend::drain_completed_present_events`.
-pub const PRESENT_COMPLETION_TOKEN: Token = Token(6);
-/// DRM-subsystem udev hotplug monitor fd; readiness drives
-/// `Backend::on_display_hotplug`.
-pub const DRM_HOTPLUG_TOKEN: Token = Token(8);
+
+/// First token usable for backend-owned poll sources. The core keeps the
+/// corresponding `(fd, BackendFdKind)` records in the same order.
+const BACKEND_TOKEN_BASE: usize = 0x100;
 
 /// First token usable for per-client writers. Picked far above the
-/// fixed system tokens so they're cheap to recognise on a hot poll.
+/// backend range so both classes are cheap to recognise on a hot poll.
 const CLIENT_TOKEN_BASE: usize = 0x1000;
+
+/// Map an index in the core's backend poll-source table to a unique token.
+/// Returns `None` when the table would overlap client tokens.
+#[must_use]
+pub fn backend_token(index: usize) -> Option<Token> {
+    let raw = BACKEND_TOKEN_BASE.checked_add(index)?;
+    (raw < CLIENT_TOKEN_BASE).then_some(Token(raw))
+}
+
+/// Inverse of [`backend_token`]. Tokens outside the backend-owned range
+/// return `None`.
+#[must_use]
+pub fn token_to_backend_index(token: Token) -> Option<usize> {
+    if (BACKEND_TOKEN_BASE..CLIENT_TOKEN_BASE).contains(&token.0) {
+        Some(token.0 - BACKEND_TOKEN_BASE)
+    } else {
+        None
+    }
+}
 
 /// Map a `ClientId` to the token used for its writer fd in the
 /// poller.
@@ -122,18 +134,22 @@ mod tests {
 
     #[test]
     fn system_tokens_decode_to_none() {
-        for tok in [
-            NOTIFY_TOKEN,
-            LISTENER_TOKEN,
-            DRM_TOKEN,
-            SIGNAL_TOKEN,
-            LIBINPUT_TOKEN,
-            HOST_X11_TOKEN,
-            PRESENT_COMPLETION_TOKEN,
-            DRM_HOTPLUG_TOKEN,
-        ] {
+        for tok in [NOTIFY_TOKEN, LISTENER_TOKEN, SIGNAL_TOKEN] {
             assert!(token_to_client(tok).is_none(), "{tok:?}");
         }
+    }
+
+    #[test]
+    fn backend_tokens_are_unique_and_round_trip() {
+        for index in [0, 1, 2, 100, CLIENT_TOKEN_BASE - BACKEND_TOKEN_BASE - 1] {
+            let token = backend_token(index).expect("backend index should fit");
+            assert_eq!(token_to_backend_index(token), Some(index));
+            assert!(token_to_client(token).is_none());
+        }
+        assert_ne!(backend_token(0), backend_token(1));
+        assert!(backend_token(CLIENT_TOKEN_BASE - BACKEND_TOKEN_BASE).is_none());
+        assert_eq!(token_to_backend_index(LISTENER_TOKEN), None);
+        assert_eq!(token_to_backend_index(client_token(ClientId(1))), None);
     }
 
     #[test]
@@ -152,16 +168,7 @@ mod tests {
     #[test]
     fn fixed_tokens_are_distinct() {
         // Sanity: catches accidental duplicate constants.
-        let all = [
-            NOTIFY_TOKEN.0,
-            LISTENER_TOKEN.0,
-            DRM_TOKEN.0,
-            SIGNAL_TOKEN.0,
-            LIBINPUT_TOKEN.0,
-            HOST_X11_TOKEN.0,
-            PRESENT_COMPLETION_TOKEN.0,
-            DRM_HOTPLUG_TOKEN.0,
-        ];
+        let all = [NOTIFY_TOKEN.0, LISTENER_TOKEN.0, SIGNAL_TOKEN.0];
         let mut sorted: Vec<_> = all.to_vec();
         sorted.sort_unstable();
         sorted.dedup();

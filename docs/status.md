@@ -48,12 +48,20 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   stable output and CRTC XIDs. Provider IDs reserve entries from the same
   monotonic RANDR XID source, and `SetCrtcConfig` carries the output XID back
   into the backend instead of treating a connector name as globally unique.
-  Device/render-node resources now live in a one-entry `KmsDevice` vector, but
-  the runtime still opens and activates only one KMS card at this step;
-  multi-card opening, exact-fd event routing, and activation land in the
-  subsequent PRIME lifecycle work. The current lightweight forced-probe path,
-  mode deduplication, output-change notifications, DRI3 syncobj handling, and
-  direct-scanout behavior remain intact.
+  Startup now opens every KMS-capable primary node, retains device-local
+  render-node/syncobj resources for each one, and gives every DRM poll source a
+  distinct core-loop token so completion events drain from the exact ready fd.
+  Initial scanout remains deliberately limited to the first opened device;
+  later entries are provider/topology inventory for subsequent PRIME routing.
+  Both zero opened cards and an opened card with zero connected outputs are
+  valid headless states. Software Vulkan is permitted only while no output is
+  active; a later RANDR enable refuses software-to-KMS scanout unless the
+  explicit override is set. Every opened card is identity-qualified before the
+  first modeset, and a construction-wide rollback disables initial scanout if
+  any later Vulkan, pool, poller, core, engine, or compositor step fails. The
+  current lightweight forced-probe path, mode deduplication, output-change
+  notifications, DRI3 syncobj handling, and direct-scanout behavior remain
+  intact.
 - **2026-08-14 render-node resolution on split display/render SoCs (Asahi):**
   cinnamon flashed and rendered unstably on Apple Silicon (`air`) while
   MATE/XFCE looked fine; bisected to `bbc9d30f` (the FreeBSD render-node

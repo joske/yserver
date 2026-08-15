@@ -43,7 +43,8 @@ pub enum BackendFdKind {
     /// thread (KMS) — but the fd inventory still flows through the
     /// trait so the core's poller can register it uniformly.
     Libinput,
-    /// DRM device fd; readiness drives `on_page_flip_ready`.
+    /// DRM device fd; readiness drives `on_page_flip_ready` with this fd so a
+    /// multi-device backend drains only the ready device.
     Drm,
     /// Host X11 connection fd (ynest only); readiness drives
     /// `Backend::drain_host_socket` on the core thread.
@@ -455,9 +456,10 @@ pub trait Backend {
     /// (KMS) and F2 (host-X11); inert until then.
     fn on_host_input(&mut self, state: &mut ServerState, ev: HostInputEvent);
 
-    /// DRM page-flip completion fd is readable. The backend should
-    /// drain completion events and submit the next composite/flip.
-    fn on_page_flip_ready(&mut self, state: &mut ServerState);
+    /// `drm_fd` is readable. The backend should drain completion events from
+    /// that exact DRM device and submit the next composite/flip. The fd is one
+    /// returned by [`Backend::poll_fds`] with [`BackendFdKind::Drm`].
+    fn on_page_flip_ready(&mut self, state: &mut ServerState, drm_fd: std::os::fd::RawFd);
 
     /// The DRM hotplug monitor is readable. Default: no-op.
     fn on_display_hotplug(&mut self, _state: &mut ServerState) {}
@@ -866,9 +868,9 @@ pub trait Backend {
     /// silent no-op.
     fn release_present_source(&mut self, _pin_id: u64) {}
 
-    /// Raw fds the core's poller should watch on this backend's behalf.
-    /// The core registers each fd against the matching token derived
-    /// from `BackendFdKind`.
+    /// Raw fds the core's poller should watch on this backend's behalf. The
+    /// core gives every entry a unique token and retains both the fd and its
+    /// `BackendFdKind` for readiness dispatch.
     fn poll_fds(&self) -> Vec<(std::os::fd::RawFd, BackendFdKind)>;
 
     /// Downcast to `Any` for backend-specific operations (e.g. KMS composite).

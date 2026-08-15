@@ -350,17 +350,18 @@ impl VkContext {
     }
 }
 
-/// Pre-flight check run BEFORE any DRM open / modeset: enumerate the
-/// Vulkan physical devices (instance-level only — no VkDevice, no DRM,
-/// no master, no screen blank) and refuse when every available device
-/// is a software rasterizer (`CPU` type — llvmpipe/lavapipe).
+/// Pre-flight check run before KMS buffer allocation / modeset: enumerate the
+/// Vulkan physical devices (instance-level only — no VkDevice and no screen
+/// blank) and refuse when every available device is a software rasterizer
+/// (`CPU` type — llvmpipe/lavapipe). The caller may already have opened a DRM
+/// card so it can distinguish real scanout from a zero-output headless start.
 ///
 /// Rationale: driving real KMS scanout off software Vulkan hard-hangs
 /// the machine (observed on two KMS drivers: simpledrm and nvidia-drm —
 /// no ping, no journal, power-cycle required). The in-bring-up guard in
-/// `PlatformBackend::from_platform_init` exists too, but it runs after
-/// the initial modeset; this preflight refuses while the console is
-/// still intact, before yserver has touched the GPU at all.
+/// `PlatformBackend::from_platform_init` exists too, but it runs after the
+/// initial modeset; this preflight refuses before yserver allocates or commits
+/// a scanout buffer.
 ///
 /// Conservative on probe errors: if the loader / instance / enumeration
 /// itself fails, this returns `Ok(())` and lets the real `VkContext::new`
@@ -440,7 +441,7 @@ pub fn ensure_hardware_vulkan_for_scanout() -> Result<(), String> {
     let msg = format!(
         "every available Vulkan device is a software rasterizer: [{listing}]. \
          Driving real KMS scanout off software Vulkan (llvmpipe/lavapipe) \
-         hard-hangs the machine. Refusing to start BEFORE touching the GPU. \
+         hard-hangs the machine. Refusing to start before committing scanout. \
          Install a hardware Vulkan driver for the scanout GPU (radv / anv / nvk), \
          or check the GPU driver setup (e.g. proprietary driver removed but \
          nouveau not loaded leaves only llvmpipe). To override deliberately, \

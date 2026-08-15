@@ -30,7 +30,7 @@ pub enum HostSocketStatus {
     /// Read drained the kernel buffer; nothing more to read right now.
     /// Frames decoded out of `read_buffer` have been classified.
     WouldBlock,
-    /// Host closed the connection. The core's `HOST_X11_TOKEN` arm
+    /// Host closed the connection. The core's host-X11 poll-source arm
     /// posts `Message::Shutdown` in response.
     Eof,
 }
@@ -424,7 +424,7 @@ impl HostX11Backend {
     }
 
     /// Raw fd of the host X11 connection. The core registers this with
-    /// its mio poller (`HOST_X11_TOKEN`) so readiness wakes the core
+    /// its mio poller (using a unique backend poll-source token) so readiness wakes the core
     /// to call `drain_host_socket`.
     pub(super) fn host_fd(&self) -> RawFd {
         self.stream.as_raw_fd()

@@ -360,7 +360,7 @@ pub fn run(display: u16, width: u16, height: u16) -> io::Result<()> {
     // The single-threaded core loop owns the host X11 connection
     // directly — no dispatcher thread, no per-client kb pumps. Host
     // events come off the host fd via the core's mio poller
-    // (`HOST_X11_TOKEN`) and fan out at the outer-loop boundary.
+    // (its backend poll-source token) and fan out at the outer-loop boundary.
     let mut backend = match HostX11Backend::open_from_env(width, height) {
         Ok(opened) => {
             info!(

@@ -164,10 +164,15 @@ impl Backend for HostX11Backend {
     }
 
     /// Host-X11 backend never page-flips.
-    fn on_page_flip_ready(&mut self, _state: &mut crate::server::ServerState) {}
+    fn on_page_flip_ready(
+        &mut self,
+        _state: &mut crate::server::ServerState,
+        _drm_fd: std::os::fd::RawFd,
+    ) {
+    }
 
-    /// F2: host fd registered with the core's poller as
-    /// `HOST_X11_TOKEN`. Readiness drives `drain_host_socket`.
+    /// F2: host fd registered with the core's poller. Readiness drives
+    /// `drain_host_socket`.
     fn poll_fds(&self) -> Vec<(std::os::fd::RawFd, crate::backend::BackendFdKind)> {
         vec![(self.host_fd(), crate::backend::BackendFdKind::HostX11)]
     }

@@ -541,10 +541,6 @@ pub(crate) struct SequenceCompletion {
 }
 
 /// One opened DRM/KMS device and its sibling render-node resources.
-///
-/// This commit deliberately constructs exactly one entry. Keeping the
-/// ownership device-scoped here lets later PRIME work extend the vector
-/// without moving these fields a second time.
 pub(crate) struct KmsDevice {
     pub(crate) key: crate::platform::drm::DrmDeviceKey,
     pub(crate) device: Rc<drm::Device>,
@@ -564,9 +560,102 @@ pub(crate) struct KmsDevice {
     pub(crate) render_node_path: Option<PathBuf>,
 }
 
+fn rollback_initial_scanout_with<F>(
+    devices: &[KmsDevice],
+    outputs: &mut [ActiveOutput],
+    disable: &mut F,
+) where
+    F: FnMut(&drm::Device, &crate::platform::drm::Output) -> io::Result<()>,
+{
+    for layout in outputs.iter_mut().rev() {
+        let Some(device) = devices
+            .iter()
+            .find(|device| device.key == layout.key.device_key)
+        else {
+            log::error!(
+                "initial scanout rollback: no DRM device {} for {}; \
+                 leaving its buffers for DRM-fd close",
+                layout.key.device_key,
+                layout.output.connector_name,
+            );
+            layout.swapchain.disarm();
+            continue;
+        };
+        if let Err(err) = disable(&device.device, &layout.output) {
+            log::warn!(
+                "initial scanout rollback: failed to disable {} on {}: {err}; \
+                 leaving its buffers for DRM-fd close",
+                layout.output.connector_name,
+                device.key,
+            );
+            layout.swapchain.disarm();
+        }
+    }
+}
+
+/// RAII coverage for every fallible step between the initial modeset and a
+/// fully-built [`PlatformBackend`]. The output buffers stay borrowed until
+/// this guard is either dropped (rollback) or explicitly disarmed when
+/// responsibility transfers into `PlatformBackend::drop`.
+struct InitialScanoutRollbackGuard<'a, F>
+where
+    F: FnMut(&drm::Device, &crate::platform::drm::Output) -> io::Result<()>,
+{
+    devices: &'a [KmsDevice],
+    outputs: &'a mut [ActiveOutput],
+    disable: F,
+    armed: bool,
+}
+
+impl<'a, F> InitialScanoutRollbackGuard<'a, F>
+where
+    F: FnMut(&drm::Device, &crate::platform::drm::Output) -> io::Result<()>,
+{
+    fn new_with(devices: &'a [KmsDevice], outputs: &'a mut [ActiveOutput], disable: F) -> Self {
+        Self {
+            devices,
+            armed: !outputs.is_empty(),
+            outputs,
+            disable,
+        }
+    }
+
+    fn devices(&self) -> &[KmsDevice] {
+        self.devices
+    }
+
+    fn outputs(&self) -> &[ActiveOutput] {
+        self.outputs
+    }
+
+    fn is_armed(&self) -> bool {
+        self.armed
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl<F> Drop for InitialScanoutRollbackGuard<'_, F>
+where
+    F: FnMut(&drm::Device, &crate::platform::drm::Output) -> io::Result<()>,
+{
+    fn drop(&mut self) {
+        if self.armed {
+            rollback_initial_scanout_with(self.devices, self.outputs, &mut self.disable);
+            self.armed = false;
+        }
+    }
+}
+
 /// v2's real DRM/Vk/libinput owner. Replaces the flat field set
 /// that Stage 1b's `KmsBackend` carried.
 pub(crate) struct PlatformBackend {
+    /// Armed only while the outer `KmsBackend` constructor is still
+    /// fallible. `Drop` disables the initial modesets before the dumb
+    /// swapchains are destroyed; full construction explicitly disarms it.
+    initial_scanout_rollback_armed: bool,
     // DRM / output side
     pub(crate) devices: Vec<KmsDevice>,
     pub(crate) outputs: Vec<ActiveOutput>,
@@ -736,7 +825,28 @@ pub(crate) fn recompute_fb_extent_from(layouts: &[(i32, i32, u16, u16)]) -> (u16
     (fb_w, fb_h)
 }
 
+impl Drop for PlatformBackend {
+    fn drop(&mut self) {
+        if !self.initial_scanout_rollback_armed {
+            return;
+        }
+        rollback_initial_scanout_with(
+            &self.devices,
+            &mut self.outputs,
+            &mut drm::modeset::disable_output,
+        );
+        self.initial_scanout_rollback_armed = false;
+    }
+}
+
 impl PlatformBackend {
+    /// Mark the initial modesets as owned by a fully constructed backend.
+    /// Normal shutdown will disable them through `KmsBackend::disable_output`;
+    /// construction failures leave this armed so `Drop` performs rollback.
+    pub(crate) fn disarm_initial_scanout_rollback(&mut self) {
+        self.initial_scanout_rollback_armed = false;
+    }
+
     /// Backend constructor. Opens DRM, initialises Vk,
     /// allocates per-output scanout pools, builds the fence pool.
     /// Fatal initialization failures tear down already-allocated resources
@@ -750,17 +860,17 @@ impl PlatformBackend {
     /// failure is non-fatal while another output remains displayable; startup
     /// fails if every connected output lacks a live pool.
     pub(crate) fn open_with_commit(
-        device_path: &str,
+        device_paths: &[PathBuf],
         commit: fn(
             &drm::Device,
             &crate::platform::drm::Output,
             ::drm::control::framebuffer::Handle,
         ) -> io::Result<()>,
     ) -> io::Result<Self> {
-        // Refuse software-only Vulkan BEFORE touching DRM (no modeset,
-        // no master, console stays intact). See the preflight's docs.
-        crate::kms::vk::device::ensure_hardware_vulkan_for_scanout().map_err(io::Error::other)?;
-        let platform_init = core_platform_init(device_path, commit)?;
+        // `core_platform_init` runs the hardware-Vulkan preflight after it
+        // discovers an active output but before allocating or committing
+        // scanout. Headless platforms skip it and may use software Vulkan.
+        let platform_init = core_platform_init(device_paths, commit)?;
         Self::from_platform_init(platform_init)
     }
 
@@ -769,34 +879,46 @@ impl PlatformBackend {
     /// [`open_with_commit`] (Direct mode — the only mode).
     fn from_platform_init(platform_init: PlatformInit) -> io::Result<Self> {
         let PlatformInit {
-            device_key,
-            device,
-            render_node_fd,
-            render_node_path,
-            layouts,
+            devices,
+            mut layouts,
             fb_w,
             fb_h,
             input_ctx,
         } = platform_init;
 
-        let render_node_device = render_node_path
-            .as_deref()
-            .and_then(|path| {
-                // `open_render_node` takes a `&str`; a non-UTF8 node path
-                // (unrealistic under /dev/dri) degrades to no device, which
-                // `dri3_import_syncobj` surfaces as a hard error.
-                drm::Device::open_render_node(path.to_str()?).ok()
+        let devices: Vec<KmsDevice> = devices
+            .into_iter()
+            .map(|device| {
+                let render_node_device = device
+                    .render_node_path
+                    .as_deref()
+                    .and_then(|path| drm::Device::open_render_node(path.to_str()?).ok())
+                    .map(Arc::new);
+                let syncobj_timeline = render_node_device
+                    .as_ref()
+                    .and_then(|render_device| {
+                        use ::drm::Device as _;
+                        render_device
+                            .get_driver_capability(::drm::DriverCapability::TimelineSyncObj)
+                            .ok()
+                    })
+                    .is_some_and(|value| value != 0);
+                KmsDevice {
+                    key: device.key,
+                    device: device.device,
+                    render_node_fd: device.render_node_fd,
+                    render_node_device,
+                    syncobj_timeline,
+                    render_node_path: device.render_node_path,
+                }
             })
-            .map(Arc::new);
+            .collect();
 
-        let syncobj_timeline = render_node_device
-            .as_ref()
-            .and_then(|d| {
-                use ::drm::Device as _;
-                d.get_driver_capability(::drm::DriverCapability::TimelineSyncObj)
-                    .ok()
-            })
-            .is_some_and(|v| v != 0);
+        let mut initial_scanout_rollback = InitialScanoutRollbackGuard::new_with(
+            &devices,
+            &mut layouts,
+            drm::modeset::disable_output,
+        );
 
         let vk = match VkContext::new() {
             Ok(v) => v,
@@ -824,7 +946,8 @@ impl PlatformBackend {
         // Venus (virtio-gpu) reports VIRTUAL_GPU, not CPU, so it is not
         // affected; the env override exists for any deliberate
         // software-scanout setup (e.g. lavapipe under vng).
-        if vk.is_software_rasterizer()
+        if !initial_scanout_rollback.outputs().is_empty()
+            && vk.is_software_rasterizer()
             && std::env::var_os("YSERVER_ALLOW_SOFTWARE_VULKAN").is_none()
         {
             return Err(io::Error::other(format!(
@@ -837,6 +960,11 @@ impl PlatformBackend {
                  To override (e.g. virtio-gpu under vng), set YSERVER_ALLOW_SOFTWARE_VULKAN=1.",
                 vk.driver_id,
             )));
+        }
+        if initial_scanout_rollback.outputs().is_empty() && vk.is_software_rasterizer() {
+            log::info!(
+                "render PlatformBackend: using software Vulkan for headless rendering; no KMS outputs are active"
+            );
         }
 
         let ops_command_pool = OpsCommandPool::new(Arc::clone(&vk))
@@ -860,15 +988,25 @@ impl PlatformBackend {
         };
 
         // One ScanoutBoPool per output, 3-BO depth (matches v1).
-        let mut scanout_pools = Vec::with_capacity(layouts.len());
-        let mut bo_generations = Vec::with_capacity(layouts.len());
+        let mut scanout_pools = Vec::with_capacity(initial_scanout_rollback.outputs().len());
+        let mut bo_generations = Vec::with_capacity(initial_scanout_rollback.outputs().len());
         let mut scanout_alloc_errors: Vec<String> = Vec::new();
-        for (i, layout) in layouts.iter().enumerate() {
+        for (i, layout) in initial_scanout_rollback.outputs().iter().enumerate() {
             let w = u32::from(layout.width);
             let h = u32::from(layout.height);
+            let device = initial_scanout_rollback
+                .devices()
+                .iter()
+                .find(|device| device.key == layout.key.device_key)
+                .ok_or_else(|| {
+                    io::Error::other(format!(
+                        "render PlatformBackend: output {} belongs to missing DRM device {}",
+                        layout.key.connector_name, layout.key.device_key
+                    ))
+                })?;
             match ScanoutBoPool::allocate(
                 Arc::clone(&vk),
-                Rc::clone(&device),
+                Rc::clone(&device.device),
                 w,
                 h,
                 3,
@@ -897,40 +1035,50 @@ impl PlatformBackend {
         // instead of leaving a silent black screen. (Split-GPU scanout
         // with no shared modifier, e.g. RPi 4/400, lands here.)
         let live_pool_count = scanout_pools.iter().filter(|p| p.is_some()).count();
-        if let Err(msg) =
-            check_scanout_liveness(layouts.len(), live_pool_count, &scanout_alloc_errors)
-        {
+        if let Err(msg) = check_scanout_liveness(
+            initial_scanout_rollback.outputs().len(),
+            live_pool_count,
+            &scanout_alloc_errors,
+        ) {
             return Err(io::Error::other(format!("render PlatformBackend: {msg}")));
         }
-        let first_pageflip_logged = vec![false; layouts.len()];
+        let first_pageflip_logged = vec![false; initial_scanout_rollback.outputs().len()];
 
-        // Stage 5 Phase B — bring up the DRM cursor plane. Failure
-        // is non-fatal; v2 falls back to the SW scene cursor path.
-        let crtc_handles: Vec<::drm::control::crtc::Handle> =
-            layouts.iter().map(|l| l.output.crtc).collect();
-        let cursor_plane = match crate::kms::cursor_plane::CursorPlane::new(
-            Rc::clone(&device),
-            &crtc_handles,
-        ) {
-            Ok(plane) => {
-                // Report the size actually allocated, not a constant:
-                // `CursorPlane::new` uses the driver-reported cursor
-                // dimensions (64 on i915, 128/256 on amdgpu). Hardcoding
-                // 64 here contradicted the real geometry in the logs and
-                // sent a #79 diagnosis round chasing a stride mismatch
-                // that did not exist.
-                log::info!(
-                    "render PlatformBackend: hardware cursor plane initialised ({}x{} ARGB8888)",
-                    plane.width(),
-                    plane.height(),
-                );
-                Some(plane)
-            }
-            Err(e) => {
-                log::warn!(
-                    "render PlatformBackend: cursor plane init failed ({e}); SW cursor fallback",
-                );
-                None
+        // Stage 5 Phase B — bring up the primary DRM cursor plane. Failure
+        // is non-fatal; the scene falls back to software. With no CRTCs there
+        // is no plane to bind, so defer initialization until an output exists.
+        let crtc_handles: Vec<::drm::control::crtc::Handle> = initial_scanout_rollback
+            .outputs()
+            .iter()
+            .map(|l| l.output.crtc)
+            .collect();
+        let cursor_plane = if crtc_handles.is_empty() {
+            log::info!("render PlatformBackend: no active CRTCs; hardware cursor init deferred");
+            None
+        } else {
+            let primary = initial_scanout_rollback.devices().first().ok_or_else(|| {
+                io::Error::other("render PlatformBackend: active CRTC exists without a KMS device")
+            })?;
+            match crate::kms::cursor_plane::CursorPlane::new(
+                Rc::clone(&primary.device),
+                &crtc_handles,
+            ) {
+                Ok(plane) => {
+                    // Report the driver-provided geometry (64 on i915,
+                    // commonly 128/256 on amdgpu).
+                    log::info!(
+                        "render PlatformBackend: hardware cursor plane initialised ({}x{} ARGB8888)",
+                        plane.width(),
+                        plane.height(),
+                    );
+                    Some(plane)
+                }
+                Err(e) => {
+                    log::warn!(
+                        "render PlatformBackend: cursor plane init failed ({e}); SW cursor fallback",
+                    );
+                    None
+                }
             }
         };
 
@@ -969,22 +1117,22 @@ impl PlatformBackend {
 
         log::info!(
             "render PlatformBackend: ready — {} outputs, fb {}x{}, {} scanout pools live",
-            layouts.len(),
+            initial_scanout_rollback.outputs().len(),
             fb_w,
             fb_h,
             scanout_pools.iter().filter(|p| p.is_some()).count(),
         );
 
-        let devices = vec![KmsDevice {
-            key: device_key,
-            device,
-            render_node_fd,
-            render_node_device,
-            syncobj_timeline,
-            render_node_path,
-        }];
+        // `Self` construction below is infallible. Transfer rollback
+        // responsibility from the borrowing stack guard to PlatformBackend's
+        // Drop implementation so the outer KmsBackend constructor remains
+        // covered until it explicitly disarms the completed backend.
+        let initial_scanout_rollback_armed = initial_scanout_rollback.is_armed();
+        initial_scanout_rollback.disarm();
+        drop(initial_scanout_rollback);
 
         Ok(Self {
+            initial_scanout_rollback_armed,
             devices,
             outputs: layouts,
             fb_w,
@@ -1037,6 +1185,7 @@ impl PlatformBackend {
         let device_key = crate::platform::drm::DrmDeviceKey { major: 0, minor: 0 };
         let device = Rc::new(drm::Device::for_tests().expect("test drm device"));
         Self {
+            initial_scanout_rollback_armed: false,
             devices: vec![KmsDevice {
                 key: device_key,
                 device,
@@ -1175,8 +1324,7 @@ impl PlatformBackend {
     pub(crate) fn is_nvidia_drm(&self) -> bool {
         use ::drm::Device as _;
         self.primary_device()
-            .device
-            .get_driver()
+            .and_then(|device| device.device.get_driver().ok())
             .map(|d| {
                 d.name()
                     .to_string_lossy()
@@ -1531,19 +1679,13 @@ impl PlatformBackend {
         self.input_ctx.take()
     }
 
-    /// The sole opened KMS device in this incremental topology commit.
-    /// Multi-device/headless startup changes this invariant in a later step.
-    pub(crate) fn primary_device(&self) -> &KmsDevice {
-        self.devices
-            .first()
-            .expect("PlatformBackend currently owns exactly one KMS device")
+    pub(crate) fn primary_device(&self) -> Option<&KmsDevice> {
+        self.devices.first()
     }
 
     #[cfg(test)]
-    pub(crate) fn primary_device_mut(&mut self) -> &mut KmsDevice {
-        self.devices
-            .first_mut()
-            .expect("PlatformBackend currently owns exactly one KMS device")
+    pub(crate) fn primary_device_mut(&mut self) -> Option<&mut KmsDevice> {
+        self.devices.first_mut()
     }
 
     pub(crate) fn device_for_key(
@@ -1578,16 +1720,26 @@ impl PlatformBackend {
         fds
     }
 
+    fn drm_device_index_for_fd(&self, drm_fd: RawFd) -> Option<usize> {
+        self.devices
+            .iter()
+            .position(|device| device.device.as_fd().as_raw_fd() == drm_fd)
+    }
+
     pub(crate) fn drain_page_flip_events(
         &mut self,
+        drm_fd: RawFd,
     ) -> io::Result<(Vec<usize>, Vec<SequenceCompletion>)> {
         use ::drm::control::crtc;
 
-        // This commit preserves the one-card runtime invariant. Carry the
-        // device identity through every completion now so later multi-card
-        // polling can route the exact ready fd without changing event shape.
-        let device_key = self.primary_device().key;
-        let device = Rc::clone(&self.primary_device().device);
+        let device_index = self.drm_device_index_for_fd(drm_fd).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("page-flip readiness from unknown DRM fd {drm_fd}"),
+            )
+        })?;
+        let device_key = self.devices[device_index].key;
+        let device = Rc::clone(&self.devices[device_index].device);
 
         // Capture the kernel vblank (msc=frame, ust=duration) alongside the
         // CRTC so Present pacing can complete NotifyMSC with real values.
@@ -3216,8 +3368,11 @@ impl PlatformBackend {
         &mut self,
         client_configured: &HashSet<OutputKey>,
     ) -> io::Result<RescanResult> {
-        let device_key = self.primary_device().key;
-        let device = Rc::clone(&self.primary_device().device);
+        let Some(primary) = self.primary_device() else {
+            return Ok(RescanResult::default());
+        };
+        let device_key = primary.key;
+        let device = Rc::clone(&primary.device);
         let discovered = crate::platform::drm::discover_outputs(&device)?;
         let discovered_order: Vec<OutputKey> = discovered
             .iter()
@@ -3473,6 +3628,88 @@ fn check_scanout_liveness(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initial_scanout_rollback_guard_fires_and_can_be_disarmed() {
+        let mut platform = PlatformBackend::for_tests();
+        let calls = Rc::new(Cell::new(0_u32));
+
+        {
+            let calls = Rc::clone(&calls);
+            let _guard = InitialScanoutRollbackGuard::new_with(
+                &platform.devices,
+                &mut platform.outputs,
+                move |_device, _output| {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                },
+            );
+        }
+        assert_eq!(calls.get(), 1, "armed guard must run rollback on drop");
+
+        {
+            let calls = Rc::clone(&calls);
+            let mut guard = InitialScanoutRollbackGuard::new_with(
+                &platform.devices,
+                &mut platform.outputs,
+                move |_device, _output| {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                },
+            );
+            guard.disarm();
+        }
+        assert_eq!(calls.get(), 1, "disarmed guard must not roll back");
+    }
+
+    #[test]
+    fn zero_device_platform_has_no_drm_poll_source_or_rescan_work() {
+        let mut platform = PlatformBackend::for_tests();
+        platform.devices.clear();
+        platform.outputs.clear();
+
+        assert!(platform.primary_device().is_none());
+        assert!(
+            platform
+                .poll_fds()
+                .iter()
+                .all(|(_, kind)| !matches!(kind, BackendFdKind::Drm)),
+            "a zero-device platform must not register a DRM poll source"
+        );
+
+        let rescan = platform
+            .requery_outputs_and_modeset(&HashSet::new())
+            .expect("zero-device requery is an empty no-op");
+        assert!(rescan.added_keys.is_empty());
+        assert!(rescan.dropped_keys.is_empty());
+        assert!(rescan.dropped_old_indices.is_empty());
+        assert!(rescan.added_outputs.is_empty());
+        assert_eq!(rescan.added_count, 0);
+    }
+
+    #[test]
+    fn drm_device_fd_lookup_distinguishes_same_kind_poll_sources() {
+        let mut platform = PlatformBackend::for_tests();
+        let first_fd = platform.devices[0].device.as_fd().as_raw_fd();
+        let second_device = Rc::new(drm::Device::for_tests().expect("second test DRM device"));
+        let second_fd = second_device.as_fd().as_raw_fd();
+        platform.devices.push(KmsDevice {
+            key: crate::platform::drm::DrmDeviceKey {
+                major: 226,
+                minor: 1,
+            },
+            device: second_device,
+            render_node_fd: None,
+            render_node_device: None,
+            syncobj_timeline: false,
+            render_node_path: None,
+        });
+
+        assert_ne!(first_fd, second_fd);
+        assert_eq!(platform.drm_device_index_for_fd(first_fd), Some(0));
+        assert_eq!(platform.drm_device_index_for_fd(second_fd), Some(1));
+        assert_eq!(platform.drm_device_index_for_fd(-1), None);
+    }
 
     /// A connected output that yielded no scanout pool must abort
     /// bring-up rather than run invisibly (the RPi 4/400 split-GPU

@@ -312,13 +312,24 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     let console_guard = crate::kms::console::ConsoleGuard::acquire(opts.vt)?;
     #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     let console_guard: Option<()> = None;
-    let device_path = crate::platform::drm::resolve_default_kms_device()?;
-    log::info!("yserver: opening DRM device {device_path}");
+    let device_paths = crate::platform::drm::resolve_default_kms_devices()?;
+    if device_paths.is_empty() {
+        log::info!("yserver: no DRM devices to open; starting zero-card headless");
+    } else {
+        log::info!(
+            "yserver: opening DRM devices (primary first): {}",
+            device_paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 
     // Always Direct (self-managed DRM master + VT_PROCESS): open DRM +
     // libinput directly, arming VT_PROCESS when a controlling console is
     // present.
-    let mut backend = build_kms_backend(&device_path, console_guard, opts.layout.clone())?;
+    let mut backend = build_kms_backend(&device_paths, console_guard, opts.layout.clone())?;
     let (fb_w, fb_h) = backend.fb_dimensions();
     log::info!("yserver: scanout {fb_w}x{fb_h}");
 
@@ -636,11 +647,11 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
 /// when a real controlling console is present. (libseat/logind session
 /// management was removed; the Direct model is the sole seat model.)
 fn build_kms_backend(
-    device_path: &str,
+    device_paths: &[std::path::PathBuf],
     console_guard: crate::kms::ConsoleGuardOpt,
     layout: Option<String>,
 ) -> io::Result<crate::kms::render::KmsBackend> {
-    crate::kms::render::KmsBackend::open(device_path, console_guard, layout)
+    crate::kms::render::KmsBackend::open(device_paths, console_guard, layout)
 }
 
 #[cfg(target_os = "linux")]

@@ -27,7 +27,7 @@
 //! v1; a future rename to something like `kms::raster` is fine but
 //! not load-bearing.
 
-use std::{io, rc::Rc};
+use std::{io, path::PathBuf, rc::Rc};
 
 use crate::{
     drm,
@@ -612,45 +612,33 @@ pub(crate) fn primary_output_center(outputs: &[ActiveOutput], fb_w: u16, fb_h: u
     )
 }
 
-pub(crate) struct PlatformInit {
-    pub(crate) device_key: crate::platform::drm::DrmDeviceKey,
+/// One DRM/KMS device opened during platform bring-up.
+pub(crate) struct PlatformInitDevice {
+    pub(crate) key: crate::platform::drm::DrmDeviceKey,
     pub(crate) device: Rc<drm::Device>,
     pub(crate) render_node_fd: Option<std::os::fd::OwnedFd>,
-    pub(crate) render_node_path: Option<std::path::PathBuf>,
+    pub(crate) render_node_path: Option<PathBuf>,
+}
+
+/// Transient handoff from device discovery to the long-lived renderer.
+///
+/// The ordered device vector carries every successfully opened KMS card. Only
+/// the first entry receives startup scanout in this incremental PRIME step;
+/// secondary entries exist for provider identity and later device routing.
+/// Empty `devices` and `layouts` is a valid zero-card headless platform.
+pub(crate) struct PlatformInit {
+    pub(crate) devices: Vec<PlatformInitDevice>,
     pub(crate) layouts: Vec<ActiveOutput>,
     pub(crate) fb_w: u16,
     pub(crate) fb_h: u16,
     pub(crate) input_ctx: Option<crate::input::SendContext>,
 }
 
-/// Shared DRM / outputs / libinput bring-up for the v1 and v2
-/// backends. Extracted in Stage 1b so both `KmsBackend::open_with_commit`
-/// and `KmsBackend::open` use the same code path.
-///
-/// **Vulkan / pipelines / scanout pools / scheduler / pixmap pool**
-/// stay in the v1-specific portion of `open_with_commit` for now —
-/// v2 doesn't build any of that in Stage 1b (paint paths are
-/// stubbed). Stage 2 promotes the appropriate subset into the
-/// real `PlatformBackend` component.
-///
-/// # Errors
-///
-/// Propagates DRM open / output discovery / per-output commit
-/// failures. On bring-up error any output already committed gets
-/// disabled before returning so the next caller starts clean.
-pub(crate) fn platform_init(
+fn render_node_for_device(
     device_path: &str,
-    commit: fn(
-        &crate::drm::Device,
-        &crate::platform::drm::Output,
-        ::drm::control::framebuffer::Handle,
-    ) -> io::Result<()>,
-) -> io::Result<PlatformInit> {
-    let device = Rc::new(drm::Device::open(device_path)?);
-    let device_key =
-        crate::platform::drm::primary_device_key_from_fd(std::os::fd::AsFd::as_fd(&*device))?;
-    let (render_node_fd, render_node_path) = match crate::kms::render_node::open_for_card(&*device)
-    {
+    device: &drm::Device,
+) -> (Option<std::os::fd::OwnedFd>, Option<PathBuf>) {
+    match crate::kms::render_node::open_for_card(device) {
         Ok((fd, path)) => {
             use std::os::fd::AsRawFd;
             let raw = fd.as_raw_fd();
@@ -665,47 +653,64 @@ pub(crate) fn platform_init(
                 .unwrap_or_else(|| "?".into());
             log::info!(
                 "DRI3 render node ready for {device_path}: fd={raw} \
-                     path={path:?} rdev={stat_minor} (render node minor should be >=128)"
+                 path={path:?} rdev={stat_minor} (render node minor should be >=128)"
             );
             (Some(fd), Some(path))
         }
         Err(err) => {
             log::warn!(
-                "DRI3 render node unavailable: {err}; DRI3 import path will be \
-                     unavailable but the rest of yserver continues"
+                "DRI3 render node unavailable for {device_path}: {err}; DRI3 import path will be \
+                 unavailable on this device but the rest of yserver continues"
             );
             (None, None)
         }
-    };
-    let outputs = crate::platform::drm::discover_outputs(&device)?;
+    }
+}
 
-    // Horizontal layout in connector order. If anything fails part
-    // way through bring-up, disable everything we have already
-    // committed so the next caller starts from a clean slate.
-    let mut layouts: Vec<ActiveOutput> = Vec::with_capacity(outputs.len());
-    let mut next_x: i32 = 0;
-    let mut bring_up_err: Option<io::Error> = None;
+fn activate_initial_scanout_outputs(
+    device_key: crate::platform::drm::DrmDeviceKey,
+    device: &Rc<drm::Device>,
+    commit: fn(
+        &crate::drm::Device,
+        &crate::platform::drm::Output,
+        ::drm::control::framebuffer::Handle,
+    ) -> io::Result<()>,
+) -> io::Result<Vec<ActiveOutput>> {
+    let outputs = crate::platform::drm::discover_outputs(device)?;
+    if !outputs.is_empty() {
+        // Refuse software-only Vulkan before allocating or committing any
+        // scanout buffer. An opened card with no connected outputs remains a
+        // valid headless platform; later RANDR enable repeats this guard.
+        crate::kms::vk::device::ensure_hardware_vulkan_for_scanout().map_err(io::Error::other)?;
+    }
+
+    // Horizontal layout in connector order. If anything fails part way
+    // through bring-up, disable everything already committed so the caller
+    // starts from a clean slate.
+    let mut layouts = Vec::with_capacity(outputs.len());
+    let mut next_x = 0_i32;
+    let mut bring_up_err = None;
     for output in outputs {
         let w = output.picked.width;
         let h = output.picked.height;
         let mut buffers = Vec::with_capacity(2);
-        let mut buffer_err: Option<io::Error> = None;
+        let mut buffer_err = None;
         for _ in 0..2 {
-            match drm::Buffer::new(Rc::clone(&device), w, h) {
-                Ok(b) => buffers.push(b),
-                Err(e) => {
-                    buffer_err = Some(e);
+            match drm::Buffer::new(Rc::clone(device), w, h) {
+                Ok(buffer) => buffers.push(buffer),
+                Err(err) => {
+                    buffer_err = Some(err);
                     break;
                 }
             }
         }
-        if let Some(e) = buffer_err {
-            bring_up_err = Some(e);
+        if let Some(err) = buffer_err {
+            bring_up_err = Some(err);
             break;
         }
         let initial_fb = buffers[0].fb_id();
-        if let Err(e) = commit(&device, &output, initial_fb) {
-            bring_up_err = Some(e);
+        if let Err(err) = commit(device, &output, initial_fb) {
+            bring_up_err = Some(err);
             break;
         }
         let swapchain = drm::Swapchain::with_initial_scanout(buffers, 0);
@@ -713,10 +718,97 @@ pub(crate) fn platform_init(
         next_x = next_x.saturating_add(i32::from(w));
     }
     if let Some(err) = bring_up_err {
-        for done in layouts.iter().rev() {
-            let _ = drm::modeset::disable_output(&device, &done.output);
+        for done in layouts.iter_mut().rev() {
+            if let Err(disable_err) = drm::modeset::disable_output(device, &done.output) {
+                log::warn!(
+                    "initial scanout rollback: failed to disable {}: {disable_err}; \
+                     leaving its buffers for DRM-fd close",
+                    done.output.connector_name,
+                );
+                done.swapchain.disarm();
+            }
         }
         return Err(err);
+    }
+    Ok(layouts)
+}
+
+/// Shared DRM / outputs / libinput bring-up for the v1 and v2
+/// backends. Extracted in Stage 1b so both `KmsBackend::open_with_commit`
+/// and `KmsBackend::open` use the same code path.
+///
+/// **Vulkan / pipelines / scanout pools / scheduler / pixmap pool**
+/// stay in the v1-specific portion of `open_with_commit` for now —
+/// v2 doesn't build any of that in Stage 1b (paint paths are
+/// stubbed). Stage 2 promotes the appropriate subset into the
+/// real `PlatformBackend` component.
+///
+/// # Errors
+///
+/// Individual DRM-open failures are logged and skipped. Once a device opens,
+/// identity/discovery/commit failures remain fatal. If no device opens, the
+/// returned platform is headless. On bring-up error any output already
+/// committed gets disabled before returning so the next caller starts clean.
+pub(crate) fn platform_init(
+    device_paths: &[PathBuf],
+    commit: fn(
+        &crate::drm::Device,
+        &crate::platform::drm::Output,
+        ::drm::control::framebuffer::Handle,
+    ) -> io::Result<()>,
+) -> io::Result<PlatformInit> {
+    let mut devices = Vec::with_capacity(device_paths.len());
+    let mut layouts = Vec::new();
+    let mut open_errors = Vec::new();
+    for device_path in device_paths {
+        let device_path_str = device_path.to_string_lossy().into_owned();
+        let device = match drm::Device::open(&device_path_str) {
+            Ok(device) => Rc::new(device),
+            Err(err) => {
+                log::warn!(
+                    "yserver: skipping DRM device {}: open failed: {err}",
+                    device_path.display()
+                );
+                open_errors.push(format!("{}: open failed: {err}", device_path.display()));
+                continue;
+            }
+        };
+        let device_key =
+            crate::platform::drm::primary_device_key_from_fd(std::os::fd::AsFd::as_fd(&*device))?;
+
+        let (render_node_fd, render_node_path) = render_node_for_device(&device_path_str, &device);
+        if !devices.is_empty() {
+            log::info!(
+                "yserver: opened secondary KMS device {} as provider/topology data; \
+                 initial scanout remains on the first opened device",
+                device_path.display()
+            );
+        }
+        devices.push(PlatformInitDevice {
+            key: device_key,
+            device,
+            render_node_fd,
+            render_node_path,
+        });
+    }
+
+    // Finish every fallible per-device identity qualification before the
+    // first modeset. Otherwise a bad secondary card could abort startup after
+    // the primary was already scanning out, bypassing the renderer's
+    // construction-wide rollback guard.
+    if let Some(primary) = devices.first() {
+        layouts = activate_initial_scanout_outputs(primary.key, &primary.device, commit)?;
+    }
+
+    if devices.is_empty() {
+        if open_errors.is_empty() {
+            log::info!("platform_init: no DRM devices supplied; starting headless");
+        } else {
+            log::warn!(
+                "platform_init: no DRM devices opened; starting headless. Tried:\n  {}",
+                open_errors.join("\n  ")
+            );
+        }
     }
 
     // fb_w / fb_h carry the virtual-screen extent. Saturating
@@ -744,15 +836,48 @@ pub(crate) fn platform_init(
     };
 
     Ok(PlatformInit {
-        device_key,
-        device,
-        render_node_fd,
-        render_node_path,
+        devices,
         layouts,
         fb_w,
         fb_h,
         input_ctx,
     })
+}
+
+#[cfg(test)]
+mod platform_init_tests {
+    use super::*;
+
+    fn unused_commit(
+        _device: &crate::drm::Device,
+        _output: &crate::platform::drm::Output,
+        _fb: ::drm::control::framebuffer::Handle,
+    ) -> io::Result<()> {
+        unreachable!("a zero-device platform must not commit an output")
+    }
+
+    #[test]
+    fn accepts_empty_device_list_as_headless() {
+        let init = platform_init(&[], unused_commit)
+            .expect("an empty DRM device list should produce a headless platform");
+        assert!(init.devices.is_empty());
+        assert!(init.layouts.is_empty());
+        assert_eq!((init.fb_w, init.fb_h), (0, 0));
+    }
+
+    #[test]
+    fn accepts_all_open_failures_as_headless() {
+        let suffix = std::process::id();
+        let paths = [
+            std::env::temp_dir().join(format!("yserver-missing-drm-{suffix}-a")),
+            std::env::temp_dir().join(format!("yserver-missing-drm-{suffix}-b")),
+        ];
+        let init = platform_init(&paths, unused_commit)
+            .expect("missing DRM paths should produce a headless platform");
+        assert!(init.devices.is_empty());
+        assert!(init.layouts.is_empty());
+        assert_eq!((init.fb_w, init.fb_h), (0, 0));
+    }
 }
 
 /// Parse an AddGlyphs `body_tail` and insert glyphs into `gs`.

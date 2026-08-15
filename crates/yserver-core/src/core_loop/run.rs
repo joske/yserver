@@ -2,8 +2,8 @@
 //!
 //! B4 established the shape; D4 wired `Message::Request` against the
 //! new `process_request` entry point and the lifecycle arms
-//! (SetupAllocate, ClientSetupComplete, ClientDisconnected,
-//! HostInput, PageFlipReady). E3/E4 (DRM + signalfd) and F2
+//! (SetupAllocate, ClientSetupComplete, ClientDisconnected, HostInput).
+//! E3/E4 (DRM + signalfd) and F2
 //! (host-X11) supply the missing token arms; D5 supplies the
 //! listener.
 
@@ -11,7 +11,7 @@ use std::{
     collections::{HashMap, VecDeque},
     io,
     os::{
-        fd::{AsRawFd, OwnedFd},
+        fd::{AsRawFd, OwnedFd, RawFd},
         unix::net::{UnixListener, UnixStream},
     },
     sync::Arc,
@@ -26,8 +26,8 @@ use super::{
     client_io::{self, WriteOutcome},
     message::{HostInputEvent, Message, SetupAllocateResponse},
     poll_tokens::{
-        ClientIdAllocator, DRM_HOTPLUG_TOKEN, DRM_TOKEN, HOST_X11_TOKEN, LIBINPUT_TOKEN,
-        LISTENER_TOKEN, NOTIFY_TOKEN, PRESENT_COMPLETION_TOKEN, client_token, token_to_client,
+        ClientIdAllocator, LISTENER_TOKEN, NOTIFY_TOKEN, backend_token, client_token,
+        token_to_backend_index, token_to_client,
     },
     process_request::{RequestOutcome, fire_present_configure_notify_for_window, process_request},
     sender::{CoreReceiver, CoreSender},
@@ -442,8 +442,8 @@ impl LoopTelemetry {
 /// iteration when GTK fires bursts of RENDER traffic during a
 /// window drag — observed iter_wall_max=6884ms with
 /// drain_max=32857 in one iteration. During that window,
-/// `HostInput` and `PageFlipReady` messages sit in the same
-/// channel undelivered, so the cursor visibly freezes (gap_max
+/// `HostInput` messages and DRM readiness sit undelivered, so the cursor
+/// visibly freezes (gap_max
 /// up to 8.5 seconds between consecutive cursor events).
 ///
 /// 32 chosen as the initial cap because: typical request cost is
@@ -471,7 +471,7 @@ const MAX_REQUESTS_PER_ITER: usize = 32;
 /// individual requests reach **44-50 ms** (`longest=op70:44.23ms`,
 /// `op70:49.61ms`) because a request that closes the open frame
 /// absorbs the whole batch flush. 32 × 44 ms is ~1.4 s inside one
-/// iteration, and `HostInput` / `PageFlipReady` share that channel —
+/// iteration, while `HostInput` and DRM readiness still need service —
 /// so the cursor and the window position stall together
 /// (`gap_max` 225-360 ms between consecutive input events, against
 /// `host_input/s` ≈ 128 arriving fine). The visible symptom is a drag
@@ -486,6 +486,15 @@ const MAX_REQUESTS_PER_ITER: usize = 32;
 /// (one frame at 120 Hz), so this restores the intended design point
 /// rather than picking a new one.
 const REQUEST_TIME_BUDGET: Duration = Duration::from_millis(8);
+
+/// One backend-owned source registered with the core poller. The vector index
+/// is encoded in its mio token, preserving the exact fd identity even when
+/// several entries share one `BackendFdKind`.
+#[derive(Debug, Clone, Copy)]
+struct BackendPollSource {
+    fd: RawFd,
+    kind: BackendFdKind,
+}
 
 /// Whether this iteration's request drain must stop, given how many
 /// requests remain in the count budget and how long the drain has been
@@ -829,16 +838,20 @@ pub fn run_core(
     // the core never sees the libinput fd in production. The Libinput
     // arm is registered defensively in case a backend variant chooses
     // to skip the dedicated thread and run libinput on the core poll.
-    for (fd, kind) in backend.poll_fds() {
-        let token = match kind {
-            BackendFdKind::Drm => DRM_TOKEN,
-            BackendFdKind::DrmHotplug => DRM_HOTPLUG_TOKEN,
-            BackendFdKind::Libinput => LIBINPUT_TOKEN,
-            BackendFdKind::HostX11 => HOST_X11_TOKEN,
-            BackendFdKind::PresentCompletion => PRESENT_COMPLETION_TOKEN,
-        };
+    let backend_poll_sources: Vec<_> = backend
+        .poll_fds()
+        .into_iter()
+        .map(|(fd, kind)| BackendPollSource { fd, kind })
+        .collect();
+    for (index, source) in backend_poll_sources.iter().enumerate() {
+        let token = backend_token(index).ok_or_else(|| {
+            io::Error::other(format!(
+                "backend exposes too many poll fds: {}",
+                backend_poll_sources.len()
+            ))
+        })?;
         poll.registry()
-            .register(&mut SourceFd(&fd), token, Interest::READABLE)?;
+            .register(&mut SourceFd(&source.fd), token, Interest::READABLE)?;
     }
 
     // Probe input devices at startup, Xorg-style: drain libinput's
@@ -976,6 +989,54 @@ pub fn run_core(
             drain_start,
         );
         for ev in events.iter() {
+            if let Some(index) = token_to_backend_index(ev.token()) {
+                let Some(source) = backend_poll_sources.get(index).copied() else {
+                    warn!(
+                        "core_loop::run: backend poll token {:?} has no source",
+                        ev.token()
+                    );
+                    continue;
+                };
+                match source.kind {
+                    BackendFdKind::Drm => {
+                        // Drain only the DRM device whose fd became readable.
+                        // `receive_events()` may block on an idle device, so a
+                        // multi-device backend must retain this exact identity.
+                        if telemetry.enabled {
+                            telemetry.page_flip_count += 1;
+                        }
+                        backend.on_page_flip_ready(state, source.fd);
+                    }
+                    BackendFdKind::DrmHotplug => {
+                        backend.on_display_hotplug(state);
+                    }
+                    BackendFdKind::Libinput => {
+                        // Optional core-owned libinput path. Direct KMS does
+                        // not expose this fd because its input thread owns it.
+                        backend.on_libinput_ready(state);
+                    }
+                    BackendFdKind::HostX11 => {
+                        // Drain host frames into the backend's pending
+                        // reply/event queues. Fanout remains at the outer-loop
+                        // boundary to avoid recursive dispatch.
+                        match backend.drain_host_socket() {
+                            Ok(HostSocketStatus::WouldBlock) => {}
+                            Ok(HostSocketStatus::Eof) => {
+                                log::info!("host X11 connection closed; shutting down");
+                                return Ok(());
+                            }
+                            Err(err) => {
+                                log::warn!("drain_host_socket: {err}");
+                                return Ok(());
+                            }
+                        }
+                    }
+                    BackendFdKind::PresentCompletion => {
+                        drain_present_completions(state, backend);
+                    }
+                }
+                continue;
+            }
             match ev.token() {
                 LISTENER_TOKEN => {
                     if let Some(listener) = listener.as_ref() {
@@ -987,47 +1048,6 @@ pub fn run_core(
                             &auth,
                         );
                     }
-                }
-                DRM_TOKEN => {
-                    // DRM completion event(s). Backend drains
-                    // page-flip completions and submits the next
-                    // composite/flip if the screen is dirty. mio is
-                    // edge-triggered; the backend itself owns
-                    // batching, so this dispatch never coalesces.
-                    if telemetry.enabled {
-                        telemetry.page_flip_count += 1;
-                    }
-                    backend.on_page_flip_ready(state);
-                }
-                DRM_HOTPLUG_TOKEN => {
-                    backend.on_display_hotplug(state);
-                }
-                LIBINPUT_TOKEN => {
-                    // Optional core-owned libinput path. Direct KMS never
-                    // registers this fd because the input thread owns libinput.
-                    backend.on_libinput_ready(state);
-                }
-                HOST_X11_TOKEN => {
-                    // F2: host X11 connection is readable. Drain
-                    // whatever frames are buffered into the backend's
-                    // pending_replies / pending_events queues. Fanout
-                    // happens at the outer-loop boundary so a host
-                    // request issued from inside fanout cannot
-                    // recursively re-enter event dispatch.
-                    match backend.drain_host_socket() {
-                        Ok(HostSocketStatus::WouldBlock) => {}
-                        Ok(HostSocketStatus::Eof) => {
-                            log::info!("host X11 connection closed; shutting down");
-                            return Ok(());
-                        }
-                        Err(err) => {
-                            log::warn!("drain_host_socket: {err}");
-                            return Ok(());
-                        }
-                    }
-                }
-                PRESENT_COMPLETION_TOKEN => {
-                    drain_present_completions(state, backend);
                 }
                 NOTIFY_TOKEN => {
                     let mut channel_requests = 0_usize;
@@ -1108,12 +1128,6 @@ pub fn run_core(
                                 }
                                 handle_host_input(state, backend, ev);
                                 backend.mark_dirty();
-                            }
-                            Message::PageFlipReady => {
-                                if telemetry.enabled {
-                                    telemetry.page_flip_count += 1;
-                                }
-                                backend.on_page_flip_ready(state);
                             }
                             Message::VtRelease => {
                                 // When VT switching isn't armed there is no
@@ -2556,10 +2570,9 @@ mod tests {
     /// request (`MAX_REQUESTS_PER_ITER`'s own doc comment). Measured on
     /// silence under MATE + adapta-nokto during a window drag, single
     /// requests reach 44-50 ms (`longest=op70:44.23ms`), so 32 of them
-    /// is ~1.4 s in one iteration — during which `HostInput` and
-    /// `PageFlipReady` sit undelivered in the same channel and the
-    /// cursor visibly stalls (`gap_max` 225-360 ms). These pin the
-    /// deadline half of the budget.
+    /// is ~1.4 s in one iteration — during which host input and backend-fd
+    /// readiness sit undelivered and the cursor visibly stalls (`gap_max`
+    /// 225-360 ms). These pin the deadline half of the budget.
     #[test]
     fn budget_not_exhausted_when_both_count_and_time_remain() {
         assert!(!budget_exhausted(31, Duration::from_millis(1)));
@@ -2915,18 +2928,32 @@ mod tests {
         drop(peer);
     }
 
-    /// E3 liveness test: back-to-back `PageFlipReady` messages each
-    /// reach `Backend::on_page_flip_ready` — no dedup, no rate-limit,
-    /// no message-coalescing. Codex's missing-test bullet for E3.
+    /// Multi-device regression: two DRM fds of the same kind must get
+    /// distinct poll tokens, and readiness on the second fd must carry
+    /// that exact fd through `Backend::on_page_flip_ready`.
     #[test]
-    fn back_to_back_page_flip_ready_dispatches_each_time() {
-        use crate::backend::recording::RecordingBackend;
-        use std::sync::atomic::Ordering;
+    fn drm_readiness_routes_to_the_exact_backend_fd() {
+        use crate::backend::{BackendFdKind, recording::RecordingBackend};
+        use std::{io::Write, os::fd::AsRawFd};
 
         let (poll, sender, rx) = channel().unwrap();
         let sender_for_core = sender.clone_handle();
-        let mut backend = RecordingBackend::new();
+        let (drm_reader_a, _drm_writer_a) = UnixStream::pair().unwrap();
+        let (drm_reader_b, mut drm_writer_b) = UnixStream::pair().unwrap();
+        let drm_fd_a = drm_reader_a.as_raw_fd();
+        let drm_fd_b = drm_reader_b.as_raw_fd();
+        let (ready_tx, ready_rx) = crossbeam_channel::unbounded();
+        let mut backend = RecordingBackend::new().with_poll_sources(
+            vec![
+                (drm_fd_a, BackendFdKind::Drm),
+                (drm_fd_b, BackendFdKind::Drm),
+            ],
+            ready_tx,
+        );
         let handle = std::thread::spawn(move || {
+            // `RecordingBackend` intentionally stores only raw fds; keep
+            // their owners alive for the duration of the core loop.
+            let _drm_readers = (drm_reader_a, drm_reader_b);
             let mut state = ServerState::new();
             let alloc = ClientIdAllocator::new();
             let result = run_core(
@@ -2941,23 +2968,29 @@ mod tests {
             );
             (result, backend)
         });
-        for _ in 0..3 {
-            sender.send(Message::PageFlipReady).unwrap();
-        }
+
+        drm_writer_b.write_all(&[1]).unwrap();
+        assert_eq!(
+            ready_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            drm_fd_b,
+            "readiness from the second DRM source must retain its fd identity"
+        );
         sender.send(Message::Shutdown).unwrap();
-        for _ in 0..50 {
-            if handle.is_finished() {
-                break;
-            }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !handle.is_finished() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(handle.is_finished(), "run_core did not return");
         let (result, backend) = handle.join().unwrap();
         result.unwrap();
-        assert_eq!(
-            backend.page_flip_count.load(Ordering::Relaxed),
-            3,
-            "expected 3 on_page_flip_ready dispatches",
+        let dispatched_fds = backend.page_flip_fds.lock().unwrap();
+        assert!(
+            !dispatched_fds.is_empty(),
+            "the readable DRM source must be dispatched"
+        );
+        assert!(
+            dispatched_fds.iter().all(|fd| *fd == drm_fd_b),
+            "idle DRM fd {drm_fd_a} was dispatched: {dispatched_fds:?}",
         );
     }
 
@@ -2968,7 +3001,7 @@ mod tests {
     /// display was dark (DPMS-off / standby / VT-away) no flips occurred,
     /// so a client that kept drawing grew the engine `submitted` queue
     /// without bound until the GPU lost its device. Here we run the loop
-    /// with ZERO `PageFlipReady` messages and assert `before_block` still
+    /// with ZERO DRM readiness events and assert `before_block` still
     /// fired — i.e. reclamation rides the dispatch loop, not scanout.
     #[test]
     fn before_block_runs_without_any_page_flip() {
@@ -2993,7 +3026,7 @@ mod tests {
             );
             (result, backend)
         });
-        // No PageFlipReady — only a Shutdown. The loop must still run at
+        // No DRM readiness — only a Shutdown. The loop must still run at
         // least one iteration, calling before_block before it blocks.
         sender.send(Message::Shutdown).unwrap();
         // Generous deadline so a slow/loaded CI box can't spuriously fail:

@@ -447,6 +447,21 @@ pub(crate) enum ConnectorConfig {
     },
 }
 
+/// Reconcile the physical-output gate after a successful CRTC mutation.
+///
+/// Enabling or reconfiguring an output commits an active mode, so it opens the
+/// gate. Disabling the last output closes it. Disabling one output while other
+/// outputs remain preserves the prior state: those survivors may already be
+/// dark because DPMS is off, and an unrelated disable must not claim that they
+/// were re-lit.
+fn kms_outputs_active_after_crtc_config(
+    was_active: bool,
+    request_enabled: bool,
+    live_output_count: usize,
+) -> bool {
+    live_output_count != 0 && (was_active || request_enabled)
+}
+
 /// One connector the backend has ever seen.
 // Fields consumed by later RANDR output-management tasks (reprobe,
 // SetCrtcConfig apply, layout preservation); storage only here.
@@ -765,10 +780,11 @@ pub struct KmsBackend {
     /// `DrawableStore`, patterned fills must still use the last image.
     pub(crate) fill_pattern_cache: Option<FillPatternCache>,
 
-    /// Cached binary KMS power state. `true` at startup (outputs
-    /// come up active); mutated only by `set_dpms_power`. Lets
-    /// `set_dpms_power` no-op when called for Standby→Suspend /
-    /// Suspend→Off (same binary state, different protocol level).
+    /// Cached binary KMS power state. `true` when at least one live output is
+    /// lit; `false` during DPMS/VT blackout or when the active-output
+    /// inventory is empty. Lets `set_dpms_power` no-op when called for
+    /// Standby→Suspend / Suspend→Off (same binary state, different protocol
+    /// level), and lets Present avoid waiting for a clock that cannot advance.
     pub(crate) kms_outputs_active: bool,
 
     /// Test-only counter: bumps every time
@@ -1397,10 +1413,10 @@ impl KmsBackend {
                 })
             })
             .collect::<io::Result<_>>()?;
-        crate::drm::modeset::submit_composed_scanout(
-            &self.platform.primary_device().device,
-            &planes,
-        )?;
+        let primary = self.platform.primary_device().ok_or_else(|| {
+            io::Error::other("scanout M2: composed unflip requested without a KMS device")
+        })?;
+        crate::drm::modeset::submit_composed_scanout(&primary.device, &planes)?;
         self.scanout_m2.unflip_awaiting_outputs = (0..planes.len()).collect();
         log::info!(
             "scanout_m2: submitted atomic composed unflip outputs={}",
@@ -1634,8 +1650,15 @@ impl KmsBackend {
                 src_h: u32::from(layout.height),
             })
             .collect();
+        let Some(primary) = self.platform.primary_device() else {
+            self.scanout_m1
+                .entries
+                .insert(source_id, ScanoutM1ProbeEntry::rejected());
+            self.scanout_m0.m1_probe_reject = self.scanout_m0.m1_probe_reject.saturating_add(1);
+            return;
+        };
         let result = crate::drm::modeset::probe_direct_scanout_test_only(
-            Rc::clone(&self.platform.primary_device().device),
+            Rc::clone(&primary.device),
             fd.as_fd(),
             u32::from(width),
             u32::from(height),
@@ -2331,12 +2354,12 @@ impl KmsBackend {
     /// `PlatformBackend::open_with_commit`, plus FontLoader / XKB
     /// init failures from `KmsCore::new`.
     pub fn open(
-        device_path: &str,
+        device_paths: &[std::path::PathBuf],
         console_guard: crate::kms::ConsoleGuardOpt,
         layout: Option<String>,
     ) -> io::Result<Self> {
         Self::open_with_commit(
-            device_path,
+            device_paths,
             console_guard,
             layout,
             drm::modeset::commit_modeset,
@@ -2344,7 +2367,7 @@ impl KmsBackend {
     }
 
     fn open_with_commit(
-        device_path: &str,
+        device_paths: &[std::path::PathBuf],
         console_guard: crate::kms::ConsoleGuardOpt,
         layout: Option<String>,
         commit: fn(
@@ -2353,7 +2376,7 @@ impl KmsBackend {
             ::drm::control::framebuffer::Handle,
         ) -> io::Result<()>,
     ) -> io::Result<Self> {
-        let platform = PlatformBackend::open_with_commit(device_path, commit)?;
+        let platform = PlatformBackend::open_with_commit(device_paths, commit)?;
         let (fb_w, fb_h) = (platform.fb_w, platform.fb_h);
         let mut core = KmsCore::new(fb_w, fb_h, layout)?;
         // Warp the pointer to the centre of the primary output at startup
@@ -2371,6 +2394,7 @@ impl KmsBackend {
             .vk
             .as_ref()
             .is_some_and(probe_dmabuf_export_support);
+        let kms_outputs_active = !platform.outputs.is_empty();
         let mut b = Self {
             core,
             platform,
@@ -2394,7 +2418,7 @@ impl KmsBackend {
             depth1_mask_cache: crate::kms::backend::Depth1MaskCache::new(256),
             clip_mask_snapshot: None,
             fill_pattern_cache: None,
-            kms_outputs_active: true,
+            kms_outputs_active,
             clear_window_area_calls: 0,
             engine_copy_area_calls: 0,
             recent_present_pixmaps: std::collections::VecDeque::with_capacity(32),
@@ -2446,6 +2470,10 @@ impl KmsBackend {
             log::warn!("render: software cursor init failed: {e:?} — no visible cursor");
         }
         b.arm_direct_vt_switching();
+        // Every fallible outer-constructor step has now succeeded. Normal
+        // shutdown owns modeset teardown from here; construction errors above
+        // let PlatformBackend::drop roll back the initial scanout first.
+        b.platform.disarm_initial_scanout_rollback();
         Ok(b)
     }
 
@@ -3066,7 +3094,13 @@ impl KmsBackend {
         for (i, layout) in base.platform.outputs.iter().enumerate() {
             let pool = crate::kms::vk::scanout::ScanoutBoPool::allocate(
                 Arc::clone(&vk),
-                Rc::clone(&base.platform.primary_device().device),
+                Rc::clone(
+                    &base
+                        .platform
+                        .primary_device()
+                        .expect("live-scene fixture has a DRM device")
+                        .device,
+                ),
                 u32::from(layout.width),
                 u32::from(layout.height),
                 3,
@@ -4278,11 +4312,11 @@ impl KmsBackend {
         use yserver_core::randr::{ModeTiming, RandrMode, RandrOutput};
 
         // Provider ids share the same XID source as outputs, CRTCs, and modes
-        // even before providers are exposed on the wire. Reserving the primary
-        // device now keeps all later identities stable and collision-free.
-        let _ = self
-            .randr_id_alloc
-            .provider_id_for(self.platform.primary_device().key);
+        // even before providers are exposed on the wire. Reserve every opened
+        // device now so later provider identities stay stable and collision-free.
+        for device in &self.platform.devices {
+            let _ = self.randr_id_alloc.provider_id_for(device.key);
+        }
 
         let live_keys: HashSet<OutputKey> = self
             .platform
@@ -7230,7 +7264,10 @@ impl KmsBackend {
         if self.crtc_queue_sequence_unsupported {
             return Ok(0);
         }
-        let device = Rc::clone(&self.platform.primary_device().device);
+        let Some(primary) = self.platform.primary_device() else {
+            return Ok(0);
+        };
+        let device = Rc::clone(&primary.device);
         let mut newly_unsupported = false;
         let result = self.arm_idle_vblanks_with(target_mscs, |crtc_id| {
             match crate::drm::page_flip::queue_crtc_sequence(
@@ -7436,7 +7473,7 @@ impl KmsBackend {
         //     this brings the binary cache into agreement so a later DPMS
         //     Off request actually fires the modeset commit instead of
         //     no-opping through the same-binary-state guard.
-        self.kms_outputs_active = true;
+        self.kms_outputs_active = !self.platform.outputs.is_empty();
 
         // 3. Re-arm the hardware cursor plane. Use the current cursor
         //    position + effective cursor hotspot.
@@ -7565,7 +7602,7 @@ impl KmsBackend {
         self.update_input_extent(new_fb_w, new_fb_h);
 
         if state.dpms.power_level == 0 {
-            self.kms_outputs_active = true;
+            self.kms_outputs_active = !self.platform.outputs.is_empty();
         }
 
         let (w, h) = (state.randr.screen_width, state.randr.screen_height);
@@ -12557,7 +12594,7 @@ impl Backend for KmsBackend {
         }
     }
 
-    fn on_page_flip_ready(&mut self, _state: &mut ServerState) {
+    fn on_page_flip_ready(&mut self, _state: &mut ServerState, drm_fd: std::os::fd::RawFd) {
         // Gate: when not Active we have no DRM master; page-flip events
         // are drained (so the fd doesn't stay readable) but no resubmit
         // or flush_submit_group runs. In Direct mode this is always false
@@ -12567,7 +12604,7 @@ impl Backend for KmsBackend {
             // state) but STILL run the sequence handler so the armed-target
             // map clears — leaving a stuck entry across suspend is exactly
             // the permanent-stall failure mode this guards against.
-            if let Ok((_flips, sequences)) = self.platform.drain_page_flip_events() {
+            if let Ok((_flips, sequences)) = self.platform.drain_page_flip_events(drm_fd) {
                 for seq in sequences {
                     self.on_crtc_sequence_event(
                         seq.device_key,
@@ -12580,7 +12617,7 @@ impl Backend for KmsBackend {
             log::debug!("render on_page_flip_ready: skipped (seat not Active)");
             return;
         }
-        let (flipped, sequences) = match self.platform.drain_page_flip_events() {
+        let (flipped, sequences) = match self.platform.drain_page_flip_events(drm_fd) {
             Ok(pair) => pair,
             Err(e) => {
                 log::warn!("render: drain_page_flip_events failed: {e}");
@@ -13135,11 +13172,12 @@ impl Backend for KmsBackend {
                 src_h: u32::from(layout.height),
             })
             .collect();
-        if let Err(error) = crate::drm::modeset::submit_direct_scanout(
-            &self.platform.primary_device().device,
-            fb,
-            &plane_states,
-        ) {
+        let primary = self.platform.primary_device().ok_or_else(|| {
+            io::Error::other("direct scanout submitted without an opened KMS device")
+        })?;
+        if let Err(error) =
+            crate::drm::modeset::submit_direct_scanout(&primary.device, fb, &plane_states)
+        {
             <Self as Backend>::release_present_source(self, source_pin);
             <Self as Backend>::release_present_source(self, fallback_target_pin);
             self.scanout_m2.reset_eligible_root_probation();
@@ -13338,8 +13376,7 @@ impl Backend for KmsBackend {
                     let v = self
                         .platform
                         .primary_device()
-                        .render_node_device
-                        .as_ref()
+                        .and_then(|device| device.render_node_device.as_ref())
                         .is_some_and(crate::kms::render::imported_syncobj::eventfd_supported);
                     self.syncobj_eventfd_supported = Some(v);
                     if !v {
@@ -13535,7 +13572,10 @@ impl Backend for KmsBackend {
         if self.crtc_queue_sequence_unsupported {
             return Ok(0);
         }
-        let device = Rc::clone(&self.platform.primary_device().device);
+        let Some(primary) = self.platform.primary_device() else {
+            return Ok(0);
+        };
+        let device = Rc::clone(&primary.device);
         let mut newly_unsupported = false;
         let result = self.arm_present_absolute_vblank_with(targets, |crtc_id, target| {
             match crate::drm::page_flip::queue_crtc_sequence(
@@ -13726,8 +13766,11 @@ impl Backend for KmsBackend {
         // properties and modifiers and computes hypothetical assignments;
         // under Cinnamon/GPU load that unrelated work blocked dispatch for
         // 90–113 ms every time the desktop polled GetScreenResources.
-        let device_key = self.platform.primary_device().key;
-        let device = Rc::clone(&self.platform.primary_device().device);
+        let Some(primary) = self.platform.primary_device() else {
+            return Ok(());
+        };
+        let device_key = primary.key;
+        let device = Rc::clone(&primary.device);
         let probes = crate::platform::drm::probe_connectors(&device)?;
         let changed = reconcile_connector_probe(&mut self.randr_id_alloc, device_key, &probes);
         // Pure re-probe: never bumps lastSetTime (set_time = None); bumps
@@ -13813,6 +13856,26 @@ impl Backend for KmsBackend {
             let entry = self.randr_id_alloc.entry_mut(&output_key);
             entry.config = requested;
             return Ok(false);
+        }
+
+        // An opened card may have started with no connected outputs, in which
+        // case software Vulkan is valid for headless X rendering. Refuse the
+        // first later RANDR scanout enable unless the same explicit override
+        // accepted by startup is present; exporting a software-Vulkan BO to
+        // real KMS can hard-hang the machine.
+        if mode.is_some()
+            && self
+                .platform
+                .vk
+                .as_ref()
+                .is_some_and(|vk| vk.is_software_rasterizer())
+            && std::env::var_os("YSERVER_ALLOW_SOFTWARE_VULKAN").is_none()
+        {
+            return Err(io::Error::other(format!(
+                "apply_crtc_config: refusing to enable {connector} with a software Vulkan \
+                 renderer; install a hardware Vulkan driver or set \
+                 YSERVER_ALLOW_SOFTWARE_VULKAN=1 for a deliberate software-scanout setup"
+            )));
         }
 
         // ── Flip-safety: quiesce exactly like fire_randr_changes ──────────
@@ -13936,6 +13999,17 @@ impl Backend for KmsBackend {
                 );
             }
         }
+
+        // The KMS mutation above has already taken effect, even if the scene
+        // rebuild below fails. Reconcile the Present/compositor power gate
+        // now so a first output enabled from a headless start can render, and
+        // disabling the final output cannot leave Present parked on a vblank
+        // clock that no longer exists.
+        self.kms_outputs_active = kms_outputs_active_after_crtc_config(
+            self.kms_outputs_active,
+            matches!(requested, ConnectorConfig::Enabled { .. }),
+            self.platform.outputs.len(),
+        );
 
         // ── Scene + RANDR rebuild ─────────────────────────────────────────
         if let Err(e) = self.scene.rebuild_outputs(&self.platform) {
@@ -19196,8 +19270,7 @@ impl Backend for KmsBackend {
         let path = self
             .platform
             .primary_device()
-            .render_node_path
-            .as_deref()
+            .and_then(|device| device.render_node_path.as_deref())
             .ok_or_else(|| {
                 io::Error::other("DRI3 unavailable — render node was not resolved at backend init")
             })?;
@@ -19211,8 +19284,10 @@ impl Backend for KmsBackend {
         // both. `render_node_device` is the guard here (not the bare
         // `render_node_fd`) because it is what the syncobj ioctls and the
         // capability query run on.
-        if self.platform.primary_device().render_node_device.is_none() || self.platform.vk.is_none()
-        {
+        let Some(primary) = self.platform.primary_device() else {
+            return Dri3Caps::unsupported();
+        };
+        if primary.render_node_device.is_none() || self.platform.vk.is_none() {
             return Dri3Caps::unsupported();
         }
         let vk = self.platform.vk.as_ref().expect("vk Some by branch above");
@@ -19224,7 +19299,7 @@ impl Backend for KmsBackend {
         // driver. The previous NVIDIA blacklist here was a correct response
         // to vkImportSemaphoreFdKHR rejecting DRM syncobj fds, which no
         // longer matters because nothing imports them into Vulkan.
-        let syncobj = self.platform.primary_device().syncobj_timeline;
+        let syncobj = primary.syncobj_timeline;
         Dri3Caps {
             version: dri3_version_for(syncobj),
             modifiers,
@@ -19577,8 +19652,7 @@ impl Backend for KmsBackend {
         let render_node = self
             .platform
             .primary_device()
-            .render_node_device
-            .as_ref()
+            .and_then(|device| device.render_node_device.as_ref())
             .cloned()
             .ok_or_else(|| {
                 io::Error::other("DRI3 ImportSyncobj: render node not resolved at init")
@@ -20566,7 +20640,7 @@ impl Backend for KmsBackend {
             // stale. Force a fresh full frame on the next composite tick.
             self.scene.wake_for_damage();
             if res.is_ok() {
-                self.kms_outputs_active = true;
+                self.kms_outputs_active = !self.platform.outputs.is_empty();
             }
             res
         } else {
@@ -20927,7 +21001,10 @@ mod tests {
         platform::drm::DrmDeviceKey,
     };
     use std::collections::HashMap;
-    use yserver_core::{backend::Backend, server::ServerState};
+    use yserver_core::{
+        backend::{Backend, Dri3Caps},
+        server::ServerState,
+    };
 
     fn test_device_key(minor: u32) -> DrmDeviceKey {
         DrmDeviceKey { major: 226, minor }
@@ -20943,7 +21020,11 @@ mod tests {
         time_ns: i64,
         sequence: u64,
     ) {
-        let device_key = backend.platform.primary_device().key;
+        let device_key = backend
+            .platform
+            .primary_device()
+            .expect("test fixture has a DRM device")
+            .key;
         backend.on_crtc_sequence_event(device_key, user_data, time_ns, sequence);
     }
 
@@ -21634,7 +21715,10 @@ mod tests {
         assert_eq!(b.platform.outputs.len(), 1);
         assert_eq!(
             b.platform.outputs[0].key.device_key,
-            b.platform.primary_device().key
+            b.platform
+                .primary_device()
+                .expect("test fixture has a DRM device")
+                .key
         );
     }
 
@@ -21654,7 +21738,11 @@ mod tests {
         }
 
         let mut b = KmsBackend::for_tests();
-        let device_key = b.platform.primary_device().key;
+        let device_key = b
+            .platform
+            .primary_device()
+            .expect("test fixture has a DRM device")
+            .key;
         let dp1_key = OutputKey::new(device_key, "DP-1");
         let dp2_key = OutputKey::new(device_key, "DP-2");
         let hdmi_key = OutputKey::new(device_key, "HDMI-A-1");
@@ -21732,7 +21820,13 @@ mod tests {
     #[test]
     fn randr_output_mode_ids_have_no_duplicate_xids() {
         let mut b = KmsBackend::for_tests();
-        let hdmi_key = OutputKey::new(b.platform.primary_device().key, "HDMI-A-1");
+        let hdmi_key = OutputKey::new(
+            b.platform
+                .primary_device()
+                .expect("test fixture has a DRM device")
+                .key,
+            "HDMI-A-1",
+        );
         {
             let e = b.randr_id_alloc.entry_mut(&hdmi_key);
             e.connected = true;
@@ -21768,8 +21862,13 @@ mod tests {
     #[test]
     fn not_live_output_reports_connected_off_vs_disconnected() {
         let mut b = KmsBackend::for_tests();
-        let hdmi_key = OutputKey::new(b.platform.primary_device().key, "HDMI-A-1");
-        let dp_key = OutputKey::new(b.platform.primary_device().key, "DP-3");
+        let device_key = b
+            .platform
+            .primary_device()
+            .expect("test fixture has a DRM device")
+            .key;
+        let hdmi_key = OutputKey::new(device_key, "HDMI-A-1");
+        let dp_key = OutputKey::new(device_key, "DP-3");
 
         // Hotplugged, registered OFF (the Task 5.2 add-path outcome).
         {
@@ -28391,7 +28490,10 @@ mod tests {
 
         let b = KmsBackend::for_tests();
         assert!(
-            !b.platform.primary_device().syncobj_timeline,
+            !b.platform
+                .primary_device()
+                .expect("test fixture has a DRM device")
+                .syncobj_timeline,
             "for_tests() has no render node, so the capability must be false",
         );
     }
@@ -28583,7 +28685,10 @@ mod tests {
         // directly; the OwnedFd's Drop closes it.
         let fd = unsafe { OwnedFd::from_raw_fd(f.into_raw_fd()) };
         let mut b = KmsBackend::for_tests();
-        b.platform.primary_device_mut().render_node_device = Some(std::sync::Arc::new(
+        b.platform
+            .primary_device_mut()
+            .expect("test fixture has a DRM device")
+            .render_node_device = Some(std::sync::Arc::new(
             crate::drm::Device::open_render_node("/dev/null").expect("open /dev/null"),
         ));
         assert!(
@@ -32029,7 +32134,10 @@ mod tests {
     fn push_test_output(b: &mut super::KmsBackend, crtc_id: u32) {
         use crate::kms::backend::ActiveOutput;
         b.platform.outputs.push(ActiveOutput::new(
-            b.platform.primary_device().key,
+            b.platform
+                .primary_device()
+                .expect("test fixture has a DRM device")
+                .key,
             crate::platform::drm::Output {
                 connector: ::drm::control::from_u32(crtc_id).unwrap(),
                 connector_name: "test2".to_string(),
@@ -32156,6 +32264,51 @@ mod tests {
             b.present_scanout_blackout(),
             "kms_outputs_active=false must blackout even while scanout_allowed()"
         );
+    }
+
+    #[test]
+    fn crtc_enable_from_zero_outputs_opens_kms_output_gate() {
+        assert!(super::kms_outputs_active_after_crtc_config(false, true, 1));
+    }
+
+    #[test]
+    fn crtc_disable_last_output_closes_kms_output_gate() {
+        assert!(!super::kms_outputs_active_after_crtc_config(true, false, 0));
+    }
+
+    #[test]
+    fn headless_output_inventory_keeps_present_in_blackout() {
+        let mut b = super::KmsBackend::for_tests();
+        b.platform.outputs.clear();
+        b.kms_outputs_active = !b.platform.outputs.is_empty();
+
+        assert!(b.scanout_allowed(), "the fixture VT remains active");
+        assert!(
+            b.present_scanout_blackout(),
+            "zero active outputs must flush Present through blackout fallback instead of parking for an MSC that cannot advance"
+        );
+    }
+
+    #[test]
+    fn zero_device_backend_disables_dri3_and_vblank_arms() {
+        let mut b = super::KmsBackend::for_tests();
+        b.platform.devices.clear();
+        b.platform.outputs.clear();
+        b.kms_outputs_active = false;
+
+        assert!(b.platform.primary_device().is_none());
+        assert_eq!(b.dri3_capabilities(), Dri3Caps::unsupported());
+        assert!(b.dri3_open(0).is_err());
+        assert_eq!(
+            b.arm_idle_vblanks_ioctl(&[1]).expect("relative arm no-op"),
+            0
+        );
+        assert_eq!(
+            b.arm_present_absolute_vblank(&[1])
+                .expect("absolute arm no-op"),
+            0
+        );
+        assert!(b.present_scanout_blackout());
     }
 
     #[test]
