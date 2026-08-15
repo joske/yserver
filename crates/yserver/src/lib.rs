@@ -4,6 +4,7 @@ pub mod input;
 pub mod input_thread;
 pub mod kms;
 pub mod launch;
+pub(crate) mod platform;
 pub mod present;
 pub mod version;
 mod vt;
@@ -311,7 +312,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     let console_guard = crate::kms::console::ConsoleGuard::acquire(opts.vt)?;
     #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     let console_guard: Option<()> = None;
-    let device_path = resolve_drm_device()?;
+    let device_path = crate::platform::drm::resolve_default_kms_device()?;
     log::info!("yserver: opening DRM device {device_path}");
 
     // Always Direct (self-managed DRM master + VT_PROCESS): open DRM +
@@ -642,131 +643,6 @@ fn build_kms_backend(
     crate::kms::render::KmsBackend::open(device_path, console_guard, layout)
 }
 
-/// A KMS-capable `/dev/dri/card*` node, tagged with whether it currently has a
-/// display attached. Built by [`resolve_drm_device`] while probing.
-struct DrmCandidate {
-    path: String,
-    has_connected_connector: bool,
-}
-
-/// Choose a DRM device from KMS-capable candidates, preferring one that has at
-/// least one connected connector.
-///
-/// `candidates` must be in priority order (lexicographic by path, matching the
-/// historical behaviour). The first candidate with a connected connector wins;
-/// if none report a connection we fall back to the first candidate. The
-/// fallback preserves the headless / `vng` path, where connectors are absent
-/// until `--graphics` is requested and `discover_outputs` errors downstream.
-fn pick_drm_candidate(candidates: &[DrmCandidate]) -> Option<&DrmCandidate> {
-    candidates
-        .iter()
-        .find(|c| c.has_connected_connector)
-        .or_else(|| candidates.first())
-}
-
-fn resolve_drm_device() -> io::Result<String> {
-    if let Ok(explicit) = std::env::var("YSERVER_DRM_DEVICE") {
-        return Ok(explicit);
-    }
-    // Split-driver systems expose a render-only card alongside the
-    // KMS card. On Asahi (M1 / M2): `asahi` GPU is card0 (render-only,
-    // MODE_GETRESOURCES → EOPNOTSUPP); `apple-drm` is card2 (KMS).
-    // On AMD/Intel hybrid laptops similar layouts occur. The pre-asahi
-    // resolver only probed card0/card1 and didn't distinguish render-
-    // only nodes, so it would pick a card whose first KMS ioctl then
-    // fails. Probe each /dev/dri/card* by attempting MODE_GETRESOURCES
-    // (drm-rs's `resource_handles`) and keep every one that succeeds.
-    //
-    // KMS-capable is necessary but not sufficient: on hybrid setups the
-    // iGPU is often KMS-capable yet has no display attached, while the
-    // dGPU drives the monitor. Sorting lexicographically and taking the
-    // first KMS card then picks the dead iGPU (issue #62 / discussion
-    // #56). So we additionally probe connectors and prefer a card with a
-    // connected display, falling back to the first KMS card otherwise.
-    use ::drm::control::{Device as _, connector};
-
-    let mut entries: Vec<PathBuf> = match fs::read_dir("/dev/dri") {
-        Ok(it) => it
-            .filter_map(Result::ok)
-            .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("card"))
-            })
-            .collect(),
-        Err(err) => {
-            return Err(io::Error::new(
-                err.kind(),
-                format!("read_dir(/dev/dri): {err}"),
-            ));
-        }
-    };
-    entries.sort();
-
-    let mut candidates: Vec<DrmCandidate> = Vec::new();
-    let mut reasons: Vec<String> = Vec::new();
-    for path in entries {
-        let path_str = match path.to_str() {
-            Some(s) => s.to_string(),
-            None => continue,
-        };
-        let device = match drm::Device::open(&path_str) {
-            Ok(d) => d,
-            Err(err) => {
-                log::info!("yserver: skipping {path_str}: open failed: {err}");
-                reasons.push(format!("{path_str}: open failed: {err}"));
-                continue;
-            }
-        };
-        // Render-only drivers (asahi GPU, etc.) return EOPNOTSUPP here.
-        // Anything else (success or some other error) we trust — let the
-        // caller surface a downstream error rather than masking it.
-        let resources = match device.resource_handles() {
-            Ok(r) => r,
-            Err(err) => {
-                log::info!("yserver: skipping {path_str}: not KMS-capable: {err}");
-                reasons.push(format!("{path_str}: not KMS-capable: {err}"));
-                // device drops here, releasing master.
-                continue;
-            }
-        };
-        // Use the cached connector state (force_probe = false), matching
-        // `discover_outputs`; a full probe per card on startup is needless.
-        let has_connected_connector = resources.connectors().iter().any(|&handle| {
-            device
-                .get_connector(handle, false)
-                .is_ok_and(|info| info.state() == connector::State::Connected)
-        });
-        log::info!(
-            "yserver: candidate {path_str}: KMS-capable, connected_display={has_connected_connector}"
-        );
-        candidates.push(DrmCandidate {
-            path: path_str,
-            has_connected_connector,
-        });
-    }
-
-    if let Some(chosen) = pick_drm_candidate(&candidates) {
-        log::info!(
-            "yserver: selected DRM device {} (connected_display={})",
-            chosen.path,
-            chosen.has_connected_connector
-        );
-        return Ok(chosen.path.clone());
-    }
-
-    Err(io::Error::other(format!(
-        "no KMS-capable DRM device found under /dev/dri. Tried:\n  {}\n\
-         Override with YSERVER_DRM_DEVICE=/dev/dri/cardN.",
-        if reasons.is_empty() {
-            "(no /dev/dri/card* entries)".to_string()
-        } else {
-            reasons.join("\n  ")
-        }
-    )))
-}
-
 #[cfg(target_os = "linux")]
 fn block_termination_signals() -> io::Result<SignalFd> {
     let mut mask = SigSet::empty();
@@ -869,63 +745,14 @@ fn block_termination_signals() -> io::Result<nix::sys::event::Kqueue> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DrmCandidate, InputStartup, ensure_input_devices_opened, input_startup_action,
-        install_backend_root_bindings, pick_drm_candidate,
+        InputStartup, ensure_input_devices_opened, input_startup_action,
+        install_backend_root_bindings,
     };
     use yserver_core::{
         backend::Backend,
         resources::{ARGB_COLORMAP, ARGB_VISUAL, ROOT_VISUAL, ROOT_WINDOW},
         server::ServerState,
     };
-
-    fn candidate(path: &str, connected: bool) -> DrmCandidate {
-        DrmCandidate {
-            path: path.to_string(),
-            has_connected_connector: connected,
-        }
-    }
-
-    #[test]
-    fn pick_drm_candidate_returns_none_for_empty() {
-        assert!(pick_drm_candidate(&[]).is_none());
-    }
-
-    #[test]
-    fn pick_drm_candidate_prefers_connected_over_earlier_disconnected() {
-        // The iGPU+dGPU case from issue #62: card1 (Intel, no display) sorts
-        // first but card2 (AMD) drives the monitor. We must pick card2.
-        let cands = [
-            candidate("/dev/dri/card1", false),
-            candidate("/dev/dri/card2", true),
-        ];
-        assert_eq!(pick_drm_candidate(&cands).unwrap().path, "/dev/dri/card2");
-    }
-
-    #[test]
-    fn pick_drm_candidate_keeps_lexicographic_order_among_connected() {
-        let cands = [
-            candidate("/dev/dri/card0", true),
-            candidate("/dev/dri/card1", true),
-        ];
-        assert_eq!(pick_drm_candidate(&cands).unwrap().path, "/dev/dri/card0");
-    }
-
-    #[test]
-    fn pick_drm_candidate_falls_back_to_first_when_none_connected() {
-        // Headless / vng: KMS-capable but no connectors report Connected.
-        // Preserve the historical "first KMS-capable card" behaviour.
-        let cands = [
-            candidate("/dev/dri/card0", false),
-            candidate("/dev/dri/card1", false),
-        ];
-        assert_eq!(pick_drm_candidate(&cands).unwrap().path, "/dev/dri/card0");
-    }
-
-    #[test]
-    fn pick_drm_candidate_single_disconnected_card_is_still_selected() {
-        let cands = [candidate("/dev/dri/card0", false)];
-        assert_eq!(pick_drm_candidate(&cands).unwrap().path, "/dev/dri/card0");
-    }
 
     #[test]
     fn install_backend_root_bindings_sets_root_host_xid_and_visuals() {
