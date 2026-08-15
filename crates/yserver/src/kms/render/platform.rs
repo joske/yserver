@@ -49,7 +49,7 @@ use yserver_core::backend::{BackendFdKind, PresentClockSample, PresentClockSourc
 use crate::{
     drm,
     kms::{
-        backend::{OutputLayout, PlatformInit, platform_init as core_platform_init},
+        backend::{ActiveOutput, OutputKey, PlatformInit, platform_init as core_platform_init},
         render::{
             store::Storage,
             submit_group::{FlushReason, SubmitGroup},
@@ -529,6 +529,9 @@ fn cursor_err_disables_hw(e: &io::Error) -> bool {
 /// `KmsBackend::on_crtc_sequence_event`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SequenceCompletion {
+    /// DRM primary-node identity that produced this event. CRTC handles are
+    /// only unique within one DRM device.
+    pub(crate) device_key: crate::platform::drm::DrmDeviceKey,
     /// Echoed verbatim from the arm call: low 32 bits are the crtc_id,
     /// the high bit optionally tags an absolute per-target arm
     /// (`ABSOLUTE_SEQ_TAG` in `backend.rs`).
@@ -537,12 +540,15 @@ pub(crate) struct SequenceCompletion {
     pub(crate) sequence: u64,
 }
 
-/// v2's real DRM/Vk/libinput owner. Replaces the flat field set
-/// that Stage 1b's `KmsBackend` carried.
-pub(crate) struct PlatformBackend {
-    // DRM / output side
+/// One opened DRM/KMS device and its sibling render-node resources.
+///
+/// This commit deliberately constructs exactly one entry. Keeping the
+/// ownership device-scoped here lets later PRIME work extend the vector
+/// without moving these fields a second time.
+pub(crate) struct KmsDevice {
+    pub(crate) key: crate::platform::drm::DrmDeviceKey,
     pub(crate) device: Rc<drm::Device>,
-    pub(crate) render_node_fd: Option<std::os::fd::OwnedFd>,
+    pub(crate) render_node_fd: Option<OwnedFd>,
     /// The DRM device over the render node, retained so every DRI3 syncobj
     /// ioctl and the `DRM_CAP_SYNCOBJ_TIMELINE` query issue on the SAME fd
     /// kind DRI3 hands clients. This is deliberately NOT `device` (the KMS
@@ -556,7 +562,14 @@ pub(crate) struct PlatformBackend {
     /// syncobj and every operation on it is a DRM ioctl.
     pub(crate) syncobj_timeline: bool,
     pub(crate) render_node_path: Option<PathBuf>,
-    pub(crate) outputs: Vec<OutputLayout>,
+}
+
+/// v2's real DRM/Vk/libinput owner. Replaces the flat field set
+/// that Stage 1b's `KmsBackend` carried.
+pub(crate) struct PlatformBackend {
+    // DRM / output side
+    pub(crate) devices: Vec<KmsDevice>,
+    pub(crate) outputs: Vec<ActiveOutput>,
     pub(crate) fb_w: u16,
     pub(crate) fb_h: u16,
     /// Latest general kernel `(msc, ust_micros)` per output index, updated
@@ -691,15 +704,15 @@ pub(crate) struct PlatformBackend {
 /// Outcome of a connector rescan.
 #[derive(Debug, Default)]
 pub(crate) struct RescanResult {
-    pub added_names: Vec<String>,
-    pub dropped_names: Vec<String>,
+    pub added_keys: Vec<OutputKey>,
+    pub dropped_keys: Vec<OutputKey>,
     pub dropped_old_indices: Vec<usize>,
     pub added_count: usize,
     /// Task 5.2: newly-connected connectors discovered by a *runtime*
     /// rescan are NOT auto-enabled — they're surfaced here (with their
     /// advertised modes/dimensions) so the backend can register them
     /// off in the connector registry and fire `OutputChangeNotify`.
-    pub added_outputs: Vec<crate::platform::drm::Output>,
+    pub added_outputs: Vec<(OutputKey, crate::platform::drm::Output)>,
 }
 
 /// Pure recompute of the virtual-screen extent from `(x, y, width, height)`.
@@ -756,6 +769,7 @@ impl PlatformBackend {
     /// [`open_with_commit`] (Direct mode — the only mode).
     fn from_platform_init(platform_init: PlatformInit) -> io::Result<Self> {
         let PlatformInit {
+            device_key,
             device,
             render_node_fd,
             render_node_path,
@@ -961,12 +975,17 @@ impl PlatformBackend {
             scanout_pools.iter().filter(|p| p.is_some()).count(),
         );
 
-        Ok(Self {
+        let devices = vec![KmsDevice {
+            key: device_key,
             device,
             render_node_fd,
             render_node_device,
             syncobj_timeline,
             render_node_path,
+        }];
+
+        Ok(Self {
+            devices,
             outputs: layouts,
             fb_w,
             fb_h,
@@ -997,7 +1016,7 @@ impl PlatformBackend {
         })
     }
 
-    /// Headless test seed. No DRM device, no Vk, single
+    /// Headless test seed. No live DRM device, no Vk, single
     /// stub 800×600 output. Mirrors `KmsBackend::for_tests`'s
     /// existing shape from Stage 1b.
     #[doc(hidden)]
@@ -1015,14 +1034,20 @@ impl PlatformBackend {
             .expect("test poller register");
         #[cfg(target_os = "linux")]
         let hotplug_monitor = None;
+        let device_key = crate::platform::drm::DrmDeviceKey { major: 0, minor: 0 };
+        let device = Rc::new(drm::Device::for_tests().expect("test drm device"));
         Self {
-            device: Rc::new(drm::Device::for_tests().expect("test drm device")),
-            render_node_fd: None,
-            render_node_device: None,
-            syncobj_timeline: false,
-            render_node_path: None,
-            outputs: vec![OutputLayout {
-                output: crate::platform::drm::Output {
+            devices: vec![KmsDevice {
+                key: device_key,
+                device,
+                render_node_fd: None,
+                render_node_device: None,
+                syncobj_timeline: false,
+                render_node_path: None,
+            }],
+            outputs: vec![ActiveOutput::new(
+                device_key,
+                crate::platform::drm::Output {
                     connector: ::drm::control::from_u32(1).unwrap(),
                     connector_name: "test".to_string(),
                     crtc: ::drm::control::from_u32(1).unwrap(),
@@ -1063,12 +1088,10 @@ impl PlatformBackend {
                         ..Default::default()
                     }],
                 },
-                swapchain: drm::Swapchain::empty_for_tests(),
-                x: 0,
-                y: 0,
-                width: 800,
-                height: 600,
-            }],
+                drm::Swapchain::empty_for_tests(),
+                0,
+                0,
+            )],
             fb_w: 800,
             fb_h: 600,
             ust_msc: std::collections::HashMap::new(),
@@ -1151,7 +1174,8 @@ impl PlatformBackend {
     #[must_use]
     pub(crate) fn is_nvidia_drm(&self) -> bool {
         use ::drm::Device as _;
-        self.device
+        self.primary_device()
+            .device
             .get_driver()
             .map(|d| {
                 d.name()
@@ -1507,12 +1531,40 @@ impl PlatformBackend {
         self.input_ctx.take()
     }
 
+    /// The sole opened KMS device in this incremental topology commit.
+    /// Multi-device/headless startup changes this invariant in a later step.
+    pub(crate) fn primary_device(&self) -> &KmsDevice {
+        self.devices
+            .first()
+            .expect("PlatformBackend currently owns exactly one KMS device")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn primary_device_mut(&mut self) -> &mut KmsDevice {
+        self.devices
+            .first_mut()
+            .expect("PlatformBackend currently owns exactly one KMS device")
+    }
+
+    pub(crate) fn device_for_key(
+        &self,
+        key: crate::platform::drm::DrmDeviceKey,
+    ) -> Option<&KmsDevice> {
+        self.devices.iter().find(|device| device.key == key)
+    }
+
+    pub(crate) fn device_for_output(&self, key: &OutputKey) -> Option<&KmsDevice> {
+        self.device_for_key(key.device_key)
+    }
+
     pub(crate) fn poll_fds(&self) -> Vec<(RawFd, BackendFdKind)> {
-        let mut fds = Vec::with_capacity(4);
+        let mut fds = Vec::with_capacity(3 + self.devices.len());
         if let Some(ctx) = self.input_ctx.as_ref() {
             fds.push((ctx.fd(), BackendFdKind::Libinput));
         }
-        fds.push((self.device.as_fd().as_raw_fd(), BackendFdKind::Drm));
+        for device in &self.devices {
+            fds.push((device.device.as_fd().as_raw_fd(), BackendFdKind::Drm));
+        }
         #[cfg(target_os = "linux")]
         if let Some(mon) = self.hotplug_monitor.as_ref() {
             fds.push((mon.raw_fd(), BackendFdKind::DrmHotplug));
@@ -1531,12 +1583,18 @@ impl PlatformBackend {
     ) -> io::Result<(Vec<usize>, Vec<SequenceCompletion>)> {
         use ::drm::control::crtc;
 
+        // This commit preserves the one-card runtime invariant. Carry the
+        // device identity through every completion now so later multi-card
+        // polling can route the exact ready fd without changing event shape.
+        let device_key = self.primary_device().key;
+        let device = Rc::clone(&self.primary_device().device);
+
         // Capture the kernel vblank (msc=frame, ust=duration) alongside the
         // CRTC so Present pacing can complete NotifyMSC with real values.
         let mut flipped: Vec<(crtc::Handle, u32, std::time::Duration)> = Vec::new();
         let mut sequenced: Vec<SequenceCompletion> = Vec::new();
         crate::drm::page_flip::drain_events(
-            &self.device,
+            &device,
             |c, frame, dur| {
                 flipped.push((c, frame, dur));
             },
@@ -1545,6 +1603,7 @@ impl PlatformBackend {
                 // resolution) and tag decode happen in
                 // `on_crtc_sequence_event`.
                 sequenced.push(SequenceCompletion {
+                    device_key,
                     user_data,
                     time_ns,
                     sequence,
@@ -1554,8 +1613,10 @@ impl PlatformBackend {
 
         let mut output_indices = Vec::with_capacity(flipped.len());
         for (crtc, frame, dur) in flipped {
-            let Some(output_idx) = self.outputs.iter().position(|o| o.output.crtc == crtc) else {
-                log::warn!("render: pageflip-complete for unknown CRTC {crtc:?}");
+            let Some(output_idx) = self.outputs.iter().position(|output| {
+                output.key.device_key == device_key && output.output.crtc == crtc
+            }) else {
+                log::warn!("render: pageflip-complete for unknown CRTC {crtc:?} on {device_key}");
                 continue;
             };
             // u32 frame → u64 MSC (kernel wraps at 2^32; monotonic enough
@@ -2498,7 +2559,7 @@ impl PlatformBackend {
     }
 
     /// Disable a single connector: issue a DRM `disable_output` for the
-    /// matching `OutputLayout`, free/drop its scanout pool entry, and
+    /// matching `ActiveOutput`, free/drop its scanout pool entry, and
     /// remove it from `self.outputs` / parallel vecs.  Recomputes
     /// `fb_w`/`fb_h` from the remaining outputs (2-D, no recompact —
     /// client-driven layouts are preserved). Does NOT touch the
@@ -2507,19 +2568,25 @@ impl PlatformBackend {
     /// Returns `Ok(true)` when the connector was found and disabled,
     /// `Ok(false)` when it was not currently in the active output list
     /// (already off — no-op), or `Err` on a DRM-level failure.
-    pub(crate) fn disable_connector(&mut self, connector: &str) -> io::Result<bool> {
+    pub(crate) fn disable_connector(&mut self, output_key: &OutputKey) -> io::Result<bool> {
+        let connector = &output_key.connector_name;
         let idx = match self
             .outputs
             .iter()
-            .position(|l| l.output.connector_name == connector)
+            .position(|layout| &layout.key == output_key)
         {
             Some(i) => i,
             None => return Ok(false),
         };
+        let device = Rc::clone(
+            &self
+                .device_for_output(output_key)
+                .ok_or_else(|| io::Error::other(format!("no DRM device for {output_key:?}")))?
+                .device,
+        );
 
         // DRM disable (ALLOW_MODESET atomic commit zeroing the CRTC).
-        if let Err(e) = crate::drm::modeset::disable_output(&self.device, &self.outputs[idx].output)
-        {
+        if let Err(e) = crate::drm::modeset::disable_output(&device, &self.outputs[idx].output) {
             log::error!("render disable_connector: disable_output({connector}) failed: {e}");
             return Err(e);
         }
@@ -2560,7 +2627,7 @@ impl PlatformBackend {
     /// connector's discovered `Output::modes` list, (re)allocates the
     /// `ScanoutBoPool` when the resolution changes or the output was
     /// previously off, commits the modeset, and adds/updates the
-    /// `OutputLayout` in `self.outputs` and the parallel vecs.
+    /// `ActiveOutput` in `self.outputs` and the parallel vecs.
     ///
     /// The `Output` for `connector` must be pre-discovered via
     /// `discover_outputs`; pass the **full** `Vec<Output>` from a
@@ -2572,12 +2639,20 @@ impl PlatformBackend {
     /// Returns `Ok(())` on success.
     pub(crate) fn enable_connector(
         &mut self,
+        output_key: &OutputKey,
         mut output: crate::platform::drm::Output,
         mode_spec: yserver_core::backend::ModeSpec,
         x: i32,
         y: i32,
     ) -> io::Result<()> {
         let connector = output.connector_name.clone();
+        debug_assert_eq!(output_key.connector_name, connector);
+        let device = Rc::clone(
+            &self
+                .device_for_output(output_key)
+                .ok_or_else(|| io::Error::other(format!("no DRM device for {output_key:?}")))?
+                .device,
+        );
 
         // Resolve ModeSpec → the DRM mode on the output.
         // `Output::modes` is the full advertised list (preferred-first).
@@ -2630,12 +2705,12 @@ impl PlatformBackend {
             // instead we call get_connector inline to fetch the full
             // DRM mode list, then match by (width, height, vrefresh).
             use ::drm::control::Device as ControlDevice;
-            let resources = self.device.resource_handles().map_err(|e| {
+            let resources = device.resource_handles().map_err(|e| {
                 io::Error::other(format!("enable_connector: resource_handles failed: {e}"))
             })?;
             let mut drm_mode_opt: Option<::drm::control::Mode> = None;
             'outer: for &handle in resources.connectors() {
-                let info = match self.device.get_connector(handle, false) {
+                let info = match device.get_connector(handle, false) {
                     Ok(i) => i,
                     Err(_) => continue,
                 };
@@ -2672,7 +2747,7 @@ impl PlatformBackend {
         let existing_idx = self
             .outputs
             .iter()
-            .position(|l| l.output.connector_name == connector);
+            .position(|layout| &layout.key == output_key);
         let needs_pool_realloc = match existing_idx {
             Some(idx) => self.outputs[idx].width != w || self.outputs[idx].height != h,
             None => true,
@@ -2683,7 +2758,7 @@ impl PlatformBackend {
             if let Some(vk) = self.vk.as_ref().cloned() {
                 match ScanoutBoPool::allocate(
                     Arc::clone(&vk),
-                    Rc::clone(&self.device),
+                    Rc::clone(&device),
                     u32::from(w),
                     u32::from(h),
                     3,
@@ -2751,7 +2826,7 @@ impl PlatformBackend {
         };
 
         // Commit the modeset.  On failure, pool is freed (dropped below).
-        if let Err(e) = crate::drm::modeset::commit_modeset(&self.device, &output, fb_for_commit) {
+        if let Err(e) = crate::drm::modeset::commit_modeset(&device, &output, fb_for_commit) {
             log::error!(
                 "render enable_connector: commit_modeset for {connector} ({}×{}@{}) at ({x},{y}) failed: {e}",
                 mode_spec.width,
@@ -2785,14 +2860,13 @@ impl PlatformBackend {
             }
         } else {
             // New output — push to end.
-            self.outputs.push(OutputLayout {
+            self.outputs.push(ActiveOutput::new(
+                output_key.device_key,
                 output,
-                swapchain: drm::Swapchain::empty_for_tests(),
+                drm::Swapchain::empty_for_tests(),
                 x,
                 y,
-                width: w,
-                height: h,
-            });
+            ));
             let pool = new_pool.unwrap_or(None);
             let gens = pool
                 .as_ref()
@@ -2982,7 +3056,18 @@ impl PlatformBackend {
 
         let mut first_err: Option<io::Error> = None;
         for (i, layout) in self.outputs.iter().enumerate() {
-            if let Err(e) = drm::modeset::disable_output(&self.device, &layout.output) {
+            let Some(device) = self
+                .device_for_output(&layout.key)
+                .map(|device| Rc::clone(&device.device))
+            else {
+                log::warn!(
+                    "render disable_output: no DRM device {} for {}",
+                    layout.key.device_key,
+                    layout.output.connector_name,
+                );
+                continue;
+            };
+            if let Err(e) = drm::modeset::disable_output(&device, &layout.output) {
                 log::warn!(
                     "render disable_output: failed for {} (output {i}): {e}",
                     layout.output.connector_name,
@@ -3025,6 +3110,17 @@ impl PlatformBackend {
             // before blank) or any registered fb — same selection
             // logic as `requery_outputs_and_modeset` at :2030.
             for (i, layout) in self.outputs.iter().enumerate() {
+                let Some(device) = self
+                    .device_for_output(&layout.key)
+                    .map(|device| Rc::clone(&device.device))
+                else {
+                    log::warn!(
+                        "dpms_set_outputs_active(true): no DRM device {} for {}",
+                        layout.key.device_key,
+                        layout.output.connector_name,
+                    );
+                    continue;
+                };
                 let fb = self
                     .scanout_pools
                     .get(i)
@@ -3045,8 +3141,7 @@ impl PlatformBackend {
                     );
                     continue;
                 };
-                if let Err(e) =
-                    crate::drm::modeset::commit_modeset(&self.device, &layout.output, fb_id)
+                if let Err(e) = crate::drm::modeset::commit_modeset(&device, &layout.output, fb_id)
                 {
                     log::error!(
                         "dpms_set_outputs_active(true): commit_modeset for {} failed: {e}",
@@ -3059,7 +3154,18 @@ impl PlatformBackend {
             }
         } else {
             for layout in &self.outputs {
-                if let Err(e) = crate::drm::modeset::disable_output(&self.device, &layout.output) {
+                let Some(device) = self
+                    .device_for_output(&layout.key)
+                    .map(|device| Rc::clone(&device.device))
+                else {
+                    log::warn!(
+                        "dpms_set_outputs_active(false): no DRM device {} for {}",
+                        layout.key.device_key,
+                        layout.output.connector_name,
+                    );
+                    continue;
+                };
+                if let Err(e) = crate::drm::modeset::disable_output(&device, &layout.output) {
                     log::error!(
                         "dpms_set_outputs_active(false): disable_output for {} failed: {e}",
                         layout.output.connector_name,
@@ -3090,10 +3196,10 @@ impl PlatformBackend {
     /// doesn't overlap. (Mixed pinned+auto with gaps is refined later if a
     /// real workload needs it; the common case is all-auto at boot or
     /// all-pinned after the desktop configures the layout.)
-    fn recompact_horizontal_layout(&mut self, client_configured: &HashSet<String>) {
+    fn recompact_horizontal_layout(&mut self, client_configured: &HashSet<OutputKey>) {
         let mut next_x: i32 = 0;
         for layout in &mut self.outputs {
-            if client_configured.contains(&layout.output.connector_name) {
+            if client_configured.contains(&layout.key) {
                 next_x = next_x.max(layout.x.saturating_add(i32::from(layout.width)));
                 continue;
             }
@@ -3108,30 +3214,37 @@ impl PlatformBackend {
     /// connected outputs.
     pub(crate) fn requery_outputs_and_modeset(
         &mut self,
-        client_configured: &HashSet<String>,
+        client_configured: &HashSet<OutputKey>,
     ) -> io::Result<RescanResult> {
-        let discovered = crate::platform::drm::discover_outputs(&self.device)?;
-        let discovered_order: Vec<String> = discovered
+        let device_key = self.primary_device().key;
+        let device = Rc::clone(&self.primary_device().device);
+        let discovered = crate::platform::drm::discover_outputs(&device)?;
+        let discovered_order: Vec<OutputKey> = discovered
             .iter()
-            .map(|o| o.connector_name.clone())
+            .map(|output| OutputKey::new(device_key, output.connector_name.clone()))
             .collect();
-        let discovered_names: HashSet<String> = discovered
+        let discovered_keys: HashSet<OutputKey> = discovered
             .iter()
-            .map(|o| o.connector_name.clone())
+            .map(|output| OutputKey::new(device_key, output.connector_name.clone()))
             .collect();
-        let current_names: HashSet<String> = self
+        let current_keys: HashSet<OutputKey> = self
             .outputs
             .iter()
-            .map(|l| l.output.connector_name.clone())
+            .map(|layout| layout.key.clone())
             .collect();
-        let mut discovered_by_name: HashMap<String, crate::platform::drm::Output> = discovered
+        let mut discovered_by_key: HashMap<OutputKey, crate::platform::drm::Output> = discovered
             .into_iter()
-            .map(|o| (o.connector_name.clone(), o))
+            .map(|output| {
+                (
+                    OutputKey::new(device_key, output.connector_name.clone()),
+                    output,
+                )
+            })
             .collect();
 
         let mut rescan = RescanResult::default();
         for (idx, layout) in self.outputs.iter().enumerate() {
-            if discovered_names.contains(&layout.output.connector_name) {
+            if discovered_keys.contains(&layout.key) {
                 continue;
             }
             log::warn!(
@@ -3139,9 +3252,7 @@ impl PlatformBackend {
                 layout.output.connector_name,
             );
             rescan.dropped_old_indices.push(idx);
-            rescan
-                .dropped_names
-                .push(layout.output.connector_name.clone());
+            rescan.dropped_keys.push(layout.key.clone());
         }
         rescan.dropped_old_indices.sort_unstable_by(|a, b| b.cmp(a));
         for idx in rescan.dropped_old_indices.iter().copied() {
@@ -3158,7 +3269,7 @@ impl PlatformBackend {
         }
 
         for layout in &mut self.outputs {
-            if let Some(mut output) = discovered_by_name.remove(&layout.output.connector_name) {
+            if let Some(mut output) = discovered_by_key.remove(&layout.key) {
                 // Preserve the live ACTIVE mode. A rescan / VT-resume does
                 // not re-modeset a surviving (enabled) output, so its
                 // current mode — which may be a client `RRSetCrtcConfig`
@@ -3190,19 +3301,19 @@ impl PlatformBackend {
         // no CRTC) and fires `OutputChangeNotify`. Boot auto-enable lives
         // in `open_with_commit`, a distinct entry point that never calls
         // this runtime-rescan path.
-        for name in discovered_order {
-            if current_names.contains(&name) {
+        for key in discovered_order {
+            if current_keys.contains(&key) {
                 continue;
             }
-            let Some(output) = discovered_by_name.remove(&name) else {
+            let Some(output) = discovered_by_key.remove(&key) else {
                 continue;
             };
             log::info!(
                 "render rescan: new connector {} discovered — registering OFF (client must enable)",
                 output.connector_name,
             );
-            rescan.added_names.push(name);
-            rescan.added_outputs.push(output);
+            rescan.added_keys.push(key.clone());
+            rescan.added_outputs.push((key, output));
             rescan.added_count += 1;
         }
 

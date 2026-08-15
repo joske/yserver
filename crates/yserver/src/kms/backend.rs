@@ -6,7 +6,7 @@
 //! / air / nvidia hardware. What remains is the small set of free
 //! functions + plain-data types v2 still uses:
 //!
-//! - `OutputLayout` / `Rect` / `PlatformInit` / `platform_init` —
+//! - `ActiveOutput` / `Rect` / `PlatformInit` / `platform_init` —
 //!   per-output bring-up that v2's `PlatformBackend::open_with_commit`
 //!   delegates into.
 //! - Wire-byte helpers (`read_i16_pair`, `read_rect`) consumed by v2's
@@ -540,13 +540,31 @@ pub(crate) fn read_rect(data: &[u8], offset: usize) -> Option<Rectangle16> {
     })
 }
 
-/// A simple integer rectangle in virtual-screen coordinates.
-///
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct OutputKey {
+    pub(crate) device_key: crate::platform::drm::DrmDeviceKey,
+    pub(crate) connector_name: String,
+}
+
+impl OutputKey {
+    pub(crate) fn new(
+        device_key: crate::platform::drm::DrmDeviceKey,
+        connector_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            device_key,
+            connector_name: connector_name.into(),
+        }
+    }
+}
+
 /// A single DRM output and its dedicated swapchain, positioned in the
-/// virtual screen. v2's `PlatformBackend` owns one of these per
+/// virtual screen. The stable key keeps equal connector names on different
+/// devices distinct. The render `PlatformBackend` owns one of these per
 /// discovered output; `fb_w` / `fb_h` describe the virtual-screen
 /// extent.
-pub(crate) struct OutputLayout {
+pub(crate) struct ActiveOutput {
+    pub key: OutputKey,
     pub output: crate::platform::drm::Output,
     /// Kept alive for the lifetime of the output to retain initial-
     /// scanout buffer ownership; v2 has its own per-output
@@ -559,12 +577,35 @@ pub(crate) struct OutputLayout {
     pub height: u16,
 }
 
+impl ActiveOutput {
+    pub(crate) fn new(
+        device_key: crate::platform::drm::DrmDeviceKey,
+        output: crate::platform::drm::Output,
+        swapchain: crate::drm::Swapchain,
+        x: i32,
+        y: i32,
+    ) -> Self {
+        let key = OutputKey::new(device_key, output.connector_name.clone());
+        let width = output.picked.width;
+        let height = output.picked.height;
+        Self {
+            key,
+            output,
+            swapchain,
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+}
+
 /// Centre of the primary output (output 0) — the startup pointer position,
 /// matching Xorg which warps the pointer to the centre of the first display.
 /// On a multi-head layout the framebuffer centre lands on the seam between
 /// monitors, so we centre on output 0 instead. Falls back to the framebuffer
 /// centre when no outputs are known.
-pub(crate) fn primary_output_center(outputs: &[OutputLayout], fb_w: u16, fb_h: u16) -> (i32, i32) {
+pub(crate) fn primary_output_center(outputs: &[ActiveOutput], fb_w: u16, fb_h: u16) -> (i32, i32) {
     outputs.first().map_or_else(
         || (i32::from(fb_w) / 2, i32::from(fb_h) / 2),
         |o| (o.x + i32::from(o.width) / 2, o.y + i32::from(o.height) / 2),
@@ -572,10 +613,11 @@ pub(crate) fn primary_output_center(outputs: &[OutputLayout], fb_w: u16, fb_h: u
 }
 
 pub(crate) struct PlatformInit {
+    pub(crate) device_key: crate::platform::drm::DrmDeviceKey,
     pub(crate) device: Rc<drm::Device>,
     pub(crate) render_node_fd: Option<std::os::fd::OwnedFd>,
     pub(crate) render_node_path: Option<std::path::PathBuf>,
-    pub(crate) layouts: Vec<OutputLayout>,
+    pub(crate) layouts: Vec<ActiveOutput>,
     pub(crate) fb_w: u16,
     pub(crate) fb_h: u16,
     pub(crate) input_ctx: Option<crate::input::SendContext>,
@@ -605,6 +647,8 @@ pub(crate) fn platform_init(
     ) -> io::Result<()>,
 ) -> io::Result<PlatformInit> {
     let device = Rc::new(drm::Device::open(device_path)?);
+    let device_key =
+        crate::platform::drm::primary_device_key_from_fd(std::os::fd::AsFd::as_fd(&*device))?;
     let (render_node_fd, render_node_path) = match crate::kms::render_node::open_for_card(&*device)
     {
         Ok((fd, path)) => {
@@ -638,7 +682,7 @@ pub(crate) fn platform_init(
     // Horizontal layout in connector order. If anything fails part
     // way through bring-up, disable everything we have already
     // committed so the next caller starts from a clean slate.
-    let mut layouts: Vec<OutputLayout> = Vec::with_capacity(outputs.len());
+    let mut layouts: Vec<ActiveOutput> = Vec::with_capacity(outputs.len());
     let mut next_x: i32 = 0;
     let mut bring_up_err: Option<io::Error> = None;
     for output in outputs {
@@ -665,14 +709,7 @@ pub(crate) fn platform_init(
             break;
         }
         let swapchain = drm::Swapchain::with_initial_scanout(buffers, 0);
-        layouts.push(OutputLayout {
-            output,
-            swapchain,
-            x: next_x,
-            y: 0,
-            width: w,
-            height: h,
-        });
+        layouts.push(ActiveOutput::new(device_key, output, swapchain, next_x, 0));
         next_x = next_x.saturating_add(i32::from(w));
     }
     if let Some(err) = bring_up_err {
@@ -707,6 +744,7 @@ pub(crate) fn platform_init(
     };
 
     Ok(PlatformInit {
+        device_key,
         device,
         render_node_fd,
         render_node_path,

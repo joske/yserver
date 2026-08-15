@@ -48,6 +48,7 @@ use yserver_protocol::x11::{
 use crate::{
     drm,
     kms::{
+        backend::OutputKey,
         core::{GradientStop, KmsCore, PictureFilter, PictureRecord},
         cpu_types::{PictTransform, Rectangle16, Repeat},
         render::{
@@ -403,7 +404,7 @@ struct SeedInferiorDraw {
     height: u32,
 }
 
-/// Monotonic connector-keyed RANDR connector registry.
+/// Monotonic device-qualified RANDR connector registry.
 ///
 /// Authoritative store for every connector yserver has ever seen:
 /// stable ids, connection state, current config, the persistent
@@ -413,7 +414,8 @@ struct SeedInferiorDraw {
 #[derive(Debug, Default)]
 pub(crate) struct RandrIdAllocator {
     next: u32,
-    connectors: HashMap<String, ConnectorEntry>,
+    providers: HashMap<crate::platform::drm::DrmDeviceKey, u32>,
+    connectors: HashMap<OutputKey, ConnectorEntry>,
     modes: HashMap<(u16, u16, u32), u32>,
 }
 
@@ -423,10 +425,10 @@ pub(crate) struct ConnectorIds {
     pub crtc_id: u32,
 }
 
-/// `(connector_name, ids, connected, advertised_modes)` snapshot for a
+/// `(output_key, ids, connected, advertised_modes)` snapshot for a
 /// not-live connector, materialized in `randr_outputs_and_modes` to
 /// release the `&self` borrow before the `&mut self` `mode_id()` calls.
-type NotLiveConnector = (String, ConnectorIds, bool, Vec<(u16, u16, u32, bool)>);
+type NotLiveConnector = (OutputKey, ConnectorIds, bool, Vec<(u16, u16, u32, bool)>);
 
 /// Per-connector current configuration in the registry.
 // Consumed by the SetCrtcConfig apply path + rescan/resume layout
@@ -500,8 +502,20 @@ impl RandrIdAllocator {
         self.next
     }
 
-    pub(crate) fn ids_for(&mut self, connector_name: &str) -> ConnectorIds {
-        if let Some(entry) = self.connectors.get(connector_name) {
+    pub(crate) fn provider_id_for(
+        &mut self,
+        device_key: crate::platform::drm::DrmDeviceKey,
+    ) -> u32 {
+        if let Some(id) = self.providers.get(&device_key) {
+            return *id;
+        }
+        let id = self.fresh();
+        self.providers.insert(device_key, id);
+        id
+    }
+
+    pub(crate) fn ids_for(&mut self, output_key: &OutputKey) -> ConnectorIds {
+        if let Some(entry) = self.connectors.get(output_key) {
             return entry.ids;
         }
         let ids = ConnectorIds {
@@ -509,7 +523,7 @@ impl RandrIdAllocator {
             crtc_id: self.fresh(),
         };
         self.connectors.insert(
-            connector_name.to_string(),
+            output_key.clone(),
             ConnectorEntry {
                 ids,
                 connected: false,
@@ -530,59 +544,61 @@ impl RandrIdAllocator {
         id
     }
 
-    /// Connector names whose layout a client has explicitly configured
+    /// Output keys whose layout a client has explicitly configured
     /// (SetCrtcConfig/SetScreenSize). The auto-layout recompact must
     /// leave these where the client placed them — see Task 5.1.
-    pub(crate) fn client_configured_names(&self) -> HashSet<String> {
+    pub(crate) fn client_configured_keys(&self) -> HashSet<OutputKey> {
         self.connectors
             .iter()
             .filter(|(_, e)| e.client_configured)
-            .map(|(name, _)| name.clone())
+            .map(|(key, _)| key.clone())
             .collect()
     }
 
-    pub(crate) fn known_connectors(&self) -> Vec<(String, ConnectorIds)> {
+    pub(crate) fn known_connectors(&self) -> Vec<(OutputKey, ConnectorIds)> {
         self.connectors
             .iter()
-            .map(|(name, entry)| (name.clone(), entry.ids))
+            .map(|(key, entry)| (key.clone(), entry.ids))
             .collect()
     }
 
     /// Get or create the registry entry for a connector, allocating
     /// stable ids on first sight. New entries default to disconnected,
     /// Off, not-client-configured, empty mode list.
-    pub(crate) fn entry_mut(&mut self, name: &str) -> &mut ConnectorEntry {
-        if !self.connectors.contains_key(name) {
+    pub(crate) fn entry_mut(&mut self, key: &OutputKey) -> &mut ConnectorEntry {
+        if !self.connectors.contains_key(key) {
             // Allocate ids (also inserts the default entry).
-            let _ = self.ids_for(name);
+            let _ = self.ids_for(key);
         }
-        self.connectors.get_mut(name).expect("just inserted")
+        self.connectors.get_mut(key).expect("just inserted")
     }
 
     #[allow(dead_code)]
-    pub(crate) fn entry(&self, name: &str) -> Option<&ConnectorEntry> {
-        self.connectors.get(name)
+    pub(crate) fn entry(&self, key: &OutputKey) -> Option<&ConnectorEntry> {
+        self.connectors.get(key)
     }
 
-    pub(crate) fn entries(&self) -> impl Iterator<Item = (&String, &ConnectorEntry)> {
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (&OutputKey, &ConnectorEntry)> {
         self.connectors.iter()
     }
 }
 
 fn reconcile_connector_probe(
     randr_id_alloc: &mut RandrIdAllocator,
+    device_key: crate::platform::drm::DrmDeviceKey,
     probes: &[crate::platform::drm::ConnectorProbe],
 ) -> bool {
     let mut changed = false;
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen: HashSet<OutputKey> = HashSet::new();
     for probe in probes {
-        seen.insert(probe.connector_name.clone());
+        let output_key = OutputKey::new(device_key, probe.connector_name.clone());
+        seen.insert(output_key.clone());
         let new_modes: Vec<(u16, u16, u32, bool)> = probe
             .modes
             .iter()
             .map(|m| (m.width, m.height, m.vrefresh, m.preferred))
             .collect();
-        let entry = randr_id_alloc.entry_mut(&probe.connector_name);
+        let entry = randr_id_alloc.entry_mut(&output_key);
         if entry.connected != probe.connected {
             entry.connected = probe.connected;
             changed = true;
@@ -597,14 +613,15 @@ fn reconcile_connector_probe(
     // Connectors the registry knows but the probe no longer sees are
     // disconnected. Their mode lists are retained (so GetOutputInfo stays
     // consistent with the union) — only the flag flips.
-    let known: Vec<String> = randr_id_alloc
+    let known: Vec<OutputKey> = randr_id_alloc
         .known_connectors()
         .into_iter()
-        .map(|(name, _)| name)
+        .map(|(key, _)| key)
+        .filter(|key| key.device_key == device_key)
         .collect();
-    for name in known {
-        if !seen.contains(&name) {
-            let entry = randr_id_alloc.entry_mut(&name);
+    for key in known {
+        if !seen.contains(&key) {
+            let entry = randr_id_alloc.entry_mut(&key);
             if entry.connected {
                 entry.connected = false;
                 changed = true;
@@ -965,6 +982,9 @@ pub struct KmsBackend {
     /// time RANDR state is (re)projected; read by the `EDID`/`EDID_DATA`
     /// /`ConnectorType` output-property handlers via `output_identity`.
     output_identity_by_id: std::collections::HashMap<u32, (Vec<u8>, String)>,
+    /// Resolve a RANDR output XID back to its owning DRM device and connector.
+    /// Connector names are only unique within one DRM device.
+    output_key_by_id: std::collections::HashMap<u32, OutputKey>,
     hotplug_rescan_deadline: Option<std::time::Instant>,
     gamma_luts: RefCell<HashMap<String, GammaLut>>,
 
@@ -1075,7 +1095,7 @@ fn mode_timing(m: &crate::platform::drm::Mode) -> Option<yserver_core::randr::Mo
 /// `scanout_prefers_linear` (`kms/vk/scanout.rs:922`). DRI3 syncobj
 /// used to be one of them (`VkContext::supports_dri3_syncobj`), but it
 /// is a kernel capability now: `DRM_CAP_SYNCOBJ_TIMELINE` on the render
-/// node (`PlatformBackend::syncobj_timeline`), not a driver branch.
+/// node (`KmsDevice::syncobj_timeline`), not a driver branch.
 ///
 /// Deliberately binary. Every non-NVIDIA driver keeps "mesa": an
 /// unmeasured mapping that redirects a configuration working today onto
@@ -1377,7 +1397,10 @@ impl KmsBackend {
                 })
             })
             .collect::<io::Result<_>>()?;
-        crate::drm::modeset::submit_composed_scanout(&self.platform.device, &planes)?;
+        crate::drm::modeset::submit_composed_scanout(
+            &self.platform.primary_device().device,
+            &planes,
+        )?;
         self.scanout_m2.unflip_awaiting_outputs = (0..planes.len()).collect();
         log::info!(
             "scanout_m2: submitted atomic composed unflip outputs={}",
@@ -1612,7 +1635,7 @@ impl KmsBackend {
             })
             .collect();
         let result = crate::drm::modeset::probe_direct_scanout_test_only(
-            Rc::clone(&self.platform.device),
+            Rc::clone(&self.platform.primary_device().device),
             fd.as_fd(),
             u32::from(width),
             u32::from(height),
@@ -2409,6 +2432,7 @@ impl KmsBackend {
             input_thread_control: None,
             randr_id_alloc: RandrIdAllocator::default(),
             output_identity_by_id: std::collections::HashMap::new(),
+            output_key_by_id: std::collections::HashMap::new(),
             hotplug_rescan_deadline: None,
             gamma_luts: RefCell::new(HashMap::new()),
             exported_dmabufs: HashMap::new(),
@@ -3042,7 +3066,7 @@ impl KmsBackend {
         for (i, layout) in base.platform.outputs.iter().enumerate() {
             let pool = crate::kms::vk::scanout::ScanoutBoPool::allocate(
                 Arc::clone(&vk),
-                Rc::clone(&base.platform.device),
+                Rc::clone(&base.platform.primary_device().device),
                 u32::from(layout.width),
                 u32::from(layout.height),
                 3,
@@ -3299,6 +3323,7 @@ impl KmsBackend {
             input_thread_control: None,
             randr_id_alloc: RandrIdAllocator::default(),
             output_identity_by_id: std::collections::HashMap::new(),
+            output_key_by_id: std::collections::HashMap::new(),
             hotplug_rescan_deadline: None,
             gamma_luts: RefCell::new(HashMap::new()),
             exported_dmabufs: HashMap::new(),
@@ -4252,11 +4277,18 @@ impl KmsBackend {
     ) {
         use yserver_core::randr::{ModeTiming, RandrMode, RandrOutput};
 
-        let live_names: HashSet<String> = self
+        // Provider ids share the same XID source as outputs, CRTCs, and modes
+        // even before providers are exposed on the wire. Reserving the primary
+        // device now keeps all later identities stable and collision-free.
+        let _ = self
+            .randr_id_alloc
+            .provider_id_for(self.platform.primary_device().key);
+
+        let live_keys: HashSet<OutputKey> = self
             .platform
             .outputs
             .iter()
-            .map(|layout| layout.output.connector_name.clone())
+            .map(|layout| layout.key.clone())
             .collect();
         // Timing for each advertised (w,h,vrefresh), preferred-first so the
         // preferred instance's timing survives the #48 duplicate collapse.
@@ -4276,9 +4308,10 @@ impl KmsBackend {
         // Rebuild the per-output identity map (EDID + ConnectorType) each
         // projection so the output-property handlers serve current data.
         self.output_identity_by_id.clear();
+        self.output_key_by_id.clear();
         for layout in &self.platform.outputs {
             let vrefresh = layout.output.picked.vrefresh;
-            let ids = self.randr_id_alloc.ids_for(&layout.output.connector_name);
+            let ids = self.randr_id_alloc.ids_for(&layout.key);
             self.output_identity_by_id.insert(
                 ids.output_id,
                 (
@@ -4286,6 +4319,8 @@ impl KmsBackend {
                     layout.output.connector_type.clone(),
                 ),
             );
+            self.output_key_by_id
+                .insert(ids.output_id, layout.key.clone());
             let mode_id = self
                 .randr_id_alloc
                 .mode_id(layout.width, layout.height, vrefresh);
@@ -4306,9 +4341,7 @@ impl KmsBackend {
                     num_preferred = num_preferred.saturating_add(1);
                 }
             }
-            self.randr_id_alloc
-                .entry_mut(&layout.output.connector_name)
-                .modes = layout
+            self.randr_id_alloc.entry_mut(&layout.key).modes = layout
                 .output
                 .modes
                 .iter()
@@ -4372,17 +4405,10 @@ impl KmsBackend {
         let not_live: Vec<NotLiveConnector> = self
             .randr_id_alloc
             .entries()
-            .filter(|(name, _)| !live_names.contains(name.as_str()))
-            .map(|(name, entry)| {
-                (
-                    name.clone(),
-                    entry.ids,
-                    entry.connected,
-                    entry.modes.clone(),
-                )
-            })
+            .filter(|(key, _)| !live_keys.contains(*key))
+            .map(|(key, entry)| (key.clone(), entry.ids, entry.connected, entry.modes.clone()))
             .collect();
-        for (name, ids, connected, conn_modes) in not_live {
+        for (key, ids, connected, conn_modes) in not_live {
             let mut mode_ids = Vec::with_capacity(conn_modes.len());
             let mut num_preferred: u16 = 0;
             for (w, h, vrefresh, preferred) in conn_modes {
@@ -4397,8 +4423,9 @@ impl KmsBackend {
                     num_preferred = num_preferred.saturating_add(1);
                 }
             }
+            self.output_key_by_id.insert(ids.output_id, key.clone());
             outs.push(RandrOutput {
-                name,
+                name: key.connector_name,
                 output_id: ids.output_id,
                 crtc_id: ids.crtc_id,
                 mode_id: 0,
@@ -7011,7 +7038,13 @@ impl KmsBackend {
     ///
     /// NEVER mutates scanout BO state, scene state, or triggers a flip
     /// (black-scanout-regression guard).
-    pub(crate) fn on_crtc_sequence_event(&mut self, user_data: u64, time_ns: i64, sequence: u64) {
+    pub(crate) fn on_crtc_sequence_event(
+        &mut self,
+        device_key: crate::platform::drm::DrmDeviceKey,
+        user_data: u64,
+        time_ns: i64,
+        sequence: u64,
+    ) {
         let tagged = user_data & ABSOLUTE_SEQ_TAG != 0;
         let crtc_id_raw = user_data as u32;
         // (1) Clear-arm by kind, BEFORE any validity check.
@@ -7033,15 +7066,14 @@ impl KmsBackend {
             return;
         };
         // (2) Stale CRTC → drop (arm already cleared above).
-        let Some(output_idx) = self
-            .platform
-            .outputs
-            .iter()
-            .position(|o| o.output.crtc == handle)
+        let Some(output_idx) =
+            self.platform.outputs.iter().position(|output| {
+                output.key.device_key == device_key && output.output.crtc == handle
+            })
         else {
             log::warn!(
                 "PRESENT-DBG: CrtcSequence for unknown crtc_id={crtc_id_raw} \
-                 (output removed?) — dropped"
+                 on device {device_key} (output removed?) — dropped"
             );
             return;
         };
@@ -7198,7 +7230,7 @@ impl KmsBackend {
         if self.crtc_queue_sequence_unsupported {
             return Ok(0);
         }
-        let device = self.platform.device.clone();
+        let device = Rc::clone(&self.platform.primary_device().device);
         let mut newly_unsupported = false;
         let result = self.arm_idle_vblanks_with(target_mscs, |crtc_id| {
             match crate::drm::page_flip::queue_crtc_sequence(
@@ -7358,10 +7390,10 @@ impl KmsBackend {
         );
         // 2. Re-query connectors + redo modeset on existing device.
         log::info!("kms: run_resume step 2 — requery_outputs_and_modeset");
-        let configured = self.randr_id_alloc.client_configured_names();
+        let configured = self.randr_id_alloc.client_configured_keys();
         match self.platform.requery_outputs_and_modeset(&configured) {
             Ok(rescan) => {
-                if rescan.added_count != 0 || !rescan.dropped_names.is_empty() {
+                if rescan.added_count != 0 || !rescan.dropped_keys.is_empty() {
                     self.fire_randr_changes(state, rescan);
                 }
                 // Drop armed-target entries for CRTCs retired while suspended
@@ -7445,11 +7477,19 @@ impl KmsBackend {
         state: &mut ServerState,
         rescan: crate::kms::render::platform::RescanResult,
     ) {
-        for name in &rescan.added_names {
-            log::info!("kms: RandR output connected: {name}");
+        for key in &rescan.added_keys {
+            log::info!(
+                "kms: RandR output connected: {} on {}",
+                key.connector_name,
+                key.device_key
+            );
         }
-        for name in &rescan.dropped_names {
-            log::info!("kms: RandR output disconnected: {name}");
+        for key in &rescan.dropped_keys {
+            log::info!(
+                "kms: RandR output disconnected: {} on {}",
+                key.connector_name,
+                key.device_key
+            );
         }
 
         // `requery_outputs_and_modeset` has established the new output set,
@@ -7480,16 +7520,16 @@ impl KmsBackend {
         // `platform.outputs`, so `randr_outputs_and_modes` reports them
         // connected-but-dark (mode=0, crtc unassigned) until a client
         // enables them via RRSetCrtcConfig.
-        for name in &rescan.dropped_names {
-            self.randr_id_alloc.entry_mut(name).connected = false;
+        for key in &rescan.dropped_keys {
+            self.randr_id_alloc.entry_mut(key).connected = false;
         }
-        for output in &rescan.added_outputs {
+        for (key, output) in &rescan.added_outputs {
             let modes: Vec<(u16, u16, u32, bool)> = output
                 .modes
                 .iter()
                 .map(|m| (m.width, m.height, m.vrefresh, m.preferred))
                 .collect();
-            let entry = self.randr_id_alloc.entry_mut(&output.connector_name);
+            let entry = self.randr_id_alloc.entry_mut(key);
             entry.connected = true;
             entry.config = ConnectorConfig::Off;
             entry.modes = modes;
@@ -7562,10 +7602,10 @@ impl KmsBackend {
             log::debug!("kms: display rescan skipped (VT not Active)");
             return;
         }
-        let configured = self.randr_id_alloc.client_configured_names();
+        let configured = self.randr_id_alloc.client_configured_keys();
         match self.platform.requery_outputs_and_modeset(&configured) {
             Ok(rescan) => {
-                if rescan.added_count == 0 && rescan.dropped_names.is_empty() {
+                if rescan.added_count == 0 && rescan.dropped_keys.is_empty() {
                     log::debug!("kms: display rescan found no topology change");
                     return;
                 }
@@ -12131,7 +12171,13 @@ impl KmsBackend {
     fn live_crtc_and_gamma_size(
         &self,
         connector: &str,
-    ) -> io::Result<Option<(::drm::control::crtc::Handle, u16)>> {
+    ) -> io::Result<
+        Option<(
+            crate::platform::drm::DrmDeviceKey,
+            ::drm::control::crtc::Handle,
+            u16,
+        )>,
+    > {
         use ::drm::control::Device as ControlDevice;
 
         let Some(layout) = self
@@ -12143,16 +12189,19 @@ impl KmsBackend {
             return Ok(None);
         };
         let crtc = layout.output.crtc;
-        let info = self.platform.device.get_crtc(crtc).map_err(|e| {
+        let Some(device) = self.platform.device_for_output(&layout.key) else {
+            return Ok(None);
+        };
+        let info = device.device.get_crtc(crtc).map_err(|e| {
             io::Error::other(format!("get_crtc gamma size for {connector} failed: {e}"))
         })?;
         let size = u16::try_from(info.gamma_length()).unwrap_or(u16::MAX);
-        Ok(Some((crtc, size)))
+        Ok(Some((layout.key.device_key, crtc, size)))
     }
 
     fn nominal_gamma_size(&self, connector: &str) -> u16 {
         match self.live_crtc_and_gamma_size(connector) {
-            Ok(Some((_, size))) => size,
+            Ok(Some((_, _, size))) => size,
             Ok(None) => self
                 .gamma_luts
                 .borrow()
@@ -12196,14 +12245,17 @@ impl KmsBackend {
     fn apply_gamma_to_live_connector(&self, connector: &str) -> io::Result<()> {
         use ::drm::control::Device as ControlDevice;
 
-        let Some((crtc, gamma_size)) = self.live_crtc_and_gamma_size(connector)? else {
+        let Some((device_key, crtc, gamma_size)) = self.live_crtc_and_gamma_size(connector)? else {
             return Ok(());
         };
         if gamma_size == 0 {
             return Ok(());
         }
         let lut = self.cached_gamma_for_current_size(connector, gamma_size);
-        self.platform
+        let Some(device) = self.platform.device_for_key(device_key) else {
+            return Ok(());
+        };
+        device
             .device
             .set_gamma(crtc, &lut.red, &lut.green, &lut.blue)
             .map_err(|e| io::Error::other(format!("set_gamma for {connector} failed: {e}")))
@@ -12324,7 +12376,7 @@ impl Backend for KmsBackend {
 
     fn get_crtc_gamma(&self, connector: &str) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
         let lut = match self.live_crtc_and_gamma_size(connector) {
-            Ok(Some((_, size))) => self.cached_gamma_for_current_size(connector, size),
+            Ok(Some((_, _, size))) => self.cached_gamma_for_current_size(connector, size),
             Ok(None) => self.cached_gamma(connector),
             Err(e) => {
                 log::warn!("kms gamma: {connector} get gamma size failed: {e}");
@@ -12517,7 +12569,12 @@ impl Backend for KmsBackend {
             // the permanent-stall failure mode this guards against.
             if let Ok((_flips, sequences)) = self.platform.drain_page_flip_events() {
                 for seq in sequences {
-                    self.on_crtc_sequence_event(seq.user_data, seq.time_ns, seq.sequence);
+                    self.on_crtc_sequence_event(
+                        seq.device_key,
+                        seq.user_data,
+                        seq.time_ns,
+                        seq.sequence,
+                    );
                 }
             }
             log::debug!("render on_page_flip_ready: skipped (seat not Active)");
@@ -12547,7 +12604,7 @@ impl Backend for KmsBackend {
         // updated `(msc, ust)` via `present_get_ust_msc` and fires parked
         // NotifyMSC, then re-arms if any remain.
         for seq in sequences {
-            self.on_crtc_sequence_event(seq.user_data, seq.time_ns, seq.sequence);
+            self.on_crtc_sequence_event(seq.device_key, seq.user_data, seq.time_ns, seq.sequence);
         }
         // The just-retired flip(s) freed up the primary atomic-commit
         // queue on at least one CRTC; retry any cursor move that lost
@@ -13078,9 +13135,11 @@ impl Backend for KmsBackend {
                 src_h: u32::from(layout.height),
             })
             .collect();
-        if let Err(error) =
-            crate::drm::modeset::submit_direct_scanout(&self.platform.device, fb, &plane_states)
-        {
+        if let Err(error) = crate::drm::modeset::submit_direct_scanout(
+            &self.platform.primary_device().device,
+            fb,
+            &plane_states,
+        ) {
             <Self as Backend>::release_present_source(self, source_pin);
             <Self as Backend>::release_present_source(self, fallback_target_pin);
             self.scanout_m2.reset_eligible_root_probation();
@@ -13278,6 +13337,7 @@ impl Backend for KmsBackend {
                 None => {
                     let v = self
                         .platform
+                        .primary_device()
                         .render_node_device
                         .as_ref()
                         .is_some_and(crate::kms::render::imported_syncobj::eventfd_supported);
@@ -13475,7 +13535,7 @@ impl Backend for KmsBackend {
         if self.crtc_queue_sequence_unsupported {
             return Ok(0);
         }
-        let device = self.platform.device.clone();
+        let device = Rc::clone(&self.platform.primary_device().device);
         let mut newly_unsupported = false;
         let result = self.arm_present_absolute_vblank_with(targets, |crtc_id, target| {
             match crate::drm::page_flip::queue_crtc_sequence(
@@ -13574,8 +13634,10 @@ impl Backend for KmsBackend {
         log::info!("kms: VT release — input paused; run_suspend");
         self.drive_vt_event(state, VtEventKind::Disable);
         log::info!("kms: VT release — suspended; drmDropMaster");
-        if let Err(err) = self.platform.device.release_master_lock() {
-            log::warn!("kms: drmDropMaster failed: {err}");
+        for device in &self.platform.devices {
+            if let Err(err) = device.device.release_master_lock() {
+                log::warn!("kms: drmDropMaster failed on {}: {err}", device.key);
+            }
         }
         log::info!("kms: VT release — master dropped; VT_RELDISP(1)");
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -13600,17 +13662,20 @@ impl Backend for KmsBackend {
         }
         log::info!("kms: VT acquire — acked; drmSetMaster");
 
-        let acquired = match try_acquire_master_bounded(
-            || self.platform.device.acquire_master_lock(),
-            10,
-            std::time::Duration::from_millis(5),
-        ) {
-            Ok(()) => true,
-            Err(err) => {
-                log::error!("kms: drmSetMaster failed after retries: {err}");
-                false
+        let mut acquired = true;
+        for device in &self.platform.devices {
+            if let Err(err) = try_acquire_master_bounded(
+                || device.device.acquire_master_lock(),
+                10,
+                std::time::Duration::from_millis(5),
+            ) {
+                log::error!(
+                    "kms: drmSetMaster failed on {} after retries: {err}",
+                    device.key
+                );
+                acquired = false;
             }
-        };
+        }
         if !acquired {
             log::warn!("kms: proceeding with best-effort resume after SetMaster failure");
         }
@@ -13661,8 +13726,10 @@ impl Backend for KmsBackend {
         // properties and modifiers and computes hypothetical assignments;
         // under Cinnamon/GPU load that unrelated work blocked dispatch for
         // 90–113 ms every time the desktop polled GetScreenResources.
-        let probes = crate::platform::drm::probe_connectors(&self.platform.device)?;
-        let changed = reconcile_connector_probe(&mut self.randr_id_alloc, &probes);
+        let device_key = self.platform.primary_device().key;
+        let device = Rc::clone(&self.platform.primary_device().device);
+        let probes = crate::platform::drm::probe_connectors(&device)?;
+        let changed = reconcile_connector_probe(&mut self.randr_id_alloc, device_key, &probes);
         // Pure re-probe: never bumps lastSetTime (set_time = None); bumps
         // lastConfigTime only when something actually changed. A no-op
         // probe leaves both timestamps + the client-set screen size
@@ -13673,11 +13740,36 @@ impl Backend for KmsBackend {
 
     fn apply_crtc_config(
         &mut self,
+        output_id: u32,
         connector: &str,
         mode: Option<yserver_core::backend::ModeSpec>,
         x: i32,
         y: i32,
     ) -> io::Result<bool> {
+        let output_key = self
+            .output_key_by_id
+            .get(&output_id)
+            .cloned()
+            .ok_or_else(|| io::Error::other(format!("unknown RANDR output id {output_id}")))?;
+        if output_key.connector_name != connector {
+            return Err(io::Error::other(format!(
+                "RANDR output {output_id} name mismatch: registry has {}, request resolved {connector}",
+                output_key.connector_name
+            )));
+        }
+        let output_device = Rc::clone(
+            &self
+                .platform
+                .device_for_output(&output_key)
+                .ok_or_else(|| {
+                    io::Error::other(format!(
+                        "RANDR output {output_id} belongs to unavailable DRM device {}",
+                        output_key.device_key
+                    ))
+                })?
+                .device,
+        );
+
         // ── Idempotency guard (CRITICAL) ──────────────────────────────────
         //
         // MATE / mate-settings-daemon re-assert the SAME SetCrtcConfig many
@@ -13702,7 +13794,7 @@ impl Backend for KmsBackend {
             .platform
             .outputs
             .iter()
-            .find(|l| l.output.connector_name == connector)
+            .find(|layout| layout.key == output_key)
             .map_or(ConnectorConfig::Off, |l| ConnectorConfig::Enabled {
                 mode_w: l.width,
                 mode_h: l.height,
@@ -13718,7 +13810,7 @@ impl Backend for KmsBackend {
             // touching the hardware. Return `false` = nothing changed, so the
             // handler skips the change-notify (Xorg RRTellChanged only fires
             // on a real change) — this is what breaks MATE's re-assert loop.
-            let entry = self.randr_id_alloc.entry_mut(connector);
+            let entry = self.randr_id_alloc.entry_mut(&output_key);
             entry.config = requested;
             return Ok(false);
         }
@@ -13752,7 +13844,7 @@ impl Backend for KmsBackend {
         match mode {
             None => {
                 // ── Disable path ─────────────────────────────────────────
-                match self.platform.disable_connector(connector) {
+                match self.platform.disable_connector(&output_key) {
                     Ok(true) => {
                         log::info!("apply_crtc_config: disabled {connector}");
                     }
@@ -13772,7 +13864,7 @@ impl Backend for KmsBackend {
                 }
                 // Update registry: connector stays known, config → Off.
                 {
-                    let entry = self.randr_id_alloc.entry_mut(connector);
+                    let entry = self.randr_id_alloc.entry_mut(&output_key);
                     entry.config = ConnectorConfig::Off;
                     // client_configured is set to record that a client
                     // explicitly disabled this output (not an auto-layout op).
@@ -13785,8 +13877,7 @@ impl Backend for KmsBackend {
                 // Re-discover all outputs to get a fresh Output with the
                 // correct CRTC/plane/property assignments. We filter to
                 // the one matching `connector`.
-                let discovered = match crate::platform::drm::discover_outputs(&self.platform.device)
-                {
+                let discovered = match crate::platform::drm::discover_outputs(&output_device) {
                     Ok(v) => v,
                     Err(e) => {
                         log::error!("apply_crtc_config: discover_outputs failed: {e}");
@@ -13811,9 +13902,12 @@ impl Backend for KmsBackend {
                 };
 
                 // enable_connector handles: mode resolution, pool
-                // (re)alloc, commit_modeset, OutputLayout update,
+                // (re)alloc, commit_modeset, ActiveOutput update,
                 // fb extent recompute.
-                if let Err(e) = self.platform.enable_connector(output, mode_spec, x, y) {
+                if let Err(e) = self
+                    .platform
+                    .enable_connector(&output_key, output, mode_spec, x, y)
+                {
                     log::error!("apply_crtc_config: enable_connector({connector}) failed: {e}");
                     let _ = self.scene.rebuild_outputs(&self.platform);
                     return Err(e);
@@ -13822,7 +13916,7 @@ impl Backend for KmsBackend {
 
                 // Update registry.
                 {
-                    let entry = self.randr_id_alloc.entry_mut(connector);
+                    let entry = self.randr_id_alloc.entry_mut(&output_key);
                     entry.config = ConnectorConfig::Enabled {
                         mode_w: mode_spec.width,
                         mode_h: mode_spec.height,
@@ -19099,9 +19193,14 @@ impl Backend for KmsBackend {
         // populates it, the second crashes in `amdgpu_winsys_create`
         // hitting leftover handles. See
         // feedback_dri3_open_fresh_fd.md.
-        let path = self.platform.render_node_path.as_deref().ok_or_else(|| {
-            io::Error::other("DRI3 unavailable — render node was not resolved at backend init")
-        })?;
+        let path = self
+            .platform
+            .primary_device()
+            .render_node_path
+            .as_deref()
+            .ok_or_else(|| {
+                io::Error::other("DRI3 unavailable — render node was not resolved at backend init")
+            })?;
         crate::kms::render_node::open_fresh(path)
             .map_err(|e| io::Error::other(format!("open render-node {}: {e}", path.display())))
     }
@@ -19112,7 +19211,8 @@ impl Backend for KmsBackend {
         // both. `render_node_device` is the guard here (not the bare
         // `render_node_fd`) because it is what the syncobj ioctls and the
         // capability query run on.
-        if self.platform.render_node_device.is_none() || self.platform.vk.is_none() {
+        if self.platform.primary_device().render_node_device.is_none() || self.platform.vk.is_none()
+        {
             return Dri3Caps::unsupported();
         }
         let vk = self.platform.vk.as_ref().expect("vk Some by branch above");
@@ -19124,7 +19224,7 @@ impl Backend for KmsBackend {
         // driver. The previous NVIDIA blacklist here was a correct response
         // to vkImportSemaphoreFdKHR rejecting DRM syncobj fds, which no
         // longer matters because nothing imports them into Vulkan.
-        let syncobj = self.platform.syncobj_timeline;
+        let syncobj = self.platform.primary_device().syncobj_timeline;
         Dri3Caps {
             version: dri3_version_for(syncobj),
             modifiers,
@@ -19476,6 +19576,7 @@ impl Backend for KmsBackend {
 
         let render_node = self
             .platform
+            .primary_device()
             .render_node_device
             .as_ref()
             .cloned()
@@ -20817,12 +20918,34 @@ mod tests {
         reconcile_connector_probe, resolve_picture_for_render,
         restore_primary_output_after_rebuild,
     };
-    use crate::kms::{
-        cpu_types::{Rectangle16, Repeat},
-        render::{platform::PlatformBackend, store::Storage},
+    use crate::{
+        kms::{
+            backend::OutputKey,
+            cpu_types::{Rectangle16, Repeat},
+            render::{platform::PlatformBackend, store::Storage},
+        },
+        platform::drm::DrmDeviceKey,
     };
     use std::collections::HashMap;
     use yserver_core::{backend::Backend, server::ServerState};
+
+    fn test_device_key(minor: u32) -> DrmDeviceKey {
+        DrmDeviceKey { major: 226, minor }
+    }
+
+    fn test_output_key(minor: u32, connector_name: &str) -> OutputKey {
+        OutputKey::new(test_device_key(minor), connector_name)
+    }
+
+    fn dispatch_test_sequence(
+        backend: &mut KmsBackend,
+        user_data: u64,
+        time_ns: i64,
+        sequence: u64,
+    ) {
+        let device_key = backend.platform.primary_device().key;
+        backend.on_crtc_sequence_event(device_key, user_data, time_ns, sequence);
+    }
 
     #[test]
     fn randr_rebuild_preserves_primary_while_output_resource_exists() {
@@ -21433,15 +21556,86 @@ mod tests {
     #[test]
     fn randr_ids_are_stable_across_drop() {
         let mut alloc = RandrIdAllocator::default();
-        let a = alloc.ids_for("DP-1");
-        let b = alloc.ids_for("HDMI-A-1");
+        let dp1 = test_output_key(0, "DP-1");
+        let hdmi1 = test_output_key(0, "HDMI-A-1");
+        let dp2 = test_output_key(0, "DP-2");
+        let a = alloc.ids_for(&dp1);
+        let b = alloc.ids_for(&hdmi1);
         assert_ne!(a.output_id, b.output_id);
-        let a2 = alloc.ids_for("DP-1");
+        let a2 = alloc.ids_for(&dp1);
         assert_eq!(a, a2, "a surviving/returning connector keeps its IDs");
-        let c = alloc.ids_for("DP-2");
+        let c = alloc.ids_for(&dp2);
         assert_ne!(c.output_id, a.output_id);
         assert_ne!(c.output_id, b.output_id);
         assert_ne!(c.crtc_id, a.crtc_id);
+    }
+
+    #[test]
+    fn randr_ids_distinguish_equal_connector_names_on_different_devices() {
+        let mut alloc = RandrIdAllocator::default();
+        let first = test_output_key(0, "HDMI-A-1");
+        let second = test_output_key(1, "HDMI-A-1");
+
+        let first_ids = alloc.ids_for(&first);
+        let second_ids = alloc.ids_for(&second);
+
+        assert_ne!(first_ids.output_id, second_ids.output_id);
+        assert_ne!(first_ids.crtc_id, second_ids.crtc_id);
+        assert_eq!(alloc.ids_for(&first), first_ids);
+        assert_eq!(alloc.ids_for(&second), second_ids);
+    }
+
+    #[test]
+    fn randr_provider_ids_are_stable_and_share_the_xid_namespace() {
+        let mut alloc = RandrIdAllocator::default();
+        let first_device = test_device_key(0);
+        let second_device = test_device_key(1);
+        let first_provider = alloc.provider_id_for(first_device);
+        let output = alloc.ids_for(&test_output_key(0, "DP-1"));
+        let mode = alloc.mode_id(1920, 1080, 60);
+        let second_provider = alloc.provider_id_for(second_device);
+
+        assert_eq!(alloc.provider_id_for(first_device), first_provider);
+        let ids = [
+            first_provider,
+            output.output_id,
+            output.crtc_id,
+            mode,
+            second_provider,
+        ];
+        let unique: std::collections::HashSet<u32> = ids.into_iter().collect();
+        assert_eq!(unique.len(), ids.len());
+    }
+
+    #[test]
+    fn randr_projection_retains_device_identity_for_equal_connector_names() {
+        let mut b = KmsBackend::for_tests();
+        let first = test_output_key(1, "HDMI-A-1");
+        let second = test_output_key(2, "HDMI-A-1");
+        let first_ids = b.randr_id_alloc.ids_for(&first);
+        let second_ids = b.randr_id_alloc.ids_for(&second);
+
+        let (outputs, _) = b.randr_outputs_and_modes();
+        let matching: Vec<_> = outputs
+            .iter()
+            .filter(|output| output.name == "HDMI-A-1")
+            .collect();
+
+        assert_eq!(matching.len(), 2);
+        assert_ne!(first_ids.output_id, second_ids.output_id);
+        assert_eq!(b.output_key_by_id.get(&first_ids.output_id), Some(&first));
+        assert_eq!(b.output_key_by_id.get(&second_ids.output_id), Some(&second));
+    }
+
+    #[test]
+    fn active_test_output_carries_its_owning_device_key() {
+        let b = KmsBackend::for_tests();
+        assert_eq!(b.platform.devices.len(), 1);
+        assert_eq!(b.platform.outputs.len(), 1);
+        assert_eq!(
+            b.platform.outputs[0].key.device_key,
+            b.platform.primary_device().key
+        );
     }
 
     #[test]
@@ -21460,14 +21654,21 @@ mod tests {
         }
 
         let mut b = KmsBackend::for_tests();
+        let device_key = b.platform.primary_device().key;
+        let dp1_key = OutputKey::new(device_key, "DP-1");
+        let dp2_key = OutputKey::new(device_key, "DP-2");
+        let hdmi_key = OutputKey::new(device_key, "HDMI-A-1");
+        let other_device_key = test_output_key(1, "DP-9");
         {
-            let dp = b.randr_id_alloc.entry_mut("DP-1");
+            let dp = b.randr_id_alloc.entry_mut(&dp1_key);
             dp.connected = true;
             dp.modes = vec![(2560, 1440, 60, true)];
         }
         // A connector absent from the kernel resource list must also be
         // marked disconnected.
-        b.randr_id_alloc.entry_mut("DP-2").connected = true;
+        b.randr_id_alloc.entry_mut(&dp2_key).connected = true;
+        // A connector on another device is outside this probe's scope.
+        b.randr_id_alloc.entry_mut(&other_device_key).connected = true;
 
         let probes = vec![
             ConnectorProbe {
@@ -21481,22 +21682,34 @@ mod tests {
                 modes: vec![mode(1920, 1080, true)],
             },
         ];
-        assert!(reconcile_connector_probe(&mut b.randr_id_alloc, &probes));
+        assert!(reconcile_connector_probe(
+            &mut b.randr_id_alloc,
+            device_key,
+            &probes
+        ));
 
-        let dp1 = b.randr_id_alloc.connectors.get("DP-1").unwrap();
+        let dp1 = b.randr_id_alloc.connectors.get(&dp1_key).unwrap();
         assert!(!dp1.connected);
         assert_eq!(
             dp1.modes,
             vec![(2560, 1440, 60, true)],
             "disconnect retains the last-known mode list"
         );
-        assert!(!b.randr_id_alloc.connectors.get("DP-2").unwrap().connected);
-        let hdmi = b.randr_id_alloc.connectors.get("HDMI-A-1").unwrap();
+        assert!(!b.randr_id_alloc.connectors.get(&dp2_key).unwrap().connected);
+        assert!(
+            b.randr_id_alloc
+                .connectors
+                .get(&other_device_key)
+                .unwrap()
+                .connected,
+            "probing one DRM device must not disconnect another device's outputs"
+        );
+        let hdmi = b.randr_id_alloc.connectors.get(&hdmi_key).unwrap();
         assert!(hdmi.connected);
         assert_eq!(hdmi.modes, vec![(1920, 1080, 60, true)]);
 
         assert!(
-            !reconcile_connector_probe(&mut b.randr_id_alloc, &probes),
+            !reconcile_connector_probe(&mut b.randr_id_alloc, device_key, &probes),
             "an identical forced probe must not bump RANDR config time"
         );
     }
@@ -21519,8 +21732,9 @@ mod tests {
     #[test]
     fn randr_output_mode_ids_have_no_duplicate_xids() {
         let mut b = KmsBackend::for_tests();
+        let hdmi_key = OutputKey::new(b.platform.primary_device().key, "HDMI-A-1");
         {
-            let e = b.randr_id_alloc.entry_mut("HDMI-A-1");
+            let e = b.randr_id_alloc.entry_mut(&hdmi_key);
             e.connected = true;
             e.config = super::ConnectorConfig::Off;
             e.modes = vec![
@@ -21554,16 +21768,18 @@ mod tests {
     #[test]
     fn not_live_output_reports_connected_off_vs_disconnected() {
         let mut b = KmsBackend::for_tests();
+        let hdmi_key = OutputKey::new(b.platform.primary_device().key, "HDMI-A-1");
+        let dp_key = OutputKey::new(b.platform.primary_device().key, "DP-3");
 
         // Hotplugged, registered OFF (the Task 5.2 add-path outcome).
         {
-            let e = b.randr_id_alloc.entry_mut("HDMI-A-1");
+            let e = b.randr_id_alloc.entry_mut(&hdmi_key);
             e.connected = true;
             e.config = super::ConnectorConfig::Off;
             e.modes = vec![(1920, 1080, 60, true)];
         }
         // Physically disconnected (default connected=false).
-        let _ = b.randr_id_alloc.entry_mut("DP-3");
+        let _ = b.randr_id_alloc.entry_mut(&dp_key);
 
         let (outs, _modes) = b.randr_outputs_and_modes();
 
@@ -28175,7 +28391,7 @@ mod tests {
 
         let b = KmsBackend::for_tests();
         assert!(
-            !b.platform.syncobj_timeline,
+            !b.platform.primary_device().syncobj_timeline,
             "for_tests() has no render node, so the capability must be false",
         );
     }
@@ -28367,7 +28583,7 @@ mod tests {
         // directly; the OwnedFd's Drop closes it.
         let fd = unsafe { OwnedFd::from_raw_fd(f.into_raw_fd()) };
         let mut b = KmsBackend::for_tests();
-        b.platform.render_node_device = Some(std::sync::Arc::new(
+        b.platform.primary_device_mut().render_node_device = Some(std::sync::Arc::new(
             crate::drm::Device::open_render_node("/dev/null").expect("open /dev/null"),
         ));
         assert!(
@@ -31402,7 +31618,12 @@ mod tests {
         let crtc = b.platform.outputs[0].output.crtc;
         b.armed_vblank_targets.insert(crtc, 0);
 
-        b.on_crtc_sequence_event(u64::from(u32::from(crtc)), 1_500_000 /* 1.5ms */, 7);
+        dispatch_test_sequence(
+            &mut b,
+            u64::from(u32::from(crtc)),
+            1_500_000, /* 1.5ms */
+            7,
+        );
 
         assert!(b.armed_vblank_targets.is_empty(), "arm must be cleared");
         // ust_msc stores microseconds; primary output is index 0.
@@ -31425,7 +31646,7 @@ mod tests {
         b.armed_vblank_targets.insert(crtc, 0);
         b.scene.scene_structure_dirty = true;
 
-        b.on_crtc_sequence_event(u64::from(u32::from(crtc)), 2_000_000, 9);
+        dispatch_test_sequence(&mut b, u64::from(u32::from(crtc)), 2_000_000, 9);
 
         assert_eq!(b.platform.present_get_ust_msc(), (9, 2_000));
         assert_eq!(
@@ -31446,7 +31667,7 @@ mod tests {
             .insert(9);
         b.scene.scene_structure_dirty = true;
 
-        b.on_crtc_sequence_event(super::absolute_seq_user_data(crtc_id), 2_000_000, 9);
+        dispatch_test_sequence(&mut b, super::absolute_seq_user_data(crtc_id), 2_000_000, 9);
 
         assert_eq!(b.platform.present_get_ust_msc(), (9, 2_000));
         assert_eq!(
@@ -31502,7 +31723,7 @@ mod tests {
         let crtc = b.platform.outputs[0].output.crtc;
         b.armed_vblank_targets.insert(crtc, 0);
 
-        b.on_crtc_sequence_event(u64::from(u32::from(crtc)), -1, 7);
+        dispatch_test_sequence(&mut b, u64::from(u32::from(crtc)), -1, 7);
 
         assert!(
             b.armed_vblank_targets.is_empty(),
@@ -31521,13 +31742,33 @@ mod tests {
         let stale = ::drm::control::from_u32(999).unwrap();
         b.armed_vblank_targets.insert(stale, 0);
 
-        b.on_crtc_sequence_event(999, 1_000_000, 5);
+        dispatch_test_sequence(&mut b, 999, 1_000_000, 5);
 
         assert!(
             b.armed_vblank_targets.is_empty(),
             "stale arm cleared so the CRTC can't strand"
         );
         assert_eq!(b.platform.present_get_ust_msc(), (0, 0));
+    }
+
+    #[test]
+    fn on_crtc_sequence_event_from_wrong_device_does_not_advance_clock() {
+        let mut b = super::KmsBackend::for_tests();
+        let crtc = b.platform.outputs[0].output.crtc;
+        b.armed_vblank_targets.insert(crtc, 0);
+        let wrong_device = test_device_key(99);
+
+        b.on_crtc_sequence_event(wrong_device, u64::from(u32::from(crtc)), 1_000_000, 5);
+
+        assert!(
+            b.armed_vblank_targets.is_empty(),
+            "the raw CRTC arm is still cleared so it cannot strand"
+        );
+        assert_eq!(
+            b.platform.present_get_ust_msc(),
+            (0, 0),
+            "an equal CRTC handle from another DRM device must not update this output"
+        );
     }
 
     #[test]
@@ -31629,7 +31870,12 @@ mod tests {
             .insert(50);
 
         // Tagged (absolute) event for the same CRTC.
-        b.on_crtc_sequence_event(super::ABSOLUTE_SEQ_TAG | u64::from(crtc_id), 1_000_000, 50);
+        dispatch_test_sequence(
+            &mut b,
+            super::ABSOLUTE_SEQ_TAG | u64::from(crtc_id),
+            1_000_000,
+            50,
+        );
 
         assert!(
             b.armed_vblank_targets.contains_key(&crtc),
@@ -31649,7 +31895,7 @@ mod tests {
             .insert(50);
 
         // Untagged (relative) event for the same CRTC.
-        b.on_crtc_sequence_event(u64::from(crtc_id), 1_000_000, 50);
+        dispatch_test_sequence(&mut b, u64::from(crtc_id), 1_000_000, 50);
 
         assert_eq!(
             b.absolute_vblank_targets.get(&crtc_id).unwrap(),
@@ -31668,7 +31914,12 @@ mod tests {
             .or_default()
             .extend([40u64, 50, 60]);
 
-        b.on_crtc_sequence_event(super::ABSOLUTE_SEQ_TAG | u64::from(crtc_id), 1_000_000, 50);
+        dispatch_test_sequence(
+            &mut b,
+            super::ABSOLUTE_SEQ_TAG | u64::from(crtc_id),
+            1_000_000,
+            50,
+        );
 
         assert_eq!(
             b.absolute_vblank_targets.get(&crtc_id).unwrap(),
@@ -31696,7 +31947,12 @@ mod tests {
 
         // Uses the same producer `arm_present_absolute_vblank` feeds the
         // ioctl, pinning that producer and consumer agree on the encoding.
-        b.on_crtc_sequence_event(super::absolute_seq_user_data(crtc_id), 1_000_000, 50);
+        dispatch_test_sequence(
+            &mut b,
+            super::absolute_seq_user_data(crtc_id),
+            1_000_000,
+            50,
+        );
 
         assert!(
             !b.absolute_vblank_targets.contains_key(&crtc_id),
@@ -31771,9 +32027,10 @@ mod tests {
     /// between. Mirrors `PlatformBackend::for_tests()`'s single-output
     /// literal.
     fn push_test_output(b: &mut super::KmsBackend, crtc_id: u32) {
-        use crate::kms::backend::OutputLayout;
-        b.platform.outputs.push(OutputLayout {
-            output: crate::platform::drm::Output {
+        use crate::kms::backend::ActiveOutput;
+        b.platform.outputs.push(ActiveOutput::new(
+            b.platform.primary_device().key,
+            crate::platform::drm::Output {
                 connector: ::drm::control::from_u32(crtc_id).unwrap(),
                 connector_name: "test2".to_string(),
                 crtc: ::drm::control::from_u32(crtc_id).unwrap(),
@@ -31814,12 +32071,10 @@ mod tests {
                     ..Default::default()
                 }],
             },
-            swapchain: crate::drm::Swapchain::empty_for_tests(),
-            x: 800,
-            y: 0,
-            width: 800,
-            height: 600,
-        });
+            crate::drm::Swapchain::empty_for_tests(),
+            800,
+            0,
+        ));
     }
 
     #[test]

@@ -42,6 +42,18 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   exposed to higher KMS/RANDR layers through the `platform::drm` topology
   façade. The sibling-first, sole-node fallback, ambiguity error, and both
   explicit device overrides are preserved.
+- **2026-08-16 device-qualified RANDR topology groundwork:** active outputs
+  and the persistent connector registry are now keyed by `(DRM device key,
+  connector name)`, so equal names on different cards receive distinct,
+  stable output and CRTC XIDs. Provider IDs reserve entries from the same
+  monotonic RANDR XID source, and `SetCrtcConfig` carries the output XID back
+  into the backend instead of treating a connector name as globally unique.
+  Device/render-node resources now live in a one-entry `KmsDevice` vector, but
+  the runtime still opens and activates only one KMS card at this step;
+  multi-card opening, exact-fd event routing, and activation land in the
+  subsequent PRIME lifecycle work. The current lightweight forced-probe path,
+  mode deduplication, output-change notifications, DRI3 syncobj handling, and
+  direct-scanout behavior remain intact.
 - **2026-08-14 render-node resolution on split display/render SoCs (Asahi):**
   cinnamon flashed and rendered unstably on Apple Silicon (`air`) while
   MATE/XFCE looked fine; bisected to `bbc9d30f` (the FreeBSD render-node

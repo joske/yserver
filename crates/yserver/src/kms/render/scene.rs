@@ -1833,6 +1833,15 @@ fn tick_one_output(
     let compose_ticket = platform
         .acquire_fence_ticket()
         .map_err(|e| SceneError::Present(PresentError::Vk(e)))?;
+    let drm_device = platform
+        .device_for_output(&platform.outputs[output_idx].key)
+        .map(|device| device.device.clone())
+        .ok_or_else(|| {
+            SceneError::Present(PresentError::Io(std::io::Error::other(format!(
+                "no DRM device for output {:?}",
+                platform.outputs[output_idx].key
+            ))))
+        })?;
     let pool = platform
         .scanout_pools
         .get_mut(output_idx)
@@ -1866,7 +1875,7 @@ fn tick_one_output(
     let record_start = std::time::Instant::now();
     let compose_result = record_compose(
         &inner.vk,
-        &platform.device,
+        &drm_device,
         &layout.output,
         bo,
         &inner.pipeline,

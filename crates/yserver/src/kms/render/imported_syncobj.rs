@@ -15,7 +15,7 @@
 //! export.
 //!
 //! The `Arc<crate::drm::Device>` here MUST be the render node — the device
-//! DRI3 hands the client (`PlatformBackend::render_node_device`), never the
+//! DRI3 hands the client (`KmsDevice::render_node_device`), never the
 //! KMS node. See the spec's "Which fd to ask" section.
 
 use std::{

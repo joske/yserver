@@ -24,7 +24,7 @@ use yserver_protocol::x11::{ClipRectangles, FontMetrics, ResourceId, glx, xfixes
 use crate::{
     backend::{
         AnyHandle, Backend, ClipState, CompletedPresentEvent, CursorHandle, DrawState, FillState,
-        FontHandle, GlyphSetHandle, OriginContext, PictureHandle, PixmapHandle,
+        FontHandle, GlyphSetHandle, ModeSpec, OriginContext, PictureHandle, PixmapHandle,
         PresentScanoutCandidate, PresentSourceWait, WindowHandle,
     },
     host_x11::{HostSubwindowConfig, HostSubwindowVisual, HostXidMap, PointerPosition},
@@ -124,6 +124,13 @@ pub enum RecordedCall {
         back: (u16, u16, u16),
     },
     SetDpmsPower(u8),
+    ApplyCrtcConfig {
+        output_id: u32,
+        connector: String,
+        mode: Option<ModeSpec>,
+        x: i32,
+        y: i32,
+    },
     /// GLX-TFP Task 3.4: `acquire_glx_pixmap_export(host_xid)` called.
     AcquireGlxPixmapExport(u32),
     /// GLX-TFP Task 3.4: `release_glx_pixmap_export(host_xid)` called.
@@ -835,6 +842,24 @@ impl Backend for RecordingBackend {
 
     fn crtc_gamma_size(&self, _connector: &str) -> u16 {
         256
+    }
+
+    fn apply_crtc_config(
+        &mut self,
+        output_id: u32,
+        connector: &str,
+        mode: Option<ModeSpec>,
+        x: i32,
+        y: i32,
+    ) -> io::Result<bool> {
+        self.record(RecordedCall::ApplyCrtcConfig {
+            output_id,
+            connector: connector.to_string(),
+            mode,
+            x,
+            y,
+        });
+        Ok(false)
     }
 
     fn set_crtc_gamma(

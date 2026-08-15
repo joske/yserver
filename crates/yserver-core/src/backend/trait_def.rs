@@ -474,7 +474,7 @@ pub trait Backend {
         Ok(())
     }
 
-    /// Apply a client-driven CRTC configuration to `connector`.
+    /// Apply a client-driven CRTC configuration to `output_id` / `connector`.
     /// `mode = None` disables the output (frees its scanout, removes it
     /// from the active set, registry → Off, connector stays known).
     /// `mode = Some` enables/changes it at `(x, y)` (reallocating the
@@ -489,6 +489,7 @@ pub trait Backend {
     /// `Ok(false)` no-op for nested/recording backends.
     fn apply_crtc_config(
         &mut self,
+        _output_id: u32,
         _connector: &str,
         _mode: Option<ModeSpec>,
         _x: i32,

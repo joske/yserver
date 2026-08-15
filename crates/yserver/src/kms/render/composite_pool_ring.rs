@@ -138,7 +138,7 @@ impl CompositePoolRing {
 impl Drop for CompositePoolRing {
     fn drop(&mut self) {
         // The frames that owned these pools are gone; destroy them.
-        // Drop runs only when the parent OutputLayout is itself
+        // Drop runs only when the parent ActiveOutput is itself
         // being torn down (hotplug-remove or server shutdown).
         unsafe {
             let _ = self.vk.device.device_wait_idle();

@@ -4059,13 +4059,8 @@ fn handle_randr_request(
 
             // Resolve connector name from crtc_id (validated above →
             // guaranteed to exist).
-            let connector = state
-                .randr
-                .outputs
-                .iter()
-                .find(|o| o.crtc_id == crtc)
-                .map(|o| o.name.clone());
-            let Some(connector) = connector else {
+            let output_row = state.randr.outputs.iter().find(|o| o.crtc_id == crtc);
+            let Some(output_row) = output_row else {
                 return emit_x11_error_with_minor(
                     state,
                     client_id,
@@ -4076,6 +4071,8 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             };
+            let output_id = output_row.output_id;
+            let connector = output_row.name.clone();
             let mode_spec = resolved.map(|m| ModeSpec {
                 width: m.width,
                 height: m.height,
@@ -4088,7 +4085,13 @@ fn handle_randr_request(
                 req_timestamp
             };
             let output_bbox_before = super::run::enabled_output_bbox(state);
-            match backend.apply_crtc_config(&connector, mode_spec, i32::from(x), i32::from(y)) {
+            match backend.apply_crtc_config(
+                output_id,
+                &connector,
+                mode_spec,
+                i32::from(x),
+                i32::from(y),
+            ) {
                 Ok(true) => {
                     // Something actually changed. Single rebuild path: a CRTC
                     // set bumps lastSetTime (to the client timestamp) but NOT
@@ -4098,7 +4101,7 @@ fn handle_randr_request(
                         .randr
                         .outputs
                         .iter()
-                        .find(|o| o.name == connector)
+                        .find(|o| o.output_id == output_id)
                         .map(|o| (o.output_id, o.crtc_id, o.mode_id))
                         .into_iter()
                         .collect();
@@ -50547,7 +50550,11 @@ mod tests {
     /// calls `apply_crtc_config`. Replaces the old no-op-accept test.
     ///
     /// Cases:
-    /// 1. valid enable (mode=3, crtc=2, outputs=[1], rotation=RR_Rotate_0)
+    /// The fixture has two outputs with the same connector name. Requests
+    /// target the second by `(crtc=5, output=4)` so routing cannot fall back
+    /// to a globally-ambiguous name.
+    ///
+    /// 1. valid enable (mode=3, crtc=5, outputs=[4], rotation=RR_Rotate_0)
     ///    → reply status=0 (Success).
     /// 2. disable (mode=0, crtc=2, no outputs)
     ///    → reply status=0.
@@ -50567,23 +50574,45 @@ mod tests {
             vrefresh: 60,
             timing: None,
         }];
-        let outputs = vec![RandrOutput {
-            name: "test-0".to_string(),
-            output_id: 1,
-            crtc_id: 2,
-            mode_id: 3,
-            connected: true,
-            x: 0,
-            y: 0,
-            width: 1920,
-            height: 1080,
-            vrefresh: 60,
-            timing: None,
-            mm_width: 0,
-            mm_height: 0,
-            mode_ids: vec![3],
-            num_preferred: 1,
-        }];
+        let outputs = vec![
+            RandrOutput {
+                name: "test-0".to_string(),
+                output_id: 1,
+                crtc_id: 2,
+                mode_id: 3,
+                connected: true,
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                vrefresh: 60,
+                timing: None,
+                mm_width: 0,
+                mm_height: 0,
+                mode_ids: vec![3],
+                num_preferred: 1,
+            },
+            // Equal connector names are legal across different DRM devices.
+            // Address this second row by CRTC/XID to prove the core never
+            // re-resolves the request through the ambiguous display name.
+            RandrOutput {
+                name: "test-0".to_string(),
+                output_id: 4,
+                crtc_id: 5,
+                mode_id: 3,
+                connected: true,
+                x: 1920,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                vrefresh: 60,
+                timing: None,
+                mm_width: 0,
+                mm_height: 0,
+                mode_ids: vec![3],
+                num_preferred: 1,
+            },
+        ];
         let mut state = ServerState::new();
         state.randr = RandrState::from_outputs_with_modes(1, outputs, mode_table);
         let mut backend = RecordingBackend::new();
@@ -50593,7 +50622,7 @@ mod tests {
         // pad(2) outputs(4*N).
         fn build_body(mode: u32, rotation: u16, output_ids: &[u32]) -> Vec<u8> {
             let mut b = Vec::with_capacity(24 + output_ids.len() * 4);
-            b.extend_from_slice(&2u32.to_le_bytes()); // crtc = 2
+            b.extend_from_slice(&5u32.to_le_bytes()); // target the second same-name CRTC
             b.extend_from_slice(&0u32.to_le_bytes()); // timestamp
             b.extend_from_slice(&0u32.to_le_bytes()); // config_timestamp
             b.extend_from_slice(&0i16.to_le_bytes()); // x
@@ -50612,14 +50641,14 @@ mod tests {
             length_units: 7,
         };
 
-        // (1) Valid enable: mode=3, rotation=RR_Rotate_0(1), outputs=[1] → Success reply.
+        // (1) Valid enable: mode=3, rotation=RR_Rotate_0(1), outputs=[4] → Success reply.
         handle_randr_request(
             &mut state,
             &mut backend,
             ClientId(CLIENT_ID),
             SequenceNumber(1),
             header,
-            &build_body(3, 1, &[1]),
+            &build_body(3, 1, &[4]),
         )
         .expect("valid enable");
 
@@ -50641,7 +50670,7 @@ mod tests {
             ClientId(CLIENT_ID),
             SequenceNumber(3),
             header,
-            &build_body(555, 1, &[1]),
+            &build_body(555, 1, &[4]),
         )
         .expect("bad mode → error");
 
@@ -50655,7 +50684,7 @@ mod tests {
             ClientId(CLIENT_ID),
             SequenceNumber(4),
             header,
-            &build_body(3, 2, &[1]),
+            &build_body(3, 2, &[4]),
         )
         .expect("bad rotation → error");
 
@@ -50683,6 +50712,36 @@ mod tests {
         assert_eq!(status_disable, 0, "disable → status=0");
         assert_eq!(type_bytes[2], 0, "bad mode → X11 error (type=0)");
         assert_eq!(type_bytes[3], 0, "bad rotation → X11 error (type=0)");
+
+        let crtc_calls: Vec<_> = backend
+            .calls()
+            .into_iter()
+            .filter(|call| matches!(call, RecordedCall::ApplyCrtcConfig { .. }))
+            .collect();
+        assert_eq!(
+            crtc_calls,
+            vec![
+                RecordedCall::ApplyCrtcConfig {
+                    output_id: 4,
+                    connector: "test-0".to_string(),
+                    mode: Some(ModeSpec {
+                        width: 1920,
+                        height: 1080,
+                        vrefresh: 60,
+                    }),
+                    x: 0,
+                    y: 0,
+                },
+                RecordedCall::ApplyCrtcConfig {
+                    output_id: 4,
+                    connector: "test-0".to_string(),
+                    mode: None,
+                    x: 0,
+                    y: 0,
+                },
+            ],
+            "the second same-name output XID must be carried into backend routing",
+        );
     }
 
     #[test]
