@@ -571,7 +571,7 @@ impl RandrIdAllocator {
 
 fn reconcile_connector_probe(
     randr_id_alloc: &mut RandrIdAllocator,
-    probes: &[crate::drm::modeset::ConnectorProbe],
+    probes: &[crate::platform::drm::ConnectorProbe],
 ) -> bool {
     let mut changed = false;
     let mut seen: HashSet<String> = HashSet::new();
@@ -1052,7 +1052,7 @@ struct ClipMaskSnapshot {
 /// falls back to synthesised blanking. The low 6 `DRM_MODE_FLAG_*` bits
 /// (sync polarity / interlace / doublescan) coincide with the RANDR
 /// `RR_*` flag bits; higher DRM-only bits are masked off.
-fn mode_timing(m: &crate::drm::modeset::Mode) -> Option<yserver_core::randr::ModeTiming> {
+fn mode_timing(m: &crate::platform::drm::Mode) -> Option<yserver_core::randr::ModeTiming> {
     if m.clock_khz == 0 {
         return None;
     }
@@ -2326,7 +2326,7 @@ impl KmsBackend {
         layout: Option<String>,
         commit: fn(
             &crate::drm::Device,
-            &crate::drm::modeset::Output,
+            &crate::platform::drm::Output,
             ::drm::control::framebuffer::Handle,
         ) -> io::Result<()>,
     ) -> io::Result<Self> {
@@ -13661,7 +13661,7 @@ impl Backend for KmsBackend {
         // properties and modifiers and computes hypothetical assignments;
         // under Cinnamon/GPU load that unrelated work blocked dispatch for
         // 90–113 ms every time the desktop polled GetScreenResources.
-        let probes = crate::drm::modeset::probe_connectors(&self.platform.device)?;
+        let probes = crate::platform::drm::probe_connectors(&self.platform.device)?;
         let changed = reconcile_connector_probe(&mut self.randr_id_alloc, &probes);
         // Pure re-probe: never bumps lastSetTime (set_time = None); bumps
         // lastConfigTime only when something actually changed. A no-op
@@ -13785,7 +13785,7 @@ impl Backend for KmsBackend {
                 // Re-discover all outputs to get a fresh Output with the
                 // correct CRTC/plane/property assignments. We filter to
                 // the one matching `connector`.
-                let discovered = match crate::drm::modeset::discover_outputs(&self.platform.device)
+                let discovered = match crate::platform::drm::discover_outputs(&self.platform.device)
                 {
                     Ok(v) => v,
                     Err(e) => {
@@ -20875,7 +20875,7 @@ mod tests {
         // A real 2560x1440@59.95 mode: timing must pass through verbatim,
         // and DRM-only flag bits above the RANDR RR_* range must be masked
         // so we never advertise a bit RANDR would misinterpret.
-        let m = crate::drm::modeset::Mode {
+        let m = crate::platform::drm::Mode {
             name: "2560x1440".into(),
             width: 2560,
             height: 1440,
@@ -20900,7 +20900,7 @@ mod tests {
         assert_eq!(t.mode_flags, 0x5, "DRM-only bits masked to RR_* range");
 
         // Synthetic/nested mode (no clock) => None => RANDR synthesises.
-        let synthetic = crate::drm::modeset::Mode {
+        let synthetic = crate::platform::drm::Mode {
             width: 800,
             height: 600,
             vrefresh: 60,
@@ -21446,7 +21446,7 @@ mod tests {
 
     #[test]
     fn connector_only_probe_reconciles_state_and_retains_disconnected_modes() {
-        use crate::drm::modeset::{ConnectorProbe, Mode};
+        use crate::platform::drm::{ConnectorProbe, Mode};
 
         fn mode(width: u16, height: u16, preferred: bool) -> Mode {
             Mode {
@@ -31773,14 +31773,14 @@ mod tests {
     fn push_test_output(b: &mut super::KmsBackend, crtc_id: u32) {
         use crate::kms::backend::OutputLayout;
         b.platform.outputs.push(OutputLayout {
-            output: crate::drm::modeset::Output {
+            output: crate::platform::drm::Output {
                 connector: ::drm::control::from_u32(crtc_id).unwrap(),
                 connector_name: "test2".to_string(),
                 crtc: ::drm::control::from_u32(crtc_id).unwrap(),
                 plane: ::drm::control::from_u32(crtc_id).unwrap(),
                 // SAFETY: tests never pass this mode to DRM.
                 mode: unsafe { std::mem::zeroed() },
-                picked: crate::drm::modeset::Mode {
+                picked: crate::platform::drm::Mode {
                     name: "test2".to_string(),
                     width: 800,
                     height: 600,
@@ -31805,7 +31805,7 @@ mod tests {
                 mm_height: 0,
                 edid: Vec::new(),
                 connector_type: "unknown".to_string(),
-                modes: vec![crate::drm::modeset::Mode {
+                modes: vec![crate::platform::drm::Mode {
                     name: "test2".to_string(),
                     width: 800,
                     height: 600,

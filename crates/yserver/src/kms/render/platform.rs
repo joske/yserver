@@ -699,7 +699,7 @@ pub(crate) struct RescanResult {
     /// rescan are NOT auto-enabled — they're surfaced here (with their
     /// advertised modes/dimensions) so the backend can register them
     /// off in the connector registry and fire `OutputChangeNotify`.
-    pub added_outputs: Vec<crate::drm::modeset::Output>,
+    pub added_outputs: Vec<crate::platform::drm::Output>,
 }
 
 /// Pure recompute of the virtual-screen extent from `(x, y, width, height)`.
@@ -740,7 +740,7 @@ impl PlatformBackend {
         device_path: &str,
         commit: fn(
             &drm::Device,
-            &drm::modeset::Output,
+            &crate::platform::drm::Output,
             ::drm::control::framebuffer::Handle,
         ) -> io::Result<()>,
     ) -> io::Result<Self> {
@@ -1022,14 +1022,14 @@ impl PlatformBackend {
             syncobj_timeline: false,
             render_node_path: None,
             outputs: vec![OutputLayout {
-                output: drm::modeset::Output {
+                output: crate::platform::drm::Output {
                     connector: ::drm::control::from_u32(1).unwrap(),
                     connector_name: "test".to_string(),
                     crtc: ::drm::control::from_u32(1).unwrap(),
                     plane: ::drm::control::from_u32(1).unwrap(),
                     // SAFETY: tests never pass this mode to DRM.
                     mode: unsafe { std::mem::zeroed() },
-                    picked: drm::modeset::Mode {
+                    picked: crate::platform::drm::Mode {
                         name: "test".to_string(),
                         width: 800,
                         height: 600,
@@ -1054,7 +1054,7 @@ impl PlatformBackend {
                     mm_height: 0,
                     edid: Vec::new(),
                     connector_type: "unknown".to_string(),
-                    modes: vec![drm::modeset::Mode {
+                    modes: vec![crate::platform::drm::Mode {
                         name: "test".to_string(),
                         width: 800,
                         height: 600,
@@ -2572,7 +2572,7 @@ impl PlatformBackend {
     /// Returns `Ok(())` on success.
     pub(crate) fn enable_connector(
         &mut self,
-        mut output: crate::drm::modeset::Output,
+        mut output: crate::platform::drm::Output,
         mode_spec: yserver_core::backend::ModeSpec,
         x: i32,
         y: i32,
@@ -3110,7 +3110,7 @@ impl PlatformBackend {
         &mut self,
         client_configured: &HashSet<String>,
     ) -> io::Result<RescanResult> {
-        let discovered = crate::drm::modeset::discover_outputs(&self.device)?;
+        let discovered = crate::platform::drm::discover_outputs(&self.device)?;
         let discovered_order: Vec<String> = discovered
             .iter()
             .map(|o| o.connector_name.clone())
@@ -3124,7 +3124,7 @@ impl PlatformBackend {
             .iter()
             .map(|l| l.output.connector_name.clone())
             .collect();
-        let mut discovered_by_name: HashMap<String, crate::drm::modeset::Output> = discovered
+        let mut discovered_by_name: HashMap<String, crate::platform::drm::Output> = discovered
             .into_iter()
             .map(|o| (o.connector_name.clone(), o))
             .collect();

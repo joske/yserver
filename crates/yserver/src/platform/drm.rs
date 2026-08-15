@@ -18,6 +18,10 @@ use std::{
 
 use ::drm::control::{Device as _, connector};
 
+pub(crate) use crate::drm::modeset::{
+    ConnectorProbe, Mode, Output, discover_outputs, probe_connectors,
+};
+
 const DRM_DIR: &str = "/dev/dri";
 pub(crate) const RENDER_NODE_ENV: &str = "YSERVER_DRI_RENDER_NODE";
 

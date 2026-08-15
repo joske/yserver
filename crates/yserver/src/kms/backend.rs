@@ -547,7 +547,7 @@ pub(crate) fn read_rect(data: &[u8], offset: usize) -> Option<Rectangle16> {
 /// discovered output; `fb_w` / `fb_h` describe the virtual-screen
 /// extent.
 pub(crate) struct OutputLayout {
-    pub output: crate::drm::modeset::Output,
+    pub output: crate::platform::drm::Output,
     /// Kept alive for the lifetime of the output to retain initial-
     /// scanout buffer ownership; v2 has its own per-output
     /// `ScanoutBoPool` and doesn't read this field after construction.
@@ -600,7 +600,7 @@ pub(crate) fn platform_init(
     device_path: &str,
     commit: fn(
         &crate::drm::Device,
-        &crate::drm::modeset::Output,
+        &crate::platform::drm::Output,
         ::drm::control::framebuffer::Handle,
     ) -> io::Result<()>,
 ) -> io::Result<PlatformInit> {
@@ -633,7 +633,7 @@ pub(crate) fn platform_init(
             (None, None)
         }
     };
-    let outputs = drm::modeset::discover_outputs(&device)?;
+    let outputs = crate::platform::drm::discover_outputs(&device)?;
 
     // Horizontal layout in connector order. If anything fails part
     // way through bring-up, disable everything we have already

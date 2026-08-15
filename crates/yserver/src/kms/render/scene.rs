@@ -3123,7 +3123,7 @@ fn add_projected_damage(
 fn record_compose(
     vk: &crate::kms::vk::device::VkContext,
     drm: &crate::drm::Device,
-    output: &crate::drm::modeset::Output,
+    output: &crate::platform::drm::Output,
     bo: &mut ScanoutBo,
     pipeline: &CompositorPipeline,
     descriptor_pool: vk::DescriptorPool,

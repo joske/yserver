@@ -38,9 +38,10 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   render-node choice now live in `platform::drm`. Linux sysfs is an optional
   relationship mechanism in `platform::drm_linux`; FreeBSD continues through
   the shared node and DRM-control paths. Connector/CRTC/plane discovery and
-  modesetting remain in the portable `drm::modeset` implementation. The
-  sibling-first, sole-node fallback, ambiguity error, and both explicit device
-  overrides are preserved.
+  modesetting remain in the portable `drm::modeset` implementation and are
+  exposed to higher KMS/RANDR layers through the `platform::drm` topology
+  façade. The sibling-first, sole-node fallback, ambiguity error, and both
+  explicit device overrides are preserved.
 - **2026-08-14 render-node resolution on split display/render SoCs (Asahi):**
   cinnamon flashed and rendered unstably on Apple Silicon (`air`) while
   MATE/XFCE looked fine; bisected to `bbc9d30f` (the FreeBSD render-node

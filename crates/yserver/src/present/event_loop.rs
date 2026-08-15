@@ -42,7 +42,7 @@ const SIGNAL_TOKEN: u64 = 3;
 #[allow(clippy::too_many_arguments)]
 pub fn run_loop(
     device: &Rc<Device>,
-    output: &drm::modeset::Output,
+    output: &crate::platform::drm::Output,
     swapchain: &mut Swapchain,
     input_ctx: Option<&mut input::Context>,
     signal_fd: &SignalFd,
@@ -155,7 +155,7 @@ pub fn run_loop(
 #[allow(clippy::too_many_arguments)]
 pub fn run_loop(
     device: &Rc<Device>,
-    output: &drm::modeset::Output,
+    output: &crate::platform::drm::Output,
     swapchain: &mut Swapchain,
     input_ctx: Option<&mut input::Context>,
     signal_kq: &Kqueue,
