@@ -150,6 +150,11 @@ mod tests {
                 dst_host_xid: 0xE00001,
                 options: 0,
                 present_id: 9,
+                window_generation: 0,
+                crtc_id: 0,
+                crtc_epoch: 0,
+                msc_offset: 0,
+                completion_clock: None,
                 wake: PresentWake::PixmapSynced {
                     release: handle,
                     release_syncobj: 0x200001,
@@ -181,6 +186,11 @@ mod tests {
             dst_host_xid: 0xE00001,
             options: 0,
             present_id: 0,
+            window_generation: 0,
+            crtc_id: 0,
+            crtc_epoch: 0,
+            msc_offset: 0,
+            completion_clock: None,
             wake: PresentWake::Pixmap {
                 idle_fence_xid: 0xCC,
             },

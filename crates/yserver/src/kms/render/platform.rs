@@ -540,6 +540,8 @@ pub(crate) struct SequenceCompletion {
     pub(crate) sequence: u64,
 }
 
+pub(crate) type DrainedPageFlipEvents = (Vec<(usize, PresentClockSample)>, Vec<SequenceCompletion>);
+
 /// Process-local identity of one KMS CRTC.
 ///
 /// DRM object handles are scoped to a DRM device. Two cards may expose the
@@ -1993,7 +1995,7 @@ impl PlatformBackend {
     pub(crate) fn drain_page_flip_events(
         &mut self,
         drm_fd: RawFd,
-    ) -> io::Result<(Vec<usize>, Vec<SequenceCompletion>)> {
+    ) -> io::Result<DrainedPageFlipEvents> {
         use ::drm::control::crtc;
 
         let device_index = self.drm_device_index_for_fd(drm_fd).ok_or_else(|| {
@@ -2027,7 +2029,7 @@ impl PlatformBackend {
             },
         )?;
 
-        let mut output_indices = Vec::with_capacity(flipped.len());
+        let mut completions = Vec::with_capacity(flipped.len());
         for (crtc, frame, dur) in flipped {
             let crtc_key = CrtcKey::new(device_key, crtc);
             let Some(output_idx) = self.output_index_for_crtc(crtc_key) else {
@@ -2068,50 +2070,34 @@ impl PlatformBackend {
                 "render pageflip ust_msc output={output_idx} msc={msc} kernel_frame={frame} kernel_ust_micros={ust}"
             );
             self.record_vblank_clock(crtc_key, msc, ust);
-            self.record_completion_clock(
-                crtc_key,
-                PresentClockSample {
-                    msc,
-                    ust,
-                    source: PresentClockSource::PageFlip,
-                },
-            );
+            let sample = PresentClockSample {
+                msc,
+                ust,
+                source: PresentClockSource::PageFlip,
+            };
+            self.record_completion_clock(crtc_key, sample);
             log::debug!(
                 target: "present_pace",
                 "present_clock sample source=pageflip output={output_idx} msc={msc} ust={ust}"
             );
-            output_indices.push(output_idx);
+            completions.push((output_idx, sample));
         }
-        Ok((output_indices, sequenced))
+        Ok((completions, sequenced))
     }
 
-    /// Latest kernel `(msc, ust_micros)` across all live CRTC samples, or
-    /// `(0, 0)` before the first pageflip/sequence event. This preserves the
-    /// current upstream global-clock behavior until the immediately-following
-    /// per-Present domain adaptation carries a selected RANDR CRTC end to end.
-    pub(crate) fn present_get_ust_msc(&self) -> (u64, u64) {
-        self.ust_msc
-            .values()
-            .copied()
-            .max_by_key(|(msc, _)| *msc)
-            .unwrap_or((0, 0))
+    /// Latest kernel `(msc, ust_micros)` for one device-qualified CRTC, or
+    /// `(0, 0)` before that display domain has produced a pageflip/sequence
+    /// event. Samples from other cards or CRTCs must never influence this
+    /// result: their MSC counters are unrelated even when raw handles match.
+    pub(crate) fn present_get_ust_msc(&self, crtc_key: CrtcKey) -> (u64, u64) {
+        self.ust_msc.get(&crtc_key).copied().unwrap_or((0, 0))
     }
 
-    /// Device-qualified CRTC that contributed the maximum current general
-    /// clock sample. Absolute arms must use this same counter domain while the
-    /// core still exposes one global clock.
-    pub(crate) fn present_max_clock_crtc(&self) -> Option<CrtcKey> {
-        self.ust_msc
-            .iter()
-            .max_by_key(|(_, (msc, _))| *msc)
-            .map(|(&key, _)| key)
-    }
-
-    pub(crate) fn present_get_completion_clock(&self) -> PresentClockSample {
+    /// Latest completion-eligible clock for one device-qualified CRTC.
+    pub(crate) fn present_get_completion_clock(&self, crtc_key: CrtcKey) -> PresentClockSample {
         self.completion_clocks
-            .values()
+            .get(&crtc_key)
             .copied()
-            .max_by_key(|sample| sample.msc)
             .unwrap_or(PresentClockSample {
                 msc: 0,
                 ust: 0,
@@ -2120,7 +2106,7 @@ impl PlatformBackend {
     }
 
     /// Record a general vblank sample without allowing late events to move
-    /// the shared Present clock backwards.
+    /// this CRTC domain's Present clock backwards.
     pub(crate) fn record_vblank_clock(&mut self, crtc_key: CrtcKey, msc: u64, ust: u64) {
         let replace = self.ust_msc.get(&crtc_key).is_none_or(|(old_msc, _)| {
             msc == *old_msc || yserver_core::present_scheduler::msc_is_after(msc, *old_msc)

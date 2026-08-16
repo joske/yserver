@@ -79,6 +79,10 @@ pub enum PresentSourceWait {
 pub struct PresentScanoutCandidate {
     pub client_id: u32,
     pub present_id: u64,
+    /// RANDR CRTC XID selected for this Present. `0` is the synthetic
+    /// headless domain used when no output is enabled.
+    pub crtc_id: u32,
+    pub crtc_epoch: u64,
     pub src_pixmap_xid: u32,
     pub dst_window_xid: u32,
     pub src_host_xid: u32,
@@ -196,6 +200,23 @@ pub struct CompletedPresentEvent {
     /// `ServerState::next_present_id`). Keys the backend's retained-wake
     /// map and core's pacing gate. Never 0 for a real completion.
     pub present_id: u64,
+    /// Non-reusable identity for the destination window's current Present
+    /// lifetime. A backend completion carrying an older generation is
+    /// discarded if the numeric XID has since been destroyed/reused.
+    pub window_generation: u64,
+    /// RANDR CRTC XID whose raw MSC clock owns this completion. `0` is the
+    /// synthetic headless domain.
+    pub crtc_id: u32,
+    pub crtc_epoch: u64,
+    /// Per-window Xorg-style MSC offset captured when the request selected
+    /// `crtc_id`. Wire MSC is `raw_crtc_msc - msc_offset`; retaining the
+    /// request-time snapshot prevents a later window/CRTC switch from
+    /// reinterpreting an older completion.
+    pub msc_offset: u64,
+    /// Exact selected-CRTC retirement sample when the backend already owns
+    /// it (notably grouped direct scanout). Copy completions leave this
+    /// `None` and core samples `crtc_id` through the trait.
+    pub completion_clock: Option<PresentClockSample>,
     pub wake: PresentWake,
     /// Present wire completion mode (Copy, Flip, or Skip).
     pub completion_mode: u8,
@@ -825,19 +846,26 @@ pub trait Backend {
     /// A scanout pageflip is submitted and not yet retired. Used ONLY by
     /// the immediate-target arrival rule (spec §msc-due). Default false:
     /// non-KMS backends execute everything at arrival.
-    fn present_flip_in_flight(&self) -> bool {
+    fn present_flip_in_flight(&self, _crtc_id: u32) -> bool {
         false
     }
     /// No flip in flight AND nothing composing. Used ONLY by the
     /// idle-display fallback. Distinct from present_flip_in_flight: with
     /// the drain hoisted above maybe_composite, flips can be false while
     /// a compose is pending. Default true (nothing ever composes).
-    fn present_display_idle(&self) -> bool {
+    fn present_display_idle(&self, _crtc_id: u32) -> bool {
         true
+    }
+    /// Epoch of the raw MSC counter currently resolved by this stable RANDR
+    /// CRTC XID. Backends return a different token when topology remaps the
+    /// XID to a different physical counter; zero is a stable default for
+    /// single-domain/non-KMS backends.
+    fn present_crtc_clock_epoch(&self, _crtc_id: u32) -> u64 {
+        0
     }
     /// Kernel accepts absolute CRTC_QUEUE_SEQUENCE arming. Gates the
     /// idle-display fallback to flip-driven-clock drivers. Default false.
-    fn present_absolute_vblank_arm_supported(&self) -> bool {
+    fn present_absolute_vblank_arm_supported(&self, _crtc_id: u32) -> bool {
         false
     }
     /// Arm absolute vblank sequences for parked future-target presents.
@@ -851,7 +879,11 @@ pub trait Backend {
     /// or `Err` means the caller must not park on this mechanism (no
     /// targets, no outputs, arming unsupported/failed) and should fall
     /// through to another due-execution trigger. Default `Ok(0)`.
-    fn arm_present_absolute_vblank(&mut self, _targets: &[u64]) -> std::io::Result<usize> {
+    fn arm_present_absolute_vblank(
+        &mut self,
+        _crtc_id: u32,
+        _targets: &[u64],
+    ) -> std::io::Result<usize> {
         Ok(0)
     }
     /// Display cannot scan out at all (VT-away OR DPMS-off). Gates the
@@ -2221,15 +2253,15 @@ pub trait Backend {
     /// `PresentNotifyMSC` completions; KMS updates it from pageflip
     /// retirements and standalone sequence events. Default `(0, 0)` for
     /// backends without real vblanks.
-    fn present_get_ust_msc(&self) -> (u64, u64) {
+    fn present_get_ust_msc(&self, _crtc_id: u32) -> (u64, u64) {
         (0, 0)
     }
 
     /// Latest display-clock sample eligible to release a paced Pixmap
     /// completion. KMS distinguishes pageflip retirements from standalone
     /// sequence events; other backends preserve their existing clock.
-    fn present_get_completion_clock(&self) -> PresentClockSample {
-        let (msc, ust) = self.present_get_ust_msc();
+    fn present_get_completion_clock(&self, crtc_id: u32) -> PresentClockSample {
+        let (msc, ust) = self.present_get_ust_msc(crtc_id);
         PresentClockSample {
             msc,
             ust,
@@ -2254,7 +2286,7 @@ pub trait Backend {
     ///
     /// Default `Ok(0)` keeps backends without real vblanks (`HostX11`,
     /// `Recording`) opted out — they flush parked notifies synchronously.
-    fn arm_idle_vblanks(&mut self, _target_mscs: &[u64]) -> std::io::Result<usize> {
+    fn arm_idle_vblanks(&mut self, _crtc_id: u32, _target_mscs: &[u64]) -> std::io::Result<usize> {
         Ok(0)
     }
 
@@ -2263,6 +2295,7 @@ pub trait Backend {
     /// or visible compose work is pending.
     fn arm_present_completion_idle_vblanks(
         &mut self,
+        _crtc_id: u32,
         _target_mscs: &[u64],
     ) -> std::io::Result<usize> {
         Ok(0)
@@ -2529,6 +2562,11 @@ mod present_completion_trait_tests {
                 dst_host_xid: 0,
                 options: 0,
                 present_id: 0,
+                window_generation: 0,
+                crtc_id: 0,
+                crtc_epoch: 0,
+                msc_offset: 0,
+                completion_clock: None,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
                 completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
                 emit_idle: true,

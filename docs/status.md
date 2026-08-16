@@ -33,6 +33,30 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-08-17 Present requests now own one RANDR CRTC clock domain:** every
+  Pixmap, PixmapSynced, NotifyMSC, completion gate, and backend scanout
+  candidate carries a RANDR CRTC XID plus a physical-route epoch. Explicit
+  targets validate the CRTC resource; an Off CRTC is accepted but unpaced,
+  while a genuinely headless implicit request uses synthetic domain 0.
+  Implicit Pixmap requests choose the enabled output with greatest window
+  overlap (RANDR primary wins equal-area ties), and NotifyMSC reuses the
+  window's prior selection. Per-window MSC offsets preserve a continuous wire
+  clock when a window moves between unrelated CRTC/device counters, while an
+  epoch change prevents queued work from being reinterpreted against a new
+  physical route behind the same stable XID. The core groups relative,
+  completion-idle, and absolute arms by domain; KMS resolves each XID through
+  its device-qualified output key to the owning fd. Grouped whole-root direct
+  scanout still waits for every participating CRTC to retire, but stamps the
+  completion with the selected reference CRTC's exact sample, matching Xorg.
+  Destroying a window purges every core-visible Present population and its
+  per-window clock state; non-reusable generation tags suppress completions
+  that were still hidden in the backend when the numeric XID is reused. An
+  active direct frame is first materialized and scheduled for composed
+  replacement, with its source and COW storage pinned until retirement.
+  Historical clock samples remain cached per physical-route epoch because a
+  completion can likewise remain backend-hidden after core queues drain; each
+  route change adds one small entry until backend epoch-reference accounting
+  permits safe compaction.
 - **2026-08-17 PRIME device-qualified lifecycle semantic replay:** connector
   inventory, hotplug probing, and VT-resume probing now cover every
   opened DRM device and reconcile a complete `(device key, connector name)`
@@ -52,11 +76,10 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   failures is documented but deferred. Present UST/MSC clocks, software-MSC
   fallbacks, relative/absolute vblank arms, sequence-event routing, and
   lifecycle pruning are keyed by `(device key, CRTC handle)`; unsupported
-  `DRM_IOCTL_CRTC_QUEUE_SEQUENCE` is latched per device. Absolute Present
-  targets reside on the device-qualified CRTC supplying the current maximum
-  clock, while the protocol-facing clock remains the existing maximum across
-  live CRTCs. Per-Present CRTC/device ownership with per-window MSC continuity
-  is the immediate next adaptation commit. RANDR/XF86VidMode gamma calls
+  `DRM_IOCTL_CRTC_QUEUE_SEQUENCE` is latched per device. The subsequent
+  per-Present adaptation now selects and carries one RANDR CRTC/device clock
+  domain per request, with per-window MSC continuity across domain changes.
+  RANDR/XF86VidMode gamma calls
   route by CRTC XID to a device-qualified LUT and DRM fd. Whole-root grouped
   direct scanout is now
   limited to active outputs on the primary DRM device with identical effective

@@ -4686,6 +4686,9 @@ impl RenderEngine {
     /// `cow_id` (predicate is `RecordedOp::dst_id() == Some(cow_id)`, NOT
     /// `touched` — touched includes sampled-only references that would
     /// attach completions to frames that never wrote the cow).
+    // This Result is an ownership hand-back, not a conventional error path;
+    // boxing the entry would add an allocation to every COW Present.
+    #[allow(clippy::result_large_err)]
     pub(crate) fn attach_cow_present_completion(
         &mut self,
         cow_id: DrawableId,

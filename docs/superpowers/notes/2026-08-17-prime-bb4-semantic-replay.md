@@ -111,11 +111,40 @@ live CRTC samples.
 `DRM_IOCTL_CRTC_QUEUE_SEQUENCE` support is latched per DRM device. An
 unsupported ioctl on one card leaves sequence arming available on other cards.
 
-This maximum reduction is a compatibility bridge, not the final ownership
-model. Protocol-side pending Presents still share one clock in this commit.
-The immediately following adaptation carries a selected RANDR CRTC/device
-through each Present, groups arms by that domain, and preserves per-window MSC
-continuity when a window moves between unrelated device counters.
+That maximum reduction was the compatibility bridge at the bb4 commit
+boundary, not the final ownership model. The subsequent adaptation now carries
+a selected RANDR CRTC XID and physical-route epoch through each Present,
+groups every arm by that domain, and preserves per-window MSC continuity when
+a window moves between unrelated device counters. Explicit valid-but-Off CRTCs
+remain accepted but unpaced, and zero-output implicit Presents use synthetic
+domain 0. Because a stable RANDR CRTC XID may later resolve to another raw KMS
+CRTC, an epoch change fails old queued work open instead of comparing or arming
+it against the replacement counter.
+
+Implicit Pixmap requests reselect by greatest window/output intersection, with
+the active RANDR primary winning equal-area ties; NotifyMSC reuses the window's
+last selected domain. The request snapshots its Xorg-style MSC offset, so a
+later window move cannot reinterpret an older target or completion. Grouped
+whole-root direct scanout still withholds completion until every participating
+CRTC retires, but records the selected/reference CRTC's exact sample for the
+wire event.
+
+Present destination windows also carry a non-reusable lifetime generation.
+Window or final overlay destruction purges every core-visible request and
+clock binding; a completion already hidden in a render batch or direct frame
+is discarded when its old generation eventually retires, so reusing the XID
+cannot receive stale Complete or Idle events. If direct scanout owns that
+window or the COW fallback, destruction, unmapping, geometry changes, and
+logical-screen resizing first materialize the authoritative frame and request
+a composed replacement. Source and COW pins remain live until the grouped
+replacement retires.
+
+The core deliberately retains the last samples for superseded physical-route
+epochs. A copy or direct completion can remain hidden inside the backend after
+the corresponding core-visible queue has disappeared, so pruning from core
+state alone could discard the only clock needed to stamp that event. This is
+one small cache entry per route epoch; compacting it safely is deferred until
+the backend exposes epoch-reference retirement.
 
 RANDR and XF86VidMode gamma requests now carry the RANDR CRTC XID through the
 backend boundary. KMS resolves that XID to its device-qualified output key, and

@@ -1346,56 +1346,68 @@ pub(crate) fn arm_present_idle_vblanks(state: &mut ServerState, backend: &mut dy
     // dedups against its per-CRTC armed-target map, so calling every
     // iteration is safe (no refire storm).
     if !state.present_pending_msc.is_empty() {
-        let targets: Vec<u64> = state
-            .present_pending_msc
-            .iter()
-            .map(|p| p.target_msc)
-            .collect();
-        match backend.arm_idle_vblanks(&targets) {
-            Ok(armed) => {
-                if armed > 0 {
-                    log::debug!(
-                        "PRESENT-DBG: arm_idle_vblanks pending={} -> armed={armed}",
-                        targets.len()
-                    );
-                }
+        let mut by_domain: std::collections::BTreeMap<(u32, u64), Vec<u64>> =
+            std::collections::BTreeMap::new();
+        for pending in &state.present_pending_msc {
+            by_domain
+                .entry((pending.crtc_id, pending.crtc_epoch))
+                .or_default()
+                .push(pending.target_msc);
+        }
+        for ((crtc_id, crtc_epoch), targets) in by_domain {
+            if backend.present_crtc_clock_epoch(crtc_id) != crtc_epoch {
+                continue;
             }
-            Err(e) => log::warn!(
-                "PRESENT-DBG: arm_idle_vblanks pending={} -> ERR {e}",
-                targets.len()
-            ),
+            match backend.arm_idle_vblanks(crtc_id, &targets) {
+                Ok(armed) => {
+                    if armed > 0 {
+                        log::debug!(
+                            "PRESENT-DBG: arm_idle_vblanks crtc=0x{crtc_id:x} pending={} -> armed={armed}",
+                            targets.len()
+                        );
+                    }
+                }
+                Err(e) => log::warn!(
+                    "PRESENT-DBG: arm_idle_vblanks crtc=0x{crtc_id:x} pending={} -> ERR {e}",
+                    targets.len()
+                ),
+            }
         }
     }
     if !state.present_pending_complete.is_empty() {
-        let targets: Vec<u64> = state
-            .present_pending_complete
-            .iter()
-            .map(|p| p.effective_target_msc)
-            .collect();
-        // A page flip in flight is not sufficient as the only wake source:
-        // GPU contention can delay that flip past a Present completion's
-        // target MSC. In that case the client observes a late MSC, retargets
-        // from it, and can settle at a fractional refresh rate. Sequence-
-        // capable KMS can wake at the target independently of scanout
-        // activity; retain the idle-only fallback for other backends.
-        let result = if backend.present_absolute_vblank_arm_supported() {
-            backend.arm_present_absolute_vblank(&targets)
-        } else {
-            backend.arm_present_completion_idle_vblanks(&targets)
-        };
-        match result {
-            Ok(armed) => {
-                if armed > 0 {
-                    log::debug!(
-                        "PRESENT-DBG: arm_present_completion_vblanks pending={} -> armed={armed}",
-                        targets.len()
-                    );
-                }
+        let mut by_domain: std::collections::BTreeMap<(u32, u64), Vec<u64>> =
+            std::collections::BTreeMap::new();
+        for pending in &state.present_pending_complete {
+            by_domain
+                .entry((pending.event.crtc_id, pending.event.crtc_epoch))
+                .or_default()
+                .push(pending.effective_target_msc);
+        }
+        for ((crtc_id, crtc_epoch), targets) in by_domain {
+            if backend.present_crtc_clock_epoch(crtc_id) != crtc_epoch {
+                continue;
             }
-            Err(e) => log::warn!(
-                "PRESENT-DBG: arm_present_completion_vblanks pending={} -> ERR {e}",
-                targets.len()
-            ),
+            // A page flip in flight is not sufficient as the only wake
+            // source: arm the selected CRTC independently.
+            let result = if backend.present_absolute_vblank_arm_supported(crtc_id) {
+                backend.arm_present_absolute_vblank(crtc_id, &targets)
+            } else {
+                backend.arm_present_completion_idle_vblanks(crtc_id, &targets)
+            };
+            match result {
+                Ok(armed) => {
+                    if armed > 0 {
+                        log::debug!(
+                            "PRESENT-DBG: arm_present_completion_vblanks crtc=0x{crtc_id:x} pending={} -> armed={armed}",
+                            targets.len()
+                        );
+                    }
+                }
+                Err(e) => log::warn!(
+                    "PRESENT-DBG: arm_present_completion_vblanks crtc=0x{crtc_id:x} pending={} -> ERR {e}",
+                    targets.len()
+                ),
+            }
         }
     }
 
@@ -1411,8 +1423,7 @@ pub(crate) fn arm_present_idle_vblanks(state: &mut ServerState, backend: &mut dy
     // this codebase already lives in this post-compose function. Must
     // NOT route through `arm_present_completion_idle_vblanks` — its
     // idle-only gate would suppress the arm during any activity.
-    if backend.present_absolute_vblank_arm_supported() {
-        let clock_msc = state.present_kernel_msc;
+    {
         // `(present_id, eff - 1)` for every still-parked, source-ready,
         // genuinely future-target entry. The `-1` is CORE-SIDE: `eff` is
         // the vblank at which the compose carrying this copy must already
@@ -1422,20 +1433,33 @@ pub(crate) fn arm_present_idle_vblanks(state: &mut ServerState, backend: &mut dy
         // subtract. `wrapping_sub`: `eff` is a wrapped MSC value (u64
         // wraparound is a documented, tested case throughout this
         // module), so a plain `eff - 1` would debug-panic when `eff == 0`.
-        let future_parked: Vec<(u64, u64)> = state
-            .present_pending_exec
-            .iter()
-            .filter_map(|(&pid, e)| {
-                if !e.source_ready {
-                    return None;
-                }
-                e.pending.effective_target_msc.and_then(|eff| {
-                    crate::present_scheduler::msc_is_after(eff, clock_msc.wrapping_add(1))
-                        .then_some((pid, eff.wrapping_sub(1)))
-                })
-            })
-            .collect();
-        if !future_parked.is_empty() {
+        let mut by_domain: std::collections::BTreeMap<(u32, u64), Vec<(u64, u64)>> =
+            std::collections::BTreeMap::new();
+        for (&pid, entry) in &state.present_pending_exec {
+            if !entry.source_ready {
+                continue;
+            }
+            let crtc_id = entry.pending.crtc_id;
+            let crtc_epoch = entry.pending.crtc_epoch;
+            if backend.present_crtc_clock_epoch(crtc_id) != crtc_epoch
+                || !backend.present_absolute_vblank_arm_supported(crtc_id)
+            {
+                continue;
+            }
+            let clock_msc = crate::core_loop::process_request::cached_present_crtc_clock(
+                state, crtc_id, crtc_epoch,
+            )
+            .msc;
+            if let Some(eff) = entry.pending.effective_target_msc
+                && crate::present_scheduler::msc_is_after(eff, clock_msc.wrapping_add(1))
+            {
+                by_domain
+                    .entry((crtc_id, crtc_epoch))
+                    .or_default()
+                    .push((pid, eff.wrapping_sub(1)));
+            }
+        }
+        for ((crtc_id, _crtc_epoch), future_parked) in by_domain {
             let targets: Vec<u64> = future_parked.iter().map(|&(_, t)| t).collect();
             // Full coverage required, not just `> 0`: the trait contract
             // (`arm_present_absolute_vblank`'s doc comment) allows a
@@ -1448,10 +1472,10 @@ pub(crate) fn arm_present_idle_vblanks(state: &mut ServerState, backend: &mut dy
             // EOPNOTSUPP latch and returns `Err`, so it's all-or-`Err`
             // in practice — this guard is a contract-level guarantee,
             // not a dead branch removal candidate.
-            match backend.arm_present_absolute_vblank(&targets) {
+            match backend.arm_present_absolute_vblank(crtc_id, &targets) {
                 Ok(covered) if covered == targets.len() => {
                     log::debug!(
-                        "PRESENT-DBG: arm_present_absolute_vblank pending={} -> armed={covered}",
+                        "PRESENT-DBG: arm_present_absolute_vblank crtc=0x{crtc_id:x} pending={} -> armed={covered}",
                         targets.len()
                     );
                 }
@@ -1471,12 +1495,12 @@ pub(crate) fn arm_present_idle_vblanks(state: &mut ServerState, backend: &mut dy
                     // latency path.
                     match other {
                         Ok(covered) => log::debug!(
-                            "PRESENT-DBG: arm_present_absolute_vblank pending={} -> covered={covered}, \
+                            "PRESENT-DBG: arm_present_absolute_vblank crtc=0x{crtc_id:x} pending={} -> covered={covered}, \
                              executing immediately",
                             targets.len()
                         ),
                         Err(e) => log::warn!(
-                            "PRESENT-DBG: arm_present_absolute_vblank pending={} -> ERR {e}",
+                            "PRESENT-DBG: arm_present_absolute_vblank crtc=0x{crtc_id:x} pending={} -> ERR {e}",
                             targets.len()
                         ),
                     }
@@ -1509,21 +1533,35 @@ fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend)
     // compose.
     crate::core_loop::process_request::drain_due_present_pending_exec(state, backend);
 
-    let completion_clock = backend.present_get_completion_clock();
     let completed = backend.drain_completed_present_events();
     for entry in completed {
+        if !crate::core_loop::process_request::present_event_window_is_current(state, &entry) {
+            state.present_complete_gate.remove(&entry.present_id);
+            crate::core_loop::process_request::discard_stale_present_event(
+                state, backend, &entry, false,
+            );
+            continue;
+        }
+        let completion_clock =
+            crate::core_loop::process_request::refresh_present_crtc_completion_clock(
+                state,
+                backend,
+                entry.crtc_id,
+                entry.crtc_epoch,
+                entry.completion_clock,
+            );
         // Pace: if this completion recorded a future target-msc gate, park the
         // whole thing (wake NOT signalled yet) until that vblank. Otherwise
         // (async / no clock / target already reached) complete now.
-        // `present_kernel_msc` here is the previous iteration's value; the MSC
-        // refresh + fire_due_present_completions below release anything due
-        // this iteration.
+        // The epoch-qualified cache here is the previous iteration's value;
+        // the refresh + per-domain sweep below release anything due now.
         match state.present_complete_gate.remove(&entry.present_id) {
             Some(gate)
-                if crate::present_scheduler::msc_is_after(
-                    gate.effective_target_msc,
-                    completion_clock.msc,
-                ) =>
+                if backend.present_crtc_clock_epoch(gate.crtc_id) == gate.crtc_epoch
+                    && crate::present_scheduler::msc_is_after(
+                        gate.effective_target_msc,
+                        completion_clock.msc,
+                    ) =>
             {
                 let mode = entry.completion_mode;
                 let emit_idle = entry.emit_idle;
@@ -1580,7 +1618,7 @@ fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend)
                     "PACE-INSTR t={} pid={} stage=drained_immediate kernel_msc={}",
                     crate::core_loop::process_request::pace_instr_ms(),
                     entry.present_id,
-                    state.present_kernel_msc
+                    completion_clock.msc
                 );
                 // Async completions sit outside the per-window hold-back
                 // by design (spec round-4 F6) and fire here immediately —
@@ -1592,9 +1630,11 @@ fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend)
                 // in this same `completed` loop, for exactly this
                 // reason). Held-back entries are unaffected — they stay
                 // held regardless of how many times the sweep runs.
-                crate::core_loop::process_request::fire_due_present_completions(
+                crate::core_loop::process_request::fire_due_present_completions_for_domain(
                     state,
                     backend,
+                    entry.crtc_id,
+                    entry.crtc_epoch,
                     completion_clock,
                 );
                 crate::core_loop::process_request::complete_present_now(state, backend, &entry);
@@ -1606,26 +1646,65 @@ fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend)
     // A replacement frame idles the previous source without completing it a
     // second time.
     for event in backend.drain_retired_present_idle_events() {
-        crate::core_loop::process_request::retire_present_idle(state, backend, &event);
+        if crate::core_loop::process_request::present_event_window_is_current(state, &event) {
+            crate::core_loop::process_request::retire_present_idle(state, backend, &event);
+        } else {
+            crate::core_loop::process_request::discard_stale_present_event(
+                state, backend, &event, true,
+            );
+        }
     }
 
-    // General Present clock: mirror the backend's latest kernel (msc, ust)
-    // sample and fire any parked NotifyMSC whose target is now satisfied.
-    // Keeps a compositor's
-    // `present` frame clock (picom) advancing at the display refresh rate —
-    // without it an unsatisfied NotifyMSC was dropped and the clock froze
-    // after one frame.
-    let (msc, ust) = backend.present_get_ust_msc();
-    if msc > 0 {
-        state.present_kernel_msc = msc;
-        state.present_kernel_ust = ust;
-        crate::core_loop::process_request::fire_due_present_notify_msc(state, msc, ust);
-    }
-    crate::core_loop::process_request::fire_due_present_completions(
-        state,
-        backend,
-        completion_clock,
+    // Refresh every domain that still owns parked work. Epoch-qualified
+    // caches preserve old clocks across stable-XID remaps; stale rows fail
+    // open against that old cache and are never compared/armed against the
+    // replacement physical counter.
+    let mut domains: Vec<(u32, u64)> = Vec::new();
+    domains.extend(
+        state
+            .present_pending_msc
+            .iter()
+            .map(|p| (p.crtc_id, p.crtc_epoch)),
     );
+    domains.extend(
+        state
+            .present_pending_complete
+            .iter()
+            .map(|p| (p.event.crtc_id, p.event.crtc_epoch)),
+    );
+    domains.extend(
+        state
+            .present_pending_exec
+            .values()
+            .map(|p| (p.pending.crtc_id, p.pending.crtc_epoch)),
+    );
+    domains.sort_unstable();
+    domains.dedup();
+
+    for (crtc_id, crtc_epoch) in domains {
+        let epoch_current = backend.present_crtc_clock_epoch(crtc_id) == crtc_epoch;
+        let general = if epoch_current {
+            crate::core_loop::process_request::refresh_present_crtc_general_clock(
+                state, backend, crtc_id, crtc_epoch,
+            )
+        } else {
+            crate::core_loop::process_request::cached_present_crtc_clock(state, crtc_id, crtc_epoch)
+        };
+        crate::core_loop::process_request::fire_due_present_notify_msc_for_domain(
+            state,
+            crtc_id,
+            crtc_epoch,
+            general.msc,
+            general.ust,
+            !epoch_current,
+        );
+        let completion = crate::core_loop::process_request::refresh_present_crtc_completion_clock(
+            state, backend, crtc_id, crtc_epoch, None,
+        );
+        crate::core_loop::process_request::fire_due_present_completions_for_domain(
+            state, backend, crtc_id, crtc_epoch, completion,
+        );
+    }
 }
 
 /// F2: pop every pending host event off the backend and fan it out
@@ -3444,10 +3523,25 @@ mod tests {
         // A standalone sequence has advanced the general clock beyond the
         // target, but the completion-eligible clock is still zero. The gate
         // must park rather than taking the old already-due immediate path.
-        state.present_kernel_msc = 250;
+        state.present_crtc_clocks.insert(
+            (0, 0),
+            crate::server::PresentCrtcClock {
+                epoch: 0,
+                msc: 250,
+                ust: 0,
+                completion: crate::backend::PresentClockSample {
+                    msc: 0,
+                    ust: 0,
+                    source: crate::backend::PresentClockSource::Immediate,
+                },
+            },
+        );
         state.present_complete_gate.insert(
             PRESENT_ID,
             PresentCompleteGate {
+                crtc_id: 0,
+                crtc_epoch: 0,
+                msc_offset: 0,
                 effective_target_msc: TARGET_MSC,
                 owner: ClientId(1),
                 dst_window_xid: WINDOW_XID,
@@ -3463,6 +3557,15 @@ mod tests {
                 dst_host_xid: WINDOW_XID,
                 options: 0,
                 present_id: PRESENT_ID,
+                window_generation: 0,
+                crtc_id: 0,
+                crtc_epoch: 0,
+                msc_offset: 0,
+                completion_clock: Some(crate::backend::PresentClockSample {
+                    msc: 0,
+                    ust: 0,
+                    source: crate::backend::PresentClockSource::Immediate,
+                }),
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
                 completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
                 emit_idle: true,
@@ -3487,6 +3590,10 @@ mod tests {
         );
 
         // Vblank advances to the target: the parked completion fires + signals.
+        // The zero sample above is a fixture-only stand-in for the initial
+        // copy-completion clock. Real copy completions carry `None`, allowing
+        // the later selected-domain vblank sample to stamp the paced event.
+        state.present_pending_complete[0].event.completion_clock = None;
         crate::core_loop::process_request::fire_due_present_completions(
             &mut state,
             &mut backend,
@@ -3528,6 +3635,11 @@ mod tests {
                 dst_host_xid: 0x0000_0202,
                 options: 0,
                 present_id: PRESENT_ID,
+                window_generation: 0,
+                crtc_id: 0,
+                crtc_epoch: 0,
+                msc_offset: 0,
+                completion_clock: None,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
                 completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
                 emit_idle: true,
@@ -3572,6 +3684,9 @@ mod tests {
         state.present_complete_gate.insert(
             PRESENT_ID,
             PresentCompleteGate {
+                crtc_id: 0,
+                crtc_epoch: 0,
+                msc_offset: 0,
                 effective_target_msc: 0,
                 owner: ClientId(1),
                 dst_window_xid: WINDOW_XID,
@@ -3586,6 +3701,11 @@ mod tests {
                 dst_host_xid: WINDOW_XID,
                 options: 0,
                 present_id: PRESENT_ID,
+                window_generation: 0,
+                crtc_id: 0,
+                crtc_epoch: 0,
+                msc_offset: 0,
+                completion_clock: None,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
                 completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
                 emit_idle: true,
@@ -3641,6 +3761,11 @@ mod tests {
                 dst_host_xid: WINDOW_XID,
                 options: 0,
                 present_id: PARKED_SMALLER_ID,
+                window_generation: 0,
+                crtc_id: 0,
+                crtc_epoch: 0,
+                msc_offset: 0,
+                completion_clock: None,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
                 completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
                 emit_idle: true,
@@ -3660,6 +3785,11 @@ mod tests {
                 dst_host_xid: WINDOW_XID,
                 options: 0,
                 present_id: ASYNC_ID,
+                window_generation: 0,
+                crtc_id: 0,
+                crtc_epoch: 0,
+                msc_offset: 0,
+                completion_clock: None,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
                 completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
                 emit_idle: true,
@@ -3712,6 +3842,9 @@ mod tests {
         state.present_complete_gate.insert(
             GATED_ID,
             PresentCompleteGate {
+                crtc_id: 0,
+                crtc_epoch: 0,
+                msc_offset: 0,
                 effective_target_msc: TARGET_MSC,
                 owner: ClientId(1),
                 dst_window_xid: WINDOW_XID,
@@ -3728,6 +3861,15 @@ mod tests {
                 dst_host_xid: WINDOW_XID,
                 options: 0,
                 present_id: GATED_ID,
+                window_generation: 0,
+                crtc_id: 0,
+                crtc_epoch: 0,
+                msc_offset: 0,
+                completion_clock: Some(crate::backend::PresentClockSample {
+                    msc: TARGET_MSC,
+                    ust: 0xABCD,
+                    source: crate::backend::PresentClockSource::PageFlip,
+                }),
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
                 completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
                 emit_idle: true,
@@ -3741,6 +3883,11 @@ mod tests {
                 dst_host_xid: WINDOW_XID,
                 options: 0,
                 present_id: ASYNC_ID,
+                window_generation: 0,
+                crtc_id: 0,
+                crtc_epoch: 0,
+                msc_offset: 0,
+                completion_clock: None,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
                 completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
                 emit_idle: true,
@@ -3823,6 +3970,10 @@ mod tests {
                     src_height: 10,
                     update_rects: None,
                     present_id: DEFERRED_PRESENT_ID,
+                    window_generation: 0,
+                    crtc_id: 0,
+                    crtc_epoch: 0,
+                    msc_offset: 0,
                     effective_target_msc: None,
                 },
                 source_ready: false,
@@ -3842,6 +3993,11 @@ mod tests {
                 dst_host_xid: WINDOW_XID,
                 options: 0,
                 present_id: PRESENT_ID,
+                window_generation: 0,
+                crtc_id: 0,
+                crtc_epoch: 0,
+                msc_offset: 0,
+                completion_clock: None,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
                 completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
                 emit_idle: true,
@@ -3910,6 +4066,11 @@ mod tests {
                 dst_host_xid: WINDOW_XID,
                 options: 0,
                 present_id: PARKED_PRESENT_ID,
+                window_generation: 0,
+                crtc_id: 0,
+                crtc_epoch: 0,
+                msc_offset: 0,
+                completion_clock: None,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
                 completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
                 emit_idle: true,
@@ -3929,6 +4090,11 @@ mod tests {
                 dst_host_xid: WINDOW_XID,
                 options: 0,
                 present_id: DRAINED_PRESENT_ID,
+                window_generation: 0,
+                crtc_id: 0,
+                crtc_epoch: 0,
+                msc_offset: 0,
+                completion_clock: None,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
                 completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
                 emit_idle: true,

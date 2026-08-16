@@ -907,6 +907,21 @@ impl SceneCompositor {
             .is_some_and(|inner| inner.outputs.iter().any(|o| !o.pending_acks.is_empty()))
     }
 
+    /// True while one specific output has an atomic pageflip awaiting
+    /// retirement. Present scheduling is CRTC-domain-specific: activity on a
+    /// different card/output must not change the selected output's immediate
+    /// target rule.
+    pub(crate) fn has_pending_page_flip(&self, output_idx: usize) -> bool {
+        #[cfg(test)]
+        if let Some(v) = self.test_flip_in_flight_override {
+            return v;
+        }
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.outputs.get(output_idx))
+            .is_some_and(|output| !output.pending_acks.is_empty())
+    }
+
     /// Test-only: force [`has_pending_page_flips`](Self::has_pending_page_flips)
     /// without a live output/`PendingAck` queue.
     #[cfg(test)]

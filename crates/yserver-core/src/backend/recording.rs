@@ -312,6 +312,7 @@ pub struct RecordingBackend {
     /// Completions returned (and drained) by `drain_completed_present_events`,
     /// so tests can drive the vblank-pacing park/fire path.
     pub completed_present_events_to_drain: Vec<CompletedPresentEvent>,
+    pub retired_present_idle_events_to_drain: Vec<CompletedPresentEvent>,
     /// Monotonic counter backing `pin_present_source`'s returned tokens.
     next_present_source_pin: u64,
     /// `(pin_id, host_xid)` recorded by `pin_present_source`, in call
@@ -329,6 +330,9 @@ pub struct RecordingBackend {
     /// to actually sweep (its early-return guard bails whenever
     /// `clock.msc == 0`) set this to a nonzero MSC.
     pub present_ust_msc: (u64, u64),
+    /// Per-CRTC overrides for `present_ust_msc`; missing domains fall back to
+    /// the legacy scalar above so existing single-domain tests stay terse.
+    pub present_ust_msc_by_crtc: std::collections::HashMap<u32, (u64, u64)>,
     /// Overrides `present_get_completion_clock` independently of
     /// `present_ust_msc`. `None` (default) falls back to the trait's
     /// derive-from-`present_get_ust_msc` behavior — the two clocks read
@@ -337,15 +341,23 @@ pub struct RecordingBackend {
     /// (`present_ust_msc`) ahead of a deliberately stale completion clock,
     /// to prove `classify_msc_due`'s caller reads the former only.
     pub present_completion_clock: Option<crate::backend::PresentClockSample>,
+    /// Per-CRTC completion-clock overrides; missing domains fall back to the
+    /// legacy scalar override/general clock.
+    pub present_completion_clock_by_crtc:
+        std::collections::HashMap<u32, crate::backend::PresentClockSample>,
     /// Task 7: canned return for `present_flip_in_flight`. Default `false`
     /// matches the trait default.
     pub present_flip_in_flight: bool,
+    pub present_flip_in_flight_by_crtc: std::collections::HashMap<u32, bool>,
     /// Task 7: canned return for `present_display_idle`. Default `true`
     /// matches the trait default.
     pub present_display_idle: bool,
+    pub present_display_idle_by_crtc: std::collections::HashMap<u32, bool>,
+    pub present_crtc_clock_epoch_by_crtc: std::collections::HashMap<u32, u64>,
     /// Task 7: canned return for `present_absolute_vblank_arm_supported`.
     /// Default `false` matches the trait default.
     pub present_absolute_vblank_arm_supported: bool,
+    pub present_absolute_vblank_arm_supported_by_crtc: std::collections::HashMap<u32, bool>,
     /// Task 7: canned return for `present_scanout_blackout`. Default
     /// `false` matches the trait default.
     pub present_scanout_blackout: bool,
@@ -360,6 +372,11 @@ pub struct RecordingBackend {
     /// `eff` is core-side (Task 7), so this should read `eff - 1`, never
     /// the raw `effective_target_msc`.
     pub armed_absolute_vblank_targets: Vec<Vec<u64>>,
+    pub armed_absolute_vblank_crtcs: Vec<u32>,
+    /// Domain-qualified calls made by the two idle-arm paths.
+    pub armed_idle_vblank_targets: Vec<(u32, Vec<u64>)>,
+    pub armed_completion_idle_vblank_targets: Vec<(u32, Vec<u64>)>,
+    pub arm_idle_vblanks_result: Option<Result<usize, io::ErrorKind>>,
     /// Task 8 (copy-failure reroute): when `true`, `copy_area` still
     /// records the call (so a test can see it was attempted) but returns
     /// `Err` instead of `Ok(())`, driving
@@ -435,17 +452,28 @@ impl RecordingBackend {
             dri3_caps: crate::backend::Dri3Caps::unsupported(),
             signalled_present_wakes: Vec::new(),
             completed_present_events_to_drain: Vec::new(),
+            retired_present_idle_events_to_drain: Vec::new(),
             next_present_source_pin: 1,
             pinned_present_sources: Vec::new(),
             released_present_sources: Vec::new(),
             present_ust_msc: (0, 0),
+            present_ust_msc_by_crtc: std::collections::HashMap::new(),
             present_completion_clock: None,
+            present_completion_clock_by_crtc: std::collections::HashMap::new(),
             present_flip_in_flight: false,
+            present_flip_in_flight_by_crtc: std::collections::HashMap::new(),
             present_display_idle: true,
+            present_display_idle_by_crtc: std::collections::HashMap::new(),
+            present_crtc_clock_epoch_by_crtc: std::collections::HashMap::new(),
             present_absolute_vblank_arm_supported: false,
+            present_absolute_vblank_arm_supported_by_crtc: std::collections::HashMap::new(),
             present_scanout_blackout: false,
             arm_present_absolute_vblank_result: None,
             armed_absolute_vblank_targets: Vec::new(),
+            armed_absolute_vblank_crtcs: Vec::new(),
+            armed_idle_vblank_targets: Vec::new(),
+            armed_completion_idle_vblank_targets: Vec::new(),
+            arm_idle_vblanks_result: None,
             fail_copy_area: false,
             present_direct_result: false,
             present_direct_candidates: Vec::new(),
@@ -703,34 +731,58 @@ impl Backend for RecordingBackend {
         self.signalled_present_wakes.push(present_id);
     }
 
-    fn present_get_ust_msc(&self) -> (u64, u64) {
-        self.present_ust_msc
+    fn present_get_ust_msc(&self, crtc_id: u32) -> (u64, u64) {
+        self.present_ust_msc_by_crtc
+            .get(&crtc_id)
+            .copied()
+            .unwrap_or(self.present_ust_msc)
     }
 
-    fn present_get_completion_clock(&self) -> crate::backend::PresentClockSample {
-        self.present_completion_clock.unwrap_or_else(|| {
-            let (msc, ust) = self.present_ust_msc;
-            crate::backend::PresentClockSample {
-                msc,
-                ust,
-                source: crate::backend::PresentClockSource::BackendVblank,
-            }
-        })
+    fn present_get_completion_clock(&self, crtc_id: u32) -> crate::backend::PresentClockSample {
+        self.present_completion_clock_by_crtc
+            .get(&crtc_id)
+            .copied()
+            .or(self.present_completion_clock)
+            .unwrap_or_else(|| {
+                let (msc, ust) = self.present_get_ust_msc(crtc_id);
+                crate::backend::PresentClockSample {
+                    msc,
+                    ust,
+                    source: crate::backend::PresentClockSource::BackendVblank,
+                }
+            })
     }
 
-    fn present_flip_in_flight(&self) -> bool {
-        self.present_flip_in_flight
+    fn present_flip_in_flight(&self, crtc_id: u32) -> bool {
+        self.present_flip_in_flight_by_crtc
+            .get(&crtc_id)
+            .copied()
+            .unwrap_or(self.present_flip_in_flight)
     }
 
-    fn present_display_idle(&self) -> bool {
-        self.present_display_idle
+    fn present_display_idle(&self, crtc_id: u32) -> bool {
+        self.present_display_idle_by_crtc
+            .get(&crtc_id)
+            .copied()
+            .unwrap_or(self.present_display_idle)
     }
 
-    fn present_absolute_vblank_arm_supported(&self) -> bool {
-        self.present_absolute_vblank_arm_supported
+    fn present_crtc_clock_epoch(&self, crtc_id: u32) -> u64 {
+        self.present_crtc_clock_epoch_by_crtc
+            .get(&crtc_id)
+            .copied()
+            .unwrap_or(0)
     }
 
-    fn arm_present_absolute_vblank(&mut self, targets: &[u64]) -> io::Result<usize> {
+    fn present_absolute_vblank_arm_supported(&self, crtc_id: u32) -> bool {
+        self.present_absolute_vblank_arm_supported_by_crtc
+            .get(&crtc_id)
+            .copied()
+            .unwrap_or(self.present_absolute_vblank_arm_supported)
+    }
+
+    fn arm_present_absolute_vblank(&mut self, crtc_id: u32, targets: &[u64]) -> io::Result<usize> {
+        self.armed_absolute_vblank_crtcs.push(crtc_id);
         self.armed_absolute_vblank_targets.push(targets.to_vec());
         match self.arm_present_absolute_vblank_result {
             None => Ok(targets.len()),
@@ -746,6 +798,10 @@ impl Backend for RecordingBackend {
     fn drain_completed_present_events(&mut self) -> Vec<CompletedPresentEvent> {
         self.record(RecordedCall::DrainCompletedPresentEvents);
         std::mem::take(&mut self.completed_present_events_to_drain)
+    }
+
+    fn drain_retired_present_idle_events(&mut self) -> Vec<CompletedPresentEvent> {
+        std::mem::take(&mut self.retired_present_idle_events_to_drain)
     }
 
     fn mark_dirty(&mut self) {
@@ -776,10 +832,23 @@ impl Backend for RecordingBackend {
 
     fn arm_present_completion_idle_vblanks(
         &mut self,
-        _target_mscs: &[u64],
+        crtc_id: u32,
+        target_mscs: &[u64],
     ) -> std::io::Result<usize> {
+        self.armed_completion_idle_vblank_targets
+            .push((crtc_id, target_mscs.to_vec()));
         self.record(RecordedCall::ArmPresentCompletionIdleVblanks);
         Ok(0)
+    }
+
+    fn arm_idle_vblanks(&mut self, crtc_id: u32, target_mscs: &[u64]) -> std::io::Result<usize> {
+        self.armed_idle_vblank_targets
+            .push((crtc_id, target_mscs.to_vec()));
+        match self.arm_idle_vblanks_result {
+            None => Ok(0),
+            Some(Ok(n)) => Ok(n),
+            Some(Err(kind)) => Err(std::io::Error::from(kind)),
+        }
     }
 
     fn argb_visual_xid(&self) -> Option<u32> {

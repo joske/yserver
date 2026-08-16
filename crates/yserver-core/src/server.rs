@@ -829,6 +829,14 @@ pub struct PendingNotifyMsc {
     /// Owning client — parked requests are purged when it disconnects.
     pub owner: ClientId,
     pub window: u32,
+    /// RANDR CRTC XID whose raw clock owns this request. `0` is the
+    /// synthetic headless domain.
+    pub crtc_id: u32,
+    pub crtc_epoch: u64,
+    /// Window-to-CRTC offset captured at request acceptance. The request's
+    /// raw target is `wire_target + msc_offset`; divisor/remainder remain
+    /// unshifted for Xorg parity.
+    pub msc_offset: u64,
     pub serial: u32,
     pub target_msc: u64,
     pub divisor: u64,
@@ -842,6 +850,7 @@ pub struct PendingNotifyMsc {
 #[derive(Debug, Clone)]
 pub struct PendingPresentComplete {
     pub event: crate::backend::CompletedPresentEvent,
+    /// Raw target MSC in `event.crtc_id`'s clock domain.
     pub effective_target_msc: u64,
     /// Wire `CompleteNotify` mode byte (`COMPLETE_MODE_COPY` /
     /// `COMPLETE_MODE_SKIP`) — threaded through instead of
@@ -863,11 +872,51 @@ pub struct PendingPresentComplete {
 /// park-vs-fire. Keyed by `present_id` in `present_complete_gate`.
 #[derive(Debug, Clone, Copy)]
 pub struct PresentCompleteGate {
+    pub crtc_id: u32,
+    pub crtc_epoch: u64,
+    pub msc_offset: u64,
+    /// Raw target MSC in `crtc_id`'s clock domain.
     pub effective_target_msc: u64,
     pub owner: yserver_protocol::x11::ClientId,
     /// Destination window xid (`req.window`, == `event.dst_host_xid`), so a
     /// window-destroy purge can drop a gate whose copy has not completed yet.
     pub dst_window_xid: u32,
+}
+
+/// Last raw clocks observed for one Present RANDR CRTC domain.
+#[derive(Debug, Clone, Copy)]
+pub struct PresentCrtcClock {
+    pub epoch: u64,
+    pub msc: u64,
+    pub ust: u64,
+    pub completion: crate::backend::PresentClockSample,
+}
+
+impl Default for PresentCrtcClock {
+    fn default() -> Self {
+        Self {
+            epoch: 0,
+            msc: 0,
+            ust: 0,
+            completion: crate::backend::PresentClockSample {
+                msc: 0,
+                ust: 0,
+                source: crate::backend::PresentClockSource::Immediate,
+            },
+        }
+    }
+}
+
+/// Xorg-compatible Present clock continuity state for one destination
+/// window. When the selected CRTC changes, `msc_offset` is adjusted by
+/// `new_raw_msc - old_raw_msc`; requests snapshot it so later switches do
+/// not reinterpret work already in flight.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PresentWindowMsc {
+    pub last_crtc: u32,
+    pub last_crtc_epoch: u64,
+    pub msc_offset: u64,
+    pub last_raw_msc: u64,
 }
 
 #[derive(Debug)]
@@ -1090,17 +1139,26 @@ pub struct ServerState {
     pub present_pending_msc: Vec<PendingNotifyMsc>,
     /// Monotonic Present completion id source (starts at 1; 0 is "unset").
     pub present_next_id: u64,
+    /// Monotonic identity source for a numeric window XID's Present lifetime.
+    /// Unlike the XID-keyed map below, this counter is never reset when a
+    /// window is destroyed, so a later window reusing the same XID cannot be
+    /// confused with backend completion events still in flight for the old
+    /// resource.
+    pub present_next_window_generation: u64,
+    /// Active Present lifetime generation for each window that has accepted a
+    /// Pixmap/PixmapSynced operation. Removed on window destruction.
+    pub present_window_generations: HashMap<u32, u64>,
     /// Per-in-flight-present pacing target, set at request time, consumed at
     /// GPU-copy completion. Keyed by `present_id`.
     pub present_complete_gate: std::collections::HashMap<u64, PresentCompleteGate>,
     /// Completions parked until their target-msc vblank.
     pub present_pending_complete: Vec<PendingPresentComplete>,
-    /// Latest general kernel `(msc, ust_micros)` sample, mirrored from the
-    /// backend each loop. `NotifyMSC` completes report this clock; paced
-    /// Pixmap completion uses the backend's separate provenance-aware
-    /// completion clock. `(0, 0)` until the first vblank sample.
-    pub present_kernel_msc: u64,
-    pub present_kernel_ust: u64,
+    /// Raw general and completion clocks keyed by RANDR CRTC XID. Domain 0
+    /// is the synthetic headless clock and normally remains at zero.
+    pub present_crtc_clocks: HashMap<(u32, u64), PresentCrtcClock>,
+    /// Per-window clock-continuity state. Entries are removed with their
+    /// windows; pending requests retain their own offset snapshot.
+    pub present_window_msc: HashMap<u32, PresentWindowMsc>,
     /// Diagnostic side-table: client_id → first WM_CLASS string the
     /// client set on any of its windows. Used by perf logs to attribute
     /// hot-path activity (e.g. SHM PutImage bursts) to a recognisable
@@ -1382,10 +1440,12 @@ impl ServerState {
             present_event_selections: HashMap::new(),
             present_pending_msc: Vec::new(),
             present_next_id: 1,
+            present_next_window_generation: 1,
+            present_window_generations: HashMap::new(),
             present_complete_gate: std::collections::HashMap::new(),
             present_pending_complete: Vec::new(),
-            present_kernel_msc: 0,
-            present_kernel_ust: 0,
+            present_crtc_clocks: HashMap::new(),
+            present_window_msc: HashMap::new(),
             client_wm_class: HashMap::new(),
             mit_shm_segments: HashMap::new(),
             glx_contexts: HashMap::new(),
@@ -1457,6 +1517,22 @@ impl ServerState {
         let id = self.present_next_id;
         self.present_next_id = self.present_next_id.wrapping_add(1).max(1);
         id
+    }
+
+    /// Return the active Present lifetime identity for `window`, allocating a
+    /// fresh nonzero generation when this is the first accepted Present since
+    /// the window was created (or recreated with a reused numeric XID).
+    pub fn present_window_generation(&mut self, window: u32) -> u64 {
+        if let Some(&generation) = self.present_window_generations.get(&window) {
+            return generation;
+        }
+        let generation = self.present_next_window_generation;
+        self.present_next_window_generation = self
+            .present_next_window_generation
+            .checked_add(1)
+            .expect("Present window generation exhausted");
+        self.present_window_generations.insert(window, generation);
+        generation
     }
 
     /// Seed the XI2 device-property registry from a libinput pointer
@@ -1821,8 +1897,18 @@ pub struct PendingPresentPixmap {
     pub update_rects: Option<Vec<xfixes::RegionRect>>,
     /// Server-generated correlation id for this present's completion.
     pub present_id: u64,
+    /// Destination window lifetime identity captured at request acceptance.
+    pub window_generation: u64,
+    /// RANDR CRTC XID whose raw clock owns this request. `0` is the
+    /// synthetic headless domain.
+    pub crtc_id: u32,
+    pub crtc_epoch: u64,
+    /// Per-window offset captured when `crtc_id` was selected. Client MSCs
+    /// are raw CRTC MSCs minus this offset.
+    pub msc_offset: u64,
     /// `Some(msc)` when the completion must be paced to that vblank
-    /// (synced present, target in the future). `None` = complete asap.
+    /// (synced present, target in the future). Stored in the selected CRTC's
+    /// raw clock domain. `None` = complete asap.
     pub effective_target_msc: Option<u64>,
 }
 

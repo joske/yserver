@@ -190,6 +190,11 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
         let _ = state.resources.destroy_window(root);
         all_destroyed.extend(order);
     }
+    crate::core_loop::process_request::purge_present_for_destroyed_windows(
+        state,
+        backend,
+        &all_destroyed,
+    );
     state.drop_window_subscriptions(&all_destroyed);
 
     let removed = if retain {
@@ -593,6 +598,11 @@ pub fn destroy_zombie_resources(
         let _ = state.resources.destroy_window(root);
         all_destroyed.extend(order);
     }
+    crate::core_loop::process_request::purge_present_for_destroyed_windows(
+        state,
+        backend,
+        &all_destroyed,
+    );
     state.drop_window_subscriptions(&all_destroyed);
 
     let removed = state.resources.remove_non_window_resources_owned_by(zombie);
@@ -808,6 +818,10 @@ mod tests {
             src_height: 100,
             update_rects: None,
             present_id: PRESENT_ID,
+            window_generation: 0,
+            crtc_id: 0,
+            crtc_epoch: 0,
+            msc_offset: 0,
             effective_target_msc: None,
         };
         state.present_wait_to_id.insert(WAIT_ID, PRESENT_ID);

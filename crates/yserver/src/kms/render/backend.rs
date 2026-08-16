@@ -241,6 +241,12 @@ struct DirectPresentFrame {
     candidate: PresentScanoutCandidate,
     fallback_target: PaintTarget,
     event: yserver_core::backend::CompletedPresentEvent,
+    /// Output whose CRTC domain owns CompleteNotify/MSC for this Present.
+    completion_output_idx: usize,
+    /// Exact pageflip sample from the selected/reference CRTC. Xorg waits for
+    /// every grouped CRTC to retire before completing, but stamps the event
+    /// from this reference sample rather than the last/max output.
+    completion_clock: Option<yserver_core::backend::PresentClockSample>,
     awaiting_outputs: HashSet<usize>,
 }
 
@@ -715,6 +721,10 @@ pub struct KmsBackend {
     /// refcount lives on `core.cow_refcount` per the v2 plan
     /// §"`KmsCore` scope — narrowly drawn" split.
     pub(crate) cow_id: Option<crate::kms::render::store::DrawableId>,
+    /// Final COW release accepted while direct scanout still owns a frame.
+    /// The protocol resource is logically gone, but the backend identity and
+    /// storage stay alive until the composed replacement retires.
+    deferred_cow_release: bool,
 
     /// M0 direct-scanout telemetry. Purely observational: it never owns a
     /// drawable pin, submits DRM work, or affects Present capabilities.
@@ -1013,6 +1023,13 @@ pub struct KmsBackend {
     /// requests address the CRTC XID, so connector names alone are ambiguous
     /// once multiple cards can both expose (for example) `DP-1`.
     crtc_key_by_id: std::collections::HashMap<u32, OutputKey>,
+    /// Live Present clock-domain generation per RANDR CRTC XID. The epoch is
+    /// retained only while that XID resolves to the same active
+    /// device-qualified CRTC. Off/removal or a KMS CRTC reassignment allocates
+    /// a fresh epoch on the next live projection, letting core discard raw MSC
+    /// targets captured in the old counter domain.
+    present_crtc_clock_epochs: HashMap<u32, (CrtcKey, u64)>,
+    next_present_crtc_clock_epoch: u64,
     hotplug_rescan_deadline: Option<std::time::Instant>,
     gamma_luts: RefCell<HashMap<OutputKey, GammaLut>>,
 
@@ -1266,6 +1283,37 @@ impl KmsBackend {
         self.scanout_m2.hold_direct = false;
     }
 
+    fn finish_cow_release(&mut self) {
+        debug_assert_eq!(self.core.cow_refcount, 0);
+        self.deferred_cow_release = false;
+
+        // Keep the backend COW projection and storage together until the
+        // last owner is safe to drop. For a direct frame, this helper runs
+        // only after the composed replacement retired and its pins released.
+        let cow_host_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+        self.windows.remove(&cow_host_xid);
+        self.scene.mark_scene_structure_dirty();
+
+        self.drain_engine_present_batches();
+        if let Err(e) = self.engine.flush_render_batch(
+            &mut self.store,
+            &mut self.platform,
+            crate::kms::render::engine::RenderFlushReason::Other,
+        ) {
+            log::warn!("render release_overlay_window: flush_render_batch failed: {e:?}");
+        }
+        self.drain_render_telemetry();
+        if let Some(id) = self.cow_id.take() {
+            self.store_decref_with_invalidate(id);
+        }
+    }
+
+    fn finish_deferred_cow_release(&mut self) {
+        if self.deferred_cow_release {
+            self.finish_cow_release();
+        }
+    }
+
     fn bind_direct_cursor_on_all_outputs(&mut self) {
         if self.scanout_m2.cursor_bound_all {
             return;
@@ -1355,6 +1403,7 @@ impl KmsBackend {
         self.scanout_m2.reset_eligible_root_probation();
         self.scanout_m2.unflip_fallback_source = None;
         self.scanout_m2.unflip_shadow_ready = false;
+        self.finish_deferred_cow_release();
         log::info!("scanout_m2: stopped after scanout replacement: {reason}");
     }
 
@@ -1641,7 +1690,11 @@ impl KmsBackend {
         Ok(())
     }
 
-    fn retire_direct_output(&mut self, output_idx: usize) -> bool {
+    fn retire_direct_output(
+        &mut self,
+        output_idx: usize,
+        clock: yserver_core::backend::PresentClockSample,
+    ) -> bool {
         if self.scanout_m2.unflip_awaiting_outputs.remove(&output_idx) {
             if self.scanout_m2.unflip_awaiting_outputs.is_empty() {
                 self.stop_direct_after_scanout_replaced("atomic composed unflip");
@@ -1657,6 +1710,9 @@ impl KmsBackend {
         if !pending.awaiting_outputs.remove(&output_idx) {
             return false;
         }
+        if output_idx == pending.completion_output_idx {
+            pending.completion_clock = Some(clock);
+        }
         // Deliberately keep the platform pool's prior `OnScreen` BO reserved.
         // KMS no longer reads it after this external flip retires, but it is
         // the known-good framebuffer restored by the synchronized M2a unflip;
@@ -1668,8 +1724,12 @@ impl KmsBackend {
                 .pending
                 .take()
                 .expect("pending direct frame disappeared");
+            let completion_clock = presented
+                .completion_clock
+                .expect("selected direct CRTC retired with the grouped flip");
             presented.event.completion_mode = yserver_protocol::x11::present::COMPLETE_MODE_FLIP;
             presented.event.emit_idle = false;
+            presented.event.completion_clock = Some(completion_clock);
             self.scanout_m2.completed.push(presented.event.clone());
             if let Some(previous) = self.scanout_m2.current.replace(presented) {
                 self.release_direct_frame(previous);
@@ -1710,6 +1770,24 @@ impl KmsBackend {
         })
     }
 
+    /// A whole-root direct Present is paced in the selected RANDR CRTC's
+    /// domain even though the grouped framebuffer is installed on every
+    /// output. The selected CRTC therefore has to be live, owned by the
+    /// primary DRM device that imported the framebuffer, and a member of the
+    /// homogeneous single-device topology accepted by the grouped path.
+    fn direct_present_crtc_eligible(&self, crtc_id: u32, crtc_epoch: u64) -> bool {
+        if crtc_epoch == 0 || self.present_crtc_clock_epoch(crtc_id) != crtc_epoch {
+            return false;
+        }
+        let Some(crtc_key) = self.present_crtc_key(crtc_id) else {
+            return false;
+        };
+        self.platform
+            .primary_device()
+            .is_some_and(|primary| crtc_key.device_key == primary.key)
+            && self.direct_scanout_topology_eligible()
+    }
+
     fn scanout_m1_topology_signature(&self) -> u64 {
         use std::hash::{Hash, Hasher};
 
@@ -1742,7 +1820,7 @@ impl KmsBackend {
     ) {
         if !self.scanout_allowed()
             || !self.kms_outputs_active
-            || !self.direct_scanout_topology_eligible()
+            || !self.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch)
             || !matches!(
                 self.scene.cursor_mode(),
                 crate::kms::render::scene::CursorPlaneMode::Hw
@@ -2655,6 +2733,7 @@ impl KmsBackend {
             last_observed_pool_creates: 0,
             last_observed_pool_resets: 0,
             cow_id: None,
+            deferred_cow_release: false,
             scanout_m0: ScanoutM0Telemetry::default(),
             scanout_m1: ScanoutM1ProbeCache::new(),
             scanout_m2: ScanoutM2State::new(),
@@ -2705,6 +2784,8 @@ impl KmsBackend {
             output_identity_by_id: std::collections::HashMap::new(),
             output_key_by_id: std::collections::HashMap::new(),
             crtc_key_by_id: std::collections::HashMap::new(),
+            present_crtc_clock_epochs: HashMap::new(),
+            next_present_crtc_clock_epoch: 1,
             hotplug_rescan_deadline: None,
             gamma_luts: RefCell::new(HashMap::new()),
             exported_dmabufs: HashMap::new(),
@@ -3559,6 +3640,7 @@ impl KmsBackend {
             last_observed_pool_creates: 0,
             last_observed_pool_resets: 0,
             cow_id: None,
+            deferred_cow_release: false,
             scanout_m0: ScanoutM0Telemetry::default(),
             scanout_m1: ScanoutM1ProbeCache::new(),
             scanout_m2: ScanoutM2State::new(),
@@ -3608,6 +3690,8 @@ impl KmsBackend {
             output_identity_by_id: std::collections::HashMap::new(),
             output_key_by_id: std::collections::HashMap::new(),
             crtc_key_by_id: std::collections::HashMap::new(),
+            present_crtc_clock_epochs: HashMap::new(),
+            next_present_crtc_clock_epoch: 1,
             hotplug_rescan_deadline: None,
             gamma_luts: RefCell::new(HashMap::new()),
             exported_dmabufs: HashMap::new(),
@@ -4859,6 +4943,7 @@ impl KmsBackend {
         }
         outs.sort_by_key(|o| o.output_id);
         modes.sort_by_key(|m| m.mode_id);
+        self.refresh_present_crtc_clock_epochs();
         (outs, modes)
     }
 
@@ -6361,6 +6446,11 @@ impl KmsBackend {
                 dst_host_xid: 0,
                 options: 0,
                 present_id: 0,
+                window_generation: 0,
+                crtc_id: 0,
+                crtc_epoch: 0,
+                msc_offset: 0,
+                completion_clock: None,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
                 completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
                 emit_idle: true,
@@ -6574,6 +6664,11 @@ impl KmsBackend {
                 dst_host_xid: 0,
                 options: 0,
                 present_id: 0,
+                window_generation: 0,
+                crtc_id: 0,
+                crtc_epoch: 0,
+                msc_offset: 0,
+                completion_clock: None,
                 wake: PresentWake::Pixmap { idle_fence_xid: 0 },
                 completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
                 emit_idle: true,
@@ -7381,12 +7476,33 @@ impl KmsBackend {
         self.scene.scene_structure_dirty || self.store.has_pending_presentation_damage()
     }
 
+    fn present_flip_in_flight_for_output(&self, output_idx: usize) -> bool {
+        self.scene.has_pending_page_flip(output_idx)
+            || self
+                .scanout_m2
+                .pending
+                .as_ref()
+                .is_some_and(|frame| frame.awaiting_outputs.contains(&output_idx))
+            || self
+                .scanout_m2
+                .unflip_awaiting_outputs
+                .contains(&output_idx)
+    }
+
     /// Standalone CRTC sequence events may pace Pixmap completions only when
-    /// no visible scanout work is pending. This is evaluated when the event
-    /// is consumed, closing the race where an idle arm is followed by damage
-    /// and a submitted flip before the sequence arrives.
-    fn present_completion_is_idle(&self) -> bool {
-        !self.scene.has_pending_page_flips() && !self.scene_wants_compose()
+    /// the selected output has no visible scanout work pending. This is
+    /// evaluated when the event is consumed, closing the race where an idle
+    /// arm is followed by damage and a submitted flip before the sequence
+    /// arrives. Scene damage remains global because projecting arbitrary
+    /// window damage to one output requires the scene walk itself; treating
+    /// it conservatively as work in every domain is safe, while unrelated
+    /// pageflips are isolated here.
+    fn present_completion_is_idle_for(&self, crtc_key: CrtcKey) -> bool {
+        self.platform
+            .output_index_for_crtc(crtc_key)
+            .is_some_and(|output_idx| {
+                !self.present_flip_in_flight_for_output(output_idx) && !self.scene_wants_compose()
+            })
     }
 
     /// Clear both armed-target maps (relative single-slot + absolute
@@ -7508,7 +7624,7 @@ impl KmsBackend {
         // the completion still waits for the delayed flip it was meant to
         // avoid.
         let ust = ns / 1000;
-        let completion_eligible = tagged || self.present_completion_is_idle();
+        let completion_eligible = tagged || self.present_completion_is_idle_for(crtc_key);
         self.platform.record_vblank_clock(crtc_key, sequence, ust);
         if completion_eligible {
             self.platform.record_completion_clock(
@@ -7528,12 +7644,12 @@ impl KmsBackend {
     }
 
     /// Testable seam for `arm_idle_vblanks`: `armer` performs the actual
-    /// ioctl (or a stub in tests). Arms a single one-shot vblank on every
-    /// eligible output. This preserves upstream's global-clock wake behavior
-    /// until the following per-Present CRTC-domain commit. One in-flight
-    /// sequence per device-qualified CRTC is deduplicated independently.
+    /// ioctl (or a stub in tests). Arms a single one-shot vblank only in the
+    /// selected Present's device-qualified CRTC domain. One in-flight
+    /// sequence per domain is deduplicated independently.
     pub(crate) fn arm_idle_vblanks_with<F>(
         &mut self,
+        crtc_key: CrtcKey,
         target_mscs: &[u64],
         mut armer: F,
     ) -> std::io::Result<usize>
@@ -7549,42 +7665,18 @@ impl KmsBackend {
             self.clear_all_armed_vblank_targets();
             return Ok(0);
         }
-        let crtc_keys: Vec<CrtcKey> = self
-            .platform
-            .outputs
-            .iter()
-            .map(CrtcKey::for_output)
-            .filter(|key| {
-                !self
-                    .crtc_queue_sequence_unsupported_devices
-                    .contains(&key.device_key)
-            })
-            .collect();
-        let mut armed = 0;
-        let mut first_error = None;
-        for crtc_key in crtc_keys {
-            if self.armed_vblank_targets.contains_key(&crtc_key) {
-                continue;
-            }
-            match armer(crtc_key) {
-                Ok(true) => {
-                    self.armed_vblank_targets.insert(crtc_key, 0);
-                    armed += 1;
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    // DRM devices have independent vblank domains. A
-                    // transient failure on one card must not prevent a later
-                    // card from receiving its own wake arm.
-                    if first_error.is_none() {
-                        first_error = Some(error);
-                    }
-                }
-            }
+        if self
+            .crtc_queue_sequence_unsupported_devices
+            .contains(&crtc_key.device_key)
+            || self.armed_vblank_targets.contains_key(&crtc_key)
+        {
+            return Ok(0);
         }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(armed),
+        if armer(crtc_key)? {
+            self.armed_vblank_targets.insert(crtc_key, 0);
+            Ok(1)
+        } else {
+            Ok(0)
         }
     }
 
@@ -7597,9 +7689,9 @@ impl KmsBackend {
     /// `CRTC_QUEUE_SEQUENCE`s per CRTC are legal, and a target already in
     /// the set is skipped (dedup) rather than re-armed.
     ///
-    /// Arms only the device-qualified CRTC that contributed the current
-    /// global maximum sample, matching `present_get_ust_msc`. The next
-    /// adaptation commit removes this cross-domain reduction entirely.
+    /// Arms only the explicitly selected device-qualified CRTC. Callers
+    /// resolve the RANDR CRTC XID through the current live output inventory
+    /// before entering this seam.
     ///
     /// Returns the count of targets now **covered** by an in-flight arm
     /// — newly issued OR already armed — not just newly issued ioctls
@@ -7609,6 +7701,7 @@ impl KmsBackend {
     /// `Err` "arm failed, execute immediately" contract and fire early.
     pub(crate) fn arm_present_absolute_vblank_with<F>(
         &mut self,
+        crtc_key: CrtcKey,
         targets: &[u64],
         mut armer: F,
     ) -> std::io::Result<usize>
@@ -7624,13 +7717,6 @@ impl KmsBackend {
             self.clear_all_armed_vblank_targets();
             return Ok(0);
         }
-        let Some(crtc_key) = self
-            .platform
-            .present_max_clock_crtc()
-            .or_else(|| self.platform.outputs.first().map(CrtcKey::for_output))
-        else {
-            return Ok(0);
-        };
         if self
             .crtc_queue_sequence_unsupported_devices
             .contains(&crtc_key.device_key)
@@ -7658,24 +7744,26 @@ impl KmsBackend {
         Ok(covered)
     }
 
-    fn arm_idle_vblanks_ioctl(&mut self, target_mscs: &[u64]) -> std::io::Result<usize> {
-        let devices: HashMap<_, _> = self
+    fn arm_idle_vblanks_ioctl(
+        &mut self,
+        randr_crtc_id: u32,
+        target_mscs: &[u64],
+    ) -> std::io::Result<usize> {
+        let Some(crtc_key) = self.present_crtc_key(randr_crtc_id) else {
+            return Ok(0);
+        };
+        let Some(device) = self
             .platform
-            .devices
-            .iter()
-            .map(|device| (device.key, Rc::clone(&device.device)))
-            .collect();
-        let mut newly_unsupported = HashSet::new();
-        let result = self.arm_idle_vblanks_with(target_mscs, |crtc_key| {
-            let Some(device) = devices.get(&crtc_key.device_key) else {
-                return Err(io::Error::other(format!(
-                    "no DRM device {} for idle vblank arm",
-                    crtc_key.device_key
-                )));
-            };
+            .device_for_key(crtc_key.device_key)
+            .map(|device| Rc::clone(&device.device))
+        else {
+            return Ok(0);
+        };
+        let mut newly_unsupported = false;
+        let result = self.arm_idle_vblanks_with(crtc_key, target_mscs, |crtc_key| {
             let crtc_id = u32::from(crtc_key.crtc);
             match crate::drm::page_flip::queue_crtc_sequence(
-                device,
+                &device,
                 crtc_id,
                 /* relative */ true,
                 /* sequence */ 1,
@@ -7686,19 +7774,20 @@ impl KmsBackend {
                     if e.raw_os_error() == Some(libc::EOPNOTSUPP)
                         || e.raw_os_error() == Some(libc::ENOTTY) =>
                 {
-                    newly_unsupported.insert(crtc_key.device_key);
+                    newly_unsupported = true;
                     Ok(false)
                 }
                 Err(e) => Err(e),
             }
         });
-        for device_key in newly_unsupported {
+        if newly_unsupported {
             log::warn!(
-                "DRM_IOCTL_CRTC_QUEUE_SEQUENCE returned EOPNOTSUPP on {device_key} — disabling \
-                 vblank arming on that DRM device (flip-driven MSC only)"
+                "DRM_IOCTL_CRTC_QUEUE_SEQUENCE returned EOPNOTSUPP on {} — disabling \
+                 vblank arming on that DRM device (flip-driven MSC only)",
+                crtc_key.device_key
             );
             self.crtc_queue_sequence_unsupported_devices
-                .insert(device_key);
+                .insert(crtc_key.device_key);
         }
         result
     }
@@ -12706,6 +12795,64 @@ impl KmsBackend {
         Ok(Some((layout.key.device_key, crtc, size)))
     }
 
+    /// Resolve one protocol-visible RANDR CRTC XID into the live KMS clock
+    /// domain that currently owns it.
+    ///
+    /// `crtc_key_by_id` deliberately names the stable connector resource,
+    /// not a raw DRM handle: RANDR keeps CRTC resources for disconnected/off
+    /// outputs and a later modeset may assign a different kernel CRTC. Walk
+    /// through the current `ActiveOutput` inventory on every Present call so
+    /// an off/stale resource cleanly has no clock or arm target. Requiring the
+    /// owning device here also prevents an inconsistent topology from routing
+    /// an ioctl to some other card with the same raw CRTC handle.
+    fn present_crtc_output(&self, crtc_id: u32) -> Option<(usize, CrtcKey)> {
+        let output_key = self.crtc_key_by_id.get(&crtc_id)?;
+        let (output_idx, output) = self
+            .platform
+            .outputs
+            .iter()
+            .enumerate()
+            .find(|(_, output)| output.key == *output_key)?;
+        let crtc_key = CrtcKey::for_output(output);
+        self.platform.device_for_key(crtc_key.device_key)?;
+        Some((output_idx, crtc_key))
+    }
+
+    fn present_crtc_key(&self, crtc_id: u32) -> Option<CrtcKey> {
+        self.present_crtc_output(crtc_id).map(|(_, key)| key)
+    }
+
+    fn refresh_present_crtc_clock_epochs(&mut self) {
+        let live: Vec<(u32, CrtcKey)> = self
+            .crtc_key_by_id
+            .keys()
+            .filter_map(|&crtc_id| {
+                self.present_crtc_key(crtc_id)
+                    .map(|crtc_key| (crtc_id, crtc_key))
+            })
+            .collect();
+        let live_ids: HashSet<u32> = live.iter().map(|(crtc_id, _)| *crtc_id).collect();
+        self.present_crtc_clock_epochs
+            .retain(|crtc_id, _| live_ids.contains(crtc_id));
+
+        for (crtc_id, crtc_key) in live {
+            let route_unchanged = self
+                .present_crtc_clock_epochs
+                .get(&crtc_id)
+                .is_some_and(|(old_key, _)| *old_key == crtc_key);
+            if route_unchanged {
+                continue;
+            }
+            let epoch = self.next_present_crtc_clock_epoch;
+            self.next_present_crtc_clock_epoch = self
+                .next_present_crtc_clock_epoch
+                .checked_add(1)
+                .expect("Present CRTC clock epoch overflow");
+            self.present_crtc_clock_epochs
+                .insert(crtc_id, (crtc_key, epoch));
+        }
+    }
+
     fn nominal_gamma_size(&self, output_key: &OutputKey) -> u16 {
         match self.live_crtc_and_gamma_size(output_key) {
             Ok(Some((_, _, size))) => size,
@@ -13106,8 +13253,8 @@ impl Backend for KmsBackend {
                 return;
             }
         };
-        for output_idx in flipped {
-            if self.retire_direct_output(output_idx) {
+        for (output_idx, clock) in flipped {
+            if self.retire_direct_output(output_idx, clock) {
                 self.telemetry.record_frame_present();
                 continue;
             }
@@ -13568,7 +13715,7 @@ impl Backend for KmsBackend {
         let authoritative_root = scanout_m2_is_authoritative_root(target, root_coverage);
         let eligible = self.scanout_allowed()
             && self.kms_outputs_active
-            && self.direct_scanout_topology_eligible()
+            && self.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch)
             && !candidate.explicit_sync
             && matches!(
                 self.scene.cursor_mode(),
@@ -13598,6 +13745,17 @@ impl Backend for KmsBackend {
             }
             return Ok(false);
         }
+        let Some((completion_output_idx, _)) = self.present_crtc_output(candidate.crtc_id) else {
+            return Ok(false);
+        };
+        debug_assert_eq!(
+            event.crtc_id, candidate.crtc_id,
+            "direct candidate and completion must share one CRTC domain"
+        );
+        debug_assert_eq!(
+            event.crtc_epoch, candidate.crtc_epoch,
+            "direct candidate and completion must share one CRTC epoch"
+        );
 
         if !self.scanout_m2.admit_eligible_root() {
             return Ok(false);
@@ -13680,6 +13838,8 @@ impl Backend for KmsBackend {
             candidate,
             fallback_target,
             event,
+            completion_output_idx,
+            completion_clock: None,
             awaiting_outputs,
         });
         self.scanout_m2.hold_direct = true;
@@ -14035,66 +14195,69 @@ impl Backend for KmsBackend {
         self.store_decref_with_invalidate(wait.source_id);
     }
 
-    fn present_flip_in_flight(&self) -> bool {
-        self.scene.has_pending_page_flips()
+    fn present_flip_in_flight(&self, crtc_id: u32) -> bool {
+        self.present_crtc_output(crtc_id)
+            .is_some_and(|(output_idx, _)| self.present_flip_in_flight_for_output(output_idx))
     }
 
-    fn present_display_idle(&self) -> bool {
-        self.present_completion_is_idle()
+    fn present_display_idle(&self, crtc_id: u32) -> bool {
+        self.present_crtc_key(crtc_id)
+            .is_some_and(|crtc_key| self.present_completion_is_idle_for(crtc_key))
     }
 
-    fn present_absolute_vblank_arm_supported(&self) -> bool {
-        self.platform
-            .present_max_clock_crtc()
-            .or_else(|| self.platform.outputs.first().map(CrtcKey::for_output))
-            .is_some_and(|key| {
-                !self
-                    .crtc_queue_sequence_unsupported_devices
-                    .contains(&key.device_key)
-            })
+    fn present_absolute_vblank_arm_supported(&self, crtc_id: u32) -> bool {
+        self.present_crtc_key(crtc_id).is_some_and(|key| {
+            !self
+                .crtc_queue_sequence_unsupported_devices
+                .contains(&key.device_key)
+        })
     }
 
-    fn arm_present_absolute_vblank(&mut self, targets: &[u64]) -> io::Result<usize> {
-        let devices: HashMap<_, _> = self
+    fn arm_present_absolute_vblank(
+        &mut self,
+        randr_crtc_id: u32,
+        targets: &[u64],
+    ) -> io::Result<usize> {
+        let Some(crtc_key) = self.present_crtc_key(randr_crtc_id) else {
+            return Ok(0);
+        };
+        let Some(device) = self
             .platform
-            .devices
-            .iter()
-            .map(|device| (device.key, Rc::clone(&device.device)))
-            .collect();
-        let mut newly_unsupported = HashSet::new();
-        let result = self.arm_present_absolute_vblank_with(targets, |crtc_key, target| {
-            let Some(device) = devices.get(&crtc_key.device_key) else {
-                return Err(io::Error::other(format!(
-                    "no DRM device {} for absolute vblank arm",
-                    crtc_key.device_key
-                )));
-            };
-            let crtc_id = u32::from(crtc_key.crtc);
-            match crate::drm::page_flip::queue_crtc_sequence(
-                device,
-                crtc_id,
-                /* relative */ false,
-                target,
-                absolute_seq_user_data(crtc_id),
-            ) {
-                Ok(_) => Ok(true),
-                Err(e)
-                    if e.raw_os_error() == Some(libc::EOPNOTSUPP)
-                        || e.raw_os_error() == Some(libc::ENOTTY) =>
-                {
-                    newly_unsupported.insert(crtc_key.device_key);
-                    Ok(false)
+            .device_for_key(crtc_key.device_key)
+            .map(|device| Rc::clone(&device.device))
+        else {
+            return Ok(0);
+        };
+        let mut newly_unsupported = false;
+        let result =
+            self.arm_present_absolute_vblank_with(crtc_key, targets, |crtc_key, target| {
+                let crtc_id = u32::from(crtc_key.crtc);
+                match crate::drm::page_flip::queue_crtc_sequence(
+                    &device,
+                    crtc_id,
+                    /* relative */ false,
+                    target,
+                    absolute_seq_user_data(crtc_id),
+                ) {
+                    Ok(_) => Ok(true),
+                    Err(e)
+                        if e.raw_os_error() == Some(libc::EOPNOTSUPP)
+                            || e.raw_os_error() == Some(libc::ENOTTY) =>
+                    {
+                        newly_unsupported = true;
+                        Ok(false)
+                    }
+                    Err(e) => Err(e),
                 }
-                Err(e) => Err(e),
-            }
-        });
-        for device_key in newly_unsupported {
+            });
+        if newly_unsupported {
             log::warn!(
                 "DRM_IOCTL_CRTC_QUEUE_SEQUENCE returned EOPNOTSUPP from the absolute \
-                 vblank arm on {device_key} — disabling sequence arming on that device"
+                 vblank arm on {} — disabling sequence arming on that device",
+                crtc_key.device_key,
             );
             self.crtc_queue_sequence_unsupported_devices
-                .insert(device_key);
+                .insert(crtc_key.device_key);
         }
         result
     }
@@ -14553,6 +14716,15 @@ impl Backend for KmsBackend {
         let w = w.max(1);
         let h = h.max(1);
 
+        // Reallocating root/COW storage changes the fallback identity held by
+        // an active direct frame. Snapshot that frame into its old COW and
+        // request the synchronized replacement first. On failure, leave the
+        // old dimensions and every storage owner/pin untouched.
+        if self.scanout_m2.active() {
+            self.materialize_direct_shadow_for_unflip()?;
+            self.request_direct_unflip();
+        }
+
         // ── 1. Update the platform's logical extent ───────────────────────
         self.platform.fb_w = w;
         self.platform.fb_h = h;
@@ -14843,6 +15015,11 @@ impl Backend for KmsBackend {
         _origin: Option<OriginContext>,
         host_xid: u32,
     ) -> io::Result<()> {
+        // A direct frame may still scan a source whose Copy fallback targets
+        // this window. Request the composed replacement before dropping the
+        // window's storage ownership; the frame's pins deliberately remain
+        // alive until that replacement retires.
+        self.request_direct_unflip();
         if let Some(id) = self.store.lookup(host_xid) {
             self.store_decref_with_invalidate(id);
         }
@@ -14857,6 +15034,7 @@ impl Backend for KmsBackend {
     }
 
     fn map_subwindow(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
+        self.request_direct_unflip();
         if let Some(geom) = self.windows.get_mut(&host_xid) {
             geom.mapped = true;
         }
@@ -14896,6 +15074,7 @@ impl Backend for KmsBackend {
     }
 
     fn unmap_subwindow(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
+        self.request_direct_unflip();
         if let Some(geom) = self.windows.get_mut(&host_xid) {
             geom.mapped = false;
         }
@@ -14912,6 +15091,7 @@ impl Backend for KmsBackend {
         host_xid: u32,
         config: HostSubwindowConfig,
     ) -> io::Result<()> {
+        self.request_direct_unflip();
         let Some(geom) = self.windows.get_mut(&host_xid) else {
             // Window not tracked — log + skip (e.g., configure
             // before register). v1 tolerates this.
@@ -15551,6 +15731,16 @@ impl Backend for KmsBackend {
     /// log + continue (storage already exists at xid level).
     fn get_overlay_window(&mut self, _origin: Option<OriginContext>) -> io::Result<bool> {
         if self.cow_id.is_some() {
+            if self.deferred_cow_release {
+                debug_assert_eq!(self.core.cow_refcount, 0);
+                // The protocol resource was logically destroyed on the final
+                // release, but direct scanout kept the backend COW alive for
+                // its safe replacement. Reuse that identity and ask core to
+                // materialize the protocol resource again.
+                self.deferred_cow_release = false;
+                self.core.cow_refcount = 1;
+                return Ok(true);
+            }
             self.core.cow_refcount += 1;
             return Ok(false); // already materialized; refcount bump only
         }
@@ -15633,6 +15823,7 @@ impl Backend for KmsBackend {
             cursor: None,
         };
         self.windows.insert(cow_host_xid, geom);
+        self.deferred_cow_release = false;
         // Step 2 (DRIFT 2): the COW's place in top_level_order is no longer
         // set here — the GetOverlayWindow core handler reprojects from core
         // children via `sync_top_level_order` AFTER materialize_cow_resource
@@ -15643,8 +15834,10 @@ impl Backend for KmsBackend {
 
     /// Stage 4d — Composite Overlay Window release.
     ///
-    /// Decrements `core.cow_refcount`; on the final release it
-    /// decrefs the store storage and clears `self.cow_id`.
+    /// Decrements `core.cow_refcount`; on the final release it normally
+    /// decrefs the store storage and clears `self.cow_id`. If direct scanout
+    /// is active, the logical final release succeeds immediately but physical
+    /// teardown is deferred until the composed replacement retires.
     /// `DrawableStore::decref` removes the xid mapping
     /// (immediately on synchronous-destroy, deferred on
     /// `PendingFence`) so the next `GetOverlayWindow`
@@ -15654,39 +15847,28 @@ impl Backend for KmsBackend {
     /// no-op). The trait docstring is the canonical statement of
     /// this shape.
     ///
-    /// Returns `Ok(true)` iff this call drove the refcount to 0
-    /// and the COW storage was destroyed. The handler uses that
-    /// signal to clear `host_xid` on the COW resource record so
-    /// the next `GetOverlayWindow` re-wires fresh.
+    /// Returns `Ok(true)` iff this call drove the refcount to 0. The handler
+    /// uses that signal to clear the protocol COW resource; a new claim during
+    /// deferred physical teardown reuses the retained backend identity and
+    /// returns `Ok(true)` so core re-wires it.
     fn release_overlay_window(&mut self, _origin: Option<OriginContext>) -> io::Result<bool> {
         if self.core.cow_refcount == 0 {
             return Ok(false);
         }
+        if self.core.cow_refcount == 1 && self.scanout_m2.active() {
+            // Do this while cow_id and its storage owner are authoritative.
+            // Failure leaves the logical refcount, COW, and direct pins
+            // untouched so the compositor can retry or the server can fail
+            // safely without freeing a scanned buffer.
+            self.materialize_direct_shadow_for_unflip()?;
+            self.request_direct_unflip();
+            self.core.cow_refcount = 0;
+            self.deferred_cow_release = true;
+            return Ok(true);
+        }
         self.core.cow_refcount -= 1;
         if self.core.cow_refcount == 0 {
-            // Phase 2 Task 2.2 — remove the COW's windows entry so any
-            // in-flight build_scene observer sees a consistent "COW gone"
-            // view (the scene skips xids absent from windows, so no
-            // CompositeDraw is emitted against the dead xid).
-            // Step 2 (DRIFT 2): top_level_order is NOT mutated here — the
-            // ReleaseOverlayWindow core handler reprojects from core via
-            // `sync_top_level_order` after destroy_cow_resource.
-            let cow_host_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
-            self.windows.remove(&cow_host_xid);
-            self.scene.mark_scene_structure_dirty();
-
-            self.drain_engine_present_batches();
-            if let Err(e) = self.engine.flush_render_batch(
-                &mut self.store,
-                &mut self.platform,
-                crate::kms::render::engine::RenderFlushReason::Other,
-            ) {
-                log::warn!("render release_overlay_window: flush_render_batch failed: {e:?}");
-            }
-            self.drain_render_telemetry();
-            if let Some(id) = self.cow_id.take() {
-                self.store_decref_with_invalidate(id);
-            }
+            self.finish_cow_release();
             Ok(true)
         } else {
             Ok(false)
@@ -20418,26 +20600,52 @@ impl Backend for KmsBackend {
         }
     }
 
-    fn present_get_ust_msc(&self) -> (u64, u64) {
-        self.platform.present_get_ust_msc()
+    fn present_crtc_clock_epoch(&self, crtc_id: u32) -> u64 {
+        let Some(crtc_key) = self.present_crtc_key(crtc_id) else {
+            return 0;
+        };
+        self.present_crtc_clock_epochs
+            .get(&crtc_id)
+            .filter(|(epoch_key, _)| *epoch_key == crtc_key)
+            .map_or(0, |(_, epoch)| *epoch)
     }
 
-    fn present_get_completion_clock(&self) -> yserver_core::backend::PresentClockSample {
-        self.platform.present_get_completion_clock()
+    fn present_get_ust_msc(&self, crtc_id: u32) -> (u64, u64) {
+        self.present_crtc_key(crtc_id).map_or((0, 0), |crtc_key| {
+            self.platform.present_get_ust_msc(crtc_key)
+        })
     }
 
-    fn arm_idle_vblanks(&mut self, target_mscs: &[u64]) -> std::io::Result<usize> {
-        self.arm_idle_vblanks_ioctl(target_mscs)
+    fn present_get_completion_clock(
+        &self,
+        crtc_id: u32,
+    ) -> yserver_core::backend::PresentClockSample {
+        self.present_crtc_key(crtc_id).map_or(
+            yserver_core::backend::PresentClockSample {
+                msc: 0,
+                ust: 0,
+                source: yserver_core::backend::PresentClockSource::PageFlip,
+            },
+            |crtc_key| self.platform.present_get_completion_clock(crtc_key),
+        )
+    }
+
+    fn arm_idle_vblanks(&mut self, crtc_id: u32, target_mscs: &[u64]) -> std::io::Result<usize> {
+        self.arm_idle_vblanks_ioctl(crtc_id, target_mscs)
     }
 
     fn arm_present_completion_idle_vblanks(
         &mut self,
+        crtc_id: u32,
         target_mscs: &[u64],
     ) -> std::io::Result<usize> {
-        if !self.present_completion_is_idle() {
+        let Some(crtc_key) = self.present_crtc_key(crtc_id) else {
+            return Ok(0);
+        };
+        if !self.present_completion_is_idle_for(crtc_key) {
             return Ok(0);
         }
-        self.arm_idle_vblanks_ioctl(target_mscs)
+        self.arm_idle_vblanks_ioctl(crtc_id, target_mscs)
     }
 
     fn present_capabilities(&self, _window: u32) -> PresentCaps {
@@ -21532,6 +21740,29 @@ mod tests {
         CrtcKey::for_output(&backend.platform.outputs[output_idx])
     }
 
+    fn bind_test_randr_crtc(backend: &mut KmsBackend, output_idx: usize, crtc_id: u32) {
+        let output_key = backend.platform.outputs[output_idx].key.clone();
+        backend.crtc_key_by_id.insert(crtc_id, output_key);
+        backend.refresh_present_crtc_clock_epochs();
+    }
+
+    fn push_test_device(backend: &mut KmsBackend, key: DrmDeviceKey) {
+        let device = std::rc::Rc::new(
+            crate::drm::Device::for_tests().expect("open a second test DRM device"),
+        );
+        backend
+            .platform
+            .devices
+            .push(crate::kms::render::platform::KmsDevice {
+                key,
+                device,
+                render_node_fd: None,
+                render_node_device: None,
+                syncobj_timeline: false,
+                render_node_path: None,
+            });
+    }
+
     fn test_crtc_key(device_key: DrmDeviceKey, crtc_id: u32) -> CrtcKey {
         CrtcKey::new(
             device_key,
@@ -22044,6 +22275,11 @@ mod tests {
                 dst_host_xid: 0x1001,
                 options: 0,
                 present_id: 0,
+                window_generation: 0,
+                crtc_id: 0,
+                crtc_epoch: 0,
+                msc_offset: 0,
+                completion_clock: None,
                 wake: yserver_core::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
                 completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
                 emit_idle: true,
@@ -22141,6 +22377,11 @@ mod tests {
                 dst_host_xid: 0x1001,
                 options: 0,
                 present_id: 0,
+                window_generation: 0,
+                crtc_id: 0,
+                crtc_epoch: 0,
+                msc_offset: 0,
+                completion_clock: None,
                 wake: yserver_core::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
                 completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
                 emit_idle: true,
@@ -32295,9 +32536,9 @@ mod tests {
 
         assert!(b.armed_vblank_targets.is_empty(), "arm must be cleared");
         // ust_msc stores microseconds; primary output is index 0.
-        assert_eq!(b.platform.present_get_ust_msc(), (7, 1_500));
+        assert_eq!(b.platform.present_get_ust_msc(crtc_key), (7, 1_500));
         assert_eq!(
-            b.platform.present_get_completion_clock(),
+            b.platform.present_get_completion_clock(crtc_key),
             yserver_core::backend::PresentClockSample {
                 msc: 7,
                 ust: 1_500,
@@ -32317,9 +32558,9 @@ mod tests {
 
         dispatch_test_sequence(&mut b, u64::from(u32::from(crtc)), 2_000_000, 9);
 
-        assert_eq!(b.platform.present_get_ust_msc(), (9, 2_000));
+        assert_eq!(b.platform.present_get_ust_msc(crtc_key), (9, 2_000));
         assert_eq!(
-            b.platform.present_get_completion_clock().msc,
+            b.platform.present_get_completion_clock(crtc_key).msc,
             0,
             "active standalone sequence must not release Pixmap completions"
         );
@@ -32339,9 +32580,9 @@ mod tests {
 
         dispatch_test_sequence(&mut b, super::absolute_seq_user_data(crtc_id), 2_000_000, 9);
 
-        assert_eq!(b.platform.present_get_ust_msc(), (9, 2_000));
+        assert_eq!(b.platform.present_get_ust_msc(crtc_key), (9, 2_000));
         assert_eq!(
-            b.platform.present_get_completion_clock().msc,
+            b.platform.present_get_completion_clock(crtc_key).msc,
             9,
             "tagged Present-target sequence must release due completions",
         );
@@ -32379,7 +32620,7 @@ mod tests {
         );
 
         assert_eq!(
-            b.platform.present_get_completion_clock(),
+            b.platform.present_get_completion_clock(crtc_key),
             PresentClockSample {
                 msc: 20,
                 ust: 2_001,
@@ -32402,7 +32643,7 @@ mod tests {
             "arm cleared even on drop"
         );
         assert_eq!(
-            b.platform.present_get_ust_msc(),
+            b.platform.present_get_ust_msc(crtc_key),
             (0, 0),
             "negative time_ns must not advance the clock"
         );
@@ -32421,7 +32662,7 @@ mod tests {
             b.armed_vblank_targets.is_empty(),
             "stale arm cleared so the CRTC can't strand"
         );
-        assert_eq!(b.platform.present_get_ust_msc(), (0, 0));
+        assert_eq!(b.platform.present_get_ust_msc(stale), (0, 0));
     }
 
     #[test]
@@ -32439,7 +32680,7 @@ mod tests {
             "an equal raw CRTC on another DRM device must not spend this device's arm"
         );
         assert_eq!(
-            b.platform.present_get_ust_msc(),
+            b.platform.present_get_ust_msc(crtc_key),
             (0, 0),
             "an equal CRTC handle from another DRM device must not update this output"
         );
@@ -32473,29 +32714,123 @@ mod tests {
     }
 
     #[test]
-    fn present_get_ust_msc_returns_most_advanced_output() {
-        // Multi-monitor: a full-screen compositor on a secondary output flips
-        // only that CRTC. Keying on output 0 would leave the global clock at 0
-        // and park its NotifyMSC forever; the max across outputs keeps it live.
+    fn present_get_ust_msc_keeps_output_domains_independent() {
         let mut b = super::KmsBackend::for_tests();
         let primary = output_crtc_key(&b, 0);
         push_test_output(&mut b, 2);
         let secondary = output_crtc_key(&b, 1);
-        b.platform.ust_msc.insert(primary, (10, 100)); // primary, idle-ish
-        b.platform.ust_msc.insert(secondary, (42, 424)); // secondary, flipping ahead
+        b.platform.ust_msc.insert(primary, (10, 100));
+        b.platform.ust_msc.insert(secondary, (42, 424));
         assert_eq!(
-            b.platform.present_get_ust_msc(),
-            (42, 424),
-            "picks the most-advanced output's (msc, ust)"
+            b.platform.present_get_ust_msc(primary),
+            (10, 100),
+            "a faster secondary must not advance the primary CRTC's counter"
         );
+        assert_eq!(
+            b.platform.present_get_ust_msc(secondary),
+            (42, 424),
+            "the secondary reads only its own (msc, ust)"
+        );
+    }
+
+    #[test]
+    fn present_randr_crtc_routes_equal_raw_handles_to_the_owning_device() {
+        let mut b = super::KmsBackend::for_tests();
+        let raw_crtc = u32::from(b.platform.outputs[0].output.crtc);
+        let primary_xid = 0x5100;
+        bind_test_randr_crtc(&mut b, 0, primary_xid);
+
+        push_test_output(&mut b, raw_crtc);
+        let secondary_device = test_device_key(99);
+        b.platform.outputs[1].key.device_key = secondary_device;
+        push_test_device(&mut b, secondary_device);
+        let secondary_xid = 0x5101;
+        bind_test_randr_crtc(&mut b, 1, secondary_xid);
+
+        let primary = output_crtc_key(&b, 0);
+        let secondary = output_crtc_key(&b, 1);
+        assert_eq!(primary.crtc, secondary.crtc);
+        assert_ne!(primary.device_key, secondary.device_key);
+        assert_eq!(b.present_crtc_key(primary_xid), Some(primary));
+        assert_eq!(b.present_crtc_key(secondary_xid), Some(secondary));
+
+        b.platform.ust_msc.insert(primary, (11, 1_100));
+        b.platform.ust_msc.insert(secondary, (77, 7_700));
+        assert_eq!(b.present_get_ust_msc(primary_xid), (11, 1_100));
+        assert_eq!(b.present_get_ust_msc(secondary_xid), (77, 7_700));
+
+        let mut armed_on = Vec::new();
+        b.arm_idle_vblanks_with(secondary, &[78], |key| {
+            armed_on.push(key);
+            Ok(true)
+        })
+        .expect("arm selected secondary domain");
+        assert_eq!(armed_on, vec![secondary]);
+        assert!(!b.armed_vblank_targets.contains_key(&primary));
+        assert!(b.armed_vblank_targets.contains_key(&secondary));
+
+        b.crtc_queue_sequence_unsupported_devices
+            .insert(primary.device_key);
+        assert!(!b.present_absolute_vblank_arm_supported(primary_xid));
+        assert!(b.present_absolute_vblank_arm_supported(secondary_xid));
+        assert!(
+            !b.direct_present_crtc_eligible(
+                secondary_xid,
+                b.present_crtc_clock_epoch(secondary_xid),
+            ),
+            "a secondary-card CRTC cannot own the primary-device grouped framebuffer"
+        );
+    }
+
+    #[test]
+    fn present_clock_epoch_changes_on_route_removal_and_readd() {
+        let mut b = super::KmsBackend::for_tests();
+        let crtc_id = 0x5200;
+        bind_test_randr_crtc(&mut b, 0, crtc_id);
+        let first = b.present_crtc_clock_epoch(crtc_id);
+        assert_ne!(first, 0);
+        assert!(b.direct_present_crtc_eligible(crtc_id, first));
+
+        b.refresh_present_crtc_clock_epochs();
+        assert_eq!(b.present_crtc_clock_epoch(crtc_id), first);
+
+        let output = b.platform.outputs.pop().expect("fixture output");
+        b.refresh_present_crtc_clock_epochs();
+        assert_eq!(b.present_crtc_clock_epoch(crtc_id), 0);
+
+        b.platform.outputs.push(output);
+        b.refresh_present_crtc_clock_epochs();
+        let second = b.present_crtc_clock_epoch(crtc_id);
+        assert_ne!(second, 0);
+        assert_ne!(second, first, "off-to-on starts a new MSC epoch");
+        assert!(
+            !b.direct_present_crtc_eligible(crtc_id, first),
+            "a candidate captured in the old domain cannot enter direct scanout"
+        );
+    }
+
+    #[test]
+    fn off_randr_crtc_has_no_present_domain_or_direct_path() {
+        let mut b = super::KmsBackend::for_tests();
+        let crtc_id = 0x5300;
+        b.crtc_key_by_id
+            .insert(crtc_id, test_output_key(0, "not-live"));
+        b.refresh_present_crtc_clock_epochs();
+
+        assert_eq!(b.present_crtc_clock_epoch(crtc_id), 0);
+        assert_eq!(b.present_get_ust_msc(crtc_id), (0, 0));
+        assert!(!b.present_flip_in_flight(crtc_id));
+        assert!(!b.present_absolute_vblank_arm_supported(crtc_id));
+        assert!(!b.direct_present_crtc_eligible(crtc_id, 0));
     }
 
     #[test]
     fn arm_idle_vblanks_with_empty_targets_is_noop() {
         let mut b = super::KmsBackend::for_tests();
+        let primary = output_crtc_key(&b, 0);
         let mut calls = 0u32;
         let armed = b
-            .arm_idle_vblanks_with(&[], |_| {
+            .arm_idle_vblanks_with(primary, &[], |_| {
                 calls += 1;
                 Ok(true)
             })
@@ -32512,7 +32847,7 @@ mod tests {
         let mut calls = 0u32;
 
         let armed = b
-            .arm_idle_vblanks_with(&[100], |_| {
+            .arm_idle_vblanks_with(primary, &[100], |_| {
                 calls += 1;
                 Ok(true)
             })
@@ -32523,7 +32858,7 @@ mod tests {
 
         // Already armed → no second ioctl while the sequence is in flight.
         let armed2 = b
-            .arm_idle_vblanks_with(&[200], |_| {
+            .arm_idle_vblanks_with(primary, &[200], |_| {
                 calls += 1;
                 Ok(true)
             })
@@ -32533,7 +32868,7 @@ mod tests {
     }
 
     #[test]
-    fn arm_idle_vblanks_skips_only_the_unsupported_device() {
+    fn arm_idle_vblanks_skips_an_unsupported_selected_device() {
         let mut b = super::KmsBackend::for_tests();
         let primary = output_crtc_key(&b, 0);
         push_test_output(&mut b, 2);
@@ -32544,20 +32879,29 @@ mod tests {
 
         let mut attempted = Vec::new();
         let armed = b
-            .arm_idle_vblanks_with(&[100], |crtc_key| {
+            .arm_idle_vblanks_with(primary, &[100], |crtc_key| {
                 attempted.push(crtc_key);
                 Ok(true)
             })
             .unwrap();
 
-        assert_eq!(armed, 1);
-        assert_eq!(attempted, vec![secondary]);
+        assert_eq!(armed, 0);
+        assert!(attempted.is_empty());
         assert!(!b.armed_vblank_targets.contains_key(&primary));
+
+        let secondary_armed = b
+            .arm_idle_vblanks_with(secondary, &[100], |crtc_key| {
+                attempted.push(crtc_key);
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!(secondary_armed, 1);
+        assert_eq!(attempted, vec![secondary]);
         assert!(b.armed_vblank_targets.contains_key(&secondary));
     }
 
     #[test]
-    fn arm_idle_vblanks_attempts_later_devices_after_a_transient_error() {
+    fn arm_idle_vblanks_transient_error_does_not_cross_domains() {
         let mut b = super::KmsBackend::for_tests();
         let primary = output_crtc_key(&b, 0);
         push_test_output(&mut b, 2);
@@ -32566,20 +32910,16 @@ mod tests {
 
         let mut attempted = Vec::new();
         let error = b
-            .arm_idle_vblanks_with(&[100], |crtc_key| {
+            .arm_idle_vblanks_with(primary, &[100], |crtc_key| {
                 attempted.push(crtc_key);
-                if crtc_key == primary {
-                    Err(std::io::Error::from_raw_os_error(libc::EINVAL))
-                } else {
-                    Ok(true)
-                }
+                Err(std::io::Error::from_raw_os_error(libc::EINVAL))
             })
-            .expect_err("the first transient error is still reported");
+            .expect_err("the selected domain's transient error is reported");
 
         assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
-        assert_eq!(attempted, vec![primary, secondary]);
+        assert_eq!(attempted, vec![primary]);
         assert!(!b.armed_vblank_targets.contains_key(&primary));
-        assert!(b.armed_vblank_targets.contains_key(&secondary));
+        assert!(!b.armed_vblank_targets.contains_key(&secondary));
     }
 
     #[test]
@@ -32591,7 +32931,7 @@ mod tests {
 
         let mut calls = 0u32;
         let armed = b
-            .arm_idle_vblanks_with(&[100], |_| {
+            .arm_idle_vblanks_with(primary, &[100], |_| {
                 calls += 1;
                 Ok(true)
             })
@@ -32684,7 +33024,7 @@ mod tests {
             "targets <= sequence retire; later targets stay armed"
         );
         assert_eq!(
-            b.platform.present_get_ust_msc(),
+            b.platform.present_get_ust_msc(crtc_key),
             (50, 1_000),
             "the general clock must advance on a TAGGED event too — Task 7's \
              due rule rests on this"
@@ -32741,10 +33081,11 @@ mod tests {
     #[test]
     fn arm_present_absolute_vblank_with_dedups_same_target_one_kernel_call() {
         let mut b = super::KmsBackend::for_tests();
+        let crtc_key = output_crtc_key(&b, 0);
         let mut calls = 0u32;
 
         let covered = b
-            .arm_present_absolute_vblank_with(&[500], |_, _| {
+            .arm_present_absolute_vblank_with(crtc_key, &[500], |_, _| {
                 calls += 1;
                 Ok(true)
             })
@@ -32759,7 +33100,7 @@ mod tests {
         // must execute immediately" (spec §msc-due) — a still-parked,
         // already-armed target must never read as that.
         let covered2 = b
-            .arm_present_absolute_vblank_with(&[500], |_, _| {
+            .arm_present_absolute_vblank_with(crtc_key, &[500], |_, _| {
                 calls += 1;
                 Ok(true)
             })
@@ -32770,7 +33111,7 @@ mod tests {
         // A distinct target on the same CRTC still arms (own per-target
         // set, unlike the relative arm's single in-flight slot).
         let covered3 = b
-            .arm_present_absolute_vblank_with(&[600], |_, _| {
+            .arm_present_absolute_vblank_with(crtc_key, &[600], |_, _| {
                 calls += 1;
                 Ok(true)
             })
@@ -32782,10 +33123,11 @@ mod tests {
     #[test]
     fn arm_present_absolute_vblank_false_result_is_not_tracked_as_covered() {
         let mut b = super::KmsBackend::for_tests();
+        let crtc_key = output_crtc_key(&b, 0);
         let mut calls = 0;
 
         let covered = b
-            .arm_present_absolute_vblank_with(&[500], |_, _| {
+            .arm_present_absolute_vblank_with(crtc_key, &[500], |_, _| {
                 calls += 1;
                 Ok(false)
             })
@@ -32796,10 +33138,8 @@ mod tests {
         assert!(b.absolute_vblank_targets.is_empty());
     }
 
-    /// Push a second live output onto the fixture, with its own distinct
-    /// `crtc_id`, so multi-output CRTC-selection logic (the absolute
-    /// arm's max-clock targeting) has more than one real CRTC to choose
-    /// between. Mirrors `PlatformBackend::for_tests()`'s single-output
+    /// Push a second live output onto the fixture, with its own selected raw
+    /// CRTC handle. Mirrors `PlatformBackend::for_tests()`'s single-output
     /// literal.
     fn push_test_output(b: &mut super::KmsBackend, crtc_id: u32) {
         use crate::kms::backend::ActiveOutput;
@@ -32856,6 +33196,448 @@ mod tests {
         ));
     }
 
+    fn install_direct_frame_for_target_test(
+        b: &mut super::KmsBackend,
+        target_xid: u32,
+        fallback_id: crate::kms::render::store::DrawableId,
+        current: bool,
+    ) -> (
+        crate::kms::render::store::DrawableId,
+        crate::kms::render::store::DrawableId,
+        u64,
+        u64,
+    ) {
+        use ash::vk;
+        use yserver_core::backend::{
+            CompletedPresentEvent, PresentClockSample, PresentClockSource, PresentScanoutCandidate,
+            PresentWake,
+        };
+
+        use crate::kms::render::store::{DrawableKind, Storage};
+
+        let source_xid = target_xid + 1;
+        let source_id = b
+            .store
+            .allocate(
+                source_xid,
+                DrawableKind::Pixmap,
+                24,
+                false,
+                Storage::for_tests_null(
+                    vk::Extent2D {
+                        width: 100,
+                        height: 100,
+                    },
+                    vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("direct source");
+        let source_pin = b.pin_direct_source(source_id);
+        let fallback_target_pin = b.pin_direct_source(fallback_id);
+        let completion_clock = current.then_some(PresentClockSample {
+            msc: 17,
+            ust: 1_700,
+            source: PresentClockSource::PageFlip,
+        });
+        let candidate = PresentScanoutCandidate {
+            client_id: 1,
+            present_id: 77,
+            crtc_id: 0,
+            crtc_epoch: 0,
+            src_pixmap_xid: source_xid,
+            dst_window_xid: target_xid,
+            src_host_xid: source_xid,
+            paint_dst_host_xid: target_xid,
+            completion_dst_host_xid: target_xid,
+            src_width: 100,
+            src_height: 100,
+            x_off: 0,
+            y_off: 0,
+            valid_region_xid: 0,
+            update_region_xid: 0,
+            update_is_full: true,
+            explicit_sync: false,
+            options: 0,
+        };
+        let frame = super::DirectPresentFrame {
+            source_pin,
+            fallback_target_pin,
+            source_id,
+            candidate,
+            fallback_target: super::PaintTarget {
+                id: fallback_id,
+                offset: (0, 0),
+                x11_depth: 24,
+            },
+            event: CompletedPresentEvent {
+                client_id: yserver_protocol::x11::ClientId(1),
+                serial: 9,
+                host_xid: source_xid,
+                dst_host_xid: target_xid,
+                options: 0,
+                present_id: 77,
+                window_generation: 5,
+                crtc_id: 0,
+                crtc_epoch: 0,
+                msc_offset: 0,
+                completion_clock,
+                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+                completion_mode: if current {
+                    yserver_protocol::x11::present::COMPLETE_MODE_FLIP
+                } else {
+                    yserver_protocol::x11::present::COMPLETE_MODE_COPY
+                },
+                emit_idle: !current,
+            },
+            completion_output_idx: 0,
+            completion_clock,
+            awaiting_outputs: if current {
+                std::collections::HashSet::new()
+            } else {
+                std::collections::HashSet::from([0])
+            },
+        };
+        if current {
+            b.scanout_m2.current = Some(frame);
+        } else {
+            b.scanout_m2.pending = Some(frame);
+        }
+        b.scanout_m2.hold_direct = true;
+        (source_id, fallback_id, source_pin, fallback_target_pin)
+    }
+
+    #[test]
+    fn destroy_subwindow_without_direct_frame_does_not_request_unflip() {
+        let mut b = super::KmsBackend::for_tests();
+        let target_xid = 0x5600;
+        let target_id = seed_window(&mut b, target_xid, None, 0, 0);
+
+        b.destroy_subwindow(None, target_xid)
+            .expect("destroy inactive target");
+
+        assert!(!b.scanout_m2.active());
+        assert!(!b.scanout_m2.unflip_requested);
+        assert!(!b.scanout_m2.hold_direct);
+        assert!(!b.windows.contains_key(&target_xid));
+        assert!(b.store.get(target_id).is_none());
+    }
+
+    #[test]
+    fn destroy_subwindow_requests_pending_direct_unflip_without_releasing_pins() {
+        let mut b = super::KmsBackend::for_tests();
+        let target_xid = 0x5700;
+        let target_id = seed_window(&mut b, target_xid, None, 0, 0);
+        b.get_overlay_window(None).expect("materialize COW");
+        let cow_id = b.cow_id.expect("COW id");
+        let (source_id, _, source_pin, cow_pin) =
+            install_direct_frame_for_target_test(&mut b, target_xid, cow_id, false);
+
+        b.destroy_subwindow(None, target_xid)
+            .expect("destroy pending direct target");
+
+        assert!(b.scanout_m2.unflip_requested);
+        assert!(!b.scanout_m2.hold_direct);
+        assert!(b.scanout_m2.pending.is_some());
+        assert!(b.scanout_m2.current.is_none());
+        assert!(b.scanout_m2.completed.is_empty());
+        assert!(b.scanout_m2.idled.is_empty());
+        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
+        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+        assert_eq!(b.store.get(source_id).map(|d| d.refcount), Some(2));
+        assert!(
+            b.store.get(target_id).is_none(),
+            "the destroyed destination leaf has no direct lifetime pin"
+        );
+        assert_eq!(
+            b.store.get(cow_id).map(|d| d.refcount),
+            Some(2),
+            "the separately pinned COW fallback survives until replacement"
+        );
+    }
+
+    #[test]
+    fn destroy_subwindow_retires_current_direct_idle_once_after_replacement() {
+        let mut b = super::KmsBackend::for_tests();
+        let target_xid = 0x5800;
+        let target_id = seed_window(&mut b, target_xid, None, 0, 0);
+        b.get_overlay_window(None).expect("materialize COW");
+        let cow_id = b.cow_id.expect("COW id");
+        let (source_id, _, source_pin, cow_pin) =
+            install_direct_frame_for_target_test(&mut b, target_xid, cow_id, true);
+
+        b.destroy_subwindow(None, target_xid)
+            .expect("destroy current direct target");
+
+        assert!(b.scanout_m2.unflip_requested);
+        assert!(!b.scanout_m2.hold_direct);
+        assert!(b.scanout_m2.current.is_some());
+        assert!(b.scanout_m2.idled.is_empty());
+        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
+        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+        assert_eq!(b.store.get(source_id).map(|d| d.refcount), Some(2));
+        assert!(b.store.get(target_id).is_none());
+        assert_eq!(b.store.get(cow_id).map(|d| d.refcount), Some(2));
+
+        b.stop_direct_after_scanout_replaced("destroy-subwindow test replacement");
+        b.stop_direct_after_scanout_replaced("destroy-subwindow duplicate replacement");
+
+        assert!(!b.present_source_pins.contains_key(&source_pin));
+        assert!(!b.present_source_pins.contains_key(&cow_pin));
+        assert_eq!(b.store.get(source_id).map(|d| d.refcount), Some(1));
+        assert_eq!(b.store.get(cow_id).map(|d| d.refcount), Some(1));
+        let retired = b.drain_retired_present_idle_events();
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].present_id, 77);
+        assert!(b.drain_retired_present_idle_events().is_empty());
+    }
+
+    #[test]
+    fn final_cow_release_defers_storage_until_direct_replacement() {
+        let mut b = super::KmsBackend::for_tests();
+        let target_xid = 0x5900;
+        let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
+        b.get_overlay_window(None).expect("materialize COW");
+        let cow_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+        let cow_id = b.cow_id.expect("COW id");
+        let (source_id, _, source_pin, cow_pin) =
+            install_direct_frame_for_target_test(&mut b, target_xid, cow_id, true);
+        // The production path may already have prepared the lazy COW shadow
+        // before the protocol release reaches us. Keep this unit test free of
+        // Vulkan while exercising the ownership/deferral transition itself.
+        b.scanout_m2.unflip_shadow_ready = true;
+
+        let final_release = b.release_overlay_window(None).expect("final COW release");
+
+        assert!(final_release);
+        assert_eq!(b.core.cow_refcount, 0);
+        assert!(b.deferred_cow_release);
+        assert_eq!(b.cow_id, Some(cow_id));
+        assert!(b.windows.contains_key(&cow_xid));
+        assert!(b.scanout_m2.current.is_some());
+        assert!(b.scanout_m2.unflip_requested);
+        assert!(!b.scanout_m2.hold_direct);
+        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
+        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+        assert_eq!(b.store.get(cow_id).map(|d| d.refcount), Some(2));
+
+        b.stop_direct_after_scanout_replaced("final COW release test replacement");
+
+        assert!(!b.deferred_cow_release);
+        assert!(b.cow_id.is_none());
+        assert!(!b.windows.contains_key(&cow_xid));
+        assert!(b.store.get(cow_id).is_none());
+        assert!(!b.present_source_pins.contains_key(&source_pin));
+        assert!(!b.present_source_pins.contains_key(&cow_pin));
+        assert_eq!(b.store.get(source_id).map(|d| d.refcount), Some(1));
+        assert_eq!(b.drain_retired_present_idle_events().len(), 1);
+        assert!(b.drain_retired_present_idle_events().is_empty());
+    }
+
+    #[test]
+    fn final_cow_release_materialization_failure_keeps_cow_and_pins() {
+        let mut b = super::KmsBackend::for_tests();
+        let target_xid = 0x5a00;
+        let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
+        b.get_overlay_window(None).expect("materialize COW");
+        let cow_id = b.cow_id.expect("COW id");
+        let wrong_fallback = seed_window(&mut b, 0x5a10, None, 0, 0);
+        let (source_id, _, source_pin, fallback_pin) =
+            install_direct_frame_for_target_test(&mut b, target_xid, wrong_fallback, true);
+
+        let error = b
+            .release_overlay_window(None)
+            .expect_err("non-COW fallback cannot be materialized as the direct shadow");
+
+        assert!(error.to_string().contains("not COW"));
+        assert_eq!(b.core.cow_refcount, 1);
+        assert!(!b.deferred_cow_release);
+        assert_eq!(b.cow_id, Some(cow_id));
+        assert!(b.store.get(cow_id).is_some());
+        assert!(b.scanout_m2.current.is_some());
+        assert!(!b.scanout_m2.unflip_requested);
+        assert!(b.scanout_m2.hold_direct);
+        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
+        assert_eq!(
+            b.present_source_pins.get(&fallback_pin),
+            Some(&wrong_fallback)
+        );
+    }
+
+    #[test]
+    fn get_cow_during_deferred_release_reuses_backend_identity() {
+        let mut b = super::KmsBackend::for_tests();
+        let target_xid = 0x5b00;
+        let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
+        b.get_overlay_window(None).expect("materialize COW");
+        let cow_id = b.cow_id.expect("COW id");
+        let _ = install_direct_frame_for_target_test(&mut b, target_xid, cow_id, true);
+        b.scanout_m2.unflip_shadow_ready = true;
+        assert!(b.release_overlay_window(None).expect("final release"));
+
+        let rematerialized = b.get_overlay_window(None).expect("reclaim deferred COW");
+
+        assert!(rematerialized, "core must rebuild its logical COW resource");
+        assert_eq!(b.core.cow_refcount, 1);
+        assert!(!b.deferred_cow_release);
+        assert_eq!(b.cow_id, Some(cow_id));
+        b.stop_direct_after_scanout_replaced("reclaimed COW test replacement");
+        assert_eq!(b.cow_id, Some(cow_id));
+        assert_eq!(b.store.get(cow_id).map(|d| d.refcount), Some(1));
+    }
+
+    #[test]
+    fn unmap_subwindow_requests_direct_unflip_without_releasing_pins() {
+        let mut b = super::KmsBackend::for_tests();
+        let target_xid = 0x5c00;
+        let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
+        b.get_overlay_window(None).expect("materialize COW");
+        let cow_id = b.cow_id.expect("COW id");
+        let (source_id, _, source_pin, cow_pin) =
+            install_direct_frame_for_target_test(&mut b, target_xid, cow_id, true);
+
+        b.unmap_subwindow(None, target_xid)
+            .expect("unmap direct destination");
+
+        assert!(!b.windows[&target_xid].mapped);
+        assert!(b.scanout_m2.unflip_requested);
+        assert!(!b.scanout_m2.hold_direct);
+        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
+        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+    }
+
+    #[test]
+    fn map_subwindow_requests_direct_unflip_without_releasing_pins() {
+        let mut b = super::KmsBackend::for_tests();
+        let target_xid = 0x5c80;
+        let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
+        b.windows
+            .get_mut(&target_xid)
+            .expect("target geometry")
+            .mapped = false;
+        b.get_overlay_window(None).expect("materialize COW");
+        let cow_id = b.cow_id.expect("COW id");
+        let (source_id, _, source_pin, cow_pin) =
+            install_direct_frame_for_target_test(&mut b, target_xid, cow_id, true);
+
+        b.map_subwindow(None, target_xid)
+            .expect("map direct destination");
+
+        assert!(b.windows[&target_xid].mapped);
+        assert!(b.scanout_m2.unflip_requested);
+        assert!(!b.scanout_m2.hold_direct);
+        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
+        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+    }
+
+    #[test]
+    fn configure_subwindow_requests_direct_unflip_without_releasing_pins() {
+        use yserver_core::host_x11::HostSubwindowConfig;
+
+        let mut b = super::KmsBackend::for_tests();
+        let target_xid = 0x5d00;
+        let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
+        b.get_overlay_window(None).expect("materialize COW");
+        let cow_id = b.cow_id.expect("COW id");
+        let (source_id, _, source_pin, cow_pin) =
+            install_direct_frame_for_target_test(&mut b, target_xid, cow_id, true);
+
+        b.configure_subwindow(
+            None,
+            target_xid,
+            HostSubwindowConfig {
+                x: Some(12),
+                y: None,
+                width: None,
+                height: None,
+                border_width: None,
+                sibling: None,
+                stack_mode: None,
+            },
+        )
+        .expect("configure direct destination");
+
+        assert_eq!(b.windows[&target_xid].x, 12);
+        assert!(b.scanout_m2.unflip_requested);
+        assert!(!b.scanout_m2.hold_direct);
+        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
+        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&cow_id));
+    }
+
+    #[test]
+    fn logical_resize_keeps_old_cow_pinned_until_direct_replacement() {
+        let mut b = super::KmsBackend::for_tests();
+        let target_xid = 0x5e00;
+        let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
+        b.get_overlay_window(None).expect("materialize COW");
+        let old_cow_id = b.cow_id.expect("old COW id");
+        let (source_id, _, source_pin, cow_pin) =
+            install_direct_frame_for_target_test(&mut b, target_xid, old_cow_id, true);
+        b.scanout_m2.unflip_shadow_ready = true;
+        let new_w = b.platform.fb_w.saturating_add(1);
+        let new_h = b.platform.fb_h.saturating_add(1);
+
+        b.set_logical_screen_size(new_w, new_h)
+            .expect("resize after direct shadow materialization");
+
+        let new_cow_id = b.cow_id.expect("replacement COW id");
+        assert_ne!(new_cow_id, old_cow_id);
+        assert!(b.scanout_m2.unflip_requested);
+        assert!(!b.scanout_m2.hold_direct);
+        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
+        assert_eq!(b.present_source_pins.get(&cow_pin), Some(&old_cow_id));
+        assert_eq!(
+            b.store.get(old_cow_id).map(|d| d.refcount),
+            Some(1),
+            "the old COW survives only through the direct fallback pin"
+        );
+        assert_eq!(
+            b.store
+                .lookup(yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0),
+            Some(new_cow_id)
+        );
+
+        b.stop_direct_after_scanout_replaced("logical resize test replacement");
+        assert!(b.store.get(old_cow_id).is_none());
+        assert_eq!(b.cow_id, Some(new_cow_id));
+        assert!(b.store.get(new_cow_id).is_some());
+    }
+
+    #[test]
+    fn logical_resize_materialization_failure_preserves_old_dimensions_and_cow() {
+        let mut b = super::KmsBackend::for_tests();
+        let target_xid = 0x5f00;
+        let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
+        b.get_overlay_window(None).expect("materialize COW");
+        let old_cow_id = b.cow_id.expect("old COW id");
+        let wrong_fallback = seed_window(&mut b, 0x5f10, None, 0, 0);
+        let (source_id, _, source_pin, fallback_pin) =
+            install_direct_frame_for_target_test(&mut b, target_xid, wrong_fallback, true);
+        let old_size = (b.platform.fb_w, b.platform.fb_h);
+        let old_root_id = b.store.lookup(b.core.window_id);
+
+        let error = b
+            .set_logical_screen_size(old_size.0.saturating_add(1), old_size.1.saturating_add(1))
+            .expect_err("invalid direct fallback must abort before resize mutation");
+
+        assert!(error.to_string().contains("not COW"));
+        assert_eq!((b.platform.fb_w, b.platform.fb_h), old_size);
+        assert_eq!(b.store.lookup(b.core.window_id), old_root_id);
+        assert_eq!(b.cow_id, Some(old_cow_id));
+        assert_eq!(
+            b.store
+                .lookup(yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0),
+            Some(old_cow_id)
+        );
+        assert!(b.store.get(old_cow_id).is_some());
+        assert!(!b.scanout_m2.unflip_requested);
+        assert!(b.scanout_m2.hold_direct);
+        assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
+        assert_eq!(
+            b.present_source_pins.get(&fallback_pin),
+            Some(&wrong_fallback)
+        );
+    }
+
     #[test]
     fn direct_scanout_topology_requires_one_drm_device() {
         let mut b = super::KmsBackend::for_tests();
@@ -32870,6 +33652,113 @@ mod tests {
             !b.direct_scanout_topology_eligible(),
             "one atomic direct transaction cannot span DRM devices"
         );
+    }
+
+    #[test]
+    fn grouped_direct_waits_all_outputs_and_uses_selected_reference_sample() {
+        use yserver_core::backend::{
+            CompletedPresentEvent, PresentClockSample, PresentClockSource, PresentScanoutCandidate,
+            PresentWake,
+        };
+
+        let mut b = super::KmsBackend::for_tests();
+        push_test_output(&mut b, 2);
+        b.scanout_m2.cursor_bound_all = true;
+
+        let crtc_id = 0x5400;
+        bind_test_randr_crtc(&mut b, 0, crtc_id);
+        let crtc_epoch = b.present_crtc_clock_epoch(crtc_id);
+        let source_id = crate::kms::render::store::DrawableId::for_tests(90);
+        let fallback_id = crate::kms::render::store::DrawableId::for_tests(91);
+        let candidate = PresentScanoutCandidate {
+            client_id: 1,
+            present_id: 44,
+            crtc_id,
+            crtc_epoch,
+            src_pixmap_xid: 0x100,
+            dst_window_xid: 0x200,
+            src_host_xid: 0x300,
+            paint_dst_host_xid: 0x400,
+            completion_dst_host_xid: 0x400,
+            src_width: 800,
+            src_height: 600,
+            x_off: 0,
+            y_off: 0,
+            valid_region_xid: 0,
+            update_region_xid: 0,
+            update_is_full: true,
+            explicit_sync: false,
+            options: 0,
+        };
+        let event = CompletedPresentEvent {
+            client_id: yserver_protocol::x11::ClientId(1),
+            serial: 7,
+            host_xid: 0x300,
+            dst_host_xid: 0x400,
+            options: 0,
+            present_id: 44,
+            window_generation: 0,
+            crtc_id,
+            crtc_epoch,
+            msc_offset: 3,
+            completion_clock: None,
+            wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+            emit_idle: true,
+        };
+        b.scanout_m2.pending = Some(super::DirectPresentFrame {
+            source_pin: 1,
+            fallback_target_pin: 2,
+            source_id,
+            candidate,
+            fallback_target: super::PaintTarget {
+                id: fallback_id,
+                offset: (0, 0),
+                x11_depth: 24,
+            },
+            event,
+            completion_output_idx: 0,
+            completion_clock: None,
+            awaiting_outputs: std::collections::HashSet::from([0, 1]),
+        });
+
+        let reference = PresentClockSample {
+            msc: 123,
+            ust: 4_567,
+            source: PresentClockSource::PageFlip,
+        };
+        let other = PresentClockSample {
+            msc: 999,
+            ust: 9_999,
+            source: PresentClockSource::PageFlip,
+        };
+        assert!(b.retire_direct_output(0, reference));
+        assert!(b.scanout_m2.completed.is_empty());
+        assert!(b.scanout_m2.current.is_none());
+        assert_eq!(
+            b.scanout_m2
+                .pending
+                .as_ref()
+                .and_then(|frame| frame.completion_clock),
+            Some(reference),
+            "the selected CRTC sample is cached without completing early"
+        );
+
+        assert!(b.retire_direct_output(1, other));
+        assert_eq!(b.scanout_m2.completed.len(), 1);
+        assert_eq!(
+            b.scanout_m2.completed[0].completion_clock,
+            Some(reference),
+            "the last retiring output must not replace the selected CRTC timestamp"
+        );
+        assert!(b.scanout_m2.pending.is_none());
+        assert!(b.scanout_m2.current.is_some());
+        assert!(b.scanout_m2.idled.is_empty());
+        assert!(
+            !b.retire_direct_output(1, other),
+            "a duplicate retirement cannot emit a second completion"
+        );
+        assert_eq!(b.scanout_m2.completed.len(), 1);
     }
 
     #[test]
@@ -32937,7 +33826,7 @@ mod tests {
     }
 
     #[test]
-    fn arm_present_absolute_vblank_with_arms_only_max_clock_crtc() {
+    fn arm_present_absolute_vblank_with_arms_only_selected_crtc() {
         let mut b = super::KmsBackend::for_tests();
         let crtc0 = output_crtc_key(&b, 0);
         push_test_output(&mut b, 2);
@@ -32948,10 +33837,11 @@ mod tests {
         b.platform.ust_msc.insert(crtc1, (50, 50_000));
 
         let mut armed_on: Vec<CrtcKey> = Vec::new();
+        let target = u64::from(u32::MAX) + 999;
         let covered = b
-            .arm_present_absolute_vblank_with(&[999], |crtc_key, target| {
+            .arm_present_absolute_vblank_with(crtc0, &[target], |crtc_key, armed_target| {
                 armed_on.push(crtc_key);
-                assert_eq!(target, 999);
+                assert_eq!(armed_target, target, "MSC must stay full-width u64");
                 Ok(true)
             })
             .unwrap();
@@ -32959,26 +33849,24 @@ mod tests {
         assert_eq!(covered, 1);
         assert_eq!(
             armed_on,
-            vec![crtc1],
-            "must arm only the CRTC backing the max clock, not every output \
-             — a lagging CRTC on a mixed-refresh dual-head could leave the \
-             target pending for hours"
+            vec![crtc0],
+            "must arm the selected CRTC even when another domain has a larger counter"
         );
         assert!(
-            !b.absolute_vblank_targets.contains_key(&crtc0),
-            "the non-max-clock CRTC must not gain an armed entry"
+            !b.absolute_vblank_targets.contains_key(&crtc1),
+            "the unrelated CRTC must not gain an armed entry"
         );
     }
 
     #[test]
-    fn arm_present_absolute_vblank_with_uses_first_live_crtc_before_first_sample() {
+    fn arm_present_absolute_vblank_with_uses_selected_crtc_before_first_sample() {
         let mut b = super::KmsBackend::for_tests();
         let first = output_crtc_key(&b, 0);
         assert!(b.platform.ust_msc.is_empty());
 
         let mut armed_on = Vec::new();
         let covered = b
-            .arm_present_absolute_vblank_with(&[17], |crtc_key, target| {
+            .arm_present_absolute_vblank_with(first, &[17], |crtc_key, target| {
                 armed_on.push(crtc_key);
                 assert_eq!(target, 17);
                 Ok(true)
@@ -32994,27 +33882,35 @@ mod tests {
     #[test]
     fn present_flip_in_flight_mirrors_scene_state() {
         let mut b = super::KmsBackend::for_tests();
+        let crtc_id = 0x5000;
+        bind_test_randr_crtc(&mut b, 0, crtc_id);
         assert!(
-            !b.present_flip_in_flight(),
+            !b.present_flip_in_flight(crtc_id),
             "no flip queued at fixture init"
         );
 
         b.scene.test_set_flip_in_flight(true);
         assert_eq!(
-            b.present_flip_in_flight(),
+            b.present_flip_in_flight(crtc_id),
             b.scene.has_pending_page_flips(),
             "must mirror scene.has_pending_page_flips(), not a copy of it"
         );
-        assert!(b.present_flip_in_flight());
+        assert!(b.present_flip_in_flight(crtc_id));
+        assert!(
+            !b.present_flip_in_flight(0x5fff),
+            "an unknown/off CRTC never borrows another output's flip state"
+        );
     }
 
     #[test]
     fn present_display_idle_false_when_scene_wants_compose_even_with_no_flips() {
         let mut b = super::KmsBackend::for_tests();
-        assert!(!b.present_flip_in_flight(), "no flip in flight");
+        let crtc_id = 0x5000;
+        bind_test_randr_crtc(&mut b, 0, crtc_id);
+        assert!(!b.present_flip_in_flight(crtc_id), "no flip in flight");
         b.scene.scene_structure_dirty = true;
         assert!(
-            !b.present_display_idle(),
+            !b.present_display_idle(crtc_id),
             "pending compose damage must gate the idle-display fallback \
              even though no flip is in flight (spec round-4 F1)"
         );
@@ -33070,11 +33966,12 @@ mod tests {
         assert_eq!(b.dri3_capabilities(), Dri3Caps::unsupported());
         assert!(b.dri3_open(0).is_err());
         assert_eq!(
-            b.arm_idle_vblanks_ioctl(&[1]).expect("relative arm no-op"),
+            b.arm_idle_vblanks_ioctl(0, &[1])
+                .expect("relative arm no-op"),
             0
         );
         assert_eq!(
-            b.arm_present_absolute_vblank(&[1])
+            b.arm_present_absolute_vblank(0, &[1])
                 .expect("absolute arm no-op"),
             0
         );
@@ -33233,9 +34130,13 @@ mod tests {
         use yserver_core::backend::PresentScanoutCandidate;
 
         let mut b = super::KmsBackend::for_tests();
+        let crtc_id = 0x5500;
+        bind_test_randr_crtc(&mut b, 0, crtc_id);
         let candidate = PresentScanoutCandidate {
             client_id: 1,
             present_id: 1,
+            crtc_id,
+            crtc_epoch: b.present_crtc_clock_epoch(crtc_id),
             src_pixmap_xid: 0x100,
             dst_window_xid: 0x200,
             src_host_xid: 0x300,
@@ -33378,6 +34279,8 @@ mod tests {
         let candidate = PresentScanoutCandidate {
             client_id: 1,
             present_id: 1,
+            crtc_id: 0,
+            crtc_epoch: 0,
             src_pixmap_xid: 0x100,
             dst_window_xid: 0x200,
             src_host_xid: 0x5AC,
