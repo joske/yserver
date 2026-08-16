@@ -25,15 +25,116 @@
 //! haven't retired the transition yet (the multi-output double-cursor
 //! hazard).
 
-use std::{collections::HashMap, io, mem, ptr::NonNull, rc::Rc};
+use std::{
+    collections::{HashMap, HashSet},
+    io, mem,
+    ptr::NonNull,
+    rc::Rc,
+};
 
 use drm::{
     Device as DrmDevice, DriverCapability,
     buffer::{Buffer, DrmFourcc},
-    control::{Device as ControlDevice, crtc, dumbbuffer::DumbBuffer},
+    control::{Device as ControlDevice, PlaneType, crtc, dumbbuffer::DumbBuffer},
 };
 
 use crate::drm::Device;
+
+/// A failed cursor bind/reposition operation, including whether the cursor is
+/// still bound after best-effort rollback. Callers must not switch an output
+/// to software composition while `remains_visible()` is true: doing so would
+/// display both the old hardware cursor and the new software sprite.
+#[derive(Debug)]
+pub enum CursorShowError {
+    Unbound(io::Error),
+    StillVisible {
+        operation_error: io::Error,
+        rollback_error: Option<io::Error>,
+    },
+}
+
+impl CursorShowError {
+    #[must_use]
+    pub fn remains_visible(&self) -> bool {
+        matches!(self, Self::StillVisible { .. })
+    }
+
+    #[must_use]
+    pub fn operation_error(&self) -> &io::Error {
+        match self {
+            Self::Unbound(error) => error,
+            Self::StillVisible {
+                operation_error, ..
+            } => operation_error,
+        }
+    }
+
+    #[must_use]
+    pub fn rollback_error(&self) -> Option<&io::Error> {
+        match self {
+            Self::Unbound(_) => None,
+            Self::StillVisible { rollback_error, .. } => rollback_error.as_ref(),
+        }
+    }
+
+    /// A failed `set_cursor2` on an already-visible CRTC leaves the prior
+    /// buffer/hotspot binding intact. A position-only retry cannot repair it;
+    /// the caller must retry the full show operation.
+    #[must_use]
+    pub fn needs_full_rebind(&self) -> bool {
+        matches!(
+            self,
+            Self::StillVisible {
+                rollback_error: None,
+                ..
+            }
+        )
+    }
+}
+
+impl std::fmt::Display for CursorShowError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unbound(error) => write!(f, "cursor remains unbound: {error}"),
+            Self::StillVisible {
+                operation_error,
+                rollback_error,
+            } => match rollback_error {
+                Some(rollback_error) => write!(
+                    f,
+                    "cursor operation failed ({operation_error}) and hide rollback failed ({rollback_error}); prior binding remains visible"
+                ),
+                None => write!(
+                    f,
+                    "cursor rebind failed ({operation_error}); prior binding remains visible"
+                ),
+            },
+        }
+    }
+}
+
+impl std::error::Error for CursorShowError {}
+
+fn bind_failure(prior_visible: bool, error: io::Error) -> CursorShowError {
+    if prior_visible {
+        CursorShowError::StillVisible {
+            operation_error: error,
+            rollback_error: None,
+        }
+    } else {
+        CursorShowError::Unbound(error)
+    }
+}
+
+fn move_failure(move_error: io::Error, rollback: io::Result<()>) -> CursorShowError {
+    match rollback {
+        Ok(()) => CursorShowError::Unbound(move_error),
+        Err(rollback_error) => CursorShowError::StillVisible {
+            operation_error: move_error,
+            rollback_error: Some(rollback_error),
+        },
+    }
+}
 
 /// Fallback cursor size when `DRM_CAP_CURSOR_WIDTH/HEIGHT` query fails
 /// (very old drivers, broken devices). Every Intel / AMD / mainstream-
@@ -77,17 +178,107 @@ pub struct CursorPlane {
     /// init / VT-leave / full modeset (forces the next show to
     /// re-upload).
     uploaded_version: Option<u64>,
+    /// Compatibility masks for explicitly exposed universal cursor planes.
+    /// `None` means the driver exposed no cursor planes, so the legacy cursor
+    /// ioctls remain an optimistic runtime probe. When present, every active
+    /// CRTC needs a distinct compatible plane: a single universal plane cannot
+    /// simultaneously display a cursor on two CRTCs.
+    explicit_plane_crtcs: Option<Vec<HashSet<crtc::Handle>>>,
+}
+
+/// Whether distinct cursor planes can be assigned to every required CRTC.
+/// Union coverage is insufficient because one plane object can only be active
+/// on one CRTC at a time even if its `possible_crtcs` mask names several.
+fn cursor_planes_cover_crtcs(
+    required_crtcs: &[crtc::Handle],
+    plane_crtcs: &[HashSet<crtc::Handle>],
+) -> bool {
+    let mut required = required_crtcs.to_vec();
+    required.sort_by_key(|handle| u32::from(*handle));
+    required.dedup();
+    required.sort_by_key(|handle| {
+        plane_crtcs
+            .iter()
+            .filter(|possible| possible.contains(handle))
+            .count()
+    });
+
+    fn assign(
+        required: &[crtc::Handle],
+        plane_crtcs: &[HashSet<crtc::Handle>],
+        used: &mut [bool],
+        index: usize,
+    ) -> bool {
+        if index == required.len() {
+            return true;
+        }
+        for (plane_index, possible) in plane_crtcs.iter().enumerate() {
+            if used[plane_index] || !possible.contains(&required[index]) {
+                continue;
+            }
+            used[plane_index] = true;
+            if assign(required, plane_crtcs, used, index + 1) {
+                return true;
+            }
+            used[plane_index] = false;
+        }
+        false
+    }
+
+    assign(
+        &required,
+        plane_crtcs,
+        &mut vec![false; plane_crtcs.len()],
+        0,
+    )
+}
+
+fn discover_cursor_plane_crtcs(device: &Device) -> io::Result<Vec<HashSet<crtc::Handle>>> {
+    let resources = device.resource_handles()?;
+    let mut cursor_planes = Vec::new();
+    for handle in device.plane_handles()? {
+        let info = device.get_plane(handle)?;
+        let props = device.get_properties(handle)?;
+        let map = props.as_hashmap(device)?;
+        let Some(type_info) = map.get("type") else {
+            continue;
+        };
+        let raw = props
+            .iter()
+            .find(|(property, _)| **property == type_info.handle())
+            .map(|(_, value)| *value)
+            .unwrap_or(0);
+        if raw != PlaneType::Cursor as u64 {
+            continue;
+        }
+        cursor_planes.push(
+            resources
+                .filter_crtcs(info.possible_crtcs())
+                .into_iter()
+                .collect(),
+        );
+    }
+    Ok(cursor_planes)
 }
 
 impl CursorPlane {
-    /// Allocate the cursor dumb buffer + mmap it. Discovers cursor
-    /// planes for `crtcs` and creates a DRM framebuffer for the atomic
-    /// path. Falls back to legacy ioctls on any per-CRTC discovery
-    /// failure.
+    /// Allocate the cursor dumb buffer + mmap it and remember any universal
+    /// cursor-plane compatibility masks exposed by the device. Drivers that
+    /// expose no cursor planes retain the optimistic legacy-ioctl probe.
     ///
     /// # Errors
-    /// `create_dumb_buffer` or `map_dumb_buffer` ioctl failures.
+    /// Cursor-plane topology discovery, `create_dumb_buffer`, or
+    /// `map_dumb_buffer` ioctl failures.
     pub fn new(device: Rc<Device>, crtcs: &[crtc::Handle]) -> io::Result<Self> {
+        let cursor_planes = discover_cursor_plane_crtcs(&device)?;
+        let explicit_plane_crtcs = if cursor_planes.is_empty() {
+            log::debug!(
+                "cursor: no universal cursor planes exposed; assuming legacy cursor ioctl support"
+            );
+            None
+        } else {
+            Some(cursor_planes)
+        };
         // Query the driver's preferred cursor dimensions. amdgpu commonly
         // reports 128×128 or 256×256; i915 typically 64×64. We MUST use
         // the reported size — see [`HW_CURSOR_FALLBACK_W`] for the
@@ -116,12 +307,7 @@ impl CursorPlane {
         // Zero-fill the plane buffer up front.
         unsafe { std::ptr::write_bytes(ptr.as_ptr(), 0, len) };
 
-        // crtcs parameter retained for API stability and future expansion;
-        // legacy `set_cursor2`/`move_cursor` route by CRTC handle directly,
-        // no per-CRTC plane discovery needed.
-        let _ = crtcs;
-
-        Ok(Self {
+        let plane = Self {
             device,
             dumb: Some(dumb),
             ptr,
@@ -131,7 +317,25 @@ impl CursorPlane {
             height,
             visible: HashMap::new(),
             uploaded_version: None,
-        })
+            explicit_plane_crtcs,
+        };
+        if !plane.supports_crtcs(crtcs) {
+            log::warn!(
+                "cursor: explicitly exposed planes cannot simultaneously cover all {} active CRTCs",
+                crtcs.len()
+            );
+        }
+        Ok(plane)
+    }
+
+    /// Whether this device's explicitly exposed cursor planes can cover all
+    /// requested CRTCs simultaneously. Drivers exposing no universal cursor
+    /// planes return true and are probed through legacy ioctls at bind time.
+    #[must_use]
+    pub fn supports_crtcs(&self, crtcs: &[crtc::Handle]) -> bool {
+        self.explicit_plane_crtcs
+            .as_ref()
+            .is_none_or(|planes| cursor_planes_cover_crtcs(crtcs, planes))
     }
 
     /// Copy a cursor image into the plane buffer. `bgra_bytes` is a
@@ -238,7 +442,7 @@ impl CursorPlane {
         hotspot: (i32, i32),
         img_x: i32,
         img_y: i32,
-    ) -> io::Result<()> {
+    ) -> Result<(), CursorShowError> {
         log::debug!(
             "cursor_plane::show CRTC={crtc:?} hotspot=({},{}) pos=({img_x},{img_y}) \
              prior_visible={}",
@@ -256,14 +460,21 @@ impl CursorPlane {
         hotspot: (i32, i32),
         img_x: i32,
         img_y: i32,
-    ) -> io::Result<()> {
+    ) -> Result<(), CursorShowError> {
         let Some(dumb) = self.dumb.as_ref() else {
-            return Err(io::Error::other("cursor plane already destroyed"));
+            return Err(CursorShowError::Unbound(io::Error::other(
+                "cursor plane already destroyed",
+            )));
         };
-        self.device.set_cursor2(crtc, Some(dumb), hotspot)?;
+        let prior_visible = self.is_visible_on(crtc);
+        self.device
+            .set_cursor2(crtc, Some(dumb), hotspot)
+            .map_err(|error| bind_failure(prior_visible, error))?;
         self.visible.insert(crtc, true);
-        self.device.move_cursor(crtc, (img_x, img_y))?;
-        Ok(())
+        match self.device.move_cursor(crtc, (img_x, img_y)) {
+            Ok(()) => Ok(()),
+            Err(move_error) => Err(move_failure(move_error, self.hide_legacy(crtc))),
+        }
     }
 
     /// Detach the cursor from `crtc`. The plane buffer is retained so
@@ -323,6 +534,13 @@ impl CursorPlane {
     /// against.
     pub fn known_crtcs(&self) -> impl Iterator<Item = crtc::Handle> + '_ {
         self.visible.keys().copied()
+    }
+
+    /// Forget visibility records for routes no longer active on this device.
+    /// Raw CRTC handles may be reused after a topology change; carrying an old
+    /// `true` into the new route would skip the required show transition.
+    pub fn retain_crtcs(&mut self, active: &HashSet<crtc::Handle>) {
+        self.visible.retain(|crtc, _| active.contains(crtc));
     }
 
     /// Cursor plane width in pixels (driver-reported).
@@ -392,6 +610,66 @@ impl Drop for CursorPlane {
 mod tests {
     use super::*;
 
+    fn test_crtc(raw: u32) -> crtc::Handle {
+        ::drm::control::from_u32(raw).unwrap()
+    }
+
+    #[test]
+    fn cursor_plane_coverage_requires_every_crtc() {
+        let a = test_crtc(11);
+        let b = test_crtc(12);
+        let planes = vec![HashSet::from([a])];
+
+        assert!(cursor_planes_cover_crtcs(&[a], &planes));
+        assert!(!cursor_planes_cover_crtcs(&[a, b], &planes));
+    }
+
+    #[test]
+    fn cursor_plane_coverage_requires_distinct_simultaneous_planes() {
+        let a = test_crtc(11);
+        let b = test_crtc(12);
+        let shared_only = vec![HashSet::from([a, b])];
+        let independently_drivable = vec![HashSet::from([a, b]), HashSet::from([a, b])];
+
+        assert!(!cursor_planes_cover_crtcs(&[a, b], &shared_only));
+        assert!(cursor_planes_cover_crtcs(&[a, b], &independently_drivable));
+    }
+
+    #[test]
+    fn cursor_plane_coverage_finds_non_greedy_matching() {
+        let a = test_crtc(11);
+        let b = test_crtc(12);
+        let planes = vec![HashSet::from([a, b]), HashSet::from([a])];
+
+        assert!(cursor_planes_cover_crtcs(&[a, b], &planes));
+    }
+
+    #[test]
+    fn failed_rebind_preserves_prior_visibility() {
+        let error = bind_failure(true, io::Error::from_raw_os_error(libc::EINVAL));
+        assert!(error.remains_visible());
+        assert!(error.rollback_error().is_none());
+
+        let error = bind_failure(false, io::Error::from_raw_os_error(libc::EINVAL));
+        assert!(!error.remains_visible());
+    }
+
+    #[test]
+    fn failed_move_reports_hide_rollback_result() {
+        let error = move_failure(io::Error::from_raw_os_error(libc::EINVAL), Ok(()));
+        assert!(!error.remains_visible());
+
+        let error = move_failure(
+            io::Error::from_raw_os_error(libc::EINVAL),
+            Err(io::Error::from_raw_os_error(libc::ENODEV)),
+        );
+        assert!(error.remains_visible());
+        assert_eq!(
+            error.rollback_error().and_then(io::Error::raw_os_error),
+            Some(libc::ENODEV)
+        );
+    }
+
     /// Phase B regression: `is_visible_on` tracks per-CRTC binding
     /// independently.
     #[test]
@@ -426,14 +704,13 @@ mod tests {
         let mut p = PlatformBackend::for_tests();
         assert!(!p.cursor_plane_available());
         assert!(
-            p.cursor_plane_upload_image(1, 16, 16, &[0u8; 16 * 16 * 4])
+            p.cursor_plane_upload_image_for_output(0, 1, 16, 16, &[0u8; 16 * 16 * 4])
                 .is_err()
         );
         assert!(p.cursor_plane_show_on_crtc(0, 0, 0, 0, 0).is_err());
-        assert!(p.cursor_plane_rebind_visible_crtcs(0, 0, 0, 0).is_err());
         assert!(p.cursor_plane_move(0, 0, 0, 0).is_err());
         assert!(p.cursor_plane_hide_on_crtc(0).is_err());
         assert!(p.cursor_plane_hide_all().is_err());
-        assert!(p.cursor_plane_uploaded_version().is_none());
+        assert!(p.cursor_plane_uploaded_version_for_output(0).is_none());
     }
 }

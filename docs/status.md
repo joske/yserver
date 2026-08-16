@@ -33,6 +33,32 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-08-17 PRIME per-card hardware cursor manager:** every opened DRM
+  device with an active startup CRTC now owns an independent cursor plane,
+  pending EBUSY position, topology-coverage state, and fallback policy.
+  Output operations resolve the stable device key before using a raw CRTC
+  handle; sprite upload/show is committed per output/device, while pointer
+  motion fans out across all currently visible hardware planes. Universal
+  cursor-plane masks require a distinct-plane matching for every simultaneous
+  CRTC; drivers exposing no universal planes retain the optimistic legacy
+  ioctl probe. `ENXIO`/`ENODEV`/`EOPNOTSUPP` latch only their card. `EINVAL`
+  forces an output-local, non-sticky SW interval with own-output exponential
+  retirement backoff and clears on topology/resume or cursor geometry/hotspot
+  change; EBUSY is latest-wins and drains only on the retiring card. Show and
+  hide transitions record actual kernel ownership: failed move rolls the bind
+  back before SW is allowed, while a failed show/rollback retains HW mode and
+  schedules a version-qualified full-show retry. Hw→Sw is two-phase: the
+  retiring hide frame is cursorless, failed hide retains the sole HW sprite and
+  retries hide, and successful hide permits SW only on the following frame (a
+  one-frame cursor gap). Old retirements cannot clear a newer sprite request.
+  NVIDIA policy and cursor-size fit are evaluated per owning
+  card, allowing persistent mixed HW/SW layouts; mixed motion still moves every
+  live HW plane and wakes composition for SW outputs. Any fallback/rebind while
+  grouped direct scanout is active requests an unflip. A transient plane-init
+  failure on an active startup card retries only at explicit topology/resume
+  boundaries; a device that starts without an active CRTC deliberately remains
+  uninitialized, and first-output lazy creation stays in the separate
+  `ed8fcad4` successor.
 - **2026-08-17 Present requests now own one RANDR CRTC clock domain:** every
   Pixmap, PixmapSynced, NotifyMSC, completion gate, and backend scanout
   candidate carries a RANDR CRTC XID plus a physical-route epoch. Explicit
@@ -85,9 +111,9 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   limited to active outputs on the primary DRM device with identical effective
   refresh timings; mixed-device, heterogeneous-refresh, and secondary-only
   layouts retain ordinary per-output composition and independent flips.
-  Best-effort hardware-cursor ownership per card is a subsequent adaptation,
-  not part of this slice; it must restore device-local plane/CRTC coverage and
-  retain non-sticky `EINVAL` handling.
+  Best-effort hardware-cursor ownership per card is now provided by the
+  incremental adaptation above, including device-local plane/CRTC coverage
+  and non-sticky `EINVAL` handling.
   Decision record:
   [`2026-08-17-prime-bb4-semantic-replay.md`](superpowers/notes/2026-08-17-prime-bb4-semantic-replay.md).
 - **2026-08-16 portable DRM node-discovery boundary:** stable `st_rdev`

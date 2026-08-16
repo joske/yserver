@@ -269,6 +269,8 @@ struct ScanoutM2State {
     eligible_root_streak: u8,
     unflip_fallback_source: Option<DrawableId>,
     unflip_shadow_ready: bool,
+    #[cfg(test)]
+    test_force_active: bool,
 }
 
 impl ScanoutM2State {
@@ -286,11 +288,22 @@ impl ScanoutM2State {
             eligible_root_streak: 0,
             unflip_fallback_source: None,
             unflip_shadow_ready: false,
+            #[cfg(test)]
+            test_force_active: false,
         }
     }
 
     fn active(&self) -> bool {
-        self.pending.is_some() || self.current.is_some()
+        self.pending.is_some() || self.current.is_some() || {
+            #[cfg(test)]
+            {
+                self.test_force_active
+            }
+            #[cfg(not(test))]
+            {
+                false
+            }
+        }
     }
 
     fn admit_eligible_root(&mut self) -> bool {
@@ -1275,6 +1288,20 @@ fn restore_primary_output_after_rebuild(
 }
 
 impl KmsBackend {
+    fn handle_cursor_move_outcome(
+        &mut self,
+        outcome: crate::kms::render::platform::CursorMoveOutcome,
+    ) {
+        self.telemetry
+            .record_cursor_move_ebusy(u64::from(outcome.ebusy_count));
+        if outcome.fallback_changed || outcome.retry_required {
+            self.scene.wake_for_damage();
+            if self.scanout_m2.active() {
+                self.request_direct_unflip();
+            }
+        }
+    }
+
     fn request_direct_unflip(&mut self) {
         if !self.scanout_m2.active() {
             return;
@@ -3301,6 +3328,16 @@ impl KmsBackend {
         {
             return;
         }
+        // Parameter changes can make a previously-EINVAL cursor bind valid.
+        // Notify every device even while all outputs are temporarily using SW;
+        // record version/pixel-only animation changes intentionally do not
+        // reset the per-CRTC backoff.
+        self.platform.cursor_plane_note_sprite_hotspot(
+            record.width,
+            record.height,
+            record.hot_x,
+            record.hot_y,
+        );
         self.scene
             .register_cursor(crate::kms::render::scene::CursorEntry {
                 id: pixmap_id,
@@ -3326,15 +3363,13 @@ impl KmsBackend {
             self.scene.cursor_mode(),
             crate::kms::render::scene::CursorPlaneMode::Hw
                 | crate::kms::render::scene::CursorPlaneMode::Mixed
-        ) && record.width <= 64
-            && record.height <= 64
-        {
+        ) {
             let bytes = std::sync::Arc::new(record.bgra_bytes.clone());
             #[allow(clippy::cast_possible_truncation)]
             let cx = self.core.cursor_x as i32;
             #[allow(clippy::cast_possible_truncation)]
             let cy = self.core.cursor_y as i32;
-            self.scene.queue_steady_state_cursor_upload(
+            let refreshes_hw_binding = self.scene.queue_steady_state_cursor_upload(
                 &mut self.platform,
                 record.version,
                 record.width,
@@ -3345,6 +3380,12 @@ impl KmsBackend {
                 cx,
                 cy,
             );
+            if refreshes_hw_binding && self.scanout_m2.active() {
+                // Direct scanout suppresses ordinary scene composition, so a
+                // per-output upload+Show retry cannot retire until the direct
+                // frame is first unwound.
+                self.request_direct_unflip();
+            }
         }
         // The scene blit ordering: register_cursor already marks
         // scene_structure_dirty so the next tick repaints; no extra
@@ -8700,12 +8741,13 @@ impl KmsBackend {
                     cursor_mode,
                     crate::kms::render::scene::CursorPlaneMode::Mixed
                 ) {
-                    // A primary-card hardware cursor may coexist with a
-                    // secondary-card software cursor. Move the visible owner
-                    // plane immediately and also repaint the SW outputs.
+                    // Hardware and software cursor ownership may coexist on
+                    // arbitrary cards. Move every visible HW plane immediately
+                    // and also repaint the SW outputs.
                     match self.platform.cursor_plane_move(cx, cy, hot_x, hot_y) {
-                        Ok(0) => {}
-                        Ok(n) => self.telemetry.record_cursor_move_ebusy(u64::from(n)),
+                        Ok(outcome) => {
+                            self.handle_cursor_move_outcome(outcome);
+                        }
                         Err(e) => log::debug!("render cursor mixed path: move failed: {e}"),
                     }
                     self.scene.wake_for_damage();
@@ -8729,8 +8771,9 @@ impl KmsBackend {
                     self.scene.wake_for_damage();
                 } else {
                     match self.platform.cursor_plane_move(cx, cy, hot_x, hot_y) {
-                        Ok(0) => {}
-                        Ok(n) => self.telemetry.record_cursor_move_ebusy(u64::from(n)),
+                        Ok(outcome) => {
+                            self.handle_cursor_move_outcome(outcome);
+                        }
                         Err(e) => log::debug!("render cursor fast path: move failed: {e}"),
                     }
                 }
@@ -11850,10 +11893,18 @@ fn do_dump_scanout(backend: &mut KmsBackend) -> io::Result<()> {
     // view, before the display engine samples it). Compared against the
     // on-screen cursor it isolates load_image stride bugs from display-
     // engine stride misinterpretation.
-    if let Some(plane) = backend.platform.cursor_plane.as_ref() {
-        let path = format!("./yserver-cursor-{run}.ppm");
-        if let Err(e) = plane.dump_to_ppm(&path) {
-            log::warn!("render do_dump_scanout: cursor dump failed: {e}");
+    for device in &backend.platform.devices {
+        if let Some(plane) = device.cursor.plane.as_ref() {
+            let path = format!(
+                "./yserver-cursor-{run}-{}-{}.ppm",
+                device.key.major, device.key.minor
+            );
+            if let Err(e) = plane.dump_to_ppm(&path) {
+                log::warn!(
+                    "render do_dump_scanout: cursor dump for device {} failed: {e}",
+                    device.key
+                );
+            }
         }
     }
     // Also dump the source CursorRecord bytes (BEFORE load_image), so a
@@ -13254,15 +13305,27 @@ impl Backend for KmsBackend {
             }
         };
         for (output_idx, clock) in flipped {
-            if self.retire_direct_output(output_idx, clock) {
+            let direct_retired = self.retire_direct_output(output_idx, clock);
+            let scene_retired = !direct_retired
+                && self.scene.handle_page_flip_complete(
+                    output_idx,
+                    &mut self.store,
+                    &mut self.platform,
+                );
+            if direct_retired || scene_retired {
                 self.telemetry.record_frame_present();
-                continue;
             }
-            if self
-                .scene
-                .handle_page_flip_complete(output_idx, &mut self.store, &mut self.platform)
+            // Retry only the cursor state owned by the card whose output just
+            // retired. A page flip on card A must not consume card B's EBUSY
+            // slot or EINVAL backoff.
+            match self
+                .platform
+                .cursor_plane_drain_pending_move_for_output(output_idx)
             {
-                self.telemetry.record_frame_present();
+                Ok(outcome) => {
+                    self.handle_cursor_move_outcome(outcome);
+                }
+                Err(e) => log::debug!("render cursor drain on page-flip retire: {e}"),
             }
         }
         // Idle vblank arming: clear the arm + advance the Present clock for
@@ -13271,18 +13334,6 @@ impl Backend for KmsBackend {
         // NotifyMSC, then re-arms if any remain.
         for seq in sequences {
             self.on_crtc_sequence_event(seq.device_key, seq.user_data, seq.time_ns, seq.sequence);
-        }
-        // The just-retired flip(s) freed up the primary atomic-commit
-        // queue on at least one CRTC; retry any cursor move that lost
-        // to a pending primary commit since its fresh motion event.
-        // Latest-wins: only the most recent pending position is
-        // re-issued. If the retry itself EBUSY's against another
-        // primary commit that landed in the meantime, the slot stays
-        // populated for the next page-flip retire.
-        match self.platform.cursor_plane_drain_pending_move() {
-            Ok(0) => {}
-            Ok(n) => self.telemetry.record_cursor_move_ebusy(u64::from(n)),
-            Err(e) => log::debug!("render cursor drain on page-flip retire: {e}"),
         }
         // Sweep retired engine submits + retired drawables now
         // that their fences may have signaled.
@@ -21760,6 +21811,7 @@ mod tests {
                 render_node_device: None,
                 syncobj_timeline: false,
                 render_node_path: None,
+                cursor: crate::kms::render::platform::KmsCursorState::new(false),
             });
     }
 
@@ -34221,6 +34273,34 @@ mod tests {
             }
             state.reset_eligible_root_probation();
         }
+    }
+
+    #[test]
+    fn active_direct_scanout_unflips_on_cursor_output_fallback() {
+        let mut backend = super::KmsBackend::for_tests();
+        backend.scanout_m2.test_force_active = true;
+        backend.handle_cursor_move_outcome(crate::kms::render::platform::CursorMoveOutcome {
+            ebusy_count: 0,
+            fallback_changed: true,
+            retry_required: false,
+        });
+        assert!(backend.scanout_m2.unflip_requested);
+        assert!(!backend.scanout_m2.hold_direct);
+    }
+
+    #[test]
+    fn active_direct_scanout_unflips_and_wakes_for_cursor_rollback_retry() {
+        let mut backend = super::KmsBackend::for_tests();
+        backend.scene.scene_structure_dirty = false;
+        backend.scanout_m2.test_force_active = true;
+        backend.handle_cursor_move_outcome(crate::kms::render::platform::CursorMoveOutcome {
+            ebusy_count: 0,
+            fallback_changed: false,
+            retry_required: true,
+        });
+        assert!(backend.scene.scene_structure_dirty);
+        assert!(backend.scanout_m2.unflip_requested);
+        assert!(!backend.scanout_m2.hold_direct);
     }
 
     #[test]

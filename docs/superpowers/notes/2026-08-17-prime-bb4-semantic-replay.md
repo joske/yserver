@@ -15,11 +15,11 @@ The replayed slice covers:
 - device-qualified RANDR gamma state; and
 - a conservative boundary around upstream's grouped direct-scanout path.
 
-Per-card hardware-cursor ownership is deliberately split into a subsequent
+Per-card hardware-cursor ownership is split into the subsequent incremental
 adaptation after per-Present device routing. The multi-device inventory added
-before and in this slice supplies the device/output routing that follow-up
-needs, but the current cursor manager still owns one primary-device cursor
-resource.
+before and in this slice supplies its device/output routing; the adaptation
+now gives every already-active startup card its own cursor resource and
+fallback state.
 
 ## Connector probing and failure policy
 
@@ -177,34 +177,62 @@ A future per-output direct path could relax this boundary only after it defines
 independent authoritative-source ownership, partial-success rollback, and
 per-output completion/Idle lifetimes.
 
-## Per-card hardware-cursor follow-up
+## Per-card hardware-cursor adaptation
 
-The desired policy is best-effort hardware cursors independently on each DRM
-card, with software composition only on the card/output whose cursor path is
-unavailable. The repository now has stable device keys, a vector of opened KMS
-devices, and output-to-device routing, but the cursor plane, pending move, and
-unsupported latch are still singleton platform state. This replay therefore
-does not claim that multiple hardware cursors are already managed correctly.
+Hardware cursors are now best effort independently on each DRM card, with
+software composition only on the card/output whose cursor path is unavailable.
+Each `KmsDevice` owns its cursor plane, latest-wins EBUSY retry, permanent
+unsupported latch, topology-coverage decision, and device-qualified per-CRTC
+transient state. Every bind/move/hide resolves the output's device key before a
+raw CRTC handle can reach an fd, so numerically equal CRTC handles on two cards
+cannot cross-route.
 
-The subsequent per-card cursor adaptation should:
+The adaptation:
 
-- move cursor-plane ownership, pending motion, and fallback state to the
+- moves cursor-plane ownership, pending motion, and fallback state to the
   owning KMS device;
-- restore and adapt bb4's distinct cursor-plane-to-CRTC coverage matching per
+- restores and adapts bb4's distinct cursor-plane-to-CRTC coverage matching per
   device, while retaining the optimistic legacy-ioctl path when a driver does
   not expose universal-plane metadata;
-- route upload, bind, move, hide, resume, and teardown operations by output
+- routes upload, bind, move, hide, resume, and teardown operations by output
   device;
-- preserve hardware cursors on unaffected cards when one card falls back to
-  software; and
-- add same-handle/different-device and independent-fallback regression tests.
+- preserves hardware cursors on unaffected cards when one card falls back to
+  software;
+- evaluates NVIDIA's software-cursor policy and driver cursor dimensions per
+  owning card, so card order does not leak policy and a 96px cursor may remain
+  hardware on a 128px plane while a 64px card composes it; and
+- adds same-handle/different-device, distinct-plane matching, device-local
+  fallback, and transaction-outcome regression tests.
 
-The follow-up must preserve current runtime probing. In particular, `EINVAL`
-is ambiguous: a disabled CRTC, a temporary atomic state, or a bad parameter can
-produce it even when hardware cursors are supported. It must remain non-sticky.
-Only errors that establish unsupported device behavior may latch that device
-to software; transient or ambiguous failures are warned and retried through
-the normal lifecycle.
+`EINVAL` remains non-sticky because a disabled CRTC, temporary atomic state, or
+bad parameter can produce it even when hardware cursors are supported. A
+failed operation first rolls back any live bind before software composition is
+allowed. Once safely unbound, only that output composes in software for a
+bounded number of its own successful frame retirements; repeated `EINVAL`
+probes use an exponential 1/2/4/8-frame cap. A topology/resume boundary or a
+sprite geometry/hotspot change clears the transient observation. Pixel-only
+animation versions do not reset the backoff. `ENXIO`, `ENODEV`, and
+`EOPNOTSUPP` latch only the owning device; EBUSY remains a device-local
+latest-position retry drained only when that device retires a flip.
+An active-startup transient plane-construction failure is recorded separately
+and retries only at an explicit active-topology or resume boundary. A device
+that had no startup CRTC stays in a distinct deferred state; ordinary probes
+and frames do not allocate its first cursor plane, which remains the later
+`ed8fcad4` successor's responsibility.
+
+Cursor show is transactional across the legacy bind and move ioctls. If move
+fails, a hide rollback must succeed before the scene records Hidden/SW; if the
+prior or new hardware binding remains visible, the scene retains actual HW
+mode and last-known metadata, forces a full Show retry, and never draws a
+second software cursor over it. Hw→Sw/Hidden is a separate two-phase handoff:
+the first retiring frame omits the software cursor, then attempts hide. Hide
+failure keeps the old HW sprite as the only cursor and submits another
+cursorless hide-retry frame; success permits the SW cursor only on the next
+frame, accepting a one-frame cursor gap to preserve the no-double invariant.
+The pending reveal remains Mixed/non-direct until that SW frame retires.
+Sprite and hotspot Show retries are version-qualified so an older or unrelated
+frame retirement cannot clear newer work. Any cursor fallback or pending
+rebind unwinds active direct scanout before the composed retry.
 
 Deferred cursor initialization after a genuinely headless start remains the
 separate later `ed8fcad4` successor; this follow-up must not absorb it.
