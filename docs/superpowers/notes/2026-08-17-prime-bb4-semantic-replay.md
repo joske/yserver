@@ -216,9 +216,14 @@ animation versions do not reset the backoff. `ENXIO`, `ENODEV`, and
 latest-position retry drained only when that device retires a flip.
 An active-startup transient plane-construction failure is recorded separately
 and retries only at an explicit active-topology or resume boundary. A device
-that had no startup CRTC stays in a distinct deferred state; ordinary probes
-and frames do not allocate its first cursor plane, which remains the later
-`ed8fcad4` successor's responsibility.
+that had no startup CRTC stays in a distinct deferred state. The standalone
+`ed8fcad4` successor consumes that state only after a successful explicit
+RANDR enable has inserted the first `ActiveOutput`: it passes every
+post-insertion active CRTC on the owning card to the factory before scene/RANDR
+rebuild. Ordinary probes, connected-Off rescans, failed enable paths, frames,
+and zero-card startup do not allocate. A transient lazy failure retries only at
+a later topology/resume boundary; a permanent failure latches only that card.
+Once allocated, the plane persists across last-output disable/re-enable.
 
 Cursor show is transactional across the legacy bind and move ioctls. If move
 fails, a hide rollback must succeed before the scene records Hidden/SW; if the
@@ -234,5 +239,5 @@ Sprite and hotspot Show retries are version-qualified so an older or unrelated
 frame retirement cannot clear newer work. Any cursor fallback or pending
 rebind unwinds active direct scanout before the composed retry.
 
-Deferred cursor initialization after a genuinely headless start remains the
-separate later `ed8fcad4` successor; this follow-up must not absorb it.
+The lazy first-output behavior above is kept in the separate `ed8fcad4`
+successor rather than folded into the per-card manager commit.

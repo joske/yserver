@@ -57,8 +57,20 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   grouped direct scanout is active requests an unflip. A transient plane-init
   failure on an active startup card retries only at explicit topology/resume
   boundaries; a device that starts without an active CRTC deliberately remains
-  uninitialized, and first-output lazy creation stays in the separate
-  `ed8fcad4` successor.
+  uninitialized for the following standalone `ed8fcad4` successor.
+- **2026-08-17 PRIME headless cursor first-output initialization:** an opened
+  DRM card that had no active startup CRTC now constructs its device-local
+  cursor plane only after an explicit RANDR enable has committed its modeset,
+  installed the first `ActiveOutput`, and refreshed the post-insertion
+  topology. The factory receives every active CRTC on that card before scene
+  and RANDR rebuild observe eligibility; a fresh plane starts with no uploaded
+  sprite version, so the first retired HW assignment performs the normal
+  output-qualified upload. Connected-Off probes, failed mode/pool/modeset
+  paths, ordinary frames, and zero-card startup never invoke the factory.
+  Permanent construction errors latch only that card; transient failures retry
+  at a later topology/resume boundary, never twice in the first-enable
+  boundary. The allocation persists when the card's last output is disabled
+  and is reused on a later enable.
 - **2026-08-17 Present requests now own one RANDR CRTC clock domain:** every
   Pixmap, PixmapSynced, NotifyMSC, completion gate, and backend scanout
   candidate carries a RANDR CRTC XID plus a physical-route epoch. Explicit

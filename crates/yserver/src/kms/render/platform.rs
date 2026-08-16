@@ -636,9 +636,12 @@ pub(crate) struct KmsCursorState {
     permanently_disabled: bool,
     /// CursorPlane::new was attempted for an active startup topology and
     /// failed transiently. Only explicit active-topology/resume boundaries
-    /// may retry it. False with no plane is the intentionally headless-
-    /// deferred state whose first-output initialization belongs to ed8.
+    /// may retry it.
     initialization_retryable: bool,
+    /// This opened device had no active startup CRTC and has never attempted
+    /// cursor-plane construction. Only a successful explicit RANDR enable may
+    /// consume this state; connected-Off probes and ordinary frames cannot.
+    headless_deferred: bool,
     topology_blocked: bool,
     transient_fallback_crtcs: HashMap<::drm::control::crtc::Handle, TransientCursorFallback>,
     nvidia_policy_disabled: bool,
@@ -652,6 +655,7 @@ impl KmsCursorState {
             pending_move: None,
             permanently_disabled: false,
             initialization_retryable: false,
+            headless_deferred: true,
             topology_blocked: false,
             transient_fallback_crtcs: HashMap::new(),
             nvidia_policy_disabled,
@@ -713,9 +717,18 @@ impl KmsCursorState {
     }
 
     fn note_initialization_failure(&mut self, error: &io::Error) {
+        self.headless_deferred = false;
         let permanent = cursor_err_disables_hw(error);
         self.permanently_disabled |= permanent;
         self.initialization_retryable = !permanent;
+    }
+
+    fn should_initialize_headless_deferred(&self, has_active_crtcs: bool) -> bool {
+        has_active_crtcs
+            && self.headless_deferred
+            && self.plane.is_none()
+            && !self.permanently_disabled
+            && !self.initialization_retryable
     }
 
     fn should_retry_initialization(&self, has_active_crtcs: bool) -> bool {
@@ -822,25 +835,34 @@ pub(crate) struct KmsDevice {
     pub(crate) cursor: KmsCursorState,
 }
 
+fn install_cursor_plane_for_device(
+    kms_device: &mut KmsDevice,
+    crtcs: &[::drm::control::crtc::Handle],
+    boundary: &str,
+    plane: crate::kms::cursor_plane::CursorPlane,
+) {
+    kms_device.cursor.topology_blocked = !plane.supports_crtcs(crtcs);
+    kms_device.cursor.initialization_retryable = false;
+    kms_device.cursor.headless_deferred = false;
+    log::info!(
+        "render cursor: device {} initialized {}x{} ARGB8888 for {} active CRTC(s) at {boundary}; topology_blocked={}",
+        kms_device.key,
+        plane.width(),
+        plane.height(),
+        crtcs.len(),
+        kms_device.cursor.topology_blocked,
+    );
+    kms_device.cursor.plane = Some(plane);
+}
+
 fn initialize_cursor_plane_for_device(
     kms_device: &mut KmsDevice,
     crtcs: &[::drm::control::crtc::Handle],
     boundary: &str,
 ) {
+    kms_device.cursor.headless_deferred = false;
     match crate::kms::cursor_plane::CursorPlane::new(Rc::clone(&kms_device.device), crtcs) {
-        Ok(plane) => {
-            kms_device.cursor.topology_blocked = !plane.supports_crtcs(crtcs);
-            kms_device.cursor.initialization_retryable = false;
-            log::info!(
-                "render cursor: device {} initialized {}x{} ARGB8888 for {} active CRTC(s) at {boundary}; topology_blocked={}",
-                kms_device.key,
-                plane.width(),
-                plane.height(),
-                crtcs.len(),
-                kms_device.cursor.topology_blocked,
-            );
-            kms_device.cursor.plane = Some(plane);
-        }
+        Ok(plane) => install_cursor_plane_for_device(kms_device, crtcs, boundary, plane),
         Err(error) => {
             kms_device.cursor.note_initialization_failure(&error);
             let retry = if kms_device.cursor.initialization_retryable {
@@ -1227,8 +1249,8 @@ impl PlatformBackend {
             .collect();
 
         // One independently-owned cursor buffer/state per DRM device. A
-        // device with no active startup CRTC intentionally stays uninitialised;
-        // the later ed8 semantic successor owns first-output lazy creation.
+        // device with no active startup CRTC stays explicitly deferred until
+        // its first successful RANDR enable inserts an ActiveOutput.
         for kms_device in &mut devices {
             let crtcs: Vec<_> = layouts
                 .iter()
@@ -2061,12 +2083,27 @@ impl PlatformBackend {
     }
 
     /// Revalidate every existing per-device cursor plane after an active CRTC
-    /// topology change. This does not create a plane for a device that started
-    /// headless; that is intentionally left for the ed8 successor.
+    /// topology change. A genuinely headless-deferred device is deliberately
+    /// skipped here: only the post-success explicit-enable hook may make its
+    /// first attempt. A prior transient attempt is retried at this later
+    /// topology/resume boundary.
     fn refresh_cursor_topology_for_devices(
         &mut self,
         changed_devices: &HashSet<crate::platform::drm::DrmDeviceKey>,
     ) {
+        self.refresh_cursor_topology_for_devices_with(
+            changed_devices,
+            initialize_cursor_plane_for_device,
+        );
+    }
+
+    fn refresh_cursor_topology_for_devices_with<F>(
+        &mut self,
+        changed_devices: &HashSet<crate::platform::drm::DrmDeviceKey>,
+        mut factory: F,
+    ) where
+        F: FnMut(&mut KmsDevice, &[::drm::control::crtc::Handle], &str),
+    {
         let mut crtcs_by_device: HashMap<_, Vec<_>> = HashMap::new();
         for output in &self.outputs {
             crtcs_by_device
@@ -2082,7 +2119,7 @@ impl PlatformBackend {
             device.cursor.transient_fallback_crtcs.clear();
             let crtcs = crtcs_by_device.remove(&device.key).unwrap_or_default();
             if device.cursor.should_retry_initialization(!crtcs.is_empty()) {
-                initialize_cursor_plane_for_device(device, &crtcs, "lifecycle retry");
+                factory(device, &crtcs, "lifecycle retry");
             }
             if let Some(plane) = device.cursor.plane.as_mut() {
                 plane.retain_crtcs(&crtcs.iter().copied().collect());
@@ -2103,6 +2140,48 @@ impl PlatformBackend {
             }
             device.cursor.topology_blocked = blocked;
         }
+    }
+
+    /// Run the one-time first-output factory for an opened device that began
+    /// genuinely headless. Callers must invoke this only after the successful
+    /// ActiveOutput insertion. All post-insertion active CRTCs on the owning
+    /// device are passed to the factory, and no other card is touched.
+    fn initialize_headless_cursor_for_device_with<F>(
+        &mut self,
+        device_key: crate::platform::drm::DrmDeviceKey,
+        boundary: &str,
+        factory: F,
+    ) -> bool
+    where
+        F: FnOnce(&mut KmsDevice, &[::drm::control::crtc::Handle], &str),
+    {
+        let crtcs: Vec<_> = self
+            .outputs
+            .iter()
+            .filter(|output| output.key.device_key == device_key)
+            .map(|output| output.output.crtc)
+            .collect();
+        let Some(device) = self
+            .devices
+            .iter_mut()
+            .find(|device| device.key == device_key)
+        else {
+            return false;
+        };
+        if !device
+            .cursor
+            .should_initialize_headless_deferred(!crtcs.is_empty())
+        {
+            return false;
+        }
+
+        // Consume genuine-deferred before invoking the injectable factory so
+        // even a test/factory panic cannot make ordinary probes look like a
+        // never-attempted device. The production factory records success or
+        // retryable/permanent failure in the remaining state.
+        device.cursor.headless_deferred = false;
+        factory(device, &crtcs, boundary);
+        true
     }
 
     pub(crate) fn refresh_cursor_topology(&mut self) {
@@ -3436,11 +3515,33 @@ impl PlatformBackend {
     pub(crate) fn enable_connector(
         &mut self,
         output_key: &OutputKey,
-        mut output: crate::platform::drm::Output,
+        output: crate::platform::drm::Output,
         mode_spec: yserver_core::backend::ModeSpec,
         x: i32,
         y: i32,
     ) -> io::Result<()> {
+        self.enable_connector_with_cursor_factory(
+            output_key,
+            output,
+            mode_spec,
+            x,
+            y,
+            initialize_cursor_plane_for_device,
+        )
+    }
+
+    fn enable_connector_with_cursor_factory<F>(
+        &mut self,
+        output_key: &OutputKey,
+        mut output: crate::platform::drm::Output,
+        mode_spec: yserver_core::backend::ModeSpec,
+        x: i32,
+        y: i32,
+        mut cursor_factory: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&mut KmsDevice, &[::drm::control::crtc::Handle], &str),
+    {
         let connector = output.connector_name.clone();
         debug_assert_eq!(output_key.connector_name, connector);
         let device = Rc::clone(
@@ -3721,7 +3822,18 @@ impl PlatformBackend {
         self.fb_w = fb_w;
         self.fb_h = fb_h;
         self.prune_present_clocks_to_live_outputs();
-        self.refresh_cursor_topology_for_devices(&HashSet::from([output_key.device_key]));
+        let changed_devices = HashSet::from([output_key.device_key]);
+        // Refresh first. If a previous first-output attempt failed
+        // transiently, this later explicit topology boundary retries it. A
+        // genuinely deferred device is intentionally skipped here so a
+        // failure in the new lazy attempt cannot be retried twice at the same
+        // boundary.
+        self.refresh_cursor_topology_for_devices_with(&changed_devices, &mut cursor_factory);
+        self.initialize_headless_cursor_for_device_with(
+            output_key.device_key,
+            "first successful explicit RANDR enable",
+            |device, crtcs, boundary| cursor_factory(device, crtcs, boundary),
+        );
 
         log::info!(
             "render enable_connector: {connector} enabled {}×{}@{} at ({x},{y}); fb now {}×{}",
@@ -4336,6 +4448,35 @@ mod tests {
         }
     }
 
+    fn install_test_cursor_plane(
+        device: &mut KmsDevice,
+        crtcs: &[::drm::control::crtc::Handle],
+        boundary: &str,
+    ) {
+        let plane = crate::kms::cursor_plane::CursorPlane::for_tests_stub(
+            Rc::clone(&device.device),
+            64,
+            64,
+        );
+        install_cursor_plane_for_device(device, crtcs, boundary, plane);
+    }
+
+    fn test_active_output_for(
+        device_key: crate::platform::drm::DrmDeviceKey,
+        connector_name: &str,
+        raw_crtc: u32,
+    ) -> ActiveOutput {
+        let mut seed = PlatformBackend::for_tests();
+        let mut output = seed.outputs.remove(0);
+        output.key = OutputKey::new(device_key, connector_name);
+        output.output.connector_name = connector_name.to_string();
+        output.output.connector = ::drm::control::from_u32(raw_crtc).unwrap();
+        output.output.encoder = ::drm::control::from_u32(raw_crtc).unwrap();
+        output.output.crtc = ::drm::control::from_u32(raw_crtc).unwrap();
+        output.output.plane = ::drm::control::from_u32(raw_crtc).unwrap();
+        output
+    }
+
     #[test]
     fn initial_scanout_rollback_guard_fires_and_can_be_disarmed() {
         let mut platform = PlatformBackend::for_tests();
@@ -4884,10 +5025,12 @@ mod tests {
         let mut state = KmsCursorState::new(false);
         assert!(
             !state.should_retry_initialization(true),
-            "a genuinely headless-deferred device must wait for the ed8 first-output successor"
+            "a genuinely headless-deferred device is not a lifecycle retry"
         );
+        assert!(state.should_initialize_headless_deferred(true));
 
         state.note_initialization_failure(&io::Error::from_raw_os_error(libc::ENOMEM));
+        assert!(!state.headless_deferred);
         assert!(!state.permanently_disabled);
         assert!(!state.should_retry_initialization(false));
         assert!(state.should_retry_initialization(true));
@@ -4895,6 +5038,292 @@ mod tests {
         state.note_initialization_failure(&io::Error::from_raw_os_error(libc::ENODEV));
         assert!(state.permanently_disabled);
         assert!(!state.should_retry_initialization(true));
+    }
+
+    #[test]
+    fn primary_first_explicit_enable_initializes_and_exposes_fresh_upload_state() {
+        let mut platform = PlatformBackend::for_tests();
+        let key = platform.devices[0].key;
+        let crtc = platform.outputs[0].output.crtc;
+        assert!(platform.devices[0].cursor.headless_deferred);
+
+        let calls = Cell::new(0_u32);
+        assert!(platform.initialize_headless_cursor_for_device_with(
+            key,
+            "test primary first enable",
+            |device, crtcs, boundary| {
+                calls.set(calls.get() + 1);
+                assert_eq!(device.key, key);
+                assert_eq!(crtcs, &[crtc]);
+                assert_eq!(boundary, "test primary first enable");
+                install_test_cursor_plane(device, crtcs, boundary);
+            },
+        ));
+        assert_eq!(calls.get(), 1);
+        assert!(!platform.devices[0].cursor.headless_deferred);
+        assert!(platform.cursor_plane_available_for_output(0));
+        assert_eq!(platform.cursor_plane_uploaded_version_for_output(0), None);
+
+        let bytes = vec![0_u8; 16 * 16 * 4];
+        platform
+            .cursor_plane_upload_image_for_output(0, 7, 16, 16, &bytes)
+            .expect("fresh lazy plane accepts its first retire-time upload");
+        assert_eq!(
+            platform.cursor_plane_uploaded_version_for_output(0),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn secondary_first_enable_uses_owning_device_despite_raw_crtc_collision() {
+        let mut platform = PlatformBackend::for_tests();
+        let primary_key = platform.devices[0].key;
+        let raw_crtc = platform.outputs[0].output.crtc;
+        let secondary_key = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 93,
+        };
+        platform.devices.push(test_kms_device(secondary_key, false));
+        let primary_fd = platform.devices[0].device.as_fd().as_raw_fd();
+        let secondary_fd = platform.devices[1].device.as_fd().as_raw_fd();
+        platform.outputs.push(test_active_output_for(
+            secondary_key,
+            "secondary",
+            u32::from(raw_crtc),
+        ));
+
+        let calls = Cell::new(0_u32);
+        assert!(platform.initialize_headless_cursor_for_device_with(
+            secondary_key,
+            "test secondary first enable",
+            |device, crtcs, boundary| {
+                calls.set(calls.get() + 1);
+                assert_eq!(device.key, secondary_key);
+                assert_eq!(device.device.as_fd().as_raw_fd(), secondary_fd);
+                assert_ne!(device.device.as_fd().as_raw_fd(), primary_fd);
+                assert_eq!(crtcs, &[raw_crtc]);
+                install_test_cursor_plane(device, crtcs, boundary);
+            },
+        ));
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(platform.devices[0].key, primary_key);
+        assert!(platform.devices[0].cursor.plane.is_none());
+        assert!(platform.devices[0].cursor.headless_deferred);
+        assert!(platform.devices[1].cursor.plane.is_some());
+        assert!(platform.cursor_plane_available_for_output(1));
+        assert!(!platform.cursor_plane_available_for_output(0));
+    }
+
+    #[test]
+    fn failed_enable_never_reaches_deferred_cursor_factory() {
+        let mut platform = PlatformBackend::for_tests();
+        let active = platform.outputs.remove(0);
+        let output_key = active.key;
+        let output = active.output;
+        platform.scanout_pools.clear();
+        platform.bo_generations.clear();
+        platform.first_pageflip_logged.clear();
+        let mode = yserver_core::backend::ModeSpec {
+            width: output.picked.width,
+            height: output.picked.height,
+            vrefresh: output.picked.vrefresh,
+        };
+        let calls = Cell::new(0_u32);
+
+        let result = platform.enable_connector_with_cursor_factory(
+            &output_key,
+            output,
+            mode,
+            0,
+            0,
+            |_device, _crtcs, _boundary| calls.set(calls.get() + 1),
+        );
+
+        assert!(result.is_err(), "test fixture has no initial fb handle");
+        assert_eq!(calls.get(), 0);
+        assert!(platform.outputs.is_empty());
+        assert!(platform.devices[0].cursor.headless_deferred);
+    }
+
+    #[test]
+    fn deferred_init_failure_policy_is_device_local_and_retries_later_only() {
+        let mut platform = PlatformBackend::for_tests();
+        let primary_key = platform.devices[0].key;
+        let secondary_key = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 94,
+        };
+        platform.devices.push(test_kms_device(secondary_key, false));
+        platform
+            .outputs
+            .push(test_active_output_for(secondary_key, "secondary", 2));
+
+        let first_calls = Cell::new(0_u32);
+        assert!(platform.initialize_headless_cursor_for_device_with(
+            secondary_key,
+            "first explicit enable",
+            |device, _crtcs, _boundary| {
+                first_calls.set(first_calls.get() + 1);
+                device
+                    .cursor
+                    .note_initialization_failure(&io::Error::from_raw_os_error(libc::ENOMEM));
+            },
+        ));
+        assert_eq!(first_calls.get(), 1);
+        assert!(!platform.devices[1].cursor.headless_deferred);
+        assert!(platform.devices[1].cursor.initialization_retryable);
+        assert!(!platform.devices[1].cursor.permanently_disabled);
+        assert!(!platform.initialize_headless_cursor_for_device_with(
+            secondary_key,
+            "same boundary must not retry",
+            |_device, _crtcs, _boundary| first_calls.set(first_calls.get() + 1),
+        ));
+        assert_eq!(first_calls.get(), 1);
+
+        let retry_calls = Cell::new(0_u32);
+        platform.refresh_cursor_topology_for_devices_with(
+            &HashSet::from([secondary_key]),
+            |device, crtcs, boundary| {
+                retry_calls.set(retry_calls.get() + 1);
+                assert_eq!(device.key, secondary_key);
+                assert_eq!(boundary, "lifecycle retry");
+                install_test_cursor_plane(device, crtcs, boundary);
+            },
+        );
+        assert_eq!(retry_calls.get(), 1);
+        assert!(platform.devices[1].cursor.plane.is_some());
+        assert!(!platform.devices[1].cursor.initialization_retryable);
+        assert!(platform.devices[0].cursor.headless_deferred);
+        assert!(!platform.devices[0].cursor.permanently_disabled);
+
+        // A separate card's permanent failure latches only that owner.
+        let tertiary_key = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 95,
+        };
+        platform.devices.push(test_kms_device(tertiary_key, false));
+        platform
+            .outputs
+            .push(test_active_output_for(tertiary_key, "tertiary", 3));
+        assert!(platform.initialize_headless_cursor_for_device_with(
+            tertiary_key,
+            "first explicit enable",
+            |device, _crtcs, _boundary| {
+                device
+                    .cursor
+                    .note_initialization_failure(&io::Error::from_raw_os_error(libc::ENODEV));
+            },
+        ));
+        assert!(platform.devices[2].cursor.permanently_disabled);
+        assert!(!platform.devices[2].cursor.initialization_retryable);
+        assert!(platform.devices[2].cursor.plane.is_none());
+        assert!(platform.devices[1].cursor.plane.is_some());
+        assert!(!platform.devices[1].cursor.permanently_disabled);
+        assert_eq!(platform.devices[0].key, primary_key);
+    }
+
+    #[test]
+    fn initialized_cursor_plane_persists_but_reuploads_across_last_disable_and_reenable() {
+        let mut platform = PlatformBackend::for_tests();
+        let key = platform.devices[0].key;
+        assert!(platform.initialize_headless_cursor_for_device_with(
+            key,
+            "first explicit enable",
+            install_test_cursor_plane,
+        ));
+        platform
+            .cursor_plane_upload_image_for_output(0, 9, 16, 16, &[0_u8; 16 * 16 * 4])
+            .unwrap();
+        assert_eq!(
+            platform.devices[0]
+                .cursor
+                .plane
+                .as_ref()
+                .and_then(crate::kms::cursor_plane::CursorPlane::uploaded_version),
+            Some(9)
+        );
+
+        platform
+            .cursor_plane_hide_all()
+            .expect("topology quiesce retains the plane while invalidating its upload");
+        assert_eq!(
+            platform.devices[0]
+                .cursor
+                .plane
+                .as_ref()
+                .and_then(crate::kms::cursor_plane::CursorPlane::uploaded_version),
+            None
+        );
+
+        platform.remove_connector_at(0);
+        assert!(platform.outputs.is_empty());
+        assert!(platform.devices[0].cursor.plane.is_some());
+        assert!(!platform.devices[0].cursor.headless_deferred);
+        assert_eq!(
+            platform.devices[0]
+                .cursor
+                .plane
+                .as_ref()
+                .and_then(crate::kms::cursor_plane::CursorPlane::uploaded_version),
+            None,
+            "last-output removal retains the allocation, not stale pixels"
+        );
+
+        platform
+            .outputs
+            .push(test_active_output_for(key, "reenabled", 1));
+        platform.refresh_cursor_topology_for_devices(&HashSet::from([key]));
+        assert!(platform.cursor_plane_available_for_output(0));
+        assert_eq!(platform.cursor_plane_uploaded_version_for_output(0), None);
+        platform
+            .cursor_plane_upload_image_for_output(0, 10, 16, 16, &[0_u8; 16 * 16 * 4])
+            .expect("first retirement after re-enable refreshes retained storage");
+        assert_eq!(
+            platform.cursor_plane_uploaded_version_for_output(0),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn connected_off_probe_and_zero_card_do_not_run_deferred_factory() {
+        let mut platform = PlatformBackend::for_tests();
+        let key = platform.outputs[0].key.clone();
+        platform.outputs.clear();
+        platform.scanout_pools.clear();
+        platform.bo_generations.clear();
+        platform.first_pageflip_logged.clear();
+        let snapshot = ConnectorSnapshot {
+            key: key.clone(),
+            modes: vec![crate::platform::drm::Mode {
+                name: "800x600".into(),
+                width: 800,
+                height: 600,
+                vrefresh: 60,
+                preferred: true,
+                ..Default::default()
+            }],
+            mm_width: 520,
+            mm_height: 290,
+            edid: vec![1, 2, 3, 4],
+            connector_type: "DisplayPort".into(),
+        };
+
+        let rescan =
+            platform.apply_connector_snapshot(vec![snapshot], &HashSet::new(), &HashSet::new());
+        assert_eq!(rescan.added_keys, vec![key.clone()]);
+        assert!(platform.outputs.is_empty());
+        assert!(platform.devices[0].cursor.headless_deferred);
+        assert!(platform.devices[0].cursor.plane.is_none());
+
+        let calls = Cell::new(0_u32);
+        platform.devices.clear();
+        assert!(!platform.initialize_headless_cursor_for_device_with(
+            key.device_key,
+            "zero-card",
+            |_device, _crtcs, _boundary| calls.set(calls.get() + 1),
+        ));
+        assert_eq!(calls.get(), 0);
     }
 
     #[test]

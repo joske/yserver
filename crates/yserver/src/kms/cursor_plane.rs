@@ -184,6 +184,11 @@ pub struct CursorPlane {
     /// CRTC needs a distinct compatible plane: a single universal plane cannot
     /// simultaneously display a cursor on two CRTCs.
     explicit_plane_crtcs: Option<Vec<HashSet<crtc::Handle>>>,
+    /// In-memory storage for the ioctl-free test factory. Production cursor
+    /// planes own an mmap through `dumb`; tests need a safe buffer to exercise
+    /// lazy-init upload/version behavior without a real DRM node.
+    #[cfg(test)]
+    _test_backing: Option<Box<[u8]>>,
 }
 
 /// Whether distinct cursor planes can be assigned to every required CRTC.
@@ -318,6 +323,8 @@ impl CursorPlane {
             visible: HashMap::new(),
             uploaded_version: None,
             explicit_plane_crtcs,
+            #[cfg(test)]
+            _test_backing: None,
         };
         if !plane.supports_crtcs(crtcs) {
             log::warn!(
@@ -326,6 +333,33 @@ impl CursorPlane {
             );
         }
         Ok(plane)
+    }
+
+    /// Build an ioctl-free cursor plane for platform state-machine tests.
+    /// The backing allocation is real, so upload/version paths are safe; show
+    /// remains unavailable because there is deliberately no dumb buffer.
+    #[cfg(test)]
+    pub(crate) fn for_tests_stub(device: Rc<Device>, width: u32, height: u32) -> Self {
+        let stride = width.checked_mul(4).expect("test cursor stride overflow");
+        let len = usize::try_from(stride)
+            .expect("test cursor stride fits usize")
+            .checked_mul(usize::try_from(height).expect("test cursor height fits usize"))
+            .expect("test cursor allocation overflow");
+        let mut test_backing = vec![0_u8; len].into_boxed_slice();
+        let ptr = NonNull::new(test_backing.as_mut_ptr()).expect("non-empty test cursor buffer");
+        Self {
+            device,
+            dumb: None,
+            ptr,
+            len,
+            stride,
+            width,
+            height,
+            visible: HashMap::new(),
+            uploaded_version: None,
+            explicit_plane_crtcs: None,
+            _test_backing: Some(test_backing),
+        }
     }
 
     /// Whether this device's explicitly exposed cursor planes can cover all
