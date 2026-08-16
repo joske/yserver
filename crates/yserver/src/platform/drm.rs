@@ -19,7 +19,8 @@ use std::{
 use ::drm::control::{Device as _, connector};
 
 pub(crate) use crate::drm::modeset::{
-    ConnectorProbe, Mode, Output, discover_outputs, probe_connectors,
+    ConnectorProbe, ConnectorSnapshotProbe, Mode, Output, discover_output_for_connector,
+    discover_outputs, probe_connector_snapshots, probe_connectors,
 };
 
 const DRM_DIR: &str = "/dev/dri";

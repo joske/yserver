@@ -500,20 +500,21 @@ pub trait Backend {
         Ok(false)
     }
 
-    /// Number of entries in the connector's CRTC hardware gamma LUT
-    /// (`0` = gamma unsupported on this backend/connector). Default: 0.
-    fn crtc_gamma_size(&self, _connector: &str) -> u16 {
+    /// Number of entries in the RANDR CRTC's hardware gamma LUT (`0` = gamma
+    /// unsupported). The XID, rather than a connector name, preserves device
+    /// identity when multiple providers expose identically named connectors.
+    fn crtc_gamma_size(&self, _crtc: u32) -> u16 {
         0
     }
 
-    /// Cache the gamma LUT for `connector` (cache-before-apply: store
+    /// Cache the gamma LUT for `crtc` (cache-before-apply: store
     /// the requested ramp first), then apply it to the live CRTC. Each
     /// of `red`/`green`/`blue` has `crtc_gamma_size` entries. A transient
     /// apply failure keeps the cached ramp so a later reapply retries it.
     /// Default: Ok(()) no-op.
     fn set_crtc_gamma(
         &mut self,
-        _connector: &str,
+        _crtc: u32,
         _red: &[u16],
         _green: &[u16],
         _blue: &[u16],
@@ -521,9 +522,9 @@ pub trait Backend {
         Ok(())
     }
 
-    /// The connector's current cached gamma LUT (lazily seeded with a
+    /// The CRTC's current cached gamma LUT (lazily seeded with a
     /// linear identity ramp on first query/set). Default: empty triple.
-    fn get_crtc_gamma(&self, _connector: &str) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+    fn get_crtc_gamma(&self, _crtc: u32) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
         (Vec::new(), Vec::new(), Vec::new())
     }
 

@@ -253,6 +253,34 @@ struct FailedSubmitBo {
     ticket: FenceTicket,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeferredSceneRelease {
+    PoolSlot(usize),
+    FailedSubmit { bo_idx: usize, pool_slot: usize },
+}
+
+fn drain_deferred_scene_resources<W, R>(
+    pending_pool_releases: &mut VecDeque<(usize, FenceTicket)>,
+    failed_submit_bos: &mut VecDeque<FailedSubmitBo>,
+    mut wait: W,
+    mut release: R,
+) where
+    W: FnMut(&FenceTicket),
+    R: FnMut(DeferredSceneRelease),
+{
+    for (slot, ticket) in pending_pool_releases.drain(..) {
+        wait(&ticket);
+        release(DeferredSceneRelease::PoolSlot(slot));
+    }
+    for failed in failed_submit_bos.drain(..) {
+        wait(&failed.ticket);
+        release(DeferredSceneRelease::FailedSubmit {
+            bo_idx: failed.bo_idx,
+            pool_slot: failed.pool_slot,
+        });
+    }
+}
+
 /// Ring of recent output-damage regions keyed by generation.
 /// Depth = max(scanout_bo_count) + 1 per Stage 2 plan
 /// cross-cutting §"BufferAgeRing".
@@ -988,7 +1016,7 @@ impl SceneCompositor {
             return;
         };
         let vk = inner.vk.clone();
-        for o in &mut inner.outputs {
+        for (output_idx, o) in inner.outputs.iter_mut().enumerate() {
             // B.2-context fix (codex audit followup): wait for any
             // in-flight compose fences before resetting their
             // descriptor-pool slots. `disable_output` runs
@@ -1001,9 +1029,23 @@ impl SceneCompositor {
                     let _ = t.wait(&vk);
                 }
             }
-            for (_, ticket) in o.pending_pool_releases.drain(..) {
-                let _ = ticket.wait(&vk);
-            }
+            let pending_pool_releases = &mut o.pending_pool_releases;
+            let failed_submit_bos = &mut o.failed_submit_bos;
+            let pool_ring = &mut o.pool_ring;
+            drain_deferred_scene_resources(
+                pending_pool_releases,
+                failed_submit_bos,
+                |ticket| {
+                    let _ = ticket.wait(&vk);
+                },
+                |release| match release {
+                    DeferredSceneRelease::PoolSlot(slot) => pool_ring.release(slot),
+                    DeferredSceneRelease::FailedSubmit { bo_idx, pool_slot } => {
+                        platform.recycle_failed_submit_bo(output_idx, bo_idx);
+                        pool_ring.release(pool_slot);
+                    }
+                },
+            );
             while let Some(slot) = o.pool_slots.pop_front() {
                 o.pool_ring.release(slot);
             }
@@ -1629,7 +1671,7 @@ fn tick_one_output(
     let cursor_prev_pos_before = inner.outputs[output_idx].cursor_prev_pos;
     let last_present_cursor_rect = inner.outputs[output_idx].last_present_cursor_rect;
     let last_present_cursor_version = inner.outputs[output_idx].last_present_cursor_version;
-    let hw_available = platform.cursor_plane_available();
+    let hw_available = platform.cursor_plane_available_for_output(output_idx);
     let hw_can_run = hw_strategy_enabled && hw_available;
     let prev_mode = inner.outputs[output_idx].last_frame_cursor_mode;
     // Phase 5.1 — `cow_host_xid` is threaded directly from the
@@ -3523,6 +3565,42 @@ fn record_command_buffer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn global_drain_waits_and_releases_every_deferred_scene_resource() {
+        let mut pending = VecDeque::from([(
+            3,
+            crate::kms::render::platform::FenceTicket::for_tests_stub(),
+        )]);
+        let mut failed = VecDeque::from([FailedSubmitBo {
+            bo_idx: 7,
+            pool_slot: 5,
+            ticket: crate::kms::render::platform::FenceTicket::for_tests_stub(),
+        }]);
+        let mut waited = 0;
+        let mut released = Vec::new();
+
+        drain_deferred_scene_resources(
+            &mut pending,
+            &mut failed,
+            |_| waited += 1,
+            |release| released.push(release),
+        );
+
+        assert_eq!(waited, 2);
+        assert!(pending.is_empty());
+        assert!(failed.is_empty());
+        assert_eq!(
+            released,
+            vec![
+                DeferredSceneRelease::PoolSlot(3),
+                DeferredSceneRelease::FailedSubmit {
+                    bo_idx: 7,
+                    pool_slot: 5,
+                },
+            ]
+        );
+    }
 
     // Stage 5 Phase G — strategy decision unit tests. Verify the
     // pure `derive_cursor_transition` matrix without needing

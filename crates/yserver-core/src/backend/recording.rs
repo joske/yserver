@@ -252,8 +252,8 @@ pub struct RecordingBackend {
     /// Last `warp_pointer_root` call target; `None` if never called.
     /// Tests assert a screen shrink warps a stranded cursor into bounds.
     pub warped_to: Option<(i32, i32)>,
-    /// In-memory per-connector gamma LUT for unit tests (size 256).
-    pub gamma: std::cell::RefCell<std::collections::HashMap<String, GammaTriplet>>,
+    /// In-memory per-RANDR-CRTC gamma LUT for unit tests (size 256).
+    pub gamma: std::cell::RefCell<std::collections::HashMap<u32, GammaTriplet>>,
     /// Active RMLVO `[rules, model, layout, variant, options]` returned by
     /// `current_xkb_rules_names`. `None` (the default) models a backend
     /// without a real keymap; tests that exercise `_XKB_RULES_NAMES`
@@ -871,7 +871,7 @@ impl Backend for RecordingBackend {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    fn crtc_gamma_size(&self, _connector: &str) -> u16 {
+    fn crtc_gamma_size(&self, _crtc: u32) -> u16 {
         256
     }
 
@@ -895,20 +895,19 @@ impl Backend for RecordingBackend {
 
     fn set_crtc_gamma(
         &mut self,
-        connector: &str,
+        crtc: u32,
         red: &[u16],
         green: &[u16],
         blue: &[u16],
     ) -> io::Result<()> {
-        self.gamma.borrow_mut().insert(
-            connector.to_string(),
-            (red.to_vec(), green.to_vec(), blue.to_vec()),
-        );
+        self.gamma
+            .borrow_mut()
+            .insert(crtc, (red.to_vec(), green.to_vec(), blue.to_vec()));
         Ok(())
     }
 
-    fn get_crtc_gamma(&self, connector: &str) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
-        if let Some(lut) = self.gamma.borrow().get(connector) {
+    fn get_crtc_gamma(&self, crtc: u32) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+        if let Some(lut) = self.gamma.borrow().get(&crtc) {
             return lut.clone();
         }
         let ramp = crate::backend::gamma::identity_ramp(256);
@@ -2140,9 +2139,9 @@ mod tests {
     #[test]
     fn recording_backend_gamma_roundtrip_and_seed() {
         let mut backend = RecordingBackend::new();
-        assert_eq!(backend.crtc_gamma_size("DP-1"), 256);
+        assert_eq!(backend.crtc_gamma_size(2), 256);
 
-        let (red, green, blue) = backend.get_crtc_gamma("DP-1");
+        let (red, green, blue) = backend.get_crtc_gamma(2);
         assert_eq!(red.len(), 256);
         assert_eq!(red[0], 0);
         assert_eq!(red[255], 65535);
@@ -2152,8 +2151,8 @@ mod tests {
         let green = vec![2u16; 256];
         let blue = vec![3u16; 256];
         backend
-            .set_crtc_gamma("DP-1", &red, &green, &blue)
+            .set_crtc_gamma(2, &red, &green, &blue)
             .expect("set_crtc_gamma");
-        assert_eq!(backend.get_crtc_gamma("DP-1"), (red, green, blue));
+        assert_eq!(backend.get_crtc_gamma(2), (red, green, blue));
     }
 }

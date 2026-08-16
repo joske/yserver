@@ -201,6 +201,16 @@ impl BoState {
             release_fence,
         }
     }
+
+    /// Reserve a framebuffer installed by a synchronous modeset as the
+    /// current front buffer. Unlike an ordinary nonblocking flip there is no
+    /// PAGE_FLIP_EVENT transition through `Pending`; the commit has already
+    /// latched before returning. Callers must have reset any old fence state
+    /// first (or be reusing the existing OnScreen BO).
+    pub fn mark_on_screen_after_modeset(&mut self) {
+        debug_assert!(matches!(self.phase, BoPhase::Free | BoPhase::OnScreen));
+        self.phase = BoPhase::OnScreen;
+    }
 }
 
 /// Fences released when a bo is force-reset on modeset. Caller closes
@@ -2219,6 +2229,17 @@ mod tests {
     fn fresh_bo_is_free() {
         let bo = BoState::default();
         assert_eq!(bo.phase, BoPhase::Free);
+        assert!(bo.in_fence_fd.is_none());
+        assert!(bo.release_fence_fd.is_none());
+    }
+
+    #[test]
+    fn synchronous_modeset_reserves_its_front_buffer_without_waiting_for_an_event() {
+        let mut bo = BoState::default();
+
+        bo.mark_on_screen_after_modeset();
+
+        assert_eq!(bo.phase, BoPhase::OnScreen);
         assert!(bo.in_fence_fd.is_none());
         assert!(bo.release_fence_fd.is_none());
     }

@@ -53,7 +53,7 @@ use crate::{
         cpu_types::{PictTransform, Rectangle16, Repeat},
         render::{
             engine::{RenderEngine, decode_x11_pixel_for_storage},
-            platform::PlatformBackend,
+            platform::{ConnectorSnapshot, CrtcKey, PlatformBackend},
             scene::SceneCompositor,
             store::{
                 DrawableId, DrawableKind, DrawableStore, ImportedDmabufMetadata,
@@ -425,8 +425,8 @@ pub(crate) struct ConnectorIds {
     pub crtc_id: u32,
 }
 
-/// `(output_key, ids, connected, advertised_modes)` snapshot for a
-/// not-live connector, materialized in `randr_outputs_and_modes` to
+/// `(output_key, ids, connected, advertised_modes)` snapshot for a not-live
+/// connector, materialized in `randr_outputs_and_modes` to
 /// release the `&self` borrow before the `&mut self` `mode_id()` calls.
 type NotLiveConnector = (OutputKey, ConnectorIds, bool, Vec<(u16, u16, u32, bool)>);
 
@@ -566,6 +566,14 @@ impl RandrIdAllocator {
         self.connectors
             .iter()
             .filter(|(_, e)| e.client_configured)
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
+    pub(crate) fn connected_keys(&self) -> HashSet<OutputKey> {
+        self.connectors
+            .iter()
+            .filter(|(_, entry)| entry.connected)
             .map(|(key, _)| key.clone())
             .collect()
     }
@@ -728,7 +736,7 @@ pub struct KmsBackend {
     /// `run_suspend` / DPMS-off (master loss drops queued sequences), and
     /// output removal (`prune_armed_targets_to_live_outputs`). A stuck
     /// entry = a permanent ~0 fps stall on that CRTC.
-    pub(crate) armed_vblank_targets: std::collections::HashMap<::drm::control::crtc::Handle, u64>,
+    pub(crate) armed_vblank_targets: std::collections::HashMap<CrtcKey, u64>,
 
     /// Per-CRTC absolute (per-target) armed MSCs for deferred Present
     /// execution (spec §msc-due future-target rule). Keyed by raw
@@ -743,7 +751,7 @@ pub struct KmsBackend {
     /// the target; `clear_all_armed_vblank_targets` clears this
     /// alongside `armed_vblank_targets` at the same lifecycle edges.
     pub(crate) absolute_vblank_targets:
-        std::collections::HashMap<u32, std::collections::BTreeSet<u64>>,
+        std::collections::HashMap<CrtcKey, std::collections::BTreeSet<u64>>,
 
     /// Latches true the first time `DRM_IOCTL_CRTC_QUEUE_SEQUENCE` returns
     /// EOPNOTSUPP/ENOTTY (pre-4.14 kernels lack the ioctl). Once set we stop
@@ -752,7 +760,7 @@ pub struct KmsBackend {
     /// absolute per-target arm (`arm_present_absolute_vblank`) — the ioctl
     /// is either supported or not, independent of which caller issues it.
     /// Logged once on transition; never resets within a process lifetime.
-    pub(crate) crtc_queue_sequence_unsupported: bool,
+    pub(crate) crtc_queue_sequence_unsupported_devices: HashSet<crate::platform::drm::DrmDeviceKey>,
 
     /// CPU-side clip-mask cache for the current GC clip pixmap
     /// (depth-1 or depth-8). Install keeps identity/origin metadata
@@ -1001,8 +1009,12 @@ pub struct KmsBackend {
     /// Resolve a RANDR output XID back to its owning DRM device and connector.
     /// Connector names are only unique within one DRM device.
     output_key_by_id: std::collections::HashMap<u32, OutputKey>,
+    /// RANDR CRTC XID to the owning device-qualified connector. Gamma
+    /// requests address the CRTC XID, so connector names alone are ambiguous
+    /// once multiple cards can both expose (for example) `DP-1`.
+    crtc_key_by_id: std::collections::HashMap<u32, OutputKey>,
     hotplug_rescan_deadline: Option<std::time::Instant>,
-    gamma_luts: RefCell<HashMap<String, GammaLut>>,
+    gamma_luts: RefCell<HashMap<OutputKey, GammaLut>>,
 
     /// GLX-TFP (Tasks 2.3 + 2.4): per-`DrawableId` export tracking for
     /// pixmaps shared with a GL consumer via `GLX_EXT_texture_from_pixmap`.
@@ -1191,6 +1203,41 @@ fn absolute_seq_user_data(crtc_id: u32) -> u64 {
     ABSOLUTE_SEQ_TAG | u64::from(crtc_id)
 }
 
+/// Compare the effective vertical rates without collapsing fractional timings
+/// to `Mode::vrefresh`'s integer. Kernel mode refresh is pixel clock divided by
+/// horizontal and vertical totals, doubled for interlace and halved for
+/// doublescan. Synthetic/test modes fall back to the advertised integer rate.
+fn effective_refresh_matches(
+    a: &crate::platform::drm::Mode,
+    b: &crate::platform::drm::Mode,
+) -> bool {
+    const DRM_MODE_FLAG_INTERLACE: u32 = 1 << 4;
+    const DRM_MODE_FLAG_DBLSCAN: u32 = 1 << 5;
+
+    fn ratio(mode: &crate::platform::drm::Mode) -> Option<(u128, u128)> {
+        if mode.clock_khz == 0 || mode.htotal == 0 || mode.vtotal == 0 {
+            return None;
+        }
+        let mut numerator = u128::from(mode.clock_khz) * 1_000;
+        let mut denominator = u128::from(mode.htotal) * u128::from(mode.vtotal);
+        if mode.flags & DRM_MODE_FLAG_INTERLACE != 0 {
+            numerator *= 2;
+        }
+        if mode.flags & DRM_MODE_FLAG_DBLSCAN != 0 {
+            denominator *= 2;
+        }
+        if mode.vscan > 1 {
+            denominator *= u128::from(mode.vscan);
+        }
+        Some((numerator, denominator))
+    }
+
+    match (ratio(a), ratio(b)) {
+        (Some((a_num, a_den)), Some((b_num, b_den))) => a_num * b_den == b_num * a_den,
+        _ => a.vrefresh == b.vrefresh,
+    }
+}
+
 fn restore_primary_output_after_rebuild(
     previous: u32,
     was_explicit: bool,
@@ -1311,6 +1358,170 @@ impl KmsBackend {
         log::info!("scanout_m2: stopped after scanout replacement: {reason}");
     }
 
+    /// Restore the current composed scanout after a topology operation had to
+    /// disable every CRTC in order to release a grouped direct framebuffer.
+    /// Failure is fatal: the direct source has already been released and the
+    /// cached DPMS state cannot truthfully claim that scanout remains active.
+    fn relight_after_direct_teardown(
+        &mut self,
+        required: bool,
+        context: &'static str,
+    ) -> io::Result<()> {
+        if !required {
+            return Ok(());
+        }
+        if let Err(error) = self.platform.dpms_set_outputs_active(true) {
+            self.kms_outputs_active = false;
+            log::error!("scanout_m2: {context}: composed re-light failed: {error}; exiting");
+            self.request_exit();
+            return Err(io::Error::new(
+                error.kind(),
+                format!("scanout M2 {context}: composed re-light failed: {error}"),
+            ));
+        }
+        // A full modeset may reset the hardware LUT. Reapply only after every
+        // composed framebuffer has been restored, matching DPMS-on/resume.
+        self.reapply_gamma_for_live_outputs();
+        Ok(())
+    }
+
+    /// Stop grouped direct scanout while the old output/CRTC routing is still
+    /// authoritative. A subsequent topology query is allowed to remove or
+    /// reassign those objects, so releasing the client framebuffer afterward
+    /// would be too late.
+    fn teardown_direct_before_topology_requery(
+        &mut self,
+        context: &'static str,
+    ) -> io::Result<bool> {
+        if !self.scanout_m2.active() {
+            return Ok(false);
+        }
+        let relight = self.kms_outputs_active;
+        self.materialize_direct_shadow_for_unflip()?;
+        if let Err(error) = self.platform.dpms_set_outputs_active(false) {
+            log::error!(
+                "scanout_m2: {context}: could not disable the old grouped direct topology: {error}; exiting"
+            );
+            // Keep direct source pins/framebuffers alive: the helper attempts
+            // every output and failure may mean one CRTC still scans them.
+            self.request_exit();
+            return Err(error);
+        }
+        self.stop_direct_after_scanout_replaced(context);
+        self.scanout_m1.clear(context);
+        // Disabling every CRTC cancels queued sequence events. Retaining an
+        // arm entry would make the next composed frame believe the cancelled
+        // request was still pending forever.
+        self.clear_all_armed_vblank_targets();
+        Ok(relight)
+    }
+
+    /// Quiesce the old active-output set before a connector snapshot removes
+    /// an output or drops its scanout pool.
+    ///
+    /// A physical disconnect does not prove that the KMS plane stopped
+    /// referencing its framebuffer. Keep the old routes and allocations alive
+    /// until every CRTC has been disabled successfully. On failure the caller
+    /// fail-stops without applying the snapshot, which is safer than dropping
+    /// a framebuffer the kernel may still scan out.
+    fn pending_pageflip_crtcs(&self) -> HashSet<CrtcKey> {
+        self.platform
+            .outputs
+            .iter()
+            .enumerate()
+            .filter(|(output_idx, _)| {
+                self.platform
+                    .scanout_pools
+                    .get(*output_idx)
+                    .and_then(Option::as_ref)
+                    .is_some_and(crate::kms::vk::scanout::ScanoutBoPool::has_pending_pageflip)
+                    || self
+                        .scanout_m2
+                        .pending
+                        .as_ref()
+                        .is_some_and(|frame| frame.awaiting_outputs.contains(output_idx))
+                    || self.scanout_m2.unflip_awaiting_outputs.contains(output_idx)
+            })
+            .map(|(_, output)| CrtcKey::for_output(output))
+            .collect()
+    }
+
+    fn quiesce_before_topology_mutation(&mut self, context: &'static str) -> io::Result<()> {
+        let old_pending_pageflips = self.pending_pageflip_crtcs();
+        if self.scanout_m2.active() {
+            if let Err(error) = self.teardown_direct_before_topology_requery(context) {
+                // This also covers failure to materialize the direct source's
+                // COW shadow. Consuming the topology event while retaining an
+                // unquiesced client framebuffer would leave the session in a
+                // permanently stale state, so fail-stop explicitly.
+                self.request_exit();
+                return Err(error);
+            }
+        } else {
+            self.platform.wait_idle_bounded();
+            if let Err(error) = self.platform.dpms_set_outputs_active(false) {
+                log::error!(
+                    "kms: {context}: could not disable the old output topology: {error}; exiting"
+                );
+                self.request_exit();
+                return Err(error);
+            }
+            self.clear_all_armed_vblank_targets();
+        }
+
+        if let Err(error) = self.platform.discard_old_drm_events_after_all_off(
+            &old_pending_pageflips,
+            std::time::Duration::from_secs(1),
+        ) {
+            log::error!(
+                "kms: {context}: old page-flip events could not be retired safely: {error}; exiting"
+            );
+            self.request_exit();
+            return Err(error);
+        }
+
+        // Direct teardown may have submitted the lazy COW copy immediately
+        // before disabling scanout. Wait for that work, then retire scene and
+        // pool state while the old output indices are still authoritative.
+        self.platform.wait_idle_bounded();
+        self.scene.drain_all(&mut self.platform);
+        self.platform.reset_scanout_bos_for_suspend();
+        self.scanout_m1.clear(context);
+        Ok(())
+    }
+
+    fn recover_failed_crtc_config(
+        &mut self,
+        restore_old_topology: bool,
+        original: io::Error,
+    ) -> io::Error {
+        let scene_recovery_failed = if let Err(scene_error) =
+            self.scene.rebuild_outputs(&self.platform)
+        {
+            log::error!(
+                "apply_crtc_config: scene recovery after failure also failed: {scene_error:?}; exiting"
+            );
+            self.kms_outputs_active = false;
+            self.request_exit();
+            true
+        } else {
+            false
+        };
+        match self.relight_after_direct_teardown(
+            restore_old_topology,
+            "RANDR CRTC configuration recovery",
+        ) {
+            Ok(()) => {
+                if !scene_recovery_failed {
+                    self.kms_outputs_active =
+                        restore_old_topology && !self.platform.outputs.is_empty();
+                }
+                original
+            }
+            Err(relight_error) => relight_error,
+        }
+    }
+
     /// M2b lazy fallback: steady direct Presents skip their source-to-COW
     /// Copy. Before a non-Present-triggered unflip, materialize the currently
     /// scanned root source into its redirected COW backing exactly once.
@@ -1392,6 +1603,11 @@ impl KmsBackend {
     /// the complete set together avoids both that intermediate state and the
     /// visible blackout of a disable/re-enable cycle.
     fn submit_composed_unflip(&mut self) -> io::Result<()> {
+        if !self.direct_scanout_topology_eligible() {
+            return Err(io::Error::other(
+                "scanout M2: grouped unflip requires one DRM device and homogeneous refresh",
+            ));
+        }
         self.materialize_direct_shadow_for_unflip()?;
         let planes: Vec<crate::drm::modeset::ComposedScanoutPlaneState<'_>> = self
             .platform
@@ -1470,6 +1686,30 @@ impl KmsBackend {
         true
     }
 
+    /// Whether the current whole-root Present may use upstream's grouped
+    /// all-output direct transaction.
+    ///
+    /// One atomic request cannot cross DRM devices. Even on one card, grouping
+    /// heterogeneous-refresh CRTCs makes replacement retirement wait for the
+    /// slowest CRTC; keep those layouts on the normal per-output composed path
+    /// so each output retains its native cadence. A future direct path can
+    /// relax this only with per-output authoritative sources and lifetimes.
+    fn direct_scanout_topology_eligible(&self) -> bool {
+        let Some(primary) = self.platform.primary_device() else {
+            return false;
+        };
+        let Some(first) = self.platform.outputs.first() else {
+            return false;
+        };
+        if first.key.device_key != primary.key {
+            return false;
+        }
+        self.platform.outputs.iter().all(|layout| {
+            layout.key.device_key == primary.key
+                && effective_refresh_matches(&first.output.picked, &layout.output.picked)
+        })
+    }
+
     fn scanout_m1_topology_signature(&self) -> u64 {
         use std::hash::{Hash, Hasher};
 
@@ -1477,12 +1717,18 @@ impl KmsBackend {
         self.platform.fb_w.hash(&mut hasher);
         self.platform.fb_h.hash(&mut hasher);
         for layout in &self.platform.outputs {
+            layout.key.device_key.hash(&mut hasher);
             layout.x.hash(&mut hasher);
             layout.y.hash(&mut hasher);
             layout.width.hash(&mut hasher);
             layout.height.hash(&mut hasher);
             u32::from(layout.output.crtc).hash(&mut hasher);
             u32::from(layout.output.plane).hash(&mut hasher);
+            layout.output.picked.clock_khz.hash(&mut hasher);
+            layout.output.picked.htotal.hash(&mut hasher);
+            layout.output.picked.vtotal.hash(&mut hasher);
+            layout.output.picked.vscan.hash(&mut hasher);
+            layout.output.picked.flags.hash(&mut hasher);
         }
         hasher.finish()
     }
@@ -1496,6 +1742,7 @@ impl KmsBackend {
     ) {
         if !self.scanout_allowed()
             || !self.kms_outputs_active
+            || !self.direct_scanout_topology_eligible()
             || !matches!(
                 self.scene.cursor_mode(),
                 crate::kms::render::scene::CursorPlaneMode::Hw
@@ -2413,7 +2660,7 @@ impl KmsBackend {
             scanout_m2: ScanoutM2State::new(),
             armed_vblank_targets: std::collections::HashMap::new(),
             absolute_vblank_targets: std::collections::HashMap::new(),
-            crtc_queue_sequence_unsupported: false,
+            crtc_queue_sequence_unsupported_devices: HashSet::new(),
             clip_mask_cache: None,
             depth1_mask_cache: crate::kms::backend::Depth1MaskCache::new(256),
             clip_mask_snapshot: None,
@@ -2457,11 +2704,13 @@ impl KmsBackend {
             randr_id_alloc: RandrIdAllocator::default(),
             output_identity_by_id: std::collections::HashMap::new(),
             output_key_by_id: std::collections::HashMap::new(),
+            crtc_key_by_id: std::collections::HashMap::new(),
             hotplug_rescan_deadline: None,
             gamma_luts: RefCell::new(HashMap::new()),
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported,
         };
+        b.seed_initial_connector_topology()?;
         b.init_root_storage();
         // Stage 3f.8: bake the default-arrow software cursor.
         // Best-effort — a failure logs + leaves the cursor invisible
@@ -3297,7 +3546,7 @@ impl KmsBackend {
     /// storage. Used by `for_tests_with_vk` so root allocation
     /// happens after the Vk context is attached.
     fn for_tests_seed() -> Self {
-        Self {
+        let mut backend = Self {
             core: KmsCore::for_tests(),
             platform: PlatformBackend::for_tests(),
             logged_gaps: RefCell::new(HashSet::new()),
@@ -3315,7 +3564,7 @@ impl KmsBackend {
             scanout_m2: ScanoutM2State::new(),
             armed_vblank_targets: std::collections::HashMap::new(),
             absolute_vblank_targets: std::collections::HashMap::new(),
-            crtc_queue_sequence_unsupported: false,
+            crtc_queue_sequence_unsupported_devices: HashSet::new(),
             clip_mask_cache: None,
             depth1_mask_cache: crate::kms::backend::Depth1MaskCache::new(256),
             clip_mask_snapshot: None,
@@ -3358,11 +3607,42 @@ impl KmsBackend {
             randr_id_alloc: RandrIdAllocator::default(),
             output_identity_by_id: std::collections::HashMap::new(),
             output_key_by_id: std::collections::HashMap::new(),
+            crtc_key_by_id: std::collections::HashMap::new(),
             hotplug_rescan_deadline: None,
             gamma_luts: RefCell::new(HashMap::new()),
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported: false,
+        };
+        let live: Vec<_> = backend
+            .platform
+            .outputs
+            .iter()
+            .map(|layout| {
+                (
+                    layout.key.clone(),
+                    ConnectorConfig::Enabled {
+                        mode_w: layout.width,
+                        mode_h: layout.height,
+                        vrefresh: layout.output.picked.vrefresh,
+                        x: layout.x,
+                        y: layout.y,
+                    },
+                    layout
+                        .output
+                        .modes
+                        .iter()
+                        .map(|mode| (mode.width, mode.height, mode.vrefresh, mode.preferred))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        for (key, config, modes) in live {
+            let entry = backend.randr_id_alloc.entry_mut(&key);
+            entry.connected = true;
+            entry.config = config;
+            entry.modes = modes;
         }
+        backend
     }
 
     fn init_root_storage(&mut self) {
@@ -4295,6 +4575,95 @@ impl KmsBackend {
         crate::kms::backend::primary_output_center(&self.platform.outputs, fw, fh)
     }
 
+    /// Seed the stable RANDR connector registry from every opened DRM card.
+    /// Startup scanout remains limited to the outputs activated during
+    /// platform bring-up; connected secondary-card connectors are registered
+    /// as available but off until a RANDR client enables them.
+    fn seed_initial_connector_topology(&mut self) -> io::Result<()> {
+        for device in &self.platform.devices {
+            let _ = self.randr_id_alloc.provider_id_for(device.key);
+        }
+
+        // Preserve historical XID allocation order: active startup outputs
+        // receive output/CRTC IDs before inactive secondary connectors.
+        let live_keys: Vec<_> = self
+            .platform
+            .outputs
+            .iter()
+            .map(|layout| layout.key.clone())
+            .collect();
+        for key in &live_keys {
+            let _ = self.randr_id_alloc.ids_for(key);
+        }
+
+        // The lightweight probe avoids plane/property/modifier discovery for
+        // connectors that are only being entered in the RANDR registry. The
+        // platform gathers every card first, so an error is returned before
+        // this state is partially reconciled.
+        let probes = self.platform.probe_all_connectors()?;
+        for (device_key, connectors) in probes {
+            let _ = reconcile_connector_probe(&mut self.randr_id_alloc, device_key, &connectors);
+        }
+
+        let live_configs: Vec<_> = self
+            .platform
+            .outputs
+            .iter()
+            .map(|layout| {
+                (
+                    layout.key.clone(),
+                    ConnectorConfig::Enabled {
+                        mode_w: layout.width,
+                        mode_h: layout.height,
+                        vrefresh: layout.output.picked.vrefresh,
+                        x: layout.x,
+                        y: layout.y,
+                    },
+                )
+            })
+            .collect();
+        for (key, config) in live_configs {
+            let entry = self.randr_id_alloc.entry_mut(&key);
+            entry.connected = true;
+            entry.config = config;
+        }
+        Ok(())
+    }
+
+    /// Reconcile a complete connected-output snapshot from full KMS
+    /// discovery. Returns whether connection state or advertised modes
+    /// changed, so callers can avoid spurious RANDR timestamp bumps.
+    fn reconcile_connector_registry(
+        &mut self,
+        connected: &[ConnectorSnapshot],
+        dropped: &[OutputKey],
+    ) -> bool {
+        let mut changed = false;
+        for key in dropped {
+            let entry = self.randr_id_alloc.entry_mut(key);
+            if entry.connected || entry.config != ConnectorConfig::Off || entry.client_configured {
+                changed = true;
+            }
+            entry.connected = false;
+            entry.config = ConnectorConfig::Off;
+            entry.client_configured = false;
+        }
+        for snapshot in connected {
+            let modes: Vec<(u16, u16, u32, bool)> = snapshot
+                .modes
+                .iter()
+                .map(|mode| (mode.width, mode.height, mode.vrefresh, mode.preferred))
+                .collect();
+            let entry = self.randr_id_alloc.entry_mut(&snapshot.key);
+            if !entry.connected || entry.modes != modes {
+                changed = true;
+            }
+            entry.connected = true;
+            entry.modes = modes;
+        }
+        changed
+    }
+
     /// RandR output list — mirrors `KmsBackend::randr_outputs`.
     #[must_use]
     pub fn randr_outputs(&mut self) -> Vec<yserver_core::randr::RandrOutput> {
@@ -4343,9 +4712,16 @@ impl KmsBackend {
         // projection so the output-property handlers serve current data.
         self.output_identity_by_id.clear();
         self.output_key_by_id.clear();
+        self.crtc_key_by_id.clear();
         for layout in &self.platform.outputs {
             let vrefresh = layout.output.picked.vrefresh;
             let ids = self.randr_id_alloc.ids_for(&layout.key);
+            self.output_key_by_id
+                .insert(ids.output_id, layout.key.clone());
+            self.crtc_key_by_id.insert(ids.crtc_id, layout.key.clone());
+            let mode_id = self
+                .randr_id_alloc
+                .mode_id(layout.width, layout.height, vrefresh);
             self.output_identity_by_id.insert(
                 ids.output_id,
                 (
@@ -4353,17 +4729,12 @@ impl KmsBackend {
                     layout.output.connector_type.clone(),
                 ),
             );
-            self.output_key_by_id
-                .insert(ids.output_id, layout.key.clone());
-            let mode_id = self
-                .randr_id_alloc
-                .mode_id(layout.width, layout.height, vrefresh);
-            // Full advertised list, preferred-first (Output.modes is
-            // already sorted preferred-first by discover_outputs).
             let mut mode_ids = Vec::with_capacity(layout.output.modes.len());
             let mut num_preferred: u16 = 0;
-            for m in &layout.output.modes {
-                let mode_id = self.randr_id_alloc.mode_id(m.width, m.height, m.vrefresh);
+            for mode in &layout.output.modes {
+                let mode_id = self
+                    .randr_id_alloc
+                    .mode_id(mode.width, mode.height, mode.vrefresh);
                 // A connector can advertise the same (w,h,vrefresh) more
                 // than once (HDMI EDID+CEA+DMT); those collapse to one XID
                 // and must appear once in GetOutputInfo (issue #48).
@@ -4371,15 +4742,24 @@ impl KmsBackend {
                     continue;
                 }
                 mode_ids.push(mode_id);
-                if m.preferred {
+                if mode.preferred {
                     num_preferred = num_preferred.saturating_add(1);
                 }
             }
-            self.randr_id_alloc.entry_mut(&layout.key).modes = layout
+            let entry = self.randr_id_alloc.entry_mut(&layout.key);
+            entry.connected = true;
+            entry.config = ConnectorConfig::Enabled {
+                mode_w: layout.width,
+                mode_h: layout.height,
+                vrefresh,
+                x: layout.x,
+                y: layout.y,
+            };
+            entry.modes = layout
                 .output
                 .modes
                 .iter()
-                .map(|m| (m.width, m.height, m.vrefresh, m.preferred))
+                .map(|mode| (mode.width, mode.height, mode.vrefresh, mode.preferred))
                 .collect();
             outs.push(RandrOutput {
                 name: layout.output.connector_name.clone(),
@@ -4458,6 +4838,7 @@ impl KmsBackend {
                 }
             }
             self.output_key_by_id.insert(ids.output_id, key.clone());
+            self.crtc_key_by_id.insert(ids.crtc_id, key.clone());
             outs.push(RandrOutput {
                 name: key.connector_name,
                 output_id: ids.output_id,
@@ -7033,16 +7414,16 @@ impl KmsBackend {
     /// retain dead entries — they would mis-dedup a CRTC id reused by a
     /// later hotplug.)
     pub(crate) fn prune_armed_targets_to_live_outputs(&mut self) {
-        let live: std::collections::HashSet<::drm::control::crtc::Handle> = self
+        let live: std::collections::HashSet<CrtcKey> = self
             .platform
             .outputs
             .iter()
-            .map(|o| o.output.crtc)
+            .map(CrtcKey::for_output)
             .collect();
-        self.armed_vblank_targets.retain(|h, _| live.contains(h));
-        let live_ids: std::collections::HashSet<u32> = live.iter().map(|&h| u32::from(h)).collect();
+        self.armed_vblank_targets
+            .retain(|key, _| live.contains(key));
         self.absolute_vblank_targets
-            .retain(|id, _| live_ids.contains(id));
+            .retain(|key, _| live.contains(key));
     }
 
     /// Side-effect-free `DRM_CRTC_SEQUENCE` event handler.
@@ -7083,28 +7464,28 @@ impl KmsBackend {
         let crtc_id_raw = user_data as u32;
         // (1) Clear-arm by kind, BEFORE any validity check.
         let crtc_handle = ::drm::control::from_u32(crtc_id_raw);
+        let crtc_key = crtc_handle.map(|crtc| CrtcKey::new(device_key, crtc));
         if tagged {
-            if let Some(targets) = self.absolute_vblank_targets.get_mut(&crtc_id_raw) {
+            if let Some(key) = crtc_key
+                && let Some(targets) = self.absolute_vblank_targets.get_mut(&key)
+            {
                 targets.retain(|&target| {
                     yserver_core::present_scheduler::msc_is_after(target, sequence)
                 });
                 if targets.is_empty() {
-                    self.absolute_vblank_targets.remove(&crtc_id_raw);
+                    self.absolute_vblank_targets.remove(&key);
                 }
             }
-        } else if let Some(h) = crtc_handle {
-            self.armed_vblank_targets.remove(&h);
+        } else if let Some(key) = crtc_key {
+            self.armed_vblank_targets.remove(&key);
         }
         let Some(handle) = crtc_handle else {
             log::warn!("PRESENT-DBG: CrtcSequence bogus crtc_id={crtc_id_raw} — dropped");
             return;
         };
         // (2) Stale CRTC → drop (arm already cleared above).
-        let Some(output_idx) =
-            self.platform.outputs.iter().position(|output| {
-                output.key.device_key == device_key && output.output.crtc == handle
-            })
-        else {
+        let crtc_key = CrtcKey::new(device_key, handle);
+        let Some(output_idx) = self.platform.output_index_for_crtc(crtc_key) else {
             log::warn!(
                 "PRESENT-DBG: CrtcSequence for unknown crtc_id={crtc_id_raw} \
                  on device {device_key} (output removed?) — dropped"
@@ -7128,10 +7509,10 @@ impl KmsBackend {
         // avoid.
         let ust = ns / 1000;
         let completion_eligible = tagged || self.present_completion_is_idle();
-        self.platform.record_vblank_clock(output_idx, sequence, ust);
+        self.platform.record_vblank_clock(crtc_key, sequence, ust);
         if completion_eligible {
             self.platform.record_completion_clock(
-                output_idx,
+                crtc_key,
                 yserver_core::backend::PresentClockSample {
                     msc: sequence,
                     ust,
@@ -7147,18 +7528,17 @@ impl KmsBackend {
     }
 
     /// Testable seam for `arm_idle_vblanks`: `armer` performs the actual
-    /// ioctl (or a stub in tests). Arms a single one-shot vblank on the
-    /// **primary output** (index 0) — this spike has no per-window CRTC
-    /// routing, so all parked `NotifyMSC` waiters pace off the primary
-    /// pipe's clock. One in-flight sequence per CRTC: if already armed, the
-    /// parked notifies fire when it retires and the next iteration re-arms.
+    /// ioctl (or a stub in tests). Arms a single one-shot vblank on every
+    /// eligible output. This preserves upstream's global-clock wake behavior
+    /// until the following per-Present CRTC-domain commit. One in-flight
+    /// sequence per device-qualified CRTC is deduplicated independently.
     pub(crate) fn arm_idle_vblanks_with<F>(
         &mut self,
         target_mscs: &[u64],
         mut armer: F,
     ) -> std::io::Result<usize>
     where
-        F: FnMut(u32 /*crtc_id*/) -> std::io::Result<()>,
+        F: FnMut(CrtcKey) -> std::io::Result<bool>,
     {
         if target_mscs.is_empty() {
             return Ok(0);
@@ -7169,27 +7549,43 @@ impl KmsBackend {
             self.clear_all_armed_vblank_targets();
             return Ok(0);
         }
-        // Arm EVERY output (not just the primary): a full-screen compositor on
-        // a secondary output flips only that CRTC, so arming output 0 alone
-        // would leave its clock — and frame loop — stalled. Each output dedups
-        // against armed_vblank_targets independently.
-        let handles: Vec<_> = self
+        let crtc_keys: Vec<CrtcKey> = self
             .platform
             .outputs
             .iter()
-            .map(|o| o.output.crtc)
+            .map(CrtcKey::for_output)
+            .filter(|key| {
+                !self
+                    .crtc_queue_sequence_unsupported_devices
+                    .contains(&key.device_key)
+            })
             .collect();
         let mut armed = 0;
-        for handle in handles {
-            if self.armed_vblank_targets.contains_key(&handle) {
+        let mut first_error = None;
+        for crtc_key in crtc_keys {
+            if self.armed_vblank_targets.contains_key(&crtc_key) {
                 continue;
             }
-            let crtc_id = u32::from(handle);
-            armer(crtc_id)?;
-            self.armed_vblank_targets.insert(handle, 0);
-            armed += 1;
+            match armer(crtc_key) {
+                Ok(true) => {
+                    self.armed_vblank_targets.insert(crtc_key, 0);
+                    armed += 1;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    // DRM devices have independent vblank domains. A
+                    // transient failure on one card must not prevent a later
+                    // card from receiving its own wake arm.
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
         }
-        Ok(armed)
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(armed),
+        }
     }
 
     /// Testable seam for the absolute per-target vblank arm (spec
@@ -7201,14 +7597,9 @@ impl KmsBackend {
     /// `CRTC_QUEUE_SEQUENCE`s per CRTC are legal, and a target already in
     /// the set is skipped (dedup) rather than re-armed.
     ///
-    /// Arms only the CRTC currently backing the max general clock
-    /// (`present_max_clock_output_idx`), NOT every output like
-    /// `arm_idle_vblanks_with`: the target MSC lives in that CRTC's
-    /// counter space, and queuing it on a lagging CRTC too (mixed-refresh
-    /// dual-head) could leave the event pending for hours — leaking a
-    /// set entry and a queued kernel event for the whole wait. Falls
-    /// back to the primary output (index 0) before the first pageflip
-    /// retires (no clock sample yet).
+    /// Arms only the device-qualified CRTC that contributed the current
+    /// global maximum sample, matching `present_get_ust_msc`. The next
+    /// adaptation commit removes this cross-domain reduction entirely.
     ///
     /// Returns the count of targets now **covered** by an in-flight arm
     /// — newly issued OR already armed — not just newly issued ioctls
@@ -7222,7 +7613,7 @@ impl KmsBackend {
         mut armer: F,
     ) -> std::io::Result<usize>
     where
-        F: FnMut(u32 /*crtc_id*/, u64 /*target*/) -> std::io::Result<()>,
+        F: FnMut(CrtcKey, u64 /*target*/) -> std::io::Result<bool>,
     {
         if targets.is_empty() {
             return Ok(0);
@@ -7233,69 +7624,81 @@ impl KmsBackend {
             self.clear_all_armed_vblank_targets();
             return Ok(0);
         }
-        let output_idx = self.platform.present_max_clock_output_idx().unwrap_or(0);
-        let Some(handle) = self.platform.outputs.get(output_idx).map(|o| o.output.crtc) else {
+        let Some(crtc_key) = self
+            .platform
+            .present_max_clock_crtc()
+            .or_else(|| self.platform.outputs.first().map(CrtcKey::for_output))
+        else {
             return Ok(0);
         };
-        let crtc_id = u32::from(handle);
+        if self
+            .crtc_queue_sequence_unsupported_devices
+            .contains(&crtc_key.device_key)
+        {
+            return Ok(0);
+        }
         let mut covered = 0;
         for &target in targets {
             let already_armed = self
                 .absolute_vblank_targets
-                .get(&crtc_id)
+                .get(&crtc_key)
                 .is_some_and(|set| set.contains(&target));
             if already_armed {
                 covered += 1;
                 continue;
             }
-            armer(crtc_id, target)?;
-            self.absolute_vblank_targets
-                .entry(crtc_id)
-                .or_default()
-                .insert(target);
-            covered += 1;
+            if armer(crtc_key, target)? {
+                self.absolute_vblank_targets
+                    .entry(crtc_key)
+                    .or_default()
+                    .insert(target);
+                covered += 1;
+            }
         }
         Ok(covered)
     }
 
     fn arm_idle_vblanks_ioctl(&mut self, target_mscs: &[u64]) -> std::io::Result<usize> {
-        // Pre-4.14 kernels lack DRM_IOCTL_CRTC_QUEUE_SEQUENCE; once latched,
-        // stay flip-driven for the rest of this DRM master grab.
-        if self.crtc_queue_sequence_unsupported {
-            return Ok(0);
-        }
-        let Some(primary) = self.platform.primary_device() else {
-            return Ok(0);
-        };
-        let device = Rc::clone(&primary.device);
-        let mut newly_unsupported = false;
-        let result = self.arm_idle_vblanks_with(target_mscs, |crtc_id| {
+        let devices: HashMap<_, _> = self
+            .platform
+            .devices
+            .iter()
+            .map(|device| (device.key, Rc::clone(&device.device)))
+            .collect();
+        let mut newly_unsupported = HashSet::new();
+        let result = self.arm_idle_vblanks_with(target_mscs, |crtc_key| {
+            let Some(device) = devices.get(&crtc_key.device_key) else {
+                return Err(io::Error::other(format!(
+                    "no DRM device {} for idle vblank arm",
+                    crtc_key.device_key
+                )));
+            };
+            let crtc_id = u32::from(crtc_key.crtc);
             match crate::drm::page_flip::queue_crtc_sequence(
-                &device,
+                device,
                 crtc_id,
                 /* relative */ true,
                 /* sequence */ 1,
                 /* user_data */ u64::from(crtc_id),
             ) {
-                Ok(_) => Ok(()),
+                Ok(_) => Ok(true),
                 Err(e)
                     if e.raw_os_error() == Some(libc::EOPNOTSUPP)
                         || e.raw_os_error() == Some(libc::ENOTTY) =>
                 {
-                    newly_unsupported = true;
-                    Err(e)
+                    newly_unsupported.insert(crtc_key.device_key);
+                    Ok(false)
                 }
                 Err(e) => Err(e),
             }
         });
-        if newly_unsupported {
+        for device_key in newly_unsupported {
             log::warn!(
-                "DRM_IOCTL_CRTC_QUEUE_SEQUENCE returned EOPNOTSUPP — disabling \
-                 idle vblank arming (flip-driven MSC only) for the rest of this \
-                 DRM master grab"
+                "DRM_IOCTL_CRTC_QUEUE_SEQUENCE returned EOPNOTSUPP on {device_key} — disabling \
+                 vblank arming on that DRM device (flip-driven MSC only)"
             );
-            self.crtc_queue_sequence_unsupported = true;
-            return Ok(0);
+            self.crtc_queue_sequence_unsupported_devices
+                .insert(device_key);
         }
         result
     }
@@ -7334,44 +7737,44 @@ impl KmsBackend {
         state.dpms.power_level = 0;
         state.dpms.last_activity = std::time::Instant::now();
 
-        if self.scanout_m2.active()
-            && let Err(error) = self.materialize_direct_shadow_for_unflip()
-        {
-            log::warn!("scanout_m2: VT-suspend lazy fallback Copy failed: {error}");
-        }
+        let direct_shadow_error = if self.scanout_m2.active() {
+            self.materialize_direct_shadow_for_unflip().err()
+        } else {
+            None
+        };
+
+        let old_pending_pageflips = self.pending_pageflip_crtcs();
 
         // 4. Wait for in-flight GPU work, bounded.
         self.platform.wait_idle_bounded();
 
-        // 4b. Drain the scene's in-flight page-flip acks BEFORE master is
-        //     revoked (step 6). A pageflip submitted before the VT switch
-        //     will NEVER get its page-flip-complete event once we lose
-        //     master, so its per-output `pending_acks` entry would be
-        //     stranded forever — and `tick_one_output`'s first gate
-        //     (`if !pending_acks.is_empty()`) then bails every tick, leaving
-        //     that output frozen on its last frame after resume (observed:
-        //     "VT switch → 1 output frozen, switch again → both", diagnostic
-        //     `tick skip output=N reason=PendingAcks` accumulating forever).
-        //     `drain_all` clears pending_acks, releases pool slots, and
-        //     resets per-output cursor state; the GPU is already idle (step
-        //     4) so its compose-fence waits return immediately, and master
-        //     is still held so its cursor-plane-hide ioctl is valid. Resume
-        //     re-modesets + rearms the cursor + issues a full-damage repaint,
-        //     which submits a fresh flip that re-arms the completion cycle.
-        self.scene.drain_all(&mut self.platform);
-
-        // A direct client FB is not owned by the normal scanout pool. Stop
-        // every CRTC while DRM master is still held before releasing its
-        // client pin or framebuffer registration. The resume path performs
-        // a fresh modeset and full-damage repaint.
-        if self.scanout_m2.active() {
-            match self.platform.dpms_set_outputs_active(false) {
-                Ok(()) => self.stop_direct_after_scanout_replaced("VT suspend"),
-                Err(error) => log::warn!(
-                    "scanout_m2: could not disable direct scanout before VT loss: {error}"
-                ),
-            }
+        // 4b. Take the complete old CRTC set off-screen before discarding any
+        //     scene acknowledgement or BO phase. Otherwise a surviving CRTC
+        //     can still reference a buffer userspace has just made reusable.
+        if let Err(error) = self.platform.dpms_set_outputs_active(false) {
+            log::error!(
+                "kms: VT suspend could not disable the complete old topology: {error}; exiting"
+            );
+            self.request_exit();
+            self.clear_all_armed_vblank_targets();
+            return;
         }
+        self.clear_all_armed_vblank_targets();
+        if let Err(error) = self.platform.discard_old_drm_events_after_all_off(
+            &old_pending_pageflips,
+            std::time::Duration::from_secs(1),
+        ) {
+            log::error!("kms: VT suspend could not drain old DRM events: {error}; exiting");
+            self.request_exit();
+            return;
+        }
+        if self.scanout_m2.active() {
+            self.stop_direct_after_scanout_replaced("VT suspend");
+        }
+
+        // The old framebuffer references and events are gone. It is now safe
+        // to discard the scene's ack ledger and reset every pool phase.
+        self.scene.drain_all(&mut self.platform);
 
         // 4c. Reset the PLATFORM scanout-BO state too. `drain_all` (4b)
         //     clears the SCENE's pending_acks, but the platform pool still
@@ -7391,14 +7794,14 @@ impl KmsBackend {
             self.scanout_m1.clear("VT suspend");
         }
 
-        // 4d. Clear the per-CRTC armed-vblank-target map. The kernel drops
-        //     all queued `DRM_CRTC_SEQUENCE` events when DRM master is
-        //     revoked (step 6). A surviving entry would permanently block
-        //     the next re-arm on resume (the dedup gate would see the stale
-        //     arm and skip) → permanent ~0 fps stall. Clear unconditionally
-        //     here (GPU idle, scene drained) so resume re-arms on the first
-        //     idle tick.
-        self.clear_all_armed_vblank_targets();
+        if let Some(error) = direct_shadow_error {
+            // VT release itself must finish so the kernel can switch away,
+            // but the only authoritative direct source is now gone. Never
+            // resume stale composed content after this safe all-off cleanup.
+            log::error!("scanout_m2: VT-suspend lazy fallback Copy failed: {error}; exiting");
+            self.kms_outputs_active = false;
+            self.request_exit();
+        }
 
         // Input is paused by `on_vt_release` before this runs; there is no
         // on-core libinput context to suspend here.
@@ -7418,53 +7821,81 @@ impl KmsBackend {
     /// 4. Full-damage repaint is deferred to after `resume_complete`
     ///    commits `Active` (gate must be open first) — handled in
     ///    `drive_vt_event`.
-    fn run_resume(&mut self, state: &mut ServerState) {
+    fn run_resume(&mut self, state: &mut ServerState) -> bool {
         log::info!(
             "kms: run_resume enter — cursor=({:.0},{:.0}) effective_cursor_xid={:?}",
             self.core.cursor_x,
             self.core.cursor_y,
             self.effective_cursor_xid,
         );
-        // 2. Re-query connectors + redo modeset on existing device.
-        log::info!("kms: run_resume step 2 — requery_outputs_and_modeset");
-        let configured = self.randr_id_alloc.client_configured_keys();
-        match self.platform.requery_outputs_and_modeset(&configured) {
-            Ok(rescan) => {
-                if rescan.added_count != 0 || !rescan.dropped_keys.is_empty() {
-                    self.fire_randr_changes(state, rescan);
-                }
-                // Drop armed-target entries for CRTCs retired while suspended
-                // (disconnected connectors). The kernel already dropped their
-                // queued sequences; a stale entry would block re-arm on that
-                // handle or mis-dedup a reused CRTC id from a later hotplug.
-                self.prune_armed_targets_to_live_outputs();
-            }
-            Err(e) => {
-                log::error!("kms: resume: modeset failed (card gone?): {e}; exiting");
+        // 2. Gather every device's connector state before mutating live
+        // outputs. A failed probe is fatal on resume: applying only a prefix
+        // would create a fabricated combined topology.
+        log::info!("kms: run_resume step 2 — probe connector snapshot");
+        let snapshot = match self.platform.probe_connector_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                log::error!("kms: resume: connector probe failed: {error}; exiting");
                 self.request_exit();
-                return;
+                return false;
             }
+        };
+        let active_removed = self.platform.outputs.iter().any(|output| {
+            !snapshot
+                .iter()
+                .any(|entry| entry.preserves_active_output(output))
+        });
+
+        // A retained direct framebuffer must be released against the old
+        // routes even when the connector set is unchanged. Any active removal
+        // likewise requires all old CRTCs to be disabled before pools drop.
+        let topology_quiesced = self.scanout_m2.active() || active_removed;
+        if topology_quiesced
+            && let Err(error) = self.quiesce_before_topology_mutation("VT resume topology apply")
+        {
+            log::error!("kms: resume: old topology could not be quiesced: {error}");
+            return false;
         }
 
-        // 2a. Re-light every live output. `requery_outputs_and_modeset`
-        //     only re-commits modeset on NEWLY-added connectors (so the
-        //     hotplug path doesn't flicker already-lit survivors); on a
-        //     VT/seat resume the kernel dropped the mode when another VT
-        //     took DRM master, so the surviving CRTCs are dark until we
-        //     re-commit. The steady-state flip path (`submit_flip`) only
+        let configured = self.randr_id_alloc.client_configured_keys();
+        let known_connected = self.randr_id_alloc.connected_keys();
+        let rescan =
+            self.platform
+                .apply_connector_snapshot(snapshot, &configured, &known_connected);
+        let registry_changed =
+            self.reconcile_connector_registry(&rescan.connected, &rescan.dropped_keys);
+        let active_topology_changed = !rescan.dropped_old_indices.is_empty();
+        if (registry_changed || active_topology_changed)
+            && !self.fire_randr_changes(state, rescan, active_topology_changed, false)
+        {
+            return false;
+        }
+
+        // Drop armed-target entries for CRTCs retired while suspended. A
+        // successful all-off quiesce cleared every arm already; prune remains
+        // useful for metadata-only/no-direct transitions.
+        self.prune_armed_targets_to_live_outputs();
+
+        // 2a. Re-light every live output. The connector snapshot is read-only
+        //     for surviving routes; on a VT/seat resume the kernel may have
+        //     dropped the mode while another VT held DRM master, so the CRTCs
+        //     are dark until we re-commit. The steady-state flip path only
         //     sets FB_ID — it can't re-establish the mode. Drive the same
         //     re-light the DPMS-on path uses; it's a no-op-cost full
         //     modeset on outputs that are already active.
-        //     `dpms_set_outputs_active` attempts every output and returns
-        //     the FIRST per-output failure after trying the rest, so a
-        //     single connector that won't re-light must NOT tear down the
-        //     session when the others came back. Card-gone is already
-        //     caught above by the requery step (`discover_outputs` fails →
-        //     we exit there), so a failure here is per-output: log it and
-        //     let the next composite retry, matching how the DPMS-on path
-        //     (`set_dpms_power`) handles the same call.
+        //     `dpms_set_outputs_active` attempts every output and returns the
+        //     first failure after trying the rest. Any failure is fatal here:
+        //     a normal FB-only flip cannot reconstruct MODE_ID/ACTIVE for a
+        //     CRTC whose full resume modeset failed.
         if let Err(e) = self.platform.dpms_set_outputs_active(true) {
-            log::warn!("kms: resume: re-light modeset failed for an output: {e}; continuing");
+            // A normal FB-only flip cannot reconstruct MODE_ID/ACTIVE after a
+            // failed VT-resume modeset. Claiming Active would strand the dark
+            // CRTC permanently, so fail-stop even when the connector snapshot
+            // itself was unchanged.
+            log::error!("kms: resume: composed re-light failed: {e}; exiting");
+            self.request_exit();
+            self.kms_outputs_active = false;
+            return false;
         }
         self.reapply_gamma_for_live_outputs();
 
@@ -7494,6 +7925,7 @@ impl KmsBackend {
         // 4. Full-damage repaint deferred to `drive_vt_event` after
         //    `resume_complete` commits `Active` and opens the scanout gate.
         log::info!("kms: run_resume exit");
+        true
     }
 
     /// Request process shutdown through the core-channel sender
@@ -7513,7 +7945,11 @@ impl KmsBackend {
         &mut self,
         state: &mut ServerState,
         rescan: crate::kms::render::platform::RescanResult,
-    ) {
+        rebuild_scene: bool,
+        relight_after_quiesce: bool,
+    ) -> bool {
+        let physically_connected: HashSet<&OutputKey> =
+            rescan.connected.iter().map(|entry| &entry.key).collect();
         for key in &rescan.added_keys {
             log::info!(
                 "kms: RandR output connected: {} on {}",
@@ -7522,70 +7958,41 @@ impl KmsBackend {
             );
         }
         for key in &rescan.dropped_keys {
-            log::info!(
-                "kms: RandR output disconnected: {} on {}",
-                key.connector_name,
-                key.device_key
-            );
-        }
-
-        // `requery_outputs_and_modeset` has established the new output set,
-        // but an unchanged CRTC may still be reading the old direct client
-        // FB. Disable every surviving CRTC before dropping that FB's cache
-        // entry/source pin, then re-light the configured survivors after the
-        // scene has been rebuilt for the new topology.
-        let relight_after_direct = self.scanout_m2.active();
-        if relight_after_direct {
-            if let Err(error) = self.materialize_direct_shadow_for_unflip() {
-                log::warn!("scanout_m2: topology-change lazy fallback Copy failed: {error}");
-            }
-            if let Err(error) = self.platform.dpms_set_outputs_active(false) {
-                log::error!(
-                    "scanout_m2: could not stop direct scanout for topology change: {error}"
+            if physically_connected.contains(key) {
+                log::info!(
+                    "kms: active output disabled (no usable modes): {} on {}",
+                    key.connector_name,
+                    key.device_key
                 );
-                self.request_exit();
-                return;
+            } else {
+                log::info!(
+                    "kms: RandR output disconnected: {} on {}",
+                    key.connector_name,
+                    key.device_key
+                );
             }
-            self.stop_direct_after_scanout_replaced("output topology changed");
-        }
-        self.scanout_m1.clear("output topology changed");
-
-        // Task 5.2: reconcile the connector registry with the topology
-        // change BEFORE rebuilding `state.randr` below. Dropped connectors
-        // go disconnected; newly-connected ones register OFF (connected,
-        // config=Off, advertised modes recorded) — they are NOT in
-        // `platform.outputs`, so `randr_outputs_and_modes` reports them
-        // connected-but-dark (mode=0, crtc unassigned) until a client
-        // enables them via RRSetCrtcConfig.
-        for key in &rescan.dropped_keys {
-            self.randr_id_alloc.entry_mut(key).connected = false;
-        }
-        for (key, output) in &rescan.added_outputs {
-            let modes: Vec<(u16, u16, u32, bool)> = output
-                .modes
-                .iter()
-                .map(|m| (m.width, m.height, m.vrefresh, m.preferred))
-                .collect();
-            let entry = self.randr_id_alloc.entry_mut(key);
-            entry.connected = true;
-            entry.config = ConnectorConfig::Off;
-            entry.modes = modes;
         }
 
-        self.platform.wait_idle_bounded();
-        self.scene.drain_all(&mut self.platform);
-        if let Err(e) = self.scene.rebuild_outputs(&self.platform) {
+        // Any active-output removal was quiesced against the old authoritative
+        // CRTC set before the connector snapshot mutated platform vectors.
+        // Metadata-only/inactive-connector changes need no scene disruption.
+        // A metadata-only/inactive-connector update does not replace the
+        // active scanout topology. M2 owns the framebuffer cached by M1, so
+        // clearing it in that case could RMFB a client buffer still being
+        // scanned. Active removals were quiesced (and M1 cleared) before this
+        // method; retain the cache for all other publications.
+        if rebuild_scene {
+            self.scanout_m1.clear("output topology changed");
+        }
+
+        if rebuild_scene && let Err(e) = self.scene.rebuild_outputs(&self.platform) {
             log::error!("kms: scene rebuild after topology change failed: {e:?}; exiting");
             self.request_exit();
-            return;
+            return false;
         }
-        if relight_after_direct
-            && state.dpms.power_level == 0
-            && let Err(error) = self.platform.dpms_set_outputs_active(true)
-        {
-            log::warn!(
-                "scanout_m2: re-light after topology-change unflip failed: {error}; continuing"
-            );
+        let relit = relight_after_quiesce && state.dpms.power_level == 0;
+        if let Err(_error) = self.relight_after_direct_teardown(relit, "output-topology change") {
+            return false;
         }
 
         // Hotplug add/remove changes the available config AND the
@@ -7594,15 +8001,17 @@ impl KmsBackend {
         let ts = state.timestamp_now();
         self.rebuild_randr_state(state, Some(ts), true);
 
-        // Propagate the new virtual extent (set by requery_outputs_and_modeset
-        // before we were called) to the cursor accumulator on both input paths.
+        // Propagate the new virtual extent (set while applying the connector
+        // snapshot) to the cursor accumulator on both input paths.
         // This allows the pointer to reach the full multi-monitor span after a
         // hotplug.
         let (new_fb_w, new_fb_h) = (self.platform.fb_w, self.platform.fb_h);
         self.update_input_extent(new_fb_w, new_fb_h);
 
-        if state.dpms.power_level == 0 {
+        if relit {
             self.kms_outputs_active = !self.platform.outputs.is_empty();
+        } else if self.platform.outputs.is_empty() {
+            self.kms_outputs_active = false;
         }
 
         let (w, h) = (state.randr.screen_width, state.randr.screen_height);
@@ -7629,6 +8038,7 @@ impl KmsBackend {
             .collect();
         yserver_core::core_loop::run::emit_randr_change_notifications(state, &changed);
         self.scene.wake_for_damage();
+        true
     }
 
     fn run_display_rescan(&mut self, state: &mut ServerState) {
@@ -7639,20 +8049,57 @@ impl KmsBackend {
             log::debug!("kms: display rescan skipped (VT not Active)");
             return;
         }
-        let configured = self.randr_id_alloc.client_configured_keys();
-        match self.platform.requery_outputs_and_modeset(&configured) {
-            Ok(rescan) => {
-                if rescan.added_count == 0 && rescan.dropped_keys.is_empty() {
-                    log::debug!("kms: display rescan found no topology change");
+        // Gather first. A card-level probe error aborts the combined rescan
+        // without touching the last-known topology.
+        let snapshot = match self.platform.probe_connector_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                log::error!("kms: display rescan probe failed: {error}");
+                return;
+            }
+        };
+        let active_removed = self.platform.outputs.iter().any(|output| {
+            !snapshot
+                .iter()
+                .any(|entry| entry.preserves_active_output(output))
+        });
+
+        // Only an active removal can drop a pool or invalidate the scene's
+        // output-index ledger. Metadata and inactive-connector changes leave
+        // normal composition and direct scanout undisturbed.
+        if active_removed {
+            match self.quiesce_before_topology_mutation("display hotplug rescan") {
+                Ok(()) => {}
+                Err(error) => {
+                    log::error!("kms: display rescan could not quiesce old topology: {error}");
                     return;
                 }
-                self.fire_randr_changes(state, rescan);
-                // A retired connector's CRTC is gone; drop any stale armed
-                // entry so it can't block re-arm or mis-dedup a reused id.
-                self.prune_armed_targets_to_live_outputs();
             }
-            Err(e) => log::error!("kms: display rescan failed: {e}"),
         }
+
+        let configured = self.randr_id_alloc.client_configured_keys();
+        let known_connected = self.randr_id_alloc.connected_keys();
+        let rescan =
+            self.platform
+                .apply_connector_snapshot(snapshot, &configured, &known_connected);
+        let registry_changed =
+            self.reconcile_connector_registry(&rescan.connected, &rescan.dropped_keys);
+        let should_publish = registry_changed || active_removed;
+        if !should_publish {
+            log::debug!("kms: display rescan found no connector or active-topology change");
+            return;
+        }
+        if !self.fire_randr_changes(
+            state,
+            rescan,
+            active_removed,
+            active_removed && state.dpms.power_level == 0,
+        ) {
+            return;
+        }
+        // A retired connector's CRTC is gone; drop any stale armed entry so it
+        // cannot block re-arm or mis-dedup a reused id.
+        self.prune_armed_targets_to_live_outputs();
     }
 
     /// Per-event state-machine driver. Extracted so both
@@ -7690,7 +8137,13 @@ impl KmsBackend {
                     break;
                 }
                 VtAction::BeginResume => {
-                    self.run_resume(state);
+                    if !self.run_resume(state) {
+                        // Keep the state machine in Resuming with the scanout
+                        // gate closed. `request_exit` has already been issued;
+                        // never publish Active after a failed all-device
+                        // probe/discovery or unsafe direct-scanout recovery.
+                        break;
+                    }
                     // `resume_complete` returns `BeginSuspend` (consuming
                     // `pending_disable`) for the no-blink boundary, else
                     // commits `Active`.
@@ -8132,9 +8585,11 @@ impl KmsBackend {
             // not a thread-safety question — the ioctl is
             // synchronous from the same thread that owns scene
             // state.
+            let cursor_mode = self.scene.cursor_mode();
             if matches!(
-                self.scene.cursor_mode(),
+                cursor_mode,
                 crate::kms::render::scene::CursorPlaneMode::Hw
+                    | crate::kms::render::scene::CursorPlaneMode::Mixed
             ) {
                 #[allow(clippy::cast_possible_truncation)]
                 let cx = new_x as i32;
@@ -8152,7 +8607,20 @@ impl KmsBackend {
                         )
                     })
                     .unwrap_or((0, 0, 0, 0));
-                if !self.scanout_m2.active()
+                if matches!(
+                    cursor_mode,
+                    crate::kms::render::scene::CursorPlaneMode::Mixed
+                ) {
+                    // A primary-card hardware cursor may coexist with a
+                    // secondary-card software cursor. Move the visible owner
+                    // plane immediately and also repaint the SW outputs.
+                    match self.platform.cursor_plane_move(cx, cy, hot_x, hot_y) {
+                        Ok(0) => {}
+                        Ok(n) => self.telemetry.record_cursor_move_ebusy(u64::from(n)),
+                        Err(e) => log::debug!("render cursor mixed path: move failed: {e}"),
+                    }
+                    self.scene.wake_for_damage();
+                } else if !self.scanout_m2.active()
                     && cw > 0
                     && ch > 0
                     && self
@@ -12207,7 +12675,7 @@ fn depth_for_visual(visual: HostSubwindowVisual, parent_depth: Option<u8>) -> u8
 impl KmsBackend {
     fn live_crtc_and_gamma_size(
         &self,
-        connector: &str,
+        output_key: &OutputKey,
     ) -> io::Result<
         Option<(
             crate::platform::drm::DrmDeviceKey,
@@ -12221,7 +12689,7 @@ impl KmsBackend {
             .platform
             .outputs
             .iter()
-            .find(|layout| layout.output.connector_name == connector)
+            .find(|layout| layout.key == *output_key)
         else {
             return Ok(None);
         };
@@ -12230,89 +12698,92 @@ impl KmsBackend {
             return Ok(None);
         };
         let info = device.device.get_crtc(crtc).map_err(|e| {
-            io::Error::other(format!("get_crtc gamma size for {connector} failed: {e}"))
+            io::Error::other(format!(
+                "get_crtc gamma size for {output_key:?} failed: {e}"
+            ))
         })?;
         let size = u16::try_from(info.gamma_length()).unwrap_or(u16::MAX);
         Ok(Some((layout.key.device_key, crtc, size)))
     }
 
-    fn nominal_gamma_size(&self, connector: &str) -> u16 {
-        match self.live_crtc_and_gamma_size(connector) {
+    fn nominal_gamma_size(&self, output_key: &OutputKey) -> u16 {
+        match self.live_crtc_and_gamma_size(output_key) {
             Ok(Some((_, _, size))) => size,
             Ok(None) => self
                 .gamma_luts
                 .borrow()
-                .get(connector)
+                .get(output_key)
                 .map(|lut| u16::try_from(lut.len()).unwrap_or(u16::MAX))
                 .unwrap_or(256),
             Err(e) => {
-                log::warn!("kms gamma: {connector} gamma-size query failed: {e}");
+                log::warn!("kms gamma: {output_key:?} gamma-size query failed: {e}");
                 self.gamma_luts
                     .borrow()
-                    .get(connector)
+                    .get(output_key)
                     .map(|lut| u16::try_from(lut.len()).unwrap_or(u16::MAX))
                     .unwrap_or(0)
             }
         }
     }
 
-    fn cached_gamma(&self, connector: &str) -> GammaLut {
-        if let Some(lut) = self.gamma_luts.borrow().get(connector).cloned() {
+    fn cached_gamma(&self, output_key: &OutputKey) -> GammaLut {
+        if let Some(lut) = self.gamma_luts.borrow().get(output_key).cloned() {
             return lut;
         }
-        let lut = GammaLut::identity(self.nominal_gamma_size(connector));
+        let lut = GammaLut::identity(self.nominal_gamma_size(output_key));
         self.gamma_luts
             .borrow_mut()
-            .insert(connector.to_string(), lut.clone());
+            .insert(output_key.clone(), lut.clone());
         lut
     }
 
-    fn cached_gamma_for_current_size(&self, connector: &str, size: u16) -> GammaLut {
-        let lut = self.cached_gamma(connector);
+    fn cached_gamma_for_current_size(&self, output_key: &OutputKey, size: u16) -> GammaLut {
+        let lut = self.cached_gamma(output_key);
         if lut.len() == usize::from(size) {
             return lut;
         }
         let resampled = lut.resampled(size);
         self.gamma_luts
             .borrow_mut()
-            .insert(connector.to_string(), resampled.clone());
+            .insert(output_key.clone(), resampled.clone());
         resampled
     }
 
-    fn apply_gamma_to_live_connector(&self, connector: &str) -> io::Result<()> {
+    fn apply_gamma_to_live_output(&self, output_key: &OutputKey) -> io::Result<()> {
         use ::drm::control::Device as ControlDevice;
 
-        let Some((device_key, crtc, gamma_size)) = self.live_crtc_and_gamma_size(connector)? else {
+        let Some((device_key, crtc, gamma_size)) = self.live_crtc_and_gamma_size(output_key)?
+        else {
             return Ok(());
         };
         if gamma_size == 0 {
             return Ok(());
         }
-        let lut = self.cached_gamma_for_current_size(connector, gamma_size);
+        let lut = self.cached_gamma_for_current_size(output_key, gamma_size);
         let Some(device) = self.platform.device_for_key(device_key) else {
             return Ok(());
         };
         device
             .device
             .set_gamma(crtc, &lut.red, &lut.green, &lut.blue)
-            .map_err(|e| io::Error::other(format!("set_gamma for {connector} failed: {e}")))
+            .map_err(|e| io::Error::other(format!("set_gamma for {output_key:?} failed: {e}")))
     }
 
-    fn reapply_gamma_for_connector(&self, connector: &str) {
-        if let Err(e) = self.apply_gamma_to_live_connector(connector) {
-            log::warn!("kms gamma: reapply for {connector} failed: {e}");
+    fn reapply_gamma_for_output(&self, output_key: &OutputKey) {
+        if let Err(e) = self.apply_gamma_to_live_output(output_key) {
+            log::warn!("kms gamma: reapply for {output_key:?} failed: {e}");
         }
     }
 
     fn reapply_gamma_for_live_outputs(&self) {
-        let connectors: Vec<String> = self
+        let output_keys: Vec<OutputKey> = self
             .platform
             .outputs
             .iter()
-            .map(|layout| layout.output.connector_name.clone())
+            .map(|layout| layout.key.clone())
             .collect();
-        for connector in connectors {
-            self.reapply_gamma_for_connector(&connector);
+        for output_key in output_keys {
+            self.reapply_gamma_for_output(&output_key);
         }
     }
 }
@@ -12377,23 +12848,31 @@ impl Backend for KmsBackend {
         Some(144)
     }
 
-    fn crtc_gamma_size(&self, connector: &str) -> u16 {
-        self.nominal_gamma_size(connector)
+    fn crtc_gamma_size(&self, crtc: u32) -> u16 {
+        self.crtc_key_by_id
+            .get(&crtc)
+            .map_or(0, |output_key| self.nominal_gamma_size(output_key))
     }
 
     fn set_crtc_gamma(
         &mut self,
-        connector: &str,
+        crtc: u32,
         red: &[u16],
         green: &[u16],
         blue: &[u16],
     ) -> io::Result<()> {
-        let expected = usize::from(self.crtc_gamma_size(connector));
+        let output_key = self.crtc_key_by_id.get(&crtc).cloned().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("unknown RANDR CRTC 0x{crtc:x}"),
+            )
+        })?;
+        let expected = usize::from(self.crtc_gamma_size(crtc));
         if red.len() != expected || green.len() != expected || blue.len() != expected {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "connector {connector}: gamma length mismatch (expected {expected}, got {}/{}/{})",
+                    "CRTC 0x{crtc:x} ({output_key:?}): gamma length mismatch (expected {expected}, got {}/{}/{})",
                     red.len(),
                     green.len(),
                     blue.len(),
@@ -12401,23 +12880,26 @@ impl Backend for KmsBackend {
             ));
         }
         self.gamma_luts.borrow_mut().insert(
-            connector.to_string(),
+            output_key.clone(),
             GammaLut {
                 red: red.to_vec(),
                 green: green.to_vec(),
                 blue: blue.to_vec(),
             },
         );
-        self.apply_gamma_to_live_connector(connector)
+        self.apply_gamma_to_live_output(&output_key)
     }
 
-    fn get_crtc_gamma(&self, connector: &str) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
-        let lut = match self.live_crtc_and_gamma_size(connector) {
-            Ok(Some((_, _, size))) => self.cached_gamma_for_current_size(connector, size),
-            Ok(None) => self.cached_gamma(connector),
+    fn get_crtc_gamma(&self, crtc: u32) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+        let Some(output_key) = self.crtc_key_by_id.get(&crtc) else {
+            return (Vec::new(), Vec::new(), Vec::new());
+        };
+        let lut = match self.live_crtc_and_gamma_size(output_key) {
+            Ok(Some((_, _, size))) => self.cached_gamma_for_current_size(output_key, size),
+            Ok(None) => self.cached_gamma(output_key),
             Err(e) => {
-                log::warn!("kms gamma: {connector} get gamma size failed: {e}");
-                self.cached_gamma(connector)
+                log::warn!("kms gamma: {output_key:?} get gamma size failed: {e}");
+                self.cached_gamma(output_key)
             }
         };
         (lut.red, lut.green, lut.blue)
@@ -13086,6 +13568,7 @@ impl Backend for KmsBackend {
         let authoritative_root = scanout_m2_is_authoritative_root(target, root_coverage);
         let eligible = self.scanout_allowed()
             && self.kms_outputs_active
+            && self.direct_scanout_topology_eligible()
             && !candidate.explicit_sync
             && matches!(
                 self.scene.cursor_mode(),
@@ -13561,48 +14044,57 @@ impl Backend for KmsBackend {
     }
 
     fn present_absolute_vblank_arm_supported(&self) -> bool {
-        !self.crtc_queue_sequence_unsupported
+        self.platform
+            .present_max_clock_crtc()
+            .or_else(|| self.platform.outputs.first().map(CrtcKey::for_output))
+            .is_some_and(|key| {
+                !self
+                    .crtc_queue_sequence_unsupported_devices
+                    .contains(&key.device_key)
+            })
     }
 
     fn arm_present_absolute_vblank(&mut self, targets: &[u64]) -> io::Result<usize> {
-        // Shared latch with the relative idle arm (`arm_idle_vblanks_ioctl`):
-        // pre-4.14 kernels lack DRM_IOCTL_CRTC_QUEUE_SEQUENCE entirely, so
-        // once either caller trips it we stay flip-driven for the rest of
-        // this DRM master grab.
-        if self.crtc_queue_sequence_unsupported {
-            return Ok(0);
-        }
-        let Some(primary) = self.platform.primary_device() else {
-            return Ok(0);
-        };
-        let device = Rc::clone(&primary.device);
-        let mut newly_unsupported = false;
-        let result = self.arm_present_absolute_vblank_with(targets, |crtc_id, target| {
+        let devices: HashMap<_, _> = self
+            .platform
+            .devices
+            .iter()
+            .map(|device| (device.key, Rc::clone(&device.device)))
+            .collect();
+        let mut newly_unsupported = HashSet::new();
+        let result = self.arm_present_absolute_vblank_with(targets, |crtc_key, target| {
+            let Some(device) = devices.get(&crtc_key.device_key) else {
+                return Err(io::Error::other(format!(
+                    "no DRM device {} for absolute vblank arm",
+                    crtc_key.device_key
+                )));
+            };
+            let crtc_id = u32::from(crtc_key.crtc);
             match crate::drm::page_flip::queue_crtc_sequence(
-                &device,
+                device,
                 crtc_id,
                 /* relative */ false,
                 target,
                 absolute_seq_user_data(crtc_id),
             ) {
-                Ok(_) => Ok(()),
+                Ok(_) => Ok(true),
                 Err(e)
                     if e.raw_os_error() == Some(libc::EOPNOTSUPP)
                         || e.raw_os_error() == Some(libc::ENOTTY) =>
                 {
-                    newly_unsupported = true;
-                    Err(e)
+                    newly_unsupported.insert(crtc_key.device_key);
+                    Ok(false)
                 }
                 Err(e) => Err(e),
             }
         });
-        if newly_unsupported {
+        for device_key in newly_unsupported {
             log::warn!(
-                "DRM_IOCTL_CRTC_QUEUE_SEQUENCE returned EOPNOTSUPP from the \
-                 absolute vblank arm — disabling sequence arming (shared latch, \
-                 flip-driven MSC only) for the rest of this DRM master grab"
+                "DRM_IOCTL_CRTC_QUEUE_SEQUENCE returned EOPNOTSUPP from the absolute \
+                 vblank arm on {device_key} — disabling sequence arming on that device"
             );
-            self.crtc_queue_sequence_unsupported = true;
+            self.crtc_queue_sequence_unsupported_devices
+                .insert(device_key);
         }
         result
     }
@@ -13717,11 +14209,30 @@ impl Backend for KmsBackend {
             }
         }
         if !acquired {
-            log::warn!("kms: proceeding with best-effort resume after SetMaster failure");
+            log::error!(
+                "kms: at least one DRM device did not regain master; keeping scanout closed and exiting"
+            );
+            for device in &self.platform.devices {
+                if let Err(error) = device.device.release_master_lock() {
+                    log::warn!(
+                        "kms: cleanup drmDropMaster failed on {} after partial acquire: {error}",
+                        device.key
+                    );
+                }
+            }
+            self.request_exit();
+            return;
         }
 
         log::info!("kms: VT acquire — master held={acquired}; run_resume");
         self.drive_vt_event(state, VtEventKind::Enable);
+        if self.vt_state != crate::vt::state::VtState::Active {
+            log::error!(
+                "kms: VT acquire did not reach Active ({:?}); keeping input paused",
+                self.vt_state
+            );
+            return;
+        }
         log::info!("kms: VT acquire — resumed; resume input");
         self.resume_input_thread();
 
@@ -13766,13 +14277,11 @@ impl Backend for KmsBackend {
         // properties and modifiers and computes hypothetical assignments;
         // under Cinnamon/GPU load that unrelated work blocked dispatch for
         // 90–113 ms every time the desktop polled GetScreenResources.
-        let Some(primary) = self.platform.primary_device() else {
-            return Ok(());
-        };
-        let device_key = primary.key;
-        let device = Rc::clone(&primary.device);
-        let probes = crate::platform::drm::probe_connectors(&device)?;
-        let changed = reconcile_connector_probe(&mut self.randr_id_alloc, device_key, &probes);
+        let probes = self.platform.probe_all_connectors()?;
+        let mut changed = false;
+        for (device_key, connectors) in probes {
+            changed |= reconcile_connector_probe(&mut self.randr_id_alloc, device_key, &connectors);
+        }
         // Pure re-probe: never bumps lastSetTime (set_time = None); bumps
         // lastConfigTime only when something actually changed. A no-op
         // probe leaves both timestamps + the client-set screen size
@@ -13878,52 +14387,70 @@ impl Backend for KmsBackend {
             )));
         }
 
-        // ── Flip-safety: quiesce exactly like fire_randr_changes ──────────
+        // Resolve the requested connector before taking the old CRTC set
+        // offline. A pure discovery failure must not blank a working desktop.
+        // Pool allocation and the actual modeset remain in `enable_connector`
+        // after quiescing, where failures can restore the old composed set.
+        let prepared_output = if mode.is_some() {
+            let reserved_routes: Vec<_> = self
+                .platform
+                .outputs
+                .iter()
+                .filter(|layout| {
+                    layout.key.device_key == output_key.device_key && layout.key != output_key
+                })
+                .map(|layout| {
+                    (
+                        layout.output.encoder,
+                        layout.output.crtc,
+                        layout.output.plane,
+                    )
+                })
+                .collect();
+            Some(
+                crate::platform::drm::discover_output_for_connector(
+                    &output_device,
+                    connector,
+                    &reserved_routes,
+                )
+                .map_err(|e| {
+                    log::error!("apply_crtc_config: target discovery for {connector} failed: {e}");
+                    e
+                })?,
+            )
+        } else {
+            None
+        };
+
+        // ── Flip-safety: quiesce the complete old topology ────────────────
         //
         // Both enable and disable modify `platform.outputs` (topology),
         // so we need `drain_all` + `rebuild_outputs` — the same path
         // `fire_randr_changes` uses for hotplug.  The sequence below:
         //
-        //   wait_idle_bounded — ensures in-flight GPU CBs have retired
-        //                       before we free/reallocate scanout pools.
-        //   scene.drain_all   — clears `pending_acks` (the per-output
-        //                       "flip in flight" gate) and releases pool
-        //                       slots.  The GPU is already idle so compose-
-        //                       fence waits return immediately.
-        //   reset_scanout_bos_for_suspend — resets BO phase tracking so
-        //                       the new topology starts clean.
+        //   all CRTCs off      — proves no survivor still references a BO
+        //                       whose userspace phase is about to be reset.
+        //   wait/drain/reset   — retires GPU work and clears both the scene
+        //                       ack ledger and matching platform BO phases.
         //   platform mutate   — disable_connector / enable_connector
-        //   rebuild_outputs   — re-arms the scene for the new topology.
+        //   rebuild + relight — restores every surviving/new active CRTC.
         //
         // The `commit_modeset` / `disable_output` calls in the platform
         // helpers are ALLOW_MODESET atomic commits (not page-flips), so
         // they are always legal after drain_all.  After rebuild_outputs
         // the scene's `pending_acks` is fresh-empty for every output, so
         // the subsequent `wake_for_damage` tick is EBUSY-safe.
-        self.platform.wait_idle_bounded();
-        self.scene.drain_all(&mut self.platform);
-        self.platform.reset_scanout_bos_for_suspend();
+        let restore_old_on_failure = self.kms_outputs_active;
+        self.quiesce_before_topology_mutation("RANDR CRTC configuration changed")?;
 
         match mode {
             None => {
                 // ── Disable path ─────────────────────────────────────────
-                match self.platform.disable_connector(&output_key) {
-                    Ok(true) => {
-                        log::info!("apply_crtc_config: disabled {connector}");
-                    }
-                    Ok(false) => {
-                        // Already off — still update the registry.
-                        log::debug!("apply_crtc_config: {connector} was already off");
-                    }
-                    Err(e) => {
-                        log::error!(
-                            "apply_crtc_config: disable_connector({connector}) failed: {e}"
-                        );
-                        // Attempt to restore the scene with whatever state
-                        // platform.outputs is in now.
-                        let _ = self.scene.rebuild_outputs(&self.platform);
-                        return Err(e);
-                    }
+                if self.platform.remove_connector_after_all_off(&output_key) {
+                    log::info!("apply_crtc_config: disabled {connector}");
+                } else {
+                    // Already off — still update the registry.
+                    log::debug!("apply_crtc_config: {connector} was already off");
                 }
                 // Update registry: connector stays known, config → Off.
                 {
@@ -13936,33 +14463,7 @@ impl Backend for KmsBackend {
             }
             Some(mode_spec) => {
                 // ── Enable / mode-change path ────────────────────────────
-                //
-                // Re-discover all outputs to get a fresh Output with the
-                // correct CRTC/plane/property assignments. We filter to
-                // the one matching `connector`.
-                let discovered = match crate::platform::drm::discover_outputs(&output_device) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        log::error!("apply_crtc_config: discover_outputs failed: {e}");
-                        let _ = self.scene.rebuild_outputs(&self.platform);
-                        return Err(e);
-                    }
-                };
-                let output = match discovered
-                    .into_iter()
-                    .find(|o| o.connector_name == connector)
-                {
-                    Some(o) => o,
-                    None => {
-                        let e = io::Error::other(format!(
-                            "apply_crtc_config: connector {connector} not found in \
-                             discover_outputs (disconnected?)"
-                        ));
-                        log::error!("{e}");
-                        let _ = self.scene.rebuild_outputs(&self.platform);
-                        return Err(e);
-                    }
-                };
+                let output = prepared_output.expect("enabled request prepared its connector");
 
                 // enable_connector handles: mode resolution, pool
                 // (re)alloc, commit_modeset, ActiveOutput update,
@@ -13972,10 +14473,8 @@ impl Backend for KmsBackend {
                     .enable_connector(&output_key, output, mode_spec, x, y)
                 {
                     log::error!("apply_crtc_config: enable_connector({connector}) failed: {e}");
-                    let _ = self.scene.rebuild_outputs(&self.platform);
-                    return Err(e);
+                    return Err(self.recover_failed_crtc_config(restore_old_on_failure, e));
                 }
-                self.reapply_gamma_for_connector(connector);
 
                 // Update registry.
                 {
@@ -14000,13 +14499,13 @@ impl Backend for KmsBackend {
             }
         }
 
-        // The KMS mutation above has already taken effect, even if the scene
-        // rebuild below fails. Reconcile the Present/compositor power gate
-        // now so a first output enabled from a headless start can render, and
-        // disabling the final output cannot leave Present parked on a vblank
-        // clock that no longer exists.
-        self.kms_outputs_active = kms_outputs_active_after_crtc_config(
-            self.kms_outputs_active,
+        self.prune_armed_targets_to_live_outputs();
+
+        // Decide whether the new topology should be lit. A first enable from
+        // headless opens the gate; disabling while the old topology was dark
+        // keeps surviving outputs dark.
+        let desired_active = kms_outputs_active_after_crtc_config(
+            restore_old_on_failure,
             matches!(requested, ConnectorConfig::Enabled { .. }),
             self.platform.outputs.len(),
         );
@@ -14014,10 +14513,19 @@ impl Backend for KmsBackend {
         // ── Scene + RANDR rebuild ─────────────────────────────────────────
         if let Err(e) = self.scene.rebuild_outputs(&self.platform) {
             log::error!("apply_crtc_config: scene rebuild failed after topology change: {e:?}");
-            return Err(io::Error::other(format!(
-                "apply_crtc_config: scene rebuild failed: {e:?}"
-            )));
+            let error = io::Error::other(format!("apply_crtc_config: scene rebuild failed: {e:?}"));
+            let relight = self
+                .relight_after_direct_teardown(desired_active, "RANDR CRTC scene-rebuild failure");
+            // Hardware/platform/registry state has already changed, but the
+            // core RANDR projection cannot be rebuilt consistently. Rollback
+            // would itself require another fallible modeset, so fail-stop
+            // instead of continuing with two contradictory topologies.
+            self.kms_outputs_active = false;
+            self.request_exit();
+            return Err(relight.err().unwrap_or(error));
         }
+        self.relight_after_direct_teardown(desired_active, "RANDR CRTC configuration")?;
+        self.kms_outputs_active = desired_active;
 
         // Update input extent (cursor clamp) to reflect new fb size.
         let (new_fb_w, new_fb_h) = (self.platform.fb_w, self.platform.fb_h);
@@ -20644,47 +21152,50 @@ impl Backend for KmsBackend {
             }
             res
         } else {
-            // ── Sleep side. Mirrors KmsBackend::run_suspend steps 4 →
-            //    4b → 4c around `disable_output`:
-            //      (1) wait for GPU idle so disable_output isn't racing
-            //          in-flight compose CBs.
-            //      (2) drain in-flight page-flip acks + reset per-output
-            //          cursor plane state. Without this, the cursor plane
-            //          stays bound across disable_output and the kernel
-            //          rejects the next page-flip after wake with EINVAL.
-            //      (3) reset platform's scanout BO state machine so
-            //          orphaned Pending/OnScreen entries don't leak.
-            //      (4) actually disable_output per output.
-            if self.scanout_m2.active()
-                && let Err(error) = self.materialize_direct_shadow_for_unflip()
-            {
-                log::warn!("scanout_m2: DPMS-off lazy fallback Copy failed: {error}");
-            }
+            // ── Sleep side. The complete old CRTC set must be disabled and
+            //    its queued flip events consumed before scene acknowledgements
+            //    or BO phases are reset. Otherwise a live front buffer can be
+            //    reused, or a stale event can retire a fresh post-wake flip.
+            let direct_shadow_error = if self.scanout_m2.active() {
+                self.materialize_direct_shadow_for_unflip().err()
+            } else {
+                None
+            };
+            let old_pending_pageflips = self.pending_pageflip_crtcs();
             log::info!("kms: dpms sleep — wait_idle_bounded");
             self.platform.wait_idle_bounded();
+            log::info!("kms: dpms sleep — disable_output per output");
+            if let Err(error) = self.platform.dpms_set_outputs_active(false) {
+                // The helper attempted every CRTC, so this may be a partial
+                // all-off. Without a transactional rollback the only safe
+                // policy is to keep allocations/direct pins and fail-stop.
+                self.kms_outputs_active = false;
+                log::error!("kms: DPMS off could not disable every output: {error}; exiting");
+                self.request_exit();
+                return Err(error);
+            }
+            self.clear_all_armed_vblank_targets();
+            if let Err(error) = self.platform.discard_old_drm_events_after_all_off(
+                &old_pending_pageflips,
+                std::time::Duration::from_secs(1),
+            ) {
+                log::error!("kms: DPMS off could not drain old DRM events: {error}; exiting");
+                self.request_exit();
+                return Err(error);
+            }
+            self.stop_direct_after_scanout_replaced("DPMS off");
+            self.scanout_m1.clear("DPMS off");
             log::info!("kms: dpms sleep — scene.drain_all");
             self.scene.drain_all(&mut self.platform);
             log::info!("kms: dpms sleep — reset_scanout_bos_for_suspend");
             self.platform.reset_scanout_bos_for_suspend();
-            // Clear the per-CRTC armed-vblank-target map. The kernel stops
-            // generating vblank events for disabled CRTCs, so any queued
-            // `DRM_CRTC_SEQUENCE` will never fire; a stale entry would block
-            // re-arm on DPMS wake. Global off transition → clear-all.
-            log::info!("kms: dpms sleep — clear_all_armed_vblank_targets");
-            self.clear_all_armed_vblank_targets();
-            log::info!("kms: dpms sleep — disable_output per output");
-            let res = self.platform.dpms_set_outputs_active(false);
-            if res.is_ok() {
-                self.stop_direct_after_scanout_replaced("DPMS off");
-                self.scanout_m1.clear("DPMS off");
+            self.kms_outputs_active = false;
+            if let Some(error) = direct_shadow_error {
+                log::error!("scanout_m2: DPMS-off lazy fallback Copy failed: {error}; exiting");
+                self.request_exit();
+                return Err(error);
             }
-            // Only flip the cache on success. On Err, leave it where it was
-            // so the next set_dpms_power call retries rather than no-opping
-            // through the same-binary-state guard above.
-            if res.is_ok() {
-                self.kms_outputs_active = false;
-            }
-            res
+            Ok(())
         }
     }
 }
@@ -20996,7 +21507,10 @@ mod tests {
         kms::{
             backend::OutputKey,
             cpu_types::{Rectangle16, Repeat},
-            render::{platform::PlatformBackend, store::Storage},
+            render::{
+                platform::{CrtcKey, PlatformBackend},
+                store::Storage,
+            },
         },
         platform::drm::DrmDeviceKey,
     };
@@ -21012,6 +21526,17 @@ mod tests {
 
     fn test_output_key(minor: u32, connector_name: &str) -> OutputKey {
         OutputKey::new(test_device_key(minor), connector_name)
+    }
+
+    fn output_crtc_key(backend: &KmsBackend, output_idx: usize) -> CrtcKey {
+        CrtcKey::for_output(&backend.platform.outputs[output_idx])
+    }
+
+    fn test_crtc_key(device_key: DrmDeviceKey, crtc_id: u32) -> CrtcKey {
+        CrtcKey::new(
+            device_key,
+            ::drm::control::from_u32(crtc_id).expect("nonzero test CRTC"),
+        )
     }
 
     fn dispatch_test_sequence(
@@ -21092,6 +21617,7 @@ mod tests {
             vsync_start: 1443,
             vsync_end: 1448,
             vtotal: 1481,
+            vscan: 1,
             // PHSYNC(0x1) | PVSYNC(0x4) kept; DBLCLK(0x1000, DRM-only) dropped.
             flags: 0x1 | 0x4 | 0x1000,
         };
@@ -21430,9 +21956,12 @@ mod tests {
 
     #[test]
     fn kms_gamma_off_connector_seeds_identity_ramp_at_256() {
-        let b = KmsBackend::for_tests();
-        assert_eq!(b.crtc_gamma_size("DP-1"), 256);
-        let (red, green, blue) = b.get_crtc_gamma("DP-1");
+        let mut b = KmsBackend::for_tests();
+        let crtc = 0x4000;
+        b.crtc_key_by_id.insert(crtc, test_output_key(0, "DP-1"));
+
+        assert_eq!(b.crtc_gamma_size(crtc), 256);
+        let (red, green, blue) = b.get_crtc_gamma(crtc);
         assert_eq!(red.len(), 256);
         assert_eq!(red[0], 0);
         assert_eq!(red[255], 65535);
@@ -21442,12 +21971,33 @@ mod tests {
     #[test]
     fn kms_gamma_off_connector_set_roundtrips_cached_values() {
         let mut b = KmsBackend::for_tests();
+        let crtc = 0x4000;
+        b.crtc_key_by_id.insert(crtc, test_output_key(0, "DP-1"));
         let red = vec![1u16; 256];
         let green = vec![2u16; 256];
         let blue = vec![3u16; 256];
-        b.set_crtc_gamma("DP-1", &red, &green, &blue)
+        b.set_crtc_gamma(crtc, &red, &green, &blue)
             .expect("set gamma cache");
-        assert_eq!(b.get_crtc_gamma("DP-1"), (red, green, blue));
+        assert_eq!(b.get_crtc_gamma(crtc), (red, green, blue));
+    }
+
+    #[test]
+    fn kms_gamma_same_connector_name_on_two_devices_stays_independent() {
+        let mut b = KmsBackend::for_tests();
+        let crtc_a = 0x4000;
+        let crtc_b = 0x4001;
+        b.crtc_key_by_id.insert(crtc_a, test_output_key(0, "DP-1"));
+        b.crtc_key_by_id.insert(crtc_b, test_output_key(1, "DP-1"));
+
+        let a = (vec![1u16; 256], vec![2u16; 256], vec![3u16; 256]);
+        let b_lut = (vec![4u16; 256], vec![5u16; 256], vec![6u16; 256]);
+        b.set_crtc_gamma(crtc_a, &a.0, &a.1, &a.2)
+            .expect("set first card gamma cache");
+        b.set_crtc_gamma(crtc_b, &b_lut.0, &b_lut.1, &b_lut.2)
+            .expect("set second card gamma cache");
+
+        assert_eq!(b.get_crtc_gamma(crtc_a), a);
+        assert_eq!(b.get_crtc_gamma(crtc_b), b_lut);
     }
 
     /// Spec: "the first paint op produces a logged 'v2 not yet
@@ -30770,16 +31320,25 @@ mod tests {
     // real hardware. They exercise the full state-machine path
     // plus `run_suspend` side-effects that are reachable in the stub harness.
     //
-    // Resume path note: `run_resume` calls
-    // `platform.requery_outputs_and_modeset()` → `discover_outputs` which
-    // issues DRM ioctls on `/dev/null` and fails immediately.  The error
-    // path logs the failure, calls `request_exit()` (a no-op in the stub
-    // harness because `input_sender` is None), and returns.  `drive_vt_event`
-    // then always calls `resume_complete()` regardless, so the state machine
-    // still transitions from `Resuming` → `Active` (or `Suspending` if a
-    // pending disable is set).  This is correct and asserted below.
-    // The post-modeset parts of resume (cursor re-arm, repaint) are
-    // hardware-only and not asserted here — documented as DONE_WITH_CONCERNS.
+    // Resume path note: the ordinary fixture's synthetic `/dev/null` DRM
+    // device fails connector probing. That failure must leave the state in
+    // `Resuming` with scanout closed; production concurrently requests a
+    // process exit. Tests that need a successful logical VT cycle convert the
+    // fixture to the supported zero-device headless configuration first.
+
+    fn make_vt_fixture_headless(b: &mut KmsBackend) {
+        b.platform.devices.clear();
+        b.platform.outputs.clear();
+        b.platform.scanout_pools.clear();
+        b.platform.bo_generations.clear();
+        b.platform.first_pageflip_logged.clear();
+        b.platform.fb_w = 0;
+        b.platform.fb_h = 0;
+        b.kms_outputs_active = false;
+        b.scene
+            .rebuild_outputs(&b.platform)
+            .expect("headless scene rebuild");
+    }
 
     /// A screensaver blank that lands after a VT switch away used to issue a
     /// modeset while we no longer held DRM master, failing with EACCES
@@ -30789,7 +31348,7 @@ mod tests {
     /// `disable_output for eDP-1 failed: ... Permission denied (os error 13)`.
     /// `scanout_allowed()` is the documented gate for master-requiring work.
     #[test]
-    fn set_dpms_power_is_skipped_while_the_session_is_suspended() {
+    fn set_dpms_power_is_skipped_while_suspended_and_failed_resume_stays_closed() {
         use crate::vt::state::VtState;
         use yserver_core::backend::Backend;
 
@@ -30813,10 +31372,14 @@ mod tests {
              the cache from the hardware"
         );
 
-        // And it must still work once the session is back.
+        // The synthetic DRM fd cannot be probed on resume. Do not reopen the
+        // scanout gate merely because shutdown was requested asynchronously.
         b.inject_seat_event_for_test(&mut state, true);
-        assert_eq!(b.vt_state, VtState::Active);
-        assert!(b.scanout_allowed(), "resume must reopen the gate");
+        assert_eq!(b.vt_state, VtState::Resuming);
+        assert!(
+            !b.scanout_allowed(),
+            "failed resume must keep the gate closed"
+        );
     }
 
     /// After `inject_seat_event_for_test(false)` the backend must be in
@@ -30874,25 +31437,21 @@ mod tests {
 
     /// After a Disable→Enable cycle the state machine must return to `Active`.
     ///
-    /// In the stub harness `run_resume`'s `requery_outputs_and_modeset` fails
-    /// (DRM ioctls on `/dev/null`), but the state machine still completes the
-    /// transition because `drive_vt_event` calls `resume_complete()` after
-    /// `run_resume` returns regardless of the modeset outcome.  This is the
-    /// correct behaviour: a failed modeset calls `request_exit` (a no-op here)
-    /// and the server would exit in production; the state-machine transition
-    /// is a logical consequence, not a claim that the hardware path succeeded.
+    /// The test uses a zero-device configuration, for which an empty connector
+    /// snapshot and an empty re-light are both successful by design.
     #[test]
     fn vt_switch_enable_after_disable_returns_to_active() {
         use crate::vt::state::VtState;
 
         let mut b = KmsBackend::for_tests();
         let mut state = ServerState::new();
+        make_vt_fixture_headless(&mut b);
 
         // Drive Disable → Suspended.
         b.inject_seat_event_for_test(&mut state, false);
         assert_eq!(b.vt_state, VtState::Suspended);
 
-        // Drive Enable → Active (modeset fails in stub, state still advances).
+        // Drive Enable → Active through the valid headless resume path.
         b.inject_seat_event_for_test(&mut state, true);
 
         assert_eq!(
@@ -30928,6 +31487,7 @@ mod tests {
 
         let mut b = KmsBackend::for_tests();
         let mut state = ServerState::new();
+        make_vt_fixture_headless(&mut b);
 
         // Step 1: normal Disable → Suspended.
         b.inject_seat_event_for_test(&mut state, false);
@@ -30977,6 +31537,7 @@ mod tests {
 
         let mut b = KmsBackend::for_tests();
         let mut state = ServerState::new();
+        make_vt_fixture_headless(&mut b);
 
         b.vt_pending = VtPending {
             pending_enable: true,
@@ -31005,6 +31566,7 @@ mod tests {
 
         let mut b = KmsBackend::for_tests();
         let mut state = ServerState::new();
+        make_vt_fixture_headless(&mut b);
 
         // Two full cycles — if any RefCell is double-borrowed this panics.
         for _ in 0..2 {
@@ -31675,13 +32237,13 @@ mod tests {
     fn armed_vblank_targets_starts_empty() {
         let b = super::KmsBackend::for_tests();
         assert!(b.armed_vblank_targets.is_empty());
-        assert!(!b.crtc_queue_sequence_unsupported);
+        assert!(b.crtc_queue_sequence_unsupported_devices.is_empty());
     }
 
     #[test]
     fn clear_all_armed_vblank_targets_empties_map() {
         let mut b = super::KmsBackend::for_tests();
-        let h = ::drm::control::from_u32(7).unwrap();
+        let h = test_crtc_key(test_device_key(7), 7);
         b.armed_vblank_targets.insert(h, 0);
         b.clear_all_armed_vblank_targets();
         assert!(b.armed_vblank_targets.is_empty());
@@ -31690,8 +32252,8 @@ mod tests {
     #[test]
     fn prune_armed_targets_drops_stale_keeps_live() {
         let mut b = super::KmsBackend::for_tests();
-        let live = b.platform.outputs[0].output.crtc;
-        let stale = ::drm::control::from_u32(999).unwrap();
+        let live = output_crtc_key(&b, 0);
+        let stale = test_crtc_key(live.device_key, 999);
         b.armed_vblank_targets.insert(live, 0);
         b.armed_vblank_targets.insert(stale, 0);
         b.prune_armed_targets_to_live_outputs();
@@ -31702,8 +32264,8 @@ mod tests {
     #[test]
     fn prune_armed_targets_drops_stale_absolute_entries_keeps_live() {
         let mut b = super::KmsBackend::for_tests();
-        let live = u32::from(b.platform.outputs[0].output.crtc);
-        let stale = 999u32;
+        let live = output_crtc_key(&b, 0);
+        let stale = test_crtc_key(live.device_key, 999);
         b.absolute_vblank_targets
             .entry(live)
             .or_default()
@@ -31721,7 +32283,8 @@ mod tests {
     fn on_crtc_sequence_event_happy_path_records_msc_and_clears_arm() {
         let mut b = super::KmsBackend::for_tests();
         let crtc = b.platform.outputs[0].output.crtc;
-        b.armed_vblank_targets.insert(crtc, 0);
+        let crtc_key = output_crtc_key(&b, 0);
+        b.armed_vblank_targets.insert(crtc_key, 0);
 
         dispatch_test_sequence(
             &mut b,
@@ -31748,7 +32311,8 @@ mod tests {
     fn active_crtc_sequence_advances_general_clock_only() {
         let mut b = super::KmsBackend::for_tests();
         let crtc = b.platform.outputs[0].output.crtc;
-        b.armed_vblank_targets.insert(crtc, 0);
+        let crtc_key = output_crtc_key(&b, 0);
+        b.armed_vblank_targets.insert(crtc_key, 0);
         b.scene.scene_structure_dirty = true;
 
         dispatch_test_sequence(&mut b, u64::from(u32::from(crtc)), 2_000_000, 9);
@@ -31766,8 +32330,9 @@ mod tests {
         let mut b = super::KmsBackend::for_tests();
         let crtc = b.platform.outputs[0].output.crtc;
         let crtc_id = u32::from(crtc);
+        let crtc_key = output_crtc_key(&b, 0);
         b.absolute_vblank_targets
-            .entry(crtc_id)
+            .entry(crtc_key)
             .or_default()
             .insert(9);
         b.scene.scene_structure_dirty = true;
@@ -31787,8 +32352,9 @@ mod tests {
         use yserver_core::backend::{PresentClockSample, PresentClockSource};
 
         let mut b = super::KmsBackend::for_tests();
+        let crtc_key = output_crtc_key(&b, 0);
         b.platform.record_completion_clock(
-            0,
+            crtc_key,
             PresentClockSample {
                 msc: 20,
                 ust: 2_000,
@@ -31796,7 +32362,7 @@ mod tests {
             },
         );
         b.platform.record_completion_clock(
-            0,
+            crtc_key,
             PresentClockSample {
                 msc: 20,
                 ust: 2_001,
@@ -31804,7 +32370,7 @@ mod tests {
             },
         );
         b.platform.record_completion_clock(
-            0,
+            crtc_key,
             PresentClockSample {
                 msc: 19,
                 ust: 1_900,
@@ -31826,7 +32392,8 @@ mod tests {
     fn on_crtc_sequence_event_negative_time_clears_arm_and_drops() {
         let mut b = super::KmsBackend::for_tests();
         let crtc = b.platform.outputs[0].output.crtc;
-        b.armed_vblank_targets.insert(crtc, 0);
+        let crtc_key = output_crtc_key(&b, 0);
+        b.armed_vblank_targets.insert(crtc_key, 0);
 
         dispatch_test_sequence(&mut b, u64::from(u32::from(crtc)), -1, 7);
 
@@ -31844,7 +32411,8 @@ mod tests {
     #[test]
     fn on_crtc_sequence_event_stale_crtc_clears_arm_and_drops() {
         let mut b = super::KmsBackend::for_tests();
-        let stale = ::drm::control::from_u32(999).unwrap();
+        let device_key = b.platform.outputs[0].key.device_key;
+        let stale = test_crtc_key(device_key, 999);
         b.armed_vblank_targets.insert(stale, 0);
 
         dispatch_test_sequence(&mut b, 999, 1_000_000, 5);
@@ -31860,14 +32428,15 @@ mod tests {
     fn on_crtc_sequence_event_from_wrong_device_does_not_advance_clock() {
         let mut b = super::KmsBackend::for_tests();
         let crtc = b.platform.outputs[0].output.crtc;
-        b.armed_vblank_targets.insert(crtc, 0);
+        let crtc_key = output_crtc_key(&b, 0);
+        b.armed_vblank_targets.insert(crtc_key, 0);
         let wrong_device = test_device_key(99);
 
         b.on_crtc_sequence_event(wrong_device, u64::from(u32::from(crtc)), 1_000_000, 5);
 
         assert!(
-            b.armed_vblank_targets.is_empty(),
-            "the raw CRTC arm is still cleared so it cannot strand"
+            b.armed_vblank_targets.contains_key(&crtc_key),
+            "an equal raw CRTC on another DRM device must not spend this device's arm"
         );
         assert_eq!(
             b.platform.present_get_ust_msc(),
@@ -31877,13 +32446,43 @@ mod tests {
     }
 
     #[test]
+    fn same_raw_crtc_on_two_devices_keeps_present_state_independent() {
+        let mut b = super::KmsBackend::for_tests();
+        let primary = output_crtc_key(&b, 0);
+        let raw_crtc = u32::from(primary.crtc);
+        push_test_output(&mut b, raw_crtc);
+        b.platform.outputs[1].key.device_key = test_device_key(99);
+        let secondary = output_crtc_key(&b, 1);
+        assert_eq!(primary.crtc, secondary.crtc);
+        assert_ne!(primary.device_key, secondary.device_key);
+
+        b.armed_vblank_targets.insert(primary, 0);
+        b.armed_vblank_targets.insert(secondary, 0);
+        b.on_crtc_sequence_event(secondary.device_key, u64::from(raw_crtc), 3_000_000, 17);
+
+        assert!(
+            b.armed_vblank_targets.contains_key(&primary),
+            "the event must not retire the equal raw CRTC on the primary card"
+        );
+        assert!(
+            !b.armed_vblank_targets.contains_key(&secondary),
+            "the event retires only the device-qualified secondary arm"
+        );
+        assert_eq!(b.platform.ust_msc.get(&secondary), Some(&(17, 3_000)));
+        assert!(!b.platform.ust_msc.contains_key(&primary));
+    }
+
+    #[test]
     fn present_get_ust_msc_returns_most_advanced_output() {
         // Multi-monitor: a full-screen compositor on a secondary output flips
         // only that CRTC. Keying on output 0 would leave the global clock at 0
         // and park its NotifyMSC forever; the max across outputs keeps it live.
         let mut b = super::KmsBackend::for_tests();
-        b.platform.ust_msc.insert(0, (10, 100)); // primary, idle-ish
-        b.platform.ust_msc.insert(1, (42, 424)); // secondary, flipping ahead
+        let primary = output_crtc_key(&b, 0);
+        push_test_output(&mut b, 2);
+        let secondary = output_crtc_key(&b, 1);
+        b.platform.ust_msc.insert(primary, (10, 100)); // primary, idle-ish
+        b.platform.ust_msc.insert(secondary, (42, 424)); // secondary, flipping ahead
         assert_eq!(
             b.platform.present_get_ust_msc(),
             (42, 424),
@@ -31898,7 +32497,7 @@ mod tests {
         let armed = b
             .arm_idle_vblanks_with(&[], |_| {
                 calls += 1;
-                Ok(())
+                Ok(true)
             })
             .unwrap();
         assert_eq!(armed, 0);
@@ -31909,13 +32508,13 @@ mod tests {
     #[test]
     fn arm_idle_vblanks_with_arms_primary_once_then_dedups() {
         let mut b = super::KmsBackend::for_tests();
-        let primary = b.platform.outputs[0].output.crtc;
+        let primary = output_crtc_key(&b, 0);
         let mut calls = 0u32;
 
         let armed = b
             .arm_idle_vblanks_with(&[100], |_| {
                 calls += 1;
-                Ok(())
+                Ok(true)
             })
             .unwrap();
         assert_eq!(armed, 1);
@@ -31926,7 +32525,7 @@ mod tests {
         let armed2 = b
             .arm_idle_vblanks_with(&[200], |_| {
                 calls += 1;
-                Ok(())
+                Ok(true)
             })
             .unwrap();
         assert_eq!(armed2, 0);
@@ -31934,9 +32533,59 @@ mod tests {
     }
 
     #[test]
+    fn arm_idle_vblanks_skips_only_the_unsupported_device() {
+        let mut b = super::KmsBackend::for_tests();
+        let primary = output_crtc_key(&b, 0);
+        push_test_output(&mut b, 2);
+        b.platform.outputs[1].key.device_key = test_device_key(1);
+        let secondary = output_crtc_key(&b, 1);
+        b.crtc_queue_sequence_unsupported_devices
+            .insert(primary.device_key);
+
+        let mut attempted = Vec::new();
+        let armed = b
+            .arm_idle_vblanks_with(&[100], |crtc_key| {
+                attempted.push(crtc_key);
+                Ok(true)
+            })
+            .unwrap();
+
+        assert_eq!(armed, 1);
+        assert_eq!(attempted, vec![secondary]);
+        assert!(!b.armed_vblank_targets.contains_key(&primary));
+        assert!(b.armed_vblank_targets.contains_key(&secondary));
+    }
+
+    #[test]
+    fn arm_idle_vblanks_attempts_later_devices_after_a_transient_error() {
+        let mut b = super::KmsBackend::for_tests();
+        let primary = output_crtc_key(&b, 0);
+        push_test_output(&mut b, 2);
+        b.platform.outputs[1].key.device_key = test_device_key(1);
+        let secondary = output_crtc_key(&b, 1);
+
+        let mut attempted = Vec::new();
+        let error = b
+            .arm_idle_vblanks_with(&[100], |crtc_key| {
+                attempted.push(crtc_key);
+                if crtc_key == primary {
+                    Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+                } else {
+                    Ok(true)
+                }
+            })
+            .expect_err("the first transient error is still reported");
+
+        assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+        assert_eq!(attempted, vec![primary, secondary]);
+        assert!(!b.armed_vblank_targets.contains_key(&primary));
+        assert!(b.armed_vblank_targets.contains_key(&secondary));
+    }
+
+    #[test]
     fn arm_idle_vblanks_with_scanout_disallowed_clears_and_returns_zero() {
         let mut b = super::KmsBackend::for_tests();
-        let primary = b.platform.outputs[0].output.crtc;
+        let primary = output_crtc_key(&b, 0);
         b.armed_vblank_targets.insert(primary, 0);
         b.vt_state = crate::vt::state::VtState::Suspended;
 
@@ -31944,7 +32593,7 @@ mod tests {
         let armed = b
             .arm_idle_vblanks_with(&[100], |_| {
                 calls += 1;
-                Ok(())
+                Ok(true)
             })
             .unwrap();
         assert_eq!(armed, 0);
@@ -31968,9 +32617,10 @@ mod tests {
         let mut b = super::KmsBackend::for_tests();
         let crtc = b.platform.outputs[0].output.crtc;
         let crtc_id = u32::from(crtc);
-        b.armed_vblank_targets.insert(crtc, 0);
+        let crtc_key = output_crtc_key(&b, 0);
+        b.armed_vblank_targets.insert(crtc_key, 0);
         b.absolute_vblank_targets
-            .entry(crtc_id)
+            .entry(crtc_key)
             .or_default()
             .insert(50);
 
@@ -31983,7 +32633,7 @@ mod tests {
         );
 
         assert!(
-            b.armed_vblank_targets.contains_key(&crtc),
+            b.armed_vblank_targets.contains_key(&crtc_key),
             "a tagged event must not spend the untagged relative-1 slot"
         );
     }
@@ -31993,9 +32643,10 @@ mod tests {
         let mut b = super::KmsBackend::for_tests();
         let crtc = b.platform.outputs[0].output.crtc;
         let crtc_id = u32::from(crtc);
-        b.armed_vblank_targets.insert(crtc, 0);
+        let crtc_key = output_crtc_key(&b, 0);
+        b.armed_vblank_targets.insert(crtc_key, 0);
         b.absolute_vblank_targets
-            .entry(crtc_id)
+            .entry(crtc_key)
             .or_default()
             .insert(50);
 
@@ -32003,7 +32654,7 @@ mod tests {
         dispatch_test_sequence(&mut b, u64::from(crtc_id), 1_000_000, 50);
 
         assert_eq!(
-            b.absolute_vblank_targets.get(&crtc_id).unwrap(),
+            b.absolute_vblank_targets.get(&crtc_key).unwrap(),
             &std::collections::BTreeSet::from([50u64]),
             "an untagged event must not retire the absolute per-target set"
         );
@@ -32014,8 +32665,9 @@ mod tests {
         let mut b = super::KmsBackend::for_tests();
         let crtc = b.platform.outputs[0].output.crtc;
         let crtc_id = u32::from(crtc);
+        let crtc_key = output_crtc_key(&b, 0);
         b.absolute_vblank_targets
-            .entry(crtc_id)
+            .entry(crtc_key)
             .or_default()
             .extend([40u64, 50, 60]);
 
@@ -32027,7 +32679,7 @@ mod tests {
         );
 
         assert_eq!(
-            b.absolute_vblank_targets.get(&crtc_id).unwrap(),
+            b.absolute_vblank_targets.get(&crtc_key).unwrap(),
             &std::collections::BTreeSet::from([60u64]),
             "targets <= sequence retire; later targets stay armed"
         );
@@ -32044,9 +32696,10 @@ mod tests {
         let mut b = super::KmsBackend::for_tests();
         let crtc = b.platform.outputs[0].output.crtc;
         let crtc_id = u32::from(crtc);
-        b.armed_vblank_targets.insert(crtc, 0);
+        let crtc_key = output_crtc_key(&b, 0);
+        b.armed_vblank_targets.insert(crtc_key, 0);
         b.absolute_vblank_targets
-            .entry(crtc_id)
+            .entry(crtc_key)
             .or_default()
             .insert(50);
 
@@ -32060,11 +32713,11 @@ mod tests {
         );
 
         assert!(
-            !b.absolute_vblank_targets.contains_key(&crtc_id),
+            !b.absolute_vblank_targets.contains_key(&crtc_key),
             "the target must retire through the real producer encoding"
         );
         assert!(
-            b.armed_vblank_targets.contains_key(&crtc),
+            b.armed_vblank_targets.contains_key(&crtc_key),
             "and must not touch the relative slot"
         );
     }
@@ -32072,10 +32725,10 @@ mod tests {
     #[test]
     fn clear_all_armed_vblank_targets_clears_absolute_targets_too() {
         let mut b = super::KmsBackend::for_tests();
-        let crtc = b.platform.outputs[0].output.crtc;
-        b.armed_vblank_targets.insert(crtc, 0);
+        let crtc_key = output_crtc_key(&b, 0);
+        b.armed_vblank_targets.insert(crtc_key, 0);
         b.absolute_vblank_targets
-            .entry(u32::from(crtc))
+            .entry(crtc_key)
             .or_default()
             .insert(50);
 
@@ -32093,7 +32746,7 @@ mod tests {
         let covered = b
             .arm_present_absolute_vblank_with(&[500], |_, _| {
                 calls += 1;
-                Ok(())
+                Ok(true)
             })
             .unwrap();
         assert_eq!(covered, 1);
@@ -32108,7 +32761,7 @@ mod tests {
         let covered2 = b
             .arm_present_absolute_vblank_with(&[500], |_, _| {
                 calls += 1;
-                Ok(())
+                Ok(true)
             })
             .unwrap();
         assert_eq!(covered2, 1, "duplicate target stays covered, not 0");
@@ -32119,11 +32772,28 @@ mod tests {
         let covered3 = b
             .arm_present_absolute_vblank_with(&[600], |_, _| {
                 calls += 1;
-                Ok(())
+                Ok(true)
             })
             .unwrap();
         assert_eq!(covered3, 1);
         assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn arm_present_absolute_vblank_false_result_is_not_tracked_as_covered() {
+        let mut b = super::KmsBackend::for_tests();
+        let mut calls = 0;
+
+        let covered = b
+            .arm_present_absolute_vblank_with(&[500], |_, _| {
+                calls += 1;
+                Ok(false)
+            })
+            .unwrap();
+
+        assert_eq!(calls, 1);
+        assert_eq!(covered, 0);
+        assert!(b.absolute_vblank_targets.is_empty());
     }
 
     /// Push a second live output onto the fixture, with its own distinct
@@ -32141,6 +32811,7 @@ mod tests {
             crate::platform::drm::Output {
                 connector: ::drm::control::from_u32(crtc_id).unwrap(),
                 connector_name: "test2".to_string(),
+                encoder: ::drm::control::from_u32(crtc_id).unwrap(),
                 crtc: ::drm::control::from_u32(crtc_id).unwrap(),
                 plane: ::drm::control::from_u32(crtc_id).unwrap(),
                 // SAFETY: tests never pass this mode to DRM.
@@ -32186,22 +32857,102 @@ mod tests {
     }
 
     #[test]
+    fn direct_scanout_topology_requires_one_drm_device() {
+        let mut b = super::KmsBackend::for_tests();
+        push_test_output(&mut b, 2);
+        assert!(
+            b.direct_scanout_topology_eligible(),
+            "two equal-refresh outputs on the primary card may use grouped direct scanout"
+        );
+
+        b.platform.outputs[1].key.device_key = test_device_key(1);
+        assert!(
+            !b.direct_scanout_topology_eligible(),
+            "one atomic direct transaction cannot span DRM devices"
+        );
+    }
+
+    #[test]
+    fn direct_scanout_topology_rejects_heterogeneous_refresh() {
+        let mut b = super::KmsBackend::for_tests();
+        push_test_output(&mut b, 2);
+        b.platform.outputs[1].output.picked.vrefresh = 75;
+
+        assert!(
+            !b.direct_scanout_topology_eligible(),
+            "heterogeneous synthetic refresh rates stay on per-output composition"
+        );
+    }
+
+    #[test]
+    fn direct_scanout_topology_compares_precise_fractional_timings() {
+        let mut b = super::KmsBackend::for_tests();
+        push_test_output(&mut b, 2);
+        let timing = crate::platform::drm::Mode {
+            name: "1920x1080".to_string(),
+            width: 1920,
+            height: 1080,
+            vrefresh: 60,
+            preferred: true,
+            clock_khz: 148_500,
+            htotal: 2200,
+            vtotal: 1125,
+            ..Default::default()
+        };
+        b.platform.outputs[0].output.picked = timing.clone();
+        b.platform.outputs[1].output.picked = timing;
+        assert!(b.direct_scanout_topology_eligible());
+
+        // Both modes round to the same advertised integer refresh, but their
+        // pixel-clock ratios differ. The grouped path must not conflate them.
+        b.platform.outputs[1].output.picked.clock_khz = 148_352;
+        assert!(
+            !b.direct_scanout_topology_eligible(),
+            "same integer vrefresh is insufficient when kernel timing is available"
+        );
+    }
+
+    #[test]
+    fn direct_scanout_refresh_comparison_accounts_for_scan_multipliers() {
+        let base = crate::platform::drm::Mode {
+            clock_khz: 148_500,
+            htotal: 2200,
+            vtotal: 1125,
+            vscan: 1,
+            ..Default::default()
+        };
+        let mut adjusted = base.clone();
+
+        adjusted.flags = 1 << 4; // interlace doubles the effective rate
+        assert!(!super::effective_refresh_matches(&base, &adjusted));
+
+        adjusted.flags |= 1 << 5; // doublescan divides it back by two
+        assert!(super::effective_refresh_matches(&base, &adjusted));
+
+        adjusted.vscan = 2;
+        assert!(
+            !super::effective_refresh_matches(&base, &adjusted),
+            "vscan > 1 divides the effective refresh"
+        );
+    }
+
+    #[test]
     fn arm_present_absolute_vblank_with_arms_only_max_clock_crtc() {
         let mut b = super::KmsBackend::for_tests();
-        let crtc0 = u32::from(b.platform.outputs[0].output.crtc);
+        let crtc0 = output_crtc_key(&b, 0);
         push_test_output(&mut b, 2);
-        let crtc1 = 2u32;
+        let crtc1 = output_crtc_key(&b, 1);
 
         // Output 1 holds the max general-clock sample.
-        b.platform.ust_msc.insert(0, (5, 5_000));
-        b.platform.ust_msc.insert(1, (50, 50_000));
+        b.platform.ust_msc.insert(crtc0, (5, 5_000));
+        b.platform.ust_msc.insert(crtc1, (50, 50_000));
 
-        let mut armed_on: Vec<u32> = Vec::new();
+        let mut armed_on: Vec<CrtcKey> = Vec::new();
         let covered = b
-            .arm_present_absolute_vblank_with(&[999], |crtc_id, target| {
-                armed_on.push(crtc_id);
+            .arm_present_absolute_vblank_with(&[999], |crtc_key, target| {
+                armed_on.push(crtc_key);
                 assert_eq!(target, 999);
-                Ok(())
+                Ok(true)
             })
             .unwrap();
 
@@ -32217,6 +32968,25 @@ mod tests {
             !b.absolute_vblank_targets.contains_key(&crtc0),
             "the non-max-clock CRTC must not gain an armed entry"
         );
+    }
+
+    #[test]
+    fn arm_present_absolute_vblank_with_uses_first_live_crtc_before_first_sample() {
+        let mut b = super::KmsBackend::for_tests();
+        let first = output_crtc_key(&b, 0);
+        assert!(b.platform.ust_msc.is_empty());
+
+        let mut armed_on = Vec::new();
+        let covered = b
+            .arm_present_absolute_vblank_with(&[17], |crtc_key, target| {
+                armed_on.push(crtc_key);
+                assert_eq!(target, 17);
+                Ok(true)
+            })
+            .unwrap();
+
+        assert_eq!(covered, 1);
+        assert_eq!(armed_on, vec![first]);
     }
 
     // ── Present deferred-execution capability surface (Task 2) ─────────────

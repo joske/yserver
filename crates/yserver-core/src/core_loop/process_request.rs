@@ -2430,14 +2430,6 @@ fn handle_randr_request(
 ) -> io::Result<RequestOutcome> {
     use yserver_protocol::x11::{ClientByteOrder, randr as x11randr};
     const RANDR_MAJOR_OPCODE: u8 = 128;
-    fn connector_name_for_crtc(state: &ServerState, crtc: u32) -> Option<String> {
-        state
-            .randr
-            .outputs
-            .iter()
-            .find(|output| output.crtc_id == crtc)
-            .map(|output| output.name.clone())
-    }
     fn crtc_is_leased(_state: &ServerState, _crtc: u32) -> bool {
         false
     }
@@ -3438,7 +3430,7 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             };
-            let Some(connector) = connector_name_for_crtc(state, req.crtc) else {
+            if !crtc_exists(state, req.crtc) {
                 return emit_x11_error_with_minor(
                     state,
                     client_id,
@@ -3448,11 +3440,11 @@ fn handle_randr_request(
                     u16::from(header.data),
                     RANDR_MAJOR_OPCODE,
                 );
-            };
+            }
             let buf = x11randr::encode_get_crtc_gamma_size_reply(
                 byte_order,
                 sequence,
-                backend.crtc_gamma_size(&connector),
+                backend.crtc_gamma_size(req.crtc),
             );
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
@@ -3472,7 +3464,7 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             };
-            let Some(connector) = connector_name_for_crtc(state, req.crtc) else {
+            if !crtc_exists(state, req.crtc) {
                 return emit_x11_error_with_minor(
                     state,
                     client_id,
@@ -3482,8 +3474,8 @@ fn handle_randr_request(
                     u16::from(header.data),
                     RANDR_MAJOR_OPCODE,
                 );
-            };
-            let (red, green, blue) = backend.get_crtc_gamma(&connector);
+            }
+            let (red, green, blue) = backend.get_crtc_gamma(req.crtc);
             let buf =
                 x11randr::encode_get_crtc_gamma_reply(byte_order, sequence, &red, &green, &blue);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
@@ -3505,7 +3497,7 @@ fn handle_randr_request(
                 );
             };
             let crtc = u32::from_le_bytes(crtc_bytes.try_into().unwrap());
-            let Some(connector) = connector_name_for_crtc(state, crtc) else {
+            if !crtc_exists(state, crtc) {
                 return emit_x11_error_with_minor(
                     state,
                     client_id,
@@ -3515,7 +3507,7 @@ fn handle_randr_request(
                     u16::from(header.data),
                     RANDR_MAJOR_OPCODE,
                 );
-            };
+            }
             if crtc_is_leased(state, crtc) {
                 return emit_x11_error_with_minor(
                     state,
@@ -3553,7 +3545,7 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             }
-            let gamma_size = backend.crtc_gamma_size(&connector);
+            let gamma_size = backend.crtc_gamma_size(crtc);
             if size != gamma_size {
                 return emit_x11_error_with_minor(
                     state,
@@ -3582,8 +3574,8 @@ fn handle_randr_request(
                 .map(|chunk| u16::from_le_bytes(chunk.try_into().unwrap()))
                 .collect();
 
-            if let Err(e) = backend.set_crtc_gamma(&connector, &red, &green, &blue) {
-                log::warn!("RRSetCrtcGamma apply failed for {connector}: {e}");
+            if let Err(e) = backend.set_crtc_gamma(crtc, &red, &green, &blue) {
+                log::warn!("RRSetCrtcGamma apply failed for CRTC 0x{crtc:x}: {e}");
             }
             return Ok(RequestOutcome::Handled);
         }
@@ -12404,6 +12396,7 @@ fn handle_x_resource_request(
 #[derive(Debug)]
 struct CurrentVidModeOutput {
     output_id: u32,
+    crtc_id: u32,
     connector: String,
     mode: yserver_protocol::x11::xf86vidmode::ModeLine,
 }
@@ -12442,6 +12435,7 @@ fn current_vidmode_output(state: &ServerState) -> Option<CurrentVidModeOutput> {
     }
     Some(CurrentVidModeOutput {
         output_id: output.output_id,
+        crtc_id: output.crtc_id,
         connector: output.name.clone(),
         mode: ModeLine {
             dot_clock: timing.dot_clock_khz(),
@@ -12746,7 +12740,7 @@ fn handle_xf86vidmode_request(
                     XF86VIDMODE_MAJOR_OPCODE,
                 );
             };
-            let expected = backend.crtc_gamma_size(&current.connector);
+            let expected = backend.crtc_gamma_size(current.crtc_id);
             if request.size != expected {
                 return emit_x11_error_with_minor(
                     state,
@@ -12758,7 +12752,7 @@ fn handle_xf86vidmode_request(
                     XF86VIDMODE_MAJOR_OPCODE,
                 );
             }
-            let (red, green, blue) = backend.get_crtc_gamma(&current.connector);
+            let (red, green, blue) = backend.get_crtc_gamma(current.crtc_id);
             let expected = usize::from(expected);
             if red.len() != expected || green.len() != expected || blue.len() != expected {
                 return emit_x11_error_with_minor(
@@ -12818,7 +12812,7 @@ fn handle_xf86vidmode_request(
                         x11vm::GET_GAMMA_RAMP_SIZE => x11vm::encode_get_gamma_ramp_size_reply(
                             byte_order,
                             sequence,
-                            backend.crtc_gamma_size(&current.connector),
+                            backend.crtc_gamma_size(current.crtc_id),
                         ),
                         x11vm::GET_MONITOR => {
                             let edid = backend
@@ -39070,9 +39064,9 @@ mod tests {
 
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
-        let connector = current_vidmode_output(&state)
+        let crtc = current_vidmode_output(&state)
             .expect("active output")
-            .connector;
+            .crtc_id;
         let mut backend = RecordingBackend::new();
 
         let mut red = vec![0u16; 256];
@@ -39085,8 +39079,8 @@ mod tests {
         green[255] = 0xbbbb;
         blue[255] = 0xcccc;
         backend
-            .set_crtc_gamma(&connector, &red, &green, &blue)
-            .expect("seed selected connector gamma");
+            .set_crtc_gamma(crtc, &red, &green, &blue)
+            .expect("seed selected CRTC gamma");
 
         let perms = dispatch_vidmode_with_backend(
             &mut state,
@@ -50929,7 +50923,7 @@ mod tests {
             &body,
         )
         .expect("set gamma");
-        assert_eq!(backend.get_crtc_gamma("DP-1"), (red, green, blue));
+        assert_eq!(backend.get_crtc_gamma(2), (red, green, blue));
 
         handle_randr_request(
             &mut state,

@@ -33,6 +33,40 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-08-17 PRIME device-qualified lifecycle semantic replay:** connector
+  inventory, hotplug probing, and VT-resume probing now cover every
+  opened DRM device and reconcile a complete `(device key, connector name)`
+  connection/mode snapshot without recomputing live plane assignments.
+  Physical hotplug/resume snapshots also refresh size, EDID, and connector
+  type transiently on already-live outputs; forced-query and connected-Off
+  metadata authority remains deferred to the later metadata replay. Connected
+  secondary-card connectors are advertised off until a RANDR client enables
+  them; target-only discovery reserves every same-card survivor
+  encoder/CRTC/primary plane. Equal
+  connector names on different cards retain independent stable output/CRTC
+  XIDs, modes, and connection state. A probe
+  failure is an error rather than an inferred disconnect: startup fails,
+  forced `RRGetScreenResources` returns `BadAlloc`, resume requests shutdown,
+  and asynchronous hotplug logs the error while leaving the prior snapshot
+  untouched. A more tolerant retain/warn/retry policy for transient secondary
+  failures is documented but deferred. Present UST/MSC clocks, software-MSC
+  fallbacks, relative/absolute vblank arms, sequence-event routing, and
+  lifecycle pruning are keyed by `(device key, CRTC handle)`; unsupported
+  `DRM_IOCTL_CRTC_QUEUE_SEQUENCE` is latched per device. Absolute Present
+  targets reside on the device-qualified CRTC supplying the current maximum
+  clock, while the protocol-facing clock remains the existing maximum across
+  live CRTCs. Per-Present CRTC/device ownership with per-window MSC continuity
+  is the immediate next adaptation commit. RANDR/XF86VidMode gamma calls
+  route by CRTC XID to a device-qualified LUT and DRM fd. Whole-root grouped
+  direct scanout is now
+  limited to active outputs on the primary DRM device with identical effective
+  refresh timings; mixed-device, heterogeneous-refresh, and secondary-only
+  layouts retain ordinary per-output composition and independent flips.
+  Best-effort hardware-cursor ownership per card is a subsequent adaptation,
+  not part of this slice; it must restore device-local plane/CRTC coverage and
+  retain non-sticky `EINVAL` handling.
+  Decision record:
+  [`2026-08-17-prime-bb4-semantic-replay.md`](superpowers/notes/2026-08-17-prime-bb4-semantic-replay.md).
 - **2026-08-16 portable DRM node-discovery boundary:** stable `st_rdev`
   device identities, `/dev/dri` enumeration, KMS-card selection, and safe
   render-node choice now live in `platform::drm`. Linux sysfs is an optional
@@ -611,7 +645,7 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   KMS modesetting driver by advertising a programmable clock rather than a
   legacy fixed-clock table. `ValidateModeLine` returns `MODE_OK` only for that
   advertised active timing and `MODE_BAD` for invalid or other modes. VidMode
-  gamma-ramp reads resolve the same connector and backend LUT as RANDR, while
+  gamma-ramp reads resolve the same selected RANDR CRTC and backend LUT, while
   the independent per-screen `GetGamma` scalar stays at the unmodified Xorg
   default of 1.0.
   RANDR remains the only display-configuration interface:

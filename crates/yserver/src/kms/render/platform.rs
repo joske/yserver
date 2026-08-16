@@ -540,6 +540,30 @@ pub(crate) struct SequenceCompletion {
     pub(crate) sequence: u64,
 }
 
+/// Process-local identity of one KMS CRTC.
+///
+/// DRM object handles are scoped to a DRM device. Two cards may expose the
+/// same raw CRTC handle, so every long-lived clock, vblank arm, and event
+/// route must carry the owning device as well.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct CrtcKey {
+    pub(crate) device_key: crate::platform::drm::DrmDeviceKey,
+    pub(crate) crtc: ::drm::control::crtc::Handle,
+}
+
+impl CrtcKey {
+    pub(crate) fn new(
+        device_key: crate::platform::drm::DrmDeviceKey,
+        crtc: ::drm::control::crtc::Handle,
+    ) -> Self {
+        Self { device_key, crtc }
+    }
+
+    pub(crate) fn for_output(output: &ActiveOutput) -> Self {
+        Self::new(output.key.device_key, output.output.crtc)
+    }
+}
+
 /// One opened DRM/KMS device and its sibling render-node resources.
 pub(crate) struct KmsDevice {
     pub(crate) key: crate::platform::drm::DrmDeviceKey,
@@ -661,17 +685,17 @@ pub(crate) struct PlatformBackend {
     pub(crate) outputs: Vec<ActiveOutput>,
     pub(crate) fb_w: u16,
     pub(crate) fb_h: u16,
-    /// Latest general kernel `(msc, ust_micros)` per output index, updated
+    /// Latest general kernel `(msc, ust_micros)` per device-qualified CRTC, updated
     /// by pageflip retirements and standalone sequence events. Drives
     /// `PresentNotifyMSC` (`present_get_ust_msc`): a compositor's
     /// `PresentNotifyMSC` completes with these real values so its frame
     /// clock advances at the display refresh rate. Empty until the first
     /// flip retires.
-    pub(crate) ust_msc: std::collections::HashMap<usize, (u64, u64)>,
+    pub(crate) ust_msc: std::collections::HashMap<CrtcKey, (u64, u64)>,
     /// Latest per-output sample eligible to release a paced Present
     /// completion. Pageflip retirements always qualify; standalone sequence
     /// events are inserted by `KmsBackend` only when the display is idle.
-    pub(crate) completion_clocks: std::collections::HashMap<usize, PresentClockSample>,
+    pub(crate) completion_clocks: std::collections::HashMap<CrtcKey, PresentClockSample>,
 
     /// Per-output software MSC fallback. Some KMS drivers (notably
     /// apple_drm on Asahi) report `frame == 0` in every page-flip
@@ -688,7 +712,7 @@ pub(crate) struct PlatformBackend {
     /// advancing MSC at the actual pageflip cadence. On drivers that
     /// report a real `frame > 0` this map stays empty (the real value
     /// is used directly).
-    pub(crate) software_msc: std::collections::HashMap<usize, u64>,
+    pub(crate) software_msc: std::collections::HashMap<CrtcKey, u64>,
 
     // Input side
     input_ctx: Option<crate::input::SendContext>,
@@ -797,11 +821,48 @@ pub(crate) struct RescanResult {
     pub dropped_keys: Vec<OutputKey>,
     pub dropped_old_indices: Vec<usize>,
     pub added_count: usize,
-    /// Task 5.2: newly-connected connectors discovered by a *runtime*
-    /// rescan are NOT auto-enabled — they're surfaced here (with their
-    /// advertised modes/dimensions) so the backend can register them
-    /// off in the connector registry and fire `OutputChangeNotify`.
-    pub added_outputs: Vec<(OutputKey, crate::platform::drm::Output)>,
+    /// Every connector currently discovered as connected, including inactive
+    /// secondary-card connectors. The backend reconciles this complete,
+    /// device-qualified snapshot into its stable RANDR registry.
+    pub connected: Vec<ConnectorSnapshot>,
+}
+
+/// Device-qualified connector metadata used to reconcile lightweight probes
+/// with the stable RANDR registry without inventing a CRTC/plane assignment.
+#[derive(Debug, Clone)]
+pub(crate) struct ConnectorSnapshot {
+    pub(crate) key: OutputKey,
+    pub(crate) modes: Vec<crate::platform::drm::Mode>,
+    pub(crate) mm_width: u32,
+    pub(crate) mm_height: u32,
+    pub(crate) edid: Vec<u8>,
+    pub(crate) connector_type: String,
+}
+
+impl ConnectorSnapshot {
+    fn from_probe(
+        device_key: crate::platform::drm::DrmDeviceKey,
+        probe: &crate::platform::drm::ConnectorSnapshotProbe,
+    ) -> Self {
+        Self {
+            key: OutputKey::new(device_key, probe.connector_name.clone()),
+            modes: probe.modes.clone(),
+            mm_width: probe.mm_width,
+            mm_height: probe.mm_height,
+            edid: probe.edid.clone(),
+            connector_type: probe.connector_type.clone(),
+        }
+    }
+
+    pub(crate) fn preserves_active_output(&self, output: &ActiveOutput) -> bool {
+        // A monitor replacement on the same connector does not revoke the
+        // mode already programmed in KMS. Keep that live route until a RANDR
+        // client selects a replacement; only a disconnected/no-mode probe
+        // forces it Off. The later metadata-refresh replay will make the
+        // registry's exact mode identities authoritative without changing
+        // this live-mode preservation policy.
+        self.key == output.key && !self.modes.is_empty()
+    }
 }
 
 /// Pure recompute of the virtual-screen extent from `(x, y, width, height)`.
@@ -1047,18 +1108,22 @@ impl PlatformBackend {
         // Stage 5 Phase B — bring up the primary DRM cursor plane. Failure
         // is non-fatal; the scene falls back to software. With no CRTCs there
         // is no plane to bind, so defer initialization until an output exists.
-        let crtc_handles: Vec<::drm::control::crtc::Handle> = initial_scanout_rollback
-            .outputs()
-            .iter()
-            .map(|l| l.output.crtc)
-            .collect();
+        let primary = initial_scanout_rollback.devices().first();
+        let crtc_handles: Vec<::drm::control::crtc::Handle> = primary.map_or_else(Vec::new, |p| {
+            initial_scanout_rollback
+                .outputs()
+                .iter()
+                .filter(|layout| layout.key.device_key == p.key)
+                .map(|layout| layout.output.crtc)
+                .collect()
+        });
         let cursor_plane = if crtc_handles.is_empty() {
-            log::info!("render PlatformBackend: no active CRTCs; hardware cursor init deferred");
+            log::info!(
+                "render PlatformBackend: no active primary-device CRTCs; hardware cursor init deferred"
+            );
             None
         } else {
-            let primary = initial_scanout_rollback.devices().first().ok_or_else(|| {
-                io::Error::other("render PlatformBackend: active CRTC exists without a KMS device")
-            })?;
+            let primary = primary.expect("a primary device supplied the nonempty CRTC list");
             match crate::kms::cursor_plane::CursorPlane::new(
                 Rc::clone(&primary.device),
                 &crtc_handles,
@@ -1199,6 +1264,7 @@ impl PlatformBackend {
                 crate::platform::drm::Output {
                     connector: ::drm::control::from_u32(1).unwrap(),
                     connector_name: "test".to_string(),
+                    encoder: ::drm::control::from_u32(1).unwrap(),
                     crtc: ::drm::control::from_u32(1).unwrap(),
                     plane: ::drm::control::from_u32(1).unwrap(),
                     // SAFETY: tests never pass this mode to DRM.
@@ -1281,8 +1347,10 @@ impl PlatformBackend {
     // transition state machine can drive the plane without
     // re-introducing the multi-output double-cursor hazard.
     //
-    // - `cursor_plane_available()` is consulted by `build_scene`'s
-    //   pure `CursorAssignment` decision.
+    // - `cursor_plane_available_for_output()` is consulted by `build_scene`'s
+    //   pure `CursorAssignment` decision. The current singleton plane belongs
+    //   to the primary DRM fd, so secondary-card outputs must stay software
+    //   until the next incremental commit installs one plane per device.
     // - `cursor_plane_upload_image` memcpys bytes into the shared
     //   dumb buffer ONLY. It does NOT call `set_cursor2`.
     //   `set_cursor2(Some, …)` IS the show operation in legacy DRM;
@@ -1310,6 +1378,22 @@ impl PlatformBackend {
     #[must_use]
     pub(crate) fn cursor_plane_available(&self) -> bool {
         self.cursor_plane.is_some() && !self.hw_cursor_disabled
+    }
+
+    /// True iff the singleton hardware cursor belongs to this output's DRM
+    /// device. Raw CRTC handles are only device-local: passing a secondary
+    /// card's numerically-colliding handle to the primary cursor fd could move
+    /// or hide the cursor on the wrong primary output.
+    #[must_use]
+    pub(crate) fn cursor_plane_available_for_output(&self, output_idx: usize) -> bool {
+        self.cursor_plane_available() && self.cursor_plane_owns_output(output_idx)
+    }
+
+    fn cursor_plane_owns_output(&self, output_idx: usize) -> bool {
+        self.outputs
+            .get(output_idx)
+            .zip(self.primary_device())
+            .is_some_and(|(output, owner)| output.key.device_key == owner.key)
     }
 
     /// True iff the KMS driver is nvidia-drm. On NVIDIA the HW cursor
@@ -1404,6 +1488,11 @@ impl PlatformBackend {
         x: i32,
         y: i32,
     ) -> io::Result<()> {
+        if !self.cursor_plane_owns_output(output_idx) {
+            return Err(io::Error::other(
+                "cursor plane does not own this output's DRM device",
+            ));
+        }
         let Some(layout) = self.outputs.get(output_idx) else {
             return Err(io::Error::new(io::ErrorKind::NotFound, "no such output"));
         };
@@ -1444,9 +1533,11 @@ impl PlatformBackend {
     ) -> io::Result<()> {
         // Snapshot output layouts so the per-CRTC ioctls below can
         // borrow `&mut self.cursor_plane` exclusively.
+        let owner = self.primary_device().map(|device| device.key);
         let layouts: Vec<(::drm::control::crtc::Handle, i32, i32)> = self
             .outputs
             .iter()
+            .filter(|layout| Some(layout.key.device_key) == owner)
             .map(|l| (l.output.crtc, l.x, l.y))
             .collect();
         let Some(plane) = self.cursor_plane.as_mut() else {
@@ -1537,9 +1628,11 @@ impl PlatformBackend {
         hot_y: u16,
     ) -> io::Result<u32> {
         // Snapshot first (see `cursor_plane_rebind_visible_crtcs`).
+        let owner = self.primary_device().map(|device| device.key);
         let layouts: Vec<(::drm::control::crtc::Handle, i32, i32)> = self
             .outputs
             .iter()
+            .filter(|layout| Some(layout.key.device_key) == owner)
             .map(|l| (l.output.crtc, l.x, l.y))
             .collect();
         let Some(plane) = self.cursor_plane.as_mut() else {
@@ -1592,7 +1685,11 @@ impl PlatformBackend {
         let Some(plane) = self.cursor_plane.as_ref() else {
             return false;
         };
+        let owner = self.primary_device().map(|device| device.key);
         for l in &self.outputs {
+            if Some(l.key.device_key) != owner {
+                continue;
+            }
             let dx = x - i32::from(hot_x) - l.x;
             let dy = y - i32::from(hot_y) - l.y;
             let intersects = cursor_footprint_intersects_output(
@@ -1618,6 +1715,11 @@ impl PlatformBackend {
     /// `NotFound` if `output_idx` is out of range or plane is
     /// unavailable; `set_cursor2` ioctl failure otherwise.
     pub(crate) fn cursor_plane_hide_on_crtc(&mut self, output_idx: usize) -> io::Result<()> {
+        if self.outputs.get(output_idx).is_some() && !self.cursor_plane_owns_output(output_idx) {
+            // Secondary outputs never bind this plane, so there is nothing to
+            // detach and—critically—no raw CRTC handle may reach the owner fd.
+            return Ok(());
+        }
         let Some(layout) = self.outputs.get(output_idx) else {
             return Err(io::Error::new(io::ErrorKind::NotFound, "no such output"));
         };
@@ -1646,8 +1748,13 @@ impl PlatformBackend {
         // Union of currently-tracked CRTCs and current output CRTCs.
         // Output disable could have removed a CRTC from `outputs`
         // while a stale visibility entry survives; iterate both.
-        let mut crtcs: Vec<::drm::control::crtc::Handle> =
-            self.outputs.iter().map(|l| l.output.crtc).collect();
+        let owner = self.primary_device().map(|device| device.key);
+        let mut crtcs: Vec<::drm::control::crtc::Handle> = self
+            .outputs
+            .iter()
+            .filter(|layout| Some(layout.key.device_key) == owner)
+            .map(|layout| layout.output.crtc)
+            .collect();
         let Some(plane) = self.cursor_plane.as_mut() else {
             return Err(io::Error::other("cursor plane unavailable"));
         };
@@ -1699,6 +1806,71 @@ impl PlatformBackend {
         self.device_for_key(key.device_key)
     }
 
+    /// Gather lightweight connector probes for every opened DRM device.
+    /// Results are accumulated before callers mutate RANDR state, so a
+    /// failure on card N cannot leave a half-reconciled combined snapshot.
+    pub(crate) fn probe_all_connectors(
+        &self,
+    ) -> io::Result<
+        Vec<(
+            crate::platform::drm::DrmDeviceKey,
+            Vec<crate::platform::drm::ConnectorProbe>,
+        )>,
+    > {
+        let mut all = Vec::with_capacity(self.devices.len());
+        for device in &self.devices {
+            let probes =
+                crate::platform::drm::probe_connectors(&device.device).map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!("probe connectors on DRM device {}: {error}", device.key),
+                    )
+                })?;
+            all.push((device.key, probes));
+        }
+        Ok(all)
+    }
+
+    /// Gather the complete connected-connector snapshot without mutating any
+    /// live output, pool, or RANDR-facing state. The backend can therefore
+    /// quiesce GPU/page-flip/direct work only after every device probe has
+    /// succeeded, and before applying removals.
+    pub(crate) fn probe_connector_snapshot(&self) -> io::Result<Vec<ConnectorSnapshot>> {
+        let mut snapshot = Vec::new();
+        for device in &self.devices {
+            let probes = crate::platform::drm::probe_connector_snapshots(&device.device).map_err(
+                |error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!(
+                            "probe connector snapshot on DRM device {}: {error}",
+                            device.key
+                        ),
+                    )
+                },
+            )?;
+            snapshot.extend(
+                probes
+                    .iter()
+                    .map(|probe| ConnectorSnapshot::from_probe(device.key, probe)),
+            );
+        }
+        Ok(snapshot)
+    }
+
+    pub(crate) fn output_index_for_crtc(&self, crtc_key: CrtcKey) -> Option<usize> {
+        self.outputs.iter().position(|output| {
+            output.key.device_key == crtc_key.device_key && output.output.crtc == crtc_key.crtc
+        })
+    }
+
+    fn prune_present_clocks_to_live_outputs(&mut self) {
+        let live: HashSet<CrtcKey> = self.outputs.iter().map(CrtcKey::for_output).collect();
+        self.ust_msc.retain(|key, _| live.contains(key));
+        self.completion_clocks.retain(|key, _| live.contains(key));
+        self.software_msc.retain(|key, _| live.contains(key));
+    }
+
     pub(crate) fn poll_fds(&self) -> Vec<(RawFd, BackendFdKind)> {
         let mut fds = Vec::with_capacity(3 + self.devices.len());
         if let Some(ctx) = self.input_ctx.as_ref() {
@@ -1724,6 +1896,98 @@ impl PlatformBackend {
         self.devices
             .iter()
             .position(|device| device.device.as_fd().as_raw_fd() == drm_fd)
+    }
+
+    /// Drain page-flip events that belong to the topology epoch just taken
+    /// fully off-screen. A blocking ALLOW_MODESET waits prior flips, but the
+    /// kernel can signal that wait just before it links the corresponding
+    /// event onto the DRM fd. Wait boundedly for every CRTC known to have had
+    /// a pending flip, then drain any already-ready tail. Sequence events are
+    /// intentionally discarded too: all vblank arm bookkeeping was cleared
+    /// when the CRTCs were disabled.
+    pub(crate) fn discard_old_drm_events_after_all_off(
+        &self,
+        expected_pageflips: &HashSet<CrtcKey>,
+        timeout: std::time::Duration,
+    ) -> io::Result<()> {
+        let mut expected = expected_pageflips.clone();
+        let deadline = std::time::Instant::now() + timeout;
+
+        loop {
+            let wait_ms = if expected.is_empty() {
+                0
+            } else {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "timed out waiting for {} old DRM page-flip event(s): {expected:?}",
+                            expected.len()
+                        ),
+                    ));
+                }
+                i32::try_from((deadline - now).as_millis().max(1)).unwrap_or(i32::MAX)
+            };
+            let mut poll_fds: Vec<libc::pollfd> = self
+                .devices
+                .iter()
+                .map(|device| libc::pollfd {
+                    fd: device.device.as_fd().as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                })
+                .collect();
+            if poll_fds.is_empty() {
+                return if expected.is_empty() {
+                    Ok(())
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "old page flips remained but no DRM device is open",
+                    ))
+                };
+            }
+            let nfds = libc::nfds_t::try_from(poll_fds.len())
+                .map_err(|_| io::Error::other("too many DRM fds to poll"))?;
+            // SAFETY: `poll_fds` is a live contiguous array of `nfds`
+            // initialized pollfd records for the duration of this call.
+            let ready = unsafe { libc::poll(poll_fds.as_mut_ptr(), nfds, wait_ms) };
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if ready == 0 {
+                if expected.is_empty() {
+                    return Ok(());
+                }
+                continue;
+            }
+
+            for (device, poll_fd) in self.devices.iter().zip(&poll_fds) {
+                let error_events = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
+                if poll_fd.revents & error_events != 0 {
+                    return Err(io::Error::other(format!(
+                        "DRM fd {} reported poll error flags 0x{:x} while draining old events",
+                        poll_fd.fd, poll_fd.revents
+                    )));
+                }
+                if poll_fd.revents & libc::POLLIN == 0 {
+                    continue;
+                }
+                let device_key = device.key;
+                crate::drm::page_flip::drain_events(
+                    &device.device,
+                    |crtc, _frame, _duration| {
+                        expected.remove(&CrtcKey::new(device_key, crtc));
+                    },
+                    |_user_data, _time_ns, _sequence| {},
+                )?;
+            }
+        }
     }
 
     pub(crate) fn drain_page_flip_events(
@@ -1765,9 +2029,8 @@ impl PlatformBackend {
 
         let mut output_indices = Vec::with_capacity(flipped.len());
         for (crtc, frame, dur) in flipped {
-            let Some(output_idx) = self.outputs.iter().position(|output| {
-                output.key.device_key == device_key && output.output.crtc == crtc
-            }) else {
+            let crtc_key = CrtcKey::new(device_key, crtc);
+            let Some(output_idx) = self.output_index_for_crtc(crtc_key) else {
                 log::warn!("render: pageflip-complete for unknown CRTC {crtc:?} on {device_key}");
                 continue;
             };
@@ -1786,11 +2049,11 @@ impl PlatformBackend {
             let msc = if frame == 0 {
                 let next = self
                     .software_msc
-                    .get(&output_idx)
+                    .get(&crtc_key)
                     .copied()
                     .unwrap_or(0)
                     .saturating_add(1);
-                self.software_msc.insert(output_idx, next);
+                self.software_msc.insert(crtc_key, next);
                 log::debug!(
                     target: "yserver::kms::render::platform",
                     "render pageflip software-msc fallback output={output_idx} msc={next} \
@@ -1804,9 +2067,9 @@ impl PlatformBackend {
                 target: "yserver::kms::render::platform",
                 "render pageflip ust_msc output={output_idx} msc={msc} kernel_frame={frame} kernel_ust_micros={ust}"
             );
-            self.record_vblank_clock(output_idx, msc, ust);
+            self.record_vblank_clock(crtc_key, msc, ust);
             self.record_completion_clock(
-                output_idx,
+                crtc_key,
                 PresentClockSample {
                     msc,
                     ust,
@@ -1822,15 +2085,10 @@ impl PlatformBackend {
         Ok((output_indices, sequenced))
     }
 
-    /// Latest kernel `(msc, ust_micros)` across all outputs — the most
-    /// advanced output's pair — or `(0, 0)` before the first pageflip retires.
-    /// Consumed by the Present vblank-pacing path to complete
-    /// `PresentNotifyMSC`.
-    ///
-    /// Taking the max (rather than keying on output 0) matters for
-    /// multi-monitor: a full-screen compositor on a *secondary* output flips
-    /// only that CRTC, so an output-0 reading would leave the global clock
-    /// stuck at 0 and that compositor's NotifyMSC parked forever.
+    /// Latest kernel `(msc, ust_micros)` across all live CRTC samples, or
+    /// `(0, 0)` before the first pageflip/sequence event. This preserves the
+    /// current upstream global-clock behavior until the immediately-following
+    /// per-Present domain adaptation carries a selected RANDR CRTC end to end.
     pub(crate) fn present_get_ust_msc(&self) -> (u64, u64) {
         self.ust_msc
             .values()
@@ -1839,19 +2097,14 @@ impl PlatformBackend {
             .unwrap_or((0, 0))
     }
 
-    /// Which output index holds the current max general-clock sample —
-    /// the same reduction `present_get_ust_msc` performs — or `None`
-    /// before the first pageflip retires. The absolute per-target
-    /// vblank arm targets only this CRTC: the target MSC lives in this
-    /// CRTC's counter space, and arming every CRTC would queue the
-    /// event on a lagging CRTC too (mixed-refresh dual-head), where it
-    /// may not fire for hours — leaking a set entry and a queued kernel
-    /// event for the whole wait.
-    pub(crate) fn present_max_clock_output_idx(&self) -> Option<usize> {
+    /// Device-qualified CRTC that contributed the maximum current general
+    /// clock sample. Absolute arms must use this same counter domain while the
+    /// core still exposes one global clock.
+    pub(crate) fn present_max_clock_crtc(&self) -> Option<CrtcKey> {
         self.ust_msc
             .iter()
             .max_by_key(|(_, (msc, _))| *msc)
-            .map(|(&idx, _)| idx)
+            .map(|(&key, _)| key)
     }
 
     pub(crate) fn present_get_completion_clock(&self) -> PresentClockSample {
@@ -1868,12 +2121,12 @@ impl PlatformBackend {
 
     /// Record a general vblank sample without allowing late events to move
     /// the shared Present clock backwards.
-    pub(crate) fn record_vblank_clock(&mut self, output_idx: usize, msc: u64, ust: u64) {
-        let replace = self.ust_msc.get(&output_idx).is_none_or(|(old_msc, _)| {
+    pub(crate) fn record_vblank_clock(&mut self, crtc_key: CrtcKey, msc: u64, ust: u64) {
+        let replace = self.ust_msc.get(&crtc_key).is_none_or(|(old_msc, _)| {
             msc == *old_msc || yserver_core::present_scheduler::msc_is_after(msc, *old_msc)
         });
         if replace {
-            self.ust_msc.insert(output_idx, (msc, ust));
+            self.ust_msc.insert(crtc_key, (msc, ust));
         }
     }
 
@@ -1882,17 +2135,17 @@ impl PlatformBackend {
     /// the stronger event if both arrive for the same field.
     pub(crate) fn record_completion_clock(
         &mut self,
-        output_idx: usize,
+        crtc_key: CrtcKey,
         sample: PresentClockSample,
     ) {
-        let replace = self.completion_clocks.get(&output_idx).is_none_or(|old| {
+        let replace = self.completion_clocks.get(&crtc_key).is_none_or(|old| {
             yserver_core::present_scheduler::msc_is_after(sample.msc, old.msc)
                 || (sample.msc == old.msc
                     && (old.source != PresentClockSource::PageFlip
                         || sample.source == PresentClockSource::PageFlip))
         });
         if replace {
-            self.completion_clocks.insert(output_idx, sample);
+            self.completion_clocks.insert(crtc_key, sample);
         }
     }
 
@@ -2743,6 +2996,33 @@ impl PlatformBackend {
             return Err(e);
         }
 
+        self.remove_connector_at(idx);
+
+        log::info!(
+            "render disable_connector: {connector} disabled; fb now {}×{}",
+            self.fb_w,
+            self.fb_h
+        );
+        Ok(true)
+    }
+
+    /// Remove a connector after the caller has successfully disabled the
+    /// complete old CRTC set. This is the topology-mutation counterpart to
+    /// `disable_connector`: it must not issue a second ioctl against an
+    /// already-off (or newly disconnected) connector object.
+    pub(crate) fn remove_connector_after_all_off(&mut self, output_key: &OutputKey) -> bool {
+        let Some(idx) = self
+            .outputs
+            .iter()
+            .position(|layout| &layout.key == output_key)
+        else {
+            return false;
+        };
+        self.remove_connector_at(idx);
+        true
+    }
+
+    fn remove_connector_at(&mut self, idx: usize) {
         // Drop the scanout pool for this output so its VkImages are freed.
         if idx < self.scanout_pools.len() {
             self.scanout_pools.remove(idx);
@@ -2765,13 +3045,7 @@ impl PlatformBackend {
         let (fb_w, fb_h) = recompute_fb_extent_from(&layouts);
         self.fb_w = fb_w;
         self.fb_h = fb_h;
-
-        log::info!(
-            "render disable_connector: {connector} disabled; fb now {}×{}",
-            fb_w,
-            fb_h
-        );
-        Ok(true)
+        self.prune_present_clocks_to_live_outputs();
     }
 
     /// Enable (or reconfigure) a single connector at `(x, y)` with
@@ -2781,9 +3055,9 @@ impl PlatformBackend {
     /// previously off, commits the modeset, and adds/updates the
     /// `ActiveOutput` in `self.outputs` and the parallel vecs.
     ///
-    /// The `Output` for `connector` must be pre-discovered via
-    /// `discover_outputs`; pass the **full** `Vec<Output>` from a
-    /// fresh discovery call.  The selected `Output` is consumed.
+    /// The `Output` for `connector` must be pre-discovered with the live
+    /// routes of every same-device survivor reserved. The selected `Output`
+    /// is consumed.
     ///
     /// On any failure after pool allocation, the pool is freed and the
     /// output stays off (no partial enable), leaving `self` consistent.
@@ -2805,6 +3079,20 @@ impl PlatformBackend {
                 .ok_or_else(|| io::Error::other(format!("no DRM device for {output_key:?}")))?
                 .device,
         );
+
+        if let Some(conflict) = self.outputs.iter().find(|layout| {
+            layout.key.device_key == output_key.device_key
+                && layout.key != *output_key
+                && (layout.output.encoder == output.encoder
+                    || layout.output.crtc == output.crtc
+                    || layout.output.plane == output.plane)
+        }) {
+            return Err(io::Error::other(format!(
+                "enable_connector {connector}: proposed encoder {:?}/CRTC {:?}/plane {:?} conflicts with \
+                 live output {} on the same DRM device",
+                output.encoder, output.crtc, output.plane, conflict.output.connector_name
+            )));
+        }
 
         // Resolve ModeSpec → the DRM mode on the output.
         // `Output::modes` is the full advertised list (preferred-first).
@@ -2906,7 +3194,7 @@ impl PlatformBackend {
         };
 
         // (Re)allocate the scanout pool if needed.
-        let new_pool = if needs_pool_realloc {
+        let mut new_pool = if needs_pool_realloc {
             if let Some(vk) = self.vk.as_ref().cloned() {
                 match ScanoutBoPool::allocate(
                     Arc::clone(&vk),
@@ -2989,6 +3277,30 @@ impl PlatformBackend {
             return Err(e);
         }
 
+        // A synchronous modeset has already latched this framebuffer; unlike
+        // an ordinary page flip no completion event will promote it from
+        // Pending. Reserve it now so the compositor cannot immediately acquire
+        // and render into the live front buffer.
+        let mark_front = |pool: &mut ScanoutBoPool| {
+            if let Some(bo) = pool
+                .bos
+                .iter_mut()
+                .find(|bo| bo.fb_handle == Some(fb_for_commit))
+            {
+                bo.state.mark_on_screen_after_modeset();
+            }
+        };
+        if needs_pool_realloc {
+            if let Some(pool) = new_pool.as_mut().and_then(Option::as_mut) {
+                mark_front(pool);
+            }
+        } else if let Some(pool) = existing_idx
+            .and_then(|idx| self.scanout_pools.get_mut(idx))
+            .and_then(Option::as_mut)
+        {
+            mark_front(pool);
+        }
+
         // Commit succeeded — install the output into the active set.
         if let Some(idx) = existing_idx {
             // Update in-place.
@@ -3038,6 +3350,7 @@ impl PlatformBackend {
         let (fb_w, fb_h) = recompute_fb_extent_from(&layouts);
         self.fb_w = fb_w;
         self.fb_h = fb_h;
+        self.prune_present_clocks_to_live_outputs();
 
         log::info!(
             "render enable_connector: {connector} enabled {}×{}@{} at ({x},{y}); fb now {}×{}",
@@ -3266,31 +3579,46 @@ impl PlatformBackend {
                     .device_for_output(&layout.key)
                     .map(|device| Rc::clone(&device.device))
                 else {
-                    log::warn!(
-                        "dpms_set_outputs_active(true): no DRM device {} for {}",
-                        layout.key.device_key,
-                        layout.output.connector_name,
+                    let error = io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!(
+                            "dpms_set_outputs_active(true): no DRM device {} for {}",
+                            layout.key.device_key, layout.output.connector_name,
+                        ),
                     );
+                    log::error!("{error}");
+                    if first_err.is_none() {
+                        first_err = Some(error);
+                    }
                     continue;
                 };
-                let fb = self
-                    .scanout_pools
-                    .get(i)
-                    .and_then(|p| p.as_ref())
-                    .and_then(|pool| {
-                        use crate::kms::vk::scanout::BoPhase;
-                        pool.bos
-                            .iter()
-                            .find(|bo| bo.state.phase == BoPhase::OnScreen)
-                            .and_then(|bo| bo.fb_handle)
-                            .or_else(|| pool.bos.iter().find_map(|bo| bo.fb_handle))
-                    });
-                let Some(fb_id) = fb else {
-                    log::warn!(
-                        "dpms_set_outputs_active(true): no fb for output {} — skipping; \
-                         next composite tick will set it",
-                        layout.output.connector_name,
-                    );
+                let front =
+                    self.scanout_pools
+                        .get(i)
+                        .and_then(|p| p.as_ref())
+                        .and_then(|pool| {
+                            use crate::kms::vk::scanout::BoPhase;
+                            pool.bos
+                                .iter()
+                                .enumerate()
+                                .find(|(_, bo)| bo.state.phase == BoPhase::OnScreen)
+                                .and_then(|(bo_idx, bo)| bo.fb_handle.map(|fb| (bo_idx, fb)))
+                                .or_else(|| {
+                                    pool.bos.iter().enumerate().find_map(|(bo_idx, bo)| {
+                                        bo.fb_handle.map(|fb| (bo_idx, fb))
+                                    })
+                                })
+                        });
+                let Some((bo_idx, fb_id)) = front else {
+                    let error = io::Error::other(format!(
+                        "dpms_set_outputs_active(true): no framebuffer for output {}; \
+                         an ordinary page flip cannot restore MODE_ID/ACTIVE",
+                        layout.output.connector_name
+                    ));
+                    log::error!("{error}");
+                    if first_err.is_none() {
+                        first_err = Some(error);
+                    }
                     continue;
                 };
                 if let Err(e) = crate::drm::modeset::commit_modeset(&device, &layout.output, fb_id)
@@ -3302,6 +3630,13 @@ impl PlatformBackend {
                     if first_err.is_none() {
                         first_err = Some(e);
                     }
+                } else if let Some(bo) = self
+                    .scanout_pools
+                    .get_mut(i)
+                    .and_then(Option::as_mut)
+                    .and_then(|pool| pool.bos.get_mut(bo_idx))
+                {
+                    bo.state.mark_on_screen_after_modeset();
                 }
             }
         } else {
@@ -3310,11 +3645,17 @@ impl PlatformBackend {
                     .device_for_output(&layout.key)
                     .map(|device| Rc::clone(&device.device))
                 else {
-                    log::warn!(
-                        "dpms_set_outputs_active(false): no DRM device {} for {}",
-                        layout.key.device_key,
-                        layout.output.connector_name,
+                    let error = io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!(
+                            "dpms_set_outputs_active(false): no DRM device {} for {}",
+                            layout.key.device_key, layout.output.connector_name,
+                        ),
                     );
+                    log::error!("{error}");
+                    if first_err.is_none() {
+                        first_err = Some(error);
+                    }
                     continue;
                 };
                 if let Err(e) = crate::drm::modeset::disable_output(&device, &layout.output) {
@@ -3361,54 +3702,69 @@ impl PlatformBackend {
         }
     }
 
-    /// Re-scan connectors on the existing device, dropping missing
-    /// outputs, refreshing surviving output metadata, and adding newly
-    /// connected outputs.
-    pub(crate) fn requery_outputs_and_modeset(
+    /// Apply a previously gathered all-device connector snapshot. Callers must
+    /// quiesce GPU/page-flip state before invoking this method: it may remove
+    /// scanout pools and ActiveOutputs for disconnected connectors.
+    pub(crate) fn apply_connector_snapshot(
         &mut self,
+        connected: Vec<ConnectorSnapshot>,
         client_configured: &HashSet<OutputKey>,
-    ) -> io::Result<RescanResult> {
-        let Some(primary) = self.primary_device() else {
-            return Ok(RescanResult::default());
-        };
-        let device_key = primary.key;
-        let device = Rc::clone(&primary.device);
-        let discovered = crate::platform::drm::discover_outputs(&device)?;
-        let discovered_order: Vec<OutputKey> = discovered
+        known_connected: &HashSet<OutputKey>,
+    ) -> RescanResult {
+        let connected_order: Vec<OutputKey> = connected
             .iter()
-            .map(|output| OutputKey::new(device_key, output.connector_name.clone()))
+            .map(|snapshot| snapshot.key.clone())
             .collect();
-        let discovered_keys: HashSet<OutputKey> = discovered
-            .iter()
-            .map(|output| OutputKey::new(device_key, output.connector_name.clone()))
-            .collect();
-        let current_keys: HashSet<OutputKey> = self
+        let connected_keys: HashSet<OutputKey> = connected_order.iter().cloned().collect();
+        // A connector can be physically connected yet advertise no usable
+        // mode. Keep it connected in RANDR, but it cannot retain a live CRTC
+        // route or scanout pool.
+        let active_survivor_keys: HashSet<OutputKey> = self
             .outputs
             .iter()
-            .map(|layout| layout.key.clone())
-            .collect();
-        let mut discovered_by_key: HashMap<OutputKey, crate::platform::drm::Output> = discovered
-            .into_iter()
-            .map(|output| {
-                (
-                    OutputKey::new(device_key, output.connector_name.clone()),
-                    output,
-                )
+            .filter(|output| {
+                connected
+                    .iter()
+                    .any(|snapshot| snapshot.preserves_active_output(output))
             })
+            .map(|output| output.key.clone())
+            .collect();
+        let snapshot_by_key: HashMap<OutputKey, ConnectorSnapshot> = connected
+            .iter()
+            .map(|snapshot| (snapshot.key.clone(), snapshot.clone()))
             .collect();
 
-        let mut rescan = RescanResult::default();
+        let mut rescan = RescanResult {
+            added_keys: connected_order
+                .iter()
+                .filter(|key| !known_connected.contains(*key))
+                .cloned()
+                .collect(),
+            dropped_keys: known_connected
+                .difference(&connected_keys)
+                .cloned()
+                .collect(),
+            connected,
+            ..RescanResult::default()
+        };
         for (idx, layout) in self.outputs.iter().enumerate() {
-            if discovered_keys.contains(&layout.key) {
+            if active_survivor_keys.contains(&layout.key) {
                 continue;
             }
             log::warn!(
-                "render rescan: output {} disappeared — dropping",
+                "render rescan: output {} disconnected — dropping active scanout",
                 layout.output.connector_name,
             );
             rescan.dropped_old_indices.push(idx);
+            // A preceding forced RANDR probe may already have marked this
+            // connector disconnected in the registry. Keep the active-output
+            // identity in the transition result anyway so its Enabled config
+            // and client-configured bit are retired when the physical rescan
+            // removes the live CRTC.
             rescan.dropped_keys.push(layout.key.clone());
         }
+        rescan.dropped_keys.sort();
+        rescan.dropped_keys.dedup();
         rescan.dropped_old_indices.sort_unstable_by(|a, b| b.cmp(a));
         for idx in rescan.dropped_old_indices.iter().copied() {
             self.outputs.remove(idx);
@@ -3424,71 +3780,48 @@ impl PlatformBackend {
         }
 
         for layout in &mut self.outputs {
-            if let Some(mut output) = discovered_by_key.remove(&layout.key) {
-                // Preserve the live ACTIVE mode. A rescan / VT-resume does
-                // not re-modeset a surviving (enabled) output, so its
-                // current mode — which may be a client `RRSetCrtcConfig`
-                // mode, NOT the connector's preferred — must survive.
-                // `discover_outputs` always sets `picked`/`mode` to the
-                // preferred mode, so taking them wholesale would silently
-                // reset an enabled output's mode. Both representations must
-                // be preserved together: RANDR state reads `picked`, while
-                // the VT-resume re-light (`dpms_set_outputs_active` →
-                // `commit_modeset`) re-blobs `mode` (the DrmMode). Keeping
-                // only `picked` made state report e.g. 70 Hz while the
-                // hardware came back at the preferred 60 Hz. Refresh only
-                // the metadata that legitimately changes: advertised mode
-                // list, EDID dims, connector handles.
-                output.picked = layout.output.picked.clone();
-                output.mode = layout.output.mode; // DrmMode: Copy
-                layout.output = output;
-                // width/height already reflect the live mode — leave them.
+            if let Some(snapshot) = snapshot_by_key.get(&layout.key) {
+                // A probe does not commit a route. Preserve the exact live
+                // connector/CRTC/plane handles, property IDs, picked mode and
+                // DRM mode blob; refresh only connector-owned metadata. The
+                // next explicit RANDR modeset discovers and commits any
+                // changed assignment on this output's owning card.
+                layout.output.modes.clone_from(&snapshot.modes);
+                layout.output.mm_width = snapshot.mm_width;
+                layout.output.mm_height = snapshot.mm_height;
+                layout.output.edid.clone_from(&snapshot.edid);
+                layout
+                    .output
+                    .connector_type
+                    .clone_from(&snapshot.connector_type);
             }
         }
 
-        // Task 5.2: a *runtime* rescan (hotplug / VT-resume) does NOT
-        // auto-enable a newly-connected connector. Xorg leaves
-        // `output->crtc = NULL` until a client configures it; we mirror
-        // that — no scanout pool, no modeset, not added to
-        // `self.outputs`, so it contributes nothing to the virtual
-        // extent and stays dark. The connector is surfaced in
-        // `added_outputs` so the backend registers it off (connected,
-        // no CRTC) and fires `OutputChangeNotify`. Boot auto-enable lives
-        // in `open_with_commit`, a distinct entry point that never calls
-        // this runtime-rescan path.
-        for key in discovered_order {
-            if current_keys.contains(&key) {
-                continue;
-            }
-            let Some(output) = discovered_by_key.remove(&key) else {
-                continue;
-            };
-            log::info!(
-                "render rescan: new connector {} discovered — registering OFF (client must enable)",
-                output.connector_name,
-            );
-            rescan.added_keys.push(key.clone());
-            rescan.added_outputs.push((key, output));
-            rescan.added_count += 1;
-        }
+        // Runtime discovery never auto-enables a newly-connected connector.
+        // It enters the registry connected-but-Off; SetCrtcConfig performs
+        // the expensive assignment/scanout allocation if a client enables it.
+        rescan.added_count = rescan.added_keys.len();
 
-        self.recompact_horizontal_layout(client_configured);
-        let layouts: Vec<(i32, i32, u16, u16)> = self
-            .outputs
-            .iter()
-            .map(|layout| (layout.x, layout.y, layout.width, layout.height))
-            .collect();
-        let (fb_w, fb_h) = recompute_fb_extent_from(&layouts);
-        self.fb_w = fb_w;
-        self.fb_h = fb_h;
-        Ok(rescan)
+        if !rescan.dropped_old_indices.is_empty() {
+            self.recompact_horizontal_layout(client_configured);
+            let layouts: Vec<(i32, i32, u16, u16)> = self
+                .outputs
+                .iter()
+                .map(|layout| (layout.x, layout.y, layout.width, layout.height))
+                .collect();
+            let (fb_w, fb_h) = recompute_fb_extent_from(&layouts);
+            self.fb_w = fb_w;
+            self.fb_h = fb_h;
+            self.prune_present_clocks_to_live_outputs();
+        }
+        rescan
     }
 
     /// Re-arm the hardware cursor plane on every CRTC that was
     /// showing the cursor before the suspend. This restores the
     /// kernel-side cursor binding that the VT switch tore down.
     ///
-    /// Called after `requery_outputs_and_modeset` so the output list
+    /// Called after a connector snapshot has been applied so the output list
     /// is up to date. The cursor position and hotspot come from the
     /// caller (backend passes `core.cursor_x/y` and the effective
     /// cursor's hotspot).
@@ -3515,9 +3848,11 @@ impl PlatformBackend {
         // Snapshot output layouts so the per-CRTC ioctls can borrow
         // `&mut self.cursor_plane` exclusively (mirrors
         // `cursor_plane_rebind_visible_crtcs`).
+        let owner = self.primary_device().map(|device| device.key);
         let layouts: Vec<(::drm::control::crtc::Handle, i32, i32)> = self
             .outputs
             .iter()
+            .filter(|layout| Some(layout.key.device_key) == owner)
             .map(|l| (l.output.crtc, l.x, l.y))
             .collect();
         // Safe to unwrap — checked above.
@@ -3677,14 +4012,209 @@ mod tests {
             "a zero-device platform must not register a DRM poll source"
         );
 
-        let rescan = platform
-            .requery_outputs_and_modeset(&HashSet::new())
-            .expect("zero-device requery is an empty no-op");
+        let snapshot = platform
+            .probe_connector_snapshot()
+            .expect("zero-device probe is an empty no-op");
+        let rescan = platform.apply_connector_snapshot(snapshot, &HashSet::new(), &HashSet::new());
         assert!(rescan.added_keys.is_empty());
         assert!(rescan.dropped_keys.is_empty());
         assert!(rescan.dropped_old_indices.is_empty());
-        assert!(rescan.added_outputs.is_empty());
         assert_eq!(rescan.added_count, 0);
+    }
+
+    #[test]
+    fn old_event_drain_accepts_an_empty_zero_device_epoch() {
+        let mut platform = PlatformBackend::for_tests();
+        platform.devices.clear();
+
+        platform
+            .discard_old_drm_events_after_all_off(&HashSet::new(), std::time::Duration::ZERO)
+            .expect("an empty topology epoch has no DRM event to retire");
+    }
+
+    #[test]
+    fn old_event_drain_rejects_pending_work_without_an_owning_device() {
+        let mut platform = PlatformBackend::for_tests();
+        let pending = HashSet::from([CrtcKey::for_output(&platform.outputs[0])]);
+        platform.devices.clear();
+
+        let error = platform
+            .discard_old_drm_events_after_all_off(&pending, std::time::Duration::ZERO)
+            .expect_err("pending work cannot be proven retired without its DRM fd");
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::TimedOut | io::ErrorKind::NotFound
+        ));
+    }
+
+    #[test]
+    fn connector_snapshot_refreshes_live_metadata_without_changing_its_route() {
+        let mut platform = PlatformBackend::for_tests();
+        let key = platform.outputs[0].key.clone();
+        let old_crtc = platform.outputs[0].output.crtc;
+        let old_plane = platform.outputs[0].output.plane;
+        let snapshot = ConnectorSnapshot {
+            key: key.clone(),
+            modes: vec![
+                crate::platform::drm::Mode {
+                    name: "800x600".into(),
+                    width: 800,
+                    height: 600,
+                    vrefresh: 60,
+                    preferred: true,
+                    ..Default::default()
+                },
+                crate::platform::drm::Mode {
+                    name: "1024x768".into(),
+                    width: 1024,
+                    height: 768,
+                    vrefresh: 75,
+                    preferred: false,
+                    ..Default::default()
+                },
+            ],
+            mm_width: 520,
+            mm_height: 290,
+            edid: vec![1, 2, 3, 4],
+            connector_type: "DisplayPort".into(),
+        };
+        let known_connected = HashSet::from([key]);
+
+        let rescan =
+            platform.apply_connector_snapshot(vec![snapshot], &HashSet::new(), &known_connected);
+
+        assert!(rescan.dropped_old_indices.is_empty());
+        let output = &platform.outputs[0].output;
+        assert_eq!(output.crtc, old_crtc);
+        assert_eq!(output.plane, old_plane);
+        assert_eq!((output.mm_width, output.mm_height), (520, 290));
+        assert_eq!(output.edid, vec![1, 2, 3, 4]);
+        assert_eq!(output.connector_type, "DisplayPort");
+        assert_eq!(output.modes[1].vrefresh, 75);
+    }
+
+    #[test]
+    fn metadata_only_snapshot_preserves_active_layout_and_extent() {
+        let mut platform = PlatformBackend::for_tests();
+        let key = platform.outputs[0].key.clone();
+        platform.outputs[0].x = 123;
+        platform.outputs[0].y = 45;
+        platform.fb_w = 923;
+        platform.fb_h = 645;
+        let snapshot = ConnectorSnapshot {
+            key: key.clone(),
+            modes: platform.outputs[0].output.modes.clone(),
+            mm_width: 520,
+            mm_height: 290,
+            edid: vec![1, 2, 3, 4],
+            connector_type: "DisplayPort".into(),
+        };
+
+        let rescan = platform.apply_connector_snapshot(
+            vec![snapshot],
+            &HashSet::new(),
+            &HashSet::from([key]),
+        );
+
+        assert!(rescan.dropped_old_indices.is_empty());
+        assert_eq!((platform.outputs[0].x, platform.outputs[0].y), (123, 45));
+        assert_eq!(platform.fb_dimensions(), (923, 645));
+    }
+
+    #[test]
+    fn connector_snapshot_preserves_a_live_route_across_mode_list_replacement() {
+        let mut platform = PlatformBackend::for_tests();
+        let key = platform.outputs[0].key.clone();
+        let snapshot = ConnectorSnapshot {
+            key: key.clone(),
+            modes: vec![crate::platform::drm::Mode {
+                name: "1024x768".into(),
+                width: 1024,
+                height: 768,
+                vrefresh: 75,
+                preferred: true,
+                ..Default::default()
+            }],
+            mm_width: 520,
+            mm_height: 290,
+            edid: vec![1, 2, 3, 4],
+            connector_type: "DisplayPort".into(),
+        };
+
+        let rescan = platform.apply_connector_snapshot(
+            vec![snapshot],
+            &HashSet::new(),
+            &HashSet::from([key.clone()]),
+        );
+
+        assert_eq!(platform.outputs.len(), 1);
+        assert!(rescan.dropped_old_indices.is_empty());
+        assert!(rescan.dropped_keys.is_empty());
+        assert_eq!(
+            rescan.connected.len(),
+            1,
+            "the connector remains physically connected"
+        );
+    }
+
+    #[test]
+    fn crtc_identity_and_present_clocks_include_the_drm_device() {
+        let mut platform = PlatformBackend::for_tests();
+        let live = CrtcKey::for_output(&platform.outputs[0]);
+        let colliding = CrtcKey::new(
+            crate::platform::drm::DrmDeviceKey {
+                major: live.device_key.major,
+                minor: live.device_key.minor + 1,
+            },
+            live.crtc,
+        );
+
+        assert_ne!(live, colliding);
+        assert_eq!(platform.output_index_for_crtc(live), Some(0));
+        assert_eq!(platform.output_index_for_crtc(colliding), None);
+
+        for key in [live, colliding] {
+            platform.ust_msc.insert(key, (7, 11));
+            platform.completion_clocks.insert(
+                key,
+                PresentClockSample {
+                    msc: 7,
+                    ust: 11,
+                    source: PresentClockSource::PageFlip,
+                },
+            );
+            platform.software_msc.insert(key, 7);
+        }
+
+        platform.prune_present_clocks_to_live_outputs();
+        assert_eq!(platform.ust_msc.keys().copied().collect::<Vec<_>>(), [live]);
+        assert_eq!(
+            platform
+                .completion_clocks
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            [live]
+        );
+        assert_eq!(
+            platform.software_msc.keys().copied().collect::<Vec<_>>(),
+            [live]
+        );
+    }
+
+    #[test]
+    fn singleton_cursor_never_routes_a_secondary_cards_colliding_crtc() {
+        let mut platform = PlatformBackend::for_tests();
+        assert!(platform.cursor_plane_owns_output(0));
+        let raw_crtc = platform.outputs[0].output.crtc;
+        platform.outputs[0].key.device_key.minor += 1;
+
+        assert_eq!(platform.outputs[0].output.crtc, raw_crtc);
+        assert!(!platform.cursor_plane_owns_output(0));
+        let error = platform
+            .cursor_plane_show_on_crtc(0, 0, 0, 10, 10)
+            .expect_err("a secondary CRTC must never reach the primary cursor fd");
+        assert!(error.to_string().contains("does not own"));
     }
 
     #[test]
