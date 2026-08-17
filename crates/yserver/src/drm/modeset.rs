@@ -920,6 +920,38 @@ pub fn commit_modeset(
     output: &Output,
     fb_id: framebuffer::Handle,
 ) -> io::Result<()> {
+    modeset_with_flags(
+        device,
+        output,
+        fb_id,
+        AtomicCommitFlags::ALLOW_MODESET,
+        "atomic modeset commit",
+    )
+}
+
+/// Validate a complete connector/CRTC/primary-plane modeset without changing
+/// the hardware state.
+pub(crate) fn test_modeset(
+    device: &Device,
+    output: &Output,
+    fb_id: framebuffer::Handle,
+) -> io::Result<()> {
+    modeset_with_flags(
+        device,
+        output,
+        fb_id,
+        AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY,
+        "atomic modeset TEST_ONLY",
+    )
+}
+
+fn modeset_with_flags(
+    device: &Device,
+    output: &Output,
+    fb_id: framebuffer::Handle,
+    flags: AtomicCommitFlags,
+    operation: &str,
+) -> io::Result<()> {
     let connector_props = PropMap::for_object(device, output.connector)?;
     let crtc_props = PropMap::for_object(device, output.crtc)?;
     let plane_props = PropMap::for_object(device, output.plane)?;
@@ -969,13 +1001,13 @@ pub fn commit_modeset(
         u64::from(mode_h),
     );
 
-    let result = device.atomic_commit(AtomicCommitFlags::ALLOW_MODESET, req);
+    let result = device.atomic_commit(flags, req);
     let _ = device.destroy_property_blob(mode_blob_raw);
     result.map_err(|err| {
         io::Error::new(
             err.kind(),
             format!(
-                "atomic modeset commit rejected (mode {}, {}x{}): {err}",
+                "{operation} rejected (mode {}, {}x{}): {err}",
                 output.picked.name, output.picked.width, output.picked.height
             ),
         )

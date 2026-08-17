@@ -32,11 +32,31 @@ pub(crate) struct VulkanDrmPhysicalDevice {
     pub(crate) identity: VulkanDrmIdentity,
 }
 
+/// Cross-instance identity for one Vulkan physical device.
+///
+/// DRM render-node identity remains the platform's endpoint identity.  This
+/// selector serves a narrower purpose: a disposable PRIME route probe creates
+/// a fresh `VkInstance`, so it cannot reuse the live instance's opaque
+/// `VkPhysicalDevice` handle.  Matching both UUIDs selects the same physical
+/// device *and* ICD without falling back to device-type scoring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct VulkanDeviceSelector {
+    device_uuid: [u8; vk::UUID_SIZE],
+    driver_uuid: [u8; vk::UUID_SIZE],
+}
+
 /// DRM endpoint the compositor wants its Vulkan renderer to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RequestedRenderDevice {
     render: Option<DrmDeviceKey>,
     display_primary: DrmDeviceKey,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PhysicalDeviceSelection {
+    Automatic,
+    RenderEndpoint(RequestedRenderDevice),
+    Exact(VulkanDeviceSelector),
 }
 
 /// Lives for the entire backend lifetime. Drop order matters: device
@@ -53,6 +73,9 @@ pub struct VkContext {
     pub instance: ash::Instance,
     pub debug_utils_instance: ash::ext::debug_utils::Instance,
     pub physical_device: vk::PhysicalDevice,
+    /// Stable cross-instance selector for the exact physical device and ICD
+    /// backing `physical_device`.
+    selected_device_selector: VulkanDeviceSelector,
     /// DRM identity advertised by the selected physical device. This is
     /// copied into the platform's separate `RenderDevice` record; it is not
     /// treated as ownership of a KMS device.
@@ -111,7 +134,7 @@ pub struct VkContext {
 
 impl VkContext {
     pub fn new() -> Result<Arc<Self>, VkInitError> {
-        Self::new_with_render_device(None)
+        Self::new_with_selection(PhysicalDeviceSelection::Automatic)
     }
 
     /// Build the context on the renderer associated with `render`.
@@ -123,15 +146,29 @@ impl VkContext {
         render: Option<DrmDeviceKey>,
         display_primary: DrmDeviceKey,
     ) -> Result<Arc<Self>, VkInitError> {
-        Self::new_with_render_device(Some(RequestedRenderDevice {
-            render,
-            display_primary,
-        }))
+        Self::new_with_selection(PhysicalDeviceSelection::RenderEndpoint(
+            RequestedRenderDevice {
+                render,
+                display_primary,
+            },
+        ))
     }
 
-    fn new_with_render_device(
-        requested_render_device: Option<RequestedRenderDevice>,
+    /// Create a disposable logical device on the exact physical device and
+    /// ICD used by `live`.
+    ///
+    /// This never re-runs generic GPU scoring.  PRIME probing must not render
+    /// on a merely similar GPU, and an instance-local `VkPhysicalDevice`
+    /// handle cannot be carried into the fresh instance.
+    pub(crate) fn new_disposable_for_same_physical_device(
+        live: &Self,
     ) -> Result<Arc<Self>, VkInitError> {
+        Self::new_with_selection(PhysicalDeviceSelection::Exact(
+            live.selected_device_selector,
+        ))
+    }
+
+    fn new_with_selection(selection: PhysicalDeviceSelection) -> Result<Arc<Self>, VkInitError> {
         let entry = unsafe { ash::Entry::load()? };
         let app_info = vk::ApplicationInfo::default()
             .application_name(c"yserver")
@@ -193,19 +230,24 @@ impl VkContext {
             }
         };
 
-        let (physical_device, graphics_queue_family, selected_drm_identity, drm_physical_devices) =
-            match pick_physical_device(&instance, requested_render_device) {
-                Ok(t) => t,
-                Err(e) => {
-                    unsafe {
-                        if let Some(m) = debug_messenger {
-                            debug_utils_instance.destroy_debug_utils_messenger(m, None);
-                        }
-                        instance.destroy_instance(None);
+        let PickedPhysicalDevice {
+            physical_device,
+            graphics_queue_family,
+            selected_device_selector,
+            selected_drm_identity,
+            drm_physical_devices,
+        } = match pick_physical_device(&instance, selection) {
+            Ok(t) => t,
+            Err(e) => {
+                unsafe {
+                    if let Some(m) = debug_messenger {
+                        debug_utils_instance.destroy_debug_utils_messenger(m, None);
                     }
-                    return Err(e);
+                    instance.destroy_instance(None);
                 }
-            };
+                return Err(e);
+            }
+        };
 
         // Device extensions actually used by Phase 4.1.2's
         // Vulkan-first scanout path:
@@ -376,6 +418,7 @@ impl VkContext {
             instance,
             debug_utils_instance,
             physical_device,
+            selected_device_selector,
             selected_drm_identity,
             drm_physical_devices,
             device,
@@ -576,6 +619,10 @@ pub enum VkInitError {
     NoMatchingRenderDevice(String),
     #[error("multiple Vulkan physical devices match render endpoint {0}")]
     AmbiguousRenderDevice(String),
+    #[error("no Vulkan physical device matches disposable selector {0}")]
+    NoMatchingDeviceUuid(String),
+    #[error("multiple Vulkan physical devices match disposable selector {0}")]
+    AmbiguousDeviceUuid(String),
     #[error("Vulkan DRM identity conflicts with render endpoint {0}")]
     ConflictingRenderDevice(String),
     #[error("multiple Vulkan physical devices advertise DRM render node {0}")]
@@ -638,21 +685,22 @@ struct PhysicalDeviceCandidate {
     physical_device: vk::PhysicalDevice,
     graphics_queue_family: Option<u32>,
     score: u32,
+    selector: VulkanDeviceSelector,
     drm_identity: Option<VulkanDrmIdentity>,
+}
+
+struct PickedPhysicalDevice {
+    physical_device: vk::PhysicalDevice,
+    graphics_queue_family: u32,
+    selected_device_selector: VulkanDeviceSelector,
+    selected_drm_identity: Option<VulkanDrmIdentity>,
+    drm_physical_devices: Vec<VulkanDrmPhysicalDevice>,
 }
 
 fn pick_physical_device(
     instance: &ash::Instance,
-    requested: Option<RequestedRenderDevice>,
-) -> Result<
-    (
-        vk::PhysicalDevice,
-        u32,
-        Option<VulkanDrmIdentity>,
-        Vec<VulkanDrmPhysicalDevice>,
-    ),
-    VkInitError,
-> {
+    selection: PhysicalDeviceSelection,
+) -> Result<PickedPhysicalDevice, VkInitError> {
     let devices = unsafe { instance.enumerate_physical_devices() }?;
 
     let candidates: Vec<PhysicalDeviceCandidate> = devices
@@ -669,13 +717,22 @@ fn pick_physical_device(
                 physical_device,
                 graphics_queue_family: pick_graphics_queue_family(instance, physical_device),
                 score,
+                selector: physical_device_selector(instance, physical_device),
                 drm_identity: physical_device_drm_identity(instance, physical_device)?,
             })
         })
         .collect::<Result<_, VkInitError>>()?;
 
     validate_render_device_inventory(&candidates)?;
-    let selected = select_physical_device_candidate(&candidates, requested)?;
+    let selected = match selection {
+        PhysicalDeviceSelection::Automatic => select_physical_device_candidate(&candidates, None),
+        PhysicalDeviceSelection::RenderEndpoint(requested) => {
+            select_physical_device_candidate(&candidates, Some(requested))
+        }
+        PhysicalDeviceSelection::Exact(selector) => {
+            select_exact_physical_device_candidate(&candidates, selector)
+        }
+    }?;
     let queue_family = selected
         .graphics_queue_family
         .ok_or(VkInitError::NoSuitableDevice)?;
@@ -690,12 +747,39 @@ fn pick_physical_device(
             })
         })
         .collect();
-    Ok((
-        selected.physical_device,
-        queue_family,
-        selected.drm_identity,
+    Ok(PickedPhysicalDevice {
+        physical_device: selected.physical_device,
+        graphics_queue_family: queue_family,
+        selected_device_selector: selected.selector,
+        selected_drm_identity: selected.drm_identity,
         drm_physical_devices,
-    ))
+    })
+}
+
+fn select_exact_physical_device_candidate(
+    candidates: &[PhysicalDeviceCandidate],
+    selector: VulkanDeviceSelector,
+) -> Result<&PhysicalDeviceCandidate, VkInitError> {
+    let matches = candidates
+        .iter()
+        .filter(|candidate| candidate.graphics_queue_family.is_some())
+        .filter(|candidate| candidate.selector == selector)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [selected] => {
+            log::info!(
+                "vulkan: selected disposable physical device by exact UUID pair {}",
+                format_device_selector(selector),
+            );
+            Ok(selected)
+        }
+        [] => Err(VkInitError::NoMatchingDeviceUuid(format_device_selector(
+            selector,
+        ))),
+        [_, _, ..] => Err(VkInitError::AmbiguousDeviceUuid(format_device_selector(
+            selector,
+        ))),
+    }
 }
 
 fn select_physical_device_candidate(
@@ -798,6 +882,35 @@ fn validate_render_device_inventory(
         }
     }
     Ok(())
+}
+
+fn physical_device_selector(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> VulkanDeviceSelector {
+    let mut id = vk::PhysicalDeviceIDProperties::default();
+    let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut id);
+    unsafe {
+        instance.get_physical_device_properties2(physical_device, &mut properties);
+    }
+    VulkanDeviceSelector {
+        device_uuid: id.device_uuid,
+        driver_uuid: id.driver_uuid,
+    }
+}
+
+fn format_device_selector(selector: VulkanDeviceSelector) -> String {
+    fn uuid(bytes: [u8; vk::UUID_SIZE]) -> String {
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    }
+    format!(
+        "deviceUUID={} driverUUID={}",
+        uuid(selector.device_uuid),
+        uuid(selector.driver_uuid),
+    )
 }
 
 fn physical_device_drm_identity(
@@ -925,6 +1038,13 @@ mod tests {
         }
     }
 
+    fn selector(seed: u8) -> VulkanDeviceSelector {
+        VulkanDeviceSelector {
+            device_uuid: [seed; vk::UUID_SIZE],
+            driver_uuid: [seed.wrapping_add(0x40); vk::UUID_SIZE],
+        }
+    }
+
     fn candidate(
         handle: u64,
         score: u32,
@@ -934,6 +1054,7 @@ mod tests {
             physical_device: vk::PhysicalDevice::from_raw(handle),
             graphics_queue_family: Some(0),
             score,
+            selector: selector(u8::try_from(handle).expect("test handle fits in u8")),
             drm_identity,
         }
     }
@@ -1045,6 +1166,40 @@ mod tests {
         let selected = select_physical_device_candidate(&candidates, None)
             .expect("headless selection has no DRM endpoint to match");
         assert_eq!(selected.physical_device.as_raw(), 2);
+    }
+
+    #[test]
+    fn disposable_selection_uses_exact_device_and_driver_uuid_pair() {
+        let candidates = [
+            candidate(1, 3, Some(identity(Some(0), Some(128)))),
+            candidate(2, 1, None),
+        ];
+
+        let selected = select_exact_physical_device_candidate(&candidates, selector(2))
+            .expect("UUID selection ignores generic score and DRM metadata");
+
+        assert_eq!(selected.physical_device.as_raw(), 2);
+    }
+
+    #[test]
+    fn disposable_selection_never_falls_back_to_generic_scoring() {
+        let candidates = [candidate(1, 3, None), candidate(2, 2, None)];
+
+        assert!(matches!(
+            select_exact_physical_device_candidate(&candidates, selector(3)),
+            Err(VkInitError::NoMatchingDeviceUuid(_))
+        ));
+    }
+
+    #[test]
+    fn disposable_selection_rejects_duplicate_uuid_pairs() {
+        let mut candidates = [candidate(1, 3, None), candidate(2, 2, None)];
+        candidates[1].selector = candidates[0].selector;
+
+        assert!(matches!(
+            select_exact_physical_device_candidate(&candidates, selector(1)),
+            Err(VkInitError::AmbiguousDeviceUuid(_))
+        ));
     }
 
     #[test]

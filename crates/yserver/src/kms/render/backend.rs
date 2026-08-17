@@ -1054,8 +1054,10 @@ pub struct KmsBackend {
     /// Values use the provider's tagged endpoint identity rather than a DRM
     /// primary-node key: the selected renderer may be a distinct render node
     /// or the unverified Vulkan fallback, neither of which can be represented
-    /// truthfully as a KMS device. Provider XIDs are only a projection of this
-    /// policy and may be rebuilt without changing it.
+    /// truthfully as a KMS device. Startup seeds every distinct opened KMS
+    /// endpoint once; a later explicit detach removes that entry. Provider
+    /// XIDs are only a projection of this policy and may be rebuilt without
+    /// changing it.
     provider_output_sources: HashMap<crate::platform::drm::DrmDeviceKey, RandrProviderEndpoint>,
     /// Per-output-id identity for RANDR output properties: `(EDID blob,
     /// ConnectorType name)`. Rebuilt by `randr_outputs_and_modes` each
@@ -2852,13 +2854,13 @@ impl KmsBackend {
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported,
         };
-        // Platform bring-up may already have committed a first-card output
-        // whose renderer is a distinct provider (the Asahi-shaped case). Adopt
-        // that live route before publishing RANDR providers so policy and
-        // hardware never disagree. This remains inside the construction-wide
-        // rollback window: an invariant failure drops `b` with the platform's
-        // initial-scanout rollback still armed.
-        b.adopt_initial_provider_output_sources()?;
+        // Validate every route already committed during platform bring-up,
+        // then apply Xorg's one-shot AutoBindGPU-shaped startup policy: every
+        // opened KMS endpoint distinct from the selected renderer becomes an
+        // output sink for that renderer. This remains inside the
+        // construction-wide rollback window, so an invariant failure drops
+        // `b` with the platform's initial-scanout rollback still armed.
+        b.initialize_provider_output_sources()?;
         b.seed_initial_connector_topology()?;
         b.init_root_storage();
         // Stage 3f.8: bake the default-arrow software cursor.
@@ -4882,14 +4884,17 @@ impl KmsBackend {
         source == sink || self.provider_output_sources.get(&kms_device_key) == Some(&source)
     }
 
-    /// Adopt split renderer-to-KMS routes that were already committed during
-    /// platform bring-up, before RANDR provider policy existed.
+    /// Validate the routes committed during platform bring-up and initialize
+    /// the one-shot automatic PRIME Output Source policy.
     ///
-    /// This is deliberately narrower than Xorg's default `AutoBindGPU`: only
-    /// live startup routes are adopted. Inactive distinct sinks still require
-    /// an explicit `SetProviderOutputSource`, preserving this replay's original
-    /// client-controlled policy boundary.
-    fn adopt_initial_provider_output_sources(&mut self) -> io::Result<()> {
+    /// Every opened KMS endpoint distinct from the selected renderer is
+    /// recorded, even when it currently has no connector inventory. Provider
+    /// projection remains capability-aware and hides such an association until
+    /// a connector is discovered. This initializer is constructor-only: a
+    /// later explicit detach removes the map entry permanently and ordinary
+    /// RANDR rebuilds or connector disconnect/reconnect cycles never recreate
+    /// it.
+    fn initialize_provider_output_sources(&mut self) -> io::Result<()> {
         let Some(selected_renderer) = self.platform.selected_render_device() else {
             if self.platform.outputs.is_empty() {
                 return Ok(());
@@ -4921,24 +4926,25 @@ impl KmsBackend {
                     output.key.device_key,
                 )));
             }
+        }
 
-            let sink = RandrProviderEndpoint::Kms(output.key.device_key);
+        for device in &self.platform.devices {
+            let sink = RandrProviderEndpoint::Kms(device.key);
             if sink == source {
                 continue;
             }
-            if let Some(previous) = self
-                .provider_output_sources
-                .insert(output.key.device_key, source)
-                && previous != source
-            {
-                return Err(io::Error::other(format!(
-                    "active startup KMS sink {} has conflicting sources {previous:?} and {source:?}",
-                    output.key.device_key,
-                )));
+            if let Some(&previous) = self.provider_output_sources.get(&device.key) {
+                if previous != source {
+                    return Err(io::Error::other(format!(
+                        "automatic KMS sink {} has conflicting sources {previous:?} and {source:?}",
+                        device.key,
+                    )));
+                }
+                continue;
             }
+            self.provider_output_sources.insert(device.key, source);
             log::info!(
-                "PRIME Output Source: adopted live startup sink {:?} -> source {source:?}",
-                sink,
+                "PRIME Output Source: automatically associated sink {sink:?} -> source {source:?}",
             );
         }
         Ok(())
@@ -14917,6 +14923,9 @@ impl Backend for KmsBackend {
                 );
             }
             None => {
+                // Startup auto-association is one-shot. Absence therefore
+                // records the client's explicit detach for the rest of this
+                // backend lifetime; registry rebuilds never repopulate it.
                 self.provider_output_sources.remove(&sink_key);
                 log::info!(
                     "PRIME Output Source: detached sink provider {provider} ({sink_endpoint:?})"
@@ -14963,11 +14972,13 @@ impl Backend for KmsBackend {
                 .device,
         );
 
-        // Provider policy authorizes only the attempt. The directional
-        // tri-state metadata gate and real DMA-BUF allocation/import remain in
-        // `enable_connector`. Place this before the idempotency guard so an
+        // Provider policy authorizes only the attempt. Exact real-operation
+        // DMA-BUF allocation/import/render/TEST_ONLY probing remains in
+        // `enable_connector`; capability metadata there is diagnostic only.
+        // Place this before the idempotency guard so an
         // already-active split output can never be silently reasserted under a
-        // missing/stale policy; production startup adopts such live routes.
+        // missing/stale policy. Production startup auto-associates every
+        // distinct sink, while an explicit later detach remains persistent.
         if mode.is_some() && !self.provider_output_source_allows(output_key.device_key) {
             let sink_endpoint = RandrProviderEndpoint::Kms(output_key.device_key);
             let sink_provider = self.randr_id_alloc.providers.get(&sink_endpoint).copied();
@@ -23120,7 +23131,7 @@ mod tests {
     }
 
     #[test]
-    fn kms_without_connector_inventory_does_not_advertise_sink_output() {
+    fn automatic_inventoryless_sink_waits_for_connector_projection() {
         use yserver_protocol::x11::randr::PROVIDER_CAPABILITY_SOURCE_OUTPUT;
 
         let mut backend = KmsBackend::for_tests();
@@ -23130,6 +23141,11 @@ mod tests {
         let render_id = RenderDeviceId::DrmRender(test_device_key(128));
         backend.platform.render_devices = vec![test_render_device(render_id, Some(source_key))];
         backend.platform.selected_render_device = Some(render_id);
+        backend.platform.outputs[0].scanout_route =
+            ScanoutRoute::new(render_id, source_key, RenderKmsRelationship::Same);
+        backend
+            .initialize_provider_output_sources()
+            .expect("initialize automatic provider policy");
 
         let providers = backend.randr_providers();
         let source_id = backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(source_key)];
@@ -23159,22 +23175,45 @@ mod tests {
                 .is_gpu,
             "a distinct KMS endpoint remains logically a GPU provider even before connectors exist"
         );
-        assert!(!backend.provider_output_source_allows(inventoryless_key));
+        assert!(backend.provider_output_source_allows(inventoryless_key));
+        assert_eq!(
+            backend.provider_output_sources.get(&inventoryless_key),
+            Some(&RandrProviderEndpoint::Kms(source_key)),
+            "automatic policy is retained before the sink can be projected"
+        );
+        assert!(
+            providers
+                .iter()
+                .find(|provider| provider.provider_id == inventoryless_id)
+                .expect("inventory-less KMS provider")
+                .associations
+                .is_empty(),
+            "capability-zero providers do not project a premature association"
+        );
+
+        let _ = backend
+            .randr_id_alloc
+            .ids_for(&OutputKey::new(inventoryless_key, "DP-9"));
+        let providers = backend.randr_providers();
+        let sink = providers
+            .iter()
+            .find(|provider| provider.provider_id == inventoryless_id)
+            .expect("newly eligible KMS sink");
+        assert_eq!(
+            sink.capabilities,
+            yserver_protocol::x11::randr::PROVIDER_CAPABILITY_SINK_OUTPUT
+        );
+        assert_eq!(sink.associations.len(), 1);
     }
 
     #[test]
-    fn startup_adopts_live_asahi_shaped_split_route_only() {
+    fn startup_automatically_binds_asahi_first_and_only_kms_sink() {
         use yserver_protocol::x11::randr::{
             PROVIDER_CAPABILITY_SINK_OUTPUT, PROVIDER_CAPABILITY_SOURCE_OUTPUT,
         };
 
         let mut backend = KmsBackend::for_tests();
         let display_key = backend.platform.devices[0].key;
-        let inactive_sink_key = test_device_key(1);
-        push_test_device(&mut backend, inactive_sink_key);
-        let _ = backend
-            .randr_id_alloc
-            .ids_for(&OutputKey::new(inactive_sink_key, "DP-9"));
         let render_id = RenderDeviceId::DrmRender(test_device_key(128));
         backend.platform.render_devices =
             vec![test_render_device(render_id, Some(test_device_key(7)))];
@@ -23183,20 +23222,17 @@ mod tests {
             ScanoutRoute::new(render_id, display_key, RenderKmsRelationship::Different);
 
         backend
-            .adopt_initial_provider_output_sources()
-            .expect("adopt live split route");
+            .initialize_provider_output_sources()
+            .expect("initialize Asahi-shaped automatic policy");
         let source_endpoint = RandrProviderEndpoint::Render(render_id);
         assert_eq!(
             backend.provider_output_sources.get(&display_key),
             Some(&source_endpoint)
         );
         assert!(backend.provider_output_source_allows(display_key));
-        assert!(
-            !backend.provider_output_source_allows(inactive_sink_key),
-            "inactive distinct KMS sinks remain client-controlled"
-        );
 
         let providers = backend.randr_providers();
+        assert_eq!(providers.len(), 2);
         let source = providers
             .iter()
             .find(|provider| {
@@ -23219,9 +23255,14 @@ mod tests {
     }
 
     #[test]
-    fn startup_same_device_route_is_implicit_not_persisted() {
+    fn coalesced_renderer_automatically_binds_inactive_secondary_sink() {
         let mut backend = KmsBackend::for_tests();
         let kms_key = backend.platform.devices[0].key;
+        let inactive_sink_key = test_device_key(1);
+        push_test_device(&mut backend, inactive_sink_key);
+        let _ = backend
+            .randr_id_alloc
+            .ids_for(&OutputKey::new(inactive_sink_key, "DP-9"));
         let render_id = RenderDeviceId::DrmRender(test_device_key(128));
         backend.platform.render_devices = vec![test_render_device(render_id, Some(kms_key))];
         backend.platform.selected_render_device = Some(render_id);
@@ -23229,10 +23270,59 @@ mod tests {
             ScanoutRoute::new(render_id, kms_key, RenderKmsRelationship::Same);
 
         backend
-            .adopt_initial_provider_output_sources()
-            .expect("same-device startup route");
-        assert!(backend.provider_output_sources.is_empty());
+            .initialize_provider_output_sources()
+            .expect("initialize coalesced automatic policy");
+        assert_eq!(backend.provider_output_sources.len(), 1);
+        assert_eq!(
+            backend.provider_output_sources.get(&inactive_sink_key),
+            Some(&RandrProviderEndpoint::Kms(kms_key))
+        );
+        assert!(!backend.provider_output_sources.contains_key(&kms_key));
         assert!(backend.provider_output_source_allows(kms_key));
+        assert!(backend.provider_output_source_allows(inactive_sink_key));
+
+        let providers = backend.randr_providers();
+        let source_id = backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(kms_key)];
+        let sink_id =
+            backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(inactive_sink_key)];
+        let source = providers
+            .iter()
+            .find(|provider| provider.provider_id == source_id)
+            .expect("coalesced source");
+        let sink = providers
+            .iter()
+            .find(|provider| provider.provider_id == sink_id)
+            .expect("inactive sink");
+        assert_eq!(source.associations.len(), 1);
+        assert_eq!(sink.associations.len(), 1);
+    }
+
+    #[test]
+    fn automatic_provider_policy_validates_live_route_endpoints_before_binding() {
+        let mut backend = KmsBackend::for_tests();
+        let display_key = backend.platform.devices[0].key;
+        let secondary_key = test_device_key(1);
+        push_test_device(&mut backend, secondary_key);
+        let selected_id = RenderDeviceId::DrmRender(test_device_key(128));
+        let stale_id = RenderDeviceId::DrmRender(test_device_key(129));
+        backend.platform.render_devices = vec![test_render_device(selected_id, Some(display_key))];
+        backend.platform.selected_render_device = Some(selected_id);
+        backend.platform.outputs[0].scanout_route =
+            ScanoutRoute::new(stale_id, display_key, RenderKmsRelationship::Unknown);
+
+        let error = backend
+            .initialize_provider_output_sources()
+            .expect_err("stale renderer endpoint must reject startup policy");
+        assert!(error.to_string().contains("records renderer"));
+        assert!(backend.provider_output_sources.is_empty());
+
+        backend.platform.outputs[0].scanout_route =
+            ScanoutRoute::new(selected_id, secondary_key, RenderKmsRelationship::Different);
+        let error = backend
+            .initialize_provider_output_sources()
+            .expect_err("wrong KMS endpoint must reject startup policy");
+        assert!(error.to_string().contains("records KMS endpoint"));
+        assert!(backend.provider_output_sources.is_empty());
     }
 
     #[test]
@@ -23382,7 +23472,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_output_source_survives_connector_disconnect_and_reconnect() {
+    fn explicit_detach_survives_rebuild_disconnect_and_reconnect() {
         let mut backend = KmsBackend::for_tests();
         let source_key = backend.platform.devices[0].key;
         let sink_key = test_device_key(1);
@@ -23403,6 +23493,11 @@ mod tests {
         let render_id = RenderDeviceId::DrmRender(test_device_key(128));
         backend.platform.render_devices = vec![test_render_device(render_id, Some(source_key))];
         backend.platform.selected_render_device = Some(render_id);
+        backend.platform.outputs[0].scanout_route =
+            ScanoutRoute::new(render_id, source_key, RenderKmsRelationship::Same);
+        backend
+            .initialize_provider_output_sources()
+            .expect("initialize automatic provider policy");
         let providers = backend.randr_providers();
         let source_id = backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(source_key)];
         let sink_id = backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(sink_key)];
@@ -23416,11 +23511,7 @@ mod tests {
         );
         state.randr.set_providers(providers);
 
-        assert!(
-            backend
-                .set_provider_output_source(&mut state, sink_id, Some(source_id))
-                .expect("attach selected source")
-        );
+        assert!(backend.provider_output_source_allows(sink_key));
         assert_eq!(
             state
                 .randr
@@ -23431,17 +23522,42 @@ mod tests {
             source_id
         );
 
+        assert!(
+            backend
+                .set_provider_output_source(&mut state, sink_id, None)
+                .expect("explicitly detach automatic source")
+        );
+        assert!(!backend.provider_output_source_allows(sink_key));
+        assert!(
+            state
+                .randr
+                .provider(sink_id)
+                .expect("detached sink")
+                .associations
+                .is_empty()
+        );
+
+        backend.rebuild_randr_state(&mut state, None, false);
+        assert!(
+            state
+                .randr
+                .provider(sink_id)
+                .expect("detached sink survives rebuild")
+                .associations
+                .is_empty(),
+            "ordinary RANDR rebuild must not recreate automatic policy"
+        );
+
         assert!(backend.reconcile_connector_registry(&[], std::slice::from_ref(&sink_output)));
         backend.rebuild_randr_state(&mut state, None, true);
-        assert_eq!(
+        assert!(
             state
                 .randr
                 .provider(sink_id)
                 .expect("disconnected sink remains a provider")
-                .associations[0]
-                .provider_id,
-            source_id,
-            "disconnect must not erase endpoint policy"
+                .associations
+                .is_empty(),
+            "disconnect must not recreate explicitly removed policy"
         );
 
         assert!(backend.reconcile_connector_registry(
@@ -23456,20 +23572,16 @@ mod tests {
             &[],
         ));
         backend.rebuild_randr_state(&mut state, None, true);
-        assert_eq!(
+        assert!(
             state
                 .randr
                 .provider(sink_id)
                 .expect("reconnected sink")
-                .associations[0]
-                .provider_id,
-            source_id,
-            "reconnect must reproject the retained endpoint policy"
+                .associations
+                .is_empty(),
+            "reconnect must preserve explicit detach"
         );
-        assert_eq!(
-            backend.provider_output_sources.get(&sink_key),
-            Some(&RandrProviderEndpoint::Kms(source_key))
-        );
+        assert!(!backend.provider_output_sources.contains_key(&sink_key));
     }
 
     #[test]
@@ -23482,8 +23594,8 @@ mod tests {
         backend.platform.outputs[0].scanout_route =
             ScanoutRoute::new(render_id, display_key, RenderKmsRelationship::Unknown);
         backend
-            .adopt_initial_provider_output_sources()
-            .expect("adopt active unknown split route");
+            .initialize_provider_output_sources()
+            .expect("initialize active unknown split route");
         let providers = backend.randr_providers();
         let sink_id = backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(display_key)];
         let mut state = ServerState::new();
@@ -23536,7 +23648,7 @@ mod tests {
     }
 
     #[test]
-    fn adopted_live_split_route_passes_gate_before_idempotent_reassert() {
+    fn automatically_bound_live_split_route_passes_gate_before_idempotent_reassert() {
         let mut backend = KmsBackend::for_tests();
         let display_key = backend.platform.devices[0].key;
         let render_id = RenderDeviceId::DrmRender(test_device_key(128));
@@ -23545,8 +23657,8 @@ mod tests {
         backend.platform.outputs[0].scanout_route =
             ScanoutRoute::new(render_id, display_key, RenderKmsRelationship::Unknown);
         backend
-            .adopt_initial_provider_output_sources()
-            .expect("adopt the already-live split route");
+            .initialize_provider_output_sources()
+            .expect("initialize the already-live split route");
 
         let layout = &backend.platform.outputs[0];
         let connector = layout.key.connector_name.clone();
@@ -23568,7 +23680,7 @@ mod tests {
         assert!(
             !backend
                 .apply_crtc_config(output_id, &connector, Some(mode), x, y)
-                .expect("adopted policy lets the active reassert reach idempotency"),
+                .expect("automatic policy lets the active reassert reach idempotency"),
             "an unchanged active configuration remains a no-op after policy authorization"
         );
     }

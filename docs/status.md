@@ -64,38 +64,42 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   fallback remain distinguishable. Associations are projected symmetrically
   and deterministically through `GetProviderInfo` and survive every RANDR
   rebuild, connector disconnect/reconnect, and VT resume. Same-device scanout
-  is implicit. A distinct sink requires `SetProviderOutputSource` before any
-  RANDR CRTC enable reaches the existing metadata gate and real allocation;
-  disables remain unconditional, and an active sink cannot be detached or
-  rebound even while DPMS-dark or VT-suspended. Platform bring-up predates
-  RANDR policy, so any already-live split route is adopted while construction
-  rollback remains armed—most importantly the single-display Asahi shape—while
-  inactive sinks stay client-controlled. This is intentionally narrower than
-  Xorg's default `AutoBindGPU` policy, which automatically associates all
-  eligible GPU screens; a later explicit auto-bind layer can add that policy
-  without changing route identity or allocation authority. Relationship-only
+  is implicit. Construction now applies Xorg's default `AutoBindGPU`-shaped
+  policy once: every opened KMS endpoint distinct from the selected renderer is
+  associated with that renderer, including inactive or temporarily
+  inventory-less sinks. A later explicit `SetProviderOutputSource` detach or
+  override remains persistent across provider rebuild, connector
+  disconnect/reconnect, and VT resume; disables remain unconditional, and an
+  active sink cannot be detached or rebound even while DPMS-dark or
+  VT-suspended. Already-live startup routes are validated against the selected
+  renderer before automatic policy is installed, while coalesced ordinary
+  render/KMS providers never receive a self-association. Relationship-only
   rebuilds preserve both lastSetTime and configTimestamp.
-- **2026-08-18 conservative PRIME route policy:** scanout-pool creation now
-  classifies the previously recorded route evidence as `Compatible`,
-  `Incompatible`, or `Unknown`. Same-device routes preserve their established
-  allocator unconditionally, and an unknown renderer/KMS relationship remains
-  attemptable. A known-different route is rejected before its first BO is
-  allocated only when `VK_KHR_external_memory_fd` is conclusively unavailable,
-  or when KMS positively reports neither PRIME export for output-owned GBM nor
-  PRIME import for renderer-owned Vulkan allocations. Either usable direction
-  keeps the route compatible. Missing `IN_FORMATS`, no advertised shared
-  modifier/linear layout, and PRIME or Vulkan query failures remain `Unknown`
-  and reach the real allocation/import attempts. GBM-device creation failure
-  likewise makes the output-owned direction `Unknown`; a proven renderer-owned
-  direction can still keep the aggregate route compatible. GBM availability is
-  observed before the final verdict so an
-  output-owned-only route is not mislabeled compatible after GBM creation
-  fails, but no BO, GEM handle, framebuffer, or Vulkan scanout image exists at
-  the rejection boundary. The verdict never filters or reorders the existing
-  GBM-first, Vulkan-modifier, padded-linear, explicit-linear, and legacy-linear
-  candidate sequence. Focused policy tests cover the complete direction-state
-  matrix, same/unknown relationship bypasses, asymmetric Asahi-shaped routes,
-  layout/query uncertainty, GBM failure, and paired blocker diagnostics.
+- **2026-08-18 real-operation copy-free PRIME probing:** advertised PRIME,
+  modifier, linear-layout, and external-memory evidence remains recorded as
+  `Compatible`, `Incompatible`, or `Unknown` for diagnostics, but no metadata
+  verdict now suppresses a real allocation attempt. Same-device outputs retain
+  the established GBM-first allocator. Every different-device or
+  relationship-unknown route—including a split first output during startup—is
+  validated on a fresh disposable logical device selected by the live
+  renderer's exact Vulkan device and driver UUIDs. Each candidate must allocate
+  one complete three-BO pool with a single exact representation, pass a full
+  connector/CRTC/primary-plane atomic `TEST_ONLY` for every framebuffer, render
+  a real color-attachment clear into every BO, and complete its probe fence.
+  The exact winner is then reallocated on the live renderer and all three live
+  framebuffers are tested again before a runtime modeset may install the first
+  front buffer. Candidate order remains output-owned GBM modifiers first, then
+  renderer-owned padded-linear, Vulkan-modifier, explicit-linear, and
+  legacy-linear plans; modifier candidates independently require Vulkan import
+  support for GBM ownership and export support for renderer ownership. A failed
+  disposable device is torn down and the next exact candidate gets a fresh
+  device, while loss of the live renderer is fatal. Startup probes remain
+  under the initial dumb-scanout rollback guard, and a successful runtime
+  commit marks its exact BO `OnScreen` before ownership leaves the candidate
+  loop. Shutdown disarm deliberately retains output-owned GBM storage if KMS
+  could not be disabled. Both ownership directions remain zero-copy shared
+  DMA-BUF paths; copied reverse-PRIME transport is still a separate later
+  layer.
 - **2026-08-18 PRIME renderer-to-KMS scanout-route qualification:** every
   live output and `ScanoutBoPool` now records one `ScanoutRoute` from the
   selected `RenderDeviceId` to the output's DRM-primary `DrmDeviceKey`.

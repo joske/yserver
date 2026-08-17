@@ -61,7 +61,7 @@ use crate::{
         vk::{
             device::VkContext,
             ops::OpsCommandPool,
-            scanout::{BoPhase, BoState, ScanoutBoPool},
+            scanout::{BoPhase, BoState, ScanoutAllocationPlan, ScanoutBoPool},
         },
     },
 };
@@ -869,6 +869,197 @@ fn scanout_pool_needs_reallocation(
     })
 }
 
+const SCANOUT_POOL_DEPTH: usize = 3;
+const PRIME_RENDER_PROBE_TIMEOUT_NS: u64 = 5_000_000_000;
+
+struct PreparedScanoutPool {
+    pool: ScanoutBoPool,
+    /// The exact framebuffer synchronously installed by the candidate loop.
+    /// Its BO is already marked `OnScreen` before ownership leaves the helper.
+    committed_framebuffer: Option<::drm::control::framebuffer::Handle>,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum CopyFreeScanoutError {
+    #[error("{0}")]
+    Candidates(io::Error),
+    #[error("live renderer lost during copy-free scanout setup: {0}")]
+    LiveRendererLost(io::Error),
+}
+
+impl CopyFreeScanoutError {
+    fn into_io_error(self) -> io::Error {
+        match self {
+            Self::Candidates(error) => error,
+            Self::LiveRendererLost(error) => io::Error::other(Self::LiveRendererLost(error)),
+        }
+    }
+}
+
+fn route_requires_copy_free_probe(route: ScanoutRoute) -> bool {
+    route.relationship != RenderKmsRelationship::Same
+}
+
+fn test_scanout_pool(
+    scanout_device: &drm::Device,
+    output: &crate::platform::drm::Output,
+    pool: &ScanoutBoPool,
+) -> io::Result<()> {
+    for (index, bo) in pool.bos.iter().enumerate() {
+        let framebuffer = bo.fb_handle.ok_or_else(|| {
+            io::Error::other(format!("scanout pool BO {index} has no framebuffer"))
+        })?;
+        crate::drm::modeset::test_modeset(scanout_device, output, framebuffer).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("scanout pool BO {index} atomic TEST_ONLY failed: {err}"),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn copy_free_candidate_error(
+    plan: ScanoutAllocationPlan,
+    stage: &str,
+    error: &io::Error,
+) -> String {
+    format!("{} {stage}: {error}", plan.describe())
+}
+
+/// Validate and replay one non-local renderer-to-KMS route without ever
+/// submitting an unproven shared image to the backend's live Vulkan device.
+///
+/// Each candidate gets a fresh logical device for allocation, a real render,
+/// and complete connector/CRTC/plane TEST_ONLY checks. Only the exact winning
+/// plan is then allocated on the live renderer and tested again. Runtime
+/// enables also perform the first state-changing modeset here so a rejected
+/// candidate can fall through before the caller mutates its active topology.
+fn allocate_copy_free_scanout_pool(
+    live_vk: Arc<VkContext>,
+    scanout_device: Rc<drm::Device>,
+    output: &crate::platform::drm::Output,
+    route: ScanoutRoute,
+    width: u32,
+    height: u32,
+    scanout_modifiers: &[u64],
+    commit_first_framebuffer: bool,
+) -> Result<PreparedScanoutPool, CopyFreeScanoutError> {
+    debug_assert!(route_requires_copy_free_probe(route));
+    let plans =
+        ScanoutBoPool::exact_allocation_plans(&live_vk, &scanout_device, width, scanout_modifiers);
+    let mut failures = Vec::new();
+
+    for plan in plans {
+        let probe_vk = match VkContext::new_disposable_for_same_physical_device(&live_vk) {
+            Ok(vk) => vk,
+            Err(error) => {
+                failures.push(format!(
+                    "{} disposable Vulkan device: {error}",
+                    plan.describe()
+                ));
+                continue;
+            }
+        };
+        let probe_pool = match ScanoutBoPool::allocate_exact(
+            probe_vk,
+            Rc::clone(&scanout_device),
+            route,
+            width,
+            height,
+            SCANOUT_POOL_DEPTH,
+            scanout_modifiers,
+            plan,
+        ) {
+            Ok(pool) => pool,
+            Err(error) => {
+                failures.push(copy_free_candidate_error(plan, "probe allocation", &error));
+                continue;
+            }
+        };
+        if let Err(error) = test_scanout_pool(&scanout_device, output, &probe_pool) {
+            failures.push(copy_free_candidate_error(plan, "probe TEST_ONLY", &error));
+            continue;
+        }
+        if let Err(error) = probe_pool.probe_renderer_access(PRIME_RENDER_PROBE_TIMEOUT_NS) {
+            failures.push(copy_free_candidate_error(plan, "probe rendering", &error));
+            continue;
+        }
+        drop(probe_pool);
+
+        let live_pool = match ScanoutBoPool::allocate_exact(
+            Arc::clone(&live_vk),
+            Rc::clone(&scanout_device),
+            route,
+            width,
+            height,
+            SCANOUT_POOL_DEPTH,
+            scanout_modifiers,
+            plan,
+        ) {
+            Ok(pool) => pool,
+            Err(error) => {
+                if crate::kms::vk::scanout::scanout_error_is_device_lost(&error) {
+                    return Err(CopyFreeScanoutError::LiveRendererLost(io::Error::new(
+                        error.kind(),
+                        format!("{} live allocation: {error}", plan.describe()),
+                    )));
+                }
+                failures.push(copy_free_candidate_error(plan, "live allocation", &error));
+                continue;
+            }
+        };
+        if let Err(error) = test_scanout_pool(&scanout_device, output, &live_pool) {
+            failures.push(copy_free_candidate_error(plan, "live TEST_ONLY", &error));
+            continue;
+        }
+
+        let mut live_pool = live_pool;
+        let committed_framebuffer = if commit_first_framebuffer {
+            let (front_index, framebuffer) = live_pool
+                .bos
+                .iter()
+                .enumerate()
+                .find_map(|(index, bo)| bo.fb_handle.map(|framebuffer| (index, framebuffer)))
+                .ok_or_else(|| {
+                    CopyFreeScanoutError::Candidates(io::Error::other(format!(
+                        "{} live pool has no framebuffer",
+                        plan.describe(),
+                    )))
+                })?;
+            if let Err(error) =
+                crate::drm::modeset::commit_modeset(&scanout_device, output, framebuffer)
+            {
+                failures.push(copy_free_candidate_error(plan, "live modeset", &error));
+                continue;
+            }
+            // The successful synchronous commit has already made this BO the
+            // hardware front. Mark it before returning so no fallible caller
+            // work or structure-state gap can drop/acquire the scanned BO.
+            live_pool.bos[front_index]
+                .state
+                .mark_on_screen_after_modeset();
+            Some(framebuffer)
+        } else {
+            None
+        };
+
+        log::info!(
+            "copy-free scanout probe selected {} for {route:?}",
+            plan.describe()
+        );
+        return Ok(PreparedScanoutPool {
+            pool: live_pool,
+            committed_framebuffer,
+        });
+    }
+
+    Err(CopyFreeScanoutError::Candidates(io::Error::other(format!(
+        "every copy-free scanout candidate failed for {route:?}: {}",
+        failures.join("; ")
+    ))))
+}
+
 fn mode_via_connector_handle<T: Copy>(
     connector: ::drm::control::connector::Handle,
     mode_spec: yserver_core::backend::ModeSpec,
@@ -1553,15 +1744,38 @@ impl PlatformBackend {
                 })?;
             let scanout_route = selected_renderer.scanout_route_to(device);
             scanout_routes.push(scanout_route);
-            match ScanoutBoPool::allocate(
-                Arc::clone(&vk),
-                Rc::clone(&device.device),
-                scanout_route,
-                w,
-                h,
-                3,
-                &layout.output.scanout_modifiers,
-            ) {
+            let allocation = if route_requires_copy_free_probe(scanout_route) {
+                match allocate_copy_free_scanout_pool(
+                    Arc::clone(&vk),
+                    Rc::clone(&device.device),
+                    &layout.output,
+                    scanout_route,
+                    w,
+                    h,
+                    &layout.output.scanout_modifiers,
+                    false,
+                ) {
+                    Ok(prepared) => {
+                        debug_assert!(prepared.committed_framebuffer.is_none());
+                        Ok(prepared.pool)
+                    }
+                    Err(error @ CopyFreeScanoutError::LiveRendererLost(_)) => {
+                        return Err(io::Error::other(format!("render PlatformBackend: {error}")));
+                    }
+                    Err(CopyFreeScanoutError::Candidates(error)) => Err(error),
+                }
+            } else {
+                ScanoutBoPool::allocate(
+                    Arc::clone(&vk),
+                    Rc::clone(&device.device),
+                    scanout_route,
+                    w,
+                    h,
+                    SCANOUT_POOL_DEPTH,
+                    &layout.output.scanout_modifiers,
+                )
+            };
+            match allocation {
                 Ok(pool) => {
                     let n = pool.bos.len();
                     scanout_pools.push(Some(pool));
@@ -3945,6 +4159,13 @@ impl PlatformBackend {
             .outputs
             .iter()
             .position(|layout| &layout.key == output_key);
+        if let Some(index) = existing_idx
+            && (index >= self.scanout_pools.len() || index >= self.bo_generations.len())
+        {
+            return Err(io::Error::other(format!(
+                "enable_connector {connector}: active output index {index} has no paired scanout-pool/generation slot"
+            )));
+        }
         let needs_pool_realloc = scanout_pool_needs_reallocation(
             existing_idx.and_then(|idx| self.outputs.get(idx)),
             existing_idx
@@ -3957,28 +4178,53 @@ impl PlatformBackend {
         );
 
         // (Re)allocate the scanout pool if needed.
+        let mut new_pool_committed_framebuffer = None;
         let mut new_pool = if needs_pool_realloc {
             if let Some(vk) = self.vk.as_ref().cloned() {
-                match ScanoutBoPool::allocate(
-                    Arc::clone(&vk),
-                    Rc::clone(&device),
-                    scanout_route,
-                    u32::from(w),
-                    u32::from(h),
-                    3,
-                    &output.scanout_modifiers,
-                ) {
+                let allocation = if route_requires_copy_free_probe(scanout_route) {
+                    match allocate_copy_free_scanout_pool(
+                        Arc::clone(&vk),
+                        Rc::clone(&device),
+                        &output,
+                        scanout_route,
+                        u32::from(w),
+                        u32::from(h),
+                        &output.scanout_modifiers,
+                        true,
+                    ) {
+                        Ok(prepared) => {
+                            new_pool_committed_framebuffer = prepared.committed_framebuffer;
+                            Ok(prepared.pool)
+                        }
+                        Err(error @ CopyFreeScanoutError::LiveRendererLost(_)) => {
+                            self.renderer_failed = true;
+                            return Err(error.into_io_error());
+                        }
+                        Err(CopyFreeScanoutError::Candidates(error)) => Err(error),
+                    }
+                } else {
+                    ScanoutBoPool::allocate(
+                        Arc::clone(&vk),
+                        Rc::clone(&device),
+                        scanout_route,
+                        u32::from(w),
+                        u32::from(h),
+                        SCANOUT_POOL_DEPTH,
+                        &output.scanout_modifiers,
+                    )
+                };
+                match allocation {
                     Ok(pool) => Some(Some(pool)),
                     Err(e) => {
                         log::warn!(
-                            "render enable_connector: scanout pool alloc failed for {connector} ({}×{}): {e:?}",
+                            "render enable_connector: scanout pool setup failed for {connector} ({}×{}): {e:?}",
                             w,
                             h
                         );
                         // Pool allocation failed — leave output off,
                         // return error to caller.
                         return Err(io::Error::other(format!(
-                            "enable_connector {connector}: scanout pool alloc failed: {e:?}"
+                            "enable_connector {connector}: scanout pool setup failed: {e:?}"
                         )));
                     }
                 }
@@ -3994,7 +4240,7 @@ impl PlatformBackend {
         // OnScreen BO from the existing pool (if unchanged), or the
         // first BO in the new pool.  Fall back to a legacy dumb buffer
         // if nothing is available.
-        let fb_id = {
+        let fb_id = new_pool_committed_framebuffer.or_else(|| {
             let pool_ref: Option<&ScanoutBoPool> = if needs_pool_realloc {
                 new_pool.as_ref().and_then(|p| p.as_ref())
             } else {
@@ -4010,7 +4256,7 @@ impl PlatformBackend {
                     .and_then(|bo| bo.fb_handle)
                     .or_else(|| pool.bos.iter().find_map(|bo| bo.fb_handle))
             })
-        };
+        });
 
         let fb_for_commit = fb_id.ok_or_else(|| {
             // Free the newly-allocated pool before returning error.
@@ -4030,7 +4276,9 @@ impl PlatformBackend {
         };
 
         // Commit the modeset.  On failure, pool is freed (dropped below).
-        if let Err(e) = crate::drm::modeset::commit_modeset(&device, &output, fb_for_commit) {
+        if new_pool_committed_framebuffer.is_none()
+            && let Err(e) = crate::drm::modeset::commit_modeset(&device, &output, fb_for_commit)
+        {
             log::error!(
                 "render enable_connector: commit_modeset for {connector} ({}×{}@{}) at ({x},{y}) failed: {e}",
                 mode_spec.width,
@@ -4054,13 +4302,14 @@ impl PlatformBackend {
                 bo.state.mark_on_screen_after_modeset();
             }
         };
-        if needs_pool_realloc {
+        if needs_pool_realloc && new_pool_committed_framebuffer.is_none() {
             if let Some(pool) = new_pool.as_mut().and_then(Option::as_mut) {
                 mark_front(pool);
             }
-        } else if let Some(pool) = existing_idx
-            .and_then(|idx| self.scanout_pools.get_mut(idx))
-            .and_then(Option::as_mut)
+        } else if !needs_pool_realloc
+            && let Some(pool) = existing_idx
+                .and_then(|idx| self.scanout_pools.get_mut(idx))
+                .and_then(Option::as_mut)
         {
             mark_front(pool);
         }
@@ -4075,17 +4324,11 @@ impl PlatformBackend {
             self.outputs[idx].width = w;
             self.outputs[idx].height = h;
             if let Some(pool) = new_pool {
-                if idx < self.scanout_pools.len() {
-                    self.scanout_pools[idx] = pool;
-                }
-                if idx < self.bo_generations.len() {
-                    self.bo_generations[idx] = self
-                        .scanout_pools
-                        .get(idx)
-                        .and_then(|p| p.as_ref())
-                        .map(|p| vec![BoGenerationEntry::default(); p.bos.len()])
-                        .unwrap_or_default();
-                }
+                self.scanout_pools[idx] = pool;
+                self.bo_generations[idx] = self.scanout_pools[idx]
+                    .as_ref()
+                    .map(|pool| vec![BoGenerationEntry::default(); pool.bos.len()])
+                    .unwrap_or_default();
             }
         } else {
             // New output — push to end.
@@ -4910,6 +5153,40 @@ mod tests {
                 RenderKmsRelationship::Different,
             ),
             "an Asahi-style split route is valid and must retain both endpoints"
+        );
+    }
+
+    #[test]
+    fn every_non_same_route_requires_real_copy_free_probing() {
+        let render = RenderDeviceId::DrmRender(drm_key(128));
+        let kms = drm_key(0);
+        assert!(!route_requires_copy_free_probe(ScanoutRoute::new(
+            render,
+            kms,
+            RenderKmsRelationship::Same,
+        )));
+        assert!(route_requires_copy_free_probe(ScanoutRoute::new(
+            render,
+            kms,
+            RenderKmsRelationship::Different,
+        )));
+        assert!(route_requires_copy_free_probe(ScanoutRoute::new(
+            render,
+            kms,
+            RenderKmsRelationship::Unknown,
+        )));
+    }
+
+    #[test]
+    fn copy_free_candidate_diagnostics_name_the_exact_plan_and_stage() {
+        let diagnostic = copy_free_candidate_error(
+            ScanoutAllocationPlan::LegacyLinear,
+            "probe rendering",
+            &io::Error::other("synthetic device loss"),
+        );
+        assert_eq!(
+            diagnostic,
+            "legacy-linear probe rendering: synthetic device loss"
         );
     }
 
