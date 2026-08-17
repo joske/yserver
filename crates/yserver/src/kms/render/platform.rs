@@ -49,11 +49,15 @@ use yserver_core::backend::{BackendFdKind, PresentClockSample, PresentClockSourc
 use crate::{
     drm,
     kms::{
-        backend::{ActiveOutput, OutputKey, PlatformInit, platform_init as core_platform_init},
+        backend::{
+            ActiveOutput, OutputKey, PlatformInit, PlatformInitOutput,
+            platform_init as core_platform_init,
+        },
         render::{
             store::Storage,
             submit_group::{FlushReason, SubmitGroup},
         },
+        scanout_route::{RenderKmsRelationship, ScanoutRoute},
         vk::{
             device::VkContext,
             ops::OpsCommandPool,
@@ -61,6 +65,8 @@ use crate::{
         },
     },
 };
+
+pub(crate) use crate::kms::scanout_route::RenderDeviceId;
 
 // ────────────────────────────────────────────────────────────────
 // FenceTicket — CPU-side I6a lifetime ticket.
@@ -814,16 +820,6 @@ fn apply_cursor_operation_result(
         })
 }
 
-/// Stable renderer endpoint identity. Verified devices are keyed by their DRM
-/// render node. The explicit unverified fallback covers a targeted selection
-/// when every candidate lacks DRM identity, and a headless scored selection
-/// whose candidate advertises no render node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum RenderDeviceId {
-    DrmRender(crate::platform::drm::DrmDeviceKey),
-    UnverifiedFallback,
-}
-
 /// One Vulkan renderer endpoint. Its physical-device handle belongs to the
 /// platform's `VkContext` instance; KMS devices are represented separately.
 pub(crate) struct RenderDevice {
@@ -844,10 +840,33 @@ pub(crate) struct RenderDevice {
 
 impl RenderDevice {
     #[must_use]
-    pub(crate) fn is_same_device_as(&self, kms: &KmsDevice) -> Option<bool> {
-        self.advertised_primary_node
-            .map(|primary| primary == kms.key)
+    pub(crate) fn relationship_to(&self, kms: &KmsDevice) -> RenderKmsRelationship {
+        match self.advertised_primary_node {
+            Some(primary) if primary == kms.key => RenderKmsRelationship::Same,
+            Some(_) => RenderKmsRelationship::Different,
+            None => RenderKmsRelationship::Unknown,
+        }
     }
+
+    #[must_use]
+    pub(crate) fn scanout_route_to(&self, kms: &KmsDevice) -> ScanoutRoute {
+        ScanoutRoute::new(self.id, kms.key, self.relationship_to(kms))
+    }
+}
+
+fn scanout_pool_needs_reallocation(
+    existing: Option<&ActiveOutput>,
+    existing_pool_route: Option<ScanoutRoute>,
+    width: u16,
+    height: u16,
+    route: ScanoutRoute,
+) -> bool {
+    existing.is_none_or(|output| {
+        output.width != width
+            || output.height != height
+            || output.scanout_route != route
+            || existing_pool_route != Some(route)
+    })
 }
 
 /// One opened display/KMS device. Renderer identity and render-node resources
@@ -901,35 +920,66 @@ fn initialize_cursor_plane_for_device(
     }
 }
 
-fn rollback_initial_scanout_with<F>(
-    devices: &[KmsDevice],
-    outputs: &mut [ActiveOutput],
-    disable: &mut F,
-) where
+trait RollbackScanoutOutput {
+    fn output_key(&self) -> &OutputKey;
+    fn drm_output(&self) -> &crate::platform::drm::Output;
+    fn disarm_swapchain(&mut self);
+}
+
+impl RollbackScanoutOutput for PlatformInitOutput {
+    fn output_key(&self) -> &OutputKey {
+        &self.key
+    }
+
+    fn drm_output(&self) -> &crate::platform::drm::Output {
+        &self.output
+    }
+
+    fn disarm_swapchain(&mut self) {
+        self.swapchain.disarm();
+    }
+}
+
+impl RollbackScanoutOutput for ActiveOutput {
+    fn output_key(&self) -> &OutputKey {
+        &self.key
+    }
+
+    fn drm_output(&self) -> &crate::platform::drm::Output {
+        &self.output
+    }
+
+    fn disarm_swapchain(&mut self) {
+        self.swapchain.disarm();
+    }
+}
+
+fn rollback_initial_scanout_with<O, F>(devices: &[KmsDevice], outputs: &mut [O], disable: &mut F)
+where
+    O: RollbackScanoutOutput,
     F: FnMut(&drm::Device, &crate::platform::drm::Output) -> io::Result<()>,
 {
     for layout in outputs.iter_mut().rev() {
-        let Some(device) = devices
-            .iter()
-            .find(|device| device.key == layout.key.device_key)
-        else {
+        let device_key = layout.output_key().device_key;
+        let connector_name = layout.drm_output().connector_name.clone();
+        let Some(device) = devices.iter().find(|device| device.key == device_key) else {
             log::error!(
                 "initial scanout rollback: no DRM device {} for {}; \
                  leaving its buffers for DRM-fd close",
-                layout.key.device_key,
-                layout.output.connector_name,
+                device_key,
+                connector_name,
             );
-            layout.swapchain.disarm();
+            layout.disarm_swapchain();
             continue;
         };
-        if let Err(err) = disable(&device.device, &layout.output) {
+        if let Err(err) = disable(&device.device, layout.drm_output()) {
             log::warn!(
                 "initial scanout rollback: failed to disable {} on {}: {err}; \
                  leaving its buffers for DRM-fd close",
-                layout.output.connector_name,
+                connector_name,
                 device.key,
             );
-            layout.swapchain.disarm();
+            layout.disarm_swapchain();
         }
     }
 }
@@ -938,21 +988,23 @@ fn rollback_initial_scanout_with<F>(
 /// fully-built [`PlatformBackend`]. The output buffers stay borrowed until
 /// this guard is either dropped (rollback) or explicitly disarmed when
 /// responsibility transfers into `PlatformBackend::drop`.
-struct InitialScanoutRollbackGuard<'a, F>
+struct InitialScanoutRollbackGuard<'a, O, F>
 where
+    O: RollbackScanoutOutput,
     F: FnMut(&drm::Device, &crate::platform::drm::Output) -> io::Result<()>,
 {
     devices: &'a [KmsDevice],
-    outputs: &'a mut [ActiveOutput],
+    outputs: &'a mut [O],
     disable: F,
     armed: bool,
 }
 
-impl<'a, F> InitialScanoutRollbackGuard<'a, F>
+impl<'a, O, F> InitialScanoutRollbackGuard<'a, O, F>
 where
+    O: RollbackScanoutOutput,
     F: FnMut(&drm::Device, &crate::platform::drm::Output) -> io::Result<()>,
 {
-    fn new_with(devices: &'a [KmsDevice], outputs: &'a mut [ActiveOutput], disable: F) -> Self {
+    fn new_with(devices: &'a [KmsDevice], outputs: &'a mut [O], disable: F) -> Self {
         Self {
             devices,
             armed: !outputs.is_empty(),
@@ -965,7 +1017,7 @@ where
         self.devices
     }
 
-    fn outputs(&self) -> &[ActiveOutput] {
+    fn outputs(&self) -> &[O] {
         self.outputs
     }
 
@@ -978,8 +1030,9 @@ where
     }
 }
 
-impl<F> Drop for InitialScanoutRollbackGuard<'_, F>
+impl<O, F> Drop for InitialScanoutRollbackGuard<'_, O, F>
 where
+    O: RollbackScanoutOutput,
     F: FnMut(&drm::Device, &crate::platform::drm::Output) -> io::Result<()>,
 {
     fn drop(&mut self) {
@@ -1396,21 +1449,21 @@ impl PlatformBackend {
         );
         let (render_devices, selected_render_device) =
             build_render_device_inventory(&vk, render_node)?;
+        let selected_renderer = render_devices
+            .iter()
+            .find(|device| device.id == selected_render_device)
+            .expect("selected renderer is present in renderer inventory");
         if let Some(display) = devices.first() {
-            let selected = render_devices
-                .iter()
-                .find(|device| device.id == selected_render_device)
-                .expect("selected renderer is present in renderer inventory");
-            let kms_relationship = match selected.is_same_device_as(display) {
-                Some(true) => "same-device",
-                Some(false) => "different-device",
-                None => "unknown",
+            let kms_relationship = match selected_renderer.relationship_to(display) {
+                RenderKmsRelationship::Same => "same-device",
+                RenderKmsRelationship::Different => "different-device",
+                RenderKmsRelationship::Unknown => "unknown",
             };
             log::info!(
                 "render PlatformBackend: selected renderer {:?} (render={:?}, primary={:?}) has {kms_relationship} relationship to KMS device {}",
-                selected.physical_device,
-                selected.advertised_render_node,
-                selected.advertised_primary_node,
+                selected_renderer.physical_device,
+                selected_renderer.advertised_render_node,
+                selected_renderer.advertised_primary_node,
                 display.key,
             );
         }
@@ -1470,6 +1523,7 @@ impl PlatformBackend {
         // One ScanoutBoPool per output, 3-BO depth (matches v1).
         let mut scanout_pools = Vec::with_capacity(initial_scanout_rollback.outputs().len());
         let mut bo_generations = Vec::with_capacity(initial_scanout_rollback.outputs().len());
+        let mut scanout_routes = Vec::with_capacity(initial_scanout_rollback.outputs().len());
         let mut scanout_alloc_errors: Vec<String> = Vec::new();
         for (i, layout) in initial_scanout_rollback.outputs().iter().enumerate() {
             let w = u32::from(layout.width);
@@ -1484,9 +1538,12 @@ impl PlatformBackend {
                         layout.key.connector_name, layout.key.device_key
                     ))
                 })?;
+            let scanout_route = selected_renderer.scanout_route_to(device);
+            scanout_routes.push(scanout_route);
             match ScanoutBoPool::allocate(
                 Arc::clone(&vk),
                 Rc::clone(&device.device),
+                scanout_route,
                 w,
                 h,
                 3,
@@ -1573,12 +1630,23 @@ impl PlatformBackend {
         initial_scanout_rollback.disarm();
         drop(initial_scanout_rollback);
 
+        debug_assert_eq!(layouts.len(), scanout_routes.len());
+        let outputs = layouts
+            .into_iter()
+            .zip(scanout_routes)
+            .map(|(layout, route)| layout.qualify(route))
+            .collect::<Vec<_>>();
+        debug_assert!(outputs.iter().zip(&scanout_pools).all(|(output, pool)| {
+            pool.as_ref()
+                .is_none_or(|pool| pool.route == output.scanout_route)
+        }));
+
         Ok(Self {
             initial_scanout_rollback_armed,
             devices,
             render_devices,
             selected_render_device: Some(selected_render_device),
-            outputs: layouts,
+            outputs,
             fb_w,
             fb_h,
             ust_msc: std::collections::HashMap::new(),
@@ -1624,6 +1692,11 @@ impl PlatformBackend {
         #[cfg(target_os = "linux")]
         let hotplug_monitor = None;
         let device_key = crate::platform::drm::DrmDeviceKey { major: 0, minor: 0 };
+        let test_route = ScanoutRoute::new(
+            RenderDeviceId::UnverifiedFallback,
+            device_key,
+            RenderKmsRelationship::Unknown,
+        );
         let device = Rc::new(drm::Device::for_tests().expect("test drm device"));
         Self {
             initial_scanout_rollback_armed: false,
@@ -1635,7 +1708,7 @@ impl PlatformBackend {
             render_devices: Vec::new(),
             selected_render_device: None,
             outputs: vec![ActiveOutput::new(
-                device_key,
+                test_route,
                 crate::platform::drm::Output {
                     connector: ::drm::control::from_u32(1).unwrap(),
                     connector_name: "test".to_string(),
@@ -1715,6 +1788,17 @@ impl PlatformBackend {
             .expect("a test Vulkan context without an opened render node cannot mismatch");
         self.render_devices = render_devices;
         self.selected_render_device = Some(selected);
+        let routes = self
+            .outputs
+            .iter()
+            .map(|output| {
+                self.scanout_route_for_kms(output.key.device_key)
+                    .expect("test output has a KMS owner and selected renderer")
+            })
+            .collect::<Vec<_>>();
+        for (output, route) in self.outputs.iter_mut().zip(routes) {
+            output.scanout_route = route;
+        }
         self.vk = Some(vk);
     }
 
@@ -2414,6 +2498,34 @@ impl PlatformBackend {
 
     pub(crate) fn device_for_output(&self, key: &OutputKey) -> Option<&KmsDevice> {
         self.device_for_key(key.device_key)
+    }
+
+    /// Construct the live renderer-to-KMS route for one display device.
+    ///
+    /// A missing renderer is accepted only by the explicit Vk-less fixture;
+    /// production backends with a Vulkan context must always have a selected
+    /// renderer inventory entry.
+    pub(crate) fn scanout_route_for_kms(
+        &self,
+        kms_device_key: crate::platform::drm::DrmDeviceKey,
+    ) -> io::Result<ScanoutRoute> {
+        let kms = self.device_for_key(kms_device_key).ok_or_else(|| {
+            io::Error::other(format!("no KMS device for scanout route {kms_device_key}"))
+        })?;
+        if let Some(renderer) = self.selected_render_device() {
+            return Ok(renderer.scanout_route_to(kms));
+        }
+        if self.vk.is_none() {
+            return Ok(ScanoutRoute::new(
+                RenderDeviceId::UnverifiedFallback,
+                kms.key,
+                RenderKmsRelationship::Unknown,
+            ));
+        }
+        Err(io::Error::other(format!(
+            "Vulkan is active but no renderer is selected for KMS device {}",
+            kms.key
+        )))
     }
 
     /// Gather lightweight connector probes for every opened DRM device.
@@ -3450,6 +3562,18 @@ impl PlatformBackend {
 
     // ── I6b: scanout BO management ──────────────────────────────
 
+    fn debug_assert_scanout_pool_route(&self, output_idx: usize) {
+        if let Some(pool) = self.scanout_pools.get(output_idx).and_then(Option::as_ref) {
+            debug_assert_eq!(
+                self.outputs
+                    .get(output_idx)
+                    .map(|output| output.scanout_route),
+                Some(pool.route),
+                "scanout pool must stay paired with its output's renderer-to-KMS route"
+            );
+        }
+    }
+
     /// Pick the next BO to render into for `output_idx`, or
     /// `None` if all BOs are still in flight (the SceneCompositor
     /// should retry next core-loop iteration).
@@ -3458,6 +3582,7 @@ impl PlatformBackend {
     /// `content_invalidated` so the buffer-age algorithm in
     /// SceneCompositor doesn't need to reach into the pool.
     pub(crate) fn acquire_scanout_bo(&mut self, output_idx: usize) -> Option<ScanoutBoToken> {
+        self.debug_assert_scanout_pool_route(output_idx);
         let pool = self.scanout_pools.get_mut(output_idx)?.as_mut()?;
         let gens = self.bo_generations.get(output_idx)?;
         for (bo_idx, bo) in pool.bos.iter().enumerate() {
@@ -3486,6 +3611,7 @@ impl PlatformBackend {
         &self,
         output_idx: usize,
     ) -> Option<::drm::control::framebuffer::Handle> {
+        self.debug_assert_scanout_pool_route(output_idx);
         self.scanout_pools
             .get(output_idx)?
             .as_ref()?
@@ -3514,6 +3640,7 @@ impl PlatformBackend {
     /// be rendered into again while the previous command buffer is
     /// still writing it.
     pub(crate) fn recycle_failed_submit_bo(&mut self, output_idx: usize, bo_idx: usize) {
+        self.debug_assert_scanout_pool_route(output_idx);
         let Some(bo) = self
             .scanout_pools
             .get_mut(output_idx)
@@ -3697,6 +3824,7 @@ impl PlatformBackend {
                 .ok_or_else(|| io::Error::other(format!("no DRM device for {output_key:?}")))?
                 .device,
         );
+        let scanout_route = self.scanout_route_for_kms(output_key.device_key)?;
 
         if let Some(conflict) = self.outputs.iter().find(|layout| {
             layout.key.device_key == output_key.device_key
@@ -3806,10 +3934,16 @@ impl PlatformBackend {
             .outputs
             .iter()
             .position(|layout| &layout.key == output_key);
-        let needs_pool_realloc = match existing_idx {
-            Some(idx) => self.outputs[idx].width != w || self.outputs[idx].height != h,
-            None => true,
-        };
+        let needs_pool_realloc = scanout_pool_needs_reallocation(
+            existing_idx.and_then(|idx| self.outputs.get(idx)),
+            existing_idx
+                .and_then(|idx| self.scanout_pools.get(idx))
+                .and_then(Option::as_ref)
+                .map(|pool| pool.route),
+            w,
+            h,
+            scanout_route,
+        );
 
         // (Re)allocate the scanout pool if needed.
         let mut new_pool = if needs_pool_realloc {
@@ -3817,6 +3951,7 @@ impl PlatformBackend {
                 match ScanoutBoPool::allocate(
                     Arc::clone(&vk),
                     Rc::clone(&device),
+                    scanout_route,
                     u32::from(w),
                     u32::from(h),
                     3,
@@ -3923,6 +4058,7 @@ impl PlatformBackend {
         if let Some(idx) = existing_idx {
             // Update in-place.
             self.outputs[idx].output = output;
+            self.outputs[idx].scanout_route = scanout_route;
             self.outputs[idx].x = x;
             self.outputs[idx].y = y;
             self.outputs[idx].width = w;
@@ -3943,7 +4079,7 @@ impl PlatformBackend {
         } else {
             // New output — push to end.
             self.outputs.push(ActiveOutput::new(
-                output_key.device_key,
+                scanout_route,
                 output,
                 drm::Swapchain::empty_for_tests(),
                 x,
@@ -3958,6 +4094,15 @@ impl PlatformBackend {
             self.bo_generations.push(gens);
             self.first_pageflip_logged.push(false);
         }
+
+        let installed_idx = existing_idx.unwrap_or_else(|| self.outputs.len() - 1);
+        debug_assert_eq!(self.outputs[installed_idx].scanout_route, scanout_route);
+        debug_assert!(
+            self.scanout_pools
+                .get(installed_idx)
+                .and_then(Option::as_ref)
+                .is_none_or(|pool| pool.route == scanout_route)
+        );
 
         // Recompute virtual framebuffer extent (2-D, no recompact).
         let layouts: Vec<(i32, i32, u16, u16)> = self
@@ -4020,6 +4165,7 @@ impl PlatformBackend {
         &mut self,
         output_idx: usize,
     ) -> Option<PageFlipRetirement> {
+        self.debug_assert_scanout_pool_route(output_idx);
         let pool = self.scanout_pools.get_mut(output_idx)?.as_mut()?;
         // First pass: find any BO currently `Pending`. Walk only
         // — don't mutate during the search.
@@ -4621,10 +4767,10 @@ mod tests {
     }
 
     #[test]
-    fn renderer_primary_relationship_distinguishes_unknown_from_different() {
+    fn renderer_primary_relationship_preserves_same_different_and_unknown() {
         let kms = test_kms_device(drm_key(0), false);
-        let renderer = |primary| RenderDevice {
-            id: RenderDeviceId::UnverifiedFallback,
+        let renderer = |id, primary| RenderDevice {
+            id,
             physical_device: vk::PhysicalDevice::default(),
             advertised_primary_node: primary,
             advertised_render_node: None,
@@ -4633,15 +4779,93 @@ mod tests {
             syncobj_timeline: false,
         };
 
-        assert_eq!(renderer(None).is_same_device_as(&kms), None);
         assert_eq!(
-            renderer(Some(drm_key(0))).is_same_device_as(&kms),
-            Some(true)
+            renderer(RenderDeviceId::UnverifiedFallback, None).relationship_to(&kms),
+            RenderKmsRelationship::Unknown
         );
         assert_eq!(
-            renderer(Some(drm_key(1))).is_same_device_as(&kms),
-            Some(false)
+            renderer(RenderDeviceId::UnverifiedFallback, Some(drm_key(0))).relationship_to(&kms),
+            RenderKmsRelationship::Same
         );
+        assert_eq!(
+            renderer(RenderDeviceId::UnverifiedFallback, Some(drm_key(1))).relationship_to(&kms),
+            RenderKmsRelationship::Different
+        );
+        assert_eq!(
+            renderer(RenderDeviceId::DrmRender(drm_key(128)), Some(drm_key(0)))
+                .relationship_to(&kms),
+            RenderKmsRelationship::Same,
+            "same-device detection compares the advertised primary node, not the render node"
+        );
+        assert_eq!(
+            renderer(RenderDeviceId::DrmRender(drm_key(128)), Some(drm_key(1)))
+                .relationship_to(&kms),
+            RenderKmsRelationship::Different
+        );
+    }
+
+    #[test]
+    fn split_gpu_route_keeps_renderer_and_kms_endpoint_identities() {
+        let kms = test_kms_device(drm_key(0), false);
+        let renderer = RenderDevice {
+            id: RenderDeviceId::DrmRender(drm_key(128)),
+            physical_device: vk::PhysicalDevice::default(),
+            advertised_primary_node: Some(drm_key(1)),
+            advertised_render_node: Some(drm_key(128)),
+            render_node: None,
+            render_node_device: None,
+            syncobj_timeline: false,
+        };
+
+        assert_eq!(
+            renderer.scanout_route_to(&kms),
+            ScanoutRoute::new(
+                RenderDeviceId::DrmRender(drm_key(128)),
+                drm_key(0),
+                RenderKmsRelationship::Different,
+            ),
+            "an Asahi-style split route is valid and must retain both endpoints"
+        );
+    }
+
+    #[test]
+    fn route_or_pool_mismatch_reallocates_a_same_size_scanout_pool() {
+        let platform = PlatformBackend::for_tests();
+        let output = &platform.outputs[0];
+        assert!(!scanout_pool_needs_reallocation(
+            Some(output),
+            Some(output.scanout_route),
+            output.width,
+            output.height,
+            output.scanout_route,
+        ));
+
+        let changed_route = ScanoutRoute::new(
+            RenderDeviceId::DrmRender(drm_key(128)),
+            output.key.device_key,
+            RenderKmsRelationship::Unknown,
+        );
+        assert!(scanout_pool_needs_reallocation(
+            Some(output),
+            Some(output.scanout_route),
+            output.width,
+            output.height,
+            changed_route,
+        ));
+        assert!(scanout_pool_needs_reallocation(
+            Some(output),
+            Some(changed_route),
+            output.width,
+            output.height,
+            output.scanout_route,
+        ));
+        assert!(scanout_pool_needs_reallocation(
+            Some(output),
+            None,
+            output.width,
+            output.height,
+            output.scanout_route,
+        ));
     }
 
     fn install_test_cursor_plane(
@@ -4665,6 +4889,11 @@ mod tests {
         let mut seed = PlatformBackend::for_tests();
         let mut output = seed.outputs.remove(0);
         output.key = OutputKey::new(device_key, connector_name);
+        output.scanout_route = ScanoutRoute::new(
+            output.scanout_route.render_device_id,
+            device_key,
+            RenderKmsRelationship::Unknown,
+        );
         output.output.connector_name = connector_name.to_string();
         output.output.connector = ::drm::control::from_u32(raw_crtc).unwrap();
         output.output.encoder = ::drm::control::from_u32(raw_crtc).unwrap();
@@ -4674,15 +4903,25 @@ mod tests {
     }
 
     #[test]
-    fn initial_scanout_rollback_guard_fires_and_can_be_disarmed() {
+    fn unqualified_initial_scanout_rollback_guard_fires_and_can_be_disarmed() {
         let mut platform = PlatformBackend::for_tests();
+        let active = platform.outputs.remove(0);
+        let mut initial_outputs = [PlatformInitOutput {
+            key: active.key,
+            output: active.output,
+            swapchain: active.swapchain,
+            x: active.x,
+            y: active.y,
+            width: active.width,
+            height: active.height,
+        }];
         let calls = Rc::new(Cell::new(0_u32));
 
         {
             let calls = Rc::clone(&calls);
             let _guard = InitialScanoutRollbackGuard::new_with(
                 &platform.devices,
-                &mut platform.outputs,
+                &mut initial_outputs,
                 move |_device, _output| {
                     calls.set(calls.get() + 1);
                     Ok(())
@@ -4695,7 +4934,7 @@ mod tests {
             let calls = Rc::clone(&calls);
             let mut guard = InitialScanoutRollbackGuard::new_with(
                 &platform.devices,
-                &mut platform.outputs,
+                &mut initial_outputs,
                 move |_device, _output| {
                     calls.set(calls.get() + 1);
                     Ok(())
@@ -4704,6 +4943,19 @@ mod tests {
             guard.disarm();
         }
         assert_eq!(calls.get(), 1, "disarmed guard must not roll back");
+
+        let route = ScanoutRoute::new(
+            RenderDeviceId::DrmRender(drm_key(128)),
+            initial_outputs[0].key.device_key,
+            RenderKmsRelationship::Unknown,
+        );
+        let qualified = initial_outputs
+            .into_iter()
+            .next()
+            .expect("one init output")
+            .qualify(route);
+        assert_eq!(qualified.scanout_route, route);
+        assert_eq!(qualified.key.device_key, route.kms_device_key);
     }
 
     #[test]

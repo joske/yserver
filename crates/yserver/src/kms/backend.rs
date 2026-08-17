@@ -34,6 +34,7 @@ use crate::{
     kms::{
         core::{GlyphSetFormat, GlyphSetState, StoredGlyph},
         cpu_types::{PictTransform, Rectangle16, Repeat},
+        scanout_route::ScanoutRoute,
     },
 };
 
@@ -565,6 +566,10 @@ impl OutputKey {
 /// extent.
 pub(crate) struct ActiveOutput {
     pub key: OutputKey,
+    /// Renderer and KMS endpoints that own this live output's scanout route.
+    /// This is qualified only after Vulkan selects its operational renderer;
+    /// init-time dumb scanout uses [`PlatformInitOutput`] instead.
+    pub scanout_route: ScanoutRoute,
     pub output: crate::platform::drm::Output,
     /// Kept alive for the lifetime of the output to retain initial-
     /// scanout buffer ownership; v2 has its own per-output
@@ -579,6 +584,43 @@ pub(crate) struct ActiveOutput {
 
 impl ActiveOutput {
     pub(crate) fn new(
+        scanout_route: ScanoutRoute,
+        output: crate::platform::drm::Output,
+        swapchain: crate::drm::Swapchain,
+        x: i32,
+        y: i32,
+    ) -> Self {
+        let key = OutputKey::new(scanout_route.kms_device_key, output.connector_name.clone());
+        let width = output.picked.width;
+        let height = output.picked.height;
+        Self {
+            key,
+            scanout_route,
+            output,
+            swapchain,
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+}
+
+/// Output committed during platform discovery, before Vulkan has selected a
+/// renderer endpoint. It is converted into [`ActiveOutput`] only after a
+/// truthful [`ScanoutRoute`] can be constructed.
+pub(crate) struct PlatformInitOutput {
+    pub key: OutputKey,
+    pub output: crate::platform::drm::Output,
+    pub swapchain: crate::drm::Swapchain,
+    pub x: i32,
+    pub y: i32,
+    pub width: u16,
+    pub height: u16,
+}
+
+impl PlatformInitOutput {
+    fn new(
         device_key: crate::platform::drm::DrmDeviceKey,
         output: crate::platform::drm::Output,
         swapchain: crate::drm::Swapchain,
@@ -596,6 +638,22 @@ impl ActiveOutput {
             y,
             width,
             height,
+        }
+    }
+
+    /// Attach the post-Vulkan renderer identity without reopening, cloning, or
+    /// otherwise disturbing the already-committed dumb scanout resources.
+    pub(crate) fn qualify(self, scanout_route: ScanoutRoute) -> ActiveOutput {
+        debug_assert_eq!(self.key.device_key, scanout_route.kms_device_key);
+        ActiveOutput {
+            key: self.key,
+            scanout_route,
+            output: self.output,
+            swapchain: self.swapchain,
+            x: self.x,
+            y: self.y,
+            width: self.width,
+            height: self.height,
         }
     }
 }
@@ -629,7 +687,7 @@ pub(crate) struct PlatformInit {
     /// Selected render endpoint, separate from the KMS-device inventory.
     /// `None` is valid for headless startup or unavailable DRI3.
     pub(crate) render_node: Option<crate::kms::render_node::OpenedRenderNode>,
-    pub(crate) layouts: Vec<ActiveOutput>,
+    pub(crate) layouts: Vec<PlatformInitOutput>,
     pub(crate) fb_w: u16,
     pub(crate) fb_h: u16,
     pub(crate) input_ctx: Option<crate::input::SendContext>,
@@ -669,7 +727,7 @@ fn activate_initial_scanout_outputs(
         &crate::platform::drm::Output,
         ::drm::control::framebuffer::Handle,
     ) -> io::Result<()>,
-) -> io::Result<Vec<ActiveOutput>> {
+) -> io::Result<Vec<PlatformInitOutput>> {
     let outputs = crate::platform::drm::discover_outputs(device)?;
     if !outputs.is_empty() {
         // Refuse software-only Vulkan before allocating or committing any
@@ -708,7 +766,9 @@ fn activate_initial_scanout_outputs(
             break;
         }
         let swapchain = drm::Swapchain::with_initial_scanout(buffers, 0);
-        layouts.push(ActiveOutput::new(device_key, output, swapchain, next_x, 0));
+        layouts.push(PlatformInitOutput::new(
+            device_key, output, swapchain, next_x, 0,
+        ));
         next_x = next_x.saturating_add(i32::from(w));
     }
     if let Some(err) = bring_up_err {

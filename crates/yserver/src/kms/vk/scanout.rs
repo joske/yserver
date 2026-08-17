@@ -62,6 +62,7 @@ use std::{
 
 use ash::vk;
 use drm::{
+    Device as DrmDevice, DriverCapability,
     buffer::{DrmFourcc, DrmModifier, Handle as DrmBufferHandle, PlanarBuffer as DrmPlanarBuffer},
     control::{Device as DrmControlDevice, FbCmd2Flags, framebuffer},
 };
@@ -73,6 +74,7 @@ use drm::{
 type GbmDevice = gbm::Device<Rc<crate::drm::Device>>;
 
 use super::device::VkContext;
+use crate::kms::scanout_route::ScanoutRoute;
 
 /// Per-bo phase. The lifecycle is roughly
 /// `Free → Recording → Submitted → Pending → OnScreen → Retiring → Free`.
@@ -334,6 +336,14 @@ pub struct ScanoutBoPool {
     pub bos: Vec<ScanoutBo>,
     pub width: u32,
     pub height: u32,
+    /// Stable renderer and KMS endpoints this pool connects. Kept separately
+    /// from the observations below because incomplete device metadata must not
+    /// erase either endpoint's identity.
+    pub(crate) route: ScanoutRoute,
+    /// Non-authoritative capability observations for both zero-copy allocation
+    /// directions. Real GBM/Vulkan allocation and import remain the source of
+    /// truth; these observations never filter or reorder allocation plans.
+    pub(crate) metadata: DmabufScanoutMetadata,
     /// GBM device on the pool's KMS DRM fd. Populated when
     /// `gbm_create_device` succeeds; individual BOs use this to
     /// allocate driver-side scanout-layout buffers (ecosystem-
@@ -346,6 +356,299 @@ pub struct ScanoutBoPool {
     /// refactors.
     #[allow(dead_code)]
     gbm_device: Option<Rc<GbmDevice>>,
+}
+
+/// Result of observing one advertised prerequisite for a DMA-BUF path.
+///
+/// `Unknown` is deliberately distinct from `Unsupported`: missing metadata or
+/// a failed capability query cannot prove that the driver's real ioctls will
+/// reject a buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScanoutMetadataSupport {
+    Supported,
+    Unsupported,
+    Unknown,
+}
+
+/// Metadata for one allocation direction's explicit-modifier path.
+///
+/// `kms_prime` is KMS PRIME export for output-owned (GBM) allocations and KMS
+/// PRIME import for renderer-owned (Vulkan) allocations. `modifiers` contains
+/// the KMS-plane modifiers for which Vulkan advertised the direction's needed
+/// external-memory feature. `modifier_path` combines those two observations;
+/// it is diagnostic only and says nothing conclusive about linear fallbacks or
+/// the success of a concrete allocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DmabufDirectionMetadata {
+    pub(crate) kms_prime: ScanoutMetadataSupport,
+    pub(crate) vulkan_modifiers: ScanoutMetadataSupport,
+    pub(crate) modifiers: Vec<u64>,
+    pub(crate) modifier_path: ScanoutMetadataSupport,
+    pub(crate) linear: DmabufLinearMetadata,
+}
+
+/// How the KMS plane's metadata says a linear framebuffer would be registered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KmsLinearLayout {
+    /// `IN_FORMATS` explicitly includes `DRM_FORMAT_MOD_LINEAR`.
+    ExplicitModifier,
+    /// No usable `IN_FORMATS` metadata was available. The allocator may still
+    /// attempt traditional untagged `addfb2`, but the metadata cannot prove it.
+    LegacyAddfb,
+    /// `IN_FORMATS` was present and did not include linear.
+    NotAdvertised,
+}
+
+/// Direction-specific evidence for a linear DMA-BUF path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DmabufLinearMetadata {
+    /// Vulkan IMPORTABLE for output-owned explicit-linear GBM buffers;
+    /// Vulkan EXPORTABLE with `VK_IMAGE_TILING_LINEAR` for renderer-owned
+    /// buffers.
+    pub(crate) vulkan: ScanoutMetadataSupport,
+    pub(crate) kms_layout: KmsLinearLayout,
+    /// PRIME, Vulkan, and KMS-layout evidence combined without affecting the
+    /// allocator.
+    pub(crate) path: ScanoutMetadataSupport,
+}
+
+/// Direction-specific metadata captured when a scanout pool is allocated.
+///
+/// The directions have asymmetric requirements:
+/// - output-owned: KMS PRIME export plus Vulkan DMA-BUF import;
+/// - renderer-owned: Vulkan DMA-BUF export plus KMS PRIME import.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DmabufScanoutMetadata {
+    pub(crate) vulkan_external_memory_fd: ScanoutMetadataSupport,
+    pub(crate) output_owned: DmabufDirectionMetadata,
+    pub(crate) renderer_owned: DmabufDirectionMetadata,
+}
+
+const DRM_PRIME_CAP_IMPORT: u64 = 1 << 0;
+const DRM_PRIME_CAP_EXPORT: u64 = 1 << 1;
+
+fn support_from_prime_bits(bits: u64, required: u64) -> ScanoutMetadataSupport {
+    if bits & required != 0 {
+        ScanoutMetadataSupport::Supported
+    } else {
+        ScanoutMetadataSupport::Unsupported
+    }
+}
+
+fn combine_required_metadata(
+    first: ScanoutMetadataSupport,
+    second: ScanoutMetadataSupport,
+) -> ScanoutMetadataSupport {
+    use ScanoutMetadataSupport::{Supported, Unknown, Unsupported};
+
+    match (first, second) {
+        (Unsupported, _) | (_, Unsupported) => Unsupported,
+        (Supported, Supported) => Supported,
+        (Supported | Unknown, Supported | Unknown) => Unknown,
+    }
+}
+
+fn kms_linear_layout(kms_scanout_modifiers: &[u64]) -> KmsLinearLayout {
+    if kms_scanout_modifiers.is_empty() {
+        KmsLinearLayout::LegacyAddfb
+    } else if kms_scanout_modifiers.contains(&super::dri3::DRM_FORMAT_MOD_LINEAR) {
+        KmsLinearLayout::ExplicitModifier
+    } else {
+        KmsLinearLayout::NotAdvertised
+    }
+}
+
+fn kms_linear_layout_support(layout: KmsLinearLayout) -> ScanoutMetadataSupport {
+    match layout {
+        KmsLinearLayout::ExplicitModifier => ScanoutMetadataSupport::Supported,
+        KmsLinearLayout::LegacyAddfb => ScanoutMetadataSupport::Unknown,
+        KmsLinearLayout::NotAdvertised => ScanoutMetadataSupport::Unsupported,
+    }
+}
+
+fn build_linear_metadata(
+    prime: ScanoutMetadataSupport,
+    vulkan: ScanoutMetadataSupport,
+    kms_layout: KmsLinearLayout,
+) -> DmabufLinearMetadata {
+    let path = combine_required_metadata(
+        prime,
+        combine_required_metadata(vulkan, kms_linear_layout_support(kms_layout)),
+    );
+    DmabufLinearMetadata {
+        vulkan,
+        kms_layout,
+        path,
+    }
+}
+
+fn classify_modifier_observations(
+    kms_advertised_modifiers: bool,
+    observations: &[(u64, ScanoutMetadataSupport)],
+) -> (Vec<u64>, ScanoutMetadataSupport) {
+    use ScanoutMetadataSupport::{Supported, Unknown, Unsupported};
+
+    if !kms_advertised_modifiers {
+        return (Vec::new(), Unknown);
+    }
+
+    let mut modifiers = Vec::new();
+    let mut saw_unknown = false;
+    for &(modifier, support) in observations {
+        match support {
+            Supported if !modifiers.contains(&modifier) => modifiers.push(modifier),
+            Supported | Unsupported => {}
+            Unknown => saw_unknown = true,
+        }
+    }
+
+    let support = if modifiers.is_empty() {
+        if saw_unknown { Unknown } else { Unsupported }
+    } else {
+        Supported
+    };
+    (modifiers, support)
+}
+
+fn probe_kms_prime_metadata(
+    drm: &crate::drm::Device,
+    route: ScanoutRoute,
+) -> (ScanoutMetadataSupport, ScanoutMetadataSupport) {
+    match drm.get_driver_capability(DriverCapability::Prime) {
+        Ok(bits) => (
+            support_from_prime_bits(bits, DRM_PRIME_CAP_IMPORT),
+            support_from_prime_bits(bits, DRM_PRIME_CAP_EXPORT),
+        ),
+        Err(error) => {
+            log::warn!(
+                "dma-buf metadata for {route:?}: DRM_CAP_PRIME query failed: {error}; \
+                 import/export support remains unknown"
+            );
+            (
+                ScanoutMetadataSupport::Unknown,
+                ScanoutMetadataSupport::Unknown,
+            )
+        }
+    }
+}
+
+fn probe_directional_modifiers(
+    vk: &VkContext,
+    kms_scanout_modifiers: &[u64],
+    feature: vk::ExternalMemoryFeatureFlags,
+) -> (Vec<u64>, ScanoutMetadataSupport) {
+    if kms_scanout_modifiers.is_empty() {
+        return classify_modifier_observations(false, &[]);
+    }
+
+    let observations = kms_scanout_modifiers
+        .iter()
+        .copied()
+        .map(|modifier| {
+            (
+                modifier,
+                probe_scanout_modifier_single_plane_feature(vk, modifier, feature),
+            )
+        })
+        .collect::<Vec<_>>();
+    classify_modifier_observations(true, &observations)
+}
+
+fn build_dmabuf_scanout_metadata(
+    external_memory_fd: ScanoutMetadataSupport,
+    prime_import: ScanoutMetadataSupport,
+    prime_export: ScanoutMetadataSupport,
+    output_owned_modifiers: (Vec<u64>, ScanoutMetadataSupport),
+    renderer_owned_modifiers: (Vec<u64>, ScanoutMetadataSupport),
+    output_owned_linear: (ScanoutMetadataSupport, KmsLinearLayout),
+    renderer_owned_linear: (ScanoutMetadataSupport, KmsLinearLayout),
+) -> DmabufScanoutMetadata {
+    let (output_owned_modifiers, output_owned_modifier_support) = output_owned_modifiers;
+    let (renderer_owned_modifiers, renderer_owned_modifier_support) = renderer_owned_modifiers;
+    let output_owned_modifier_path =
+        combine_required_metadata(prime_export, output_owned_modifier_support);
+    let renderer_owned_modifier_path =
+        combine_required_metadata(prime_import, renderer_owned_modifier_support);
+    let output_owned_linear =
+        build_linear_metadata(prime_export, output_owned_linear.0, output_owned_linear.1);
+    let renderer_owned_linear = build_linear_metadata(
+        prime_import,
+        renderer_owned_linear.0,
+        renderer_owned_linear.1,
+    );
+    DmabufScanoutMetadata {
+        vulkan_external_memory_fd: external_memory_fd,
+        output_owned: DmabufDirectionMetadata {
+            kms_prime: prime_export,
+            vulkan_modifiers: output_owned_modifier_support,
+            modifiers: output_owned_modifiers,
+            modifier_path: output_owned_modifier_path,
+            linear: output_owned_linear,
+        },
+        renderer_owned: DmabufDirectionMetadata {
+            kms_prime: prime_import,
+            vulkan_modifiers: renderer_owned_modifier_support,
+            modifiers: renderer_owned_modifiers,
+            modifier_path: renderer_owned_modifier_path,
+            linear: renderer_owned_linear,
+        },
+    }
+}
+
+fn probe_dmabuf_scanout_metadata(
+    vk: &VkContext,
+    drm: &crate::drm::Device,
+    route: ScanoutRoute,
+    kms_scanout_modifiers: &[u64],
+) -> DmabufScanoutMetadata {
+    let external_memory_fd = if vk.external_memory_fd.is_some() {
+        ScanoutMetadataSupport::Supported
+    } else {
+        ScanoutMetadataSupport::Unsupported
+    };
+    let (prime_import, prime_export) = probe_kms_prime_metadata(drm, route);
+    let (output_owned_modifiers, output_owned_modifier_support) = probe_directional_modifiers(
+        vk,
+        kms_scanout_modifiers,
+        vk::ExternalMemoryFeatureFlags::IMPORTABLE,
+    );
+    let (renderer_owned_modifiers, renderer_owned_modifier_support) = probe_directional_modifiers(
+        vk,
+        kms_scanout_modifiers,
+        vk::ExternalMemoryFeatureFlags::EXPORTABLE,
+    );
+    let linear_layout = kms_linear_layout(kms_scanout_modifiers);
+    let output_owned_linear = probe_scanout_modifier_single_plane_feature(
+        vk,
+        super::dri3::DRM_FORMAT_MOD_LINEAR,
+        vk::ExternalMemoryFeatureFlags::IMPORTABLE,
+    );
+    let renderer_owned_linear =
+        probe_scanout_linear_feature(vk, vk::ExternalMemoryFeatureFlags::EXPORTABLE);
+    let metadata = build_dmabuf_scanout_metadata(
+        external_memory_fd,
+        prime_import,
+        prime_export,
+        (output_owned_modifiers, output_owned_modifier_support),
+        (renderer_owned_modifiers, renderer_owned_modifier_support),
+        (output_owned_linear, linear_layout),
+        (renderer_owned_linear, linear_layout),
+    );
+    log::info!(
+        "dma-buf metadata for {route:?}: output-owned KMS-export={:?} \
+         Vulkan-import={:?} modifiers={} linear={:?}; renderer-owned \
+         Vulkan-export={:?} KMS-import={:?} modifiers={} linear={:?} \
+         (observation only)",
+        metadata.output_owned.kms_prime,
+        metadata.output_owned.vulkan_modifiers,
+        format_modifiers(&metadata.output_owned.modifiers),
+        metadata.output_owned.linear,
+        metadata.renderer_owned.vulkan_modifiers,
+        metadata.renderer_owned.kms_prime,
+        format_modifiers(&metadata.renderer_owned.modifiers),
+        metadata.renderer_owned.linear,
+    );
+    metadata
 }
 
 impl ScanoutBo {
@@ -765,14 +1068,16 @@ impl ScanoutBoPool {
     /// Vulkan-first legacy allocator. On BO allocation failure the
     /// partial pool is dropped (each successful bo cleans up via
     /// `ScanoutBo::Drop`).
-    pub fn allocate(
+    pub(crate) fn allocate(
         vk: Arc<VkContext>,
         drm: Rc<crate::drm::Device>,
+        route: ScanoutRoute,
         width: u32,
         height: u32,
         count: usize,
         scanout_modifiers: &[u64],
     ) -> io::Result<Self> {
+        let metadata = probe_dmabuf_scanout_metadata(&vk, &drm, route, scanout_modifiers);
         let gbm_device = match GbmDevice::new(Rc::clone(&drm)) {
             Ok(g) => Some(Rc::new(g)),
             Err(e) => {
@@ -800,6 +1105,8 @@ impl ScanoutBoPool {
             bos,
             width,
             height,
+            route,
+            metadata,
             gbm_device,
         })
     }
@@ -1287,6 +1594,122 @@ fn scanout_modifier_single_plane_supports_feature(
             .compatible_handle_types
             .contains(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
         && drm_modifier_plane_count(vk, modifier) == Some(1)
+}
+
+/// Observe one explicit-modifier external-memory feature without collapsing
+/// failed or missing metadata into `Unsupported`.
+///
+/// This intentionally does not replace
+/// [`scanout_modifier_single_plane_supports_feature`]: the latter is part of
+/// the established allocator's candidate construction. Keeping the runtime
+/// predicate separate guarantees that adding diagnostics cannot prune or
+/// reorder any allocation plan.
+fn probe_scanout_modifier_single_plane_feature(
+    vk: &VkContext,
+    modifier: u64,
+    feature: vk::ExternalMemoryFeatureFlags,
+) -> ScanoutMetadataSupport {
+    use ScanoutMetadataSupport::{Supported, Unknown, Unsupported};
+    use std::ffi::c_void;
+
+    if !vk.image_drm_format_modifier || vk.external_memory_fd.is_none() {
+        return Unsupported;
+    }
+
+    let mut modifier_info = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
+        .drm_format_modifier(modifier)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let mut external_info = vk::PhysicalDeviceExternalImageFormatInfo::default()
+        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+    external_info.p_next = std::ptr::from_mut(&mut modifier_info).cast::<c_void>();
+
+    let mut format_info = vk::PhysicalDeviceImageFormatInfo2::default()
+        .format(vk::Format::B8G8R8A8_UNORM)
+        .ty(vk::ImageType::TYPE_2D)
+        .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+        .usage(scanout_image_usage());
+    format_info.p_next = std::ptr::from_mut(&mut external_info).cast::<c_void>();
+
+    let mut external_props = vk::ExternalImageFormatProperties::default();
+    let mut props2 = vk::ImageFormatProperties2::default().push_next(&mut external_props);
+    if let Err(error) = unsafe {
+        vk.instance.get_physical_device_image_format_properties2(
+            vk.physical_device,
+            &format_info,
+            &mut props2,
+        )
+    } {
+        return if error == vk::Result::ERROR_FORMAT_NOT_SUPPORTED {
+            Unsupported
+        } else {
+            Unknown
+        };
+    }
+
+    let external = external_props.external_memory_properties;
+    if !external.external_memory_features.contains(feature)
+        || !external
+            .compatible_handle_types
+            .contains(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+    {
+        return Unsupported;
+    }
+
+    match drm_modifier_plane_count(vk, modifier) {
+        Some(1) => Supported,
+        Some(_) => Unsupported,
+        None => Unknown,
+    }
+}
+
+/// Observe Vulkan's DMA-BUF support for a plain
+/// `VK_IMAGE_TILING_LINEAR` scanout image. This is the renderer-owned
+/// ExplicitLinear/LegacyLinear evidence; padded explicit-linear remains part
+/// of the modifier observation above.
+fn probe_scanout_linear_feature(
+    vk: &VkContext,
+    feature: vk::ExternalMemoryFeatureFlags,
+) -> ScanoutMetadataSupport {
+    use ScanoutMetadataSupport::{Supported, Unknown, Unsupported};
+
+    if vk.external_memory_fd.is_none() {
+        return Unsupported;
+    }
+
+    let mut external_info = vk::PhysicalDeviceExternalImageFormatInfo::default()
+        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+    let format_info = vk::PhysicalDeviceImageFormatInfo2::default()
+        .format(vk::Format::B8G8R8A8_UNORM)
+        .ty(vk::ImageType::TYPE_2D)
+        .tiling(vk::ImageTiling::LINEAR)
+        .usage(scanout_image_usage())
+        .push_next(&mut external_info);
+    let mut external_props = vk::ExternalImageFormatProperties::default();
+    let mut props2 = vk::ImageFormatProperties2::default().push_next(&mut external_props);
+    if let Err(error) = unsafe {
+        vk.instance.get_physical_device_image_format_properties2(
+            vk.physical_device,
+            &format_info,
+            &mut props2,
+        )
+    } {
+        return if error == vk::Result::ERROR_FORMAT_NOT_SUPPORTED {
+            Unsupported
+        } else {
+            Unknown
+        };
+    }
+
+    let external = external_props.external_memory_properties;
+    if external.external_memory_features.contains(feature)
+        && external
+            .compatible_handle_types
+            .contains(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+    {
+        Supported
+    } else {
+        Unsupported
+    }
 }
 
 fn drm_modifier_plane_count(vk: &VkContext, modifier: u64) -> Option<u32> {
@@ -2084,6 +2507,172 @@ mod tests {
     // Representative tiled modifiers (real AMD GFX9+ vendor-tiled values).
     const TILED_A: u64 = 0x0200_0000_0000_0008;
     const TILED_B: u64 = 0x0200_0000_0000_000a;
+
+    #[test]
+    fn prime_capability_bits_keep_import_and_export_distinct() {
+        assert_eq!(
+            support_from_prime_bits(DRM_PRIME_CAP_IMPORT, DRM_PRIME_CAP_IMPORT),
+            ScanoutMetadataSupport::Supported
+        );
+        assert_eq!(
+            support_from_prime_bits(DRM_PRIME_CAP_IMPORT, DRM_PRIME_CAP_EXPORT),
+            ScanoutMetadataSupport::Unsupported
+        );
+        assert_eq!(
+            support_from_prime_bits(DRM_PRIME_CAP_EXPORT, DRM_PRIME_CAP_IMPORT),
+            ScanoutMetadataSupport::Unsupported
+        );
+        assert_eq!(
+            support_from_prime_bits(DRM_PRIME_CAP_EXPORT, DRM_PRIME_CAP_EXPORT),
+            ScanoutMetadataSupport::Supported
+        );
+    }
+
+    #[test]
+    fn direction_metadata_uses_kms_export_for_output_and_import_for_renderer() {
+        let metadata = build_dmabuf_scanout_metadata(
+            ScanoutMetadataSupport::Supported,   // VK_KHR_external_memory_fd
+            ScanoutMetadataSupport::Supported,   // KMS PRIME import
+            ScanoutMetadataSupport::Unsupported, // KMS PRIME export
+            (
+                vec![TILED_A],
+                ScanoutMetadataSupport::Supported, // Vulkan import
+            ),
+            (
+                vec![TILED_B],
+                ScanoutMetadataSupport::Supported, // Vulkan export
+            ),
+            (
+                ScanoutMetadataSupport::Supported, // Vulkan imports GBM LINEAR
+                KmsLinearLayout::ExplicitModifier,
+            ),
+            (
+                ScanoutMetadataSupport::Supported, // Vulkan exports linear image
+                KmsLinearLayout::ExplicitModifier,
+            ),
+        );
+
+        assert_eq!(
+            metadata.vulkan_external_memory_fd,
+            ScanoutMetadataSupport::Supported
+        );
+        assert_eq!(
+            metadata.output_owned.kms_prime,
+            ScanoutMetadataSupport::Unsupported
+        );
+        assert_eq!(metadata.output_owned.modifiers, vec![TILED_A]);
+        assert_eq!(
+            metadata.output_owned.linear.path,
+            ScanoutMetadataSupport::Unsupported
+        );
+        assert_eq!(
+            metadata.output_owned.modifier_path,
+            ScanoutMetadataSupport::Unsupported
+        );
+        assert_eq!(
+            metadata.renderer_owned.kms_prime,
+            ScanoutMetadataSupport::Supported
+        );
+        assert_eq!(metadata.renderer_owned.modifiers, vec![TILED_B]);
+        assert_eq!(
+            metadata.renderer_owned.linear.path,
+            ScanoutMetadataSupport::Supported
+        );
+        assert_eq!(
+            metadata.renderer_owned.modifier_path,
+            ScanoutMetadataSupport::Supported
+        );
+    }
+
+    #[test]
+    fn linear_layout_distinguishes_legacy_unknown_from_not_advertised() {
+        let legacy = kms_linear_layout(&[]);
+        assert_eq!(legacy, KmsLinearLayout::LegacyAddfb);
+        assert_eq!(
+            kms_linear_layout_support(legacy),
+            ScanoutMetadataSupport::Unknown
+        );
+
+        let explicit = kms_linear_layout(&[TILED_A, LINEAR]);
+        assert_eq!(explicit, KmsLinearLayout::ExplicitModifier);
+        assert_eq!(
+            kms_linear_layout_support(explicit),
+            ScanoutMetadataSupport::Supported
+        );
+
+        let absent_from_known_list = kms_linear_layout(&[TILED_A]);
+        assert_eq!(absent_from_known_list, KmsLinearLayout::NotAdvertised);
+        assert_eq!(
+            kms_linear_layout_support(absent_from_known_list),
+            ScanoutMetadataSupport::Unsupported
+        );
+    }
+
+    #[test]
+    fn renderer_owned_legacy_linear_evidence_remains_unknown_and_attemptable() {
+        let linear = build_linear_metadata(
+            ScanoutMetadataSupport::Supported,
+            ScanoutMetadataSupport::Supported,
+            KmsLinearLayout::LegacyAddfb,
+        );
+        assert_eq!(linear.kms_layout, KmsLinearLayout::LegacyAddfb);
+        assert_eq!(linear.path, ScanoutMetadataSupport::Unknown);
+    }
+
+    #[test]
+    fn absent_or_failed_modifier_metadata_stays_unknown() {
+        let absent = classify_modifier_observations(false, &[]);
+        assert_eq!(absent, (Vec::new(), ScanoutMetadataSupport::Unknown));
+
+        let failed =
+            classify_modifier_observations(true, &[(TILED_A, ScanoutMetadataSupport::Unknown)]);
+        assert_eq!(failed, (Vec::new(), ScanoutMetadataSupport::Unknown));
+    }
+
+    #[test]
+    fn conclusive_modifier_observations_remain_tri_state() {
+        let unsupported = classify_modifier_observations(
+            true,
+            &[
+                (TILED_A, ScanoutMetadataSupport::Unsupported),
+                (TILED_B, ScanoutMetadataSupport::Unsupported),
+            ],
+        );
+        assert_eq!(
+            unsupported,
+            (Vec::new(), ScanoutMetadataSupport::Unsupported)
+        );
+
+        let partly_known = classify_modifier_observations(
+            true,
+            &[
+                (TILED_A, ScanoutMetadataSupport::Unknown),
+                (TILED_B, ScanoutMetadataSupport::Supported),
+            ],
+        );
+        assert_eq!(
+            partly_known,
+            (vec![TILED_B], ScanoutMetadataSupport::Supported)
+        );
+    }
+
+    #[test]
+    fn unknown_prerequisite_never_becomes_false() {
+        assert_eq!(
+            combine_required_metadata(
+                ScanoutMetadataSupport::Supported,
+                ScanoutMetadataSupport::Unknown,
+            ),
+            ScanoutMetadataSupport::Unknown
+        );
+        assert_eq!(
+            combine_required_metadata(
+                ScanoutMetadataSupport::Unknown,
+                ScanoutMetadataSupport::Supported,
+            ),
+            ScanoutMetadataSupport::Unknown
+        );
+    }
 
     #[test]
     fn scanout_usage_matches_render_and_readback_paths() {

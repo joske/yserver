@@ -3470,18 +3470,18 @@ impl KmsBackend {
             ))
         })?;
         let fence_pool = crate::kms::render::platform::FencePool::new(Arc::clone(&vk));
+        base.platform.attach_test_vk_context(Arc::clone(&vk));
         let mut scanout_pools = Vec::with_capacity(base.platform.outputs.len());
         let mut bo_generations = Vec::with_capacity(base.platform.outputs.len());
         for (i, layout) in base.platform.outputs.iter().enumerate() {
+            let kms_device = base
+                .platform
+                .device_for_key(layout.key.device_key)
+                .expect("live-scene fixture output has a KMS owner");
             let pool = crate::kms::vk::scanout::ScanoutBoPool::allocate(
                 Arc::clone(&vk),
-                Rc::clone(
-                    &base
-                        .platform
-                        .primary_device()
-                        .expect("live-scene fixture has a DRM device")
-                        .device,
-                ),
+                Rc::clone(&kms_device.device),
+                layout.scanout_route,
                 u32::from(layout.width),
                 u32::from(layout.height),
                 3,
@@ -3501,7 +3501,6 @@ impl KmsBackend {
                 n
             ]);
         }
-        base.platform.attach_test_vk_context(vk);
         base.platform.ops_command_pool = Some(ops_pool);
         base.platform.fence_pool = Some(fence_pool);
         base.platform.scanout_pools = scanout_pools;
@@ -33682,11 +33681,17 @@ mod tests {
     /// literal.
     fn push_test_output(b: &mut super::KmsBackend, crtc_id: u32) {
         use crate::kms::backend::ActiveOutput;
+        let device_key = b
+            .platform
+            .primary_device()
+            .expect("test fixture has a DRM device")
+            .key;
+        let scanout_route = b
+            .platform
+            .scanout_route_for_kms(device_key)
+            .expect("test fixture has a scanout route");
         b.platform.outputs.push(ActiveOutput::new(
-            b.platform
-                .primary_device()
-                .expect("test fixture has a DRM device")
-                .key,
+            scanout_route,
             crate::platform::drm::Output {
                 connector: ::drm::control::from_u32(crtc_id).unwrap(),
                 connector_name: "test2".to_string(),

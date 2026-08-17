@@ -33,6 +33,28 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-08-18 PRIME renderer-to-KMS scanout-route qualification:** every
+  live output and `ScanoutBoPool` now records one `ScanoutRoute` from the
+  selected `RenderDeviceId` to the output's DRM-primary `DrmDeviceKey`.
+  Same-device, different-device, and unknown relationships remain distinct
+  and are derived only from Vulkan's optional advertised primary-node
+  identity; render-node and primary-node major/minor values are never compared
+  directly. Startup dumb-scanout outputs remain deliberately unqualified while
+  Vulkan selects the operational renderer, so the initial modeset rollback
+  guard stays armed across every fallible renderer and pool-allocation step;
+  only the infallible final handoff produces `ActiveOutput`s. Runtime RANDR
+  enable/reconfigure rebuilds a pool when either the output route or its
+  existing pool route differs, even at an unchanged mode, and updates the live
+  route only after a successful modeset. Pool creation also records
+  direction-specific advertised evidence for output-owned GBM allocation (KMS
+  PRIME export plus Vulkan import) and renderer-owned Vulkan allocation
+  (Vulkan export plus KMS PRIME import), including explicit-modifier and linear
+  paths. Missing/failed metadata remains `Unknown`; these observations do not
+  filter, reorder, or skip allocation attempts, whose real ioctls remain the
+  source of truth. Focused tests cover ordinary, Asahi-shaped split, and
+  unverified endpoint relationships, init-time rollback/qualification, stale
+  pool-route replacement, asymmetric PRIME directions, and explicit versus
+  legacy-linear evidence. Mixed-GPU and FreeBSD hardware smoke remain pending.
 - **2026-08-18 PRIME renderer/display endpoint separation:** renderer
   topology is no longer stored under `KmsDevice`. `KmsDevice` now owns only a
   DRM primary node, KMS state, and its device-local cursor manager, while an

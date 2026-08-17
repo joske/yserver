@@ -14,6 +14,7 @@ pub(crate) mod cursor_plane;
 pub(crate) mod hotplug;
 pub mod render;
 pub(crate) mod render_node;
+pub(crate) mod scanout_route;
 pub mod vk;
 pub(super) mod xkb;
 pub(crate) mod xshmfence;
