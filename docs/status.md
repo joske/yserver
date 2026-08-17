@@ -33,6 +33,26 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-08-18 endpoint-qualified PRIME Output Source policy:** the selected
+  operational renderer now advertises RANDR `SourceOutput`; each distinct KMS
+  provider with known connector inventory advertises `SinkOutput`. Provider
+  policy is stored by KMS sink and canonical tagged renderer endpoint rather
+  than by protocol XID or a guessed primary DRM node, so a coalesced ordinary
+  GPU, a distinct Asahi-shaped render provider, and the unverified Vulkan
+  fallback remain distinguishable. Associations are projected symmetrically
+  and deterministically through `GetProviderInfo` and survive every RANDR
+  rebuild, connector disconnect/reconnect, and VT resume. Same-device scanout
+  is implicit. A distinct sink requires `SetProviderOutputSource` before any
+  RANDR CRTC enable reaches the existing metadata gate and real allocation;
+  disables remain unconditional, and an active sink cannot be detached or
+  rebound even while DPMS-dark or VT-suspended. Platform bring-up predates
+  RANDR policy, so any already-live split route is adopted while construction
+  rollback remains armed—most importantly the single-display Asahi shape—while
+  inactive sinks stay client-controlled. This is intentionally narrower than
+  Xorg's default `AutoBindGPU` policy, which automatically associates all
+  eligible GPU screens; a later explicit auto-bind layer can add that policy
+  without changing route identity or allocation authority. Relationship-only
+  rebuilds preserve both lastSetTime and configTimestamp.
 - **2026-08-18 conservative PRIME route policy:** scanout-pool creation now
   classifies the previously recorded route evidence as `Compatible`,
   `Incompatible`, or `Unknown`. Same-device routes preserve their established

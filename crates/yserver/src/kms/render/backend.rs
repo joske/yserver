@@ -558,6 +558,21 @@ impl RandrIdAllocator {
         id
     }
 
+    /// Resolve a provider XID back to its tagged endpoint identity.
+    ///
+    /// The allocator is monotonic, so this may return an endpoint that was
+    /// projected earlier in the process lifetime but is not part of the
+    /// current provider set. Request paths must additionally validate the
+    /// result against [`KmsBackend::randr_provider_endpoints`].
+    pub(crate) fn provider_endpoint_for_id(
+        &self,
+        provider_id: u32,
+    ) -> Option<RandrProviderEndpoint> {
+        self.providers
+            .iter()
+            .find_map(|(endpoint, id)| (*id == provider_id).then_some(*endpoint))
+    }
+
     pub(crate) fn ids_for(&mut self, output_key: &OutputKey) -> ConnectorIds {
         if let Some(entry) = self.connectors.get(output_key) {
             return entry.ids;
@@ -1034,6 +1049,14 @@ pub struct KmsBackend {
     /// acquire to pause and resume the dedicated input thread.
     input_thread_control: Option<std::sync::Arc<crate::input_thread::InputThreadControl>>,
     randr_id_alloc: RandrIdAllocator,
+    /// Session-persistent PRIME Output Source policy, keyed by the KMS sink.
+    ///
+    /// Values use the provider's tagged endpoint identity rather than a DRM
+    /// primary-node key: the selected renderer may be a distinct render node
+    /// or the unverified Vulkan fallback, neither of which can be represented
+    /// truthfully as a KMS device. Provider XIDs are only a projection of this
+    /// policy and may be rebuilt without changing it.
+    provider_output_sources: HashMap<crate::platform::drm::DrmDeviceKey, RandrProviderEndpoint>,
     /// Per-output-id identity for RANDR output properties: `(EDID blob,
     /// ConnectorType name)`. Rebuilt by `randr_outputs_and_modes` each
     /// time RANDR state is (re)projected; read by the `EDID`/`EDID_DATA`
@@ -2818,6 +2841,7 @@ impl KmsBackend {
             input_sender: None,
             input_thread_control: None,
             randr_id_alloc: RandrIdAllocator::default(),
+            provider_output_sources: HashMap::new(),
             output_identity_by_id: std::collections::HashMap::new(),
             output_key_by_id: std::collections::HashMap::new(),
             crtc_key_by_id: std::collections::HashMap::new(),
@@ -2828,6 +2852,13 @@ impl KmsBackend {
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported,
         };
+        // Platform bring-up may already have committed a first-card output
+        // whose renderer is a distinct provider (the Asahi-shaped case). Adopt
+        // that live route before publishing RANDR providers so policy and
+        // hardware never disagree. This remains inside the construction-wide
+        // rollback window: an invariant failure drops `b` with the platform's
+        // initial-scanout rollback still armed.
+        b.adopt_initial_provider_output_sources()?;
         b.seed_initial_connector_topology()?;
         b.init_root_storage();
         // Stage 3f.8: bake the default-arrow software cursor.
@@ -3737,6 +3768,7 @@ impl KmsBackend {
             input_sender: None,
             input_thread_control: None,
             randr_id_alloc: RandrIdAllocator::default(),
+            provider_output_sources: HashMap::new(),
             output_identity_by_id: std::collections::HashMap::new(),
             output_key_by_id: std::collections::HashMap::new(),
             crtc_key_by_id: std::collections::HashMap::new(),
@@ -4822,6 +4854,96 @@ impl KmsBackend {
         Some(RandrProviderEndpoint::Render(renderer.id))
     }
 
+    /// Resolve a provider XID only when its endpoint is still projected now.
+    /// `RandrIdAllocator` deliberately retains historical IDs, so using its
+    /// reverse lookup alone at a request boundary could revive a stale source
+    /// or sink after a future renderer/provider topology change.
+    fn current_provider_endpoint_for_id(&self, provider_id: u32) -> Option<RandrProviderEndpoint> {
+        let endpoint = self.randr_id_alloc.provider_endpoint_for_id(provider_id)?;
+        self.randr_provider_endpoints()
+            .contains(&endpoint)
+            .then_some(endpoint)
+    }
+
+    /// Whether the selected renderer is authorized to feed one KMS device.
+    ///
+    /// A coalesced renderer/KMS provider needs no self-association. Every
+    /// distinct KMS sink must retain an explicit endpoint-level policy entry;
+    /// the route's tri-state transport probe remains authoritative later when
+    /// the scanout pool is allocated.
+    fn provider_output_source_allows(
+        &self,
+        kms_device_key: crate::platform::drm::DrmDeviceKey,
+    ) -> bool {
+        let Some(source) = self.selected_render_provider_endpoint() else {
+            return false;
+        };
+        let sink = RandrProviderEndpoint::Kms(kms_device_key);
+        source == sink || self.provider_output_sources.get(&kms_device_key) == Some(&source)
+    }
+
+    /// Adopt split renderer-to-KMS routes that were already committed during
+    /// platform bring-up, before RANDR provider policy existed.
+    ///
+    /// This is deliberately narrower than Xorg's default `AutoBindGPU`: only
+    /// live startup routes are adopted. Inactive distinct sinks still require
+    /// an explicit `SetProviderOutputSource`, preserving this replay's original
+    /// client-controlled policy boundary.
+    fn adopt_initial_provider_output_sources(&mut self) -> io::Result<()> {
+        let Some(selected_renderer) = self.platform.selected_render_device() else {
+            if self.platform.outputs.is_empty() {
+                return Ok(());
+            }
+            return Err(io::Error::other(
+                "active startup outputs exist without a selected renderer endpoint",
+            ));
+        };
+        let selected_render_device_id = selected_renderer.id;
+        let source = self
+            .selected_render_provider_endpoint()
+            .expect("selected renderer has a provider endpoint");
+
+        for output in &self.platform.outputs {
+            if output.scanout_route.render_device_id != selected_render_device_id {
+                return Err(io::Error::other(format!(
+                    "active startup output {} on {} records renderer {:?}, but the selected renderer is {:?}",
+                    output.key.connector_name,
+                    output.key.device_key,
+                    output.scanout_route.render_device_id,
+                    selected_render_device_id,
+                )));
+            }
+            if output.scanout_route.kms_device_key != output.key.device_key {
+                return Err(io::Error::other(format!(
+                    "active startup output {} records KMS endpoint {}, but its owner is {}",
+                    output.key.connector_name,
+                    output.scanout_route.kms_device_key,
+                    output.key.device_key,
+                )));
+            }
+
+            let sink = RandrProviderEndpoint::Kms(output.key.device_key);
+            if sink == source {
+                continue;
+            }
+            if let Some(previous) = self
+                .provider_output_sources
+                .insert(output.key.device_key, source)
+                && previous != source
+            {
+                return Err(io::Error::other(format!(
+                    "active startup KMS sink {} has conflicting sources {previous:?} and {source:?}",
+                    output.key.device_key,
+                )));
+            }
+            log::info!(
+                "PRIME Output Source: adopted live startup sink {:?} -> source {source:?}",
+                sink,
+            );
+        }
+        Ok(())
+    }
+
     fn randr_provider_endpoints(&self) -> Vec<RandrProviderEndpoint> {
         let mut endpoints = Vec::with_capacity(self.platform.devices.len().saturating_add(1));
         if let Some(renderer) = self.selected_render_provider_endpoint() {
@@ -4868,20 +4990,25 @@ impl KmsBackend {
         }
     }
 
-    /// Project opened KMS devices and the selected renderer into stable RANDR
-    /// providers.
+    /// Project opened KMS devices, the selected renderer, and persistent PRIME
+    /// Output Source relationships into stable RANDR providers.
     ///
     /// The selected renderer coalesces with a KMS provider only when its
-    /// advertised primary node exactly matches that KMS device. Unselected
-    /// metadata-only renderer inventory is not operational and is therefore
-    /// omitted. Capabilities intentionally remain zero until a later PRIME
-    /// layer can execute source/sink transport. KMS providers own every
+    /// advertised primary node exactly matches that KMS device. It advertises
+    /// `SourceOutput`; distinct KMS endpoints with known connector inventory
+    /// advertise only `SinkOutput`. Unselected metadata-only renderer inventory
+    /// is not operational and is therefore omitted. KMS providers own every
     /// connector/CRTC XID allocated for their device, including connectors
     /// that are currently disconnected; a distinct render provider owns no
-    /// display resources.
+    /// display resources. Associations are the endpoint policy projected in
+    /// both directions and never assert that a concrete DMA-BUF allocation is
+    /// compatible.
     #[must_use]
     pub fn randr_providers(&mut self) -> Vec<yserver_core::randr::RandrProvider> {
-        use yserver_core::randr::RandrProvider;
+        use yserver_core::randr::{RandrProvider, RandrProviderAssociation};
+        use yserver_protocol::x11::randr::{
+            PROVIDER_CAPABILITY_SINK_OUTPUT, PROVIDER_CAPABILITY_SOURCE_OUTPUT,
+        };
 
         self.reserve_randr_provider_ids();
         let selected_endpoint = self.selected_render_provider_endpoint();
@@ -4892,11 +5019,61 @@ impl KmsBackend {
                 .map(|device| (endpoint, Self::render_provider_name(device))),
             _ => None,
         };
-        let mut providers = Vec::with_capacity(self.randr_provider_endpoints().len());
+        let endpoints = self.randr_provider_endpoints();
+        let provider_ids: HashMap<_, _> = endpoints
+            .iter()
+            .copied()
+            .map(|endpoint| {
+                let id = self.randr_id_alloc.provider_id_for(endpoint);
+                (endpoint, id)
+            })
+            .collect();
+        let kms_with_connector_inventory: HashSet<_> = self
+            .randr_id_alloc
+            .entries()
+            .map(|(key, _)| key.device_key)
+            .collect();
+        let mut associations_by_endpoint: HashMap<
+            RandrProviderEndpoint,
+            Vec<RandrProviderAssociation>,
+        > = HashMap::new();
+        if let Some(source) = selected_endpoint {
+            for (&sink_key, &configured_source) in &self.provider_output_sources {
+                let sink = RandrProviderEndpoint::Kms(sink_key);
+                if configured_source != source
+                    || sink == source
+                    || !provider_ids.contains_key(&sink)
+                    || !kms_with_connector_inventory.contains(&sink_key)
+                {
+                    continue;
+                }
+                let Some(&source_id) = provider_ids.get(&source) else {
+                    continue;
+                };
+                let sink_id = provider_ids[&sink];
+                associations_by_endpoint
+                    .entry(sink)
+                    .or_default()
+                    .push(RandrProviderAssociation {
+                        provider_id: source_id,
+                        capability: PROVIDER_CAPABILITY_SOURCE_OUTPUT,
+                    });
+                associations_by_endpoint.entry(source).or_default().push(
+                    RandrProviderAssociation {
+                        provider_id: sink_id,
+                        capability: PROVIDER_CAPABILITY_SINK_OUTPUT,
+                    },
+                );
+            }
+        }
+        for associations in associations_by_endpoint.values_mut() {
+            associations.sort_by_key(|association| association.provider_id);
+        }
+
+        let mut providers = Vec::with_capacity(endpoints.len());
         for device in &self.platform.devices {
-            let provider_id = self
-                .randr_id_alloc
-                .provider_id_for(RandrProviderEndpoint::Kms(device.key));
+            let endpoint = RandrProviderEndpoint::Kms(device.key);
+            let provider_id = provider_ids[&endpoint];
             let mut crtcs = Vec::new();
             let mut outputs = Vec::new();
             for (key, entry) in self.randr_id_alloc.entries() {
@@ -4908,23 +5085,36 @@ impl KmsBackend {
             }
             crtcs.sort_unstable();
             outputs.sort_unstable();
+            let capabilities = match selected_endpoint {
+                Some(source) if source == endpoint => PROVIDER_CAPABILITY_SOURCE_OUTPUT,
+                Some(_) if kms_with_connector_inventory.contains(&device.key) => {
+                    PROVIDER_CAPABILITY_SINK_OUTPUT
+                }
+                _ => 0,
+            };
             providers.push(RandrProvider {
                 provider_id,
                 name: Self::kms_provider_name(device),
-                capabilities: 0,
+                capabilities,
+                is_gpu: selected_endpoint.is_some_and(|source| source != endpoint),
                 crtcs,
                 outputs,
-                associations: Vec::new(),
+                associations: associations_by_endpoint
+                    .remove(&endpoint)
+                    .unwrap_or_default(),
             });
         }
         if let Some((endpoint, name)) = distinct_renderer {
             providers.push(RandrProvider {
-                provider_id: self.randr_id_alloc.provider_id_for(endpoint),
+                provider_id: provider_ids[&endpoint],
                 name,
-                capabilities: 0,
+                capabilities: PROVIDER_CAPABILITY_SOURCE_OUTPUT,
+                is_gpu: false,
                 crtcs: Vec::new(),
                 outputs: Vec::new(),
-                associations: Vec::new(),
+                associations: associations_by_endpoint
+                    .remove(&endpoint)
+                    .unwrap_or_default(),
             });
         }
         providers.sort_by_key(|provider| provider.provider_id);
@@ -14641,6 +14831,106 @@ impl Backend for KmsBackend {
         Ok(())
     }
 
+    fn set_provider_output_source(
+        &mut self,
+        state: &mut ServerState,
+        provider: u32,
+        source_provider: Option<u32>,
+    ) -> io::Result<bool> {
+        let invalid = |message: String| io::Error::new(io::ErrorKind::InvalidInput, message);
+        let sink_endpoint = self
+            .current_provider_endpoint_for_id(provider)
+            .ok_or_else(|| invalid(format!("unknown or inactive RANDR provider id {provider}")))?;
+        let RandrProviderEndpoint::Kms(sink_key) = sink_endpoint else {
+            return Err(invalid(format!(
+                "RANDR provider {provider} ({sink_endpoint:?}) is not a KMS output sink",
+            )));
+        };
+        let sink_has_connector_inventory = self
+            .randr_id_alloc
+            .entries()
+            .any(|(key, _)| key.device_key == sink_key);
+        if !sink_has_connector_inventory {
+            return Err(invalid(format!(
+                "RANDR provider {provider} ({sink_endpoint:?}) has no connector inventory and is not an output sink",
+            )));
+        }
+
+        let selected_source = self.selected_render_provider_endpoint();
+        if selected_source == Some(sink_endpoint) {
+            return Err(invalid(format!(
+                "RANDR provider {provider} is the selected renderer's coalesced KMS endpoint; same-device scanout is implicit and it cannot be an output sink",
+            )));
+        }
+        let requested_source = source_provider
+            .map(|source_id| {
+                self.current_provider_endpoint_for_id(source_id)
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "unknown or inactive RANDR source provider id {source_id}",
+                        ))
+                    })
+            })
+            .transpose()?;
+        if let Some(source) = requested_source
+            && Some(source) != selected_source
+        {
+            return Err(invalid(format!(
+                "RANDR source provider {} ({source:?}) is not the selected operational renderer {:?}",
+                source_provider.expect("requested source has an XID"),
+                selected_source,
+            )));
+        }
+
+        let current_source = self.provider_output_sources.get(&sink_key).copied();
+        let source_changes = requested_source != current_source;
+        if !source_changes {
+            return Ok(false);
+        }
+
+        // `platform.outputs` is the authoritative lifetime inventory even
+        // while DPMS is off or the VT is suspended: those routes still own
+        // scanout pools and can be re-lit. Never revoke or replace their source
+        // policy in place.
+        if current_source.is_some() {
+            let active_connectors: Vec<_> = self
+                .platform
+                .outputs
+                .iter()
+                .filter(|output| output.key.device_key == sink_key)
+                .map(|output| format!("{} on {}", output.key.connector_name, output.key.device_key))
+                .collect();
+            if !active_connectors.is_empty() {
+                return Err(invalid(format!(
+                    "cannot change PRIME Output Source for active sink provider {provider}: {}",
+                    active_connectors.join(", "),
+                )));
+            }
+        }
+
+        match requested_source {
+            Some(source) => {
+                self.provider_output_sources.insert(sink_key, source);
+                log::info!(
+                    "PRIME Output Source: sink provider {provider} ({sink_endpoint:?}) -> source provider {} ({source:?})",
+                    source_provider.expect("attached source has an XID"),
+                );
+            }
+            None => {
+                self.provider_output_sources.remove(&sink_key);
+                log::info!(
+                    "PRIME Output Source: detached sink provider {provider} ({sink_endpoint:?})"
+                );
+            }
+        }
+
+        // A provider relationship changes neither the CRTC configuration nor
+        // available connector/mode inventory. Rebuild only the projection and
+        // preserve both lastSetTime and configTimestamp.
+        self.rebuild_randr_state(state, None, false);
+        Ok(true)
+    }
+
     fn apply_crtc_config(
         &mut self,
         output_id: u32,
@@ -14672,6 +14962,27 @@ impl Backend for KmsBackend {
                 })?
                 .device,
         );
+
+        // Provider policy authorizes only the attempt. The directional
+        // tri-state metadata gate and real DMA-BUF allocation/import remain in
+        // `enable_connector`. Place this before the idempotency guard so an
+        // already-active split output can never be silently reasserted under a
+        // missing/stale policy; production startup adopts such live routes.
+        if mode.is_some() && !self.provider_output_source_allows(output_key.device_key) {
+            let sink_endpoint = RandrProviderEndpoint::Kms(output_key.device_key);
+            let sink_provider = self.randr_id_alloc.providers.get(&sink_endpoint).copied();
+            let selected_source = self.selected_render_provider_endpoint();
+            let source_provider = selected_source
+                .and_then(|endpoint| self.randr_id_alloc.providers.get(&endpoint).copied());
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "output {connector} belongs to KMS sink provider {} ({sink_endpoint:?}); attach it to selected source provider {} ({selected_source:?}) with RANDR SetProviderOutputSource before enabling it",
+                    sink_provider.map_or_else(|| "<unknown>".to_string(), |id| id.to_string()),
+                    source_provider.map_or_else(|| "<none>".to_string(), |id| id.to_string()),
+                ),
+            ));
+        }
 
         // ── Idempotency guard (CRITICAL) ──────────────────────────────────
         //
@@ -21912,10 +22223,11 @@ mod tests {
                 },
                 store::Storage,
             },
+            scanout_route::{RenderKmsRelationship, ScanoutRoute},
         },
         platform::drm::DrmDeviceKey,
     };
-    use std::collections::HashMap;
+    use std::{collections::HashMap, io};
     use yserver_core::{
         backend::{Backend, Dri3Caps},
         server::ServerState,
@@ -22679,6 +22991,16 @@ mod tests {
 
         assert_eq!(alloc.provider_id_for(first_endpoint), first_provider);
         assert_eq!(
+            alloc.provider_endpoint_for_id(first_provider),
+            Some(first_endpoint)
+        );
+        assert_eq!(
+            alloc.provider_endpoint_for_id(tagged_render_provider),
+            Some(tagged_render_endpoint),
+            "tagged render and KMS endpoints must reverse-resolve distinctly"
+        );
+        assert_eq!(alloc.provider_endpoint_for_id(u32::MAX), None);
+        assert_eq!(
             alloc.provider_id_for(tagged_render_endpoint),
             tagged_render_provider
         );
@@ -22740,6 +23062,189 @@ mod tests {
         assert!(second.associations.is_empty());
         assert_eq!(first.name, "null");
         assert_eq!(second.name, "null");
+    }
+
+    #[test]
+    fn provider_output_source_projection_is_endpoint_qualified_and_symmetric() {
+        use yserver_protocol::x11::randr::{
+            PROVIDER_CAPABILITY_SINK_OUTPUT, PROVIDER_CAPABILITY_SOURCE_OUTPUT,
+        };
+
+        let mut backend = KmsBackend::for_tests();
+        let source_key = backend.platform.devices[0].key;
+        let sink_key = test_device_key(1);
+        push_test_device(&mut backend, sink_key);
+        let sink_output = OutputKey::new(sink_key, "DP-9");
+        let _ = backend.randr_id_alloc.ids_for(&sink_output);
+        let render_id = RenderDeviceId::DrmRender(test_device_key(128));
+        backend.platform.render_devices = vec![test_render_device(render_id, Some(source_key))];
+        backend.platform.selected_render_device = Some(render_id);
+        let source_endpoint = RandrProviderEndpoint::Kms(source_key);
+        backend
+            .provider_output_sources
+            .insert(sink_key, source_endpoint);
+
+        let providers = backend.randr_providers();
+        let source_id = backend.randr_id_alloc.providers[&source_endpoint];
+        let sink_endpoint = RandrProviderEndpoint::Kms(sink_key);
+        let sink_id = backend.randr_id_alloc.providers[&sink_endpoint];
+        let source = providers
+            .iter()
+            .find(|provider| provider.provider_id == source_id)
+            .expect("coalesced source provider");
+        let sink = providers
+            .iter()
+            .find(|provider| provider.provider_id == sink_id)
+            .expect("KMS sink provider");
+
+        assert_eq!(source.capabilities, PROVIDER_CAPABILITY_SOURCE_OUTPUT);
+        assert_eq!(sink.capabilities, PROVIDER_CAPABILITY_SINK_OUTPUT);
+        assert!(!source.is_gpu);
+        assert!(sink.is_gpu);
+        assert_eq!(
+            source.associations,
+            vec![yserver_core::randr::RandrProviderAssociation {
+                provider_id: sink_id,
+                capability: PROVIDER_CAPABILITY_SINK_OUTPUT,
+            }]
+        );
+        assert_eq!(
+            sink.associations,
+            vec![yserver_core::randr::RandrProviderAssociation {
+                provider_id: source_id,
+                capability: PROVIDER_CAPABILITY_SOURCE_OUTPUT,
+            }]
+        );
+        assert!(backend.provider_output_source_allows(source_key));
+        assert!(backend.provider_output_source_allows(sink_key));
+    }
+
+    #[test]
+    fn kms_without_connector_inventory_does_not_advertise_sink_output() {
+        use yserver_protocol::x11::randr::PROVIDER_CAPABILITY_SOURCE_OUTPUT;
+
+        let mut backend = KmsBackend::for_tests();
+        let source_key = backend.platform.devices[0].key;
+        let inventoryless_key = test_device_key(9);
+        push_test_device(&mut backend, inventoryless_key);
+        let render_id = RenderDeviceId::DrmRender(test_device_key(128));
+        backend.platform.render_devices = vec![test_render_device(render_id, Some(source_key))];
+        backend.platform.selected_render_device = Some(render_id);
+
+        let providers = backend.randr_providers();
+        let source_id = backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(source_key)];
+        let inventoryless_id =
+            backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(inventoryless_key)];
+        assert_eq!(
+            providers
+                .iter()
+                .find(|provider| provider.provider_id == source_id)
+                .expect("source")
+                .capabilities,
+            PROVIDER_CAPABILITY_SOURCE_OUTPUT,
+        );
+        assert_eq!(
+            providers
+                .iter()
+                .find(|provider| provider.provider_id == inventoryless_id)
+                .expect("inventory-less KMS provider")
+                .capabilities,
+            0,
+        );
+        assert!(
+            providers
+                .iter()
+                .find(|provider| provider.provider_id == inventoryless_id)
+                .expect("inventory-less KMS provider")
+                .is_gpu,
+            "a distinct KMS endpoint remains logically a GPU provider even before connectors exist"
+        );
+        assert!(!backend.provider_output_source_allows(inventoryless_key));
+    }
+
+    #[test]
+    fn startup_adopts_live_asahi_shaped_split_route_only() {
+        use yserver_protocol::x11::randr::{
+            PROVIDER_CAPABILITY_SINK_OUTPUT, PROVIDER_CAPABILITY_SOURCE_OUTPUT,
+        };
+
+        let mut backend = KmsBackend::for_tests();
+        let display_key = backend.platform.devices[0].key;
+        let inactive_sink_key = test_device_key(1);
+        push_test_device(&mut backend, inactive_sink_key);
+        let _ = backend
+            .randr_id_alloc
+            .ids_for(&OutputKey::new(inactive_sink_key, "DP-9"));
+        let render_id = RenderDeviceId::DrmRender(test_device_key(128));
+        backend.platform.render_devices =
+            vec![test_render_device(render_id, Some(test_device_key(7)))];
+        backend.platform.selected_render_device = Some(render_id);
+        backend.platform.outputs[0].scanout_route =
+            ScanoutRoute::new(render_id, display_key, RenderKmsRelationship::Different);
+
+        backend
+            .adopt_initial_provider_output_sources()
+            .expect("adopt live split route");
+        let source_endpoint = RandrProviderEndpoint::Render(render_id);
+        assert_eq!(
+            backend.provider_output_sources.get(&display_key),
+            Some(&source_endpoint)
+        );
+        assert!(backend.provider_output_source_allows(display_key));
+        assert!(
+            !backend.provider_output_source_allows(inactive_sink_key),
+            "inactive distinct KMS sinks remain client-controlled"
+        );
+
+        let providers = backend.randr_providers();
+        let source = providers
+            .iter()
+            .find(|provider| {
+                provider.provider_id == backend.randr_id_alloc.providers[&source_endpoint]
+            })
+            .expect("distinct render source");
+        let display = providers
+            .iter()
+            .find(|provider| {
+                provider.provider_id
+                    == backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(display_key)]
+            })
+            .expect("display sink");
+        assert_eq!(source.capabilities, PROVIDER_CAPABILITY_SOURCE_OUTPUT);
+        assert_eq!(display.capabilities, PROVIDER_CAPABILITY_SINK_OUTPUT);
+        assert!(!source.is_gpu);
+        assert!(display.is_gpu);
+        assert_eq!(source.associations.len(), 1);
+        assert_eq!(display.associations.len(), 1);
+    }
+
+    #[test]
+    fn startup_same_device_route_is_implicit_not_persisted() {
+        let mut backend = KmsBackend::for_tests();
+        let kms_key = backend.platform.devices[0].key;
+        let render_id = RenderDeviceId::DrmRender(test_device_key(128));
+        backend.platform.render_devices = vec![test_render_device(render_id, Some(kms_key))];
+        backend.platform.selected_render_device = Some(render_id);
+        backend.platform.outputs[0].scanout_route =
+            ScanoutRoute::new(render_id, kms_key, RenderKmsRelationship::Same);
+
+        backend
+            .adopt_initial_provider_output_sources()
+            .expect("same-device startup route");
+        assert!(backend.provider_output_sources.is_empty());
+        assert!(backend.provider_output_source_allows(kms_key));
+    }
+
+    #[test]
+    fn stale_allocated_provider_id_is_not_a_current_endpoint() {
+        let mut backend = KmsBackend::for_tests();
+        let stale = RandrProviderEndpoint::Render(RenderDeviceId::DrmRender(test_device_key(199)));
+        let stale_id = backend.randr_id_alloc.provider_id_for(stale);
+        assert_eq!(
+            backend.randr_id_alloc.provider_endpoint_for_id(stale_id),
+            Some(stale)
+        );
+        assert_eq!(backend.current_provider_endpoint_for_id(stale_id), None);
     }
 
     #[test]
@@ -22809,6 +23314,287 @@ mod tests {
     }
 
     #[test]
+    fn provider_output_source_attach_detach_persists_without_timestamp_changes() {
+        let mut backend = KmsBackend::for_tests();
+        let source_key = backend.platform.devices[0].key;
+        let sink_key = test_device_key(1);
+        push_test_device(&mut backend, sink_key);
+        let _ = backend
+            .randr_id_alloc
+            .ids_for(&OutputKey::new(sink_key, "DP-9"));
+        let render_id = RenderDeviceId::DrmRender(test_device_key(128));
+        backend.platform.render_devices = vec![test_render_device(render_id, Some(source_key))];
+        backend.platform.selected_render_device = Some(render_id);
+        let providers = backend.randr_providers();
+        let source_id = backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(source_key)];
+        let sink_id = backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(sink_key)];
+        let (outputs, modes) = backend.randr_outputs_and_modes();
+        let mut state = ServerState::with_randr_outputs_and_modes(
+            backend.platform.fb_w,
+            backend.platform.fb_h,
+            outputs,
+            modes,
+            yserver_core::server::BackendCapabilities::from_backend(&backend),
+        );
+        state.randr.set_providers(providers);
+        state.randr.timestamp = 41;
+        state.randr.config_timestamp = 37;
+
+        assert!(
+            backend
+                .set_provider_output_source(&mut state, sink_id, Some(source_id))
+                .expect("attach selected source")
+        );
+        assert_eq!(state.randr.timestamp, 41);
+        assert_eq!(state.randr.config_timestamp, 37);
+        assert!(backend.provider_output_source_allows(sink_key));
+        let sink = state.randr.provider(sink_id).expect("projected sink");
+        assert_eq!(sink.associations.len(), 1);
+        assert_eq!(sink.associations[0].provider_id, source_id);
+
+        backend.rebuild_randr_state(&mut state, None, false);
+        assert_eq!(
+            state
+                .randr
+                .provider(sink_id)
+                .expect("sink survives rebuild")
+                .associations
+                .len(),
+            1,
+            "endpoint policy must survive an unrelated RANDR rebuild"
+        );
+        assert_eq!(state.randr.timestamp, 41);
+        assert_eq!(state.randr.config_timestamp, 37);
+
+        assert!(
+            backend
+                .set_provider_output_source(&mut state, sink_id, None)
+                .expect("detach inactive sink")
+        );
+        assert!(!backend.provider_output_source_allows(sink_key));
+        assert_eq!(state.randr.timestamp, 41);
+        assert_eq!(state.randr.config_timestamp, 37);
+        assert!(
+            !backend
+                .set_provider_output_source(&mut state, sink_id, None)
+                .expect("repeat detach is idempotent")
+        );
+    }
+
+    #[test]
+    fn provider_output_source_survives_connector_disconnect_and_reconnect() {
+        let mut backend = KmsBackend::for_tests();
+        let source_key = backend.platform.devices[0].key;
+        let sink_key = test_device_key(1);
+        push_test_device(&mut backend, sink_key);
+        let sink_output = OutputKey::new(sink_key, "DP-9");
+        let _ = backend.randr_id_alloc.ids_for(&sink_output);
+        assert!(backend.reconcile_connector_registry(
+            &[ConnectorSnapshot {
+                key: sink_output.clone(),
+                modes: Vec::new(),
+                mm_width: 0,
+                mm_height: 0,
+                edid: Vec::new(),
+                connector_type: "DisplayPort".to_string(),
+            }],
+            &[],
+        ));
+        let render_id = RenderDeviceId::DrmRender(test_device_key(128));
+        backend.platform.render_devices = vec![test_render_device(render_id, Some(source_key))];
+        backend.platform.selected_render_device = Some(render_id);
+        let providers = backend.randr_providers();
+        let source_id = backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(source_key)];
+        let sink_id = backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(sink_key)];
+        let (outputs, modes) = backend.randr_outputs_and_modes();
+        let mut state = ServerState::with_randr_outputs_and_modes(
+            backend.platform.fb_w,
+            backend.platform.fb_h,
+            outputs,
+            modes,
+            yserver_core::server::BackendCapabilities::from_backend(&backend),
+        );
+        state.randr.set_providers(providers);
+
+        assert!(
+            backend
+                .set_provider_output_source(&mut state, sink_id, Some(source_id))
+                .expect("attach selected source")
+        );
+        assert_eq!(
+            state
+                .randr
+                .provider(sink_id)
+                .expect("attached sink")
+                .associations[0]
+                .provider_id,
+            source_id
+        );
+
+        assert!(backend.reconcile_connector_registry(&[], std::slice::from_ref(&sink_output)));
+        backend.rebuild_randr_state(&mut state, None, true);
+        assert_eq!(
+            state
+                .randr
+                .provider(sink_id)
+                .expect("disconnected sink remains a provider")
+                .associations[0]
+                .provider_id,
+            source_id,
+            "disconnect must not erase endpoint policy"
+        );
+
+        assert!(backend.reconcile_connector_registry(
+            &[ConnectorSnapshot {
+                key: sink_output,
+                modes: Vec::new(),
+                mm_width: 0,
+                mm_height: 0,
+                edid: Vec::new(),
+                connector_type: "DisplayPort".to_string(),
+            }],
+            &[],
+        ));
+        backend.rebuild_randr_state(&mut state, None, true);
+        assert_eq!(
+            state
+                .randr
+                .provider(sink_id)
+                .expect("reconnected sink")
+                .associations[0]
+                .provider_id,
+            source_id,
+            "reconnect must reproject the retained endpoint policy"
+        );
+        assert_eq!(
+            backend.provider_output_sources.get(&sink_key),
+            Some(&RandrProviderEndpoint::Kms(source_key))
+        );
+    }
+
+    #[test]
+    fn active_split_sink_cannot_be_detached_while_dpms_dark() {
+        let mut backend = KmsBackend::for_tests();
+        let display_key = backend.platform.devices[0].key;
+        let render_id = RenderDeviceId::UnverifiedFallback;
+        backend.platform.render_devices = vec![test_render_device(render_id, None)];
+        backend.platform.selected_render_device = Some(render_id);
+        backend.platform.outputs[0].scanout_route =
+            ScanoutRoute::new(render_id, display_key, RenderKmsRelationship::Unknown);
+        backend
+            .adopt_initial_provider_output_sources()
+            .expect("adopt active unknown split route");
+        let providers = backend.randr_providers();
+        let sink_id = backend.randr_id_alloc.providers[&RandrProviderEndpoint::Kms(display_key)];
+        let mut state = ServerState::new();
+        state.randr.set_providers(providers);
+        backend.kms_outputs_active = false;
+
+        let error = backend
+            .set_provider_output_source(&mut state, sink_id, None)
+            .expect_err("DPMS-dark ActiveOutput still owns the route");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("active sink provider"));
+        assert!(
+            error
+                .to_string()
+                .contains(&backend.platform.outputs[0].key.connector_name)
+        );
+        assert!(backend.provider_output_source_allows(display_key));
+    }
+
+    #[test]
+    fn split_enable_gate_runs_before_idempotent_active_reassert() {
+        let mut backend = KmsBackend::for_tests();
+        let display_key = backend.platform.devices[0].key;
+        let render_id = RenderDeviceId::DrmRender(test_device_key(128));
+        backend.platform.render_devices = vec![test_render_device(render_id, None)];
+        backend.platform.selected_render_device = Some(render_id);
+        backend.platform.outputs[0].scanout_route =
+            ScanoutRoute::new(render_id, display_key, RenderKmsRelationship::Unknown);
+        let layout = &backend.platform.outputs[0];
+        let connector = layout.key.connector_name.clone();
+        let mode = yserver_core::backend::ModeSpec {
+            width: layout.width,
+            height: layout.height,
+            vrefresh: layout.output.picked.vrefresh,
+        };
+        let (x, y) = (layout.x, layout.y);
+        let output_id = backend
+            .randr_outputs_and_modes()
+            .0
+            .into_iter()
+            .find(|output| output.name == connector)
+            .expect("active output projection")
+            .output_id;
+
+        let error = backend
+            .apply_crtc_config(output_id, &connector, Some(mode), x, y)
+            .expect_err("missing split policy must not hide behind idempotency");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("SetProviderOutputSource"));
+    }
+
+    #[test]
+    fn adopted_live_split_route_passes_gate_before_idempotent_reassert() {
+        let mut backend = KmsBackend::for_tests();
+        let display_key = backend.platform.devices[0].key;
+        let render_id = RenderDeviceId::DrmRender(test_device_key(128));
+        backend.platform.render_devices = vec![test_render_device(render_id, None)];
+        backend.platform.selected_render_device = Some(render_id);
+        backend.platform.outputs[0].scanout_route =
+            ScanoutRoute::new(render_id, display_key, RenderKmsRelationship::Unknown);
+        backend
+            .adopt_initial_provider_output_sources()
+            .expect("adopt the already-live split route");
+
+        let layout = &backend.platform.outputs[0];
+        let connector = layout.key.connector_name.clone();
+        let mode = yserver_core::backend::ModeSpec {
+            width: layout.width,
+            height: layout.height,
+            vrefresh: layout.output.picked.vrefresh,
+        };
+        let (x, y) = (layout.x, layout.y);
+        let output_id = backend
+            .randr_outputs_and_modes()
+            .0
+            .into_iter()
+            .find(|output| output.name == connector)
+            .expect("active output projection")
+            .output_id;
+
+        assert!(backend.provider_output_source_allows(display_key));
+        assert!(
+            !backend
+                .apply_crtc_config(output_id, &connector, Some(mode), x, y)
+                .expect("adopted policy lets the active reassert reach idempotency"),
+            "an unchanged active configuration remains a no-op after policy authorization"
+        );
+    }
+
+    #[test]
+    fn disabling_an_off_split_sink_does_not_require_attachment() {
+        let mut backend = KmsBackend::for_tests();
+        let source_key = backend.platform.devices[0].key;
+        let sink_key = test_device_key(1);
+        push_test_device(&mut backend, sink_key);
+        let render_id = RenderDeviceId::DrmRender(test_device_key(128));
+        backend.platform.render_devices = vec![test_render_device(render_id, Some(source_key))];
+        backend.platform.selected_render_device = Some(render_id);
+        let output_key = OutputKey::new(sink_key, "DP-9");
+        let ids = backend.randr_id_alloc.ids_for(&output_key);
+        backend.output_key_by_id.insert(ids.output_id, output_key);
+
+        assert!(!backend.provider_output_source_allows(sink_key));
+        assert!(
+            !backend
+                .apply_crtc_config(ids.output_id, "DP-9", None, 0, 0)
+                .expect("an already-off output can always remain disabled")
+        );
+    }
+
+    #[test]
     fn conventional_renderer_coalesces_with_its_matching_kms_provider() {
         let mut backend = KmsBackend::for_tests();
         let kms_key = backend.platform.devices[0].key;
@@ -22823,6 +23609,11 @@ mod tests {
         let (outputs, _) = backend.randr_outputs_and_modes();
         let providers = backend.randr_providers();
         assert_eq!(providers.len(), 1);
+        assert!(!providers[0].is_gpu);
+        assert_eq!(
+            providers[0].capabilities,
+            yserver_protocol::x11::randr::PROVIDER_CAPABILITY_SOURCE_OUTPUT
+        );
         assert_eq!(providers[0].outputs, vec![outputs[0].output_id]);
         assert_eq!(providers[0].crtcs, vec![outputs[0].crtc_id]);
         assert_eq!(
@@ -22857,6 +23648,11 @@ mod tests {
 
         let providers = backend.randr_providers();
         assert_eq!(providers.len(), 1);
+        assert!(!providers[0].is_gpu);
+        assert_eq!(
+            providers[0].capabilities,
+            yserver_protocol::x11::randr::PROVIDER_CAPABILITY_SOURCE_OUTPUT
+        );
         assert_eq!(
             providers[0].provider_id,
             backend
@@ -22885,6 +23681,11 @@ mod tests {
         let providers = backend.randr_providers();
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].name, "drm-render-226:128");
+        assert!(!providers[0].is_gpu);
+        assert_eq!(
+            providers[0].capabilities,
+            yserver_protocol::x11::randr::PROVIDER_CAPABILITY_SOURCE_OUTPUT
+        );
         assert!(providers[0].outputs.is_empty());
         assert!(providers[0].crtcs.is_empty());
         assert_eq!(
@@ -22929,8 +23730,18 @@ mod tests {
             .expect("AGX render provider");
         assert_eq!(display.outputs, vec![outputs[0].output_id]);
         assert_eq!(display.crtcs, vec![outputs[0].crtc_id]);
+        assert!(display.is_gpu);
+        assert_eq!(
+            display.capabilities,
+            yserver_protocol::x11::randr::PROVIDER_CAPABILITY_SINK_OUTPUT
+        );
         assert!(renderer.outputs.is_empty());
         assert!(renderer.crtcs.is_empty());
+        assert!(!renderer.is_gpu);
+        assert_eq!(
+            renderer.capabilities,
+            yserver_protocol::x11::randr::PROVIDER_CAPABILITY_SOURCE_OUTPUT
+        );
         assert_eq!(renderer.name, "drm-render-226:128");
     }
 
@@ -22984,6 +23795,11 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].name, "vulkan-unverified");
+        assert!(!first[0].is_gpu);
+        assert_eq!(
+            first[0].capabilities,
+            yserver_protocol::x11::randr::PROVIDER_CAPABILITY_SOURCE_OUTPUT
+        );
         assert!(first[0].outputs.is_empty());
         assert!(first[0].crtcs.is_empty());
         assert_eq!(

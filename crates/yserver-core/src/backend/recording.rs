@@ -124,6 +124,10 @@ pub enum RecordedCall {
         back: (u16, u16, u16),
     },
     SetDpmsPower(u8),
+    SetProviderOutputSource {
+        provider: u32,
+        source_provider: Option<u32>,
+    },
     ApplyCrtcConfig {
         output_id: u32,
         connector: String,
@@ -237,6 +241,11 @@ pub struct RecordingBackend {
     /// When set, `set_dpms_power` returns Err; tests assert the
     /// transition helper advances state anyway.
     pub dpms_set_returns_err: bool,
+    /// Result controls for `set_provider_output_source`. Successful calls
+    /// return `provider_output_source_changed`; an error kind takes
+    /// precedence and lets request-layer tests pin protocol error mapping.
+    pub provider_output_source_changed: bool,
+    pub provider_output_source_error: Option<io::ErrorKind>,
     /// Startup input-probe model. Each inner `Vec` is one "dispatch
     /// round" the fake libinput would yield; `probe_input_devices`
     /// consumes the front round per iteration and seeds the registry,
@@ -432,6 +441,8 @@ impl RecordingBackend {
             dpms_capable: true,
             glx_vendor_names: glx::VENDOR_NAMES,
             dpms_set_returns_err: false,
+            provider_output_source_changed: true,
+            provider_output_source_error: None,
             probe_rounds: std::collections::VecDeque::new(),
             probe_rounds_run: std::cell::Cell::new(0),
             warped_to: None,
@@ -938,6 +949,22 @@ impl Backend for RecordingBackend {
     fn before_block(&mut self) {
         self.before_block_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn set_provider_output_source(
+        &mut self,
+        _state: &mut crate::server::ServerState,
+        provider: u32,
+        source_provider: Option<u32>,
+    ) -> io::Result<bool> {
+        self.record(RecordedCall::SetProviderOutputSource {
+            provider,
+            source_provider,
+        });
+        if let Some(kind) = self.provider_output_source_error {
+            return Err(io::Error::from(kind));
+        }
+        Ok(self.provider_output_source_changed)
     }
 
     fn crtc_gamma_size(&self, _crtc: u32) -> u16 {

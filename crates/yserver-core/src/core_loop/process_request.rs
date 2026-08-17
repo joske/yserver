@@ -2468,9 +2468,11 @@ fn handle_randr_request(
             crate::randr::ProviderRelationshipError::UnknownProvider(provider) => {
                 (RANDR_BAD_PROVIDER, provider)
             }
-            // Xorg returns BadValue for a missing provider capability without
-            // assigning client->errorValue, so the wire value remains zero.
-            crate::randr::ProviderRelationshipError::MissingCapability(_) => {
+            // Xorg returns BadValue for a missing provider capability or an
+            // initiating provider that is not a GPU screen without assigning
+            // client->errorValue, so the wire value remains zero.
+            crate::randr::ProviderRelationshipError::MissingCapability(_)
+            | crate::randr::ProviderRelationshipError::NotGpuProvider(_) => {
                 (x11::error::BAD_VALUE, 0)
             }
         }
@@ -3544,23 +3546,40 @@ fn handle_randr_request(
                 );
             }
             let _ = req.config_timestamp;
-            warn_randr_unsupported_once(
+            let changed = match backend.set_provider_output_source(
                 state,
-                client_id,
-                sequence,
-                minor,
-                "SetProviderOutputSource",
-                "rejecting a validated relationship because output transport is unavailable",
-            );
-            return emit_x11_error_with_minor(
-                state,
-                client_id,
-                sequence,
-                x11::error::BAD_IMPLEMENTATION,
-                0,
-                u16::from(minor),
-                RANDR_MAJOR_OPCODE,
-            );
+                req.provider,
+                (req.source_provider != 0).then_some(req.source_provider),
+            ) {
+                Ok(changed) => changed,
+                Err(err) => {
+                    log::warn!(
+                        "client {} #{} RANDR::SetProviderOutputSource provider={} source={} failed: {err}",
+                        client_id.0,
+                        sequence.0,
+                        req.provider,
+                        req.source_provider,
+                    );
+                    let (error_code, error_value) = if err.kind() == io::ErrorKind::InvalidInput {
+                        (x11::error::BAD_MATCH, req.provider)
+                    } else {
+                        (x11::error::BAD_IMPLEMENTATION, 0)
+                    };
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        error_code,
+                        error_value,
+                        u16::from(minor),
+                        RANDR_MAJOR_OPCODE,
+                    );
+                }
+            };
+            if changed {
+                super::run::notify_randr_provider_changed(state, req.provider);
+            }
+            return Ok(RequestOutcome::Handled);
         }
         x11randr::RR_GET_MONITORS => {
             let window = request_xid(body);
@@ -31905,6 +31924,7 @@ mod tests {
             provider_id,
             name: format!("card{provider_id}"),
             capabilities,
+            is_gpu: true,
             crtcs: Vec::new(),
             outputs: Vec::new(),
             associations: Vec::new(),
@@ -31947,6 +31967,14 @@ mod tests {
             }
             _ => panic!("not a provider request minor: {minor}"),
         }
+        body
+    }
+
+    fn randr_output_source_body(provider: u32, source_provider: u32, timestamp: u32) -> Vec<u8> {
+        let mut body = Vec::with_capacity(12);
+        body.extend_from_slice(&provider.to_le_bytes());
+        body.extend_from_slice(&source_provider.to_le_bytes());
+        body.extend_from_slice(&timestamp.to_le_bytes());
         body
     }
 
@@ -32360,7 +32388,7 @@ mod tests {
     fn randr_provider_relationships_validate_roles_in_xorg_order() {
         use yserver_protocol::x11::randr as x11randr;
 
-        let cases: [(u8, u32, u32, u8, u32); 12] = [
+        let cases: &[(u8, u32, u32, u8, u32)] = &[
             (
                 x11randr::RR_SET_PROVIDER_OUTPUT_SOURCE,
                 99,
@@ -32391,16 +32419,23 @@ mod tests {
             ),
             (
                 x11randr::RR_SET_PROVIDER_OUTPUT_SOURCE,
-                1,
-                0,
-                x11::error::BAD_IMPLEMENTATION,
-                0,
+                6,
+                99,
+                RANDR_BAD_PROVIDER,
+                99,
             ),
             (
                 x11randr::RR_SET_PROVIDER_OUTPUT_SOURCE,
-                1,
+                6,
                 2,
-                x11::error::BAD_IMPLEMENTATION,
+                x11::error::BAD_VALUE,
+                0,
+            ),
+            (
+                x11randr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+                6,
+                0,
+                x11::error::BAD_VALUE,
                 0,
             ),
             (
@@ -32414,6 +32449,20 @@ mod tests {
                 x11randr::RR_SET_PROVIDER_OFFLOAD_SINK,
                 5,
                 99,
+                x11::error::BAD_VALUE,
+                0,
+            ),
+            (
+                x11randr::RR_SET_PROVIDER_OFFLOAD_SINK,
+                7,
+                99,
+                x11::error::BAD_VALUE,
+                0,
+            ),
+            (
+                x11randr::RR_SET_PROVIDER_OFFLOAD_SINK,
+                7,
+                0,
                 x11::error::BAD_VALUE,
                 0,
             ),
@@ -32446,7 +32495,7 @@ mod tests {
                 0,
             ),
         ];
-        for (minor, provider, peer_provider, error_code, error_value) in cases {
+        for &(minor, provider, peer_provider, error_code, error_value) in cases {
             let mut state = ServerState::new();
             state.randr.set_providers(vec![
                 randr_provider(1, x11randr::PROVIDER_CAPABILITY_SINK_OUTPUT),
@@ -32454,6 +32503,14 @@ mod tests {
                 randr_provider(3, x11randr::PROVIDER_CAPABILITY_SOURCE_OFFLOAD),
                 randr_provider(4, x11randr::PROVIDER_CAPABILITY_SINK_OFFLOAD),
                 randr_provider(5, 0),
+                crate::randr::RandrProvider {
+                    is_gpu: false,
+                    ..randr_provider(6, x11randr::PROVIDER_CAPABILITY_SINK_OUTPUT)
+                },
+                crate::randr::RandrProvider {
+                    is_gpu: false,
+                    ..randr_provider(7, x11randr::PROVIDER_CAPABILITY_SOURCE_OFFLOAD)
+                },
             ]);
             let mut peer = install_client(&mut state, 1);
             let mut backend = RecordingBackend::new();
@@ -32480,6 +32537,203 @@ mod tests {
                 u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
                 error_value,
                 "minor={minor} provider={provider}",
+            );
+        }
+    }
+
+    #[test]
+    fn randr_set_provider_output_source_reaches_backend_for_attach_and_detach() {
+        use yserver_protocol::x11::randr as x11randr;
+
+        let mut state = ServerState::new();
+        state.randr.set_providers(vec![
+            randr_provider(10, x11randr::PROVIDER_CAPABILITY_SOURCE_OUTPUT),
+            randr_provider(11, x11randr::PROVIDER_CAPABILITY_SINK_OUTPUT),
+        ]);
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        for (sequence, source_provider) in [(1, 10), (2, 0)] {
+            handle_randr_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(sequence),
+                RequestHeader {
+                    opcode: 128,
+                    data: x11randr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+                    length_units: 4,
+                },
+                &randr_output_source_body(11, source_provider, 77),
+            )
+            .expect("set provider output source");
+            assert!(
+                read_all_available(&mut peer).is_empty(),
+                "successful void requests do not emit a reply"
+            );
+        }
+
+        assert_eq!(
+            backend.calls(),
+            vec![
+                RecordedCall::SetProviderOutputSource {
+                    provider: 11,
+                    source_provider: Some(10),
+                },
+                RecordedCall::SetProviderOutputSource {
+                    provider: 11,
+                    source_provider: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn randr_set_provider_output_source_notifies_in_both_byte_orders() {
+        use yserver_protocol::x11::randr as x11randr;
+
+        for byte_order in [ClientByteOrder::LittleEndian, ClientByteOrder::BigEndian] {
+            let mut state = ServerState::new();
+            state.randr.timestamp = 0x0102_0304;
+            state.randr.config_timestamp = 0x0506_0708;
+            state.randr.set_providers(vec![
+                randr_provider(10, x11randr::PROVIDER_CAPABILITY_SOURCE_OUTPUT),
+                randr_provider(11, x11randr::PROVIDER_CAPABILITY_SINK_OUTPUT),
+            ]);
+            let mut peer = install_client(&mut state, 1);
+            let client = state.clients.get_mut(&1).expect("test client");
+            client.byte_order = byte_order;
+            client
+                .last_sequence
+                .store(14, std::sync::atomic::Ordering::Relaxed);
+            state
+                .randr_select_masks
+                .insert((1, ROOT_WINDOW), x11randr::NOTIFY_MASK_PROVIDER_CHANGE);
+            let mut backend = RecordingBackend::new();
+
+            handle_randr_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(14),
+                RequestHeader {
+                    opcode: 128,
+                    data: x11randr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+                    length_units: 4,
+                },
+                &randr_output_source_body(11, 10, 99),
+            )
+            .expect("set provider output source");
+
+            let event = read_all_available(&mut peer);
+            let (sequence, timestamp, request_window, provider) = match byte_order {
+                ClientByteOrder::LittleEndian => (
+                    14u16.to_le_bytes(),
+                    0x0102_0304u32.to_le_bytes(),
+                    ROOT_WINDOW.0.to_le_bytes(),
+                    11u32.to_le_bytes(),
+                ),
+                ClientByteOrder::BigEndian => (
+                    14u16.to_be_bytes(),
+                    0x0102_0304u32.to_be_bytes(),
+                    ROOT_WINDOW.0.to_be_bytes(),
+                    11u32.to_be_bytes(),
+                ),
+            };
+            assert_eq!(event.len(), 32);
+            assert_eq!(event[0], 90, "RANDR Notify event");
+            assert_eq!(event[1], x11randr::NOTIFY_PROVIDER_CHANGE);
+            assert_eq!(&event[2..4], &sequence);
+            assert_eq!(&event[4..8], &timestamp);
+            assert_eq!(&event[8..12], &request_window);
+            assert_eq!(&event[12..16], &provider);
+            assert_eq!(state.randr.timestamp, 0x0102_0304);
+            assert_eq!(state.randr.config_timestamp, 0x0506_0708);
+        }
+    }
+
+    #[test]
+    fn randr_idempotent_provider_output_source_skips_notify() {
+        use yserver_protocol::x11::randr as x11randr;
+
+        let mut state = ServerState::new();
+        state.randr.timestamp = 40;
+        state.randr.config_timestamp = 50;
+        state.randr.set_providers(vec![
+            randr_provider(10, x11randr::PROVIDER_CAPABILITY_SOURCE_OUTPUT),
+            randr_provider(11, x11randr::PROVIDER_CAPABILITY_SINK_OUTPUT),
+        ]);
+        let mut peer = install_client(&mut state, 1);
+        state
+            .randr_select_masks
+            .insert((1, ROOT_WINDOW), x11randr::NOTIFY_MASK_PROVIDER_CHANGE);
+        let mut backend = RecordingBackend::new();
+        backend.provider_output_source_changed = false;
+
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 128,
+                data: x11randr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+                length_units: 4,
+            },
+            &randr_output_source_body(11, 10, 99),
+        )
+        .expect("idempotent provider output source");
+
+        assert!(read_all_available(&mut peer).is_empty());
+        assert_eq!(state.randr.timestamp, 40);
+        assert_eq!(state.randr.config_timestamp, 50);
+        assert_eq!(
+            backend.calls(),
+            vec![RecordedCall::SetProviderOutputSource {
+                provider: 11,
+                source_provider: Some(10),
+            }]
+        );
+    }
+
+    #[test]
+    fn randr_provider_output_source_maps_backend_errors_by_kind() {
+        use yserver_protocol::x11::randr as x11randr;
+
+        for (kind, error_code, error_value) in [
+            (io::ErrorKind::InvalidInput, x11::error::BAD_MATCH, 11),
+            (io::ErrorKind::Other, x11::error::BAD_IMPLEMENTATION, 0),
+        ] {
+            let mut state = ServerState::new();
+            state.randr.set_providers(vec![
+                randr_provider(10, x11randr::PROVIDER_CAPABILITY_SOURCE_OUTPUT),
+                randr_provider(11, x11randr::PROVIDER_CAPABILITY_SINK_OUTPUT),
+            ]);
+            let mut peer = install_client(&mut state, 1);
+            let mut backend = RecordingBackend::new();
+            backend.provider_output_source_error = Some(kind);
+
+            handle_randr_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(1),
+                RequestHeader {
+                    opcode: 128,
+                    data: x11randr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+                    length_units: 4,
+                },
+                &randr_output_source_body(11, 10, 99),
+            )
+            .expect("backend provider output source error");
+
+            let bytes = read_all_available(&mut peer);
+            assert_eq!(bytes.len(), 32);
+            assert_eq!(bytes[1], error_code, "backend error kind {kind:?}");
+            assert_eq!(
+                u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+                error_value,
+                "backend error kind {kind:?}"
             );
         }
     }

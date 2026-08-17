@@ -77,12 +77,14 @@ pub const NOTIFY_MASK_SCREEN_CHANGE: u16 = 1 << 0;
 pub const NOTIFY_MASK_CRTC_CHANGE: u16 = 1 << 1;
 pub const NOTIFY_MASK_OUTPUT_CHANGE: u16 = 1 << 2;
 pub const NOTIFY_MASK_OUTPUT_PROPERTY: u16 = 1 << 3;
+pub const NOTIFY_MASK_PROVIDER_CHANGE: u16 = 1 << 4;
 
 pub const EVENT_SCREEN_CHANGE_NOTIFY: u8 = 0;
 pub const EVENT_NOTIFY: u8 = 1;
 pub const NOTIFY_CRTC_CHANGE: u8 = 0;
 pub const NOTIFY_OUTPUT_CHANGE: u8 = 1;
 pub const NOTIFY_OUTPUT_PROPERTY: u8 = 2;
+pub const NOTIFY_PROVIDER_CHANGE: u8 = 3;
 pub const ROTATION_ROTATE_0: u16 = 1;
 pub const SET_CONFIG_SUCCESS: u8 = 0;
 pub const SET_CONFIG_FAILED: u8 = 3;
@@ -1314,6 +1316,14 @@ pub struct OutputChangeNotify {
     pub mode: u32,
 }
 
+/// `xRRProviderChangeNotifyEvent` (`randrproto.h`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderChangeNotify {
+    pub timestamp: u32,
+    pub request_window: u32,
+    pub provider: u32,
+}
+
 #[must_use]
 pub fn encode_screen_change_notify_event(
     byte_order: ClientByteOrder,
@@ -1383,6 +1393,24 @@ pub fn encode_output_change_notify_event(
     put(byte_order, &mut buf, ROTATION_ROTATE_0);
     buf.push(CONNECTION_CONNECTED);
     buf.push(SUBPIXEL_UNKNOWN as u8);
+    buf.try_into().expect("32-byte event")
+}
+
+#[must_use]
+pub fn encode_provider_change_notify_event(
+    byte_order: ClientByteOrder,
+    first_event: u8,
+    sequence: SequenceNumber,
+    event: ProviderChangeNotify,
+) -> [u8; 32] {
+    let mut buf: Vec<u8> = Vec::with_capacity(32);
+    buf.push(first_event + EVENT_NOTIFY);
+    buf.push(NOTIFY_PROVIDER_CHANGE);
+    put(byte_order, &mut buf, sequence.0);
+    put(byte_order, &mut buf, event.timestamp);
+    put(byte_order, &mut buf, event.request_window);
+    put(byte_order, &mut buf, event.provider);
+    buf.extend_from_slice(&[0u8; 16]);
     buf.try_into().expect("32-byte event")
 }
 
@@ -2203,6 +2231,44 @@ mod tests {
         assert_eq!(&buf[12..16], &42u32.to_le_bytes());
         assert_eq!(&buf[16..20], &999u32.to_le_bytes());
         assert_eq!(buf[20], PROPERTY_NEW_VALUE);
+    }
+
+    #[test]
+    fn provider_change_notify_event_shape_in_both_byte_orders() {
+        for byte_order in [ClientByteOrder::LittleEndian, ClientByteOrder::BigEndian] {
+            let buf = encode_provider_change_notify_event(
+                byte_order,
+                89,
+                SequenceNumber(14),
+                ProviderChangeNotify {
+                    timestamp: 0x0102_0304,
+                    request_window: 0x1112_1314,
+                    provider: 0x2122_2324,
+                },
+            );
+            let (sequence, timestamp, request_window, provider) = match byte_order {
+                ClientByteOrder::LittleEndian => (
+                    14u16.to_le_bytes(),
+                    0x0102_0304u32.to_le_bytes(),
+                    0x1112_1314u32.to_le_bytes(),
+                    0x2122_2324u32.to_le_bytes(),
+                ),
+                ClientByteOrder::BigEndian => (
+                    14u16.to_be_bytes(),
+                    0x0102_0304u32.to_be_bytes(),
+                    0x1112_1314u32.to_be_bytes(),
+                    0x2122_2324u32.to_be_bytes(),
+                ),
+            };
+
+            assert_eq!(buf[0], 89 + EVENT_NOTIFY);
+            assert_eq!(buf[1], NOTIFY_PROVIDER_CHANGE);
+            assert_eq!(&buf[2..4], &sequence);
+            assert_eq!(&buf[4..8], &timestamp);
+            assert_eq!(&buf[8..12], &request_window);
+            assert_eq!(&buf[12..16], &provider);
+            assert!(buf[16..].iter().all(|byte| *byte == 0));
+        }
     }
 
     #[test]

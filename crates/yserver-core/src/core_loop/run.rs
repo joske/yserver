@@ -1874,6 +1874,48 @@ pub(crate) fn notify_randr_layout_changed(state: &mut ServerState, changed_outpu
     }
 }
 
+/// Fan out `RRNotify_ProviderChange` after an output-source relationship
+/// actually changes. Xorg marks and announces the initiating provider only;
+/// the peer's reciprocal association is observable through `GetProviderInfo`
+/// without a second event.
+pub(crate) fn notify_randr_provider_changed(state: &mut ServerState, provider: u32) {
+    use std::sync::atomic::Ordering;
+    use yserver_protocol::x11::{SequenceNumber, randr as x11randr};
+
+    const RANDR_FIRST_EVENT: u8 = 89;
+
+    let subscribers: Vec<(u32, yserver_protocol::x11::ResourceId, u16)> = state
+        .randr_select_masks
+        .iter()
+        .map(|((owner, window), mask)| (*owner, *window, *mask))
+        .collect();
+    for (owner, request_window, mask) in subscribers {
+        if mask & x11randr::NOTIFY_MASK_PROVIDER_CHANGE == 0 {
+            continue;
+        }
+        let Some(client) = state.clients.get_mut(&owner) else {
+            continue;
+        };
+        let sequence = SequenceNumber(client.last_sequence.load(Ordering::Relaxed));
+        let event = x11randr::encode_provider_change_notify_event(
+            client.byte_order,
+            RANDR_FIRST_EVENT,
+            sequence,
+            x11randr::ProviderChangeNotify {
+                timestamp: state.randr.timestamp,
+                request_window: request_window.0,
+                provider,
+            },
+        );
+        crate::core_loop::fanout::record_outbound_telemetry(
+            yserver_protocol::x11::ClientId(owner),
+            client.byte_order,
+            &event,
+        );
+        let _ = client_io::write_or_buffer(client, &event);
+    }
+}
+
 /// Fans out `RRNotify_OutputProperty` (randr/rrproperty.c
 /// `RRDeliverPropertyEvent`) to every client that selected
 /// `NOTIFY_MASK_OUTPUT_PROPERTY` via `RRSelectInput`. Unlike

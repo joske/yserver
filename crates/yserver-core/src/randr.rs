@@ -131,6 +131,13 @@ pub struct RandrProvider {
     pub name: String,
     /// RANDR `ProviderCapability` bitmask.
     pub capabilities: u32,
+    /// Whether this provider represents Xorg's secondary GPU-screen role.
+    ///
+    /// This is internal policy metadata, not part of `GetProviderInfo`.
+    /// Xorg permits `SetProviderOutputSource` and `SetProviderOffloadSink`
+    /// only when the initiating provider belongs to a GPU screen, even when
+    /// its advertised capability bit otherwise matches the request.
+    pub is_gpu: bool,
     /// Device-owned CRTC XIDs.
     pub crtcs: Vec<u32>,
     /// Device-owned output XIDs.
@@ -155,6 +162,9 @@ pub enum ProviderRelationshipError {
     /// The named provider lacks the capability required by its role
     /// (`BadValue`).
     MissingCapability(u32),
+    /// The initiating provider is not a secondary GPU-screen provider
+    /// (`BadValue`).
+    NotGpuProvider(u32),
 }
 
 /// A mode's timing after the `Option<ModeTiming>` fallback has been
@@ -373,8 +383,9 @@ impl RandrState {
     }
 
     /// Validate `SetProviderOutputSource` in Xorg's order: the initiating
-    /// sink provider's existence and capability first, then the optional
-    /// source provider's existence and capability.
+    /// sink provider's existence and capability, the optional source
+    /// provider's existence and capability, then the initiating provider's
+    /// secondary-GPU role.
     pub fn validate_provider_output_source(
         &self,
         provider_id: u32,
@@ -386,25 +397,25 @@ impl RandrState {
         if provider.capabilities & proto::PROVIDER_CAPABILITY_SINK_OUTPUT == 0 {
             return Err(ProviderRelationshipError::MissingCapability(provider_id));
         }
-        if source_provider_id == 0 {
-            return Ok(());
-        }
-        let source =
-            self.provider(source_provider_id)
-                .ok_or(ProviderRelationshipError::UnknownProvider(
+        if source_provider_id != 0 {
+            let source = self.provider(source_provider_id).ok_or(
+                ProviderRelationshipError::UnknownProvider(source_provider_id),
+            )?;
+            if source.capabilities & proto::PROVIDER_CAPABILITY_SOURCE_OUTPUT == 0 {
+                return Err(ProviderRelationshipError::MissingCapability(
                     source_provider_id,
-                ))?;
-        if source.capabilities & proto::PROVIDER_CAPABILITY_SOURCE_OUTPUT == 0 {
-            return Err(ProviderRelationshipError::MissingCapability(
-                source_provider_id,
-            ));
+                ));
+            }
+        }
+        if !provider.is_gpu {
+            return Err(ProviderRelationshipError::NotGpuProvider(provider_id));
         }
         Ok(())
     }
 
     /// Validate `SetProviderOffloadSink` in Xorg's order: the initiating
-    /// source provider's existence and capability first, then the optional
-    /// sink provider's existence and capability.
+    /// source provider's existence, capability, and secondary-GPU role,
+    /// followed by the optional sink provider's existence and capability.
     pub fn validate_provider_offload_sink(
         &self,
         provider_id: u32,
@@ -416,10 +427,9 @@ impl RandrState {
         if provider.capabilities & proto::PROVIDER_CAPABILITY_SOURCE_OFFLOAD == 0 {
             return Err(ProviderRelationshipError::MissingCapability(provider_id));
         }
-        // Xorg next checks whether the provider belongs to a secondary GPU
-        // screen. Yserver has logical providers rather than Xorg GPU screens;
-        // advertising SOURCE_OFFLOAD is therefore the backend's assertion
-        // that this provider is eligible to act as an offload source.
+        if !provider.is_gpu {
+            return Err(ProviderRelationshipError::NotGpuProvider(provider_id));
+        }
         if sink_provider_id == 0 {
             return Ok(());
         }
@@ -764,6 +774,7 @@ mod tests {
             provider_id,
             name: format!("card{provider_id}"),
             capabilities,
+            is_gpu: true,
             crtcs: Vec::new(),
             outputs: Vec::new(),
             associations: Vec::new(),
@@ -808,6 +819,10 @@ mod tests {
             provider(1, proto::PROVIDER_CAPABILITY_SINK_OUTPUT),
             provider(2, proto::PROVIDER_CAPABILITY_SOURCE_OUTPUT),
             provider(5, 0),
+            RandrProvider {
+                is_gpu: false,
+                ..provider(6, proto::PROVIDER_CAPABILITY_SINK_OUTPUT)
+            },
         ]);
 
         assert_eq!(state.validate_provider_output_source(1, 2), Ok(()));
@@ -834,6 +849,20 @@ mod tests {
             state.validate_provider_output_source(1, 5),
             Err(ProviderRelationshipError::MissingCapability(5))
         );
+        assert_eq!(
+            state.validate_provider_output_source(6, 99),
+            Err(ProviderRelationshipError::UnknownProvider(99)),
+            "output-source peer lookup precedes the initiating GPU-role check"
+        );
+        assert_eq!(
+            state.validate_provider_output_source(6, 2),
+            Err(ProviderRelationshipError::NotGpuProvider(6))
+        );
+        assert_eq!(
+            state.validate_provider_output_source(6, 0),
+            Err(ProviderRelationshipError::NotGpuProvider(6)),
+            "detach still validates the initiating GPU role"
+        );
     }
 
     #[test]
@@ -843,6 +872,10 @@ mod tests {
             provider(3, proto::PROVIDER_CAPABILITY_SOURCE_OFFLOAD),
             provider(4, proto::PROVIDER_CAPABILITY_SINK_OFFLOAD),
             provider(5, 0),
+            RandrProvider {
+                is_gpu: false,
+                ..provider(6, proto::PROVIDER_CAPABILITY_SOURCE_OFFLOAD)
+            },
         ]);
 
         assert_eq!(state.validate_provider_offload_sink(3, 4), Ok(()));
@@ -868,6 +901,16 @@ mod tests {
         assert_eq!(
             state.validate_provider_offload_sink(3, 5),
             Err(ProviderRelationshipError::MissingCapability(5))
+        );
+        assert_eq!(
+            state.validate_provider_offload_sink(6, 99),
+            Err(ProviderRelationshipError::NotGpuProvider(6)),
+            "offload checks the initiating GPU role before peer lookup"
+        );
+        assert_eq!(
+            state.validate_provider_offload_sink(6, 0),
+            Err(ProviderRelationshipError::NotGpuProvider(6)),
+            "detach still validates the initiating GPU role"
         );
     }
 
