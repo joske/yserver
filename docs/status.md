@@ -33,6 +33,18 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-08-18 ordered multi-KMS override:** `YSERVER_DRM_DEVICES` accepts a
+  comma-separated list of KMS primary-node paths and takes precedence over the
+  compatible singular `YSERVER_DRM_DEVICE`. Commas preserve the colons in
+  stable udev by-path PCI names. Empty entries, repeated paths, non-Unicode
+  plural values, and distinct paths that resolve to the same DRM major/minor
+  identity fail explicitly; alias detection completes before the first
+  modeset. The first entry that opens successfully owns startup scanout and is
+  the default anchor for render-node resolution, while later entries remain
+  secondary KMS/provider inventory. This ordering does not conflate the first
+  KMS device with the selected `RenderDevice`: split display/render systems may
+  select a distinct renderer, and `YSERVER_DRI_RENDER_NODE` remains the direct
+  renderer override. Machine-specific device profiles stay outside yserver.
 - **2026-08-18 endpoint-qualified PRIME Output Source policy:** the selected
   operational renderer now advertises RANDR `SourceOutput`; each distinct KMS
   provider with known connector inventory advertises `SinkOutput`. Provider

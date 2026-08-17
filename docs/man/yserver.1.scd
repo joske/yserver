@@ -112,13 +112,22 @@ above.
 	are for diagnosis.
 
 *YSERVER_DRM_DEVICE*
-	Path to the DRM device to use instead of auto-selecting one, e.g.
-	_/dev/dri/card1_.
+	Path to the sole KMS device to use instead of auto-selecting devices,
+	e.g. _/dev/dri/card1_. Ignored when *YSERVER_DRM_DEVICES* is set.
+
+*YSERVER_DRM_DEVICES*
+	Comma-separated ordered KMS-device paths, e.g.
+	_/dev/dri/card1,/dev/dri/card0_. This overrides
+	*YSERVER_DRM_DEVICE*. The first entry that opens successfully supplies
+	the startup scanout device; remaining entries are retained as secondary
+	KMS providers. Commas delimit entries so stable by-path names may retain
+	their PCI-address colons.
 
 *YSERVER_DRI_RENDER_NODE*
-	Path to the DRI3 render node to use instead of resolving a sibling of
-	*YSERVER_DRM_DEVICE*, e.g. _/dev/dri/renderD128_. Useful on systems
-	without sysfs-style card/render parent metadata.
+	Path to the Vulkan/DRI3 render node to use instead of resolving one from
+	the first successfully opened KMS device, e.g. _/dev/dri/renderD128_.
+	Useful on split display/render systems and systems without sysfs-style
+	card/render parent metadata.
 
 *YSERVER_MODE*
 	Force a mode instead of the connector's preferred mode, as

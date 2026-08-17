@@ -64,14 +64,37 @@ struct KmsCardCandidate {
 
 /// Resolve the KMS cards yserver should open at startup.
 ///
+/// `YSERVER_DRM_DEVICES` accepts a comma-separated ordered device list. The
+/// existing singular `YSERVER_DRM_DEVICE` remains a one-device-only override
+/// and is ignored when the plural override is present. The first device that
+/// opens successfully becomes the startup KMS device; remaining devices stay
+/// available as secondary KMS/provider inventory.
+///
 /// Node enumeration is portable between yserver's Linux and FreeBSD targets;
 /// only optional relationship metadata is delegated to an OS module. The
 /// selected primary scanout candidate is first and every remaining KMS-capable
 /// primary node keeps its platform enumeration order. No candidates is a valid
 /// headless result.
 pub(crate) fn resolve_default_kms_devices() -> io::Result<Vec<PathBuf>> {
-    if let Ok(explicit) = std::env::var("YSERVER_DRM_DEVICE") {
-        return Ok(vec![PathBuf::from(explicit)]);
+    let ordered_override = ordered_kms_override_value(std::env::var("YSERVER_DRM_DEVICES"))?;
+    let singular_override = std::env::var("YSERVER_DRM_DEVICE").ok();
+    if let Some(devices) =
+        resolve_kms_device_override(ordered_override.as_deref(), singular_override.as_deref())?
+    {
+        let source = if ordered_override.is_some() {
+            "YSERVER_DRM_DEVICES"
+        } else {
+            "YSERVER_DRM_DEVICE"
+        };
+        log::info!(
+            "yserver: using {source} DRM device override: {}",
+            devices
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        return Ok(devices);
     }
 
     let (candidates, reasons) = discover_kms_candidates()?;
@@ -104,6 +127,61 @@ pub(crate) fn resolve_default_kms_devices() -> io::Result<Vec<PathBuf>> {
         );
     }
     Ok(Vec::new())
+}
+
+fn ordered_kms_override_value(
+    value: Result<String, std::env::VarError>,
+) -> io::Result<Option<String>> {
+    match value {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "YSERVER_DRM_DEVICES must be valid UTF-8",
+        )),
+    }
+}
+
+fn resolve_kms_device_override(
+    ordered: Option<&str>,
+    singular: Option<&str>,
+) -> io::Result<Option<Vec<PathBuf>>> {
+    if let Some(spec) = ordered {
+        return parse_ordered_kms_devices(spec).map(Some);
+    }
+    Ok(singular.map(|path| vec![PathBuf::from(path)]))
+}
+
+fn parse_ordered_kms_devices(spec: &str) -> io::Result<Vec<PathBuf>> {
+    if spec.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "YSERVER_DRM_DEVICES must contain at least one device path",
+        ));
+    }
+
+    let mut devices = Vec::new();
+    for (index, component) in spec.split(',').enumerate() {
+        let component = component.trim();
+        if component.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("YSERVER_DRM_DEVICES contains an empty path at position {index}"),
+            ));
+        }
+        let path = PathBuf::from(component);
+        if devices.contains(&path) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "YSERVER_DRM_DEVICES contains duplicate path {}",
+                    path.display()
+                ),
+            ));
+        }
+        devices.push(path);
+    }
+    Ok(devices)
 }
 
 fn discover_kms_candidates() -> io::Result<(Vec<KmsCardCandidate>, Vec<String>)> {
@@ -374,6 +452,77 @@ mod tests {
             },
             has_connected_connector: connected,
         }
+    }
+
+    #[test]
+    fn ordered_kms_override_preserves_order_and_colons_in_stable_paths() {
+        assert_eq!(
+            parse_ordered_kms_devices(
+                " /dev/dri/by-path/pci-0000:01:00.0-card,\
+                 /dev/dri/by-path/pci-0000:00:02.0-card ",
+            )
+            .unwrap(),
+            vec![
+                PathBuf::from("/dev/dri/by-path/pci-0000:01:00.0-card"),
+                PathBuf::from("/dev/dri/by-path/pci-0000:00:02.0-card"),
+            ]
+        );
+    }
+
+    #[test]
+    fn ordered_kms_override_rejects_empty_and_duplicate_paths() {
+        for invalid in [
+            "",
+            "   ",
+            ",/dev/dri/card0",
+            "/dev/dri/card0,",
+            "/dev/dri/card1,,/dev/dri/card0",
+            "/dev/dri/card1,/dev/dri/card1",
+            "/dev/dri/card1, /dev/dri/card1 ",
+        ] {
+            let error = parse_ordered_kms_devices(invalid)
+                .expect_err("empty or duplicate ordered override must fail");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn plural_kms_override_wins_and_fails_closed() {
+        assert_eq!(
+            resolve_kms_device_override(
+                Some("/dev/dri/card1,/dev/dri/card0"),
+                Some("/dev/dri/card9"),
+            )
+            .unwrap(),
+            Some(vec![
+                PathBuf::from("/dev/dri/card1"),
+                PathBuf::from("/dev/dri/card0"),
+            ])
+        );
+        assert_eq!(
+            resolve_kms_device_override(None, Some("/dev/dri/card9")).unwrap(),
+            Some(vec![PathBuf::from("/dev/dri/card9")])
+        );
+        assert_eq!(
+            resolve_kms_device_override(Some("/dev/dri/card1"), Some("/dev/dri/card9")).unwrap(),
+            Some(vec![PathBuf::from("/dev/dri/card1")]),
+            "a single-entry plural override remains plural and wins precedence"
+        );
+        assert_eq!(resolve_kms_device_override(None, None).unwrap(), None);
+
+        let error = resolve_kms_device_override(Some(""), Some("/dev/dri/card9"))
+            .expect_err("an invalid plural override must not fall back to singular");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        assert_eq!(
+            ordered_kms_override_value(Err(std::env::VarError::NotPresent)).unwrap(),
+            None
+        );
+        let error = ordered_kms_override_value(Err(std::env::VarError::NotUnicode(
+            std::ffi::OsString::from("non-Unicode sentinel"),
+        )))
+        .expect_err("a present non-Unicode plural override must not look absent");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]

@@ -27,7 +27,11 @@
 //! v1; a future rename to something like `kms::raster` is fine but
 //! not load-bearing.
 
-use std::{io, path::PathBuf, rc::Rc};
+use std::{
+    io,
+    path::{Path, PathBuf},
+    rc::Rc,
+};
 
 use crate::{
     drm,
@@ -787,6 +791,25 @@ fn activate_initial_scanout_outputs(
     Ok(layouts)
 }
 
+/// Reject two paths that resolve to the same kernel DRM device identity.
+fn validate_unique_kms_device_identity(
+    opened: &[(crate::platform::drm::DrmDeviceKey, PathBuf)],
+    key: crate::platform::drm::DrmDeviceKey,
+    path: &Path,
+) -> io::Result<()> {
+    let Some((_, existing_path)) = opened.iter().find(|(existing, _)| *existing == key) else {
+        return Ok(());
+    };
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "DRM device {} aliases already-opened device {} (same rdev {key})",
+            path.display(),
+            existing_path.display(),
+        ),
+    ))
+}
+
 /// Shared DRM / outputs / libinput bring-up for the v1 and v2
 /// backends. Extracted in Stage 1b so both `KmsBackend::open_with_commit`
 /// and `KmsBackend::open` use the same code path.
@@ -812,6 +835,7 @@ pub(crate) fn platform_init(
     ) -> io::Result<()>,
 ) -> io::Result<PlatformInit> {
     let mut devices = Vec::with_capacity(device_paths.len());
+    let mut opened_device_paths = Vec::with_capacity(device_paths.len());
     let mut render_node = None;
     let mut layouts = Vec::new();
     let mut open_errors = Vec::new();
@@ -830,6 +854,8 @@ pub(crate) fn platform_init(
         };
         let device_key =
             crate::platform::drm::primary_device_key_from_fd(std::os::fd::AsFd::as_fd(&*device))?;
+        validate_unique_kms_device_identity(&opened_device_paths, device_key, device_path)?;
+        opened_device_paths.push((device_key, device_path.clone()));
 
         if devices.is_empty() {
             render_node = render_node_for_device(&device_path_str, &device);
@@ -910,6 +936,37 @@ mod platform_init_tests {
         _fb: ::drm::control::framebuffer::Handle,
     ) -> io::Result<()> {
         unreachable!("a zero-device platform must not commit an output")
+    }
+
+    #[test]
+    fn duplicate_kms_identity_rejects_distinct_alias_paths() {
+        let key = crate::platform::drm::DrmDeviceKey {
+            major: 226,
+            minor: 1,
+        };
+        let opened = [(key, PathBuf::from("/dev/dri/card1"))];
+
+        validate_unique_kms_device_identity(
+            &opened,
+            crate::platform::drm::DrmDeviceKey {
+                major: 226,
+                minor: 0,
+            },
+            Path::new("/dev/dri/card0"),
+        )
+        .expect("a distinct DRM identity is allowed");
+
+        let error = validate_unique_kms_device_identity(
+            &opened,
+            key,
+            Path::new("/dev/dri/by-path/pci-0000:01:00.0-card"),
+        )
+        .expect_err("two paths naming the same DRM identity must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let message = error.to_string();
+        assert!(message.contains("/dev/dri/card1"));
+        assert!(message.contains("/dev/dri/by-path/pci-0000:01:00.0-card"));
+        assert!(message.contains("226:1"));
     }
 
     #[test]
