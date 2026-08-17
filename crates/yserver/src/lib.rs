@@ -334,6 +334,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     log::info!("yserver: scanout {fb_w}x{fb_h}");
 
     let (randr_outputs, randr_mode_table) = backend.randr_outputs_and_modes();
+    let randr_providers = backend.randr_providers();
     let capabilities = yserver_core::server::BackendCapabilities::from_backend(&backend);
     let mut state = ServerState::with_randr_outputs_and_modes(
         fb_w,
@@ -342,6 +343,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
         randr_mode_table,
         capabilities,
     );
+    state.randr.set_providers(randr_providers);
     // Tie the libinput thread's `clock::server_time_ms()` baseline
     // to ServerState's `start_instant` so the input-event timestamps
     // and the `state.timestamp_now()` clock used by the

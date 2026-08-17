@@ -2461,6 +2461,20 @@ fn handle_randr_request(
     fn crtc_is_leased(_state: &ServerState, _crtc: u32) -> bool {
         false
     }
+    fn provider_relationship_protocol_error(
+        error: crate::randr::ProviderRelationshipError,
+    ) -> (u8, u32) {
+        match error {
+            crate::randr::ProviderRelationshipError::UnknownProvider(provider) => {
+                (RANDR_BAD_PROVIDER, provider)
+            }
+            // Xorg returns BadValue for a missing provider capability without
+            // assigning client->errorValue, so the wire value remains zero.
+            crate::randr::ProviderRelationshipError::MissingCapability(_) => {
+                (x11::error::BAD_VALUE, 0)
+            }
+        }
+    }
     fn request_xid(body: &[u8]) -> u32 {
         body.get(0..4)
             .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
@@ -3362,6 +3376,18 @@ fn handle_randr_request(
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_GET_PROVIDERS => {
+            // Xorg uses REQUEST_SIZE_MATCH for this fixed-size request.
+            if body.len() != 4 {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
             let window = request_xid(body);
             if state.resources.window(ResourceId(window)).is_none() {
                 return emit_x11_error_with_minor(
@@ -3375,12 +3401,166 @@ fn handle_randr_request(
                 );
             }
             let timestamp = state.randr.timestamp;
-            let buf = x11randr::encode_get_providers_reply(byte_order, sequence, timestamp);
+            let providers: Vec<u32> = state
+                .randr
+                .providers
+                .iter()
+                .map(|provider| provider.provider_id)
+                .collect();
+            let buf =
+                x11randr::encode_get_providers_reply(byte_order, sequence, timestamp, &providers);
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };
             let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &buf));
+        }
+        x11randr::RR_GET_PROVIDER_INFO => {
+            let Some(req) = x11randr::parse_provider_info_request(body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            let Some(provider) = state.randr.provider(req.provider) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    RANDR_BAD_PROVIDER,
+                    req.provider,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            // Xorg accepts config_timestamp but does not use it for this
+            // request; a live provider always reports RRSetConfigSuccess.
+            let _ = req.config_timestamp;
+            let associated_providers: Vec<u32> = provider
+                .associations
+                .iter()
+                .map(|association| association.provider_id)
+                .collect();
+            let associated_capabilities: Vec<u32> = provider
+                .associations
+                .iter()
+                .map(|association| association.capability)
+                .collect();
+            let buf = x11randr::encode_get_provider_info_reply(
+                byte_order,
+                sequence,
+                &x11randr::ProviderInfoReply {
+                    status: x11randr::SET_CONFIG_SUCCESS,
+                    timestamp: state.randr.timestamp,
+                    capabilities: provider.capabilities,
+                    crtcs: &provider.crtcs,
+                    outputs: &provider.outputs,
+                    associated_providers: &associated_providers,
+                    associated_capabilities: &associated_capabilities,
+                    name: provider.name.as_bytes(),
+                },
+            );
+            let Some(client) = state.clients.get_mut(&client_id.0) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            return Ok(write_to_client(client, client_id, &buf));
+        }
+        x11randr::RR_SET_PROVIDER_OFFLOAD_SINK => {
+            let Some(req) = x11randr::parse_set_provider_offload_sink_request(body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            if let Err(error) = state
+                .randr
+                .validate_provider_offload_sink(req.provider, req.sink_provider)
+            {
+                let (error_code, error_value) = provider_relationship_protocol_error(error);
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    error_code,
+                    error_value,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            let _ = req.config_timestamp;
+            warn_randr_unsupported_once(
+                state,
+                client_id,
+                sequence,
+                minor,
+                "SetProviderOffloadSink",
+                "rejecting a validated relationship because offload transport is unavailable",
+            );
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_IMPLEMENTATION,
+                0,
+                u16::from(minor),
+                RANDR_MAJOR_OPCODE,
+            );
+        }
+        x11randr::RR_SET_PROVIDER_OUTPUT_SOURCE => {
+            let Some(req) = x11randr::parse_set_provider_output_source_request(body) else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            };
+            if let Err(error) = state
+                .randr
+                .validate_provider_output_source(req.provider, req.source_provider)
+            {
+                let (error_code, error_value) = provider_relationship_protocol_error(error);
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    error_code,
+                    error_value,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            let _ = req.config_timestamp;
+            warn_randr_unsupported_once(
+                state,
+                client_id,
+                sequence,
+                minor,
+                "SetProviderOutputSource",
+                "rejecting a validated relationship because output transport is unavailable",
+            );
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                x11::error::BAD_IMPLEMENTATION,
+                0,
+                u16::from(minor),
+                RANDR_MAJOR_OPCODE,
+            );
         }
         x11randr::RR_GET_MONITORS => {
             let window = request_xid(body);
@@ -4193,23 +4373,129 @@ fn handle_randr_request(
                 RANDR_MAJOR_OPCODE,
             );
         }
-        33..=41 => {
-            // Yserver advertises no RANDR providers (GetProviders returns an
-            // empty list), so every provider id is invalid. Xorg's
-            // VERIFY_RR_PROVIDER therefore returns the extension's
-            // BadProvider error before any reply/property work. This also
-            // prevents the reply-bearing minors 33, 36, 37 and 41 from
-            // silently hanging clients.
-            let provider = body
-                .get(0..4)
-                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
-                .unwrap_or(0);
+        x11randr::RR_LIST_PROVIDER_PROPERTIES
+        | x11randr::RR_QUERY_PROVIDER_PROPERTY
+        | x11randr::RR_CONFIGURE_PROVIDER_PROPERTY
+        | x11randr::RR_CHANGE_PROVIDER_PROPERTY
+        | x11randr::RR_DELETE_PROVIDER_PROPERTY
+        | x11randr::RR_GET_PROVIDER_PROPERTY => {
+            // These requests remain deliberately unsupported, but now that
+            // providers are live we must preserve Xorg's validation order:
+            // request shape first, then provider lookup, then the unsupported
+            // result. ChangeProviderProperty additionally validates mode and
+            // format before its computed-length check and provider lookup.
+            let provider = match minor {
+                x11randr::RR_LIST_PROVIDER_PROPERTIES if body.len() == 4 => request_xid(body),
+                x11randr::RR_QUERY_PROVIDER_PROPERTY | x11randr::RR_DELETE_PROVIDER_PROPERTY
+                    if body.len() == 8 =>
+                {
+                    request_xid(body)
+                }
+                x11randr::RR_CONFIGURE_PROVIDER_PROPERTY
+                    if body.len() >= 12 && body.len().is_multiple_of(4) =>
+                {
+                    request_xid(body)
+                }
+                x11randr::RR_GET_PROVIDER_PROPERTY if body.len() == 24 => request_xid(body),
+                x11randr::RR_CHANGE_PROVIDER_PROPERTY => {
+                    let Some(req) = x11randr::parse_change_provider_property_header(body) else {
+                        return emit_x11_error_with_minor(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_LENGTH,
+                            0,
+                            u16::from(minor),
+                            RANDR_MAJOR_OPCODE,
+                        );
+                    };
+                    let Some(_mode) = properties::ChangeMode::from_protocol(req.mode) else {
+                        return emit_x11_error_with_minor(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_VALUE,
+                            u32::from(req.mode),
+                            u16::from(minor),
+                            RANDR_MAJOR_OPCODE,
+                        );
+                    };
+                    let Some(format) = properties::PropertyFormat::from_protocol(req.format) else {
+                        return emit_x11_error_with_minor(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_VALUE,
+                            u32::from(req.format),
+                            u16::from(minor),
+                            RANDR_MAJOR_OPCODE,
+                        );
+                    };
+                    let expected_len = usize::try_from(req.n_units)
+                        .ok()
+                        .and_then(|units| units.checked_mul(format.bytes()))
+                        .and_then(|bytes| bytes.checked_add(3))
+                        .map(|bytes| bytes & !3)
+                        .and_then(|bytes| 20usize.checked_add(bytes));
+                    if expected_len != Some(body.len()) {
+                        return emit_x11_error_with_minor(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_LENGTH,
+                            0,
+                            u16::from(minor),
+                            RANDR_MAJOR_OPCODE,
+                        );
+                    }
+                    req.provider
+                }
+                _ => {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_LENGTH,
+                        0,
+                        u16::from(minor),
+                        RANDR_MAJOR_OPCODE,
+                    );
+                }
+            };
+            if state.randr.provider(provider).is_none() {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    RANDR_BAD_PROVIDER,
+                    provider,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
+            let request_name = match minor {
+                x11randr::RR_LIST_PROVIDER_PROPERTIES => "ListProviderProperties",
+                x11randr::RR_QUERY_PROVIDER_PROPERTY => "QueryProviderProperty",
+                x11randr::RR_CONFIGURE_PROVIDER_PROPERTY => "ConfigureProviderProperty",
+                x11randr::RR_CHANGE_PROVIDER_PROPERTY => "ChangeProviderProperty",
+                x11randr::RR_DELETE_PROVIDER_PROPERTY => "DeleteProviderProperty",
+                x11randr::RR_GET_PROVIDER_PROPERTY => "GetProviderProperty",
+                _ => unreachable!(),
+            };
+            warn_randr_unsupported_once(
+                state,
+                client_id,
+                sequence,
+                minor,
+                request_name,
+                "rejecting request because provider properties are unavailable",
+            );
             return emit_x11_error_with_minor(
                 state,
                 client_id,
                 sequence,
-                RANDR_BAD_PROVIDER,
-                provider,
+                x11::error::BAD_IMPLEMENTATION,
+                0,
                 u16::from(minor),
                 RANDR_MAJOR_OPCODE,
             );
@@ -31614,6 +31900,56 @@ mod tests {
         body
     }
 
+    fn randr_provider(provider_id: u32, capabilities: u32) -> crate::randr::RandrProvider {
+        crate::randr::RandrProvider {
+            provider_id,
+            name: format!("card{provider_id}"),
+            capabilities,
+            crtcs: Vec::new(),
+            outputs: Vec::new(),
+            associations: Vec::new(),
+        }
+    }
+
+    fn randr_provider_request_body(minor: u8, provider: u32) -> Vec<u8> {
+        use yserver_protocol::x11::randr as x11randr;
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&provider.to_le_bytes());
+        match minor {
+            x11randr::RR_GET_PROVIDER_INFO => {
+                body.extend_from_slice(&0u32.to_le_bytes());
+            }
+            x11randr::RR_SET_PROVIDER_OFFLOAD_SINK | x11randr::RR_SET_PROVIDER_OUTPUT_SOURCE => {
+                body.extend_from_slice(&0u32.to_le_bytes());
+                body.extend_from_slice(&0u32.to_le_bytes());
+            }
+            x11randr::RR_LIST_PROVIDER_PROPERTIES => {}
+            x11randr::RR_QUERY_PROVIDER_PROPERTY | x11randr::RR_DELETE_PROVIDER_PROPERTY => {
+                body.extend_from_slice(&0u32.to_le_bytes());
+            }
+            x11randr::RR_CONFIGURE_PROVIDER_PROPERTY => {
+                body.extend_from_slice(&0u32.to_le_bytes());
+                body.extend_from_slice(&[0u8; 4]);
+            }
+            x11randr::RR_CHANGE_PROVIDER_PROPERTY => {
+                body.extend_from_slice(&0u32.to_le_bytes());
+                body.extend_from_slice(&0u32.to_le_bytes());
+                body.extend_from_slice(&[8, 0, 0, 0]);
+                body.extend_from_slice(&0u32.to_le_bytes());
+            }
+            x11randr::RR_GET_PROVIDER_PROPERTY => {
+                body.extend_from_slice(&0u32.to_le_bytes());
+                body.extend_from_slice(&0u32.to_le_bytes());
+                body.extend_from_slice(&0u32.to_le_bytes());
+                body.extend_from_slice(&0u32.to_le_bytes());
+                body.extend_from_slice(&[0u8; 4]);
+            }
+            _ => panic!("not a provider request minor: {minor}"),
+        }
+        body
+    }
+
     #[test]
     fn randr_create_mode_unimplemented_returns_error_not_hang() {
         // RRCreateMode (minor 16): reply-bearing, unimplemented → error.
@@ -31804,9 +32140,192 @@ mod tests {
     }
 
     #[test]
-    fn randr_unadvertised_provider_requests_return_bad_provider() {
+    fn randr_provider_queries_report_sorted_topology_in_both_byte_orders() {
+        use yserver_protocol::x11::randr as x11randr;
+
+        for byte_order in [ClientByteOrder::LittleEndian, ClientByteOrder::BigEndian] {
+            let mut state = ServerState::new();
+            state.randr.set_providers(vec![
+                randr_provider(20, 0),
+                crate::randr::RandrProvider {
+                    name: "card0".to_string(),
+                    capabilities: x11randr::PROVIDER_CAPABILITY_SOURCE_OUTPUT,
+                    crtcs: vec![2],
+                    outputs: vec![1],
+                    associations: vec![crate::randr::RandrProviderAssociation {
+                        provider_id: 20,
+                        capability: x11randr::PROVIDER_CAPABILITY_SINK_OUTPUT,
+                    }],
+                    ..randr_provider(10, 0)
+                },
+            ]);
+            let mut peer = install_client(&mut state, 1);
+            state.clients.get_mut(&1).expect("test client").byte_order = byte_order;
+            let mut backend = RecordingBackend::new();
+
+            let mut providers_body = match byte_order {
+                ClientByteOrder::LittleEndian => ROOT_WINDOW.0.to_le_bytes().to_vec(),
+                ClientByteOrder::BigEndian => ROOT_WINDOW.0.to_be_bytes().to_vec(),
+            };
+            yserver_protocol::x11::request_swap::swap_request_body(
+                128,
+                x11randr::RR_GET_PROVIDERS,
+                byte_order,
+                &mut providers_body,
+            );
+            handle_randr_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(1),
+                RequestHeader {
+                    opcode: 128,
+                    data: x11randr::RR_GET_PROVIDERS,
+                    length_units: 2,
+                },
+                &providers_body,
+            )
+            .expect("get providers");
+            let bytes = read_all_available(&mut peer);
+            assert_eq!(bytes.len(), 40);
+            match byte_order {
+                ClientByteOrder::LittleEndian => {
+                    assert_eq!(&bytes[4..8], &2u32.to_le_bytes());
+                    assert_eq!(&bytes[12..14], &2u16.to_le_bytes());
+                    assert_eq!(&bytes[32..36], &10u32.to_le_bytes());
+                    assert_eq!(&bytes[36..40], &20u32.to_le_bytes());
+                }
+                ClientByteOrder::BigEndian => {
+                    assert_eq!(&bytes[4..8], &2u32.to_be_bytes());
+                    assert_eq!(&bytes[12..14], &2u16.to_be_bytes());
+                    assert_eq!(&bytes[32..36], &10u32.to_be_bytes());
+                    assert_eq!(&bytes[36..40], &20u32.to_be_bytes());
+                }
+            }
+
+            let mut info_body = Vec::new();
+            match byte_order {
+                ClientByteOrder::LittleEndian => {
+                    info_body.extend_from_slice(&10u32.to_le_bytes());
+                    info_body.extend_from_slice(&0u32.to_le_bytes());
+                }
+                ClientByteOrder::BigEndian => {
+                    info_body.extend_from_slice(&10u32.to_be_bytes());
+                    info_body.extend_from_slice(&0u32.to_be_bytes());
+                }
+            }
+            yserver_protocol::x11::request_swap::swap_request_body(
+                128,
+                x11randr::RR_GET_PROVIDER_INFO,
+                byte_order,
+                &mut info_body,
+            );
+            handle_randr_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(2),
+                RequestHeader {
+                    opcode: 128,
+                    data: x11randr::RR_GET_PROVIDER_INFO,
+                    length_units: 3,
+                },
+                &info_body,
+            )
+            .expect("get provider info");
+            let bytes = read_all_available(&mut peer);
+            assert_eq!(bytes.len(), 56);
+            assert_eq!(bytes[1], x11randr::SET_CONFIG_SUCCESS);
+            match byte_order {
+                ClientByteOrder::LittleEndian => {
+                    assert_eq!(&bytes[4..8], &6u32.to_le_bytes());
+                    assert_eq!(
+                        &bytes[12..16],
+                        &x11randr::PROVIDER_CAPABILITY_SOURCE_OUTPUT.to_le_bytes()
+                    );
+                    assert_eq!(&bytes[16..18], &1u16.to_le_bytes());
+                    assert_eq!(&bytes[18..20], &1u16.to_le_bytes());
+                    assert_eq!(&bytes[20..22], &1u16.to_le_bytes());
+                    assert_eq!(&bytes[32..36], &2u32.to_le_bytes());
+                    assert_eq!(&bytes[36..40], &1u32.to_le_bytes());
+                    assert_eq!(&bytes[40..44], &20u32.to_le_bytes());
+                    assert_eq!(
+                        &bytes[44..48],
+                        &x11randr::PROVIDER_CAPABILITY_SINK_OUTPUT.to_le_bytes()
+                    );
+                }
+                ClientByteOrder::BigEndian => {
+                    assert_eq!(&bytes[4..8], &6u32.to_be_bytes());
+                    assert_eq!(
+                        &bytes[12..16],
+                        &x11randr::PROVIDER_CAPABILITY_SOURCE_OUTPUT.to_be_bytes()
+                    );
+                    assert_eq!(&bytes[16..18], &1u16.to_be_bytes());
+                    assert_eq!(&bytes[18..20], &1u16.to_be_bytes());
+                    assert_eq!(&bytes[20..22], &1u16.to_be_bytes());
+                    assert_eq!(&bytes[32..36], &2u32.to_be_bytes());
+                    assert_eq!(&bytes[36..40], &1u32.to_be_bytes());
+                    assert_eq!(&bytes[40..44], &20u32.to_be_bytes());
+                    assert_eq!(
+                        &bytes[44..48],
+                        &x11randr::PROVIDER_CAPABILITY_SINK_OUTPUT.to_be_bytes()
+                    );
+                }
+            }
+            assert_eq!(&bytes[48..53], b"card0");
+            assert!(bytes[53..].iter().all(|byte| *byte == 0));
+        }
+    }
+
+    #[test]
+    fn randr_provider_requests_validate_exact_or_minimum_wire_size_first() {
+        use yserver_protocol::x11::randr as x11randr;
+
+        let mut valid_bodies = vec![(
+            x11randr::RR_GET_PROVIDERS,
+            ROOT_WINDOW.0.to_le_bytes().to_vec(),
+        )];
+        valid_bodies.extend(
+            (33..=41).map(|minor| (minor, randr_provider_request_body(minor, 0x00ab_cdef))),
+        );
+        for (minor, valid) in valid_bodies {
+            let mut malformed_bodies = vec![valid[..valid.len() - 4].to_vec()];
+            if minor != x11randr::RR_CONFIGURE_PROVIDER_PROPERTY {
+                let mut extra = valid.clone();
+                extra.extend_from_slice(&[0; 4]);
+                malformed_bodies.push(extra);
+            }
+            for malformed in malformed_bodies {
+                let mut state = ServerState::new();
+                let mut peer = install_client(&mut state, 1);
+                let mut backend = RecordingBackend::new();
+                handle_randr_request(
+                    &mut state,
+                    &mut backend,
+                    ClientId(1),
+                    SequenceNumber(u16::from(minor)),
+                    RequestHeader {
+                        opcode: 128,
+                        data: minor,
+                        length_units: 1 + malformed.len().div_ceil(4) as u32,
+                    },
+                    &malformed,
+                )
+                .expect("process malformed provider request");
+
+                let bytes = read_all_available(&mut peer);
+                assert_eq!(bytes.len(), 32, "minor {minor} must return an error");
+                assert_eq!(bytes[1], x11::error::BAD_LENGTH, "minor {minor} code");
+                assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn randr_unknown_provider_requests_use_valid_shapes_then_bad_provider() {
         const PROVIDER: u32 = 0x00ab_cdef;
         for minor in 33..=41 {
+            let body = randr_provider_request_body(minor, PROVIDER);
             let mut state = ServerState::new();
             let mut peer = install_client(&mut state, 1);
             let mut backend = RecordingBackend::new();
@@ -31818,9 +32337,9 @@ mod tests {
                 RequestHeader {
                     opcode: 128,
                     data: minor,
-                    length_units: 2,
+                    length_units: 1 + (body.len() / 4) as u32,
                 },
-                &PROVIDER.to_le_bytes(),
+                &body,
             )
             .expect("process provider request");
 
@@ -31834,6 +32353,211 @@ mod tests {
             );
             assert_eq!(&bytes[8..10], &u16::from(minor).to_le_bytes());
             assert_eq!(bytes[10], 128);
+        }
+    }
+
+    #[test]
+    fn randr_provider_relationships_validate_roles_in_xorg_order() {
+        use yserver_protocol::x11::randr as x11randr;
+
+        let cases: [(u8, u32, u32, u8, u32); 12] = [
+            (
+                x11randr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+                99,
+                0,
+                RANDR_BAD_PROVIDER,
+                99,
+            ),
+            (
+                x11randr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+                5,
+                99,
+                x11::error::BAD_VALUE,
+                0,
+            ),
+            (
+                x11randr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+                1,
+                99,
+                RANDR_BAD_PROVIDER,
+                99,
+            ),
+            (
+                x11randr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+                1,
+                5,
+                x11::error::BAD_VALUE,
+                0,
+            ),
+            (
+                x11randr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+                1,
+                0,
+                x11::error::BAD_IMPLEMENTATION,
+                0,
+            ),
+            (
+                x11randr::RR_SET_PROVIDER_OUTPUT_SOURCE,
+                1,
+                2,
+                x11::error::BAD_IMPLEMENTATION,
+                0,
+            ),
+            (
+                x11randr::RR_SET_PROVIDER_OFFLOAD_SINK,
+                99,
+                0,
+                RANDR_BAD_PROVIDER,
+                99,
+            ),
+            (
+                x11randr::RR_SET_PROVIDER_OFFLOAD_SINK,
+                5,
+                99,
+                x11::error::BAD_VALUE,
+                0,
+            ),
+            (
+                x11randr::RR_SET_PROVIDER_OFFLOAD_SINK,
+                3,
+                99,
+                RANDR_BAD_PROVIDER,
+                99,
+            ),
+            (
+                x11randr::RR_SET_PROVIDER_OFFLOAD_SINK,
+                3,
+                5,
+                x11::error::BAD_VALUE,
+                0,
+            ),
+            (
+                x11randr::RR_SET_PROVIDER_OFFLOAD_SINK,
+                3,
+                0,
+                x11::error::BAD_IMPLEMENTATION,
+                0,
+            ),
+            (
+                x11randr::RR_SET_PROVIDER_OFFLOAD_SINK,
+                3,
+                4,
+                x11::error::BAD_IMPLEMENTATION,
+                0,
+            ),
+        ];
+        for (minor, provider, peer_provider, error_code, error_value) in cases {
+            let mut state = ServerState::new();
+            state.randr.set_providers(vec![
+                randr_provider(1, x11randr::PROVIDER_CAPABILITY_SINK_OUTPUT),
+                randr_provider(2, x11randr::PROVIDER_CAPABILITY_SOURCE_OUTPUT),
+                randr_provider(3, x11randr::PROVIDER_CAPABILITY_SOURCE_OFFLOAD),
+                randr_provider(4, x11randr::PROVIDER_CAPABILITY_SINK_OFFLOAD),
+                randr_provider(5, 0),
+            ]);
+            let mut peer = install_client(&mut state, 1);
+            let mut backend = RecordingBackend::new();
+            let mut body = Vec::new();
+            body.extend_from_slice(&provider.to_le_bytes());
+            body.extend_from_slice(&peer_provider.to_le_bytes());
+            body.extend_from_slice(&0u32.to_le_bytes());
+            handle_randr_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(u16::from(minor)),
+                RequestHeader {
+                    opcode: 128,
+                    data: minor,
+                    length_units: 4,
+                },
+                &body,
+            )
+            .expect("process provider relationship");
+            let bytes = read_all_available(&mut peer);
+            assert_eq!(bytes[1], error_code, "minor={minor} provider={provider}");
+            assert_eq!(
+                u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+                error_value,
+                "minor={minor} provider={provider}",
+            );
+        }
+    }
+
+    #[test]
+    fn randr_known_provider_property_requests_are_explicitly_unsupported() {
+        use yserver_protocol::x11::randr as x11randr;
+
+        for minor in x11randr::RR_LIST_PROVIDER_PROPERTIES..=x11randr::RR_GET_PROVIDER_PROPERTY {
+            let mut body = randr_provider_request_body(minor, 10);
+            if minor == x11randr::RR_CONFIGURE_PROVIDER_PROPERTY {
+                // This request is variable-sized: trailing INT32 values are
+                // part of a valid request shape, not an overlong request.
+                body.extend_from_slice(&17i32.to_le_bytes());
+            }
+            let mut state = ServerState::new();
+            state.randr.set_providers(vec![randr_provider(10, 0)]);
+            let mut peer = install_client(&mut state, 1);
+            let mut backend = RecordingBackend::new();
+            handle_randr_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(u16::from(minor)),
+                RequestHeader {
+                    opcode: 128,
+                    data: minor,
+                    length_units: 1 + (body.len() / 4) as u32,
+                },
+                &body,
+            )
+            .expect("process known provider property request");
+            let bytes = read_all_available(&mut peer);
+            assert_eq!(bytes[1], x11::error::BAD_IMPLEMENTATION, "minor {minor}");
+            assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 0);
+        }
+    }
+
+    #[test]
+    fn randr_change_provider_property_pins_xorg_error_precedence() {
+        use yserver_protocol::x11::randr as x11randr;
+
+        let mut cases = Vec::new();
+        let mut bad_mode = randr_provider_request_body(x11randr::RR_CHANGE_PROVIDER_PROPERTY, 99);
+        bad_mode[13] = 99;
+        bad_mode[16..20].copy_from_slice(&1u32.to_le_bytes());
+        cases.push((bad_mode, x11::error::BAD_VALUE, 99));
+        let mut bad_format = randr_provider_request_body(x11randr::RR_CHANGE_PROVIDER_PROPERTY, 99);
+        bad_format[12] = 7;
+        bad_format[16..20].copy_from_slice(&1u32.to_le_bytes());
+        cases.push((bad_format, x11::error::BAD_VALUE, 7));
+        let mut bad_length = randr_provider_request_body(x11randr::RR_CHANGE_PROVIDER_PROPERTY, 99);
+        bad_length[16..20].copy_from_slice(&1u32.to_le_bytes());
+        cases.push((bad_length, x11::error::BAD_LENGTH, 0));
+
+        for (body, error_code, error_value) in cases {
+            let mut state = ServerState::new();
+            let mut peer = install_client(&mut state, 1);
+            let mut backend = RecordingBackend::new();
+            handle_randr_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(39),
+                RequestHeader {
+                    opcode: 128,
+                    data: x11randr::RR_CHANGE_PROVIDER_PROPERTY,
+                    length_units: 1 + (body.len() / 4) as u32,
+                },
+                &body,
+            )
+            .expect("process malformed ChangeProviderProperty");
+            let bytes = read_all_available(&mut peer);
+            assert_eq!(bytes[1], error_code);
+            assert_eq!(
+                u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+                error_value
+            );
         }
     }
 

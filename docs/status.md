@@ -130,6 +130,29 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   completion can likewise remain backend-hidden after core queues drain; each
   route change adds one small entry until backend epoch-reference accounting
   permits safe compaction.
+- **2026-08-18 PRIME RANDR provider-topology semantic replay:** RANDR now
+  exposes a stable, zero-capability provider union of every opened KMS device
+  and the selected operational `RenderDevice`. Provider XIDs use tagged
+  endpoint identities, so a render-node key cannot alias a primary-node KMS
+  key accidentally. The renderer coalesces with a KMS provider only when its
+  Vulkan-advertised primary node exactly matches that KMS device; unselected
+  metadata-only render inventory is not exposed. KMS providers are named from
+  the opened DRM primary-node basename and own exactly that device's
+  connector-registry output/CRTC XIDs, including disconnected connectors;
+  a distinct renderer owns no display resources. Thus a conventional
+  same-device pipeline advertises one provider, an Asahi-shaped AGX renderer
+  plus `apple-drm` display pipeline advertises two, headless startup with a
+  selected renderer advertises one, and a topology with neither KMS nor a
+  selected renderer advertises none. The provider projection is restored on
+  every RANDR state rebuild, so hotplug and resume cannot silently erase it.
+  `GetProviders` and `GetProviderInfo` return the stable descriptors and
+  complete variable-length topology; provider
+  relationship requests validate provider IDs and role capabilities in
+  Xorg-compatible order. All capability and association fields intentionally
+  remain empty until yserver implements cross-device source/sink transport,
+  so clients cannot configure a PRIME route that the backend cannot execute.
+  Provider properties, provider-qualified DRI3 routing, and transport remain
+  future layers.
 - **2026-08-17 PRIME device-qualified lifecycle semantic replay:** connector
   inventory, hotplug probing, and VT-resume probing now cover every
   opened DRM device and reconcile a complete `(device key, connector name)`

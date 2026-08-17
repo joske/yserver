@@ -433,9 +433,22 @@ struct SeedInferiorDraw {
 #[derive(Debug, Default)]
 pub(crate) struct RandrIdAllocator {
     next: u32,
-    providers: HashMap<crate::platform::drm::DrmDeviceKey, u32>,
+    providers: HashMap<RandrProviderEndpoint, u32>,
     connectors: HashMap<OutputKey, ConnectorEntry>,
     modes: HashMap<(u16, u16, u32), u32>,
+}
+
+/// One endpoint that can own a RANDR provider XID.
+///
+/// Keep the variants tagged even though both verified renderer identities and
+/// KMS identities ultimately contain DRM major/minor pairs. A render node and
+/// a primary node with the same raw numbers are different endpoint kinds and
+/// must never alias by accident. Same-device provider coalescing is an
+/// explicit projection decision based on Vulkan's advertised primary node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum RandrProviderEndpoint {
+    Kms(crate::platform::drm::DrmDeviceKey),
+    Render(crate::kms::render::platform::RenderDeviceId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -536,15 +549,12 @@ impl RandrIdAllocator {
         self.next
     }
 
-    pub(crate) fn provider_id_for(
-        &mut self,
-        device_key: crate::platform::drm::DrmDeviceKey,
-    ) -> u32 {
-        if let Some(id) = self.providers.get(&device_key) {
+    pub(crate) fn provider_id_for(&mut self, endpoint: RandrProviderEndpoint) -> u32 {
+        if let Some(id) = self.providers.get(&endpoint) {
             return *id;
         }
         let id = self.fresh();
-        self.providers.insert(device_key, id);
+        self.providers.insert(endpoint, id);
         id
     }
 
@@ -4705,9 +4715,7 @@ impl KmsBackend {
     /// platform bring-up; connected secondary-card connectors are registered
     /// as available but off until a RANDR client enables them.
     fn seed_initial_connector_topology(&mut self) -> io::Result<()> {
-        for device in &self.platform.devices {
-            let _ = self.randr_id_alloc.provider_id_for(device.key);
-        }
+        self.reserve_randr_provider_ids();
 
         // Preserve historical XID allocation order: active startup outputs
         // receive output/CRTC IDs before inactive secondary connectors.
@@ -4795,6 +4803,135 @@ impl KmsBackend {
         self.randr_outputs_and_modes().0
     }
 
+    /// Provider endpoint used by the selected operational renderer.
+    ///
+    /// Vulkan primary-node metadata is diagnostic, not a KMS ownership
+    /// claim. It coalesces the renderer with an existing KMS provider only
+    /// when it exactly names an opened KMS device; every other selected
+    /// renderer remains its own endpoint.
+    fn selected_render_provider_endpoint(&self) -> Option<RandrProviderEndpoint> {
+        let renderer = self.platform.selected_render_device()?;
+        if let Some(primary) = renderer.advertised_primary_node
+            && self
+                .platform
+                .devices
+                .iter()
+                .any(|device| device.key == primary)
+        {
+            return Some(RandrProviderEndpoint::Kms(primary));
+        }
+        Some(RandrProviderEndpoint::Render(renderer.id))
+    }
+
+    fn randr_provider_endpoints(&self) -> Vec<RandrProviderEndpoint> {
+        let mut endpoints = Vec::with_capacity(self.platform.devices.len().saturating_add(1));
+        if let Some(renderer) = self.selected_render_provider_endpoint() {
+            endpoints.push(renderer);
+        }
+        for device in &self.platform.devices {
+            let kms = RandrProviderEndpoint::Kms(device.key);
+            if !endpoints.contains(&kms) {
+                endpoints.push(kms);
+            }
+        }
+        endpoints
+    }
+
+    fn reserve_randr_provider_ids(&mut self) {
+        for endpoint in self.randr_provider_endpoints() {
+            let _ = self.randr_id_alloc.provider_id_for(endpoint);
+        }
+    }
+
+    fn kms_provider_name(device: &crate::kms::render::platform::KmsDevice) -> String {
+        std::path::Path::new(device.device.path())
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or_else(|| device.device.path())
+            .to_string()
+    }
+
+    fn render_provider_name(device: &crate::kms::render::platform::RenderDevice) -> String {
+        if let Some(node) = &device.render_node {
+            return node
+                .path()
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .map_or_else(|| node.path().display().to_string(), str::to_string);
+        }
+        match device.id {
+            crate::kms::render::platform::RenderDeviceId::DrmRender(key) => {
+                format!("drm-render-{key}")
+            }
+            crate::kms::render::platform::RenderDeviceId::UnverifiedFallback => {
+                "vulkan-unverified".to_string()
+            }
+        }
+    }
+
+    /// Project opened KMS devices and the selected renderer into stable RANDR
+    /// providers.
+    ///
+    /// The selected renderer coalesces with a KMS provider only when its
+    /// advertised primary node exactly matches that KMS device. Unselected
+    /// metadata-only renderer inventory is not operational and is therefore
+    /// omitted. Capabilities intentionally remain zero until a later PRIME
+    /// layer can execute source/sink transport. KMS providers own every
+    /// connector/CRTC XID allocated for their device, including connectors
+    /// that are currently disconnected; a distinct render provider owns no
+    /// display resources.
+    #[must_use]
+    pub fn randr_providers(&mut self) -> Vec<yserver_core::randr::RandrProvider> {
+        use yserver_core::randr::RandrProvider;
+
+        self.reserve_randr_provider_ids();
+        let selected_endpoint = self.selected_render_provider_endpoint();
+        let distinct_renderer = match selected_endpoint {
+            Some(endpoint @ RandrProviderEndpoint::Render(_)) => self
+                .platform
+                .selected_render_device()
+                .map(|device| (endpoint, Self::render_provider_name(device))),
+            _ => None,
+        };
+        let mut providers = Vec::with_capacity(self.randr_provider_endpoints().len());
+        for device in &self.platform.devices {
+            let provider_id = self
+                .randr_id_alloc
+                .provider_id_for(RandrProviderEndpoint::Kms(device.key));
+            let mut crtcs = Vec::new();
+            let mut outputs = Vec::new();
+            for (key, entry) in self.randr_id_alloc.entries() {
+                if key.device_key != device.key {
+                    continue;
+                }
+                crtcs.push(entry.ids.crtc_id);
+                outputs.push(entry.ids.output_id);
+            }
+            crtcs.sort_unstable();
+            outputs.sort_unstable();
+            providers.push(RandrProvider {
+                provider_id,
+                name: Self::kms_provider_name(device),
+                capabilities: 0,
+                crtcs,
+                outputs,
+                associations: Vec::new(),
+            });
+        }
+        if let Some((endpoint, name)) = distinct_renderer {
+            providers.push(RandrProvider {
+                provider_id: self.randr_id_alloc.provider_id_for(endpoint),
+                name,
+                capabilities: 0,
+                crtcs: Vec::new(),
+                outputs: Vec::new(),
+                associations: Vec::new(),
+            });
+        }
+        providers.sort_by_key(|provider| provider.provider_id);
+        providers
+    }
+
     /// RandR outputs plus the full deduped mode table.
     #[must_use]
     pub fn randr_outputs_and_modes(
@@ -4806,11 +4943,10 @@ impl KmsBackend {
         use yserver_core::randr::{ModeTiming, RandrMode, RandrOutput};
 
         // Provider ids share the same XID source as outputs, CRTCs, and modes
-        // even before providers are exposed on the wire. Reserve every opened
-        // device now so later provider identities stay stable and collision-free.
-        for device in &self.platform.devices {
-            let _ = self.randr_id_alloc.provider_id_for(device.key);
-        }
+        // even before providers are exposed on the wire. Reserve every
+        // projected endpoint now (selected renderer first, then deduplicated
+        // KMS devices) so identities stay stable and collision-free.
+        self.reserve_randr_provider_ids();
 
         let live_keys: HashSet<OutputKey> = self
             .platform
@@ -5021,10 +5157,12 @@ impl KmsBackend {
             state.randr.height_mm,
         );
         let (outputs, mode_table) = self.randr_outputs_and_modes();
+        let providers = self.randr_providers();
         let new_ts = set_time.unwrap_or(prev_ts);
         let ts_now = state.timestamp_now();
         state.randr =
             yserver_core::randr::RandrState::from_outputs_with_modes(new_ts, outputs, mode_table);
+        state.randr.set_providers(providers);
         // Carry forward the client-set logical size (from_outputs reseeds
         // it to the bbox; that is only correct at boot, where prev_screen
         // already equals the bbox).
@@ -21759,10 +21897,10 @@ fn subtract_one_rect_clip(outer: ash::vk::Rect2D, inner: ash::vk::Rect2D) -> Vec
 #[cfg(test)]
 mod tests {
     use super::{
-        KmsBackend, PaintTarget, PictureRecord, RandrIdAllocator, compute_copy_area_dst_rects,
-        compute_render_composite_clip, dri3_version_for, dst_picture_clip_by_children,
-        glx_vendor_names_for_driver, intersect_rect_with_clip, mode_timing,
-        reconcile_connector_probe, resolve_picture_for_render,
+        KmsBackend, PaintTarget, PictureRecord, RandrIdAllocator, RandrProviderEndpoint,
+        compute_copy_area_dst_rects, compute_render_composite_clip, dri3_version_for,
+        dst_picture_clip_by_children, glx_vendor_names_for_driver, intersect_rect_with_clip,
+        mode_timing, reconcile_connector_probe, resolve_picture_for_render,
         restore_primary_output_after_rebuild,
     };
     use crate::{
@@ -21770,7 +21908,9 @@ mod tests {
             backend::OutputKey,
             cpu_types::{Rectangle16, Repeat},
             render::{
-                platform::{CrtcKey, PlatformBackend},
+                platform::{
+                    ConnectorSnapshot, CrtcKey, PlatformBackend, RenderDevice, RenderDeviceId,
+                },
                 store::Storage,
             },
         },
@@ -21812,6 +21952,21 @@ mod tests {
                 device,
                 cursor: crate::kms::render::platform::KmsCursorState::new(false),
             });
+    }
+
+    fn test_render_device(id: RenderDeviceId, primary: Option<DrmDeviceKey>) -> RenderDevice {
+        RenderDevice {
+            id,
+            physical_device: ash::vk::PhysicalDevice::default(),
+            advertised_primary_node: primary,
+            advertised_render_node: match id {
+                RenderDeviceId::DrmRender(render) => Some(render),
+                RenderDeviceId::UnverifiedFallback => None,
+            },
+            render_node: None,
+            render_node_device: None,
+            syncobj_timeline: false,
+        }
     }
 
     fn test_crtc_key(device_key: DrmDeviceKey, crtc_id: u32) -> CrtcKey {
@@ -22513,21 +22668,343 @@ mod tests {
         let mut alloc = RandrIdAllocator::default();
         let first_device = test_device_key(0);
         let second_device = test_device_key(1);
-        let first_provider = alloc.provider_id_for(first_device);
+        let first_endpoint = RandrProviderEndpoint::Kms(first_device);
+        let second_endpoint = RandrProviderEndpoint::Kms(second_device);
+        let tagged_render_endpoint =
+            RandrProviderEndpoint::Render(RenderDeviceId::DrmRender(first_device));
+        let first_provider = alloc.provider_id_for(first_endpoint);
         let output = alloc.ids_for(&test_output_key(0, "DP-1"));
         let mode = alloc.mode_id(1920, 1080, 60);
-        let second_provider = alloc.provider_id_for(second_device);
+        let second_provider = alloc.provider_id_for(second_endpoint);
+        let tagged_render_provider = alloc.provider_id_for(tagged_render_endpoint);
 
-        assert_eq!(alloc.provider_id_for(first_device), first_provider);
+        assert_eq!(alloc.provider_id_for(first_endpoint), first_provider);
+        assert_eq!(
+            alloc.provider_id_for(tagged_render_endpoint),
+            tagged_render_provider
+        );
         let ids = [
             first_provider,
             output.output_id,
             output.crtc_id,
             mode,
             second_provider,
+            tagged_render_provider,
         ];
         let unique: std::collections::HashSet<u32> = ids.into_iter().collect();
         assert_eq!(unique.len(), ids.len());
+    }
+
+    #[test]
+    fn randr_provider_projection_is_per_kms_device_and_includes_disconnected_connectors() {
+        let mut backend = KmsBackend::for_tests();
+        let first_device = backend.platform.devices[0].key;
+        let second_device = test_device_key(1);
+        push_test_device(&mut backend, second_device);
+
+        let first_live = backend.platform.outputs[0].key.clone();
+        let first_disconnected = OutputKey::new(first_device, "DP-9");
+        let second_disconnected = OutputKey::new(second_device, "HDMI-A-1");
+        let first_live_ids = backend.randr_id_alloc.ids_for(&first_live);
+        let first_disconnected_ids = backend.randr_id_alloc.ids_for(&first_disconnected);
+        let second_disconnected_ids = backend.randr_id_alloc.ids_for(&second_disconnected);
+
+        let providers = backend.randr_providers();
+        assert_eq!(providers.len(), 2);
+        let first_id = backend
+            .randr_id_alloc
+            .provider_id_for(RandrProviderEndpoint::Kms(first_device));
+        let second_id = backend
+            .randr_id_alloc
+            .provider_id_for(RandrProviderEndpoint::Kms(second_device));
+        let first = providers
+            .iter()
+            .find(|provider| provider.provider_id == first_id)
+            .expect("first KMS provider");
+        let second = providers
+            .iter()
+            .find(|provider| provider.provider_id == second_id)
+            .expect("second KMS provider");
+
+        let mut expected_first_outputs =
+            vec![first_live_ids.output_id, first_disconnected_ids.output_id];
+        expected_first_outputs.sort_unstable();
+        let mut expected_first_crtcs = vec![first_live_ids.crtc_id, first_disconnected_ids.crtc_id];
+        expected_first_crtcs.sort_unstable();
+        assert_eq!(first.outputs, expected_first_outputs);
+        assert_eq!(first.crtcs, expected_first_crtcs);
+        assert_eq!(second.outputs, vec![second_disconnected_ids.output_id]);
+        assert_eq!(second.crtcs, vec![second_disconnected_ids.crtc_id]);
+        assert_eq!(first.capabilities, 0);
+        assert_eq!(second.capabilities, 0);
+        assert!(first.associations.is_empty());
+        assert!(second.associations.is_empty());
+        assert_eq!(first.name, "null");
+        assert_eq!(second.name, "null");
+    }
+
+    #[test]
+    fn randr_rebuild_restores_the_stable_provider_projection() {
+        let mut backend = KmsBackend::for_tests();
+        let second_device = test_device_key(1);
+        push_test_device(&mut backend, second_device);
+        let disconnected = OutputKey::new(second_device, "DP-2");
+        let disconnected_ids = backend.randr_id_alloc.ids_for(&disconnected);
+        let render_id = RenderDeviceId::DrmRender(test_device_key(128));
+        backend.platform.render_devices = vec![test_render_device(render_id, None)];
+        backend.platform.selected_render_device = Some(render_id);
+        let capabilities = yserver_core::server::BackendCapabilities::from_backend(&backend);
+        let (outputs, modes) = backend.randr_outputs_and_modes();
+        let (width, height) = backend.fb_dimensions();
+        let mut state =
+            ServerState::with_randr_outputs_and_modes(width, height, outputs, modes, capabilities);
+
+        backend.rebuild_randr_state(&mut state, None, false);
+        let first = state.randr.providers.clone();
+        assert_eq!(first.len(), 3);
+        assert!(
+            first
+                .iter()
+                .any(|provider| provider.outputs.contains(&disconnected_ids.output_id))
+        );
+
+        let first_provider_ids: Vec<_> =
+            first.iter().map(|provider| provider.provider_id).collect();
+        let added_key = OutputKey::new(second_device, "HDMI-A-9");
+        assert!(backend.reconcile_connector_registry(
+            &[ConnectorSnapshot {
+                key: added_key.clone(),
+                modes: Vec::new(),
+                mm_width: 0,
+                mm_height: 0,
+                edid: Vec::new(),
+                connector_type: "unknown".to_string(),
+            }],
+            &[],
+        ));
+        let added_ids = backend
+            .randr_id_alloc
+            .entry(&added_key)
+            .expect("reconciled connector entry")
+            .ids;
+
+        state.randr.providers.clear();
+        backend.rebuild_randr_state(&mut state, None, false);
+        assert_eq!(
+            state
+                .randr
+                .providers
+                .iter()
+                .map(|provider| provider.provider_id)
+                .collect::<Vec<_>>(),
+            first_provider_ids,
+            "connector allocation and rebuild must not renumber providers"
+        );
+        assert!(
+            state
+                .randr
+                .providers
+                .iter()
+                .any(|provider| provider.outputs.contains(&added_ids.output_id))
+        );
+    }
+
+    #[test]
+    fn conventional_renderer_coalesces_with_its_matching_kms_provider() {
+        let mut backend = KmsBackend::for_tests();
+        let kms_key = backend.platform.devices[0].key;
+        let selected_id = RenderDeviceId::DrmRender(test_device_key(128));
+        let unselected_id = RenderDeviceId::DrmRender(test_device_key(129));
+        backend.platform.render_devices = vec![
+            test_render_device(selected_id, Some(kms_key)),
+            test_render_device(unselected_id, None),
+        ];
+        backend.platform.selected_render_device = Some(selected_id);
+
+        let (outputs, _) = backend.randr_outputs_and_modes();
+        let providers = backend.randr_providers();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].outputs, vec![outputs[0].output_id]);
+        assert_eq!(providers[0].crtcs, vec![outputs[0].crtc_id]);
+        assert_eq!(
+            providers[0].provider_id,
+            backend
+                .randr_id_alloc
+                .provider_id_for(RandrProviderEndpoint::Kms(kms_key))
+        );
+        assert!(
+            !backend
+                .randr_id_alloc
+                .providers
+                .contains_key(&RandrProviderEndpoint::Render(selected_id)),
+            "same-device renderer must not allocate a second provider"
+        );
+        assert!(
+            !backend
+                .randr_id_alloc
+                .providers
+                .contains_key(&RandrProviderEndpoint::Render(unselected_id)),
+            "metadata-only unselected render inventory is not a provider"
+        );
+    }
+
+    #[test]
+    fn unverified_renderer_coalesces_when_its_primary_matches_kms() {
+        let mut backend = KmsBackend::for_tests();
+        let kms_key = backend.platform.devices[0].key;
+        let render_id = RenderDeviceId::UnverifiedFallback;
+        backend.platform.render_devices = vec![test_render_device(render_id, Some(kms_key))];
+        backend.platform.selected_render_device = Some(render_id);
+
+        let providers = backend.randr_providers();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(
+            providers[0].provider_id,
+            backend
+                .randr_id_alloc
+                .provider_id_for(RandrProviderEndpoint::Kms(kms_key))
+        );
+        assert!(
+            !backend
+                .randr_id_alloc
+                .providers
+                .contains_key(&RandrProviderEndpoint::Render(render_id)),
+            "coalescing keys on advertised primary identity, not RenderDeviceId"
+        );
+    }
+
+    #[test]
+    fn headless_selected_renderer_is_the_only_provider() {
+        let mut backend = KmsBackend::for_tests();
+        backend.platform.devices.clear();
+        backend.platform.outputs.clear();
+        backend.randr_id_alloc = RandrIdAllocator::default();
+        let render_id = RenderDeviceId::DrmRender(test_device_key(128));
+        backend.platform.render_devices = vec![test_render_device(render_id, None)];
+        backend.platform.selected_render_device = Some(render_id);
+
+        let providers = backend.randr_providers();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].name, "drm-render-226:128");
+        assert!(providers[0].outputs.is_empty());
+        assert!(providers[0].crtcs.is_empty());
+        assert_eq!(
+            providers[0].provider_id,
+            backend
+                .randr_id_alloc
+                .provider_id_for(RandrProviderEndpoint::Render(render_id))
+        );
+    }
+
+    #[test]
+    fn split_asahi_shape_exposes_distinct_display_and_render_providers() {
+        let mut backend = KmsBackend::for_tests();
+        let display_key = test_device_key(2);
+        let renderer_primary_key = test_device_key(0);
+        let render_id = RenderDeviceId::DrmRender(test_device_key(128));
+        backend.platform.devices[0].key = display_key;
+        backend.platform.outputs[0].key.device_key = display_key;
+        backend.randr_id_alloc = RandrIdAllocator::default();
+        backend.platform.render_devices =
+            vec![test_render_device(render_id, Some(renderer_primary_key))];
+        backend.platform.selected_render_device = Some(render_id);
+
+        let (outputs, _) = backend.randr_outputs_and_modes();
+        let providers = backend.randr_providers();
+        assert_eq!(backend.platform.devices.len(), 1);
+        assert_eq!(backend.platform.render_devices.len(), 1);
+        assert_eq!(providers.len(), 2);
+        let display_id = backend
+            .randr_id_alloc
+            .provider_id_for(RandrProviderEndpoint::Kms(display_key));
+        let renderer_id = backend
+            .randr_id_alloc
+            .provider_id_for(RandrProviderEndpoint::Render(render_id));
+        let display = providers
+            .iter()
+            .find(|provider| provider.provider_id == display_id)
+            .expect("apple-drm display provider");
+        let renderer = providers
+            .iter()
+            .find(|provider| provider.provider_id == renderer_id)
+            .expect("AGX render provider");
+        assert_eq!(display.outputs, vec![outputs[0].output_id]);
+        assert_eq!(display.crtcs, vec![outputs[0].crtc_id]);
+        assert!(renderer.outputs.is_empty());
+        assert!(renderer.crtcs.is_empty());
+        assert_eq!(renderer.name, "drm-render-226:128");
+    }
+
+    #[test]
+    fn provider_order_is_deterministic_and_reserves_selected_renderer_first() {
+        let mut backend = KmsBackend::for_tests();
+        let display_key = test_device_key(2);
+        let render_id = RenderDeviceId::DrmRender(test_device_key(128));
+        backend.platform.devices[0].key = display_key;
+        backend.platform.outputs[0].key.device_key = display_key;
+        backend.randr_id_alloc = RandrIdAllocator::default();
+        backend.platform.render_devices =
+            vec![test_render_device(render_id, Some(test_device_key(0)))];
+        backend.platform.selected_render_device = Some(render_id);
+
+        let (outputs, _) = backend.randr_outputs_and_modes();
+        let providers = backend.randr_providers();
+        let providers_again = backend.randr_providers();
+        let renderer_xid = backend
+            .randr_id_alloc
+            .provider_id_for(RandrProviderEndpoint::Render(render_id));
+        let display_xid = backend
+            .randr_id_alloc
+            .provider_id_for(RandrProviderEndpoint::Kms(display_key));
+
+        assert!(renderer_xid < display_xid);
+        assert!(display_xid < outputs[0].output_id);
+        assert!(display_xid < outputs[0].crtc_id);
+        assert_eq!(
+            providers
+                .iter()
+                .map(|provider| provider.provider_id)
+                .collect::<Vec<_>>(),
+            vec![renderer_xid, display_xid]
+        );
+        assert_eq!(providers_again, providers);
+    }
+
+    #[test]
+    fn unverified_selected_renderer_has_a_tagged_stable_provider() {
+        let mut backend = KmsBackend::for_tests();
+        backend.platform.devices.clear();
+        backend.platform.outputs.clear();
+        backend.randr_id_alloc = RandrIdAllocator::default();
+        let render_id = RenderDeviceId::UnverifiedFallback;
+        backend.platform.render_devices = vec![test_render_device(render_id, None)];
+        backend.platform.selected_render_device = Some(render_id);
+
+        let first = backend.randr_providers();
+        let second = backend.randr_providers();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].name, "vulkan-unverified");
+        assert!(first[0].outputs.is_empty());
+        assert!(first[0].crtcs.is_empty());
+        assert_eq!(
+            first[0].provider_id,
+            backend
+                .randr_id_alloc
+                .provider_id_for(RandrProviderEndpoint::Render(render_id))
+        );
+    }
+
+    #[test]
+    fn no_kms_and_no_selected_renderer_has_no_providers() {
+        let mut backend = KmsBackend::for_tests();
+        backend.platform.devices.clear();
+        backend.platform.outputs.clear();
+        backend.platform.render_devices.clear();
+        backend.platform.selected_render_device = None;
+        backend.randr_id_alloc = RandrIdAllocator::default();
+
+        assert!(backend.randr_providers().is_empty());
     }
 
     #[test]
