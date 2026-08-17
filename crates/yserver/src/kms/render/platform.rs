@@ -869,6 +869,19 @@ fn scanout_pool_needs_reallocation(
     })
 }
 
+fn mode_via_connector_handle<T: Copy>(
+    connector: ::drm::control::connector::Handle,
+    mode_spec: yserver_core::backend::ModeSpec,
+    query_modes: impl FnOnce(::drm::control::connector::Handle) -> io::Result<Vec<T>>,
+    mode_timing: impl Fn(&T) -> (u16, u16, u32),
+) -> io::Result<Option<T>> {
+    let modes = query_modes(connector)?;
+    Ok(modes.into_iter().find(|mode| {
+        let (width, height, vrefresh) = mode_timing(mode);
+        width == mode_spec.width && height == mode_spec.height && vrefresh == mode_spec.vrefresh
+    }))
+}
+
 /// One opened display/KMS device. Renderer identity and render-node resources
 /// deliberately live in `RenderDevice` instead.
 pub(crate) struct KmsDevice {
@@ -3885,39 +3898,37 @@ impl PlatformBackend {
             || output.picked.height != mode_spec.height
             || output.picked.vrefresh != mode_spec.vrefresh
         {
-            // Client requested a non-picked mode.  We need to re-derive
-            // the DRM mode for it.  The cleanest safe path: re-run
-            // discover_outputs limited to this connector is expensive;
-            // instead we call get_connector inline to fetch the full
-            // DRM mode list, then match by (width, height, vrefresh).
+            // Client requested a non-picked mode. Fetch the full DRM mode
+            // list through the typed connector handle already carried by
+            // `Output`; connector display names are protocol/UI data and
+            // are not DRM object identity (e.g. Xorg `HDMI-1` versus
+            // drm-rs `HDMI-A-1`).
             use ::drm::control::Device as ControlDevice;
-            let resources = device.resource_handles().map_err(|e| {
-                io::Error::other(format!("enable_connector: resource_handles failed: {e}"))
-            })?;
-            let mut drm_mode_opt: Option<::drm::control::Mode> = None;
-            'outer: for &handle in resources.connectors() {
-                let info = match device.get_connector(handle, false) {
-                    Ok(i) => i,
-                    Err(_) => continue,
-                };
-                if format!("{info}") != connector {
-                    continue;
-                }
-                for m in info.modes() {
-                    let (w, h) = m.size();
-                    if w == mode_spec.width
-                        && h == mode_spec.height
-                        && m.vrefresh() == mode_spec.vrefresh
-                    {
-                        drm_mode_opt = Some(*m);
-                        break 'outer;
-                    }
-                }
-            }
+            let drm_mode_opt = mode_via_connector_handle(
+                output.connector,
+                mode_spec,
+                |connector_handle| {
+                    device
+                        .get_connector(connector_handle, false)
+                        .map(|info| info.modes().to_vec())
+                        .map_err(|e| {
+                            io::Error::new(
+                                e.kind(),
+                                format!(
+                                    "connector {connector} ({connector_handle:?}): get_connector failed: {e}"
+                                ),
+                            )
+                        })
+                },
+                |mode| {
+                    let (width, height) = mode.size();
+                    (width, height, mode.vrefresh())
+                },
+            )?;
             let drm_mode = drm_mode_opt.ok_or_else(|| {
                 io::Error::other(format!(
-                    "connector {connector}: DRM mode {}×{}@{} not found via kernel",
-                    mode_spec.width, mode_spec.height, mode_spec.vrefresh
+                    "connector {connector} ({:?}): DRM mode {}×{}@{} not found via kernel",
+                    output.connector, mode_spec.width, mode_spec.height, mode_spec.vrefresh
                 ))
             })?;
             output.mode = drm_mode;
@@ -4728,6 +4739,80 @@ mod tests {
 
     fn drm_key(minor: u32) -> crate::platform::drm::DrmDeviceKey {
         crate::platform::drm::DrmDeviceKey { major: 226, minor }
+    }
+
+    #[test]
+    fn non_picked_mode_lookup_uses_the_carried_connector_handle() {
+        let connector = ::drm::control::from_u32(17).expect("non-zero connector handle");
+        let protocol_name = "HDMI-1";
+        let drm_diagnostic_name = "HDMI-A-1";
+        assert_ne!(protocol_name, drm_diagnostic_name);
+
+        let selected = mode_via_connector_handle(
+            connector,
+            yserver_core::backend::ModeSpec {
+                width: 1920,
+                height: 1080,
+                vrefresh: 60,
+            },
+            |queried| {
+                assert_eq!(queried, connector);
+                Ok(vec![(1280_u16, 720_u16, 60_u32), (1920, 1080, 60)])
+            },
+            |mode| *mode,
+        )
+        .expect("connector query should succeed");
+
+        assert_eq!(selected, Some((1920, 1080, 60)));
+    }
+
+    #[test]
+    fn connector_handle_mode_lookup_preserves_query_error_kind() {
+        let connector = ::drm::control::from_u32(17).expect("non-zero connector handle");
+        let error = mode_via_connector_handle::<(u16, u16, u32)>(
+            connector,
+            yserver_core::backend::ModeSpec {
+                width: 1920,
+                height: 1080,
+                vrefresh: 60,
+            },
+            |_| {
+                Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "injected query failure",
+                ))
+            },
+            |mode| *mode,
+        )
+        .expect_err("query failure must propagate");
+
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn equal_raw_connector_handles_stay_scoped_to_the_output_device_key() {
+        let mut platform = PlatformBackend::for_tests();
+        let first_key = platform.devices[0].key;
+        let second_key = drm_key(7);
+        platform.devices.push(test_kms_device(second_key, false));
+
+        let first = test_active_output_for(first_key, "HDMI-1", 17);
+        let second = test_active_output_for(second_key, "HDMI-1", 17);
+        assert_eq!(first.output.connector, second.output.connector);
+        assert_eq!(
+            platform
+                .device_for_output(&first.key)
+                .expect("first output device")
+                .key,
+            first_key
+        );
+        assert_eq!(
+            platform
+                .device_for_output(&second.key)
+                .expect("second output device")
+                .key,
+            second_key
+        );
     }
 
     #[test]

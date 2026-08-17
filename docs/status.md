@@ -33,6 +33,16 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-08-18 connector-handle mode resolution:** RANDR requests for a
+  non-preferred mode now query the exact typed DRM connector handle carried by
+  the freshly discovered `Output` on its owning KMS device. Protocol-facing
+  names remain presentation data and are never reinterpreted as kernel object
+  identity, fixing the Xorg-style `HDMI-1` versus drm-rs `HDMI-A-1` mismatch.
+  Equal raw connector handles on different DRM devices remain isolated by the
+  device-qualified `OutputKey`. The requested kernel mode is still selected by the
+  existing width, height, and integer-refresh tuple; exact timing identity is
+  a separate concern. Focused tests cover name-independent handle lookup,
+  device-local raw-handle collisions, and query-error propagation.
 - **2026-08-18 ordered multi-KMS override:** `YSERVER_DRM_DEVICES` accepts a
   comma-separated list of KMS primary-node paths and takes precedence over the
   compatible singular `YSERVER_DRM_DEVICE`. Commas preserve the colons in
