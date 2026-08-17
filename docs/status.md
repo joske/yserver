@@ -33,6 +33,27 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-08-18 conservative PRIME route policy:** scanout-pool creation now
+  classifies the previously recorded route evidence as `Compatible`,
+  `Incompatible`, or `Unknown`. Same-device routes preserve their established
+  allocator unconditionally, and an unknown renderer/KMS relationship remains
+  attemptable. A known-different route is rejected before its first BO is
+  allocated only when `VK_KHR_external_memory_fd` is conclusively unavailable,
+  or when KMS positively reports neither PRIME export for output-owned GBM nor
+  PRIME import for renderer-owned Vulkan allocations. Either usable direction
+  keeps the route compatible. Missing `IN_FORMATS`, no advertised shared
+  modifier/linear layout, and PRIME or Vulkan query failures remain `Unknown`
+  and reach the real allocation/import attempts. GBM-device creation failure
+  likewise makes the output-owned direction `Unknown`; a proven renderer-owned
+  direction can still keep the aggregate route compatible. GBM availability is
+  observed before the final verdict so an
+  output-owned-only route is not mislabeled compatible after GBM creation
+  fails, but no BO, GEM handle, framebuffer, or Vulkan scanout image exists at
+  the rejection boundary. The verdict never filters or reorders the existing
+  GBM-first, Vulkan-modifier, padded-linear, explicit-linear, and legacy-linear
+  candidate sequence. Focused policy tests cover the complete direction-state
+  matrix, same/unknown relationship bypasses, asymmetric Asahi-shaped routes,
+  layout/query uncertainty, GBM failure, and paired blocker diagnostics.
 - **2026-08-18 PRIME renderer-to-KMS scanout-route qualification:** every
   live output and `ScanoutBoPool` now records one `ScanoutRoute` from the
   selected `RenderDeviceId` to the output's DRM-primary `DrmDeviceKey`.

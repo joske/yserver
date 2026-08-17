@@ -74,7 +74,7 @@ use drm::{
 type GbmDevice = gbm::Device<Rc<crate::drm::Device>>;
 
 use super::device::VkContext;
-use crate::kms::scanout_route::ScanoutRoute;
+use crate::kms::scanout_route::{RenderKmsRelationship, ScanoutRoute};
 
 /// Per-bo phase. The lifecycle is roughly
 /// `Free → Recording → Submitted → Pending → OnScreen → Retiring → Free`.
@@ -344,6 +344,9 @@ pub struct ScanoutBoPool {
     /// directions. Real GBM/Vulkan allocation and import remain the source of
     /// truth; these observations never filter or reorder allocation plans.
     pub(crate) metadata: DmabufScanoutMetadata,
+    /// Aggregate policy applied to `metadata`. `Unknown` remains attemptable;
+    /// only a conclusively `Incompatible` known-different route is rejected.
+    pub(crate) verdict: DmabufScanoutVerdict,
     /// GBM device on the pool's KMS DRM fd. Populated when
     /// `gbm_create_device` succeeds; individual BOs use this to
     /// allocate driver-side scanout-layout buffers (ecosystem-
@@ -422,6 +425,65 @@ pub(crate) struct DmabufScanoutMetadata {
     pub(crate) vulkan_external_memory_fd: ScanoutMetadataSupport,
     pub(crate) output_owned: DmabufDirectionMetadata,
     pub(crate) renderer_owned: DmabufDirectionMetadata,
+}
+
+/// One conclusively unavailable DMA-BUF allocation direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DmabufDirectionIncompatibility {
+    OutputOwnedKmsPrimeExportUnsupported,
+    RendererOwnedKmsPrimeImportUnsupported,
+}
+
+/// Metadata that conclusively rules out a known-different scanout route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DmabufScanoutIncompatibility {
+    VulkanExternalMemoryFdUnavailable,
+    BothAllocationDirectionsUnavailable {
+        output_owned: DmabufDirectionIncompatibility,
+        renderer_owned: DmabufDirectionIncompatibility,
+    },
+}
+
+/// Missing or inconclusive evidence that must preserve the real allocation
+/// attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DmabufScanoutUncertainty {
+    RenderKmsRelationshipUnknown,
+    VulkanExternalMemoryFdUnknown,
+    OutputOwnedGbmUnavailable,
+    OutputOwnedKmsPrimeExportUnknown,
+    RendererOwnedKmsPrimeImportUnknown,
+    OutputOwnedLayoutMetadataIncomplete,
+    RendererOwnedLayoutMetadataIncomplete,
+    OutputOwnedNoAdvertisedSharedLayout,
+    RendererOwnedNoAdvertisedSharedLayout,
+}
+
+/// Aggregate metadata-only route policy.
+///
+/// `Compatible` means either the same-device policy preserves established
+/// behavior or at least one direction has the advertised prerequisites. It is
+/// not proof that a concrete allocation will succeed. `Incompatible` is
+/// reserved for conclusive blockers. `Unknown` always reaches the established
+/// real allocation attempts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DmabufScanoutVerdict {
+    Compatible,
+    Incompatible(DmabufScanoutIncompatibility),
+    Unknown(Vec<DmabufScanoutUncertainty>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DmabufDirectionVerdict {
+    Supported,
+    Unsupported(DmabufDirectionIncompatibility),
+    Unknown(DmabufScanoutUncertainty),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DmabufAllocationDirection {
+    OutputOwned,
+    RendererOwned,
 }
 
 const DRM_PRIME_CAP_IMPORT: u64 = 1 << 0;
@@ -593,6 +655,151 @@ fn build_dmabuf_scanout_metadata(
             linear: renderer_owned_linear,
         },
     }
+}
+
+fn classify_direction_metadata(
+    direction: DmabufAllocationDirection,
+    metadata: &DmabufDirectionMetadata,
+    output_owned_gbm: ScanoutMetadataSupport,
+) -> DmabufDirectionVerdict {
+    use ScanoutMetadataSupport::{Supported, Unknown, Unsupported};
+
+    let (prime_unsupported, prime_unknown, layout_incomplete, no_shared_layout) = match direction {
+        DmabufAllocationDirection::OutputOwned => (
+            DmabufDirectionIncompatibility::OutputOwnedKmsPrimeExportUnsupported,
+            DmabufScanoutUncertainty::OutputOwnedKmsPrimeExportUnknown,
+            DmabufScanoutUncertainty::OutputOwnedLayoutMetadataIncomplete,
+            DmabufScanoutUncertainty::OutputOwnedNoAdvertisedSharedLayout,
+        ),
+        DmabufAllocationDirection::RendererOwned => (
+            DmabufDirectionIncompatibility::RendererOwnedKmsPrimeImportUnsupported,
+            DmabufScanoutUncertainty::RendererOwnedKmsPrimeImportUnknown,
+            DmabufScanoutUncertainty::RendererOwnedLayoutMetadataIncomplete,
+            DmabufScanoutUncertainty::RendererOwnedNoAdvertisedSharedLayout,
+        ),
+    };
+
+    match metadata.kms_prime {
+        Unsupported => return DmabufDirectionVerdict::Unsupported(prime_unsupported),
+        Unknown => return DmabufDirectionVerdict::Unknown(prime_unknown),
+        Supported => {}
+    }
+
+    if direction == DmabufAllocationDirection::OutputOwned
+        && output_owned_gbm != ScanoutMetadataSupport::Supported
+    {
+        return DmabufDirectionVerdict::Unknown(
+            DmabufScanoutUncertainty::OutputOwnedGbmUnavailable,
+        );
+    }
+
+    if metadata.modifier_path == Supported || metadata.linear.path == Supported {
+        DmabufDirectionVerdict::Supported
+    } else if metadata.modifier_path == Unknown || metadata.linear.path == Unknown {
+        DmabufDirectionVerdict::Unknown(layout_incomplete)
+    } else {
+        // Even complete advertised metadata cannot prove that the historical
+        // runtime fallback will fail. Preserve original 07's broad attempt.
+        DmabufDirectionVerdict::Unknown(no_shared_layout)
+    }
+}
+
+fn classify_route_from_direction_verdicts(
+    relationship: RenderKmsRelationship,
+    external_memory_fd: ScanoutMetadataSupport,
+    output_owned: DmabufDirectionVerdict,
+    renderer_owned: DmabufDirectionVerdict,
+) -> DmabufScanoutVerdict {
+    use DmabufDirectionVerdict::{Supported, Unknown, Unsupported};
+
+    match relationship {
+        RenderKmsRelationship::Same => return DmabufScanoutVerdict::Compatible,
+        RenderKmsRelationship::Unknown => {
+            return DmabufScanoutVerdict::Unknown(vec![
+                DmabufScanoutUncertainty::RenderKmsRelationshipUnknown,
+            ]);
+        }
+        RenderKmsRelationship::Different => {}
+    }
+
+    match external_memory_fd {
+        ScanoutMetadataSupport::Unsupported => {
+            return DmabufScanoutVerdict::Incompatible(
+                DmabufScanoutIncompatibility::VulkanExternalMemoryFdUnavailable,
+            );
+        }
+        ScanoutMetadataSupport::Unknown => {
+            return DmabufScanoutVerdict::Unknown(vec![
+                DmabufScanoutUncertainty::VulkanExternalMemoryFdUnknown,
+            ]);
+        }
+        ScanoutMetadataSupport::Supported => {}
+    }
+
+    match (output_owned, renderer_owned) {
+        (Supported, _) | (_, Supported) => DmabufScanoutVerdict::Compatible,
+        (Unsupported(output_owned), Unsupported(renderer_owned)) => {
+            DmabufScanoutVerdict::Incompatible(
+                DmabufScanoutIncompatibility::BothAllocationDirectionsUnavailable {
+                    output_owned,
+                    renderer_owned,
+                },
+            )
+        }
+        (output_owned, renderer_owned) => {
+            let mut uncertainty = Vec::with_capacity(2);
+            if let Unknown(reason) = output_owned {
+                uncertainty.push(reason);
+            }
+            if let Unknown(reason) = renderer_owned {
+                uncertainty.push(reason);
+            }
+            debug_assert!(
+                !uncertainty.is_empty(),
+                "all non-unknown direction pairs were handled above"
+            );
+            DmabufScanoutVerdict::Unknown(uncertainty)
+        }
+    }
+}
+
+fn classify_dmabuf_scanout_route(
+    route: ScanoutRoute,
+    metadata: &DmabufScanoutMetadata,
+    output_owned_gbm: ScanoutMetadataSupport,
+) -> DmabufScanoutVerdict {
+    classify_route_from_direction_verdicts(
+        route.relationship,
+        metadata.vulkan_external_memory_fd,
+        classify_direction_metadata(
+            DmabufAllocationDirection::OutputOwned,
+            &metadata.output_owned,
+            output_owned_gbm,
+        ),
+        classify_direction_metadata(
+            DmabufAllocationDirection::RendererOwned,
+            &metadata.renderer_owned,
+            output_owned_gbm,
+        ),
+    )
+}
+
+fn incompatible_route_error(
+    route: ScanoutRoute,
+    metadata: &DmabufScanoutMetadata,
+    verdict: &DmabufScanoutVerdict,
+) -> Option<io::Error> {
+    if route.relationship != RenderKmsRelationship::Different {
+        return None;
+    }
+    let DmabufScanoutVerdict::Incompatible(reason) = verdict else {
+        return None;
+    };
+    Some(io::Error::other(format!(
+        "dma-buf scanout route {route:?} is conclusively incompatible: {reason:?}; \
+         output-owned={:?}; renderer-owned={:?}",
+        metadata.output_owned, metadata.renderer_owned,
+    )))
 }
 
 fn probe_dmabuf_scanout_metadata(
@@ -1090,6 +1297,19 @@ impl ScanoutBoPool {
                 None
             }
         };
+        let output_owned_gbm = if gbm_device.is_some() {
+            ScanoutMetadataSupport::Supported
+        } else {
+            ScanoutMetadataSupport::Unknown
+        };
+        let verdict = classify_dmabuf_scanout_route(route, &metadata, output_owned_gbm);
+        log::info!(
+            "dma-buf scanout policy for {route:?}: gbm={output_owned_gbm:?} verdict={verdict:?}"
+        );
+        if let Some(error) = incompatible_route_error(route, &metadata, &verdict) {
+            return Err(error);
+        }
+
         let mut bos = Vec::with_capacity(count);
         for _ in 0..count {
             bos.push(ScanoutBo::allocate(
@@ -1107,6 +1327,7 @@ impl ScanoutBoPool {
             height,
             route,
             metadata,
+            verdict,
             gbm_device,
         })
     }
@@ -2508,6 +2729,89 @@ mod tests {
     const TILED_A: u64 = 0x0200_0000_0000_0008;
     const TILED_B: u64 = 0x0200_0000_0000_000a;
 
+    fn test_route(relationship: RenderKmsRelationship) -> ScanoutRoute {
+        ScanoutRoute::new(
+            crate::kms::scanout_route::RenderDeviceId::DrmRender(
+                crate::platform::drm::DrmDeviceKey {
+                    major: 226,
+                    minor: 128,
+                },
+            ),
+            crate::platform::drm::DrmDeviceKey {
+                major: 226,
+                minor: 1,
+            },
+            relationship,
+        )
+    }
+
+    fn test_direction_metadata(
+        kms_prime: ScanoutMetadataSupport,
+        modifier_path: ScanoutMetadataSupport,
+        linear_path: ScanoutMetadataSupport,
+    ) -> DmabufDirectionMetadata {
+        let kms_layout = match linear_path {
+            ScanoutMetadataSupport::Supported => KmsLinearLayout::ExplicitModifier,
+            ScanoutMetadataSupport::Unsupported => KmsLinearLayout::NotAdvertised,
+            ScanoutMetadataSupport::Unknown => KmsLinearLayout::LegacyAddfb,
+        };
+        DmabufDirectionMetadata {
+            kms_prime,
+            vulkan_modifiers: modifier_path,
+            modifiers: (modifier_path == ScanoutMetadataSupport::Supported)
+                .then_some(TILED_A)
+                .into_iter()
+                .collect(),
+            modifier_path,
+            linear: DmabufLinearMetadata {
+                vulkan: linear_path,
+                kms_layout,
+                path: linear_path,
+            },
+        }
+    }
+
+    fn test_scanout_metadata(
+        external_memory_fd: ScanoutMetadataSupport,
+        output_owned: DmabufDirectionMetadata,
+        renderer_owned: DmabufDirectionMetadata,
+    ) -> DmabufScanoutMetadata {
+        DmabufScanoutMetadata {
+            vulkan_external_memory_fd: external_memory_fd,
+            output_owned,
+            renderer_owned,
+        }
+    }
+
+    fn test_direction_verdict(
+        status: ScanoutMetadataSupport,
+        direction: DmabufAllocationDirection,
+    ) -> DmabufDirectionVerdict {
+        match (status, direction) {
+            (ScanoutMetadataSupport::Supported, _) => DmabufDirectionVerdict::Supported,
+            (ScanoutMetadataSupport::Unsupported, DmabufAllocationDirection::OutputOwned) => {
+                DmabufDirectionVerdict::Unsupported(
+                    DmabufDirectionIncompatibility::OutputOwnedKmsPrimeExportUnsupported,
+                )
+            }
+            (ScanoutMetadataSupport::Unsupported, DmabufAllocationDirection::RendererOwned) => {
+                DmabufDirectionVerdict::Unsupported(
+                    DmabufDirectionIncompatibility::RendererOwnedKmsPrimeImportUnsupported,
+                )
+            }
+            (ScanoutMetadataSupport::Unknown, DmabufAllocationDirection::OutputOwned) => {
+                DmabufDirectionVerdict::Unknown(
+                    DmabufScanoutUncertainty::OutputOwnedLayoutMetadataIncomplete,
+                )
+            }
+            (ScanoutMetadataSupport::Unknown, DmabufAllocationDirection::RendererOwned) => {
+                DmabufDirectionVerdict::Unknown(
+                    DmabufScanoutUncertainty::RendererOwnedLayoutMetadataIncomplete,
+                )
+            }
+        }
+    }
+
     #[test]
     fn prime_capability_bits_keep_import_and_export_distinct() {
         assert_eq!(
@@ -2671,6 +2975,276 @@ mod tests {
                 ScanoutMetadataSupport::Supported,
             ),
             ScanoutMetadataSupport::Unknown
+        );
+    }
+
+    #[test]
+    fn different_route_blocks_only_when_both_directions_are_unsupported() {
+        use ScanoutMetadataSupport::{Supported, Unknown, Unsupported};
+
+        for output_status in [Supported, Unsupported, Unknown] {
+            for renderer_status in [Supported, Unsupported, Unknown] {
+                let verdict = classify_route_from_direction_verdicts(
+                    RenderKmsRelationship::Different,
+                    Supported,
+                    test_direction_verdict(output_status, DmabufAllocationDirection::OutputOwned),
+                    test_direction_verdict(
+                        renderer_status,
+                        DmabufAllocationDirection::RendererOwned,
+                    ),
+                );
+                let should_block = output_status == Unsupported && renderer_status == Unsupported;
+                assert_eq!(
+                    matches!(verdict, DmabufScanoutVerdict::Incompatible(_)),
+                    should_block,
+                    "output={output_status:?} renderer={renderer_status:?} verdict={verdict:?}"
+                );
+                if output_status == Supported || renderer_status == Supported {
+                    assert_eq!(verdict, DmabufScanoutVerdict::Compatible);
+                } else if !should_block {
+                    assert!(matches!(verdict, DmabufScanoutVerdict::Unknown(_)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn same_and_unknown_relationships_ignore_every_direction_status() {
+        use ScanoutMetadataSupport::{Supported, Unknown, Unsupported};
+
+        for external_memory_fd in [Supported, Unsupported, Unknown] {
+            for output_status in [Supported, Unsupported, Unknown] {
+                for renderer_status in [Supported, Unsupported, Unknown] {
+                    let output = test_direction_verdict(
+                        output_status,
+                        DmabufAllocationDirection::OutputOwned,
+                    );
+                    let renderer = test_direction_verdict(
+                        renderer_status,
+                        DmabufAllocationDirection::RendererOwned,
+                    );
+                    assert_eq!(
+                        classify_route_from_direction_verdicts(
+                            RenderKmsRelationship::Same,
+                            external_memory_fd,
+                            output,
+                            renderer,
+                        ),
+                        DmabufScanoutVerdict::Compatible,
+                    );
+                    assert_eq!(
+                        classify_route_from_direction_verdicts(
+                            RenderKmsRelationship::Unknown,
+                            external_memory_fd,
+                            output,
+                            renderer,
+                        ),
+                        DmabufScanoutVerdict::Unknown(vec![
+                            DmabufScanoutUncertainty::RenderKmsRelationshipUnknown,
+                        ]),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn asahi_shaped_export_only_or_import_only_routes_remain_attemptable() {
+        use ScanoutMetadataSupport::{Supported, Unsupported};
+
+        let output_owned_only = test_scanout_metadata(
+            Supported,
+            test_direction_metadata(Supported, Supported, Unsupported),
+            test_direction_metadata(Unsupported, Unsupported, Unsupported),
+        );
+        assert_eq!(
+            classify_dmabuf_scanout_route(
+                test_route(RenderKmsRelationship::Different),
+                &output_owned_only,
+                Supported,
+            ),
+            DmabufScanoutVerdict::Compatible,
+        );
+
+        let renderer_owned_only = test_scanout_metadata(
+            Supported,
+            test_direction_metadata(Unsupported, Unsupported, Unsupported),
+            test_direction_metadata(Supported, Supported, Unsupported),
+        );
+        assert_eq!(
+            classify_dmabuf_scanout_route(
+                test_route(RenderKmsRelationship::Different),
+                &renderer_owned_only,
+                Supported,
+            ),
+            DmabufScanoutVerdict::Compatible,
+        );
+    }
+
+    #[test]
+    fn no_shared_layout_and_query_uncertainty_still_attempt() {
+        use ScanoutMetadataSupport::{Supported, Unknown, Unsupported};
+
+        let no_shared_layout = test_scanout_metadata(
+            Supported,
+            test_direction_metadata(Supported, Unsupported, Unsupported),
+            test_direction_metadata(Supported, Unsupported, Unsupported),
+        );
+        let verdict = classify_dmabuf_scanout_route(
+            test_route(RenderKmsRelationship::Different),
+            &no_shared_layout,
+            Supported,
+        );
+        assert_eq!(
+            verdict,
+            DmabufScanoutVerdict::Unknown(vec![
+                DmabufScanoutUncertainty::OutputOwnedNoAdvertisedSharedLayout,
+                DmabufScanoutUncertainty::RendererOwnedNoAdvertisedSharedLayout,
+            ])
+        );
+
+        let query_unknown = test_scanout_metadata(
+            Supported,
+            test_direction_metadata(Unknown, Unknown, Unknown),
+            test_direction_metadata(Unknown, Unknown, Unknown),
+        );
+        assert!(matches!(
+            classify_dmabuf_scanout_route(
+                test_route(RenderKmsRelationship::Different),
+                &query_unknown,
+                Unknown,
+            ),
+            DmabufScanoutVerdict::Unknown(_)
+        ));
+    }
+
+    #[test]
+    fn gbm_unavailable_makes_output_owned_unknown_but_prime_negative_dominates() {
+        use ScanoutMetadataSupport::{Supported, Unknown, Unsupported};
+
+        let output_only = test_scanout_metadata(
+            Supported,
+            test_direction_metadata(Supported, Supported, Unsupported),
+            test_direction_metadata(Unsupported, Unsupported, Unsupported),
+        );
+        assert_eq!(
+            classify_dmabuf_scanout_route(
+                test_route(RenderKmsRelationship::Different),
+                &output_only,
+                Unknown,
+            ),
+            DmabufScanoutVerdict::Unknown(vec![
+                DmabufScanoutUncertainty::OutputOwnedGbmUnavailable,
+            ])
+        );
+        assert_eq!(
+            classify_dmabuf_scanout_route(
+                test_route(RenderKmsRelationship::Same),
+                &output_only,
+                Unknown,
+            ),
+            DmabufScanoutVerdict::Compatible,
+        );
+        assert_eq!(
+            classify_dmabuf_scanout_route(
+                test_route(RenderKmsRelationship::Unknown),
+                &output_only,
+                Unknown,
+            ),
+            DmabufScanoutVerdict::Unknown(vec![
+                DmabufScanoutUncertainty::RenderKmsRelationshipUnknown,
+            ]),
+        );
+
+        let neither_prime_direction = test_scanout_metadata(
+            Supported,
+            test_direction_metadata(Unsupported, Unsupported, Unsupported),
+            test_direction_metadata(Unsupported, Unsupported, Unsupported),
+        );
+        assert!(matches!(
+            classify_dmabuf_scanout_route(
+                test_route(RenderKmsRelationship::Different),
+                &neither_prime_direction,
+                Unknown,
+            ),
+            DmabufScanoutVerdict::Incompatible(
+                DmabufScanoutIncompatibility::BothAllocationDirectionsUnavailable { .. }
+            )
+        ));
+    }
+
+    #[test]
+    fn external_memory_fd_absence_blocks_only_known_different_routes() {
+        use ScanoutMetadataSupport::{Supported, Unknown, Unsupported};
+
+        let supported_direction =
+            test_direction_verdict(Supported, DmabufAllocationDirection::OutputOwned);
+        let unknown_direction =
+            test_direction_verdict(Unknown, DmabufAllocationDirection::RendererOwned);
+        assert_eq!(
+            classify_route_from_direction_verdicts(
+                RenderKmsRelationship::Different,
+                Unsupported,
+                supported_direction,
+                unknown_direction,
+            ),
+            DmabufScanoutVerdict::Incompatible(
+                DmabufScanoutIncompatibility::VulkanExternalMemoryFdUnavailable,
+            )
+        );
+        assert_eq!(
+            classify_route_from_direction_verdicts(
+                RenderKmsRelationship::Same,
+                Unsupported,
+                supported_direction,
+                unknown_direction,
+            ),
+            DmabufScanoutVerdict::Compatible,
+        );
+        assert_eq!(
+            classify_route_from_direction_verdicts(
+                RenderKmsRelationship::Different,
+                Unknown,
+                supported_direction,
+                unknown_direction,
+            ),
+            DmabufScanoutVerdict::Unknown(vec![
+                DmabufScanoutUncertainty::VulkanExternalMemoryFdUnknown,
+            ]),
+        );
+        assert!(matches!(
+            classify_route_from_direction_verdicts(
+                RenderKmsRelationship::Unknown,
+                Unsupported,
+                supported_direction,
+                unknown_direction,
+            ),
+            DmabufScanoutVerdict::Unknown(_)
+        ));
+    }
+
+    #[test]
+    fn incompatible_gate_diagnostic_names_route_and_both_direction_blockers() {
+        use ScanoutMetadataSupport::{Supported, Unsupported};
+
+        let route = test_route(RenderKmsRelationship::Different);
+        let metadata = test_scanout_metadata(
+            Supported,
+            test_direction_metadata(Unsupported, Unsupported, Unsupported),
+            test_direction_metadata(Unsupported, Unsupported, Unsupported),
+        );
+        let verdict = classify_dmabuf_scanout_route(route, &metadata, Supported);
+        let error = incompatible_route_error(route, &metadata, &verdict)
+            .expect("known-different route with both PRIME directions absent must block");
+        let message = error.to_string();
+        assert!(message.contains("relationship: Different"));
+        assert!(message.contains("OutputOwnedKmsPrimeExportUnsupported"));
+        assert!(message.contains("RendererOwnedKmsPrimeImportUnsupported"));
+
+        assert!(
+            incompatible_route_error(test_route(RenderKmsRelationship::Same), &metadata, &verdict,)
+                .is_none(),
+            "the gate itself must retain the same-device bypass"
         );
     }
 
