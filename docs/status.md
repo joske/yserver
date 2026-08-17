@@ -33,6 +33,41 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-08-18 PRIME renderer/display endpoint separation:** renderer
+  topology is no longer stored under `KmsDevice`. `KmsDevice` now owns only a
+  DRM primary node, KMS state, and its device-local cursor manager, while an
+  immutable `RenderDevice` inventory records every graphics+transfer
+  queue-capable same-instance `VkPhysicalDevice` that advertises a DRM render
+  node through `VK_EXT_physical_device_drm`. Verified renderer IDs use that
+  advertised render-node major/minor identity. Only the selected renderer owns
+  the operational render-node fd/path, DRI3 syncobj device, and cached
+  timeline capability. DRI3 resolves through that renderer rather than the
+  primary KMS card. Vulkan selection matches the resolved render node first
+  and permits a different advertised primary node, preserving split hardware
+  such as Asahi (`asahi` render versus `apple-drm` display).
+  `YSERVER_DRI_RENDER_NODE` therefore selects both the DRI3 endpoint and the
+  compositor Vulkan device when a verified identity is available. The
+  advertised render identity is rechecked before operational DRI3 resources
+  attach to a verified inventory record; only `UnverifiedFallback` may attach
+  without claiming that Vulkan advertised the node. The optional advertised
+  primary identity is retained as same-device/diagnostic metadata and never
+  selects a renderer or implies KMS support. Duplicate Vulkan claims for one
+  render node, a same-primary conflicting render claim, and an
+  extension-present topology with no matching render identity are
+  errors rather than guesses. On the KMS/render-targeted path, generic
+  discrete/integrated scoring survives only when no suitable Vulkan candidate
+  exposes the DRM extension at all; that selected endpoint is explicitly
+  `UnverifiedFallback`. A genuinely zero-card headless start has no endpoint
+  to match, so it keeps the generic renderer choice even when identities are
+  advertised and creates no false KMS relationship. On FreeBSD, a verified
+  inventory is likewise available only when the Vulkan ICD advertises this
+  extension; otherwise yserver retains one unverified selected renderer but
+  cannot yet construct a verified multi-renderer inventory.
+  Focused selector tests
+  cover Asahi-style primary mismatch, primary-only metadata,
+  extension-presence gating, duplicate and conflicting claims, and the
+  extension-absent fallback. Live mixed-GPU and FreeBSD hardware smoke remain
+  pending.
 - **2026-08-17 PRIME per-card hardware cursor manager:** every opened DRM
   device with an active startup CRTC now owns an independent cursor plane,
   pending EBUSY position, topology-coverage state, and fallback policy.
@@ -143,11 +178,14 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   stable output and CRTC XIDs. Provider IDs reserve entries from the same
   monotonic RANDR XID source, and `SetCrtcConfig` carries the output XID back
   into the backend instead of treating a connector name as globally unique.
-  Startup now opens every KMS-capable primary node, retains device-local
-  render-node/syncobj resources for each one, and gives every DRM poll source a
-  distinct core-loop token so completion events drain from the exact ready fd.
-  Initial scanout remains deliberately limited to the first opened device;
-  later entries are provider/topology inventory for subsequent PRIME routing.
+  Startup now opens every KMS-capable primary node and gives every KMS poll
+  source a distinct core-loop token so completion events drain from the exact
+  ready fd. Render-node and syncobj resources no longer live on those display
+  records: the separate selected `RenderDevice` owns the operational DRI3
+  endpoint, while same-instance Vulkan render identities form their own PRIME
+  inventory. Initial scanout remains deliberately limited to the first opened
+  KMS device; later KMS entries are provider/topology inventory for subsequent
+  PRIME routing.
   Both zero opened cards and an opened card with zero connected outputs are
   valid headless states. Software Vulkan is permitted only while no output is
   active; a later RANDR enable refuses software-to-KMS scanout unless the

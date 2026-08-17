@@ -616,8 +616,6 @@ pub(crate) fn primary_output_center(outputs: &[ActiveOutput], fb_w: u16, fb_h: u
 pub(crate) struct PlatformInitDevice {
     pub(crate) key: crate::platform::drm::DrmDeviceKey,
     pub(crate) device: Rc<drm::Device>,
-    pub(crate) render_node_fd: Option<std::os::fd::OwnedFd>,
-    pub(crate) render_node_path: Option<PathBuf>,
 }
 
 /// Transient handoff from device discovery to the long-lived renderer.
@@ -628,6 +626,9 @@ pub(crate) struct PlatformInitDevice {
 /// Empty `devices` and `layouts` is a valid zero-card headless platform.
 pub(crate) struct PlatformInit {
     pub(crate) devices: Vec<PlatformInitDevice>,
+    /// Selected render endpoint, separate from the KMS-device inventory.
+    /// `None` is valid for headless startup or unavailable DRI3.
+    pub(crate) render_node: Option<crate::kms::render_node::OpenedRenderNode>,
     pub(crate) layouts: Vec<ActiveOutput>,
     pub(crate) fb_w: u16,
     pub(crate) fb_h: u16,
@@ -637,32 +638,25 @@ pub(crate) struct PlatformInit {
 fn render_node_for_device(
     device_path: &str,
     device: &drm::Device,
-) -> (Option<std::os::fd::OwnedFd>, Option<PathBuf>) {
+) -> Option<crate::kms::render_node::OpenedRenderNode> {
     match crate::kms::render_node::open_for_card(device) {
-        Ok((fd, path)) => {
-            use std::os::fd::AsRawFd;
-            let raw = fd.as_raw_fd();
-            let stat_minor = std::fs::metadata(&path)
-                .ok()
-                .map(|m| {
-                    use std::os::unix::fs::MetadataExt;
-                    let rdev = m.rdev();
-                    ((rdev >> 8) & 0xff, rdev & 0xff)
-                })
-                .map(|(maj, min)| format!("{maj}:{min}"))
-                .unwrap_or_else(|| "?".into());
+        Ok(render_node) => {
             log::info!(
-                "DRI3 render node ready for {device_path}: fd={raw} \
-                 path={path:?} rdev={stat_minor} (render node minor should be >=128)"
+                "DRI3 render node ready for {device_path}: fd={} path={:?} rdev={} \
+                 (render node minor should be >=128)",
+                render_node.raw_fd(),
+                render_node.path(),
+                render_node.key(),
             );
-            (Some(fd), Some(path))
+            Some(render_node)
         }
         Err(err) => {
             log::warn!(
-                "DRI3 render node unavailable for {device_path}: {err}; DRI3 import path will be \
-                 unavailable on this device but the rest of yserver continues"
+                "DRI3 render node unavailable for selected display {device_path}: {err}; \
+                 renderer selection may continue only through the explicit unverified fallback \
+                 when no suitable Vulkan device exposes VK_EXT_physical_device_drm"
             );
-            (None, None)
+            None
         }
     }
 }
@@ -758,6 +752,7 @@ pub(crate) fn platform_init(
     ) -> io::Result<()>,
 ) -> io::Result<PlatformInit> {
     let mut devices = Vec::with_capacity(device_paths.len());
+    let mut render_node = None;
     let mut layouts = Vec::new();
     let mut open_errors = Vec::new();
     for device_path in device_paths {
@@ -776,7 +771,9 @@ pub(crate) fn platform_init(
         let device_key =
             crate::platform::drm::primary_device_key_from_fd(std::os::fd::AsFd::as_fd(&*device))?;
 
-        let (render_node_fd, render_node_path) = render_node_for_device(&device_path_str, &device);
+        if devices.is_empty() {
+            render_node = render_node_for_device(&device_path_str, &device);
+        }
         if !devices.is_empty() {
             log::info!(
                 "yserver: opened secondary KMS device {} as provider/topology data; \
@@ -787,8 +784,6 @@ pub(crate) fn platform_init(
         devices.push(PlatformInitDevice {
             key: device_key,
             device,
-            render_node_fd,
-            render_node_path,
         });
     }
 
@@ -837,6 +832,7 @@ pub(crate) fn platform_init(
 
     Ok(PlatformInit {
         devices,
+        render_node,
         layouts,
         fb_w,
         fb_h,

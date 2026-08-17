@@ -1153,7 +1153,7 @@ fn mode_timing(m: &crate::platform::drm::Mode) -> Option<yserver_core::randr::Mo
 /// `scanout_prefers_linear` (`kms/vk/scanout.rs:922`). DRI3 syncobj
 /// used to be one of them (`VkContext::supports_dri3_syncobj`), but it
 /// is a kernel capability now: `DRM_CAP_SYNCOBJ_TIMELINE` on the render
-/// node (`KmsDevice::syncobj_timeline`), not a driver branch.
+/// node (`RenderDevice::syncobj_timeline`), not a driver branch.
 ///
 /// Deliberately binary. Every non-NVIDIA driver keeps "mesa": an
 /// unmeasured mapping that redirects a configuration working today onto
@@ -3421,7 +3421,7 @@ impl KmsBackend {
             io::Error::other(format!("render for_tests_with_vk: OpsCommandPool: {e:?}"))
         })?;
         let fence_pool = crate::kms::render::platform::FencePool::new(Arc::clone(&vk));
-        base.platform.vk = Some(vk);
+        base.platform.attach_test_vk_context(vk);
         base.platform.ops_command_pool = Some(ops_pool);
         base.platform.fence_pool = Some(fence_pool);
         // Replace the stub engine with a live one now that Vk
@@ -3491,7 +3491,7 @@ impl KmsBackend {
                 n
             ]);
         }
-        base.platform.vk = Some(vk);
+        base.platform.attach_test_vk_context(vk);
         base.platform.ops_command_pool = Some(ops_pool);
         base.platform.fence_pool = Some(fence_pool);
         base.platform.scanout_pools = scanout_pools;
@@ -14069,7 +14069,7 @@ impl Backend for KmsBackend {
                 None => {
                     let v = self
                         .platform
-                        .primary_device()
+                        .selected_render_device()
                         .and_then(|device| device.render_node_device.as_ref())
                         .is_some_and(crate::kms::render::imported_syncobj::eventfd_supported);
                     self.syncobj_eventfd_supported = Some(v);
@@ -20008,27 +20008,30 @@ impl Backend for KmsBackend {
         // populates it, the second crashes in `amdgpu_winsys_create`
         // hitting leftover handles. See
         // feedback_dri3_open_fresh_fd.md.
-        let path = self
+        let render_node = self
             .platform
-            .primary_device()
-            .and_then(|device| device.render_node_path.as_deref())
+            .selected_render_device()
+            .and_then(|device| device.render_node.as_ref())
             .ok_or_else(|| {
                 io::Error::other("DRI3 unavailable — render node was not resolved at backend init")
             })?;
-        crate::kms::render_node::open_fresh(path)
-            .map_err(|e| io::Error::other(format!("open render-node {}: {e}", path.display())))
+        render_node.open_fresh().map_err(|e| {
+            io::Error::other(format!(
+                "open render-node {}: {e}",
+                render_node.path().display()
+            ))
+        })
     }
 
     fn dri3_capabilities(&self) -> Dri3Caps {
         // DRI3 entirely unavailable when the render-node device or Vulkan
         // weren't resolved at backend init: pixmap import/export still needs
-        // both. `render_node_device` is the guard here (not the bare
-        // `render_node_fd`) because it is what the syncobj ioctls and the
+        // both. `render_node_device` is the guard here because it is what the syncobj ioctls and the
         // capability query run on.
-        let Some(primary) = self.platform.primary_device() else {
+        let Some(renderer) = self.platform.selected_render_device() else {
             return Dri3Caps::unsupported();
         };
-        if primary.render_node_device.is_none() || self.platform.vk.is_none() {
+        if renderer.render_node_device.is_none() || self.platform.vk.is_none() {
             return Dri3Caps::unsupported();
         }
         let vk = self.platform.vk.as_ref().expect("vk Some by branch above");
@@ -20040,7 +20043,7 @@ impl Backend for KmsBackend {
         // driver. The previous NVIDIA blacklist here was a correct response
         // to vkImportSemaphoreFdKHR rejecting DRM syncobj fds, which no
         // longer matters because nothing imports them into Vulkan.
-        let syncobj = primary.syncobj_timeline;
+        let syncobj = renderer.syncobj_timeline;
         Dri3Caps {
             version: dri3_version_for(syncobj),
             modifiers,
@@ -20392,7 +20395,7 @@ impl Backend for KmsBackend {
 
         let render_node = self
             .platform
-            .primary_device()
+            .selected_render_device()
             .and_then(|device| device.render_node_device.as_ref())
             .cloned()
             .ok_or_else(|| {
@@ -21807,10 +21810,6 @@ mod tests {
             .push(crate::kms::render::platform::KmsDevice {
                 key,
                 device,
-                render_node_fd: None,
-                render_node_device: None,
-                syncobj_timeline: false,
-                render_node_path: None,
                 cursor: crate::kms::render::platform::KmsCursorState::new(false),
             });
     }
@@ -29283,12 +29282,15 @@ mod tests {
 
     #[test]
     fn dri3_open_errs_when_render_node_unavailable() {
-        // for_tests sets render_node_path: None on PlatformBackend,
-        // so dri3_open must Err out (the SCM_RIGHTS dispatch path
+        // for_tests has no selected RenderDevice or render node, so
+        // dri3_open must Err out (the SCM_RIGHTS dispatch path
         // then maps it to BadAlloc).
         let mut b = KmsBackend::for_tests();
         let res = b.dri3_open(0x1234);
-        assert!(res.is_err(), "expected Err when render_node_path is None");
+        assert!(
+            res.is_err(),
+            "expected Err when no selected render node exists"
+        );
     }
 
     #[test]
@@ -29334,9 +29336,8 @@ mod tests {
         let b = KmsBackend::for_tests();
         assert!(
             !b.platform
-                .primary_device()
-                .expect("test fixture has a DRM device")
-                .syncobj_timeline,
+                .selected_render_device()
+                .is_some_and(|device| device.syncobj_timeline),
             "for_tests() has no render node, so the capability must be false",
         );
     }
@@ -29529,11 +29530,20 @@ mod tests {
         let fd = unsafe { OwnedFd::from_raw_fd(f.into_raw_fd()) };
         let mut b = KmsBackend::for_tests();
         b.platform
-            .primary_device_mut()
-            .expect("test fixture has a DRM device")
-            .render_node_device = Some(std::sync::Arc::new(
-            crate::drm::Device::open_render_node("/dev/null").expect("open /dev/null"),
-        ));
+            .render_devices
+            .push(crate::kms::render::platform::RenderDevice {
+                id: crate::kms::render::platform::RenderDeviceId::UnverifiedFallback,
+                physical_device: ash::vk::PhysicalDevice::null(),
+                advertised_primary_node: None,
+                advertised_render_node: None,
+                render_node: None,
+                render_node_device: Some(std::sync::Arc::new(
+                    crate::drm::Device::open_render_node("/dev/null").expect("open /dev/null"),
+                )),
+                syncobj_timeline: false,
+            });
+        b.platform.selected_render_device =
+            Some(crate::kms::render::platform::RenderDeviceId::UnverifiedFallback);
         assert!(
             b.dri3_import_syncobj(yserver_protocol::x11::ClientId(1), 0x4040_3333, fd,)
                 .is_err(),

@@ -814,24 +814,47 @@ fn apply_cursor_operation_result(
         })
 }
 
-/// One opened DRM/KMS device and its sibling render-node resources.
+/// Stable renderer endpoint identity. Verified devices are keyed by their DRM
+/// render node. The explicit unverified fallback covers a targeted selection
+/// when every candidate lacks DRM identity, and a headless scored selection
+/// whose candidate advertises no render node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum RenderDeviceId {
+    DrmRender(crate::platform::drm::DrmDeviceKey),
+    UnverifiedFallback,
+}
+
+/// One Vulkan renderer endpoint. Its physical-device handle belongs to the
+/// platform's `VkContext` instance; KMS devices are represented separately.
+pub(crate) struct RenderDevice {
+    pub(crate) id: RenderDeviceId,
+    pub(crate) physical_device: vk::PhysicalDevice,
+    /// Renderer-side primary identity advertised by Vulkan. This is metadata
+    /// for same-device detection only and never implies KMS capability.
+    pub(crate) advertised_primary_node: Option<crate::platform::drm::DrmDeviceKey>,
+    /// Renderer-side render identity advertised by Vulkan.
+    pub(crate) advertised_render_node: Option<crate::platform::drm::DrmDeviceKey>,
+    /// The selected operational render node. Only the active renderer owns
+    /// this resource for now; other inventory entries are identity records.
+    pub(crate) render_node: Option<crate::kms::render_node::OpenedRenderNode>,
+    /// DRM wrapper over the same selected render node, used for syncobj ioctls.
+    pub(crate) render_node_device: Option<Arc<crate::drm::Device>>,
+    pub(crate) syncobj_timeline: bool,
+}
+
+impl RenderDevice {
+    #[must_use]
+    pub(crate) fn is_same_device_as(&self, kms: &KmsDevice) -> Option<bool> {
+        self.advertised_primary_node
+            .map(|primary| primary == kms.key)
+    }
+}
+
+/// One opened display/KMS device. Renderer identity and render-node resources
+/// deliberately live in `RenderDevice` instead.
 pub(crate) struct KmsDevice {
     pub(crate) key: crate::platform::drm::DrmDeviceKey,
     pub(crate) device: Rc<drm::Device>,
-    pub(crate) render_node_fd: Option<OwnedFd>,
-    /// The DRM device over the render node, retained so every DRI3 syncobj
-    /// ioctl and the `DRM_CAP_SYNCOBJ_TIMELINE` query issue on the SAME fd
-    /// kind DRI3 hands clients. This is deliberately NOT `device` (the KMS
-    /// node): on split-device boxes (Pi 4 vc4/v3d, Asahi) the display device's
-    /// answer says nothing about the render device's. See the spec's "Which
-    /// fd to ask — one device, decided, not preferred".
-    pub(crate) render_node_device: Option<Arc<crate::drm::Device>>,
-    /// `DRM_CAP_SYNCOBJ_TIMELINE` on the render node, read once at init.
-    /// Whether DRI3 can offer syncobjs is a property of the kernel driver
-    /// behind that fd, not of the Vulkan driver — the resource is a DRM
-    /// syncobj and every operation on it is a DRM ioctl.
-    pub(crate) syncobj_timeline: bool,
-    pub(crate) render_node_path: Option<PathBuf>,
     pub(crate) cursor: KmsCursorState,
 }
 
@@ -976,6 +999,11 @@ pub(crate) struct PlatformBackend {
     initial_scanout_rollback_armed: bool,
     // DRM / output side
     pub(crate) devices: Vec<KmsDevice>,
+    /// Immutable same-instance Vulkan inventory of graphics+transfer
+    /// queue-capable render-identified devices. Handles are valid for exactly
+    /// the lifetime of `vk` below.
+    pub(crate) render_devices: Vec<RenderDevice>,
+    pub(crate) selected_render_device: Option<RenderDeviceId>,
     pub(crate) outputs: Vec<ActiveOutput>,
     pub(crate) fb_w: u16,
     pub(crate) fb_h: u16,
@@ -1083,6 +1111,98 @@ pub(crate) struct PlatformBackend {
     /// Always compiled (not cfg(test)) so integration-test pub wrappers
     /// on `KmsBackend` can reach it from the external test crate.
     force_next_submit_failure: bool,
+}
+
+fn build_render_device_inventory(
+    vk: &Arc<VkContext>,
+    render_node: Option<crate::kms::render_node::OpenedRenderNode>,
+) -> io::Result<(Vec<RenderDevice>, RenderDeviceId)> {
+    let mut render_devices: Vec<_> = vk
+        .drm_physical_devices
+        .iter()
+        .map(|entry| RenderDevice {
+            id: RenderDeviceId::DrmRender(
+                entry
+                    .identity
+                    .render
+                    .expect("VkContext inventory contains only render-identified devices"),
+            ),
+            physical_device: entry.physical_device,
+            advertised_primary_node: entry.identity.primary,
+            advertised_render_node: entry.identity.render,
+            render_node: None,
+            render_node_device: None,
+            syncobj_timeline: false,
+        })
+        .collect();
+
+    let selected_index = render_devices
+        .iter()
+        .position(|device| device.physical_device == vk.physical_device)
+        .unwrap_or_else(|| {
+            let identity = vk.selected_drm_identity;
+            render_devices.push(RenderDevice {
+                id: RenderDeviceId::UnverifiedFallback,
+                physical_device: vk.physical_device,
+                advertised_primary_node: identity.and_then(|identity| identity.primary),
+                advertised_render_node: identity.and_then(|identity| identity.render),
+                render_node: None,
+                render_node_device: None,
+                syncobj_timeline: false,
+            });
+            render_devices.len() - 1
+        });
+
+    let selected = &mut render_devices[selected_index];
+    if let Some(render_node) = render_node {
+        validate_render_node_attachment(selected.id, render_node.key())?;
+        let render_node_device = drm::Device::open_render_node(
+            render_node
+                .path()
+                .to_str()
+                .unwrap_or("<non-UTF-8 render-node path>"),
+        )
+        .and_then(|device| {
+            render_node.verify_fd(device.as_fd())?;
+            Ok(Arc::new(device))
+        })
+        .map_err(|error| {
+            log::warn!(
+                "render device: failed to reopen selected DRM render node {}: {error}; syncobj support unavailable",
+                render_node.path().display(),
+            );
+        })
+        .ok();
+        let syncobj_timeline = render_node_device
+            .as_ref()
+            .and_then(|device| {
+                use ::drm::Device as _;
+                device
+                    .get_driver_capability(::drm::DriverCapability::TimelineSyncObj)
+                    .ok()
+            })
+            .is_some_and(|value| value != 0);
+        selected.render_node = Some(render_node);
+        selected.render_node_device = render_node_device;
+        selected.syncobj_timeline = syncobj_timeline;
+    }
+
+    let selected_id = render_devices[selected_index].id;
+    Ok((render_devices, selected_id))
+}
+
+fn validate_render_node_attachment(
+    selected: RenderDeviceId,
+    opened: crate::platform::drm::DrmDeviceKey,
+) -> io::Result<()> {
+    match selected {
+        RenderDeviceId::DrmRender(advertised) if advertised != opened => {
+            Err(io::Error::other(format!(
+                "selected Vulkan renderer advertises DRM render node {advertised}, but the opened render endpoint is {opened}"
+            )))
+        }
+        RenderDeviceId::DrmRender(_) | RenderDeviceId::UnverifiedFallback => Ok(()),
+    }
 }
 
 /// Outcome of a connector rescan.
@@ -1212,6 +1332,7 @@ impl PlatformBackend {
     fn from_platform_init(platform_init: PlatformInit) -> io::Result<Self> {
         let PlatformInit {
             devices,
+            render_node,
             mut layouts,
             fb_w,
             fb_h,
@@ -1221,28 +1342,10 @@ impl PlatformBackend {
         let mut devices: Vec<KmsDevice> = devices
             .into_iter()
             .map(|device| {
-                let render_node_device = device
-                    .render_node_path
-                    .as_deref()
-                    .and_then(|path| drm::Device::open_render_node(path.to_str()?).ok())
-                    .map(Arc::new);
-                let syncobj_timeline = render_node_device
-                    .as_ref()
-                    .and_then(|render_device| {
-                        use ::drm::Device as _;
-                        render_device
-                            .get_driver_capability(::drm::DriverCapability::TimelineSyncObj)
-                            .ok()
-                    })
-                    .is_some_and(|value| value != 0);
                 let cursor = KmsCursorState::new(drm_device_is_nvidia(&device.device));
                 KmsDevice {
                     key: device.key,
                     device: device.device,
-                    render_node_fd: device.render_node_fd,
-                    render_node_device,
-                    syncobj_timeline,
-                    render_node_path: device.render_node_path,
                     cursor,
                 }
             })
@@ -1273,7 +1376,11 @@ impl PlatformBackend {
             drm::modeset::disable_output,
         );
 
-        let vk = match VkContext::new() {
+        let requested_render_node = render_node.as_ref().map(|node| node.key());
+        let vk_result = devices.first().map_or_else(VkContext::new, |display| {
+            VkContext::new_for_render_device(requested_render_node, display.key)
+        });
+        let vk = match vk_result {
             Ok(v) => v,
             Err(e) => {
                 return Err(io::Error::other(format!(
@@ -1287,6 +1394,26 @@ impl PlatformBackend {
             vk.driver_id,
             vk.device_type,
         );
+        let (render_devices, selected_render_device) =
+            build_render_device_inventory(&vk, render_node)?;
+        if let Some(display) = devices.first() {
+            let selected = render_devices
+                .iter()
+                .find(|device| device.id == selected_render_device)
+                .expect("selected renderer is present in renderer inventory");
+            let kms_relationship = match selected.is_same_device_as(display) {
+                Some(true) => "same-device",
+                Some(false) => "different-device",
+                None => "unknown",
+            };
+            log::info!(
+                "render PlatformBackend: selected renderer {:?} (render={:?}, primary={:?}) has {kms_relationship} relationship to KMS device {}",
+                selected.physical_device,
+                selected.advertised_render_node,
+                selected.advertised_primary_node,
+                display.key,
+            );
+        }
 
         // Refuse to drive real KMS scanout off a software rasterizer.
         // If the only Vulkan device is llvmpipe/lavapipe (CPU type) —
@@ -1449,6 +1576,8 @@ impl PlatformBackend {
         Ok(Self {
             initial_scanout_rollback_armed,
             devices,
+            render_devices,
+            selected_render_device: Some(selected_render_device),
             outputs: layouts,
             fb_w,
             fb_h,
@@ -1501,12 +1630,10 @@ impl PlatformBackend {
             devices: vec![KmsDevice {
                 key: device_key,
                 device,
-                render_node_fd: None,
-                render_node_device: None,
-                syncobj_timeline: false,
-                render_node_path: None,
                 cursor: KmsCursorState::new(false),
             }],
+            render_devices: Vec::new(),
+            selected_render_device: None,
             outputs: vec![ActiveOutput::new(
                 device_key,
                 crate::platform::drm::Output {
@@ -1579,6 +1706,16 @@ impl PlatformBackend {
             last_flush_outcome: None,
             force_next_submit_failure: false,
         }
+    }
+
+    /// Attach a live Vulkan context to the headless test fixture while
+    /// preserving the renderer-inventory invariant used by production.
+    pub(crate) fn attach_test_vk_context(&mut self, vk: Arc<VkContext>) {
+        let (render_devices, selected) = build_render_device_inventory(&vk, None)
+            .expect("a test Vulkan context without an opened render node cannot mismatch");
+        self.render_devices = render_devices;
+        self.selected_render_device = Some(selected);
+        self.vk = Some(vk);
     }
 
     pub(crate) fn fb_dimensions(&self) -> (u16, u16) {
@@ -2253,9 +2390,19 @@ impl PlatformBackend {
         self.devices.first()
     }
 
+    pub(crate) fn selected_render_device(&self) -> Option<&RenderDevice> {
+        let selected = self.selected_render_device?;
+        self.render_devices
+            .iter()
+            .find(|device| device.id == selected)
+    }
+
     #[cfg(test)]
-    pub(crate) fn primary_device_mut(&mut self) -> Option<&mut KmsDevice> {
-        self.devices.first_mut()
+    pub(crate) fn selected_render_device_mut(&mut self) -> Option<&mut RenderDevice> {
+        let selected = self.selected_render_device?;
+        self.render_devices
+            .iter_mut()
+            .find(|device| device.id == selected)
     }
 
     pub(crate) fn device_for_key(
@@ -4433,6 +4580,35 @@ fn check_scanout_liveness(
 mod tests {
     use super::*;
 
+    fn drm_key(minor: u32) -> crate::platform::drm::DrmDeviceKey {
+        crate::platform::drm::DrmDeviceKey { major: 226, minor }
+    }
+
+    #[test]
+    fn verified_render_device_accepts_its_advertised_node() {
+        assert!(
+            validate_render_node_attachment(RenderDeviceId::DrmRender(drm_key(128)), drm_key(128))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn verified_render_device_rejects_a_different_opened_node() {
+        let error =
+            validate_render_node_attachment(RenderDeviceId::DrmRender(drm_key(128)), drm_key(129))
+                .expect_err("a verified renderer must not acquire another node's resources");
+        assert!(error.to_string().contains("226:128"));
+        assert!(error.to_string().contains("226:129"));
+    }
+
+    #[test]
+    fn unverified_fallback_can_attach_the_resolved_node_without_claiming_identity() {
+        assert!(
+            validate_render_node_attachment(RenderDeviceId::UnverifiedFallback, drm_key(129))
+                .is_ok()
+        );
+    }
+
     fn test_kms_device(
         key: crate::platform::drm::DrmDeviceKey,
         nvidia_policy_disabled: bool,
@@ -4440,12 +4616,32 @@ mod tests {
         KmsDevice {
             key,
             device: Rc::new(drm::Device::for_tests().expect("test DRM device")),
-            render_node_fd: None,
-            render_node_device: None,
-            syncobj_timeline: false,
-            render_node_path: None,
             cursor: KmsCursorState::new(nvidia_policy_disabled),
         }
+    }
+
+    #[test]
+    fn renderer_primary_relationship_distinguishes_unknown_from_different() {
+        let kms = test_kms_device(drm_key(0), false);
+        let renderer = |primary| RenderDevice {
+            id: RenderDeviceId::UnverifiedFallback,
+            physical_device: vk::PhysicalDevice::default(),
+            advertised_primary_node: primary,
+            advertised_render_node: None,
+            render_node: None,
+            render_node_device: None,
+            syncobj_timeline: false,
+        };
+
+        assert_eq!(renderer(None).is_same_device_as(&kms), None);
+        assert_eq!(
+            renderer(Some(drm_key(0))).is_same_device_as(&kms),
+            Some(true)
+        );
+        assert_eq!(
+            renderer(Some(drm_key(1))).is_same_device_as(&kms),
+            Some(false)
+        );
     }
 
     fn install_test_cursor_plane(
@@ -4726,10 +4922,6 @@ mod tests {
         platform.devices.push(KmsDevice {
             key: second_key,
             device: Rc::new(drm::Device::for_tests().expect("second test DRM device")),
-            render_node_fd: None,
-            render_node_device: None,
-            syncobj_timeline: false,
-            render_node_path: None,
             cursor: KmsCursorState::new(false),
         });
         platform.outputs[0].key.device_key = second_key;
@@ -4750,10 +4942,6 @@ mod tests {
                 minor: 1,
             },
             device: second_device,
-            render_node_fd: None,
-            render_node_device: None,
-            syncobj_timeline: false,
-            render_node_path: None,
             cursor: KmsCursorState::new(false),
         });
 

@@ -5,20 +5,72 @@
 
 use std::{
     env, io,
-    os::fd::{AsFd, OwnedFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd},
     path::{Path, PathBuf},
 };
 
-use crate::platform::drm::{self, RENDER_NODE_ENV};
+use crate::platform::drm::{self, DrmDeviceKey, DrmNode, RENDER_NODE_ENV};
+
+/// One opened DRM render node kept together with the stable identity and path
+/// that were verified at open time.
+pub(crate) struct OpenedRenderNode {
+    fd: OwnedFd,
+    node: DrmNode,
+}
+
+impl OpenedRenderNode {
+    #[must_use]
+    pub(crate) fn raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+
+    #[must_use]
+    pub(crate) fn path(&self) -> &Path {
+        &self.node.path
+    }
+
+    #[must_use]
+    pub(crate) fn key(&self) -> DrmDeviceKey {
+        self.node.key
+    }
+
+    /// Open a fresh kernel struct file for one DRI3 client while retaining
+    /// the renderer identity selected at startup. A disappearing/recreated
+    /// path must not silently redirect the client to another DRM device.
+    pub(crate) fn open_fresh(&self) -> io::Result<OwnedFd> {
+        drm::open_node(&self.node)
+    }
+
+    /// Verify another long-lived wrapper opened from the retained path before
+    /// it is used for renderer-owned syncobj ioctls.
+    pub(crate) fn verify_fd(&self, fd: BorrowedFd<'_>) -> io::Result<()> {
+        let opened = drm::primary_device_key_from_fd(fd)?;
+        if opened != self.node.key {
+            return Err(io::Error::other(format!(
+                "DRM render node {} changed identity (selected {}, reopened {opened})",
+                self.node.path.display(),
+                self.node.key,
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl AsFd for OpenedRenderNode {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
 
 /// Resolve and open the render node associated with `card_fd`.
 ///
 /// The returned path is retained so DRI3 can open a fresh kernel struct file
 /// for each client rather than `dup()`-ing a shared one.
-pub fn open_for_card<F: AsFd>(card_fd: F) -> io::Result<(OwnedFd, PathBuf)> {
+pub fn open_for_card<F: AsFd>(card_fd: F) -> io::Result<OpenedRenderNode> {
     if let Some(path) = explicit_render_node_path() {
-        let fd = drm::open_node_path(&path)?;
-        return Ok((fd, path));
+        let node = drm::render_node_from_path(path)?;
+        let fd = drm::open_node(&node)?;
+        return Ok(OpenedRenderNode { fd, node });
     }
 
     let primary = drm::primary_device_key_from_fd(card_fd.as_fd())?;
@@ -29,11 +81,7 @@ pub fn open_for_card<F: AsFd>(card_fd: F) -> io::Result<(OwnedFd, PathBuf)> {
         ))
     })?;
     let fd = drm::open_node(&render)?;
-    Ok((fd, render.path))
-}
-
-pub fn open_fresh(path: &Path) -> io::Result<OwnedFd> {
-    drm::open_node_path(path)
+    Ok(OpenedRenderNode { fd, node: render })
 }
 
 fn explicit_render_node_path() -> Option<PathBuf> {
@@ -46,9 +94,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn open_fresh_fails_for_missing_path() {
-        let path = std::env::temp_dir().join("yserver-render-node-test-nonexistent");
-        let _ = std::fs::remove_file(&path);
-        assert!(open_fresh(&path).is_err());
+    fn open_fresh_rechecks_the_retained_node_identity() {
+        let path = PathBuf::from("/dev/null");
+        let fd = drm::open_node_path(&path).expect("open /dev/null");
+        let key = drm::primary_device_key_from_fd(fd.as_fd()).expect("identify /dev/null");
+        let node = OpenedRenderNode {
+            fd,
+            node: DrmNode {
+                path,
+                key,
+                kind: crate::platform::drm::DrmNodeKind::Render,
+            },
+        };
+        assert!(node.open_fresh().is_ok());
+
+        let mismatched = OpenedRenderNode {
+            fd: drm::open_node_path(Path::new("/dev/null")).expect("open /dev/null"),
+            node: DrmNode {
+                path: PathBuf::from("/dev/null"),
+                key: DrmDeviceKey {
+                    major: key.major,
+                    minor: key.minor.wrapping_add(1),
+                },
+                kind: crate::platform::drm::DrmNodeKind::Render,
+            },
+        };
+        assert!(mismatched.open_fresh().is_err());
     }
 }

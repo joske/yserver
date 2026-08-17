@@ -277,6 +277,11 @@ fn node_for_path(path: PathBuf, kind: DrmNodeKind) -> io::Result<DrmNode> {
     })
 }
 
+/// Identify one explicit render-node path by stable `st_rdev` identity.
+pub(crate) fn render_node_from_path(path: PathBuf) -> io::Result<DrmNode> {
+    node_for_path(path, DrmNodeKind::Render)
+}
+
 pub(crate) fn open_node_path(path: &Path) -> io::Result<OwnedFd> {
     let file = fs::OpenOptions::new().read(true).write(true).open(path)?;
     Ok(file.into())
