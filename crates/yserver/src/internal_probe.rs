@@ -691,10 +691,8 @@ fn validate_response_for_request(
     Ok(())
 }
 
-/// Process-isolation watchdog for one request/one response helper invocation.
-///
-/// This remains unused until the platform integration commit. Keeping it here
-/// makes the process boundary independently testable first.
+/// Resolve the exact executable for one production process-isolated helper
+/// invocation.
 fn probe_helper_executable() -> io::Result<PathBuf> {
     #[cfg(target_os = "linux")]
     {
@@ -751,6 +749,47 @@ pub(crate) struct ProbeHelperSupervisor {
     watchdog: Duration,
 }
 
+/// Failure stage for one supervised helper invocation.
+///
+/// `NotStarted` proves that no child handle was created, so no helper-side
+/// Vulkan/KMS work could have begun. `ChildStartedUncertain` means a child did
+/// exist and its cleanup/resource state cannot be inferred from a failed IPC
+/// exchange.
+#[derive(Debug)]
+pub(crate) enum ProbeHelperRunError {
+    NotStarted(io::Error),
+    ChildStartedUncertain(io::Error),
+}
+
+impl ProbeHelperRunError {
+    pub(crate) fn kind(&self) -> io::ErrorKind {
+        match self {
+            Self::NotStarted(error) | Self::ChildStartedUncertain(error) => error.kind(),
+        }
+    }
+}
+
+impl std::fmt::Display for ProbeHelperRunError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotStarted(error) => {
+                write!(formatter, "probe helper did not start: {error}")
+            }
+            Self::ChildStartedUncertain(error) => {
+                write!(formatter, "probe helper child state is uncertain: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProbeHelperRunError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NotStarted(error) | Self::ChildStartedUncertain(error) => Some(error),
+        }
+    }
+}
+
 #[allow(dead_code)]
 impl ProbeHelperSupervisor {
     pub(crate) fn for_current_exe(watchdog: Duration) -> io::Result<Self> {
@@ -764,10 +803,13 @@ impl ProbeHelperSupervisor {
         &self,
         kms_fd: BorrowedFd<'_>,
         request: RouteProbeRequest,
-    ) -> io::Result<RouteProbeResponse> {
-        let (parent_control, child_control) = UnixStream::pair()?;
-        let inherited_control = duplicate_fd_at_least(child_control.as_fd())?;
-        let inherited_kms = duplicate_fd_at_least(kms_fd)?;
+    ) -> Result<RouteProbeResponse, ProbeHelperRunError> {
+        let (parent_control, child_control) =
+            UnixStream::pair().map_err(ProbeHelperRunError::NotStarted)?;
+        let inherited_control = duplicate_fd_at_least(child_control.as_fd())
+            .map_err(ProbeHelperRunError::NotStarted)?;
+        let inherited_kms =
+            duplicate_fd_at_least(kms_fd).map_err(ProbeHelperRunError::NotStarted)?;
         let control_source = inherited_control.as_raw_fd();
         let kms_source = inherited_kms.as_raw_fd();
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -795,11 +837,12 @@ impl ProbeHelperSupervisor {
                 Ok(())
             });
         }
-        let child = command.spawn()?;
+        let child = command.spawn().map_err(ProbeHelperRunError::NotStarted)?;
         drop(child_control);
         drop(inherited_control);
         drop(inherited_kms);
         supervise_exchange(child, parent_control, request, self.watchdog)
+            .map_err(ProbeHelperRunError::ChildStartedUncertain)
     }
 }
 
@@ -1350,6 +1393,46 @@ mod tests {
             probe_helper_executable().expect("Linux helper executable"),
             PathBuf::from("/proc/self/exe")
         );
+    }
+
+    #[test]
+    fn supervisor_classifies_spawn_failure_as_not_started() {
+        let supervisor = ProbeHelperSupervisor {
+            executable: PathBuf::from("/definitely/missing/yserver-probe-helper"),
+            watchdog: Duration::from_secs(1),
+        };
+        let kms = File::open("/dev/null").expect("open inert KMS fixture");
+        let error = supervisor
+            .run(kms.as_fd(), request(21, true))
+            .expect_err("missing executable must fail before a child starts");
+
+        assert!(matches!(&error, ProbeHelperRunError::NotStarted(_)));
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("did not start"));
+    }
+
+    #[test]
+    fn supervisor_classifies_post_spawn_exchange_failure_as_uncertain() {
+        let supervisor = ProbeHelperSupervisor {
+            executable: PathBuf::from("/bin/true"),
+            watchdog: Duration::from_secs(1),
+        };
+        let kms = File::open("/dev/null").expect("open inert KMS fixture");
+        let error = supervisor
+            .run(kms.as_fd(), request(22, true))
+            .expect_err("non-helper child must fail its protocol exchange");
+
+        assert!(matches!(
+            &error,
+            ProbeHelperRunError::ChildStartedUncertain(_)
+        ));
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::BrokenPipe
+                | io::ErrorKind::UnexpectedEof
+                | io::ErrorKind::ConnectionReset
+        ));
+        assert!(error.to_string().contains("state is uncertain"));
     }
 
     #[cfg(target_os = "linux")]

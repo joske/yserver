@@ -20,7 +20,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     io,
-    os::fd::AsFd,
+    os::fd::{AsFd, OwnedFd},
     rc::Rc,
 };
 
@@ -47,6 +47,7 @@ use yserver_protocol::x11::{
 
 use crate::{
     drm,
+    internal_probe::{ProbeKmsHandles, RouteProbeRequest},
     kms::{
         backend::OutputKey,
         core::{GradientStop, KmsCore, PictureFilter, PictureRecord},
@@ -493,17 +494,16 @@ pub(crate) enum ConnectorConfig {
     },
 }
 
-/// Resource-free request handed to an asynchronous PRIME route qualifier.
-/// The live DRM output selected by discovery remains in the pending backend
-/// entry; this message contains only stable, worker/process-friendly values.
+/// Owned request handed to the asynchronous PRIME route qualifier.
+///
+/// The duplicate KMS fd keeps the exact DRM open-file description alive until
+/// the worker/helper finishes, even if hotplug or backend teardown retires the
+/// platform entry before this job starts. The request itself contains only
+/// scalar handles and route identities; live output ownership remains in the
+/// pending backend entry.
 pub(crate) struct CrtcConfigProbeJob {
-    pub(crate) token: CrtcConfigToken,
-    pub(crate) output_key: OutputKey,
-    pub(crate) mode: yserver_core::backend::ModeSpec,
-    pub(crate) x: i32,
-    pub(crate) y: i32,
-    pub(crate) route: ScanoutRoute,
-    pub(crate) scanout_modifiers: Vec<u64>,
+    pub(crate) kms_fd: OwnedFd,
+    pub(crate) request: RouteProbeRequest,
 }
 
 /// One completed asynchronous qualification. A successful plan contains no
@@ -514,9 +514,9 @@ pub(crate) struct CrtcConfigProbeCompletion {
     pub(crate) result: io::Result<QualifiedScanoutPlan>,
 }
 
-/// Injectable owner of the worker/helper transport. Production can later
-/// translate its process codec into these scalar jobs/results without changing
-/// the core-facing token lifecycle; tests use an in-memory implementation.
+/// Injectable owner of the worker/helper transport. Production sends the owned
+/// job through the process-isolated qualifier; tests use an in-memory
+/// implementation without changing the core-facing token lifecycle.
 pub(crate) trait CrtcConfigProbeExecutor {
     fn set_core_sender(&mut self, _sender: yserver_core::core_loop::CoreSender) {}
     /// Queue one process-helper request and return without performing the
@@ -2101,26 +2101,48 @@ impl KmsBackend {
             ));
         }
         let token = self.next_crtc_config_token();
-        let job = CrtcConfigProbeJob {
+        let kms_fd = self
+            .platform
+            .device_for_output(&output_key)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no KMS device for asynchronous output {output_key:?}"),
+                )
+            })?
+            .device
+            .as_fd()
+            .try_clone_to_owned()?;
+        let (source_selector, copied_sink) = self
+            .platform
+            .scanout_qualification_devices_for_kms(output_key.device_key)?;
+        let request = RouteProbeRequest {
             token,
-            output_key: output_key.clone(),
             mode,
+            source_route: route,
+            source_selector: source_selector.into(),
+            copied_sink: copied_sink.map(Into::into),
+            kms: ProbeKmsHandles {
+                connector: prepared_output.connector,
+                encoder: prepared_output.encoder,
+                crtc: prepared_output.crtc,
+                plane: prepared_output.plane,
+            },
+            fence_timeout_ns: super::platform::PRIME_RENDER_PROBE_TIMEOUT_NS,
+        };
+        let job = CrtcConfigProbeJob { kms_fd, request };
+        log::debug!(
+            "begin_crtc_config: enqueue token {:?} for {:?} {}x{}@{} at ({},{}), route {:?}, copied_sink={}, fence_timeout_ns={}",
+            request.token,
+            output_key,
+            request.mode.width,
+            request.mode.height,
+            request.mode.vrefresh,
             x,
             y,
-            route,
-            scanout_modifiers: prepared_output.scanout_modifiers.clone(),
-        };
-        log::debug!(
-            "begin_crtc_config: enqueue token {:?} for {:?} {}x{}@{} at ({},{}), route {:?}, {} scanout modifier(s)",
-            job.token,
-            job.output_key,
-            job.mode.width,
-            job.mode.height,
-            job.mode.vrefresh,
-            job.x,
-            job.y,
-            job.route,
-            job.scanout_modifiers.len(),
+            request.source_route,
+            request.copied_sink.is_some(),
+            request.fence_timeout_ns,
         );
         let pending = PendingCrtcConfigProbe {
             output_id,
@@ -3175,6 +3197,8 @@ impl KmsBackend {
             .vk
             .as_ref()
             .is_some_and(probe_dmabuf_export_support);
+        let crtc_config_probe_executor: Option<Box<dyn CrtcConfigProbeExecutor>> =
+            Some(Box::new(super::probe_executor::ProcessProbeExecutor::new()?));
         let kms_outputs_active = !platform.outputs.is_empty();
         let mut b = Self {
             core,
@@ -3235,7 +3259,7 @@ impl KmsBackend {
             led_relay: None,
             leds_sent: 0,
             input_sender: None,
-            crtc_config_probe_executor: None,
+            crtc_config_probe_executor,
             pending_crtc_config_probes: HashMap::new(),
             ready_crtc_config_results: HashMap::new(),
             next_crtc_config_token: 1,
@@ -15794,8 +15818,8 @@ impl Backend for KmsBackend {
         );
         // Discovery and advertised-mode validation are deliberately completed
         // while the old topology is still lit. The live DRM output stays in
-        // the pending entry; only scalar route/modifier data crosses to the
-        // executor.
+        // the pending entry; the executor receives one owned KMS-fd duplicate
+        // plus a scalar route request.
         let prepared_output =
             self.discover_crtc_config_output(&output_key, &output_device, connector)?;
         if prepared_output.connector_name != connector {
@@ -23475,10 +23499,11 @@ mod tests {
         }
 
         fn enqueue(&mut self, job: CrtcConfigProbeJob) -> io::Result<()> {
-            self.state.borrow_mut().enqueued.push(job.token);
+            let token = job.request.token;
+            self.state.borrow_mut().enqueued.push(token);
             if let Some(plan) = self.auto_complete {
                 self.completions.push_back(CrtcConfigProbeCompletion {
-                    token: job.token,
+                    token,
                     result: Ok(plan),
                 });
                 if let Some(sender) = self.sender.as_ref() {

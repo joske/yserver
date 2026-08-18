@@ -20,6 +20,7 @@ pub(crate) mod owned_semaphore;
 pub(crate) mod platform;
 pub(crate) mod present_completion;
 pub(crate) mod present_source_wait;
+pub(crate) mod probe_executor;
 pub(crate) mod root_overlay;
 pub(crate) mod scene;
 pub(crate) mod store;
