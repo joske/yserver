@@ -59,7 +59,7 @@ use crate::{
         },
         scanout_route::{RenderKmsRelationship, ScanoutRoute},
         vk::{
-            device::{VkContext, VulkanDeviceSelector},
+            device::{VkContext, VkInitError, VulkanDeviceSelector},
             ops::OpsCommandPool,
             scanout::{
                 BoPhase, BoState, CopiedScanoutPlan, CopiedScanoutPool, OutputScanout,
@@ -933,6 +933,28 @@ pub(crate) struct PreparedCopiedScanoutPool {
     committed_framebuffer: Option<::drm::control::framebuffer::Handle>,
 }
 
+/// Live exact-plan replay prepared while the current display topology remains
+/// active. The fields stay private so only the platform can commit or destroy
+/// the uninstalled scanout pool.
+pub(crate) struct PreparedQualifiedConnector {
+    output_key: OutputKey,
+    output: crate::platform::drm::Output,
+    mode_spec: yserver_core::backend::ModeSpec,
+    x: i32,
+    y: i32,
+    scanout_route: ScanoutRoute,
+    pool: OutputScanout,
+}
+
+struct ResolvedConnectorEnable {
+    connector: String,
+    device: Rc<drm::Device>,
+    output: crate::platform::drm::Output,
+    scanout_route: ScanoutRoute,
+    existing_idx: Option<usize>,
+    needs_pool_realloc: bool,
+}
+
 /// Resource-free result of disposable cross-device qualification. The parent
 /// may replay only this exact representation on its live Vulkan contexts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -942,6 +964,26 @@ pub(crate) enum QualifiedScanoutPlan {
         sink_id: RenderDeviceId,
         plan: CopiedScanoutPlan,
     },
+}
+
+/// Scalar identity of the copied-path sink selected for one worker probe.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CopiedQualificationSink {
+    pub(crate) id: RenderDeviceId,
+    pub(crate) selector: VulkanDeviceSelector,
+}
+
+/// Structured worker-visible qualification outcome. Ordinary incompatibility
+/// may be reported to the client; indeterminate submitted work and device loss
+/// must stop the candidate sequence immediately.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ScanoutQualificationError {
+    #[error("scanout route rejected: {0}")]
+    Rejected(io::Error),
+    #[error("scanout route probe became indeterminate: {0}")]
+    Indeterminate(io::Error),
+    #[error("scanout route probe lost a Vulkan device: {0}")]
+    DeviceLost(io::Error),
 }
 
 pub(crate) enum ExactPlanReplay<T> {
@@ -1061,6 +1103,258 @@ fn require_copied_sink_explicit_dmabuf_layout_import(supported: bool) -> io::Res
 
 fn route_requires_copy_free_probe(route: ScanoutRoute) -> bool {
     route.relationship != RenderKmsRelationship::Same
+}
+
+fn scanout_qualification_vk_init_error(
+    stage: &str,
+    error: VkInitError,
+) -> ScanoutQualificationError {
+    let device_lost = matches!(
+        &error,
+        VkInitError::Vk(result) if *result == vk::Result::ERROR_DEVICE_LOST
+    );
+    let error = io::Error::other(format!("{stage}: {error}"));
+    if device_lost {
+        ScanoutQualificationError::DeviceLost(error)
+    } else {
+        ScanoutQualificationError::Rejected(error)
+    }
+}
+
+fn classify_copy_free_qualification_error(
+    error: CopyFreeScanoutError,
+) -> ScanoutQualificationError {
+    match error {
+        CopyFreeScanoutError::Candidates(error)
+            if crate::kms::vk::scanout::scanout_error_is_device_lost(&error) =>
+        {
+            ScanoutQualificationError::DeviceLost(error)
+        }
+        CopyFreeScanoutError::Candidates(error) => ScanoutQualificationError::Rejected(error),
+        CopyFreeScanoutError::TerminalDisposableProbe(error) => {
+            ScanoutQualificationError::Indeterminate(error)
+        }
+        CopyFreeScanoutError::LiveRendererLost(error) => {
+            ScanoutQualificationError::DeviceLost(error)
+        }
+    }
+}
+
+fn classify_copied_qualification_error(error: CopiedScanoutError) -> ScanoutQualificationError {
+    match error {
+        CopiedScanoutError::Candidates(error)
+            if crate::kms::vk::scanout::scanout_error_is_device_lost(&error) =>
+        {
+            ScanoutQualificationError::DeviceLost(error)
+        }
+        CopiedScanoutError::Candidates(error) => ScanoutQualificationError::Rejected(error),
+        CopiedScanoutError::TerminalDisposableProbe(error) => {
+            ScanoutQualificationError::Indeterminate(error)
+        }
+        CopiedScanoutError::LiveDeviceLost { context, source } => {
+            ScanoutQualificationError::DeviceLost(io::Error::new(
+                source.kind(),
+                format!("{context}: {source}"),
+            ))
+        }
+    }
+}
+
+/// Create a disposable compositor-profile context from a stable selector.
+///
+/// `VkContext` intentionally exposes selector-based construction only for the
+/// minimal transfer profile. Use that submission-free context as an exact
+/// physical-device anchor for the compositor profile, then mark the anchor
+/// quiescent before it leaves this function.
+fn new_disposable_compositor_for_selector(
+    selector: VulkanDeviceSelector,
+) -> Result<Arc<VkContext>, VkInitError> {
+    let selector_anchor = VkContext::new_disposable_transfer_for_device(selector)?;
+    let compositor = VkContext::new_disposable_for_same_physical_device(&selector_anchor);
+    selector_anchor.mark_disposable_probe_quiescent();
+    compositor
+}
+
+/// Apply the worker candidate policy independently of Vulkan/DRM mechanics:
+/// copy-free candidates precede copied candidates, ordinary rejection advances
+/// the sequence, and an indeterminate/device-lost result stops immediately.
+fn qualify_scanout_candidates_in_order<S, C>(
+    shared_candidates: impl IntoIterator<Item = S>,
+    mut qualify_shared: impl FnMut(S) -> Result<QualifiedScanoutPlan, ScanoutQualificationError>,
+    copied_candidates: impl FnOnce() -> Result<Vec<C>, ScanoutQualificationError>,
+    mut qualify_copied: impl FnMut(C) -> Result<QualifiedScanoutPlan, ScanoutQualificationError>,
+) -> Result<QualifiedScanoutPlan, ScanoutQualificationError> {
+    let mut failures = Vec::new();
+    for candidate in shared_candidates {
+        match qualify_shared(candidate) {
+            Ok(qualified) => return Ok(qualified),
+            Err(ScanoutQualificationError::Rejected(error)) => {
+                failures.push(format!("copy-free: {error}"));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    let copied_candidates = match copied_candidates() {
+        Ok(candidates) => candidates,
+        Err(ScanoutQualificationError::Rejected(error)) => {
+            failures.push(format!("copied: {error}"));
+            Vec::new()
+        }
+        Err(error) => return Err(error),
+    };
+    for candidate in copied_candidates {
+        match qualify_copied(candidate) {
+            Ok(qualified) => return Ok(qualified),
+            Err(ScanoutQualificationError::Rejected(error)) => {
+                failures.push(format!("copied: {error}"));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(ScanoutQualificationError::Rejected(io::Error::other(
+        format!(
+            "every disposable scanout candidate failed: {}",
+            failures.join("; ")
+        ),
+    )))
+}
+
+/// Qualify a cross-device route entirely on fresh disposable Vulkan contexts.
+///
+/// The returned plan contains only scalar identities. Copy-free candidates are
+/// exhausted first; copied candidates preserve their native-modifier-before-
+/// LINEAR ordering. Every exact candidate gets a newly-created context set, so
+/// a rejected candidate cannot contaminate the next one. Only ordinary,
+/// proven-quiescent rejection advances the sequence.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qualify_scanout_route_for_worker(
+    render_selector: VulkanDeviceSelector,
+    copied_sink: Option<CopiedQualificationSink>,
+    scanout_device: Rc<drm::Device>,
+    output: &crate::platform::drm::Output,
+    route: ScanoutRoute,
+    width: u32,
+    height: u32,
+) -> Result<QualifiedScanoutPlan, ScanoutQualificationError> {
+    if !route_requires_copy_free_probe(route) {
+        return Err(ScanoutQualificationError::Rejected(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "worker qualification is only valid for a cross-device scanout route",
+        )));
+    }
+    if width == 0 || height == 0 {
+        return Err(ScanoutQualificationError::Rejected(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("worker qualification received invalid extent {width}x{height}"),
+        )));
+    }
+
+    let shared_inventory = new_disposable_compositor_for_selector(render_selector)
+        .map_err(|error| scanout_qualification_vk_init_error("copy-free plan inventory", error))?;
+    let shared_candidates = ScanoutBoPool::exact_allocation_plans(
+        &shared_inventory,
+        &scanout_device,
+        width,
+        &output.scanout_modifiers,
+    );
+    shared_inventory.mark_disposable_probe_quiescent();
+    drop(shared_inventory);
+
+    qualify_scanout_candidates_in_order(
+        shared_candidates,
+        |plan| {
+            let probe_vk =
+                new_disposable_compositor_for_selector(render_selector).map_err(|error| {
+                    scanout_qualification_vk_init_error(
+                        &format!("{} disposable source renderer", plan.describe()),
+                        error,
+                    )
+                })?;
+            qualify_copy_free_scanout_plan(
+                probe_vk,
+                Rc::clone(&scanout_device),
+                output,
+                route,
+                width,
+                height,
+                &output.scanout_modifiers,
+                plan,
+            )
+            .map_err(classify_copy_free_qualification_error)
+        },
+        || {
+            let sink = copied_sink.ok_or_else(|| {
+                ScanoutQualificationError::Rejected(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "no exact sink renderer is available for copied scanout",
+                ))
+            })?;
+            let render_inventory = new_disposable_compositor_for_selector(render_selector)
+                .map_err(|error| {
+                    scanout_qualification_vk_init_error("copied plan source inventory", error)
+                })?;
+            let sink_inventory = match VkContext::new_disposable_transfer_for_device(sink.selector)
+            {
+                Ok(context) => context,
+                Err(error) => {
+                    render_inventory.mark_disposable_probe_quiescent();
+                    return Err(scanout_qualification_vk_init_error(
+                        "copied plan sink inventory",
+                        error,
+                    ));
+                }
+            };
+            let candidates = CopiedScanoutPool::exact_allocation_plans(
+                &render_inventory,
+                &sink_inventory,
+                &scanout_device,
+                width,
+                &output.scanout_modifiers,
+            );
+            render_inventory.mark_disposable_probe_quiescent();
+            sink_inventory.mark_disposable_probe_quiescent();
+            drop(render_inventory);
+            drop(sink_inventory);
+            Ok(candidates)
+        },
+        |plan| {
+            let sink = copied_sink.expect("copied candidates require a sink identity");
+            let probe_render_vk =
+                new_disposable_compositor_for_selector(render_selector).map_err(|error| {
+                    scanout_qualification_vk_init_error(
+                        &format!("{} disposable source renderer", plan.describe()),
+                        error,
+                    )
+                })?;
+            let probe_sink_vk = match VkContext::new_disposable_transfer_for_device(sink.selector) {
+                Ok(context) => context,
+                Err(error) => {
+                    probe_render_vk.mark_disposable_probe_quiescent();
+                    return Err(scanout_qualification_vk_init_error(
+                        &format!("{} disposable sink renderer", plan.describe()),
+                        error,
+                    ));
+                }
+            };
+            let destination_route =
+                ScanoutRoute::new(sink.id, route.kms_device_key, RenderKmsRelationship::Same);
+            qualify_copied_scanout_plan(
+                probe_render_vk,
+                probe_sink_vk,
+                Rc::clone(&scanout_device),
+                output,
+                route,
+                destination_route,
+                width,
+                height,
+                &output.scanout_modifiers,
+                plan,
+            )
+            .map_err(classify_copied_qualification_error)
+        },
+    )
 }
 
 fn test_scanout_pool(
@@ -5066,6 +5360,120 @@ impl PlatformBackend {
         self.refresh_cursor_topology_for_devices(&HashSet::from([changed_device]));
     }
 
+    fn resolve_connector_enable(
+        &self,
+        output_key: &OutputKey,
+        mut output: crate::platform::drm::Output,
+        mode_spec: yserver_core::backend::ModeSpec,
+    ) -> io::Result<ResolvedConnectorEnable> {
+        let connector = output.connector_name.clone();
+        debug_assert_eq!(output_key.connector_name, connector);
+        let device = Rc::clone(
+            &self
+                .device_for_output(output_key)
+                .ok_or_else(|| io::Error::other(format!("no DRM device for {output_key:?}")))?
+                .device,
+        );
+        let scanout_route = self.scanout_route_for_kms(output_key.device_key)?;
+
+        if let Some(conflict) = self.outputs.iter().find(|layout| {
+            layout.key.device_key == output_key.device_key
+                && layout.key != *output_key
+                && (layout.output.encoder == output.encoder
+                    || layout.output.crtc == output.crtc
+                    || layout.output.plane == output.plane)
+        }) {
+            return Err(io::Error::other(format!(
+                "enable_connector {connector}: proposed encoder {:?}/CRTC {:?}/plane {:?} conflicts with \
+                 live output {} on the same DRM device",
+                output.encoder, output.crtc, output.plane, conflict.output.connector_name
+            )));
+        }
+
+        let matched = output
+            .modes
+            .iter()
+            .find(|mode| {
+                mode.width == mode_spec.width
+                    && mode.height == mode_spec.height
+                    && mode.vrefresh == mode_spec.vrefresh
+            })
+            .cloned();
+        let mode_local = matched.ok_or_else(|| {
+            io::Error::other(format!(
+                "connector {connector}: mode {}×{}@{} not in advertised list",
+                mode_spec.width, mode_spec.height, mode_spec.vrefresh
+            ))
+        })?;
+
+        if output.picked.width != mode_spec.width
+            || output.picked.height != mode_spec.height
+            || output.picked.vrefresh != mode_spec.vrefresh
+        {
+            use ::drm::control::Device as ControlDevice;
+            let drm_mode_opt = mode_via_connector_handle(
+                output.connector,
+                mode_spec,
+                |connector_handle| {
+                    device
+                        .get_connector(connector_handle, false)
+                        .map(|info| info.modes().to_vec())
+                        .map_err(|error| {
+                            io::Error::new(
+                                error.kind(),
+                                format!(
+                                    "connector {connector} ({connector_handle:?}): get_connector failed: {error}"
+                                ),
+                            )
+                        })
+                },
+                |mode| {
+                    let (width, height) = mode.size();
+                    (width, height, mode.vrefresh())
+                },
+            )?;
+            let drm_mode = drm_mode_opt.ok_or_else(|| {
+                io::Error::other(format!(
+                    "connector {connector} ({:?}): DRM mode {}×{}@{} not found via kernel",
+                    output.connector, mode_spec.width, mode_spec.height, mode_spec.vrefresh
+                ))
+            })?;
+            output.mode = drm_mode;
+            output.picked = mode_local;
+        }
+
+        let existing_idx = self
+            .outputs
+            .iter()
+            .position(|layout| &layout.key == output_key);
+        if let Some(index) = existing_idx
+            && (index >= self.scanout_pools.len() || index >= self.bo_generations.len())
+        {
+            return Err(io::Error::other(format!(
+                "enable_connector {connector}: active output index {index} has no paired scanout-pool/generation slot"
+            )));
+        }
+        let needs_pool_realloc = scanout_pool_needs_reallocation(
+            existing_idx.and_then(|idx| self.outputs.get(idx)),
+            existing_idx
+                .and_then(|idx| self.scanout_pools.get(idx))
+                .and_then(Option::as_ref)
+                .map(OutputScanout::route),
+            mode_spec.width,
+            mode_spec.height,
+            scanout_route,
+        );
+
+        Ok(ResolvedConnectorEnable {
+            connector,
+            device,
+            output,
+            scanout_route,
+            existing_idx,
+            needs_pool_realloc,
+        })
+    }
+
     /// Enable (or reconfigure) a single connector at `(x, y)` with
     /// the given `ModeSpec`.  Resolves the `ModeSpec` against the
     /// connector's discovered `Output::modes` list, (re)allocates the
@@ -5099,156 +5507,256 @@ impl PlatformBackend {
         )
     }
 
-    fn enable_connector_with_cursor_factory<F>(
+    /// Replay one resource-free worker qualification on the live Vulkan
+    /// context and install the resulting pool/output through the ordinary
+    /// synchronous modeset ownership path. This never probes another
+    /// representation or falls back to a different transport.
+    pub(crate) fn enable_connector_with_qualified_plan(
         &mut self,
         output_key: &OutputKey,
-        mut output: crate::platform::drm::Output,
+        output: crate::platform::drm::Output,
         mode_spec: yserver_core::backend::ModeSpec,
         x: i32,
         y: i32,
+        qualified: QualifiedScanoutPlan,
+    ) -> io::Result<()> {
+        let prepared =
+            self.prepare_qualified_connector_plan(output_key, output, mode_spec, x, y, qualified)?;
+        self.install_prepared_connector_plan(prepared)
+    }
+
+    /// Replay the exact worker-selected representation on live Vulkan
+    /// contexts without changing KMS state. Allocation and atomic TEST_ONLY
+    /// happen here while the old display topology remains lit.
+    pub(crate) fn prepare_qualified_connector_plan(
+        &mut self,
+        output_key: &OutputKey,
+        output: crate::platform::drm::Output,
+        mode_spec: yserver_core::backend::ModeSpec,
+        x: i32,
+        y: i32,
+        qualified: QualifiedScanoutPlan,
+    ) -> io::Result<PreparedQualifiedConnector> {
+        let resolved = self.resolve_connector_enable(output_key, output, mode_spec)?;
+        let ResolvedConnectorEnable {
+            connector,
+            device,
+            output,
+            scanout_route,
+            existing_idx: _,
+            needs_pool_realloc,
+        } = resolved;
+        if !route_requires_copy_free_probe(scanout_route) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "prepare qualified connector {connector}: route {scanout_route:?} is not cross-device"
+                ),
+            ));
+        }
+        if !needs_pool_realloc {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "prepare qualified connector {connector}: live output no longer needs scanout reallocation"
+                ),
+            ));
+        }
+        let vk = self.vk.as_ref().cloned().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("prepare qualified connector {connector}: no live Vulkan renderer"),
+            )
+        })?;
+
+        let pool = match qualified {
+            qualified @ QualifiedScanoutPlan::Shared(_) => {
+                match replay_copy_free_scanout_plan(
+                    vk,
+                    device,
+                    &output,
+                    scanout_route,
+                    u32::from(mode_spec.width),
+                    u32::from(mode_spec.height),
+                    &output.scanout_modifiers,
+                    qualified,
+                    false,
+                ) {
+                    Ok(ExactPlanReplay::Prepared(prepared)) => {
+                        debug_assert!(prepared.committed_framebuffer.is_none());
+                        OutputScanout::Shared(prepared.pool)
+                    }
+                    Ok(ExactPlanReplay::Rejected(error)) => return Err(error),
+                    Err(error @ CopyFreeScanoutError::TerminalDisposableProbe(_)) => {
+                        return Err(error.into_io_error());
+                    }
+                    Err(error @ CopyFreeScanoutError::LiveRendererLost(_)) => {
+                        self.renderer_failed = true;
+                        return Err(error.into_io_error());
+                    }
+                    Err(CopyFreeScanoutError::Candidates(error)) => return Err(error),
+                }
+            }
+            qualified @ QualifiedScanoutPlan::Copied { sink_id, .. } => {
+                let (live_sink_id, sink_vk) =
+                    self.copied_sink_context_for_kms(output_key.device_key)?;
+                if live_sink_id != sink_id {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "prepare qualified connector {connector}: qualified sink {sink_id:?} no longer matches live sink {live_sink_id:?}"
+                        ),
+                    ));
+                }
+                let destination_route = ScanoutRoute::new(
+                    live_sink_id,
+                    output_key.device_key,
+                    RenderKmsRelationship::Same,
+                );
+                match replay_copied_scanout_plan(
+                    vk,
+                    sink_vk,
+                    device,
+                    &output,
+                    scanout_route,
+                    destination_route,
+                    u32::from(mode_spec.width),
+                    u32::from(mode_spec.height),
+                    &output.scanout_modifiers,
+                    qualified,
+                    false,
+                ) {
+                    Ok(ExactPlanReplay::Prepared(prepared)) => {
+                        debug_assert!(prepared.committed_framebuffer.is_none());
+                        OutputScanout::Copied(prepared.pool)
+                    }
+                    Ok(ExactPlanReplay::Rejected(error)) => return Err(error),
+                    Err(error @ CopiedScanoutError::TerminalDisposableProbe(_)) => {
+                        return Err(error.into_io_error());
+                    }
+                    Err(error @ CopiedScanoutError::LiveDeviceLost { .. }) => {
+                        self.renderer_failed = true;
+                        return Err(error.into_io_error());
+                    }
+                    Err(CopiedScanoutError::Candidates(error))
+                        if crate::kms::vk::scanout::scanout_error_is_device_lost(&error) =>
+                    {
+                        self.renderer_failed = true;
+                        return Err(error);
+                    }
+                    Err(CopiedScanoutError::Candidates(error)) => return Err(error),
+                }
+            }
+        };
+
+        Ok(PreparedQualifiedConnector {
+            output_key: output_key.clone(),
+            output,
+            mode_spec,
+            x,
+            y,
+            scanout_route,
+            pool,
+        })
+    }
+
+    /// Commit and install a pool produced by
+    /// [`Self::prepare_qualified_connector_plan`]. No allocation,
+    /// qualification, or Vulkan content probe occurs in this short boundary.
+    pub(crate) fn install_prepared_connector_plan(
+        &mut self,
+        prepared: PreparedQualifiedConnector,
+    ) -> io::Result<()> {
+        let PreparedQualifiedConnector {
+            output_key,
+            output,
+            mode_spec,
+            x,
+            y,
+            scanout_route,
+            pool,
+        } = prepared;
+        self.enable_connector_inner(
+            &output_key,
+            output,
+            mode_spec,
+            x,
+            y,
+            Some((scanout_route, pool)),
+            initialize_cursor_plane_for_device,
+        )
+    }
+
+    fn enable_connector_with_cursor_factory<F>(
+        &mut self,
+        output_key: &OutputKey,
+        output: crate::platform::drm::Output,
+        mode_spec: yserver_core::backend::ModeSpec,
+        x: i32,
+        y: i32,
+        cursor_factory: F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(&mut KmsDevice, &[::drm::control::crtc::Handle], &str),
+    {
+        self.enable_connector_inner(output_key, output, mode_spec, x, y, None, cursor_factory)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enable_connector_inner<F>(
+        &mut self,
+        output_key: &OutputKey,
+        output: crate::platform::drm::Output,
+        mode_spec: yserver_core::backend::ModeSpec,
+        x: i32,
+        y: i32,
+        prepared_pool: Option<(ScanoutRoute, OutputScanout)>,
         mut cursor_factory: F,
     ) -> io::Result<()>
     where
         F: FnMut(&mut KmsDevice, &[::drm::control::crtc::Handle], &str),
     {
-        let connector = output.connector_name.clone();
-        debug_assert_eq!(output_key.connector_name, connector);
-        let device = Rc::clone(
-            &self
-                .device_for_output(output_key)
-                .ok_or_else(|| io::Error::other(format!("no DRM device for {output_key:?}")))?
-                .device,
-        );
-        let scanout_route = self.scanout_route_for_kms(output_key.device_key)?;
-
-        if let Some(conflict) = self.outputs.iter().find(|layout| {
-            layout.key.device_key == output_key.device_key
-                && layout.key != *output_key
-                && (layout.output.encoder == output.encoder
-                    || layout.output.crtc == output.crtc
-                    || layout.output.plane == output.plane)
-        }) {
-            return Err(io::Error::other(format!(
-                "enable_connector {connector}: proposed encoder {:?}/CRTC {:?}/plane {:?} conflicts with \
-                 live output {} on the same DRM device",
-                output.encoder, output.crtc, output.plane, conflict.output.connector_name
-            )));
-        }
-
-        // Resolve ModeSpec → the DRM mode on the output.
-        // `Output::modes` is the full advertised list (preferred-first).
-        let matched = output
-            .modes
-            .iter()
-            .find(|m| {
-                m.width == mode_spec.width
-                    && m.height == mode_spec.height
-                    && m.vrefresh == mode_spec.vrefresh
-            })
-            .cloned();
-        let mode_local = matched.ok_or_else(|| {
-            io::Error::other(format!(
-                "connector {connector}: mode {}×{}@{} not in advertised list",
-                mode_spec.width, mode_spec.height, mode_spec.vrefresh
-            ))
-        })?;
-
-        // Find the matching DRM mode by index (modes / drm_mode are
-        // co-indexed in finalize_output).  We need `output.mode` to be
-        // the DRM-level blob for commit_modeset.
-        // `Output.modes` was sorted preferred-first by discover_outputs,
-        // so we need the raw connector_info modes.  Instead, we search
-        // by name+size+vrefresh in the already-set `output.picked` /
-        // `output.modes` list with the picked index trick reused from
-        // finalize_output: find mode_local by (name,w,h,vrefresh).
-        //
-        // The simplest reliable approach: the DRM mode is exactly the
-        // one that was stored in `output.mode` when `discover_outputs`
-        // called `finalize_output`, which selects via `pick_mode`.
-        // For a client-requested mode that differs from the picked one,
-        // we must force the mode.  `Output` doesn't carry the full
-        // DrmMode list — it only carries `mode` (the picked one) and
-        // `modes` (the logical Mode structs).
-        //
-        // Strategy: set `output.picked = mode_local` and reconstruct
-        // the DRM mode from the `output.mode` field ONLY when it matches,
-        // otherwise we need a DRM-level lookup.  Since we hold the raw
-        // `Output` returned by `discover_outputs` (which runs
-        // `get_connector` under the hood), and `Output::mode` is the
-        // DRM mode for `picked`, we detect the match:
-        if output.picked.width != mode_spec.width
-            || output.picked.height != mode_spec.height
-            || output.picked.vrefresh != mode_spec.vrefresh
-        {
-            // Client requested a non-picked mode. Fetch the full DRM mode
-            // list through the typed connector handle already carried by
-            // `Output`; connector display names are protocol/UI data and
-            // are not DRM object identity (e.g. Xorg `HDMI-1` versus
-            // drm-rs `HDMI-A-1`).
-            use ::drm::control::Device as ControlDevice;
-            let drm_mode_opt = mode_via_connector_handle(
-                output.connector,
-                mode_spec,
-                |connector_handle| {
-                    device
-                        .get_connector(connector_handle, false)
-                        .map(|info| info.modes().to_vec())
-                        .map_err(|e| {
-                            io::Error::new(
-                                e.kind(),
-                                format!(
-                                    "connector {connector} ({connector_handle:?}): get_connector failed: {e}"
-                                ),
-                            )
-                        })
-                },
-                |mode| {
-                    let (width, height) = mode.size();
-                    (width, height, mode.vrefresh())
-                },
-            )?;
-            let drm_mode = drm_mode_opt.ok_or_else(|| {
-                io::Error::other(format!(
-                    "connector {connector} ({:?}): DRM mode {}×{}@{} not found via kernel",
-                    output.connector, mode_spec.width, mode_spec.height, mode_spec.vrefresh
-                ))
-            })?;
-            output.mode = drm_mode;
-            output.picked = mode_local;
-        }
-        // At this point output.mode is the DRM mode for the requested spec.
-
+        let resolved = self.resolve_connector_enable(output_key, output, mode_spec)?;
+        let ResolvedConnectorEnable {
+            connector,
+            device,
+            output,
+            scanout_route,
+            existing_idx,
+            needs_pool_realloc,
+        } = resolved;
         let w = mode_spec.width;
         let h = mode_spec.height;
 
-        // Check whether this connector is already in the active set and
-        // whether its resolution matches.
-        let existing_idx = self
-            .outputs
-            .iter()
-            .position(|layout| &layout.key == output_key);
-        if let Some(index) = existing_idx
-            && (index >= self.scanout_pools.len() || index >= self.bo_generations.len())
-        {
-            return Err(io::Error::other(format!(
-                "enable_connector {connector}: active output index {index} has no paired scanout-pool/generation slot"
-            )));
+        if let Some((prepared_route, prepared)) = prepared_pool.as_ref() {
+            if !needs_pool_realloc {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "install prepared connector {connector}: live output no longer needs scanout reallocation"
+                    ),
+                ));
+            }
+            if *prepared_route != scanout_route || prepared.route() != scanout_route {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "install prepared connector {connector}: prepared route {prepared_route:?}/pool {:?} no longer matches live route {scanout_route:?}",
+                        prepared.route(),
+                    ),
+                ));
+            }
         }
-        let needs_pool_realloc = scanout_pool_needs_reallocation(
-            existing_idx.and_then(|idx| self.outputs.get(idx)),
-            existing_idx
-                .and_then(|idx| self.scanout_pools.get(idx))
-                .and_then(Option::as_ref)
-                .map(OutputScanout::route),
-            w,
-            h,
-            scanout_route,
-        );
 
         // (Re)allocate the scanout pool if needed.
         let mut new_pool_committed_framebuffer = None;
         let mut new_pool: Option<Option<OutputScanout>> = if needs_pool_realloc {
-            if let Some(vk) = self.vk.as_ref().cloned() {
+            if let Some((_prepared_route, pool)) = prepared_pool {
+                // Exact replay and live TEST_ONLY already completed while the
+                // previous topology was still active. Keep this dark-window
+                // path to the KMS commit and ownership installation only.
+                Some(Some(pool))
+            } else if let Some(vk) = self.vk.as_ref().cloned() {
                 let allocation: io::Result<OutputScanout> =
                     if route_requires_copy_free_probe(scanout_route) {
                         match allocate_copy_free_scanout_pool(
@@ -5429,16 +5937,20 @@ impl PlatformBackend {
             }
             Ok(())
         };
+        // Once commit_modeset succeeds the selected framebuffer is KMS-owned.
+        // Defer any bookkeeping error until the pool has been installed into
+        // `self`, so an invariant failure cannot unwind and free live backing.
+        let mut post_commit_ownership_error = None;
         if needs_pool_realloc && new_pool_committed_framebuffer.is_none() {
             if let Some(pool) = new_pool.as_mut().and_then(Option::as_mut) {
-                mark_front(pool)?;
+                post_commit_ownership_error = mark_front(pool).err();
             }
         } else if !needs_pool_realloc
             && let Some(pool) = existing_idx
                 .and_then(|idx| self.scanout_pools.get_mut(idx))
                 .and_then(Option::as_mut)
         {
-            mark_front(pool)?;
+            post_commit_ownership_error = mark_front(pool).err();
         }
 
         // Commit succeeded — install the output into the active set.
@@ -5516,6 +6028,18 @@ impl PlatformBackend {
             fb_w,
             fb_h
         );
+        if let Some(error) = post_commit_ownership_error {
+            self.renderer_failed = true;
+            // The KMS commit and platform installation already succeeded.
+            // Report success so the caller's RANDR registry converges with
+            // the live topology; `renderer_failed` drives the ordinary fatal
+            // renderer path instead of misclassifying this as a pre-install
+            // configuration rejection.
+            log::error!(
+                "enable_connector {connector}: committed framebuffer is retained and installed, \
+                 but scanout ownership bookkeeping failed: {error}"
+            );
+        }
         Ok(())
     }
 
@@ -6180,6 +6704,86 @@ mod tests {
                 plan: copied_plan,
             }
         );
+    }
+
+    #[test]
+    fn worker_qualification_exhausts_copy_free_before_preserving_copied_order() {
+        let calls = RefCell::new(Vec::new());
+        let sink_id = RenderDeviceId::DrmRender(drm_key(9));
+        let copied_plan = CopiedScanoutPlan {
+            source: crate::kms::vk::scanout::CopiedSourcePlan::DrmModifier(0x91),
+            destination: ScanoutAllocationPlan::ExplicitLinear,
+        };
+
+        let qualified = qualify_scanout_candidates_in_order(
+            ["shared-native", "shared-linear"],
+            |candidate| {
+                calls.borrow_mut().push(candidate);
+                Err(ScanoutQualificationError::Rejected(io::Error::other(
+                    candidate,
+                )))
+            },
+            || {
+                calls.borrow_mut().push("copied-inventory");
+                Ok(vec![
+                    ("copied-native", copied_plan),
+                    ("copied-linear", copied_plan),
+                ])
+            },
+            |(candidate, plan)| {
+                calls.borrow_mut().push(candidate);
+                Ok(QualifiedScanoutPlan::Copied { sink_id, plan })
+            },
+        )
+        .expect("the first copied candidate should win");
+
+        assert_eq!(
+            calls.into_inner(),
+            vec![
+                "shared-native",
+                "shared-linear",
+                "copied-inventory",
+                "copied-native"
+            ]
+        );
+        assert_eq!(
+            qualified,
+            QualifiedScanoutPlan::Copied {
+                sink_id,
+                plan: copied_plan,
+            }
+        );
+    }
+
+    #[test]
+    fn worker_qualification_stops_immediately_after_indeterminate_submission() {
+        let calls = RefCell::new(Vec::new());
+        let result = qualify_scanout_candidates_in_order(
+            ["shared-first", "shared-must-not-run"],
+            |candidate| {
+                calls.borrow_mut().push(candidate);
+                Err(ScanoutQualificationError::Indeterminate(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "submitted fence did not complete",
+                )))
+            },
+            || {
+                calls.borrow_mut().push("copied-must-not-enumerate");
+                Ok(vec!["copied-must-not-run"])
+            },
+            |candidate| {
+                calls.borrow_mut().push(candidate);
+                Ok(QualifiedScanoutPlan::Shared(
+                    ScanoutAllocationPlan::ExplicitLinear,
+                ))
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(ScanoutQualificationError::Indeterminate(_))
+        ));
+        assert_eq!(calls.into_inner(), vec!["shared-first"]);
     }
 
     #[test]
