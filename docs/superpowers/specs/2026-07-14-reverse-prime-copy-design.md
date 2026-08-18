@@ -157,11 +157,15 @@ allocation and `TEST_ONLY` are outside the timed region. GPU liveness timing is
 attached to submitted work rather than the complete cold probe. Every
 copy-free BO fence and every copied A or B fence receives its own fresh 200 ms
 monotonic completion window. The budget resets for each submitted fence;
-context and pipeline creation, full-pool allocation, `TEST_ONLY`, and CPU
-validation are outside those windows. Vulkan provides no way to preempt a
-driver host call that itself returns late, so a successful fence result proves
-completion regardless of total elapsed wall time. The first copied cycle
-performs:
+context and pipeline creation, full-pool allocation, `TEST_ONLY`, and compact
+CPU verdict parsing are outside those windows. The per-device block reduction
+and compact result write are submitted GPU work and therefore complete under
+the corresponding A or B fence. The exact CPU fallback remains outside the
+fence window after its image-copy fence succeeds and can therefore run into the
+outer helper watchdog, which makes the result `Indeterminate`. Vulkan provides
+no way to preempt a driver host call that itself returns late, so a successful
+fence result proves completion regardless of total elapsed wall time. The
+first copied cycle performs:
 
 1. a real color-attachment render into A's optimal local target of a
    full-extent radial hue-and-luminance pattern. It desaturates smoothly toward
@@ -170,39 +174,61 @@ performs:
 2. an optional FOREIGN-to-A acquire of the external transport, separate local
    target/transport transitions, a full optimal-to-transport copy, local
    returns to `GENERAL`, then a separate transport A-to-FOREIGN release and
-   export of A's completion as a `sync_file`. A also copies its still-local
-   optimal target into a tightly packed host-visible BGRA buffer without
-   reacquiring or reading the external transport;
+   export of A's completion as a `sync_file`. Without reacquiring or reading
+   the external transport, A makes every pixel of its still-local optimal
+   target contribute to a positional, multi-lane digest for its exact block
+   and writes the compact digest table plus exact tokenized corner words to a
+   small host-visible result buffer, preferring a `HOST_CACHED` memory type when
+   available;
 3. B import/wait, a matching FOREIGN-to-B acquire, local transfer layouts, a
    full-image GPU copy, local return to `GENERAL`, and separate B-to-FOREIGN
    releases for source and destination. Before the destination release, B
-   copies that final Vulkan destination into its own tightly packed
-   host-visible BGRA buffer;
+   reduces every pixel of that final Vulkan destination into the same
+   positional, multi-lane per-block representation and writes its compact
+   digest table and corner words to its own small host-visible result buffer,
+   again preferring `HOST_CACHED` memory when available;
 4. A and B probe-fence completion, each with its own fresh 200 ms window,
-   followed after both report success by stable diagnostic hashes and an exact
-   byte-for-byte A-target/B-destination comparison. Completion remains
-   authoritative if a successful host wait returns after the nominal window;
-   hashes never decide admission alone, and a mismatch reports the first pixel
-   and channel.
+   followed after both report success by CPU validation of the exact expected
+   tokenized corner words, equality of every corresponding positional digest
+   block and lane, and the freshness record. Completion remains authoritative
+   if a successful host wait returns after the nominal window. Because compact
+   digests necessarily admit collisions, this is a probabilistic content
+   guarantee rather than the previous collision-free byte equality; multiple
+   independent lanes plus block position make accidental admission negligible
+   while retaining block-level diagnostics.
+
+Digest eligibility is decided independently for A and B. Each selected queue
+must support compute, and the corresponding input must fit that device's
+`maxStorageBufferRange`. If either check fails, qualification falls back to the
+previous full, tightly packed A-target/B-destination readbacks and exact CPU
+byte comparison. A reducer infrastructure failure that is safely known before
+submission takes the same correctness-preserving fallback. Neither condition
+is route incompatibility, and the fallback is not selected merely for
+performance or after a digest mismatch. A reducer failure after submission
+that leaves completion or resource state uncertain is `Indeterminate`; it
+cannot reject the route. The exact CPU fallback remains subject to the outer
+helper watchdog and therefore may itself end as `Indeterminate`.
 
 Cycle two changes the pattern token, imports B's retained return completion
 into a fresh temporary A semaphore, waits it, and executes FOREIGN-to-A on the
-external transport before another target-to-transport copy/release/readback.
-Repeating the first renderer hash is rejected, so matching stale frames on both
-devices cannot pass merely by matching each other. The optimal target stays
+external transport before another target-to-transport copy/release/reduction.
+Repeating the first renderer digest set or freshness record is rejected, and
+both devices' exact corner words must encode the new token, so matching stale
+frames cannot pass merely by matching each other. The optimal target stays
 A-local in both cycles. `TEST_ONLY` does not make KMS an ownership participant,
 so the disposable destination is treated as atomic-rejected/abandoned after
 cycle one and cycle two full-discards it from `UNDEFINED`; the real `GENERAL`
 KMS-to-B return leg is reserved for a live two-flip hardware smoke test and is
 never fabricated by the probe.
 
-A safe pre-submit failure or validation failure after both fences have
-completed, such as a pixel, fiducial, or freshness mismatch, rejects only that
-plan and continues the exact candidate order. Once both fences complete, CPU
-validation runs to its authoritative verdict even if the cycle or complete
-probe has already taken more than 200 ms. After all submitted work on the
-disposable A/B contexts is fence-proven complete, those contexts are marked
-quiescent and their pool, pipeline, and final context Drop paths skip the
+A safe route-specific pre-submit failure other than reducer preparation, or a
+validation failure after both fences have completed, such as a digest,
+fiducial, or freshness mismatch, rejects only that plan and continues the exact
+candidate order. Once both fences complete, CPU
+corner/digest/freshness validation runs to its authoritative verdict even if
+the cycle or complete probe has already taken more than 200 ms. After all
+submitted work on the disposable A/B contexts is fence-proven complete, those
+contexts are marked quiescent and their pool, pipeline, and final context Drop paths skip the
 otherwise defensive device-wide idle. Live contexts and uncertain disposable
 contexts never receive that exemption. Classification follows submission state
 rather than the error kind alone: only a timeout or other post-submit failure
@@ -218,12 +244,13 @@ outputs rather than letting constructor unwind enter an idle wait. Runtime
 qualification and live preparation leave the old topology untouched, so their
 failure returns the request error without a restore commit.
 
-The CPU readbacks are setup-time validation only, not a CPU transport fallback
-in the live frame path. They prove the Vulkan-visible render, transport copy,
-DMA-BUF import, and B copy chain. They cannot prove that the display engine
-will interpret GBM/KMS pitch, offset, and modifier metadata identically; atomic
-`TEST_ONLY` plus a live two-flip visual, writeback, or CRTC-CRC smoke remains the
-end-to-end display gate.
+The compact digest readbacks, and the exact full-image CPU readbacks on the
+eligibility/setup fallback only, are setup-time validation rather than a CPU
+transport fallback in the live frame path. They probabilistically prove the
+Vulkan-visible render, transport copy, DMA-BUF import, and B copy chain. They
+cannot prove that the display engine will interpret GBM/KMS pitch, offset, and
+modifier metadata identically; atomic `TEST_ONLY` plus a live two-flip visual,
+writeback, or CRTC-CRC smoke remains the end-to-end display gate.
 
 Only the exact winning pair is replayed on the live A/B contexts, and every
 live destination framebuffer is tested again. The runtime helper returns the
@@ -328,11 +355,21 @@ submission, and is cleared by failed-cycle recovery and lifecycle reset.
 - Live A or B device loss is fatal.
 - A sink without explicit modifier/layout import support rejects copied
   scanout before any foreign-memory allocation or submission.
-- Content-probe buffers are host-coherent and tightly packed. COPY-to-HOST
-  barriers plus successful A and B fences precede every CPU read. Each fence
-  has its own fresh 200 ms outstanding-completion window, but successful fences
-  always proceed to corner-fiducial, per-cycle freshness, hash, and exact-byte
-  validation regardless of cumulative elapsed time.
+- Every full-extent content-probe pixel contributes to one position-bound block
+  and multiple independent digest lanes on both A and B. Reducer writes and
+  copies to compact host-visible result buffers occur before the respective A
+  and B fences, with `HOST_CACHED` memory preferred but not required;
+  successful waits precede every CPU read. Each fence has its own
+  fresh 200 ms outstanding-completion window, but successful fences always
+  proceed to exact tokenized-corner, corresponding block-digest, and per-cycle
+  freshness validation regardless of cumulative elapsed time. Digest equality
+  is probabilistic, not collision-free. The digest path requires each selected
+  A/B queue independently to support compute and each input to fit that
+  endpoint's `maxStorageBufferRange`. Full tightly packed readback and exact
+  byte comparison preserve correctness when those checks fail or reducer
+  infrastructure fails safely before submission. Post-submit reducer
+  uncertainty, or an exact fallback that reaches the whole-helper watchdog, is
+  `Indeterminate` rather than route incompatibility.
 - Connector/topology, VT, provider, effective DPMS, and logical-size changes
   retire a parked qualification immediately with `Interrupted` and suppress
   its late result. Installed copied-scanout teardown separately unregisters
@@ -351,11 +388,22 @@ submission, and is cleared by failed-cycle recovery and lifecycle reset.
 Copied scanout renders and copies the full output twice on the GPU: optimal A
 target to the selected transport, then B's imported transport alias to its scanout
 destination. The scene already uses full repaint, so this adds no buffer-age
-dependency. Candidate setup additionally reads and compares both full images
-for all three slots and two cycles; per-fence 200 ms completion windows do not
-reduce the three-slot pool or full-output image extent. Live frames do not
-perform this CPU work. There is no copied CPU fallback. Damage-limited copies
-and asynchronous live-frame failure recovery are later optimizations. Runtime
-route qualification is asynchronous with respect to the core, but its initial
-scheduler is a global single-flight FIFO; safe parallel display probing awaits
+dependency. Candidate setup keeps all three slots, both cycles, full-size
+allocations, and both full-image GPU copies, but normally reads only compact
+per-block digest results on the CPU. The full exact CPU comparison is retained
+when either selected queue lacks compute, either input exceeds the relevant
+`maxStorageBufferRange`, or reducer infrastructure cannot safely be prepared;
+it is never a live-frame transport and remains subject to the outer helper
+watchdog. On the deployed AMD Radeon 780M plus NVIDIA RTX
+4070 route at 1600x1200, the allocator preference selects uncached
+`DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT` staging on both devices. The first
+cycle matched with 0 ms and 2 ms A/B fence waits, yet its whole post-fence
+validation phase took 15,149 ms. That interval also includes semaphore
+bookkeeping and cycle recovery, but its scale is consistent with the full
+mapped image scan; the second cycle then ran into the 30 s helper watchdog.
+That was a false route timeout caused by validation overhead, not evidence of
+GPU incompatibility. Damage-limited copies and asynchronous live-frame failure
+recovery are later optimizations. Runtime route qualification is asynchronous
+with respect to the core, but its initial scheduler is a global single-flight
+FIFO; safe parallel display probing awaits
 resource-scoped topology epochs and deterministic ordered admission.

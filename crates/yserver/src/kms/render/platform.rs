@@ -1452,11 +1452,10 @@ pub(crate) fn qualify_copy_free_scanout_plan(
         Ok(pool) => pool,
         Err(error) => {
             probe_vk.mark_disposable_probe_quiescent();
-            let failure = io::Error::new(
-                error.kind(),
-                copy_free_candidate_error(plan, "probe allocation", error.as_io_error()),
-            );
-            if error.abort_candidate_search() {
+            let abort_candidate_search = error.abort_candidate_search();
+            let failure =
+                error.into_io_error_with_context(format!("{} probe allocation", plan.describe()));
+            if abort_candidate_search {
                 return Err(CopyFreeScanoutError::TerminalDisposableProbe(failure));
             }
             return Err(CopyFreeScanoutError::Candidates(failure));
@@ -1466,21 +1465,19 @@ pub(crate) fn qualify_copy_free_scanout_plan(
         let error = probe_pool
             .finish_disposable_probe(Err(error))
             .expect_err("failed TEST_ONLY cannot become a successful probe");
-        let failure = io::Error::new(
-            error.kind(),
-            copy_free_candidate_error(plan, "probe TEST_ONLY", error.as_io_error()),
-        );
-        if error.abort_candidate_search() {
+        let abort_candidate_search = error.abort_candidate_search();
+        let failure =
+            error.into_io_error_with_context(format!("{} probe TEST_ONLY", plan.describe()));
+        if abort_candidate_search {
             return Err(CopyFreeScanoutError::TerminalDisposableProbe(failure));
         }
         return Err(CopyFreeScanoutError::Candidates(failure));
     }
     if let Err(error) = probe_pool.probe_renderer_access(fence_timeout_ns) {
-        let failure = io::Error::new(
-            error.kind(),
-            copy_free_candidate_error(plan, "probe rendering", error.as_io_error()),
-        );
-        if error.abort_candidate_search() {
+        let abort_candidate_search = error.abort_candidate_search();
+        let failure =
+            error.into_io_error_with_context(format!("{} probe rendering", plan.describe()));
+        if abort_candidate_search {
             return Err(CopyFreeScanoutError::TerminalDisposableProbe(failure));
         }
         return Err(CopyFreeScanoutError::Candidates(failure));
@@ -1712,15 +1709,10 @@ pub(crate) fn qualify_copied_scanout_plan(
         Err(error) => {
             probe_render_vk.mark_disposable_probe_quiescent();
             probe_sink_vk.mark_disposable_probe_quiescent();
-            let failure = io::Error::new(
-                error.kind(),
-                format!(
-                    "{} probe allocation: {}",
-                    plan.describe(),
-                    error.as_io_error()
-                ),
-            );
-            if error.abort_candidate_search() {
+            let abort_candidate_search = error.abort_candidate_search();
+            let failure =
+                error.into_io_error_with_context(format!("{} probe allocation", plan.describe()));
+            if abort_candidate_search {
                 return Err(CopiedScanoutError::TerminalDisposableProbe(failure));
             }
             return Err(CopiedScanoutError::Candidates(failure));
@@ -1732,25 +1724,19 @@ pub(crate) fn qualify_copied_scanout_plan(
         let error = probe_pool
             .finish_disposable_probe(Err(error))
             .expect_err("failed TEST_ONLY cannot become a successful copied probe");
-        let failure = io::Error::new(
-            error.kind(),
-            format!(
-                "{} probe TEST_ONLY: {}",
-                plan.describe(),
-                error.as_io_error()
-            ),
-        );
-        if error.abort_candidate_search() {
+        let abort_candidate_search = error.abort_candidate_search();
+        let failure =
+            error.into_io_error_with_context(format!("{} probe TEST_ONLY", plan.describe()));
+        if abort_candidate_search {
             return Err(CopiedScanoutError::TerminalDisposableProbe(failure));
         }
         return Err(CopiedScanoutError::Candidates(failure));
     }
     if let Err(error) = probe_pool.probe_copy_all(fence_timeout_ns) {
-        let failure = io::Error::new(
-            error.kind(),
-            format!("{} probe render/copy/readback: {error}", plan.describe()),
-        );
-        if error.abort_candidate_search() {
+        let abort_candidate_search = error.abort_candidate_search();
+        let failure = error
+            .into_io_error_with_context(format!("{} probe render/copy/readback", plan.describe()));
+        if abort_candidate_search {
             return Err(CopiedScanoutError::TerminalDisposableProbe(failure));
         }
         return Err(CopiedScanoutError::Candidates(failure));
@@ -7015,6 +7001,47 @@ mod tests {
             &error
         ));
         assert!(error.to_string().contains("test copied live allocation"));
+    }
+
+    #[test]
+    fn disposable_device_lost_survives_plan_context_and_classification() {
+        let copied_error = DisposableProbeError::from(
+            crate::kms::vk::scanout::device_lost_scanout_error_for_tests(),
+        )
+        .into_io_error_with_context("test copied disposable content probe");
+        let copied =
+            classify_copied_qualification_error(CopiedScanoutError::Candidates(copied_error));
+
+        let ScanoutQualificationError::DeviceLost(error) = copied else {
+            panic!("disposable Vulkan device loss must not become route rejection");
+        };
+        assert!(crate::kms::vk::scanout::scanout_error_is_device_lost(
+            &error
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("test copied disposable content probe")
+        );
+
+        let copy_free_error = DisposableProbeError::from(
+            crate::kms::vk::scanout::device_lost_scanout_error_for_tests(),
+        )
+        .into_io_error_with_context("test copy-free disposable content probe");
+        let copy_free = classify_copy_free_qualification_error(CopyFreeScanoutError::Candidates(
+            copy_free_error,
+        ));
+        let ScanoutQualificationError::DeviceLost(error) = copy_free else {
+            panic!("copy-free Vulkan device loss must not become route rejection");
+        };
+        assert!(crate::kms::vk::scanout::scanout_error_is_device_lost(
+            &error
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("test copy-free disposable content probe")
+        );
     }
 
     #[test]

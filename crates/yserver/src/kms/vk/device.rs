@@ -195,6 +195,13 @@ pub struct VkContext {
     pub tfp_tiling_strategy: std::sync::OnceLock<super::target::TilingStrategy>,
     pub graphics_queue_family: u32,
     pub graphics_queue: vk::Queue,
+    /// Whether the selected graphics+transfer queue family can also execute
+    /// compute commands. Device selection prefers such a family, but retains
+    /// the graphics+transfer-only fallback for devices whose compositor path
+    /// does not need compute.
+    graphics_queue_supports_compute: bool,
+    /// Maximum descriptor range, in bytes, for one storage buffer.
+    max_storage_buffer_range: u64,
     pub debug_messenger: Option<vk::DebugUtilsMessengerEXT>,
     /// Cached `VkPhysicalDeviceDriverProperties::driverID` for the
     /// picked device. Kept as a diagnostic for log lines / future
@@ -208,9 +215,9 @@ pub struct VkContext {
     /// for headless tests but NOT for real KMS scanout (see
     /// [`Self::is_software_rasterizer`]).
     pub device_type: vk::PhysicalDeviceType,
-    /// Nanoseconds per timestamp-query tick (`limits.timestampPeriod`).
-    /// `0.0` ⇒ no usable timestamp support; the compose GPU-render timer
-    /// (`gpu_render_ns` telemetry) is then skipped.
+    /// Nanoseconds per timestamp-query tick (`limits.timestampPeriod`). `0.0`
+    /// means the selected queue family exposes no timestamp bits, so the
+    /// compose GPU-render timer (`gpu_render_ns` telemetry) is skipped.
     pub timestamp_period: f32,
     /// Whether the device supports the optional `dualSrcBlend` feature,
     /// required by the RENDER `component_alpha` (subpixel/LCD text AA)
@@ -519,6 +526,14 @@ impl VkContext {
             }
         };
         let graphics_queue = unsafe { device.get_device_queue(graphics_queue_family, 0) };
+        let selected_queue_family =
+            unsafe { instance.get_physical_device_queue_family_properties(physical_device) }
+                .get(graphics_queue_family as usize)
+                .copied()
+                .expect("selected Vulkan queue family remains present");
+        let graphics_queue_supports_compute = selected_queue_family
+            .queue_flags
+            .contains(vk::QueueFlags::COMPUTE);
         let external_semaphore_fd =
             ash::khr::external_semaphore_fd::Device::new(&instance, &device);
         let external_memory_fd_supported =
@@ -555,7 +570,11 @@ impl VkContext {
         let device_type = props2.properties.device_type;
         // ns per timestamp-query tick (0.0 ⇒ device has no usable timestamp
         // support → gpu_render_ns telemetry stays 0). See `record_compose`.
-        let timestamp_period = props2.properties.limits.timestamp_period;
+        let timestamp_period = effective_timestamp_period(
+            props2.properties.limits.timestamp_period,
+            selected_queue_family.timestamp_valid_bits,
+        );
+        let max_storage_buffer_range = u64::from(props2.properties.limits.max_storage_buffer_range);
         let driver_id = driver_props.driver_id;
 
         Ok(Arc::new(VkContext {
@@ -575,6 +594,8 @@ impl VkContext {
             tfp_tiling_strategy: std::sync::OnceLock::new(),
             graphics_queue_family,
             graphics_queue,
+            graphics_queue_supports_compute,
+            max_storage_buffer_range,
             debug_messenger,
             driver_id,
             device_type,
@@ -611,6 +632,18 @@ impl VkContext {
 
     pub(crate) fn requires_drop_device_idle(&self) -> bool {
         self.drop_wait_policy.requires_device_idle()
+    }
+
+    /// Whether the queue used by this context can record compute dispatches.
+    #[must_use]
+    pub(crate) const fn graphics_queue_supports_compute(&self) -> bool {
+        self.graphics_queue_supports_compute
+    }
+
+    /// Vulkan `maxStorageBufferRange`, widened for checked byte-size math.
+    #[must_use]
+    pub(crate) const fn max_storage_buffer_range(&self) -> u64 {
+        self.max_storage_buffer_range
     }
 }
 
@@ -1166,15 +1199,30 @@ fn format_requested_render_device(requested: RequestedRenderDevice) -> String {
 
 fn pick_graphics_queue_family(instance: &ash::Instance, pd: vk::PhysicalDevice) -> Option<u32> {
     let qfp = unsafe { instance.get_physical_device_queue_family_properties(pd) };
-    qfp.iter().enumerate().find_map(|(i, p)| {
-        if p.queue_flags
-            .contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::TRANSFER)
-        {
-            Some(u32::try_from(i).expect("queue family index fits in u32"))
-        } else {
-            None
-        }
-    })
+    pick_graphics_queue_family_from_properties(&qfp)
+}
+
+fn pick_graphics_queue_family_from_properties(
+    properties: &[vk::QueueFamilyProperties],
+) -> Option<u32> {
+    let graphics_transfer = vk::QueueFlags::GRAPHICS | vk::QueueFlags::TRANSFER;
+    let preferred = graphics_transfer | vk::QueueFlags::COMPUTE;
+    let find = |required| {
+        properties.iter().enumerate().find_map(|(index, family)| {
+            (family.queue_count > 0 && family.queue_flags.contains(required))
+                .then(|| u32::try_from(index).expect("queue family index fits in u32"))
+        })
+    };
+
+    find(preferred).or_else(|| find(graphics_transfer))
+}
+
+fn effective_timestamp_period(device_period: f32, queue_timestamp_valid_bits: u32) -> f32 {
+    if queue_timestamp_valid_bits == 0 {
+        0.0
+    } else {
+        device_period
+    }
 }
 
 unsafe extern "system" fn vk_debug_callback(
@@ -1260,6 +1308,74 @@ mod tests {
         );
         assert_eq!(device_uuid, [0x21; vk::UUID_SIZE]);
         assert_eq!(driver_uuid, [0x61; vk::UUID_SIZE]);
+    }
+
+    #[test]
+    fn graphics_queue_selection_prefers_compute_capability() {
+        let families = [
+            vk::QueueFamilyProperties {
+                queue_flags: vk::QueueFlags::GRAPHICS | vk::QueueFlags::TRANSFER,
+                queue_count: 1,
+                ..Default::default()
+            },
+            vk::QueueFamilyProperties {
+                queue_flags: vk::QueueFlags::GRAPHICS
+                    | vk::QueueFlags::TRANSFER
+                    | vk::QueueFlags::COMPUTE,
+                queue_count: 1,
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(
+            pick_graphics_queue_family_from_properties(&families),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn graphics_queue_selection_retains_transfer_only_fallback() {
+        let families = [
+            vk::QueueFamilyProperties {
+                queue_flags: vk::QueueFlags::COMPUTE | vk::QueueFlags::TRANSFER,
+                queue_count: 1,
+                ..Default::default()
+            },
+            vk::QueueFamilyProperties {
+                queue_flags: vk::QueueFlags::GRAPHICS | vk::QueueFlags::TRANSFER,
+                queue_count: 1,
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(
+            pick_graphics_queue_family_from_properties(&families),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn graphics_queue_selection_rejects_incomplete_or_empty_families() {
+        let families = [
+            vk::QueueFamilyProperties {
+                queue_flags: vk::QueueFlags::GRAPHICS | vk::QueueFlags::TRANSFER,
+                queue_count: 0,
+                ..Default::default()
+            },
+            vk::QueueFamilyProperties {
+                queue_flags: vk::QueueFlags::GRAPHICS,
+                queue_count: 1,
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(pick_graphics_queue_family_from_properties(&families), None);
+    }
+
+    #[test]
+    fn timestamp_telemetry_is_disabled_for_a_queue_without_timestamp_bits() {
+        assert_eq!(effective_timestamp_period(1.25, 0), 0.0);
+        assert_eq!(effective_timestamp_period(1.25, 36), 1.25);
     }
 
     #[test]

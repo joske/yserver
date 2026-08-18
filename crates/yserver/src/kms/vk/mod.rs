@@ -22,6 +22,7 @@ pub mod memory;
 pub mod ops;
 pub mod pipeline;
 pub mod pixmap_pool;
+pub(crate) mod probe_digest;
 pub(crate) mod probe_pattern;
 pub mod render_pipeline;
 pub mod scanout;

@@ -76,6 +76,7 @@ type GbmDevice = gbm::Device<Rc<crate::drm::Device>>;
 
 use super::{
     device::VkContext,
+    probe_digest::ProbeDigestPipeline,
     probe_pattern::CopiedProbePatternPipeline,
     target::{
         COPIED_TRANSPORT_IMAGE_USAGE, DrawableImage, DrawableImageError, ExportableImage,
@@ -89,6 +90,21 @@ pub(crate) use super::target::CopiedSourcePlan;
 /// Exact usage of GPU B's imported alias of A's DMA-BUF transport. Keep this
 /// single value shared by the capability query and actual import.
 const COPIED_SINK_IMPORT_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::TRANSFER_SRC;
+
+#[derive(Clone, Copy)]
+enum CopiedProbeReadback<'a> {
+    CpuExact,
+    GpuDigest(&'a ProbeDigestPipeline),
+}
+
+impl CopiedProbeReadback<'_> {
+    fn destination_buffer(self, transfer: &TransferResources) -> vk::Buffer {
+        match self {
+            Self::CpuExact => transfer.staging_buffer,
+            Self::GpuDigest(digest) => digest.input_buffer(),
+        }
+    }
+}
 
 /// Per-bo phase. The lifecycle is roughly
 /// `Free → Recording → Submitted → Pending → OnScreen → Retiring → Free`.
@@ -1176,7 +1192,11 @@ impl CopiedRenderSource {
     /// [`Self::record_transport_copy`], while the target is back in `GENERAL`.
     /// The DMA-BUF transport remains FOREIGN-owned and is deliberately not
     /// touched by this diagnostic readback.
-    fn record_probe_readback(&self, command_buffer: vk::CommandBuffer) {
+    fn record_probe_readback(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        readback: CopiedProbeReadback<'_>,
+    ) {
         let device = &self.render_vk.device;
         unsafe {
             let to_copy = [vk::ImageMemoryBarrier2::default()
@@ -1199,7 +1219,7 @@ impl CopiedRenderSource {
                 command_buffer,
                 self.image(),
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                self.transfer.staging_buffer,
+                readback.destination_buffer(&self.transfer),
                 &regions,
             );
 
@@ -1212,13 +1232,24 @@ impl CopiedRenderSource {
                 .new_layout(vk::ImageLayout::GENERAL)
                 .image(self.image())
                 .subresource_range(color_subresource_range())];
-            let buffer_to_host = [probe_buffer_to_host_barrier(&self.transfer)];
-            device.cmd_pipeline_barrier2(
-                command_buffer,
-                &vk::DependencyInfo::default()
-                    .image_memory_barriers(&image_to_general)
-                    .buffer_memory_barriers(&buffer_to_host),
-            );
+            match readback {
+                CopiedProbeReadback::CpuExact => {
+                    let buffer_to_host = [probe_buffer_to_host_barrier(&self.transfer)];
+                    device.cmd_pipeline_barrier2(
+                        command_buffer,
+                        &vk::DependencyInfo::default()
+                            .image_memory_barriers(&image_to_general)
+                            .buffer_memory_barriers(&buffer_to_host),
+                    );
+                }
+                CopiedProbeReadback::GpuDigest(digest) => {
+                    device.cmd_pipeline_barrier2(
+                        command_buffer,
+                        &vk::DependencyInfo::default().image_memory_barriers(&image_to_general),
+                    );
+                    digest.record_after_transfer(command_buffer);
+                }
+            }
         }
     }
 
@@ -1480,7 +1511,7 @@ impl CopiedScanoutPool {
         bo_idx: usize,
         render_completion: Option<OwnedFd>,
     ) -> io::Result<Option<OwnedFd>> {
-        self.submit_copy_with_fence(bo_idx, render_completion, vk::Fence::null(), false)
+        self.submit_copy_with_fence(bo_idx, render_completion, vk::Fence::null(), None)
     }
 
     fn submit_copy_with_fence(
@@ -1488,7 +1519,7 @@ impl CopiedScanoutPool {
         bo_idx: usize,
         render_completion: Option<OwnedFd>,
         fence: vk::Fence,
-        probe_readback: bool,
+        probe_readback: Option<CopiedProbeReadback<'_>>,
     ) -> io::Result<Option<OwnedFd>> {
         let source = self
             .sources
@@ -1620,18 +1651,18 @@ impl CopiedScanoutPool {
             let destination_after_copy = [vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::COPY)
                 .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                .dst_stage_mask(if probe_readback {
+                .dst_stage_mask(if probe_readback.is_some() {
                     vk::PipelineStageFlags2::COPY
                 } else {
                     vk::PipelineStageFlags2::ALL_COMMANDS
                 })
-                .dst_access_mask(if probe_readback {
+                .dst_access_mask(if probe_readback.is_some() {
                     vk::AccessFlags2::TRANSFER_READ
                 } else {
                     vk::AccessFlags2::MEMORY_READ
                 })
                 .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .new_layout(if probe_readback {
+                .new_layout(if probe_readback.is_some() {
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL
                 } else {
                     vk::ImageLayout::GENERAL
@@ -1647,7 +1678,7 @@ impl CopiedScanoutPool {
                 &vk::DependencyInfo::default().image_memory_barriers(&destination_after_copy),
             );
 
-            if probe_readback {
+            if let Some(readback) = probe_readback {
                 let regions = [tight_bgra_buffer_image_copy(
                     source.width(),
                     source.height(),
@@ -1657,7 +1688,7 @@ impl CopiedScanoutPool {
                     command_buffer,
                     destination.vk_image,
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    destination.vk_transfer.staging_buffer,
+                    readback.destination_buffer(&destination.vk_transfer),
                     &regions,
                 );
 
@@ -1670,13 +1701,26 @@ impl CopiedScanoutPool {
                     .new_layout(vk::ImageLayout::GENERAL)
                     .image(destination.vk_image)
                     .subresource_range(color_subresource_range())];
-                let buffer_to_host = [probe_buffer_to_host_barrier(&destination.vk_transfer)];
-                self.sink_vk.device.cmd_pipeline_barrier2(
-                    command_buffer,
-                    &vk::DependencyInfo::default()
-                        .image_memory_barriers(&destination_to_general)
-                        .buffer_memory_barriers(&buffer_to_host),
-                );
+                match readback {
+                    CopiedProbeReadback::CpuExact => {
+                        let buffer_to_host =
+                            [probe_buffer_to_host_barrier(&destination.vk_transfer)];
+                        self.sink_vk.device.cmd_pipeline_barrier2(
+                            command_buffer,
+                            &vk::DependencyInfo::default()
+                                .image_memory_barriers(&destination_to_general)
+                                .buffer_memory_barriers(&buffer_to_host),
+                        );
+                    }
+                    CopiedProbeReadback::GpuDigest(digest) => {
+                        self.sink_vk.device.cmd_pipeline_barrier2(
+                            command_buffer,
+                            &vk::DependencyInfo::default()
+                                .image_memory_barriers(&destination_to_general),
+                        );
+                        digest.record_after_transfer(command_buffer);
+                    }
+                }
             }
 
             let ownership_releases = [
@@ -1745,7 +1789,9 @@ impl CopiedScanoutPool {
     }
 
     /// Probe all exact slots with a spatially unique A render, external
-    /// semaphore handoff, B copy, and exact CPU-visible content comparison.
+    /// semaphore handoff, B copy, and CPU-visible content validation. The
+    /// normal path compares compact GPU-computed block digests; unsupported
+    /// compute queues retain the exact full-image CPU fallback.
     /// Each slot runs twice: cycle two consumes B's retained
     /// completion on A, covering both directions of the source ownership
     /// protocol rather than admitting a route after only its first A -> B
@@ -1758,13 +1804,19 @@ impl CopiedScanoutPool {
     /// longer than that GPU-liveness timeout. An actual fence timeout or other
     /// uncertain post-submit failure consumes and quarantines this disposable
     /// pool so no GPU-referenced object reaches normal teardown.
-    pub(crate) fn probe_copy_all(mut self, timeout_ns: u64) -> Result<(), DisposableProbeError> {
+    pub(crate) fn probe_copy_all(self, timeout_ns: u64) -> Result<(), DisposableProbeError> {
         let probe_started = Instant::now();
-        let render_vk = match self.sources.first() {
+        let mut attempt = CopiedDisposableProbeAttempt {
+            pool: self,
+            pattern: None,
+            render_digest: None,
+            sink_digest: None,
+        };
+        let render_vk = match attempt.pool.sources.first() {
             Some(source) => Arc::clone(&source.render_vk),
             None => {
                 return finish_disposable_probe_attempt(
-                    self,
+                    attempt,
                     Err(DisposableProbeError::from(io::Error::other(
                         "copied probe pool has no source slots",
                     ))),
@@ -1779,7 +1831,7 @@ impl CopiedScanoutPool {
                 // disposable contexts are therefore safe to destroy directly
                 // even though generic context Drop remains conservative.
                 return finish_disposable_probe_attempt(
-                    self,
+                    attempt,
                     Err(DisposableProbeError::from(scanout_vk_error(
                         "create copied content-probe pipeline",
                         result,
@@ -1787,18 +1839,110 @@ impl CopiedScanoutPool {
                 );
             }
         };
-        let pipeline_elapsed = pipeline_started.elapsed();
-        log::info!(
-            "copied content probe pipeline ready in {} ms; each renderer/sink fence wait has {:?}",
-            pipeline_elapsed.as_millis(),
-            Duration::from_nanos(timeout_ns),
-        );
+        attempt.pattern = Some(pattern);
 
-        let result = self.probe_copy_all_inner(&render_vk, &pattern, timeout_ns);
+        let sink_vk = Arc::clone(&attempt.pool.sink_vk);
+        if ProbeDigestPipeline::is_supported(
+            &render_vk,
+            attempt.pool.destinations.width,
+            attempt.pool.destinations.height,
+        ) && ProbeDigestPipeline::is_supported(
+            &sink_vk,
+            attempt.pool.destinations.width,
+            attempt.pool.destinations.height,
+        ) {
+            match ProbeDigestPipeline::new(
+                Arc::clone(&render_vk),
+                attempt.pool.destinations.width,
+                attempt.pool.destinations.height,
+            ) {
+                Ok(digest) => attempt.render_digest = Some(digest),
+                Err(vk::Result::ERROR_DEVICE_LOST) => {
+                    return finish_disposable_probe_attempt(
+                        attempt,
+                        Err(DisposableProbeError::from(scanout_vk_error(
+                            "create copied renderer GPU digest",
+                            vk::Result::ERROR_DEVICE_LOST,
+                        ))),
+                    );
+                }
+                Err(result) => log::warn!(
+                    "copied content probe could not create renderer GPU digest ({result:?}); \
+                     falling back to exact CPU validation"
+                ),
+            }
+            if attempt.render_digest.is_some() {
+                match ProbeDigestPipeline::new(
+                    sink_vk,
+                    attempt.pool.destinations.width,
+                    attempt.pool.destinations.height,
+                ) {
+                    Ok(digest) => attempt.sink_digest = Some(digest),
+                    Err(vk::Result::ERROR_DEVICE_LOST) => {
+                        return finish_disposable_probe_attempt(
+                            attempt,
+                            Err(DisposableProbeError::from(scanout_vk_error(
+                                "create copied sink GPU digest",
+                                vk::Result::ERROR_DEVICE_LOST,
+                            ))),
+                        );
+                    }
+                    Err(result) => log::warn!(
+                        "copied content probe could not create sink GPU digest ({result:?}); \
+                         falling back to exact CPU validation"
+                    ),
+                }
+            }
+        } else {
+            log::warn!(
+                "copied content probe selected queue or extent cannot run compact GPU digest; \
+                 falling back to exact CPU validation"
+            );
+        }
+
+        let pipeline_elapsed = pipeline_started.elapsed();
+        if let Some((render_digest, sink_digest)) = attempt
+            .render_digest
+            .as_ref()
+            .zip(attempt.sink_digest.as_ref())
+        {
+            debug_assert_eq!(render_digest.grid_width(), sink_digest.grid_width());
+            debug_assert_eq!(render_digest.grid_height(), sink_digest.grid_height());
+            debug_assert_eq!(
+                render_digest.summary_word_count(),
+                sink_digest.summary_word_count()
+            );
+            log::info!(
+                "copied content probe pipelines ready in {} ms; validator=gpu-block-digest \
+                 grid={}x{} summary={} bytes/device; each renderer/sink fence wait has {:?}",
+                pipeline_elapsed.as_millis(),
+                render_digest.grid_width(),
+                render_digest.grid_height(),
+                render_digest.summary_word_count() * std::mem::size_of::<u32>(),
+                Duration::from_nanos(timeout_ns),
+            );
+        } else {
+            log::info!(
+                "copied content probe pipeline ready in {} ms; validator=cpu-exact; each \
+                 renderer/sink fence wait has {:?}",
+                pipeline_elapsed.as_millis(),
+                Duration::from_nanos(timeout_ns),
+            );
+        }
+
+        let result = attempt.pool.probe_copy_all_inner(
+            &render_vk,
+            attempt.pattern.as_ref().expect("probe pattern was created"),
+            attempt
+                .render_digest
+                .as_ref()
+                .zip(attempt.sink_digest.as_ref()),
+            timeout_ns,
+        );
         if result.is_ok() {
             log::info!(
                 "copied content probe completed {} slots x 2 cycles in {} ms; per-fence timeout {:?}",
-                self.sources.len(),
+                attempt.pool.sources.len(),
                 probe_started.elapsed().as_millis(),
                 Duration::from_nanos(timeout_ns),
             );
@@ -1812,26 +1956,29 @@ impl CopiedScanoutPool {
                  disposable A/B pool and pipeline without vkDeviceWaitIdle"
             );
         }
-        finish_disposable_probe_attempt(
-            CopiedDisposableProbeAttempt {
-                pool: self,
-                _pattern: pattern,
-            },
-            result,
-        )
+        finish_disposable_probe_attempt(attempt, result)
     }
 
     fn probe_copy_all_inner(
         &mut self,
         render_vk: &Arc<VkContext>,
         pattern: &CopiedProbePatternPipeline,
+        digests: Option<(&ProbeDigestPipeline, &ProbeDigestPipeline)>,
         timeout_ns: u64,
     ) -> Result<(), DisposableProbeError> {
         for bo_idx in 0..self.sources.len() {
             let mut previous_renderer_hash = None;
+            let mut previous_renderer_digest: Option<Vec<u32>> = None;
             for cycle in 0..2 {
                 let cycle_started = Instant::now();
                 let sink_vk = Arc::clone(&self.sink_vk);
+                let (renderer_readback, sink_readback) = match digests {
+                    Some((renderer, sink)) => (
+                        CopiedProbeReadback::GpuDigest(renderer),
+                        CopiedProbeReadback::GpuDigest(sink),
+                    ),
+                    None => (CopiedProbeReadback::CpuExact, CopiedProbeReadback::CpuExact),
+                };
                 let frame_token = u32::try_from(bo_idx)
                     .ok()
                     .and_then(|index| index.checked_mul(2))
@@ -1852,6 +1999,7 @@ impl CopiedScanoutPool {
                 let render_completion = match submit_copied_source_probe(
                     &mut self.sources[bo_idx],
                     pattern,
+                    renderer_readback,
                     frame_token,
                     render_fence.handle(),
                 ) {
@@ -1882,7 +2030,7 @@ impl CopiedScanoutPool {
                     bo_idx,
                     render_completion,
                     sink_fence.handle(),
-                    true,
+                    Some(sink_readback),
                 ) {
                     Ok(completion) => completion,
                     Err(error) => {
@@ -1908,39 +2056,80 @@ impl CopiedScanoutPool {
                             ))
                         })?;
                 let sink_completed = Instant::now();
-                let validation = (|| -> io::Result<()> {
+                let validation = (|| -> Result<(), DisposableProbeError> {
                     self.release_completed_source(bo_idx);
-                    let renderer_pixels = self.sources[bo_idx].probe_readback_bytes()?;
-                    let sink_pixels = tight_mapped_bgra_bytes(
-                        &self.destinations.bos[bo_idx].vk_transfer,
-                        self.sources[bo_idx].width(),
-                        self.sources[bo_idx].height(),
-                    )?;
-                    validate_copied_probe_fiducials(
-                        renderer_pixels,
-                        self.sources[bo_idx].width(),
-                        self.sources[bo_idx].height(),
-                        bo_idx,
-                        cycle,
-                        frame_token,
-                    )?;
-                    let renderer_hash = verify_copied_probe_pixels(
-                        renderer_pixels,
-                        sink_pixels,
-                        self.sources[bo_idx].width(),
-                        self.sources[bo_idx].height(),
-                        bo_idx,
-                        cycle,
-                        frame_token,
-                    )?;
-                    validate_copied_probe_freshness(
-                        previous_renderer_hash,
-                        renderer_hash,
-                        bo_idx,
-                        cycle,
-                        frame_token,
-                    )?;
-                    previous_renderer_hash = Some(renderer_hash);
+                    match digests {
+                        Some((renderer, sink)) => {
+                            let renderer_summary = renderer.read_summary().map_err(|result| {
+                                copied_probe_digest_readback_error(
+                                    "read copied renderer GPU digest",
+                                    result,
+                                )
+                            })?;
+                            let sink_summary = sink.read_summary().map_err(|result| {
+                                copied_probe_digest_readback_error(
+                                    "read copied sink GPU digest",
+                                    result,
+                                )
+                            })?;
+                            validate_copied_probe_digest_fiducials(
+                                &renderer_summary,
+                                bo_idx,
+                                cycle,
+                                frame_token,
+                            )?;
+                            verify_copied_probe_digests(
+                                &renderer_summary,
+                                &sink_summary,
+                                renderer.grid_width(),
+                                renderer.grid_height(),
+                                bo_idx,
+                                cycle,
+                                frame_token,
+                            )?;
+                            validate_copied_probe_digest_freshness(
+                                previous_renderer_digest.as_deref(),
+                                &renderer_summary,
+                                bo_idx,
+                                cycle,
+                                frame_token,
+                            )?;
+                            previous_renderer_digest = Some(renderer_summary);
+                        }
+                        None => {
+                            let renderer_pixels = self.sources[bo_idx].probe_readback_bytes()?;
+                            let sink_pixels = tight_mapped_bgra_bytes(
+                                &self.destinations.bos[bo_idx].vk_transfer,
+                                self.sources[bo_idx].width(),
+                                self.sources[bo_idx].height(),
+                            )?;
+                            validate_copied_probe_fiducials(
+                                renderer_pixels,
+                                self.sources[bo_idx].width(),
+                                self.sources[bo_idx].height(),
+                                bo_idx,
+                                cycle,
+                                frame_token,
+                            )?;
+                            let renderer_hash = verify_copied_probe_pixels(
+                                renderer_pixels,
+                                sink_pixels,
+                                self.sources[bo_idx].width(),
+                                self.sources[bo_idx].height(),
+                                bo_idx,
+                                cycle,
+                                frame_token,
+                            )?;
+                            validate_copied_probe_freshness(
+                                previous_renderer_hash,
+                                renderer_hash,
+                                bo_idx,
+                                cycle,
+                                frame_token,
+                            )?;
+                            previous_renderer_hash = Some(renderer_hash);
+                        }
+                    }
                     if cycle == 0 {
                         // No real KMS commit acquired/released the destination.
                         // After B is proven idle, recover it as an atomic reject
@@ -1951,14 +2140,24 @@ impl CopiedScanoutPool {
                     Ok(())
                 })();
                 let validation_completed = Instant::now();
+                let validation_verdict = match validation.as_ref() {
+                    Ok(()) => "match",
+                    Err(error) if scanout_error_is_device_lost(error.as_io_error()) => {
+                        "device-lost"
+                    }
+                    Err(error) if error.abort_candidate_search() => "indeterminate",
+                    Err(_) => "reject",
+                };
                 log::info!(
                     "copied content probe cycle: bo={bo_idx} cycle={cycle} verdict={} \
+                     validator={} \
                      renderer-submit={}ms sink-submit={}ms renderer-wait={}ms sink-wait={}ms \
                      validation={}ms total={}ms per-fence-timeout={:?}",
-                    if validation.is_ok() {
-                        "match"
+                    validation_verdict,
+                    if digests.is_some() {
+                        "gpu-block-digest"
                     } else {
-                        "reject"
+                        "cpu-exact"
                     },
                     renderer_submitted.duration_since(cycle_started).as_millis(),
                     sink_submitted
@@ -3806,6 +4005,10 @@ impl DisposableProbeError {
     }
 
     pub(crate) fn terminal_cleanup(source: io::Error) -> Self {
+        Self::terminal_known_quiescent(source)
+    }
+
+    fn terminal_known_quiescent(source: io::Error) -> Self {
         Self {
             source,
             quarantine: false,
@@ -3848,13 +4051,18 @@ impl DisposableProbeError {
     }
 
     #[must_use]
-    pub(crate) fn kind(&self) -> io::ErrorKind {
+    #[cfg(test)]
+    fn kind(&self) -> io::ErrorKind {
         self.source.kind()
     }
 
     #[must_use]
     pub(crate) fn as_io_error(&self) -> &io::Error {
         &self.source
+    }
+
+    pub(crate) fn into_io_error_with_context(self, context: impl Into<String>) -> io::Error {
+        scanout_io_context(context, self.source)
     }
 
     fn into_io_error(self) -> io::Error {
@@ -3872,7 +4080,10 @@ impl From<io::Error> for DisposableProbeError {
     }
 }
 
-fn completed_probe_validation<T>(validation: io::Result<T>) -> Result<T, DisposableProbeError> {
+fn completed_probe_validation<T, E>(validation: Result<T, E>) -> Result<T, DisposableProbeError>
+where
+    DisposableProbeError: From<E>,
+{
     // Once both submitted fences have signalled, content is authoritative.
     // Host-side validation time must never be reclassified as a GPU timeout.
     validation.map_err(DisposableProbeError::from)
@@ -3954,7 +4165,9 @@ impl DisposableProbeAttempt for CopiedScanoutPool {
 
 struct CopiedDisposableProbeAttempt {
     pool: CopiedScanoutPool,
-    _pattern: CopiedProbePatternPipeline,
+    pattern: Option<CopiedProbePatternPipeline>,
+    render_digest: Option<ProbeDigestPipeline>,
+    sink_digest: Option<ProbeDigestPipeline>,
 }
 
 impl DisposableProbeAttempt for CopiedDisposableProbeAttempt {
@@ -3972,6 +4185,23 @@ impl DisposableProbeAttempt for CopiedDisposableProbeAttempt {
 
 fn scanout_vk_error(operation: &'static str, result: vk::Result) -> io::Error {
     io::Error::other(ScanoutVkOperationError { operation, result })
+}
+
+fn copied_probe_digest_readback_error(
+    operation: &'static str,
+    result: vk::Result,
+) -> DisposableProbeError {
+    let source = scanout_vk_error(operation, result);
+    if result == vk::Result::ERROR_DEVICE_LOST {
+        // Preserve the structured source chain so the qualification layer can
+        // promote this to DeviceLost rather than an indeterminate route.
+        DisposableProbeError::from(source)
+    } else {
+        // Both fences are already complete, so ordinary teardown is safe, but
+        // a host mapping/invalidation failure says nothing about route
+        // compatibility. Stop candidate search as Indeterminate.
+        DisposableProbeError::terminal_known_quiescent(source)
+    }
 }
 
 #[cfg(test)]
@@ -4258,6 +4488,7 @@ fn create_probe_fence(vk: &VkContext) -> io::Result<vk::Fence> {
 fn submit_copied_source_probe(
     source: &mut CopiedRenderSource,
     pattern: &CopiedProbePatternPipeline,
+    readback: CopiedProbeReadback<'_>,
     frame_token: u32,
     fence: vk::Fence,
 ) -> Result<Option<OwnedFd>, DisposableProbeError> {
@@ -4320,7 +4551,7 @@ fn submit_copied_source_probe(
         pattern.record(command_buffer, source.width(), source.height(), frame_token);
         device.cmd_end_rendering(command_buffer);
         source.record_transport_copy(command_buffer, transport_preparation);
-        source.record_probe_readback(command_buffer);
+        source.record_probe_readback(command_buffer, readback);
         device
             .end_command_buffer(command_buffer)
             .map_err(|result| {
@@ -4423,6 +4654,140 @@ fn copied_probe_hash(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
         (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
     })
+}
+
+fn copied_probe_digest_hash(words: &[u32]) -> u64 {
+    words.iter().fold(0xcbf2_9ce4_8422_2325, |hash, word| {
+        (hash ^ u64::from(*word)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+fn copied_probe_marker_word(rgb: [u8; 3], frame_token: u32) -> u32 {
+    u32::from_le_bytes(copied_probe_marker_bgra(rgb, frame_token))
+}
+
+fn validate_copied_probe_digest_fiducials(
+    renderer: &[u32],
+    bo_idx: usize,
+    cycle: u32,
+    frame_token: u32,
+) -> io::Result<()> {
+    let expected = [
+        copied_probe_marker_word([241, 37, 83], frame_token),
+        copied_probe_marker_word([29, 211, 71], frame_token),
+        copied_probe_marker_word([47, 91, 233], frame_token),
+        copied_probe_marker_word([223, 173, 19], frame_token),
+    ];
+    let actual = renderer.get(..expected.len()).ok_or_else(|| {
+        io::Error::other(format!(
+            "copied content probe BO {bo_idx} cycle {cycle} token {frame_token}: compact GPU \
+             digest omitted its four corner fiducials"
+        ))
+    })?;
+    if actual != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "copied content probe BO {bo_idx} cycle {cycle} token {frame_token}: compact GPU \
+                 digest has corner BGRA words {actual:08x?}, expected {expected:08x?}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_copied_probe_digests(
+    renderer: &[u32],
+    sink: &[u32],
+    grid_width: u32,
+    grid_height: u32,
+    bo_idx: usize,
+    cycle: u32,
+    frame_token: u32,
+) -> io::Result<u64> {
+    if grid_width == 0 || grid_height == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "copied GPU digest grid must be non-empty",
+        ));
+    }
+    let expected_words = usize::try_from(grid_width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(grid_height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .and_then(|blocks| blocks.checked_mul(4))
+        .and_then(|digest_words| digest_words.checked_add(4))
+        .ok_or_else(|| io::Error::other("copied GPU digest word count overflow"))?;
+    if renderer.len() != expected_words || sink.len() != expected_words {
+        return Err(io::Error::other(format!(
+            "copied content probe BO {bo_idx} cycle {cycle} token {frame_token}: unexpected \
+             compact GPU digest lengths renderer={} sink={} expected={expected_words}",
+            renderer.len(),
+            sink.len(),
+        )));
+    }
+
+    let renderer_hash = copied_probe_digest_hash(renderer);
+    let sink_hash = copied_probe_digest_hash(sink);
+    if renderer == sink {
+        log::debug!(
+            "copied content probe compact GPU digest matched: BO {bo_idx} cycle {cycle} token \
+             {frame_token} grid={grid_width}x{grid_height} words={expected_words} \
+             hash=fnv1a64:{renderer_hash:016x}"
+        );
+        return Ok(renderer_hash);
+    }
+
+    let mismatch = renderer
+        .iter()
+        .zip(sink)
+        .position(|(renderer, sink)| renderer != sink)
+        .unwrap_or(0);
+    let location = if mismatch < 4 {
+        format!("corner={mismatch}")
+    } else {
+        let digest_word = mismatch - 4;
+        let block = digest_word / 4;
+        let lane = digest_word % 4;
+        let grid_width = usize::try_from(grid_width)
+            .map_err(|_| io::Error::other("copied GPU digest grid width exceeds usize"))?;
+        format!(
+            "block=({}, {}) lane={lane}",
+            block % grid_width,
+            block / grid_width,
+        )
+    };
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "copied content probe compact GPU digest mismatch: BO {bo_idx} cycle {cycle} token \
+             {frame_token} grid={grid_width}x{grid_height} renderer_hash=fnv1a64:{renderer_hash:016x} \
+             sink_hash=fnv1a64:{sink_hash:016x}; first difference at {location}"
+        ),
+    ))
+}
+
+fn validate_copied_probe_digest_freshness(
+    previous_renderer: Option<&[u32]>,
+    renderer: &[u32],
+    bo_idx: usize,
+    cycle: u32,
+    frame_token: u32,
+) -> io::Result<()> {
+    if previous_renderer.is_some_and(|previous| previous == renderer) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "copied content probe stale compact GPU digest: BO {bo_idx} cycle {cycle} token \
+                 {frame_token} repeated the prior renderer frame"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6505,6 +6870,70 @@ mod tests {
     }
 
     #[test]
+    fn copied_gpu_digest_accepts_matching_blocks_and_tokenized_corners() {
+        let token = 1;
+        let mut renderer = vec![
+            copied_probe_marker_word([241, 37, 83], token),
+            copied_probe_marker_word([29, 211, 71], token),
+            copied_probe_marker_word([47, 91, 233], token),
+            copied_probe_marker_word([223, 173, 19], token),
+        ];
+        renderer.extend([
+            0x1020_3040,
+            0x5060_7080,
+            0x90a0_b0c0,
+            0xd0e0_f001,
+            0x1234_5678,
+            0x9abc_def0,
+            0x55aa_aa55,
+            0x0f0f_f0f0,
+        ]);
+        let sink = renderer.clone();
+
+        validate_copied_probe_digest_fiducials(&renderer, 0, 1, token)
+            .expect("digest carries the current rendered corner words");
+        verify_copied_probe_digests(&renderer, &sink, 2, 1, 0, 1, token)
+            .expect("matching per-block GPU digests");
+    }
+
+    #[test]
+    fn copied_gpu_digest_rejects_block_lane_corruption() {
+        let token = 0;
+        let mut renderer = vec![
+            copied_probe_marker_word([241, 37, 83], token),
+            copied_probe_marker_word([29, 211, 71], token),
+            copied_probe_marker_word([47, 91, 233], token),
+            copied_probe_marker_word([223, 173, 19], token),
+        ];
+        renderer.extend(0_u32..24);
+        let mut sink = renderer.clone();
+        // Header occupies four words; this is lane 2 of grid block (1, 1)
+        // in a 3-wide grid.
+        sink[4 + (4 * 4) + 2] ^= 1;
+
+        let error = verify_copied_probe_digests(&renderer, &sink, 3, 2, 0, 0, token).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("block=(1, 1) lane=2"));
+    }
+
+    #[test]
+    fn copied_gpu_digest_rejects_wrong_or_stale_frame() {
+        let token = 1;
+        let previous = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let renderer = previous.clone();
+        let stale = validate_copied_probe_digest_freshness(Some(&previous), &renderer, 2, 1, token)
+            .unwrap_err();
+        assert_eq!(stale.kind(), io::ErrorKind::InvalidData);
+        assert!(stale.to_string().contains("stale compact GPU digest"));
+
+        let wrong_corners = vec![0; 8];
+        let wrong =
+            validate_copied_probe_digest_fiducials(&wrong_corners, 2, 1, token).unwrap_err();
+        assert_eq!(wrong.kind(), io::ErrorKind::InvalidData);
+        assert!(wrong.to_string().contains("corner BGRA words"));
+    }
+
+    #[test]
     fn transfer_staging_buffer_supports_upload_and_probe_readback() {
         let usage = transfer_staging_buffer_usage();
         assert!(usage.contains(vk::BufferUsageFlags::TRANSFER_SRC));
@@ -7624,11 +8053,11 @@ mod tests {
     #[test]
     fn completed_probe_validation_is_authoritative() {
         assert_eq!(
-            completed_probe_validation::<u8>(Ok(7)).expect("completed matching content"),
+            completed_probe_validation::<u8, io::Error>(Ok(7)).expect("completed matching content"),
             7
         );
 
-        let mismatch = completed_probe_validation::<()>(Err(io::Error::new(
+        let mismatch = completed_probe_validation::<(), io::Error>(Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "pixel mismatch",
         )))
@@ -7637,6 +8066,25 @@ mod tests {
         assert!(!mismatch.requires_quarantine());
         assert!(!mismatch.abort_candidate_search());
         assert!(!mismatch.bypass_normal_teardown());
+    }
+
+    #[test]
+    fn digest_readback_infrastructure_failure_is_not_route_rejection() {
+        let invalidation = copied_probe_digest_readback_error(
+            "test digest invalidate",
+            vk::Result::ERROR_OUT_OF_HOST_MEMORY,
+        );
+        assert!(!invalidation.requires_quarantine());
+        assert!(invalidation.abort_candidate_search());
+        assert!(!invalidation.bypass_normal_teardown());
+
+        let device_lost = copied_probe_digest_readback_error(
+            "test digest invalidate",
+            vk::Result::ERROR_DEVICE_LOST,
+        );
+        assert!(!device_lost.requires_quarantine());
+        assert!(!device_lost.abort_candidate_search());
+        assert!(scanout_error_is_device_lost(device_lost.as_io_error()));
     }
 
     #[test]

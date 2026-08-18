@@ -60,6 +60,19 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   bounds synchronous Vulkan and other host calls that cannot themselves be
   preempted, and a parent-death signal kills a helper that outlives yserver.
 
+  The first deployed `6bdcf8b8529b` AMD Radeon 780M-to-NVIDIA RTX 4070 HDMI
+  run exposed a validation-cost bug rather than a fence stall. At 1600x1200,
+  A and B completed their first probe fences in 0 ms and 2 ms and the content
+  matched, but the old post-fence validation phase took 15,149 ms. That phase
+  also includes semaphore bookkeeping and cycle recovery, but its scale is
+  consistent with the full scan of two uncached mapped images; the allocator
+  preference on both devices selects
+  `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT` memory without `HOST_CACHED`; the
+  next cycle consequently reached the 30 s whole-helper watchdog before the
+  required three-slot/two-cycle probe finished. The resulting
+  `Indeterminate` was a false route timeout from CPU validation overhead, not
+  evidence that the HDMI route was incompatible.
+
   The old KMS topology stays lit throughout helper search and throughout the
   parent's exact live allocation plus full-pool `TEST_ONLY`. After the result
   and topology epoch are revalidated, yserver quiesces only immediately before
@@ -97,23 +110,38 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   only after disposable work is submitted: every copy-free BO fence and every
   copied A or B fence receives its own fresh 200 ms monotonic completion
   window. The budget resets for each submitted fence; it is not a global
-  cold-probe or exact-plan deadline and does not cover context/pipeline
-  creation, allocation, `TEST_ONLY`, or CPU validation. Vulkan cannot preempt a
-  driver host call that returns late, so a fence that reports successful
-  completion remains authoritative even if total elapsed wall time has passed
-  200 ms. Each disposable copied cycle renders a token-distinct
-  full-extent radial color-ray pattern that desaturates smoothly toward the
-  rectangular edges and embeds coordinate bits, edge rails, and exact
-  asymmetric corner fiducials. After A copies its renderer-local target into
-  the selected transport and B imports/copies the DMA-BUF, both devices copy
-  their respective A-target and B-destination images into tight host-visible
-  BGRA buffers. Both fences must report completion before any CPU access. Once
-  they do, the probe always reaches the pixel verdict regardless of cumulative
-  elapsed time; it logs stable hashes for diagnosis but admits a candidate only
-  when all bytes match, the fiducials are present, and cycle two differs from
-  cycle one. Safe pre-submit failures and content mismatches after proven fence
-  completion reject only that plan and continue candidate order. Once every
-  submitted fence is proven complete, the disposable contexts are marked
+  cold-probe or exact-plan deadline. Context/pipeline creation, allocation,
+  `TEST_ONLY`, and compact CPU verdict parsing remain outside it, while each
+  device's block reduction and compact result write are covered by its existing
+  fence. The selected A and B queues qualify independently: each must support
+  compute, and that endpoint's reducer input must fit its
+  `maxStorageBufferRange`. Vulkan cannot preempt a driver host call that returns
+  late, so a fence that reports successful completion remains authoritative
+  even if total elapsed wall time has passed 200 ms. Each disposable copied
+  cycle renders a token-distinct full-extent radial color-ray pattern that
+  desaturates smoothly toward the rectangular edges and embeds coordinate bits,
+  edge rails, and exact asymmetric corner fiducials. After A copies its
+  renderer-local target into the selected transport and B imports/copies the
+  DMA-BUF, A and B each make
+  every full-extent pixel contribute to compact positional, multi-lane
+  per-block digests. They copy only those digests and exact tokenized corner
+  words into small host-visible result buffers before their fences signal,
+  preferring `HOST_CACHED` memory when the endpoint exposes it.
+  Both fences must report completion before CPU access. The CPU then requires
+  the expected corner words, equality of every corresponding digest block and
+  lane, and cross-cycle freshness. This admission is probabilistic rather than
+  collision-free; the multiple lanes and position-bound blocks make accidental
+  admission negligible but do not preserve the old mathematical exact-byte
+  guarantee. Full tightly packed readback and exact CPU comparison remain the
+  correctness-preserving fallback when either selected queue lacks compute,
+  either input exceeds that endpoint's `maxStorageBufferRange`, or reducer
+  infrastructure cannot safely be prepared before submission. Such a fallback
+  is not route incompatibility; if it exceeds the outer helper watchdog, its
+  result is `Indeterminate`. A reducer failure after submission that leaves GPU
+  state uncertain is likewise `Indeterminate`, never an incompatible-route
+  verdict. Content mismatches after proven fence completion reject only that
+  plan and continue candidate order. Once every submitted fence is proven
+  complete, the disposable contexts are marked
   quiescent so pool, pipeline, and final context teardown skip their otherwise
   defensive `vkDeviceWaitIdle`; live contexts never receive that exemption.
   Only a timeout or other post-submit failure that leaves an outstanding fence
@@ -126,8 +154,9 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   Startup probing is still synchronous: a terminal startup probe retains its
   complete disposable attempt plus partially constructed live GPU owners and
   aborts later outputs so constructor unwinding cannot re-enter an idle wait.
-  This setup-only readback is not a live CPU transport fallback. It validates
-  the Vulkan-visible render/transport/import/copy chain but cannot prove
+  This setup-only compact readback, or eligibility/setup exact CPU fallback,
+  is not a live CPU transport fallback. It validates the Vulkan-visible
+  render/transport/import/copy chain but cannot prove
   the display engine's interpretation of GBM/KMS pitch, offset, and modifier
   metadata, so the live two-flip visual/writeback/CRTC-CRC smoke remains
   pending alongside the ownership-return smoke.

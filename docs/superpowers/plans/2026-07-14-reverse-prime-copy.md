@@ -15,16 +15,29 @@
    disposable A/B contexts. Run full-pool atomic `TEST_ONLY`, then two
    source-handoff cycles per slot with separate local/FOREIGN barriers, retained
    B-to-A completion, and real render/copy/fences. Render a token-distinct
-   full-extent radial diagnostic pattern, read back A's local target and B's
-   final destination only after successful A and B fences, and require exact
-   bytes plus diagnostic hashes, valid corner fiducials, and cross-cycle
-   freshness. Preserve requested full-output allocation and the complete
-   three-slot/two-cycle probe.
+   full-extent radial diagnostic pattern and make every pixel of A's local
+   target and B's final destination contribute to compact positional,
+   multi-lane per-block digests inside the existing A and B submissions. Copy
+   only the digest blocks and exact tokenized corner words into small
+   host-visible result buffers, preferring `HOST_CACHED` memory when available.
+   After both fences succeed, require the expected corner words, equal
+   corresponding digest blocks, and cross-cycle freshness. Digest admission is
+   deliberately probabilistic rather than collision-free. Enable it only when
+   the selected A and B queues independently support compute and each
+   endpoint's input fits its `maxStorageBufferRange`; otherwise retain full
+   exact CPU comparison as the correctness-preserving capability fallback.
+   Reducer infrastructure that cannot be prepared safely before submission
+   also takes that fallback; post-submit uncertainty is `Indeterminate`, never
+   route incompatibility. Preserve requested full-output allocation, both
+   full-image GPU copies, and the complete three-slot/two-cycle probe.
 5. Attach liveness timing to work, not to cold setup. Give every copy-free BO
    fence and every copied A or B fence its own fresh 200 ms monotonic completion
-   window; keep context/pipeline creation, allocation, atomic `TEST_ONLY`, and
-   CPU validation outside that window. A successful fence always proceeds to
-   the pixel verdict even when total elapsed time exceeds 200 ms. Safe
+   window, including that device's block-digest reduction and compact result
+   write. Keep context/pipeline creation, allocation, atomic `TEST_ONLY`, and
+   CPU verdict parsing outside that window; the exact CPU fallback also remains
+   outside it and may therefore reach the whole-helper watchdog, yielding
+   `Indeterminate`. A successful fence always proceeds to the content verdict
+   even when total elapsed time exceeds 200 ms. Other safe, route-specific
    pre-submit failures and mismatches after proven completion continue candidate
    order. Fence-proven disposable teardown skips redundant device-wide idle;
    an incomplete or uncertain submission is terminal and must never enter
@@ -67,9 +80,9 @@
     semantics, and retire the paired slot plus scene acknowledgements only on
     page flip.
 12. Track exclusive FOREIGN ownership and layout provenance for the A/B
-    transport, B destination, and KMS; keep copied readback on A's local optimal
-    target while all framebuffer/front/pageflip/direct state uses B's
-    destination. Integrate installed-pool completion cancellation, VT/DPMS,
+    transport, B destination, and KMS; keep copied validation anchored to A's
+    local optimal target while all framebuffer/front/pageflip/direct state uses
+    B's destination. Integrate installed-pool completion cancellation, VT/DPMS,
     shutdown, dirty semaphore rearm, device loss, full-discard lifecycle
     normalization, and quarantine-safe Drop. Keep synchronous sink
     `device_wait_idle` for live B-copy/atomic failure recovery separate from
@@ -80,10 +93,14 @@
     selected renderer.
 14. Cover exact/none/ambiguous sink selection, shared-before-copied order,
     native-before-LINEAR tiers, stable pairing, exact replay, per-fence timing,
-    content and freshness validation, safe-failure continuation, uncertain
-    submission containment, strict shared-DRM cleanup, helper watchdog and
-    parent lifetime, FIFO request parking, prompt stale interruption, late-result
-    suppression, and deterministic single-flight admission. Retain a live
+    full-extent positional multi-lane digest coverage, exact corner words,
+    cross-cycle freshness, `HOST_CACHED`-preferred compact results, independent
+    A/B compute and `maxStorageBufferRange` eligibility, exact CPU fallback,
+    reducer setup fallback, safe-failure continuation, uncertain submission
+    containment,
+    strict shared-DRM cleanup, helper watchdog and parent lifetime, FIFO request
+    parking, prompt stale interruption, late-result suppression, and
+    deterministic single-flight admission. Retain a live
     two-flip GENERAL KMS-to-B ownership and display-interpretation smoke as an
     explicit external gate. Update status, run nightly formatting, workspace
     tests, exact all-target Clippy, and diff checks before committing the
