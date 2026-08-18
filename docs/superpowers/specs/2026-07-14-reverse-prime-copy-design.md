@@ -86,13 +86,70 @@ CopiedScanoutPlan {
 }
 ```
 
+### Runtime request orchestration
+
+A runtime `RRSetCrtcConfig` that requires a different-device or
+relationship-unknown allocation is deferred before compatibility work begins.
+The core assigns a monotonic token and parks only that client's request FIFO,
+preserving same-client X11 ordering while continuing to service input, VT
+events, rendering, and other clients. Same-device requests and requests that
+can retain their existing allocation stay on the synchronous path.
+
+The backend snapshots the global topology epoch and the exact mode, source and
+sink route identities, connector, encoder, CRTC, primary plane, and per-fence
+timeout into a resource-free request. Requests enter one deterministic global
+FIFO with at most one helper active. This is deliberately not parallel display
+probing: one global topology epoch cannot yet admit concurrent disjoint results
+deterministically. Parallel qualification requires resource-scoped epochs and
+ordered admission and remains future work.
+
+For each request, the child reexecutes the exact running yserver image and owns
+a fresh disposable Vulkan/GBM graph. It receives a duplicate of the KMS DRM fd
+only so it can run the exact atomic `TEST_ONLY` checks. The duplicate shares
+the parent's DRM open file description, so process exit alone cannot be
+treated as KMS cleanup and the child must never perform a live commit. Before
+returning an ordinary `Compatible` plan or `Rejected` verdict, it strictly
+removes every mode blob, framebuffer, and GEM handle that it created. Failure
+to prove that cleanup, an uncertain submitted fence, an IPC/launch state in
+which child ownership is uncertain, or whole-helper timeout produces
+`Indeterminate`, never `Rejected`, and poisons the involved resource set.
+
+Every submitted fence keeps the fresh 200 ms completion window defined below.
+Those waits do not bound synchronous Vulkan driver entry points, allocation,
+or `TEST_ONLY`, so the parent also enforces a separate 30 s whole-helper
+watchdog. A parent-death signal prevents a helper from surviving yserver. On an
+uncertain GPU path the child terminates without running normal Rust/Vulkan Drop
+or `vkDeviceWaitIdle`; the parent does not reuse poisoned route resources.
+
+The helper returns only a serialized exact plan, never live Vulkan or GBM
+objects. While it searches, the parent leaves the old KMS topology installed.
+For a `Compatible` result, the parent replays that exact plan into a full live
+pool and runs every live `TEST_ONLY`, also without disturbing the old
+topology. It then revalidates the topology epoch and request resources,
+quiesces immediately before the real commit, and installs the prepared plan.
+Thus the only intentional runtime dark interval is the final short
+quiesce/install handoff; failure during helper search or live preparation has
+no old framebuffer state to restore.
+
+Connector/topology mutation, VT transition, provider-output-source change,
+effective DPMS transition, and logical-screen-size change immediately retire
+every affected parked request as `Interrupted` and wake its client FIFO. A
+late helper result cannot replace that synthetic completion. The executor
+still harvests the late result so uncertainty can poison resources internally.
+
+This isolation currently covers runtime cross-device route qualification.
+Startup qualification remains synchronous in the server process. The parent's
+exact live allocation and `TEST_ONLY`, final quiesce, and real modeset replay
+also remain synchronous host-call boundaries, although the old topology stays
+lit during the live preparation phase.
+
 Candidate order has three global layers: all copy-free plans first; then the
 copied native tier; then the copied explicit-LINEAR tier. Within the native
 tier, destinations retain the established GBM-first then renderer-owned
 modifier/linear order and each destination is paired with native source
 modifiers in A's stable advertised order. The LINEAR tier pairs modifier 0
-with those destinations in the same established order. The
-probe creates fresh exact disposable logical devices for both A and B,
+with those destinations in the same established order. The qualification
+worker creates fresh exact disposable logical devices for both A and B,
 allocates a complete three-slot pool with one plan pair, and first validates
 every destination framebuffer with a full connector/CRTC/primary-plane atomic
 `TEST_ONLY`. Allocation remains at the requested full output extent, and both
@@ -150,16 +207,16 @@ otherwise defensive device-wide idle. Live contexts and uncertain disposable
 contexts never receive that exemption. Classification follows submission state
 rather than the error kind alone: only a timeout or other post-submit failure
 that leaves at least one submitted fence incomplete or uncertain is terminal
-for exact-plan search. That path retains the entire disposable
-attempt, including its pool, pipeline, uncertain fences, and owning contexts,
-until process exit; it bypasses normal Drop and never calls
-`vkDeviceWaitIdle`, because Vulkan has no safe cancellation primitive. No later
-copy-free or copied exact plan is attempted after that terminal failure.
-Startup additionally retains already-built live GPU owners and aborts later
-outputs so constructor unwind cannot enter another idle wait. At runtime, the
-RANDR failure path keeps the old scene/Vulkan ownership intact, re-commits only
-the unchanged old KMS framebuffers when they were active, and returns the
-request failure without normal topology recovery.
+for exact-plan search. For a runtime request, the helper owns that entire
+disposable attempt, including its pool, pipeline, uncertain fences, and owning
+contexts. It terminates without normal Drop or `vkDeviceWaitIdle`, because
+Vulkan has no safe cancellation primitive; the parent records
+`Indeterminate`, poisons the involved resources, and attempts no later exact
+plan. Startup still runs this work in the server process, so it retains an
+uncertain attempt and any already-built live GPU owners and aborts later
+outputs rather than letting constructor unwind enter an idle wait. Runtime
+qualification and live preparation leave the old topology untouched, so their
+failure returns the request error without a restore commit.
 
 The CPU readbacks are setup-time validation only, not a CPU transport fallback
 in the live frame path. They prove the Vulkan-visible render, transport copy,
@@ -169,10 +226,12 @@ will interpret GBM/KMS pitch, offset, and modifier metadata identically; atomic
 end-to-end display gate.
 
 Only the exact winning pair is replayed on the live A/B contexts, and every
-live destination framebuffer is tested again. Startup probing runs while the
-initial dumb-framebuffer rollback guard remains armed. Runtime enable commits
-and marks the exact destination front inside the candidate helper before its
-ownership can leave that helper.
+live destination framebuffer is tested again. The runtime helper returns the
+resource-free pair and never commits it; the parent performs live allocation
+and `TEST_ONLY` while the old topology remains installed, revalidates stale
+state, then quiesces and commits. The install step marks the exact destination
+front before ownership can leave it. Startup probing runs synchronously while
+the initial dumb-framebuffer rollback guard remains armed.
 
 DMA-BUF import uses the source's exact modifier, offset, and pitch. Vulkan
 image memory requirements are intersected with
@@ -253,9 +312,16 @@ submission, and is cleared by failed-cycle recovery and lifecycle reset.
   all of its submitted fences complete, allowing final Drop to omit a redundant
   `vkDeviceWaitIdle`; this policy is never enabled for live contexts.
 - A timeout or error is terminal only when submitted work remains incomplete
-  or uncertain. That disposable attempt is retained and quarantined in its
-  entirety without normal Drop or `vkDeviceWaitIdle`; GPU-referenced resources
-  and both owning contexts remain alive until process exit.
+  or uncertain. At runtime the isolated helper abandons that graph and exits
+  without normal Drop or `vkDeviceWaitIdle`; synchronous startup retains and
+  quarantines it in the server process.
+- A runtime `Compatible` or ordinary `Rejected` result is accepted only after
+  strict cleanup of all helper-created KMS mode blobs, framebuffer IDs, and GEM
+  handles. Cleanup uncertainty is `Indeterminate` and poisons the request's
+  resources because the child and parent share a DRM open file description.
+- The 30 s process watchdog bounds the entire helper, independently of the
+  fresh 200 ms window for each submitted fence. Watchdog, IPC, uncertain launch,
+  and parent-lifetime failures never become compatibility rejections.
 - Live failure to prove quiescence quarantines and disarms both sides; Drop
   leaks the B alias, A transport backing, A optimal target, and uncertain
   scanout resources rather than freeing GPU-referenced memory.
@@ -267,9 +333,11 @@ submission, and is cleared by failed-cycle recovery and lifecycle reset.
   has its own fresh 200 ms outstanding-completion window, but successful fences
   always proceed to corner-fiducial, per-cycle freshness, hash, and exact-byte
   validation regardless of cumulative elapsed time.
-- Connector removal, topology rebuild, VT release, DPMS off, and shutdown
-  unregister waiting jobs, retire scene pins, quiesce both devices, and only
-  then reset or drop pools.
+- Connector/topology, VT, provider, effective DPMS, and logical-size changes
+  retire a parked qualification immediately with `Interrupted` and suppress
+  its late result. Installed copied-scanout teardown separately unregisters
+  live frame jobs, retires scene pins, quiesces both devices, and only then
+  resets or drops pools.
 - A failed live fence wait or recovery retains the exact BO/descriptor ledger
   and latches fatal instead of releasing anything still queue-referenced. After
   KMS is off and both devices are proven idle, lifecycle reset destroys both
@@ -287,4 +355,7 @@ dependency. Candidate setup additionally reads and compares both full images
 for all three slots and two cycles; per-fence 200 ms completion windows do not
 reduce the three-slot pool or full-output image extent. Live frames do not
 perform this CPU work. There is no copied CPU fallback. Damage-limited copies
-and asynchronous failure recovery are later optimizations.
+and asynchronous live-frame failure recovery are later optimizations. Runtime
+route qualification is asynchronous with respect to the core, but its initial
+scheduler is a global single-flight FIFO; safe parallel display probing awaits
+resource-scoped topology epochs and deterministic ordered admission.

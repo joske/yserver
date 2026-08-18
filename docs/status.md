@@ -33,6 +33,46 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-08-18 process-isolated runtime PRIME route qualification:** a runtime
+  `RRSetCrtcConfig` that needs a different-device or relationship-unknown
+  allocation no longer executes its compatibility search on the core thread.
+  The core parks only the requesting client's FIFO behind a monotonic request
+  token; input, VT handling, rendering, and requests from other clients remain
+  serviceable. The KMS backend runs qualification as a deterministic global
+  FIFO with a single active helper. This initial cap of one is intentional:
+  route probes are not yet parallel because topology validity still uses one
+  global epoch. Resource-scoped epochs plus ordered admission are future work.
+
+  The helper reexecutes the exact running yserver image, builds a fresh
+  disposable Vulkan/GBM object graph, and receives a duplicate of the parent's
+  KMS DRM fd. That duplicate shares the same open file description, so the
+  child uses it only for atomic `TEST_ONLY`; it never performs a live modeset.
+  A normal `Compatible` or `Rejected` response is valid only after strict
+  cleanup has removed every helper-created mode blob, framebuffer, and GEM
+  handle. Any uncertain submitted fence, helper/IPC/watchdog state that may
+  have started child work, or uncertain KMS cleanup returns `Indeterminate`
+  and poisons the involved resources instead of converting uncertainty into
+  incompatibility. A failure proven to occur before child creation does not
+  poison resources. Every
+  submitted disposable fence retains its own fresh 200 ms wait window. A
+  full copied qualification can therefore perform twelve independent waits
+  (three slots, two cycles, A plus B). A separate 30 s whole-helper watchdog
+  bounds synchronous Vulkan and other host calls that cannot themselves be
+  preempted, and a parent-death signal kills a helper that outlives yserver.
+
+  The old KMS topology stays lit throughout helper search and throughout the
+  parent's exact live allocation plus full-pool `TEST_ONLY`. After the result
+  and topology epoch are revalidated, yserver quiesces only immediately before
+  installing the prepared plan, keeping the dark interval to the final handoff.
+  Connector/topology changes, VT transitions, provider-output-source changes,
+  effective DPMS transitions, and logical-screen-size changes immediately
+  retire a parked request as `Interrupted`; the client FIFO resumes, and any
+  late helper result is suppressed (while an uncertain late result still
+  poisons its resources internally). Same-device and no-reallocation requests
+  remain synchronous. Startup qualification also remains synchronous, as do
+  the parent's final exact live allocation, `TEST_ONLY`, quiesce, and install;
+  those are explicit remaining blocking boundaries, although runtime live
+  preparation leaves the old display active until the short install stage.
 - **2026-08-18 copied reverse-PRIME scanout:** a different-device or
   relationship-unknown output now falls back to GPU copy transport only after
   every exact copy-free allocation plan fails. `OutputScanout` keeps the
@@ -77,14 +117,15 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   quiescent so pool, pipeline, and final context teardown skip their otherwise
   defensive `vkDeviceWaitIdle`; live contexts never receive that exemption.
   Only a timeout or other post-submit failure that leaves an outstanding fence
-  incomplete or uncertain terminally stops exact-plan search and retains the complete
-  disposable attempt until process exit, bypassing normal Drop and
-  `vkDeviceWaitIdle`. No later exact plan is tried after that terminal failure.
-  During startup, a terminal probe also aborts later outputs and retains the
-  partially constructed live GPU owners so constructor unwinding cannot
-  re-enter an idle wait. During runtime RANDR, yserver skips scene/Vulkan
-  teardown and attempts to restore only the unchanged old KMS framebuffers;
-  the request still returns failure to the client.
+  incomplete or uncertain terminally stops exact-plan search. During runtime,
+  that attempt belongs to the isolated helper, which terminates without normal
+  Drop or `vkDeviceWaitIdle`; the parent receives `Indeterminate`, poisons the
+  involved resources, and tries no later exact plan. Because the helper never
+  changes the live topology and parent-side preparation also keeps the old
+  topology installed, runtime failure needs no framebuffer restoration.
+  Startup probing is still synchronous: a terminal startup probe retains its
+  complete disposable attempt plus partially constructed live GPU owners and
+  aborts later outputs so constructor unwinding cannot re-enter an idle wait.
   This setup-only readback is not a live CPU transport fallback. It validates
   the Vulkan-visible render/transport/import/copy chain but cannot prove
   the display engine's interpretation of GBM/KMS pitch, offset, and modifier
@@ -142,8 +183,11 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   displaying empty window interiors. An unverified selected renderer retains
   the historical one-KMS allowance and fails closed when multiple KMS devices
   prevent proving that topology.
-  Topology, VT, DPMS, and shutdown paths unregister waiting jobs and quiesce
-  both devices before reset/drop. Failed A-fence waits retain BO/descriptor
+  Installed copied-scanout topology, VT, DPMS, and shutdown paths unregister
+  live frame jobs and quiesce both devices before reset/drop. Separately,
+  topology/VT/provider/DPMS/logical-size changes promptly interrupt a pending
+  route-qualification request without waiting for its helper. Failed A-fence
+  waits retain BO/descriptor
   ledgers; post-submit export failures rearm binary semaphores only after the
   corresponding queue is proven complete. Successful KMS-off plus A/B idle
   clears temporary waits/retained fds and normalizes ownership to full-discard
@@ -237,18 +281,22 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   the established GBM-first allocator. Every different-device or
   relationship-unknown route—including a split first output during startup—is
   validated on a fresh disposable logical device selected by the live
-  renderer's exact Vulkan device and driver UUIDs. Each candidate must allocate
-  one complete three-BO pool with a single exact representation, pass a full
-  connector/CRTC/primary-plane atomic `TEST_ONLY` for every framebuffer, render
-  a real color-attachment clear into every BO, and complete its probe fence.
+  renderer's exact Vulkan device and driver UUIDs. Runtime validation builds
+  that disposable device in the isolated probe helper; startup validation
+  still builds it synchronously in the server process. Each candidate must
+  allocate one complete three-BO pool with a single exact representation, pass
+  a full connector/CRTC/primary-plane atomic `TEST_ONLY` for every framebuffer,
+  render a real color-attachment clear into every BO, and complete its probe
+  fence.
   The exact winner is then reallocated on the live renderer and all three live
   framebuffers are tested again before a runtime modeset may install the first
   front buffer. Candidate order remains output-owned GBM modifiers first, then
   renderer-owned padded-linear, Vulkan-modifier, explicit-linear, and
   legacy-linear plans; modifier candidates independently require Vulkan import
-  support for GBM ownership and export support for renderer ownership. A failed
-  disposable device is torn down and the next exact candidate gets a fresh
-  device, while loss of the live renderer is fatal. Startup probes remain
+  support for GBM ownership and export support for renderer ownership. A safely
+  rejected disposable device is torn down and the next exact candidate gets a
+  fresh device; an uncertain helper result instead poisons the route resources,
+  while loss of the live renderer is fatal. Startup probes remain
   under the initial dumb-scanout rollback guard, and a successful runtime
   commit marks its exact BO `OnScreen` before ownership leaves the candidate
   loop. Shutdown disarm deliberately retains output-owned GBM storage if KMS
@@ -265,9 +313,13 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   Vulkan selects the operational renderer, so the initial modeset rollback
   guard stays armed across every fallible renderer and pool-allocation step;
   only the infallible final handoff produces `ActiveOutput`s. Runtime RANDR
-  enable/reconfigure rebuilds a pool when either the output route or its
-  existing pool route differs, even at an unchanged mode, and updates the live
-  route only after a successful modeset. Pool creation also records
+  enable/reconfigure parks cross-device qualification without changing the
+  installed output. Once a resource-free exact plan is qualified, the parent
+  rebuilds and `TEST_ONLY`s the live pool while the old topology remains lit,
+  revalidates the topology epoch, then performs the short quiesce/install
+  handoff. A pool is rebuilt when either the output route or its existing pool
+  route differs, even at an unchanged mode, and the live route changes only
+  after a successful modeset. Pool creation also records
   direction-specific advertised evidence for output-owned GBM allocation (KMS
   PRIME export plus Vulkan import) and renderer-owned Vulkan allocation
   (Vulkan export plus KMS PRIME import), including explicit-modifier and linear
