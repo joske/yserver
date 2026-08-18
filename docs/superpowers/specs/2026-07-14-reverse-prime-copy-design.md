@@ -87,27 +87,46 @@ destination without changing that order. The
 probe creates fresh exact disposable logical devices for both A and B,
 allocates a complete three-slot pool with one plan pair, and first validates
 every destination framebuffer with a full connector/CRTC/primary-plane atomic
-`TEST_ONLY`. It then validates every slot with two A/B cycles. The first cycle
-performs:
+`TEST_ONLY`. It then validates every slot with two token-distinct A/B cycles.
+The first cycle performs:
 
-1. a real color-attachment render into A's optimal local target;
+1. a real color-attachment render into A's optimal local target of a
+   full-extent radial hue-and-luminance pattern. It desaturates smoothly toward
+   every rectangular edge and includes coordinate-coded low bits, edge rails,
+   and asymmetric exact-color corner fiducials;
 2. an optional FOREIGN-to-A acquire of the linear transport, separate local
    target/transport transitions, a full optimal-to-linear copy, local returns
    to `GENERAL`, then a separate linear-transport A-to-FOREIGN release and
-   export of A's completion as a `sync_file`;
+   export of A's completion as a `sync_file`. A also copies its still-local
+   optimal target into a tightly packed host-visible BGRA buffer without
+   reacquiring or reading the external transport;
 3. B import/wait, a matching FOREIGN-to-B acquire, local transfer layouts, a
    full-image GPU copy, local return to `GENERAL`, and separate B-to-FOREIGN
-   releases for source and destination;
-4. bounded A and B probe-fence completion.
+   releases for source and destination. Before the destination release, B
+   copies that final Vulkan destination into its own tightly packed
+   host-visible BGRA buffer;
+4. bounded A and B probe-fence completion, followed by stable diagnostic
+   hashes and an exact byte-for-byte A-target/B-destination comparison. Hashes
+   never decide admission alone, and a mismatch reports the first pixel and
+   channel.
 
-Cycle two imports B's retained return completion into a fresh temporary A
-semaphore, waits it, and executes FOREIGN-to-A on the linear transport before
-another target-to-transport copy/release. The optimal target stays A-local in
-both cycles. `TEST_ONLY` does not make KMS an ownership participant, so the disposable
-destination is treated as atomic-rejected/abandoned after cycle one and cycle
-two full-discards it from `UNDEFINED`; the real `GENERAL` KMS-to-B return leg
-is reserved for a live two-flip hardware smoke test and is never fabricated by
-the probe.
+Cycle two changes the pattern token, imports B's retained return completion
+into a fresh temporary A semaphore, waits it, and executes FOREIGN-to-A on the
+linear transport before another target-to-transport copy/release/readback.
+Repeating the first renderer hash is rejected, so matching stale frames on both
+devices cannot pass merely by matching each other. The optimal target stays
+A-local in both cycles. `TEST_ONLY` does not make KMS an ownership participant,
+so the disposable destination is treated as atomic-rejected/abandoned after
+cycle one and cycle two full-discards it from `UNDEFINED`; the real `GENERAL`
+KMS-to-B return leg is reserved for a live two-flip hardware smoke test and is
+never fabricated by the probe.
+
+The CPU readbacks are setup-time validation only, not a CPU transport fallback
+in the live frame path. They prove the Vulkan-visible render, linearization,
+DMA-BUF import, and B copy chain. They cannot prove that the display engine
+will interpret GBM/KMS pitch, offset, and modifier metadata identically; atomic
+`TEST_ONLY` plus a live two-flip visual, writeback, or CRTC-CRC smoke remains the
+end-to-end display gate.
 
 Only the exact winning pair is replayed on the live A/B contexts, and every
 live destination framebuffer is tested again. Startup probing runs while the
@@ -195,6 +214,9 @@ submission, and is cleared by failed-cycle recovery and lifecycle reset.
   next exact pair with fresh contexts.
 - A sink without explicit modifier/layout import support rejects copied
   scanout before any foreign-memory allocation or submission.
+- Content-probe buffers are host-coherent and tightly packed. COPY-to-HOST
+  barriers plus successful bounded fences precede every CPU read; corner
+  fiducials, per-cycle freshness, hashes, and exact bytes must all validate.
 - Connector removal, topology rebuild, VT release, DPMS off, and shutdown
   unregister waiting jobs, retire scene pins, quiesce both devices, and only
   then reset or drop pools.
@@ -211,5 +233,7 @@ submission, and is cleared by failed-cycle recovery and lifecycle reset.
 Copied scanout renders and copies the full output twice on the GPU: optimal A
 target to linear transport, then B's imported transport alias to its scanout
 destination. The scene already uses full repaint, so this adds no buffer-age
-dependency. There is no copied CPU fallback. Damage-limited copies and
-asynchronous failure recovery are later optimizations.
+dependency. Candidate setup additionally reads and compares both full images
+for all three slots and two cycles; live frames do not perform this CPU work.
+There is no copied CPU fallback. Damage-limited copies and asynchronous failure
+recovery are later optimizations.

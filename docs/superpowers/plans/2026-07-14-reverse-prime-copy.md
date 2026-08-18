@@ -13,8 +13,11 @@
 4. Probe full three-slot target/transport/destination pairs on disposable exact
    A/B contexts by running full-pool atomic `TEST_ONLY` first, then two
    source-handoff cycles with separate local/FOREIGN barriers, retained B-to-A
-   completion, and real render/copy/fences; never fabricate the absent KMS
-   return leg, and replay only the exact winner live.
+   completion, and real render/copy/fences. Render a token-distinct full-extent
+   radial diagnostic pattern, read back A's local target and B's final
+   destination after bounded fences, and require exact bytes plus diagnostic
+   hashes, valid corner fiducials, and cross-cycle freshness; never fabricate
+   the absent KMS return leg, and replay only the exact winner live.
 5. Add a stable copied-render completion poller and core backend-fd dispatch
    using monotonic job id, `OutputKey`, and BO index.
 6. Render into A's optimal target, linearize into the external transport,
@@ -35,8 +38,9 @@
    selected renderer.
 10. Cover exact/none/ambiguous sink selection, shared-before-copied order,
    route pairing, plan order, completion matching, deferred recycle, fd=-1,
-   ownership transitions, local-pixel validity, failed-wait retention, and core
-   fd routing; retain a live two-flip GENERAL KMS-to-B ownership smoke as an
-   explicit external gate.
+   ownership transitions, local-pixel validity, A/B readback equality, first
+   mismatch diagnostics, stale-cycle rejection, corner fiducials, failed-wait
+   retention, and core fd routing; retain a live two-flip GENERAL KMS-to-B
+   ownership and display-interpretation smoke as an explicit external gate.
 11. Update status, run nightly formatting, workspace tests, exact all-target
     Clippy, and diff checks before committing the semantic successor.

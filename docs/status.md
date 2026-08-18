@@ -51,7 +51,20 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   does not provide a KMS ownership return, its destination full-discards from
   `UNDEFINED`, while real `GENERAL` KMS-to-B reuse remains a live two-flip
   hardware-smoke gate. Every destination framebuffer passes full atomic
-  `TEST_ONLY` before the exact source/destination plans are replayed live.
+  `TEST_ONLY` before the exact source/destination plans are replayed live. Each
+  disposable cycle now renders a token-distinct full-extent radial color-ray
+  pattern that desaturates smoothly toward the rectangular edges and embeds
+  coordinate bits, edge rails, and exact asymmetric corner fiducials. After
+  A linearizes its renderer-local target and B imports/copies the DMA-BUF, both
+  devices copy their respective A-target and B-destination images into tight
+  host-visible BGRA buffers. Successful bounded fences precede CPU access; the
+  probe logs stable hashes for diagnosis but admits a candidate only when all
+  bytes match, the fiducials are present, and cycle two differs from cycle one.
+  This setup-only readback is not a live CPU transport fallback. It validates
+  the Vulkan-visible render/linearization/import/copy chain but cannot prove
+  the display engine's interpretation of GBM/KMS pitch, offset, and modifier
+  metadata, so the live two-flip visual/writeback/CRTC-CRC smoke remains
+  pending alongside the ownership-return smoke.
   Startup fallback remains under the dumb-scanout rollback guard; runtime
   enable commits and marks the exact destination front before installing it.
   A stable backend completion poller carries monotonic job id, device-qualified

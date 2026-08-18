@@ -75,6 +75,7 @@ type GbmDevice = gbm::Device<Rc<crate::drm::Device>>;
 
 use super::{
     device::VkContext,
+    probe_pattern::CopiedProbePatternPipeline,
     target::{
         COPIED_TRANSPORT_IMAGE_USAGE, DrawableImage, DrawableImageError, ExportableImage,
         allocate_copied_source_exact,
@@ -1169,6 +1170,61 @@ impl CopiedRenderSource {
         }
     }
 
+    /// Copy the renderer-local optimal target into this source's tightly
+    /// packed host-visible probe buffer. The caller records this only after
+    /// [`Self::record_linearization`], while the target is back in `GENERAL`.
+    /// The linear transport remains FOREIGN-owned and is deliberately not
+    /// touched by this diagnostic readback.
+    fn record_probe_readback(&self, command_buffer: vk::CommandBuffer) {
+        let device = &self.render_vk.device;
+        unsafe {
+            let to_copy = [vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                .src_access_mask(vk::AccessFlags2::MEMORY_READ)
+                .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .image(self.image())
+                .subresource_range(color_subresource_range())];
+            device.cmd_pipeline_barrier2(
+                command_buffer,
+                &vk::DependencyInfo::default().image_memory_barriers(&to_copy),
+            );
+
+            let regions = [tight_bgra_buffer_image_copy(self.width(), self.height())];
+            crate::vk_count!(cmd_copy_image_to_buffer);
+            device.cmd_copy_image_to_buffer(
+                command_buffer,
+                self.image(),
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                self.transfer.staging_buffer,
+                &regions,
+            );
+
+            let image_to_general = [vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_READ)
+                .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                .dst_access_mask(vk::AccessFlags2::MEMORY_READ)
+                .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .image(self.image())
+                .subresource_range(color_subresource_range())];
+            let buffer_to_host = [probe_buffer_to_host_barrier(&self.transfer)];
+            device.cmd_pipeline_barrier2(
+                command_buffer,
+                &vk::DependencyInfo::default()
+                    .image_memory_barriers(&image_to_general)
+                    .buffer_memory_barriers(&buffer_to_host),
+            );
+        }
+    }
+
+    fn probe_readback_bytes(&self) -> io::Result<&[u8]> {
+        tight_mapped_bgra_bytes(&self.transfer, self.width(), self.height())
+    }
+
     /// Preserve every Vulkan child and both owning contexts when GPU
     /// quiescence could not be proven. This is the copied-path analogue of
     /// [`ScanoutBo::disarm`]: leaking is safer than freeing referenced memory.
@@ -1327,7 +1383,7 @@ impl CopiedScanoutPool {
         bo_idx: usize,
         render_completion: Option<OwnedFd>,
     ) -> io::Result<Option<OwnedFd>> {
-        self.submit_copy_with_fence(bo_idx, render_completion, vk::Fence::null())
+        self.submit_copy_with_fence(bo_idx, render_completion, vk::Fence::null(), false)
     }
 
     fn submit_copy_with_fence(
@@ -1335,6 +1391,7 @@ impl CopiedScanoutPool {
         bo_idx: usize,
         render_completion: Option<OwnedFd>,
         fence: vk::Fence,
+        probe_readback: bool,
     ) -> io::Result<Option<OwnedFd>> {
         let source = self
             .sources
@@ -1454,30 +1511,76 @@ impl CopiedScanoutPool {
                     .dst_image_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                     .regions(&regions),
             );
-            let local_to_general = [
-                vk::ImageMemoryBarrier2::default()
+            let source_to_general = [vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_READ)
+                .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                .dst_access_mask(vk::AccessFlags2::empty())
+                .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .image(source.imported_sink_image())
+                .subresource_range(color_subresource_range())];
+            let destination_after_copy = [vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(if probe_readback {
+                    vk::PipelineStageFlags2::COPY
+                } else {
+                    vk::PipelineStageFlags2::ALL_COMMANDS
+                })
+                .dst_access_mask(if probe_readback {
+                    vk::AccessFlags2::TRANSFER_READ
+                } else {
+                    vk::AccessFlags2::MEMORY_READ
+                })
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(if probe_readback {
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+                } else {
+                    vk::ImageLayout::GENERAL
+                })
+                .image(destination.vk_image)
+                .subresource_range(color_subresource_range())];
+            self.sink_vk.device.cmd_pipeline_barrier2(
+                command_buffer,
+                &vk::DependencyInfo::default().image_memory_barriers(&source_to_general),
+            );
+            self.sink_vk.device.cmd_pipeline_barrier2(
+                command_buffer,
+                &vk::DependencyInfo::default().image_memory_barriers(&destination_after_copy),
+            );
+
+            if probe_readback {
+                let regions = [tight_bgra_buffer_image_copy(
+                    source.width(),
+                    source.height(),
+                )];
+                crate::vk_count!(cmd_copy_image_to_buffer);
+                self.sink_vk.device.cmd_copy_image_to_buffer(
+                    command_buffer,
+                    destination.vk_image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    destination.vk_transfer.staging_buffer,
+                    &regions,
+                );
+
+                let destination_to_general = [vk::ImageMemoryBarrier2::default()
                     .src_stage_mask(vk::PipelineStageFlags2::COPY)
                     .src_access_mask(vk::AccessFlags2::TRANSFER_READ)
                     .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-                    .dst_access_mask(vk::AccessFlags2::empty())
+                    .dst_access_mask(vk::AccessFlags2::MEMORY_READ)
                     .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
                     .new_layout(vk::ImageLayout::GENERAL)
-                    .image(source.imported_sink_image())
-                    .subresource_range(color_subresource_range()),
-                vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::COPY)
-                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-                    .dst_access_mask(vk::AccessFlags2::MEMORY_READ)
-                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .new_layout(vk::ImageLayout::GENERAL)
                     .image(destination.vk_image)
-                    .subresource_range(color_subresource_range()),
-            ];
-            self.sink_vk.device.cmd_pipeline_barrier2(
-                command_buffer,
-                &vk::DependencyInfo::default().image_memory_barriers(&local_to_general),
-            );
+                    .subresource_range(color_subresource_range())];
+                let buffer_to_host = [probe_buffer_to_host_barrier(&destination.vk_transfer)];
+                self.sink_vk.device.cmd_pipeline_barrier2(
+                    command_buffer,
+                    &vk::DependencyInfo::default()
+                        .image_memory_barriers(&destination_to_general)
+                        .buffer_memory_barriers(&buffer_to_host),
+                );
+            }
 
             let ownership_releases = [
                 vk::ImageMemoryBarrier2::default()
@@ -1544,8 +1647,9 @@ impl CopiedScanoutPool {
         Ok(completion)
     }
 
-    /// Probe all exact slots with a real A render, external semaphore handoff,
-    /// and B copy. Each slot runs twice: cycle two consumes B's retained
+    /// Probe all exact slots with a spatially unique A render, external
+    /// semaphore handoff, B copy, and exact CPU-visible content comparison.
+    /// Each slot runs twice: cycle two consumes B's retained
     /// completion on A, covering both directions of the source ownership
     /// protocol rather than admitting a route after only its first A -> B
     /// handoff. TEST_ONLY does not perform a KMS ownership release, so the
@@ -1554,19 +1658,42 @@ impl CopiedScanoutPool {
     /// two-flip hardware check. Bounded fences keep rejected disposable work
     /// from racing pool destruction.
     pub(crate) fn probe_copy_all(&mut self, timeout_ns: u64) -> io::Result<()> {
+        let render_vk = Arc::clone(
+            &self
+                .sources
+                .first()
+                .ok_or_else(|| io::Error::other("copied probe pool has no source slots"))?
+                .render_vk,
+        );
+        let pattern = CopiedProbePatternPipeline::new(Arc::clone(&render_vk))
+            .map_err(|result| scanout_vk_error("create copied content-probe pipeline", result))?;
+
         for bo_idx in 0..self.sources.len() {
+            let mut previous_renderer_hash = None;
             for cycle in 0..2 {
-                let render_vk = Arc::clone(&self.sources[bo_idx].render_vk);
                 let sink_vk = Arc::clone(&self.sink_vk);
+                let frame_token = u32::try_from(bo_idx)
+                    .ok()
+                    .and_then(|index| index.checked_mul(2))
+                    .and_then(|base| base.checked_add(cycle))
+                    .ok_or_else(|| io::Error::other("copied probe frame token overflow"))?;
                 let render_fence = create_probe_fence(&render_vk)?;
                 let render_fence = ProbeFence::new(&render_vk.device, render_fence);
-                let render_completion =
-                    submit_copied_source_probe(&mut self.sources[bo_idx], render_fence.handle())?;
+                let render_completion = submit_copied_source_probe(
+                    &mut self.sources[bo_idx],
+                    &pattern,
+                    frame_token,
+                    render_fence.handle(),
+                )?;
 
                 let sink_fence_handle = create_probe_fence(&sink_vk)?;
                 let sink_fence = ProbeFence::new(&sink_vk.device, sink_fence_handle);
-                let copy_completion =
-                    self.submit_copy_with_fence(bo_idx, render_completion, sink_fence.handle())?;
+                let copy_completion = self.submit_copy_with_fence(
+                    bo_idx,
+                    render_completion,
+                    sink_fence.handle(),
+                    true,
+                )?;
                 drop(copy_completion);
 
                 wait_probe_fence(
@@ -1577,6 +1704,37 @@ impl CopiedScanoutPool {
                 )?;
                 wait_probe_fence(&sink_vk, sink_fence, timeout_ns, "copied sink probe")?;
                 self.release_completed_source(bo_idx);
+                let renderer_pixels = self.sources[bo_idx].probe_readback_bytes()?;
+                let sink_pixels = tight_mapped_bgra_bytes(
+                    &self.destinations.bos[bo_idx].vk_transfer,
+                    self.sources[bo_idx].width(),
+                    self.sources[bo_idx].height(),
+                )?;
+                validate_copied_probe_fiducials(
+                    renderer_pixels,
+                    self.sources[bo_idx].width(),
+                    self.sources[bo_idx].height(),
+                    bo_idx,
+                    cycle,
+                    frame_token,
+                )?;
+                let renderer_hash = verify_copied_probe_pixels(
+                    renderer_pixels,
+                    sink_pixels,
+                    self.sources[bo_idx].width(),
+                    self.sources[bo_idx].height(),
+                    bo_idx,
+                    cycle,
+                    frame_token,
+                )?;
+                validate_copied_probe_freshness(
+                    previous_renderer_hash,
+                    renderer_hash,
+                    bo_idx,
+                    cycle,
+                    frame_token,
+                )?;
+                previous_renderer_hash = Some(renderer_hash);
                 if cycle == 0 {
                     // No real KMS commit acquired/released the destination.
                     // After B is proven idle, recover it as an atomic reject
@@ -3178,6 +3336,8 @@ fn wait_probe_fence<'a>(
 
 fn submit_copied_source_probe(
     source: &mut CopiedRenderSource,
+    pattern: &CopiedProbePatternPipeline,
+    frame_token: u32,
     fence: vk::Fence,
 ) -> io::Result<Option<OwnedFd>> {
     source.prepare_renderer_acquire()?;
@@ -3220,7 +3380,7 @@ fn submit_copied_source_probe(
             .store_op(vk::AttachmentStoreOp::STORE)
             .clear_value(vk::ClearValue {
                 color: vk::ClearColorValue {
-                    float32: [0.125, 0.25, 0.5, 1.0],
+                    float32: [0.0, 0.0, 0.0, 1.0],
                 },
             })];
         device.cmd_begin_rendering(
@@ -3236,8 +3396,10 @@ fn submit_copied_source_probe(
                 .layer_count(1)
                 .color_attachments(&attachments),
         );
+        pattern.record(command_buffer, source.width(), source.height(), frame_token);
         device.cmd_end_rendering(command_buffer);
         source.record_linearization(command_buffer, transport_preparation);
+        source.record_probe_readback(command_buffer);
         device
             .end_command_buffer(command_buffer)
             .map_err(|result| {
@@ -3272,6 +3434,212 @@ fn submit_copied_source_probe(
     source
         .export_render_completion()
         .map_err(|result| scanout_vk_error("export copied renderer probe completion", result))
+}
+
+fn tight_bgra_len(width: u32, height: u32) -> io::Result<usize> {
+    let bytes = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| io::Error::other("copied probe BGRA byte length overflow"))?;
+    usize::try_from(bytes)
+        .map_err(|_| io::Error::other("copied probe BGRA byte length exceeds usize"))
+}
+
+fn tight_mapped_bgra_bytes(
+    transfer: &TransferResources,
+    width: u32,
+    height: u32,
+) -> io::Result<&[u8]> {
+    let len = tight_bgra_len(width, height)?;
+    if transfer.staging_size < len as u64 {
+        return Err(io::Error::other(format!(
+            "copied probe staging buffer is too small: have {} bytes, need {len}",
+            transfer.staging_size,
+        )));
+    }
+    // SAFETY: `staging_mapped` points to `staging_size` live mapped bytes for
+    // the lifetime of `transfer`; the checked slice is no larger than that
+    // mapping. Callers read only after the corresponding probe fence signals.
+    Ok(unsafe { std::slice::from_raw_parts(transfer.staging_mapped.as_ptr(), len) })
+}
+
+fn tight_bgra_buffer_image_copy(width: u32, height: u32) -> vk::BufferImageCopy {
+    vk::BufferImageCopy::default()
+        .buffer_offset(0)
+        .buffer_row_length(0)
+        .buffer_image_height(0)
+        .image_subresource(color_subresource_layers())
+        .image_extent(vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        })
+}
+
+fn probe_buffer_to_host_barrier(transfer: &TransferResources) -> vk::BufferMemoryBarrier2<'_> {
+    vk::BufferMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::COPY)
+        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+        .dst_access_mask(vk::AccessFlags2::HOST_READ)
+        .buffer(transfer.staging_buffer)
+        .offset(0)
+        .size(transfer.staging_size)
+}
+
+/// Stable FNV-1a digest used only for concise probe diagnostics. Successful
+/// validation also compares every byte, so hash collisions cannot admit a
+/// corrupt route.
+fn copied_probe_hash(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_copied_probe_fiducials(
+    renderer: &[u8],
+    width: u32,
+    height: u32,
+    bo_idx: usize,
+    cycle: u32,
+    frame_token: u32,
+) -> io::Result<()> {
+    if width < 2 || height < 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "copied content probe requires an image at least 2x2",
+        ));
+    }
+    let expected_len = tight_bgra_len(width, height)?;
+    if renderer.len() != expected_len {
+        return Err(io::Error::other(format!(
+            "copied content probe BO {bo_idx} cycle {cycle} token {frame_token}: renderer \
+             readback length {} does not match expected {expected_len}",
+            renderer.len(),
+        )));
+    }
+
+    // The fragment shader writes exact tokenized RGB corner fiducials.
+    // Readback is tightly packed B8G8R8A8, so the byte order below is BGRA.
+    // Besides making screenshots orientable, this ensures a failed/no-op draw
+    // cannot pass merely because both devices copied the same uniform clear.
+    let corners = [
+        (0, 0, copied_probe_marker_bgra([241, 37, 83], frame_token)),
+        (
+            width - 1,
+            0,
+            copied_probe_marker_bgra([29, 211, 71], frame_token),
+        ),
+        (
+            0,
+            height - 1,
+            copied_probe_marker_bgra([47, 91, 233], frame_token),
+        ),
+        (
+            width - 1,
+            height - 1,
+            copied_probe_marker_bgra([223, 173, 19], frame_token),
+        ),
+    ];
+    for (x, y, expected) in corners {
+        let start = ((y as usize * width as usize) + x as usize) * 4;
+        let actual = &renderer[start..start + 4];
+        if actual != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "copied content probe BO {bo_idx} cycle {cycle} token {frame_token}: \
+                     renderer fiducial at ({x},{y}) is BGRA {actual:?}, expected {expected:?}"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn copied_probe_marker_bgra(rgb: [u8; 3], frame_token: u32) -> [u8; 4] {
+    let token = frame_token as u8;
+    let rgb_mask = [token, token.wrapping_mul(17), token.wrapping_mul(31)];
+    [
+        rgb[2] ^ rgb_mask[2],
+        rgb[1] ^ rgb_mask[1],
+        rgb[0] ^ rgb_mask[0],
+        255,
+    ]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_copied_probe_pixels(
+    renderer: &[u8],
+    sink: &[u8],
+    width: u32,
+    height: u32,
+    bo_idx: usize,
+    cycle: u32,
+    frame_token: u32,
+) -> io::Result<u64> {
+    let expected_len = tight_bgra_len(width, height)?;
+    if renderer.len() != expected_len || sink.len() != expected_len {
+        return Err(io::Error::other(format!(
+            "copied content probe BO {bo_idx} cycle {cycle} token {frame_token}: unexpected \
+             readback lengths renderer={} sink={} expected={expected_len}",
+            renderer.len(),
+            sink.len(),
+        )));
+    }
+
+    let renderer_hash = copied_probe_hash(renderer);
+    let sink_hash = copied_probe_hash(sink);
+    if renderer_hash == sink_hash && renderer == sink {
+        log::debug!(
+            "copied content probe matched: BO {bo_idx} cycle {cycle} token {frame_token} \
+             {width}x{height} bytes={expected_len} hash=fnv1a64:{renderer_hash:016x}"
+        );
+        return Ok(renderer_hash);
+    }
+
+    let mismatch = renderer
+        .iter()
+        .zip(sink)
+        .position(|(renderer, sink)| renderer != sink)
+        .unwrap_or(0);
+    let pixel = mismatch / 4;
+    let x = pixel % width as usize;
+    let y = pixel / width as usize;
+    let channel = ["B", "G", "R", "A"][mismatch % 4];
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "copied content probe mismatch: BO {bo_idx} cycle {cycle} token {frame_token} \
+             {width}x{height} renderer_hash=fnv1a64:{renderer_hash:016x} \
+             sink_hash=fnv1a64:{sink_hash:016x}; first difference at ({x},{y}) channel={channel} \
+             renderer={} sink={}",
+            renderer[mismatch], sink[mismatch],
+        ),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_copied_probe_freshness(
+    previous_renderer_hash: Option<u64>,
+    renderer_hash: u64,
+    bo_idx: usize,
+    cycle: u32,
+    frame_token: u32,
+) -> io::Result<()> {
+    // The shader tokenizes its corner fiducials as well as the radial field,
+    // so even the smallest admitted 2x2 extent must change between cycles.
+    if previous_renderer_hash == Some(renderer_hash) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "copied content probe BO {bo_idx} produced stale renderer pixels in cycle \
+                 {cycle}: frame token {frame_token} repeated fnv1a64:{renderer_hash:016x}"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn color_subresource_range() -> vk::ImageSubresourceRange {
@@ -4673,7 +5041,7 @@ fn allocate_transfer_resources(
     let staging_size: u64 = u64::from(width) * u64::from(height) * 4;
     let buf_info = vk::BufferCreateInfo::default()
         .size(staging_size)
-        .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+        .usage(transfer_staging_buffer_usage())
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
     let staging_buffer = match unsafe { vk.device.create_buffer(&buf_info, None) } {
         Ok(b) => b,
@@ -4780,6 +5148,13 @@ fn allocate_transfer_resources(
         staging_size,
         timestamp_pool,
     })
+}
+
+fn transfer_staging_buffer_usage() -> vk::BufferUsageFlags {
+    // Normal upload/readback code shares this per-BO allocation. Copied
+    // compatibility probing additionally writes complete A/B images into the
+    // mapping before the CPU validates their content.
+    vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST
 }
 
 fn destroy_transfer_resources(vk: &VkContext, transfer: &mut TransferResources) {
@@ -4975,6 +5350,83 @@ mod tests {
                 "source-drm-modifier=0x0-linear-transport -> destination-gbm-modifier=0x{TILED_B:x}"
             )
         );
+    }
+
+    #[test]
+    fn copied_content_probe_accepts_exact_odd_extent_pixels() {
+        let width = 3;
+        let height = 5;
+        let pixels: Vec<u8> = (0..tight_bgra_len(width, height).unwrap())
+            .map(|index| index.wrapping_mul(37) as u8)
+            .collect();
+
+        verify_copied_probe_pixels(&pixels, &pixels, width, height, 1, 0, 2)
+            .expect("identical renderer and sink pixels");
+    }
+
+    #[test]
+    fn copied_content_probe_rejects_one_channel_corruption() {
+        let width = 4;
+        let height = 3;
+        let renderer = vec![0x5a; tight_bgra_len(width, height).unwrap()];
+        let mut sink = renderer.clone();
+        let mismatch = ((2 * width + 1) * 4 + 2) as usize;
+        sink[mismatch] ^= 0xff;
+
+        let error =
+            verify_copied_probe_pixels(&renderer, &sink, width, height, 0, 1, 1).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let text = error.to_string();
+        assert!(text.contains("first difference at (1,2) channel=R"));
+        assert!(text.contains("renderer_hash=fnv1a64:"));
+        assert!(text.contains("sink_hash=fnv1a64:"));
+    }
+
+    #[test]
+    fn copied_content_probe_rejects_equal_stale_cycles() {
+        let error = validate_copied_probe_freshness(
+            Some(0xfeed_face_cafe_beef),
+            0xfeed_face_cafe_beef,
+            2,
+            1,
+            5,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("stale renderer pixels"));
+
+        validate_copied_probe_freshness(
+            Some(0xfeed_face_cafe_beef),
+            0x0123_4567_89ab_cdef,
+            2,
+            1,
+            5,
+        )
+        .expect("different tokenized renderer frames remain admissible");
+    }
+
+    #[test]
+    fn copied_content_probe_requires_rendered_corner_fiducials() {
+        let pixels = [
+            83, 37, 241, 255, 71, 211, 29, 255, 233, 91, 47, 255, 19, 173, 223, 255,
+        ];
+        validate_copied_probe_fiducials(&pixels, 2, 2, 0, 0, 0).expect("four shader fiducials");
+
+        let token_one = [
+            76, 52, 240, 255, 88, 194, 28, 255, 246, 74, 46, 255, 12, 188, 222, 255,
+        ];
+        validate_copied_probe_fiducials(&token_one, 2, 2, 0, 1, 1)
+            .expect("tokenized shader fiducials");
+
+        let uniform = [0; 16];
+        assert!(validate_copied_probe_fiducials(&uniform, 2, 2, 0, 0, 0).is_err());
+    }
+
+    #[test]
+    fn transfer_staging_buffer_supports_upload_and_probe_readback() {
+        let usage = transfer_staging_buffer_usage();
+        assert!(usage.contains(vk::BufferUsageFlags::TRANSFER_SRC));
+        assert!(usage.contains(vk::BufferUsageFlags::TRANSFER_DST));
     }
 
     #[test]

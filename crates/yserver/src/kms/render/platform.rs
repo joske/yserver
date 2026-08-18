@@ -1219,7 +1219,10 @@ fn allocate_copied_scanout_pool(
             continue;
         }
         if let Err(error) = probe_pool.probe_copy_all(PRIME_RENDER_PROBE_TIMEOUT_NS) {
-            failures.push(format!("{} probe render/copy: {error}", plan.describe()));
+            failures.push(format!(
+                "{} probe render/copy/readback: {error}",
+                plan.describe()
+            ));
             continue;
         }
         drop(probe_pool);
