@@ -35,6 +35,25 @@ pub struct ModeSpec {
     pub vrefresh: u32,
 }
 
+/// Opaque identity of an asynchronous CRTC configuration operation.
+///
+/// Tokens must remain unique until the core calls either
+/// [`Backend::finish_crtc_config`] or [`Backend::cancel_crtc_config`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CrtcConfigToken(pub u64);
+
+/// Initial disposition of a client-driven CRTC configuration request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrtcConfigApply {
+    /// The backend completed synchronously. The boolean has the same
+    /// changed/no-op meaning as [`Backend::apply_crtc_config`].
+    Applied(bool),
+    /// Work continues outside the core thread. The core parks the requesting
+    /// client's reply and later calls [`Backend::finish_crtc_config`] after a
+    /// `Message::CrtcConfigReady` wake identifies this token as ready.
+    Pending(CrtcConfigToken),
+}
+
 /// Categorises the raw fds a backend wants the core's mio poller to
 /// watch on its behalf (returned by `Backend::poll_fds`).
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -554,6 +573,47 @@ pub trait Backend {
     ) -> io::Result<bool> {
         Ok(false)
     }
+
+    /// Begin applying a CRTC configuration without requiring the operation
+    /// to finish on the core thread.
+    ///
+    /// The additive default preserves existing backends exactly: they keep
+    /// using the synchronous [`Backend::apply_crtc_config`] implementation.
+    /// A backend with an asynchronous executor overrides this method, returns
+    /// [`CrtcConfigApply::Pending`], and wakes the core with
+    /// `Message::CrtcConfigReady` when one or more tokens can be drained.
+    fn begin_crtc_config(
+        &mut self,
+        output_id: u32,
+        connector: &str,
+        mode: Option<ModeSpec>,
+        x: i32,
+        y: i32,
+    ) -> io::Result<CrtcConfigApply> {
+        self.apply_crtc_config(output_id, connector, mode, x, y)
+            .map(CrtcConfigApply::Applied)
+    }
+
+    /// Drain tokens announced by a `Message::CrtcConfigReady` wake.
+    /// Implementations should remove the returned tokens from their ready
+    /// queue, but retain each operation's result until
+    /// [`Backend::finish_crtc_config`] or [`Backend::cancel_crtc_config`].
+    fn drain_ready_crtc_configs(&mut self) -> Vec<CrtcConfigToken> {
+        Vec::new()
+    }
+
+    /// Finish a ready asynchronous CRTC operation on the core thread.
+    /// Returns the same changed/no-op result as `apply_crtc_config`.
+    fn finish_crtc_config(&mut self, _token: CrtcConfigToken) -> io::Result<bool> {
+        Err(io::Error::other(
+            "unknown asynchronous CRTC configuration token",
+        ))
+    }
+
+    /// Cancel or discard an asynchronous CRTC operation whose client is no
+    /// longer waiting. Implementations must tolerate a completion racing the
+    /// cancellation and must never install that cancelled result later.
+    fn cancel_crtc_config(&mut self, _token: CrtcConfigToken) {}
 
     /// Number of entries in the RANDR CRTC's hardware gamma LUT (`0` = gamma
     /// unsupported). The XID, rather than a connector name, preserves device

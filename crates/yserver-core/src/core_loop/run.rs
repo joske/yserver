@@ -29,12 +29,15 @@ use super::{
         ClientIdAllocator, LISTENER_TOKEN, NOTIFY_TOKEN, backend_token, client_token,
         token_to_backend_index, token_to_client,
     },
-    process_request::{RequestOutcome, fire_present_configure_notify_for_window, process_request},
+    process_request::{
+        PendingCrtcConfig, RequestOutcome, complete_crtc_config,
+        fire_present_configure_notify_for_window, process_request,
+    },
     sender::{CoreReceiver, CoreSender},
     setup_thread::{self, SetupRegistry},
 };
 use crate::{
-    backend::{Backend, BackendFdKind, HostSocketStatus},
+    backend::{Backend, BackendFdKind, CrtcConfigToken, HostSocketStatus},
     host_x11::HostEvent,
     server::{KeyRepeatState, ServerState},
 };
@@ -518,6 +521,64 @@ struct DeferredRequest {
     attached_fd: Option<OwnedFd>,
 }
 
+/// A request whose backend work is running asynchronously. The raw request is
+/// deliberately not retained: validation and begin-side effects run exactly
+/// once, and completion resumes only the protocol reply/notification tail.
+struct ParkedCrtcConfig {
+    client_id: yserver_protocol::x11::ClientId,
+    sequence: yserver_protocol::x11::SequenceNumber,
+    continuation: PendingCrtcConfig,
+    request_wire_bytes: usize,
+}
+
+/// Backend waits indexed both by opaque token (completion) and by client
+/// (strict same-client FIFO blocking/cancellation).
+#[derive(Default)]
+struct PendingBackendRequests {
+    crtc_by_token: HashMap<CrtcConfigToken, ParkedCrtcConfig>,
+    crtc_by_client: HashMap<yserver_protocol::x11::ClientId, CrtcConfigToken>,
+}
+
+impl PendingBackendRequests {
+    fn client_is_blocked(&self, client: yserver_protocol::x11::ClientId) -> bool {
+        self.crtc_by_client.contains_key(&client)
+    }
+
+    fn park_crtc(&mut self, parked: ParkedCrtcConfig) -> Result<(), &'static str> {
+        let client = parked.client_id;
+        let token = parked.continuation.token;
+        if self.crtc_by_client.contains_key(&client) {
+            return Err("client already has a pending backend request");
+        }
+        if self.crtc_by_token.contains_key(&token) {
+            return Err("backend reused a live CRTC configuration token");
+        }
+        self.crtc_by_client.insert(client, token);
+        self.crtc_by_token.insert(token, parked);
+        Ok(())
+    }
+
+    fn take_crtc(&mut self, token: CrtcConfigToken) -> Option<ParkedCrtcConfig> {
+        let parked = self.crtc_by_token.remove(&token)?;
+        self.crtc_by_client.remove(&parked.client_id);
+        Some(parked)
+    }
+
+    fn take_client_crtc(
+        &mut self,
+        client: yserver_protocol::x11::ClientId,
+    ) -> Option<CrtcConfigToken> {
+        let token = self.crtc_by_client.remove(&client)?;
+        self.crtc_by_token.remove(&token);
+        Some(token)
+    }
+
+    fn take_all_crtc_tokens(&mut self) -> Vec<CrtcConfigToken> {
+        self.crtc_by_client.clear();
+        self.crtc_by_token.drain().map(|(token, _)| token).collect()
+    }
+}
+
 /// Per-client FIFO queues behind a round-robin ready ring.
 ///
 /// Request order is preserved within each client, as required by X11, while a
@@ -531,6 +592,7 @@ struct FairRequestQueue {
 }
 
 impl FairRequestQueue {
+    #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -567,8 +629,36 @@ impl FairRequestQueue {
         self.len = self.len.saturating_add(added);
     }
 
+    #[cfg(test)]
     fn pop_front(&mut self) -> Option<DeferredRequest> {
-        while let Some(client) = self.ready.pop_front() {
+        self.pop_front_if(|_| true)
+    }
+
+    fn has_runnable(&self, pending: &PendingBackendRequests) -> bool {
+        self.ready
+            .iter()
+            .any(|client| !pending.client_is_blocked(*client))
+    }
+
+    fn pop_front_unblocked(&mut self, pending: &PendingBackendRequests) -> Option<DeferredRequest> {
+        self.pop_front_if(|client| !pending.client_is_blocked(client))
+    }
+
+    fn pop_front_if(
+        &mut self,
+        mut is_runnable: impl FnMut(yserver_protocol::x11::ClientId) -> bool,
+    ) -> Option<DeferredRequest> {
+        // Inspect each currently-ready client at most once. Blocked clients
+        // retain their position in the ring while other clients keep moving.
+        let candidates = self.ready.len();
+        for _ in 0..candidates {
+            let Some(client) = self.ready.pop_front() else {
+                break;
+            };
+            if !is_runnable(client) {
+                self.ready.push_back(client);
+                continue;
+            }
             let (request, remains_ready) = {
                 let Some(queue) = self.by_client.get_mut(&client) else {
                     continue;
@@ -587,7 +677,6 @@ impl FairRequestQueue {
             }
             return Some(request);
         }
-        debug_assert_eq!(self.len, 0);
         None
     }
 }
@@ -632,10 +721,46 @@ fn release_server_grab_waiters(
     }
 }
 
+fn grant_request_credit(
+    state: &ServerState,
+    client: yserver_protocol::x11::ClientId,
+    bytes: usize,
+) {
+    if let Some(control) = state
+        .clients
+        .get(&client.0)
+        .and_then(|client| client.reader_control.as_ref())
+    {
+        let _ = control.send(crate::server::ReaderControl::GrantRequestBytes(bytes));
+    }
+}
+
+fn disconnect_with_pending_cleanup(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    pending: &mut PendingBackendRequests,
+    client: yserver_protocol::x11::ClientId,
+) {
+    if let Some(token) = pending.take_client_crtc(client) {
+        backend.cancel_crtc_config(token);
+    }
+    crate::core_loop::process_disconnect::process_disconnect(state, backend, client);
+}
+
+fn cancel_all_pending_backend_requests(
+    backend: &mut dyn Backend,
+    pending: &mut PendingBackendRequests,
+) {
+    for token in pending.take_all_crtc_tokens() {
+        backend.cancel_crtc_config(token);
+    }
+}
+
 fn process_one_request(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     telemetry: &mut LoopTelemetry,
+    pending: &mut PendingBackendRequests,
     requests_this_iter: &mut u32,
     request_budget: &mut usize,
     req: DeferredRequest,
@@ -653,7 +778,7 @@ fn process_one_request(
     } else {
         None
     };
-    let disc = process_request_inline(
+    let outcome = process_request_inline(
         state,
         backend,
         req.id,
@@ -673,16 +798,36 @@ fn process_one_request(
     }
     *requests_this_iter += 1;
     *request_budget -= 1;
-    if let Some(disc_id) = disc {
-        crate::core_loop::process_disconnect::process_disconnect(state, backend, disc_id);
-    } else if let Some(control) = state
-        .clients
-        .get(&req_client.0)
-        .and_then(|client| client.reader_control.as_ref())
-    {
-        let _ = control.send(crate::server::ReaderControl::GrantRequestBytes(
-            req_wire_bytes,
-        ));
+    match outcome {
+        RequestOutcome::Handled => grant_request_credit(state, req_client, req_wire_bytes),
+        RequestOutcome::Disconnect(disc_id) => {
+            disconnect_with_pending_cleanup(state, backend, pending, disc_id);
+        }
+        RequestOutcome::PendingCrtcConfig(continuation) => {
+            let token = continuation.token;
+            let parked = ParkedCrtcConfig {
+                client_id: req_client,
+                sequence: req.sequence,
+                continuation,
+                request_wire_bytes: req_wire_bytes,
+            };
+            if let Err(reason) = pending.park_crtc(parked) {
+                log::error!(
+                    "cannot park asynchronous RRSetCrtcConfig for client {} token {}: {reason}",
+                    req_client.0,
+                    token.0,
+                );
+                // If this token is not already owned by another waiter, it is
+                // the just-started operation and can be cancelled safely.
+                if !pending.crtc_by_token.contains_key(&token) {
+                    backend.cancel_crtc_config(token);
+                }
+                // An ordering/token contract violation cannot be replied to
+                // safely without overtaking an earlier request from this
+                // client. Disconnect it and cancel any older parked work.
+                disconnect_with_pending_cleanup(state, backend, pending, req_client);
+            }
+        }
     }
 }
 
@@ -690,6 +835,7 @@ fn drain_pending_requests(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     telemetry: &mut LoopTelemetry,
+    pending: &mut PendingBackendRequests,
     deferred_requests: &mut FairRequestQueue,
     server_grab_waiters: &mut VecDeque<DeferredRequest>,
     requests_this_iter: &mut u32,
@@ -697,7 +843,7 @@ fn drain_pending_requests(
     drain_start: Instant,
 ) {
     while !budget_exhausted(*request_budget, drain_start.elapsed()) {
-        let Some(req) = deferred_requests.pop_front() else {
+        let Some(req) = deferred_requests.pop_front_unblocked(pending) else {
             break;
         };
         telemetry.record_deferred_pop(req.id);
@@ -709,6 +855,7 @@ fn drain_pending_requests(
             state,
             backend,
             telemetry,
+            pending,
             requests_this_iter,
             request_budget,
             req,
@@ -724,8 +871,6 @@ fn drain_pending_requests(
 /// in `run_core` (the deferred queue at the top of each iteration and
 /// the channel drain inside `NOTIFY_TOKEN`) share identical semantics.
 ///
-/// Returns `Some(disconnect_id)` if the handler signalled a
-/// disconnect; the caller runs `process_disconnect` immediately after.
 fn process_request_inline(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -734,7 +879,7 @@ fn process_request_inline(
     header: yserver_protocol::x11::RequestHeader,
     body: &[u8],
     attached_fd: Option<OwnedFd>,
-) -> Option<yserver_protocol::x11::ClientId> {
+) -> RequestOutcome {
     // Half-closed-socket / post-disconnect guard. The `Message::Request`
     // The reader/channel/fair-queue path preserves per-client arrival order.
     // When a client crashes (e.g.
@@ -765,7 +910,7 @@ fn process_request_inline(
             header.opcode,
             sequence.0,
         );
-        return None;
+        return RequestOutcome::Handled;
     }
     let outcome = match process_request(state, backend, id, sequence, header, body, attached_fd) {
         Ok(out) => out,
@@ -782,13 +927,72 @@ fn process_request_inline(
             RequestOutcome::Handled
         }
     };
-    if std::mem::take(&mut state.damage_notify_flush_pending) {
-        backend.flush_before_damage_notify();
+    // Pending work has not committed any visible result yet. Its completion
+    // path performs this bookkeeping exactly once when the result is applied.
+    if !matches!(&outcome, RequestOutcome::PendingCrtcConfig(_)) {
+        if std::mem::take(&mut state.damage_notify_flush_pending) {
+            backend.flush_before_damage_notify();
+        }
+        backend.mark_dirty();
     }
-    backend.mark_dirty();
-    match outcome {
-        RequestOutcome::Disconnect(disc_id) => Some(disc_id),
-        _ => None,
+    outcome
+}
+
+/// Resume every asynchronous CRTC request whose backend result is ready.
+/// `finish_crtc_config` is called only while the originating client is still
+/// waiting, so a late worker completion can never install a cancelled mode.
+fn drain_ready_crtc_configs(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    pending: &mut PendingBackendRequests,
+) {
+    for token in backend.drain_ready_crtc_configs() {
+        let Some(parked) = pending.take_crtc(token) else {
+            // Cancellation may race a worker completion. Discard the backend
+            // result and keep the operation from becoming visible later.
+            backend.cancel_crtc_config(token);
+            continue;
+        };
+        if !state.clients.contains_key(&parked.client_id.0) {
+            backend.cancel_crtc_config(token);
+            continue;
+        }
+
+        let result = backend.finish_crtc_config(token);
+        let outcome = match complete_crtc_config(
+            state,
+            backend,
+            parked.client_id,
+            parked.sequence,
+            parked.continuation.completion,
+            result,
+        ) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                log::warn!(
+                    "RRSetCrtcConfig completion handler error (client {} token {}): {err}",
+                    parked.client_id.0,
+                    token.0,
+                );
+                RequestOutcome::Handled
+            }
+        };
+
+        if std::mem::take(&mut state.damage_notify_flush_pending) {
+            backend.flush_before_damage_notify();
+        }
+        backend.mark_dirty();
+        match outcome {
+            RequestOutcome::Disconnect(client) => {
+                disconnect_with_pending_cleanup(state, backend, pending, client);
+            }
+            RequestOutcome::Handled => {
+                grant_request_credit(state, parked.client_id, parked.request_wire_bytes)
+            }
+            RequestOutcome::PendingCrtcConfig(_) => {
+                unreachable!("CRTC completion cannot start a second asynchronous request")
+            }
+        }
     }
 }
 
@@ -892,6 +1096,7 @@ pub fn run_core(
     }
     let mut deferred_requests = FairRequestQueue::default();
     let mut server_grab_waiters: VecDeque<DeferredRequest> = VecDeque::new();
+    let mut pending_backend_requests = PendingBackendRequests::default();
     loop {
         // The grab can be dropped by paths that have no release check of
         // their own — notably the two disconnect sites outside the message
@@ -913,7 +1118,7 @@ pub fn run_core(
         // to do right now. Without this, an idle moment where the
         // channel is briefly empty would let `poll.poll` block until
         // a fresh fd event, leaving the backlog stranded.
-        let poll_timeout = if !deferred_requests.is_empty() {
+        let poll_timeout = if deferred_requests.has_runnable(&pending_backend_requests) {
             Some(Duration::ZERO)
         } else {
             // Wake for the earliest deadline owned by either core
@@ -959,7 +1164,10 @@ pub fn run_core(
             match poll.poll(&mut events, poll_timeout) {
                 Ok(()) => break,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
+                Err(e) => {
+                    cancel_all_pending_backend_requests(backend, &mut pending_backend_requests);
+                    return Err(e);
+                }
             }
         }
         let iter_start = if telemetry.enabled {
@@ -982,6 +1190,7 @@ pub fn run_core(
             state,
             backend,
             &mut telemetry,
+            &mut pending_backend_requests,
             &mut deferred_requests,
             &mut server_grab_waiters,
             &mut requests_this_iter,
@@ -1023,10 +1232,18 @@ pub fn run_core(
                             Ok(HostSocketStatus::WouldBlock) => {}
                             Ok(HostSocketStatus::Eof) => {
                                 log::info!("host X11 connection closed; shutting down");
+                                cancel_all_pending_backend_requests(
+                                    backend,
+                                    &mut pending_backend_requests,
+                                );
                                 return Ok(());
                             }
                             Err(err) => {
                                 log::warn!("drain_host_socket: {err}");
+                                cancel_all_pending_backend_requests(
+                                    backend,
+                                    &mut pending_backend_requests,
+                                );
                                 return Ok(());
                             }
                         }
@@ -1059,6 +1276,10 @@ pub fn run_core(
                         match msg {
                             Message::Shutdown => {
                                 setup_thread::shutdown_all(&setup_registry);
+                                cancel_all_pending_backend_requests(
+                                    backend,
+                                    &mut pending_backend_requests,
+                                );
                                 return Ok(());
                             }
                             Message::Request {
@@ -1115,14 +1336,20 @@ pub fn run_core(
                                     byte_order,
                                 ) {
                                     error!("ClientSetupComplete for client {} failed: {err}", id.0);
-                                    crate::core_loop::process_disconnect::process_disconnect(
-                                        state, backend, id,
+                                    disconnect_with_pending_cleanup(
+                                        state,
+                                        backend,
+                                        &mut pending_backend_requests,
+                                        id,
                                     );
                                 }
                             }
                             Message::ClientDisconnected { id, reason: _ } => {
-                                crate::core_loop::process_disconnect::process_disconnect(
-                                    state, backend, id,
+                                disconnect_with_pending_cleanup(
+                                    state,
+                                    backend,
+                                    &mut pending_backend_requests,
+                                    id,
                                 );
                             }
                             Message::HostInput(ev) => {
@@ -1131,6 +1358,13 @@ pub fn run_core(
                                 }
                                 handle_host_input(state, backend, ev);
                                 backend.mark_dirty();
+                            }
+                            Message::CrtcConfigReady => {
+                                drain_ready_crtc_configs(
+                                    state,
+                                    backend,
+                                    &mut pending_backend_requests,
+                                );
                             }
                             Message::VtRelease => {
                                 // When VT switching isn't armed there is no
@@ -1168,6 +1402,7 @@ pub fn run_core(
                         state,
                         backend,
                         &mut telemetry,
+                        &mut pending_backend_requests,
                         &mut deferred_requests,
                         &mut server_grab_waiters,
                         &mut requests_this_iter,
@@ -1201,8 +1436,11 @@ pub fn run_core(
                     match client_io::drain_outbound(client) {
                         Ok(WriteOutcome::Done | WriteOutcome::WouldBlock) => {}
                         Ok(WriteOutcome::Disconnect) | Err(_) => {
-                            crate::core_loop::process_disconnect::process_disconnect(
-                                state, backend, client_id,
+                            disconnect_with_pending_cleanup(
+                                state,
+                                backend,
+                                &mut pending_backend_requests,
+                                client_id,
                             );
                         }
                     }
@@ -1266,6 +1504,7 @@ pub fn run_core(
         // observe the EOF flag here and stop the core loop.
         if backend.host_socket_eof() {
             log::info!("host X11 EOF observed; shutting down");
+            cancel_all_pending_backend_requests(backend, &mut pending_backend_requests);
             return Ok(());
         }
 
@@ -1277,7 +1516,7 @@ pub fn run_core(
         // disconnect that ran during this iteration doesn't break
         // the next one.
         for disc_id in reconcile_client_writable_interest(poll.registry(), state) {
-            crate::core_loop::process_disconnect::process_disconnect(state, backend, disc_id);
+            disconnect_with_pending_cleanup(state, backend, &mut pending_backend_requests, disc_id);
         }
 
         run_iteration_tail(state, backend);
@@ -3002,6 +3241,143 @@ mod tests {
         }
         assert_eq!(order, [(57, 1), (12, 10), (57, 2), (12, 11), (57, 3)]);
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn pending_backend_request_blocks_only_its_clients_fifo() {
+        use yserver_protocol::x11::ClientByteOrder;
+
+        let blocked = yserver_protocol::x11::ClientId(57);
+        let other = yserver_protocol::x11::ClientId(12);
+        let token = CrtcConfigToken(91);
+        let mut pending = PendingBackendRequests::default();
+        pending
+            .park_crtc(ParkedCrtcConfig {
+                client_id: blocked,
+                sequence: yserver_protocol::x11::SequenceNumber(1),
+                continuation: PendingCrtcConfig {
+                    token,
+                    completion: crate::core_loop::process_request::CrtcConfigCompletion {
+                        output_id: 1,
+                        set_time: 0,
+                        output_bbox_before: None,
+                        byte_order: ClientByteOrder::LittleEndian,
+                    },
+                },
+                request_wire_bytes: 28,
+            })
+            .unwrap();
+
+        let mut queue = FairRequestQueue::default();
+        queue.push_back(deferred_request(blocked.0, 2));
+        queue.push_back(deferred_request(other.0, 10));
+        queue.push_back(deferred_request(blocked.0, 3));
+
+        let runnable = queue.pop_front_unblocked(&pending).unwrap();
+        assert_eq!((runnable.id, runnable.header.opcode), (other, 10));
+        assert!(
+            queue.pop_front_unblocked(&pending).is_none(),
+            "later requests from the pending client must stay parked"
+        );
+        assert!(
+            !queue.has_runnable(&pending),
+            "a blocked-only queue must not force a zero-timeout poll spin"
+        );
+
+        pending.take_crtc(token).unwrap();
+        let first = queue.pop_front_unblocked(&pending).unwrap();
+        let second = queue.pop_front_unblocked(&pending).unwrap();
+        assert_eq!((first.header.opcode, second.header.opcode), (2, 3));
+    }
+
+    #[test]
+    fn ready_crtc_completion_replies_unblocks_and_returns_reader_credit() {
+        use crate::{backend::recording::RecordingBackend, server::ClientState};
+        use std::{
+            collections::{HashMap, HashSet, VecDeque},
+            io::Read,
+            os::unix::net::UnixStream,
+            sync::{Arc, Mutex, atomic::AtomicU16},
+        };
+        use yserver_protocol::x11::{ClientByteOrder, ClientId, SequenceNumber};
+
+        let client_id = ClientId(57);
+        let token = CrtcConfigToken(92);
+        let (mut peer, writer) = UnixStream::pair().unwrap();
+        writer.set_nonblocking(true).unwrap();
+        let (control_tx, control_rx) = crossbeam_channel::unbounded();
+        let mut state = ServerState::new();
+        state.clients.insert(
+            client_id.0,
+            ClientState {
+                writer: Arc::new(Mutex::new(writer)),
+                byte_order: ClientByteOrder::LittleEndian,
+                last_sequence: Arc::new(AtomicU16::new(0)),
+                resource_id_base: 0,
+                resource_id_mask: u32::MAX,
+                event_masks: HashMap::new(),
+                save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::new(),
+                xi1_event_classes: HashSet::new(),
+                xi1_window_event_classes: HashMap::new(),
+                outbound: VecDeque::new(),
+                watching_writable: false,
+                focused_window: crate::resources::ROOT_WINDOW,
+                reader_control: Some(control_tx),
+            },
+        );
+
+        let completion = crate::core_loop::process_request::CrtcConfigCompletion {
+            output_id: state.randr.outputs[0].output_id,
+            set_time: 123,
+            output_bbox_before: enabled_output_bbox(&state),
+            byte_order: ClientByteOrder::LittleEndian,
+        };
+        let continuation = PendingCrtcConfig { token, completion };
+        let mut pending = PendingBackendRequests::default();
+        pending
+            .park_crtc(ParkedCrtcConfig {
+                client_id,
+                sequence: SequenceNumber(9),
+                continuation,
+                request_wire_bytes: 28,
+            })
+            .unwrap();
+        let mut backend = RecordingBackend::new();
+        backend.ready_crtc_configs.push(token);
+        backend.crtc_config_results.insert(token, Ok(false));
+
+        drain_ready_crtc_configs(&mut state, &mut backend, &mut pending);
+
+        let mut reply = [0_u8; 32];
+        peer.read_exact(&mut reply).unwrap();
+        assert_eq!((reply[0], reply[1]), (1, 0), "success reply, status=0");
+        assert!(!pending.client_is_blocked(client_id));
+        assert_eq!(backend.finished_crtc_configs, [token]);
+        assert!(backend.cancelled_crtc_configs.is_empty());
+        assert!(matches!(
+            control_rx.try_recv(),
+            Ok(crate::server::ReaderControl::GrantRequestBytes(28))
+        ));
+
+        // Disconnecting a still-pending client cancels its backend token and
+        // never waits for the worker to finish.
+        let cancel_token = CrtcConfigToken(93);
+        pending
+            .park_crtc(ParkedCrtcConfig {
+                client_id,
+                sequence: SequenceNumber(10),
+                continuation: PendingCrtcConfig {
+                    token: cancel_token,
+                    completion,
+                },
+                request_wire_bytes: 28,
+            })
+            .unwrap();
+        disconnect_with_pending_cleanup(&mut state, &mut backend, &mut pending, client_id);
+        assert_eq!(backend.cancelled_crtc_configs, [cancel_token]);
+        assert!(!state.clients.contains_key(&client_id.0));
     }
 
     /// The grab owner can be dropped by paths that carry no release check of

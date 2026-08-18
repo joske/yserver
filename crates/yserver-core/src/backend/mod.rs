@@ -19,10 +19,10 @@ pub use params::{
     JoinStyle, LineStyle, SubwindowMode,
 };
 pub use trait_def::{
-    ActiveCursorImage, Backend, BackendFdKind, CompletedPresentEvent, Dri3Caps, Dri3PixmapExport,
-    HostSocketStatus, KeymapLoad, ModeSpec, PresentCaps, PresentClockSample, PresentClockSource,
-    PresentScanoutCandidate, PresentSourceWait, PresentWake, SyncobjHandle, XkbNewKeyboardInfo,
-    XshmfenceHandle,
+    ActiveCursorImage, Backend, BackendFdKind, CompletedPresentEvent, CrtcConfigApply,
+    CrtcConfigToken, Dri3Caps, Dri3PixmapExport, HostSocketStatus, KeymapLoad, ModeSpec,
+    PresentCaps, PresentClockSample, PresentClockSource, PresentScanoutCandidate,
+    PresentSourceWait, PresentWake, SyncobjHandle, XkbNewKeyboardInfo, XshmfenceHandle,
 };
 
 use yserver_protocol::x11::ClientId;

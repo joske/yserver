@@ -31,7 +31,9 @@ use yserver_protocol::x11::{self, AtomId, ClientId, RequestHeader, ResourceId, S
 #[cfg(test)]
 use crate::core_loop::pointer_fanout::pointer_event_fanout_to_state;
 use crate::{
-    backend::{Backend, ModeSpec, OriginContext, params::FillState},
+    backend::{
+        Backend, CrtcConfigApply, CrtcConfigToken, ModeSpec, OriginContext, params::FillState,
+    },
     core_loop::{
         client_io::{self, WriteOutcome},
         damage_fanout::{
@@ -99,6 +101,29 @@ pub enum RequestOutcome {
     /// The peer's outbound buffer overflowed (or its socket is
     /// unrecoverable); the core should issue a `Message::ClientDisconnected`.
     Disconnect(ClientId),
+    /// A backend operation is still running. The core must withhold this
+    /// request's flow-control credit and park later requests from the same
+    /// client until the token becomes ready.
+    PendingCrtcConfig(PendingCrtcConfig),
+}
+
+/// Continuation data needed to finish an asynchronous `RRSetCrtcConfig`
+/// without redispatching the original request.
+#[derive(Debug, Clone, Copy)]
+pub struct PendingCrtcConfig {
+    pub token: CrtcConfigToken,
+    pub completion: CrtcConfigCompletion,
+}
+
+/// Protocol continuation shared by synchronous and asynchronous CRTC apply
+/// paths. It contains no backend token, so immediate completion never needs a
+/// sentinel token value.
+#[derive(Debug, Clone, Copy)]
+pub struct CrtcConfigCompletion {
+    pub output_id: u32,
+    pub set_time: u32,
+    pub output_bbox_before: Option<(u16, u16)>,
+    pub byte_order: yserver_protocol::x11::ClientByteOrder,
 }
 
 /// Dispatch one X11 request entirely on the core thread.
@@ -4304,68 +4329,43 @@ fn handle_randr_request(
                 req_timestamp
             };
             let output_bbox_before = super::run::enabled_output_bbox(state);
-            match backend.apply_crtc_config(
+            let completion = CrtcConfigCompletion {
+                output_id,
+                set_time,
+                output_bbox_before,
+                byte_order,
+            };
+            match backend.begin_crtc_config(
                 output_id,
                 &connector,
                 mode_spec,
                 i32::from(x),
                 i32::from(y),
             ) {
-                Ok(true) => {
-                    // Something actually changed. Single rebuild path: a CRTC
-                    // set bumps lastSetTime (to the client timestamp) but NOT
-                    // lastConfigTime.
-                    backend.refresh_randr_state_set_time(state, set_time);
-                    let changed: Vec<(u32, u32, u32)> = state
-                        .randr
-                        .outputs
-                        .iter()
-                        .find(|o| o.output_id == output_id)
-                        .map(|o| (o.output_id, o.crtc_id, o.mode_id))
-                        .into_iter()
-                        .collect();
-                    // Fire Crtc/Output change (+ ScreenChangeNotify via
-                    // RRTellChanged) → emit_randr_change_notifications.
-                    super::run::emit_randr_change_notifications(state, &changed);
-                    super::run::emit_screen_resize_window_notifications_if_outputs_caught_up(
+                Ok(CrtcConfigApply::Applied(changed)) => {
+                    return complete_crtc_config(
                         state,
-                        output_bbox_before,
-                    );
-                    return reply_set_crtc_config(
-                        state,
+                        backend,
                         client_id,
                         sequence,
-                        byte_order,
-                        0,
-                        state.randr.timestamp,
+                        completion,
+                        Ok(changed),
                     );
                 }
-                Ok(false) => {
-                    // No-op: the request matched the current config. Reply
-                    // success WITHOUT a rebuild or any change-notify. Xorg's
-                    // RRTellChanged only fires on a real change; firing on a
-                    // redundant re-assert makes mate-settings-daemon re-apply
-                    // on the notify → feedback loop → constant modeset/flicker.
-                    return reply_set_crtc_config(
-                        state,
-                        client_id,
-                        sequence,
-                        byte_order,
-                        0,
-                        state.randr.timestamp,
-                    );
+                Ok(CrtcConfigApply::Pending(token)) => {
+                    return Ok(RequestOutcome::PendingCrtcConfig(PendingCrtcConfig {
+                        token,
+                        completion,
+                    }));
                 }
                 Err(e) => {
-                    log::warn!("RRSetCrtcConfig apply failed: {e}");
-                    // RRSetConfigFailed=3 (status reply, not a protocol
-                    // error). lastSetTime unchanged → reply existing value.
-                    return reply_set_crtc_config(
+                    return complete_crtc_config(
                         state,
+                        backend,
                         client_id,
                         sequence,
-                        byte_order,
-                        3,
-                        state.randr.timestamp,
+                        completion,
+                        Err(e),
                     );
                 }
             }
@@ -4593,6 +4593,60 @@ fn handle_randr_request(
         }
     }
     Ok(RequestOutcome::Handled)
+}
+
+/// Complete the protocol-visible half of `RRSetCrtcConfig` after either a
+/// synchronous apply or an asynchronous backend result. Keeping this as one
+/// continuation prevents the async path from redispatching validation or
+/// accidentally diverging in notification/timestamp behavior.
+pub(crate) fn complete_crtc_config(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    client_id: ClientId,
+    sequence: SequenceNumber,
+    completion: CrtcConfigCompletion,
+    result: io::Result<bool>,
+) -> io::Result<RequestOutcome> {
+    let status = match result {
+        Ok(true) => {
+            // Something actually changed. Single rebuild path: a CRTC set
+            // bumps lastSetTime (to the client timestamp) but NOT
+            // lastConfigTime.
+            backend.refresh_randr_state_set_time(state, completion.set_time);
+            let changed: Vec<(u32, u32, u32)> = state
+                .randr
+                .outputs
+                .iter()
+                .find(|o| o.output_id == completion.output_id)
+                .map(|o| (o.output_id, o.crtc_id, o.mode_id))
+                .into_iter()
+                .collect();
+            super::run::emit_randr_change_notifications(state, &changed);
+            super::run::emit_screen_resize_window_notifications_if_outputs_caught_up(
+                state,
+                completion.output_bbox_before,
+            );
+            0
+        }
+        Ok(false) => {
+            // A no-op succeeds without a rebuild or change notification.
+            0
+        }
+        Err(e) => {
+            log::warn!("RRSetCrtcConfig apply failed: {e}");
+            // RRSetConfigFailed=3 (a status reply, not a protocol error).
+            3
+        }
+    };
+    let timestamp = state.randr.timestamp;
+    reply_set_crtc_config(
+        state,
+        client_id,
+        sequence,
+        completion.byte_order,
+        status,
+        timestamp,
+    )
 }
 
 /// Build and send the 32-byte `SetCrtcConfig` reply.
@@ -53795,6 +53849,30 @@ mod tests {
                 },
             ],
             "the second same-name output XID must be carried into backend routing",
+        );
+
+        // An asynchronous backend returns a continuation token without
+        // sending a premature reply. The core loop owns parking and later
+        // invokes `complete_crtc_config` with the finished result.
+        let token = CrtcConfigToken(0x1234);
+        backend.pending_crtc_config = Some(token);
+        let outcome = handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(CLIENT_ID),
+            SequenceNumber(5),
+            header,
+            &build_body(3, 1, &[4]),
+        )
+        .expect("asynchronous enable begins");
+        let RequestOutcome::PendingCrtcConfig(pending) = outcome else {
+            panic!("asynchronous backend must return a pending continuation");
+        };
+        assert_eq!(pending.token, token);
+        assert_eq!(pending.completion.output_id, 4);
+        assert!(
+            read_all_available(&mut peer).is_empty(),
+            "pending request must not receive a reply before completion"
         );
     }
 

@@ -164,6 +164,11 @@ pub enum Message {
     /// Host input event (KMS libinput producer, or host-X11 dispatch
     /// after F2).
     HostInput(HostInputEvent),
+    /// A backend worker has completed one or more asynchronous CRTC
+    /// configuration operations. The wake carries no backend-owned result;
+    /// the core drains opaque tokens through `Backend` and finishes them on
+    /// its own thread.
+    CrtcConfigReady,
     /// signalfd readable.
     Shutdown,
     /// SIGUSR1 → release the VT on direct-mode backends. Ignored when the

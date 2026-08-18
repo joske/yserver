@@ -23,9 +23,9 @@ use yserver_protocol::x11::{ClipRectangles, FontMetrics, ResourceId, glx, xfixes
 
 use crate::{
     backend::{
-        AnyHandle, Backend, ClipState, CompletedPresentEvent, CursorHandle, DrawState, FillState,
-        FontHandle, GlyphSetHandle, ModeSpec, OriginContext, PictureHandle, PixmapHandle,
-        PresentScanoutCandidate, PresentSourceWait, WindowHandle,
+        AnyHandle, Backend, ClipState, CompletedPresentEvent, CrtcConfigApply, CrtcConfigToken,
+        CursorHandle, DrawState, FillState, FontHandle, GlyphSetHandle, ModeSpec, OriginContext,
+        PictureHandle, PixmapHandle, PresentScanoutCandidate, PresentSourceWait, WindowHandle,
     },
     host_x11::{HostSubwindowConfig, HostSubwindowVisual, HostXidMap, PointerPosition},
 };
@@ -250,6 +250,14 @@ pub struct RecordingBackend {
     /// precedence and lets request-layer tests pin protocol error mapping.
     pub provider_output_source_changed: bool,
     pub provider_output_source_error: Option<io::ErrorKind>,
+    /// Test controls and observations for asynchronous CRTC configuration.
+    /// `None` preserves the synchronous `apply_crtc_config` path.
+    pub pending_crtc_config: Option<CrtcConfigToken>,
+    pub ready_crtc_configs: Vec<CrtcConfigToken>,
+    pub crtc_config_results:
+        std::collections::HashMap<CrtcConfigToken, Result<bool, io::ErrorKind>>,
+    pub finished_crtc_configs: Vec<CrtcConfigToken>,
+    pub cancelled_crtc_configs: Vec<CrtcConfigToken>,
     /// Startup input-probe model. Each inner `Vec` is one "dispatch
     /// round" the fake libinput would yield; `probe_input_devices`
     /// consumes the front round per iteration and seeds the registry,
@@ -449,6 +457,11 @@ impl RecordingBackend {
             dpms_set_returns_err: false,
             provider_output_source_changed: true,
             provider_output_source_error: None,
+            pending_crtc_config: None,
+            ready_crtc_configs: Vec::new(),
+            crtc_config_results: std::collections::HashMap::new(),
+            finished_crtc_configs: Vec::new(),
+            cancelled_crtc_configs: Vec::new(),
             probe_rounds: std::collections::VecDeque::new(),
             probe_rounds_run: std::cell::Cell::new(0),
             warped_to: None,
@@ -1011,6 +1024,46 @@ impl Backend for RecordingBackend {
             y,
         });
         Ok(false)
+    }
+
+    fn begin_crtc_config(
+        &mut self,
+        output_id: u32,
+        connector: &str,
+        mode: Option<ModeSpec>,
+        x: i32,
+        y: i32,
+    ) -> io::Result<CrtcConfigApply> {
+        let Some(token) = self.pending_crtc_config.take() else {
+            return self
+                .apply_crtc_config(output_id, connector, mode, x, y)
+                .map(CrtcConfigApply::Applied);
+        };
+        self.record(RecordedCall::ApplyCrtcConfig {
+            output_id,
+            connector: connector.to_string(),
+            mode,
+            x,
+            y,
+        });
+        Ok(CrtcConfigApply::Pending(token))
+    }
+
+    fn drain_ready_crtc_configs(&mut self) -> Vec<CrtcConfigToken> {
+        std::mem::take(&mut self.ready_crtc_configs)
+    }
+
+    fn finish_crtc_config(&mut self, token: CrtcConfigToken) -> io::Result<bool> {
+        self.finished_crtc_configs.push(token);
+        self.crtc_config_results
+            .remove(&token)
+            .unwrap_or(Ok(false))
+            .map_err(io::Error::from)
+    }
+
+    fn cancel_crtc_config(&mut self, token: CrtcConfigToken) {
+        self.cancelled_crtc_configs.push(token);
+        self.crtc_config_results.remove(&token);
     }
 
     fn set_crtc_gamma(
