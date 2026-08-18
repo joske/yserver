@@ -62,8 +62,8 @@ use crate::{
             device::{VkContext, VulkanDeviceSelector},
             ops::OpsCommandPool,
             scanout::{
-                BoPhase, BoState, CopiedScanoutPool, OutputScanout, ScanoutAllocationPlan,
-                ScanoutBoPool,
+                BoPhase, BoState, CopiedScanoutPlan, CopiedScanoutPool, OutputScanout,
+                ScanoutAllocationPlan, ScanoutBoPool,
             },
         },
     },
@@ -921,20 +921,36 @@ const SCANOUT_POOL_DEPTH: usize = 3;
 /// validation are not charged to this GPU-liveness bound.
 const PRIME_RENDER_PROBE_TIMEOUT_NS: u64 = 200_000_000;
 
-struct PreparedScanoutPool {
+pub(crate) struct PreparedScanoutPool {
     pool: ScanoutBoPool,
     /// The exact framebuffer synchronously installed by the candidate loop.
     /// Its BO is already marked `OnScreen` before ownership leaves the helper.
     committed_framebuffer: Option<::drm::control::framebuffer::Handle>,
 }
 
-struct PreparedCopiedScanoutPool {
+pub(crate) struct PreparedCopiedScanoutPool {
     pool: CopiedScanoutPool,
     committed_framebuffer: Option<::drm::control::framebuffer::Handle>,
 }
 
+/// Resource-free result of disposable cross-device qualification. The parent
+/// may replay only this exact representation on its live Vulkan contexts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QualifiedScanoutPlan {
+    Shared(ScanoutAllocationPlan),
+    Copied {
+        sink_id: RenderDeviceId,
+        plan: CopiedScanoutPlan,
+    },
+}
+
+pub(crate) enum ExactPlanReplay<T> {
+    Prepared(T),
+    Rejected(io::Error),
+}
+
 #[derive(Debug, thiserror::Error)]
-enum CopyFreeScanoutError {
+pub(crate) enum CopyFreeScanoutError {
     #[error("{0}")]
     Candidates(io::Error),
     #[error("terminal disposable copy-free probe failure: {0}")]
@@ -954,7 +970,7 @@ impl CopyFreeScanoutError {
 }
 
 #[derive(Debug, thiserror::Error)]
-enum CopiedScanoutError {
+pub(crate) enum CopiedScanoutError {
     #[error("{0}")]
     Candidates(io::Error),
     #[error("terminal disposable copied probe failure: {0}")]
@@ -1074,14 +1090,155 @@ fn copy_free_candidate_error(
     format!("{} {stage}: {error}", plan.describe())
 }
 
-/// Validate and replay one non-local renderer-to-KMS route without ever
-/// submitting an unproven shared image to the backend's live Vulkan device.
-///
-/// Each candidate gets a fresh logical device for allocation, a real render,
-/// and complete connector/CRTC/plane TEST_ONLY checks. Only the exact winning
-/// plan is then allocated on the live renderer and tested again. Runtime
-/// enables also perform the first state-changing modeset here so a rejected
-/// candidate can fall through before the caller mutates its active topology.
+/// Qualify one exact copy-free representation using only a disposable Vulkan
+/// context. The returned value owns no Vulkan or DRM resource and can be handed
+/// to a later live replay boundary.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qualify_copy_free_scanout_plan(
+    probe_vk: Arc<VkContext>,
+    scanout_device: Rc<drm::Device>,
+    output: &crate::platform::drm::Output,
+    route: ScanoutRoute,
+    width: u32,
+    height: u32,
+    scanout_modifiers: &[u64],
+    plan: ScanoutAllocationPlan,
+) -> Result<QualifiedScanoutPlan, CopyFreeScanoutError> {
+    debug_assert!(route_requires_copy_free_probe(route));
+    let probe_pool = match ScanoutBoPool::allocate_exact(
+        Arc::clone(&probe_vk),
+        Rc::clone(&scanout_device),
+        route,
+        width,
+        height,
+        SCANOUT_POOL_DEPTH,
+        scanout_modifiers,
+        plan,
+    ) {
+        Ok(pool) => pool,
+        Err(error) => {
+            probe_vk.mark_disposable_probe_quiescent();
+            return Err(CopyFreeScanoutError::Candidates(io::Error::new(
+                error.kind(),
+                copy_free_candidate_error(plan, "probe allocation", &error),
+            )));
+        }
+    };
+    if let Err(error) = test_scanout_pool(&scanout_device, output, &probe_pool) {
+        probe_vk.mark_disposable_probe_quiescent();
+        return Err(CopyFreeScanoutError::Candidates(io::Error::new(
+            error.kind(),
+            copy_free_candidate_error(plan, "probe TEST_ONLY", &error),
+        )));
+    }
+    if let Err(error) = probe_pool.probe_renderer_access(PRIME_RENDER_PROBE_TIMEOUT_NS) {
+        let failure = io::Error::new(
+            error.kind(),
+            copy_free_candidate_error(plan, "probe rendering", error.as_io_error()),
+        );
+        if error.abort_candidate_search() {
+            return Err(CopyFreeScanoutError::TerminalDisposableProbe(failure));
+        }
+        return Err(CopyFreeScanoutError::Candidates(failure));
+    }
+
+    Ok(QualifiedScanoutPlan::Shared(plan))
+}
+
+/// Replay one already-qualified copy-free representation on the live context.
+/// Live allocation receives its own TEST_ONLY pass before an optional first
+/// modeset. A recoverable live-only rejection is returned separately so the
+/// synchronous compatibility wrapper can preserve its established fallback.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn replay_copy_free_scanout_plan(
+    live_vk: Arc<VkContext>,
+    scanout_device: Rc<drm::Device>,
+    output: &crate::platform::drm::Output,
+    route: ScanoutRoute,
+    width: u32,
+    height: u32,
+    scanout_modifiers: &[u64],
+    qualified: QualifiedScanoutPlan,
+    commit_first_framebuffer: bool,
+) -> Result<ExactPlanReplay<PreparedScanoutPool>, CopyFreeScanoutError> {
+    let QualifiedScanoutPlan::Shared(plan) = qualified else {
+        return Err(CopyFreeScanoutError::Candidates(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "copy-free replay received a copied qualification result",
+        )));
+    };
+
+    let live_pool = match ScanoutBoPool::allocate_exact(
+        Arc::clone(&live_vk),
+        Rc::clone(&scanout_device),
+        route,
+        width,
+        height,
+        SCANOUT_POOL_DEPTH,
+        scanout_modifiers,
+        plan,
+    ) {
+        Ok(pool) => pool,
+        Err(error) => {
+            if crate::kms::vk::scanout::scanout_error_is_device_lost(&error) {
+                return Err(CopyFreeScanoutError::LiveRendererLost(io::Error::new(
+                    error.kind(),
+                    format!("{} live allocation: {error}", plan.describe()),
+                )));
+            }
+            return Ok(ExactPlanReplay::Rejected(io::Error::new(
+                error.kind(),
+                copy_free_candidate_error(plan, "live allocation", &error),
+            )));
+        }
+    };
+    if let Err(error) = test_scanout_pool(&scanout_device, output, &live_pool) {
+        return Ok(ExactPlanReplay::Rejected(io::Error::new(
+            error.kind(),
+            copy_free_candidate_error(plan, "live TEST_ONLY", &error),
+        )));
+    }
+
+    let mut live_pool = live_pool;
+    let committed_framebuffer = if commit_first_framebuffer {
+        let (front_index, framebuffer) = live_pool
+            .bos
+            .iter()
+            .enumerate()
+            .find_map(|(index, bo)| bo.fb_handle.map(|framebuffer| (index, framebuffer)))
+            .ok_or_else(|| {
+                CopyFreeScanoutError::Candidates(io::Error::other(format!(
+                    "{} live pool has no framebuffer",
+                    plan.describe(),
+                )))
+            })?;
+        if let Err(error) =
+            crate::drm::modeset::commit_modeset(&scanout_device, output, framebuffer)
+        {
+            return Ok(ExactPlanReplay::Rejected(io::Error::new(
+                error.kind(),
+                copy_free_candidate_error(plan, "live modeset", &error),
+            )));
+        }
+        // The successful synchronous commit has already made this BO the
+        // hardware front. Mark it before returning so no fallible caller work
+        // or structure-state gap can drop/acquire the scanned BO.
+        live_pool.bos[front_index]
+            .state
+            .mark_on_screen_after_modeset();
+        Some(framebuffer)
+    } else {
+        None
+    };
+
+    Ok(ExactPlanReplay::Prepared(PreparedScanoutPool {
+        pool: live_pool,
+        committed_framebuffer,
+    }))
+}
+
+/// Preserve the synchronous candidate order while keeping disposable
+/// qualification and live exact-plan replay as separate operations.
 fn allocate_copy_free_scanout_pool(
     live_vk: Arc<VkContext>,
     scanout_device: Rc<drm::Device>,
@@ -1108,116 +1265,58 @@ fn allocate_copy_free_scanout_pool(
                 continue;
             }
         };
-        let probe_pool = match ScanoutBoPool::allocate_exact(
-            Arc::clone(&probe_vk),
+        let qualified = match qualify_copy_free_scanout_plan(
+            probe_vk,
             Rc::clone(&scanout_device),
+            output,
             route,
             width,
             height,
-            SCANOUT_POOL_DEPTH,
             scanout_modifiers,
             plan,
         ) {
-            Ok(pool) => pool,
-            Err(error) => {
-                probe_vk.mark_disposable_probe_quiescent();
-                failures.push(copy_free_candidate_error(plan, "probe allocation", &error));
+            Ok(qualified) => qualified,
+            Err(CopyFreeScanoutError::Candidates(error)) => {
+                failures.push(error.to_string());
                 continue;
             }
-        };
-        if let Err(error) = test_scanout_pool(&scanout_device, output, &probe_pool) {
-            probe_vk.mark_disposable_probe_quiescent();
-            failures.push(copy_free_candidate_error(plan, "probe TEST_ONLY", &error));
-            continue;
-        }
-        if let Err(error) = probe_pool.probe_renderer_access(PRIME_RENDER_PROBE_TIMEOUT_NS) {
-            let abort_candidate_search = error.abort_candidate_search();
-            let error_kind = error.kind();
-            failures.push(copy_free_candidate_error(
-                plan,
-                "probe rendering",
-                error.as_io_error(),
-            ));
-            if abort_candidate_search {
+            Err(CopyFreeScanoutError::TerminalDisposableProbe(error)) => {
+                let error_kind = error.kind();
+                failures.push(error.to_string());
                 return Err(CopyFreeScanoutError::TerminalDisposableProbe(
                     io::Error::new(
                         error_kind,
                         format!(
                             "copy-free scanout probing stopped after a terminal disposable-probe \
-                         failure: {}",
+                             failure: {}",
                             failures.join("; ")
                         ),
                     ),
                 ));
             }
-            continue;
-        }
+            Err(error @ CopyFreeScanoutError::LiveRendererLost(_)) => return Err(error),
+        };
 
-        let live_pool = match ScanoutBoPool::allocate_exact(
+        match replay_copy_free_scanout_plan(
             Arc::clone(&live_vk),
             Rc::clone(&scanout_device),
+            output,
             route,
             width,
             height,
-            SCANOUT_POOL_DEPTH,
             scanout_modifiers,
-            plan,
-        ) {
-            Ok(pool) => pool,
-            Err(error) => {
-                if crate::kms::vk::scanout::scanout_error_is_device_lost(&error) {
-                    return Err(CopyFreeScanoutError::LiveRendererLost(io::Error::new(
-                        error.kind(),
-                        format!("{} live allocation: {error}", plan.describe()),
-                    )));
-                }
-                failures.push(copy_free_candidate_error(plan, "live allocation", &error));
-                continue;
+            qualified,
+            commit_first_framebuffer,
+        )? {
+            ExactPlanReplay::Prepared(prepared) => {
+                log::info!(
+                    "copy-free scanout probe selected {} for {route:?}",
+                    plan.describe()
+                );
+                return Ok(prepared);
             }
-        };
-        if let Err(error) = test_scanout_pool(&scanout_device, output, &live_pool) {
-            failures.push(copy_free_candidate_error(plan, "live TEST_ONLY", &error));
-            continue;
+            ExactPlanReplay::Rejected(error) => failures.push(error.to_string()),
         }
-
-        let mut live_pool = live_pool;
-        let committed_framebuffer = if commit_first_framebuffer {
-            let (front_index, framebuffer) = live_pool
-                .bos
-                .iter()
-                .enumerate()
-                .find_map(|(index, bo)| bo.fb_handle.map(|framebuffer| (index, framebuffer)))
-                .ok_or_else(|| {
-                    CopyFreeScanoutError::Candidates(io::Error::other(format!(
-                        "{} live pool has no framebuffer",
-                        plan.describe(),
-                    )))
-                })?;
-            if let Err(error) =
-                crate::drm::modeset::commit_modeset(&scanout_device, output, framebuffer)
-            {
-                failures.push(copy_free_candidate_error(plan, "live modeset", &error));
-                continue;
-            }
-            // The successful synchronous commit has already made this BO the
-            // hardware front. Mark it before returning so no fallible caller
-            // work or structure-state gap can drop/acquire the scanned BO.
-            live_pool.bos[front_index]
-                .state
-                .mark_on_screen_after_modeset();
-            Some(framebuffer)
-        } else {
-            None
-        };
-
-        log::info!(
-            "copy-free scanout probe selected {} for {route:?}",
-            plan.describe()
-        );
-        return Ok(PreparedScanoutPool {
-            pool: live_pool,
-            committed_framebuffer,
-        });
     }
 
     Err(CopyFreeScanoutError::Candidates(io::Error::other(format!(
@@ -1226,11 +1325,184 @@ fn allocate_copy_free_scanout_pool(
     ))))
 }
 
-/// Probe and replay the copied compatibility path after every shared
-/// allocation plan has failed.  Every source/destination-plan pair receives
-/// fresh exact A and B logical devices; only a complete three-slot real
-/// render, cross-device copy, and per-framebuffer TEST_ONLY winner is replayed
-/// on the two live devices.
+/// Qualify one exact copied representation using only disposable A/B contexts.
+/// The KMS destination passes TEST_ONLY before any submitted content probe.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qualify_copied_scanout_plan(
+    probe_render_vk: Arc<VkContext>,
+    probe_sink_vk: Arc<VkContext>,
+    scanout_device: Rc<drm::Device>,
+    output: &crate::platform::drm::Output,
+    route: ScanoutRoute,
+    destination_route: ScanoutRoute,
+    width: u32,
+    height: u32,
+    scanout_modifiers: &[u64],
+    plan: CopiedScanoutPlan,
+) -> Result<QualifiedScanoutPlan, CopiedScanoutError> {
+    debug_assert!(route_requires_copy_free_probe(route));
+    debug_assert_eq!(destination_route.relationship, RenderKmsRelationship::Same);
+    if let Err(error) =
+        require_copied_sink_explicit_dmabuf_layout_import(probe_sink_vk.image_drm_format_modifier)
+    {
+        probe_render_vk.mark_disposable_probe_quiescent();
+        probe_sink_vk.mark_disposable_probe_quiescent();
+        return Err(CopiedScanoutError::Candidates(error));
+    }
+
+    let probe_pool = match CopiedScanoutPool::allocate_exact(
+        Arc::clone(&probe_render_vk),
+        Arc::clone(&probe_sink_vk),
+        Rc::clone(&scanout_device),
+        route,
+        destination_route,
+        width,
+        height,
+        SCANOUT_POOL_DEPTH,
+        scanout_modifiers,
+        plan,
+    ) {
+        Ok(pool) => pool,
+        Err(error) => {
+            probe_render_vk.mark_disposable_probe_quiescent();
+            probe_sink_vk.mark_disposable_probe_quiescent();
+            return Err(CopiedScanoutError::Candidates(io::Error::new(
+                error.kind(),
+                format!("{} probe allocation: {error}", plan.describe()),
+            )));
+        }
+    };
+    if let Err(error) = test_scanout_pool(&scanout_device, output, &probe_pool.destinations) {
+        probe_render_vk.mark_disposable_probe_quiescent();
+        probe_sink_vk.mark_disposable_probe_quiescent();
+        return Err(CopiedScanoutError::Candidates(io::Error::new(
+            error.kind(),
+            format!("{} probe TEST_ONLY: {error}", plan.describe()),
+        )));
+    }
+    if let Err(error) = probe_pool.probe_copy_all(PRIME_RENDER_PROBE_TIMEOUT_NS) {
+        let failure = io::Error::new(
+            error.kind(),
+            format!("{} probe render/copy/readback: {error}", plan.describe()),
+        );
+        if error.abort_candidate_search() {
+            return Err(CopiedScanoutError::TerminalDisposableProbe(failure));
+        }
+        return Err(CopiedScanoutError::Candidates(failure));
+    }
+
+    Ok(QualifiedScanoutPlan::Copied {
+        sink_id: destination_route.render_device_id,
+        plan,
+    })
+}
+
+/// Replay one already-qualified copied representation on the live A/B
+/// contexts, repeating TEST_ONLY before an optional first modeset.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn replay_copied_scanout_plan(
+    live_render_vk: Arc<VkContext>,
+    live_sink_vk: Arc<VkContext>,
+    scanout_device: Rc<drm::Device>,
+    output: &crate::platform::drm::Output,
+    route: ScanoutRoute,
+    destination_route: ScanoutRoute,
+    width: u32,
+    height: u32,
+    scanout_modifiers: &[u64],
+    qualified: QualifiedScanoutPlan,
+    commit_first_framebuffer: bool,
+) -> Result<ExactPlanReplay<PreparedCopiedScanoutPool>, CopiedScanoutError> {
+    let QualifiedScanoutPlan::Copied { sink_id, plan } = qualified else {
+        return Err(CopiedScanoutError::Candidates(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "copied replay received a shared qualification result",
+        )));
+    };
+    if sink_id != destination_route.render_device_id {
+        return Err(CopiedScanoutError::Candidates(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "copied replay sink {sink_id:?} does not match destination route {:?}",
+                destination_route.render_device_id
+            ),
+        )));
+    }
+
+    let live_pool = match CopiedScanoutPool::allocate_exact(
+        Arc::clone(&live_render_vk),
+        Arc::clone(&live_sink_vk),
+        Rc::clone(&scanout_device),
+        route,
+        destination_route,
+        width,
+        height,
+        SCANOUT_POOL_DEPTH,
+        scanout_modifiers,
+        plan,
+    ) {
+        Ok(pool) => pool,
+        Err(error) => {
+            if crate::kms::vk::scanout::scanout_error_is_device_lost(&error) {
+                return Err(CopiedScanoutError::LiveDeviceLost {
+                    context: format!("{} live allocation", plan.describe()),
+                    source: error,
+                });
+            }
+            return Ok(ExactPlanReplay::Rejected(io::Error::new(
+                error.kind(),
+                format!("{} live allocation: {error}", plan.describe()),
+            )));
+        }
+    };
+    if let Err(error) = test_scanout_pool(&scanout_device, output, &live_pool.destinations) {
+        return Ok(ExactPlanReplay::Rejected(io::Error::new(
+            error.kind(),
+            format!("{} live TEST_ONLY: {error}", plan.describe()),
+        )));
+    }
+
+    let mut live_pool = live_pool;
+    let committed_framebuffer = if commit_first_framebuffer {
+        let (front_index, framebuffer) = live_pool
+            .destinations
+            .bos
+            .iter()
+            .enumerate()
+            .find_map(|(index, bo)| bo.fb_handle.map(|framebuffer| (index, framebuffer)))
+            .ok_or_else(|| {
+                CopiedScanoutError::Candidates(io::Error::other(format!(
+                    "{} live destination pool has no framebuffer",
+                    plan.describe()
+                )))
+            })?;
+        if let Err(error) =
+            crate::drm::modeset::commit_modeset(&scanout_device, output, framebuffer)
+        {
+            return Ok(ExactPlanReplay::Rejected(io::Error::new(
+                error.kind(),
+                format!("{} live modeset: {error}", plan.describe()),
+            )));
+        }
+        live_pool.destinations.bos[front_index]
+            .state
+            .mark_on_screen_after_modeset();
+        live_pool
+            .note_kms_modeset_installed(front_index)
+            .map_err(CopiedScanoutError::Candidates)?;
+        Some(framebuffer)
+    } else {
+        None
+    };
+
+    Ok(ExactPlanReplay::Prepared(PreparedCopiedScanoutPool {
+        pool: live_pool,
+        committed_framebuffer,
+    }))
+}
+
+/// Preserve the synchronous copied candidate order while keeping disposable
+/// qualification and live exact-plan replay as separate operations.
 #[allow(clippy::too_many_arguments)]
 fn allocate_copied_scanout_pool(
     live_render_vk: Arc<VkContext>,
@@ -1281,40 +1553,26 @@ fn allocate_copied_scanout_pool(
                     continue;
                 }
             };
-        let probe_pool = match CopiedScanoutPool::allocate_exact(
-            Arc::clone(&probe_render_vk),
-            Arc::clone(&probe_sink_vk),
+        let qualified = match qualify_copied_scanout_plan(
+            probe_render_vk,
+            probe_sink_vk,
             Rc::clone(&scanout_device),
+            output,
             route,
             destination_route,
             width,
             height,
-            SCANOUT_POOL_DEPTH,
             scanout_modifiers,
             plan,
         ) {
-            Ok(pool) => pool,
-            Err(error) => {
-                probe_render_vk.mark_disposable_probe_quiescent();
-                probe_sink_vk.mark_disposable_probe_quiescent();
-                failures.push(format!("{} probe allocation: {error}", plan.describe()));
+            Ok(qualified) => qualified,
+            Err(CopiedScanoutError::Candidates(error)) => {
+                failures.push(error.to_string());
                 continue;
             }
-        };
-        if let Err(error) = test_scanout_pool(&scanout_device, output, &probe_pool.destinations) {
-            probe_render_vk.mark_disposable_probe_quiescent();
-            probe_sink_vk.mark_disposable_probe_quiescent();
-            failures.push(format!("{} probe TEST_ONLY: {error}", plan.describe()));
-            continue;
-        }
-        if let Err(error) = probe_pool.probe_copy_all(PRIME_RENDER_PROBE_TIMEOUT_NS) {
-            let abort_candidate_search = error.abort_candidate_search();
-            let error_kind = error.kind();
-            failures.push(format!(
-                "{} probe render/copy/readback: {error}",
-                plan.describe()
-            ));
-            if abort_candidate_search {
+            Err(CopiedScanoutError::TerminalDisposableProbe(error)) => {
+                let error_kind = error.kind();
+                failures.push(error.to_string());
                 return Err(CopiedScanoutError::TerminalDisposableProbe(io::Error::new(
                     error_kind,
                     format!(
@@ -1324,77 +1582,34 @@ fn allocate_copied_scanout_pool(
                     ),
                 )));
             }
-            continue;
-        }
+            Err(error @ CopiedScanoutError::LiveDeviceLost { .. }) => return Err(error),
+        };
 
-        let live_pool = match CopiedScanoutPool::allocate_exact(
+        match replay_copied_scanout_plan(
             Arc::clone(&live_render_vk),
             Arc::clone(&live_sink_vk),
             Rc::clone(&scanout_device),
+            output,
             route,
             destination_route,
             width,
             height,
-            SCANOUT_POOL_DEPTH,
             scanout_modifiers,
-            plan,
-        ) {
-            Ok(pool) => pool,
-            Err(error) => {
-                if crate::kms::vk::scanout::scanout_error_is_device_lost(&error) {
-                    return Err(CopiedScanoutError::LiveDeviceLost {
-                        context: format!("{} live allocation", plan.describe()),
-                        source: error,
-                    });
-                }
-                failures.push(format!("{} live allocation: {error}", plan.describe()));
+            qualified,
+            commit_first_framebuffer,
+        )? {
+            ExactPlanReplay::Prepared(prepared) => {
+                log::info!(
+                    "copied scanout probe selected {} for {route:?}",
+                    plan.describe()
+                );
+                return Ok(prepared);
+            }
+            ExactPlanReplay::Rejected(error) => {
+                failures.push(error.to_string());
                 continue;
             }
-        };
-        if let Err(error) = test_scanout_pool(&scanout_device, output, &live_pool.destinations) {
-            failures.push(format!("{} live TEST_ONLY: {error}", plan.describe()));
-            continue;
         }
-
-        let mut live_pool = live_pool;
-        let committed_framebuffer = if commit_first_framebuffer {
-            let (front_index, framebuffer) = live_pool
-                .destinations
-                .bos
-                .iter()
-                .enumerate()
-                .find_map(|(index, bo)| bo.fb_handle.map(|framebuffer| (index, framebuffer)))
-                .ok_or_else(|| {
-                    CopiedScanoutError::Candidates(io::Error::other(format!(
-                        "{} live destination pool has no framebuffer",
-                        plan.describe()
-                    )))
-                })?;
-            if let Err(error) =
-                crate::drm::modeset::commit_modeset(&scanout_device, output, framebuffer)
-            {
-                failures.push(format!("{} live modeset: {error}", plan.describe()));
-                continue;
-            }
-            live_pool.destinations.bos[front_index]
-                .state
-                .mark_on_screen_after_modeset();
-            live_pool
-                .note_kms_modeset_installed(front_index)
-                .map_err(CopiedScanoutError::Candidates)?;
-            Some(framebuffer)
-        } else {
-            None
-        };
-
-        log::info!(
-            "copied scanout probe selected {} for {route:?}",
-            plan.describe()
-        );
-        return Ok(PreparedCopiedScanoutPool {
-            pool: live_pool,
-            committed_framebuffer,
-        });
     }
 
     Err(CopiedScanoutError::Candidates(io::Error::other(format!(
@@ -5935,6 +6150,36 @@ mod tests {
     #[test]
     fn prime_render_probe_fence_timeout_is_two_hundred_milliseconds() {
         assert_eq!(PRIME_RENDER_PROBE_TIMEOUT_NS, 200_000_000);
+    }
+
+    #[test]
+    fn qualified_scanout_plan_is_resource_free_and_preserves_the_exact_choice() {
+        fn assert_copy<T: Copy>() {}
+
+        assert_copy::<QualifiedScanoutPlan>();
+        assert!(!std::mem::needs_drop::<QualifiedScanoutPlan>());
+
+        let shared_plan = ScanoutAllocationPlan::ExplicitLinear;
+        assert_eq!(
+            QualifiedScanoutPlan::Shared(shared_plan),
+            QualifiedScanoutPlan::Shared(ScanoutAllocationPlan::ExplicitLinear)
+        );
+
+        let sink_id = RenderDeviceId::DrmRender(drm_key(7));
+        let copied_plan = CopiedScanoutPlan {
+            source: crate::kms::vk::scanout::CopiedSourcePlan::DrmModifier(0),
+            destination: ScanoutAllocationPlan::LegacyLinear,
+        };
+        assert_eq!(
+            QualifiedScanoutPlan::Copied {
+                sink_id,
+                plan: copied_plan,
+            },
+            QualifiedScanoutPlan::Copied {
+                sink_id,
+                plan: copied_plan,
+            }
+        );
     }
 
     #[test]
