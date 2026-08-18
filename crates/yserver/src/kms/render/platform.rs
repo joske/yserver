@@ -62,8 +62,8 @@ use crate::{
             device::{VkContext, VkInitError, VulkanDeviceSelector},
             ops::OpsCommandPool,
             scanout::{
-                BoPhase, BoState, CopiedScanoutPlan, CopiedScanoutPool, OutputScanout,
-                ScanoutAllocationPlan, ScanoutBoPool,
+                BoPhase, BoState, CopiedScanoutPlan, CopiedScanoutPool, DisposableProbeError,
+                OutputScanout, ScanoutAllocationPlan, ScanoutBoPool,
             },
         },
     },
@@ -1385,6 +1385,36 @@ fn test_scanout_pool(
     Ok(())
 }
 
+fn test_disposable_scanout_pool(
+    scanout_device: &drm::Device,
+    output: &crate::platform::drm::Output,
+    pool: &ScanoutBoPool,
+) -> Result<(), DisposableProbeError> {
+    for (index, bo) in pool.bos.iter().enumerate() {
+        let framebuffer = bo.fb_handle.ok_or_else(|| {
+            DisposableProbeError::from(io::Error::other(format!(
+                "disposable scanout pool BO {index} has no framebuffer"
+            )))
+        })?;
+        if let Err(error) =
+            crate::drm::modeset::test_modeset_strict(scanout_device, output, framebuffer)
+        {
+            let blob_cleanup_failed = error.blob_cleanup_failed();
+            let source = error.into_io_error();
+            let source = io::Error::new(
+                source.kind(),
+                format!("scanout pool BO {index} atomic TEST_ONLY failed: {source}"),
+            );
+            return Err(if blob_cleanup_failed {
+                DisposableProbeError::terminal_cleanup(source)
+            } else {
+                DisposableProbeError::from(source)
+            });
+        }
+    }
+    Ok(())
+}
+
 fn copy_free_candidate_error(
     plan: ScanoutAllocationPlan,
     stage: &str,
@@ -1409,7 +1439,7 @@ pub(crate) fn qualify_copy_free_scanout_plan(
     fence_timeout_ns: u64,
 ) -> Result<QualifiedScanoutPlan, CopyFreeScanoutError> {
     debug_assert!(route_requires_copy_free_probe(route));
-    let probe_pool = match ScanoutBoPool::allocate_exact(
+    let probe_pool = match ScanoutBoPool::allocate_exact_for_disposable_probe(
         Arc::clone(&probe_vk),
         Rc::clone(&scanout_device),
         route,
@@ -1422,18 +1452,28 @@ pub(crate) fn qualify_copy_free_scanout_plan(
         Ok(pool) => pool,
         Err(error) => {
             probe_vk.mark_disposable_probe_quiescent();
-            return Err(CopyFreeScanoutError::Candidates(io::Error::new(
+            let failure = io::Error::new(
                 error.kind(),
-                copy_free_candidate_error(plan, "probe allocation", &error),
-            )));
+                copy_free_candidate_error(plan, "probe allocation", error.as_io_error()),
+            );
+            if error.abort_candidate_search() {
+                return Err(CopyFreeScanoutError::TerminalDisposableProbe(failure));
+            }
+            return Err(CopyFreeScanoutError::Candidates(failure));
         }
     };
-    if let Err(error) = test_scanout_pool(&scanout_device, output, &probe_pool) {
-        probe_vk.mark_disposable_probe_quiescent();
-        return Err(CopyFreeScanoutError::Candidates(io::Error::new(
+    if let Err(error) = test_disposable_scanout_pool(&scanout_device, output, &probe_pool) {
+        let error = probe_pool
+            .finish_disposable_probe(Err(error))
+            .expect_err("failed TEST_ONLY cannot become a successful probe");
+        let failure = io::Error::new(
             error.kind(),
-            copy_free_candidate_error(plan, "probe TEST_ONLY", &error),
-        )));
+            copy_free_candidate_error(plan, "probe TEST_ONLY", error.as_io_error()),
+        );
+        if error.abort_candidate_search() {
+            return Err(CopyFreeScanoutError::TerminalDisposableProbe(failure));
+        }
+        return Err(CopyFreeScanoutError::Candidates(failure));
     }
     if let Err(error) = probe_pool.probe_renderer_access(fence_timeout_ns) {
         let failure = io::Error::new(
@@ -1656,7 +1696,7 @@ pub(crate) fn qualify_copied_scanout_plan(
         return Err(CopiedScanoutError::Candidates(error));
     }
 
-    let probe_pool = match CopiedScanoutPool::allocate_exact(
+    let probe_pool = match CopiedScanoutPool::allocate_exact_for_disposable_probe(
         Arc::clone(&probe_render_vk),
         Arc::clone(&probe_sink_vk),
         Rc::clone(&scanout_device),
@@ -1672,19 +1712,38 @@ pub(crate) fn qualify_copied_scanout_plan(
         Err(error) => {
             probe_render_vk.mark_disposable_probe_quiescent();
             probe_sink_vk.mark_disposable_probe_quiescent();
-            return Err(CopiedScanoutError::Candidates(io::Error::new(
+            let failure = io::Error::new(
                 error.kind(),
-                format!("{} probe allocation: {error}", plan.describe()),
-            )));
+                format!(
+                    "{} probe allocation: {}",
+                    plan.describe(),
+                    error.as_io_error()
+                ),
+            );
+            if error.abort_candidate_search() {
+                return Err(CopiedScanoutError::TerminalDisposableProbe(failure));
+            }
+            return Err(CopiedScanoutError::Candidates(failure));
         }
     };
-    if let Err(error) = test_scanout_pool(&scanout_device, output, &probe_pool.destinations) {
-        probe_render_vk.mark_disposable_probe_quiescent();
-        probe_sink_vk.mark_disposable_probe_quiescent();
-        return Err(CopiedScanoutError::Candidates(io::Error::new(
+    if let Err(error) =
+        test_disposable_scanout_pool(&scanout_device, output, &probe_pool.destinations)
+    {
+        let error = probe_pool
+            .finish_disposable_probe(Err(error))
+            .expect_err("failed TEST_ONLY cannot become a successful copied probe");
+        let failure = io::Error::new(
             error.kind(),
-            format!("{} probe TEST_ONLY: {error}", plan.describe()),
-        )));
+            format!(
+                "{} probe TEST_ONLY: {}",
+                plan.describe(),
+                error.as_io_error()
+            ),
+        );
+        if error.abort_candidate_search() {
+            return Err(CopiedScanoutError::TerminalDisposableProbe(failure));
+        }
+        return Err(CopiedScanoutError::Candidates(failure));
     }
     if let Err(error) = probe_pool.probe_copy_all(fence_timeout_ns) {
         let failure = io::Error::new(

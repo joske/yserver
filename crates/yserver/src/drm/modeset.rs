@@ -1124,13 +1124,13 @@ pub fn commit_modeset(
     output: &Output,
     fb_id: framebuffer::Handle,
 ) -> io::Result<()> {
-    modeset_with_flags(
+    finish_best_effort_modeset(modeset_with_flags(
         device,
         output,
         fb_id,
         AtomicCommitFlags::ALLOW_MODESET,
         "atomic modeset commit",
-    )
+    )?)
 }
 
 /// Validate a complete connector/CRTC/primary-plane modeset without changing
@@ -1140,13 +1140,73 @@ pub(crate) fn test_modeset(
     output: &Output,
     fb_id: framebuffer::Handle,
 ) -> io::Result<()> {
-    modeset_with_flags(
+    finish_best_effort_modeset(modeset_with_flags(
+        device,
+        output,
+        fb_id,
+        AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY,
+        "atomic modeset TEST_ONLY",
+    )?)
+}
+
+/// Failure from a helper-only TEST_ONLY transaction. An ordinary rejection is
+/// safe once its mode blob was removed. A blob cleanup failure is terminal:
+/// the helper shares the parent's DRM file description, so process exit cannot
+/// reclaim the leaked blob while the server keeps that fd open.
+#[derive(Debug)]
+pub(crate) struct StrictTestModesetError {
+    source: io::Error,
+    blob_cleanup_failed: bool,
+}
+
+impl StrictTestModesetError {
+    #[must_use]
+    pub(crate) fn blob_cleanup_failed(&self) -> bool {
+        self.blob_cleanup_failed
+    }
+
+    pub(crate) fn into_io_error(self) -> io::Error {
+        self.source
+    }
+}
+
+impl std::fmt::Display for StrictTestModesetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(f)
+    }
+}
+
+impl std::error::Error for StrictTestModesetError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// TEST_ONLY variant for disposable helpers. Unlike the live path, mode-blob
+/// cleanup is part of the authoritative result and overrides atomic success or
+/// rejection when it fails.
+pub(crate) fn test_modeset_strict(
+    device: &Device,
+    output: &Output,
+    fb_id: framebuffer::Handle,
+) -> Result<(), StrictTestModesetError> {
+    let attempt = modeset_with_flags(
         device,
         output,
         fb_id,
         AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY,
         "atomic modeset TEST_ONLY",
     )
+    .map_err(|source| StrictTestModesetError {
+        source,
+        blob_cleanup_failed: false,
+    })?;
+    finish_strict_test_modeset(attempt)
+}
+
+struct ModesetWithBlobResult {
+    atomic: io::Result<()>,
+    blob_cleanup: io::Result<()>,
 }
 
 fn modeset_with_flags(
@@ -1155,7 +1215,7 @@ fn modeset_with_flags(
     fb_id: framebuffer::Handle,
     flags: AtomicCommitFlags,
     operation: &str,
-) -> io::Result<()> {
+) -> io::Result<ModesetWithBlobResult> {
     let connector_props = PropMap::for_object(device, output.connector)?;
     let crtc_props = PropMap::for_object(device, output.crtc)?;
     let plane_props = PropMap::for_object(device, output.plane)?;
@@ -1211,9 +1271,7 @@ fn modeset_with_flags(
     req.add_raw_property(output.plane.into(), plane_crtc_w_prop, u64::from(mode_w));
     req.add_raw_property(output.plane.into(), plane_crtc_h_prop, u64::from(mode_h));
 
-    let result = device.atomic_commit(flags, req);
-    let _ = device.destroy_property_blob(mode_blob_raw);
-    result.map_err(|err| {
+    let atomic = device.atomic_commit(flags, req).map_err(|err| {
         io::Error::new(
             err.kind(),
             format!(
@@ -1221,7 +1279,50 @@ fn modeset_with_flags(
                 output.picked.name, output.picked.width, output.picked.height
             ),
         )
+    });
+    let blob_cleanup = device.destroy_property_blob(mode_blob_raw).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("{operation} could not destroy mode blob {mode_blob_raw}: {err}"),
+        )
+    });
+    Ok(ModesetWithBlobResult {
+        atomic,
+        blob_cleanup,
     })
+}
+
+fn finish_best_effort_modeset(result: ModesetWithBlobResult) -> io::Result<()> {
+    if let Err(error) = result.blob_cleanup {
+        // A committed live modeset cannot be reported as a pre-commit failure:
+        // callers have already crossed the KMS ownership boundary. Preserve
+        // the established result semantics and keep cleanup best-effort.
+        log::warn!("{error}");
+    }
+    result.atomic
+}
+
+fn finish_strict_test_modeset(result: ModesetWithBlobResult) -> Result<(), StrictTestModesetError> {
+    match (result.atomic, result.blob_cleanup) {
+        (atomic, Err(cleanup)) => {
+            let source = match atomic {
+                Ok(()) => cleanup,
+                Err(atomic) => io::Error::new(
+                    cleanup.kind(),
+                    format!("{cleanup}; atomic TEST_ONLY also failed: {atomic}"),
+                ),
+            };
+            Err(StrictTestModesetError {
+                source,
+                blob_cleanup_failed: true,
+            })
+        }
+        (Err(source), Ok(())) => Err(StrictTestModesetError {
+            source,
+            blob_cleanup_failed: false,
+        }),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 /// One primary-plane assignment in an M1 direct-scanout dry run. Source
@@ -1782,6 +1883,51 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn strict_test_only_blob_cleanup_wins_the_atomic_result_matrix() {
+        let accepted_and_clean = finish_strict_test_modeset(ModesetWithBlobResult {
+            atomic: Ok(()),
+            blob_cleanup: Ok(()),
+        });
+        assert!(accepted_and_clean.is_ok());
+
+        let rejected_and_clean = finish_strict_test_modeset(ModesetWithBlobResult {
+            atomic: Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "atomic rejection",
+            )),
+            blob_cleanup: Ok(()),
+        })
+        .expect_err("atomic rejection remains ordinary after clean blob teardown");
+        assert!(!rejected_and_clean.blob_cleanup_failed());
+        assert_eq!(
+            rejected_and_clean.into_io_error().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        for atomic in [
+            Ok(()),
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "atomic rejection",
+            )),
+        ] {
+            let cleanup_failed = finish_strict_test_modeset(ModesetWithBlobResult {
+                atomic,
+                blob_cleanup: Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "blob cleanup failure",
+                )),
+            })
+            .expect_err("blob cleanup failure must override either atomic result");
+            assert!(cleanup_failed.blob_cleanup_failed());
+            assert_eq!(
+                cleanup_failed.into_io_error().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
     }
 
     #[test]

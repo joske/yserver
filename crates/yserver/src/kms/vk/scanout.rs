@@ -1275,6 +1275,13 @@ pub(crate) struct CopiedScanoutPool {
 }
 
 impl CopiedScanoutPool {
+    pub(crate) fn finish_disposable_probe(
+        self,
+        result: Result<(), DisposableProbeError>,
+    ) -> Result<(), DisposableProbeError> {
+        finish_disposable_probe_attempt(self, result)
+    }
+
     /// Enumerate exact copied candidates in transport tiers. All mutually
     /// supported native transport modifiers are exhausted before explicit
     /// LINEAR; within each tier the established destination allocator order
@@ -1315,37 +1322,111 @@ impl CopiedScanoutPool {
         scanout_modifiers: &[u64],
         plan: CopiedScanoutPlan,
     ) -> io::Result<Self> {
-        validate_copied_route_pair(route, destination_route)?;
-        if render_vk.device_selector() == sink_vk.device_selector() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "copied scanout requires distinct renderer and sink Vulkan devices",
-            ));
-        }
-        if !render_vk.queue_family_foreign || !sink_vk.queue_family_foreign {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "copied scanout requires VK_EXT_queue_family_foreign on renderer and sink",
-            ));
-        }
-
-        let destinations = ScanoutBoPool::allocate_exact(
-            Arc::clone(&sink_vk),
+        Self::allocate_exact_with_policy(
+            render_vk,
+            sink_vk,
             drm,
+            route,
             destination_route,
             width,
             height,
             count,
             scanout_modifiers,
-            plan.destination,
+            plan,
+            AllocationCleanupPolicy::BestEffort,
         )
-        .map_err(|error| {
-            scanout_io_context(
-                format!("exact copied {} destination pool", plan.describe()),
-                error,
+        .map_err(DisposableProbeError::into_io_error)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn allocate_exact_for_disposable_probe(
+        render_vk: Arc<VkContext>,
+        sink_vk: Arc<VkContext>,
+        drm: Rc<crate::drm::Device>,
+        route: ScanoutRoute,
+        destination_route: ScanoutRoute,
+        width: u32,
+        height: u32,
+        count: usize,
+        scanout_modifiers: &[u64],
+        plan: CopiedScanoutPlan,
+    ) -> Result<Self, DisposableProbeError> {
+        Self::allocate_exact_with_policy(
+            render_vk,
+            sink_vk,
+            drm,
+            route,
+            destination_route,
+            width,
+            height,
+            count,
+            scanout_modifiers,
+            plan,
+            AllocationCleanupPolicy::StrictDisposable,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn allocate_exact_with_policy(
+        render_vk: Arc<VkContext>,
+        sink_vk: Arc<VkContext>,
+        drm: Rc<crate::drm::Device>,
+        route: ScanoutRoute,
+        destination_route: ScanoutRoute,
+        width: u32,
+        height: u32,
+        count: usize,
+        scanout_modifiers: &[u64],
+        plan: CopiedScanoutPlan,
+        cleanup_policy: AllocationCleanupPolicy,
+    ) -> Result<Self, DisposableProbeError> {
+        validate_copied_route_pair(route, destination_route).map_err(DisposableProbeError::from)?;
+        if render_vk.device_selector() == sink_vk.device_selector() {
+            return Err(DisposableProbeError::from(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "copied scanout requires distinct renderer and sink Vulkan devices",
+            )));
+        }
+        if !render_vk.queue_family_foreign || !sink_vk.queue_family_foreign {
+            return Err(DisposableProbeError::from(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "copied scanout requires VK_EXT_queue_family_foreign on renderer and sink",
+            )));
+        }
+
+        let destinations = match cleanup_policy {
+            AllocationCleanupPolicy::BestEffort => ScanoutBoPool::allocate_exact(
+                Arc::clone(&sink_vk),
+                drm,
+                destination_route,
+                width,
+                height,
+                count,
+                scanout_modifiers,
+                plan.destination,
             )
+            .map_err(DisposableProbeError::from),
+            AllocationCleanupPolicy::StrictDisposable => {
+                ScanoutBoPool::allocate_exact_for_disposable_probe(
+                    Arc::clone(&sink_vk),
+                    drm,
+                    destination_route,
+                    width,
+                    height,
+                    count,
+                    scanout_modifiers,
+                    plan.destination,
+                )
+            }
+        }
+        .map_err(|error| {
+            error.with_context(format!("exact copied {} destination pool", plan.describe()))
         })?;
 
+        let initial_destination_ownership = match plan.destination.ownership() {
+            ScanoutOwnership::Output => CopiedDestinationOwnership::ForeignImportedFirstUse,
+            ScanoutOwnership::Renderer => CopiedDestinationOwnership::LocalFirstUse,
+        };
         let mut sources = Vec::with_capacity(count);
         for index in 0..count {
             let source = CopiedRenderSource::allocate_exact(
@@ -1356,18 +1437,32 @@ impl CopiedScanoutPool {
                 plan.source,
             )
             .map_err(|error| {
-                scanout_io_context(
+                DisposableProbeError::from(scanout_io_context(
                     format!("exact copied {} source BO {index}", plan.describe()),
                     error,
-                )
-            })?;
-            sources.push(source);
+                ))
+            });
+            match source {
+                Ok(source) => sources.push(source),
+                Err(error)
+                    if matches!(cleanup_policy, AllocationCleanupPolicy::StrictDisposable) =>
+                {
+                    let partial_pool = Self {
+                        sources,
+                        destinations,
+                        route,
+                        plan,
+                        sink_vk,
+                        destination_ownership: vec![initial_destination_ownership; count],
+                    };
+                    return Err(partial_pool
+                        .finish_disposable_probe(Err(error))
+                        .expect_err("failed copied allocation cannot become a successful probe"));
+                }
+                Err(error) => return Err(error),
+            }
         }
 
-        let initial_destination_ownership = match plan.destination.ownership() {
-            ScanoutOwnership::Output => CopiedDestinationOwnership::ForeignImportedFirstUse,
-            ScanoutOwnership::Renderer => CopiedDestinationOwnership::LocalFirstUse,
-        };
         Ok(Self {
             sources,
             destinations,
@@ -2528,6 +2623,141 @@ fn probe_dmabuf_scanout_metadata(
     metadata
 }
 
+#[derive(Clone, Copy)]
+enum AllocationCleanupPolicy {
+    BestEffort,
+    StrictDisposable,
+}
+
+fn release_drm_handles_strict<Fb, Gem>(
+    framebuffer: &mut Option<Fb>,
+    gem: &mut Option<Gem>,
+    mut destroy_framebuffer: impl FnMut(Fb) -> io::Result<()>,
+    mut close_gem: impl FnMut(Gem) -> io::Result<()>,
+) -> io::Result<()>
+where
+    Fb: Copy,
+    Gem: Copy,
+{
+    if let Some(handle) = *framebuffer {
+        destroy_framebuffer(handle)?;
+        *framebuffer = None;
+    }
+    if let Some(handle) = *gem {
+        close_gem(handle)?;
+        *gem = None;
+    }
+    Ok(())
+}
+
+/// Staged owner used after PRIME_FD_TO_HANDLE succeeds but before a complete
+/// `ScanoutBo` exists. The strict helper path can remove KMS registrations
+/// before destroying backing, or retain this entire graph when either removal
+/// ioctl fails. The live path keeps its established best-effort rollback.
+struct PartialScanoutBoAllocation {
+    vk: Arc<VkContext>,
+    drm: Rc<crate::drm::Device>,
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    image_view: Option<vk::ImageView>,
+    semaphore: Option<vk::Semaphore>,
+    transfer: Option<TransferResources>,
+    framebuffer: Option<framebuffer::Handle>,
+    gem: Option<DrmBufferHandle>,
+    gbm_bo: Option<gbm::BufferObject<()>>,
+}
+
+impl PartialScanoutBoAllocation {
+    fn release_drm_strict(&mut self) -> io::Result<()> {
+        release_drm_handles_strict(
+            &mut self.framebuffer,
+            &mut self.gem,
+            |framebuffer| {
+                self.drm.destroy_framebuffer(framebuffer).map_err(|error| {
+                    scanout_io_context(
+                        format!("destroy partial disposable framebuffer {framebuffer:?}"),
+                        error,
+                    )
+                })
+            },
+            |gem| {
+                self.drm.close_buffer(gem).map_err(|error| {
+                    scanout_io_context(
+                        format!("close partial disposable GEM handle {gem:?}"),
+                        error,
+                    )
+                })
+            },
+        )
+    }
+
+    fn release_drm_best_effort(&mut self) {
+        if let Some(framebuffer) = self.framebuffer.take()
+            && let Err(error) = self.drm.destroy_framebuffer(framebuffer)
+        {
+            log::warn!("drm destroy partial framebuffer failed: {error}");
+        }
+        if let Some(gem) = self.gem.take()
+            && let Err(error) = self.drm.close_buffer(gem)
+        {
+            log::warn!("drm close partial GEM handle failed: {error}");
+        }
+    }
+
+    fn destroy_backing(mut self) {
+        unsafe {
+            if let Some(mut transfer) = self.transfer.take() {
+                destroy_transfer_resources(&self.vk, &mut transfer);
+            }
+            if let Some(image_view) = self.image_view.take() {
+                self.vk.device.destroy_image_view(image_view, None);
+            }
+            if let Some(semaphore) = self.semaphore.take() {
+                self.vk.device.destroy_semaphore(semaphore, None);
+            }
+        }
+        destroy_scanout_image(&self.vk, self.image, self.memory);
+    }
+
+    fn rollback(
+        mut self,
+        original: io::Error,
+        policy: AllocationCleanupPolicy,
+    ) -> DisposableProbeError {
+        match policy {
+            AllocationCleanupPolicy::BestEffort => {
+                self.release_drm_best_effort();
+                self.destroy_backing();
+                DisposableProbeError::from(original)
+            }
+            AllocationCleanupPolicy::StrictDisposable => match self.release_drm_strict() {
+                Ok(()) => {
+                    self.destroy_backing();
+                    DisposableProbeError::from(original)
+                }
+                Err(cleanup) => {
+                    let cleanup = io::Error::new(
+                        cleanup.kind(),
+                        format!(
+                            "strict partial scanout rollback failed after {original}; retaining \
+                            backing: {cleanup}"
+                        ),
+                    );
+                    // `self` is the retention anchor: it owns the VkContext
+                    // Arc, DRM Rc, optional GBM BO, and every raw Vulkan/KMS
+                    // handle created so far. Forgetting the complete staged
+                    // owner keeps backing alive until the isolated helper is
+                    // killed; retaining only the raw handles would allow the
+                    // VkDevice or GBM allocation to disappear underneath the
+                    // parent-shared GEM/FB registration.
+                    std::mem::forget(self);
+                    DisposableProbeError::terminal_cleanup(cleanup)
+                }
+            },
+        }
+    }
+}
+
 impl ScanoutBo {
     /// Allocate one scanout bo: GBM-alloc or Vulkan-alloc dma-buf +
     /// DRM framebuffer registration. All steps must succeed; partial
@@ -2603,25 +2833,74 @@ impl ScanoutBo {
         height: u32,
         plan: ScanoutAllocationPlan,
     ) -> io::Result<Self> {
+        Self::allocate_with_plan_policy(
+            vk,
+            drm,
+            gbm,
+            width,
+            height,
+            plan,
+            AllocationCleanupPolicy::BestEffort,
+        )
+        .map_err(DisposableProbeError::into_io_error)
+    }
+
+    fn allocate_with_plan_for_disposable_probe(
+        vk: Arc<VkContext>,
+        drm: Rc<crate::drm::Device>,
+        gbm: Option<Rc<GbmDevice>>,
+        width: u32,
+        height: u32,
+        plan: ScanoutAllocationPlan,
+    ) -> Result<Self, DisposableProbeError> {
+        Self::allocate_with_plan_policy(
+            vk,
+            drm,
+            gbm,
+            width,
+            height,
+            plan,
+            AllocationCleanupPolicy::StrictDisposable,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn allocate_with_plan_policy(
+        vk: Arc<VkContext>,
+        drm: Rc<crate::drm::Device>,
+        gbm: Option<Rc<GbmDevice>>,
+        width: u32,
+        height: u32,
+        plan: ScanoutAllocationPlan,
+        cleanup_policy: AllocationCleanupPolicy,
+    ) -> Result<Self, DisposableProbeError> {
         // 1. Allocate the source dma-buf + import into Vulkan
         //    (GBM plans) OR allocate the `VkImage` and export as
         //    dma-buf (Vulkan-alloc plans).
         let img = match plan {
             ScanoutAllocationPlan::GbmModifier(modifier) => {
                 let gbm_device = gbm.as_ref().ok_or_else(|| {
-                    io::Error::other("gbm plan requested but pool has no gbm_device")
+                    DisposableProbeError::from(io::Error::other(
+                        "gbm plan requested but pool has no gbm_device",
+                    ))
                 })?;
                 allocate_gbm_scanout_image(&vk, gbm_device, width, height, modifier).map_err(
                     |error| match error {
-                        GbmScanoutError::Vk(result) => {
-                            scanout_vk_error("gbm scanout Vulkan import", result)
-                        }
-                        error => io::Error::other(format!("gbm scanout image: {error}")),
+                        GbmScanoutError::Vk(result) => DisposableProbeError::from(
+                            scanout_vk_error("gbm scanout Vulkan import", result),
+                        ),
+                        error => DisposableProbeError::from(io::Error::other(format!(
+                            "gbm scanout image: {error}"
+                        ))),
                     },
                 )?
             }
-            _ => allocate_vk_scanout_image(&vk, width, height, plan)
-                .map_err(|result| scanout_vk_error("Vulkan scanout image allocation", result))?,
+            _ => allocate_vk_scanout_image(&vk, width, height, plan).map_err(|result| {
+                DisposableProbeError::from(scanout_vk_error(
+                    "Vulkan scanout image allocation",
+                    result,
+                ))
+            })?,
         };
         let VkScanoutImage {
             image,
@@ -2642,17 +2921,32 @@ impl ScanoutBo {
             Ok(h) => h,
             Err(e) => {
                 destroy_scanout_image(&vk, image, memory);
-                return Err(io::Error::other(format!("drm prime_fd_to_buffer: {e}")));
+                return Err(DisposableProbeError::from(io::Error::other(format!(
+                    "drm prime_fd_to_buffer: {e}"
+                ))));
             }
         };
         // The GEM handle holds its own reference; close the dma-buf
         // fd we no longer need.
         drop(dmabuf);
 
+        let mut partial = PartialScanoutBoAllocation {
+            vk,
+            drm,
+            image,
+            memory,
+            image_view: None,
+            semaphore: None,
+            transfer: None,
+            framebuffer: None,
+            gem: Some(gem_handle),
+            gbm_bo,
+        };
+
         // 3. add_fb2. Modifier-backed paths must pass the MODIFIERS
         // flag even for DRM_FORMAT_MOD_LINEAR; the legacy fallback
         // deliberately keeps the old untagged shape.
-        let fb_handle = match drm.add_planar_framebuffer(
+        let fb_handle = match partial.drm.add_planar_framebuffer(
             &VkScanoutFb {
                 gem_handle,
                 width,
@@ -2665,49 +2959,42 @@ impl ScanoutBo {
         ) {
             Ok(h) => h,
             Err(e) => {
-                let _ = drm.close_buffer(gem_handle);
-                destroy_scanout_image(&vk, image, memory);
-                return Err(io::Error::other(format!("drm add_fb: {e}")));
+                return Err(
+                    partial.rollback(io::Error::other(format!("drm add_fb: {e}")), cleanup_policy)
+                );
             }
         };
+        partial.framebuffer = Some(fb_handle);
 
         // 4. Long-lived export semaphore.
-        let vk_semaphore = match create_export_semaphore(&vk) {
+        let vk_semaphore = match create_export_semaphore(&partial.vk) {
             Ok(s) => s,
             Err(result) => {
-                let _ = drm.destroy_framebuffer(fb_handle);
-                let _ = drm.close_buffer(gem_handle);
-                unsafe {
-                    vk.device.destroy_image(image, None);
-                    vk.device.free_memory(memory, None);
-                }
-                return Err(scanout_vk_error("Vulkan scanout semaphore", result));
-            }
-        };
-
-        // 5. Per-bo transfer resources (always present now —
-        //    every bo has a live VkImage to upload into).
-        let vk_transfer = match allocate_transfer_resources(&vk, width, height) {
-            Ok(t) => t,
-            Err(result) => {
-                unsafe {
-                    vk.device.destroy_semaphore(vk_semaphore, None);
-                    vk.device.destroy_image(image, None);
-                    vk.device.free_memory(memory, None);
-                }
-                let _ = drm.destroy_framebuffer(fb_handle);
-                let _ = drm.close_buffer(gem_handle);
-                return Err(scanout_vk_error(
-                    "Vulkan scanout transfer resources",
-                    result,
+                return Err(partial.rollback(
+                    scanout_vk_error("Vulkan scanout semaphore", result),
+                    cleanup_policy,
                 ));
             }
         };
+        partial.semaphore = Some(vk_semaphore);
+
+        // 5. Per-bo transfer resources (always present now —
+        //    every bo has a live VkImage to upload into).
+        let vk_transfer = match allocate_transfer_resources(&partial.vk, width, height) {
+            Ok(t) => t,
+            Err(result) => {
+                return Err(partial.rollback(
+                    scanout_vk_error("Vulkan scanout transfer resources", result),
+                    cleanup_policy,
+                ));
+            }
+        };
+        partial.transfer = Some(vk_transfer);
 
         // 6. Color image view used by the 4.1.3.4 composite pass
         //    `vkCmdBeginRendering` as the color attachment.
         let view_info = vk::ImageViewCreateInfo::default()
-            .image(image)
+            .image(partial.image)
             .view_type(vk::ImageViewType::TYPE_2D)
             .format(vk::Format::B8G8R8A8_UNORM)
             .subresource_range(
@@ -2716,24 +3003,29 @@ impl ScanoutBo {
                     .level_count(1)
                     .layer_count(1),
             );
-        let vk_image_view = match unsafe { vk.device.create_image_view(&view_info, None) } {
+        let vk_image_view = match unsafe { partial.vk.device.create_image_view(&view_info, None) } {
             Ok(v) => v,
             Err(result) => {
-                unsafe {
-                    vk.device.unmap_memory(vk_transfer.staging_memory);
-                    vk.device.destroy_buffer(vk_transfer.staging_buffer, None);
-                    vk.device.free_memory(vk_transfer.staging_memory, None);
-                    vk.device
-                        .destroy_command_pool(vk_transfer.command_pool, None);
-                    vk.device.destroy_semaphore(vk_semaphore, None);
-                    vk.device.destroy_image(image, None);
-                    vk.device.free_memory(memory, None);
-                }
-                let _ = drm.destroy_framebuffer(fb_handle);
-                let _ = drm.close_buffer(gem_handle);
-                return Err(scanout_vk_error("Vulkan scanout image view", result));
+                return Err(partial.rollback(
+                    scanout_vk_error("Vulkan scanout image view", result),
+                    cleanup_policy,
+                ));
             }
         };
+        partial.image_view = Some(vk_image_view);
+
+        let PartialScanoutBoAllocation {
+            vk,
+            drm,
+            image,
+            memory,
+            image_view,
+            semaphore,
+            transfer,
+            framebuffer,
+            gem,
+            gbm_bo,
+        } = partial;
 
         Ok(Self {
             state: BoState::default(),
@@ -2744,12 +3036,12 @@ impl ScanoutBo {
             last_gpu_render_ns: None,
             vk_image: image,
             vk_memory: memory,
-            vk_image_view,
-            vk_semaphore,
+            vk_image_view: image_view.expect("completed allocation has an image view"),
+            vk_semaphore: semaphore.expect("completed allocation has a semaphore"),
             export_semaphore_reuse: ExportSemaphoreReuseState::Reusable,
-            fb_handle: Some(fb_handle),
-            gem_handle: Some(gem_handle),
-            vk_transfer,
+            fb_handle: framebuffer,
+            gem_handle: gem,
+            vk_transfer: transfer.expect("completed allocation has transfer resources"),
             drm,
             vk,
             disarmed: false,
@@ -2910,6 +3202,30 @@ impl ScanoutBo {
         Ok(())
     }
 
+    /// Strictly remove helper-created KMS registrations while their backing is
+    /// still alive. Handles are cleared only after the corresponding ioctl
+    /// succeeds, so a caller can retain the complete object graph when cleanup
+    /// fails instead of letting ordinary Drop free still-referenced backing.
+    fn release_disposable_drm_resources(&mut self) -> io::Result<()> {
+        release_drm_handles_strict(
+            &mut self.fb_handle,
+            &mut self.gem_handle,
+            |framebuffer| {
+                self.drm.destroy_framebuffer(framebuffer).map_err(|error| {
+                    scanout_io_context(
+                        format!("destroy disposable framebuffer {framebuffer:?}"),
+                        error,
+                    )
+                })
+            },
+            |gem| {
+                self.drm.close_buffer(gem).map_err(|error| {
+                    scanout_io_context(format!("close disposable GEM handle {gem:?}"), error)
+                })
+            },
+        )
+    }
+
     /// Mark this BO as "let process-exit clean up." Subsequent
     /// `Drop` is a no-op. Idempotent.
     /// **Only valid at final process exit** — see field doc.
@@ -3019,6 +3335,22 @@ pub struct AlienBoHandle {
 }
 
 impl ScanoutBoPool {
+    fn release_disposable_drm_resources(&mut self) -> io::Result<()> {
+        for (index, bo) in self.bos.iter_mut().enumerate() {
+            bo.release_disposable_drm_resources().map_err(|error| {
+                scanout_io_context(format!("disposable scanout BO {index}"), error)
+            })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish_disposable_probe(
+        self,
+        result: Result<(), DisposableProbeError>,
+    ) -> Result<(), DisposableProbeError> {
+        finish_disposable_probe_attempt(self, result)
+    }
+
     /// Register a client-imported `DrawableImage` as an alien BO in
     /// the pool. The DrawableImage's underlying `VkDeviceMemory` is
     /// already allocated; we run the same `add_fb2` framebuffer
@@ -3236,6 +3568,48 @@ impl ScanoutBoPool {
         )
     }
 
+    /// Helper-only exact allocation. Any partially-created KMS registration is
+    /// rolled back strictly; a cleanup failure is terminal and retains the
+    /// backing rather than returning through live best-effort Drop.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn allocate_exact_for_disposable_probe(
+        vk: Arc<VkContext>,
+        drm: Rc<crate::drm::Device>,
+        route: ScanoutRoute,
+        width: u32,
+        height: u32,
+        count: usize,
+        scanout_modifiers: &[u64],
+        plan: ScanoutAllocationPlan,
+    ) -> Result<Self, DisposableProbeError> {
+        let metadata = probe_dmabuf_scanout_metadata(&vk, &drm, route, scanout_modifiers);
+        let gbm_device = open_scanout_gbm_device(&drm);
+        let output_owned_gbm = if gbm_device.is_some() {
+            ScanoutMetadataSupport::Supported
+        } else {
+            ScanoutMetadataSupport::Unknown
+        };
+        let verdict = classify_dmabuf_scanout_route(route, &metadata, output_owned_gbm);
+        log::info!(
+            "disposable dma-buf exact scanout observation for {route:?}: plan={} \
+             gbm={output_owned_gbm:?} verdict={verdict:?} (diagnostic only)",
+            plan.describe(),
+        );
+        Self::allocate_exact_observed_with_policy(
+            vk,
+            drm,
+            gbm_device,
+            route,
+            width,
+            height,
+            count,
+            metadata,
+            verdict,
+            plan,
+            AllocationCleanupPolicy::StrictDisposable,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn allocate_exact_observed(
         vk: Arc<VkContext>,
@@ -3249,30 +3623,92 @@ impl ScanoutBoPool {
         verdict: DmabufScanoutVerdict,
         plan: ScanoutAllocationPlan,
     ) -> io::Result<Self> {
+        Self::allocate_exact_observed_with_policy(
+            vk,
+            drm,
+            gbm_device,
+            route,
+            width,
+            height,
+            count,
+            metadata,
+            verdict,
+            plan,
+            AllocationCleanupPolicy::BestEffort,
+        )
+        .map_err(DisposableProbeError::into_io_error)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn allocate_exact_observed_with_policy(
+        vk: Arc<VkContext>,
+        drm: Rc<crate::drm::Device>,
+        gbm_device: Option<Rc<GbmDevice>>,
+        route: ScanoutRoute,
+        width: u32,
+        height: u32,
+        count: usize,
+        metadata: DmabufScanoutMetadata,
+        verdict: DmabufScanoutVerdict,
+        plan: ScanoutAllocationPlan,
+        cleanup_policy: AllocationCleanupPolicy,
+    ) -> Result<Self, DisposableProbeError> {
         if plan.ownership() == ScanoutOwnership::Output && gbm_device.is_none() {
-            return Err(io::Error::other(format!(
+            return Err(DisposableProbeError::from(io::Error::other(format!(
                 "exact {} requires a GBM device on the KMS fd",
                 plan.describe()
-            )));
+            ))));
         }
 
         let mut bos = Vec::with_capacity(count);
         for index in 0..count {
-            let bo = ScanoutBo::allocate_with_plan(
-                Arc::clone(&vk),
-                Rc::clone(&drm),
-                gbm_device.as_ref().map(Rc::clone),
-                width,
-                height,
-                plan,
-            )
-            .map_err(|error| {
-                scanout_io_context(
-                    format!("exact {} BO {index} allocation", plan.describe()),
-                    error,
+            let allocation = match cleanup_policy {
+                AllocationCleanupPolicy::BestEffort => ScanoutBo::allocate_with_plan(
+                    Arc::clone(&vk),
+                    Rc::clone(&drm),
+                    gbm_device.as_ref().map(Rc::clone),
+                    width,
+                    height,
+                    plan,
                 )
-            })?;
-            bos.push(bo);
+                .map_err(DisposableProbeError::from),
+                AllocationCleanupPolicy::StrictDisposable => {
+                    ScanoutBo::allocate_with_plan_for_disposable_probe(
+                        Arc::clone(&vk),
+                        Rc::clone(&drm),
+                        gbm_device.as_ref().map(Rc::clone),
+                        width,
+                        height,
+                        plan,
+                    )
+                }
+            }
+            .map_err(|error| {
+                error.with_context(format!("exact {} BO {index} allocation", plan.describe()))
+            });
+            match allocation {
+                Ok(bo) => bos.push(bo),
+                Err(error)
+                    if matches!(cleanup_policy, AllocationCleanupPolicy::StrictDisposable)
+                        && !bos.is_empty() =>
+                {
+                    let partial_pool = Self {
+                        bos,
+                        width,
+                        height,
+                        route,
+                        ownership: plan.ownership(),
+                        allocation_plan: plan,
+                        metadata,
+                        verdict,
+                        gbm_device,
+                    };
+                    return Err(partial_pool
+                        .finish_disposable_probe(Err(error))
+                        .expect_err("failed allocation cannot become a successful probe"));
+                }
+                Err(error) => return Err(error),
+            }
         }
         Ok(Self {
             bos,
@@ -3346,16 +3782,18 @@ struct ScanoutIoContext {
 
 /// Failure from a disposable GPU route probe.
 ///
-/// `quarantine` means a queue submission may still reference the attempt's
-/// resources. The consuming pool helpers intentionally forget the complete
-/// disposable object graph in that case; Vulkan provides no cancellation
-/// primitive that would make ordinary destruction safe.
+/// `quarantine` means ordinary destruction cannot safely touch the attempt's
+/// backing. `abort_candidate_search` is deliberately separate: a strict KMS
+/// cleanup failure is terminal even when no GPU submission is outstanding,
+/// while a TEST_ONLY mode-blob failure must still release the pool's FB/GEM
+/// registrations before the terminal result is returned.
 #[derive(Debug, thiserror::Error)]
 #[error("{source}")]
 pub(crate) struct DisposableProbeError {
     #[source]
     source: io::Error,
     quarantine: bool,
+    abort_candidate_search: bool,
 }
 
 impl DisposableProbeError {
@@ -3363,11 +3801,21 @@ impl DisposableProbeError {
         Self {
             source,
             quarantine: true,
+            abort_candidate_search: true,
+        }
+    }
+
+    pub(crate) fn terminal_cleanup(source: io::Error) -> Self {
+        Self {
+            source,
+            quarantine: false,
+            abort_candidate_search: true,
         }
     }
 
     fn with_quarantine(mut self, quarantine: bool) -> Self {
         self.quarantine |= quarantine;
+        self.abort_candidate_search |= quarantine;
         self
     }
 
@@ -3375,6 +3823,7 @@ impl DisposableProbeError {
         Self {
             source: scanout_io_context(context, self.source),
             quarantine: self.quarantine,
+            abort_candidate_search: self.abort_candidate_search,
         }
     }
 
@@ -3384,9 +3833,10 @@ impl DisposableProbeError {
     }
 
     /// Whether returning this failure through normal RAII could enter an
-    /// unbounded device-wide idle. Only an incomplete or otherwise uncertain
-    /// submission requires quarantine; a pre-submit error and a completed
-    /// content mismatch are safe to tear down normally.
+    /// unbounded device-wide idle or release backing still referenced by a
+    /// failed strict DRM cleanup. Submission uncertainty and strict cleanup
+    /// failure require quarantine; a pre-submit error and a completed content
+    /// mismatch with successful cleanup are safe to tear down normally.
     #[must_use]
     fn bypass_normal_teardown(&self) -> bool {
         self.quarantine
@@ -3394,7 +3844,7 @@ impl DisposableProbeError {
 
     #[must_use]
     pub(crate) fn abort_candidate_search(&self) -> bool {
-        self.quarantine
+        self.abort_candidate_search
     }
 
     #[must_use]
@@ -3406,6 +3856,10 @@ impl DisposableProbeError {
     pub(crate) fn as_io_error(&self) -> &io::Error {
         &self.source
     }
+
+    fn into_io_error(self) -> io::Error {
+        self.source
+    }
 }
 
 impl From<io::Error> for DisposableProbeError {
@@ -3413,6 +3867,7 @@ impl From<io::Error> for DisposableProbeError {
         Self {
             source,
             quarantine: false,
+            abort_candidate_search: false,
         }
     }
 }
@@ -3433,6 +3888,8 @@ fn completed_probe_validation<T>(validation: io::Result<T>) -> Result<T, Disposa
 trait DisposableProbeAttempt {
     fn mark_known_quiescent(&self);
 
+    fn release_strict_drm_resources(&mut self) -> io::Result<()>;
+
     fn retain_uncertain(self)
     where
         Self: Sized,
@@ -3442,7 +3899,7 @@ trait DisposableProbeAttempt {
 }
 
 fn finish_disposable_probe_attempt<A>(
-    attempt: A,
+    mut attempt: A,
     result: Result<(), DisposableProbeError>,
 ) -> Result<(), DisposableProbeError>
 where
@@ -3453,10 +3910,23 @@ where
         .is_err_and(DisposableProbeError::bypass_normal_teardown)
     {
         attempt.retain_uncertain();
-    } else {
-        attempt.mark_known_quiescent();
-        drop(attempt);
+        return result;
     }
+
+    attempt.mark_known_quiescent();
+    if let Err(cleanup) = attempt.release_strict_drm_resources() {
+        let prior = result
+            .as_ref()
+            .err()
+            .map_or_else(|| "successful probe".to_string(), ToString::to_string);
+        let cleanup = io::Error::new(
+            cleanup.kind(),
+            format!("strict disposable DRM cleanup failed after {prior}: {cleanup}"),
+        );
+        attempt.retain_uncertain();
+        return Err(DisposableProbeError::quarantined(cleanup));
+    }
+    drop(attempt);
     result
 }
 
@@ -3466,11 +3936,19 @@ impl DisposableProbeAttempt for ScanoutBoPool {
             bo.vk.mark_disposable_probe_quiescent();
         }
     }
+
+    fn release_strict_drm_resources(&mut self) -> io::Result<()> {
+        self.release_disposable_drm_resources()
+    }
 }
 
 impl DisposableProbeAttempt for CopiedScanoutPool {
     fn mark_known_quiescent(&self) {
         self.mark_disposable_probe_quiescent();
+    }
+
+    fn release_strict_drm_resources(&mut self) -> io::Result<()> {
+        self.destinations.release_disposable_drm_resources()
     }
 }
 
@@ -3485,6 +3963,10 @@ impl DisposableProbeAttempt for CopiedDisposableProbeAttempt {
         // policy. Their per-submit fences already prove all child resources are
         // idle, so both destructors may destroy directly.
         self.pool.mark_disposable_probe_quiescent();
+    }
+
+    fn release_strict_drm_resources(&mut self) -> io::Result<()> {
+        self.pool.destinations.release_disposable_drm_resources()
     }
 }
 
@@ -6823,6 +7305,16 @@ mod tests {
         assert!(!safe_pre_submit_timeout.abort_candidate_search());
         assert!(!safe_pre_submit_timeout.bypass_normal_teardown());
 
+        let blob_cleanup = DisposableProbeError::terminal_cleanup(io::Error::other(
+            "TEST_ONLY mode blob cleanup failed",
+        ));
+        assert!(!blob_cleanup.requires_quarantine());
+        assert!(blob_cleanup.abort_candidate_search());
+        assert!(
+            !blob_cleanup.bypass_normal_teardown(),
+            "blob failure is terminal but must still strictly clean the pool"
+        );
+
         let uncertain = DisposableProbeError::quarantined(io::Error::other("submission unknown"))
             .with_context("BO 2 copied sink wait");
         assert!(uncertain.requires_quarantine());
@@ -6896,44 +7388,161 @@ mod tests {
     }
 
     #[test]
-    fn production_probe_finalizer_disposes_safe_results_and_retains_uncertain_work() {
+    fn strict_drm_cleanup_orders_framebuffer_before_gem_and_preserves_failures() {
+        use std::cell::Cell;
+
+        let calls = Cell::new(0_u8);
+        let mut framebuffer = Some(11_u8);
+        let mut gem = Some(22_u8);
+        release_drm_handles_strict(
+            &mut framebuffer,
+            &mut gem,
+            |handle| {
+                assert_eq!((handle, calls.get()), (11, 0));
+                calls.set(1);
+                Ok(())
+            },
+            |handle| {
+                assert_eq!((handle, calls.get()), (22, 1));
+                calls.set(2);
+                Ok(())
+            },
+        )
+        .expect("both strict cleanup ioctls succeed");
+        assert_eq!((framebuffer, gem, calls.get()), (None, None, 2));
+
+        let calls = Cell::new(0_u8);
+        let mut framebuffer = Some(11_u8);
+        let mut gem = Some(22_u8);
+        release_drm_handles_strict(
+            &mut framebuffer,
+            &mut gem,
+            |_| {
+                calls.set(1);
+                Err(io::Error::other("RMFB failed"))
+            },
+            |_| {
+                calls.set(2);
+                Ok(())
+            },
+        )
+        .expect_err("framebuffer cleanup failure is terminal");
+        assert_eq!(
+            (framebuffer, gem, calls.get()),
+            (Some(11), Some(22), 1),
+            "GEM close must not run after RMFB failure"
+        );
+
+        let calls = Cell::new(0_u8);
+        let mut framebuffer = Some(11_u8);
+        let mut gem = Some(22_u8);
+        release_drm_handles_strict(
+            &mut framebuffer,
+            &mut gem,
+            |_| {
+                calls.set(1);
+                Ok(())
+            },
+            |_| {
+                assert_eq!(calls.get(), 1);
+                calls.set(2);
+                Err(io::Error::other("GEM_CLOSE failed"))
+            },
+        )
+        .expect_err("GEM cleanup failure is terminal");
+        assert_eq!(
+            (framebuffer, gem, calls.get()),
+            (None, Some(22), 2),
+            "successful RMFB stays cleared while the failed GEM handle is retained"
+        );
+    }
+
+    #[test]
+    fn production_probe_finalizer_enforces_strict_cleanup_precedence() {
         use std::{cell::Cell, rc::Rc};
 
         #[derive(Default)]
         struct AttemptCounts {
             known_quiescent: Cell<u8>,
+            strict_cleanups: Cell<u8>,
             drops: Cell<u8>,
             device_idle_waits: Cell<u8>,
         }
 
-        struct AttemptSpy(Rc<AttemptCounts>);
+        struct AttemptSpy {
+            counts: Rc<AttemptCounts>,
+            cleanup_fails: bool,
+        }
 
         impl DisposableProbeAttempt for AttemptSpy {
             fn mark_known_quiescent(&self) {
-                self.0.known_quiescent.set(self.0.known_quiescent.get() + 1);
+                self.counts
+                    .known_quiescent
+                    .set(self.counts.known_quiescent.get() + 1);
+            }
+
+            fn release_strict_drm_resources(&mut self) -> io::Result<()> {
+                self.counts
+                    .strict_cleanups
+                    .set(self.counts.strict_cleanups.get() + 1);
+                if self.cleanup_fails {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "strict DRM cleanup failure",
+                    ))
+                } else {
+                    Ok(())
+                }
             }
         }
 
         impl Drop for AttemptSpy {
             fn drop(&mut self) {
-                self.0.drops.set(self.0.drops.get() + 1);
-                if self.0.known_quiescent.get() == 0 {
-                    self.0
+                self.counts.drops.set(self.counts.drops.get() + 1);
+                if self.counts.known_quiescent.get() == 0 {
+                    self.counts
                         .device_idle_waits
-                        .set(self.0.device_idle_waits.get() + 1);
+                        .set(self.counts.device_idle_waits.get() + 1);
                 }
             }
         }
 
         let cases = [
-            ("success", Ok(()), (1, 1, 0)),
+            ("success", Ok(()), false, true, false, false, (1, 1, 1, 0)),
             (
                 "completed mismatch",
                 completed_probe_validation(Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "pixel mismatch",
                 ))),
-                (1, 1, 0),
+                false,
+                false,
+                false,
+                false,
+                (1, 1, 1, 0),
+            ),
+            (
+                "copied source allocation rejected after destination allocation",
+                Err(DisposableProbeError::from(io::Error::other(
+                    "copied source allocation failed",
+                ))),
+                false,
+                false,
+                false,
+                false,
+                (1, 1, 1, 0),
+            ),
+            (
+                "terminal blob cleanup after strict pool cleanup",
+                Err(DisposableProbeError::terminal_cleanup(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "mode blob cleanup failure",
+                ))),
+                false,
+                false,
+                true,
+                false,
+                (1, 1, 1, 0),
             ),
             (
                 "uncertain post-submit failure",
@@ -6941,18 +7550,68 @@ mod tests {
                     io::ErrorKind::TimedOut,
                     "fence timeout",
                 ))),
-                (0, 0, 0),
+                false,
+                false,
+                true,
+                true,
+                (0, 0, 0, 0),
+            ),
+            (
+                "cleanup failure overrides success",
+                Ok(()),
+                true,
+                false,
+                true,
+                true,
+                (1, 1, 0, 0),
+            ),
+            (
+                "cleanup failure overrides completed mismatch",
+                completed_probe_validation(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "pixel mismatch",
+                ))),
+                true,
+                false,
+                true,
+                true,
+                (1, 1, 0, 0),
             ),
         ];
 
-        for (label, result, expected) in cases {
+        for (label, result, cleanup_fails, expect_ok, expect_abort, expect_quarantine, expected) in
+            cases
+        {
             let counts = Rc::new(AttemptCounts::default());
-            let returned = finish_disposable_probe_attempt(AttemptSpy(Rc::clone(&counts)), result);
+            let returned = finish_disposable_probe_attempt(
+                AttemptSpy {
+                    counts: Rc::clone(&counts),
+                    cleanup_fails,
+                },
+                result,
+            );
 
-            assert_eq!(returned.is_ok(), label == "success", "{label}");
+            assert_eq!(returned.is_ok(), expect_ok, "{label}");
+            assert_eq!(
+                returned
+                    .as_ref()
+                    .err()
+                    .is_some_and(DisposableProbeError::abort_candidate_search),
+                expect_abort,
+                "{label}",
+            );
+            assert_eq!(
+                returned
+                    .as_ref()
+                    .err()
+                    .is_some_and(DisposableProbeError::requires_quarantine),
+                expect_quarantine,
+                "{label}",
+            );
             assert_eq!(
                 (
                     counts.known_quiescent.get(),
+                    counts.strict_cleanups.get(),
                     counts.drops.get(),
                     counts.device_idle_waits.get(),
                 ),
