@@ -13,8 +13,8 @@ endpoints:
 
 Copy removes the requirement that one allocation be both renderable by A and
 scannable by B. It still requires a Vulkan renderer associated unambiguously
-with B and capable of importing A's DMA-BUF as a transfer source. CPU
-readback/upload is outside this design.
+with B and capable of importing A's DMA-BUF as a transfer source with its exact
+modifier, offset, and pitch. CPU readback/upload is outside this design.
 
 ## Endpoint and selection model
 
@@ -46,6 +46,24 @@ devices/drivers, so their ownership transfers use
 because it is limited to queues from the same physical device and driver.
 Missing foreign-family support removes copied candidates without making the
 selected live renderer globally fatal.
+
+The sink context must also expose `VK_EXT_image_drm_format_modifier`. A driver
+without explicit DMA-BUF modifier/layout import cannot safely express A's
+foreign pitch; copied scanout rejects that sink before allocating or importing
+foreign memory. This gate still permits explicit `DRM_FORMAT_MOD_LINEAR`; it
+does not add the renderer-local optimal-to-linear transport reserved for the
+later linearization revision.
+
+Legacy DRI3 imports have the same layout-description limit but a narrower
+topology gate. If the selected renderer exposes the modifier extension, DRI3
+remains available. Without it, DRI3 remains available for one inventoried
+Vulkan renderer, including a verified renderer paired with additional
+display-only KMS endpoints, and is hidden once another Vulkan renderer may
+originate a PRIME buffer whose padded stride cannot be represented. This makes
+clients choose their software fallback rather than displaying empty window
+interiors. `UnverifiedFallback` cannot prove that several KMS endpoints
+coalesce with the selected renderer, so it preserves the historical one-KMS
+allowance and fails closed when more than one KMS device is open.
 
 ## Exact probing and replay
 
@@ -90,11 +108,10 @@ ownership can leave that helper.
 
 DMA-BUF import uses the source's exact modifier, offset, and pitch. Vulkan
 image memory requirements are intersected with
-`vkGetMemoryFdPropertiesKHR`'s fd memory-type mask. When the sink lacks the
-explicit modifier path, its computed linear offset and pitch must equal the
-supplied layout before memory is bound. A later hardening layer may require
-explicit modifier-layout import categorically; this design still permits a
-proved matching linear fallback.
+`vkGetMemoryFdPropertiesKHR`'s fd memory-type mask. A sink without the explicit
+modifier path is rejected categorically: a coincidentally matching implicit
+linear pitch is not treated as a safe compatibility probe on affected older
+drivers.
 
 ## Completion boundary and frame sequence
 
@@ -162,6 +179,8 @@ own FOREIGN-to-A acquire before copying pixels.
   memory.
 - Live A or B device loss is fatal. Disposable probe failure advances to the
   next exact pair with fresh contexts.
+- A sink without explicit modifier/layout import support rejects copied
+  scanout before any foreign-memory allocation or submission.
 - Connector removal, topology rebuild, VT release, DPMS off, and shutdown
   unregister waiting jobs, retire scene pins, quiesce both devices, and only
   then reset or drop pools.

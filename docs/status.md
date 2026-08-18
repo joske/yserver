@@ -67,8 +67,21 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   contents from a fresh synchronous-modeset image whose Vulkan layout remains
   uninitialized, so retirement selects `GENERAL` acquire versus `UNDEFINED`
   discard correctly. Copied readback consumes the retained B completion and
-  acquires A before reading. DMA-BUF import intersects Vulkan image and fd memory-type
-  masks and verifies the supplied layout on the non-modifier linear path.
+  acquires A before reading. DMA-BUF import intersects Vulkan image and fd
+  memory-type masks. Post-review hardware validation showed that an implicit
+  linear import cannot safely express a foreign pitch on affected older sink
+  drivers, so B must expose `VK_EXT_image_drm_format_modifier`; copied scanout
+  rejects the route before foreign allocation when explicit modifier/layout
+  import is unavailable. Explicit `DRM_FORMAT_MOD_LINEAR` remains eligible,
+  while renderer-local optimal-to-linear transport remains a separate later
+  revision. The same implicit-layout limitation affects legacy DRI3 imports:
+  without the modifier extension, DRI3 remains available for a proven single
+  renderer (including verified display-only KMS splits), but is hidden when a
+  second Vulkan renderer may supply a PRIME buffer whose padded stride cannot
+  be expressed. Clients then select their software fallback instead of
+  displaying empty window interiors. An unverified selected renderer retains
+  the historical one-KMS allowance and fails closed when multiple KMS devices
+  prevent proving that topology.
   Topology, VT, DPMS, and shutdown paths unregister waiting jobs and quiesce
   both devices before reset/drop. Failed A-fence waits retain BO/descriptor
   ledgers; post-submit export failures rearm binary semaphores only after the

@@ -968,6 +968,16 @@ impl CopiedScanoutError {
     }
 }
 
+fn require_copied_sink_explicit_dmabuf_layout_import(supported: bool) -> io::Result<()> {
+    if supported {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "copied scanout requires VK_EXT_image_drm_format_modifier on the sink renderer to import the source DMA-BUF with its exact modifier, offset, and pitch",
+    ))
+}
+
 fn route_requires_copy_free_probe(route: ScanoutRoute) -> bool {
     route.relationship != RenderKmsRelationship::Same
 }
@@ -1152,6 +1162,8 @@ fn allocate_copied_scanout_pool(
 ) -> Result<PreparedCopiedScanoutPool, CopiedScanoutError> {
     debug_assert!(route_requires_copy_free_probe(route));
     debug_assert_eq!(destination_route.relationship, RenderKmsRelationship::Same);
+    require_copied_sink_explicit_dmabuf_layout_import(live_sink_vk.image_drm_format_modifier)
+        .map_err(CopiedScanoutError::Candidates)?;
     let plans = CopiedScanoutPool::exact_allocation_plans(
         &live_render_vk,
         &live_sink_vk,
@@ -5856,6 +5868,44 @@ mod tests {
             &error
         ));
         assert!(error.to_string().contains("test copied live allocation"));
+    }
+
+    #[test]
+    fn copied_scanout_rejects_sink_without_explicit_dmabuf_layout_import() {
+        let error = require_copied_sink_explicit_dmabuf_layout_import(false)
+            .expect_err("implicit linear layout import is unsafe for copied scanout");
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(
+            error
+                .to_string()
+                .contains("VK_EXT_image_drm_format_modifier")
+        );
+        require_copied_sink_explicit_dmabuf_layout_import(true)
+            .expect("explicit modifier-layout import is accepted");
+    }
+
+    #[test]
+    fn topology_reset_cancels_completion_for_a_surviving_output() {
+        use nix::sys::eventfd::{EfdFlags, EventFd};
+
+        let mut platform = PlatformBackend::for_tests();
+        let output_key = platform.outputs[0].key.clone();
+        let ready: OwnedFd =
+            EventFd::from_value_and_flags(1, EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK)
+                .expect("ready eventfd")
+                .into();
+        platform
+            .register_scanout_render_completion(output_key, 1, Some(ready))
+            .expect("register pollable copied completion");
+
+        platform
+            .reset_scanout_bos_for_suspend()
+            .expect("Vk-less fixture reset");
+
+        assert!(
+            platform.drain_scanout_render_completions().is_empty(),
+            "the topology-quiesce reset must cancel jobs even when the output survives",
+        );
     }
 
     #[test]

@@ -6,7 +6,8 @@
    sink renderer only through one unambiguous advertised KMS-primary match.
 3. Add minimal per-sink Vulkan transfer contexts, exact A-source plans, and
    paired B-local destination pools without touching the TFP strategy cache;
-   require `VK_EXT_queue_family_foreign` on both devices.
+   require `VK_EXT_queue_family_foreign` on both devices and
+   `VK_EXT_image_drm_format_modifier` on B before foreign allocation.
 4. Probe full three-slot source/destination pairs on disposable exact A/B
    contexts by running full-pool atomic `TEST_ONLY` first, then two
    source-handoff cycles with separate local/FOREIGN barriers, retained B-to-A
@@ -24,9 +25,13 @@
 8. Integrate startup fallback, runtime modesets, completion cancellation,
    topology changes, VT/DPMS, shutdown, dirty semaphore rearm, device loss,
    full-discard lifecycle normalization, and quarantine-safe Drop.
-9. Cover exact/none/ambiguous sink selection, shared-before-copied order,
+9. Hide legacy DRI3 without explicit modifier/layout import only when another
+   inventoried Vulkan renderer may supply PRIME buffers; retain verified
+   display-only splits, with a conservative multi-KMS rule for an unverified
+   selected renderer.
+10. Cover exact/none/ambiguous sink selection, shared-before-copied order,
    route pairing, plan order, completion matching, deferred recycle, fd=-1,
    ownership transitions, failed-wait retention, and core fd routing; retain a
    live two-flip GENERAL KMS-to-B ownership smoke as an explicit external gate.
-10. Update status, run nightly formatting, workspace tests, exact all-target
+11. Update status, run nightly formatting, workspace tests, exact all-target
     Clippy, and diff checks before committing the semantic successor.
