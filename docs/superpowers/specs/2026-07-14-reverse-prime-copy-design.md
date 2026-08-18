@@ -95,8 +95,16 @@ with those destinations in the same established order. The
 probe creates fresh exact disposable logical devices for both A and B,
 allocates a complete three-slot pool with one plan pair, and first validates
 every destination framebuffer with a full connector/CRTC/primary-plane atomic
-`TEST_ONLY`. It then validates every slot with two token-distinct A/B cycles.
-The first cycle performs:
+`TEST_ONLY`. Allocation remains at the requested full output extent, and both
+allocation and `TEST_ONLY` are outside the timed region. GPU liveness timing is
+attached to submitted work rather than the complete cold probe. Every
+copy-free BO fence and every copied A or B fence receives its own fresh 200 ms
+monotonic completion window. The budget resets for each submitted fence;
+context and pipeline creation, full-pool allocation, `TEST_ONLY`, and CPU
+validation are outside those windows. Vulkan provides no way to preempt a
+driver host call that itself returns late, so a successful fence result proves
+completion regardless of total elapsed wall time. The first copied cycle
+performs:
 
 1. a real color-attachment render into A's optimal local target of a
    full-extent radial hue-and-luminance pattern. It desaturates smoothly toward
@@ -113,10 +121,12 @@ The first cycle performs:
    releases for source and destination. Before the destination release, B
    copies that final Vulkan destination into its own tightly packed
    host-visible BGRA buffer;
-4. bounded A and B probe-fence completion, followed by stable diagnostic
-   hashes and an exact byte-for-byte A-target/B-destination comparison. Hashes
-   never decide admission alone, and a mismatch reports the first pixel and
-   channel.
+4. A and B probe-fence completion, each with its own fresh 200 ms window,
+   followed after both report success by stable diagnostic hashes and an exact
+   byte-for-byte A-target/B-destination comparison. Completion remains
+   authoritative if a successful host wait returns after the nominal window;
+   hashes never decide admission alone, and a mismatch reports the first pixel
+   and channel.
 
 Cycle two changes the pattern token, imports B's retained return completion
 into a fresh temporary A semaphore, waits it, and executes FOREIGN-to-A on the
@@ -128,6 +138,28 @@ so the disposable destination is treated as atomic-rejected/abandoned after
 cycle one and cycle two full-discards it from `UNDEFINED`; the real `GENERAL`
 KMS-to-B return leg is reserved for a live two-flip hardware smoke test and is
 never fabricated by the probe.
+
+A safe pre-submit failure or validation failure after both fences have
+completed, such as a pixel, fiducial, or freshness mismatch, rejects only that
+plan and continues the exact candidate order. Once both fences complete, CPU
+validation runs to its authoritative verdict even if the cycle or complete
+probe has already taken more than 200 ms. After all submitted work on the
+disposable A/B contexts is fence-proven complete, those contexts are marked
+quiescent and their pool, pipeline, and final context Drop paths skip the
+otherwise defensive device-wide idle. Live contexts and uncertain disposable
+contexts never receive that exemption. Classification follows submission state
+rather than the error kind alone: only a timeout or other post-submit failure
+that leaves at least one submitted fence incomplete or uncertain is terminal
+for exact-plan search. That path retains the entire disposable
+attempt, including its pool, pipeline, uncertain fences, and owning contexts,
+until process exit; it bypasses normal Drop and never calls
+`vkDeviceWaitIdle`, because Vulkan has no safe cancellation primitive. No later
+copy-free or copied exact plan is attempted after that terminal failure.
+Startup additionally retains already-built live GPU owners and aborts later
+outputs so constructor unwind cannot enter another idle wait. At runtime, the
+RANDR failure path keeps the old scene/Vulkan ownership intact, re-commits only
+the unchanged old KMS framebuffers when they were active, and returns the
+request failure without normal topology recovery.
 
 The CPU readbacks are setup-time validation only, not a CPU transport fallback
 in the live frame path. They prove the Vulkan-visible render, transport copy,
@@ -206,30 +238,40 @@ submission, and is cleared by failed-cycle recovery and lifecycle reset.
 - B is never written while pending or on screen.
 - Completion registration failure keeps the destination reserved and defers
   recycling until A's compose fence signals.
-- A post-submit completion-export failure leaves that binary semaphore dirty.
-  A's semaphore is recreated only after its compose fence succeeds; B's is
-  recreated only after a successful sink `device_wait_idle`. Exporting either
-  a real fd or `fd = -1` makes the semaphore reusable normally.
+- A live post-submit completion-export failure leaves that binary semaphore
+  dirty. A's semaphore is recreated only after its compose fence succeeds; B's
+  is recreated only after a successful sink `device_wait_idle`. Exporting
+  either a real fd or `fd = -1` makes the semaphore reusable normally.
 - A stale live-output completion fails closed rather than guessing a ledger
   entry.
-- A B-copy or atomic failure synchronously quiesces B before reuse and folds
-  damage forward with retry backoff. This base recovery is safe but may block
-  on a wedged driver.
-- Failure to prove quiescence quarantines and disarms both sides; Drop leaks
-  the B alias, A transport backing, A optimal target, and uncertain scanout
-  resources rather than freeing GPU-referenced memory.
-- Live A or B device loss is fatal. Disposable probe failure advances to the
-  next exact pair with fresh contexts.
+- A live B-copy or atomic failure synchronously quiesces B before reuse and
+  folds damage forward with retry backoff. This live recovery remains safe but
+  may block on a wedged driver.
+- A safe disposable validation failure after proven fence completion advances
+  to the next exact pair with fresh contexts. A safe failure before submission
+  does likewise. Safe teardown marks a disposable context quiescent only after
+  all of its submitted fences complete, allowing final Drop to omit a redundant
+  `vkDeviceWaitIdle`; this policy is never enabled for live contexts.
+- A timeout or error is terminal only when submitted work remains incomplete
+  or uncertain. That disposable attempt is retained and quarantined in its
+  entirety without normal Drop or `vkDeviceWaitIdle`; GPU-referenced resources
+  and both owning contexts remain alive until process exit.
+- Live failure to prove quiescence quarantines and disarms both sides; Drop
+  leaks the B alias, A transport backing, A optimal target, and uncertain
+  scanout resources rather than freeing GPU-referenced memory.
+- Live A or B device loss is fatal.
 - A sink without explicit modifier/layout import support rejects copied
   scanout before any foreign-memory allocation or submission.
 - Content-probe buffers are host-coherent and tightly packed. COPY-to-HOST
-  barriers plus successful bounded fences precede every CPU read; corner
-  fiducials, per-cycle freshness, hashes, and exact bytes must all validate.
+  barriers plus successful A and B fences precede every CPU read. Each fence
+  has its own fresh 200 ms outstanding-completion window, but successful fences
+  always proceed to corner-fiducial, per-cycle freshness, hash, and exact-byte
+  validation regardless of cumulative elapsed time.
 - Connector removal, topology rebuild, VT release, DPMS off, and shutdown
   unregister waiting jobs, retire scene pins, quiesce both devices, and only
   then reset or drop pools.
-- A failed fence wait or recovery retains the exact BO/descriptor ledger and
-  latches fatal instead of releasing anything still queue-referenced. After
+- A failed live fence wait or recovery retains the exact BO/descriptor ledger
+  and latches fatal instead of releasing anything still queue-referenced. After
   KMS is off and both devices are proven idle, lifecycle reset destroys both
   temporary wait semaphores, drops retained payloads, rearms dirty export
   semaphores, and normalizes source/destination ownership to full-overwrite
@@ -242,6 +284,7 @@ Copied scanout renders and copies the full output twice on the GPU: optimal A
 target to the selected transport, then B's imported transport alias to its scanout
 destination. The scene already uses full repaint, so this adds no buffer-age
 dependency. Candidate setup additionally reads and compares both full images
-for all three slots and two cycles; live frames do not perform this CPU work.
-There is no copied CPU fallback. Damage-limited copies and asynchronous failure
-recovery are later optimizations.
+for all three slots and two cycles; per-fence 200 ms completion windows do not
+reduce the three-slot pool or full-output image extent. Live frames do not
+perform this CPU work. There is no copied CPU fallback. Damage-limited copies
+and asynchronous failure recovery are later optimizations.

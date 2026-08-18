@@ -916,7 +916,10 @@ fn scanout_pool_needs_reallocation(
 }
 
 const SCANOUT_POOL_DEPTH: usize = 3;
-const PRIME_RENDER_PROBE_TIMEOUT_NS: u64 = 5_000_000_000;
+/// Fresh completion timeout for each submitted disposable-probe fence.
+/// Allocation, atomic TEST_ONLY, pipeline setup, and completed CPU content
+/// validation are not charged to this GPU-liveness bound.
+const PRIME_RENDER_PROBE_TIMEOUT_NS: u64 = 200_000_000;
 
 struct PreparedScanoutPool {
     pool: ScanoutBoPool,
@@ -934,6 +937,8 @@ struct PreparedCopiedScanoutPool {
 enum CopyFreeScanoutError {
     #[error("{0}")]
     Candidates(io::Error),
+    #[error("terminal disposable copy-free probe failure: {0}")]
+    TerminalDisposableProbe(io::Error),
     #[error("live renderer lost during copy-free scanout setup: {0}")]
     LiveRendererLost(io::Error),
 }
@@ -942,6 +947,7 @@ impl CopyFreeScanoutError {
     fn into_io_error(self) -> io::Error {
         match self {
             Self::Candidates(error) => error,
+            Self::TerminalDisposableProbe(error) => terminal_disposable_probe_io_error(error),
             Self::LiveRendererLost(error) => io::Error::other(Self::LiveRendererLost(error)),
         }
     }
@@ -951,6 +957,8 @@ impl CopyFreeScanoutError {
 enum CopiedScanoutError {
     #[error("{0}")]
     Candidates(io::Error),
+    #[error("terminal disposable copied probe failure: {0}")]
+    TerminalDisposableProbe(io::Error),
     #[error("live Vulkan device lost during copied scanout setup ({context}): {source}")]
     LiveDeviceLost {
         context: String,
@@ -959,13 +967,70 @@ enum CopiedScanoutError {
     },
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("terminal disposable scanout probe failure: {source}")]
+struct TerminalDisposableProbeMarker {
+    #[source]
+    source: io::Error,
+}
+
+fn terminal_disposable_probe_io_error(source: io::Error) -> io::Error {
+    io::Error::new(source.kind(), TerminalDisposableProbeMarker { source })
+}
+
+pub(crate) fn is_terminal_disposable_probe_error(error: &io::Error) -> bool {
+    fn contains(error: &(dyn std::error::Error + 'static)) -> bool {
+        if error
+            .downcast_ref::<TerminalDisposableProbeMarker>()
+            .is_some()
+        {
+            return true;
+        }
+        if let Some(io_error) = error.downcast_ref::<io::Error>()
+            && let Some(inner) = io_error.get_ref()
+        {
+            return contains(inner);
+        }
+        error.source().is_some_and(contains)
+    }
+
+    contains(error)
+}
+
 impl CopiedScanoutError {
     fn into_io_error(self) -> io::Error {
         match self {
             Self::Candidates(error) => error,
+            Self::TerminalDisposableProbe(error) => terminal_disposable_probe_io_error(error),
             error @ Self::LiveDeviceLost { .. } => io::Error::other(error),
         }
     }
+}
+
+fn retain_live_vk_contexts_after_terminal_probe(
+    live_vk: &Arc<VkContext>,
+    copied_contexts: &HashMap<RenderDeviceId, Arc<VkContext>>,
+) {
+    // PlatformBackend construction returns an error after a terminal probe.
+    // Retain one Arc for every live logical device so unwinding the partially
+    // constructed backend cannot re-enter VkContext::drop's device-wide idle
+    // on the same physical GPU that just timed out.
+    std::mem::forget(Arc::clone(live_vk));
+    for context in copied_contexts.values() {
+        std::mem::forget(Arc::clone(context));
+    }
+}
+
+fn retain_initialized_scanout_pools<T>(pools: &mut [Option<T>]) {
+    for pool in pools.iter_mut().filter_map(Option::take) {
+        std::mem::forget(pool);
+    }
+}
+
+fn retain_startup_gpu_owners<A, B, C>(ops: A, fences: B, pixmaps: C) {
+    std::mem::forget(pixmaps);
+    std::mem::forget(fences);
+    std::mem::forget(ops);
 }
 
 fn require_copied_sink_explicit_dmabuf_layout_import(supported: bool) -> io::Result<()> {
@@ -1044,7 +1109,7 @@ fn allocate_copy_free_scanout_pool(
             }
         };
         let probe_pool = match ScanoutBoPool::allocate_exact(
-            probe_vk,
+            Arc::clone(&probe_vk),
             Rc::clone(&scanout_device),
             route,
             width,
@@ -1055,19 +1120,38 @@ fn allocate_copy_free_scanout_pool(
         ) {
             Ok(pool) => pool,
             Err(error) => {
+                probe_vk.mark_disposable_probe_quiescent();
                 failures.push(copy_free_candidate_error(plan, "probe allocation", &error));
                 continue;
             }
         };
         if let Err(error) = test_scanout_pool(&scanout_device, output, &probe_pool) {
+            probe_vk.mark_disposable_probe_quiescent();
             failures.push(copy_free_candidate_error(plan, "probe TEST_ONLY", &error));
             continue;
         }
         if let Err(error) = probe_pool.probe_renderer_access(PRIME_RENDER_PROBE_TIMEOUT_NS) {
-            failures.push(copy_free_candidate_error(plan, "probe rendering", &error));
+            let abort_candidate_search = error.abort_candidate_search();
+            let error_kind = error.kind();
+            failures.push(copy_free_candidate_error(
+                plan,
+                "probe rendering",
+                error.as_io_error(),
+            ));
+            if abort_candidate_search {
+                return Err(CopyFreeScanoutError::TerminalDisposableProbe(
+                    io::Error::new(
+                        error_kind,
+                        format!(
+                            "copy-free scanout probing stopped after a terminal disposable-probe \
+                         failure: {}",
+                            failures.join("; ")
+                        ),
+                    ),
+                ));
+            }
             continue;
         }
-        drop(probe_pool);
 
         let live_pool = match ScanoutBoPool::allocate_exact(
             Arc::clone(&live_vk),
@@ -1185,20 +1269,21 @@ fn allocate_copied_scanout_pool(
                     continue;
                 }
             };
-        let probe_sink_vk = match VkContext::new_transfer_for_device(live_sink_vk.device_selector())
-        {
-            Ok(vk) => vk,
-            Err(error) => {
-                failures.push(format!(
-                    "{} disposable sink renderer: {error}",
-                    plan.describe()
-                ));
-                continue;
-            }
-        };
-        let mut probe_pool = match CopiedScanoutPool::allocate_exact(
-            probe_render_vk,
-            probe_sink_vk,
+        let probe_sink_vk =
+            match VkContext::new_disposable_transfer_for_device(live_sink_vk.device_selector()) {
+                Ok(vk) => vk,
+                Err(error) => {
+                    probe_render_vk.mark_disposable_probe_quiescent();
+                    failures.push(format!(
+                        "{} disposable sink renderer: {error}",
+                        plan.describe()
+                    ));
+                    continue;
+                }
+            };
+        let probe_pool = match CopiedScanoutPool::allocate_exact(
+            Arc::clone(&probe_render_vk),
+            Arc::clone(&probe_sink_vk),
             Rc::clone(&scanout_device),
             route,
             destination_route,
@@ -1210,22 +1295,37 @@ fn allocate_copied_scanout_pool(
         ) {
             Ok(pool) => pool,
             Err(error) => {
+                probe_render_vk.mark_disposable_probe_quiescent();
+                probe_sink_vk.mark_disposable_probe_quiescent();
                 failures.push(format!("{} probe allocation: {error}", plan.describe()));
                 continue;
             }
         };
         if let Err(error) = test_scanout_pool(&scanout_device, output, &probe_pool.destinations) {
+            probe_render_vk.mark_disposable_probe_quiescent();
+            probe_sink_vk.mark_disposable_probe_quiescent();
             failures.push(format!("{} probe TEST_ONLY: {error}", plan.describe()));
             continue;
         }
         if let Err(error) = probe_pool.probe_copy_all(PRIME_RENDER_PROBE_TIMEOUT_NS) {
+            let abort_candidate_search = error.abort_candidate_search();
+            let error_kind = error.kind();
             failures.push(format!(
                 "{} probe render/copy/readback: {error}",
                 plan.describe()
             ));
+            if abort_candidate_search {
+                return Err(CopiedScanoutError::TerminalDisposableProbe(io::Error::new(
+                    error_kind,
+                    format!(
+                        "copied scanout probing stopped after a terminal disposable-probe \
+                         failure: {}",
+                        failures.join("; ")
+                    ),
+                )));
+            }
             continue;
         }
-        drop(probe_pool);
 
         let live_pool = match CopiedScanoutPool::allocate_exact(
             Arc::clone(&live_render_vk),
@@ -2044,35 +2144,43 @@ impl PlatformBackend {
                         debug_assert!(prepared.committed_framebuffer.is_none());
                         Ok(OutputScanout::Shared(prepared.pool))
                     }
+                    Err(CopyFreeScanoutError::TerminalDisposableProbe(error)) => {
+                        retain_initialized_scanout_pools(&mut scanout_pools);
+                        retain_live_vk_contexts_after_terminal_probe(&vk, &copy_vk_contexts);
+                        retain_startup_gpu_owners(ops_command_pool, fence_pool, pixmap_pool);
+                        return Err(io::Error::new(
+                            error.kind(),
+                            format!("render PlatformBackend: {error}"),
+                        ));
+                    }
                     Err(error @ CopyFreeScanoutError::LiveRendererLost(_)) => {
                         return Err(io::Error::other(format!("render PlatformBackend: {error}")));
                     }
                     Err(CopyFreeScanoutError::Candidates(shared_error)) => {
-                        let copied_result = resolve_copied_sink_renderer(
-                            &render_devices,
-                            selected_render_device,
-                            device.key,
-                        )
-                        .and_then(|(sink_id, sink_selector)| {
+                        let copied_result = (|| {
+                            let (sink_id, sink_selector) = resolve_copied_sink_renderer(
+                                &render_devices,
+                                selected_render_device,
+                                device.key,
+                            )
+                            .map_err(CopiedScanoutError::Candidates)?;
                             let sink_vk = if let Some(vk) = copy_vk_contexts.get(&sink_id) {
                                 Arc::clone(vk)
                             } else {
                                 let sink_vk = VkContext::new_transfer_for_device(sink_selector)
                                     .map_err(|error| {
-                                        io::Error::other(format!(
-                                            "copied sink Vulkan context for {sink_id:?}/{}: {error}",
-                                            device.key
-                                        ))
+                                        CopiedScanoutError::Candidates(io::Error::other(format!(
+                                            "copied sink Vulkan context for {sink_id:?}/{}: \
+                                             {error}",
+                                            device.key,
+                                        )))
                                     })?;
                                 copy_vk_contexts.insert(sink_id, Arc::clone(&sink_vk));
                                 sink_vk
                             };
-                            let destination_route = ScanoutRoute::new(
-                                sink_id,
-                                device.key,
-                                RenderKmsRelationship::Same,
-                            );
-                            match allocate_copied_scanout_pool(
+                            let destination_route =
+                                ScanoutRoute::new(sink_id, device.key, RenderKmsRelationship::Same);
+                            allocate_copied_scanout_pool(
                                 Arc::clone(&vk),
                                 sink_vk,
                                 Rc::clone(&device.device),
@@ -2083,20 +2191,35 @@ impl PlatformBackend {
                                 h,
                                 &layout.output.scanout_modifiers,
                                 false,
-                            ) {
-                                Ok(prepared) => {
-                                    debug_assert!(prepared.committed_framebuffer.is_none());
-                                    Ok(OutputScanout::Copied(prepared.pool))
-                                }
-                                Err(CopiedScanoutError::Candidates(error)) => Err(error),
-                                Err(error @ CopiedScanoutError::LiveDeviceLost { .. }) => {
-                                    Err(io::Error::other(error))
-                                }
-                            }
-                        });
+                            )
+                        })();
                         match copied_result {
-                            Ok(pool) => Ok(pool),
-                            Err(copied_error)
+                            Ok(prepared) => {
+                                debug_assert!(prepared.committed_framebuffer.is_none());
+                                Ok(OutputScanout::Copied(prepared.pool))
+                            }
+                            Err(CopiedScanoutError::TerminalDisposableProbe(error)) => {
+                                retain_initialized_scanout_pools(&mut scanout_pools);
+                                retain_live_vk_contexts_after_terminal_probe(
+                                    &vk,
+                                    &copy_vk_contexts,
+                                );
+                                retain_startup_gpu_owners(
+                                    ops_command_pool,
+                                    fence_pool,
+                                    pixmap_pool,
+                                );
+                                return Err(io::Error::new(
+                                    error.kind(),
+                                    format!("render PlatformBackend: {error}"),
+                                ));
+                            }
+                            Err(error @ CopiedScanoutError::LiveDeviceLost { .. }) => {
+                                return Err(io::Error::other(format!(
+                                    "render PlatformBackend: {error}"
+                                )));
+                            }
+                            Err(CopiedScanoutError::Candidates(copied_error))
                                 if crate::kms::vk::scanout::scanout_error_is_device_lost(
                                     &copied_error,
                                 ) =>
@@ -2105,9 +2228,11 @@ impl PlatformBackend {
                                     "render PlatformBackend: {copied_error}"
                                 )));
                             }
-                            Err(copied_error) => Err(io::Error::other(format!(
-                                "copy-free scanout: {shared_error}; copied scanout: {copied_error}"
-                            ))),
+                            Err(CopiedScanoutError::Candidates(copied_error)) => {
+                                Err(io::Error::other(format!(
+                                    "copy-free scanout: {shared_error}; copied scanout: {copied_error}"
+                                )))
+                            }
                         }
                     }
                 }
@@ -4909,56 +5034,65 @@ impl PlatformBackend {
         let mut new_pool_committed_framebuffer = None;
         let mut new_pool: Option<Option<OutputScanout>> = if needs_pool_realloc {
             if let Some(vk) = self.vk.as_ref().cloned() {
-                let allocation: io::Result<OutputScanout> = if route_requires_copy_free_probe(
-                    scanout_route,
-                ) {
-                    match allocate_copy_free_scanout_pool(
-                        Arc::clone(&vk),
-                        Rc::clone(&device),
-                        &output,
-                        scanout_route,
-                        u32::from(w),
-                        u32::from(h),
-                        &output.scanout_modifiers,
-                        true,
-                    ) {
-                        Ok(prepared) => {
-                            new_pool_committed_framebuffer = prepared.committed_framebuffer;
-                            Ok(OutputScanout::Shared(prepared.pool))
-                        }
-                        Err(error @ CopyFreeScanoutError::LiveRendererLost(_)) => {
-                            self.renderer_failed = true;
-                            return Err(error.into_io_error());
-                        }
-                        Err(CopyFreeScanoutError::Candidates(shared_error)) => {
-                            let copied_result = self
-                                .copied_sink_context_for_kms(output_key.device_key)
-                                .and_then(|(sink_id, sink_vk)| {
-                                    let destination_route = ScanoutRoute::new(
-                                        sink_id,
-                                        output_key.device_key,
-                                        RenderKmsRelationship::Same,
-                                    );
-                                    allocate_copied_scanout_pool(
-                                        Arc::clone(&vk),
-                                        sink_vk,
-                                        Rc::clone(&device),
-                                        &output,
-                                        scanout_route,
-                                        destination_route,
-                                        u32::from(w),
-                                        u32::from(h),
-                                        &output.scanout_modifiers,
-                                        true,
-                                    )
-                                    .map_err(CopiedScanoutError::into_io_error)
-                                });
-                            match copied_result {
+                let allocation: io::Result<OutputScanout> =
+                    if route_requires_copy_free_probe(scanout_route) {
+                        match allocate_copy_free_scanout_pool(
+                            Arc::clone(&vk),
+                            Rc::clone(&device),
+                            &output,
+                            scanout_route,
+                            u32::from(w),
+                            u32::from(h),
+                            &output.scanout_modifiers,
+                            true,
+                        ) {
+                            Ok(prepared) => {
+                                new_pool_committed_framebuffer = prepared.committed_framebuffer;
+                                Ok(OutputScanout::Shared(prepared.pool))
+                            }
+                            Err(error @ CopyFreeScanoutError::TerminalDisposableProbe(_)) => {
+                                return Err(error.into_io_error());
+                            }
+                            Err(error @ CopyFreeScanoutError::LiveRendererLost(_)) => {
+                                self.renderer_failed = true;
+                                return Err(error.into_io_error());
+                            }
+                            Err(CopyFreeScanoutError::Candidates(shared_error)) => {
+                                let copied_result = self
+                                    .copied_sink_context_for_kms(output_key.device_key)
+                                    .map_err(CopiedScanoutError::Candidates)
+                                    .and_then(|(sink_id, sink_vk)| {
+                                        let destination_route = ScanoutRoute::new(
+                                            sink_id,
+                                            output_key.device_key,
+                                            RenderKmsRelationship::Same,
+                                        );
+                                        allocate_copied_scanout_pool(
+                                            Arc::clone(&vk),
+                                            sink_vk,
+                                            Rc::clone(&device),
+                                            &output,
+                                            scanout_route,
+                                            destination_route,
+                                            u32::from(w),
+                                            u32::from(h),
+                                            &output.scanout_modifiers,
+                                            true,
+                                        )
+                                    });
+                                match copied_result {
                                 Ok(prepared) => {
                                     new_pool_committed_framebuffer = prepared.committed_framebuffer;
                                     Ok(OutputScanout::Copied(prepared.pool))
                                 }
-                                Err(copied_error)
+                                Err(error @ CopiedScanoutError::TerminalDisposableProbe(_)) => {
+                                    return Err(error.into_io_error());
+                                }
+                                Err(error @ CopiedScanoutError::LiveDeviceLost { .. }) => {
+                                    self.renderer_failed = true;
+                                    return Err(error.into_io_error());
+                                }
+                                Err(CopiedScanoutError::Candidates(copied_error))
                                     if crate::kms::vk::scanout::scanout_error_is_device_lost(
                                         &copied_error,
                                     ) =>
@@ -4966,24 +5100,27 @@ impl PlatformBackend {
                                     self.renderer_failed = true;
                                     return Err(copied_error);
                                 }
-                                Err(copied_error) => Err(io::Error::other(format!(
-                                    "copy-free scanout: {shared_error}; copied scanout: {copied_error}"
-                                ))),
+                                Err(CopiedScanoutError::Candidates(copied_error)) => {
+                                    Err(io::Error::other(format!(
+                                        "copy-free scanout: {shared_error}; copied scanout: \
+                                         {copied_error}"
+                                    )))
+                                }
+                            }
                             }
                         }
-                    }
-                } else {
-                    ScanoutBoPool::allocate(
-                        Arc::clone(&vk),
-                        Rc::clone(&device),
-                        scanout_route,
-                        u32::from(w),
-                        u32::from(h),
-                        SCANOUT_POOL_DEPTH,
-                        &output.scanout_modifiers,
-                    )
-                    .map(OutputScanout::Shared)
-                };
+                    } else {
+                        ScanoutBoPool::allocate(
+                            Arc::clone(&vk),
+                            Rc::clone(&device),
+                            scanout_route,
+                            u32::from(w),
+                            u32::from(h),
+                            SCANOUT_POOL_DEPTH,
+                            &output.scanout_modifiers,
+                        )
+                        .map(OutputScanout::Shared)
+                    };
                 match allocation {
                     Ok(pool) => Some(Some(pool)),
                     Err(e) => {
@@ -5794,6 +5931,67 @@ fn check_scanout_liveness(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prime_render_probe_fence_timeout_is_two_hundred_milliseconds() {
+        assert_eq!(PRIME_RENDER_PROBE_TIMEOUT_NS, 200_000_000);
+    }
+
+    #[test]
+    fn terminal_disposable_probe_errors_cannot_be_mistaken_for_candidates() {
+        let copy_free = CopyFreeScanoutError::TerminalDisposableProbe(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "copy-free probe expired",
+        ));
+        assert!(matches!(
+            &copy_free,
+            CopyFreeScanoutError::TerminalDisposableProbe(_)
+        ));
+        let copy_free = copy_free.into_io_error();
+        assert_eq!(copy_free.kind(), io::ErrorKind::TimedOut);
+        assert!(is_terminal_disposable_probe_error(&copy_free));
+
+        let copied = CopiedScanoutError::TerminalDisposableProbe(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "copied probe expired",
+        ));
+        assert!(matches!(
+            &copied,
+            CopiedScanoutError::TerminalDisposableProbe(_)
+        ));
+        let copied = copied.into_io_error();
+        assert_eq!(copied.kind(), io::ErrorKind::TimedOut);
+        assert!(is_terminal_disposable_probe_error(&copied));
+        assert!(!is_terminal_disposable_probe_error(&io::Error::other(
+            "ordinary candidate failure"
+        )));
+    }
+
+    #[test]
+    fn terminal_startup_retains_existing_gpu_owners_without_drop() {
+        use std::{cell::Cell, rc::Rc};
+
+        struct DropSpy(Rc<Cell<u8>>);
+        impl Drop for DropSpy {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+
+        let pool_drops = Rc::new(Cell::new(0));
+        let mut pools = vec![Some(DropSpy(Rc::clone(&pool_drops)))];
+        retain_initialized_scanout_pools(&mut pools);
+        assert!(pools[0].is_none());
+        assert_eq!(pool_drops.get(), 0);
+
+        let owner_drops = Rc::new(Cell::new(0));
+        retain_startup_gpu_owners(
+            DropSpy(Rc::clone(&owner_drops)),
+            DropSpy(Rc::clone(&owner_drops)),
+            DropSpy(Rc::clone(&owner_drops)),
+        );
+        assert_eq!(owner_drops.get(), 0);
+    }
 
     fn drm_key(minor: u32) -> crate::platform::drm::DrmDeviceKey {
         crate::platform::drm::DrmDeviceKey { major: 226, minor }

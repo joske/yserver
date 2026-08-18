@@ -58,6 +58,7 @@ use std::{
     os::fd::{AsFd, FromRawFd, IntoRawFd, OwnedFd},
     rc::Rc,
     sync::{Arc, OnceLock},
+    time::{Duration, Instant},
 };
 
 use ash::vk;
@@ -1656,93 +1657,229 @@ impl CopiedScanoutPool {
     /// handoff. TEST_ONLY does not perform a KMS ownership release, so the
     /// destination is explicitly abandoned after cycle one and cycle two
     /// full-discards from UNDEFINED; GENERAL KMS -> B reuse requires a live
-    /// two-flip hardware check. Bounded fences keep rejected disposable work
-    /// from racing pool destruction.
-    pub(crate) fn probe_copy_all(&mut self, timeout_ns: u64) -> io::Result<()> {
-        let render_vk = Arc::clone(
-            &self
-                .sources
-                .first()
-                .ok_or_else(|| io::Error::other("copied probe pool has no source slots"))?
-                .render_vk,
+    /// two-flip hardware check. Each submitted renderer and sink batch gets a
+    /// fresh bounded fence wait. Pipeline creation, command recording, and CPU
+    /// validation are not compatibility failures merely because they take
+    /// longer than that GPU-liveness timeout. An actual fence timeout or other
+    /// uncertain post-submit failure consumes and quarantines this disposable
+    /// pool so no GPU-referenced object reaches normal teardown.
+    pub(crate) fn probe_copy_all(mut self, timeout_ns: u64) -> Result<(), DisposableProbeError> {
+        let probe_started = Instant::now();
+        let render_vk = match self.sources.first() {
+            Some(source) => Arc::clone(&source.render_vk),
+            None => {
+                return finish_disposable_probe_attempt(
+                    self,
+                    Err(DisposableProbeError::from(io::Error::other(
+                        "copied probe pool has no source slots",
+                    ))),
+                );
+            }
+        };
+        let pipeline_started = Instant::now();
+        let pattern = match CopiedProbePatternPipeline::new(Arc::clone(&render_vk)) {
+            Ok(pattern) => pattern,
+            Err(result) => {
+                // Pipeline creation performs no queue submission. The pool's
+                // disposable contexts are therefore safe to destroy directly
+                // even though generic context Drop remains conservative.
+                return finish_disposable_probe_attempt(
+                    self,
+                    Err(DisposableProbeError::from(scanout_vk_error(
+                        "create copied content-probe pipeline",
+                        result,
+                    ))),
+                );
+            }
+        };
+        let pipeline_elapsed = pipeline_started.elapsed();
+        log::info!(
+            "copied content probe pipeline ready in {} ms; each renderer/sink fence wait has {:?}",
+            pipeline_elapsed.as_millis(),
+            Duration::from_nanos(timeout_ns),
         );
-        let pattern = CopiedProbePatternPipeline::new(Arc::clone(&render_vk))
-            .map_err(|result| scanout_vk_error("create copied content-probe pipeline", result))?;
 
+        let result = self.probe_copy_all_inner(&render_vk, &pattern, timeout_ns);
+        if result.is_ok() {
+            log::info!(
+                "copied content probe completed {} slots x 2 cycles in {} ms; per-fence timeout {:?}",
+                self.sources.len(),
+                probe_started.elapsed().as_millis(),
+                Duration::from_nanos(timeout_ns),
+            );
+        }
+        if result
+            .as_ref()
+            .is_err_and(DisposableProbeError::bypass_normal_teardown)
+        {
+            log::error!(
+                "copied content probe timed out or left GPU completion uncertain; retaining the \
+                 disposable A/B pool and pipeline without vkDeviceWaitIdle"
+            );
+        }
+        finish_disposable_probe_attempt(
+            CopiedDisposableProbeAttempt {
+                pool: self,
+                _pattern: pattern,
+            },
+            result,
+        )
+    }
+
+    fn probe_copy_all_inner(
+        &mut self,
+        render_vk: &Arc<VkContext>,
+        pattern: &CopiedProbePatternPipeline,
+        timeout_ns: u64,
+    ) -> Result<(), DisposableProbeError> {
         for bo_idx in 0..self.sources.len() {
             let mut previous_renderer_hash = None;
             for cycle in 0..2 {
+                let cycle_started = Instant::now();
                 let sink_vk = Arc::clone(&self.sink_vk);
                 let frame_token = u32::try_from(bo_idx)
                     .ok()
                     .and_then(|index| index.checked_mul(2))
                     .and_then(|base| base.checked_add(cycle))
                     .ok_or_else(|| io::Error::other("copied probe frame token overflow"))?;
-                let render_fence = create_probe_fence(&render_vk)?;
-                let render_fence = ProbeFence::new(&render_vk.device, render_fence);
-                let render_completion = submit_copied_source_probe(
+                let render_fence = create_probe_fence(render_vk)?;
+                let mut render_fence = ProbeFence::new(&render_vk.device, render_fence);
+                let sink_fence = match create_probe_fence(&sink_vk) {
+                    Ok(fence) => fence,
+                    Err(error) => {
+                        render_fence.destroy_known_idle();
+                        return Err(DisposableProbeError::from(error).with_context(format!(
+                            "BO {bo_idx} cycle {cycle} copied sink fence creation"
+                        )));
+                    }
+                };
+                let mut sink_fence = ProbeFence::new(&sink_vk.device, sink_fence);
+                let render_completion = match submit_copied_source_probe(
                     &mut self.sources[bo_idx],
-                    &pattern,
+                    pattern,
                     frame_token,
                     render_fence.handle(),
-                )?;
+                ) {
+                    Ok(completion) => completion,
+                    Err(error) => {
+                        let pending = if error.requires_quarantine() {
+                            PendingProbeSubmissions::Render
+                        } else {
+                            PendingProbeSubmissions::None
+                        };
+                        return Err(finish_pending_probe_failure(
+                            pending,
+                            error,
+                            &mut render_fence,
+                            &mut sink_fence,
+                        )
+                        .with_context(format!(
+                            "BO {bo_idx} cycle {cycle} copied renderer submission"
+                        )));
+                    }
+                };
+                let renderer_submitted = Instant::now();
 
-                let sink_fence_handle = create_probe_fence(&sink_vk)?;
-                let sink_fence = ProbeFence::new(&sink_vk.device, sink_fence_handle);
-                let copy_completion = self.submit_copy_with_fence(
+                // The sink helper may fail either side of its queue-submit
+                // call. A is already outstanding, so conservatively retain
+                // both fence handles and the aggregate attempt on any error.
+                let copy_completion = match self.submit_copy_with_fence(
                     bo_idx,
                     render_completion,
                     sink_fence.handle(),
                     true,
-                )?;
+                ) {
+                    Ok(completion) => completion,
+                    Err(error) => {
+                        return Err(finish_pending_probe_failure(
+                            PendingProbeSubmissions::RenderAndSink,
+                            DisposableProbeError::from(error),
+                            &mut render_fence,
+                            &mut sink_fence,
+                        )
+                        .with_context(format!(
+                            "BO {bo_idx} cycle {cycle} copied sink submission"
+                        )));
+                    }
+                };
                 drop(copy_completion);
+                let sink_submitted = Instant::now();
 
-                wait_probe_fence(
-                    &render_vk,
-                    render_fence,
-                    timeout_ns,
-                    "copied renderer probe",
-                )?;
-                wait_probe_fence(&sink_vk, sink_fence, timeout_ns, "copied sink probe")?;
-                self.release_completed_source(bo_idx);
-                let renderer_pixels = self.sources[bo_idx].probe_readback_bytes()?;
-                let sink_pixels = tight_mapped_bgra_bytes(
-                    &self.destinations.bos[bo_idx].vk_transfer,
-                    self.sources[bo_idx].width(),
-                    self.sources[bo_idx].height(),
-                )?;
-                validate_copied_probe_fiducials(
-                    renderer_pixels,
-                    self.sources[bo_idx].width(),
-                    self.sources[bo_idx].height(),
-                    bo_idx,
-                    cycle,
-                    frame_token,
-                )?;
-                let renderer_hash = verify_copied_probe_pixels(
-                    renderer_pixels,
-                    sink_pixels,
-                    self.sources[bo_idx].width(),
-                    self.sources[bo_idx].height(),
-                    bo_idx,
-                    cycle,
-                    frame_token,
-                )?;
-                validate_copied_probe_freshness(
-                    previous_renderer_hash,
-                    renderer_hash,
-                    bo_idx,
-                    cycle,
-                    frame_token,
-                )?;
-                previous_renderer_hash = Some(renderer_hash);
-                if cycle == 0 {
-                    // No real KMS commit acquired/released the destination.
-                    // After B is proven idle, recover it as an atomic reject
-                    // and let the next full copy discard from UNDEFINED rather
-                    // than fabricating an external GENERAL return.
-                    self.recover_copy_failure(bo_idx)?;
-                }
+                let fence_waits =
+                    wait_copied_probe_fence_pair(&mut render_fence, &mut sink_fence, timeout_ns)
+                        .map_err(|error| {
+                            error.with_context(format!(
+                                "BO {bo_idx} cycle {cycle} copied fence completion"
+                            ))
+                        })?;
+                let sink_completed = Instant::now();
+                let validation = (|| -> io::Result<()> {
+                    self.release_completed_source(bo_idx);
+                    let renderer_pixels = self.sources[bo_idx].probe_readback_bytes()?;
+                    let sink_pixels = tight_mapped_bgra_bytes(
+                        &self.destinations.bos[bo_idx].vk_transfer,
+                        self.sources[bo_idx].width(),
+                        self.sources[bo_idx].height(),
+                    )?;
+                    validate_copied_probe_fiducials(
+                        renderer_pixels,
+                        self.sources[bo_idx].width(),
+                        self.sources[bo_idx].height(),
+                        bo_idx,
+                        cycle,
+                        frame_token,
+                    )?;
+                    let renderer_hash = verify_copied_probe_pixels(
+                        renderer_pixels,
+                        sink_pixels,
+                        self.sources[bo_idx].width(),
+                        self.sources[bo_idx].height(),
+                        bo_idx,
+                        cycle,
+                        frame_token,
+                    )?;
+                    validate_copied_probe_freshness(
+                        previous_renderer_hash,
+                        renderer_hash,
+                        bo_idx,
+                        cycle,
+                        frame_token,
+                    )?;
+                    previous_renderer_hash = Some(renderer_hash);
+                    if cycle == 0 {
+                        // No real KMS commit acquired/released the destination.
+                        // After B is proven idle, recover it as an atomic reject
+                        // and let the next full copy discard from UNDEFINED rather
+                        // than fabricating an external GENERAL return.
+                        self.recover_copy_failure_after_quiescence(bo_idx)?;
+                    }
+                    Ok(())
+                })();
+                let validation_completed = Instant::now();
+                log::info!(
+                    "copied content probe cycle: bo={bo_idx} cycle={cycle} verdict={} \
+                     renderer-submit={}ms sink-submit={}ms renderer-wait={}ms sink-wait={}ms \
+                     validation={}ms total={}ms per-fence-timeout={:?}",
+                    if validation.is_ok() {
+                        "match"
+                    } else {
+                        "reject"
+                    },
+                    renderer_submitted.duration_since(cycle_started).as_millis(),
+                    sink_submitted
+                        .duration_since(renderer_submitted)
+                        .as_millis(),
+                    fence_waits.renderer.as_millis(),
+                    fence_waits.sink.as_millis(),
+                    validation_completed
+                        .duration_since(sink_completed)
+                        .as_millis(),
+                    validation_completed
+                        .duration_since(cycle_started)
+                        .as_millis(),
+                    Duration::from_nanos(timeout_ns),
+                );
+                completed_probe_validation(validation)?;
             }
         }
         Ok(())
@@ -1756,6 +1893,13 @@ impl CopiedScanoutPool {
             // GPU-referenced and must be destroyed before importing the next
             // cycle's retained completion.
             source.release_renderer_wait_semaphore();
+        }
+    }
+
+    fn mark_disposable_probe_quiescent(&self) {
+        self.sink_vk.mark_disposable_probe_quiescent();
+        for source in &self.sources {
+            source.render_vk.mark_disposable_probe_quiescent();
         }
     }
 
@@ -1793,6 +1937,13 @@ impl CopiedScanoutPool {
         copied_quiescence_result("quiesce sink after copied scanout failure", unsafe {
             self.sink_vk.device.device_wait_idle()
         })?;
+        self.recover_copy_failure_after_quiescence(bo_idx)
+    }
+
+    /// Recover a disposable copied-probe cycle after its explicit A and B
+    /// fences have both signalled. Unlike live failure recovery, this proven
+    /// boundary needs no device-wide idle wait.
+    fn recover_copy_failure_after_quiescence(&mut self, bo_idx: usize) -> io::Result<()> {
         let source = self
             .sources
             .get_mut(bo_idx)
@@ -1880,6 +2031,13 @@ impl CopiedScanoutPool {
 
 impl Drop for CopiedScanoutPool {
     fn drop(&mut self) {
+        let render_requires_idle = self
+            .sources
+            .iter()
+            .any(|source| source.render_vk.requires_drop_device_idle());
+        if !self.sink_vk.requires_drop_device_idle() && !render_requires_idle {
+            return;
+        }
         if let Err(error) = self.drain_all_pending() {
             log::error!(
                 "copied scanout drop could not prove GPU quiescence ({error}); \
@@ -2604,9 +2762,9 @@ impl ScanoutBo {
     ///
     /// Import/export and framebuffer creation alone cannot prove that a
     /// foreign allocation is renderable. The probe follows the first-frame
-    /// layout path, waits with a bounded timeout, and leaves the image in
-    /// `GENERAL` for scanout validation.
-    fn probe_renderer_access(&self, timeout_ns: u64) -> io::Result<()> {
+    /// layout path, gives this submitted batch one bounded fence wait, and
+    /// leaves the image in `GENERAL` for scanout validation.
+    fn probe_renderer_access(&self, timeout_ns: u64) -> Result<(), DisposableProbeError> {
         let device = &self.vk.device;
         let command_buffer = self.vk_transfer.command_buffer;
 
@@ -2700,32 +2858,23 @@ impl ScanoutBo {
                 .map_err(|result| {
                     scanout_vk_error("create disposable scanout probe fence", result)
                 })?;
-            let fence = ProbeFence::new(device, fence);
+            let mut fence = ProbeFence::new(device, fence);
             let command_buffers =
                 [vk::CommandBufferSubmitInfo::default().command_buffer(command_buffer)];
             let submits = [vk::SubmitInfo2::default().command_buffer_infos(&command_buffers)];
             crate::vk_count!(queue_submit2);
             crate::vk_count!(submit_other);
-            device
-                .queue_submit2(self.vk.graphics_queue, &submits, fence.handle())
-                .map_err(|result| {
-                    scanout_vk_error("submit disposable scanout rendering probe", result)
-                })?;
-
-            match device.wait_for_fences(&[fence.handle()], true, timeout_ns) {
-                Ok(()) => {
-                    fence.destroy_signaled();
-                    Ok(())
-                }
-                Err(vk::Result::TIMEOUT) => Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "disposable scanout rendering probe timed out",
-                )),
-                Err(result) => Err(scanout_vk_error(
-                    "wait for disposable scanout rendering probe",
+            if let Err(result) =
+                device.queue_submit2(self.vk.graphics_queue, &submits, fence.handle())
+            {
+                fence.abandon_pending();
+                return Err(DisposableProbeError::quarantined(scanout_vk_error(
+                    "submit disposable scanout rendering probe",
                     result,
-                )),
+                )));
             }
+
+            wait_copy_free_probe_fence(&mut fence, timeout_ns)
         }
     }
 
@@ -2955,16 +3104,31 @@ impl ScanoutBoPool {
     /// Prove that every BO in this exact pool can complete a real Vulkan
     /// color-attachment write. Callers use only disposable contexts here, so
     /// a rejected foreign-memory submission cannot poison the live renderer.
-    pub(crate) fn probe_renderer_access(&self, timeout_ns: u64) -> io::Result<()> {
-        for (index, bo) in self.bos.iter().enumerate() {
-            bo.probe_renderer_access(timeout_ns).map_err(|error| {
-                scanout_io_context(
-                    format!("BO {index} disposable renderer-access probe"),
-                    error,
-                )
-            })?;
+    pub(crate) fn probe_renderer_access(self, timeout_ns: u64) -> Result<(), DisposableProbeError> {
+        let result = (|| {
+            for (index, bo) in self.bos.iter().enumerate() {
+                let probe_started = Instant::now();
+                bo.probe_renderer_access(timeout_ns).map_err(|error| {
+                    error.with_context(format!("BO {index} disposable renderer-access probe"))
+                })?;
+                log::info!(
+                    "copy-free rendering probe: bo={index} completed in {} ms; fence timeout {:?}",
+                    probe_started.elapsed().as_millis(),
+                    Duration::from_nanos(timeout_ns),
+                );
+            }
+            Ok(())
+        })();
+        if result
+            .as_ref()
+            .is_err_and(DisposableProbeError::bypass_normal_teardown)
+        {
+            log::error!(
+                "copy-free rendering probe timed out or left GPU completion uncertain; retaining \
+                 the disposable pool without vkDeviceWaitIdle"
+            );
         }
-        Ok(())
+        finish_disposable_probe_attempt(self, result)
     }
 
     /// Allocate `count` bos for one output. Phase 4.1.2 uses 3 bos
@@ -3180,6 +3344,150 @@ struct ScanoutIoContext {
     source: io::Error,
 }
 
+/// Failure from a disposable GPU route probe.
+///
+/// `quarantine` means a queue submission may still reference the attempt's
+/// resources. The consuming pool helpers intentionally forget the complete
+/// disposable object graph in that case; Vulkan provides no cancellation
+/// primitive that would make ordinary destruction safe.
+#[derive(Debug, thiserror::Error)]
+#[error("{source}")]
+pub(crate) struct DisposableProbeError {
+    #[source]
+    source: io::Error,
+    quarantine: bool,
+}
+
+impl DisposableProbeError {
+    fn quarantined(source: io::Error) -> Self {
+        Self {
+            source,
+            quarantine: true,
+        }
+    }
+
+    fn with_quarantine(mut self, quarantine: bool) -> Self {
+        self.quarantine |= quarantine;
+        self
+    }
+
+    fn with_context(self, context: impl Into<String>) -> Self {
+        Self {
+            source: scanout_io_context(context, self.source),
+            quarantine: self.quarantine,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn requires_quarantine(&self) -> bool {
+        self.quarantine
+    }
+
+    /// Whether returning this failure through normal RAII could enter an
+    /// unbounded device-wide idle. Only an incomplete or otherwise uncertain
+    /// submission requires quarantine; a pre-submit error and a completed
+    /// content mismatch are safe to tear down normally.
+    #[must_use]
+    fn bypass_normal_teardown(&self) -> bool {
+        self.quarantine
+    }
+
+    #[must_use]
+    pub(crate) fn abort_candidate_search(&self) -> bool {
+        self.quarantine
+    }
+
+    #[must_use]
+    pub(crate) fn kind(&self) -> io::ErrorKind {
+        self.source.kind()
+    }
+
+    #[must_use]
+    pub(crate) fn as_io_error(&self) -> &io::Error {
+        &self.source
+    }
+}
+
+impl From<io::Error> for DisposableProbeError {
+    fn from(source: io::Error) -> Self {
+        Self {
+            source,
+            quarantine: false,
+        }
+    }
+}
+
+fn completed_probe_validation<T>(validation: io::Result<T>) -> Result<T, DisposableProbeError> {
+    // Once both submitted fences have signalled, content is authoritative.
+    // Host-side validation time must never be reclassified as a GPU timeout.
+    validation.map_err(DisposableProbeError::from)
+}
+
+/// Complete ownership of one disposable probe candidate.
+///
+/// The consuming split is deliberate: a known-quiescent attempt marks every
+/// disposable context before ordinary child destruction, while an uncertain
+/// attempt bypasses Drop for the complete graph. Keeping both branches behind
+/// one production-used seam prevents a new return path from accidentally
+/// running an unbounded defensive `vkDeviceWaitIdle`.
+trait DisposableProbeAttempt {
+    fn mark_known_quiescent(&self);
+
+    fn retain_uncertain(self)
+    where
+        Self: Sized,
+    {
+        std::mem::forget(self);
+    }
+}
+
+fn finish_disposable_probe_attempt<A>(
+    attempt: A,
+    result: Result<(), DisposableProbeError>,
+) -> Result<(), DisposableProbeError>
+where
+    A: DisposableProbeAttempt,
+{
+    if result
+        .as_ref()
+        .is_err_and(DisposableProbeError::bypass_normal_teardown)
+    {
+        attempt.retain_uncertain();
+    } else {
+        attempt.mark_known_quiescent();
+        drop(attempt);
+    }
+    result
+}
+
+impl DisposableProbeAttempt for ScanoutBoPool {
+    fn mark_known_quiescent(&self) {
+        for bo in &self.bos {
+            bo.vk.mark_disposable_probe_quiescent();
+        }
+    }
+}
+
+impl DisposableProbeAttempt for CopiedScanoutPool {
+    fn mark_known_quiescent(&self) {
+        self.mark_disposable_probe_quiescent();
+    }
+}
+
+struct CopiedDisposableProbeAttempt {
+    pool: CopiedScanoutPool,
+    _pattern: CopiedProbePatternPipeline,
+}
+
+impl DisposableProbeAttempt for CopiedDisposableProbeAttempt {
+    fn mark_known_quiescent(&self) {
+        // Mark both contexts before either pool or pipeline Drop observes the
+        // policy. Their per-submit fences already prove all child resources are
+        // idle, so both destructors may destroy directly.
+        self.pool.mark_disposable_probe_quiescent();
+    }
+}
+
 fn scanout_vk_error(operation: &'static str, result: vk::Result) -> io::Error {
     io::Error::other(ScanoutVkOperationError { operation, result })
 }
@@ -3262,10 +3570,11 @@ fn probe_teardown_wait_completed(result: Result<(), vk::Result>) -> bool {
 
 /// Fence lifetime guard for one disposable rendering probe.
 ///
-/// A failed submit or fence wait leaves completion uncertain. Before child
-/// resources are destroyed, the guard idles the disposable device. Vulkan
-/// permits orderly object destruction after `ERROR_DEVICE_LOST`, so that
-/// result also completes the teardown barrier.
+/// Expected uncertain-submission paths explicitly abandon the raw fence while
+/// the aggregate disposable attempt is quarantined. This Drop-side idle is a
+/// defensive fallback for an unhandled unwind; Vulkan permits orderly object
+/// destruction after `ERROR_DEVICE_LOST`, so that result also completes the
+/// fallback teardown barrier.
 struct ProbeFence<'a> {
     device: &'a ash::Device,
     handle: vk::Fence,
@@ -3280,10 +3589,161 @@ impl<'a> ProbeFence<'a> {
         self.handle
     }
 
-    fn destroy_signaled(mut self) {
+    fn destroy_known_idle(&mut self) {
+        if self.handle == vk::Fence::null() {
+            return;
+        }
         unsafe { self.device.destroy_fence(self.handle, None) };
         self.handle = vk::Fence::null();
     }
+
+    /// Relinquish userspace ownership of a fence whose submission may still
+    /// reference it. The aggregate disposable probe attempt keeps the owning
+    /// device and every submitted child alive until process exit.
+    fn abandon_pending(&mut self) {
+        self.handle = vk::Fence::null();
+    }
+}
+
+trait DisposableProbeFence {
+    fn abandon(&mut self);
+    fn destroy_idle(&mut self);
+    fn wait_bounded(&mut self, timeout_ns: u64, operation: &'static str) -> io::Result<()>;
+}
+
+impl DisposableProbeFence for ProbeFence<'_> {
+    fn abandon(&mut self) {
+        self.abandon_pending();
+    }
+
+    fn destroy_idle(&mut self) {
+        self.destroy_known_idle();
+    }
+
+    fn wait_bounded(&mut self, timeout_ns: u64, operation: &'static str) -> io::Result<()> {
+        match unsafe {
+            self.device
+                .wait_for_fences(&[self.handle()], true, timeout_ns)
+        } {
+            Ok(()) => Ok(()),
+            Err(vk::Result::TIMEOUT) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "{operation} timed out after {:?}",
+                    Duration::from_nanos(timeout_ns),
+                ),
+            )),
+            Err(result) => Err(scanout_vk_error(operation, result)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingProbeSubmissions {
+    None,
+    Render,
+    RenderAndSink,
+}
+
+/// Resolve both fence guards without ever waiting device-wide. Returns true
+/// when at least one submission remains uncertain and the owning aggregate
+/// attempt must also be retained.
+#[must_use]
+fn dispose_probe_fences_after_failure<R, S>(
+    pending: PendingProbeSubmissions,
+    render: &mut R,
+    sink: &mut S,
+) -> bool
+where
+    R: DisposableProbeFence,
+    S: DisposableProbeFence,
+{
+    match pending {
+        PendingProbeSubmissions::None => {
+            render.destroy_idle();
+            sink.destroy_idle();
+            false
+        }
+        PendingProbeSubmissions::Render => {
+            render.abandon();
+            sink.destroy_idle();
+            true
+        }
+        PendingProbeSubmissions::RenderAndSink => {
+            render.abandon();
+            sink.abandon();
+            true
+        }
+    }
+}
+
+fn finish_pending_probe_failure<R, S>(
+    pending: PendingProbeSubmissions,
+    error: DisposableProbeError,
+    render: &mut R,
+    sink: &mut S,
+) -> DisposableProbeError
+where
+    R: DisposableProbeFence,
+    S: DisposableProbeFence,
+{
+    let quarantine = dispose_probe_fences_after_failure(pending, render, sink);
+    error.with_quarantine(quarantine)
+}
+
+fn wait_copy_free_probe_fence<F>(fence: &mut F, timeout_ns: u64) -> Result<(), DisposableProbeError>
+where
+    F: DisposableProbeFence,
+{
+    match fence.wait_bounded(timeout_ns, "disposable scanout rendering probe") {
+        Ok(()) => {
+            fence.destroy_idle();
+            Ok(())
+        }
+        Err(error) => {
+            fence.abandon();
+            Err(DisposableProbeError::quarantined(error))
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CopiedProbeFenceWaitDurations {
+    renderer: Duration,
+    sink: Duration,
+}
+
+fn wait_copied_probe_fence_pair<R, S>(
+    render: &mut R,
+    sink: &mut S,
+    timeout_ns: u64,
+) -> Result<CopiedProbeFenceWaitDurations, DisposableProbeError>
+where
+    R: DisposableProbeFence,
+    S: DisposableProbeFence,
+{
+    let renderer_started = Instant::now();
+    if let Err(error) = render.wait_bounded(timeout_ns, "copied renderer probe") {
+        return Err(finish_pending_probe_failure(
+            PendingProbeSubmissions::RenderAndSink,
+            DisposableProbeError::from(error),
+            render,
+            sink,
+        ));
+    }
+    render.destroy_idle();
+    let renderer_elapsed = renderer_started.elapsed();
+
+    let sink_started = Instant::now();
+    if let Err(error) = sink.wait_bounded(timeout_ns, "copied sink probe") {
+        sink.abandon();
+        return Err(DisposableProbeError::from(error).with_quarantine(true));
+    }
+    sink.destroy_idle();
+    Ok(CopiedProbeFenceWaitDurations {
+        renderer: renderer_elapsed,
+        sink: sink_started.elapsed(),
+    })
 }
 
 impl Drop for ProbeFence<'_> {
@@ -3313,34 +3773,12 @@ fn create_probe_fence(vk: &VkContext) -> io::Result<vk::Fence> {
     .map_err(|result| scanout_vk_error("create copied scanout probe fence", result))
 }
 
-fn wait_probe_fence<'a>(
-    vk: &'a VkContext,
-    fence: ProbeFence<'a>,
-    timeout_ns: u64,
-    operation: &'static str,
-) -> io::Result<()> {
-    match unsafe {
-        vk.device
-            .wait_for_fences(&[fence.handle()], true, timeout_ns)
-    } {
-        Ok(()) => {
-            fence.destroy_signaled();
-            Ok(())
-        }
-        Err(vk::Result::TIMEOUT) => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!("{operation} timed out"),
-        )),
-        Err(result) => Err(scanout_vk_error(operation, result)),
-    }
-}
-
 fn submit_copied_source_probe(
     source: &mut CopiedRenderSource,
     pattern: &CopiedProbePatternPipeline,
     frame_token: u32,
     fence: vk::Fence,
-) -> io::Result<Option<OwnedFd>> {
+) -> Result<Option<OwnedFd>, DisposableProbeError> {
     source.prepare_renderer_acquire()?;
     let transport_preparation = source.transport_preparation()?;
     let device = &source.render_vk.device;
@@ -3427,14 +3865,22 @@ fn submit_copied_source_probe(
         crate::vk_count!(submit_other);
         device
             .queue_submit2(source.render_vk.graphics_queue, &submits, fence)
-            .map_err(|result| scanout_vk_error("submit copied renderer probe", result))?;
+            .map_err(|result| {
+                DisposableProbeError::quarantined(scanout_vk_error(
+                    "submit copied renderer probe",
+                    result,
+                ))
+            })?;
     }
 
     source.note_renderer_submit_succeeded();
 
-    source
-        .export_render_completion()
-        .map_err(|result| scanout_vk_error("export copied renderer probe completion", result))
+    source.export_render_completion().map_err(|result| {
+        DisposableProbeError::quarantined(scanout_vk_error(
+            "export copied renderer probe completion",
+            result,
+        ))
+    })
 }
 
 fn tight_bgra_len(width: u32, height: u32) -> io::Result<usize> {
@@ -5285,6 +5731,41 @@ mod tests {
     const TILED_A: u64 = 0x0200_0000_0000_0008;
     const TILED_B: u64 = 0x0200_0000_0000_000a;
 
+    #[derive(Default)]
+    struct ProbeFenceSpy {
+        abandoned: u8,
+        destroyed_idle: u8,
+        wait_error: Option<io::ErrorKind>,
+        waits: Vec<(u64, &'static str)>,
+    }
+
+    impl ProbeFenceSpy {
+        fn timing_out() -> Self {
+            Self {
+                wait_error: Some(io::ErrorKind::TimedOut),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl DisposableProbeFence for ProbeFenceSpy {
+        fn abandon(&mut self) {
+            self.abandoned += 1;
+        }
+
+        fn destroy_idle(&mut self) {
+            self.destroyed_idle += 1;
+        }
+
+        fn wait_bounded(&mut self, timeout_ns: u64, operation: &'static str) -> io::Result<()> {
+            self.waits.push((timeout_ns, operation));
+            match self.wait_error {
+                Some(kind) => Err(io::Error::new(kind, "scripted probe fence wait")),
+                None => Ok(()),
+            }
+        }
+    }
+
     fn test_route(relationship: RenderKmsRelationship) -> ScanoutRoute {
         ScanoutRoute::new(
             crate::kms::scanout_route::RenderDeviceId::DrmRender(
@@ -6276,6 +6757,227 @@ mod tests {
         assert!(!probe_teardown_wait_completed(Err(
             vk::Result::ERROR_OUT_OF_HOST_MEMORY
         )));
+    }
+
+    #[test]
+    fn copied_probe_gives_every_fence_a_fresh_timeout() {
+        const TIMEOUT_NS: u64 = 200_000_000;
+        let mut observed = Vec::new();
+
+        for _bo_idx in 0..3 {
+            for _cycle in 0..2 {
+                let mut render = ProbeFenceSpy::default();
+                let mut sink = ProbeFenceSpy::default();
+                wait_copied_probe_fence_pair(&mut render, &mut sink, TIMEOUT_NS)
+                    .expect("both scripted fences complete");
+                observed.extend(render.waits);
+                observed.extend(sink.waits);
+                assert_eq!(render.destroyed_idle, 1);
+                assert_eq!(sink.destroyed_idle, 1);
+            }
+        }
+
+        assert_eq!(observed.len(), 12);
+        assert!(observed.iter().all(|(timeout, _)| *timeout == TIMEOUT_NS));
+        assert_eq!(
+            observed
+                .iter()
+                .map(|(_, operation)| *operation)
+                .collect::<Vec<_>>(),
+            ["copied renderer probe", "copied sink probe"].repeat(6),
+        );
+    }
+
+    #[test]
+    fn copy_free_probe_gives_every_bo_a_fresh_timeout() {
+        const TIMEOUT_NS: u64 = 200_000_000;
+
+        for _bo_idx in 0..3 {
+            let mut fence = ProbeFenceSpy::default();
+            wait_copy_free_probe_fence(&mut fence, TIMEOUT_NS)
+                .expect("scripted copy-free fence completes");
+            assert_eq!(
+                fence.waits,
+                vec![(TIMEOUT_NS, "disposable scanout rendering probe")]
+            );
+            assert_eq!(fence.destroyed_idle, 1);
+            assert_eq!(fence.abandoned, 0);
+        }
+    }
+
+    #[test]
+    fn disposable_probe_failure_policy_distinguishes_rejection_and_quarantine() {
+        let mismatch = DisposableProbeError::from(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "pixel mismatch",
+        ));
+        assert!(!mismatch.requires_quarantine());
+        assert!(!mismatch.abort_candidate_search());
+        assert!(!mismatch.bypass_normal_teardown());
+
+        let safe_pre_submit_timeout = DisposableProbeError::from(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "pre-submit operation timed out",
+        ));
+        assert!(!safe_pre_submit_timeout.requires_quarantine());
+        assert!(!safe_pre_submit_timeout.abort_candidate_search());
+        assert!(!safe_pre_submit_timeout.bypass_normal_teardown());
+
+        let uncertain = DisposableProbeError::quarantined(io::Error::other("submission unknown"))
+            .with_context("BO 2 copied sink wait");
+        assert!(uncertain.requires_quarantine());
+        assert!(uncertain.abort_candidate_search());
+        assert!(uncertain.bypass_normal_teardown());
+        assert!(uncertain.to_string().contains("BO 2 copied sink wait"));
+    }
+
+    #[test]
+    fn probe_fence_failure_disposition_never_waits_device_wide() {
+        let cases = [
+            (PendingProbeSubmissions::None, (0, 1), (0, 1), false),
+            (PendingProbeSubmissions::Render, (1, 0), (0, 1), true),
+            (PendingProbeSubmissions::RenderAndSink, (1, 0), (1, 0), true),
+        ];
+
+        for (pending, render_expected, sink_expected, quarantine_expected) in cases {
+            let mut render = ProbeFenceSpy::default();
+            let mut sink = ProbeFenceSpy::default();
+            let error = finish_pending_probe_failure(
+                pending,
+                DisposableProbeError::from(io::Error::other("probe failed")),
+                &mut render,
+                &mut sink,
+            );
+
+            assert_eq!(
+                (render.abandoned, render.destroyed_idle),
+                render_expected,
+                "render fence disposition for {pending:?}"
+            );
+            assert_eq!(
+                (sink.abandoned, sink.destroyed_idle),
+                sink_expected,
+                "sink fence disposition for {pending:?}"
+            );
+            assert_eq!(error.requires_quarantine(), quarantine_expected);
+        }
+    }
+
+    #[test]
+    fn actual_probe_fence_timeouts_are_terminal_and_quarantined() {
+        const TIMEOUT_NS: u64 = 200_000_000;
+
+        let mut copy_free = ProbeFenceSpy::timing_out();
+        let error = wait_copy_free_probe_fence(&mut copy_free, TIMEOUT_NS)
+            .expect_err("copy-free timeout must fail");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.requires_quarantine());
+        assert!(error.abort_candidate_search());
+        assert!(error.bypass_normal_teardown());
+        assert_eq!((copy_free.abandoned, copy_free.destroyed_idle), (1, 0));
+
+        let mut render = ProbeFenceSpy::timing_out();
+        let mut sink = ProbeFenceSpy::default();
+        let error = wait_copied_probe_fence_pair(&mut render, &mut sink, TIMEOUT_NS)
+            .expect_err("renderer timeout must fail the copied pair");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.requires_quarantine());
+        assert_eq!((render.abandoned, render.destroyed_idle), (1, 0));
+        assert_eq!((sink.abandoned, sink.destroyed_idle), (1, 0));
+
+        let mut render = ProbeFenceSpy::default();
+        let mut sink = ProbeFenceSpy::timing_out();
+        let error = wait_copied_probe_fence_pair(&mut render, &mut sink, TIMEOUT_NS)
+            .expect_err("sink timeout must fail the copied pair");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.requires_quarantine());
+        assert_eq!((render.abandoned, render.destroyed_idle), (0, 1));
+        assert_eq!((sink.abandoned, sink.destroyed_idle), (1, 0));
+    }
+
+    #[test]
+    fn production_probe_finalizer_disposes_safe_results_and_retains_uncertain_work() {
+        use std::{cell::Cell, rc::Rc};
+
+        #[derive(Default)]
+        struct AttemptCounts {
+            known_quiescent: Cell<u8>,
+            drops: Cell<u8>,
+            device_idle_waits: Cell<u8>,
+        }
+
+        struct AttemptSpy(Rc<AttemptCounts>);
+
+        impl DisposableProbeAttempt for AttemptSpy {
+            fn mark_known_quiescent(&self) {
+                self.0.known_quiescent.set(self.0.known_quiescent.get() + 1);
+            }
+        }
+
+        impl Drop for AttemptSpy {
+            fn drop(&mut self) {
+                self.0.drops.set(self.0.drops.get() + 1);
+                if self.0.known_quiescent.get() == 0 {
+                    self.0
+                        .device_idle_waits
+                        .set(self.0.device_idle_waits.get() + 1);
+                }
+            }
+        }
+
+        let cases = [
+            ("success", Ok(()), (1, 1, 0)),
+            (
+                "completed mismatch",
+                completed_probe_validation(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "pixel mismatch",
+                ))),
+                (1, 1, 0),
+            ),
+            (
+                "uncertain post-submit failure",
+                Err(DisposableProbeError::quarantined(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "fence timeout",
+                ))),
+                (0, 0, 0),
+            ),
+        ];
+
+        for (label, result, expected) in cases {
+            let counts = Rc::new(AttemptCounts::default());
+            let returned = finish_disposable_probe_attempt(AttemptSpy(Rc::clone(&counts)), result);
+
+            assert_eq!(returned.is_ok(), label == "success", "{label}");
+            assert_eq!(
+                (
+                    counts.known_quiescent.get(),
+                    counts.drops.get(),
+                    counts.device_idle_waits.get(),
+                ),
+                expected,
+                "{label}",
+            );
+        }
+    }
+
+    #[test]
+    fn completed_probe_validation_is_authoritative() {
+        assert_eq!(
+            completed_probe_validation::<u8>(Ok(7)).expect("completed matching content"),
+            7
+        );
+
+        let mismatch = completed_probe_validation::<()>(Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "pixel mismatch",
+        )))
+        .expect_err("completed mismatching content remains a rejection");
+        assert_eq!(mismatch.kind(), io::ErrorKind::InvalidData);
+        assert!(!mismatch.requires_quarantine());
+        assert!(!mismatch.abort_candidate_search());
+        assert!(!mismatch.bypass_normal_teardown());
     }
 
     #[test]

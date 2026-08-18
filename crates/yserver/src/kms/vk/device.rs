@@ -7,7 +7,10 @@
 use ash::vk;
 use std::{
     ffi::{CStr, c_char, c_void},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use crate::platform::drm::DrmDeviceKey;
@@ -63,6 +66,46 @@ impl VulkanDeviceSelector {
 enum DeviceProfile {
     Compositor,
     Transfer,
+}
+
+/// Controls the defensive device-wide wait in [`VkContext::drop`].
+///
+/// Live contexts always retain the wait. Disposable probe contexts may skip
+/// it only after their owner has observed every submitted fence and declared
+/// the complete queue graph quiescent. Uncertain attempts are retained instead
+/// of being marked, so an unwind still takes the conservative path.
+#[derive(Debug)]
+struct DropWaitPolicy {
+    disposable_probe: bool,
+    probe_quiescent: AtomicBool,
+}
+
+impl DropWaitPolicy {
+    const fn live() -> Self {
+        Self {
+            disposable_probe: false,
+            probe_quiescent: AtomicBool::new(false),
+        }
+    }
+
+    const fn disposable_probe() -> Self {
+        Self {
+            disposable_probe: true,
+            probe_quiescent: AtomicBool::new(false),
+        }
+    }
+
+    fn mark_probe_quiescent(&self) {
+        assert!(
+            self.disposable_probe,
+            "only disposable probe contexts may bypass the drop idle"
+        );
+        self.probe_quiescent.store(true, Ordering::Release);
+    }
+
+    fn requires_device_idle(&self) -> bool {
+        !self.disposable_probe || !self.probe_quiescent.load(Ordering::Acquire)
+    }
 }
 
 /// DRM endpoint the compositor wants its Vulkan renderer to use.
@@ -156,6 +199,7 @@ pub struct VkContext {
     /// v3dv); component-alpha masks then fall back to grayscale AA
     /// instead of requesting an unavailable feature.
     pub component_alpha_supported: bool,
+    drop_wait_policy: DropWaitPolicy,
 }
 
 impl VkContext {
@@ -163,6 +207,7 @@ impl VkContext {
         Self::new_with_selection(
             PhysicalDeviceSelection::Automatic,
             DeviceProfile::Compositor,
+            DropWaitPolicy::live(),
         )
     }
 
@@ -181,6 +226,7 @@ impl VkContext {
                 display_primary,
             }),
             DeviceProfile::Compositor,
+            DropWaitPolicy::live(),
         )
     }
 
@@ -196,6 +242,7 @@ impl VkContext {
         Self::new_with_selection(
             PhysicalDeviceSelection::Exact(live.selected_device_selector),
             DeviceProfile::Compositor,
+            DropWaitPolicy::disposable_probe(),
         )
     }
 
@@ -212,6 +259,20 @@ impl VkContext {
         Self::new_with_selection(
             PhysicalDeviceSelection::Exact(selector),
             DeviceProfile::Transfer,
+            DropWaitPolicy::live(),
+        )
+    }
+
+    /// Create a sink-side transfer context owned only by one disposable route
+    /// probe. Its Drop remains conservative until the probe explicitly proves
+    /// every submitted fence complete.
+    pub(crate) fn new_disposable_transfer_for_device(
+        selector: VulkanDeviceSelector,
+    ) -> Result<Arc<Self>, VkInitError> {
+        Self::new_with_selection(
+            PhysicalDeviceSelection::Exact(selector),
+            DeviceProfile::Transfer,
+            DropWaitPolicy::disposable_probe(),
         )
     }
 
@@ -224,6 +285,7 @@ impl VkContext {
     fn new_with_selection(
         selection: PhysicalDeviceSelection,
         profile: DeviceProfile,
+        drop_wait_policy: DropWaitPolicy,
     ) -> Result<Arc<Self>, VkInitError> {
         let entry = unsafe { ash::Entry::load()? };
         let app_info = vk::ApplicationInfo::default()
@@ -499,6 +561,7 @@ impl VkContext {
             device_type,
             timestamp_period,
             component_alpha_supported,
+            drop_wait_policy,
         }))
     }
 
@@ -516,6 +579,19 @@ impl VkContext {
     #[must_use]
     pub fn is_software_rasterizer(&self) -> bool {
         self.device_type == vk::PhysicalDeviceType::CPU
+    }
+
+    /// Mark a disposable context as fence-proven quiescent.
+    ///
+    /// After this call no queue submission may be made through this context.
+    /// Its remaining child resources may be destroyed directly, and the final
+    /// context Drop skips the otherwise unbounded `vkDeviceWaitIdle` fallback.
+    pub(crate) fn mark_disposable_probe_quiescent(&self) {
+        self.drop_wait_policy.mark_probe_quiescent();
+    }
+
+    pub(crate) fn requires_drop_device_idle(&self) -> bool {
+        self.drop_wait_policy.requires_device_idle()
     }
 }
 
@@ -660,8 +736,12 @@ impl Drop for VkContext {
     fn drop(&mut self) {
         unsafe {
             // Wait for all queue work; tearing down with in-flight CBs
-            // is undefined behaviour.
-            let _ = self.device.device_wait_idle();
+            // is undefined behaviour. Disposable probe owners may establish
+            // the same fact from their complete submitted-fence set and then
+            // deliberately skip this unbounded defensive fallback.
+            if self.requires_drop_device_idle() {
+                let _ = self.device.device_wait_idle();
+            }
             self.device.destroy_device(None);
             if let Some(m) = self.debug_messenger.take() {
                 self.debug_utils_instance
@@ -1341,6 +1421,27 @@ mod tests {
         assert_eq!(selected.enabled.logic_op, vk::FALSE);
         assert_eq!(selected.enabled.dual_src_blend, vk::FALSE);
         assert!(!selected.component_alpha);
+    }
+
+    #[test]
+    fn disposable_drop_wait_is_removed_only_after_quiescence_proof() {
+        assert!(DropWaitPolicy::live().requires_device_idle());
+
+        let policy = DropWaitPolicy::disposable_probe();
+        assert!(policy.requires_device_idle());
+
+        policy.mark_probe_quiescent();
+        // A full pool owns several Arcs to the same context and marks each one;
+        // proving the same disposable device quiescent again is harmless.
+        policy.mark_probe_quiescent();
+
+        assert!(!policy.requires_device_idle());
+    }
+
+    #[test]
+    #[should_panic(expected = "only disposable probe contexts")]
+    fn live_context_cannot_bypass_drop_wait() {
+        DropWaitPolicy::live().mark_probe_quiescent();
     }
 
     /// Real V3D 4.2 (v3dv) feature mask observed via `vulkaninfo` on an

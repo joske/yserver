@@ -135,21 +135,24 @@ impl CopiedProbePatternPipeline {
 
 impl Drop for CopiedProbePatternPipeline {
     fn drop(&mut self) {
-        // Most paths have already waited every probe fence. This final
-        // disposable-device barrier also covers an early error: pipeline
-        // objects must not be destroyed while an uncertain submission may
-        // still reference them. Device loss permits orderly Vulkan teardown;
-        // any other idle failure keeps the context and child handles leaked
-        // until process exit rather than risking a use-after-free in the
+        // The normal consuming probe finalizer marks the disposable context
+        // known-quiescent, so success and safe rejection skip this wait. This
+        // branch is only the defensive fallback for an unfinalized unwind:
+        // pipeline objects must not be destroyed while an uncertain submission
+        // may still reference them. Device loss permits orderly Vulkan
+        // teardown; any other idle failure keeps the context and child handles
+        // leaked until process exit rather than risking a use-after-free in the
         // driver.
-        let wait = unsafe { self.vk.device.device_wait_idle() };
-        if !matches!(wait, Ok(()) | Err(vk::Result::ERROR_DEVICE_LOST)) {
-            log::warn!(
-                "copied content-probe pipeline: vkDeviceWaitIdle failed during teardown: \
-                 {wait:?}; leaking the uncertain pipeline and device context"
-            );
-            std::mem::forget(Arc::clone(&self.vk));
-            return;
+        if self.vk.requires_drop_device_idle() {
+            let wait = unsafe { self.vk.device.device_wait_idle() };
+            if !matches!(wait, Ok(()) | Err(vk::Result::ERROR_DEVICE_LOST)) {
+                log::warn!(
+                    "copied content-probe pipeline: vkDeviceWaitIdle failed during teardown: \
+                     {wait:?}; leaking the uncertain pipeline and device context"
+                );
+                std::mem::forget(Arc::clone(&self.vk));
+                return;
+            }
         }
         unsafe {
             self.vk.device.destroy_pipeline(self.pipeline, None);

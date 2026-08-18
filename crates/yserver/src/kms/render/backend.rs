@@ -53,7 +53,9 @@ use crate::{
         cpu_types::{PictTransform, Rectangle16, Repeat},
         render::{
             engine::{RenderEngine, decode_x11_pixel_for_storage},
-            platform::{ConnectorSnapshot, CrtcKey, PlatformBackend},
+            platform::{
+                ConnectorSnapshot, CrtcKey, PlatformBackend, is_terminal_disposable_probe_error,
+            },
             scene::SceneCompositor,
             store::{
                 DrawableId, DrawableKind, DrawableStore, ImportedDmabufMetadata,
@@ -15535,6 +15537,44 @@ impl Backend for KmsBackend {
                     .enable_connector(&output_key, output, mode_spec, x, y)
                 {
                     log::error!("apply_crtc_config: enable_connector({connector}) failed: {e}");
+                    if is_terminal_disposable_probe_error(&e) {
+                        // The old topology is already quiesced and dark. A
+                        // terminal probe failure deliberately retains GPU
+                        // owners; rebuilding the scene here would drop the old
+                        // composite rings and re-enter vkDeviceWaitIdle on the
+                        // same physical GPU. Re-commit only the unchanged old
+                        // KMS framebuffers, without rebuilding or dropping any
+                        // Vulkan owner, then return to the core loop so
+                        // input/VT handling remains responsive.
+                        if restore_old_on_failure {
+                            match self.platform.dpms_set_outputs_active(true) {
+                                Ok(()) => {
+                                    self.reapply_gamma_for_live_outputs();
+                                    self.kms_outputs_active = !self.platform.outputs.is_empty();
+                                    log::error!(
+                                        "apply_crtc_config: terminal disposable probe failure; \
+                                         restored the unchanged old KMS topology and skipped \
+                                         Vulkan teardown/recovery"
+                                    );
+                                }
+                                Err(relight_error) => {
+                                    self.kms_outputs_active = false;
+                                    log::error!(
+                                        "apply_crtc_config: terminal disposable probe failure; \
+                                         old KMS topology relight also failed: {relight_error}; \
+                                         skipped Vulkan teardown/recovery"
+                                    );
+                                }
+                            }
+                        } else {
+                            self.kms_outputs_active = false;
+                            log::error!(
+                                "apply_crtc_config: terminal disposable probe failure from a \
+                                 previously headless topology; skipped Vulkan teardown/recovery"
+                            );
+                        }
+                        return Err(e);
+                    }
                     return Err(self.recover_failed_crtc_config(restore_old_on_failure, e));
                 }
 

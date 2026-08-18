@@ -51,15 +51,40 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   does not provide a KMS ownership return, its destination full-discards from
   `UNDEFINED`, while real `GENERAL` KMS-to-B reuse remains a live two-flip
   hardware-smoke gate. Every destination framebuffer passes full atomic
-  `TEST_ONLY` before the exact source/destination plans are replayed live. Each
-  disposable cycle now renders a token-distinct full-extent radial color-ray
-  pattern that desaturates smoothly toward the rectangular edges and embeds
-  coordinate bits, edge rails, and exact asymmetric corner fiducials. After
-  A copies its renderer-local target into the selected transport and B imports/copies the DMA-BUF, both
-  devices copy their respective A-target and B-destination images into tight
-  host-visible BGRA buffers. Successful bounded fences precede CPU access; the
-  probe logs stable hashes for diagnosis but admits a candidate only when all
-  bytes match, the fiducials are present, and cycle two differs from cycle one.
+  `TEST_ONLY` before the exact source/destination plans are replayed live. Full
+  three-slot allocation at the requested output extent and atomic `TEST_ONLY`
+  remain outside the timed region and are unchanged. GPU liveness timing begins
+  only after disposable work is submitted: every copy-free BO fence and every
+  copied A or B fence receives its own fresh 200 ms monotonic completion
+  window. The budget resets for each submitted fence; it is not a global
+  cold-probe or exact-plan deadline and does not cover context/pipeline
+  creation, allocation, `TEST_ONLY`, or CPU validation. Vulkan cannot preempt a
+  driver host call that returns late, so a fence that reports successful
+  completion remains authoritative even if total elapsed wall time has passed
+  200 ms. Each disposable copied cycle renders a token-distinct
+  full-extent radial color-ray pattern that desaturates smoothly toward the
+  rectangular edges and embeds coordinate bits, edge rails, and exact
+  asymmetric corner fiducials. After A copies its renderer-local target into
+  the selected transport and B imports/copies the DMA-BUF, both devices copy
+  their respective A-target and B-destination images into tight host-visible
+  BGRA buffers. Both fences must report completion before any CPU access. Once
+  they do, the probe always reaches the pixel verdict regardless of cumulative
+  elapsed time; it logs stable hashes for diagnosis but admits a candidate only
+  when all bytes match, the fiducials are present, and cycle two differs from
+  cycle one. Safe pre-submit failures and content mismatches after proven fence
+  completion reject only that plan and continue candidate order. Once every
+  submitted fence is proven complete, the disposable contexts are marked
+  quiescent so pool, pipeline, and final context teardown skip their otherwise
+  defensive `vkDeviceWaitIdle`; live contexts never receive that exemption.
+  Only a timeout or other post-submit failure that leaves an outstanding fence
+  incomplete or uncertain terminally stops exact-plan search and retains the complete
+  disposable attempt until process exit, bypassing normal Drop and
+  `vkDeviceWaitIdle`. No later exact plan is tried after that terminal failure.
+  During startup, a terminal probe also aborts later outputs and retains the
+  partially constructed live GPU owners so constructor unwinding cannot
+  re-enter an idle wait. During runtime RANDR, yserver skips scene/Vulkan
+  teardown and attempts to restore only the unchanged old KMS framebuffers;
+  the request still returns failure to the client.
   This setup-only readback is not a live CPU transport fallback. It validates
   the Vulkan-visible render/transport/import/copy chain but cannot prove
   the display engine's interpretation of GBM/KMS pitch, offset, and modifier
@@ -123,9 +148,10 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   corresponding queue is proven complete. Successful KMS-off plus A/B idle
   clears temporary waits/retained fds and normalizes ownership to full-discard
   states; failed quiescence quarantines and leaks uncertain resources rather
-  than reusing them, and live A/B device loss is fatal. Failure recovery
-  currently uses synchronous sink `device_wait_idle`,
-  so it is safe but may block on a wedged driver. The compatibility path remains
+  than reusing them, and live A/B device loss is fatal. Live B-copy or atomic
+  failure recovery still uses synchronous sink `device_wait_idle`, so it is safe
+  but may block on a wedged driver; that live recovery boundary is separate from
+  disposable-probe timeout quarantine. The compatibility path remains
   full-frame two-stage GPU copy with no CPU fallback. Validation: focused
   scanout, target, and scene state suites; full workspace tests; workspace
   all-target Clippy with warnings denied; nightly formatting and diff checks.

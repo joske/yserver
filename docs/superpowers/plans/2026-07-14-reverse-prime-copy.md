@@ -16,9 +16,26 @@
    source-handoff cycles with separate local/FOREIGN barriers, retained B-to-A
    completion, and real render/copy/fences. Render a token-distinct full-extent
    radial diagnostic pattern, read back A's local target and B's final
-   destination after bounded fences, and require exact bytes plus diagnostic
-   hashes, valid corner fiducials, and cross-cycle freshness; never fabricate
-   the absent KMS return leg, and replay only the exact winner live.
+   destination only after successful A and B fences, and require exact bytes
+   plus diagnostic hashes, valid corner fiducials, and cross-cycle freshness.
+   Keep full-size allocation and `TEST_ONLY` outside the timed region. Give
+   every copy-free BO fence and every copied A or B fence its own fresh 200 ms
+   monotonic completion window; do not use a global cold-probe or exact-plan
+   deadline, and keep CPU validation outside the liveness window. Completed
+   fences always proceed to the pixel verdict even when cumulative elapsed time
+   exceeds 200 ms. Safe pre-submit failures and mismatches after proven
+   completion continue candidate order. Mark disposable contexts quiescent
+   after every submitted fence completes so their ordinary pool, pipeline, and
+   context teardown skips the redundant device-wide idle; never grant that
+   exemption to live or uncertain contexts. Classify failure by submission
+   state: only a timeout or other post-submit failure that leaves submitted
+   work incomplete or uncertain terminally stops exact-plan search and retains
+   the whole disposable attempt until process exit without normal Drop or
+   `vkDeviceWaitIdle`. Never fabricate the absent KMS return leg, and replay
+   only the exact winner live. Propagate terminal status through startup and
+   runtime: startup retains already-built GPU owners and aborts later outputs,
+   while runtime skips scene/Vulkan teardown and restores only the unchanged
+   old KMS topology before returning failure.
 5. Add a stable copied-render completion poller and core backend-fd dispatch
    using monotonic job id, `OutputKey`, and BO index.
 6. Render into A's optimal target, copy into the selected external transport,
@@ -32,7 +49,10 @@
    destination.
 8. Integrate startup fallback, runtime modesets, completion cancellation,
    topology changes, VT/DPMS, shutdown, dirty semaphore rearm, device loss,
-   full-discard lifecycle normalization, and quarantine-safe Drop.
+   full-discard lifecycle normalization, terminal disposable-probe quarantine,
+   fence-proven disposable teardown, and quarantine-safe Drop. Keep synchronous
+   sink `device_wait_idle` for live B-copy/atomic failure recovery separate from
+   the disposable timeout path.
 9. Hide legacy DRI3 without explicit modifier/layout import only when another
    inventoried Vulkan renderer may supply PRIME buffers; retain verified
    display-only splits, with a conservative multi-KMS rule for an unverified
@@ -43,7 +63,11 @@
    matching, deferred recycle, fd=-1,
    ownership transitions, local-pixel validity, A/B readback equality, first
    mismatch diagnostics, stale-cycle rejection, corner fiducials, failed-wait
-   retention, and core fd routing; retain a live two-flip GENERAL KMS-to-B
-   ownership and display-interpretation smoke as an explicit external gate.
+   retention, per-fence completion-window accounting, completed-fence
+   validation beyond nominal elapsed time, submission-state timeout
+   classification, safe-failure continuation, uncertain-attempt retention
+   without `vkDeviceWaitIdle`, and core fd routing; retain a live two-flip
+   GENERAL KMS-to-B ownership and display-interpretation smoke as an explicit
+   external gate.
 11. Update status, run nightly formatting, workspace tests, exact all-target
     Clippy, and diff checks before committing the semantic successor.
