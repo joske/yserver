@@ -3978,7 +3978,7 @@ impl ComposeRenderTarget for CopiedRenderSource {
         let PostComposePreparation::Copied(preparation) = preparation else {
             unreachable!("copied target received shared post-compose preparation")
         };
-        self.record_linearization(command_buffer, preparation);
+        self.record_transport_copy(command_buffer, preparation);
     }
 }
 

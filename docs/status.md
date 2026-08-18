@@ -37,7 +37,7 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   relationship-unknown output now falls back to GPU copy transport only after
   every exact copy-free allocation plan fails. `OutputScanout` keeps the
   ordinary shared pool distinct from a copied pool pairing renderer-A optimal
-  targets and linear external transports with a truthful renderer-B-local
+  targets and explicit DRM-modifier external transports with a truthful renderer-B-local
   destination pool and the outer A-to-KMS route. Renderer B is accepted only
   when exactly one inventoried `RenderDevice` advertises the sink KMS primary
   node; disposable and live
@@ -55,13 +55,13 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   disposable cycle now renders a token-distinct full-extent radial color-ray
   pattern that desaturates smoothly toward the rectangular edges and embeds
   coordinate bits, edge rails, and exact asymmetric corner fiducials. After
-  A linearizes its renderer-local target and B imports/copies the DMA-BUF, both
+  A copies its renderer-local target into the selected transport and B imports/copies the DMA-BUF, both
   devices copy their respective A-target and B-destination images into tight
   host-visible BGRA buffers. Successful bounded fences precede CPU access; the
   probe logs stable hashes for diagnosis but admits a candidate only when all
   bytes match, the fiducials are present, and cycle two differs from cycle one.
   This setup-only readback is not a live CPU transport fallback. It validates
-  the Vulkan-visible render/linearization/import/copy chain but cannot prove
+  the Vulkan-visible render/transport/import/copy chain but cannot prove
   the display engine's interpretation of GBM/KMS pitch, offset, and modifier
   metadata, so the live two-flip visual/writeback/CRTC-CRC smoke remains
   pending alongside the ownership-return smoke.
@@ -76,13 +76,19 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   their consuming submission's fence completes. Damage,
   generation, cursor, descriptor, and paired A-source retirement wait for the
   matching page-flip completion. A composes into an optimal renderer-local
-  target, copies it into an explicit modifier-0 `TRANSFER_DST` transport, and
-  releases only that transport to FOREIGN. A creates the DMA-BUF with
-  `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` and `[DRM_FORMAT_MOD_LINEAR]`; B
+  target, copies it into an explicit one-plane `TRANSFER_DST` transport, and
+  releases only that transport to FOREIGN. A enumerates its native nonzero
+  `B8G8R8A8_UNORM` modifiers and retains only exact A-exportable/B-importable
+  `TRANSFER_DST`/`TRANSFER_SRC` pairs; explicit modifier 0 is appended as the
+  final fallback. All native transport pairs are exhausted before any LINEAR
+  pair, while the established sink-destination order remains intact within
+  each tier. Every source is created with
+  `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` and a singleton modifier list; B
   imports the same explicit modifier, offset, and row pitch with `TRANSFER_SRC`
-  usage. The same recorder is
+  usage. The intermediate transport is not filtered by KMS plane modifiers
+  because it is never scanned out. The same recorder is
   exercised in live submission and both disposable-probe cycles; cycle two
-  acquires the returned linear transport while the optimal target remains
+  acquires the returned external transport while the optimal target remains
   local. Readback uses A's optimal target after a successful compose and does
   not consume B's retained completion or mutate transport ownership, while
   framebuffer retention, direct-scanout bookkeeping, and KMS retirement use
@@ -97,11 +103,13 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   drivers, so both A and B must expose `VK_EXT_image_drm_format_modifier`;
   copied scanout rejects the route before foreign allocation when explicit
   modifier/layout export or import is unavailable. A live RADV/NVIDIA probe
-  confirmed why this is policy rather than spelling: RADV rejected the
+  confirmed why explicit modifier 0 must remain the fallback rather than an
+  implicit-linear spelling: RADV rejected the
   implicit `VK_IMAGE_TILING_LINEAR + TRANSFER_DST + DMA_BUF` query but exposed
   exportable explicit modifier 0, while NVIDIA exposed the matching import.
-  Explicit `DRM_FORMAT_MOD_LINEAR` is therefore the sole A/B transport
-  representation. The same implicit-layout limitation affects
+  Native common modifiers are preferred, while explicit
+  `DRM_FORMAT_MOD_LINEAR` remains the compatibility representation when A and
+  B share no nonzero modifier. The same implicit-layout limitation affects
   legacy DRI3 imports: without the modifier extension, DRI3 remains available for a proven single
   renderer (including verified display-only KMS splits), but is hidden when a
   second Vulkan renderer may supply a PRIME buffer whose padded stride cannot

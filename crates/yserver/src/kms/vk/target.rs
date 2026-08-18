@@ -1161,19 +1161,13 @@ pub(crate) const EXPORT_IMAGE_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::
         | vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw(),
 );
 
-/// Exact usage of copied scanout's renderer-side linear DMA-BUF transport.
-/// Renderer A copies its optimal compose target into this image and renderer B
-/// copies out of an imported alias. Keeping color-attachment and sampling
-/// usage out of the external-memory contract supports drivers which cannot
-/// render directly into a linear exportable image.
+/// Exact usage of copied scanout's renderer-side DMA-BUF transport. Renderer A
+/// copies its optimal compose target into this image and renderer B copies out
+/// of an imported alias. Keeping color-attachment and sampling usage out of
+/// the external-memory contract supports transport modifiers which cannot be
+/// rendered into or sampled directly.
 pub(crate) const COPIED_TRANSPORT_IMAGE_USAGE: vk::ImageUsageFlags =
     vk::ImageUsageFlags::TRANSFER_DST;
-
-/// Copied scanout always describes its linear DMA-BUF explicitly. In
-/// particular, do not substitute `VK_IMAGE_TILING_LINEAR`: RADV may reject
-/// that external-image contract while accepting the equivalent explicit DRM
-/// modifier with the exact same transfer-only usage.
-pub(crate) const COPIED_TRANSPORT_DRM_MODIFIER: u64 = super::dri3::DRM_FORMAT_MOD_LINEAR;
 
 /// The exact external transport representation persisted for copied scanout.
 /// Unlike [`TilingStrategy`], this never consults or mutates the GLX-TFP
@@ -1181,19 +1175,28 @@ pub(crate) const COPIED_TRANSPORT_DRM_MODIFIER: u64 = super::dri3::DRM_FORMAT_MO
 /// image and is not part of this external-memory plan.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) enum CopiedSourcePlan {
-    DrmModifierLinear,
+    DrmModifier(u64),
 }
 
 impl CopiedSourcePlan {
     #[must_use]
     pub(crate) const fn modifier(self) -> u64 {
         match self {
-            Self::DrmModifierLinear => COPIED_TRANSPORT_DRM_MODIFIER,
+            Self::DrmModifier(modifier) => modifier,
         }
     }
 
+    #[must_use]
+    pub(crate) const fn is_linear(self) -> bool {
+        self.modifier() == super::dri3::DRM_FORMAT_MOD_LINEAR
+    }
+
     pub(crate) fn describe(self) -> String {
-        format!("drm-modifier=0x{:x}-linear-transport", self.modifier())
+        if self.is_linear() {
+            "drm-modifier=0x0-linear-transport".to_string()
+        } else {
+            format!("drm-modifier=0x{:x}-native-transport", self.modifier())
+        }
     }
 }
 
@@ -1375,8 +1378,9 @@ fn allocate_with_strategy(
     }
 }
 
-/// Allocate copied scanout's exact explicit-modifier linear transport without
-/// consulting or changing [`VkContext::tfp_tiling_strategy`].
+/// Allocate one exact copied-scanout transport modifier without consulting or
+/// changing [`VkContext::tfp_tiling_strategy`]. The one-element modifier list
+/// makes the disposable winner exactly replayable on the live renderer.
 pub(crate) fn allocate_copied_source_exact(
     vk: &Arc<VkContext>,
     width: u32,
@@ -1384,18 +1388,32 @@ pub(crate) fn allocate_copied_source_exact(
     format: vk::Format,
     plan: CopiedSourcePlan,
 ) -> Result<ExportableImage, vk::Result> {
-    match plan {
-        CopiedSourcePlan::DrmModifierLinear => {
-            let modifiers = [plan.modifier()];
-            allocate_exportable_modifier(
-                vk,
-                width,
-                height,
-                format,
-                &modifiers,
-                COPIED_TRANSPORT_IMAGE_USAGE,
-            )
-        }
+    let requested_modifier = plan.modifier();
+    let modifiers = [requested_modifier];
+    let image = allocate_exportable_modifier(
+        vk,
+        width,
+        height,
+        format,
+        &modifiers,
+        COPIED_TRANSPORT_IMAGE_USAGE,
+    )?;
+    if let Err(error) = validate_copied_source_modifier(requested_modifier, image.modifier) {
+        log::warn!(
+            "copied transport exact modifier mismatch: requested=0x{requested_modifier:x} \
+             actual=0x{:x}",
+            image.modifier,
+        );
+        return Err(error);
+    }
+    Ok(image)
+}
+
+fn validate_copied_source_modifier(requested: u64, actual: u64) -> Result<(), vk::Result> {
+    if requested == actual {
+        Ok(())
+    } else {
+        Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED)
     }
 }
 
@@ -1641,14 +1659,23 @@ mod tests {
     }
 
     #[test]
-    fn copied_source_plan_names_explicit_modifier_linear_transport() {
+    fn copied_source_plan_distinguishes_native_and_explicit_linear_transport() {
+        let linear = CopiedSourcePlan::DrmModifier(super::super::dri3::DRM_FORMAT_MOD_LINEAR);
+        let native = CopiedSourcePlan::DrmModifier(0xabcd);
+        assert_eq!(linear.describe(), "drm-modifier=0x0-linear-transport");
+        assert_eq!(linear.modifier(), super::super::dri3::DRM_FORMAT_MOD_LINEAR);
+        assert!(linear.is_linear());
+        assert_eq!(native.describe(), "drm-modifier=0xabcd-native-transport");
+        assert_eq!(native.modifier(), 0xabcd);
+        assert!(!native.is_linear());
+    }
+
+    #[test]
+    fn copied_source_exact_allocation_rejects_a_different_modifier() {
+        assert_eq!(validate_copied_source_modifier(0xabcd, 0xabcd), Ok(()));
         assert_eq!(
-            CopiedSourcePlan::DrmModifierLinear.describe(),
-            "drm-modifier=0x0-linear-transport"
-        );
-        assert_eq!(
-            CopiedSourcePlan::DrmModifierLinear.modifier(),
-            super::super::dri3::DRM_FORMAT_MOD_LINEAR
+            validate_copied_source_modifier(0xabcd, 0xef01),
+            Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED)
         );
     }
 

@@ -12395,7 +12395,7 @@ fn read_scanout_region(
     // KMS phase selection above is always against B's display pool, but the
     // composited pixels live in A's paired optimal target on a copied route.
     // Readback must therefore use that local image/staging allocation with A's
-    // live Vk context; the linear transport is not acquired or synchronized,
+    // live Vk context; the external transport is not acquired or synchronized,
     // while display, M2 retention, and pageflip retirement keep using B.
     let (image, staging_buffer, staging_mapped, copied_route) = match pool {
         crate::kms::vk::scanout::OutputScanout::Shared(pool) => {

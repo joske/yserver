@@ -8,13 +8,13 @@ endpoints:
 
 - output-owned shared: B allocates, A renders, B scans out;
 - renderer-owned shared: A allocates, A renders, B scans out;
-- copied: A renders an optimal local target, copies it into a linear external
-  transport, then renderer B copies that transport into an independent B-local
-  scanout destination.
+- copied: A renders an optimal local target, copies it into an explicit
+  DRM-modifier external transport, then renderer B copies that transport into
+  an independent B-local scanout destination.
 
 Copy removes the requirement that one allocation be both renderable by A and
 scannable by B. It still requires a Vulkan renderer associated unambiguously
-with B and capable of importing A's linear DMA-BUF transport as a transfer
+with B and capable of importing A's DMA-BUF transport as a transfer
 source with its exact offset and pitch. CPU readback/upload is not a scanout
 transport fallback.
 
@@ -25,7 +25,7 @@ Copy is transport, not a third `ScanoutOwnership`. One output owns:
 ```text
 OutputScanout
   Shared(ScanoutBoPool)          owner = Output | Renderer
-  Copied(CopiedScanoutPool)      optimal A -> linear A/B -> destination B -> KMS B
+  Copied(CopiedScanoutPool)      optimal A -> external A/B -> destination B -> KMS B
 ```
 
 The outer `ScanoutRoute` always identifies the selected `RenderDeviceId` A
@@ -42,7 +42,7 @@ ambiguous, or display-only B endpoints make copied scanout unavailable; they
 never trigger generic Vulkan scoring or a first-node fallback.
 
 Both logical devices must expose and enable `VK_EXT_queue_family_foreign`.
-The linear A/B transport is an exclusive external-memory allocation shared by
+The A/B transport is an exclusive external-memory allocation shared by
 distinct devices/drivers, so its ownership transfers use
 `VK_QUEUE_FAMILY_FOREIGN_EXT`; `VK_QUEUE_FAMILY_EXTERNAL` is not a substitute
 because it is limited to queues from the same physical device and driver.
@@ -50,14 +50,19 @@ Missing foreign-family support removes copied candidates without making the
 selected live renderer globally fatal.
 
 Both contexts must also expose `VK_EXT_image_drm_format_modifier`. Renderer A
-creates `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` from the singleton modifier
-list `[DRM_FORMAT_MOD_LINEAR]` with exactly `TRANSFER_DST` usage; renderer B
-imports that same explicit modifier, offset, and row pitch as a distinct local
-image with exactly `TRANSFER_SRC` usage. Copied DMA-BUF transport never uses
+enumerates its `B8G8R8A8_UNORM` modifier list and retains a nonzero modifier
+only when A can export it as a one-plane DMA-BUF with exactly `TRANSFER_DST`
+usage and B can import the same one-plane modifier with exactly `TRANSFER_SRC`
+usage. Mutually supported native modifiers retain A's advertised order;
+explicit `DRM_FORMAT_MOD_LINEAR` is queried independently and appended as the
+final transport fallback. Every allocation uses
+`VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` with a singleton modifier list, and B
+imports that exact modifier, offset, and row pitch. Copied transport never uses
 implicit `VK_IMAGE_TILING_LINEAR`: RADV can reject that external-image query
-while supporting the equivalent explicit modifier-0 contract. A's optimal
-color-attachment target is not external and never changes queue-family
-ownership.
+while supporting the equivalent explicit modifier-0 contract. The transport
+is not intersected with KMS plane modifiers because it is never scanned out.
+A's optimal color-attachment target is not external and never changes
+queue-family ownership.
 
 Legacy DRI3 imports have the same layout-description limit but a narrower
 topology gate. If the selected renderer exposes the modifier extension, DRI3
@@ -76,14 +81,17 @@ Each copied candidate is a persisted pair:
 
 ```text
 CopiedScanoutPlan {
-  source: A linear external transport,
+  source: one exact A/B external transport modifier,
   destination: one existing exact B-local ScanoutAllocationPlan,
 }
 ```
 
-Destination order remains the established GBM-first then renderer-owned
-modifier/linear order; the singleton linear transport is paired with each
-destination without changing that order. The
+Candidate order has three global layers: all copy-free plans first; then the
+copied native tier; then the copied explicit-LINEAR tier. Within the native
+tier, destinations retain the established GBM-first then renderer-owned
+modifier/linear order and each destination is paired with native source
+modifiers in A's stable advertised order. The LINEAR tier pairs modifier 0
+with those destinations in the same established order. The
 probe creates fresh exact disposable logical devices for both A and B,
 allocates a complete three-slot pool with one plan pair, and first validates
 every destination framebuffer with a full connector/CRTC/primary-plane atomic
@@ -94,9 +102,9 @@ The first cycle performs:
    full-extent radial hue-and-luminance pattern. It desaturates smoothly toward
    every rectangular edge and includes coordinate-coded low bits, edge rails,
    and asymmetric exact-color corner fiducials;
-2. an optional FOREIGN-to-A acquire of the linear transport, separate local
-   target/transport transitions, a full optimal-to-linear copy, local returns
-   to `GENERAL`, then a separate linear-transport A-to-FOREIGN release and
+2. an optional FOREIGN-to-A acquire of the external transport, separate local
+   target/transport transitions, a full optimal-to-transport copy, local
+   returns to `GENERAL`, then a separate transport A-to-FOREIGN release and
    export of A's completion as a `sync_file`. A also copies its still-local
    optimal target into a tightly packed host-visible BGRA buffer without
    reacquiring or reading the external transport;
@@ -112,7 +120,7 @@ The first cycle performs:
 
 Cycle two changes the pattern token, imports B's retained return completion
 into a fresh temporary A semaphore, waits it, and executes FOREIGN-to-A on the
-linear transport before another target-to-transport copy/release/readback.
+external transport before another target-to-transport copy/release/readback.
 Repeating the first renderer hash is rejected, so matching stale frames on both
 devices cannot pass merely by matching each other. The optimal target stays
 A-local in both cycles. `TEST_ONLY` does not make KMS an ownership participant,
@@ -122,7 +130,7 @@ KMS-to-B return leg is reserved for a live two-flip hardware smoke test and is
 never fabricated by the probe.
 
 The CPU readbacks are setup-time validation only, not a CPU transport fallback
-in the live frame path. They prove the Vulkan-visible render, linearization,
+in the live frame path. They prove the Vulkan-visible render, transport copy,
 DMA-BUF import, and B copy chain. They cannot prove that the display engine
 will interpret GBM/KMS pitch, offset, and modifier metadata identically; atomic
 `TEST_ONLY` plus a live two-flip visual, writeback, or CRTC-CRC smoke remains the
@@ -193,7 +201,7 @@ submission, and is cleared by failed-cycle recovery and lifecycle reset.
 ## Failure and lifetime invariants
 
 - At most one frame per output waits for A or a KMS flip.
-- A's linear transport is never overwritten while B may still read it; the
+- A's external transport is never overwritten while B may still read it; the
   optimal target itself remains renderer-local.
 - B is never written while pending or on screen.
 - Completion registration failure keeps the destination reserved and defers
@@ -208,7 +216,7 @@ submission, and is cleared by failed-cycle recovery and lifecycle reset.
   damage forward with retry backoff. This base recovery is safe but may block
   on a wedged driver.
 - Failure to prove quiescence quarantines and disarms both sides; Drop leaks
-  the B alias, A linear backing, A optimal target, and uncertain scanout
+  the B alias, A transport backing, A optimal target, and uncertain scanout
   resources rather than freeing GPU-referenced memory.
 - Live A or B device loss is fatal. Disposable probe failure advances to the
   next exact pair with fresh contexts.
@@ -231,7 +239,7 @@ submission, and is cleared by failed-cycle recovery and lifecycle reset.
 ## Initial performance and follow-up boundary
 
 Copied scanout renders and copies the full output twice on the GPU: optimal A
-target to linear transport, then B's imported transport alias to its scanout
+target to the selected transport, then B's imported transport alias to its scanout
 destination. The scene already uses full repaint, so this adds no buffer-age
 dependency. Candidate setup additionally reads and compares both full images
 for all three slots and two cycles; live frames do not perform this CPU work.

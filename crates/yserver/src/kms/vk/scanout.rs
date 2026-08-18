@@ -85,7 +85,7 @@ use crate::kms::scanout_route::{RenderKmsRelationship, ScanoutRoute};
 
 pub(crate) use super::target::CopiedSourcePlan;
 
-/// Exact usage of GPU B's imported alias of A's linear transport. Keep this
+/// Exact usage of GPU B's imported alias of A's DMA-BUF transport. Keep this
 /// single value shared by the capability query and actual import.
 const COPIED_SINK_IMPORT_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::TRANSFER_SRC;
 
@@ -700,13 +700,13 @@ impl CopiedScanoutPlan {
     }
 }
 
-/// Renderer A's local optimal compose target, its linear DMA-BUF transport,
+/// Renderer A's local optimal compose target, its DMA-BUF transport,
 /// and GPU B's imported transfer-source alias. The sink alias is declared
-/// first, then the linear backing, so both aliases drop before their storage;
+/// first, then the transport backing, so both aliases drop before their storage;
 /// the independent local target drops last.
 pub(crate) struct CopiedRenderSource {
     imported_on_sink: Option<DrawableImage>,
-    linear_on_renderer: Option<ExportableImage>,
+    transport_on_renderer: Option<ExportableImage>,
     render_target: Option<DrawableImage>,
     pub(crate) completion_semaphore: vk::Semaphore,
     completion_semaphore_reuse: ExportSemaphoreReuseState,
@@ -730,7 +730,7 @@ impl CopiedRenderSource {
         height: u32,
         plan: CopiedSourcePlan,
     ) -> io::Result<Self> {
-        let linear_on_renderer = allocate_copied_source_exact(
+        let transport_on_renderer = allocate_copied_source_exact(
             &render_vk,
             width,
             height,
@@ -738,8 +738,8 @@ impl CopiedRenderSource {
             plan,
         )
         .map_err(|result| scanout_vk_error("allocate exact copied source", result))?;
-        let exported = super::dri3::export_backing(&render_vk, &linear_on_renderer)
-            .map_err(|result| scanout_vk_error("export copied linear transport DMA-BUF", result))?;
+        let exported = super::dri3::export_backing(&render_vk, &transport_on_renderer)
+            .map_err(|result| scanout_vk_error("export copied transport DMA-BUF", result))?;
         let imported_on_sink = DrawableImage::from_dmabuf_with_usage(
             Arc::clone(&sink_vk),
             exported.fd,
@@ -747,8 +747,8 @@ impl CopiedRenderSource {
             height,
             vk::Format::B8G8R8A8_UNORM,
             exported.modifier,
-            &[linear_on_renderer.offset],
-            &[linear_on_renderer.stride],
+            &[transport_on_renderer.offset],
+            &[transport_on_renderer.stride],
             COPIED_SINK_IMPORT_USAGE,
         )
         .map_err(|error| copied_drawable_error("import copied transport on sink", error))?;
@@ -777,7 +777,7 @@ impl CopiedRenderSource {
 
         Ok(Self {
             imported_on_sink: Some(imported_on_sink),
-            linear_on_renderer: Some(linear_on_renderer),
+            transport_on_renderer: Some(transport_on_renderer),
             render_target: Some(render_target),
             completion_semaphore,
             completion_semaphore_reuse: ExportSemaphoreReuseState::Reusable,
@@ -811,10 +811,10 @@ impl CopiedRenderSource {
     }
 
     #[must_use]
-    fn linear_image(&self) -> vk::Image {
-        self.linear_on_renderer
+    fn transport_image(&self) -> vk::Image {
+        self.transport_on_renderer
             .as_ref()
-            .expect("live copied source has linear transport")
+            .expect("live copied source has DMA-BUF transport")
             .image
     }
 
@@ -873,7 +873,7 @@ impl CopiedRenderSource {
     }
 
     /// Import renderer B's retained completion before recording an overwrite
-    /// of the reused linear transport. The subsequent preflight determines
+    /// of the reused DMA-BUF transport. The subsequent preflight determines
     /// whether the command buffer records a FOREIGN -> A acquire barrier.
     pub(crate) fn prepare_renderer_acquire(&mut self) -> io::Result<()> {
         match self.ownership {
@@ -925,7 +925,7 @@ impl CopiedRenderSource {
     /// Confirm that renderer A's local optimal target contains a completed or
     /// queue-ordered compose suitable for readback. The target never crosses
     /// devices, so this deliberately does not consume B's retained completion
-    /// or mutate linear-transport ownership.
+    /// or mutate transport ownership.
     pub(crate) fn validate_renderer_readback(&self) -> io::Result<()> {
         self.render_target_contents.validate_readback()
     }
@@ -1045,13 +1045,13 @@ impl CopiedRenderSource {
             .vk_image
     }
 
-    /// Record renderer A's post-compose optimal-to-linear transport copy.
+    /// Record renderer A's post-compose copy into the selected transport.
     ///
     /// Queue-family ownership barriers and local layout transitions are kept
     /// in separate commands because overlapping transitions for one image in
-    /// a single dependency info are not sequential. Only the linear transport
+    /// a single dependency info are not sequential. Only the DMA-BUF transport
     /// crosses FOREIGN; the optimal target remains renderer-local in GENERAL.
-    pub(crate) fn record_linearization(
+    pub(crate) fn record_transport_copy(
         &self,
         command_buffer: vk::CommandBuffer,
         preparation: CopiedTransportPreparation,
@@ -1068,7 +1068,7 @@ impl CopiedRenderSource {
                     .dst_queue_family_index(self.render_vk.graphics_queue_family)
                     .old_layout(vk::ImageLayout::GENERAL)
                     .new_layout(vk::ImageLayout::GENERAL)
-                    .image(self.linear_image())
+                    .image(self.transport_image())
                     .subresource_range(color_subresource_range())];
                 device.cmd_pipeline_barrier2(
                     command_buffer,
@@ -1101,7 +1101,7 @@ impl CopiedRenderSource {
                     .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
                     .old_layout(preparation.local_old_layout)
                     .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .image(self.linear_image())
+                    .image(self.transport_image())
                     .subresource_range(color_subresource_range()),
             ];
             device.cmd_pipeline_barrier2(
@@ -1122,7 +1122,7 @@ impl CopiedRenderSource {
                 &vk::CopyImageInfo2::default()
                     .src_image(self.image())
                     .src_image_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                    .dst_image(self.linear_image())
+                    .dst_image(self.transport_image())
                     .dst_image_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                     .regions(&regions),
             );
@@ -1144,7 +1144,7 @@ impl CopiedRenderSource {
                     .dst_access_mask(vk::AccessFlags2::MEMORY_READ)
                     .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                     .new_layout(vk::ImageLayout::GENERAL)
-                    .image(self.linear_image())
+                    .image(self.transport_image())
                     .subresource_range(color_subresource_range()),
             ];
             device.cmd_pipeline_barrier2(
@@ -1161,7 +1161,7 @@ impl CopiedRenderSource {
                 .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
                 .old_layout(vk::ImageLayout::GENERAL)
                 .new_layout(vk::ImageLayout::GENERAL)
-                .image(self.linear_image())
+                .image(self.transport_image())
                 .subresource_range(color_subresource_range())];
             device.cmd_pipeline_barrier2(
                 command_buffer,
@@ -1172,8 +1172,8 @@ impl CopiedRenderSource {
 
     /// Copy the renderer-local optimal target into this source's tightly
     /// packed host-visible probe buffer. The caller records this only after
-    /// [`Self::record_linearization`], while the target is back in `GENERAL`.
-    /// The linear transport remains FOREIGN-owned and is deliberately not
+    /// [`Self::record_transport_copy`], while the target is back in `GENERAL`.
+    /// The DMA-BUF transport remains FOREIGN-owned and is deliberately not
     /// touched by this diagnostic readback.
     fn record_probe_readback(&self, command_buffer: vk::CommandBuffer) {
         let device = &self.render_vk.device;
@@ -1233,7 +1233,7 @@ impl CopiedRenderSource {
             return;
         }
         leak_owned_backing(&mut self.imported_on_sink);
-        leak_owned_backing(&mut self.linear_on_renderer);
+        leak_owned_backing(&mut self.transport_on_renderer);
         leak_owned_backing(&mut self.render_target);
         std::mem::forget(Arc::clone(&self.render_vk));
         std::mem::forget(Arc::clone(&self.sink_vk));
@@ -1274,9 +1274,10 @@ pub(crate) struct CopiedScanoutPool {
 }
 
 impl CopiedScanoutPool {
-    /// Enumerate exact copied candidates without changing the established
-    /// destination allocator order. Each destination plan is the outer loop;
-    /// copied-source representations are tried in stable order within it.
+    /// Enumerate exact copied candidates in transport tiers. All mutually
+    /// supported native transport modifiers are exhausted before explicit
+    /// LINEAR; within each tier the established destination allocator order
+    /// remains authoritative.
     #[must_use]
     pub(crate) fn exact_allocation_plans(
         render_vk: &VkContext,
@@ -3398,7 +3399,7 @@ fn submit_copied_source_probe(
         );
         pattern.record(command_buffer, source.width(), source.height(), frame_token);
         device.cmd_end_rendering(command_buffer);
-        source.record_linearization(command_buffer, transport_preparation);
+        source.record_transport_copy(command_buffer, transport_preparation);
         source.record_probe_readback(command_buffer);
         device
             .end_command_buffer(command_buffer)
@@ -4189,46 +4190,121 @@ fn modifier_single_plane_supports_feature(
         && drm_modifier_plane_count(vk, modifier) == Some(1)
 }
 
-fn exact_copied_source_plans(render_vk: &VkContext, sink_vk: &VkContext) -> Vec<CopiedSourcePlan> {
-    let plan = CopiedSourcePlan::DrmModifierLinear;
-    let modifier = plan.modifier();
-    let renderer_linear = modifier_single_plane_supports_feature(
-        render_vk,
-        modifier,
-        COPIED_TRANSPORT_IMAGE_USAGE,
-        vk::ExternalMemoryFeatureFlags::EXPORTABLE,
-    );
-    // Both sides use the explicit DRM-modifier path, including modifier 0.
-    // Their queries must match their actual narrow usages; silently falling
-    // back to non-explicit linear images would admit an A/B pair whose foreign
-    // pitch cannot be represented reliably.
-    let sink_linear = modifier_single_plane_supports_feature(
-        sink_vk,
-        modifier,
-        COPIED_SINK_IMPORT_USAGE,
-        vk::ExternalMemoryFeatureFlags::IMPORTABLE,
-    );
-
-    if renderer_linear && sink_linear {
-        vec![plan]
-    } else {
-        Vec::new()
+fn advertised_drm_modifiers(vk: &VkContext) -> Vec<u64> {
+    if !vk.image_drm_format_modifier {
+        return Vec::new();
     }
+
+    let modifier_count = {
+        let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
+        let mut format_props = vk::FormatProperties2::default().push_next(&mut list);
+        unsafe {
+            vk.instance.get_physical_device_format_properties2(
+                vk.physical_device,
+                vk::Format::B8G8R8A8_UNORM,
+                &mut format_props,
+            );
+        }
+        list.drm_format_modifier_count
+    };
+    if modifier_count == 0 {
+        return Vec::new();
+    }
+
+    let mut props_storage =
+        vec![vk::DrmFormatModifierPropertiesEXT::default(); modifier_count as usize];
+    let mut list = vk::DrmFormatModifierPropertiesListEXT::default()
+        .drm_format_modifier_properties(&mut props_storage);
+    let mut format_props = vk::FormatProperties2::default().push_next(&mut list);
+    unsafe {
+        vk.instance.get_physical_device_format_properties2(
+            vk.physical_device,
+            vk::Format::B8G8R8A8_UNORM,
+            &mut format_props,
+        );
+    }
+
+    let entries = list.drm_format_modifier_count as usize;
+    let mut modifiers = Vec::new();
+    for property in props_storage.iter().take(entries) {
+        if !modifiers.contains(&property.drm_format_modifier) {
+            modifiers.push(property.drm_format_modifier);
+        }
+    }
+    modifiers
+}
+
+fn order_copied_source_plans(
+    renderer_modifiers: &[u64],
+    mut supports_pair: impl FnMut(u64) -> bool,
+) -> Vec<CopiedSourcePlan> {
+    let linear = super::dri3::DRM_FORMAT_MOD_LINEAR;
+    let mut plans: Vec<CopiedSourcePlan> = Vec::new();
+
+    // Native modifiers retain renderer A's advertised order. Modifier 0 is
+    // deliberately excluded from this tier even if the driver lists it amid
+    // native layouts.
+    for &modifier in renderer_modifiers {
+        if modifier != linear
+            && !plans.iter().any(|plan| plan.modifier() == modifier)
+            && supports_pair(modifier)
+        {
+            plans.push(CopiedSourcePlan::DrmModifier(modifier));
+        }
+    }
+
+    // Query explicit modifier 0 independently and append it exactly once.
+    // This keeps LINEAR out of the native ordering regardless of where the
+    // driver places it in the advertised list.
+    if supports_pair(linear) {
+        plans.push(CopiedSourcePlan::DrmModifier(linear));
+    }
+    plans
+}
+
+fn exact_copied_source_plans(render_vk: &VkContext, sink_vk: &VkContext) -> Vec<CopiedSourcePlan> {
+    let advertised = advertised_drm_modifiers(render_vk);
+    let plans = order_copied_source_plans(&advertised, |modifier| {
+        modifier_single_plane_supports_feature(
+            render_vk,
+            modifier,
+            COPIED_TRANSPORT_IMAGE_USAGE,
+            vk::ExternalMemoryFeatureFlags::EXPORTABLE,
+        ) && modifier_single_plane_supports_feature(
+            sink_vk,
+            modifier,
+            COPIED_SINK_IMPORT_USAGE,
+            vk::ExternalMemoryFeatureFlags::IMPORTABLE,
+        )
+    });
+    let candidates = plans.iter().map(|plan| plan.modifier()).collect::<Vec<_>>();
+    log::info!(
+        "copied transport modifier select: renderer_advertised={} -> native_then_linear={}",
+        format_modifiers(&advertised),
+        format_modifiers(&candidates),
+    );
+    plans
 }
 
 fn assemble_copied_scanout_plans(
     destinations: &[ScanoutAllocationPlan],
     sources: &[CopiedSourcePlan],
 ) -> Vec<CopiedScanoutPlan> {
-    destinations
-        .iter()
-        .flat_map(|&destination| {
-            sources.iter().map(move |&source| CopiedScanoutPlan {
-                source,
-                destination,
-            })
-        })
-        .collect()
+    let mut plans = Vec::new();
+    for linear_tier in [false, true] {
+        for &destination in destinations {
+            for &source in sources
+                .iter()
+                .filter(|source| source.is_linear() == linear_tier)
+            {
+                plans.push(CopiedScanoutPlan {
+                    source,
+                    destination,
+                });
+            }
+        }
+    }
+    plans
 }
 
 fn validate_copied_route_pair(
@@ -5309,28 +5385,71 @@ mod tests {
     }
 
     #[test]
-    fn copied_plan_cartesian_order_keeps_destination_allocator_authoritative() {
+    fn copied_source_candidates_dedupe_native_and_append_linear_once() {
+        let advertised = [LINEAR, TILED_A, TILED_B, TILED_A, LINEAR];
+        assert_eq!(
+            order_copied_source_plans(&advertised, |_| true),
+            vec![
+                CopiedSourcePlan::DrmModifier(TILED_A),
+                CopiedSourcePlan::DrmModifier(TILED_B),
+                CopiedSourcePlan::DrmModifier(LINEAR),
+            ]
+        );
+    }
+
+    #[test]
+    fn copied_source_candidates_filter_unsupported_pairs_and_keep_native_only() {
+        let advertised = [TILED_A, TILED_B];
+        assert_eq!(
+            order_copied_source_plans(&advertised, |modifier| modifier == TILED_B),
+            vec![CopiedSourcePlan::DrmModifier(TILED_B)]
+        );
+        assert_eq!(
+            order_copied_source_plans(&[], |modifier| modifier == LINEAR),
+            vec![CopiedSourcePlan::DrmModifier(LINEAR)]
+        );
+    }
+
+    #[test]
+    fn copied_plan_order_exhausts_native_tier_before_linear() {
         let destinations = [
             ScanoutAllocationPlan::GbmModifier(TILED_A),
             ScanoutAllocationPlan::DrmModifier(TILED_B),
-            ScanoutAllocationPlan::LegacyLinear,
         ];
-        let sources = [CopiedSourcePlan::DrmModifierLinear];
+        // Deliberately place LINEAR first: assembly must enforce tiers rather
+        // than trusting its caller's input order.
+        let sources = [
+            CopiedSourcePlan::DrmModifier(LINEAR),
+            CopiedSourcePlan::DrmModifier(TILED_A),
+            CopiedSourcePlan::DrmModifier(TILED_B),
+        ];
 
         assert_eq!(
             assemble_copied_scanout_plans(&destinations, &sources),
             vec![
                 CopiedScanoutPlan {
-                    source: CopiedSourcePlan::DrmModifierLinear,
+                    source: CopiedSourcePlan::DrmModifier(TILED_A),
                     destination: ScanoutAllocationPlan::GbmModifier(TILED_A),
                 },
                 CopiedScanoutPlan {
-                    source: CopiedSourcePlan::DrmModifierLinear,
+                    source: CopiedSourcePlan::DrmModifier(TILED_B),
+                    destination: ScanoutAllocationPlan::GbmModifier(TILED_A),
+                },
+                CopiedScanoutPlan {
+                    source: CopiedSourcePlan::DrmModifier(TILED_A),
                     destination: ScanoutAllocationPlan::DrmModifier(TILED_B),
                 },
                 CopiedScanoutPlan {
-                    source: CopiedSourcePlan::DrmModifierLinear,
-                    destination: ScanoutAllocationPlan::LegacyLinear,
+                    source: CopiedSourcePlan::DrmModifier(TILED_B),
+                    destination: ScanoutAllocationPlan::DrmModifier(TILED_B),
+                },
+                CopiedScanoutPlan {
+                    source: CopiedSourcePlan::DrmModifier(LINEAR),
+                    destination: ScanoutAllocationPlan::GbmModifier(TILED_A),
+                },
+                CopiedScanoutPlan {
+                    source: CopiedSourcePlan::DrmModifier(LINEAR),
+                    destination: ScanoutAllocationPlan::DrmModifier(TILED_B),
                 },
             ]
         );
@@ -5339,7 +5458,7 @@ mod tests {
     #[test]
     fn copied_plan_is_transport_not_a_third_allocation_owner() {
         let plan = CopiedScanoutPlan {
-            source: CopiedSourcePlan::DrmModifierLinear,
+            source: CopiedSourcePlan::DrmModifier(TILED_A),
             destination: ScanoutAllocationPlan::GbmModifier(TILED_B),
         };
 
@@ -5347,7 +5466,7 @@ mod tests {
         assert_eq!(
             plan.describe(),
             format!(
-                "source-drm-modifier=0x0-linear-transport -> destination-gbm-modifier=0x{TILED_B:x}"
+                "source-drm-modifier=0x{TILED_A:x}-native-transport -> destination-gbm-modifier=0x{TILED_B:x}"
             )
         );
     }
