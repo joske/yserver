@@ -19,8 +19,8 @@ use std::{
 use ::drm::control::{Device as _, connector};
 
 pub(crate) use crate::drm::modeset::{
-    ConnectorProbe, ConnectorSnapshotProbe, Mode, Output, discover_output_for_connector,
-    discover_outputs, probe_connector_snapshots, probe_connectors,
+    ConnectorProbe, ConnectorSnapshotProbe, Mode, ModeIdentity, Output,
+    discover_output_for_connector, discover_outputs, probe_connector_snapshots, probe_connectors,
 };
 
 const DRM_DIR: &str = "/dev/dri";
@@ -209,7 +209,7 @@ fn discover_kms_candidates() -> io::Result<(Vec<KmsCardCandidate>, Vec<String>)>
         };
         let has_connected_connector = resources.connectors().iter().any(|&handle| {
             device
-                .get_connector(handle, false)
+                .get_connector(handle, true)
                 .is_ok_and(|info| info.state() == connector::State::Connected)
         });
         log::info!(

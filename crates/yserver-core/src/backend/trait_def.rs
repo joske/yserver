@@ -496,10 +496,13 @@ pub trait Backend {
 
     /// Force a connector re-probe (RANDR `GetScreenResources`,
     /// `force_query=TRUE` in Xorg `RRGetInfo`). Re-reads connection
-    /// state + mode lists into the registry WITHOUT changing any
-    /// enabled output's config, and rebuilds `state.randr`. Bumps
-    /// `config_timestamp` ONLY when connection state / mode lists
-    /// changed; leaves both timestamps untouched on a no-op probe.
+    /// state and mode lists into the registry WITHOUT changing any enabled
+    /// output's config or running full KMS assignment/property discovery.
+    /// Physical topology boundaries separately refresh heavier identity
+    /// metadata. Publishes scoped RANDR output changes when connection, modes,
+    /// or invalidated monitor identity changes; bumps `config_timestamp` only
+    /// for connection/mode-list changes and leaves `timestamp` untouched.
+    /// A no-op probe leaves both timestamps untouched.
     /// `Err` is surfaced by the handler as `BadAlloc`. Default
     /// `Ok(())` no-op for fixed-topology backends (ynest, recording).
     fn reprobe_connectors(&mut self, _state: &mut ServerState) -> io::Result<()> {

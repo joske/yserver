@@ -1801,12 +1801,13 @@ pub(crate) fn notify_randr_layout_changed(state: &mut ServerState, changed_outpu
     const RANDR_FIRST_EVENT: u8 = 89;
 
     let timestamp = state.randr.timestamp;
+    let config_timestamp = state.randr.config_timestamp;
     let width = state.randr.screen_width;
     let height = state.randr.screen_height;
     let width_mm = u16::try_from(state.randr.width_mm).unwrap_or(u16::MAX);
     let height_mm = u16::try_from(state.randr.height_mm).unwrap_or(u16::MAX);
     // Resolve each changed output's current crtc/mode for the notify payload.
-    let changed: Vec<(u32, u32, u32)> = changed_outputs
+    let changed: Vec<(u32, u32, u32, u8)> = changed_outputs
         .iter()
         .filter_map(|id| {
             state
@@ -1814,7 +1815,18 @@ pub(crate) fn notify_randr_layout_changed(state: &mut ServerState, changed_outpu
                 .outputs
                 .iter()
                 .find(|o| o.output_id == *id)
-                .map(|o| (o.output_id, o.crtc_id, o.mode_id))
+                .map(|o| {
+                    (
+                        o.output_id,
+                        if o.mode_id != 0 { o.crtc_id } else { 0 },
+                        o.mode_id,
+                        if o.connected {
+                            x11randr::CONNECTION_CONNECTED
+                        } else {
+                            x11randr::CONNECTION_DISCONNECTED
+                        },
+                    )
+                })
         })
         .collect();
 
@@ -1835,7 +1847,7 @@ pub(crate) fn notify_randr_layout_changed(state: &mut ServerState, changed_outpu
                 sequence,
                 x11randr::ScreenChangeNotify {
                     timestamp,
-                    config_timestamp: timestamp,
+                    config_timestamp,
                     root: crate::resources::ROOT_WINDOW.0,
                     request_window: request_window.0,
                     width,
@@ -1852,18 +1864,19 @@ pub(crate) fn notify_randr_layout_changed(state: &mut ServerState, changed_outpu
             let _ = client_io::write_or_buffer(client, &event);
         }
         if mask & x11randr::NOTIFY_MASK_OUTPUT_CHANGE != 0 {
-            for &(output, crtc, mode) in &changed {
+            for &(output, crtc, mode, connection) in &changed {
                 let event = x11randr::encode_output_change_notify_event(
                     client.byte_order,
                     RANDR_FIRST_EVENT,
                     sequence,
                     x11randr::OutputChangeNotify {
                         timestamp,
-                        config_timestamp: timestamp,
+                        config_timestamp,
                         request_window: request_window.0,
                         output,
                         crtc,
                         mode,
+                        connection,
                     },
                 );
                 crate::core_loop::fanout::record_outbound_telemetry(
@@ -2149,12 +2162,7 @@ pub(crate) fn enabled_output_bbox(state: &ServerState) -> Option<(u16, u16)> {
     let mut any = false;
     let mut max_x = 0i32;
     let mut max_y = 0i32;
-    for output in state
-        .randr
-        .outputs
-        .iter()
-        .filter(|o| o.connected && o.mode_id != 0)
-    {
+    for output in state.randr.outputs.iter().filter(|o| o.mode_id != 0) {
         any = true;
         max_x = max_x.max(i32::from(output.x).saturating_add(i32::from(output.width)));
         max_y = max_y.max(i32::from(output.y).saturating_add(i32::from(output.height)));
@@ -2169,12 +2177,34 @@ pub(crate) fn enabled_output_bbox(state: &ServerState) -> Option<(u16, u16)> {
 
 /// Fan out RANDR change notifications for a topology/geometry change.
 pub fn emit_randr_change_notifications(state: &mut ServerState, changed: &[(u32, u32, u32)]) {
+    emit_randr_change_notifications_split(state, changed, changed);
+}
+
+/// Fan out a connector-registry change while allowing Output-only changes to
+/// remain distinct from changes to current CRTC assignment or geometry.
+/// The dirty sets are independent: a recompact can move a surviving CRTC
+/// without changing its output association, while a mode-list or connection
+/// refresh can dirty only an Output.
+pub fn emit_randr_connector_change_notifications(
+    state: &mut ServerState,
+    crtc_changed: &[(u32, u32, u32)],
+    output_changed: &[(u32, u32, u32)],
+) {
+    emit_randr_change_notifications_split(state, crtc_changed, output_changed);
+}
+
+fn emit_randr_change_notifications_split(
+    state: &mut ServerState,
+    crtc_changed: &[(u32, u32, u32)],
+    output_changed: &[(u32, u32, u32)],
+) {
     use std::sync::atomic::Ordering;
     use yserver_protocol::x11::{SequenceNumber, randr as x11randr};
 
     const RANDR_FIRST_EVENT: u8 = 89;
 
     let timestamp = state.randr.timestamp;
+    let config_timestamp = state.randr.config_timestamp;
     let width = state.randr.screen_width;
     let height = state.randr.screen_height;
     let width_mm = u16::try_from(state.randr.width_mm).unwrap_or(u16::MAX);
@@ -2188,6 +2218,28 @@ pub fn emit_randr_change_notifications(state: &mut ServerState, changed: &[(u32,
         .outputs
         .iter()
         .map(|o| (o.crtc_id, (o.x, o.y, o.width, o.height)))
+        .collect();
+    let output_states: std::collections::HashMap<u32, (u8, u32)> = state
+        .randr
+        .outputs
+        .iter()
+        .map(|output| {
+            (
+                output.output_id,
+                (
+                    if output.connected {
+                        x11randr::CONNECTION_CONNECTED
+                    } else {
+                        x11randr::CONNECTION_DISCONNECTED
+                    },
+                    if output.mode_id != 0 {
+                        output.crtc_id
+                    } else {
+                        0
+                    },
+                ),
+            )
+        })
         .collect();
 
     let subscribers: Vec<(u32, yserver_protocol::x11::ResourceId, u16)> = state
@@ -2207,7 +2259,7 @@ pub fn emit_randr_change_notifications(state: &mut ServerState, changed: &[(u32,
                 sequence,
                 x11randr::ScreenChangeNotify {
                     timestamp,
-                    config_timestamp: timestamp,
+                    config_timestamp,
                     root: crate::resources::ROOT_WINDOW.0,
                     request_window: request_window.0,
                     width,
@@ -2223,9 +2275,11 @@ pub fn emit_randr_change_notifications(state: &mut ServerState, changed: &[(u32,
             );
             let _ = client_io::write_or_buffer(client, &event);
         }
-        for &(output, crtc, mode) in changed {
-            let (x, y, crtc_w, crtc_h) = crtc_geom.get(&crtc).copied().unwrap_or((0, 0, 0, 0));
-            if mask & x11randr::NOTIFY_MASK_CRTC_CHANGE != 0 {
+        // Xorg fans out all dirty CRTCs before all dirty outputs for each
+        // subscriber; do not interleave the two event classes per output.
+        if mask & x11randr::NOTIFY_MASK_CRTC_CHANGE != 0 {
+            for &(_output, crtc, mode) in crtc_changed {
+                let (x, y, crtc_w, crtc_h) = crtc_geom.get(&crtc).copied().unwrap_or((0, 0, 0, 0));
                 let event = x11randr::encode_crtc_change_notify_event(
                     client.byte_order,
                     RANDR_FIRST_EVENT,
@@ -2248,18 +2302,25 @@ pub fn emit_randr_change_notifications(state: &mut ServerState, changed: &[(u32,
                 );
                 let _ = client_io::write_or_buffer(client, &event);
             }
-            if mask & x11randr::NOTIFY_MASK_OUTPUT_CHANGE != 0 {
+        }
+        if mask & x11randr::NOTIFY_MASK_OUTPUT_CHANGE != 0 {
+            for &(output, projected_crtc, projected_mode) in output_changed {
+                let (connection, current_crtc) = output_states
+                    .get(&output)
+                    .copied()
+                    .unwrap_or((x11randr::CONNECTION_CONNECTED, projected_crtc));
                 let event = x11randr::encode_output_change_notify_event(
                     client.byte_order,
                     RANDR_FIRST_EVENT,
                     sequence,
                     x11randr::OutputChangeNotify {
                         timestamp,
-                        config_timestamp: timestamp,
+                        config_timestamp,
                         request_window: request_window.0,
                         output,
-                        crtc,
-                        mode,
+                        crtc: current_crtc,
+                        mode: projected_mode,
+                        connection,
                     },
                 );
                 crate::core_loop::fanout::record_outbound_telemetry(
@@ -2689,6 +2750,78 @@ fn _hint(_: UnixStream) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn randr_change_fanout_orders_screen_then_all_crtcs_then_all_outputs() {
+        use crate::server::ClientState;
+        use std::{
+            collections::{HashMap, HashSet, VecDeque},
+            io::Read,
+            os::unix::net::UnixStream,
+            sync::{Arc, Mutex, atomic::AtomicU16},
+        };
+        use yserver_protocol::x11::{ClientByteOrder, randr as x11randr};
+
+        let mut state = ServerState::new();
+        let first = state.randr.outputs[0].clone();
+        let mut second = first.clone();
+        second.name = "HDMI-A-1".into();
+        second.output_id = first.output_id + 10;
+        second.crtc_id = first.crtc_id + 10;
+        state.randr.outputs.push(second.clone());
+
+        let (mut peer, writer) = UnixStream::pair().unwrap();
+        writer.set_nonblocking(true).unwrap();
+        state.clients.insert(
+            7,
+            ClientState {
+                writer: Arc::new(Mutex::new(writer)),
+                byte_order: ClientByteOrder::LittleEndian,
+                last_sequence: Arc::new(AtomicU16::new(9)),
+                resource_id_base: 0,
+                resource_id_mask: 0,
+                event_masks: HashMap::new(),
+                save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::new(),
+                xi1_event_classes: HashSet::new(),
+                xi1_window_event_classes: HashMap::new(),
+                outbound: VecDeque::new(),
+                watching_writable: false,
+                focused_window: crate::resources::ROOT_WINDOW,
+                reader_control: None,
+            },
+        );
+        state.randr_select_masks.insert(
+            (7, crate::resources::ROOT_WINDOW),
+            x11randr::NOTIFY_MASK_SCREEN_CHANGE
+                | x11randr::NOTIFY_MASK_CRTC_CHANGE
+                | x11randr::NOTIFY_MASK_OUTPUT_CHANGE,
+        );
+
+        emit_randr_connector_change_notifications(
+            &mut state,
+            &[(first.output_id, first.crtc_id, first.mode_id)],
+            &[(second.output_id, second.crtc_id, second.mode_id)],
+        );
+
+        let mut wire = [0; 96];
+        peer.read_exact(&mut wire).unwrap();
+        const RANDR_FIRST_EVENT: u8 = 89;
+        assert_eq!(wire[0] & 0x7f, RANDR_FIRST_EVENT);
+        assert_eq!(wire[32] & 0x7f, RANDR_FIRST_EVENT + 1);
+        assert_eq!(wire[33], x11randr::NOTIFY_CRTC_CHANGE);
+        assert_eq!(wire[64] & 0x7f, RANDR_FIRST_EVENT + 1);
+        assert_eq!(wire[65], x11randr::NOTIFY_OUTPUT_CHANGE);
+        assert_eq!(
+            u32::from_le_bytes(wire[44..48].try_into().unwrap()),
+            first.crtc_id
+        );
+        assert_eq!(
+            u32::from_le_bytes(wire[80..84].try_into().unwrap()),
+            second.output_id
+        );
+    }
 
     /// The count cap alone was sized on an assumption of ~0.25 ms per
     /// request (`MAX_REQUESTS_PER_ITER`'s own doc comment). Measured on

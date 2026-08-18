@@ -101,9 +101,41 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   identity, fixing the Xorg-style `HDMI-1` versus drm-rs `HDMI-A-1` mismatch.
   Equal raw connector handles on different DRM devices remain isolated by the
   device-qualified `OutputKey`. The requested kernel mode is still selected by the
-  existing width, height, and integer-refresh tuple; exact timing identity is
-  a separate concern. Focused tests cover name-independent handle lookup,
-  device-local raw-handle collisions, and query-error propagation.
+  existing width, height, and integer-refresh tuple. Global RANDR mode XIDs now
+  distinguish exact client-visible timings across outputs and monitor
+  replacements, while connector-local same-tuple timings remain nominally
+  collapsed because the request path cannot select between them yet. Focused
+  tests cover name-independent handle lookup, device-local raw-handle
+  collisions, and query-error propagation.
+- **2026-08-18 authoritative RANDR connector metadata:** the stable,
+  device-qualified connector registry now owns full advertised DRM modes,
+  EDID, physical dimensions, and connector type. Startup keeps a lightweight
+  all-connector inventory for disconnected output XIDs, then a forced heavy
+  snapshot authoritatively seeds connection and monitor identity; debounced
+  hotplug and VT resume use the same heavy snapshot. Heavy metadata-only
+  changes preserve `lastSetTime`, update only the dirty Output resources, and
+  do not emit CRTC events. Connection or mode-list changes advance only
+  `lastConfigTime`; asynchronous topology handling never advances
+  `lastSetTime`.
+
+  Forced `GetScreenResources` deliberately retains the later lightweight
+  connector query (`get_connector(..., false)`), so it updates connection and
+  modes without full assignment/property discovery. It may invalidate stale
+  EDID/dimensions, immediately publishes Screen plus only dirty Output events,
+  and never detaches a live CRTC or clears client layout policy. Thus a light
+  disconnect reports `RR_Disconnected` while retaining the current CRTC/mode
+  until the heavy physical boundary turns it Off and emits the scoped CRTC
+  transition. A same-mode EDID-only replacement remains intentionally
+  undetectable until that heavy boundary. Output/CRTC XIDs stay stable,
+  disconnected notifications carry the real connection byte, and a programmed
+  timing omitted by a replacement monitor remains in ScreenResources until it
+  is replaced. Per-connector mode exposure still collapses the nominal
+  `(width,height,integer refresh)` tuple because `SetCrtcConfig` has not yet
+  grown an exact-timing selector. Validation covers focused connector-registry,
+  exact-mode, notification-order, timestamp, and light/heavy lifecycle
+  regressions plus the full workspace test suite, strict all-target Clippy,
+  nightly formatting, and diff checks; live hotplug/EDID-replacement hardware
+  smoke remains pending.
 - **2026-08-18 ordered multi-KMS override:** `YSERVER_DRM_DEVICES` accepts a
   comma-separated list of KMS primary-node paths and takes precedence over the
   compatible singular `YSERVER_DRM_DEVICE`. Commas preserve the colons in
@@ -307,9 +339,10 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   inventory, hotplug probing, and VT-resume probing now cover every
   opened DRM device and reconcile a complete `(device key, connector name)`
   connection/mode snapshot without recomputing live plane assignments.
-  Physical hotplug/resume snapshots also refresh size, EDID, and connector
-  type transiently on already-live outputs; forced-query and connected-Off
-  metadata authority remains deferred to the later metadata replay. Connected
+  Physical hotplug/resume snapshots also refresh authoritative size, EDID,
+  connector type, and exact mode identity for both live and connected-Off
+  outputs. Forced RANDR queries remain lightweight and update only
+  connection/modes while invalidating monitor identity when needed. Connected
   secondary-card connectors are advertised off until a RANDR client enables
   them; target-only discovery reserves every same-card survivor
   encoder/CRTC/primary plane. Equal

@@ -1754,8 +1754,9 @@ pub(crate) struct RescanResult {
     pub connected: Vec<ConnectorSnapshot>,
 }
 
-/// Device-qualified connector metadata used to reconcile lightweight probes
-/// with the stable RANDR registry without inventing a CRTC/plane assignment.
+/// Device-qualified connector metadata gathered at a forced heavy
+/// startup/hotplug/resume boundary. It refreshes the stable RANDR registry
+/// without inventing a CRTC/plane assignment.
 #[derive(Debug, Clone)]
 pub(crate) struct ConnectorSnapshot {
     pub(crate) key: OutputKey,
@@ -1785,9 +1786,8 @@ impl ConnectorSnapshot {
         // A monitor replacement on the same connector does not revoke the
         // mode already programmed in KMS. Keep that live route until a RANDR
         // client selects a replacement; only a disconnected/no-mode probe
-        // forces it Off. The later metadata-refresh replay will make the
-        // registry's exact mode identities authoritative without changing
-        // this live-mode preservation policy.
+        // forces it Off. The registry's exact mode identities are
+        // authoritative without changing this live-mode preservation policy.
         self.key == output.key && !self.modes.is_empty()
     }
 }

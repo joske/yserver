@@ -66,6 +66,7 @@ use crate::{
         },
         scanout_route::RenderDeviceId,
     },
+    platform::drm::ModeIdentity,
 };
 
 /// Per-window geometry tracked by v2's scene assembler. Stage 2 plan
@@ -436,7 +437,7 @@ pub(crate) struct RandrIdAllocator {
     next: u32,
     providers: HashMap<RandrProviderEndpoint, u32>,
     connectors: HashMap<OutputKey, ConnectorEntry>,
-    modes: HashMap<(u16, u16, u32), u32>,
+    modes: HashMap<ModeIdentity, u32>,
 }
 
 /// One endpoint that can own a RANDR provider XID.
@@ -458,10 +459,19 @@ pub(crate) struct ConnectorIds {
     pub crtc_id: u32,
 }
 
-/// `(output_key, ids, connected, advertised_modes)` snapshot for a not-live
-/// connector, materialized in `randr_outputs_and_modes` to
-/// release the `&self` borrow before the `&mut self` `mode_id()` calls.
-type NotLiveConnector = (OutputKey, ConnectorIds, bool, Vec<(u16, u16, u32, bool)>);
+/// Owned connector snapshot used while allocating mode XIDs mutably.
+struct NotLiveConnector {
+    key: OutputKey,
+    ids: ConnectorIds,
+    connected: bool,
+    modes: Vec<crate::platform::drm::Mode>,
+    edid: Vec<u8>,
+    mm_width: u32,
+    mm_height: u32,
+    connector_type: String,
+}
+
+type ProjectedRandrOutputState = (bool, u32, u32, i16, i16, u16, u16);
 
 /// Per-connector current configuration in the registry.
 // Consumed by the SetCrtcConfig apply path + rescan/resume layout
@@ -505,12 +515,38 @@ pub(crate) struct ConnectorEntry {
     pub config: ConnectorConfig,
     /// `true` once a client SetCrtcConfig/SetScreenSize touched this
     /// output. The auto-layout (recompact / boot extend-right) only
-    /// ever touches `!client_configured` outputs; cleared on disconnect.
+    /// ever touches `!client_configured` outputs. A lightweight connection
+    /// query retains it because that query does not detach the CRTC; the
+    /// later heavy physical-topology apply clears it when the route goes.
     pub client_configured: bool,
-    /// Last-known advertised mode list `(w, h, vrefresh, preferred)`,
-    /// preferred-first. Retained across disconnect so a momentarily-gone
-    /// monitor keeps reporting its modes until reconnect refreshes them.
-    pub modes: Vec<(u16, u16, u32, bool)>,
+    /// Last-known advertised mode list, preferred-first. Retained across
+    /// disconnect so a momentarily-gone monitor keeps reporting stable mode
+    /// resources until reconnect refreshes them.
+    pub modes: Vec<crate::platform::drm::Mode>,
+    /// Connector identity from the latest heavy startup/hotplug/resume
+    /// snapshot. Lightweight RANDR force queries never refresh these fields;
+    /// they invalidate monitor-owned EDID/dimensions when connection or mode
+    /// evidence says the previous identity may have departed.
+    pub edid: Vec<u8>,
+    pub mm_width: u32,
+    pub mm_height: u32,
+    pub connector_type: String,
+}
+
+#[derive(Debug, Default)]
+struct ConnectorRegistryDelta {
+    /// Outputs whose advertised connection, modes, or monitor identity
+    /// changed and therefore need OutputChangeNotify.
+    changed_keys: Vec<OutputKey>,
+    /// Xorg's config timestamp covers available output/mode configuration,
+    /// not EDID, millimeter dimensions, or connector-type metadata alone.
+    config_changed: bool,
+}
+
+impl ConnectorRegistryDelta {
+    fn is_empty(&self) -> bool {
+        self.changed_keys.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -590,17 +626,22 @@ impl RandrIdAllocator {
                 config: ConnectorConfig::Off,
                 client_configured: false,
                 modes: Vec::new(),
+                edid: Vec::new(),
+                mm_width: 0,
+                mm_height: 0,
+                connector_type: String::new(),
             },
         );
         ids
     }
 
-    pub(crate) fn mode_id(&mut self, w: u16, h: u16, vrefresh: u32) -> u32 {
-        if let Some(id) = self.modes.get(&(w, h, vrefresh)) {
+    pub(crate) fn mode_id(&mut self, mode: &crate::platform::drm::Mode) -> u32 {
+        let identity = ModeIdentity::from(mode);
+        if let Some(id) = self.modes.get(&identity) {
             return *id;
         }
         let id = self.fresh();
-        self.modes.insert((w, h, vrefresh), id);
+        self.modes.insert(identity, id);
         id
     }
 
@@ -655,32 +696,51 @@ fn reconcile_connector_probe(
     randr_id_alloc: &mut RandrIdAllocator,
     device_key: crate::platform::drm::DrmDeviceKey,
     probes: &[crate::platform::drm::ConnectorProbe],
-) -> bool {
-    let mut changed = false;
+) -> ConnectorRegistryDelta {
+    let mut delta = ConnectorRegistryDelta::default();
     let mut seen: HashSet<OutputKey> = HashSet::new();
     for probe in probes {
         let output_key = OutputKey::new(device_key, probe.connector_name.clone());
         seen.insert(output_key.clone());
-        let new_modes: Vec<(u16, u16, u32, bool)> = probe
-            .modes
-            .iter()
-            .map(|m| (m.width, m.height, m.vrefresh, m.preferred))
-            .collect();
+        let newly_known = randr_id_alloc.entry(&output_key).is_none();
         let entry = randr_id_alloc.entry_mut(&output_key);
+        // A dynamically-created connector resource changes the available
+        // RANDR output set even when it first appears disconnected.
+        let mut entry_changed = newly_known;
+        let mut config_changed = newly_known;
         if entry.connected != probe.connected {
             entry.connected = probe.connected;
-            changed = true;
+            entry_changed = true;
+            config_changed = true;
         }
         // Retain the last-known mode list while disconnected, matching the
         // registry's existing hot-unplug semantics.
-        if probe.connected && entry.modes != new_modes {
-            entry.modes = new_modes;
-            changed = true;
+        if probe.connected && entry.modes != probe.modes {
+            entry.modes.clone_from(&probe.modes);
+            // A changed advertised list can identify a replacement monitor,
+            // but the lightweight query deliberately does not read EDID or
+            // dimensions. Do not expose the departed monitor's identity
+            // before the next heavy physical-topology snapshot.
+            entry.edid.clear();
+            entry.mm_width = 0;
+            entry.mm_height = 0;
+            entry_changed = true;
+            config_changed = true;
         }
+        if !probe.connected {
+            entry_changed |= !entry.edid.is_empty() || entry.mm_width != 0 || entry.mm_height != 0;
+            entry.edid.clear();
+            entry.mm_width = 0;
+            entry.mm_height = 0;
+        }
+        if entry_changed {
+            delta.changed_keys.push(output_key);
+        }
+        delta.config_changed |= config_changed;
     }
     // Connectors the registry knows but the probe no longer sees are
-    // disconnected. Their mode lists are retained (so GetOutputInfo stays
-    // consistent with the union) — only the flag flips.
+    // disconnected. Their mode lists and live/client configuration are
+    // retained; only the later heavy topology path may detach a CRTC.
     let known: Vec<OutputKey> = randr_id_alloc
         .known_connectors()
         .into_iter()
@@ -690,13 +750,24 @@ fn reconcile_connector_probe(
     for key in known {
         if !seen.contains(&key) {
             let entry = randr_id_alloc.entry_mut(&key);
+            let mut entry_changed = false;
+            let mut config_changed = false;
             if entry.connected {
                 entry.connected = false;
-                changed = true;
+                entry_changed = true;
+                config_changed = true;
             }
+            entry_changed |= !entry.edid.is_empty() || entry.mm_width != 0 || entry.mm_height != 0;
+            entry.edid.clear();
+            entry.mm_width = 0;
+            entry.mm_height = 0;
+            if entry_changed {
+                delta.changed_keys.push(key.clone());
+            }
+            delta.config_changed |= config_changed;
         }
     }
-    changed
+    delta
 }
 
 /// v2 sibling backend. Shares `KmsCore` with `KmsBackend`;
@@ -3804,20 +3875,23 @@ impl KmsBackend {
                         x: layout.x,
                         y: layout.y,
                     },
-                    layout
-                        .output
-                        .modes
-                        .iter()
-                        .map(|mode| (mode.width, mode.height, mode.vrefresh, mode.preferred))
-                        .collect::<Vec<_>>(),
+                    layout.output.modes.clone(),
+                    layout.output.edid.clone(),
+                    layout.output.mm_width,
+                    layout.output.mm_height,
+                    layout.output.connector_type.clone(),
                 )
             })
             .collect();
-        for (key, config, modes) in live {
+        for (key, config, modes, edid, mm_width, mm_height, connector_type) in live {
             let entry = backend.randr_id_alloc.entry_mut(&key);
             entry.connected = true;
             entry.config = config;
             entry.modes = modes;
+            entry.edid = edid;
+            entry.mm_width = mm_width;
+            entry.mm_height = mm_height;
+            entry.connector_type = connector_type;
         }
         backend
     }
@@ -4771,14 +4845,36 @@ impl KmsBackend {
             let _ = self.randr_id_alloc.ids_for(key);
         }
 
-        // The lightweight probe avoids plane/property/modifier discovery for
-        // connectors that are only being entered in the RANDR registry. The
-        // platform gathers every card first, so an error is returned before
-        // this state is partially reconciled.
+        // Keep a lightweight all-connector pass for disconnected connector
+        // XIDs/provider inventory, then enrich every connected entry from a
+        // forced metadata snapshot. Gather both before mutating the registry,
+        // so a failure on card N cannot leave a partially reconciled startup
+        // view.
         let probes = self.platform.probe_all_connectors()?;
+        let snapshots = self.platform.probe_connector_snapshot()?;
+        self.seed_connector_topology_from_probes(&probes, &snapshots);
+        Ok(())
+    }
+
+    /// Apply already-gathered startup probes. The cached pass reserves stable
+    /// XIDs only; the forced connected-only snapshot is authoritative for
+    /// connection, modes, and monitor metadata.
+    fn seed_connector_topology_from_probes(
+        &mut self,
+        probes: &[(
+            crate::platform::drm::DrmDeviceKey,
+            Vec<crate::platform::drm::ConnectorProbe>,
+        )],
+        snapshots: &[ConnectorSnapshot],
+    ) {
         for (device_key, connectors) in probes {
-            let _ = reconcile_connector_probe(&mut self.randr_id_alloc, device_key, &connectors);
+            for connector in connectors {
+                let key = OutputKey::new(*device_key, connector.connector_name.clone());
+                let _ = self.randr_id_alloc.ids_for(&key);
+            }
         }
+        // Entries seen only by cached inventory remain default-disconnected.
+        let _ = self.reconcile_connector_registry(snapshots, &[]);
 
         let live_configs: Vec<_> = self
             .platform
@@ -4799,42 +4895,124 @@ impl KmsBackend {
             .collect();
         for (key, config) in live_configs {
             let entry = self.randr_id_alloc.entry_mut(&key);
-            entry.connected = true;
-            entry.config = config;
+            if entry.connected && !entry.modes.is_empty() {
+                entry.config = config;
+            }
         }
-        Ok(())
     }
 
-    /// Reconcile a complete connected-output snapshot from full KMS
-    /// discovery. Returns whether connection state or advertised modes
-    /// changed, so callers can avoid spurious RANDR timestamp bumps.
+    /// Reconcile a complete connected-output metadata snapshot from a heavy
+    /// physical-topology boundary. Returns connector keys whose advertised
+    /// connection, modes, or identity changed, so callers can avoid spurious
+    /// RANDR config-timestamp bumps. Retiring an already-light-disconnected
+    /// CRTC still clears its internal config below, but is deliberately not a
+    /// second advertised-config delta.
     fn reconcile_connector_registry(
         &mut self,
         connected: &[ConnectorSnapshot],
         dropped: &[OutputKey],
-    ) -> bool {
-        let mut changed = false;
+    ) -> ConnectorRegistryDelta {
+        let mut delta = ConnectorRegistryDelta::default();
+        let connected_keys: HashSet<_> = connected.iter().map(|snapshot| &snapshot.key).collect();
         for key in dropped {
             let entry = self.randr_id_alloc.entry_mut(key);
-            if entry.connected || entry.config != ConnectorConfig::Off || entry.client_configured {
-                changed = true;
+            if connected_keys.contains(key) {
+                // Physically connected but no longer usable by the live CRTC
+                // (for example, its current mode vanished). The connected
+                // snapshot below owns advertised state; this arm retires only
+                // the route policy, so do not fabricate a disconnect/reconnect
+                // pair or a second config timestamp.
+                entry.config = ConnectorConfig::Off;
+                entry.client_configured = false;
+                continue;
             }
+            let config_changed = entry.connected;
+            let output_changed = config_changed
+                || !entry.edid.is_empty()
+                || entry.mm_width != 0
+                || entry.mm_height != 0;
+            if output_changed {
+                delta.changed_keys.push(key.clone());
+            }
+            delta.config_changed |= config_changed;
             entry.connected = false;
             entry.config = ConnectorConfig::Off;
             entry.client_configured = false;
+            // Retain stable mode resources and connector-owned type, but do
+            // not project the departed monitor's identity while disconnected.
+            entry.edid.clear();
+            entry.mm_width = 0;
+            entry.mm_height = 0;
         }
         for snapshot in connected {
-            let modes: Vec<(u16, u16, u32, bool)> = snapshot
-                .modes
-                .iter()
-                .map(|mode| (mode.width, mode.height, mode.vrefresh, mode.preferred))
-                .collect();
             let entry = self.randr_id_alloc.entry_mut(&snapshot.key);
-            if !entry.connected || entry.modes != modes {
-                changed = true;
+            let config_changed = !entry.connected || entry.modes != snapshot.modes;
+            let output_changed = config_changed
+                || entry.edid != snapshot.edid
+                || entry.mm_width != snapshot.mm_width
+                || entry.mm_height != snapshot.mm_height
+                || entry.connector_type != snapshot.connector_type;
+            if output_changed {
+                delta.changed_keys.push(snapshot.key.clone());
             }
+            delta.config_changed |= config_changed;
             entry.connected = true;
-            entry.modes = modes;
+            entry.modes.clone_from(&snapshot.modes);
+            entry.edid.clone_from(&snapshot.edid);
+            entry.mm_width = snapshot.mm_width;
+            entry.mm_height = snapshot.mm_height;
+            entry.connector_type.clone_from(&snapshot.connector_type);
+        }
+        delta
+    }
+
+    /// Merge cached connector-only results for an explicit RANDR query.
+    /// This never mutates live KMS routing, but a changed client-visible
+    /// registry is rebuilt and published immediately so a later debounced
+    /// heavy snapshot cannot lose the corresponding disconnect notification.
+    fn publish_connector_probes(
+        &mut self,
+        state: &mut ServerState,
+        probes: &[(
+            crate::platform::drm::DrmDeviceKey,
+            Vec<crate::platform::drm::ConnectorProbe>,
+        )],
+    ) -> bool {
+        let mut changed_keys = HashSet::new();
+        let mut config_changed = false;
+        for (device_key, connectors) in probes {
+            let delta =
+                reconcile_connector_probe(&mut self.randr_id_alloc, *device_key, connectors);
+            changed_keys.extend(delta.changed_keys);
+            config_changed |= delta.config_changed;
+        }
+        let changed = !changed_keys.is_empty();
+        // A force query never advances lastSetTime. It advances lastConfigTime
+        // for connection/mode-list changes and notifies dirty outputs for
+        // those or monitor-identity invalidation.
+        self.rebuild_randr_state(state, None, config_changed);
+        if changed {
+            let changed_ids: HashSet<_> = changed_keys
+                .iter()
+                .filter_map(|key| {
+                    self.randr_id_alloc
+                        .entry(key)
+                        .map(|entry| entry.ids.output_id)
+                })
+                .collect();
+            let mut changed_outputs: Vec<_> = state
+                .randr
+                .outputs
+                .iter()
+                .filter(|output| changed_ids.contains(&output.output_id))
+                .map(|output| (output.output_id, output.crtc_id, output.mode_id))
+                .collect();
+            changed_outputs.sort_unstable_by_key(|&(output, _, _)| output);
+            yserver_core::core_loop::run::emit_randr_connector_change_notifications(
+                state,
+                &[],
+                &changed_outputs,
+            );
         }
         changed
     }
@@ -5144,7 +5322,7 @@ impl KmsBackend {
         Vec<yserver_core::randr::RandrOutput>,
         Vec<yserver_core::randr::RandrMode>,
     ) {
-        use yserver_core::randr::{ModeTiming, RandrMode, RandrOutput};
+        use yserver_core::randr::{RandrMode, RandrOutput};
 
         // Provider ids share the same XID source as outputs, CRTCs, and modes
         // even before providers are exposed on the wire. Reserve every
@@ -5152,24 +5330,21 @@ impl KmsBackend {
         // KMS devices) so identities stay stable and collision-free.
         self.reserve_randr_provider_ids();
 
+        // A lightweight disconnect leaves the registry config Enabled, so
+        // the live CRTC remains projected while `connected` flips false. A
+        // heavy drop (and a startup force-probe miss) sets config Off; do not
+        // let a stale `platform.outputs` row revive that route.
         let live_keys: HashSet<OutputKey> = self
             .platform
             .outputs
             .iter()
+            .filter(|layout| {
+                self.randr_id_alloc
+                    .entry(&layout.key)
+                    .is_none_or(|entry| matches!(entry.config, ConnectorConfig::Enabled { .. }))
+            })
             .map(|layout| layout.key.clone())
             .collect();
-        // Timing for each advertised (w,h,vrefresh), preferred-first so the
-        // preferred instance's timing survives the #48 duplicate collapse.
-        let mut timing_map: HashMap<(u16, u16, u32), ModeTiming> = HashMap::new();
-        for layout in &self.platform.outputs {
-            for m in &layout.output.modes {
-                if let Some(t) = mode_timing(m) {
-                    timing_map
-                        .entry((m.width, m.height, m.vrefresh))
-                        .or_insert(t);
-                }
-            }
-        }
         let mut outs: Vec<RandrOutput> = Vec::with_capacity(
             self.platform.outputs.len() + self.randr_id_alloc.known_connectors().len(),
         );
@@ -5178,31 +5353,61 @@ impl KmsBackend {
         self.output_identity_by_id.clear();
         self.output_key_by_id.clear();
         self.crtc_key_by_id.clear();
-        for layout in &self.platform.outputs {
+        for layout in self
+            .platform
+            .outputs
+            .iter()
+            .filter(|layout| live_keys.contains(&layout.key))
+        {
             let vrefresh = layout.output.picked.vrefresh;
-            let ids = self.randr_id_alloc.ids_for(&layout.key);
-            self.output_key_by_id
-                .insert(ids.output_id, layout.key.clone());
-            self.crtc_key_by_id.insert(ids.crtc_id, layout.key.clone());
-            let mode_id = self
-                .randr_id_alloc
-                .mode_id(layout.width, layout.height, vrefresh);
-            self.output_identity_by_id.insert(
-                ids.output_id,
+            let output_key = layout.key.clone();
+            let registry_entry_exists = self.randr_id_alloc.entry(&output_key).is_some();
+            let ids = self.randr_id_alloc.ids_for(&output_key);
+            let (connected, connector_modes, edid, mm_width, mm_height, connector_type) = {
+                let entry = self.randr_id_alloc.entry_mut(&output_key);
+                // Production seeds every connected connector from a heavy
+                // snapshot before projection. Keep a defensive fallback for
+                // synthetic fixtures which construct ActiveOutput directly.
+                if !registry_entry_exists {
+                    entry.modes.clone_from(&layout.output.modes);
+                    entry.edid.clone_from(&layout.output.edid);
+                    entry.mm_width = layout.output.mm_width;
+                    entry.mm_height = layout.output.mm_height;
+                    entry
+                        .connector_type
+                        .clone_from(&layout.output.connector_type);
+                    entry.connected = true;
+                    entry.config = ConnectorConfig::Enabled {
+                        mode_w: layout.width,
+                        mode_h: layout.height,
+                        vrefresh,
+                        x: layout.x,
+                        y: layout.y,
+                    };
+                }
                 (
-                    layout.output.edid.clone(),
-                    layout.output.connector_type.clone(),
-                ),
-            );
-            let mut mode_ids = Vec::with_capacity(layout.output.modes.len());
+                    entry.connected,
+                    entry.modes.clone(),
+                    entry.edid.clone(),
+                    entry.mm_width,
+                    entry.mm_height,
+                    entry.connector_type.clone(),
+                )
+            };
+            self.output_key_by_id
+                .insert(ids.output_id, output_key.clone());
+            self.crtc_key_by_id.insert(ids.crtc_id, output_key);
+            let mode_id = self.randr_id_alloc.mode_id(&layout.output.picked);
+            if connected {
+                self.output_identity_by_id
+                    .insert(ids.output_id, (edid, connector_type));
+            }
+            let mut mode_ids = Vec::with_capacity(connector_modes.len());
             let mut num_preferred: u16 = 0;
-            for mode in &layout.output.modes {
-                let mode_id = self
-                    .randr_id_alloc
-                    .mode_id(mode.width, mode.height, mode.vrefresh);
-                // A connector can advertise the same (w,h,vrefresh) more
-                // than once (HDMI EDID+CEA+DMT); those collapse to one XID
-                // and must appear once in GetOutputInfo (issue #48).
+            for mode in &connector_modes {
+                let mode_id = self.randr_id_alloc.mode_id(mode);
+                // A connector can advertise the same exact resource more
+                // than once. List each XID only once (issue #48).
                 if mode_ids.contains(&mode_id) {
                     continue;
                 }
@@ -5211,62 +5416,52 @@ impl KmsBackend {
                     num_preferred = num_preferred.saturating_add(1);
                 }
             }
-            let entry = self.randr_id_alloc.entry_mut(&layout.key);
-            entry.connected = true;
-            entry.config = ConnectorConfig::Enabled {
-                mode_w: layout.width,
-                mode_h: layout.height,
-                vrefresh,
-                x: layout.x,
-                y: layout.y,
-            };
-            entry.modes = layout
-                .output
-                .modes
-                .iter()
-                .map(|mode| (mode.width, mode.height, mode.vrefresh, mode.preferred))
-                .collect();
             outs.push(RandrOutput {
                 name: layout.output.connector_name.clone(),
                 output_id: ids.output_id,
                 crtc_id: ids.crtc_id,
                 mode_id,
-                connected: true,
+                connected,
                 x: i16::try_from(layout.x).unwrap_or(i16::MAX),
                 y: i16::try_from(layout.y).unwrap_or(i16::MAX),
                 width: layout.width,
                 height: layout.height,
                 vrefresh,
                 timing: mode_timing(&layout.output.picked),
-                mm_width: layout.output.mm_width,
-                mm_height: layout.output.mm_height,
+                mm_width: if connected { mm_width } else { 0 },
+                mm_height: if connected { mm_height } else { 0 },
                 mode_ids,
                 num_preferred,
             });
         }
 
-        let advertised_modes: Vec<(u16, u16, u32)> = self
+        let advertised_modes: Vec<crate::platform::drm::Mode> = self
             .randr_id_alloc
             .entries()
-            .flat_map(|(_, entry)| {
-                entry
-                    .modes
-                    .iter()
-                    .map(|&(w, h, vrefresh, _)| (w, h, vrefresh))
-                    .collect::<Vec<_>>()
-            })
+            .flat_map(|(_, entry)| entry.modes.clone())
+            .collect();
+        // A replacement monitor can omit the timing still programmed on a
+        // live CRTC. Retain that current mode resource until a client selects
+        // a replacement-advertised mode, avoiding a dangling mode XID.
+        let current_modes: Vec<crate::platform::drm::Mode> = self
+            .platform
+            .outputs
+            .iter()
+            .filter(|layout| live_keys.contains(&layout.key))
+            .map(|layout| layout.output.picked.clone())
             .collect();
         let mut modes: Vec<RandrMode> = Vec::new();
-        let mut mode_map: HashMap<(u16, u16, u32), u32> = HashMap::new();
-        for (w, h, vrefresh) in advertised_modes {
-            let mode_id = self.randr_id_alloc.mode_id(w, h, vrefresh);
-            if mode_map.insert((w, h, vrefresh), mode_id).is_none() {
+        let mut mode_identities = HashSet::new();
+        for mode in current_modes.into_iter().chain(advertised_modes) {
+            let identity = ModeIdentity::from(&mode);
+            let mode_id = self.randr_id_alloc.mode_id(&mode);
+            if mode_identities.insert(identity) {
                 modes.push(RandrMode {
                     mode_id,
-                    width: w,
-                    height: h,
-                    vrefresh,
-                    timing: timing_map.get(&(w, h, vrefresh)).copied(),
+                    width: mode.width,
+                    height: mode.height,
+                    vrefresh: mode.vrefresh,
+                    timing: mode_timing(&mode),
                 });
             }
         }
@@ -5285,39 +5480,63 @@ impl KmsBackend {
             .randr_id_alloc
             .entries()
             .filter(|(key, _)| !live_keys.contains(*key))
-            .map(|(key, entry)| (key.clone(), entry.ids, entry.connected, entry.modes.clone()))
+            .map(|(key, entry)| NotLiveConnector {
+                key: key.clone(),
+                ids: entry.ids,
+                connected: entry.connected,
+                modes: entry.modes.clone(),
+                edid: entry.edid.clone(),
+                mm_width: entry.mm_width,
+                mm_height: entry.mm_height,
+                connector_type: entry.connector_type.clone(),
+            })
             .collect();
-        for (key, ids, connected, conn_modes) in not_live {
-            let mut mode_ids = Vec::with_capacity(conn_modes.len());
+        for connector in not_live {
+            let mut mode_ids = Vec::with_capacity(connector.modes.len());
             let mut num_preferred: u16 = 0;
-            for (w, h, vrefresh, preferred) in conn_modes {
-                let mode_id = self.randr_id_alloc.mode_id(w, h, vrefresh);
-                // See live-output loop above: dedup repeated (w,h,vrefresh)
-                // so GetOutputInfo lists each mode XID once (issue #48).
+            for mode in connector.modes {
+                let mode_id = self.randr_id_alloc.mode_id(&mode);
+                // See the live-output loop: list each exact XID once.
                 if mode_ids.contains(&mode_id) {
                     continue;
                 }
                 mode_ids.push(mode_id);
-                if preferred {
+                if mode.preferred {
                     num_preferred = num_preferred.saturating_add(1);
                 }
             }
-            self.output_key_by_id.insert(ids.output_id, key.clone());
-            self.crtc_key_by_id.insert(ids.crtc_id, key.clone());
+            self.output_key_by_id
+                .insert(connector.ids.output_id, connector.key.clone());
+            self.crtc_key_by_id
+                .insert(connector.ids.crtc_id, connector.key.clone());
+            if connector.connected {
+                self.output_identity_by_id.insert(
+                    connector.ids.output_id,
+                    (connector.edid, connector.connector_type),
+                );
+            }
             outs.push(RandrOutput {
-                name: key.connector_name,
-                output_id: ids.output_id,
-                crtc_id: ids.crtc_id,
+                name: connector.key.connector_name,
+                output_id: connector.ids.output_id,
+                crtc_id: connector.ids.crtc_id,
                 mode_id: 0,
-                connected,
+                connected: connector.connected,
                 x: 0,
                 y: 0,
                 width: 0,
                 height: 0,
                 vrefresh: 0,
                 timing: None,
-                mm_width: 0,
-                mm_height: 0,
+                mm_width: if connector.connected {
+                    connector.mm_width
+                } else {
+                    0
+                },
+                mm_height: if connector.connected {
+                    connector.mm_height
+                } else {
+                    0
+                },
                 mode_ids,
                 num_preferred,
             });
@@ -5331,9 +5550,9 @@ impl KmsBackend {
     /// The one place `state.randr` is rebuilt from the backend's
     /// registry/outputs.
     /// - `set_time`: `Some(t)` sets `timestamp` (lastSetTime) to `t`
-    ///   (SetCrtcConfig uses the client-provided request timestamp;
-    ///   hotplug uses `timestamp_now()`); `None` preserves the prior
-    ///   value (a no-op re-probe must not advance lastSetTime).
+    ///   (SetCrtcConfig uses the client-provided request timestamp);
+    ///   `None` preserves the prior value (connector discovery and no-op
+    ///   reprobes must not advance lastSetTime).
     /// - `config_changed`: advances `config_timestamp` (lastConfigTime)
     ///   only when the available config (outputs/modes/connection)
     ///   changed — i.e. hotplug/reprobe-with-change, NOT a CRTC set.
@@ -8342,11 +8561,18 @@ impl KmsBackend {
         let rescan =
             self.platform
                 .apply_connector_snapshot(snapshot, &configured, &known_connected);
-        let registry_changed =
+        let registry_delta =
             self.reconcile_connector_registry(&rescan.connected, &rescan.dropped_keys);
         let active_topology_changed = !rescan.dropped_old_indices.is_empty();
-        if (registry_changed || active_topology_changed)
-            && !self.fire_randr_changes(state, rescan, active_topology_changed, false)
+        if (!registry_delta.is_empty() || active_topology_changed)
+            && !self.fire_randr_changes(
+                state,
+                rescan,
+                &registry_delta.changed_keys,
+                registry_delta.config_changed,
+                active_topology_changed,
+                false,
+            )
         {
             return false;
         }
@@ -8425,9 +8651,30 @@ impl KmsBackend {
         &mut self,
         state: &mut ServerState,
         rescan: crate::kms::render::platform::RescanResult,
+        registry_changed_keys: &[OutputKey],
+        config_changed: bool,
         rebuild_scene: bool,
         relight_after_quiesce: bool,
     ) -> bool {
+        let previous_outputs: HashMap<u32, ProjectedRandrOutputState> = state
+            .randr
+            .outputs
+            .iter()
+            .map(|output| {
+                (
+                    output.output_id,
+                    (
+                        output.connected,
+                        output.crtc_id,
+                        output.mode_id,
+                        output.x,
+                        output.y,
+                        output.width,
+                        output.height,
+                    ),
+                )
+            })
+            .collect();
         let physically_connected: HashSet<&OutputKey> =
             rescan.connected.iter().map(|entry| &entry.key).collect();
         for key in &rescan.added_keys {
@@ -8475,11 +8722,13 @@ impl KmsBackend {
             return false;
         }
 
-        // Hotplug add/remove changes the available config AND the
-        // current scanout set: bump both lastSetTime and lastConfigTime
-        // via the single consolidated rebuild path.
-        let ts = state.timestamp_now();
-        self.rebuild_randr_state(state, Some(ts), true);
+        // Asynchronous physical discovery never represents a client Set, so
+        // it preserves lastSetTime even when a live CRTC is retired. A fresh
+        // connection or mode-list delta advances lastConfigTime; monitor
+        // identity metadata alone does not. If a lightweight force query
+        // already published the connector delta, its later heavy CRTC
+        // retirement preserves both timestamps.
+        self.rebuild_randr_state(state, None, config_changed);
 
         // Propagate the new virtual extent (set while applying the connector
         // snapshot) to the cursor accumulator on both input paths.
@@ -8510,13 +8759,55 @@ impl KmsBackend {
             overlay.height = h;
         }
 
-        let changed: Vec<(u32, u32, u32)> = state
-            .randr
-            .outputs
+        let registry_changed_ids: HashSet<_> = registry_changed_keys
             .iter()
-            .map(|o| (o.output_id, o.crtc_id, o.mode_id))
+            .filter_map(|key| {
+                self.randr_id_alloc
+                    .entry(key)
+                    .map(|entry| entry.ids.output_id)
+            })
             .collect();
-        yserver_core::core_loop::run::emit_randr_change_notifications(state, &changed);
+        let mut crtc_changed = Vec::new();
+        let mut output_changed = Vec::new();
+        for output in &state.randr.outputs {
+            let before = previous_outputs.get(&output.output_id).copied();
+            let before_crtc = before.map(|(_, crtc, mode, x, y, width, height)| {
+                (mode != 0, crtc, mode, x, y, width, height)
+            });
+            let after_crtc = (
+                output.mode_id != 0,
+                output.crtc_id,
+                output.mode_id,
+                output.x,
+                output.y,
+                output.width,
+                output.height,
+            );
+            if before_crtc != Some(after_crtc)
+                && (before_crtc.is_some_and(|state| state.0) || after_crtc.0)
+            {
+                crtc_changed.push((output.output_id, output.crtc_id, output.mode_id));
+            }
+
+            let before_output =
+                before.map(|(connected, crtc, mode, ..)| (connected, (mode != 0).then_some(crtc)));
+            let after_output = (
+                output.connected,
+                (output.mode_id != 0).then_some(output.crtc_id),
+            );
+            if registry_changed_ids.contains(&output.output_id)
+                || before_output != Some(after_output)
+            {
+                output_changed.push((output.output_id, output.crtc_id, output.mode_id));
+            }
+        }
+        crtc_changed.sort_unstable_by_key(|&(output, _, _)| output);
+        output_changed.sort_unstable_by_key(|&(output, _, _)| output);
+        yserver_core::core_loop::run::emit_randr_connector_change_notifications(
+            state,
+            &crtc_changed,
+            &output_changed,
+        );
         self.scene.wake_for_damage();
         true
     }
@@ -8562,9 +8853,9 @@ impl KmsBackend {
         let rescan =
             self.platform
                 .apply_connector_snapshot(snapshot, &configured, &known_connected);
-        let registry_changed =
+        let registry_delta =
             self.reconcile_connector_registry(&rescan.connected, &rescan.dropped_keys);
-        let should_publish = registry_changed || active_removed;
+        let should_publish = !registry_delta.is_empty() || active_removed;
         if !should_publish {
             log::debug!("kms: display rescan found no connector or active-topology change");
             return;
@@ -8572,6 +8863,8 @@ impl KmsBackend {
         if !self.fire_randr_changes(
             state,
             rescan,
+            &registry_delta.changed_keys,
+            registry_delta.config_changed,
             active_removed,
             active_removed && state.dpms.power_level == 0,
         ) {
@@ -14998,15 +15291,7 @@ impl Backend for KmsBackend {
         // under Cinnamon/GPU load that unrelated work blocked dispatch for
         // 90–113 ms every time the desktop polled GetScreenResources.
         let probes = self.platform.probe_all_connectors()?;
-        let mut changed = false;
-        for (device_key, connectors) in probes {
-            changed |= reconcile_connector_probe(&mut self.randr_id_alloc, device_key, &connectors);
-        }
-        // Pure re-probe: never bumps lastSetTime (set_time = None); bumps
-        // lastConfigTime only when something actually changed. A no-op
-        // probe leaves both timestamps + the client-set screen size
-        // intact (Xorg RRGetInfo force_query semantics).
-        self.rebuild_randr_state(state, None, changed);
+        let _ = self.publish_connector_probes(state, &probes);
         Ok(())
     }
 
@@ -22447,6 +22732,22 @@ mod tests {
         OutputKey::new(test_device_key(minor), connector_name)
     }
 
+    fn test_advertised_mode(
+        width: u16,
+        height: u16,
+        vrefresh: u32,
+        preferred: bool,
+    ) -> crate::platform::drm::Mode {
+        crate::platform::drm::Mode {
+            name: format!("{width}x{height}"),
+            width,
+            height,
+            vrefresh,
+            preferred,
+            ..Default::default()
+        }
+    }
+
     fn output_crtc_key(backend: &KmsBackend, output_idx: usize) -> CrtcKey {
         CrtcKey::for_output(&backend.platform.outputs[output_idx])
     }
@@ -23196,7 +23497,7 @@ mod tests {
             RandrProviderEndpoint::Render(RenderDeviceId::DrmRender(first_device));
         let first_provider = alloc.provider_id_for(first_endpoint);
         let output = alloc.ids_for(&test_output_key(0, "DP-1"));
-        let mode = alloc.mode_id(1920, 1080, 60);
+        let mode = alloc.mode_id(&test_advertised_mode(1920, 1080, 60, false));
         let second_provider = alloc.provider_id_for(second_endpoint);
         let tagged_render_provider = alloc.provider_id_for(tagged_render_endpoint);
 
@@ -23565,17 +23866,21 @@ mod tests {
         let first_provider_ids: Vec<_> =
             first.iter().map(|provider| provider.provider_id).collect();
         let added_key = OutputKey::new(second_device, "HDMI-A-9");
-        assert!(backend.reconcile_connector_registry(
-            &[ConnectorSnapshot {
-                key: added_key.clone(),
-                modes: Vec::new(),
-                mm_width: 0,
-                mm_height: 0,
-                edid: Vec::new(),
-                connector_type: "unknown".to_string(),
-            }],
-            &[],
-        ));
+        assert!(
+            !backend
+                .reconcile_connector_registry(
+                    &[ConnectorSnapshot {
+                        key: added_key.clone(),
+                        modes: Vec::new(),
+                        mm_width: 0,
+                        mm_height: 0,
+                        edid: Vec::new(),
+                        connector_type: "unknown".to_string(),
+                    }],
+                    &[],
+                )
+                .is_empty()
+        );
         let added_ids = backend
             .randr_id_alloc
             .entry(&added_key)
@@ -23679,17 +23984,21 @@ mod tests {
         push_test_device(&mut backend, sink_key);
         let sink_output = OutputKey::new(sink_key, "DP-9");
         let _ = backend.randr_id_alloc.ids_for(&sink_output);
-        assert!(backend.reconcile_connector_registry(
-            &[ConnectorSnapshot {
-                key: sink_output.clone(),
-                modes: Vec::new(),
-                mm_width: 0,
-                mm_height: 0,
-                edid: Vec::new(),
-                connector_type: "DisplayPort".to_string(),
-            }],
-            &[],
-        ));
+        assert!(
+            !backend
+                .reconcile_connector_registry(
+                    &[ConnectorSnapshot {
+                        key: sink_output.clone(),
+                        modes: Vec::new(),
+                        mm_width: 0,
+                        mm_height: 0,
+                        edid: Vec::new(),
+                        connector_type: "DisplayPort".to_string(),
+                    }],
+                    &[],
+                )
+                .is_empty()
+        );
         let render_id = RenderDeviceId::DrmRender(test_device_key(128));
         backend.platform.render_devices = vec![test_render_device(render_id, Some(source_key))];
         backend.platform.selected_render_device = Some(render_id);
@@ -23748,7 +24057,11 @@ mod tests {
             "ordinary RANDR rebuild must not recreate automatic policy"
         );
 
-        assert!(backend.reconcile_connector_registry(&[], std::slice::from_ref(&sink_output)));
+        assert!(
+            !backend
+                .reconcile_connector_registry(&[], std::slice::from_ref(&sink_output))
+                .is_empty()
+        );
         backend.rebuild_randr_state(&mut state, None, true);
         assert!(
             state
@@ -23760,17 +24073,21 @@ mod tests {
             "disconnect must not recreate explicitly removed policy"
         );
 
-        assert!(backend.reconcile_connector_registry(
-            &[ConnectorSnapshot {
-                key: sink_output,
-                modes: Vec::new(),
-                mm_width: 0,
-                mm_height: 0,
-                edid: Vec::new(),
-                connector_type: "DisplayPort".to_string(),
-            }],
-            &[],
-        ));
+        assert!(
+            !backend
+                .reconcile_connector_registry(
+                    &[ConnectorSnapshot {
+                        key: sink_output,
+                        modes: Vec::new(),
+                        mm_width: 0,
+                        mm_height: 0,
+                        edid: Vec::new(),
+                        connector_type: "DisplayPort".to_string(),
+                    }],
+                    &[],
+                )
+                .is_empty()
+        );
         backend.rebuild_randr_state(&mut state, None, true);
         assert!(
             state
@@ -24191,12 +24508,17 @@ mod tests {
             .key;
         let dp1_key = OutputKey::new(device_key, "DP-1");
         let dp2_key = OutputKey::new(device_key, "DP-2");
+        let dp3_key = OutputKey::new(device_key, "DP-3");
         let hdmi_key = OutputKey::new(device_key, "HDMI-A-1");
         let other_device_key = test_output_key(1, "DP-9");
         {
             let dp = b.randr_id_alloc.entry_mut(&dp1_key);
             dp.connected = true;
-            dp.modes = vec![(2560, 1440, 60, true)];
+            dp.modes = vec![mode(2560, 1440, true)];
+            dp.edid = vec![0x01, 0x02];
+            dp.mm_width = 600;
+            dp.mm_height = 340;
+            dp.connector_type = "DisplayPort".into();
         }
         // A connector absent from the kernel resource list must also be
         // marked disconnected.
@@ -24215,21 +24537,31 @@ mod tests {
                 connected: true,
                 modes: vec![mode(1920, 1080, true)],
             },
+            ConnectorProbe {
+                connector_name: "DP-3".into(),
+                connected: false,
+                modes: Vec::new(),
+            },
         ];
-        assert!(reconcile_connector_probe(
-            &mut b.randr_id_alloc,
-            device_key,
-            &probes
-        ));
+        let delta = reconcile_connector_probe(&mut b.randr_id_alloc, device_key, &probes);
+        assert!(!delta.is_empty());
+        assert!(delta.config_changed);
 
         let dp1 = b.randr_id_alloc.connectors.get(&dp1_key).unwrap();
         assert!(!dp1.connected);
         assert_eq!(
             dp1.modes,
-            vec![(2560, 1440, 60, true)],
+            vec![mode(2560, 1440, true)],
             "disconnect retains the last-known mode list"
         );
+        assert!(dp1.edid.is_empty(), "disconnect invalidates monitor EDID");
+        assert_eq!((dp1.mm_width, dp1.mm_height), (0, 0));
+        assert_eq!(dp1.connector_type, "DisplayPort");
         assert!(!b.randr_id_alloc.connectors.get(&dp2_key).unwrap().connected);
+        assert!(
+            !b.randr_id_alloc.connectors.get(&dp3_key).unwrap().connected,
+            "a newly-known disconnected connector still receives a stable output XID",
+        );
         assert!(
             b.randr_id_alloc
                 .connectors
@@ -24240,29 +24572,630 @@ mod tests {
         );
         let hdmi = b.randr_id_alloc.connectors.get(&hdmi_key).unwrap();
         assert!(hdmi.connected);
-        assert_eq!(hdmi.modes, vec![(1920, 1080, 60, true)]);
+        assert_eq!(hdmi.modes, vec![mode(1920, 1080, true)]);
 
         assert!(
-            !reconcile_connector_probe(&mut b.randr_id_alloc, device_key, &probes),
+            reconcile_connector_probe(&mut b.randr_id_alloc, device_key, &probes).is_empty(),
             "an identical forced probe must not bump RANDR config time"
         );
     }
 
     #[test]
-    fn randr_mode_ids_dedup_by_resolution() {
+    fn startup_inventory_reserves_xids_but_heavy_snapshot_owns_identity_and_state() {
+        use crate::platform::drm::ConnectorProbe;
+
+        let mut backend = KmsBackend::for_tests();
+        let key = backend.platform.outputs[0].key.clone();
+        let probes = vec![(
+            key.device_key,
+            vec![ConnectorProbe {
+                connector_name: key.connector_name.clone(),
+                connected: true,
+                modes: backend.platform.outputs[0].output.modes.clone(),
+            }],
+        )];
+        let heavy_mode = test_advertised_mode(1200, 1600, 60, true);
+        let snapshot = ConnectorSnapshot {
+            key: key.clone(),
+            modes: vec![heavy_mode.clone()],
+            edid: vec![0xde, 0xad],
+            mm_width: 203,
+            mm_height: 271,
+            connector_type: "HDMI".into(),
+        };
+
+        backend.randr_id_alloc = RandrIdAllocator::default();
+        backend.seed_connector_topology_from_probes(&probes, std::slice::from_ref(&snapshot));
+        let entry = backend.randr_id_alloc.entry(&key).unwrap();
+        let ids = entry.ids;
+        assert!(entry.connected);
+        assert_eq!(entry.modes, vec![heavy_mode]);
+        assert_eq!(entry.edid, vec![0xde, 0xad]);
+        assert_eq!((entry.mm_width, entry.mm_height), (203, 271));
+        assert_eq!(entry.connector_type, "HDMI");
+        assert!(matches!(
+            entry.config,
+            super::ConnectorConfig::Enabled { .. }
+        ));
+
+        backend.randr_id_alloc = RandrIdAllocator::default();
+        backend.seed_connector_topology_from_probes(&probes, &[]);
+        let entry = backend.randr_id_alloc.entry(&key).unwrap();
+        assert_eq!(
+            entry.ids, ids,
+            "deterministic startup order keeps connector XIDs"
+        );
+        assert!(
+            !entry.connected,
+            "forced snapshot overrides cached connected state"
+        );
+        assert_eq!(entry.config, super::ConnectorConfig::Off);
+        let output = backend
+            .randr_outputs()
+            .into_iter()
+            .find(|output| output.output_id == ids.output_id)
+            .unwrap();
+        assert!(
+            !output.connected,
+            "stale ActiveOutput must not revive startup state"
+        );
+    }
+
+    #[test]
+    fn lightweight_mode_change_invalidates_identity_until_heavy_refresh() {
+        use crate::platform::drm::ConnectorProbe;
+
+        let mut backend = KmsBackend::for_tests();
+        let key = backend.platform.outputs[0].key.clone();
+        let replacement_mode = test_advertised_mode(1200, 1600, 60, true);
+        {
+            let entry = backend.randr_id_alloc.entry_mut(&key);
+            entry.edid = vec![0x01, 0x02];
+            entry.mm_width = 600;
+            entry.mm_height = 340;
+            entry.connector_type = "DisplayPort".into();
+        }
+        let probe = ConnectorProbe {
+            connector_name: key.connector_name.clone(),
+            connected: true,
+            modes: vec![replacement_mode.clone()],
+        };
+
+        assert!(
+            !reconcile_connector_probe(
+                &mut backend.randr_id_alloc,
+                key.device_key,
+                std::slice::from_ref(&probe),
+            )
+            .is_empty()
+        );
+        let entry = backend.randr_id_alloc.entry(&key).unwrap();
+        assert_eq!(entry.modes, vec![replacement_mode]);
+        assert!(entry.edid.is_empty());
+        assert_eq!((entry.mm_width, entry.mm_height), (0, 0));
+        assert_eq!(entry.connector_type, "DisplayPort");
+        assert!(
+            reconcile_connector_probe(&mut backend.randr_id_alloc, key.device_key, &[probe],)
+                .is_empty(),
+            "the same lightweight evidence is idempotent"
+        );
+    }
+
+    #[test]
+    fn lightweight_same_modes_cannot_detect_edid_only_replacement() {
+        use crate::platform::drm::ConnectorProbe;
+
+        let mut backend = KmsBackend::for_tests();
+        let key = backend.platform.outputs[0].key.clone();
+        let entry = backend.randr_id_alloc.entry_mut(&key);
+        entry.edid = vec![0xaa, 0xbb];
+        entry.mm_width = 500;
+        entry.mm_height = 300;
+        let probe = ConnectorProbe {
+            connector_name: key.connector_name.clone(),
+            connected: true,
+            modes: entry.modes.clone(),
+        };
+
+        assert!(
+            reconcile_connector_probe(&mut backend.randr_id_alloc, key.device_key, &[probe],)
+                .is_empty()
+        );
+        let entry = backend.randr_id_alloc.entry(&key).unwrap();
+        assert_eq!(entry.edid, vec![0xaa, 0xbb]);
+        assert_eq!((entry.mm_width, entry.mm_height), (500, 300));
+    }
+
+    #[test]
+    fn connector_registry_detects_edid_only_replacement_and_keeps_xids() {
+        let mut backend = KmsBackend::for_tests();
+        let key = test_output_key(0, "HDMI-A-1");
+        let first = ConnectorSnapshot {
+            key: key.clone(),
+            modes: vec![test_advertised_mode(1600, 1200, 60, true)],
+            edid: vec![0x01, 0x02],
+            mm_width: 600,
+            mm_height: 340,
+            connector_type: "HDMI".to_string(),
+        };
+        let replacement = ConnectorSnapshot {
+            edid: vec![0x03, 0x04],
+            ..first.clone()
+        };
+
+        assert!(
+            !backend
+                .reconcile_connector_registry(std::slice::from_ref(&first), &[])
+                .is_empty()
+        );
+        let ids = backend.randr_id_alloc.entry(&key).unwrap().ids;
+        let replacement_delta =
+            backend.reconcile_connector_registry(std::slice::from_ref(&replacement), &[]);
+        assert!(
+            !replacement_delta.is_empty(),
+            "a changed EDID must invalidate the heavy RANDR projection"
+        );
+        assert!(
+            !replacement_delta.config_changed,
+            "identity-only metadata does not advance lastConfigTime",
+        );
+        let entry = backend.randr_id_alloc.entry(&key).unwrap();
+        assert_eq!(entry.ids, ids, "monitor replacement reuses connector XIDs");
+        assert_eq!(entry.edid, replacement.edid);
+        assert!(
+            backend
+                .reconcile_connector_registry(std::slice::from_ref(&replacement), &[])
+                .is_empty(),
+            "the refreshed heavy snapshot is idempotent"
+        );
+    }
+
+    #[test]
+    fn live_randr_projection_uses_heavy_registry_identity() {
+        let mut backend = KmsBackend::for_tests();
+        let key = backend.platform.outputs[0].key.clone();
+        let initial = backend.randr_outputs();
+        let initial_output = initial.iter().find(|output| output.name == "test").unwrap();
+        let initial_ids = (initial_output.output_id, initial_output.crtc_id);
+        let replacement = ConnectorSnapshot {
+            key,
+            modes: vec![test_advertised_mode(1200, 1600, 60, true)],
+            edid: vec![0x00, 0xff, 0xff, 0xff, 0xff],
+            mm_width: 203,
+            mm_height: 271,
+            connector_type: "HDMI".to_string(),
+        };
+
+        assert!(
+            !backend
+                .reconcile_connector_registry(std::slice::from_ref(&replacement), &[])
+                .is_empty()
+        );
+        let (refreshed, mode_table) = backend.randr_outputs_and_modes();
+        let output = refreshed
+            .iter()
+            .find(|output| output.name == "test")
+            .unwrap();
+
+        assert_eq!((output.output_id, output.crtc_id), initial_ids);
+        assert_eq!((output.mm_width, output.mm_height), (203, 271));
+        assert!(
+            mode_table.iter().any(|mode| mode.mode_id == output.mode_id),
+            "the preserved programmed mode must remain in screen resources"
+        );
+        assert_eq!(
+            backend.output_identity(output.output_id),
+            Some((replacement.edid, "HDMI".to_string()))
+        );
+    }
+
+    #[test]
+    fn connected_off_output_exposes_identity_and_disconnect_clears_it() {
+        let mut backend = KmsBackend::for_tests();
+        let key = test_output_key(0, "HDMI-A-1");
+        let snapshot = ConnectorSnapshot {
+            key: key.clone(),
+            modes: vec![test_advertised_mode(1200, 1600, 60, true)],
+            edid: vec![0x00, 0xff, 0xff, 0xff],
+            mm_width: 203,
+            mm_height: 271,
+            connector_type: "HDMI".to_string(),
+        };
+        assert!(
+            !backend
+                .reconcile_connector_registry(std::slice::from_ref(&snapshot), &[])
+                .is_empty()
+        );
+        let ids = backend.randr_id_alloc.entry(&key).unwrap().ids;
+
+        let (outputs, _) = backend.randr_outputs_and_modes();
+        let connected = outputs
+            .iter()
+            .find(|output| output.output_id == ids.output_id)
+            .unwrap();
+        assert!(connected.connected);
+        assert_eq!(connected.mode_id, 0);
+        assert_eq!((connected.mm_width, connected.mm_height), (203, 271));
+        assert_eq!(
+            backend.output_identity(ids.output_id),
+            Some((snapshot.edid, "HDMI".to_string()))
+        );
+
+        assert!(
+            !backend
+                .reconcile_connector_registry(&[], std::slice::from_ref(&key))
+                .is_empty()
+        );
+        let (outputs, _) = backend.randr_outputs_and_modes();
+        let disconnected = outputs
+            .iter()
+            .find(|output| output.output_id == ids.output_id)
+            .unwrap();
+        assert!(!disconnected.connected);
+        assert_eq!((disconnected.mm_width, disconnected.mm_height), (0, 0));
+        assert_eq!(backend.output_identity(ids.output_id), None);
+    }
+
+    #[test]
+    fn lightweight_active_disconnect_retains_crtc_then_heavy_detach_publishes_off() {
+        use std::{
+            collections::{HashMap, HashSet, VecDeque},
+            io::Read,
+            os::unix::net::UnixStream,
+            sync::{Arc, Mutex, atomic::AtomicU16},
+        };
+        use yserver_core::server::ClientState;
+        use yserver_protocol::x11::{ClientByteOrder, randr as x11randr};
+
+        let mut backend = KmsBackend::for_tests();
+        let key = backend.platform.outputs[0].key.clone();
+        let device_key = key.device_key;
+        let (outputs, modes) = backend.randr_outputs_and_modes();
+        let live = outputs
+            .iter()
+            .find(|output| output.name == key.connector_name)
+            .unwrap();
+        let (output_id, crtc_id, mode_id) = (live.output_id, live.crtc_id, live.mode_id);
+        let mut state = ServerState::with_randr_outputs_and_modes(
+            backend.platform.fb_w,
+            backend.platform.fb_h,
+            outputs,
+            modes,
+            yserver_core::server::BackendCapabilities::from_backend(&backend),
+        );
+        state.randr.timestamp = 41;
+        state.randr.config_timestamp = 37;
+
+        let (mut peer, writer) = UnixStream::pair().unwrap();
+        writer.set_nonblocking(true).unwrap();
+        state.clients.insert(
+            7,
+            ClientState {
+                writer: Arc::new(Mutex::new(writer)),
+                byte_order: ClientByteOrder::LittleEndian,
+                last_sequence: Arc::new(AtomicU16::new(9)),
+                resource_id_base: 0,
+                resource_id_mask: 0,
+                event_masks: HashMap::new(),
+                save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::new(),
+                xi1_event_classes: HashSet::new(),
+                xi1_window_event_classes: HashMap::new(),
+                outbound: VecDeque::new(),
+                watching_writable: false,
+                focused_window: yserver_core::resources::ROOT_WINDOW,
+                reader_control: None,
+            },
+        );
+        state.randr_select_masks.insert(
+            (7, yserver_core::resources::ROOT_WINDOW),
+            x11randr::NOTIFY_MASK_CRTC_CHANGE | x11randr::NOTIFY_MASK_OUTPUT_CHANGE,
+        );
+        let probes = vec![(
+            device_key,
+            vec![crate::platform::drm::ConnectorProbe {
+                connector_name: key.connector_name.clone(),
+                connected: false,
+                modes: Vec::new(),
+            }],
+        )];
+
+        assert!(backend.publish_connector_probes(&mut state, &probes));
+        assert_eq!(
+            state.randr.timestamp, 41,
+            "force query preserves lastSetTime"
+        );
+        assert_ne!(state.randr.config_timestamp, 37);
+
+        let mut wire = vec![0; 32];
+        peer.read_exact(&mut wire).unwrap();
+        let event = wire.as_slice();
+        assert_eq!(
+            u32::from_le_bytes(event[16..20].try_into().unwrap()),
+            output_id,
+            "only the dirty output is notified",
+        );
+        assert_eq!(u32::from_le_bytes(event[4..8].try_into().unwrap()), 41);
+        assert_eq!(
+            u32::from_le_bytes(event[8..12].try_into().unwrap()),
+            state.randr.config_timestamp,
+        );
+        assert_eq!(
+            u32::from_le_bytes(event[20..24].try_into().unwrap()),
+            crtc_id,
+            "a lightweight disconnect does not detach the current CRTC",
+        );
+        assert_eq!(
+            u32::from_le_bytes(event[24..28].try_into().unwrap()),
+            mode_id
+        );
+        assert_eq!(event[30], x11randr::CONNECTION_DISCONNECTED);
+        assert_eq!(event[1], x11randr::NOTIFY_OUTPUT_CHANGE);
+
+        let projected = state
+            .randr
+            .outputs
+            .iter()
+            .find(|output| output.output_id == output_id)
+            .unwrap();
+        assert!(!projected.connected);
+        assert_eq!((projected.crtc_id, projected.mode_id), (crtc_id, mode_id));
+        let output_info = state
+            .randr
+            .output_info(output_id, state.randr.config_timestamp)
+            .unwrap();
+        assert_eq!(output_info.connection, x11randr::CONNECTION_DISCONNECTED);
+        assert_eq!((output_info.crtc, output_info.mode_id), (crtc_id, mode_id));
+
+        let light_config_timestamp = state.randr.config_timestamp;
+        assert!(
+            backend
+                .reconcile_connector_registry(&[], std::slice::from_ref(&key))
+                .is_empty(),
+            "the later heavy boundary sees no second advertised connector delta",
+        );
+        // Model the heavy topology apply retiring the ActiveOutput. The
+        // registry's Off config prevents a stale platform row from reviving
+        // it; clearing the row is the production apply's corresponding side.
+        backend.platform.outputs.clear();
+        backend.rebuild_randr_state(&mut state, None, false);
+        assert_eq!(state.randr.timestamp, 41);
+        assert_eq!(state.randr.config_timestamp, light_config_timestamp);
+        let detached = state
+            .randr
+            .outputs
+            .iter()
+            .find(|output| output.output_id == output_id)
+            .unwrap();
+        assert!(!detached.connected);
+        assert_eq!(detached.mode_id, 0);
+
+        let changed = [(detached.output_id, detached.crtc_id, detached.mode_id)];
+        yserver_core::core_loop::run::emit_randr_connector_change_notifications(
+            &mut state, &changed, &changed,
+        );
+        let mut wire = [0; 64];
+        peer.read_exact(&mut wire).unwrap();
+        let crtc_event = &wire[..32];
+        let output_event = &wire[32..];
+        assert_eq!(crtc_event[1], x11randr::NOTIFY_CRTC_CHANGE);
+        assert_eq!(output_event[1], x11randr::NOTIFY_OUTPUT_CHANGE);
+        assert_eq!(
+            u32::from_le_bytes(crtc_event[12..16].try_into().unwrap()),
+            crtc_id,
+        );
+        assert_eq!(
+            u32::from_le_bytes(crtc_event[16..20].try_into().unwrap()),
+            0
+        );
+        assert_eq!(
+            u32::from_le_bytes(output_event[20..24].try_into().unwrap()),
+            0
+        );
+        assert_eq!(
+            u32::from_le_bytes(output_event[24..28].try_into().unwrap()),
+            0
+        );
+        assert_eq!(output_event[30], x11randr::CONNECTION_DISCONNECTED);
+        assert_eq!(
+            u32::from_le_bytes(output_event[8..12].try_into().unwrap()),
+            light_config_timestamp,
+            "heavy detach after a published light disconnect does not advance lastConfigTime",
+        );
+    }
+
+    #[test]
+    fn light_mode_change_then_heavy_connected_route_retirement_is_not_a_second_config_delta() {
+        use crate::platform::drm::ConnectorProbe;
+
+        let mut backend = KmsBackend::for_tests();
+        let key = backend.platform.outputs[0].key.clone();
+        let replacement_mode = test_advertised_mode(1024, 768, 60, true);
+        let light_delta = reconcile_connector_probe(
+            &mut backend.randr_id_alloc,
+            key.device_key,
+            &[ConnectorProbe {
+                connector_name: key.connector_name.clone(),
+                connected: true,
+                modes: vec![replacement_mode.clone()],
+            }],
+        );
+        assert!(light_delta.config_changed);
+        assert!(matches!(
+            backend.randr_id_alloc.entry(&key).unwrap().config,
+            super::ConnectorConfig::Enabled { .. }
+        ));
+
+        let (outputs, modes) = backend.randr_outputs_and_modes();
+        let mut state = ServerState::with_randr_outputs_and_modes(
+            backend.platform.fb_w,
+            backend.platform.fb_h,
+            outputs,
+            modes,
+            yserver_core::server::BackendCapabilities::from_backend(&backend),
+        );
+        state.randr.timestamp = 41;
+        state.randr.config_timestamp = 37;
+
+        let entry = backend.randr_id_alloc.entry(&key).unwrap();
+        let snapshot = ConnectorSnapshot {
+            key: key.clone(),
+            modes: vec![replacement_mode],
+            edid: entry.edid.clone(),
+            mm_width: entry.mm_width,
+            mm_height: entry.mm_height,
+            connector_type: entry.connector_type.clone(),
+        };
+        let heavy_delta = backend.reconcile_connector_registry(
+            std::slice::from_ref(&snapshot),
+            std::slice::from_ref(&key),
+        );
+        assert!(heavy_delta.is_empty());
+        assert!(!heavy_delta.config_changed);
+        assert_eq!(
+            backend.randr_id_alloc.entry(&key).unwrap().config,
+            super::ConnectorConfig::Off,
+            "the unusable live route is still retired internally",
+        );
+
+        backend.platform.outputs.clear();
+        backend.rebuild_randr_state(&mut state, None, heavy_delta.config_changed);
+        assert_eq!(
+            (state.randr.timestamp, state.randr.config_timestamp),
+            (41, 37)
+        );
+        let output = state
+            .randr
+            .outputs
+            .iter()
+            .find(|output| output.name == key.connector_name)
+            .unwrap();
+        assert!(output.connected);
+        assert_eq!(output.mode_id, 0);
+    }
+
+    #[test]
+    fn heavy_disconnect_projection_does_not_revive_stale_active_output() {
+        let mut backend = KmsBackend::for_tests();
+        let key = backend.platform.outputs[0].key.clone();
+        let initial = backend.randr_outputs();
+        let ids = initial
+            .iter()
+            .find(|output| output.name == "test")
+            .map(|output| (output.output_id, output.crtc_id))
+            .unwrap();
+
+        assert!(
+            !backend
+                .reconcile_connector_registry(&[], std::slice::from_ref(&key))
+                .is_empty()
+        );
+        let projected = backend.randr_outputs();
+        let output = projected
+            .iter()
+            .find(|output| output.output_id == ids.0)
+            .unwrap();
+
+        assert_eq!(output.crtc_id, ids.1);
+        assert!(!output.connected);
+        assert_eq!(output.mode_id, 0);
+        assert!(
+            !backend.randr_id_alloc.entry(&key).unwrap().connected,
+            "stale platform output state must not overwrite a heavy disconnect"
+        );
+    }
+
+    #[test]
+    fn randr_mode_ids_dedup_exact_modes_but_distinguish_timings() {
         let mut alloc = RandrIdAllocator::default();
-        let m1 = alloc.mode_id(2560, 1440, 60);
-        let m2 = alloc.mode_id(2560, 1440, 60);
-        let m3 = alloc.mode_id(1920, 1080, 60);
+        let mode = test_advertised_mode(2560, 1440, 60, true);
+        let same_mode_different_preference = crate::platform::drm::Mode {
+            preferred: false,
+            ..mode.clone()
+        };
+        let different_timing = crate::platform::drm::Mode {
+            clock_khz: 241_500,
+            hsync_start: 2608,
+            hsync_end: 2640,
+            htotal: 2720,
+            vsync_start: 1443,
+            vsync_end: 1448,
+            vtotal: 1481,
+            ..mode.clone()
+        };
+        let m1 = alloc.mode_id(&mode);
+        let m2 = alloc.mode_id(&same_mode_different_preference);
+        let m3 = alloc.mode_id(&different_timing);
         assert_eq!(m1, m2);
         assert_ne!(m1, m3);
     }
 
-    /// Issue #48: a connector advertising the same `(w,h,vrefresh)` more
-    /// than once (HDMI EDID+CEA+DMT timings all collapse to one mode XID)
-    /// must not emit that XID multiple times in `GetOutputInfo` — `xrandr`
-    /// showed `1920x1080 60.00*+ 60.00* 60.00*`. The per-output `mode_ids`
-    /// list must contain each XID at most once.
+    #[test]
+    fn same_signature_monitor_replacement_keeps_exact_timings_distinct() {
+        let mut backend = KmsBackend::for_tests();
+        let initial = backend.randr_outputs();
+        let initial = initial.iter().find(|output| output.name == "test").unwrap();
+        let current_mode_id = initial.mode_id;
+        let key = backend.platform.outputs[0].key.clone();
+        let replacement_mode = crate::platform::drm::Mode {
+            name: "test".to_string(),
+            width: 800,
+            height: 600,
+            vrefresh: 60,
+            preferred: true,
+            clock_khz: 40_000,
+            hsync_start: 840,
+            hsync_end: 968,
+            htotal: 1056,
+            vsync_start: 601,
+            vsync_end: 605,
+            vtotal: 628,
+            flags: 0x5,
+            ..Default::default()
+        };
+        let replacement = ConnectorSnapshot {
+            key,
+            modes: vec![replacement_mode.clone()],
+            edid: vec![0x00, 0xff, 0xff, 0xff, 0x02],
+            mm_width: 211,
+            mm_height: 158,
+            connector_type: "HDMI".to_string(),
+        };
+
+        assert!(
+            !backend
+                .reconcile_connector_registry(&[replacement], &[])
+                .is_empty()
+        );
+        let (outputs, modes) = backend.randr_outputs_and_modes();
+        let output = outputs.iter().find(|output| output.name == "test").unwrap();
+        let advertised_mode_id = output.mode_ids[0];
+
+        assert_eq!(output.mode_id, current_mode_id);
+        assert_ne!(
+            output.mode_id, advertised_mode_id,
+            "the programmed old timing and replacement timing need distinct XIDs"
+        );
+        assert_eq!(
+            modes
+                .iter()
+                .find(|mode| mode.mode_id == output.mode_id)
+                .and_then(|mode| mode.timing),
+            None,
+        );
+        assert_eq!(
+            modes
+                .iter()
+                .find(|mode| mode.mode_id == advertised_mode_id)
+                .and_then(|mode| mode.timing),
+            mode_timing(&replacement_mode),
+        );
+    }
+
+    /// Issue #48: connector-local duplicate nominal timings are collapsed
+    /// before projection; the output's XID list must also remain duplicate
+    /// free when exact copies reach the registry through synthetic fixtures.
     #[test]
     fn randr_output_mode_ids_have_no_duplicate_xids() {
         let mut b = KmsBackend::for_tests();
@@ -24278,9 +25211,9 @@ mod tests {
             e.connected = true;
             e.config = super::ConnectorConfig::Off;
             e.modes = vec![
-                (1920, 1080, 60, true),
-                (1920, 1080, 60, false),
-                (1920, 1080, 60, false),
+                test_advertised_mode(1920, 1080, 60, true),
+                test_advertised_mode(1920, 1080, 60, false),
+                test_advertised_mode(1920, 1080, 60, false),
             ];
         }
 
@@ -24321,7 +25254,7 @@ mod tests {
             let e = b.randr_id_alloc.entry_mut(&hdmi_key);
             e.connected = true;
             e.config = super::ConnectorConfig::Off;
-            e.modes = vec![(1920, 1080, 60, true)];
+            e.modes = vec![test_advertised_mode(1920, 1080, 60, true)];
         }
         // Physically disconnected (default connected=false).
         let _ = b.randr_id_alloc.entry_mut(&dp_key);

@@ -2378,11 +2378,12 @@ pub(crate) struct ActiveMonitor {
 }
 
 fn active_monitors(state: &ServerState) -> Vec<ActiveMonitor> {
-    // One automatic monitor per ENABLED output (Xorg builds an automatic
-    // monitor only for an output with an active CRTC). Off and
-    // disconnected outputs are absent. `primary` is the RANDR primary
-    // output, which itself prefers an enabled output — the first output
-    // in the list may now be off/disconnected, so `i == 0` is wrong.
+    // One automatic monitor per ASSIGNED output (Xorg builds an automatic
+    // monitor for an output with a current CRTC). A lightweight connection
+    // query does not detach that CRTC, so a transient disconnected+assigned
+    // output remains present until the heavy topology path turns it off.
+    // `primary` is the RANDR primary output, which itself prefers an assigned
+    // output — the first output in the list may be off, so `i == 0` is wrong.
     let primary = state.randr.primary_output;
     state
         .randr
@@ -3351,7 +3352,6 @@ fn handle_randr_request(
             // the affected outputs + layoutChanged, then RRTellChanged
             // (randr/rroutput.c). Both the old and new primary changed, so both
             // are announced; clients learn about this by notify, not polling.
-            state.randr.timestamp = state.timestamp_now();
             let changed: Vec<u32> = [previous, output].into_iter().filter(|o| *o != 0).collect();
             super::run::notify_randr_layout_changed(state, &changed);
             return Ok(RequestOutcome::Handled);
@@ -13372,17 +13372,13 @@ fn current_vidmode_output(state: &ServerState) -> Option<CurrentVidModeOutput> {
         .randr
         .outputs
         .iter()
-        .find(|output| {
-            output.output_id == state.randr.primary_output
-                && output.connected
-                && output.mode_id != 0
-        })
+        .find(|output| output.output_id == state.randr.primary_output && output.mode_id != 0)
         .or_else(|| {
             state
                 .randr
                 .outputs
                 .iter()
-                .find(|output| output.connected && output.mode_id != 0)
+                .find(|output| output.mode_id != 0)
         })?;
 
     // Same resolved timing RANDR's ModeInfo reports, so the two extensions
@@ -30901,7 +30897,7 @@ mod tests {
                 output_id: 2,
                 crtc_id: 2,
                 mode_id: 1,
-                connected: true,
+                connected: false,
                 x: 2560,
                 y: 0,
                 width: 2560,
@@ -30921,6 +30917,30 @@ mod tests {
         assert!(monitors[0].primary);
         assert!(!monitors[1].primary);
         assert_eq!(monitors[1].x, 2560);
+        assert_eq!(
+            (monitors[1].width_mm, monitors[1].height_mm),
+            (677, 381),
+            "automatic monitor geometry still derives physical size from its retained CRTC",
+        );
+    }
+
+    #[test]
+    fn vidmode_retains_a_light_disconnected_assigned_primary() {
+        let mut state = ServerState::new();
+        let primary = state.randr.primary_output;
+        let expected = state
+            .randr
+            .outputs
+            .iter_mut()
+            .find(|output| output.output_id == primary)
+            .map(|output| {
+                output.connected = false;
+                (output.output_id, output.crtc_id)
+            })
+            .unwrap();
+
+        let current = current_vidmode_output(&state).expect("the CRTC remains assigned");
+        assert_eq!((current.output_id, current.crtc_id), expected);
     }
 
     #[test]
@@ -33009,6 +33029,8 @@ mod tests {
             (1, ROOT_WINDOW),
             x11randr::NOTIFY_MASK_SCREEN_CHANGE | x11randr::NOTIFY_MASK_OUTPUT_CHANGE,
         );
+        state.randr.timestamp = 41;
+        state.randr.config_timestamp = 37;
 
         let request = |target: u32| {
             let mut body = Vec::with_capacity(8);
@@ -33050,6 +33072,10 @@ mod tests {
         )
         .expect("clear primary");
         let _ = read_all_available(&mut peer);
+        assert_eq!(
+            (state.randr.timestamp, state.randr.config_timestamp),
+            (41, 37)
+        );
 
         handle_randr_request(
             &mut state,
@@ -33072,6 +33098,14 @@ mod tests {
             events[32] & 0x7f,
             RANDR_FIRST_EVENT + 1,
             "RRNotify (OutputChange)"
+        );
+        for event in events.chunks_exact(32) {
+            assert_eq!(u32::from_le_bytes(event[4..8].try_into().unwrap()), 41);
+            assert_eq!(u32::from_le_bytes(event[8..12].try_into().unwrap()), 37);
+        }
+        assert_eq!(
+            (state.randr.timestamp, state.randr.config_timestamp),
+            (41, 37)
         );
 
         // Setting the same output again changes nothing, so it must be silent.

@@ -90,6 +90,7 @@ pub const SET_CONFIG_SUCCESS: u8 = 0;
 pub const SET_CONFIG_FAILED: u8 = 3;
 pub const SUBPIXEL_UNKNOWN: u16 = 0;
 pub const CONNECTION_CONNECTED: u8 = 0;
+pub const CONNECTION_DISCONNECTED: u8 = 1;
 pub const PROVIDER_CAPABILITY_SOURCE_OUTPUT: u32 = 1 << 0;
 pub const PROVIDER_CAPABILITY_SINK_OUTPUT: u32 = 1 << 1;
 pub const PROVIDER_CAPABILITY_SOURCE_OFFLOAD: u32 = 1 << 2;
@@ -1314,6 +1315,7 @@ pub struct OutputChangeNotify {
     pub output: u32,
     pub crtc: u32,
     pub mode: u32,
+    pub connection: u8,
 }
 
 /// `xRRProviderChangeNotifyEvent` (`randrproto.h`).
@@ -1391,7 +1393,7 @@ pub fn encode_output_change_notify_event(
     put(byte_order, &mut buf, event.crtc);
     put(byte_order, &mut buf, event.mode);
     put(byte_order, &mut buf, ROTATION_ROTATE_0);
-    buf.push(CONNECTION_CONNECTED);
+    buf.push(event.connection);
     buf.push(SUBPIXEL_UNKNOWN as u8);
     buf.try_into().expect("32-byte event")
 }
@@ -2403,6 +2405,7 @@ mod tests {
                 output: 1,
                 crtc: 2,
                 mode: 3,
+                connection: CONNECTION_CONNECTED,
             },
         );
 
@@ -2412,5 +2415,25 @@ mod tests {
         assert_eq!(&event[16..20], &1u32.to_le_bytes());
         assert_eq!(event[30], CONNECTION_CONNECTED);
         assert_eq!(event[31], 0);
+    }
+
+    #[test]
+    fn output_change_notify_encodes_disconnected_state() {
+        let event = encode_output_change_notify_event(
+            ClientByteOrder::LittleEndian,
+            89,
+            SequenceNumber(13),
+            OutputChangeNotify {
+                timestamp: 300,
+                config_timestamp: 301,
+                request_window: 0x100,
+                output: 1,
+                crtc: 0,
+                mode: 0,
+                connection: CONNECTION_DISCONNECTED,
+            },
+        );
+
+        assert_eq!(event[30], CONNECTION_DISCONNECTED);
     }
 }

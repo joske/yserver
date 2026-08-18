@@ -16,7 +16,7 @@ use drm::{
 
 use crate::drm::Device;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Mode {
     pub name: String,
     pub width: u16,
@@ -40,6 +40,59 @@ pub struct Mode {
     pub vscan: u16,
     /// Raw `DRM_MODE_FLAG_*` bits; mapped to RANDR flags at report time.
     pub flags: u32,
+}
+
+/// Fields which make one client-visible RANDR mode resource distinct.
+///
+/// `preferred` is an output association rather than mode identity. A zero
+/// clock is projected with synthetic timing, so dormant kernel timing fields
+/// are likewise excluded in that case. The mode name and `vscan` are not
+/// exposed in RANDR's `ModeInfo` timing either.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ModeIdentity {
+    width: u16,
+    height: u16,
+    vrefresh: u32,
+    clock_khz: u32,
+    hsync_start: u16,
+    hsync_end: u16,
+    htotal: u16,
+    vsync_start: u16,
+    vsync_end: u16,
+    vtotal: u16,
+    flags: u32,
+}
+
+impl From<&Mode> for ModeIdentity {
+    fn from(mode: &Mode) -> Self {
+        let (hsync_start, hsync_end, htotal, vsync_start, vsync_end, vtotal, flags) =
+            if mode.clock_khz == 0 {
+                (0, 0, 0, 0, 0, 0, 0)
+            } else {
+                (
+                    mode.hsync_start,
+                    mode.hsync_end,
+                    mode.htotal,
+                    mode.vsync_start,
+                    mode.vsync_end,
+                    mode.vtotal,
+                    mode.flags & 0x3f,
+                )
+            };
+        Self {
+            width: mode.width,
+            height: mode.height,
+            vrefresh: mode.vrefresh,
+            clock_khz: mode.clock_khz,
+            hsync_start,
+            hsync_end,
+            htotal,
+            vsync_start,
+            vsync_end,
+            vtotal,
+            flags,
+        }
+    }
 }
 
 pub fn pick_mode(modes: &[Mode]) -> Option<&Mode> {
@@ -75,22 +128,19 @@ pub fn pick_mode(modes: &[Mode]) -> Option<&Mode> {
     modes.first()
 }
 
-/// Collapse modes that are identical under our RANDR mode identity
-/// `(width, height, vrefresh)`, keeping the first occurrence.
+/// Collapse modes that share the selectable `(width, height, vrefresh)`
+/// identity, keeping the first occurrence.
 ///
-/// The kernel exposes the same logical resolution multiple times for a
-/// connector (e.g. HDMI: an EDID detailed timing plus CEA VIC and DMT
-/// entries), differing only by pixel clock / timing flags. yserver keys
-/// modes solely on `(w, h, vrefresh)`, so without this collapse each of
-/// those kernel duplicates is emitted as a separate `GetOutputInfo` mode
-/// that all resolve to the *same* RANDR mode XID — producing the
-/// `1920x1080 60.00*+ 60.00* 60.00*` triple seen in issue #48. Callers
-/// pass a preferred-first list so the preferred instance survives.
+/// `SetCrtcConfig` still selects a DRM mode by this nominal triple, so exposing
+/// two connector-local timings with the same triple would make the second XID
+/// unselectable and regress issue #48. Exact timing remains part of global
+/// RANDR mode identity across different outputs and monitor replacements.
+/// Callers pass a preferred-first list so the preferred instance survives.
 fn collapse_duplicate_modes(modes: Vec<Mode>) -> Vec<Mode> {
     let mut seen: HashSet<(u16, u16, u32)> = HashSet::new();
     modes
         .into_iter()
-        .filter(|m| seen.insert((m.width, m.height, m.vrefresh)))
+        .filter(|mode| seen.insert((mode.width, mode.height, mode.vrefresh)))
         .collect()
 }
 
@@ -192,9 +242,10 @@ pub(crate) struct ConnectorProbe {
 
 /// Connector-owned metadata gathered only at physical topology boundaries.
 ///
-/// Unlike [`ConnectorProbe`], this may read EDID/property blobs. Keep it out
-/// of forced `RRGetScreenResources`: the later metadata-refresh replay owns
-/// making those heavier values authoritative for every registry entry.
+/// Unlike [`ConnectorProbe`], this forces current connector state and may read
+/// EDID/property blobs. Keep it out of forced `RRGetScreenResources`: the
+/// backend stores these heavier snapshots authoritatively at startup,
+/// hotplug, and resume boundaries.
 #[derive(Debug)]
 pub(crate) struct ConnectorSnapshotProbe {
     pub(crate) connector_name: String,
@@ -248,7 +299,7 @@ pub(crate) fn probe_connector_snapshots(
     let resources = device.resource_handles()?;
     let mut probes = Vec::with_capacity(resources.connectors().len());
     for &handle in resources.connectors() {
-        let info = device.get_connector(handle, false)?;
+        let info = device.get_connector(handle, true)?;
         if info.state() != connector::State::Connected {
             continue;
         }
@@ -480,7 +531,7 @@ pub fn discover_outputs(device: &Device) -> io::Result<Vec<Output>> {
     let mut candidates: Vec<ConnectorCandidate> = Vec::new();
     let mut connector_infos: HashMap<connector::Handle, connector::Info> = HashMap::new();
     for &handle in resources.connectors() {
-        let info = device.get_connector(handle, false)?;
+        let info = device.get_connector(handle, true)?;
         if info.state() != connector::State::Connected || info.modes().is_empty() {
             continue;
         }
@@ -1449,23 +1500,30 @@ mod tests {
     }
 
     #[test]
-    fn collapse_duplicate_modes_dedups_by_resolution_keeping_first() {
-        // HDMI displays routinely expose the same w×h@refresh several
-        // times (EDID detailed timing + CEA VIC + DMT), differing only by
-        // pixel clock/flags — all collapse to one (w,h,vrefresh) in our
-        // RANDR model. Issue #48: this leaked three identical 1920x1080@60
-        // XIDs into GetOutputInfo (`xrandr` showed `60.00*+ 60.00* 60.00*`).
-        // Input is preferred-first (as in finalize_output): the preferred
-        // instance leads, so first-occurrence-wins keeps it.
+    fn collapse_duplicate_modes_dedups_nominal_modes_keeping_first() {
+        // The apply path can select only w×h@refresh today, so even timings
+        // with distinct blanking must collapse within one connector. Input is
+        // preferred-first and first-occurrence-wins retains that association.
         let modes = vec![
             mode("3440x1440", 3440, 1440, 165, true),
             mode("1920x1080-edid", 1920, 1080, 60, true),
             mode("1920x1080-cea", 1920, 1080, 60, false),
-            mode("1920x1080-dmt", 1920, 1080, 60, false),
+            Mode {
+                name: "1920x1080-alt".into(),
+                clock_khz: 148_500,
+                hsync_start: 2008,
+                hsync_end: 2052,
+                htotal: 2200,
+                vsync_start: 1084,
+                vsync_end: 1089,
+                vtotal: 1125,
+                flags: 0x5,
+                ..mode("ignored", 1920, 1080, 60, false)
+            },
         ];
         let deduped = collapse_duplicate_modes(modes);
 
-        assert_eq!(deduped.len(), 2, "two unique (w,h,vrefresh) modes remain");
+        assert_eq!(deduped.len(), 2, "two nominal modes remain");
         assert_eq!(deduped[0].name, "3440x1440", "order preserved");
         assert_eq!(deduped[1].name, "1920x1080-edid", "first occurrence wins");
         assert!(deduped[1].preferred, "the preferred instance survives");

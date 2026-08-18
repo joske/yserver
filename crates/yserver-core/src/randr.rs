@@ -64,8 +64,9 @@ pub struct RandrOutput {
     /// `width`/`height` in that case.
     pub mm_width: u32,
     pub mm_height: u32,
-    /// Available mode ids for this output, preferred-first. Empty for a
-    /// disconnected output. The current mode is `mode_id` (0 = off).
+    /// Last-known available mode ids for this output, preferred-first.
+    /// Retained across a lightweight disconnect so resource XIDs stay
+    /// stable. The current mode is `mode_id` (0 = off).
     pub mode_ids: Vec<u32>,
     /// Count of leading entries in `mode_ids` that are preferred modes
     /// (Xorg `GetOutputInfo` `nPreferred`).
@@ -107,7 +108,7 @@ pub struct ModeTiming {
     pub mode_flags: u32,
 }
 
-/// One unique mode (deduped by `(width, height, vrefresh)`).
+/// One unique mode (deduped by dimensions, refresh, and exact timing).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RandrMode {
     pub mode_id: u32,
@@ -288,10 +289,9 @@ impl RandrState {
     ///
     /// The caller is responsible for picking output / CRTC / mode IDs
     /// per spec §2.6.1: outputs `1..=N`, CRTCs `(N+1)..=2N`, modes
-    /// `2N+1..` with dedup by `(width, height, vrefresh)`. `from_outputs`
-    /// trusts the caller's mode-id assignment and just collects the
-    /// unique `(mode_id, w, h, vrefresh)` tuples for the `modes`
-    /// vector.
+    /// `2N+1..` with timing-aware deduplication. `from_outputs` trusts the
+    /// caller's mode-id assignment and just collects unique mode resources
+    /// into the `modes` vector.
     ///
     /// Aggregation (boot default; `RRSetScreenSize` later overrides the
     /// reported `screen_width`/`screen_height`):
@@ -345,7 +345,7 @@ impl RandrState {
 
         let primary_output = outputs
             .iter()
-            .find(|o| o.connected && o.mode_id != 0)
+            .find(|o| o.mode_id != 0)
             .or_else(|| outputs.iter().find(|o| o.connected))
             .or_else(|| outputs.first())
             .map_or(0, |o| o.output_id);
@@ -506,13 +506,10 @@ impl RandrState {
     /// output? (Xorg `RRSetScreenSize` BadMatch, rrscreen.c:266.)
     #[must_use]
     pub fn screen_size_would_crop(&self, w: u16, h: u16) -> bool {
-        self.outputs
-            .iter()
-            .filter(|o| o.connected && o.mode_id != 0)
-            .any(|o| {
-                i32::from(o.x) + i32::from(o.width) > i32::from(w)
-                    || i32::from(o.y) + i32::from(o.height) > i32::from(h)
-            })
+        self.outputs.iter().filter(|o| o.mode_id != 0).any(|o| {
+            i32::from(o.x) + i32::from(o.width) > i32::from(w)
+                || i32::from(o.y) + i32::from(o.height) > i32::from(h)
+        })
     }
 
     /// Set the logical (reported) screen size after validation. Uses
@@ -528,14 +525,12 @@ impl RandrState {
         self.config_timestamp = self.timestamp;
     }
 
-    /// Monitors for RANDR `GetMonitors` / XINERAMA: one per ENABLED
-    /// output (connected with a non-zero mode), at its `(x,y,w,h)`.
-    /// Off and disconnected outputs are absent (Xorg builds an
-    /// automatic monitor only for an output with an active CRTC).
+    /// Monitors for RANDR `GetMonitors` / XINERAMA: one per output with a
+    /// currently assigned CRTC/mode, at its `(x,y,w,h)`. A lightweight
+    /// connection reprobe does not detach that assignment; the later heavy
+    /// topology boundary does. Off outputs are absent.
     pub fn enabled_outputs(&self) -> impl Iterator<Item = &RandrOutput> {
-        self.outputs
-            .iter()
-            .filter(|o| o.connected && o.mode_id != 0)
+        self.outputs.iter().filter(|o| o.mode_id != 0)
     }
 
     /// Build a `ScreenResources` reply describing every output / CRTC /
@@ -596,18 +591,19 @@ impl RandrState {
         // queries GetOutputInfo before enabling the output). Synthesize
         // only when an active mode gives real pixel dimensions; otherwise
         // report the EDID size if present, else 0 (unknown).
-        let enabled = out.connected && out.mode_id != 0;
+        let assigned = out.mode_id != 0;
+        let synthesize_dimensions = out.connected && assigned;
         let synth_mm = |px: u16| ((u32::from(px) * 254 + 480) / 960).max(1);
         let width_mm = if out.mm_width > 0 {
             out.mm_width
-        } else if enabled {
+        } else if synthesize_dimensions {
             synth_mm(out.width)
         } else {
             0
         };
         let height_mm = if out.mm_height > 0 {
             out.mm_height
-        } else if enabled {
+        } else if synthesize_dimensions {
             synth_mm(out.height)
         } else {
             0
@@ -616,7 +612,7 @@ impl RandrState {
             timestamp: self.timestamp,
             // Currently-assigned CRTC: 0 (unassigned) unless the output is
             // actually enabled. A connected-but-off output reports crtc=0.
-            crtc: if enabled { out.crtc_id } else { 0 },
+            crtc: if assigned { out.crtc_id } else { 0 },
             // The set of CRTCs this output *can* be driven by (Xorg
             // `crtcs`), independent of whether one is currently assigned.
             // Our model is a stable 1:1 output↔crtc allocation, so the
@@ -704,9 +700,9 @@ impl RandrState {
     fn current_mode_table(outputs: &[RandrOutput]) -> Vec<RandrMode> {
         let mut modes: Vec<RandrMode> = Vec::new();
         let mut seen: HashSet<u32> = HashSet::new();
-        // Skip connected-but-OFF outputs: their `mode_id` is 0, which is
-        // reserved for `None` and must never appear in the mode table.
-        for out in outputs.iter().filter(|o| o.connected && o.mode_id != 0) {
+        // Skip OFF outputs: mode id 0 is reserved for `None`. Connection and
+        // assignment intentionally diverge until heavy topology apply.
+        for out in outputs.iter().filter(|o| o.mode_id != 0) {
             if seen.insert(out.mode_id) {
                 modes.push(RandrMode {
                     mode_id: out.mode_id,
@@ -1456,6 +1452,49 @@ mod tests {
     }
 
     #[test]
+    fn disconnected_assigned_output_retains_crtc_mode_and_geometry_until_heavy_apply() {
+        let output = RandrOutput {
+            name: "eDP-1".into(),
+            output_id: 11,
+            crtc_id: 12,
+            mode_id: 13,
+            connected: false,
+            x: 100,
+            y: 50,
+            width: 1920,
+            height: 1080,
+            vrefresh: 60,
+            timing: None,
+            mm_width: 0,
+            mm_height: 0,
+            mode_ids: vec![13],
+            num_preferred: 1,
+        };
+        let state = RandrState::from_outputs(41, vec![output]);
+
+        assert_eq!(
+            state.primary_output, 11,
+            "assignment wins primary selection"
+        );
+        assert_eq!(state.enabled_outputs().count(), 1);
+        assert!(state.screen_size_would_crop(1919, 1080));
+        assert!(
+            state
+                .screen_resources_current()
+                .modes
+                .iter()
+                .any(|mode| mode.id == 13),
+            "the current mode remains a screen resource",
+        );
+
+        let info = state.output_info(11, state.config_timestamp).unwrap();
+        assert_eq!(info.connection, 1);
+        assert_eq!(info.crtc, 12);
+        assert_eq!(info.mode_id, 13);
+        assert_eq!((info.width_mm, info.height_mm), (0, 0));
+    }
+
+    #[test]
     fn from_outputs_preserves_nonzero_y_position() {
         // Task 5.1 layout-preservation contract (core half): the core
         // RANDR state faithfully reflects whatever (x, y) the backend
@@ -1596,7 +1635,7 @@ mod tests {
     }
 
     #[test]
-    fn enabled_outputs_excludes_off_and_disconnected() {
+    fn enabled_outputs_excludes_unassigned_outputs() {
         let outs = vec![
             RandrOutput {
                 // enabled
