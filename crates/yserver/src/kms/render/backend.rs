@@ -18,7 +18,7 @@
 use std::{
     any::Any,
     cell::{Cell, RefCell},
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     io,
     os::fd::{AsFd, OwnedFd},
     rc::Rc,
@@ -1176,6 +1176,8 @@ pub struct KmsBackend {
     crtc_config_probe_executor: Option<Box<dyn CrtcConfigProbeExecutor>>,
     pending_crtc_config_probes: HashMap<CrtcConfigToken, PendingCrtcConfigProbe>,
     ready_crtc_config_results: HashMap<CrtcConfigToken, io::Result<QualifiedScanoutPlan>>,
+    invalidated_crtc_config_probes: HashSet<CrtcConfigToken>,
+    ready_crtc_config_announcements: VecDeque<CrtcConfigToken>,
     next_crtc_config_token: u64,
     /// Invalidates results across any topology quiesce or VT event, including
     /// an ABA transition which happens to restore the same final layout.
@@ -1697,7 +1699,7 @@ impl KmsBackend {
     }
 
     fn quiesce_before_topology_mutation(&mut self, context: &'static str) -> io::Result<()> {
-        self.bump_crtc_config_topology_epoch();
+        self.bump_crtc_config_topology_epoch(context);
         let old_pending_pageflips = self.pending_pageflip_crtcs();
         if self.scanout_m2.active() {
             if let Err(error) = self.teardown_direct_before_topology_requery(context) {
@@ -2040,8 +2042,61 @@ impl KmsBackend {
         hasher.finish()
     }
 
-    fn bump_crtc_config_topology_epoch(&mut self) {
+    /// Advance the global qualification snapshot and promptly retire every
+    /// request still parked against the previous topology/DRM-master lifetime.
+    ///
+    /// The pending entry deliberately remains owned by the backend until the
+    /// core finishes or cancels it. Cancelling the executor drops queued work;
+    /// an already-running process is only logically retired and continues
+    /// off-core so its eventual uncertain result can still poison its resource
+    /// domain inside the executor.
+    fn bump_crtc_config_topology_epoch(&mut self, reason: &str) {
         self.crtc_config_topology_epoch = self.crtc_config_topology_epoch.wrapping_add(1);
+
+        let mut tokens: Vec<_> = self.pending_crtc_config_probes.keys().copied().collect();
+        tokens.sort_unstable_by_key(|token| token.0);
+        let mut announced = false;
+        for token in tokens {
+            if self.invalidated_crtc_config_probes.contains(&token) {
+                continue;
+            }
+            // A completed worker result may already have been announced but
+            // not yet consumed by finish. Replace it so a topology change can
+            // never install that stale plan, while avoiding a duplicate wake.
+            let already_announced = self.ready_crtc_config_results.contains_key(&token);
+            if let Some(executor) = self.crtc_config_probe_executor.as_mut() {
+                executor.cancel(token);
+            }
+            self.ready_crtc_config_results.insert(
+                token,
+                Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    format!("asynchronous CRTC configuration {token:?} invalidated by {reason}"),
+                )),
+            );
+            self.invalidated_crtc_config_probes.insert(token);
+            if !already_announced {
+                self.ready_crtc_config_announcements.push_back(token);
+                announced = true;
+            }
+        }
+        if announced {
+            self.wake_crtc_config_ready();
+        }
+    }
+
+    fn wake_crtc_config_ready(&self) {
+        let Some(sender) = self.input_sender.as_ref() else {
+            return;
+        };
+        if let Err(error) = sender.send(yserver_core::core_loop::Message::CrtcConfigReady) {
+            log::warn!("failed to wake core for invalidated CRTC configuration: {error}");
+        }
+    }
+
+    fn remove_crtc_config_ready_announcement(&mut self, token: CrtcConfigToken) {
+        self.ready_crtc_config_announcements
+            .retain(|announced| *announced != token);
     }
 
     fn next_crtc_config_token(&mut self) -> CrtcConfigToken {
@@ -3262,6 +3317,8 @@ impl KmsBackend {
             crtc_config_probe_executor,
             pending_crtc_config_probes: HashMap::new(),
             ready_crtc_config_results: HashMap::new(),
+            invalidated_crtc_config_probes: HashSet::new(),
+            ready_crtc_config_announcements: VecDeque::new(),
             next_crtc_config_token: 1,
             crtc_config_topology_epoch: 0,
             #[cfg(test)]
@@ -4196,6 +4253,8 @@ impl KmsBackend {
             crtc_config_probe_executor: None,
             pending_crtc_config_probes: HashMap::new(),
             ready_crtc_config_results: HashMap::new(),
+            invalidated_crtc_config_probes: HashSet::new(),
+            ready_crtc_config_announcements: VecDeque::new(),
             next_crtc_config_token: 1,
             crtc_config_topology_epoch: 0,
             #[cfg(test)]
@@ -5316,7 +5375,7 @@ impl KmsBackend {
             entry.connector_type.clone_from(&snapshot.connector_type);
         }
         if !delta.is_empty() {
-            self.bump_crtc_config_topology_epoch();
+            self.bump_crtc_config_topology_epoch("connector registry changed");
         }
         delta
     }
@@ -5343,7 +5402,7 @@ impl KmsBackend {
         }
         let changed = !changed_keys.is_empty();
         if changed {
-            self.bump_crtc_config_topology_epoch();
+            self.bump_crtc_config_topology_epoch("connector probe changed");
         }
         // A force query never advances lastSetTime. It advances lastConfigTime
         // for connection/mode-list changes and notifies dirty outputs for
@@ -9241,7 +9300,7 @@ impl KmsBackend {
 
         // Even an Active→Suspended→Active ABA cycle invalidates a result that
         // was qualified against the old DRM-master/resource lifetime.
-        self.bump_crtc_config_topology_epoch();
+        self.bump_crtc_config_topology_epoch("VT transition");
 
         // Drive the state machine to a stable state. The loop consumes
         // any counter-event coalesced into the pending flags so a fast VT
@@ -15440,6 +15499,9 @@ impl Backend for KmsBackend {
             executor.set_core_sender(sender.clone_handle());
         }
         self.input_sender = Some(sender);
+        if !self.ready_crtc_config_announcements.is_empty() {
+            self.wake_crtc_config_ready();
+        }
     }
 
     fn request_vt_switch(&mut self, vt: u32) {
@@ -15686,7 +15748,7 @@ impl Backend for KmsBackend {
                 );
             }
         }
-        self.bump_crtc_config_topology_epoch();
+        self.bump_crtc_config_topology_epoch("PRIME provider output source changed");
 
         // A provider relationship changes neither the CRTC configuration nor
         // available connector/mode inventory. Rebuild only the projection and
@@ -15859,11 +15921,11 @@ impl Backend for KmsBackend {
     }
 
     fn drain_ready_crtc_configs(&mut self) -> Vec<CrtcConfigToken> {
-        let Some(executor) = self.crtc_config_probe_executor.as_mut() else {
-            return Vec::new();
-        };
-        let completions = executor.drain_ready();
-        let mut ready = Vec::with_capacity(completions.len());
+        let completions = self
+            .crtc_config_probe_executor
+            .as_mut()
+            .map(|executor| executor.drain_ready())
+            .unwrap_or_default();
         for completion in completions {
             if !self
                 .pending_crtc_config_probes
@@ -15881,20 +15943,23 @@ impl Backend for KmsBackend {
                 .ready_crtc_config_results
                 .contains_key(&completion.token)
             {
-                log::warn!(
-                    "asynchronous CRTC qualifier returned duplicate token {:?}; ignoring it",
+                log::debug!(
+                    "asynchronous CRTC qualifier returned late/duplicate token {:?}; ignoring it",
                     completion.token
                 );
                 continue;
             }
             self.ready_crtc_config_results
                 .insert(completion.token, completion.result);
-            ready.push(completion.token);
+            self.ready_crtc_config_announcements
+                .push_back(completion.token);
         }
-        ready
+        self.ready_crtc_config_announcements.drain(..).collect()
     }
 
     fn finish_crtc_config(&mut self, token: CrtcConfigToken) -> io::Result<bool> {
+        self.remove_crtc_config_ready_announcement(token);
+        self.invalidated_crtc_config_probes.remove(&token);
         let result = match self.ready_crtc_config_results.remove(&token) {
             Some(result) => result,
             None if self.pending_crtc_config_probes.contains_key(&token) => {
@@ -16018,6 +16083,8 @@ impl Backend for KmsBackend {
     }
 
     fn cancel_crtc_config(&mut self, token: CrtcConfigToken) {
+        self.remove_crtc_config_ready_announcement(token);
+        self.invalidated_crtc_config_probes.remove(&token);
         self.pending_crtc_config_probes.remove(&token);
         self.ready_crtc_config_results.remove(&token);
         if let Some(executor) = self.crtc_config_probe_executor.as_mut() {
@@ -16348,6 +16415,9 @@ impl Backend for KmsBackend {
     fn set_logical_screen_size(&mut self, w: u16, h: u16) -> io::Result<()> {
         let w = w.max(1);
         let h = h.max(1);
+        if (w, h) == (self.platform.fb_w, self.platform.fb_h) {
+            return Ok(());
+        }
 
         // Reallocating root/COW storage changes the fallback identity held by
         // an active direct frame. Snapshot that frame into its old COW and
@@ -16359,6 +16429,7 @@ impl Backend for KmsBackend {
         }
 
         // ── 1. Update the platform's logical extent ───────────────────────
+        self.bump_crtc_config_topology_epoch("logical screen size changed");
         self.platform.fb_w = w;
         self.platform.fb_h = h;
 
@@ -22963,6 +23034,7 @@ impl Backend for KmsBackend {
             );
             return Ok(()); // same binary state (e.g. Standby → Suspend)
         }
+        self.bump_crtc_config_topology_epoch("DPMS output state changed");
         log::info!(
             "kms: set_dpms_power(level={level}) — transition active={} → {want_active}",
             self.kms_outputs_active,
@@ -23371,6 +23443,7 @@ mod tests {
         restore_primary_output_after_rebuild,
     };
     use crate::{
+        internal_probe::{ProbeKmsHandles, RouteProbeRequest},
         kms::{
             backend::OutputKey,
             cpu_types::{Rectangle16, Repeat},
@@ -23469,14 +23542,15 @@ mod tests {
     #[derive(Default)]
     struct TestCrtcConfigProbeState {
         enqueued: Vec<CrtcConfigToken>,
+        enqueued_requests: Vec<RouteProbeRequest>,
         cancelled: Vec<CrtcConfigToken>,
+        completions: VecDeque<CrtcConfigProbeCompletion>,
     }
 
     struct TestCrtcConfigProbeExecutor {
         state: Rc<RefCell<TestCrtcConfigProbeState>>,
         sender: Option<CoreSender>,
         auto_complete: Option<QualifiedScanoutPlan>,
-        completions: VecDeque<CrtcConfigProbeCompletion>,
     }
 
     impl TestCrtcConfigProbeExecutor {
@@ -23488,7 +23562,6 @@ mod tests {
                 state,
                 sender: None,
                 auto_complete,
-                completions: VecDeque::new(),
             }
         }
     }
@@ -23500,12 +23573,15 @@ mod tests {
 
         fn enqueue(&mut self, job: CrtcConfigProbeJob) -> io::Result<()> {
             let token = job.request.token;
-            self.state.borrow_mut().enqueued.push(token);
+            let mut state = self.state.borrow_mut();
+            state.enqueued.push(token);
+            state.enqueued_requests.push(job.request);
             if let Some(plan) = self.auto_complete {
-                self.completions.push_back(CrtcConfigProbeCompletion {
+                state.completions.push_back(CrtcConfigProbeCompletion {
                     token,
                     result: Ok(plan),
                 });
+                drop(state);
                 if let Some(sender) = self.sender.as_ref() {
                     sender.send(Message::CrtcConfigReady)?;
                 }
@@ -23514,7 +23590,7 @@ mod tests {
         }
 
         fn drain_ready(&mut self) -> Vec<CrtcConfigProbeCompletion> {
-            self.completions.drain(..).collect()
+            self.state.borrow_mut().completions.drain(..).collect()
         }
 
         fn cancel(&mut self, token: CrtcConfigToken) {
@@ -23558,8 +23634,11 @@ mod tests {
         let mut backend = KmsBackend::for_tests();
         let display_key = backend.platform.devices[0].key;
         let render_id = RenderDeviceId::DrmRender(test_device_key(128));
-        backend.platform.render_devices =
-            vec![test_render_device(render_id, Some(test_device_key(9)))];
+        let sink_id = RenderDeviceId::DrmRender(test_device_key(129));
+        backend.platform.render_devices = vec![
+            test_render_device(render_id, Some(test_device_key(9))),
+            test_render_device(sink_id, Some(display_key)),
+        ];
         backend.platform.selected_render_device = Some(render_id);
         let route = ScanoutRoute::new(render_id, display_key, RenderKmsRelationship::Different);
         backend.platform.outputs[0].scanout_route = route;
@@ -23607,6 +23686,27 @@ mod tests {
             None,
         )));
 
+        let route = backend.platform.outputs[0].scanout_route;
+        let display_key = backend.platform.outputs[0].key.device_key;
+        let (source_selector, copied_sink) = backend
+            .platform
+            .scanout_qualification_devices_for_kms(display_key)
+            .expect("qualification device identities");
+        assert!(
+            copied_sink.is_some(),
+            "fixture must exercise copied sink wire data"
+        );
+        let discovered = backend
+            .crtc_config_discovery_override
+            .as_ref()
+            .expect("fixture has prepared output");
+        let kms = ProbeKmsHandles {
+            connector: discovered.connector,
+            encoder: discovered.encoder,
+            crtc: discovered.crtc,
+            plane: discovered.plane,
+        };
+
         let before = (
             backend.platform.outputs.len(),
             backend.platform.outputs[0].key.clone(),
@@ -23627,6 +23727,19 @@ mod tests {
 
         assert_eq!(state.borrow().enqueued, vec![token]);
         assert_eq!(
+            state.borrow().enqueued_requests,
+            vec![RouteProbeRequest {
+                token,
+                mode: requested,
+                source_route: route,
+                source_selector: source_selector.into(),
+                copied_sink: copied_sink.map(Into::into),
+                kms,
+                fence_timeout_ns: super::super::platform::PRIME_RENDER_PROBE_TIMEOUT_NS,
+            }],
+            "begin must pass the exact scalar route, device identities, KMS assignment, mode, and per-fence budget",
+        );
+        assert_eq!(
             (
                 backend.platform.outputs.len(),
                 backend.platform.outputs[0].key.clone(),
@@ -23643,6 +23756,212 @@ mod tests {
         );
         Backend::cancel_crtc_config(&mut backend, token);
         assert_eq!(state.borrow().cancelled, vec![token]);
+    }
+
+    #[test]
+    fn pending_probe_invalidation_wakes_once_and_suppresses_late_success() {
+        let (mut backend, output_id, requested) = async_crtc_config_test_backend();
+        let state = Rc::new(RefCell::new(TestCrtcConfigProbeState::default()));
+        let (_poll, sender, receiver) = yserver_core::core_loop::channel().unwrap();
+        Backend::set_input_sender(&mut backend, sender);
+        backend.set_crtc_config_probe_executor(Box::new(TestCrtcConfigProbeExecutor::new(
+            Rc::clone(&state),
+            None,
+        )));
+        let topology_before = (
+            backend.platform.outputs.len(),
+            backend.platform.outputs[0].key.clone(),
+            backend.platform.outputs[0].x,
+            backend.platform.outputs[0].y,
+            backend.platform.outputs[0].width,
+            backend.platform.outputs[0].height,
+            backend.platform.outputs[0].scanout_route,
+            backend.kms_outputs_active,
+        );
+
+        let CrtcConfigApply::Pending(token) =
+            Backend::begin_crtc_config(&mut backend, output_id, "test", Some(requested), 40, 20)
+                .expect("enqueue asynchronous qualification")
+        else {
+            panic!("cross-device reallocation must be asynchronous");
+        };
+        assert!(receiver.try_recv_all().next().is_none());
+
+        backend.bump_crtc_config_topology_epoch("test topology invalidation");
+        assert_eq!(state.borrow().cancelled, vec![token]);
+        assert!(backend.pending_crtc_config_probes.contains_key(&token));
+        assert_eq!(
+            backend
+                .ready_crtc_config_results
+                .get(&token)
+                .expect("synthetic invalidation result")
+                .as_ref()
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted,
+        );
+        assert_eq!(
+            backend.ready_crtc_config_announcements,
+            VecDeque::from([token])
+        );
+        assert_eq!(
+            receiver
+                .try_recv_all()
+                .filter(|message| matches!(message, Message::CrtcConfigReady))
+                .count(),
+            1,
+            "invalidation must wake the parked request immediately",
+        );
+
+        // Another global epoch transition before the core drains this token
+        // must neither re-cancel nor announce a second client completion.
+        backend.bump_crtc_config_topology_epoch("second topology invalidation");
+        assert_eq!(state.borrow().cancelled, vec![token]);
+        assert!(receiver.try_recv_all().next().is_none());
+
+        // Model a running helper returning success after logical cancellation.
+        // The synthetic Interrupted result remains authoritative.
+        state
+            .borrow_mut()
+            .completions
+            .push_back(CrtcConfigProbeCompletion {
+                token,
+                result: Ok(QualifiedScanoutPlan::Shared(
+                    ScanoutAllocationPlan::LegacyLinear,
+                )),
+            });
+        assert_eq!(Backend::drain_ready_crtc_configs(&mut backend), vec![token]);
+        assert!(Backend::drain_ready_crtc_configs(&mut backend).is_empty());
+
+        let error = Backend::finish_crtc_config(&mut backend, token)
+            .expect_err("invalidated request must finish promptly with Interrupted");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(backend.pending_crtc_config_probes.is_empty());
+        assert!(backend.ready_crtc_config_results.is_empty());
+        assert!(backend.ready_crtc_config_announcements.is_empty());
+        assert_eq!(
+            (
+                backend.platform.outputs.len(),
+                backend.platform.outputs[0].key.clone(),
+                backend.platform.outputs[0].x,
+                backend.platform.outputs[0].y,
+                backend.platform.outputs[0].width,
+                backend.platform.outputs[0].height,
+                backend.platform.outputs[0].scanout_route,
+                backend.kms_outputs_active,
+            ),
+            topology_before,
+            "logical invalidation itself must not darken or mutate the live topology",
+        );
+    }
+
+    #[test]
+    fn vt_transition_promptly_interrupts_and_cancels_pending_probe() {
+        let (mut backend, output_id, requested) = async_crtc_config_test_backend();
+        let probe_state = Rc::new(RefCell::new(TestCrtcConfigProbeState::default()));
+        let (_poll, sender, receiver) = yserver_core::core_loop::channel().unwrap();
+        Backend::set_input_sender(&mut backend, sender);
+        backend.set_crtc_config_probe_executor(Box::new(TestCrtcConfigProbeExecutor::new(
+            Rc::clone(&probe_state),
+            None,
+        )));
+        let CrtcConfigApply::Pending(token) =
+            Backend::begin_crtc_config(&mut backend, output_id, "test", Some(requested), 0, 0)
+                .expect("enqueue asynchronous qualification")
+        else {
+            panic!("cross-device reallocation must be asynchronous");
+        };
+
+        let mut server_state = ServerState::new();
+        backend.inject_seat_event_for_test(&mut server_state, false);
+        assert_eq!(probe_state.borrow().cancelled, vec![token]);
+        assert_eq!(
+            receiver
+                .try_recv_all()
+                .filter(|message| matches!(message, Message::CrtcConfigReady))
+                .count(),
+            1,
+        );
+        assert_eq!(Backend::drain_ready_crtc_configs(&mut backend), vec![token]);
+        let error = Backend::finish_crtc_config(&mut backend, token)
+            .expect_err("VT transition must interrupt the parked request");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(backend.pending_crtc_config_probes.is_empty());
+    }
+
+    #[test]
+    fn cancelling_invalidated_probe_removes_undrained_announcement() {
+        let (mut backend, output_id, requested) = async_crtc_config_test_backend();
+        let probe_state = Rc::new(RefCell::new(TestCrtcConfigProbeState::default()));
+        backend.set_crtc_config_probe_executor(Box::new(TestCrtcConfigProbeExecutor::new(
+            Rc::clone(&probe_state),
+            None,
+        )));
+        let CrtcConfigApply::Pending(token) =
+            Backend::begin_crtc_config(&mut backend, output_id, "test", Some(requested), 0, 0)
+                .expect("enqueue asynchronous qualification")
+        else {
+            panic!("cross-device reallocation must be asynchronous");
+        };
+        backend.bump_crtc_config_topology_epoch("test cancellation boundary");
+        assert_eq!(
+            backend.ready_crtc_config_announcements,
+            VecDeque::from([token])
+        );
+
+        Backend::cancel_crtc_config(&mut backend, token);
+        assert!(backend.pending_crtc_config_probes.is_empty());
+        assert!(backend.ready_crtc_config_results.is_empty());
+        assert!(backend.ready_crtc_config_announcements.is_empty());
+        assert!(Backend::drain_ready_crtc_configs(&mut backend).is_empty());
+        assert_eq!(probe_state.borrow().cancelled, vec![token, token]);
+    }
+
+    #[test]
+    fn dpms_transition_promptly_invalidates_pending_probe_after_no_op_guard() {
+        let (mut backend, output_id, requested) = async_crtc_config_test_backend();
+        let probe_state = Rc::new(RefCell::new(TestCrtcConfigProbeState::default()));
+        let (_poll, sender, receiver) = yserver_core::core_loop::channel().unwrap();
+        Backend::set_input_sender(&mut backend, sender);
+        backend.set_crtc_config_probe_executor(Box::new(TestCrtcConfigProbeExecutor::new(
+            Rc::clone(&probe_state),
+            None,
+        )));
+        let CrtcConfigApply::Pending(token) =
+            Backend::begin_crtc_config(&mut backend, output_id, "test", Some(requested), 0, 0)
+                .expect("enqueue asynchronous qualification")
+        else {
+            panic!("cross-device reallocation must be asynchronous");
+        };
+        let epoch_before = backend.crtc_config_topology_epoch;
+
+        Backend::set_dpms_power(&mut backend, 0).expect("already-on DPMS request is a no-op");
+        assert_eq!(backend.crtc_config_topology_epoch, epoch_before);
+        assert!(probe_state.borrow().cancelled.is_empty());
+        assert!(receiver.try_recv_all().next().is_none());
+
+        // The synthetic DRM fixture may reject the subsequent all-off commit,
+        // but invalidation must happen before that fallible transition.
+        let _ = Backend::set_dpms_power(&mut backend, 3);
+        assert_eq!(
+            backend.crtc_config_topology_epoch,
+            epoch_before.wrapping_add(1)
+        );
+        assert_eq!(probe_state.borrow().cancelled, vec![token]);
+        assert_eq!(
+            receiver
+                .try_recv_all()
+                .filter(|message| matches!(message, Message::CrtcConfigReady))
+                .count(),
+            1,
+        );
+        assert_eq!(Backend::drain_ready_crtc_configs(&mut backend), vec![token]);
+        assert_eq!(
+            Backend::finish_crtc_config(&mut backend, token)
+                .expect_err("DPMS transition must interrupt the parked request")
+                .kind(),
+            io::ErrorKind::Interrupted,
+        );
     }
 
     #[test]
@@ -23675,6 +23994,55 @@ mod tests {
 
         Backend::cancel_crtc_config(&mut backend, token);
         assert_eq!(state.borrow().cancelled, vec![token]);
+    }
+
+    #[test]
+    fn topology_invalidation_overwrites_announced_result_without_duplicate_wake() {
+        let (mut backend, output_id, requested) = async_crtc_config_test_backend();
+        let state = Rc::new(RefCell::new(TestCrtcConfigProbeState::default()));
+        let (_poll, sender, receiver) = yserver_core::core_loop::channel().unwrap();
+        Backend::set_input_sender(&mut backend, sender);
+        backend.set_crtc_config_probe_executor(Box::new(TestCrtcConfigProbeExecutor::new(
+            Rc::clone(&state),
+            Some(QualifiedScanoutPlan::Shared(
+                ScanoutAllocationPlan::LegacyLinear,
+            )),
+        )));
+
+        let CrtcConfigApply::Pending(token) =
+            Backend::begin_crtc_config(&mut backend, output_id, "test", Some(requested), 0, 0)
+                .expect("enqueue asynchronous qualification")
+        else {
+            panic!("cross-device reallocation must be asynchronous");
+        };
+        assert!(
+            receiver
+                .try_recv_all()
+                .any(|message| matches!(message, Message::CrtcConfigReady))
+        );
+        assert_eq!(Backend::drain_ready_crtc_configs(&mut backend), vec![token]);
+
+        backend.bump_crtc_config_topology_epoch("test after ready announcement");
+        assert_eq!(state.borrow().cancelled, vec![token]);
+        assert!(receiver.try_recv_all().next().is_none());
+        assert!(backend.ready_crtc_config_announcements.is_empty());
+        assert_eq!(
+            backend
+                .ready_crtc_config_results
+                .get(&token)
+                .expect("announced result remains consumable")
+                .as_ref()
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted,
+        );
+
+        assert_eq!(
+            Backend::finish_crtc_config(&mut backend, token)
+                .expect_err("topology invalidation must replace the stale qualified plan")
+                .kind(),
+            io::ErrorKind::Interrupted,
+        );
     }
 
     #[test]
@@ -35479,6 +35847,7 @@ mod tests {
         let mut b = KmsBackend::for_tests();
         let initial_w = b.platform.fb_w;
         let initial_h = b.platform.fb_h;
+        let initial_epoch = b.crtc_config_topology_epoch;
 
         // Sanity: root storage allocated at boot dimensions.
         let root_xid = b.core.window_id;
@@ -35499,6 +35868,11 @@ mod tests {
         // Platform extent updated.
         assert_eq!(b.platform.fb_w, new_w, "fb_w must reflect new width");
         assert_eq!(b.platform.fb_h, new_h, "fb_h must reflect new height");
+        assert_eq!(
+            b.crtc_config_topology_epoch,
+            initial_epoch.wrapping_add(1),
+            "a changed logical extent invalidates pending topology snapshots",
+        );
 
         // Root xid is live with the new extent.
         let id_after = b
@@ -35534,6 +35908,11 @@ mod tests {
             .expect("repeat call to same dimensions must succeed");
         assert_eq!(b.platform.fb_w, new_w);
         assert_eq!(b.platform.fb_h, new_h);
+        assert_eq!(
+            b.crtc_config_topology_epoch,
+            initial_epoch.wrapping_add(1),
+            "an idempotent logical-size request must not invalidate probes",
+        );
     }
 
     /// Frame tick: advances mod n, re-arms relative, mints strictly
