@@ -1,7 +1,7 @@
 use std::{
     fs::{File, OpenOptions},
     io,
-    os::unix::io::{AsFd, BorrowedFd},
+    os::unix::io::{AsFd, BorrowedFd, OwnedFd},
 };
 
 use drm::{ClientCapability, Device as DrmDevice};
@@ -9,6 +9,14 @@ use drm::{ClientCapability, Device as DrmDevice};
 pub struct Device {
     file: File,
     path: String,
+    master_ownership: MasterOwnership,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MasterOwnership {
+    None,
+    AcquiredHere,
+    InheritedDuplicate,
 }
 
 impl AsFd for Device {
@@ -35,6 +43,7 @@ impl Device {
         Ok(Self {
             file,
             path: "/dev/null".to_string(),
+            master_ownership: MasterOwnership::None,
         })
     }
 
@@ -54,7 +63,26 @@ impl Device {
         Ok(Self {
             file,
             path: path.to_string(),
+            master_ownership: MasterOwnership::None,
         })
+    }
+
+    /// Wrap a duplicated KMS fd inherited by a helper process.
+    ///
+    /// The fd must refer to the same DRM file description as a parent-owned
+    /// KMS device. This `Device` owns and closes its duplicate, but deliberately
+    /// never issues `DRM_IOCTL_DROP_MASTER`: master ownership remains with the
+    /// parent, and closing one duplicate does not release it while the parent's
+    /// reference remains open. Per-file client capabilities are inherited with
+    /// the duplicated file description, so this constructor does not repeat
+    /// `SET_CLIENT_CAP` either.
+    #[doc(hidden)]
+    pub fn from_inherited_kms_fd(fd: OwnedFd, path: impl Into<String>) -> Self {
+        Self {
+            file: File::from(fd),
+            path: path.into(),
+            master_ownership: MasterOwnership::InheritedDuplicate,
+        }
     }
 
     pub fn open(path: &str) -> io::Result<Self> {
@@ -66,6 +94,7 @@ impl Device {
         let device = Self {
             file,
             path: path.to_string(),
+            master_ownership: MasterOwnership::AcquiredHere,
         };
         device.acquire_master_lock().map_err(|err| {
             io::Error::new(
@@ -109,6 +138,9 @@ impl Device {
 
 impl Drop for Device {
     fn drop(&mut self) {
+        if self.master_ownership != MasterOwnership::AcquiredHere {
+            return;
+        }
         if let Err(err) = self.release_master_lock() {
             log::warn!(
                 "failed to release DRM master on {}: {err} (file close will still drop the fd)",

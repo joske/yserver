@@ -3,6 +3,16 @@ use std::{env, process::ExitCode};
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
+    if let Some(result) = yserver::internal_probe::run_reexec_helper_if_requested() {
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                log::error!("yserver internal PRIME probe helper: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     let opts = match yserver::launch::parse_args(env::args().skip(1)) {
         Ok(o) => o,
         Err(err) => {

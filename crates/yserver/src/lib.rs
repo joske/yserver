@@ -2,6 +2,8 @@ pub mod clock;
 pub mod drm;
 pub mod input;
 pub mod input_thread;
+#[doc(hidden)]
+pub mod internal_probe;
 pub mod kms;
 pub mod launch;
 pub(crate) mod platform;
