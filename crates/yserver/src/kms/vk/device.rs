@@ -53,12 +53,31 @@ pub(crate) struct VulkanDeviceSelector {
 }
 
 impl VulkanDeviceSelector {
+    /// Reconstruct the stable cross-instance selector carried over the
+    /// private helper protocol. No opaque Vulkan handle crosses the process
+    /// boundary; both UUIDs are required to select the same GPU and ICD.
+    pub(crate) const fn from_uuid_pair(
+        device_uuid: [u8; vk::UUID_SIZE],
+        driver_uuid: [u8; vk::UUID_SIZE],
+    ) -> Self {
+        Self {
+            device_uuid,
+            driver_uuid,
+        }
+    }
+
+    /// Return the scalar UUID pair suitable for the private helper protocol.
+    #[must_use]
+    pub(crate) const fn uuid_pair(self) -> ([u8; vk::UUID_SIZE], [u8; vk::UUID_SIZE]) {
+        (self.device_uuid, self.driver_uuid)
+    }
+
     #[cfg(test)]
     pub(crate) const fn for_tests(seed: u8) -> Self {
-        Self {
-            device_uuid: [seed; vk::UUID_SIZE],
-            driver_uuid: [seed.wrapping_add(0x40); vk::UUID_SIZE],
-        }
+        Self::from_uuid_pair(
+            [seed; vk::UUID_SIZE],
+            [seed.wrapping_add(0x40); vk::UUID_SIZE],
+        )
     }
 }
 
@@ -1229,6 +1248,18 @@ mod tests {
             display_primary: key(primary),
             render: render.map(key),
         }
+    }
+
+    #[test]
+    fn selector_uuid_pair_round_trips_without_exposing_vulkan_handles() {
+        let original = selector(0x21);
+        let (device_uuid, driver_uuid) = original.uuid_pair();
+        assert_eq!(
+            VulkanDeviceSelector::from_uuid_pair(device_uuid, driver_uuid),
+            original
+        );
+        assert_eq!(device_uuid, [0x21; vk::UUID_SIZE]);
+        assert_eq!(driver_uuid, [0x61; vk::UUID_SIZE]);
     }
 
     #[test]

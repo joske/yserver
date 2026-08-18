@@ -13,6 +13,7 @@ use drm::{
         plane, property,
     },
 };
+use yserver_core::backend::ModeSpec;
 
 use crate::drm::Device;
 
@@ -609,29 +610,181 @@ pub fn discover_output_for_connector(
     ))
 }
 
+fn exact_assignment_from_candidate(
+    candidate: &ConnectorCandidate,
+    encoder: encoder::Handle,
+    crtc: crtc::Handle,
+    plane: plane::Handle,
+) -> io::Result<Assignment> {
+    if candidate.encoder != encoder {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "connector {} exact encoder {encoder:?} is no longer the selected encoder {:?}",
+                candidate.connector_name, candidate.encoder
+            ),
+        ));
+    }
+    if !candidate.candidate_crtcs.contains(&crtc) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "connector {} exact CRTC {crtc:?} is not drivable by encoder {encoder:?}",
+                candidate.connector_name
+            ),
+        ));
+    }
+    let plane_drives_crtc = candidate
+        .candidate_planes
+        .iter()
+        .any(|(candidate_plane, drivable)| *candidate_plane == plane && drivable.contains(&crtc));
+    if !plane_drives_crtc {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "connector {} exact primary plane {plane:?} cannot drive CRTC {crtc:?}",
+                candidate.connector_name
+            ),
+        ));
+    }
+    Ok(Assignment {
+        connector: candidate.connector,
+        connector_name: candidate.connector_name.clone(),
+        encoder,
+        crtc,
+        plane,
+    })
+}
+
+fn requested_mode_index(modes: &[Mode], requested: ModeSpec) -> Option<usize> {
+    modes.iter().position(|mode| {
+        mode.width == requested.width
+            && mode.height == requested.height
+            && mode.vrefresh == requested.vrefresh
+    })
+}
+
+/// Reconstruct one exact parent-selected connector/encoder/CRTC/primary-plane
+/// assignment on an inherited KMS device.
+///
+/// Every object is rediscovered and revalidated against the child's current
+/// DRM resources. The returned [`Output`] uses the exact requested nominal
+/// mode rather than the connector's default/preferred mode. This performs no
+/// atomic commit; disposable qualification later issues only `TEST_ONLY`.
+pub(crate) fn output_for_exact_probe_assignment(
+    device: &Device,
+    connector: connector::Handle,
+    encoder: encoder::Handle,
+    crtc: crtc::Handle,
+    plane: plane::Handle,
+    requested_mode: ModeSpec,
+) -> io::Result<Output> {
+    let resources = device.resource_handles()?;
+    if !resources.connectors().contains(&connector) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("exact probe connector {connector:?} is not present on the inherited device"),
+        ));
+    }
+    let connector_info = device.get_connector(connector, true)?;
+    let connector_name =
+        xorg_output_name(connector_info.interface(), connector_info.interface_id());
+    if connector_info.state() != connector::State::Connected || connector_info.modes().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            format!(
+                "exact probe connector {connector_name}/{connector:?} is disconnected or has no usable modes"
+            ),
+        ));
+    }
+    if !resources.encoders().contains(&encoder)
+        || (!connector_info.encoders().contains(&encoder)
+            && connector_info.current_encoder() != Some(encoder))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "exact probe encoder {encoder:?} is no longer available to connector {connector_name}"
+            ),
+        ));
+    }
+
+    let primary_planes = primary_plane_candidates(device, &resources)?;
+    let encoder_info = device.get_encoder(encoder)?;
+    let mut candidate_crtcs = resources.filter_crtcs(encoder_info.possible_crtcs());
+    if let Some(current) = encoder_info.crtc() {
+        if let Some(index) = candidate_crtcs
+            .iter()
+            .position(|candidate| *candidate == current)
+        {
+            candidate_crtcs.swap(0, index);
+        } else {
+            candidate_crtcs.insert(0, current);
+        }
+    }
+    let candidate_crtc_set: HashSet<_> = candidate_crtcs.iter().copied().collect();
+    let candidate_planes = primary_planes
+        .into_iter()
+        .filter(|(_, drivable)| {
+            drivable
+                .iter()
+                .any(|crtc| candidate_crtc_set.contains(crtc))
+        })
+        .collect();
+    let candidate = ConnectorCandidate {
+        connector,
+        connector_name,
+        encoder,
+        candidate_crtcs,
+        candidate_planes,
+    };
+    let assignment = exact_assignment_from_candidate(&candidate, encoder, crtc, plane)?;
+    finalize_output_with_mode(device, assignment, &connector_info, Some(requested_mode))
+}
+
 fn finalize_output(
     device: &Device,
     asg: Assignment,
     connector_info: &connector::Info,
 ) -> io::Result<Output> {
+    finalize_output_with_mode(device, asg, connector_info, None)
+}
+
+fn finalize_output_with_mode(
+    device: &Device,
+    asg: Assignment,
+    connector_info: &connector::Info,
+    requested_mode: Option<ModeSpec>,
+) -> io::Result<Output> {
     let local_modes: Vec<Mode> = connector_info.modes().iter().map(local_mode_from).collect();
-    let picked = pick_mode(&local_modes)
-        .ok_or_else(|| {
+    let picked_idx = if let Some(requested) = requested_mode {
+        requested_mode_index(&local_modes, requested).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "connector {} does not advertise requested mode {}x{}@{}",
+                    asg.connector_name, requested.width, requested.height, requested.vrefresh
+                ),
+            )
+        })?
+    } else {
+        let picked = pick_mode(&local_modes).ok_or_else(|| {
             io::Error::other(format!(
                 "connector {} reports no usable modes",
                 asg.connector_name
             ))
-        })?
-        .clone();
-    let picked_idx = local_modes
-        .iter()
-        .position(|m| {
-            m.name == picked.name
-                && m.width == picked.width
-                && m.height == picked.height
-                && m.vrefresh == picked.vrefresh
-        })
-        .expect("picked mode is from local_modes");
+        })?;
+        local_modes
+            .iter()
+            .position(|mode| {
+                mode.name == picked.name
+                    && mode.width == picked.width
+                    && mode.height == picked.height
+                    && mode.vrefresh == picked.vrefresh
+            })
+            .expect("picked mode is from local_modes")
+    };
+    let picked = local_modes[picked_idx].clone();
     let drm_mode = connector_info.modes()[picked_idx];
 
     let plane_props_map = PropMap::for_object(device, asg.plane)?;
@@ -1007,6 +1160,24 @@ fn modeset_with_flags(
     let crtc_props = PropMap::for_object(device, output.crtc)?;
     let plane_props = PropMap::for_object(device, output.plane)?;
 
+    // Resolve every fallible property lookup before creating the mode blob.
+    // Probe helpers share the parent's DRM file description, so an early `?`
+    // after blob creation would otherwise leave that object attached to the
+    // still-live parent fd even after the child exits.
+    let connector_crtc_id_prop = connector_props.id("CRTC_ID")?;
+    let crtc_mode_id_prop = crtc_props.id("MODE_ID")?;
+    let crtc_active_prop = crtc_props.id("ACTIVE")?;
+    let plane_fb_id_prop = plane_props.id("FB_ID")?;
+    let plane_crtc_id_prop = plane_props.id("CRTC_ID")?;
+    let plane_src_x_prop = plane_props.id("SRC_X")?;
+    let plane_src_y_prop = plane_props.id("SRC_Y")?;
+    let plane_src_w_prop = plane_props.id("SRC_W")?;
+    let plane_src_h_prop = plane_props.id("SRC_H")?;
+    let plane_crtc_x_prop = plane_props.id("CRTC_X")?;
+    let plane_crtc_y_prop = plane_props.id("CRTC_Y")?;
+    let plane_crtc_w_prop = plane_props.id("CRTC_W")?;
+    let plane_crtc_h_prop = plane_props.id("CRTC_H")?;
+
     let mode_blob = device.create_property_blob(&output.mode)?;
     let mode_blob_raw: u64 = mode_blob.into();
 
@@ -1020,37 +1191,25 @@ fn modeset_with_flags(
     let mut req = AtomicModeReq::new();
     req.add_raw_property(
         output.connector.into(),
-        connector_props.id("CRTC_ID")?,
+        connector_crtc_id_prop,
         u64::from(crtc_id_raw),
     );
-    req.add_raw_property(output.crtc.into(), crtc_props.id("MODE_ID")?, mode_blob_raw);
-    req.add_raw_property(output.crtc.into(), crtc_props.id("ACTIVE")?, 1);
+    req.add_raw_property(output.crtc.into(), crtc_mode_id_prop, mode_blob_raw);
+    req.add_raw_property(output.crtc.into(), crtc_active_prop, 1);
+    req.add_raw_property(output.plane.into(), plane_fb_id_prop, u64::from(fb_id_raw));
     req.add_raw_property(
         output.plane.into(),
-        plane_props.id("FB_ID")?,
-        u64::from(fb_id_raw),
-    );
-    req.add_raw_property(
-        output.plane.into(),
-        plane_props.id("CRTC_ID")?,
+        plane_crtc_id_prop,
         u64::from(plane_crtc_raw),
     );
-    req.add_raw_property(output.plane.into(), plane_props.id("SRC_X")?, 0);
-    req.add_raw_property(output.plane.into(), plane_props.id("SRC_Y")?, 0);
-    req.add_raw_property(output.plane.into(), plane_props.id("SRC_W")?, src_w);
-    req.add_raw_property(output.plane.into(), plane_props.id("SRC_H")?, src_h);
-    req.add_raw_property(output.plane.into(), plane_props.id("CRTC_X")?, 0);
-    req.add_raw_property(output.plane.into(), plane_props.id("CRTC_Y")?, 0);
-    req.add_raw_property(
-        output.plane.into(),
-        plane_props.id("CRTC_W")?,
-        u64::from(mode_w),
-    );
-    req.add_raw_property(
-        output.plane.into(),
-        plane_props.id("CRTC_H")?,
-        u64::from(mode_h),
-    );
+    req.add_raw_property(output.plane.into(), plane_src_x_prop, 0);
+    req.add_raw_property(output.plane.into(), plane_src_y_prop, 0);
+    req.add_raw_property(output.plane.into(), plane_src_w_prop, src_w);
+    req.add_raw_property(output.plane.into(), plane_src_h_prop, src_h);
+    req.add_raw_property(output.plane.into(), plane_crtc_x_prop, 0);
+    req.add_raw_property(output.plane.into(), plane_crtc_y_prop, 0);
+    req.add_raw_property(output.plane.into(), plane_crtc_w_prop, u64::from(mode_w));
+    req.add_raw_property(output.plane.into(), plane_crtc_h_prop, u64::from(mode_h));
 
     let result = device.atomic_commit(flags, req);
     let _ = device.destroy_property_blob(mode_blob_raw);
@@ -1560,6 +1719,69 @@ mod tests {
                 .map(|(p, cs)| (p, cs.iter().copied().collect()))
                 .collect(),
         }
+    }
+
+    #[test]
+    fn exact_probe_assignment_accepts_only_the_requested_drivable_tuple() {
+        let crtc = rh(10);
+        let other_crtc = rh(11);
+        let plane = ph(20);
+        let candidate = cand(1, "HDMI-1", vec![crtc, other_crtc], vec![(plane, &[crtc])]);
+
+        let exact = exact_assignment_from_candidate(&candidate, candidate.encoder, crtc, plane)
+            .expect("the exact tuple is valid");
+        assert_eq!(exact.connector, candidate.connector);
+        assert_eq!(exact.encoder, candidate.encoder);
+        assert_eq!(exact.crtc, crtc);
+        assert_eq!(exact.plane, plane);
+
+        assert!(
+            exact_assignment_from_candidate(&candidate, eh(99), crtc, plane).is_err(),
+            "a different encoder must not be substituted"
+        );
+        assert!(
+            exact_assignment_from_candidate(&candidate, candidate.encoder, rh(99), plane).is_err(),
+            "an encoder-incompatible CRTC must be rejected"
+        );
+        assert!(
+            exact_assignment_from_candidate(&candidate, candidate.encoder, other_crtc, plane)
+                .is_err(),
+            "the exact plane must advertise the exact CRTC"
+        );
+        assert!(
+            exact_assignment_from_candidate(&candidate, candidate.encoder, crtc, ph(99)).is_err(),
+            "a different primary plane must not be substituted"
+        );
+    }
+
+    #[test]
+    fn exact_probe_mode_selection_includes_refresh_rate() {
+        let modes = vec![
+            mode("2560x1440-60", 2560, 1440, 60, false),
+            mode("2560x1440-165", 2560, 1440, 165, true),
+        ];
+        assert_eq!(
+            requested_mode_index(
+                &modes,
+                ModeSpec {
+                    width: 2560,
+                    height: 1440,
+                    vrefresh: 165,
+                }
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            requested_mode_index(
+                &modes,
+                ModeSpec {
+                    width: 2560,
+                    height: 1440,
+                    vrefresh: 144,
+                }
+            ),
+            None
+        );
     }
 
     #[test]

@@ -919,7 +919,7 @@ const SCANOUT_POOL_DEPTH: usize = 3;
 /// Fresh completion timeout for each submitted disposable-probe fence.
 /// Allocation, atomic TEST_ONLY, pipeline setup, and completed CPU content
 /// validation are not charged to this GPU-liveness bound.
-const PRIME_RENDER_PROBE_TIMEOUT_NS: u64 = 200_000_000;
+pub(crate) const PRIME_RENDER_PROBE_TIMEOUT_NS: u64 = 200_000_000;
 
 pub(crate) struct PreparedScanoutPool {
     pool: ScanoutBoPool,
@@ -1237,6 +1237,7 @@ pub(crate) fn qualify_scanout_route_for_worker(
     route: ScanoutRoute,
     width: u32,
     height: u32,
+    fence_timeout_ns: u64,
 ) -> Result<QualifiedScanoutPlan, ScanoutQualificationError> {
     if !route_requires_copy_free_probe(route) {
         return Err(ScanoutQualificationError::Rejected(io::Error::new(
@@ -1248,6 +1249,12 @@ pub(crate) fn qualify_scanout_route_for_worker(
         return Err(ScanoutQualificationError::Rejected(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("worker qualification received invalid extent {width}x{height}"),
+        )));
+    }
+    if fence_timeout_ns == 0 {
+        return Err(ScanoutQualificationError::Rejected(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "worker qualification requires a non-zero per-fence timeout",
         )));
     }
 
@@ -1281,6 +1288,7 @@ pub(crate) fn qualify_scanout_route_for_worker(
                 height,
                 &output.scanout_modifiers,
                 plan,
+                fence_timeout_ns,
             )
             .map_err(classify_copy_free_qualification_error)
         },
@@ -1351,6 +1359,7 @@ pub(crate) fn qualify_scanout_route_for_worker(
                 height,
                 &output.scanout_modifiers,
                 plan,
+                fence_timeout_ns,
             )
             .map_err(classify_copied_qualification_error)
         },
@@ -1397,6 +1406,7 @@ pub(crate) fn qualify_copy_free_scanout_plan(
     height: u32,
     scanout_modifiers: &[u64],
     plan: ScanoutAllocationPlan,
+    fence_timeout_ns: u64,
 ) -> Result<QualifiedScanoutPlan, CopyFreeScanoutError> {
     debug_assert!(route_requires_copy_free_probe(route));
     let probe_pool = match ScanoutBoPool::allocate_exact(
@@ -1425,7 +1435,7 @@ pub(crate) fn qualify_copy_free_scanout_plan(
             copy_free_candidate_error(plan, "probe TEST_ONLY", &error),
         )));
     }
-    if let Err(error) = probe_pool.probe_renderer_access(PRIME_RENDER_PROBE_TIMEOUT_NS) {
+    if let Err(error) = probe_pool.probe_renderer_access(fence_timeout_ns) {
         let failure = io::Error::new(
             error.kind(),
             copy_free_candidate_error(plan, "probe rendering", error.as_io_error()),
@@ -1568,6 +1578,7 @@ fn allocate_copy_free_scanout_pool(
             height,
             scanout_modifiers,
             plan,
+            PRIME_RENDER_PROBE_TIMEOUT_NS,
         ) {
             Ok(qualified) => qualified,
             Err(CopyFreeScanoutError::Candidates(error)) => {
@@ -1633,6 +1644,7 @@ pub(crate) fn qualify_copied_scanout_plan(
     height: u32,
     scanout_modifiers: &[u64],
     plan: CopiedScanoutPlan,
+    fence_timeout_ns: u64,
 ) -> Result<QualifiedScanoutPlan, CopiedScanoutError> {
     debug_assert!(route_requires_copy_free_probe(route));
     debug_assert_eq!(destination_route.relationship, RenderKmsRelationship::Same);
@@ -1674,7 +1686,7 @@ pub(crate) fn qualify_copied_scanout_plan(
             format!("{} probe TEST_ONLY: {error}", plan.describe()),
         )));
     }
-    if let Err(error) = probe_pool.probe_copy_all(PRIME_RENDER_PROBE_TIMEOUT_NS) {
+    if let Err(error) = probe_pool.probe_copy_all(fence_timeout_ns) {
         let failure = io::Error::new(
             error.kind(),
             format!("{} probe render/copy/readback: {error}", plan.describe()),
@@ -1858,6 +1870,7 @@ fn allocate_copied_scanout_pool(
             height,
             scanout_modifiers,
             plan,
+            PRIME_RENDER_PROBE_TIMEOUT_NS,
         ) {
             Ok(qualified) => qualified,
             Err(CopiedScanoutError::Candidates(error)) => {
@@ -3716,6 +3729,31 @@ impl PlatformBackend {
             .selected_render_device
             .ok_or_else(|| io::Error::other("copied scanout has no selected source renderer"))?;
         resolve_copied_sink_renderer(&self.render_devices, selected, kms_key)
+    }
+
+    /// Return the scalar Vulkan identities needed by an isolated route probe.
+    /// Copy-free qualification remains useful when no unambiguous copied sink
+    /// exists, so sink-resolution failure is represented as `None` rather than
+    /// preventing the worker request.
+    pub(crate) fn scanout_qualification_devices_for_kms(
+        &self,
+        kms_key: crate::platform::drm::DrmDeviceKey,
+    ) -> io::Result<(VulkanDeviceSelector, Option<CopiedQualificationSink>)> {
+        let source = self.selected_render_device().ok_or_else(|| {
+            io::Error::other(format!(
+                "scanout qualification for {kms_key} has no selected source renderer"
+            ))
+        })?;
+        let copied_sink = match self.copied_sink_renderer_for_kms(kms_key) {
+            Ok((id, selector)) => Some(CopiedQualificationSink { id, selector }),
+            Err(error) => {
+                log::debug!(
+                    "scanout qualification for {kms_key}: copied sink unavailable: {error}"
+                );
+                None
+            }
+        };
+        Ok((source.selector, copied_sink))
     }
 
     fn copied_sink_context_for_kms(

@@ -18,16 +18,22 @@ use std::{
     },
     path::PathBuf,
     process::{Child, Command, Stdio},
+    rc::Rc,
     thread,
     time::{Duration, Instant},
 };
 use yserver_core::backend::{CrtcConfigToken, ModeSpec};
 
 use crate::{
+    drm::modeset::output_for_exact_probe_assignment,
     kms::{
-        render::platform::QualifiedScanoutPlan,
+        render::platform::{
+            CopiedQualificationSink, QualifiedScanoutPlan, ScanoutQualificationError,
+            qualify_scanout_route_for_worker,
+        },
         scanout_route::{RenderDeviceId, RenderKmsRelationship, ScanoutRoute},
         vk::{
+            device::VulkanDeviceSelector,
             scanout::{CopiedScanoutPlan, ScanoutAllocationPlan},
             target::CopiedSourcePlan,
         },
@@ -50,7 +56,11 @@ const RESPONSE_PAYLOAD_LEN: usize = 64;
 const REQUEST_FRAME_LEN: usize = HEADER_LEN + REQUEST_PAYLOAD_LEN;
 const RESPONSE_FRAME_LEN: usize = HEADER_LEN + RESPONSE_PAYLOAD_LEN;
 
-const ERROR_HANDLER_NOT_INTEGRATED: u32 = 1;
+const ERROR_KMS_RECONSTRUCTION: u32 = 1;
+const ERROR_ROUTE_REJECTED: u32 = 2;
+const ERROR_ROUTE_INDETERMINATE: u32 = 3;
+const ERROR_ROUTE_DEVICE_LOST: u32 = 4;
+const ERROR_KMS_INTERNAL: u32 = 5;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ProbeVulkanDeviceSelector {
@@ -58,10 +68,44 @@ pub(crate) struct ProbeVulkanDeviceSelector {
     pub(crate) driver_uuid: [u8; 16],
 }
 
+impl From<VulkanDeviceSelector> for ProbeVulkanDeviceSelector {
+    fn from(selector: VulkanDeviceSelector) -> Self {
+        let (device_uuid, driver_uuid) = selector.uuid_pair();
+        Self {
+            device_uuid,
+            driver_uuid,
+        }
+    }
+}
+
+impl From<ProbeVulkanDeviceSelector> for VulkanDeviceSelector {
+    fn from(selector: ProbeVulkanDeviceSelector) -> Self {
+        Self::from_uuid_pair(selector.device_uuid, selector.driver_uuid)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ProbeCopiedSink {
     pub(crate) render_device_id: RenderDeviceId,
     pub(crate) selector: ProbeVulkanDeviceSelector,
+}
+
+impl From<CopiedQualificationSink> for ProbeCopiedSink {
+    fn from(sink: CopiedQualificationSink) -> Self {
+        Self {
+            render_device_id: sink.id,
+            selector: sink.selector.into(),
+        }
+    }
+}
+
+impl From<ProbeCopiedSink> for CopiedQualificationSink {
+    fn from(sink: ProbeCopiedSink) -> Self {
+        Self {
+            id: sink.render_device_id,
+            selector: sink.selector.into(),
+        }
+    }
 }
 
 /// Exact KMS objects the child must rediscover and use for atomic `TEST_ONLY`.
@@ -651,6 +695,21 @@ fn validate_response_for_request(
 ///
 /// This remains unused until the platform integration commit. Keeping it here
 /// makes the process boundary independently testable first.
+fn probe_helper_executable() -> io::Result<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        // Resolve this at exec time through procfs. Unlike the pathname from
+        // `current_exe`, `/proc/self/exe` continues to name the exact running
+        // image after an atomic deployment replaces or unlinks that pathname,
+        // so parent and helper cannot silently cross protocol versions.
+        Ok(PathBuf::from("/proc/self/exe"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        env::current_exe()
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) struct ProbeHelperSupervisor {
     executable: PathBuf,
@@ -661,7 +720,7 @@ pub(crate) struct ProbeHelperSupervisor {
 impl ProbeHelperSupervisor {
     pub(crate) fn for_current_exe(watchdog: Duration) -> io::Result<Self> {
         Ok(Self {
-            executable: env::current_exe()?,
+            executable: probe_helper_executable()?,
             watchdog,
         })
     }
@@ -727,31 +786,161 @@ fn run_reexec_helper() -> io::Result<()> {
     let kms = take_inherited_fd(KMS_FD, "KMS device")?;
     let control = UnixStream::from(control);
     let device = crate::drm::Device::from_inherited_kms_fd(kms, "<inherited probe KMS fd>");
-    serve_one(control, device, placeholder_probe_handler)
+    serve_one(control, device, qualify_route_probe)
 }
 
-fn placeholder_probe_handler(
-    _device: &crate::drm::Device,
+fn elapsed_ns(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn probe_failure(error_code: u32, error: &io::Error) -> ProbeFailure {
+    ProbeFailure {
+        error_code,
+        detail_code: error
+            .raw_os_error()
+            .map_or(0, |errno| u64::from(errno.unsigned_abs())),
+    }
+}
+
+fn route_probe_outcome(
+    result: Result<QualifiedScanoutPlan, ScanoutQualificationError>,
+) -> RouteProbeOutcome {
+    match result {
+        Ok(qualified) => RouteProbeOutcome::Compatible(qualified),
+        Err(ScanoutQualificationError::Rejected(error)) => {
+            RouteProbeOutcome::Rejected(probe_failure(ERROR_ROUTE_REJECTED, &error))
+        }
+        Err(ScanoutQualificationError::Indeterminate(error)) => {
+            RouteProbeOutcome::Indeterminate(probe_failure(ERROR_ROUTE_INDETERMINATE, &error))
+        }
+        Err(ScanoutQualificationError::DeviceLost(error)) => {
+            RouteProbeOutcome::Indeterminate(probe_failure(ERROR_ROUTE_DEVICE_LOST, &error))
+        }
+    }
+}
+
+fn kms_reconstruction_outcome(error: &io::Error) -> RouteProbeOutcome {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::InvalidInput
+            | io::ErrorKind::NotFound
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::Unsupported
+    ) {
+        RouteProbeOutcome::Rejected(probe_failure(ERROR_KMS_RECONSTRUCTION, error))
+    } else {
+        // A hard inherited-fd/ioctl failure is not evidence that another
+        // representation is incompatible. Keep it distinct from ordinary
+        // rejection so the parent does not continue after uncertain KMS state.
+        RouteProbeOutcome::Internal(probe_failure(ERROR_KMS_INTERNAL, error))
+    }
+}
+
+fn qualify_route_probe(
+    device: Rc<crate::drm::Device>,
     request: RouteProbeRequest,
 ) -> RouteProbeResponse {
+    let started = Instant::now();
+    let output = match output_for_exact_probe_assignment(
+        &device,
+        request.kms.connector,
+        request.kms.encoder,
+        request.kms.crtc,
+        request.kms.plane,
+        request.mode,
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            let outcome = kms_reconstruction_outcome(&error);
+            match outcome {
+                RouteProbeOutcome::Rejected(_) => log::warn!(
+                    "isolated PRIME probe token {:?} rejected exact KMS assignment {:?} for route \
+                     {:?}: {error}",
+                    request.token,
+                    request.kms,
+                    request.source_route,
+                ),
+                RouteProbeOutcome::Internal(_) => log::error!(
+                    "isolated PRIME probe token {:?} failed to reconstruct KMS assignment {:?} \
+                     for route {:?}: {error}",
+                    request.token,
+                    request.kms,
+                    request.source_route,
+                ),
+                RouteProbeOutcome::Compatible(_) | RouteProbeOutcome::Indeterminate(_) => {
+                    unreachable!("KMS reconstruction maps only to rejection or internal failure")
+                }
+            }
+            return RouteProbeResponse {
+                token: request.token,
+                outcome,
+                elapsed_ns: elapsed_ns(started),
+            };
+        }
+    };
+
+    let result = qualify_scanout_route_for_worker(
+        request.source_selector.into(),
+        request.copied_sink.map(Into::into),
+        device,
+        &output,
+        request.source_route,
+        u32::from(request.mode.width),
+        u32::from(request.mode.height),
+        request.fence_timeout_ns,
+    );
+    match &result {
+        Ok(qualified) => {
+            log::info!(
+                "isolated PRIME probe token {:?} qualified {qualified:?} for route {:?} in {} ms",
+                request.token,
+                request.source_route,
+                started.elapsed().as_millis(),
+            );
+        }
+        Err(ScanoutQualificationError::Rejected(error)) => {
+            log::info!(
+                "isolated PRIME probe token {:?} rejected route {:?} after {} ms: {error}",
+                request.token,
+                request.source_route,
+                started.elapsed().as_millis(),
+            );
+        }
+        Err(ScanoutQualificationError::Indeterminate(error)) => {
+            log::error!(
+                "isolated PRIME probe token {:?} became indeterminate for route {:?} after {} ms: \
+                 {error}",
+                request.token,
+                request.source_route,
+                started.elapsed().as_millis(),
+            );
+        }
+        Err(ScanoutQualificationError::DeviceLost(error)) => {
+            log::error!(
+                "isolated PRIME probe token {:?} lost a Vulkan device for route {:?} after {} ms: \
+                 {error}",
+                request.token,
+                request.source_route,
+                started.elapsed().as_millis(),
+            );
+        }
+    }
+    let outcome = route_probe_outcome(result);
     RouteProbeResponse {
         token: request.token,
-        outcome: RouteProbeOutcome::Internal(ProbeFailure {
-            error_code: ERROR_HANDLER_NOT_INTEGRATED,
-            detail_code: 0,
-        }),
-        elapsed_ns: 0,
+        outcome,
+        elapsed_ns: elapsed_ns(started),
     }
 }
 
 fn serve_one<H>(mut control: UnixStream, device: crate::drm::Device, handler: H) -> io::Result<()>
 where
-    H: FnOnce(&crate::drm::Device, RouteProbeRequest) -> RouteProbeResponse,
+    H: FnOnce(Rc<crate::drm::Device>, RouteProbeRequest) -> RouteProbeResponse,
 {
     let mut request_frame = [0_u8; REQUEST_FRAME_LEN];
     control.read_exact(&mut request_frame)?;
     let request = RouteProbeRequest::decode(&request_frame).map_err(protocol_io_error)?;
-    let response = handler(&device, request);
+    let response = handler(Rc::new(device), request);
     validate_response_for_request(&request, &response).map_err(protocol_io_error)?;
     control.write_all(&response.encode())?;
     Ok(())
@@ -763,11 +952,14 @@ fn supervise_exchange(
     request: RouteProbeRequest,
     watchdog: Duration,
 ) -> io::Result<RouteProbeResponse> {
-    control.set_nonblocking(true)?;
-    let deadline = Instant::now()
-        .checked_add(watchdog)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "probe watchdog overflow"))?;
     let result = (|| {
+        // Keep all fallible post-spawn setup inside this closure. The cleanup
+        // below therefore runs for socket setup, deadline construction,
+        // protocol I/O, decode, and validation failures alike.
+        control.set_nonblocking(true)?;
+        let deadline = Instant::now().checked_add(watchdog).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "probe watchdog overflow")
+        })?;
         write_all_until(&mut control, &request.encode(), deadline)?;
         let mut response_frame = [0_u8; RESPONSE_FRAME_LEN];
         read_exact_until(&mut control, &mut response_frame, deadline)?;
@@ -1086,6 +1278,86 @@ mod tests {
         }
     }
 
+    #[test]
+    fn wire_selectors_round_trip_platform_uuid_pairs_and_copied_sink_identity() {
+        let wire_selector = selector(0x23);
+        let platform_selector: VulkanDeviceSelector = wire_selector.into();
+        assert_eq!(
+            ProbeVulkanDeviceSelector::from(platform_selector),
+            wire_selector
+        );
+
+        let wire_sink = ProbeCopiedSink {
+            render_device_id: drm_render(226, 131),
+            selector: wire_selector,
+        };
+        let platform_sink: CopiedQualificationSink = wire_sink.into();
+        assert_eq!(ProbeCopiedSink::from(platform_sink), wire_sink);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn helper_reexec_uses_the_running_procfs_image() {
+        assert_eq!(
+            probe_helper_executable().expect("Linux helper executable"),
+            PathBuf::from("/proc/self/exe")
+        );
+    }
+
+    #[test]
+    fn qualification_errors_preserve_rejected_indeterminate_and_device_lost_policy() {
+        let rejected = route_probe_outcome(Err(ScanoutQualificationError::Rejected(
+            io::Error::from_raw_os_error(libc::EINVAL),
+        )));
+        assert_eq!(
+            rejected,
+            RouteProbeOutcome::Rejected(ProbeFailure {
+                error_code: ERROR_ROUTE_REJECTED,
+                detail_code: libc::EINVAL as u64,
+            })
+        );
+
+        let indeterminate = route_probe_outcome(Err(ScanoutQualificationError::Indeterminate(
+            io::Error::new(io::ErrorKind::TimedOut, "fence timeout"),
+        )));
+        assert!(matches!(
+            indeterminate,
+            RouteProbeOutcome::Indeterminate(ProbeFailure {
+                error_code: ERROR_ROUTE_INDETERMINATE,
+                ..
+            })
+        ));
+
+        let device_lost = route_probe_outcome(Err(ScanoutQualificationError::DeviceLost(
+            io::Error::other("VK_ERROR_DEVICE_LOST"),
+        )));
+        assert!(matches!(
+            device_lost,
+            RouteProbeOutcome::Indeterminate(ProbeFailure {
+                error_code: ERROR_ROUTE_DEVICE_LOST,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn kms_reconstruction_distinguishes_stale_assignment_from_hard_io_failure() {
+        assert!(matches!(
+            kms_reconstruction_outcome(&io::Error::new(io::ErrorKind::InvalidInput, "stale CRTC")),
+            RouteProbeOutcome::Rejected(ProbeFailure {
+                error_code: ERROR_KMS_RECONSTRUCTION,
+                ..
+            })
+        ));
+        assert!(matches!(
+            kms_reconstruction_outcome(&io::Error::from_raw_os_error(libc::EIO)),
+            RouteProbeOutcome::Internal(ProbeFailure {
+                error_code: ERROR_KMS_INTERNAL,
+                ..
+            })
+        ));
+    }
+
     fn copied_response(request: &RouteProbeRequest) -> RouteProbeResponse {
         RouteProbeResponse {
             token: request.token,
@@ -1374,6 +1646,39 @@ mod tests {
         assert_eq!(observed, copied_response(&request));
         assert!(started.elapsed() < Duration::from_secs(1));
         worker.join().expect("response writer");
+    }
+
+    #[test]
+    fn supervisor_reaps_child_when_post_spawn_deadline_setup_fails() {
+        assert!(
+            Instant::now().checked_add(Duration::MAX).is_none(),
+            "Duration::MAX must overflow this platform's Instant"
+        );
+        let (parent, _helper) = UnixStream::pair().expect("socketpair");
+        let child = Command::new("/bin/sleep")
+            .arg("10")
+            .spawn()
+            .expect("spawn sleeping child");
+        let child_pid = libc::pid_t::try_from(child.id()).expect("child pid fits pid_t");
+
+        let error = supervise_exchange(child, parent, request(12, true), Duration::MAX)
+            .expect_err("deadline overflow must fail setup");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        let reap_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            // SAFETY: signal 0 does not affect the process; it only checks
+            // whether the child PID still names a live or zombie process.
+            let present = unsafe { libc::kill(child_pid, 0) } == 0;
+            if !present && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                break;
+            }
+            assert!(
+                Instant::now() < reap_deadline,
+                "supervisor cleanup did not reap setup-failed child {child_pid}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
