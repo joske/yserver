@@ -27,10 +27,10 @@ use std::{
 use ash::vk;
 use yserver_core::{
     backend::{
-        AnyHandle, Backend, BackendFdKind, ClipState, CursorHandle, DrawState, Dri3Caps,
-        Dri3PixmapExport, FillState, FontHandle, GlyphSetHandle, KeymapLoad, OriginContext,
-        PictureHandle, PixmapHandle, PresentCaps, PresentScanoutCandidate, PresentSourceWait,
-        WindowHandle, identity_ramp, resample_channel,
+        AnyHandle, Backend, BackendFdKind, ClipState, CrtcConfigApply, CrtcConfigToken,
+        CursorHandle, DrawState, Dri3Caps, Dri3PixmapExport, FillState, FontHandle, GlyphSetHandle,
+        KeymapLoad, OriginContext, PictureHandle, PixmapHandle, PresentCaps,
+        PresentScanoutCandidate, PresentSourceWait, WindowHandle, identity_ramp, resample_channel,
     },
     core_loop::HostInputEvent,
     host_x11::{
@@ -54,7 +54,8 @@ use crate::{
         render::{
             engine::{RenderEngine, decode_x11_pixel_for_storage},
             platform::{
-                ConnectorSnapshot, CrtcKey, PlatformBackend, is_terminal_disposable_probe_error,
+                ConnectorSnapshot, CrtcKey, PlatformBackend, QualifiedScanoutPlan,
+                is_terminal_disposable_probe_error,
             },
             scene::SceneCompositor,
             store::{
@@ -66,7 +67,7 @@ use crate::{
             },
             telemetry::Telemetry,
         },
-        scanout_route::RenderDeviceId,
+        scanout_route::{RenderDeviceId, RenderKmsRelationship, ScanoutRoute},
     },
     platform::drm::ModeIdentity,
 };
@@ -490,6 +491,57 @@ pub(crate) enum ConnectorConfig {
         x: i32,
         y: i32,
     },
+}
+
+/// Resource-free request handed to an asynchronous PRIME route qualifier.
+/// The live DRM output selected by discovery remains in the pending backend
+/// entry; this message contains only stable, worker/process-friendly values.
+pub(crate) struct CrtcConfigProbeJob {
+    pub(crate) token: CrtcConfigToken,
+    pub(crate) output_key: OutputKey,
+    pub(crate) mode: yserver_core::backend::ModeSpec,
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+    pub(crate) route: ScanoutRoute,
+    pub(crate) scanout_modifiers: Vec<u64>,
+}
+
+/// One completed asynchronous qualification. A successful plan contains no
+/// live Vulkan/DRM object and can therefore be rejected safely if its topology
+/// or VT snapshot has gone stale.
+pub(crate) struct CrtcConfigProbeCompletion {
+    pub(crate) token: CrtcConfigToken,
+    pub(crate) result: io::Result<QualifiedScanoutPlan>,
+}
+
+/// Injectable owner of the worker/helper transport. Production can later
+/// translate its process codec into these scalar jobs/results without changing
+/// the core-facing token lifecycle; tests use an in-memory implementation.
+pub(crate) trait CrtcConfigProbeExecutor {
+    fn set_core_sender(&mut self, _sender: yserver_core::core_loop::CoreSender) {}
+    /// Queue one process-helper request and return without performing the
+    /// qualification or waiting for the child on the core thread.
+    fn enqueue(&mut self, job: CrtcConfigProbeJob) -> io::Result<()>;
+    /// Non-blockingly drain results already delivered by the helper owner.
+    fn drain_ready(&mut self) -> Vec<CrtcConfigProbeCompletion>;
+    /// Best-effort, non-blocking cancellation/retirement. Implementations must
+    /// tolerate this racing a completed child and repeated calls.
+    fn cancel(&mut self, _token: CrtcConfigToken) {}
+}
+
+struct PendingCrtcConfigProbe {
+    output_id: u32,
+    output_key: OutputKey,
+    connector: String,
+    mode: yserver_core::backend::ModeSpec,
+    x: i32,
+    y: i32,
+    route: ScanoutRoute,
+    prepared_output: Option<crate::platform::drm::Output>,
+    topology_signature: u64,
+    topology_epoch: u64,
+    vt_state: crate::vt::state::VtState,
+    was_active: bool,
 }
 
 /// Reconcile the physical-output gate after a successful CRTC mutation.
@@ -1119,6 +1171,19 @@ pub struct KmsBackend {
     /// Core-channel sender for backend-originated shutdowns. Handed in via
     /// `set_input_sender` after the channel is created in `lib.rs`.
     input_sender: Option<yserver_core::core_loop::CoreSender>,
+    /// Optional asynchronous cross-device scanout qualifier. Absence keeps the
+    /// existing synchronous `apply_crtc_config` path unchanged.
+    crtc_config_probe_executor: Option<Box<dyn CrtcConfigProbeExecutor>>,
+    pending_crtc_config_probes: HashMap<CrtcConfigToken, PendingCrtcConfigProbe>,
+    ready_crtc_config_results: HashMap<CrtcConfigToken, io::Result<QualifiedScanoutPlan>>,
+    next_crtc_config_token: u64,
+    /// Invalidates results across any topology quiesce or VT event, including
+    /// an ABA transition which happens to restore the same final layout.
+    crtc_config_topology_epoch: u64,
+    /// Test-only discovery result used to exercise the real `begin` hook with
+    /// the fd-less DRM fixture. Production always performs live discovery.
+    #[cfg(test)]
+    crtc_config_discovery_override: Option<crate::platform::drm::Output>,
     /// Direct-mode input-thread control channel. Used by VT release /
     /// acquire to pause and resume the dedicated input thread.
     input_thread_control: Option<std::sync::Arc<crate::input_thread::InputThreadControl>>,
@@ -1632,6 +1697,7 @@ impl KmsBackend {
     }
 
     fn quiesce_before_topology_mutation(&mut self, context: &'static str) -> io::Result<()> {
+        self.bump_crtc_config_topology_epoch();
         let old_pending_pageflips = self.pending_pageflip_crtcs();
         if self.scanout_m2.active() {
             if let Err(error) = self.teardown_direct_before_topology_requery(context) {
@@ -1953,6 +2019,252 @@ impl KmsBackend {
             layout.output.picked.flags.hash(&mut hasher);
         }
         hasher.finish()
+    }
+
+    fn crtc_config_topology_signature(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.scanout_m1_topology_signature().hash(&mut hasher);
+        self.kms_outputs_active.hash(&mut hasher);
+        for (index, output) in self.platform.outputs.iter().enumerate() {
+            output.key.hash(&mut hasher);
+            output.scanout_route.hash(&mut hasher);
+            self.platform
+                .scanout_pools
+                .get(index)
+                .and_then(Option::as_ref)
+                .map(crate::kms::vk::scanout::OutputScanout::route)
+                .hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    fn bump_crtc_config_topology_epoch(&mut self) {
+        self.crtc_config_topology_epoch = self.crtc_config_topology_epoch.wrapping_add(1);
+    }
+
+    fn next_crtc_config_token(&mut self) -> CrtcConfigToken {
+        loop {
+            let token = CrtcConfigToken(self.next_crtc_config_token.max(1));
+            self.next_crtc_config_token = token.0.wrapping_add(1).max(1);
+            if !self.pending_crtc_config_probes.contains_key(&token)
+                && !self.ready_crtc_config_results.contains_key(&token)
+            {
+                return token;
+            }
+        }
+    }
+
+    fn crtc_enable_needs_async_qualification(
+        &self,
+        output_key: &OutputKey,
+        mode: yserver_core::backend::ModeSpec,
+        route: ScanoutRoute,
+    ) -> bool {
+        if route.relationship == RenderKmsRelationship::Same {
+            return false;
+        }
+        let existing_idx = self
+            .platform
+            .outputs
+            .iter()
+            .position(|output| &output.key == output_key);
+        let existing = existing_idx.and_then(|index| self.platform.outputs.get(index));
+        let pool_route = existing_idx
+            .and_then(|index| self.platform.scanout_pools.get(index))
+            .and_then(Option::as_ref)
+            .map(crate::kms::vk::scanout::OutputScanout::route);
+        existing.is_none_or(|output| {
+            output.width != mode.width
+                || output.height != mode.height
+                || output.scanout_route != route
+                || pool_route != Some(route)
+        })
+    }
+
+    fn enqueue_prepared_crtc_config_probe(
+        &mut self,
+        output_id: u32,
+        output_key: OutputKey,
+        connector: String,
+        mode: yserver_core::backend::ModeSpec,
+        x: i32,
+        y: i32,
+        prepared_output: crate::platform::drm::Output,
+        route: ScanoutRoute,
+    ) -> io::Result<CrtcConfigToken> {
+        if self.crtc_config_probe_executor.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "no asynchronous CRTC probe executor installed",
+            ));
+        }
+        let token = self.next_crtc_config_token();
+        let job = CrtcConfigProbeJob {
+            token,
+            output_key: output_key.clone(),
+            mode,
+            x,
+            y,
+            route,
+            scanout_modifiers: prepared_output.scanout_modifiers.clone(),
+        };
+        log::debug!(
+            "begin_crtc_config: enqueue token {:?} for {:?} {}x{}@{} at ({},{}), route {:?}, {} scanout modifier(s)",
+            job.token,
+            job.output_key,
+            job.mode.width,
+            job.mode.height,
+            job.mode.vrefresh,
+            job.x,
+            job.y,
+            job.route,
+            job.scanout_modifiers.len(),
+        );
+        let pending = PendingCrtcConfigProbe {
+            output_id,
+            output_key,
+            connector,
+            mode,
+            x,
+            y,
+            route,
+            prepared_output: Some(prepared_output),
+            topology_signature: self.crtc_config_topology_signature(),
+            topology_epoch: self.crtc_config_topology_epoch,
+            vt_state: self.vt_state,
+            was_active: self.kms_outputs_active,
+        };
+        self.pending_crtc_config_probes.insert(token, pending);
+        let enqueue_result = self
+            .crtc_config_probe_executor
+            .as_mut()
+            .expect("executor checked above")
+            .enqueue(job);
+        if let Err(error) = enqueue_result {
+            self.pending_crtc_config_probes.remove(&token);
+            self.crtc_config_probe_executor
+                .as_mut()
+                .expect("executor checked above")
+                .cancel(token);
+            return Err(error);
+        }
+        Ok(token)
+    }
+
+    fn discover_crtc_config_output(
+        &mut self,
+        output_key: &OutputKey,
+        output_device: &Rc<crate::drm::Device>,
+        connector: &str,
+    ) -> io::Result<crate::platform::drm::Output> {
+        #[cfg(test)]
+        if let Some(output) = self.crtc_config_discovery_override.take() {
+            return Ok(output);
+        }
+
+        let reserved_routes: Vec<_> = self
+            .platform
+            .outputs
+            .iter()
+            .filter(|layout| {
+                layout.key.device_key == output_key.device_key && layout.key != *output_key
+            })
+            .map(|layout| {
+                (
+                    layout.output.encoder,
+                    layout.output.crtc,
+                    layout.output.plane,
+                )
+            })
+            .collect();
+        crate::platform::drm::discover_output_for_connector(
+            output_device,
+            connector,
+            &reserved_routes,
+        )
+        .map_err(|error| {
+            log::error!("begin_crtc_config: target discovery for {connector} failed: {error}");
+            error
+        })
+    }
+
+    fn stale_crtc_config_probe_reason(&self, pending: &PendingCrtcConfigProbe) -> Option<String> {
+        if !self.scanout_allowed() {
+            return Some(format!(
+                "VT/DRM-master state is {:?}, not Active",
+                self.vt_state
+            ));
+        }
+        if self.vt_state != pending.vt_state {
+            return Some(format!(
+                "VT state changed from {:?} to {:?}",
+                pending.vt_state, self.vt_state
+            ));
+        }
+        if self.crtc_config_topology_epoch != pending.topology_epoch {
+            return Some(format!(
+                "topology epoch changed from {} to {}",
+                pending.topology_epoch, self.crtc_config_topology_epoch
+            ));
+        }
+        if self.crtc_config_topology_signature() != pending.topology_signature {
+            return Some("live output topology changed".to_string());
+        }
+        if self.output_key_by_id.get(&pending.output_id) != Some(&pending.output_key) {
+            return Some(format!(
+                "RANDR output {} no longer names {:?}",
+                pending.output_id, pending.output_key
+            ));
+        }
+        let Some(entry) = self.randr_id_alloc.entry(&pending.output_key) else {
+            return Some(format!("connector {} left the registry", pending.connector));
+        };
+        if !entry.connected {
+            return Some(format!("connector {} disconnected", pending.connector));
+        }
+        if !entry.modes.iter().any(|candidate| {
+            candidate.width == pending.mode.width
+                && candidate.height == pending.mode.height
+                && candidate.vrefresh == pending.mode.vrefresh
+        }) {
+            return Some(format!(
+                "connector {} no longer advertises {}x{}@{}",
+                pending.connector, pending.mode.width, pending.mode.height, pending.mode.vrefresh
+            ));
+        }
+        if !self.provider_output_source_allows(pending.output_key.device_key) {
+            return Some(format!(
+                "PRIME Output Source policy for {} was detached",
+                pending.output_key.device_key
+            ));
+        }
+        match self
+            .platform
+            .scanout_route_for_kms(pending.output_key.device_key)
+        {
+            Ok(route) if route == pending.route => None,
+            Ok(route) => Some(format!(
+                "scanout route changed from {:?} to {:?}",
+                pending.route, route
+            )),
+            Err(error) => Some(format!("scanout route is no longer available: {error}")),
+        }
+    }
+
+    /// Install the process-helper adapter that owns qualification execution.
+    /// Kept as a narrow injection seam so helper transport can land without
+    /// exposing backend internals or changing the core-facing token contract.
+    #[allow(dead_code)]
+    pub(crate) fn set_crtc_config_probe_executor(
+        &mut self,
+        mut executor: Box<dyn CrtcConfigProbeExecutor>,
+    ) {
+        if let Some(sender) = self.input_sender.as_ref() {
+            executor.set_core_sender(sender.clone_handle());
+        }
+        self.crtc_config_probe_executor = Some(executor);
     }
 
     fn maybe_probe_scanout_m1(
@@ -2923,6 +3235,13 @@ impl KmsBackend {
             led_relay: None,
             leds_sent: 0,
             input_sender: None,
+            crtc_config_probe_executor: None,
+            pending_crtc_config_probes: HashMap::new(),
+            ready_crtc_config_results: HashMap::new(),
+            next_crtc_config_token: 1,
+            crtc_config_topology_epoch: 0,
+            #[cfg(test)]
+            crtc_config_discovery_override: None,
             input_thread_control: None,
             randr_id_alloc: RandrIdAllocator::default(),
             provider_output_sources: HashMap::new(),
@@ -3850,6 +4169,13 @@ impl KmsBackend {
             led_relay: None,
             leds_sent: 0,
             input_sender: None,
+            crtc_config_probe_executor: None,
+            pending_crtc_config_probes: HashMap::new(),
+            ready_crtc_config_results: HashMap::new(),
+            next_crtc_config_token: 1,
+            crtc_config_topology_epoch: 0,
+            #[cfg(test)]
+            crtc_config_discovery_override: None,
             input_thread_control: None,
             randr_id_alloc: RandrIdAllocator::default(),
             provider_output_sources: HashMap::new(),
@@ -4965,6 +5291,9 @@ impl KmsBackend {
             entry.mm_height = snapshot.mm_height;
             entry.connector_type.clone_from(&snapshot.connector_type);
         }
+        if !delta.is_empty() {
+            self.bump_crtc_config_topology_epoch();
+        }
         delta
     }
 
@@ -4989,6 +5318,9 @@ impl KmsBackend {
             config_changed |= delta.config_changed;
         }
         let changed = !changed_keys.is_empty();
+        if changed {
+            self.bump_crtc_config_topology_epoch();
+        }
         // A force query never advances lastSetTime. It advances lastConfigTime
         // for connection/mode-list changes and notifies dirty outputs for
         // those or monitor-identity invalidation.
@@ -8882,6 +9214,10 @@ impl KmsBackend {
     /// (`inject_seat_event_for_test`) share the same logic.
     fn drive_vt_event(&mut self, state: &mut ServerState, ev: crate::vt::state::VtEventKind) {
         use crate::vt::state::{VtAction, VtEventKind};
+
+        // Even an Active→Suspended→Active ABA cycle invalidates a result that
+        // was qualified against the old DRM-master/resource lifetime.
+        self.bump_crtc_config_topology_epoch();
 
         // Drive the state machine to a stable state. The loop consumes
         // any counter-event coalesced into the pending flags so a fast VT
@@ -15076,6 +15412,9 @@ impl Backend for KmsBackend {
     }
 
     fn set_input_sender(&mut self, sender: yserver_core::core_loop::CoreSender) {
+        if let Some(executor) = self.crtc_config_probe_executor.as_mut() {
+            executor.set_core_sender(sender.clone_handle());
+        }
         self.input_sender = Some(sender);
     }
 
@@ -15323,12 +15662,343 @@ impl Backend for KmsBackend {
                 );
             }
         }
+        self.bump_crtc_config_topology_epoch();
 
         // A provider relationship changes neither the CRTC configuration nor
         // available connector/mode inventory. Rebuild only the projection and
         // preserve both lastSetTime and configTimestamp.
         self.rebuild_randr_state(state, None, false);
         Ok(true)
+    }
+
+    fn begin_crtc_config(
+        &mut self,
+        output_id: u32,
+        connector: &str,
+        mode: Option<yserver_core::backend::ModeSpec>,
+        x: i32,
+        y: i32,
+    ) -> io::Result<CrtcConfigApply> {
+        // Until a worker/helper transport is installed, preserve the existing
+        // synchronous backend behavior exactly. Disables and same-device
+        // changes also have no disposable PRIME qualification to move away
+        // from the core thread.
+        let Some(mode_spec) = mode else {
+            return self
+                .apply_crtc_config(output_id, connector, mode, x, y)
+                .map(CrtcConfigApply::Applied);
+        };
+        if self.crtc_config_probe_executor.is_none() {
+            return self
+                .apply_crtc_config(output_id, connector, mode, x, y)
+                .map(CrtcConfigApply::Applied);
+        }
+
+        let output_key = self
+            .output_key_by_id
+            .get(&output_id)
+            .cloned()
+            .ok_or_else(|| io::Error::other(format!("unknown RANDR output id {output_id}")))?;
+        if output_key.connector_name != connector {
+            return Err(io::Error::other(format!(
+                "RANDR output {output_id} name mismatch: registry has {}, request resolved {connector}",
+                output_key.connector_name
+            )));
+        }
+
+        // Match apply_crtc_config's policy ordering: an idempotent request may
+        // not silently reassert a split output after its provider association
+        // was detached while another client was active.
+        if !self.provider_output_source_allows(output_key.device_key) {
+            let sink_endpoint = RandrProviderEndpoint::Kms(output_key.device_key);
+            let sink_provider = self.randr_id_alloc.providers.get(&sink_endpoint).copied();
+            let selected_source = self.selected_render_provider_endpoint();
+            let source_provider = selected_source
+                .and_then(|endpoint| self.randr_id_alloc.providers.get(&endpoint).copied());
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "output {connector} belongs to KMS sink provider {} ({sink_endpoint:?}); attach it to selected source provider {} ({selected_source:?}) with RANDR SetProviderOutputSource before enabling it",
+                    sink_provider.map_or_else(|| "<unknown>".to_string(), |id| id.to_string()),
+                    source_provider.map_or_else(|| "<none>".to_string(), |id| id.to_string()),
+                ),
+            ));
+        }
+
+        let requested = ConnectorConfig::Enabled {
+            mode_w: mode_spec.width,
+            mode_h: mode_spec.height,
+            vrefresh: mode_spec.vrefresh,
+            x,
+            y,
+        };
+        let current = self
+            .platform
+            .outputs
+            .iter()
+            .find(|layout| layout.key == output_key)
+            .map_or(ConnectorConfig::Off, |layout| ConnectorConfig::Enabled {
+                mode_w: layout.width,
+                mode_h: layout.height,
+                vrefresh: layout.output.picked.vrefresh,
+                x: layout.x,
+                y: layout.y,
+            });
+        if current == requested {
+            return self
+                .apply_crtc_config(output_id, connector, mode, x, y)
+                .map(CrtcConfigApply::Applied);
+        }
+
+        if self
+            .platform
+            .vk
+            .as_ref()
+            .is_some_and(|vk| vk.is_software_rasterizer())
+            && std::env::var_os("YSERVER_ALLOW_SOFTWARE_VULKAN").is_none()
+        {
+            return Err(io::Error::other(format!(
+                "begin_crtc_config: refusing to enable {connector} with a software Vulkan \
+                 renderer; install a hardware Vulkan driver or set \
+                 YSERVER_ALLOW_SOFTWARE_VULKAN=1 for a deliberate software-scanout setup"
+            )));
+        }
+        if self.vt_state != crate::vt::state::VtState::Active {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                format!(
+                    "begin_crtc_config: cannot qualify {connector} while VT is {:?}",
+                    self.vt_state
+                ),
+            ));
+        }
+
+        let route = self.platform.scanout_route_for_kms(output_key.device_key)?;
+        if !self.crtc_enable_needs_async_qualification(&output_key, mode_spec, route) {
+            return self
+                .apply_crtc_config(output_id, connector, mode, x, y)
+                .map(CrtcConfigApply::Applied);
+        }
+
+        let output_device = Rc::clone(
+            &self
+                .platform
+                .device_for_output(&output_key)
+                .ok_or_else(|| {
+                    io::Error::other(format!(
+                        "RANDR output {output_id} belongs to unavailable DRM device {}",
+                        output_key.device_key
+                    ))
+                })?
+                .device,
+        );
+        // Discovery and advertised-mode validation are deliberately completed
+        // while the old topology is still lit. The live DRM output stays in
+        // the pending entry; only scalar route/modifier data crosses to the
+        // executor.
+        let prepared_output =
+            self.discover_crtc_config_output(&output_key, &output_device, connector)?;
+        if prepared_output.connector_name != connector {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "begin_crtc_config: discovery returned connector {} for requested {connector}",
+                    prepared_output.connector_name
+                ),
+            ));
+        }
+        if !prepared_output.modes.iter().any(|candidate| {
+            candidate.width == mode_spec.width
+                && candidate.height == mode_spec.height
+                && candidate.vrefresh == mode_spec.vrefresh
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "connector {connector}: mode {}x{}@{} not in advertised list",
+                    mode_spec.width, mode_spec.height, mode_spec.vrefresh
+                ),
+            ));
+        }
+
+        let token = self.enqueue_prepared_crtc_config_probe(
+            output_id,
+            output_key,
+            connector.to_string(),
+            mode_spec,
+            x,
+            y,
+            prepared_output,
+            route,
+        )?;
+        Ok(CrtcConfigApply::Pending(token))
+    }
+
+    fn drain_ready_crtc_configs(&mut self) -> Vec<CrtcConfigToken> {
+        let Some(executor) = self.crtc_config_probe_executor.as_mut() else {
+            return Vec::new();
+        };
+        let completions = executor.drain_ready();
+        let mut ready = Vec::with_capacity(completions.len());
+        for completion in completions {
+            if !self
+                .pending_crtc_config_probes
+                .contains_key(&completion.token)
+            {
+                // Cancellation may race worker completion. The result is
+                // resource-free, so dropping it is sufficient; still notify
+                // the executor so it can retire transport bookkeeping.
+                if let Some(executor) = self.crtc_config_probe_executor.as_mut() {
+                    executor.cancel(completion.token);
+                }
+                continue;
+            }
+            if self
+                .ready_crtc_config_results
+                .contains_key(&completion.token)
+            {
+                log::warn!(
+                    "asynchronous CRTC qualifier returned duplicate token {:?}; ignoring it",
+                    completion.token
+                );
+                continue;
+            }
+            self.ready_crtc_config_results
+                .insert(completion.token, completion.result);
+            ready.push(completion.token);
+        }
+        ready
+    }
+
+    fn finish_crtc_config(&mut self, token: CrtcConfigToken) -> io::Result<bool> {
+        let result = match self.ready_crtc_config_results.remove(&token) {
+            Some(result) => result,
+            None if self.pending_crtc_config_probes.contains_key(&token) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!("asynchronous CRTC configuration {token:?} is not ready"),
+                ));
+            }
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("unknown asynchronous CRTC configuration token {token:?}"),
+                ));
+            }
+        };
+        let Some(mut pending) = self.pending_crtc_config_probes.remove(&token) else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("orphaned asynchronous CRTC result for token {token:?}"),
+            ));
+        };
+        if let Some(executor) = self.crtc_config_probe_executor.as_mut() {
+            executor.cancel(token);
+        }
+
+        let stale_error = |stage: &str, reason: String| {
+            io::Error::new(
+                io::ErrorKind::Interrupted,
+                format!("asynchronous CRTC configuration {token:?} became stale {stage}: {reason}"),
+            )
+        };
+        if let Some(reason) = self.stale_crtc_config_probe_reason(&pending) {
+            return Err(stale_error("before exact-plan replay", reason));
+        }
+        // Worker failures are terminal for this request but have not touched
+        // the live topology. In particular, an indeterminate disposable probe
+        // never enters quiesce/recovery on the core thread.
+        let qualified = result?;
+        let prepared_output = pending
+            .prepared_output
+            .take()
+            .expect("pending CRTC qualification owns its discovered output");
+
+        // Exact live allocation and TEST_ONLY happen while the old topology
+        // is still scanning out. The returned object is opaque but owns all
+        // uncommitted live resources, so an error or stale result can drop it
+        // safely without a blackout or partial installation.
+        let prepared = self.platform.prepare_qualified_connector_plan(
+            &pending.output_key,
+            prepared_output,
+            pending.mode,
+            pending.x,
+            pending.y,
+            qualified,
+        )?;
+        if let Some(reason) = self.stale_crtc_config_probe_reason(&pending) {
+            return Err(stale_error("during exact-plan replay", reason));
+        }
+
+        let restore_old_on_failure = pending.was_active;
+        self.quiesce_before_topology_mutation("asynchronous RANDR CRTC configuration changed")?;
+        if let Err(error) = self.platform.install_prepared_connector_plan(prepared) {
+            log::error!(
+                "finish_crtc_config: installing qualified plan for {} failed: {error}",
+                pending.connector
+            );
+            return Err(self.recover_failed_crtc_config(restore_old_on_failure, error));
+        }
+
+        {
+            let entry = self.randr_id_alloc.entry_mut(&pending.output_key);
+            entry.config = ConnectorConfig::Enabled {
+                mode_w: pending.mode.width,
+                mode_h: pending.mode.height,
+                vrefresh: pending.mode.vrefresh,
+                x: pending.x,
+                y: pending.y,
+            };
+            entry.client_configured = true;
+            entry.connected = true;
+        }
+        log::info!(
+            "finish_crtc_config: enabled {} {}x{}@{} at ({},{}) with qualified plan",
+            pending.connector,
+            pending.mode.width,
+            pending.mode.height,
+            pending.mode.vrefresh,
+            pending.x,
+            pending.y,
+        );
+
+        self.prune_armed_targets_to_live_outputs();
+        let desired_active = kms_outputs_active_after_crtc_config(
+            restore_old_on_failure,
+            true,
+            self.platform.outputs.len(),
+        );
+        if let Err(error) = self.scene.rebuild_outputs(&self.platform) {
+            log::error!(
+                "finish_crtc_config: scene rebuild failed after topology change: {error:?}"
+            );
+            let error = io::Error::other(format!(
+                "finish_crtc_config: scene rebuild failed: {error:?}"
+            ));
+            let relight = self.relight_after_direct_teardown(
+                desired_active,
+                "asynchronous RANDR CRTC scene-rebuild failure",
+            );
+            self.kms_outputs_active = false;
+            self.request_exit();
+            return Err(relight.err().unwrap_or(error));
+        }
+        self.relight_after_direct_teardown(
+            desired_active,
+            "asynchronous RANDR CRTC configuration",
+        )?;
+        self.kms_outputs_active = desired_active;
+        self.update_input_extent(self.platform.fb_w, self.platform.fb_h);
+        self.scene.wake_for_damage();
+        Ok(true)
+    }
+
+    fn cancel_crtc_config(&mut self, token: CrtcConfigToken) {
+        self.pending_crtc_config_probes.remove(&token);
+        self.ready_crtc_config_results.remove(&token);
+        if let Some(executor) = self.crtc_config_probe_executor.as_mut() {
+            executor.cancel(token);
+        }
     }
 
     fn apply_crtc_config(
@@ -22668,7 +23338,8 @@ fn subtract_one_rect_clip(outer: ash::vk::Rect2D, inner: ash::vk::Rect2D) -> Vec
 #[cfg(test)]
 mod tests {
     use super::{
-        KmsBackend, PaintTarget, PictureRecord, RandrIdAllocator, RandrProviderEndpoint,
+        CrtcConfigProbeCompletion, CrtcConfigProbeExecutor, CrtcConfigProbeJob, KmsBackend,
+        PaintTarget, PictureRecord, RandrIdAllocator, RandrProviderEndpoint,
         compute_copy_area_dst_rects, compute_render_composite_clip,
         dri3_import_supported_for_topology, dri3_version_for, dst_picture_clip_by_children,
         glx_vendor_names_for_driver, intersect_rect_with_clip, mode_timing,
@@ -22681,17 +23352,25 @@ mod tests {
             cpu_types::{Rectangle16, Repeat},
             render::{
                 platform::{
-                    ConnectorSnapshot, CrtcKey, PlatformBackend, RenderDevice, RenderDeviceId,
+                    ConnectorSnapshot, CrtcKey, PlatformBackend, QualifiedScanoutPlan,
+                    RenderDevice, RenderDeviceId,
                 },
                 store::Storage,
             },
             scanout_route::{RenderKmsRelationship, ScanoutRoute},
+            vk::scanout::ScanoutAllocationPlan,
         },
         platform::drm::DrmDeviceKey,
     };
-    use std::{collections::HashMap, io};
+    use std::{
+        cell::RefCell,
+        collections::{HashMap, VecDeque},
+        io,
+        rc::Rc,
+    };
     use yserver_core::{
-        backend::{Backend, Dri3Caps},
+        backend::{Backend, CrtcConfigApply, CrtcConfigToken, Dri3Caps, ModeSpec},
+        core_loop::{CoreSender, Message},
         server::ServerState,
     };
 
@@ -22761,6 +23440,269 @@ mod tests {
             render_node_device: None,
             syncobj_timeline: false,
         }
+    }
+
+    #[derive(Default)]
+    struct TestCrtcConfigProbeState {
+        enqueued: Vec<CrtcConfigToken>,
+        cancelled: Vec<CrtcConfigToken>,
+    }
+
+    struct TestCrtcConfigProbeExecutor {
+        state: Rc<RefCell<TestCrtcConfigProbeState>>,
+        sender: Option<CoreSender>,
+        auto_complete: Option<QualifiedScanoutPlan>,
+        completions: VecDeque<CrtcConfigProbeCompletion>,
+    }
+
+    impl TestCrtcConfigProbeExecutor {
+        fn new(
+            state: Rc<RefCell<TestCrtcConfigProbeState>>,
+            auto_complete: Option<QualifiedScanoutPlan>,
+        ) -> Self {
+            Self {
+                state,
+                sender: None,
+                auto_complete,
+                completions: VecDeque::new(),
+            }
+        }
+    }
+
+    impl CrtcConfigProbeExecutor for TestCrtcConfigProbeExecutor {
+        fn set_core_sender(&mut self, sender: CoreSender) {
+            self.sender = Some(sender);
+        }
+
+        fn enqueue(&mut self, job: CrtcConfigProbeJob) -> io::Result<()> {
+            self.state.borrow_mut().enqueued.push(job.token);
+            if let Some(plan) = self.auto_complete {
+                self.completions.push_back(CrtcConfigProbeCompletion {
+                    token: job.token,
+                    result: Ok(plan),
+                });
+                if let Some(sender) = self.sender.as_ref() {
+                    sender.send(Message::CrtcConfigReady)?;
+                }
+            }
+            Ok(())
+        }
+
+        fn drain_ready(&mut self) -> Vec<CrtcConfigProbeCompletion> {
+            self.completions.drain(..).collect()
+        }
+
+        fn cancel(&mut self, token: CrtcConfigToken) {
+            self.state.borrow_mut().cancelled.push(token);
+        }
+    }
+
+    fn clone_test_drm_output(
+        output: &crate::platform::drm::Output,
+    ) -> crate::platform::drm::Output {
+        crate::platform::drm::Output {
+            connector: output.connector,
+            connector_name: output.connector_name.clone(),
+            encoder: output.encoder,
+            crtc: output.crtc,
+            plane: output.plane,
+            mode: output.mode,
+            picked: output.picked.clone(),
+            plane_fb_id_prop: output.plane_fb_id_prop,
+            plane_crtc_id_prop: output.plane_crtc_id_prop,
+            plane_src_x_prop: output.plane_src_x_prop,
+            plane_src_y_prop: output.plane_src_y_prop,
+            plane_src_w_prop: output.plane_src_w_prop,
+            plane_src_h_prop: output.plane_src_h_prop,
+            plane_crtc_x_prop: output.plane_crtc_x_prop,
+            plane_crtc_y_prop: output.plane_crtc_y_prop,
+            plane_crtc_w_prop: output.plane_crtc_w_prop,
+            plane_crtc_h_prop: output.plane_crtc_h_prop,
+            plane_in_fence_fd_prop: output.plane_in_fence_fd_prop,
+            crtc_out_fence_ptr_prop: output.crtc_out_fence_ptr_prop,
+            scanout_modifiers: output.scanout_modifiers.clone(),
+            mm_width: output.mm_width,
+            mm_height: output.mm_height,
+            edid: output.edid.clone(),
+            connector_type: output.connector_type.clone(),
+            modes: output.modes.clone(),
+        }
+    }
+
+    fn async_crtc_config_test_backend() -> (KmsBackend, u32, ModeSpec) {
+        let mut backend = KmsBackend::for_tests();
+        let display_key = backend.platform.devices[0].key;
+        let render_id = RenderDeviceId::DrmRender(test_device_key(128));
+        backend.platform.render_devices =
+            vec![test_render_device(render_id, Some(test_device_key(9)))];
+        backend.platform.selected_render_device = Some(render_id);
+        let route = ScanoutRoute::new(render_id, display_key, RenderKmsRelationship::Different);
+        backend.platform.outputs[0].scanout_route = route;
+        backend
+            .initialize_provider_output_sources()
+            .expect("initialize split provider policy");
+
+        let output_key = backend.platform.outputs[0].key.clone();
+        let output_id = backend.randr_id_alloc.ids_for(&output_key).output_id;
+        backend
+            .output_key_by_id
+            .insert(output_id, output_key.clone());
+        let requested = ModeSpec {
+            width: 1024,
+            height: 768,
+            vrefresh: 60,
+        };
+        backend
+            .randr_id_alloc
+            .entry_mut(&output_key)
+            .modes
+            .push(test_advertised_mode(
+                requested.width,
+                requested.height,
+                requested.vrefresh,
+                false,
+            ));
+        let mut discovered = clone_test_drm_output(&backend.platform.outputs[0].output);
+        discovered.modes.push(test_advertised_mode(
+            requested.width,
+            requested.height,
+            requested.vrefresh,
+            false,
+        ));
+        backend.crtc_config_discovery_override = Some(discovered);
+        (backend, output_id, requested)
+    }
+
+    #[test]
+    fn async_crtc_config_begin_keeps_old_topology_lit() {
+        let (mut backend, output_id, requested) = async_crtc_config_test_backend();
+        let state = Rc::new(RefCell::new(TestCrtcConfigProbeState::default()));
+        backend.set_crtc_config_probe_executor(Box::new(TestCrtcConfigProbeExecutor::new(
+            Rc::clone(&state),
+            None,
+        )));
+
+        let before = (
+            backend.platform.outputs.len(),
+            backend.platform.outputs[0].key.clone(),
+            backend.platform.outputs[0].x,
+            backend.platform.outputs[0].y,
+            backend.platform.outputs[0].width,
+            backend.platform.outputs[0].height,
+            backend.platform.outputs[0].scanout_route,
+            backend.kms_outputs_active,
+            backend.crtc_config_topology_epoch,
+        );
+        let apply =
+            Backend::begin_crtc_config(&mut backend, output_id, "test", Some(requested), 100, 50)
+                .expect("enqueue asynchronous qualification");
+        let CrtcConfigApply::Pending(token) = apply else {
+            panic!("cross-device reallocation must be asynchronous");
+        };
+
+        assert_eq!(state.borrow().enqueued, vec![token]);
+        assert_eq!(
+            (
+                backend.platform.outputs.len(),
+                backend.platform.outputs[0].key.clone(),
+                backend.platform.outputs[0].x,
+                backend.platform.outputs[0].y,
+                backend.platform.outputs[0].width,
+                backend.platform.outputs[0].height,
+                backend.platform.outputs[0].scanout_route,
+                backend.kms_outputs_active,
+                backend.crtc_config_topology_epoch,
+            ),
+            before,
+            "begin must not quiesce, modeset, or mutate the old live topology",
+        );
+        Backend::cancel_crtc_config(&mut backend, token);
+        assert_eq!(state.borrow().cancelled, vec![token]);
+    }
+
+    #[test]
+    fn async_crtc_config_completion_wakes_core_and_drains_token() {
+        let (mut backend, output_id, requested) = async_crtc_config_test_backend();
+        let state = Rc::new(RefCell::new(TestCrtcConfigProbeState::default()));
+        let (_poll, sender, receiver) = yserver_core::core_loop::channel().unwrap();
+        Backend::set_input_sender(&mut backend, sender);
+        backend.set_crtc_config_probe_executor(Box::new(TestCrtcConfigProbeExecutor::new(
+            Rc::clone(&state),
+            Some(QualifiedScanoutPlan::Shared(
+                ScanoutAllocationPlan::LegacyLinear,
+            )),
+        )));
+
+        let CrtcConfigApply::Pending(token) =
+            Backend::begin_crtc_config(&mut backend, output_id, "test", Some(requested), 0, 0)
+                .expect("enqueue asynchronous qualification")
+        else {
+            panic!("cross-device reallocation must be asynchronous");
+        };
+
+        assert!(
+            receiver
+                .try_recv_all()
+                .any(|message| matches!(message, Message::CrtcConfigReady))
+        );
+        assert_eq!(Backend::drain_ready_crtc_configs(&mut backend), vec![token]);
+        assert!(Backend::drain_ready_crtc_configs(&mut backend).is_empty());
+
+        Backend::cancel_crtc_config(&mut backend, token);
+        assert_eq!(state.borrow().cancelled, vec![token]);
+    }
+
+    #[test]
+    fn async_crtc_config_finish_rejects_vt_stale_result_without_quiesce() {
+        let (mut backend, output_id, requested) = async_crtc_config_test_backend();
+        let state = Rc::new(RefCell::new(TestCrtcConfigProbeState::default()));
+        backend.set_crtc_config_probe_executor(Box::new(TestCrtcConfigProbeExecutor::new(
+            Rc::clone(&state),
+            Some(QualifiedScanoutPlan::Shared(
+                ScanoutAllocationPlan::LegacyLinear,
+            )),
+        )));
+        let before = (
+            backend.platform.outputs.len(),
+            backend.platform.outputs[0].key.clone(),
+            backend.platform.outputs[0].width,
+            backend.platform.outputs[0].height,
+            backend.kms_outputs_active,
+            backend.crtc_config_topology_epoch,
+        );
+
+        let CrtcConfigApply::Pending(token) =
+            Backend::begin_crtc_config(&mut backend, output_id, "test", Some(requested), 0, 0)
+                .expect("enqueue asynchronous qualification")
+        else {
+            panic!("cross-device reallocation must be asynchronous");
+        };
+        assert_eq!(Backend::drain_ready_crtc_configs(&mut backend), vec![token]);
+
+        // Model a release arriving after helper completion but before the
+        // parked request is finalized. Direct assignment keeps this focused
+        // on finish's pre-replay guard: a real drive_vt_event also bumps the
+        // topology epoch and would be rejected for both reasons.
+        backend.vt_state = crate::vt::state::VtState::Suspended;
+        let error = Backend::finish_crtc_config(&mut backend, token)
+            .expect_err("VT-stale qualification must not be installed");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(error.to_string().contains("VT/DRM-master"));
+        assert_eq!(
+            (
+                backend.platform.outputs.len(),
+                backend.platform.outputs[0].key.clone(),
+                backend.platform.outputs[0].width,
+                backend.platform.outputs[0].height,
+                backend.kms_outputs_active,
+                backend.crtc_config_topology_epoch,
+            ),
+            before,
+            "stale finish must not quiesce or mutate the old topology",
+        );
+        assert!(backend.pending_crtc_config_probes.is_empty());
+        assert!(backend.ready_crtc_config_results.is_empty());
+        assert_eq!(state.borrow().cancelled, vec![token]);
     }
 
     fn test_crtc_key(device_key: DrmDeviceKey, crtc_id: u32) -> CrtcKey {
