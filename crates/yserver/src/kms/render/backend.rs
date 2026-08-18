@@ -12393,100 +12393,43 @@ fn read_scanout_region(
         return Err(io::Error::other("scanout pool vanished"));
     };
     // KMS phase selection above is always against B's display pool, but the
-    // composited pixels live in A's paired source on a copied route. Readback
-    // must therefore use A's image/staging allocation with A's live Vk
-    // context; display, M2 retention, and pageflip retirement keep using B.
-    let (image, staging_buffer, staging_mapped, copied_route, foreign_acquire, wait_semaphore) =
-        match match pool {
-            crate::kms::vk::scanout::OutputScanout::Shared(pool) => {
-                let Some(bo) = pool.bos.get(bo_idx) else {
-                    return Err(io::Error::other("scanout bo vanished"));
-                };
-                if needed_bytes > bo.vk_transfer.staging_size as usize {
-                    return Err(io::Error::other("scanout staging buffer too small"));
-                }
-                Ok((
-                    bo.vk_image,
-                    bo.vk_transfer.staging_buffer,
-                    bo.vk_transfer.staging_mapped,
-                    false,
-                    false,
-                    None,
-                ))
+    // composited pixels live in A's paired optimal target on a copied route.
+    // Readback must therefore use that local image/staging allocation with A's
+    // live Vk context; the linear transport is not acquired or synchronized,
+    // while display, M2 retention, and pageflip retirement keep using B.
+    let (image, staging_buffer, staging_mapped, copied_route) = match pool {
+        crate::kms::vk::scanout::OutputScanout::Shared(pool) => {
+            let Some(bo) = pool.bos.get(bo_idx) else {
+                return Err(io::Error::other("scanout bo vanished"));
+            };
+            if needed_bytes > bo.vk_transfer.staging_size as usize {
+                return Err(io::Error::other("scanout staging buffer too small"));
             }
-            crate::kms::vk::scanout::OutputScanout::Copied(pool) => {
-                let Some(source) = pool.sources.get_mut(bo_idx) else {
-                    return Err(io::Error::other("copied scanout source vanished"));
-                };
-                if needed_bytes > source.transfer.staging_size as usize {
-                    return Err(io::Error::other("scanout staging buffer too small"));
-                }
-                match source.prepare_renderer_readback() {
-                    Err(error) => {
-                        let requires_fail_stop = error.requires_fail_stop();
-                        Err((error.into_io_error(), requires_fail_stop))
-                    }
-                    Ok(foreign_acquire) => {
-                        let wait_semaphore = source.renderer_wait_semaphore();
-                        if foreign_acquire && wait_semaphore.is_none() {
-                            Err((
-                                io::Error::other(
-                                    "copied scanout readback prepared no renderer wait semaphore",
-                                ),
-                                true,
-                            ))
-                        } else {
-                            Ok((
-                                source.image(),
-                                source.transfer.staging_buffer,
-                                source.transfer.staging_mapped,
-                                true,
-                                foreign_acquire,
-                                wait_semaphore,
-                            ))
-                        }
-                    }
-                }
-            }
-        } {
-            Ok(prepared) => prepared,
-            Err((error, copied_prepare_failed)) => {
-                if copied_prepare_failed {
-                    // The only retained B -> A completion may have been consumed
-                    // by a failed import. The caller is allowed to ignore dump or
-                    // readback errors, so latch fatal here before returning.
-                    backend.platform.renderer_failed = true;
-                }
-                return Err(error);
-            }
-        };
-
-    let run_result = run_one_shot_op_with_wait(&vk, pool_handle, wait_semaphore, |vk, cb| {
-        if foreign_acquire {
-            let acquire = [ash::vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(ash::vk::PipelineStageFlags2::ALL_COMMANDS)
-                .src_access_mask(ash::vk::AccessFlags2::MEMORY_WRITE)
-                .dst_stage_mask(ash::vk::PipelineStageFlags2::ALL_COMMANDS)
-                .dst_access_mask(ash::vk::AccessFlags2::MEMORY_READ)
-                .src_queue_family_index(ash::vk::QUEUE_FAMILY_FOREIGN_EXT)
-                .dst_queue_family_index(vk.graphics_queue_family)
-                .old_layout(ash::vk::ImageLayout::GENERAL)
-                .new_layout(ash::vk::ImageLayout::GENERAL)
-                .image(image)
-                .subresource_range(
-                    ash::vk::ImageSubresourceRange::default()
-                        .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
-                        .level_count(1)
-                        .layer_count(1),
-                )];
-            crate::vk_count!(cmd_pipeline_barrier2);
-            unsafe {
-                vk.device.cmd_pipeline_barrier2(
-                    cb,
-                    &ash::vk::DependencyInfo::default().image_memory_barriers(&acquire),
-                );
-            }
+            (
+                bo.vk_image,
+                bo.vk_transfer.staging_buffer,
+                bo.vk_transfer.staging_mapped,
+                false,
+            )
         }
+        crate::kms::vk::scanout::OutputScanout::Copied(pool) => {
+            let Some(source) = pool.sources.get(bo_idx) else {
+                return Err(io::Error::other("copied scanout source vanished"));
+            };
+            if needed_bytes > source.transfer.staging_size as usize {
+                return Err(io::Error::other("scanout staging buffer too small"));
+            }
+            source.validate_renderer_readback()?;
+            (
+                source.image(),
+                source.transfer.staging_buffer,
+                source.transfer.staging_mapped,
+                true,
+            )
+        }
+    };
+
+    let run_result = run_one_shot_op_with_wait(&vk, pool_handle, None, |vk, cb| {
         let pre = [ash::vk::ImageMemoryBarrier2::default()
             .src_stage_mask(ash::vk::PipelineStageFlags2::ALL_COMMANDS)
             .src_access_mask(ash::vk::AccessFlags2::MEMORY_WRITE)
@@ -12565,18 +12508,6 @@ fn read_scanout_region(
             backend.platform.renderer_failed = true;
         }
         return Err(io::Error::other(format!("scanout copy submit: {e:?}")));
-    }
-
-    if foreign_acquire
-        && let Some(source) = backend
-            .platform
-            .scanout_pools
-            .get_mut(pool_idx)
-            .and_then(Option::as_mut)
-            .and_then(crate::kms::vk::scanout::OutputScanout::copied_mut)
-            .and_then(|pool| pool.sources.get_mut(bo_idx))
-    {
-        source.note_renderer_readback_succeeded();
     }
 
     let raw = unsafe { std::slice::from_raw_parts(staging_mapped.as_ptr(), needed_bytes) };

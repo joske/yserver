@@ -8,13 +8,15 @@ endpoints:
 
 - output-owned shared: B allocates, A renders, B scans out;
 - renderer-owned shared: A allocates, A renders, B scans out;
-- copied: A renders an exportable source, then renderer B copies into an
-  independent B-local scanout destination.
+- copied: A renders an optimal local target, copies it into a linear external
+  transport, then renderer B copies that transport into an independent B-local
+  scanout destination.
 
 Copy removes the requirement that one allocation be both renderable by A and
 scannable by B. It still requires a Vulkan renderer associated unambiguously
-with B and capable of importing A's DMA-BUF as a transfer source with its exact
-modifier, offset, and pitch. CPU readback/upload is outside this design.
+with B and capable of importing A's linear DMA-BUF transport as a transfer
+source with its exact offset and pitch. CPU readback/upload is not a scanout
+transport fallback.
 
 ## Endpoint and selection model
 
@@ -23,7 +25,7 @@ Copy is transport, not a third `ScanoutOwnership`. One output owns:
 ```text
 OutputScanout
   Shared(ScanoutBoPool)          owner = Output | Renderer
-  Copied(CopiedScanoutPool)      source A -> destination B -> KMS B
+  Copied(CopiedScanoutPool)      optimal A -> linear A/B -> destination B -> KMS B
 ```
 
 The outer `ScanoutRoute` always identifies the selected `RenderDeviceId` A
@@ -40,19 +42,22 @@ ambiguous, or display-only B endpoints make copied scanout unavailable; they
 never trigger generic Vulkan scoring or a first-node fallback.
 
 Both logical devices must expose and enable `VK_EXT_queue_family_foreign`.
-Copied allocations are exclusive external-memory images shared by distinct
-devices/drivers, so their ownership transfers use
+The linear A/B transport is an exclusive external-memory allocation shared by
+distinct devices/drivers, so its ownership transfers use
 `VK_QUEUE_FAMILY_FOREIGN_EXT`; `VK_QUEUE_FAMILY_EXTERNAL` is not a substitute
 because it is limited to queues from the same physical device and driver.
 Missing foreign-family support removes copied candidates without making the
 selected live renderer globally fatal.
 
-The sink context must also expose `VK_EXT_image_drm_format_modifier`. A driver
-without explicit DMA-BUF modifier/layout import cannot safely express A's
-foreign pitch; copied scanout rejects that sink before allocating or importing
-foreign memory. This gate still permits explicit `DRM_FORMAT_MOD_LINEAR`; it
-does not add the renderer-local optimal-to-linear transport reserved for the
-later linearization revision.
+Both contexts must also expose `VK_EXT_image_drm_format_modifier`. Renderer A
+creates `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` from the singleton modifier
+list `[DRM_FORMAT_MOD_LINEAR]` with exactly `TRANSFER_DST` usage; renderer B
+imports that same explicit modifier, offset, and row pitch as a distinct local
+image with exactly `TRANSFER_SRC` usage. Copied DMA-BUF transport never uses
+implicit `VK_IMAGE_TILING_LINEAR`: RADV can reject that external-image query
+while supporting the equivalent explicit modifier-0 contract. A's optimal
+color-attachment target is not external and never changes queue-family
+ownership.
 
 Legacy DRI3 imports have the same layout-description limit but a narrower
 topology gate. If the selected renderer exposes the modifier extension, DRI3
@@ -71,30 +76,34 @@ Each copied candidate is a persisted pair:
 
 ```text
 CopiedScanoutPlan {
-  source: A exportable linear or exact DRM modifier,
+  source: A linear external transport,
   destination: one existing exact B-local ScanoutAllocationPlan,
 }
 ```
 
 Destination order remains the established GBM-first then renderer-owned
-modifier/linear order; source order is stable within each destination. The
+modifier/linear order; the singleton linear transport is paired with each
+destination without changing that order. The
 probe creates fresh exact disposable logical devices for both A and B,
 allocates a complete three-slot pool with one plan pair, and first validates
 every destination framebuffer with a full connector/CRTC/primary-plane atomic
 `TEST_ONLY`. It then validates every slot with two A/B cycles. The first cycle
 performs:
 
-1. a real color-attachment render on A;
-2. A's local transition to `GENERAL`, then a separate A-to-FOREIGN ownership
-   release and export of A's completion as a `sync_file`;
+1. a real color-attachment render into A's optimal local target;
+2. an optional FOREIGN-to-A acquire of the linear transport, separate local
+   target/transport transitions, a full optimal-to-linear copy, local returns
+   to `GENERAL`, then a separate linear-transport A-to-FOREIGN release and
+   export of A's completion as a `sync_file`;
 3. B import/wait, a matching FOREIGN-to-B acquire, local transfer layouts, a
    full-image GPU copy, local return to `GENERAL`, and separate B-to-FOREIGN
    releases for source and destination;
 4. bounded A and B probe-fence completion.
 
 Cycle two imports B's retained return completion into a fresh temporary A
-semaphore, waits it, and executes FOREIGN-to-A before another render/release.
-`TEST_ONLY` does not make KMS an ownership participant, so the disposable
+semaphore, waits it, and executes FOREIGN-to-A on the linear transport before
+another target-to-transport copy/release. The optimal target stays A-local in
+both cycles. `TEST_ONLY` does not make KMS an ownership participant, so the disposable
 destination is treated as atomic-rejected/abandoned after cycle one and cycle
 two full-discards it from `UNDEFINED`; the real `GENERAL` KMS-to-B return leg
 is reserved for a live two-flip hardware smoke test and is never fabricated by
@@ -142,11 +151,13 @@ FOREIGN-to-A acquire. The `fd = -1` result is retained as an explicit
 already-signalled sentinel and is likewise imported, not omitted. Each
 temporary imported semaphore lives through the submission that consumes it
 and is destroyed only after that submission's fence is proven complete. Only
-the matching KMS
-page-flip retirement acknowledges damage/generation/cursor state, releases
-descriptor and drawable pins, and makes the paired A source reusable. KMS
+the matching KMS page-flip retirement acknowledges
+damage/generation/cursor state, releases descriptor and drawable pins, and
+makes the paired A slot reusable. KMS
 framebuffer selection, retained-front state, and direct-scanout bookkeeping
-always use B's destination; composited readback uses A's source.
+always use B's destination. Composited readback uses A's optimal local target,
+requires a previously submitted successful compose, and neither consumes the
+retained B completion nor changes transport ownership.
 
 Destination ownership also preserves layout provenance. A destination
 actually produced by B is released in `GENERAL`; after KMS later replaces it,
@@ -154,14 +165,17 @@ the next B write uses a matching `GENERAL` FOREIGN acquire. A fresh destination
 installed directly by synchronous modeset was never given a Vulkan layout, so
 its eventual retirement remains uninitialized and the next full copy performs
 a FOREIGN acquire/discard from `UNDEFINED`. Atomic rejection similarly uses a
-local full-discard path rather than inventing a KMS return release. Readback of
-a foreign-owned A source consumes the retained B completion and performs its
-own FOREIGN-to-A acquire before copying pixels.
+local full-discard path rather than inventing a KMS return release. The next
+transport overwrite consumes the retained B completion and performs its own
+FOREIGN-to-A acquire. A separate local-pixel-valid bit starts false, becomes
+true only after successful A queue
+submission, and is cleared by failed-cycle recovery and lifecycle reset.
 
 ## Failure and lifetime invariants
 
 - At most one frame per output waits for A or a KMS flip.
-- A is never rendered again while B may still read it.
+- A's linear transport is never overwritten while B may still read it; the
+  optimal target itself remains renderer-local.
 - B is never written while pending or on screen.
 - Completion registration failure keeps the destination reserved and defers
   recycling until A's compose fence signals.
@@ -175,8 +189,8 @@ own FOREIGN-to-A acquire before copying pixels.
   damage forward with retry backoff. This base recovery is safe but may block
   on a wedged driver.
 - Failure to prove quiescence quarantines and disarms both sides; Drop leaks
-  uncertain Vulkan/scanout resources rather than freeing GPU-referenced
-  memory.
+  the B alias, A linear backing, A optimal target, and uncertain scanout
+  resources rather than freeing GPU-referenced memory.
 - Live A or B device loss is fatal. Disposable probe failure advances to the
   next exact pair with fresh contexts.
 - A sink without explicit modifier/layout import support rejects copied
@@ -194,9 +208,8 @@ own FOREIGN-to-A acquire before copying pixels.
 
 ## Initial performance and follow-up boundary
 
-Copied scanout renders and copies the full output. The scene already uses full
-repaint, so this adds no buffer-age dependency. There is no copied CPU
-fallback. Damage-limited copies and asynchronous failure recovery are later
-optimizations. Renderer-local optimal composition followed by an explicit
-A-side linearization copy is a separate transport revision and is not part of
-this first copied path.
+Copied scanout renders and copies the full output twice on the GPU: optimal A
+target to linear transport, then B's imported transport alias to its scanout
+destination. The scene already uses full repaint, so this adds no buffer-age
+dependency. There is no copied CPU fallback. Damage-limited copies and
+asynchronous failure recovery are later optimizations.

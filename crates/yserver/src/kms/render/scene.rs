@@ -77,7 +77,10 @@ use crate::kms::{
     vk::{
         compositor::{CompositeDraw, CompositeScene, PresentError},
         pipeline::{CompositePushConsts, CompositorPipeline, MAX_DESCRIPTOR_SETS_PER_FRAME},
-        scanout::{BoPhase, BoState, CopiedRenderSource, OutputScanout, ScanoutBo},
+        scanout::{
+            BoPhase, BoState, CopiedRenderSource, CopiedTransportPreparation, OutputScanout,
+            ScanoutBo,
+        },
     },
 };
 
@@ -3830,20 +3833,25 @@ trait ComposeRenderTarget {
     fn height(&self) -> u32;
     fn timestamp_pool(&self) -> vk::QueryPool;
     fn set_last_gpu_render_ns(&mut self, value: Option<u64>);
-
-    fn requires_foreign_acquire(&self) -> bool {
-        false
-    }
-
-    fn releases_to_foreign(&self) -> bool {
-        false
-    }
+    fn post_compose_preparation(&self) -> Result<PostComposePreparation, PresentError>;
+    fn record_post_compose(
+        &self,
+        vk: &crate::kms::vk::device::VkContext,
+        command_buffer: vk::CommandBuffer,
+        preparation: PostComposePreparation,
+    );
 
     fn renderer_wait_semaphore(&self) -> Option<vk::Semaphore> {
         None
     }
 
     fn note_submit_succeeded(&mut self) {}
+}
+
+#[derive(Clone, Copy)]
+enum PostComposePreparation {
+    Shared,
+    Copied(CopiedTransportPreparation),
 }
 
 impl ComposeRenderTarget for ScanoutBo {
@@ -3878,6 +3886,40 @@ impl ComposeRenderTarget for ScanoutBo {
     fn set_last_gpu_render_ns(&mut self, value: Option<u64>) {
         self.last_gpu_render_ns = value;
     }
+
+    fn post_compose_preparation(&self) -> Result<PostComposePreparation, PresentError> {
+        Ok(PostComposePreparation::Shared)
+    }
+
+    fn record_post_compose(
+        &self,
+        vk: &crate::kms::vk::device::VkContext,
+        command_buffer: vk::CommandBuffer,
+        preparation: PostComposePreparation,
+    ) {
+        debug_assert!(matches!(preparation, PostComposePreparation::Shared));
+        let to_scanout = [vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .dst_access_mask(vk::AccessFlags2::empty())
+            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .image(self.vk_image)
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .level_count(1)
+                    .layer_count(1),
+            )];
+        crate::vk_count!(cmd_pipeline_barrier2);
+        unsafe {
+            vk.device.cmd_pipeline_barrier2(
+                command_buffer,
+                &vk::DependencyInfo::default().image_memory_barriers(&to_scanout),
+            );
+        }
+    }
 }
 
 impl ComposeRenderTarget for CopiedRenderSource {
@@ -3886,7 +3928,7 @@ impl ComposeRenderTarget for CopiedRenderSource {
     }
 
     fn image_view(&self) -> vk::ImageView {
-        self.image_view
+        self.image_view()
     }
 
     fn command_buffer(&self) -> vk::CommandBuffer {
@@ -3913,12 +3955,10 @@ impl ComposeRenderTarget for CopiedRenderSource {
         self.last_gpu_render_ns = value;
     }
 
-    fn requires_foreign_acquire(&self) -> bool {
-        self.renderer_requires_foreign_acquire()
-    }
-
-    fn releases_to_foreign(&self) -> bool {
-        true
+    fn post_compose_preparation(&self) -> Result<PostComposePreparation, PresentError> {
+        self.transport_preparation()
+            .map(PostComposePreparation::Copied)
+            .map_err(PresentError::Io)
     }
 
     fn renderer_wait_semaphore(&self) -> Option<vk::Semaphore> {
@@ -3927,6 +3967,18 @@ impl ComposeRenderTarget for CopiedRenderSource {
 
     fn note_submit_succeeded(&mut self) {
         self.note_renderer_submit_succeeded();
+    }
+
+    fn record_post_compose(
+        &self,
+        _vk: &crate::kms::vk::device::VkContext,
+        command_buffer: vk::CommandBuffer,
+        preparation: PostComposePreparation,
+    ) {
+        let PostComposePreparation::Copied(preparation) = preparation else {
+            unreachable!("copied target received shared post-compose preparation")
+        };
+        self.record_linearization(command_buffer, preparation);
     }
 }
 
@@ -4182,9 +4234,11 @@ fn record_command_buffer<T: ComposeRenderTarget + ?Sized>(
     // previous pool contents before we reset the pool below.
     let ts_pool = bo.timestamp_pool();
     let ts_enabled = vk.timestamp_period > 0.0 && ts_pool != vk::QueryPool::null();
-    let foreign_acquire = bo.requires_foreign_acquire();
-
-    let (load_op, render_area, mut old_layout) = match repaint {
+    // Validate all copied transport state before beginning the command buffer.
+    // The post-compose recorder is then infallible and cannot strand a live CB
+    // in recording state on an ownership-ledger error.
+    let post_compose_preparation = bo.post_compose_preparation()?;
+    let (load_op, render_area, old_layout) = match repaint {
         Repaint::Full(extent) => (
             vk::AttachmentLoadOp::CLEAR,
             vk::Rect2D {
@@ -4210,9 +4264,6 @@ fn record_command_buffer<T: ComposeRenderTarget + ?Sized>(
             vk::ImageLayout::GENERAL,
         ),
     };
-    if foreign_acquire {
-        old_layout = vk::ImageLayout::GENERAL;
-    }
     let scissor = match repaint {
         Repaint::Full(extent) => vk::Rect2D {
             offset: vk::Offset2D::default(),
@@ -4236,33 +4287,7 @@ fn record_command_buffer<T: ComposeRenderTarget + ?Sized>(
             device.cmd_write_timestamp(cb, vk::PipelineStageFlags::TOP_OF_PIPE, ts_pool, 0);
         }
 
-        if foreign_acquire {
-            let acquire = [vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-                .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-                .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE)
-                .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
-                .dst_queue_family_index(vk.graphics_queue_family)
-                .old_layout(vk::ImageLayout::GENERAL)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .image(bo.image())
-                .subresource_range(
-                    vk::ImageSubresourceRange::default()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .level_count(1)
-                        .layer_count(1),
-                )];
-            crate::vk_count!(cmd_pipeline_barrier2);
-            device.cmd_pipeline_barrier2(
-                cb,
-                &vk::DependencyInfo::default().image_memory_barriers(&acquire),
-            );
-        }
-
-        let to_color_src_access = if foreign_acquire {
-            vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE
-        } else if matches!(load_op, vk::AttachmentLoadOp::LOAD) {
+        let to_color_src_access = if matches!(load_op, vk::AttachmentLoadOp::LOAD) {
             // LOAD: previous KMS scanout left the BO in GENERAL.
             // The kernel "consumed" the BO contents via the page
             // flip; we now need the GPU to read+write them. Pair
@@ -4275,11 +4300,7 @@ fn record_command_buffer<T: ComposeRenderTarget + ?Sized>(
             vk::AccessFlags2::empty()
         };
         let to_color = vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(if foreign_acquire {
-                vk::PipelineStageFlags2::ALL_COMMANDS
-            } else {
-                vk::PipelineStageFlags2::TOP_OF_PIPE
-            })
+            .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
             .src_access_mask(to_color_src_access)
             .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
             // B.2 fix (vkdebug READ_AFTER_WRITE at vkCmdBeginRendering):
@@ -4402,49 +4423,7 @@ fn record_command_buffer<T: ComposeRenderTarget + ?Sized>(
         crate::vk_count!(cmd_end_rendering);
         device.cmd_end_rendering(cb);
 
-        // Transition to GENERAL for KMS scanout.
-        let to_scanout = vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-            .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-            .dst_access_mask(vk::AccessFlags2::empty())
-            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .image(bo.image())
-            .subresource_range(
-                vk::ImageSubresourceRange::default()
-                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                    .level_count(1)
-                    .layer_count(1),
-            );
-        let to_scanout_arr = [to_scanout];
-        let to_scanout_dep = vk::DependencyInfo::default().image_memory_barriers(&to_scanout_arr);
-        crate::vk_count!(cmd_pipeline_barrier2);
-        device.cmd_pipeline_barrier2(cb, &to_scanout_dep);
-
-        if bo.releases_to_foreign() {
-            let release = [vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-                .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-                .dst_access_mask(vk::AccessFlags2::empty())
-                .src_queue_family_index(vk.graphics_queue_family)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
-                .old_layout(vk::ImageLayout::GENERAL)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .image(bo.image())
-                .subresource_range(
-                    vk::ImageSubresourceRange::default()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .level_count(1)
-                        .layer_count(1),
-                )];
-            crate::vk_count!(cmd_pipeline_barrier2);
-            device.cmd_pipeline_barrier2(
-                cb,
-                &vk::DependencyInfo::default().image_memory_barriers(&release),
-            );
-        }
+        bo.record_post_compose(vk, cb, post_compose_preparation);
 
         // GPU-render timer: stamp BOTTOM-of-pipe after all compose work.
         if ts_enabled {

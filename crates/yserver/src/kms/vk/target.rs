@@ -1161,29 +1161,39 @@ pub(crate) const EXPORT_IMAGE_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::
         | vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw(),
 );
 
-/// Exact usage of the renderer-side image in copied scanout's first transport
-/// generation. The compositor renders directly into it and GPU B later reads
-/// it as a transfer source. A later linearization layer may split those roles;
-/// this boundary deliberately does not.
-pub(crate) const COPIED_SOURCE_IMAGE_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
-    vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw() | vk::ImageUsageFlags::TRANSFER_SRC.as_raw(),
-);
+/// Exact usage of copied scanout's renderer-side linear DMA-BUF transport.
+/// Renderer A copies its optimal compose target into this image and renderer B
+/// copies out of an imported alias. Keeping color-attachment and sampling
+/// usage out of the external-memory contract supports drivers which cannot
+/// render directly into a linear exportable image.
+pub(crate) const COPIED_TRANSPORT_IMAGE_USAGE: vk::ImageUsageFlags =
+    vk::ImageUsageFlags::TRANSFER_DST;
 
-/// One exact external-image representation for copied scanout's renderer-side
-/// source. Unlike [`TilingStrategy`], this is persisted per output and never
-/// consults or mutates the GLX-TFP strategy cache.
+/// Copied scanout always describes its linear DMA-BUF explicitly. In
+/// particular, do not substitute `VK_IMAGE_TILING_LINEAR`: RADV may reject
+/// that external-image contract while accepting the equivalent explicit DRM
+/// modifier with the exact same transfer-only usage.
+pub(crate) const COPIED_TRANSPORT_DRM_MODIFIER: u64 = super::dri3::DRM_FORMAT_MOD_LINEAR;
+
+/// The exact external transport representation persisted for copied scanout.
+/// Unlike [`TilingStrategy`], this never consults or mutates the GLX-TFP
+/// strategy cache. The local compose target is always an independent optimal
+/// image and is not part of this external-memory plan.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) enum CopiedSourcePlan {
-    Linear,
-    DrmModifier(u64),
+    DrmModifierLinear,
 }
 
 impl CopiedSourcePlan {
-    pub(crate) fn describe(self) -> String {
+    #[must_use]
+    pub(crate) const fn modifier(self) -> u64 {
         match self {
-            Self::Linear => "linear".to_string(),
-            Self::DrmModifier(modifier) => format!("modifier=0x{modifier:x}"),
+            Self::DrmModifierLinear => COPIED_TRANSPORT_DRM_MODIFIER,
         }
+    }
+
+    pub(crate) fn describe(self) -> String {
+        format!("drm-modifier=0x{:x}-linear-transport", self.modifier())
     }
 }
 
@@ -1365,8 +1375,8 @@ fn allocate_with_strategy(
     }
 }
 
-/// Allocate one exact copied-source representation without consulting or
-/// changing [`VkContext::tfp_tiling_strategy`].
+/// Allocate copied scanout's exact explicit-modifier linear transport without
+/// consulting or changing [`VkContext::tfp_tiling_strategy`].
 pub(crate) fn allocate_copied_source_exact(
     vk: &Arc<VkContext>,
     width: u32,
@@ -1375,21 +1385,21 @@ pub(crate) fn allocate_copied_source_exact(
     plan: CopiedSourcePlan,
 ) -> Result<ExportableImage, vk::Result> {
     match plan {
-        CopiedSourcePlan::Linear => {
-            allocate_exportable_linear(vk, width, height, format, COPIED_SOURCE_IMAGE_USAGE)
+        CopiedSourcePlan::DrmModifierLinear => {
+            let modifiers = [plan.modifier()];
+            allocate_exportable_modifier(
+                vk,
+                width,
+                height,
+                format,
+                &modifiers,
+                COPIED_TRANSPORT_IMAGE_USAGE,
+            )
         }
-        CopiedSourcePlan::DrmModifier(modifier) => allocate_exportable_modifier(
-            vk,
-            width,
-            height,
-            format,
-            &[modifier],
-            COPIED_SOURCE_IMAGE_USAGE,
-        ),
     }
 }
 
-/// Modifier-tiled exportable allocation (RADV path). The chosen
+/// DRM-modifier exportable allocation (including modifier-linear). The chosen
 /// `modifiers` come from [`crate::kms::vk::dri3::export_capable_modifiers`];
 /// the driver selects one from the list and reports it back.
 fn allocate_exportable_modifier(
@@ -1623,19 +1633,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn copied_source_usage_is_exact_direct_render_contract() {
-        assert!(COPIED_SOURCE_IMAGE_USAGE.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT));
-        assert!(COPIED_SOURCE_IMAGE_USAGE.contains(vk::ImageUsageFlags::TRANSFER_SRC));
-        assert!(!COPIED_SOURCE_IMAGE_USAGE.contains(vk::ImageUsageFlags::TRANSFER_DST));
-        assert!(!COPIED_SOURCE_IMAGE_USAGE.contains(vk::ImageUsageFlags::SAMPLED));
+    fn copied_transport_usage_is_exact_explicit_modifier_destination_contract() {
+        assert!(!COPIED_TRANSPORT_IMAGE_USAGE.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT));
+        assert!(!COPIED_TRANSPORT_IMAGE_USAGE.contains(vk::ImageUsageFlags::TRANSFER_SRC));
+        assert!(COPIED_TRANSPORT_IMAGE_USAGE.contains(vk::ImageUsageFlags::TRANSFER_DST));
+        assert!(!COPIED_TRANSPORT_IMAGE_USAGE.contains(vk::ImageUsageFlags::SAMPLED));
     }
 
     #[test]
-    fn copied_source_plan_description_names_exact_layout() {
-        assert_eq!(CopiedSourcePlan::Linear.describe(), "linear");
+    fn copied_source_plan_names_explicit_modifier_linear_transport() {
         assert_eq!(
-            CopiedSourcePlan::DrmModifier(0x1234).describe(),
-            "modifier=0x1234"
+            CopiedSourcePlan::DrmModifierLinear.describe(),
+            "drm-modifier=0x0-linear-transport"
+        );
+        assert_eq!(
+            CopiedSourcePlan::DrmModifierLinear.modifier(),
+            super::super::dri3::DRM_FORMAT_MOD_LINEAR
         );
     }
 

@@ -76,13 +76,17 @@ type GbmDevice = gbm::Device<Rc<crate::drm::Device>>;
 use super::{
     device::VkContext,
     target::{
-        COPIED_SOURCE_IMAGE_USAGE, DrawableImage, DrawableImageError, ExportableImage,
+        COPIED_TRANSPORT_IMAGE_USAGE, DrawableImage, DrawableImageError, ExportableImage,
         allocate_copied_source_exact,
     },
 };
 use crate::kms::scanout_route::{RenderKmsRelationship, ScanoutRoute};
 
 pub(crate) use super::target::CopiedSourcePlan;
+
+/// Exact usage of GPU B's imported alias of A's linear transport. Keep this
+/// single value shared by the capability query and actual import.
+const COPIED_SINK_IMPORT_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::TRANSFER_SRC;
 
 /// Per-bo phase. The lifecycle is roughly
 /// `Free → Recording → Submitted → Pending → OnScreen → Retiring → Free`.
@@ -130,17 +134,18 @@ enum ExportSemaphoreReuseState {
     NeedsRearm,
 }
 
-/// Ownership of renderer A's exported source allocation.
+/// Ownership of renderer A's linear copied-transport allocation.
 ///
-/// The image is created on A, so its first A use acquires ownership
-/// implicitly. Every submitted render releases A -> FOREIGN; B then acquires,
-/// copies, and releases B -> FOREIGN. A may not use the source again until it
-/// imports B's retained completion payload and records FOREIGN -> A.
+/// The transport is created on A, so its first A write acquires ownership
+/// implicitly. Every submitted compose copies the local optimal target into
+/// the transport and releases A -> FOREIGN; B then acquires, copies, and
+/// releases B -> FOREIGN. A may not overwrite the transport again until it
+/// imports B's retained completion payload and records FOREIGN -> A. The
+/// optimal compose target itself never leaves A.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum CopiedSourceOwnership {
     #[default]
     RendererFirstUse,
-    RendererOwned,
     ForeignAwaitingSink,
     ForeignAwaitingRenderer,
     /// A released to FOREIGN but no matching synchronized B->A return can be
@@ -153,30 +158,17 @@ enum CopiedSourceOwnership {
     ForeignReturnPending,
 }
 
-#[derive(Debug)]
-pub(crate) enum CopiedReadbackPrepareError {
-    Unavailable(io::Error),
-    RendererAcquire(io::Error),
-}
-
-impl CopiedReadbackPrepareError {
-    #[must_use]
-    pub(crate) fn requires_fail_stop(&self) -> bool {
-        matches!(self, Self::RendererAcquire(_))
-    }
-
-    pub(crate) fn into_io_error(self) -> io::Error {
-        match self {
-            Self::Unavailable(error) | Self::RendererAcquire(error) => error,
-        }
-    }
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum CopiedRenderTargetContents {
+    #[default]
+    Uninitialized,
+    Initialized,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CopiedReadbackPreparation {
-    RendererOwned,
-    RendererAcquire,
-    Unavailable(&'static str),
+pub(crate) struct CopiedTransportPreparation {
+    foreign_acquire: bool,
+    local_old_layout: vk::ImageLayout,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -260,21 +252,22 @@ impl CopiedDestinationOwnership {
 }
 
 impl CopiedSourceOwnership {
-    fn readback_preparation(self) -> CopiedReadbackPreparation {
+    fn transport_preparation(self) -> io::Result<CopiedTransportPreparation> {
         match self {
-            Self::RendererOwned => CopiedReadbackPreparation::RendererOwned,
-            Self::ForeignAwaitingRenderer => CopiedReadbackPreparation::RendererAcquire,
-            Self::RendererFirstUse | Self::RendererDiscard => {
-                CopiedReadbackPreparation::Unavailable(
-                    "copied source has no preserved pixels for renderer readback",
-                )
-            }
-            Self::ForeignAwaitingSink => CopiedReadbackPreparation::Unavailable(
-                "copied source readback raced its sink handoff",
-            ),
-            Self::ForeignReturnPending => CopiedReadbackPreparation::Unavailable(
-                "copied source readback raced an unresolved sink return",
-            ),
+            Self::RendererFirstUse | Self::RendererDiscard => Ok(CopiedTransportPreparation {
+                foreign_acquire: false,
+                local_old_layout: vk::ImageLayout::UNDEFINED,
+            }),
+            Self::ForeignAwaitingRenderer => Ok(CopiedTransportPreparation {
+                foreign_acquire: true,
+                local_old_layout: vk::ImageLayout::GENERAL,
+            }),
+            Self::ForeignAwaitingSink => Err(io::Error::other(
+                "copied transport cannot return to renderer before sink handoff",
+            )),
+            Self::ForeignReturnPending => Err(io::Error::other(
+                "copied transport B-to-A completion is not resolved",
+            )),
         }
     }
 
@@ -284,6 +277,26 @@ impl CopiedSourceOwnership {
         // The next copied compose is Full, so abandoning any interrupted
         // handoff and reinitializing from UNDEFINED is the safe common state.
         Self::RendererDiscard
+    }
+}
+
+impl CopiedRenderTargetContents {
+    fn note_submit_succeeded(&mut self) {
+        *self = Self::Initialized;
+    }
+
+    fn invalidate(&mut self) {
+        *self = Self::Uninitialized;
+    }
+
+    fn validate_readback(self) -> io::Result<()> {
+        if self == Self::Initialized {
+            Ok(())
+        } else {
+            Err(io::Error::other(
+                "copied source has no preserved local render-target pixels",
+            ))
+        }
     }
 }
 
@@ -686,13 +699,14 @@ impl CopiedScanoutPlan {
     }
 }
 
-/// Renderer-owned source image on GPU A together with GPU B's imported
-/// transfer-source alias. The sink alias is declared first so it is dropped
-/// before the renderer allocation whose DMA-BUF it references.
+/// Renderer A's local optimal compose target, its linear DMA-BUF transport,
+/// and GPU B's imported transfer-source alias. The sink alias is declared
+/// first, then the linear backing, so both aliases drop before their storage;
+/// the independent local target drops last.
 pub(crate) struct CopiedRenderSource {
     imported_on_sink: Option<DrawableImage>,
-    exportable_on_renderer: Option<ExportableImage>,
-    pub(crate) image_view: vk::ImageView,
+    linear_on_renderer: Option<ExportableImage>,
+    render_target: Option<DrawableImage>,
     pub(crate) completion_semaphore: vk::Semaphore,
     completion_semaphore_reuse: ExportSemaphoreReuseState,
     pub(crate) transfer: TransferResources,
@@ -703,6 +717,7 @@ pub(crate) struct CopiedRenderSource {
     renderer_wait_semaphore: Option<vk::Semaphore>,
     renderer_return_completion: Option<RetainedSyncFile>,
     ownership: CopiedSourceOwnership,
+    render_target_contents: CopiedRenderTargetContents,
     disarmed: bool,
 }
 
@@ -714,7 +729,7 @@ impl CopiedRenderSource {
         height: u32,
         plan: CopiedSourcePlan,
     ) -> io::Result<Self> {
-        let exportable_on_renderer = allocate_copied_source_exact(
+        let linear_on_renderer = allocate_copied_source_exact(
             &render_vk,
             width,
             height,
@@ -722,8 +737,8 @@ impl CopiedRenderSource {
             plan,
         )
         .map_err(|result| scanout_vk_error("allocate exact copied source", result))?;
-        let exported = super::dri3::export_backing(&render_vk, &exportable_on_renderer)
-            .map_err(|result| scanout_vk_error("export exact copied source DMA-BUF", result))?;
+        let exported = super::dri3::export_backing(&render_vk, &linear_on_renderer)
+            .map_err(|result| scanout_vk_error("export copied linear transport DMA-BUF", result))?;
         let imported_on_sink = DrawableImage::from_dmabuf_with_usage(
             Arc::clone(&sink_vk),
             exported.fd,
@@ -731,29 +746,19 @@ impl CopiedRenderSource {
             height,
             vk::Format::B8G8R8A8_UNORM,
             exported.modifier,
-            &[exportable_on_renderer.offset],
-            &[exported.stride],
-            vk::ImageUsageFlags::TRANSFER_SRC,
+            &[linear_on_renderer.offset],
+            &[linear_on_renderer.stride],
+            COPIED_SINK_IMPORT_USAGE,
         )
-        .map_err(|error| copied_drawable_error("import copied source on sink", error))?;
+        .map_err(|error| copied_drawable_error("import copied transport on sink", error))?;
+        let render_target =
+            DrawableImage::new_server_owned_window(Arc::clone(&render_vk), width, height).map_err(
+                |error| copied_drawable_error("allocate copied optimal render target", error),
+            )?;
 
-        let view_info = vk::ImageViewCreateInfo::default()
-            .image(exportable_on_renderer.image)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .format(vk::Format::B8G8R8A8_UNORM)
-            .subresource_range(color_subresource_range());
-        let image_view = unsafe { render_vk.device.create_image_view(&view_info, None) }
-            .map_err(|result| scanout_vk_error("create copied source image view", result))?;
-        let completion_semaphore = match create_export_semaphore(&render_vk) {
-            Ok(semaphore) => semaphore,
-            Err(result) => {
-                unsafe { render_vk.device.destroy_image_view(image_view, None) };
-                return Err(scanout_vk_error(
-                    "create copied source completion semaphore",
-                    result,
-                ));
-            }
-        };
+        let completion_semaphore = create_export_semaphore(&render_vk).map_err(|result| {
+            scanout_vk_error("create copied source completion semaphore", result)
+        })?;
         let transfer = match allocate_transfer_resources(&render_vk, width, height) {
             Ok(transfer) => transfer,
             Err(result) => {
@@ -761,7 +766,6 @@ impl CopiedRenderSource {
                     render_vk
                         .device
                         .destroy_semaphore(completion_semaphore, None);
-                    render_vk.device.destroy_image_view(image_view, None);
                 }
                 return Err(scanout_vk_error(
                     "allocate copied source command resources",
@@ -772,8 +776,8 @@ impl CopiedRenderSource {
 
         Ok(Self {
             imported_on_sink: Some(imported_on_sink),
-            exportable_on_renderer: Some(exportable_on_renderer),
-            image_view,
+            linear_on_renderer: Some(linear_on_renderer),
+            render_target: Some(render_target),
             completion_semaphore,
             completion_semaphore_reuse: ExportSemaphoreReuseState::Reusable,
             transfer,
@@ -784,32 +788,49 @@ impl CopiedRenderSource {
             renderer_wait_semaphore: None,
             renderer_return_completion: None,
             ownership: CopiedSourceOwnership::RendererFirstUse,
+            render_target_contents: CopiedRenderTargetContents::Uninitialized,
             disarmed: false,
         })
     }
 
     #[must_use]
     pub(crate) fn image(&self) -> vk::Image {
-        self.exportable_on_renderer
+        self.render_target
             .as_ref()
-            .expect("live copied source has renderer allocation")
+            .expect("live copied source has optimal render target")
+            .vk_image
+    }
+
+    #[must_use]
+    pub(crate) fn image_view(&self) -> vk::ImageView {
+        self.render_target
+            .as_ref()
+            .expect("live copied source has optimal render target")
+            .vk_image_view
+    }
+
+    #[must_use]
+    fn linear_image(&self) -> vk::Image {
+        self.linear_on_renderer
+            .as_ref()
+            .expect("live copied source has linear transport")
             .image
     }
 
     #[must_use]
     pub(crate) fn width(&self) -> u32 {
-        self.exportable_on_renderer
+        self.render_target
             .as_ref()
-            .expect("live copied source has renderer allocation")
+            .expect("live copied source has optimal render target")
             .extent
             .width
     }
 
     #[must_use]
     pub(crate) fn height(&self) -> u32 {
-        self.exportable_on_renderer
+        self.render_target
             .as_ref()
-            .expect("live copied source has renderer allocation")
+            .expect("live copied source has optimal render target")
             .extent
             .height
     }
@@ -850,14 +871,14 @@ impl CopiedRenderSource {
         Ok(())
     }
 
-    /// Prepare renderer A's ownership acquire before recording a reused
-    /// copied source. Returns whether the command buffer must record the
-    /// FOREIGN -> A acquire barrier.
-    pub(crate) fn prepare_renderer_acquire(&mut self) -> io::Result<bool> {
+    /// Import renderer B's retained completion before recording an overwrite
+    /// of the reused linear transport. The subsequent preflight determines
+    /// whether the command buffer records a FOREIGN -> A acquire barrier.
+    pub(crate) fn prepare_renderer_acquire(&mut self) -> io::Result<()> {
         match self.ownership {
-            CopiedSourceOwnership::RendererFirstUse
-            | CopiedSourceOwnership::RendererOwned
-            | CopiedSourceOwnership::RendererDiscard => Ok(false),
+            CopiedSourceOwnership::RendererFirstUse | CopiedSourceOwnership::RendererDiscard => {
+                Ok(())
+            }
             CopiedSourceOwnership::ForeignAwaitingRenderer => {
                 if self.renderer_return_completion.is_some()
                     && self.renderer_wait_semaphore.is_some()
@@ -880,7 +901,7 @@ impl CopiedRenderSource {
                         "copied source has no retained B completion for renderer acquire",
                     ));
                 }
-                Ok(true)
+                Ok(())
             }
             CopiedSourceOwnership::ForeignAwaitingSink => Err(io::Error::other(
                 "copied source cannot return to renderer before sink handoff",
@@ -896,35 +917,26 @@ impl CopiedRenderSource {
         self.renderer_wait_semaphore
     }
 
-    #[must_use]
-    pub(crate) fn renderer_requires_foreign_acquire(&self) -> bool {
-        self.ownership == CopiedSourceOwnership::ForeignAwaitingRenderer
+    pub(crate) fn transport_preparation(&self) -> io::Result<CopiedTransportPreparation> {
+        self.ownership.transport_preparation()
     }
 
-    /// Prepare a blocking renderer-side readback of pixels previously copied
-    /// by B. Unlike a full repaint, readback must preserve the existing image
-    /// contents, so only locally-owned GENERAL or a synchronized FOREIGN
-    /// return is valid.
-    pub(crate) fn prepare_renderer_readback(&mut self) -> Result<bool, CopiedReadbackPrepareError> {
-        match self.ownership.readback_preparation() {
-            CopiedReadbackPreparation::RendererOwned => Ok(false),
-            CopiedReadbackPreparation::RendererAcquire => self
-                .prepare_renderer_acquire()
-                .map_err(CopiedReadbackPrepareError::RendererAcquire),
-            CopiedReadbackPreparation::Unavailable(reason) => Err(
-                CopiedReadbackPrepareError::Unavailable(io::Error::other(reason)),
-            ),
-        }
+    /// Confirm that renderer A's local optimal target contains a completed or
+    /// queue-ordered compose suitable for readback. The target never crosses
+    /// devices, so this deliberately does not consume B's retained completion
+    /// or mutate linear-transport ownership.
+    pub(crate) fn validate_renderer_readback(&self) -> io::Result<()> {
+        self.render_target_contents.validate_readback()
     }
 
     pub(crate) fn note_renderer_submit_succeeded(&mut self) {
         debug_assert!(matches!(
             self.ownership,
             CopiedSourceOwnership::RendererFirstUse
-                | CopiedSourceOwnership::RendererOwned
                 | CopiedSourceOwnership::RendererDiscard
                 | CopiedSourceOwnership::ForeignAwaitingRenderer
         ));
+        self.render_target_contents.note_submit_succeeded();
         self.ownership = CopiedSourceOwnership::ForeignAwaitingSink;
         self.renderer_return_completion = None;
     }
@@ -964,9 +976,6 @@ impl CopiedRenderSource {
             CopiedSourceOwnership::RendererFirstUse => Err(io::Error::other(
                 "copied sink failure observed before renderer ownership release",
             )),
-            CopiedSourceOwnership::RendererOwned => Err(io::Error::other(
-                "copied sink failure observed while renderer still owned the source",
-            )),
             CopiedSourceOwnership::RendererDiscard => Ok(()),
         }
     }
@@ -976,6 +985,7 @@ impl CopiedRenderSource {
     /// (ownership is still awaiting B) and a later B/copy/KMS failure (B's
     /// recovery already retained a return completion).
     pub(crate) fn recover_failed_cycle_after_renderer_quiescence(&mut self) -> io::Result<()> {
+        self.render_target_contents.invalidate();
         self.rearm_completion_semaphore_after_quiescence()
             .map_err(|result| {
                 scanout_vk_error(
@@ -993,27 +1003,14 @@ impl CopiedRenderSource {
             CopiedSourceOwnership::ForeignAwaitingRenderer
             | CopiedSourceOwnership::RendererDiscard => Ok(()),
             CopiedSourceOwnership::RendererFirstUse
-            | CopiedSourceOwnership::RendererOwned
             | CopiedSourceOwnership::ForeignReturnPending => Err(io::Error::other(
                 "copied failed-cycle recovery found unsafe ownership",
             )),
         }
     }
 
-    pub(crate) fn note_renderer_readback_succeeded(&mut self) {
-        debug_assert!(matches!(
-            self.ownership,
-            CopiedSourceOwnership::RendererFirstUse
-                | CopiedSourceOwnership::RendererOwned
-                | CopiedSourceOwnership::RendererDiscard
-                | CopiedSourceOwnership::ForeignAwaitingRenderer
-        ));
-        self.ownership = CopiedSourceOwnership::RendererOwned;
-        self.renderer_return_completion = None;
-        self.release_renderer_wait_semaphore();
-    }
-
     fn reset_after_lifecycle_quiescence(&mut self) -> io::Result<()> {
+        self.render_target_contents.invalidate();
         self.rearm_completion_semaphore_after_quiescence()
             .map_err(|result| {
                 scanout_vk_error(
@@ -1047,6 +1044,131 @@ impl CopiedRenderSource {
             .vk_image
     }
 
+    /// Record renderer A's post-compose optimal-to-linear transport copy.
+    ///
+    /// Queue-family ownership barriers and local layout transitions are kept
+    /// in separate commands because overlapping transitions for one image in
+    /// a single dependency info are not sequential. Only the linear transport
+    /// crosses FOREIGN; the optimal target remains renderer-local in GENERAL.
+    pub(crate) fn record_linearization(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        preparation: CopiedTransportPreparation,
+    ) {
+        let device = &self.render_vk.device;
+        unsafe {
+            if preparation.foreign_acquire {
+                let acquire = [vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                    .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                    .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+                    .dst_queue_family_index(self.render_vk.graphics_queue_family)
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .image(self.linear_image())
+                    .subresource_range(color_subresource_range())];
+                device.cmd_pipeline_barrier2(
+                    command_buffer,
+                    &vk::DependencyInfo::default().image_memory_barriers(&acquire),
+                );
+            }
+
+            let local_to_copy = [
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                    .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
+                    .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .image(self.image())
+                    .subresource_range(color_subresource_range()),
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(if preparation.foreign_acquire {
+                        vk::PipelineStageFlags2::ALL_COMMANDS
+                    } else {
+                        vk::PipelineStageFlags2::TOP_OF_PIPE
+                    })
+                    .src_access_mask(if preparation.foreign_acquire {
+                        vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE
+                    } else {
+                        vk::AccessFlags2::empty()
+                    })
+                    .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    .old_layout(preparation.local_old_layout)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .image(self.linear_image())
+                    .subresource_range(color_subresource_range()),
+            ];
+            device.cmd_pipeline_barrier2(
+                command_buffer,
+                &vk::DependencyInfo::default().image_memory_barriers(&local_to_copy),
+            );
+
+            let regions = [vk::ImageCopy2::default()
+                .src_subresource(color_subresource_layers())
+                .dst_subresource(color_subresource_layers())
+                .extent(vk::Extent3D {
+                    width: self.width(),
+                    height: self.height(),
+                    depth: 1,
+                })];
+            device.cmd_copy_image2(
+                command_buffer,
+                &vk::CopyImageInfo2::default()
+                    .src_image(self.image())
+                    .src_image_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .dst_image(self.linear_image())
+                    .dst_image_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .regions(&regions),
+            );
+
+            let local_to_general = [
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .src_access_mask(vk::AccessFlags2::TRANSFER_READ)
+                    .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                    .dst_access_mask(vk::AccessFlags2::MEMORY_READ)
+                    .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .image(self.image())
+                    .subresource_range(color_subresource_range()),
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                    .dst_access_mask(vk::AccessFlags2::MEMORY_READ)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .image(self.linear_image())
+                    .subresource_range(color_subresource_range()),
+            ];
+            device.cmd_pipeline_barrier2(
+                command_buffer,
+                &vk::DependencyInfo::default().image_memory_barriers(&local_to_general),
+            );
+
+            let release = [vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                .dst_access_mask(vk::AccessFlags2::empty())
+                .src_queue_family_index(self.render_vk.graphics_queue_family)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .image(self.linear_image())
+                .subresource_range(color_subresource_range())];
+            device.cmd_pipeline_barrier2(
+                command_buffer,
+                &vk::DependencyInfo::default().image_memory_barriers(&release),
+            );
+        }
+    }
+
     /// Preserve every Vulkan child and both owning contexts when GPU
     /// quiescence could not be proven. This is the copied-path analogue of
     /// [`ScanoutBo::disarm`]: leaking is safer than freeing referenced memory.
@@ -1055,7 +1177,8 @@ impl CopiedRenderSource {
             return;
         }
         leak_owned_backing(&mut self.imported_on_sink);
-        leak_owned_backing(&mut self.exportable_on_renderer);
+        leak_owned_backing(&mut self.linear_on_renderer);
+        leak_owned_backing(&mut self.render_target);
         std::mem::forget(Arc::clone(&self.render_vk));
         std::mem::forget(Arc::clone(&self.sink_vk));
         self.disarmed = true;
@@ -1077,9 +1200,6 @@ impl Drop for CopiedRenderSource {
             self.render_vk
                 .device
                 .destroy_semaphore(self.completion_semaphore, None);
-            self.render_vk
-                .device
-                .destroy_image_view(self.image_view, None);
         }
     }
 }
@@ -3060,7 +3180,8 @@ fn submit_copied_source_probe(
     source: &mut CopiedRenderSource,
     fence: vk::Fence,
 ) -> io::Result<Option<OwnedFd>> {
-    let foreign_acquire = source.prepare_renderer_acquire()?;
+    source.prepare_renderer_acquire()?;
+    let transport_preparation = source.transport_preparation()?;
     let device = &source.render_vk.device;
     let command_buffer = source.transfer.command_buffer;
     unsafe {
@@ -3079,34 +3200,12 @@ fn submit_copied_source_probe(
                 scanout_vk_error("begin copied renderer probe command buffer", result)
             })?;
 
-        if foreign_acquire {
-            let acquire = [vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-                .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-                .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE)
-                .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
-                .dst_queue_family_index(source.render_vk.graphics_queue_family)
-                .old_layout(vk::ImageLayout::GENERAL)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .image(source.image())
-                .subresource_range(color_subresource_range())];
-            device.cmd_pipeline_barrier2(
-                command_buffer,
-                &vk::DependencyInfo::default().image_memory_barriers(&acquire),
-            );
-        }
-
         let to_color = [vk::ImageMemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
             .src_access_mask(vk::AccessFlags2::empty())
             .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
             .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-            .old_layout(if foreign_acquire {
-                vk::ImageLayout::GENERAL
-            } else {
-                vk::ImageLayout::UNDEFINED
-            })
+            .old_layout(vk::ImageLayout::UNDEFINED)
             .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .image(source.image())
             .subresource_range(color_subresource_range())];
@@ -3115,7 +3214,7 @@ fn submit_copied_source_probe(
             &vk::DependencyInfo::default().image_memory_barriers(&to_color),
         );
         let attachments = [vk::RenderingAttachmentInfo::default()
-            .image_view(source.image_view)
+            .image_view(source.image_view())
             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .load_op(vk::AttachmentLoadOp::CLEAR)
             .store_op(vk::AttachmentStoreOp::STORE)
@@ -3138,34 +3237,7 @@ fn submit_copied_source_probe(
                 .color_attachments(&attachments),
         );
         device.cmd_end_rendering(command_buffer);
-        let to_general = [vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-            .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-            .dst_access_mask(vk::AccessFlags2::empty())
-            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .image(source.image())
-            .subresource_range(color_subresource_range())];
-        device.cmd_pipeline_barrier2(
-            command_buffer,
-            &vk::DependencyInfo::default().image_memory_barriers(&to_general),
-        );
-        let release = [vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-            .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
-            .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-            .dst_access_mask(vk::AccessFlags2::empty())
-            .src_queue_family_index(source.render_vk.graphics_queue_family)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
-            .old_layout(vk::ImageLayout::GENERAL)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .image(source.image())
-            .subresource_range(color_subresource_range())];
-        device.cmd_pipeline_barrier2(
-            command_buffer,
-            &vk::DependencyInfo::default().image_memory_barriers(&release),
-        );
+        source.record_linearization(command_buffer, transport_preparation);
         device
             .end_command_buffer(command_buffer)
             .map_err(|result| {
@@ -3749,130 +3821,31 @@ fn modifier_single_plane_supports_feature(
         && drm_modifier_plane_count(vk, modifier) == Some(1)
 }
 
-fn linear_external_image_supports_feature(
-    vk: &VkContext,
-    usage: vk::ImageUsageFlags,
-    feature: vk::ExternalMemoryFeatureFlags,
-) -> bool {
-    if vk.external_memory_fd.is_none() {
-        return false;
-    }
-
-    let mut external_info = vk::PhysicalDeviceExternalImageFormatInfo::default()
-        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-    let format_info = vk::PhysicalDeviceImageFormatInfo2::default()
-        .format(vk::Format::B8G8R8A8_UNORM)
-        .ty(vk::ImageType::TYPE_2D)
-        .tiling(vk::ImageTiling::LINEAR)
-        .usage(usage)
-        .push_next(&mut external_info);
-    let mut external_props = vk::ExternalImageFormatProperties::default();
-    let mut props2 = vk::ImageFormatProperties2::default().push_next(&mut external_props);
-    if unsafe {
-        vk.instance.get_physical_device_image_format_properties2(
-            vk.physical_device,
-            &format_info,
-            &mut props2,
-        )
-    }
-    .is_err()
-    {
-        return false;
-    }
-
-    let external = external_props.external_memory_properties;
-    external.external_memory_features.contains(feature)
-        && external
-            .compatible_handle_types
-            .contains(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
-}
-
 fn exact_copied_source_plans(render_vk: &VkContext, sink_vk: &VkContext) -> Vec<CopiedSourcePlan> {
-    let renderer_linear = linear_external_image_supports_feature(
+    let plan = CopiedSourcePlan::DrmModifierLinear;
+    let modifier = plan.modifier();
+    let renderer_linear = modifier_single_plane_supports_feature(
         render_vk,
-        COPIED_SOURCE_IMAGE_USAGE,
+        modifier,
+        COPIED_TRANSPORT_IMAGE_USAGE,
         vk::ExternalMemoryFeatureFlags::EXPORTABLE,
     );
-    let sink_linear = if sink_vk.image_drm_format_modifier {
-        modifier_single_plane_supports_feature(
-            sink_vk,
-            super::dri3::DRM_FORMAT_MOD_LINEAR,
-            vk::ImageUsageFlags::TRANSFER_SRC,
-            vk::ExternalMemoryFeatureFlags::IMPORTABLE,
-        )
-    } else {
-        linear_external_image_supports_feature(
-            sink_vk,
-            vk::ImageUsageFlags::TRANSFER_SRC,
-            vk::ExternalMemoryFeatureFlags::IMPORTABLE,
-        )
-    };
+    // Both sides use the explicit DRM-modifier path, including modifier 0.
+    // Their queries must match their actual narrow usages; silently falling
+    // back to non-explicit linear images would admit an A/B pair whose foreign
+    // pitch cannot be represented reliably.
+    let sink_linear = modifier_single_plane_supports_feature(
+        sink_vk,
+        modifier,
+        COPIED_SINK_IMPORT_USAGE,
+        vk::ExternalMemoryFeatureFlags::IMPORTABLE,
+    );
 
-    let mut plans = Vec::new();
     if renderer_linear && sink_linear {
-        plans.push(CopiedSourcePlan::Linear);
+        vec![plan]
+    } else {
+        Vec::new()
     }
-
-    if render_vk.image_drm_format_modifier && sink_vk.image_drm_format_modifier {
-        for modifier in drm_modifier_candidates(render_vk) {
-            if modifier_single_plane_supports_feature(
-                render_vk,
-                modifier,
-                COPIED_SOURCE_IMAGE_USAGE,
-                vk::ExternalMemoryFeatureFlags::EXPORTABLE,
-            ) && modifier_single_plane_supports_feature(
-                sink_vk,
-                modifier,
-                vk::ImageUsageFlags::TRANSFER_SRC,
-                vk::ExternalMemoryFeatureFlags::IMPORTABLE,
-            ) {
-                plans.push(CopiedSourcePlan::DrmModifier(modifier));
-            }
-        }
-    }
-    plans
-}
-
-fn drm_modifier_candidates(vk: &VkContext) -> Vec<u64> {
-    let modifier_count = {
-        let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
-        let mut format_props = vk::FormatProperties2::default().push_next(&mut list);
-        unsafe {
-            vk.instance.get_physical_device_format_properties2(
-                vk.physical_device,
-                vk::Format::B8G8R8A8_UNORM,
-                &mut format_props,
-            );
-        }
-        list.drm_format_modifier_count
-    };
-    if modifier_count == 0 {
-        return Vec::new();
-    }
-
-    let mut storage = vec![vk::DrmFormatModifierPropertiesEXT::default(); modifier_count as usize];
-    let mut list = vk::DrmFormatModifierPropertiesListEXT::default()
-        .drm_format_modifier_properties(&mut storage);
-    let mut format_props = vk::FormatProperties2::default().push_next(&mut list);
-    unsafe {
-        vk.instance.get_physical_device_format_properties2(
-            vk.physical_device,
-            vk::Format::B8G8R8A8_UNORM,
-            &mut format_props,
-        );
-    }
-    let entries = list.drm_format_modifier_count as usize;
-    let mut candidates = Vec::new();
-    for modifier in storage
-        .iter()
-        .take(entries)
-        .map(|properties| properties.drm_format_modifier)
-    {
-        if !candidates.contains(&modifier) {
-            candidates.push(modifier);
-        }
-    }
-    candidates
 }
 
 fn assemble_copied_scanout_plans(
@@ -4967,36 +4940,21 @@ mod tests {
             ScanoutAllocationPlan::DrmModifier(TILED_B),
             ScanoutAllocationPlan::LegacyLinear,
         ];
-        let sources = [
-            CopiedSourcePlan::Linear,
-            CopiedSourcePlan::DrmModifier(TILED_A),
-        ];
+        let sources = [CopiedSourcePlan::DrmModifierLinear];
 
         assert_eq!(
             assemble_copied_scanout_plans(&destinations, &sources),
             vec![
                 CopiedScanoutPlan {
-                    source: CopiedSourcePlan::Linear,
+                    source: CopiedSourcePlan::DrmModifierLinear,
                     destination: ScanoutAllocationPlan::GbmModifier(TILED_A),
                 },
                 CopiedScanoutPlan {
-                    source: CopiedSourcePlan::DrmModifier(TILED_A),
-                    destination: ScanoutAllocationPlan::GbmModifier(TILED_A),
-                },
-                CopiedScanoutPlan {
-                    source: CopiedSourcePlan::Linear,
+                    source: CopiedSourcePlan::DrmModifierLinear,
                     destination: ScanoutAllocationPlan::DrmModifier(TILED_B),
                 },
                 CopiedScanoutPlan {
-                    source: CopiedSourcePlan::DrmModifier(TILED_A),
-                    destination: ScanoutAllocationPlan::DrmModifier(TILED_B),
-                },
-                CopiedScanoutPlan {
-                    source: CopiedSourcePlan::Linear,
-                    destination: ScanoutAllocationPlan::LegacyLinear,
-                },
-                CopiedScanoutPlan {
-                    source: CopiedSourcePlan::DrmModifier(TILED_A),
+                    source: CopiedSourcePlan::DrmModifierLinear,
                     destination: ScanoutAllocationPlan::LegacyLinear,
                 },
             ]
@@ -5006,14 +4964,16 @@ mod tests {
     #[test]
     fn copied_plan_is_transport_not_a_third_allocation_owner() {
         let plan = CopiedScanoutPlan {
-            source: CopiedSourcePlan::DrmModifier(TILED_A),
+            source: CopiedSourcePlan::DrmModifierLinear,
             destination: ScanoutAllocationPlan::GbmModifier(TILED_B),
         };
 
         assert_eq!(plan.destination.ownership(), ScanoutOwnership::Output);
         assert_eq!(
             plan.describe(),
-            format!("source-modifier=0x{TILED_A:x} -> destination-gbm-modifier=0x{TILED_B:x}")
+            format!(
+                "source-drm-modifier=0x0-linear-transport -> destination-gbm-modifier=0x{TILED_B:x}"
+            )
         );
     }
 
@@ -5073,40 +5033,61 @@ mod tests {
     }
 
     #[test]
-    fn copied_readback_initial_front_is_unavailable_without_fail_stop() {
-        assert!(matches!(
-            CopiedSourceOwnership::RendererFirstUse.readback_preparation(),
-            CopiedReadbackPreparation::Unavailable(_)
-        ));
-        assert!(matches!(
-            CopiedSourceOwnership::RendererDiscard.readback_preparation(),
-            CopiedReadbackPreparation::Unavailable(_)
-        ));
-        assert!(matches!(
-            CopiedSourceOwnership::ForeignAwaitingSink.readback_preparation(),
-            CopiedReadbackPreparation::Unavailable(_)
-        ));
-        assert!(matches!(
-            CopiedSourceOwnership::ForeignReturnPending.readback_preparation(),
-            CopiedReadbackPreparation::Unavailable(_)
-        ));
-        assert_eq!(
-            CopiedSourceOwnership::ForeignAwaitingRenderer.readback_preparation(),
-            CopiedReadbackPreparation::RendererAcquire
-        );
+    fn copied_local_target_readback_is_independent_of_transport_ownership() {
+        let mut contents = CopiedRenderTargetContents::default();
+        assert!(contents.validate_readback().is_err());
 
-        let ordinary = CopiedReadbackPrepareError::Unavailable(io::Error::other("no pixels"));
-        assert!(!ordinary.requires_fail_stop());
-        let consumed_return =
-            CopiedReadbackPrepareError::RendererAcquire(io::Error::other("import failed"));
-        assert!(consumed_return.requires_fail_stop());
+        contents.note_submit_succeeded();
+        assert!(contents.validate_readback().is_ok());
+
+        contents.invalidate();
+        assert!(contents.validate_readback().is_err());
+    }
+
+    #[test]
+    fn copied_transport_preparation_tracks_first_discard_and_foreign_return() {
+        for state in [
+            CopiedSourceOwnership::RendererFirstUse,
+            CopiedSourceOwnership::RendererDiscard,
+        ] {
+            assert_eq!(
+                state.transport_preparation().expect("local full overwrite"),
+                CopiedTransportPreparation {
+                    foreign_acquire: false,
+                    local_old_layout: vk::ImageLayout::UNDEFINED,
+                }
+            );
+        }
+        assert_eq!(
+            CopiedSourceOwnership::ForeignAwaitingRenderer
+                .transport_preparation()
+                .expect("synchronized foreign return"),
+            CopiedTransportPreparation {
+                foreign_acquire: true,
+                local_old_layout: vk::ImageLayout::GENERAL,
+            }
+        );
+        assert!(
+            CopiedSourceOwnership::ForeignAwaitingSink
+                .transport_preparation()
+                .is_err()
+        );
+        assert!(
+            CopiedSourceOwnership::ForeignReturnPending
+                .transport_preparation()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn copied_sink_query_and_import_share_exact_transfer_source_usage() {
+        assert_eq!(COPIED_SINK_IMPORT_USAGE, vk::ImageUsageFlags::TRANSFER_SRC);
     }
 
     #[test]
     fn lifecycle_quiescence_normalizes_every_source_handoff_to_full_discard() {
         let states = [
             CopiedSourceOwnership::RendererFirstUse,
-            CopiedSourceOwnership::RendererOwned,
             CopiedSourceOwnership::ForeignAwaitingSink,
             CopiedSourceOwnership::ForeignAwaitingRenderer,
             CopiedSourceOwnership::RendererDiscard,

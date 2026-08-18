@@ -36,15 +36,16 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 - **2026-08-18 copied reverse-PRIME scanout:** a different-device or
   relationship-unknown output now falls back to GPU copy transport only after
   every exact copy-free allocation plan fails. `OutputScanout` keeps the
-  ordinary shared pool distinct from a copied pool pairing renderer-A export
-  sources with a truthful renderer-B-local destination pool and the outer
-  A-to-KMS route. Renderer B is accepted only when exactly one inventoried
-  `RenderDevice` advertises the sink KMS primary node; disposable and live
+  ordinary shared pool distinct from a copied pool pairing renderer-A optimal
+  targets and linear external transports with a truthful renderer-B-local
+  destination pool and the outer A-to-KMS route. Renderer B is accepted only
+  when exactly one inventoried `RenderDevice` advertises the sink KMS primary
+  node; disposable and live
   contexts select A and B by exact Vulkan device plus driver UUID, so
   display-only and ambiguous sinks are never guessed or rescored. Every copied
   candidate requires `VK_EXT_queue_family_foreign` on both contexts, allocates
-  all three source/destination slots on fresh A/B logical devices, and runs two
-  real render/copy cycles per slot with separate local-layout and
+  all three target/transport/destination slots on fresh A/B logical devices,
+  and runs two real render/copy cycles per slot with separate local-layout and
   `VK_QUEUE_FAMILY_FOREIGN_EXT` barriers. Cycle two consumes a retained B-to-A
   completion through a fresh temporary semaphore; because atomic `TEST_ONLY`
   does not provide a KMS ownership return, its destination full-discards from
@@ -61,21 +62,34 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   (or retained as an explicit `fd=-1` sentinel); temporary waits live until
   their consuming submission's fence completes. Damage,
   generation, cursor, descriptor, and paired A-source retirement wait for the
-  matching page-flip completion. Readback uses A's composited source while
+  matching page-flip completion. A composes into an optimal renderer-local
+  target, copies it into an explicit modifier-0 `TRANSFER_DST` transport, and
+  releases only that transport to FOREIGN. A creates the DMA-BUF with
+  `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` and `[DRM_FORMAT_MOD_LINEAR]`; B
+  imports the same explicit modifier, offset, and row pitch with `TRANSFER_SRC`
+  usage. The same recorder is
+  exercised in live submission and both disposable-probe cycles; cycle two
+  acquires the returned linear transport while the optimal target remains
+  local. Readback uses A's optimal target after a successful compose and does
+  not consume B's retained completion or mutate transport ownership, while
   framebuffer retention, direct-scanout bookkeeping, and KMS retirement use
   B's destination. Destination state distinguishes B-produced `GENERAL`
   contents from a fresh synchronous-modeset image whose Vulkan layout remains
   uninitialized, so retirement selects `GENERAL` acquire versus `UNDEFINED`
-  discard correctly. Copied readback consumes the retained B completion and
-  acquires A before reading. DMA-BUF import intersects Vulkan image and fd
-  memory-type masks. Post-review hardware validation showed that an implicit
+  discard correctly. A separate local-pixel-valid state is cleared initially,
+  after failed-cycle recovery, and across lifecycle reset. DMA-BUF import
+  intersects Vulkan image and fd memory-type masks. Post-review hardware
+  validation showed that an implicit
   linear import cannot safely express a foreign pitch on affected older sink
-  drivers, so B must expose `VK_EXT_image_drm_format_modifier`; copied scanout
-  rejects the route before foreign allocation when explicit modifier/layout
-  import is unavailable. Explicit `DRM_FORMAT_MOD_LINEAR` remains eligible,
-  while renderer-local optimal-to-linear transport remains a separate later
-  revision. The same implicit-layout limitation affects legacy DRI3 imports:
-  without the modifier extension, DRI3 remains available for a proven single
+  drivers, so both A and B must expose `VK_EXT_image_drm_format_modifier`;
+  copied scanout rejects the route before foreign allocation when explicit
+  modifier/layout export or import is unavailable. A live RADV/NVIDIA probe
+  confirmed why this is policy rather than spelling: RADV rejected the
+  implicit `VK_IMAGE_TILING_LINEAR + TRANSFER_DST + DMA_BUF` query but exposed
+  exportable explicit modifier 0, while NVIDIA exposed the matching import.
+  Explicit `DRM_FORMAT_MOD_LINEAR` is therefore the sole A/B transport
+  representation. The same implicit-layout limitation affects
+  legacy DRI3 imports: without the modifier extension, DRI3 remains available for a proven single
   renderer (including verified display-only KMS splits), but is hidden when a
   second Vulkan renderer may supply a PRIME buffer whose padded stride cannot
   be expressed. Clients then select their software fallback instead of
@@ -91,9 +105,10 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   than reusing them, and live A/B device loss is fatal. Failure recovery
   currently uses synchronous sink `device_wait_idle`,
   so it is safe but may block on a wedged driver. The compatibility path remains
-  full-frame GPU copy with no CPU fallback; renderer-local optimal targets plus
-  explicit linearization remain a later transport layer. Live mixed-GPU and
-  FreeBSD hardware smoke remain pending.
+  full-frame two-stage GPU copy with no CPU fallback. Validation: focused
+  scanout, target, and scene state suites; full workspace tests; workspace
+  all-target Clippy with warnings denied; nightly formatting and diff checks.
+  Live mixed-GPU and FreeBSD hardware smoke remain pending.
 - **2026-08-18 connector-handle mode resolution:** RANDR requests for a
   non-preferred mode now query the exact typed DRM connector handle carried by
   the freshly discovered `Output` on its owning KMS device. Protocol-facing
