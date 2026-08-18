@@ -193,11 +193,15 @@ pub struct RecordingBackend {
     /// core-loop tests use this to verify same-kind poll sources remain
     /// distinguishable.
     pub page_flip_fds: Mutex<Vec<std::os::fd::RawFd>>,
+    /// Number of copied-scanout render-completion readiness callbacks.
+    pub scanout_render_completion_count: std::sync::atomic::AtomicU32,
     /// Stable test-owned fd inventory returned by `poll_fds`.
     poll_sources: Vec<(std::os::fd::RawFd, crate::backend::BackendFdKind)>,
     /// Optional test notification sent after a DRM fd is dispatched,
     /// allowing a test thread to wait without timing-dependent sleeps.
     page_flip_ready_tx: Option<crossbeam_channel::Sender<std::os::fd::RawFd>>,
+    /// Optional notification sent after copied-scanout completion dispatch.
+    scanout_render_completion_tx: Option<crossbeam_channel::Sender<()>>,
     /// Counter — incremented every time `before_block` is invoked. Tests
     /// assert the core loop drives per-iteration reclamation even when no
     /// page-flip ever occurs (project_reclamation_starvation_leak).
@@ -431,8 +435,10 @@ impl RecordingBackend {
             xid_map: HostXidMap::new(),
             page_flip_count: std::sync::atomic::AtomicU32::new(0),
             page_flip_fds: Mutex::new(Vec::new()),
+            scanout_render_completion_count: std::sync::atomic::AtomicU32::new(0),
             poll_sources: Vec::new(),
             page_flip_ready_tx: None,
+            scanout_render_completion_tx: None,
             before_block_count: std::sync::atomic::AtomicU32::new(0),
             cow_next_release_is_final: false,
             cow_materialized: false,
@@ -504,6 +510,16 @@ impl RecordingBackend {
     ) -> Self {
         self.poll_sources = sources;
         self.page_flip_ready_tx = Some(page_flip_ready_tx);
+        self
+    }
+
+    /// Configure a test notification for copied-scanout completion dispatch.
+    #[must_use]
+    pub fn with_scanout_render_completion_notification(
+        mut self,
+        tx: crossbeam_channel::Sender<()>,
+    ) -> Self {
+        self.scanout_render_completion_tx = Some(tx);
         self
     }
 
@@ -943,6 +959,14 @@ impl Backend for RecordingBackend {
         self.page_flip_fds.lock().unwrap().push(drm_fd);
         if let Some(tx) = self.page_flip_ready_tx.as_ref() {
             let _ = tx.send(drm_fd);
+        }
+    }
+
+    fn on_scanout_render_completion(&mut self, _state: &mut crate::server::ServerState) {
+        self.scanout_render_completion_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(tx) = self.scanout_render_completion_tx.as_ref() {
+            let _ = tx.send(());
         }
     }
 

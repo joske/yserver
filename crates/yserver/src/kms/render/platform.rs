@@ -37,7 +37,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     io,
-    os::fd::{AsFd, AsRawFd, OwnedFd, RawFd},
+    os::fd::{AsFd, AsRawFd, IntoRawFd, OwnedFd, RawFd},
     path::PathBuf,
     rc::{Rc, Weak},
     sync::Arc,
@@ -59,9 +59,12 @@ use crate::{
         },
         scanout_route::{RenderKmsRelationship, ScanoutRoute},
         vk::{
-            device::VkContext,
+            device::{VkContext, VulkanDeviceSelector},
             ops::OpsCommandPool,
-            scanout::{BoPhase, BoState, ScanoutAllocationPlan, ScanoutBoPool},
+            scanout::{
+                BoPhase, BoState, CopiedScanoutPool, OutputScanout, ScanoutAllocationPlan,
+                ScanoutBoPool,
+            },
         },
     },
 };
@@ -152,22 +155,38 @@ impl std::fmt::Debug for FenceTicketInner {
 }
 
 impl FenceTicket {
-    /// Non-blocking signaled check. Caches `true` once observed
-    /// so subsequent calls don't hit the driver.
-    pub(crate) fn poll_signaled(&self, vk: &VkContext) -> bool {
-        if self.inner.signaled_cache.get() {
-            return true;
+    fn note_status_failure(&self) {
+        if let Some(pool) = self.inner.pool.upgrade()
+            && let Ok(mut pool) = pool.try_borrow_mut()
+        {
+            pool.renderer_failed = true;
         }
-        // ash's `get_fence_status` returns `Result<bool, vk::Result>`
-        // where the bool is the signaled state (Ok(true) =
-        // VK_SUCCESS, Ok(false) = VK_NOT_READY). Errors are real
-        // driver failures.
+    }
+
+    /// Non-blocking status query that preserves Vulkan errors for callers
+    /// owning resources gated by this ticket.
+    pub(crate) fn poll_signaled_result(&self, vk: &VkContext) -> Result<bool, vk::Result> {
+        if self.inner.signaled_cache.get() {
+            return Ok(true);
+        }
         match unsafe { vk.device.get_fence_status(self.inner.fence) } {
             Ok(true) => {
                 self.inner.signaled_cache.set(true);
-                true
+                Ok(true)
             }
-            Ok(false) => false,
+            Ok(false) => Ok(false),
+            Err(error) => {
+                self.note_status_failure();
+                Err(error)
+            }
+        }
+    }
+
+    /// Non-blocking signaled check. Caches `true` once observed
+    /// so subsequent calls don't hit the driver.
+    pub(crate) fn poll_signaled(&self, vk: &VkContext) -> bool {
+        match self.poll_signaled_result(vk) {
+            Ok(signaled) => signaled,
             Err(e) => {
                 log::warn!("FenceTicket::poll_signaled: get_fence_status: {e:?}");
                 false
@@ -510,6 +529,29 @@ pub(crate) struct FlushOutcome {
 /// token instead, distinguishing them from the wakeup_eventfd.
 pub(crate) const WAKEUP_EVENTFD_TOKEN: u64 = u64::MAX;
 
+/// One source-renderer completion retained by the platform until its
+/// `sync_file` becomes readable.  The stable [`OutputKey`] and monotonic job
+/// id remain authoritative across output-vector rebuilds; raw fds and vector
+/// indices are deliberately not identities.
+struct PendingScanoutRenderCompletion {
+    job_id: u64,
+    output_key: OutputKey,
+    bo_idx: usize,
+    /// `None` is Vulkan's valid already-signalled SYNC_FD payload (`fd=-1`).
+    /// It bypasses readiness polling but remains a real synchronization
+    /// payload that the sink imports as raw -1.
+    fd: Option<OwnedFd>,
+}
+
+/// A completed source-render job ready for the sink-side copied-scanout
+/// submission.
+pub(crate) struct ReadyScanoutRenderCompletion {
+    pub(crate) job_id: u64,
+    pub(crate) output_key: OutputKey,
+    pub(crate) bo_idx: usize,
+    pub(crate) fd: Option<OwnedFd>,
+}
+
 /// True iff a cursor-plane ioctl error means the driver does not
 /// implement the (legacy) cursor ioctls at all — a permanent,
 /// per-driver condition that warrants latching the HW cursor strategy
@@ -825,6 +867,10 @@ fn apply_cursor_operation_result(
 pub(crate) struct RenderDevice {
     pub(crate) id: RenderDeviceId,
     pub(crate) physical_device: vk::PhysicalDevice,
+    /// Stable cross-instance identity used to create an exact disposable or
+    /// sink-side transfer logical device.  The opaque physical-device handle
+    /// above is valid only inside the live renderer's Vulkan instance.
+    pub(crate) selector: VulkanDeviceSelector,
     /// Renderer-side primary identity advertised by Vulkan. This is metadata
     /// for same-device detection only and never implies KMS capability.
     pub(crate) advertised_primary_node: Option<crate::platform::drm::DrmDeviceKey>,
@@ -879,6 +925,11 @@ struct PreparedScanoutPool {
     committed_framebuffer: Option<::drm::control::framebuffer::Handle>,
 }
 
+struct PreparedCopiedScanoutPool {
+    pool: CopiedScanoutPool,
+    committed_framebuffer: Option<::drm::control::framebuffer::Handle>,
+}
+
 #[derive(Debug, thiserror::Error)]
 enum CopyFreeScanoutError {
     #[error("{0}")]
@@ -892,6 +943,27 @@ impl CopyFreeScanoutError {
         match self {
             Self::Candidates(error) => error,
             Self::LiveRendererLost(error) => io::Error::other(Self::LiveRendererLost(error)),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum CopiedScanoutError {
+    #[error("{0}")]
+    Candidates(io::Error),
+    #[error("live Vulkan device lost during copied scanout setup ({context}): {source}")]
+    LiveDeviceLost {
+        context: String,
+        #[source]
+        source: io::Error,
+    },
+}
+
+impl CopiedScanoutError {
+    fn into_io_error(self) -> io::Error {
+        match self {
+            Self::Candidates(error) => error,
+            error @ Self::LiveDeviceLost { .. } => io::Error::other(error),
         }
     }
 }
@@ -1056,6 +1128,162 @@ fn allocate_copy_free_scanout_pool(
 
     Err(CopyFreeScanoutError::Candidates(io::Error::other(format!(
         "every copy-free scanout candidate failed for {route:?}: {}",
+        failures.join("; ")
+    ))))
+}
+
+/// Probe and replay the copied compatibility path after every shared
+/// allocation plan has failed.  Every source/destination-plan pair receives
+/// fresh exact A and B logical devices; only a complete three-slot real
+/// render, cross-device copy, and per-framebuffer TEST_ONLY winner is replayed
+/// on the two live devices.
+#[allow(clippy::too_many_arguments)]
+fn allocate_copied_scanout_pool(
+    live_render_vk: Arc<VkContext>,
+    live_sink_vk: Arc<VkContext>,
+    scanout_device: Rc<drm::Device>,
+    output: &crate::platform::drm::Output,
+    route: ScanoutRoute,
+    destination_route: ScanoutRoute,
+    width: u32,
+    height: u32,
+    scanout_modifiers: &[u64],
+    commit_first_framebuffer: bool,
+) -> Result<PreparedCopiedScanoutPool, CopiedScanoutError> {
+    debug_assert!(route_requires_copy_free_probe(route));
+    debug_assert_eq!(destination_route.relationship, RenderKmsRelationship::Same);
+    let plans = CopiedScanoutPool::exact_allocation_plans(
+        &live_render_vk,
+        &live_sink_vk,
+        &scanout_device,
+        width,
+        scanout_modifiers,
+    );
+    let mut failures = Vec::new();
+
+    for plan in plans {
+        let probe_render_vk =
+            match VkContext::new_disposable_for_same_physical_device(&live_render_vk) {
+                Ok(vk) => vk,
+                Err(error) => {
+                    failures.push(format!(
+                        "{} disposable source renderer: {error}",
+                        plan.describe()
+                    ));
+                    continue;
+                }
+            };
+        let probe_sink_vk = match VkContext::new_transfer_for_device(live_sink_vk.device_selector())
+        {
+            Ok(vk) => vk,
+            Err(error) => {
+                failures.push(format!(
+                    "{} disposable sink renderer: {error}",
+                    plan.describe()
+                ));
+                continue;
+            }
+        };
+        let mut probe_pool = match CopiedScanoutPool::allocate_exact(
+            probe_render_vk,
+            probe_sink_vk,
+            Rc::clone(&scanout_device),
+            route,
+            destination_route,
+            width,
+            height,
+            SCANOUT_POOL_DEPTH,
+            scanout_modifiers,
+            plan,
+        ) {
+            Ok(pool) => pool,
+            Err(error) => {
+                failures.push(format!("{} probe allocation: {error}", plan.describe()));
+                continue;
+            }
+        };
+        if let Err(error) = test_scanout_pool(&scanout_device, output, &probe_pool.destinations) {
+            failures.push(format!("{} probe TEST_ONLY: {error}", plan.describe()));
+            continue;
+        }
+        if let Err(error) = probe_pool.probe_copy_all(PRIME_RENDER_PROBE_TIMEOUT_NS) {
+            failures.push(format!("{} probe render/copy: {error}", plan.describe()));
+            continue;
+        }
+        drop(probe_pool);
+
+        let live_pool = match CopiedScanoutPool::allocate_exact(
+            Arc::clone(&live_render_vk),
+            Arc::clone(&live_sink_vk),
+            Rc::clone(&scanout_device),
+            route,
+            destination_route,
+            width,
+            height,
+            SCANOUT_POOL_DEPTH,
+            scanout_modifiers,
+            plan,
+        ) {
+            Ok(pool) => pool,
+            Err(error) => {
+                if crate::kms::vk::scanout::scanout_error_is_device_lost(&error) {
+                    return Err(CopiedScanoutError::LiveDeviceLost {
+                        context: format!("{} live allocation", plan.describe()),
+                        source: error,
+                    });
+                }
+                failures.push(format!("{} live allocation: {error}", plan.describe()));
+                continue;
+            }
+        };
+        if let Err(error) = test_scanout_pool(&scanout_device, output, &live_pool.destinations) {
+            failures.push(format!("{} live TEST_ONLY: {error}", plan.describe()));
+            continue;
+        }
+
+        let mut live_pool = live_pool;
+        let committed_framebuffer = if commit_first_framebuffer {
+            let (front_index, framebuffer) = live_pool
+                .destinations
+                .bos
+                .iter()
+                .enumerate()
+                .find_map(|(index, bo)| bo.fb_handle.map(|framebuffer| (index, framebuffer)))
+                .ok_or_else(|| {
+                    CopiedScanoutError::Candidates(io::Error::other(format!(
+                        "{} live destination pool has no framebuffer",
+                        plan.describe()
+                    )))
+                })?;
+            if let Err(error) =
+                crate::drm::modeset::commit_modeset(&scanout_device, output, framebuffer)
+            {
+                failures.push(format!("{} live modeset: {error}", plan.describe()));
+                continue;
+            }
+            live_pool.destinations.bos[front_index]
+                .state
+                .mark_on_screen_after_modeset();
+            live_pool
+                .note_kms_modeset_installed(front_index)
+                .map_err(CopiedScanoutError::Candidates)?;
+            Some(framebuffer)
+        } else {
+            None
+        };
+
+        log::info!(
+            "copied scanout probe selected {} for {route:?}",
+            plan.describe()
+        );
+        return Ok(PreparedCopiedScanoutPool {
+            pool: live_pool,
+            committed_framebuffer,
+        });
+    }
+
+    Err(CopiedScanoutError::Candidates(io::Error::other(format!(
+        "every copied scanout candidate failed for {route:?}: {}",
         failures.join("; ")
     ))))
 }
@@ -1309,6 +1537,14 @@ pub(crate) struct PlatformBackend {
     /// `present_completion_epfd` at init under `WAKEUP_EVENTFD_TOKEN`.
     pub(crate) wakeup_eventfd: nix::sys::eventfd::EventFd,
 
+    /// Stable native readiness aggregator for renderer-completion sync files
+    /// used by copied reverse-PRIME.  This is intentionally distinct from the
+    /// Present completion poller: the two readiness streams have different
+    /// ownership, cancellation, and delivery semantics.
+    scanout_render_completion_epfd: crate::kms::render::completion_poller::CompletionPoller,
+    pending_scanout_render_completions: std::collections::VecDeque<PendingScanoutRenderCompletion>,
+    next_scanout_render_job_id: u64,
+
     // Vulkan side. `Option` only to support test fixtures that
     // skip Vk init (`for_tests`). Production `open_with_commit`
     // always returns `Some`. v2 has no pixman fallback.
@@ -1329,11 +1565,17 @@ pub(crate) struct PlatformBackend {
     /// `open_with_commit`).
     pub(crate) pixmap_pool: Option<Arc<crate::kms::vk::pixmap_pool::PixmapPool>>,
 
+    /// Minimal sink-side Vulkan transfer contexts, keyed by the exact renderer
+    /// endpoint whose advertised primary identity matches a KMS device.
+    /// Copied outputs on the same sink share one queue/context; each pool owns
+    /// an `Arc` so imported aliases remain valid until pool teardown.
+    copy_vk_contexts: HashMap<RenderDeviceId, Arc<VkContext>>,
+
     /// Per-output scanout BO pool. `None` if a particular
     /// output's allocation failed (rare; e.g. RADV/gfx8 quirks).
     /// Stage 2c+ paint paths skip output indices with `None`
     /// pool, mirroring v1's behaviour.
-    pub(crate) scanout_pools: Vec<Option<ScanoutBoPool>>,
+    pub(crate) scanout_pools: Vec<Option<OutputScanout>>,
 
     /// Per-output, per-BO generation entries. `bo_generations[oi][bi]`
     /// pairs with `scanout_pools[oi].as_ref().unwrap().bos[bi]`.
@@ -1385,6 +1627,7 @@ fn build_render_device_inventory(
                     .expect("VkContext inventory contains only render-identified devices"),
             ),
             physical_device: entry.physical_device,
+            selector: entry.selector,
             advertised_primary_node: entry.identity.primary,
             advertised_render_node: entry.identity.render,
             render_node: None,
@@ -1401,6 +1644,7 @@ fn build_render_device_inventory(
             render_devices.push(RenderDevice {
                 id: RenderDeviceId::UnverifiedFallback,
                 physical_device: vk.physical_device,
+                selector: vk.device_selector(),
                 advertised_primary_node: identity.and_then(|identity| identity.primary),
                 advertised_render_node: identity.and_then(|identity| identity.render),
                 render_node: None,
@@ -1446,6 +1690,29 @@ fn build_render_device_inventory(
 
     let selected_id = render_devices[selected_index].id;
     Ok((render_devices, selected_id))
+}
+
+fn resolve_copied_sink_renderer(
+    render_devices: &[RenderDevice],
+    selected: RenderDeviceId,
+    kms_key: crate::platform::drm::DrmDeviceKey,
+) -> io::Result<(RenderDeviceId, VulkanDeviceSelector)> {
+    let matches = render_devices
+        .iter()
+        .filter(|renderer| renderer.id != selected)
+        .filter(|renderer| renderer.advertised_primary_node == Some(kms_key))
+        .map(|renderer| (renderer.id, renderer.selector))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [matched] => Ok(*matched),
+        [] => Err(io::Error::other(format!(
+            "copied scanout KMS device {kms_key} has no distinct Vulkan renderer with matching advertised primary identity"
+        ))),
+        _ => Err(io::Error::other(format!(
+            "copied scanout KMS device {kms_key} matches multiple Vulkan renderers: {:?}",
+            matches.iter().map(|(id, _)| id).collect::<Vec<_>>()
+        ))),
+    }
 }
 
 fn validate_render_node_attachment(
@@ -1729,6 +1996,7 @@ impl PlatformBackend {
         let mut bo_generations = Vec::with_capacity(initial_scanout_rollback.outputs().len());
         let mut scanout_routes = Vec::with_capacity(initial_scanout_rollback.outputs().len());
         let mut scanout_alloc_errors: Vec<String> = Vec::new();
+        let mut copy_vk_contexts: HashMap<RenderDeviceId, Arc<VkContext>> = HashMap::new();
         for (i, layout) in initial_scanout_rollback.outputs().iter().enumerate() {
             let w = u32::from(layout.width);
             let h = u32::from(layout.height);
@@ -1744,7 +2012,9 @@ impl PlatformBackend {
                 })?;
             let scanout_route = selected_renderer.scanout_route_to(device);
             scanout_routes.push(scanout_route);
-            let allocation = if route_requires_copy_free_probe(scanout_route) {
+            let allocation: io::Result<OutputScanout> = if route_requires_copy_free_probe(
+                scanout_route,
+            ) {
                 match allocate_copy_free_scanout_pool(
                     Arc::clone(&vk),
                     Rc::clone(&device.device),
@@ -1757,12 +2027,74 @@ impl PlatformBackend {
                 ) {
                     Ok(prepared) => {
                         debug_assert!(prepared.committed_framebuffer.is_none());
-                        Ok(prepared.pool)
+                        Ok(OutputScanout::Shared(prepared.pool))
                     }
                     Err(error @ CopyFreeScanoutError::LiveRendererLost(_)) => {
                         return Err(io::Error::other(format!("render PlatformBackend: {error}")));
                     }
-                    Err(CopyFreeScanoutError::Candidates(error)) => Err(error),
+                    Err(CopyFreeScanoutError::Candidates(shared_error)) => {
+                        let copied_result = resolve_copied_sink_renderer(
+                            &render_devices,
+                            selected_render_device,
+                            device.key,
+                        )
+                        .and_then(|(sink_id, sink_selector)| {
+                            let sink_vk = if let Some(vk) = copy_vk_contexts.get(&sink_id) {
+                                Arc::clone(vk)
+                            } else {
+                                let sink_vk = VkContext::new_transfer_for_device(sink_selector)
+                                    .map_err(|error| {
+                                        io::Error::other(format!(
+                                            "copied sink Vulkan context for {sink_id:?}/{}: {error}",
+                                            device.key
+                                        ))
+                                    })?;
+                                copy_vk_contexts.insert(sink_id, Arc::clone(&sink_vk));
+                                sink_vk
+                            };
+                            let destination_route = ScanoutRoute::new(
+                                sink_id,
+                                device.key,
+                                RenderKmsRelationship::Same,
+                            );
+                            match allocate_copied_scanout_pool(
+                                Arc::clone(&vk),
+                                sink_vk,
+                                Rc::clone(&device.device),
+                                &layout.output,
+                                scanout_route,
+                                destination_route,
+                                w,
+                                h,
+                                &layout.output.scanout_modifiers,
+                                false,
+                            ) {
+                                Ok(prepared) => {
+                                    debug_assert!(prepared.committed_framebuffer.is_none());
+                                    Ok(OutputScanout::Copied(prepared.pool))
+                                }
+                                Err(CopiedScanoutError::Candidates(error)) => Err(error),
+                                Err(error @ CopiedScanoutError::LiveDeviceLost { .. }) => {
+                                    Err(io::Error::other(error))
+                                }
+                            }
+                        });
+                        match copied_result {
+                            Ok(pool) => Ok(pool),
+                            Err(copied_error)
+                                if crate::kms::vk::scanout::scanout_error_is_device_lost(
+                                    &copied_error,
+                                ) =>
+                            {
+                                return Err(io::Error::other(format!(
+                                    "render PlatformBackend: {copied_error}"
+                                )));
+                            }
+                            Err(copied_error) => Err(io::Error::other(format!(
+                                "copy-free scanout: {shared_error}; copied scanout: {copied_error}"
+                            ))),
+                        }
+                    }
                 }
             } else {
                 ScanoutBoPool::allocate(
@@ -1774,10 +2106,11 @@ impl PlatformBackend {
                     SCANOUT_POOL_DEPTH,
                     &layout.output.scanout_modifiers,
                 )
+                .map(OutputScanout::Shared)
             };
             match allocation {
                 Ok(pool) => {
-                    let n = pool.bos.len();
+                    let n = pool.display_pool().bos.len();
                     scanout_pools.push(Some(pool));
                     bo_generations.push(vec![BoGenerationEntry::default(); n]);
                 }
@@ -1824,6 +2157,8 @@ impl PlatformBackend {
         let present_completion_epfd =
             crate::kms::render::completion_poller::CompletionPoller::new()?;
         present_completion_epfd.register(wakeup_eventfd.as_fd(), WAKEUP_EVENTFD_TOKEN)?;
+        let scanout_render_completion_epfd =
+            crate::kms::render::completion_poller::CompletionPoller::new()?;
 
         let submit_group = SubmitGroup::new();
         #[cfg(target_os = "linux")]
@@ -1865,7 +2200,7 @@ impl PlatformBackend {
             .collect::<Vec<_>>();
         debug_assert!(outputs.iter().zip(&scanout_pools).all(|(output, pool)| {
             pool.as_ref()
-                .is_none_or(|pool| pool.route == output.scanout_route)
+                .is_none_or(|pool| pool.route() == output.scanout_route)
         }));
 
         Ok(Self {
@@ -1884,10 +2219,14 @@ impl PlatformBackend {
             hotplug_monitor,
             present_completion_epfd,
             wakeup_eventfd,
+            scanout_render_completion_epfd,
+            pending_scanout_render_completions: std::collections::VecDeque::new(),
+            next_scanout_render_job_id: 1,
             vk: Some(vk),
             ops_command_pool: Some(ops_command_pool),
             fence_pool: Some(fence_pool),
             pixmap_pool,
+            copy_vk_contexts,
             scanout_pools,
             bo_generations,
             next_present_generation: 0,
@@ -1916,6 +2255,9 @@ impl PlatformBackend {
         present_completion_epfd
             .register(wakeup_eventfd.as_fd(), WAKEUP_EVENTFD_TOKEN)
             .expect("test poller register");
+        let scanout_render_completion_epfd =
+            crate::kms::render::completion_poller::CompletionPoller::new()
+                .expect("test scanout completion poller");
         #[cfg(target_os = "linux")]
         let hotplug_monitor = None;
         let device_key = crate::platform::drm::DrmDeviceKey { major: 0, minor: 0 };
@@ -1992,10 +2334,14 @@ impl PlatformBackend {
             hotplug_monitor,
             present_completion_epfd,
             wakeup_eventfd,
+            scanout_render_completion_epfd,
+            pending_scanout_render_completions: std::collections::VecDeque::new(),
+            next_scanout_render_job_id: 1,
             vk: None,
             ops_command_pool: None,
             fence_pool: None,
             pixmap_pool: None,
+            copy_vk_contexts: HashMap::new(),
             scanout_pools: vec![None],
             bo_generations: vec![Vec::new()],
             next_present_generation: 0,
@@ -2708,6 +3054,38 @@ impl PlatformBackend {
             .find(|device| device.id == selected)
     }
 
+    /// Resolve the sink-side renderer for copied scanout without guessing.
+    /// A usable sink must be a distinct inventoried Vulkan endpoint whose
+    /// advertised DRM primary identity is exactly the target KMS device.
+    /// Missing or ambiguous inventory is an unavailable copied candidate,
+    /// never a reason to rescore GPUs or reinterpret a render-node identity.
+    fn copied_sink_renderer_for_kms(
+        &self,
+        kms_key: crate::platform::drm::DrmDeviceKey,
+    ) -> io::Result<(RenderDeviceId, VulkanDeviceSelector)> {
+        let selected = self
+            .selected_render_device
+            .ok_or_else(|| io::Error::other("copied scanout has no selected source renderer"))?;
+        resolve_copied_sink_renderer(&self.render_devices, selected, kms_key)
+    }
+
+    fn copied_sink_context_for_kms(
+        &mut self,
+        kms_key: crate::platform::drm::DrmDeviceKey,
+    ) -> io::Result<(RenderDeviceId, Arc<VkContext>)> {
+        let (renderer_id, selector) = self.copied_sink_renderer_for_kms(kms_key)?;
+        if let Some(vk) = self.copy_vk_contexts.get(&renderer_id) {
+            return Ok((renderer_id, Arc::clone(vk)));
+        }
+        let vk = VkContext::new_transfer_for_device(selector).map_err(|error| {
+            io::Error::other(format!(
+                "copied scanout sink Vulkan context for {renderer_id:?}/{kms_key}: {error}"
+            ))
+        })?;
+        self.copy_vk_contexts.insert(renderer_id, Arc::clone(&vk));
+        Ok((renderer_id, vk))
+    }
+
     #[cfg(test)]
     pub(crate) fn selected_render_device_mut(&mut self) -> Option<&mut RenderDevice> {
         let selected = self.selected_render_device?;
@@ -2821,7 +3199,7 @@ impl PlatformBackend {
     }
 
     pub(crate) fn poll_fds(&self) -> Vec<(RawFd, BackendFdKind)> {
-        let mut fds = Vec::with_capacity(3 + self.devices.len());
+        let mut fds = Vec::with_capacity(4 + self.devices.len());
         if let Some(ctx) = self.input_ctx.as_ref() {
             fds.push((ctx.fd(), BackendFdKind::Libinput));
         }
@@ -2838,7 +3216,121 @@ impl PlatformBackend {
             self.present_completion_epfd.as_raw_fd(),
             BackendFdKind::PresentCompletion,
         ));
+        fds.push((
+            self.scanout_render_completion_epfd.as_raw_fd(),
+            BackendFdKind::ScanoutRenderCompletion,
+        ));
         fds
+    }
+
+    /// Register one source-renderer completion with the stable copied-scanout
+    /// readiness set.  The returned job id is never derived from the fd and is
+    /// paired with a device-qualified output identity so output-vector
+    /// reordering cannot retarget a completion.
+    pub(crate) fn register_scanout_render_completion(
+        &mut self,
+        output_key: OutputKey,
+        bo_idx: usize,
+        fd: Option<OwnedFd>,
+    ) -> io::Result<u64> {
+        let job_id = self.next_scanout_render_job_id;
+        self.next_scanout_render_job_id = self
+            .next_scanout_render_job_id
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("scanout render job id overflow"))?;
+        if let Some(fd) = fd.as_ref() {
+            self.scanout_render_completion_epfd
+                .register(fd.as_fd(), job_id)?;
+        }
+        self.pending_scanout_render_completions
+            .push_back(PendingScanoutRenderCompletion {
+                job_id,
+                output_key,
+                bo_idx,
+                fd,
+            });
+        Ok(job_id)
+    }
+
+    /// Drain every currently readable copied-scanout render completion.
+    /// Different outputs are independent, so readiness is not constrained by
+    /// queue-front order.
+    pub(crate) fn drain_scanout_render_completions(&mut self) -> Vec<ReadyScanoutRenderCompletion> {
+        use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+
+        let mut ready = Vec::new();
+        let mut index = 0;
+        while index < self.pending_scanout_render_completions.len() {
+            let is_ready = {
+                let pending = &self.pending_scanout_render_completions[index];
+                if let Some(fd) = pending.fd.as_ref() {
+                    let mut fds = [PollFd::new(fd.as_fd(), PollFlags::POLLIN)];
+                    match poll(&mut fds, PollTimeout::ZERO) {
+                        Ok(0) => false,
+                        Ok(_) => fds[0].revents().is_some_and(|events| {
+                            events.intersects(
+                                PollFlags::POLLIN | PollFlags::POLLERR | PollFlags::POLLHUP,
+                            )
+                        }),
+                        Err(error) => {
+                            log::warn!("scanout render completion poll failed: {error}");
+                            true
+                        }
+                    }
+                } else {
+                    true
+                }
+            };
+            if !is_ready {
+                index += 1;
+                continue;
+            }
+            let pending = self
+                .pending_scanout_render_completions
+                .remove(index)
+                .expect("scanout completion index was checked");
+            if let Some(fd) = pending.fd.as_ref()
+                && let Err(error) = self.scanout_render_completion_epfd.unregister(fd.as_fd())
+            {
+                log::warn!("scanout render completion unregister failed: {error}");
+            }
+            ready.push(ReadyScanoutRenderCompletion {
+                job_id: pending.job_id,
+                output_key: pending.output_key,
+                bo_idx: pending.bo_idx,
+                fd: pending.fd,
+            });
+        }
+        ready
+    }
+
+    pub(crate) fn cancel_scanout_render_completions_for_output(&mut self, output_key: &OutputKey) {
+        let mut index = 0;
+        while index < self.pending_scanout_render_completions.len() {
+            if self.pending_scanout_render_completions[index].output_key != *output_key {
+                index += 1;
+                continue;
+            }
+            let pending = self
+                .pending_scanout_render_completions
+                .remove(index)
+                .expect("scanout completion index was checked");
+            if let Some(fd) = pending.fd.as_ref()
+                && let Err(error) = self.scanout_render_completion_epfd.unregister(fd.as_fd())
+            {
+                log::warn!("scanout render completion cancellation unregister failed: {error}");
+            }
+        }
+    }
+
+    pub(crate) fn clear_scanout_render_completions(&mut self) {
+        while let Some(pending) = self.pending_scanout_render_completions.pop_front() {
+            if let Some(fd) = pending.fd.as_ref()
+                && let Err(error) = self.scanout_render_completion_epfd.unregister(fd.as_fd())
+            {
+                log::warn!("scanout render completion teardown unregister failed: {error}");
+            }
+        }
     }
 
     fn drm_device_index_for_fd(&self, drm_fd: RawFd) -> Option<usize> {
@@ -3787,6 +4279,20 @@ impl PlatformBackend {
         pool.acquire()
     }
 
+    /// Propagate a fence-status failure observed through any cloned ticket to
+    /// the platform-wide fatal renderer latch. This closes the gap where a
+    /// failed status query otherwise looked like perpetual NOT_READY and held
+    /// a failed-submit BO forever.
+    pub(crate) fn refresh_fence_pool_failure(&mut self) {
+        if self
+            .fence_pool
+            .as_ref()
+            .is_some_and(FencePool::renderer_failed)
+        {
+            self.renderer_failed = true;
+        }
+    }
+
     // ── I6b: scanout BO management ──────────────────────────────
 
     fn debug_assert_scanout_pool_route(&self, output_idx: usize) {
@@ -3795,7 +4301,7 @@ impl PlatformBackend {
                 self.outputs
                     .get(output_idx)
                     .map(|output| output.scanout_route),
-                Some(pool.route),
+                Some(pool.route()),
                 "scanout pool must stay paired with its output's renderer-to-KMS route"
             );
         }
@@ -3810,9 +4316,9 @@ impl PlatformBackend {
     /// SceneCompositor doesn't need to reach into the pool.
     pub(crate) fn acquire_scanout_bo(&mut self, output_idx: usize) -> Option<ScanoutBoToken> {
         self.debug_assert_scanout_pool_route(output_idx);
-        let pool = self.scanout_pools.get_mut(output_idx)?.as_mut()?;
+        let scanout = self.scanout_pools.get_mut(output_idx)?.as_mut()?;
         let gens = self.bo_generations.get(output_idx)?;
-        for (bo_idx, bo) in pool.bos.iter().enumerate() {
+        for (bo_idx, bo) in scanout.display_pool().bos.iter().enumerate() {
             if bo.state.phase == BoPhase::Free {
                 let entry = gens.get(bo_idx).copied().unwrap_or_default();
                 return Some(ScanoutBoToken {
@@ -3830,6 +4336,127 @@ impl PlatformBackend {
         None
     }
 
+    /// Advance one copied frame from a completed source-render submission to
+    /// the sink copy and KMS page flip.  Poll readiness is only a scheduling
+    /// boundary: the source `sync_file` is still imported and waited by the
+    /// sink Vulkan submission, whose exported completion becomes KMS's
+    /// `IN_FENCE_FD`.
+    pub(crate) fn submit_copied_scanout(
+        &mut self,
+        output_idx: usize,
+        bo_idx: usize,
+        render_completion: Option<OwnedFd>,
+    ) -> io::Result<()> {
+        self.debug_assert_scanout_pool_route(output_idx);
+        let output_key = self
+            .outputs
+            .get(output_idx)
+            .map(|output| output.key.clone())
+            .ok_or_else(|| io::Error::other("copied scanout output index out of range"))?;
+        let device = self
+            .device_for_output(&output_key)
+            .map(|device| Rc::clone(&device.device))
+            .ok_or_else(|| io::Error::other("copied scanout KMS device disappeared"))?;
+
+        let mut recovery_failed = false;
+        let result = (|| {
+            // `Output` deliberately is not Clone: its DRM handles belong to
+            // the owning open fd. Borrow the output and its independently
+            // indexed scanout pool through disjoint PlatformBackend fields.
+            let output = &self
+                .outputs
+                .get(output_idx)
+                .ok_or_else(|| io::Error::other("copied scanout output disappeared"))?
+                .output;
+            let copied = self
+                .scanout_pools
+                .get_mut(output_idx)
+                .and_then(Option::as_mut)
+                .and_then(OutputScanout::copied_mut)
+                .ok_or_else(|| io::Error::other("render completion targeted a shared output"))?;
+            let framebuffer = copied
+                .destinations
+                .bos
+                .get(bo_idx)
+                .ok_or_else(|| io::Error::other("copied destination index out of range"))?
+                .fb_handle
+                .ok_or_else(|| io::Error::other("copied destination has no framebuffer"))?;
+
+            let copy_completion = match copied.submit_copy(bo_idx, render_completion) {
+                Ok(fd) => fd,
+                Err(error) => {
+                    if let Err(recovery_error) = copied.recover_copy_failure(bo_idx) {
+                        recovery_failed = true;
+                        log::error!(
+                            "copied scanout submission failed ({error}) and the sink could not be quiesced: {recovery_error}"
+                        );
+                        return Err(io::Error::new(recovery_error.kind(), recovery_error));
+                    }
+                    return Err(error);
+                }
+            };
+            let destination = copied
+                .destinations
+                .bos
+                .get_mut(bo_idx)
+                .expect("copied destination was checked before copy submission");
+            let in_fence_fd = copy_completion.map_or(-1, IntoRawFd::into_raw_fd);
+            destination.state.transition_to_submitted(in_fence_fd);
+            let mut out_fence_fd = -1;
+            match crate::drm::page_flip::submit_flip_with_fences(
+                &device,
+                output,
+                framebuffer,
+                in_fence_fd,
+                &mut out_fence_fd,
+            ) {
+                Ok(()) => {
+                    if let Some(fd) = destination.state.transition_to_pending(out_fence_fd) {
+                        // SAFETY: transition_to_pending transfers the uniquely
+                        // owned input-fence fd back to this caller.
+                        unsafe { libc::close(fd) };
+                    }
+                    Ok(())
+                }
+                Err(error) => {
+                    if let Some(fd) = destination
+                        .state
+                        .transition_to_recording_after_atomic_reject()
+                    {
+                        // SAFETY: the state transition returns unique fd
+                        // ownership after the rejected atomic commit.
+                        unsafe { libc::close(fd) };
+                    }
+                    if out_fence_fd >= 0 {
+                        // SAFETY: the kernel wrote a uniquely-owned fd into
+                        // our out-fence slot even though the commit failed.
+                        unsafe { libc::close(out_fence_fd) };
+                    }
+                    if let Err(recovery_error) = copied.recover_copy_failure(bo_idx) {
+                        recovery_failed = true;
+                        log::error!(
+                            "copied scanout atomic commit failed ({error}) and the sink could not be quiesced: {recovery_error}"
+                        );
+                        Err(io::Error::new(recovery_error.kind(), recovery_error))
+                    } else {
+                        Err(error)
+                    }
+                }
+            }
+        })();
+
+        if recovery_failed
+            || result
+                .as_ref()
+                .is_err_and(crate::kms::vk::scanout::scanout_error_is_device_lost)
+        {
+            // The failing operation used a live renderer or sink transfer
+            // device.  Neither uncertain image state may be reused.
+            self.renderer_failed = true;
+        }
+        result
+    }
+
     /// Framebuffer last presented by the scene compositor for this output.
     /// During M2 direct scanout the pool deliberately keeps this BO marked
     /// `OnScreen`: it is the known-good per-output target for one atomic
@@ -3842,6 +4469,7 @@ impl PlatformBackend {
         self.scanout_pools
             .get(output_idx)?
             .as_ref()?
+            .display_pool()
             .bos
             .iter()
             .find(|bo| bo.state.phase == BoPhase::OnScreen)?
@@ -3866,13 +4494,60 @@ impl PlatformBackend {
     /// after the compose fence has signaled, otherwise the BO could
     /// be rendered into again while the previous command buffer is
     /// still writing it.
-    pub(crate) fn recycle_failed_submit_bo(&mut self, output_idx: usize, bo_idx: usize) {
+    pub(crate) fn recycle_failed_submit_bo(
+        &mut self,
+        output_idx: usize,
+        bo_idx: usize,
+    ) -> io::Result<()> {
+        self.debug_assert_scanout_pool_route(output_idx);
+        let Some(scanout) = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+        else {
+            return Ok(());
+        };
+        match scanout {
+            OutputScanout::Shared(pool) => {
+                let Some(bo) = pool.bos.get_mut(bo_idx) else {
+                    return Ok(());
+                };
+                bo.rearm_export_semaphore_after_quiescence()
+                    .map_err(|result| {
+                        io::Error::other(format!(
+                            "rearm shared scanout export semaphore after failed handoff: {result:?}",
+                        ))
+                    })?;
+                bo.state = BoState::default();
+            }
+            OutputScanout::Copied(pool) => {
+                let source = pool
+                    .sources
+                    .get_mut(bo_idx)
+                    .ok_or_else(|| io::Error::other("copied source index out of range"))?;
+                source.recover_failed_cycle_after_renderer_quiescence()?;
+                let destination = pool
+                    .destinations
+                    .bos
+                    .get_mut(bo_idx)
+                    .ok_or_else(|| io::Error::other("copied destination index out of range"))?;
+                destination.state = BoState::default();
+            }
+        }
+        Ok(())
+    }
+
+    /// Abandon a target that never reached `vkQueueSubmit2`. No semaphore
+    /// payload or ownership release was executed, so only the display-pool
+    /// reservation needs to be undone. Any prepared temporary import remains
+    /// valid and may be reused by the next recording attempt.
+    pub(crate) fn cancel_scanout_bo_recording(&mut self, output_idx: usize, bo_idx: usize) {
         self.debug_assert_scanout_pool_route(output_idx);
         let Some(bo) = self
             .scanout_pools
             .get_mut(output_idx)
             .and_then(Option::as_mut)
-            .and_then(|pool| pool.bos.get_mut(bo_idx))
+            .and_then(|pool| pool.display_pool_mut().bos.get_mut(bo_idx))
         else {
             return;
         };
@@ -3896,12 +4571,19 @@ impl PlatformBackend {
     /// repaint does a full redraw rather than trusting a stale buffer-age
     /// generation. Safe to call while still master (no DRM ioctl here —
     /// only Vulkan idle + fence-fd close).
-    pub(crate) fn reset_scanout_bos_for_suspend(&mut self) {
-        let Some(vk) = self.vk.clone() else {
-            return;
-        };
-        for pool in self.scanout_pools.iter_mut().flatten() {
-            pool.drain_all_pending(&vk);
+    pub(crate) fn reset_scanout_bos_for_suspend(&mut self) -> io::Result<()> {
+        self.clear_scanout_render_completions();
+        let mut first_error = None;
+        for output_idx in 0..self.scanout_pools.len() {
+            if let Err(error) = self.drain_scanout_pool_at(output_idx) {
+                log::error!(
+                    "suspend could not quiesce scanout output {output_idx}: {error}; \
+                     copied resources remain quarantined"
+                );
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
         }
         for gens in &mut self.bo_generations {
             for g in gens {
@@ -3909,6 +4591,29 @@ impl PlatformBackend {
                 g.content_invalidated = true;
             }
         }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// Quiesce one output's renderer and (for copied scanout) sink devices.
+    /// Any failure makes the live renderer path unusable; the copied pool
+    /// keeps uncertain resources quarantined and its Drop path leaks them
+    /// instead of freeing memory that a GPU may still reference.
+    fn drain_scanout_pool_at(&mut self, output_idx: usize) -> io::Result<()> {
+        let Some(vk) = self.vk.clone() else {
+            return Ok(());
+        };
+        let result = self
+            .scanout_pools
+            .get_mut(output_idx)
+            .and_then(Option::as_mut)
+            .map_or(Ok(()), |pool| pool.drain_all_pending(&vk));
+        if result.is_err() {
+            self.renderer_failed = true;
+        }
+        result
     }
 
     /// Disable a single connector: issue a DRM `disable_output` for the
@@ -3971,7 +4676,15 @@ impl PlatformBackend {
     }
 
     fn remove_connector_at(&mut self, idx: usize) {
+        let output_key = self.outputs[idx].key.clone();
         let changed_device = self.outputs[idx].key.device_key;
+        self.cancel_scanout_render_completions_for_output(&output_key);
+        if let Err(error) = self.drain_scanout_pool_at(idx) {
+            log::error!(
+                "connector removal could not quiesce {output_key:?}: {error}; \
+                 copied resources remain quarantined"
+            );
+        }
         // Drop the scanout pool for this output so its VkImages are freed.
         if idx < self.scanout_pools.len() {
             self.scanout_pools.remove(idx);
@@ -4171,7 +4884,7 @@ impl PlatformBackend {
             existing_idx
                 .and_then(|idx| self.scanout_pools.get(idx))
                 .and_then(Option::as_ref)
-                .map(|pool| pool.route),
+                .map(OutputScanout::route),
             w,
             h,
             scanout_route,
@@ -4179,9 +4892,11 @@ impl PlatformBackend {
 
         // (Re)allocate the scanout pool if needed.
         let mut new_pool_committed_framebuffer = None;
-        let mut new_pool = if needs_pool_realloc {
+        let mut new_pool: Option<Option<OutputScanout>> = if needs_pool_realloc {
             if let Some(vk) = self.vk.as_ref().cloned() {
-                let allocation = if route_requires_copy_free_probe(scanout_route) {
+                let allocation: io::Result<OutputScanout> = if route_requires_copy_free_probe(
+                    scanout_route,
+                ) {
                     match allocate_copy_free_scanout_pool(
                         Arc::clone(&vk),
                         Rc::clone(&device),
@@ -4194,13 +4909,53 @@ impl PlatformBackend {
                     ) {
                         Ok(prepared) => {
                             new_pool_committed_framebuffer = prepared.committed_framebuffer;
-                            Ok(prepared.pool)
+                            Ok(OutputScanout::Shared(prepared.pool))
                         }
                         Err(error @ CopyFreeScanoutError::LiveRendererLost(_)) => {
                             self.renderer_failed = true;
                             return Err(error.into_io_error());
                         }
-                        Err(CopyFreeScanoutError::Candidates(error)) => Err(error),
+                        Err(CopyFreeScanoutError::Candidates(shared_error)) => {
+                            let copied_result = self
+                                .copied_sink_context_for_kms(output_key.device_key)
+                                .and_then(|(sink_id, sink_vk)| {
+                                    let destination_route = ScanoutRoute::new(
+                                        sink_id,
+                                        output_key.device_key,
+                                        RenderKmsRelationship::Same,
+                                    );
+                                    allocate_copied_scanout_pool(
+                                        Arc::clone(&vk),
+                                        sink_vk,
+                                        Rc::clone(&device),
+                                        &output,
+                                        scanout_route,
+                                        destination_route,
+                                        u32::from(w),
+                                        u32::from(h),
+                                        &output.scanout_modifiers,
+                                        true,
+                                    )
+                                    .map_err(CopiedScanoutError::into_io_error)
+                                });
+                            match copied_result {
+                                Ok(prepared) => {
+                                    new_pool_committed_framebuffer = prepared.committed_framebuffer;
+                                    Ok(OutputScanout::Copied(prepared.pool))
+                                }
+                                Err(copied_error)
+                                    if crate::kms::vk::scanout::scanout_error_is_device_lost(
+                                        &copied_error,
+                                    ) =>
+                                {
+                                    self.renderer_failed = true;
+                                    return Err(copied_error);
+                                }
+                                Err(copied_error) => Err(io::Error::other(format!(
+                                    "copy-free scanout: {shared_error}; copied scanout: {copied_error}"
+                                ))),
+                            }
+                        }
                     }
                 } else {
                     ScanoutBoPool::allocate(
@@ -4212,6 +4967,7 @@ impl PlatformBackend {
                         SCANOUT_POOL_DEPTH,
                         &output.scanout_modifiers,
                     )
+                    .map(OutputScanout::Shared)
                 };
                 match allocation {
                     Ok(pool) => Some(Some(pool)),
@@ -4240,39 +4996,38 @@ impl PlatformBackend {
         // OnScreen BO from the existing pool (if unchanged), or the
         // first BO in the new pool.  Fall back to a legacy dumb buffer
         // if nothing is available.
-        let fb_id = new_pool_committed_framebuffer.or_else(|| {
+        let fb_for_commit = if let Some(framebuffer) = new_pool_committed_framebuffer {
+            // The candidate helper already committed and marked this exact
+            // framebuffer.  From here through pool installation the path is
+            // deliberately infallible: dropping a successfully committed
+            // candidate would free memory still referenced by KMS.
+            framebuffer
+        } else {
             let pool_ref: Option<&ScanoutBoPool> = if needs_pool_realloc {
-                new_pool.as_ref().and_then(|p| p.as_ref())
+                new_pool
+                    .as_ref()
+                    .and_then(|p| p.as_ref())
+                    .map(OutputScanout::display_pool)
             } else {
                 existing_idx
                     .and_then(|i| self.scanout_pools.get(i))
                     .and_then(|p| p.as_ref())
+                    .map(OutputScanout::display_pool)
             };
-            pool_ref.and_then(|pool| {
-                use crate::kms::vk::scanout::BoPhase;
-                pool.bos
-                    .iter()
-                    .find(|bo| bo.state.phase == BoPhase::OnScreen)
-                    .and_then(|bo| bo.fb_handle)
-                    .or_else(|| pool.bos.iter().find_map(|bo| bo.fb_handle))
-            })
-        });
-
-        let fb_for_commit = fb_id.ok_or_else(|| {
-            // Free the newly-allocated pool before returning error.
-            // (new_pool would be dropped by going out of scope, which
-            //  is the desired free.)
-            io::Error::other(format!(
-                "enable_connector {connector}: no fb handle available for initial modeset"
-            ))
-        });
-
-        let fb_for_commit = match fb_for_commit {
-            Ok(fb) => fb,
-            Err(e) => {
-                // new_pool dropped here (freed).
-                return Err(e);
-            }
+            pool_ref
+                .and_then(|pool| {
+                    use crate::kms::vk::scanout::BoPhase;
+                    pool.bos
+                        .iter()
+                        .find(|bo| bo.state.phase == BoPhase::OnScreen)
+                        .and_then(|bo| bo.fb_handle)
+                        .or_else(|| pool.bos.iter().find_map(|bo| bo.fb_handle))
+                })
+                .ok_or_else(|| {
+                    io::Error::other(format!(
+                        "enable_connector {connector}: no fb handle available for initial modeset"
+                    ))
+                })?
         };
 
         // Commit the modeset.  On failure, pool is freed (dropped below).
@@ -4293,25 +5048,30 @@ impl PlatformBackend {
         // an ordinary page flip no completion event will promote it from
         // Pending. Reserve it now so the compositor cannot immediately acquire
         // and render into the live front buffer.
-        let mark_front = |pool: &mut ScanoutBoPool| {
-            if let Some(bo) = pool
+        let mark_front = |scanout: &mut OutputScanout| -> io::Result<()> {
+            let bo_idx = scanout
+                .display_pool()
                 .bos
-                .iter_mut()
-                .find(|bo| bo.fb_handle == Some(fb_for_commit))
-            {
-                bo.state.mark_on_screen_after_modeset();
+                .iter()
+                .position(|bo| bo.fb_handle == Some(fb_for_commit));
+            if let Some(bo_idx) = bo_idx {
+                scanout.display_pool_mut().bos[bo_idx]
+                    .state
+                    .mark_on_screen_after_modeset();
+                scanout.note_kms_modeset_installed(bo_idx)?;
             }
+            Ok(())
         };
         if needs_pool_realloc && new_pool_committed_framebuffer.is_none() {
             if let Some(pool) = new_pool.as_mut().and_then(Option::as_mut) {
-                mark_front(pool);
+                mark_front(pool)?;
             }
         } else if !needs_pool_realloc
             && let Some(pool) = existing_idx
                 .and_then(|idx| self.scanout_pools.get_mut(idx))
                 .and_then(Option::as_mut)
         {
-            mark_front(pool);
+            mark_front(pool)?;
         }
 
         // Commit succeeded — install the output into the active set.
@@ -4327,7 +5087,7 @@ impl PlatformBackend {
                 self.scanout_pools[idx] = pool;
                 self.bo_generations[idx] = self.scanout_pools[idx]
                     .as_ref()
-                    .map(|pool| vec![BoGenerationEntry::default(); pool.bos.len()])
+                    .map(|pool| vec![BoGenerationEntry::default(); pool.display_pool().bos.len()])
                     .unwrap_or_default();
             }
         } else {
@@ -4342,7 +5102,7 @@ impl PlatformBackend {
             let pool = new_pool.unwrap_or(None);
             let gens = pool
                 .as_ref()
-                .map(|p| vec![BoGenerationEntry::default(); p.bos.len()])
+                .map(|p| vec![BoGenerationEntry::default(); p.display_pool().bos.len()])
                 .unwrap_or_default();
             self.scanout_pools.push(pool);
             self.bo_generations.push(gens);
@@ -4355,7 +5115,7 @@ impl PlatformBackend {
             self.scanout_pools
                 .get(installed_idx)
                 .and_then(Option::as_ref)
-                .is_none_or(|pool| pool.route == scanout_route)
+                .is_none_or(|pool| pool.route() == scanout_route)
         );
 
         // Recompute virtual framebuffer extent (2-D, no recompact).
@@ -4420,11 +5180,12 @@ impl PlatformBackend {
         output_idx: usize,
     ) -> Option<PageFlipRetirement> {
         self.debug_assert_scanout_pool_route(output_idx);
-        let pool = self.scanout_pools.get_mut(output_idx)?.as_mut()?;
+        let scanout = self.scanout_pools.get_mut(output_idx)?.as_mut()?;
         // First pass: find any BO currently `Pending`. Walk only
         // — don't mutate during the search.
         let mut pending: Option<usize> = None;
         let mut on_screen: Option<usize> = None;
+        let pool = scanout.display_pool_mut();
         for (i, bo) in pool.bos.iter().enumerate() {
             match bo.state.phase {
                 BoPhase::Pending => {
@@ -4463,6 +5224,25 @@ impl PlatformBackend {
             None
         };
         pool.bos[presented].state.transition_to_on_screen();
+        let mut copied_ownership_failed = false;
+        if let Some(copied) = scanout.copied_mut() {
+            if let Some(retired) = retired
+                && let Err(error) = copied.note_kms_retired(retired)
+            {
+                log::error!(
+                    "render on_page_flip_complete: copied ownership ledger failed for output \
+                     {output_idx} retired bo {retired}: {error}"
+                );
+                copied_ownership_failed = true;
+            }
+            // KMS retirement proves the sink copy completed (the atomic flip
+            // waited on its exported fence), so the paired A source and B
+            // import-wait payload may now be reused.
+            copied.release_completed_source(presented);
+        }
+        if copied_ownership_failed {
+            self.renderer_failed = true;
+        }
 
         let logged_first = self
             .first_pageflip_logged
@@ -4519,6 +5299,14 @@ impl PlatformBackend {
                 log::warn!("kms: wait_idle_bounded: device_wait_idle failed: {e:?}");
             }
         }
+        for (renderer_id, vk) in &self.copy_vk_contexts {
+            let result = unsafe { vk.device.device_wait_idle() };
+            if let Err(e) = result {
+                log::warn!(
+                    "kms: wait_idle_bounded: copied sink {renderer_id:?} device_wait_idle failed: {e:?}"
+                );
+            }
+        }
     }
 
     /// Post-loop teardown — disable each output, leaving the
@@ -4532,14 +5320,11 @@ impl PlatformBackend {
     /// subsequent outputs still attempted.
     pub(crate) fn disable_output(&mut self) -> io::Result<()> {
         self.shutting_down = true;
+        self.clear_scanout_render_completions();
 
-        // Best-effort: drain all in-flight GPU work before
-        // pulling the modeset.
-        if let Some(vk) = self.vk.as_ref() {
-            unsafe {
-                let _ = vk.device.device_wait_idle();
-            }
-        }
+        // Best-effort: drain both the selected renderer and every copied
+        // sink transfer device before pulling the modeset.
+        self.wait_idle_bounded();
 
         // Stage 3f.10: drain the pixmap pool so the recycled
         // image/memory/view triples don't leak through the
@@ -4571,9 +5356,7 @@ impl PlatformBackend {
                 // doesn't try to destroy framebuffers KMS may
                 // still hold (matches v1's behaviour).
                 if let Some(pool) = self.scanout_pools.get_mut(i).and_then(|p| p.as_mut()) {
-                    for bo in &mut pool.bos {
-                        bo.disarm();
-                    }
+                    pool.disarm();
                 }
                 if first_err.is_none() {
                     first_err = Some(e);
@@ -4628,6 +5411,7 @@ impl PlatformBackend {
                         .and_then(|p| p.as_ref())
                         .and_then(|pool| {
                             use crate::kms::vk::scanout::BoPhase;
+                            let pool = pool.display_pool();
                             pool.bos
                                 .iter()
                                 .enumerate()
@@ -4660,13 +5444,21 @@ impl PlatformBackend {
                     if first_err.is_none() {
                         first_err = Some(e);
                     }
-                } else if let Some(bo) = self
-                    .scanout_pools
-                    .get_mut(i)
-                    .and_then(Option::as_mut)
-                    .and_then(|pool| pool.bos.get_mut(bo_idx))
+                } else if let Some(scanout) = self.scanout_pools.get_mut(i).and_then(Option::as_mut)
                 {
-                    bo.state.mark_on_screen_after_modeset();
+                    scanout.display_pool_mut().bos[bo_idx]
+                        .state
+                        .mark_on_screen_after_modeset();
+                    if let Err(error) = scanout.note_kms_modeset_installed(bo_idx) {
+                        log::error!(
+                            "dpms_set_outputs_active(true): copied ownership ledger failed for \
+                             output {i} bo {bo_idx}: {error}"
+                        );
+                        self.renderer_failed = true;
+                        if first_err.is_none() {
+                            first_err = Some(error);
+                        }
+                    }
                 }
             }
         } else {
@@ -4803,6 +5595,14 @@ impl PlatformBackend {
             .map(|output| output.key.device_key)
             .collect();
         for idx in rescan.dropped_old_indices.iter().copied() {
+            let dropped_key = self.outputs[idx].key.clone();
+            self.cancel_scanout_render_completions_for_output(&dropped_key);
+            if let Err(error) = self.drain_scanout_pool_at(idx) {
+                log::error!(
+                    "rescan could not quiesce dropped output {dropped_key:?}: {error}; \
+                     copied resources remain quarantined"
+                );
+            }
             self.outputs.remove(idx);
             if idx < self.scanout_pools.len() {
                 self.scanout_pools.remove(idx);
@@ -4984,6 +5784,132 @@ mod tests {
         crate::platform::drm::DrmDeviceKey { major: 226, minor }
     }
 
+    fn test_render_device(
+        id: RenderDeviceId,
+        primary: Option<crate::platform::drm::DrmDeviceKey>,
+        selector_seed: u8,
+    ) -> RenderDevice {
+        RenderDevice {
+            id,
+            physical_device: vk::PhysicalDevice::default(),
+            selector: VulkanDeviceSelector::for_tests(selector_seed),
+            advertised_primary_node: primary,
+            advertised_render_node: match id {
+                RenderDeviceId::DrmRender(key) => Some(key),
+                RenderDeviceId::UnverifiedFallback => None,
+            },
+            render_node: None,
+            render_node_device: None,
+            syncobj_timeline: false,
+        }
+    }
+
+    #[test]
+    fn copied_sink_resolution_requires_one_exact_distinct_primary_match() {
+        let selected = RenderDeviceId::DrmRender(drm_key(128));
+        let sink = RenderDeviceId::DrmRender(drm_key(129));
+        let renderers = vec![
+            test_render_device(selected, Some(drm_key(0)), 1),
+            test_render_device(sink, Some(drm_key(1)), 2),
+        ];
+
+        assert_eq!(
+            resolve_copied_sink_renderer(&renderers, selected, drm_key(1))
+                .expect("one exact sink renderer"),
+            (sink, VulkanDeviceSelector::for_tests(2)),
+        );
+        assert!(
+            resolve_copied_sink_renderer(&renderers, selected, drm_key(0)).is_err(),
+            "the selected renderer is never reused as copied sink B"
+        );
+        assert!(
+            resolve_copied_sink_renderer(&renderers, selected, drm_key(2)).is_err(),
+            "a display-only sink must not trigger generic Vulkan rescoring"
+        );
+    }
+
+    #[test]
+    fn copied_sink_resolution_rejects_ambiguous_primary_claims() {
+        let selected = RenderDeviceId::DrmRender(drm_key(128));
+        let renderers = vec![
+            test_render_device(selected, Some(drm_key(0)), 1),
+            test_render_device(RenderDeviceId::DrmRender(drm_key(129)), Some(drm_key(1)), 2),
+            test_render_device(RenderDeviceId::DrmRender(drm_key(130)), Some(drm_key(1)), 3),
+        ];
+
+        let error = resolve_copied_sink_renderer(&renderers, selected, drm_key(1))
+            .expect_err("ambiguous sink identity must not be guessed");
+        assert!(error.to_string().contains("multiple Vulkan renderers"));
+        assert!(error.to_string().contains("minor: 129"));
+        assert!(error.to_string().contains("minor: 130"));
+    }
+
+    #[test]
+    fn copied_live_device_lost_survives_platform_error_wrapping() {
+        let error = CopiedScanoutError::LiveDeviceLost {
+            context: "test copied live allocation".to_owned(),
+            source: crate::kms::vk::scanout::device_lost_scanout_error_for_tests(),
+        }
+        .into_io_error();
+
+        assert!(crate::kms::vk::scanout::scanout_error_is_device_lost(
+            &error
+        ));
+        assert!(error.to_string().contains("test copied live allocation"));
+    }
+
+    #[test]
+    fn scanout_render_completion_drain_is_not_queue_front_blocked() {
+        use nix::sys::eventfd::{EfdFlags, EventFd};
+
+        let mut platform = PlatformBackend::for_tests();
+        let output_key = platform.outputs[0].key.clone();
+        let blocked: OwnedFd =
+            EventFd::from_value_and_flags(0, EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK)
+                .expect("blocked eventfd")
+                .into();
+        let ready: OwnedFd =
+            EventFd::from_value_and_flags(1, EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK)
+                .expect("ready eventfd")
+                .into();
+        let first_job = platform
+            .register_scanout_render_completion(output_key.clone(), 0, Some(blocked))
+            .expect("register first job");
+        let second_job = platform
+            .register_scanout_render_completion(output_key.clone(), 1, Some(ready))
+            .expect("register second job");
+
+        let completions = platform.drain_scanout_render_completions();
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].job_id, second_job);
+        assert_eq!(completions[0].output_key, output_key);
+        assert_eq!(completions[0].bo_idx, 1);
+        assert_eq!(
+            platform.pending_scanout_render_completions[0].job_id, first_job,
+            "an unreadable earlier job remains registered"
+        );
+
+        platform.cancel_scanout_render_completions_for_output(&output_key);
+        assert!(platform.pending_scanout_render_completions.is_empty());
+    }
+
+    #[test]
+    fn already_signalled_scanout_completion_is_immediately_ready_without_fd() {
+        let mut platform = PlatformBackend::for_tests();
+        let output_key = platform.outputs[0].key.clone();
+        let job = platform
+            .register_scanout_render_completion(output_key.clone(), 2, None)
+            .expect("register Vulkan fd=-1 completion");
+
+        let completions = platform.drain_scanout_render_completions();
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].job_id, job);
+        assert_eq!(completions[0].output_key, output_key);
+        assert_eq!(completions[0].bo_idx, 2);
+        assert!(completions[0].fd.is_none());
+        assert!(platform.pending_scanout_render_completions.is_empty());
+    }
+
     #[test]
     fn non_picked_mode_lookup_uses_the_carried_connector_handle() {
         let connector = ::drm::control::from_u32(17).expect("non-zero connector handle");
@@ -5100,6 +6026,7 @@ mod tests {
         let renderer = |id, primary| RenderDevice {
             id,
             physical_device: vk::PhysicalDevice::default(),
+            selector: VulkanDeviceSelector::for_tests(1),
             advertised_primary_node: primary,
             advertised_render_node: None,
             render_node: None,
@@ -5138,6 +6065,7 @@ mod tests {
         let renderer = RenderDevice {
             id: RenderDeviceId::DrmRender(drm_key(128)),
             physical_device: vk::PhysicalDevice::default(),
+            selector: VulkanDeviceSelector::for_tests(1),
             advertised_primary_node: Some(drm_key(1)),
             advertised_render_node: Some(drm_key(128)),
             render_node: None,

@@ -198,14 +198,57 @@ pub enum ImageBacking {
 pub enum DrawableImageError {
     #[error("vulkan: {0}")]
     Vk(vk::Result),
-    #[error("no memory type matches image requirements")]
+    #[error("no memory type matches both image and DMA-BUF fd requirements")]
     NoMemoryType,
+    #[error("missing required Vulkan extension `{0}`")]
+    MissingExtension(&'static str),
+    #[error("non-explicit linear DMA-BUF import requires exactly one plane, got {0}")]
+    NonExplicitLinearPlaneCount(usize),
+    #[error("a non-linear DMA-BUF requires explicit DRM modifier layout support")]
+    NonLinearWithoutModifierSupport,
+    #[error(
+        "linear DMA-BUF layout mismatch: supplied offset={supplied_offset} pitch={supplied_pitch}, \
+         Vulkan requires offset={required_offset} pitch={required_pitch}"
+    )]
+    LinearLayoutMismatch {
+        supplied_offset: u64,
+        supplied_pitch: u64,
+        required_offset: u64,
+        required_pitch: u64,
+    },
 }
 
 impl From<vk::Result> for DrawableImageError {
     fn from(r: vk::Result) -> Self {
         DrawableImageError::Vk(r)
     }
+}
+
+fn intersect_import_memory_type_bits(image_bits: u32, fd_bits: u32) -> u32 {
+    image_bits & fd_bits
+}
+
+fn validate_non_explicit_linear_layout(
+    plane_offsets: &[u64],
+    plane_pitches: &[u32],
+    required: vk::SubresourceLayout,
+) -> Result<(), DrawableImageError> {
+    if plane_offsets.len() != 1 || plane_pitches.len() != 1 {
+        return Err(DrawableImageError::NonExplicitLinearPlaneCount(
+            plane_offsets.len(),
+        ));
+    }
+    let supplied_offset = plane_offsets[0];
+    let supplied_pitch = u64::from(plane_pitches[0]);
+    if supplied_offset != required.offset || supplied_pitch != required.row_pitch {
+        return Err(DrawableImageError::LinearLayoutMismatch {
+            supplied_offset,
+            supplied_pitch,
+            required_offset: required.offset,
+            required_pitch: required.row_pitch,
+        });
+    }
+    Ok(())
 }
 
 impl DrawableImage {
@@ -262,11 +305,11 @@ impl DrawableImage {
     /// drawable. Phase 4.2 design §3.2.
     ///
     /// **fd ownership rule.** This function takes ownership of
-    /// `dma_buf_fd` and transfers it to the resulting `VkDeviceMemory`
-    /// on success. On any error path before `vkAllocateMemory` returns
-    /// `SUCCESS`, the fd is closed (via the `OwnedFd` drop). On
-    /// success, fd lifetime is owned by `VkDeviceMemory` —
-    /// `Drop for DrawableImage` calls `vkFreeMemory` which releases it.
+    /// `dma_buf_fd`, duplicates it for `vkAllocateMemory`, and retains the
+    /// original in the resulting [`ImageBacking::Imported`]. Vulkan consumes
+    /// the duplicate only when allocation succeeds. Every failure path closes
+    /// both copies; successful drop frees the imported memory and closes the
+    /// retained original.
     pub fn from_dmabuf(
         vk: Arc<VkContext>,
         dma_buf_fd: std::os::fd::OwnedFd,
@@ -276,6 +319,40 @@ impl DrawableImage {
         modifier: u64,
         plane_offsets: &[u64],
         plane_pitches: &[u32],
+    ) -> Result<Self, DrawableImageError> {
+        Self::from_dmabuf_with_usage(
+            vk,
+            dma_buf_fd,
+            width,
+            height,
+            format,
+            modifier,
+            plane_offsets,
+            plane_pitches,
+            vk::ImageUsageFlags::SAMPLED
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST
+                | vk::ImageUsageFlags::COLOR_ATTACHMENT,
+        )
+    }
+
+    /// Import a DMA-BUF with an exact Vulkan usage contract.
+    ///
+    /// Copied scanout uses this narrower entry point so its sink GPU only has
+    /// to accept the renderer's foreign image as a transfer source, rather
+    /// than also accepting irrelevant sampling, attachment, and destination
+    /// usages.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_dmabuf_with_usage(
+        vk: Arc<VkContext>,
+        dma_buf_fd: std::os::fd::OwnedFd,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        modifier: u64,
+        plane_offsets: &[u64],
+        plane_pitches: &[u32],
+        usage: vk::ImageUsageFlags,
     ) -> Result<Self, DrawableImageError> {
         use std::os::fd::IntoRawFd as _;
         if plane_offsets.len() != plane_pitches.len() {
@@ -288,6 +365,12 @@ impl DrawableImage {
                 vk::Result::ERROR_INITIALIZATION_FAILED,
             ));
         }
+        let external_memory_fd =
+            vk.external_memory_fd
+                .as_ref()
+                .ok_or(DrawableImageError::MissingExtension(
+                    "VK_KHR_external_memory_fd",
+                ))?;
 
         // Use the explicit-modifier path whenever the extension is
         // available — including LINEAR. VK_IMAGE_TILING_LINEAR alone
@@ -297,6 +380,9 @@ impl DrawableImage {
         // alignment (e.g. Mesa anv allocates 300×BGRA8888 with
         // stride=1280, not the 1200 a tight LINEAR layout would use).
         let use_explicit_modifier = vk.image_drm_format_modifier;
+        if !use_explicit_modifier && modifier != super::dri3::DRM_FORMAT_MOD_LINEAR {
+            return Err(DrawableImageError::NonLinearWithoutModifierSupport);
+        }
 
         // Build VkSubresourceLayout array for the explicit-modifier chain
         // (only used when use_explicit_modifier is true).
@@ -340,17 +426,37 @@ impl DrawableImage {
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(tiling)
-            .usage(
-                vk::ImageUsageFlags::SAMPLED
-                    | vk::ImageUsageFlags::TRANSFER_SRC
-                    | vk::ImageUsageFlags::TRANSFER_DST
-                    | vk::ImageUsageFlags::COLOR_ATTACHMENT,
-            )
+            .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .push_next(&mut external_info);
 
         let image = unsafe { vk.device.create_image(&image_info, None)? };
+
+        // Without explicit modifier layout, Vulkan chooses the LINEAR image's
+        // offset and row pitch. Importing a DMA-BUF whose supplied layout does
+        // not exactly match those requirements would silently reinterpret its
+        // rows. Validate the concrete image before binding memory. This is a
+        // runtime compatibility check, not the later copied-sink policy gate
+        // that requires explicit layout metadata up front.
+        if !use_explicit_modifier {
+            let required = unsafe {
+                vk.device.get_image_subresource_layout(
+                    image,
+                    vk::ImageSubresource {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        array_layer: 0,
+                    },
+                )
+            };
+            if let Err(error) =
+                validate_non_explicit_linear_layout(plane_offsets, plane_pitches, required)
+            {
+                unsafe { vk.device.destroy_image(image, None) };
+                return Err(error);
+            }
+        }
 
         // Per design §3.2 fd ownership rule: dup the fd before handing
         // to vkAllocateMemory so that on any vkAllocateMemory failure
@@ -369,13 +475,31 @@ impl DrawableImage {
             .fd(server_fd_raw);
 
         let mem_reqs = unsafe { vk.device.get_image_memory_requirements(image) };
+        let mut fd_properties = vk::MemoryFdPropertiesKHR::default();
+        if let Err(error) = unsafe {
+            external_memory_fd.get_memory_fd_properties(
+                vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+                server_fd_raw,
+                &mut fd_properties,
+            )
+        } {
+            unsafe {
+                vk.device.destroy_image(image, None);
+                libc::close(server_fd_raw);
+            }
+            return Err(error.into());
+        }
         let mem_props = unsafe {
             vk.instance
                 .get_physical_device_memory_properties(vk.physical_device)
         };
+        let compatible_type_bits = intersect_import_memory_type_bits(
+            mem_reqs.memory_type_bits,
+            fd_properties.memory_type_bits,
+        );
         let memory_type_index = pick_memory_type(
             &mem_props,
-            mem_reqs.memory_type_bits,
+            compatible_type_bits,
             vk::MemoryPropertyFlags::empty(),
         );
         let memory_type_index = match memory_type_index {
@@ -1037,6 +1161,32 @@ pub(crate) const EXPORT_IMAGE_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::
         | vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw(),
 );
 
+/// Exact usage of the renderer-side image in copied scanout's first transport
+/// generation. The compositor renders directly into it and GPU B later reads
+/// it as a transfer source. A later linearization layer may split those roles;
+/// this boundary deliberately does not.
+pub(crate) const COPIED_SOURCE_IMAGE_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
+    vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw() | vk::ImageUsageFlags::TRANSFER_SRC.as_raw(),
+);
+
+/// One exact external-image representation for copied scanout's renderer-side
+/// source. Unlike [`TilingStrategy`], this is persisted per output and never
+/// consults or mutates the GLX-TFP strategy cache.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub(crate) enum CopiedSourcePlan {
+    Linear,
+    DrmModifier(u64),
+}
+
+impl CopiedSourcePlan {
+    pub(crate) fn describe(self) -> String {
+        match self {
+            Self::Linear => "linear".to_string(),
+            Self::DrmModifier(modifier) => format!("modifier=0x{modifier:x}"),
+        }
+    }
+}
+
 /// A freshly-allocated external-memory image that can be exported as a
 /// dma-buf fd.
 ///
@@ -1051,6 +1201,8 @@ pub struct ExportableImage {
     pub format: vk::Format,
     /// Row stride in bytes, from `vkGetImageSubresourceLayout`.
     pub stride: u32,
+    /// Plane-0 byte offset in the exported allocation.
+    pub(crate) offset: u64,
     /// Total memory size in bytes, from `vkGetImageSubresourceLayout`.
     pub size: u64,
     /// DRM format modifier; `DRM_FORMAT_MOD_LINEAR` (0) for the LINEAR path.
@@ -1154,7 +1306,7 @@ pub fn allocate_exportable(
     // First allocation: probe LINEAR first. Turnip / Adreno requires
     // it for same-GPU coherence (UBWC's compression metadata stays in
     // driver caches and the Mesa GL importer reads stale tiles).
-    match allocate_exportable_linear(vk, width, height, format) {
+    match allocate_exportable_linear(vk, width, height, format, EXPORT_IMAGE_USAGE) {
         Ok(img) => {
             let _ = vk.tfp_tiling_strategy.set(TilingStrategy::Linear);
             return Ok(img);
@@ -1175,7 +1327,7 @@ pub fn allocate_exportable(
     if modifiers.is_empty() {
         return Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED);
     }
-    match allocate_exportable_modifier(vk, width, height, format, &modifiers) {
+    match allocate_exportable_modifier(vk, width, height, format, &modifiers, EXPORT_IMAGE_USAGE) {
         Ok(img) => {
             let _ = vk.tfp_tiling_strategy.set(TilingStrategy::Modifier);
             Ok(img)
@@ -1197,7 +1349,9 @@ fn allocate_with_strategy(
     strategy: TilingStrategy,
 ) -> Result<ExportableImage, vk::Result> {
     match strategy {
-        TilingStrategy::Linear => allocate_exportable_linear(vk, width, height, format),
+        TilingStrategy::Linear => {
+            allocate_exportable_linear(vk, width, height, format, EXPORT_IMAGE_USAGE)
+        }
         TilingStrategy::Modifier => {
             if !vk.image_drm_format_modifier {
                 return Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED);
@@ -1206,8 +1360,32 @@ fn allocate_with_strategy(
             if modifiers.is_empty() {
                 return Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED);
             }
-            allocate_exportable_modifier(vk, width, height, format, &modifiers)
+            allocate_exportable_modifier(vk, width, height, format, &modifiers, EXPORT_IMAGE_USAGE)
         }
+    }
+}
+
+/// Allocate one exact copied-source representation without consulting or
+/// changing [`VkContext::tfp_tiling_strategy`].
+pub(crate) fn allocate_copied_source_exact(
+    vk: &Arc<VkContext>,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+    plan: CopiedSourcePlan,
+) -> Result<ExportableImage, vk::Result> {
+    match plan {
+        CopiedSourcePlan::Linear => {
+            allocate_exportable_linear(vk, width, height, format, COPIED_SOURCE_IMAGE_USAGE)
+        }
+        CopiedSourcePlan::DrmModifier(modifier) => allocate_exportable_modifier(
+            vk,
+            width,
+            height,
+            format,
+            &[modifier],
+            COPIED_SOURCE_IMAGE_USAGE,
+        ),
     }
 }
 
@@ -1220,6 +1398,7 @@ fn allocate_exportable_modifier(
     height: u32,
     format: vk::Format,
     modifiers: &[u64],
+    usage: vk::ImageUsageFlags,
 ) -> Result<ExportableImage, vk::Result> {
     let modifier_ext = vk
         .image_drm_format_modifier_ext
@@ -1243,7 +1422,7 @@ fn allocate_exportable_modifier(
         .array_layers(1)
         .samples(vk::SampleCountFlags::TYPE_1)
         .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-        .usage(EXPORT_IMAGE_USAGE)
+        .usage(usage)
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .initial_layout(vk::ImageLayout::UNDEFINED)
         .push_next(&mut ext_mem)
@@ -1287,6 +1466,7 @@ fn allocate_exportable_modifier(
         extent: vk::Extent2D { width, height },
         format,
         stride: u32::try_from(layout.row_pitch).unwrap_or(u32::MAX),
+        offset: layout.offset,
         size: layout.size,
         modifier: mod_props.drm_format_modifier,
         vk: Arc::clone(vk),
@@ -1301,6 +1481,7 @@ fn allocate_exportable_linear(
     width: u32,
     height: u32,
     format: vk::Format,
+    usage: vk::ImageUsageFlags,
 ) -> Result<ExportableImage, vk::Result> {
     let mut ext_mem = vk::ExternalMemoryImageCreateInfo::default()
         .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
@@ -1317,7 +1498,7 @@ fn allocate_exportable_linear(
         .array_layers(1)
         .samples(vk::SampleCountFlags::TYPE_1)
         .tiling(vk::ImageTiling::LINEAR)
-        .usage(EXPORT_IMAGE_USAGE)
+        .usage(usage)
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .initial_layout(vk::ImageLayout::UNDEFINED)
         .push_next(&mut ext_mem);
@@ -1345,6 +1526,7 @@ fn allocate_exportable_linear(
         extent: vk::Extent2D { width, height },
         format,
         stride: u32::try_from(layout.row_pitch).unwrap_or(u32::MAX),
+        offset: layout.offset,
         size: layout.size,
         modifier: 0, // DRM_FORMAT_MOD_LINEAR
         vk: Arc::clone(vk),
@@ -1434,4 +1616,72 @@ fn _compile_check_from_dmabuf(
         plane_offsets,
         plane_pitches,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copied_source_usage_is_exact_direct_render_contract() {
+        assert!(COPIED_SOURCE_IMAGE_USAGE.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT));
+        assert!(COPIED_SOURCE_IMAGE_USAGE.contains(vk::ImageUsageFlags::TRANSFER_SRC));
+        assert!(!COPIED_SOURCE_IMAGE_USAGE.contains(vk::ImageUsageFlags::TRANSFER_DST));
+        assert!(!COPIED_SOURCE_IMAGE_USAGE.contains(vk::ImageUsageFlags::SAMPLED));
+    }
+
+    #[test]
+    fn copied_source_plan_description_names_exact_layout() {
+        assert_eq!(CopiedSourcePlan::Linear.describe(), "linear");
+        assert_eq!(
+            CopiedSourcePlan::DrmModifier(0x1234).describe(),
+            "modifier=0x1234"
+        );
+    }
+
+    #[test]
+    fn imported_memory_types_intersect_image_and_fd_requirements() {
+        assert_eq!(intersect_import_memory_type_bits(0b1101, 0b0110), 0b0100);
+        assert_eq!(intersect_import_memory_type_bits(0b1000, 0b0011), 0);
+    }
+
+    #[test]
+    fn non_explicit_linear_layout_requires_exact_offset_and_pitch() {
+        let required = vk::SubresourceLayout {
+            offset: 256,
+            row_pitch: 4096,
+            ..Default::default()
+        };
+        validate_non_explicit_linear_layout(&[256], &[4096], required)
+            .expect("identical concrete DMA-BUF layout is importable");
+
+        assert!(matches!(
+            validate_non_explicit_linear_layout(&[0], &[4096], required),
+            Err(DrawableImageError::LinearLayoutMismatch {
+                supplied_offset: 0,
+                required_offset: 256,
+                ..
+            })
+        ));
+        assert!(matches!(
+            validate_non_explicit_linear_layout(&[256], &[2048], required),
+            Err(DrawableImageError::LinearLayoutMismatch {
+                supplied_pitch: 2048,
+                required_pitch: 4096,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn non_explicit_linear_layout_rejects_multiplane_shape() {
+        let required = vk::SubresourceLayout {
+            row_pitch: 4096,
+            ..Default::default()
+        };
+        assert!(matches!(
+            validate_non_explicit_linear_layout(&[0, 8192], &[4096, 4096], required),
+            Err(DrawableImageError::NonExplicitLinearPlaneCount(2))
+        ));
+    }
 }

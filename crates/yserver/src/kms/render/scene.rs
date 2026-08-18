@@ -67,7 +67,7 @@ use ash::vk;
 use yserver_protocol::x11::xfixes;
 
 use super::{
-    platform::{FenceTicket, PlatformBackend},
+    platform::{FenceTicket, PlatformBackend, ReadyScanoutRenderCompletion},
     store::{DamageSnapshot, DrawableKind, DrawableStore, RegionSet},
     telemetry::Telemetry,
 };
@@ -77,7 +77,7 @@ use crate::kms::{
     vk::{
         compositor::{CompositeDraw, CompositeScene, PresentError},
         pipeline::{CompositePushConsts, CompositorPipeline, MAX_DESCRIPTOR_SETS_PER_FRAME},
-        scanout::{BoPhase, ScanoutBo},
+        scanout::{BoPhase, BoState, CopiedRenderSource, OutputScanout, ScanoutBo},
     },
 };
 
@@ -87,9 +87,69 @@ use crate::kms::{
 
 /// Per-output pending-ack ledger. Each entry corresponds to one
 /// in-flight compose; popped front on page-flip-complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InFlightStage {
+    WaitingForRenderCompletion { job_id: u64 },
+    KmsFlipPending,
+}
+
+impl InFlightStage {
+    fn matches_render_completion(self, job_id: u64) -> bool {
+        self == Self::WaitingForRenderCompletion { job_id }
+    }
+
+    fn is_kms_flip_pending(self) -> bool {
+        self == Self::KmsFlipPending
+    }
+}
+
+fn copied_render_completion_matches(
+    stage: InFlightStage,
+    pending_bo_idx: usize,
+    completion_job_id: u64,
+    completion_bo_idx: usize,
+) -> bool {
+    pending_bo_idx == completion_bo_idx && stage.matches_render_completion(completion_job_id)
+}
+
+fn kms_retirement_matches(
+    stage: InFlightStage,
+    pending_bo_idx: usize,
+    presented_bo_idx: usize,
+) -> bool {
+    pending_bo_idx == presented_bo_idx && stage.is_kms_flip_pending()
+}
+
+fn present_error_is_device_lost(error: &PresentError) -> bool {
+    matches!(error, PresentError::Vk(vk::Result::ERROR_DEVICE_LOST))
+}
+
+enum CopiedRenderSubmitError {
+    RendererAcquire(io::Error),
+    Present(PresentError),
+}
+
+impl CopiedRenderSubmitError {
+    fn requires_fail_stop(&self) -> bool {
+        matches!(self, Self::RendererAcquire(_))
+    }
+
+    fn into_present(self) -> PresentError {
+        match self {
+            Self::RendererAcquire(error) => PresentError::Io(error),
+            Self::Present(error) => error,
+        }
+    }
+}
+
+fn vk_result_is_device_lost(result: vk::Result) -> bool {
+    result == vk::Result::ERROR_DEVICE_LOST
+}
+
 struct PendingAck {
     bo_idx: usize,
     generation: u64,
+    stage: InFlightStage,
     /// Snapshots taken at tick entry, one per source drawable
     /// that contributed to the compose. Ack'd against the
     /// store's live presentation damage on flip retirement.
@@ -282,20 +342,31 @@ fn drain_deferred_scene_resources<W, R>(
     mut wait: W,
     mut release: R,
 ) where
-    W: FnMut(&FenceTicket),
-    R: FnMut(DeferredSceneRelease),
+    W: FnMut(&FenceTicket) -> bool,
+    R: FnMut(DeferredSceneRelease) -> bool,
 {
-    for (slot, ticket) in pending_pool_releases.drain(..) {
-        wait(&ticket);
-        release(DeferredSceneRelease::PoolSlot(slot));
+    let mut retained_pool_releases = VecDeque::with_capacity(pending_pool_releases.len());
+    while let Some((slot, ticket)) = pending_pool_releases.pop_front() {
+        if wait(&ticket) && release(DeferredSceneRelease::PoolSlot(slot)) {
+            continue;
+        }
+        retained_pool_releases.push_back((slot, ticket));
     }
-    for failed in failed_submit_bos.drain(..) {
-        wait(&failed.ticket);
-        release(DeferredSceneRelease::FailedSubmit {
-            bo_idx: failed.bo_idx,
-            pool_slot: failed.pool_slot,
-        });
+    *pending_pool_releases = retained_pool_releases;
+
+    let mut retained_failed_submits = VecDeque::with_capacity(failed_submit_bos.len());
+    while let Some(failed) = failed_submit_bos.pop_front() {
+        if wait(&failed.ticket)
+            && release(DeferredSceneRelease::FailedSubmit {
+                bo_idx: failed.bo_idx,
+                pool_slot: failed.pool_slot,
+            })
+        {
+            continue;
+        }
+        retained_failed_submits.push_back(failed);
     }
+    *failed_submit_bos = retained_failed_submits;
 }
 
 /// Ring of recent output-damage regions keyed by generation.
@@ -694,7 +765,7 @@ impl SceneCompositor {
         let bo_depth = platform
             .scanout_pools
             .get(i)
-            .and_then(|p| p.as_ref().map(|pp| pp.bos.len()))
+            .and_then(|p| p.as_ref().map(|pool| pool.display_pool().bos.len()))
             .unwrap_or(3);
         Ok(OutputSceneState {
             output_idx: i,
@@ -1017,6 +1088,12 @@ impl SceneCompositor {
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
+        // Stop readiness delivery before discarding the ledger that owns each
+        // job id. The source-completion fd is only a notification handle; the
+        // fence ticket below still proves A's submitted command buffer is done
+        // before descriptor slots are reset, and the platform subsequently
+        // drains both devices before any copied pool is reset or dropped.
+        platform.clear_scanout_render_completions();
         let vk = inner.vk.clone();
         for (output_idx, o) in inner.outputs.iter_mut().enumerate() {
             // B.2-context fix (codex audit followup): wait for any
@@ -1026,32 +1103,83 @@ impl SceneCompositor {
             // vkResetDescriptorPool BEFORE that wait. Wait on each
             // ack's ticket here to keep VUID-vkResetDescriptorPool-
             // descriptorPool-00313 satisfied during teardown too.
-            for ack in &o.pending_acks {
-                if let Some(t) = ack.ticket.as_ref() {
-                    let _ = t.wait(&vk);
+            let mut retained_acks = VecDeque::with_capacity(o.pending_acks.len());
+            let mut retained_slots = VecDeque::with_capacity(o.pool_slots.len());
+            while let Some(ack) = o.pending_acks.pop_front() {
+                let slot = o.pool_slots.pop_front();
+                let wait_ok = ack
+                    .ticket
+                    .as_ref()
+                    .is_none_or(|ticket| match ticket.wait(&vk) {
+                        Ok(()) => true,
+                        Err(error) => {
+                            log::error!(
+                                "render scene drain: output {output_idx} compose fence wait \
+                                 failed: {error:?}; retaining resources for quarantine"
+                            );
+                            platform.renderer_failed = true;
+                            false
+                        }
+                    });
+                if wait_ok {
+                    if let Some(slot) = slot {
+                        o.pool_ring.release(slot);
+                    }
+                } else {
+                    retained_acks.push_back(ack);
+                    if let Some(slot) = slot {
+                        retained_slots.push_back(slot);
+                    }
                 }
             }
+            retained_slots.append(&mut o.pool_slots);
+            o.pending_acks = retained_acks;
+            o.pool_slots = retained_slots;
             let pending_pool_releases = &mut o.pending_pool_releases;
             let failed_submit_bos = &mut o.failed_submit_bos;
             let pool_ring = &mut o.pool_ring;
+            let mut wait_failed = false;
+            let mut recovery_failed = false;
             drain_deferred_scene_resources(
                 pending_pool_releases,
                 failed_submit_bos,
-                |ticket| {
-                    let _ = ticket.wait(&vk);
+                |ticket| match ticket.wait(&vk) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        log::error!(
+                            "render scene drain: deferred compose fence wait failed: \
+                             {error:?}; retaining resources for quarantine"
+                        );
+                        wait_failed = true;
+                        false
+                    }
                 },
                 |release| match release {
-                    DeferredSceneRelease::PoolSlot(slot) => pool_ring.release(slot),
+                    DeferredSceneRelease::PoolSlot(slot) => {
+                        pool_ring.release(slot);
+                        true
+                    }
                     DeferredSceneRelease::FailedSubmit { bo_idx, pool_slot } => {
-                        platform.recycle_failed_submit_bo(output_idx, bo_idx);
-                        pool_ring.release(pool_slot);
+                        match platform.recycle_failed_submit_bo(output_idx, bo_idx) {
+                            Ok(()) => {
+                                pool_ring.release(pool_slot);
+                                true
+                            }
+                            Err(error) => {
+                                log::error!(
+                                    "render scene drain: failed to recover output {output_idx} \
+                                     bo {bo_idx}: {error}"
+                                );
+                                recovery_failed = true;
+                                false
+                            }
+                        }
                     }
                 },
             );
-            while let Some(slot) = o.pool_slots.pop_front() {
-                o.pool_ring.release(slot);
+            if wait_failed || recovery_failed {
+                platform.renderer_failed = true;
             }
-            o.pending_acks.clear();
             // Stage 5 Phase D' — global recovery: reset every
             // output's cursor mode to Hidden. The post-recovery
             // first compose re-decides via build_scene's
@@ -1101,6 +1229,7 @@ impl SceneCompositor {
         let Some(inner) = inner.as_mut() else {
             return Err(SceneError::NoVk);
         };
+        platform.refresh_fence_pool_failure();
         if platform.renderer_failed {
             return Ok(Vec::new());
         }
@@ -1156,6 +1285,21 @@ impl SceneCompositor {
         if clear_dirty {
             *scene_structure_dirty = false;
         }
+        // Vulkan may export the already-signalled SYNC_FD sentinel (`fd=-1`).
+        // Such a job has no pollable fd, so drain only after every composed
+        // output installed its PendingAck; exact job/BO matching is then live
+        // before the immediate B submission runs.
+        for completion in platform.drain_scanout_render_completions() {
+            if platform.renderer_failed {
+                break;
+            }
+            if !handle_scanout_render_completion_inner(inner, completion, platform) {
+                telemetry.record_missed_pageflip();
+            }
+            if platform.renderer_failed {
+                break;
+            }
+        }
         Ok(composed)
     }
 
@@ -1174,12 +1318,27 @@ impl SceneCompositor {
         let Some(inner) = self.inner.as_mut() else {
             return false;
         };
+        let expected = inner
+            .outputs
+            .get(output_idx)
+            .and_then(|state| state.pending_acks.front())
+            .map(|ack| (ack.stage, ack.bo_idx));
         let Some(retire) = platform.on_page_flip_complete(output_idx) else {
             return false;
         };
         let Some(state) = inner.outputs.get_mut(output_idx) else {
             return false;
         };
+        if !expected.is_some_and(|(stage, bo_idx)| {
+            kms_retirement_matches(stage, bo_idx, retire.presented_bo_idx)
+        }) {
+            log::warn!(
+                "render scene: page-flip-complete on output {output_idx} presented bo {} \
+                 but the pending scene frame was {expected:?}",
+                retire.presented_bo_idx,
+            );
+            return false;
+        }
         if let Some(ack) = state.pending_acks.pop_front() {
             // Ack each per-drawable damage snapshot. Snapshots
             // from paint that landed after the tick's peek
@@ -1218,12 +1377,20 @@ impl SceneCompositor {
             if let Some(slot) = state.pool_slots.pop_front() {
                 match &ack.ticket {
                     None => state.pool_ring.release(slot),
-                    Some(t) if t.poll_signaled(&inner.vk) => {
-                        state.pool_ring.release(slot);
-                    }
-                    Some(t) => {
-                        state.pending_pool_releases.push_back((slot, t.clone()));
-                    }
+                    Some(t) => match t.poll_signaled_result(&inner.vk) {
+                        Ok(true) => state.pool_ring.release(slot),
+                        Ok(false) => {
+                            state.pending_pool_releases.push_back((slot, t.clone()));
+                        }
+                        Err(error) => {
+                            log::error!(
+                                "render scene: compose fence status failed at pageflip \
+                                 retirement: {error:?}"
+                            );
+                            platform.renderer_failed = true;
+                            state.pending_pool_releases.push_back((slot, t.clone()));
+                        }
+                    },
                 }
             }
             // Commit the BO's new last_present_generation in the
@@ -1287,6 +1454,130 @@ impl SceneCompositor {
                 "render scene: page-flip-complete on output {output_idx} \
                  with no pending ack — startup flush or spurious event",
             );
+            false
+        }
+    }
+
+    /// Advance one copied frame from source-render completion on renderer A
+    /// to the copy + KMS submission on sink renderer B. Stable output identity,
+    /// monotonic job id, and the paired BO index must all match the ledger; a
+    /// stale notification never retargets a rebuilt output vector.
+    pub(crate) fn handle_scanout_render_completion(
+        &mut self,
+        completion: ReadyScanoutRenderCompletion,
+        platform: &mut PlatformBackend,
+    ) -> bool {
+        let Some(inner) = self.inner.as_mut() else {
+            return false;
+        };
+        handle_scanout_render_completion_inner(inner, completion, platform)
+    }
+}
+
+fn handle_scanout_render_completion_inner(
+    inner: &mut SceneCompositorInner,
+    completion: ReadyScanoutRenderCompletion,
+    platform: &mut PlatformBackend,
+) -> bool {
+    if platform.renderer_failed {
+        return false;
+    }
+    let ReadyScanoutRenderCompletion {
+        job_id,
+        output_key,
+        bo_idx,
+        fd,
+    } = completion;
+    let Some(output_idx) = platform
+        .outputs
+        .iter()
+        .position(|output| output.key == output_key)
+    else {
+        log::debug!(
+            "render copied scanout: completion job {job_id} targeted removed output \
+                 {output_key:?}",
+        );
+        return false;
+    };
+    let expected = inner
+        .outputs
+        .get(output_idx)
+        .and_then(|state| state.pending_acks.front())
+        .is_some_and(|ack| copied_render_completion_matches(ack.stage, ack.bo_idx, job_id, bo_idx));
+    if !expected {
+        log::warn!(
+            "render copied scanout: stale completion job {job_id} for output \
+                 {output_idx} bo {bo_idx}",
+        );
+        // A live output retaining a different ledger entry means the
+        // completed source can no longer be associated safely. Fail-stop
+        // rather than guessing a pool slot or making either device's
+        // allocation reusable while GPU ownership is uncertain.
+        platform.renderer_failed = true;
+        return false;
+    }
+
+    match platform.submit_copied_scanout(output_idx, bo_idx, fd) {
+        Ok(()) => {
+            if let Some(ack) = inner.outputs[output_idx].pending_acks.front_mut() {
+                ack.stage = InFlightStage::KmsFlipPending;
+            }
+            true
+        }
+        Err(error) => {
+            log::warn!(
+                "render copied scanout: sink copy/KMS submit failed for output \
+                     {output_idx} bo {bo_idx}: {error}",
+            );
+            // The platform/resource layer synchronously idles B before
+            // recovery and quarantines the pair if quiescence fails.
+            // The scene may retire only A-local descriptor resources, and
+            // only behind A's compose fence; damage/cursor metadata remain
+            // live for a later repaint because no frame reached the screen.
+            platform.invalidate_bo(output_idx, bo_idx);
+            let state = &mut inner.outputs[output_idx];
+            let ack = state
+                .pending_acks
+                .pop_front()
+                .expect("completion identity was checked against the front ack");
+            state.current_generation = ack.generation.saturating_sub(1);
+            if let Some(rect) = ack.submitted_output_damage.bounding_rect() {
+                state.pending_repaint_after_failed_submit.add(rect);
+            }
+            if let Some(slot) = state.pool_slots.pop_front() {
+                match ack.ticket {
+                    None => match platform.recycle_failed_submit_bo(output_idx, bo_idx) {
+                        Ok(()) => state.pool_ring.release(slot),
+                        Err(recovery_error) => {
+                            log::error!(
+                                "render copied scanout: renderer recovery failed for output \
+                                     {output_idx} bo {bo_idx}: {recovery_error}"
+                            );
+                            platform.renderer_failed = true;
+                        }
+                    },
+                    Some(ticket) => {
+                        // Even if the fence is already signalled, route
+                        // all post-A-submit failures through the same
+                        // deferred recycler. That recycler rearms dirty
+                        // export semaphores, retires the consumed prior
+                        // B->A wait, and only then frees the paired slot.
+                        state.failed_submit_bos.push_back(FailedSubmitBo {
+                            bo_idx,
+                            pool_slot: slot,
+                            ticket,
+                        });
+                    }
+                }
+            } else {
+                log::error!(
+                    "render copied scanout: missing descriptor slot for failed output \
+                         {output_idx} bo {bo_idx}"
+                );
+                platform.renderer_failed = true;
+            }
+            state.next_submit_retry_at =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(100));
             false
         }
     }
@@ -1680,16 +1971,36 @@ fn retire_failed_submit_bos(
 ) {
     let mut remaining = VecDeque::with_capacity(state.failed_submit_bos.len());
     while let Some(failed) = state.failed_submit_bos.pop_front() {
-        if failed.ticket.poll_signaled(vk) {
-            platform.recycle_failed_submit_bo(output_idx, failed.bo_idx);
-            state.pool_ring.release(failed.pool_slot);
-            log::debug!(
-                "render scene: recycled failed-submit output {output_idx} bo {} pool slot {}",
-                failed.bo_idx,
-                failed.pool_slot,
-            );
-        } else {
-            remaining.push_back(failed);
+        match failed.ticket.poll_signaled_result(vk) {
+            Ok(true) => match platform.recycle_failed_submit_bo(output_idx, failed.bo_idx) {
+                Ok(()) => {
+                    state.pool_ring.release(failed.pool_slot);
+                    log::debug!(
+                        "render scene: recycled failed-submit output {output_idx} bo {} pool slot {}",
+                        failed.bo_idx,
+                        failed.pool_slot,
+                    );
+                }
+                Err(error) => {
+                    log::error!(
+                        "render scene: failed-submit recovery failed for output {output_idx} \
+                         bo {}: {error}",
+                        failed.bo_idx,
+                    );
+                    platform.renderer_failed = true;
+                    remaining.push_back(failed);
+                }
+            },
+            Ok(false) => remaining.push_back(failed),
+            Err(error) => {
+                log::error!(
+                    "render scene: failed-submit fence status failed for output {output_idx} \
+                     bo {}: {error:?}",
+                    failed.bo_idx,
+                );
+                platform.renderer_failed = true;
+                remaining.push_back(failed);
+            }
         }
     }
     state.failed_submit_bos = remaining;
@@ -1704,16 +2015,21 @@ fn retire_failed_submit_bos(
 fn drain_pending_pool_releases(
     state: &mut OutputSceneState,
     vk: &crate::kms::vk::device::VkContext,
+    platform: &mut PlatformBackend,
 ) {
     if state.pending_pool_releases.is_empty() {
         return;
     }
     let mut remaining = VecDeque::with_capacity(state.pending_pool_releases.len());
     while let Some((slot, ticket)) = state.pending_pool_releases.pop_front() {
-        if ticket.poll_signaled(vk) {
-            state.pool_ring.release(slot);
-        } else {
-            remaining.push_back((slot, ticket));
+        match ticket.poll_signaled_result(vk) {
+            Ok(true) => state.pool_ring.release(slot),
+            Ok(false) => remaining.push_back((slot, ticket)),
+            Err(error) => {
+                log::error!("render scene: deferred pool fence status failed: {error:?}");
+                platform.renderer_failed = true;
+                remaining.push_back((slot, ticket));
+            }
         }
     }
     state.pending_pool_releases = remaining;
@@ -1867,7 +2183,7 @@ fn tick_one_output(
         // queued at `handle_page_flip_complete` when the GPU hadn't
         // yet finished the compose CB at KMS pageflip time;
         // releasing the slot then would have tripped the VUID.
-        drain_pending_pool_releases(s, vk.as_ref());
+        drain_pending_pool_releases(s, vk.as_ref(), platform);
         if !s.pending_acks.is_empty() {
             record_tick_skip(s, output_idx, TickSkipReason::PendingAcks, 0);
             return Ok(TickOutcome::Skipped(TickSkipReason::PendingAcks));
@@ -2130,16 +2446,24 @@ fn tick_one_output(
     let descriptor_pool = state.pool_ring.pool_at(slot);
 
     // 7. Record + submit + flip via the v2 clipped compose path.
-    let compose_ticket = platform
-        .acquire_fence_ticket()
-        .map_err(|e| SceneError::Present(PresentError::Vk(e)))?;
+    let compose_ticket = match platform.acquire_fence_ticket() {
+        Ok(ticket) => ticket,
+        Err(error) => {
+            inner.outputs[output_idx].pool_ring.release(slot);
+            if vk_result_is_device_lost(error) {
+                platform.renderer_failed = true;
+            }
+            return Err(SceneError::Present(PresentError::Vk(error)));
+        }
+    };
+    let output_key = platform.outputs[output_idx].key.clone();
     let drm_device = platform
-        .device_for_output(&platform.outputs[output_idx].key)
+        .device_for_output(&output_key)
         .map(|device| device.device.clone())
         .ok_or_else(|| {
             SceneError::Present(PresentError::Io(std::io::Error::other(format!(
                 "no DRM device for output {:?}",
-                platform.outputs[output_idx].key
+                output_key
             ))))
         })?;
     let pool = platform
@@ -2170,29 +2494,83 @@ fn tick_one_output(
             .get(yserver_core::backend::GcFunction::Xor, true)?;
         (pl, inner.overlay_xor_cache.pipeline_layout())
     };
-    let bo = pool.bos.get_mut(token.bo_idx).ok_or(SceneError::NoVk)?;
     let mut gpu_submitted = false;
     let record_start = std::time::Instant::now();
-    let compose_result = record_compose(
-        &inner.vk,
-        &drm_device,
-        &layout.output,
-        bo,
-        &inner.pipeline,
-        descriptor_pool,
-        &built.scene,
-        repaint,
-        compose_ticket.fence(),
-        &mut gpu_submitted,
-        &overlay_ops,
-        xor_pipeline,
-        xor_layout,
-    );
+    let (render_result, previous_gpu_ns, copied_prepare_failed) = match pool {
+        OutputScanout::Shared(pool) => {
+            let bo = pool.bos.get_mut(token.bo_idx).ok_or(SceneError::NoVk)?;
+            let result = submit_shared_scanout_frame(
+                &inner.vk,
+                &drm_device,
+                &layout.output,
+                bo,
+                &inner.pipeline,
+                descriptor_pool,
+                &built.scene,
+                repaint,
+                compose_ticket.fence(),
+                &mut gpu_submitted,
+                &overlay_ops,
+                xor_pipeline,
+                xor_layout,
+            )
+            .map(|()| None);
+            (result, bo.last_gpu_render_ns.take(), false)
+        }
+        OutputScanout::Copied(pool) => {
+            let source = pool.sources.get_mut(token.bo_idx).ok_or(SceneError::NoVk)?;
+            let destination_state = &mut pool
+                .destinations
+                .bos
+                .get_mut(token.bo_idx)
+                .ok_or(SceneError::NoVk)?
+                .state;
+            let result = submit_copied_scanout_render(
+                &inner.vk,
+                source,
+                destination_state,
+                &inner.pipeline,
+                descriptor_pool,
+                &built.scene,
+                Repaint::Full(token.extent),
+                compose_ticket.fence(),
+                &mut gpu_submitted,
+                &overlay_ops,
+                xor_pipeline,
+                xor_layout,
+            );
+            let copied_prepare_failed = result
+                .as_ref()
+                .is_err_and(CopiedRenderSubmitError::requires_fail_stop);
+            (
+                result
+                    .map(Some)
+                    .map_err(CopiedRenderSubmitError::into_present),
+                source.last_gpu_render_ns.take(),
+                copied_prepare_failed,
+            )
+        }
+    };
+    if copied_prepare_failed {
+        // Importing the retained B -> A completion consumes its sole payload.
+        // A failed import therefore cannot be retried without fabricating the
+        // external memory dependency; fail-stop before the source can be
+        // reserved or reused again.
+        platform.renderer_failed = true;
+    }
+    let compose_result = match render_result {
+        Ok(Some(completion)) => platform
+            .register_scanout_render_completion(output_key, token.bo_idx, completion)
+            .map(|job_id| InFlightStage::WaitingForRenderCompletion { job_id })
+            .map_err(PresentError::Io),
+        Ok(None) => Ok(InFlightStage::KmsFlipPending),
+        Err(error) => Err(error),
+    };
     let record_ns = u64::try_from(record_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
     telemetry.record_compose_cb_record_ns(record_ns);
-    // GPU-render time from this bo's PREVIOUS compose (timestamp pool),
-    // read during record_compose. `.take()` so it's counted once.
-    if let Some(gpu_ns) = bo.last_gpu_render_ns.take() {
+    // GPU-render time from this paired target's PREVIOUS compose (timestamp
+    // pool), read before this command buffer overwrites the query slots.
+    if let Some(gpu_ns) = previous_gpu_ns {
         telemetry.record_gpu_render_ns(gpu_ns);
     }
     telemetry
@@ -2200,7 +2578,7 @@ fn tick_one_output(
 
     let state = inner.outputs.get_mut(output_idx).expect("range");
     match compose_result {
-        Ok(()) => {
+        Ok(stage) => {
             state.next_submit_retry_at = None;
             for id in &built.sampled_ids {
                 store.touch_render_fence(*id, compose_ticket.clone());
@@ -2209,6 +2587,7 @@ fn tick_one_output(
             state.pending_acks.push_back(PendingAck {
                 bo_idx: token.bo_idx,
                 generation: frame_gen,
+                stage,
                 drawable_snapshots: built.snapshots,
                 ticket: Some(compose_ticket),
                 submitted_output_damage: output_damage,
@@ -2225,31 +2604,34 @@ fn tick_one_output(
             Ok(TickOutcome::Composed)
         }
         Err(e) => {
-            match &e {
-                PresentError::Io(_) => {
-                    if gpu_submitted {
-                        for id in &built.sampled_ids {
-                            store.touch_render_fence(*id, compose_ticket.clone());
-                        }
-                    }
-                    // 9b — atomic commit failed after queue
-                    // submit succeeded. BO contents indeterminate.
-                    platform.invalidate_bo(output_idx, token.bo_idx);
-                    telemetry.record_missed_pageflip();
-                    log::warn!(
-                        "render scene: atomic commit failed for output {output_idx} \
-                         (bo {}): {e}; BO invalidated",
-                        token.bo_idx,
-                    );
+            if present_error_is_device_lost(&e) {
+                // The live source renderer submitted or recorded this frame.
+                // Neither shared nor copied source resources are reusable
+                // after DEVICE_LOST; latch the same fatal renderer state used
+                // by the engine before any retry bookkeeping runs.
+                platform.renderer_failed = true;
+            }
+            if gpu_submitted {
+                for id in &built.sampled_ids {
+                    store.touch_render_fence(*id, compose_ticket.clone());
                 }
-                _ => {
-                    // 9a — queue submit failed. BO not written.
-                    log::warn!(
-                        "render scene: queue submit failed for output {output_idx} \
-                         (bo {}): {e}",
-                        token.bo_idx,
-                    );
-                }
+                // Rendering reached GPU A, but a later export, completion-job
+                // registration, or shared KMS commit failed. Keep the paired
+                // resources fenced until A is done and make buffer-age state
+                // conservative; no pageflip event will retire this frame.
+                platform.invalidate_bo(output_idx, token.bo_idx);
+                telemetry.record_missed_pageflip();
+                log::warn!(
+                    "render scene: post-render scanout handoff failed for output \
+                     {output_idx} (bo {}): {e}; BO invalidated",
+                    token.bo_idx,
+                );
+            } else {
+                log::warn!(
+                    "render scene: compose record/queue submit failed for output \
+                     {output_idx} (bo {}): {e}",
+                    token.bo_idx,
+                );
             }
             // Both failure paths fold repaint forward and do NOT
             // push a pending_ack or advance current_generation.
@@ -2280,7 +2662,7 @@ fn tick_one_output(
                 });
             } else {
                 state.pool_ring.release(slot);
-                platform.recycle_failed_submit_bo(output_idx, token.bo_idx);
+                platform.cancel_scanout_bo_recording(output_idx, token.bo_idx);
             }
             Err(SceneError::Present(e))
         }
@@ -3439,8 +3821,118 @@ fn add_projected_damage(
 // handling stay identical to v1.
 // ────────────────────────────────────────────────────────────────
 
+trait ComposeRenderTarget {
+    fn image(&self) -> vk::Image;
+    fn image_view(&self) -> vk::ImageView;
+    fn command_buffer(&self) -> vk::CommandBuffer;
+    fn completion_semaphore(&self) -> vk::Semaphore;
+    fn width(&self) -> u32;
+    fn height(&self) -> u32;
+    fn timestamp_pool(&self) -> vk::QueryPool;
+    fn set_last_gpu_render_ns(&mut self, value: Option<u64>);
+
+    fn requires_foreign_acquire(&self) -> bool {
+        false
+    }
+
+    fn releases_to_foreign(&self) -> bool {
+        false
+    }
+
+    fn renderer_wait_semaphore(&self) -> Option<vk::Semaphore> {
+        None
+    }
+
+    fn note_submit_succeeded(&mut self) {}
+}
+
+impl ComposeRenderTarget for ScanoutBo {
+    fn image(&self) -> vk::Image {
+        self.vk_image
+    }
+
+    fn image_view(&self) -> vk::ImageView {
+        self.vk_image_view
+    }
+
+    fn command_buffer(&self) -> vk::CommandBuffer {
+        self.vk_transfer.command_buffer
+    }
+
+    fn completion_semaphore(&self) -> vk::Semaphore {
+        self.vk_semaphore
+    }
+
+    fn width(&self) -> u32 {
+        self.width
+    }
+
+    fn height(&self) -> u32 {
+        self.height
+    }
+
+    fn timestamp_pool(&self) -> vk::QueryPool {
+        self.vk_transfer.timestamp_pool
+    }
+
+    fn set_last_gpu_render_ns(&mut self, value: Option<u64>) {
+        self.last_gpu_render_ns = value;
+    }
+}
+
+impl ComposeRenderTarget for CopiedRenderSource {
+    fn image(&self) -> vk::Image {
+        self.image()
+    }
+
+    fn image_view(&self) -> vk::ImageView {
+        self.image_view
+    }
+
+    fn command_buffer(&self) -> vk::CommandBuffer {
+        self.transfer.command_buffer
+    }
+
+    fn completion_semaphore(&self) -> vk::Semaphore {
+        self.completion_semaphore
+    }
+
+    fn width(&self) -> u32 {
+        self.width()
+    }
+
+    fn height(&self) -> u32 {
+        self.height()
+    }
+
+    fn timestamp_pool(&self) -> vk::QueryPool {
+        self.transfer.timestamp_pool
+    }
+
+    fn set_last_gpu_render_ns(&mut self, value: Option<u64>) {
+        self.last_gpu_render_ns = value;
+    }
+
+    fn requires_foreign_acquire(&self) -> bool {
+        self.renderer_requires_foreign_acquire()
+    }
+
+    fn releases_to_foreign(&self) -> bool {
+        true
+    }
+
+    fn renderer_wait_semaphore(&self) -> Option<vk::Semaphore> {
+        self.renderer_wait_semaphore()
+    }
+
+    fn note_submit_succeeded(&mut self) {
+        self.note_renderer_submit_succeeded();
+    }
+}
+
+/// Render directly into the KMS framebuffer and immediately queue its flip.
 #[allow(clippy::too_many_arguments)]
-fn record_compose(
+fn submit_shared_scanout_frame(
     vk: &crate::kms::vk::device::VkContext,
     drm: &crate::drm::Device,
     output: &crate::platform::drm::Output,
@@ -3462,17 +3954,121 @@ fn record_compose(
     }
     let fb_handle = bo.fb_handle.ok_or(PresentError::NoFb)?;
     bo.state.transition_to_recording();
+    record_and_submit_render(
+        vk,
+        bo,
+        pipeline,
+        descriptor_pool,
+        scene,
+        repaint,
+        signal_fence,
+        gpu_submitted,
+        overlay_ops,
+        xor_pipeline,
+        xor_layout,
+    )?;
 
+    let fd = bo
+        .export_signaled_fd()
+        .map_err(PresentError::Vk)?
+        .map_or(-1, IntoRawFd::into_raw_fd);
+    bo.state.transition_to_submitted(fd);
+
+    let mut out_fence: i32 = -1;
+    match crate::drm::page_flip::submit_flip_with_fences(drm, output, fb_handle, fd, &mut out_fence)
+    {
+        Ok(()) => {
+            if let Some(reclaimed) = bo.state.transition_to_pending(out_fence) {
+                // SAFETY: `reclaimed` was inserted by
+                // `transition_to_submitted` above.
+                drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(reclaimed) });
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if let Some(reclaimed) = bo.state.transition_to_recording_after_atomic_reject() {
+                // SAFETY: same fd we just inserted.
+                drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(reclaimed) });
+            }
+            if out_fence >= 0 {
+                // Defensive: OUT_FENCE_PTR should only be written on success.
+                drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(out_fence) });
+            }
+            Err(PresentError::Io(error))
+        }
+    }
+}
+
+/// Render into A's exportable source. The paired destination phase reserves
+/// the same BO index until readiness advances the frame to B's copy + KMS
+/// submission on the main-loop boundary.
+#[allow(clippy::too_many_arguments)]
+fn submit_copied_scanout_render(
+    vk: &crate::kms::vk::device::VkContext,
+    source: &mut CopiedRenderSource,
+    destination_state: &mut BoState,
+    pipeline: &CompositorPipeline,
+    descriptor_pool: vk::DescriptorPool,
+    scene: &CompositeScene,
+    repaint: Repaint,
+    signal_fence: vk::Fence,
+    gpu_submitted: &mut bool,
+    overlay_ops: &[(u32, vk::Rect2D)],
+    xor_pipeline: vk::Pipeline,
+    xor_layout: vk::PipelineLayout,
+) -> Result<Option<std::os::fd::OwnedFd>, CopiedRenderSubmitError> {
+    if destination_state.phase != BoPhase::Free {
+        return Err(CopiedRenderSubmitError::Present(PresentError::WrongPhase(
+            destination_state.phase,
+        )));
+    }
+    source
+        .prepare_renderer_acquire()
+        .map_err(CopiedRenderSubmitError::RendererAcquire)?;
+    destination_state.transition_to_recording();
+    record_and_submit_render(
+        vk,
+        source,
+        pipeline,
+        descriptor_pool,
+        scene,
+        repaint,
+        signal_fence,
+        gpu_submitted,
+        overlay_ops,
+        xor_pipeline,
+        xor_layout,
+    )
+    .map_err(CopiedRenderSubmitError::Present)?;
+    source
+        .export_render_completion()
+        .map_err(|error| CopiedRenderSubmitError::Present(PresentError::Vk(error)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_and_submit_render(
+    vk: &crate::kms::vk::device::VkContext,
+    target: &mut impl ComposeRenderTarget,
+    pipeline: &CompositorPipeline,
+    descriptor_pool: vk::DescriptorPool,
+    scene: &CompositeScene,
+    repaint: Repaint,
+    signal_fence: vk::Fence,
+    gpu_submitted: &mut bool,
+    overlay_ops: &[(u32, vk::Rect2D)],
+    xor_pipeline: vk::Pipeline,
+    xor_layout: vk::PipelineLayout,
+) -> Result<(), PresentError> {
     // Compose GPU-render telemetry. Read the PREVIOUS compose's
     // timestamps BEFORE the CB overwrites them; the read is
     // synchronous (no WAIT flag), and the bo is being re-acquired so
     // its prior compose fence has already signalled → results are
     // available. `NOT_READY` on the very first compose (pool never
     // written) → `None`. `tick_one_output` takes and forwards this to
-    // `telemetry.record_gpu_render_ns` after `record_compose` returns.
-    let ts_pool = bo.vk_transfer.timestamp_pool;
+    // `telemetry.record_gpu_render_ns` after submission returns.
+    let ts_pool = target.timestamp_pool();
     let ts_enabled = vk.timestamp_period > 0.0 && ts_pool != vk::QueryPool::null();
-    bo.last_gpu_render_ns = if ts_enabled {
+    let last_gpu_render_ns = if ts_enabled {
         let mut ts = [0u64; 2];
         match unsafe {
             vk.device
@@ -3493,6 +4089,7 @@ fn record_compose(
     } else {
         None
     };
+    target.set_last_gpu_render_ns(last_gpu_render_ns);
 
     // Allocate descriptor sets — same shape as v1.
     let mut descriptors: Vec<vk::DescriptorSet> = Vec::with_capacity(scene.draws.len());
@@ -3528,7 +4125,7 @@ fn record_compose(
     // Record.
     record_command_buffer(
         vk,
-        bo,
+        target,
         pipeline,
         scene,
         &descriptors,
@@ -3538,65 +4135,38 @@ fn record_compose(
         xor_layout,
     )?;
 
-    // Submit. Same shape as v1: signal bo.vk_semaphore for the
-    // KMS IN_FENCE_FD handoff; null fence.
-    let cb = bo.vk_transfer.command_buffer;
+    let cb = target.command_buffer();
     let cb_info = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
     let sig_info = [vk::SemaphoreSubmitInfo::default()
-        .semaphore(bo.vk_semaphore)
+        .semaphore(target.completion_semaphore())
         .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
-    let submit = [vk::SubmitInfo2::default()
+    let waits = target.renderer_wait_semaphore().map(|semaphore| {
+        [vk::SemaphoreSubmitInfo::default()
+            .semaphore(semaphore)
+            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)]
+    });
+    let mut submit = vk::SubmitInfo2::default()
         .command_buffer_infos(&cb_info)
-        .signal_semaphore_infos(&sig_info)];
+        .signal_semaphore_infos(&sig_info);
+    if let Some(waits) = waits.as_ref() {
+        submit = submit.wait_semaphore_infos(waits);
+    }
+    let submit = [submit];
     unsafe {
         crate::vk_count!(queue_submit2);
         crate::vk_count!(submit_compositor);
         vk.device
             .queue_submit2(vk.graphics_queue, &submit, signal_fence)?;
     }
+    target.note_submit_succeeded();
     *gpu_submitted = true;
-
-    // Export SYNC_FD + atomic flip — same as v1.
-    let fd = bo
-        .export_signaled_fd()
-        .map_err(PresentError::Vk)?
-        .map_or(-1, IntoRawFd::into_raw_fd);
-    bo.state.transition_to_submitted(fd);
-
-    let mut out_fence: i32 = -1;
-    match crate::drm::page_flip::submit_flip_with_fences(drm, output, fb_handle, fd, &mut out_fence)
-    {
-        Ok(()) => {
-            if let Some(reclaimed) = bo.state.transition_to_pending(out_fence) {
-                // SAFETY: `reclaimed` was inserted by
-                // `transition_to_submitted` above.
-                drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(reclaimed) });
-            }
-            Ok(())
-        }
-        Err(e) => {
-            if let Some(reclaimed) = bo.state.transition_to_recording_after_atomic_reject() {
-                // SAFETY: same fd we just inserted.
-                drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(reclaimed) });
-            }
-            if out_fence >= 0 {
-                // Defensive: OUT_FENCE_PTR should only be written
-                // on a successful atomic commit, but close it if a
-                // driver/kernel ever returns one alongside an error.
-                drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(out_fence) });
-            }
-            // Leave the BO non-free. The command buffer was already
-            // submitted, so the caller must hold this BO until the
-            // compose fence signals and then recycle it explicitly.
-            Err(PresentError::Io(e))
-        }
-    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-fn record_command_buffer(
+fn record_command_buffer<T: ComposeRenderTarget + ?Sized>(
     vk: &crate::kms::vk::device::VkContext,
-    bo: &ScanoutBo,
+    bo: &T,
     pipeline: &CompositorPipeline,
     scene: &CompositeScene,
     descriptors: &[vk::DescriptorSet],
@@ -3606,15 +4176,15 @@ fn record_command_buffer(
     xor_layout: vk::PipelineLayout,
 ) -> Result<(), PresentError> {
     let device = &vk.device;
-    let cb = bo.vk_transfer.command_buffer;
-    // Mirror the ts gate `record_compose` uses so we can bracket the
+    let cb = bo.command_buffer();
+    // Mirror the timestamp gate `record_and_submit_render` uses so we can bracket the
     // CB with TOP/BOTTOM timestamp writes; caller already read the
-    // previous pool contents into `bo.last_gpu_render_ns` before we
-    // reset the pool below.
-    let ts_pool = bo.vk_transfer.timestamp_pool;
+    // previous pool contents before we reset the pool below.
+    let ts_pool = bo.timestamp_pool();
     let ts_enabled = vk.timestamp_period > 0.0 && ts_pool != vk::QueryPool::null();
+    let foreign_acquire = bo.requires_foreign_acquire();
 
-    let (load_op, render_area, old_layout) = match repaint {
+    let (load_op, render_area, mut old_layout) = match repaint {
         Repaint::Full(extent) => (
             vk::AttachmentLoadOp::CLEAR,
             vk::Rect2D {
@@ -3628,8 +4198,8 @@ fn record_command_buffer(
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
                 extent: vk::Extent2D {
-                    width: bo.width,
-                    height: bo.height,
+                    width: bo.width(),
+                    height: bo.height(),
                 },
             },
             // LOAD requires the previous layout to be valid; the
@@ -3640,6 +4210,9 @@ fn record_command_buffer(
             vk::ImageLayout::GENERAL,
         ),
     };
+    if foreign_acquire {
+        old_layout = vk::ImageLayout::GENERAL;
+    }
     let scissor = match repaint {
         Repaint::Full(extent) => vk::Rect2D {
             offset: vk::Offset2D::default(),
@@ -3663,7 +4236,33 @@ fn record_command_buffer(
             device.cmd_write_timestamp(cb, vk::PipelineStageFlags::TOP_OF_PIPE, ts_pool, 0);
         }
 
-        let to_color_src_access = if matches!(load_op, vk::AttachmentLoadOp::LOAD) {
+        if foreign_acquire {
+            let acquire = [vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+                .dst_queue_family_index(vk.graphics_queue_family)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .image(bo.image())
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                )];
+            crate::vk_count!(cmd_pipeline_barrier2);
+            device.cmd_pipeline_barrier2(
+                cb,
+                &vk::DependencyInfo::default().image_memory_barriers(&acquire),
+            );
+        }
+
+        let to_color_src_access = if foreign_acquire {
+            vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE
+        } else if matches!(load_op, vk::AttachmentLoadOp::LOAD) {
             // LOAD: previous KMS scanout left the BO in GENERAL.
             // The kernel "consumed" the BO contents via the page
             // flip; we now need the GPU to read+write them. Pair
@@ -3676,7 +4275,11 @@ fn record_command_buffer(
             vk::AccessFlags2::empty()
         };
         let to_color = vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+            .src_stage_mask(if foreign_acquire {
+                vk::PipelineStageFlags2::ALL_COMMANDS
+            } else {
+                vk::PipelineStageFlags2::TOP_OF_PIPE
+            })
             .src_access_mask(to_color_src_access)
             .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
             // B.2 fix (vkdebug READ_AFTER_WRITE at vkCmdBeginRendering):
@@ -3690,7 +4293,7 @@ fn record_command_buffer(
             )
             .old_layout(old_layout)
             .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .image(bo.vk_image)
+            .image(bo.image())
             .subresource_range(
                 vk::ImageSubresourceRange::default()
                     .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -3703,7 +4306,7 @@ fn record_command_buffer(
         device.cmd_pipeline_barrier2(cb, &to_color_dep);
 
         let color_attachment = [vk::RenderingAttachmentInfo::default()
-            .image_view(bo.vk_image_view)
+            .image_view(bo.image_view())
             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .load_op(load_op)
             .store_op(vk::AttachmentStoreOp::STORE)
@@ -3723,9 +4326,9 @@ fn record_command_buffer(
             x: 0.0,
             y: 0.0,
             #[allow(clippy::cast_precision_loss)]
-            width: bo.width as f32,
+            width: bo.width() as f32,
             #[allow(clippy::cast_precision_loss)]
-            height: bo.height as f32,
+            height: bo.height() as f32,
             min_depth: 0.0,
             max_depth: 1.0,
         }];
@@ -3735,7 +4338,7 @@ fn record_command_buffer(
         device.cmd_set_scissor(cb, 0, &[scissor]);
 
         #[allow(clippy::cast_precision_loss)]
-        let viewport_size = [bo.width as f32, bo.height as f32];
+        let viewport_size = [bo.width() as f32, bo.height() as f32];
         let mut last_pipeline: Option<vk::Pipeline> = None;
         for (i, draw) in scene.draws.iter().enumerate().take(descriptors.len()) {
             let pl = pipeline.pipeline_for(draw.alpha_passthrough);
@@ -3807,7 +4410,7 @@ fn record_command_buffer(
             .dst_access_mask(vk::AccessFlags2::empty())
             .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .new_layout(vk::ImageLayout::GENERAL)
-            .image(bo.vk_image)
+            .image(bo.image())
             .subresource_range(
                 vk::ImageSubresourceRange::default()
                     .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -3818,6 +4421,30 @@ fn record_command_buffer(
         let to_scanout_dep = vk::DependencyInfo::default().image_memory_barriers(&to_scanout_arr);
         crate::vk_count!(cmd_pipeline_barrier2);
         device.cmd_pipeline_barrier2(cb, &to_scanout_dep);
+
+        if bo.releases_to_foreign() {
+            let release = [vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                .dst_access_mask(vk::AccessFlags2::empty())
+                .src_queue_family_index(vk.graphics_queue_family)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .image(bo.image())
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                )];
+            crate::vk_count!(cmd_pipeline_barrier2);
+            device.cmd_pipeline_barrier2(
+                cb,
+                &vk::DependencyInfo::default().image_memory_barriers(&release),
+            );
+        }
 
         // GPU-render timer: stamp BOTTOM-of-pipe after all compose work.
         if ts_enabled {
@@ -3836,6 +4463,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn copied_completion_requires_exact_job_and_paired_bo() {
+        let waiting = InFlightStage::WaitingForRenderCompletion { job_id: 41 };
+        assert!(copied_render_completion_matches(waiting, 2, 41, 2));
+        assert!(!copied_render_completion_matches(waiting, 2, 42, 2));
+        assert!(!copied_render_completion_matches(waiting, 2, 41, 1));
+    }
+
+    #[test]
+    fn copied_frame_cannot_retire_before_sink_kms_submission() {
+        let waiting = InFlightStage::WaitingForRenderCompletion { job_id: 7 };
+        assert!(!kms_retirement_matches(waiting, 1, 1));
+        assert!(!copied_render_completion_matches(
+            InFlightStage::KmsFlipPending,
+            1,
+            7,
+            1,
+        ));
+    }
+
+    #[test]
+    fn kms_retirement_requires_the_exact_paired_bo() {
+        assert!(kms_retirement_matches(InFlightStage::KmsFlipPending, 1, 1,));
+        assert!(!kms_retirement_matches(InFlightStage::KmsFlipPending, 1, 2,));
+    }
+
+    #[test]
     fn global_drain_waits_and_releases_every_deferred_scene_resource() {
         let mut pending = VecDeque::from([(
             3,
@@ -3852,8 +4505,14 @@ mod tests {
         drain_deferred_scene_resources(
             &mut pending,
             &mut failed,
-            |_| waited += 1,
-            |release| released.push(release),
+            |_| {
+                waited += 1;
+                true
+            },
+            |release| {
+                released.push(release);
+                true
+            },
         );
 
         assert_eq!(waited, 2);
@@ -3869,6 +4528,37 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn global_drain_retains_every_resource_whose_fence_wait_fails() {
+        let mut pending = VecDeque::from([(
+            3,
+            crate::kms::render::platform::FenceTicket::for_tests_stub(),
+        )]);
+        let mut failed = VecDeque::from([FailedSubmitBo {
+            bo_idx: 7,
+            pool_slot: 5,
+            ticket: crate::kms::render::platform::FenceTicket::for_tests_stub(),
+        }]);
+        let mut released = Vec::new();
+
+        drain_deferred_scene_resources(
+            &mut pending,
+            &mut failed,
+            |_| false,
+            |release| {
+                released.push(release);
+                true
+            },
+        );
+
+        assert!(released.is_empty());
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, 3);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].bo_idx, 7);
+        assert_eq!(failed[0].pool_slot, 5);
     }
 
     // Stage 5 Phase G — strategy decision unit tests. Verify the
@@ -3988,6 +4678,34 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn live_source_device_lost_is_the_only_fatal_vulkan_present_error() {
+        assert!(vk_result_is_device_lost(vk::Result::ERROR_DEVICE_LOST));
+        assert!(!vk_result_is_device_lost(
+            vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+        ));
+        assert!(present_error_is_device_lost(&PresentError::Vk(
+            vk::Result::ERROR_DEVICE_LOST,
+        )));
+        assert!(!present_error_is_device_lost(&PresentError::Vk(
+            vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+        )));
+    }
+
+    #[test]
+    fn copied_renderer_acquire_failure_is_fail_stop_before_submit() {
+        let acquire = CopiedRenderSubmitError::RendererAcquire(io::Error::other(
+            "retained B-to-A completion import failed",
+        ));
+        assert!(acquire.requires_fail_stop());
+        assert!(matches!(acquire.into_present(), PresentError::Io(_)));
+
+        let ordinary = CopiedRenderSubmitError::Present(PresentError::Vk(
+            vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+        ));
+        assert!(!ordinary.requires_fail_stop());
     }
 
     #[test]

@@ -33,6 +33,54 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-08-18 copied reverse-PRIME scanout:** a different-device or
+  relationship-unknown output now falls back to GPU copy transport only after
+  every exact copy-free allocation plan fails. `OutputScanout` keeps the
+  ordinary shared pool distinct from a copied pool pairing renderer-A export
+  sources with a truthful renderer-B-local destination pool and the outer
+  A-to-KMS route. Renderer B is accepted only when exactly one inventoried
+  `RenderDevice` advertises the sink KMS primary node; disposable and live
+  contexts select A and B by exact Vulkan device plus driver UUID, so
+  display-only and ambiguous sinks are never guessed or rescored. Every copied
+  candidate requires `VK_EXT_queue_family_foreign` on both contexts, allocates
+  all three source/destination slots on fresh A/B logical devices, and runs two
+  real render/copy cycles per slot with separate local-layout and
+  `VK_QUEUE_FAMILY_FOREIGN_EXT` barriers. Cycle two consumes a retained B-to-A
+  completion through a fresh temporary semaphore; because atomic `TEST_ONLY`
+  does not provide a KMS ownership return, its destination full-discards from
+  `UNDEFINED`, while real `GENERAL` KMS-to-B reuse remains a live two-flip
+  hardware-smoke gate. Every destination framebuffer passes full atomic
+  `TEST_ONLY` before the exact source/destination plans are replayed live.
+  Startup fallback remains under the dumb-scanout rollback guard; runtime
+  enable commits and marks the exact destination front before installing it.
+  A stable backend completion poller carries monotonic job id, device-qualified
+  `OutputKey`, and BO index from A render readiness to B copy submission.
+  Vulkan's valid already-signalled `SYNC_FD` (`fd=-1`) bypasses polling but is
+  still imported into a temporary B semaphore and waited. B's exported
+  completion is duplicated for KMS `IN_FENCE_FD` and A's next FOREIGN acquire
+  (or retained as an explicit `fd=-1` sentinel); temporary waits live until
+  their consuming submission's fence completes. Damage,
+  generation, cursor, descriptor, and paired A-source retirement wait for the
+  matching page-flip completion. Readback uses A's composited source while
+  framebuffer retention, direct-scanout bookkeeping, and KMS retirement use
+  B's destination. Destination state distinguishes B-produced `GENERAL`
+  contents from a fresh synchronous-modeset image whose Vulkan layout remains
+  uninitialized, so retirement selects `GENERAL` acquire versus `UNDEFINED`
+  discard correctly. Copied readback consumes the retained B completion and
+  acquires A before reading. DMA-BUF import intersects Vulkan image and fd memory-type
+  masks and verifies the supplied layout on the non-modifier linear path.
+  Topology, VT, DPMS, and shutdown paths unregister waiting jobs and quiesce
+  both devices before reset/drop. Failed A-fence waits retain BO/descriptor
+  ledgers; post-submit export failures rearm binary semaphores only after the
+  corresponding queue is proven complete. Successful KMS-off plus A/B idle
+  clears temporary waits/retained fds and normalizes ownership to full-discard
+  states; failed quiescence quarantines and leaks uncertain resources rather
+  than reusing them, and live A/B device loss is fatal. Failure recovery
+  currently uses synchronous sink `device_wait_idle`,
+  so it is safe but may block on a wedged driver. The compatibility path remains
+  full-frame GPU copy with no CPU fallback; renderer-local optimal targets plus
+  explicit linearization remain a later transport layer. Live mixed-GPU and
+  FreeBSD hardware smoke remain pending.
 - **2026-08-18 connector-handle mode resolution:** RANDR requests for a
   non-preferred mode now query the exact typed DRM connector handle carried by
   the freshly discovered `Output` on its owning KMS device. Protocol-facing
@@ -98,8 +146,8 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   commit marks its exact BO `OnScreen` before ownership leaves the candidate
   loop. Shutdown disarm deliberately retains output-owned GBM storage if KMS
   could not be disabled. Both ownership directions remain zero-copy shared
-  DMA-BUF paths; copied reverse-PRIME transport is still a separate later
-  layer.
+  DMA-BUF paths; only after this complete candidate sequence fails does the
+  copied reverse-PRIME layer described above run.
 - **2026-08-18 PRIME renderer-to-KMS scanout-route qualification:** every
   live output and `ScanoutBoPool` now records one `ScanoutRoute` from the
   selected `RenderDeviceId` to the output's DRM-primary `DrmDeviceKey`.

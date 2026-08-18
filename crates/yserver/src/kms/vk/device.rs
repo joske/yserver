@@ -29,6 +29,10 @@ pub(crate) struct VulkanDrmIdentity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct VulkanDrmPhysicalDevice {
     pub(crate) physical_device: vk::PhysicalDevice,
+    /// Stable identity usable from a different Vulkan instance. Platform
+    /// inventory records this alongside the DRM endpoint so copied scanout can
+    /// open the exact sink GPU without re-running generic device scoring.
+    pub(crate) selector: VulkanDeviceSelector,
     pub(crate) identity: VulkanDrmIdentity,
 }
 
@@ -43,6 +47,22 @@ pub(crate) struct VulkanDrmPhysicalDevice {
 pub(crate) struct VulkanDeviceSelector {
     device_uuid: [u8; vk::UUID_SIZE],
     driver_uuid: [u8; vk::UUID_SIZE],
+}
+
+impl VulkanDeviceSelector {
+    #[cfg(test)]
+    pub(crate) const fn for_tests(seed: u8) -> Self {
+        Self {
+            device_uuid: [seed; vk::UUID_SIZE],
+            driver_uuid: [seed.wrapping_add(0x40); vk::UUID_SIZE],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeviceProfile {
+    Compositor,
+    Transfer,
 }
 
 /// DRM endpoint the compositor wants its Vulkan renderer to use.
@@ -93,6 +113,12 @@ pub struct VkContext {
     /// when false, `kms::vk::dri3::supported_modifiers` returns
     /// `[DRM_FORMAT_MOD_LINEAR]` per design §4 fallback matrix.
     pub image_drm_format_modifier: bool,
+    /// Whether `VK_EXT_queue_family_foreign` is enabled. Copied scanout moves
+    /// exclusive dma-buf images between distinct Vulkan physical devices (and
+    /// KMS), which requires `VK_QUEUE_FAMILY_FOREIGN_EXT`; the core
+    /// `VK_QUEUE_FAMILY_EXTERNAL` sentinel is restricted to the same physical
+    /// device and driver UUID.
+    pub(crate) queue_family_foreign: bool,
     /// GLX-TFP: per-driver tiling strategy for the exported image,
     /// cached on first successful allocation. LINEAR is preferred —
     /// Turnip / Adreno same-GPU dma-buf sharing only delivers live
@@ -134,7 +160,10 @@ pub struct VkContext {
 
 impl VkContext {
     pub fn new() -> Result<Arc<Self>, VkInitError> {
-        Self::new_with_selection(PhysicalDeviceSelection::Automatic)
+        Self::new_with_selection(
+            PhysicalDeviceSelection::Automatic,
+            DeviceProfile::Compositor,
+        )
     }
 
     /// Build the context on the renderer associated with `render`.
@@ -146,12 +175,13 @@ impl VkContext {
         render: Option<DrmDeviceKey>,
         display_primary: DrmDeviceKey,
     ) -> Result<Arc<Self>, VkInitError> {
-        Self::new_with_selection(PhysicalDeviceSelection::RenderEndpoint(
-            RequestedRenderDevice {
+        Self::new_with_selection(
+            PhysicalDeviceSelection::RenderEndpoint(RequestedRenderDevice {
                 render,
                 display_primary,
-            },
-        ))
+            }),
+            DeviceProfile::Compositor,
+        )
     }
 
     /// Create a disposable logical device on the exact physical device and
@@ -163,12 +193,38 @@ impl VkContext {
     pub(crate) fn new_disposable_for_same_physical_device(
         live: &Self,
     ) -> Result<Arc<Self>, VkInitError> {
-        Self::new_with_selection(PhysicalDeviceSelection::Exact(
-            live.selected_device_selector,
-        ))
+        Self::new_with_selection(
+            PhysicalDeviceSelection::Exact(live.selected_device_selector),
+            DeviceProfile::Compositor,
+        )
     }
 
-    fn new_with_selection(selection: PhysicalDeviceSelection) -> Result<Arc<Self>, VkInitError> {
+    /// Create the minimal sink-side context used by copied scanout on the
+    /// exact physical device and ICD named by `selector`.
+    ///
+    /// The sink only imports external memory and semaphores, records transfer
+    /// commands, and exports a completion semaphore. It deliberately does not
+    /// request compositor-only dynamic rendering, logic operations, or
+    /// dual-source blending.
+    pub(crate) fn new_transfer_for_device(
+        selector: VulkanDeviceSelector,
+    ) -> Result<Arc<Self>, VkInitError> {
+        Self::new_with_selection(
+            PhysicalDeviceSelection::Exact(selector),
+            DeviceProfile::Transfer,
+        )
+    }
+
+    /// Stable UUID pair for the selected physical device and ICD.
+    #[must_use]
+    pub(crate) const fn device_selector(&self) -> VulkanDeviceSelector {
+        self.selected_device_selector
+    }
+
+    fn new_with_selection(
+        selection: PhysicalDeviceSelection,
+        profile: DeviceProfile,
+    ) -> Result<Arc<Self>, VkInitError> {
         let entry = unsafe { ash::Entry::load()? };
         let app_info = vk::ApplicationInfo::default()
             .application_name(c"yserver")
@@ -280,6 +336,7 @@ impl VkContext {
             ash::ext::external_memory_dma_buf::NAME,
             ash::khr::external_semaphore_fd::NAME,
             ash::ext::image_drm_format_modifier::NAME,
+            ash::ext::queue_family_foreign::NAME,
         ];
         let supported_device_exts =
             match unsafe { instance.enumerate_device_extension_properties(physical_device) } {
@@ -320,8 +377,9 @@ impl VkContext {
             .queue_family_index(graphics_queue_family)
             .queue_priorities(&priorities)];
 
+        let compositor_features = profile == DeviceProfile::Compositor;
         let mut features13 = vk::PhysicalDeviceVulkan13Features::default()
-            .dynamic_rendering(true)
+            .dynamic_rendering(compositor_features)
             .synchronization2(true);
 
         // `logicOp` (the X11 GcFunction Xor/And/Or/Invert fill path —
@@ -335,22 +393,26 @@ impl VkContext {
         // `dualSrcBlend` degrades component-alpha to grayscale AA
         // (`component_alpha_supported`), a missing `logicOp` (no
         // fallback yet) is a hard, named error.
-        let supported_features = unsafe { instance.get_physical_device_features(physical_device) };
-        let selected = match select_device_features(&supported_features) {
-            Ok(s) => s,
-            Err(e) => {
+        let supported_features = if compositor_features {
+            unsafe { instance.get_physical_device_features(physical_device) }
+        } else {
+            vk::PhysicalDeviceFeatures::default()
+        };
+        let selected = match select_device_features_for_profile(&supported_features, profile) {
+            Ok(selected) => selected,
+            Err(error) => {
                 unsafe {
                     if let Some(m) = debug_messenger {
                         debug_utils_instance.destroy_debug_utils_messenger(m, None);
                     }
                     instance.destroy_instance(None);
                 }
-                return Err(e);
+                return Err(error);
             }
         };
         let enabled_features = selected.enabled;
         let component_alpha_supported = selected.component_alpha;
-        if !component_alpha_supported {
+        if compositor_features && !component_alpha_supported {
             log::warn!(
                 "vulkan: device lacks dualSrcBlend — RENDER component-alpha \
                  (subpixel text AA) falls back to grayscale AA"
@@ -396,6 +458,8 @@ impl VkContext {
         } else {
             None
         };
+        let queue_family_foreign =
+            device_extension_names.contains(&ash::ext::queue_family_foreign::NAME);
 
         // Driver-id query. Diagnostic-only after the Vulkan-first
         // pivot — no path branches on it. Kept so future quirks can
@@ -426,6 +490,7 @@ impl VkContext {
             external_memory_fd,
             image_drm_format_modifier_ext,
             image_drm_format_modifier,
+            queue_family_foreign,
             tfp_tiling_strategy: std::sync::OnceLock::new(),
             graphics_queue_family,
             graphics_queue,
@@ -680,6 +745,19 @@ fn select_device_features(
     })
 }
 
+fn select_device_features_for_profile(
+    supported: &vk::PhysicalDeviceFeatures,
+    profile: DeviceProfile,
+) -> Result<SelectedFeatures, VkInitError> {
+    match profile {
+        DeviceProfile::Compositor => select_device_features(supported),
+        DeviceProfile::Transfer => Ok(SelectedFeatures {
+            enabled: vk::PhysicalDeviceFeatures::default(),
+            component_alpha: false,
+        }),
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PhysicalDeviceCandidate {
     physical_device: vk::PhysicalDevice,
@@ -736,17 +814,7 @@ fn pick_physical_device(
     let queue_family = selected
         .graphics_queue_family
         .ok_or(VkInitError::NoSuitableDevice)?;
-    let drm_physical_devices = candidates
-        .iter()
-        .filter(|candidate| candidate.graphics_queue_family.is_some())
-        .filter_map(|candidate| {
-            let identity = candidate.drm_identity?;
-            identity.render.map(|_| VulkanDrmPhysicalDevice {
-                physical_device: candidate.physical_device,
-                identity,
-            })
-        })
-        .collect();
+    let drm_physical_devices = drm_physical_device_inventory(&candidates);
     Ok(PickedPhysicalDevice {
         physical_device: selected.physical_device,
         graphics_queue_family: queue_family,
@@ -754,6 +822,23 @@ fn pick_physical_device(
         selected_drm_identity: selected.drm_identity,
         drm_physical_devices,
     })
+}
+
+fn drm_physical_device_inventory(
+    candidates: &[PhysicalDeviceCandidate],
+) -> Vec<VulkanDrmPhysicalDevice> {
+    candidates
+        .iter()
+        .filter(|candidate| candidate.graphics_queue_family.is_some())
+        .filter_map(|candidate| {
+            let identity = candidate.drm_identity?;
+            identity.render.map(|_| VulkanDrmPhysicalDevice {
+                physical_device: candidate.physical_device,
+                selector: candidate.selector,
+                identity,
+            })
+        })
+        .collect()
 }
 
 fn select_exact_physical_device_candidate(
@@ -1225,6 +1310,37 @@ mod tests {
             validate_render_device_inventory(&candidates),
             Err(VkInitError::DuplicateRenderNodeIdentity(key)) if key == "226:128"
         ));
+    }
+
+    #[test]
+    fn render_inventory_preserves_every_exact_uuid_selector() {
+        let candidates = [
+            candidate(1, 3, Some(identity(Some(0), Some(128)))),
+            candidate(2, 2, Some(identity(Some(1), Some(129)))),
+            candidate(3, 1, None),
+        ];
+
+        let inventory = drm_physical_device_inventory(&candidates);
+
+        assert_eq!(inventory.len(), 2);
+        assert_eq!(inventory[0].selector, selector(1));
+        assert_eq!(inventory[0].identity, identity(Some(0), Some(128)));
+        assert_eq!(inventory[1].selector, selector(2));
+        assert_eq!(inventory[1].identity, identity(Some(1), Some(129)));
+    }
+
+    #[test]
+    fn transfer_profile_does_not_require_compositor_features() {
+        let unsupported = vk::PhysicalDeviceFeatures::default()
+            .logic_op(false)
+            .dual_src_blend(false);
+
+        let selected = select_device_features_for_profile(&unsupported, DeviceProfile::Transfer)
+            .expect("sink transfer context needs no compositor-only features");
+
+        assert_eq!(selected.enabled.logic_op, vk::FALSE);
+        assert_eq!(selected.enabled.dual_src_blend, vk::FALSE);
+        assert!(!selected.component_alpha);
     }
 
     /// Real V3D 4.2 (v3dv) feature mask observed via `vulkaninfo` on an

@@ -15,16 +15,34 @@
 //! raw fd and close it before returning `Err`.
 
 use ash::vk;
-use std::os::fd::{IntoRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
 
 use super::device::VkContext;
 
 /// Import a `sync_file` fd as a fresh **binary** `VkSemaphore`.
 /// Phase 4.2.2 — backs DRI3 `FenceFromFD`.
 pub fn import_sync_file(vk: &VkContext, fd: OwnedFd) -> Result<vk::Semaphore, vk::Result> {
+    import_optional_sync_file(vk, Some(fd))
+}
+
+/// Import a `sync_file` payload, including Vulkan's `fd = -1`
+/// already-signalled sentinel, as a fresh temporary binary semaphore.
+///
+/// `VK_KHR_external_semaphore_fd` gives `-1` real synchronization semantics:
+/// importing it produces a signalled temporary payload.  It must therefore
+/// remain a semaphore wait in cross-device submissions rather than being
+/// optimized away merely because there is no userspace fd to poll.
+///
+/// On success Vulkan consumes only a real fd. On failure `fd` remains owned by
+/// this function and drops normally; the sentinel is never passed to
+/// `close(2)`.
+pub(crate) fn import_optional_sync_file(
+    vk: &VkContext,
+    fd: Option<OwnedFd>,
+) -> Result<vk::Semaphore, vk::Result> {
     let create_info = vk::SemaphoreCreateInfo::default();
     let semaphore = unsafe { vk.device.create_semaphore(&create_info, None)? };
-    let raw = fd.into_raw_fd();
+    let raw = optional_sync_file_raw(fd.as_ref().map(AsRawFd::as_raw_fd));
     let import_info = vk::ImportSemaphoreFdInfoKHR::default()
         .semaphore(semaphore)
         .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
@@ -33,18 +51,27 @@ pub fn import_sync_file(vk: &VkContext, fd: OwnedFd) -> Result<vk::Semaphore, vk
         .fd(raw);
     let result = unsafe { vk.external_semaphore_fd.import_semaphore_fd(&import_info) };
     match result {
-        Ok(()) => Ok(semaphore),
-        Err(e) => {
-            // SAFETY: vkImportSemaphoreFdKHR didn't consume the fd
-            // on failure — we still own it and must close to avoid
-            // a leak. Then destroy the freshly-created semaphore.
-            unsafe {
-                libc::close(raw);
-                vk.device.destroy_semaphore(semaphore, None);
+        Ok(()) => {
+            if let Some(fd) = fd {
+                // Vulkan consumed this real fd on success. Relinquish Rust's
+                // close-on-drop ownership without closing the transferred
+                // descriptor.
+                let _ = fd.into_raw_fd();
             }
+            Ok(semaphore)
+        }
+        Err(e) => {
+            // `fd` is still owned on failure and closes automatically when
+            // this function returns. `None` represented raw -1, so there is
+            // deliberately no descriptor to close.
+            unsafe { vk.device.destroy_semaphore(semaphore, None) };
             Err(e)
         }
     }
+}
+
+fn optional_sync_file_raw(fd: Option<RawFd>) -> RawFd {
+    fd.unwrap_or(-1)
 }
 
 /// Export a `VkSemaphore`'s current payload as a fresh `sync_file`
@@ -61,9 +88,12 @@ pub fn export_sync_file(vk: &VkContext, semaphore: vk::Semaphore) -> Result<Owne
 
 #[cfg(test)]
 mod tests {
-    // The import / export helpers all touch live Vulkan handles, so
-    // they're only exercised by the integration smoke under vng or
-    // bare metal (design §5.5 hardware coverage matrix). Wire-level
-    // unit-test coverage of the wrapping XSync resource types lives
-    // in process_request::tests::sync_create_trigger_query_fence_round_trip.
+    #[test]
+    fn optional_sync_file_preserves_vulkan_already_signalled_sentinel() {
+        assert_eq!(super::optional_sync_file_raw(None), -1);
+        assert_eq!(super::optional_sync_file_raw(Some(17)), 17);
+    }
+
+    // The Vulkan import / export calls themselves require live handles and
+    // remain covered by the integration smoke under vng or bare metal.
 }

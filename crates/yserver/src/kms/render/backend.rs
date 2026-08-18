@@ -1545,7 +1545,7 @@ impl KmsBackend {
                     .scanout_pools
                     .get(*output_idx)
                     .and_then(Option::as_ref)
-                    .is_some_and(crate::kms::vk::scanout::ScanoutBoPool::has_pending_pageflip)
+                    .is_some_and(|pool| pool.display_pool().has_pending_pageflip())
                     || self
                         .scanout_m2
                         .pending
@@ -1596,7 +1596,15 @@ impl KmsBackend {
         // pool state while the old output indices are still authoritative.
         self.platform.wait_idle_bounded();
         self.scene.drain_all(&mut self.platform);
-        self.platform.reset_scanout_bos_for_suspend();
+        if let Err(error) = self.platform.reset_scanout_bos_for_suspend() {
+            self.kms_outputs_active = false;
+            log::error!(
+                "kms: {context}: copied scanout devices could not be quiesced after all outputs \
+                 were disabled: {error}; preserving quarantine and exiting"
+            );
+            self.request_exit();
+            return Err(error);
+        }
         self.scanout_m1.clear(context);
         Ok(())
     }
@@ -3527,7 +3535,7 @@ impl KmsBackend {
                 ))
             })?;
             let n = pool.bos.len();
-            scanout_pools.push(Some(pool));
+            scanout_pools.push(Some(crate::kms::vk::scanout::OutputScanout::Shared(pool)));
             bo_generations.push(vec![
                 crate::kms::render::platform::BoGenerationEntry::default(
                 );
@@ -4173,7 +4181,7 @@ impl KmsBackend {
     /// caller can fall through to the empty-reply path. Uncovered / failed
     /// pieces are zero-filled. See [`assemble_root_scanout`] for why the plain
     /// GetImage path must split like `CopyArea` does.
-    fn read_root_scanout_assembled(&self, region: vk::Rect2D) -> Option<Vec<u8>> {
+    fn read_root_scanout_assembled(&mut self, region: vk::Rect2D) -> Option<Vec<u8>> {
         let outputs: Vec<(i32, i32, u32, u32)> = self
             .platform
             .outputs
@@ -8249,7 +8257,15 @@ impl KmsBackend {
         //     stale Pending BOs. Force every BO back to Free here so resume
         //     starts with a clean pool; the deferred full-damage repaint
         //     re-renders (content marked invalidated).
-        self.platform.reset_scanout_bos_for_suspend();
+        if let Err(error) = self.platform.reset_scanout_bos_for_suspend() {
+            self.kms_outputs_active = false;
+            log::error!(
+                "kms: VT suspend could not quiesce copied scanout devices after all outputs \
+                 were disabled: {error}; preserving quarantine and exiting"
+            );
+            self.request_exit();
+            return;
+        }
 
         // M1 framebuffers are diagnostic-only and never active, but their GEM
         // registrations belong to this DRM-master/topology epoch.
@@ -11896,6 +11912,7 @@ fn select_scanout_bo_for_rect(
         else {
             continue;
         };
+        let pool = pool.display_pool();
         for phase in phases {
             if let Some(bo_idx) = pool.bos.iter().position(|bo| bo.state.phase == *phase) {
                 let local = vk::Rect2D {
@@ -12044,11 +12061,11 @@ where
 }
 
 fn read_scanout_region(
-    backend: &KmsBackend,
+    backend: &mut KmsBackend,
     rect: vk::Rect2D,
     selection: ScanoutReadSelection,
 ) -> io::Result<Vec<u8>> {
-    use crate::kms::vk::ops::run_one_shot_op;
+    use crate::kms::vk::ops::run_one_shot_op_with_wait;
 
     if rect.extent.width == 0 || rect.extent.height == 0 {
         return Ok(Vec::new());
@@ -12062,21 +12079,6 @@ fn read_scanout_region(
     };
 
     let (pool_idx, bo_idx, local_rect) = select_scanout_bo_for_rect(backend, rect, selection)?;
-    let Some(pool) = backend
-        .platform
-        .scanout_pools
-        .get(pool_idx)
-        .and_then(|p| p.as_ref())
-    else {
-        return Err(io::Error::other("scanout pool vanished"));
-    };
-    let Some(bo) = pool.bos.get(bo_idx) else {
-        return Err(io::Error::other("scanout bo vanished"));
-    };
-    let image = bo.vk_image;
-    let staging_buffer = bo.vk_transfer.staging_buffer;
-    let staging_mapped = bo.vk_transfer.staging_mapped;
-    let staging_size = bo.vk_transfer.staging_size;
     let copy_width = local_rect.extent.width;
     let copy_height = local_rect.extent.height;
     let needed_bytes = usize::try_from(copy_width)
@@ -12088,11 +12090,109 @@ fn read_scanout_region(
         })
         .and_then(|px| px.checked_mul(4))
         .ok_or_else(|| io::Error::other("scanout copy size overflow"))?;
-    if needed_bytes > staging_size as usize {
-        return Err(io::Error::other("scanout staging buffer too small"));
-    }
+    let Some(pool) = backend
+        .platform
+        .scanout_pools
+        .get_mut(pool_idx)
+        .and_then(|p| p.as_mut())
+    else {
+        return Err(io::Error::other("scanout pool vanished"));
+    };
+    // KMS phase selection above is always against B's display pool, but the
+    // composited pixels live in A's paired source on a copied route. Readback
+    // must therefore use A's image/staging allocation with A's live Vk
+    // context; display, M2 retention, and pageflip retirement keep using B.
+    let (image, staging_buffer, staging_mapped, copied_route, foreign_acquire, wait_semaphore) =
+        match match pool {
+            crate::kms::vk::scanout::OutputScanout::Shared(pool) => {
+                let Some(bo) = pool.bos.get(bo_idx) else {
+                    return Err(io::Error::other("scanout bo vanished"));
+                };
+                if needed_bytes > bo.vk_transfer.staging_size as usize {
+                    return Err(io::Error::other("scanout staging buffer too small"));
+                }
+                Ok((
+                    bo.vk_image,
+                    bo.vk_transfer.staging_buffer,
+                    bo.vk_transfer.staging_mapped,
+                    false,
+                    false,
+                    None,
+                ))
+            }
+            crate::kms::vk::scanout::OutputScanout::Copied(pool) => {
+                let Some(source) = pool.sources.get_mut(bo_idx) else {
+                    return Err(io::Error::other("copied scanout source vanished"));
+                };
+                if needed_bytes > source.transfer.staging_size as usize {
+                    return Err(io::Error::other("scanout staging buffer too small"));
+                }
+                match source.prepare_renderer_readback() {
+                    Err(error) => {
+                        let requires_fail_stop = error.requires_fail_stop();
+                        Err((error.into_io_error(), requires_fail_stop))
+                    }
+                    Ok(foreign_acquire) => {
+                        let wait_semaphore = source.renderer_wait_semaphore();
+                        if foreign_acquire && wait_semaphore.is_none() {
+                            Err((
+                                io::Error::other(
+                                    "copied scanout readback prepared no renderer wait semaphore",
+                                ),
+                                true,
+                            ))
+                        } else {
+                            Ok((
+                                source.image(),
+                                source.transfer.staging_buffer,
+                                source.transfer.staging_mapped,
+                                true,
+                                foreign_acquire,
+                                wait_semaphore,
+                            ))
+                        }
+                    }
+                }
+            }
+        } {
+            Ok(prepared) => prepared,
+            Err((error, copied_prepare_failed)) => {
+                if copied_prepare_failed {
+                    // The only retained B -> A completion may have been consumed
+                    // by a failed import. The caller is allowed to ignore dump or
+                    // readback errors, so latch fatal here before returning.
+                    backend.platform.renderer_failed = true;
+                }
+                return Err(error);
+            }
+        };
 
-    let run_result = run_one_shot_op(&vk, pool_handle, |vk, cb| {
+    let run_result = run_one_shot_op_with_wait(&vk, pool_handle, wait_semaphore, |vk, cb| {
+        if foreign_acquire {
+            let acquire = [ash::vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(ash::vk::PipelineStageFlags2::ALL_COMMANDS)
+                .src_access_mask(ash::vk::AccessFlags2::MEMORY_WRITE)
+                .dst_stage_mask(ash::vk::PipelineStageFlags2::ALL_COMMANDS)
+                .dst_access_mask(ash::vk::AccessFlags2::MEMORY_READ)
+                .src_queue_family_index(ash::vk::QUEUE_FAMILY_FOREIGN_EXT)
+                .dst_queue_family_index(vk.graphics_queue_family)
+                .old_layout(ash::vk::ImageLayout::GENERAL)
+                .new_layout(ash::vk::ImageLayout::GENERAL)
+                .image(image)
+                .subresource_range(
+                    ash::vk::ImageSubresourceRange::default()
+                        .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                )];
+            crate::vk_count!(cmd_pipeline_barrier2);
+            unsafe {
+                vk.device.cmd_pipeline_barrier2(
+                    cb,
+                    &ash::vk::DependencyInfo::default().image_memory_barriers(&acquire),
+                );
+            }
+        }
         let pre = [ash::vk::ImageMemoryBarrier2::default()
             .src_stage_mask(ash::vk::PipelineStageFlags2::ALL_COMMANDS)
             .src_access_mask(ash::vk::AccessFlags2::MEMORY_WRITE)
@@ -12162,7 +12262,27 @@ fn read_scanout_region(
     });
 
     if let Err(e) = run_result {
+        if copied_route || e == ash::vk::Result::ERROR_DEVICE_LOST {
+            // The one-shot helper cannot distinguish a post-submit wait
+            // failure from earlier errors at this boundary. Fail closed: the
+            // copied source may have executed work (including an ownership
+            // acquire) and must not be reused or destroyed under an uncertain
+            // live submission. DEVICE_LOST is fatal on the shared path too.
+            backend.platform.renderer_failed = true;
+        }
         return Err(io::Error::other(format!("scanout copy submit: {e:?}")));
+    }
+
+    if foreign_acquire
+        && let Some(source) = backend
+            .platform
+            .scanout_pools
+            .get_mut(pool_idx)
+            .and_then(Option::as_mut)
+            .and_then(crate::kms::vk::scanout::OutputScanout::copied_mut)
+            .and_then(|pool| pool.sources.get_mut(bo_idx))
+    {
+        source.note_renderer_readback_succeeded();
     }
 
     let raw = unsafe { std::slice::from_raw_parts(staging_mapped.as_ptr(), needed_bytes) };
@@ -12178,15 +12298,18 @@ fn do_dump_scanout(backend: &mut KmsBackend) -> io::Result<()> {
     static DUMP_COUNT: AtomicU32 = AtomicU32::new(0);
     let run = DUMP_COUNT.fetch_add(1, Ordering::Relaxed);
 
-    for (pool_idx, layout) in backend.platform.outputs.iter().enumerate() {
+    let layouts: Vec<(i32, i32, u16, u16)> = backend
+        .platform
+        .outputs
+        .iter()
+        .map(|layout| (layout.x, layout.y, layout.width, layout.height))
+        .collect();
+    for (pool_idx, (x, y, width, height)) in layouts.into_iter().enumerate() {
         let rect = vk::Rect2D {
-            offset: vk::Offset2D {
-                x: layout.x,
-                y: layout.y,
-            },
+            offset: vk::Offset2D { x, y },
             extent: vk::Extent2D {
-                width: u32::from(layout.width),
-                height: u32::from(layout.height),
+                width: u32::from(width),
+                height: u32::from(height),
             },
         };
         let raw = match read_scanout_region(backend, rect, ScanoutReadSelection::PermissiveDump) {
@@ -12201,11 +12324,11 @@ fn do_dump_scanout(backend: &mut KmsBackend) -> io::Result<()> {
         let path = format!("./yserver-scanout-{run}-out{pool_idx}.ppm");
         use std::io::Write;
         let mut file = std::fs::File::create(&path)?;
-        file.write_all(format!("P6\n{} {}\n255\n", layout.width, layout.height).as_bytes())?;
-        let mut row_buf = vec![0u8; usize::from(layout.width) * 3];
-        for y in 0..usize::from(layout.height) {
-            let row_start = y * usize::from(layout.width) * 4;
-            for x in 0..usize::from(layout.width) {
+        file.write_all(format!("P6\n{width} {height}\n255\n").as_bytes())?;
+        let mut row_buf = vec![0u8; usize::from(width) * 3];
+        for y in 0..usize::from(height) {
+            let row_start = y * usize::from(width) * 4;
+            for x in 0..usize::from(width) {
                 let pi = row_start + x * 4;
                 let dst = x * 3;
                 row_buf[dst] = raw[pi + 2];
@@ -12216,8 +12339,8 @@ fn do_dump_scanout(backend: &mut KmsBackend) -> io::Result<()> {
         }
         log::info!(
             "render do_dump_scanout: wrote {path} ({}x{})",
-            layout.width,
-            layout.height
+            width,
+            height
         );
         wrote_any = true;
     }
@@ -13604,6 +13727,35 @@ impl Backend for KmsBackend {
         let xid_map = self.core.xid_map.clone();
         for ev in pending {
             let _dropped = pointer_event_fanout_to_state(state, self, &xid_map, ev, true, false);
+        }
+    }
+
+    fn on_scanout_render_completion(&mut self, _state: &mut ServerState) {
+        let completions = self.platform.drain_scanout_render_completions();
+        if !self.scanout_allowed() {
+            // Draining avoids a readable aggregator spinning the core loop.
+            // The suspend/topology lifecycle subsequently waits A, cancels
+            // the ledger, and drains both pool devices before any allocation
+            // can be reset or dropped.
+            log::debug!(
+                "render copied scanout: discarded {} completion(s) while scanout is inactive",
+                completions.len(),
+            );
+            return;
+        }
+        for completion in completions {
+            if self.platform.renderer_failed {
+                break;
+            }
+            if !self
+                .scene
+                .handle_scanout_render_completion(completion, &mut self.platform)
+            {
+                self.telemetry.record_missed_pageflip();
+            }
+            if self.platform.renderer_failed {
+                break;
+            }
         }
     }
 
@@ -21909,7 +22061,15 @@ impl Backend for KmsBackend {
             log::info!("kms: dpms sleep — scene.drain_all");
             self.scene.drain_all(&mut self.platform);
             log::info!("kms: dpms sleep — reset_scanout_bos_for_suspend");
-            self.platform.reset_scanout_bos_for_suspend();
+            if let Err(error) = self.platform.reset_scanout_bos_for_suspend() {
+                self.kms_outputs_active = false;
+                log::error!(
+                    "kms: DPMS off could not quiesce copied scanout devices after all outputs \
+                     were disabled: {error}; preserving quarantine and exiting"
+                );
+                self.request_exit();
+                return Err(error);
+            }
             self.kms_outputs_active = false;
             if let Some(error) = direct_shadow_error {
                 log::error!("scanout_m2: DPMS-off lazy fallback Copy failed: {error}; exiting");
@@ -22277,9 +22437,14 @@ mod tests {
     }
 
     fn test_render_device(id: RenderDeviceId, primary: Option<DrmDeviceKey>) -> RenderDevice {
+        let selector_seed = match id {
+            RenderDeviceId::DrmRender(render) => u8::try_from(render.minor).unwrap_or(1),
+            RenderDeviceId::UnverifiedFallback => u8::MAX,
+        };
         RenderDevice {
             id,
             physical_device: ash::vk::PhysicalDevice::default(),
+            selector: crate::kms::vk::device::VulkanDeviceSelector::for_tests(selector_seed),
             advertised_primary_node: primary,
             advertised_render_node: match id {
                 RenderDeviceId::DrmRender(render) => Some(render),
@@ -30938,6 +31103,7 @@ mod tests {
             .push(crate::kms::render::platform::RenderDevice {
                 id: crate::kms::render::platform::RenderDeviceId::UnverifiedFallback,
                 physical_device: ash::vk::PhysicalDevice::null(),
+                selector: crate::kms::vk::device::VulkanDeviceSelector::for_tests(0x40),
                 advertised_primary_node: None,
                 advertised_render_node: None,
                 render_node: None,
@@ -32236,7 +32402,7 @@ mod tests {
             },
         };
         let scanout = super::read_scanout_region(
-            &backend,
+            &mut backend,
             scan_rect,
             super::ScanoutReadSelection::OnScreenOnly,
         )
@@ -32340,13 +32506,13 @@ mod tests {
         backend.tick_maybe_composite_for_tests();
 
         let overlaid = super::read_scanout_region(
-            &backend,
+            &mut backend,
             overlay_rect,
             super::ScanoutReadSelection::OnScreenOnly,
         )
         .expect("scanout readback (overlay)");
         let control = super::read_scanout_region(
-            &backend,
+            &mut backend,
             control_rect,
             super::ScanoutReadSelection::OnScreenOnly,
         )
@@ -32461,7 +32627,7 @@ mod tests {
             .expect("dst get_image window region")
             .expect("dst window bytes");
         let scanout_win = super::read_scanout_region(
-            &backend,
+            &mut backend,
             ash::vk::Rect2D {
                 offset: ash::vk::Offset2D { x: 32, y: 24 },
                 extent: ash::vk::Extent2D {
@@ -32484,7 +32650,7 @@ mod tests {
             .expect("dst get_image bg region")
             .expect("dst bg bytes");
         let scanout_bg = super::read_scanout_region(
-            &backend,
+            &mut backend,
             ash::vk::Rect2D {
                 offset: ash::vk::Offset2D { x: 0, y: 0 },
                 extent: ash::vk::Extent2D {

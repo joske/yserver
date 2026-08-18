@@ -1034,6 +1034,9 @@ pub fn run_core(
                     BackendFdKind::PresentCompletion => {
                         drain_present_completions(state, backend);
                     }
+                    BackendFdKind::ScanoutRenderCompletion => {
+                        backend.on_scanout_render_completion(state);
+                    }
                 }
                 continue;
             }
@@ -3112,6 +3115,66 @@ mod tests {
         assert!(
             dispatched_fds.iter().all(|fd| *fd == drm_fd_b),
             "idle DRM fd {drm_fd_a} was dispatched: {dispatched_fds:?}",
+        );
+    }
+
+    #[test]
+    fn copied_scanout_completion_fd_dispatches_dedicated_hook() {
+        use crate::backend::{BackendFdKind, recording::RecordingBackend};
+        use std::{io::Write, os::fd::AsRawFd, sync::atomic::Ordering};
+
+        let (poll, sender, rx) = channel().unwrap();
+        let sender_for_core = sender.clone_handle();
+        let (completion_reader, mut completion_writer) = UnixStream::pair().unwrap();
+        let completion_fd = completion_reader.as_raw_fd();
+        let (unused_page_tx, _unused_page_rx) = crossbeam_channel::unbounded();
+        let (ready_tx, ready_rx) = crossbeam_channel::unbounded();
+        let mut backend = RecordingBackend::new()
+            .with_poll_sources(
+                vec![(completion_fd, BackendFdKind::ScanoutRenderCompletion)],
+                unused_page_tx,
+            )
+            .with_scanout_render_completion_notification(ready_tx);
+        let handle = std::thread::spawn(move || {
+            // `RecordingBackend` stores only the raw fd, so retain its owner
+            // until `run_core` has unregistered every backend source.
+            let _completion_reader = completion_reader;
+            let mut state = ServerState::new();
+            let alloc = ClientIdAllocator::new();
+            let result = run_core(
+                poll,
+                rx,
+                sender_for_core,
+                &mut state,
+                &mut backend,
+                None,
+                &alloc,
+                AuthState::new(None),
+            );
+            (result, backend)
+        });
+
+        completion_writer.write_all(&[1]).unwrap();
+        ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        sender.send(Message::Shutdown).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(handle.is_finished(), "run_core did not return");
+        let (result, backend) = handle.join().unwrap();
+        result.unwrap();
+        assert!(
+            backend
+                .scanout_render_completion_count
+                .load(Ordering::Relaxed)
+                >= 1,
+            "readiness must dispatch the copied-scanout completion hook"
+        );
+        assert_eq!(
+            backend.page_flip_count.load(Ordering::Relaxed),
+            0,
+            "copied-scanout readiness must not be misrouted as a DRM page flip"
         );
     }
 

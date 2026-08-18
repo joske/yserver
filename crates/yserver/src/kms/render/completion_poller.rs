@@ -1,4 +1,4 @@
-//! Cross-platform readiness set for deferred PRESENT-completion FDs.
+//! Cross-platform readiness set for backend-owned completion FDs.
 //!
 //! Wraps the OS-native pollable object — `epoll` on Linux, `kqueue` on
 //! FreeBSD — behind one uniform API so the rest of v2 (`platform`,
@@ -35,7 +35,7 @@ const ZERO_TIMEOUT: libc::timespec = libc::timespec {
 };
 
 /// OS-native readiness set (epoll on Linux, kqueue on FreeBSD) for
-/// deferred PRESENT-completion FDs. See module docs.
+/// deferred PRESENT and copied-scanout completion FDs. See module docs.
 pub(crate) struct CompletionPoller {
     #[cfg(target_os = "linux")]
     inner: Epoll,

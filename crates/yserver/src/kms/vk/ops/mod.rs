@@ -96,6 +96,22 @@ pub fn run_one_shot_op<F>(
 where
     F: FnOnce(&VkContext, vk::CommandBuffer) -> Result<(), vk::Result>,
 {
+    run_one_shot_op_with_wait(vk, pool, None, record)
+}
+
+/// [`run_one_shot_op`] with one optional binary semaphore wait. The caller
+/// retains semaphore ownership through return: success proves the wait was
+/// consumed, while any post-submit error requires the caller to quarantine
+/// both the command resources and semaphore with the failed renderer.
+pub(crate) fn run_one_shot_op_with_wait<F>(
+    vk: &VkContext,
+    pool: vk::CommandPool,
+    wait_semaphore: Option<vk::Semaphore>,
+    record: F,
+) -> Result<(), vk::Result>
+where
+    F: FnOnce(&VkContext, vk::CommandBuffer) -> Result<(), vk::Result>,
+{
     let alloc_info = vk::CommandBufferAllocateInfo::default()
         .command_pool(pool)
         .level(vk::CommandBufferLevel::PRIMARY)
@@ -157,7 +173,16 @@ where
         // Path 1b — submit failure. Destroy the fence; the CB is
         // still safe to free (cb_safe_to_free stays true).
         let cb_info = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
-        let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cb_info)];
+        let waits = wait_semaphore.map(|semaphore| {
+            [vk::SemaphoreSubmitInfo::default()
+                .semaphore(semaphore)
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)]
+        });
+        let mut submit = vk::SubmitInfo2::default().command_buffer_infos(&cb_info);
+        if let Some(waits) = waits.as_ref() {
+            submit = submit.wait_semaphore_infos(waits);
+        }
+        let submit = [submit];
         crate::vk_count!(queue_submit2);
         crate::vk_count!(submit_one_shot);
         if let Err(e) = unsafe { vk.device.queue_submit2(vk.graphics_queue, &submit, fence) } {
