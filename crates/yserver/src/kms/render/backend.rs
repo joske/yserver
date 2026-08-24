@@ -37395,15 +37395,15 @@ mod tests {
         let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
         b.get_overlay_window(None).expect("materialize COW");
         let cow_id = b.cow_id.expect("COW id");
-        let wrong_fallback = seed_window(&mut b, 0x5a10, None, 0, 0);
+        let redirected_fallback = seed_window(&mut b, 0x5a10, None, 0, 0);
         let (source_id, _, source_pin, fallback_pin) =
-            install_direct_frame_for_target_test(&mut b, target_xid, wrong_fallback, true);
+            install_direct_frame_for_target_test(&mut b, target_xid, redirected_fallback, true);
 
         let error = b
             .release_overlay_window(None)
-            .expect_err("non-COW fallback cannot be materialized as the direct shadow");
+            .expect_err("test backend has no Vulkan engine for fallback materialization");
 
-        assert!(error.to_string().contains("not COW"));
+        assert!(error.to_string().contains("NoVk"), "{error}");
         assert_eq!(b.core.cow_refcount, 1);
         assert!(!b.deferred_cow_release);
         assert_eq!(b.cow_id, Some(cow_id));
@@ -37414,7 +37414,7 @@ mod tests {
         assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
         assert_eq!(
             b.present_source_pins.get(&fallback_pin),
-            Some(&wrong_fallback)
+            Some(&redirected_fallback)
         );
     }
 
@@ -37564,17 +37564,17 @@ mod tests {
         let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
         b.get_overlay_window(None).expect("materialize COW");
         let old_cow_id = b.cow_id.expect("old COW id");
-        let wrong_fallback = seed_window(&mut b, 0x5f10, None, 0, 0);
+        let redirected_fallback = seed_window(&mut b, 0x5f10, None, 0, 0);
         let (source_id, _, source_pin, fallback_pin) =
-            install_direct_frame_for_target_test(&mut b, target_xid, wrong_fallback, true);
+            install_direct_frame_for_target_test(&mut b, target_xid, redirected_fallback, true);
         let old_size = (b.platform.fb_w, b.platform.fb_h);
         let old_root_id = b.store.lookup(b.core.window_id);
 
         let error = b
             .set_logical_screen_size(old_size.0.saturating_add(1), old_size.1.saturating_add(1))
-            .expect_err("invalid direct fallback must abort before resize mutation");
+            .expect_err("materialization failure must abort before resize mutation");
 
-        assert!(error.to_string().contains("not COW"));
+        assert!(error.to_string().contains("NoVk"), "{error}");
         assert_eq!((b.platform.fb_w, b.platform.fb_h), old_size);
         assert_eq!(b.store.lookup(b.core.window_id), old_root_id);
         assert_eq!(b.cow_id, Some(old_cow_id));
@@ -37589,7 +37589,7 @@ mod tests {
         assert_eq!(b.present_source_pins.get(&source_pin), Some(&source_id));
         assert_eq!(
             b.present_source_pins.get(&fallback_pin),
-            Some(&wrong_fallback)
+            Some(&redirected_fallback)
         );
     }
 
