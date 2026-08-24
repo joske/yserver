@@ -1783,9 +1783,10 @@ impl KmsBackend {
         }
     }
 
-    /// M2b lazy fallback: steady direct Presents skip their source-to-COW
+    /// M2b lazy fallback: steady direct Presents skip their source-to-backing
     /// Copy. Before a non-Present-triggered unflip, materialize the currently
-    /// scanned root source into its redirected COW backing exactly once.
+    /// scanned root source into the exact redirected paint target captured and
+    /// pinned when that direct frame was submitted.
     fn materialize_direct_shadow_for_unflip(&mut self) -> io::Result<()> {
         if self.scanout_m2.unflip_shadow_ready {
             return Ok(());
@@ -1799,13 +1800,13 @@ impl KmsBackend {
         let source_id = current.source_id;
         let candidate = current.candidate;
         let target = current.fallback_target;
-        if Some(target.id) != self.cow_id {
-            return Err(io::Error::other(format!(
-                "scanout M2: direct fallback target {} is not COW {:?}",
-                target.id.as_u64(),
-                self.cow_id.map(DrawableId::as_u64)
-            )));
-        }
+        // `CowDescendant` describes scene participation, not identity with
+        // the Composite Overlay Window. In particular, Cinnamon can Present
+        // a root descendant whose nearest redirected ancestor has its own
+        // backing while the COW is a different drawable. `fallback_target`
+        // is the paint-routing result for this Present and its pin keeps that
+        // exact storage alive across an asynchronous unflip; comparing it to
+        // the current `cow_id` rejects a valid and common startup state.
         self.engine
             .cow_copy_area(
                 &mut self.store,
@@ -1852,8 +1853,9 @@ impl KmsBackend {
             .map_err(|error| io::Error::other(format!("scanout M2 lazy COW submit: {error:?}")))?;
         self.scanout_m2.unflip_shadow_ready = true;
         log::info!(
-            "scanout_m2: lazily materialized direct source_id={} into COW for unflip",
-            source_id.as_u64()
+            "scanout_m2: lazily materialized direct source_id={} into fallback_target={} for unflip",
+            source_id.as_u64(),
+            target.id.as_u64()
         );
         Ok(())
     }

@@ -578,6 +578,12 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ## Where we are
 
+- **2026-08-24 direct-scanout fallback-target fix:** a `CowDescendant` root
+  Present's pinned redirected paint target need not be the Composite Overlay
+  Window itself. Lazy fallback now copies into that exact pinned paint target
+  instead of aborting the server when its drawable ID differs from the current
+  overlay-window ID. This fixes the Cinnamon startup failure exposed by the
+  PRIME branch.
 - **2026-08-13 Present 1.4 release fences now publish submitted GPU work:**
   synced Copy presents immediately import the still-pending Vulkan completion
   `sync_file` into the client's release timeline instead of host-signalling
