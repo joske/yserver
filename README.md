@@ -147,11 +147,11 @@ https://github.com/user-attachments/assets/dc266c55-e9ee-4649-a0c4-be3db2526713
 - bspwm/sxhkd
 - i3/fastcompmgr
 - enlightenment e16 + e27
+- leftwm
 
 ## Hardware tested
 
-- **AMD** — Ryzen 9 6900HX (Rembrandt, RDNA2, RADV); i9 13900k + RX580
-  (Polaris/GCN4, RADV).
+- **AMD** — Ryzen 9 6900HX (Rembrandt, RDNA2, RADV); i9 13900k + RX580 (Polaris/GCN4, RADV); AMD Ryzen AI 9 HX 370 w/ Radeon 890M.
 - **Intel** — i5-7200U (Kaby Lake, ANV) iGPU.
 - **NVIDIA** — i5 6500 with GTX 1050 (proprietary driver).
 - **Snapdragon X1** X1E80100 (Adreno X1, Turnip).
