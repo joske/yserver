@@ -8586,6 +8586,31 @@ impl KmsBackend {
             log::debug!("render composite_and_flip: skipped (seat not Active)");
             return Ok(());
         }
+        // Flush buffered paint before composing, exactly as
+        // `maybe_composite` does — `scene.tick` must observe every paint CB
+        // already submitted to the queue. `init_root_storage` fills the root
+        // with `bg_pixel` through the batched engine, so without this the
+        // first compose samples root storage *before* that fill executes and
+        // flips pre-fill content (a black frame instead of the root
+        // background). Worse, that compose also peeks and acks the root's
+        // presentation damage, so nothing reports the difference afterwards —
+        // only the unconditional full redraw of the following frames hides it.
+        // Found by the damage-completeness audit; see
+        // docs/superpowers/findings/2026-09-01-damage-completeness-audit.md.
+        if let Err(e) = self.engine.close_open_frame(
+            &mut self.store,
+            &mut self.platform,
+            crate::kms::render::frame_builder::CloseReason::LegacyScCompose,
+        ) {
+            log::warn!("render composite_and_flip: close_open_frame failed: {e:?}");
+        }
+        if let Err(e) = self.engine.flush_submit_group(
+            &mut self.store,
+            &mut self.platform,
+            crate::kms::render::submit_group::FlushReason::SceneCompose,
+        ) {
+            log::warn!("render composite_and_flip: flush_submit_group failed: {e:?}");
+        }
         let cow_host_xid = self.cow_host_xid();
         match self.scene.tick(
             &self.core,
