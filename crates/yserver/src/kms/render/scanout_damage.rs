@@ -245,6 +245,16 @@ impl ScanoutDamage {
         }
     }
 
+    /// True if unattributed damage is waiting to be painted — after
+    /// [`Self::invalidate`], after [`Self::retire_failure`], or when a tick added
+    /// damage and then could not submit. The tick's empty-damage skip and the
+    /// backend's compose-wanted predicate both consult this; neither can see it
+    /// through the producers, so without it an invalidated output stays stale
+    /// until something unrelated damages it.
+    pub(crate) fn owes_repaint(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
     pub(crate) fn has_staged_frame(&self) -> bool {
         self.in_flight.is_some()
     }
@@ -268,6 +278,36 @@ impl ScanoutDamage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `invalidate` and a failed retirement leave work owed that no producer
+    /// reports; a fresh model and a committed frame owe nothing.
+    #[test]
+    fn owes_repaint_follows_pending() {
+        let extent = vk::Extent2D {
+            width: 100,
+            height: 50,
+        };
+        let full = vk::Rect2D {
+            offset: vk::Offset2D::default(),
+            extent,
+        };
+        let mut d = ScanoutDamage::new(2, extent);
+        assert!(
+            !d.owes_repaint(),
+            "fresh: missing is full but nothing is pending"
+        );
+        d.invalidate();
+        assert!(d.owes_repaint(), "invalidated: the whole output is owed");
+        let repaint = d.repaint_for(0, false);
+        d.commit_submitted(0, &repaint, &Region::from_rect(full));
+        assert!(!d.owes_repaint(), "staged: pending moved in flight");
+        d.retire_failure();
+        assert!(d.owes_repaint(), "never reached the screen: owed again");
+        let repaint = d.repaint_for(0, false);
+        d.commit_submitted(0, &repaint, &Region::from_rect(full));
+        d.retire_success();
+        assert!(!d.owes_repaint());
+    }
     use std::collections::BTreeSet;
 
     const W: u32 = 16;

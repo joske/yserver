@@ -161,3 +161,12 @@ with real union / subtract / intersect, because today's `RegionSet` subtracts by
 exact rect match and cannot express the per-BO bookkeeping. It is required under
 every outcome above, it is testable against a brute-force oracle with no
 hardware, and it risks nothing if the sizing comes back small.
+
+---
+
+**Raw captures are not tracked** (2026-09-04): the `amdgpu_top --json` files
+named above were committed in `02bafec3` and are recoverable from that commit,
+but `docs/superpowers/findings/data/*.json` is now gitignored — a finding quotes
+the numbers, the dump stays on the box that produced it. They cannot be taken
+out of history: rewriting master would break every fork and contributor branch
+built on it.

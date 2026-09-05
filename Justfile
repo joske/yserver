@@ -311,6 +311,7 @@ yserver-mate-hw log="warn,yserver::kms::render::scene=info" seed="1":
     cargo build --release --bin yserver
     bash -c '\
         YSERVER_DAMAGE_AUDIT=1 YSERVER_DAMAGE_AUDIT_SEED_FRAME="{{seed}}" \
+        YSERVER_TICK_SKIP_LOG=1 \
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-mate.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
@@ -480,6 +481,7 @@ yserver-xfce-hw-telemetry log="info":
     rm -f yserver-xfce.submit.tsv
     bash -c '\
         YSERVER_LOOP_TELEMETRY=1 YSERVER_SUBMIT_TRACE=yserver-xfce.submit.tsv \
+            YSERVER_TICK_SKIP_LOG=1 \
             RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
             target/release/yserver > yserver-hw-xfce.log 2>&1 &\
         yserver_pid=$!;\

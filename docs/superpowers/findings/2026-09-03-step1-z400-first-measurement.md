@@ -326,3 +326,12 @@ measured before it is argued:
 
 Everything else in his log is quiet: no warnings under `-C debug-assertions`,
 `content_damage_off_output = 0`, the cap never collapsed (6-7 nodes per walk).
+
+---
+
+**Raw captures are not tracked** (2026-09-04): the `amdgpu_top --json` files
+named above were committed in `02bafec3` and are recoverable from that commit,
+but `docs/superpowers/findings/data/*.json` is now gitignored — a finding quotes
+the numbers, the dump stays on the box that produced it. They cannot be taken
+out of history: rewriting master would break every fork and contributor branch
+built on it.

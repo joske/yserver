@@ -545,6 +545,17 @@ struct OutputSceneState {
     /// over-damages, which is safe. A fresh state starts empty, which damages
     /// every participant present, i.e. the whole output.
     prev_presented: Vec<ScenePresence>,
+    /// Sampled sources that emitted at least one piece on this output in its
+    /// most recent walk (`SceneBuild::pieces_ids`). Read by the pre-walk
+    /// predicate ([`walk_needed`] / [`pending_presentation_for_output`]) to
+    /// decide whether an armed drawable's damage can possibly land here.
+    ///
+    /// Exact between structural changes: visibility on an output changes only
+    /// through a structural change, and every one sets `scene_structure_dirty`,
+    /// which forces the walk before this set is consulted again. A fresh state
+    /// (startup, `rebuild_outputs`) starts empty, and a drawable in NO output's
+    /// set is treated as unknown ⇒ every output walks — conservative.
+    last_pieces: std::collections::HashSet<super::store::DrawableId>,
 }
 
 struct OutputDamageAudit {
@@ -856,6 +867,10 @@ enum TickSkipReason {
     NoBO,
     /// `pool_ring.acquire` returned None — descriptor-pool ring exhausted.
     NoPool,
+    /// Nothing that could produce damage has changed since the last walk:
+    /// no structural change, no armed presentation damage, no owed repaint,
+    /// no audit. The tick returns BEFORE `build_scene` — see [`walk_needed`].
+    NothingPending,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -872,17 +887,18 @@ impl TickOutcome {
         )
     }
 
-    /// True iff `build_scene` ran for this output (so its sampled ids
-    /// were recorded). The `PendingAcks`/`RetryDeadline` skips return
-    /// BEFORE the walk; everything else runs it. `tick` only reconciles
-    /// `offscreen_no_draw` when EVERY output walked — otherwise a
-    /// window visible only on a not-yet-walked (mid-flip) output would
-    /// be mis-flagged off-screen (cut 2b).
+    /// True iff `build_scene` ran for this output (so its presented and
+    /// pieces ids were recorded and its `last_pieces` refreshed). The
+    /// `PendingAcks`/`RetryDeadline`/`NothingPending` skips return BEFORE
+    /// the walk; everything else runs it. `tick` reconciles dormancy on any
+    /// tick where some output walked; the outputs that did not walk speak
+    /// through their retained `last_pieces` — see `dormancy_inputs`.
     fn walked(self) -> bool {
         !matches!(
             self,
             Self::Skipped(TickSkipReason::PendingAcks)
                 | Self::Skipped(TickSkipReason::RetryDeadline)
+                | Self::Skipped(TickSkipReason::NothingPending)
         )
     }
 }
@@ -999,6 +1015,7 @@ struct WalkStats {
     content_visible: u64,
     content_hidden: u64,
     content_off_output: u64,
+    content_other_output: u64,
 }
 
 /// Where a node's captured content damage landed on this output.
@@ -1025,21 +1042,40 @@ struct WalkStats {
 /// composed, and is acked at retire like any other. On a two-output layout a
 /// window hidden on A and visible on B is composed and acked by B —
 /// `ack_presentation_damage` clears the drawable globally, so *not* acking from
-/// the hidden side is exactly what keeps B correct. And when this output does
-/// compose for another reason, hidden snapshots still ride `built.snapshots`
-/// into the `PendingAck` and ack at retire, as before.
+/// the hidden side is exactly what keeps B correct. Hidden snapshots therefore
+/// do NOT ride `built.snapshots` either (2026-09-04): a compose this output
+/// makes for another reason must not carry — and at retire ack — damage it did
+/// not present. The same holds for `OtherOutput`.
 ///
-/// The one cost: every paint into a hidden window still wakes the tick and
-/// walks the tree before discovering there is nothing to compose. That is the
-/// wake-rate item (walks per compose), out of this stage's scope.
+/// **Hidden damage must also stop arming the scheduler.** A drawable whose
+/// damage classified `Hidden` on every walked output is left out of the
+/// `presented_ids` the tick feeds to `reconcile_offscreen_no_draw`, so it goes
+/// dormant and `has_pending_presentation_damage` ignores it. Without that the
+/// tick woke on its own pending damage, walked, found nothing to compose and
+/// woke again: ~1850 walks/s at 2 composes/s with mpv under a terminal
+/// (silence/MATE, 2026-09-04). The dormancy has two reasons with different
+/// re-arm rules (`store::DormantReason`): a node that emitted NO pieces stays
+/// dormant until a structural change wakes the tick, while a partially covered
+/// node whose damage happened to be hidden is re-armed by its next paint,
+/// which may land in its visible part — one walk per paint, not one per
+/// wake. See [`WalkSink::presented_ids`] and [`WalkSink::pieces_ids`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ContentDamage {
     /// Some of the projection intersects the node's visible pieces.
     Visible,
     /// The projection lands on the output but entirely under a cover.
     Hidden,
-    /// The projection misses the output entirely.
+    /// The projection misses the output entirely AND the drawable has no
+    /// visible pieces on any other output either: a stranded paint (the xfce
+    /// submenu) that this output must force-compose and ack so it drains.
     OffOutput,
+    /// The projection misses this output, but the drawable is visible on
+    /// another output, which presents and acks it. Neither forced nor carried
+    /// here — carrying it would let THIS output's retire ack damage the owning
+    /// output has not composed yet (the multi-output ack race, silence/MATE
+    /// 2026-09-04: a hover highlight on a two-monitor caja desktop lost on the
+    /// monitor it was painted on).
+    OtherOutput,
 }
 
 impl WalkStats {
@@ -1065,7 +1101,14 @@ impl WalkStats {
 /// children bottom → top). One presence, one sampled id and at most one
 /// snapshot per node, pushed at the node's own step, so the four lists reverse
 /// consistently.
-struct WalkSink {
+struct WalkSink<'a> {
+    /// Which output this walk is for — only for the gated diagnostics.
+    output_idx: usize,
+    /// Sampled sources that emitted pieces on some OTHER output at its last
+    /// walk (the union of the other outputs' retained `last_pieces`). Decides
+    /// `ContentDamage::OtherOutput` vs `OffOutput`. Empty when unknown (single
+    /// output, first frame, tests), which degrades to the old force-and-ack.
+    elsewhere: &'a std::collections::HashSet<super::store::DrawableId>,
     draws: Vec<CompositeDraw>,
     snapshots: Vec<DamageSnapshot>,
     sampled_ids: Vec<super::store::DrawableId>,
@@ -1076,11 +1119,35 @@ struct WalkSink {
     /// its content damage. A scratch buffer on the sink, cleared per node, so
     /// the hot path allocates once per walk rather than once per node.
     pieces: Vec<vk::Rect2D>,
+    /// The sampled sources whose pending content damage this output PRESENTED
+    /// (projected `Visible`, or off-output — which forces a compose that acks
+    /// it — or carrying no damage at all). This, not `sampled_ids`, is what
+    /// `reconcile_offscreen_no_draw` must be fed: a node whose damage
+    /// classified `Hidden` was sampled but nothing of its paint reached the
+    /// screen, and counting it as drawn kept `has_pending_presentation_damage`
+    /// true forever — the tick woke, walked, found nothing to compose, and woke
+    /// again, ~1850 walks/s at 2 composes/s with mpv under a terminal on
+    /// silence/MATE (codex, post-merge review of `02bafec3`, finding 1). Left
+    /// out of this set on every output, the drawable goes dormant
+    /// (`store::DormantReason`) and stops arming the scheduler; its damage is
+    /// preserved, and either its next paint (`HiddenDamage`) or the mover's
+    /// structural change (`NoPieces`) brings it back.
+    presented_ids: Vec<super::store::DrawableId>,
+    /// The sampled sources that emitted at least one piece on this output.
+    /// With `presented_ids` this decides the dormancy REASON: not presented
+    /// and no pieces anywhere ⇒ `DormantReason::NoPieces`; not presented but
+    /// pieces ⇒ `HiddenDamage`, which the next paint re-arms.
+    pieces_ids: Vec<super::store::DrawableId>,
 }
 
-impl WalkSink {
-    fn new() -> Self {
+impl<'a> WalkSink<'a> {
+    fn new(
+        output_idx: usize,
+        elsewhere: &'a std::collections::HashSet<super::store::DrawableId>,
+    ) -> Self {
         Self {
+            output_idx,
+            elsewhere,
             draws: Vec::new(),
             snapshots: Vec::new(),
             sampled_ids: Vec::new(),
@@ -1088,6 +1155,8 @@ impl WalkSink {
             participants: Vec::new(),
             stats: WalkStats::default(),
             pieces: Vec::new(),
+            presented_ids: Vec::new(),
+            pieces_ids: Vec::new(),
         }
     }
 
@@ -1097,6 +1166,8 @@ impl WalkSink {
         self.snapshots.reverse();
         self.sampled_ids.reverse();
         self.participants.reverse();
+        self.presented_ids.reverse();
+        self.pieces_ids.reverse();
     }
 }
 
@@ -1128,6 +1199,10 @@ struct SceneBuild {
     participants: Vec<ScenePresence>,
     /// Step 1 — what the walk did, for telemetry.
     stats: WalkStats,
+    /// See [`WalkSink::presented_ids`]. Feeds the tick's `drawn` set.
+    presented_ids: Vec<super::store::DrawableId>,
+    /// See [`WalkSink::pieces_ids`]. Feeds the tick's `had_pieces` set.
+    pieces_ids: Vec<super::store::DrawableId>,
 }
 
 impl SceneBuild {
@@ -1135,6 +1210,9 @@ impl SceneBuild {
         if let Some((draw_index, sampled_index)) = self.software_cursor_tail.take() {
             debug_assert_eq!(self.scene.draws.len(), draw_index + 1);
             debug_assert_eq!(self.sampled_ids.len(), sampled_index + 1);
+            let cursor_id = self.sampled_ids[sampled_index];
+            self.presented_ids.retain(|id| *id != cursor_id);
+            self.pieces_ids.retain(|id| *id != cursor_id);
             self.scene.draws.truncate(draw_index);
             self.sampled_ids.truncate(sampled_index);
         }
@@ -1266,6 +1344,7 @@ impl SceneCompositor {
             // also how a pool that changed length or identity gets a correctly
             // shaped `missing` vector — see the plan's 3.4.
             prev_presented: Vec::new(),
+            last_pieces: std::collections::HashSet::new(),
             damage: ScanoutDamage::new(
                 bo_depth,
                 vk::Extent2D {
@@ -1505,9 +1584,25 @@ impl SceneCompositor {
         value: u32,
         rects: &[ash::vk::Rect2D],
     ) {
-        if self.root_overlay.toggle(client, value, rects) {
+        let outcome = self.root_overlay.toggle(client, value, rects);
+        if outcome.changed {
             let mut dmg = rects.to_vec();
             dmg.extend(self.root_overlay.all_rects());
+            // An erase that does not exactly match what was drawn inserts a
+            // second copy instead of removing the first; the two XOR to
+            // identity, so every fresh compose looks right while pixels
+            // inverted earlier stay stale — the same symptom as damage that
+            // never composed. `removed`/`inserted` separate the two.
+            if tick_skip_log_enabled() {
+                log::info!(
+                    "overlay-diag: value={value:#x} batch={} removed={} inserted={} total={} damaged={}",
+                    rects.len(),
+                    outcome.removed,
+                    outcome.inserted,
+                    outcome.total,
+                    dmg.len(),
+                );
+            }
             self.mark_scene_structure_damage_rects(&dmg);
             self.wake_for_damage();
         }
@@ -1560,6 +1655,16 @@ impl SceneCompositor {
                 && o.next_submit_retry_at
                     .is_none_or(|deadline| now >= deadline)
         })
+    }
+
+    /// True if any output's per-BO damage model owes a repaint that no producer
+    /// is reporting — after an `invalidate`, or a submitted frame that never
+    /// reached the screen. The backend's compose-wanted predicate must include
+    /// this, or an invalidated output waits for unrelated damage to be repaired.
+    pub(crate) fn owes_repaint(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|inner| inner.outputs.iter().any(|o| o.damage.owes_repaint()))
     }
 
     /// True while any output has an atomic pageflip awaiting retirement.
@@ -1832,7 +1937,6 @@ impl SceneCompositor {
             platform.outputs.len(),
             "scene/platform output vectors must stay in lockstep",
         );
-        let n_outputs = inner.outputs.len();
         let mut composed = Vec::new();
         let mut clear_dirty = true;
         // Idle free-run fix (cut 2b): union of sampled sources drawn
@@ -1841,11 +1945,52 @@ impl SceneCompositor {
         // walked — see `TickOutcome::walked`.
         let mut drawn: std::collections::HashSet<super::store::DrawableId> =
             std::collections::HashSet::new();
-        let mut all_walked = true;
+        let mut had_pieces: std::collections::HashSet<super::store::DrawableId> =
+            std::collections::HashSet::new();
+        // Which outputs ran `build_scene` this tick. Dormancy is reconciled on
+        // any tick where at least one did; outputs that did not walk
+        // contribute their retained `last_pieces` instead (see
+        // `dormancy_inputs`). Requiring EVERY output to walk (the old rule)
+        // meant that with two outputs and one of them skipping as
+        // `NothingPending`, reconciliation never ran at all and nothing ever
+        // went dormant — the root's covered damage was re-peeked and
+        // re-classified Hidden ~1000×/s (silence/MATE, 2026-09-04).
+        let mut walked_outputs: Vec<bool> = vec![false; inner.outputs.len()];
         if damage_audit_enabled() {
             emit_damage_audit_heartbeat(inner);
         }
-        for output_idx in 0..n_outputs {
+        // Inputs of the pre-walk predicate that are global to the tick, read
+        // once: the structure flag, and whether any armed drawable has
+        // presentation damage waiting (an O(drawables) scan with an early exit
+        // — far cheaper than one walk, let alone one per output).
+        let structure_dirty = *scene_structure_dirty;
+        // Per output: can an armed, damaged drawable land here? Decided from
+        // each output's retained `last_pieces` — see
+        // `pending_presentation_for_output`. Computed for every output up
+        // front because the loop below borrows `inner` mutably.
+        let pending_presentation_per_output: Vec<bool> = {
+            let armed = store.armed_damaged_ids();
+            let all: Vec<&std::collections::HashSet<super::store::DrawableId>> =
+                inner.outputs.iter().map(|o| &o.last_pieces).collect();
+            inner
+                .outputs
+                .iter()
+                .map(|o| pending_presentation_for_output(&armed, &o.last_pieces, &all))
+                .collect()
+        };
+        for (output_idx, &pending_presentation) in
+            pending_presentation_per_output.iter().enumerate()
+        {
+            // The union of the OTHER outputs' retained pieces, read now rather
+            // than before the loop so an output walked earlier in this same
+            // iteration contributes its fresh set.
+            let elsewhere: std::collections::HashSet<super::store::DrawableId> = inner
+                .outputs
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != output_idx)
+                .flat_map(|(_, o)| o.last_pieces.iter().copied())
+                .collect();
             match tick_one_output(
                 inner,
                 output_idx,
@@ -1857,7 +2002,11 @@ impl SceneCompositor {
                 true,
                 cow_host_xid,
                 root_overlay,
+                &elsewhere,
                 &mut drawn,
+                &mut had_pieces,
+                structure_dirty,
+                pending_presentation,
             ) {
                 Ok(outcome) => {
                     if outcome == TickOutcome::Composed {
@@ -1865,19 +2014,47 @@ impl SceneCompositor {
                     } else {
                         clear_dirty &= outcome.clears_scene_structure_dirty();
                     }
-                    all_walked &= outcome.walked();
+                    walked_outputs[output_idx] = outcome.walked();
                 }
                 Err(e) => {
                     clear_dirty = false;
-                    all_walked = false;
                     log::warn!(
                         "render scene tick: output {output_idx} compose failed: {e}; continuing",
                     );
                 }
             }
         }
-        if all_walked {
-            store.reconcile_offscreen_no_draw(&drawn);
+        if walked_outputs.iter().any(|w| *w) {
+            let none = std::collections::HashSet::new();
+            let reports: Vec<OutputWalkReport<'_>> = inner
+                .outputs
+                .iter()
+                .zip(&walked_outputs)
+                .map(|(o, &walked)| OutputWalkReport {
+                    walked,
+                    // `drawn` is the union over the walked outputs; for the
+                    // union `dormancy_inputs` takes, attributing it to each
+                    // walked output is equivalent.
+                    presented: if walked { &drawn } else { &none },
+                    last_pieces: &o.last_pieces,
+                })
+                .collect();
+            let (keep_armed, pieces_anywhere) = dormancy_inputs(&reports);
+            debug_assert!(
+                had_pieces.iter().all(|id| pieces_anywhere.contains(id)),
+                "a walked output's pieces are its retained last_pieces"
+            );
+            let changed = store.reconcile_offscreen_no_draw(&keep_armed, &pieces_anywhere);
+            // A window whose damage is pending while it is wrongly dormant is
+            // stranded: `NoPieces` never re-arms on paint, so its content only
+            // heals where something else composes. Log every transition behind
+            // the tick-skip gate so a hardware log can name the drawable
+            // instead of leaving the verdict to inference.
+            if tick_skip_log_enabled() {
+                for (id, reason) in changed {
+                    log::info!("dormant-diag: drawable={id:?} reason={reason:?}");
+                }
+            }
         }
         if clear_dirty {
             *scene_structure_dirty = false;
@@ -1952,6 +2129,14 @@ impl SceneCompositor {
             // from paint that landed after the tick's peek
             // survive (per I5 epoch semantics).
             for snap in ack.drawable_snapshots {
+                if tick_skip_log_enabled() {
+                    log::info!(
+                        "ack-diag: out{output_idx} acked drawable={:?} epoch={} rects={}",
+                        snap.id,
+                        snap.epoch,
+                        snap.region.rects().len(),
+                    );
+                }
                 store.ack_presentation_damage(snap);
             }
             // Subtract the submitted output-damage snapshots
@@ -3610,6 +3795,150 @@ fn cursor_damage_for_frame(
 /// — the idle free-run bug. Only a window that actually painted
 /// (non-empty captured damage) whose projection landed empty needs the
 /// forced full compose (the xfce submenu case).
+/// Whether a tick with no output damage may skip composing.
+///
+/// `owed` is what the per-BO damage model still has to paint regardless of
+/// producers — set by `ScanoutDamage::invalidate` (a truncated submit, a failed
+/// flip, a return from direct scanout, a drain) and by a frame whose submit
+/// succeeded but never reached the screen. Before this was consulted here, an
+/// invalidated output with no fresh damage stayed on its stale frame until
+/// unrelated damage arrived, because this skip ran before the plan ever looked
+/// at the model (codex, post-merge review of `02bafec3`, finding 4).
+fn skip_for_empty_damage(damage_empty: bool, first_frame: bool, owed: bool) -> bool {
+    damage_empty && !first_frame && !owed
+}
+
+/// Whether this tick has to walk the scene at all.
+///
+/// The walk is how the tick learns whether anything is damaged, so until now
+/// every wake walked every output and then, most of the time, took the
+/// `EmptyDamage` skip. On the e16 phased workload that was 769 walks/s at 57
+/// composes/s (13.8 per compose, 436 µs each — a third of a core), because
+/// e16's pager copies ~1000 strips/s and every paint wakes the loop, and the
+/// present-completion poll wakes it every millisecond besides.
+///
+/// Everything `build_scene` can discover is announced beforehand by one of
+/// these inputs, so a tick where none is set cannot produce damage and may skip
+/// without walking:
+///
+/// - `structure_dirty` — `scene_structure_dirty`: every mutation of a scene
+///   input the walk reads (geometry, map state, stacking, shape, redirect
+///   routing, storage reallocation, cursor image or software-cursor position,
+///   root overlay, output topology, direct-scanout transitions) calls
+///   `wake_for_damage` or `mark_scene_structure_*`. A hardware-cursor move
+///   goes straight to the plane and correctly does not set it.
+/// - `pending_presentation` — an ARMED drawable painted, was not acked, and
+///   can land on THIS output: see [`pending_presentation_for_output`]. Dormant
+///   drawables (`DormantReason`) are excluded by design; a `HiddenDamage` one
+///   re-arms on its next paint. The global form of this input had no effect
+///   on e16 (2 outputs): the pager paints ~1000/s on output 0, so some armed
+///   drawable is always damaged, and the wake walked output 1 — where nothing
+///   is — ~700 times a second to find `EmptyDamage`.
+/// - `first_frame` — nothing has ever been presented on this output.
+/// - `owed` — the per-BO damage model still owes a repaint (`invalidate`,
+///   a frame that never reached the screen).
+/// - `pending_structure` — this output already holds rect-precise structure
+///   damage or a failed-submit repaint. Both setters also raise
+///   `structure_dirty`; listed separately so the predicate does not depend on
+///   that coupling.
+/// - `audit_armed` — the damage audit uses the empty-damage path for its idle
+///   re-compare and must keep walking.
+///
+/// A wake that a mutation site forgot shows up as a stale window; the audit
+/// (`YSERVER_DAMAGE_AUDIT=1`) is what catches it, which is why it forces walks.
+fn walk_needed(
+    structure_dirty: bool,
+    pending_presentation: bool,
+    first_frame: bool,
+    owed: bool,
+    pending_structure: bool,
+    audit_armed: bool,
+) -> bool {
+    structure_dirty
+        || pending_presentation
+        || first_frame
+        || owed
+        || pending_structure
+        || audit_armed
+}
+
+/// One output's contribution to this tick's dormancy decision.
+struct OutputWalkReport<'a> {
+    /// `build_scene` ran for this output this tick.
+    walked: bool,
+    /// This walk's presented ids (empty when it did not walk).
+    presented: &'a std::collections::HashSet<super::store::DrawableId>,
+    /// The output's retained `last_pieces` — refreshed by this walk if it
+    /// walked, otherwise as of its most recent walk.
+    last_pieces: &'a std::collections::HashSet<super::store::DrawableId>,
+}
+
+/// The two sets `DrawableStore::reconcile_offscreen_no_draw` needs, computed so
+/// that reconciliation can run on any tick where at least one output walked.
+///
+/// A drawable with pending damage goes dormant iff, for EVERY output, either
+/// that output walked this tick and did not present it, or that output did not
+/// walk and the drawable is not in its retained `last_pieces`. The second clause
+/// is what makes skipping safe: an output that did not walk (flip pending,
+/// retry deadline, nothing pending) has unchanged visibility since its last
+/// walk — every structural change forces a walk everywhere — so if the drawable
+/// has pieces there, that output may present it once it walks, and its pre-walk
+/// predicate WILL walk it, because the drawable is armed and in its
+/// `last_pieces`. Until then it must stay armed. Returns `(keep_armed,
+/// pieces_anywhere)`: ids that stay armed, and ids with pieces on some output
+/// (which decides `HiddenDamage` vs `NoPieces` for the rest).
+fn dormancy_inputs(
+    reports: &[OutputWalkReport<'_>],
+) -> (
+    std::collections::HashSet<super::store::DrawableId>,
+    std::collections::HashSet<super::store::DrawableId>,
+) {
+    let mut keep_armed = std::collections::HashSet::new();
+    let mut pieces_anywhere = std::collections::HashSet::new();
+    for r in reports {
+        if r.walked {
+            keep_armed.extend(r.presented.iter().copied());
+        } else {
+            // Unchanged visibility since its last walk: whatever had pieces
+            // there may still be presented there, once it walks.
+            keep_armed.extend(r.last_pieces.iter().copied());
+        }
+        pieces_anywhere.extend(r.last_pieces.iter().copied());
+    }
+    (keep_armed, pieces_anywhere)
+}
+
+/// Whether any armed, damaged drawable can land on one output — the per-output
+/// form of the `pending_presentation` input of [`walk_needed`].
+///
+/// `mine` is this output's retained `last_pieces`; `all` is every output's.
+/// A drawable is pending for this output if it emitted pieces here in the
+/// last walk, or if it emitted pieces on NO output — never walked, newly
+/// created, or otherwise unknown — in which case every output walks. That is
+/// the conservative direction: the cost of a wrong "yes" is one walk, the cost
+/// of a wrong "no" is a stale window.
+///
+/// Why the sets are trustworthy without geometry: where a drawable is visible
+/// changes only through a structural change, and every structural change sets
+/// `scene_structure_dirty`, which forces the walk on its own. So whenever this
+/// function is the deciding input, the sets are from a walk of the current
+/// structure.
+///
+/// Multi-output: a drawable spanning both outputs is in both sets ⇒ both walk.
+/// One on output 0 only ⇒ output 1 skips; its damage is captured by output 0's
+/// compose and acked at that retire, as today. An off-output window emits no
+/// pieces anywhere ⇒ in no set ⇒ every output walks, and today's
+/// off-output force-compose path is preserved.
+fn pending_presentation_for_output(
+    armed: &[super::store::DrawableId],
+    mine: &std::collections::HashSet<super::store::DrawableId>,
+    all: &[&std::collections::HashSet<super::store::DrawableId>],
+) -> bool {
+    armed
+        .iter()
+        .any(|id| mine.contains(id) || !all.iter().any(|set| set.contains(id)))
+}
+
 fn snapshots_carry_damage(snaps: &[DamageSnapshot]) -> bool {
     snaps.iter().any(|s| !s.region.is_empty())
 }
@@ -3632,7 +3961,18 @@ fn tick_one_output(
     // outputs by `tick` to reconcile `offscreen_no_draw`. Only written
     // once `build_scene` has run (after the pending-flip/retry gate),
     // so a `PendingAcks`/`RetryDeadline` skip contributes nothing.
+    // What the OTHER outputs showed at their last walk, for classifying an
+    // off-output paint as theirs (`ContentDamage::OtherOutput`) rather than
+    // stranded. See `WalkSink::elsewhere`.
+    elsewhere: &std::collections::HashSet<super::store::DrawableId>,
     drawn: &mut std::collections::HashSet<super::store::DrawableId>,
+    // Sampled sources that emitted at least one piece on this output — with
+    // `drawn` this picks the dormancy reason (see `DormantReason`).
+    had_pieces: &mut std::collections::HashSet<super::store::DrawableId>,
+    // Pre-walk predicate inputs read once per tick by `tick` — see
+    // `walk_needed`.
+    structure_dirty: bool,
+    pending_presentation: bool,
 ) -> Result<TickOutcome, SceneError> {
     // 0. **Per-output flip-pending gate.** KMS only allows one
     //    pending atomic commit per CRTC at a time; a second
@@ -3673,6 +4013,22 @@ fn tick_one_output(
             record_tick_skip(s, output_idx, TickSkipReason::RetryDeadline, 0);
             return Ok(TickOutcome::Skipped(TickSkipReason::RetryDeadline));
         }
+        // 0b. Pre-walk predicate. Everything `build_scene` could find is
+        //     announced by one of these inputs; if none is set, walking would
+        //     only end in the `EmptyDamage` skip below at the cost of the walk.
+        if !walk_needed(
+            structure_dirty,
+            pending_presentation,
+            s.current_generation == 0,
+            s.damage.owes_repaint(),
+            !s.scene_structure_damage.is_empty()
+                || !s.pending_repaint_after_failed_submit.is_empty(),
+            damage_audit_enabled(),
+        ) {
+            record_tick_skip(s, output_idx, TickSkipReason::NothingPending, 0);
+            telemetry.record_tick_skip_nothing_pending();
+            return Ok(TickOutcome::Skipped(TickSkipReason::NothingPending));
+        }
     }
 
     // 1. Snapshot live output state so we can fold cleanly
@@ -3708,7 +4064,7 @@ fn tick_one_output(
     // `build_scene` returns, and this is the pass whose cost grows with the
     // window count. Timed on every tick that gets this far, composed or not.
     let build_scene_start = std::time::Instant::now();
-    let mut built = build_scene(
+    let mut built = build_scene_with(
         core,
         store,
         windows,
@@ -3719,10 +4075,19 @@ fn tick_one_output(
         cow_host_xid,
         hw_can_run,
         Visibility::On,
+        elsewhere,
     );
     telemetry.record_build_scene_ns(
         u64::try_from(build_scene_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
     );
+    // Retain what emitted pieces on this output for the pre-walk predicate.
+    // Recorded before any skip below so the set always reflects the most
+    // recent walk, composed or not.
+    {
+        let s = &mut inner.outputs[output_idx];
+        s.last_pieces.clear();
+        s.last_pieces.extend(built.pieces_ids.iter().copied());
+    }
     let prev_mode = effective_cursor_prev_mode(
         scene_prev_mode,
         platform.cursor_plane_visible_for_output(output_idx),
@@ -3736,12 +4101,16 @@ fn tick_one_output(
         built.omit_software_cursor_for_hide();
     }
 
-    // Idle free-run fix (cut 2b): record the sampled sources this output
-    // actually drew, so `tick` can reconcile `offscreen_no_draw` from
-    // the union across outputs. Recorded unconditionally here (before
-    // the empty-damage / BO / pool skips below) so a window that WAS
-    // drawn is never mis-flagged just because its output later skips.
-    drawn.extend(built.sampled_ids.iter().copied());
+    // Idle free-run fix (cut 2b): record the sampled sources whose pending
+    // damage this output PRESENTED, so `tick` can reconcile
+    // `offscreen_no_draw` from the union across outputs. Recorded
+    // unconditionally here (before the empty-damage / BO / pool skips below)
+    // so a window that WAS presented is never mis-flagged just because its
+    // output later skips. `presented_ids`, not `sampled_ids`: a node sampled
+    // but with all of its damage under a cover must NOT count, or the
+    // scheduler never goes dormant (see `WalkSink::presented_ids`).
+    drawn.extend(built.presented_ids.iter().copied());
+    had_pieces.extend(built.pieces_ids.iter().copied());
 
     // Stage 5 Phase D — derive the per-output cursor transition
     // and new prev_pos from `built.cursor_assignment` and the
@@ -3833,10 +4202,18 @@ fn tick_one_output(
         ],
         built.stats.hidden_participants,
     );
-    telemetry.record_content_damage(built.stats.content_hidden, built.stats.content_off_output);
+    telemetry.record_content_damage(
+        built.stats.content_hidden,
+        built.stats.content_off_output,
+        built.stats.content_other_output,
+    );
 
     // 3. Empty-damage fast path (after first frame).
-    if output_damage.is_empty() && !first_frame {
+    if skip_for_empty_damage(
+        output_damage.is_empty(),
+        first_frame,
+        inner.outputs[output_idx].damage.owes_repaint(),
+    ) {
         // A drawn, scene-participating window had presentation damage
         // that `build_scene` CAPTURED (`built.snapshots`, via
         // `peek_presentation_damage`) but whose `add_projected_damage`
@@ -4821,8 +5198,42 @@ fn cursor_footprint_rect(
 ///   z when `cursor` is `Some`. Real theme support + per-window
 ///   `define_cursor` wiring stays Stage 4.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_lines)]
 fn build_scene(
+    core: &KmsCore,
+    store: &mut DrawableStore,
+    windows: &super::backend::WindowsMap,
+    output_idx: usize,
+    platform: &PlatformBackend,
+    cursor: Option<CursorEntry>,
+    cursor_prev_pos: Option<(i32, i32)>,
+    cow_host_xid: Option<u32>,
+    hw_strategy_active: bool,
+    mode: Visibility,
+) -> SceneBuild {
+    // No knowledge of other outputs: every off-output paint is treated as
+    // stranded (forced and acked here), which is the single-output rule.
+    let nowhere = std::collections::HashSet::new();
+    build_scene_with(
+        core,
+        store,
+        windows,
+        output_idx,
+        platform,
+        cursor,
+        cursor_prev_pos,
+        cow_host_xid,
+        hw_strategy_active,
+        mode,
+        &nowhere,
+    )
+}
+
+/// [`build_scene`] with knowledge of what the OTHER outputs showed at their
+/// last walk, so an off-output paint that another output presents is classified
+/// `ContentDamage::OtherOutput` and left to that output. See [`WalkSink::elsewhere`].
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
+fn build_scene_with(
     core: &KmsCore,
     store: &mut DrawableStore,
     windows: &super::backend::WindowsMap,
@@ -4851,6 +5262,7 @@ fn build_scene(
     // every node's full placement as before step 1 (`Off`). Production passes
     // `On`; the damage audit's reference and the tests use `Off`.
     mode: Visibility,
+    elsewhere: &std::collections::HashSet<super::store::DrawableId>,
 ) -> SceneBuild {
     let bg = [0.0, 0.0, 0.0, 1.0];
     let layout = &platform.outputs[output_idx];
@@ -4859,7 +5271,7 @@ fn build_scene(
     let layout_w = u32::from(layout.width);
     let layout_h = u32::from(layout.height);
 
-    let mut sink = WalkSink::new();
+    let mut sink = WalkSink::new(output_idx, elsewhere);
     // Stage 4c.3 — the root samples through `redirected_target` like any other
     // node; geometry stays the host drawable's. Decided up front, emitted last
     // (see below).
@@ -5051,7 +5463,7 @@ fn build_scene(
     // emitter pushed it. Under `On` it gets what the top-levels left.
     if let Some(root) = root {
         sink.stats.nodes_visited += 1;
-        let emitted = emit_node(
+        let out = emit_node(
             &mut sink,
             mode,
             &universe,
@@ -5063,22 +5475,30 @@ fn build_scene(
             root.view,
             false,
             root.source_id,
-            ParticipantId {
-                role: SceneRole::Root,
-                xid: core.window_id,
-                generation: root.id.as_u64(),
-            },
             store,
             layout_w,
             layout_h,
         );
         log::trace!(
-            "render scene_walk root output={output_idx}: place={} pieces={emitted}",
+            "render scene_walk root output={output_idx}: place={} pieces={}",
             root.place.len(),
+            out.emitted,
+        );
+        push_presence(
+            &mut sink,
+            root.place,
+            out,
+            ParticipantId {
+                role: SceneRole::Root,
+                xid: core.window_id,
+                generation: root.id.as_u64(),
+            },
         );
     }
     sink.reverse();
     let WalkSink {
+        output_idx: _,
+        elsewhere: _,
         mut draws,
         snapshots,
         mut sampled_ids,
@@ -5086,6 +5506,8 @@ fn build_scene(
         participants,
         stats,
         pieces: _,
+        mut presented_ids,
+        mut pieces_ids,
     } = sink;
     log::trace!(
         "render scene_walk end output={output_idx} draws={n_draws} \
@@ -5164,6 +5586,8 @@ fn build_scene(
                     alpha_passthrough: true,
                 });
                 sampled_ids.push(cur.id);
+                presented_ids.push(cur.id);
+                pieces_ids.push(cur.id);
                 software_cursor_tail = Some((draw_index, sampled_index));
                 (
                     CursorAssignment::Sw { pos: (dx, dy) },
@@ -5191,6 +5615,8 @@ fn build_scene(
         software_cursor_tail,
         participants,
         stats,
+        presented_ids,
+        pieces_ids,
     }
 }
 
@@ -5344,7 +5770,7 @@ fn union_bbox(a: vk::Rect2D, b: vk::Rect2D) -> vk::Rect2D {
 /// to the old emitter.
 #[allow(clippy::too_many_arguments)]
 fn emit_node(
-    sink: &mut WalkSink,
+    sink: &mut WalkSink<'_>,
     mode: Visibility,
     mine: &Region,
     place: &[vk::Rect2D],
@@ -5355,11 +5781,10 @@ fn emit_node(
     view: vk::ImageView,
     alpha_passthrough: bool,
     source_id: super::store::DrawableId,
-    participant: ParticipantId,
     store: &DrawableStore,
     layout_w: u32,
     layout_h: u32,
-) -> u64 {
+) -> Emitted {
     let mut emitted = 0u64;
     let mut visible_bbox: Option<vk::Rect2D> = None;
     // The exact visible pieces this node emits, for clipping its content
@@ -5416,27 +5841,24 @@ fn emit_node(
     sink.stats.draws_emitted += emitted;
     if emitted == 0 {
         sink.stats.hidden_participants += 1;
+    } else {
+        sink.pieces_ids.push(source_id);
     }
     sink.sampled_ids.push(source_id);
     // Signature from the first PLACE rect — what the unclipped draw would
     // carry — never from an emitted piece, whose src moves whenever the cover
-    // above moves and would read as a resample every frame.
-    if let Some(first) = place.first() {
+    // above moves and would read as a resample every frame. The presence itself
+    // is pushed by the caller once the claim step is done with `place`
+    // (`push_presence`), so the decision's rect list moves into it uncopied.
+    let signature = place.first().map(|first| {
         let unclipped = piece_draw(*first, dx, dy, denom_w, denom_h, view, alpha_passthrough);
-        if let Some(p) = presence_from_place(
-            place,
-            visible,
-            participant,
-            PresenceSignature::new(
-                unclipped.image_view,
-                unclipped.src_origin,
-                unclipped.src_size,
-                unclipped.alpha_passthrough,
-            ),
-        ) {
-            sink.participants.push(p);
-        }
-    }
+        PresenceSignature::new(
+            unclipped.image_view,
+            unclipped.src_origin,
+            unclipped.src_size,
+            unclipped.alpha_passthrough,
+        )
+    });
     if let Some(snap) = store.peek_presentation_damage(source_id) {
         // Stage C — project the captured damage onto the output and, under
         // `On`, keep only what lands on this node's visible pieces: a paint
@@ -5465,9 +5887,33 @@ fn emit_node(
                 }
             }
         }
+        // Presented, and carried into this output's PendingAck, ONLY for
+        // `Visible` — damage that reached the screen here — plus a node with no
+        // damage at all, which has nothing to present. `Hidden`, `OtherOutput`
+        // and `OffOutput` are none of those: the snapshot stays in the store for
+        // the walk that does present it. Acking a snapshot this output did not
+        // present is the multi-output ack race, and it must not depend on
+        // cross-output knowledge to avoid: `OffOutput` used to be carried on the
+        // theory that it is stranded everywhere, but "everywhere" was decided
+        // from `elsewhere`, which is one walk stale. Measured 2026-09-04 on
+        // silence/MATE: the caja desktop spans both outputs, output 1 classified
+        // its rubberband-erase damage `OffOutput` 104× while output 0's set was
+        // cold, acked it, and left the selection on output 0's scanout —
+        // 260 audit mismatches, 247 unhealed. `OffOutput` still FORCES a compose
+        // here (the xfce submenu case: a paint whose projection is empty must
+        // not sit undrained), but the drain now comes from dormancy — the
+        // snapshot is not presented, so reconciliation makes it dormant and it
+        // stops re-forcing until its next paint. See [`ContentDamage`] and
+        // `WalkSink::presented_ids`.
+        let mut presented = true;
+        let mut carry = true;
         if !snap.region.is_empty() {
             let class = if !on_output {
-                ContentDamage::OffOutput
+                if sink.elsewhere.contains(&source_id) {
+                    ContentDamage::OtherOutput
+                } else {
+                    ContentDamage::OffOutput
+                }
             } else if added {
                 ContentDamage::Visible
             } else {
@@ -5475,16 +5921,73 @@ fn emit_node(
             };
             match class {
                 ContentDamage::Visible => sink.stats.content_visible += 1,
-                ContentDamage::Hidden => sink.stats.content_hidden += 1,
-                ContentDamage::OffOutput => sink.stats.content_off_output += 1,
+                ContentDamage::Hidden => {
+                    sink.stats.content_hidden += 1;
+                    presented = false;
+                    carry = false;
+                }
+                ContentDamage::OffOutput => {
+                    sink.stats.content_off_output += 1;
+                    presented = false;
+                    carry = false;
+                }
+                ContentDamage::OtherOutput => {
+                    sink.stats.content_other_output += 1;
+                    presented = false;
+                    carry = false;
+                }
+            }
+            if class != ContentDamage::Visible && tick_skip_log_enabled() {
+                log::info!(
+                    "content-diag: out{} drawable={:?} epoch={} class={class:?}",
+                    sink.output_idx,
+                    source_id,
+                    snap.epoch,
+                );
             }
         }
-        // Pushed whatever the classification: a hidden snapshot that rides a
-        // compose made for other reasons acks at retire like any other, and one
-        // that rides no compose is re-peeked next walk. See [`ContentDamage`].
-        sink.snapshots.push(snap);
+        if presented {
+            sink.presented_ids.push(source_id);
+        }
+        if carry {
+            sink.snapshots.push(snap);
+        }
+    } else {
+        // Nothing pending to present; parity with the old "sampled ⇒ drawn".
+        sink.presented_ids.push(source_id);
     }
-    emitted
+    Emitted {
+        emitted,
+        visible,
+        signature,
+    }
+}
+
+/// What [`emit_node`] hands back for the caller to finish the node with.
+struct Emitted {
+    /// Pieces pushed.
+    emitted: u64,
+    /// Damage-side summary of the pieces (bbox under `On`, the place under
+    /// `Off`), for the presence.
+    visible: Region,
+    /// `None` only for a node with no place rects, which has no presence.
+    signature: Option<PresenceSignature>,
+}
+
+/// Push the node's presence, consuming the decision's `place`. Called after the
+/// claim step, which is the last reader of `place`; still within the node's own
+/// step, so the participants list keeps computation order.
+fn push_presence(
+    sink: &mut WalkSink<'_>,
+    place: Vec<vk::Rect2D>,
+    out: Emitted,
+    participant: ParticipantId,
+) {
+    if let Some(signature) = out.signature
+        && let Some(p) = presence_from_place(place, out.visible, participant, signature)
+    {
+        sink.participants.push(p);
+    }
 }
 
 /// Intersection of two rects, `None` if they do not overlap.
@@ -5890,7 +6393,7 @@ fn visit_window_subtree(
     // What nothing above this node has claimed yet, output-local. This node's
     // subtree subtracts what it opaquely covers on the way out.
     universe: &mut Region,
-    sink: &mut WalkSink,
+    sink: &mut WalkSink<'_>,
     // Audit #3 (2026-05-19): true iff some ancestor on the recursion
     // path owns a `redirected_target`. When set, this window's paint
     // landed in that ancestor's backing (via `resolve_paint_target`'s
@@ -6217,7 +6720,9 @@ fn visit_window_subtree(
         }
     }
 
-    // Step 4: emit what the children left of this node.
+    // Step 4: emit what the children left of this node. The presence is pushed
+    // in step 6, after the claim step has finished reading `place`.
+    let mut emitted_presence: Option<(Emitted, ParticipantId)> = None;
     if node.emits
         && let Some(s) = node.store
     {
@@ -6265,7 +6770,7 @@ fn visit_window_subtree(
                 i32::try_from(s.source_extent.height).unwrap_or(i32::MAX),
             ),
         };
-        emit_node(
+        let out = emit_node(
             sink,
             mode,
             if is_leaf { universe } else { &mine },
@@ -6277,17 +6782,20 @@ fn visit_window_subtree(
             s.source_view,
             under_cow_subtree,
             s.source_id,
-            // Identity is the host drawable, so a redirect swap is a
-            // resample rather than a replacement.
+            store,
+            layout_w,
+            layout_h,
+        );
+        // Identity is the host drawable, so a redirect swap is a resample
+        // rather than a replacement.
+        emitted_presence = Some((
+            out,
             ParticipantId {
                 role: SceneRole::Window,
                 xid: host_xid,
                 generation: s.d_id.as_u64(),
             },
-            store,
-            layout_w,
-            layout_h,
-        );
+        ));
     }
 
     // Step 5: claim from the caller's universe. An opaque node takes its whole
@@ -6360,6 +6868,12 @@ fn visit_window_subtree(
                 );
             }
         }
+    }
+
+    // Step 6: the presence, consuming the decision's `place` — nothing reads it
+    // after the claim step, so it moves into the presence uncopied.
+    if let Some((out, participant)) = emitted_presence {
+        push_presence(sink, node.place, out, participant);
     }
 }
 
@@ -7596,6 +8110,8 @@ mod tests {
             },
             snapshots: Vec::new(),
             sampled_ids: vec![cursor_id],
+            presented_ids: vec![cursor_id],
+            pieces_ids: vec![cursor_id],
             stats: WalkStats::default(),
             projected_damage: RegionSet::new(),
             cursor_assignment: assignment,
@@ -7677,6 +8193,8 @@ mod tests {
             },
             snapshots: Vec::new(),
             sampled_ids: vec![cursor_id],
+            presented_ids: vec![cursor_id],
+            pieces_ids: vec![cursor_id],
             stats: WalkStats::default(),
             projected_damage: RegionSet::new(),
             cursor_assignment: CursorAssignment::Sw { pos: (10, 20) },
@@ -7791,6 +8309,134 @@ mod tests {
         );
         assert!(!TickOutcome::Skipped(TickSkipReason::NoBO).clears_scene_structure_dirty());
         assert!(!TickOutcome::Skipped(TickSkipReason::NoPool).clears_scene_structure_dirty());
+        assert!(
+            !TickOutcome::Skipped(TickSkipReason::NothingPending).clears_scene_structure_dirty()
+        );
+    }
+
+    /// A `NothingPending` skip returns before `build_scene`, so it must not
+    /// count as walked — dormancy reconciliation would otherwise run on ids
+    /// this output never recorded and flag every armed window dormant.
+    #[test]
+    fn nothing_pending_skip_did_not_walk() {
+        assert!(!TickOutcome::Skipped(TickSkipReason::NothingPending).walked());
+        assert!(!TickOutcome::Skipped(TickSkipReason::PendingAcks).walked());
+        assert!(TickOutcome::Skipped(TickSkipReason::EmptyDamage).walked());
+        assert!(TickOutcome::Composed.walked());
+    }
+
+    /// Each input of the pre-walk predicate alone forces a walk; with none set
+    /// the tick may skip before walking. The dormant-only case is the one the
+    /// predicate exists for: `has_pending_presentation_damage` already
+    /// excludes dormant drawables, so it arrives here as `false`.
+    #[test]
+    fn walk_needed_for_each_input_alone_and_not_otherwise() {
+        assert!(!walk_needed(false, false, false, false, false, false));
+        assert!(
+            walk_needed(true, false, false, false, false, false),
+            "structure dirty"
+        );
+        assert!(
+            walk_needed(false, true, false, false, false, false),
+            "armed damage"
+        );
+        assert!(
+            walk_needed(false, false, true, false, false, false),
+            "first frame"
+        );
+        assert!(
+            walk_needed(false, false, false, true, false, false),
+            "owed repaint"
+        );
+        assert!(
+            walk_needed(false, false, false, false, true, false),
+            "structure rects"
+        );
+        assert!(
+            walk_needed(false, false, false, false, false, true),
+            "audit armed"
+        );
+    }
+
+    /// The per-output form of the presentation input: a damaged drawable that
+    /// emitted pieces on output 0 only makes output 0 walk; one in no output's
+    /// set makes every output walk; nothing armed makes none walk.
+    #[test]
+    fn pending_presentation_is_decided_per_output_from_retained_pieces() {
+        use super::super::store::DrawableId;
+        use std::collections::HashSet;
+        let a = DrawableId::for_tests(1);
+        let b = DrawableId::for_tests(2);
+        let out0: HashSet<DrawableId> = [a].into_iter().collect();
+        let out1: HashSet<DrawableId> = HashSet::new();
+        let all = [&out0, &out1];
+        // `a` damaged, on output 0 only.
+        assert!(pending_presentation_for_output(&[a], &out0, &all));
+        assert!(!pending_presentation_for_output(&[a], &out1, &all));
+        // `b` damaged but in no output's set ⇒ unknown ⇒ both walk.
+        assert!(pending_presentation_for_output(&[b], &out0, &all));
+        assert!(pending_presentation_for_output(&[b], &out1, &all));
+        // Nothing armed ⇒ neither.
+        assert!(!pending_presentation_for_output(&[], &out0, &all));
+        assert!(!pending_presentation_for_output(&[], &out1, &all));
+        // Spanning both outputs ⇒ both.
+        let both0: HashSet<DrawableId> = [a].into_iter().collect();
+        let both1: HashSet<DrawableId> = [a].into_iter().collect();
+        let all2 = [&both0, &both1];
+        assert!(pending_presentation_for_output(&[a], &both0, &all2));
+        assert!(pending_presentation_for_output(&[a], &both1, &all2));
+        // Structure dirty forces the walk regardless of the per-output answer.
+        assert!(walk_needed(true, false, false, false, false, false));
+    }
+
+    /// The scheduler's view of a dormant drawable is exactly what the
+    /// predicate consumes: a `HiddenDamage`/`NoPieces` drawable with damage
+    /// reads as no armed id, so no output walks for it; the paint that re-arms
+    /// it flips both back.
+    #[test]
+    fn dormant_only_damage_does_not_walk_until_a_paint_rearms_it() {
+        use super::super::store::{DormantReason, DrawableKind, DrawableStore, Storage};
+        let mut store = DrawableStore::new();
+        let storage = Storage::for_tests_null(
+            vk::Extent2D {
+                width: 8,
+                height: 8,
+            },
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        let id = store
+            .allocate(0x700, DrawableKind::Window, 24, true, storage)
+            .expect("allocate");
+        store.damage(id, audit_rect(0, 0, 4, 4));
+        assert!(store.has_pending_presentation_damage());
+        // Reconciled as hidden-under-a-cover: pieces but no presented damage.
+        let none = std::collections::HashSet::new();
+        let pieces: std::collections::HashSet<_> = [id].into_iter().collect();
+        store.reconcile_offscreen_no_draw(&none, &pieces);
+        assert_eq!(
+            store.get(id).map(|d| d.dormant),
+            Some(Some(DormantReason::HiddenDamage))
+        );
+        assert!(!store.has_pending_presentation_damage());
+        assert!(!walk_needed(
+            false,
+            store.has_pending_presentation_damage(),
+            false,
+            false,
+            false,
+            false
+        ));
+        // A new paint re-arms it and the predicate walks again.
+        store.damage(id, audit_rect(2, 2, 2, 2));
+        assert!(store.has_pending_presentation_damage());
+        assert!(walk_needed(
+            false,
+            store.has_pending_presentation_damage(),
+            false,
+            false,
+            false,
+            false
+        ));
     }
 
     /// Regression guard for the idle free-run fix: the empty-projection
@@ -11087,6 +11733,7 @@ mod tests {
         let emitted = draws.get(from..)?;
         let first = emitted.first()?;
         let mut region = Region::new();
+        let mut place = Vec::new();
         for d in emitted {
             let x0 = d.dst_origin[0].floor();
             let y0 = d.dst_origin[1].floor();
@@ -11094,7 +11741,7 @@ mod tests {
             let y1 = (d.dst_origin[1] + d.dst_size[1]).ceil();
             if x1 > x0 && y1 > y0 {
                 #[allow(clippy::cast_possible_truncation)]
-                region.add_rect(vk::Rect2D {
+                let r = vk::Rect2D {
                     offset: vk::Offset2D {
                         x: x0 as i32,
                         y: y0 as i32,
@@ -11103,7 +11750,9 @@ mod tests {
                         width: (x1 - x0) as u32,
                         height: (y1 - y0) as u32,
                     },
-                });
+                };
+                region.add_rect(r);
+                place.push(r);
             }
         }
         if region.is_empty() {
@@ -11113,6 +11762,7 @@ mod tests {
             id,
             visible: region.clone(),
             region,
+            place,
             signature: PresenceSignature::new(
                 first.image_view,
                 first.src_origin,
@@ -11154,6 +11804,33 @@ mod tests {
             cow_host_xid,
             false,
             mode,
+        )
+    }
+
+    /// `build_with` for one output of a multi-output layout: `elsewhere` is
+    /// what the OTHER output(s) showed at their last walk (their `pieces_ids`).
+    fn build_with_elsewhere(
+        mode: Visibility,
+        core: &KmsCore,
+        store: &mut DrawableStore,
+        windows: &super::super::backend::WindowsMap,
+        layout: (i32, i32, u32, u32),
+        cow_host_xid: Option<u32>,
+        elsewhere: &std::collections::HashSet<super::super::store::DrawableId>,
+    ) -> SceneBuild {
+        let platform = platform_with_layout(layout);
+        build_scene_with(
+            core,
+            store,
+            windows,
+            0,
+            &platform,
+            None,
+            None,
+            cow_host_xid,
+            false,
+            mode,
+            elsewhere,
         )
     }
 
@@ -11685,6 +12362,25 @@ mod tests {
     }
 
     // ── Step 1 stage A: an incomplete submit never stages `painted` ──────
+
+    /// After an `invalidate` the model owes a full repaint; a tick that finds no
+    /// producer damage must compose anyway, not take the EmptyDamage skip.
+    #[test]
+    fn an_owed_repaint_is_not_an_empty_damage_skip() {
+        assert!(skip_for_empty_damage(true, false, false), "idle skips");
+        assert!(
+            !skip_for_empty_damage(false, false, false),
+            "damage composes"
+        );
+        assert!(
+            !skip_for_empty_damage(true, true, false),
+            "first frame composes"
+        );
+        assert!(
+            !skip_for_empty_damage(true, false, true),
+            "owed repaint (invalidated BO) must compose"
+        );
+    }
 
     #[test]
     fn incomplete_submit_invalidates_instead_of_staging() {
@@ -12523,11 +13219,10 @@ mod tests {
             "hidden damage must take the EmptyDamage skip, not force a Full compose"
         );
         assert!(
-            built
-                .snapshots
-                .iter()
-                .any(|s| s.id == lower && !s.region.is_empty()),
-            "the hidden snapshot still rides the build so it can ack at retire"
+            !built.snapshots.iter().any(|s| s.id == lower),
+            "a hidden snapshot must NOT ride this output's build: it was not presented \
+             here, and carrying it would let this output's retire ack it globally \
+             (the multi-output ack race, 2026-09-04)"
         );
         // Un-acked: the store still holds it for the next walk.
         assert!(
@@ -12537,6 +13232,150 @@ mod tests {
                 .region
                 .is_empty()
         );
+    }
+
+    /// Codex, post-merge review of `02bafec3` (finding 1): a drawable whose
+    /// damage classified `Hidden` was still counted as drawn, so
+    /// `reconcile_offscreen_no_draw` never flagged it and
+    /// `has_pending_presentation_damage` kept waking the tick — ~1850 walks/s
+    /// at 2 composes/s with mpv under a terminal. The presented set must leave
+    /// it out; a drawable with visible damage stays in.
+    #[test]
+    fn hidden_damage_is_not_presented_so_the_scheduler_can_go_dormant() {
+        // Lower 0x100 fully under upper 0x200; both painted.
+        let (core, mut store, windows) = two_windows((100, 100, 50, 50), (80, 80, 100, 100));
+        let lower = drawable_of(&store, 0x100);
+        let upper = drawable_of(&store, 0x200);
+        store.damage(lower, rect(5, 5, 20, 20));
+        store.damage(upper, rect(1, 1, 5, 5));
+        let built = build_with(
+            Visibility::On,
+            &core,
+            &mut store,
+            &windows,
+            (0, 0, 800, 600),
+            None,
+        );
+        assert_eq!(built.stats.content_hidden, 1);
+        assert!(
+            built.sampled_ids.contains(&lower),
+            "sampling bookkeeping is unchanged: the hidden node is still a participant"
+        );
+        assert!(
+            !built.presented_ids.contains(&lower),
+            "hidden damage was not presented: {:?}",
+            built.presented_ids
+        );
+        assert!(built.presented_ids.contains(&upper));
+        assert!(
+            !built.pieces_ids.contains(&lower),
+            "fully covered: no pieces either ⇒ NoPieces, stays dormant across paints"
+        );
+        let drawn: std::collections::HashSet<_> = built.presented_ids.iter().copied().collect();
+        let pieces: std::collections::HashSet<_> = built.pieces_ids.iter().copied().collect();
+        store.reconcile_offscreen_no_draw(&drawn, &pieces);
+        assert_eq!(
+            store.get(lower).unwrap().dormant,
+            Some(super::super::store::DormantReason::NoPieces),
+            "flagged out of the scheduler"
+        );
+        assert!(store.get(upper).unwrap().dormant.is_none());
+        assert!(
+            !store
+                .peek_presentation_damage(lower)
+                .unwrap()
+                .region
+                .is_empty(),
+            "damage is preserved, only the flag changes"
+        );
+
+        // A PARTIALLY covered node whose damage lies entirely under the cover:
+        // it emits pieces (it is drawn) but presented nothing of its paint.
+        let (core, mut store, windows) = two_windows((100, 100, 200, 200), (200, 100, 200, 200));
+        let lower = drawable_of(&store, 0x100);
+        // Storage-local x 150..190 → output x 250..290, under the cover (x ≥ 200).
+        store.damage(lower, rect(150, 50, 40, 20));
+        let built = build_with(
+            Visibility::On,
+            &core,
+            &mut store,
+            &windows,
+            (0, 0, 800, 600),
+            None,
+        );
+        assert_eq!(built.stats.content_hidden, 1);
+        assert!(built.stats.draws_emitted > 0);
+        assert!(built.sampled_ids.contains(&lower));
+        assert!(!built.presented_ids.contains(&lower));
+        assert!(
+            built.pieces_ids.contains(&lower),
+            "partially covered: it emitted pieces ⇒ HiddenDamage, re-armed by the next paint"
+        );
+        let drawn: std::collections::HashSet<_> = built.presented_ids.iter().copied().collect();
+        let pieces: std::collections::HashSet<_> = built.pieces_ids.iter().copied().collect();
+        store.reconcile_offscreen_no_draw(&drawn, &pieces);
+        assert_eq!(
+            store.get(lower).unwrap().dormant,
+            Some(super::super::store::DormantReason::HiddenDamage)
+        );
+        assert!(
+            !store.has_pending_presentation_damage(),
+            "nothing presentable is pending: the scheduler must go dormant"
+        );
+        // The next paint lands in the VISIBLE part (storage-local x 10..40 →
+        // output 110..140, left of the cover): it must re-arm and present.
+        store.damage(lower, rect(10, 10, 30, 30));
+        assert!(
+            store.has_pending_presentation_damage(),
+            "a paint into a HiddenDamage-dormant window re-arms the scheduler"
+        );
+        let built = build_with(
+            Visibility::On,
+            &core,
+            &mut store,
+            &windows,
+            (0, 0, 800, 600),
+            None,
+        );
+        assert_eq!(built.stats.content_visible, 1);
+        assert!(built.presented_ids.contains(&lower));
+    }
+
+    /// Two outputs: hidden on output 0, visible on output 1. The union of the
+    /// two outputs' presented sets contains it, so the drawable stays armed and
+    /// output 1 composes it.
+    #[test]
+    fn damage_visible_on_one_output_keeps_the_drawable_armed() {
+        let (core, mut store, windows) = two_windows((700, 100, 200, 100), (650, 0, 150, 600));
+        let w = drawable_of(&store, 0x100);
+        store.damage(w, rect(0, 0, 200, 100));
+        let out0 = build_with(
+            Visibility::On,
+            &core,
+            &mut store,
+            &windows,
+            (0, 0, 800, 600),
+            None,
+        );
+        let out1 = build_with(
+            Visibility::On,
+            &core,
+            &mut store,
+            &windows,
+            (800, 0, 800, 600),
+            None,
+        );
+        assert_eq!(out0.stats.content_hidden, 1);
+        assert!(!out0.presented_ids.contains(&w));
+        assert_eq!(out1.stats.content_visible, 1);
+        assert!(out1.presented_ids.contains(&w));
+        let mut drawn: std::collections::HashSet<_> = out0.presented_ids.iter().copied().collect();
+        drawn.extend(out1.presented_ids.iter().copied());
+        let mut pieces: std::collections::HashSet<_> = out0.pieces_ids.iter().copied().collect();
+        pieces.extend(out1.pieces_ids.iter().copied());
+        store.reconcile_offscreen_no_draw(&drawn, &pieces);
+        assert!(store.get(w).unwrap().dormant.is_none());
+        assert!(store.has_pending_presentation_damage());
     }
 
     /// Paint straddling a cover's edge projects only the visible side.
@@ -12688,6 +13527,336 @@ mod tests {
         );
         assert_eq!(projected_sorted(&out1), vec![rect(0, 100, 100, 100)]);
         assert_eq!(out1.stats.content_visible, 1);
+        // Only the presenting output carries the snapshot into its PendingAck.
+        assert!(
+            !out0.snapshots.iter().any(|s| s.id == w),
+            "output 0 (hidden) must not carry W's snapshot"
+        );
+        assert!(
+            out1.snapshots
+                .iter()
+                .any(|s| s.id == w && !s.region.is_empty()),
+            "output 1 (visible) carries it and acks it at its retire"
+        );
+    }
+
+    // ── dormancy across outputs that did not walk ────────────────────────
+
+    fn set(ids: &[u64]) -> std::collections::HashSet<super::super::store::DrawableId> {
+        ids.iter()
+            .map(|i| super::super::store::DrawableId::for_tests(*i))
+            .collect()
+    }
+
+    /// Hidden on output 0 (walked), but output 1 skipped this tick and its
+    /// retained pieces include the drawable: it may present it once it walks,
+    /// so it stays armed.
+    #[test]
+    fn dormancy_keeps_a_drawable_armed_when_a_skipped_output_may_present_it() {
+        let none = set(&[]);
+        let out0_pieces = set(&[7, 9]);
+        let out0_presented = set(&[9]);
+        let out1_last = set(&[7]);
+        let reports = [
+            OutputWalkReport {
+                walked: true,
+                presented: &out0_presented,
+                last_pieces: &out0_pieces,
+            },
+            OutputWalkReport {
+                walked: false,
+                presented: &none,
+                last_pieces: &out1_last,
+            },
+        ];
+        let (keep_armed, pieces) = dormancy_inputs(&reports);
+        assert!(keep_armed.contains(&set(&[7]).into_iter().next().unwrap()));
+        assert!(keep_armed.contains(&set(&[9]).into_iter().next().unwrap()));
+        assert!(pieces.contains(&set(&[7]).into_iter().next().unwrap()));
+    }
+
+    /// Same, but output 1 walked and did not present it either: dormant with
+    /// reason `HiddenDamage`, since it has pieces.
+    #[test]
+    fn dormancy_flags_hidden_damage_when_every_walked_output_declined_it() {
+        let out0_pieces = set(&[7, 9]);
+        let out0_presented = set(&[9]);
+        let out1_pieces = set(&[7]);
+        let out1_presented = set(&[]);
+        let reports = [
+            OutputWalkReport {
+                walked: true,
+                presented: &out0_presented,
+                last_pieces: &out0_pieces,
+            },
+            OutputWalkReport {
+                walked: true,
+                presented: &out1_presented,
+                last_pieces: &out1_pieces,
+            },
+        ];
+        let (keep_armed, pieces) = dormancy_inputs(&reports);
+        let seven = set(&[7]).into_iter().next().unwrap();
+        assert!(!keep_armed.contains(&seven));
+        assert!(pieces.contains(&seven), "⇒ HiddenDamage");
+    }
+
+    /// In no output's pieces, output 1 skipped: `NoPieces`.
+    #[test]
+    fn dormancy_flags_no_pieces_when_no_output_shows_it() {
+        let out0_pieces = set(&[9]);
+        let out0_presented = set(&[9]);
+        let none = set(&[]);
+        let out1_last = set(&[11]);
+        let reports = [
+            OutputWalkReport {
+                walked: true,
+                presented: &out0_presented,
+                last_pieces: &out0_pieces,
+            },
+            OutputWalkReport {
+                walked: false,
+                presented: &none,
+                last_pieces: &out1_last,
+            },
+        ];
+        let (keep_armed, pieces) = dormancy_inputs(&reports);
+        let seven = set(&[7]).into_iter().next().unwrap();
+        assert!(!keep_armed.contains(&seven));
+        assert!(!pieces.contains(&seven), "⇒ NoPieces");
+        // And 11, shown only on the skipped output, stays armed.
+        assert!(keep_armed.contains(&set(&[11]).into_iter().next().unwrap()));
+    }
+
+    /// The hardware case (silence/MATE 2026-09-04): the root's damage lies
+    /// under covers on both outputs; output 1 keeps skipping as NothingPending.
+    /// After output 0's walk alone the root must go dormant (`HiddenDamage`:
+    /// it has pieces on both), or it is re-peeked and re-classified Hidden
+    /// ~1000×/s forever.
+    #[test]
+    fn dormancy_runs_without_every_output_walking() {
+        let root = set(&[1]);
+        let out0_pieces = set(&[1, 5]);
+        let out0_presented = set(&[5]);
+        let none = set(&[]);
+        let out1_last = set(&[1, 6]);
+        let reports = [
+            OutputWalkReport {
+                walked: true,
+                presented: &out0_presented,
+                last_pieces: &out0_pieces,
+            },
+            OutputWalkReport {
+                walked: false,
+                presented: &none,
+                last_pieces: &out1_last,
+            },
+        ];
+        let (keep_armed, pieces) = dormancy_inputs(&reports);
+        let one = root.into_iter().next().unwrap();
+        // Output 1 has pieces for the root and did not walk ⇒ it MAY present
+        // it ⇒ armed. That is the sound rule; what makes it terminate on
+        // hardware is that output 1's predicate then walks (root armed and in
+        // its last_pieces), declines it (Hidden), and the NEXT reconciliation
+        // sees both outputs decline ⇒ dormant.
+        assert!(keep_armed.contains(&one));
+        let out1_pieces = set(&[1, 6]);
+        let out1_presented = set(&[6]);
+        let reports = [
+            OutputWalkReport {
+                walked: true,
+                presented: &out0_presented,
+                last_pieces: &out0_pieces,
+            },
+            OutputWalkReport {
+                walked: true,
+                presented: &out1_presented,
+                last_pieces: &out1_pieces,
+            },
+        ];
+        let (keep_armed, pieces2) = dormancy_inputs(&reports);
+        assert!(!keep_armed.contains(&one));
+        assert!(pieces2.contains(&one), "⇒ HiddenDamage");
+        let _ = pieces;
+    }
+
+    /// The multi-output ack race, first half (silence/MATE, 2026-09-04): a
+    /// paint into a window spanning both outputs, landing inside output 0 only.
+    /// Output 1 knows (from output 0's retained pieces) that the window is shown
+    /// there, so it classifies `OtherOutput`: no force, no snapshot, not
+    /// presented — output 0 owns that damage. Before this rule output 1 read it
+    /// as `OffOutput`, forced a Full compose, and its retire acked the damage
+    /// before output 0 had composed it.
+    #[test]
+    fn other_output_damage_is_neither_forced_nor_carried_here() {
+        // W 0x100 at x 700..900 spans the boundary at 800; 0x200 is far away.
+        let (core, mut store, windows) = two_windows((700, 100, 200, 100), (0, 0, 10, 10));
+        let w = drawable_of(&store, 0x100);
+        // Storage-local x 0..50 → output-0 x 700..750 only.
+        store.damage(w, rect(0, 0, 50, 100));
+        let out0 = build_with(
+            Visibility::On,
+            &core,
+            &mut store,
+            &windows,
+            (0, 0, 800, 600),
+            None,
+        );
+        assert_eq!(out0.stats.content_visible, 1);
+        assert!(
+            out0.snapshots
+                .iter()
+                .any(|s| s.id == w && !s.region.is_empty())
+        );
+        assert!(out0.presented_ids.contains(&w));
+        let elsewhere: std::collections::HashSet<_> = out0.pieces_ids.iter().copied().collect();
+        let out1 = build_with_elsewhere(
+            Visibility::On,
+            &core,
+            &mut store,
+            &windows,
+            (800, 0, 800, 600),
+            None,
+            &elsewhere,
+        );
+        assert_eq!(out1.stats.content_other_output, 1, "{:?}", out1.stats);
+        assert_eq!(out1.stats.content_off_output, 0);
+        assert!(
+            !out1.stats.off_output_damage_forces_compose(),
+            "damage another output presents must not force a Full compose here"
+        );
+        assert!(
+            !out1.snapshots.iter().any(|s| s.id == w),
+            "output 1 must not carry (and later ack) damage it did not present"
+        );
+        assert!(!out1.presented_ids.contains(&w));
+        assert!(
+            out1.pieces_ids.contains(&w),
+            "W's right half is visible on output 1, so it has pieces there"
+        );
+        assert!(out1.projected_damage.is_empty());
+    }
+
+    /// The xfce-submenu rule, pinned: an off-output paint still FORCES a
+    /// compose here, so a paint whose projection is empty is not left
+    /// undrained. It is deliberately **not carried and not presented** — the
+    /// forced compose displays none of those pixels, and carrying the snapshot
+    /// is what let a cold `elsewhere` turn this branch into the multi-output
+    /// ack race (2026-09-04: caja's spanning desktop, 247 unhealed audit
+    /// mismatches). The drain comes from dormancy instead: not presented ⇒
+    /// dormant ⇒ no re-forcing until the next paint. A window entirely off the
+    /// output never reaches the classifier at all (the intersects gate), so the
+    /// fixture is a spanning window whose damage projects off output 0.
+    #[test]
+    fn damage_off_output_forces_a_compose_but_is_never_carried() {
+        let (core, mut store, windows) = two_windows((700, 100, 200, 100), (0, 0, 10, 10));
+        let w = drawable_of(&store, 0x100);
+        // Storage-local x 150..200 → x 850..900: off output 0, on output 1.
+        store.damage(w, rect(150, 0, 50, 100));
+        let nowhere = std::collections::HashSet::new();
+        let out0 = build_with_elsewhere(
+            Visibility::On,
+            &core,
+            &mut store,
+            &windows,
+            (0, 0, 800, 600),
+            None,
+            &nowhere,
+        );
+        assert_eq!(out0.stats.content_off_output, 1, "{:?}", out0.stats);
+        assert_eq!(out0.stats.content_other_output, 0);
+        assert!(
+            out0.stats.off_output_damage_forces_compose(),
+            "an empty projection must still force a compose (xfce submenu)"
+        );
+        assert!(
+            !out0.snapshots.iter().any(|s| s.id == w),
+            "the forced compose shows none of those pixels, so it must not ack them"
+        );
+        assert!(
+            !out0.presented_ids.contains(&w),
+            "not presented ⇒ dormancy stops the forcing until the next paint"
+        );
+        // Once output 1's pieces are known, the same paint is output 1's.
+        let out1 = build_with_elsewhere(
+            Visibility::On,
+            &core,
+            &mut store,
+            &windows,
+            (800, 0, 800, 600),
+            None,
+            &nowhere,
+        );
+        assert_eq!(out1.stats.content_visible, 1);
+        let elsewhere: std::collections::HashSet<_> = out1.pieces_ids.iter().copied().collect();
+        let out0 = build_with_elsewhere(
+            Visibility::On,
+            &core,
+            &mut store,
+            &windows,
+            (0, 0, 800, 600),
+            None,
+            &elsewhere,
+        );
+        assert_eq!(out0.stats.content_other_output, 1);
+        assert!(!out0.stats.off_output_damage_forces_compose());
+        assert!(!out0.snapshots.iter().any(|s| s.id == w));
+    }
+
+    /// The multi-output ack race, second half: output 0 is flip-pending when
+    /// the paint lands, so only output 1 walks; output 1 composes for its own
+    /// reasons, retires, and acks what it carried. W's damage must survive that
+    /// ack, and output 0's next walk must project it.
+    #[test]
+    fn an_output_never_acks_damage_it_did_not_present() {
+        let (core, mut store, windows) = two_windows((700, 100, 200, 100), (0, 0, 10, 10));
+        let w = drawable_of(&store, 0x100);
+        // Output 0's most recent walk saw W (its retained pieces); no paint yet.
+        let warm = build_with(
+            Visibility::On,
+            &core,
+            &mut store,
+            &windows,
+            (0, 0, 800, 600),
+            None,
+        );
+        let elsewhere: std::collections::HashSet<_> = warm.pieces_ids.iter().copied().collect();
+        assert!(elsewhere.contains(&w));
+        // The paint lands while output 0 is flip-pending: only output 1 walks.
+        store.damage(w, rect(0, 0, 50, 100));
+        let out1 = build_with_elsewhere(
+            Visibility::On,
+            &core,
+            &mut store,
+            &windows,
+            (800, 0, 800, 600),
+            None,
+            &elsewhere,
+        );
+        // Output 1 composes (say, for its own cursor) and retires: it acks
+        // exactly what it carried.
+        for snap in out1.snapshots {
+            store.ack_presentation_damage(snap);
+        }
+        assert!(
+            !store.peek_presentation_damage(w).unwrap().region.is_empty(),
+            "output 1 never presented W's damage, so its retire must not have acked it"
+        );
+        // Output 0 retires and walks: the highlight is still there to compose.
+        let out0 = build_with(
+            Visibility::On,
+            &core,
+            &mut store,
+            &windows,
+            (0, 0, 800, 600),
+            None,
+        );
+        assert_eq!(projected_sorted(&out0), vec![rect(700, 100, 50, 100)]);
+        assert!(
+            out0.snapshots
+                .iter()
+                .any(|s| s.id == w && !s.region.is_empty())
+        );
     }
 
     /// `Off` keeps the unclipped projection: what the legacy emitter damaged.

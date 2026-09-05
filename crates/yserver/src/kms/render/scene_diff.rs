@@ -139,8 +139,24 @@ impl PresenceSignature {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ScenePresence {
     pub(crate) id: ParticipantId,
-    /// Placement (unclipped by occlusion), output-local.
+    /// Placement (unclipped by occlusion), output-local — the damage-side
+    /// summary, under the 32-box cap (a superset is safe when it is *added*).
     pub(crate) region: Region,
+    /// The exact placement rects, in EMISSION order — the participant's
+    /// **identity** for the diff. `region` cannot serve: past the cap it
+    /// collapses towards its bounding box, so two shapes of more than 32
+    /// fragments with the same extents compared EQUAL and a shape change went
+    /// undamaged (codex, post-merge review of `02bafec3`). Since step 2 a shape
+    /// change only wakes the tick, so this comparison is the only thing that
+    /// repaints it.
+    ///
+    /// Not canonicalised: the order is deterministic for an unchanged tree
+    /// (shape rects come from the stored `shape_bounding` list, an unshaped
+    /// node has one rect), and a client that re-specifies the same shape in a
+    /// different order reads as `moved` — over-damage, the safe direction. A
+    /// per-node sort on the walk's hot path was measurable (+13% on the bench)
+    /// and bought nothing.
+    pub(crate) place: Vec<vk::Rect2D>,
     /// What of `region` nothing above covers. Empty for a fully hidden
     /// participant, which is **still a participant**. Not read by the diff.
     pub(crate) visible: Region,
@@ -149,12 +165,14 @@ pub(crate) struct ScenePresence {
 
 /// Build a presence from a participant's placement rects.
 ///
-/// `place` is the node decision's exact rect list; the union here is
-/// damage-side, so the region cap's over-approximation is safe. `None` when the
-/// participant occupies nothing, which is not the same as being hidden: a
-/// hidden participant has a non-empty `place` and an empty `visible`.
+/// `place` is the node decision's exact rect list, taken by value — the
+/// decision is done with it once the node has emitted and claimed, so the
+/// presence owns it without a copy. The union here is damage-side, so the
+/// region cap's over-approximation is safe. `None` when the participant
+/// occupies nothing, which is not the same as being hidden: a hidden
+/// participant has a non-empty `place` and an empty `visible`.
 pub(crate) fn presence_from_place(
-    place: &[vk::Rect2D],
+    place: Vec<vk::Rect2D>,
     visible: Region,
     id: ParticipantId,
     signature: PresenceSignature,
@@ -166,6 +184,7 @@ pub(crate) fn presence_from_place(
     Some(ScenePresence {
         id,
         region,
+        place,
         visible,
         signature,
     })
@@ -209,14 +228,20 @@ pub(crate) fn structural_damage(prev: &[ScenePresence], now: &[ScenePresence]) -
     let now_rank = common_rank(now, &prev_by_id);
 
     // Participants whose rank index moved. A pair whose relative order flipped
-    // must contain two of these (if neither index moved, their order did not
-    // change), so the pairwise pass below is O(k²) in this set, not O(n²).
+    // must contain AT LEAST ONE of these (if neither index moved, their order
+    // did not change) — but not necessarily two: prev [A,B,C] → now [C,B,A]
+    // leaves B at rank 1 while it flips against both A and C. So every
+    // rank-changed participant is compared against every other common
+    // participant, O(k·n), not only against the other rank-changed ones
+    // (codex, post-merge review of `02bafec3`, finding 2).
     let mut rank_changed: Vec<&ScenePresence> = Vec::new();
     for p in now {
         match prev_by_id.get(&p.id) {
             None => damage.union_with(&p.region),
             Some(old) => {
-                let moved = old.region != p.region;
+                // Identity is the exact place list; `region` alone collapses
+                // past the cap (see `ScenePresence::place`).
+                let moved = old.place != p.place || old.region != p.region;
                 let resampled = old.signature != p.signature;
                 if moved || resampled {
                     damage.union_with(&old.region);
@@ -228,8 +253,18 @@ pub(crate) fn structural_damage(prev: &[ScenePresence], now: &[ScenePresence]) -
             }
         }
     }
-    for (i, p) in rank_changed.iter().enumerate() {
-        for q in &rank_changed[i + 1..] {
+    let changed_ids: std::collections::HashSet<ParticipantId> =
+        rank_changed.iter().map(|p| p.id).collect();
+    for p in &rank_changed {
+        for q in now
+            .iter()
+            .filter(|q| q.id != p.id && prev_by_id.contains_key(&q.id))
+        {
+            // A pair with both members rank-changed is visited from both sides;
+            // handle it once, from the member that now ranks lower.
+            if changed_ids.contains(&q.id) && now_rank[&p.id] > now_rank[&q.id] {
+                continue;
+            }
             let flipped =
                 (prev_rank[&p.id] < prev_rank[&q.id]) != (now_rank[&p.id] < now_rank[&q.id]);
             if !flipped {
@@ -283,6 +318,7 @@ mod tests {
         ScenePresence {
             id: id(xid),
             region: Region::from_rect(r),
+            place: vec![r],
             visible: Region::from_rect(r),
             signature: sig(),
         }
@@ -398,6 +434,7 @@ mod tests {
                 generation: 1,
             },
             region: Region::from_rect(rect(0, 0, 100, 100)),
+            place: vec![rect(0, 0, 100, 100)],
             visible: Region::from_rect(rect(0, 0, 100, 100)),
             signature: sig(),
         };
@@ -502,6 +539,75 @@ mod tests {
         assert_eq!(pixels(&d), pixels(&expect));
     }
 
+    /// Codex, post-merge review of `02bafec3` (finding 2): a batched restack
+    /// can leave a participant at the SAME rank while its order relative to
+    /// others flips. prev [A,B,C] → now [C,B,A]: B keeps rank 1 yet is now below
+    /// C and above A. Comparing only pairs where BOTH ranks moved (A,C) misses
+    /// both overlaps involving B, and when A and C are disjoint the damage is
+    /// empty despite a visible stacking change.
+    #[test]
+    fn a_batched_restack_damages_the_pivot_that_kept_its_rank() {
+        let a = presence(1, rect(0, 0, 30, 10));
+        let b = presence(2, rect(20, 0, 30, 10)); // a ∩ b = [20,30), b ∩ c = [40,50)
+        let c = presence(3, rect(40, 0, 30, 10)); // a ∩ c = ∅
+        let d = structural_damage(
+            &[a.clone(), b.clone(), c.clone()],
+            &[c.clone(), b.clone(), a.clone()],
+        );
+        let mut expect = Region::from_rect(rect(20, 0, 10, 10));
+        expect.union_with(&Region::from_rect(rect(40, 0, 10, 10)));
+        assert_eq!(
+            pixels(&d),
+            pixels(&expect),
+            "b flipped against both a and c: both overlaps are owed"
+        );
+    }
+
+    fn shape(xid: u32, rects: &[vk::Rect2D]) -> ScenePresence {
+        presence_from_place(rects.to_vec(), Region::new(), id(xid), sig()).expect("non-empty shape")
+    }
+
+    /// Codex finding 3: `region` is a capped `Region`, so two shapes with more
+    /// than 32 fragments and the same bounding box compare EQUAL after the
+    /// collapse. Shape changes only wake the tick since step 2, so a missed
+    /// comparison is a missed repaint. Identity must be the exact rect list.
+    #[test]
+    fn a_shape_change_beyond_the_region_cap_is_still_a_move() {
+        // 40 disjoint 2×2 rects. `Region::from_rects` adds one at a time and
+        // collapses the accumulated prefix to its bounding box the moment it
+        // exceeds 32 boxes, so rects 0..=32 end up as ONE box in both shapes
+        // when their first and last rects agree; rects 1..32 differ by a pixel
+        // and are exactly what the collapse erases. Rects 33..40 are identical.
+        let mut one = vec![rect(0, 0, 2, 2)];
+        let mut two = vec![rect(0, 0, 2, 2)];
+        for i in 1..32 {
+            one.push(rect(i * 4, 0, 2, 2));
+            two.push(rect(i * 4 + 1, 0, 2, 2));
+        }
+        for i in 32..40 {
+            one.push(rect(i * 4, 0, 2, 2));
+            two.push(rect(i * 4, 0, 2, 2));
+        }
+        let before = shape(7, &one);
+        let after = shape(7, &two);
+        assert_eq!(
+            before.region, after.region,
+            "precondition: the capped regions are indistinguishable"
+        );
+        let d = structural_damage(std::slice::from_ref(&before), std::slice::from_ref(&after));
+        assert!(!d.is_empty(), "a different shape must owe damage");
+        assert!(
+            d.intersects_rect(rect(4, 0, 2, 2)),
+            "covers a fragment that is in one shape and not the other"
+        );
+        // Identical shapes owe nothing.
+        let same = structural_damage(
+            std::slice::from_ref(&before),
+            std::slice::from_ref(&shape(7, &one)),
+        );
+        assert!(same.is_empty());
+    }
+
     #[test]
     fn a_map_does_not_read_as_a_restack_of_everything() {
         // Rank is computed among COMMON participants, so inserting a new
@@ -526,7 +632,7 @@ mod tests {
         // window change" becomes a per-quad question and a shape edit reads as
         // several participants appearing and vanishing.
         let place = [rect(0, 0, 10, 10), rect(20, 0, 10, 10)];
-        let p = presence_from_place(&place, Region::new(), id(1), sig()).expect("placed");
+        let p = presence_from_place(place.to_vec(), Region::new(), id(1), sig()).expect("placed");
         let mut expect = Region::from_rect(rect(0, 0, 10, 10));
         expect.union_with(&Region::from_rect(rect(20, 0, 10, 10)));
         assert_eq!(pixels(&p.region), pixels(&expect));
@@ -534,7 +640,7 @@ mod tests {
 
     #[test]
     fn a_participant_with_no_place_has_no_presence() {
-        assert!(presence_from_place(&[], Region::new(), id(1), sig()).is_none());
+        assert!(presence_from_place(Vec::new(), Region::new(), id(1), sig()).is_none());
     }
 
     /// Step 1: the diff reads placement, never visibility. Two frames that
@@ -545,12 +651,14 @@ mod tests {
         let before = vec![ScenePresence {
             id: id(1),
             region: Region::from_rect(rect(0, 0, 100, 100)),
+            place: vec![rect(0, 0, 100, 100)],
             visible: Region::from_rect(rect(0, 0, 100, 100)),
             signature: sig(),
         }];
         let after = vec![ScenePresence {
             id: id(1),
             region: Region::from_rect(rect(0, 0, 100, 100)),
+            place: vec![rect(0, 0, 100, 100)],
             visible: Region::new(),
             signature: sig(),
         }];

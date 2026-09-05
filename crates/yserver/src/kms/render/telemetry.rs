@@ -108,6 +108,11 @@ pub struct Bucket {
     pub scene_entries_visited: u64,
     pub scene_entries_drawn: u64,
     pub full_redraw_fallback: u64,
+    /// Ticks that returned before `build_scene` because nothing that could
+    /// produce damage had changed (`TickSkipReason::NothingPending`). Read
+    /// against `build_scene_calls/s`: the two together are the wake rate, and
+    /// this one is the part the walk-skip saved.
+    pub tick_skips_nothing_pending: u64,
     /// Step 4 — frames that took the clipped path. Against
     /// `full_redraw_fallback` this is the headline "is it working" signal.
     pub clipped_repaint: u64,
@@ -178,6 +183,8 @@ pub struct Bucket {
     /// that still forces a compose so the paint can ack). Summed over walks.
     pub content_damage_hidden: u64,
     pub content_damage_off_output: u64,
+    /// Off this output but shown on another, which presents and acks it.
+    pub content_damage_other_output: u64,
     // ── Stage 3a glyph/text counters ─────────────────────────
     /// Glyphs successfully interned into the atlas during the
     /// window. One `intern` call that returns `Some(entry)`
@@ -546,7 +553,9 @@ impl Telemetry {
              visibility_collapses/s[mine={} claim={} taken={} taken_skipped={}] \
              hidden_participants/s={} \
              content_damage_hidden/s={} content_damage_off_output/s={} \
-             full_redraw_fallback/s={} storage_allocations/s={} \
+             content_damage_other_output/s={} \
+             full_redraw_fallback/s={} tick_skips_nothing_pending/s={} \
+             storage_allocations/s={} \
              descriptor_allocations/s={} image_view_creates/s={} \
              frame_present_count/s={} missed_pageflips/s={} present_skips/s={} \
              atlas_intern/s={} glyph_uploads/s={} \
@@ -610,7 +619,9 @@ impl Telemetry {
             b.hidden_participants,
             b.content_damage_hidden,
             b.content_damage_off_output,
+            b.content_damage_other_output,
             b.full_redraw_fallback,
+            b.tick_skips_nothing_pending,
             b.storage_allocations,
             b.descriptor_allocations,
             b.image_view_creates,
@@ -994,6 +1005,11 @@ impl Telemetry {
         self.lifetime.full_redraw_fallback += 1;
     }
 
+    pub(crate) fn record_tick_skip_nothing_pending(&mut self) {
+        self.bucket.tick_skips_nothing_pending += 1;
+        self.lifetime.tick_skips_nothing_pending += 1;
+    }
+
     pub(crate) fn record_storage_allocation(&mut self) {
         self.bucket.storage_allocations += 1;
         self.lifetime.storage_allocations += 1;
@@ -1046,10 +1062,17 @@ impl Telemetry {
 
     /// Stage C — content-damage classification for one walk. See
     /// [`Bucket::content_damage_hidden`].
-    pub(crate) fn record_content_damage(&mut self, hidden: u64, off_output: u64) {
+    pub(crate) fn record_content_damage(
+        &mut self,
+        hidden: u64,
+        off_output: u64,
+        other_output: u64,
+    ) {
         for t in [&mut self.bucket, &mut self.lifetime] {
             t.content_damage_hidden = t.content_damage_hidden.saturating_add(hidden);
             t.content_damage_off_output = t.content_damage_off_output.saturating_add(off_output);
+            t.content_damage_other_output =
+                t.content_damage_other_output.saturating_add(other_output);
         }
     }
 

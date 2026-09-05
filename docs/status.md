@@ -6570,8 +6570,41 @@ follows the wlroots model, in the order the plan argues for (0 → 3 → 4 → 2
   whole-draw cull was reverted: it failed because a `covered` UNION collapsed to
   its bounding box past the cap and claimed everything under it — see
   `docs/superpowers/findings/2026-09-03-naive-occlusion-cull-postmortem.md`.
-  **Not yet:** clipping projected content damage to the visible region and the
-  matching hidden-damage ack (stage C, plan step 1 "Content damage").
+- **Stage C** (`92a7e0f1`) — projected content damage is clipped to the node's
+  visible pieces, so a paint into the covered part of a window damages nothing.
+  Each snapshot is classified per output; only damage that projected off *every*
+  output still forces a compose (the xfce-submenu gap), and hidden damage is not
+  acked — it is re-peeked and drains when the window is uncovered.
+
+### Post-merge follow-ups (branch `fix/damage-repaint-followups`, 2026-09-04)
+
+A codex review of the squash found four regressions, all confirmed and fixed
+tests-first, and hardware testing then found a fifth:
+
+- Hidden damage **busy-looped** the render thread (1650-1900 scene walks/s at 2
+  composes/s with a window covered). Dormancy now has two reasons: no visible
+  pieces stays dormant across paints, hidden damage re-arms on the next paint.
+- A **batched restack** could miss damage (`A B C → C B A` leaves the pivot's
+  rank unchanged while it flips against both neighbours).
+- A **shape change past the 32-box region cap** compared equal by bounding box;
+  presences now carry their exact place rects for the moved test.
+- A **truncated submit** was not repaired next frame: an owed repaint now counts
+  as wanting a compose and is consulted before the empty-damage skip.
+- **Multi-output ack race** (`36e357af`, found by the damage audit + a scanout
+  dump: 260 mismatches in one frame, 247 unhealed, a rubber-band selection left
+  on screen). An output now carries and acks only damage it actually presented;
+  off-output damage still forces a compose but never acks pixels it did not
+  display. Correctness no longer depends on cross-output state that is a walk
+  stale. **Still open:** damage straddling two outputs is presented by whichever
+  output composes first — pre-existing on master, no repro yet.
+- A **pre-walk predicate** skips the scene walk on wakes that cannot produce
+  damage, asked per output: e16 phased workload 771 → 354 walks/s and
+  `build_scene` CPU 357 → 98 ms/s, with composes 57 → 34/s at identical painted
+  fractions (the ack-race fix removed forced composes that displayed nothing).
+- Diagnostics behind `YSERVER_TICK_SKIP_LOG` (which the audit recipe now sets):
+  `content-diag`, `ack-diag`, `dormant-diag`, `overlay-diag`.
+
+Finding: `docs/superpowers/findings/2026-09-04-post-merge-followups.md`.
 
 Instruments: `tools/damage-workload.sh` + `tools/damage-phases.py` +
 `just yserver-{awesome,mate,e16}-hw-workload` (deterministic phased workload;

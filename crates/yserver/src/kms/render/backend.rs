@@ -3319,6 +3319,11 @@ impl KmsBackend {
         // Redirected windows paint through their backing, so resize-time
         // callers can defer this work until unredirect without affecting
         // the compositor-visible pixels.
+        //
+        // Storage replacement changes the view the walk samples. Both callers
+        // (configure, unredirect) wake the scene themselves; this one is here so
+        // the walk-skip predicate does not depend on that staying true.
+        self.scene.wake_for_damage();
         self.store.detach_xid(host_xid);
         self.store_decref_with_invalidate(old_id);
         let storage = match self
@@ -8994,7 +8999,11 @@ impl KmsBackend {
     /// xfce submenu bug — a menu painted after its map-compose sat
     /// off-screen until an unrelated event poked the loop).
     fn scene_wants_compose(&self) -> bool {
-        self.scene.scene_structure_dirty || self.store.has_pending_presentation_damage()
+        self.scene.scene_structure_dirty
+            || self.store.has_pending_presentation_damage()
+            // An invalidated or never-presented frame owes a repaint no producer
+            // reports; without this the tick is never driven to paint it.
+            || self.scene.owes_repaint()
     }
 
     fn present_flip_in_flight_for_output(&self, output_idx: usize) -> bool {
@@ -17682,6 +17691,12 @@ impl Backend for KmsBackend {
             return Ok(());
         };
         self.store.set_scene_participating(b_id, participating);
+        // No wake: a backing is a pixmap, never a walked node, so its
+        // `scene_participating` is not a `decide_node` input — it only gates
+        // whether the backing's own presentation damage is peeked/pending.
+        // The WINDOW's flag is what the walk reads, and
+        // `set_window_scene_participation` dirties for that. Pinned by
+        // `set_backing_scene_participation_flips_flag_no_damage`.
         Ok(())
     }
 
@@ -17777,6 +17792,11 @@ impl Backend for KmsBackend {
             // record stays uninstalled (protocol error upstream).
             if let Some(w_id) = self.store.lookup(w_xid) {
                 self.store.set_redirected_target(w_id, Some(b_id));
+                // The route flip changes what the walk samples for W (the
+                // backing's view, extent and UV denominator). The content is
+                // the same, but the tick only walks when told something
+                // changed, and the presence signature must catch up.
+                self.scene.wake_for_damage();
             } else {
                 log::warn!(
                     "render allocate_redirected_backing(0x{w_xid:x}): window not in store \

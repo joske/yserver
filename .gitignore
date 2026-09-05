@@ -8,6 +8,14 @@ target/
 # Runtime logs (reference traces live under docs/assets/)
 *.log
 !docs/assets/*.log
+
+# Raw measurement captures stay LOCAL. A finding quotes the numbers it drew
+# from a run; the multi-hundred-KB `amdgpu_top --json` dump behind it does not
+# belong in history. Four went in on 2026-09-03 before this rule and are there
+# for good: rewriting shared history would break every fork and every
+# contributor branch based on it, which matters more than the ruleset that also
+# forbids the force-push. Get it right the first time instead.
+docs/superpowers/findings/data/*.json
 *.strace
 # Stage 5 Task 6.1 vng smoke captures (large, regenerable via
 # `just yserver-defpresent-vng-smoke`).

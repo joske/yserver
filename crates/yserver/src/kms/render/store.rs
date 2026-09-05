@@ -626,6 +626,25 @@ pub(crate) struct DamageSnapshot {
 // Drawable — one entry in DrawableStore.
 // ────────────────────────────────────────────────────────────────
 
+/// Why a scene-participating drawable with pending presentation damage is not
+/// arming the compose scheduler. Two reasons, two re-arm rules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DormantReason {
+    /// The walk emitted no piece of it on any output: fully covered,
+    /// off-output, or an empty bounding shape. No paint can become visible
+    /// without a structural change, and every structural change wakes the
+    /// tick, so this stays dormant across paints — an off-screen window
+    /// painting at 60 fps must not cost 60 walks/s (cut 2b).
+    NoPieces,
+    /// The walk emitted pieces of it, but its captured damage lay entirely
+    /// under a cover on every output. The NEXT paint may land in the visible
+    /// part, so `DrawableStore::damage` clears this reason: one walk per paint
+    /// for such a window (mpv half under a terminal: ~26 walks/s, not the ~1850
+    /// of a scheduler that never went dormant), re-flagged if that paint is
+    /// hidden again.
+    HiddenDamage,
+}
+
 pub(crate) struct Drawable {
     pub(crate) id: DrawableId,
     pub(crate) xid: u32,
@@ -663,7 +682,7 @@ pub(crate) struct Drawable {
     /// forced full recompose draws it from storage and the ack drains
     /// it, clearing this flag. Reconciled only when every output walked
     /// this tick (see `SceneCompositor::tick`).
-    pub(crate) offscreen_no_draw: bool,
+    pub(crate) dormant: Option<DormantReason>,
 
     /// Ungated monotonic content-write counter. Bumped (saturating) on EVERY
     /// write to this drawable's pixels — the eight engine paint entry points —
@@ -900,7 +919,7 @@ impl DrawableStore {
             last_render_ticket: None,
             presentation_damage: RegionSet::new(),
             presentation_damage_epoch: 0,
-            offscreen_no_draw: false,
+            dormant: None,
             content_version: 0,
             redirected_target: None,
         };
@@ -1104,6 +1123,12 @@ impl DrawableStore {
         if d.scene_participating {
             d.presentation_damage.add(rect);
             d.presentation_damage_epoch = d.presentation_damage_epoch.checked_add(1).unwrap_or(0);
+            // A window whose last paint was under a cover may be painting its
+            // visible part now: re-arm. A window nothing of which is drawn
+            // cannot become visible by painting, so it stays dormant.
+            if d.dormant == Some(DormantReason::HiddenDamage) {
+                d.dormant = None;
+            }
         }
     }
 
@@ -1118,30 +1143,70 @@ impl DrawableStore {
     /// circuits on the first match, no allocation.
     pub(crate) fn has_pending_presentation_damage(&self) -> bool {
         self.entries.values().any(|d| {
-            d.scene_participating && !d.presentation_damage.is_empty() && !d.offscreen_no_draw
+            d.scene_participating && !d.presentation_damage.is_empty() && d.dormant.is_none()
         })
     }
 
-    /// Idle free-run fix (cut 2b): reconcile the `offscreen_no_draw`
-    /// flag from the set of drawables actually drawn (sampled) by
-    /// `build_scene` across ALL outputs this tick. A scene-participating
-    /// drawable with undrained presentation damage that was NOT drawn on
-    /// any output cannot be composed/ack'd right now (it clips to an
-    /// empty visible box — off-screen / empty bounding shape), so flag
-    /// it OUT of the compose scheduler; one that WAS drawn is cleared.
-    /// The damage is never cleared here — see `offscreen_no_draw`. MUST
-    /// be called only when every output walked (`build_scene` ran), so a
-    /// drawable visible only on a mid-flip output isn't mis-flagged.
-    /// `drawn` holds *sampled source* ids (a redirected Automatic
-    /// window is sampled via its backing id, not its own).
-    pub(crate) fn reconcile_offscreen_no_draw(&mut self, drawn: &HashSet<DrawableId>) {
+    /// The drawables [`Self::has_pending_presentation_damage`] counts, by id —
+    /// armed, scene-participating, with damage waiting. The tick's pre-walk
+    /// predicate tests these against each output's retained set of drawables
+    /// that emitted pieces there, so an output the damaged window is not on
+    /// need not walk. Small in practice: at most the windows that painted since
+    /// the last compose.
+    pub(crate) fn armed_damaged_ids(&self) -> Vec<DrawableId> {
+        self.entries
+            .iter()
+            .filter(|(_, d)| {
+                d.scene_participating && !d.presentation_damage.is_empty() && d.dormant.is_none()
+            })
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Reconcile dormancy from what the walk did on ALL outputs this tick.
+    ///
+    /// `presented`: sampled sources whose pending damage reached the screen on
+    /// some output (projected `Visible`), was off-output (forces a compose that
+    /// acks it), or had no damage. `had_pieces`: sources that emitted at least
+    /// one piece on some output. A scene-participating drawable with undrained
+    /// damage that is in neither set is `NoPieces`; one that emitted pieces but
+    /// presented none of its damage is `HiddenDamage` — see [`DormantReason`]
+    /// for the two re-arm rules. The damage itself is PRESERVED. MUST be called
+    /// only when every output walked (`build_scene` ran), so a drawable visible
+    /// only on a mid-flip output isn't mis-flagged. Ids are *sampled source*
+    /// ids (a redirected Automatic window is sampled via its backing).
+    ///
+    /// 2026-09-04: `presented` is really "presented by a walked output, OR
+    /// possibly presentable by an output that did not walk this tick" and
+    /// `had_pieces` is "has pieces on some output, retained" — the tick builds
+    /// both with `scene::dormancy_inputs`, so this runs on any tick where at
+    /// least one output walked, not only when all did.
+    /// Returns the drawables whose dormancy CHANGED, so the caller can log the
+    /// transitions. A stranded window — damage pending, dormancy wrong — shows
+    /// on screen as content that only heals where something else happens to
+    /// compose, and the reason (`NoPieces` never re-arms on paint,
+    /// `HiddenDamage` does) is what separates a correct verdict from a bug.
+    pub(crate) fn reconcile_offscreen_no_draw(
+        &mut self,
+        presented: &HashSet<DrawableId>,
+        had_pieces: &HashSet<DrawableId>,
+    ) -> Vec<(DrawableId, Option<DormantReason>)> {
+        let mut changed = Vec::new();
         for (id, d) in &mut self.entries {
-            if !d.scene_participating || d.presentation_damage.is_empty() {
-                d.offscreen_no_draw = false;
-                continue;
+            let before = d.dormant;
+            if !d.scene_participating || d.presentation_damage.is_empty() || presented.contains(id)
+            {
+                d.dormant = None;
+            } else if had_pieces.contains(id) {
+                d.dormant = Some(DormantReason::HiddenDamage);
+            } else {
+                d.dormant = Some(DormantReason::NoPieces);
             }
-            d.offscreen_no_draw = !drawn.contains(id);
+            if before != d.dormant {
+                changed.push((*id, d.dormant));
+            }
         }
+        changed
     }
 
     /// Snapshot for the SceneCompositor to ack later.
@@ -1574,11 +1639,12 @@ mod tests {
         );
 
         // Not drawn on any output this tick → flag off-screen.
-        s.reconcile_offscreen_no_draw(&HashSet::new());
+        s.reconcile_offscreen_no_draw(&HashSet::new(), &HashSet::new());
         assert!(
             !s.has_pending_presentation_damage(),
             "un-drawable off-screen damage must not arm the scheduler (idle spin)",
         );
+        assert_eq!(s.get(id).unwrap().dormant, Some(DormantReason::NoPieces));
         assert_eq!(
             s.get(id).unwrap().presentation_damage.rects().len(),
             1,
@@ -1588,10 +1654,81 @@ mod tests {
         // Drawn this tick (e.g. it came on-screen) → flag cleared →
         // counted again so its damage composes + drains.
         let drawn: HashSet<DrawableId> = std::iter::once(id).collect();
-        s.reconcile_offscreen_no_draw(&drawn);
+        s.reconcile_offscreen_no_draw(&drawn, &drawn);
         assert!(
             s.has_pending_presentation_damage(),
             "a drawn window's damage re-arms the scheduler",
+        );
+    }
+
+    /// Two drawables with pending damage, only one presented: the other is
+    /// flagged, and the scheduler stays armed for the presented one alone.
+    #[test]
+    fn reconcile_flags_only_the_drawables_left_out_of_the_presented_set() {
+        let mut s = DrawableStore::new();
+        let shown = s
+            .allocate(0x1, DrawableKind::Window, 24, true, stub_storage())
+            .unwrap();
+        let hidden = s
+            .allocate(0x2, DrawableKind::Window, 24, true, stub_storage())
+            .unwrap();
+        s.damage(shown, rect(0, 0, 4, 4));
+        s.damage(hidden, rect(0, 0, 4, 4));
+        let presented: HashSet<DrawableId> = std::iter::once(shown).collect();
+        s.reconcile_offscreen_no_draw(&presented, &presented);
+        assert!(s.get(shown).unwrap().dormant.is_none());
+        assert_eq!(
+            s.get(hidden).unwrap().dormant,
+            Some(DormantReason::NoPieces)
+        );
+        assert!(
+            s.has_pending_presentation_damage(),
+            "the presented drawable still arms the scheduler"
+        );
+        s.reconcile_offscreen_no_draw(&HashSet::new(), &HashSet::new());
+        assert!(!s.has_pending_presentation_damage());
+        assert_eq!(s.get(hidden).unwrap().presentation_damage.rects().len(), 1);
+    }
+
+    /// Coordinator review of fix 1 (2026-09-04): a partially covered window
+    /// whose paint was hidden once must re-arm on its NEXT paint, which may
+    /// land in the visible part. A fully un-drawable window must not.
+    #[test]
+    fn a_paint_rearms_hidden_damage_dormancy_but_not_no_pieces() {
+        let mut s = DrawableStore::new();
+        let half = s
+            .allocate(0x1, DrawableKind::Window, 24, true, stub_storage())
+            .unwrap();
+        let gone = s
+            .allocate(0x2, DrawableKind::Window, 24, true, stub_storage())
+            .unwrap();
+        s.damage(half, rect(0, 0, 4, 4));
+        s.damage(gone, rect(0, 0, 4, 4));
+        // `half` emitted pieces but presented none of its damage; `gone`
+        // emitted nothing at all.
+        let pieces: HashSet<DrawableId> = std::iter::once(half).collect();
+        s.reconcile_offscreen_no_draw(&HashSet::new(), &pieces);
+        assert_eq!(
+            s.get(half).unwrap().dormant,
+            Some(DormantReason::HiddenDamage)
+        );
+        assert_eq!(s.get(gone).unwrap().dormant, Some(DormantReason::NoPieces));
+        assert!(!s.has_pending_presentation_damage());
+        // A new paint into the hidden-damage window re-arms it …
+        s.damage(half, rect(1, 1, 2, 2));
+        assert!(s.get(half).unwrap().dormant.is_none());
+        assert!(
+            s.has_pending_presentation_damage(),
+            "the next paint may be visible: it must wake the tick"
+        );
+        // … and a new paint into the no-pieces window does not.
+        s.reconcile_offscreen_no_draw(&HashSet::new(), &HashSet::new());
+        assert!(!s.has_pending_presentation_damage());
+        s.damage(gone, rect(1, 1, 2, 2));
+        assert_eq!(s.get(gone).unwrap().dormant, Some(DormantReason::NoPieces));
+        assert!(
+            !s.has_pending_presentation_damage(),
+            "nothing of it can appear without a structural change; stay dormant"
         );
     }
 

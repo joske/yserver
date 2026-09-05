@@ -16,6 +16,16 @@ use yserver_protocol::x11::ClientId;
 /// exact-match erase symmetry). Real outlines are a handful of thin rects.
 const MAX_OVERLAY_RECTS: usize = 4096;
 
+/// What one [`RootOverlay::toggle`] did. `changed == false` means the batch was
+/// empty and nothing needs damaging.
+#[derive(Default, Clone, Copy, Debug)]
+pub(crate) struct ToggleOutcome {
+    pub(crate) changed: bool,
+    pub(crate) removed: usize,
+    pub(crate) inserted: usize,
+    pub(crate) total: usize,
+}
+
 #[derive(Default)]
 pub(crate) struct RootOverlay {
     /// xor_value -> active rects toggled by that value (root-absolute coords).
@@ -30,18 +40,31 @@ impl RootOverlay {
 
     /// Toggle a batch of rects for one xor_value by EXACT match (present ->
     /// remove, absent -> insert). Records the owner. Returns true if state
-    /// changed. On cap overflow, clears everything and returns true.
-    pub(crate) fn toggle(&mut self, client: ClientId, value: u32, rects: &[vk::Rect2D]) -> bool {
+    /// changed, plus how many rects were removed and inserted — an erase that
+    /// does not match what was drawn INSERTS instead, and two copies of a rect
+    /// XOR to identity, so fresh composes look clean while already-inverted
+    /// pixels stay stale on screen. That is indistinguishable from lost damage
+    /// by eye, so the counts are reported for the caller to log.
+    pub(crate) fn toggle(
+        &mut self,
+        client: ClientId,
+        value: u32,
+        rects: &[vk::Rect2D],
+    ) -> ToggleOutcome {
         if rects.is_empty() {
-            return false;
+            return ToggleOutcome::default();
         }
         self.owner_clients.insert(client);
+        let mut removed = 0usize;
+        let mut inserted = 0usize;
         let list = self.xor_ops.entry(value).or_default();
         for r in rects {
             if let Some(pos) = list.iter().position(|e| rect_eq(e, r)) {
                 let _ = list.swap_remove(pos);
+                removed += 1;
             } else {
                 list.push(*r);
+                inserted += 1;
             }
         }
         if list.is_empty() {
@@ -53,7 +76,12 @@ impl RootOverlay {
             );
             self.clear();
         }
-        true
+        ToggleOutcome {
+            changed: true,
+            removed,
+            inserted,
+            total: self.total_rects(),
+        }
     }
 
     fn total_rects(&self) -> usize {
