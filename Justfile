@@ -807,12 +807,8 @@ yserver-awesome-hw log="info":
         RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-awesome.log 2>&1 &\
         yserver_pid=$!;\
         sleep 2;\
-        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
-            DISPLAY=:7 awesome > awesome.log 2>&1 &\
-        sleep 2;\
-        DISPLAY=:7 feh --bg-fill /home/jos/Pictures/catbackground.jpg ;\
-        DISPLAY=:7 wezterm ;\
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET GDK_BACKEND=x11 XDG_SESSION_TYPE=x11 \
+            DISPLAY=:7 awesome > awesome.log 2>&1;\
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;'
 
@@ -845,10 +841,7 @@ yserver-awesome-hw-telemetry log="info":
         sleep 2;\
         env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET GDK_BACKEND=x11 \
             XDG_SESSION_TYPE=x11 XDG_RUNTIME_DIR="$xdg_rd" \
-            DISPLAY=:7 awesome > awesome.log 2>&1 &\
-        sleep 2;\
-        DISPLAY=:7 feh --bg-fill /home/jos/Pictures/catbackground.jpg ;\
-        DISPLAY=:7 wezterm ;\
+            DISPLAY=:7 awesome > awesome.log 2>&1 ;\
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;\
         rm -rf "$xdg_rd" 2>/dev/null;'
