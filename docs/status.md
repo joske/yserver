@@ -686,6 +686,25 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   (`dix/dispatch.c:3762`), so a port scan, a bad cookie or a failed setup arms
   nothing. Default `-noreset`, opposite to Xorg, because a stray reset in a
   desktop session is indistinguishable from a crash.
+  *First hardware run (bee, 2026-09-09):* the server survived **four** real
+  resets, kept its outputs, and shut down cleanly on SIGTERM — no errors, only
+  the pre-existing Vulkan validation-layer and dma-buf warnings from startup.
+  **Input worked in the second session**, which is the load-bearing result:
+  Direct mode's `probe_input_devices` is a no-op and libinput's `DeviceAdded`
+  burst is one-shot at process start, so XI state can only come from the
+  `InputInventory`, and by session 2 it had been rebuilt three times. Note a
+  re-seed does not re-emit `DeviceAdded`, so the absence of further
+  `xi-device: added` lines in the log is expected and proves nothing either
+  way — only a client receiving events does.
+  The run also surfaced a semantic sharp edge, now in the man page: under
+  `-reset` **any** one-shot client that is the last one resets the session, so
+  running `xprop` against an idle `-reset` server destroys it. That invalidated
+  the first version of the `yserver-reset-hw` probe, whose own `xprop -set`
+  reset away the property it had just written — it could only ever report
+  "not found". Fixed by holding session 1's xterm open across the stamp.
+  *Still unverified on hardware:* the root-property leak check (the probe was
+  vacuous on the first run), and whether the boundary clears the screen
+  without blinking or changing mode.
   *Not done:* the composite-overlay claim is still not a per-client resource,
   which is a prerequisite for shipping reset; stage 2 (`xhost`) is specified
   and deferred; stage 4 (XDMCP) is unstarted; the two-session hardware run is
