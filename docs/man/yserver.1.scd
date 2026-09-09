@@ -52,6 +52,32 @@ how the server is started:
 *-layout* _layout_
 	XKB layout name, e.g. *be*.
 
+*-listen* _protocol_, *-nolisten* _protocol_
+	Enable or disable a transport. Only *tcp* is understood; any other
+	value is accepted and ignored so a display manager's argv does not
+	fail. The options are ordered and the last one for a transport wins,
+	so *-listen tcp -nolisten tcp* leaves TCP disabled.
+
+	TCP is *disabled by default*, as on a modern *Xorg*(1) build. With
+	*-listen tcp* the server binds *0.0.0.0* on port 6000 plus the display
+	number — every interface, not just loopback.
+
+	*-listen tcp* requires *-auth* with a usable MIT-MAGIC-COOKIE-1 file
+	and refuses to start without one. Read the warning under *SECURITY*
+	before using it.
+
+*-noreset*, *-reset*, *-terminate*
+	What to do when the last client that completed connection setup
+	disconnects. *-noreset* is the default and does nothing, so the server
+	outlives its clients — this is what *starty*(1) and an ordinary
+	desktop session want. *-reset* destroys the session and returns the
+	server to a freshly-started state, ready for the next one. *-terminate*
+	exits instead. Ordered and last-wins.
+
+	Note the default is the opposite of *Xorg*(1), which resets. A stray
+	reset in a desktop session is indistinguishable from a crash, and
+	nothing that launches *yserver* today expects one.
+
 *--version*, *-version*
 	Print the version and the commit it was built from, then exit.
 
@@ -66,9 +92,8 @@ parses them so startup does not fail, but they have no effect:
 *-novtswitch*
 	No-op.
 
-*-nolisten* _protocol_, *-config* _file_, *-background* _spec_
-	Parsed with their value and discarded. TCP is never listened on
-	regardless of *-nolisten*.
+*-config* _file_, *-background* _spec_
+	Parsed with their value and discarded.
 
 # KEY BINDINGS
 
@@ -99,8 +124,26 @@ parses them so startup does not fail, but they have no effect:
 *SIGUSR2* (incoming)
 	Acquire the virtual console.
 
-*SIGTERM*, *SIGINT*, *SIGHUP*
+*SIGTERM*, *SIGINT*
 	Shut down, restoring the console.
+
+*SIGHUP*
+	Depends on the reset policy, and is deliberately not uniform:
+
+[[ *policy*
+:[ *SIGHUP does*
+|  *-noreset* (default)
+:  shuts down, restoring the console
+|  *-reset*
+:  forces a reset
+|  *-terminate*
+:  forces a reset, *not* a terminate
+
+	Forcing a reset under *-terminate* follows *Xorg*(1), where a hangup
+	always resets and *-terminate* governs only what the last client
+	leaving does. The *-noreset* row is the exception: a hangup has always
+	stopped *yserver*, and making it destroy a default session instead
+	would be a surprising change to a signal people already send.
 
 The diagnostic dumps are *not* signal-driven; they are the key bindings
 above.
@@ -150,6 +193,32 @@ above.
 
 Further *YSERVER_*\* variables exist for development tracing and are
 deliberately not documented here; see the project documentation.
+
+# SECURITY
+
+With the default options *yserver* listens on a UNIX socket only, and the
+socket's filesystem permissions are the access control.
+
+*-listen tcp* changes that completely. The server binds *0.0.0.0* — every
+interface — and the *only* thing standing between the network and the display
+is the MIT-MAGIC-COOKIE-1 cookie. There is no host-based access control:
+*xhost*(1) is not implemented yet, so there is nothing to restrict which hosts
+may connect, and no way to grant or revoke access per host.
+
+Consequences worth being explicit about:
+
+- Anyone who can reach the port and obtain the cookie has the display: all
+  input, all window contents, and the ability to inject events.
+- The cookie is the whole boundary, so treat the authority file as a secret.
+  *-listen tcp* refuses to start without one precisely because the failure
+  mode of forgetting it would be an open X server on the network.
+- The X11 wire protocol is *not encrypted*. Everything, including keystrokes,
+  crosses the network in clear text.
+
+For ordinary remote use, prefer *ssh -X*, which needs none of this: it proxies
+through a local UNIX socket on the remote host and never touches the TCP
+listener. *-listen tcp* exists for XDMCP, where the display manager supplies a
+per-session cookie and the network is assumed to be trusted.
 
 # FILES
 
