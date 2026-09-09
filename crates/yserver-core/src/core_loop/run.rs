@@ -3156,13 +3156,6 @@ fn handle_client_setup_complete(
             fd_passing,
         },
     );
-    // The single production site where a client becomes ESTABLISHED,
-    // and therefore the only place the reset trigger is armed. Not at
-    // accept and not at connect: a port scan on the TCP listener, a
-    // handshake that drops half-way, and a connection refused for a bad
-    // cookie all end before this line and must arm nothing.
-    reset_trigger.note_client_established();
-
     setup_registry
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -3188,6 +3181,28 @@ fn handle_client_setup_complete(
         reader_control_rx,
         sender.clone_handle(),
     )?;
+
+    // The single production site where a client becomes ESTABLISHED, and
+    // therefore the only place the reset trigger is armed. Deliberately
+    // LAST, after both the poller registration and the reader spawn have
+    // succeeded — not at the `state.clients.insert` above.
+    //
+    // Xorg's equivalent is `client->clientState = ClientStateRunning`
+    // (`dix/dispatch.c:3762`), set only after the setup reply is written
+    // and establishment has fully succeeded; `CloseDownClient`
+    // (`:3537`) then triggers the last-client reset only for a client
+    // that reached Running. A client of ours whose `register` or
+    // `spawn` fails cannot participate in the core loop at all — it
+    // produces no request and no reader thread — so it is not the
+    // analogue of Running. Arming at the insert instead would let the
+    // caller's own error path (`run.rs:1491`, which disconnects a failed
+    // setup) fire a reset for a client that never ran.
+    //
+    // Everything that ends before this line must arm nothing: a port
+    // scan on the TCP listener, a handshake that drops half-way, a
+    // connection refused for a bad cookie, and now a failed
+    // registration or reader spawn.
+    reset_trigger.note_client_established();
 
     Ok(())
 }

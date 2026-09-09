@@ -311,7 +311,20 @@ is why it is a requirement and not a nicety.
   single-session desktop launched by `starty`.
 - `-reset` — reset on last client (Xorg's default).
 - `-terminate` — exit instead of resetting.
-- `SIGHUP` — force a reset regardless.
+- `SIGHUP` — an **explicit forced reset that overrides `-reset` and
+  `-terminate`**, matching Xorg: `AutoResetServer` (`os/utils.c:407`) raises
+  `DE_RESET` unconditionally, while `dispatchExceptionAtReset`
+  (`dix/dispatch.c:3480`) is consumed only by the last-client path through
+  `SetDispatchExceptionTimer` (`:422`). So Xorg resets on HUP even under
+  `-terminate`, and we keep that: `-terminate` means "terminate when the last
+  running client leaves", not "make every reset a terminate".
+
+  **Our HUP behaviour is therefore deliberately non-uniform**, and that must be
+  documented in the man page rather than discovered: it **shuts down** under
+  `-noreset` and **resets** under `-reset` and `-terminate`. The `-noreset`
+  case is a compatibility exception — SIGHUP shuts the server down today, and
+  adopting Xorg's meaning there would turn a signal that currently stops a
+  default server into one that destroys its session.
 
 **Our default is `-noreset`** — reset only when `-reset` is passed, or implied
 by the XDMCP options in stage 4. Recommended here and concurred by codex.
