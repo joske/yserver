@@ -13,13 +13,16 @@ again. `-once` exits instead.
 
 ## Ordering principle
 
-**Codec, then state machine, then integrations, then the loop.** The codec is
-pure and testable against protocol byte vectors with nothing else in place.
-The state machine is a pure transition function over decoded packets, testable
-with no socket. Only then do the two integrations that carry the real risk —
-auth and reset — get wired, and only last does any of it touch the core loop.
+**Codec, state machine, config, then integrations, then the loop.** The codec
+is pure and testable against protocol byte vectors with nothing else in place.
+The state machine is a pure transition function — over packets, timers *and*
+the session-client lifecycle events — testable with no socket. `XdmcpOptions`
+comes third rather than last because the reset and socket wiring both need a
+production configuration source to read. Only then do the two integrations
+that carry the real risk — auth and reset — get wired, and only after that
+does any of it touch the core loop.
 
-Nothing sends a packet until step 5. Steps 1-2 are pure functions.
+Nothing sends a packet until step 6. Steps 1-2 are pure functions.
 
 ## Prerequisites
 
@@ -38,12 +41,13 @@ Nothing sends a packet until step 5. Steps 1-2 are pure functions.
 
 ## Step 1 — the wire codec
 
-Pure encode/decode for the nine message types: `Query`, `BroadcastQuery`,
+Pure encode/decode for the thirteen message types: `Query`, `BroadcastQuery`,
 `IndirectQuery`, `Willing`, `Unwilling`, `Request`, `Accept`, `Decline`,
 `Manage`, `Refuse`, `Failed`, `KeepAlive`, `Alive`. `ARRAY8`, `ARRAY16`,
 `ARRAY32` and `ARRAYofARRAY8` primitives underneath.
 
-**Proof.** Round-trips are necessary but **not sufficient** — a self-consistent
+**Proof.** Vectors for **every one of the thirteen**, not just the ones the
+happy path uses. Round-trips are necessary but **not sufficient** — a self-consistent
 codec that is wrong on the wire passes every round-trip test. So the vectors
 must come from the protocol specification and from real captured packets, not
 from our own encoder. Include the length-field arithmetic explicitly:
@@ -58,9 +62,29 @@ States per `xdmcp.c:80` and its option assignments: `Off`, `Query`,
 `AwaitRequestResponse`, `Manage`, `AwaitManageResponse`, `RunSession`,
 `KeepAlive`, `AwaitAliveResponse`.
 
-Model it as `(state, event) -> (state, actions)` with no I/O, where events are
-decoded packets and timer expiry, and actions are "send packet X", "install
-cookie", "clear cookie", "reset generation", "terminate".
+Model it as `(state, event) -> (state, actions)` with no I/O. Actions are
+"send packet X", "install cookie", "clear cookie", "reset generation",
+"terminate".
+
+**Events are not only packets and timers.** The session's actual lifecycle is
+driven from outside the protocol, and leaving those out would make the two
+hardest behaviours integration accidents rather than tested transitions:
+
+| Event | Why it belongs here |
+|---|---|
+| decoded packet | the obvious half |
+| timer expiry | retransmission and keepalive |
+| `SessionClientEstablished(client)` | **`RunSession` is entered by an authenticated TCP setup**, not by any packet we receive. This is also what makes the `Refuse`-versus-setup serialisation testable as a transition rather than hoped for at integration time. |
+| `SessionClientDisconnected(client)` | what ends the session and triggers the reset |
+
+And the rule that makes the second one correct: **only the recorded session
+client ends the session.** Xorg records `sessionSocket` and
+`XdmcpCloseDisplay` returns immediately unless `sessionSocket == sock` *and*
+the state is `RUN_SESSION` or `AWAIT_ALIVE_RESPONSE` (`xdmcp.c:642`). So the
+state machine records which client is the session's, and any *other* client
+disconnecting is not a session end — on a display serving several clients,
+treating any disconnect as the end would reset the session under the user
+whenever a transient client exits.
 
 Encode these exactly, each of which a review round had to correct:
 
@@ -78,7 +102,24 @@ Encode these exactly, each of which a review round had to correct:
 every state, including the four above. This is where the protocol correctness
 lives, and it costs nothing to test exhaustively.
 
-## Step 3 — auth integration ⚠ the security-critical step
+## Step 3 — `XdmcpOptions`: the configuration source
+
+Small and pure, but it has to come **before** the reset and socket wiring,
+which both need to know whether XDMCP is enabled, in which mode, against which
+manager, on which port, from which address, and whether `-once` is set.
+Deferring it to the end would leave steps 4-6 with no production configuration
+to read.
+
+`-query <host>`, `-indirect <host>`, `-broadcast`, `-port <n>`, `-from <addr>`,
+`-class <str>`, `-displayID <str>`, `-once`. Ordered, last-wins, mirroring
+`xdmcp.c:252-312`. `-cookie` is parsed and **rejected with a clear message**,
+since accepting it implies XDM-AUTHENTICATION-1.
+
+**Proof.** A parse table: each option, the ordering/last-wins cases, mode
+conflicts (`-query` then `-broadcast`), `-cookie` rejected rather than ignored,
+and no XDMCP option leaving XDMCP disabled.
+
+## Step 4 — auth integration ⚠ the security-critical step
 
 `AuthState` gains a generation-bound session credential:
 `{ generation, cookie }`, per the spec.
@@ -104,7 +145,7 @@ not authorize a TCP client while XDMCP is active; an empty cookie is never
 installed (`ct_eq(&[], &[])` is `true`, so an empty credential matches any
 empty presentation).
 
-## Step 4 — reset integration
+## Step 5 — reset integration
 
 - An XDMCP option implies `-reset`; `-once` implies `-terminate`.
 - On a new generation the state machine returns to its init state and
@@ -116,7 +157,7 @@ starts on the same server. Failed negotiation also resets — the invariant is
 "every established session ends at a boundary; a failed negotiation may also
 restart one", so a generation with zero sessions is correct, not a bug.
 
-## Step 5 — the socket and the timer
+## Step 6 — the socket and the timer
 
 The first step that sends anything.
 
@@ -136,19 +177,14 @@ The first step that sends anything.
 never answers backs off and gives up at the limit rather than spinning or
 wedging; `-once` exits on that path instead.
 
-## Step 6 — options and documentation
-
-`-query <host>`, `-indirect <host>`, `-broadcast`, `-port <n>`, `-from <addr>`,
-`-class <str>`, `-displayID <str>`, `-once`. Ordered, last-wins, mirroring
-`xdmcp.c:252-312`. `-cookie` is parsed and **rejected with a clear message**,
-since accepting it implies XDM-AUTHENTICATION-1.
+## Step 7 — documentation
 
 Man page and `docs/setup.md`: the options, and plainly that XDMCP without
 XDM-AUTHENTICATION-1 is unauthenticated and unencrypted, so anything that can
 spoof a `Willing` can offer a session. True of Xorg in the same configuration,
 which is why XDMCP deployments assume a trusted network.
 
-## Step 7 — hardware
+## Step 8 — hardware
 
 - `-query` against a local LightDM with XDMCP enabled: session starts, ends, a
   second session starts on the same server.
@@ -157,7 +193,7 @@ which is why XDMCP deployments assume a trusted network.
 
 ## Hazards
 
-- **Step 3 is where a mistake is not recoverable.** A stale session cookie is
+- **Step 4 is where a mistake is not recoverable.** A stale session cookie is
   cross-user access on a shared login node, which is the deployment #121 is
   for. Everything else here is a hang or a refusal.
 - **`Accept` is the first untrusted input.** Anything that can answer our
