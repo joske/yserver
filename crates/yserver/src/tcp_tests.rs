@@ -146,6 +146,7 @@ fn listen_tcp_binds_ipv4_display_port_after_loading_shared_auth() {
     assert_eq!(
         auth.check(
             core_loop::auth::AuthTransport::Tcp,
+            core_loop::generation::Generation::default(),
             MIT_MAGIC_COOKIE.as_bytes(),
             &COOKIE
         ),

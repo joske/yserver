@@ -76,6 +76,17 @@ fn input_startup_action(has_input_ctx: bool) -> InputStartup {
     }
 }
 
+/// Build the process-lifetime authorization state from argv.
+///
+/// XDMCP is an approved *dynamic* authorization source: with `-query` and
+/// friends the session cookie arrives in an `Accept` rather than from
+/// `-auth`, which is what lets `-listen tcp` come up without an auth file —
+/// and what makes the file cookies stop authorizing TCP clients. See
+/// `core_loop::auth::AuthState::new_with_xdmcp`.
+fn build_auth_state(opts: &launch::LaunchOptions) -> std::sync::Arc<core_loop::auth::AuthState> {
+    core_loop::auth::AuthState::new_with_xdmcp(opts.auth_file.clone(), opts.xdmcp.is_some())
+}
+
 /// Validate TCP prerequisites before opening hardware or sockets, using the
 /// same authorization state that will serve every accepted connection.
 fn validate_tcp_startup(
@@ -133,7 +144,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     log::info!(target: "yserver::startup", "yserver: startup — {}", crate::version::line());
 
     // Validate TCP's startup invariants before opening devices or sockets.
-    let auth = core_loop::auth::AuthState::new(opts.auth_file.clone());
+    let auth = build_auth_state(&opts);
     validate_tcp_startup(&opts, &auth)?;
 
     // Capture the inherited SIGUSR1 disposition before signalfd masking.
@@ -828,8 +839,8 @@ mod tcp_tests;
 #[cfg(test)]
 mod tests {
     use super::{
-        InputStartup, Message, ResetPolicy, ensure_input_devices_opened, input_startup_action,
-        install_backend_root_bindings, signal_action, validate_tcp_startup,
+        InputStartup, Message, ResetPolicy, build_auth_state, ensure_input_devices_opened,
+        input_startup_action, install_backend_root_bindings, signal_action, validate_tcp_startup,
     };
     use yserver_core::{
         backend::Backend,
@@ -944,10 +955,42 @@ mod tests {
     #[test]
     fn listen_tcp_without_auth_is_rejected_before_startup() {
         let opts = crate::launch::parse_args(["-listen".into(), "tcp".into()]).unwrap();
-        let auth = yserver_core::core_loop::auth::AuthState::new(opts.auth_file.clone());
+        let auth = build_auth_state(&opts);
 
         let err = validate_tcp_startup(&opts, &auth).expect_err("-auth is mandatory for TCP");
         assert!(err.to_string().contains("-auth"));
+    }
+
+    #[test]
+    fn listen_tcp_with_an_xdmcp_option_needs_no_auth_file() {
+        // The stage-1 contradiction: XDMCP has no cookie at startup — it
+        // arrives in the `Accept` — but TCP has to be listening already for
+        // the manager's session to connect. XDMCP is therefore an approved
+        // dynamic authorization source for this check.
+        let opts = crate::launch::parse_args([
+            "-listen".into(),
+            "tcp".into(),
+            "-query".into(),
+            "manager.example".into(),
+        ])
+        .unwrap();
+        assert!(opts.xdmcp.is_some() && opts.auth_file.is_none());
+
+        let auth = build_auth_state(&opts);
+        validate_tcp_startup(&opts, &auth)
+            .expect("an XDMCP option satisfies the -listen tcp startup check");
+
+        // And it fails closed until an `Accept` arrives: passing the startup
+        // check authorizes nobody.
+        assert!(matches!(
+            auth.check(
+                yserver_core::core_loop::auth::AuthTransport::Tcp,
+                yserver_core::core_loop::generation::Generation::default(),
+                yserver_core::xauth::MIT_MAGIC_COOKIE.as_bytes(),
+                &[0u8; 16],
+            ),
+            yserver_core::core_loop::auth::AuthVerdict::Reject(_)
+        ));
     }
 
     #[test]
@@ -978,7 +1021,7 @@ mod tests {
                 path.display().to_string(),
             ])
             .unwrap();
-            let auth = yserver_core::core_loop::auth::AuthState::new(opts.auth_file.clone());
+            let auth = build_auth_state(&opts);
             assert_eq!(
                 validate_tcp_startup(&opts, &auth).is_ok(),
                 succeeds,

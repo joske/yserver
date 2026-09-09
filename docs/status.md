@@ -726,9 +726,26 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   the `ARRAY8`/`ARRAY16`/`ARRAY32`/`ARRAYofARRAY8` primitives, with the
   declared-length arithmetic every `xdmcp.c` receiver checks by hand) and
   `xdmcp::state` (the `(state, event) -> (state, actions)` transition
-  function). Both are pure and unwired: no UDP socket, no timer, no options,
-  no auth or reset integration yet, so nothing about a server without an XDMCP
-  option changes.
+  function). Both are pure and unwired. Step 3 added `launch::XdmcpOptions`
+  (`-query`/`-broadcast`/`-indirect`/`-port`/`-from`/`-class`/`-displayID`/
+  `-once`, ordered and last-wins; `-cookie` rejected), still only a
+  configuration source. Step 4 is the auth integration, and the one place in
+  this stage where a mistake is cross-user access rather than a hang:
+  `AuthState` now holds one **session credential** beside the file cookies —
+  the cookie an `Accept` carries — installed by
+  `install_session_cookie(generation, name, data)` and dropped by
+  `clear_session_cookie()`. `check` takes the *calling setup thread's own*
+  `BoundSender` generation, so a reset invalidates the previous session's
+  cookie by **mismatch**, with no clear call at the boundary to miss or race;
+  the explicit clear covers the case the binding cannot, an offer abandoned
+  inside one generation (`Refuse` → `StartConnection`, same generation). In
+  XDMCP mode TCP setup accepts that credential *only* — file cookies no longer
+  authorize a TCP client, Unix is untouched — an XDMCP option satisfies the
+  stage-1 `-listen tcp` startup check in place of `-auth`, and TCP fails
+  closed until the first `Accept`. An empty or non-MIT credential is never
+  installed (`ct_eq(&[], &[])` is true, so an empty one would match any client
+  presenting an empty cookie). Still no UDP socket, no timer and no reset
+  integration, and nothing changes for a server without an XDMCP option.
 - **2026-08-24 direct-scanout fallback-target fix:** a `CowDescendant` root
   Present's pinned redirected paint target need not be the Composite Overlay
   Window itself. Lazy fallback now copies into that exact pinned paint target
