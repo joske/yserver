@@ -34,6 +34,22 @@ impl Backend for HostX11Backend {
         HostX11Backend::argb_colormap_xid(self)
     }
 
+    fn fb_dimensions(&self) -> (u16, u16) {
+        HostX11Backend::fb_dimensions(self)
+    }
+
+    fn randr_outputs_and_modes(
+        &mut self,
+    ) -> (Vec<crate::randr::RandrOutput>, Vec<crate::randr::RandrMode>) {
+        HostX11Backend::randr_outputs_and_modes(self)
+    }
+
+    /// The nested backend exposes no RandR providers: there is no
+    /// second GPU behind a host X11 connection to offload to.
+    fn randr_providers(&mut self) -> Vec<crate::randr::RandrProvider> {
+        Vec::new()
+    }
+
     fn render_opcode(&self) -> Option<u8> {
         HostX11Backend::render_opcode(self)
     }

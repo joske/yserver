@@ -1,18 +1,40 @@
-//! Forced session teardown for the server-reset generation boundary
-//! (`docs/superpowers/specs/2026-09-09-server-reset-design.md`, "Forced
+//! The server-reset generation boundary
+//! (`docs/superpowers/specs/2026-09-09-server-reset-design.md`, "The
+//! generation boundary" / "Seeding the new generation" / "Forced
 //! cleanup, not the normal disconnect path").
 //!
-//! Nothing in production calls this yet — the reset boundary that will
-//! (`reset_generation`) is a later step. It exists on its own so it can be
-//! proved on its own.
+//! Two pieces:
+//!
+//! - [`force_destroy_all_clients`] — the forced session teardown, which
+//!   destroys every client ignoring close-down mode and releases what
+//!   they hold on BOTH sides.
+//! - [`reset_generation`] — the boundary itself, which assembles that
+//!   with the generation counter, the setup registry, the loop-local
+//!   per-client collections and a freshly seeded `ServerState`.
+//!
+//! Nothing in production calls `reset_generation` yet: the armed
+//! trigger is a later step, so this module is still reachable only from
+//! tests.
 
+use std::{collections::VecDeque, os::fd::AsRawFd};
+
+use mio::unix::SourceFd;
 use yserver_protocol::x11::ClientId;
 
 use crate::{
-    backend::{Backend, PixmapHandle},
-    core_loop::process_disconnect::{
-        HostPixmapFrees, destroy_zombie_resources_reporting, process_disconnect_reporting,
+    backend::{Backend, BackendTopology, PixmapHandle, install_backend_root_bindings},
+    core_loop::{
+        Generation, GenerationCounter, InputInventory,
+        process_disconnect::{
+            HostPixmapFrees, destroy_zombie_resources_reporting, process_disconnect_reporting,
+        },
+        run::{
+            DeferredRequest, FairRequestQueue, LoopTelemetry, PendingBackendRequests,
+            cancel_all_pending_backend_requests,
+        },
+        setup_thread::{self, SetupRegistry},
     },
+    resources::ROOT_WINDOW,
     server::ServerState,
 };
 
@@ -84,6 +106,231 @@ pub fn force_destroy_all_clients(state: &mut ServerState, backend: &mut dyn Back
     }
 }
 
+/// The loop-local per-client collections that live OUTSIDE
+/// `ServerState` and therefore survive a state swap.
+///
+/// Grouped into one struct so [`reset_generation`] names them all at
+/// its call site: the hazard the plan calls out is not clearing them
+/// wrongly, it is *forgetting* one, and a struct makes the set
+/// reviewable in a single place.
+// Step 5 of the plan lands the armed trigger that calls
+// `reset_generation`; until then the whole boundary is reachable only
+// from this module's tests. Deliberately NOT `#[cfg(test)]` — it must
+// compile, lint and be reviewed as production code from the moment it
+// exists, which is the plan's "nothing can fire until everything is
+// built" ordering.
+#[allow(dead_code)]
+pub(crate) struct GenerationLocals<'a> {
+    /// The fair round-robin request queue (`by_client` / `ready`).
+    pub deferred_requests: &'a mut FairRequestQueue,
+    /// The SEPARATE server-grab waiter queue. Not part of the fair
+    /// queue, and the one with teeth: `release_server_grab_waiters`
+    /// pushes its contents back into `deferred_requests` the moment a
+    /// server grab releases, so anything left here would be restored
+    /// into the fresh generation.
+    pub server_grab_waiters: &'a mut VecDeque<DeferredRequest>,
+    /// Parked asynchronous CRTC configurations, indexed by token and by
+    /// client.
+    pub pending_backend_requests: &'a mut PendingBackendRequests,
+    /// Per-client loop telemetry rows. Diagnostics only; see
+    /// `LoopTelemetry::forget_clients` for why a reset has to clear
+    /// them explicitly.
+    pub telemetry: &'a mut LoopTelemetry,
+}
+
+/// A parked COW release cannot loop forever: the refcount is one per
+/// outstanding `GetOverlayWindow` from a session that no longer exists.
+/// The bound only guards against a backend whose `cow_host_xid` never
+/// clears, which would otherwise hang the core loop.
+#[allow(dead_code)]
+const MAX_OVERLAY_RELEASE_ATTEMPTS: usize = 64;
+
+/// Cross the generation boundary: quarantine the old session, destroy
+/// it, and install a freshly seeded `ServerState` in its place.
+///
+/// Returns the new generation. The steps are the spec's, in the spec's
+/// order (`docs/superpowers/specs/2026-09-09-server-reset-design.md`,
+/// "The generation boundary"); each is marked below.
+///
+/// Nothing in production calls this yet — step 5 of the plan adds the
+/// armed trigger. It never exits the process, never re-initialises KMS
+/// or Vulkan, and never touches `listeners`.
+#[allow(dead_code)]
+pub(crate) fn reset_generation(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    registry: &mio::Registry,
+    generations: &GenerationCounter,
+    setup_registry: &SetupRegistry,
+    inventory: &InputInventory,
+    locals: GenerationLocals<'_>,
+) -> Generation {
+    // -- 1. Bump the generation. ------------------------------------
+    // First, so everything below is defined relative to the new one and
+    // any message a still-running producer tags from here on is already
+    // stale by construction.
+    let generation = generations.bump();
+
+    // -- 2. Cancel pending setup handshakes. ------------------------
+    // A handshake that began before the reset would otherwise complete
+    // into the NEW generation (`handle_client_setup_complete` inserts
+    // into whatever state is current), producing a client authorized
+    // against the destroyed session.
+    setup_thread::shutdown_all(setup_registry);
+
+    // -- 3. Force-close every established client. -------------------
+    // Deregister first: `epoll_ctl(DEL)` needs a live fd, and the
+    // teardown below drops the last `ClientState` reference to the
+    // writer, closing it.
+    let mut live: Vec<u32> = state.clients.keys().copied().collect();
+    live.sort_unstable();
+    for id in &live {
+        let Some(client) = state.clients.get(id) else {
+            continue;
+        };
+        let raw = match client.writer.lock() {
+            Ok(writer) => writer.as_raw_fd(),
+            Err(poisoned) => poisoned.into_inner().as_raw_fd(),
+        };
+        if let Err(err) = registry.deregister(&mut SourceFd(&raw))
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            log::warn!("reset: deregister client {id} from the poller: {err}");
+        }
+    }
+    force_destroy_all_clients(state, backend);
+
+    // -- 4. Clear the per-client state that lives outside ServerState.
+    // Cancel BEFORE clearing: the token is the only handle to the
+    // backend operation, so emptying the maps first leaks any parked
+    // config permanently. `drain_ready_crtc_configs` cannot recover it
+    // either -- that path runs only when a completion arrives, and a
+    // parked op may never deliver one.
+    cancel_all_pending_backend_requests(backend, locals.pending_backend_requests);
+    locals.deferred_requests.clear();
+    locals.server_grab_waiters.clear();
+    locals.telemetry.forget_clients();
+
+    // -- 5. Cancel remaining in-flight backend work for the dead
+    // session. The parked CRTC configs went in step 4 (they had to --
+    // their tokens live in the maps that step clears). What is left is
+    // the composite overlay window: `release_overlay_window` is called
+    // only from the protocol handler, never from disconnect, so a
+    // compositor that died without releasing it leaves the backend's
+    // COW refcount held -- and under XDMCP the next session would start
+    // with the previous user's overlay still referenced. The core-side
+    // COW record needs no teardown here: it lives in `state.resources`,
+    // which step 6 replaces wholesale.
+    drain_overlay_window(backend);
+
+    // -- 6. Replace `*state` with a freshly seeded one. -------------
+    // Constructed, not cleared: a field added to `ServerState` later is
+    // then reset correctly by default. Topology and capabilities are
+    // re-derived from the LIVE backend through the same snapshot type
+    // startup uses, so the second generation is built exactly the way
+    // the first one was.
+    let topology = BackendTopology::from_backend(backend);
+    let mut fresh = topology.into_server_state();
+    // The single field that survives literally. X11 timestamps must not
+    // go backwards: a client reconnecting a millisecond after a reset
+    // would otherwise see the server clock jump.
+    fresh.start_instant = state.start_instant;
+    // Input is seeded from the process-lifetime inventory, not
+    // re-probed: `probe_input_devices` is a no-op in Direct mode
+    // (libinput's enumeration burst is one-shot, at process start), so
+    // a generation that re-probed would come back with no devices at
+    // all. Property-name atoms are interned HERE, against the fresh
+    // table -- carrying `xi_devices` across instead would leave every
+    // device property pointing at an atom id that no longer exists.
+    for info in inventory.devices_by_node() {
+        fresh.xi_seed_touchpad(info);
+    }
+    *state = fresh;
+
+    // -- 7. Re-attach the backend to the new state. -----------------
+    install_backend_root_bindings(state, backend);
+
+    // -- 8. Repaint the root. ---------------------------------------
+    // The fresh constructor creates a root window, but that leaves the
+    // previous session's pixels on screen -- a visual bug, and under
+    // XDMCP an information leak to the next user.
+    clear_root(state, backend);
+    backend.mark_dirty();
+
+    // -- 9. Listeners are left bound and untouched. -----------------
+    generation
+}
+
+/// Drop the backend's composite-overlay reference for a session that is
+/// gone.
+///
+/// `release_overlay_window` is a refcount decrement with no "force to
+/// zero" form, so this drives it with `cow_host_xid` as the predicate:
+/// `Some` means the backend still has the COW materialised. Backends
+/// that do not model the COW report `None` and this is a no-op.
+#[allow(dead_code)]
+fn drain_overlay_window(backend: &mut dyn Backend) {
+    for _ in 0..MAX_OVERLAY_RELEASE_ATTEMPTS {
+        if backend.cow_host_xid().is_none() {
+            return;
+        }
+        match backend.release_overlay_window(None) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(err) => {
+                log::warn!("reset: releasing the composite overlay window failed: {err}");
+                return;
+            }
+        }
+    }
+    log::warn!(
+        "reset: composite overlay window still referenced after \
+         {MAX_OVERLAY_RELEASE_ATTEMPTS} release attempts"
+    );
+}
+
+/// Paint the fresh root window's background over the whole screen.
+///
+/// Deliberately the same call the protocol's `ClearArea` makes, against
+/// the same resolved background, so KMS records the damage its
+/// composite path needs rather than relying on `mark_dirty` alone.
+#[allow(dead_code)]
+fn clear_root(state: &mut ServerState, backend: &mut dyn Backend) {
+    let Some((width, height)) = state
+        .resources
+        .window(ROOT_WINDOW)
+        .map(|root| (root.width, root.height))
+    else {
+        return;
+    };
+    // `None` here means background None -- "leave the contents
+    // untouched" -- which a fresh root never is (it is created with a
+    // background pixel), but the branch is kept rather than unwrapped
+    // so a future default change degrades to "no paint" instead of a
+    // panic.
+    let Some(background) = state.resources.window_resolved_background(ROOT_WINDOW) else {
+        return;
+    };
+    let Some(target) = state.resources.host_drawable_target(ROOT_WINDOW) else {
+        return;
+    };
+    if let Err(err) = backend.clear_area(
+        None,
+        target.host_xid(),
+        background.background_pixel,
+        background
+            .background_pixmap_host_xid
+            .map(crate::backend::PixmapHandle::as_raw),
+        0,
+        0,
+        width,
+        height,
+        background.tile_origin_offset,
+    ) {
+        log::warn!("reset: clearing the root window failed: {err}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -96,9 +343,22 @@ mod tests {
         ClientByteOrder, ClientId, CreatePixmapRequest, CreateWindowRequest, ResourceId,
     };
 
-    use super::force_destroy_all_clients;
+    use super::{GenerationLocals, force_destroy_all_clients, reset_generation};
     use crate::{
-        backend::{Backend, PixmapHandle, WindowHandle, recording::RecordingBackend},
+        backend::{
+            Backend, CrtcConfigToken, PixmapHandle, WindowHandle,
+            recording::{RecordedCall, RecordingBackend},
+        },
+        core_loop::{
+            GenerationCounter, InputInventory,
+            message::{BoolSetting, DeviceInfo, LibinputConfigSnapshot},
+            run::{
+                FairRequestQueue, LoopTelemetry, PendingBackendRequests, deferred_request_for_test,
+                drain_ready_crtc_configs, release_server_grab_waiters,
+            },
+            setup_thread,
+        },
+        randr::{RandrMode, RandrOutput},
         resources::ROOT_WINDOW,
         server::{ClientState, GlxContext, GlxDrawable, GlxDrawableKind, ServerState},
     };
@@ -407,6 +667,566 @@ mod tests {
             "a tile deferred while another client's GC held it was never \
              re-examined once that client died: {:?}",
             backend.live_pixmaps
+        );
+    }
+    // ────────────────────────────────────────────────────────────────
+    // `reset_generation` — the boundary itself.
+    // ────────────────────────────────────────────────────────────────
+
+    /// A poller for the tests. `reset_generation` deregisters every
+    /// client fd from it; nothing here has ever been registered, so the
+    /// calls take the tolerated `NotFound` branch.
+    fn poll() -> mio::Poll {
+        mio::Poll::new().expect("mio poll")
+    }
+
+    struct Locals {
+        deferred_requests: FairRequestQueue,
+        server_grab_waiters: VecDeque<super::DeferredRequest>,
+        pending_backend_requests: PendingBackendRequests,
+        telemetry: LoopTelemetry,
+    }
+
+    impl Locals {
+        fn new() -> Self {
+            Self {
+                deferred_requests: FairRequestQueue::default(),
+                server_grab_waiters: VecDeque::new(),
+                pending_backend_requests: PendingBackendRequests::default(),
+                telemetry: LoopTelemetry::default(),
+            }
+        }
+
+        fn borrow(&mut self) -> GenerationLocals<'_> {
+            GenerationLocals {
+                deferred_requests: &mut self.deferred_requests,
+                server_grab_waiters: &mut self.server_grab_waiters,
+                pending_backend_requests: &mut self.pending_backend_requests,
+                telemetry: &mut self.telemetry,
+            }
+        }
+    }
+
+    /// Mirrors `xinput::tests::touchpad_info`: tap must be *available*
+    /// for `seed_touchpad` to intern `libinput Tapping Enabled`, which
+    /// is the property this module's atom assertion turns on.
+    fn touchpad(node: &str, name: &str) -> DeviceInfo {
+        DeviceInfo {
+            name: name.into(),
+            device_node: node.into(),
+            sysname: node.trim_start_matches("/dev/input/").into(),
+            vendor_id: 0x046d,
+            product_id: 0xc52f,
+            is_touchpad: true,
+            config: LibinputConfigSnapshot {
+                tap: BoolSetting {
+                    available: true,
+                    current: true,
+                    default: false,
+                },
+                natural_scroll: BoolSetting {
+                    available: true,
+                    current: false,
+                    default: true,
+                },
+                ..Default::default()
+            },
+        }
+    }
+
+    /// A backend carrying a topology distinguishable from every
+    /// `ServerState` default, so "the new generation was re-derived from
+    /// the backend" is provable rather than coincidental.
+    fn backend_with_topology() -> RecordingBackend {
+        let mut backend = RecordingBackend::new();
+        backend.fb_size = (1920, 1080);
+        backend.randr_outputs = vec![RandrOutput {
+            name: "DP-1".to_string(),
+            output_id: 0x40,
+            crtc_id: 0x41,
+            mode_id: 0x42,
+            connected: true,
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            vrefresh: 60,
+            timing: None,
+            mm_width: 520,
+            mm_height: 290,
+            mode_ids: vec![0x42],
+            num_preferred: 1,
+        }];
+        backend.randr_modes = vec![RandrMode {
+            mode_id: 0x42,
+            width: 1920,
+            height: 1080,
+            vrefresh: 60,
+            timing: None,
+        }];
+        backend
+    }
+
+    /// The core obligation: after a direct call the state is a fresh
+    /// one — no resources, atoms, selections or grabs from the destroyed
+    /// session — while `start_instant` (the X11 timestamp epoch) is
+    /// carried over literally, and the generation has advanced.
+    #[test]
+    fn reset_generation_installs_a_fresh_state_and_keeps_the_timestamp_epoch() {
+        let mut state = ServerState::new();
+        let mut backend = backend_with_topology();
+        let f = seed_client_session(&mut state, &mut backend, 7);
+        let session_atom = state.atoms.intern("_SESSION_ONLY_ATOM", false);
+        state.selections.insert(session_atom, (f.window, 1));
+        state.server_grab_owner = Some(ClientId(7));
+        state.set_pointer_grab(crate::server::ActivePointerGrab {
+            owner: ClientId(7),
+            grab_window: f.window,
+            event_mask: 0,
+            cursor: ResourceId(0),
+            time: 1,
+            owner_events: false,
+            via_xi2: false,
+            implicit: false,
+            passive: false,
+            xi2_mask: 0,
+        });
+
+        let epoch = state.start_instant;
+        let generations = GenerationCounter::new();
+        let before = generations.current();
+        let registry = setup_thread::make_registry();
+        let inventory = InputInventory::new();
+        let mut locals = Locals::new();
+        let p = poll();
+
+        let generation = reset_generation(
+            &mut state,
+            &mut backend,
+            p.registry(),
+            &generations,
+            &registry,
+            &inventory,
+            locals.borrow(),
+        );
+
+        assert_ne!(generation, before, "the generation must advance");
+        assert_eq!(generations.current(), generation);
+
+        assert!(state.clients.is_empty());
+        assert!(state.zombie_clients.is_empty());
+        assert!(state.selections.is_empty(), "selections must not survive");
+        assert!(state.server_grab_owner.is_none());
+        assert!(state.active_pointer_grab.is_none());
+        assert!(state.key_grabs.is_empty());
+        assert!(state.button_grabs.is_empty());
+        assert!(
+            !state.resources.xid_in_use(f.window),
+            "the destroyed session's window ids must be free again"
+        );
+        assert!(
+            state.atoms.id_for("_SESSION_ONLY_ATOM").is_none(),
+            "the atom table must be back to predefined-only"
+        );
+        assert_ne!(
+            state.atoms.name(session_atom),
+            Some("_SESSION_ONLY_ATOM"),
+            "a session atom id still resolving to its old name is the \
+             dangling-atom bug the survive list was corrected for"
+        );
+
+        assert_eq!(
+            state.start_instant, epoch,
+            "start_instant is the ONLY field that survives literally — \
+             X11 timestamps must not go backwards across a reset"
+        );
+    }
+
+    /// Topology is re-derived from the live backend, not carried: the
+    /// new root geometry and RandR view come back with the backend's
+    /// values, not the destroyed state's.
+    #[test]
+    fn reset_generation_reseeds_topology_from_the_backend() {
+        let mut state = ServerState::with_geometry(640, 480);
+        let mut backend = backend_with_topology();
+        let generations = GenerationCounter::new();
+        let registry = setup_thread::make_registry();
+        let inventory = InputInventory::new();
+        let mut locals = Locals::new();
+        let p = poll();
+
+        reset_generation(
+            &mut state,
+            &mut backend,
+            p.registry(),
+            &generations,
+            &registry,
+            &inventory,
+            locals.borrow(),
+        );
+
+        let root = state.resources.window(ROOT_WINDOW).expect("root");
+        assert_eq!(
+            (root.width, root.height),
+            (1920, 1080),
+            "root geometry must come from the backend's live topology"
+        );
+        assert_eq!(state.randr.screen_width, 1920);
+        assert_eq!(
+            state.randr.outputs.len(),
+            1,
+            "the RandR output set must be rebuilt from the backend"
+        );
+        assert_eq!(state.randr.outputs[0].name, "DP-1");
+        assert_eq!(
+            root.host_xid.map(|h| h.as_raw()),
+            Some(backend.window_id()),
+            "install_backend_root_bindings must have re-run against the \
+             fresh state"
+        );
+    }
+
+    /// The devices come back — from the process-lifetime inventory, not
+    /// a re-probe — and their property-name atoms are interned in the
+    /// NEW atom table. Carrying `xi_devices` instead would leave those
+    /// properties pointing at ids the fresh table never issued.
+    #[test]
+    fn reset_generation_reseeds_devices_with_atoms_in_the_new_table() {
+        let mut state = ServerState::new();
+        let mut backend = backend_with_topology();
+        // Burn atom ids in the OLD table so a carried-over property atom
+        // would be a recognisably different number from a freshly
+        // interned one.
+        for i in 0..32 {
+            state.atoms.intern(&format!("_OLD_SESSION_{i}"), false);
+        }
+        let mut inventory = InputInventory::new();
+        inventory.add(touchpad("/dev/input/event4", "SynPS/2 Touchpad"));
+
+        let generations = GenerationCounter::new();
+        let registry = setup_thread::make_registry();
+        let mut locals = Locals::new();
+        let p = poll();
+
+        reset_generation(
+            &mut state,
+            &mut backend,
+            p.registry(),
+            &generations,
+            &registry,
+            &inventory,
+            locals.borrow(),
+        );
+
+        let slave = state
+            .xi_devices
+            .iter()
+            .find(|d| d.id == crate::xinput::DEVICEID_SLAVE_POINTER)
+            .expect("slave pointer");
+        assert_eq!(
+            slave.name, "SynPS/2 Touchpad",
+            "the device set must be present again after a reset"
+        );
+        assert!(slave.is_touchpad);
+
+        // `intern(only_if_exists = true)` returns the live id: the
+        // property must resolve through the NEW table.
+        let tap = state.atoms.intern("libinput Tapping Enabled", true);
+        assert_ne!(
+            tap,
+            yserver_protocol::x11::AtomId(0),
+            "the property atom must exist in the new table"
+        );
+        assert!(
+            slave.properties.contains_key(&tap),
+            "device properties must be keyed by atoms interned in the new \
+             table, not ids carried from the destroyed one"
+        );
+    }
+
+    /// The quarantine case with teeth. `release_server_grab_waiters`
+    /// pushes the waiter queue back into the fair queue whenever a
+    /// server grab releases, so a request the destroyed client left
+    /// parked there would be restored — and dispatched — inside the
+    /// fresh generation.
+    #[test]
+    fn a_destroyed_clients_server_grab_waiter_is_not_restored_after_the_reset() {
+        let mut state = ServerState::new();
+        let mut backend = backend_with_topology();
+        install_client(&mut state, 7);
+        let mut locals = Locals::new();
+        locals
+            .server_grab_waiters
+            .push_back(deferred_request_for_test(7));
+        locals
+            .deferred_requests
+            .push_back(deferred_request_for_test(7));
+
+        let generations = GenerationCounter::new();
+        let registry = setup_thread::make_registry();
+        let inventory = InputInventory::new();
+        let p = poll();
+
+        reset_generation(
+            &mut state,
+            &mut backend,
+            p.registry(),
+            &generations,
+            &registry,
+            &inventory,
+            locals.borrow(),
+        );
+
+        assert!(
+            locals.server_grab_waiters.is_empty(),
+            "the separate server-grab waiter queue must be cleared"
+        );
+        assert!(locals.deferred_requests.is_empty());
+
+        // Now drive the new generation's grab release, which is the path
+        // that would resurrect a leftover waiter.
+        release_server_grab_waiters(
+            &mut locals.deferred_requests,
+            &mut locals.server_grab_waiters,
+            &mut locals.telemetry,
+        );
+        assert!(
+            locals.deferred_requests.is_empty(),
+            "a destroyed client's request was restored into the fresh \
+             generation when its server grab released"
+        );
+    }
+
+    /// The parked-CRTC token is the only handle to the backend
+    /// operation, so the boundary must cancel it before emptying the
+    /// maps — and a completion that lands afterwards must be discarded,
+    /// not mistaken for a live wait.
+    #[test]
+    fn a_parked_crtc_config_is_cancelled_and_a_late_completion_is_ignored() {
+        let mut state = ServerState::new();
+        let mut backend = backend_with_topology();
+        install_client(&mut state, 7);
+        let token = CrtcConfigToken(0x5150);
+        let mut locals = Locals::new();
+        locals
+            .pending_backend_requests
+            .park_crtc_for_test(ClientId(7), token)
+            .expect("park");
+
+        let generations = GenerationCounter::new();
+        let registry = setup_thread::make_registry();
+        let inventory = InputInventory::new();
+        let p = poll();
+
+        reset_generation(
+            &mut state,
+            &mut backend,
+            p.registry(),
+            &generations,
+            &registry,
+            &inventory,
+            locals.borrow(),
+        );
+
+        assert_eq!(
+            backend.cancelled_crtc_configs,
+            vec![token],
+            "a parked CRTC config must be cancelled at the boundary, not \
+             leaked — the token is the only handle to it"
+        );
+        assert!(
+            locals.pending_backend_requests.is_empty(),
+            "the parked-CRTC maps must be empty afterwards"
+        );
+
+        // A worker completion racing the reset arrives now.
+        backend.ready_crtc_configs = vec![token];
+        drain_ready_crtc_configs(
+            &mut state,
+            &mut backend,
+            &mut locals.pending_backend_requests,
+        );
+        assert!(
+            backend.finished_crtc_configs.is_empty(),
+            "a late completion for a cancelled token must never be \
+             finished into the new generation"
+        );
+        assert_eq!(
+            backend.cancelled_crtc_configs,
+            vec![token, token],
+            "the late completion is discarded by cancelling again"
+        );
+    }
+
+    /// Scanout: the reset must repaint the root and wake the compositor.
+    /// "The old pixels are actually gone" is step 6, on hardware — here
+    /// the obligation is that the clear/dirty path is invoked at all.
+    #[test]
+    fn reset_generation_clears_the_root_and_marks_the_backend_dirty() {
+        let mut state = ServerState::new();
+        let mut backend = backend_with_topology();
+        let generations = GenerationCounter::new();
+        let registry = setup_thread::make_registry();
+        let inventory = InputInventory::new();
+        let mut locals = Locals::new();
+        let p = poll();
+
+        reset_generation(
+            &mut state,
+            &mut backend,
+            p.registry(),
+            &generations,
+            &registry,
+            &inventory,
+            locals.borrow(),
+        );
+
+        let calls = backend.calls.lock().expect("calls");
+        let root_host_xid = backend.window_id();
+        let cleared = calls.iter().find_map(|call| match call {
+            RecordedCall::FillRectangle {
+                host_xid,
+                x,
+                y,
+                width,
+                height,
+                ..
+            } if *host_xid == root_host_xid => Some((*x, *y, *width, *height)),
+            _ => None,
+        });
+        assert_eq!(
+            cleared,
+            Some((0, 0, 1920, 1080)),
+            "the reset must clear the WHOLE root — at the geometry the \
+             fresh state was just built at, not the destroyed one's"
+        );
+
+        let dirty = calls
+            .iter()
+            .position(|call| matches!(call, RecordedCall::MarkDirty));
+        let fill = calls
+            .iter()
+            .position(|call| matches!(call, RecordedCall::FillRectangle { .. }));
+        assert!(
+            matches!((fill, dirty), (Some(f), Some(d)) if f < d),
+            "mark_dirty must follow the clear, or the composite it \
+             ungates can run before the repaint: {calls:?}"
+        );
+    }
+
+    /// A compositor that died without `ReleaseOverlayWindow` leaves the
+    /// backend's COW refcount held: `release_overlay_window` is called
+    /// only from the protocol handler, never from disconnect. The reset
+    /// must not inherit it into the next session.
+    #[test]
+    fn reset_generation_releases_a_leaked_composite_overlay_window() {
+        let mut state = ServerState::new();
+        let mut backend = backend_with_topology();
+        backend.get_overlay_window(None).expect("materialize");
+        assert!(backend.cow_host_xid().is_some(), "precondition");
+        // The recording backend only takes its final-release branch when
+        // this knob is armed; KMS's own refcount reaches zero on its own.
+        backend.cow_next_release_is_final = true;
+
+        let generations = GenerationCounter::new();
+        let registry = setup_thread::make_registry();
+        let inventory = InputInventory::new();
+        let mut locals = Locals::new();
+        let p = poll();
+
+        reset_generation(
+            &mut state,
+            &mut backend,
+            p.registry(),
+            &generations,
+            &registry,
+            &inventory,
+            locals.borrow(),
+        );
+
+        assert!(
+            backend.cow_host_xid().is_none(),
+            "the overlay window must not stay referenced across a reset"
+        );
+    }
+
+    /// Backend-side accounting, not just `ServerState`: the boundary
+    /// runs the forced teardown, so host pixmaps, GLX export refs, DRI3
+    /// syncobjs and host-window registrations all go with the session.
+    #[test]
+    fn reset_generation_empties_backend_accounting_for_the_old_session() {
+        let mut state = ServerState::new();
+        let mut backend = backend_with_topology();
+        seed_client_session(&mut state, &mut backend, 7);
+        seed_client_session(&mut state, &mut backend, 8);
+        state.close_down_modes.insert(8, 1); // RetainPermanent
+        assert_eq!(backend.live_pixmaps.len(), 2, "precondition");
+
+        let generations = GenerationCounter::new();
+        let registry = setup_thread::make_registry();
+        let inventory = InputInventory::new();
+        let mut locals = Locals::new();
+        let p = poll();
+
+        reset_generation(
+            &mut state,
+            &mut backend,
+            p.registry(),
+            &generations,
+            &registry,
+            &inventory,
+            locals.borrow(),
+        );
+
+        assert!(
+            backend.live_pixmaps.is_empty(),
+            "host pixmaps survived the reset: {:?}",
+            backend.live_pixmaps
+        );
+        assert!(backend.glx_pixmap_exports.is_empty());
+        assert!(backend.dri3_syncobj_owners.is_empty());
+        assert!(backend.xid_map().is_empty());
+    }
+
+    /// The setup registry is emptied at the boundary, so a handshake
+    /// still in flight cannot complete into the new generation.
+    #[test]
+    fn reset_generation_shuts_down_in_flight_setup_handshakes() {
+        let mut state = ServerState::new();
+        let mut backend = backend_with_topology();
+        let registry = setup_thread::make_registry();
+        let (a, b) = UnixStream::pair().expect("socketpair");
+        registry
+            .lock()
+            .expect("registry")
+            .insert(ClientId(9), crate::transport::Transport::Unix(a));
+
+        let generations = GenerationCounter::new();
+        let inventory = InputInventory::new();
+        let mut locals = Locals::new();
+        let p = poll();
+
+        reset_generation(
+            &mut state,
+            &mut backend,
+            p.registry(),
+            &generations,
+            &registry,
+            &inventory,
+            locals.borrow(),
+        );
+
+        assert!(
+            registry.lock().expect("registry").is_empty(),
+            "a pending setup handshake must be cancelled at the boundary"
+        );
+        // The peer sees EOF: the registry's clone was shut down and
+        // dropped, so nothing can still be written to it.
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            std::io::Read::read(&mut &b, &mut buf).expect("read"),
+            0,
+            "the handshake socket must be closed"
         );
     }
 }

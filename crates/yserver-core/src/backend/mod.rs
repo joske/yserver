@@ -84,6 +84,100 @@ fn resolve_glx_vendor_names(derived: &str, raw_env: Option<&str>) -> String {
     }
 }
 
+/// Everything a `ServerState` needs from the live backend at
+/// construction time, snapshotted in one place.
+///
+/// Startup (`yserver::run`, `nested::run`) and the server-reset
+/// generation boundary (`core_loop::reset::reset_generation`) build
+/// their state from the *same* snapshot, so a second generation is
+/// seeded exactly the way the first one was. That equality is the
+/// point of the type: the spec's rule is that only `start_instant`
+/// crosses a reset literally and everything else is re-derived from
+/// hardware, and re-derivation is only trustworthy if it runs the same
+/// code startup runs.
+///
+/// `capabilities` is nested rather than flattened so
+/// [`BackendCapabilities::from_backend`]'s compile-time
+/// "fill in the new field" property keeps working on its own.
+pub struct BackendTopology {
+    pub width: u16,
+    pub height: u16,
+    pub outputs: Vec<crate::randr::RandrOutput>,
+    pub modes: Vec<crate::randr::RandrMode>,
+    pub providers: Vec<crate::randr::RandrProvider>,
+    pub capabilities: BackendCapabilities,
+}
+
+impl BackendTopology {
+    /// Read the live topology off `backend`.
+    ///
+    /// Call order matters and mirrors `yserver::run`'s original
+    /// startup sequence: `randr_outputs_and_modes` before
+    /// `randr_providers`, because on KMS both reserve provider XIDs
+    /// and the first caller fixes the allocation order.
+    pub fn from_backend(backend: &mut dyn Backend) -> Self {
+        let (width, height) = backend.fb_dimensions();
+        let (outputs, modes) = backend.randr_outputs_and_modes();
+        let providers = backend.randr_providers();
+        let capabilities = BackendCapabilities::from_backend(backend);
+        Self {
+            width,
+            height,
+            outputs,
+            modes,
+            providers,
+            capabilities,
+        }
+    }
+
+    /// Build the `ServerState` this topology describes. Providers are
+    /// applied through `RandrState::set_providers`, exactly as startup
+    /// does.
+    #[must_use]
+    pub fn into_server_state(self) -> crate::server::ServerState {
+        let mut state = crate::server::ServerState::with_randr_outputs_and_modes(
+            self.width,
+            self.height,
+            self.outputs,
+            self.modes,
+            self.capabilities,
+        );
+        state.randr.set_providers(self.providers);
+        state
+    }
+}
+
+/// Point the fresh `ServerState`'s root window, root visual and ARGB
+/// visual/colormap at the backend's real host XIDs.
+///
+/// Lives in core (rather than in `yserver::lib`, where it started)
+/// because three callers need the identical binding step: KMS startup,
+/// nested startup, and the server-reset generation boundary, which
+/// re-runs it against a freshly constructed state.
+pub fn install_backend_root_bindings(
+    state: &mut crate::server::ServerState,
+    backend: &dyn Backend,
+) {
+    use crate::resources::{ARGB_COLORMAP, ARGB_VISUAL, ROOT_VISUAL, ROOT_WINDOW};
+
+    if let Some(root) = state.resources.window_mut(ROOT_WINDOW) {
+        root.host_xid = WindowHandle::from_raw(backend.window_id());
+    }
+    state
+        .resources
+        .set_visual_host_xid(ROOT_VISUAL, backend.root_visual_xid());
+    if let Some(host_colormap) = backend.argb_colormap_xid() {
+        state
+            .resources
+            .set_colormap_host_xid(ARGB_COLORMAP, host_colormap);
+    }
+    if let Some(host_argb_visual) = backend.argb_visual_xid() {
+        state
+            .resources
+            .set_visual_host_xid(ARGB_VISUAL, host_argb_visual);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OriginContext {
     pub client_id: ClientId,

@@ -152,6 +152,17 @@ pub enum RecordedCall {
         kind: u8,
         rects: Option<usize>,
     },
+    /// `fill_rectangle(host_xid, foreground, x, y, w, h)` called —
+    /// including via the trait's default `clear_area`, which is how the
+    /// server-reset boundary repaints the root.
+    FillRectangle {
+        host_xid: u32,
+        foreground: u32,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+    },
     /// Task 4: `mark_dirty()` called. Trait default is a no-op
     /// (`trait_def.rs:583`); recorded here so ordering tests (e.g. against
     /// `MaybeComposite`) can read it straight off the shared `calls` log.
@@ -232,6 +243,18 @@ pub struct RecordingBackend {
     /// Toggled by tests that want to exercise the ynest path
     /// (kms_capable=false) — default true.
     pub dpms_capable: bool,
+    /// Virtual-screen extent returned by `fb_dimensions()`. Settable
+    /// (rather than a hardcoded constant) so a reset test can prove the
+    /// new generation's root geometry was re-derived from the backend
+    /// and not carried over from the destroyed state.
+    pub fb_size: (u16, u16),
+    /// RandR topology returned by `randr_outputs_and_modes()` /
+    /// `randr_providers()`. Same reason: a generation boundary is only
+    /// provably re-seeding if the value it comes back with is one the
+    /// test put on the backend.
+    pub randr_outputs: Vec<crate::randr::RandrOutput>,
+    pub randr_modes: Vec<crate::randr::RandrMode>,
+    pub randr_providers: Vec<crate::randr::RandrProvider>,
     /// Value returned by `glx_vendor_names()`. Defaults to the trait
     /// default (`glx::VENDOR_NAMES`, "mesa"); tests that need to prove
     /// a value actually flows through from the backend (rather than a
@@ -462,6 +485,10 @@ impl RecordingBackend {
             redirect_activation_supported: false,
             query_pointer_mask: 0,
             dpms_capable: true,
+            fb_size: (800, 600),
+            randr_outputs: Vec::new(),
+            randr_modes: Vec::new(),
+            randr_providers: Vec::new(),
             glx_vendor_names: glx::VENDOR_NAMES,
             dpms_set_returns_err: false,
             provider_output_source_changed: true,
@@ -908,6 +935,20 @@ impl Backend for RecordingBackend {
 
     fn argb_colormap_xid(&self) -> Option<u32> {
         None
+    }
+
+    fn fb_dimensions(&self) -> (u16, u16) {
+        self.fb_size
+    }
+
+    fn randr_outputs_and_modes(
+        &mut self,
+    ) -> (Vec<crate::randr::RandrOutput>, Vec<crate::randr::RandrMode>) {
+        (self.randr_outputs.clone(), self.randr_modes.clone())
+    }
+
+    fn randr_providers(&mut self) -> Vec<crate::randr::RandrProvider> {
+        self.randr_providers.clone()
     }
 
     fn render_opcode(&self) -> Option<u8> {
@@ -1698,17 +1739,29 @@ impl Backend for RecordingBackend {
         unimplemented!("RecordingBackend: fill_poly")
     }
 
+    /// Recorded rather than `unimplemented!()` because the trait's
+    /// default `clear_area` lands here, and the server-reset boundary
+    /// clears the whole root through `clear_area` — its only sandbox
+    /// proof is that this call shows up.
     fn fill_rectangle(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_xid: u32,
-        _foreground: u32,
-        _x: i16,
-        _y: i16,
-        _width: u16,
-        _height: u16,
+        host_xid: u32,
+        foreground: u32,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
     ) -> io::Result<()> {
-        unimplemented!("RecordingBackend: fill_rectangle")
+        self.record(RecordedCall::FillRectangle {
+            host_xid,
+            foreground,
+            x,
+            y,
+            width,
+            height,
+        });
+        Ok(())
     }
 
     fn poly_text8(

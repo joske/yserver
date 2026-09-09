@@ -168,6 +168,11 @@ pub struct HostX11Backend {
     /// Host XID of the host root visual. Pushed into `ResourceTable` so
     /// that core CreateWindow forwarding for our `ROOT_VISUAL` resolves
     /// to a real host visual.
+    /// Container-window extent, as requested at `open_from_env`. The
+    /// nested backend has no KMS framebuffer, so this IS its virtual
+    /// screen — it backs `Backend::fb_dimensions` and the synthetic
+    /// `ynest-0` RandR output.
+    container_size: (u16, u16),
     root_visual_xid: u32,
     /// Host XID of an ARGB (32-bit TrueColor) visual on the host, if
     /// one was advertised at setup. `None` means we can't honour
@@ -377,6 +382,7 @@ impl HostX11Backend {
             xid_map,
             depth_gcs: HashMap::new(),
             host_drawable_depths: HashMap::new(),
+            container_size: (width, height),
             root_visual_xid: setup.root_visual,
             argb_visual_xid: setup.argb_visual,
             argb_colormap_xid: None,
@@ -443,6 +449,51 @@ impl HostX11Backend {
 
     pub fn argb_colormap_xid(&self) -> Option<u32> {
         self.argb_colormap_xid
+    }
+
+    /// Virtual-screen extent — the host container window's size.
+    #[must_use]
+    pub fn fb_dimensions(&self) -> (u16, u16) {
+        self.container_size
+    }
+
+    /// The synthetic single-output RandR topology the nested backend
+    /// presents, plus the mode table derived from it.
+    ///
+    /// The exact integer ids (output=1, crtc=2, mode=3) and the
+    /// `ynest-0` name are load-bearing for existing xts wire-byte
+    /// fixtures. This used to be built inline in `nested::run`; it moved
+    /// here when `Backend::randr_outputs_and_modes` was promoted onto
+    /// the trait, so that startup and any later re-derivation read one
+    /// definition.
+    #[must_use]
+    pub fn randr_outputs_and_modes(
+        &self,
+    ) -> (Vec<crate::randr::RandrOutput>, Vec<crate::randr::RandrMode>) {
+        let (width, height) = self.container_size;
+        let outputs = vec![crate::randr::RandrOutput {
+            name: "ynest-0".to_string(),
+            output_id: 1,
+            crtc_id: 2,
+            mode_id: 3,
+            connected: true,
+            x: 0,
+            y: 0,
+            width,
+            height,
+            vrefresh: 60,
+            timing: None,
+            // Nested backend has no EDID; `RandrState::output_info` falls
+            // back to 96-DPI synthesis from pixel dims.
+            mm_width: 0,
+            mm_height: 0,
+            mode_ids: vec![3],
+            num_preferred: 1,
+        }];
+        // Exactly what `ServerState::with_randr_outputs` used to derive
+        // for this output set, so the nested screen is byte-identical.
+        let modes = crate::randr::RandrState::from_outputs(0, outputs.clone()).mode_table;
+        (outputs, modes)
     }
 
     /// Allocate a host colormap for our ARGB visual via `XCreateColormap(
@@ -1345,6 +1396,7 @@ mod tests {
             stream,
             window_id: 1,
             gc_id: 2,
+            container_size: (800, 600),
             current_foreground: 0,
             current_background: 0,
             current_clip: HostClipState::None,

@@ -20,30 +20,14 @@ use nix::sys::signal::{SigmaskHow, sigprocmask};
 use nix::sys::signalfd::SignalFd;
 
 use yserver_core::{
-    backend::Backend,
+    // Moved into core (`backend::install_backend_root_bindings`) so the
+    // server-reset generation boundary can re-run the identical binding
+    // step against a freshly constructed `ServerState`. Imported under
+    // its own name here so this crate's call sites and test read as
+    // before.
+    backend::{Backend, BackendTopology, install_backend_root_bindings},
     core_loop::{self, Message, poll_tokens::ClientIdAllocator},
-    resources::{ARGB_COLORMAP, ARGB_VISUAL, ROOT_VISUAL, ROOT_WINDOW},
-    server::ServerState,
 };
-
-fn install_backend_root_bindings(state: &mut ServerState, backend: &dyn Backend) {
-    if let Some(root) = state.resources.window_mut(ROOT_WINDOW) {
-        root.host_xid = yserver_core::backend::WindowHandle::from_raw(backend.window_id());
-    }
-    state
-        .resources
-        .set_visual_host_xid(ROOT_VISUAL, backend.root_visual_xid());
-    if let Some(host_colormap) = backend.argb_colormap_xid() {
-        state
-            .resources
-            .set_colormap_host_xid(ARGB_COLORMAP, host_colormap);
-    }
-    if let Some(host_argb_visual) = backend.argb_visual_xid() {
-        state
-            .resources
-            .set_visual_host_xid(ARGB_VISUAL, host_argb_visual);
-    }
-}
 
 /// Refuse to start when libinput's initial seat enumeration opened zero
 /// **usable** (keyboard- or pointer-capable) input devices. A display server
@@ -386,20 +370,15 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // libinput directly, arming VT_PROCESS when a controlling console is
     // present.
     let mut backend = build_kms_backend(&device_paths, console_guard, opts.layout.clone())?;
-    let (fb_w, fb_h) = backend.fb_dimensions();
+    // One snapshot of everything `ServerState` needs from the live
+    // backend — screen extent, RandR outputs/modes/providers, backend
+    // capabilities. The server-reset boundary re-derives a generation
+    // through this same call, so a second session is seeded exactly the
+    // way the first one was.
+    let topology = BackendTopology::from_backend(&mut backend);
+    let (fb_w, fb_h) = (topology.width, topology.height);
     log::info!("yserver: scanout {fb_w}x{fb_h}");
-
-    let (randr_outputs, randr_mode_table) = backend.randr_outputs_and_modes();
-    let randr_providers = backend.randr_providers();
-    let capabilities = yserver_core::server::BackendCapabilities::from_backend(&backend);
-    let mut state = ServerState::with_randr_outputs_and_modes(
-        fb_w,
-        fb_h,
-        randr_outputs,
-        randr_mode_table,
-        capabilities,
-    );
-    state.randr.set_providers(randr_providers);
+    let mut state = topology.into_server_state();
     // Tie the libinput thread's `clock::server_time_ms()` baseline
     // to ServerState's `start_instant` so the input-event timestamps
     // and the `state.timestamp_now()` clock used by the
