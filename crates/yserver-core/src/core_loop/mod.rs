@@ -12,6 +12,7 @@ pub mod client_reader;
 pub mod composite_overlay;
 pub mod damage_fanout;
 pub mod fanout;
+pub mod input_inventory;
 pub mod key_fanout;
 pub mod message;
 pub mod pointer_fanout;
@@ -25,6 +26,7 @@ pub mod xi1_focus;
 pub mod xi1_state_notify;
 pub mod xkb_layout;
 
+pub use input_inventory::{DeviceNode, InputInventory};
 pub use message::{
     DeviceInfo, HostInputEvent, Message, SYNTH_SCROLL_DOWN, SYNTH_SCROLL_LEFT, SYNTH_SCROLL_RIGHT,
     SYNTH_SCROLL_UP, SetupAllocateResponse,

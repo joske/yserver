@@ -21,6 +21,7 @@ use mio::{Events, Interest, Poll, unix::SourceFd};
 use super::{
     auth::AuthState,
     client_io::{self, WriteOutcome},
+    input_inventory::InputInventory,
     message::{HostInputEvent, Message, SetupAllocateResponse},
     poll_tokens::{
         ClientIdAllocator, NOTIFY_TOKEN, backend_token, client_token, listener_token,
@@ -1100,6 +1101,10 @@ pub fn run_core(
     let mut deferred_requests = FairRequestQueue::default();
     let mut server_grab_waiters: VecDeque<DeferredRequest> = VecDeque::new();
     let mut pending_backend_requests = PendingBackendRequests::default();
+    // Process-lifetime, not per-generation — see `input_inventory`'s
+    // module docs. Populated below on every `HostInput` device event;
+    // nothing consumes it yet (step 1 of the server-reset plan).
+    let mut input_inventory = InputInventory::new();
     loop {
         // The grab can be dropped by paths that have no release check of
         // their own — notably the two disconnect sites outside the message
@@ -1357,6 +1362,22 @@ pub fn run_core(
                             Message::HostInput(ev) => {
                                 if telemetry.enabled {
                                     telemetry.record_host_input(Instant::now());
+                                }
+                                // Process-lifetime bookkeeping: maintain
+                                // `InputInventory` regardless of
+                                // generation (it always dispatches, see
+                                // above) so a device add/remove is never
+                                // missed, even mid-reset once resets
+                                // exist. Nothing consumes the inventory
+                                // yet — purely additive.
+                                match &ev {
+                                    HostInputEvent::DeviceAdded(info) => {
+                                        input_inventory.add(info.clone());
+                                    }
+                                    HostInputEvent::DeviceRemoved { device_node } => {
+                                        input_inventory.remove(device_node);
+                                    }
+                                    _ => {}
                                 }
                                 handle_host_input(state, backend, ev);
                                 backend.mark_dirty();
