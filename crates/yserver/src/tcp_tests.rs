@@ -62,8 +62,14 @@ impl Fixture {
     }
 
     fn write_authority(&self) {
-        // FamilyInternet (0), 127.0.0.1, and the actual display. A FamilyLocal
-        // fixture would not be selected by a TCP X11 client.
+        // FamilyInternet (0), 127.0.0.1, and the actual display. This test
+        // selects its own cookie from the file below, so the family only has
+        // to be self-consistent — it is NOT a claim about what a real client
+        // would pick. Measured 2026-09-09: with only a FamilyLocal record
+        // present, Xlib connecting to 127.0.0.1:N sends that cookie anyway,
+        // because xtrans converts the loopback address to FamilyLocal. A
+        // FamilyInternet record is required for a genuinely remote client,
+        // not for loopback.
         let mut record = 0u16.to_be_bytes().to_vec();
         let number = (self.port - 6000).to_string();
         for field in [

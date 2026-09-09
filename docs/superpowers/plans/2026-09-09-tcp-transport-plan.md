@@ -11,7 +11,7 @@ their own branches and specs.
 **Deliverable:** `yserver :7 -listen tcp -auth <file>` accepts
 `xdpyinfo -display 127.0.0.1:7` with `XAUTHORITY` set, and refuses it without.
 Without `-listen tcp` no TCP socket exists. Unix clients are unchanged, proven
-by the xts A/B.
+by the existing suite passing unmodified.
 
 ## Ordering principle
 
@@ -33,9 +33,11 @@ yet.
 
 - `cargo +nightly fmt`, `cargo clippy --all-targets -- -D warnings`,
   `cargo test` clean before each commit, per AGENTS.md.
-- The xts A/B (Xlib4 + Xlib9, zero PASS→FAIL) is a **hard gate on steps 3, 4
-  and 5** — the seam and the dispatch gate both sit in the path every local
-  client already uses. It is not a closing sweep.
+- **No xts A/B.** That gate is for pixel/rendering changes; nothing here draws,
+  moves geometry, or alters protocol semantics for a local client, and
+  `is_local` is `true` for every connection until step 6, so the dispatch gate
+  is a no-op by construction until then. The unit suite exercises the real
+  paths over socket pairs and covers the gate in both directions.
 - No hardware needed for any step: everything here is socket and dispatch
   work, testable in the sandbox. The integration check in step 7 wants a real
   `xdpyinfo`/`xterm`, which run locally.
@@ -90,7 +92,7 @@ must all still parse. Startup test: `-listen tcp` without `-auth` fails.
 Overflow test at display 59535 (ok) and 59536 (error). Still no socket bound
 anywhere in the suite.
 
-## Step 3 — the `Transport` enum ⚠ xts gate
+## Step 3 — the `Transport` enum
 
 Mechanical, wide, zero behaviour change. The risk is a silent local
 regression, not a TCP bug.
@@ -108,10 +110,10 @@ regression, not a TCP bug.
   edits.
 
 **Proof.** The whole existing suite, unchanged in meaning, must pass — that is
-the point of the step. Plus the xts A/B. Delegation unit tests for all eight
-methods on the Unix variant. **No** TCP variant is constructed yet.
+the point of the step. Delegation unit tests for all eight methods on the Unix
+variant. **No** TCP variant is constructed yet.
 
-## Step 4 — `is_local` and `fd_passing`, and the dispatch gate ⚠ xts gate
+## Step 4 — `is_local` and `fd_passing`, and the dispatch gate
 
 Lands while every client is still Unix, so the gate is provable in isolation
 before anything can reach it remotely.
@@ -149,8 +151,7 @@ asserting the **exact** error per the table above, including the vidmode split
 across all 12 unconditional requests and at least three mutating ones, and
 `GetPermissions`'s two reply forms. A test asserting Present is reachable with
 `is_local == false`. A test that all three extensions are still advertised.
-xts A/B — every xts client is local, so a mistake in the gate that inverts the
-sense would show here.
+A sense inversion would show as the local-direction tests failing.
 
 ## Step 5 — `FdReader`, the ingress seam
 
@@ -160,7 +161,7 @@ sense would show here.
   variant, so "TCP got an fd" cannot typecheck.
 
 **Proof.** Unit: a Unix pair still passes an fd through; a TCP pair reads the
-same bytes and returns an empty fd list. Full suite + xts A/B.
+same bytes and returns an empty fd list. Full suite.
 
 ## Step 6 — bind the listener, with fairness
 
@@ -208,14 +209,20 @@ of them:
 - assert the resulting client is `!is_local && !fd_passing`;
 - repeat with no cookie and with a wrong cookie, asserting refusal.
 
-Write the temporary Xauthority record with **`FamilyInternet` (0)** and the
-loopback address explicitly. A normal `:N` / `FamilyLocal` (256) entry is not
-selected for `127.0.0.1:N` — our own client-side reader picks a cookie by
-family and number (`xauth.rs:5`), and libXau does the same — so a
-FamilyLocal-only file makes the *client* send no auth data at all. The server
-then refuses with `REASON_NO_PROTO` and the failure reads as a server bug when
-it is a test-fixture bug. Note our server ignores family entirely
-(`auth.rs:137`), so this is purely about what the client will send.
+On the cookie family, **measured rather than assumed** (2026-09-09): an
+earlier draft of this plan asserted that a `FamilyLocal` (256) entry is not
+selected for `127.0.0.1:N` and that the fixture therefore needs a
+`FamilyInternet` (0) record. **That is false for loopback.** With an authority
+file containing only a FamilyLocal record, `xdpyinfo -display 127.0.0.1:77`
+against a capturing listener sent `MIT-MAGIC-COOKIE-1` with exactly that
+cookie — xtrans converts the loopback address to FamilyLocal before the auth
+lookup. So an ordinary `:N` cookie works for loopback TCP and no separate
+record is needed.
+
+It still matters for the real target: a **genuinely remote** client resolves to
+`FamilyInternet`, so XDMCP deployments in stage 4 do need Internet-family
+records. And since our server ignores family entirely (`auth.rs:137`), any of
+this is purely about what the *client* chooses to send.
 
 ## Step 7 — end-to-end, and the documentation the security posture requires
 
@@ -236,9 +243,8 @@ it is a test-fixture bug. Note our server ignores family entirely
   accidentally making local clients stricter — breaks every desktop we
   support. Hence the local-four regression fence before the TCP arm.
 - **A `!is_local` sense inversion** would refuse DRI3 to *local* clients, i.e.
-  break all GL everywhere. The xts A/B plus the explicit both-directions unit
-  tests are what catch it; a test that only checks the remote direction would
-  not.
+  break all GL everywhere. The explicit both-directions unit tests are what
+  catch it; a test that only checks the remote direction would not.
 - **`OUTBOUND_CAP` is resolved in step 6** (keep 4 MiB, both transports,
   documented). The residual hazard is the empty-queue skip described there: it
   means one huge reply to a slow remote peer can hold tens of MB queued for
