@@ -21,6 +21,7 @@ use mio::{Events, Interest, Poll, unix::SourceFd};
 use super::{
     auth::AuthState,
     client_io::{self, WriteOutcome},
+    generation,
     input_inventory::InputInventory,
     message::{HostInputEvent, Message, SetupAllocateResponse},
     poll_tokens::{
@@ -1275,7 +1276,19 @@ pub fn run_core(
                 NOTIFY_TOKEN => {
                     let mut channel_requests = 0_usize;
                     let mut channel_requests_by_client = HashMap::new();
-                    for msg in rx.try_recv_all() {
+                    for (msg_generation, msg) in rx.try_recv_all_tagged() {
+                        // Discard stale session-scoped traffic at the top
+                        // of dispatch (server-reset plan step 2). Inert
+                        // today: the generation never advances yet, so
+                        // `msg_generation` always equals the current one
+                        // and every message dispatches exactly as before.
+                        if !generation::should_dispatch(
+                            rx.current_generation(),
+                            msg_generation,
+                            &msg,
+                        ) {
+                            continue;
+                        }
                         match msg {
                             Message::Shutdown => {
                                 setup_thread::shutdown_all(&setup_registry);
