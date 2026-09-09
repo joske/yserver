@@ -66,6 +66,54 @@ fn fanout_destroy_sequence(state: &mut ServerState, pending: &PendingDestroy) {
     });
 }
 
+/// The host-pixmap frees one teardown made: `freed` went back to the backend,
+/// `deferred` was held because [`ResourceTable::host_xid_still_referenced`]
+/// found a surviving reference.
+///
+/// [`ResourceTable::host_xid_still_referenced`]: crate::resources::ResourceTable::host_xid_still_referenced
+#[derive(Debug, Default)]
+pub struct HostPixmapFrees {
+    pub freed: Vec<u32>,
+    pub deferred: Vec<u32>,
+}
+
+/// The single host-pixmap orphan gate. Every teardown path routes its
+/// candidates through here so the decision stays
+/// `ResourceTable::host_xid_still_referenced` and never a per-call-site
+/// subset — the omissions were the #133 use-after-free/leak pair.
+fn free_orphaned_host_pixmaps(
+    state: &ServerState,
+    backend: &mut dyn Backend,
+    mut candidates: Vec<u32>,
+    mut report: Option<&mut HostPixmapFrees>,
+) {
+    // Deduplicated, because a tile can arrive from more than one source — a
+    // freed pixmap resource AND a destroyed window's background or border.
+    // Freeing it twice is the same broken contract the CWA path had.
+    //
+    // Neither source may be freed unconditionally: another client's window may
+    // still name the tile as its background or border, and a GC may still hold
+    // it as a tile / stipple / clip mask. The disconnect path checked nothing
+    // at all, so `A` creating a tile, `B` bordering with it and `A`
+    // disconnecting left `B` sampling freed GPU storage (#133).
+    candidates.sort_unstable();
+    candidates.dedup();
+    for xid in candidates {
+        if crate::backend::PixmapHandle::from_raw(xid)
+            .is_some_and(|handle| state.resources.host_xid_still_referenced(handle))
+        {
+            if let Some(report) = report.as_deref_mut() {
+                report.deferred.push(xid);
+            }
+            continue;
+        }
+        let _ = backend.free_pixmap(None, xid);
+        if let Some(report) = report.as_deref_mut() {
+            report.freed.push(xid);
+        }
+    }
+}
+
 /// Drop every server-side resource owned by `client_id` and free the
 /// corresponding host objects.
 ///
@@ -79,6 +127,22 @@ fn fanout_destroy_sequence(state: &mut ServerState, pending: &PendingDestroy) {
 /// findable by ID until either `KillClient(resource_owned_by_this_id)`
 /// or, for RetainTemporary only, `KillClient(AllTemporary)`.
 pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, client_id: ClientId) {
+    process_disconnect_reporting(state, backend, client_id, None);
+}
+
+/// [`process_disconnect`], additionally reporting which host pixmaps it freed
+/// and which it held back because a surviving reference still named them.
+///
+/// Only the reset path needs the report: it tears down every client, so a
+/// deferral taken while a later client still held the tile has to be
+/// re-examined once that client is gone too. The normal disconnect passes
+/// `None` and behaves exactly as before.
+pub fn process_disconnect_reporting(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    client_id: ClientId,
+    host_pixmap_frees: Option<&mut HostPixmapFrees>,
+) {
     // Idempotent: a client can be disconnected twice in quick succession
     // (write-side EPIPE from process_request races the reader thread's
     // EOF → Message::ClientDisconnected). The first call removes the
@@ -480,16 +544,7 @@ pub fn process_disconnect(state: &mut ServerState, backend: &mut dyn Backend, cl
     // are gone by this point, so the gate sees only survivors.
     let mut freeable = removed.freed_pixmaps;
     freeable.extend(attr_pixmap_xids);
-    freeable.sort_unstable();
-    freeable.dedup();
-    for xid in freeable {
-        if crate::backend::PixmapHandle::from_raw(xid)
-            .is_some_and(|handle| state.resources.host_xid_still_referenced(handle))
-        {
-            continue;
-        }
-        let _ = backend.free_pixmap(None, xid);
-    }
+    free_orphaned_host_pixmaps(state, backend, freeable, host_pixmap_frees);
     for (pic_xid, owned_pix) in removed.freed_pictures {
         let _ = backend.render_free_picture(None, pic_xid);
         if let Some(pix_xid) = owned_pix {
@@ -599,6 +654,17 @@ pub fn destroy_zombie_resources(
     backend: &mut dyn Backend,
     zombie: ClientId,
 ) {
+    destroy_zombie_resources_reporting(state, backend, zombie, None);
+}
+
+/// [`destroy_zombie_resources`], reporting its host-pixmap frees the same way
+/// [`process_disconnect_reporting`] does.
+pub fn destroy_zombie_resources_reporting(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    zombie: ClientId,
+    host_pixmap_frees: Option<&mut HostPixmapFrees>,
+) {
     let mut owned_roots: Vec<ResourceId> = Vec::new();
     state
         .resources
@@ -683,16 +749,7 @@ pub fn destroy_zombie_resources(
     // are gone by this point, so the gate sees only survivors.
     let mut freeable = removed.freed_pixmaps;
     freeable.extend(attr_pixmap_xids);
-    freeable.sort_unstable();
-    freeable.dedup();
-    for xid in freeable {
-        if crate::backend::PixmapHandle::from_raw(xid)
-            .is_some_and(|handle| state.resources.host_xid_still_referenced(handle))
-        {
-            continue;
-        }
-        let _ = backend.free_pixmap(None, xid);
-    }
+    free_orphaned_host_pixmaps(state, backend, freeable, host_pixmap_frees);
     for (pic_xid, owned_pix) in removed.freed_pictures {
         let _ = backend.render_free_picture(None, pic_xid);
         if let Some(pix_xid) = owned_pix {

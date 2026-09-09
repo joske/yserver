@@ -323,6 +323,18 @@ pub struct RecordingBackend {
     /// flip this to a (1, 4)/`syncobj: true` surface so the `IMPORT_SYNCOBJ` /
     /// `FREE_SYNCOBJ` handlers pass their `caps.syncobj` gate.
     pub(crate) dri3_caps: crate::backend::Dri3Caps,
+    /// Live host-pixmap accounting: every xid handed out by
+    /// [`Backend::create_pixmap`] that has not yet come back through
+    /// [`Backend::free_pixmap`]. The call log alone cannot answer "does the
+    /// backend still hold storage?" — a create with no matching free leaves
+    /// no trace in it — so teardown tests assert against this set.
+    pub live_pixmaps: std::collections::BTreeSet<u32>,
+    /// Live GLX pixmap-export refcounts, keyed by host xid: incremented by
+    /// `acquire_glx_pixmap_export`, decremented by
+    /// `release_glx_pixmap_export`, entry dropped at zero. Mirrors the KMS
+    /// backend's `glx_refs`, so an unreleased export is visible as a
+    /// non-empty map rather than only as a missing call.
+    pub glx_pixmap_exports: std::collections::BTreeMap<u32, u32>,
     /// `present_id`s passed to `signal_present_wake`, in call order, so
     /// vblank-pacing tests can assert the deferred wake fired.
     pub signalled_present_wakes: Vec<u64>,
@@ -477,6 +489,8 @@ impl RecordingBackend {
             signalled_dri3_syncobjs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             dri3_syncobj_owners: std::collections::HashMap::new(),
             dri3_caps: crate::backend::Dri3Caps::unsupported(),
+            live_pixmaps: std::collections::BTreeSet::new(),
+            glx_pixmap_exports: std::collections::BTreeMap::new(),
             signalled_present_wakes: Vec::new(),
             completed_present_events_to_drain: Vec::new(),
             retired_present_idle_events_to_drain: Vec::new(),
@@ -1356,6 +1370,7 @@ impl Backend for RecordingBackend {
         height: u16,
     ) -> io::Result<PixmapHandle> {
         let xid = self.allocate_handle();
+        self.live_pixmaps.insert(xid);
         self.record(RecordedCall::CreatePixmap {
             depth,
             width,
@@ -1365,6 +1380,7 @@ impl Backend for RecordingBackend {
     }
 
     fn free_pixmap(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
+        self.live_pixmaps.remove(&host_xid);
         self.record(RecordedCall::FreePixmap(host_xid));
         Ok(())
     }
@@ -2119,6 +2135,7 @@ impl Backend for RecordingBackend {
     }
 
     fn acquire_glx_pixmap_export(&mut self, host_xid: u32) {
+        *self.glx_pixmap_exports.entry(host_xid).or_insert(0) += 1;
         self.calls
             .lock()
             .unwrap()
@@ -2126,6 +2143,14 @@ impl Backend for RecordingBackend {
     }
 
     fn release_glx_pixmap_export(&mut self, host_xid: u32) {
+        if let std::collections::btree_map::Entry::Occupied(mut e) =
+            self.glx_pixmap_exports.entry(host_xid)
+        {
+            *e.get_mut() -= 1;
+            if *e.get() == 0 {
+                e.remove();
+            }
+        }
         self.calls
             .lock()
             .unwrap()
