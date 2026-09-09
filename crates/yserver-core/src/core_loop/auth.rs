@@ -179,6 +179,31 @@ impl AuthState {
         })
     }
 
+    /// Load the configured authorization file into this state and require at
+    /// least one MIT cookie before a TCP listener may be enabled.
+    pub fn require_tcp_auth_at_startup(&self) -> Result<(), String> {
+        let Some(path) = self.file.as_deref() else {
+            return Err("-listen tcp requires -auth with a MIT-MAGIC-COOKIE-1 cookie".into());
+        };
+        // Use the same state and file decoder as `check`, but force the first
+        // load even when `stat` fails so startup and runtime share precisely
+        // the same load outcome.
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        Self::reload_if_needed(&mut inner, path, true);
+        if inner.cookies.is_empty() {
+            return Err("-listen tcp requires -auth with a MIT-MAGIC-COOKIE-1 cookie".into());
+        }
+        Ok(())
+    }
+
+    fn reload_if_needed(inner: &mut Inner, path: &Path, force: bool) {
+        let stat_mtime = fs::metadata(path).ok().and_then(|m| m.modified().ok());
+        let changed = should_reload(stat_mtime, &mut inner.last_mtime);
+        if force || changed {
+            inner.apply_load_outcome(load_outcome(path));
+        }
+    }
+
     /// Authorize one client. Reloads lazily on file change, then decides.
     pub fn check(
         &self,
@@ -197,11 +222,7 @@ impl AuthState {
         };
         // Poisoning recovery — same pattern as setup_thread.rs:66.
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let stat_mtime = fs::metadata(path).ok().and_then(|m| m.modified().ok());
-        if should_reload(stat_mtime, &mut inner.last_mtime) {
-            let outcome = load_outcome(path);
-            inner.apply_load_outcome(outcome);
-        }
+        Self::reload_if_needed(&mut inner, path, false);
         inner.verdict(transport, proto_name, proto_data)
     }
 }
@@ -483,5 +504,50 @@ mod tests {
             AuthVerdict::Reject(REASON_BAD_COOKIE)
         );
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn startup_tcp_auth_loads_the_runtime_cookie_state() {
+        let cookie = [0x3Du8; 16];
+        let path = temp_path("startup-tcp-cookie");
+        fs::write(&path, xauth_bytes(b"7", &cookie)).unwrap();
+        let auth = AuthState::new(Some(path.clone()));
+
+        assert!(auth.require_tcp_auth_at_startup().is_ok());
+        assert_eq!(
+            auth.check(AuthTransport::Tcp, MIT_MAGIC_COOKIE.as_bytes(), &cookie),
+            AuthVerdict::Allow,
+            "startup validation must load the exact state used at runtime"
+        );
+        let inner = auth.inner.lock().unwrap();
+        assert_eq!(
+            inner.cookies,
+            vec![cookie.to_vec()],
+            "runtime must see the startup load rather than append a second load"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn startup_tcp_auth_rejects_missing_or_empty_auth_files() {
+        assert!(AuthState::new(None).require_tcp_auth_at_startup().is_err());
+
+        let missing = temp_path("startup-tcp-missing");
+        let _ = fs::remove_file(&missing);
+        assert!(
+            AuthState::new(Some(missing))
+                .require_tcp_auth_at_startup()
+                .is_err()
+        );
+
+        let empty = temp_path("startup-tcp-empty");
+        fs::write(&empty, b"").unwrap();
+        assert!(
+            AuthState::new(Some(empty.clone()))
+                .require_tcp_auth_at_startup()
+                .is_err()
+        );
+        let _ = fs::remove_file(empty);
     }
 }

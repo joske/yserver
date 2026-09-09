@@ -92,6 +92,24 @@ fn input_startup_action(has_input_ctx: bool) -> InputStartup {
     }
 }
 
+/// Validate the prerequisites that make a future TCP listener safe. Kept
+/// separate from `run` so this remains testable without opening hardware or
+/// any socket; this stage intentionally creates no TCP listener.
+fn validate_tcp_startup(
+    opts: &launch::LaunchOptions,
+    auth: &core_loop::auth::AuthState,
+) -> io::Result<()> {
+    if !opts.tcp_listen {
+        return Ok(());
+    }
+    auth.require_tcp_auth_at_startup()
+        .map_err(io::Error::other)?;
+    if let launch::Resolution::Explicit { display, .. } = launch::resolve(opts) {
+        let _ = launch::tcp_port(display).map_err(io::Error::other)?;
+    }
+    Ok(())
+}
+
 pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     panic!("yserver only supports Linux and FreeBSD (DRM/KMS, libinput, evdev)");
@@ -101,6 +119,11 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // the whole crate at `info`. A log without the hash cannot say which commit
     // it measured — that bit the 2026-09-03 z400 runs.
     log::info!(target: "yserver::startup", "yserver: startup — {}", crate::version::line());
+
+    // Validate TCP's two startup invariants before opening devices or binding
+    // sockets. This stage deliberately does not bind a TCP listener yet.
+    let auth = core_loop::auth::AuthState::new(opts.auth_file.clone());
+    validate_tcp_startup(&opts, &auth)?;
 
     // Capture the inherited SIGUSR1 disposition before signalfd masking.
     // If the DM started us with SIGUSR1 ignored, we signal it when ready.
@@ -585,7 +608,6 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     launch::signal_ready(&opts, display, sigusr1_was_ignored, parent_pid);
 
     let alloc = ClientIdAllocator::new();
-    let auth = core_loop::auth::AuthState::new(opts.auth_file.clone());
     if opts.auth_file.is_some() {
         log::info!(
             "yserver: authorization enabled via -auth {:?}",
@@ -765,7 +787,7 @@ fn block_termination_signals() -> io::Result<nix::sys::event::Kqueue> {
 mod tests {
     use super::{
         InputStartup, ensure_input_devices_opened, input_startup_action,
-        install_backend_root_bindings,
+        install_backend_root_bindings, validate_tcp_startup,
     };
     use yserver_core::{
         backend::Backend,
@@ -836,5 +858,53 @@ mod tests {
     #[test]
     fn with_input_ctx_spawns_input_thread() {
         assert_eq!(input_startup_action(true), InputStartup::DirectSpawn);
+    }
+
+    #[test]
+    fn listen_tcp_without_auth_is_rejected_before_startup() {
+        let opts = crate::launch::parse_args(["-listen".into(), "tcp".into()]).unwrap();
+        let auth = yserver_core::core_loop::auth::AuthState::new(opts.auth_file.clone());
+
+        let err = validate_tcp_startup(&opts, &auth).expect_err("-auth is mandatory for TCP");
+        assert!(err.to_string().contains("-auth"));
+    }
+
+    #[test]
+    fn tcp_startup_port_validation_accepts_65535_and_rejects_overflow() {
+        let path = std::env::temp_dir().join(format!(
+            "yserver-tcp-startup-port-test-{}",
+            std::process::id()
+        ));
+        let cookie = [0x7Bu8; 16];
+        let mut record = 256u16.to_be_bytes().to_vec(); // FamilyLocal
+        for field in [
+            b"host".as_slice(),
+            b"7".as_slice(),
+            b"MIT-MAGIC-COOKIE-1".as_slice(),
+            cookie.as_slice(),
+        ] {
+            record.extend_from_slice(&(field.len() as u16).to_be_bytes());
+            record.extend_from_slice(field);
+        }
+        std::fs::write(&path, record).unwrap();
+
+        for (display, succeeds) in [(59_535, true), (59_536, false)] {
+            let opts = crate::launch::parse_args([
+                format!(":{display}"),
+                "-listen".into(),
+                "tcp".into(),
+                "-auth".into(),
+                path.display().to_string(),
+            ])
+            .unwrap();
+            let auth = yserver_core::core_loop::auth::AuthState::new(opts.auth_file.clone());
+            assert_eq!(
+                validate_tcp_startup(&opts, &auth).is_ok(),
+                succeeds,
+                "display :{display}"
+            );
+        }
+
+        let _ = std::fs::remove_file(path);
     }
 }
