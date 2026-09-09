@@ -419,6 +419,20 @@ impl ResourceTable {
             .insert(id.0, Gc::with_defaults(id, ROOT_WINDOW, owner));
     }
 
+    /// Seed a GC that names `host_xid` as its tile — the GC arm of
+    /// [`Self::host_xid_still_referenced`]. For use in tests only.
+    #[cfg(test)]
+    pub fn seed_gc_with_tile_for_test(
+        &mut self,
+        owner: ClientId,
+        id: ResourceId,
+        host_xid: crate::backend::PixmapHandle,
+    ) {
+        let mut gc = Gc::with_defaults(id, ROOT_WINDOW, owner);
+        gc.tile_host_xid = Some(host_xid);
+        self.gcs.insert(id.0, gc);
+    }
+
     /// Seed a minimal Font into the resource table. For use in tests only.
     #[cfg(test)]
     pub fn seed_font_for_test(&mut self, owner: ClientId, id: ResourceId) {

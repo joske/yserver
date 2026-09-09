@@ -20,6 +20,7 @@ pub mod pointer_fanout;
 pub mod poll_tokens;
 pub mod process_disconnect;
 pub mod process_request;
+pub mod reset;
 pub mod run;
 pub mod sender;
 pub mod setup_thread;
