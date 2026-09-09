@@ -96,11 +96,42 @@ directions from the file source:
   and be forgotten with the state — clearing it has to be explicit at the
   generation boundary.
 
-The cleanest shape: the in-memory slot is part of `AuthState` but keyed by
-generation, or cleared by an explicit call the reset boundary makes. Either
-way it must be **impossible** for a reset to leave the old session's cookie
-installed. Specify which before implementing; do not leave it to the
-implementation, because both spellings look right in review.
+**Decided: generation-bound, and cleared on abandonment.** Not an explicit
+reset-time clear alone — that is a call which can be missed or raced.
+
+- `AuthState` stores `{ generation, cookie }`.
+- Setup authentication compares it against **the setup thread's own bound
+  producer generation** — the binding introduced by the reset work's
+  `BoundSender`, captured at accept — *not* the global current generation. A
+  reset then invalidates the cookie by mismatch, immediately and without
+  anyone remembering to clear anything.
+
+Generation binding alone is **not sufficient**, because an Accept can be
+abandoned with no generation change. `recv_refuse_msg` (`xdmcp.c:1264`) takes
+`XDM_AWAIT_MANAGE_RESPONSE` back to `XDM_START_CONNECTION` and resends
+`Request`; the cookie from the refused Accept is still installed and the next
+Accept brings a different one. So the cookie belongs to **the accepted offer**,
+not merely to the generation: clear or replace it on every path that leaves
+`AWAIT_MANAGE_RESPONSE` without a running session.
+
+### The stage-1 contradiction, and how it resolves
+
+Stage 1 made `-listen tcp` a **startup error** unless `-auth` yields a usable
+cookie. XDMCP has no cookie at startup — it arrives in the `Accept`, and TCP
+must already be listening for the manager's session to connect. As written the
+two rules cannot both hold.
+
+Resolution: **XDMCP is an approved dynamic authorization source** for the
+purposes of that startup check, so `-query` and friends satisfy it in place of
+`-auth`. Before an `Accept` has been received, TCP setup **fails closed** —
+there is no cookie, so nothing authorizes.
+
+And the decision that follows, which must be explicit: **in XDMCP mode, TCP
+setup accepts the generation-bound XDMCP cookie only.** File cookies do not
+authorize a TCP client while XDMCP is driving the session. Honouring both
+would let a cookie in a local file authorize a client in a session it has
+nothing to do with, which defeats the per-session model this whole stage is
+built on. Unix clients are unaffected.
 
 #### 2. XDMCP owns the reset policy
 
@@ -134,9 +165,17 @@ would imply an authentication mode we do not implement.
 
 ## Invariants
 
-1. A session's cookie authorizes only that session. A new generation never
-   inherits the previous one's XDMCP cookie.
-2. One XDMCP session is exactly one server generation.
+1. A session's cookie authorizes only that session — enforced by generation
+   binding, and by clearing the provisional cookie when an accepted offer is
+   abandoned. A new generation never inherits the previous one's cookie, and
+   nor does a retried negotiation within one.
+2. **Every established XDMCP session ends at a generation boundary; a failed
+   negotiation may also restart a generation.** The weaker second clause is
+   Xorg-faithful and load-bearing: the generic retransmission limit
+   (`xdmcp.c:826`) calls `XdmcpDeadSession` regardless of state, so exhausting
+   retries during Query or Request resets with no session having existed.
+   Generations can therefore exist with zero sessions, and an invariant saying
+   "one session = one generation" would be false.
 3. `-once` terminates rather than resetting when the session ends.
 4. With no XDMCP option, nothing changes: no UDP socket, no state machine, and
    the reset policy stays `-noreset`.
@@ -165,9 +204,16 @@ would imply an authentication mode we do not implement.
   a self-consistent codec that is wrong on the wire passes every round-trip
   test. State-machine transitions including `Unwilling`, `Decline`, `Refuse`
   and `Failed`.
-- Cookie lifetime: an `Accept` installs a cookie that authorizes a client; a
-  reset clears it; a client presenting the previous session's cookie after a
-  reset is refused. That last one is the test this spec exists for.
+- Cookie lifetime, the tests this spec exists for: an `Accept` installs a
+  cookie that authorizes a client; after a reset, a client presenting the
+  previous session's cookie is refused **by generation mismatch** — assert the
+  mechanism, not just the refusal, or a test passes for the wrong reason. And
+  the abandoned-offer case with no reset in it: `Accept`, then `Refuse`, then a
+  second `Accept` with a different cookie — a client presenting the *first*
+  cookie is refused.
+- The stage-1 interaction: `-listen tcp` with an XDMCP option and no `-auth`
+  starts; a TCP client connecting **before** any `Accept` is refused; a file
+  cookie does not authorize a TCP client while XDMCP is driving.
 - Integration: `-query` against LightDM with XDMCP enabled, on one machine
   first, then across the LAN. A session starts, ends, and a second session
   starts on the same server.
