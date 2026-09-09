@@ -440,8 +440,13 @@ how the server is actually started today.
   and unrelated to reset, but it is the only departure that bypasses the
   funnel, so anything else added to that funnel later will miss it too.
 
-- **The composite-overlay claim is not a per-client resource, and that must be
-  fixed BEFORE reset ships.** `GetOverlayWindow` increments an anonymous
+- **⛔ BLOCKING PREREQUISITE, now specified separately:**
+  `2026-09-09-composite-overlay-claim-ownership-design.md`. Reset must not be
+  enabled or merged until it lands, and once it does reset inherits the
+  cleanup through `force_destroy_all_clients` with no COW-specific code. The
+  summary below is kept for context; that spec is authoritative.
+
+- **The composite-overlay claim is not a per-client resource.** `GetOverlayWindow` increments an anonymous
   backend counter (`core.cow_refcount`); nothing decrements it when the
   claiming client disconnects. `process_disconnect` calls
   `backend.client_disconnected`, which clears the *scene* root-overlay
