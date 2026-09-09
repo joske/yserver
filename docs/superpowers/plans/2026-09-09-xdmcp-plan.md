@@ -154,7 +154,16 @@ presenting the previous session's cookie after a reset is refused **by
 generation mismatch** — assert the mechanism, not just the refusal, or it
 passes for the wrong reason. Second, with no reset in it: `Accept`, `Refuse`,
 second `Accept` with a different cookie, and a client presenting the *first*
-cookie is refused. Plus: TCP before any `Accept` is refused; a file cookie does
+cookie is refused.
+
+⚠ **As originally worded, that second test passes for the wrong reason** —
+found in implementation. There is one credential slot, so the second `Accept`
+overwrites the first regardless of whether `Refuse` cleared anything; the test
+is green against an implementation with no clear at all. The assertion that
+actually bites goes in the **window between the `Refuse` and the next
+`Accept`**: the refused offer's cookie must stop authorizing *immediately*, not
+merely once a replacement arrives. That window is several retransmits long in
+practice, so it is the operationally important one too. Plus: TCP before any `Accept` is refused; a file cookie does
 not authorize a TCP client while XDMCP is active; an empty cookie is never
 installed (`ct_eq(&[], &[])` is `true`, so an empty credential matches any
 empty presentation).
@@ -197,6 +206,15 @@ The first step that sends anything.
   (`xdmcp.c:65`, `defaultDisplayClass`), and the `Request` packet carries it —
   so an unset class must become that string on the wire, not an empty
   `ARRAY8`.
+- **Read the generation for `install_session_cookie` at the moment the
+  `Accept` is processed on the core loop** (`CoreReceiver::current_generation()`),
+  not when the socket was created. Capturing it earlier reintroduces the race
+  the binding exists to close.
+- **Serialising `ClearCookie` against an in-flight setup** is this step's
+  problem, not the auth layer's. Each `AuthState` operation is atomic under its
+  mutex, but a setup thread that has already passed `check` is past that point;
+  the ordering has to come from the state machine's `SessionClientEstablished`
+  event.
 - The deadline joins the loop's existing per-iteration poll-timeout
   computation. **No new thread** — the state machine belongs on the core loop
   where it can see the generation boundary directly.
