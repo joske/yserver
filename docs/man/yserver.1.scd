@@ -78,6 +78,13 @@ how the server is started:
 	reset in a desktop session is indistinguishable from a crash, and
 	nothing that launches *yserver* today expects one.
 
+	Under *-reset*, *any* client that is the last one to disconnect
+	triggers a reset — including a one-shot tool. Running *xprop*(1) or
+	*xdpyinfo*(1) against an otherwise idle *-reset* server therefore
+	destroys the session as that tool exits. This matches *Xorg*(1), and it
+	means *-reset* only makes sense when something holds the display open
+	continuously, such as a display manager's session.
+
 *--version*, *-version*
 	Print the version and the commit it was built from, then exit.
 
