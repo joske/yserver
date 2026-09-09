@@ -419,6 +419,43 @@ how the server is actually started today.
 
 ## Adjacent gaps, not in scope
 
+- **The composite-overlay claim is not a per-client resource, and that must be
+  fixed BEFORE reset ships.** `GetOverlayWindow` increments an anonymous
+  backend counter (`core.cow_refcount`); nothing decrements it when the
+  claiming client disconnects. `process_disconnect` calls
+  `backend.client_disconnected`, which clears the *scene* root-overlay
+  contribution (`kms/render/backend.rs:19621`,
+  `scene.root_overlay_on_disconnect`) — a different overlay concept with a
+  confusingly similar name, and not the COW claim.
+
+  Xorg has no such gap: the claim is a per-client XID resource, so the
+  resource system frees it on disconnect (`FreeCompositeClientOverlay`,
+  `../xserver/composite/compext.c:88`, calling `compFreeOverlayClient`,
+  `compoverlay.c:59`), and the COW is destroyed when the last claim goes.
+
+  The fix, and it is structural rather than reset-specific:
+  1. Track COW claim ownership **per client** in core state, so repeated
+     `GetOverlayWindow` from one client cannot create unbounded anonymous
+     claims.
+  2. Share one "release this client's claim" helper between
+     `ReleaseOverlayWindow` and both the ordinary and forced disconnect paths.
+  3. Reset then inherits the cleanup through `force_destroy_all_clients` with
+     no special case — no counting, no looping.
+  4. **Final COW teardown failure must be fatal to the reset**, not logged.
+     `release_overlay_window`'s `refcount == 1 && scanout_m2.active()` branch
+     calls `materialize_direct_shadow_for_unflip()?` and can fail
+     (`kms/render/backend.rs:20169`), leaving the refcount untouched by
+     design. Continuing past that would start the next XDMCP session with the
+     previous user's overlay still held. Either add a reset-specific teardown
+     that can complete the unflip safely, or fail/terminate rather than expose
+     the next session.
+
+  A bounded decrement loop inside `reset_generation` was written and then
+  **rejected** (jos and codex, 2026-09-09): the cap is arbitrary and
+  protocol-invalid, and the failure mode is precisely the one reset exists to
+  prevent.
+
+
 - ~~`SetCloseDownMode`/`RetainPermanent`~~ — no longer an adjacent gap. Forced
   destruction of retained and zombie resources is core design (see "Forced
   cleanup"), with its own invariant and test, not something to defer.
