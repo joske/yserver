@@ -301,9 +301,18 @@ pub(crate) fn reset_generation(
     locals: GenerationLocals<'_>,
 ) -> Generation {
     // -- 1. Bump the generation. ------------------------------------
-    // First, so everything below is defined relative to the new one and
-    // any message a still-running producer tags from here on is already
-    // stale by construction.
+    // First, so everything below is defined relative to the new one.
+    //
+    // What makes a still-running producer's traffic stale is NOT this
+    // bump: a producer is bound to a generation when it is created
+    // (`CoreSender::bind`, called at accept), and tags every message
+    // with that fixed value. So a setup or reader thread belonging to
+    // the session being destroyed keeps tagging with the OLD generation
+    // however long it takes to wake, and the dispatcher discards it.
+    // Reading the counter at send time instead would do the opposite —
+    // a producer that woke after this line would tag its message with
+    // the NEW generation and be let straight through, which is the
+    // cross-session race the quarantine exists to prevent.
     let generation = generations.bump();
 
     // -- 2. Cancel pending setup handshakes. ------------------------

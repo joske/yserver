@@ -6,7 +6,7 @@ use std::{os::fd::OwnedFd, time::Instant};
 
 use yserver_protocol::x11::{ClientByteOrder, ClientId, RequestHeader, SequenceNumber};
 
-use crate::{host_x11::HostKeyEvent, transport::Transport};
+use crate::{core_loop::generation::Generation, host_x11::HostKeyEvent, transport::Transport};
 
 /// Snapshot of a libinput device's identity and touchpad configuration at
 /// device-add time.  Plain data — no libinput handles, safe to send across
@@ -134,6 +134,16 @@ pub enum Message {
     /// spawn (D4).
     ClientSetupComplete {
         id: ClientId,
+        /// The generation the setup thread was bound to at accept.
+        /// Carried explicitly so the reader thread spawned for this
+        /// client inherits the *connection's* generation rather than
+        /// re-reading the counter. Necessarily equal to this message's
+        /// own channel tag — a completion whose tag did not match the
+        /// running generation is discarded before it is ever read — but
+        /// the counter is not a safe substitute: the point of the
+        /// quarantine is that a producer's generation is fixed where the
+        /// producer is created.
+        generation: Generation,
         stream: Transport,
         resource_id_base: u32,
         resource_id_mask: u32,

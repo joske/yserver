@@ -40,7 +40,7 @@ use log::warn;
 use yserver_protocol::x11::{self, ClientByteOrder, ClientId, SequenceNumber};
 
 use crate::{
-    core_loop::{message::Message, sender::CoreSender},
+    core_loop::{message::Message, sender::BoundSender},
     server::ReaderControl,
     transport::Transport,
     unix_fd::FdReader,
@@ -82,13 +82,21 @@ impl ReaderIngressWindow {
 /// Spawn the reader thread. Returns immediately; the thread runs
 /// until it observes EOF, an unrecoverable framing error, or
 /// `ReaderControl::Shutdown`.
+///
+/// `sender` must carry the generation this *connection* was accepted in
+/// — the setup thread's binding, forwarded through
+/// `Message::ClientSetupComplete`. A reader thread can still be parked
+/// in `read` when a reset retires its session, and both messages it
+/// produces (`Request`, `ClientDisconnected`) are session-scoped: tagged
+/// with the generation running at send time they would be applied to the
+/// *next* session instead of discarded.
 pub fn spawn(
     id: ClientId,
     stream: impl Into<Transport>,
     byte_order: ClientByteOrder,
     big_requests_major: u8,
     control_rx: Receiver<ReaderControl>,
-    sender: CoreSender,
+    sender: BoundSender,
 ) -> io::Result<()> {
     let stream = stream.into();
     std::thread::Builder::new()
@@ -114,7 +122,7 @@ fn run(
     byte_order: ClientByteOrder,
     big_requests_major: u8,
     control_rx: Receiver<ReaderControl>,
-    sender: &CoreSender,
+    sender: &BoundSender,
 ) -> io::Result<()> {
     let mut reader = BlockingFdReader::new(FdReader::new(stream));
     let mut big = false;
@@ -425,7 +433,7 @@ mod tests {
             ClientByteOrder::LittleEndian,
             BIG_MAJOR,
             ctrl_rx,
-            sender,
+            sender.bind(),
         )
         .unwrap();
 
@@ -471,7 +479,7 @@ mod tests {
             ClientByteOrder::LittleEndian,
             BIG_MAJOR,
             ctrl_rx,
-            sender,
+            sender.bind(),
         )
         .unwrap();
 
@@ -501,7 +509,7 @@ mod tests {
             ClientByteOrder::LittleEndian,
             BIG_MAJOR,
             ctrl_rx,
-            sender,
+            sender.bind(),
         )
         .unwrap();
 
@@ -545,7 +553,7 @@ mod tests {
             ClientByteOrder::LittleEndian,
             BIG_MAJOR,
             ctrl_rx,
-            sender,
+            sender.bind(),
         )
         .unwrap();
 
@@ -590,7 +598,7 @@ mod tests {
             ClientByteOrder::LittleEndian,
             BIG_MAJOR,
             ctrl_rx,
-            sender,
+            sender.bind(),
         )
         .unwrap();
 
@@ -634,7 +642,7 @@ mod tests {
             ClientByteOrder::LittleEndian,
             BIG_MAJOR,
             ctrl_rx,
-            sender,
+            sender.bind(),
         )
         .unwrap();
         // Very first byte the client ever sends is Enable.
@@ -657,7 +665,7 @@ mod tests {
             ClientByteOrder::LittleEndian,
             BIG_MAJOR,
             ctrl_rx,
-            sender,
+            sender.bind(),
         )
         .unwrap();
 
@@ -685,7 +693,7 @@ mod tests {
             ClientByteOrder::LittleEndian,
             BIG_MAJOR,
             ctrl_rx,
-            sender,
+            sender.bind(),
         )
         .unwrap();
         // Enable header — reader doesn't validate; it just parks.
@@ -715,7 +723,7 @@ mod tests {
             ClientByteOrder::LittleEndian,
             BIG_MAJOR,
             ctrl_rx,
-            sender,
+            sender.bind(),
         )
         .unwrap();
         write_request_no_body(&mut client_side, BIG_MAJOR, 0, 1);
@@ -748,7 +756,7 @@ mod tests {
             ClientByteOrder::LittleEndian,
             BIG_MAJOR,
             ctrl_rx,
-            sender,
+            sender.bind(),
         )
         .unwrap();
         drop(client_side);

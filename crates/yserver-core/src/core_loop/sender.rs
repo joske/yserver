@@ -7,8 +7,27 @@
 //! channel readiness — when a poll iteration sees it, drain the
 //! receiver via `try_recv_all`.
 //!
-//! Every message is also tagged, at send time, with the generation the
-//! loop was running when it was produced (see `super::generation`).
+//! Every message is also tagged with a generation (see
+//! `super::generation`), and *which* generation depends on the producer:
+//!
+//! - [`CoreSender`] is the process-lifetime handle. It reads the shared
+//!   counter at send time. Only process-lifetime messages may travel
+//!   this way — they are dispatched whatever their tag, so the value is
+//!   never load-bearing.
+//! - [`BoundSender`] carries a *fixed* generation, captured when the
+//!   producer was created, and stamps every message with it. Every
+//!   session-scoped producer — the per-connection setup thread and the
+//!   client reader thread it hands off to — must use one.
+//!
+//! The distinction is the whole quarantine. A session-scoped producer
+//! that read the shared counter at send time would tag a message
+//! belonging to the OLD session with the NEW generation whenever it woke
+//! up after `reset_generation` bumped the counter, and the dispatcher
+//! would accept it: an old client's `ClientSetupComplete` inserted into
+//! the fresh session, an old reader's `Request` executed against it.
+//! Binding at creation makes the tag a property of the producer, which
+//! is what "belongs to that session" actually means.
+//!
 //! `try_recv_all` keeps returning bare `Message`s — its existing callers
 //! (across both crates) are unaffected — while `try_recv_all_tagged`
 //! additionally hands back each message's tag, for `run_core`'s dispatch
@@ -20,7 +39,7 @@ use crossbeam_channel::{Receiver, Sender};
 use mio::{Poll, Token, Waker};
 
 use super::{
-    generation::{Generation, GenerationCounter},
+    generation::{self, Generation, GenerationCounter},
     message::Message,
 };
 
@@ -31,6 +50,21 @@ pub struct CoreSender {
     waker: Arc<Waker>,
     tx: Sender<(Generation, Message)>,
     generation: GenerationCounter,
+}
+
+/// A producer handle pinned to one generation.
+///
+/// Created from a [`CoreSender`] at the moment the producer itself is
+/// created — for a client, at accept — and tags every message with the
+/// generation that was running *then*, not the one running when the
+/// message is finally sent. Cheap to clone; a clone keeps the same
+/// binding, which is how a setup thread hands its generation to the
+/// reader thread it spawns.
+#[derive(Clone)]
+pub struct BoundSender {
+    waker: Arc<Waker>,
+    tx: Sender<(Generation, Message)>,
+    generation: Generation,
 }
 
 pub struct CoreReceiver {
@@ -58,15 +92,78 @@ pub fn channel() -> io::Result<(Poll, CoreSender, CoreReceiver)> {
     ))
 }
 
+/// The one place a `(Generation, Message)` reaches the channel, shared
+/// by both handles so the tag is the only thing that differs between
+/// them.
+fn post(
+    waker: &Waker,
+    tx: &Sender<(Generation, Message)>,
+    generation: Generation,
+    m: Message,
+) -> io::Result<()> {
+    tx.send((generation, m))
+        .map_err(|_| io::Error::other("core receiver dropped"))?;
+    waker.wake()
+}
+
 impl CoreSender {
+    /// Send a **process-lifetime** message. The tag is read from the
+    /// shared counter, which is sound only because such messages
+    /// dispatch regardless of their tag (`generation::is_session_scoped`
+    /// classifies them; `should_dispatch` waives the match). A
+    /// session-scoped message must go through a [`BoundSender`] instead
+    /// — sending one here would tag it with whatever generation happens
+    /// to be running at send time, which is exactly the cross-session
+    /// leak the quarantine exists to stop.
     pub fn send(&self, m: Message) -> io::Result<()> {
-        self.tx
-            .send((self.generation.current(), m))
-            .map_err(|_| io::Error::other("core receiver dropped"))?;
-        self.waker.wake()
+        debug_assert!(
+            !generation::is_session_scoped(&m),
+            "session-scoped message sent through an unbound CoreSender: {m:?} — \
+             session-scoped producers must hold a BoundSender (CoreSender::bind)"
+        );
+        post(&self.waker, &self.tx, self.generation.current(), m)
     }
 
     /// Cheap clone for handing to producer threads.
+    #[must_use]
+    pub fn clone_handle(&self) -> Self {
+        self.clone()
+    }
+
+    /// Bind a new producer to the generation running *now*. The call
+    /// site must be where the producer comes into existence — for a
+    /// client, the accept — not where it eventually sends.
+    #[must_use]
+    pub fn bind(&self) -> BoundSender {
+        self.bind_to(self.generation.current())
+    }
+
+    /// Bind to a generation established elsewhere. Used once, to give a
+    /// reader thread the generation its setup thread was bound to, which
+    /// travels with `Message::ClientSetupComplete`.
+    #[must_use]
+    pub fn bind_to(&self, generation: Generation) -> BoundSender {
+        BoundSender {
+            waker: self.waker.clone(),
+            tx: self.tx.clone(),
+            generation,
+        }
+    }
+}
+
+impl BoundSender {
+    /// Send tagged with this producer's fixed generation.
+    pub fn send(&self, m: Message) -> io::Result<()> {
+        post(&self.waker, &self.tx, self.generation, m)
+    }
+
+    /// The generation this producer belongs to.
+    #[must_use]
+    pub fn generation(&self) -> Generation {
+        self.generation
+    }
+
+    /// Cheap clone for handing to producer threads. Keeps the binding.
     #[must_use]
     pub fn clone_handle(&self) -> Self {
         self.clone()
@@ -125,6 +222,57 @@ mod tests {
         let (_poll, sender, rx) = channel().unwrap();
         sender.send(Message::Shutdown).unwrap();
         assert!(matches!(rx.try_recv_all().next(), Some(Message::Shutdown)));
+    }
+
+    #[test]
+    fn a_bound_sender_keeps_tagging_with_the_generation_it_captured() {
+        // The quarantine's core property: the tag follows the PRODUCER,
+        // not the clock. A producer bound before a reset stays stale
+        // however many generations go by before it sends.
+        let (_poll, sender, rx) = channel().unwrap();
+        let old = rx.current_generation();
+        let bound = sender.bind();
+        let bumped = rx.generation_counter().bump();
+        assert_ne!(old, bumped);
+
+        bound.send(Message::Shutdown).unwrap();
+        bound.clone_handle().send(Message::Shutdown).unwrap();
+        rx.generation_counter().bump();
+        bound.send(Message::Shutdown).unwrap();
+
+        let tagged: Vec<_> = rx.try_recv_all_tagged().collect();
+        assert_eq!(tagged.len(), 3);
+        for (tag, _) in &tagged {
+            assert_eq!(*tag, old, "a bound producer never re-reads the counter");
+        }
+        assert_eq!(bound.generation(), old);
+    }
+
+    #[test]
+    fn a_sender_bound_after_a_bump_is_current() {
+        // The other half: binding at accept must not make a connection
+        // accepted in the new generation stale.
+        let (_poll, sender, rx) = channel().unwrap();
+        let bumped = rx.generation_counter().bump();
+        let bound = sender.bind();
+        bound.send(Message::Shutdown).unwrap();
+        let tagged: Vec<_> = rx.try_recv_all_tagged().collect();
+        assert_eq!(tagged[0].0, bumped);
+        assert_eq!(tagged[0].0, rx.current_generation());
+    }
+
+    #[test]
+    fn bind_to_hands_one_producers_generation_to_another() {
+        // How a setup thread's generation reaches the reader thread the
+        // core spawns for that client.
+        let (_poll, sender, rx) = channel().unwrap();
+        let setup = sender.bind();
+        rx.generation_counter().bump();
+        let reader = sender.bind_to(setup.generation());
+        reader.send(Message::Shutdown).unwrap();
+        let tagged: Vec<_> = rx.try_recv_all_tagged().collect();
+        assert_eq!(tagged[0].0, setup.generation());
+        assert_ne!(tagged[0].0, rx.current_generation());
     }
 
     #[test]
