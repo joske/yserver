@@ -230,9 +230,11 @@ yserver-tcp-hw log="warn":
 #     produces a completely empty log — verified the hard way.
 # Deliberately prints no summary: this runs from a bare TTY, where console
 # output cannot be copied. Ask for `yserver-hw-startx.log` and grep it here.
-# Session 1 stamps a root property; the server resets when its last client
-# exits; session 2 must NOT see that property and must still have working
-# input. Watch the screen at the boundary: it should clear, and the display
+# Session 1 stamps a root property WHILE its xterm holds the display open --
+# a one-shot client like xprop is itself the last client, so on a -reset
+# server its own exit resets away whatever it just set. The server resets
+# when session 1's xterm exits; session 2 must NOT see that property and
+# must still have working input. Watch the screen at the boundary: it should clear, and the display
 # must not blink or change mode.
 # Two consecutive sessions on ONE server — proves the #121 reset boundary.
 yserver-reset-hw log="info":
@@ -252,8 +254,12 @@ yserver-reset-hw log="info":
         for i in $(seq 30); do [ -S /tmp/.X11-unix/X$display ] && break; sleep 1; done;\
         export XAUTHORITY="$userauth" DISPLAY=":$display";\
         echo "reset-hw: SESSION 1 — close the xterm to end it and trigger the reset";\
+        xterm -T "session 1 - close me" > /dev/null 2>&1 &\
+        xterm_pid=$!;\
+        sleep 3;\
         xprop -root -f YSERVER_RESET_PROBE 8s -set YSERVER_RESET_PROBE session-one;\
-        xterm -T "session 1 - close me" > /dev/null 2>&1;\
+        echo "reset-hw: property stamped while session 1 holds the display";\
+        wait $xterm_pid;\
         sleep 2;\
         if ! kill -0 $yserver_pid 2>/dev/null; then echo "FAIL: the server exited instead of resetting"; exit 1; fi;\
         echo "reset-hw: server survived the last client — reset fired";\
