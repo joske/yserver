@@ -3,18 +3,17 @@
 //! generation boundary" / "Seeding the new generation" / "Forced
 //! cleanup, not the normal disconnect path").
 //!
-//! Two pieces:
+//! Three pieces:
 //!
+//! - [`ResetPolicy`] / [`ResetTrigger`] — the `-noreset` / `-reset` /
+//!   `-terminate` policy and the armed trigger that decides *when* the
+//!   boundary is crossed ("The trigger must be armed, not inferred").
 //! - [`force_destroy_all_clients`] — the forced session teardown, which
 //!   destroys every client ignoring close-down mode and releases what
 //!   they hold on BOTH sides.
 //! - [`reset_generation`] — the boundary itself, which assembles that
 //!   with the generation counter, the setup registry, the loop-local
 //!   per-client collections and a freshly seeded `ServerState`.
-//!
-//! Nothing in production calls `reset_generation` yet: the armed
-//! trigger is a later step, so this module is still reachable only from
-//! tests.
 
 use std::{collections::VecDeque, os::fd::AsRawFd};
 
@@ -37,6 +36,157 @@ use crate::{
     resources::ROOT_WINDOW,
     server::ServerState,
 };
+
+/// What the server does when the last established client of a
+/// generation goes away (`docs/superpowers/specs/2026-09-09-server-
+/// reset-design.md`, "Flags and signals").
+///
+/// The default is [`ResetPolicy::NoReset`], which inverts Xorg
+/// (`dispatchExceptionAtReset`, `dix/dispatch.c:3480`, defaults to
+/// `DE_RESET`). `starty` and every `just *-hw` recipe launch the server
+/// expecting it to outlive its clients, so inheriting Xorg's default
+/// would turn a momentarily empty client set into what looks exactly
+/// like a crash. The divergence is in the safe direction: wrongly not
+/// resetting leaves a stale session, wrongly resetting destroys a live
+/// one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResetPolicy {
+    /// `-noreset`: never reset. Behaviour is byte-identical to a server
+    /// built before this feature existed.
+    #[default]
+    NoReset,
+    /// `-reset`: cross the generation boundary when the session drains.
+    Reset,
+    /// `-terminate`: exit the process cleanly instead of resetting.
+    Terminate,
+}
+
+/// What the loop must do once it reaches the end of the iteration a
+/// trigger fired in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResetAction {
+    /// Call [`reset_generation`] and carry on serving.
+    Reset,
+    /// Return from `run_core`, shutting the server down cleanly.
+    Terminate,
+}
+
+/// The armed reset trigger for the generation currently running.
+///
+/// Xorg's trigger is an **event** inside `CloseDownClient`
+/// (`dix/dispatch.c:3537`) with two conditions — the departing client
+/// reached `ClientStateRunning`, and the count is now zero — and this
+/// mirrors it explicitly. A state check of the shape "no clients are
+/// connected" would fire on an idle `-reset` server before anyone had
+/// ever connected, so the departure is what latches an action here;
+/// nothing else in the loop may synthesise one.
+pub(crate) struct ResetTrigger {
+    policy: ResetPolicy,
+    /// False at the start of every generation. Set only where a client
+    /// becomes *established* — not at accept, not at connect — so a
+    /// port scan, a dropped handshake or a refused cookie arms nothing.
+    armed: bool,
+    /// Latched by a SIGHUP request. Not cancellable: the operator asked
+    /// for it, and a connection racing the logout must not veto it.
+    forced: bool,
+    /// Latched by a departure that drained an armed generation.
+    /// Cancelled if a client becomes established before the loop
+    /// reaches the boundary, because the session is then not drained
+    /// after all.
+    drained: Option<ResetAction>,
+}
+
+impl ResetTrigger {
+    pub(crate) fn new(policy: ResetPolicy) -> Self {
+        Self {
+            policy,
+            armed: false,
+            forced: false,
+            drained: None,
+        }
+    }
+
+    /// The policy this trigger was built with.
+    #[cfg(test)]
+    pub(crate) fn policy(&self) -> ResetPolicy {
+        self.policy
+    }
+
+    /// Whether this generation has ever seen a client become
+    /// established.
+    #[cfg(test)]
+    pub(crate) fn is_armed(&self) -> bool {
+        self.armed
+    }
+
+    /// A client became established (`state.clients.insert` in
+    /// `handle_client_setup_complete`). Arms the trigger, and cancels a
+    /// drain latched earlier in this same iteration — the session has a
+    /// client again, so it is no longer drained. A SIGHUP request is
+    /// deliberately *not* cancelled.
+    pub(crate) fn note_client_established(&mut self) {
+        self.armed = true;
+        self.drained = None;
+    }
+
+    /// A disconnect completed, leaving `clients_remaining` established
+    /// clients. The only site that may latch a drain.
+    ///
+    /// `RetainPermanent` inhibits nothing: `process_disconnect` removes
+    /// the `state.clients` entry whatever the close-down mode, so a
+    /// retained client is gone for this count even though its resources
+    /// survive as a zombie.
+    pub(crate) fn note_client_departed(&mut self, clients_remaining: usize) {
+        if !self.armed || clients_remaining != 0 {
+            return;
+        }
+        self.drained = match self.policy {
+            // Not "latch and ignore later" — nothing at all, so the
+            // default server behaves exactly as it did before resets
+            // existed.
+            ResetPolicy::NoReset => return,
+            ResetPolicy::Reset => Some(ResetAction::Reset),
+            ResetPolicy::Terminate => Some(ResetAction::Terminate),
+        };
+    }
+
+    /// SIGHUP arrived as [`Message::ResetRequested`].
+    ///
+    /// [`Message::ResetRequested`]: crate::core_loop::Message::ResetRequested
+    pub(crate) fn note_reset_requested(&mut self) {
+        if self.policy == ResetPolicy::NoReset {
+            // Unreachable in production — the signal thread sends
+            // `Shutdown` under `-noreset` and never produces this
+            // message — but honouring it here anyway would break the
+            // "byte-identical to today" guarantee for anything that
+            // sends it by another route.
+            log::warn!("reset: ignoring a reset request under -noreset");
+            return;
+        }
+        // A forced reset outranks `-terminate`: Xorg's `AutoResetServer`
+        // raises `DE_RESET`, not `DE_TERMINATE`, and the spec says
+        // SIGHUP forces a reset regardless of policy.
+        self.forced = true;
+    }
+
+    /// Take whatever this iteration latched, if anything.
+    pub(crate) fn take_pending(&mut self) -> Option<ResetAction> {
+        if self.forced {
+            self.forced = false;
+            self.drained = None;
+            return Some(ResetAction::Reset);
+        }
+        self.drained.take()
+    }
+
+    /// Start a fresh generation: disarmed again, so the empty client
+    /// set the reset leaves behind cannot fire a second reset.
+    pub(crate) fn begin_generation(&mut self) {
+        self.armed = false;
+        self.forced = false;
+        self.drained = None;
+    }
+}
 
 /// Destroy every client of the current session — live and zombie — ignoring
 /// close-down mode, and release what they hold on BOTH sides.
@@ -113,13 +263,6 @@ pub fn force_destroy_all_clients(state: &mut ServerState, backend: &mut dyn Back
 /// its call site: the hazard the plan calls out is not clearing them
 /// wrongly, it is *forgetting* one, and a struct makes the set
 /// reviewable in a single place.
-// Step 5 of the plan lands the armed trigger that calls
-// `reset_generation`; until then the whole boundary is reachable only
-// from this module's tests. Deliberately NOT `#[cfg(test)]` — it must
-// compile, lint and be reviewed as production code from the moment it
-// exists, which is the plan's "nothing can fire until everything is
-// built" ordering.
-#[allow(dead_code)]
 pub(crate) struct GenerationLocals<'a> {
     /// The fair round-robin request queue (`by_client` / `ready`).
     pub deferred_requests: &'a mut FairRequestQueue,
@@ -138,13 +281,6 @@ pub(crate) struct GenerationLocals<'a> {
     pub telemetry: &'a mut LoopTelemetry,
 }
 
-/// A parked COW release cannot loop forever: the refcount is one per
-/// outstanding `GetOverlayWindow` from a session that no longer exists.
-/// The bound only guards against a backend whose `cow_host_xid` never
-/// clears, which would otherwise hang the core loop.
-#[allow(dead_code)]
-const MAX_OVERLAY_RELEASE_ATTEMPTS: usize = 64;
-
 /// Cross the generation boundary: quarantine the old session, destroy
 /// it, and install a freshly seeded `ServerState` in its place.
 ///
@@ -152,10 +288,9 @@ const MAX_OVERLAY_RELEASE_ATTEMPTS: usize = 64;
 /// order (`docs/superpowers/specs/2026-09-09-server-reset-design.md`,
 /// "The generation boundary"); each is marked below.
 ///
-/// Nothing in production calls this yet — step 5 of the plan adds the
-/// armed trigger. It never exits the process, never re-initialises KMS
-/// or Vulkan, and never touches `listeners`.
-#[allow(dead_code)]
+/// Called from `run_core` when [`ResetTrigger::take_pending`] yields
+/// [`ResetAction::Reset`]. It never exits the process, never
+/// re-initialises KMS or Vulkan, and never touches `listeners`.
 pub(crate) fn reset_generation(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -273,7 +408,6 @@ pub(crate) fn reset_generation(
 /// Deliberately the same call the protocol's `ClearArea` makes, against
 /// the same resolved background, so KMS records the damage its
 /// composite path needs rather than relying on `mark_dirty` alone.
-#[allow(dead_code)]
 fn clear_root(state: &mut ServerState, backend: &mut dyn Backend) {
     let Some((width, height)) = state
         .resources
@@ -322,7 +456,10 @@ mod tests {
         ClientByteOrder, ClientId, CreatePixmapRequest, CreateWindowRequest, ResourceId,
     };
 
-    use super::{GenerationLocals, force_destroy_all_clients, reset_generation};
+    use super::{
+        GenerationLocals, ResetAction, ResetPolicy, ResetTrigger, force_destroy_all_clients,
+        reset_generation,
+    };
     use crate::{
         backend::{
             Backend, CrtcConfigToken, PixmapHandle, WindowHandle,
@@ -1024,6 +1161,7 @@ mod tests {
             &mut state,
             &mut backend,
             &mut locals.pending_backend_requests,
+            &mut ResetTrigger::new(ResetPolicy::NoReset),
         );
         assert!(
             backend.finished_crtc_configs.is_empty(),
@@ -1171,5 +1309,184 @@ mod tests {
             0,
             "the handshake socket must be closed"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // The armed trigger (plan step 5, spec "The trigger must be armed,
+    // not inferred"). Pure state machine — the loop-level wiring that
+    // feeds it is covered by `core_loop::run`'s `server_reset` tests.
+    // ---------------------------------------------------------------
+
+    /// One established client, which then leaves.
+    fn drained(policy: ResetPolicy) -> ResetTrigger {
+        let mut trigger = ResetTrigger::new(policy);
+        trigger.note_client_established();
+        trigger.note_client_departed(0);
+        trigger
+    }
+
+    #[test]
+    fn the_default_policy_is_noreset() {
+        assert_eq!(ResetPolicy::default(), ResetPolicy::NoReset);
+        assert_eq!(
+            ResetTrigger::new(ResetPolicy::default()).policy(),
+            ResetPolicy::NoReset
+        );
+    }
+
+    #[test]
+    fn a_new_trigger_is_not_armed() {
+        for policy in [
+            ResetPolicy::NoReset,
+            ResetPolicy::Reset,
+            ResetPolicy::Terminate,
+        ] {
+            assert!(!ResetTrigger::new(policy).is_armed(), "{policy:?}");
+        }
+    }
+
+    #[test]
+    fn the_last_client_leaving_does_nothing_under_noreset() {
+        assert_eq!(drained(ResetPolicy::NoReset).take_pending(), None);
+    }
+
+    #[test]
+    fn the_last_client_leaving_resets_under_reset() {
+        assert_eq!(
+            drained(ResetPolicy::Reset).take_pending(),
+            Some(ResetAction::Reset)
+        );
+    }
+
+    #[test]
+    fn the_last_client_leaving_terminates_under_terminate() {
+        assert_eq!(
+            drained(ResetPolicy::Terminate).take_pending(),
+            Some(ResetAction::Terminate)
+        );
+    }
+
+    #[test]
+    fn a_departure_that_leaves_another_client_fires_nothing() {
+        let mut trigger = ResetTrigger::new(ResetPolicy::Reset);
+        trigger.note_client_established();
+        trigger.note_client_established();
+        trigger.note_client_departed(1);
+        assert_eq!(trigger.take_pending(), None);
+        trigger.note_client_departed(0);
+        assert_eq!(trigger.take_pending(), Some(ResetAction::Reset));
+    }
+
+    #[test]
+    fn an_idle_reset_server_never_resets() {
+        // The case a `clients.is_empty()` state check gets wrong: at
+        // startup the client set is ALSO empty, so an unarmed
+        // departure-shaped event must fire nothing however often it
+        // arrives.
+        let mut trigger = ResetTrigger::new(ResetPolicy::Reset);
+        for _ in 0..100 {
+            trigger.note_client_departed(0);
+            assert_eq!(trigger.take_pending(), None);
+        }
+        assert!(!trigger.is_armed());
+    }
+
+    #[test]
+    fn a_connection_that_drops_before_completing_setup_arms_nothing() {
+        // A handshake that never reaches `handle_client_setup_complete`
+        // never calls `note_client_established`; its socket closing is
+        // just another unarmed departure.
+        let mut trigger = ResetTrigger::new(ResetPolicy::Reset);
+        trigger.note_client_departed(0);
+        assert!(!trigger.is_armed());
+        assert_eq!(trigger.take_pending(), None);
+    }
+
+    #[test]
+    fn a_client_refused_for_a_bad_cookie_arms_nothing() {
+        // Same shape, and the one a stranger can reach: the TCP
+        // listener binds 0.0.0.0, so a port scan or a wrong cookie must
+        // not be able to make the server erase its session.
+        let mut trigger = ResetTrigger::new(ResetPolicy::Reset);
+        for _ in 0..10 {
+            trigger.note_client_departed(0);
+        }
+        assert!(!trigger.is_armed());
+        assert_eq!(trigger.take_pending(), None);
+    }
+
+    #[test]
+    fn sighup_forces_a_reset_under_reset() {
+        let mut trigger = ResetTrigger::new(ResetPolicy::Reset);
+        trigger.note_reset_requested();
+        assert_eq!(trigger.take_pending(), Some(ResetAction::Reset));
+    }
+
+    #[test]
+    fn sighup_forces_a_reset_not_a_terminate_under_terminate() {
+        // Xorg's `AutoResetServer` raises DE_RESET, never DE_TERMINATE.
+        let mut trigger = ResetTrigger::new(ResetPolicy::Terminate);
+        trigger.note_reset_requested();
+        assert_eq!(trigger.take_pending(), Some(ResetAction::Reset));
+    }
+
+    #[test]
+    fn sighup_is_refused_by_the_trigger_under_noreset() {
+        // Belt and braces: the production gate is at the sender — the
+        // signal thread keeps sending `Shutdown` under `-noreset` — and
+        // the trigger refuses the message even if it arrives anyway.
+        let mut trigger = ResetTrigger::new(ResetPolicy::NoReset);
+        trigger.note_reset_requested();
+        assert_eq!(trigger.take_pending(), None);
+    }
+
+    #[test]
+    fn sighup_forces_a_reset_with_clients_still_connected() {
+        // Logout: the point of SIGHUP is to erase a session that is
+        // still running, so neither arming nor emptiness gates it.
+        let mut trigger = ResetTrigger::new(ResetPolicy::Reset);
+        trigger.note_client_established();
+        trigger.note_reset_requested();
+        assert_eq!(trigger.take_pending(), Some(ResetAction::Reset));
+    }
+
+    #[test]
+    fn a_client_established_after_the_drain_cancels_it() {
+        // The boundary runs at the end of the iteration, so a setup
+        // that completes between the disconnect and the boundary
+        // un-drains the session; resetting then would destroy a client
+        // that had only just connected.
+        let mut trigger = drained(ResetPolicy::Reset);
+        trigger.note_client_established();
+        assert_eq!(trigger.take_pending(), None);
+    }
+
+    #[test]
+    fn a_client_established_after_a_sighup_does_not_cancel_it() {
+        let mut trigger = ResetTrigger::new(ResetPolicy::Reset);
+        trigger.note_reset_requested();
+        trigger.note_client_established();
+        assert_eq!(trigger.take_pending(), Some(ResetAction::Reset));
+    }
+
+    #[test]
+    fn a_fired_reset_disarms_the_trigger_for_the_new_generation() {
+        // The reset leaves an empty client set behind. Without the
+        // disarm the next departure-shaped event would reset again —
+        // and with the old generation's reader threads still winding
+        // down, one is guaranteed to arrive.
+        let mut trigger = drained(ResetPolicy::Reset);
+        assert_eq!(trigger.take_pending(), Some(ResetAction::Reset));
+        trigger.begin_generation();
+        assert!(!trigger.is_armed());
+        trigger.note_client_departed(0);
+        assert_eq!(trigger.take_pending(), None);
+    }
+
+    #[test]
+    fn taking_a_pending_action_consumes_it() {
+        let mut trigger = drained(ResetPolicy::Reset);
+        assert_eq!(trigger.take_pending(), Some(ResetAction::Reset));
+        assert_eq!(trigger.take_pending(), None);
     }
 }

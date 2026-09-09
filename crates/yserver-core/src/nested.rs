@@ -404,6 +404,12 @@ pub fn run(display: u16, width: u16, height: u16) -> io::Result<()> {
         vec![crate::transport::Listener::Unix(listener)],
         &allocator,
         crate::core_loop::auth::AuthState::new(None),
+        // The nested harness parses no X-server argv of its own, so it
+        // takes the default policy: never reset. `ynest` is a dev
+        // harness whose clients come and go constantly
+        // (`project_discontinue_ynest`), and a reset on the last one
+        // leaving would look exactly like a crash.
+        crate::core_loop::ResetPolicy::NoReset,
     )
 }
 

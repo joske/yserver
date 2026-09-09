@@ -26,7 +26,7 @@ use yserver_core::{
     // its own name here so this crate's call sites and test read as
     // before.
     backend::{Backend, BackendTopology, install_backend_root_bindings},
-    core_loop::{self, Message, poll_tokens::ClientIdAllocator},
+    core_loop::{self, Message, ResetPolicy, poll_tokens::ClientIdAllocator},
 };
 
 /// Refuse to start when libinput's initial seat enumeration opened zero
@@ -528,6 +528,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // at readiness. Disposition-in, delivery-to-self, and signal-out
     // are separate.
     let signal_sender = sender.clone_handle();
+    let signal_reset_policy = opts.reset_policy;
     thread::Builder::new()
         .name("yserver-signalfd".into())
         .spawn(move || {
@@ -551,9 +552,13 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
                             }
                             continue;
                         }
-                        log::info!("yserver: received signal {signo}, requesting shutdown");
-                        let _ = signal_sender.send(Message::Shutdown);
-                        return;
+                        let (message, what) = signal_action(signo, signal_reset_policy);
+                        log::info!("yserver: received signal {signo}, requesting {what}");
+                        let stop = matches!(message, Message::Shutdown);
+                        if signal_sender.send(message).is_err() || stop {
+                            return;
+                        }
+                        continue;
                     }
                     Ok(None) => {}
                     Err(err) => {
@@ -600,9 +605,12 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
                             }
                             continue;
                         }
-                        log::info!("yserver: received signal {signo}, requesting shutdown");
-                        let _ = signal_sender.send(Message::Shutdown);
-                        return;
+                        let (message, what) = signal_action(signo, signal_reset_policy);
+                        log::info!("yserver: received signal {signo}, requesting {what}");
+                        let stop = matches!(message, Message::Shutdown);
+                        if signal_sender.send(message).is_err() || stop {
+                            return;
+                        }
                     }
                 }
             }
@@ -633,6 +641,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
         listeners,
         &alloc,
         auth,
+        opts.reset_policy,
     );
     if let Err(err) = &result {
         log::warn!("yserver: run_core returned error: {err}");
@@ -689,6 +698,29 @@ fn build_kms_backend(
     layout: Option<String>,
 ) -> io::Result<crate::kms::render::KmsBackend> {
     crate::kms::render::KmsBackend::open(device_paths, console_guard, layout)
+}
+
+/// Map a delivered signal to the core-loop message it requests, plus a
+/// word for the log line.
+///
+/// Only SIGHUP is policy-dependent. Xorg's `AutoResetServer`
+/// (`os/utils.c:407`) resets unconditionally on SIGHUP; we deliberately
+/// do not. Under `-noreset` — the default — SIGHUP keeps requesting a
+/// clean shutdown exactly as it does today, because adopting Xorg's
+/// behaviour would make SIGHUP destroy a default server's session where
+/// today it stops it cleanly. Under `-reset` / `-terminate` the operator
+/// has asked for generations, so SIGHUP forces one (a reset, not a
+/// terminate — matching `AutoResetServer` raising `DE_RESET`).
+///
+/// SIGINT/SIGTERM and anything else still map to `Shutdown` under every
+/// policy. SIGUSR1/SIGUSR2 never reach here — the signalfd loops handle
+/// the VT handshake before calling this.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn signal_action(signo: i32, policy: ResetPolicy) -> (Message, &'static str) {
+    if signo == nix::libc::SIGHUP && policy != ResetPolicy::NoReset {
+        return (Message::ResetRequested, "a server reset");
+    }
+    (Message::Shutdown, "shutdown")
 }
 
 #[cfg(target_os = "linux")]
@@ -796,14 +828,53 @@ mod tcp_tests;
 #[cfg(test)]
 mod tests {
     use super::{
-        InputStartup, ensure_input_devices_opened, input_startup_action,
-        install_backend_root_bindings, validate_tcp_startup,
+        InputStartup, Message, ResetPolicy, ensure_input_devices_opened, input_startup_action,
+        install_backend_root_bindings, signal_action, validate_tcp_startup,
     };
     use yserver_core::{
         backend::Backend,
         resources::{ARGB_COLORMAP, ARGB_VISUAL, ROOT_VISUAL, ROOT_WINDOW},
         server::ServerState,
     };
+
+    #[test]
+    fn sighup_still_shuts_down_under_the_default_policy() {
+        // The deliberate deviation from Xorg's `AutoResetServer`
+        // (`os/utils.c:407`), which resets unconditionally. Adopting that
+        // would make SIGHUP destroy a default server's session where
+        // today it stops it cleanly — and SIGHUP is exactly what the
+        // kernel sends on logout.
+        let (message, _) = signal_action(nix::libc::SIGHUP, ResetPolicy::NoReset);
+        assert!(matches!(message, Message::Shutdown));
+    }
+
+    #[test]
+    fn sighup_requests_a_reset_once_a_reset_policy_is_asked_for() {
+        for policy in [ResetPolicy::Reset, ResetPolicy::Terminate] {
+            let (message, _) = signal_action(nix::libc::SIGHUP, policy);
+            assert!(
+                matches!(message, Message::ResetRequested),
+                "SIGHUP under {policy:?} must request a reset"
+            );
+        }
+    }
+
+    #[test]
+    fn every_other_signal_shuts_down_under_every_policy() {
+        for policy in [
+            ResetPolicy::NoReset,
+            ResetPolicy::Reset,
+            ResetPolicy::Terminate,
+        ] {
+            for signo in [nix::libc::SIGINT, nix::libc::SIGTERM] {
+                let (message, _) = signal_action(signo, policy);
+                assert!(
+                    matches!(message, Message::Shutdown),
+                    "signal {signo} under {policy:?} must shut down"
+                );
+            }
+        }
+    }
 
     #[test]
     fn install_backend_root_bindings_sets_root_host_xid_and_visuals() {

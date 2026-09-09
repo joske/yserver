@@ -32,6 +32,7 @@ use super::{
         PendingCrtcConfig, RequestOutcome, complete_crtc_config,
         fire_present_configure_notify_for_window, process_request,
     },
+    reset::{GenerationLocals, ResetAction, ResetPolicy, ResetTrigger, reset_generation},
     sender::{CoreReceiver, CoreSender},
     setup_thread::{self, SetupRegistry},
 };
@@ -814,16 +815,27 @@ fn grant_request_credit(
     }
 }
 
+/// Complete one client's disconnect and tell the reset trigger about
+/// it.
+///
+/// Every path in this file that removes a client from `state.clients`
+/// funnels through here — a request handler asking for a disconnect, a
+/// failed `park_crtc`, an asynchronous CRTC completion, a failed
+/// `ClientSetupComplete`, the reader thread's `ClientDisconnected`, a
+/// failed outbound drain and the writable-interest reconcile — which is
+/// what lets the trigger be an *event* rather than a state check.
 fn disconnect_with_pending_cleanup(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     pending: &mut PendingBackendRequests,
+    reset_trigger: &mut ResetTrigger,
     client: yserver_protocol::x11::ClientId,
 ) {
     if let Some(token) = pending.take_client_crtc(client) {
         backend.cancel_crtc_config(token);
     }
     crate::core_loop::process_disconnect::process_disconnect(state, backend, client);
+    reset_trigger.note_client_departed(state.clients.len());
 }
 
 pub(crate) fn cancel_all_pending_backend_requests(
@@ -840,6 +852,7 @@ fn process_one_request(
     backend: &mut dyn Backend,
     telemetry: &mut LoopTelemetry,
     pending: &mut PendingBackendRequests,
+    reset_trigger: &mut ResetTrigger,
     requests_this_iter: &mut u32,
     request_budget: &mut usize,
     req: DeferredRequest,
@@ -857,6 +870,7 @@ fn process_one_request(
     } else {
         None
     };
+    let clients_before = state.clients.len();
     let outcome = process_request_inline(
         state,
         backend,
@@ -866,6 +880,21 @@ fn process_one_request(
         &req.body,
         req.attached_fd,
     );
+    // The one client removal that does NOT come back as
+    // `RequestOutcome::Disconnect`: `KillClient` naming a resource owned
+    // by a *different* client calls `process_disconnect` inline
+    // (`process_request.rs`, "Force-disconnect the other client"). That
+    // is still a departure and the trigger has to hear about it. Gated
+    // on the count actually dropping, so this stays an event — a
+    // request that removes nobody reports nothing.
+    //
+    // Today it can never be the departure that drains the session (the
+    // killer is still connected, so the set is non-empty), but nothing
+    // in the handler guarantees that, and an unreported departure is a
+    // trigger that silently never fires again.
+    if state.clients.len() < clients_before {
+        reset_trigger.note_client_departed(state.clients.len());
+    }
     if let Some(start) = req_start {
         telemetry.record_request(
             req_client,
@@ -880,7 +909,7 @@ fn process_one_request(
     match outcome {
         RequestOutcome::Handled => grant_request_credit(state, req_client, req_wire_bytes),
         RequestOutcome::Disconnect(disc_id) => {
-            disconnect_with_pending_cleanup(state, backend, pending, disc_id);
+            disconnect_with_pending_cleanup(state, backend, pending, reset_trigger, disc_id);
         }
         RequestOutcome::PendingCrtcConfig(continuation) => {
             let token = continuation.token;
@@ -904,7 +933,7 @@ fn process_one_request(
                 // An ordering/token contract violation cannot be replied to
                 // safely without overtaking an earlier request from this
                 // client. Disconnect it and cancel any older parked work.
-                disconnect_with_pending_cleanup(state, backend, pending, req_client);
+                disconnect_with_pending_cleanup(state, backend, pending, reset_trigger, req_client);
             }
         }
     }
@@ -915,6 +944,7 @@ fn drain_pending_requests(
     backend: &mut dyn Backend,
     telemetry: &mut LoopTelemetry,
     pending: &mut PendingBackendRequests,
+    reset_trigger: &mut ResetTrigger,
     deferred_requests: &mut FairRequestQueue,
     server_grab_waiters: &mut VecDeque<DeferredRequest>,
     requests_this_iter: &mut u32,
@@ -935,6 +965,7 @@ fn drain_pending_requests(
             backend,
             telemetry,
             pending,
+            reset_trigger,
             requests_this_iter,
             request_budget,
             req,
@@ -1024,6 +1055,7 @@ pub(crate) fn drain_ready_crtc_configs(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     pending: &mut PendingBackendRequests,
+    reset_trigger: &mut ResetTrigger,
 ) {
     for token in backend.drain_ready_crtc_configs() {
         let Some(parked) = pending.take_crtc(token) else {
@@ -1063,7 +1095,7 @@ pub(crate) fn drain_ready_crtc_configs(
         backend.mark_dirty();
         match outcome {
             RequestOutcome::Disconnect(client) => {
-                disconnect_with_pending_cleanup(state, backend, pending, client);
+                disconnect_with_pending_cleanup(state, backend, pending, reset_trigger, client);
             }
             RequestOutcome::Handled => {
                 grant_request_credit(state, parked.client_id, parked.request_wire_bytes)
@@ -1103,8 +1135,17 @@ pub fn run_core(
     listeners: impl IntoIterator<Item = Listener>,
     client_id_allocator: &ClientIdAllocator,
     auth: Arc<AuthState>,
+    reset_policy: ResetPolicy,
 ) -> io::Result<()> {
     let setup_registry = setup_thread::make_registry();
+    // The generation counter is shared with every `CoreSender`; the
+    // receiver is the loop's sole handle to it, and the reset boundary
+    // is the only thing that bumps it.
+    let generations = rx.generation_counter();
+    // The armed trigger (server-reset design, "The trigger must be
+    // armed, not inferred"). False until a client becomes established,
+    // and false again immediately after every reset.
+    let mut reset_trigger = ResetTrigger::new(reset_policy);
     let listeners: Vec<_> = listeners
         .into_iter()
         .enumerate()
@@ -1281,6 +1322,7 @@ pub fn run_core(
             backend,
             &mut telemetry,
             &mut pending_backend_requests,
+            &mut reset_trigger,
             &mut deferred_requests,
             &mut server_grab_waiters,
             &mut requests_this_iter,
@@ -1377,6 +1419,16 @@ pub fn run_core(
                                 );
                                 return Ok(());
                             }
+                            Message::ResetRequested => {
+                                // SIGHUP under `-reset` / `-terminate`.
+                                // Latched, not executed here: the
+                                // boundary needs the loop-local
+                                // collections that this dispatch arm
+                                // has borrowed, and it runs at the tail
+                                // of this same iteration.
+                                log::info!("reset: SIGHUP requested a server reset");
+                                reset_trigger.note_reset_requested();
+                            }
                             Message::Request {
                                 id,
                                 sequence,
@@ -1426,6 +1478,7 @@ pub fn run_core(
                                     &sender,
                                     &setup_registry,
                                     state,
+                                    &mut reset_trigger,
                                     id,
                                     stream,
                                     resource_id_base,
@@ -1439,6 +1492,7 @@ pub fn run_core(
                                         state,
                                         backend,
                                         &mut pending_backend_requests,
+                                        &mut reset_trigger,
                                         id,
                                     );
                                 }
@@ -1448,6 +1502,7 @@ pub fn run_core(
                                     state,
                                     backend,
                                     &mut pending_backend_requests,
+                                    &mut reset_trigger,
                                     id,
                                 );
                             }
@@ -1479,6 +1534,7 @@ pub fn run_core(
                                     state,
                                     backend,
                                     &mut pending_backend_requests,
+                                    &mut reset_trigger,
                                 );
                             }
                             Message::VtRelease => {
@@ -1518,6 +1574,7 @@ pub fn run_core(
                         backend,
                         &mut telemetry,
                         &mut pending_backend_requests,
+                        &mut reset_trigger,
                         &mut deferred_requests,
                         &mut server_grab_waiters,
                         &mut requests_this_iter,
@@ -1555,6 +1612,7 @@ pub fn run_core(
                                 state,
                                 backend,
                                 &mut pending_backend_requests,
+                                &mut reset_trigger,
                                 client_id,
                             );
                         }
@@ -1638,7 +1696,13 @@ pub fn run_core(
         // disconnect that ran during this iteration doesn't break
         // the next one.
         for disc_id in reconcile_client_writable_interest(poll.registry(), state) {
-            disconnect_with_pending_cleanup(state, backend, &mut pending_backend_requests, disc_id);
+            disconnect_with_pending_cleanup(
+                state,
+                backend,
+                &mut pending_backend_requests,
+                &mut reset_trigger,
+                disc_id,
+            );
         }
 
         run_iteration_tail(state, backend);
@@ -1650,6 +1714,52 @@ pub fn run_core(
             let wall = now.saturating_duration_since(start);
             telemetry.record_iteration(requests_this_iter, wall);
             telemetry.maybe_emit(now);
+        }
+
+        // The generation boundary. Reached only from an action the
+        // trigger LATCHED earlier in this iteration — a departure that
+        // drained an armed generation, or a SIGHUP — never from a state
+        // check here: an idle client set is indistinguishable from a
+        // drained one, and a `-reset` server that inspected
+        // `state.clients` would reset itself repeatedly at startup.
+        //
+        // The boundary runs at the tail rather than at the disconnect
+        // site because it needs the loop-local collections
+        // (`GenerationLocals`) that the dispatch arms have borrowed.
+        // Deferring it inside one iteration is also what makes the
+        // cancellation in `note_client_established` meaningful: a
+        // client that completes setup after the drain, in this same
+        // batch, un-drains the session before the boundary is reached.
+        match reset_trigger.take_pending() {
+            None => {}
+            Some(ResetAction::Terminate) => {
+                log::info!("reset: -terminate — last client left, shutting down");
+                setup_thread::shutdown_all(&setup_registry);
+                cancel_all_pending_backend_requests(backend, &mut pending_backend_requests);
+                return Ok(());
+            }
+            Some(ResetAction::Reset) => {
+                let generation = reset_generation(
+                    state,
+                    backend,
+                    poll.registry(),
+                    &generations,
+                    &setup_registry,
+                    &input_inventory,
+                    GenerationLocals {
+                        deferred_requests: &mut deferred_requests,
+                        server_grab_waiters: &mut server_grab_waiters,
+                        pending_backend_requests: &mut pending_backend_requests,
+                        telemetry: &mut telemetry,
+                    },
+                );
+                // Disarm for the generation just installed. Without
+                // this the empty client set the reset leaves behind
+                // would be re-latched by the next departure-shaped
+                // event and reset a second time.
+                reset_trigger.begin_generation();
+                log::info!("reset: new generation installed ({generation:?})");
+            }
         }
     }
 }
@@ -3008,6 +3118,7 @@ fn handle_client_setup_complete(
     sender: &CoreSender,
     setup_registry: &SetupRegistry,
     state: &mut ServerState,
+    reset_trigger: &mut ResetTrigger,
     id: yserver_protocol::x11::ClientId,
     stream: Transport,
     resource_id_base: u32,
@@ -3045,6 +3156,12 @@ fn handle_client_setup_complete(
             fd_passing,
         },
     );
+    // The single production site where a client becomes ESTABLISHED,
+    // and therefore the only place the reset trigger is armed. Not at
+    // accept and not at connect: a port scan on the TCP listener, a
+    // handshake that drops half-way, and a connection refused for a bad
+    // cookie all end before this line and must arm nothing.
+    reset_trigger.note_client_established();
 
     setup_registry
         .lock()
@@ -3332,6 +3449,7 @@ mod tests {
                 [Listener::Unix(listener)],
                 &ClientIdAllocator::new(),
                 AuthState::new(None),
+                ResetPolicy::NoReset,
             )
         });
         let result: io::Result<()> = (|| {
@@ -3711,7 +3829,12 @@ mod tests {
         backend.ready_crtc_configs.push(token);
         backend.crtc_config_results.insert(token, Ok(false));
 
-        drain_ready_crtc_configs(&mut state, &mut backend, &mut pending);
+        drain_ready_crtc_configs(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut ResetTrigger::new(ResetPolicy::NoReset),
+        );
 
         let mut reply = [0_u8; 32];
         peer.read_exact(&mut reply).unwrap();
@@ -3738,7 +3861,13 @@ mod tests {
                 request_wire_bytes: 28,
             })
             .unwrap();
-        disconnect_with_pending_cleanup(&mut state, &mut backend, &mut pending, client_id);
+        disconnect_with_pending_cleanup(
+            &mut state,
+            &mut backend,
+            &mut pending,
+            &mut ResetTrigger::new(ResetPolicy::NoReset),
+            client_id,
+        );
         assert_eq!(backend.cancelled_crtc_configs, [cancel_token]);
         assert!(!state.clients.contains_key(&client_id.0));
     }
@@ -3963,6 +4092,7 @@ mod tests {
                 None,
                 &alloc,
                 AuthState::new(None),
+                ResetPolicy::NoReset,
             );
             (result, backend)
         });
@@ -4024,6 +4154,7 @@ mod tests {
                 None,
                 &alloc,
                 AuthState::new(None),
+                ResetPolicy::NoReset,
             );
             (result, backend)
         });
@@ -4081,6 +4212,7 @@ mod tests {
                 None,
                 &alloc,
                 AuthState::new(None),
+                ResetPolicy::NoReset,
             );
             (result, backend)
         });
@@ -4361,6 +4493,7 @@ mod tests {
                 None,
                 &alloc,
                 AuthState::new(None),
+                ResetPolicy::NoReset,
             )
         });
         sender.send(Message::Shutdown).unwrap();
@@ -5127,5 +5260,473 @@ mod tests {
             .expect("compose attempted");
         assert!(flush < compose);
         assert!(!state.damage_notify_flush_pending);
+    }
+}
+
+/// The armed reset trigger, driven through a live `run_core` rather than
+/// against `ResetTrigger` directly (that state machine is unit-tested in
+/// `core_loop::reset`). What these pin is the *wiring*: which loop events
+/// arm it, which fire it, and what the boundary does afterwards.
+///
+/// A reset is observed through the generation counter — the boundary
+/// bumps it, and nothing else in the loop does — read from the clone the
+/// test keeps before handing `CoreReceiver` to the loop.
+#[cfg(test)]
+mod server_reset {
+    use std::{
+        io::{Read, Write},
+        os::unix::net::{UnixListener, UnixStream},
+        path::PathBuf,
+        sync::atomic::{AtomicU32, Ordering},
+        thread::JoinHandle,
+        time::{Duration, Instant},
+    };
+
+    use super::{Listener, ResetPolicy, ServerState, run_core};
+    use crate::{
+        backend::recording::RecordingBackend,
+        core_loop::{
+            Generation, GenerationCounter, Message,
+            auth::AuthState,
+            poll_tokens::ClientIdAllocator,
+            sender::{CoreSender, channel},
+        },
+    };
+
+    /// Generous: these wait on real threads (setup, reader, core) under a
+    /// loaded test binary, and every use is a wait-for-success.
+    const TIMEOUT: Duration = Duration::from_secs(10);
+    /// How long a "must NOT happen" assertion watches for. The positive
+    /// cases below complete in single-digit milliseconds.
+    const QUIET: Duration = Duration::from_millis(400);
+
+    /// The value a `GenerationCounter` holds after `n` resets.
+    fn generation_after(n: u64) -> Generation {
+        let counter = GenerationCounter::new();
+        for _ in 0..n {
+            counter.bump();
+        }
+        counter.current()
+    }
+
+    fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+        let start = Instant::now();
+        while start.elapsed() < TIMEOUT {
+            if cond() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// A `run_core` running on its own thread over a private unix socket.
+    struct Server {
+        path: PathBuf,
+        sender: CoreSender,
+        generations: GenerationCounter,
+        handle: Option<JoinHandle<std::io::Result<()>>>,
+    }
+
+    impl Server {
+        fn start(policy: ResetPolicy, auth: std::sync::Arc<AuthState>) -> Self {
+            static SEQ: AtomicU32 = AtomicU32::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "yserver-reset-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_file(&path);
+            let listener = UnixListener::bind(&path).expect("bind");
+            let (poll, sender, rx) = channel().expect("channel");
+            let generations = rx.generation_counter();
+            let sender_for_core = sender.clone_handle();
+            let handle = std::thread::spawn(move || {
+                let mut state = ServerState::new();
+                let mut backend = RecordingBackend::new();
+                run_core(
+                    poll,
+                    rx,
+                    sender_for_core,
+                    &mut state,
+                    &mut backend,
+                    [Listener::Unix(listener)],
+                    &ClientIdAllocator::new(),
+                    auth,
+                    policy,
+                )
+            });
+            Self {
+                path,
+                sender,
+                generations,
+                handle: Some(handle),
+            }
+        }
+
+        fn with_policy(policy: ResetPolicy) -> Self {
+            Self::start(policy, AuthState::new(None))
+        }
+
+        fn generation(&self) -> Generation {
+            self.generations.current()
+        }
+
+        fn connect(&self) -> UnixStream {
+            let peer = UnixStream::connect(&self.path).expect("connect");
+            peer.set_read_timeout(Some(TIMEOUT)).expect("read timeout");
+            peer
+        }
+
+        /// Connect and take the connection all the way to *established*:
+        /// setup handshake, then a `GetInputFocus` round-trip. The reply
+        /// is what proves the core reached `handle_client_setup_complete`
+        /// — the setup reply alone is written by the setup thread and
+        /// says nothing about `state.clients`.
+        fn establish(&self) -> UnixStream {
+            let mut peer = self.connect();
+            peer.write_all(&[b'l', 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+                .expect("setup request");
+            let mut header = [0_u8; 8];
+            peer.read_exact(&mut header).expect("setup reply header");
+            assert_eq!(header[0], 1, "setup must succeed");
+            let len = usize::from(u16::from_le_bytes([header[6], header[7]])) * 4;
+            peer.read_exact(&mut vec![0; len])
+                .expect("setup reply body");
+            round_trip(&mut peer);
+            peer
+        }
+
+        fn shutdown(mut self) -> std::io::Result<()> {
+            let _ = self.sender.send(Message::Shutdown);
+            let result = self.handle.take().expect("handle").join().expect("join");
+            let _ = std::fs::remove_file(&self.path);
+            result
+        }
+    }
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            if let Some(handle) = self.handle.take() {
+                let _ = self.sender.send(Message::Shutdown);
+                let _ = handle.join();
+            }
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// `GetInputFocus` — the classic X11 round-trip probe. Always replies,
+    /// changes nothing.
+    fn round_trip(peer: &mut UnixStream) {
+        peer.write_all(&[43, 0, 1, 0]).expect("GetInputFocus");
+        let mut reply = [0_u8; 32];
+        peer.read_exact(&mut reply).expect("GetInputFocus reply");
+        assert_eq!(reply[0], 1, "reply, not an error");
+    }
+
+    /// `SetCloseDownMode(RetainPermanent)` — opcode 112, mode in the data
+    /// byte. Followed by a round-trip so the request is known to have been
+    /// processed before the caller drops the socket.
+    fn set_retain_permanent(peer: &mut UnixStream) {
+        peer.write_all(&[112, 1, 1, 0]).expect("SetCloseDownMode");
+        round_trip(peer);
+    }
+
+    // -- the trigger table: last client leaves x each policy ----------
+
+    #[test]
+    fn the_last_client_leaving_resets_under_reset() {
+        let server = Server::with_policy(ResetPolicy::Reset);
+        let peer = server.establish();
+        assert_eq!(server.generation(), generation_after(0));
+        drop(peer);
+        wait_until("the drained session to reset", || {
+            server.generation() == generation_after(1)
+        });
+        server.shutdown().expect("clean shutdown");
+    }
+
+    #[test]
+    fn the_last_client_leaving_does_nothing_under_noreset() {
+        let server = Server::with_policy(ResetPolicy::NoReset);
+        let peer = server.establish();
+        drop(peer);
+        std::thread::sleep(QUIET);
+        // Non-vacuous: the server is still serving, so the loop did run
+        // through the disconnect — it simply did not reset.
+        let survivor = server.establish();
+        assert_eq!(
+            server.generation(),
+            generation_after(0),
+            "-noreset must never cross the boundary"
+        );
+        drop(survivor);
+        server.shutdown().expect("clean shutdown");
+    }
+
+    #[test]
+    fn the_last_client_leaving_terminates_under_terminate() {
+        let mut server = Server::with_policy(ResetPolicy::Terminate);
+        let peer = server.establish();
+        drop(peer);
+        let handle = server.handle.take().expect("handle");
+        wait_until("run_core to return", || handle.is_finished());
+        handle
+            .join()
+            .expect("join")
+            .expect("-terminate must shut down cleanly, not error");
+        assert_eq!(
+            server.generation(),
+            generation_after(0),
+            "-terminate exits instead of resetting"
+        );
+    }
+
+    #[test]
+    fn a_retain_permanent_client_does_not_inhibit_the_reset() {
+        // `process_disconnect` keeps a retained client's resources as a
+        // zombie but removes it from `state.clients` regardless, so the
+        // session still counts as drained. Xorg's `really_close_down`
+        // gate does the opposite; the forced teardown at the boundary is
+        // what makes ours safe.
+        let server = Server::with_policy(ResetPolicy::Reset);
+        let mut peer = server.establish();
+        set_retain_permanent(&mut peer);
+        drop(peer);
+        wait_until("a retained client's departure to reset", || {
+            server.generation() == generation_after(1)
+        });
+        server.shutdown().expect("clean shutdown");
+    }
+
+    #[test]
+    fn a_client_that_leaves_while_another_stays_does_not_reset() {
+        let server = Server::with_policy(ResetPolicy::Reset);
+        let first = server.establish();
+        let mut second = server.establish();
+        drop(first);
+        std::thread::sleep(QUIET);
+        round_trip(&mut second);
+        assert_eq!(
+            server.generation(),
+            generation_after(0),
+            "the session is not drained while a client remains"
+        );
+        drop(second);
+        wait_until("the second departure to reset", || {
+            server.generation() == generation_after(1)
+        });
+        server.shutdown().expect("clean shutdown");
+    }
+
+    // -- SIGHUP, per policy -------------------------------------------
+
+    #[test]
+    fn sighup_resets_a_running_session_under_reset() {
+        let server = Server::with_policy(ResetPolicy::Reset);
+        let _peer = server.establish();
+        server
+            .sender
+            .send(Message::ResetRequested)
+            .expect("send SIGHUP request");
+        wait_until("SIGHUP to reset", || {
+            server.generation() == generation_after(1)
+        });
+        server.shutdown().expect("clean shutdown");
+    }
+
+    #[test]
+    fn sighup_resets_rather_than_terminating_under_terminate() {
+        let server = Server::with_policy(ResetPolicy::Terminate);
+        let _peer = server.establish();
+        server
+            .sender
+            .send(Message::ResetRequested)
+            .expect("send SIGHUP request");
+        wait_until("SIGHUP to reset", || {
+            server.generation() == generation_after(1)
+        });
+        assert!(
+            !server.handle.as_ref().expect("handle").is_finished(),
+            "SIGHUP raises DE_RESET, not DE_TERMINATE"
+        );
+        server.shutdown().expect("clean shutdown");
+    }
+
+    #[test]
+    fn sighup_does_not_reset_under_noreset() {
+        // Under the default policy the signal thread never produces this
+        // message (it keeps sending `Shutdown`); the loop refuses it
+        // anyway, so `-noreset` behaviour cannot drift.
+        let server = Server::with_policy(ResetPolicy::NoReset);
+        let mut peer = server.establish();
+        server
+            .sender
+            .send(Message::ResetRequested)
+            .expect("send SIGHUP request");
+        std::thread::sleep(QUIET);
+        round_trip(&mut peer);
+        assert_eq!(server.generation(), generation_after(0));
+        drop(peer);
+        server.shutdown().expect("clean shutdown");
+    }
+
+    // -- the arming cases a happy-path suite misses --------------------
+
+    #[test]
+    fn an_idle_reset_server_never_resets() {
+        // No client has ever connected, so the client set is empty from
+        // the first iteration. A state check would reset here, over and
+        // over.
+        let server = Server::with_policy(ResetPolicy::Reset);
+        std::thread::sleep(QUIET);
+        assert_eq!(server.generation(), generation_after(0));
+        // Still serving: the idle loop was running, not wedged.
+        let peer = server.establish();
+        assert_eq!(server.generation(), generation_after(0));
+        drop(peer);
+        server.shutdown().expect("clean shutdown");
+    }
+
+    #[test]
+    fn a_connection_dropped_before_setup_completes_arms_nothing() {
+        // Accepted, a setup thread spawned, then gone before any
+        // `ClientSetupComplete`. Nothing was ever established, so
+        // nothing may fire.
+        let server = Server::with_policy(ResetPolicy::Reset);
+        for _ in 0..5 {
+            let peer = server.connect();
+            drop(peer);
+        }
+        std::thread::sleep(QUIET);
+        assert_eq!(
+            server.generation(),
+            generation_after(0),
+            "accept is not arming"
+        );
+        let peer = server.establish();
+        assert_eq!(server.generation(), generation_after(0));
+        drop(peer);
+        server.shutdown().expect("clean shutdown");
+    }
+
+    #[test]
+    fn a_client_refused_for_a_bad_cookie_arms_nothing() {
+        // The case a stranger can reach: stage 1's TCP listener binds
+        // 0.0.0.0, so a wrong cookie must not be able to erase a
+        // session. Refused inside the setup thread — the core never
+        // hears about it.
+        let cookie = [0x5A_u8; 16];
+        let auth_path = write_xauth(&cookie);
+        let server = Server::start(ResetPolicy::Reset, AuthState::new(Some(auth_path.clone())));
+
+        let mut peer = server.connect();
+        write_setup_with_cookie(&mut peer, &[0x22_u8; 16]);
+        let mut header = [0_u8; 8];
+        peer.read_exact(&mut header).expect("setup reply header");
+        assert_eq!(header[0], 0, "a bad cookie must be refused");
+        drop(peer);
+
+        std::thread::sleep(QUIET);
+        assert_eq!(
+            server.generation(),
+            generation_after(0),
+            "a refused connection is not arming"
+        );
+
+        // And the good cookie still works, so the refusal was the
+        // server's decision, not a broken fixture.
+        let mut good = server.connect();
+        write_setup_with_cookie(&mut good, &cookie);
+        good.read_exact(&mut header).expect("setup reply header");
+        assert_eq!(header[0], 1, "the matching cookie must be accepted");
+        let len = usize::from(u16::from_le_bytes([header[6], header[7]])) * 4;
+        good.read_exact(&mut vec![0; len])
+            .expect("setup reply body");
+        round_trip(&mut good);
+        assert_eq!(server.generation(), generation_after(0));
+
+        drop(good);
+        wait_until("the authorized client's departure to reset", || {
+            server.generation() == generation_after(1)
+        });
+        server.shutdown().expect("clean shutdown");
+        let _ = std::fs::remove_file(&auth_path);
+    }
+
+    #[test]
+    fn a_reset_disarms_the_new_generation() {
+        // The boundary leaves an empty client set behind, and the dead
+        // generation's reader thread posts its `ClientDisconnected`
+        // afterwards. Neither may produce a second reset.
+        let server = Server::with_policy(ResetPolicy::Reset);
+        let peer = server.establish();
+        drop(peer);
+        wait_until("the first reset", || {
+            server.generation() == generation_after(1)
+        });
+        std::thread::sleep(QUIET);
+        assert_eq!(
+            server.generation(),
+            generation_after(1),
+            "exactly one reset; the fresh generation starts disarmed"
+        );
+        // The new generation serves, and arms again on its own client.
+        let peer = server.establish();
+        drop(peer);
+        wait_until("the second generation to reset in turn", || {
+            server.generation() == generation_after(2)
+        });
+        server.shutdown().expect("clean shutdown");
+    }
+
+    // -- fixtures for the auth case ------------------------------------
+
+    const MIT_MAGIC_COOKIE: &str = "MIT-MAGIC-COOKIE-1";
+
+    fn write_xauth(cookie: &[u8]) -> PathBuf {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&256_u16.to_be_bytes()); // FamilyLocal
+        for field in [
+            b"host".as_slice(),
+            b"0",
+            MIT_MAGIC_COOKIE.as_bytes(),
+            cookie,
+        ] {
+            bytes.extend_from_slice(
+                &u16::try_from(field.len())
+                    .expect("field fits")
+                    .to_be_bytes(),
+            );
+            bytes.extend_from_slice(field);
+        }
+        let path = std::env::temp_dir().join(format!("yserver-reset-auth-{}", std::process::id()));
+        std::fs::write(&path, bytes).expect("write xauthority");
+        path
+    }
+
+    fn write_setup_with_cookie(peer: &mut UnixStream, cookie: &[u8]) {
+        let name = MIT_MAGIC_COOKIE.as_bytes();
+        let mut buf = Vec::new();
+        buf.push(b'l');
+        buf.push(0);
+        buf.extend_from_slice(&11_u16.to_le_bytes());
+        buf.extend_from_slice(&0_u16.to_le_bytes());
+        buf.extend_from_slice(&u16::try_from(name.len()).expect("name fits").to_le_bytes());
+        buf.extend_from_slice(
+            &u16::try_from(cookie.len())
+                .expect("cookie fits")
+                .to_le_bytes(),
+        );
+        buf.extend_from_slice(&[0, 0]);
+        buf.extend_from_slice(name);
+        while buf.len() % 4 != 0 {
+            buf.push(0);
+        }
+        buf.extend_from_slice(cookie);
+        while buf.len() % 4 != 0 {
+            buf.push(0);
+        }
+        peer.write_all(&buf).expect("setup request with cookie");
     }
 }
