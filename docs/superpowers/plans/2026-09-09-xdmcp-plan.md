@@ -124,6 +124,11 @@ to read.
 `xdmcp.c:252-312`. `-cookie` is parsed and **rejected with a clear message**,
 since accepting it implies XDM-AUTHENTICATION-1.
 
+One deliberate divergence: Xorg's `-port` is `(unsigned short) atoi(...)`,
+which **silently wraps** an out-of-range value; ours rejects it. Failing at
+startup beats querying a manager on a port the operator did not ask for, and
+nothing in a display manager's argv passes a bogus port.
+
 **Proof.** A parse table: each option, the ordering/last-wins cases, mode
 conflicts (`-query` then `-broadcast`), `-cookie` rejected rather than ignored,
 and no XDMCP option leaving XDMCP disabled.
@@ -186,6 +191,12 @@ The first step that sends anything.
   `XDM_MAX_RTX` — **2 s doubling to 32 s** (`Xdmcp.h:39-40`), giving up at
   `XDM_RTX_LIMIT` **7** retransmissions, or `XDM_KA_RTX_LIMIT` **4** while
   awaiting `Alive` (`:41-42`).
+- **Apply the display-class default here**, not in the parser. Step 3 leaves
+  `class: None` when `-class` is absent, because a default is only meaningful
+  where the packet is built. Xorg's is `"MIT-unspecified"`
+  (`xdmcp.c:65`, `defaultDisplayClass`), and the `Request` packet carries it —
+  so an unset class must become that string on the wire, not an empty
+  `ARRAY8`.
 - The deadline joins the loop's existing per-iteration poll-timeout
   computation. **No new thread** — the state machine belongs on the core loop
   where it can see the generation boundary directly.
