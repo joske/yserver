@@ -719,8 +719,16 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   without blinking or changing mode.
   *Not done:* the composite-overlay claim is still not a per-client resource,
   which is a prerequisite for shipping reset; stage 2 (`xhost`) is specified
-  and deferred; stage 4 (XDMCP) is unstarted; the two-session hardware run is
-  outstanding.
+  and deferred; the two-session hardware run is outstanding. Stage 4 (XDMCP)
+  is under way on `feat/121-xdmcp`: steps 1 and 2 of
+  [the plan](superpowers/plans/2026-09-09-xdmcp-plan.md) are in —
+  `yserver-protocol`'s `xdmcp::codec` (the thirteen display-side messages over
+  the `ARRAY8`/`ARRAY16`/`ARRAY32`/`ARRAYofARRAY8` primitives, with the
+  declared-length arithmetic every `xdmcp.c` receiver checks by hand) and
+  `xdmcp::state` (the `(state, event) -> (state, actions)` transition
+  function). Both are pure and unwired: no UDP socket, no timer, no options,
+  no auth or reset integration yet, so nothing about a server without an XDMCP
+  option changes.
 - **2026-08-24 direct-scanout fallback-target fix:** a `CowDescendant` root
   Present's pinned redirected paint target need not be the Composite Overlay
   Window itself. Lazy fallback now copies into that exact pinned paint target
