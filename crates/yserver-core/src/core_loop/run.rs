@@ -10,10 +10,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     io,
-    os::{
-        fd::{AsRawFd, OwnedFd, RawFd},
-        unix::net::{UnixListener, UnixStream},
-    },
+    os::fd::{AsRawFd, OwnedFd, RawFd},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -40,6 +37,7 @@ use crate::{
     backend::{Backend, BackendFdKind, CrtcConfigToken, HostSocketStatus},
     host_x11::HostEvent,
     server::{KeyRepeatState, ServerState},
+    transport::{Listener, Transport},
 };
 
 /// Diagnostic: per-second loop telemetry emit interval. Toggle via
@@ -1021,20 +1019,21 @@ pub fn run_core(
     sender: CoreSender,
     state: &mut ServerState,
     backend: &mut dyn Backend,
-    listener: Option<UnixListener>,
+    listeners: impl IntoIterator<Item = Listener>,
     client_id_allocator: &ClientIdAllocator,
     auth: Arc<AuthState>,
 ) -> io::Result<()> {
     let setup_registry = setup_thread::make_registry();
-    let listener = if let Some(listener) = listener {
-        listener.set_nonblocking(true)?;
-        let raw = listener.as_raw_fd();
-        poll.registry()
-            .register(&mut SourceFd(&raw), LISTENER_TOKEN, Interest::READABLE)?;
-        Some(listener)
-    } else {
-        None
-    };
+    let listeners: Vec<_> = listeners
+        .into_iter()
+        .map(|listener| {
+            listener.set_nonblocking(true)?;
+            let raw = listener.as_raw_fd();
+            poll.registry()
+                .register(&mut SourceFd(&raw), LISTENER_TOKEN, Interest::READABLE)?;
+            Ok(listener)
+        })
+        .collect::<io::Result<_>>()?;
 
     // E3: register backend-owned fds with the core poller. KMS returns
     // `Drm` only after `take_input_ctx`; the libinput context, when
@@ -1259,7 +1258,7 @@ pub fn run_core(
             }
             match ev.token() {
                 LISTENER_TOKEN => {
-                    if let Some(listener) = listener.as_ref() {
+                    for listener in &listeners {
                         accept_pending(
                             listener,
                             client_id_allocator,
@@ -2887,7 +2886,7 @@ fn handle_client_setup_complete(
     setup_registry: &SetupRegistry,
     state: &mut ServerState,
     id: yserver_protocol::x11::ClientId,
-    stream: UnixStream,
+    stream: Transport,
     resource_id_base: u32,
     resource_id_mask: u32,
     byte_order: yserver_protocol::x11::ClientByteOrder,
@@ -2952,43 +2951,47 @@ fn handle_client_setup_complete(
 /// Drain pending accepts on the listener. For each, allocate a fresh
 /// `ClientId` and spawn a setup thread that does the X11 handshake.
 fn accept_pending(
-    listener: &UnixListener,
+    listener: &Listener,
     client_id_allocator: &ClientIdAllocator,
     sender: &CoreSender,
     registry: &SetupRegistry,
     auth: &Arc<AuthState>,
 ) {
-    loop {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                let id = client_id_allocator.allocate();
-                if let Err(err) = setup_thread::spawn(
-                    id,
-                    stream,
-                    sender.clone_handle(),
-                    registry.clone(),
-                    auth.clone(),
-                ) {
-                    error!("setup thread spawn failed for client {}: {err}", id.0);
+    match listener {
+        Listener::Unix(listener) => loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let id = client_id_allocator.allocate();
+                    if let Err(err) = setup_thread::spawn(
+                        id,
+                        Transport::Unix(stream),
+                        sender.clone_handle(),
+                        registry.clone(),
+                        auth.clone(),
+                    ) {
+                        error!("setup thread spawn failed for client {}: {err}", id.0);
+                    }
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(err) => {
+                    warn!("accept failed: {err}");
+                    break;
                 }
             }
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
-            Err(err) => {
-                warn!("accept failed: {err}");
-                break;
-            }
-        }
+        },
+        Listener::Tcp(_) => unreachable!("TCP listener support lands after transport migration"),
     }
 }
 
 // Silence unused-import lints when the listener path is only exercised
 // indirectly. Concrete uses below.
 #[allow(dead_code)]
-fn _hint(_: UnixStream) {}
+fn _hint(_: Transport) {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::net::UnixStream;
 
     #[test]
     fn randr_change_fanout_orders_screen_then_all_crtcs_then_all_outputs() {
@@ -3014,7 +3017,7 @@ mod tests {
         state.clients.insert(
             7,
             ClientState {
-                writer: Arc::new(Mutex::new(writer)),
+                writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(writer))),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(9)),
                 resource_id_base: 0,
@@ -3310,7 +3313,7 @@ mod tests {
         state.clients.insert(
             client_id.0,
             ClientState {
-                writer: Arc::new(Mutex::new(writer)),
+                writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(writer))),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
                 resource_id_base: 0,
@@ -3441,7 +3444,7 @@ mod tests {
         // We just need a real fd registered with the poller.
         let (mut peer, writer) = UnixStream::pair().unwrap();
         writer.set_nonblocking(true).unwrap();
-        let writer_arc = Arc::new(Mutex::new(writer));
+        let writer_arc = Arc::new(Mutex::new(crate::transport::Transport::Unix(writer)));
         let raw = writer_arc.lock().unwrap().as_raw_fd();
         let token = client_token(Cid(7));
         poll.registry()

@@ -623,7 +623,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
         sender,
         &mut state,
         &mut backend,
-        Some(listener),
+        vec![yserver_core::transport::Listener::Unix(listener)],
         &alloc,
         auth,
     );

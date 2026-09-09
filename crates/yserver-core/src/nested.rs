@@ -440,7 +440,7 @@ pub fn run(display: u16, width: u16, height: u16) -> io::Result<()> {
         sender,
         &mut state,
         &mut backend,
-        Some(listener),
+        vec![crate::transport::Listener::Unix(listener)],
         &allocator,
         crate::core_loop::auth::AuthState::new(None),
     )
@@ -1474,7 +1474,7 @@ mod tests {
             state.clients.insert(
                 1,
                 ClientState {
-                    writer: Arc::new(Mutex::new(writer_local)),
+                    writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(writer_local))),
                     byte_order: ClientByteOrder::LittleEndian,
                     last_sequence: Arc::new(AtomicU16::new(0)),
                     resource_id_base: 0x0010_0000,

@@ -2,14 +2,11 @@
 //!
 //! See `docs/superpowers/plans/2026-05-06-single-threaded-core.md` Phase B.
 
-use std::{
-    os::{fd::OwnedFd, unix::net::UnixStream},
-    time::Instant,
-};
+use std::{os::fd::OwnedFd, time::Instant};
 
 use yserver_protocol::x11::{ClientByteOrder, ClientId, RequestHeader, SequenceNumber};
 
-use crate::host_x11::HostKeyEvent;
+use crate::{host_x11::HostKeyEvent, transport::Transport};
 
 /// Snapshot of a libinput device's identity and touchpad configuration at
 /// device-add time.  Plain data — no libinput handles, safe to send across
@@ -137,7 +134,7 @@ pub enum Message {
     /// spawn (D4).
     ClientSetupComplete {
         id: ClientId,
-        stream: UnixStream,
+        stream: Transport,
         resource_id_base: u32,
         resource_id_mask: u32,
         byte_order: ClientByteOrder,

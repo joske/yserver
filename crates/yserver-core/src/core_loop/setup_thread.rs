@@ -23,7 +23,6 @@
 use std::{
     collections::HashMap,
     io::{self, ErrorKind},
-    os::unix::net::UnixStream,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -40,6 +39,7 @@ use crate::{
         sender::CoreSender,
     },
     resources::{ARGB_VISUAL, ROOT_COLORMAP, ROOT_VISUAL, ROOT_WINDOW},
+    transport::Transport,
 };
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -47,7 +47,7 @@ const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Shared registry of setup-stage UnixStreams. The setup thread holds
 /// the *original* stream; this map holds a `try_clone` so the core can
 /// `shutdown(Both)` it on shutdown to unblock the setup thread.
-pub type SetupRegistry = Arc<Mutex<HashMap<ClientId, UnixStream>>>;
+pub type SetupRegistry = Arc<Mutex<HashMap<ClientId, Transport>>>;
 
 pub fn make_registry() -> SetupRegistry {
     Arc::new(Mutex::new(HashMap::new()))
@@ -58,11 +58,12 @@ pub fn make_registry() -> SetupRegistry {
 /// the spawn cannot miss it.
 pub fn spawn(
     id: ClientId,
-    stream: UnixStream,
+    stream: impl Into<Transport>,
     sender: CoreSender,
     registry: SetupRegistry,
     auth: Arc<AuthState>,
 ) -> io::Result<()> {
+    let stream = stream.into();
     let cloned = stream.try_clone()?;
     registry
         .lock()
@@ -124,7 +125,7 @@ impl Drop for SetupGuard {
 
 fn run_setup(
     id: ClientId,
-    mut stream: UnixStream,
+    mut stream: Transport,
     sender: &CoreSender,
     auth: &AuthState,
 ) -> io::Result<()> {
@@ -253,6 +254,7 @@ mod tests {
     use crate::{core_loop::sender::channel, xauth::MIT_MAGIC_COOKIE};
     use std::{
         io::{Read, Write},
+        os::unix::net::UnixStream,
         path::PathBuf,
         time::Instant,
     };

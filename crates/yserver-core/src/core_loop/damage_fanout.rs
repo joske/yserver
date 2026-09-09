@@ -802,12 +802,12 @@ mod tests {
     };
     use yserver_protocol::x11::{ClientByteOrder, CreatePixmapRequest, CreateWindowRequest};
 
-    fn make_test_writer() -> Arc<Mutex<UnixStream>> {
+    fn make_test_writer() -> Arc<Mutex<crate::transport::Transport>> {
         // Pair of sockets; we keep the read end alive in the same
         // Arc so writes don't EPIPE during tests. We never inspect
         // the data sent — assertions are against `damage_objects`.
         let (a, _b) = UnixStream::pair().expect("UnixStream::pair");
-        Arc::new(Mutex::new(a))
+        Arc::new(Mutex::new(crate::transport::Transport::Unix(a)))
     }
 
     fn add_client(state: &mut ServerState, client_id: u32, base: u32) {
@@ -898,7 +898,7 @@ mod tests {
         state.clients.insert(
             client_id,
             ClientState {
-                writer: Arc::new(Mutex::new(a)),
+                writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(a))),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
                 resource_id_base: base,
@@ -1354,7 +1354,7 @@ mod tests {
         state.clients.insert(
             1,
             ClientState {
-                writer: Arc::new(Mutex::new(writer_end)),
+                writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(writer_end))),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
                 resource_id_base: 0x0010_0000,
