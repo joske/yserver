@@ -21,6 +21,8 @@ use std::{
 /// convention).
 pub const DEFAULT_DISPLAY: u16 = 7;
 
+const TCP_PORT_BASE: u16 = 6_000;
+
 /// Parsed X-server-style command line. Fields the issue's items 1-2 act
 /// on; `vt`/`seat` are parsed + logged but otherwise ignored (logind owns
 /// the seat/VT), `auth_file` is stashed for the deferred item 4.
@@ -36,6 +38,9 @@ pub struct LaunchOptions {
     pub seat: Option<String>,
     /// `-auth FILE` — stashed for item 4, unused now.
     pub auth_file: Option<PathBuf>,
+    /// Whether `-listen tcp` is the last TCP transport option in argv.
+    /// TCP remains disabled by default, matching Xorg's no-listen list.
+    pub tcp_listen: bool,
     /// `--version` / `-version` — print version + git commit and exit
     /// (handled by the binary before `run()`).
     pub show_version: bool,
@@ -76,7 +81,16 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchOption
             );
         } else if arg == "-layout" {
             o.layout = Some(next_value(&mut it, "-layout")?);
-        } else if matches!(arg.as_str(), "-nolisten" | "-config" | "-background") {
+        } else if matches!(arg.as_str(), "-listen" | "-nolisten") {
+            let transport = next_value(&mut it, &arg)?;
+            if transport == "tcp" {
+                // Xorg mutates one no-listen list as it scans argv, so the
+                // final option for a transport wins.
+                o.tcp_listen = arg == "-listen";
+            } else {
+                log::warn!("yserver: ignoring {arg} for unsupported transport {transport}");
+            }
+        } else if matches!(arg.as_str(), "-config" | "-background") {
             // Known value-taking no-ops. Consume + ignore the value; a
             // missing value is tolerated (these don't affect us).
             if it.next().is_none() {
@@ -96,6 +110,14 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchOption
         }
     }
     Ok(o)
+}
+
+/// X11's TCP port for a display, with overflow rejected at startup rather
+/// than silently wrapping to an unrelated port.
+pub fn tcp_port(display: u16) -> Result<u16, String> {
+    TCP_PORT_BASE
+        .checked_add(display)
+        .ok_or_else(|| format!("display :{display} cannot use a TCP port"))
 }
 
 /// How `run()` should obtain the display + whether to take the lock.
@@ -561,6 +583,33 @@ mod tests {
         assert_eq!(o.vt, Some(7));
         assert_eq!(o.seat.as_deref(), Some("seat0"));
         assert_eq!(o.auth_file, Some(PathBuf::from("/var/run/lightdm/root/:0")));
+        assert!(
+            !o.tcp_listen,
+            "LightDM's -nolisten tcp preserves the default"
+        );
+    }
+
+    #[test]
+    fn tcp_listen_arguments_are_ordered_and_last_wins() {
+        // This catches a parser which accepts these familiar Xorg arguments
+        // but discards them (the old behaviour): the enabled form must differ
+        // from the default/disabled form, and later arguments reverse it.
+        let bare = parse(&[]).unwrap();
+        let disabled = parse(&["-nolisten", "tcp"]).unwrap();
+        let enabled = parse(&["-listen", "tcp"]).unwrap();
+        let enabled_then_disabled = parse(&["-listen", "tcp", "-nolisten", "tcp"]).unwrap();
+        let disabled_then_enabled = parse(&["-nolisten", "tcp", "-listen", "tcp"]).unwrap();
+
+        assert_eq!(disabled, bare);
+        assert_ne!(enabled, bare);
+        assert_eq!(enabled_then_disabled, bare);
+        assert_eq!(disabled_then_enabled, enabled);
+    }
+
+    #[test]
+    fn tcp_port_rejects_displays_that_would_overflow() {
+        assert_eq!(tcp_port(59_535), Ok(65_535));
+        assert!(tcp_port(59_536).is_err());
     }
 
     #[test]
@@ -568,6 +617,10 @@ mod tests {
         let o = parse(&["-displayfd", "12"]).unwrap();
         assert_eq!(o.displayfd, Some(12));
         assert_eq!(o.display, None);
+        assert!(
+            !o.tcp_listen,
+            "GDM-style argv keeps TCP disabled by default"
+        );
     }
 
     #[test]
