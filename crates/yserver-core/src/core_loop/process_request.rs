@@ -13354,6 +13354,9 @@ fn handle_x_resource_request(
     #[cfg(target_os = "linux")]
     fn client_peer_pid(client: &crate::server::ClientState) -> Option<u32> {
         use std::os::fd::AsRawFd;
+        if !client.is_local {
+            return None;
+        }
         let guard = client
             .writer
             .lock()
@@ -35222,6 +35225,40 @@ mod tests {
             u32::from_le_bytes(error[4..8].try_into().unwrap()),
             0x00f0_0000
         );
+    }
+
+    #[test]
+    fn x_resource_query_client_ids_omits_pid_for_nonlocal_client() {
+        use yserver_protocol::x11::x_resource as x11xres;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.clients.get_mut(&1).unwrap().is_local = false;
+        let mut backend = RecordingBackend::new();
+        let mut body = 1u32.to_le_bytes().to_vec();
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&x11xres::LOCAL_CLIENT_PID_MASK.to_le_bytes());
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 149,
+                data: x11xres::QUERY_CLIENT_IDS,
+                length_units: 4,
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+        let reply = read_all_available(&mut peer);
+        assert_eq!(
+            u32::from_le_bytes(reply[8..12].try_into().unwrap()),
+            0,
+            "nonlocal clients have no LocalClientPID even if the underlying socket supports credentials"
+        );
+        assert_eq!(reply.len(), 32);
     }
 
     #[test]

@@ -92,9 +92,8 @@ fn input_startup_action(has_input_ctx: bool) -> InputStartup {
     }
 }
 
-/// Validate the prerequisites that make a future TCP listener safe. Kept
-/// separate from `run` so this remains testable without opening hardware or
-/// any socket; this stage intentionally creates no TCP listener.
+/// Validate TCP prerequisites before opening hardware or sockets, using the
+/// same authorization state that will serve every accepted connection.
 fn validate_tcp_startup(
     opts: &launch::LaunchOptions,
     auth: &core_loop::auth::AuthState,
@@ -110,6 +109,35 @@ fn validate_tcp_startup(
     Ok(())
 }
 
+fn bind_client_listeners(
+    unix: std::os::unix::net::UnixListener,
+    display: u16,
+    opts: &launch::LaunchOptions,
+    auth: &core_loop::auth::AuthState,
+) -> io::Result<Vec<yserver_core::transport::Listener>> {
+    use std::net::{Ipv4Addr, TcpListener};
+    use yserver_core::transport::Listener;
+
+    let mut listeners = vec![Listener::Unix(unix)];
+    if opts.tcp_listen {
+        // Keep the validation adjacent to the first network bind as well as
+        // the early startup check. In particular AutoPick resolves its actual
+        // display only after the early validation.
+        auth.require_tcp_auth_at_startup()
+            .map_err(io::Error::other)?;
+        let port = launch::tcp_port(display).map_err(io::Error::other)?;
+        let tcp = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("cannot listen on TCP port {port}: {err}"),
+            )
+        })?;
+        log::info!("yserver: listening on TCP 0.0.0.0:{port}");
+        listeners.push(Listener::Tcp(tcp));
+    }
+    Ok(listeners)
+}
+
 pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     panic!("yserver only supports Linux and FreeBSD (DRM/KMS, libinput, evdev)");
@@ -120,8 +148,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // it measured — that bit the 2026-09-03 z400 runs.
     log::info!(target: "yserver::startup", "yserver: startup — {}", crate::version::line());
 
-    // Validate TCP's two startup invariants before opening devices or binding
-    // sockets. This stage deliberately does not bind a TCP listener yet.
+    // Validate TCP's startup invariants before opening devices or sockets.
     let auth = core_loop::auth::AuthState::new(opts.auth_file.clone());
     validate_tcp_startup(&opts, &auth)?;
 
@@ -417,6 +444,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
         }
     };
     log::info!("yserver: listening on unix socket DISPLAY=:{display}");
+    let listeners = bind_client_listeners(listener, display, &opts, &auth)?;
 
     // Initial composite+flip so the screen has a known frame before any
     // client connects.
@@ -623,7 +651,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
         sender,
         &mut state,
         &mut backend,
-        vec![yserver_core::transport::Listener::Unix(listener)],
+        listeners,
         &alloc,
         auth,
     );
@@ -782,6 +810,9 @@ fn block_termination_signals() -> io::Result<nix::sys::event::Kqueue> {
         .map_err(|err| io::Error::other(format!("kevent register signals: {err}")))?;
     Ok(kq)
 }
+
+#[cfg(test)]
+mod tcp_tests;
 
 #[cfg(test)]
 mod tests {
