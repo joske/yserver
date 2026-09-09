@@ -57,10 +57,19 @@ truncated packets.
 
 ## Step 2 — the state machine as a pure function
 
-States per `xdmcp.c:80` and its option assignments: `Off`, `Query`,
-`Broadcast`, `IndirectQuery`, `CollectQuery`, `StartConnection`,
+States per the protocol enum (`X11/Xdmcp.h:51-62`), not from a summary of it:
+`Off`, `Query`, `Broadcast`, `Indirect`, **`CollectQuery`,
+`CollectBroadcastQuery`, `CollectIndirectQuery`**, `StartConnection`,
 `AwaitRequestResponse`, `Manage`, `AwaitManageResponse`, `RunSession`,
 `KeepAlive`, `AwaitAliveResponse`.
+
+**Three collect states, not one.** An earlier draft of this plan collapsed
+them, which would silently break `-broadcast` and `-indirect`: `recv_willing_msg`
+switches on which one it is in (`xdmcp.c:1058`), calling `XdmcpSelectHost` from
+`CollectQuery` but `XdmcpAddHost` from the broadcast and indirect ones — the
+difference between "this is my manager" and "add it to the list of managers
+that answered". `XDM_MULTICAST` and `XDM_COLLECT_MULTICAST_QUERY` stay out,
+per the non-goal; `XDM_AWAIT_USER_INPUT` likewise, being the chooser.
 
 Model it as `(state, event) -> (state, actions)` with no I/O. Actions are
 "send packet X", "install cookie", "clear cookie", "reset generation",
@@ -148,8 +157,16 @@ empty presentation).
 ## Step 5 — reset integration
 
 - An XDMCP option implies `-reset`; `-once` implies `-terminate`.
-- On a new generation the state machine returns to its init state and
-  re-queries, running **after** the new generation is installed.
+- On a new generation the state machine returns to its **configured initial
+  mode** and re-queries, running **after** the new generation is installed.
+
+  Be precise about the target, because it is a trap: there is no `Init` state.
+  `XDM_INIT_STATE` is a *variable* holding whichever of `XDM_QUERY`,
+  `XDM_BROADCAST` or `XDM_INDIRECT` the options selected (`xdmcp.c:80`, assigned
+  at `:254-276`) — it does not appear in the state enum at all. So the reset
+  action is `state = options.initial_mode()`, and an implementation that
+  hardcodes `Query` would work under `-query` and quietly break `-broadcast`
+  and `-indirect` on the second session only.
 - Session end and `XdmcpDeadSession` raise the reset.
 
 **Proof.** Session end produces exactly one new generation; a second session
