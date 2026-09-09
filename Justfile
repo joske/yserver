@@ -200,6 +200,8 @@ yserver-tcp-hw log="warn":
 # SERVER's copy — used only to validate incoming clients). The same cookie
 # is also added to the user's ~/.Xauthority keyed to :$display, and the
 # session runs with XAUTHORITY pointed at ~/.Xauthority (NOT the /tmp file).
+# Xlib/xauth deliberately use that FamilyLocal cookie for a loopback TCP
+# DISPLAY such as 127.0.0.1:$display too; a separate record is not needed.
 # So, exactly like real startx: the session's own clients authenticate; a
 # second terminal in the same login connects with a bare DISPLAY=:$display
 # (no hunting for the /tmp file); the session can also reach other X
@@ -240,7 +242,7 @@ startx log="info":
         xauth -f "$authfile" add ":$display" . "$cookie";\
         xauth -f "$userauth" add ":$display" . "$cookie";\
         echo "startx: using DISPLAY=:$display (server auth $authfile; cookie also added to $userauth)";\
-        YSERVER_LOOP_TELEMETRY=1 RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver "$display" -auth "$authfile" > yserver-hw-startx.log 2>&1 &\
+        YSERVER_LOOP_TELEMETRY=1 RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver "$display" -auth "$authfile" -listen tcp > yserver-hw-startx.log 2>&1 &\
         yserver_pid=$!;\
         for i in $(seq 30); do [ -S /tmp/.X11-unix/X$display ] && break; sleep 1; done;\
         xinitrc=~/.xinitrc;\
