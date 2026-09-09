@@ -268,7 +268,8 @@ keeping zombie resources alive on purpose. Reusing it for a reset would be
 wrong twice over: retained resources would survive the erasure, and replacing
 `ServerState` afterwards would drop the *core* metadata while leaving the
 **backend-side** objects — host pixmaps, GLX contexts and drawables, DRI3
-syncobjs, registered writers — allocated with nothing left to reference them.
+syncobjs, host-window registrations — allocated with nothing left to
+reference them.
 That is precisely the host-pixmap lifetime class fixed under #133 behind
 `host_xid_still_referenced`.
 
