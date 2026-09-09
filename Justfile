@@ -164,6 +164,30 @@ yserver-hw log="warn":
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null'
 
+# Local TCP transport smoke. Creates a temporary FamilyInternet Xauthority
+# record for 127.0.0.1:7, starts yserver with TCP explicitly enabled, then
+# proves a real TCP client can complete setup. Requires a real KMS-capable
+# environment plus xauth, mcookie and xdpyinfo.
+yserver-tcp-hw log="warn":
+    cargo build --release --bin yserver
+    bash -c '\
+        authfile=$(mktemp /tmp/yserver-tcp-auth.XXXXXX);\
+        cookie=$(mcookie);\
+        xauth -f "$authfile" add 127.0.0.1:7 . "$cookie";\
+        cleanup() { \
+            [ -z "${yserver_pid:-}" ] || kill -TERM "$yserver_pid" 2>/dev/null;\
+            [ -z "${yserver_pid:-}" ] || wait "$yserver_pid" 2>/dev/null;\
+            rm -f "$authfile";\
+        } ;\
+        trap cleanup EXIT INT TERM;\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver 7 -listen tcp -auth "$authfile" > yserver-tcp-hw.log 2>&1 &\
+        yserver_pid=$!;\
+        for i in $(seq 1 50); do DISPLAY=127.0.0.1:7 XAUTHORITY="$authfile" xdpyinfo >/dev/null 2>&1 && break; sleep 0.2; done;\
+        DISPLAY=127.0.0.1:7 XAUTHORITY="$authfile" xdpyinfo >/dev/null || { \
+            echo "yserver-tcp-hw: TCP setup failed; see yserver-tcp-hw.log" >&2; exit 1;\
+        } ;\
+        echo "yserver-tcp-hw: TCP setup succeeded; see yserver-tcp-hw.log"'
+
 # Picks the lowest free X display by scanning /tmp/.X11-unix/, brings
 # yserver up there, then runs ~/.xinitrc (or /etc/X11/xinit/xinitrc
 # fallback) with the matching DISPLAY. When xinitrc exits, yserver is
