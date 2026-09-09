@@ -160,6 +160,8 @@ mod tests {
             watching_writable: false,
             focused_window: ResourceId(0),
             reader_control: None,
+            is_local: true,
+            fd_passing: true,
         }
     }
 

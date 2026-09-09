@@ -2916,6 +2916,8 @@ fn handle_client_setup_complete(
             watching_writable: false,
             focused_window: crate::resources::ROOT_WINDOW,
             reader_control: Some(reader_control_tx),
+            is_local: true,
+            fd_passing: true,
         },
     );
 
@@ -3032,6 +3034,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
         state.randr_select_masks.insert(
@@ -3328,6 +3332,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: Some(control_tx),
+                is_local: true,
+                fd_passing: true,
             },
         );
 
@@ -3470,6 +3476,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
 
