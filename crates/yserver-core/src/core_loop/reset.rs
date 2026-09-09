@@ -211,17 +211,24 @@ pub(crate) fn reset_generation(
     locals.server_grab_waiters.clear();
     locals.telemetry.forget_clients();
 
-    // -- 5. Cancel remaining in-flight backend work for the dead
-    // session. The parked CRTC configs went in step 4 (they had to --
-    // their tokens live in the maps that step clears). What is left is
-    // the composite overlay window: `release_overlay_window` is called
-    // only from the protocol handler, never from disconnect, so a
-    // compositor that died without releasing it leaves the backend's
-    // COW refcount held -- and under XDMCP the next session would start
-    // with the previous user's overlay still referenced. The core-side
-    // COW record needs no teardown here: it lives in `state.resources`,
-    // which step 6 replaces wholesale.
-    drain_overlay_window(backend);
+    // NOT handled here: the leaked composite-overlay claim. A compositor
+    // that disconnects without `ReleaseOverlayWindow` leaves
+    // `cow_refcount` held, and a reset would otherwise carry that across
+    // the session boundary. The first attempt at this was a bounded
+    // decrement loop here, which jos and codex both rejected: the cap is
+    // arbitrary and protocol-invalid (a client may issue more Gets than
+    // the cap), and on a `materialize_direct_shadow_for_unflip` failure
+    // it degenerated to logging and continuing — carrying the old
+    // compositor's claim into the next user's session, the exact outcome
+    // a reset must forbid.
+    //
+    // The real fix is structural and belongs upstream of reset: make the
+    // claim a PER-CLIENT resource as Xorg does (`FreeCompositeClientOverlay`,
+    // ../xserver/composite/compext.c:88, is a resource destructor calling
+    // compFreeOverlayClient), share one release helper between
+    // ReleaseOverlayWindow and disconnect, and then reset inherits the
+    // cleanup through `force_destroy_all_clients` with no special case.
+    // Tracked separately; see the spec's "Adjacent gaps".
 
     // -- 6. Replace `*state` with a freshly seeded one. -------------
     // Constructed, not cleared: a field added to `ServerState` later is
@@ -259,34 +266,6 @@ pub(crate) fn reset_generation(
 
     // -- 9. Listeners are left bound and untouched. -----------------
     generation
-}
-
-/// Drop the backend's composite-overlay reference for a session that is
-/// gone.
-///
-/// `release_overlay_window` is a refcount decrement with no "force to
-/// zero" form, so this drives it with `cow_host_xid` as the predicate:
-/// `Some` means the backend still has the COW materialised. Backends
-/// that do not model the COW report `None` and this is a no-op.
-#[allow(dead_code)]
-fn drain_overlay_window(backend: &mut dyn Backend) {
-    for _ in 0..MAX_OVERLAY_RELEASE_ATTEMPTS {
-        if backend.cow_host_xid().is_none() {
-            return;
-        }
-        match backend.release_overlay_window(None) {
-            Ok(true) => return,
-            Ok(false) => {}
-            Err(err) => {
-                log::warn!("reset: releasing the composite overlay window failed: {err}");
-                return;
-            }
-        }
-    }
-    log::warn!(
-        "reset: composite overlay window still referenced after \
-         {MAX_OVERLAY_RELEASE_ATTEMPTS} release attempts"
-    );
 }
 
 /// Paint the fresh root window's background over the whole screen.
@@ -1111,42 +1090,6 @@ mod tests {
             matches!((fill, dirty), (Some(f), Some(d)) if f < d),
             "mark_dirty must follow the clear, or the composite it \
              ungates can run before the repaint: {calls:?}"
-        );
-    }
-
-    /// A compositor that died without `ReleaseOverlayWindow` leaves the
-    /// backend's COW refcount held: `release_overlay_window` is called
-    /// only from the protocol handler, never from disconnect. The reset
-    /// must not inherit it into the next session.
-    #[test]
-    fn reset_generation_releases_a_leaked_composite_overlay_window() {
-        let mut state = ServerState::new();
-        let mut backend = backend_with_topology();
-        backend.get_overlay_window(None).expect("materialize");
-        assert!(backend.cow_host_xid().is_some(), "precondition");
-        // The recording backend only takes its final-release branch when
-        // this knob is armed; KMS's own refcount reaches zero on its own.
-        backend.cow_next_release_is_final = true;
-
-        let generations = GenerationCounter::new();
-        let registry = setup_thread::make_registry();
-        let inventory = InputInventory::new();
-        let mut locals = Locals::new();
-        let p = poll();
-
-        reset_generation(
-            &mut state,
-            &mut backend,
-            p.registry(),
-            &generations,
-            &registry,
-            &inventory,
-            locals.borrow(),
-        );
-
-        assert!(
-            backend.cow_host_xid().is_none(),
-            "the overlay window must not stay referenced across a reset"
         );
     }
 

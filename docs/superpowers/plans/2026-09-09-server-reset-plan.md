@@ -169,13 +169,12 @@ Order, per the spec:
    `InputInventory`, interning device-property atoms anew.
 7. `install_backend_root_bindings` (`lib.rs:29`).
 8. Rebind the root window, mark the backend dirty, **clear the scanout**.
-   Decide here on a pre-existing leak surfaced by step 3: a compositor client
-   that disconnects without `ReleaseOverlayWindow` leaves the COW refcount
-   held, because `backend.release_overlay_window` is called only from the
-   protocol handler (`process_request.rs:7232`) and never from disconnect. A
-   reset inherits it. It belongs to this step rather than step 3 because the
-   COW is root-adjacent, and under XDMCP the next session would start with the
-   previous user's overlay still referenced.
+   The leaked COW claim is **not** handled here. Decided 2026-09-09: it needs
+   the structural per-client-resource fix in the spec's "Adjacent gaps", which
+   is a prerequisite for shipping reset rather than a part of it. A bounded
+   decrement loop was written here and rejected — arbitrary cap, and on a
+   teardown failure it carried the old compositor's claim into the next
+   session.
 9. Listeners untouched.
 
 **Proof.** Unit: after a direct call, the new state has empty
