@@ -673,7 +673,19 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   *Reset* — a generation quarantine, not a `ServerState` swap: setup threads,
   reader threads, queued messages, the parked-CRTC maps, both deferred-request
   queues and the telemetry rows all live outside `ServerState` and are cleared
-  or generation-tagged. Only `start_instant` survives a generation literally
+  or generation-tagged. The tag is bound to the **producer**, not read at send
+  time: `CoreSender::bind` is called at accept, the setup thread forwards that
+  binding to its reader thread through `ClientSetupComplete`, and both keep
+  stamping the accepting generation however long after the boundary they wake.
+  The first implementation read the shared counter inside `CoreSender::send`,
+  which had the opposite effect — a producer of the destroyed session that woke
+  after the bump stamped its message with the *new* generation and the
+  dispatcher accepted it, so an old client's `ClientSetupComplete` could still
+  be inserted into the fresh session. Shutting the setup sockets down at the
+  boundary narrows that window but cannot close it: a producer may already hold
+  a fully decoded message. Process-lifetime producers (libinput, signalfd,
+  backend completions) keep the unbound `CoreSender`; their messages dispatch
+  whatever their tag. Only `start_instant` survives a generation literally
   (timestamps must not go backwards); topology and devices are re-seeded from
   the backend and from a new process-lifetime `InputInventory`, which exists
   because `probe_input_devices` is a no-op in Direct mode and libinput's

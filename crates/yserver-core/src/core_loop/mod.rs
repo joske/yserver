@@ -36,4 +36,4 @@ pub use message::{
 };
 pub use reset::ResetPolicy;
 pub use run::{handle_host_input, run_core};
-pub use sender::{CoreReceiver, CoreSender, NOTIFY_TOKEN, channel};
+pub use sender::{BoundSender, CoreReceiver, CoreSender, NOTIFY_TOKEN, channel};

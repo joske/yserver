@@ -1466,6 +1466,7 @@ pub fn run_core(
                             }
                             Message::ClientSetupComplete {
                                 id,
+                                generation,
                                 stream,
                                 resource_id_base,
                                 resource_id_mask,
@@ -1480,6 +1481,7 @@ pub fn run_core(
                                     state,
                                     &mut reset_trigger,
                                     id,
+                                    generation,
                                     stream,
                                     resource_id_base,
                                     resource_id_mask,
@@ -3120,6 +3122,7 @@ fn handle_client_setup_complete(
     state: &mut ServerState,
     reset_trigger: &mut ResetTrigger,
     id: yserver_protocol::x11::ClientId,
+    generation: crate::core_loop::Generation,
     stream: Transport,
     resource_id_base: u32,
     resource_id_mask: u32,
@@ -3173,13 +3176,16 @@ fn handle_client_setup_complete(
     )?;
 
     const BIG_REQUESTS_MAJOR_OPCODE: u8 = 135;
+    // The reader inherits the setup thread's binding rather than
+    // re-reading the counter, so the connection keeps ONE generation
+    // from accept to disconnect.
     crate::core_loop::client_reader::spawn(
         id,
         stream,
         byte_order,
         BIG_REQUESTS_MAJOR_OPCODE,
         reader_control_rx,
-        sender.clone_handle(),
+        sender.bind_to(generation),
     )?;
 
     // The single production site where a client becomes ESTABLISHED, and
@@ -3284,10 +3290,17 @@ fn accept_pending(
         match accepted {
             Ok(stream) => {
                 let id = client_id_allocator.allocate();
+                // Bind the connection's producer HERE, at accept: this
+                // is the moment that decides which session the client
+                // belongs to. Everything it later sends — its setup
+                // thread's messages, and its reader thread's, which
+                // inherit this binding — is tagged with the generation
+                // running now, so a reset retires all of it even if the
+                // thread only wakes up on the far side of the boundary.
                 if let Err(err) = setup_thread::spawn(
                     id,
                     stream,
-                    sender.clone_handle(),
+                    sender.bind(),
                     registry.clone(),
                     auth.clone(),
                     is_local,
@@ -5306,7 +5319,9 @@ mod server_reset {
             poll_tokens::ClientIdAllocator,
             sender::{CoreSender, channel},
         },
+        transport::Transport,
     };
+    use yserver_protocol::x11::{ClientByteOrder, ClientId, RequestHeader, SequenceNumber};
 
     /// Generous: these wait on real threads (setup, reader, core) under a
     /// loaded test binary, and every use is a wait-for-success.
@@ -5340,6 +5355,10 @@ mod server_reset {
         path: PathBuf,
         sender: CoreSender,
         generations: GenerationCounter,
+        /// The loop's own id allocator, shared so a test can learn the
+        /// `ClientId` the next connection will be given. Monotonic, so a
+        /// peek before `establish()` names that client exactly.
+        client_ids: std::sync::Arc<ClientIdAllocator>,
         handle: Option<JoinHandle<std::io::Result<()>>>,
     }
 
@@ -5356,6 +5375,8 @@ mod server_reset {
             let (poll, sender, rx) = channel().expect("channel");
             let generations = rx.generation_counter();
             let sender_for_core = sender.clone_handle();
+            let client_ids = std::sync::Arc::new(ClientIdAllocator::new());
+            let client_ids_for_core = client_ids.clone();
             let handle = std::thread::spawn(move || {
                 let mut state = ServerState::new();
                 let mut backend = RecordingBackend::new();
@@ -5366,7 +5387,7 @@ mod server_reset {
                     &mut state,
                     &mut backend,
                     [Listener::Unix(listener)],
-                    &ClientIdAllocator::new(),
+                    &client_ids_for_core,
                     auth,
                     policy,
                 )
@@ -5375,8 +5396,14 @@ mod server_reset {
                 path,
                 sender,
                 generations,
+                client_ids,
                 handle: Some(handle),
             }
+        }
+
+        /// The id the next accepted connection will get.
+        fn next_client_id(&self) -> ClientId {
+            self.client_ids.peek()
         }
 
         fn with_policy(policy: ResetPolicy) -> Self {
@@ -5689,6 +5716,213 @@ mod server_reset {
         // The new generation serves, and arms again on its own client.
         let peer = server.establish();
         drop(peer);
+        wait_until("the second generation to reset in turn", || {
+            server.generation() == generation_after(2)
+        });
+        server.shutdown().expect("clean shutdown");
+    }
+
+    // -- the generation quarantine: producers bound at creation time ---
+
+    /// Watch a socket for `QUIET` and report whether the server wrote
+    /// **no bytes** to it. Restores the long timeout, so the caller can
+    /// keep using the socket afterwards.
+    ///
+    /// "The far end went away without writing" counts as quiet, and has
+    /// three shapes here: a timeout (nobody holds the other half open),
+    /// `Ok(0)`, and — when the other half is dropped while bytes we sent
+    /// are still unread in its queue, which is exactly what discarding a
+    /// message carrying a `Transport` does — `ECONNRESET`. What must not
+    /// happen is bytes arriving; a caller that also cares whether the
+    /// peer is still *alive* follows this with a `round_trip`.
+    fn stays_quiet(peer: &mut UnixStream) -> bool {
+        peer.set_read_timeout(Some(QUIET)).expect("read timeout");
+        let mut byte = [0_u8; 1];
+        let quiet = match peer.read(&mut byte) {
+            Ok(0) => true,
+            Ok(_) => false,
+            Err(err) => matches!(
+                err.kind(),
+                std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::UnexpectedEof
+            ),
+        };
+        peer.set_read_timeout(Some(TIMEOUT)).expect("read timeout");
+        quiet
+    }
+
+    /// The hole the quarantine exists to close: a producer belonging to
+    /// the destroyed session must not be able to hand the new one a
+    /// client.
+    ///
+    /// `reset_generation` shuts the setup sockets down, which narrows the
+    /// window but does not close it — a setup thread can already hold a
+    /// fully decoded `ClientSetupComplete` and be one instruction away
+    /// from sending it. The producer here stands in for that thread: it
+    /// takes its handle while generation 0 runs, exactly where
+    /// `accept_pending` hands one to `setup_thread::spawn`, and sends
+    /// after the boundary. Tagging at *send* time would stamp it with the
+    /// new generation and let it through.
+    #[test]
+    fn an_old_setup_completion_cannot_create_a_client_in_the_new_generation() {
+        let server = Server::with_policy(ResetPolicy::Reset);
+        // The id the pre-reset client holds — what a real old setup
+        // thread's completion would carry.
+        let doomed = server.next_client_id();
+        let stale = server.sender.bind();
+        let peer = server.establish();
+        assert_eq!(server.generation(), generation_after(0));
+        drop(peer);
+        wait_until("the drained session to reset", || {
+            server.generation() == generation_after(1)
+        });
+
+        let (core_side, mut phantom) = UnixStream::pair().expect("socketpair");
+        stale
+            .send(Message::ClientSetupComplete {
+                id: doomed,
+                generation: stale.generation(),
+                stream: Transport::Unix(core_side),
+                resource_id_base: 0x0020_0000,
+                resource_id_mask: 0x000F_FFFF,
+                byte_order: ClientByteOrder::LittleEndian,
+                is_local: true,
+                fd_passing: true,
+            })
+            .expect("send the stale completion");
+
+        // Accepted, this would insert a `ClientState` and spawn a reader,
+        // and the request below would come back answered.
+        phantom.write_all(&[43, 0, 1, 0]).expect("GetInputFocus");
+        assert!(
+            stays_quiet(&mut phantom),
+            "a client authorized in the destroyed session must not be served by the new one"
+        );
+        // Nor may it arm the fresh generation: an accepted completion
+        // calls `note_client_established`, and the phantom's own
+        // departure would then reset a session it was never part of.
+        drop(phantom);
+        std::thread::sleep(QUIET);
+        assert_eq!(
+            server.generation(),
+            generation_after(1),
+            "the phantom must not arm — and then drain — the new generation"
+        );
+        server.shutdown().expect("clean shutdown");
+    }
+
+    /// The reader-thread half: a `Request` produced by a retired reader
+    /// must not execute against the new session.
+    ///
+    /// It names a client of the *new* session deliberately. The loop
+    /// already drops a request whose client is unknown
+    /// (`process_request_inline`'s post-disconnect guard), so an old id
+    /// would pass whether or not the generation filter works, and the
+    /// test would prove nothing. The reply landing on a live client's
+    /// socket is the sharpest observable there is.
+    #[test]
+    fn an_old_generation_request_is_not_executed_in_the_new_session() {
+        let server = Server::with_policy(ResetPolicy::Reset);
+        let stale = server.sender.bind();
+        let peer = server.establish();
+        drop(peer);
+        wait_until("the drained session to reset", || {
+            server.generation() == generation_after(1)
+        });
+
+        let live_id = server.next_client_id();
+        let mut live = server.establish();
+
+        stale
+            .send(Message::Request {
+                id: live_id,
+                sequence: SequenceNumber(0x4242),
+                accepted_at: None,
+                header: RequestHeader {
+                    opcode: 43, // GetInputFocus — always replies
+                    data: 0,
+                    length_units: 1,
+                },
+                body: Vec::new(),
+                attached_fd: None,
+            })
+            .expect("send the stale request");
+
+        assert!(
+            stays_quiet(&mut live),
+            "a request tagged by a retired producer must not be executed"
+        );
+        // Quiet because the request was discarded, not because the
+        // client is broken.
+        round_trip(&mut live);
+        assert_eq!(server.generation(), generation_after(1));
+        drop(live);
+        server.shutdown().expect("clean shutdown");
+    }
+
+    /// The other message a retired reader can still emit. Accepted, it
+    /// runs `disconnect_with_pending_cleanup` against the new session —
+    /// which under `-reset` drains it and resets a generation that was
+    /// serving a live client.
+    #[test]
+    fn an_old_generation_disconnect_cannot_tear_down_a_new_session_client() {
+        let server = Server::with_policy(ResetPolicy::Reset);
+        let stale = server.sender.bind();
+        let peer = server.establish();
+        drop(peer);
+        wait_until("the drained session to reset", || {
+            server.generation() == generation_after(1)
+        });
+
+        let live_id = server.next_client_id();
+        let mut live = server.establish();
+
+        stale
+            .send(Message::ClientDisconnected {
+                id: live_id,
+                reason: std::io::Error::other("retired reader"),
+            })
+            .expect("send the stale disconnect");
+
+        std::thread::sleep(QUIET);
+        assert_eq!(
+            server.generation(),
+            generation_after(1),
+            "a retired producer must not be able to drain the new session"
+        );
+        round_trip(&mut live);
+
+        // The real departure still works, so the filter did not wedge
+        // the trigger.
+        drop(live);
+        wait_until("the live client's own departure to reset", || {
+            server.generation() == generation_after(2)
+        });
+        server.shutdown().expect("clean shutdown");
+    }
+
+    /// The other half of binding at accept: a connection accepted *after*
+    /// the boundary gets a producer bound to the new generation, so
+    /// nothing it sends is stale. Both its setup thread and its reader
+    /// thread have to pass the filter for `establish` (which ends in a
+    /// `GetInputFocus` round-trip) to return at all.
+    #[test]
+    fn a_connection_accepted_after_a_reset_is_served_normally() {
+        let server = Server::with_policy(ResetPolicy::Reset);
+        let peer = server.establish();
+        drop(peer);
+        wait_until("the drained session to reset", || {
+            server.generation() == generation_after(1)
+        });
+
+        let mut fresh = server.establish();
+        for _ in 0..3 {
+            round_trip(&mut fresh);
+        }
+        assert_eq!(server.generation(), generation_after(1));
+        drop(fresh);
         wait_until("the second generation to reset in turn", || {
             server.generation() == generation_after(2)
         });

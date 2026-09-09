@@ -36,7 +36,7 @@ use crate::{
     core_loop::{
         auth::{AuthState, AuthTransport, AuthVerdict},
         message::{Message, SetupAllocateResponse},
-        sender::CoreSender,
+        sender::BoundSender,
     },
     resources::{ARGB_VISUAL, ROOT_COLORMAP, ROOT_VISUAL, ROOT_WINDOW},
     transport::Transport,
@@ -57,10 +57,19 @@ pub fn make_registry() -> SetupRegistry {
 /// synchronously, before the thread starts, so a shutdown that races
 /// the spawn cannot miss it. Locality and fd capability come from the
 /// accepting listener and survive the setup handoff to `ClientState`.
+///
+/// `sender` must be bound to the generation running at **accept** (see
+/// [`CoreSender::bind`]). A setup thread outlives the session boundary
+/// in the worst case — `reset_generation` shuts its socket down, but it
+/// may already hold a decoded `ClientSetupComplete` — so its tag has to
+/// name the session the connection belongs to, not the one running when
+/// it happens to wake.
+///
+/// [`CoreSender::bind`]: crate::core_loop::sender::CoreSender::bind
 pub fn spawn(
     id: ClientId,
     stream: impl Into<Transport>,
-    sender: CoreSender,
+    sender: BoundSender,
     registry: SetupRegistry,
     auth: Arc<AuthState>,
     is_local: bool,
@@ -129,7 +138,7 @@ impl Drop for SetupGuard {
 fn run_setup(
     id: ClientId,
     mut stream: Transport,
-    sender: &CoreSender,
+    sender: &BoundSender,
     auth: &AuthState,
     is_local: bool,
     fd_passing: bool,
@@ -251,6 +260,9 @@ fn run_setup(
 
     sender.send(Message::ClientSetupComplete {
         id,
+        // The connection's generation, fixed at accept — handed on so
+        // the reader thread the core spawns for this client inherits it.
+        generation: sender.generation(),
         stream,
         resource_id_base: resp.resource_id_base,
         resource_id_mask: resp.resource_id_mask,
@@ -284,7 +296,7 @@ mod tests {
         spawn(
             ClientId(1),
             Transport::Tcp(stream),
-            sender,
+            sender.bind(),
             registry.clone(),
             AuthState::new(None),
             false,
@@ -354,7 +366,7 @@ mod tests {
         spawn(
             id,
             server_side,
-            sender,
+            sender.bind(),
             registry.clone(),
             AuthState::new(None),
             true,
@@ -440,7 +452,7 @@ mod tests {
         spawn(
             id,
             server_side,
-            sender,
+            sender.bind(),
             registry.clone(),
             AuthState::new(None),
             true,
@@ -504,7 +516,7 @@ mod tests {
         spawn(
             id,
             server_side,
-            sender,
+            sender.bind(),
             registry.clone(),
             AuthState::new(None),
             true,
@@ -541,7 +553,7 @@ mod tests {
         spawn(
             id,
             server_side,
-            sender,
+            sender.bind(),
             registry.clone(),
             AuthState::new(None),
             true,
@@ -658,7 +670,7 @@ mod tests {
         spawn(
             ClientId(1),
             server_side,
-            sender,
+            sender.bind(),
             registry.clone(),
             AuthState::new(Some(path.clone())),
             true,
@@ -686,7 +698,7 @@ mod tests {
         spawn(
             ClientId(2),
             server_side,
-            sender,
+            sender.bind(),
             registry.clone(),
             AuthState::new(Some(path.clone())),
             true,
