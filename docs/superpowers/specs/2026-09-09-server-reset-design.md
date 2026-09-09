@@ -419,6 +419,14 @@ how the server is actually started today.
 
 ## Adjacent gaps, not in scope
 
+- **`KillClient` on another client's resource leaks that client's parked CRTC
+  token.** `process_request.rs:22458` calls `process_disconnect` inline rather
+  than going through `disconnect_with_pending_cleanup`, so
+  `pending.take_client_crtc` / `backend.cancel_crtc_config` never run. Found
+  while auditing every client-removal path for the reset trigger; pre-existing
+  and unrelated to reset, but it is the only departure that bypasses the
+  funnel, so anything else added to that funnel later will miss it too.
+
 - **The composite-overlay claim is not a per-client resource, and that must be
   fixed BEFORE reset ships.** `GetOverlayWindow` increments an anonymous
   backend counter (`core.cow_refcount`); nothing decrements it when the
