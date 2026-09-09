@@ -138,14 +138,32 @@ session whose cookie has just been cleared.
 `Accept` carries **two** credential pairs, and they are checked separately
 (`recv_accept_msg`, `xdmcp.c:1168`):
 
-**1. `AcceptAuthenticationName` / `Data` must be EMPTY.** We advertise no
-authentication, because XDM-AUTHENTICATION-1 is a non-goal. A non-empty
-authentication field means the manager selected a mode we do not implement, and
-accepting it would silently bypass the very authentication the manager chose.
-Xorg validates this through `XdmcpCheckAuthentication(..., ACCEPT)` and, on
-failure, calls `XdmcpFatal("Authentication Failure", ...)` — fatal, not a
-retry. **Match that**: refuse to run rather than proceed under an
-authentication mode we cannot honour.
+**1. `AcceptAuthenticationName` must be EMPTY; its `Data` is ignored.** We
+advertise no authentication, because XDM-AUTHENTICATION-1 is a non-goal. A
+non-empty *name* means the manager selected a mode we do not implement, and
+accepting it would silently bypass the authentication the manager chose. Xorg
+validates through `XdmcpCheckAuthentication(..., ACCEPT)` and, on failure,
+calls `XdmcpFatal("Authentication Failure", ...)` — **fatal, not a retry**.
+Match that: refuse to run rather than proceed under a mode we cannot honour.
+
+Be precise about the *data*, though, because the obvious stricter reading is
+wrong:
+
+```c
+return (XdmcpARRAY8Equal(Name, AuthenticationName) &&
+        (AuthenticationName->length == 0 ||
+         (*AuthenticationFuncs->Validator)(AuthenticationData, Data, packet_type)));
+```
+
+With our configured name empty, the `length == 0` short-circuit means the
+accompanying data is **never examined** — so Xorg accepts an empty name with
+non-empty data. We do the same, and log the stray data at debug rather than
+refusing it. An earlier draft of this spec required both to be empty; that is
+a divergence with nothing forcing it, and unlike the authorization case below
+(where Xorg's fallback needs a host ACL we do not have) there is no gain to
+weigh against the risk: with no authentication mode selected the data is inert
+and we would never interpret it, while refusing it could break a manager that
+sends stray bytes — in the exact deployment this stage targets.
 
 **2. `AcceptAuthorizationName` must be `MIT-MAGIC-COOKIE-1`**, with well-formed
 data. That is the only name our runtime auth layer recognises
@@ -295,9 +313,12 @@ would imply an authentication mode we do not implement.
 - `-once`, both cases: the server exits at session end, **and** exits on
   retransmission exhaustion during a negotiation that never established a
   session — the second is the one a happy-path suite skips.
-- `Accept` rejection: an authorization name other than `MIT-MAGIC-COOKIE-1`,
-  and a malformed/empty cookie, each leave the state machine out of the
-  session with no credential installed. Include these as protocol vectors.
+- `Accept` rejection, as protocol vectors: an authorization name other than
+  `MIT-MAGIC-COOKIE-1`, and a malformed/empty cookie, each leave the state
+  machine in `AWAIT_REQUEST_RESPONSE` with no credential installed. A
+  **non-empty authentication name** is fatal. And the fidelity case that is
+  easy to get backwards: an **empty authentication name with non-empty data is
+  ACCEPTED**, matching `XdmcpCheckAuthentication`'s short-circuit.
 - No XDMCP option ⇒ byte-identical behaviour to today.
 
 ## Adjacent gaps, not in scope
