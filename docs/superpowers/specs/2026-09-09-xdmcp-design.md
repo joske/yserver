@@ -165,9 +165,19 @@ weigh against the risk: with no authentication mode selected the data is inert
 and we would never interpret it, while refusing it could break a manager that
 sends stray bytes — in the exact deployment this stage targets.
 
-**2. `AcceptAuthorizationName` must be `MIT-MAGIC-COOKIE-1`**, with well-formed
-data. That is the only name our runtime auth layer recognises
+**2. `AcceptAuthorizationName` must be `MIT-MAGIC-COOKIE-1`**, with **non-empty
+opaque data**. That is the only name our runtime auth layer recognises
 (`auth.rs:150`).
+
+"Opaque" is the whole policy: no length requirement, because neither layer has
+one. Xorg's `MitAddCookie` (`os/mitauth.c:51`) `memcpy`s whatever length it is
+given, and our `ct_eq` compares length then bytes. Do not invent a 16-byte
+rule; the conventional size is a property of `mcookie`, not of the protocol.
+
+Non-empty, however, is load-bearing rather than tidiness. `ct_eq(&[], &[])`
+returns **true** (`auth.rs:342`'s own test asserts it), so installing an empty
+cookie would create a credential that any client presenting an empty cookie
+matches — an open display dressed as an authenticated one.
 
 **Here we diverge from Xorg deliberately.** When `XdmcpAddAuthorization` fails,
 Xorg does *not* abandon the offer: it calls `AddLocalHosts()` and proceeds to
@@ -314,7 +324,7 @@ would imply an authentication mode we do not implement.
   retransmission exhaustion during a negotiation that never established a
   session — the second is the one a happy-path suite skips.
 - `Accept` rejection, as protocol vectors: an authorization name other than
-  `MIT-MAGIC-COOKIE-1`, and a malformed/empty cookie, each leave the state
+  `MIT-MAGIC-COOKIE-1`, and an **empty** cookie, each leave the state
   machine in `AWAIT_REQUEST_RESPONSE` with no credential installed. A
   **non-empty authentication name** is fatal. And the fidelity case that is
   easy to get backwards: an **empty authentication name with non-empty data is
