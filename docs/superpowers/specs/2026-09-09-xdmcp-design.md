@@ -194,11 +194,16 @@ this arrives in `AWAIT_REQUEST_RESPONSE`:
 
 **Stay in `AWAIT_REQUEST_RESPONSE` and let the retry timer drive.** Do not jump
 back to `START_CONNECTION` and immediately resend `Request`. This is
-Xorg-faithful — a malformed or short `Accept` falls through `recv_accept_msg`
-without touching `state`, so retransmission handles it — and it is the bounded
-choice: an immediate resend against a manager that keeps answering badly is a
-tight loop, whereas the retry path backs off and terminates at the
-retransmission limit via `XdmcpDeadSession` (or exits, under `-once`).
+Xorg-faithful: a malformed or short `Accept` falls through `recv_accept_msg`
+without touching `state`, so retransmission handles it.
+
+⚠ **The "and therefore it is bounded" half of this argument is WRONG, found in
+implementation.** `receive_packet` sets `timeOutRtx = 0` at `xdmcp.c:729` —
+*before* `XdmcpReadHeader` and before the version check. **Any** datagram
+resets the retransmission counter, including garbage, a wrong version, or an
+unknown opcode. So the retry limit is only reachable against a **silent**
+manager; one that keeps answering badly holds the counter at zero forever, and
+`XdmcpDeadSession` is never reached. See "Two Xorg behaviours to decide on".
 
 Any provisional cookie from the rejected offer is cleared regardless.
 
@@ -263,6 +268,37 @@ Xorg's `:252-312`. `-cookie` (the XDM-AUTHENTICATION-1 key) is parsed and
 rejected with a clear message rather than silently ignored, since accepting it
 would imply an authentication mode we do not implement.
 
+## Two Xorg behaviours to decide on before the socket exists
+
+Both found by reading the handlers during step 2, neither mentioned anywhere
+above until now. **Nothing is exposed yet** — no socket is wired until plan
+step 6 — but both need a decision before one is.
+
+**1. `Unwilling` is fatal in every state, and its status field is never read.**
+`receive_packet`'s `case UNWILLING:` (`xdmcp.c:741`) calls `XdmcpFatal` with a
+canned message, with no state guard and no length check. So an unsolicited
+`Unwilling` datagram kills a **live** session — from anyone who can reach the
+port, at any time.
+
+Recommended divergence: gate it on the collect states, where we are actually
+awaiting a `Willing`. In `RunSession` ignore it, exactly as `Refuse` is
+ignored there (`xdmcp.c:1264`). Costs no functionality; removes a remote kill.
+
+**2. Any datagram resets the retransmission counter.** `timeOutRtx = 0` at
+`xdmcp.c:729` runs before the header is even parsed, so the backoff and the
+retry limit are defeated by *any* inbound traffic.
+
+Recommended divergence: reset the counter only on a datagram that decodes,
+carries the right version, and is relevant to the current state. Otherwise the
+retransmission limit — which this spec relies on as the bound on a
+misbehaving manager, and which `-once` relies on to terminate — is unreachable
+whenever anyone is sending us packets.
+
+Both are cases where Xorg's behaviour looks like an oversight rather than a
+decision, and where XDMCP's "assume a trusted network" premise is doing more
+work than it should. Faithful implementations of both are in the state machine
+already, so switching to either divergence is a small, local change.
+
 ## Invariants
 
 1. A session's cookie authorizes only that session — enforced by generation
@@ -302,7 +338,7 @@ would imply an authentication mode we do not implement.
 
 ## Verification
 
-- Unit: packet encode/decode round-trips for all nine message types against
+- Unit: packet encode/decode round-trips for all thirteen message types against
   byte vectors taken from the protocol spec, **not** from our own encoder —
   a self-consistent codec that is wrong on the wire passes every round-trip
   test. State-machine transitions including `Unwilling`, `Decline`, `Refuse`
