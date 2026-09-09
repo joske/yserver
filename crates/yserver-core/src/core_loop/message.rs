@@ -170,6 +170,23 @@ pub enum Message {
     CrtcConfigReady,
     /// signalfd readable.
     Shutdown,
+    /// SIGHUP under a policy other than `-noreset` → cross the
+    /// generation boundary instead of shutting down (the server-reset
+    /// design's "Flags and signals": *`SIGHUP` — force a reset
+    /// regardless*).
+    ///
+    /// The policy gate lives at the *sender*: under `-noreset` the
+    /// signal thread keeps sending `Shutdown`, so a default server's
+    /// SIGHUP behaviour is byte-identical to today and this variant is
+    /// never produced. Xorg resets unconditionally
+    /// (`AutoResetServer`, `os/utils.c:407`); we deliberately do not,
+    /// because adopting that would make SIGHUP destroy a default
+    /// server's session where today it stops it cleanly.
+    ///
+    /// Process-lifetime, not session-scoped: an operator's request must
+    /// never be discarded because it happened to be tagged with the
+    /// generation that a reset just retired.
+    ResetRequested,
     /// SIGUSR1 → release the VT on direct-mode backends. Ignored when the
     /// backend has not armed VT switching: there is no switch to service,
     /// and this is *not* a diagnostic-dump path (see `DumpScanout`).

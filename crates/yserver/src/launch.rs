@@ -16,6 +16,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use yserver_core::core_loop::ResetPolicy;
+
 /// Display yserver uses when neither an explicit display nor `-displayfd`
 /// is given. 7 avoids clashing with a real Xorg on `:0` (existing
 /// convention).
@@ -46,6 +48,10 @@ pub struct LaunchOptions {
     pub show_version: bool,
     /// `-layout NAME` — XKB layout for the startup keymap (Xorg-style).
     pub layout: Option<String>,
+    /// What happens when the last established client disconnects:
+    /// `-noreset` (the default), `-reset` or `-terminate`. Ordered and
+    /// last-wins, like `-listen`/`-nolisten`.
+    pub reset_policy: ResetPolicy,
 }
 
 fn next_value(it: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
@@ -96,6 +102,19 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchOption
             if it.next().is_none() {
                 log::warn!("yserver: {arg} given without a value; ignoring");
             }
+        } else if matches!(arg.as_str(), "-noreset" | "-reset" | "-terminate") {
+            // Server-reset policy. Xorg mutates one
+            // `dispatchExceptionAtReset` as it scans argv
+            // (`dix/dispatch.c:3480`), so the LAST of the three wins —
+            // the same last-wins rule as `-listen`/`-nolisten` above.
+            // Our default inverts Xorg's: `-noreset` unless asked
+            // otherwise, because `starty` and the `just *-hw` recipes
+            // launch the server expecting it to outlive its clients.
+            o.reset_policy = match arg.as_str() {
+                "-reset" => ResetPolicy::Reset,
+                "-terminate" => ResetPolicy::Terminate,
+                _ => ResetPolicy::NoReset,
+            };
         } else if arg == "-novtswitch" {
             // Known no-arg no-op (lightdm passes it).
         } else if matches!(arg.as_str(), "--version" | "-version") {
@@ -604,6 +623,81 @@ mod tests {
         assert_ne!(enabled, bare);
         assert_eq!(enabled_then_disabled, bare);
         assert_eq!(disabled_then_enabled, enabled);
+    }
+
+    #[test]
+    fn the_reset_policy_defaults_to_noreset() {
+        // The inversion of Xorg's default, and the one that keeps
+        // `starty` and every `just *-hw` recipe behaving as before.
+        assert_eq!(parse(&[]).unwrap().reset_policy, ResetPolicy::NoReset);
+        assert_eq!(
+            parse(&[":1", "-nolisten", "tcp"]).unwrap().reset_policy,
+            ResetPolicy::NoReset
+        );
+    }
+
+    #[test]
+    fn reset_policy_arguments_are_parsed() {
+        assert_eq!(
+            parse(&["-noreset"]).unwrap().reset_policy,
+            ResetPolicy::NoReset
+        );
+        assert_eq!(parse(&["-reset"]).unwrap().reset_policy, ResetPolicy::Reset);
+        assert_eq!(
+            parse(&["-terminate"]).unwrap().reset_policy,
+            ResetPolicy::Terminate
+        );
+    }
+
+    #[test]
+    fn reset_policy_arguments_are_ordered_and_last_wins() {
+        // Xorg mutates one `dispatchExceptionAtReset` as it scans argv,
+        // so the last of the three wins — the same rule as
+        // `-listen`/`-nolisten`.
+        for (argv, expected) in [
+            (vec!["-reset", "-noreset"], ResetPolicy::NoReset),
+            (vec!["-noreset", "-reset"], ResetPolicy::Reset),
+            (vec!["-reset", "-terminate"], ResetPolicy::Terminate),
+            (vec!["-terminate", "-reset"], ResetPolicy::Reset),
+            (vec!["-terminate", "-noreset"], ResetPolicy::NoReset),
+            (
+                vec!["-reset", "-terminate", "-noreset", "-reset"],
+                ResetPolicy::Reset,
+            ),
+        ] {
+            assert_eq!(
+                parse(&argv).unwrap().reset_policy,
+                expected,
+                "argv {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reset_policy_arguments_take_no_value() {
+        // `-reset` is a bare flag: the token after it must still be
+        // parsed. A value-consuming parse would swallow the display.
+        let o = parse(&["-reset", ":9"]).unwrap();
+        assert_eq!(o.reset_policy, ResetPolicy::Reset);
+        assert_eq!(o.display, Some(9));
+    }
+
+    #[test]
+    fn reset_policy_arguments_do_not_disturb_the_value_taking_no_ops() {
+        // `-config`/`-background` swallow their value; a `-reset` in the
+        // value position would be consumed by them, exactly as it is by
+        // Xorg's parser.
+        let o = parse(&[
+            "-config",
+            "xorg.conf",
+            "-reset",
+            "-background",
+            "none",
+            ":2",
+        ])
+        .unwrap();
+        assert_eq!(o.reset_policy, ResetPolicy::Reset);
+        assert_eq!(o.display, Some(2));
     }
 
     #[test]

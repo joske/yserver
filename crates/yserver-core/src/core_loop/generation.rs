@@ -71,6 +71,7 @@ pub(crate) fn is_session_scoped(message: &Message) -> bool {
         Message::HostInput(_)
         | Message::CrtcConfigReady
         | Message::Shutdown
+        | Message::ResetRequested
         | Message::VtRelease
         | Message::VtAcquire
         | Message::SwitchVt(_)
@@ -149,6 +150,21 @@ mod tests {
     }
 
     #[test]
+    fn reset_request_tagged_with_an_old_generation_is_still_dispatched() {
+        // SIGHUP is process-lifetime: an operator's reset request must
+        // never be dropped because a reset retired the generation it
+        // was tagged with. (Server-reset plan, step 5.)
+        let old = Generation::default();
+        let current = GenerationCounter::new();
+        current.bump();
+        assert!(should_dispatch(
+            current.current(),
+            old,
+            &Message::ResetRequested
+        ));
+    }
+
+    #[test]
     fn device_removed_tagged_with_an_old_generation_is_still_dispatched() {
         // The important one: discarding this would corrupt
         // `InputInventory` permanently, since the device is gone and no
@@ -168,6 +184,7 @@ mod tests {
         let counter = GenerationCounter::new();
         let messages = [
             Message::Shutdown,
+            Message::ResetRequested,
             Message::CrtcConfigReady,
             Message::VtRelease,
             Message::VtAcquire,
