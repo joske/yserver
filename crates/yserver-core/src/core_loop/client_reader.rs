@@ -116,9 +116,6 @@ fn run(
     control_rx: Receiver<ReaderControl>,
     sender: &CoreSender,
 ) -> io::Result<()> {
-    let Transport::Unix(stream) = stream else {
-        unreachable!("TCP reader support lands with transport-aware FdReader");
-    };
     let mut reader = BlockingFdReader::new(FdReader::new(stream));
     let mut big = false;
     let mut sequence: u16 = 0;
@@ -344,6 +341,7 @@ mod tests {
     use crossbeam_channel::unbounded;
     use std::{
         io::Write,
+        net::{TcpListener, TcpStream},
         os::unix::net::UnixStream,
         time::{Duration, Instant},
     };
@@ -359,7 +357,7 @@ mod tests {
         None
     }
 
-    fn write_request_no_body(s: &mut UnixStream, opcode: u8, minor: u8, length_units: u16) {
+    fn write_request_no_body(s: &mut impl Write, opcode: u8, minor: u8, length_units: u16) {
         // 4-byte header: opcode | minor | length_lo | length_hi
         let buf = [
             opcode,
@@ -370,11 +368,19 @@ mod tests {
         s.write_all(&buf).unwrap();
     }
 
-    fn write_big_request(s: &mut UnixStream, opcode: u8, minor: u8, length_units: u32) {
+    fn write_big_request(s: &mut impl Write, opcode: u8, minor: u8, length_units: u32) {
         // length_units==0 in 16-bit field, then full 32-bit length.
         let buf = [opcode, minor, 0, 0];
         s.write_all(&buf).unwrap();
         s.write_all(&length_units.to_le_bytes()).unwrap();
+    }
+
+    fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback TCP listener");
+        let address = listener.local_addr().expect("loopback listener address");
+        let client = TcpStream::connect(address).expect("connect loopback TCP client");
+        let (server, _) = listener.accept().expect("accept loopback TCP client");
+        (server, client)
     }
 
     const BIG_MAJOR: u8 = 135;
@@ -449,6 +455,37 @@ mod tests {
             recv_with_timeout(&rx, Duration::from_millis(50)).is_none(),
             "one returned credit must not admit multiple requests"
         );
+        ctrl_tx.send(ReaderControl::Shutdown).unwrap();
+    }
+
+    #[test]
+    fn reader_accepts_tcp_request_without_an_attached_fd() {
+        let (poll, sender, rx) = channel().unwrap();
+        let _ = poll;
+        let (server_side, mut client_side) = tcp_pair();
+        let (ctrl_tx, ctrl_rx) = unbounded::<ReaderControl>();
+
+        spawn(
+            ClientId(98),
+            Transport::Tcp(server_side),
+            ClientByteOrder::LittleEndian,
+            BIG_MAJOR,
+            ctrl_rx,
+            sender,
+        )
+        .unwrap();
+
+        write_request_no_body(&mut client_side, 42, 0, 1);
+        let message =
+            recv_with_timeout(&rx, Duration::from_secs(2)).expect("TCP request reaches the core");
+        assert!(matches!(
+            message,
+            Message::Request {
+                header,
+                attached_fd: None,
+                ..
+            } if header.opcode == 42
+        ));
         ctrl_tx.send(ReaderControl::Shutdown).unwrap();
     }
 

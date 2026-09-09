@@ -9,11 +9,14 @@ use std::{
     collections::VecDeque,
     io,
     mem::MaybeUninit,
+    net::TcpStream,
     os::{
         fd::{AsRawFd, RawFd},
         unix::net::UnixStream,
     },
 };
+
+use crate::transport::Transport;
 
 /// Read up to `buf.len()` bytes from `stream` and collect any file
 /// descriptors that arrived via `SCM_RIGHTS` in the same message. Returns
@@ -110,7 +113,7 @@ pub fn send_with_fd(stream: &mut UnixStream, bytes: &[u8], fd: RawFd) -> io::Res
 /// so any file descriptors that arrive via `SCM_RIGHTS` are queued for
 /// later retrieval. The X11 dispatcher uses this to pull the FD that
 /// accompanies a `MIT-SHM AttachFd` request.
-pub struct FdReader {
+pub(crate) struct UnixFdReader {
     stream: UnixStream,
     /// Bytes received but not yet handed out via `Read`.
     buf: Vec<u8>,
@@ -120,8 +123,8 @@ pub struct FdReader {
     fds: VecDeque<RawFd>,
 }
 
-impl FdReader {
-    pub fn new(stream: UnixStream) -> Self {
+impl UnixFdReader {
+    fn new(stream: UnixStream) -> Self {
         Self {
             stream,
             buf: Vec::with_capacity(4096),
@@ -131,14 +134,14 @@ impl FdReader {
     }
 
     /// Pop the next received FD, if any.
-    pub fn pop_fd(&mut self) -> Option<RawFd> {
+    fn pop_fd(&mut self) -> Option<RawFd> {
         self.fds.pop_front()
     }
 
     fn fill(&mut self) -> io::Result<()> {
         debug_assert!(
             self.pos == self.buf.len(),
-            "FdReader::fill called with bytes still buffered",
+            "UnixFdReader::fill called with bytes still buffered",
         );
         self.buf.clear();
         self.buf.resize(4096, 0);
@@ -169,15 +172,9 @@ impl FdReader {
             }
         }
     }
-
-    /// Raw fd backing this reader. Useful for `poll(2)` waits in the
-    /// reader-thread WouldBlock retry loop.
-    pub fn fd(&self) -> RawFd {
-        self.stream.as_raw_fd()
-    }
 }
 
-impl io::Read for FdReader {
+impl io::Read for UnixFdReader {
     fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
         if self.pos == self.buf.len() {
             self.fill()?;
@@ -190,13 +187,67 @@ impl io::Read for FdReader {
     }
 }
 
+/// Reader for client ingress. Unix connections retain their `SCM_RIGHTS`
+/// receive queue; TCP connections are ordinary byte streams and therefore
+/// cannot hold received file descriptors.
+pub(crate) enum FdReader {
+    Unix(UnixFdReader),
+    Tcp(TcpStream),
+}
+
+impl FdReader {
+    pub fn new(stream: Transport) -> Self {
+        match stream {
+            Transport::Unix(stream) => Self::Unix(UnixFdReader::new(stream)),
+            Transport::Tcp(stream) => Self::Tcp(stream),
+        }
+    }
+
+    /// Pop the next descriptor received on a Unix connection. TCP has no
+    /// descriptor-passing mechanism and always returns `None`.
+    pub fn pop_fd(&mut self) -> Option<RawFd> {
+        match self {
+            Self::Unix(reader) => reader.pop_fd(),
+            Self::Tcp(_) => None,
+        }
+    }
+
+    /// Raw fd backing this reader. Useful for `poll(2)` waits in the
+    /// reader-thread WouldBlock retry loop.
+    pub fn fd(&self) -> RawFd {
+        match self {
+            Self::Unix(reader) => reader.stream.as_raw_fd(),
+            Self::Tcp(stream) => stream.as_raw_fd(),
+        }
+    }
+}
+
+impl io::Read for FdReader {
+    fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Unix(reader) => reader.read(dst),
+            Self::Tcp(stream) => stream.read(dst),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{recv_with_fds, send_with_fd};
+    use super::{FdReader, recv_with_fds, send_with_fd};
+    use crate::transport::Transport;
     use std::{
         io::Write,
+        net::{TcpListener, TcpStream},
         os::{fd::AsRawFd, unix::net::UnixStream},
     };
+
+    fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback TCP listener");
+        let address = listener.local_addr().expect("loopback listener address");
+        let client = TcpStream::connect(address).expect("connect loopback TCP client");
+        let (server, _) = listener.accept().expect("accept loopback TCP client");
+        (server, client)
+    }
 
     #[test]
     fn round_trips_a_file_descriptor_through_a_unix_socket() {
@@ -244,7 +295,6 @@ mod tests {
 
     #[test]
     fn fd_reader_yields_bytes_via_read_and_makes_fds_available() {
-        use super::FdReader;
         use std::io::Read;
 
         let (mut tx, rx) = UnixStream::pair().expect("socketpair");
@@ -261,7 +311,7 @@ mod tests {
         tx.write_all(b"trailing").expect("write");
         drop(tx);
 
-        let mut reader = FdReader::new(rx);
+        let mut reader = FdReader::new(Transport::Unix(rx));
         let mut buf = [0u8; 5];
         reader.read_exact(&mut buf).expect("first chunk");
         assert_eq!(&buf, b"hello");
@@ -286,5 +336,27 @@ mod tests {
         assert_eq!(got, "ok");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fd_reader_reads_tcp_bytes_without_file_descriptors() {
+        use std::io::Read;
+
+        let (server, mut client) = tcp_pair();
+        client.write_all(b"tcp payload").expect("write TCP payload");
+
+        let mut reader = FdReader::new(Transport::Tcp(server));
+        assert!(
+            matches!(reader, FdReader::Tcp(_)),
+            "TCP has its own reader variant"
+        );
+
+        let mut bytes = [0; 11];
+        reader.read_exact(&mut bytes).expect("read TCP payload");
+        assert_eq!(&bytes, b"tcp payload");
+        assert!(
+            reader.pop_fd().is_none(),
+            "TCP cannot receive SCM_RIGHTS fds"
+        );
     }
 }
