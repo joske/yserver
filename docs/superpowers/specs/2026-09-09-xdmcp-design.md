@@ -65,8 +65,11 @@ state = XDM_INIT_STATE;                              /* back to Query */
 dispatchException |= (OneSession ? DE_TERMINATE : DE_RESET);
 ```
 
-So one XDMCP session is exactly one server generation, and `-once` means
-terminate instead of looping.
+So an established session always ends at a generation boundary, and `-once`
+means terminate instead of looping. Note the converse does **not** hold: the
+generic retransmission limit (`:826`) calls `XdmcpDeadSession` regardless of
+state, so a negotiation that never reached a session can reset a generation
+too. See invariant 2 — "one session = one generation" is too strong.
 
 ## Design
 
@@ -86,15 +89,15 @@ Required: a second, in-memory cookie source alongside the file one, which
 `check` consults identically. Two properties matter, and they pull in opposite
 directions from the file source:
 
-- **It is per-session.** The manager issues a new cookie for each session, so
-  the in-memory cookie must be **replaced** on each `Accept` and **cleared**
-  when the session ends. A cookie from the previous user's session authorizing
-  a client in the next one is the same class of leak stage 3 exists to prevent.
+- **It is per-offer, not merely per-process.** The manager issues a new cookie
+  with each `Accept`. A cookie from the previous user's session authorizing a
+  client in the next one is the same class of leak stage 3 exists to prevent.
 - **`AuthState` deliberately survives a reset.** It sits outside `ServerState`
   as an `Arc`, and the reset spec keeps it that way because the *file* cookie
-  is process-lifetime. So the XDMCP cookie cannot simply live in `AuthState`
-  and be forgotten with the state — clearing it has to be explicit at the
-  generation boundary.
+  is process-lifetime. So the XDMCP cookie cannot be forgotten along with the
+  state — its invalidation has to come from somewhere else. That is what the
+  generation binding below provides, *without* an explicit clear at the reset
+  boundary.
 
 **Decided: generation-bound, and cleared on abandonment.** Not an explicit
 reset-time clear alone — that is a call which can be missed or raced.
@@ -113,6 +116,22 @@ abandoned with no generation change. `recv_refuse_msg` (`xdmcp.c:1264`) takes
 Accept brings a different one. So the cookie belongs to **the accepted offer**,
 not merely to the generation: clear or replace it on every path that leaves
 `AWAIT_MANAGE_RESPONSE` without a running session.
+
+To be exact about the division of labour, because it is the whole point of
+this design:
+
+| How an offer dies | What invalidates the cookie |
+|---|---|
+| reset / new generation | the bound-generation **mismatch** — no clear call, nothing to miss or race |
+| abandoned in the same generation (`Refuse`, and any other exit from `AWAIT_MANAGE_RESPONSE` without a session) | an **explicit** clear/replace, because no generation changed |
+
+**Once the session is running, a late `Refuse` must not clear anything.**
+Xorg's `recv_refuse_msg` returns immediately unless
+`state == XDM_AWAIT_MANAGE_RESPONSE` (`xdmcp.c:1264`), so a stray or delayed
+refusal cannot disturb a live session. Our equivalent must be serialised
+against the TCP setup that takes the state to `RUN_SESSION`: an authenticated
+setup arriving concurrently with a `Refuse` must not end with a running
+session whose cookie has just been cleared.
 
 ### The stage-1 contradiction, and how it resolves
 
