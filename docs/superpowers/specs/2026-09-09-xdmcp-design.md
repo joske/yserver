@@ -135,23 +135,47 @@ session whose cookie has just been cleared.
 
 ### What counts as an acceptable `Accept`
 
-Our runtime auth layer recognises exactly one authorization name:
-`MIT-MAGIC-COOKIE-1` (`auth.rs:150`, `name == MIT_MAGIC_COOKIE && cookies
-contains data`). So an `Accept` is only usable if it carries **that name**
-with well-formed cookie data.
+`Accept` carries **two** credential pairs, and they are checked separately
+(`recv_accept_msg`, `xdmcp.c:1168`):
 
-An `Accept` whose authorization name is anything else, or whose data is
-malformed or empty, must **not** proceed to `Manage` and must **not** install
-a dynamic credential. Treat it as a failed offer: do not enter the session,
-and take the same abandoned-offer path as a `Refuse`, clearing any provisional
-cookie. Silently entering `Manage` with an authorization we cannot enforce
-would produce a session whose TCP clients can never authenticate — an obscure
-hang instead of a diagnosable refusal — and installing a credential we do not
-understand is worse.
+**1. `AcceptAuthenticationName` / `Data` must be EMPTY.** We advertise no
+authentication, because XDM-AUTHENTICATION-1 is a non-goal. A non-empty
+authentication field means the manager selected a mode we do not implement, and
+accepting it would silently bypass the very authentication the manager chose.
+Xorg validates this through `XdmcpCheckAuthentication(..., ACCEPT)` and, on
+failure, calls `XdmcpFatal("Authentication Failure", ...)` — fatal, not a
+retry. **Match that**: refuse to run rather than proceed under an
+authentication mode we cannot honour.
 
-This matters more than it looks because it is reachable by anything that can
-answer our `Query`: an attacker-supplied `Accept` is the first untrusted input
-in the whole flow.
+**2. `AcceptAuthorizationName` must be `MIT-MAGIC-COOKIE-1`**, with well-formed
+data. That is the only name our runtime auth layer recognises
+(`auth.rs:150`).
+
+**Here we diverge from Xorg deliberately.** When `XdmcpAddAuthorization` fails,
+Xorg does *not* abandon the offer: it calls `AddLocalHosts()` and proceeds to
+`XDM_MANAGE` anyway — "if the authorization specified in the packet fails to be
+acceptable, enable the local addresses". That fallback depends on the
+host-based access control we have deliberately not implemented (stage 2,
+deferred). Without it, proceeding would create a session no TCP client can ever
+authenticate to: an obscure hang instead of a diagnosable refusal. So an
+unusable authorization **fails the offer** for us.
+
+**The transition on a failed offer**, which must not be left to inference — and
+note it differs from `Refuse`, which arrives in `AWAIT_MANAGE_RESPONSE` whereas
+this arrives in `AWAIT_REQUEST_RESPONSE`:
+
+**Stay in `AWAIT_REQUEST_RESPONSE` and let the retry timer drive.** Do not jump
+back to `START_CONNECTION` and immediately resend `Request`. This is
+Xorg-faithful — a malformed or short `Accept` falls through `recv_accept_msg`
+without touching `state`, so retransmission handles it — and it is the bounded
+choice: an immediate resend against a manager that keeps answering badly is a
+tight loop, whereas the retry path backs off and terminates at the
+retransmission limit via `XdmcpDeadSession` (or exits, under `-once`).
+
+Any provisional cookie from the rejected offer is cleared regardless.
+
+This is the first untrusted input in the whole flow: anything that can answer
+our `Query` can send an `Accept`.
 
 ### The stage-1 contradiction, and how it resolves
 
@@ -224,7 +248,10 @@ would imply an authentication mode we do not implement.
    retries during Query or Request resets with no session having existed.
    Generations can therefore exist with zero sessions, and an invariant saying
    "one session = one generation" would be false.
-3. `-once` terminates rather than resetting when the session ends.
+3. `-once` turns **every** XDMCP-driven reset-or-renew condition into
+   termination — session end, keepalive failure, and retransmission exhaustion
+   during a negotiation that never established a session — not only session
+   end.
 4. With no XDMCP option, nothing changes: no UDP socket, no state machine, and
    the reset policy stays `-noreset`.
 5. A manager that never answers leaves the server retrying, not wedged or
