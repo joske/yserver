@@ -25,6 +25,74 @@ pub const DEFAULT_DISPLAY: u16 = 7;
 
 const TCP_PORT_BASE: u16 = 6_000;
 
+/// Default UDP port to the XDMCP manager (`XDM_UDP_PORT`,
+/// `/usr/include/X11/Xdmcp.h:26`).
+pub const XDM_UDP_PORT: u16 = 177;
+
+/// Which of `-query`, `-broadcast` or `-indirect` selects the XDMCP query
+/// mode. Mirrors Xorg's `XDM_INIT_STATE` (`../xserver/os/xdmcp.c:80`,
+/// assigned at `:254-276`): note that in Xorg this is a *variable* holding
+/// one of `XDM_QUERY`/`XDM_BROADCAST`/`XDM_INDIRECT`, not a member of the
+/// protocol state enum itself — it only decides where the state machine
+/// starts (and, per the design doc, where a reset sends it back to). The
+/// three are mutually exclusive and ordered, last-wins, exactly like
+/// `-listen`/`-nolisten` and `-noreset`/`-reset`/`-terminate` above:
+/// `-query a -broadcast` ends up in `Broadcast` mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum XdmcpQueryMode {
+    /// `-query <host>` — direct query to that manager.
+    Query(String),
+    /// `-broadcast` — broadcast query; no manager address.
+    Broadcast,
+    /// `-indirect <host>` — indirect query to that manager.
+    Indirect(String),
+}
+
+/// XDMCP configuration, parsed alongside the rest of `LaunchOptions`.
+/// This is a pure configuration source: parsing it does not open a
+/// socket, start a state machine, or touch the reset policy. It exists
+/// only so the later steps that DO those things (the design doc's auth
+/// and reset integrations) have something concrete to read.
+///
+/// `LaunchOptions::xdmcp` is `None` whenever argv contained none of
+/// `-query`, `-broadcast` or `-indirect` — XDMCP is then fully disabled
+/// and nothing else in this struct applies, matching Xorg where
+/// `XDM_INIT_STATE` stays `XDM_OFF` absent one of those three options.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XdmcpOptions {
+    /// The configured initial query mode. Always present whenever
+    /// `XdmcpOptions` exists at all — there is no "unset" state to
+    /// default away, deliberately: a later reset must target this exact
+    /// mode and must never fall back to `Query` for a server that was
+    /// actually configured with `-broadcast` or `-indirect`.
+    mode: XdmcpQueryMode,
+    /// `-port <n>`: UDP port to the manager. Defaults to
+    /// [`XDM_UDP_PORT`] (177).
+    pub port: u16,
+    /// `-from <addr>`: source address to query from, unparsed (a later
+    /// step resolves it when the socket is created).
+    pub from: Option<String>,
+    /// `-class <str>`: display class sent in `Manage`. `None` means the
+    /// argument was not given; Xorg's own default (`"MIT-unspecified"`)
+    /// is a packet-construction concern for a later step, not this one.
+    pub class: Option<String>,
+    /// `-displayID <str>`: manufacturer display ID sent in `Request`.
+    pub display_id: Option<String>,
+    /// `-once`: terminate after one session instead of renewing.
+    pub once: bool,
+}
+
+impl XdmcpOptions {
+    /// The mode a reset must return the state machine to
+    /// (`../xserver/os/xdmcp.c:80,254-276`'s `XDM_INIT_STATE` again).
+    /// Named to match the design doc's own reference to it: "the reset
+    /// action is `state = options.initial_mode()`".
+    #[must_use]
+    pub fn initial_mode(&self) -> &XdmcpQueryMode {
+        &self.mode
+    }
+}
+
 /// Parsed X-server-style command line. Fields the issue's items 1-2 act
 /// on; `vt`/`seat` are parsed + logged but otherwise ignored (logind owns
 /// the seat/VT), `auth_file` is stashed for the deferred item 4.
@@ -52,6 +120,9 @@ pub struct LaunchOptions {
     /// `-noreset` (the default), `-reset` or `-terminate`. Ordered and
     /// last-wins, like `-listen`/`-nolisten`.
     pub reset_policy: ResetPolicy,
+    /// XDMCP configuration: `None` unless one of `-query`, `-broadcast`
+    /// or `-indirect` was given. See [`XdmcpOptions`].
+    pub xdmcp: Option<XdmcpOptions>,
 }
 
 fn next_value(it: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
@@ -64,6 +135,18 @@ fn next_value(it: &mut impl Iterator<Item = String>, flag: &str) -> Result<Strin
 pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchOptions, String> {
     let mut o = LaunchOptions::default();
     let mut it = args.into_iter();
+    // XDMCP fields build up alongside `o` as local state, and are only
+    // assembled into `o.xdmcp` at the end of the loop: `XdmcpOptions`
+    // exists at all only if one of the three query-mode options was
+    // seen, however early or late in argv (mirroring Xorg, where
+    // `xdm_udp_port`/`-from`/`-class`/etc. are process-global variables
+    // that matter only once `XDM_INIT_STATE` leaves `XDM_OFF`).
+    let mut xdmcp_mode: Option<XdmcpQueryMode> = None;
+    let mut xdmcp_port: u16 = XDM_UDP_PORT;
+    let mut xdmcp_from: Option<String> = None;
+    let mut xdmcp_class: Option<String> = None;
+    let mut xdmcp_display_id: Option<String> = None;
+    let mut xdmcp_once = false;
     while let Some(arg) = it.next() {
         if let Some(rest) = arg.strip_prefix(':') {
             o.display = Some(
@@ -121,6 +204,48 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchOption
             // Print-and-exit; the binary acts on this before `run()`.
             // Keep scanning so it works regardless of position.
             o.show_version = true;
+        } else if arg == "-query" {
+            // The three query-mode options are mutually exclusive and
+            // ordered, last-wins — same rule as `-listen`/`-nolisten`
+            // and the reset-policy trio above (`../xserver/os/
+            // xdmcp.c:252-276`: each just overwrites `XDM_INIT_STATE`).
+            xdmcp_mode = Some(XdmcpQueryMode::Query(next_value(&mut it, "-query")?));
+        } else if arg == "-indirect" {
+            xdmcp_mode = Some(XdmcpQueryMode::Indirect(next_value(&mut it, "-indirect")?));
+        } else if arg == "-broadcast" {
+            xdmcp_mode = Some(XdmcpQueryMode::Broadcast);
+        } else if arg == "-port" {
+            let v = next_value(&mut it, "-port")?;
+            // Xorg casts with `(unsigned short) atoi(...)`, which
+            // silently wraps an out-of-range value. `u16::from_str`
+            // rejects it instead, per the design's "use checked
+            // arithmetic/parsing" — a typo'd port must be a startup
+            // error, not a silently wrong one.
+            xdmcp_port = v
+                .parse::<u16>()
+                .map_err(|_| format!("invalid -port argument: {v} (must fit in 0..=65535)"))?;
+        } else if arg == "-from" {
+            xdmcp_from = Some(next_value(&mut it, "-from")?);
+        } else if arg == "-class" {
+            xdmcp_class = Some(next_value(&mut it, "-class")?);
+        } else if arg == "-displayID" {
+            xdmcp_display_id = Some(next_value(&mut it, "-displayID")?);
+        } else if arg == "-once" {
+            xdmcp_once = true;
+        } else if arg == "-cookie" {
+            // Parsed (so a missing value still errors as "requires a
+            // value", not silently), then REJECTED rather than ignored:
+            // accepting this would imply XDM-AUTHENTICATION-1, which we
+            // deliberately do not implement (see the design doc's
+            // non-goals). Silently ignoring it would leave a user
+            // believing authentication is active when it is not.
+            let _cookie = next_value(&mut it, "-cookie")?;
+            return Err(
+                "yserver: -cookie is not supported: XDM-AUTHENTICATION-1 (the DES-based XDMCP \
+                 authentication this key implies) is not implemented, and silently ignoring \
+                 the flag would leave XDMCP looking authenticated when it is not"
+                    .to_string(),
+            );
         } else if let Ok(n) = arg.parse::<u16>() {
             // Bare number → display. Keeps `yserver 7` (Justfile) working.
             o.display = Some(n);
@@ -128,6 +253,19 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchOption
             log::warn!("yserver: ignoring unrecognized argument: {arg}");
         }
     }
+    // `XdmcpOptions` exists only if a query mode was actually selected —
+    // `-port`/`-from`/`-class`/`-displayID`/`-once` alone (no `-query`,
+    // `-broadcast` or `-indirect`) leave XDMCP disabled, matching Xorg
+    // where none of those independently moves `XDM_INIT_STATE` off
+    // `XDM_OFF`.
+    o.xdmcp = xdmcp_mode.map(|mode| XdmcpOptions {
+        mode,
+        port: xdmcp_port,
+        from: xdmcp_from,
+        class: xdmcp_class,
+        display_id: xdmcp_display_id,
+        once: xdmcp_once,
+    });
     Ok(o)
 }
 
@@ -698,6 +836,153 @@ mod tests {
         .unwrap();
         assert_eq!(o.reset_policy, ResetPolicy::Reset);
         assert_eq!(o.display, Some(2));
+    }
+
+    #[test]
+    fn no_xdmcp_option_leaves_it_disabled() {
+        assert_eq!(parse(&[]).unwrap().xdmcp, None);
+        // Options that only matter once XDMCP is on don't enable it by
+        // themselves — matches Xorg, where none of them touches
+        // `XDM_INIT_STATE`.
+        assert_eq!(
+            parse(&["-port", "9999", "-once", "-class", "MIT-unspecified"])
+                .unwrap()
+                .xdmcp,
+            None
+        );
+    }
+
+    #[test]
+    fn xdmcp_query_option_parses() {
+        let o = parse(&["-query", "dm.example.com"]).unwrap();
+        let xdmcp = o.xdmcp.unwrap();
+        assert_eq!(
+            *xdmcp.initial_mode(),
+            XdmcpQueryMode::Query("dm.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn xdmcp_indirect_option_parses() {
+        let o = parse(&["-indirect", "dm.example.com"]).unwrap();
+        let xdmcp = o.xdmcp.unwrap();
+        assert_eq!(
+            *xdmcp.initial_mode(),
+            XdmcpQueryMode::Indirect("dm.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn xdmcp_broadcast_option_parses() {
+        let o = parse(&["-broadcast"]).unwrap();
+        let xdmcp = o.xdmcp.unwrap();
+        assert_eq!(*xdmcp.initial_mode(), XdmcpQueryMode::Broadcast);
+    }
+
+    #[test]
+    fn xdmcp_port_defaults_to_the_xdm_udp_port() {
+        let o = parse(&["-query", "dm"]).unwrap();
+        assert_eq!(o.xdmcp.unwrap().port, XDM_UDP_PORT);
+        assert_eq!(XDM_UDP_PORT, 177);
+    }
+
+    #[test]
+    fn xdmcp_port_option_parses() {
+        let o = parse(&["-query", "dm", "-port", "9999"]).unwrap();
+        assert_eq!(o.xdmcp.unwrap().port, 9999);
+    }
+
+    #[test]
+    fn xdmcp_port_out_of_range_is_rejected() {
+        // Xorg's `(unsigned short) atoi(...)` would silently wrap this;
+        // we must reject it instead.
+        assert!(parse(&["-query", "dm", "-port", "70000"]).is_err());
+        assert!(parse(&["-query", "dm", "-port", "-1"]).is_err());
+        assert!(parse(&["-query", "dm", "-port", "notanumber"]).is_err());
+    }
+
+    #[test]
+    fn xdmcp_from_class_and_display_id_options_parse() {
+        let o = parse(&[
+            "-query",
+            "dm",
+            "-from",
+            "192.0.2.1",
+            "-class",
+            "MIT-unspecified",
+            "-displayID",
+            "thin-client-1",
+        ])
+        .unwrap();
+        let xdmcp = o.xdmcp.unwrap();
+        assert_eq!(xdmcp.from.as_deref(), Some("192.0.2.1"));
+        assert_eq!(xdmcp.class.as_deref(), Some("MIT-unspecified"));
+        assert_eq!(xdmcp.display_id.as_deref(), Some("thin-client-1"));
+    }
+
+    #[test]
+    fn xdmcp_once_option_parses() {
+        assert!(!parse(&["-query", "dm"]).unwrap().xdmcp.unwrap().once);
+        assert!(
+            parse(&["-query", "dm", "-once"])
+                .unwrap()
+                .xdmcp
+                .unwrap()
+                .once
+        );
+    }
+
+    #[test]
+    fn xdmcp_query_mode_options_are_ordered_and_last_wins() {
+        // Mutually exclusive and ordered, last-wins — the same rule as
+        // `-listen`/`-nolisten` and the reset-policy trio. Cover both
+        // directions across all three modes, like
+        // `reset_policy_arguments_are_ordered_and_last_wins`.
+        for (argv, expected) in [
+            (vec!["-query", "a", "-broadcast"], XdmcpQueryMode::Broadcast),
+            (
+                vec!["-broadcast", "-query", "a"],
+                XdmcpQueryMode::Query("a".to_string()),
+            ),
+            (
+                vec!["-query", "a", "-indirect", "b"],
+                XdmcpQueryMode::Indirect("b".to_string()),
+            ),
+            (
+                vec!["-indirect", "b", "-query", "a"],
+                XdmcpQueryMode::Query("a".to_string()),
+            ),
+            (
+                vec!["-broadcast", "-indirect", "b"],
+                XdmcpQueryMode::Indirect("b".to_string()),
+            ),
+            (
+                vec!["-indirect", "b", "-broadcast"],
+                XdmcpQueryMode::Broadcast,
+            ),
+            (
+                vec!["-query", "a", "-broadcast", "-indirect", "b", "-query", "c"],
+                XdmcpQueryMode::Query("c".to_string()),
+            ),
+        ] {
+            let o = parse(&argv).unwrap();
+            assert_eq!(*o.xdmcp.unwrap().initial_mode(), expected, "argv {argv:?}");
+        }
+    }
+
+    #[test]
+    fn xdmcp_cookie_is_rejected_not_ignored() {
+        // Accepting `-cookie` would imply XDM-AUTHENTICATION-1, which we
+        // deliberately do not implement — silently ignoring it would
+        // leave a user believing authentication is active when it is
+        // not, so it must be a hard parse error.
+        let err = parse(&["-query", "dm", "-cookie", "deadbeef"]).unwrap_err();
+        assert!(
+            err.contains("XDM-AUTHENTICATION-1"),
+            "error should explain WHY, not just refuse: {err}"
+        );
+        // Missing value still errors, just with the ordinary message.
+        assert!(parse(&["-cookie"]).is_err());
     }
 
     #[test]
