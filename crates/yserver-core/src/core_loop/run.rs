@@ -23,8 +23,8 @@ use super::{
     client_io::{self, WriteOutcome},
     message::{HostInputEvent, Message, SetupAllocateResponse},
     poll_tokens::{
-        ClientIdAllocator, LISTENER_TOKEN, NOTIFY_TOKEN, backend_token, client_token,
-        token_to_backend_index, token_to_client,
+        ClientIdAllocator, NOTIFY_TOKEN, backend_token, client_token, listener_token,
+        token_to_backend_index, token_to_client, token_to_listener_index,
     },
     process_request::{
         PendingCrtcConfig, RequestOutcome, complete_crtc_config,
@@ -1026,14 +1026,18 @@ pub fn run_core(
     let setup_registry = setup_thread::make_registry();
     let listeners: Vec<_> = listeners
         .into_iter()
-        .map(|listener| {
+        .enumerate()
+        .map(|(index, listener)| {
             listener.set_nonblocking(true)?;
             let raw = listener.as_raw_fd();
+            let token = listener_token(index)
+                .ok_or_else(|| io::Error::other("too many client listeners"))?;
             poll.registry()
-                .register(&mut SourceFd(&raw), LISTENER_TOKEN, Interest::READABLE)?;
+                .register(&mut SourceFd(&raw), token, Interest::READABLE)?;
             Ok(listener)
         })
         .collect::<io::Result<_>>()?;
+    let mut listener_readiness = ListenerReadiness::new(listeners.len());
 
     // E3: register backend-owned fds with the core poller. KMS returns
     // `Drm` only after `take_input_ctx`; the libinput context, when
@@ -1117,7 +1121,9 @@ pub fn run_core(
         // to do right now. Without this, an idle moment where the
         // channel is briefly empty would let `poll.poll` block until
         // a fresh fd event, leaving the backlog stranded.
-        let poll_timeout = if deferred_requests.has_runnable(&pending_backend_requests) {
+        let poll_timeout = if deferred_requests.has_runnable(&pending_backend_requests)
+            || listener_readiness.has_pending()
+        {
             Some(Duration::ZERO)
         } else {
             // Wake for the earliest deadline owned by either core
@@ -1197,6 +1203,10 @@ pub fn run_core(
             drain_start,
         );
         for ev in events.iter() {
+            if let Some(index) = token_to_listener_index(ev.token()) {
+                listener_readiness.mark_ready(index);
+                continue;
+            }
             if let Some(index) = token_to_backend_index(ev.token()) {
                 let Some(source) = backend_poll_sources.get(index).copied() else {
                     warn!(
@@ -1257,17 +1267,6 @@ pub fn run_core(
                 continue;
             }
             match ev.token() {
-                LISTENER_TOKEN => {
-                    for listener in &listeners {
-                        accept_pending(
-                            listener,
-                            client_id_allocator,
-                            &sender,
-                            &setup_registry,
-                            &auth,
-                        );
-                    }
-                }
                 NOTIFY_TOKEN => {
                     let mut channel_requests = 0_usize;
                     let mut channel_requests_by_client = HashMap::new();
@@ -1322,6 +1321,8 @@ pub fn run_core(
                                 resource_id_base,
                                 resource_id_mask,
                                 byte_order,
+                                is_local,
+                                fd_passing,
                             } => {
                                 if let Err(err) = handle_client_setup_complete(
                                     poll.registry(),
@@ -1333,6 +1334,8 @@ pub fn run_core(
                                     resource_id_base,
                                     resource_id_mask,
                                     byte_order,
+                                    is_local,
+                                    fd_passing,
                                 ) {
                                     error!("ClientSetupComplete for client {} failed: {err}", id.0);
                                     disconnect_with_pending_cleanup(
@@ -1446,6 +1449,13 @@ pub fn run_core(
                 }
             }
         }
+        listener_readiness.accept_ready(
+            &listeners,
+            client_id_allocator,
+            &sender,
+            &setup_registry,
+            &auth,
+        );
         // F2: drain any host-X11 events the backend decoded during
         // this iteration. Fanout runs at the outermost stack frame
         // — no `wait_for_reply` is on the stack here — so handlers
@@ -2890,6 +2900,8 @@ fn handle_client_setup_complete(
     resource_id_base: u32,
     resource_id_mask: u32,
     byte_order: yserver_protocol::x11::ClientByteOrder,
+    is_local: bool,
+    fd_passing: bool,
 ) -> io::Result<()> {
     use std::sync::{Arc, Mutex, atomic::AtomicU16};
     let writer = stream.try_clone()?;
@@ -2916,8 +2928,8 @@ fn handle_client_setup_complete(
             watching_writable: false,
             focused_window: crate::resources::ROOT_WINDOW,
             reader_control: Some(reader_control_tx),
-            is_local: true,
-            fd_passing: true,
+            is_local,
+            fd_passing,
         },
     );
 
@@ -2950,39 +2962,110 @@ fn handle_client_setup_complete(
     Ok(())
 }
 
-/// Drain pending accepts on the listener. For each, allocate a fresh
-/// `ClientId` and spawn a setup thread that does the X11 handshake.
+/// Accept at most this many connections per listener and core iteration.
+const ACCEPT_BUDGET: usize = 16;
+
+/// Preserve readiness across budget-limited accepts, and rotate the first
+/// listener served each iteration independently of the poller's event order.
+struct ListenerReadiness {
+    ready: Vec<bool>,
+    next: usize,
+}
+
+impl ListenerReadiness {
+    fn new(count: usize) -> Self {
+        Self {
+            ready: vec![false; count],
+            next: 0,
+        }
+    }
+
+    fn mark_ready(&mut self, index: usize) {
+        if let Some(ready) = self.ready.get_mut(index) {
+            *ready = true;
+        }
+    }
+
+    fn has_pending(&self) -> bool {
+        self.ready.iter().any(|ready| *ready)
+    }
+
+    fn accept_ready(
+        &mut self,
+        listeners: &[Listener],
+        allocator: &ClientIdAllocator,
+        sender: &CoreSender,
+        registry: &SetupRegistry,
+        auth: &Arc<AuthState>,
+    ) {
+        let mut first = None;
+        for offset in 0..listeners.len() {
+            let index = (self.next + offset) % listeners.len();
+            if self.ready[index] {
+                first.get_or_insert(index);
+                self.ready[index] =
+                    accept_pending(&listeners[index], allocator, sender, registry, auth);
+            }
+        }
+        if let Some(first) = first {
+            self.next = (first + 1) % listeners.len();
+        }
+    }
+}
+
+/// Accept one bounded batch, returning whether readiness must be retained.
+/// mio is edge-triggered: after hitting the budget, keep polling this listener
+/// without blocking until an accept reaches WouldBlock.
 fn accept_pending(
     listener: &Listener,
     client_id_allocator: &ClientIdAllocator,
     sender: &CoreSender,
     registry: &SetupRegistry,
     auth: &Arc<AuthState>,
-) {
-    match listener {
-        Listener::Unix(listener) => loop {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    let id = client_id_allocator.allocate();
-                    if let Err(err) = setup_thread::spawn(
-                        id,
-                        Transport::Unix(stream),
-                        sender.clone_handle(),
-                        registry.clone(),
-                        auth.clone(),
-                    ) {
-                        error!("setup thread spawn failed for client {}: {err}", id.0);
-                    }
-                }
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
-                Err(err) => {
-                    warn!("accept failed: {err}");
-                    break;
+) -> bool {
+    for _ in 0..ACCEPT_BUDGET {
+        let (accepted, is_local, fd_passing) = match listener {
+            Listener::Unix(listener) => (
+                listener.accept().map(|(stream, _)| Transport::Unix(stream)),
+                true,
+                true,
+            ),
+            Listener::Tcp(listener) => (
+                listener.accept().map(|(stream, _)| Transport::Tcp(stream)),
+                false,
+                false,
+            ),
+        };
+        match accepted {
+            Ok(stream) => {
+                let id = client_id_allocator.allocate();
+                if let Err(err) = setup_thread::spawn(
+                    id,
+                    stream,
+                    sender.clone_handle(),
+                    registry.clone(),
+                    auth.clone(),
+                    is_local,
+                    fd_passing,
+                ) {
+                    error!("setup thread spawn failed for client {}: {err}", id.0);
                 }
             }
-        },
-        Listener::Tcp(_) => unreachable!("TCP listener support lands after transport migration"),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => return false,
+            // These do not mean the accept queue is empty. Count failed
+            // syscalls toward the budget too, so even repeated errors yield.
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted
+                ) => {}
+            Err(err) => {
+                warn!("accept failed: {err}");
+                return false;
+            }
+        }
     }
+    true
 }
 
 // Silence unused-import lints when the listener path is only exercised
@@ -2994,6 +3077,164 @@ fn _hint(_: Transport) {}
 mod tests {
     use super::*;
     use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn listener_accept_budget_leaves_flood_backlog_for_next_turn() {
+        let path =
+            std::env::temp_dir().join(format!("yserver-accept-budget-{}", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let peers: Vec<_> = (0..33)
+            .map(|_| UnixStream::connect(&path).unwrap())
+            .collect();
+        std::fs::remove_file(path).unwrap();
+        let listener = Listener::Unix(listener);
+        let alloc = ClientIdAllocator::new();
+        let (_poll, sender, _rx) = channel().unwrap();
+        let registry = setup_thread::make_registry();
+
+        accept_pending(&listener, &alloc, &sender, &registry, &AuthState::new(None));
+        let accepted = alloc.peek().0 - 1;
+        setup_thread::shutdown_all(&registry);
+        drop(peers);
+        assert_eq!(
+            accepted, 16,
+            "one listener must yield after its accept budget"
+        );
+    }
+
+    #[test]
+    fn ready_listeners_round_robin_under_accept_flood() {
+        for tcp_count in [1, 33] {
+            let path = std::env::temp_dir().join(format!(
+                "yserver-accept-fair-{}-{tcp_count}",
+                std::process::id()
+            ));
+            let unix = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let tcp = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let unix_peers: Vec<_> = (0..33)
+                .map(|_| UnixStream::connect(&path).unwrap())
+                .collect();
+            let tcp_peers: Vec<_> = (0..tcp_count)
+                .map(|_| std::net::TcpStream::connect(tcp.local_addr().unwrap()).unwrap())
+                .collect();
+            std::fs::remove_file(path).unwrap();
+            let listeners = [Listener::Unix(unix), Listener::Tcp(tcp)];
+            for listener in &listeners {
+                listener.set_nonblocking(true).unwrap();
+            }
+            let alloc = ClientIdAllocator::new();
+            let (_poll, sender, _rx) = channel().unwrap();
+            let registry = setup_thread::make_registry();
+            let mut readiness = ListenerReadiness::new(2);
+            readiness.mark_ready(0);
+            readiness.mark_ready(1);
+            readiness.accept_ready(
+                &listeners,
+                &alloc,
+                &sender,
+                &registry,
+                &AuthState::new(None),
+            );
+            {
+                let clients = registry.lock().unwrap();
+                assert!(matches!(
+                    clients[&yserver_protocol::x11::ClientId(1)],
+                    Transport::Unix(_)
+                ));
+                assert!(
+                    matches!(
+                        clients[&yserver_protocol::x11::ClientId(17)],
+                        Transport::Tcp(_)
+                    ),
+                    "TCP must be accepted within one Unix accept budget, even during a flood"
+                );
+                assert_eq!(clients.len(), if tcp_count == 1 { 17 } else { 32 });
+            }
+            // No fresh readiness marks. Queued accepts must persist, and the
+            // second round must start at TCP rather than repeat Unix-first.
+            readiness.accept_ready(
+                &listeners,
+                &alloc,
+                &sender,
+                &registry,
+                &AuthState::new(None),
+            );
+            if tcp_count == 33 {
+                let clients = registry.lock().unwrap();
+                assert!(matches!(
+                    clients[&yserver_protocol::x11::ClientId(33)],
+                    Transport::Tcp(_)
+                ));
+                assert!(matches!(
+                    clients[&yserver_protocol::x11::ClientId(49)],
+                    Transport::Unix(_)
+                ));
+            }
+            readiness.accept_ready(
+                &listeners,
+                &alloc,
+                &sender,
+                &registry,
+                &AuthState::new(None),
+            );
+            assert!(
+                !readiness.has_pending(),
+                "WouldBlock clears retained readiness"
+            );
+            assert_eq!(alloc.peek().0 - 1, 33 + tcp_count);
+            setup_thread::shutdown_all(&registry);
+            drop((unix_peers, tcp_peers));
+        }
+    }
+
+    #[test]
+    fn listener_backlog_completes_without_a_fresh_readiness_edge() {
+        use std::io::{Read, Write};
+        let path = std::env::temp_dir().join(format!("yserver-accept-edge-{}", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        // Queue more than two accept budgets before the listener is registered:
+        // there is one readiness edge, with no later connection to wake it.
+        let mut peers: Vec<_> = (0..33)
+            .map(|_| {
+                let mut peer = UnixStream::connect(&path).unwrap();
+                peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                peer.write_all(&[b'l', 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+                    .unwrap();
+                peer
+            })
+            .collect();
+        std::fs::remove_file(path).unwrap();
+        let (poll, sender, rx) = channel().unwrap();
+        let sender_for_core = sender.clone_handle();
+        let handle = std::thread::spawn(move || {
+            let mut state = ServerState::new();
+            let mut backend = RecordingBackend::new();
+            run_core(
+                poll,
+                rx,
+                sender_for_core,
+                &mut state,
+                &mut backend,
+                [Listener::Unix(listener)],
+                &ClientIdAllocator::new(),
+                AuthState::new(None),
+            )
+        });
+        let result: io::Result<()> = (|| {
+            for peer in &mut peers {
+                let mut header = [0; 8];
+                peer.read_exact(&mut header)?;
+                assert_eq!(header[0], 1);
+                let len = usize::from(u16::from_le_bytes([header[6], header[7]])) * 4;
+                peer.read_exact(&mut vec![0; len])?;
+            }
+            Ok(())
+        })();
+        sender.send(Message::Shutdown).unwrap();
+        handle.join().unwrap().unwrap();
+        result.expect("all queued connections must finish setup without another accept edge");
+    }
 
     #[test]
     fn randr_change_fanout_orders_screen_then_all_crtcs_then_all_outputs() {

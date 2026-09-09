@@ -44,7 +44,7 @@ use crate::{
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Shared registry of setup-stage UnixStreams. The setup thread holds
+/// Shared registry of setup-stage streams. The setup thread holds
 /// the *original* stream; this map holds a `try_clone` so the core can
 /// `shutdown(Both)` it on shutdown to unblock the setup thread.
 pub type SetupRegistry = Arc<Mutex<HashMap<ClientId, Transport>>>;
@@ -55,13 +55,16 @@ pub fn make_registry() -> SetupRegistry {
 
 /// Spawn a setup thread. The clone is inserted into `registry`
 /// synchronously, before the thread starts, so a shutdown that races
-/// the spawn cannot miss it.
+/// the spawn cannot miss it. Locality and fd capability come from the
+/// accepting listener and survive the setup handoff to `ClientState`.
 pub fn spawn(
     id: ClientId,
     stream: impl Into<Transport>,
     sender: CoreSender,
     registry: SetupRegistry,
     auth: Arc<AuthState>,
+    is_local: bool,
+    fd_passing: bool,
 ) -> io::Result<()> {
     let stream = stream.into();
     let cloned = stream.try_clone()?;
@@ -78,7 +81,7 @@ pub fn spawn(
                 id,
                 registry: registry_for_thread,
             };
-            if let Err(e) = run_setup(id, stream, &sender, &auth) {
+            if let Err(e) = run_setup(id, stream, &sender, &auth, is_local, fd_passing) {
                 // ConnectionAborted/UnexpectedEof on shutdown is
                 // expected; anything else is worth a warn.
                 if !matches!(
@@ -128,6 +131,8 @@ fn run_setup(
     mut stream: Transport,
     sender: &CoreSender,
     auth: &AuthState,
+    is_local: bool,
+    fd_passing: bool,
 ) -> io::Result<()> {
     stream.set_read_timeout(Some(SETUP_TIMEOUT))?;
     stream.set_write_timeout(Some(SETUP_TIMEOUT))?;
@@ -138,8 +143,14 @@ fn run_setup(
         id.0, setup.byte_order, setup.protocol_major, setup.protocol_minor
     );
 
+    // Authorization follows the actual socket, independently of extension
+    // capability metadata: TCP must never take the local-open fallback.
+    let auth_transport = match &stream {
+        Transport::Unix(_) => AuthTransport::Unix,
+        Transport::Tcp(_) => AuthTransport::Tcp,
+    };
     if let AuthVerdict::Reject(reason) = auth.check(
-        AuthTransport::Unix,
+        auth_transport,
         &setup.auth_protocol_name,
         &setup.auth_protocol_data,
     ) {
@@ -244,6 +255,8 @@ fn run_setup(
         resource_id_base: resp.resource_id_base,
         resource_id_mask: resp.resource_id_mask,
         byte_order: setup.byte_order,
+        is_local,
+        fd_passing,
     })?;
     Ok(())
 }
@@ -259,6 +272,39 @@ mod tests {
         time::Instant,
     };
     use yserver_protocol::x11::ClientByteOrder;
+
+    #[test]
+    fn tcp_setup_without_loaded_auth_never_allocates_a_client() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let (_poll, sender, rx) = channel().unwrap();
+        let registry = make_registry();
+        spawn(
+            ClientId(1),
+            Transport::Tcp(stream),
+            sender,
+            registry.clone(),
+            AuthState::new(None),
+            false,
+            false,
+        )
+        .unwrap();
+        let mut setup = [0; 12];
+        setup[0] = b'l';
+        setup[2] = 11;
+        peer.write_all(&setup).unwrap();
+        let mut reply = [0; 8];
+        let result = peer.read_exact(&mut reply);
+        let allocated = rx
+            .try_recv_all()
+            .any(|m| matches!(m, Message::SetupAllocate { .. }));
+        shutdown_all(&registry);
+        assert!(!allocated, "TCP must not use Unix's fail-open auth path");
+        result.unwrap();
+        assert_eq!(reply[0], 0, "setup refused");
+    }
 
     /// Hand-encode a minimal little-endian SetupRequest with empty auth.
     fn write_setup_request(s: &mut UnixStream) -> io::Result<()> {
@@ -311,6 +357,8 @@ mod tests {
             sender,
             registry.clone(),
             AuthState::new(None),
+            true,
+            true,
         )
         .unwrap();
 
@@ -395,6 +443,8 @@ mod tests {
             sender,
             registry.clone(),
             AuthState::new(None),
+            true,
+            true,
         )
         .unwrap();
         write_big_endian_setup(&mut client_side).unwrap();
@@ -457,6 +507,8 @@ mod tests {
             sender,
             registry.clone(),
             AuthState::new(None),
+            true,
+            true,
         )
         .unwrap();
 
@@ -492,6 +544,8 @@ mod tests {
             sender,
             registry.clone(),
             AuthState::new(None),
+            true,
+            true,
         )
         .unwrap();
         write_setup_request(&mut client_side).unwrap();
@@ -607,6 +661,8 @@ mod tests {
             sender,
             registry.clone(),
             AuthState::new(Some(path.clone())),
+            true,
+            true,
         )
         .unwrap();
 
@@ -633,6 +689,8 @@ mod tests {
             sender,
             registry.clone(),
             AuthState::new(Some(path.clone())),
+            true,
+            true,
         )
         .unwrap();
 

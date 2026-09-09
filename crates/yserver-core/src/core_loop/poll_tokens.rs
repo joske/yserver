@@ -1,10 +1,12 @@
 //! Token assignment for the core's mio poller, plus monotonic
 //! `ClientId` allocation.
 //!
-//! The poller's tokens fall into three ranges:
+//! The poller's tokens fall into four ranges:
 //!
-//! - Fixed system tokens at the bottom: notify-channel, listener, and
+//! - Fixed system tokens at the bottom: notify-channel and
 //!   signalfd. These never change at runtime.
+//! - Listener tokens from `0x10`, one per listening socket, so TCP and Unix
+//!   readiness can be scheduled independently.
 //! - Backend-owned fds, allocated densely from `0x100` in the order returned
 //!   by `Backend::poll_fds`. Every fd gets its own token so readiness can be
 //!   routed back to that exact source, even when a backend exposes multiple
@@ -31,10 +33,11 @@ use yserver_protocol::x11::ClientId;
 
 pub use super::sender::NOTIFY_TOKEN;
 
-/// `UnixListener` accepting connections from clients.
-pub const LISTENER_TOKEN: Token = Token(1);
 /// signalfd; readiness causes the core to issue `Message::Shutdown`.
 pub const SIGNAL_TOKEN: Token = Token(3);
+
+/// Listener tokens occupy a separate range from fixed system/backend tokens.
+const LISTENER_TOKEN_BASE: usize = 0x10;
 
 /// First token usable for backend-owned poll sources. The core keeps the
 /// corresponding `(fd, BackendFdKind)` records in the same order.
@@ -43,6 +46,20 @@ const BACKEND_TOKEN_BASE: usize = 0x100;
 /// First token usable for per-client writers. Picked far above the
 /// backend range so both classes are cheap to recognise on a hot poll.
 const CLIENT_TOKEN_BASE: usize = 0x1000;
+
+/// Map a listener's index to its own readiness token.
+#[must_use]
+pub fn listener_token(index: usize) -> Option<Token> {
+    let raw = LISTENER_TOKEN_BASE.checked_add(index)?;
+    (raw < BACKEND_TOKEN_BASE).then_some(Token(raw))
+}
+
+#[must_use]
+pub fn token_to_listener_index(token: Token) -> Option<usize> {
+    (LISTENER_TOKEN_BASE..BACKEND_TOKEN_BASE)
+        .contains(&token.0)
+        .then(|| token.0 - LISTENER_TOKEN_BASE)
+}
 
 /// Map an index in the core's backend poll-source table to a unique token.
 /// Returns `None` when the table would overlap client tokens.
@@ -134,7 +151,7 @@ mod tests {
 
     #[test]
     fn system_tokens_decode_to_none() {
-        for tok in [NOTIFY_TOKEN, LISTENER_TOKEN, SIGNAL_TOKEN] {
+        for tok in [NOTIFY_TOKEN, listener_token(0).unwrap(), SIGNAL_TOKEN] {
             assert!(token_to_client(tok).is_none(), "{tok:?}");
         }
     }
@@ -148,8 +165,28 @@ mod tests {
         }
         assert_ne!(backend_token(0), backend_token(1));
         assert!(backend_token(CLIENT_TOKEN_BASE - BACKEND_TOKEN_BASE).is_none());
-        assert_eq!(token_to_backend_index(LISTENER_TOKEN), None);
+        assert_eq!(token_to_backend_index(listener_token(0).unwrap()), None);
         assert_eq!(token_to_backend_index(client_token(ClientId(1))), None);
+    }
+
+    #[test]
+    fn listener_tokens_preserve_listener_identity_without_overlapping_other_sources() {
+        for index in 0..BACKEND_TOKEN_BASE - LISTENER_TOKEN_BASE {
+            let token = listener_token(index).unwrap();
+            assert_eq!(token_to_listener_index(token), Some(index));
+            assert_eq!(token_to_backend_index(token), None);
+            assert_eq!(token_to_client(token), None);
+        }
+        assert!(listener_token(BACKEND_TOKEN_BASE - LISTENER_TOKEN_BASE).is_none());
+        assert!(listener_token(usize::MAX).is_none());
+        for token in [
+            NOTIFY_TOKEN,
+            SIGNAL_TOKEN,
+            backend_token(0).unwrap(),
+            client_token(ClientId(1)),
+        ] {
+            assert_eq!(token_to_listener_index(token), None);
+        }
     }
 
     #[test]
@@ -168,7 +205,7 @@ mod tests {
     #[test]
     fn fixed_tokens_are_distinct() {
         // Sanity: catches accidental duplicate constants.
-        let all = [NOTIFY_TOKEN.0, LISTENER_TOKEN.0, SIGNAL_TOKEN.0];
+        let all = [NOTIFY_TOKEN.0, listener_token(0).unwrap().0, SIGNAL_TOKEN.0];
         let mut sorted: Vec<_> = all.to_vec();
         sorted.sort_unstable();
         sorted.dedup();

@@ -138,6 +138,8 @@ pub enum Message {
         resource_id_base: u32,
         resource_id_mask: u32,
         byte_order: ClientByteOrder,
+        is_local: bool,
+        fd_passing: bool,
     },
     /// One framed X11 request from a client reader thread.
     Request {

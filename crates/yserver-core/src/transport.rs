@@ -1,8 +1,7 @@
 //! Socket transport abstractions for X11 clients.
 //!
-//! The server currently accepts only Unix-domain clients.  Keeping TCP as a
-//! variant here lets the connection path become transport-neutral before a
-//! TCP listener is introduced.
+//! Unix-domain clients are local and can pass descriptors. Opt-in TCP clients
+//! use the same byte-stream setup/read/write path with remote-client policy.
 
 use std::{
     io::{self, Read, Write},
