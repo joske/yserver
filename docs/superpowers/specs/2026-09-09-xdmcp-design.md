@@ -133,6 +133,26 @@ against the TCP setup that takes the state to `RUN_SESSION`: an authenticated
 setup arriving concurrently with a `Refuse` must not end with a running
 session whose cookie has just been cleared.
 
+### What counts as an acceptable `Accept`
+
+Our runtime auth layer recognises exactly one authorization name:
+`MIT-MAGIC-COOKIE-1` (`auth.rs:150`, `name == MIT_MAGIC_COOKIE && cookies
+contains data`). So an `Accept` is only usable if it carries **that name**
+with well-formed cookie data.
+
+An `Accept` whose authorization name is anything else, or whose data is
+malformed or empty, must **not** proceed to `Manage` and must **not** install
+a dynamic credential. Treat it as a failed offer: do not enter the session,
+and take the same abandoned-offer path as a `Refuse`, clearing any provisional
+cookie. Silently entering `Manage` with an authorization we cannot enforce
+would produce a session whose TCP clients can never authenticate — an obscure
+hang instead of a diagnosable refusal — and installing a credential we do not
+understand is worse.
+
+This matters more than it looks because it is reachable by anything that can
+answer our `Query`: an attacker-supplied `Accept` is the first untrusted input
+in the whole flow.
+
 ### The stage-1 contradiction, and how it resolves
 
 Stage 1 made `-listen tcp` a **startup error** unless `-auth` yields a usable
@@ -155,8 +175,17 @@ built on. Unix clients are unaffected.
 #### 2. XDMCP owns the reset policy
 
 Stage 3 defaults to `-noreset`, deliberately opposite to Xorg. XDMCP inverts
-that: one session is one generation, and the loop *is* the feature. So an
-XDMCP option implies `-reset`, and `-once` implies `-terminate`.
+that: an established session ends its generation, and the loop *is* the
+feature. So an XDMCP option implies `-reset`.
+
+**`-once` is stronger than "terminate at session end".** It turns *every*
+XDMCP-driven reset-or-renew condition into termination: session end, keepalive
+failure, and — the one easy to miss — generic retransmission exhaustion during
+a negotiation that never established a session. Xorg's timeout handler checks
+`OneSession` before `XdmcpDeadSession` is ever reached (`xdmcp.c:826-834`), so
+a `-once` server that cannot reach its manager exits rather than looping
+forever. That case needs its own test, because it is the one with no session
+in it.
 
 The reset boundary gains an XDMCP hook: on a new generation, the state machine
 returns to its init state and re-queries. It must run **after** the new
@@ -236,7 +265,12 @@ would imply an authentication mode we do not implement.
 - Integration: `-query` against LightDM with XDMCP enabled, on one machine
   first, then across the LAN. A session starts, ends, and a second session
   starts on the same server.
-- `-once`: the server exits rather than re-querying.
+- `-once`, both cases: the server exits at session end, **and** exits on
+  retransmission exhaustion during a negotiation that never established a
+  session — the second is the one a happy-path suite skips.
+- `Accept` rejection: an authorization name other than `MIT-MAGIC-COOKIE-1`,
+  and a malformed/empty cookie, each leave the state machine out of the
+  session with no credential installed. Include these as protocol vectors.
 - No XDMCP option ⇒ byte-identical behaviour to today.
 
 ## Adjacent gaps, not in scope
