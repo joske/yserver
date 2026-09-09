@@ -651,6 +651,45 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   shape: force a full repaint at the materialise edge. Worth confirming
   against Xorg, where killing and restarting a compositor recovers promptly.
 
+- **2026-09-09 TCP transport and server reset (#121 stages 1 and 3, branch
+  `feat/121-server-reset`):** groundwork for XDMCP on HPC login nodes.
+  *Transport* — a `Transport`/`Listener` enum replaces the concrete
+  `UnixStream` at the six production seams, and `-listen tcp` binds
+  `0.0.0.0:6000+N`, off by default per Xorg's `defaultNoListenList`.
+  Authorization was **fail-open** before this (`check` returned `Allow` with no
+  `-auth`, and `local_open` started true) which was harmless while every
+  connection was AF_UNIX; it is now transport-aware and fail-closed, and
+  `-listen tcp` is a startup error when auth cannot satisfy a TCP client. Two
+  per-client capability flags, deliberately distinct: `fd_passing` gates
+  `SCM_RIGHTS`, `is_local` gates extension policy. Extensions stay advertised
+  and are refused at dispatch exactly as Xorg does — DRI3 `BadMatch`
+  (`dri3_request.c:662`), MIT-SHM `BadRequest` except `QueryVersion`
+  (`shm.c:1346`), vidmode's mutating half only
+  (`VidModeErrorBase + ClientNotLocal`); Present is **not** gated, having no
+  `client->local` anywhere in Xorg. Verified against a real remote client
+  (`bee:2`), not just loopback — loopback proves nothing about
+  FamilyInternet selection, because xtrans rewrites `127.0.0.1` to FamilyLocal
+  before the cookie lookup.
+  *Reset* — a generation quarantine, not a `ServerState` swap: setup threads,
+  reader threads, queued messages, the parked-CRTC maps, both deferred-request
+  queues and the telemetry rows all live outside `ServerState` and are cleared
+  or generation-tagged. Only `start_instant` survives a generation literally
+  (timestamps must not go backwards); topology and devices are re-seeded from
+  the backend and from a new process-lifetime `InputInventory`, which exists
+  because `probe_input_devices` is a no-op in Direct mode and libinput's
+  `DeviceAdded` burst is one-shot at process start. Forced teardown ignores
+  close-down mode and releases backend-side objects, with a whole-session
+  re-sweep because the orphan gate is per-*reference*: a GC tile named by
+  another client is deferred and never reported again once that client also
+  dies. Trigger is armed, never inferred — set only after registration *and*
+  reader spawn succeed, mirroring `ClientStateRunning`
+  (`dix/dispatch.c:3762`), so a port scan, a bad cookie or a failed setup arms
+  nothing. Default `-noreset`, opposite to Xorg, because a stray reset in a
+  desktop session is indistinguishable from a crash.
+  *Not done:* the composite-overlay claim is still not a per-client resource,
+  which is a prerequisite for shipping reset; stage 2 (`xhost`) is specified
+  and deferred; stage 4 (XDMCP) is unstarted; the two-session hardware run is
+  outstanding.
 - **2026-08-24 direct-scanout fallback-target fix:** a `CowDescendant` root
   Present's pinned redirected paint target need not be the Composite Overlay
   Window itself. Lazy fallback now copies into that exact pinned paint target
