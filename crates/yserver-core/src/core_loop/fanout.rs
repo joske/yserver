@@ -770,7 +770,7 @@ mod tests {
 
     fn make_client(writer: UnixStream, mask_for_root: u32) -> ClientState {
         ClientState {
-            writer: Arc::new(Mutex::new(writer)),
+            writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(writer))),
             byte_order: ClientByteOrder::LittleEndian,
             last_sequence: Arc::new(AtomicU16::new(0)),
             resource_id_base: 0,

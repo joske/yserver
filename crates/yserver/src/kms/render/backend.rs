@@ -28779,7 +28779,7 @@ mod tests {
         state.clients.insert(
             7,
             ClientState {
-                writer: Arc::new(Mutex::new(writer)),
+                writer: Arc::new(Mutex::new(yserver_core::transport::Transport::Unix(writer))),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(9)),
                 resource_id_base: 0,
@@ -38944,7 +38944,7 @@ mod tests {
         state.clients.insert(
             id,
             ClientState {
-                writer: Arc::new(Mutex::new(a)),
+                writer: Arc::new(Mutex::new(yserver_core::transport::Transport::Unix(a))),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
                 resource_id_base: 0,

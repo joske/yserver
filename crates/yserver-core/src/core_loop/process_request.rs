@@ -7219,7 +7219,10 @@ fn send_reply_with_fd(
     let mut w = writer_arc
         .lock()
         .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "client writer mutex poisoned"))?;
-    crate::unix_fd::send_with_fd(&mut w, bytes, fd)
+    let crate::transport::Transport::Unix(stream) = &mut *w else {
+        unreachable!("TCP fd passing is unreachable until transport capabilities land");
+    };
+    crate::unix_fd::send_with_fd(stream, bytes, fd)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -30745,7 +30748,7 @@ mod tests {
         state.clients.insert(
             id,
             ClientState {
-                writer: Arc::new(Mutex::new(a)),
+                writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(a))),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
                 // Permissive resource-id range so tests driving

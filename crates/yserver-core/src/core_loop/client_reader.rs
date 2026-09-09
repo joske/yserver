@@ -31,10 +31,7 @@
 
 use std::{
     io::{self, ErrorKind},
-    os::{
-        fd::{FromRawFd, RawFd},
-        unix::net::UnixStream,
-    },
+    os::fd::{FromRawFd, RawFd},
 };
 
 use crossbeam_channel::{Receiver, TryRecvError};
@@ -45,6 +42,7 @@ use yserver_protocol::x11::{self, ClientByteOrder, ClientId, SequenceNumber};
 use crate::{
     core_loop::{message::Message, sender::CoreSender},
     server::ReaderControl,
+    transport::Transport,
     unix_fd::FdReader,
 };
 
@@ -86,12 +84,13 @@ impl ReaderIngressWindow {
 /// `ReaderControl::Shutdown`.
 pub fn spawn(
     id: ClientId,
-    stream: UnixStream,
+    stream: impl Into<Transport>,
     byte_order: ClientByteOrder,
     big_requests_major: u8,
     control_rx: Receiver<ReaderControl>,
     sender: CoreSender,
 ) -> io::Result<()> {
+    let stream = stream.into();
     std::thread::Builder::new()
         .name(format!("yserver-reader-{}", id.0))
         .spawn(move || {
@@ -111,12 +110,15 @@ pub fn spawn(
 
 fn run(
     id: ClientId,
-    stream: UnixStream,
+    stream: Transport,
     byte_order: ClientByteOrder,
     big_requests_major: u8,
     control_rx: Receiver<ReaderControl>,
     sender: &CoreSender,
 ) -> io::Result<()> {
+    let Transport::Unix(stream) = stream else {
+        unreachable!("TCP reader support lands with transport-aware FdReader");
+    };
     let mut reader = BlockingFdReader::new(FdReader::new(stream));
     let mut big = false;
     let mut sequence: u16 = 0;
@@ -342,6 +344,7 @@ mod tests {
     use crossbeam_channel::unbounded;
     use std::{
         io::Write,
+        os::unix::net::UnixStream,
         time::{Duration, Instant},
     };
 
