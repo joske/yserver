@@ -98,9 +98,26 @@ Destroys a session. Not yet called by any reset.
   (`process_disconnect.rs:89`, `let retain = close_mode == 1 || close_mode == 2`).
 - Explicitly destroys existing zombie/retained clients' resources.
 - Releases **backend-side** objects — host pixmaps, GLX contexts and
-  drawables, DRI3 syncobjs, registered writers. This is the #133
-  `host_xid_still_referenced` lifetime class; core metadata disappearing is not
-  the same as the backend freeing anything.
+  drawables, DRI3 syncobjs, host-window registrations (`HostXidMap`). This is
+  the #133 `host_xid_still_referenced` lifetime class; core metadata
+  disappearing is not the same as the backend freeing anything.
+
+  Two corrections to an earlier draft of this list, found in implementation:
+  **"registered writers" named nothing** — there is no writer registry on the
+  `Backend` trait; client writers are core-side in `ServerState.clients`. And
+  **`GlxContext` is core-only** — the sole backend-side GLX lifetime is the
+  pixmap-export refcount taken at `glXCreatePixmap`, so a context has nothing
+  to release.
+
+  **The per-client orphan gate is not sufficient on its own.** It is
+  per-*reference*: client A's tile stays allocated while client B's GC names it
+  as tile/stipple, which is the right answer in a normal disconnect because B
+  is still running. In a reset B dies too and nothing reports that tile a
+  second time — `remove_non_window_resources_owned_by` yields only pixmap
+  resources, and `collect_attribute_pixmap_host_xids` covers window background
+  and border only. So the teardown must collect deferrals, subtract anything
+  freed later, and re-check each survivor against `host_xid_still_referenced`
+  once the whole session is gone.
 
 **Proof.** Unit, called directly: a session that allocated host pixmaps, GLX
 objects and DRI3 syncobjs leaves the **backend's own accounting empty** — not
@@ -152,6 +169,13 @@ Order, per the spec:
    `InputInventory`, interning device-property atoms anew.
 7. `install_backend_root_bindings` (`lib.rs:29`).
 8. Rebind the root window, mark the backend dirty, **clear the scanout**.
+   Decide here on a pre-existing leak surfaced by step 3: a compositor client
+   that disconnects without `ReleaseOverlayWindow` leaves the COW refcount
+   held, because `backend.release_overlay_window` is called only from the
+   protocol handler (`process_request.rs:7232`) and never from disconnect. A
+   reset inherits it. It belongs to this step rather than step 3 because the
+   COW is root-adjacent, and under XDMCP the next session would start with the
+   previous user's overlay still referenced.
 9. Listeners untouched.
 
 **Proof.** Unit: after a direct call, the new state has empty
