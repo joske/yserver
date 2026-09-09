@@ -16565,6 +16565,23 @@ impl Backend for KmsBackend {
         Some(ARGB_COLORMAP.0)
     }
 
+    fn fb_dimensions(&self) -> (u16, u16) {
+        KmsBackend::fb_dimensions(self)
+    }
+
+    fn randr_outputs_and_modes(
+        &mut self,
+    ) -> (
+        Vec<yserver_core::randr::RandrOutput>,
+        Vec<yserver_core::randr::RandrMode>,
+    ) {
+        KmsBackend::randr_outputs_and_modes(self)
+    }
+
+    fn randr_providers(&mut self) -> Vec<yserver_core::randr::RandrProvider> {
+        KmsBackend::randr_providers(self)
+    }
+
     fn render_opcode(&self) -> Option<u8> {
         Some(133)
     }

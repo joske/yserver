@@ -468,6 +468,34 @@ pub trait Backend {
     fn root_visual_xid(&self) -> u32;
     fn argb_visual_xid(&self) -> Option<u32>;
     fn argb_colormap_xid(&self) -> Option<u32>;
+
+    /// Virtual-screen extent in pixels — the size the root window and
+    /// the COW are built at.
+    ///
+    /// On the trait rather than inherent on `KmsBackend` because the
+    /// core has to re-derive screen topology at a generation boundary
+    /// (`core_loop::reset::reset_generation`), where all it holds is
+    /// `&mut dyn Backend`. Same reason as
+    /// [`crate::server::BackendCapabilities::from_backend`], and it is
+    /// read through the same snapshot type, [`BackendTopology`].
+    ///
+    /// [`BackendTopology`]: crate::backend::BackendTopology
+    fn fb_dimensions(&self) -> (u16, u16);
+
+    /// The live RandR output set plus the full deduped mode table.
+    ///
+    /// `&mut self` because a real KMS implementation reserves provider
+    /// XIDs as a side effect, so outputs and providers keep colliding-free
+    /// identities. Not a pure getter, and deliberately not memoised: a
+    /// reset must see the topology as it is NOW, not as it was at
+    /// process start.
+    fn randr_outputs_and_modes(
+        &mut self,
+    ) -> (Vec<crate::randr::RandrOutput>, Vec<crate::randr::RandrMode>);
+
+    /// The live RandR provider set (`RRGetProviders`). Empty for
+    /// backends that expose no provider topology.
+    fn randr_providers(&mut self) -> Vec<crate::randr::RandrProvider>;
     fn render_opcode(&self) -> Option<u8>;
     fn xkb_opcode(&self) -> Option<u8>;
     fn xkb_info(&self) -> Option<(u8, u8, u8)>;

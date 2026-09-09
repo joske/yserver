@@ -84,6 +84,24 @@ impl InputInventory {
         self.devices.get(&DeviceNode::new(device_node))
     }
 
+    /// Every recorded device, ordered by device node.
+    ///
+    /// Sorted rather than in `HashMap` order because the consumer —
+    /// the server-reset boundary — replays these into
+    /// `ServerState::xi_seed_touchpad`, which writes a single
+    /// latest-wins slave-pointer slot. Iteration order therefore
+    /// decides which device wins, and a reset must not produce a
+    /// different XI model each time it runs.
+    #[must_use]
+    pub fn devices_by_node(&self) -> Vec<&DeviceInfo> {
+        let mut nodes: Vec<&DeviceNode> = self.devices.keys().collect();
+        nodes.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        nodes
+            .into_iter()
+            .filter_map(|node| self.devices.get(node))
+            .collect()
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.devices.len()

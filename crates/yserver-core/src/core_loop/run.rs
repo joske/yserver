@@ -77,7 +77,7 @@ struct ClientLoopTelemetry {
 }
 
 #[derive(Debug, Default)]
-struct LoopTelemetry {
+pub(crate) struct LoopTelemetry {
     enabled: bool,
     last_emit: Option<Instant>,
     iter_count: u64,
@@ -431,6 +431,25 @@ impl LoopTelemetry {
             stats.deferred_current != 0
         });
     }
+
+    /// Drop every per-client row and zero the deferred-depth gauges.
+    ///
+    /// Called only from the server-reset boundary, and only because the
+    /// window rollover above prunes a client row when its
+    /// `deferred_current` reaches zero — which happens through
+    /// `record_deferred_pop`, i.e. only when a request is actually
+    /// dispatched. A reset DISCARDS the queues instead, so without this
+    /// the gauge would stay permanently non-zero, the dead client's row
+    /// would never be pruned, and — since client ids are reused across
+    /// generations — the next generation's client 7 would inherit the
+    /// previous one's numbers. Diagnostics only; nothing on the
+    /// protocol path reads these.
+    #[allow(dead_code)] // called by `reset::reset_generation`; armed in step 5
+    pub(crate) fn forget_clients(&mut self) {
+        self.clients.clear();
+        self.deferred_current = 0;
+        self.max_deferred_depth = 0;
+    }
 }
 
 /// Core-loop work cap. Each main-loop iteration processes at
@@ -512,7 +531,7 @@ fn budget_exhausted(remaining: usize, elapsed: Duration) -> bool {
 }
 
 /// One pending X protocol request accepted by a reader but not yet dispatched.
-struct DeferredRequest {
+pub(crate) struct DeferredRequest {
     id: yserver_protocol::x11::ClientId,
     sequence: yserver_protocol::x11::SequenceNumber,
     accepted_at: Option<Instant>,
@@ -534,7 +553,7 @@ struct ParkedCrtcConfig {
 /// Backend waits indexed both by opaque token (completion) and by client
 /// (strict same-client FIFO blocking/cancellation).
 #[derive(Default)]
-struct PendingBackendRequests {
+pub(crate) struct PendingBackendRequests {
     crtc_by_token: HashMap<CrtcConfigToken, ParkedCrtcConfig>,
     crtc_by_client: HashMap<yserver_protocol::x11::ClientId, CrtcConfigToken>,
 }
@@ -573,7 +592,37 @@ impl PendingBackendRequests {
         Some(token)
     }
 
-    fn take_all_crtc_tokens(&mut self) -> Vec<CrtcConfigToken> {
+    /// Park a CRTC configuration with only the fields a lifetime test
+    /// needs. The protocol continuation is inert filler: nothing here
+    /// completes the request, it only has to be cancellable.
+    #[cfg(test)]
+    pub(crate) fn park_crtc_for_test(
+        &mut self,
+        client: yserver_protocol::x11::ClientId,
+        token: CrtcConfigToken,
+    ) -> Result<(), &'static str> {
+        self.park_crtc(ParkedCrtcConfig {
+            client_id: client,
+            sequence: yserver_protocol::x11::SequenceNumber(1),
+            continuation: PendingCrtcConfig {
+                token,
+                completion: crate::core_loop::process_request::CrtcConfigCompletion {
+                    output_id: 1,
+                    set_time: 0,
+                    output_bbox_before: None,
+                    byte_order: yserver_protocol::x11::ClientByteOrder::LittleEndian,
+                },
+            },
+            request_wire_bytes: 0,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.crtc_by_token.is_empty() && self.crtc_by_client.is_empty()
+    }
+
+    pub(crate) fn take_all_crtc_tokens(&mut self) -> Vec<CrtcConfigToken> {
         self.crtc_by_client.clear();
         self.crtc_by_token.drain().map(|(token, _)| token).collect()
     }
@@ -585,7 +634,7 @@ impl PendingBackendRequests {
 /// continuously busy client gets at most one request before every other ready
 /// client gets a turn. Cross-client request order has no protocol meaning.
 #[derive(Default)]
-struct FairRequestQueue {
+pub(crate) struct FairRequestQueue {
     by_client: HashMap<yserver_protocol::x11::ClientId, VecDeque<DeferredRequest>>,
     ready: VecDeque<yserver_protocol::x11::ClientId>,
     len: usize,
@@ -593,11 +642,22 @@ struct FairRequestQueue {
 
 impl FairRequestQueue {
     #[cfg(test)]
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    fn push_back(&mut self, req: DeferredRequest) {
+    /// Drop every queued request. Used only by the server-reset
+    /// generation boundary: the clients that issued them are gone, and
+    /// a request is meaningless in a generation whose resource ids mean
+    /// something else.
+    #[allow(dead_code)] // called by `reset::reset_generation`; armed in step 5
+    pub(crate) fn clear(&mut self) {
+        self.by_client.clear();
+        self.ready.clear();
+        self.len = 0;
+    }
+
+    pub(crate) fn push_back(&mut self, req: DeferredRequest) {
         let client = req.id;
         let queue = self.by_client.entry(client).or_default();
         if queue.is_empty() {
@@ -681,13 +741,32 @@ impl FairRequestQueue {
     }
 }
 
+/// A minimal `DeferredRequest` for tests outside this module. The
+/// opcode is arbitrary: the reset boundary discards these without ever
+/// decoding one.
+#[cfg(test)]
+pub(crate) fn deferred_request_for_test(id: u32) -> DeferredRequest {
+    DeferredRequest {
+        id: yserver_protocol::x11::ClientId(id),
+        sequence: yserver_protocol::x11::SequenceNumber(1),
+        accepted_at: None,
+        header: yserver_protocol::x11::RequestHeader {
+            opcode: 127,
+            data: 0,
+            length_units: 1,
+        },
+        body: Vec::new(),
+        attached_fd: None,
+    }
+}
+
 fn blocked_by_server_grab(state: &ServerState, req: &DeferredRequest) -> bool {
     state.server_grab_owner.is_some_and(|owner| owner != req.id)
 }
 
 /// Restore parked server-grab requests to the fair queue without changing
 /// their per-client arrival order.
-fn release_server_grab_waiters(
+pub(crate) fn release_server_grab_waiters(
     deferred_requests: &mut FairRequestQueue,
     server_grab_waiters: &mut VecDeque<DeferredRequest>,
     telemetry: &mut LoopTelemetry,
@@ -747,7 +826,7 @@ fn disconnect_with_pending_cleanup(
     crate::core_loop::process_disconnect::process_disconnect(state, backend, client);
 }
 
-fn cancel_all_pending_backend_requests(
+pub(crate) fn cancel_all_pending_backend_requests(
     backend: &mut dyn Backend,
     pending: &mut PendingBackendRequests,
 ) {
@@ -941,7 +1020,7 @@ fn process_request_inline(
 /// Resume every asynchronous CRTC request whose backend result is ready.
 /// `finish_crtc_config` is called only while the originating client is still
 /// waiting, so a late worker completion can never install a cancelled mode.
-fn drain_ready_crtc_configs(
+pub(crate) fn drain_ready_crtc_configs(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     pending: &mut PendingBackendRequests,
