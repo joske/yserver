@@ -230,6 +230,45 @@ yserver-tcp-hw log="warn":
 #     produces a completely empty log — verified the hard way.
 # Deliberately prints no summary: this runs from a bare TTY, where console
 # output cannot be copied. Ask for `yserver-hw-startx.log` and grep it here.
+# Session 1 stamps a root property; the server resets when its last client
+# exits; session 2 must NOT see that property and must still have working
+# input. Watch the screen at the boundary: it should clear, and the display
+# must not blink or change mode.
+# Two consecutive sessions on ONE server — proves the #121 reset boundary.
+yserver-reset-hw log="info":
+    RUSTFLAGS="-C debug-assertions=yes" cargo build --release --bin yserver
+    bash -c '\
+        case "$(tty)" in /dev/tty[0-9]*) ;; *) echo "reset-hw: must be run from a TTY (got: $(tty))" >&2; exit 1;; esac;\
+        display=0;\
+        while [ -e /tmp/.X11-unix/X$display ]; do display=$((display+1)); done;\
+        authfile=$(mktemp /tmp/yserver-reset-auth.XXXXXX);\
+        userauth="${XAUTHORITY:-$HOME/.Xauthority}";\
+        cookie=$(mcookie);\
+        xauth -f "$authfile" add ":$display" . "$cookie";\
+        xauth -f "$userauth" add ":$display" . "$cookie";\
+        echo "reset-hw: DISPLAY=:$display, policy -reset";\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver "$display" -auth "$authfile" -reset > yserver-hw-reset.log 2>&1 &\
+        yserver_pid=$!;\
+        for i in $(seq 30); do [ -S /tmp/.X11-unix/X$display ] && break; sleep 1; done;\
+        export XAUTHORITY="$userauth" DISPLAY=":$display";\
+        echo "reset-hw: SESSION 1 — close the xterm to end it and trigger the reset";\
+        xprop -root -f YSERVER_RESET_PROBE 8s -set YSERVER_RESET_PROBE session-one;\
+        xterm -T "session 1 - close me" > /dev/null 2>&1;\
+        sleep 2;\
+        if ! kill -0 $yserver_pid 2>/dev/null; then echo "FAIL: the server exited instead of resetting"; exit 1; fi;\
+        echo "reset-hw: server survived the last client — reset fired";\
+        probe=$(xprop -root YSERVER_RESET_PROBE 2>&1);\
+        case "$probe" in *"not found"*|*"no such atom"*) echo "PASS: the root property did not survive the reset";; *) echo "FAIL: session 1 state leaked into session 2: $probe";; esac;\
+        echo "reset-hw: SESSION 2 — type in the xterm to check input, then close it";\
+        xterm -T "session 2 - type here, then close" > /dev/null 2>&1;\
+        sleep 2;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;\
+        xauth -f "$userauth" remove ":$display" 2>/dev/null;\
+        rm -f "$authfile";\
+        echo "";\
+        echo "reset-hw: done. Please send yserver-hw-reset.log from this directory."'
+
 startx log="info":
     RUSTFLAGS="-C debug-assertions=yes" cargo build --release --bin yserver
     bash -c '\
