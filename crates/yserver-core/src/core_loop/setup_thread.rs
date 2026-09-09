@@ -158,8 +158,15 @@ fn run_setup(
         Transport::Unix(_) => AuthTransport::Unix,
         Transport::Tcp(_) => AuthTransport::Tcp,
     };
+    // The generation handed to `check` is THIS thread's producer binding,
+    // captured at accept — never the counter's current value. An XDMCP
+    // session credential is bound to the generation its `Accept` belonged to,
+    // so a connection accepted in a destroyed session fails the comparison
+    // even if it reaches this line long after the reset, and even though the
+    // new session has by then installed a credential of its own.
     if let AuthVerdict::Reject(reason) = auth.check(
         auth_transport,
+        sender.generation(),
         &setup.auth_protocol_name,
         &setup.auth_protocol_data,
     ) {
