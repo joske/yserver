@@ -35,7 +35,7 @@ use yserver_protocol::x11::{self, ClientId};
 
 use crate::{
     core_loop::{
-        auth::{AuthState, AuthVerdict},
+        auth::{AuthState, AuthTransport, AuthVerdict},
         message::{Message, SetupAllocateResponse},
         sender::CoreSender,
     },
@@ -137,9 +137,11 @@ fn run_setup(
         id.0, setup.byte_order, setup.protocol_major, setup.protocol_minor
     );
 
-    if let AuthVerdict::Reject(reason) =
-        auth.check(&setup.auth_protocol_name, &setup.auth_protocol_data)
-    {
+    if let AuthVerdict::Reject(reason) = auth.check(
+        AuthTransport::Unix,
+        &setup.auth_protocol_name,
+        &setup.auth_protocol_data,
+    ) {
         warn!(
             "client {} auth rejected ({reason:?}); presented proto {:?}",
             id.0,

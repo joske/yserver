@@ -27,6 +27,16 @@ pub enum AuthVerdict {
     Reject(&'static str),
 }
 
+/// Connection locality supplied by the accepting transport.
+///
+/// Unix sockets retain Xorg's existing local-open behaviour. TCP is never
+/// admitted by that fallback: it must present a loaded MIT cookie.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthTransport {
+    Unix,
+    Tcp,
+}
+
 pub struct AuthState {
     file: Option<PathBuf>,
     inner: Mutex<Inner>,
@@ -134,13 +144,13 @@ fn load_outcome(path: &Path) -> LoadOutcome {
 }
 
 impl Inner {
-    fn verdict(&self, name: &[u8], data: &[u8]) -> AuthVerdict {
+    fn verdict(&self, transport: AuthTransport, name: &[u8], data: &[u8]) -> AuthVerdict {
         // Cookie match OR local-open admits (mirrors CheckAuthorization +
         // host-ACL fallthrough, os/connection.c:536-560).
         if name == MIT_MAGIC_COOKIE.as_bytes() && self.cookies.iter().any(|c| ct_eq(c, data)) {
             return AuthVerdict::Allow;
         }
-        if self.local_open {
+        if transport == AuthTransport::Unix && self.local_open {
             return AuthVerdict::Allow;
         }
         if name.is_empty() {
@@ -170,9 +180,20 @@ impl AuthState {
     }
 
     /// Authorize one client. Reloads lazily on file change, then decides.
-    pub fn check(&self, proto_name: &[u8], proto_data: &[u8]) -> AuthVerdict {
+    pub fn check(
+        &self,
+        transport: AuthTransport,
+        proto_name: &[u8],
+        proto_data: &[u8],
+    ) -> AuthVerdict {
         let Some(path) = self.file.as_deref() else {
-            return AuthVerdict::Allow;
+            return Inner {
+                last_mtime: None,
+                ever_loaded: false,
+                local_open: true,
+                cookies: Vec::new(),
+            }
+            .verdict(transport, proto_name, proto_data);
         };
         // Poisoning recovery — same pattern as setup_thread.rs:66.
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -181,7 +202,7 @@ impl AuthState {
             let outcome = load_outcome(path);
             inner.apply_load_outcome(outcome);
         }
-        inner.verdict(proto_name, proto_data)
+        inner.verdict(transport, proto_name, proto_data)
     }
 }
 
@@ -308,7 +329,7 @@ mod tests {
     fn verdict_cookie_match_allows() {
         let i = enforcing_with(vec![vec![9u8; 16]]);
         assert_eq!(
-            i.verdict(MIT_MAGIC_COOKIE.as_bytes(), &[9u8; 16]),
+            i.verdict(AuthTransport::Unix, MIT_MAGIC_COOKIE.as_bytes(), &[9u8; 16]),
             AuthVerdict::Allow
         );
     }
@@ -317,12 +338,15 @@ mod tests {
     fn verdict_enforcing_rejects() {
         let i = enforcing_with(vec![vec![9u8; 16]]);
         assert_eq!(
-            i.verdict(MIT_MAGIC_COOKIE.as_bytes(), &[0u8; 16]),
+            i.verdict(AuthTransport::Unix, MIT_MAGIC_COOKIE.as_bytes(), &[0u8; 16]),
             AuthVerdict::Reject(REASON_BAD_COOKIE)
         );
-        assert_eq!(i.verdict(b"", b""), AuthVerdict::Reject(REASON_NO_PROTO));
         assert_eq!(
-            i.verdict(b"XDM-AUTHORIZATION-1", &[0u8; 8]),
+            i.verdict(AuthTransport::Unix, b"", b""),
+            AuthVerdict::Reject(REASON_NO_PROTO)
+        );
+        assert_eq!(
+            i.verdict(AuthTransport::Unix, b"XDM-AUTHORIZATION-1", &[0u8; 8]),
             AuthVerdict::Reject(REASON_BAD_PROTO)
         );
     }
@@ -331,9 +355,9 @@ mod tests {
     fn verdict_local_open_allows_anything() {
         let mut i = fresh_open();
         i.local_open = true;
-        assert_eq!(i.verdict(b"", b""), AuthVerdict::Allow);
+        assert_eq!(i.verdict(AuthTransport::Unix, b"", b""), AuthVerdict::Allow);
         assert_eq!(
-            i.verdict(MIT_MAGIC_COOKIE.as_bytes(), &[0u8; 16]),
+            i.verdict(AuthTransport::Unix, MIT_MAGIC_COOKIE.as_bytes(), &[0u8; 16]),
             AuthVerdict::Allow
         );
     }
@@ -367,24 +391,27 @@ mod tests {
         let auth = AuthState::new(Some(path.clone()));
 
         assert_eq!(
-            auth.check(MIT_MAGIC_COOKIE.as_bytes(), &cookie),
+            auth.check(AuthTransport::Unix, MIT_MAGIC_COOKIE.as_bytes(), &cookie),
             AuthVerdict::Allow
         );
         assert_eq!(
-            auth.check(MIT_MAGIC_COOKIE.as_bytes(), &[0u8; 16]),
+            auth.check(AuthTransport::Unix, MIT_MAGIC_COOKIE.as_bytes(), &[0u8; 16]),
             AuthVerdict::Reject(REASON_BAD_COOKIE)
         );
-        assert_eq!(auth.check(b"", b""), AuthVerdict::Reject(REASON_NO_PROTO));
+        assert_eq!(
+            auth.check(AuthTransport::Unix, b"", b""),
+            AuthVerdict::Reject(REASON_NO_PROTO)
+        );
 
         // File vanishes after a successful load → stays enforcing; the
         // already-loaded cookie still validates (additive list).
         fs::remove_file(&path).unwrap();
         assert_eq!(
-            auth.check(MIT_MAGIC_COOKIE.as_bytes(), &cookie),
+            auth.check(AuthTransport::Unix, MIT_MAGIC_COOKIE.as_bytes(), &cookie),
             AuthVerdict::Allow
         );
         assert_eq!(
-            auth.check(MIT_MAGIC_COOKIE.as_bytes(), &[0u8; 16]),
+            auth.check(AuthTransport::Unix, MIT_MAGIC_COOKIE.as_bytes(), &[0u8; 16]),
             AuthVerdict::Reject(REASON_BAD_COOKIE),
             "missing-after-load does not reopen"
         );
@@ -393,7 +420,15 @@ mod tests {
     #[test]
     fn check_no_auth_file_is_open() {
         let auth = AuthState::new(None);
-        assert_eq!(auth.check(b"", b""), AuthVerdict::Allow);
+        assert_eq!(
+            auth.check(AuthTransport::Unix, b"", b""),
+            AuthVerdict::Allow
+        );
+        assert_eq!(
+            auth.check(AuthTransport::Tcp, b"", b""),
+            AuthVerdict::Reject(REASON_NO_PROTO),
+            "TCP must never inherit Unix local-open access"
+        );
     }
 
     #[test]
@@ -401,7 +436,15 @@ mod tests {
         let path = temp_path("empty");
         fs::write(&path, b"").unwrap();
         let auth = AuthState::new(Some(path.clone()));
-        assert_eq!(auth.check(b"", b""), AuthVerdict::Allow);
+        assert_eq!(
+            auth.check(AuthTransport::Unix, b"", b""),
+            AuthVerdict::Allow
+        );
+        assert_eq!(
+            auth.check(AuthTransport::Tcp, b"", b""),
+            AuthVerdict::Reject(REASON_NO_PROTO),
+            "an empty -auth file cannot authorize TCP"
+        );
         let _ = fs::remove_file(&path);
     }
 
@@ -413,10 +456,32 @@ mod tests {
         let path = temp_path("missing");
         let _ = fs::remove_file(&path); // ensure absent
         let auth = AuthState::new(Some(path));
-        assert_eq!(auth.check(b"", b""), AuthVerdict::Allow);
         assert_eq!(
-            auth.check(MIT_MAGIC_COOKIE.as_bytes(), &[0u8; 16]),
+            auth.check(AuthTransport::Unix, b"", b""),
             AuthVerdict::Allow
         );
+        assert_eq!(
+            auth.check(AuthTransport::Tcp, MIT_MAGIC_COOKIE.as_bytes(), &[0u8; 16]),
+            AuthVerdict::Reject(REASON_BAD_COOKIE),
+            "a missing auth file cannot authorize TCP"
+        );
+    }
+
+    #[test]
+    fn tcp_auth_requires_a_loaded_matching_cookie() {
+        let cookie = [0x51u8; 16];
+        let path = temp_path("tcp-cookie");
+        fs::write(&path, xauth_bytes(b"7", &cookie)).unwrap();
+        let auth = AuthState::new(Some(path.clone()));
+
+        assert_eq!(
+            auth.check(AuthTransport::Tcp, MIT_MAGIC_COOKIE.as_bytes(), &cookie),
+            AuthVerdict::Allow
+        );
+        assert_eq!(
+            auth.check(AuthTransport::Tcp, MIT_MAGIC_COOKIE.as_bytes(), &[0u8; 16]),
+            AuthVerdict::Reject(REASON_BAD_COOKIE)
+        );
+        let _ = fs::remove_file(path);
     }
 }
