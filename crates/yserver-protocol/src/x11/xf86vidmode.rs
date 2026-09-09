@@ -62,9 +62,10 @@ pub const CLOCK_FLAG_PROGRAMMABLE: u32 = 1;
 /// Xorg's fixed upper bound for a legacy hardware clock table.
 pub const MAX_CLOCKS: u32 = 128;
 
-/// `XF86VM_READ_PERMISSION`. Yserver never grants
-/// `XF86VM_WRITE_PERMISSION` (2): no VidMode mode-setting request exists.
+/// `XF86VM_READ_PERMISSION`.
 pub const PERMISSION_READ: u32 = 1;
+/// `XF86VM_WRITE_PERMISSION`.
+pub const PERMISSION_WRITE: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClientVersion {
@@ -422,13 +423,19 @@ pub fn encode_get_gamma_ramp_reply(
     out
 }
 
-/// Encode `GetPermissions` — read-only, never `XF86VM_WRITE_PERMISSION`.
+/// Encode `GetPermissions` for a local or remote client.
 #[must_use]
 pub fn encode_get_permissions_reply(
     byte_order: ClientByteOrder,
     sequence: SequenceNumber,
+    writable: bool,
 ) -> Vec<u8> {
-    encode_u32_reply(byte_order, sequence, PERMISSION_READ)
+    let permissions = if writable {
+        PERMISSION_READ | PERMISSION_WRITE
+    } else {
+        PERMISSION_READ
+    };
+    encode_u32_reply(byte_order, sequence, permissions)
 }
 
 #[cfg(test)]
@@ -580,13 +587,17 @@ mod tests {
     }
 
     #[test]
-    fn permissions_reply_is_read_only() {
-        let reply = encode_get_permissions_reply(ClientByteOrder::LittleEndian, SequenceNumber(3));
+    fn permissions_reply_encodes_writable_flag() {
+        let reply =
+            encode_get_permissions_reply(ClientByteOrder::LittleEndian, SequenceNumber(3), false);
         assert_eq!(reply.len(), 32);
         assert_eq!(u32::from_le_bytes(reply[4..8].try_into().unwrap()), 0);
-        // READ without WRITE — mode setting is not implemented.
         assert_eq!(u32::from_le_bytes(reply[8..12].try_into().unwrap()), 1);
         assert_eq!(&reply[12..32], &[0; 20]);
+
+        let reply =
+            encode_get_permissions_reply(ClientByteOrder::LittleEndian, SequenceNumber(3), true);
+        assert_eq!(u32::from_le_bytes(reply[8..12].try_into().unwrap()), 3);
     }
 
     #[test]

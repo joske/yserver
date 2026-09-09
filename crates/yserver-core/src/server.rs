@@ -2241,6 +2241,10 @@ impl ShapeWindowState {
 #[derive(Debug)]
 pub struct ClientState {
     pub writer: Arc<Mutex<Transport>>,
+    /// Transport-locality policy, matching Xorg's `ClientRec::local`.
+    pub is_local: bool,
+    /// Whether this connection can carry SCM_RIGHTS descriptors.
+    pub fd_passing: bool,
     pub byte_order: ClientByteOrder,
     pub last_sequence: Arc<AtomicU16>,
     pub resource_id_base: u32,
@@ -3694,6 +3698,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
         state.clients.insert(
@@ -3714,6 +3720,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
         // PropertyChange = 0x0040_0000
@@ -3742,6 +3750,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
         let subs = state.subscribers(ResourceId(0x100), 0x0040_0000);
@@ -3767,6 +3777,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             };
 
             assert_eq!(
@@ -3806,6 +3818,8 @@ mod tests {
             watching_writable: false,
             focused_window: crate::resources::ROOT_WINDOW,
             reader_control: None,
+            is_local: true,
+            fd_passing: true,
         };
 
         // Button bits come from device 0; motion bit from either. First-match
@@ -3841,6 +3855,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             };
 
             assert_eq!(
@@ -3871,6 +3887,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
         assert_eq!(state.subscribers(ResourceId(0x100), 0x0040_0000).len(), 1);
@@ -3899,6 +3917,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
         state.clients.insert(
@@ -3919,6 +3939,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
 
@@ -3962,6 +3984,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
 
@@ -4002,6 +4026,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
         state.clients.insert(
@@ -4022,6 +4048,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
 
@@ -4079,6 +4107,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
         assert_eq!(state.subscribers(ResourceId(0x100), 0x0040_0000).len(), 1);
@@ -4175,6 +4205,8 @@ mod tests {
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
+                    is_local: true,
+                    fd_passing: true,
                 },
             );
             s.clients.insert(
@@ -4195,6 +4227,8 @@ mod tests {
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
+                    is_local: true,
+                    fd_passing: true,
                 },
             );
             s.set_pointer_grab(ActivePointerGrab {
@@ -4334,6 +4368,8 @@ mod tests {
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
+                    is_local: true,
+                    fd_passing: true,
                 },
             );
             s.clients.insert(
@@ -4354,6 +4390,8 @@ mod tests {
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
+                    is_local: true,
+                    fd_passing: true,
                 },
             );
             s.set_pointer_grab(ActivePointerGrab {
@@ -4494,6 +4532,8 @@ mod tests {
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
+                    is_local: true,
+                    fd_passing: true,
                 },
             );
             s.clients.insert(
@@ -4514,6 +4554,8 @@ mod tests {
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
+                    is_local: true,
+                    fd_passing: true,
                 },
             );
             s.set_pointer_grab(ActivePointerGrab {
@@ -4613,6 +4655,8 @@ mod tests {
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
+                    is_local: true,
+                    fd_passing: true,
                 },
             );
             s.clients.insert(
@@ -4633,6 +4677,8 @@ mod tests {
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
+                    is_local: true,
+                    fd_passing: true,
                 },
             );
             s.clients.insert(
@@ -4653,6 +4699,8 @@ mod tests {
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
+                    is_local: true,
+                    fd_passing: true,
                 },
             );
         }
@@ -4752,6 +4800,8 @@ mod tests {
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
+                    is_local: true,
+                    fd_passing: true,
                 },
             );
             s.clients.insert(
@@ -4772,6 +4822,8 @@ mod tests {
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
+                    is_local: true,
+                    fd_passing: true,
                 },
             );
         }
@@ -4871,6 +4923,8 @@ mod tests {
                     watching_writable: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
+                    is_local: true,
+                    fd_passing: true,
                 },
             );
         }
@@ -4993,6 +5047,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
     }
@@ -5448,6 +5504,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
         let (win, px, py, _subs) = state

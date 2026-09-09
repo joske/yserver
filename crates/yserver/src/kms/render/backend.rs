@@ -28794,6 +28794,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: yserver_core::resources::ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
         state.randr_select_masks.insert(
@@ -38959,6 +38961,8 @@ mod tests {
                 watching_writable: false,
                 focused_window: ROOT_WINDOW,
                 reader_control: None,
+                is_local: true,
+                fd_passing: true,
             },
         );
     }
