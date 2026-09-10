@@ -236,8 +236,9 @@ yserver-tcp-hw log="warn":
 # Deliberately no -auth: the session cookie arrives in the manager's Accept,
 # and -query implies -reset, so logging out wipes the session and re-queries
 # for a fresh greeter. Runs in the FOREGROUND on this VT; stop it with
-# `pkill -TERM yserver` from another VT, or pass once=1 to exit after one
-# session (which also exercises -once).
+# `pkill -TERM yserver` from another VT. Arguments are POSITIONAL:
+#   just yserver-xdmcp-hw 192.168.1.5 info 1
+# is manager, log level, and 1 for -once (which also exercises -once).
 # yserver as an XDMCP display, driven by a display manager.
 yserver-xdmcp-hw manager="127.0.0.1" log="info" once="0":
     RUSTFLAGS="-C debug-assertions=yes" cargo build --release --bin yserver
