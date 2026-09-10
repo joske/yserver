@@ -259,8 +259,9 @@ Then, from a TTY on the machine that will *be* the display:
 yserver :7 -query <manager-host> -listen tcp
 ```
 
-or `just yserver-xdmcp-hw manager=<host>`, which does the same and captures a
-log.
+or `just yserver-xdmcp-hw <manager-host>`, which does the same and captures a
+log. `just` arguments are positional, so the manager comes first, then the log
+level, then `1` for `-once`.
 
 No `-auth` is needed or wanted: the manager sends a per-session cookie in its
 reply, and while XDMCP is driving, that cookie is the **only** thing that
