@@ -410,6 +410,9 @@ pub fn run(display: u16, width: u16, height: u16) -> io::Result<()> {
         // (`project_discontinue_ynest`), and a reset on the last one
         // leaving would look exactly like a crash.
         crate::core_loop::ResetPolicy::NoReset,
+        // Likewise no XDMCP: the nested harness is not a display manager's
+        // display.
+        None,
     )
 }
 

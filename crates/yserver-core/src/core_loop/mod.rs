@@ -24,6 +24,7 @@ pub mod reset;
 pub mod run;
 pub mod sender;
 pub mod setup_thread;
+pub mod xdmcp;
 pub mod xi1_focus;
 pub mod xi1_state_notify;
 pub mod xkb_layout;
@@ -37,3 +38,4 @@ pub use message::{
 pub use reset::ResetPolicy;
 pub use run::{handle_host_input, run_core};
 pub use sender::{BoundSender, CoreReceiver, CoreSender, NOTIFY_TOKEN, channel};
+pub use xdmcp::{XdmcpMode, XdmcpService, XdmcpSetup};

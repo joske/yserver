@@ -266,6 +266,7 @@ fn tcp_loopback_cookie_setup_and_listener_capabilities() {
             &ClientIdAllocator::new(),
             auth,
             yserver_core::core_loop::ResetPolicy::NoReset,
+            None,
         );
         let mut capabilities: Vec<_> = state
             .clients
