@@ -3292,6 +3292,18 @@ fn handle_client_setup_complete(
         sender.bind_to(generation),
     )?;
 
+    // At INFO deliberately: this is the only place a log says which
+    // transport a client arrived on. In an XDMCP deployment that is the
+    // first question worth asking, because it decides whether DRI3 and
+    // MIT-SHM were available to that client at all — and it should not
+    // require raising the log level of a whole session to find out.
+    log::info!(
+        "client {} established over {} (fd passing {})",
+        id.0,
+        if is_local { "unix" } else { "TCP" },
+        if fd_passing { "on" } else { "off" },
+    );
+
     // Reaching here is what "ESTABLISHED" means: the poller registration
     // and the reader spawn have both succeeded, so the client can
     // actually participate in the loop. The reset trigger is NOT armed
