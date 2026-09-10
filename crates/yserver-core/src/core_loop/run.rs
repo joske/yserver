@@ -3292,10 +3292,11 @@ fn handle_client_setup_complete(
         sender.bind_to(generation),
     )?;
 
-    // The single production site where a client becomes ESTABLISHED, and
-    // therefore the only place the reset trigger is armed. Deliberately
-    // LAST, after both the poller registration and the reader spawn have
-    // succeeded — not at the `state.clients.insert` above.
+    // Reaching here is what "ESTABLISHED" means: the poller registration
+    // and the reader spawn have both succeeded, so the client can
+    // actually participate in the loop. The reset trigger is NOT armed
+    // here — see the note at the end of this function — but this is the
+    // point the caller's arming decision is about.
     //
     // Xorg's equivalent is `client->clientState = ClientStateRunning`
     // (`dix/dispatch.c:3762`), set only after the setup reply is written
@@ -3305,8 +3306,8 @@ fn handle_client_setup_complete(
     // `spawn` fails cannot participate in the core loop at all — it
     // produces no request and no reader thread — so it is not the
     // analogue of Running. Arming at the insert instead would let the
-    // caller's own error path (`run.rs:1491`, which disconnects a failed
-    // setup) fire a reset for a client that never ran.
+    // caller's own error path — which disconnects a failed setup — fire a
+    // reset for a client that never ran.
     //
     // Everything that ends before this line must arm nothing: a port
     // scan on the TCP listener, a handshake that drops half-way, a
