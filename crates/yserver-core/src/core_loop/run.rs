@@ -3336,6 +3336,56 @@ fn handle_client_setup_complete(
     Ok(())
 }
 
+/// Is `peer` one of this machine's own addresses?
+///
+/// Xorg's `xtransLocalClient` (`os/access.c`) treats an AF_UNIX peer as
+/// local, and otherwise compares the peer against `selfhosts` — the
+/// addresses `DefineSelf` collected from the interfaces. So a TCP
+/// connection from the machine's own address is a LOCAL client there, and
+/// keeps the locality-gated extensions.
+///
+/// Queried per accept rather than snapshotted at startup: accepts are
+/// rare, `getifaddrs` is cheap, and a cached set goes stale across a
+/// hotplug or a DHCP renewal. Xorg snapshots and then patches with
+/// `AugmentSelf`; asking each time is simpler and cannot drift.
+///
+/// Not implemented: Xorg additionally treats a client whose command name
+/// is `ssh` as non-local, to catch a forwarded connection. That is a
+/// heuristic on `/proc`, and `ssh -X` reaches us over a UNIX socket
+/// anyway.
+fn address_is_ours(peer: std::net::IpAddr) -> bool {
+    if peer.is_loopback() {
+        return true;
+    }
+    let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: `getifaddrs` fills `ifap` with an owned list on success; we
+    // walk it without retaining anything and free it before returning.
+    if unsafe { libc::getifaddrs(&raw mut ifap) } != 0 {
+        return false;
+    }
+    let mut found = false;
+    let mut cur = ifap;
+    while !cur.is_null() {
+        // SAFETY: `cur` is a node of the list `getifaddrs` just built, and
+        // `ifa_addr` is either null or a valid `sockaddr` for its family.
+        let addr = unsafe { (*cur).ifa_addr };
+        if !addr.is_null() && unsafe { (*addr).sa_family } == libc::AF_INET as libc::sa_family_t {
+            let sin = addr.cast::<libc::sockaddr_in>();
+            // SAFETY: family said AF_INET, so the node is a sockaddr_in.
+            let raw = unsafe { (*sin).sin_addr.s_addr };
+            if std::net::IpAddr::V4(std::net::Ipv4Addr::from(u32::from_be(raw))) == peer {
+                found = true;
+                break;
+            }
+        }
+        // SAFETY: as above; `ifa_next` is null at the end of the list.
+        cur = unsafe { (*cur).ifa_next };
+    }
+    // SAFETY: `ifap` is exactly what `getifaddrs` returned and is freed once.
+    unsafe { libc::freeifaddrs(ifap) };
+    found
+}
+
 /// Accept at most this many connections per listener and core iteration.
 const ACCEPT_BUDGET: usize = 16;
 
@@ -3398,20 +3448,26 @@ fn accept_pending(
     auth: &Arc<AuthState>,
 ) -> bool {
     for _ in 0..ACCEPT_BUDGET {
-        let (accepted, is_local, fd_passing) = match listener {
-            Listener::Unix(listener) => (
-                listener.accept().map(|(stream, _)| Transport::Unix(stream)),
-                true,
-                true,
-            ),
-            Listener::Tcp(listener) => (
-                listener.accept().map(|(stream, _)| Transport::Tcp(stream)),
-                false,
-                false,
-            ),
+        let accepted = match listener {
+            Listener::Unix(listener) => listener
+                .accept()
+                .map(|(stream, _)| (Transport::Unix(stream), true, true)),
+            Listener::Tcp(listener) => listener.accept().map(|(stream, peer)| {
+                // `is_local` is an ADDRESS property, `fd_passing` is a
+                // TRANSPORT one, and this is the site that must not
+                // conflate them. `SCM_RIGHTS` is impossible over TCP
+                // whoever the peer is, so fd passing is always off here.
+                // Locality is not: Xorg's `xtransLocalClient`
+                // (`os/access.c`) answers TRUE for a TCP peer whose
+                // address is one of the server's own, which is why a
+                // same-machine client keeps MIT-SHM — its `Attach` passes
+                // a SysV shmid, an integer on the wire, so shared memory
+                // works fine without a descriptor.
+                (Transport::Tcp(stream), address_is_ours(peer.ip()), false)
+            }),
         };
         match accepted {
-            Ok(stream) => {
+            Ok((stream, is_local, fd_passing)) => {
                 let id = client_id_allocator.allocate();
                 // Bind the connection's producer HERE, at accept: this
                 // is the moment that decides which session the client
@@ -4481,6 +4537,34 @@ mod tests {
     /// client, because the orphan rule deliberately spares local ones
     /// (Xorg's `XdmcpOpenDisplay` ignores a unix client, which the XDMCP
     /// cookie never authorized).
+    /// `is_local` is an ADDRESS property. A TCP peer on this machine is a
+    /// local client — Xorg's `xtransLocalClient` says so — and therefore
+    /// keeps MIT-SHM, whose legacy `Attach` passes a SysV shmid rather
+    /// than a descriptor and so works fine without fd passing.
+    ///
+    /// Deriving it from the transport instead, as this did until
+    /// 2026-09-10, refused shared memory to a same-machine XDMCP session
+    /// (`DISPLAY=127.0.0.1:1`) and pushed every image over the wire.
+    #[test]
+    fn a_tcp_peer_on_this_machine_is_a_local_client() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        assert!(
+            address_is_ours(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            "127.0.0.1 is ours"
+        );
+        assert!(
+            address_is_ours(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))),
+            "the whole loopback range is ours, not just 127.0.0.1"
+        );
+        // TEST-NET-3 (RFC 5737): reserved for documentation, so it cannot
+        // be a real interface address on the machine running this test.
+        assert!(
+            !address_is_ours(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))),
+            "a documentation-range address is not ours"
+        );
+    }
+
     #[test]
     fn an_orphaned_xdmcp_client_does_not_reset_the_generation() {
         use crate::backend::recording::RecordingBackend;

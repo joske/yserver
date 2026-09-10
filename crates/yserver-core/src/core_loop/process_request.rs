@@ -494,10 +494,33 @@ fn reject_non_local_extension_request(
     sequence: SequenceNumber,
     header: RequestHeader,
 ) -> Option<io::Result<RequestOutcome>> {
-    let is_local = state
+    let (is_local, fd_passing) = state
         .clients
         .get(&client_id.0)
-        .is_none_or(|client| client.is_local);
+        .map_or((true, true), |client| (client.is_local, client.fd_passing));
+
+    // DRI3 needs a DESCRIPTOR, not merely a local peer — every one of its
+    // requests either sends or receives one. So it is gated on
+    // `fd_passing`, which is false for any TCP peer however local.
+    //
+    // This is finer-grained than Xorg, deliberately. There a loopback TCP
+    // client is `client->local` (`xtransLocalClient`, os/access.c), so
+    // DRI3 dispatch is allowed and the request fails later, at the
+    // descriptor it cannot carry. Same refusal, worse diagnosis: the
+    // client sees the extension work and then break. Refusing at the gate
+    // reports `BadMatch` where the client already handles it.
+    if header.opcode == 147 && !fd_passing {
+        return Some(emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_MATCH,
+            0,
+            u16::from(header.data),
+            147,
+        ));
+    }
+
     if is_local {
         return None;
     }
