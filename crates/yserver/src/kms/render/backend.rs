@@ -37070,7 +37070,7 @@ mod tests {
     ///   - an explicit import reports back that same modifier;
     ///   - stride and offset survive the round trip unchanged.
     #[test]
-    #[ignore = "needs live Vulkan ICD and a render node"]
+    #[ignore = "needs a Vulkan ICD that can export dma-bufs (not lavapipe)"]
     fn dri3_imported_pixmap_exports_the_clients_own_description() {
         use yserver_core::backend::Dri3ImportModifier;
         const INVALID: u64 = crate::kms::vk::dri3::DRM_FORMAT_MOD_INVALID;
@@ -37088,17 +37088,26 @@ mod tests {
         // dual-GPU host, and skipping when a node is missing made an
         // earlier version of this test pass vacuously.
         let (w, h) = (256u16, 64u16);
-        // Past this point nothing may "skip". A missing Vulkan ICD is a
-        // legitimate skip and is handled above; a fixture that cannot
-        // build once Vulkan IS up is a broken test, and letting it
-        // return green is how the first version of this test passed
-        // vacuously.
         let seed = b
             .create_pixmap(None, 32, w, h)
             .expect("fixture: create_pixmap with a live Vk context");
-        let seed_export = b
-            .dri3_export_pixmap_buffers(seed.as_raw())
-            .expect("fixture: export the seed pixmap");
+        // The real precondition is not "Vulkan initialised" but "this
+        // device can hand out an exportable dma-buf". CI runs the
+        // ignored tests on lavapipe, which initialises fine and then
+        // cannot allocate exportable storage -- that is a legitimate
+        // "not here", not a failure.
+        //
+        // Everything else IS a failure. Skipping on any error is how an
+        // earlier version of this test passed vacuously, and the point of
+        // the narrow match is to keep that door shut.
+        let seed_export = match b.dri3_export_pixmap_buffers(seed.as_raw()) {
+            Ok(e) => e,
+            Err(e) if e.to_string().contains("ERROR_FORMAT_NOT_SUPPORTED") => {
+                eprintln!("skip: ICD cannot export dma-bufs (lavapipe on CI): {e}");
+                return;
+            }
+            Err(e) => panic!("fixture: export the seed pixmap: {e}"),
+        };
         assert!(
             seed_export.size > 0 && seed_export.stride > 0,
             "fixture: seed export must describe a real buffer, got size={} stride={}",
