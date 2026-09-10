@@ -197,13 +197,14 @@ back to `START_CONNECTION` and immediately resend `Request`. This is
 Xorg-faithful: a malformed or short `Accept` falls through `recv_accept_msg`
 without touching `state`, so retransmission handles it.
 
-⚠ **The "and therefore it is bounded" half of this argument is WRONG, found in
-implementation.** `receive_packet` sets `timeOutRtx = 0` at `xdmcp.c:729` —
-*before* `XdmcpReadHeader` and before the version check. **Any** datagram
-resets the retransmission counter, including garbage, a wrong version, or an
-unknown opcode. So the retry limit is only reachable against a **silent**
-manager; one that keeps answering badly holds the counter at zero forever, and
-`XdmcpDeadSession` is never reached. See "Two Xorg behaviours to decide on".
+The "and therefore it is bounded" half of this argument is only true **because
+of divergence B below**. In Xorg it is false: `receive_packet` sets
+`timeOutRtx = 0` at `xdmcp.c:729`, before the header is parsed, so any datagram
+resets the counter and the retry limit is reachable only against a *silent*
+manager. Under B — reset only on a packet accepted for the current state — a
+manager that keeps answering badly does exhaust the budget, which is what makes
+staying in `AWAIT_REQUEST_RESPONSE` a bounded choice rather than an unbounded
+one.
 
 Any provisional cookie from the rejected offer is cleared regardless.
 
@@ -228,6 +229,14 @@ authorize a TCP client while XDMCP is driving the session. Honouring both
 would let a cookie in a local file authorize a client in a session it has
 nothing to do with, which defeats the per-session model this whole stage is
 built on. Unix clients are unaffected.
+
+**"In XDMCP mode" is fixed at process start**, decided by the presence of an
+XDMCP option — not by whether an `Accept` has arrived (confirmed 2026-09-10).
+So: before the first `Accept`, fail closed; after it, that offer's cookie;
+after a reset, refused by generation mismatch. There is never a window in
+which a `-auth` file cookie authorizes a TCP client, not even the one before
+the first offer. Deciding it from state instead would create exactly that
+window, and it would move under the server as sessions come and go.
 
 #### 2. XDMCP owns the reset policy
 
@@ -268,36 +277,58 @@ Xorg's `:252-312`. `-cookie` (the XDM-AUTHENTICATION-1 key) is parsed and
 rejected with a clear message rather than silently ignored, since accepting it
 would imply an authentication mode we do not implement.
 
-## Two Xorg behaviours to decide on before the socket exists
+## Two deliberate hardening divergences from Xorg
 
-Both found by reading the handlers during step 2, neither mentioned anywhere
-above until now. **Nothing is exposed yet** — no socket is wired until plan
-step 6 — but both need a decision before one is.
+**Decided 2026-09-10 (jos, codex).** Both were found while implementing the
+state machine; both look like oversights in `os/xdmcp.c` rather than choices;
+neither costs functionality. Faithful implementations existed first, so each
+is a small local change with its own tests.
 
-**1. `Unwilling` is fatal in every state, and its status field is never read.**
-`receive_packet`'s `case UNWILLING:` (`xdmcp.c:741`) calls `XdmcpFatal` with a
-canned message, with no state guard and no length check. So an unsolicited
-`Unwilling` datagram kills a **live** session — from anyone who can reach the
-port, at any time.
+### A. `Unwilling` may not kill a live session
 
-Recommended divergence: gate it on the collect states, where we are actually
-awaiting a `Willing`. In `RunSession` ignore it, exactly as `Refuse` is
-ignored there (`xdmcp.c:1264`). Costs no functionality; removes a remote kill.
+Xorg: `receive_packet`'s `case UNWILLING:` (`xdmcp.c:741`) calls `XdmcpFatal`
+with **no state guard**, **no length check**, and without ever reading the
+packet's status field. An unsolicited datagram terminates a running desktop.
 
-**2. Any datagram resets the retransmission counter.** `timeOutRtx = 0` at
-`xdmcp.c:729` runs before the header is even parsed, so the backoff and the
-retry limit are defeated by *any* inbound traffic.
+Ours, in three parts:
 
-Recommended divergence: reset the counter only on a datagram that decodes,
-carries the right version, and is relevant to the current state. Otherwise the
-retransmission limit — which this spec relies on as the bound on a
-misbehaving manager, and which `-once` relies on to terminate — is unreachable
-whenever anyone is sending us packets.
+1. **Meaningful only in the collection states.** Ignored everywhere else, and
+   emphatically in `RunSession` — exactly as `Refuse` is already ignored there
+   (`xdmcp.c:1264`).
+2. **Under `-query`, only from the configured manager.** Check the source
+   address; an `Unwilling` from anywhere else is not ours to act on.
+3. **Under `-broadcast` and `-indirect`, one unwilling manager does not abort
+   the collection.** Keep waiting for a `Willing` from another. Aborting on the
+   first refusal defeats the point of asking several.
 
-Both are cases where Xorg's behaviour looks like an oversight rather than a
-decision, and where XDMCP's "assume a trusted network" premise is doing more
-work than it should. Faithful implementations of both are in the state machine
-already, so switching to either divergence is a small, local change.
+### B. Only a *semantically accepted* packet resets the retry budget
+
+Xorg: `timeOutRtx = 0` at `xdmcp.c:729`, before `XdmcpReadHeader` and before
+the version check. **Any** datagram resets it.
+
+This is not cosmetic — it falsified this spec's own reasoning. The argument for
+staying in `AWAIT_REQUEST_RESPONSE` on a bad `Accept` was that the retry limit
+bounds the loop; in fact the limit is reachable only against a **silent**
+manager. A peer that keeps answering badly holds the counter at zero forever,
+and `-once` then never terminates either.
+
+Ours: reset the retransmission state only once a packet has been **accepted
+for the current state** — right version, recognised opcode, correct state, and
+matching identifiers or source where those apply. So a wrong-version packet, an
+unknown opcode, a malformed `Accept`, a wrong-session `Alive` and a late
+`Refuse` all leave the budget untouched. That restores the bounded-retry claim
+and makes `-once` terminate even against a peer deliberately feeding rubbish.
+
+### Tests these require
+
+- An `Unwilling` arriving in `RunSession` is ignored and the session survives.
+- Under `-query`, an `Unwilling` from an address other than the configured
+  manager is ignored.
+- Under `-broadcast`/`-indirect`, an `Unwilling` does not end the collection; a
+  subsequent `Willing` from another manager is still accepted.
+- Retry exhaustion **while a peer is sending undecodable or irrelevant
+  datagrams**: the budget still runs out, `XdmcpDeadSession` fires, and under
+  `-once` the server terminates.
 
 ## Invariants
 
