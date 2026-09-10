@@ -673,11 +673,31 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   daemon and the session. Query → Willing → Request → Accept → Manage, a MATE
   session, logout, reset, re-query, an XFCE session, logout — the full loop
   twice in one run, with a **fresh 16-byte session cookie installed per
-  generation**. 59 clients established in the second generation, every one
-  over TCP with fd passing off. This is the first exercise of `FamilyInternet`
-  cookie selection: loopback cannot reach it, because xtrans rewrites
-  `127.0.0.1` to FamilyLocal before the lookup. Both hardware checks the reset
-  work still owed are covered by the same run.
+  generation**, and every client that established did so over TCP with fd
+  passing off. This is the first exercise of `FamilyInternet` cookie
+  selection: loopback cannot reach it, because xtrans rewrites `127.0.0.1` to
+  FamilyLocal before the lookup. Both hardware checks the reset work still
+  owed are covered by the same run.
+
+  **The log is a CLOBBERED file, and no per-client count may be taken from
+  it.** An earlier revision of this note claimed "59 clients established in
+  the second generation"; that number is withdrawn. The run predates
+  `b634bb56`, so the recipe still wrote a fixed `yserver-hw-xdmcp.log` with
+  `>`: two runs opened the same path with independent write offsets and the
+  later one's bytes landed inside the earlier one's file. The evidence, in
+  case a future log looks like this: timestamps run backwards at one point
+  (09:04:03 → 08:54:24), there is only one startup banner for two runs, and a
+  block of `KeepAlive`/`Alive` targets `127.0.0.1:177` in a run configured for
+  `192.168.1.40:177` — which `XdmcpService` cannot emit, because `manager` is
+  resolved once at construction and never reassigned, and `restart()` only
+  feeds `Start`. Client ids being monotonic in file order is **not** evidence
+  of a single writer here: two id sequences interleave by offset, not by value.
+
+  What does survive attribution is the part that matters: a single process
+  logged `Generation(1)` and then `Generation(2)`, which no second process
+  could produce, and both boundaries ran the full
+  Query → Willing → Request → Accept → Manage to `192.168.1.40` on display 2
+  with a fresh cookie. Counts need a re-run under the timestamped recipe.
   *Six clients refused* at the logout boundary for presenting no authorization
   at all — after the new cookie was installed, so not the fail-closed window;
   old-session components reconnecting during teardown. Nothing was lost.
