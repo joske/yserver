@@ -254,11 +254,16 @@ yserver-xdmcp-hw manager="127.0.0.1" log="info" once="0":
         echo "xdmcp-hw: if nothing appears, grep the log for Willing to tell";\
         echo "xdmcp-hw:   \"manager never answered\" from \"negotiation failed\"";\
         echo "";\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver "$display" -query "{{manager}}" -listen tcp $once > yserver-hw-xdmcp.log 2>&1;\
+        log="yserver-hw-xdmcp-$(date +%Y%m%d-%H%M%S).log";\
+        echo "xdmcp-hw: logging to $log";\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver "$display" -query "{{manager}}" -listen tcp $once > "$log" 2>&1;\
         rc=$?;\
         echo "";\
-        echo "xdmcp-hw: yserver exited ($rc). Please send yserver-hw-xdmcp.log from this directory.";\
-        grep -ciE "willing|accept|manage" yserver-hw-xdmcp.log | xargs -I{} echo "xdmcp-hw: {} negotiation lines in the log"'
+        echo "xdmcp-hw: yserver exited ($rc). Please send $log from this directory.";\
+        echo "xdmcp-hw: $(grep -ciE "willing|accept|manage" "$log") negotiation lines";\
+        n=$(grep -c "outbound cap exceeded" "$log");\
+        [ "$n" != "0" ] && echo "xdmcp-hw: !! $n clients DISCONNECTED on the outbound cap -- see the log";\
+        true'
 
 # Session 1 stamps a root property WHILE its xterm holds the display open --
 # a one-shot client like xprop is itself the last client, so on a -reset
@@ -278,8 +283,9 @@ yserver-reset-hw log="info":
         cookie=$(mcookie);\
         xauth -f "$authfile" add ":$display" . "$cookie";\
         xauth -f "$userauth" add ":$display" . "$cookie";\
-        echo "reset-hw: DISPLAY=:$display, policy -reset";\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver "$display" -auth "$authfile" -reset > yserver-hw-reset.log 2>&1 &\
+        resetlog="yserver-hw-reset-$(date +%Y%m%d-%H%M%S).log";\
+        echo "reset-hw: DISPLAY=:$display, policy -reset, logging to $resetlog";\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver "$display" -auth "$authfile" -reset > "$resetlog" 2>&1 &\
         yserver_pid=$!;\
         for i in $(seq 30); do [ -S /tmp/.X11-unix/X$display ] && break; sleep 1; done;\
         export XAUTHORITY="$userauth" DISPLAY=":$display";\
@@ -303,7 +309,7 @@ yserver-reset-hw log="info":
         xauth -f "$userauth" remove ":$display" 2>/dev/null;\
         rm -f "$authfile";\
         echo "";\
-        echo "reset-hw: done. Please send yserver-hw-reset.log from this directory."'
+        echo "reset-hw: done. Please send $resetlog from this directory."'
 
 startx log="info":
     RUSTFLAGS="-C debug-assertions=yes" cargo build --release --bin yserver

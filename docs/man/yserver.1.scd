@@ -63,8 +63,19 @@ how the server is started:
 	number — every interface, not just loopback.
 
 	*-listen tcp* requires *-auth* with a usable MIT-MAGIC-COOKIE-1 file
-	and refuses to start without one. Read the warning under *SECURITY*
-	before using it.
+	and refuses to start without one, unless an XDMCP option supplies
+	the credential instead. Read the warning under *SECURITY* before
+	using it.
+
+	*A client that cannot keep up is disconnected.* Output that cannot
+	be written is buffered per client, and a client whose backlog grows
+	past 4 MiB is dropped rather than allowed to consume memory without
+	bound. A single large reply is always buffered whole, so this is
+	about sustained backlog, not one big transfer — but a burst to a
+	slow link, such as the event storm from a screen reconfiguration,
+	can reach it. *Xorg*(1) keeps buffering instead. If clients die
+	during a display-settings change over a slow link, look for
+	*outbound cap exceeded* in the log.
 
 *-noreset*, *-reset*, *-terminate*
 	What to do when the last client that completed connection setup
