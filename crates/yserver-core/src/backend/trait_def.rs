@@ -340,11 +340,22 @@ pub enum Dri3ImportModifier {
     /// The client named the layout (`PixmapFromBuffers`). `0` here is a
     /// real, explicit `DRM_FORMAT_MOD_LINEAR` and must stay meaningful.
     Explicit(u64),
-    /// The client did not name it (`PixmapFromBuffer`). The backend must
-    /// resolve the concrete modifier from the dma-buf, and must fail the
-    /// import if it cannot — a wrong successful import is worse than a
-    /// refused one.
-    Implicit,
+    /// The client did not name it (`PixmapFromBuffer`), and carried a
+    /// buffer `size` on the wire that an export must report verbatim.
+    ///
+    /// **The backend cannot currently resolve the real layout**, and does
+    /// not pretend to: it builds its own Vulkan view as if the buffer
+    /// were linear, records the layout as unknown, and reports
+    /// `DRM_FORMAT_MOD_INVALID` to anyone who asks — so a client can
+    /// resolve the layout itself, which is what fixes #138. The
+    /// consequence is that the *server's* view of such a pixmap is
+    /// wrong whenever the buffer is not in fact linear, so anything
+    /// that would sample or scan it out server-side must refuse it
+    /// rather than render garbage. Making the view itself correct needs
+    /// an EGL implicit-import path or a driver-specific layout
+    /// resolver; gbm cannot do it on amdgpu (measured: it answers
+    /// `DRM_FORMAT_MOD_INVALID` even for its own fresh allocation).
+    Implicit { size: u32 },
 }
 
 /// rather than the whole extension.

@@ -2928,6 +2928,15 @@ impl KmsBackend {
 
         let import = self.store.get(source_id).and_then(|drawable| {
             let metadata = drawable.storage.imported_dmabuf.as_ref()?;
+            // An unresolved layout must never reach KMS. The client never
+            // named it (legacy `PixmapFromBuffer`), so `metadata.modifier`
+            // is our linear guess; scanning a tiled buffer out as linear
+            // puts garbage on the display, and `add_fb2` may well accept
+            // it. Refuse the direct path and let the ordinary composite
+            // handle the pixmap instead.
+            if metadata.implicit_layout {
+                return None;
+            }
             let plane = metadata.planes.first()?;
             let fd = drawable
                 .storage
@@ -24323,15 +24332,17 @@ impl Backend for KmsBackend {
         // allocation -- so there is nothing to resolve against. i915 does
         // report a concrete modifier, but a fix that only works on Intel
         // is not a fix.
-        let (vk_modifier, reported_modifier) = match modifier {
-            Dri3ImportModifier::Explicit(m) => (m, Some(m)),
+        let (vk_modifier, reported_modifier, client_size, implicit_layout) = match modifier {
+            Dri3ImportModifier::Explicit(m) => (m, Some(m), None, false),
             // LINEAR is a best-effort for OUR OWN Vulkan view of the
             // buffer, which is only ever sampled if the server itself
             // composites this pixmap. It is deliberately NOT what we
             // report back.
-            Dri3ImportModifier::Implicit => (
+            Dri3ImportModifier::Implicit { size } => (
                 crate::kms::vk::dri3::DRM_FORMAT_MOD_LINEAR,
                 Some(crate::kms::vk::dri3::DRM_FORMAT_MOD_INVALID),
+                Some(size),
+                true,
             ),
         };
         let modifier = vk_modifier;
@@ -24343,6 +24354,7 @@ impl Backend for KmsBackend {
             format,
             modifier,
             reported_modifier,
+            client_size,
             &[crate::kms::vk::dri3::DmabufPlane {
                 offset: u64::from(offset),
                 pitch: stride,
@@ -24375,6 +24387,7 @@ impl Backend for KmsBackend {
                 fourcc,
                 vk_format: format,
                 modifier,
+                implicit_layout,
                 planes: vec![ImportedDmabufPlane {
                     offset: u64::from(offset),
                     pitch: stride,
@@ -37040,6 +37053,95 @@ mod tests {
     /// (depth, bpp) combinations with a non-empty error before
     /// touching the dma-buf fd. Exercises the guard above the
     /// `import_dmabuf` call. Vk-attached so we hit the second
+    /// #138 regression, at the metadata boundary that actually broke.
+    ///
+    /// An imported pixmap must be handed back to the client **as the
+    /// client described it**. Two separate lies used to live here:
+    /// a legacy `PixmapFromBuffer` was recorded as explicit LINEAR, and
+    /// every export re-derived its answer from our own VkImage rather
+    /// than from the client's buffer. Chrome imports a TILED VA-API
+    /// frame through the legacy request and then asks for it straight
+    /// back, so both lies reached it and it sampled its own frame wrong.
+    ///
+    /// The contract asserted here:
+    ///   - an implicit import reports `DRM_FORMAT_MOD_INVALID`, never
+    ///     LINEAR -- "I was not told" is the honest answer, and it is
+    ///     what lets the client resolve the layout itself;
+    ///   - an explicit import reports back that same modifier;
+    ///   - stride and offset survive the round trip unchanged.
+    #[test]
+    #[ignore = "needs live Vulkan ICD and a render node"]
+    fn dri3_imported_pixmap_exports_the_clients_own_description() {
+        use yserver_core::backend::Dri3ImportModifier;
+        const INVALID: u64 = crate::kms::vk::dri3::DRM_FORMAT_MOD_INVALID;
+
+        let mut b = match KmsBackend::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skip: no Vk: {e}");
+                return;
+            }
+        };
+        // A real dma-buf from the SAME device the backend renders on:
+        // create a server pixmap and export it. Sourcing one from a
+        // /dev/dri node instead risks allocating on the wrong GPU on a
+        // dual-GPU host, and skipping when a node is missing made an
+        // earlier version of this test pass vacuously.
+        let (w, h) = (256u16, 64u16);
+        let seed = match b.create_pixmap(None, 32, w, h) {
+            Ok(handle) => handle,
+            Err(e) => {
+                eprintln!("skip: create_pixmap: {e}");
+                return;
+            }
+        };
+        let seed_export = match b.dri3_export_pixmap_buffers(seed.as_raw()) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("skip: seed export: {e}");
+                return;
+            }
+        };
+        let stride = seed_export.stride;
+        let seed_modifier = seed_export.modifier;
+
+        for (case, requested, expected) in [
+            (
+                "implicit",
+                Dri3ImportModifier::Implicit {
+                    size: seed_export.size,
+                },
+                INVALID,
+            ),
+            (
+                "explicit",
+                Dri3ImportModifier::Explicit(seed_modifier),
+                seed_modifier,
+            ),
+        ] {
+            let fd = seed_export.fd.try_clone().expect("dup the seed dma-buf");
+            let handle = b
+                .dri3_import_pixmap(fd, w, h, stride, 0, requested, 32, 32)
+                .unwrap_or_else(|e| panic!("{case}: import failed: {e}"));
+            let export = b
+                .dri3_export_pixmap_buffers(handle.as_raw())
+                .unwrap_or_else(|e| panic!("{case}: export failed: {e}"));
+
+            assert_eq!(
+                export.modifier, expected,
+                "{case}: exported modifier must be what the client's buffer is described by. \
+                 Reporting LINEAR (0) for an unnamed layout is #138 -- the client believes it \
+                 and samples a tiled buffer as linear",
+            );
+            assert_eq!(
+                export.stride, stride,
+                "{case}: the client's own stride must survive the round trip, not be \
+                 re-derived from our VkImage",
+            );
+            assert_eq!(export.offset, 0, "{case}: offset must round trip");
+        }
+    }
+
     /// arm (the Vk branch).
     #[test]
     #[ignore = "needs live Vulkan ICD"]

@@ -64,6 +64,12 @@ pub struct DrawableImage {
     /// from our Vulkan view -- which for an implicit import is a view we
     /// had to guess at.
     pub import_plane0: Option<(u32, u32)>,
+    /// Buffer size the client stated at import, where the request
+    /// carried one (legacy `PixmapFromBuffer` does; `PixmapFromBuffers`
+    /// does not). Reported verbatim on export rather than measured:
+    /// an `lseek` on a dup'd SCM_RIGHTS fd shares its open-file
+    /// description, so probing it moves the client's file offset.
+    pub import_size: Option<u32>,
     /// Damage accumulated since the last successful upload. Updated
     /// at every drawing-op call site (Task 3.3 marks whole-image
     /// damage; 4.1.4 family ports tighten to per-op rects).
@@ -601,6 +607,7 @@ impl DrawableImage {
                 vk_memory: memory,
             },
             drm_modifier: Some(modifier),
+            import_size: None,
             import_plane0: Some((
                 plane_pitches.first().copied().unwrap_or(0),
                 u32::try_from(plane_offsets.first().copied().unwrap_or(0)).unwrap_or(0),
@@ -702,6 +709,7 @@ impl DrawableImage {
             // Server-owned: exported via export_promoted, which carries
             // the modifier on the storage instead.
             drm_modifier: None,
+            import_size: None,
             import_plane0: None,
             vk_image: image,
             vk_image_view: view,
@@ -1060,6 +1068,7 @@ impl DrawableImage {
             // Server-owned: exported via export_promoted, which carries
             // the modifier on the storage instead.
             drm_modifier: None,
+            import_size: None,
             import_plane0: None,
             vk_image: entry.image,
             vk_image_view: entry.view,

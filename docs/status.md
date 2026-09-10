@@ -669,13 +669,30 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   tiled `0x200000020801b03` for its window pixmap and the video was still
   scrambled.
 
-  *Still open.* Our own Vulkan view of an implicitly imported pixmap is still
-  described as LINEAR when it is not, so a server-side composite of one would
-  render garbage; in Chrome's flow nothing does — the log shows zero
-  server-side draw ops against those pixmaps — but a screenshot or a
-  compositor redirecting one would. Fixing that needs amdgpu BO-metadata
-  decoding or an EGL import path. Multi-plane `PixmapFromBuffers` also remains
-  unimplemented.
+  *Scope, stated precisely (codex, and it is the right framing):* this fixes
+  **Chrome's round trip**, not "legacy implicit DRI3 imports". Our own Vulkan
+  view of such a pixmap is still built as if the buffer were linear, because
+  Vulkan cannot import implicitly and gbm cannot resolve the layout on
+  amdgpu. Chrome never makes the server sample those pixmaps — the log shows
+  zero server-side draw ops against them — but `CopyArea`, RENDER, a
+  compositor redirect or a screenshot involving one would still render
+  garbage. Making the view itself right needs an EGL implicit-import path or
+  a driver-specific layout resolver.
+
+  Two consequences of that are now handled rather than left latent, both
+  found by codex on review:
+  - The legacy request carries `size` on the wire and it is now preserved and
+    reported verbatim. The first version measured it with `lseek(SEEK_END)`,
+    which is wrong twice over: a failure silently reports 0, and the fd
+    shares its open-file description with the client's, so probing it moves
+    the client's file offset.
+  - `ImportedDmabufMetadata::implicit_layout` marks a guessed layout, and the
+    **M1 direct-scanout probe refuses such a pixmap**. Without that, a tiled
+    buffer described as linear could be handed to `add_fb2`, which may well
+    accept it and put garbage on the display. The refusal accounts as
+    `m1_gate_reject_import`, so it is visible in telemetry.
+
+  Multi-plane `PixmapFromBuffers` also remains unimplemented.
 
 - **2026-09-10 composite overlay claim ownership validated on hardware:**
   awesome + picom on silence, **A/B against master on the same hardware**:

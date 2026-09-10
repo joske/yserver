@@ -322,13 +322,23 @@ pub fn export_dmabuf(
         let fd = dma_buf_fd
             .try_clone()
             .map_err(|_| vk::Result::ERROR_OUT_OF_HOST_MEMORY)?;
-        // dma-buf size via lseek(SEEK_END); the fd's offset is not used
-        // by anything else here, and libc is already a dependency.
-        let size = {
-            use std::os::fd::AsRawFd as _;
-            let end = unsafe { libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_END) };
-            u32::try_from(end.max(0)).unwrap_or(u32::MAX)
-        };
+        // The client's own stated size when the request carried one.
+        // Never measured with lseek: this fd shares its open-file
+        // description with the client's, so seeking it would move the
+        // client's offset, and a failed seek would silently report 0.
+        let size = drawable.import_size.unwrap_or_else(|| {
+            let layout = unsafe {
+                vk.device.get_image_subresource_layout(
+                    drawable.vk_image,
+                    vk::ImageSubresource {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        array_layer: 0,
+                    },
+                )
+            };
+            u32::try_from(layout.size).unwrap_or(u32::MAX)
+        });
         return Ok(DmabufExport {
             fd,
             size,
@@ -471,10 +481,12 @@ pub fn import_dmabuf_reporting(
     format: vk::Format,
     modifier: u64,
     reported_modifier: Option<u64>,
+    client_size: Option<u32>,
     planes: &[DmabufPlane],
 ) -> Result<DrawableImage, DrawableImageError> {
     let mut image = import_dmabuf(vk, dma_buf_fd, width, height, format, modifier, planes)?;
     image.drm_modifier = reported_modifier;
+    image.import_size = client_size;
     Ok(image)
 }
 

@@ -12303,7 +12303,7 @@ fn handle_dri3_request(
                 // TILED VA-API decode buffer here, we recorded it as
                 // linear, and `BuffersFromPixmap` then handed that lie
                 // back so Chrome sampled its own frame wrong.
-                crate::backend::Dri3ImportModifier::Implicit,
+                crate::backend::Dri3ImportModifier::Implicit { size: req.size },
                 req.depth,
                 req.bpp,
             ) {

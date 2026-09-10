@@ -91,6 +91,13 @@ pub(crate) struct ImportedDmabufMetadata {
     pub(crate) fourcc: u32,
     pub(crate) vk_format: vk::Format,
     pub(crate) modifier: u64,
+    /// True when the client never named the layout (legacy
+    /// `PixmapFromBuffer`), so `modifier` above is **our guess**, not a
+    /// fact. Any consumer that acts on the layout -- notably the M1
+    /// direct-scanout probe, which would hand the buffer to KMS
+    /// described as linear -- must refuse such a pixmap rather than
+    /// trust the field.
+    pub(crate) implicit_layout: bool,
     pub(crate) planes: Vec<ImportedDmabufPlane>,
     pub(crate) width: u16,
     pub(crate) height: u16,
@@ -2194,6 +2201,7 @@ mod tests {
     #[test]
     fn imported_dmabuf_metadata_preserves_layout_exactly() {
         let metadata = ImportedDmabufMetadata {
+            implicit_layout: false,
             fourcc: u32::from_le_bytes(*b"XR24"),
             vk_format: vk::Format::B8G8R8A8_UNORM,
             modifier: 0x0100_0000_0000_0002,
