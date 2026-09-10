@@ -757,7 +757,11 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   the packet is built, not in the parser; the generation for
   `install_session_cookie` is read *as the `Accept` is processed*; the machine
   emits the session-client lifecycle, so a `Refuse` racing an authenticated
-  setup leaves the loser disconnected rather than running on a cleared cookie;
+  setup leaves the loser disconnected rather than running on a cleared cookie
+  — and that loser arms nothing, because arming the reset trigger belongs to
+  the caller, *after* XDMCP admission: an orphan that armed would have its own
+  disconnect drain the session and, under XDMCP's implied `-reset`, cross a
+  generation boundary in the middle of the negotiation's own `Request` retry;
   and the re-query hook runs **after** the new generation is installed. Two
   deliberate hardening divergences from `os/xdmcp.c`, both decided 2026-09-10:
   **(A)** `Unwilling` acts only in `CollectQuery` and only from the configured
