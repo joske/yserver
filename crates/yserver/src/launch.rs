@@ -147,6 +147,9 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchOption
     let mut xdmcp_class: Option<String> = None;
     let mut xdmcp_display_id: Option<String> = None;
     let mut xdmcp_once = false;
+    // Whether argv named a reset policy at all, so the XDMCP implication
+    // below can tell "the default" from "the operator asked for this".
+    let mut reset_policy_given = false;
     while let Some(arg) = it.next() {
         if let Some(rest) = arg.strip_prefix(':') {
             o.display = Some(
@@ -193,6 +196,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchOption
             // Our default inverts Xorg's: `-noreset` unless asked
             // otherwise, because `starty` and the `just *-hw` recipes
             // launch the server expecting it to outlive its clients.
+            reset_policy_given = true;
             o.reset_policy = match arg.as_str() {
                 "-reset" => ResetPolicy::Reset,
                 "-terminate" => ResetPolicy::Terminate,
@@ -266,7 +270,49 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchOption
         display_id: xdmcp_display_id,
         once: xdmcp_once,
     });
+    apply_xdmcp_reset_policy(&mut o, reset_policy_given);
     Ok(o)
+}
+
+/// XDMCP owns the reset policy (design: "XDMCP owns the reset policy").
+///
+/// Our default is `-noreset`, deliberately opposite to Xorg's. XDMCP
+/// inverts that back: an established session ends its generation and the
+/// server queries again — the loop *is* the feature, and a `-noreset`
+/// XDMCP display would serve one session and then sit there. So an XDMCP
+/// option implies `-reset`, and `-once` implies `-terminate`.
+///
+/// `-once` is stronger than "terminate at session end": it turns *every*
+/// XDMCP-driven renew condition into termination, including retransmission
+/// exhaustion during a negotiation that never established a session
+/// (`xdmcp.c:826-834` checks `OneSession` before `XdmcpDeadSession` is
+/// reached). The state machine enforces that part; this only has to make
+/// sure the loop's policy agrees.
+///
+/// The implication OVERRIDES an explicit `-noreset`/`-reset`/`-terminate`
+/// rather than losing to it, because the two are not really the same knob:
+/// `-noreset` answers "what happens when the last client leaves", and under
+/// XDMCP the answer is fixed by the protocol. A contradicting explicit
+/// value is warned about rather than silently honoured — that is the case
+/// where an operator would otherwise get a display that never comes back.
+fn apply_xdmcp_reset_policy(o: &mut LaunchOptions, reset_policy_given: bool) {
+    let Some(xdmcp) = o.xdmcp.as_ref() else {
+        // Invariant 4: with no XDMCP option nothing here changes.
+        return;
+    };
+    let implied = if xdmcp.once {
+        ResetPolicy::Terminate
+    } else {
+        ResetPolicy::Reset
+    };
+    if reset_policy_given && o.reset_policy != implied {
+        log::warn!(
+            "yserver: XDMCP overrides the reset policy ({:?} -> {implied:?}); \
+             an XDMCP display resets at session end, and -once terminates",
+            o.reset_policy
+        );
+    }
+    o.reset_policy = implied;
 }
 
 /// X11's TCP port for a display, with overflow rejected at startup rather
@@ -849,6 +895,76 @@ mod tests {
                 .unwrap()
                 .xdmcp,
             None
+        );
+    }
+
+    /// Step 5: "an XDMCP option implies `-reset`; `-once` implies
+    /// `-terminate`". Without it a `-query` display would serve one session
+    /// and then sit on the default `-noreset`, never querying again.
+    #[test]
+    fn an_xdmcp_option_implies_the_reset_policy() {
+        for argv in [
+            vec!["-query", "dm"],
+            vec!["-broadcast"],
+            vec!["-indirect", "dm"],
+        ] {
+            assert_eq!(
+                parse(&argv).unwrap().reset_policy,
+                ResetPolicy::Reset,
+                "{argv:?}"
+            );
+        }
+        // `-once` is the stronger form, on all three modes.
+        for argv in [
+            vec!["-query", "dm", "-once"],
+            vec!["-once", "-broadcast"],
+            vec!["-indirect", "dm", "-once"],
+        ] {
+            assert_eq!(
+                parse(&argv).unwrap().reset_policy,
+                ResetPolicy::Terminate,
+                "{argv:?}"
+            );
+        }
+    }
+
+    /// The implication is not a default that an explicit flag can beat:
+    /// under XDMCP the protocol decides what happens at session end.
+    #[test]
+    fn xdmcp_overrides_an_explicit_reset_policy() {
+        for (argv, expected) in [
+            (vec!["-noreset", "-query", "dm"], ResetPolicy::Reset),
+            (vec!["-query", "dm", "-noreset"], ResetPolicy::Reset),
+            (vec!["-terminate", "-query", "dm"], ResetPolicy::Reset),
+            (
+                vec!["-reset", "-query", "dm", "-once"],
+                ResetPolicy::Terminate,
+            ),
+            (
+                vec!["-noreset", "-broadcast", "-once"],
+                ResetPolicy::Terminate,
+            ),
+        ] {
+            assert_eq!(parse(&argv).unwrap().reset_policy, expected, "{argv:?}");
+        }
+    }
+
+    /// Invariant 4: with no XDMCP option nothing about the reset policy
+    /// changes — including `-once`, which is an XDMCP option and inert on
+    /// its own.
+    #[test]
+    fn without_xdmcp_the_reset_policy_is_untouched() {
+        assert_eq!(
+            parse(&["-once"]).unwrap().reset_policy,
+            ResetPolicy::NoReset
+        );
+        assert_eq!(
+            parse(&["-once", "-reset"]).unwrap().reset_policy,
+            ResetPolicy::Reset
+        );
+        assert_eq!(
+            parse(&["-port", "177", "-noreset"]).unwrap().reset_policy,
+            ResetPolicy::NoReset
         );
     }
 

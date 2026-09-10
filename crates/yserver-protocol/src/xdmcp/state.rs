@@ -37,7 +37,22 @@
 //! 5. **Multicast and the chooser are absent.** `XDM_MULTICAST`,
 //!    `XDM_COLLECT_MULTICAST_QUERY` and `XDM_AWAIT_USER_INPUT` are non-goals,
 //!    so they are not in [`XdmcpState`].
-//! 6. **Sends never fail.** `send_request_msg` moves to
+//! 6. **`Unwilling` may not kill a live session** (design: "Two deliberate
+//!    hardening divergences from Xorg", A). `receive_packet`'s
+//!    `case UNWILLING:` (`xdmcp.c:741`) calls `XdmcpFatal` with no state
+//!    guard, no length check and without reading the packet's status field,
+//!    so an unsolicited datagram terminates a running desktop. Ours is
+//!    meaningful only in [`XdmcpState::CollectQuery`] and only from the
+//!    configured manager; under `-broadcast`/`-indirect` one unwilling
+//!    manager does not abort the collection. See [`XdmcpMachine::recv_unwilling`].
+//! 7. **Only a packet accepted for the current state resets the retry
+//!    budget** (design: divergence B). Xorg sets `timeOutRtx = 0` at
+//!    `xdmcp.c:729`, before `XdmcpReadHeader` and before the version check,
+//!    so *any* datagram resets it and the retry limit is reachable only
+//!    against a silent manager — which also means `-once` never terminates
+//!    against a peer that keeps answering badly. See
+//!    [`XdmcpMachine::accept_for_state`].
+//! 8. **Sends never fail.** `send_request_msg` moves to
 //!    `XDM_AWAIT_REQUEST_RESPONSE` only `if (XdmcpFlush(...))`
 //!    (`xdmcp.c:1164`); with no I/O here the transition is unconditional.
 
@@ -166,6 +181,15 @@ pub struct XdmcpConfig {
     pub connection_types: Vec<u16>,
     /// `ConnectionAddresses`, parallel to `connection_types`.
     pub connection_addresses: Vec<Vec<u8>>,
+    /// `ManagerAddress` (`xdmcp.c:71`) — the resolved address `-query` or
+    /// `-indirect` named, once the caller has resolved it. `None` under
+    /// `-broadcast`, where there is no configured manager.
+    ///
+    /// The machine needs it for one thing only: divergence A's source check
+    /// on `Unwilling` under `-query`. Every outgoing packet addresses itself
+    /// through [`PacketDestination`] instead, so the socket layer still owns
+    /// where a datagram actually goes.
+    pub manager_address: Option<SocketAddr>,
 }
 
 impl XdmcpConfig {
@@ -183,6 +207,7 @@ impl XdmcpConfig {
             authorization_names: vec![MIT_MAGIC_COOKIE_1.to_vec()],
             connection_types: Vec::new(),
             connection_addresses: Vec::new(),
+            manager_address: None,
         }
     }
 }
@@ -384,16 +409,12 @@ impl XdmcpMachine {
         }
         match event {
             XdmcpEvent::Start => self.start(),
-            // `receive_packet` resets the backoff before it has even looked
-            // at the header (`xdmcp.c:728`).
-            XdmcpEvent::UndecodablePacket => {
-                self.timeout_rtx = 0;
-                Vec::new()
-            }
-            XdmcpEvent::Packet { from, message } => {
-                self.timeout_rtx = 0;
-                self.receive(from, &message)
-            }
+            // Divergence B: `receive_packet` resets the backoff before it
+            // has even looked at the header (`xdmcp.c:728`); we do not.
+            // Nothing here has been accepted for the current state, so the
+            // budget is untouched.
+            XdmcpEvent::UndecodablePacket => Vec::new(),
+            XdmcpEvent::Packet { from, message } => self.receive(from, &message),
             XdmcpEvent::TimerExpired => self.timer_expired(),
             XdmcpEvent::SessionClientEstablished(client) => self.open_display(client),
             XdmcpEvent::SessionClientDisconnected(client) => self.close_display(client),
@@ -673,13 +694,7 @@ impl XdmcpMachine {
                 authentication_name,
                 ..
             } => self.recv_willing(from, authentication_name),
-            // No state guard, no length check, and the packet's own status is
-            // never read — `receive_packet` passes the canned
-            // `UnwillingMessage` (`xdmcp.c:740-742`). An `Unwilling` arriving
-            // during a live session is therefore fatal too.
-            XdmcpMessage::Unwilling { .. } => {
-                self.fatal(FatalKind::ManagerUnwilling, UNWILLING_MESSAGE.to_vec())
-            }
+            XdmcpMessage::Unwilling { .. } => self.recv_unwilling(from),
             XdmcpMessage::Accept {
                 session_id,
                 authentication_name,
@@ -706,6 +721,75 @@ impl XdmcpMachine {
             } => self.recv_alive(*session_running, *session_id),
             _ => Vec::new(),
         }
+    }
+
+    /// Divergence 7 (design divergence B): a packet has been **accepted for
+    /// the current state** — right version and opcode (the decoder settled
+    /// those), correct state, and matching identifiers or source where those
+    /// apply — so the retransmission budget starts again.
+    ///
+    /// Xorg does this at `xdmcp.c:729`, before the header is even parsed,
+    /// which makes [`XDM_RTX_LIMIT`] unreachable against a peer that keeps
+    /// answering badly: a wrong-version packet, an unknown opcode, a
+    /// malformed `Accept`, a wrong-session `Alive` or a late `Refuse` all
+    /// held `timeOutRtx` at zero forever, and `-once` then never terminated.
+    /// Calling this only from the paths that act on a packet restores the
+    /// bound — which is what makes "a bad `Accept` leaves the state at
+    /// `AwaitRequestResponse` and lets the retry timer drive" a *bounded*
+    /// choice rather than an unbounded one.
+    ///
+    /// Called *before* the transition, so the [`XdmcpAction::SetTimer`] that
+    /// a following [`Self::send_packet`] emits already uses the reset
+    /// backoff — the ordering Xorg gets from resetting in `receive_packet`.
+    ///
+    /// The fatal paths (`Unwilling`, `Decline`, `Failed`, and an `Accept`
+    /// with an authentication name) deliberately do not call this: they park
+    /// the machine in [`XdmcpState::Off`], where there is no budget left to
+    /// reset.
+    fn accept_for_state(&mut self) {
+        self.timeout_rtx = 0;
+    }
+
+    /// `receive_packet`'s `case UNWILLING:` (`xdmcp.c:741`), hardened —
+    /// divergence 6 (design divergence A).
+    ///
+    /// Xorg's is:
+    ///
+    /// ```c
+    /// case UNWILLING:
+    ///     XdmcpFatal("Manager unwilling", &UnwillingMessage);
+    ///     break;
+    /// ```
+    ///
+    /// No state guard, no length check, and `UnwillingMessage` is a canned
+    /// string — the status the packet actually carries is never read. So any
+    /// host that can reach the display's UDP port can terminate a running
+    /// desktop with six bytes. Three restrictions, none of which costs
+    /// functionality:
+    ///
+    /// 1. **Only while collecting.** A refusal answers a query; there is no
+    ///    query outstanding in any other state. Ignored everywhere else and
+    ///    emphatically in [`XdmcpState::RunSession`], exactly as `Refuse`
+    ///    already is (`xdmcp.c:1264`).
+    /// 2. **Only from the configured manager, under `-query`.** With
+    ///    `manager_address` unset we ignore it: fail closed rather than let
+    ///    an unresolved configuration widen the check to every host.
+    /// 3. **Never under `-broadcast`/`-indirect`.** Asking several managers
+    ///    and dying on the first refusal defeats the point of asking;
+    ///    collection continues and a `Willing` from another manager is still
+    ///    accepted. The retransmission budget still bounds the wait.
+    ///
+    /// The status stays the canned [`UNWILLING_MESSAGE`]: reading the
+    /// packet's own status would put attacker-supplied bytes in a fatal
+    /// message, and Xorg does not read it either.
+    fn recv_unwilling(&mut self, from: SocketAddr) -> Vec<XdmcpAction> {
+        if self.state != XdmcpState::CollectQuery {
+            return Vec::new();
+        }
+        if self.config.manager_address != Some(from) {
+            return Vec::new();
+        }
+        self.fatal(FatalKind::ManagerUnwilling, UNWILLING_MESSAGE.to_vec())
     }
 
     /// `recv_willing_msg` (`xdmcp.c:1044`).
@@ -743,6 +827,8 @@ impl XdmcpMachine {
 
     /// `XdmcpSelectHost` (`xdmcp.c:681`).
     fn select_host(&mut self, from: SocketAddr, authentication_name: &[u8]) -> Vec<XdmcpAction> {
+        // A `Willing` in a collect state is the answer we are waiting for.
+        self.accept_for_state();
         self.state = XdmcpState::StartConnection;
         self.selected_host = Some(from);
         self.set_authentication(authentication_name);
@@ -825,6 +911,10 @@ impl XdmcpMachine {
         if authorization_name != MIT_MAGIC_COOKIE_1 || authorization_data.is_empty() {
             return vec![XdmcpAction::ClearCookie];
         }
+        // Accepted only here: a malformed or unusable `Accept` is NOT a
+        // packet accepted for this state, so the two `return`s above leave
+        // the budget running (divergence 7).
+        self.accept_for_state();
         self.session_id = session_id;
         self.state = XdmcpState::Manage;
         let mut actions = vec![XdmcpAction::InstallCookie {
@@ -866,6 +956,7 @@ impl XdmcpMachine {
         if self.state != XdmcpState::AwaitManageResponse || session_id != self.session_id {
             return Vec::new();
         }
+        self.accept_for_state();
         self.state = XdmcpState::StartConnection;
         // Divergence 2: the accepted offer is abandoned inside the same
         // generation, so nothing else invalidates its cookie.
@@ -891,6 +982,9 @@ impl XdmcpMachine {
         // `if (SessionRunning && AliveSessionID == SessionID)` — truthiness,
         // not equality with 1.
         if session_running != 0 && session_id == self.session_id {
+            // Only an `Alive` naming OUR session is accepted for this state;
+            // one naming another session falls through to `dead_session`.
+            self.accept_for_state();
             self.state = XdmcpState::RunSession;
             return vec![XdmcpAction::SetTimer {
                 seconds: XDM_DEF_DORMANCY,
@@ -935,6 +1029,7 @@ mod tests {
             authorization_names: vec![MIT_MAGIC_COOKIE_1.to_vec()],
             connection_types: vec![0],
             connection_addresses: vec![vec![192, 168, 1, 5]],
+            manager_address: Some(MANAGER),
         }
     }
 
@@ -1392,27 +1487,118 @@ mod tests {
         assert_eq!(m.state(), XdmcpState::AwaitRequestResponse);
     }
 
-    /// `receive_packet`'s `case UNWILLING:` (`xdmcp.c:740`) has no state
-    /// guard, no length check, and ignores the packet's own status in favour
-    /// of the canned `UnwillingMessage`.
+    fn unwilling() -> XdmcpMessage {
+        XdmcpMessage::Unwilling {
+            hostname: b"xdm".to_vec(),
+            status: b"a status we must not use".to_vec(),
+        }
+    }
+
+    fn unwilling_from(from: SocketAddr) -> XdmcpEvent {
+        XdmcpEvent::Packet {
+            from,
+            message: unwilling(),
+        }
+    }
+
+    /// Divergence A. `receive_packet`'s `case UNWILLING:` (`xdmcp.c:741`)
+    /// has no state guard at all; ours acts only where a query is
+    /// outstanding to the manager that answered it. The canned status is
+    /// kept — the packet's own status is still never read.
     #[test]
-    fn unwilling_is_fatal_in_every_state_with_the_canned_status() {
+    fn unwilling_is_fatal_only_in_collect_query_and_only_from_the_manager() {
         for state in ALL_STATES {
-            if state == XdmcpState::Off {
-                continue;
-            }
             let mut m = machine_in(state, false);
-            assert_eq!(
-                m.handle(packet(XdmcpMessage::Unwilling {
-                    hostname: b"xdm".to_vec(),
-                    status: b"a status we must not use".to_vec(),
-                })),
-                vec![XdmcpAction::Terminate(TerminateReason::Fatal {
-                    kind: FatalKind::ManagerUnwilling,
-                    status: b"Host unwilling".to_vec(),
-                })],
-                "{state:?}"
+            let actions = m.handle(unwilling_from(MANAGER));
+            if state == XdmcpState::CollectQuery {
+                assert_eq!(
+                    actions,
+                    vec![XdmcpAction::Terminate(TerminateReason::Fatal {
+                        kind: FatalKind::ManagerUnwilling,
+                        status: b"Host unwilling".to_vec(),
+                    })],
+                    "{state:?}"
+                );
+                assert_eq!(m.state(), XdmcpState::Off);
+            } else {
+                assert!(actions.is_empty(), "{state:?} acted on it: {actions:?}");
+                assert_eq!(m.state(), state, "{state:?} moved");
+            }
+        }
+    }
+
+    /// Divergence A.1, the one that matters most: an unsolicited datagram
+    /// must not terminate a running desktop.
+    #[test]
+    fn an_unwilling_in_run_session_is_ignored_and_the_session_survives() {
+        let mut m = at_run_session();
+        assert_eq!(m.handle(unwilling_from(MANAGER)), vec![]);
+        assert_eq!(m.handle(unwilling_from(OTHER_MANAGER)), vec![]);
+        assert_eq!(m.state(), XdmcpState::RunSession);
+        assert_eq!(m.session_client(), Some(SESSION_CLIENT));
+        // And still ignored while a KeepAlive for that session is out.
+        let _ = m.handle(XdmcpEvent::TimerExpired);
+        assert_eq!(m.state(), XdmcpState::AwaitAliveResponse);
+        assert_eq!(m.handle(unwilling_from(MANAGER)), vec![]);
+        assert_eq!(m.state(), XdmcpState::AwaitAliveResponse);
+    }
+
+    /// Divergence A.2: under `-query` the refusal has to come from the host
+    /// we asked. An unresolved manager address fails closed.
+    #[test]
+    fn an_unwilling_from_another_host_is_ignored_under_query() {
+        let mut m = machine(InitialMode::Query, false);
+        let _ = m.handle(XdmcpEvent::Start);
+        assert_eq!(m.state(), XdmcpState::CollectQuery);
+        assert_eq!(m.handle(unwilling_from(OTHER_MANAGER)), vec![]);
+        assert_eq!(m.state(), XdmcpState::CollectQuery);
+        // The real manager is still able to refuse.
+        assert!(matches!(
+            m.handle(unwilling_from(MANAGER)).as_slice(),
+            [XdmcpAction::Terminate(_)]
+        ));
+
+        // With no resolved manager address, nobody may refuse.
+        let mut config = config(InitialMode::Query, false);
+        config.manager_address = None;
+        let mut m = XdmcpMachine::new(config);
+        let _ = m.handle(XdmcpEvent::Start);
+        assert_eq!(m.handle(unwilling_from(MANAGER)), vec![]);
+        assert_eq!(m.state(), XdmcpState::CollectQuery);
+    }
+
+    /// Divergence A.3: asking several managers and dying on the first
+    /// refusal defeats the point of asking. The collection continues and a
+    /// `Willing` from another manager is still accepted.
+    #[test]
+    fn an_unwilling_does_not_end_a_broadcast_or_indirect_collection() {
+        for (mode, collecting) in [
+            (InitialMode::Broadcast, XdmcpState::CollectBroadcastQuery),
+            (InitialMode::Indirect, XdmcpState::CollectIndirectQuery),
+        ] {
+            let mut m = machine(mode, false);
+            let _ = m.handle(XdmcpEvent::Start);
+            assert_eq!(m.state(), collecting);
+            // Even the configured manager's refusal is not the end of it.
+            assert_eq!(m.handle(unwilling_from(MANAGER)), vec![], "{mode:?}");
+            assert_eq!(m.handle(unwilling_from(OTHER_MANAGER)), vec![], "{mode:?}");
+            assert_eq!(m.state(), collecting, "{mode:?}");
+
+            let actions = m.handle(XdmcpEvent::Packet {
+                from: OTHER_MANAGER,
+                message: willing(),
+            });
+            assert!(
+                actions.iter().any(|a| matches!(
+                    a,
+                    XdmcpAction::Send {
+                        destination: PacketDestination::SelectedHost(host),
+                        message: XdmcpMessage::Request { .. },
+                    } if *host == OTHER_MANAGER
+                )),
+                "{mode:?} did not accept the second manager: {actions:?}"
             );
+            assert_eq!(m.state(), XdmcpState::AwaitRequestResponse, "{mode:?}");
         }
     }
 
@@ -1888,27 +2074,142 @@ mod tests {
         assert_eq!(m.state(), XdmcpState::CollectQuery);
     }
 
-    /// `receive_packet` sets `timeOutRtx = 0` at `xdmcp.c:728`, before it has
-    /// read the header — so even a datagram we cannot decode cancels the
-    /// backoff. Xorg-faithful, and worth knowing: it is remotely triggerable.
+    /// Divergence B. Xorg sets `timeOutRtx = 0` at `xdmcp.c:729` — before
+    /// `XdmcpReadHeader`, before the version check — so *any* datagram
+    /// resets the budget and [`XDM_RTX_LIMIT`] is reachable only against a
+    /// silent manager. Ours resets only for a packet accepted for the
+    /// current state.
     #[test]
-    fn any_datagram_including_an_undecodable_one_resets_the_backoff() {
+    fn only_a_packet_accepted_for_the_current_state_resets_the_backoff() {
+        // Nothing accepted in CollectQuery: an undecodable datagram, one of
+        // our own opcodes coming back, and an `Alive` for a state that is
+        // not awaiting one.
+        let ignored = [
+            XdmcpEvent::UndecodablePacket,
+            packet(XdmcpMessage::Alive {
+                session_running: 1,
+                session_id: SESSION,
+            }),
+            packet(XdmcpMessage::Manage {
+                session_id: SESSION,
+                display_number: 7,
+                display_class: vec![],
+            }),
+            unwilling_from(OTHER_MANAGER),
+        ];
+        for event in ignored {
+            let mut m = machine(InitialMode::Query, false);
+            let _ = m.handle(XdmcpEvent::Start);
+            let _ = m.handle(XdmcpEvent::TimerExpired);
+            let _ = m.handle(XdmcpEvent::TimerExpired);
+            assert_eq!(m.timeout_rtx(), 2);
+            let _ = m.handle(event.clone());
+            assert_eq!(m.timeout_rtx(), 2, "{event:?} reset the budget");
+        }
+
+        // The `Willing` that state IS waiting for does reset it, and the
+        // retransmit timer armed with the `Request` uses the reset backoff.
         let mut m = machine(InitialMode::Query, false);
         let _ = m.handle(XdmcpEvent::Start);
         let _ = m.handle(XdmcpEvent::TimerExpired);
         let _ = m.handle(XdmcpEvent::TimerExpired);
-        assert_eq!(m.timeout_rtx(), 2);
-        assert_eq!(m.handle(XdmcpEvent::UndecodablePacket), vec![]);
+        let actions = m.handle(packet(willing()));
         assert_eq!(m.timeout_rtx(), 0);
-
-        let _ = m.handle(XdmcpEvent::TimerExpired);
-        assert_eq!(m.timeout_rtx(), 1);
-        // A decoded packet we ignore in this state does the same.
-        let _ = m.handle(packet(XdmcpMessage::Alive {
-            session_running: 1,
-            session_id: SESSION,
+        assert!(actions.contains(&XdmcpAction::SetTimer {
+            seconds: XDM_MIN_RTX
         }));
-        assert_eq!(m.timeout_rtx(), 0);
+    }
+
+    /// A malformed `Accept`, a `Refuse` for another session and a
+    /// wrong-session `Alive` are all recognised opcodes in a plausible
+    /// state, and none of them is accepted *for* that state.
+    #[test]
+    fn a_packet_rejected_by_its_own_handler_leaves_the_budget_untouched() {
+        // Unusable authorization: state is retained, budget is retained.
+        let mut m = at_await_request_response();
+        let _ = m.handle(XdmcpEvent::TimerExpired);
+        let before = m.timeout_rtx();
+        assert_eq!(before, 1);
+        assert_eq!(
+            m.handle(packet(accept_with(b"MIT-MAGIC-COOKIE-1", &[]))),
+            vec![XdmcpAction::ClearCookie]
+        );
+        assert_eq!(m.state(), XdmcpState::AwaitRequestResponse);
+        assert_eq!(m.timeout_rtx(), before);
+
+        // A `Refuse` naming a session that is not ours.
+        let mut m = at_await_manage_response();
+        let _ = m.handle(XdmcpEvent::TimerExpired);
+        let before = m.timeout_rtx();
+        assert_eq!(
+            m.handle(packet(XdmcpMessage::Refuse {
+                session_id: SESSION ^ 1
+            })),
+            vec![]
+        );
+        assert_eq!(m.timeout_rtx(), before);
+
+        // A late `Refuse`, after the session is up: ignored, and it must not
+        // hold the dormancy/keepalive machinery open either.
+        let mut m = at_await_alive_response();
+        let _ = m.handle(XdmcpEvent::TimerExpired);
+        let before = m.timeout_rtx();
+        assert_eq!(
+            m.handle(packet(XdmcpMessage::Refuse {
+                session_id: SESSION
+            })),
+            vec![]
+        );
+        assert_eq!(m.timeout_rtx(), before);
+    }
+
+    /// The case divergence B exists for, and the one that falsified the
+    /// design's own bounded-retry argument: a peer that keeps answering
+    /// badly. Under Xorg the budget never advances, so `XdmcpDeadSession` is
+    /// never reached and `-once` never terminates.
+    #[test]
+    fn a_peer_flooding_rubbish_still_exhausts_the_retry_budget() {
+        let rubbish = |m: &mut XdmcpMachine| {
+            // Undecodable, then a decodable packet that is irrelevant here,
+            // then an `Unwilling` from a stranger: three shapes, none of
+            // them accepted for `CollectQuery`.
+            let _ = m.handle(XdmcpEvent::UndecodablePacket);
+            let _ = m.handle(packet(XdmcpMessage::Alive {
+                session_running: 1,
+                session_id: SESSION,
+            }));
+            let _ = m.handle(unwilling_from(OTHER_MANAGER));
+        };
+
+        let mut m = machine(InitialMode::Query, false);
+        let _ = m.handle(XdmcpEvent::Start);
+        let mut last = Vec::new();
+        for _ in 0..XDM_RTX_LIMIT {
+            rubbish(&mut m);
+            last = m.handle(XdmcpEvent::TimerExpired);
+        }
+        assert!(
+            last.contains(&XdmcpAction::ResetGeneration {
+                cause: RenewCause::RetransmissionsExhausted
+            }),
+            "the flood held the budget open: {last:?}"
+        );
+
+        // And under `-once`, the server terminates rather than looping.
+        let mut m = machine(InitialMode::Query, true);
+        let _ = m.handle(XdmcpEvent::Start);
+        let mut last = Vec::new();
+        for _ in 0..XDM_RTX_LIMIT {
+            rubbish(&mut m);
+            last = m.handle(XdmcpEvent::TimerExpired);
+        }
+        assert_eq!(
+            last,
+            vec![XdmcpAction::Terminate(TerminateReason::OneSession {
+                cause: RenewCause::RetransmissionsExhausted
+            })]
+        );
+        assert_eq!(m.state(), XdmcpState::Off);
     }
 
     /// Reset targets the **configured** mode. `XDM_INIT_STATE` is a variable
