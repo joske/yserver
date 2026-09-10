@@ -314,11 +314,14 @@ pub enum XdmcpEvent {
     /// A datagram arrived but did not decode — wrong version, unhandled
     /// opcode, bad length.
     ///
-    /// This exists because `receive_packet` resets `timeOutRtx` at
-    /// `xdmcp.c:728`, *before* it reads the header, so even a garbage
-    /// datagram cancels the retransmission backoff. Modelling it keeps that
+    /// It exists as an event rather than being dropped at the socket
+    /// because `receive_packet` resets `timeOutRtx` at `xdmcp.c:728`,
+    /// *before* it reads the header, so under Xorg even a garbage datagram
+    /// cancels the retransmission backoff. Modelling it keeps that
     /// (attacker-controllable) behaviour visible and testable rather than
-    /// accidental.
+    /// accidental — and divergence 7 is precisely the decision not to
+    /// reproduce it: here the event is a no-op that leaves the budget
+    /// running.
     UndecodablePacket,
     /// The XDMCP timer fired (`XdmcpTimerNotify`, `xdmcp.c:664`).
     TimerExpired,
