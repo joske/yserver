@@ -620,6 +620,63 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ## Where we are
 
+- **2026-09-10 #138 Chrome hardware-decoded video scrambled — FIXED, hardware
+  confirmed:** ads, video and fullscreen all correct on silence (RX 6800,
+  Mesa 26.2.2, Chromium, AV1 via `VaapiVideoDecoder`). Two server-side lies,
+  both ours, on the legacy `DRI3::PixmapFromBuffer` path.
+
+  *The layout claim.* DRI3 1.0 carries no modifier, which means the layout is
+  **implicit**, not linear. We passed a hardcoded `0` — an explicit
+  `DRM_FORMAT_MOD_LINEAR` — for every such import. `Dri3ImportModifier` now
+  makes the two requests structurally distinct: `Explicit(m)` for
+  `PixmapFromBuffers`, `Implicit` for the legacy request, so they cannot be
+  conflated again.
+
+  *The export.* `export_dmabuf` re-exported via `vkGetMemoryFdKHR` from a
+  VkImage we had to *describe* as LINEAR in order to create at all, so the
+  client got back a re-export of our wrong description of its own buffer. An
+  imported pixmap now exports a dup of the **client's original fd** with the
+  client's own stride/offset, never routed through our Vulkan view. The
+  buffer keeps its own layout metadata, which is what lets the client resolve
+  the real tiling — the thing glamor gets for free by staying implicit end to
+  end. This is more correct independently of #138: an imported pixmap *is* the
+  client's buffer.
+
+  *Why the obvious repairs do not work, measured so nobody retries them.*
+  gbm cannot resolve an implicit layout on amdgpu: `gbm_bo_get_modifier`
+  returns `DRM_FORMAT_MOD_INVALID` for an implicitly imported buffer **and for
+  gbm's own fresh allocation**. i915 does report a concrete modifier, so a
+  probe run against the wrong render node looks like success — silence is
+  dual-GPU and `renderD128` is the i915, `renderD129` the RX 6800. Vulkan has
+  no implicit-import path, unlike EGL. Reporting `DRM_FORMAT_MOD_INVALID`
+  instead of LINEAR is *not* sufficient on its own — tried, still garbled;
+  the fd is the part that matters.
+
+  *Diagnosis path, since inference from the corruption pattern failed three
+  times:* an `LD_PRELOAD` interposer on `vaExportSurfaceHandle` read the real
+  descriptor — tiled `0x0200000020801b03`, NV12/ARGB. It has to interpose
+  `dlsym`, because Chromium `dlopen`s libva and a plain symbol override never
+  fires. Kept at `target/diag138/va_trace.c` (gitignored); needs
+  `chromium --disable-gpu-sandbox`.
+
+  *Also fixed on the way, separate contract bug:* `dri3_supported_modifiers`
+  returned a LINEAR-only **window** list. Widening it to the full screen list
+  blanks every GL client — Mesa picks a DCC modifier needing 2–3 planes, our
+  dispatcher rejects `num_buffers != 1`, and Mesa logs
+  `dri3_alloc_render_buffer ... failed`. The window list is now the
+  single-plane subset, filtered on `drmFormatModifierPlaneCount` rather than
+  on decoded modifier bits. Verified NOT to be the #138 fix: Chrome then took
+  tiled `0x200000020801b03` for its window pixmap and the video was still
+  scrambled.
+
+  *Still open.* Our own Vulkan view of an implicitly imported pixmap is still
+  described as LINEAR when it is not, so a server-side composite of one would
+  render garbage; in Chrome's flow nothing does — the log shows zero
+  server-side draw ops against those pixmaps — but a screenshot or a
+  compositor redirecting one would. Fixing that needs amdgpu BO-metadata
+  decoding or an EGL import path. Multi-plane `PixmapFromBuffers` also remains
+  unimplemented.
+
 - **2026-09-10 composite overlay claim ownership validated on hardware:**
   awesome + picom on silence, **A/B against master on the same hardware**:
 

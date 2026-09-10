@@ -51,6 +51,19 @@ pub struct DrawableImage {
     pub extent: vk::Extent2D,
     pub format: vk::Format,
     pub backing: ImageBacking,
+    /// DRM format modifier this image was imported with, for images
+    /// that came from a client dma-buf. `BuffersFromPixmap` must report
+    /// it back verbatim: answering LINEAR for a tiled import is #138 --
+    /// the client re-imports by our answer and samples its own buffer
+    /// wrong. `None` for server-owned images, which export through
+    /// `export_promoted` and carry their modifier on the storage.
+    pub drm_modifier: Option<u64>,
+    /// Plane-0 `(stride, offset)` exactly as the client described it at
+    /// import. An export of an imported pixmap hands back the client's
+    /// own buffer and its own description, rather than re-deriving one
+    /// from our Vulkan view -- which for an implicit import is a view we
+    /// had to guess at.
+    pub import_plane0: Option<(u32, u32)>,
     /// Damage accumulated since the last successful upload. Updated
     /// at every drawing-op call site (Task 3.3 marks whole-image
     /// damage; 4.1.4 family ports tighten to per-op rects).
@@ -587,6 +600,11 @@ impl DrawableImage {
                 dma_buf_fd,
                 vk_memory: memory,
             },
+            drm_modifier: Some(modifier),
+            import_plane0: Some((
+                plane_pitches.first().copied().unwrap_or(0),
+                u32::try_from(plane_offsets.first().copied().unwrap_or(0)).unwrap_or(0),
+            )),
             damage: MirrorDamage::default(),
             current_layout: vk::ImageLayout::UNDEFINED,
             vk,
@@ -681,6 +699,10 @@ impl DrawableImage {
         };
 
         Ok(Self {
+            // Server-owned: exported via export_promoted, which carries
+            // the modifier on the storage instead.
+            drm_modifier: None,
+            import_plane0: None,
             vk_image: image,
             vk_image_view: view,
             mask_view: None,
@@ -1035,6 +1057,10 @@ impl DrawableImage {
         extent: vk::Extent2D,
     ) -> Self {
         Self {
+            // Server-owned: exported via export_promoted, which carries
+            // the modifier on the storage instead.
+            drm_modifier: None,
+            import_plane0: None,
             vk_image: entry.image,
             vk_image_view: entry.view,
             mask_view: None,

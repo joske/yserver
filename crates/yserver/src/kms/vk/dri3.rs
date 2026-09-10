@@ -13,6 +13,10 @@ use super::{
 
 /// Linear, untagged DRM format modifier (`DRM_FORMAT_MOD_LINEAR`).
 pub const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+/// "Layout not named." What DRI3 1.0 `PixmapFromBuffer` conveys, and
+/// what we must report back for such a pixmap rather than inventing a
+/// concrete modifier -- see `Dri3ImportModifier` and #138.
+pub const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 
 /// All DRM format modifiers the driver advertises as importable for
 /// `format` as DMA_BUF (single-plane, EXCLUSIVE sharing).
@@ -51,8 +55,27 @@ pub fn supported_modifiers(
     format: vk::Format,
     usage: vk::ImageUsageFlags,
 ) -> Vec<u64> {
+    supported_modifiers_with_planes(vk, format, usage)
+        .into_iter()
+        .map(|(modifier, _planes)| modifier)
+        .collect()
+}
+
+/// [`supported_modifiers`], but each entry carries the number of memory
+/// planes the layout needs (`drmFormatModifierPlaneCount`).
+///
+/// Callers that can only handle a single plane must filter on it rather
+/// than guess from the modifier bits: AMD's DCC layouts need two planes
+/// (three when retiled), and advertising one we then refuse makes the
+/// client render nothing at all rather than fall back.
+#[must_use]
+pub fn supported_modifiers_with_planes(
+    vk: &VkContext,
+    format: vk::Format,
+    usage: vk::ImageUsageFlags,
+) -> Vec<(u64, u32)> {
     if !vk.image_drm_format_modifier {
-        return vec![DRM_FORMAT_MOD_LINEAR];
+        return vec![(DRM_FORMAT_MOD_LINEAR, 1)];
     }
 
     let modifier_count = match list_modifier_count(vk, format) {
@@ -77,7 +100,10 @@ pub fn supported_modifiers(
     let mut accepted = Vec::with_capacity(entries);
     for prop in props_storage.iter().take(entries) {
         if can_import_modifier(vk, format, prop.drm_format_modifier, usage) {
-            accepted.push(prop.drm_format_modifier);
+            accepted.push((
+                prop.drm_format_modifier,
+                prop.drm_format_modifier_plane_count,
+            ));
         }
     }
 
@@ -281,6 +307,37 @@ pub fn export_dmabuf(
         .external_memory_fd
         .as_ref()
         .ok_or(vk::Result::ERROR_EXTENSION_NOT_PRESENT)?;
+    // An imported pixmap is the CLIENT's buffer. Hand back that same
+    // buffer, with the client's own plane description -- do not launder
+    // it through `vkGetMemoryFdKHR` on our VkImage.
+    //
+    // #138: for a legacy `PixmapFromBuffer` we had to guess a modifier to
+    // build that VkImage at all, so re-exporting from it describes the
+    // buffer by our guess rather than by what it is. Returning the
+    // original fd keeps the buffer's own layout metadata intact, which is
+    // what lets the client resolve the layout itself.
+    if let super::target::ImageBacking::Imported { dma_buf_fd, .. } = &drawable.backing
+        && let Some((stride, offset)) = drawable.import_plane0
+    {
+        let fd = dma_buf_fd
+            .try_clone()
+            .map_err(|_| vk::Result::ERROR_OUT_OF_HOST_MEMORY)?;
+        // dma-buf size via lseek(SEEK_END); the fd's offset is not used
+        // by anything else here, and libc is already a dependency.
+        let size = {
+            use std::os::fd::AsRawFd as _;
+            let end = unsafe { libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_END) };
+            u32::try_from(end.max(0)).unwrap_or(u32::MAX)
+        };
+        return Ok(DmabufExport {
+            fd,
+            size,
+            stride,
+            offset,
+            modifier: drawable.drm_modifier.unwrap_or(DRM_FORMAT_MOD_LINEAR),
+        });
+    }
+
     let memory = drawable.backing_memory();
     let layout = unsafe {
         vk.device.get_image_subresource_layout(
@@ -304,10 +361,16 @@ pub fn export_dmabuf(
         size,
         stride: pitch,
         offset: u32::try_from(layout.offset).unwrap_or(0),
-        // DrawableImage (imported client buffers) does not currently
-        // track its DRM modifier; report LINEAR. The TFP export path uses
-        // export_promoted/export_backing, which carry the real modifier.
-        modifier: DRM_FORMAT_MOD_LINEAR,
+        // Report the modifier the image was actually imported with.
+        //
+        // This used to hardcode LINEAR "because DrawableImage does not
+        // track its modifier", which is the export half of #138: a
+        // client that imported a TILED buffer through the legacy
+        // PixmapFromBuffer asked for it back, was told LINEAR, and
+        // sampled its own frame as linear. Server-owned images have no
+        // client modifier and still answer LINEAR here; they export
+        // through export_promoted, which carries the real one.
+        modifier: drawable.drm_modifier.unwrap_or(DRM_FORMAT_MOD_LINEAR),
     })
 }
 
@@ -394,6 +457,27 @@ pub fn export_promoted(
 /// §3.2. Takes ownership of `dma_buf_fd`. On success the fd lifetime
 /// is owned by the resulting `DrawableImage`; on failure the OwnedFd
 /// drops and closes the fd.
+/// [`import_dmabuf`], but recording a *reported* modifier that may differ
+/// from the one Vulkan was given.
+///
+/// They diverge for a legacy `PixmapFromBuffer`: Vulkan needs some
+/// concrete modifier to build an image at all, while the honest answer to
+/// give a client asking about that pixmap is `DRM_FORMAT_MOD_INVALID`.
+pub fn import_dmabuf_reporting(
+    vk: Arc<VkContext>,
+    dma_buf_fd: std::os::fd::OwnedFd,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+    modifier: u64,
+    reported_modifier: Option<u64>,
+    planes: &[DmabufPlane],
+) -> Result<DrawableImage, DrawableImageError> {
+    let mut image = import_dmabuf(vk, dma_buf_fd, width, height, format, modifier, planes)?;
+    image.drm_modifier = reported_modifier;
+    Ok(image)
+}
+
 pub fn import_dmabuf(
     vk: Arc<VkContext>,
     dma_buf_fd: std::os::fd::OwnedFd,

@@ -325,6 +325,28 @@ mod present_caps_tests {
 /// DRI3 capability surface. Phase 4.2 design §4. `version == (0, 0)`
 /// is the "DRI3 unsupported" sentinel; any other value advertises
 /// DRI3 to clients. The other booleans gate individual request types
+/// How the layout of a client-supplied dma-buf is known.
+///
+/// The two DRI3 import requests differ in exactly this, and conflating
+/// them is #138: `PixmapFromBuffers` (DRI3 1.2) carries an explicit
+/// modifier on the wire, while the legacy `PixmapFromBuffer` (DRI3 1.0)
+/// carries none. "No modifier on the wire" means the layout is
+/// **implicit** and must be resolved from the buffer itself. It does
+/// **not** mean linear, and assuming linear makes the server re-export
+/// false metadata that a client then samples by — scrambling its own
+/// output with no bad pixel ever passing through us.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Dri3ImportModifier {
+    /// The client named the layout (`PixmapFromBuffers`). `0` here is a
+    /// real, explicit `DRM_FORMAT_MOD_LINEAR` and must stay meaningful.
+    Explicit(u64),
+    /// The client did not name it (`PixmapFromBuffer`). The backend must
+    /// resolve the concrete modifier from the dma-buf, and must fail the
+    /// import if it cannot — a wrong successful import is worse than a
+    /// refused one.
+    Implicit,
+}
+
 /// rather than the whole extension.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Dri3Caps {
@@ -2124,6 +2146,12 @@ pub trait Backend {
     /// Phase 4.2 only handles single-plane (RGB) imports; the
     /// multi-plane variant of `PixmapFromBuffers` is rejected at the
     /// dispatcher.
+    ///
+    /// `modifier` distinguishes a layout the client named from one it
+    /// did not; see [`Dri3ImportModifier`]. Whatever concrete modifier
+    /// an implicit import resolves to is what `BuffersFromPixmap` must
+    /// later report back — that round trip is the contract clients
+    /// sample by.
     #[allow(clippy::too_many_arguments)]
     fn dri3_import_pixmap(
         &mut self,
@@ -2132,7 +2160,7 @@ pub trait Backend {
         _height: u16,
         _stride: u32,
         _offset: u32,
-        _modifier: u64,
+        _modifier: Dri3ImportModifier,
         _depth: u8,
         _bpp: u8,
     ) -> io::Result<PixmapHandle> {

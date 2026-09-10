@@ -12296,7 +12296,14 @@ fn handle_dri3_request(
                 req.height,
                 u32::from(req.stride),
                 0,
-                0, // PixmapFromBuffer always implies LINEAR (no modifier).
+                // DRI3 1.0 carries no modifier. That means the layout is
+                // IMPLICIT, to be resolved from the buffer -- not linear.
+                // This line used to pass `0`, i.e. an explicit
+                // DRM_FORMAT_MOD_LINEAR, which is #138: Chrome hands us a
+                // TILED VA-API decode buffer here, we recorded it as
+                // linear, and `BuffersFromPixmap` then handed that lie
+                // back so Chrome sampled its own frame wrong.
+                crate::backend::Dri3ImportModifier::Implicit,
                 req.depth,
                 req.bpp,
             ) {
@@ -12401,7 +12408,7 @@ fn handle_dri3_request(
                 req.height,
                 req.strides[0],
                 req.offsets[0],
-                req.modifier,
+                crate::backend::Dri3ImportModifier::Explicit(req.modifier),
                 req.depth,
                 req.bpp,
             ) {
