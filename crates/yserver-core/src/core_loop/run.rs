@@ -1508,7 +1508,6 @@ pub fn run_core(
                                     &sender,
                                     &setup_registry,
                                     state,
-                                    &mut reset_trigger,
                                     id,
                                     generation,
                                     stream,
@@ -1544,6 +1543,14 @@ pub fn run_core(
                                         &auth,
                                         rx.current_generation(),
                                     ) {
+                                        // Orphaned by a lost `Refuse`
+                                        // race. Drop it WITHOUT having
+                                        // armed the reset trigger: an
+                                        // orphan never counted as an
+                                        // established client, so its
+                                        // departure must not drain an
+                                        // armed set and start a
+                                        // generation mid-retry.
                                         disconnect_with_pending_cleanup(
                                             state,
                                             backend,
@@ -1551,7 +1558,11 @@ pub fn run_core(
                                             &mut reset_trigger,
                                             id,
                                         );
+                                    } else {
+                                        reset_trigger.note_client_established();
                                     }
+                                } else {
+                                    reset_trigger.note_client_established();
                                 }
                             }
                             Message::ClientDisconnected { id, reason: _ } => {
@@ -3214,7 +3225,6 @@ fn handle_client_setup_complete(
     sender: &CoreSender,
     setup_registry: &SetupRegistry,
     state: &mut ServerState,
-    reset_trigger: &mut ResetTrigger,
     id: yserver_protocol::x11::ClientId,
     generation: crate::core_loop::Generation,
     stream: Transport,
@@ -3300,10 +3310,16 @@ fn handle_client_setup_complete(
     //
     // Everything that ends before this line must arm nothing: a port
     // scan on the TCP listener, a handshake that drops half-way, a
-    // connection refused for a bad cookie, and now a failed
-    // registration or reader spawn.
-    reset_trigger.note_client_established();
-
+    // connection refused for a bad cookie, and a failed registration or
+    // reader spawn.
+    //
+    // Arming itself is the CALLER's, deliberately. Under XDMCP a setup
+    // can complete and then immediately lose a `Refuse` race, and the
+    // service disconnects it as orphaned. Arming here would let that
+    // drop drain an armed client set and schedule a generation — a
+    // spurious reset in the middle of the negotiation's own retry. Only
+    // a RETAINED client may arm, so the decision has to sit after
+    // XDMCP admission.
     Ok(())
 }
 
