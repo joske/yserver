@@ -744,8 +744,34 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   stage-1 `-listen tcp` startup check in place of `-auth`, and TCP fails
   closed until the first `Accept`. An empty or non-MIT credential is never
   installed (`ct_eq(&[], &[])` is true, so an empty one would match any client
-  presenting an empty cookie). Still no UDP socket, no timer and no reset
-  integration, and nothing changes for a server without an XDMCP option.
+  presenting an empty cookie). Steps 5 and 6 wire it up. An XDMCP option now
+  implies `-reset` and `-once` implies `-terminate` (overriding an explicit
+  flag, with a warning: under XDMCP the protocol decides what happens at
+  session end), and `core_loop::xdmcp::XdmcpService` puts one **UDP socket in
+  the core poll set** (`XDMCP_TOKEN`) with its retransmission deadline joining
+  the loop's existing per-iteration poll-timeout computation — **no new
+  thread**, because the machine has to see the generation boundary directly.
+  Backoff is `XDM_MIN_RTX << timeOutRtx` capped at `XDM_MAX_RTX` (2 s → 32 s),
+  giving up at `XDM_RTX_LIMIT` 7 (`XDM_KA_RTX_LIMIT` 4 awaiting `Alive`), all
+  from `X11/Xdmcp.h`. The class default (`MIT-unspecified`) is applied where
+  the packet is built, not in the parser; the generation for
+  `install_session_cookie` is read *as the `Accept` is processed*; the machine
+  emits the session-client lifecycle, so a `Refuse` racing an authenticated
+  setup leaves the loser disconnected rather than running on a cleared cookie;
+  and the re-query hook runs **after** the new generation is installed. Two
+  deliberate hardening divergences from `os/xdmcp.c`, both decided 2026-09-10:
+  **(A)** `Unwilling` acts only in `CollectQuery` and only from the configured
+  manager — Xorg's `case UNWILLING:` (`xdmcp.c:741`) is unguarded, so one
+  datagram kills a running desktop — and never aborts a broadcast/indirect
+  collection; **(B)** only a packet *accepted for the current state* resets
+  the retry budget, where Xorg clears `timeOutRtx` at `xdmcp.c:729` before the
+  header is even parsed, which made `XDM_RTX_LIMIT` unreachable against a peer
+  answering rubbish and `-once` unable to terminate. Both have fake-manager
+  tests over loopback UDP, alongside the happy path (Query → Willing → Request
+  → Accept → Manage → session → session end → reset → re-query), a silent
+  manager backing off to the limit, and `-once` on both exits. *Not done:*
+  steps 7 (docs/man page) and 8 (hardware against LightDM). Nothing changes
+  for a server without an XDMCP option: no socket, no timer, no policy change.
 - **2026-08-24 direct-scanout fallback-target fix:** a `CowDescendant` root
   Present's pinned redirected paint target need not be the Composite Overlay
   Window itself. Lazy fallback now copies into that exact pinned paint target

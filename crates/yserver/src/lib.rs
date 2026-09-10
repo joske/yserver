@@ -104,6 +104,40 @@ fn validate_tcp_startup(
     Ok(())
 }
 
+/// Build the XDMCP service from argv, or `None` when no XDMCP option was
+/// given — in which case no UDP socket is opened and nothing about the
+/// server changes (design invariant 4).
+///
+/// Binding here, at the point the display number is finally known, is also
+/// where the display-class default lands: `-class` is left unset by the
+/// parser precisely because a default is only meaningful where the packet
+/// is built (`xdmcp.c:65`, `defaultDisplayClass`).
+fn build_xdmcp_service(
+    opts: &launch::LaunchOptions,
+    display: u16,
+) -> io::Result<Option<yserver_core::core_loop::XdmcpService>> {
+    use yserver_core::core_loop::{XdmcpMode, XdmcpService, XdmcpSetup};
+
+    let Some(xdmcp) = opts.xdmcp.as_ref() else {
+        return Ok(None);
+    };
+    let mode = match xdmcp.initial_mode() {
+        launch::XdmcpQueryMode::Query(host) => XdmcpMode::Query(host.clone()),
+        launch::XdmcpQueryMode::Broadcast => XdmcpMode::Broadcast,
+        launch::XdmcpQueryMode::Indirect(host) => XdmcpMode::Indirect(host.clone()),
+    };
+    let service = XdmcpService::bind(&XdmcpSetup {
+        mode,
+        port: xdmcp.port,
+        from: xdmcp.from.clone(),
+        class: xdmcp.class.clone(),
+        display_id: xdmcp.display_id.clone(),
+        once: xdmcp.once,
+        display_number: display,
+    })?;
+    Ok(Some(service))
+}
+
 fn bind_client_listeners(
     unix: std::os::unix::net::UnixListener,
     display: u16,
@@ -642,6 +676,9 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     } else {
         log::info!("yserver: no -auth file; local access open (Xorg default)");
     }
+    // XDMCP last, so an unresolvable manager fails after the display is
+    // known but before the loop takes the thread.
+    let xdmcp = build_xdmcp_service(&opts, display)?;
     log::info!("yserver: entering single-threaded core loop");
     let result = core_loop::run_core(
         poll,
@@ -653,6 +690,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
         &alloc,
         auth,
         opts.reset_policy,
+        xdmcp,
     );
     if let Err(err) = &result {
         log::warn!("yserver: run_core returned error: {err}");
@@ -839,8 +877,9 @@ mod tcp_tests;
 #[cfg(test)]
 mod tests {
     use super::{
-        InputStartup, Message, ResetPolicy, build_auth_state, ensure_input_devices_opened,
-        input_startup_action, install_backend_root_bindings, signal_action, validate_tcp_startup,
+        InputStartup, Message, ResetPolicy, build_auth_state, build_xdmcp_service,
+        ensure_input_devices_opened, input_startup_action, install_backend_root_bindings, launch,
+        signal_action, validate_tcp_startup,
     };
     use yserver_core::{
         backend::Backend,
@@ -868,6 +907,31 @@ mod tests {
                 "SIGHUP under {policy:?} must request a reset"
             );
         }
+    }
+
+    /// Design invariant 4: with no XDMCP option, no UDP socket is opened
+    /// and nothing else changes. Asserted at the one place a socket could
+    /// come from, so it cannot drift back in.
+    #[test]
+    fn no_xdmcp_option_opens_no_socket() {
+        let opts = launch::parse_args([":7".to_string()]).unwrap();
+        assert!(opts.xdmcp.is_none());
+        assert!(build_xdmcp_service(&opts, 7).unwrap().is_none());
+        assert_eq!(opts.reset_policy, ResetPolicy::NoReset);
+    }
+
+    /// And with one, the socket is opened and the policy follows.
+    #[test]
+    fn an_xdmcp_option_opens_a_socket_and_implies_a_reset() {
+        let opts = launch::parse_args(
+            [":7", "-query", "127.0.0.1", "-port", "17177"]
+                .into_iter()
+                .map(String::from),
+        )
+        .unwrap();
+        assert_eq!(opts.reset_policy, ResetPolicy::Reset);
+        let service = build_xdmcp_service(&opts, 7).unwrap();
+        assert!(service.is_some(), "an XDMCP option must open the socket");
     }
 
     #[test]

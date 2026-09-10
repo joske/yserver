@@ -150,16 +150,24 @@ impl ResetTrigger {
         };
     }
 
-    /// SIGHUP arrived as [`Message::ResetRequested`].
+    /// A reset was *asked for* rather than latched by a departure: SIGHUP
+    /// arriving as [`Message::ResetRequested`], or the XDMCP machine's
+    /// `ResetGeneration` at the end of a session
+    /// (`core_loop::xdmcp::XdmcpOutcome::Reset`).
+    ///
+    /// Forced in both cases for the same reason: the decision is already
+    /// made elsewhere — by the operator, or by the protocol — and a client
+    /// connecting between that decision and the boundary must not veto it.
     ///
     /// [`Message::ResetRequested`]: crate::core_loop::Message::ResetRequested
     pub(crate) fn note_reset_requested(&mut self) {
         if self.policy == ResetPolicy::NoReset {
             // Unreachable in production — the signal thread sends
             // `Shutdown` under `-noreset` and never produces this
-            // message — but honouring it here anyway would break the
-            // "byte-identical to today" guarantee for anything that
-            // sends it by another route.
+            // message, and an XDMCP option forces the policy off
+            // `NoReset` at parse time — but honouring it here anyway
+            // would break the "byte-identical to today" guarantee for
+            // anything that sends it by another route.
             log::warn!("reset: ignoring a reset request under -noreset");
             return;
         }

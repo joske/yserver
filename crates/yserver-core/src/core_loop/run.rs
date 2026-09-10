@@ -35,6 +35,7 @@ use super::{
     reset::{GenerationLocals, ResetAction, ResetPolicy, ResetTrigger, reset_generation},
     sender::{CoreReceiver, CoreSender},
     setup_thread::{self, SetupRegistry},
+    xdmcp::{XDMCP_TOKEN, XdmcpOutcome, XdmcpService},
 };
 use crate::{
     backend::{Backend, BackendFdKind, CrtcConfigToken, HostSocketStatus},
@@ -1136,6 +1137,7 @@ pub fn run_core(
     client_id_allocator: &ClientIdAllocator,
     auth: Arc<AuthState>,
     reset_policy: ResetPolicy,
+    xdmcp: Option<XdmcpService>,
 ) -> io::Result<()> {
     let setup_registry = setup_thread::make_registry();
     // The generation counter is shared with every `CoreSender`; the
@@ -1160,6 +1162,18 @@ pub fn run_core(
         })
         .collect::<io::Result<_>>()?;
     let mut listener_readiness = ListenerReadiness::new(listeners.len());
+
+    // XDMCP: one UDP socket in this same poll set, and the first query.
+    // `None` unless argv named `-query`/`-broadcast`/`-indirect`, in which
+    // case nothing below this point does anything at all (invariant 4).
+    let mut xdmcp = xdmcp;
+    if let Some(service) = xdmcp.as_mut() {
+        service.register(poll.registry())?;
+        // `XdmcpInit` (`xdmcp.c:600`): the query goes out before the first
+        // poll, so a manager on the same host can answer within the first
+        // iteration.
+        service.start(&auth, rx.current_generation());
+    }
 
     // E3: register backend-owned fds with the core poller. KMS returns
     // `Drm` only after `take_input_ctx`; the libinput context, when
@@ -1263,6 +1277,11 @@ pub fn run_core(
             let ss_idle_deadline = state.screensaver_idle_deadline();
             let ss_cycle_deadline = state.screensaver_cycle_deadline();
             let idletime_alarm_deadline = state.idletime_alarm_deadline();
+            // The XDMCP retransmission/dormancy deadline joins the existing
+            // computation rather than bringing a thread of its own — the
+            // state machine belongs on this loop, where it can see the
+            // generation boundary directly.
+            let xdmcp_deadline = xdmcp.as_ref().and_then(XdmcpService::next_deadline);
             repeat_deadline
                 .into_iter()
                 .chain(backend_deadline)
@@ -1270,6 +1289,7 @@ pub fn run_core(
                 .chain(ss_idle_deadline)
                 .chain(ss_cycle_deadline)
                 .chain(idletime_alarm_deadline)
+                .chain(xdmcp_deadline)
                 .min()
                 .map(|deadline| {
                     deadline
@@ -1332,6 +1352,15 @@ pub fn run_core(
         for ev in events.iter() {
             if let Some(index) = token_to_listener_index(ev.token()) {
                 listener_readiness.mark_ready(index);
+                continue;
+            }
+            if ev.token() == XDMCP_TOKEN {
+                // `XdmcpSocketNotify` (`xdmcp.c:655`). Whatever the machine
+                // decides is latched on the service and acted on at the
+                // tail of this iteration, where the reset boundary lives.
+                if let Some(service) = xdmcp.as_mut() {
+                    service.handle_readable(&auth, rx.current_generation());
+                }
                 continue;
             }
             if let Some(index) = token_to_backend_index(ev.token()) {
@@ -1497,6 +1526,32 @@ pub fn run_core(
                                         &mut reset_trigger,
                                         id,
                                     );
+                                } else if let Some(service) = xdmcp.as_mut() {
+                                    // `XdmcpOpenDisplay` (`xdmcp.c:632`),
+                                    // called from `ClientAuthorized`
+                                    // (`os/connection.c:581`) for every
+                                    // client that completes an authorized
+                                    // setup. Immediately after
+                                    // establishment, not deferred to the
+                                    // tail: this is the ordering that
+                                    // decides a `Refuse` racing an
+                                    // in-flight setup, and the service
+                                    // reports a client the race left with
+                                    // no session to belong to.
+                                    if service.note_client_established(
+                                        id,
+                                        is_local,
+                                        &auth,
+                                        rx.current_generation(),
+                                    ) {
+                                        disconnect_with_pending_cleanup(
+                                            state,
+                                            backend,
+                                            &mut pending_backend_requests,
+                                            &mut reset_trigger,
+                                            id,
+                                        );
+                                    }
                                 }
                             }
                             Message::ClientDisconnected { id, reason: _ } => {
@@ -1732,6 +1787,38 @@ pub fn run_core(
         // cancellation in `note_client_established` meaningful: a
         // client that completes setup after the drain, in this same
         // batch, un-drains the session before the boundary is reached.
+        // XDMCP, once per iteration and immediately before the boundary:
+        // fire a due timer, notice the session client leaving, and act on
+        // whatever the machine decided.
+        if let Some(service) = xdmcp.as_mut() {
+            service.service_timer(Instant::now(), &auth, rx.current_generation());
+            // `XdmcpCloseDisplay` (`xdmcp.c:642`). Ids are allocated
+            // monotonically and only `disconnect_with_pending_cleanup`
+            // removes an entry, so a recorded session client that is no
+            // longer in `state.clients` HAS departed — this is the
+            // departure, not a guess about one.
+            if let Some(client) = service.live_session_client()
+                && !state.clients.contains_key(&client.0)
+            {
+                service.note_session_client_disconnected(client, &auth, rx.current_generation());
+            }
+            match service.take_outcome() {
+                None => {}
+                Some(XdmcpOutcome::Terminate) => {
+                    log::info!("xdmcp: terminating the server");
+                    setup_thread::shutdown_all(&setup_registry);
+                    cancel_all_pending_backend_requests(backend, &mut pending_backend_requests);
+                    return Ok(());
+                }
+                Some(XdmcpOutcome::Reset) => {
+                    // Forced, like SIGHUP: a client connecting between the
+                    // session ending and the boundary must not veto the
+                    // renewal the protocol already committed to.
+                    reset_trigger.note_reset_requested();
+                }
+            }
+        }
+
         match reset_trigger.take_pending() {
             None => {}
             Some(ResetAction::Terminate) => {
@@ -1761,6 +1848,13 @@ pub fn run_core(
                 // event and reset a second time.
                 reset_trigger.begin_generation();
                 log::info!("reset: new generation installed ({generation:?})");
+                // `XdmcpReset` (`xdmcp.c:618`), AFTER the new generation is
+                // installed — the cookie the re-query is about to earn
+                // belongs to this generation, and binding it to the old one
+                // would refuse the very session it is fetching.
+                if let Some(service) = xdmcp.as_mut() {
+                    service.restart(&auth, generation);
+                }
             }
         }
     }
@@ -3478,6 +3572,7 @@ mod tests {
                 &ClientIdAllocator::new(),
                 AuthState::new(None),
                 ResetPolicy::NoReset,
+                None,
             )
         });
         let result: io::Result<()> = (|| {
@@ -4121,6 +4216,7 @@ mod tests {
                 &alloc,
                 AuthState::new(None),
                 ResetPolicy::NoReset,
+                None,
             );
             (result, backend)
         });
@@ -4148,6 +4244,192 @@ mod tests {
             dispatched_fds.iter().all(|fd| *fd == drm_fd_b),
             "idle DRM fd {drm_fd_a} was dispatched: {dispatched_fds:?}",
         );
+    }
+
+    /// A fake XDMCP manager on loopback, for the two loop-level tests
+    /// below. The service-level behaviour is covered in `core_loop::xdmcp`;
+    /// what these prove is the *plumbing* — the UDP socket really is in
+    /// this poll set, its readiness really is dispatched, and the reset
+    /// hook really runs after the new generation is installed.
+    struct XdmcpManagerFixture {
+        socket: std::net::UdpSocket,
+    }
+
+    impl XdmcpManagerFixture {
+        fn new() -> Self {
+            let socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            Self { socket }
+        }
+
+        fn service(&self, once: bool) -> XdmcpService {
+            use crate::core_loop::xdmcp::{XdmcpMode, XdmcpSetup};
+            XdmcpService::bind(&XdmcpSetup {
+                mode: XdmcpMode::Query("127.0.0.1".into()),
+                port: self.socket.local_addr().unwrap().port(),
+                from: Some("127.0.0.1".into()),
+                class: None,
+                display_id: None,
+                once,
+                display_number: 7,
+            })
+            .unwrap()
+        }
+
+        fn expect(
+            &self,
+            what: &str,
+        ) -> (yserver_protocol::xdmcp::XdmcpMessage, std::net::SocketAddr) {
+            let mut buf = [0_u8; 8192];
+            let (len, from) = self
+                .socket
+                .recv_from(&mut buf)
+                .unwrap_or_else(|e| panic!("no {what} from the display: {e}"));
+            (
+                yserver_protocol::xdmcp::decode_message(&buf[..len]).unwrap(),
+                from,
+            )
+        }
+
+        fn send(&self, to: std::net::SocketAddr, message: &yserver_protocol::xdmcp::XdmcpMessage) {
+            let packet = yserver_protocol::xdmcp::encode_message(message).unwrap();
+            self.socket.send_to(&packet, to).unwrap();
+        }
+    }
+
+    /// The socket is registered with the core poller, its readiness is
+    /// dispatched, and a reset re-queries — from the loop, not from a
+    /// hand-driven service.
+    #[test]
+    fn the_xdmcp_socket_is_polled_and_a_reset_re_queries() {
+        use crate::backend::recording::RecordingBackend;
+        use yserver_protocol::xdmcp::XdmcpMessage;
+
+        let manager = XdmcpManagerFixture::new();
+        let service = manager.service(false);
+        let (poll, sender, rx) = channel().unwrap();
+        let sender_for_core = sender.clone_handle();
+        let handle = std::thread::spawn(move || {
+            let mut state = ServerState::new();
+            let mut backend = RecordingBackend::new();
+            let alloc = ClientIdAllocator::new();
+            run_core(
+                poll,
+                rx,
+                sender_for_core,
+                &mut state,
+                &mut backend,
+                None,
+                &alloc,
+                AuthState::new_with_xdmcp(None, true),
+                ResetPolicy::Reset,
+                Some(service),
+            )
+        });
+
+        let (query, display) = manager.expect("the startup Query");
+        assert!(matches!(query, XdmcpMessage::Query { .. }), "{query:?}");
+
+        manager.send(
+            display,
+            &XdmcpMessage::Willing {
+                authentication_name: Vec::new(),
+                hostname: b"fake-dm".to_vec(),
+                status: b"willing".to_vec(),
+            },
+        );
+        let (request, _) = manager.expect("a Request");
+        assert!(
+            matches!(request, XdmcpMessage::Request { .. }),
+            "the loop did not dispatch the socket's readiness: {request:?}"
+        );
+
+        // A forced reset (the SIGHUP path) crosses the boundary; the XDMCP
+        // hook then re-queries on the NEW generation.
+        sender.send(Message::ResetRequested).unwrap();
+        let (requery, _) = manager.expect("a re-query after the reset");
+        assert!(matches!(requery, XdmcpMessage::Query { .. }), "{requery:?}");
+
+        sender.send(Message::Shutdown).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(handle.is_finished(), "run_core did not return");
+        handle.join().unwrap().unwrap();
+    }
+
+    /// A `Terminate` from the machine ends the loop cleanly — the other
+    /// half of the outcome wiring. `Failed` gets there in three packets
+    /// instead of the 126 seconds a retransmission timeout would take.
+    #[test]
+    fn an_xdmcp_terminate_ends_the_core_loop() {
+        use crate::backend::recording::RecordingBackend;
+        use yserver_protocol::xdmcp::{MIT_MAGIC_COOKIE_1, XdmcpMessage};
+
+        let manager = XdmcpManagerFixture::new();
+        let service = manager.service(false);
+        let (poll, sender, rx) = channel().unwrap();
+        let sender_for_core = sender.clone_handle();
+        let handle = std::thread::spawn(move || {
+            let mut state = ServerState::new();
+            let mut backend = RecordingBackend::new();
+            let alloc = ClientIdAllocator::new();
+            run_core(
+                poll,
+                rx,
+                sender_for_core,
+                &mut state,
+                &mut backend,
+                None,
+                &alloc,
+                AuthState::new_with_xdmcp(None, true),
+                ResetPolicy::Reset,
+                Some(service),
+            )
+        });
+
+        let (_, display) = manager.expect("the startup Query");
+        manager.send(
+            display,
+            &XdmcpMessage::Willing {
+                authentication_name: Vec::new(),
+                hostname: b"fake-dm".to_vec(),
+                status: b"willing".to_vec(),
+            },
+        );
+        let _ = manager.expect("a Request");
+        manager.send(
+            display,
+            &XdmcpMessage::Accept {
+                session_id: 0x1234,
+                authentication_name: Vec::new(),
+                authentication_data: Vec::new(),
+                authorization_name: MIT_MAGIC_COOKIE_1.to_vec(),
+                authorization_data: b"cookie".to_vec(),
+            },
+        );
+        let _ = manager.expect("a Manage");
+        manager.send(
+            display,
+            &XdmcpMessage::Failed {
+                session_id: 0x1234,
+                status: b"no session for you".to_vec(),
+            },
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            handle.is_finished(),
+            "a fatal XDMCP packet did not stop the loop"
+        );
+        handle.join().unwrap().unwrap();
+        drop(sender);
     }
 
     #[test]
@@ -4183,6 +4465,7 @@ mod tests {
                 &alloc,
                 AuthState::new(None),
                 ResetPolicy::NoReset,
+                None,
             );
             (result, backend)
         });
@@ -4241,6 +4524,7 @@ mod tests {
                 &alloc,
                 AuthState::new(None),
                 ResetPolicy::NoReset,
+                None,
             );
             (result, backend)
         });
@@ -4522,6 +4806,7 @@ mod tests {
                 &alloc,
                 AuthState::new(None),
                 ResetPolicy::NoReset,
+                None,
             )
         });
         sender.send(Message::Shutdown).unwrap();
@@ -5390,6 +5675,7 @@ mod server_reset {
                     &client_ids_for_core,
                     auth,
                     policy,
+                    None,
                 )
             });
             Self {
