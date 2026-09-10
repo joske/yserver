@@ -4447,6 +4447,210 @@ mod tests {
         handle.join().unwrap().unwrap();
         drop(sender);
     }
+    /// A setup that lost the `Refuse` race is dropped as orphaned — and
+    /// that drop must not start a generation.
+    ///
+    /// `AuthState` is atomic per call, but a setup thread that already
+    /// passed `check` is past that point: a `Refuse` can clear the
+    /// session cookie while the thread is one instruction from sending
+    /// its `ClientSetupComplete`. `XdmcpService::note_client_established`
+    /// reports that loser and the loop disconnects it. Under XDMCP the
+    /// policy is an implied `-reset`, so if the completion had armed the
+    /// reset trigger, the orphan's *own* disconnect would drain an armed
+    /// client set and cross the generation boundary — tearing down the
+    /// negotiation that is at that very moment retrying its `Request`.
+    ///
+    /// Arming therefore belongs to the caller, after XDMCP admission has
+    /// decided. What this pins is that decision order: the orphan goes
+    /// away, the generation does not move, and the manager's outstanding
+    /// offer is undisturbed. The injected message stands in for the
+    /// racing setup thread exactly as it reaches the loop — a **remote**
+    /// client, because the orphan rule deliberately spares local ones
+    /// (Xorg's `XdmcpOpenDisplay` ignores a unix client, which the XDMCP
+    /// cookie never authorized).
+    #[test]
+    fn an_orphaned_xdmcp_client_does_not_reset_the_generation() {
+        use crate::backend::recording::RecordingBackend;
+        use std::io::Read;
+        use yserver_protocol::{
+            x11::ClientByteOrder,
+            xdmcp::{MIT_MAGIC_COOKIE_1, XdmcpMessage, decode_message},
+        };
+
+        /// How long the "no reset happened" assertions watch for. The
+        /// XDMCP retransmit floor is `XDM_MIN_RTX` = 2 s, so nothing the
+        /// healthy machine does can land inside this window; a reset's
+        /// re-query would land immediately.
+        const QUIET: Duration = Duration::from_millis(400);
+        const SESSION: u32 = 0x1234;
+
+        let manager = XdmcpManagerFixture::new();
+        let service = manager.service(false);
+        let (poll, sender, rx) = channel().unwrap();
+        // The generation is read from the counter, not inferred from
+        // timing: the boundary bumps it and nothing else in the loop
+        // does.
+        let generations = rx.generation_counter();
+        let sender_for_core = sender.clone_handle();
+        let client_ids = std::sync::Arc::new(ClientIdAllocator::new());
+        let client_ids_for_core = client_ids.clone();
+        let handle = std::thread::spawn(move || {
+            let mut state = ServerState::new();
+            let mut backend = RecordingBackend::new();
+            run_core(
+                poll,
+                rx,
+                sender_for_core,
+                &mut state,
+                &mut backend,
+                None,
+                &client_ids_for_core,
+                AuthState::new_with_xdmcp(None, true),
+                ResetPolicy::Reset,
+                Some(service),
+            )
+        });
+
+        let start_generation = generations.current();
+
+        // Query -> Willing -> Request -> Accept installs the session
+        // cookie, and the machine answers with Manage.
+        let (query, display) = manager.expect("the startup Query");
+        assert!(matches!(query, XdmcpMessage::Query { .. }), "{query:?}");
+        manager.send(
+            display,
+            &XdmcpMessage::Willing {
+                authentication_name: Vec::new(),
+                hostname: b"fake-dm".to_vec(),
+                status: b"willing".to_vec(),
+            },
+        );
+        let (request, _) = manager.expect("a Request");
+        assert!(
+            matches!(request, XdmcpMessage::Request { .. }),
+            "{request:?}"
+        );
+        manager.send(
+            display,
+            &XdmcpMessage::Accept {
+                session_id: SESSION,
+                authentication_name: Vec::new(),
+                authentication_data: Vec::new(),
+                authorization_name: MIT_MAGIC_COOKIE_1.to_vec(),
+                authorization_data: b"cookie".to_vec(),
+            },
+        );
+        let (manage, _) = manager.expect("a Manage");
+        assert!(matches!(manage, XdmcpMessage::Manage { .. }), "{manage:?}");
+
+        // The Refuse clears the cookie and sends the machine back round
+        // to Request. Reading that retry is the synchronisation point:
+        // it cannot be on the wire until the Refuse has been fully
+        // applied, so the injection below is unambiguously *after* the
+        // clear. No generation change — the offer is being retried, not
+        // abandoned.
+        manager.send(
+            display,
+            &XdmcpMessage::Refuse {
+                session_id: SESSION,
+            },
+        );
+        let (retry, _) = manager.expect("the Request retry after the Refuse");
+        assert!(
+            matches!(retry, XdmcpMessage::Request { .. }),
+            "a Refuse must resend the Request, got {retry:?}"
+        );
+        assert_eq!(
+            generations.current(),
+            start_generation,
+            "a Refuse retries the offer; it does not cross a boundary"
+        );
+
+        // The racing setup thread's completion, arriving now.
+        let orphan = client_ids.allocate();
+        let (core_side, mut peer) = UnixStream::pair().expect("socketpair");
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        let stale = sender.bind();
+        stale
+            .send(Message::ClientSetupComplete {
+                id: orphan,
+                generation: stale.generation(),
+                stream: Transport::Unix(core_side),
+                resource_id_base: 0x0020_0000,
+                resource_id_mask: 0x000F_FFFF,
+                byte_order: ClientByteOrder::LittleEndian,
+                // Remote: only a TCP client can have been authorized by
+                // the session credential the Refuse just revoked.
+                is_local: false,
+                fd_passing: false,
+            })
+            .expect("send the racing completion");
+
+        // 1. The orphan is dropped. `process_disconnect` shuts the
+        //    socket down on both sides, so this is EOF, not a timeout.
+        let mut sink = [0_u8; 1];
+        match peer.read(&mut sink) {
+            Ok(0) => {}
+            other => panic!("a client with no session must be disconnected; read {other:?}"),
+        }
+
+        // Watch the manager socket for a while before judging anything.
+        // The boundary is crossed at the *end* of the iteration the
+        // disconnect ran in, so EOF above races the bump by microseconds
+        // — this window is what makes the two assertions below decisive
+        // rather than a coin flip. Collect only; asserting inside the
+        // loop would let the re-query fire first and hide which of the
+        // two actually broke.
+        manager
+            .socket
+            .set_read_timeout(Some(QUIET))
+            .expect("quiet-window timeout");
+        let mut buf = [0_u8; 8192];
+        let mut seen = Vec::new();
+        let deadline = Instant::now() + QUIET;
+        while Instant::now() < deadline {
+            let len = match manager.socket.recv_from(&mut buf) {
+                Ok((len, _)) => len,
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break;
+                }
+                Err(err) => panic!("unexpected error reading the manager socket: {err}"),
+            };
+            seen.push(decode_message(&buf[..len]).expect("decode"));
+        }
+
+        // 2. The regression itself.
+        assert_eq!(
+            generations.current(),
+            start_generation,
+            "an orphaned client never became established; its disconnect must not \
+             drain an armed session and start a new generation"
+        );
+
+        // 3. And the negotiation carried on untouched: the retry read
+        //    above is the manager's Request, and no Query followed it —
+        //    a Query is what a reset's re-query looks like.
+        assert!(
+            !seen
+                .iter()
+                .any(|message| matches!(message, XdmcpMessage::Query { .. })),
+            "the display re-queried mid-negotiation: {seen:?}"
+        );
+
+        sender.send(Message::Shutdown).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(handle.is_finished(), "run_core did not return");
+        handle.join().unwrap().unwrap();
+    }
 
     #[test]
     fn copied_scanout_completion_fd_dispatches_dedicated_hook() {
