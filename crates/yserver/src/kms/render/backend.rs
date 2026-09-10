@@ -37088,35 +37088,50 @@ mod tests {
         // dual-GPU host, and skipping when a node is missing made an
         // earlier version of this test pass vacuously.
         let (w, h) = (256u16, 64u16);
-        let seed = match b.create_pixmap(None, 32, w, h) {
-            Ok(handle) => handle,
-            Err(e) => {
-                eprintln!("skip: create_pixmap: {e}");
-                return;
-            }
-        };
-        let seed_export = match b.dri3_export_pixmap_buffers(seed.as_raw()) {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("skip: seed export: {e}");
-                return;
-            }
-        };
+        // Past this point nothing may "skip". A missing Vulkan ICD is a
+        // legitimate skip and is handled above; a fixture that cannot
+        // build once Vulkan IS up is a broken test, and letting it
+        // return green is how the first version of this test passed
+        // vacuously.
+        let seed = b
+            .create_pixmap(None, 32, w, h)
+            .expect("fixture: create_pixmap with a live Vk context");
+        let seed_export = b
+            .dri3_export_pixmap_buffers(seed.as_raw())
+            .expect("fixture: export the seed pixmap");
+        assert!(
+            seed_export.size > 0 && seed_export.stride > 0,
+            "fixture: seed export must describe a real buffer, got size={} stride={}",
+            seed_export.size,
+            seed_export.stride,
+        );
         let stride = seed_export.stride;
         let seed_modifier = seed_export.modifier;
 
-        for (case, requested, expected) in [
+        // The legacy request states a size on the wire; an export must
+        // report that number back verbatim.
+        //
+        // Deliberately NOT the seed's own size: the fallback path derives
+        // the same number from the Vulkan layout, so reusing it makes the
+        // assertion pass whether or not the stated size is honoured. A
+        // distinguishable value is what gives it teeth. A client would not
+        // normally overstate its buffer, but the contract is "report what
+        // the client said", and nothing here consumes the buffer.
+        let stated_size = seed_export.size + 4096;
+        for (case, requested, expected, expected_size) in [
             (
                 "implicit",
-                Dri3ImportModifier::Implicit {
-                    size: seed_export.size,
-                },
+                Dri3ImportModifier::Implicit { size: stated_size },
                 INVALID,
+                stated_size,
             ),
             (
+                // No size on the PixmapFromBuffers wire, so this one
+                // legitimately falls back to the Vulkan layout.
                 "explicit",
                 Dri3ImportModifier::Explicit(seed_modifier),
                 seed_modifier,
+                seed_export.size,
             ),
         ] {
             let fd = seed_export.fd.try_clone().expect("dup the seed dma-buf");
@@ -37139,6 +37154,13 @@ mod tests {
                  re-derived from our VkImage",
             );
             assert_eq!(export.offset, 0, "{case}: offset must round trip");
+            assert_eq!(
+                export.size, expected_size,
+                "{case}: the client's stated buffer size must be reported verbatim. \
+                 Measuring it from the fd instead reports 0 on a failed seek, and moves \
+                 the client's file offset, since a dup'd SCM_RIGHTS fd shares its \
+                 open-file description",
+            );
         }
     }
 
