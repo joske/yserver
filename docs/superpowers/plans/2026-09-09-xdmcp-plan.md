@@ -198,8 +198,14 @@ The first step that sends anything.
 - Retransmission with exponential backoff, taken from the protocol header
   rather than invented: `rtx = XDM_MIN_RTX << timeOutRtx` capped at
   `XDM_MAX_RTX` — **2 s doubling to 32 s** (`Xdmcp.h:39-40`), giving up at
-  `XDM_RTX_LIMIT` **7** retransmissions, or `XDM_KA_RTX_LIMIT` **4** while
-  awaiting `Alive` (`:41-42`).
+  `XDM_RTX_LIMIT` (**7**) or `XDM_KA_RTX_LIMIT` (**4**) while awaiting `Alive`
+  (`:41-42`).
+
+  ⚠ **"7 retransmissions" is off by one**, corrected in implementation: the
+  7th *timeout* declares the session dead rather than resending, so a silent
+  manager produces 1 initial + 6 retransmits + 1 dead-session re-query — 8
+  datagrams, delays `[2,4,8,16,32,32,32]`. The limit counts timeouts, not
+  resends. Pinned by a test rather than left to arithmetic.
 - **Apply the display-class default here**, not in the parser. Step 3 leaves
   `class: None` when `-class` is absent, because a default is only meaningful
   where the packet is built. Xorg's is `"MIT-unspecified"`

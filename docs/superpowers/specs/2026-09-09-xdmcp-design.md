@@ -330,6 +330,32 @@ and makes `-once` terminate even against a peer deliberately feeding rubbish.
   datagrams**: the budget still runs out, `XdmcpDeadSession` fires, and under
   `-once` the server terminates.
 
+### Found in implementation, needing a second opinion
+
+**The `Refuse`-vs-setup serialisation had no owner.** This spec required that a
+`Refuse` racing an authenticated setup "must not end with a running session
+whose cookie has just been cleared", but neither it nor the plan said *who*
+disconnects the loser, and nothing in steps 1-4 did. The state machine alone
+cannot: its `open_display` returns no actions, leaving the client established,
+running, and authenticated by a credential that was just cleared.
+
+Decided during step 6, and flagged as a decision rather than a spec reading:
+a **remote** client established while no session is live is reported as
+orphaned and disconnected by the loop. The reasoning is that in XDMCP mode only
+the session credential can authorize a TCP client, so such a client was
+admitted by an offer that has since died. **Local** clients are untouched,
+matching Xorg's `XdmcpOpenDisplay`, which simply ignores them.
+
+**Broadcast addressing diverges, undocumented until now.** Xorg enumerates
+per-interface broadcast addresses via `SIOCGIFCONF` (`AddBroadcastAddresses`);
+we send to the limited broadcast `255.255.255.255:<port>`. Correct for a
+single-homed thin client — the target deployment — but a multi-homed host will
+not behave like Xorg, and none of this is hardware-tested.
+
+**An unresolvable `-query` host fails at startup.** Neither document specified
+it. The alternative, coming up and querying nobody, is indistinguishable from a
+hung manager.
+
 ## Invariants
 
 1. A session's cookie authorizes only that session — enforced by generation
