@@ -50,14 +50,6 @@
 //! - **The empty-projection force-compose**, which exists so a paint whose
 //!   projection landed empty can retire at all.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the signature accessors land ahead of their consumers"
-    )
-)]
-
 use std::collections::HashMap;
 
 use ash::vk;
