@@ -169,12 +169,22 @@ Order, per the spec:
    `InputInventory`, interning device-property atoms anew.
 7. `install_backend_root_bindings` (`lib.rs:29`).
 8. Rebind the root window, mark the backend dirty, **clear the scanout**.
-   The leaked COW claim is **not** handled here. Decided 2026-09-09: it needs
-   the structural per-client-resource fix in the spec's "Adjacent gaps", which
-   is a prerequisite for shipping reset rather than a part of it. A bounded
-   decrement loop was written here and rejected — arbitrary cap, and on a
-   teardown failure it carried the old compositor's claim into the next
-   session.
+   The leaked COW claim is **not** cleaned up here, and deliberately still
+   is not. Decided 2026-09-09: it needed the structural per-client-resource
+   fix in the spec's "Adjacent gaps", a prerequisite for shipping reset
+   rather than a part of it. That landed on master
+   (`2248b352`), so `force_destroy_all_clients` inherits the release through
+   the ordinary disconnect path and the boundary adds no COW-specific code.
+   A bounded decrement loop was written here and rejected — arbitrary cap,
+   and on a teardown failure it carried the old compositor's claim into the
+   next session.
+
+   What the boundary *does* add is a refusal: between the forced teardown
+   and the state swap it returns `None` if `cow_teardown_failed` holds or a
+   claim somehow remains, and the caller terminates. Both halves matter — a
+   failed teardown releases the claim anyway, so a claim-only test would see
+   nothing — and so does the placement, because the flag lives in
+   `ServerState` and a check after the swap reads a fresh state with it clear.
 9. Listeners untouched.
 
 **Proof.** Unit: after a direct call, the new state has empty

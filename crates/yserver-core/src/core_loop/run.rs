@@ -1839,7 +1839,7 @@ pub fn run_core(
                 return Ok(());
             }
             Some(ResetAction::Reset) => {
-                let generation = reset_generation(
+                let outcome = reset_generation(
                     state,
                     backend,
                     poll.registry(),
@@ -1853,6 +1853,16 @@ pub fn run_core(
                         telemetry: &mut telemetry,
                     },
                 );
+                // The boundary refused: the old session's composite overlay
+                // could not be released, so there is no safe generation to
+                // continue into. `reset_generation` has already logged why.
+                // Shut down the same way `-terminate` does — under XDMCP the
+                // display manager re-queries and gets a clean process.
+                let Some(generation) = outcome else {
+                    setup_thread::shutdown_all(&setup_registry);
+                    cancel_all_pending_backend_requests(backend, &mut pending_backend_requests);
+                    return Ok(());
+                };
                 // Disarm for the generation just installed. Without
                 // this the empty client set the reset leaves behind
                 // would be re-latched by the next departure-shaped
