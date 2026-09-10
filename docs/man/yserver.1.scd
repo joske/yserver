@@ -85,6 +85,44 @@ how the server is started:
 	means *-reset* only makes sense when something holds the display open
 	continuously, such as a display manager's session.
 
+*-query* _host_, *-indirect* _host_, *-broadcast*
+	Run as an *XDMCP* display: ask a display manager for a session
+	instead of starting one locally. *-query* asks one manager directly,
+	*-indirect* asks it to choose, *-broadcast* asks whoever answers.
+	Ordered and last-wins, so *-query a -broadcast* ends up broadcasting.
+
+	These imply *-reset*, and *-once* then implies *-terminate*: one
+	XDMCP session is one server generation, so logging out wipes the
+	session and queries again for the next user.
+
+	They also require *-listen tcp* in practice, because the session's
+	clients run on the manager's host. No *-auth* is needed — the
+	manager supplies a per-session cookie in its reply, and that cookie
+	is the *only* thing that authorizes a TCP client while XDMCP is
+	driving. See *SECURITY*.
+
+	*-broadcast* sends to the limited broadcast address rather than
+	enumerating each interface's broadcast address as *Xorg*(1) does.
+	That is correct for a single-homed machine, which is the case this
+	was built for; on a multi-homed host it will not reach the same set
+	of managers.
+
+*-port* _n_
+	UDP port of the display manager. Default *177*.
+
+*-from* _address_
+	Source address to send XDMCP packets from.
+
+*-class* _string_, *-displayID* _string_
+	Display class and identifier reported to the manager. The class
+	defaults to *MIT-unspecified*.
+
+*-once*
+	Exit rather than renewing. This covers every renewal condition, not
+	only a clean logout: a keepalive failure, or exhausting the
+	retransmission budget against a manager that never answers, also
+	exits.
+
 *--version*, *-version*
 	Print the version and the commit it was built from, then exit.
 
@@ -226,6 +264,25 @@ For ordinary remote use, prefer *ssh -X*, which needs none of this: it proxies
 through a local UNIX socket on the remote host and never touches the TCP
 listener. *-listen tcp* exists for XDMCP, where the display manager supplies a
 per-session cookie and the network is assumed to be trusted.
+
+# XDMCP AND TRUST
+
+XDMCP as implemented here has *no authentication of the manager*.
+XDM-AUTHENTICATION-1, the protocol's optional mutual authentication, is not
+implemented — so anything on the network that can answer your query can offer
+you a session, and everything including keystrokes crosses the network in
+clear text. This is equally true of *Xorg*(1) in the same configuration, and
+is why XDMCP deployments assume a trusted, controlled network.
+
+Two hardening choices deliberately differ from *Xorg*(1), both because its
+behaviour looks like an oversight:
+
+- An *Unwilling* reply is acted on only while actually collecting replies, and
+  under *-query* only from the manager that was asked. In *Xorg* any host may
+  end a *running* session with a single packet.
+- The retransmission budget is reset only by a packet that is valid for the
+  current state. In *Xorg* any datagram resets it, so a peer sending rubbish
+  can keep a display retrying forever and stop *-once* from ever exiting.
 
 # FILES
 
