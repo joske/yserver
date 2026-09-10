@@ -236,6 +236,46 @@ and the requests fail — DRI3 with `BadMatch`, MIT-SHM with `BadRequest` — so
 clients fall back the same way they do against a remote Xorg. In practice that
 means no GPU acceleration for remote clients.
 
+## XDMCP: getting your session from a display manager
+
+XDMCP inverts the usual arrangement. Instead of starting a session locally,
+yserver asks a display manager — possibly on another machine — for one, and
+the manager's greeter and session clients connect *back* to your display over
+TCP. It is the thin-client model, and it is what `-listen tcp` exists for.
+
+**The manager must speak XDMCP, and many no longer do.** GNOME's `gdm` has
+removed support entirely. `lightdm` works:
+
+```ini
+# /etc/lightdm/lightdm.conf
+[XDMCPServer]
+enabled=true
+port=177
+```
+
+Then, from a TTY on the machine that will *be* the display:
+
+```sh
+yserver :7 -query <manager-host> -listen tcp
+```
+
+or `just yserver-xdmcp-hw manager=<host>`, which does the same and captures a
+log.
+
+No `-auth` is needed or wanted: the manager sends a per-session cookie in its
+reply, and while XDMCP is driving, that cookie is the **only** thing that
+authorizes a TCP client — a cookie in a local file will not do, because it
+does not belong to this session. `-query` also implies `-reset`, so logging
+out erases the session and queries again for the next user.
+
+Add `-once` to exit after one session instead of looping. That covers every
+renewal path, including failing to reach the manager at all.
+
+**Before trusting it on a network**, read the XDMCP section of `yserver(1)`.
+There is no authentication of the manager and no encryption of the
+connection; XDMCP assumes a trusted network, and that assumption is doing real
+work.
+
 ## Key bindings
 
 | Keys                           | Effect                                                          |

@@ -230,6 +230,35 @@ yserver-tcp-hw log="warn":
 #     produces a completely empty log — verified the hard way.
 # Deliberately prints no summary: this runs from a bare TTY, where console
 # output cannot be copied. Ask for `yserver-hw-startx.log` and grep it here.
+# Needs a display manager with XDMCP ENABLED and reachable on UDP 177 --
+# lightdm's [XDMCPServer] enabled=true works; GNOME's gdm has removed XDMCP
+# entirely (no xdmcp strings in the binary), so it cannot be the manager.
+# Deliberately no -auth: the session cookie arrives in the manager's Accept,
+# and -query implies -reset, so logging out wipes the session and re-queries
+# for a fresh greeter. Runs in the FOREGROUND on this VT; stop it with
+# `pkill -TERM yserver` from another VT, or pass once=1 to exit after one
+# session (which also exercises -once).
+# yserver as an XDMCP display, driven by a display manager.
+yserver-xdmcp-hw manager="127.0.0.1" log="info" once="0":
+    RUSTFLAGS="-C debug-assertions=yes" cargo build --release --bin yserver
+    bash -c '\
+        case "$(tty)" in /dev/tty[0-9]*) ;; *) echo "xdmcp-hw: must be run from a TTY (got: $(tty))" >&2; exit 1;; esac;\
+        display=0;\
+        while [ -e /tmp/.X11-unix/X$display ]; do display=$((display+1)); done;\
+        once="";\
+        [ "{{once}}" = "1" ] && once="-once";\
+        echo "xdmcp-hw: display :$display, manager {{manager}}:177, TCP port $((6000+display))";\
+        echo "xdmcp-hw: no -auth by design -- the cookie comes from the Accept";\
+        [ -n "$once" ] && echo "xdmcp-hw: -once, so the server exits after one session";\
+        echo "xdmcp-hw: if nothing appears, grep the log for Willing to tell";\
+        echo "xdmcp-hw:   \"manager never answered\" from \"negotiation failed\"";\
+        echo "";\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver "$display" -query "{{manager}}" -listen tcp $once > yserver-hw-xdmcp.log 2>&1;\
+        rc=$?;\
+        echo "";\
+        echo "xdmcp-hw: yserver exited ($rc). Please send yserver-hw-xdmcp.log from this directory.";\
+        grep -ciE "willing|accept|manage" yserver-hw-xdmcp.log | xargs -I{} echo "xdmcp-hw: {} negotiation lines in the log"'
+
 # Session 1 stamps a root property WHILE its xterm holds the display open --
 # a one-shot client like xprop is itself the last client, so on a -reset
 # server its own exit resets away whatever it just set. The server resets
