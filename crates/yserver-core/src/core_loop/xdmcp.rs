@@ -260,9 +260,10 @@ impl XdmcpService {
     /// or not.
     ///
     /// `receive_packet` (`xdmcp.c:713`) reads exactly one datagram per
-    /// readiness because `ospoll` re-arms; we drain to `WouldBlock` because
-    /// the core poller is level-triggered over many other sources and a
-    /// backlog would otherwise be serviced one datagram per iteration.
+    /// readiness because `ospoll` re-arms level-triggered. mio registers
+    /// edge-triggered, so stopping before `WouldBlock` risks a queued
+    /// datagram with no further wakeup to collect it — draining is the
+    /// requirement here, not an optimisation.
     pub fn handle_readable(&mut self, auth: &AuthState, generation: Generation) {
         loop {
             let (len, from) = match self.socket.recv_from(&mut self.buffer) {
