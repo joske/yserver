@@ -319,5 +319,16 @@ fn tcp_loopback_cookie_setup_and_listener_capabilities() {
     let (core_result, capabilities) = handle.join().unwrap();
     core_result.unwrap();
     result.unwrap();
-    assert_eq!(capabilities, [(false, false), (true, true)]);
+    // (is_local, fd_passing) for the TCP client then the unix one.
+    //
+    // The TCP peer is 127.0.0.1, so it is LOCAL: `is_local` is an address
+    // property, and Xorg's `xtransLocalClient` (os/access.c) answers TRUE
+    // for a TCP peer whose address is the server's own. It keeps MIT-SHM,
+    // whose legacy `Attach` passes a SysV shmid rather than a descriptor.
+    //
+    // `fd_passing` stays false: SCM_RIGHTS is impossible over TCP however
+    // local the peer is. Until 2026-09-10 both were derived from the
+    // transport and this asserted `(false, false)`, which cost a
+    // same-machine XDMCP session its shared memory.
+    assert_eq!(capabilities, [(true, false), (true, true)]);
 }
