@@ -620,6 +620,24 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ## Where we are
 
+- **2026-09-10 the reset boundary inherits the overlay release (#121 step 4):**
+  the claim-ownership fix landed on master as `2248b352`, so
+  `reset_generation` no longer carries the "NOT handled here" note and adds no
+  COW-specific cleanup: `force_destroy_all_clients` routes every client
+  through `process_disconnect`, which releases its claims. Note the rebase put
+  master's call inside `process_disconnect_reporting`, the shared body, not the
+  `process_disconnect` wrapper — reset calls the reporting variant, so had it
+  landed in the wrapper the forced teardown would have silently skipped it.
+  What the boundary *does* add is a **refusal**: between the forced teardown
+  and the state swap it returns `None`, and the caller shuts down the way
+  `-terminate` does, if `cow_teardown_failed` holds or a claim somehow remains.
+  Both halves are tested because a failed teardown releases the claim anyway,
+  so a claim-only check would see nothing; and the placement is asserted, not
+  trusted, because the flag lives in `ServerState` and a check after the swap
+  would read a fresh state with it clear — destroying the evidence and then
+  proceeding on the strength of its absence. Verified by disabling the guard
+  and watching the refusal test fail on that assertion.
+
 - **2026-09-10 composite overlay claim ownership validated on hardware:**
   awesome + picom on silence, **A/B against master on the same hardware**:
 
@@ -739,9 +757,11 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   *Still unverified on hardware:* the root-property leak check (the probe was
   vacuous on the first run), and whether the boundary clears the screen
   without blinking or changing mode.
-  *Not done:* the composite-overlay claim is still not a per-client resource,
-  which is a prerequisite for shipping reset; stage 2 (`xhost`) is specified
-  and deferred; the two-session hardware run is outstanding. Stage 4 (XDMCP)
+  *Not done:* stage 2 (`xhost`) is specified and deferred. The
+  composite-overlay claim prerequisite is **done** — it became a per-client
+  resource on master (`2248b352`), so the boundary inherits the release
+  through `force_destroy_all_clients` and adds no COW-specific code, only a
+  refusal to install a generation while `cow_teardown_failed` holds. Stage 4 (XDMCP)
   is under way on `feat/121-xdmcp`: steps 1 and 2 of
   [the plan](superpowers/plans/2026-09-09-xdmcp-plan.md) are in —
   `yserver-protocol`'s `xdmcp::codec` (the thirteen display-side messages over

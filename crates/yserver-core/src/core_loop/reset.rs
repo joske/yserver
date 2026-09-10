@@ -292,8 +292,13 @@ pub(crate) struct GenerationLocals<'a> {
 /// Cross the generation boundary: quarantine the old session, destroy
 /// it, and install a freshly seeded `ServerState` in its place.
 ///
-/// Returns the new generation. The steps are the spec's, in the spec's
-/// order (`docs/superpowers/specs/2026-09-09-server-reset-design.md`,
+/// Returns the new generation, or `None` when the boundary **refuses** to
+/// install one: the old session's composite overlay could not be released,
+/// and the caller must terminate rather than hand it to the next session.
+/// A reset that half-succeeds is worse than one that refuses.
+///
+/// The steps are the spec's, in the spec's order
+/// (`docs/superpowers/specs/2026-09-09-server-reset-design.md`,
 /// "The generation boundary"); each is marked below.
 ///
 /// Called from `run_core` when [`ResetTrigger::take_pending`] yields
@@ -307,7 +312,7 @@ pub(crate) fn reset_generation(
     setup_registry: &SetupRegistry,
     inventory: &InputInventory,
     locals: GenerationLocals<'_>,
-) -> Generation {
+) -> Option<Generation> {
     // -- 1. Bump the generation. ------------------------------------
     // First, so everything below is defined relative to the new one.
     //
@@ -363,24 +368,34 @@ pub(crate) fn reset_generation(
     locals.server_grab_waiters.clear();
     locals.telemetry.forget_clients();
 
-    // NOT handled here: the leaked composite-overlay claim. A compositor
-    // that disconnects without `ReleaseOverlayWindow` leaves
-    // `cow_refcount` held, and a reset would otherwise carry that across
-    // the session boundary. The first attempt at this was a bounded
-    // decrement loop here, which jos and codex both rejected: the cap is
-    // arbitrary and protocol-invalid (a client may issue more Gets than
-    // the cap), and on a `materialize_direct_shadow_for_unflip` failure
-    // it degenerated to logging and continuing — carrying the old
-    // compositor's claim into the next user's session, the exact outcome
-    // a reset must forbid.
+    // -- 5. Refuse the boundary if the overlay outlived the session. -
+    // There is no COW-specific *cleanup* here, deliberately: step 3's
+    // `force_destroy_all_clients` routes every client through
+    // `process_disconnect`, which releases that client's overlay claims.
+    // What remains is the one thing cleanup cannot repair.
     //
-    // The real fix is structural and belongs upstream of reset: make the
-    // claim a PER-CLIENT resource as Xorg does (`FreeCompositeClientOverlay`,
-    // ../xserver/composite/compext.c:88, is a resource destructor calling
-    // compFreeOverlayClient), share one release helper between
-    // ReleaseOverlayWindow and disconnect, and then reset inherits the
-    // cleanup through `force_destroy_all_clients` with no special case.
-    // Tracked separately; see the spec's "Adjacent gaps".
+    // Both halves of the claim-ownership design's invariant 7 are tested,
+    // and the second is the one with teeth. A failed final teardown
+    // releases the departing client's claim anyway — no claim outlives its
+    // owner — so afterwards there is nothing left for a claim-only test to
+    // find, and a claim-only test would wave the reset through into a
+    // session inheriting the previous user's pinned overlay.
+    //
+    // The test must also happen HERE, between the forced teardown that can
+    // set the flag and step 6 that replaces `*state`. `cow_teardown_failed`
+    // lives in `ServerState`, so a check after the swap reads a fresh state
+    // with the flag clear: the reset would destroy the evidence and then
+    // proceed on the strength of its absence.
+    if state.cow_teardown_failed || !state.cow_claims.is_empty() {
+        log::error!(
+            "reset: refusing to install {generation:?} -- the composite overlay \
+             was not released ({} claim(s) still recorded, teardown_failed={}). \
+             Terminating instead of exposing it to the next session.",
+            state.cow_claims.len(),
+            state.cow_teardown_failed,
+        );
+        return None;
+    }
 
     // -- 6. Replace `*state` with a freshly seeded one. -------------
     // Constructed, not cleared: a field added to `ServerState` later is
@@ -417,7 +432,7 @@ pub(crate) fn reset_generation(
     backend.mark_dirty();
 
     // -- 9. Listeners are left bound and untouched. -----------------
-    generation
+    Some(generation)
 }
 
 /// Paint the fresh root window's background over the whole screen.
@@ -484,6 +499,7 @@ mod tests {
         },
         core_loop::{
             GenerationCounter, InputInventory,
+            composite_overlay::materialize_overlay,
             message::{BoolSetting, DeviceInfo, LibinputConfigSnapshot},
             run::{
                 FairRequestQueue, LoopTelemetry, PendingBackendRequests, deferred_request_for_test,
@@ -941,7 +957,8 @@ mod tests {
             &registry,
             &inventory,
             locals.borrow(),
-        );
+        )
+        .expect("the reset must proceed: this test holds no overlay claim");
 
         assert_ne!(generation, before, "the generation must advance");
         assert_eq!(generations.current(), generation);
@@ -996,7 +1013,8 @@ mod tests {
             &registry,
             &inventory,
             locals.borrow(),
-        );
+        )
+        .expect("the reset must proceed: this test holds no overlay claim");
 
         let root = state.resources.window(ROOT_WINDOW).expect("root");
         assert_eq!(
@@ -1049,7 +1067,8 @@ mod tests {
             &registry,
             &inventory,
             locals.borrow(),
-        );
+        )
+        .expect("the reset must proceed: this test holds no overlay claim");
 
         let slave = state
             .xi_devices
@@ -1108,7 +1127,8 @@ mod tests {
             &registry,
             &inventory,
             locals.borrow(),
-        );
+        )
+        .expect("the reset must proceed: this test holds no overlay claim");
 
         assert!(
             locals.server_grab_waiters.is_empty(),
@@ -1159,7 +1179,8 @@ mod tests {
             &registry,
             &inventory,
             locals.borrow(),
-        );
+        )
+        .expect("the reset must proceed: this test holds no overlay claim");
 
         assert_eq!(
             backend.cancelled_crtc_configs,
@@ -1213,7 +1234,8 @@ mod tests {
             &registry,
             &inventory,
             locals.borrow(),
-        );
+        )
+        .expect("the reset must proceed: this test holds no overlay claim");
 
         let calls = backend.calls.lock().expect("calls");
         let root_host_xid = backend.window_id();
@@ -1274,7 +1296,8 @@ mod tests {
             &registry,
             &inventory,
             locals.borrow(),
-        );
+        )
+        .expect("the reset must proceed: this test holds no overlay claim");
 
         assert!(
             backend.live_pixmaps.is_empty(),
@@ -1312,7 +1335,8 @@ mod tests {
             &registry,
             &inventory,
             locals.borrow(),
-        );
+        )
+        .expect("the reset must proceed: this test holds no overlay claim");
 
         assert!(
             registry.lock().expect("registry").is_empty(),
@@ -1505,5 +1529,115 @@ mod tests {
         let mut trigger = drained(ResetPolicy::Reset);
         assert_eq!(trigger.take_pending(), Some(ResetAction::Reset));
         assert_eq!(trigger.take_pending(), None);
+    }
+
+    /// Takes the overlay the way `GetOverlayWindow` does — record the
+    /// claim, then materialize — so the fixture cannot drift from the
+    /// production ordering.
+    fn take_the_overlay(state: &mut ServerState, backend: &mut RecordingBackend, client: ClientId) {
+        state.cow_claims.push(client);
+        materialize_overlay(state, backend, None).expect("the recording backend materializes");
+        assert!(
+            backend.cow_materialized,
+            "precondition: the overlay must be up before the reset"
+        );
+    }
+
+    #[test]
+    fn reset_generation_inherits_the_overlay_release_from_the_forced_teardown() {
+        let mut state = ServerState::new();
+        let mut backend = backend_with_topology();
+        let compositor = ClientId(7);
+        seed_client_session(&mut state, &mut backend, compositor.0);
+        take_the_overlay(&mut state, &mut backend, compositor);
+
+        let generations = GenerationCounter::new();
+        let registry = setup_thread::make_registry();
+        let inventory = InputInventory::new();
+        let mut locals = Locals::new();
+        let p = poll();
+
+        reset_generation(
+            &mut state,
+            &mut backend,
+            p.registry(),
+            &generations,
+            &registry,
+            &inventory,
+            locals.borrow(),
+        )
+        .expect("the reset must proceed: the teardown succeeds here");
+
+        // This is the whole point of the fix landing upstream of reset:
+        // the boundary contains no COW-specific code, and the overlay is
+        // released anyway because `force_destroy_all_clients` routes the
+        // compositor through the ordinary disconnect path.
+        assert!(
+            !backend.cow_materialized,
+            "the overlay survived the boundary — a compositor that never \
+             called ReleaseOverlayWindow would hand it to the next session"
+        );
+        assert!(
+            state.cow_claims.is_empty(),
+            "the fresh generation must start with no claims: {:?}",
+            state.cow_claims
+        );
+        assert!(
+            !state.cow_teardown_failed,
+            "a teardown that succeeded must not leave the session-fatal state set"
+        );
+    }
+
+    #[test]
+    fn reset_generation_refuses_the_boundary_when_the_overlay_teardown_failed() {
+        let mut state = ServerState::new();
+        let mut backend = backend_with_topology();
+        let compositor = ClientId(7);
+        seed_client_session(&mut state, &mut backend, compositor.0);
+        take_the_overlay(&mut state, &mut backend, compositor);
+        // `materialize_direct_shadow_for_unflip` failing on the 1 -> 0 edge.
+        backend.cow_teardown_fails = true;
+
+        let generations = GenerationCounter::new();
+        let registry = setup_thread::make_registry();
+        let inventory = InputInventory::new();
+        let mut locals = Locals::new();
+        let p = poll();
+
+        let outcome = reset_generation(
+            &mut state,
+            &mut backend,
+            p.registry(),
+            &generations,
+            &registry,
+            &inventory,
+            locals.borrow(),
+        );
+
+        assert!(
+            outcome.is_none(),
+            "the boundary must refuse rather than install a generation that \
+             inherits the previous user's pinned overlay"
+        );
+        assert!(
+            backend.cow_materialized,
+            "precondition of the refusal: the overlay really is still up"
+        );
+        // The ordering hazard, asserted rather than trusted. `state` is the
+        // OLD state because the refusal returns before step 6 replaces it;
+        // a fresh state would report `false` here and the reset would then
+        // have destroyed its own evidence.
+        assert!(
+            state.cow_teardown_failed,
+            "the refusal must be visible in the state the caller still holds"
+        );
+        // A claim never outlives its owner, even when the teardown fails —
+        // so a claim-only check here would have seen nothing and waved the
+        // reset through.
+        assert!(
+            state.cow_claims.is_empty(),
+            "the departed compositor's claim must be gone regardless: {:?}",
+            state.cow_claims
+        );
     }
 }
