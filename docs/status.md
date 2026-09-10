@@ -650,6 +650,28 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   allocated storage that nothing initialises — and the cheap fix is the same
   shape: force a full repaint at the materialise edge. Worth confirming
   against Xorg, where killing and restarting a compositor recovers promptly.
+- **2026-09-10 XDMCP validated on hardware, cross-machine (#121 stage 4):**
+  eiger (aarch64) as the display, silence (x86_64) running LightDM's XDMCP
+  daemon and the session. Query → Willing → Request → Accept → Manage, a MATE
+  session, logout, reset, re-query, an XFCE session, logout — the full loop
+  twice in one run, with a **fresh 16-byte session cookie installed per
+  generation**. 59 clients established in the second generation, every one
+  over TCP with fd passing off. This is the first exercise of `FamilyInternet`
+  cookie selection: loopback cannot reach it, because xtrans rewrites
+  `127.0.0.1` to FamilyLocal before the lookup. Both hardware checks the reset
+  work still owed are covered by the same run.
+  *Six clients refused* at the logout boundary for presenting no authorization
+  at all — after the new cookie was installed, so not the fail-closed window;
+  old-session components reconnecting during teardown. Nothing was lost.
+  *Open, not reproduced:* applying a display-scaling change in MATE killed
+  caja and the panel. Not the outbound cap (zero cap disconnects in the log
+  covering the other runs) and not auth rejection; the run that showed it was
+  overwritten before it could be read, which is why both hardware recipes now
+  write timestamped logs.
+  *Also seen:* resizing wezterm exposes the lightdm greeter's background
+  through the uninitialised strip — the known resize bug, but showing
+  recycled content rather than black, which makes it stale content disclosure
+  between clients rather than a cosmetic fault.
 
 - **2026-09-09 TCP transport and server reset (#121 stages 1 and 3, branch
   `feat/121-server-reset`):** groundwork for XDMCP on HPC login nodes.
