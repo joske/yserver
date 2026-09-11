@@ -7326,10 +7326,31 @@ impl KmsBackend {
         if plan.is_empty() {
             return;
         }
-        // PictOpOver — alpha children blend over the parent base;
-        // depth-24 leaves sample with α=1 (engine `sample_view`
-        // swizzle) so they fully replace the base where opaque.
-        const OP_OVER: u8 = 3;
+        // RAW COPY, not a composite. Xorg's `compNewPixmap` seeds the
+        // new backing with `CopyArea(parent, …, IncludeInferiors)`
+        // (`composite/compalloc.c:562`), and CopyArea replaces the
+        // destination — it has no notion of alpha at all. This walk
+        // exists only because yserver keeps a separate per-window leaf,
+        // so it must reproduce the same REPLACEMENT that a single
+        // shared-storage CopyArea would have performed, one leaf at a
+        // time in bottom-to-top stack order.
+        //
+        // This was `PictOpOver` until 2026-09-11, on the reasoning that
+        // "alpha children blend over the parent base". They must not: a
+        // depth-32 child with α = 0 then blends as a NO-OP and the
+        // parent's seed shows through its background. Measured — a
+        // window asking for `background-pixel = 0x00000000` kept the
+        // root's red and read back `00ff0000` where Xorg 21.1.24 gives
+        // `00000000` (`tools/depth32-bg-probe.c`, transparent-zero
+        // A-root, vng 2026-09-11).
+        //
+        // Shape and stacking are unaffected: `push_inferior_rects`
+        // already intersects each leaf with its `shape_bounding` and
+        // `collect_backing_inferiors` walks in `stack_rank` order, so
+        // only the blend equation changes here. Depth-24 leaves still
+        // land opaque — `sample_view` gives them α = 1 — so the one
+        // behaviour that changes is the one that was wrong.
+        const OP_SRC: u8 = 1;
         for d in plan {
             // Skip leaves whose storage has no realized view (no GPU
             // backing yet) — the planner left the liveness check here.
@@ -7353,7 +7374,7 @@ impl KmsBackend {
             match self.engine.render_composite(
                 &mut self.store,
                 &mut self.platform,
-                OP_OVER,
+                OP_SRC,
                 // The planner already put this leaf's CONTENT origin
                 // into `src_x`/`src_y` (`push_inferior_rects`), so the
                 // source is addressed in raw leaf-storage coordinates
