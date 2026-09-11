@@ -7071,8 +7071,91 @@ fix was confirmed to produce its intended effect *on hardware* — that evidence
 is the vng A/B against Xorg 21.1.24, which is where both were measured. No
 desktop other than Plasma and Cinnamon was exercised.
 
+### LEAD — window content goes WHITE with compositing off, and Xorg does not
+
+Reported 2026-09-11 after the exoneration above, and **narrower than the
+symptom that was exonerated**. With compositing off, the window CONTENT of
+specific KDE apps (dolphin, systemsettings) turns white. Unlike the
+full-output/dock blocks, this does **not** reproduce on Xorg.
+
+This is not a revival of the refuted plan — it is a different symptom with the
+Xorg differential the refuted one lacked. Read the distinction before acting:
+
+| | exonerated | this lead |
+|---|---|---|
+| symptom | white/black blocks over output and dock | specific windows' content goes white |
+| on Xorg | identical | does NOT happen |
+| verdict | KWin suspend/resume, normal comp-off X11 | ours |
+
+#### Why the unredirect path is back in scope
+
+Xorg has no per-window storage: a window's pixels live in the screen pixmap, so
+"unredirect" hands back content that was never anywhere else and nothing can be
+lost. yserver keeps a per-window leaf, releases the redirect backing on
+unredirect (`teardown_redirect_for_window`,
+`process_disconnect.rs:543` — it releases the backing and restores scene
+participation, and does **neither** a content restore nor an Expose), and falls
+back to that leaf. For a window whose background is None, that leaf may never
+have been painted by anything.
+
+#### The evidence already on disk
+
+- **37 windows are created with `background-pixmap=None`** in `plasma.xtrace`,
+  and 37 in `plasma-xorg.xtrace` — the largest category by far, and the shape
+  Qt/KDE apps use because they paint every pixel themselves.
+- **`window_storage_init_covers_the_whole_allocation` has been failing all
+  along** with exactly that shape, and its failure text is the symptom:
+
+  ```
+  no background attribute, depth 24: expected [0,0,0,255], got [255,255,255,255]
+  no background attribute, depth 32: expected [0,0,0,0],   got [255,255,255,0]
+  ```
+
+  RGB reads `0xFF` — WHITE — while alpha is exactly the init colour's. Its doc
+  comment (`render_acceptance.rs:13890`) already concluded "something writes
+  the alpha channel and leaves RGB untouched". `fresh_pixmap_reads_back_zero`
+  covers the same invariant for PIXMAPS and PASSES, so the gap is windows only.
+
+This test has been reported as "pre-existing" in every run on this branch. It
+is pre-existing, and it may well be the bug.
+
+#### What is NOT yet established
+
+The link between that white storage and the on-screen symptom is a
+**hypothesis, not a measurement**. Specifically unverified: that the white
+survives because the client's paint went to the redirect backing and the leaf
+was never written; and whether Xorg's comp-off result differs because of
+storage or because of Expose. Do not write a fix against this paragraph — get
+the A/B first.
+
+#### The next measurement
+
+`tools/unredirect-restore-probe.c` + `tools/vng-scenarios/unredirect-restore.sh`
+exist **UNTRACKED and uncommitted**, deliberately. The probe reproduces KWin's
+cycle in the observed order (`UnredirectSubwindows` then
+`ReleaseOverlayWindow`), and now includes a `background-pixmap=None` window
+that is fully client-painted, so a white reading cannot be blamed on the client
+having left pixels undrawn. It grades content-after-unredirect and
+Expose-after-unredirect separately, passing if either route works, because a
+server that restores content needs no Expose and vice versa.
+
+Run it as an Xorg/yserver A/B:
+
+```
+tools/vng-shot.sh --server xorg --dump none --name ur-xorg \
+    --scenario tools/vng-scenarios/unredirect-restore.sh
+tools/vng-shot.sh --name ur-ys --dump scanout \
+    --scenario tools/vng-scenarios/unredirect-restore.sh
+```
+
+It has never been run. Commit it only once it produces a real difference.
+
 ### Next
 
 Neither fix on this branch depends on the Plasma question; both stand on their
-own measured Xorg mismatches. The open work is the stale-drawable acceptance
-divergence in the table above, which wants its own branch.
+own measured Xorg mismatches. Open work, in order:
+
+1. The white-content lead above — A/B first, then fix
+   `window_storage_init_covers_the_whole_allocation` if it is confirmed.
+2. The stale-drawable acceptance divergence in the table above (we accept
+   requests on drawables unredirect should have killed).
