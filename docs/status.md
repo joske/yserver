@@ -6948,6 +6948,9 @@ itself.
   single pre-existing `window_storage_init_covers_the_whole_allocation`
   failure (documented at `render_acceptance.rs:13890`, fails identically on
   master — baseline re-measured, not assumed).
+  **Superseded later the same day** — that failure was a real bug, it is
+  fixed, and the suite is now 155/155. See "RESOLVED — the white content,
+  end to end" at the end of this section.
 
 ### Three things that are REFUTED — do not revive them
 
@@ -7073,6 +7076,14 @@ desktop other than Plasma and Cinnamon was exercised.
 
 ### LEAD — window content goes WHITE with compositing off, and Xorg does not
 
+> **CONFIRMED AND FIXED** the same day. This subsection is kept as written
+> because its reasoning held up; read it, then read "RESOLVED — the white
+> content, end to end" at the end for what the measurements actually said.
+> Two details below are wrong and are corrected there: the symptom's
+> trigger is `_NET_WM_BYPASS_COMPOSITOR`, not compositing-off in general,
+> and the storage bug's cause is not the alpha-channel write this text
+> infers from `window_storage_init_covers_the_whole_allocation`.
+
 Reported 2026-09-11 after the exoneration above, and **narrower than the
 symptom that was exonerated**. With compositing off, the window CONTENT of
 specific KDE apps (dolphin, systemsettings) turns white. Unlike the
@@ -7150,12 +7161,129 @@ tools/vng-shot.sh --name ur-ys --dump scanout \
 
 It has never been run. Commit it only once it produces a real difference.
 
+### RESOLVED — the white content, end to end (2026-09-11, evening)
+
+The lead above was right that the leaf was the culprit and right to demand
+an A/B before a fix. What the A/B turned out to be was better than the
+planned probe: two controlled changes on the real desktop, each of which
+moved the symptom.
+
+**The chain, measured link by link:**
+
+1. mpv going fullscreen sets `_NET_WM_BYPASS_COMPOSITOR` (its
+   `--x11-bypass-compositor` default is `fs-only`). KWin honours it by
+   suspending compositing screen-wide — which is the same global
+   unredirect the trace comparison earlier in this section caught, and
+   why the Plasma blocks and this symptom share one trigger while only
+   one of them is ours.
+2. That unredirect releases each redirect backing and falls back to a
+   per-window leaf. `mpv --x11-bypass-compositor=no` suppresses the whole
+   thing with compositing left up (focus glow intact), and **totem never
+   triggers it at all** because it does not set the property. That is the
+   negative control.
+3. The leaf was WHITE because `background-None` windows were being
+   initialised from a white PLACEHOLDER, not because of the alpha-channel
+   write the test's doc comment inferred. Fixing that turned the symptom
+   BLACK — the leaf's new init colour. That is the positive control, and
+   it is what proves the on-screen pixels ARE the leaf: nothing about a
+   missing Expose would track an init colour.
+4. Restoring each leaf from the backing on unredirect fixed dolphin on HW.
+
+**Fix 1 — the white placeholder.** `create_window` stores
+`background_pixel: 0x00ff_ffff` as a placeholder when a request carries no
+background attribute, records the truth in `background_none`, and
+`window_resolved_background` honours it by returning `None`. The
+CreateWindow path then defeated that with
+`.or_else(|| local.map(|w| w.background_pixel))`. There is no input for
+which that fallback can produce a correct `Some` — `window_resolved_background`
+returns `None` only for a cycle, an absent window (where `local` is `None`
+too), a ParentRelative chain that resolved to no background, or
+`background_none` — so it is deleted rather than filtered. A
+`!background_none` filter would have kept the bug for a ParentRelative
+child of a background-None parent, which is worth knowing if anyone
+re-derives this.
+
+**Fix 2 — the unredirect restore.** Xorg needs no restore because
+`compSetParentPixmap` (`composite/compalloc.c:649`) points the window back
+at the SCREEN pixmap, which already holds what the compositor painted. The
+copy is on the REDIRECT side there — `compNewPixmap` seeds the new backing
+from the parent with `CopyArea(…, IncludeInferiors)` (`compalloc.c:556`).
+The invariant both halves keep is that a window's pixels stay CONTINUOUS
+with the screen across either transition, and yserver's private per-window
+leaf breaks the unredirect half. `release_redirected_backing` now copies
+B → leaf with `OP_SRC` before the backing can retire.
+
+It must walk the SUBTREE, and the first attempt did not — that is the one
+thing here that took a second HW round. A compositor redirects with
+`RedirectSubwindows(root)`, so the windows that own a backing are the WM's
+FRAMES; the client's window is reparented inside one, its pixels live in
+the frame's backing at an offset, and its own leaf is stale. Restoring only
+the frame's leaf brought decorations back and left dolphin's content black
+— and it repainted in full on hover, i.e. the client could rebuild exactly
+what the server had dropped. The restore now reuses
+`plan_backing_inferiors` with src/dst swapped, which is literally the seed
+plan read backwards.
+
+Occluded regions come back holding the OCCLUDER's pixels, because B only
+ever held the composited result. That matches Xorg, where an occluded
+window's pixels are not stored anywhere either.
+
+**Tests, both proven red first:**
+`window_storage_init_covers_the_whole_allocation` (existing, was the
+"pre-existing failure"), plus
+`unredirect_restores_the_window_leaf_from_the_backing` and
+`unredirect_restores_a_reparented_child_leaf_not_just_the_frame`. The last
+one was checked for discrimination, not just greenness: narrowing the plan
+back to W alone leaves the frame test green and fails the child test with
+`[0,0,0,0]: 64`. Suite 155/155, libs 1294 + 1248, clippy `-D warnings` and
+nightly fmt clean.
+
+### OPEN — Plasma panel restores to its top half only (intermittent)
+
+Seen once on HW after fix 2: dolphin correct, panel painted in its top half
+only, and after a few fullscreen/windowed cycles it stayed fully drawn for
+the rest of the session. Then it stopped reproducing — including on a fresh
+session with the diagnostic built in, and at `warn`. Self-healing,
+first-cycle, cosmetic.
+
+A horizontal split at half height is what a copy clamped in Y looks like:
+the restore can only hand back `min(B, leaf)`, so a short B leaves the
+bottom without a source. The leading suspect is
+`allocate_redirected_backing`'s idempotent early-return, which hands back
+an existing backing WITHOUT comparing the requested size to it — Xorg
+deliberately does the opposite (`compReallocPixmap` reallocates iff the
+bordered extent changed, keeping the old pixmap "so bits can be
+recovered"). That would also explain the self-healing. **Unverified.**
+
+`restore_leaves_from_backing` carries a debug-level coverage log for
+exactly this, flagging `SHORT-OF-LEAF`, so the next sighting is cheap to
+diagnose:
+
+```
+RUST_LOG=warn,yserver::kms::render::backend=debug just <session-recipe> 2>&1 | tee /tmp/panel.log
+grep restore_leaves_from_backing /tmp/panel.log
+```
+
+Read it as: `leaf_extent` taller than `b_extent` → B is stale, fix in
+`allocate_redirected_backing`. Rect shorter than both → the planner clips,
+fix in `push_inferior_rects`. No `SHORT-OF-LEAF` for the panel → the copy
+covered the leaf and something after the restore repaints only part of it.
+Whatever B genuinely cannot source is Xorg's Expose case, not a copy case.
+
+Note the prior art at `backend.rs` (the compiz `--replace`
+half-drawn-panel fix, 2026-06-11): same shape, opposite direction, fixed on
+the seed side. Worth reading before designing this one.
+
+**Not claimed:** that fix 2 fixed the panel. Dolphin is HW-confirmed; the
+panel either got fixed or moved out of reach on its own.
+
 ### Next
 
-Neither fix on this branch depends on the Plasma question; both stand on their
-own measured Xorg mismatches. Open work, in order:
-
-1. The white-content lead above — A/B first, then fix
-   `window_storage_init_covers_the_whole_allocation` if it is confirmed.
+1. The panel half-restore above, if it reappears — the diagnostic is
+   already in place, so capture the log before touching anything.
 2. The stale-drawable acceptance divergence in the table above (we accept
-   requests on drawables unredirect should have killed).
+   requests on drawables unredirect should have killed; Xorg emits 16 each
+   of BadPixmap / BadGC / BadDrawable and we emit none).
+3. `feat/cow-structural` is unmerged and touches `release_redirected_backing`
+   and `activate_redirect_backing_for`; the restore will need reconciling
+   when that lands.
