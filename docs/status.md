@@ -6901,7 +6901,8 @@ free, and diff their gates", not "read the site the bug was reported at".
 
 ## Handoff — `fix/redirect-backing-and-logical-depth` (2026-09-11)
 
-Branched off master `7c01c69a`. Three commits, **unmerged, no HW smoke run**.
+Branched off master `7c01c69a`. Three code/test commits plus this note,
+**unmerged, no HW smoke run**.
 Everything below was measured in the vng harness against X.Org 1.21.1.24
 (Arch's `xorg-server 21.1.24`), never inferred from spec prose.
 
@@ -6920,7 +6921,16 @@ tools/vng-shot.sh --server xorg --dump none --name X --scenario tools/vng-scenar
 tools/vng-shot.sh --name Y --dump none --scenario tools/vng-scenarios/depth32-bg-composited.sh
 ```
 
-Both grade themselves and print a VERDICT line. `depth32-bg-probe` also runs
+Both grade themselves and print a VERDICT line.
+
+A correction to `cf7585f4`'s commit message, which overstates this: only
+`depth32-bg-probe` reads raw image bytes. `redirect-subtree-probe` still uses
+`XGetPixel`, which is sound there because it grades only the defined low 24
+bits of a depth-24 frame pixmap — the bits `XGetPixel` would mask away carry no
+contract anyway. The distinction matters if either probe is ever extended to
+compare alpha.
+
+`depth32-bg-probe` also runs
 inside a live desktop session (`cc -O1 -o /tmp/p tools/depth32-bg-probe.c -lX11
 -lXcomposite && /tmp/p --hold 15`) — it detects an existing compositor via
 `_NET_WM_CM_Sn` rather than redirecting, takes no grabs, and cleans up after
@@ -6977,19 +6987,69 @@ Written up at `get_image` (`backend.rs:22258`) with both failure cases named.
 `get_image` was the one caller not using it. `resources::ROOT_DEPTH` is now the
 single source for the root's depth, used by both the setup reply and GetImage.
 
+### The Plasma white/black blocks are NOT a yserver bug
+
+Measured on HW the same afternoon these commits were written, and this
+supersedes every earlier plan in this section.
+
+The blocks appear when mpv goes fullscreen and back under Plasma. They appear
+**identically on stock Xorg** with the same KWin session and the same toggle.
+What KWin is doing is suspending and resuming compositing, and both servers get
+byte-for-byte the same request sequence for it:
+
+| | yserver (`plasma.xtrace`) | Xorg (`plasma-xorg.xtrace`) |
+|---|---|---|
+| `RedirectSubwindows` Manual | 4 | 4 |
+| `UnredirectSubwindows` Manual | 3 | 3 |
+| `ReleaseOverlayWindow` | 3 | 3 |
+| `GetOverlayWindow` | 8 | 8 |
+| `NameWindowPixmap` | 47 | 45 |
+
+Interleave is `Redirect → Unredirect → Release` three times over, then a final
+`Redirect`, in that order on both. With compositing off, an ARGB window drawn
+opaque is ordinary X11 behaviour, not a defect.
+
+**Two plans that were live before this measurement are now dead as Plasma
+fixes. Do not pick them up on this evidence:**
+
+- the `scene.rs:6685` alpha/occlusion split. The analysis may describe a real
+  latent defect and is kept on file, but it is not this symptom.
+- "restore from the backing on unredirect, then Expose". Xorg receives the same
+  global unredirect and produces the same visual result, so the premise that
+  Xorg's restore rescues this case is wrong.
+
+Also retracted: the Cinnamon/Plasma split (Muffin never unredirects; KWin does
+three times) was read as evidence that *we* broke KWin's path. It only ever
+showed that Muffin does not exercise that path.
+
+### The one real divergence the traces did surface
+
+Comparing CORE opcodes only — extension majors are numbered per server
+(Composite is 144 for us, 142 on Xorg) and cannot be compared across traces:
+
+| error | opcode | yserver | Xorg |
+|---|---|---|---|
+| BadPixmap | 54 `FreePixmap` | **0** | 16 |
+| BadGC | 60 `FreeGC` | **0** | 16 |
+| BadDrawable | 55 `CreateGC` | **0** | 16 |
+| BadDrawable | 72 `PutImage` | **0** | 16 |
+| BadValue | 53 `CreatePixmap` | **64** | 16 |
+| BadAtom | 20 `GetProperty` | 128 | 68 |
+| BadAtom | 17 `GetAtomName` | 66 | 16 |
+
+Xorg emits a coherent set of 16 errors: KWin keeps using `NameWindowPixmap`
+handles that unredirect has invalidated, and Xorg rejects them four different
+ways. We emit **none** of those, i.e. we accept requests on drawables that
+should be dead — the permissive direction, and exactly what would let a
+compositor keep painting into a freed backing. It is NOT the cause of the
+blocks (Xorg errors correctly and still shows them), but it is a real measured
+divergence on the same teardown path. The 64-vs-16 `CreatePixmap` BadValue is a
+second, separate lead.
+
 ### Next
 
-The Plasma white/black blocks, unchanged in priority and still unfixed:
+Neither fix on this branch depends on any of the above; both stand on their own
+measured Xorg mismatches. The open work is the stale-drawable acceptance
+divergence in the table above, which wants its own branch.
 
-1. Split scene "preserve alpha while blending" from "may claim occlusion" at
-   `scene.rs:6685`. Depth 32 must preserve alpha and must NOT claim its whole
-   rectangle opaque. Actual pixel alpha is not a usable occlusion predicate.
-   `_NET_WM_OPAQUE_REGION` could later supply a conservative region hint but is
-   not needed for the correctness fix.
-2. On unredirect, restore from the backing before un-routing/freeing it where
-   Xorg's depth-compatible restore applies, then emit Expose for the formerly
-   redirected mapped subtree. The backing is gone only after release, so it IS
-   available at the point restoration must happen — an earlier "there is no
-   backing" caveat was wrong.
-
-**Gate before any of this lands: HW smoke. None has been run on this branch.**
+**Gate before this branch lands: HW smoke. None has been run on it.**

@@ -34,6 +34,14 @@
  * MEASURED BASELINE — filled in from X.Org 1.21.1.24 below; that table is the
  * contract, exactly as in tools/depth32-bg-probe.c.
  *
+ * Note this probe reads through XGetPixel, NOT raw image bytes as
+ * depth32-bg-probe does. That is sound here only because every sample is
+ * graded on the defined low 24 bits of a depth-24 frame pixmap, and XGetPixel
+ * masks to exactly that depth — the bits it drops are the protocol-undefined
+ * pad, which carries no contract. Anyone extending this probe to compare
+ * ALPHA must switch to raw bytes first, or the comparison will silently
+ * succeed against a masked value.
+ *
  * Build: cc -O1 -o redirect-subtree-probe redirect-subtree-probe.c -lX11 -lXcomposite
  * Run:   ./redirect-subtree-probe [--hold N]
  */
