@@ -41,6 +41,16 @@ pub const COMPOSITE_OVERLAY_WINDOW: ResourceId = ResourceId(0x103);
 pub const ARGB_VISUAL: ResourceId = ResourceId(0x103);
 pub const ARGB_COLORMAP: ResourceId = ResourceId(0x104);
 
+/// The X11 depth of the root window, as advertised in the setup reply.
+///
+/// This is a CLIENT-VISIBLE protocol constant, not a storage property. Our
+/// scanout and root readback storage is 32-bit BGRA, but the root DRAWABLE is
+/// depth 24, and every reply that names a depth — `GetImage`, `GetGeometry`,
+/// plane-mask truncation — has to say 24. Reading the storage's depth instead
+/// makes the server claim depth 32 for the root, which is what
+/// `tools/depth32-bg-probe.c` measured against Xorg 21.1.24's 24.
+pub const ROOT_DEPTH: u8 = 24;
+
 /// X11 visual class codes (subset we care about). The setup reply
 /// advertises these per-visual; clients pass a visual ID into
 /// `CreateWindow`, `CreateColormap`, and RENDER `CreatePicture`.

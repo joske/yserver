@@ -224,7 +224,7 @@ fn run_setup(
                 max_installed_maps: 1,
                 root_visual: ROOT_VISUAL,
                 argb_visual: ARGB_VISUAL,
-                root_depth: 24,
+                root_depth: crate::resources::ROOT_DEPTH,
             },
         },
     )?;

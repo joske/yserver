@@ -7344,6 +7344,12 @@ impl KmsBackend {
         // `00000000` (`tools/depth32-bg-probe.c`, transparent-zero
         // A-root, vng 2026-09-11).
         //
+        // The same probe shows the replacement model is what Xorg
+        // actually stores: on 21.1.24 a depth-24 frame's redirected
+        // pixmap reads `00ffffff` under an ARGB child whose background
+        // is transparent white — the child's own bits, alpha and all,
+        // stamped into the parent's pixmap rather than blended with it.
+        //
         // Shape and stacking are unaffected: `push_inferior_rects`
         // already intersects each leaf with its `shape_bounding` and
         // `collect_backing_inferiors` walks in `stack_rank` order, so
@@ -22236,18 +22242,48 @@ impl Backend for KmsBackend {
     ) -> io::Result<Option<Vec<u8>>> {
         // Stage 4a — resolve through redirect routing per spec Risk 1
         // ("GetImage reads what the X server considers W's content,
-        // which under redirect is B"). Depth comes from the
-        // resolved target's drawable (backing is allocated to match
-        // W's depth, so v1 / v2 see the same wire shape).
+        // which under redirect is B").
+        //
+        // THE INVARIANT (2026-09-11): the reply's depth and plane-mask
+        // semantics come from the REQUESTED DRAWABLE, never from the
+        // redirected backing or the scanout storage. Where the pixels
+        // are read from and what depth the drawable is are two
+        // different questions, and only the first one follows the
+        // redirect routing.
+        //
+        // The comment this replaces assumed "backing is allocated to
+        // match W's depth, so v1 / v2 see the same wire shape". Both
+        // halves of that are false in the field:
+        //
+        //   root       the root DRAWABLE is depth 24
+        //              (`resources::ROOT_DEPTH`), while its readback
+        //              storage is 32-bit BGRA — we replied depth 32.
+        //   routed     a depth-32 child of a redirected depth-24 frame
+        //   child      paints into the FRAME's depth-24 backing, so the
+        //              backing depth is 24 while the drawable is 32 —
+        //              we replied depth 24.
+        //
+        // Measured against Xorg 21.1.24, which answers 24 and 32
+        // respectively (`tools/depth32-bg-probe.c`, reply-depth line).
+        //
+        // This is a reply-header and plane-mask fix ONLY. The stored
+        // CONTENT needs no reconstruction: the same probe, reading raw
+        // image bytes rather than XGetPixel, shows our stored words are
+        // already byte-identical to Xorg's for all six background cases
+        // including the routed depth-32 child, whose alpha survives in
+        // the depth-24 frame backing exactly as it does on Xorg.
         if host_xid == self.core.window_id {
             let Some(root_id) = self.store.lookup(self.core.window_id) else {
                 self.log_render_gap("get_image_root_unknown_root");
                 return Ok(None);
             };
-            let depth = match self.store.get(root_id) {
-                Some(d) => d.depth,
-                None => return Ok(None),
-            };
+            // The drawable is the ROOT WINDOW, whose X11 depth is a
+            // protocol constant; `root_id`'s storage is the 32-bit
+            // scanout readback buffer and says nothing about it.
+            if self.store.get(root_id).is_none() {
+                return Ok(None);
+            }
+            let depth = yserver_core::resources::ROOT_DEPTH;
             let mask = plane_mask & depth_plane_mask(depth);
             if format == GET_IMAGE_FORMAT_XY_PIXMAP && mask == 0 {
                 return Ok(Some(wrap_get_image_reply(depth, Vec::new())));
@@ -22307,10 +22343,15 @@ impl Backend for KmsBackend {
             self.log_render_gap("get_image_unknown_xid");
             return Ok(None);
         };
-        let (depth, storage_extent) = match self.store.get(target.backing_id()) {
-            Some(d) => (d.depth, d.storage.extent),
+        // `x11_depth()` is the depth of the drawable the CLIENT named;
+        // `store.get(backing).depth` is the depth of whatever storage the
+        // redirect routing landed on. The extent must come from the
+        // storage (that is what is being read); the depth must not.
+        let storage_extent = match self.store.get(target.backing_id()) {
+            Some(d) => d.storage.extent,
             None => return Ok(None),
         };
+        let depth = target.x11_depth();
         let mask = plane_mask & depth_plane_mask(depth);
         if format == GET_IMAGE_FORMAT_XY_PIXMAP && mask == 0 {
             // No planes requested: Xorg replies with zero data. This
