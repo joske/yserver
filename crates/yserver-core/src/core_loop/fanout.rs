@@ -143,6 +143,38 @@ pub fn subscribers_by_id(state: &ServerState, window: ResourceId, mask_bits: u32
         .collect()
 }
 
+/// XI2 device ids whose selection ABSORBS a core pointer event: the
+/// master pointer plus the `XIAllMasterDevices(1)` / `XIAllDevices(0)`
+/// wildcards.
+///
+/// The SLAVE pointer id is deliberately ABSENT. Core events are generated
+/// from the master device and a slave-device XI2 selection is matched in
+/// its own delivery pass, so it does not suppress the core form: a client
+/// selecting core AND slave-XI2 on one window legitimately receives BOTH.
+/// Hardware-measured, not inferred — see
+/// `implicit_grab_core_release_survives_dual_core_and_slave_xi2_selection_e27`,
+/// whose Xorg baseline delivers core 3/3 and XI2 3/3 on the same clicks.
+/// Including the slave id here silently dropped E27's core press.
+const XI2_ABSORBING_POINTER_DEVICES: [u16; 3] = [2, 1, 0];
+
+/// Does any client hold an XI2 selection for `evtype` on this window?
+///
+/// Xorg's `DeliverDeviceEvents` (`dix/events.c:2895-2916`) tries XI2, then
+/// XI1, then CORE **per window**, returning as soon as any flavour
+/// delivers — so an XI2 selection ABSORBS the event and the core
+/// propagation walk stops there, whoever selected core further up.
+fn xi2_pointer_selected_on(state: &ServerState, window: ResourceId, evtype: u16) -> bool {
+    let bit = 1u32 << evtype;
+    state.clients.values().any(|client| {
+        XI2_ABSORBING_POINTER_DEVICES.iter().any(|device| {
+            client
+                .xi2_masks
+                .get(&(window, *device))
+                .is_some_and(|mask| mask & bit != 0)
+        })
+    })
+}
+
 /// Walk up the parent chain from `start`, returning the first window
 /// with any client subscribed to `mask_bits`, the (event_x, event_y)
 /// translated to be relative to that window, and the subscriber list.
@@ -171,12 +203,25 @@ pub fn pointer_propagation_target_by_id(
     start_x: i16,
     start_y: i16,
     mask_bits: u32,
+    xi2_evtype: Option<u16>,
 ) -> Option<(ResourceId, i16, i16, Vec<ClientId>, ResourceId)> {
     let mut current = start;
     let mut x = start_x;
     let mut y = start_y;
     let mut child: Option<ResourceId> = None;
     for _ in 0..256 {
+        // XI2 FIRST, per Xorg's per-window flavour order. A window whose
+        // XI2 selection matches consumes the event: no core delivery here,
+        // and crucially no walk past it. Without this a GTK client — XI2,
+        // no core mask — let the press climb to the reparenting WM's
+        // frame, handing the WM a press Xorg never sends. That armed
+        // OpenBox's drag state, so a later bare MotionNotify started a
+        // Move/Resize with no button held (#141).
+        if let Some(evtype) = xi2_evtype
+            && xi2_pointer_selected_on(state, current, evtype)
+        {
+            return None;
+        }
         let subs = subscribers_by_id(state, current, mask_bits);
         if !subs.is_empty() {
             return Some((current, x, y, subs, child.unwrap_or(ResourceId(0))));
@@ -793,6 +838,115 @@ mod tests {
         let client = make_client(a, mask);
         state.clients.insert(id, client);
         b
+    }
+
+    /// Issue #141 — a reparenting WM must not be handed a core press that
+    /// an XI2 client absorbed. Xorg's `DeliverDeviceEvents`
+    /// (`dix/events.c:2895-2916`) tries XI2, then XI1, then core PER
+    /// WINDOW and returns as soon as any flavour delivers, so a GTK-style
+    /// child selecting XI2 and no core mask consumes the event and the
+    /// walk stops — the frame above it sees nothing.
+    ///
+    /// Oracle is measured, not read off the source:
+    /// `tools/replay-propagation-probe.c` run under
+    /// `tools/vng-scenarios/replay-propagation.sh` against Xorg 21.1 and
+    /// yserver in the same harness. Xorg gave the WM 1 core press (its own
+    /// grab activation) and no propagated second one; yserver gave 2, the
+    /// second on the PARENT. That second press armed OpenBox's drag state,
+    /// so a later bare MotionNotify started a Move/Resize with no button
+    /// held — windows following the pointer once every minute or two.
+    ///
+    /// The slave half is the E27 carve-out and is asserted here too: a
+    /// SLAVE-device XI2 selection must NOT absorb, because core events come
+    /// from the master and the slave form is a separate delivery pass. See
+    /// `implicit_grab_core_release_survives_dual_core_and_slave_xi2_selection_e27`,
+    /// whose Xorg baseline delivers both forms 3/3.
+    #[test]
+    fn xi2_master_selection_absorbs_core_propagation_but_slave_does_not() {
+        use yserver_protocol::x11::CreateWindowRequest;
+        const WM: u32 = 1;
+        const APP: u32 = 2;
+        const XI_BUTTON_PRESS: u16 = 4;
+        const FRAME: ResourceId = ResourceId(0x0010_0001);
+        const CHILD: ResourceId = ResourceId(0x0020_0001);
+
+        let build = |xi2_device: u16| {
+            let mut state = ServerState::new();
+            let _wm_peer = install(&mut state, WM, 0);
+            let _app_peer = install(&mut state, APP, 0);
+            for (window, parent) in [(FRAME, ROOT_WINDOW), (CHILD, FRAME)] {
+                state.resources.create_window(
+                    ClientId(if window == FRAME { WM } else { APP }),
+                    CreateWindowRequest {
+                        depth: 24,
+                        window,
+                        parent,
+                        x: 0,
+                        y: 0,
+                        width: 100,
+                        height: 100,
+                        border_width: 0,
+                        class: 1,
+                        visual: crate::resources::ROOT_VISUAL,
+                        ..Default::default()
+                    },
+                );
+                let _ = state.resources.map_window(window);
+            }
+            // The frame selects core ButtonPress, as a reparenting WM does.
+            state
+                .clients
+                .get_mut(&WM)
+                .unwrap()
+                .event_masks
+                .insert(FRAME, 0x0000_0004);
+            // The child selects XI2 ButtonPress and NO core mask.
+            state
+                .clients
+                .get_mut(&APP)
+                .unwrap()
+                .xi2_masks
+                .insert((CHILD, xi2_device), 1 << XI_BUTTON_PRESS);
+            state
+        };
+
+        // XIAllMasterDevices: absorbed, nothing propagates to the frame.
+        let state = build(1);
+        assert!(
+            pointer_propagation_target_by_id(
+                &state,
+                CHILD,
+                5,
+                5,
+                0x0000_0004,
+                Some(XI_BUTTON_PRESS)
+            )
+            .is_none(),
+            "an XI2 master-device selection must absorb the core press, \
+             leaving the WM's frame nothing to receive",
+        );
+
+        // Slave device: NOT absorbed — core still propagates to the frame.
+        let state = build(4);
+        let (win, _, _, subs, _) = pointer_propagation_target_by_id(
+            &state,
+            CHILD,
+            5,
+            5,
+            0x0000_0004,
+            Some(XI_BUTTON_PRESS),
+        )
+        .expect("a slave-device XI2 selection must not absorb the core press");
+        assert_eq!(win, FRAME);
+        assert_eq!(subs, vec![ClientId(WM)]);
+
+        // And with no XI2 evtype in play (crossing events) the walk is
+        // unchanged: Enter/Leave are not routed by the flavour-ordered loop.
+        let state = build(1);
+        let (win, _, _, _, _) =
+            pointer_propagation_target_by_id(&state, CHILD, 5, 5, 0x0000_0004, None)
+                .expect("without an absorbing evtype the walk still finds the frame");
+        assert_eq!(win, FRAME);
     }
 
     #[test]

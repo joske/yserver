@@ -696,10 +696,16 @@ fn pointer_event_fanout_to_state_inner(
             },
         );
         let mask_bit = pointer_mask_bit(event.kind, event.state);
-        let core_clients =
-            pointer_propagation_target_by_id(state, target, target_x, target_y, mask_bit)
-                .map(|(_, _, _, c, _)| c)
-                .unwrap_or_default();
+        let core_clients = pointer_propagation_target_by_id(
+            state,
+            target,
+            target_x,
+            target_y,
+            mask_bit,
+            xi2_absorbing_evtype(event.kind),
+        )
+        .map(|(_, _, _, c, _)| c)
+        .unwrap_or_default();
         let xi2_evt = xi2_evtype(event.kind);
         let (xi2_clients, _) = compute_xi2_targets(state, target, top_level_id, xi2_evt, None);
         let label_clients = |cs: &[ClientId]| -> String {
@@ -1083,8 +1089,15 @@ fn pointer_event_fanout_to_state_inner(
             (target, target_x, target_y)
         };
         let (nested_id, event_x, event_y, mut core_targets, propagation_child) =
-            pointer_propagation_target_by_id(state, cross_start, cross_x, cross_y, mask_bit)
-                .unwrap_or((cross_start, cross_x, cross_y, Vec::new(), ResourceId(0)));
+            pointer_propagation_target_by_id(
+                state,
+                cross_start,
+                cross_x,
+                cross_y,
+                mask_bit,
+                xi2_absorbing_evtype(event.kind),
+            )
+            .unwrap_or((cross_start, cross_x, cross_y, Vec::new(), ResourceId(0)));
 
         // XI2 shadows core per client (Xorg behaviour, mirrors
         // `deliver_key_to_window`): a client that receives the XI2
@@ -2827,6 +2840,22 @@ fn xi2_evtype(kind: PointerEventKind) -> u16 {
         PointerEventKind::MotionNotify => 6,
         PointerEventKind::EnterNotify => 7,
         PointerEventKind::LeaveNotify => 8,
+    }
+}
+
+/// The XI2 evtype whose selection ABSORBS this event during the core
+/// propagation walk, or None when the absorb rule does not apply.
+///
+/// Device events only. Crossing events are NOT routed by
+/// `DeliverDeviceEvents`' flavour-ordered loop in Xorg — they are
+/// delivered per window along the crossing chain — so an XI_Enter /
+/// XI_Leave selection must not suppress core Enter/Leave anywhere.
+fn xi2_absorbing_evtype(kind: PointerEventKind) -> Option<u16> {
+    match kind {
+        PointerEventKind::ButtonPress
+        | PointerEventKind::ButtonRelease
+        | PointerEventKind::MotionNotify => Some(xi2_evtype(kind)),
+        PointerEventKind::EnterNotify | PointerEventKind::LeaveNotify => None,
     }
 }
 
