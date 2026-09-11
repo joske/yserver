@@ -20567,9 +20567,24 @@ fn handle_create_window(
         };
         let local = state.resources.window(window_id);
         let resolved_bg = state.resources.window_resolved_background(window_id);
-        let host_bg_pixel = resolved_bg
-            .map(|bg| bg.background_pixel)
-            .or_else(|| local.map(|w| w.background_pixel));
+        // `window_resolved_background` returning None is MEANINGFUL: it
+        // says this window has no background, so the server paints
+        // nothing (X11 §CreateWindow — background-pixmap defaults to
+        // None). It returns None in exactly four cases, and a stored
+        // pixel is the wrong answer in all of them: a ParentRelative
+        // cycle; the window absent from the map (then `local` is None
+        // too); a ParentRelative chain that resolved to no background;
+        // and `background_none` itself.
+        //
+        // So DO NOT fall back to `w.background_pixel` here. For a
+        // background-None window that field holds the 0x00ffffff
+        // PLACEHOLDER `create_window` stores when the request carries no
+        // background attribute, and passing it on painted every such
+        // window's fresh storage WHITE — the storage half of
+        // `window_storage_init_covers_the_whole_allocation`, and the
+        // reason `default_window_init_color`'s None branch was dead for
+        // client windows. None reaches that safe default instead.
+        let host_bg_pixel = resolved_bg.map(|bg| bg.background_pixel);
         let host_bg_pixmap = resolved_bg
             .and_then(|bg| bg.background_pixmap_host_xid)
             .map(|h| h.as_raw())

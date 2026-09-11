@@ -13871,10 +13871,9 @@ fn the_awesome_wezterm_grow_keeps_the_client_below_the_titlebar() {
 /// #133 investigation — the initial clear of window storage created with
 /// NO background attribute.
 ///
-/// **This test currently FAILS, and that is the point: it is the
-/// reproduction of a defect, not a regression guard.** It is `#[ignore]`d
-/// with the rest of the Vk-gated suite, so `cargo test` stays green;
-/// run it with `--ignored` to see the finding.
+/// Wrote the defect down as a failing test on 2026-09-11 and fixed it
+/// the same day; it is a regression guard now. Kept `#[ignore]`d with
+/// the rest of the Vk-gated suite, so `cargo test` stays green.
 ///
 /// Measured, on this box, for a fresh window that is mapped and never
 /// painted:
@@ -13887,13 +13886,28 @@ fn the_awesome_wezterm_grow_keeps_the_client_below_the_titlebar() {
 /// | `background-pixel = 0x00ff0000` | 32 | `0000ff00` | `0000ff00` ✓ |
 /// | `background-pixel = 0xff00ff00` | 32 | `00ff00ff` | `00ff00ff` ✓ |
 ///
-/// Note `bg_pixel = Some(0)` and `bg_pixel = None` at depth 32 hand
-/// `fill_rect` the **identical** `[0.0, 0.0, 0.0, 0.0]`
-/// (`default_window_init_color`, `decode_x11_pixel_for_storage`), and
-/// only one of them lands — so the colour is not the discriminator, the
-/// code path is. In both failing rows RGB is `0xFF` (the fresh
-/// allocation) while ALPHA is exactly the init colour's alpha, i.e.
-/// something writes the alpha channel and leaves RGB untouched.
+/// The CAUSE, measured by logging the colour that actually reached the
+/// fill: `bg_pixel` arrived as `Some(0x00ff_ffff)` — WHITE — for both
+/// failing rows, and the fill landed all four channels faithfully.
+/// `create_window` stores `0x00ff_ffff` as a PLACEHOLDER when a request
+/// carries no background attribute (`resources.rs`), records the real
+/// state separately in `background_none`, and
+/// `window_resolved_background` honours it by returning `None` — but
+/// the CreateWindow path then defeated that with
+/// `.or_else(|| local.map(|w| w.background_pixel))`, resurrecting the
+/// placeholder. `default_window_init_color`'s `None` branch was
+/// therefore dead for every client window.
+///
+/// Two earlier readings of the same numbers were WRONG, and the trap is
+/// worth keeping on file. Alpha looked meaningful — exactly the init
+/// colour's alpha in both rows, suggesting "something writes alpha and
+/// leaves RGB untouched", and a write-mask hunt followed. It is an
+/// artifact of the placeholder: `decode_x11_pixel_for_storage` takes
+/// alpha from the pixel's top byte, so `0x00ff_ffff` gives `ffffffff` at
+/// depth 24 and `ffffff00` at depth 32 in one pass. And `bg_pixel =
+/// Some(0)` vs `None` at depth 32 do NOT hand `fill_rect` the same
+/// colour, as this comment used to claim: `Some(0)` gives
+/// `[0.0, 0.0, 0.0, 0.0]`, `None` gave white.
 ///
 /// Why it shows as WHITE rather than as transparency: the scene draws
 /// windows with `alpha_passthrough = false`, whose shader forces
