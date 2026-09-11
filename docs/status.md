@@ -6898,3 +6898,98 @@ through `destroy_zombie_resources`.
 The pattern worth remembering: **three of these four were the same omission at a
 different site.** The audit that finds them is "list every site that decides to
 free, and diff their gates", not "read the site the bug was reported at".
+
+## Handoff — `fix/redirect-backing-and-logical-depth` (2026-09-11)
+
+Branched off master `7c01c69a`. Three commits, **unmerged, no HW smoke run**.
+Everything below was measured in the vng harness against X.Org 1.21.1.24
+(Arch's `xorg-server 21.1.24`), never inferred from spec prose.
+
+### What is on the branch
+
+| commit | what |
+|---|---|
+| `cf7585f4` | `tools/depth32-bg-probe.c`, `tools/redirect-subtree-probe.c` + 3 vng scenarios |
+| `786c4c20` | redirect-backing reconstruction: `PictOpOver` → raw copy |
+| `b38302c0` | `GetImage` reply depth from the drawable, not the backing |
+
+Re-run either probe with:
+
+```
+tools/vng-shot.sh --server xorg --dump none --name X --scenario tools/vng-scenarios/depth32-bg-composited.sh
+tools/vng-shot.sh --name Y --dump none --scenario tools/vng-scenarios/depth32-bg-composited.sh
+```
+
+Both grade themselves and print a VERDICT line. `depth32-bg-probe` also runs
+inside a live desktop session (`cc -O1 -o /tmp/p tools/depth32-bg-probe.c -lX11
+-lXcomposite && /tmp/p --hold 15`) — it detects an existing compositor via
+`_NET_WM_CM_Sn` rather than redirecting, takes no grabs, and cleans up after
+itself.
+
+### State at the tip
+
+- `depth32-bg-probe`: 12/12 graded cells match Xorg. Reply depth root=24,
+  depth-32 window=32.
+- `redirect-subtree-probe`: 8/8. Proven RED on `cf7585f4` (three samples) and
+  green at `786c4c20`.
+- `cargo clippy --all-targets -- -D warnings` clean; `yserver` lib 1294 pass,
+  `yserver-core` lib 1248 pass, `render_acceptance --ignored` 152 pass with the
+  single pre-existing `window_storage_init_covers_the_whole_allocation`
+  failure (documented at `render_acceptance.rs:13890`, fails identically on
+  master — baseline re-measured, not assumed).
+
+### Three things that are REFUTED — do not revive them
+
+1. **The depth-32 background alpha rule is master-only.** `miPaintWindow`'s
+   `fill.pixel |= 0xff000000` ancestor-chain walk (`mi/miexpose.c:487-511`)
+   arrived in commit `2de50de56` (2023-07-20), *after* the 21.1 branch point.
+   It is absent from every 21.1 release, i.e. from the server every user runs.
+   Background painting must NOT be made to follow it, and it must not be
+   coupled to the border decision. `border_solid_pixel`
+   (`backend.rs:4451`) already implements it, which means we diverge from
+   distro Xorg on borders — a standing choice from #133 step 4, not a defect
+   to "fix" by making backgrounds match.
+
+2. **Xorg does not canonicalise the depth-24 pad byte, and neither may we.**
+   `fbGetImage` masks only `if (pm != FB_ALLONES)`, and `AllPlanes` on a 32-bpp
+   depth-24 drawable replicates to all-ones, so the mask step is skipped
+   entirely and the byte passes through verbatim (measured: fg `0x00ff0000` →
+   pad `00`, fg `0xffff0000` → pad `ff`). A change to clear it was written,
+   broke 7 acceptance tests, and was reverted — **those tests were right**.
+   The 8 pad bits are protocol-undefined; our `ff` where Xorg passes through
+   `00` on the depth-24 root is informational and deliberately kept out of the
+   probe's verdict.
+
+3. **The "depth-32 child under a depth-24 frame loses its alpha" finding was a
+   measurement artifact.** `XGetPixel` masks to the image's depth CLIENT-side,
+   which stripped the pad byte on both servers equally. Reading raw image bytes
+   instead, our stored words are byte-identical to Xorg's in all six background
+   cases. There is no content-reconstruction problem; item 3 was a reply-header
+   fix only. Both probes now read raw bytes — keep it that way.
+
+### The invariant this established
+
+> The X reply's depth and plane-mask semantics come from the requested
+> drawable, never from the redirected backing or scanout storage.
+
+Written up at `get_image` (`backend.rs:22258`) with both failure cases named.
+`PaintTarget::x11_depth` already carried the logical depth for exactly this;
+`get_image` was the one caller not using it. `resources::ROOT_DEPTH` is now the
+single source for the root's depth, used by both the setup reply and GetImage.
+
+### Next
+
+The Plasma white/black blocks, unchanged in priority and still unfixed:
+
+1. Split scene "preserve alpha while blending" from "may claim occlusion" at
+   `scene.rs:6685`. Depth 32 must preserve alpha and must NOT claim its whole
+   rectangle opaque. Actual pixel alpha is not a usable occlusion predicate.
+   `_NET_WM_OPAQUE_REGION` could later supply a conservative region hint but is
+   not needed for the correctness fix.
+2. On unredirect, restore from the backing before un-routing/freeing it where
+   Xorg's depth-compatible restore applies, then emit Expose for the formerly
+   redirected mapped subtree. The backing is gone only after release, so it IS
+   available at the point restoration must happen — an earlier "there is no
+   backing" caveat was wrong.
+
+**Gate before any of this lands: HW smoke. None has been run on this branch.**
