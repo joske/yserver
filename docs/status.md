@@ -6902,7 +6902,8 @@ free, and diff their gates", not "read the site the bug was reported at".
 ## Handoff — `fix/redirect-backing-and-logical-depth` (2026-09-11)
 
 Branched off master `7c01c69a`. Three code/test commits plus this note,
-**unmerged, no HW smoke run**.
+**unmerged; HW-smoked on silence under Plasma and Cinnamon** (see the HW smoke
+section below).
 Everything below was measured in the vng harness against X.Org 1.21.1.24
 (Arch's `xorg-server 21.1.24`), never inferred from spec prose.
 
@@ -7046,10 +7047,32 @@ blocks (Xorg errors correctly and still shows them), but it is a real measured
 divergence on the same teardown path. The 64-vs-16 `CreatePixmap` BadValue is a
 second, separate lead.
 
+### HW smoke — done, on silence, 2026-09-11
+
+The binary that produced all three traces above reports
+`yserver 1.5.0 (282f0b10e324)` in its startup line, i.e. it was built from this
+branch with both fixes live. That is what makes the runs smoke evidence for the
+branch rather than for master.
+
+- **Cinnamon** — mpv fullscreen and back: correct throughout, nothing lost or
+  discoloured. This is the path the `PictOpOver` → raw-copy change touches, and
+  it is the desktop that redirects per-window and never tears compositing down,
+  so it exercises the reconstruction walk without the KWin teardown confusing
+  the result. No regression.
+- **Plasma** — mpv fullscreen and back: white/black blocks, matched by stock
+  Xorg on the same session, as above. Not attributable to the branch.
+
+Both sessions ran under xtrace, and the Plasma yserver/Xorg pair was traced
+identically, so the tracer is held constant across that comparison
+(it is a known confound otherwise).
+
+What this does NOT establish: it is smoke, not targeted verification. Neither
+fix was confirmed to produce its intended effect *on hardware* — that evidence
+is the vng A/B against Xorg 21.1.24, which is where both were measured. No
+desktop other than Plasma and Cinnamon was exercised.
+
 ### Next
 
-Neither fix on this branch depends on any of the above; both stand on their own
-measured Xorg mismatches. The open work is the stale-drawable acceptance
+Neither fix on this branch depends on the Plasma question; both stand on their
+own measured Xorg mismatches. The open work is the stale-drawable acceptance
 divergence in the table above, which wants its own branch.
-
-**Gate before this branch lands: HW smoke. None has been run on it.**
