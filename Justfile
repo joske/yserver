@@ -784,38 +784,6 @@ yserver-openbox-hw log="info":
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;'
 
-# Issue #141 — OpenBox windows spontaneously enter Move/Resize.
-# Client-side ground truth (what OpenBox actually RECEIVED) plus the
-# trace-level pointer paths, which is where QUEUE-WHILE-FROZEN and the
-# grab-delivery decisions live. A debug-level capture cannot show either:
-# the core fanout log line is gated on `!handled_core_via_grab`, so an
-# implicit grab's ButtonRelease never reaches it.
-#
-# Release build on purpose — the bug needs 1-2 minutes of ordinary use to
-# show up, and a debug build's pacing is not that. Only the pointer module
-# is raised to trace, so the log stays readable across that long a session.
-#
-# After a runaway, in openbox-141.xtrace find the last ButtonPress before
-# it and compare its root-x/root-y against the MotionNotify coordinates
-# around it — OpenBox moves by (motion_pos - press_pos), so a warp means
-# those disagree. Then check whether a ButtonRelease for that press ever
-# arrived.
-yserver-openbox-141-trace log="warn,yserver_core::core_loop::pointer_fanout=trace":
-    cargo build --release --bin yserver
-    rm -f openbox-141.xtrace
-    bash -c '\
-        RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-openbox-141.log 2>&1 &\
-        yserver_pid=$!;\
-        sleep 2;\
-        x11trace -d :7 -D :8 -n -o openbox-141.xtrace &\
-        xtrace_pid=$!;\
-        sleep 1;\
-        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET DISPLAY=:8 GDK_BACKEND=x11 \
-            XDG_SESSION_TYPE=x11 \
-            openbox > openbox-141.log 2>&1;\
-        kill -TERM $xtrace_pid $yserver_pid 2>/dev/null;\
-        wait $yserver_pid 2>/dev/null;'
-
 yserver-openbox-picom-hw log="info":
     cargo build ---release -bin yserver
     bash -c '\
