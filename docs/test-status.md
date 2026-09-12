@@ -5,29 +5,36 @@ smoke) pass rates. This file is the headline only; run-by-run history
 and debugging notes live in [`xts-baseline.md`](xts-baseline.md) and
 `status.md`.
 
-## xts5 — full run #6, yserver/KMS bare-metal (eiger/aarch64, 2026-06-25)
+## xts5 — full run #7, yserver/KMS bare-metal (bee/x86_64, 2026-09-12)
 
-**3993 / 5987 test purposes PASS (66.7%)** — +32 vs run #5 (3961),
-FAIL 818 → 813, UNRES 80 → 67. 
+**4011 / 5987 test purposes PASS (67.0%)** — +18 vs run #6 (3993),
+FAIL 813 → 802, UNRES 67 → 61. Results in
+`xts/results/2026-09-12-09:40:39/` on bee.
 
-Movers: XIproto +8, Xlib4 +4, Xlib8 +4, Xlib9 +4, Xlib7 +3, Xproto +3, Xlib12 / Xlib13 / Xt13 +2 each.
+**Read the deltas with care: run #6 was eiger/aarch64 and this run is
+bee/x86_64.** Every Δ below therefore mixes real change with whatever
+differs between the two machines, and the small negatives are as likely
+to be platform as regression. Only a same-box rerun separates them.
+
+Movers: Xlib11 +13, Xlib4 +11, Xlib9 / Xt11 +2, six suites +1.
+Down: Xproto −5, XI −5, Xlib13 / Xt13 −2, XIproto −1.
 
 For context, Xorg itself only passes 77% of the test suite.
 
 | scenario  | cases | tests | PASS | FAIL | UNRES | UNTST | UNSUP | NOTIU | Δ PASS |
 |-----------|------:|------:|-----:|-----:|------:|------:|------:|------:|-------:|
-| Xproto    |   122 |   389 |  361 |    6 |     1 |    19 |     2 |     0 |     +3 |
-| Xlib3     |   109 |   162 |  107 |   18 |     3 |    27 |     6 |     1 |      0 |
-| Xlib4     |    29 |   324 |  171 |  113 |     7 |    17 |    11 |     5 |     +4 |
-| Xlib5     |    15 |    84 |   59 |   18 |     0 |     5 |     2 |     0 |      0 |
-| Xlib6     |     8 |    50 |    6 |   15 |     0 |    29 |     0 |     0 |      0 |
-| Xlib7     |    58 |   172 |   86 |   28 |     0 |    13 |    45 |     0 |     +3 |
-| Xlib8     |    29 |   165 |   92 |   37 |     4 |    22 |    10 |     0 |     +4 |
-| Xlib9     |    46 |  1472 |  833 |  376 |     0 |    36 |    23 |   201 |     +4 |
-| Xlib10    |    23 |    95 |   25 |   29 |     5 |    35 |     1 |     0 |      0 |
-| Xlib11    |    33 |   195 |   74 |   49 |     3 |     4 |    22 |    43 |      0 |
-| Xlib12    |    27 |   138 |   96 |   12 |     1 |    15 |     2 |    12 |     +2 |
-| Xlib13    |    32 |   269 |  207 |   23 |    23 |    10 |     3 |     3 |     +2 |
+| Xproto    |   122 |   389 |  356 |    9 |     3 |    19 |     2 |     0 |     −5 |
+| Xlib3     |   109 |   162 |  108 |   18 |     2 |    21 |     6 |     1 |     +1 |
+| Xlib4     |    29 |   324 |  182 |  103 |     3 |    20 |    11 |     5 |    +11 |
+| Xlib5     |    15 |    84 |   60 |   17 |     0 |     5 |     2 |     0 |     +1 |
+| Xlib6     |     8 |    50 |    7 |   14 |     0 |    29 |     0 |     0 |     +1 |
+| Xlib7     |    58 |   172 |   87 |   27 |     0 |    13 |    45 |     0 |     +1 |
+| Xlib8     |    29 |   165 |   92 |   37 |     4 |    22 |    10 |     0 |      0 |
+| Xlib9     |    46 |  1472 |  835 |  374 |     0 |    36 |    23 |   201 |     +2 |
+| Xlib10    |    23 |    95 |   25 |   37 |     4 |    28 |     1 |     0 |      0 |
+| Xlib11    |    33 |   195 |   87 |   36 |     3 |     4 |    22 |    43 |    +13 |
+| Xlib12    |    27 |   138 |   97 |   11 |     1 |    15 |     2 |    12 |     +1 |
+| Xlib13    |    32 |   269 |  205 |   30 |    18 |    10 |     3 |     3 |     −2 |
 | Xlib14    |    45 |    58 |   46 |    7 |     0 |     5 |     0 |     0 |      0 |
 | Xlib15    |    45 |   159 |  125 |    1 |     0 |    33 |     0 |     0 |      0 |
 | Xlib16    |    30 |   105 |   82 |    0 |     0 |    22 |     1 |     0 |      0 |
@@ -41,38 +48,51 @@ For context, Xorg itself only passes 77% of the test suite.
 | Xt8       |     7 |    43 |   35 |    4 |     0 |     4 |     0 |     0 |      0 |
 | Xt9       |    33 |   189 |  122 |    2 |     8 |    55 |     2 |     0 |      0 |
 | Xt10      |     8 |    17 |   16 |    0 |     0 |     1 |     0 |     0 |      0 |
-| Xt11      |    58 |   285 |  246 |    3 |     0 |    34 |     0 |     0 |     −1 |
+| Xt11      |    58 |   285 |  248 |    1 |     0 |    34 |     0 |     0 |     +2 |
 | Xt12      |    22 |    67 |   55 |    0 |     1 |    11 |     0 |     0 |      0 |
-| Xt13      |    39 |   178 |  126 |    5 |     0 |    47 |     0 |     0 |     +2 |
+| Xt13      |    39 |   178 |  124 |    5 |     2 |    47 |     0 |     0 |     −2 |
 | Xt14      |     2 |    18 |   18 |    0 |     0 |     0 |     0 |     0 |      0 |
 | Xt15      |     1 |     2 |    0 |    0 |     0 |     0 |     2 |     0 |      0 |
-| XtC       |    29 |   147 |   88 |    1 |     1 |    56 |     1 |     0 |      0 |
+| XtC       |    29 |   147 |   88 |    0 |     2 |    56 |     1 |     0 |      0 |
 | XtE       |     1 |     1 |    1 |    0 |     0 |     0 |     0 |     0 |      0 |
 | ShapeExt  |    11 |    11 |   11 |    0 |     0 |     0 |     0 |     0 |      0 |
-| XI        |    36 |   316 |  222 |   49 |    10 |    28 |     2 |     5 |     +1 |
-| XIproto   |    35 |   107 |  103 |    1 |     0 |     3 |     0 |     0 |     +8 |
-| **total** | **1078** | **5987** | **3993** | **813** | **67** | **697** | **137** | **273** | **+32** |
+| XI        |    36 |   316 |  217 |   51 |    10 |    31 |     2 |     5 |     −5 |
+| XIproto   |    35 |   107 |  102 |    2 |     0 |     3 |     0 |     0 |     −1 |
+| **total** | **1078** | **5987** | **4011** | **802** | **61** | **690** | **137** | **273** | **+18** |
 
-ShapeExt, Xlib16 and Xt3/4/5/10/14 are fully clean (zero
-FAIL/UNRES). yserver survived the whole sweep with zero panics in
-the server log; 2 NORESULTs (`Xt5/XtUnmanageChild(ren)`, unchanged).
+ShapeExt, Xlib16 and Xt3/4/5/10/14/XtE are fully clean (zero
+FAIL/UNRES). 2 NORESULTs, unchanged.
 
-Movement vs #5 came from regular bugfixing, no focused xts work:
-XIproto +8 (UNTST → PASS), Xlib4/8/9 +4 each, Xlib7/Xproto +3. The
-minor new FAILs (XtC +1, Xt11 −1 PASS fontset/resource, XIproto
-ChangeFeedbackControl) are unrelated to the e27 input fixes — those
-touched XI2 delivery, which xts5 doesn't exercise.
+Note on what xts5 can and cannot show: the #141 fix (an XI2 selection
+absorbs the core press, so core propagation stops there) cannot move a
+single number here. xts5 has **no XI2 at all** — its `XI` and `XIproto`
+suites are XInput 1.x (`XOpenDevice`, `AllowDeviceEvents`,
+`ChangeDeviceKeyMapping`). The same was true of the earlier e27 work.
+Both were caught instead by `tools/replay-propagation-probe.c` under
+`tools/vng-scenarios/replay-propagation.sh`, which diffs the same probe
+binary against Xorg and yserver in one harness.
+
+The XI bucket is spread thin rather than concentrated: 51 FAIL across
+~20 files, led by `XSelectExtensionEvent` 7, `ChangeKeyboardDevice` 6,
+`ChangePointerDevice` 5, `AllowDeviceEvents` 5, `GrabDeviceKey` 4.
+Beware of ranking these by report-line volume —
+`ChangeDeviceKeyMapping` emits 612 keysym lines from just 2 FAILs.
+Delivery-shaped reports are a small minority: "not delivered" 15, "too
+many events sent" 2, "incorrectly delivered" 2.
 
 Largest FAIL buckets / next targets:
-1. **Xlib9 (376)** — remaining drawing/GetImage content semantics.
-2. **Xlib4 (113)** — depth-mismatch BadMatch (CWBorderPixmap parser
+1. **Xlib9 (374)** — remaining drawing/GetImage content semantics.
+   Biggest single bucket by a wide margin.
+2. **Xlib4 (103)** — depth-mismatch BadMatch (CWBorderPixmap parser
    needed), colormap visual-type checks, bit-gravity pixel cluster,
    stacking-order pixel checks, BadAccess event-mask conflicts.
-3. **Xlib11 (49)** — residual grab semantics.
-4. **XI (49)** — XInput-1.x device functions + XTest-through-XI1 gaps.
-5. **Xlib8 (37)** / **Xlib7 (28)** — events / colormap sections.
+3. **XI (51)** — XInput-1.x device functions, now the third bucket.
+4. **Xlib8 (37)** / **Xlib10 (37)** — events / colormap sections.
+5. **Xlib11 (36)** — residual grab semantics, down from 49.
 
 Previous full runs:
+- #6 — 2026-06-25 (eiger, aarch64): 3993/5987 PASS (66.7%); results on
+  that box.
 - #5 — 2026-06-07 22:03:01 (bee, HW): 3961/5987 PASS (66.2%) —
   `xts/results/2026-06-07-22:03:01/`.
 - #4 — 2026-06-07 17:14:17 (bee, HW): 3747/5987 PASS (62.6%) —
