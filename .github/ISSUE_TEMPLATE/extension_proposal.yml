@@ -1,0 +1,37 @@
+name: Extension / feature proposal
+description: Propose a new X11 extension, protocol feature, or capability
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Proposals for new protocol coverage, not bug reports. See
+        [`docs/high-level-design.md`](../../docs/high-level-design.md#protocol-scope) for what's
+        already implemented.
+  - type: textarea
+    id: gap
+    attributes:
+      label: What's missing?
+      description: Which extension, request, or capability isn't currently supported.
+    validations:
+      required: true
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Which clients or use cases need this?
+      description: A real client/application that depends on it is the strongest case.
+    validations:
+      required: true
+  - type: textarea
+    id: approach
+    attributes:
+      label: Proposed approach (optional)
+      description: If you have a rough idea of the implementation shape, sketch it here.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I checked this isn't already listed as a non-goal in `docs/high-level-design.md`
+          required: true
