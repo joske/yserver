@@ -11,13 +11,15 @@ and debugging notes live in [`xts-baseline.md`](xts-baseline.md) and
 FAIL 813 → 802, UNRES 67 → 61. Results in
 `xts/results/2026-09-12-09:40:39/` on bee.
 
-**Read the deltas with care: run #6 was eiger/aarch64 and this run is
-bee/x86_64.** Every Δ below therefore mixes real change with whatever
-differs between the two machines, and the small negatives are as likely
-to be platform as regression. Only a same-box rerun separates them.
+Run #6 was on eiger, this one on bee. That is not a caveat: xts5 tests
+protocol conformance, so the same server build should produce the same
+verdicts on any machine. A number that moves between boxes without a
+code change is our own non-determinism and is itself worth chasing —
+not a reason to discount the delta.
 
 Movers: Xlib11 +13, Xlib4 +11, Xlib9 / Xt11 +2, six suites +1.
-Down: Xproto −5, XI −5, Xlib13 / Xt13 −2, XIproto −1.
+Down: Xproto −5, XI −5, Xlib13 / Xt13 −2, XIproto −1 — all unexplained
+and worth a look.
 
 For context, Xorg itself only passes 77% of the test suite.
 
