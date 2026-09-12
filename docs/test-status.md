@@ -11,15 +11,21 @@ and debugging notes live in [`xts-baseline.md`](xts-baseline.md) and
 FAIL 813 → 802, UNRES 67 → 61. Results in
 `xts/results/2026-09-12-09:40:39/` on bee.
 
-Run #6 was on eiger, this one on bee. That is not a caveat: xts5 tests
-protocol conformance, so the same server build should produce the same
-verdicts on any machine. A number that moves between boxes without a
-code change is our own non-determinism and is itself worth chasing —
-not a reason to discount the delta.
+Run #6 was on eiger, this one on bee, but that is not why numbers move:
+xts5 tests protocol conformance, so the same build should return the
+same verdicts anywhere. What does move them is run-to-run
+non-determinism, which is real and recorded — `xts-baseline.md` marks
+per-suite deltas of ±1-2 PASS as noise outright, and has a case of the
+whole `Xproto` grab family flipping UNRES → PASS. So read small
+per-suite deltas as noise in either direction, and treat a
+box-dependent number as OUR non-determinism to chase rather than as a
+platform difference to excuse.
 
 Movers: Xlib11 +13, Xlib4 +11, Xlib9 / Xt11 +2, six suites +1.
-Down: Xproto −5, XI −5, Xlib13 / Xt13 −2, XIproto −1 — all unexplained
-and worth a look.
+Down: Xproto −5, XI −5, Xlib13 / Xt13 −2, XIproto −1. The −2s and −1
+are inside the noise band; the two −5s are larger than anything
+`xts-baseline.md` has previously called noise, so they are worth a
+look before being assumed benign.
 
 For context, Xorg itself only passes 77% of the test suite.
 
