@@ -193,6 +193,28 @@ impl XdmcpService {
             }
         };
 
+        // Say what we are about to advertise. This is the address the manager
+        // will connect BACK to, so when a session comes up on the wrong
+        // machine it is the first thing worth knowing — and until now the
+        // only way to find out was to infer it from the absence of failures.
+        // Logged even when empty, because "carries none" and "carries the
+        // wrong one" fail in completely different ways.
+        match connection_addresses.first() {
+            Some(addr) => log::info!(
+                "xdmcp: Request advertises connect-back {} (FamilyInternet), display {}",
+                addr.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("."),
+                setup.display_number,
+            ),
+            None => log::info!(
+                "xdmcp: Request advertises NO connect-back address; the manager \
+                 has nowhere to reach display {}",
+                setup.display_number,
+            ),
+        }
+
         let config = XdmcpConfig {
             initial_mode: setup.mode.initial(),
             once: setup.once,
