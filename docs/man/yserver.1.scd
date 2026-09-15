@@ -6,7 +6,7 @@ yserver - X11 server for Linux KMS/DRM
 
 # SYNOPSIS
 
-*yserver* [:_display_] [vt_N_] [-auth _file_] [-displayfd _fd_] [-layout _layout_] [--version]
+*yserver* [:_display_] [vt_N_] [-auth _file_] [-displayfd _fd_] [-layout _layout_] [-listen _protocol_] [-nolisten _protocol_] [-noreset|-reset|-terminate] [-query _host_|-indirect _host_|-broadcast] [-port _n_] [-from _address_] [-class _string_] [-displayID _string_] [-once] [--version]
 
 # DESCRIPTION
 

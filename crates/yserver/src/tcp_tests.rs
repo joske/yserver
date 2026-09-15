@@ -332,3 +332,36 @@ fn tcp_loopback_cookie_setup_and_listener_capabilities() {
     // same-machine XDMCP session its shared memory.
     assert_eq!(capabilities, [(true, false), (true, true)]);
 }
+
+/// Raised in review on #148. XDMCP over UDP negotiates a session and then the
+/// manager starts clients that must reach this display over TCP. With no
+/// listener bound, that handshake succeeds and the session then has nowhere
+/// to connect — the server sits there looking healthy. `build_xdmcp_service`
+/// opens the UDP socket regardless, so nothing downstream catches it either.
+///
+/// Both directions are asserted: the unusable combination must fail, and the
+/// documented one must still pass — `-query` with `-listen tcp` and NO
+/// `-auth`, because XDMCP is itself the dynamic auth source that satisfies
+/// the stage-1 TCP check. That is the combination `just yserver-xdmcp-hw`
+/// runs, so breaking it would break the hardware path.
+#[test]
+fn xdmcp_requires_a_tcp_listener_at_startup() {
+    let fixture = Fixture::new();
+
+    // `build_auth_state`, not `AuthState::new`: the XDMCP flag it sets is
+    // what lets `-listen tcp` come up without `-auth`, so constructing the
+    // state any other way tests a configuration startup never produces.
+    let opts = fixture.options(&["-query", "127.0.0.1"]);
+    let auth = super::build_auth_state(&opts);
+    let err = super::validate_tcp_startup(&opts, &auth)
+        .expect_err("XDMCP without -listen tcp must be refused at startup");
+    assert!(
+        err.to_string().contains("-listen tcp"),
+        "the error must name the missing option, got: {err}"
+    );
+
+    let opts = fixture.options(&["-query", "127.0.0.1", "-listen", "tcp"]);
+    let auth = super::build_auth_state(&opts);
+    super::validate_tcp_startup(&opts, &auth)
+        .expect("-query with -listen tcp is the documented pairing and must start");
+}

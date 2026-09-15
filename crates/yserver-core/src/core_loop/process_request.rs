@@ -521,6 +521,38 @@ fn reject_non_local_extension_request(
         ));
     }
 
+    // MIT-SHM's two descriptor-bearing minors need the same treatment, and
+    // for the same reason: `is_local` is an ADDRESS property, so a loopback
+    // TCP peer is local and reaches them, then fails at the descriptor the
+    // transport cannot carry. `Attach` is deliberately NOT here — it passes
+    // a SysV shmid, not a descriptor, and stays available to a local TCP
+    // client (see `tcp_tests.rs`). Neither is `QueryVersion`.
+    //
+    // The codes are Xorg's, per minor rather than uniform: `ProcShmAttachFd`
+    // reaches `ReadFdFromClient` and returns `BadMatch` when it fails
+    // (`Xext/shm.c:1163`), while `ProcShmCreateSegment` returns `BadAlloc`
+    // when `WriteFdToClient` does (`Xext/shm.c:1323`). A client that handles
+    // Xorg's answer handles ours.
+    if header.opcode == 130 && !fd_passing {
+        use yserver_protocol::x11::mit_shm;
+        let code = match header.data {
+            mit_shm::ATTACH_FD => Some(x11::error::BAD_MATCH),
+            mit_shm::CREATE_SEGMENT => Some(x11::error::BAD_ALLOC),
+            _ => None,
+        };
+        if let Some(code) = code {
+            return Some(emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                code,
+                0,
+                u16::from(header.data),
+                130,
+            ));
+        }
+    }
+
     if is_local {
         return None;
     }
@@ -8068,7 +8100,32 @@ fn handle_mit_shm_create_segment(
         None => Ok(()),
     };
     unsafe { libc::close(fd_for_client) };
-    send_res?;
+    if send_res.is_err() {
+        // Xorg's `ProcShmCreateSegment` (`Xext/shm.c:1323`):
+        //
+        //     if (WriteFdToClient(client, fd, TRUE) < 0) {
+        //         FreeResource(stuff->shmseg, X11_RESTYPE_NONE);
+        //         close(fd);
+        //         return BadAlloc;
+        //     }
+        //
+        // Both halves matter. Propagating the I/O error instead left the
+        // segment in `mit_shm_segments` with no client able to reach it,
+        // and sent no protocol reply at all — the client saw a request that
+        // neither succeeded nor failed. The dispatch gate above should mean
+        // this is now unreachable for the transport reason; it stays
+        // because a short write is not the only way to get here.
+        state.mit_shm_segments.remove(&req.shmseg);
+        return emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_ALLOC,
+            req.shmseg,
+            u16::from(shm::CREATE_SEGMENT),
+            MIT_SHM_MAJOR_OPCODE,
+        );
+    }
     Ok(RequestOutcome::Handled)
 }
 

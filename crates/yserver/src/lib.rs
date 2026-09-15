@@ -94,6 +94,19 @@ fn validate_tcp_startup(
     auth: &core_loop::auth::AuthState,
 ) -> io::Result<()> {
     if !opts.tcp_listen {
+        // XDMCP without a TCP listener starts happily and can never finish:
+        // the manager completes Query/Willing/Request/Accept/Manage over
+        // UDP and then starts a session whose clients have no X server to
+        // connect to, because the only socket we bound is the unix one it
+        // cannot reach. Every documented invocation pairs them
+        // (`docs/setup.md`, and the stage-4 plan's deliverable is
+        // `yserver :N -query <host> -listen tcp`); this makes the pairing a
+        // startup error instead of a silent dead end.
+        if opts.xdmcp.is_some() {
+            return Err(io::Error::other(
+                "XDMCP requires -listen tcp: the manager's session has no way to                  reach this display without it",
+            ));
+        }
         return Ok(());
     }
     auth.require_tcp_auth_at_startup()
@@ -661,6 +674,15 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
             }
         })?;
 
+    // XDMCP binds BEFORE readiness is signalled. It used to be built after,
+    // "so an unresolvable manager fails after the display is known but
+    // before the loop takes the thread" — but the display is known here
+    // too, and signalling first means a bad `-query` host or a UDP bind
+    // failure told the parent the server was up and only then returned
+    // `Err` through `?`, skipping the shutdown path everything after this
+    // point relies on.
+    let xdmcp = build_xdmcp_service(&opts, display)?;
+
     // Readiness handshake: ServerState is fully constructed, the socket is
     // bound + chmod'd, and the lock is held — we can complete an initial X
     // connection setup now. This is the analog of Xorg signaling after
@@ -676,9 +698,6 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     } else {
         log::info!("yserver: no -auth file; local access open (Xorg default)");
     }
-    // XDMCP last, so an unresolvable manager fails after the display is
-    // known but before the loop takes the thread.
-    let xdmcp = build_xdmcp_service(&opts, display)?;
     log::info!("yserver: entering single-threaded core loop");
     let result = core_loop::run_core(
         poll,
