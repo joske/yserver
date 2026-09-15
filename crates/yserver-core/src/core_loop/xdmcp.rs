@@ -35,7 +35,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mio::{Interest, Token, unix::SourceFd};
+use mio::{Interest, unix::SourceFd};
 use yserver_protocol::{
     x11::ClientId,
     xdmcp::{
@@ -46,10 +46,10 @@ use yserver_protocol::{
 
 use super::{Generation, auth::AuthState};
 
-/// The XDMCP socket's poll token. Fixed, like the notify and signal
-/// tokens, and below the listener range (`poll_tokens`'s `0x10`) so it can
-/// never collide with a listener, a backend fd or a client writer.
-pub const XDMCP_TOKEN: Token = Token(4);
+/// The XDMCP socket's poll token. Defined once in `poll_tokens`, next to
+/// the other fixed system tokens, so this build and the feature-off stub
+/// build cannot drift apart.
+pub use super::poll_tokens::XDMCP_TOKEN;
 
 /// `FamilyInternet` (`X11/Xdmcp.h`, and `xdmcp.c`'s
 /// `XdmcpRegisterConnection` call sites) — the connection type for an

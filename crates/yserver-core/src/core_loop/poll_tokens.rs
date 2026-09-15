@@ -3,8 +3,8 @@
 //!
 //! The poller's tokens fall into four ranges:
 //!
-//! - Fixed system tokens at the bottom: notify-channel and
-//!   signalfd. These never change at runtime.
+//! - Fixed system tokens at the bottom: notify-channel, signalfd and the
+//!   XDMCP UDP socket. These never change at runtime.
 //! - Listener tokens from `0x10`, one per listening socket, so TCP and Unix
 //!   readiness can be scheduled independently.
 //! - Backend-owned fds, allocated densely from `0x100` in the order returned
@@ -35,6 +35,14 @@ pub use super::sender::NOTIFY_TOKEN;
 
 /// signalfd; readiness causes the core to issue `Message::Shutdown`.
 pub const SIGNAL_TOKEN: Token = Token(3);
+
+/// The XDMCP UDP socket. Fixed, like the notify and signal tokens, and
+/// below the listener range (`LISTENER_TOKEN_BASE`) so it can never
+/// collide with a listener, a backend fd or a client writer. Defined
+/// here (rather than in `xdmcp`/`xdmcp_stub`) so both the full and the
+/// minimal build share one definition instead of two literals that
+/// nothing keeps in sync.
+pub const XDMCP_TOKEN: Token = Token(4);
 
 /// Listener tokens occupy a separate range from fixed system/backend tokens.
 const LISTENER_TOKEN_BASE: usize = 0x10;
@@ -210,5 +218,31 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), all.len());
+    }
+
+    /// Guards against the drift this module exists to prevent: `XDMCP_TOKEN`
+    /// used to be defined twice (once per `xdmcp`/`xdmcp_stub` build), with
+    /// nothing keeping the two literals in sync. A future renumbering of one
+    /// fixed system token that missed the other would compile clean in every
+    /// feature configuration and only misroute readiness events at runtime.
+    /// Runs unconditionally (no `#[cfg(feature = ...)]`) so it catches that
+    /// in every build, including the minimal one where `xdmcp` is a stub.
+    #[test]
+    fn fixed_system_tokens_are_distinct_and_below_listener_base() {
+        let fixed = [NOTIFY_TOKEN, SIGNAL_TOKEN, XDMCP_TOKEN];
+        for token in fixed {
+            assert!(
+                token.0 < LISTENER_TOKEN_BASE,
+                "{token:?} must stay below LISTENER_TOKEN_BASE ({LISTENER_TOKEN_BASE:#x})"
+            );
+        }
+        let mut sorted: Vec<_> = fixed.iter().map(|t| t.0).collect();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            fixed.len(),
+            "fixed system tokens must be pairwise distinct"
+        );
     }
 }

@@ -14,15 +14,15 @@
 
 use std::{io, time::Instant};
 
-use mio::Token;
 use yserver_protocol::x11::ClientId;
 
 use super::{Generation, auth::AuthState};
 
 /// The XDMCP socket's poll token. Nothing ever registers against it in
 /// this build, but `run.rs` still compares it and the token numbering
-/// must not shift between configurations.
-pub const XDMCP_TOKEN: Token = Token(4);
+/// must not shift between configurations. Defined once in `poll_tokens`
+/// so this stub cannot drift from the real `xdmcp` module's value.
+pub use super::poll_tokens::XDMCP_TOKEN;
 
 /// What the core loop must do about the XDMCP machine's decisions.
 ///
