@@ -43295,4 +43295,98 @@ mod tests {
         assert_eq!(b.store.lookup(0xD57), Some(dst_id));
         assert_eq!(b.store.lookup(0x5AC), Some(source_id));
     }
+
+    /// Issue #146 — the dedup key must not move when only the region XIDs do.
+    ///
+    /// `scanout_m0 shape` logs when the shape CHANGES, and the key used to
+    /// carry the Present valid/update region XIDs. A compositor creates a
+    /// fresh update region every frame (`0x4144dd` → `0x4144eb` → `0x4144f9`
+    /// across three consecutive Presents in the #146 report), so the key
+    /// changed on every Present by construction and the guard suppressed
+    /// nothing — one ~700-byte line per composited frame.
+    ///
+    /// The sibling test above cannot catch this: it sends
+    /// `update_region_xid: 0` on both Presents, so the key is identical
+    /// either way and it passes before and after the fix.
+    ///
+    /// Both directions are asserted. Identity must NOT move the key, or the
+    /// flood returns; presence must STILL move it, or the fix has simply
+    /// thrown the information away.
+    #[test]
+    fn scanout_m0_shape_ignores_region_xid_identity_but_not_presence() {
+        use crate::kms::render::store::{DrawableKind, Storage};
+        use ash::vk;
+        use yserver_core::backend::PresentScanoutCandidate;
+
+        let mut b = super::KmsBackend::for_tests();
+        seed_window(&mut b, 0xD57, None, 0, 0);
+        b.store
+            .allocate(
+                0x5AC,
+                DrawableKind::Pixmap,
+                24,
+                false,
+                Storage::for_tests_null(
+                    vk::Extent2D {
+                        width: 100,
+                        height: 100,
+                    },
+                    vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("source");
+        let base = PresentScanoutCandidate {
+            client_id: 1,
+            present_id: 1,
+            crtc_id: 0,
+            crtc_epoch: 0,
+            src_pixmap_xid: 0x100,
+            dst_window_xid: 0x200,
+            src_host_xid: 0x5AC,
+            paint_dst_host_xid: 0xD57,
+            completion_dst_host_xid: 0xD57,
+            src_width: 100,
+            src_height: 100,
+            x_off: 0,
+            y_off: 0,
+            // A real compositor's regions: present, and a different XID every
+            // frame. These are the exact values from the #146 report.
+            valid_region_xid: 0,
+            update_region_xid: 0x0041_44dd,
+            update_is_full: false,
+            explicit_sync: false,
+            options: 0,
+        };
+
+        b.observe_scanout_m0(base);
+        let after_first = b.scanout_m0.last_shape_by_dst[&0xD57].clone();
+
+        for (present_id, update) in [(2u64, 0x0041_44ebu32), (3, 0x0041_44f9)] {
+            b.observe_scanout_m0(PresentScanoutCandidate {
+                present_id,
+                update_region_xid: update,
+                ..base
+            });
+            assert_eq!(
+                b.scanout_m0.last_shape_by_dst[&0xD57], after_first,
+                "a fresh update-region XID must not count as a shape change \
+                 (present {present_id}, update {update:#x}) — that is the \
+                 per-frame log flood in #146",
+            );
+        }
+
+        // ...but losing the region entirely IS a real change, so the key has
+        // to notice. Otherwise the fix would just have dropped the signal.
+        b.observe_scanout_m0(PresentScanoutCandidate {
+            present_id: 4,
+            update_region_xid: 0,
+            update_is_full: true,
+            ..base
+        });
+        assert_ne!(
+            b.scanout_m0.last_shape_by_dst[&0xD57], after_first,
+            "a Present that carries no update region at all is a different \
+             shape and must still be logged",
+        );
+    }
 }
