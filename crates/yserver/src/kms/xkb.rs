@@ -111,16 +111,33 @@ const XKB_MAP_PART_KEY_SYMS: u16 = 1 << 1;
 const XKB_MAP_PART_MODIFIER_MAP: u16 = 1 << 2;
 const XKB_MAP_PART_EXPLICIT_COMPONENTS: u16 = 1 << 3;
 const XKB_MAP_PART_KEY_ACTIONS: u16 = 1 << 4;
+const XKB_MAP_PART_KEY_BEHAVIORS: u16 = 1 << 5;
 const XKB_MAP_PART_VIRTUAL_MODS: u16 = 1 << 6;
 const XKB_MAP_PART_VIRTUAL_MOD_MAP: u16 = 1 << 7;
 
 /// Map components this backend can actually serialize into GetMap.
-/// KeyBehaviors (bit 5) is intentionally absent.
+///
+/// KeyBehaviors (bit 5) is included even though we have no behaviours
+/// to send. libX11 allocates `xkb->server->behaviors` from the reply's
+/// `present` bit *alone* (`XkbGetUpdatedMap` still returns `Success`
+/// when the bit is clear), so omitting it leaves that array NULL while
+/// the client believes the map is complete — a Barrier client then
+/// segfaults dereferencing `server->behaviors[9]` (GH #150). Xorg has
+/// the same shape for an all-default keymap: `ProcXkbGetMap` echoes
+/// `partial | full` into `present` (xkb.c:1489) and fills
+/// `firstKeyBehavior`/`nKeyBehaviors` from the keycode range while
+/// leaving `totalKeyBehaviors = 0` (xkb.c:1538-1549);
+/// `XkbSizeKeyBehaviors` clears the bit only when the server has *no*
+/// behaviors array at all (xkb.c:1230-1236), and `XkbSendMap` writes
+/// section bytes only when `totalKeyBehaviors > 0` (xkb.c:1428-1429).
+/// So we emit the three header fields with an **empty section body**:
+/// the reply length is unchanged, and the client gets its allocation.
 const XKB_MAP_PARTS_EMITTED: u16 = XKB_MAP_PART_KEY_TYPES
     | XKB_MAP_PART_KEY_SYMS
     | XKB_MAP_PART_MODIFIER_MAP
     | XKB_MAP_PART_EXPLICIT_COMPONENTS
     | XKB_MAP_PART_KEY_ACTIONS
+    | XKB_MAP_PART_KEY_BEHAVIORS
     | XKB_MAP_PART_VIRTUAL_MODS
     | XKB_MAP_PART_VIRTUAL_MOD_MAP;
 
@@ -350,9 +367,12 @@ pub(super) fn reply_get_map_for_request(keymap: &Keymap, body: &[u8]) -> Vec<u8>
 /// * `KeyActions` advertises the full `[min, max]` range with
 ///   per-key counts of zero — xkbcommon's `get_actions` requires
 ///   exact range coverage, but accepts no actions per key.
-/// * Other sections (`KeyBehaviors`, `VirtualMods`,
-///   `ExplicitComponents`, `VirtualModMap`) stay empty —
-///   xkbcommon's per-section validators tolerate that here.
+/// * `KeyBehaviors` advertises the full `[min, max]` range with
+///   `totalKeyBehaviors = 0` and no section body — every key has the
+///   default behaviour. The bit must be in `present` regardless:
+///   libX11 allocates `server->behaviors` from it alone (GH #150).
+/// * `ExplicitComponents` stays empty — xkbcommon's per-section
+///   validators tolerate that here.
 ///
 /// Reply layout follows xkb.xml's `GetMap` switch order, which is
 /// XML order, *not* bit-position order:
@@ -367,6 +387,7 @@ fn reply_get_map_for_parts(keymap: &Keymap, requested_parts: u16) -> Vec<u8> {
     let include_key_types = present & XKB_MAP_PART_KEY_TYPES != 0;
     let include_key_syms = present & XKB_MAP_PART_KEY_SYMS != 0;
     let include_key_actions = present & XKB_MAP_PART_KEY_ACTIONS != 0;
+    let include_key_behaviors = present & XKB_MAP_PART_KEY_BEHAVIORS != 0;
     let include_virtual_mods = present & XKB_MAP_PART_VIRTUAL_MODS != 0;
     let include_explicit = present & XKB_MAP_PART_EXPLICIT_COMPONENTS != 0;
     let include_modifier_map = present & XKB_MAP_PART_MODIFIER_MAP != 0;
@@ -579,7 +600,19 @@ fn reply_get_map_for_parts(keymap: &Keymap, requested_parts: u16) -> Vec<u8> {
         r[22..24].copy_from_slice(&u16::try_from(total_acts).unwrap_or(u16::MAX).to_le_bytes());
         r[24] = n_keys; // nKeyActions — covers full range
     }
-    // KeyBehaviors are not implemented and bit 5 is never set in `present`.
+    // KeyBehaviors: header fields only, no section body. We have no
+    // non-default behaviours, so `totalKeyBehaviors` stays 0 and the
+    // reply length is unaffected — but the range fields and the bit in
+    // `present` must still be there, because libX11 allocates its
+    // client-side `server->behaviors` array off that bit (GH #150).
+    // Xorg does exactly this for an all-default keymap (xkb.c:1538-1549,
+    // 1428-1429): first = min_key_code, n = the full keycode range,
+    // total = 0. Offsets 25/26/27 per `xkbGetMapReply` in XKBproto.h.
+    if include_key_behaviors {
+        r[25] = min_kc; // firstKeyBehavior
+        r[26] = n_keys; // nKeyBehaviors — covers full range
+        // [27] totalKeyBehaviors = 0 — empty section, no body bytes
+    }
     if include_explicit {
         r[28] = min_kc; // firstKeyExplicit; empty section
     }
@@ -2661,10 +2694,10 @@ mod tests {
         assert!(min_kc >= 8);
         let n_keys = max_kc - min_kc + 1;
 
-        // present advertises every required map part — xkbcommon's
-        // get_map_required_components is a subset of 0xDF.
+        // present advertises every map part we emit, including
+        // KeyBehaviors (bit 5, 0x20) — see XKB_MAP_PARTS_EMITTED.
         let present = u16::from_le_bytes([r[12], r[13]]);
-        assert_eq!(present & 0xDF, 0xDF);
+        assert_eq!(present & 0xFF, 0xFF);
 
         // KeyTypes: the derived table — Xlib's XkbAllocClientMap rejects
         // nTypes < XkbNumRequiredTypes (= 4) with BadValue, so the table
@@ -2698,6 +2731,129 @@ mod tests {
         assert_eq!(r[31], min_kc, "firstModMapKey = min_kc");
         assert_eq!(r[32], n_keys, "nModMapKeys = full range");
         assert!(r[33] <= r[32], "totalModMapKeys ≤ nModMapKeys");
+    }
+
+    /// GH #150: libX11 allocates `xkb->server->behaviors` from the
+    /// `present` KeyBehaviors bit alone, so a reply that clears the bit
+    /// leaves that array NULL while `XkbGetUpdatedMap` still returns
+    /// Success — Barrier then segfaults on `server->behaviors[9]`.
+    /// Xorg sets the bit and emits an EMPTY section: `firstKeyBehavior
+    /// = min_key_code`, `nKeyBehaviors` = the keycode range,
+    /// `totalKeyBehaviors = 0`, and no body bytes (xkb.c:1538-1549 and
+    /// the `totalKeyBehaviors > 0` guard in XkbSendMap, xkb.c:1428).
+    ///
+    /// Asserted against the raw wire bytes at the offsets of
+    /// `xkbGetMapReply` in XKBproto.h (verified on this box:
+    /// present=12, firstKeyBehavior=25, nKeyBehaviors=26,
+    /// totalKeyBehaviors=27, sz=40) — deliberately not via our own
+    /// decoder, which would agree with a wrong encoder.
+    #[test]
+    fn get_map_advertises_empty_key_behaviors_section() {
+        let km = test_keymap();
+
+        // Baseline: the reply without KeyBehaviors requested at all.
+        let without = reply_get_map_for_parts(&km, XKB_MAP_PARTS_EMITTED & !(1 << 5));
+        assert_eq!(
+            u16::from_le_bytes([without[12], without[13]]) & (1 << 5),
+            0,
+            "control: bit 5 clear when KeyBehaviors is not requested"
+        );
+        assert_eq!(without[25], 0, "control: firstKeyBehavior zero");
+        assert_eq!(without[26], 0, "control: nKeyBehaviors zero");
+        assert_eq!(without[27], 0, "control: totalKeyBehaviors zero");
+
+        let r = reply_get_map(&km);
+        let min_kc = r[10];
+        let max_kc = r[11];
+        let n_keys = max_kc - min_kc + 1;
+
+        // present (offset 12..14) carries KeyBehaviors, bit 5 = 0x20.
+        let present = u16::from_le_bytes([r[12], r[13]]);
+        assert_eq!(
+            present & 0x20,
+            0x20,
+            "present must carry XkbKeyBehaviorsMask (bit 5)"
+        );
+
+        // The three header bytes, at their real offsets.
+        assert_eq!(r[25], min_kc, "firstKeyBehavior = minKeyCode");
+        assert_eq!(r[26], n_keys, "nKeyBehaviors = full keycode range");
+        assert_eq!(r[27], 0, "totalKeyBehaviors = 0 (empty section)");
+
+        // Adjacent fields must be untouched by the new writes.
+        assert_eq!(r[24], n_keys, "nKeyActs (offset 24) unchanged");
+        assert_eq!(r[28], min_kc, "firstKeyExplicit (offset 28) unchanged");
+
+        // No section body: the reply length is byte-for-byte what it
+        // was before KeyBehaviors joined XKB_MAP_PARTS_EMITTED.
+        assert_eq!(
+            r.len(),
+            without.len(),
+            "an empty KeyBehaviors section adds no bytes to the reply"
+        );
+        let length_words = u32::from_le_bytes([r[4], r[5], r[6], r[7]]) as usize;
+        assert_eq!(length_words * 4 + 32, r.len(), "length field consistent");
+        assert_eq!(
+            u32::from_le_bytes([without[4], without[5], without[6], without[7]]),
+            length_words as u32,
+            "reply length word unchanged by the KeyBehaviors header"
+        );
+
+        // A client that asks for KeyBehaviors alone gets the bit back.
+        let body = get_map_request_body(1 << 5, 0);
+        let only = reply_get_map_for_request(&km, &body);
+        assert_eq!(
+            u16::from_le_bytes([only[12], only[13]]),
+            1 << 5,
+            "a KeyBehaviors-only request is answered with just that bit"
+        );
+        assert_eq!(only[25], min_kc, "firstKeyBehavior = minKeyCode");
+        assert_eq!(only[26], n_keys, "nKeyBehaviors = full keycode range");
+        assert_eq!(only[27], 0, "totalKeyBehaviors = 0");
+        assert_eq!(only.len(), 40, "empty sections only: bare 40-byte reply");
+    }
+
+    /// GetKbdByName embeds `reply_get_map` verbatim as its first nested
+    /// block, so the #150 fix must show up there too.
+    #[test]
+    fn get_kbd_by_name_map_block_carries_key_behaviors() {
+        let km = test_keymap();
+        let map = reply_get_map(&km);
+        let rmlvo = crate::kms::core::XkbRmlvo {
+            rules: "evdev".into(),
+            model: "pc105".into(),
+            layout: "us".into(),
+            variant: String::new(),
+            options: None,
+        };
+        let mut next_atom = 1u32;
+        let gbn = reply_get_kbd_by_name(
+            &km,
+            &rmlvo,
+            GBN_TYPES | GBN_CLIENT_SYMBOLS | GBN_SERVER_SYMBOLS,
+            0,
+            true,
+            &mut |_name| {
+                next_atom += 1;
+                next_atom
+            },
+        );
+        // The nested GetMap reply starts right after GetKbdByName's own
+        // 32-byte generic header + 4 bytes of GBN fields... rather than
+        // assume, locate it by searching for the exact map block.
+        let start = gbn
+            .windows(map.len())
+            .position(|w| w == map.as_slice())
+            .expect("GetKbdByName must embed the GetMap reply verbatim");
+        let blk = &gbn[start..start + map.len()];
+        assert_eq!(
+            u16::from_le_bytes([blk[12], blk[13]]) & 0x20,
+            0x20,
+            "embedded GetMap block carries XkbKeyBehaviorsMask"
+        );
+        assert_eq!(blk[25], blk[10], "firstKeyBehavior = minKeyCode");
+        assert_eq!(blk[26], blk[11] - blk[10] + 1, "nKeyBehaviors = range");
+        assert_eq!(blk[27], 0, "totalKeyBehaviors = 0");
     }
 
     #[test]
