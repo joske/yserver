@@ -63,17 +63,20 @@ mod tests {
     #[test]
     fn feature_suffix_default_build() {
         assert_eq!(feature_list(), "tcp-transport,xdmcp");
+        assert!(line().ends_with(" features=[tcp-transport,xdmcp]"));
     }
 
     #[cfg(all(feature = "tcp-transport", not(feature = "xdmcp")))]
     #[test]
     fn feature_suffix_tcp_transport_only() {
         assert_eq!(feature_list(), "tcp-transport");
+        assert!(line().ends_with(" features=[tcp-transport]"));
     }
 
     #[cfg(not(feature = "tcp-transport"))]
     #[test]
     fn feature_suffix_no_default_features() {
         assert_eq!(feature_list(), "");
+        assert!(line().ends_with(" features=[]"));
     }
 }
