@@ -11,11 +11,12 @@ whole point of the feature is a build nobody exercises by habit, so a step that
 "will be fixed by the next one" is a step that ships broken to whoever builds
 minimally in the meantime.
 
-The one ordering constraint that is not obvious: **step 3 must not start until
-step 2's stub is complete.** Gating the listener while the core loop is still
-half-gated leaves an intermediate commit where `run_core` has some `cfg`s and
-some not — the inter-commit state trap, and the exact scattering the design
-exists to prevent.
+This is why steps 2 and 3 are each **one commit** rather than a gating step
+followed by a validation step. Splitting them produces an intermediate commit
+where a minimal binary accepts `-query` or `-listen tcp` and silently comes up
+without it — the inter-commit state trap, and a direct violation of the
+design's "fail loudly, never silently ignore" rule. Each step gates a feature
+and teaches the binary to refuse that feature's options in the same breath.
 
 ## Prerequisites
 
@@ -37,60 +38,68 @@ master, since no code is conditional yet. Then
 later exclusion is real, and it is cheapest to make now while nothing else
 could explain a failure.
 
-## Step 2 — gate the XDMCP modules, add the complete stub
+## Step 2 — gate XDMCP: modules, stub, entry point, tests, and its startup error
 
-`#[cfg(feature = "xdmcp")]` on `yserver-protocol`'s `xdmcp` module and
-`yserver-core`'s `core_loop::xdmcp`. Add the feature-off stub: the ten methods
-in the design's table with exactly those inert results, `XDMCP_TOKEN`, and an
-`XdmcpOutcome` retaining both `Reset` and `Terminate`.
+One commit, because the pieces are not separable without leaving a build that
+either does not compile or silently ignores an option.
 
-**Proof.** The acceptance criterion is structural, not behavioural:
-`git diff` on `crates/yserver-core/src/core_loop/run.rs` must be **empty**. If
-that file changed, the stub is incomplete and the design has already failed.
-Beyond that: `--no-default-features` builds, and the 5,291 lines are gone —
-check with `cargo llvm-lines` or simply that the modules are absent from the
-build plan.
+- `#[cfg(feature = "xdmcp")]` on `yserver-protocol`'s `xdmcp` module and
+  `yserver-core`'s `core_loop::xdmcp`.
+- The feature-off stub: the ten methods in the design's table with exactly
+  those inert results, `XDMCP_TOKEN`, and an `XdmcpOutcome` keeping both
+  `Reset` and `Terminate`.
+- **`build_xdmcp_service` both ways.** It unconditionally does
+  `use yserver_core::core_loop::{XdmcpMode, XdmcpService, XdmcpSetup};`
+  (`crates/yserver/src/lib.rs:129`), so gating the core module without gating
+  this breaks the minimal build outright. The feature-off version returns
+  `Ok(None)` when no XDMCP option was given and **errors when one was** — the
+  error belongs here, not in a later step, or this commit ships a minimal
+  binary that accepts `-query` and silently does nothing.
+- **The XDMCP test gating**, every site the design names. Those tests reference
+  the now-gated path and will not compile otherwise.
 
-## Step 3 — gate listener creation
+**Proof.** The acceptance criterion is structural: `git diff` on
+`crates/yserver-core/src/core_loop/run.rs` must be **empty**. If that file
+changed, the stub is incomplete and the design has already failed. Then all
+three configurations build and test, and a minimal binary given `-query` fails
+with the feature message.
 
-`#[cfg(feature = "tcp-transport")]` on the TCP listener bind only.
-`Transport::Tcp` stays compiled in every configuration.
+## Step 3 — gate the TCP listener, its tests, and its startup error
+
+One commit, for the same reason. Gating the bind without the validation leaves
+a minimal binary that accepts `-listen tcp` and comes up unix-only without
+saying so, which is precisely the "fail loudly, never silently ignore" rule the
+design turns on.
+
+- `#[cfg(feature = "tcp-transport")]` on listener creation only.
+  `Transport::Tcp` stays compiled in every configuration.
+- `tcp_tests` becomes `#[cfg(all(test, feature = "tcp-transport"))]`.
+- `-listen tcp` without the feature fails at startup.
 
 **Proof.** `grep -c 'cfg(feature = "tcp-transport")'` over `transport.rs`,
-`run.rs` and `auth.rs` is **zero** — the gate belongs at the bind site alone.
-A minimal build cannot bind a TCP socket; a default build's existing TCP tests
-still pass unchanged.
+`run.rs` and `auth.rs` is **zero** — the gate belongs at the bind site alone. A
+minimal build cannot bind a TCP socket and says so; a default build's TCP tests
+pass unchanged.
 
-## Step 4 — startup errors, asserted by message
+Both startup errors are asserted by **message text**, not merely by failing. A
+test that checks only for an error passes equally well when the option becomes
+unrecognised, which is the failure these steps exist to prevent.
 
-`-listen tcp` without `tcp-transport` and `-query`/`-broadcast`/`-indirect`
-without `xdmcp` fail at startup. The parser stays unconditional, so `-query` in
-a minimal build reports the feature, never "unknown option".
-
-**Proof.** Tests assert the **message text**, not merely that startup failed —
-a test that only checks for an error passes just as well when the option
-becomes unrecognised, which is the failure mode this step exists to prevent.
-One test per option group, in the minimal configuration.
-
-## Step 5 — advertise the feature set, and use it
+## Step 4 — advertise the feature set
 
 `version::line()` gains the machine-readable suffix in the design's exact
 format (`features=[tcp-transport,xdmcp]`, alphabetical, no spaces, present even
 when empty). The two feature-dependent recipes build with `--features`
-explicitly rather than relying on `default`. `tools/vng-shot.sh --binary` reads
-the suffix and fails with an actionable message.
+explicitly rather than relying on `default`.
 
-**Proof.** A test pins the format for all three configurations, including the
-empty case — the parser in `vng-shot.sh` is the consumer and must not be
-handed prose. Then `vng-shot.sh --binary` against a deliberately minimal
-binary produces the actionable error rather than a connection timeout.
+**Proof.** A test pins the format in all three configurations, including the
+empty case. Note `tools/vng-shot.sh` is **not** a consumer — see the design; it
+runs unix-only and a minimal binary is valid there.
 
-## Step 6 — test gating, CI, docs
+## Step 5 — CI matrix and documentation
 
-Apply the narrowest-feature rule to every site the design names, including the
-`lib.rs:940` exception that stays ungated. Add the three-configuration CI
-matrix, each running `clippy --all-targets -- -D warnings` **and**
-`test --all-targets`.
+The three-configuration matrix, each running
+`clippy --all-targets -- -D warnings` **and** `test --all-targets`.
 
 Documentation lands **here, with the code** — not earlier. A man page that
 describes a feature flag before the flag exists is simply wrong for everyone
@@ -113,9 +122,9 @@ briefly. The existing `XDMCP AND TRUST` section (`:279`) is the natural home
 for the XDMCP half. Prose is jos's; this plan only fixes where it goes.
 
 **Proof.** The matrix is green. Then the check that matters: temporarily break
-something only a minimal build would notice — say, a `cfg`-gated `use` that is
-unused without the feature — and confirm CI catches it. A matrix nobody has
-seen fail is a matrix nobody knows works.
+something only a minimal build would notice — a `cfg`-gated `use` left unused
+without the feature — and confirm CI catches it. A matrix nobody has seen fail
+is a matrix nobody knows works.
 
 ## Hazards
 

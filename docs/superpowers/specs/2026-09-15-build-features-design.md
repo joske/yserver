@@ -240,11 +240,12 @@ cargo build --release --features xdmcp --bin yserver
 so they stay correct if the default set ever changes or a user has configured
 otherwise, rather than silently depending on `default`.
 
-The one place a check earns its place is `tools/vng-shot.sh --binary`, which
-runs a binary it did **not** build — an A/B against another commit or another
-worktree. A minimal binary there produces a confusing connection failure with
-no hint of the cause, so that path should read the advertised feature set and
-fail with an actionable message.
+`tools/vng-shot.sh --binary` was proposed as a consumer of the feature suffix
+and is **not** one: it starts `'$binary' 7` and exports `DISPLAY=:7`, using the
+unix socket, and passes neither `-listen tcp` nor any XDMCP option. A minimal
+binary is perfectly valid there, so rejecting one would invent a regression and
+undermine the feature's purpose. The version suffix remains useful for external
+tooling, packagers and diagnostics; vng-shot simply is not a caller.
 
 The man page and `docs/setup.md` describe `-listen tcp` and the XDMCP options
 without qualification today; both need a note that they require the
@@ -260,7 +261,7 @@ corresponding feature.
 4. Startup errors for `-listen tcp` / `-query` and friends, with tests
    asserting the **message**, not merely the failure.
 5. Feature set in `version::line()`; `--features` on the two recipes' own
-   builds; the check in `vng-shot.sh --binary`.
+   builds.
 6. CI matrix, man page and `docs/setup.md`.
 
 ## Do not
