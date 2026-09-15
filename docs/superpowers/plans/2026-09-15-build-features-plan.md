@@ -48,21 +48,35 @@ either does not compile or silently ignores an option.
 - The feature-off stub: the ten methods in the design's table with exactly
   those inert results, `XDMCP_TOKEN`, and an `XdmcpOutcome` keeping both
   `Reset` and `Terminate`.
+- **The rejection goes in `validate_tcp_startup`**, under
+  `#[cfg(not(feature = "xdmcp"))]`, not in `build_xdmcp_service`. This is the
+  load-bearing detail. `validate_tcp_startup` runs at `lib.rs:195`, before
+  hardware or sockets; `build_xdmcp_service` runs at `:498`, *after*
+  `bind_client_listeners` and after KMS initialisation. Rejecting there would
+  mean `-query … -listen tcp` on a no-XDMCP binary initialises the GPU, binds
+  a TCP listener, and only then fails — briefly opening TCP on a binary that
+  cannot serve XDMCP at all, and recreating precisely the startup-order defect
+  `dc417cfd` fixed.
 - **`build_xdmcp_service` both ways.** It unconditionally does
   `use yserver_core::core_loop::{XdmcpMode, XdmcpService, XdmcpSetup};`
   (`crates/yserver/src/lib.rs:129`), so gating the core module without gating
   this breaks the minimal build outright. The feature-off version returns
-  `Ok(None)` when no XDMCP option was given and **errors when one was** — the
-  error belongs here, not in a later step, or this commit ships a minimal
-  binary that accepts `-query` and silently does nothing.
+  `Ok(None)` for no XDMCP option; it may also error defensively for an option,
+  but it is the second line of defence, never the guard.
 - **The XDMCP test gating**, every site the design names. Those tests reference
   the now-gated path and will not compile otherwise.
 
 **Proof.** The acceptance criterion is structural: `git diff` on
 `crates/yserver-core/src/core_loop/run.rs` must be **empty**. If that file
 changed, the stub is incomplete and the design has already failed. Then all
-three configurations build and test, and a minimal binary given `-query` fails
-with the feature message.
+three configurations build and test.
+
+The behavioural test is **`-query <host> -listen tcp` in the
+`--no-default-features --features tcp-transport` configuration**: it must fail
+in `validate_tcp_startup`, before any listener is bound. That combination is
+the one that distinguishes an early guard from a late one — with `-listen tcp`
+alone valid in that build, a late rejection would have already bound the
+socket.
 
 ## Step 3 — gate the TCP listener, its tests, and its startup error
 

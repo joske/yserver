@@ -106,8 +106,11 @@ whether TCP was compiled in.
 `yserver::version::line()` feeds both `--version` and the startup banner, so it
 is the one place to append the built feature set.
 
-The suffix is a **stable, machine-readable** field, not prose, because
-`vng-shot.sh` parses it:
+The suffix is a **stable, machine-readable** field, not prose, because tooling
+reads it — packagers verifying what they shipped, recipes checking a foreign
+binary, a bug report quoting a build. Anything that has to pattern-match a
+sentence whose wording is unconstrained will break the first time the sentence
+is reworded:
 
 ```
 features=[tcp-transport,xdmcp]
