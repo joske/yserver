@@ -392,8 +392,21 @@ struct ScanoutM0Shape {
     plane_offset: u64,
     plane_pitch: u32,
     offsets: (i16, i16),
-    valid_region: u32,
-    update_region: u32,
+    /// Whether the Present carried a valid / update region, NOT which one.
+    ///
+    /// Issue #146: these were the region XIDs. A compositor creates a fresh
+    /// update region every frame (`update=0x4144dd` → `0x4144eb` →
+    /// `0x4144f9` in the reporter's log), so putting the XID in the dedup key
+    /// made the key change on every Present by construction — and
+    /// `scanout_m0 shape`, which is supposed to log only when the shape
+    /// CHANGES, logged once per composited frame instead.
+    ///
+    /// Only the zero-ness is ever consumed: `regions_ok` tests
+    /// `valid_region_xid == 0 && update_region_xid == 0 && update_is_full`.
+    /// The identities are printed in the log line straight from the
+    /// candidate, so nothing is lost by keeping them out of the key.
+    valid_region_present: bool,
+    update_region_present: bool,
     update_is_full: bool,
 }
 
@@ -3214,8 +3227,8 @@ impl KmsBackend {
             plane_offset,
             plane_pitch,
             offsets: (candidate.x_off, candidate.y_off),
-            valid_region: candidate.valid_region_xid,
-            update_region: candidate.update_region_xid,
+            valid_region_present: candidate.valid_region_xid != 0,
+            update_region_present: candidate.update_region_xid != 0,
             update_is_full: candidate.update_is_full,
         };
         let authoritative = !matches!(target, ScanoutM0Target::Other);
@@ -3316,7 +3329,7 @@ impl KmsBackend {
                     recent.pop_front();
                 }
                 recent.push_back(source_id);
-                log::info!(
+                log::debug!(
                     "scanout_m0 new_buffer dst_host={:#x} source_id={} rotation_depth={}",
                     candidate.paint_dst_host_xid,
                     source_id.as_u64(),
@@ -3343,7 +3356,7 @@ impl KmsBackend {
             } else {
                 String::new()
             };
-            log::info!(
+            log::debug!(
                 "scanout_m0 shape client={} present={} src_client={:#x} src_host={:#x} \
                  dst_client={:#x} dst_host={:#x} completion_host={:#x} source_id={:?} \
                  target={target:?} coverage={coverage:?} rect={rect:?} root={root_extent:?} \
@@ -3382,7 +3395,7 @@ impl KmsBackend {
                 .insert(candidate.paint_dst_host_xid, shape);
         }
         if diag.interval_start.elapsed() >= std::time::Duration::from_secs(1) {
-            log::info!(
+            log::debug!(
                 "scanout_m0_summary presents={} authoritative={} root={} output={} \
                  distinct_sources={} reject_server_owned={} reject_target={} \
                  reject_geometry={} reject_offsets={} reject_regions={} \
