@@ -10,6 +10,25 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Three configurations because two would not catch the interesting
+          # failure (design: docs/superpowers/specs/2026-09-15-build-features-design.md#ci):
+          # default features; `--no-default-features` (unix-only); and
+          # `--no-default-features --features tcp-transport`, which proves
+          # tcp-transport does not drag xdmcp back in. Only clippy and test
+          # are matrixed — the steps below that are independent of feature
+          # gating (fmt, man pages, install-smoke, the version-stamp check,
+          # the lavapipe render tests) run once, on the default leg, to avoid
+          # tripling unrelated CI time for zero extra coverage.
+          - name: default
+            flags: ""
+          - name: no-default-features
+            flags: "--no-default-features"
+          - name: tcp-transport-only
+            flags: "--no-default-features --features tcp-transport"
     steps:
       - uses: actions/checkout@v7
       - name: Install packages needed for build
@@ -28,37 +47,47 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
       - name: Check formatting
+        if: matrix.name == 'default'
         run: cargo +nightly fmt -- --check
       - name: Clippy
         # TODO: also enable `-W clippy::pedantic` once the existing pedantic
         # warnings are cleaned up in a follow-up pass.
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets ${{ matrix.flags }} -- -D warnings
       - name: Build
+        if: matrix.name == 'default'
         run: cargo build --locked
       - name: Run tests
-        run: cargo test --all-targets --locked
+        # --all-targets is what reaches feature-gated test code (e.g. the
+        # tcp_tests module, cfg'd on `feature = "tcp-transport"`); without it
+        # this leg would build the gated code but never execute it.
+        run: cargo test --all-targets ${{ matrix.flags }} --locked
       - name: Lint the shell scripts
         # starty is installed on every supported platform, so it must work
         # beyond bash.
+        if: matrix.name == 'default'
         run: |
           shellcheck -s sh starty tools/install-smoke.sh
           dash ./starty --help > /dev/null
       - name: Render man pages
+        if: matrix.name == 'default'
         run: PREFIX=/usr just man
       - name: Check man pages render without roff warnings
         # `man --warnings` prints to stderr but still exits 0, so assert
         # stderr is empty rather than trusting the exit status.
+        if: matrix.name == 'default'
         run: |
           for p in yserver starty; do
             err=$(man --warnings -l "target/man/$p.1" 2>&1 >/dev/null)
             if [ -n "$err" ]; then echo "roff warnings in $p.1:"; echo "$err"; exit 1; fi
           done
       - name: Verify the install contract
+        if: matrix.name == 'default'
         run: just install-smoke
       - name: Verify the version-stamp override
         # Two builds in the SAME target dir with different values — what
         # catches a missing rerun-if-env-changed. A clean one-shot build
         # passes either way.
+        if: matrix.name == 'default'
         run: |
           set -eu
           YSERVER_GIT_COMMIT=deadbeefcafe cargo build --locked --bin yserver
@@ -73,6 +102,7 @@ jobs:
         # the `#[ignore = "needs live Vulkan ICD"]` render tests run on
         # it. They self-skip if no Vulkan device is present. KMS/scanout
         # tests aren't in this set (no /dev/dri on the runner).
+        if: matrix.name == 'default'
         env:
           YSERVER_ALLOW_SOFTWARE_VULKAN: "1"
         run: cargo test -p yserver --lib --locked -- --ignored
