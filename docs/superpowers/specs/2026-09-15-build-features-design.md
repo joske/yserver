@@ -4,6 +4,8 @@
 > be made a crate feature? I would actually prefer disabling this at compile
 > time"), agreed by jos as a follow-up to keep #148 from growing further.
 > Shape settled with codex 2026-09-15. Precedent: Xorg's `--disable-xdmcp`.
+> Implementation plan:
+> [`2026-09-15-build-features-plan.md`](../plans/2026-09-15-build-features-plan.md).
 
 ## Problem
 
