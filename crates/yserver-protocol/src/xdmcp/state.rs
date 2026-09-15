@@ -657,6 +657,29 @@ impl XdmcpMachine {
     /// `state = XDM_INIT_STATE` is the reset target, and it is the
     /// *configured* mode — see [`InitialMode`]. Under `-once` the trailing
     /// `send_packet()` is suppressed; see divergence 3 in the module docs.
+    ///
+    /// The trailing `send_packet()` looks like it double-queries, because the
+    /// reset that `ResetGeneration` triggers ends in `XdmcpService::restart`,
+    /// which queries again on the new generation. Xorg does exactly the same
+    /// thing, and both halves are load-bearing there:
+    ///
+    /// ```c
+    /// /* os/xdmcp.c — XdmcpDeadSession */
+    /// dispatchException |= (OneSession ? DE_TERMINATE : DE_RESET);
+    /// TimerCancel(xdmcp_timer);
+    /// timeOutRtx = 0;
+    /// send_packet();              /* <- in the OLD generation */
+    ///
+    /// /* os/xdmcp.c — xdmcp_reset(), reached from XdmcpReset() at
+    ///    os/connection.c:344, i.e. after the reset */
+    /// xdmcp_timer = TimerSet(NULL, 0, 0, XdmcpTimerNotify, NULL);
+    /// send_packet();              /* <- in the NEW generation */
+    /// ```
+    ///
+    /// The first query carries no cookie — a `Query` is unauthenticated, and
+    /// the credential is only minted at `Accept`/`Manage` — so emitting it
+    /// before the boundary costs nothing and loses nothing. Raised as a
+    /// finding in review on #148 and rejected on this evidence.
     fn dead_session(&mut self, cause: RenewCause) -> Vec<XdmcpAction> {
         self.state = self.config.initial_mode.state();
         self.timeout_rtx = 0;

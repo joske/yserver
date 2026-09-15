@@ -327,9 +327,37 @@ impl XdmcpService {
     /// running: in XDMCP mode a TCP client can only have been authorized by
     /// the session credential (`AuthState::xdmcp`), so one that did not
     /// become the session and has no session to join was admitted by a
-    /// credential that is no longer the running session's. Local clients
-    /// are unaffected — a unix client is not authorized by the XDMCP cookie
-    /// and Xorg's `XdmcpOpenDisplay` simply ignores it.
+    /// credential that is no longer the running session's. A local client is
+    /// never a loser — it was authorized by the ordinary cookie, not the
+    /// session credential, so an abandoned offer says nothing about it.
+    ///
+    /// `is_local` gates the DROP only, never the machine event, and that is
+    /// deliberate. An earlier version of this comment claimed Xorg's
+    /// `XdmcpOpenDisplay` ignores unix clients; it does not. `ClientAuthorized`
+    /// calls it for every client that completes authorization, with no
+    /// locality test at all:
+    ///
+    /// ```c
+    /// /* os/connection.c:581 — no transport or locality condition */
+    /// XdmcpOpenDisplay(priv->fd);
+    ///
+    /// /* os/xdmcp.c:632 — the state IS the whole guard */
+    /// XdmcpOpenDisplay(int sock)
+    /// {
+    ///     if (state != XDM_AWAIT_MANAGE_RESPONSE)
+    ///         return;
+    ///     state = XDM_RUN_SESSION;
+    ///     ...
+    ///     sessionSocket = sock;
+    /// }
+    /// ```
+    ///
+    /// So a unix client that completes setup while a `Manage` is outstanding
+    /// becomes the session client on Xorg too. Feeding the event
+    /// unconditionally reproduces that; returning early for local clients
+    /// would be a deliberate divergence, not a bug fix, and is not one this
+    /// port makes. Raised as a finding in review on #148 and rejected on this
+    /// evidence: the oracle is `../xserver`, not the prose around it.
     #[must_use]
     pub fn note_client_established(
         &mut self,
