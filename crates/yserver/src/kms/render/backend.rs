@@ -510,7 +510,7 @@ impl ScanoutM1ProbeCache {
 
     fn clear(&mut self, reason: &'static str) {
         if !self.entries.is_empty() {
-            log::info!(
+            log::debug!(
                 "scanout_m1: dropping {} cached probe framebuffer(s): {reason}",
                 self.entries.len()
             );
@@ -2004,7 +2004,7 @@ impl KmsBackend {
         };
         match self.submit_direct_frame(&mut successor) {
             Ok(()) => {
-                log::info!(
+                log::debug!(
                     "scanout_m2: submitted queued direct successor source_id={} present_id={} outputs={}",
                     successor.source_id.as_u64(),
                     successor.candidate.present_id,
@@ -2092,7 +2092,7 @@ impl KmsBackend {
         self.scanout_m2.unflip_shadow_ready = false;
         self.scanout_m2.degraded_composed_unflip = false;
         self.finish_deferred_cow_release();
-        log::info!("scanout_m2: stopped after scanout replacement: {reason}");
+        log::debug!("scanout_m2: stopped after scanout replacement: {reason}");
     }
 
     /// Restore the current composed scanout after a topology operation had to
@@ -2347,7 +2347,7 @@ impl KmsBackend {
             )
             .map_err(|error| io::Error::other(format!("scanout M2 lazy COW submit: {error:?}")))?;
         self.scanout_m2.unflip_shadow_ready = true;
-        log::info!(
+        log::debug!(
             "scanout_m2: lazily materialized direct source_id={} into fallback_target={} for unflip",
             source_id.as_u64(),
             target.backing_id().as_u64()
@@ -2399,7 +2399,7 @@ impl KmsBackend {
                 frame.candidate.paint_dst_host_xid,
             )
         };
-        log::info!(
+        log::debug!(
             "scanout_m2: submitted atomic composed unflip outputs={} reason={} last_reason={} pending={:?} current={:?}",
             planes.len(),
             self.scanout_m2.unflip_reason.unwrap_or("unknown"),
@@ -2432,7 +2432,7 @@ impl KmsBackend {
                 self.scene.invalidate_all_scanout_damage();
                 self.scene.mark_scene_structure_dirty();
                 self.scanout_m2.degraded_composed_unflip = false;
-                log::info!("scanout_m2: composed unflip retired on all outputs");
+                log::debug!("scanout_m2: composed unflip retired on all outputs");
             }
             if degraded {
                 // The planes were replaced by the scene's own per-output
@@ -2478,7 +2478,7 @@ impl KmsBackend {
             if let Some(previous) = self.scanout_m2.current.replace(presented) {
                 self.release_direct_frame(previous);
             }
-            log::info!(
+            log::debug!(
                 "scanout_m2: direct frame retired on all outputs source_id={}",
                 self.scanout_m2
                     .current
@@ -2936,7 +2936,7 @@ impl KmsBackend {
             })
             .collect();
         if !scanout_m1_outputs_cover_root(root, &output_geometry) {
-            log::info!(
+            log::debug!(
                 "scanout_m1: source_id={} skipped: active outputs do not exactly tile root {:?}: {:?}",
                 source_id.as_u64(),
                 root,
@@ -3012,7 +3012,7 @@ impl KmsBackend {
                     && !layout.output.scanout_modifiers.contains(&modifier)
             })
         {
-            log::info!(
+            log::debug!(
                 "scanout_m1: source_id={} skipped: incompatible metadata fourcc={fourcc:#010x} \
                  vk_format={vk_format:?} modifier={modifier:#x} planes={plane_count} \
                  size={}x{} depth={depth} bpp={bpp} pitch={pitch}",
@@ -3072,7 +3072,7 @@ impl KmsBackend {
         );
         match result {
             Ok(crate::drm::modeset::DirectScanoutTestResult::Accepted(framebuffer)) => {
-                log::info!(
+                log::debug!(
                     "scanout_m1: TEST_ONLY passed source_id={} drawable_host={:#x} \
                      root={}x{} modifier={modifier:#x} pitch={pitch} outputs={:?}; \
                      live scanout unchanged",
@@ -3088,7 +3088,7 @@ impl KmsBackend {
                 self.scanout_m0.m1_probe_pass = self.scanout_m0.m1_probe_pass.saturating_add(1);
             }
             Ok(crate::drm::modeset::DirectScanoutTestResult::Rejected(error)) => {
-                log::info!(
+                log::debug!(
                     "scanout_m1: TEST_ONLY rejected source_id={} drawable_host={:#x}: {error}",
                     source_id.as_u64(),
                     candidate.src_host_xid,
@@ -17803,7 +17803,7 @@ impl Backend for KmsBackend {
                         && composed_outputs.len() == self.platform.outputs.len()
                     {
                         self.scanout_m2.reentry_blocked_until_composed = false;
-                        log::info!(
+                        log::debug!(
                             "scanout_m2: composed fallback submitted; re-entry barrier cleared"
                         );
                     }
@@ -17902,7 +17902,7 @@ impl Backend for KmsBackend {
         {
             self.scanout_m2.unflip_fallback_source = None;
             self.scanout_m2.unflip_shadow_ready = true;
-            log::info!(
+            log::debug!(
                 "scanout_m2: normal Present Copy prepared composed fallback source=0x{src_pixmap_xid:x}"
             );
         }
@@ -18077,7 +18077,7 @@ impl Backend for KmsBackend {
         self.scanout_m2.unflip_last_reason = None;
         self.scanout_m2.unflip_fallback_source = None;
         self.scanout_m2.unflip_shadow_ready = false;
-        log::info!(
+        log::debug!(
             "scanout_m2: live direct submit source_id={} present_id={} outputs={}",
             source_id.as_u64(),
             present_id,
