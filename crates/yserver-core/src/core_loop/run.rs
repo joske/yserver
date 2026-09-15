@@ -4357,10 +4357,12 @@ mod tests {
     /// what these prove is the *plumbing* — the UDP socket really is in
     /// this poll set, its readiness really is dispatched, and the reset
     /// hook really runs after the new generation is installed.
+    #[cfg(feature = "xdmcp")]
     struct XdmcpManagerFixture {
         socket: std::net::UdpSocket,
     }
 
+    #[cfg(feature = "xdmcp")]
     impl XdmcpManagerFixture {
         fn new() -> Self {
             let socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -4408,6 +4410,7 @@ mod tests {
     /// The socket is registered with the core poller, its readiness is
     /// dispatched, and a reset re-queries — from the loop, not from a
     /// hand-driven service.
+    #[cfg(feature = "xdmcp")]
     #[test]
     fn the_xdmcp_socket_is_polled_and_a_reset_re_queries() {
         use crate::backend::recording::RecordingBackend;
@@ -4470,6 +4473,7 @@ mod tests {
     /// A `Terminate` from the machine ends the loop cleanly — the other
     /// half of the outcome wiring. `Failed` gets there in three packets
     /// instead of the 126 seconds a retransmission timeout would take.
+    #[cfg(feature = "xdmcp")]
     #[test]
     fn an_xdmcp_terminate_ends_the_core_loop() {
         use crate::backend::recording::RecordingBackend;
@@ -4586,6 +4590,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "xdmcp")]
     #[test]
     fn an_orphaned_xdmcp_client_does_not_reset_the_generation() {
         use crate::backend::recording::RecordingBackend;

@@ -24,6 +24,13 @@ pub mod reset;
 pub mod run;
 pub mod sender;
 pub mod setup_thread;
+// The real service, or the inert stub of the same shape — see
+// `xdmcp_stub.rs`. Selecting the module here is what keeps `run.rs` free
+// of any `cfg`.
+#[cfg(feature = "xdmcp")]
+pub mod xdmcp;
+#[cfg(not(feature = "xdmcp"))]
+#[path = "xdmcp_stub.rs"]
 pub mod xdmcp;
 pub mod xi1_focus;
 pub mod xi1_state_notify;
@@ -38,4 +45,6 @@ pub use message::{
 pub use reset::ResetPolicy;
 pub use run::{handle_host_input, run_core};
 pub use sender::{BoundSender, CoreReceiver, CoreSender, NOTIFY_TOKEN, channel};
-pub use xdmcp::{XdmcpMode, XdmcpService, XdmcpSetup};
+pub use xdmcp::XdmcpService;
+#[cfg(feature = "xdmcp")]
+pub use xdmcp::{XdmcpMode, XdmcpSetup};

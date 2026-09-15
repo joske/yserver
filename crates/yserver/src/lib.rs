@@ -93,6 +93,20 @@ fn validate_tcp_startup(
     opts: &launch::LaunchOptions,
     auth: &core_loop::auth::AuthState,
 ) -> io::Result<()> {
+    // Refuse an XDMCP option HERE, and not in `build_xdmcp_service`: this
+    // runs before any hardware is opened and before any socket is bound,
+    // while `build_xdmcp_service` runs after `bind_client_listeners` and
+    // after KMS init. Rejecting there would initialise the GPU and briefly
+    // bind a TCP listener on a binary that cannot serve XDMCP at all —
+    // exactly the startup-order defect `dc417cfd` fixed. The parser stays
+    // unconditional so this reads as "built without", never as a typo.
+    #[cfg(not(feature = "xdmcp"))]
+    if opts.xdmcp.is_some() {
+        return Err(io::Error::other(
+            "this yserver was built without XDMCP support: -query, -broadcast and \
+             -indirect need the `xdmcp` build feature",
+        ));
+    }
     if !opts.tcp_listen {
         // XDMCP without a TCP listener starts happily and can never finish:
         // the manager completes Query/Willing/Request/Accept/Manage over
@@ -125,6 +139,7 @@ fn validate_tcp_startup(
 /// where the display-class default lands: `-class` is left unset by the
 /// parser precisely because a default is only meaningful where the packet
 /// is built (`xdmcp.c:65`, `defaultDisplayClass`).
+#[cfg(feature = "xdmcp")]
 fn build_xdmcp_service(
     opts: &launch::LaunchOptions,
     display: u16,
@@ -149,6 +164,27 @@ fn build_xdmcp_service(
         display_number: display,
     })?;
     Ok(Some(service))
+}
+
+/// The feature-off twin: no XDMCP module is compiled in, so there is no
+/// service to build and no UDP socket to open.
+///
+/// The `Err` arm is a second line of defence only — `validate_tcp_startup`
+/// has already refused the option long before this point, before hardware
+/// or sockets. It exists so a future caller that skipped that check still
+/// cannot come up silently ignoring `-query`.
+#[cfg(not(feature = "xdmcp"))]
+fn build_xdmcp_service(
+    opts: &launch::LaunchOptions,
+    _display: u16,
+) -> io::Result<Option<yserver_core::core_loop::XdmcpService>> {
+    if opts.xdmcp.is_some() {
+        return Err(io::Error::other(
+            "this yserver was built without XDMCP support: -query, -broadcast and \
+             -indirect need the `xdmcp` build feature",
+        ));
+    }
+    Ok(None)
 }
 
 fn bind_client_listeners(
@@ -945,6 +981,7 @@ mod tests {
     }
 
     /// And with one, the socket is opened and the policy follows.
+    #[cfg(feature = "xdmcp")]
     #[test]
     fn an_xdmcp_option_opens_a_socket_and_implies_a_reset() {
         let opts = launch::parse_args(
@@ -956,6 +993,48 @@ mod tests {
         assert_eq!(opts.reset_policy, ResetPolicy::Reset);
         let service = build_xdmcp_service(&opts, 7).unwrap();
         assert!(service.is_some(), "an XDMCP option must open the socket");
+    }
+
+    /// A build without the `xdmcp` feature must refuse `-query` in
+    /// `validate_tcp_startup` — before `bind_client_listeners` and before
+    /// KMS init — and must say the option was BUILT OUT.
+    ///
+    /// `-listen tcp` is deliberately part of the invocation: on its own it
+    /// is valid in a `tcp-transport`-only build, so this is the
+    /// combination that distinguishes an early guard from a late one. A
+    /// test asserting only that it errored would pass just as well if
+    /// `-query` had degraded to "unknown option", which is the failure
+    /// this whole step exists to prevent — hence the message assertions.
+    #[cfg(not(feature = "xdmcp"))]
+    #[test]
+    fn a_build_without_xdmcp_refuses_query_at_startup_validation() {
+        let opts = launch::parse_args(
+            [":7", "-query", "127.0.0.1", "-listen", "tcp"]
+                .into_iter()
+                .map(String::from),
+        )
+        .expect("the argument parser stays unconditional");
+        assert!(
+            opts.xdmcp.is_some(),
+            "-query must still parse, so the error can be about the build"
+        );
+
+        let auth = build_auth_state(&opts);
+        let err = validate_tcp_startup(&opts, &auth)
+            .expect_err("-query must be refused before anything is bound");
+        let message = err.to_string();
+        assert!(
+            message.contains("built without XDMCP support"),
+            "the error must say the option was built out, got: {message}"
+        );
+        assert!(
+            message.contains("-query"),
+            "the error must name the option the operator passed, got: {message}"
+        );
+        assert!(
+            !message.contains("unknown option"),
+            "-query is a known option in a build that simply lacks the feature: {message}"
+        );
     }
 
     #[test]
@@ -1049,6 +1128,7 @@ mod tests {
         assert!(err.to_string().contains("-auth"));
     }
 
+    #[cfg(feature = "xdmcp")]
     #[test]
     fn listen_tcp_with_an_xdmcp_option_needs_no_auth_file() {
         // The stage-1 contradiction: XDMCP has no cookie at startup — it

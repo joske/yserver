@@ -344,6 +344,7 @@ fn tcp_loopback_cookie_setup_and_listener_capabilities() {
 /// `-auth`, because XDMCP is itself the dynamic auth source that satisfies
 /// the stage-1 TCP check. That is the combination `just yserver-xdmcp-hw`
 /// runs, so breaking it would break the hardware path.
+#[cfg(feature = "xdmcp")]
 #[test]
 fn xdmcp_requires_a_tcp_listener_at_startup() {
     let fixture = Fixture::new();
