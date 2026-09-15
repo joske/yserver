@@ -482,6 +482,20 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     };
     log::info!("yserver: listening on unix socket DISPLAY=:{display}");
     let listeners = bind_client_listeners(listener, display, &opts, &auth)?;
+    // XDMCP binds HERE, with the other listeners, and not later.
+    //
+    // It used to be built last — "so an unresolvable manager fails after the
+    // display is known but before the loop takes the thread". The display is
+    // known here too, and building it last meant a bad `-query` host or a
+    // UDP bind failure returned `Err` through `?` from a point where the
+    // input thread, the core channel and the signal handlers were all
+    // already live, and after the parent had been told the server was up.
+    // Every one of those is skipped by `?`; only process exit cleaned them.
+    //
+    // Everything this call can fail on — argument parsing, host resolution,
+    // the UDP bind — depends on nothing but `opts` and `display`, so there
+    // is no reason for it to run after resources it cannot use.
+    let xdmcp = build_xdmcp_service(&opts, display)?;
 
     // Initial composite+flip so the screen has a known frame before any
     // client connects.
@@ -673,15 +687,6 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
                 }
             }
         })?;
-
-    // XDMCP binds BEFORE readiness is signalled. It used to be built after,
-    // "so an unresolvable manager fails after the display is known but
-    // before the loop takes the thread" — but the display is known here
-    // too, and signalling first means a bad `-query` host or a UDP bind
-    // failure told the parent the server was up and only then returned
-    // `Err` through `?`, skipping the shutdown path everything after this
-    // point relies on.
-    let xdmcp = build_xdmcp_service(&opts, display)?;
 
     // Readiness handshake: ServerState is fully constructed, the socket is
     // bound + chmod'd, and the lock is held — we can complete an initial X
