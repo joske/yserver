@@ -32,6 +32,9 @@ how the server is started:
 
 	then log out and back in.
 
+Some options need a build feature that a given binary may not have; those
+entries say so. *--version* reports what this binary was built with.
+
 # OPTIONS
 
 *:*_display_
@@ -61,6 +64,11 @@ how the server is started:
 	TCP is *disabled by default*, as on a modern *Xorg*(1) build. With
 	*-listen tcp* the server binds *0.0.0.0* on port 6000 plus the display
 	number — every interface, not just loopback.
+
+	*-listen tcp* also needs a binary built with the *tcp-transport*
+	feature. A build without it exits at startup with a message naming the
+	feature, rather than coming up silently on the unix socket alone.
+	*-nolisten tcp* is accepted either way.
 
 	*-listen tcp* requires *-auth* with a usable MIT-MAGIC-COOKIE-1 file
 	and refuses to start without one, unless an XDMCP option supplies
@@ -102,6 +110,10 @@ how the server is started:
 	*-indirect* asks it to choose, *-broadcast* asks whoever answers.
 	Ordered and last-wins, so *-query a -broadcast* ends up broadcasting.
 
+	These need a binary built with the *xdmcp* feature. A build without it
+	exits at startup with a message naming the feature, rather than
+	reporting an unknown option.
+
 	These imply *-reset*, and *-once* then implies *-terminate*: one
 	XDMCP session is one server generation, so logging out wipes the
 	session and queries again for the next user.
@@ -135,7 +147,12 @@ how the server is started:
 	exits.
 
 *--version*, *-version*
-	Print the version and the commit it was built from, then exit.
+	Print the version, the commit it was built from and the build features
+	compiled in, then exit. The feature field is stable and
+	machine-readable rather than prose, because tooling reads it:
+	*features=[tcp-transport,xdmcp]*, *features=[tcp-transport]* or
+	*features=[]* — alphabetical, comma-separated, no spaces, always
+	present.
 
 ## ACCEPTED FOR COMPATIBILITY, IGNORED
 

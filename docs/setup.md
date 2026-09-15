@@ -70,6 +70,41 @@ Or in one step, which builds, renders the man pages and installs to
 just install-local
 ```
 
+### Optional build features
+
+Two capabilities are compiled in only when asked for:
+
+| Feature         | Enables                                                         |
+| --------------- | --------------------------------------------------------------- |
+| `tcp-transport` | `-listen tcp`, the TCP listener                                 |
+| `xdmcp`         | `-query`, `-indirect` and `-broadcast`; implies `tcp-transport` |
+
+```sh
+cargo build --release --bin yserver --features tcp-transport
+cargo build --release --bin yserver --features xdmcp
+```
+
+They are off for two different reasons. Listening on TCP widens the
+server's exposure, so it should be an affirmative decision by whoever
+builds the binary — a stronger position than the runtime `-nolisten tcp`
+convention, because the capability is absent rather than merely switched
+off. XDMCP is niche: most deployments never negotiate a session with a
+display manager, and it is several thousand lines that would otherwise
+ship unused.
+
+A build without a feature does not silently ignore the options it covers.
+It exits at startup with a message naming the feature. `-nolisten tcp`
+stays accepted either way, so a display manager's argv needs no
+adjusting.
+
+`yserver --version` ends with the set that was compiled in, as
+`features=[tcp-transport,xdmcp]`, `features=[tcp-transport]` or
+`features=[]`.
+
+`just install-local` builds with neither. To install a build that has
+them, run the `cargo build` above in place of the plain one, then
+`just man` and `just install` as shown earlier.
+
 To run a session you also need `xauth` and `mcookie` at runtime —
 `xorg-xauth` and `util-linux` respectively.
 
@@ -194,7 +229,11 @@ through a UNIX socket on the remote host, so it never touches yserver's TCP
 listener at all, and it encrypts the connection. The TCP listener exists for
 XDMCP, where a display manager hands each session its own cookie.
 
-TCP is off by default, as on a modern Xorg build. To enable it:
+TCP is off at runtime, as on a modern Xorg build, and it is not compiled in at
+all unless the binary was built with the `tcp-transport` feature — see
+[Optional build features](#optional-build-features). Without it, `-listen tcp`
+exits at startup naming the feature. To enable the listener on a binary that
+has it:
 
 ```sh
 yserver :7 -auth /path/to/authority -listen tcp
@@ -242,6 +281,10 @@ XDMCP inverts the usual arrangement. Instead of starting a session locally,
 yserver asks a display manager — possibly on another machine — for one, and
 the manager's greeter and session clients connect *back* to your display over
 TCP. It is the thin-client model, and it is what `-listen tcp` exists for.
+
+This needs a binary built with the `xdmcp` feature — see [Optional build
+features](#optional-build-features). Without it, `-query`, `-indirect` and
+`-broadcast` exit at startup naming the feature.
 
 **The manager must speak XDMCP, and many no longer do.** GNOME's `gdm` has
 removed support entirely. `lightdm` works:
@@ -352,6 +395,13 @@ with no `.git`:
 ```sh
 YSERVER_GIT_COMMIT=<commit> cargo build --locked --release --bin yserver
 ```
+
+The packaging `cargo build` above enables no build features on purpose: a
+distro package ships a unix-socket-only server with no XDMCP, and
+`--version` records that as `features=[]`. Shipping either capability
+means adding `--features tcp-transport` or `--features xdmcp`, which is a
+per-distro policy decision — see
+[Optional build features](#optional-build-features).
 
 Man pages are installed uncompressed and binaries unstripped —
 compression, stripping and debuginfo extraction belong to distro tooling.
