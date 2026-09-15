@@ -15,5 +15,9 @@ mio.workspace = true
 [dev-dependencies]
 proptest = "1"
 
+[features]
+default = []
+xdmcp = ["yserver-protocol/xdmcp"]
+
 [lints]
 workspace = true

@@ -10,5 +10,9 @@ repository.workspace = true
 [dev-dependencies]
 proptest = "1"
 
+[features]
+default = []
+xdmcp = []
+
 [lints]
 workspace = true

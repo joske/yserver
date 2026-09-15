@@ -37,8 +37,8 @@ signal-hook = "0.4"
 thiserror = "2"
 udev = "0.9"
 xkbcommon = "0.9"
-yserver-core = { path = "crates/yserver-core" }
-yserver-protocol = { path = "crates/yserver-protocol" }
+yserver-core = { path = "crates/yserver-core", default-features = false }
+yserver-protocol = { path = "crates/yserver-protocol", default-features = false }
 
 [workspace.lints.clippy]
 # X11 protocol encoders and request handlers naturally take many

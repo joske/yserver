@@ -40,5 +40,10 @@ yserver-protocol.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 udev.workspace = true
 
+[features]
+default = ["tcp-transport", "xdmcp"]
+tcp-transport = []
+xdmcp = ["tcp-transport", "yserver-core/xdmcp"]
+
 [lints]
 workspace = true
