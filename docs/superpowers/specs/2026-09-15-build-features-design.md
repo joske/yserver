@@ -125,17 +125,27 @@ Naive gating looks enormous — `run.rs` has 95 XDMCP references and `launch.rs`
 1. **A stub `XdmcpService`** when the feature is off — and it must be the
    COMPLETE surface `run_core` uses, or step 2 grows ad-hoc `cfg`s in the core
    loop, which is the exact outcome this design exists to prevent. Measured
-   from `run.rs`, that is nine methods:
+   from `run.rs`, that is **ten** methods, with these exact inert results:
 
-   `register`, `start`, `restart`, `handle_readable`, `service_timer`,
-   `next_deadline`, `take_outcome`, `live_session_client`,
-   `note_client_established`, `note_session_client_disconnected`
+   | method | stub returns |
+   |---|---|
+   | `register(&Registry)` | `Ok(())` — registers nothing |
+   | `start(&AuthState, Generation)` | `()` |
+   | `restart(&AuthState, Generation)` | `()` |
+   | `handle_readable(&AuthState, Generation)` | `()` |
+   | `service_timer(Instant, &AuthState, Generation)` | `()` |
+   | `next_deadline()` | `None` |
+   | `take_outcome()` | `None` |
+   | `live_session_client()` | `None` |
+   | `note_client_established(..)` | **`false`** — never orphaned |
+   | `note_session_client_disconnected(..)` | `false` |
 
-   plus the two items it imports and matches on: `XDMCP_TOKEN` and
-   `XdmcpOutcome`. Inert semantics throughout — `next_deadline` and
-   `take_outcome` return `None`, the notes return whatever the live service
-   returns when there is no session, the rest are no-ops. `run_core`'s
-   signature never forks, so its 95 references need no `cfg` at all.
+   plus the two items `run.rs` imports and matches on: `XDMCP_TOKEN` and
+   `XdmcpOutcome`. `note_client_established` returning `false` is the one worth
+   stating outright: it is `#[must_use] -> bool` meaning "drop this client",
+   and a stub that guessed `true` would silently disconnect every client in a
+   minimal build. `run_core`'s signature never forks, so its 95 references need
+   no `cfg` at all.
 2. **Keep the parser**, as above — so the 120 references stay put.
 
 Leaving: `pub mod xdmcp` in `yserver-protocol/src/lib.rs`, the module selection
@@ -161,11 +171,37 @@ cargo test   --all-targets --no-default-features [--features ...]
 Building alone leaves `cfg`-specific lint failures dormant for GitHub to find
 later, and `--all-targets` is what reaches test code.
 
-**`tcp_tests` must be gated.** It is `#[cfg(test)] mod tcp_tests;`
-(`crates/yserver/src/lib.rs:898`) today, so it compiles into every test build
-and starts TCP listeners. It becomes
-`#[cfg(all(test, feature = "tcp-transport"))]`. Unix-only tests stay enabled in
-every configuration — the point is to keep coverage, not to shed it.
+### Test gating — the rule, and every site it applies to
+
+The rule: **a test is gated by the narrowest feature whose behaviour it
+asserts.** Unix-only tests always run; TCP-only tests take `tcp-transport`;
+anything asserting XDMCP codec, state-machine or service behaviour takes
+`xdmcp`, even when it lives in a module already gated on `tcp-transport`.
+
+`tcp_tests` is `#[cfg(test)] mod tcp_tests;` (`crates/yserver/src/lib.rs:898`)
+today, so it compiles into every test build and starts TCP listeners. It
+becomes `#[cfg(all(test, feature = "tcp-transport"))]`.
+
+XDMCP-specific tests need `#[cfg(feature = "xdmcp")]` individually, or they
+either fail to compile once `yserver_protocol::xdmcp` is genuinely gated, or
+assert behaviour deliberately absent from that build:
+
+- `crates/yserver/src/lib.rs:949` `an_xdmcp_option_opens_a_socket_and_implies_a_reset`
+- `crates/yserver/src/lib.rs:1053` `listen_tcp_with_an_xdmcp_option_needs_no_auth_file`
+- `crates/yserver-core/src/core_loop/run.rs:4412` `the_xdmcp_socket_is_polled_and_a_reset_re_queries`
+- `:4474` `an_xdmcp_terminate_ends_the_core_loop`, `:4590`
+  `an_orphaned_xdmcp_client_does_not_reset_the_generation`, and the test
+  transport helper at `:4402`
+- `crates/yserver/src/tcp_tests.rs:348` `xdmcp_requires_a_tcp_listener_at_startup`
+  — inside a `tcp-transport` module but asserting XDMCP behaviour, so it takes
+  the **narrower** `xdmcp` gate
+
+`crates/yserver/src/lib.rs:940` `no_xdmcp_option_opens_no_socket` is the
+exception: it asserts an ABSENCE that holds in both builds, so it stays
+ungated and is worth keeping as coverage in the minimal configuration.
+
+Unix-only tests stay enabled in every configuration — the point is to keep
+coverage, not to shed it.
 
 A feature nobody builds rots silently.
 
