@@ -3290,6 +3290,17 @@ fn handle_client_setup_complete(
     )?;
 
     const BIG_REQUESTS_MAJOR_OPCODE: u8 = 135;
+    // Read the transport off the stream before it is moved into the
+    // reader. It has to be the transport, not `is_local`: locality is a
+    // property of the ADDRESS, so a loopback TCP client is local and
+    // would otherwise be reported as "unix" on the same line that says
+    // fd passing is off — misleading exactly where same-host XDMCP is
+    // being debugged. The branch already had to learn this distinction
+    // once, for authorization.
+    let transport_label = match &stream {
+        Transport::Unix(_) => "unix",
+        Transport::Tcp(_) => "TCP",
+    };
     // The reader inherits the setup thread's binding rather than
     // re-reading the counter, so the connection keeps ONE generation
     // from accept to disconnect.
@@ -3310,7 +3321,7 @@ fn handle_client_setup_complete(
     log::info!(
         "client {} established over {} (fd passing {})",
         id.0,
-        if is_local { "unix" } else { "TCP" },
+        transport_label,
         if fd_passing { "on" } else { "off" },
     );
 
