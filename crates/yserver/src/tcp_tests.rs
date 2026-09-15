@@ -365,3 +365,130 @@ fn xdmcp_requires_a_tcp_listener_at_startup() {
     super::validate_tcp_startup(&opts, &auth)
         .expect("-query with -listen tcp is the documented pairing and must start");
 }
+
+/// Send one request and return `(reply_or_error_kind, code)` where kind is
+/// byte 0 (0 = error, 1 = reply) and code is byte 1 (the error code, or the
+/// reply's first data byte).
+fn request_reply(stream: &mut (impl Read + Write), request: &[u8]) -> io::Result<(u8, u8)> {
+    stream.write_all(request)?;
+    let mut header = [0; 32];
+    stream.read_exact(&mut header)?;
+    Ok((header[0], header[1]))
+}
+
+/// Raised in review on #148, and the fourth outing for the same trap on this
+/// branch: `is_local` is an ADDRESS property, so a loopback TCP peer is local
+/// and sailed past the locality gate into MIT-SHM's descriptor-bearing
+/// minors. `CreateSegment` then inserted a segment and failed at
+/// `send_reply_with_fd`, leaving the segment behind and answering nothing at
+/// all — a request that neither succeeded nor failed.
+///
+/// Four assertions, because only refusing is not the whole contract:
+/// `CreateSegment` and `AttachFd` must be refused with Xorg's codes, the
+/// non-descriptor minors must STILL work over the same connection, and the
+/// segment table must be untouched — that last one is what fails if the
+/// refusal is added without the cleanup.
+#[test]
+fn loopback_tcp_is_refused_the_fd_bearing_mit_shm_minors() {
+    const MIT_SHM: u8 = 130;
+    const QUERY_VERSION: u8 = 0;
+    const ATTACH_FD: u8 = 6;
+    const CREATE_SEGMENT: u8 = 7;
+
+    let mut fixture = Fixture::new();
+    fixture.write_authority();
+    let opts = fixture.options(&[
+        "-listen",
+        "tcp",
+        "-auth",
+        fixture.auth_path().to_str().unwrap(),
+    ]);
+    let auth = AuthState::new(opts.auth_file.clone());
+    super::validate_tcp_startup(&opts, &auth).unwrap();
+    let listeners = fixture.bind(&opts, &auth).unwrap();
+    let records = parse_records(&fs::read(fixture.auth_path()).unwrap());
+    let cookie = records
+        .iter()
+        .find(|record| {
+            record.family == 0
+                && record.address == [127, 0, 0, 1]
+                && record.number == (fixture.port - 6000).to_string().as_bytes()
+        })
+        .expect("FamilyInternet cookie for this loopback display")
+        .data
+        .clone();
+
+    let (poll, sender, rx) = core_loop::channel().unwrap();
+    let core_sender = sender.clone_handle();
+    let handle = std::thread::spawn(move || {
+        let mut state = ServerState::new();
+        let mut backend = crate::kms::render::KmsBackend::for_tests();
+        backend.platform.devices.clear();
+        let result = core_loop::run_core(
+            poll,
+            rx,
+            core_sender,
+            &mut state,
+            &mut backend,
+            listeners,
+            &ClientIdAllocator::new(),
+            auth,
+            yserver_core::core_loop::ResetPolicy::NoReset,
+            None,
+        );
+        // The bug left a segment here with no client able to reach it.
+        (result, state.mit_shm_segments.len())
+    });
+
+    let mut peer_hold = None;
+    let outcome: io::Result<()> = (|| {
+        let mut peer = TcpStream::connect_timeout(&fixture.address(), Duration::from_secs(2))?;
+        peer.set_read_timeout(Some(Duration::from_secs(5)))?;
+        assert_eq!(setup(&mut peer, MIT_MAGIC_COOKIE.as_bytes(), &cookie)?.0, 1);
+
+        // QueryVersion carries no descriptor and must keep working: the gate
+        // is about the transport's capability, not about the extension.
+        let (kind, _) = request_reply(&mut peer, &[MIT_SHM, QUERY_VERSION, 1, 0])?;
+        assert_eq!(kind, 1, "MIT-SHM QueryVersion must still answer over TCP");
+
+        // CreateSegment: shmseg, size, read_only, pad — a well-formed body,
+        // so that without the gate the handler really would create a segment.
+        let mut create = vec![MIT_SHM, CREATE_SEGMENT, 4, 0];
+        create.extend_from_slice(&0x0400_0042u32.to_le_bytes());
+        create.extend_from_slice(&4096u32.to_le_bytes());
+        create.extend_from_slice(&[0, 0, 0, 0]);
+        let (kind, code) = request_reply(&mut peer, &create)?;
+        assert_eq!(kind, 0, "CreateSegment must be refused, not answered");
+        assert_eq!(
+            code,
+            yserver_protocol::x11::error::BAD_ALLOC,
+            "Xorg's ProcShmCreateSegment returns BadAlloc when the fd cannot be written"
+        );
+
+        // AttachFd: shmseg, read_only, pad. The descriptor would arrive out
+        // of band, which TCP cannot do at all.
+        let mut attach_fd = vec![MIT_SHM, ATTACH_FD, 3, 0];
+        attach_fd.extend_from_slice(&0x0400_0043u32.to_le_bytes());
+        attach_fd.extend_from_slice(&[0, 0, 0, 0]);
+        let (kind, code) = request_reply(&mut peer, &attach_fd)?;
+        assert_eq!(kind, 0, "AttachFd must be refused, not answered");
+        assert_eq!(
+            code,
+            yserver_protocol::x11::error::BAD_MATCH,
+            "Xorg's ProcShmAttachFd returns BadMatch when ReadFdFromClient fails"
+        );
+
+        peer_hold = Some(peer);
+        Ok(())
+    })();
+
+    sender.send(Message::Shutdown).unwrap();
+    let (core_result, segments) = handle.join().unwrap();
+    core_result.unwrap();
+    outcome.unwrap();
+    drop(peer_hold);
+    assert_eq!(
+        segments, 0,
+        "a refused CreateSegment must leave no segment behind"
+    );
+}
