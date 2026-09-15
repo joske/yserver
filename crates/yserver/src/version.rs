@@ -57,11 +57,12 @@ mod tests {
     use super::*;
 
     // Pins the exact, literal suffix per build configuration. Each assertion
-    // only holds under the matching `--features`/`--no-default-features`
-    // invocation; run all three to see all three strings.
+    // only holds under the matching `--features` invocation; run all three to
+    // see all three strings. Names describe what is built, not which one is
+    // the default — the default set is a policy that can change.
     #[cfg(all(feature = "tcp-transport", feature = "xdmcp"))]
     #[test]
-    fn feature_suffix_default_build() {
+    fn feature_suffix_full_build() {
         assert_eq!(feature_list(), "tcp-transport,xdmcp");
         assert!(line().ends_with(" features=[tcp-transport,xdmcp]"));
     }
@@ -75,7 +76,7 @@ mod tests {
 
     #[cfg(not(feature = "tcp-transport"))]
     #[test]
-    fn feature_suffix_no_default_features() {
+    fn feature_suffix_minimal_build() {
         assert_eq!(feature_list(), "");
         assert!(line().ends_with(" features=[]"));
     }
