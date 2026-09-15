@@ -73,3 +73,11 @@ Implemented and tested on AMD, intel, Asahi and Qualcomm. It can NOT (read: NEVE
 the only nvidia card I have (GTX 1050), the nouveau driver can not even bring up Xorg. Nouveau may work on other
 cards, but untested.
 
+## XDMCP (not an X11 extension)
+
+XDMCP is a separate protocol over UDP, not an X11 extension, so it is not in
+the lists above. Support (`-query`, `-indirect`, `-broadcast`) is an optional,
+off-by-default Cargo build feature; see the "Optional build features" and
+"XDMCP" sections of `docs/setup.md` and `yserver(1)`. Stage-2 ACL, IPv6 and
+XDM-AUTHENTICATION-1 are not implemented.
+

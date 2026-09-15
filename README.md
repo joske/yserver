@@ -25,6 +25,9 @@ See [`docs/extensions.txt`](docs/extensions.txt) for a list of all supported/imp
 
 ### Recent work
 
+- XDMCP session negotiation with a display manager, and a TCP listener —
+  both optional Cargo build features, off by default; see
+  [`docs/setup.md`](docs/setup.md)
 - X11 server-side window borders, solid and tiled (awesome)
 - damage-clipped repaint on non-composited desktops: only what changed is redrawn,
   cutting compositing GPU load to roughly a third
