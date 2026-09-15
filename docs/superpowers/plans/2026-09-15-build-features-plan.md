@@ -90,8 +90,27 @@ binary produces the actionable error rather than a connection timeout.
 Apply the narrowest-feature rule to every site the design names, including the
 `lib.rs:940` exception that stays ungated. Add the three-configuration CI
 matrix, each running `clippy --all-targets -- -D warnings` **and**
-`test --all-targets`. Note the feature requirement in the man page and
-`docs/setup.md`.
+`test --all-targets`.
+
+Documentation lands **here, with the code** — not earlier. A man page that
+describes a feature flag before the flag exists is simply wrong for everyone
+who reads it in the meantime, and there is no minimal build for it to
+describe yet.
+
+`docs/man/yserver.1.scd` mentions build options **nowhere** today, so this
+introduces the idea to it. Three touch points:
+
+- `-listen` / `-nolisten` (`:55`) — requires `tcp-transport`
+- the XDMCP options (`:99` `-query`/`-indirect`/`-broadcast`, plus `-port`,
+  `-from`, `-class`, `-displayID`, `-once`) — require `xdmcp`
+- `--version` — now prints the built feature set, which is how a reader checks
+  which they have
+
+Placement is a decision, not a discovery: either repeat a note on each of the
+seven-odd options, or state it once under `DESCRIPTION` (some options require
+build features; `--version` lists them) and flag the options themselves
+briefly. The existing `XDMCP AND TRUST` section (`:279`) is the natural home
+for the XDMCP half. Prose is jos's; this plan only fixes where it goes.
 
 **Proof.** The matrix is green. Then the check that matters: temporarily break
 something only a minimal build would notice — say, a `cfg`-gated `use` that is
