@@ -107,6 +107,18 @@ fn validate_tcp_startup(
              -indirect need the `xdmcp` build feature",
         ));
     }
+    // Same reasoning as the XDMCP refusal above: reject here, before any
+    // hardware or socket is touched, so a minimal build never comes up
+    // silently unix-only. `-nolisten tcp` (`opts.tcp_listen == false`) stays
+    // accepted in this build — asking not to listen is satisfiable when the
+    // binary cannot listen at all.
+    #[cfg(not(feature = "tcp-transport"))]
+    if opts.tcp_listen {
+        return Err(io::Error::other(
+            "this yserver was built without TCP support: -listen tcp needs the \
+             `tcp-transport` build feature",
+        ));
+    }
     if !opts.tcp_listen {
         // XDMCP without a TCP listener starts happily and can never finish:
         // the manager completes Query/Willing/Request/Accept/Manage over
@@ -193,7 +205,6 @@ fn bind_client_listeners(
     opts: &launch::LaunchOptions,
     auth: &core_loop::auth::AuthState,
 ) -> io::Result<Vec<yserver_core::transport::Listener>> {
-    use std::net::{Ipv4Addr, TcpListener};
     use yserver_core::transport::Listener;
 
     let mut listeners = vec![Listener::Unix(unix)];
@@ -204,16 +215,39 @@ fn bind_client_listeners(
         auth.require_tcp_auth_at_startup()
             .map_err(io::Error::other)?;
         let port = launch::tcp_port(display).map_err(io::Error::other)?;
-        let tcp = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).map_err(|err| {
+        listeners.push(Listener::Tcp(bind_tcp_listener(port)?));
+    }
+    Ok(listeners)
+}
+
+/// The one place a `tcp-transport` build actually opens a TCP socket.
+/// `Transport::Tcp` / `Listener::Tcp` stay compiled in every configuration —
+/// the type is `std` and costs nothing, and forking every `match` on
+/// `Transport` would buy no meaningful size win — so only the ABILITY to
+/// create the listener is gated here.
+#[cfg(feature = "tcp-transport")]
+fn bind_tcp_listener(port: u16) -> io::Result<std::net::TcpListener> {
+    let tcp =
+        std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).map_err(|err| {
             io::Error::new(
                 err.kind(),
                 format!("cannot listen on TCP port {port}: {err}"),
             )
         })?;
-        log::info!("yserver: listening on TCP 0.0.0.0:{port}");
-        listeners.push(Listener::Tcp(tcp));
-    }
-    Ok(listeners)
+    log::info!("yserver: listening on TCP 0.0.0.0:{port}");
+    Ok(tcp)
+}
+
+/// The feature-off twin: `validate_tcp_startup` has already refused
+/// `-listen tcp` long before this point, before any hardware or sockets are
+/// touched. This is a second line of defence only, mirroring
+/// `build_xdmcp_service`'s feature-off twin above.
+#[cfg(not(feature = "tcp-transport"))]
+fn bind_tcp_listener(_port: u16) -> io::Result<std::net::TcpListener> {
+    Err(io::Error::other(
+        "this yserver was built without TCP support: -listen tcp needs the \
+         `tcp-transport` build feature",
+    ))
 }
 
 pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
@@ -931,7 +965,7 @@ fn block_termination_signals() -> io::Result<nix::sys::event::Kqueue> {
     Ok(kq)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tcp-transport"))]
 mod tcp_tests;
 
 #[cfg(test)]
@@ -1037,6 +1071,54 @@ mod tests {
         );
     }
 
+    /// A build without the `tcp-transport` feature must refuse `-listen tcp`
+    /// in `validate_tcp_startup`, and must say the option was BUILT OUT — a
+    /// test asserting only that it errored would pass just as well if
+    /// `-listen` had degraded to "unknown option", which is the failure this
+    /// step exists to prevent.
+    #[cfg(not(feature = "tcp-transport"))]
+    #[test]
+    fn a_build_without_tcp_transport_refuses_listen_tcp_at_startup_validation() {
+        let opts = launch::parse_args([":7", "-listen", "tcp"].into_iter().map(String::from))
+            .expect("the argument parser stays unconditional");
+        assert!(
+            opts.tcp_listen,
+            "-listen tcp must still parse, so the error can be about the build"
+        );
+
+        let auth = build_auth_state(&opts);
+        let err = validate_tcp_startup(&opts, &auth)
+            .expect_err("-listen tcp must be refused before anything is bound");
+        let message = err.to_string();
+        assert!(
+            message.contains("built without TCP support"),
+            "the error must say the option was built out, got: {message}"
+        );
+        assert!(
+            message.contains("-listen"),
+            "the error must name the option the operator passed, got: {message}"
+        );
+        assert!(
+            !message.contains("unknown option"),
+            "-listen is a known option in a build that simply lacks the feature: {message}"
+        );
+    }
+
+    /// `-nolisten tcp` asks not to listen, which a build lacking
+    /// `tcp-transport` can always satisfy — it must not be swept up in the
+    /// refusal above.
+    #[cfg(not(feature = "tcp-transport"))]
+    #[test]
+    fn a_build_without_tcp_transport_still_accepts_nolisten_tcp() {
+        let opts = launch::parse_args([":7", "-nolisten", "tcp"].into_iter().map(String::from))
+            .expect("the argument parser stays unconditional");
+        assert!(!opts.tcp_listen);
+
+        let auth = build_auth_state(&opts);
+        validate_tcp_startup(&opts, &auth)
+            .expect("-nolisten tcp must be satisfiable without tcp-transport");
+    }
+
     #[test]
     fn every_other_signal_shuts_down_under_every_policy() {
         for policy in [
@@ -1119,6 +1201,12 @@ mod tests {
         assert_eq!(input_startup_action(true), InputStartup::DirectSpawn);
     }
 
+    // TCP-only behaviour of `validate_tcp_startup` (auth-file requirement,
+    // port range) is unreachable in a build without `tcp-transport`: the new
+    // built-without-TCP refusal fires first. Per the design's test-gating
+    // rule, a test is gated by the narrowest feature whose behaviour it
+    // asserts.
+    #[cfg(feature = "tcp-transport")]
     #[test]
     fn listen_tcp_without_auth_is_rejected_before_startup() {
         let opts = crate::launch::parse_args(["-listen".into(), "tcp".into()]).unwrap();
@@ -1161,6 +1249,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "tcp-transport")]
     #[test]
     fn tcp_startup_port_validation_accepts_65535_and_rejects_overflow() {
         let path = std::env::temp_dir().join(format!(
