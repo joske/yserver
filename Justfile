@@ -169,7 +169,7 @@ yserver-hw log="warn":
 # proves a real TCP client can complete setup. Requires a real KMS-capable
 # environment plus xauth, mcookie and xdpyinfo.
 yserver-tcp-hw log="warn":
-    cargo build --release --bin yserver
+    cargo build --release --features tcp-transport --bin yserver
     bash -c '\
         authfile=$(mktemp /tmp/yserver-tcp-auth.XXXXXX);\
         cookie=$(mcookie);\
@@ -241,7 +241,7 @@ yserver-tcp-hw log="warn":
 # is manager, log level, and 1 for -once (which also exercises -once).
 # yserver as an XDMCP display, driven by a display manager.
 yserver-xdmcp-hw manager="127.0.0.1" log="info" once="0":
-    RUSTFLAGS="-C debug-assertions=yes" cargo build --release --bin yserver
+    RUSTFLAGS="-C debug-assertions=yes" cargo build --release --features xdmcp --bin yserver
     bash -c '\
         case "$(tty)" in /dev/tty[0-9]*) ;; *) echo "xdmcp-hw: must be run from a TTY (got: $(tty))" >&2; exit 1;; esac;\
         display=0;\
