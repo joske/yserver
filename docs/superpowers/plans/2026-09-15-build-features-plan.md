@@ -3,6 +3,12 @@
 Design: [`2026-09-15-build-features-design.md`](../specs/2026-09-15-build-features-design.md).
 Read it first; every decision below is argued there and is not repeated.
 
+> **Status: implemented on `feat/build-features`.** Both features are **off by
+> default** — a later decision by jos, after this plan was written; see the
+> design's "Why both are off by default". The three configurations are
+> unchanged in substance, only the flags that reach them: no flags,
+> `--features tcp-transport`, `--features xdmcp`.
+
 ## Ordering principle
 
 Each step must leave the tree building and passing in **all three**
@@ -27,16 +33,16 @@ and teaches the binary to refuse that feature's options in the same breath.
 ## Step 1 — the feature tables, and nothing else
 
 Add `[features]` to all three manifests exactly as the design specifies:
-`default = []` on `yserver-protocol` and `yserver-core`, the real defaults on
-`yserver`, forwarding via each package's own table. No `#[cfg]` anywhere yet,
-so nothing changes behaviourally in any configuration.
+`default = []` on all three, `tcp-transport` and `xdmcp` on `yserver`,
+forwarding via each package's own table. No `#[cfg]` anywhere yet, so nothing
+changes behaviourally in any configuration.
 
 **Proof.** All three CI configurations build and test green — identically to
-master, since no code is conditional yet. Then
-`cargo tree -f '{p} {f}' --no-default-features` shows `yserver-core` and
-`yserver-protocol` with no features active: that is the assertion that the
-later exclusion is real, and it is cheapest to make now while nothing else
-could explain a failure.
+master, since no code is conditional yet. Then `cargo tree -f '{p} {f}'` with
+no feature flags shows `yserver`, `yserver-core` and `yserver-protocol` with
+nothing but `default` active: that is the assertion that the later exclusion is
+real, and it is cheapest to make now while nothing else could explain a
+failure.
 
 ## Step 2 — gate XDMCP: modules, stub, entry point, tests, and its startup error
 
@@ -57,6 +63,13 @@ either does not compile or silently ignores an option.
   a TCP listener, and only then fails — briefly opening TCP on a binary that
   cannot serve XDMCP at all, and recreating precisely the startup-order defect
   `dc417cfd` fixed.
+- **The `core_loop/mod.rs` re-export split.** Master's single
+  `pub use xdmcp::{XdmcpMode, XdmcpService, XdmcpSetup};` (`:41`) becomes an
+  ungated `pub use xdmcp::XdmcpService;` plus a `#[cfg(feature = "xdmcp")]`
+  `pub use xdmcp::{XdmcpMode, XdmcpSetup};`. Without it the minimal build does
+  not compile however complete the stub is — the ungated `pub use` names two
+  items the stub deliberately does not have. Selecting the stub module with
+  `#[cfg]` + `#[path]` is not enough on its own.
 - **`build_xdmcp_service` both ways.** It unconditionally does
   `use yserver_core::core_loop::{XdmcpMode, XdmcpService, XdmcpSetup};`
   (`crates/yserver/src/lib.rs:129`), so gating the core module without gating
@@ -66,13 +79,28 @@ either does not compile or silently ignores an option.
 - **The XDMCP test gating**, every site the design names. Those tests reference
   the now-gated path and will not compile otherwise.
 
-**Proof.** The acceptance criterion is structural: `git diff` on
-`crates/yserver-core/src/core_loop/run.rs` must be **empty**. If that file
-changed, the stub is incomplete and the design has already failed. Then all
-three configurations build and test.
+**Proof.** The acceptance criterion is structural, and it is about
+`run_core`, not about the whole file: the **non-test half** of
+`crates/yserver-core/src/core_loop/run.rs` — lines 1 to 3533, everything above
+`#[cfg(test)] mod tests` — must be **byte-identical to master**. If any of it
+changed, the stub is incomplete and the design has already failed.
+
+The file as a whole is *not* unchanged, and must not be: the design's own
+test-gating section names the XDMCP tests in this file as sites that have to
+take `#[cfg(feature = "xdmcp")]`. As implemented that is exactly five added
+lines, all of them inside the test module — the `XdmcpManagerFixture` struct
+and its `impl`, and the three XDMCP tests. Verify with
+
+```
+diff <(git show master:crates/yserver-core/src/core_loop/run.rs | sed -n 1,3533p) \
+     <(sed -n 1,3533p crates/yserver-core/src/core_loop/run.rs)
+```
+
+not with a bare `git diff` on the path. Then all three configurations build and
+test.
 
 The behavioural test is **`-query <host> -listen tcp` in the
-`--no-default-features --features tcp-transport` configuration**: it must fail
+`--features tcp-transport` configuration**: it must fail
 in `validate_tcp_startup`, before any listener is bound. That combination is
 the one that distinguishes an early guard from a late one — with `-listen tcp`
 alone valid in that build, a late rejection would have already bound the
@@ -92,7 +120,7 @@ design turns on.
 
 **Proof.** `grep -c 'cfg(feature = "tcp-transport")'` over `transport.rs`,
 `run.rs` and `auth.rs` is **zero** — the gate belongs at the bind site alone. A
-minimal build cannot bind a TCP socket and says so; a default build's TCP tests
+minimal build cannot bind a TCP socket and says so; a `tcp-transport` build's TCP tests
 pass unchanged.
 
 Both startup errors are asserted by **message text**, not merely by failing. A
@@ -104,7 +132,8 @@ unrecognised, which is the failure these steps exist to prevent.
 `version::line()` gains the machine-readable suffix in the design's exact
 format (`features=[tcp-transport,xdmcp]`, alphabetical, no spaces, present even
 when empty). The two feature-dependent recipes build with `--features`
-explicitly rather than relying on `default`.
+explicitly rather than relying on `default` — which, with the default set now
+empty, is what makes them work at all rather than merely future-proofing them.
 
 **Proof.** A test pins the format in all three configurations, including the
 empty case. Note `tools/vng-shot.sh` is **not** a consumer — see the design; it
@@ -113,7 +142,11 @@ runs unix-only and a minimal binary is valid there.
 ## Step 5 — CI matrix and documentation
 
 The three-configuration matrix, each running
-`clippy --all-targets -- -D warnings` **and** `test --all-targets`.
+`clippy --all-targets -- -D warnings` **and** `test --all-targets`. Legs are
+named for what they build — `unix-only` (no flags), `tcp-transport`, `xdmcp` —
+not "default": with `default = []` a "default" leg and a
+"`--no-default-features`" leg are the same build, so naming them that way costs
+a configuration.
 
 Documentation lands **here, with the code** — not earlier. A man page that
 describes a feature flag before the flag exists is simply wrong for everyone
@@ -142,14 +175,25 @@ is a matrix nobody knows works.
 
 ## Hazards
 
-- **A passing default build proves nothing here.** Every step's risk lives in
-  the configurations habit does not exercise.
+- **A passing habitual build proves nothing here.** Every step's risk lives in
+  the configurations habit does not exercise — and emptying the default set
+  **inverted which those are**. A plain `cargo build` now yields the minimal
+  build, so that one is exercised constantly and it is the **full** build
+  (`--features xdmcp`) that nobody compiles unless they ask for it. The 5,291
+  gated lines are now the code most at risk of rotting; CI leg `xdmcp` is what
+  stands between them and a silent break.
 - **The stub is the whole design.** If it drifts from the live API — a method
   added to `XdmcpService` later without a matching stub method — the minimal
-  build breaks and the default build does not notice. CI config 2 is what
-  catches that, which is why it must test and not merely build.
+  build breaks. Since the flip that is the default build, so the drift shows
+  up immediately rather than lying in wait; the leg that must not be dropped
+  is instead the `xdmcp` one, and it must *test*, not merely build, or the
+  gated tests are compiled and never run.
 - **Do not gate server reset**, and do not remove `Transport::Tcp`. Both are
   argued in the design; both would look like tidying.
-- **`cargo test --no-default-features` must reach test code.** Without
-  `--all-targets`, gated test modules are not compiled and the gating is
-  unverified.
+- **`cargo test` must reach test code.** Without `--all-targets`, gated test
+  modules are not compiled and the gating is unverified.
+- **A step gated `if: matrix.name == '<leg>'` follows the leg, not the
+  configuration.** After the default set was emptied, every non-matrixed step
+  pinned to the old `default` leg would have silently become a *minimal*-build
+  step — including the ones that install and run a binary. Placement had to be
+  re-decided per step, not carried over by renaming the leg.

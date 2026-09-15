@@ -1,11 +1,17 @@
 # Build features: `tcp-transport` and `xdmcp`
 
-> **Status: not implemented.** Requested by AppleSheeple on PR #148 ("Can this
-> be made a crate feature? I would actually prefer disabling this at compile
-> time"), agreed by jos as a follow-up to keep #148 from growing further.
-> Shape settled with codex 2026-09-15. Precedent: Xorg's `--disable-xdmcp`.
-> Implementation plan:
+> **Status: implemented on `feat/build-features`.** Requested by AppleSheeple
+> on PR #148 ("Can this be made a crate feature? I would actually prefer
+> disabling this at compile time"), agreed by jos as a follow-up to keep #148
+> from growing further. Shape settled with codex 2026-09-15. Precedent:
+> Xorg's `--disable-xdmcp`. Implementation plan:
 > [`2026-09-15-build-features-plan.md`](../plans/2026-09-15-build-features-plan.md).
+>
+> **Later change by jos, 2026-09-15:** both features are **off by default**.
+> This document originally specified `default = ["tcp-transport", "xdmcp"]`;
+> that has been corrected throughout, with jos's reasoning recorded under
+> "Feature graph" below. Nothing else about the design changed — the same
+> three configurations exist, only the flags that reach them differ.
 
 ## Problem
 
@@ -47,14 +53,37 @@ xdmcp   = ["yserver-protocol/xdmcp"]
 
 # crates/yserver/Cargo.toml
 [features]
-default        = ["tcp-transport", "xdmcp"]
+default        = []
 tcp-transport  = []
 xdmcp          = ["tcp-transport", "yserver-core/xdmcp"]
 ```
 
+### Why both are off by default
+
+Two features, two different reasons — and they are worth stating separately,
+because someone later "tidying" them into one uniform policy would lose both.
+
+- **`tcp-transport` — a security posture.** Listening on TCP widens the
+  server's exposure, so it must be an affirmative choice made at build time
+  by whoever builds the binary, not something a builder inherits by not
+  thinking about it. This is a **stronger position than the runtime
+  `-nolisten tcp` convention**: the capability is not merely off, it is
+  absent from the binary.
+- **`xdmcp` — cost/benefit.** It is niche, and it carries the 5,291 lines of
+  surface measured above. Most deployments never negotiate a session with a
+  display manager, and should not be compiling and shipping that.
+
+The asymmetry in the table above still holds and still drives the design —
+`xdmcp` removes weight, `tcp-transport` removes a capability. It now points
+at *both off* rather than *both on*.
+
+A plain `cargo build` therefore yields a unix-only server. Opting in is
+`--features tcp-transport` or `--features xdmcp`; the latter implies the
+former.
+
 `default = []` on the libraries is what makes the exclusion real. If either
 library ever grows a default that includes its own `xdmcp`, then
-`cargo build -p yserver --no-default-features` still compiles the core and
+a plain `cargo build -p yserver` still compiles the core and
 protocol XDMCP modules and the 5,291-line saving silently evaporates — a
 regression with no symptom, which is the worst kind. **Forwarding belongs in
 each package's `[features]` table**, as above; `[workspace.dependencies]` needs
@@ -66,8 +95,8 @@ connect-back: the manager negotiates over UDP and then its session reaches the
 display over TCP. XDMCP without a TCP listener is already a startup error on
 master; at build level the dependency makes the combination unrepresentable.
 
-This is the workspace's **first** use of Cargo features — there is no
-`[features]` table in any of the three manifests today.
+This is the workspace's **first** use of Cargo features — before this change
+there was no `[features]` table in any of the three manifests.
 
 ### The `Transport` decision — gate the capability, not the type
 
@@ -125,7 +154,7 @@ unconstrained.
 ## The `cfg` boundary
 
 Naive gating looks enormous — `run.rs` has 95 XDMCP references and `launch.rs`
-120. Two moves collapse it to roughly four sites:
+120. Three moves collapse it to a handful of sites:
 
 1. **A stub `XdmcpService`** when the feature is off — and it must be the
    COMPLETE surface `run_core` uses, or step 2 grows ad-hoc `cfg`s in the core
@@ -168,26 +197,58 @@ Naive gating looks enormous — `run.rs` has 95 XDMCP references and `launch.rs`
    `run_core`'s signature never forks, so its 95 references need no `cfg` at
    all.
 2. **Keep the parser**, as above — so the 120 references stay put.
+3. **Split `core_loop/mod.rs`'s combined re-export.** Master has one line
+   (`core_loop/mod.rs:41`):
+
+   ```rust
+   pub use xdmcp::{XdmcpMode, XdmcpService, XdmcpSetup};
+   ```
+
+   It has to become two, because the three names do not share a fate:
+
+   ```rust
+   pub use xdmcp::XdmcpService;              // both builds — the stub supplies it
+   #[cfg(feature = "xdmcp")]
+   pub use xdmcp::{XdmcpMode, XdmcpSetup};   // feature-on only
+   ```
+
+   This is not a detail that can be deferred: without the split the minimal
+   build does not compile **no matter how complete the stub is**, because the
+   ungated `pub use` names `XdmcpMode` and `XdmcpSetup`, which are the two
+   items the stub deliberately does not provide (they are the *parsed option*
+   types, and the parser stays in `yserver`). Module selection alone —
+   `#[cfg]` + `#[path = "xdmcp_stub.rs"]` on the `pub mod` — is not enough.
 
 Leaving: `pub mod xdmcp` in `yserver-protocol/src/lib.rs`, the module selection
-in `core_loop/mod.rs`, `build_xdmcp_service`, the listener bind, and the stub.
-`auth.rs`'s 39 references are a `bool` and need nothing.
+and the re-export split in `core_loop/mod.rs`, `build_xdmcp_service`, the
+listener bind, and the stub. `auth.rs`'s 39 references are a `bool` and need
+nothing.
 
 ## CI
 
 Three configurations, because two would not catch the interesting failure:
 
-1. default features;
-2. `--no-default-features` — unix-only;
-3. `--no-default-features --features tcp-transport` — proves TCP does **not**
-   drag XDMCP back in.
+1. no flags — unix-only, which is what the empty default set now yields;
+2. `--features tcp-transport` — proves TCP does **not** drag XDMCP back in;
+3. `--features xdmcp` — the full build (implies `tcp-transport`).
 
 Each runs **both** of:
 
 ```
-cargo clippy --all-targets --no-default-features [--features ...] -- -D warnings
-cargo test   --all-targets --no-default-features [--features ...]
+cargo clippy --all-targets [--features ...] -- -D warnings
+cargo test   --all-targets [--features ...]
 ```
+
+Legs are named for what they **build** (`unix-only`, `tcp-transport`,
+`xdmcp`), not for which one is the default. With `default = []` a leg called
+"default" and a leg called "no-default-features" would be the same build, and
+the matrix would silently cover two configurations instead of three — a
+coverage loss with no symptom.
+
+Leg 1 deliberately passes no flags rather than `--no-default-features`, so it
+tests what a plain `cargo build` actually gives a user. If the default set
+ever changes, leg 1 follows it and a separate minimal leg has to be added
+back.
 
 Building alone leaves `cfg`-specific lint failures dormant for GitHub to find
 later, and `--all-targets` is what reaches test code.
@@ -209,10 +270,12 @@ assert behaviour deliberately absent from that build:
 
 - `crates/yserver/src/lib.rs:949` `an_xdmcp_option_opens_a_socket_and_implies_a_reset`
 - `crates/yserver/src/lib.rs:1053` `listen_tcp_with_an_xdmcp_option_needs_no_auth_file`
-- `crates/yserver-core/src/core_loop/run.rs:4412` `the_xdmcp_socket_is_polled_and_a_reset_re_queries`
-- `:4474` `an_xdmcp_terminate_ends_the_core_loop`, `:4590`
-  `an_orphaned_xdmcp_client_does_not_reset_the_generation`, and the test
-  transport helper at `:4402`
+- `crates/yserver-core/src/core_loop/run.rs:4413` `the_xdmcp_socket_is_polled_and_a_reset_re_queries`
+- `:4476` `an_xdmcp_terminate_ends_the_core_loop`, `:4593`
+  `an_orphaned_xdmcp_client_does_not_reset_the_generation`, and the
+  `XdmcpManagerFixture` helper, which is **two** items needing the gate, not
+  one — the `struct` (`:4360`) and its `impl` (`:4365`). Five `#[cfg]` lines
+  in this file in total.
 - `crates/yserver/src/tcp_tests.rs:348` `xdmcp_requires_a_tcp_listener_at_startup`
   — inside a `tcp-transport` module but asserting XDMCP behaviour, so it takes
   the **narrower** `xdmcp` gate
@@ -231,17 +294,29 @@ A feature nobody builds rots silently.
 Two recipes depend on a feature — `yserver-tcp-hw` on `tcp-transport`,
 `yserver-xdmcp-hw` on `xdmcp` — but **neither needs a runtime check**, and
 adding one would be dead code. Both begin with `cargo build --release --bin
-yserver`, i.e. they build the binary they then run, with default features. They
-cannot receive a minimal build.
+yserver`, i.e. they build the binary they then run, so they cannot be handed a
+foreign one.
 
-What they should do instead is build what they need **explicitly**:
+What they must do is build what they need **explicitly**:
 
 ```
 cargo build --release --features xdmcp --bin yserver
 ```
 
-so they stay correct if the default set ever changes or a user has configured
-otherwise, rather than silently depending on `default`.
+With the default set empty this is no longer defensive, it is **required**: a
+plain `cargo build` produces a binary that refuses `-listen tcp` and `-query`,
+so without the `--features` both recipes would build a server that fails at
+startup on the very option they exist to exercise. (When this was written the
+default set was full and the argument was only that the recipes should not
+silently depend on `default`. The flip turned the same edit into the thing
+that makes them work at all.)
+
+Every **other** `cargo build` in the tree — the rest of the `Justfile`'s
+~50 run recipes, `tools/*.sh`, `just install-local`, `just install-smoke`, the
+`docs/setup.md` packaging steps — runs or stages a unix-socket server and
+needs no feature. `-nolisten tcp`, which lightdm passes unconditionally, is
+**accepted** by a minimal build: the gate is on *enabling* a transport, not on
+naming one.
 
 `tools/vng-shot.sh --binary` was proposed as a consumer of the feature suffix
 and is **not** one: it starts `'$binary' 7` and exports `DISPLAY=:7`, using the
@@ -252,7 +327,21 @@ tooling, packagers and diagnostics; vng-shot simply is not a caller.
 
 The man page and `docs/setup.md` describe `-listen tcp` and the XDMCP options
 without qualification today; both need a note that they require the
-corresponding feature.
+corresponding feature. With the features off by default this is load-bearing
+rather than polish for `docs/setup.md`, whose build instructions and whose TCP
+and XDMCP sections, followed verbatim, now produce a binary that cannot do
+either.
+
+The two documents say different things, because their readers are in different
+positions:
+
+- **`yserver(1)`** is read by someone holding an installed binary, built
+  however their packager chose. The authority there is `--version`, not the
+  source default, so the option entries say *which feature an option requires*
+  and point at `--version` — they must **not** claim a feature is on or off by
+  default.
+- **`docs/setup.md`** is read by someone deciding how to build. That is where
+  the source default belongs.
 
 ## Plan
 
