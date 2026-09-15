@@ -138,14 +138,30 @@ Naive gating looks enormous — `run.rs` has 95 XDMCP references and `launch.rs`
    | `take_outcome()` | `None` |
    | `live_session_client()` | `None` |
    | `note_client_established(..)` | **`false`** — never orphaned |
-   | `note_session_client_disconnected(..)` | `false` |
+   | `note_session_client_disconnected(..)` | `()` — **not** `bool` |
 
-   plus the two items `run.rs` imports and matches on: `XDMCP_TOKEN` and
-   `XdmcpOutcome`. `note_client_established` returning `false` is the one worth
-   stating outright: it is `#[must_use] -> bool` meaning "drop this client",
-   and a stub that guessed `true` would silently disconnect every client in a
-   minimal build. `run_core`'s signature never forks, so its 95 references need
-   no `cfg` at all.
+   Two of those results are easy to get wrong in opposite directions, so both
+   are stated rather than left to symmetry:
+
+   - `note_client_established` is `#[must_use] -> bool` meaning "drop this
+     client". A stub guessing `true` would silently disconnect every client in
+     a minimal build.
+   - `note_session_client_disconnected` looks like its sibling and **is not**:
+     it returns `()` (`core_loop/xdmcp.rs:425`). A stub returning `bool` there
+     does not type-check.
+
+   `run.rs` also needs two items besides the methods:
+
+   - **`XDMCP_TOKEN`** — the mio token, which must still exist to register
+     nothing against.
+   - **`XdmcpOutcome`**, which must keep **both** variants, `Reset` and
+     `Terminate` (`core_loop/xdmcp.rs:117-123`). `run.rs` matches on both by
+     name, so a feature-off enum that dropped either — or became an empty
+     enum because the stub never returns one — fails to compile. The stub
+     never constructs an outcome; the type still has to admit both.
+
+   `run_core`'s signature never forks, so its 95 references need no `cfg` at
+   all.
 2. **Keep the parser**, as above — so the 120 references stay put.
 
 Leaving: `pub mod xdmcp` in `yserver-protocol/src/lib.rs`, the module selection
