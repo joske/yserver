@@ -29,19 +29,43 @@ later proposes "tidying" them into symmetry.
 
 ### Feature graph
 
+Features are **per package**, so a table on `yserver` alone is not enough. All
+three manifests need one, and the two library crates must default to nothing:
+
 ```toml
-default = ["tcp-transport", "xdmcp"]
-xdmcp   = ["tcp-transport", "yserver-core/xdmcp", "yserver-protocol/xdmcp"]
+# crates/yserver-protocol/Cargo.toml
+[features]
+default = []          # <- load-bearing
+xdmcp   = []
+
+# crates/yserver-core/Cargo.toml
+[features]
+default = []          # <- load-bearing
+xdmcp   = ["yserver-protocol/xdmcp"]
+
+# crates/yserver/Cargo.toml
+[features]
+default        = ["tcp-transport", "xdmcp"]
+tcp-transport  = []
+xdmcp          = ["tcp-transport", "yserver-core/xdmcp"]
 ```
+
+`default = []` on the libraries is what makes the exclusion real. If either
+library ever grows a default that includes its own `xdmcp`, then
+`cargo build -p yserver --no-default-features` still compiles the core and
+protocol XDMCP modules and the 5,291-line saving silently evaporates — a
+regression with no symptom, which is the worst kind. **Forwarding belongs in
+each package's `[features]` table**, as above; `[workspace.dependencies]` needs
+touching only if it is used to control a dependency's default features
+(`default-features = false`), not for forwarding.
 
 `xdmcp` depends on `tcp-transport` because XDMCP's entire purpose is the
 connect-back: the manager negotiates over UDP and then its session reaches the
 display over TCP. XDMCP without a TCP listener is already a startup error on
 master; at build level the dependency makes the combination unrepresentable.
 
-This is the workspace's **first** use of Cargo features. Dependencies are
-declared `.workspace = true`, so the forwarding entries have to be added to the
-workspace `[workspace.dependencies]` table as well as the member manifests.
+This is the workspace's **first** use of Cargo features — there is no
+`[features]` table in any of the three manifests today.
 
 ### The `Transport` decision — gate the capability, not the type
 
@@ -78,19 +102,40 @@ whether TCP was compiled in.
 ### Advertising the feature set
 
 `yserver::version::line()` feeds both `--version` and the startup banner, so it
-is the one place to append the built feature set. That is what makes codex's
-recipe check possible: a launcher can read `yserver --version` and fail with an
-actionable message instead of producing a confusing connection failure.
+is the one place to append the built feature set.
+
+The suffix is a **stable, machine-readable** field, not prose, because
+`vng-shot.sh` parses it:
+
+```
+features=[tcp-transport,xdmcp]
+features=[tcp-transport]
+features=[]
+```
+
+Alphabetical, comma-separated, no spaces, always present including when empty.
+A tool must never have to pattern-match a sentence whose wording is
+unconstrained.
 
 ## The `cfg` boundary
 
 Naive gating looks enormous — `run.rs` has 95 XDMCP references and `launch.rs`
 120. Two moves collapse it to roughly four sites:
 
-1. **A stub `XdmcpService`** when the feature is off: zero-sized,
-   `next_deadline() -> None`, `handle_readable()` a no-op, `take_outcome() ->
-   None`. `run_core`'s signature never forks, so those 95 references need no
-   `cfg` at all.
+1. **A stub `XdmcpService`** when the feature is off — and it must be the
+   COMPLETE surface `run_core` uses, or step 2 grows ad-hoc `cfg`s in the core
+   loop, which is the exact outcome this design exists to prevent. Measured
+   from `run.rs`, that is nine methods:
+
+   `register`, `start`, `restart`, `handle_readable`, `service_timer`,
+   `next_deadline`, `take_outcome`, `live_session_client`,
+   `note_client_established`, `note_session_client_disconnected`
+
+   plus the two items it imports and matches on: `XDMCP_TOKEN` and
+   `XdmcpOutcome`. Inert semantics throughout — `next_deadline` and
+   `take_outcome` return `None`, the notes return whatever the live service
+   returns when there is no session, the rest are no-ops. `run_core`'s
+   signature never forks, so its 95 references need no `cfg` at all.
 2. **Keep the parser**, as above — so the 120 references stay put.
 
 Leaving: `pub mod xdmcp` in `yserver-protocol/src/lib.rs`, the module selection
@@ -106,8 +151,23 @@ Three configurations, because two would not catch the interesting failure:
 3. `--no-default-features --features tcp-transport` — proves TCP does **not**
    drag XDMCP back in.
 
-A feature nobody builds rots silently. (2) and (3) must build *and* test, not
-just `cargo check`.
+Each runs **both** of:
+
+```
+cargo clippy --all-targets --no-default-features [--features ...] -- -D warnings
+cargo test   --all-targets --no-default-features [--features ...]
+```
+
+Building alone leaves `cfg`-specific lint failures dormant for GitHub to find
+later, and `--all-targets` is what reaches test code.
+
+**`tcp_tests` must be gated.** It is `#[cfg(test)] mod tcp_tests;`
+(`crates/yserver/src/lib.rs:898`) today, so it compiles into every test build
+and starts TCP listeners. It becomes
+`#[cfg(all(test, feature = "tcp-transport"))]`. Unix-only tests stay enabled in
+every configuration — the point is to keep coverage, not to shed it.
+
+A feature nobody builds rots silently.
 
 ## Recipes and docs
 
