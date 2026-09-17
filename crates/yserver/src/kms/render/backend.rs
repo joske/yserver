@@ -11737,12 +11737,22 @@ impl KmsBackend {
 
         let configured = self.randr_id_alloc.client_configured_keys();
         let known_connected = self.randr_id_alloc.connected_keys();
-        let rescan =
-            self.platform
-                .apply_connector_snapshot(snapshot, &configured, &known_connected);
+        let rescan = self
+            .platform
+            .apply_connector_snapshot(snapshot, &known_connected);
         let registry_delta =
             self.reconcile_connector_registry(&rescan.connected, &rescan.dropped_keys);
         let active_topology_changed = !rescan.dropped_old_indices.is_empty();
+        // Layout policy is the caller's now (see the connector-snapshot doc
+        // comment): pack, then take the extent — immediately, and in the same
+        // order the snapshot used, so this move is a no-op.
+        if active_topology_changed {
+            let reserved: Vec<crate::kms::render::platform::LayoutRect> = Vec::new();
+            self.platform
+                .recompact_horizontal_layout(&configured, &reserved);
+            self.platform
+                .recompute_fb_extent_with_reservations(&reserved);
+        }
         if (!registry_delta.is_empty() || active_topology_changed)
             && !self.fire_randr_changes(
                 state,
@@ -12029,11 +12039,21 @@ impl KmsBackend {
 
         let configured = self.randr_id_alloc.client_configured_keys();
         let known_connected = self.randr_id_alloc.connected_keys();
-        let rescan =
-            self.platform
-                .apply_connector_snapshot(snapshot, &configured, &known_connected);
+        let rescan = self
+            .platform
+            .apply_connector_snapshot(snapshot, &known_connected);
         let registry_delta =
             self.reconcile_connector_registry(&rescan.connected, &rescan.dropped_keys);
+        // Layout policy is the caller's now (see the connector-snapshot doc
+        // comment): pack, then take the extent — immediately, and in the same
+        // order the snapshot used, so this move is a no-op.
+        if !rescan.dropped_old_indices.is_empty() {
+            let reserved: Vec<crate::kms::render::platform::LayoutRect> = Vec::new();
+            self.platform
+                .recompact_horizontal_layout(&configured, &reserved);
+            self.platform
+                .recompute_fb_extent_with_reservations(&reserved);
+        }
         let should_publish = !registry_delta.is_empty() || active_removed;
         if !should_publish {
             log::debug!("kms: display rescan found no connector or active-topology change");
