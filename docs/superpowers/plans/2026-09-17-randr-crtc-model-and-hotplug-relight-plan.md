@@ -112,35 +112,51 @@ P3 starts here. Each step below is invisible to clients except where marked.
 
 Additive. `RandrCrtc { crtc_id, mode_id, x, y, width, height, attached_outputs }`
 — **no `DrmDeviceKey`, no `crtc::Handle`**; core depends only on
-`yserver-protocol` and `DrmDeviceKey` is `pub(crate)` in `yserver`. Populate it
-alongside the existing derivation. `screen_resources_current` and `crtc_info`
-still use the old path.
+`yserver-protocol` and `DrmDeviceKey` is `pub(crate)` in `yserver`.
+
+**Populate it from the existing synthetic 1:1 projection**, not from the kernel.
+Real `(device, kernel CRTC)` XIDs do not exist until step 6, so at this point the
+collection is a restatement of what outputs already imply — one entry per
+connector, same ids. `screen_resources_current` and `crtc_info` still use the old
+path.
 
 `PlatformBackend` retains the per-device CRTC list from `ResourceHandles`, which
-discovery currently drops after use.
+discovery currently drops after use. It is stored, not yet published.
 
-**Proof.** Byte-identical replies — assert the new collection agrees with the
-derived one for every CRTC, which is the cheapest possible check that step 5 is
-safe.
+**Proof.** Assert the new collection equals the output-derived set, entry for
+entry. That equality is only meaningful *because* both come from the same 1:1
+projection, and it is the cheapest possible check that step 5 is safe.
 
 ## Step 5 — P3a-2: readers switch to the collection
 
 `screen_resources_current` and `crtc_info` source from `RandrState::crtcs`.
-Still 1:1, so output stays byte-identical; this is the step after which an
-unpaired CRTC is *expressible*.
+The collection is still the 1:1 projection from step 4, so every reply stays
+byte-identical.
 
-**Proof.** Same replies as step 4 on hardware. Unit test: a CRTC with no output
-appears in `GetScreenResources` with an empty attached list.
+This step makes an unpaired CRTC **expressible, not existent**. The type can now
+hold one and the readers would publish it correctly — but none exists yet,
+because nothing allocates XIDs for kernel CRTCs until step 6. Do **not** test for
+an unpaired CRTC here: it cannot appear, and if it somehow did, the replies would
+change and P3a-2 would have become protocol-visible, which is exactly what this
+staging is designed to avoid.
+
+**Proof.** Byte-identical replies to step 4, on hardware and in unit tests.
+That is the entire proof; there is nothing new to observe.
 
 ## Step 6 — P3a-3: re-key CRTC XIDs, split `crtc_id`, rewrite request routing
 
-**Protocol-visible: advertised CRTC ids change.** Identity migration only — no
-new configuration is accepted. Three things, together, per ordering constraint 2:
+**Protocol-visible: advertised CRTC ids change, and CRTCs that were never
+published before appear.** Identity migration only — no new *configuration* is
+accepted. All of the following land together, per ordering constraint 2:
 
 - CRTC XIDs keyed on `(DrmDeviceKey, crtc::Handle)` in `RandrIdAllocator`;
   `ConnectorIds` loses `crtc_id`; `ids_for` stops minting one per connector.
   Add the **live-validated reverse lookup** (XID → `(device_key, handle)`
   ∩ current projection) — never a bare map inversion.
+- **The formerly unpaired kernel CRTCs enter the collection here** — this is
+  where the retained `ResourceHandles` list from step 4 is finally published,
+  and where a CRTC with no output first exists. It is why this step, and only
+  this step, changes the advertised CRTC set.
 - `RandrOutput::crtc_id` becomes the current binding (0 = unbound) and
   `possible_crtc_ids` appears, still a singleton.
 - **Request routing**: enable resolves the target from `outputs[]` (exactly one,
@@ -154,7 +170,10 @@ new configuration is accepted. Three things, together, per ordering constraint 2
 Enumerate the `crtc_id` read sites before editing — several in `backend.rs` are
 Present/pageflip CRTC handles in a different namespace and must not be touched.
 
-**Proof.** Unit tests: enable an idle CRTC; disable attached; disable idle
+**Proof.** A kernel CRTC with no output now appears in `GetScreenResources`
+with an empty attached list and a non-empty possible list — the test deferred
+from step 5, which is only satisfiable here. Then the unit tests: enable an idle
+CRTC; disable attached; disable idle
 (no-op success); `outputs.len() > 1` → `BadMatch`; unknown CRTC with
 `mode = None` → `RANDR_BAD_CRTC`; A→B move with all four postconditions
 including A's zeroed geometry; failed apply leaves A owning the output; disable
@@ -207,9 +226,11 @@ succeeds.
 - **`possible clones` is one distinct bit per encoder on both silence devices**,
   so cloning cannot be exercised here at all. The `BadMatch` rejection is
   unit-testable only.
-- **Steps 4-7 are individually unobservable**, which means a mistake in them
-  surfaces only at step 8. The byte-identical-reply assertions in steps 4 and 5
-  exist precisely to stop that.
+- **Steps 4, 5 and 7 are individually unobservable**, so a mistake in them
+  surfaces only at step 6 or 8. The byte-identical-reply assertions in steps 4
+  and 5 exist precisely to stop that. **Step 6 is not in that set** — it changes
+  the advertised CRTC ids and adds CRTCs that were never published before, and
+  is the one P3 step a client can notice before step 8.
 - **`fix/randr-crtc-model-hotplug-relight` is a shared checkout** — do not
   `git checkout` other branches to compare (`feedback_dont_switch_branches_shared_worktree`);
   use `git show <ref>:<path>`.
