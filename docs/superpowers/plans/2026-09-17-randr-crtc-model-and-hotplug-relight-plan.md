@@ -166,7 +166,20 @@ accepted. All of the following land together, per ordering constraint 2:
   and where a CRTC with no output first exists. It is why this step, and only
   this step, changes the advertised CRTC set.
 - `RandrOutput::crtc_id` becomes the current binding (0 = unbound) and
-  `possible_crtc_ids` appears, still a singleton.
+  `possible_crtc_ids` appears, still a singleton. **Which real CRTC that
+  singleton holds must be specified, not left to fall out of the re-keying**
+  (codex, plan round 4) — it is what step 7's proof compares against:
+
+  | output state | singleton contents |
+  |---|---|
+  | active (bound, scanning out) | its **actual** `(device, CRTC)` route |
+  | connected-but-Off | derive one usable tuple with **today's current-or-first discovery policy** (`modeset.rs:401`), publish that tuple's CRTC XID |
+  | no usable tuple | **empty** — publish no possible CRTC rather than an impossible one |
+
+  The middle row is the load-bearing one. Deriving it by any other rule would
+  let the advertised singleton differ from what preparation actually picks,
+  which is silent substitution reintroduced through the back door — the exact
+  failure this phase exists to remove.
 - **Request routing**: enable resolves the target from `outputs[]` (exactly one,
   no cloning); disable resolves an optional output from `attached_outputs` and
   treats an idle CRTC as successful no-op. `output_id`/`connector` become
@@ -192,6 +205,13 @@ from step 5, which is only satisfiable here. Then the unit tests that are
 `mode = None` → `RANDR_BAD_CRTC`; disable sets the output's `crtc_id` to 0; and
 an already-removed XID → `RANDR_BAD_CRTC`, which is pure core existence checking
 and needs no reverse lookup.
+
+**The projection test.** Assert the published singleton is the *same tuple* that
+step 7's pinned preparation would choose, for an active output and for a
+connected-but-Off one, and that an output with no usable tuple publishes an empty
+set. Without this, step 7's "KMS binds the requested route" assertion compares
+against an unspecified target and can hold while the advertised CRTC and the
+bound one diverge.
 
 **Deliberately not here** (codex, plan round 3): the between-validation-and-apply
 `RRSetConfigFailed` test needs the reverse lookup and an async apply that
@@ -220,8 +240,9 @@ mistake makes outputs unaddressable.
   bound CRTC is provably the requested one, and it must be recorded before a
   client can pick a non-default CRTC.
 
-**Proof.** KMS binds the **requested singleton route**, asserted from the KMS
-side rather than inferred — with `possible_crtc_ids` still a singleton there is
+**Proof.** KMS binds the **requested singleton route** — the one step 6's
+projection published, which is why that projection had to be pinned down —
+asserted from the KMS side rather than inferred — with `possible_crtc_ids` still a singleton there is
 exactly one legal CRTC per output, so this proves the value is plumbed and
 honoured, not that routing is flexible. Then the failure test deferred from
 step 6: the device is removed **between validation and the async apply** ⇒
