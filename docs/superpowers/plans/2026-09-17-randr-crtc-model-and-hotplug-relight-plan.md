@@ -27,6 +27,13 @@ boundaries below:
    finding connected-but-Off outputs. Splitting them leaves a commit where
    `xrandr --output … --auto` on an idle output fails.
 
+3. **A test lands in the first step where it can actually fail.** Two drafts of
+   this plan put proofs in steps that could only pass vacuously — an unpaired-CRTC
+   test before any unpaired CRTC existed, and an A→B move test before a second
+   legal CRTC existed. A vacuous pass is worse than no test: it reads as coverage
+   (`feedback_xts_vacuous_passes`). Where a proof is deferred, the step says so
+   and names the step that owns it.
+
 Per `feedback_no_commit_before_smoke`, every step that touches KMS or changes
 what a client sees is **observed on hardware by jos before it is committed**.
 Static checks do not catch a dark monitor.
@@ -151,8 +158,9 @@ accepted. All of the following land together, per ordering constraint 2:
 
 - CRTC XIDs keyed on `(DrmDeviceKey, crtc::Handle)` in `RandrIdAllocator`;
   `ConnectorIds` loses `crtc_id`; `ids_for` stops minting one per connector.
-  Add the **live-validated reverse lookup** (XID → `(device_key, handle)`
-  ∩ current projection) — never a bare map inversion.
+  **Forward direction only.** The live-validated reverse lookup moves to step 7,
+  where it is first needed — nothing resolves an XID back to a handle until a
+  CRTC is pinned.
 - **The formerly unpaired kernel CRTCs enter the collection here** — this is
   where the retained `ResourceHandles` list from step 4 is finally published,
   and where a CRTC with no output first exists. It is why this step, and only
@@ -162,24 +170,33 @@ accepted. All of the following land together, per ordering constraint 2:
 - **Request routing**: enable resolves the target from `outputs[]` (exactly one,
   no cloning); disable resolves an optional output from `attached_outputs` and
   treats an idle CRTC as successful no-op. `output_id`/`connector` become
-  `Option` on the trait and in `CrtcConfigCompletion`; `requested_crtc` is
-  always required. Nested and recording backends need compile-level updates.
+  `Option` on the trait and in `CrtcConfigCompletion`. Nested and recording
+  backends need compile-level updates. **`requested_crtc` is NOT added here** —
+  see step 7.
 - Validation: CRTC existence checked even for `mode = None`; `outputs.len() > 1`
-  rejected with `BadMatch`; A→B move and disable post-states as specified.
+  rejected with `BadMatch`; disable post-states as specified. The attach/detach
+  bookkeeping that the A→B move needs lands here because disable requires it,
+  but **no move is reachable yet**: `possible_crtc_ids` is a singleton, so every
+  enable targets the output's own CRTC. Unit-test the transition helper against
+  constructed state if you want the insurance; the end-to-end move test is
+  step 8's, and cannot pass before it.
 
 Enumerate the `crtc_id` read sites before editing — several in `backend.rs` are
 Present/pageflip CRTC handles in a different namespace and must not be touched.
 
 **Proof.** A kernel CRTC with no output now appears in `GetScreenResources`
 with an empty attached list and a non-empty possible list — the test deferred
-from step 5, which is only satisfiable here. Then the unit tests: enable an idle
-CRTC; disable attached; disable idle
+from step 5, which is only satisfiable here. Then the unit tests that are
+*reachable at this step*: enable an idle CRTC; disable attached; disable idle
 (no-op success); `outputs.len() > 1` → `BadMatch`; unknown CRTC with
-`mode = None` → `RANDR_BAD_CRTC`; A→B move with all four postconditions
-including A's zeroed geometry; failed apply leaves A owning the output; disable
-sets the output's `crtc_id` to 0; already-removed XID → `RANDR_BAD_CRTC`;
-device removed between validation and apply → `RRSetConfigFailed` with no
-substitution onto a same-numbered handle on a surviving device.
+`mode = None` → `RANDR_BAD_CRTC`; disable sets the output's `crtc_id` to 0; and
+an already-removed XID → `RANDR_BAD_CRTC`, which is pure core existence checking
+and needs no reverse lookup.
+
+**Deliberately not here** (codex, plan round 3): the between-validation-and-apply
+`RRSetConfigFailed` test needs the reverse lookup and an async apply that
+resolves a pinned CRTC — step 7. The client-visible A→B move needs a second
+legal CRTC to move to — step 8. Asserting either here would pass vacuously.
 
 **Hardware (jos).** Full desktop bring-up on XFCE and one other WM, plus
 `xrandr --output … --off` / `--auto` round-trips. This is the step where a
@@ -187,7 +204,11 @@ mistake makes outputs unaddressable.
 
 ## Step 7 — P3b: thread the requested CRTC, and remember it
 
-- `apply_crtc_config` / `begin_crtc_config` gain `requested_crtc`.
+- `apply_crtc_config` / `begin_crtc_config` gain `requested_crtc`, always
+  required. This is the first step at which KMS can tell a requested CRTC apart
+  from discovery's default route.
+- The **live-validated reverse lookup** (XID → `(device_key, handle)` ∩ current
+  projection), deferred from step 6 — never a bare map inversion.
 - `PendingCrtcConfigProbe` gains `requested_crtc`; it already carries
   `prepared_output`.
 - Connector preparation takes a pinned `crtc::Handle`; `connector_candidate`
@@ -199,9 +220,16 @@ mistake makes outputs unaddressable.
   bound CRTC is provably the requested one, and it must be recorded before a
   client can pick a non-default CRTC.
 
-**Proof.** The CRTC bound is the one requested, asserted from the KMS side, not
-inferred. Still no new configurations accepted, so hardware behaviour is
-unchanged — which is itself the check.
+**Proof.** KMS binds the **requested singleton route**, asserted from the KMS
+side rather than inferred — with `possible_crtc_ids` still a singleton there is
+exactly one legal CRTC per output, so this proves the value is plumbed and
+honoured, not that routing is flexible. Then the failure test deferred from
+step 6: the device is removed **between validation and the async apply** ⇒
+`RRSetConfigFailed`, with no substitution onto a same-numbered handle on a
+surviving device.
+
+Still no new configurations accepted, so hardware behaviour is unchanged —
+which is itself the check.
 
 ## Step 8 — P3c: advertise usable route tuples
 
@@ -211,10 +239,23 @@ selects a whole tuple. Encoder retention is decided **per requested route** —
 keep the current encoder only if it participates in a usable tuple for the
 requested CRTC — not on a union property.
 
-**Proof.** The synthetic unit test the hardware cannot produce: an encoder
-reaching two CRTCs while the only primary plane reaches one, asserting the
-unreachable CRTC is absent. Plus reconnect-after-A→B returns on B, and its
-negative. On hardware, the original xfce `SetCrtcConfig crtc=0x12 … outputs=0x05`
+**Proof.** This is the first step at which a second legal CRTC exists for an
+output, so it carries every test that needed one:
+
+- The **client-visible A→B move**, end to end through a real `SetCrtcConfig`,
+  asserting all four postconditions including A's zeroed geometry, plus a failed
+  apply leaving A still owning the output. Deferred from step 6, where it could
+  only have passed vacuously.
+- A route reachable **only via a non-current encoder** binds, selecting that
+  encoder — unreachable on silence's hardware (every encoder has the full mask),
+  so this one is synthetic too.
+- **Reconnect-after-A→B returns on B**, and its negative: B no longer usable at
+  reconnect ⇒ output stays Off and `last_enabled` is cleared.
+- The synthetic tuple test the hardware cannot produce: an encoder reaching two
+  CRTCs while the only primary plane reaches one, asserting the unreachable CRTC
+  is absent from `possible_crtc_ids`.
+
+On hardware, the original xfce `SetCrtcConfig crtc=0x12 … outputs=0x05`
 succeeds.
 
 ## Hazards
