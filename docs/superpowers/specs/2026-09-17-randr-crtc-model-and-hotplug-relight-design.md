@@ -1,6 +1,7 @@
 # RANDR CRTC model and hotplug relight
 
-> **Status: proposed, nothing implemented.** Reported by BergmannAtmet in
+> **Status: superseded by measurement. Do not implement P1 or P3 from this
+> document.** Reported by BergmannAtmet in
 > GH discussion #56 (comment 18481108, 2026-09-17): after `xset dpms force
 > suspend` → monitor off → monitor on, the session never renders again.
 > Root-caused from a `yserver-xfce-hw-trace` run by jos the same day
@@ -8,8 +9,13 @@
 > jos's initial read was "awesome/picom specific"; the trace disproves that —
 > it reproduces on XFCE and the mechanism is entirely in the KMS/RANDR path.
 >
-> Three defects, one regression and two dormant. Phases below are
-> independently mergeable, and **P1 alone closes the reported symptom**.
+> The later Xorg/MATE trace and a plain-master hardware run refuted P1's
+> auto-relight premise: a conforming desktop performs the disable, resize and
+> re-enable itself. The independently correct P2 attached-vs-possible CRTC
+> distinction was implemented instead and fixes XFCE's request shape. See
+> [`2026-09-18-relight-premise-refuted-by-xorg-trace.md`](../findings/2026-09-18-relight-premise-refuted-by-xorg-trace.md).
+> The broad physical-CRTC model (P3) is deferred until a separate reproducer
+> requires it.
 >
 > **Reviewed by codex, 2026-09-17.** P1 and P2 approved with changes, both
 > applied below: P1 gained an explicit ordering and now restores *every*

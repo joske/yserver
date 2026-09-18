@@ -896,6 +896,11 @@ pub(crate) struct ConnectorEntry {
     pub ids: ConnectorIds,
     pub connected: bool,
     pub config: ConnectorConfig,
+    /// Whether `GetOutputInfo.crtc` retains this connector's former CRTC.
+    /// Physical loss retains the association; an explicit client disable
+    /// clears it. It cannot be inferred from `connected` or `config`: both
+    /// physical loss and a deliberate disable leave the route Off.
+    pub crtc_associated: bool,
     /// `true` once a client SetCrtcConfig/SetScreenSize touched this
     /// output. The auto-layout (recompact / boot extend-right) only
     /// ever touches `!client_configured` outputs. A lightweight connection
@@ -1007,6 +1012,7 @@ impl RandrIdAllocator {
                 ids,
                 connected: false,
                 config: ConnectorConfig::Off,
+                crtc_associated: false,
                 client_configured: false,
                 modes: Vec::new(),
                 edid: Vec::new(),
@@ -7948,6 +7954,7 @@ impl KmsBackend {
             let entry = self.randr_id_alloc.entry_mut(&key);
             if entry.connected && !entry.modes.is_empty() {
                 entry.config = config;
+                entry.crtc_associated = true;
             }
         }
     }
@@ -7973,6 +7980,7 @@ impl KmsBackend {
                 // snapshot below owns advertised state; this arm retires only
                 // the route policy, so do not fabricate a disconnect/reconnect
                 // pair or a second config timestamp.
+                entry.crtc_associated |= matches!(entry.config, ConnectorConfig::Enabled { .. });
                 entry.config = ConnectorConfig::Off;
                 entry.client_configured = false;
                 continue;
@@ -7986,6 +7994,7 @@ impl KmsBackend {
                 delta.changed_keys.push(key.clone());
             }
             delta.config_changed |= config_changed;
+            entry.crtc_associated |= matches!(entry.config, ConnectorConfig::Enabled { .. });
             entry.connected = false;
             entry.config = ConnectorConfig::Off;
             entry.client_configured = false;
@@ -8441,7 +8450,13 @@ impl KmsBackend {
                         x: layout.x,
                         y: layout.y,
                     };
+                    entry.crtc_associated = true;
                 }
+                // A live KMS route is necessarily attached. This also seeds
+                // fixtures whose registry entry predates the active-output
+                // projection, before a later physical disconnect preserves
+                // the association while retiring the route.
+                entry.crtc_associated = true;
                 (
                     entry.connected,
                     entry.modes.clone(),
@@ -8642,6 +8657,12 @@ impl KmsBackend {
         let ts_now = state.timestamp_now();
         state.randr =
             yserver_core::randr::RandrState::from_outputs_with_modes(new_ts, outputs, mode_table);
+        let associations = self
+            .randr_id_alloc
+            .entries()
+            .filter(|(_, entry)| entry.crtc_associated)
+            .map(|(_, entry)| (entry.ids.output_id, entry.ids.crtc_id));
+        state.randr.set_output_crtc_associations(associations);
         state.randr.set_providers(providers);
         // Carry forward the client-set logical size (from_outputs reseeds
         // it to the bbox; that is only correct at boot, where prev_screen
@@ -19631,6 +19652,7 @@ impl Backend for KmsBackend {
                 {
                     let entry = self.randr_id_alloc.entry_mut(&output_key);
                     entry.config = ConnectorConfig::Off;
+                    entry.crtc_associated = false;
                     // client_configured is set to record that a client
                     // explicitly disabled this output (not an auto-layout op).
                     entry.client_configured = true;
@@ -19699,6 +19721,7 @@ impl Backend for KmsBackend {
                         x,
                         y,
                     };
+                    entry.crtc_associated = true;
                     entry.client_configured = true;
                     entry.connected = true;
                 }
@@ -29990,6 +30013,17 @@ mod tests {
         assert_eq!(output.crtc_id, ids.1);
         assert!(!output.connected);
         assert_eq!(output.mode_id, 0);
+        let mut state = ServerState::new();
+        backend.rebuild_randr_state(&mut state, None, false);
+        assert_eq!(
+            state
+                .randr
+                .output_info(ids.0, 0)
+                .expect("disconnected output remains queryable")
+                .crtc,
+            ids.1,
+            "physical loss retains the former CRTC association until a client disables it",
+        );
         assert!(
             !backend.randr_id_alloc.entry(&key).unwrap().connected,
             "stale platform output state must not overwrite a heavy disconnect"

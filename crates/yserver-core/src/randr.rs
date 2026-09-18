@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use yserver_protocol::x11::randr as proto;
 
@@ -266,6 +266,10 @@ pub struct RandrState {
     pub timestamp: u32,
     pub config_timestamp: u32,
     pub outputs: Vec<RandrOutput>,
+    /// Current output→CRTC associations. This is deliberately separate from
+    /// the output's possible-CRTC topology: a physical disconnect retains an
+    /// association while an explicit `SetCrtcConfig(mode=None)` clears it.
+    output_crtc_associations: HashMap<u32, u32>,
     /// Deduped modes referenced by `outputs[i].mode_id`.
     pub modes: Vec<RandrMode>,
     /// Full deduped advertised mode union for `GetScreenResources`.
@@ -350,10 +354,17 @@ impl RandrState {
             .or_else(|| outputs.first())
             .map_or(0, |o| o.output_id);
 
+        let output_crtc_associations = outputs
+            .iter()
+            .filter(|output| output.mode_id != 0)
+            .map(|output| (output.output_id, output.crtc_id))
+            .collect();
+
         Self {
             timestamp,
             config_timestamp: timestamp,
             outputs,
+            output_crtc_associations,
             modes,
             mode_table,
             providers: Vec::new(),
@@ -372,6 +383,16 @@ impl RandrState {
     pub fn set_providers(&mut self, mut providers: Vec<RandrProvider>) {
         providers.sort_by_key(|provider| provider.provider_id);
         self.providers = providers;
+    }
+
+    /// Replace the current output→CRTC associations from the backend's
+    /// physical/configuration state. Associations are protocol state, not a
+    /// derivation of `connected`: Xorg retains one across physical loss.
+    pub fn set_output_crtc_associations<I>(&mut self, associations: I)
+    where
+        I: IntoIterator<Item = (u32, u32)>,
+    {
+        self.output_crtc_associations = associations.into_iter().collect();
     }
 
     /// Look up a provider by its protocol XID.
@@ -591,7 +612,12 @@ impl RandrState {
         // queries GetOutputInfo before enabling the output). Synthesize
         // only when an active mode gives real pixel dimensions; otherwise
         // report the EDID size if present, else 0 (unknown).
-        let assigned = out.mode_id != 0;
+        let assigned_crtc = self
+            .output_crtc_associations
+            .get(&out.output_id)
+            .copied()
+            .unwrap_or(0);
+        let assigned = assigned_crtc != 0;
         let synthesize_dimensions = out.connected && assigned;
         let synth_mm = |px: u16| ((u32::from(px) * 254 + 480) / 960).max(1);
         let width_mm = if out.mm_width > 0 {
@@ -610,9 +636,9 @@ impl RandrState {
         };
         Some(OutputInfoReplyData {
             timestamp: self.timestamp,
-            // Currently-assigned CRTC: 0 (unassigned) unless the output is
-            // actually enabled. A connected-but-off output reports crtc=0.
-            crtc: if assigned { out.crtc_id } else { 0 },
+            // Currently-assigned CRTC. An explicit disable clears this;
+            // physical loss retains it even though the CRTC is now idle.
+            crtc: assigned_crtc,
             // The set of CRTCs this output *can* be driven by (Xorg
             // `crtcs`), independent of whether one is currently assigned.
             // Our model is a stable 1:1 output↔crtc allocation, so the
@@ -721,6 +747,20 @@ impl RandrState {
     pub fn crtc_info(&self, crtc_id: u32, config_timestamp: u32) -> Option<CrtcInfoData> {
         let _ = config_timestamp;
         let out = self.outputs.iter().find(|o| o.crtc_id == crtc_id)?;
+        let outputs: Vec<u32> = self
+            .outputs
+            .iter()
+            .filter(|o| {
+                self.output_crtc_associations.get(&o.output_id) == Some(&crtc_id) && o.mode_id != 0
+            })
+            .map(|o| o.output_id)
+            .collect();
+        let possible_outputs: Vec<u32> = self
+            .outputs
+            .iter()
+            .filter(|o| o.crtc_id == crtc_id)
+            .map(|o| o.output_id)
+            .collect();
         Some(CrtcInfoData {
             timestamp: self.timestamp,
             x: out.x,
@@ -728,7 +768,8 @@ impl RandrState {
             width: out.width,
             height: out.height,
             mode_id: out.mode_id,
-            output_id: out.output_id,
+            outputs,
+            possible_outputs,
         })
     }
 }
@@ -758,7 +799,10 @@ pub struct CrtcInfoData {
     pub width: u16,
     pub height: u16,
     pub mode_id: u32,
-    pub output_id: u32,
+    /// Outputs currently attached to this CRTC. An idle CRTC has none.
+    pub outputs: Vec<u32>,
+    /// Outputs that can be attached to this CRTC in the current model.
+    pub possible_outputs: Vec<u32>,
 }
 
 #[cfg(test)]
@@ -1447,8 +1491,13 @@ mod tests {
         assert_eq!(info.height_mm, 0);
         assert_eq!(info.mode_id, 0);
 
-        // crtc_info on the (unassigned) crtc reports the off geometry.
-        assert_eq!(st.crtc_info(11, 0).expect("crtc present").mode_id, 0);
+        // An idle CRTC has no attached outputs. Its possible-output set still
+        // records which output can drive it; conflating the two caused
+        // xfsettingsd to carry an idle output into a later SetCrtcConfig.
+        let crtc = st.crtc_info(11, 0).expect("crtc present");
+        assert_eq!(crtc.mode_id, 0);
+        assert!(crtc.outputs.is_empty(), "idle CRTC has no attached output");
+        assert_eq!(crtc.possible_outputs, [10]);
     }
 
     #[test]

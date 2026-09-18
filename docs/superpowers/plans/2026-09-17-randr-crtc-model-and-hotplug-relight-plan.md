@@ -3,8 +3,11 @@
 Design: [`2026-09-17-randr-crtc-model-and-hotplug-relight-design.md`](../specs/2026-09-17-randr-crtc-model-and-hotplug-relight-design.md).
 Read it first; every decision below is argued there and is not repeated.
 
-> **Status: not started.** Branch `fix/randr-crtc-model-hotplug-relight`, spec
-> committed as `f8438636`. Design approved by codex after nine review rounds.
+> **Status: superseded; do not execute.** The P1 auto-relight premise was
+> refuted by Xorg and plain-master MATE traces. P2 alone changed XFCE's invalid
+> two-output request into a legal one-output request and hardware confirmed the
+> second display enables. P3 remains deferred, not partially started. See
+> [`2026-09-18-relight-premise-refuted-by-xorg-trace.md`](../findings/2026-09-18-relight-premise-refuted-by-xorg-trace.md).
 
 ## Ordering principle
 

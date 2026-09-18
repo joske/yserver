@@ -3066,7 +3066,6 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             };
-            let output_ids = [crtc_data.output_id];
             let buf = x11randr::encode_get_crtc_info_reply(
                 byte_order,
                 sequence,
@@ -3079,8 +3078,8 @@ fn handle_randr_request(
                     mode: crtc_data.mode_id,
                     rotation: 1,
                     rotations: 1,
-                    outputs: &output_ids,
-                    possible: &output_ids,
+                    outputs: &crtc_data.outputs,
+                    possible: &crtc_data.possible_outputs,
                 },
             );
             let Some(client) = state.clients.get_mut(&client_id.0) else {
