@@ -13300,12 +13300,11 @@ fn handle_dri3_request(
 
 /// Build the FBConfig list returned by `GetFBConfigs`. We synthesise
 /// from each X visual (depth-24 RGB and depth-32 ARGB), double buffered,
-/// both with depth=24 stencil=8 (the universal
-/// default for OpenGL apps). 2 configs × 28 properties (+5 bind-to-
-/// texture pairs when TFP is supported) is enough for Mesa to pick a
-/// match for any common glXChooseFBConfig call without paying for the
-/// full ~30-cell sweep the design mentions. All configs advertise
-/// GLX_PBUFFER_BIT so Chromium/ANGLE can allocate its offscreen surface.
+/// plus one visual-less, single-buffered pixmap configuration for
+/// QtWebEngine's native DMA-BUF import.  All share depth=24 stencil=8 (the
+/// universal default for OpenGL apps).  The two visual-backed configurations
+/// advertise GLX_PBUFFER_BIT so Chromium/ANGLE can allocate its offscreen
+/// surface.
 /// Resolve the attribute list for a `GetDrawableAttributes` reply,
 /// mirroring Xorg's `DoGetDrawableAttributes` (glxcmds.c:1863-1914).
 /// With no GLX record (a naked X window queried directly, the GLX 1.2
@@ -13456,7 +13455,7 @@ fn glx_extension_string(tfp_supported: bool) -> String {
 
 fn synthesise_glx_fb_configs(tfp_supported: bool) -> Vec<Vec<(u32, u32)>> {
     use yserver_protocol::x11::glx as g;
-    let mut out = Vec::with_capacity(2);
+    let mut out = Vec::with_capacity(3);
     let depth = 24;
     let stencil = 8;
     for &(visual_id, fbconfig_id, alpha_size, total_buffer_size) in &[
@@ -13543,6 +13542,27 @@ fn synthesise_glx_fb_configs(tfp_supported: bool) -> Vec<Vec<(u32, u32)>> {
         }
         out.push(config);
     }
+    // QtWebEngine's GLXHelper chooses a single-buffered RGBA pixmap config
+    // before importing a native DMA-BUF through DRI3 (#152).  Do not attach it
+    // to either real visual: #96 showed that Mesa can then pair the
+    // single-buffered config with a double-buffered window of the same visual,
+    // making it allocate a fake front buffer.  A visual-less, pixmap-only
+    // config is sufficient for GLXPixmap and cannot be selected for windows
+    // or pbuffers.  Keep the property count uniform: GetFBConfigs encodes one
+    // count for the whole reply.
+    let mut native_pixmap = out[0].clone();
+    for (attribute, value) in &mut native_pixmap {
+        match *attribute {
+            g::GLX_VISUAL_ID => *value = 0,
+            g::GLX_FBCONFIG_ID => *value = 0x104,
+            g::GLX_X_VISUAL_TYPE => *value = g::GLX_NONE,
+            g::GLX_DRAWABLE_TYPE => *value = g::GLX_PIXMAP_BIT,
+            g::GLX_X_RENDERABLE => *value = 0,
+            g::GLX_DOUBLEBUFFER => *value = 0,
+            _ => {}
+        }
+    }
+    out.push(native_pixmap);
     out
 }
 
@@ -31180,11 +31200,12 @@ mod tests {
         );
     }
 
-    // #96: every synthesised GLX FBConfig must advertise GLX_PBUFFER_BIT plus
+    // #96: each visual-backed GLX FBConfig must advertise GLX_PBUFFER_BIT plus
     // the three GLX_MAX_PBUFFER_* caps, or Chromium/ANGLE can't allocate its
     // offscreen pbuffer surface and falls back to software (no WebGL/Maps 3D).
-    // Property counts must stay uniform across configs (GetFBConfigs encodes a
-    // single num_properties for all of them).
+    // The #152 native-pixmap config is deliberately pixmap-only.  Property
+    // counts must stay uniform across configs (GetFBConfigs encodes a single
+    // num_properties for all of them).
     #[test]
     fn glx_fb_configs_advertise_pbuffer() {
         use yserver_protocol::x11::glx as g;
@@ -31196,6 +31217,11 @@ mod tests {
                 assert_eq!(config.len(), prop_count, "non-uniform property count");
                 let get = |attr: u32| config.iter().find(|(a, _)| *a == attr).map(|(_, v)| *v);
                 let drawable = get(g::GLX_DRAWABLE_TYPE).expect("DRAWABLE_TYPE present");
+                if drawable == g::GLX_PIXMAP_BIT {
+                    assert_eq!(get(g::GLX_VISUAL_ID), Some(0));
+                    assert_eq!(get(g::GLX_X_RENDERABLE), Some(0));
+                    continue;
+                }
                 assert_ne!(
                     drawable & g::GLX_PBUFFER_BIT,
                     0,
@@ -31218,17 +31244,65 @@ mod tests {
         assert!(visuals.iter().all(|visual| visual.double_buffer));
 
         let configs = synthesise_glx_fb_configs(false);
-        assert_eq!(configs.len(), 2);
+        assert_eq!(configs.len(), 3);
         let mut visual_ids = HashSet::new();
         for config in configs {
             let get = |attr: u32| config.iter().find(|(a, _)| *a == attr).map(|(_, v)| *v);
             let visual_id = get(g::GLX_VISUAL_ID).expect("VISUAL_ID present");
-            assert!(
-                visual_ids.insert(visual_id),
-                "duplicate visual 0x{visual_id:x}"
-            );
-            assert_eq!(get(g::GLX_DOUBLEBUFFER), Some(1));
+            if visual_id == 0 {
+                assert_eq!(get(g::GLX_DRAWABLE_TYPE), Some(g::GLX_PIXMAP_BIT));
+                assert_eq!(get(g::GLX_DOUBLEBUFFER), Some(0));
+            } else {
+                assert!(
+                    visual_ids.insert(visual_id),
+                    "duplicate visual 0x{visual_id:x}"
+                );
+                assert_eq!(get(g::GLX_DOUBLEBUFFER), Some(1));
+            }
         }
+        assert_eq!(visual_ids.len(), 2);
+    }
+
+    // QtWebEngine's GLXHelper chooses a native-pixmap config with this exact
+    // attribute set before it imports a DMA-BUF through DRI3.  In particular,
+    // it requires GLX_DOUBLEBUFFER=false.  It must not reuse either real X
+    // visual: doing so recreates #96, where Mesa paired a single-buffered
+    // context with a double-buffered window and allocated a fake front buffer.
+    #[test]
+    fn qtwebengine_can_choose_an_isolated_single_buffered_pixmap_config() {
+        use yserver_protocol::x11::glx as g;
+
+        let configs = synthesise_glx_fb_configs(true);
+        let config = configs
+            .iter()
+            .find(|config| {
+                let get = |attr: u32| {
+                    config
+                        .iter()
+                        .find(|(key, _)| *key == attr)
+                        .map(|(_, value)| *value)
+                };
+                get(g::GLX_RED_SIZE).is_some_and(|value| value >= 8)
+                    && get(g::GLX_GREEN_SIZE).is_some_and(|value| value >= 8)
+                    && get(g::GLX_BLUE_SIZE).is_some_and(|value| value >= 8)
+                    && get(g::GLX_ALPHA_SIZE).is_some_and(|value| value >= 8)
+                    && get(g::GLX_BUFFER_SIZE).is_some_and(|value| value >= 32)
+                    && get(g::GLX_BIND_TO_TEXTURE_RGBA_EXT) == Some(1)
+                    && get(g::GLX_DRAWABLE_TYPE).is_some_and(|value| value & g::GLX_PIXMAP_BIT != 0)
+                    && get(g::GLX_BIND_TO_TEXTURE_TARGETS_EXT)
+                        .is_some_and(|value| value & g::GLX_TEXTURE_2D_BIT_EXT != 0)
+                    && get(g::GLX_DOUBLEBUFFER) == Some(0)
+            })
+            .expect("a QtWebEngine native-pixmap FBConfig");
+        let get = |attr: u32| {
+            config
+                .iter()
+                .find(|(key, _)| *key == attr)
+                .map(|(_, value)| *value)
+        };
+        assert_eq!(get(g::GLX_VISUAL_ID), Some(0));
+        assert_eq!(get(g::GLX_DRAWABLE_TYPE), Some(g::GLX_PIXMAP_BIT));
+        assert_eq!(get(g::GLX_X_RENDERABLE), Some(0));
     }
 
     // #96: pbuffer GetGeometry must report the fbconfig's true depth so Mesa's
