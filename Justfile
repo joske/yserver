@@ -1237,6 +1237,98 @@ yserver-i3-hw-trace log="debug":
         kill -TERM $yserver_pid 2>/dev/null;\
         wait $yserver_pid 2>/dev/null;'
 
+# ============================== evilwm ==============================
+#
+# The WM from issue #155 (GIMP + drag stutter on an Ivy Bridge GT1 whose
+# Vulkan driver Mesa marks incomplete). evilwm is a bare reparenting WM with
+# no compositor, so every present is a server-owned root paint — direct
+# scanout is structurally impossible here and `reject_server_owned` on every
+# frame is expected, not a fault.
+#
+# `-fn fixed` is not optional. evilwm's DEF_FONT is "variable" and it EXITS if
+# neither that nor `--fn` loads (display.c:125-131). "variable" is an alias
+# from `fonts.alias`, which is only consulted for a directory that is a valid
+# FPE — and a directory without `fonts.dir` is not one. On Arch,
+# `xorg-fonts-misc` ships no `fonts.dir` (the `xorg-mkfontscale` hook makes
+# it), so both servers drop the element: Xorg falls back to a 6-font
+# `built-ins` FPE with no "variable", and yserver's BUILTIN_ALIASES is
+# ["fixed", "cursor", "nil2"] with a fontconfig catalog of XLFDs that a bare
+# name cannot match. `fixed` resolves on both, so it is the portable choice.
+# The #155 reporter hit none of this: Debian's xfonts-base ships fonts.dir.
+
+yserver-evilwm-hw log="info":
+    cargo build --release --bin yserver
+    bash -c '\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        stdbuf -oL -eL env RUST_LOG="{{log}}" RUST_BACKTRACE=1 target/release/yserver > yserver-hw-evilwm.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        DISPLAY=:7 evilwm -fn fixed -bw 2 > evilwm.log 2>&1 &\
+        sleep 1;\
+        DISPLAY=:7 xterm ;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;'
+
+yserver-evilwm-hw-telemetry log="info":
+    cargo build --release --bin yserver
+    rm -f yserver-evilwm.submit.tsv
+    bash -c '\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        YSERVER_LOOP_TELEMETRY=1 YSERVER_SUBMIT_TRACE=yserver-evilwm.submit.tsv \
+            RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
+            target/release/yserver > yserver-hw-evilwm.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        DISPLAY=:7 evilwm -fn fixed -bw 2 > evilwm.log 2>&1 &\
+        sleep 1;\
+        DISPLAY=:7 xterm ;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;'
+
+yserver-evilwm-hw-trace log="info":
+    cargo build --release --bin yserver
+    rm -f evilwm.xtrace
+    bash -c '\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
+            target/release/yserver > yserver-hw-evilwm.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        x11trace -k -d :7 -D :8 -n -o evilwm.xtrace &\
+        trace_pid=$!;\
+        sleep 1;\
+        DISPLAY=:8 evilwm -fn fixed -bw 2 > evilwm.log 2>&1 &\
+        sleep 1;\
+        DISPLAY=:8 xterm ;\
+        kill -TERM $trace_pid 2>/dev/null;\
+        wait $trace_pid 2>/dev/null;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;'
+
+yserver-evilwm-hw-workload log="info" steps="60" step_px="6":
+    cargo build --release --bin yserver
+    rm -f yserver-evilwm.submit.tsv evilwm-phases.log
+    bash -c '\
+        unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
+        export GDK_BACKEND=x11;\
+        export XDG_SESSION_TYPE=x11;\
+        YSERVER_LOOP_TELEMETRY=1 YSERVER_SUBMIT_TRACE=yserver-evilwm.submit.tsv \
+            RUST_LOG="{{log}}" RUST_BACKTRACE=1 \
+            target/release/yserver > yserver-hw-evilwm.log 2>&1 &\
+        yserver_pid=$!;\
+        sleep 2;\
+        DISPLAY=:7 evilwm -fn fixed -bw 2 > evilwm.log 2>&1 &\
+        sleep 2;\
+        DISPLAY=:7 tools/wm-pointer-drag-workload.sh evilwm-phases.log {{steps}} {{step_px}} ;\
+        kill -TERM $yserver_pid 2>/dev/null;\
+        wait $yserver_pid 2>/dev/null;'
+
 # ============================== dwm ==============================
 
 yserver-dwm-hw log="info":
