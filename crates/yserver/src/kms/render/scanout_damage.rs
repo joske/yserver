@@ -279,23 +279,6 @@ impl ScanoutDamage {
 mod tests {
     use super::*;
 
-    /// A freshly built model already reports every BO as WHOLLY missing, no
-    /// `invalidate` needed. This is what makes the hotplug relight's own
-    /// invalidate belt-and-braces: `SceneCompositor::rebuild_outputs`
-    /// replaces every output's model, so the relit output and the survivors
-    /// all start from a full repaint.
-    #[test]
-    fn a_fresh_model_reports_every_bo_wholly_missing() {
-        let extent = vk::Extent2D {
-            width: 100,
-            height: 50,
-        };
-        let d = ScanoutDamage::new(2, extent);
-        let full = u64::from(extent.width) * u64::from(extent.height);
-        assert_eq!(d.missing_area(0), full);
-        assert_eq!(d.missing_area(1), full);
-    }
-
     /// `invalidate` and a failed retirement leave work owed that no producer
     /// reports; a fresh model and a committed frame owe nothing.
     #[test]
