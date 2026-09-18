@@ -261,6 +261,22 @@ impl RandrOutput {
     }
 }
 
+/// A virtual-screen slot held by a route that is physically gone but
+/// restorable: `(x, y, width, height)`, in root coordinates.
+///
+/// Structurally identical to the KMS backend's `LayoutRect`, which is where
+/// these come from (`KmsBackend::reserved_layout_slots`).
+pub type ScreenReservation = (i32, i32, u16, u16);
+
+/// Largest non-negative right/bottom edge in `edges`, clamped into `u16`.
+/// Zero when there are no edges at all (no outputs, no reservations).
+fn screen_extent(edges: impl Iterator<Item = i32>) -> u16 {
+    edges
+        .map(|edge| u16::try_from(edge.max(0)).unwrap_or(u16::MAX))
+        .max()
+        .unwrap_or(0)
+}
+
 #[derive(Debug)]
 pub struct RandrState {
     pub timestamp: u32,
@@ -310,11 +326,42 @@ impl RandrState {
     /// deduped mode table. The caller owns the table shape; `modes`
     /// remains the current-mode-only compatibility vector used by a few
     /// legacy call sites.
+    ///
+    /// Reservation-free shorthand for
+    /// [`Self::from_outputs_with_modes_and_reservations`].
     #[must_use]
     pub fn from_outputs_with_modes(
         timestamp: u32,
         outputs: Vec<RandrOutput>,
         mode_table: Vec<RandrMode>,
+    ) -> Self {
+        Self::from_outputs_with_modes_and_reservations(timestamp, outputs, mode_table, &[])
+    }
+
+    /// As [`Self::from_outputs_with_modes`], but the derived screen extent
+    /// also covers `reserved`.
+    ///
+    /// A reservation is the rectangle of a route that is physically gone but
+    /// restorable — a monitor unplugged from a live session whose remembered
+    /// mode the backend will re-light on the reconnect edge (RANDR CRTC model
+    /// and hotplug relight design, "Layout policy — reserved slots"). While
+    /// the slot is held the route has no live output to derive from, so an
+    /// extent taken over live outputs alone would advertise a *shrunken*
+    /// screen and invite a display daemon to lay the desktop out again around
+    /// the hole. Unioning the reservation keeps the derived extent stable
+    /// across the unplug/replug, which is also what Xorg reports: it never
+    /// resizes the screen on a disconnect.
+    ///
+    /// This is the DERIVED extent only. A logical size a client set with
+    /// `RRSetScreenSize` is owned by that client and continues to override it
+    /// (see `set_logical_size`, and the carry-forward in the KMS backend's
+    /// `rebuild_randr_state`).
+    #[must_use]
+    pub fn from_outputs_with_modes_and_reservations(
+        timestamp: u32,
+        outputs: Vec<RandrOutput>,
+        mode_table: Vec<RandrMode>,
+        reserved: &[ScreenReservation],
     ) -> Self {
         // Some compositors compare the first RANDR resource timestamp with
         // their own "last SetCrtcConfig" timestamp, which starts at zero.
@@ -322,22 +369,26 @@ impl RandrState {
         // completed client-side reconfiguration.
         let timestamp = timestamp.max(1);
         let modes = Self::current_mode_table(&outputs);
-        let screen_width: u16 = outputs
-            .iter()
-            .map(|o| {
-                let r = i32::from(o.x).saturating_add(i32::from(o.width));
-                u16::try_from(r.max(0)).unwrap_or(u16::MAX)
-            })
-            .max()
-            .unwrap_or(0);
-        let screen_height: u16 = outputs
-            .iter()
-            .map(|o| {
-                let r = i32::from(o.y).saturating_add(i32::from(o.height));
-                u16::try_from(r.max(0)).unwrap_or(u16::MAX)
-            })
-            .max()
-            .unwrap_or(0);
+        let screen_width: u16 = screen_extent(
+            outputs
+                .iter()
+                .map(|o| i32::from(o.x).saturating_add(i32::from(o.width)))
+                .chain(
+                    reserved
+                        .iter()
+                        .map(|&(x, _, width, _)| x.saturating_add(i32::from(width))),
+                ),
+        );
+        let screen_height: u16 = screen_extent(
+            outputs
+                .iter()
+                .map(|o| i32::from(o.y).saturating_add(i32::from(o.height)))
+                .chain(
+                    reserved
+                        .iter()
+                        .map(|&(_, y, _, height)| y.saturating_add(i32::from(height))),
+                ),
+        );
         // mm = px * 25.4 / 96; integer form: (px*254 + 480) / 960. Previous
         // divisor was off by 10× and made GTK auto-scale at extreme factors.
         let width_mm = ((u32::from(screen_width) * 254 + 480) / 960).max(1);
@@ -1046,6 +1097,86 @@ mod tests {
         let expect_h = (1024u32 * 254 + 480) / 960;
         assert_eq!(st.width_mm, expect_w);
         assert_eq!(st.height_mm, expect_h);
+    }
+
+    fn dual_head_output(output_id: u32, x: i16) -> RandrOutput {
+        RandrOutput {
+            name: format!("HDMI-{output_id}"),
+            output_id,
+            crtc_id: output_id + 10,
+            mode_id: 21,
+            connected: true,
+            x,
+            y: 0,
+            width: 2560,
+            height: 1440,
+            vrefresh: 60,
+            timing: None,
+            mm_width: 0,
+            mm_height: 0,
+            mode_ids: vec![21],
+            num_preferred: 1,
+        }
+    }
+
+    /// RANDR CRTC model and hotplug relight design, "Layout policy —
+    /// reserved slots": a route that is physically gone but restorable keeps
+    /// its slot, and the DERIVED screen extent counts that slot. The oracle
+    /// is the same topology with the route still live: a reserved slot must
+    /// project exactly the screen the output it stands in for did, so a
+    /// client never observes a shrink across the unplug.
+    #[test]
+    fn a_reserved_slot_projects_the_same_derived_screen_as_the_live_route() {
+        let both_live = RandrState::from_outputs_with_modes(
+            1,
+            vec![dual_head_output(1, 0), dual_head_output(2, 2560)],
+            Vec::new(),
+        );
+
+        let survivor_only =
+            RandrState::from_outputs_with_modes(1, vec![dual_head_output(1, 0)], Vec::new());
+        assert_eq!(
+            (survivor_only.screen_width, survivor_only.screen_height),
+            (2560, 1440),
+            "without the reservation the derived extent shrinks to the survivor",
+        );
+
+        let reserved = RandrState::from_outputs_with_modes_and_reservations(
+            1,
+            vec![dual_head_output(1, 0)],
+            Vec::new(),
+            &[(2560, 0, 2560, 1440)],
+        );
+        assert_eq!(
+            (reserved.screen_width, reserved.screen_height),
+            (both_live.screen_width, both_live.screen_height),
+            "a reserved slot holds the derived extent at the live-route value",
+        );
+        assert_eq!(
+            (reserved.width_mm, reserved.height_mm),
+            (both_live.width_mm, both_live.height_mm),
+            "the derived mm follow the derived pixels",
+        );
+    }
+
+    /// The reservation only feeds the DERIVED extent. A logical size a client
+    /// set with `RRSetScreenSize` is owned by that client and still wins.
+    #[test]
+    fn an_explicit_client_logical_size_overrides_a_reserved_slot() {
+        let mut st = RandrState::from_outputs_with_modes_and_reservations(
+            1,
+            vec![dual_head_output(1, 0)],
+            Vec::new(),
+            &[(2560, 0, 2560, 1440)],
+        );
+        assert_eq!(st.screen_width, 5120);
+
+        st.set_logical_size(7, 2560, 1440, 677, 381);
+        assert_eq!(
+            (st.screen_width, st.screen_height, st.width_mm, st.height_mm),
+            (2560, 1440, 677, 381),
+            "an explicit client logical size is honoured verbatim",
+        );
     }
 
     #[test]

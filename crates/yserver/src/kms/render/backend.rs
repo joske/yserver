@@ -8722,6 +8722,10 @@ impl KmsBackend {
     /// forward across every rebuild — a re-probe or CRTC set never
     /// collapses a client-resized screen back to the bounding box
     /// (Xorg keeps `pScreen->width/height` until the client resizes).
+    /// The extent the projection *derives* underneath that carry-forward
+    /// covers the live outputs unioned with the slots still reserved by
+    /// departed-but-restorable routes, so it never describes a screen that
+    /// shrank around a monitor we are about to re-light.
     fn rebuild_randr_state(
         &mut self,
         state: &mut ServerState,
@@ -8741,10 +8745,12 @@ impl KmsBackend {
         );
         let (outputs, mode_table) = self.randr_outputs_and_modes();
         let providers = self.randr_providers();
+        let reserved = self.reserved_layout_slots();
         let new_ts = set_time.unwrap_or(prev_ts);
         let ts_now = state.timestamp_now();
-        state.randr =
-            yserver_core::randr::RandrState::from_outputs_with_modes(new_ts, outputs, mode_table);
+        state.randr = yserver_core::randr::RandrState::from_outputs_with_modes_and_reservations(
+            new_ts, outputs, mode_table, &reserved,
+        );
         state.randr.set_providers(providers);
         // Carry forward the client-set logical size (from_outputs reseeds
         // it to the bbox; that is only correct at boot, where prev_screen
@@ -30226,6 +30232,63 @@ mod tests {
         assert!(
             !rects_overlap(a_rect, b_rect),
             "the relit route {a_rect:?} must not overlap the survivor {b_rect:?}",
+        );
+    }
+
+    /// The reservation feeds the DERIVED extent only. `rebuild_randr_state`
+    /// still carries a client-set logical size forward over it, so a desktop
+    /// that laid itself out with `RRSetScreenSize` keeps the size it asked
+    /// for while a slot is reserved (Xorg keeps `pScreen->width/height`
+    /// until the client resizes).
+    #[test]
+    fn a_client_set_logical_size_survives_a_rebuild_while_a_slot_is_reserved() {
+        let mut backend = KmsBackend::for_tests();
+        clear_test_outputs(&mut backend);
+        let a = push_enabled_test_output(&mut backend, "A", 7, 0, 0, 1920, 1080);
+        let b = push_enabled_test_output(&mut backend, "B", 8, 1920, 0, 1920, 1080);
+        let snapshot_a =
+            relight_test_snapshot(&a, vec![test_advertised_mode(1920, 1080, 60, true)]);
+
+        // B departs physically: its slot is reserved, the extent holds.
+        let rescan = backend
+            .platform
+            .apply_connector_snapshot(vec![snapshot_a], &std::collections::HashSet::from([a, b]));
+        let _ = backend.reconcile_connector_registry(
+            &rescan.connected,
+            &rescan.dropped_keys,
+            &rescan.dropped_layouts,
+        );
+        let reserved = backend.reserved_layout_slots();
+        assert_eq!(reserved, vec![(1920, 0, 1920, 1080)]);
+        backend
+            .platform
+            .recompute_fb_extent_with_reservations(&reserved);
+        assert_eq!(backend.platform.fb_dimensions(), (3840, 1080));
+
+        let (outputs, modes) = backend.randr_outputs_and_modes();
+        let (fb_w, fb_h) = backend.fb_dimensions();
+        let mut state = ServerState::with_randr_outputs_and_modes(
+            fb_w,
+            fb_h,
+            outputs,
+            modes,
+            yserver_core::server::BackendCapabilities::from_backend(&backend),
+        );
+        // The desktop shrank the logical screen around the survivor.
+        let ts = state.timestamp_now();
+        state.randr.set_logical_size(ts, 1920, 1080, 508, 286);
+
+        backend.rebuild_randr_state(&mut state, None, true);
+
+        assert_eq!(
+            (
+                state.randr.screen_width,
+                state.randr.screen_height,
+                state.randr.width_mm,
+                state.randr.height_mm,
+            ),
+            (1920, 1080, 508, 286),
+            "the client-owned logical size is carried forward verbatim",
         );
     }
 
