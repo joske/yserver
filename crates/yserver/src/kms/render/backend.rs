@@ -1575,13 +1575,6 @@ pub struct KmsBackend {
     present_crtc_clock_epochs: HashMap<u32, (CrtcKey, u64)>,
     next_present_crtc_clock_epoch: u64,
     hotplug_rescan_deadline: Option<std::time::Instant>,
-    /// A DRM hotplug edge arrived while DPMS had deliberately blanked every
-    /// CRTC. Some monitors withdraw link status while powered down; applying
-    /// that snapshot would turn a reversible DPMS sleep into an unplug. Keep
-    /// the last live topology; a successful wake discards this edge. A real
-    /// unplug/replug after wake produces a fresh hotplug event and normal
-    /// rescan.
-    dpms_dark_hotplug_seen: bool,
     gamma_luts: RefCell<HashMap<OutputKey, GammaLut>>,
 
     /// GLX-TFP (Tasks 2.3 + 2.4): per-`DrawableId` export tracking for
@@ -5136,7 +5129,6 @@ impl KmsBackend {
             present_crtc_clock_epochs: HashMap::new(),
             next_present_crtc_clock_epoch: 1,
             hotplug_rescan_deadline: None,
-            dpms_dark_hotplug_seen: false,
             gamma_luts: RefCell::new(HashMap::new()),
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported,
@@ -6086,7 +6078,6 @@ impl KmsBackend {
             present_crtc_clock_epochs: HashMap::new(),
             next_present_crtc_clock_epoch: 1,
             hotplug_rescan_deadline: None,
-            dpms_dark_hotplug_seen: false,
             gamma_luts: RefCell::new(HashMap::new()),
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported: false,
@@ -12029,14 +12020,6 @@ impl KmsBackend {
             log::debug!("kms: display rescan skipped (VT not Active)");
             return;
         }
-        if !self.kms_outputs_active {
-            self.dpms_dark_hotplug_seen = true;
-            log::debug!(
-                "kms: display rescan deferred (DPMS dark; retaining live topology until wake)"
-            );
-            return;
-        }
-        self.dpms_dark_hotplug_seen = false;
         // Gather first. A card-level probe error aborts the combined rescan
         // without touching the last-known topology.
         let snapshot = match self.platform.probe_connector_snapshot() {
@@ -12090,21 +12073,6 @@ impl KmsBackend {
         // A retired connector's CRTC is gone; drop any stale armed entry so it
         // cannot block re-arm or mis-dedup a reused id.
         self.prune_armed_targets_to_live_outputs();
-    }
-
-    /// Finish a successful DPMS wake without replaying connector status that
-    /// was sampled while every output was deliberately dark. Link training is
-    /// allowed to take longer than the wake commit; a genuine later hotplug
-    /// generates its own udev edge and takes the ordinary rescan path.
-    fn finish_dpms_wake(&mut self, outputs_restored: bool) {
-        if outputs_restored && self.dpms_dark_hotplug_seen {
-            self.dpms_dark_hotplug_seen = false;
-            // A debounce timer may have been armed just before the DPMS
-            // transition. It observed the same dark-link interval and must
-            // not run after wake as a stale topology probe.
-            self.hotplug_rescan_deadline = None;
-            log::debug!("kms: DPMS wake — discarding hotplug edge sampled while outputs were dark");
-        }
     }
 
     /// Per-event state-machine driver. Extracted so both
@@ -19038,16 +19006,9 @@ impl Backend for KmsBackend {
                 .map(|monitor| monitor.drain())
                 .unwrap_or(false);
             if saw_change {
-                if self.kms_outputs_active {
-                    self.hotplug_rescan_deadline =
-                        Some(std::time::Instant::now() + std::time::Duration::from_millis(150));
-                    log::debug!("kms: display hotplug edge — rescan armed (+150ms)");
-                } else {
-                    self.dpms_dark_hotplug_seen = true;
-                    log::debug!(
-                        "kms: display hotplug edge while DPMS dark — retaining live topology"
-                    );
-                }
+                self.hotplug_rescan_deadline =
+                    Some(std::time::Instant::now() + std::time::Duration::from_millis(150));
+                log::debug!("kms: display hotplug edge — rescan armed (+150ms)");
             }
         }
     }
@@ -26683,7 +26644,6 @@ impl Backend for KmsBackend {
             self.scene.wake_for_damage();
             if res.is_ok() {
                 self.kms_outputs_active = !self.platform.outputs.is_empty();
-                self.finish_dpms_wake(self.kms_outputs_active);
             }
             res
         } else {
@@ -26733,9 +26693,6 @@ impl Backend for KmsBackend {
                 return Err(error);
             }
             self.kms_outputs_active = false;
-            // A debounce timer armed before the all-off commit cannot safely
-            // distinguish that intentional darkness from an unplug.
-            self.hotplug_rescan_deadline = None;
             if let Some(error) = direct_shadow_error {
                 log::error!("scanout_m2: DPMS-off lazy fallback Copy failed: {error}; exiting");
                 self.request_exit();
@@ -28405,47 +28362,6 @@ mod tests {
         assert!(
             b.hotplug_rescan_deadline.is_none(),
             "an elapsed hotplug rescan deadline must be cleared so the loop can idle",
-        );
-    }
-
-    #[test]
-    fn dpms_dark_hotplug_keeps_live_outputs_until_wake() {
-        let mut b = KmsBackend::for_tests();
-        let mut state = ServerState::new();
-        let live_outputs = b.platform.outputs.len();
-        assert!(live_outputs > 0, "fixture must begin with a live KMS route");
-        b.kms_outputs_active = false;
-        b.hotplug_rescan_deadline =
-            Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
-
-        b.poll_deferred_input(&mut state);
-
-        assert_eq!(
-            b.platform.outputs.len(),
-            live_outputs,
-            "a connector status sampled while DPMS-dark must not retire the saved wake topology",
-        );
-        assert!(
-            b.dpms_dark_hotplug_seen,
-            "the DPMS-dark edge must be remembered until the wake outcome is known",
-        );
-    }
-
-    #[test]
-    fn successful_dpms_wake_discards_dark_hotplug_without_a_second_probe() {
-        let mut b = KmsBackend::for_tests();
-        b.dpms_dark_hotplug_seen = true;
-        b.hotplug_rescan_deadline = Some(std::time::Instant::now());
-
-        b.finish_dpms_wake(true);
-
-        assert!(
-            !b.dpms_dark_hotplug_seen,
-            "a status edge observed only while DPMS-dark is not a hotplug to replay after wake",
-        );
-        assert!(
-            b.hotplug_rescan_deadline.is_none(),
-            "a slow monitor must not be re-probed immediately after the old topology was lit",
         );
     }
 
