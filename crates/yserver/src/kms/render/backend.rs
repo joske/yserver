@@ -823,67 +823,6 @@ pub(crate) enum ConnectorConfig {
     },
 }
 
-/// Everything a relight needs to put a remembered route back exactly where it
-/// was, read out of a [`ConnectorConfig::Enabled`].
-///
-/// P3b adds the assigned CRTC XID to `ConnectorConfig::Enabled` and to this
-/// struct; every relight reader goes through
-/// [`ConnectorConfig::restorable_route`], so that addition stays local
-/// instead of touching each consumer (design, "P3 extends `last_enabled`").
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RememberedRoute {
-    pub mode: yserver_core::backend::ModeSpec,
-    pub x: i32,
-    pub y: i32,
-}
-
-impl ConnectorConfig {
-    /// The route policy this config remembers, or `None` when it is `Off`.
-    pub(crate) fn restorable_route(self) -> Option<RememberedRoute> {
-        match self {
-            Self::Off => None,
-            Self::Enabled {
-                mode_w,
-                mode_h,
-                vrefresh,
-                x,
-                y,
-            } => Some(RememberedRoute {
-                mode: yserver_core::backend::ModeSpec {
-                    width: mode_w,
-                    height: mode_h,
-                    vrefresh,
-                },
-                x,
-                y,
-            }),
-        }
-    }
-
-    /// The layout rectangle this config occupies, or `None` when it is `Off`.
-    pub(crate) fn placed_rect(self) -> Option<crate::kms::render::platform::LayoutRect> {
-        match self {
-            Self::Off => None,
-            Self::Enabled {
-                mode_w,
-                mode_h,
-                x,
-                y,
-                ..
-            } => Some((x, y, mode_w, mode_h)),
-        }
-    }
-}
-
-/// One route [`KmsBackend::take_relight_requests`] decided to restore.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RelightRequest {
-    key: OutputKey,
-    mode: yserver_core::backend::ModeSpec,
-    x: i32,
-    y: i32,
-}
-
 /// Owned request handed to the asynchronous PRIME route qualifier.
 ///
 /// The duplicate KMS fd keeps the exact DRM open-file description alive until
@@ -963,19 +902,6 @@ pub(crate) struct ConnectorEntry {
     /// query retains it because that query does not detach the CRTC; the
     /// later heavy physical-topology apply clears it when the route goes.
     pub client_configured: bool,
-    /// Route policy of a connector retired by a **physical** disconnect,
-    /// kept so the reconnect edge relights it with no client request
-    /// (design P1b, invariant 1). `None` whenever nothing is remembered: a
-    /// client's explicit `SetCrtcConfig`, an incompatible-mode reconnect and
-    /// a successful relight all clear it.
-    ///
-    /// This is also the reservation record. While it is `Some` and the route
-    /// is not live, the remembered rectangle is excluded from auto-layout
-    /// packing and unioned into the virtual-screen extent, so a survivor
-    /// never moves into the hole a restorable route left (invariant 7).
-    /// Releasing a reservation is exactly clearing this field — there is no
-    /// second record to drop.
-    pub last_enabled: Option<ConnectorConfig>,
     /// Last-known advertised mode list, preferred-first. Retained across
     /// disconnect so a momentarily-gone monitor keeps reporting stable mode
     /// resources until reconnect refreshes them.
@@ -1082,7 +1008,6 @@ impl RandrIdAllocator {
                 connected: false,
                 config: ConnectorConfig::Off,
                 client_configured: false,
-                last_enabled: None,
                 modes: Vec::new(),
                 edid: Vec::new(),
                 mm_width: 0,
@@ -8000,7 +7925,7 @@ impl KmsBackend {
             }
         }
         // Entries seen only by cached inventory remain default-disconnected.
-        let _ = self.reconcile_connector_registry(snapshots, &[], &[]);
+        let _ = self.reconcile_connector_registry(snapshots, &[]);
 
         let live_configs: Vec<_> = self
             .platform
@@ -8033,24 +7958,14 @@ impl KmsBackend {
     /// RANDR config-timestamp bumps. Retiring an already-light-disconnected
     /// CRTC still clears its internal config below, but is deliberately not a
     /// second advertised-config delta.
-    ///
-    /// `dropped_layouts` carries the live rectangle of every route the
-    /// connector snapshot removed. The registry's own `config` can be stale
-    /// after an auto-layout repack (nothing writes `(x, y)` back to it), so
-    /// the remembered route is taken from the layout that actually departed.
     fn reconcile_connector_registry(
         &mut self,
         connected: &[ConnectorSnapshot],
         dropped: &[OutputKey],
-        dropped_layouts: &[crate::kms::render::platform::DroppedRoute],
     ) -> ConnectorRegistryDelta {
         let mut delta = ConnectorRegistryDelta::default();
         let connected_keys: HashSet<_> = connected.iter().map(|snapshot| &snapshot.key).collect();
         for key in dropped {
-            let departed = dropped_layouts
-                .iter()
-                .find(|route| &route.key == key)
-                .cloned();
             let entry = self.randr_id_alloc.entry_mut(key);
             if connected_keys.contains(key) {
                 // Physically connected but no longer usable by the live CRTC
@@ -8060,25 +7975,7 @@ impl KmsBackend {
                 // pair or a second config timestamp.
                 entry.config = ConnectorConfig::Off;
                 entry.client_configured = false;
-                // Not a physical departure — the connector is still here, it
-                // just lost its route. There is nothing to relight on a
-                // reconnect edge that will not come, and nothing to reserve.
-                entry.last_enabled = None;
                 continue;
-            }
-            // The connector physically departed. Remember the route it was
-            // scanning out so the reconnect relights it without a client
-            // request, and so its slot stays reserved meanwhile.
-            if matches!(entry.config, ConnectorConfig::Enabled { .. })
-                && let Some(route) = departed
-            {
-                entry.last_enabled = Some(ConnectorConfig::Enabled {
-                    mode_w: route.width,
-                    mode_h: route.height,
-                    vrefresh: route.vrefresh,
-                    x: route.x,
-                    y: route.y,
-                });
             }
             let config_changed = entry.connected;
             let output_changed = config_changed
@@ -11843,19 +11740,14 @@ impl KmsBackend {
         let rescan = self
             .platform
             .apply_connector_snapshot(snapshot, &known_connected);
-        let registry_delta = self.reconcile_connector_registry(
-            &rescan.connected,
-            &rescan.dropped_keys,
-            &rescan.dropped_layouts,
-        );
+        let registry_delta =
+            self.reconcile_connector_registry(&rescan.connected, &rescan.dropped_keys);
         let active_topology_changed = !rescan.dropped_old_indices.is_empty();
-        // Layout policy is the caller's (see the connector-snapshot doc
-        // comment). A VT resume does not relight remembered routes — the
-        // rescan that owns that runs once the VT is Active again — but it
-        // must still honour the reserved slots, or a survivor packs into a
-        // hole the later relight lands in (invariant 7).
+        // Layout policy is the caller's now (see the connector-snapshot doc
+        // comment): pack, then take the extent — immediately, and in the same
+        // order the snapshot used, so this move is a no-op.
         if active_topology_changed {
-            let reserved = self.reserved_layout_slots();
+            let reserved: Vec<crate::kms::render::platform::LayoutRect> = Vec::new();
             self.platform
                 .recompact_horizontal_layout(&configured, &reserved);
             self.platform
@@ -12109,171 +12001,6 @@ impl KmsBackend {
         true
     }
 
-    /// Rectangles held by routes that are physically gone but restorable.
-    ///
-    /// The reservation record *is* [`ConnectorEntry::last_enabled`], so a
-    /// slot is released exactly by clearing that field — there is no second
-    /// record that could go out of step with it. A remembered route that is
-    /// live again reserves nothing, which is why the live output list is
-    /// subtracted here rather than tracked separately.
-    fn reserved_layout_slots(&self) -> Vec<crate::kms::render::platform::LayoutRect> {
-        let live: HashSet<&OutputKey> = self
-            .platform
-            .outputs
-            .iter()
-            .map(|layout| &layout.key)
-            .collect();
-        let mut reserved: Vec<_> = self
-            .randr_id_alloc
-            .entries()
-            .filter(|(key, _)| !live.contains(key))
-            .filter_map(|(_, entry)| entry.last_enabled?.placed_rect())
-            .collect();
-        // `entries()` walks a HashMap; keep the result order stable so the
-        // packing decision does not depend on hash iteration order.
-        reserved.sort_unstable();
-        reserved
-    }
-
-    /// Decide which remembered routes this rescan restores, and release the
-    /// slots of the ones it can no longer restore.
-    ///
-    /// Registry-only — no DRM object is touched — so the whole P1 policy is
-    /// deterministic and unit testable. A returning connector whose refreshed
-    /// mode list still advertises the remembered mode is restored; one whose
-    /// refreshed list no longer does is left connected-but-Off with
-    /// `last_enabled` cleared, which both retires the route and releases its
-    /// reserved slot so the next compaction can reclaim it. A connector that
-    /// has not come back keeps its reservation untouched.
-    fn take_relight_requests(&mut self) -> Vec<RelightRequest> {
-        let mut restore: Vec<RelightRequest> = Vec::new();
-        let mut stale: Vec<OutputKey> = Vec::new();
-        for (key, entry) in self.randr_id_alloc.entries() {
-            let Some(route) = entry
-                .last_enabled
-                .and_then(ConnectorConfig::restorable_route)
-            else {
-                continue;
-            };
-            if !entry.connected {
-                // Still away. Keep the reservation; nothing to relight yet.
-                continue;
-            }
-            if !matches!(entry.config, ConnectorConfig::Off) {
-                continue;
-            }
-            if entry.modes.iter().any(|mode| {
-                mode.width == route.mode.width
-                    && mode.height == route.mode.height
-                    && mode.vrefresh == route.mode.vrefresh
-            }) {
-                restore.push(RelightRequest {
-                    key: key.clone(),
-                    mode: route.mode,
-                    x: route.x,
-                    y: route.y,
-                });
-            } else {
-                stale.push(key.clone());
-            }
-        }
-        for key in stale {
-            log::info!(
-                "kms: {} on {} returned without its previous mode; leaving it off and \
-                 releasing its reserved slot",
-                key.connector_name,
-                key.device_key,
-            );
-            self.randr_id_alloc.entry_mut(&key).last_enabled = None;
-        }
-        // `entries()` walks a HashMap; relight in a deterministic order.
-        restore.sort_by(|a, b| a.key.cmp(&b.key));
-        restore
-    }
-
-    /// Restore one remembered route through the ordinary enable path — the
-    /// same `enable_connector` a client `SetCrtcConfig` drives, so pool
-    /// allocation, the modeset and the `ActiveOutput` update are all handled.
-    ///
-    /// The caller must have quiesced the old topology first. Returns whether
-    /// the output is scanning out again.
-    fn relight_remembered_route(&mut self, request: &RelightRequest) -> bool {
-        let connector = request.key.connector_name.clone();
-        let Some(device) = self
-            .platform
-            .device_for_output(&request.key)
-            .map(|kms| Rc::clone(&kms.device))
-        else {
-            log::warn!(
-                "kms: relight of {connector} skipped: DRM device {} is gone",
-                request.key.device_key,
-            );
-            return false;
-        };
-        let reserved_routes: Vec<_> = self
-            .platform
-            .outputs
-            .iter()
-            .filter(|layout| {
-                layout.key.device_key == request.key.device_key && layout.key != request.key
-            })
-            .map(|layout| {
-                (
-                    layout.output.encoder,
-                    layout.output.crtc,
-                    layout.output.plane,
-                )
-            })
-            .collect();
-        let output = match crate::platform::drm::discover_output_for_connector(
-            &device,
-            &connector,
-            &reserved_routes,
-        ) {
-            Ok(output) => output,
-            Err(error) => {
-                log::error!("kms: relight of {connector}: target discovery failed: {error}");
-                return false;
-            }
-        };
-        if let Err(error) =
-            self.platform
-                .enable_connector(&request.key, output, request.mode, request.x, request.y)
-        {
-            log::error!("kms: relight of {connector}: enable_connector failed: {error}");
-            return false;
-        }
-        self.commit_relit_route(request);
-        log::info!(
-            "kms: relit {connector} {}x{}@{} at ({},{}) after reconnect",
-            request.mode.width,
-            request.mode.height,
-            request.mode.vrefresh,
-            request.x,
-            request.y,
-        );
-        true
-    }
-
-    /// Record a route the relight has just put back on the hardware.
-    ///
-    /// Releases the reservation (clearing `last_enabled` *is* the release) and
-    /// deliberately does **not** set `client_configured`: an auto-relight
-    /// restores a previous state, it does not record a new client intent, so
-    /// the auto-layout stays free to move this output later.
-    fn commit_relit_route(&mut self, request: &RelightRequest) {
-        let entry = self.randr_id_alloc.entry_mut(&request.key);
-        entry.config = ConnectorConfig::Enabled {
-            mode_w: request.mode.width,
-            mode_h: request.mode.height,
-            vrefresh: request.mode.vrefresh,
-            x: request.x,
-            y: request.y,
-        };
-        entry.connected = true;
-        entry.last_enabled = None;
-    }
-
     fn run_display_rescan(&mut self, state: &mut ServerState) {
         // Defer while VT-suspended: DRM master is dropped, so a rescan's
         // modeset ioctls would fail/wedge. (The old guard also required
@@ -12300,10 +12027,9 @@ impl KmsBackend {
         // Only an active removal can drop a pool or invalidate the scene's
         // output-index ledger. Metadata and inactive-connector changes leave
         // normal composition and direct scanout undisturbed.
-        let mut quiesced = false;
         if active_removed {
             match self.quiesce_before_topology_mutation("display hotplug rescan") {
-                Ok(()) => quiesced = true,
+                Ok(()) => {}
                 Err(error) => {
                     log::error!("kms: display rescan could not quiesce old topology: {error}");
                     return;
@@ -12311,70 +12037,24 @@ impl KmsBackend {
             }
         }
 
-        // The five steps below are ordered so that clients never observe the
-        // intermediate output-less state: the relight sits between registry
-        // reconciliation and publication, and layout policy runs only once
-        // the relight decision is known. See the design's
-        // "Ordering inside `run_display_rescan` is load-bearing".
-
-        // ── 1. Apply the physical snapshot (topology ownership only) ──────
         let configured = self.randr_id_alloc.client_configured_keys();
         let known_connected = self.randr_id_alloc.connected_keys();
         let rescan = self
             .platform
             .apply_connector_snapshot(snapshot, &known_connected);
-
-        // ── 2. Reconcile the registry (connection bits, modes, EDID) ──────
-        let registry_delta = self.reconcile_connector_registry(
-            &rescan.connected,
-            &rescan.dropped_keys,
-            &rescan.dropped_layouts,
-        );
-
-        // ── 3. Relight every route lost to a physical disconnect whose
-        //       connector has returned with a compatible mode. Not gated on
-        //       `client_configured`: a boot auto-layout session never sets it
-        //       and is exactly the reported configuration.
-        let relight_requests = self.take_relight_requests();
-        let mut relit = false;
-        if !relight_requests.is_empty() {
-            if !quiesced {
-                match self.quiesce_before_topology_mutation("display hotplug relight") {
-                    Ok(()) => quiesced = true,
-                    Err(error) => {
-                        log::error!(
-                            "kms: display rescan could not quiesce before relight: {error}"
-                        );
-                        return;
-                    }
-                }
-            }
-            for request in relight_requests {
-                relit |= self.relight_remembered_route(&request);
-            }
-        }
-
-        // ── 4. Layout policy: pack the auto-layout outputs around the slots
-        //       still reserved by departed-but-restorable routes, then take
-        //       the extent over the live layouts unioned with those slots.
-        let reserved = self.reserved_layout_slots();
+        let registry_delta =
+            self.reconcile_connector_registry(&rescan.connected, &rescan.dropped_keys);
+        // Layout policy is the caller's now (see the connector-snapshot doc
+        // comment): pack, then take the extent — immediately, and in the same
+        // order the snapshot used, so this move is a no-op.
         if !rescan.dropped_old_indices.is_empty() {
+            let reserved: Vec<crate::kms::render::platform::LayoutRect> = Vec::new();
             self.platform
                 .recompact_horizontal_layout(&configured, &reserved);
-        }
-        if !rescan.dropped_old_indices.is_empty() || relit {
-            // `enable_connector` already recomputed the extent over the live
-            // layouts alone; redo it so surviving reservations are counted.
             self.platform
                 .recompute_fb_extent_with_reservations(&reserved);
         }
-
-        // ── 5. Publish ────────────────────────────────────────────────────
-        // `quiesced` subsumes `active_removed`. Publishing is also what
-        // re-lights the topology we tore down, so a quiesce whose relight then
-        // failed must still go through `fire_randr_changes` rather than
-        // returning with every CRTC dark.
-        let should_publish = !registry_delta.is_empty() || quiesced || relit;
+        let should_publish = !registry_delta.is_empty() || active_removed;
         if !should_publish {
             log::debug!("kms: display rescan found no connector or active-topology change");
             return;
@@ -12384,8 +12064,8 @@ impl KmsBackend {
             rescan,
             &registry_delta.changed_keys,
             registry_delta.config_changed,
-            active_removed || relit,
-            quiesced && state.dpms.power_level == 0,
+            active_removed,
+            active_removed && state.dpms.power_level == 0,
         ) {
             return;
         }
@@ -19730,9 +19410,6 @@ impl Backend for KmsBackend {
             };
             entry.client_configured = true;
             entry.connected = true;
-            // The client has placed this output itself; the remembered route
-            // and its reserved slot are released.
-            entry.last_enabled = None;
         }
         log::info!(
             "finish_crtc_config: enabled {} {}x{}@{} at ({},{}) with qualified plan",
@@ -19882,11 +19559,6 @@ impl Backend for KmsBackend {
             // on a real change) — this is what breaks MATE's re-assert loop.
             let entry = self.randr_id_alloc.entry_mut(&output_key);
             entry.config = requested;
-            // A client asserting a config is an explicit statement of intent
-            // about this output, so it releases any remembered route (and
-            // with it the reserved slot). Never resurrect a route the client
-            // has spoken for.
-            entry.last_enabled = None;
             return Ok(false);
         }
 
@@ -19982,10 +19654,6 @@ impl Backend for KmsBackend {
                     // client_configured is set to record that a client
                     // explicitly disabled this output (not an auto-layout op).
                     entry.client_configured = true;
-                    // An explicit disable must not be undone by a later
-                    // auto-relight (invariant 6): unplugging a deliberately
-                    // disabled monitor may not resurrect it.
-                    entry.last_enabled = None;
                 }
             }
             Some(mode_spec) => {
@@ -20053,9 +19721,6 @@ impl Backend for KmsBackend {
                     };
                     entry.client_configured = true;
                     entry.connected = true;
-                    // The client has placed this output itself; the
-                    // remembered route and its reserved slot are released.
-                    entry.last_enabled = None;
                 }
 
                 log::info!(
@@ -29121,7 +28786,6 @@ mod tests {
                         connector_type: "unknown".to_string(),
                     }],
                     &[],
-                    &[],
                 )
                 .is_empty()
         );
@@ -29240,7 +28904,6 @@ mod tests {
                         connector_type: "DisplayPort".to_string(),
                     }],
                     &[],
-                    &[],
                 )
                 .is_empty()
         );
@@ -29304,7 +28967,7 @@ mod tests {
 
         assert!(
             !backend
-                .reconcile_connector_registry(&[], std::slice::from_ref(&sink_output), &[])
+                .reconcile_connector_registry(&[], std::slice::from_ref(&sink_output))
                 .is_empty()
         );
         backend.rebuild_randr_state(&mut state, None, true);
@@ -29329,7 +28992,6 @@ mod tests {
                         edid: Vec::new(),
                         connector_type: "DisplayPort".to_string(),
                     }],
-                    &[],
                     &[],
                 )
                 .is_empty()
@@ -29826,449 +29488,6 @@ mod tests {
         );
     }
 
-    // ── P1: hotplug relight, remembered routes and reserved slots ────────
-    //
-    // Design:
-    // `docs/superpowers/specs/2026-09-17-randr-crtc-model-and-hotplug-relight-design.md`,
-    // "P1 — restore the reconnect relight".
-
-    fn relight_test_snapshot(
-        key: &OutputKey,
-        modes: Vec<crate::platform::drm::Mode>,
-    ) -> ConnectorSnapshot {
-        ConnectorSnapshot {
-            key: key.clone(),
-            modes,
-            mm_width: 0,
-            mm_height: 0,
-            edid: Vec::new(),
-            connector_type: "unknown".to_string(),
-        }
-    }
-
-    /// Place a live output on the fixture at `(x, y)` with a `width x height`
-    /// mode, and mark its registry entry connected and scanning out there —
-    /// the state a boot auto-layout session reaches with no client request.
-    fn push_enabled_test_output(
-        b: &mut super::KmsBackend,
-        connector_name: &str,
-        raw_crtc: u32,
-        x: i32,
-        y: i32,
-        width: u16,
-        height: u16,
-    ) -> OutputKey {
-        use crate::kms::backend::ActiveOutput;
-        let device_key = b
-            .platform
-            .primary_device()
-            .expect("test fixture has a DRM device")
-            .key;
-        let scanout_route = b
-            .platform
-            .scanout_route_for_kms(device_key)
-            .expect("test fixture has a scanout route");
-        let mode = test_advertised_mode(width, height, 60, true);
-        let output = crate::platform::drm::Output {
-            connector: ::drm::control::from_u32(raw_crtc).unwrap(),
-            connector_name: connector_name.to_string(),
-            encoder: ::drm::control::from_u32(raw_crtc).unwrap(),
-            crtc: ::drm::control::from_u32(raw_crtc).unwrap(),
-            plane: ::drm::control::from_u32(raw_crtc).unwrap(),
-            // SAFETY: tests never pass this mode to DRM.
-            mode: unsafe { std::mem::zeroed() },
-            picked: mode.clone(),
-            plane_fb_id_prop: ::drm::control::from_u32(1).unwrap(),
-            plane_crtc_id_prop: ::drm::control::from_u32(1).unwrap(),
-            plane_src_x_prop: ::drm::control::from_u32(1).unwrap(),
-            plane_src_y_prop: ::drm::control::from_u32(1).unwrap(),
-            plane_src_w_prop: ::drm::control::from_u32(1).unwrap(),
-            plane_src_h_prop: ::drm::control::from_u32(1).unwrap(),
-            plane_crtc_x_prop: ::drm::control::from_u32(1).unwrap(),
-            plane_crtc_y_prop: ::drm::control::from_u32(1).unwrap(),
-            plane_crtc_w_prop: ::drm::control::from_u32(1).unwrap(),
-            plane_crtc_h_prop: ::drm::control::from_u32(1).unwrap(),
-            plane_in_fence_fd_prop: None,
-            crtc_out_fence_ptr_prop: None,
-            scanout_modifiers: Vec::new(),
-            mm_width: 0,
-            mm_height: 0,
-            edid: Vec::new(),
-            connector_type: "unknown".to_string(),
-            modes: vec![mode.clone()],
-        };
-        let active = ActiveOutput::new(
-            scanout_route,
-            output,
-            crate::drm::Swapchain::empty_for_tests(),
-            x,
-            y,
-        );
-        let key = active.key.clone();
-        b.platform.outputs.push(active);
-        b.platform.scanout_pools.push(None);
-        b.platform.bo_generations.push(Vec::new());
-        b.platform.first_pageflip_logged.push(false);
-        let entry = b.randr_id_alloc.entry_mut(&key);
-        entry.connected = true;
-        entry.modes = vec![mode];
-        entry.config = super::ConnectorConfig::Enabled {
-            mode_w: width,
-            mode_h: height,
-            vrefresh: 60,
-            x,
-            y,
-        };
-        key
-    }
-
-    fn clear_test_outputs(b: &mut super::KmsBackend) {
-        b.platform.outputs.clear();
-        b.platform.scanout_pools.clear();
-        b.platform.bo_generations.clear();
-        b.platform.first_pageflip_logged.clear();
-    }
-
-    fn rects_overlap(
-        a: crate::kms::render::platform::LayoutRect,
-        b: crate::kms::render::platform::LayoutRect,
-    ) -> bool {
-        let (ax, ay, aw, ah) = a;
-        let (bx, by, bw, bh) = b;
-        ax < bx + i32::from(bw)
-            && bx < ax + i32::from(aw)
-            && ay < by + i32::from(bh)
-            && by < ay + i32::from(ah)
-    }
-
-    #[test]
-    fn a_physical_disconnect_remembers_the_route_and_the_reconnect_relights_it() {
-        let mut backend = KmsBackend::for_tests();
-        clear_test_outputs(&mut backend);
-        let key = push_enabled_test_output(&mut backend, "HDMI-3", 7, 0, 0, 1920, 1080);
-        let snapshot =
-            relight_test_snapshot(&key, vec![test_advertised_mode(1920, 1080, 60, true)]);
-
-        // ── Physical departure ───────────────────────────────────────────
-        let rescan = backend
-            .platform
-            .apply_connector_snapshot(Vec::new(), &std::collections::HashSet::from([key.clone()]));
-        let _ = backend.reconcile_connector_registry(
-            &rescan.connected,
-            &rescan.dropped_keys,
-            &rescan.dropped_layouts,
-        );
-
-        let entry = backend.randr_id_alloc.entry(&key).unwrap();
-        assert!(!entry.connected);
-        assert_eq!(entry.config, super::ConnectorConfig::Off);
-        assert_eq!(
-            entry.last_enabled,
-            Some(super::ConnectorConfig::Enabled {
-                mode_w: 1920,
-                mode_h: 1080,
-                vrefresh: 60,
-                x: 0,
-                y: 0,
-            }),
-            "the departed route is remembered from the layout that actually departed",
-        );
-        assert_eq!(backend.reserved_layout_slots(), vec![(0, 0, 1920, 1080)]);
-        assert!(
-            backend.take_relight_requests().is_empty(),
-            "a connector that has not come back is not relit",
-        );
-        assert!(
-            backend
-                .randr_id_alloc
-                .entry(&key)
-                .unwrap()
-                .last_enabled
-                .is_some(),
-            "and it keeps its reservation while it is away",
-        );
-
-        // ── Reconnect ────────────────────────────────────────────────────
-        let _ = backend.reconcile_connector_registry(std::slice::from_ref(&snapshot), &[], &[]);
-        let requests = backend.take_relight_requests();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].key, key);
-        assert_eq!(
-            requests[0].mode,
-            yserver_core::backend::ModeSpec {
-                width: 1920,
-                height: 1080,
-                vrefresh: 60,
-            },
-        );
-        assert_eq!((requests[0].x, requests[0].y), (0, 0));
-
-        backend.commit_relit_route(&requests[0]);
-        let entry = backend.randr_id_alloc.entry(&key).unwrap();
-        assert_eq!(
-            entry.config,
-            super::ConnectorConfig::Enabled {
-                mode_w: 1920,
-                mode_h: 1080,
-                vrefresh: 60,
-                x: 0,
-                y: 0,
-            },
-        );
-        assert!(
-            !entry.client_configured,
-            "an auto-relight restores a previous state; it is not a client intent",
-        );
-        assert!(entry.last_enabled.is_none(), "the reservation is released");
-        assert!(backend.reserved_layout_slots().is_empty());
-    }
-
-    #[test]
-    fn a_route_that_was_already_off_when_it_departed_is_never_relit() {
-        // A client's explicit SetCrtcConfig(mode=None) leaves the entry Off,
-        // so the later unplug has no route to remember. Unplugging a
-        // deliberately disabled monitor must not resurrect it (invariant 6).
-        let mut backend = KmsBackend::for_tests();
-        clear_test_outputs(&mut backend);
-        let key = push_enabled_test_output(&mut backend, "HDMI-3", 7, 0, 0, 1920, 1080);
-        backend.randr_id_alloc.entry_mut(&key).config = super::ConnectorConfig::Off;
-        backend.randr_id_alloc.entry_mut(&key).client_configured = true;
-        let snapshot =
-            relight_test_snapshot(&key, vec![test_advertised_mode(1920, 1080, 60, true)]);
-
-        let rescan = backend
-            .platform
-            .apply_connector_snapshot(Vec::new(), &std::collections::HashSet::from([key.clone()]));
-        assert_eq!(
-            rescan.dropped_layouts.len(),
-            1,
-            "the live route was still there to drop",
-        );
-        let _ = backend.reconcile_connector_registry(
-            &rescan.connected,
-            &rescan.dropped_keys,
-            &rescan.dropped_layouts,
-        );
-
-        assert!(
-            backend
-                .randr_id_alloc
-                .entry(&key)
-                .unwrap()
-                .last_enabled
-                .is_none(),
-        );
-        assert!(backend.reserved_layout_slots().is_empty());
-
-        let _ = backend.reconcile_connector_registry(std::slice::from_ref(&snapshot), &[], &[]);
-        assert!(backend.take_relight_requests().is_empty());
-    }
-
-    #[test]
-    fn a_client_config_on_a_departed_output_releases_its_reservation() {
-        // Design, "Layout policy — reserved slots" point 4: a client
-        // SetCrtcConfig on a departed output releases the reservation, and
-        // releasing it is exactly clearing `last_enabled`.
-        let mut backend = KmsBackend::for_tests();
-        clear_test_outputs(&mut backend);
-        let key = push_enabled_test_output(&mut backend, "HDMI-3", 7, 0, 0, 1920, 1080);
-        let output_id = backend.randr_id_alloc.ids_for(&key).output_id;
-        let snapshot =
-            relight_test_snapshot(&key, vec![test_advertised_mode(1920, 1080, 60, true)]);
-
-        let rescan = backend
-            .platform
-            .apply_connector_snapshot(Vec::new(), &std::collections::HashSet::from([key.clone()]));
-        let _ = backend.reconcile_connector_registry(
-            &rescan.connected,
-            &rescan.dropped_keys,
-            &rescan.dropped_layouts,
-        );
-        assert_eq!(backend.reserved_layout_slots(), vec![(0, 0, 1920, 1080)]);
-
-        // Publish, so the request path can resolve the output XID.
-        let (outputs, modes) = backend.randr_outputs_and_modes();
-        let mut state = ServerState::with_randr_outputs_and_modes(
-            backend.platform.fb_w,
-            backend.platform.fb_h,
-            outputs,
-            modes,
-            yserver_core::server::BackendCapabilities::from_backend(&backend),
-        );
-        backend.rebuild_randr_state(&mut state, None, false);
-
-        // The route is already gone, so this disable is the no-op path: it
-        // touches no hardware but is still an explicit client statement.
-        assert!(
-            !backend
-                .apply_crtc_config(output_id, "HDMI-3", None, 0, 0)
-                .expect("disabling an already-off output is a no-op"),
-        );
-
-        assert!(
-            backend
-                .randr_id_alloc
-                .entry(&key)
-                .unwrap()
-                .last_enabled
-                .is_none(),
-        );
-        assert!(backend.reserved_layout_slots().is_empty());
-        let _ = backend.reconcile_connector_registry(std::slice::from_ref(&snapshot), &[], &[]);
-        assert!(backend.take_relight_requests().is_empty());
-    }
-
-    #[test]
-    fn an_incompatible_mode_reconnect_leaves_the_output_off_and_does_not_re_reserve() {
-        let mut backend = KmsBackend::for_tests();
-        clear_test_outputs(&mut backend);
-        let key = push_enabled_test_output(&mut backend, "HDMI-3", 7, 0, 0, 1920, 1080);
-        // The monitor is replaced by a panel that cannot do 1920x1080@60.
-        let replacement =
-            relight_test_snapshot(&key, vec![test_advertised_mode(1024, 768, 60, true)]);
-
-        let rescan = backend
-            .platform
-            .apply_connector_snapshot(Vec::new(), &std::collections::HashSet::from([key.clone()]));
-        let _ = backend.reconcile_connector_registry(
-            &rescan.connected,
-            &rescan.dropped_keys,
-            &rescan.dropped_layouts,
-        );
-        assert_eq!(backend.reserved_layout_slots(), vec![(0, 0, 1920, 1080)]);
-
-        // First rescan after the replacement panel appears.
-        let _ = backend.reconcile_connector_registry(std::slice::from_ref(&replacement), &[], &[]);
-        assert!(backend.take_relight_requests().is_empty());
-        let entry = backend.randr_id_alloc.entry(&key).unwrap();
-        assert_eq!(entry.config, super::ConnectorConfig::Off);
-        assert!(
-            entry.last_enabled.is_none(),
-            "the remembered route is cleared, which is what releases the slot",
-        );
-        assert!(backend.reserved_layout_slots().is_empty());
-
-        // A SECOND rescan: a stale reservation would re-reserve the slot here,
-        // and the single-rescan assertion above would not have caught it.
-        let _ = backend.reconcile_connector_registry(std::slice::from_ref(&replacement), &[], &[]);
-        assert!(backend.take_relight_requests().is_empty());
-        assert!(backend.reserved_layout_slots().is_empty());
-        assert_eq!(
-            backend.randr_id_alloc.entry(&key).unwrap().config,
-            super::ConnectorConfig::Off,
-        );
-    }
-
-    #[test]
-    fn a_reserved_slot_keeps_the_survivor_in_place_and_the_relight_cannot_overlap_it() {
-        // codex's counterexample: A at x=0, B at x=1920. Without the
-        // reservation, unplugging A compacts B to x=0 and shrinks the extent,
-        // so restoring A at its remembered x=0 overlaps B (invariant 7).
-        let mut backend = KmsBackend::for_tests();
-        clear_test_outputs(&mut backend);
-        let a = push_enabled_test_output(&mut backend, "A", 7, 0, 0, 1920, 1080);
-        let b = push_enabled_test_output(&mut backend, "B", 8, 1920, 0, 3200, 1440);
-        backend.platform.fb_w = 5120;
-        backend.platform.fb_h = 1440;
-        let snapshot_a =
-            relight_test_snapshot(&a, vec![test_advertised_mode(1920, 1080, 60, true)]);
-        let snapshot_b =
-            relight_test_snapshot(&b, vec![test_advertised_mode(3200, 1440, 60, true)]);
-
-        // ── Unplug A ─────────────────────────────────────────────────────
-        let rescan = backend.platform.apply_connector_snapshot(
-            vec![snapshot_b.clone()],
-            &std::collections::HashSet::from([a.clone(), b.clone()]),
-        );
-        let _ = backend.reconcile_connector_registry(
-            &rescan.connected,
-            &rescan.dropped_keys,
-            &rescan.dropped_layouts,
-        );
-        let reserved = backend.reserved_layout_slots();
-        assert_eq!(reserved, vec![(0, 0, 1920, 1080)]);
-        let configured = backend.randr_id_alloc.client_configured_keys();
-        assert!(configured.is_empty(), "a bare session pins nothing");
-        backend
-            .platform
-            .recompact_horizontal_layout(&configured, &reserved);
-        backend
-            .platform
-            .recompute_fb_extent_with_reservations(&reserved);
-
-        assert_eq!(backend.platform.outputs.len(), 1);
-        assert_eq!(
-            (backend.platform.outputs[0].x, backend.platform.outputs[0].y),
-            (1920, 0),
-            "B must not move into A's reserved slot",
-        );
-        assert_eq!(backend.platform.fb_dimensions(), (5120, 1440));
-
-        // ── Replug A ─────────────────────────────────────────────────────
-        let _ = backend.reconcile_connector_registry(&[snapshot_a, snapshot_b], &[], &[]);
-        let requests = backend.take_relight_requests();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].key, a);
-        assert_eq!(
-            (requests[0].x, requests[0].y),
-            (0, 0),
-            "A returns to its own slot"
-        );
-
-        let a_rect = (
-            requests[0].x,
-            requests[0].y,
-            requests[0].mode.width,
-            requests[0].mode.height,
-        );
-        let survivor = &backend.platform.outputs[0];
-        let b_rect = (survivor.x, survivor.y, survivor.width, survivor.height);
-        assert!(
-            !rects_overlap(a_rect, b_rect),
-            "the relit route {a_rect:?} must not overlap the survivor {b_rect:?}",
-        );
-    }
-
-    #[test]
-    fn dropping_a_never_enabled_output_reserves_nothing_and_survivors_compact() {
-        // The reservation must not freeze the layout unconditionally.
-        let mut backend = KmsBackend::for_tests();
-        clear_test_outputs(&mut backend);
-        let a = push_enabled_test_output(&mut backend, "A", 7, 0, 0, 1920, 1080);
-        let b = push_enabled_test_output(&mut backend, "B", 8, 1920, 0, 3200, 1440);
-        // A was never enabled — it is connected-but-Off, as a runtime-added
-        // connector enters the registry.
-        backend.randr_id_alloc.entry_mut(&a).config = super::ConnectorConfig::Off;
-        let snapshot_b =
-            relight_test_snapshot(&b, vec![test_advertised_mode(3200, 1440, 60, true)]);
-
-        let rescan = backend.platform.apply_connector_snapshot(
-            vec![snapshot_b],
-            &std::collections::HashSet::from([a.clone(), b]),
-        );
-        let _ = backend.reconcile_connector_registry(
-            &rescan.connected,
-            &rescan.dropped_keys,
-            &rescan.dropped_layouts,
-        );
-
-        let reserved = backend.reserved_layout_slots();
-        assert!(reserved.is_empty(), "nothing enabled, nothing to reserve");
-        let configured = backend.randr_id_alloc.client_configured_keys();
-        backend
-            .platform
-            .recompact_horizontal_layout(&configured, &reserved);
-        backend
-            .platform
-            .recompute_fb_extent_with_reservations(&reserved);
-
-        assert_eq!(
-            (backend.platform.outputs[0].x, backend.platform.outputs[0].y),
-            (0, 0),
-        );
-        assert_eq!(backend.platform.fb_dimensions(), (3200, 1440));
-    }
-
     #[test]
     fn startup_inventory_reserves_xids_but_heavy_snapshot_owns_identity_and_state() {
         use crate::platform::drm::ConnectorProbe;
@@ -30414,12 +29633,12 @@ mod tests {
 
         assert!(
             !backend
-                .reconcile_connector_registry(std::slice::from_ref(&first), &[], &[])
+                .reconcile_connector_registry(std::slice::from_ref(&first), &[])
                 .is_empty()
         );
         let ids = backend.randr_id_alloc.entry(&key).unwrap().ids;
         let replacement_delta =
-            backend.reconcile_connector_registry(std::slice::from_ref(&replacement), &[], &[]);
+            backend.reconcile_connector_registry(std::slice::from_ref(&replacement), &[]);
         assert!(
             !replacement_delta.is_empty(),
             "a changed EDID must invalidate the heavy RANDR projection"
@@ -30433,7 +29652,7 @@ mod tests {
         assert_eq!(entry.edid, replacement.edid);
         assert!(
             backend
-                .reconcile_connector_registry(std::slice::from_ref(&replacement), &[], &[])
+                .reconcile_connector_registry(std::slice::from_ref(&replacement), &[])
                 .is_empty(),
             "the refreshed heavy snapshot is idempotent"
         );
@@ -30457,7 +29676,7 @@ mod tests {
 
         assert!(
             !backend
-                .reconcile_connector_registry(std::slice::from_ref(&replacement), &[], &[])
+                .reconcile_connector_registry(std::slice::from_ref(&replacement), &[])
                 .is_empty()
         );
         let (refreshed, mode_table) = backend.randr_outputs_and_modes();
@@ -30492,7 +29711,7 @@ mod tests {
         };
         assert!(
             !backend
-                .reconcile_connector_registry(std::slice::from_ref(&snapshot), &[], &[])
+                .reconcile_connector_registry(std::slice::from_ref(&snapshot), &[])
                 .is_empty()
         );
         let ids = backend.randr_id_alloc.entry(&key).unwrap().ids;
@@ -30512,7 +29731,7 @@ mod tests {
 
         assert!(
             !backend
-                .reconcile_connector_registry(&[], std::slice::from_ref(&key), &[])
+                .reconcile_connector_registry(&[], std::slice::from_ref(&key))
                 .is_empty()
         );
         let (outputs, _) = backend.randr_outputs_and_modes();
@@ -30642,7 +29861,7 @@ mod tests {
         let light_config_timestamp = state.randr.config_timestamp;
         assert!(
             backend
-                .reconcile_connector_registry(&[], std::slice::from_ref(&key), &[])
+                .reconcile_connector_registry(&[], std::slice::from_ref(&key))
                 .is_empty(),
             "the later heavy boundary sees no second advertised connector delta",
         );
@@ -30741,7 +29960,6 @@ mod tests {
         let heavy_delta = backend.reconcile_connector_registry(
             std::slice::from_ref(&snapshot),
             std::slice::from_ref(&key),
-            &[],
         );
         assert!(heavy_delta.is_empty());
         assert!(!heavy_delta.config_changed);
@@ -30780,7 +29998,7 @@ mod tests {
 
         assert!(
             !backend
-                .reconcile_connector_registry(&[], std::slice::from_ref(&key), &[])
+                .reconcile_connector_registry(&[], std::slice::from_ref(&key))
                 .is_empty()
         );
         let projected = backend.randr_outputs();
@@ -30857,7 +30075,7 @@ mod tests {
 
         assert!(
             !backend
-                .reconcile_connector_registry(&[replacement], &[], &[])
+                .reconcile_connector_registry(&[replacement], &[])
                 .is_empty()
         );
         let (outputs, modes) = backend.randr_outputs_and_modes();

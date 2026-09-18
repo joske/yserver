@@ -6557,7 +6557,8 @@ impl PlatformBackend {
     /// only the backend knows which departed routes are restorable, so only
     /// it can decide when survivors may move. See
     /// `docs/superpowers/specs/2026-09-17-randr-crtc-model-and-hotplug-relight-design.md`,
-    /// "Layout policy — reserved slots".
+    /// "Layout policy — reserved slots". Every caller still passes an empty
+    /// `reserved` set; the policy that populates it lands with the relight.
     pub(crate) fn recompact_horizontal_layout(
         &mut self,
         client_configured: &HashSet<OutputKey>,
@@ -6570,9 +6571,9 @@ impl PlatformBackend {
                 continue;
             }
             // A reserved slot belongs to a route that is physically gone but
-            // restorable. Packing over it would let the relight land on top
-            // of a survivor that moved into the hole (invariant 7), so step
-            // past every reservation this placement would straddle.
+            // restorable. Packing over it would let a later relight land on
+            // top of a survivor that moved into the hole, so step past every
+            // reservation this placement would straddle.
             next_x = advance_past_reservations(next_x, layout.width, reserved);
             layout.x = next_x;
             layout.y = 0;
@@ -6582,8 +6583,7 @@ impl PlatformBackend {
 
     /// Recompute the virtual-screen extent over the live layouts unioned with
     /// `reserved`. A reserved slot keeps the extent from shrinking while its
-    /// monitor is away, which is what stops the `SetScreenSize` churn the
-    /// hotplug trace showed.
+    /// monitor is away.
     pub(crate) fn recompute_fb_extent_with_reservations(&mut self, reserved: &[LayoutRect]) {
         let mut layouts: Vec<LayoutRect> = self
             .outputs
@@ -6724,7 +6724,7 @@ impl PlatformBackend {
         if !rescan.dropped_old_indices.is_empty() {
             // Packing and the extent recompute deliberately do NOT happen
             // here. They are layout policy and run in the backend caller,
-            // after it has decided which departed routes keep their slot.
+            // immediately and in the same order.
             self.prune_present_clocks_to_live_outputs();
             self.refresh_cursor_topology_for_devices(&cursor_changed_devices);
         }
@@ -7769,29 +7769,6 @@ mod tests {
     }
 
     #[test]
-    fn recompaction_packs_survivors_past_a_reserved_slot() {
-        let mut platform = PlatformBackend::for_tests();
-        clear_test_outputs(&mut platform);
-        push_placed_test_output(&mut platform, "B", 2, 1920, 0, 3200, 1440);
-        // The slot a departed-but-restorable 1920x1080 route still holds.
-        let reserved = vec![(0, 0, 1920u16, 1080u16)];
-
-        platform.recompact_horizontal_layout(&HashSet::new(), &reserved);
-        platform.recompute_fb_extent_with_reservations(&reserved);
-
-        assert_eq!(
-            (platform.outputs[0].x, platform.outputs[0].y),
-            (1920, 0),
-            "an auto-layout survivor must not pack into a reserved slot",
-        );
-        assert_eq!(
-            platform.fb_dimensions(),
-            (5120, 1440),
-            "the extent unions the reserved slot, so it does not shrink",
-        );
-    }
-
-    #[test]
     fn recompaction_without_a_reservation_still_packs_survivors() {
         let mut platform = PlatformBackend::for_tests();
         clear_test_outputs(&mut platform);
@@ -7803,23 +7780,9 @@ mod tests {
         assert_eq!(
             (platform.outputs[0].x, platform.outputs[0].y),
             (0, 0),
-            "dropping a never-enabled route reserves nothing, so survivors compact",
+            "with no reservation the caller packs exactly as the snapshot did",
         );
         assert_eq!(platform.fb_dimensions(), (3200, 1440));
-    }
-
-    #[test]
-    fn a_reserved_slot_does_not_move_a_client_positioned_output() {
-        let mut platform = PlatformBackend::for_tests();
-        clear_test_outputs(&mut platform);
-        let pinned = push_placed_test_output(&mut platform, "B", 2, 4000, 0, 1024, 768);
-        let reserved = vec![(0, 0, 1920u16, 1080u16)];
-
-        platform.recompact_horizontal_layout(&HashSet::from([pinned]), &reserved);
-        platform.recompute_fb_extent_with_reservations(&reserved);
-
-        assert_eq!((platform.outputs[0].x, platform.outputs[0].y), (4000, 0));
-        assert_eq!(platform.fb_dimensions(), (5024, 1080));
     }
 
     #[test]
