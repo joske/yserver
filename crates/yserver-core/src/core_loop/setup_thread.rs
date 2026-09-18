@@ -38,7 +38,7 @@ use crate::{
         message::{Message, SetupAllocateResponse},
         sender::BoundSender,
     },
-    resources::{ARGB_VISUAL, ROOT_COLORMAP, ROOT_VISUAL, ROOT_WINDOW},
+    resources::{ARGB_VISUAL, GLMARK_VISUAL, ROOT_COLORMAP, ROOT_VISUAL, ROOT_WINDOW},
     transport::Transport,
 };
 
@@ -254,6 +254,7 @@ fn run_setup(
                 max_installed_maps: 1,
                 root_visual: ROOT_VISUAL,
                 argb_visual: ARGB_VISUAL,
+                glmark_visual: GLMARK_VISUAL,
                 root_depth: crate::resources::ROOT_DEPTH,
             },
         },

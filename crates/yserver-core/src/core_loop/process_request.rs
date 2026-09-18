@@ -1927,6 +1927,7 @@ fn handle_render_request(
                 sequence,
                 crate::resources::ROOT_VISUAL,
                 ARGB_VISUAL,
+                crate::resources::GLMARK_VISUAL,
             )?;
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
@@ -13396,12 +13397,13 @@ fn synthesise_glx_visual_configs() -> Vec<yserver_protocol::x11::glx::VisualConf
     // X11 visual class 4 == TrueColor, matching the class we put in the
     // setup-reply visual list.
     const TRUE_COLOR: u32 = 4;
-    let mut out: Vec<VisualConfig> = Vec::with_capacity(2);
-    for &(visual_id, alpha_bits, rgb_bits) in &[
+    let mut out: Vec<VisualConfig> = Vec::with_capacity(3);
+    for &(visual_id, alpha_bits, rgb_bits, stencil_bits) in &[
         // Must match the client driver's configs (see synthesise_glx_fb_configs):
         // radeonsi advertises alpha-8 / 32-bit-buffer for both depths.
-        (0x102_u32, 8_u32, 32_u32), // ROOT_VISUAL — TrueColor (GL alpha 8)
-        (0x103_u32, 8_u32, 32_u32), // ARGB_VISUAL — TrueColor RGBA
+        (0x102_u32, 8_u32, 32_u32, 8_u32), // ROOT_VISUAL — TrueColor (GL alpha 8)
+        (0x103_u32, 8_u32, 32_u32, 8_u32), // ARGB_VISUAL — TrueColor RGBA
+        (crate::resources::GLMARK_VISUAL.0, 8_u32, 32_u32, 0_u32),
     ] {
         out.push(VisualConfig {
             visual_id,
@@ -13415,7 +13417,7 @@ fn synthesise_glx_visual_configs() -> Vec<yserver_protocol::x11::glx::VisualConf
             stereo: false,
             rgb_bits,
             depth_bits: 24,
-            stencil_bits: 8,
+            stencil_bits,
             aux_buffers: 0,
             level: 0,
         });
@@ -13454,10 +13456,9 @@ fn glx_extension_string(tfp_supported: bool) -> String {
 
 fn synthesise_glx_fb_configs(tfp_supported: bool) -> Vec<Vec<(u32, u32)>> {
     use yserver_protocol::x11::glx as g;
-    let mut out = Vec::with_capacity(3);
+    let mut out = Vec::with_capacity(4);
     let depth = 24;
-    let stencil = 8;
-    for &(visual_id, fbconfig_id, alpha_size, total_buffer_size) in &[
+    for &(visual_id, fbconfig_id, alpha_size, total_buffer_size, stencil) in &[
         // (X visual id, FBConfig id, alpha bits, total color buffer bits)
         //
         // These MUST match the client driver's __DRIconfig attributes
@@ -13468,10 +13469,17 @@ fn synthesise_glx_fb_configs(tfp_supported: bool) -> Vec<Vec<(u32, u32)>> {
         // 32-bit-buffer (the GL backbuffer is BGRA8 regardless of the X
         // visual's opacity), so we mirror that for both. The depth-24 X
         // visual stays opaque on screen; the alpha is GL-side only.
-        (0x102_u32, 0x101_u32, 8_u32, 32_u32), // ROOT_VISUAL — TrueColor
+        (0x102_u32, 0x101_u32, 8_u32, 32_u32, 8_u32), // ROOT_VISUAL — TrueColor
         // Preserve the IDs of the two double-buffered configurations while
         // dropping the ambiguous single-buffered 0x102 and 0x104 entries.
-        (0x103_u32, 0x103_u32, 8_u32, 32_u32), // ARGB_VISUAL — TrueColor RGBA
+        (0x103_u32, 0x103_u32, 8_u32, 32_u32, 8_u32), // ARGB_VISUAL — TrueColor RGBA
+        (
+            crate::resources::GLMARK_VISUAL.0,
+            0x105_u32,
+            8_u32,
+            32_u32,
+            0_u32,
+        ),
     ] {
         let mut config = vec![
             (g::GLX_VISUAL_ID, visual_id),
@@ -31239,11 +31247,11 @@ mod tests {
         use yserver_protocol::x11::glx as g;
 
         let visuals = synthesise_glx_visual_configs();
-        assert_eq!(visuals.len(), 2);
+        assert_eq!(visuals.len(), 3);
         assert!(visuals.iter().all(|visual| visual.double_buffer));
 
         let configs = synthesise_glx_fb_configs(false);
-        assert_eq!(configs.len(), 3);
+        assert_eq!(configs.len(), 4);
         let mut visual_ids = HashSet::new();
         for config in configs {
             let get = |attr: u32| config.iter().find(|(a, _)| *a == attr).map(|(_, v)| *v);
@@ -31259,7 +31267,43 @@ mod tests {
                 assert_eq!(get(g::GLX_DOUBLEBUFFER), Some(1));
             }
         }
-        assert_eq!(visual_ids.len(), 2);
+        assert_eq!(visual_ids.len(), 3);
+    }
+
+    // glmark2 2023.01 defaults to stencil=0 and rejects any positive
+    // stencil count while choosing its default FBConfig. Keep that config on
+    // a distinct X visual: reusing ROOT_VISUAL would recreate the config /
+    // visual ambiguity that made Mesa allocate fake front buffers (#96).
+    #[test]
+    fn glmark_can_choose_an_opaque_zero_stencil_window_config() {
+        use yserver_protocol::x11::glx as g;
+
+        let config = synthesise_glx_fb_configs(false)
+            .into_iter()
+            .find(|config| {
+                let get = |attribute| {
+                    config
+                        .iter()
+                        .find(|(key, _)| *key == attribute)
+                        .map(|(_, value)| *value)
+                };
+                get(g::GLX_DRAWABLE_TYPE).is_some_and(|value| value & g::GLX_WINDOW_BIT != 0)
+                    && get(g::GLX_DOUBLEBUFFER) == Some(1)
+                    && get(g::GLX_STENCIL_SIZE) == Some(0)
+            })
+            .expect("a double-buffered stencil-0 window FBConfig for glmark2");
+        let get = |attribute| {
+            config
+                .iter()
+                .find(|(key, _)| *key == attribute)
+                .map(|(_, value)| *value)
+        };
+        assert_ne!(get(g::GLX_VISUAL_ID), Some(crate::resources::ROOT_VISUAL.0));
+        assert_ne!(get(g::GLX_VISUAL_ID), Some(crate::resources::ARGB_VISUAL.0));
+        assert_eq!(
+            get(g::GLX_VISUAL_ID),
+            Some(crate::resources::GLMARK_VISUAL.0)
+        );
     }
 
     // QtWebEngine's GLXHelper chooses a native-pixmap config with this exact

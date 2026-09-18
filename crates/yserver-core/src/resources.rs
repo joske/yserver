@@ -40,6 +40,9 @@ pub const ROOT_VISUAL: ResourceId = ResourceId(0x102);
 pub const COMPOSITE_OVERLAY_WINDOW: ResourceId = ResourceId(0x103);
 pub const ARGB_VISUAL: ResourceId = ResourceId(0x103);
 pub const ARGB_COLORMAP: ResourceId = ResourceId(0x104);
+/// Opaque depth-24 visual dedicated to the stencil-free GLX FBConfig used by
+/// glmark2. It must not share ROOT_VISUAL with the stencil-8 configuration.
+pub const GLMARK_VISUAL: ResourceId = ResourceId(0x105);
 
 /// The X11 depth of the root window, as advertised in the setup reply.
 ///
@@ -287,6 +290,21 @@ impl Default for ResourceTable {
                 green_mask: 0x0000_ff00,
                 blue_mask: 0x0000_00ff,
                 alpha_mask: 0xff00_0000,
+                host_visual_xid: None,
+            },
+        );
+        visuals.insert(
+            GLMARK_VISUAL.0,
+            Visual {
+                id: GLMARK_VISUAL,
+                class: VISUAL_CLASS_TRUE_COLOR,
+                depth: 24,
+                bits_per_rgb: 8,
+                colormap_entries: 256,
+                red_mask: 0x00ff_0000,
+                green_mask: 0x0000_ff00,
+                blue_mask: 0x0000_00ff,
+                alpha_mask: 0,
                 host_visual_xid: None,
             },
         );
@@ -5281,7 +5299,7 @@ mod tests {
     }
 
     #[test]
-    fn visual_table_seeded_with_root_and_argb() {
+    fn visual_table_seeds_all_advertised_visuals() {
         let t = ResourceTable::new();
         let root = t.visual(ROOT_VISUAL).expect("root visual seeded");
         assert_eq!(root.depth, 24);
@@ -5291,6 +5309,10 @@ mod tests {
         assert_eq!(argb.depth, 32);
         assert_eq!(argb.alpha_mask, 0xff00_0000);
         assert_eq!(argb.host_visual_xid, None);
+        let glmark = t.visual(GLMARK_VISUAL).expect("glmark visual seeded");
+        assert_eq!(glmark.depth, 24);
+        assert_eq!(glmark.alpha_mask, 0);
+        assert_eq!(glmark.host_visual_xid, None);
     }
 
     #[test]
@@ -5336,6 +5358,7 @@ mod tests {
         let t = ResourceTable::new();
         assert!(t.is_known_visual(ROOT_VISUAL));
         assert!(t.is_known_visual(ARGB_VISUAL));
+        assert!(t.is_known_visual(GLMARK_VISUAL));
         // 0 is the wire encoding for CopyFromParent — not in the table; the
         // CreateWindow handler validates separately and never queries this.
         assert!(!t.is_known_visual(ResourceId(0)));

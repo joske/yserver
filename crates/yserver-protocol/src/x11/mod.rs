@@ -106,6 +106,7 @@ pub struct Screen {
     pub max_installed_maps: u16,
     pub root_visual: ResourceId,
     pub argb_visual: ResourceId,
+    pub glmark_visual: ResourceId,
     pub root_depth: u8,
 }
 
@@ -775,12 +776,22 @@ fn write_screen(byte_order: ClientByteOrder, out: &mut Vec<u8>, screen: Screen) 
     write_u16(byte_order, out, 0);
     write_u32(byte_order, out, 0);
 
-    // depth=24 (root depth), 1 visual: TrueColor RGB
+    // depth=24, 2 visuals: the root stencil-8 GLX visual plus glmark's
+    // stencil-0 GLX visual. They are distinct IDs even though their X pixel
+    // format is identical, matching Xorg's per-FBConfig visual model.
     out.push(24);
     out.push(0);
-    write_u16(byte_order, out, 1);
+    write_u16(byte_order, out, 2);
     write_u32(byte_order, out, 0);
     write_u32(byte_order, out, screen.root_visual.0);
+    out.push(4); // TrueColor
+    out.push(8); // bits per rgb
+    write_u16(byte_order, out, 256);
+    write_u32(byte_order, out, 0x00ff_0000);
+    write_u32(byte_order, out, 0x0000_ff00);
+    write_u32(byte_order, out, 0x0000_00ff);
+    write_u32(byte_order, out, 0);
+    write_u32(byte_order, out, screen.glmark_visual.0);
     out.push(4); // TrueColor
     out.push(8); // bits per rgb
     write_u16(byte_order, out, 256);
@@ -6416,16 +6427,17 @@ pub fn write_render_query_pict_formats_reply(
     sequence: SequenceNumber,
     root_visual: ResourceId,
     argb_visual: ResourceId,
+    glmark_visual: ResourceId,
 ) -> io::Result<()> {
     // 5 formats × 28 bytes = 140 bytes
     // 1 screen: 8-byte prelude + 2 depth sections (8-byte header +
-    //   one 8-byte visual-format pair each) = 40 bytes
-    // Total body = 180 bytes = 45 × 4-byte units
+    //   two depth-24 and one depth-32 8-byte visual-format pairs) = 48 bytes
+    // Total body = 188 bytes = 47 × 4-byte units
     let num_formats: u32 = 5;
     let num_screens: u32 = 1;
     let num_depths: u32 = 2;
-    let num_visuals: u32 = 2;
-    let body_units: u32 = (140 + 40) / 4; // 45
+    let num_visuals: u32 = 3;
+    let body_units: u32 = (140 + 48) / 4; // 47
 
     let mut out = Vec::new();
     out.push(1u8); // Reply
@@ -6519,12 +6531,14 @@ pub fn write_render_query_pict_formats_reply(
     // Screen info: 1 screen with 2 depths
     write_u32(byte_order, &mut out, num_depths); // nDepth per screen
     write_u32(byte_order, &mut out, RENDER_FMT_RGB24); // fallback
-    // Depth 24 entry: 8-byte header + 1 visual (8 bytes)
+    // Depth 24 entry: 8-byte header + 2 visuals (16 bytes)
     out.push(24);
     out.push(0);
-    write_u16(byte_order, &mut out, 1); // 1 visual
+    write_u16(byte_order, &mut out, 2); // 2 visuals
     write_u32(byte_order, &mut out, 0); // pad
     write_u32(byte_order, &mut out, root_visual.0);
+    write_u32(byte_order, &mut out, RENDER_FMT_RGB24);
+    write_u32(byte_order, &mut out, glmark_visual.0);
     write_u32(byte_order, &mut out, RENDER_FMT_RGB24);
     // Depth 32 entry: the ARGB visual has exactly one format association.
     // Xorg also reports each VisualID once; mapping this visual again to
@@ -6555,6 +6569,7 @@ mod render_query_pict_formats_tests {
     fn argb_visual_has_only_argb32_format_association() {
         let root_visual = ResourceId(0x102);
         let argb_visual = ResourceId(0x103);
+        let glmark_visual = ResourceId(0x105);
         let mut reply = Vec::new();
 
         write_render_query_pict_formats_reply(
@@ -6563,15 +6578,16 @@ mod render_query_pict_formats_tests {
             SequenceNumber(7),
             root_visual,
             argb_visual,
+            glmark_visual,
         )
         .unwrap();
 
-        assert_eq!(reply.len(), 32 + 180);
-        assert_eq!(le_u32(&reply[4..8]), 45);
+        assert_eq!(reply.len(), 32 + 188);
+        assert_eq!(le_u32(&reply[4..8]), 47);
         assert_eq!(le_u32(&reply[8..12]), 5);
         assert_eq!(le_u32(&reply[12..16]), 1);
         assert_eq!(le_u32(&reply[16..20]), 2);
-        assert_eq!(le_u32(&reply[20..24]), 2);
+        assert_eq!(le_u32(&reply[20..24]), 3);
 
         let screen = 32 + 5 * 28;
         assert_eq!(le_u32(&reply[screen..screen + 4]), 2);
@@ -6579,11 +6595,13 @@ mod render_query_pict_formats_tests {
 
         let depth24 = screen + 8;
         assert_eq!(reply[depth24], 24);
-        assert_eq!(le_u16(&reply[depth24 + 2..depth24 + 4]), 1);
+        assert_eq!(le_u16(&reply[depth24 + 2..depth24 + 4]), 2);
         assert_eq!(le_u32(&reply[depth24 + 8..depth24 + 12]), root_visual.0);
         assert_eq!(le_u32(&reply[depth24 + 12..depth24 + 16]), RENDER_FMT_RGB24);
+        assert_eq!(le_u32(&reply[depth24 + 16..depth24 + 20]), glmark_visual.0);
+        assert_eq!(le_u32(&reply[depth24 + 20..depth24 + 24]), RENDER_FMT_RGB24);
 
-        let depth32 = depth24 + 16;
+        let depth32 = depth24 + 24;
         assert_eq!(reply[depth32], 32);
         assert_eq!(le_u16(&reply[depth32 + 2..depth32 + 4]), 1);
         assert_eq!(le_u32(&reply[depth32 + 8..depth32 + 12]), argb_visual.0);
