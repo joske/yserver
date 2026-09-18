@@ -230,19 +230,49 @@ fn split_alias_token(s: &str) -> Option<(&str, &str)> {
 }
 
 /// Case-insensitive `*`/`?` glob for X11 font name patterns.
-/// Greedy backtracking matcher — font names and patterns are short.
+///
+/// Single-pass with one backtrack point (the last `*`), so cost is
+/// O(|pattern| x |name|). The obvious recursive form — `'*' =>
+/// (0..=n.len()).any(|k| rec(&p[1..], &n[k..]))` — is exponential in the
+/// number of STARS, not the length, so "font names are short" does not save
+/// it. Toolkits ask `-*-*-*-*-*-*-*-*-*-*-*-*-iso8859-1`; a name that fails
+/// on the charset forces every split of every star. That cost `ListFonts`
+/// 514ms per call in issue #155, because `path_font_names` runs this once
+/// per font-path entry. `font_pattern_glob_is_not_exponential` guards it.
+///
+/// `?` matches one char, not one byte, hence `Vec<char>` — the byte-based
+/// `xlfd_pattern_matches` is not a drop-in here.
 pub(crate) fn font_pattern_matches(pattern: &str, name: &str) -> bool {
     let p: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
     let n: Vec<char> = name.to_ascii_lowercase().chars().collect();
-    fn rec(p: &[char], n: &[char]) -> bool {
-        match p.first() {
-            None => n.is_empty(),
-            Some('*') => (0..=n.len()).any(|k| rec(&p[1..], &n[k..])),
-            Some('?') => !n.is_empty() && rec(&p[1..], &n[1..]),
-            Some(c) => n.first() == Some(c) && rec(&p[1..], &n[1..]),
+    let mut pi = 0usize;
+    let mut ni = 0usize;
+    // Position of the most recent `*` in the pattern, and the name offset
+    // it was first tried at. On a mismatch we return here and let that
+    // star swallow one more char — the only backtrack the grammar needs.
+    let mut star: Option<usize> = None;
+    let mut star_ni = 0usize;
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            star_ni = ni;
+            pi += 1;
+        } else if let Some(sp) = star {
+            pi = sp + 1;
+            star_ni += 1;
+            ni = star_ni;
+        } else {
+            return false;
         }
     }
-    rec(&p, &n)
+    // Name exhausted: any trailing stars match empty, anything else fails.
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 /// Resolution outcome for a font name against the font path.
@@ -2307,6 +2337,69 @@ mod font_tests {
         ));
         assert!(!font_pattern_matches("xtfont?", "xtfont"));
         assert!(!font_pattern_matches("nope", "xtfont0"));
+    }
+
+    /// Edge cases that distinguish a correct glob from a plausible one:
+    /// trailing stars, empty inputs, a star giving back chars so a later
+    /// literal can land, and `?` against a multibyte char (#155).
+    #[test]
+    fn font_pattern_glob_edge_cases() {
+        // Trailing stars match empty; a bare star matches empty.
+        assert!(font_pattern_matches("abc*", "abc"));
+        assert!(font_pattern_matches("abc***", "abc"));
+        assert!(font_pattern_matches("*", ""));
+        assert!(font_pattern_matches("***", ""));
+        assert!(font_pattern_matches("", ""));
+        // A non-star pattern cannot match an empty name, and vice versa.
+        assert!(!font_pattern_matches("", "a"));
+        assert!(!font_pattern_matches("?", ""));
+        // The whole name must be consumed.
+        assert!(!font_pattern_matches("abc", "abcd"));
+        // Backtracking: the star must give back chars so a later literal
+        // can land. A single-pass matcher without a backtrack point fails
+        // these.
+        assert!(font_pattern_matches("*b", "abab"));
+        assert!(font_pattern_matches("*ab", "aab"));
+        assert!(font_pattern_matches("a*b*c", "axxbyyc"));
+        assert!(!font_pattern_matches("*ab", "aba"));
+        // `?` matches exactly one CHAR, not one byte — a byte-based
+        // matcher (e.g. `xlfd_pattern_matches`) diverges here.
+        assert!(font_pattern_matches("?", "é"));
+        assert!(font_pattern_matches("*é*", "xéy"));
+        // The shape real toolkits send: all-wildcard XLFD with a literal
+        // charset tail. Matching and non-matching must both be right.
+        let name = "-misc-fixed-medium-r-normal--20-200-75-75-c-100-iso8859-1";
+        assert!(font_pattern_matches(
+            "-*-*-*-*-*-*-*-*-*-*-*-*-iso8859-1",
+            name
+        ));
+        assert!(!font_pattern_matches(
+            "-*-*-*-*-*-*-*-*-*-*-*-*-iso10646-1",
+            name
+        ));
+        assert!(font_pattern_matches("-*-*-*-*-*-*-*-*-*-*-*-*-*-*", name));
+    }
+
+    /// Complexity guard for #155: the matcher must not be exponential in
+    /// the star count. The worst case is a fully-wildcarded XLFD with a
+    /// literal charset tail against a name that does NOT match, so every
+    /// split of every star is explored before the answer is known. The
+    /// bound is loose enough that only a return to exponential can trip
+    /// it, so a wall-clock assertion is safe here.
+    #[test]
+    fn font_pattern_glob_is_not_exponential() {
+        let pattern = "-*-*-*-*-*-*-*-*-*-*-*-*-iso8859-1";
+        let name = "-misc-fixed-medium-r-normal--20-200-75-75-c-100-iso10646-1";
+        let start = std::time::Instant::now();
+        for _ in 0..5000 {
+            assert!(!font_pattern_matches(pattern, name));
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "5000 worst-case font glob matches took {elapsed:?}; the matcher \
+             has regressed to exponential backtracking (see #155)"
+        );
     }
 
     /// The built-ins escape hatch for our own synthesized alias XLFD
