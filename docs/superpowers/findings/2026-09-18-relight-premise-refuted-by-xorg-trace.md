@@ -1,8 +1,12 @@
-# The hotplug-relight premise is refuted by an Xorg trace — direction needed
+# Xorg/MATE delegates hotplug relight to the desktop
 
-**Status: P1 implemented and pushed on `fix/randr-crtc-model-hotplug-relight`,
-then its central premise contradicted by hardware. Asking for direction before
-either trimming or rewriting the design.**
+> **Status: historical, conclusion superseded.** This trace establishes how
+> MATE restores an output on Xorg. It does not establish that yserver may omit
+> recovery: Awesome does not perform the corresponding RANDR configuration, and
+> yserver then leaves a physically power-cycled output dark indefinitely.
+> Restored P1 recovery was hardware-validated with Awesome (both output
+> power-cycles and DPMS) and XFCE (ordinary power-cycle). The retained route is
+> recovery state, not a claimed current RANDR configuration.
 
 Design: [`2026-09-17-randr-crtc-model-and-hotplug-relight-design.md`](../specs/2026-09-17-randr-crtc-model-and-hotplug-relight-design.md)
 (reviewed by codex over 9 rounds).

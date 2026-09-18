@@ -1,21 +1,23 @@
 # RANDR CRTC model and hotplug relight
 
-> **Status: superseded by measurement. Do not implement P1 or P3 from this
-> document.** Reported by BergmannAtmet in
-> GH discussion #56 (comment 18481108, 2026-09-17): after `xset dpms force
-> suspend` → monitor off → monitor on, the session never renders again.
-> Root-caused from a `yserver-xfce-hw-trace` run by jos the same day
-> (`yserver-hw-xfce.log` 21 MB + `xfce.xtrace` 95 MB, not committed).
-> jos's initial read was "awesome/picom specific"; the trace disproves that —
-> it reproduces on XFCE and the mechanism is entirely in the KMS/RANDR path.
+> **Status: P1 implemented and hardware-validated; P3 remains deferred.**
+> The later Xorg/MATE trace correctly showed that a RandR-aware desktop can
+> explicitly restore a returning output itself.  It did **not** make P1
+> unnecessary: Awesome does not issue that RandR restoration.  With the P1
+> recovery removed, a physical monitor power-cycle leaves it dark indefinitely;
+> with P1 restored, Awesome and XFCE both recover ordinary off/on cycles, and
+> Awesome also recovers the DPMS sequence.  The server must therefore retain
+> only the lost route as recovery state, release its KMS resources while absent,
+> and relight that route when its connector returns.  This is a safe recovery
+> policy for display managers that do not configure RANDR, not a replacement for
+> a RANDR client's explicit configuration.
 >
-> The later Xorg/MATE trace and a plain-master hardware run refuted P1's
-> auto-relight premise: a conforming desktop performs the disable, resize and
-> re-enable itself. The independently correct P2 attached-vs-possible CRTC
-> distinction was implemented instead and fixes XFCE's request shape. See
-> [`2026-09-18-relight-premise-refuted-by-xorg-trace.md`](../findings/2026-09-18-relight-premise-refuted-by-xorg-trace.md).
-> The broad physical-CRTC model (P3) is deferred until a separate reproducer
-> requires it.
+> The independently correct P2 attached-vs-possible CRTC distinction is already
+> implemented.  See
+> [`2026-09-18-relight-premise-refuted-by-xorg-trace.md`](../findings/2026-09-18-relight-premise-refuted-by-xorg-trace.md)
+> for the limited Xorg/MATE result; its former conclusion that P1 should not be
+> implemented is superseded by the Awesome reproduction.  The broad physical-
+> CRTC model (P3) remains deferred until a separate reproducer requires it.
 >
 > **Reviewed by codex, 2026-09-17.** P1 and P2 approved with changes, both
 > applied below: P1 gained an explicit ordering and now restores *every*

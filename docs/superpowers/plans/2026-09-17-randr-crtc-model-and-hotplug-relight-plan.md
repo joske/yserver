@@ -3,11 +3,15 @@
 Design: [`2026-09-17-randr-crtc-model-and-hotplug-relight-design.md`](../specs/2026-09-17-randr-crtc-model-and-hotplug-relight-design.md).
 Read it first; every decision below is argued there and is not repeated.
 
-> **Status: superseded; do not execute.** The P1 auto-relight premise was
-> refuted by Xorg and plain-master MATE traces. P2 alone changed XFCE's invalid
-> two-output request into a legal one-output request and hardware confirmed the
-> second display enables. P3 remains deferred, not partially started. See
-> [`2026-09-18-relight-premise-refuted-by-xorg-trace.md`](../findings/2026-09-18-relight-premise-refuted-by-xorg-trace.md).
+> **Status: P1 implemented and hardware-validated; P3 deferred.** Xorg/MATE
+> traces show a RANDR-aware desktop restoring the output explicitly, but Awesome
+> does not do so. P1 is therefore required as server-side recovery for a
+> physical power-cycle. Its relight/reservation/extent/root-storage pieces must
+> remain an atomic release unit: hardware validation now covers both monitors'
+> ordinary off/on cycles in Awesome, one ordinary off/on cycle in XFCE, and the
+> Awesome DPMS sequence. P2 is independently implemented. See
+> [`2026-09-18-relight-premise-refuted-by-xorg-trace.md`](../findings/2026-09-18-relight-premise-refuted-by-xorg-trace.md)
+> for the narrower Xorg/MATE observation.
 
 ## Ordering principle
 
