@@ -2415,43 +2415,12 @@ fn validate_render_node_attachment(
     }
 }
 
-/// One live scanout route a connector snapshot removed, with the layout
-/// rectangle and mode identity it occupied at the moment it was removed.
-///
-/// `apply_connector_snapshot` deletes the `ActiveOutput` row, so this is the
-/// only surviving record of where the route was. The backend owns layout
-/// policy (packing, the virtual-screen extent, reserved slots), and it needs
-/// the rectangle after the snapshot has already destroyed it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DroppedRoute {
-    pub key: OutputKey,
-    pub x: i32,
-    pub y: i32,
-    pub width: u16,
-    pub height: u16,
-    pub vrefresh: u32,
-}
-
-impl DroppedRoute {
-    /// The layout rectangle this route occupied, in the `(x, y, w, h)` shape
-    /// [`recompute_fb_extent_from`] consumes.
-    pub(crate) fn rect(&self) -> LayoutRect {
-        (self.x, self.y, self.width, self.height)
-    }
-}
-
-/// A placed rectangle: `(x, y, width, height)`.
-pub(crate) type LayoutRect = (i32, i32, u16, u16);
-
 /// Outcome of a connector rescan.
 #[derive(Debug, Default)]
 pub(crate) struct RescanResult {
     pub added_keys: Vec<OutputKey>,
     pub dropped_keys: Vec<OutputKey>,
     pub dropped_old_indices: Vec<usize>,
-    /// Layout rectangle + mode identity of every route `dropped_old_indices`
-    /// removed, captured before the `ActiveOutput` row was deleted.
-    pub dropped_layouts: Vec<DroppedRoute>,
     pub added_count: usize,
     /// Every connector currently discovered as connected, including inactive
     /// secondary-card connectors. The backend reconciles this complete,
@@ -2502,38 +2471,7 @@ impl ConnectorSnapshot {
 /// 2-D: `fb_w = max(x + width)`, `fb_h = max(y + height)`. A client may
 /// place a CRTC at any `(x, y)` (e.g. a monitor stacked below), so the
 /// framebuffer must encompass `y + height`, not just `max(height)`.
-/// Advance `next_x` past every reserved slot a `width`-wide placement
-/// starting there would straddle.
-///
-/// Reservations are rectangles of routes that are physically gone but
-/// restorable, so nothing may be packed over them. Repeat until the
-/// placement is clear: stepping past one reservation can push the
-/// placement into the next.
-pub(crate) fn advance_past_reservations(
-    mut next_x: i32,
-    width: u16,
-    reserved: &[LayoutRect],
-) -> i32 {
-    loop {
-        let end = next_x.saturating_add(i32::from(width));
-        let Some(blocking_end) = reserved
-            .iter()
-            .filter(|(rx, _, rw, _)| {
-                let r_end = rx.saturating_add(i32::from(*rw));
-                // Half-open overlap: a reservation ending exactly at `next_x`
-                // does not block, and a zero-width one never blocks.
-                *rx < end && next_x < r_end
-            })
-            .map(|(rx, _, rw, _)| rx.saturating_add(i32::from(*rw)))
-            .max()
-        else {
-            return next_x;
-        };
-        next_x = blocking_end;
-    }
-}
-
-pub(crate) fn recompute_fb_extent_from(layouts: &[LayoutRect]) -> (u16, u16) {
+pub(crate) fn recompute_fb_extent_from(layouts: &[(i32, i32, u16, u16)]) -> (u16, u16) {
     let fb_w = layouts
         .iter()
         .map(|(x, _, w, _)| x.saturating_add(i32::from(*w)))
@@ -6552,60 +6490,26 @@ impl PlatformBackend {
     /// doesn't overlap. (Mixed pinned+auto with gaps is refined later if a
     /// real workload needs it; the common case is all-auto at boot or
     /// all-pinned after the desktop configures the layout.)
-    ///
-    /// Layout policy is the backend caller's, not the connector snapshot's:
-    /// only the backend knows which departed routes are restorable, so only
-    /// it can decide when survivors may move. See
-    /// `docs/superpowers/specs/2026-09-17-randr-crtc-model-and-hotplug-relight-design.md`,
-    /// "Layout policy — reserved slots". Every caller still passes an empty
-    /// `reserved` set; the policy that populates it lands with the relight.
-    pub(crate) fn recompact_horizontal_layout(
-        &mut self,
-        client_configured: &HashSet<OutputKey>,
-        reserved: &[LayoutRect],
-    ) {
+    fn recompact_horizontal_layout(&mut self, client_configured: &HashSet<OutputKey>) {
         let mut next_x: i32 = 0;
         for layout in &mut self.outputs {
             if client_configured.contains(&layout.key) {
                 next_x = next_x.max(layout.x.saturating_add(i32::from(layout.width)));
                 continue;
             }
-            // A reserved slot belongs to a route that is physically gone but
-            // restorable. Packing over it would let a later relight land on
-            // top of a survivor that moved into the hole, so step past every
-            // reservation this placement would straddle.
-            next_x = advance_past_reservations(next_x, layout.width, reserved);
             layout.x = next_x;
             layout.y = 0;
             next_x = next_x.saturating_add(i32::from(layout.width));
         }
     }
 
-    /// Recompute the virtual-screen extent over the live layouts unioned with
-    /// `reserved`. A reserved slot keeps the extent from shrinking while its
-    /// monitor is away.
-    pub(crate) fn recompute_fb_extent_with_reservations(&mut self, reserved: &[LayoutRect]) {
-        let mut layouts: Vec<LayoutRect> = self
-            .outputs
-            .iter()
-            .map(|layout| (layout.x, layout.y, layout.width, layout.height))
-            .collect();
-        layouts.extend_from_slice(reserved);
-        let (fb_w, fb_h) = recompute_fb_extent_from(&layouts);
-        self.fb_w = fb_w;
-        self.fb_h = fb_h;
-    }
-
     /// Apply a previously gathered all-device connector snapshot. Callers must
     /// quiesce GPU/page-flip state before invoking this method: it may remove
     /// scanout pools and ActiveOutputs for disconnected connectors.
-    ///
-    /// Topology ownership only: the dropped routes' rectangles are reported
-    /// in [`RescanResult::dropped_layouts`] and the caller owns packing and
-    /// the virtual-screen extent.
     pub(crate) fn apply_connector_snapshot(
         &mut self,
         connected: Vec<ConnectorSnapshot>,
+        client_configured: &HashSet<OutputKey>,
         known_connected: &HashSet<OutputKey>,
     ) -> RescanResult {
         let connected_order: Vec<OutputKey> = connected
@@ -6671,14 +6575,6 @@ impl PlatformBackend {
             .collect();
         for idx in rescan.dropped_old_indices.iter().copied() {
             let dropped_key = self.outputs[idx].key.clone();
-            rescan.dropped_layouts.push(DroppedRoute {
-                key: dropped_key.clone(),
-                x: self.outputs[idx].x,
-                y: self.outputs[idx].y,
-                width: self.outputs[idx].width,
-                height: self.outputs[idx].height,
-                vrefresh: self.outputs[idx].output.picked.vrefresh,
-            });
             self.cancel_scanout_render_completions_for_output(&dropped_key);
             if let Err(error) = self.drain_scanout_pool_at(idx) {
                 log::error!(
@@ -6722,9 +6618,15 @@ impl PlatformBackend {
         rescan.added_count = rescan.added_keys.len();
 
         if !rescan.dropped_old_indices.is_empty() {
-            // Packing and the extent recompute deliberately do NOT happen
-            // here. They are layout policy and run in the backend caller,
-            // immediately and in the same order.
+            self.recompact_horizontal_layout(client_configured);
+            let layouts: Vec<(i32, i32, u16, u16)> = self
+                .outputs
+                .iter()
+                .map(|layout| (layout.x, layout.y, layout.width, layout.height))
+                .collect();
+            let (fb_w, fb_h) = recompute_fb_extent_from(&layouts);
+            self.fb_w = fb_w;
+            self.fb_h = fb_h;
             self.prune_present_clocks_to_live_outputs();
             self.refresh_cursor_topology_for_devices(&cursor_changed_devices);
         }
@@ -7590,7 +7492,7 @@ mod tests {
         let snapshot = platform
             .probe_connector_snapshot()
             .expect("zero-device probe is an empty no-op");
-        let rescan = platform.apply_connector_snapshot(snapshot, &HashSet::new());
+        let rescan = platform.apply_connector_snapshot(snapshot, &HashSet::new(), &HashSet::new());
         assert!(rescan.added_keys.is_empty());
         assert!(rescan.dropped_keys.is_empty());
         assert!(rescan.dropped_old_indices.is_empty());
@@ -7655,7 +7557,8 @@ mod tests {
         };
         let known_connected = HashSet::from([key]);
 
-        let rescan = platform.apply_connector_snapshot(vec![snapshot], &known_connected);
+        let rescan =
+            platform.apply_connector_snapshot(vec![snapshot], &HashSet::new(), &known_connected);
 
         assert!(rescan.dropped_old_indices.is_empty());
         let output = &platform.outputs[0].output;
@@ -7684,125 +7587,15 @@ mod tests {
             connector_type: "DisplayPort".into(),
         };
 
-        let rescan = platform.apply_connector_snapshot(vec![snapshot], &HashSet::from([key]));
+        let rescan = platform.apply_connector_snapshot(
+            vec![snapshot],
+            &HashSet::new(),
+            &HashSet::from([key]),
+        );
 
         assert!(rescan.dropped_old_indices.is_empty());
         assert_eq!((platform.outputs[0].x, platform.outputs[0].y), (123, 45));
         assert_eq!(platform.fb_dimensions(), (923, 645));
-    }
-
-    /// Place a live output on the fixture's device at `(x, y)` with a
-    /// `width x height` mode, and extend the parallel per-output vectors so
-    /// the snapshot's index bookkeeping stays in step.
-    fn push_placed_test_output(
-        platform: &mut PlatformBackend,
-        connector_name: &str,
-        raw_crtc: u32,
-        x: i32,
-        y: i32,
-        width: u16,
-        height: u16,
-    ) -> OutputKey {
-        let device_key = platform.devices[0].key;
-        let mut output = test_active_output_for(device_key, connector_name, raw_crtc);
-        let mode = crate::platform::drm::Mode {
-            name: format!("{width}x{height}"),
-            width,
-            height,
-            vrefresh: 60,
-            preferred: true,
-            ..Default::default()
-        };
-        output.output.picked = mode.clone();
-        output.output.modes = vec![mode];
-        output.x = x;
-        output.y = y;
-        output.width = width;
-        output.height = height;
-        let key = output.key.clone();
-        platform.outputs.push(output);
-        platform.scanout_pools.push(None);
-        platform.bo_generations.push(Vec::new());
-        platform.first_pageflip_logged.push(false);
-        key
-    }
-
-    fn clear_test_outputs(platform: &mut PlatformBackend) {
-        platform.outputs.clear();
-        platform.scanout_pools.clear();
-        platform.bo_generations.clear();
-        platform.first_pageflip_logged.clear();
-    }
-
-    #[test]
-    fn connector_snapshot_reports_dropped_rectangles_and_leaves_layout_to_the_caller() {
-        let mut platform = PlatformBackend::for_tests();
-        // Put the sole route somewhere the old in-snapshot compaction would
-        // have flattened, and pin an extent the old in-snapshot recompute
-        // would have shrunk. Both are the caller's job now.
-        platform.outputs[0].x = 1000;
-        platform.outputs[0].y = 0;
-        platform.fb_w = 1800;
-        platform.fb_h = 600;
-        let key = platform.outputs[0].key.clone();
-
-        let rescan = platform.apply_connector_snapshot(Vec::new(), &HashSet::from([key.clone()]));
-
-        assert!(platform.outputs.is_empty());
-        assert_eq!(
-            rescan.dropped_layouts,
-            vec![DroppedRoute {
-                key,
-                x: 1000,
-                y: 0,
-                width: 800,
-                height: 600,
-                vrefresh: 60,
-            }],
-            "the snapshot reports the rectangle it destroyed",
-        );
-        assert_eq!(
-            platform.fb_dimensions(),
-            (1800, 600),
-            "the snapshot no longer recomputes the extent",
-        );
-    }
-
-    #[test]
-    fn recompaction_without_a_reservation_still_packs_survivors() {
-        let mut platform = PlatformBackend::for_tests();
-        clear_test_outputs(&mut platform);
-        push_placed_test_output(&mut platform, "B", 2, 1920, 0, 3200, 1440);
-
-        platform.recompact_horizontal_layout(&HashSet::new(), &[]);
-        platform.recompute_fb_extent_with_reservations(&[]);
-
-        assert_eq!(
-            (platform.outputs[0].x, platform.outputs[0].y),
-            (0, 0),
-            "with no reservation the caller packs exactly as the snapshot did",
-        );
-        assert_eq!(platform.fb_dimensions(), (3200, 1440));
-    }
-
-    #[test]
-    fn packing_steps_past_every_reservation_it_straddles() {
-        // Stepping past one reservation can push the placement into the next,
-        // so the skip has to repeat rather than fire once.
-        assert_eq!(
-            super::advance_past_reservations(0, 1000, &[(0, 0, 500, 100), (500, 0, 500, 100)]),
-            1000,
-        );
-        assert_eq!(
-            super::advance_past_reservations(0, 100, &[(100, 0, 500, 100)]),
-            0,
-            "a reservation the placement does not reach must not move it",
-        );
-        assert_eq!(
-            super::advance_past_reservations(0, 100, &[(0, 0, 0, 100)]),
-            0,
-            "a zero-width reservation blocks nothing",
-        );
     }
 
     #[test]
@@ -7825,8 +7618,11 @@ mod tests {
             connector_type: "DisplayPort".into(),
         };
 
-        let rescan =
-            platform.apply_connector_snapshot(vec![snapshot], &HashSet::from([key.clone()]));
+        let rescan = platform.apply_connector_snapshot(
+            vec![snapshot],
+            &HashSet::new(),
+            &HashSet::from([key.clone()]),
+        );
 
         assert_eq!(platform.outputs.len(), 1);
         assert!(rescan.dropped_old_indices.is_empty());
@@ -8469,7 +8265,8 @@ mod tests {
             connector_type: "DisplayPort".into(),
         };
 
-        let rescan = platform.apply_connector_snapshot(vec![snapshot], &HashSet::new());
+        let rescan =
+            platform.apply_connector_snapshot(vec![snapshot], &HashSet::new(), &HashSet::new());
         assert_eq!(rescan.added_keys, vec![key.clone()]);
         assert!(platform.outputs.is_empty());
         assert!(platform.devices[0].cursor.headless_deferred);
