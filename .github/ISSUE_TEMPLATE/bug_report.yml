@@ -1,0 +1,78 @@
+name: Bug report
+description: Something doesn't work as expected under yserver
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Please check
+        [`docs/known-issues.md`](../../docs/known-issues.md) first — it may already be tracked there.
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description of the bug.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Launch yserver with ...
+        2. Start this window manager / application ...
+        3. Do ...
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend
+      options:
+        - yserver (standalone DRM/KMS)
+        - ynest (nested)
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU / driver
+      placeholder: "e.g. AMD RX 9070 XT (RADV, Mesa 26.1.4)"
+    validations:
+      required: true
+  - type: input
+    id: distro-kernel
+    attributes:
+      label: Distro / kernel version
+      placeholder: "e.g. PikaOS (Debian Sid-based), kernel 6.12.10"
+    validations:
+      required: true
+  - type: input
+    id: desktop
+    attributes:
+      label: Desktop environment / window manager
+      placeholder: "e.g. Cinnamon, MATE, XFCE, fvwm3"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: yserver's own log (`RUST_LOG=debug`), and/or the affected client's log if relevant.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I checked `docs/known-issues.md` and this isn't already tracked there
+          required: true
+        - label: I confirmed this doesn't also happen under Xorg with the same setup
+          required: false
