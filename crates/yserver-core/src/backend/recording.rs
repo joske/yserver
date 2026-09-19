@@ -163,6 +163,15 @@ pub enum RecordedCall {
         width: u16,
         height: u16,
     },
+    ApplyClipState(ClipState),
+    PutImage {
+        host_xid: u32,
+        depth: u8,
+        width: u16,
+        height: u16,
+        dst_x: i16,
+        dst_y: i16,
+    },
     /// Task 4: `mark_dirty()` called. Trait default is a no-op
     /// (`trait_def.rs:583`); recorded here so ordering tests (e.g. against
     /// `MaybeComposite`) can read it straight off the shared `calls` log.
@@ -1570,8 +1579,9 @@ impl Backend for RecordingBackend {
     fn apply_clip_state(
         &mut self,
         _origin: Option<OriginContext>,
-        _clip: &ClipState,
+        clip: &ClipState,
     ) -> io::Result<()> {
+        self.record(RecordedCall::ApplyClipState(clip.clone()));
         Ok(())
     }
 
@@ -1642,15 +1652,23 @@ impl Backend for RecordingBackend {
     fn put_image(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_xid: u32,
-        _depth: u8,
-        _width: u16,
-        _height: u16,
-        _dst_x: i16,
-        _dst_y: i16,
+        host_xid: u32,
+        depth: u8,
+        width: u16,
+        height: u16,
+        dst_x: i16,
+        dst_y: i16,
         _data: &[u8],
     ) -> io::Result<()> {
-        unimplemented!("RecordingBackend: put_image")
+        self.record(RecordedCall::PutImage {
+            host_xid,
+            depth,
+            width,
+            height,
+            dst_x,
+            dst_y,
+        });
+        Ok(())
     }
 
     fn get_image(

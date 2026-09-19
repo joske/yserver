@@ -23153,10 +23153,6 @@ impl Backend for KmsBackend {
             self.log_render_gap("put_image_unknown_xid");
             return Ok(());
         };
-        // GC clipping is honoured upstream by `clear_clip_rectangles`
-        // when the dispatcher zeroes the clip (the MIT-SHM /
-        // ImageText callers do this); Stage 2c's engine ignores
-        // the GC's clip rectangles otherwise.
         // GC function + plane-mask (X11 §PutImage combines the wire
         // image with the destination through the full rop set):
         // non-Copy or partial plane-mask takes the CPU
@@ -23173,14 +23169,16 @@ impl Backend for KmsBackend {
             if plane_mask == 0 {
                 return Ok(());
             }
-            let pixmap_clip = matches!(
+            let has_clip = !matches!(
                 self.core.current_clip,
-                yserver_core::backend::ClipState::Pixmap { .. }
+                yserver_core::backend::ClipState::None
             );
-            if pixmap_clip {
-                // Bitmap clip-mask: intersect the put rect with the
-                // mask (pixel runs), then write each run through the
-                // CPU path (Copy through apply_gc_function = src).
+            if has_clip {
+                // A clipped upload must use per-run source offsets: the GPU
+                // fast path accepts only a whole wire image and would paint
+                // stale rows outside a rectangle clip. Bitmap clips likewise
+                // lower to pixel runs here. Copy through apply_gc_function is
+                // still exactly the source value.
                 let local = Rectangle16 {
                     x: dst_x,
                     y: dst_y,

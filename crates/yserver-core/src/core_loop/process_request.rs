@@ -7861,9 +7861,21 @@ fn handle_mit_shm_put_image(
         "client {} #{} MIT-SHM::PutImage drawable=0x{:x} {}x{} d{}",
         client_id.0, sequence.0, req.drawable, req.src_width, req.src_height, req.depth
     );
-    let target = state
-        .resources
-        .host_drawable_target(ResourceId(req.drawable));
+    let drawable = ResourceId(req.drawable);
+    let gc = ResourceId(req.gc);
+    if let Err((code, bad_value)) = validate_drawable_and_gc(state, drawable, gc) {
+        return emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            code,
+            bad_value,
+            u16::from(shm::PUT_IMAGE),
+            MIT_SHM_MAJOR_OPCODE,
+        );
+    }
+    let draw_state = state.resources.resolve_draw_state(gc).unwrap_or_default();
+    let target = state.resources.host_drawable_target(drawable);
     let Some(target) = target else {
         return Ok(RequestOutcome::Handled);
     };
@@ -7902,8 +7914,9 @@ fn handle_mit_shm_put_image(
     let t_after_extract = t_entry.elapsed();
     let snapshot_borrowed = matches!(snapshot, std::borrow::Cow::Borrowed(_));
     let snapshot_bytes = snapshot.len();
-    backend.clear_clip_rectangles(origin)?;
-    let t_after_clear_clip = t_entry.elapsed();
+    backend.apply_clip_state(origin, &draw_state.clip)?;
+    backend.apply_draw_state(origin, &draw_state)?;
+    let t_after_apply_state = t_entry.elapsed();
     backend.put_image(
         origin,
         target.host_xid(),
@@ -7965,16 +7978,16 @@ fn handle_mit_shm_put_image(
             .unwrap_or("<unknown>");
         log::debug!(
             "MIT-SHM PutImage perf: total={total_us}us \
-             [extract={ext_us}us clear_clip+={cc_us}us put_image+={pi_us}us] \
+             [extract={ext_us}us apply_state+={state_us}us put_image+={pi_us}us] \
              {w}x{h} depth={depth} bytes={bytes} borrowed={borrowed} \
              drawable=0x{drawable:x} caller=client{caller_id}/{caller_class:?}",
             total_us = total.as_micros(),
             ext_us = t_after_extract.as_micros(),
-            cc_us = t_after_clear_clip
+            state_us = t_after_apply_state
                 .saturating_sub(t_after_extract)
                 .as_micros(),
             pi_us = t_after_put_image
-                .saturating_sub(t_after_clear_clip)
+                .saturating_sub(t_after_apply_state)
                 .as_micros(),
             w = req.src_width,
             h = req.src_height,
@@ -49251,6 +49264,128 @@ mod tests {
     // of a larger shm image. xfdesktop's thumbnail upload pattern
     // and any cairo-padded surface trigger the latter, which
     // manifests as horizontal-band corruption around the thumbnail.
+
+    #[test]
+    fn mit_shm_put_image_honors_gc_clip_rectangles() {
+        const CLIENT: u32 = 1;
+        const PIXMAP: u32 = 0x0020_0001;
+        const GC: u32 = 0x0020_0002;
+        const SHMSEG: u32 = 0x0020_0003;
+        const HOST_PIXMAP: u32 = 0x0040_0001;
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        state.resources.create_pixmap(
+            ClientId(CLIENT),
+            x11::CreatePixmapRequest {
+                depth: 32,
+                pixmap: ResourceId(PIXMAP),
+                drawable: ROOT_WINDOW,
+                width: 4,
+                height: 4,
+            },
+        );
+        assert!(state.resources.set_pixmap_host_xid(
+            ResourceId(PIXMAP),
+            crate::backend::PixmapHandle::from_raw(HOST_PIXMAP).expect("non-zero host pixmap"),
+        ));
+        state.resources.create_gc(
+            ClientId(CLIENT),
+            CreateGcRequest {
+                gc: ResourceId(GC),
+                drawable: ResourceId(PIXMAP),
+                function: None,
+                plane_mask: None,
+                foreground: None,
+                background: None,
+                line_width: None,
+                line_style: None,
+                cap_style: None,
+                join_style: None,
+                fill_style: None,
+                fill_rule: None,
+                tile: None,
+                stipple: None,
+                tile_x_origin: None,
+                tile_y_origin: None,
+                font: None,
+                subwindow_mode: None,
+                graphics_exposures: None,
+                clip_x_origin: None,
+                clip_y_origin: None,
+                clip_mask: None,
+                dash_offset: None,
+                dashes: None,
+                arc_mode: None,
+            },
+        );
+        let clip = x11::ClipRectangles {
+            ordering: 0,
+            x_origin: 0,
+            y_origin: 0,
+            rectangles: [
+                0i16.to_le_bytes(),
+                1i16.to_le_bytes(),
+                4u16.to_le_bytes(),
+                1u16.to_le_bytes(),
+            ]
+            .concat(),
+        };
+        state.resources.set_clip_rectangles(
+            ClientId(CLIENT),
+            x11::SetClipRectanglesRequest {
+                gc: ResourceId(GC),
+                clip: clip.clone(),
+            },
+        );
+
+        let fd =
+            unsafe { libc::memfd_create(c"mit-shm-put-image-test".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0, "memfd_create failed");
+        assert_eq!(unsafe { libc::ftruncate(fd, 64) }, 0, "ftruncate failed");
+        let mut segment = crate::server::MitShmSegment::from_fd(ClientId(CLIENT), fd, false)
+            .expect("map test SHM segment");
+        segment
+            .as_mut_slice()
+            .expect("writable SHM segment")
+            .fill(0xff);
+        state.mit_shm_segments.insert(SHMSEG, segment);
+
+        handle_mit_shm_put_image(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(CLIENT),
+            SequenceNumber(1),
+            yserver_protocol::x11::mit_shm::PutImageRequest {
+                drawable: PIXMAP,
+                gc: GC,
+                total_width: 4,
+                total_height: 4,
+                src_x: 0,
+                src_y: 0,
+                src_width: 4,
+                src_height: 4,
+                dst_x: 0,
+                dst_y: 0,
+                depth: 32,
+                format: 2,
+                send_event: false,
+                shmseg: SHMSEG,
+                offset: 0,
+            },
+        )
+        .expect("MIT-SHM PutImage succeeds");
+
+        assert!(backend.calls.lock().expect("calls lock").contains(
+            &crate::backend::recording::RecordedCall::ApplyClipState(
+                crate::backend::ClipState::Rectangles {
+                    origin: (0, 0),
+                    rects: clip,
+                },
+            ),
+        ));
+    }
 
     fn d32_pixel(b: u8, g: u8, r: u8, a: u8) -> [u8; 4] {
         // Wire byte order for a depth-32 ZPixmap is [B, G, R, A] —

@@ -23,7 +23,9 @@
 #![cfg(target_os = "linux")]
 
 use yserver::kms::render::KmsBackend;
-use yserver_core::backend::{AnyHandle, Backend, DrawState, FillState, GcFunction, SubwindowMode};
+use yserver_core::backend::{
+    AnyHandle, Backend, ClipState, DrawState, FillState, GcFunction, SubwindowMode,
+};
 use yserver_protocol::x11::ClipRectangles;
 
 /// Acceptance sequence:
@@ -96,6 +98,70 @@ fn put_image_fill_get_image_oracle() {
         &src[0..4],
         "outside fill rect preserves the gradient",
     );
+}
+
+/// `PutImage` must honor a rectangle clip, including when the source upload
+/// covers the whole destination. Firefox uses this pattern for popup menu
+/// hover updates: the untouched rows in the reused MIT-SHM buffer are stale.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn put_image_honors_rectangle_clip() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+
+    let dst = b.create_pixmap(None, 32, 4, 4).expect("create pixmap");
+    let xid = dst.as_raw();
+    b.fill_rectangle(None, xid, 0xFF00_00FF, 0, 0, 4, 4)
+        .expect("prefill blue");
+    b.apply_clip_state(
+        None,
+        &ClipState::Rectangles {
+            origin: (0, 0),
+            rects: ClipRectangles {
+                ordering: 0,
+                x_origin: 0,
+                y_origin: 0,
+                rectangles: [
+                    0i16.to_le_bytes(),
+                    1i16.to_le_bytes(),
+                    4u16.to_le_bytes(),
+                    1u16.to_le_bytes(),
+                ]
+                .concat(),
+            },
+        },
+    )
+    .expect("install rectangle clip");
+
+    let red = [0x00, 0x00, 0xFF, 0xFF];
+    let upload: Vec<u8> = (0..16).flat_map(|_| red).collect();
+    b.put_image(None, xid, 32, 4, 4, 0, 0, &upload)
+        .expect("put image");
+
+    let pixels = b
+        .get_image_pixels_for_tests(xid, 2, 0, 0, 4, 4, !0)
+        .expect("get image")
+        .expect("pixels");
+    for row in 0..4 {
+        for col in 0..4 {
+            let off = (row * 4 + col) * 4;
+            let expected = if row == 1 {
+                red
+            } else {
+                [0xFF, 0x00, 0x00, 0xFF]
+            };
+            assert_eq!(
+                &pixels[off..off + 4],
+                expected,
+                "row {row} col {col} must respect the rectangle clip"
+            );
+        }
+    }
 }
 
 /// Acceptance for `CopyArea` between disjoint pixmaps.
