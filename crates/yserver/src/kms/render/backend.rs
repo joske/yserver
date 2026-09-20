@@ -18281,6 +18281,14 @@ impl Backend for KmsBackend {
             }
             order.push(host);
         }
+        if self.core.top_level_order != order {
+            // A direct frame bypasses the composed root scene. A real
+            // top-level restack changes that scene even when the direct
+            // Present target itself is untouched, so retire it through the
+            // normal composed replacement path before accepting another
+            // direct Present.
+            self.request_direct_unflip("top_level_stack_changed");
+        }
         self.core.top_level_order = order;
         self.scene.wake_for_damage();
     }
@@ -40117,6 +40125,64 @@ mod tests {
             "projection keeps unmapped root children (order survives unmap) and \
              excludes subwindows (reached via descendant recursion)"
         );
+    }
+
+    #[test]
+    fn sync_top_level_order_restack_requests_direct_unflip() {
+        use yserver_core::resources::ROOT_WINDOW;
+        use yserver_protocol::x11::{ConfigureWindowRequest, ResourceId};
+
+        let mut state = ServerState::new();
+        let mut b = KmsBackend::for_tests();
+        let below = ResourceId(0x0010_0a10);
+        let above = ResourceId(0x0010_0a20);
+        seed_state_window(&mut state, &mut b, below, ROOT_WINDOW, 0, 0, 100, 100);
+        seed_state_window(&mut state, &mut b, above, ROOT_WINDOW, 0, 0, 100, 100);
+        let _ = state.resources.map_window(below);
+        let _ = state.resources.map_window(above);
+        b.sync_top_level_order(&state);
+
+        b.get_overlay_window(None).expect("materialize COW");
+        let cow_id = b.cow_id.expect("COW id");
+        let _ = install_direct_frame_for_target_test(&mut b, synth_host_xid(below), cow_id, true);
+
+        state.resources.configure_window(ConfigureWindowRequest {
+            window: below,
+            value_mask: 0,
+            x: None,
+            y: None,
+            width: None,
+            height: None,
+            border_width: None,
+            sibling: None,
+            stack_mode: Some(0), // Above, no sibling -> raise to top.
+        });
+        b.sync_top_level_order(&state);
+
+        assert!(b.scanout_m2.unflip_requested);
+        assert!(!b.scanout_m2.hold_direct);
+    }
+
+    #[test]
+    fn sync_top_level_order_without_restack_keeps_direct_scanout_active() {
+        use yserver_core::resources::ROOT_WINDOW;
+        use yserver_protocol::x11::ResourceId;
+
+        let mut state = ServerState::new();
+        let mut b = KmsBackend::for_tests();
+        let target = ResourceId(0x0010_0a30);
+        seed_state_window(&mut state, &mut b, target, ROOT_WINDOW, 0, 0, 100, 100);
+        let _ = state.resources.map_window(target);
+        b.sync_top_level_order(&state);
+
+        b.get_overlay_window(None).expect("materialize COW");
+        let cow_id = b.cow_id.expect("COW id");
+        let _ = install_direct_frame_for_target_test(&mut b, synth_host_xid(target), cow_id, true);
+
+        b.sync_top_level_order(&state);
+
+        assert!(!b.scanout_m2.unflip_requested);
+        assert!(b.scanout_m2.hold_direct);
     }
 
     // ── Cross-layer agreement regression gates ──
