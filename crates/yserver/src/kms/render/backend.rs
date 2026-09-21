@@ -3328,7 +3328,7 @@ impl KmsBackend {
             && i32::from(candidate.y) <= 0
             && i32::from(candidate.x) + i32::from(candidate.width) >= root_w
             && i32::from(candidate.y) + i32::from(candidate.height) >= root_h;
-        if !candidate.mapped || candidate.depth == 32 || !covers_root {
+        if !candidate.mapped || !covers_root {
             return false;
         }
 
@@ -40280,6 +40280,31 @@ mod tests {
         assert!(
             !b.unredirected_direct_scene_eligible(synth_host_xid(fullscreen), (100, 100)),
             "a raised mapped top-level must keep the covered fullscreen window out of direct scanout"
+        );
+    }
+
+    /// Window depth is not a statement about whether the currently presented
+    /// pixels are opaque. In particular, full-screen GL/EGL clients commonly
+    /// use a depth-32 visual and have always been eligible for direct scanout.
+    #[test]
+    fn unredirected_direct_scanout_keeps_an_uncovered_depth32_fullscreen_window_eligible() {
+        use yserver_core::resources::ROOT_WINDOW;
+        use yserver_protocol::x11::ResourceId;
+
+        let mut state = ServerState::new();
+        let mut b = KmsBackend::for_tests();
+        let fullscreen = ResourceId(0x0010_0a42);
+        seed_state_window(&mut state, &mut b, fullscreen, ROOT_WINDOW, 0, 0, 100, 100);
+        b.windows
+            .get_mut(&synth_host_xid(fullscreen))
+            .unwrap()
+            .depth = 32;
+        let _ = state.resources.map_window(fullscreen);
+        b.sync_top_level_order(&state);
+
+        assert!(
+            b.unredirected_direct_scene_eligible(synth_host_xid(fullscreen), (100, 100)),
+            "an uncovered depth-32 fullscreen window must retain direct-scanout eligibility"
         );
     }
 
