@@ -181,15 +181,14 @@ pub fn process_request(
             header.opcode,
         );
     }
-    // Maximum request length: u16::MAX without BIG-REQUESTS, 256K units
-    // (1 MiB) with BIG-REQUESTS — see write_big_requests_enable_reply
-    // which advertises 256 * 1024.
+    // Maximum request length: u16::MAX without BIG-REQUESTS,
+    // MAX_BIG_REQUEST_UNITS with it (the value BigRequestsEnable advertises).
     let big_enabled = state
         .clients
         .get(&client_id.0)
         .is_some_and(|c| c.big_requests_enabled);
     let max_length_units = if big_enabled {
-        256 * 1024
+        x11::MAX_BIG_REQUEST_UNITS
     } else {
         u32::from(u16::MAX)
     };
@@ -25045,7 +25044,12 @@ fn handle_big_requests_request(
     let byte_order = client.byte_order;
     client.big_requests_enabled = true;
     let mut buf: Vec<u8> = Vec::with_capacity(32);
-    x11::write_big_requests_enable_reply(&mut buf, byte_order, sequence, 256 * 1024)?;
+    x11::write_big_requests_enable_reply(
+        &mut buf,
+        byte_order,
+        sequence,
+        x11::MAX_BIG_REQUEST_UNITS,
+    )?;
     let outcome = write_to_client(client, client_id, &buf);
     // Unblock the reader so subsequent requests use big-framing.
     if let Some(tx) = client.reader_control.as_ref() {

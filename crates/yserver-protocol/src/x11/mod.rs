@@ -874,7 +874,7 @@ pub fn read_request(
     // size of the payload to do it. Flag the request as malformed so
     // the dispatcher's max-length gate emits BadLength.
     let max_units: u32 = if big_requests_enabled {
-        256 * 1024
+        MAX_BIG_REQUEST_UNITS
     } else {
         u32::from(u16::MAX)
     };
@@ -2928,6 +2928,10 @@ pub fn write_ge_query_version_reply(
     writer.write_all(&reply)
 }
 
+/// BIG-REQUESTS maximum request length in 4-byte units: Xorg's
+/// `MAX_BIG_REQUEST_SIZE` (`include/os.h:70`), just under 16 MiB.
+pub const MAX_BIG_REQUEST_UNITS: u32 = 4_194_303;
+
 pub fn write_big_requests_enable_reply(
     writer: &mut impl Write,
     byte_order: ClientByteOrder,
@@ -4705,12 +4709,45 @@ mod tests {
     }
 
     #[test]
+    fn read_request_accepts_a_4mib_big_request() {
+        // Chromium sends ~4 MiB PutImage requests; the old 1 MiB cap rejected them (#166).
+        const UNITS: u32 = 1024 * 1024 + 8;
+        const BODY_BYTES: usize = (UNITS as usize * 4) - 8;
+        let mut input = Vec::with_capacity(8 + BODY_BYTES);
+        input.extend_from_slice(&[72, 2, 0, 0]);
+        input.extend_from_slice(&UNITS.to_le_bytes());
+        input.resize(input.len() + BODY_BYTES, 0x55);
+        let mut cursor = std::io::Cursor::new(input);
+        let (header, body) = read_request(&mut cursor, ClientByteOrder::LittleEndian, true)
+            .expect("read should succeed")
+            .expect("request should be present");
+        assert_eq!(header.length_units, UNITS);
+        assert_eq!(body.len(), BODY_BYTES);
+    }
+
+    #[test]
+    fn big_requests_enable_reply_advertises_xorg_maximum() {
+        let mut buf = Vec::new();
+        write_big_requests_enable_reply(
+            &mut buf,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(1),
+            MAX_BIG_REQUEST_UNITS,
+        )
+        .expect("encode");
+        assert_eq!(
+            u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+            4_194_303
+        );
+    }
+
+    #[test]
     fn read_request_flags_over_max_big_length_and_drains_body() {
-        // xts5 TOO_LONG: bigRequestLength = max+1 = 262145 with the
+        // xts5 TOO_LONG: bigRequestLength = max+1 with the
         // matching payload bytes on the wire. We override length to
         // the BadLength sentinel and drain the payload to keep the
         // socket aligned for the next request.
-        const OVER_MAX: u32 = 256 * 1024 + 1; // 262145 units
+        const OVER_MAX: u32 = MAX_BIG_REQUEST_UNITS + 1;
         const BODY_BYTES: usize = (OVER_MAX as usize * 4) - 8;
         let mut input = Vec::with_capacity(8 + BODY_BYTES + 4);
         input.extend_from_slice(&[1, 2, 0, 0]); // opcode, data, length=0
