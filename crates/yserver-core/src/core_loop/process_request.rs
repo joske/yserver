@@ -302,7 +302,9 @@ pub fn process_request(
         113 => handle_kill_client(state, backend, client_id, sequence, body),
         // ── pointer/modifier mapping (reply + MappingNotify fanout) ──
         116 => handle_set_pointer_mapping(state, client_id, sequence, header, body),
-        118 => handle_set_modifier_mapping(state, client_id, sequence, header, body),
+        118 => {
+            handle_set_modifier_mapping(state, backend, origin, client_id, sequence, header, body)
+        }
         // ── state-read replies (read state, no backend, no mutation) ──
         14 => handle_get_geometry(state, client_id, sequence, body),
         15 => handle_query_tree(state, client_id, sequence, body),
@@ -19470,12 +19472,10 @@ fn handle_xi2_request(
             // XkbApplyMappingChange): MapNotify first, ControlsNotify last.
             let xkb_event_base = backend.xkb_info().map_or(0, |(_maj, ev, _err)| ev);
             if let Some(change) = &xkb_change {
-                crate::core_loop::xkb_layout::send_keyboard_mapping_map_notify(
+                crate::core_loop::xkb_layout::send_xkb_map_notify(
                     state,
                     xkb_event_base,
-                    change,
-                    first,
-                    count,
+                    change.map_notify,
                 );
             }
             // ChangeDeviceKeyMapping is void (no reply), so the event
@@ -19503,10 +19503,11 @@ fn handle_xi2_request(
                 state, client_id, dev, 1, first, count,
             );
             if let Some(change) = &xkb_change {
-                crate::core_loop::xkb_layout::apply_keyboard_mapping_repeats(
+                crate::core_loop::xkb_layout::send_keyboard_mapping_followups(
                     state,
                     xkb_event_base,
                     change,
+                    crate::core_loop::xkb_layout::X_CHANGE_KEYBOARD_MAPPING,
                 );
             }
             debug!(
@@ -19559,7 +19560,8 @@ fn handle_xi2_request(
                 });
             debug_assert_eq!(keycodes.len(), 8 * usize::from(kpm));
             let length_words = u32::from(kpm) * 2; // 8*kpm bytes / 4
-            let mut reply = x11::fixed_reply(byte_order, sequence, 0, length_words);
+            // Byte 1 = RepType = X_GetDeviceModifierMapping (Xi/getmmap.c).
+            let mut reply = x11::fixed_reply(byte_order, sequence, minor, length_words);
             reply.push(kpm); // byte 8: numKeyPerModifier
             reply.extend_from_slice(&[0u8; 23]); // bytes 9..=31: pad
             reply.extend_from_slice(&keycodes);
@@ -19587,34 +19589,38 @@ fn handle_xi2_request(
             if !xi1_device_has_keys(dev) {
                 return xi1_error(state, client_id, sequence, x11::error::BAD_MATCH, 0, minor);
             }
-            // Xorg `BadDeviceMap` rejects any keycode outside
-            // `[min_keycode, max_keycode]` UNLESS it's the special
-            // `0` sentinel (slot has no key). xts5
-            // SetDeviceModifierMapping-8 probes both MinKeyCode-1
-            // and MaxKeyCode+1 expecting BadValue.
             let need = 8usize * usize::from(kpm);
             let keycodes: Vec<u8> = (0..need).filter_map(|i| body.get(4 + i).copied()).collect();
             if keycodes.len() != need {
                 return xi1_error(state, client_id, sequence, x11::error::BAD_LENGTH, 0, minor);
             }
-            for &kc in &keycodes {
-                if kc != 0 && !(XI1_KEY_MIN..=XI1_KEY_MAX).contains(&kc) {
-                    return xi1_error(
-                        state,
-                        client_id,
-                        sequence,
-                        x11::error::BAD_VALUE,
-                        u32::from(kc),
-                        minor,
-                    );
-                }
-            }
-            state.xi1_modifier_map.insert(dev, (kpm, keycodes));
+            // Xorg ProcXSetDeviceModifierMapping → change_modmap, the core
+            // request's path: a keycode outside the keycode range (xts5
+            // SetDeviceModifierMapping-8 probes MinKeyCode-1) or listed
+            // twice is BadValue; a held modifier key is MappingBusy.
+            let status =
+                match change_modifier_mapping(state, backend, origin, kpm, &keycodes, Some(dev)) {
+                    ModmapChangeOutcome::Success => 0,
+                    ModmapChangeOutcome::Busy => 1,
+                    ModmapChangeOutcome::BadValue(value) => {
+                        return xi1_error(
+                            state,
+                            client_id,
+                            sequence,
+                            x11::error::BAD_VALUE,
+                            value,
+                            minor,
+                        );
+                    }
+                };
+            // Busy changed nothing and notifies nothing (Xi/setmmap.c).
             // xts5 does `Expect_Event` then `Expect_Reply`, so emit
             // event BEFORE the reply. request_kind=0 = MappingModifier.
-            if crate::core_loop::xi1_focus::xi1_client_wants_device_mapping_notify(
-                state, client_id, dev,
-            ) {
+            if status == 0
+                && crate::core_loop::xi1_focus::xi1_client_wants_device_mapping_notify(
+                    state, client_id, dev,
+                )
+            {
                 let time = state.timestamp_now();
                 #[allow(clippy::cast_possible_truncation)]
                 let device_byte = dev as u8;
@@ -19630,8 +19636,16 @@ fn handle_xi2_request(
                     0,
                 );
             }
-            buf.extend_from_slice(&xi1_zero_reply(byte_order, sequence));
-            crate::core_loop::xi1_focus::emit_device_mapping_notify(state, client_id, dev, 0, 0, 0);
+            // xSetDeviceModifierMappingReply: RepType @1, success @8.
+            let mut reply = x11::fixed_reply(byte_order, sequence, minor, 0);
+            reply.push(status);
+            reply.extend_from_slice(&[0u8; 23]);
+            buf.extend_from_slice(&reply);
+            if status == 0 {
+                crate::core_loop::xi1_focus::emit_device_mapping_notify(
+                    state, client_id, dev, 0, 0, 0,
+                );
+            }
         }
         // GetDeviceButtonMapping: { deviceid }. Real reply: the 7-button
         // identity map the device advertises in ListInputDevices — the
@@ -24199,6 +24213,8 @@ fn handle_set_pointer_mapping(
 /// SetModifierMapping (118): MappingNotify fanout, then reply.
 fn handle_set_modifier_mapping(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
     header: RequestHeader,
@@ -24210,30 +24226,131 @@ fn handle_set_modifier_mapping(
     let Some(keycodes) = body.get(..need) else {
         return emit_x11_error(state, client_id, sequence, x11::error::BAD_LENGTH, 0, 118);
     };
-    // Xorg ProcSetModifierMapping: keycodes must be 0 or within the
-    // advertised [min_keycode, max_keycode] range (8..=255 here).
-    for &kc in keycodes {
-        if kc != 0 && kc < 8 {
+    // Xorg ProcSetModifierMapping: BadValue for a refused map, else the
+    // change_modmap status in the reply.
+    let status = match change_modifier_mapping(state, backend, origin, kpm, keycodes, None) {
+        ModmapChangeOutcome::Success => 0,
+        ModmapChangeOutcome::Busy => 1,
+        ModmapChangeOutcome::BadValue(value) => {
             return emit_x11_error(
                 state,
                 client_id,
                 sequence,
                 x11::error::BAD_VALUE,
-                u32::from(kc),
+                value,
                 118,
             );
         }
+    };
+    let Some(client) = state.clients.get_mut(&client_id.0) else {
+        return Ok(RequestOutcome::Handled);
+    };
+    let buf = stub_reply_32(client.byte_order, sequence, status);
+    Ok(write_to_client(client, client_id, &buf))
+}
+
+/// Result of [`change_modifier_mapping`] (Xorg `change_modmap`'s return).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModmapChangeOutcome {
+    /// Applied (`MappingSuccess`).
+    Success,
+    /// A key that is or would be a modifier is down: nothing applied
+    /// (`MappingBusy`).
+    Busy,
+    /// Refused; the error value (Xorg `client->errorValue`).
+    BadValue(u32),
+}
+
+/// Xorg's `change_modmap` (dix/inpututils.c) for SetModifierMapping and XI
+/// SetDeviceModifierMapping (`xi_device`: the XI device; `None` = core).
+///
+/// - `build_modmap_from_modkeymap`: row `i / kpm` of the request is modifier
+///   `i / kpm`; a keycode listed twice is BadValue with value 0.
+/// - `check_modmap_change`: a keycode outside the keycode range is BadValue
+///   (value: the lowest such keycode); MappingBusy if a new modifier key is
+///   down, or an old one is, where Xorg's loop over the old ones stops short
+///   of the last keycode (255).
+///
+/// Then the backend edits its XKB keymap's modmap and the events go out in
+/// Xorg's order (`XkbApplyMappingChange` → `XkbSendNotification`):
+/// XkbMapNotify, core MappingNotify(Modifier), XkbControlsNotify for per-key
+/// repeat changes, XkbIndicatorMapNotify. A backend without an XKB keymap
+/// gets the map stored for readback instead. An identical map still applies
+/// and notifies, as on Xorg. Keyboard devices share the one keymap, so the XI
+/// request changes it for every device (Xorg: the device, its master or
+/// slaves).
+fn change_modifier_mapping(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    kpm: u8,
+    keycodes: &[u8],
+    xi_device: Option<u16>,
+) -> ModmapChangeOutcome {
+    const MIN_KEYCODE: usize = 8;
+    const MAX_KEYCODE: usize = 255;
+    let mut modmap = [0u8; 256];
+    for (i, &kc) in keycodes.iter().enumerate() {
+        if kc == 0 {
+            continue;
+        }
+        if modmap[usize::from(kc)] != 0 {
+            return ModmapChangeOutcome::BadValue(0);
+        }
+        modmap[usize::from(kc)] = 1 << (i / usize::from(kpm.max(1)));
     }
-    state.modifier_mapping_override = Some((kpm, keycodes.to_vec()));
+    let down = |kc: usize| state.keys_down[kc >> 3] & (1 << (kc & 7)) != 0;
+    for (kc, _) in modmap.iter().enumerate().filter(|(_, m)| **m != 0) {
+        if !(MIN_KEYCODE..=MAX_KEYCODE).contains(&kc) {
+            return ModmapChangeOutcome::BadValue(u32::try_from(kc).unwrap_or(0));
+        }
+        if down(kc) {
+            return ModmapChangeOutcome::Busy;
+        }
+    }
+    let current = xi_device
+        .and_then(|dev| state.xi1_modifier_map.get(&dev).cloned())
+        .or_else(|| state.modifier_mapping_override.clone())
+        .or_else(|| backend.get_modifier_mapping(origin).ok());
+    if let Some((cur_kpm, cur_keys)) = current
+        && cur_keys.iter().take(8 * usize::from(cur_kpm)).any(|&kc| {
+            (MIN_KEYCODE..MAX_KEYCODE).contains(&usize::from(kc)) && down(usize::from(kc))
+        })
+    {
+        return ModmapChangeOutcome::Busy;
+    }
+
+    let Some(change) = backend.set_modifier_mapping(&modmap) else {
+        match xi_device {
+            Some(dev) => {
+                state.xi1_modifier_map.insert(dev, (kpm, keycodes.to_vec()));
+            }
+            None => state.modifier_mapping_override = Some((kpm, keycodes.to_vec())),
+        }
+        if xi_device.is_none() {
+            let targets: Vec<ClientId> = state.clients.keys().map(|id| ClientId(*id)).collect();
+            let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
+                let _ = x11::write_mapping_notify_event(buf, order, seq, 0, 0, 0);
+            });
+        }
+        return ModmapChangeOutcome::Success;
+    };
+    // The keymap is the one modifier map now: drop any stored readback.
+    state.modifier_mapping_override = None;
+    state.xi1_modifier_map.clear();
+    let xkb_event_base = backend.xkb_info().map_or(0, |(_maj, ev, _err)| ev);
+    crate::core_loop::xkb_layout::send_xkb_map_notify(state, xkb_event_base, change.map_notify);
     let targets: Vec<ClientId> = state.clients.keys().map(|id| ClientId(*id)).collect();
     let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
         let _ = x11::write_mapping_notify_event(buf, order, seq, 0, 0, 0);
     });
-    let Some(client) = state.clients.get_mut(&client_id.0) else {
-        return Ok(RequestOutcome::Handled);
-    };
-    let buf = stub_reply_32(client.byte_order, sequence, 0);
-    Ok(write_to_client(client, client_id, &buf))
+    crate::core_loop::xkb_layout::send_keyboard_mapping_followups(
+        state,
+        xkb_event_base,
+        &change,
+        crate::core_loop::xkb_layout::X_SET_MODIFIER_MAPPING,
+    );
+    ModmapChangeOutcome::Success
 }
 
 fn handle_get_geometry(
@@ -28259,16 +28376,10 @@ fn handle_change_keyboard_mapping(
     );
     // Xorg's order (XkbSendNotification): XkbMapNotify, then the core
     // MappingNotify (XkbSendLegacyMapNotify), then the ControlsNotify of a
-    // per-key repeat change.
+    // per-key repeat change and an IndicatorMapNotify.
     let xkb_event_base = backend.xkb_info().map_or(0, |(_maj, ev, _err)| ev);
     if let Some(change) = &xkb_change {
-        crate::core_loop::xkb_layout::send_keyboard_mapping_map_notify(
-            state,
-            xkb_event_base,
-            change,
-            first_keycode,
-            count,
-        );
+        crate::core_loop::xkb_layout::send_xkb_map_notify(state, xkb_event_base, change.map_notify);
     }
     // Server-wide MappingNotify fanout: every connected client sees the
     // same keymap change. We collect ids first to avoid an &/&mut overlap
@@ -28278,7 +28389,12 @@ fn handle_change_keyboard_mapping(
         let _ = x11::write_mapping_notify_event(buf, order, seq, 1, first_keycode, count);
     });
     if let Some(change) = &xkb_change {
-        crate::core_loop::xkb_layout::apply_keyboard_mapping_repeats(state, xkb_event_base, change);
+        crate::core_loop::xkb_layout::send_keyboard_mapping_followups(
+            state,
+            xkb_event_base,
+            change,
+            crate::core_loop::xkb_layout::X_CHANGE_KEYBOARD_MAPPING,
+        );
     }
     debug!(
         "client {} #{} ChangeKeyboardMapping",
@@ -64700,13 +64816,19 @@ mod tests {
         );
         assert_eq!(state.keyboard_control.auto_repeats_explicit[8], 0x01);
         let change = crate::backend::KeyboardMappingChange {
-            min_keycode: 8,
-            max_keycode: 255,
+            map_notify: x11::XkbMapNotify::default(),
             num_groups: 1,
             enabled_controls: 1,
             repeats: vec![(64, false), (65, false)],
+            indicator_map_changed: 0,
+            indicator_state: 0,
         };
-        crate::core_loop::xkb_layout::apply_keyboard_mapping_repeats(&mut state, 85, &change);
+        crate::core_loop::xkb_layout::apply_keyboard_mapping_repeats(
+            &mut state,
+            85,
+            &change,
+            crate::core_loop::xkb_layout::X_CHANGE_KEYBOARD_MAPPING,
+        );
         assert_eq!(
             state.keyboard_control.auto_repeats[8] & 0x03,
             0x01,
@@ -64718,8 +64840,112 @@ mod tests {
         assert_eq!(&ev[12..16], &0x4000_0000u32.to_le_bytes());
 
         // Nothing changes: no event.
-        crate::core_loop::xkb_layout::apply_keyboard_mapping_repeats(&mut state, 85, &change);
+        crate::core_loop::xkb_layout::apply_keyboard_mapping_repeats(
+            &mut state,
+            85,
+            &change,
+            crate::core_loop::xkb_layout::X_CHANGE_KEYBOARD_MAPPING,
+        );
         assert!(read_all_available(&mut peer).is_empty());
+    }
+
+    /// SetModifierMapping through the dispatcher on a backend without an XKB
+    /// keymap (the fallback store); returns everything the client received.
+    fn set_modifier_mapping(
+        state: &mut ServerState,
+        peer: &mut UnixStream,
+        kpm: u8,
+        keys: &[u8],
+    ) -> Vec<u8> {
+        let mut backend = RecordingBackend::new();
+        process_request(
+            state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 118,
+                data: kpm,
+                length_units: u32::try_from(1 + keys.len() / 4).unwrap(),
+            },
+            keys,
+            None,
+        )
+        .expect("SetModifierMapping dispatch");
+        read_all_or_buffered(state, 1, peer)
+    }
+
+    /// Xorg `build_modmap_from_modkeymap`: a keycode listed twice is
+    /// BadValue with value 0 (golden `duplicate-keycode`), before the range
+    /// check; `check_modmap_change`: a keycode below 8 is BadValue with that
+    /// keycode, the lowest one (golden `keycode-out-of-range`). Nothing is
+    /// stored or notified.
+    #[test]
+    fn set_modifier_mapping_refusals_as_xorg() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let r = set_modifier_mapping(&mut state, &mut peer, 1, &[50, 0, 37, 0, 0, 0, 0, 50]);
+        assert_eq!(r.len(), 32);
+        assert_eq!((r[0], r[1]), (0, x11::error::BAD_VALUE), "{r:02x?}");
+        assert_eq!(&r[4..8], &0u32.to_le_bytes(), "duplicate: value 0");
+
+        let r = set_modifier_mapping(&mut state, &mut peer, 1, &[50, 5, 37, 3, 0, 0, 0, 0]);
+        assert_eq!(r.len(), 32);
+        assert_eq!((r[0], r[1]), (0, x11::error::BAD_VALUE));
+        assert_eq!(&r[4..8], &3u32.to_le_bytes(), "the lowest keycode below 8");
+        assert_eq!(state.modifier_mapping_override, None);
+    }
+
+    /// Xorg `check_modmap_change`: MappingBusy (reply status 1, nothing
+    /// applied, no MappingNotify) when a key of the new map is down or a key
+    /// of the old one is — golden `busy-held-key-changes`,
+    /// `busy-held-modifier-unchanged`, `busy-held-key-becomes-modifier`; a
+    /// held key that is in neither doesn't block (`held-nonmodifier-
+    /// unaffected`). Xorg's loop over the old modifiers stops before the
+    /// last keycode, so a held keycode 255 in the old map doesn't block.
+    #[test]
+    fn set_modifier_mapping_busy_as_xorg() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let old = [50u8, 0, 66, 0, 37, 0, 0, 255];
+        let r = set_modifier_mapping(&mut state, &mut peer, 1, &old);
+        assert_eq!(r.len(), 64, "MappingNotify then the reply: {r:02x?}");
+        assert_eq!(r[0] & 0x7f, 34);
+        assert_eq!((r[32], r[33]), (1, 0), "Success");
+
+        let press = |state: &mut ServerState, kc: u8, down: bool| {
+            if down {
+                state.keys_down[usize::from(kc >> 3)] |= 1 << (kc & 7);
+            } else {
+                state.keys_down[usize::from(kc >> 3)] &= !(1 << (kc & 7));
+            }
+        };
+        let new = [62u8, 0, 66, 0, 37, 0, 0, 0];
+        // 50 held: an old modifier, not in the new map.
+        press(&mut state, 50, true);
+        let r = set_modifier_mapping(&mut state, &mut peer, 1, &new);
+        assert_eq!(r.len(), 32, "only the reply: {r:02x?}");
+        assert_eq!((r[0], r[1]), (1, 1), "MappingBusy");
+        press(&mut state, 50, false);
+        // 62 held: a new modifier.
+        press(&mut state, 62, true);
+        let r = set_modifier_mapping(&mut state, &mut peer, 1, &new);
+        assert_eq!((r.len(), r[1]), (32, 1), "MappingBusy");
+        press(&mut state, 62, false);
+        assert_eq!(state.modifier_mapping_override, Some((1, old.to_vec())));
+        // 38 held: neither.
+        press(&mut state, 38, true);
+        let r = set_modifier_mapping(&mut state, &mut peer, 1, &new);
+        assert_eq!((r.len(), r[33]), (64, 0), "applied");
+        press(&mut state, 38, false);
+
+        // 255 held and in the old map only: not checked by Xorg.
+        let with_255 = [62u8, 0, 66, 0, 37, 0, 0, 255];
+        let _ = set_modifier_mapping(&mut state, &mut peer, 1, &with_255);
+        press(&mut state, 255, true);
+        let r = set_modifier_mapping(&mut state, &mut peer, 1, &new);
+        assert_eq!((r.len(), r[33]), (64, 0), "held 255 doesn't block");
+        assert_eq!(state.modifier_mapping_override, Some((1, new.to_vec())));
     }
 
     #[test]

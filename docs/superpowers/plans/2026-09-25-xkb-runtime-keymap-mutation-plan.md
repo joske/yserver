@@ -1,6 +1,6 @@
 # Plan: runtime keymap mutation reaches XKB (#171)
 
-Status: phases 1–2 implemented (branch `feat/171-xkb-keymap-mutation`); phases 3–4 open.
+Status: phases 1–3 implemented (branch `feat/171-xkb-keymap-mutation`); phase 4 open.
 Issue: #171 — `xmodmap` (ChangeKeyboardMapping / SetModifierMapping) and
 `xkbcomp keymap.xkb $DISPLAY` (XKB SetMap & co) don't change the keymap that
 XKB clients and yserver's own key cooking use. On Xorg they do.
@@ -73,13 +73,18 @@ test-only (`golden_keymap`).
   SetNames → SetGeometry. No SetControls; no read-back first. SetGeometry is
   what triggers the NewKeyboardNotify.
 - Captured Xorg facts (`testdata/xorg-xkb-*.txt`, `tools/xkb-mutation-probe.c`):
-  ChangeKeyboardMapping → MapNotify changed=0x0012 over exactly the requested
-  keys, always (even for no-op changes), one per device; SetModifierMapping →
+  ChangeKeyboardMapping → MapNotify changed=0x0012 (keysyms over the requested
+  keys, even for no-op changes; the action range is XkbUpdateDescActions', which
+  stops at the last key with actions, and a vmodmap change adds 0x80/0x40), one
+  per device; SetModifierMapping →
   MapNotify changed=0x0014 (0x0094 when vmodmap changes), modmap range 8+248,
   with Xorg's buggy action/vmodmap ranges (copy them). MappingBusy if ANY old or
   new modifier key is held (not 255: Xorg off-by-one). A keycode under two
   modifiers is BadValue, so xkbcommon's one-modifier-per-key limit is not a gap.
   keycodes_per_modifier is never stored: readback = max keys on any modifier.
+  A keymap load keeps the per-key repeat (GetKbdByName `XkbCopyControls`).
+  A vmod no key's vmodmap names keeps its real mapping; a key no interpret
+  matches keeps its vmodmap.
 
 ## 3. Approach
 

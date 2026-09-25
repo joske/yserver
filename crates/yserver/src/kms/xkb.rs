@@ -263,7 +263,7 @@ pub(super) fn explicit_type_names(
     keymap: &Keymap,
 ) -> std::collections::HashMap<u8, [Option<String>; 4]> {
     let mut out = std::collections::HashMap::new();
-    let text = keymap.get_as_string(xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1);
+    let text = crate::kms::xkb_edit::keymap_text(keymap);
     let Some(start) = text.find("xkb_symbols") else {
         return out;
     };
@@ -377,7 +377,7 @@ fn implicit_type_names(
 ) -> std::collections::HashMap<(u8, u32), String> {
     use crate::kms::xkb_edit;
     let mut out = std::collections::HashMap::new();
-    let text = keymap.get_as_string(xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1);
+    let text = crate::kms::xkb_edit::keymap_text(keymap);
     let probed = xkb_edit::type_names(&text)
         .and_then(|names| xkb_edit::add_type_probes(&text, &names).map(|(t, kcs)| (names, t, kcs)));
     let (names, probe_text, probe_kcs) = match probed {
@@ -670,52 +670,22 @@ pub(super) fn core_mapping_change(
 }
 
 /// Whether each key in `keys` auto-repeats in `keymap` as Xorg's
-/// `XkbUpdateDescActions` derives `per_key_repeat` from the interprets: an
-/// explicit `repeat=` wins, else the level-1 interpret's `repeat`, else the
-/// key repeats. xkbcommon compiles the same rule except for a key whose
-/// level 1 is empty: it matches no interpret there (and leaves the key not
-/// repeating) where Xorg matches the `Any` interprets against `NoSymbol`.
-/// Those keys are read from a compile with that level set to `VoidSymbol`,
-/// which only the `Any` interprets match too. A key without keysyms repeats
-/// (Xorg: no interpret found).
+/// `XkbApplyCompatMapToKey` derives `per_key_repeat` from the interprets
+/// ([`crate::kms::xkb_derive::KeymapModel::key_repeats`]): the repeat flag of
+/// the interpret level 1 matches, else the key repeats (no keysyms, no
+/// interpret, or only a later level matched one). A key whose entry fixes its
+/// repeat (`repeat=`) or carries its own actions keeps what the keymap says.
+/// xkbcommon compiles the same rule except for a key whose level 1 is empty:
+/// it leaves that key not repeating.
 pub(super) fn key_auto_repeats(keymap: &Keymap, keys: &[u8]) -> Vec<(u8, bool)> {
-    let key = |kc: u8| Keycode::new(u32::from(kc));
-    let empty_level1: Vec<String> = keys
-        .iter()
-        .filter(|&&kc| {
-            keymap.num_layouts_for_key(key(kc)) > 0
-                && keymap.key_get_syms_by_level(key(kc), 0, 0).is_empty()
-        })
-        .filter_map(|&kc| keymap.key_get_name(key(kc)).map(str::to_owned))
-        .collect();
-    let voided = if empty_level1.is_empty() {
-        None
-    } else {
-        let text = keymap.get_as_string(xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1);
-        let compiled = crate::kms::xkb_edit::void_empty_level1(&text, &empty_level1)
-            .ok()
-            .and_then(|t| {
-                let ctx = xkbcommon::xkb::Context::new(xkbcommon::xkb::CONTEXT_NO_FLAGS);
-                Keymap::new_from_string(
-                    &ctx,
-                    t,
-                    xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1,
-                    xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
-                )
-            });
-        if compiled.is_none() {
-            log::warn!("xkb: can't derive the auto-repeat of keys with an empty level 1");
-        }
-        compiled
-    };
+    let model = crate::kms::xkb_derive::KeymapModel::new(keymap)
+        .inspect_err(|e| log::warn!("xkb: per-key repeat from the compiled keymap only: {e}"))
+        .ok();
     keys.iter()
         .map(|&kc| {
-            let repeats = if keymap.num_layouts_for_key(key(kc)) == 0 {
-                true
-            } else if keymap.key_get_syms_by_level(key(kc), 0, 0).is_empty() {
-                voided.as_ref().is_none_or(|v| v.key_repeats(key(kc)))
-            } else {
-                keymap.key_repeats(key(kc))
+            let repeats = match &model {
+                Some(m) if m.derives_repeat(kc) => m.key_repeats(kc),
+                _ => keymap.key_repeats(Keycode::new(u32::from(kc))),
             };
             (kc, repeats)
         })
@@ -756,16 +726,14 @@ struct KeyData {
     /// `[g0_l0, g0_l1, …, g1_l0, …]`. Levels beyond a group's own
     /// level count are filled with `NoSymbol` (0).
     syms: Vec<u32>,
-    /// Real-modifier mask this key activates (0 when it is not a
-    /// modifier key). Drives the synthesized `SetMods`/`LockMods`
-    /// KeyAction so xkbcommon clients can update modifier state from
-    /// key events — without it a client that starts with a modifier
-    /// latched (e.g. kitty launched from a `super + Return` chord)
-    /// can never clear it and every key resolves to NoSymbol (GH #59).
-    mod_bit: u8,
-    /// `true` for a lock modifier (Caps_Lock / Num_Lock) → `LockMods`;
-    /// `false` for a plain modifier (Shift/Control/Super/…) → `SetMods`.
-    mod_lock: bool,
+    /// The key's modifier actions (`xkbModAction` wire bytes, one per
+    /// keysym slot), as Xorg derives them from the compat interprets
+    /// ([`crate::kms::xkb_derive::KeymapModel::key_mod_actions`]); empty
+    /// when it has none. They let xkbcommon clients update modifier state
+    /// from key events — without them a client that starts with a modifier
+    /// latched (e.g. kitty launched from a `super + Return` chord) can never
+    /// clear it and every key resolves to NoSymbol (GH #59).
+    acts: Vec<[u8; 8]>,
 }
 
 /// Modifier-map entry for the `ModifierMap` section: keycode plus
@@ -780,6 +748,7 @@ struct ModMapEntry {
 /// activates in THIS keymap, by pressing it in a scratch xkb state and
 /// reading the effective mods. Correct across layouts/options (e.g. the
 /// lv3 chooser binds ISO_Level3_Shift to Mod5, not the keysym-table guess).
+#[cfg(test)]
 fn real_mod_mask_for_keycode(keymap: &Keymap, kc: u32) -> u8 {
     let mut st = xkbcommon::xkb::State::new(keymap);
     st.update_key(
@@ -802,27 +771,6 @@ fn real_mod_mask_for_keycode(keymap: &Keymap, kc: u32) -> u8 {
         }
     }
     mask
-}
-
-/// Map a level-0 keysym to the XKB *virtual* modifier name it
-/// realises, or `None` for keys that are pure real modifiers
-/// (Shift/Lock/Control) or non-modifiers. These names are the XKB
-/// convention GDK/mutter match against (`gdkkeys-x11.c`'s
-/// `update_keymaps` looks up "Super"/"Hyper"/"Meta"/"Alt"/…), so the
-/// real-modifier *binding* for each is derived from the keymap (via
-/// [`real_mod_mask_for_keycode`]) while only the name↔keysym pairing is
-/// convention.
-fn vmod_name_for_keysym(sym: u32) -> Option<&'static str> {
-    match sym {
-        0xFFE9 | 0xFFEA => Some("Alt"),   // Alt_L, Alt_R
-        0xFFE7 | 0xFFE8 => Some("Meta"),  // Meta_L, Meta_R
-        0xFFEB | 0xFFEC => Some("Super"), // Super_L, Super_R
-        0xFFED | 0xFFEE => Some("Hyper"), // Hyper_L, Hyper_R
-        0xFF7F => Some("NumLock"),        // Num_Lock
-        0xFE03 => Some("LevelThree"),     // ISO_Level3_Shift
-        0xFF14 => Some("ScrollLock"),     // Scroll_Lock
-        _ => None,
-    }
 }
 
 /// XKB caps virtual modifiers at 16 (`XkbNumVirtualMods`).
@@ -881,59 +829,66 @@ pub(super) struct VirtualModData {
     /// `bindings[i]` = real-modifier mask bound to vmod index `i`.
     pub bindings: [u8; XKB_NUM_VIRTUAL_MODS],
     /// `(vmod_index, name)` for each present vmod, in index order.
-    pub names: Vec<(u8, &'static str)>,
+    pub names: Vec<(u8, String)>,
     /// `VirtualModMap`: `(keycode, vmod_bits)` pairs.
     pub vmodmap: Vec<(u8, u16)>,
 }
 
-/// Build the virtual-modifier section from the live keymap. Vmod
-/// indices are assigned in first-seen order over the keycode range;
-/// the same assignment feeds GetMap (`vmods[]` + `VirtualModMap`) and
-/// GetNames (`VirtualModNames`), so a client matching by name reads a
-/// consistent real-modifier binding.
+/// The virtual-modifier section of the live keymap, as Xorg's GetMap and
+/// GetNames describe it: the keymap's virtual modifiers in declaration
+/// order (Xorg's indices), each bound to the real modifiers xkbcommon
+/// resolves it to, and each key's vmodmap as Xorg's
+/// `XkbApplyCompatMapToKey` derives it from the interprets
+/// ([`crate::kms::xkb_derive`]). GetMap builds it from its model
+/// ([`virtual_mods_from_model`]); GetNames and GetIndicatorMap read the same
+/// names and bindings ([`virtual_mod_bindings`]), so a client matching by
+/// name reads a consistent binding.
+#[cfg(test)]
 pub(super) fn virtual_mods_from_keymap(keymap: &Keymap) -> VirtualModData {
-    let (min_kc, max_kc) = clamped_keycode_bounds(keymap);
-
-    let mut present_mask: u16 = 0;
-    let mut bindings = [0u8; XKB_NUM_VIRTUAL_MODS];
-    let mut names: Vec<(u8, &'static str)> = Vec::new();
-    let mut vmodmap: Vec<(u8, u16)> = Vec::new();
-    // Name → assigned vmod index, so repeated keys (L/R) share an index.
-    let mut index_for_name: Vec<(&'static str, u8)> = Vec::new();
-
-    for kc_raw in min_kc..=max_kc {
-        let kc = Keycode::new(u32::from(kc_raw));
-        if keymap.num_layouts_for_key(kc) == 0 {
-            continue;
+    match crate::kms::xkb_derive::KeymapModel::new(keymap) {
+        Ok(model) => virtual_mods_from_model(&model),
+        Err(e) => {
+            log::warn!("xkb: can't derive the virtual modifier map: {e}");
+            let (names, bindings) = crate::kms::xkb_derive::vmod_mappings(keymap);
+            vmod_data(&names, bindings, Vec::new())
         }
-        let level_syms = keymap.key_get_syms_by_level(kc, 0, 0);
-        let Some(sym) = level_syms.first().map(|s| s.raw()) else {
-            continue;
-        };
-        let Some(name) = vmod_name_for_keysym(sym) else {
-            continue;
-        };
-        // Real-modifier binding probed from THIS keymap (what a press
-        // activates): the lv3 chooser binds ISO_Level3_Shift→Mod5, which
-        // the keysym table got wrong (it guessed Mod1).
-        let real_mod = real_mod_mask_for_keycode(keymap, u32::from(kc_raw));
-
-        let idx = if let Some((_, idx)) = index_for_name.iter().find(|(n, _)| *n == name) {
-            *idx
-        } else {
-            let idx = u8::try_from(index_for_name.len()).unwrap_or(0);
-            if usize::from(idx) >= XKB_NUM_VIRTUAL_MODS {
-                continue; // out of vmod slots; ignore extras
-            }
-            index_for_name.push((name, idx));
-            names.push((idx, name));
-            idx
-        };
-        present_mask |= 1 << idx;
-        bindings[usize::from(idx)] |= real_mod;
-        vmodmap.push((kc_raw, 1 << idx));
     }
+}
 
+/// The virtual modifiers' names and real bindings only (no vmodmap), as
+/// GetNames and the indicator maps need them: no keymap text to parse.
+fn virtual_mod_bindings(keymap: &Keymap) -> VirtualModData {
+    let (names, bindings) = crate::kms::xkb_derive::vmod_mappings(keymap);
+    vmod_data(&names, bindings, Vec::new())
+}
+
+/// The virtual-modifier section (see `virtual_mods_from_keymap`) over an
+/// already built model.
+pub(super) fn virtual_mods_from_model(
+    model: &crate::kms::xkb_derive::KeymapModel,
+) -> VirtualModData {
+    let vmodmap = model
+        .vmodmap()
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| **v != 0)
+        .filter_map(|(kc, v)| Some((u8::try_from(kc).ok()?, *v)))
+        .collect();
+    vmod_data(&model.vmod_names, model.vmods, vmodmap)
+}
+
+fn vmod_data(
+    names: &[String],
+    bindings: [u8; XKB_NUM_VIRTUAL_MODS],
+    vmodmap: Vec<(u8, u16)>,
+) -> VirtualModData {
+    let names: Vec<(u8, String)> = names
+        .iter()
+        .take(XKB_NUM_VIRTUAL_MODS)
+        .enumerate()
+        .filter_map(|(i, n)| Some((u8::try_from(i).ok()?, n.clone())))
+        .collect();
+    let present_mask = names.iter().fold(0u16, |m, (i, _)| m | (1 << i));
     VirtualModData {
         present_mask,
         bindings,
@@ -948,7 +903,7 @@ pub(super) fn virtual_mods_from_keymap(keymap: &Keymap) -> VirtualModData {
 /// `modifier_map <Mod> { <KEY>, ... };` line the compiler kept.
 pub(super) fn keymap_modmap(keymap: &Keymap) -> [u8; 256] {
     let mut modmap = [0u8; 256];
-    let text = keymap.get_as_string(xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1);
+    let text = crate::kms::xkb_edit::keymap_text(keymap);
     for line in text.lines() {
         let Some(rest) = line.trim_start().strip_prefix("modifier_map") else {
             continue;
@@ -1000,7 +955,8 @@ fn real_mod_bit_for_name(name: &str) -> Option<u8> {
 /// of Shift, Lock, Control, Mod1, Mod2, Mod3, Mod4, Mod5 in that
 /// order, zero-padded per row. A port of Xorg's `generate_modkeymap`
 /// (dix/inpututils.c) over [`keymap_modmap`]: each row lists its keycodes
-/// in ascending order and the width is the longest row.
+/// in ascending order and the width is the longest row (0 without any
+/// modifier).
 pub(super) fn modifier_mapping_from_keymap(keymap: &Keymap) -> (u8, Vec<u8>) {
     let modmap = keymap_modmap(keymap);
     let mut rows: [Vec<u8>; 8] = Default::default();
@@ -1012,7 +968,8 @@ pub(super) fn modifier_mapping_from_keymap(keymap: &Keymap) -> (u8, Vec<u8>) {
         }
     }
 
-    let kpm = rows.iter().map(Vec::len).max().unwrap_or(0).max(1);
+    // No modifier at all: zero keycodes per modifier and no data, as Xorg.
+    let kpm = rows.iter().map(Vec::len).max().unwrap_or(0);
     let mut data = Vec::with_capacity(8 * kpm);
     for row in &rows {
         for i in 0..kpm {
@@ -1099,8 +1056,14 @@ fn get_map_requested_parts(body: &[u8]) -> u16 {
     (full | partial) & XKB_MAP_PARTS_EMITTED
 }
 
-pub(super) fn reply_get_map_for_request(keymap: &Keymap, body: &[u8]) -> Vec<u8> {
-    reply_get_map_for_parts(keymap, get_map_requested_parts(body))
+/// GetMap for a request `body`; `stale_vmodmap` is the vmodmap Xorg keeps
+/// for keys no interpret matches any more (`KmsCore::xkb_stale_vmodmap`).
+pub(super) fn reply_get_map_for_request(
+    keymap: &Keymap,
+    stale_vmodmap: &std::collections::BTreeMap<u8, u16>,
+    body: &[u8],
+) -> Vec<u8> {
+    reply_get_map_for_parts(keymap, stale_vmodmap, get_map_requested_parts(body))
 }
 
 /// XKB GetMap reply (minor=8). Builds a wire-correct full reply from
@@ -1136,10 +1099,18 @@ pub(super) fn reply_get_map_for_request(keymap: &Keymap, body: &[u8]) -> Vec<u8>
 ///   KeyTypes → KeySyms → KeyActions → KeyBehaviors → VirtualMods
 ///   → ExplicitComponents → ModifierMap → VirtualModMap.
 pub(super) fn reply_get_map(keymap: &Keymap) -> Vec<u8> {
-    reply_get_map_for_parts(keymap, XKB_MAP_PARTS_EMITTED)
+    reply_get_map_for_parts(
+        keymap,
+        &std::collections::BTreeMap::new(),
+        XKB_MAP_PARTS_EMITTED,
+    )
 }
 
-fn reply_get_map_for_parts(keymap: &Keymap, requested_parts: u16) -> Vec<u8> {
+fn reply_get_map_for_parts(
+    keymap: &Keymap,
+    stale_vmodmap: &std::collections::BTreeMap<u8, u16>,
+    requested_parts: u16,
+) -> Vec<u8> {
     let present = requested_parts & XKB_MAP_PARTS_EMITTED;
     let include_key_types = present & XKB_MAP_PART_KEY_TYPES != 0;
     let include_key_syms = present & XKB_MAP_PART_KEY_SYMS != 0;
@@ -1173,6 +1144,11 @@ fn reply_get_map_for_parts(keymap: &Keymap, requested_parts: u16) -> Vec<u8> {
     let mut keys: Vec<KeyData> = Vec::with_capacity(usize::from(n_keys));
     let mut modmap: Vec<ModMapEntry> = Vec::new();
     let key_modmap = keymap_modmap(keymap);
+    // Xorg's derived actions and vmodmap (interprets over the dump).
+    let model = crate::kms::xkb_derive::KeymapModel::new(keymap)
+        .inspect_err(|e| log::warn!("xkb: GetMap without derived actions: {e}"))
+        .ok()
+        .map(|m| m.with_stale_vmodmap(stale_vmodmap));
     let mut total_syms: u32 = 0;
     for kc_raw in min_kc..=max_kc {
         let kc = Keycode::new(u32::from(kc_raw));
@@ -1218,38 +1194,34 @@ fn reply_get_map_for_parts(keymap: &Keymap, requested_parts: u16) -> Vec<u8> {
         let nsyms_this = u32::from(width) * u32::from(num_groups);
         total_syms = total_syms.saturating_add(nsyms_this);
         // ModifierMap = the keymap's modifier_map, as Xorg sends xkb->map->modmap (xkb.c:1317-1341).
-        // The SetMods/LockMods action mask is what a press activates (GH #59), not the modmap.
-        let mut mod_bit = 0u8;
-        let mut mod_lock = false;
         if key_modmap[usize::from(kc_raw)] != 0 {
             modmap.push(ModMapEntry {
                 keycode: kc_raw,
                 mods: key_modmap[usize::from(kc_raw)],
             });
         }
-        if num_groups != 0 && !syms.is_empty() {
-            let bit = real_mod_mask_for_keycode(keymap, u32::from(kc_raw));
-            if bit != 0 {
-                mod_bit = bit;
-                // Caps_Lock (0xFFE5) / Num_Lock (0xFF7F) are LOCK
-                // modifiers (LockMods); everything else is SetMods.
-                mod_lock = matches!(syms.first().copied(), Some(0xFFE5 | 0xFF7F));
-            }
-        }
+        // One action per keysym slot, as Xorg sends a key's actions.
+        let acts = model
+            .as_ref()
+            .and_then(|m| m.key_mod_actions(kc_raw))
+            .filter(|a| a.len() == syms.len())
+            .unwrap_or_default();
         keys.push(KeyData {
             width,
             num_groups,
             kt_index,
             syms,
-            mod_bit,
-            mod_lock,
+            acts,
         });
     }
 
     let total_modmap = u8::try_from(modmap.len()).unwrap_or(u8::MAX);
 
     // Virtual-modifier section, derived from the keymap.
-    let vmod = virtual_mods_from_keymap(keymap);
+    let vmod = match &model {
+        Some(m) => virtual_mods_from_model(m),
+        None => virtual_mod_bindings(keymap),
+    };
 
     // -- Section sizes --------------------------------------------
     // KeyTypes: the derived table (`key_types.types`), serialised in
@@ -1280,17 +1252,16 @@ fn reply_get_map_for_parts(keymap: &Keymap, requested_parts: u16) -> Vec<u8> {
     let key_syms_bytes = if include_key_syms { key_syms_bytes } else { 0 };
 
     // KeyActions: nKeyActions CARD8 counts + pad to 4-byte align +
-    // `totalActs` × 8-byte action structs. A modifier key carries one
-    // action per sym slot (SetMods/LockMods); every other key carries
-    // none. Emitting these lets xkbcommon track modifier state from key
-    // events (GH #59) — previously totalActs was 0 and a client that
-    // started with a modifier latched could never clear it.
+    // `totalActs` × 8-byte action structs. A key with a modifier action
+    // carries one action per sym slot; every other key carries none.
+    // Emitting these lets xkbcommon track modifier state from key events
+    // (GH #59) — previously totalActs was 0 and a client that started with
+    // a modifier latched could never clear it.
     let nk = usize::from(n_keys);
     let actions_count_pad = (4 - nk % 4) % 4;
     let total_acts: u32 = keys
         .iter()
-        .filter(|k| k.mod_bit != 0)
-        .map(|k| u32::from(k.width) * u32::from(k.num_groups))
+        .map(|k| u32::try_from(k.acts.len()).unwrap_or(0))
         .sum();
     let key_actions_bytes: usize = nk + actions_count_pad + (total_acts as usize) * 8;
     let key_actions_bytes = if include_key_actions {
@@ -1441,35 +1412,20 @@ fn reply_get_map_for_parts(keymap: &Keymap, requested_parts: u16) -> Vec<u8> {
         }
     }
 
-    // KeyActions: per-key action count (modifier keys = nSyms, else 0),
-    // padded to a 4-byte boundary, then the action structs in key order.
+    // KeyActions: per-key action count (nSyms for a key with actions,
+    // else 0), padded to a 4-byte boundary, then the action structs in key
+    // order. Each is an 8-byte `xkbModAction` (type, flags, mask, realMods,
+    // vmods high, vmods low, pad, pad) or a zeroed `NoAction`; this is what
+    // tells xkbcommon "this key sets/clears Mod4".
     if include_key_actions {
         for k in &keys {
-            r[off] = if k.mod_bit != 0 {
-                u8::try_from(usize::from(k.width) * usize::from(k.num_groups)).unwrap_or(u8::MAX)
-            } else {
-                0
-            };
+            r[off] = u8::try_from(k.acts.len()).unwrap_or(u8::MAX);
             off += 1;
         }
         off += actions_count_pad;
-        // One XkbModAction per sym slot of each modifier key: SetMods
-        // (type 1) for plain modifiers, LockMods (type 3) for Caps/Num lock.
-        // mask = realMods = the key's real-mod bit; flags = 0; vmods = 0.
-        // (8-byte action: type, flags, mask, realMods, vmods1, vmods2, pad,
-        // pad.) This is what tells xkbcommon "this key sets/clears Mod4".
         for k in &keys {
-            if k.mod_bit == 0 {
-                continue;
-            }
-            let act_type: u8 = if k.mod_lock { 3 } else { 1 };
-            let n_acts = usize::from(k.width) * usize::from(k.num_groups);
-            for _ in 0..n_acts {
-                r[off] = act_type; // type
-                // [off + 1] flags = 0
-                r[off + 2] = k.mod_bit; // mask
-                r[off + 3] = k.mod_bit; // realMods
-                // [off + 4 ..= off + 7] vmods (2) + pad (2) = 0
+            for act in &k.acts {
+                r[off..off + 8].copy_from_slice(act);
                 off += 8;
             }
         }
@@ -1585,7 +1541,7 @@ pub(super) fn reply_get_names(
     // Virtual modifiers (same derivation as GetMap). VirtualModNames
     // must carry one atom per present vmod, in ascending bit order, so
     // a client can match "Super"/"Alt"/… to the binding GetMap sent.
-    let vmod = virtual_mods_from_keymap(keymap);
+    let vmod = virtual_mod_bindings(keymap);
     let vmod_count: usize = vmod.present_mask.count_ones() as usize;
 
     // -- which mask -----------------------------------------------
@@ -2389,8 +2345,8 @@ fn parse_compat_indicator_maps(
 fn indicator_slots(
     keymap: &Keymap,
 ) -> ([IndicatorMapWire; XKB_NUM_INDICATORS], Vec<(usize, String)>) {
-    let text = keymap.get_as_string(xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1);
-    let vmod = virtual_mods_from_keymap(keymap);
+    let text = crate::kms::xkb_edit::keymap_text(keymap);
+    let vmod = virtual_mod_bindings(keymap);
 
     let names = parse_indicator_names(&text);
     let compat_maps = parse_compat_indicator_maps(&text, &vmod);
@@ -2407,6 +2363,24 @@ fn indicator_slots(
         slots[*slot] = map;
     }
     (slots, names)
+}
+
+/// Each indicator's map as far as a virtual modifier mapping change affects
+/// it: `(vmods, mods)` per indicator index, `mods` being the resolved real
+/// mask (Xorg `map->mods.vmods` / `map->mods.mask`).
+pub(super) fn indicator_mod_maps(keymap: &Keymap) -> [(u16, u8); XKB_NUM_INDICATORS] {
+    let (slots, _) = indicator_slots(keymap);
+    slots.map(|s| (s.vmods, s.mods))
+}
+
+/// The indicators lit in `state` (bit N = indicator index N), Xorg's
+/// `effectiveState`.
+pub(super) fn indicators_lit(keymap: &Keymap, state: &xkbcommon::xkb::State) -> u32 {
+    let text = crate::kms::xkb_edit::keymap_text(keymap);
+    parse_indicator_names(&text)
+        .into_iter()
+        .filter(|(_, name)| state.led_name_is_active(name))
+        .fold(0, |bits, (slot, _)| bits | (1 << slot))
 }
 
 pub(super) fn reply_get_indicator_map(keymap: &Keymap) -> Vec<u8> {
@@ -2952,22 +2926,10 @@ mod tests {
     /// The full 416-byte reply (32-byte header + 32 × 12-byte
     /// `xkbIndicatorMapWireDesc`) is asserted byte-for-byte.
     ///
-    /// DIVERGENCE from the Xorg capture — the `vmods` field of the Num Lock
-    /// and Scroll Lock slots:
-    ///   Xorg capture:  Num Lock vmods=0x0001, Scroll Lock vmods=0x0080
-    ///   yserver:       Num Lock vmods=0x0002, Scroll Lock vmods=0x0004
-    /// This is a PRINCIPLED divergence, not a bug. The `vmods` field is an
-    /// index into the keyboard's virtual-modifier table, and Xorg's xkbcomp
-    /// and libxkbcommon assign those indices in different orders (Xorg uses a
-    /// near-fixed canonical numbering; libxkbcommon allocates over the
-    /// keymap's declaration). yserver runs libxkbcommon and publishes the
-    /// SAME vmod numbering in GetMap/GetNames via `virtual_mods_from_keymap`
-    /// (here: NumLock→idx 1 → bit 0x0002, ScrollLock→idx 2 → bit 0x0004). A
-    /// client resolves `vmods` against THIS keyboard's table, so the reply
-    /// must use yserver's own indices to stay internally consistent — forcing
-    /// Xorg's bytes would point at the wrong vmod. The `mods` field (the
-    /// resolved REAL mask: NumLock→Mod2 0x10, ScrollLock→0) is canonical and
-    /// DOES match the golden vector, as do flags/realIndicators/which.
+    /// The `vmods` of the Num Lock and Scroll Lock slots are Xorg's
+    /// virtual modifier indices (NumLock 0 → 0x0001, ScrollLock 7 → 0x0080),
+    /// which are the keymap's declaration order, as GetMap/GetNames publish
+    /// them (`virtual_mods_from_keymap`).
     #[test]
     fn indicator_map_matches_us_de_golden_vector() {
         let km = us_de_keymap();
@@ -2983,15 +2945,13 @@ mod tests {
         want[12..16].copy_from_slice(&0x0000_07ffu32.to_le_bytes()); // realIndicators
         want[16] = 32; // nIndicators
 
-        // Non-empty 12-byte slot bodies. The `vmods` (bytes [6..8]) for Num
-        // Lock / Scroll Lock are yserver's principled indices (see the
-        // divergence note above); every other byte matches the Xorg capture.
+        // Non-empty 12-byte slot bodies, byte for byte the Xorg capture.
         let slot = |idx: usize, bytes: [u8; 12]| (idx, bytes);
         for (idx, bytes) in [
             // flags wG g  wM mods real vmods(le) ctrls(le)
             slot(0, [0x80, 0, 0, 4, 0x02, 0x02, 0x00, 0x00, 0, 0, 0, 0]), // Caps Lock: Lock
-            slot(1, [0x80, 0, 0, 4, 0x10, 0x00, 0x02, 0x00, 0, 0, 0, 0]), // Num Lock: NumLock→Mod2, vmod idx1
-            slot(2, [0x00, 0, 0, 4, 0x00, 0x00, 0x04, 0x00, 0, 0, 0, 0]), // Scroll Lock: ScrollLock vmod idx2
+            slot(1, [0x80, 0, 0, 4, 0x10, 0x00, 0x01, 0x00, 0, 0, 0, 0]), // Num Lock: NumLock→Mod2, vmod idx0
+            slot(2, [0x00, 0, 0, 4, 0x00, 0x00, 0x80, 0x00, 0, 0, 0, 0]), // Scroll Lock: ScrollLock vmod idx7
             slot(11, [0x80, 0, 0, 4, 0x01, 0x01, 0x00, 0x00, 0, 0, 0, 0]), // Shift Lock: Shift
             slot(12, [0x80, 8, 0xfe, 0, 0x00, 0x00, 0x00, 0x00, 0, 0, 0, 0]), // Group 2
             slot(13, [0x20, 0, 0, 0, 0x00, 0x00, 0x00, 0x00, 0x10, 0, 0, 0]), // Mouse Keys: ctrls=0x10
@@ -3534,7 +3494,11 @@ mod tests {
         let km = test_keymap();
 
         // Baseline: the reply without KeyBehaviors requested at all.
-        let without = reply_get_map_for_parts(&km, XKB_MAP_PARTS_EMITTED & !(1 << 5));
+        let without = reply_get_map_for_parts(
+            &km,
+            &std::collections::BTreeMap::new(),
+            XKB_MAP_PARTS_EMITTED & !(1 << 5),
+        );
         assert_eq!(
             u16::from_le_bytes([without[12], without[13]]) & (1 << 5),
             0,
@@ -3583,7 +3547,7 @@ mod tests {
 
         // A client that asks for KeyBehaviors alone gets the bit back.
         let body = get_map_request_body(1 << 5, 0);
-        let only = reply_get_map_for_request(&km, &body);
+        let only = reply_get_map_for_request(&km, &std::collections::BTreeMap::new(), &body);
         assert_eq!(
             u16::from_le_bytes([only[12], only[13]]),
             1 << 5,
@@ -3642,7 +3606,7 @@ mod tests {
     fn get_map_request_only_advertises_requested_parts() {
         let km = test_keymap();
         let body = get_map_request_body(XKB_MAP_PART_KEY_TYPES | XKB_MAP_PART_KEY_SYMS, 0);
-        let r = reply_get_map_for_request(&km, &body);
+        let r = reply_get_map_for_request(&km, &std::collections::BTreeMap::new(), &body);
 
         let present = u16::from_le_bytes([r[12], r[13]]);
         assert_eq!(
@@ -4506,12 +4470,12 @@ mod tests {
         assert_eq!(r[19], 0x04, "whichMods = UseLocked");
         assert_eq!(r[20], 0x10, "mods = Mod2 (NumLock binding)");
         assert_eq!(r[21], 0x00, "realMods");
-        // virtualMods is yserver's own vmod index (principled divergence,
-        // same as the IndicatorMap golden test): NumLock→idx 1 → 0x0002.
+        // virtualMods is Xorg's vmod index, as in the IndicatorMap golden
+        // test: NumLock→idx 0 → 0x0001.
         assert_eq!(
             u16::from_le_bytes(r[22..24].try_into().unwrap()),
-            0x0002,
-            "virtualMods (yserver vmod index for NumLock)"
+            0x0001,
+            "virtualMods (Xorg vmod index for NumLock)"
         );
         assert_eq!(
             u32::from_le_bytes(r[24..28].try_into().unwrap()),
@@ -4723,6 +4687,39 @@ mod tests {
     }
 
     /// Xorg's XkbGetMap sends the same `xkb->map->modmap` the core map is built from.
+    /// Golden (Xvfb 21.1.24, `testdata/xorg-per-key-repeat.txt`): the
+    /// per-key repeat Xorg derives for its startup keymap (evdev/pc105/us),
+    /// which seeds the keyboard's (`XkbFinishInit`). Keys whose level 1 is
+    /// empty but a later level matches an interpret (<ALT>, <META>, <SUPR>)
+    /// repeat: `XkbApplyCompatMapToKey` sets the bit when level 1 matched
+    /// nothing.
+    #[test]
+    fn keymap_auto_repeats_match_xorg_startup_keymap() {
+        let text = include_str!("testdata/xorg-per-key-repeat.txt");
+        let bits = text
+            .lines()
+            .find_map(|l| l.strip_prefix("repeat: "))
+            .expect("repeat line");
+        let want: Vec<u8> = (0..32)
+            .map(|i| u8::from_str_radix(&bits[2 * i..2 * i + 2], 16).unwrap())
+            .collect();
+        assert!(
+            text.contains("query: layout:     us"),
+            "golden is the us keymap"
+        );
+        let got = keymap_auto_repeats(&golden_keymap("us", None));
+        let diff: Vec<u8> = (8..=255u8)
+            .filter(|&kc| {
+                let (i, b) = (usize::from(kc >> 3), 1u8 << (kc & 7));
+                got[i] & b != want[i] & b
+            })
+            .collect();
+        assert!(
+            diff.is_empty(),
+            "per-key repeat differs from Xorg for keycodes {diff:?}"
+        );
+    }
+
     #[test]
     fn get_map_modifier_map_matches_xorg_gb() {
         let (kpm, data) = modmap_golden("gb");

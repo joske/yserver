@@ -1,0 +1,13 @@
+# Xorg per-key auto-repeat of the keymap the server starts with (issue #171): fresh Xvfb -noreset
+# server: X.Org version 21.1.24 (xdpyinfo); `Xvfb -version` -> "Unrecognized option: -version" (not supported by this build)
+# pacman -Q: xkeyboard-config 2.48-1 xorg-server-xvfb 21.1.24-1
+# XkbFinishInit derives the keyboard's per-key repeat from the startup keymap; a later keymap
+# load keeps it (ProcXkbGetKbdByName: XkbCopyControls from the old keymap), so only the
+# startup keymap shows it. Lines:
+#   query: setxkbmap -query of the fresh server (its startup RMLVO)
+#   repeat: xset q 'auto repeating keys' (autoRepeats = per_key_repeat), 32 bytes in order as
+#           hex, keycode N = byte N/8 bit N%8
+query: rules:      evdev
+query: model:      pc105
+query: layout:     us
+repeat: 00ffffffdffffbbffadfffefffedffff9ffffffffffffffffff7ffffffffffff

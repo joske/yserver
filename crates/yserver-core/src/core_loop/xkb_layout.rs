@@ -194,7 +194,12 @@ const XKB_CONTROLS_NOTIFY_MASK: u16 = 1 << 3;
 const XKB_PER_KEY_REPEAT_MASK: u32 = 1 << 30;
 /// Core `X_ChangeKeyboardMapping`: the cause Xorg's `XkbApplyMappingChange`
 /// stamps on the events of both the core and the XI request.
-const X_CHANGE_KEYBOARD_MAPPING: u8 = 100;
+pub(crate) const X_CHANGE_KEYBOARD_MAPPING: u8 = 100;
+/// Core `X_SetModifierMapping`: the cause of a modifier-map change's events,
+/// for the core and the XI request alike (`XkbApplyMappingChange`).
+pub(crate) const X_SET_MODIFIER_MAPPING: u8 = 118;
+/// `XkbSelectEvents` bit of `XkbIndicatorMapNotify`.
+const XKB_INDICATOR_MAP_NOTIFY_MASK: u16 = 1 << 5;
 
 /// Seed the core per-key auto-repeat from the backend's keymap, as Xorg's
 /// `XkbFinishInit` copies the keymap's `per_key_repeat` into the keyboard
@@ -206,45 +211,40 @@ pub fn seed_keyboard_auto_repeats(state: &mut ServerState, backend: &dyn Backend
     }
 }
 
-/// The `XkbMapNotify` of a keymap mapping change of `count` keys from
-/// `first`: KeySyms|KeyActions over exactly those keys, as Xorg's
-/// `XkbUpdateKeyTypesFromCore` + `XkbUpdateActions` report it (captured
-/// `changed=0x0012`, also for a change that alters nothing). Sent before the
-/// core `MappingNotify`, like `XkbSendMapNotify` → `XkbSendLegacyMapNotify`.
-pub(crate) fn send_keyboard_mapping_map_notify(
+/// The notifications of a keymap mapping change that follow its
+/// `XkbMapNotify` and core `MappingNotify`, in Xorg's order
+/// (`XkbSendNotification`): `XkbControlsNotify` for a per-key repeat change
+/// (`cause_major` = the core request), then `XkbIndicatorMapNotify` for the
+/// indicator maps a virtual modifier change altered.
+pub(crate) fn send_keyboard_mapping_followups(
     state: &mut ServerState,
     xkb_event_base: u8,
     change: &KeyboardMappingChange,
-    first: u8,
-    count: u8,
+    cause_major: u8,
 ) {
-    send_xkb_map_notify(
-        state,
-        xkb_event_base,
-        x11::XkbMapNotify {
-            device_id: XKB_DEVICE_ID,
-            changed: 0x0012, // XkbKeySymsMask | XkbKeyActionsMask
-            min_keycode: change.min_keycode,
-            max_keycode: change.max_keycode,
-            first_key_sym: first,
-            n_key_syms: count,
-            first_key_act: first,
-            n_key_acts: count,
-            ..x11::XkbMapNotify::default()
-        },
-    );
+    apply_keyboard_mapping_repeats(state, xkb_event_base, change, cause_major);
+    if change.indicator_map_changed != 0 {
+        send_indicator_map_notify(
+            state,
+            xkb_event_base,
+            change.indicator_state,
+            change.indicator_map_changed,
+        );
+    }
 }
 
 /// Apply the per-key auto-repeat a mapping change re-derived for its keys
 /// (Xorg `XkbUpdateActions`: `per_key_repeat` is copied from the core bits,
 /// the changed keys are recomputed, and the result is copied back), then
-/// send `XkbControlsNotify(PerKeyRepeat)` when a bit actually changed. Keys
-/// a client set with `ChangeKeyboardControl` keep their bit (Xorg marks them
+/// send `XkbControlsNotify(PerKeyRepeat)` when a bit actually changed, with
+/// `cause_major` (the core request) as its cause. Keys a client set with
+/// `ChangeKeyboardControl` keep their bit (Xorg marks them
 /// `XkbExplicitAutoRepeatMask`).
 pub(crate) fn apply_keyboard_mapping_repeats(
     state: &mut ServerState,
     xkb_event_base: u8,
     change: &KeyboardMappingChange,
+    cause_major: u8,
 ) {
     let control = &mut state.keyboard_control;
     let mut changed = false;
@@ -272,12 +272,28 @@ pub(crate) fn apply_keyboard_mapping_repeats(
         enabled_control_changes: 0,
         keycode: 0,
         event_type: 0,
-        request_major: X_CHANGE_KEYBOARD_MAPPING,
+        request_major: cause_major,
         request_minor: 0,
     };
     let recipients = subscribers(state, XKB_CONTROLS_NOTIFY_MASK);
     let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
         let _ = x11::write_xkb_controls_notify(buf, order, seq, xkb_event_base, notify);
+    });
+}
+
+/// Send `XkbIndicatorMapNotify` for the indicators in `changed` (their map
+/// changed; `lit` = the indicators on) to its subscribers, as Xorg's
+/// `XkbSendNotification` does after a virtual modifier mapping change.
+fn send_indicator_map_notify(state: &mut ServerState, xkb_event_base: u8, lit: u32, changed: u32) {
+    let notify = x11::XkbIndicatorNotify {
+        kind: x11::XkbIndicatorNotifyKind::Map,
+        device_id: XKB_DEVICE_ID,
+        state: lit,
+        changed,
+    };
+    let recipients = subscribers(state, XKB_INDICATOR_MAP_NOTIFY_MASK);
+    let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
+        let _ = x11::write_xkb_indicator_notify(buf, order, seq, xkb_event_base, notify);
     });
 }
 

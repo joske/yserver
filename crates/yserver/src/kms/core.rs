@@ -1951,6 +1951,11 @@ pub(crate) struct KmsCore {
     /// so it is taken from the keymap as loaded (lazily, always before the
     /// first edit) and carried across edits; a reload drops it.
     xkb_explicit_types: Option<Box<[u8; 256]>>,
+    /// The vmodmap Xorg keeps for keys that no interpret matches any more
+    /// after a mapping change (`XkbApplyCompatMapToKey` leaves it alone;
+    /// see [`crate::kms::xkb_derive::KeymapModel::with_stale_vmodmap`]).
+    /// xkbcommon has no such state; carried across edits, dropped on reload.
+    pub(crate) xkb_stale_vmodmap: std::collections::BTreeMap<u8, u16>,
     pub(crate) xkb_state: XkbState,
     /// The RMLVO the active keymap was compiled from, or, for an edited
     /// keymap, the one it was edited from. Read by GetNames (`symbolsName`)
@@ -2107,6 +2112,7 @@ impl KmsCore {
             keymap_source: KeymapSource::Rmlvo,
             locked_group: 0,
             down_keys: HashSet::new(),
+            xkb_stale_vmodmap: std::collections::BTreeMap::new(),
             font_loader: FontLoader::new()?,
             fonts: HashMap::new(),
             bg_pixel: None,
@@ -2190,6 +2196,7 @@ impl KmsCore {
             keymap_source: KeymapSource::Rmlvo,
             locked_group: 0,
             down_keys: HashSet::new(),
+            xkb_stale_vmodmap: std::collections::BTreeMap::new(),
             font_loader: FontLoader::new().expect("test font loader"),
             fonts: HashMap::new(),
             bg_pixel: None,
@@ -2292,6 +2299,7 @@ impl KmsCore {
     ) -> (u8, u8) {
         let bounds = self.swap_keymap(keymap, 0);
         self.xkb_explicit_types = None;
+        self.xkb_stale_vmodmap.clear();
         self.xkb_rmlvo = rmlvo.clone();
         self.keymap_source = KeymapSource::Rmlvo;
         log::info!(
@@ -2463,9 +2471,7 @@ mod xkb_rmlvo_tests {
     }
 
     fn live_text(core: &KmsCore) -> String {
-        core.xkb_keymap
-            .0
-            .get_as_string(xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1)
+        crate::kms::xkb_edit::keymap_text(&core.xkb_keymap.0)
     }
 
     fn usru_rmlvo() -> XkbRmlvo {

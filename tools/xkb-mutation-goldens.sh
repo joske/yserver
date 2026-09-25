@@ -4,6 +4,7 @@
 #   crates/yserver/src/kms/testdata/xorg-xkb-change-keyboard-mapping.txt
 #   crates/yserver/src/kms/testdata/xorg-xkb-set-modifier-mapping.txt
 #   crates/yserver/src/kms/testdata/xorg-xkbcomp-upload-trace.txt
+#   crates/yserver/src/kms/testdata/xorg-per-key-repeat.txt
 #
 # Every value in those files is Xvfb output recorded by tools/xkb-mutation-probe.c
 # (or x11trace). Never hand-edit them; rerun this script.
@@ -13,7 +14,7 @@
 # (x11trace's fake display); both must be free. Only the Xvfb this script
 # starts is ever killed (by pid).
 #
-# usage: tools/xkb-mutation-goldens.sh [ckm|smm|xkbcomp ...]   (default: all)
+# usage: tools/xkb-mutation-goldens.sh [ckm|smm|xkbcomp|repeat ...]   (default: all)
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -266,6 +267,23 @@ gen_smm() {
             smm_case "$L" kpm-grow smmx:+38@3
             smm_case "$L" duplicate-keycode smmx:+50@2
             smm_case "$L" keycode-out-of-range smmx:+7@3
+            # a key moves to another modifier while its virtual modifier stays bound
+            # (Super, NumLock, LevelThree): the vmod's real mapping changes
+            smm_case "$L" vmod-remap-super smmx:-133@6,+133@5
+            smm_case "$L" vmod-remap-numlock smmx:-77@4,+77@5
+            smm_case "$L" vmod-remap-levelthree smmx:-92@7,+92@5
+            # a vmod no key names any more keeps its mapping; named again, it is remapped
+            smm_case "$L" vmod-stale-then-rebound "$kpm2" smmx:+205@6
+            # every modifier cleared: GetModifierMapping reports kpm=0
+            smm_case "$L" clear-all smm:1:0,0,0,0,0,0,0,0
+            # ChangeKeyboardMapping, re-derived as XkbUpdateDescActions does: a key with
+            # actions then one without (the action range stops at the last such key), and a
+            # vmod-carrying key remapped (Num_Lock -> x, then x -> a: NumLock stays bound)
+            smm_case "$L" ckm-mixed-actions ckm:37:1:2:ffe3,61
+            smm_case "$L" ckm-vmod-key-remapped ckm:76:1:2:ffc9,78 ckm:77:1:1:61
+            # a keymap load after a per-key repeat change (Xorg keeps the controls)
+            smm_case "$L" reload-keeps-repeat smmx:+38@3 \
+                "run:setxkbmap -display :$DISP -rules evdev -model pc105 -layout $L"
         done
     } >"$out"
 }
@@ -310,8 +328,30 @@ EOF
     } >"$out"
 }
 
+# ---------------------------------------------------------------------------
+gen_repeat() {
+    local out=$TD/xorg-per-key-repeat.txt
+    {
+        echo "# Xorg per-key auto-repeat of the keymap the server starts with (issue #171): fresh Xvfb -noreset"
+        versions
+        echo "# XkbFinishInit derives the keyboard's per-key repeat from the startup keymap; a later keymap"
+        echo "# load keeps it (ProcXkbGetKbdByName: XkbCopyControls from the old keymap), so only the"
+        echo "# startup keymap shows it. Lines:"
+        echo "#   query: setxkbmap -query of the fresh server (its startup RMLVO)"
+        echo "#   repeat: xset q 'auto repeating keys' (autoRepeats = per_key_repeat), 32 bytes in order as"
+        echo "#           hex, keycode N = byte N/8 bit N%8"
+        start_x
+        setxkbmap -display ":$DISP" -query | sed 's/^/query: /'
+        bits=$(xset -display ":$DISP" q | sed -n '/auto repeating keys:/,/^[^ ]/p' |
+            grep -oE '[0-9a-f]{16}' | tr -d '\n')
+        [ ${#bits} -eq 64 ] || { echo "xset q: no 32-byte bitmap" >&2; exit 1; }
+        echo "repeat: $bits"
+        stop_x
+    } >"$out"
+}
+
 targets=("$@")
-[ ${#targets[@]} -eq 0 ] && targets=(ckm smm xkbcomp)
+[ ${#targets[@]} -eq 0 ] && targets=(ckm smm xkbcomp repeat)
 for t in "${targets[@]}"; do
     "gen_$t"
 done

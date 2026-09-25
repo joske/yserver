@@ -2,8 +2,8 @@
 //!
 //! xkbcommon keymaps are immutable and expose no structured access to types,
 //! actions or behaviors, so a runtime mapping change (ChangeKeyboardMapping,
-//! SetModifierMapping) takes the live keymap's
-//! `get_as_string(KEYMAP_FORMAT_TEXT_V1)`, edits it here, and hands the result
+//! SetModifierMapping) takes the live keymap's complete V1 dump
+//! ([`keymap_text`]), edits it here, and hands the result
 //! to [`crate::kms::core::KmsCore::install_keymap_text`]. The compiler then
 //! re-derives actions and the vmodmap from the compat interprets, which is what
 //! Xorg's `XkbUpdateDescActions` does after `XkbUpdateKeyTypesFromCore`.
@@ -18,6 +18,53 @@
 use std::{collections::HashSet, fmt, ops::Range};
 
 use crate::kms::xkb::REAL_MOD_NAMES;
+
+/// The live keymap as V1 text with nothing left out: what every edit starts
+/// from and every derivation reads.
+///
+/// libxkbcommon 1.12+ drops the key types and compat entries no key uses
+/// from `xkb_keymap_get_as_string` (unless asked with
+/// `XKB_KEYMAP_SERIALIZE_KEEP_UNUSED` through `xkb_keymap_get_as_string2`).
+/// An edit compiled from such text loses those interprets for good, although
+/// a later mapping change may need them: Xorg keeps its whole compat map, so
+/// after `keycode 66 = Control_L` a key still in Lock matches
+/// `Any+Exactly(Lock)` (LockMods), which the trimmed text no longer has. The
+/// `xkbcommon` crate predates the call, so it is looked up at run time;
+/// older libraries have no such trimming and their plain dump is complete.
+pub(crate) fn keymap_text(keymap: &xkbcommon::xkb::Keymap) -> String {
+    type GetAsString2 = unsafe extern "C" fn(
+        *mut xkbcommon::xkb::ffi::xkb_keymap,
+        std::ffi::c_int,
+        std::ffi::c_int,
+    ) -> *mut std::ffi::c_char;
+    /// `XKB_KEYMAP_FORMAT_TEXT_V1`, `XKB_KEYMAP_SERIALIZE_KEEP_UNUSED`.
+    const FORMAT_TEXT_V1: std::ffi::c_int = 1;
+    const SERIALIZE_KEEP_UNUSED: std::ffi::c_int = 1 << 1;
+    static GET_AS_STRING2: std::sync::OnceLock<Option<GetAsString2>> = std::sync::OnceLock::new();
+    let get = GET_AS_STRING2.get_or_init(|| {
+        // SAFETY: dlsym with RTLD_DEFAULT and a NUL-terminated name only
+        // looks the symbol up; a non-null result is libxkbcommon's
+        // `xkb_keymap_get_as_string2`, whose C signature `GetAsString2` is.
+        let sym = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"xkb_keymap_get_as_string2".as_ptr()) };
+        (!sym.is_null()).then(|| {
+            // SAFETY: see above; same size, it's a function pointer.
+            unsafe { std::mem::transmute::<*mut std::ffi::c_void, GetAsString2>(sym) }
+        })
+    });
+    if let Some(get) = get {
+        // SAFETY: the keymap pointer is live for the borrow; the result is a
+        // malloc'd NUL-terminated string (or NULL) that we own and free.
+        unsafe {
+            let raw = get(keymap.get_raw_ptr(), FORMAT_TEXT_V1, SERIALIZE_KEEP_UNUSED);
+            if !raw.is_null() {
+                let text = std::ffi::CStr::from_ptr(raw).to_string_lossy().into_owned();
+                libc::free(raw.cast());
+                return text;
+            }
+        }
+    }
+    keymap.get_as_string(xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1)
+}
 
 /// `XkbNumKbdGroups`: a key has at most four groups.
 const MAX_GROUPS: usize = 4;
@@ -53,10 +100,6 @@ pub(crate) enum XkbEditError {
     NoFreeKeyName(u8),
     /// The keycode is in more than one modifier; keymap text keeps one per
     /// key (xkbcommon and xkbcomp both drop all but the last).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "#171 phase 3 routes SetModifierMapping here")
-    )]
     MultipleModifiers(u8),
 }
 
@@ -81,16 +124,6 @@ impl fmt::Display for XkbEditError {
 }
 
 impl std::error::Error for XkbEditError {}
-
-/// The name `keycode` has in `xkb_keycodes` (not an alias), if any.
-pub(crate) fn keycode_name(text: &str, keycode: u8) -> Result<Option<String>, XkbEditError> {
-    let body = section(text, "xkb_keycodes")?;
-    Ok(statements(text, body, "xkb_keycodes")?
-        .into_iter()
-        .filter_map(|r| keycode_def(&text[r]))
-        .find(|&(_, kc)| kc == u32::from(keycode))
-        .map(|(name, _)| name.to_owned()))
-}
 
 /// Make sure `keycode` has a name in `xkb_keycodes`, adding `<Innn> = nnn;`
 /// when it has none (ChangeKeyboardMapping and SetModifierMapping may target
@@ -209,10 +242,6 @@ pub(crate) fn set_key(
 /// Keycodes with bits set and no name get one ([`ensure_keycode_name`]).
 /// A keycode in several modifiers is refused: the compiler keeps only one
 /// modifier per key, so writing it would silently lose the others.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "#171 phase 3 routes SetModifierMapping here")
-)]
 pub(crate) fn set_modifier_map(text: &str, modmap: &[u8; 256]) -> Result<String, XkbEditError> {
     if let Some(kc) = (0..=255u8).find(|&kc| modmap[usize::from(kc)].count_ones() > 1) {
         return Err(XkbEditError::MultipleModifiers(kc));
@@ -258,83 +287,6 @@ pub(crate) fn set_modifier_map(text: &str, modmap: &[u8; 256]) -> Result<String,
         edits.push((at..at, block));
     }
     Ok(apply_edits(&text, edits))
-}
-
-/// Whether the key's `xkb_symbols` entry fixes its auto-repeat (`repeat=`),
-/// which keeps the compat interprets from deriving it (Xorg's
-/// `XkbExplicitAutoRepeatMask`). A key without an entry doesn't.
-pub(crate) fn key_repeat_is_explicit(text: &str, name: &str) -> Result<bool, XkbEditError> {
-    let canonical = canonical_key_name(text, name)?;
-    let body = section(text, "xkb_symbols")?;
-    let Some(r) = statements(text, body, "xkb_symbols")?
-        .into_iter()
-        .find(|r| key_stmt_name(&text[r.clone()]) == Some(canonical.as_str()))
-    else {
-        return Ok(false);
-    };
-    let (kept, _) = kept_key_fields(&text[r], 0)?;
-    Ok(kept.iter().any(|f| {
-        f.split(|c: char| c == '=' || c.is_whitespace())
-            .next()
-            .is_some_and(|k| k.eq_ignore_ascii_case("repeat"))
-    }))
-}
-
-/// `text` with the level-1 keysym of group 1 of each key in `names` set to
-/// `VoidSymbol` where it is `NoSymbol`. Compiling that shows the auto-repeat
-/// Xorg gives those keys: Xorg matches a `NoSymbol` level 1 against the
-/// `Any` interprets (`_XkbFindMatchingInterp`), as xkbcommon does for a
-/// keysym no interpret names, while xkbcommon matches no interpret at all
-/// on an empty level. Never installed.
-pub(crate) fn void_empty_level1(text: &str, names: &[String]) -> Result<String, XkbEditError> {
-    let body = section(text, "xkb_symbols")?;
-    let mut edits = Vec::new();
-    for r in statements(text, body, "xkb_symbols")? {
-        let stmt = &text[r.clone()];
-        if !key_stmt_name(stmt).is_some_and(|n| names.iter().any(|w| w == n)) {
-            continue;
-        }
-        let open = stmt
-            .find('{')
-            .ok_or(XkbEditError::Malformed("xkb_symbols"))?;
-        let close =
-            matching_close(stmt.as_bytes(), open).ok_or(XkbEditError::Malformed("xkb_symbols"))?;
-        // The group-1 symbols: the `[ … ]` shorthand or `symbols[1]= [ … ]`.
-        let fields = &stmt[open + 1..close];
-        let Some(list) = split_top_level(fields, b',').into_iter().find(|f| {
-            f.starts_with('[')
-                || f.strip_prefix("symbols").is_some_and(|t| {
-                    t.trim_start()
-                        .strip_prefix('[')
-                        .and_then(|t| t.split_once(']'))
-                        .is_some_and(|(g, _)| group_index(g) == Some(1))
-                })
-        }) else {
-            continue;
-        };
-        let list_at = r.start + open + 1 + (list.as_ptr() as usize - fields.as_ptr() as usize);
-        let bracket = if list.starts_with('[') {
-            0
-        } else {
-            let eq = list
-                .find('=')
-                .ok_or(XkbEditError::Malformed("xkb_symbols"))?;
-            eq + list[eq..]
-                .find('[')
-                .ok_or(XkbEditError::Malformed("xkb_symbols"))?
-        };
-        let inner = &list[bracket + 1..];
-        let first = inner.trim_start();
-        let lead = inner.len() - first.len();
-        let end = first
-            .find(|c: char| c == ',' || c == ']' || c.is_whitespace())
-            .unwrap_or(first.len());
-        if &first[..end] == "NoSymbol" {
-            let at = list_at + bracket + 1 + lead;
-            edits.push((at..at + end, "VoidSymbol".to_owned()));
-        }
-    }
-    Ok(apply_edits(text, edits))
 }
 
 /// The names of the key types `xkb_types` defines, in definition order.
@@ -428,6 +380,211 @@ pub(crate) fn add_type_probes(
     }
     let text = apply_edits(&text, vec![(at..at, entries)]);
     Ok((text, probes.into_iter().map(|(_, kc)| kc).collect()))
+}
+
+/// Rewrite the explicit real-modifier mapping of virtual modifiers in every
+/// `virtual_modifiers` statement (each section declares its own). For each
+/// `(name, mapping)`: `Some(mask)` with a non-zero mask writes
+/// `Name=Mod1+…`, anything else writes a bare `Name`, which leaves the
+/// mapping to the compiler (the modmap of the keys whose vmodmap names the
+/// vmod). Virtual modifiers not listed keep their declaration.
+///
+/// xkbcommon ORs an explicit mapping with the derived one, so an explicit
+/// mapping is only exact for a virtual modifier no key's vmodmap names.
+pub(crate) fn set_virtual_modifier_mappings(
+    text: &str,
+    mappings: &[(String, Option<u8>)],
+) -> Result<String, XkbEditError> {
+    let mut edits = Vec::new();
+    for keyword in ["xkb_types", "xkb_compatibility", "xkb_symbols"] {
+        let Ok(body) = section(text, keyword) else {
+            continue;
+        };
+        for r in statements(text, body, keyword)? {
+            let stmt = &text[r.clone()];
+            let Some(rest) = stmt.strip_prefix("virtual_modifiers") else {
+                continue;
+            };
+            if !rest.starts_with(|c: char| c.is_whitespace()) {
+                continue;
+            }
+            let list = rest.trim().trim_end_matches(';');
+            let items: Vec<String> = split_top_level(list, b',')
+                .into_iter()
+                .map(|item| {
+                    let name = item.split('=').next().unwrap_or_default().trim();
+                    match mappings.iter().find(|(n, _)| n == name) {
+                        Some((_, Some(mask))) if *mask != 0 => {
+                            let mods: Vec<&str> = REAL_MOD_NAMES
+                                .iter()
+                                .enumerate()
+                                .filter(|(bit, _)| mask & (1 << bit) != 0)
+                                .map(|(_, n)| *n)
+                                .collect();
+                            format!("{name}={}", mods.join("+"))
+                        }
+                        Some(_) => name.to_owned(),
+                        None => item.to_owned(),
+                    }
+                })
+                .collect();
+            edits.push((r, format!("virtual_modifiers {};", items.join(","))));
+        }
+    }
+    Ok(apply_edits(text, edits))
+}
+
+/// One `interpret` statement of `xkb_compatibility`, split but not
+/// interpreted: `head` is `Keysym+Match(mods)`, `fields` its body's
+/// statements (`virtualModifier= Meta`, `action= SetMods(…)`, …).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct InterpretText {
+    pub head: String,
+    pub fields: Vec<String>,
+}
+
+/// `(interprets, defaults)` of [`interpret_texts`].
+pub(crate) type InterpretTexts = (Vec<InterpretText>, Vec<(String, String)>);
+
+/// The `interpret` statements of `xkb_compatibility` in order, plus the
+/// `interpret.field= value` defaults that precede them (as `(field, value)`).
+pub(crate) fn interpret_texts(text: &str) -> Result<InterpretTexts, XkbEditError> {
+    let body = section(text, "xkb_compatibility")?;
+    let mut interprets = Vec::new();
+    let mut defaults = Vec::new();
+    for r in statements(text, body, "xkb_compatibility")? {
+        let stmt = &text[r];
+        let Some(rest) = stmt.strip_prefix("interpret") else {
+            continue;
+        };
+        if let Some(default) = rest.strip_prefix('.') {
+            if let Some((field, value)) = default.trim_end_matches(';').split_once('=') {
+                defaults.push((field.trim().to_owned(), value.trim().to_owned()));
+            }
+            continue;
+        }
+        if !rest.starts_with(|c: char| c.is_whitespace()) {
+            continue;
+        }
+        let head = rest.split('{').next().unwrap_or_default().trim().to_owned();
+        interprets.push(InterpretText {
+            head,
+            fields: body_statements(stmt)?,
+        });
+    }
+    Ok((interprets, defaults))
+}
+
+/// Each key type of `xkb_types` in definition order, with the value of its
+/// `modifiers=` statement (`"none"` when it has none).
+pub(crate) fn type_modifier_texts(text: &str) -> Result<Vec<(String, String)>, XkbEditError> {
+    let body = section(text, "xkb_types")?;
+    let mut out = Vec::new();
+    for r in statements(text, body, "xkb_types")? {
+        let stmt = &text[r];
+        let Some(rest) = stmt.strip_prefix("type") else {
+            continue;
+        };
+        if !rest.starts_with(|c: char| c.is_whitespace()) {
+            continue;
+        }
+        let Some((name, _)) = rest
+            .trim_start()
+            .strip_prefix('"')
+            .and_then(|t| t.split_once('"'))
+        else {
+            continue;
+        };
+        let modifiers = body_statements(stmt)?
+            .into_iter()
+            .find_map(|f| {
+                let (k, v) = f.split_once('=')?;
+                k.trim()
+                    .eq_ignore_ascii_case("modifiers")
+                    .then(|| v.trim().to_owned())
+            })
+            .unwrap_or_else(|| "none".to_owned());
+        out.push((name.to_owned(), modifiers));
+    }
+    Ok(out)
+}
+
+/// The explicit per-key properties of an `xkb_symbols` key entry, as text.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct KeyExplicitText {
+    /// `(group, actions)` per `actions[group]= [ … ]` field (group 1-based),
+    /// each action as written (`SetMods(modifiers=Shift)`).
+    pub actions: Vec<(usize, Vec<String>)>,
+    /// The `virtualMods=` / `vmods=` value, if the entry fixes the vmodmap.
+    pub vmods: Option<String>,
+    /// Whether the entry fixes the auto-repeat (`repeat=`).
+    pub repeat: bool,
+}
+
+/// Every key entry of `xkb_symbols` that carries an explicit property
+/// (actions, virtual modifiers or repeat), by key name.
+pub(crate) fn key_explicit_texts(
+    text: &str,
+) -> Result<Vec<(String, KeyExplicitText)>, XkbEditError> {
+    let body = section(text, "xkb_symbols")?;
+    let mut out = Vec::new();
+    for r in statements(text, body, "xkb_symbols")? {
+        let stmt = &text[r];
+        let Some(name) = key_stmt_name(stmt) else {
+            continue;
+        };
+        let (kept, actions) = kept_key_fields(stmt, MAX_GROUPS)?;
+        let mut explicit = KeyExplicitText::default();
+        for field in actions {
+            let rest = field["actions".len()..].trim_start();
+            let (group, rest) = match rest.strip_prefix('[').and_then(|t| t.split_once(']')) {
+                Some((g, rest)) => (group_index(g).unwrap_or(1), rest),
+                None => (1, rest),
+            };
+            let list = rest
+                .trim_start()
+                .strip_prefix('=')
+                .map(str::trim)
+                .and_then(|l| l.strip_prefix('['))
+                .and_then(|l| l.strip_suffix(']'))
+                .ok_or(XkbEditError::Malformed("xkb_symbols"))?;
+            explicit.actions.push((
+                group,
+                split_top_level(list, b',')
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            ));
+        }
+        for field in kept {
+            let Some((k, v)) = field.split_once('=') else {
+                continue;
+            };
+            let k = k.trim();
+            if k.eq_ignore_ascii_case("virtualMods") || k.eq_ignore_ascii_case("vmods") {
+                explicit.vmods = Some(v.trim().to_owned());
+            } else if k.eq_ignore_ascii_case("repeat") {
+                explicit.repeat = true;
+            }
+        }
+        if explicit != KeyExplicitText::default() {
+            out.push((name.to_owned(), explicit));
+        }
+    }
+    Ok(out)
+}
+
+/// The statements inside the braces of `stmt` (`interpret … { a; b; };`).
+fn body_statements(stmt: &str) -> Result<Vec<String>, XkbEditError> {
+    let Some(open) = stmt.find('{') else {
+        return Ok(Vec::new());
+    };
+    let close =
+        matching_close(stmt.as_bytes(), open).ok_or(XkbEditError::Malformed("statement"))?;
+    Ok(split_top_level(&stmt[open + 1..close], b';')
+        .into_iter()
+        .map(str::to_owned)
+        .collect())
 }
 
 // ─── writing ────────────────────────────────────────────────────────
@@ -776,7 +933,7 @@ mod tests {
     /// What an edit operates on in production: xkbcommon's own V1 dump of
     /// the live keymap.
     fn dump(km: &Keymap) -> String {
-        km.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)
+        keymap_text(km)
     }
 
     fn compile(text: &str) -> Keymap {
@@ -860,22 +1017,6 @@ mod tests {
                     .collect(),
             })
             .collect()
-    }
-
-    #[test]
-    fn keycode_name_matches_xkbcommon() {
-        for (layout, options) in FIXTURES {
-            let km = golden_keymap(layout, options);
-            let text = dump(&km);
-            for kc in 8..=255u8 {
-                assert_eq!(
-                    keycode_name(&text, kc).expect("keycodes section"),
-                    km.key_get_name(Keycode::new(u32::from(kc)))
-                        .map(str::to_owned),
-                    "{layout}: name of keycode {kc}"
-                );
-            }
-        }
     }
 
     #[test]
@@ -1108,22 +1249,6 @@ mod tests {
         assert_eq!(keymap_modmap(&after2), modmap2);
     }
 
-    #[test]
-    fn key_repeat_is_explicit_reads_the_repeat_field() {
-        let km = golden_keymap("us", None);
-        let text = dump(&km);
-        let caps = "\tkey <CAPS> {\t[ 0xffe5 ] };\n";
-        assert!(text.contains(caps), "fixture shape");
-        let crafted = dump(&compile(&text.replace(
-            caps,
-            "\tkey <CAPS> {\n\t\trepeat= No,\n\t\tsymbols[1]= [ 0xffe5 ]\n\t};\n",
-        )));
-        assert_eq!(key_repeat_is_explicit(&crafted, "CAPS"), Ok(true));
-        assert_eq!(key_repeat_is_explicit(&text, "CAPS"), Ok(false));
-        assert_eq!(key_repeat_is_explicit(&text, "I248"), Ok(false), "no entry");
-        assert!(key_repeat_is_explicit(&text, "NOPE").is_err());
-    }
-
     /// Each probe key compiles with its type: the level count xkbcommon gives
     /// the probe is the one the `xkb_types` section declares for that name.
     #[test]
@@ -1149,26 +1274,5 @@ mod tests {
             }
             assert_untouched(&km, &after, &kcs);
         }
-    }
-
-    #[test]
-    fn void_empty_level1_fills_only_an_empty_level_1() {
-        let km = golden_keymap("gb", None);
-        let hole = set_key(
-            &dump(&km),
-            "AD03",
-            &[KeyGroupSpec {
-                type_name: Some("TWO_LEVEL".into()),
-                keysyms: vec![0, 0x45],
-            }],
-        )
-        .expect("set");
-        let before = compile(&hole);
-        let out = void_empty_level1(&hole, &["AD03".into(), "AD04".into()]).expect("void");
-        let after = compile(&out);
-        let e = Keycode::new(26);
-        assert_eq!(after.key_get_syms_by_level(e, 0, 0)[0].raw(), 0x00ff_ffff);
-        assert_eq!(after.key_get_syms_by_level(e, 0, 1)[0].raw(), 0x45);
-        assert_untouched(&before, &after, &[26]);
     }
 }

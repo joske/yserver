@@ -3744,6 +3744,65 @@ pub fn write_xkb_controls_notify(
     writer.write_all(&buf)
 }
 
+/// Which of the two `xkbIndicatorNotify` events an
+/// [`write_xkb_indicator_notify`] writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum XkbIndicatorNotifyKind {
+    /// `XkbIndicatorStateNotify` (xkbType 4): indicators turned on/off.
+    State,
+    /// `XkbIndicatorMapNotify` (xkbType 5): indicator maps changed.
+    Map,
+}
+
+/// Fields of an [`write_xkb_indicator_notify`] event (XKBproto.h
+/// `xkbIndicatorNotify`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct XkbIndicatorNotify {
+    pub kind: XkbIndicatorNotifyKind,
+    pub device_id: u8,
+    /// The indicators lit.
+    pub state: u32,
+    /// The indicators the event is about.
+    pub changed: u32,
+}
+
+/// `XkbIndicatorStateNotify` / `XkbIndicatorMapNotify`. Layout per
+/// XKBproto.h `xkbIndicatorNotify`: deviceID @8, state @12, changed @16.
+/// Time is 0, like our other XKB events.
+pub fn write_xkb_indicator_notify(
+    writer: &mut impl Write,
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    xkb_event_base: u8,
+    n: XkbIndicatorNotify,
+) -> io::Result<()> {
+    let XkbIndicatorNotify {
+        kind,
+        device_id,
+        state,
+        changed,
+    } = n;
+    let mut buf = [0u8; 32];
+    buf[0] = xkb_event_base;
+    buf[1] = match kind {
+        XkbIndicatorNotifyKind::State => 4,
+        XkbIndicatorNotifyKind::Map => 5,
+    };
+    let mut seq_buf = Vec::with_capacity(2);
+    write_u16(byte_order, &mut seq_buf, sequence.0);
+    buf[2..4].copy_from_slice(&seq_buf);
+    // buf[4..8] time = 0
+    buf[8] = device_id;
+    // buf[9..12] pad1
+    for (at, v) in [(12, state), (16, changed)] {
+        let mut b = Vec::with_capacity(4);
+        write_u32(byte_order, &mut b, v);
+        buf[at..at + 4].copy_from_slice(&b);
+    }
+    // buf[20..32] pad2..pad5
+    writer.write_all(&buf)
+}
+
 /// Modifier + group state carried by an [`write_xkb_state_notify`] event.
 /// Mirrors the live fields of XKBproto.h `xkbStateNotify`.
 #[derive(Clone, Copy, Default)]
@@ -4336,6 +4395,33 @@ mod tests {
         )
         .unwrap();
         let xorg = "550309005b8574060301000000000040a1130000000000000000640000000000";
+        let xorg: Vec<u8> = (0..32)
+            .map(|i| u8::from_str_radix(&xorg[2 * i..2 * i + 2], 16).unwrap())
+            .collect();
+        assert_eq!(buf[..4], xorg[..4]);
+        assert_eq!(buf[8..], xorg[8..]);
+    }
+
+    /// Golden (Xvfb 21.1.24, `xorg-xkb-set-modifier-mapping.txt`
+    /// vmod-remap-numlock): the IndicatorMapNotify of the Num Lock map, byte
+    /// for byte except seq/time.
+    #[test]
+    fn xkb_indicator_map_notify_wire_layout() {
+        let mut buf = Vec::new();
+        write_xkb_indicator_notify(
+            &mut buf,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(9),
+            0x55,
+            XkbIndicatorNotify {
+                kind: XkbIndicatorNotifyKind::Map,
+                device_id: 3,
+                state: 0,
+                changed: 0x0000_0002,
+            },
+        )
+        .unwrap();
+        let xorg = "550509002397a006030000000000000002000000000000000000000000000000";
         let xorg: Vec<u8> = (0..32)
             .map(|i| u8::from_str_radix(&xorg[2 * i..2 * i + 2], 16).unwrap())
             .collect();

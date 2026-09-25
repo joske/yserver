@@ -471,23 +471,30 @@ pub struct XkbNewKeyboardInfo {
     pub changed: u16,
 }
 
-/// What an XKB backend's `ChangeKeyboardMapping` did to its keymap, for the
-/// notifications the core loop sends (Xorg `XkbApplyMappingChange` →
-/// `XkbSendNotification`).
+/// What an XKB backend's `ChangeKeyboardMapping` or `SetModifierMapping` did
+/// to its keymap, for the notifications the core loop sends (Xorg
+/// `XkbApplyMappingChange` → `XkbSendNotification`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyboardMappingChange {
-    /// XKB keycode range after the change (the `XkbMapNotify` min/max).
-    pub min_keycode: u8,
-    pub max_keycode: u8,
+    /// The `XkbMapNotify` Xorg sends for it: KeySyms over the requested keys
+    /// or ModifierMap over the keycode range, plus the key actions and
+    /// vmodmap it re-derived and, when a virtual modifier's real mapping
+    /// changed, the virtual modifiers and the key types naming them.
+    pub map_notify: yserver_protocol::x11::XkbMapNotify,
     /// Groups in the keymap afterwards (`XkbControlsNotify.numGroups`).
     pub num_groups: u8,
     /// The XKB controls the backend reports enabled in GetControls
     /// (`XkbControlsNotify.enabledControls`).
     pub enabled_controls: u32,
-    /// Per changed key whose auto-repeat the keymap derives (no explicit
+    /// Per re-derived key whose auto-repeat the keymap derives (no explicit
     /// `repeat=`): whether it repeats now. Xorg's `XkbUpdateActions`
     /// recomputes these bits of `per_key_repeat` from the interprets.
     pub repeats: Vec<(u8, bool)>,
+    /// Indicators whose map a virtual modifier mapping change altered
+    /// (`XkbIndicatorMapNotify.changed`; 0 = none).
+    pub indicator_map_changed: u32,
+    /// The indicators lit (`XkbIndicatorMapNotify.state`).
+    pub indicator_state: u32,
 }
 
 /// Outcome of an XkbGetKbdByName keymap load by component names.
@@ -2736,6 +2743,16 @@ pub trait Backend {
         _keysyms_per_keycode: u8,
         _keysyms: &[u32],
     ) -> Option<KeyboardMappingChange> {
+        None
+    }
+
+    /// Apply `SetModifierMapping` (or XI `SetDeviceModifierMapping`) to the
+    /// backend's XKB keymap: `modmap[kc]` is the real modifier of each
+    /// keycode (Xorg `build_modmap_from_modkeymap`; one bit at most, already
+    /// validated, MappingBusy already refused by the core loop). `None` = no
+    /// XKB keymap here; the core loop stores the map itself
+    /// (`ServerState::modifier_mapping_override`).
+    fn set_modifier_mapping(&mut self, _modmap: &[u8; 256]) -> Option<KeyboardMappingChange> {
         None
     }
 
