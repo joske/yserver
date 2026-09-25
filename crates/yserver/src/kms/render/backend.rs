@@ -27330,32 +27330,9 @@ impl Backend for KmsBackend {
         first_keycode: u8,
         count: u8,
     ) -> io::Result<(u8, Vec<u32>)> {
-        // Stage 3f.7 follow-up: port v1's body verbatim. KmsCore
-        // carries `xkb_keymap` so the lookup works on both backends.
-        // The pre-fix stub returned 0 keysyms per code, which made
-        // xterm think every key was dead — typing into xterm worked
-        // for cursor movement but Enter/letters were swallowed.
-        //
-        // X11 GetKeyboardMapping: per keycode, return a flat row of
-        // keysyms across shift levels (unshifted / shifted /
-        // mode-switch-unshifted / mode-switch-shifted). Apps combine
-        // the keycode with the modifier bits in the event's `state`
-        // field to pick the right slot.
-        const LEVELS: usize = 4;
-        let max_kc = u16::from(first_keycode) + u16::from(count);
-        let mut flat = Vec::with_capacity(usize::from(count) * LEVELS);
-        for kc in u16::from(first_keycode)..max_kc {
-            let xkb_kc = xkbcommon::xkb::Keycode::new(u32::from(kc));
-            for level in 0..LEVELS as u32 {
-                let syms = self
-                    .core
-                    .xkb_keymap
-                    .0
-                    .key_get_syms_by_level(xkb_kc, 0, level);
-                flat.push(syms.first().map_or(0, |s| s.raw()));
-            }
-        }
-        Ok((LEVELS as u8, flat))
+        // Xorg's XkbGetCoreMap layout (one width for the whole map, §12.4 group order).
+        let map = crate::kms::xkb::core_keyboard_map(&self.core.xkb_keymap.0);
+        Ok((map.width, map.rows(first_keycode, count)))
     }
 
     fn get_modifier_mapping(

@@ -10,6 +10,158 @@ pub(super) fn clamped_keycode_bounds(keymap: &Keymap) -> (u8, u8) {
     (min, max)
 }
 
+/// Core (`GetKeyboardMapping`) view of an XKB keymap, laid out exactly as
+/// Xorg's `XkbGetCoreMap` (xkb/xkbUtils.c) does per XKB protocol §12.4.
+pub(super) struct CoreKeyMap {
+    pub min_keycode: u8,
+    /// `keysyms_per_keycode`: one width for the whole map, as in Xorg.
+    pub width: u8,
+    /// `(max - min + 1) * width` keysyms, row per keycode from `min_keycode`.
+    pub syms: Vec<u32>,
+}
+
+impl CoreKeyMap {
+    /// Keysym rows for `[first, first + count)`; keycodes outside the map are NoSymbol.
+    pub fn rows(&self, first: u8, count: u8) -> Vec<u32> {
+        let w = usize::from(self.width);
+        let mut out = vec![0u32; usize::from(count) * w];
+        for i in 0..usize::from(count) {
+            let kc = usize::from(first) + i;
+            let Some(row) = kc.checked_sub(usize::from(self.min_keycode)) else {
+                continue;
+            };
+            if let Some(src) = self.syms.get(row * w..(row + 1) * w) {
+                out[i * w..(i + 1) * w].copy_from_slice(src);
+            }
+        }
+        out
+    }
+}
+
+/// Bounds-checked store into one core row (Xorg writes unchecked into a row it sized).
+fn put(core: &mut [u32], i: usize, v: u32) {
+    if let Some(slot) = core.get_mut(i) {
+        *slot = v;
+    }
+}
+
+/// Port of Xorg's `XkbGetCoreMap` over an xkbcommon keymap.
+pub(super) fn core_keyboard_map(keymap: &Keymap) -> CoreKeyMap {
+    // The connection setup's keycode range (Xorg: 8..=255), not xkbcommon's.
+    let (min_kc, max_kc) = (8u8, 255u8);
+    // Per key: one Vec per group (≤ 4), each group's own level count wide.
+    let groups: Vec<Vec<Vec<u32>>> = (min_kc..=max_kc)
+        .map(|kc_raw| {
+            let kc = Keycode::new(u32::from(kc_raw));
+            let n = keymap
+                .num_layouts_for_key(kc)
+                .min(u32::from(XKB_NUM_KBD_GROUPS));
+            (0..n)
+                .map(|g| {
+                    (0..keymap.num_levels_for_key(kc, g))
+                        .map(|l| {
+                            keymap
+                                .key_get_syms_by_level(kc, g, l)
+                                .first()
+                                .map_or(0, |s| s.raw())
+                        })
+                        .collect()
+                })
+                .collect()
+        })
+        .collect();
+
+    // Size pass (XkbGetCoreMap "determine sizes").
+    let (mut max_syms, mut max_g1_width, mut max_groups) = (0usize, 0usize, 0usize);
+    for key in &groups {
+        let mut tmp = 0usize;
+        if let Some(g1) = key.first() {
+            let w = g1.len();
+            tmp += if w <= 2 { 2 } else { w + 2 };
+            max_g1_width = max_g1_width.max(w);
+        }
+        if let Some(g2) = key.get(1) {
+            let w = g2.len();
+            if tmp <= 2 {
+                tmp += if w < 2 { 2 } else { w };
+            } else if w > 2 {
+                tmp += w - 2;
+            }
+        }
+        tmp += key.iter().skip(2).map(Vec::len).sum::<usize>();
+        max_syms = max_syms.max(tmp);
+        max_groups = max_groups.max(key.len());
+    }
+    // §12.4: room to replicate the widest group 1 across every group.
+    max_syms = max_syms
+        .max(max_groups * max_g1_width)
+        .min(usize::from(u8::MAX));
+    let width = max_syms;
+
+    let mut syms = vec![0u32; groups.len() * width];
+    for (key, core) in groups.iter().zip(syms.chunks_mut(width.max(1))) {
+        let mut n_out = 2usize;
+        if let Some(g1) = key.first() {
+            for (n, &s) in g1.iter().enumerate() {
+                put(core, if n < 2 { n } else { 2 + n }, s);
+            }
+            if g1.len() > 2 {
+                n_out = g1.len();
+            }
+        }
+        if key.len() == 1 {
+            // One-group key: ABCDE on a multi-group map becomes ABABCDECDE[ABCDE…].
+            let g1 = &key[0];
+            let gw = g1.len();
+            let (a, b) = (
+                core.first().copied().unwrap_or(0),
+                core.get(1).copied().unwrap_or(0),
+            );
+            if gw > 0 && width >= 3 {
+                put(core, 2, a);
+            }
+            if gw > 1 && width >= 4 {
+                put(core, 3, b);
+            }
+            let mut idx = 2 + gw;
+            while gw > 2 && idx < width && idx < gw * 2 {
+                core[idx] = core[idx - gw + 2];
+                idx += 1;
+            }
+            idx = (2 * gw).max(4);
+            for _ in 3..=max_groups {
+                for &s in g1 {
+                    if idx >= max_syms {
+                        break;
+                    }
+                    put(core, idx, s);
+                    idx += 1;
+                }
+            }
+        }
+        n_out += 2;
+        if let Some(g2) = key.get(1) {
+            for (n, &s) in g2.iter().enumerate() {
+                put(core, if n < 2 { 2 + n } else { n_out + n - 2 }, s);
+            }
+            if g2.len() > 2 {
+                n_out += g2.len() - 2;
+            }
+        }
+        for g in key.iter().skip(2) {
+            for &s in g {
+                put(core, n_out, s);
+                n_out += 1;
+            }
+        }
+    }
+    CoreKeyMap {
+        min_keycode: min_kc,
+        width: u8::try_from(width).unwrap_or(u8::MAX),
+        syms,
+    }
+}
+
 /// Per-key data extracted from `xkbcommon::Keymap`, ready to lay
 /// out into the `KeySymMap` wire structure xkb.xml defines.
 struct KeyData {
@@ -3791,5 +3943,104 @@ mod tests {
         assert_eq!(r[28], 1, "supported = 1");
         // ndx/flags/mods etc. all zero.
         assert!(r[13..28].iter().all(|&b| b == 0), "map fields zero");
+    }
+
+    /// Keymap for an RMLVO the Xvfb golden vectors were dumped with.
+    fn keymap_for(layout: &str, options: Option<&str>) -> xkbcommon::xkb::Keymap {
+        let ctx = xkbcommon::xkb::Context::new(xkbcommon::xkb::CONTEXT_NO_FLAGS);
+        xkbcommon::xkb::Keymap::new_from_names(
+            &ctx,
+            "evdev",
+            "pc105",
+            layout,
+            "",
+            options.map(str::to_owned),
+            xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .expect("keymap")
+    }
+
+    /// Parse a `testdata/xorg-core-map-*.txt` dump into `(min, width, rows)`.
+    fn parse_core_golden(text: &str) -> (u8, u8, std::collections::BTreeMap<u8, Vec<u32>>) {
+        let mut min = 0;
+        let mut width = 0;
+        let mut rows = std::collections::BTreeMap::new();
+        for line in text.lines() {
+            if let Some(hdr) = line.strip_prefix("# min=") {
+                let f: Vec<&str> = hdr.split([' ', '=']).collect();
+                min = f[0].parse().unwrap();
+                width = f[4].parse().unwrap();
+            } else if !line.starts_with('#') && !line.is_empty() {
+                let mut it = line.split(' ');
+                let kc: u8 = it.next().unwrap().parse().unwrap();
+                let syms = it.map(|h| u32::from_str_radix(h, 16).unwrap()).collect();
+                rows.insert(kc, syms);
+            }
+        }
+        (min, width, rows)
+    }
+
+    /// Diff our core map against an Xorg dump, key by key; returns the mismatches.
+    fn core_map_diffs(km: &xkbcommon::xkb::Keymap, golden: &str) -> Vec<String> {
+        let (min, width, rows) = parse_core_golden(golden);
+        let ours = core_keyboard_map(km);
+        let mut diffs = Vec::new();
+        if (ours.min_keycode, ours.width) != (min, width) {
+            diffs.push(format!(
+                "min/keysyms_per_keycode: ours {}/{} xorg {min}/{width}",
+                ours.min_keycode, ours.width
+            ));
+            return diffs;
+        }
+        let got = ours.rows(min, 255 - min + 1);
+        for (i, row) in got.chunks(usize::from(width)).enumerate() {
+            let kc = u8::try_from(usize::from(min) + i).unwrap();
+            let want = rows
+                .get(&kc)
+                .cloned()
+                .unwrap_or_else(|| vec![0; usize::from(width)]);
+            if row != want.as_slice() {
+                diffs.push(format!("keycode {kc}: ours {row:x?} xorg {want:x?}"));
+            }
+        }
+        diffs
+    }
+
+    /// Golden: Xvfb (xorg-server 21.1.24) core map for evdev/pc105/`us`.
+    #[test]
+    fn core_map_matches_xorg_us() {
+        let d = core_map_diffs(
+            &keymap_for("us", None),
+            include_str!("testdata/xorg-core-map-us.txt"),
+        );
+        assert!(d.is_empty(), "{}", d.join("\n"));
+    }
+
+    /// Golden: Xvfb core map for `gb` (GH #168 reporter's layout).
+    #[test]
+    fn core_map_matches_xorg_gb() {
+        let d = core_map_diffs(
+            &keymap_for("gb", None),
+            include_str!("testdata/xorg-core-map-gb.txt"),
+        );
+        assert!(d.is_empty(), "{}", d.join("\n"));
+    }
+
+    /// Golden: Xvfb core map for `de` (level-3 AltGr keys, CDECDE replication).
+    #[test]
+    fn core_map_matches_xorg_de() {
+        let d = core_map_diffs(
+            &keymap_for("de", None),
+            include_str!("testdata/xorg-core-map-de.txt"),
+        );
+        assert!(d.is_empty(), "{}", d.join("\n"));
+    }
+
+    /// Golden: Xvfb core map for two groups `us,ru` + `grp:alt_shift_toggle`.
+    #[test]
+    fn core_map_matches_xorg_us_ru() {
+        let km = keymap_for("us,ru", Some("grp:alt_shift_toggle"));
+        let d = core_map_diffs(&km, include_str!("testdata/xorg-core-map-usru.txt"));
+        assert!(d.is_empty(), "{}", d.join("\n"));
     }
 }
