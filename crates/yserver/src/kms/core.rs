@@ -2152,6 +2152,17 @@ impl KmsCore {
             rmlvo.options.clone(),
             xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
         )?;
+        Some(self.install_keymap(keymap, rmlvo))
+    }
+
+    /// Make `keymap` (compiled from `rmlvo`) the active one; returns its
+    /// clamped keycode bounds. The tail of [`Self::recompile_keymap`], split
+    /// out so tests can install a keymap frozen from a known xkeyboard-config.
+    pub(crate) fn install_keymap(
+        &mut self,
+        keymap: xkbcommon::xkb::Keymap,
+        rmlvo: &XkbRmlvo,
+    ) -> (u8, u8) {
         let (min_kc, max_kc) = crate::kms::xkb::clamped_keycode_bounds(&keymap);
         let mut new_state = xkbcommon::xkb::State::new(&keymap);
         for kc in &self.down_keys {
@@ -2172,7 +2183,7 @@ impl KmsCore {
             rmlvo.variant,
             rmlvo.options
         );
-        Some((min_kc, max_kc))
+        (min_kc, max_kc)
     }
 }
 

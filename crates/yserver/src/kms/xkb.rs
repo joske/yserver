@@ -2704,6 +2704,31 @@ pub(super) fn key_types_from_keymap(keymap: &Keymap) -> KeyTypeTable {
     KeyTypeTable { types, index_for }
 }
 
+/// The evdev/pc105 keymap the `testdata/xorg-*` goldens were captured
+/// against, frozen as text (`xkbcli compile-keymap --format 1` over
+/// xkeyboard-config 2.48, the version in the goldens' headers). Compiling
+/// from RMLVO instead reads the host's xkeyboard-config, so a distro with
+/// another version compiles a different keymap and every golden diff fails
+/// on the input, not on our conversion (Ubuntu CI).
+#[cfg(test)]
+pub(crate) fn golden_keymap(layout: &str, options: Option<&str>) -> xkbcommon::xkb::Keymap {
+    let text = match (layout, options) {
+        ("us", None) => include_str!("testdata/xkb-keymap-us.xkb"),
+        ("gb", None) => include_str!("testdata/xkb-keymap-gb.xkb"),
+        ("de", None) => include_str!("testdata/xkb-keymap-de.xkb"),
+        ("us,ru", Some("grp:alt_shift_toggle")) => include_str!("testdata/xkb-keymap-usru.xkb"),
+        other => panic!("no frozen golden keymap for {other:?}"),
+    };
+    let ctx = xkbcommon::xkb::Context::new(xkbcommon::xkb::CONTEXT_NO_FLAGS);
+    xkbcommon::xkb::Keymap::new_from_string(
+        &ctx,
+        text.to_owned(),
+        xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1,
+        xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
+    )
+    .expect("frozen golden keymap parses")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4357,17 +4382,7 @@ mod tests {
 
     /// Keymap for an RMLVO the Xvfb golden vectors were dumped with.
     fn keymap_for(layout: &str, options: Option<&str>) -> xkbcommon::xkb::Keymap {
-        let ctx = xkbcommon::xkb::Context::new(xkbcommon::xkb::CONTEXT_NO_FLAGS);
-        xkbcommon::xkb::Keymap::new_from_names(
-            &ctx,
-            "evdev",
-            "pc105",
-            layout,
-            "",
-            options.map(str::to_owned),
-            xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
-        )
-        .expect("keymap")
+        super::golden_keymap(layout, options)
     }
 
     /// Parse a `testdata/xorg-core-map-*.txt` dump into `(min, width, rows)`.

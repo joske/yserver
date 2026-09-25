@@ -47001,13 +47001,16 @@ mod tests {
 
     fn kbd_map_backend(layout: &str, options: Option<&str>) -> KmsBackend {
         let mut backend = KmsBackend::for_tests();
-        backend.core.recompile_keymap(&crate::kms::core::XkbRmlvo {
-            rules: "evdev".into(),
-            model: "pc105".into(),
-            layout: layout.into(),
-            variant: String::new(),
-            options: options.map(str::to_owned),
-        });
+        backend.core.install_keymap(
+            crate::kms::xkb::golden_keymap(layout, options),
+            &crate::kms::core::XkbRmlvo {
+                rules: "evdev".into(),
+                model: "pc105".into(),
+                layout: layout.into(),
+                variant: String::new(),
+                options: options.map(str::to_owned),
+            },
+        );
         backend
     }
 
