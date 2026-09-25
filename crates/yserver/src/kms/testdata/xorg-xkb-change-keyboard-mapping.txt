@@ -1,0 +1,397 @@
+# Xorg XKB view of ChangeKeyboardMapping (issue #171): Xvfb -noreset, fresh server per case
+# server: X.Org version 21.1.24 (xdpyinfo); `Xvfb -version` -> "Unrecognized option: -version" (not supported by this build)
+# pacman -Q: xkeyboard-config 2.48-1 xorg-server-xvfb 21.1.24-1
+# each case: setxkbmap -rules evdev -model pc105 -layout L [-option O]; then tools/xkb-mutation-probe.c
+# case set = every case of xorg-change-keyboard-mapping.txt (same names, layouts, options, requests,
+# '## +' follow-ups sent in order); its '!' edge requests on layout=gb follow, with the keysyms used
+# probe output lines (see the probe header for the full grammar):
+#   > ckm:FIRST:KPK:COUNT:SYMS   raw ChangeKeyboardMapping sent by the actor (syms hex; nsyms = syms listed)
+#   = ok | = error=CODE value=V request result
+#   e xkb NAME k=v... raw=HEX    XKB event on the XKB listener (XkbSelectEvents all, core kbd), arrival order;
+#                                MapNotify fields: types/syms/acts/beh/expl/modmap/vmodmap = first+count
+#                                raw = the 32 wire bytes; seq (bytes 2-3) and time (4-7) differ run to run
+#   e xkbl ...                   core event on the XKB listener, interleaved in arrival order
+#   e core ...                   core event on a separate non-XKB connection
+#   - KC <key> / + KC <key>      XkbGetMap(full=all, keys 8..255) before/after the request, differing keys only;
+#       <key> = kt=<type index per group 1..4> gi=<groupInfo> w=<width> syms=<width*groups hex>
+#               acts=<8 raw bytes per action, '-' none> beh=<type:data> expl=<explicit> mm=<modmap> vmm=<vmodmap>
+#   -type/+type N, -vmods/+vmods, ntypes, repeat KC A->B, enabledControls   other XkbGetMap/GetControls changes
+#   coremodmap kpm=K 0:... 7:...  core GetModifierMapping after the request
+#   > total                      XkbGetMap delta from before the first request to after the last
+## one-case-sym layout=gb options=- first=10 kpk=1 count=1 syms=78
+> ckm:10:1:1:78
+= ok
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=10+1 acts=10+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=550109009e7d74060300120008ff00000a010a01000000000000000000000000
+e xkbl MappingNotify request=1 first=10 count=1 raw=22000900010a0100000000000000000000000000000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=10+1 acts=10+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=550109009e7d74060500120008ff00000a010a01000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=10+1 acts=10+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=550109009e7d74060700120008ff00000a010a01000000000000000000000000
+e core MappingNotify request=1 first=10 count=1 raw=22000200010a0100000000000000000000000000000000000000000000000000
+- 10 kt=11,0,0,0 gi=0x01 w=4 syms=31,21,b9,a1 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 10 kt=11,0,0,0 gi=0x01 w=4 syms=78,58,0,0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## one-plain-sym layout=gb options=- first=11 kpk=1 count=1 syms=31
+> ckm:11:1:1:31
+= ok
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=11+1 acts=11+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900f87d74060300120008ff00000b010b01000000000000000000000000
+e xkbl MappingNotify request=1 first=11 count=1 raw=22000900010b0100000000000000000000000000000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=11+1 acts=11+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900f87d74060500120008ff00000b010b01000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=11+1 acts=11+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900f87d74060700120008ff00000b010b01000000000000000000000000
+e core MappingNotify request=1 first=11 count=1 raw=22000200010b0100000000000000000000000000000000000000000000000000
+- 11 kt=11,0,0,0 gi=0x01 w=4 syms=32,22,b2,ac3 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 11 kt=11,0,0,0 gi=0x01 w=4 syms=31,0,0,0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## two-sterling layout=gb options=- first=12 kpk=2 count=1 syms=33,a3
+> ckm:12:2:1:33,a3
+= ok
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=12+1 acts=12+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900557e74060300120008ff00000c010c01000000000000000000000000
+e xkbl MappingNotify request=1 first=12 count=1 raw=22000900010c0100000000000000000000000000000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=12+1 acts=12+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900557e74060500120008ff00000c010c01000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=12+1 acts=12+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900557e74060700120008ff00000c010c01000000000000000000000000
+e core MappingNotify request=1 first=12 count=1 raw=22000200010c0100000000000000000000000000000000000000000000000000
+- 12 kt=11,0,0,0 gi=0x01 w=4 syms=33,a3,b3,a3 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 12 kt=11,0,0,0 gi=0x01 w=4 syms=33,a3,0,0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## two-case-pair layout=gb options=- first=38 kpk=2 count=1 syms=61,41
+> ckm:38:2:1:61,41
+= ok
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=38+1 acts=38+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900b27e74060300120008ff000026012601000000000000000000000000
+e xkbl MappingNotify request=1 first=38 count=1 raw=2200090001260100000000000000000000000000000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=38+1 acts=38+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900b27e74060500120008ff000026012601000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=38+1 acts=38+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900b27e74060700120008ff000026012601000000000000000000000000
+e core MappingNotify request=1 first=38 count=1 raw=2200020001260100000000000000000000000000000000000000000000000000
+- 38 kt=12,0,0,0 gi=0x01 w=4 syms=61,41,e6,c6 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 38 kt=12,0,0,0 gi=0x01 w=4 syms=61,41,0,0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## two-noncase-pair layout=gb options=- first=13 kpk=2 count=1 syms=34,24
+> ckm:13:2:1:34,24
+= ok
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=13+1 acts=13+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900127f74060300120008ff00000d010d01000000000000000000000000
+e xkbl MappingNotify request=1 first=13 count=1 raw=22000900010d0100000000000000000000000000000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=13+1 acts=13+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900127f74060500120008ff00000d010d01000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=13+1 acts=13+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900127f74060700120008ff00000d010d01000000000000000000000000
+e core MappingNotify request=1 first=13 count=1 raw=22000200010d0100000000000000000000000000000000000000000000000000
+- 13 kt=11,0,0,0 gi=0x01 w=4 syms=34,24,20ac,bc acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 13 kt=11,0,0,0 gi=0x01 w=4 syms=34,24,0,0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## two-lower-nosym layout=gb options=- first=39 kpk=2 count=1 syms=73,0
+> ckm:39:2:1:73,0
+= ok
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=39+1 acts=39+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=550109006d7f74060300120008ff000027012701000000000000000000000000
+e xkbl MappingNotify request=1 first=39 count=1 raw=2200090001270100000000000000000000000000000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=39+1 acts=39+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=550109006d7f74060500120008ff000027012701000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=39+1 acts=39+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=550109006d7f74060700120008ff000027012701000000000000000000000000
+e core MappingNotify request=1 first=39 count=1 raw=2200020001270100000000000000000000000000000000000000000000000000
+- 39 kt=12,0,0,0 gi=0x01 w=4 syms=73,53,df,1001e9e acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 39 kt=12,0,0,0 gi=0x01 w=4 syms=73,53,0,0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## three-syms layout=gb options=- first=14 kpk=3 count=1 syms=35,25,bd
+> ckm:14:3:1:35,25,bd
+= ok
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=14+1 acts=14+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900c77f74060300120008ff00000e010e01000000000000000000000000
+e xkbl MappingNotify request=1 first=14 count=1 raw=22000900010e0100000000000000000000000000000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=14+1 acts=14+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900c77f74060500120008ff00000e010e01000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=14+1 acts=14+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900c77f74060700120008ff00000e010e01000000000000000000000000
+e core MappingNotify request=1 first=14 count=1 raw=22000200010e0100000000000000000000000000000000000000000000000000
+- 14 kt=11,0,0,0 gi=0x01 w=4 syms=35,25,bd,ac4 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 14 kt=11,0,0,0 gi=0x02 w=4 syms=35,25,0,0,bd,0,0,0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## four-syms layout=gb options=- first=24 kpk=4 count=1 syms=71,51,40,7d9
+> ckm:24:4:1:71,51,40,7d9
+= ok
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=24+1 acts=24+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900288074060300120008ff000018011801000000000000000000000000
+e xkbl MappingNotify request=1 first=24 count=1 raw=2200090001180100000000000000000000000000000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=24+1 acts=24+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900288074060500120008ff000018011801000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=24+1 acts=24+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900288074060700120008ff000018011801000000000000000000000000
+e core MappingNotify request=1 first=24 count=1 raw=2200020001180100000000000000000000000000000000000000000000000000
+- 24 kt=13,0,0,0 gi=0x01 w=4 syms=71,51,40,7d9 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 24 kt=13,1,0,0 gi=0x02 w=4 syms=71,51,0,0,40,7d9,0,0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## six-altgr layout=gb options=- first=24 kpk=6 count=1 syms=71,51,71,51,40,7d9
+> ckm:24:6:1:71,51,71,51,40,7d9
+= ok
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=24+1 acts=24+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900838074060300120008ff000018011801000000000000000000000000
+e xkbl MappingNotify request=1 first=24 count=1 raw=2200090001180100000000000000000000000000000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=24+1 acts=24+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900838074060500120008ff000018011801000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=24+1 acts=24+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900838074060700120008ff000018011801000000000000000000000000
+e core MappingNotify request=1 first=24 count=1 raw=2200020001180100000000000000000000000000000000000000000000000000
+- 24 kt=13,0,0,0 gi=0x01 w=4 syms=71,51,40,7d9 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 24 kt=13,2,0,0 gi=0x02 w=4 syms=71,51,40,7d9,71,51,0,0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## six-two-groups layout=gb options=- first=25 kpk=6 count=1 syms=77,57,6c3,6e3,1b3,1a3
+> ckm:25:6:1:77,57,6c3,6e3,1b3,1a3
+= ok
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=25+1 acts=25+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900e78074060300120008ff000019011901000000000000000000000000
+e xkbl MappingNotify request=1 first=25 count=1 raw=2200090001190100000000000000000000000000000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=25+1 acts=25+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900e78074060500120008ff000019011901000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=25+1 acts=25+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900e78074060700120008ff000019011901000000000000000000000000
+e core MappingNotify request=1 first=25 count=1 raw=2200020001190100000000000000000000000000000000000000000000000000
+- 25 kt=13,0,0,0 gi=0x01 w=4 syms=77,57,100017f,a7 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 25 kt=13,2,0,0 gi=0x02 w=4 syms=77,57,1b3,1a3,6c3,6e3,0,0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## eight-syms layout=gb options=- first=25 kpk=8 count=1 syms=77,57,6c3,6e3,1b3,1a3,65,45
+> ckm:25:8:1:77,57,6c3,6e3,1b3,1a3,65,45
+= ok
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=25+1 acts=25+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=550109003f8174060300120008ff000019011901000000000000000000000000
+e xkbl MappingNotify request=1 first=25 count=1 raw=2200090001190100000000000000000000000000000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=25+1 acts=25+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=550109003f8174060500120008ff000019011901000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=25+1 acts=25+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=550109003f8174060700120008ff000019011901000000000000000000000000
+e core MappingNotify request=1 first=25 count=1 raw=2200020001190100000000000000000000000000000000000000000000000000
+- 25 kt=13,0,0,0 gi=0x01 w=4 syms=77,57,100017f,a7 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 25 kt=13,2,2,0 gi=0x03 w=4 syms=77,57,1b3,1a3,6c3,6e3,0,0,65,45,0,0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## hole-first layout=gb options=- first=26 kpk=2 count=1 syms=0,45
+> ckm:26:2:1:0,45
+= ok
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=26+1 acts=26+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=550109009c8174060300120008ff00001a011a01000000000000000000000000
+e xkbl MappingNotify request=1 first=26 count=1 raw=22000900011a0100000000000000000000000000000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=26+1 acts=26+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=550109009c8174060500120008ff00001a011a01000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=26+1 acts=26+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=550109009c8174060700120008ff00001a011a01000000000000000000000000
+e core MappingNotify request=1 first=26 count=1 raw=22000200011a0100000000000000000000000000000000000000000000000000
+- 26 kt=12,0,0,0 gi=0x01 w=4 syms=65,45,65,45 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 26 kt=12,0,0,0 gi=0x01 w=4 syms=0,45,0,0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## hole-mid layout=gb options=- first=27 kpk=4 count=1 syms=72,0,74,54
+> ckm:27:4:1:72,0,74,54
+= ok
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=27+1 acts=27+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900fb8174060300120008ff00001b011b01000000000000000000000000
+e xkbl MappingNotify request=1 first=27 count=1 raw=22000900011b0100000000000000000000000000000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=27+1 acts=27+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900fb8174060500120008ff00001b011b01000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=27+1 acts=27+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900fb8174060700120008ff00001b011b01000000000000000000000000
+e core MappingNotify request=1 first=27 count=1 raw=22000200011b0100000000000000000000000000000000000000000000000000
+- 27 kt=13,0,0,0 gi=0x01 w=4 syms=72,52,b6,ae acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 27 kt=13,2,0,0 gi=0x02 w=4 syms=72,52,0,0,74,54,0,0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## hole-group1 layout=gb options=- first=28 kpk=4 count=1 syms=0,0,79,59
+> ckm:28:4:1:0,0,79,59
+= ok
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=28+1 acts=28+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900568274060300120008ff00001c011c01000000000000000000000000
+e xkbl MappingNotify request=1 first=28 count=1 raw=22000900011c0100000000000000000000000000000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=28+1 acts=28+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900568274060500120008ff00001c011c01000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=28+1 acts=28+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900568274060700120008ff00001c011c01000000000000000000000000
+e core MappingNotify request=1 first=28 count=1 raw=22000200011c0100000000000000000000000000000000000000000000000000
+- 28 kt=12,0,0,0 gi=0x01 w=4 syms=74,54,3bc,3ac acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 28 kt=12,2,0,0 gi=0x02 w=4 syms=0,0,0,0,79,59,0,0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## all-nosym layout=gb options=- first=29 kpk=2 count=1 syms=0,0
+> ckm:29:2:1:0,0
+= ok
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=29+1 acts=29+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900b38274060300120008ff00001d011d01000000000000000000000000
+e xkbl MappingNotify request=1 first=29 count=1 raw=22000900011d0100000000000000000000000000000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=29+1 acts=29+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900b38274060500120008ff00001d011d01000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=29+1 acts=29+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900b38274060700120008ff00001d011d01000000000000000000000000
+e core MappingNotify request=1 first=29 count=1 raw=22000200011d0100000000000000000000000000000000000000000000000000
+- 29 kt=13,0,0,0 gi=0x01 w=4 syms=79,59,8fb,a5 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 29 kt=13,0,0,0 gi=0x01 w=4 syms=0,0,0,0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## keypad-pair layout=gb options=- first=79 kpk=2 count=1 syms=ff95,ffb7
+> ckm:79:2:1:ff95,ffb7
+= ok
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=79+1 acts=79+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=550109000e8374060300120008ff00004f014f01000000000000000000000000
+e xkbl MappingNotify request=1 first=79 count=1 raw=22000900014f0100000000000000000000000000000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=79+1 acts=79+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=550109000e8374060500120008ff00004f014f01000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=79+1 acts=79+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=550109000e8374060700120008ff00004f014f01000000000000000000000000
+e core MappingNotify request=1 first=79 count=1 raw=22000200014f0100000000000000000000000000000000000000000000000000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## keypad-one layout=gb options=- first=90 kpk=1 count=1 syms=ffb0
+> ckm:90:1:1:ffb0
+= ok
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=90+1 acts=90+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900678374060300120008ff00005a015a01000000000000000000000000
+e xkbl MappingNotify request=1 first=90 count=1 raw=22000900015a0100000000000000000000000000000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=90+1 acts=90+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900678374060500120008ff00005a015a01000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=90+1 acts=90+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900678374060700120008ff00005a015a01000000000000000000000000
+e core MappingNotify request=1 first=90 count=1 raw=22000200015a0100000000000000000000000000000000000000000000000000
+- 90 kt=3,0,0,0 gi=0x01 w=2 syms=ff9e,ffb0 acts=0902000000000000,0902000000000000 beh=00:00 expl=0x00 mm=0x00 vmm=0x0000
++ 90 kt=0,0,0,0 gi=0x01 w=1 syms=ffb0 acts=0902000000000000 beh=00:00 expl=0x00 mm=0x00 vmm=0x0000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## keypad-letters layout=gb options=- first=79 kpk=2 count=1 syms=61,41
+> ckm:79:2:1:61,41
+= ok
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=79+1 acts=79+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900c08374060300120008ff00004f014f01000000000000000000000000
+e xkbl MappingNotify request=1 first=79 count=1 raw=22000900014f0100000000000000000000000000000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=79+1 acts=79+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900c08374060500120008ff00004f014f01000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=79+1 acts=79+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900c08374060700120008ff00004f014f01000000000000000000000000
+e core MappingNotify request=1 first=79 count=1 raw=22000200014f0100000000000000000000000000000000000000000000000000
+- 79 kt=3,0,0,0 gi=0x01 w=2 syms=ff95,ffb7 acts=0700ffffffff0000,0700ffffffff0000 beh=00:00 expl=0x00 mm=0x00 vmm=0x0000
++ 79 kt=2,0,0,0 gi=0x01 w=2 syms=61,41 acts=- beh=00:00 expl=0x00 mm=0x00 vmm=0x0000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## multi-key layout=gb options=- first=10 kpk=2 count=3 syms=31,21,32,22,33,a3
+> ckm:10:2:3:31,21,32,22,33,a3
+= ok
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=10+3 acts=10+3 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900198474060300120008ff00000a030a03000000000000000000000000
+e xkbl MappingNotify request=1 first=10 count=3 raw=22000900010a0300000000000000000000000000000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=10+3 acts=10+3 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900198474060500120008ff00000a030a03000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=10+3 acts=10+3 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900198474060700120008ff00000a030a03000000000000000000000000
+e core MappingNotify request=1 first=10 count=3 raw=22000200010a0300000000000000000000000000000000000000000000000000
+- 10 kt=11,0,0,0 gi=0x01 w=4 syms=31,21,b9,a1 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 10 kt=11,0,0,0 gi=0x01 w=4 syms=31,21,0,0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+- 11 kt=11,0,0,0 gi=0x01 w=4 syms=32,22,b2,ac3 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 11 kt=11,0,0,0 gi=0x01 w=4 syms=32,22,0,0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+- 12 kt=11,0,0,0 gi=0x01 w=4 syms=33,a3,b3,a3 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 12 kt=11,0,0,0 gi=0x01 w=4 syms=33,a3,0,0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## multigroup-to-two layout=us,ru options=grp:alt_shift_toggle first=24 kpk=2 count=1 syms=71,51
+> ckm:24:2:1:71,51
+= ok
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=24+1 acts=24+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900758474060300120008ff000018011801000000000000000000000000
+e xkbl MappingNotify request=1 first=24 count=1 raw=2200090001180100000000000000000000000000000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=24+1 acts=24+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900758474060500120008ff000018011801000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=24+1 acts=24+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900758474060700120008ff000018011801000000000000000000000000
+e core MappingNotify request=1 first=24 count=1 raw=2200020001180100000000000000000000000000000000000000000000000000
+- 24 kt=2,2,0,0 gi=0x02 w=2 syms=71,51,6ca,6ea acts=- beh=00:00 expl=0x03 mm=0x00 vmm=0x0000
++ 24 kt=2,2,0,0 gi=0x02 w=2 syms=71,51,71,51 acts=- beh=00:00 expl=0x03 mm=0x00 vmm=0x0000
+coremodmap kpm=4 0:50,62,0,0 1:66,0,0,0 2:37,105,0,0 3:64,108,204,205 4:77,0,0,0 5:203,0,0,0 6:133,134,206,0 7:92,0,0,0
+## multigroup-to-four layout=us,ru options=grp:alt_shift_toggle first=24 kpk=4 count=1 syms=71,51,6ca,6ea
+> ckm:24:4:1:71,51,6ca,6ea
+= ok
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=24+1 acts=24+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900dc8474060300120008ff000018011801000000000000000000000000
+e xkbl MappingNotify request=1 first=24 count=1 raw=2200090001180100000000000000000000000000000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=24+1 acts=24+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900dc8474060500120008ff000018011801000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=24+1 acts=24+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900dc8474060700120008ff000018011801000000000000000000000000
+e core MappingNotify request=1 first=24 count=1 raw=2200020001180100000000000000000000000000000000000000000000000000
+coremodmap kpm=4 0:50,62,0,0 1:66,0,0,0 2:37,105,0,0 3:64,108,204,205 4:77,0,0,0 5:203,0,0,0 6:133,134,206,0 7:92,0,0,0
+## protected-one-level layout=gb options=- first=108 kpk=2 count=1 syms=61,41
+> ckm:108:2:1:61,41
+= ok
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=108+1 acts=108+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=550109005b8574060300120008ff00006c016c01000000000000000000000000
+e xkbl MappingNotify request=1 first=108 count=1 raw=22000900016c0100000000000000000000000000000000000000000000000000
+e xkb ControlsNotify dev=3 numGroups=1 changed=0x40000000 enabled=0x000013a1 enabledChanges=0x00000000 keycode=0 eventType=0 req=100.0 raw=550309005b8574060301000000000040a1130000000000000000640000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=108+1 acts=108+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=550109005b8574060500120008ff00006c016c01000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=108+1 acts=108+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=550109005b8574060700120008ff00006c016c01000000000000000000000000
+e core MappingNotify request=1 first=108 count=1 raw=22000200016c0100000000000000000000000000000000000000000000000000
+repeat 108 0->1
+- 108 kt=0,0,0,0 gi=0x01 w=1 syms=fe03 acts=0101800000040000 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 108 kt=0,0,0,0 gi=0x01 w=1 syms=61 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## sequential layout=gb options=- first=12 kpk=1 count=1 syms=78
+## + first=12 kpk=2 count=1 syms=33,a3
+> ckm:12:1:1:78
+= ok
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=12+1 acts=12+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900b98574060300120008ff00000c010c01000000000000000000000000
+e xkbl MappingNotify request=1 first=12 count=1 raw=22000900010c0100000000000000000000000000000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=12+1 acts=12+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900b98574060500120008ff00000c010c01000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=12+1 acts=12+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900b98574060700120008ff00000c010c01000000000000000000000000
+e core MappingNotify request=1 first=12 count=1 raw=22000200010c0100000000000000000000000000000000000000000000000000
+- 12 kt=11,0,0,0 gi=0x01 w=4 syms=33,a3,b3,a3 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 12 kt=11,0,0,0 gi=0x01 w=4 syms=78,58,0,0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> ckm:12:2:1:33,a3
+= ok
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=12+1 acts=12+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010d00ba8574060300120008ff00000c010c01000000000000000000000000
+e xkbl MappingNotify request=1 first=12 count=1 raw=22000d00010c0100000000000000000000000000000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=12+1 acts=12+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010d00ba8574060500120008ff00000c010c01000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=12+1 acts=12+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010d00ba8574060700120008ff00000c010c01000000000000000000000000
+e core MappingNotify request=1 first=12 count=1 raw=22000300010c0100000000000000000000000000000000000000000000000000
+- 12 kt=11,0,0,0 gi=0x01 w=4 syms=78,58,0,0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 12 kt=11,0,0,0 gi=0x01 w=4 syms=33,a3,0,0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> total
+- 12 kt=11,0,0,0 gi=0x01 w=4 syms=33,a3,b3,a3 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 12 kt=11,0,0,0 gi=0x01 w=4 syms=33,a3,0,0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+## sequential-wide layout=gb options=- first=25 kpk=6 count=1 syms=77,57,6c3,6e3,1b3,1a3
+## + first=25 kpk=2 count=1 syms=61,41
+> ckm:25:6:1:77,57,6c3,6e3,1b3,1a3
+= ok
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=25+1 acts=25+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900138674060300120008ff000019011901000000000000000000000000
+e xkbl MappingNotify request=1 first=25 count=1 raw=2200090001190100000000000000000000000000000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=25+1 acts=25+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900138674060500120008ff000019011901000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=25+1 acts=25+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900138674060700120008ff000019011901000000000000000000000000
+e core MappingNotify request=1 first=25 count=1 raw=2200020001190100000000000000000000000000000000000000000000000000
+- 25 kt=13,0,0,0 gi=0x01 w=4 syms=77,57,100017f,a7 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 25 kt=13,2,0,0 gi=0x02 w=4 syms=77,57,1b3,1a3,6c3,6e3,0,0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> ckm:25:2:1:61,41
+= ok
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=25+1 acts=25+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010d00148674060300120008ff000019011901000000000000000000000000
+e xkbl MappingNotify request=1 first=25 count=1 raw=22000d0001190100000000000000000000000000000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=25+1 acts=25+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010d00148674060500120008ff000019011901000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=25+1 acts=25+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010d00148674060700120008ff000019011901000000000000000000000000
+e core MappingNotify request=1 first=25 count=1 raw=2200030001190100000000000000000000000000000000000000000000000000
+- 25 kt=13,2,0,0 gi=0x02 w=4 syms=77,57,1b3,1a3,6c3,6e3,0,0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 25 kt=13,2,0,0 gi=0x01 w=4 syms=61,41,0,0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> total
+- 25 kt=13,0,0,0 gi=0x01 w=4 syms=77,57,100017f,a7 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 25 kt=13,2,0,0 gi=0x01 w=4 syms=61,41,0,0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+## multigroup-one-sym layout=us,ru options=grp:alt_shift_toggle first=24 kpk=1 count=1 syms=71
+> ckm:24:1:1:71
+= ok
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=24+1 acts=24+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900708674060300120008ff000018011801000000000000000000000000
+e xkbl MappingNotify request=1 first=24 count=1 raw=2200090001180100000000000000000000000000000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=24+1 acts=24+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900708674060500120008ff000018011801000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=24+1 acts=24+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900708674060700120008ff000018011801000000000000000000000000
+e core MappingNotify request=1 first=24 count=1 raw=2200020001180100000000000000000000000000000000000000000000000000
+- 24 kt=2,2,0,0 gi=0x02 w=2 syms=71,51,6ca,6ea acts=- beh=00:00 expl=0x03 mm=0x00 vmm=0x0000
++ 24 kt=2,2,0,0 gi=0x02 w=2 syms=71,51,71,51 acts=- beh=00:00 expl=0x03 mm=0x00 vmm=0x0000
+coremodmap kpm=4 0:50,62,0,0 1:66,0,0,0 2:37,105,0,0 3:64,108,204,205 4:77,0,0,0 5:203,0,0,0 6:133,134,206,0 7:92,0,0,0
+## multigroup-replicated layout=us,ru options=grp:alt_shift_toggle first=24 kpk=4 count=1 syms=71,51,71,51
+> ckm:24:4:1:71,51,71,51
+= ok
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=24+1 acts=24+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900ed8674060300120008ff000018011801000000000000000000000000
+e xkbl MappingNotify request=1 first=24 count=1 raw=2200090001180100000000000000000000000000000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=24+1 acts=24+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900ed8674060500120008ff000018011801000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=24+1 acts=24+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900ed8674060700120008ff000018011801000000000000000000000000
+e core MappingNotify request=1 first=24 count=1 raw=2200020001180100000000000000000000000000000000000000000000000000
+- 24 kt=2,2,0,0 gi=0x02 w=2 syms=71,51,6ca,6ea acts=- beh=00:00 expl=0x03 mm=0x00 vmm=0x0000
++ 24 kt=2,2,0,0 gi=0x02 w=2 syms=71,51,71,51 acts=- beh=00:00 expl=0x03 mm=0x00 vmm=0x0000
+coremodmap kpm=4 0:50,62,0,0 1:66,0,0,0 2:37,105,0,0 3:64,108,204,205 4:77,0,0,0 5:203,0,0,0 6:133,134,206,0 7:92,0,0,0
+! first=7 kpk=1 count=1 nsyms=1 syms=61
+> ckm:7:1:1:61
+= error=2 value=7
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+! first=250 kpk=1 count=10 nsyms=10 syms=61,61,61,61,61,61,61,61,61,61
+> ckm:250:1:10:61,61,61,61,61,61,61,61,61,61
+= error=2 value=1
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+! first=10 kpk=0 count=1 nsyms=0 syms=-
+> ckm:10:0:1:
+= error=2 value=0
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+! first=10 kpk=2 count=1 nsyms=1 syms=61
+> ckm:10:2:1:61
+= error=16 value=0
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+! first=10 kpk=2 count=0 nsyms=0 syms=-
+> ckm:10:2:0:
+= ok
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+! first=255 kpk=1 count=1 nsyms=1 syms=61
+> ckm:255:1:1:61
+= ok
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=255+1 acts=255+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900128a74060300120008ff0000ff01ff01000000000000000000000000
+e xkbl MappingNotify request=1 first=255 count=1 raw=2200090001ff0100000000000000000000000000000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=255+1 acts=255+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900128a74060500120008ff0000ff01ff01000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=255+1 acts=255+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900128a74060700120008ff0000ff01ff01000000000000000000000000
+e core MappingNotify request=1 first=255 count=1 raw=2200020001ff0100000000000000000000000000000000000000000000000000
+- 255 kt=0,0,0,0 gi=0x01 w=1 syms=1008ffb5 acts=- beh=00:00 expl=0x00 mm=0x00 vmm=0x0000
++ 255 kt=2,0,0,0 gi=0x01 w=2 syms=61,41 acts=- beh=00:00 expl=0x00 mm=0x00 vmm=0x0000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+! first=255 kpk=1 count=2 nsyms=2 syms=61,61
+> ckm:255:1:2:61,61
+= error=2 value=1
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+! first=10 kpk=2 count=1 nsyms=2 syms=61,41
+> ckm:10:2:1:61,41
+= ok
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=10+1 acts=10+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900258b74060300120008ff00000a010a01000000000000000000000000
+e xkbl MappingNotify request=1 first=10 count=1 raw=22000900010a0100000000000000000000000000000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=10+1 acts=10+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900258b74060500120008ff00000a010a01000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=10+1 acts=10+1 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900258b74060700120008ff00000a010a01000000000000000000000000
+e core MappingNotify request=1 first=10 count=1 raw=22000200010a0100000000000000000000000000000000000000000000000000
+- 10 kt=11,0,0,0 gi=0x01 w=4 syms=31,21,b9,a1 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 10 kt=11,0,0,0 gi=0x01 w=4 syms=61,41,0,0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+! first=20 kpk=1 count=3 nsyms=3 syms=61,62,63
+> ckm:20:1:3:61,62,63
+= ok
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=20+3 acts=20+3 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=550109009d8b74060300120008ff000014031403000000000000000000000000
+e xkbl MappingNotify request=1 first=20 count=3 raw=2200090001140300000000000000000000000000000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=20+3 acts=20+3 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=550109009d8b74060500120008ff000014031403000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0012 min=8 max=255 types=0+0 syms=20+3 acts=20+3 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=550109009d8b74060700120008ff000014031403000000000000000000000000
+e core MappingNotify request=1 first=20 count=3 raw=2200020001140300000000000000000000000000000000000000000000000000
+- 20 kt=11,0,0,0 gi=0x01 w=4 syms=2d,5f,5c,bf acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 20 kt=11,0,0,0 gi=0x01 w=4 syms=61,41,0,0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+- 21 kt=11,0,0,0 gi=0x01 w=4 syms=3d,2b,fe5b,fe5c acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 21 kt=11,0,0,0 gi=0x01 w=4 syms=62,42,0,0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+- 22 kt=1,0,0,0 gi=0x01 w=2 syms=ff08,ff08 acts=- beh=00:00 expl=0x00 mm=0x00 vmm=0x0000
++ 22 kt=2,0,0,0 gi=0x01 w=2 syms=63,43 acts=- beh=00:00 expl=0x00 mm=0x00 vmm=0x0000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0

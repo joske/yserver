@@ -1,0 +1,210 @@
+# xkbcomp keymap dump + upload against Xorg (issue #171): Xvfb -noreset, layout=gb
+# server: X.Org version 21.1.24 (xdpyinfo); `Xvfb -version` -> "Unrecognized option: -version" (not supported by this build)
+# pacman -Q: xkeyboard-config 2.48-1 xorg-server-xvfb 21.1.24-1
+# setxkbmap -rules evdev -model pc105 -layout gb; then, both under x11trace -n:
+#   xkbcomp -xkb $DISPLAY dump.xkb                (dump)
+#   xkbcomp dump-edited.xkb $DISPLAY              (upload; <AC01>/<AC02> symbols swapped)
+# request lines: seq(hex) bytes decoded-request; XKB Set* headers decoded from the raw bytes
+# (field names as in XKBproto.h; a+b = first+count). The upload runs as a probe 'run:' step,
+# so the listener events and the XkbGetMap delta it caused follow (grammar as in
+# xorg-xkb-change-keyboard-mapping.txt).
+## dump requests
+0005    20 Request(98): QueryExtension name='XKEYBOARD'
+0006     8 XKEYBOARD-Request(135,0): UseExtension major=1 minor=0
+0007    28 XKEYBOARD-Request(135,8): GetMap deviceSpec=UseCoreKbd(256) full=255 partial=0 firstType=0 nTypes=0 firstKeySym=0 nKeySyms=0 firstKeyAct=0 nKeyActs=0 firstKeyBehavior=0 nKeyBehaviors=0 virtualMods=0
+0008    12 XKEYBOARD-Request(135,13): GetIndicatorMap opcode=0x87 opcode2=0x0d unparsed-data=0x03,0x00,0xff,0x00,0xff,0xff,0xff,0xff;
+0009     8 XKEYBOARD-Request(135,6): GetControls opcode=0x87 opcode2=0x06 unparsed-data=0x03,0x00,0xff,0x00;
+000a    12 XKEYBOARD-Request(135,10): GetCompatMap opcode=0x87 opcode2=0x0a unparsed-data=0x03,0x00,0x0f,0x01,0x00,0x00,0x00,0x00;
+000b    12 XKEYBOARD-Request(135,17): GetNames deviceSpec=3 which=keycodes,geometry,symbols,phys_symbols,type,compat,key_type_names,key_type_level_names,indicators,key_names,key_aliases,vmods,groups,radio_groups
+000c    12 XKEYBOARD-Request(135,19): GetGeometry opcode=0x87 opcode2=0x13 unparsed-data=0x03,0x00,0x0f,0x01,0x00,0x00,0x00,0x00;
+non-XKB requests: QueryExtension x1, Enable x1, CreateGC x1, GetProperty x1, GetAtomName x105, FreeGC x1, GetInputFocus x1
+## edit
+# 1354c1354
+# <         symbols[Group1]= [               a,               A,              ae,              AE ]
+# ---
+# >         symbols[Group1]= [               s,               S,          ssharp,           U1E9E ]
+# 1358c1358
+# <         symbols[Group1]= [               s,               S,          ssharp,           U1E9E ]
+# ---
+# >         symbols[Group1]= [               a,               A,              ae,              AE ]
+## upload requests
+0005    20 Request(98): QueryExtension name='XKEYBOARD'
+0006     8 XKEYBOARD-Request(135,0): UseExtension major=1 minor=0
+0070  5736 XKEYBOARD-Request(9): SetMap deviceSpec=0x100 present=0x00ff flags=0x3 minKeyCode=8 maxKeyCode=255 types=0+27 syms=8+248 total=467 acts=8+248 total=0 behaviors=8+248 total=0 explicit=8+248 total=70 modmap=8+248 total=14 vmodmap=8+248 total=0 virtualMods=0xffff
+0071   396 XKEYBOARD-Request(14): SetIndicatorMap deviceSpec=0x100 which=0xffffffff
+0072  2016 XKEYBOARD-Request(11): SetCompatMap deviceSpec=0x100 recomputeActions=1 truncateSI=1 groups=0x0f firstSI=0 nSI=124
+0073  2288 XKEYBOARD-Request(18): SetNames deviceSpec=0x100 virtualMods=0x00ff which=0x00001fff types=4+23 ktLevels=0+27 indicators=0x00003fff groupNames=0x01 nRadioGroups=0 keys=8+248 nKeyAliases=73 totalKTLevelNames=0
+0074  2020 XKEYBOARD-Request(20): SetGeometry deviceSpec=0x100 nShapes=15 nSections=4 widthMM=4700 heightMM=1800 nProperties=1 nColors=6 nDoodads=7 nKeyAliases=2
+non-XKB requests: QueryExtension x1, Enable x1, CreateGC x1, GetProperty x1, InternAtom x105, FreeGC x1, GetInputFocus x1
+## upload listener
+> run:x11trace -n -d :92 -D :97 -m 48 -o upload.trace -- xkbcomp dump-edited.xkb :97 >/dev/null 2>&1
+= exit=0
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x00f3 min=8 max=255 types=0+27 syms=8+248 acts=8+196 beh=8+248 expl=8+248 modmap=8+248 vmodmap=64+9 vmods=0x003f raw=55010900e29a74060300f30008ff001b08f808c408f808f808f840093f000000
+e xkbl MappingNotify request=1 first=8 count=248 raw=220009000108f800000000000000000000000000000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x00f3 min=8 max=255 types=0+27 syms=8+248 acts=8+196 beh=8+248 expl=8+248 modmap=8+248 vmodmap=64+9 vmods=0x003f raw=55010900e39a74060500f30008ff001b08f808c408f808f808f840093f000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x00f3 min=8 max=255 types=0+27 syms=8+248 acts=8+196 beh=8+248 expl=8+248 modmap=8+248 vmodmap=64+9 vmods=0x003f raw=55010900e39a74060700f30008ff001b08f808c408f808f808f840093f000000
+e xkb IndicatorMapNotify dev=3 state=0x00000000 changed=0xffffffff raw=55050900e39a74060300000000000000ffffffff000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b0900e39a74060300080000000000ff3f00000000000000001f0000000000
+e xkb CompatMapNotify dev=3 changedGroups=0x0f si=0+124 totalSI=124 raw=55070900e39a7406030f00007c007c000092a382c35500000093a382c3550000
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0010 min=8 max=255 types=0+0 syms=0+0 acts=8+75 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900e39a74060300100008ff00000000084b000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0010 min=8 max=255 types=0+0 syms=0+0 acts=8+75 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900e39a74060500100008ff00000000084b000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0010 min=8 max=255 types=0+0 syms=0+0 acts=8+75 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55010900e39a74060700100008ff00000000084b000000000000000000000000
+e xkb NamesNotify dev=3 changed=0x1fff types=4+23 levelNames=0+23 nRadioGroups=0 nKeyAliases=73 changedGroupNames=0x00 changedVMods=0x0001 keys=8+248 changedIndicators=0x00003fff raw=55060900e39a74060300ff1f0417001700004900010008f8ff3f000000000000
+e xkb xkbType=11 dev=3 raw=550b0900e39a74060300040000000000ff3f00000000000000001f0000000000
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.20 changed=0x0002 raw=55000900e39a7406030308ff08ff87140200bc47ff7f0000c07e6c82c3550000
+e xkb NewKeyboardNotify dev=5 oldDev=5 min=8 max=255 oldMin=8 oldMax=255 req=135.20 changed=0x0002 raw=55000900e39a7406050508ff08ff87140200bc47ff7f0000c07e6c82c3550000
+e xkb NewKeyboardNotify dev=7 oldDev=7 min=8 max=255 oldMin=8 oldMax=255 req=135.20 changed=0x0002 raw=55000900e39a7406070708ff08ff87140200bc47ff7f0000c07e6c82c3550000
+e core MappingNotify request=1 first=8 count=248 raw=220002000108f800000000000000000000000000000000000000000000000000
+-type 6 mods=01/0008 lv=2 map=[1:01/0008->1 1:01/0000->0 1:00/0008->0] pre=[00/0000 01/0000 00/0000]
++type 6 mods=01/0008 lv=2 map=[1:01/0008->1 1:00/0008->0 1:01/0000->0] pre=[00/0000 00/0000 01/0000]
+-type 8 mods=04/0008 lv=2 map=[1:04/0008->1 1:04/0000->0 1:00/0008->0] pre=[00/0000 04/0000 00/0000]
++type 8 mods=04/0008 lv=2 map=[1:04/0008->1 1:00/0008->0 1:04/0000->0] pre=[00/0000 00/0000 04/0000]
+-type 9 mods=05/0006 lv=5 map=[1:01/0000->1 1:00/0004->2 1:01/0004->3 1:05/0000->1 1:04/0004->2 1:05/0004->3 1:01/0002->1 1:00/0006->2 1:01/0006->3 1:04/0002->4 1:05/0002->1 1:04/0006->2 1:05/0006->3 1:00/0002->0 1:04/0000->0] pre=[00/0000 00/0000 00/0000 04/0000 04/0000 04/0000 00/0000 00/0000 00/0000 00/0000 04/0000 04/0000 04/0000 00/0000 04/0000]
++type 9 mods=05/0006 lv=5 map=[1:01/0000->1 1:00/0004->2 1:01/0004->3 1:05/0000->1 1:04/0004->2 1:05/0004->3 1:01/0002->1 1:00/0006->2 1:01/0006->3 1:04/0002->4 1:05/0002->1 1:04/0006->2 1:05/0006->3 1:04/0000->0] pre=[00/0000 00/0000 00/0000 04/0000 04/0000 04/0000 00/0000 00/0000 00/0000 00/0000 04/0000 04/0000 04/0000 04/0000]
+-type 14 mods=01/0005 lv=4 map=[1:01/0000->0 1:00/0001->1 1:00/0004->2 1:01/0001->1 1:01/0004->3 1:00/0005->2 1:01/0005->3] pre=[01/0000 00/0000 00/0000 01/0000 00/0000 00/0000 00/0000]
++type 14 mods=01/0005 lv=4 map=[1:00/0001->1 1:00/0004->2 1:01/0001->1 1:01/0004->3 1:00/0005->2 1:01/0005->3 1:01/0000->0] pre=[00/0000 00/0000 01/0000 00/0000 00/0000 00/0000 01/0000]
+-type 15 mods=01/0005 lv=4 map=[1:01/0000->0 1:00/0001->1 1:00/0004->2 1:01/0001->1 1:01/0004->3 1:00/0005->2 1:01/0005->3] pre=[01/0000 00/0000 00/0000 01/0000 00/0000 00/0000 00/0000]
++type 15 mods=01/0005 lv=4 map=[1:00/0001->1 1:00/0004->2 1:01/0001->1 1:01/0004->3 1:00/0005->2 1:01/0005->3 1:01/0000->0] pre=[00/0000 00/0000 01/0000 00/0000 00/0000 00/0000 01/0000]
+-type 17 mods=05/0006 lv=4 map=[1:01/0000->0 1:00/0004->1 1:00/0002->0 1:01/0004->2 1:01/0002->0 1:04/0004->1 1:00/0006->1 1:04/0002->3 1:05/0004->2 1:01/0006->2 1:05/0002->3 1:04/0006->1 1:05/0006->2 1:04/0000->0 1:05/0000->0] pre=[01/0000 00/0000 00/0000 00/0000 01/0000 04/0000 00/0000 00/0000 04/0000 00/0000 01/0000 04/0000 04/0000 04/0000 05/0000]
++type 17 mods=05/0006 lv=4 map=[1:00/0004->1 1:01/0004->2 1:04/0004->1 1:00/0006->1 1:04/0002->3 1:05/0004->2 1:01/0006->2 1:05/0002->3 1:04/0006->1 1:05/0006->2 1:05/0000->0 1:01/0000->0 1:01/0002->0 1:04/0000->0] pre=[00/0000 00/0000 04/0000 00/0000 00/0000 04/0000 00/0000 01/0000 04/0000 04/0000 05/0000 01/0000 01/0000 04/0000]
+- 10 kt=11,0,0,0 gi=0x01 w=4 syms=31,21,b9,a1 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 10 kt=11,0,0,0 gi=0x01 w=4 syms=31,21,b9,a1 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 11 kt=11,0,0,0 gi=0x01 w=4 syms=32,22,b2,ac3 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 11 kt=11,0,0,0 gi=0x01 w=4 syms=32,22,b2,ac3 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 12 kt=11,0,0,0 gi=0x01 w=4 syms=33,a3,b3,a3 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 12 kt=11,0,0,0 gi=0x01 w=4 syms=33,a3,b3,a3 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 13 kt=11,0,0,0 gi=0x01 w=4 syms=34,24,20ac,bc acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 13 kt=11,0,0,0 gi=0x01 w=4 syms=34,24,20ac,bc acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 14 kt=11,0,0,0 gi=0x01 w=4 syms=35,25,bd,ac4 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 14 kt=11,0,0,0 gi=0x01 w=4 syms=35,25,bd,ac4 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 15 kt=11,0,0,0 gi=0x01 w=4 syms=36,5e,be,ac5 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 15 kt=11,0,0,0 gi=0x01 w=4 syms=36,5e,be,ac5 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 16 kt=11,0,0,0 gi=0x01 w=4 syms=37,26,7b,ac6 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 16 kt=11,0,0,0 gi=0x01 w=4 syms=37,26,7b,ac6 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 17 kt=11,0,0,0 gi=0x01 w=4 syms=38,2a,5b,ac9 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 17 kt=11,0,0,0 gi=0x01 w=4 syms=38,2a,5b,ac9 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 18 kt=11,0,0,0 gi=0x01 w=4 syms=39,28,5d,b1 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 18 kt=11,0,0,0 gi=0x01 w=4 syms=39,28,5d,b1 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 19 kt=11,0,0,0 gi=0x01 w=4 syms=30,29,7d,b0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 19 kt=11,0,0,0 gi=0x01 w=4 syms=30,29,7d,b0 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 20 kt=11,0,0,0 gi=0x01 w=4 syms=2d,5f,5c,bf acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 20 kt=11,0,0,0 gi=0x01 w=4 syms=2d,5f,5c,bf acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 21 kt=11,0,0,0 gi=0x01 w=4 syms=3d,2b,fe5b,fe5c acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 21 kt=11,0,0,0 gi=0x01 w=4 syms=3d,2b,fe5b,fe5c acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 24 kt=13,0,0,0 gi=0x01 w=4 syms=71,51,40,7d9 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 24 kt=13,0,0,0 gi=0x01 w=4 syms=71,51,40,7d9 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 25 kt=13,0,0,0 gi=0x01 w=4 syms=77,57,100017f,a7 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 25 kt=13,0,0,0 gi=0x01 w=4 syms=77,57,100017f,a7 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 26 kt=12,0,0,0 gi=0x01 w=4 syms=65,45,65,45 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 26 kt=12,0,0,0 gi=0x01 w=4 syms=65,45,65,45 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 27 kt=13,0,0,0 gi=0x01 w=4 syms=72,52,b6,ae acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 27 kt=13,0,0,0 gi=0x01 w=4 syms=72,52,b6,ae acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 28 kt=12,0,0,0 gi=0x01 w=4 syms=74,54,3bc,3ac acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 28 kt=12,0,0,0 gi=0x01 w=4 syms=74,54,3bc,3ac acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 29 kt=13,0,0,0 gi=0x01 w=4 syms=79,59,8fb,a5 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 29 kt=13,0,0,0 gi=0x01 w=4 syms=79,59,8fb,a5 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 30 kt=13,0,0,0 gi=0x01 w=4 syms=75,55,8fe,8fc acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 30 kt=13,0,0,0 gi=0x01 w=4 syms=75,55,8fe,8fc acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 31 kt=13,0,0,0 gi=0x01 w=4 syms=69,49,8fd,2b9 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 31 kt=13,0,0,0 gi=0x01 w=4 syms=69,49,8fd,2b9 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 32 kt=12,0,0,0 gi=0x01 w=4 syms=6f,4f,f8,d8 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 32 kt=12,0,0,0 gi=0x01 w=4 syms=6f,4f,f8,d8 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 33 kt=12,0,0,0 gi=0x01 w=4 syms=70,50,fe,de acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 33 kt=12,0,0,0 gi=0x01 w=4 syms=70,50,fe,de acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 34 kt=11,0,0,0 gi=0x01 w=4 syms=5b,7b,fe57,fe58 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 34 kt=11,0,0,0 gi=0x01 w=4 syms=5b,7b,fe57,fe58 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 35 kt=11,0,0,0 gi=0x01 w=4 syms=5d,7d,fe53,fe54 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 35 kt=11,0,0,0 gi=0x01 w=4 syms=5d,7d,fe53,fe54 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 38 kt=12,0,0,0 gi=0x01 w=4 syms=61,41,e6,c6 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 38 kt=12,0,0,0 gi=0x01 w=4 syms=73,53,df,1001e9e acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 39 kt=12,0,0,0 gi=0x01 w=4 syms=73,53,df,1001e9e acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 39 kt=12,0,0,0 gi=0x01 w=4 syms=61,41,e6,c6 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 40 kt=12,0,0,0 gi=0x01 w=4 syms=64,44,f0,d0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 40 kt=12,0,0,0 gi=0x01 w=4 syms=64,44,f0,d0 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 41 kt=13,0,0,0 gi=0x01 w=4 syms=66,46,1f0,aa acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 41 kt=13,0,0,0 gi=0x01 w=4 syms=66,46,1f0,aa acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 42 kt=12,0,0,0 gi=0x01 w=4 syms=67,47,3bf,3bd acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 42 kt=12,0,0,0 gi=0x01 w=4 syms=67,47,3bf,3bd acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 43 kt=12,0,0,0 gi=0x01 w=4 syms=68,48,2b1,2a1 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 43 kt=12,0,0,0 gi=0x01 w=4 syms=68,48,2b1,2a1 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 44 kt=13,0,0,0 gi=0x01 w=4 syms=6a,4a,fe61,fe62 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 44 kt=13,0,0,0 gi=0x01 w=4 syms=6a,4a,fe61,fe62 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 45 kt=13,0,0,0 gi=0x01 w=4 syms=6b,4b,3a2,26 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 45 kt=13,0,0,0 gi=0x01 w=4 syms=6b,4b,3a2,26 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 46 kt=12,0,0,0 gi=0x01 w=4 syms=6c,4c,1b3,1a3 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 46 kt=12,0,0,0 gi=0x01 w=4 syms=6c,4c,1b3,1a3 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 47 kt=11,0,0,0 gi=0x01 w=4 syms=3b,3a,fe51,fe59 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 47 kt=11,0,0,0 gi=0x01 w=4 syms=3b,3a,fe51,fe59 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 48 kt=11,0,0,0 gi=0x01 w=4 syms=27,40,fe52,fe5a acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 48 kt=11,0,0,0 gi=0x01 w=4 syms=27,40,fe52,fe5a acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 49 kt=11,0,0,0 gi=0x01 w=4 syms=60,ac,7c,7c acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 49 kt=11,0,0,0 gi=0x01 w=4 syms=60,ac,7c,7c acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 51 kt=11,0,0,0 gi=0x01 w=4 syms=23,7e,fe50,fe55 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 51 kt=11,0,0,0 gi=0x01 w=4 syms=23,7e,fe50,fe55 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 52 kt=13,0,0,0 gi=0x01 w=4 syms=7a,5a,ab,3c acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 52 kt=13,0,0,0 gi=0x01 w=4 syms=7a,5a,ab,3c acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 53 kt=13,0,0,0 gi=0x01 w=4 syms=78,58,bb,3e acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 53 kt=13,0,0,0 gi=0x01 w=4 syms=78,58,bb,3e acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 54 kt=13,0,0,0 gi=0x01 w=4 syms=63,43,a2,a9 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 54 kt=13,0,0,0 gi=0x01 w=4 syms=63,43,a2,a9 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 55 kt=13,0,0,0 gi=0x01 w=4 syms=76,56,afe,afd acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 55 kt=13,0,0,0 gi=0x01 w=4 syms=76,56,afe,afd acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 56 kt=13,0,0,0 gi=0x01 w=4 syms=62,42,ad2,ad0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 56 kt=13,0,0,0 gi=0x01 w=4 syms=62,42,ad2,ad0 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 57 kt=13,0,0,0 gi=0x01 w=4 syms=6e,4e,ad3,ad1 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 57 kt=13,0,0,0 gi=0x01 w=4 syms=6e,4e,ad3,ad1 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 58 kt=13,0,0,0 gi=0x01 w=4 syms=6d,4d,b5,ba acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 58 kt=13,0,0,0 gi=0x01 w=4 syms=6d,4d,b5,ba acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 59 kt=11,0,0,0 gi=0x01 w=4 syms=2c,3c,1002022,d7 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 59 kt=11,0,0,0 gi=0x01 w=4 syms=2c,3c,1002022,d7 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 60 kt=11,0,0,0 gi=0x01 w=4 syms=2e,3e,b7,f7 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 60 kt=11,0,0,0 gi=0x01 w=4 syms=2e,3e,b7,f7 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 61 kt=11,0,0,0 gi=0x01 w=4 syms=2f,3f,fe60,fe56 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 61 kt=11,0,0,0 gi=0x01 w=4 syms=2f,3f,fe60,fe56 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 63 kt=9,0,0,0 gi=0x01 w=5 syms=ffaa,ffaa,ffaa,ffaa,1008fe21 acts=0a04010200000000,0a04010200000000,0a04010200000000,0a04010200000000,0000000000000000 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 63 kt=9,0,0,0 gi=0x01 w=5 syms=ffaa,ffaa,ffaa,ffaa,1008fe21 acts=0a04010200000000,0a04010200000000,0a04010200000000,0a04010200000000,0000000000000000 beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 67 kt=9,0,0,0 gi=0x01 w=5 syms=ffbe,ffbe,ffbe,ffbe,1008fe01 acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d05010000000000 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 67 kt=9,0,0,0 gi=0x01 w=5 syms=ffbe,ffbe,ffbe,ffbe,1008fe01 acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d05010000000000 beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 68 kt=9,0,0,0 gi=0x01 w=5 syms=ffbf,ffbf,ffbf,ffbf,1008fe02 acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d05020000000000 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 68 kt=9,0,0,0 gi=0x01 w=5 syms=ffbf,ffbf,ffbf,ffbf,1008fe02 acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d05020000000000 beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 69 kt=9,0,0,0 gi=0x01 w=5 syms=ffc0,ffc0,ffc0,ffc0,1008fe03 acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d05030000000000 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 69 kt=9,0,0,0 gi=0x01 w=5 syms=ffc0,ffc0,ffc0,ffc0,1008fe03 acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d05030000000000 beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 70 kt=9,0,0,0 gi=0x01 w=5 syms=ffc1,ffc1,ffc1,ffc1,1008fe04 acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d05040000000000 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 70 kt=9,0,0,0 gi=0x01 w=5 syms=ffc1,ffc1,ffc1,ffc1,1008fe04 acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d05040000000000 beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 71 kt=9,0,0,0 gi=0x01 w=5 syms=ffc2,ffc2,ffc2,ffc2,1008fe05 acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d05050000000000 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 71 kt=9,0,0,0 gi=0x01 w=5 syms=ffc2,ffc2,ffc2,ffc2,1008fe05 acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d05050000000000 beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 72 kt=9,0,0,0 gi=0x01 w=5 syms=ffc3,ffc3,ffc3,ffc3,1008fe06 acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d05060000000000 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 72 kt=9,0,0,0 gi=0x01 w=5 syms=ffc3,ffc3,ffc3,ffc3,1008fe06 acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d05060000000000 beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 73 kt=9,0,0,0 gi=0x01 w=5 syms=ffc4,ffc4,ffc4,ffc4,1008fe07 acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d05070000000000 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 73 kt=9,0,0,0 gi=0x01 w=5 syms=ffc4,ffc4,ffc4,ffc4,1008fe07 acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d05070000000000 beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 74 kt=9,0,0,0 gi=0x01 w=5 syms=ffc5,ffc5,ffc5,ffc5,1008fe08 acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d05080000000000 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 74 kt=9,0,0,0 gi=0x01 w=5 syms=ffc5,ffc5,ffc5,ffc5,1008fe08 acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d05080000000000 beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 75 kt=9,0,0,0 gi=0x01 w=5 syms=ffc6,ffc6,ffc6,ffc6,1008fe09 acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d05090000000000 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 75 kt=9,0,0,0 gi=0x01 w=5 syms=ffc6,ffc6,ffc6,ffc6,1008fe09 acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d05090000000000 beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 76 kt=9,0,0,0 gi=0x01 w=5 syms=ffc7,ffc7,ffc7,ffc7,1008fe0a acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d050a0000000000 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 76 kt=9,0,0,0 gi=0x01 w=5 syms=ffc7,ffc7,ffc7,ffc7,1008fe0a acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d050a0000000000 beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 82 kt=9,0,0,0 gi=0x01 w=5 syms=ffad,ffad,ffad,ffad,1008fe23 acts=0a04010300000000,0a04010300000000,0a04010300000000,0a04010300000000,862d564d6f646500 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 82 kt=9,0,0,0 gi=0x01 w=5 syms=ffad,ffad,ffad,ffad,1008fe23 acts=0a04010300000000,0a04010300000000,0a04010300000000,0a04010300000000,862d564d6f646500 beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 86 kt=9,0,0,0 gi=0x01 w=5 syms=ffab,ffab,ffab,ffab,1008fe22 acts=0800020000000000,0800020000000000,0800020000000000,0800020000000000,862b564d6f646500 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 86 kt=9,0,0,0 gi=0x01 w=5 syms=ffab,ffab,ffab,ffab,1008fe22 acts=0800020000000000,0800020000000000,0800020000000000,0800020000000000,862b564d6f646500 beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 93 kt=8,0,0,0 gi=0x01 w=2 syms=ffd5,1008ffa9 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 93 kt=8,0,0,0 gi=0x01 w=2 syms=ffd5,1008ffa9 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 94 kt=11,0,0,0 gi=0x01 w=4 syms=5c,7c,7c,a6 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 94 kt=11,0,0,0 gi=0x01 w=4 syms=5c,7c,7c,a6 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 95 kt=9,0,0,0 gi=0x01 w=5 syms=ffc8,ffc8,ffc8,ffc8,1008fe0b acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d050b0000000000 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 95 kt=9,0,0,0 gi=0x01 w=5 syms=ffc8,ffc8,ffc8,ffc8,1008fe0b acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d050b0000000000 beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 96 kt=9,0,0,0 gi=0x01 w=5 syms=ffc9,ffc9,ffc9,ffc9,1008fe0c acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d050c0000000000 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 96 kt=9,0,0,0 gi=0x01 w=5 syms=ffc9,ffc9,ffc9,ffc9,1008fe0c acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d050c0000000000 beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 106 kt=9,0,0,0 gi=0x01 w=5 syms=ffaf,ffaf,ffaf,ffaf,1008fe20 acts=0a04010100000000,0a04010100000000,0a04010100000000,0a04010100000000,0000000000000000 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 106 kt=9,0,0,0 gi=0x01 w=5 syms=ffaf,ffaf,ffaf,ffaf,1008fe20 acts=0a04010100000000,0a04010100000000,0a04010100000000,0a04010100000000,0000000000000000 beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 107 kt=4,0,0,0 gi=0x01 w=2 syms=ff61,ff15 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 107 kt=4,0,0,0 gi=0x01 w=2 syms=ff61,ff15 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 108 kt=0,0,0,0 gi=0x01 w=1 syms=fe03 acts=0101800000040000 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 108 kt=0,0,0,0 gi=0x01 w=1 syms=fe03 acts=0101800000040000 beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 127 kt=7,0,0,0 gi=0x01 w=2 syms=ff13,ff6b acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 127 kt=7,0,0,0 gi=0x01 w=2 syms=ff13,ff6b acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 201 kt=6,0,0,0 gi=0x01 w=2 syms=ffd4,10081247 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 201 kt=6,0,0,0 gi=0x01 w=2 syms=ffd4,10081247 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+- 202 kt=8,0,0,0 gi=0x01 w=2 syms=ffd5,1008ffa9 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 202 kt=8,0,0,0 gi=0x01 w=2 syms=ffd5,1008ffa9 acts=- beh=00:00 expl=0x0f mm=0x00 vmm=0x0000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
