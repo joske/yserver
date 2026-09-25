@@ -157,18 +157,33 @@ pub fn apply_rules_names_change(state: &mut ServerState, backend: &mut dyn Backe
             0x0001, // changed = XkbNKN_KeycodesMask
         );
     });
-    let mapn = subscribers(state, 0x0002); // XkbMapNotifyMask
-    let _dropped = fanout_event_to_clients(state, &mapn, |buf, seq, order| {
-        // n_types = 4 in phase A; a later task (C2) changes this to the
-        // backend's derived type count once GetMap publishes the real table.
-        let _ = x11::write_xkb_map_notify(buf, order, seq, xkb_event_base, 1, min_kc, max_kc, 4);
-    });
+    // n_types = 4 in phase A; a later task (C2) changes this to the
+    // backend's derived type count once GetMap publishes the real table.
+    send_xkb_map_notify(
+        state,
+        xkb_event_base,
+        x11::XkbMapNotify::whole_keymap(1, min_kc, max_kc, 4),
+    );
     log::info!(
         "xkb: applied layout '{}' (variant '{}'); notified {} clients",
         names.layout,
         names.variant,
         all.len()
     );
+}
+
+/// Send an `XkbMapNotify` carrying `notify` to every client that selected
+/// XkbMapNotify (`XkbSelectEvents` bit 0x0002). Returns the recipients.
+pub(crate) fn send_xkb_map_notify(
+    state: &mut ServerState,
+    xkb_event_base: u8,
+    notify: x11::XkbMapNotify,
+) -> Vec<ClientId> {
+    let recipients = subscribers(state, 0x0002); // XkbMapNotifyMask
+    let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
+        let _ = x11::write_xkb_map_notify(buf, order, seq, xkb_event_base, notify);
+    });
+    recipients
 }
 
 /// Merge an `XkbSelectEvents` request into the stored per-(client, device)
@@ -325,6 +340,120 @@ mod tests {
              table — otherwise keycode 38 stays stuck on the pre-switch layout \
              forever while every other key correctly reflects the new one"
         );
+    }
+
+    fn install_client(state: &mut ServerState, id: u32) -> std::os::unix::net::UnixStream {
+        use std::{
+            collections::{HashMap, HashSet, VecDeque},
+            sync::{Arc, Mutex, atomic::AtomicU16},
+        };
+        let (server_side, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        state.clients.insert(
+            id,
+            crate::server::ClientState {
+                writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(server_side))),
+                byte_order: x11::ClientByteOrder::LittleEndian,
+                last_sequence: Arc::new(AtomicU16::new(0)),
+                resource_id_base: 0,
+                resource_id_mask: 0,
+                event_masks: HashMap::new(),
+                save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::new(),
+                xi1_event_classes: HashSet::new(),
+                xi1_window_event_classes: HashMap::new(),
+                outbound: VecDeque::new(),
+                watching_writable: false,
+                focused_window: ROOT_WINDOW,
+                reader_control: None,
+                is_local: true,
+                fd_passing: true,
+            },
+        );
+        peer
+    }
+
+    fn read_available(peer: &mut std::os::unix::net::UnixStream) -> Vec<u8> {
+        use std::io::Read;
+        peer.set_nonblocking(true).unwrap();
+        let mut out = Vec::new();
+        let mut buf = [0u8; 256];
+        loop {
+            match peer.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("read failed: {e}"),
+            }
+        }
+        out
+    }
+
+    /// The MapNotify helper reaches exactly the clients that selected
+    /// XkbMapNotify (under any device spec), each getting the encoder's
+    /// bytes for the given fields.
+    #[test]
+    fn send_xkb_map_notify_reaches_map_notify_subscribers_only() {
+        let mut state = ServerState::new();
+        let mut map_sub = install_client(&mut state, 5);
+        let mut state_sub = install_client(&mut state, 6);
+        let mut both_sub = install_client(&mut state, 7);
+        state.xkb_select_event_masks.insert((5, 0x0100), 0x0002);
+        state.xkb_select_event_masks.insert((6, 0x0100), 0x0004);
+        state.xkb_select_event_masks.insert((7, 0x0003), 0x0007);
+
+        let notify = x11::XkbMapNotify {
+            device_id: 3,
+            changed: 0x0006, // KeySyms|ModifierMap
+            min_keycode: 8,
+            max_keycode: 255,
+            first_key_sym: 38,
+            n_key_syms: 1,
+            first_mod_map_key: 38,
+            n_mod_map_keys: 1,
+            ..x11::XkbMapNotify::default()
+        };
+        let sent = send_xkb_map_notify(&mut state, 85, notify);
+        assert_eq!(sent, vec![ClientId(5), ClientId(7)]);
+
+        let mut expected = Vec::new();
+        x11::write_xkb_map_notify(
+            &mut expected,
+            x11::ClientByteOrder::LittleEndian,
+            x11::SequenceNumber(0),
+            85,
+            notify,
+        )
+        .unwrap();
+        assert_eq!(read_available(&mut map_sub), expected);
+        assert_eq!(read_available(&mut both_sub), expected);
+        assert!(
+            read_available(&mut state_sub).is_empty(),
+            "StateNotify-only client"
+        );
+    }
+
+    /// The `_XKB_RULES_NAMES` reload announces a whole-keymap MapNotify
+    /// through the helper.
+    #[test]
+    fn apply_rules_names_change_sends_whole_keymap_map_notify() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 5);
+        state.xkb_select_event_masks.insert((5, 0x0100), 0x0002);
+        let mut backend = RecordingBackend::new().with_keymap_rmlvo_result((8, 255));
+
+        apply_rules_names_change(&mut state, &mut backend, b"evdev\0pc105\0de\0\0\0");
+
+        let bytes = read_available(&mut peer);
+        let map_notify = bytes
+            .chunks_exact(32)
+            .find(|ev| ev[1] == 1 && ev[0] != 34)
+            .expect("an XkbMapNotify");
+        assert_eq!(&map_notify[10..12], &0x0007u16.to_le_bytes(), "changed");
+        assert_eq!(map_notify[12..14], [8, 255], "min/max keycode");
+        assert_eq!(map_notify[15], 4, "nTypes");
+        assert_eq!(map_notify[16..18], [8, 248], "keysym range");
+        assert_eq!(map_notify[24..26], [8, 248], "modmap range");
     }
 
     #[test]

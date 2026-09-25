@@ -257,7 +257,9 @@ fn is_keypad(sym: u32) -> bool {
 }
 
 /// xkbcommon's explicit key types (`type=` / `type[N]=`), per key and group, from its keymap text.
-fn explicit_type_names(keymap: &Keymap) -> std::collections::HashMap<u8, [Option<String>; 4]> {
+pub(super) fn explicit_type_names(
+    keymap: &Keymap,
+) -> std::collections::HashMap<u8, [Option<String>; 4]> {
     let mut out = std::collections::HashMap::new();
     let text = keymap.get_as_string(xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1);
     let Some(start) = text.find("xkb_symbols") else {
@@ -790,12 +792,15 @@ pub(super) fn keymap_modmap(keymap: &Keymap) -> [u8; 256] {
     modmap
 }
 
+/// The eight real modifiers as xkbcommon and `modifier_map` name them, in
+/// X11 bit order (bit 0 Shift … bit 7 Mod5).
+pub(super) const REAL_MOD_NAMES: [&str; 8] = [
+    "Shift", "Lock", "Control", "Mod1", "Mod2", "Mod3", "Mod4", "Mod5",
+];
+
 /// Real-modifier bit for an XKB modifier name as `modifier_map` spells it.
 fn real_mod_bit_for_name(name: &str) -> Option<u8> {
-    const NAMES: [&str; 8] = [
-        "Shift", "Lock", "Control", "Mod1", "Mod2", "Mod3", "Mod4", "Mod5",
-    ];
-    NAMES
+    REAL_MOD_NAMES
         .iter()
         .position(|n| n.eq_ignore_ascii_case(name))
         .map(|i| 1u8 << i)

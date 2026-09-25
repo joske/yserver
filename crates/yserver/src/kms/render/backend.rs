@@ -11363,9 +11363,7 @@ impl KmsBackend {
     }
 
     fn keymap_group_count(&self) -> u8 {
-        u8::try_from(self.core.xkb_keymap.0.num_layouts())
-            .unwrap_or(1)
-            .clamp(1, 4)
+        self.core.keymap_group_count()
     }
 
     fn clamp_group_to_keymap(&self, group: u8) -> u8 {
@@ -11416,6 +11414,26 @@ impl KmsBackend {
         if let Some(relay) = self.led_relay.as_ref() {
             relay.set(bits);
         }
+    }
+
+    /// Install edited keymap text in place of the live keymap
+    /// ([`crate::kms::core::KmsCore::install_keymap_text`]: fail-closed,
+    /// carries the locked state) and resync the lock LEDs, since a lock the
+    /// edit couldn't carry has been released.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "#171 phases 2/3 route ChangeKeyboardMapping and SetModifierMapping here"
+        )
+    )]
+    pub(crate) fn install_edited_keymap(
+        &mut self,
+        text: &str,
+    ) -> Result<(u8, u8), crate::kms::core::KeymapTextError> {
+        let bounds = self.core.install_keymap_text(text)?;
+        self.sync_keyboard_leds();
+        Ok(bounds)
     }
 
     /// Update xkb_state for `raw` then return a cooked
@@ -26923,13 +26941,16 @@ impl Backend for KmsBackend {
         variant: &str,
         options: Option<&str>,
     ) -> Option<(u8, u8)> {
-        self.core.recompile_keymap(&crate::kms::core::XkbRmlvo {
+        let range = self.core.recompile_keymap(&crate::kms::core::XkbRmlvo {
             rules: rules.to_string(),
             model: model.to_string(),
             layout: layout.to_string(),
             variant: variant.to_string(),
             options: options.map(str::to_string),
-        })
+        })?;
+        // The reload starts from a fresh state (locks released).
+        self.sync_keyboard_leds();
+        Some(range)
     }
 
     fn current_xkb_rules_names(&self) -> Option<[String; 5]> {
@@ -26984,9 +27005,10 @@ impl Backend for KmsBackend {
                 Some(parsed.options)
             },
         };
-        // Already active? Still a successful load, but changed=false
-        // (Xorg reports loaded=TRUE even on an unchanged reload).
-        if rmlvo == self.core.xkb_rmlvo {
+        // Already active and not edited since? Still a successful load, but
+        // changed=false (Xorg reports loaded=TRUE even on an unchanged
+        // reload). An edited keymap reloads (Xorg always reloads).
+        if self.core.keymap_is_pristine(&rmlvo) {
             let keymap = &self.core.xkb_keymap.0;
             let min = u8::try_from(keymap.min_keycode().raw()).unwrap_or(8).max(8);
             let max = u8::try_from(keymap.max_keycode().raw().min(255))
@@ -27002,13 +27024,15 @@ impl Backend for KmsBackend {
             Some((min, max)) => {
                 // New map -> group 0 active until the next LatchLockState.
                 self.core.locked_group = 0;
+                // Fresh state: locks released.
+                self.sync_keyboard_leds();
                 KeymapLoad::Loaded {
                     min_keycode: min,
                     max_keycode: max,
                     changed: true,
                 }
             }
-            // rmlvo != current was ruled out above, so None here means a
+            // A pristine match was ruled out above, so None here means a
             // compile failure -> keep the current keymap.
             None => KeymapLoad::Failed,
         }
@@ -36307,6 +36331,131 @@ mod tests {
         let _ = b.cook_host_key(key(true));
         let _ = b.cook_host_key(key(false));
         assert_eq!(b.current_led_bits(), 0, "second toggle clears the LED bit");
+    }
+
+    fn caps_key(pressed: bool) -> yserver_core::host_x11::HostKeyEvent {
+        // 66 == X keycode for Caps Lock (evdev KEY_CAPSLOCK 58 + 8).
+        yserver_core::host_x11::HostKeyEvent {
+            keycode: 66,
+            pressed,
+            state: 0,
+            root_x: 0,
+            root_y: 0,
+            event_x: 0,
+            event_y: 0,
+            time: 0,
+        }
+    }
+
+    /// The live keymap's text with `<CAPS>` rebound to `Control_L`: the
+    /// Caps Lock interpret no longer applies, so nothing can hold Lock.
+    fn caps_as_control_text(b: &KmsBackend) -> String {
+        let text = b
+            .core
+            .xkb_keymap
+            .0
+            .get_as_string(xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1);
+        crate::kms::xkb_edit::set_key(
+            &text,
+            "CAPS",
+            &[crate::kms::xkb_edit::KeyGroupSpec {
+                type_name: None,
+                keysyms: vec![xkbcommon::xkb::keysyms::KEY_Control_L],
+            }],
+        )
+        .expect("edit")
+    }
+
+    /// A full RMLVO reload starts from a fresh state (Caps Lock off), so
+    /// the keyboard LEDs must follow right away, not on the next key.
+    #[test]
+    fn rmlvo_reload_resyncs_the_lock_leds() {
+        use yserver_core::backend::Backend;
+        let mut b = KmsBackend::for_tests();
+        let _ = b.cook_host_key(caps_key(true));
+        let _ = b.cook_host_key(caps_key(false));
+        assert_eq!(b.leds_sent, input::Led::CAPSLOCK.bits(), "precondition");
+        assert!(
+            b.set_keymap_rmlvo("evdev", "pc105", "de", "", None)
+                .is_some()
+        );
+        assert_eq!(b.current_led_bits(), 0, "fresh state");
+        assert_eq!(b.leds_sent, 0, "LEDs resynced by the reload");
+    }
+
+    /// An edit carries Caps Lock across, but when the edit takes away the
+    /// only key that locks it, the lock is released and the LED must go off.
+    #[test]
+    fn keymap_edit_resyncs_the_lock_leds() {
+        let mut b = KmsBackend::for_tests();
+        let _ = b.cook_host_key(caps_key(true));
+        let _ = b.cook_host_key(caps_key(false));
+        assert_eq!(b.leds_sent, input::Led::CAPSLOCK.bits(), "precondition");
+
+        // Same keymap: Caps Lock and its LED stay on.
+        let same = b
+            .core
+            .xkb_keymap
+            .0
+            .get_as_string(xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1);
+        b.install_edited_keymap(&same).expect("compiles");
+        assert_eq!(b.leds_sent, input::Led::CAPSLOCK.bits(), "lock carried");
+
+        let text = caps_as_control_text(&b);
+        b.install_edited_keymap(&text).expect("compiles");
+        assert_eq!(b.current_led_bits(), 0, "no key locks Lock any more");
+        assert_eq!(b.leds_sent, 0, "LEDs resynced by the edit");
+    }
+
+    /// GetKbdByName for the base layout after an edit reloads it (Xorg
+    /// reloads on every load), where a pristine keymap reports no change.
+    #[test]
+    fn get_kbd_by_name_reloads_an_edited_keymap() {
+        use yserver_core::backend::{Backend, KeymapLoad};
+        let mut b = KmsBackend::for_tests();
+        let symbols = "pc+us+de:2+us:3+inet(evdev)";
+        assert!(matches!(
+            b.load_keymap_by_components(symbols),
+            KeymapLoad::Loaded { changed: true, .. }
+        ));
+        assert!(matches!(
+            b.load_keymap_by_components(symbols),
+            KeymapLoad::Loaded { changed: false, .. }
+        ));
+        let text = caps_as_control_text(&b);
+        b.install_edited_keymap(&text).expect("compiles");
+        assert!(matches!(
+            b.load_keymap_by_components(symbols),
+            KeymapLoad::Loaded { changed: true, .. }
+        ));
+        assert_eq!(
+            b.core
+                .xkb_keymap
+                .0
+                .key_get_syms_by_level(xkbcommon::xkb::Keycode::new(66), 0, 0)[0]
+                .raw(),
+            xkbcommon::xkb::keysyms::KEY_Caps_Lock,
+            "the reload dropped the edit"
+        );
+    }
+
+    /// `_XKB_RULES_NAMES` keeps naming the base RMLVO through an edit, and
+    /// `setxkbmap` with that same RMLVO then reloads.
+    #[test]
+    fn set_keymap_rmlvo_reloads_an_edited_keymap() {
+        use yserver_core::backend::Backend;
+        let mut b = KmsBackend::for_tests();
+        let names = b.current_xkb_rules_names();
+        let text = caps_as_control_text(&b);
+        b.install_edited_keymap(&text).expect("compiles");
+        assert_eq!(b.current_xkb_rules_names(), names, "base RMLVO reported");
+        let [r, m, l, v, o] = names.expect("names");
+        let opts = (!o.is_empty()).then_some(o.as_str());
+        assert!(
+            b.set_keymap_rmlvo(&r, &m, &l, &v, opts).is_some(),
+            "reloads"
+        );
+        assert_eq!(b.set_keymap_rmlvo(&r, &m, &l, &v, opts), None, "pristine");
     }
 
     /// Cinnamon alt-tab regression (2026-06-10): `query_pointer`'s

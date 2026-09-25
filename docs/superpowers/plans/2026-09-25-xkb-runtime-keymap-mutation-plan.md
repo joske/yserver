@@ -68,10 +68,18 @@ test-only (`golden_keymap`).
   (`xkb.c:3165`) re-derives actions when asked (`recomputeActions`) and sends
   CompatMapNotify. `SetNames` (`xkb.c:4522`) sends NamesNotify.
   `SetIndicatorMap` sends IndicatorMapNotify.
-- `xkbcomp file $DISPLAY` uploads through libxkbfile `XkbWriteToServer`. The
-  order is believed to be SetMap(all) → SetIndicatorMap → SetControls →
-  SetCompatMap → SetNames → SetGeometry. **Verify with x11trace against Xorg
-  before designing phase 4.**
+- `xkbcomp file $DISPLAY` uploads (captured, `testdata/xorg-xkbcomp-upload-trace.txt`):
+  SetMap(present=0xff) → SetIndicatorMap → SetCompatMap(recomputeActions=1) →
+  SetNames → SetGeometry. No SetControls; no read-back first. SetGeometry is
+  what triggers the NewKeyboardNotify.
+- Captured Xorg facts (`testdata/xorg-xkb-*.txt`, `tools/xkb-mutation-probe.c`):
+  ChangeKeyboardMapping → MapNotify changed=0x0012 over exactly the requested
+  keys, always (even for no-op changes), one per device; SetModifierMapping →
+  MapNotify changed=0x0014 (0x0094 when vmodmap changes), modmap range 8+248,
+  with Xorg's buggy action/vmodmap ranges (copy them). MappingBusy if ANY old or
+  new modifier key is held (not 255: Xorg off-by-one). A keycode under two
+  modifiers is BadValue, so xkbcommon's one-modifier-per-key limit is not a gap.
+  keycodes_per_modifier is never stored: readback = max keys on any modifier.
 
 ## 3. Approach
 
