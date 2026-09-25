@@ -11416,17 +11416,83 @@ impl KmsBackend {
         }
     }
 
+    /// `ChangeKeyboardMapping` on the XKB keymap, as Xorg's
+    /// `XkbApplyMappingChange`: `XkbUpdateKeyTypesFromCore` works out each
+    /// changed key's groups ([`crate::kms::xkb::core_mapping_change`]), they
+    /// are written into the live keymap's text and it is recompiled and
+    /// installed, so cooking, GetMap and GetKeyboardMapping all read the
+    /// change. The compiler re-derives actions, vmodmap and auto-repeat from
+    /// the compat interprets, which is `XkbUpdateActions`. Fail-closed: an
+    /// edit that doesn't compile keeps the keymap (and is logged); the
+    /// notifications still go out, as Xorg's do for a change that alters
+    /// nothing.
+    fn apply_keyboard_mapping(
+        &mut self,
+        first_keycode: u8,
+        keysyms_per_keycode: u8,
+        keysyms: &[u32],
+    ) -> yserver_core::backend::KeyboardMappingChange {
+        use crate::kms::xkb_edit;
+        let explicit = *self.core.explicit_key_types();
+        let keys = crate::kms::xkb::core_mapping_change(
+            &self.core.xkb_keymap.0,
+            &explicit,
+            first_keycode,
+            keysyms_per_keycode,
+            keysyms,
+        );
+        let text = self
+            .core
+            .xkb_keymap
+            .0
+            .get_as_string(xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1);
+        let edited = keys.iter().try_fold(text, |text, (kc, groups)| {
+            let (text, name) = xkb_edit::ensure_keycode_name(&text, *kc)?;
+            xkb_edit::set_key(&text, &name, groups)
+        });
+        match edited {
+            Ok(text) => {
+                if self.install_edited_keymap(&text).is_err() {
+                    log::warn!(
+                        "xkb: ChangeKeyboardMapping of {} keys from {first_keycode} not applied",
+                        keys.len()
+                    );
+                }
+            }
+            Err(e) => log::warn!(
+                "xkb: ChangeKeyboardMapping of {} keys from {first_keycode} not applied: {e}",
+                keys.len()
+            ),
+        }
+        let keymap = &self.core.xkb_keymap.0;
+        let text = keymap.get_as_string(xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1);
+        let derived: Vec<u8> = keys
+            .iter()
+            .map(|(kc, _)| *kc)
+            .filter(|kc| {
+                // A `repeat=` in the key's entry fixes it (Xorg
+                // XkbExplicitAutoRepeatMask): no re-derived bit to report.
+                !xkb_edit::keycode_name(&text, *kc)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|name| xkb_edit::key_repeat_is_explicit(&text, &name) == Ok(true))
+            })
+            .collect();
+        let repeats = crate::kms::xkb::key_auto_repeats(keymap, &derived);
+        let (min_keycode, max_keycode) = crate::kms::xkb::clamped_keycode_bounds(keymap);
+        yserver_core::backend::KeyboardMappingChange {
+            min_keycode,
+            max_keycode,
+            num_groups: self.keymap_group_count(),
+            enabled_controls: crate::kms::xkb::XKB_ENABLED_CONTROLS,
+            repeats,
+        }
+    }
+
     /// Install edited keymap text in place of the live keymap
     /// ([`crate::kms::core::KmsCore::install_keymap_text`]: fail-closed,
     /// carries the locked state) and resync the lock LEDs, since a lock the
     /// edit couldn't carry has been released.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "#171 phases 2/3 route ChangeKeyboardMapping and SetModifierMapping here"
-        )
-    )]
     pub(crate) fn install_edited_keymap(
         &mut self,
         text: &str,
@@ -27009,11 +27075,7 @@ impl Backend for KmsBackend {
         // changed=false (Xorg reports loaded=TRUE even on an unchanged
         // reload). An edited keymap reloads (Xorg always reloads).
         if self.core.keymap_is_pristine(&rmlvo) {
-            let keymap = &self.core.xkb_keymap.0;
-            let min = u8::try_from(keymap.min_keycode().raw()).unwrap_or(8).max(8);
-            let max = u8::try_from(keymap.max_keycode().raw().min(255))
-                .unwrap_or(255)
-                .max(min);
+            let (min, max) = crate::kms::xkb::clamped_keycode_bounds(&self.core.xkb_keymap.0);
             return KeymapLoad::Loaded {
                 min_keycode: min,
                 max_keycode: max,
@@ -27375,10 +27437,7 @@ impl Backend for KmsBackend {
         count: u8,
     ) -> io::Result<(u8, Vec<u32>)> {
         // Xorg's XkbGetCoreMap layout (one width for the whole map, §12.4 group order).
-        let map = crate::kms::xkb::core_keyboard_map(
-            &self.core.xkb_keymap.0,
-            &self.core.core_map_overrides,
-        );
+        let map = crate::kms::xkb::core_keyboard_map(&self.core.xkb_keymap.0);
         Ok((map.width, map.rows(first_keycode, count)))
     }
 
@@ -27387,15 +27446,14 @@ impl Backend for KmsBackend {
         first_keycode: u8,
         keysyms_per_keycode: u8,
         keysyms: &[u32],
-    ) -> bool {
-        crate::kms::xkb::apply_core_mapping_change(
+    ) -> Option<yserver_core::backend::KeyboardMappingChange> {
+        Some(self.apply_keyboard_mapping(first_keycode, keysyms_per_keycode, keysyms))
+    }
+
+    fn keymap_auto_repeats(&self) -> Option<[u8; 32]> {
+        Some(crate::kms::xkb::keymap_auto_repeats(
             &self.core.xkb_keymap.0,
-            &mut self.core.core_map_overrides,
-            first_keycode,
-            keysyms_per_keycode,
-            keysyms,
-        );
-        true
+        ))
     }
 
     fn get_modifier_mapping(
@@ -47053,6 +47111,13 @@ mod tests {
     fn kbd_map_client(
         state: &mut yserver_core::server::ServerState,
     ) -> std::os::unix::net::UnixStream {
+        kbd_map_client_id(state, 5)
+    }
+
+    fn kbd_map_client_id(
+        state: &mut yserver_core::server::ServerState,
+        id: u32,
+    ) -> std::os::unix::net::UnixStream {
         use std::{
             collections::{HashMap, HashSet, VecDeque},
             os::unix::net::UnixStream,
@@ -47062,7 +47127,7 @@ mod tests {
         writer.set_nonblocking(true).unwrap();
         peer.set_nonblocking(true).unwrap();
         state.clients.insert(
-            5,
+            id,
             yserver_core::server::ClientState {
                 writer: Arc::new(Mutex::new(yserver_core::transport::Transport::Unix(writer))),
                 byte_order: yserver_protocol::x11::ClientByteOrder::LittleEndian,
@@ -47294,5 +47359,643 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// One key of an XKB GetMap, as `testdata/xorg-xkb-change-keyboard-mapping.txt`
+    /// prints it (and as [`decode_xkb_get_map`] reads our reply).
+    #[derive(Clone, Debug, PartialEq, Eq, Default)]
+    struct XkbKeyRow {
+        kt: [u8; 4],
+        gi: u8,
+        width: u8,
+        syms: Vec<u32>,
+        acts: Vec<[u8; 8]>,
+        beh: (u8, u8),
+        expl: u8,
+        mm: u8,
+        vmm: u16,
+    }
+
+    /// One ChangeKeyboardMapping of a golden case: the request, Xorg's
+    /// result, the events and the GetMap/GetControls delta.
+    #[derive(Default)]
+    struct XkbCkmStep {
+        first: u8,
+        kpk: u8,
+        count: u8,
+        syms: Vec<u32>,
+        ok: bool,
+        /// Raw events on the XKB listener: the core keyboard's (dev 3) XKB
+        /// events and its core events, in arrival order.
+        listener: Vec<Vec<u8>>,
+        /// Raw events on the plain (non-XKB) connection.
+        plain: Vec<Vec<u8>>,
+        /// `(keycode, before, after)` per-key repeat changes (GetControls).
+        repeats: Vec<(u8, u8, u8)>,
+        before: std::collections::BTreeMap<u8, XkbKeyRow>,
+        after: std::collections::BTreeMap<u8, XkbKeyRow>,
+    }
+
+    struct XkbCkmCase {
+        name: String,
+        layout: String,
+        options: Option<String>,
+        steps: Vec<XkbCkmStep>,
+    }
+
+    fn parse_xkb_key_row(line: &str) -> (u8, XkbKeyRow) {
+        let mut it = line[2..].split(' ');
+        let kc: u8 = it.next().unwrap().parse().unwrap();
+        let mut row = XkbKeyRow::default();
+        let hex = |v: &str| u32::from_str_radix(v.trim_start_matches("0x"), 16).unwrap();
+        for field in it {
+            let (k, v) = field.split_once('=').unwrap();
+            match k {
+                "kt" => {
+                    for (i, t) in v.split(',').enumerate() {
+                        row.kt[i] = t.parse().unwrap();
+                    }
+                }
+                "gi" => row.gi = u8::try_from(hex(v)).unwrap(),
+                "w" => row.width = v.parse().unwrap(),
+                "syms" => row.syms = v.split(',').map(hex).collect(),
+                "acts" if v == "-" => {}
+                "acts" => {
+                    row.acts = v
+                        .split(',')
+                        .map(|a| {
+                            let mut b = [0u8; 8];
+                            for (i, byte) in b.iter_mut().enumerate() {
+                                *byte = u8::from_str_radix(&a[2 * i..2 * i + 2], 16).unwrap();
+                            }
+                            b
+                        })
+                        .collect();
+                }
+                "beh" => {
+                    let (t, d) = v.split_once(':').unwrap();
+                    row.beh = (
+                        u8::from_str_radix(t, 16).unwrap(),
+                        u8::from_str_radix(d, 16).unwrap(),
+                    );
+                }
+                "expl" => row.expl = u8::try_from(hex(v)).unwrap(),
+                "mm" => row.mm = u8::try_from(hex(v)).unwrap(),
+                "vmm" => row.vmm = u16::try_from(hex(v)).unwrap(),
+                other => panic!("unknown key field {other}"),
+            }
+        }
+        (kc, row)
+    }
+
+    fn parse_xkb_ckm_golden(text: &str) -> Vec<XkbCkmCase> {
+        let field = |line: &str, key: &str| -> Option<String> {
+            line.split(' ')
+                .find_map(|t| t.strip_prefix(&format!("{key}=")).map(str::to_owned))
+        };
+        let raw = |line: &str| -> Vec<u8> {
+            let h = field(line, "raw").unwrap();
+            (0..h.len() / 2)
+                .map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap())
+                .collect()
+        };
+        let mut cases: Vec<XkbCkmCase> = Vec::new();
+        let mut in_total = false;
+        for line in text.lines() {
+            if line.starts_with("## + ") || (line.starts_with('#') && !line.starts_with("## ")) {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("## ") {
+                let opts = field(line, "options").unwrap();
+                cases.push(XkbCkmCase {
+                    name: rest.split(' ').next().unwrap().to_owned(),
+                    layout: field(line, "layout").unwrap(),
+                    options: (opts != "-").then_some(opts),
+                    steps: Vec::new(),
+                });
+                in_total = false;
+            } else if let Some(rest) = line.strip_prefix("! ") {
+                cases.push(XkbCkmCase {
+                    name: format!("edge {rest}"),
+                    layout: "gb".into(),
+                    options: None,
+                    steps: Vec::new(),
+                });
+                in_total = false;
+            } else if line == "> total" {
+                in_total = true;
+            } else if let Some(req) = line.strip_prefix("> ckm:") {
+                let mut it = req.splitn(4, ':');
+                let first = it.next().unwrap().parse().unwrap();
+                let kpk = it.next().unwrap().parse().unwrap();
+                let count = it.next().unwrap().parse().unwrap();
+                let syms = it
+                    .next()
+                    .unwrap()
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(|h| u32::from_str_radix(h, 16).unwrap())
+                    .collect();
+                cases.last_mut().unwrap().steps.push(XkbCkmStep {
+                    first,
+                    kpk,
+                    count,
+                    syms,
+                    ..XkbCkmStep::default()
+                });
+            } else if in_total {
+                continue;
+            } else {
+                let step = cases.last_mut().unwrap().steps.last_mut().unwrap();
+                if line == "= ok" {
+                    step.ok = true;
+                } else if line.starts_with("= error") {
+                    step.ok = false;
+                } else if line.starts_with("e xkb ") {
+                    if field(line, "dev").as_deref() == Some("3") {
+                        step.listener.push(raw(line));
+                    }
+                } else if line.starts_with("e xkbl ") {
+                    step.listener.push(raw(line));
+                } else if line.starts_with("e core ") {
+                    step.plain.push(raw(line));
+                } else if let Some(r) = line.strip_prefix("repeat ") {
+                    let (kc, change) = r.split_once(' ').unwrap();
+                    let (a, b) = change.split_once("->").unwrap();
+                    step.repeats.push((
+                        kc.parse().unwrap(),
+                        a.parse().unwrap(),
+                        b.parse().unwrap(),
+                    ));
+                } else if line.starts_with("- ") {
+                    let (kc, row) = parse_xkb_key_row(line);
+                    step.before.insert(kc, row);
+                } else if line.starts_with("+ ") {
+                    let (kc, row) = parse_xkb_key_row(line);
+                    step.after.insert(kc, row);
+                } else if line.starts_with("coremodmap") {
+                } else {
+                    panic!("unparsed golden line: {line}");
+                }
+            }
+        }
+        cases
+    }
+
+    /// A key type as our GetMap describes it: level count and the active
+    /// `(real mods mask, level)` map entries, sorted.
+    type XkbTypeSig = (u8, Vec<(u8, u8)>);
+
+    /// Our XKB GetMap reply, decoded per key.
+    struct XkbMapView {
+        min: u8,
+        max: u8,
+        types: Vec<XkbTypeSig>,
+        keys: std::collections::BTreeMap<u8, XkbKeyRow>,
+    }
+
+    impl XkbMapView {
+        /// The type of group `g` of `kc`, by content (indices are table order).
+        fn type_sig(&self, kc: u8, g: usize) -> XkbTypeSig {
+            self.types[usize::from(self.keys[&kc].kt[g])].clone()
+        }
+
+        /// `kc` with its type indices replaced by what the types are.
+        fn key_by_content(&self, kc: u8) -> (XkbKeyRow, Vec<XkbTypeSig>) {
+            let mut row = self.keys.get(&kc).cloned().unwrap_or_default();
+            let sigs = (0..usize::from(row.gi & 0x0f))
+                .map(|g| self.type_sig(kc, g))
+                .collect();
+            row.kt = [0; 4];
+            (row, sigs)
+        }
+    }
+
+    /// Decode an XKB GetMap reply (XKBproto.h `xkbGetMapReply`, sections in
+    /// xkb.xml order) as the golden probe prints it.
+    fn decode_xkb_get_map(r: &[u8]) -> XkbMapView {
+        let pad4 = |n: usize| n.div_ceil(4) * 4;
+        let (min, max) = (r[10], r[11]);
+        let present = u16::from_le_bytes([r[12], r[13]]);
+        let mut keys: std::collections::BTreeMap<u8, XkbKeyRow> =
+            (min..=max).map(|kc| (kc, XkbKeyRow::default())).collect();
+        let mut off = 40;
+        let mut types = Vec::new();
+        if present & 0x01 != 0 {
+            for _ in 0..r[15] {
+                let levels = r[off + 4];
+                let n = usize::from(r[off + 5]);
+                let preserve = r[off + 6] != 0;
+                let mut entries: Vec<(u8, u8)> = (0..n)
+                    .filter(|i| r[off + 8 + 8 * i] != 0)
+                    .map(|i| (r[off + 8 + 8 * i + 1], r[off + 8 + 8 * i + 2]))
+                    .collect();
+                entries.sort_unstable();
+                types.push((levels, entries));
+                off += 8 + 8 * n + if preserve { 4 * n } else { 0 };
+            }
+        }
+        if present & 0x02 != 0 {
+            for i in 0..r[20] {
+                let kc = r[17] + i;
+                let k = keys.get_mut(&kc).unwrap();
+                k.kt.copy_from_slice(&r[off..off + 4]);
+                k.gi = r[off + 4];
+                k.width = r[off + 5];
+                let n = usize::from(u16::from_le_bytes([r[off + 6], r[off + 7]]));
+                k.syms = r[off + 8..off + 8 + 4 * n]
+                    .chunks_exact(4)
+                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                off += 8 + 4 * n;
+            }
+        }
+        if present & 0x10 != 0 {
+            let counts: Vec<u8> = r[off..off + usize::from(r[24])].to_vec();
+            off += pad4(usize::from(r[24]));
+            for (i, &n) in counts.iter().enumerate() {
+                let kc = r[21] + u8::try_from(i).unwrap();
+                for _ in 0..n {
+                    let mut a = [0u8; 8];
+                    a.copy_from_slice(&r[off..off + 8]);
+                    keys.get_mut(&kc).unwrap().acts.push(a);
+                    off += 8;
+                }
+            }
+        }
+        if present & 0x20 != 0 {
+            for _ in 0..r[27] {
+                keys.get_mut(&r[off]).unwrap().beh = (r[off + 1], r[off + 2]);
+                off += 4;
+            }
+        }
+        if present & 0x40 != 0 {
+            let vmods = u16::from_le_bytes([r[38], r[39]]);
+            off += pad4(vmods.count_ones() as usize);
+        }
+        if present & 0x08 != 0 {
+            for i in 0..usize::from(r[30]) {
+                keys.get_mut(&r[off + 2 * i]).unwrap().expl = r[off + 2 * i + 1];
+            }
+            off += pad4(2 * usize::from(r[30]));
+        }
+        if present & 0x04 != 0 {
+            for i in 0..usize::from(r[33]) {
+                keys.get_mut(&r[off + 2 * i]).unwrap().mm = r[off + 2 * i + 1];
+            }
+            off += pad4(2 * usize::from(r[33]));
+        }
+        if present & 0x80 != 0 {
+            for _ in 0..r[36] {
+                keys.get_mut(&r[off]).unwrap().vmm = u16::from_le_bytes([r[off + 2], r[off + 3]]);
+                off += 4;
+            }
+        }
+        assert_eq!(off, r.len(), "GetMap reply fully decoded");
+        XkbMapView {
+            min,
+            max,
+            types,
+            keys,
+        }
+    }
+
+    fn xkb_map_view(backend: &KmsBackend) -> XkbMapView {
+        decode_xkb_get_map(&crate::kms::xkb::reply_get_map(&backend.core.xkb_keymap.0))
+    }
+
+    /// XKB GetControls through the core loop (which owns the per-key repeat).
+    fn xkb_get_controls(
+        state: &mut yserver_core::server::ServerState,
+        backend: &mut KmsBackend,
+        peer: &mut std::os::unix::net::UnixStream,
+    ) -> Vec<u8> {
+        kbd_map_request(state, backend, 136, 6, &[0x00, 0x01, 0, 0]);
+        let r = kbd_map_drain(peer);
+        assert_eq!((r[0], r.len()), (1, 92), "GetControls reply");
+        r
+    }
+
+    fn per_key_repeat(controls: &[u8], kc: u8) -> u8 {
+        (controls[60 + usize::from(kc >> 3)] >> (kc & 7)) & 1
+    }
+
+    /// Does any action in `acts` change modifiers (SetMods/LatchMods/LockMods)?
+    fn has_mod_action(acts: &[[u8; 8]]) -> bool {
+        acts.iter().any(|a| (1..=3).contains(&a[0]))
+    }
+
+    /// Golden (Xvfb 21.1.24): what an XKB client sees after ChangeKeyboardMapping,
+    /// the events in arrival order and XKB GetMap/GetControls of the changed keys.
+    ///
+    /// Where our GetMap encoder differs from Xorg's for reasons that predate
+    /// #171, the comparison is by meaning, not bytes:
+    /// - device id: yserver's one XKB keyboard is device 1 in every XKB reply
+    ///   and event (Xorg: master 3, plus one MapNotify per slave 5/7, which
+    ///   the listener sees as extra events of other devices). The listener's
+    ///   core-keyboard (dev 3) events are what we match.
+    /// - type indices: our KeyTypes table is derived and deduplicated, so a
+    ///   type is compared by content. Xorg type index -> our type content is
+    ///   learned from the pristine keymaps (the golden's `-` rows).
+    /// - actions: our GetMap carries only modifier actions (GH #59), so the
+    ///   check is "has a SetMods/LatchMods/LockMods action".
+    /// - explicit/behaviors: our GetMap sends none. Xorg's are unchanged by
+    ///   every case (asserted), as are ours.
+    /// - ControlsNotify.enabledControls is our GetControls' value.
+    #[test]
+    fn xkb_view_of_change_keyboard_mapping_matches_xorg() {
+        use std::collections::HashMap;
+        let cases = parse_xkb_ckm_golden(include_str!(
+            "../testdata/xorg-xkb-change-keyboard-mapping.txt"
+        ));
+        assert_eq!(
+            cases.iter().filter(|c| !c.name.starts_with("edge")).count(),
+            26,
+            "golden parsed"
+        );
+        let mut failures: Vec<String> = Vec::new();
+
+        // Xorg type index -> our type. The four required types (0..=3) are
+        // the same in every keymap; the others are per keymap.
+        let mut type_of: HashMap<(String, u8), XkbTypeSig> = HashMap::new();
+        for case in &cases {
+            let Some(step) = case.steps.first() else {
+                continue;
+            };
+            let pristine = decode_xkb_get_map(&crate::kms::xkb::reply_get_map(
+                &crate::kms::xkb::golden_keymap(&case.layout, case.options.as_deref()),
+            ));
+            for (kc, row) in &step.before {
+                let ours = &pristine.keys[kc];
+                if (ours.gi & 0x0f, ours.width, &ours.syms) != (row.gi & 0x0f, row.width, &row.syms)
+                {
+                    failures.push(format!(
+                        "{}: pristine keycode {kc}: ours gi={} w={} {:x?}, xorg gi={} w={} {:x?}",
+                        case.name, ours.gi, ours.width, ours.syms, row.gi, row.width, row.syms
+                    ));
+                    continue;
+                }
+                for g in 0..usize::from(row.gi & 0x0f) {
+                    let scope = if row.kt[g] < 4 {
+                        String::new()
+                    } else {
+                        case.layout.clone()
+                    };
+                    let sig = pristine.type_sig(*kc, g);
+                    let known = type_of
+                        .entry((scope, row.kt[g]))
+                        .or_insert_with(|| sig.clone());
+                    if *known != sig {
+                        failures.push(format!(
+                            "{}: xorg type {} is {known:?} elsewhere but {sig:?} on keycode {kc}",
+                            case.name, row.kt[g]
+                        ));
+                    }
+                }
+            }
+        }
+
+        for case in &cases {
+            let mut backend = kbd_map_backend(&case.layout, case.options.as_deref());
+            let mut state = yserver_core::server::ServerState::new();
+            let mut listener = kbd_map_client_id(&mut state, 5);
+            let mut plain = kbd_map_client_id(&mut state, 6);
+            // XkbSelectEvents(all) on the core keyboard, as the probe does.
+            state.xkb_select_event_masks.insert((5, 0x0100), 0x0fff);
+            yserver_core::core_loop::xkb_layout::seed_keyboard_auto_repeats(&mut state, &backend);
+            for step in &case.steps {
+                let what = format!(
+                    "{} ckm:{}:{}:{}",
+                    case.name, step.first, step.kpk, step.count
+                );
+                let before = xkb_map_view(&backend);
+                let ctl_before = xkb_get_controls(&mut state, &mut backend, &mut listener);
+                let _ = kbd_map_drain(&mut plain);
+                kbd_map_request(
+                    &mut state,
+                    &mut backend,
+                    100,
+                    step.count,
+                    &change_kbd_map_body(step.first, step.kpk, &step.syms),
+                );
+                let got = kbd_map_drain(&mut listener);
+                let got_plain = kbd_map_drain(&mut plain);
+                let after = xkb_map_view(&backend);
+                let ctl_after = xkb_get_controls(&mut state, &mut backend, &mut listener);
+                if !step.ok {
+                    if got.first() != Some(&0) || got.len() != 32 || !got_plain.is_empty() {
+                        failures.push(format!("{what}: expected one error, got {got:x?}"));
+                    }
+                    if before.keys != after.keys {
+                        failures.push(format!("{what}: refused request changed the map"));
+                    }
+                    continue;
+                }
+
+                // Events, in arrival order.
+                let ours: Vec<&[u8]> = got.chunks(32).collect();
+                if ours.len() != step.listener.len() {
+                    failures.push(format!(
+                        "{what}: listener got {} events, xorg {}: {ours:x?}",
+                        ours.len(),
+                        step.listener.len()
+                    ));
+                }
+                for (o, x) in ours.iter().zip(&step.listener) {
+                    let same = match (x[0], x[1]) {
+                        // XKB MapNotify: all but seq/time; device 3 -> our 1.
+                        (0x55, 1) => o[..2] == x[..2] && o[8] == 1 && o[9..] == x[9..],
+                        // XKB ControlsNotify: enabledControls is ours (GetControls).
+                        (0x55, 3) => {
+                            o[..2] == x[..2]
+                                && o[8] == 1
+                                && o[9..16] == x[9..16]
+                                && o[16..20] == ctl_after[56..60]
+                                && o[20..] == x[20..]
+                        }
+                        // Core MappingNotify.
+                        (t, _) if t & 0x7f == 34 => {
+                            o[0] & 0x7f == 34 && o[1] == x[1] && o[4..] == x[4..]
+                        }
+                        other => panic!("unexpected golden event {other:?}"),
+                    };
+                    if !same {
+                        failures.push(format!("{what}: event ours {o:02x?} xorg {x:02x?}"));
+                    }
+                }
+                let ours_plain: Vec<&[u8]> = got_plain.chunks(32).collect();
+                if ours_plain.len() != step.plain.len()
+                    || ours_plain
+                        .iter()
+                        .zip(&step.plain)
+                        .any(|(o, x)| o[0] & 0x7f != x[0] & 0x7f || o[4..] != x[4..])
+                {
+                    failures.push(format!(
+                        "{what}: plain client got {ours_plain:02x?}, xorg {:02x?}",
+                        step.plain
+                    ));
+                }
+
+                // GetMap of every key.
+                if (after.min, after.max) != (8, 255) {
+                    failures.push(format!(
+                        "{what}: keycode range {}..{}, xorg 8..255",
+                        after.min, after.max
+                    ));
+                }
+                for kc in 8..=255u8 {
+                    let Some(want) = step.after.get(&kc) else {
+                        if after.key_by_content(kc) != before.key_by_content(kc) {
+                            failures.push(format!(
+                                "{what}: keycode {kc} changed, xorg left it: {:x?} -> {:x?}",
+                                before.key_by_content(kc),
+                                after.key_by_content(kc)
+                            ));
+                        }
+                        continue;
+                    };
+                    let old = &step.before[&kc];
+                    assert_eq!(
+                        (old.expl, old.beh),
+                        (want.expl, want.beh),
+                        "{what}: xorg explicit/behavior of {kc} unchanged"
+                    );
+                    let got = &after.keys[&kc];
+                    let mut diffs = Vec::new();
+                    if (got.gi & 0x0f, got.width, &got.syms)
+                        != (want.gi & 0x0f, want.width, &want.syms)
+                    {
+                        diffs.push(format!(
+                            "gi/w/syms ours {}/{} {:x?}, xorg {}/{} {:x?}",
+                            got.gi, got.width, got.syms, want.gi, want.width, want.syms
+                        ));
+                    } else {
+                        for g in 0..usize::from(want.gi & 0x0f) {
+                            let scope = if want.kt[g] < 4 {
+                                String::new()
+                            } else {
+                                case.layout.clone()
+                            };
+                            match type_of.get(&(scope, want.kt[g])) {
+                                None => diffs.push(format!(
+                                    "group {g}: xorg type {} not in any pristine key",
+                                    want.kt[g]
+                                )),
+                                Some(sig) if *sig != after.type_sig(kc, g) => diffs.push(format!(
+                                    "group {g}: type ours {:?}, xorg {} = {sig:?}",
+                                    after.type_sig(kc, g),
+                                    want.kt[g]
+                                )),
+                                Some(_) => {}
+                            }
+                        }
+                    }
+                    if has_mod_action(&got.acts) != has_mod_action(&want.acts) {
+                        diffs.push(format!(
+                            "modifier action ours {:02x?}, xorg {:02x?}",
+                            got.acts, want.acts
+                        ));
+                    }
+                    if (got.mm, got.vmm) != (want.mm, want.vmm) {
+                        diffs.push(format!(
+                            "mm/vmm ours {:#x}/{:#x}, xorg {:#x}/{:#x}",
+                            got.mm, got.vmm, want.mm, want.vmm
+                        ));
+                    }
+                    if (got.expl, got.beh) != (before.keys[&kc].expl, before.keys[&kc].beh) {
+                        diffs.push("explicit/behavior changed".into());
+                    }
+                    if !diffs.is_empty() {
+                        failures.push(format!("{what}: keycode {kc}: {}", diffs.join("; ")));
+                    }
+                }
+
+                // Per-key repeat (GetControls).
+                for kc in 8..=255u8 {
+                    let (b, a) = (
+                        per_key_repeat(&ctl_before, kc),
+                        per_key_repeat(&ctl_after, kc),
+                    );
+                    let want = step
+                        .repeats
+                        .iter()
+                        .find(|r| r.0 == kc)
+                        .map_or((b, b), |r| (r.1, r.2));
+                    if (b, a) != want {
+                        failures.push(format!(
+                            "{what}: per-key repeat of {kc}: ours {b}->{a}, xorg {}->{}",
+                            want.0, want.1
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// After ChangeKeyboardMapping the key cooks to the new keysyms, since
+    /// cooking runs on the one edited keymap (golden `one-case-sym`: keycode
+    /// 10 becomes x/X on Xorg).
+    #[test]
+    fn change_keyboard_mapping_reaches_key_cooking() {
+        use yserver_core::host_x11::HostKeyEvent;
+        let mut backend = kbd_map_backend("gb", None);
+        let mut state = yserver_core::server::ServerState::new();
+        let mut peer = kbd_map_client(&mut state);
+        kbd_map_request(
+            &mut state,
+            &mut backend,
+            100,
+            1,
+            &change_kbd_map_body(10, 1, &[0x78]),
+        );
+        let _ = kbd_map_drain(&mut peer);
+        let key = |keycode: u8, pressed: bool| HostKeyEvent {
+            keycode,
+            pressed,
+            state: 0,
+            root_x: 0,
+            root_y: 0,
+            event_x: 0,
+            event_y: 0,
+            time: 0,
+        };
+        let sym = |b: &KmsBackend| {
+            b.core
+                .xkb_state
+                .0
+                .key_get_one_sym(xkbcommon::xkb::Keycode::new(10))
+                .raw()
+        };
+        let _ = backend.cook_host_key(key(10, true));
+        assert_eq!(sym(&backend), 0x78, "x");
+        let _ = backend.cook_host_key(key(10, false));
+        let _ = backend.cook_host_key(key(50, true)); // Shift_L
+        let _ = backend.cook_host_key(key(10, true));
+        assert_eq!(sym(&backend), 0x58, "Shift+x = X");
+    }
+
+    /// XI ChangeDeviceKeyMapping edits the same keymap, so XKB clients get
+    /// the same MapNotify (Xorg: both reach XkbApplyMappingChange).
+    #[test]
+    fn xi_change_device_key_mapping_notifies_xkb_clients() {
+        let mut backend = kbd_map_backend("gb", None);
+        let mut state = yserver_core::server::ServerState::new();
+        let mut peer = kbd_map_client(&mut state);
+        state.xkb_select_event_masks.insert((5, 0x0100), 0x0002);
+        let mut body = vec![3, 12, 2, 1];
+        for s in [0x33u32, 0xa3] {
+            body.extend_from_slice(&s.to_le_bytes());
+        }
+        kbd_map_request(&mut state, &mut backend, 137, 25, &body);
+        let ev = kbd_map_drain(&mut peer);
+        let map_notify = ev
+            .chunks(32)
+            .find(|e| e[0] == 85 && e[1] == 1)
+            .expect("XkbMapNotify");
+        // changed=KeySyms|KeyActions over keycode 12 only, range 8..255.
+        assert_eq!(&map_notify[10..20], &[0x12, 0, 8, 255, 0, 0, 12, 1, 12, 1]);
+        let view = xkb_map_view(&backend);
+        assert_eq!(view.keys[&12].syms, vec![0x33, 0xa3, 0, 0]);
     }
 }

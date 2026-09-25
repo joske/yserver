@@ -1,13 +1,17 @@
 use xkbcommon::xkb::{Keycode, Keymap};
 
-/// Clamp an xkbcommon keymap's keycode range into the X11 CARD8 `[8, 255]`
-/// range used on the wire, guaranteeing `min <= max`.
+/// The XKB keycode range of `keymap` as X11 sees it: from 8, the X minimum
+/// and the minimum the keymap text declares (`minimum = 8;`), to its highest
+/// keycode clamped to CARD8. xkbcommon's own minimum is the lowest *named*
+/// keycode (9 for evdev, which names no keycode 8), and it moves when a
+/// mapping change names keycode 8; Xorg's stays at 8 (captured MapNotify
+/// `min=8`), matching the core range, and so no mapping change ever needs a
+/// NewKeyboardNotify for it.
 pub(super) fn clamped_keycode_bounds(keymap: &Keymap) -> (u8, u8) {
-    let min = u8::try_from(keymap.min_keycode().raw()).unwrap_or(8).max(8);
     let max = u8::try_from(keymap.max_keycode().raw().min(255))
         .unwrap_or(255)
-        .max(min);
-    (min, max)
+        .max(8);
+    (8, max)
 }
 
 /// Core (`GetKeyboardMapping`) view of an XKB keymap, laid out exactly as
@@ -65,17 +69,12 @@ fn key_groups(keymap: &Keymap, kc_raw: u8) -> Vec<Vec<u32>> {
         .collect()
 }
 
-/// Port of Xorg's `XkbGetCoreMap` over an xkbcommon keymap plus `ChangeKeyboardMapping` keys.
-pub(super) fn core_keyboard_map(keymap: &Keymap, overrides: &CoreMapOverrides) -> CoreKeyMap {
+/// Port of Xorg's `XkbGetCoreMap` over an xkbcommon keymap.
+pub(super) fn core_keyboard_map(keymap: &Keymap) -> CoreKeyMap {
     // The connection setup's keycode range (Xorg: 8..=255), not xkbcommon's.
     let (min_kc, max_kc) = (8u8, 255u8);
     // Per key: one Vec per group (≤ 4), each group's own level count wide.
-    let groups: Vec<Vec<Vec<u32>>> = (min_kc..=max_kc)
-        .map(|kc| match overrides.get(&kc) {
-            Some(key) => key.iter().map(|g| g.syms.clone()).collect(),
-            None => key_groups(keymap, kc),
-        })
-        .collect();
+    let groups: Vec<Vec<Vec<u32>>> = (min_kc..=max_kc).map(|kc| key_groups(keymap, kc)).collect();
 
     // Size pass (XkbGetCoreMap "determine sizes").
     let (mut max_syms, mut max_g1_width, mut max_groups) = (0usize, 0usize, 0usize);
@@ -168,11 +167,15 @@ pub(super) fn core_keyboard_map(keymap: &Keymap, overrides: &CoreMapOverrides) -
     }
 }
 
+/// The four types every XKB keymap has (`XkbNumRequiredTypes`), the only
+/// ones `XkbKeyTypesForCoreSymbols` assigns.
+const REQUIRED_TYPES: [&str; 4] = ["ONE_LEVEL", "TWO_LEVEL", "ALPHABETIC", "KEYPAD"];
+
 /// An XKB key type as `XkbKeyTypesForCoreSymbols` compares it.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub(crate) struct CoreKeyType {
-    /// Identity: the type name, or a derived-table index for an unnamed type.
-    name: String,
+struct CoreKeyType {
+    /// Identity: the type name (`None` when it couldn't be determined).
+    name: Option<String>,
     num_levels: u8,
     /// One of the four required types (index ≤ `XkbLastRequiredType`).
     required: bool,
@@ -181,22 +184,21 @@ pub(crate) struct CoreKeyType {
 impl CoreKeyType {
     fn required(name: &str) -> Self {
         Self {
-            name: name.to_owned(),
+            name: Some(name.to_owned()),
             num_levels: if name == "ONE_LEVEL" { 1 } else { 2 },
             required: true,
         }
     }
-}
 
-/// One group of a key rewritten by `ChangeKeyboardMapping`.
-#[derive(Clone, Debug)]
-pub(crate) struct CoreKeyGroup {
-    ty: CoreKeyType,
-    syms: Vec<u32>,
+    fn named(name: Option<String>, num_levels: u8) -> Self {
+        let required = name.as_deref().is_some_and(|n| REQUIRED_TYPES.contains(&n));
+        Self {
+            name,
+            num_levels,
+            required,
+        }
+    }
 }
-
-/// Keys rewritten by `ChangeKeyboardMapping`, in XKB form (Xorg keeps them in its XKB map).
-pub(crate) type CoreMapOverrides = std::collections::HashMap<u8, Vec<CoreKeyGroup>>;
 
 /// Port of Xorg's `XkbConvertCase` (xkb/xkbUtils.c): `(lower, upper)`.
 fn convert_case(sym: u32) -> (u32, u32) {
@@ -309,51 +311,161 @@ pub(super) fn explicit_type_names(
     out
 }
 
-/// Xorg's explicit type mask + types: xkbcomp also marks >2-level and lower/upper ALPHABETIC auto types explicit (verified on Xvfb us/gb/de/us,ru).
-fn key_explicit_types(
-    keymap: &Keymap,
-    kc: u8,
-    names: Option<&[Option<String>; 4]>,
-    table: &KeyTypeTable,
-) -> (u8, [CoreKeyType; 4]) {
-    let mut explicit = 0u8;
-    let mut types: [CoreKeyType; 4] = std::array::from_fn(|_| CoreKeyType::required("TWO_LEVEL"));
-    for (g, syms) in key_groups(keymap, kc).iter().enumerate() {
-        let levels = u8::try_from(syms.len()).unwrap_or(u8::MAX);
-        let named = names.and_then(|n| n[g].clone());
-        let ty = if let Some(name) = named {
-            let required = matches!(
-                name.as_str(),
-                "ONE_LEVEL" | "TWO_LEVEL" | "ALPHABETIC" | "KEYPAD"
-            );
-            Some(CoreKeyType {
-                name,
-                num_levels: levels,
-                required,
-            })
-        } else if levels > 2 {
-            Some(CoreKeyType {
-                name: format!(
-                    "#{}",
-                    table.type_index_for(kc, u8::try_from(g).unwrap_or(0))
-                ),
-                num_levels: levels,
-                required: false,
-            })
-        } else if levels == 2
-            && convert_case(syms[0]).1 != syms[0]
-            && convert_case(syms[1]).0 != syms[1]
-        {
-            Some(CoreKeyType::required("ALPHABETIC"))
-        } else {
-            None
-        };
-        if let Some(ty) = ty {
-            explicit |= 1 << g;
-            types[g] = ty;
+/// Xorg's explicit-type mask (`server->explicit & XkbExplicitKeyTypesMask`,
+/// bit g = group g+1) for every key of a keymap compiled from RMLVO:
+/// xkbcomp marks the types written in the symbols, and also every >2-level
+/// group and every lower/upper pair it typed ALPHABETIC itself (verified on
+/// Xvfb us/gb/de/us,ru, the `expl=` of the #171 goldens). xkbcommon doesn't
+/// keep this, and a mapping change must not change it (Xorg leaves
+/// `explicit` alone), so it is taken once per loaded keymap and carried
+/// across edits by [`crate::kms::core::KmsCore`].
+pub(super) fn explicit_type_masks(keymap: &Keymap) -> [u8; 256] {
+    let names = explicit_type_names(keymap);
+    let mut masks = [0u8; 256];
+    for kc in 8..=255u8 {
+        for (g, syms) in key_groups(keymap, kc).iter().enumerate() {
+            let named = names.get(&kc).is_some_and(|n| n[g].is_some());
+            let alphabetic = syms.len() == 2
+                && convert_case(syms[0]).1 != syms[0]
+                && convert_case(syms[1]).0 != syms[1];
+            if named || syms.len() > 2 || alphabetic {
+                masks[usize::from(kc)] |= 1 << g;
+            }
         }
     }
-    (explicit, types)
+    masks
+}
+
+/// Auto types xkbcommon (and xkbcomp) pick for a key without `type=`; an
+/// implicitly typed key has one of these.
+const AUTO_TYPES: [&str; 11] = [
+    "ONE_LEVEL",
+    "TWO_LEVEL",
+    "ALPHABETIC",
+    "KEYPAD",
+    "FOUR_LEVEL",
+    "FOUR_LEVEL_ALPHABETIC",
+    "FOUR_LEVEL_SEMIALPHABETIC",
+    "FOUR_LEVEL_KEYPAD",
+    "EIGHT_LEVEL",
+    "EIGHT_LEVEL_ALPHABETIC",
+    "EIGHT_LEVEL_SEMIALPHABETIC",
+];
+
+/// What a key type does, read back through xkbcommon: per level, the
+/// modifier masks that select it.
+fn type_behaviour(keymap: &Keymap, kc: u32, group: u32) -> Vec<Vec<u32>> {
+    let key = Keycode::new(kc);
+    let mut masks = [0u32; 64];
+    (0..keymap.num_levels_for_key(key, group))
+        .map(|level| {
+            let n = keymap.key_get_mods_for_level(key, group, level, &mut masks);
+            let mut m = masks[..n].to_vec();
+            m.sort_unstable();
+            m
+        })
+        .collect()
+}
+
+/// The type names of `groups` (keycode, group) whose type isn't written in
+/// the keymap text. The keymap's types are compiled onto probe keys and each
+/// group gets the type that behaves the same, an auto type first, since
+/// those are what an implicit type is. Groups no type matches are left out.
+fn implicit_type_names(
+    keymap: &Keymap,
+    groups: &[(u8, u32)],
+) -> std::collections::HashMap<(u8, u32), String> {
+    use crate::kms::xkb_edit;
+    let mut out = std::collections::HashMap::new();
+    let text = keymap.get_as_string(xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1);
+    let probed = xkb_edit::type_names(&text)
+        .and_then(|names| xkb_edit::add_type_probes(&text, &names).map(|(t, kcs)| (names, t, kcs)));
+    let (names, probe_text, probe_kcs) = match probed {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("xkb: can't probe the keymap's types: {e}");
+            return out;
+        }
+    };
+    let ctx = xkbcommon::xkb::Context::new(xkbcommon::xkb::CONTEXT_NO_FLAGS);
+    let Some(probe) = Keymap::new_from_string(
+        &ctx,
+        probe_text,
+        xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1,
+        xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
+    ) else {
+        log::warn!("xkb: the type probe keymap doesn't compile");
+        return out;
+    };
+    let behaviours: Vec<Vec<Vec<u32>>> = probe_kcs
+        .iter()
+        .map(|&kc| type_behaviour(&probe, kc, 0))
+        .collect();
+    for &(kc, g) in groups {
+        let want = type_behaviour(keymap, u32::from(kc), g);
+        let matching = || {
+            names
+                .iter()
+                .zip(&behaviours)
+                .filter(|(_, b)| **b == want)
+                .map(|(n, _)| n)
+        };
+        let best = matching()
+            .find(|n| AUTO_TYPES.contains(&n.as_str()))
+            .or_else(|| matching().next());
+        match best {
+            Some(name) => {
+                out.insert((kc, g), name.clone());
+            }
+            None => log::warn!("xkb: no key type behaves like keycode {kc} group {g}"),
+        }
+    }
+    out
+}
+
+/// The types of the explicitly typed (protected) groups of each key in
+/// `keys`, as `XkbKeyTypesForCoreSymbols` reads them: `explicit` bits over
+/// the key's groups, each with its type name and level count.
+fn protected_types(
+    keymap: &Keymap,
+    explicit: &[u8; 256],
+    keys: &[u8],
+) -> std::collections::HashMap<u8, [CoreKeyType; 4]> {
+    let names = explicit_type_names(keymap);
+    let groups_of = |kc: u8| key_groups(keymap, kc);
+    let unnamed: Vec<(u8, u32)> = keys
+        .iter()
+        .flat_map(|&kc| {
+            let n = groups_of(kc).len();
+            (0..n)
+                .filter(move |&g| explicit[usize::from(kc)] & (1 << g) != 0)
+                .filter(|&g| names.get(&kc).is_none_or(|t| t[g].is_none()))
+                .map(move |g| (kc, u32::try_from(g).unwrap_or(0)))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let implicit = if unnamed.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        implicit_type_names(keymap, &unnamed)
+    };
+    keys.iter()
+        .map(|&kc| {
+            let mut types: [CoreKeyType; 4] =
+                std::array::from_fn(|_| CoreKeyType::required("TWO_LEVEL"));
+            for (g, syms) in groups_of(kc).iter().enumerate() {
+                if explicit[usize::from(kc)] & (1 << g) == 0 {
+                    continue;
+                }
+                let name = names
+                    .get(&kc)
+                    .and_then(|t| t[g].clone())
+                    .or_else(|| implicit.get(&(kc, u32::try_from(g).unwrap_or(0))).cloned());
+                types[g] = CoreKeyType::named(name, u8::try_from(syms.len()).unwrap_or(u8::MAX));
+            }
+            (kc, types)
+        })
+        .collect()
 }
 
 /// Port of Xorg's `XkbKeyTypesForCoreSymbols` (xkb/XKBMisc.c, §12.2/§12.4): group count + symbols `groupsWidth` apart.
@@ -442,7 +554,7 @@ fn key_types_for_core_symbols(
                 types[i] = CoreKeyType::required("ONE_LEVEL");
             }
         }
-        if unprotected(i) && types[i].name == "TWO_LEVEL" {
+        if unprotected(i) && types[i].name.as_deref() == Some("TWO_LEVEL") {
             if is_keypad(out[b]) || is_keypad(out[b + 1]) {
                 types[i] = CoreKeyType::required("KEYPAD");
             } else if convert_case(out[b]) == (out[b], out[b + 1]) {
@@ -503,50 +615,125 @@ fn key_types_for_core_symbols(
     (n_groups, out)
 }
 
-/// Port of Xorg's `XkbUpdateKeyTypesFromCore` (xkb/xkbUtils.c) for one `ChangeKeyboardMapping`.
-pub(super) fn apply_core_mapping_change(
+/// Port of Xorg's `XkbUpdateKeyTypesFromCore` (xkb/xkbUtils.c) for one
+/// `ChangeKeyboardMapping`: each changed key's new groups (type + keysyms),
+/// to be written into the keymap (`kms::xkb_edit::set_key`). `explicit` is
+/// Xorg's explicit-type mask ([`explicit_type_masks`]); protected groups keep
+/// their type, the others get the required type the keysyms call for.
+/// Every group carries its type name, so the compiler takes the type Xorg
+/// chose rather than guessing its own; a type that couldn't be named is
+/// left to the compiler.
+pub(super) fn core_mapping_change(
     keymap: &Keymap,
-    overrides: &mut CoreMapOverrides,
+    explicit: &[u8; 256],
     first: u8,
     kpk: u8,
     syms: &[u32],
-) {
+) -> Vec<(u8, Vec<crate::kms::xkb_edit::KeyGroupSpec>)> {
     let kpk = usize::from(kpk);
     if kpk == 0 {
-        return;
+        return Vec::new();
     }
-    let names = explicit_type_names(keymap);
-    let table = key_types_from_keymap(keymap);
-    for (i, row) in syms.chunks_exact(kpk).enumerate() {
-        let Some(kc) = u8::try_from(usize::from(first) + i).ok() else {
-            break;
-        };
-        let (explicit, base_types) = key_explicit_types(keymap, kc, names.get(&kc), &table);
-        let mut types = base_types;
-        if let Some(key) = overrides.get(&kc) {
-            for (t, g) in types.iter_mut().zip(key) {
-                *t = g.ty.clone();
-            }
+    let rows: Vec<(u8, &[u32])> = syms
+        .chunks_exact(kpk)
+        .enumerate()
+        .map_while(|(i, row)| Some((u8::try_from(usize::from(first) + i).ok()?, row)))
+        .collect();
+    let keys: Vec<u8> = rows.iter().map(|(kc, _)| *kc).collect();
+    let mut protected = protected_types(keymap, explicit, &keys);
+    rows.into_iter()
+        .map(|(kc, row)| {
+            let mut types = protected
+                .remove(&kc)
+                .unwrap_or_else(|| std::array::from_fn(|_| CoreKeyType::required("TWO_LEVEL")));
+            let mask = explicit[usize::from(kc)] & 0x0f;
+            let (n_groups, xkb_syms) = key_types_for_core_symbols(row, mask, &mut types);
+            // XkbChangeTypesOfKey: one width (the widest type) for every group.
+            let width = types[..n_groups]
+                .iter()
+                .map(|t| usize::from(t.num_levels))
+                .max()
+                .unwrap_or(0);
+            let groups = types[..n_groups]
+                .iter()
+                .enumerate()
+                .map(|(g, ty)| crate::kms::xkb_edit::KeyGroupSpec {
+                    type_name: ty.name.clone(),
+                    keysyms: (0..usize::from(ty.num_levels))
+                        .map(|l| xkb_syms.get(g * width + l).copied().unwrap_or(0))
+                        .collect(),
+                })
+                .collect();
+            (kc, groups)
+        })
+        .collect()
+}
+
+/// Whether each key in `keys` auto-repeats in `keymap` as Xorg's
+/// `XkbUpdateDescActions` derives `per_key_repeat` from the interprets: an
+/// explicit `repeat=` wins, else the level-1 interpret's `repeat`, else the
+/// key repeats. xkbcommon compiles the same rule except for a key whose
+/// level 1 is empty: it matches no interpret there (and leaves the key not
+/// repeating) where Xorg matches the `Any` interprets against `NoSymbol`.
+/// Those keys are read from a compile with that level set to `VoidSymbol`,
+/// which only the `Any` interprets match too. A key without keysyms repeats
+/// (Xorg: no interpret found).
+pub(super) fn key_auto_repeats(keymap: &Keymap, keys: &[u8]) -> Vec<(u8, bool)> {
+    let key = |kc: u8| Keycode::new(u32::from(kc));
+    let empty_level1: Vec<String> = keys
+        .iter()
+        .filter(|&&kc| {
+            keymap.num_layouts_for_key(key(kc)) > 0
+                && keymap.key_get_syms_by_level(key(kc), 0, 0).is_empty()
+        })
+        .filter_map(|&kc| keymap.key_get_name(key(kc)).map(str::to_owned))
+        .collect();
+    let voided = if empty_level1.is_empty() {
+        None
+    } else {
+        let text = keymap.get_as_string(xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1);
+        let compiled = crate::kms::xkb_edit::void_empty_level1(&text, &empty_level1)
+            .ok()
+            .and_then(|t| {
+                let ctx = xkbcommon::xkb::Context::new(xkbcommon::xkb::CONTEXT_NO_FLAGS);
+                Keymap::new_from_string(
+                    &ctx,
+                    t,
+                    xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1,
+                    xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
+                )
+            });
+        if compiled.is_none() {
+            log::warn!("xkb: can't derive the auto-repeat of keys with an empty level 1");
         }
-        let (n_groups, xkb_syms) = key_types_for_core_symbols(row, explicit, &mut types);
-        // XkbChangeTypesOfKey: one width (the widest type) for every group.
-        let width = types[..n_groups]
-            .iter()
-            .map(|t| usize::from(t.num_levels))
-            .max()
-            .unwrap_or(0);
-        let groups = types[..n_groups]
-            .iter()
-            .enumerate()
-            .map(|(g, ty)| CoreKeyGroup {
-                ty: ty.clone(),
-                syms: (0..usize::from(ty.num_levels))
-                    .map(|l| xkb_syms.get(g * width + l).copied().unwrap_or(0))
-                    .collect(),
-            })
-            .collect();
-        overrides.insert(kc, groups);
+        compiled
+    };
+    keys.iter()
+        .map(|&kc| {
+            let repeats = if keymap.num_layouts_for_key(key(kc)) == 0 {
+                true
+            } else if keymap.key_get_syms_by_level(key(kc), 0, 0).is_empty() {
+                voided.as_ref().is_none_or(|v| v.key_repeats(key(kc)))
+            } else {
+                keymap.key_repeats(key(kc))
+            };
+            (kc, repeats)
+        })
+        .collect()
+}
+
+/// The per-key auto-repeat bitmap of `keymap` (keycode N → byte N>>3,
+/// bit N&7), keycodes 8..=255 (Xorg `XkbFinishInit`: the keymap's
+/// `per_key_repeat`).
+pub(super) fn keymap_auto_repeats(keymap: &Keymap) -> [u8; 32] {
+    let mut bits = [0u8; 32];
+    let keys: Vec<u8> = (8..=255).collect();
+    for (kc, repeats) in key_auto_repeats(keymap, &keys) {
+        if repeats {
+            bits[usize::from(kc >> 3)] |= 1 << (kc & 7);
+        }
     }
+    bits
 }
 
 /// Per-key data extracted from `xkbcommon::Keymap`, ready to lay
@@ -854,6 +1041,11 @@ pub(super) fn reply_use_extension() -> Vec<u8> {
     r
 }
 
+/// The XKB controls GetControls reports enabled: RepeatKeys (bit 0), so
+/// xkbcommon enables auto-repeat by default. Also the `enabledControls` of
+/// our ControlsNotify.
+pub(super) const XKB_ENABLED_CONTROLS: u32 = 0x0000_0001;
+
 /// XKB GetControls reply (minor=6). Fixed 92 bytes
 /// (`sz_xkbGetControlsReply`). Field offsets follow `xkbGetControlsReply`
 /// in `/usr/include/X11/extensions/XKBproto.h`:
@@ -891,9 +1083,7 @@ pub(super) fn reply_get_controls(keymap: &Keymap) -> Vec<u8> {
     // Repeat delay = 500ms, interval = 33ms (≈30 Hz)
     r[20..22].copy_from_slice(&500_u16.to_le_bytes());
     r[22..24].copy_from_slice(&33_u16.to_le_bytes());
-    // EnabledControls: RepeatKeys (bit 0) | PerKeyRepeat — pick
-    // RepeatKeys so xkbcommon enables auto-repeat by default.
-    r[56..60].copy_from_slice(&0x0000_0001_u32.to_le_bytes());
+    r[56..60].copy_from_slice(&XKB_ENABLED_CONTROLS.to_le_bytes());
     r
 }
 
@@ -4066,13 +4256,11 @@ mod tests {
 
         assert_eq!(r[0], 1, "type = Reply");
         assert_eq!(r[1], 1, "deviceID");
-        // min/max from the keymap, clamped into [8,255].
-        let min_kc = u8::try_from(km.min_keycode().raw()).unwrap_or(8).max(8);
-        let max_kc = u8::try_from(km.max_keycode().raw().min(255))
-            .unwrap_or(255)
-            .max(min_kc);
-        assert_eq!(r[8], min_kc, "minKeyCode @8");
-        assert_eq!(r[9], max_kc, "maxKeyCode @9");
+        // Xorg's evdev keycode range, 8..=255 (the XKB events of
+        // testdata/xorg-xkb-change-keyboard-mapping.txt: min=8 max=255), not
+        // xkbcommon's lowest named keycode (9).
+        assert_eq!(r[8], 8, "minKeyCode @8");
+        assert_eq!(r[9], 255, "maxKeyCode @9");
         assert_eq!(r[10], 1, "loaded = TRUE (BOOL) @10");
         assert_eq!(r[11], 0, "newKeyboard = FALSE @11");
         assert_eq!(
@@ -4413,7 +4601,7 @@ mod tests {
     /// Diff our core map against an Xorg dump, key by key; returns the mismatches.
     fn core_map_diffs(km: &xkbcommon::xkb::Keymap, golden: &str) -> Vec<String> {
         let (min, width, rows) = parse_core_golden(golden);
-        let ours = core_keyboard_map(km, &CoreMapOverrides::new());
+        let ours = core_keyboard_map(km);
         let mut diffs = Vec::new();
         if (ours.min_keycode, ours.width) != (min, width) {
             diffs.push(format!(

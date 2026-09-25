@@ -17,12 +17,5 @@ pub(crate) mod render_node;
 pub(crate) mod scanout_route;
 pub mod vk;
 pub(super) mod xkb;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "#171 phases 2/3 build ChangeKeyboardMapping and SetModifierMapping edits with it"
-    )
-)]
 pub(super) mod xkb_edit;
 pub(crate) mod xshmfence;

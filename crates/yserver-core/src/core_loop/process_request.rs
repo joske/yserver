@@ -19452,14 +19452,32 @@ fn handle_xi2_request(
             // Without this the round-trip silently dropped the change
             // (XTS XChangeDeviceKeyMapping-3).
             let kpk = *body.get(2).unwrap_or(&0);
-            apply_keymap_change(
-                state,
-                backend,
-                first,
-                kpk,
-                count,
-                &body[4.min(body.len())..],
-            );
+            // Xorg XkbApplyMappingChange changes and notifies nothing for
+            // zero keys.
+            let xkb_change = if count == 0 {
+                None
+            } else {
+                apply_keymap_change(
+                    state,
+                    backend,
+                    first,
+                    kpk,
+                    count,
+                    &body[4.min(body.len())..],
+                )
+            };
+            // Same XKB notifications as the core request (Xorg: both reach
+            // XkbApplyMappingChange): MapNotify first, ControlsNotify last.
+            let xkb_event_base = backend.xkb_info().map_or(0, |(_maj, ev, _err)| ev);
+            if let Some(change) = &xkb_change {
+                crate::core_loop::xkb_layout::send_keyboard_mapping_map_notify(
+                    state,
+                    xkb_event_base,
+                    change,
+                    first,
+                    count,
+                );
+            }
             // ChangeDeviceKeyMapping is void (no reply), so the event
             // ordering question is moot: send to originator + others.
             // request_kind=1 = MappingKeyboard.
@@ -19484,6 +19502,13 @@ fn handle_xi2_request(
             crate::core_loop::xi1_focus::emit_device_mapping_notify(
                 state, client_id, dev, 1, first, count,
             );
+            if let Some(change) = &xkb_change {
+                crate::core_loop::xkb_layout::apply_keyboard_mapping_repeats(
+                    state,
+                    xkb_event_base,
+                    change,
+                );
+            }
             debug!(
                 "client {} #{} XI1 ChangeDeviceKeyMapping device={dev}",
                 client_id.0, sequence.0
@@ -20617,6 +20642,12 @@ fn handle_xkb_request(
     if let Some(mut bytes) = reply {
         if bytes.len() >= 4 {
             bytes[2..4].copy_from_slice(&sequence.0.to_le_bytes());
+        }
+        // GetControls: the per-key repeat is the core keyboard feedback's
+        // (Xorg keeps XKB `per_key_repeat` and `autoRepeats` in sync), which
+        // lives here, not in the backend.
+        if minor == 6 && bytes.len() >= 92 {
+            bytes[60..92].copy_from_slice(&state.keyboard_control.auto_repeats);
         }
         let Some(client) = state.clients.get_mut(&client_id.0) else {
             return Ok(RequestOutcome::Handled);
@@ -23793,17 +23824,20 @@ fn handle_change_keyboard_control(
                     (0, None) => ctrl.global_auto_repeat = false,
                     (1, None) => ctrl.global_auto_repeat = true,
                     (2, None) => ctrl.global_auto_repeat = true, // DEFAULT_AUTOREPEAT
-                    (0, Some(k)) => {
-                        ctrl.auto_repeats[usize::from(k >> 3)] &= !(1 << (k & 7));
-                    }
-                    (1, Some(k)) => {
-                        ctrl.auto_repeats[usize::from(k >> 3)] |= 1 << (k & 7);
-                    }
-                    (2, Some(k)) => {
+                    (0..=2, Some(k)) => {
                         let i = usize::from(k >> 3);
                         let m = 1 << (k & 7);
-                        ctrl.auto_repeats[i] = (ctrl.auto_repeats[i] & !m)
-                            | (crate::server::DEFAULT_AUTO_REPEATS[i] & m);
+                        match t {
+                            0 => ctrl.auto_repeats[i] &= !m,
+                            1 => ctrl.auto_repeats[i] |= m,
+                            _ => {
+                                ctrl.auto_repeats[i] = (ctrl.auto_repeats[i] & !m)
+                                    | (crate::server::DEFAULT_AUTO_REPEATS[i] & m);
+                            }
+                        }
+                        // Xorg XkbDisableComputedAutoRepeats: a mapping
+                        // change no longer re-derives this key's repeat.
+                        ctrl.auto_repeats_explicit[i] |= m;
                     }
                     _ => return bad_value(state, u32::from(t)),
                 }
@@ -28215,7 +28249,7 @@ fn handle_change_keyboard_mapping(
         return Ok(RequestOutcome::Handled);
     }
     // Body: first_keycode(1) keysyms_per_keycode(1) pad(2) then count × kpk CARD32 keysyms.
-    apply_keymap_change(
+    let xkb_change = apply_keymap_change(
         state,
         backend,
         first_keycode,
@@ -28223,6 +28257,19 @@ fn handle_change_keyboard_mapping(
         count,
         &body[4.min(body.len())..],
     );
+    // Xorg's order (XkbSendNotification): XkbMapNotify, then the core
+    // MappingNotify (XkbSendLegacyMapNotify), then the ControlsNotify of a
+    // per-key repeat change.
+    let xkb_event_base = backend.xkb_info().map_or(0, |(_maj, ev, _err)| ev);
+    if let Some(change) = &xkb_change {
+        crate::core_loop::xkb_layout::send_keyboard_mapping_map_notify(
+            state,
+            xkb_event_base,
+            change,
+            first_keycode,
+            count,
+        );
+    }
     // Server-wide MappingNotify fanout: every connected client sees the
     // same keymap change. We collect ids first to avoid an &/&mut overlap
     // through `state.clients`.
@@ -28230,6 +28277,9 @@ fn handle_change_keyboard_mapping(
     let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
         let _ = x11::write_mapping_notify_event(buf, order, seq, 1, first_keycode, count);
     });
+    if let Some(change) = &xkb_change {
+        crate::core_loop::xkb_layout::apply_keyboard_mapping_repeats(state, xkb_event_base, change);
+    }
     debug!(
         "client {} #{} ChangeKeyboardMapping",
         client_id.0, sequence.0
@@ -28237,7 +28287,9 @@ fn handle_change_keyboard_mapping(
     Ok(RequestOutcome::Handled)
 }
 
-/// Hand the rows to the backend's Xorg-style conversion, else to `state.keymap_overrides`.
+/// Hand the rows to the backend's XKB keymap (Xorg `XkbApplyMappingChange`),
+/// else to `state.keymap_overrides`. Returns what the XKB keymap change did,
+/// for the XKB notifications; `None` for the core-only store.
 fn apply_keymap_change(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -28245,16 +28297,18 @@ fn apply_keymap_change(
     kpk: u8,
     count: u8,
     syms: &[u8],
-) {
+) -> Option<crate::backend::KeyboardMappingChange> {
     let n = usize::from(count) * usize::from(kpk);
     let keysyms: Vec<u32> = syms
         .chunks_exact(4)
         .take(n)
         .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect();
-    if !backend.change_keyboard_mapping(first_keycode, kpk, &keysyms) {
+    let change = backend.change_keyboard_mapping(first_keycode, kpk, &keysyms);
+    if change.is_none() {
         store_keymap_overrides(state, first_keycode, kpk, count, syms);
     }
+    change
 }
 
 /// Install `count` keysym rows starting at `first_keycode` into
@@ -64623,6 +64677,49 @@ mod tests {
             &body,
         );
         assert!(!state.keyboard_control.global_auto_repeat);
+    }
+
+    /// Xorg `DoChangeKeyboardControl` calls `XkbDisableComputedAutoRepeats`
+    /// for a per-key auto-repeat change: the key gets
+    /// `XkbExplicitAutoRepeatMask`, so a later mapping change leaves its bit
+    /// alone (`XkbUpdateDescActions`), while other keys' bits follow the
+    /// keymap and a change reports `XkbControlsNotify(PerKeyRepeat)`.
+    #[test]
+    fn per_key_auto_repeat_set_by_a_client_survives_a_mapping_change() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.xkb_select_event_masks.insert((1, 0x0100), 0x0008);
+        // key=64 auto-repeat-mode=On (already on by default).
+        let body = kbctrl_body(0xc0, &[64, 1]);
+        let _ = handle_change_keyboard_control(
+            &mut state,
+            ClientId(1),
+            SequenceNumber(1),
+            kbctrl_header(),
+            &body,
+        );
+        assert_eq!(state.keyboard_control.auto_repeats_explicit[8], 0x01);
+        let change = crate::backend::KeyboardMappingChange {
+            min_keycode: 8,
+            max_keycode: 255,
+            num_groups: 1,
+            enabled_controls: 1,
+            repeats: vec![(64, false), (65, false)],
+        };
+        crate::core_loop::xkb_layout::apply_keyboard_mapping_repeats(&mut state, 85, &change);
+        assert_eq!(
+            state.keyboard_control.auto_repeats[8] & 0x03,
+            0x01,
+            "64 keeps the client's bit, 65 follows the keymap"
+        );
+        let ev = read_all_available(&mut peer);
+        assert_eq!(ev.len(), 32, "one ControlsNotify");
+        assert_eq!((ev[0], ev[1]), (85, 3));
+        assert_eq!(&ev[12..16], &0x4000_0000u32.to_le_bytes());
+
+        // Nothing changes: no event.
+        crate::core_loop::xkb_layout::apply_keyboard_mapping_repeats(&mut state, 85, &change);
+        assert!(read_all_available(&mut peer).is_empty());
     }
 
     #[test]

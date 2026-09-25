@@ -1246,6 +1246,9 @@ pub fn run_core(
     // Xorg seeds `_XKB_RULES_NAMES` on the root at init; setxkbmap reads
     // it to learn the current rules before applying a new layout.
     crate::core_loop::xkb_layout::publish_xkb_rules_names(state, backend);
+    // Xorg's XkbFinishInit: the keyboard's per-key auto-repeat comes from
+    // the keymap.
+    crate::core_loop::xkb_layout::seed_keyboard_auto_repeats(state, backend);
 
     let mut events = Events::with_capacity(64);
     let mut telemetry = LoopTelemetry::new();

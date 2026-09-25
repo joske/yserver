@@ -1,6 +1,6 @@
 # Plan: runtime keymap mutation reaches XKB (#171)
 
-Status: DRAFT, for review. Not implemented.
+Status: phases 1–2 implemented (branch `feat/171-xkb-keymap-mutation`); phases 3–4 open.
 Issue: #171 — `xmodmap` (ChangeKeyboardMapping / SetModifierMapping) and
 `xkbcomp keymap.xkb $DISPLAY` (XKB SetMap & co) don't change the keymap that
 XKB clients and yserver's own key cooking use. On Xorg they do.
@@ -141,9 +141,9 @@ want a small structured writer (see its open question).
   faithful. Add: after the change, `cook_host_key` on the changed keycode yields
   the new keysym, and XKB GetMap of the changed keys equals an Xorg capture
   (new golden, see §4).
-- Events, in Xorg's order: core `MappingNotify(Keyboard)` (existing), then
-  `XkbMapNotify`. The changed mask and first/num ranges come from an Xorg capture;
-  don't guess.
+- Events, in Xorg's (captured) order: `XkbMapNotify` (changed=0x0012 over the
+  requested keys), then core `MappingNotify(Keyboard)`, then
+  `XkbControlsNotify(PerKeyRepeat)` when a changed key's auto-repeat changed.
 - Also routed here: XI1 `ChangeDeviceKeyMapping` (same path).
 
 ### Phase 3 — SetModifierMapping edits the real keymap

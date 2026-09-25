@@ -3689,6 +3689,61 @@ pub fn write_xkb_map_notify(
     writer.write_all(&buf)
 }
 
+/// Fields of an [`write_xkb_controls_notify`] event: XKBproto.h
+/// `xkbControlsNotify` minus the header and `time` (0, like our other XKB
+/// events).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct XkbControlsNotify {
+    pub device_id: u8,
+    pub num_groups: u8,
+    /// `XkbControlsMask` bits that changed (e.g. PerKeyRepeat `1 << 30`).
+    pub changed_controls: u32,
+    pub enabled_controls: u32,
+    pub enabled_control_changes: u32,
+    pub keycode: u8,
+    pub event_type: u8,
+    pub request_major: u8,
+    pub request_minor: u8,
+}
+
+/// `XkbControlsNotify` (xkbType=3). Layout per XKBproto.h
+/// `xkbControlsNotify`: deviceID @8, numGroups @9, changedControls @12,
+/// enabledControls @16, enabledControlChanges @20, keycode @24,
+/// eventType @25, requestMajor @26, requestMinor @27.
+pub fn write_xkb_controls_notify(
+    writer: &mut impl Write,
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    xkb_event_base: u8,
+    n: XkbControlsNotify,
+) -> io::Result<()> {
+    let mut buf = [0u8; 32];
+    buf[0] = xkb_event_base;
+    buf[1] = 3; // xkbType = XkbControlsNotify
+    let mut seq_buf = Vec::with_capacity(2);
+    write_u16(byte_order, &mut seq_buf, sequence.0);
+    buf[2..4].copy_from_slice(&seq_buf);
+    // buf[4..8] time = 0
+    buf[8] = n.device_id;
+    buf[9] = n.num_groups;
+    // buf[10..12] pad1
+    for (at, v) in [
+        (12, n.changed_controls),
+        (16, n.enabled_controls),
+        (20, n.enabled_control_changes),
+    ] {
+        let mut b = Vec::with_capacity(4);
+        write_u32(byte_order, &mut b, v);
+        buf[at..at + 4].copy_from_slice(&b);
+    }
+    buf[24] = n.keycode;
+    buf[25] = n.event_type;
+    buf[26] = n.request_major;
+    buf[27] = n.request_minor;
+    // buf[28..32] pad2
+    writer.write_all(&buf)
+}
+
 /// Modifier + group state carried by an [`write_xkb_state_notify`] event.
 /// Mirrors the live fields of XKBproto.h `xkbStateNotify`.
 #[derive(Clone, Copy, Default)]
@@ -4254,6 +4309,38 @@ mod tests {
             &0u16.to_le_bytes(),
             "virtualMods @28 = 0 (not claimed)"
         );
+    }
+
+    /// Golden (Xvfb 21.1.24, `xorg-xkb-change-keyboard-mapping.txt`
+    /// protected-one-level): the ControlsNotify for a per-key repeat change,
+    /// byte for byte except seq/time.
+    #[test]
+    fn xkb_controls_notify_wire_layout() {
+        let mut buf = Vec::new();
+        write_xkb_controls_notify(
+            &mut buf,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(9),
+            0x55,
+            XkbControlsNotify {
+                device_id: 3,
+                num_groups: 1,
+                changed_controls: 0x4000_0000,
+                enabled_controls: 0x0000_13a1,
+                enabled_control_changes: 0,
+                keycode: 0,
+                event_type: 0,
+                request_major: 100,
+                request_minor: 0,
+            },
+        )
+        .unwrap();
+        let xorg = "550309005b8574060301000000000040a1130000000000000000640000000000";
+        let xorg: Vec<u8> = (0..32)
+            .map(|i| u8::from_str_radix(&xorg[2 * i..2 * i + 2], 16).unwrap())
+            .collect();
+        assert_eq!(buf[..4], xorg[..4]);
+        assert_eq!(buf[8..], xorg[8..]);
     }
 
     /// Every `XkbMapNotify` field at its `xkbMapNotify` offset (XKBproto.h),

@@ -747,6 +747,11 @@ pub struct KeyboardControlState {
     pub global_auto_repeat: bool,
     /// Per-key auto-repeat bitmap (keycode N → byte N>>3, bit N&7).
     pub auto_repeats: [u8; 32],
+    /// Keys whose auto-repeat a client set with `ChangeKeyboardControl`
+    /// (same layout). XKB no longer re-derives their bit on a mapping
+    /// change: Xorg's `XkbDisableComputedAutoRepeats` marks them
+    /// `XkbExplicitAutoRepeatMask`.
+    pub auto_repeats_explicit: [u8; 32],
     /// LED bitmask (led N → bit N-1). `DEFAULT_LEDS` = all off.
     pub led_mask: u32,
 }
@@ -768,6 +773,7 @@ impl KeyboardControlState {
             bell_duration: 100,
             global_auto_repeat: true,
             auto_repeats: DEFAULT_AUTO_REPEATS,
+            auto_repeats_explicit: [0; 32],
             led_mask: 0,
         }
     }

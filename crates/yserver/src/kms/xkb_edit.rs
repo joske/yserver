@@ -53,6 +53,10 @@ pub(crate) enum XkbEditError {
     NoFreeKeyName(u8),
     /// The keycode is in more than one modifier; keymap text keeps one per
     /// key (xkbcommon and xkbcomp both drop all but the last).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "#171 phase 3 routes SetModifierMapping here")
+    )]
     MultipleModifiers(u8),
 }
 
@@ -205,6 +209,10 @@ pub(crate) fn set_key(
 /// Keycodes with bits set and no name get one ([`ensure_keycode_name`]).
 /// A keycode in several modifiers is refused: the compiler keeps only one
 /// modifier per key, so writing it would silently lose the others.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "#171 phase 3 routes SetModifierMapping here")
+)]
 pub(crate) fn set_modifier_map(text: &str, modmap: &[u8; 256]) -> Result<String, XkbEditError> {
     if let Some(kc) = (0..=255u8).find(|&kc| modmap[usize::from(kc)].count_ones() > 1) {
         return Err(XkbEditError::MultipleModifiers(kc));
@@ -250,6 +258,176 @@ pub(crate) fn set_modifier_map(text: &str, modmap: &[u8; 256]) -> Result<String,
         edits.push((at..at, block));
     }
     Ok(apply_edits(&text, edits))
+}
+
+/// Whether the key's `xkb_symbols` entry fixes its auto-repeat (`repeat=`),
+/// which keeps the compat interprets from deriving it (Xorg's
+/// `XkbExplicitAutoRepeatMask`). A key without an entry doesn't.
+pub(crate) fn key_repeat_is_explicit(text: &str, name: &str) -> Result<bool, XkbEditError> {
+    let canonical = canonical_key_name(text, name)?;
+    let body = section(text, "xkb_symbols")?;
+    let Some(r) = statements(text, body, "xkb_symbols")?
+        .into_iter()
+        .find(|r| key_stmt_name(&text[r.clone()]) == Some(canonical.as_str()))
+    else {
+        return Ok(false);
+    };
+    let (kept, _) = kept_key_fields(&text[r], 0)?;
+    Ok(kept.iter().any(|f| {
+        f.split(|c: char| c == '=' || c.is_whitespace())
+            .next()
+            .is_some_and(|k| k.eq_ignore_ascii_case("repeat"))
+    }))
+}
+
+/// `text` with the level-1 keysym of group 1 of each key in `names` set to
+/// `VoidSymbol` where it is `NoSymbol`. Compiling that shows the auto-repeat
+/// Xorg gives those keys: Xorg matches a `NoSymbol` level 1 against the
+/// `Any` interprets (`_XkbFindMatchingInterp`), as xkbcommon does for a
+/// keysym no interpret names, while xkbcommon matches no interpret at all
+/// on an empty level. Never installed.
+pub(crate) fn void_empty_level1(text: &str, names: &[String]) -> Result<String, XkbEditError> {
+    let body = section(text, "xkb_symbols")?;
+    let mut edits = Vec::new();
+    for r in statements(text, body, "xkb_symbols")? {
+        let stmt = &text[r.clone()];
+        if !key_stmt_name(stmt).is_some_and(|n| names.iter().any(|w| w == n)) {
+            continue;
+        }
+        let open = stmt
+            .find('{')
+            .ok_or(XkbEditError::Malformed("xkb_symbols"))?;
+        let close =
+            matching_close(stmt.as_bytes(), open).ok_or(XkbEditError::Malformed("xkb_symbols"))?;
+        // The group-1 symbols: the `[ … ]` shorthand or `symbols[1]= [ … ]`.
+        let fields = &stmt[open + 1..close];
+        let Some(list) = split_top_level(fields, b',').into_iter().find(|f| {
+            f.starts_with('[')
+                || f.strip_prefix("symbols").is_some_and(|t| {
+                    t.trim_start()
+                        .strip_prefix('[')
+                        .and_then(|t| t.split_once(']'))
+                        .is_some_and(|(g, _)| group_index(g) == Some(1))
+                })
+        }) else {
+            continue;
+        };
+        let list_at = r.start + open + 1 + (list.as_ptr() as usize - fields.as_ptr() as usize);
+        let bracket = if list.starts_with('[') {
+            0
+        } else {
+            let eq = list
+                .find('=')
+                .ok_or(XkbEditError::Malformed("xkb_symbols"))?;
+            eq + list[eq..]
+                .find('[')
+                .ok_or(XkbEditError::Malformed("xkb_symbols"))?
+        };
+        let inner = &list[bracket + 1..];
+        let first = inner.trim_start();
+        let lead = inner.len() - first.len();
+        let end = first
+            .find(|c: char| c == ',' || c == ']' || c.is_whitespace())
+            .unwrap_or(first.len());
+        if &first[..end] == "NoSymbol" {
+            let at = list_at + bracket + 1 + lead;
+            edits.push((at..at + end, "VoidSymbol".to_owned()));
+        }
+    }
+    Ok(apply_edits(text, edits))
+}
+
+/// The names of the key types `xkb_types` defines, in definition order.
+pub(crate) fn type_names(text: &str) -> Result<Vec<String>, XkbEditError> {
+    let body = section(text, "xkb_types")?;
+    Ok(statements(text, body, "xkb_types")?
+        .into_iter()
+        .filter_map(|r| {
+            let rest = text[r].strip_prefix("type")?;
+            if !rest.starts_with(|c: char| c.is_whitespace()) {
+                return None;
+            }
+            rest.trim_start()
+                .strip_prefix('"')?
+                .split_once('"')
+                .map(|(n, _)| n.to_owned())
+        })
+        .collect())
+}
+
+/// `text` plus one probe key per type in `names`: a new keycode above every
+/// existing one whose single group has that type (the keysym is
+/// `VoidSymbol`). xkbcommon exposes no key's type name, but compiling this
+/// shows what each named type does (its levels and the modifiers selecting
+/// them), which identifies the type a key got implicitly. Returns the text
+/// and the probes' keycodes, in `names` order. Never installed.
+pub(crate) fn add_type_probes(
+    text: &str,
+    names: &[String],
+) -> Result<(String, Vec<u32>), XkbEditError> {
+    let body = section(text, "xkb_keycodes")?;
+    let mut taken = HashSet::new();
+    let mut top = 0u32;
+    let mut last_def: Option<Range<usize>> = None;
+    let mut maximum: Option<Range<usize>> = None;
+    for r in statements(text, body.clone(), "xkb_keycodes")? {
+        let stmt = &text[r.clone()];
+        if let Some((name, kc)) = keycode_def(stmt) {
+            taken.insert(name.to_owned());
+            top = top.max(kc);
+            last_def = Some(r);
+        } else if let Some(alias) = alias_def(stmt) {
+            taken.insert(alias.to_owned());
+        } else if let Some(v) = assignment(stmt, "maximum") {
+            top = top.max(v);
+            maximum = Some(r);
+        }
+    }
+    let mut probes = Vec::with_capacity(names.len());
+    let mut defs = String::new();
+    let mut n = 0usize;
+    for _ in names {
+        let name = loop {
+            let candidate = format!("TPRB{n}");
+            n += 1;
+            if !taken.contains(&candidate) {
+                break candidate;
+            }
+        };
+        let kc = top + 1 + u32::try_from(probes.len()).unwrap_or(u32::MAX);
+        defs.push_str(&format!("\t<{name}> = {kc};\n"));
+        probes.push((name, kc));
+    }
+    let mut edits: Vec<(Range<usize>, String)> = Vec::new();
+    if let (Some(r), Some((_, kc))) = (maximum, probes.last()) {
+        edits.push((r, format!("maximum = {kc};")));
+    }
+    let at = last_def.map_or(body.start, |r| line_extent(text, r).end);
+    if at == body.start && !text[..at].ends_with('\n') {
+        defs.insert(0, '\n');
+    }
+    edits.push((at..at, defs));
+    let text = apply_edits(text, edits);
+
+    let body = section(&text, "xkb_symbols")?;
+    let stmts = statements(&text, body.clone(), "xkb_symbols")?;
+    let mut entries = String::new();
+    for ((name, _), ty) in probes.iter().zip(names) {
+        let group = KeyGroupSpec {
+            type_name: Some(ty.clone()),
+            keysyms: vec![0x00ff_ffff], // VoidSymbol
+        };
+        entries.push_str(&render_key(name, &[], std::slice::from_ref(&group), &[]));
+    }
+    let at = stmts
+        .iter()
+        .find(|r| is_modifier_map(&text[(*r).clone()]))
+        .map_or(body.end, |r| line_extent(&text, r.clone()).start);
+    if !text[..at].ends_with('\n') {
+        entries.insert(0, '\n');
+    }
+    let text = apply_edits(&text, vec![(at..at, entries)]);
+    Ok((text, probes.into_iter().map(|(_, kc)| kc).collect()))
 }
 
 // ─── writing ────────────────────────────────────────────────────────
@@ -928,5 +1106,69 @@ mod tests {
         let after2 = compile(&out2);
         assert!(after2.key_get_name(Keycode::new(8)).is_some());
         assert_eq!(keymap_modmap(&after2), modmap2);
+    }
+
+    #[test]
+    fn key_repeat_is_explicit_reads_the_repeat_field() {
+        let km = golden_keymap("us", None);
+        let text = dump(&km);
+        let caps = "\tkey <CAPS> {\t[ 0xffe5 ] };\n";
+        assert!(text.contains(caps), "fixture shape");
+        let crafted = dump(&compile(&text.replace(
+            caps,
+            "\tkey <CAPS> {\n\t\trepeat= No,\n\t\tsymbols[1]= [ 0xffe5 ]\n\t};\n",
+        )));
+        assert_eq!(key_repeat_is_explicit(&crafted, "CAPS"), Ok(true));
+        assert_eq!(key_repeat_is_explicit(&text, "CAPS"), Ok(false));
+        assert_eq!(key_repeat_is_explicit(&text, "I248"), Ok(false), "no entry");
+        assert!(key_repeat_is_explicit(&text, "NOPE").is_err());
+    }
+
+    /// Each probe key compiles with its type: the level count xkbcommon gives
+    /// the probe is the one the `xkb_types` section declares for that name.
+    #[test]
+    fn type_probes_carry_each_type() {
+        for (layout, options) in FIXTURES {
+            let km = golden_keymap(layout, options);
+            let text = dump(&km);
+            let names = type_names(&text).expect("types");
+            assert!(names.iter().any(|n| n == "ONE_LEVEL"));
+            assert!(names.iter().any(|n| n == "FOUR_LEVEL"));
+            let (probed, kcs) = add_type_probes(&text, &names).expect("probes");
+            let after = compile(&probed);
+            assert_eq!(kcs.len(), names.len());
+            for (name, kc) in names.iter().zip(&kcs) {
+                let levels = after.num_levels_for_key(Keycode::new(*kc), 0);
+                let expected = match name.as_str() {
+                    "ONE_LEVEL" => 1,
+                    "TWO_LEVEL" | "ALPHABETIC" | "KEYPAD" => 2,
+                    "FOUR_LEVEL" | "FOUR_LEVEL_ALPHABETIC" | "FOUR_LEVEL_SEMIALPHABETIC" => 4,
+                    _ => levels,
+                };
+                assert_eq!(levels, expected, "{layout}: probe for {name}");
+            }
+            assert_untouched(&km, &after, &kcs);
+        }
+    }
+
+    #[test]
+    fn void_empty_level1_fills_only_an_empty_level_1() {
+        let km = golden_keymap("gb", None);
+        let hole = set_key(
+            &dump(&km),
+            "AD03",
+            &[KeyGroupSpec {
+                type_name: Some("TWO_LEVEL".into()),
+                keysyms: vec![0, 0x45],
+            }],
+        )
+        .expect("set");
+        let before = compile(&hole);
+        let out = void_empty_level1(&hole, &["AD03".into(), "AD04".into()]).expect("void");
+        let after = compile(&out);
+        let e = Keycode::new(26);
+        assert_eq!(after.key_get_syms_by_level(e, 0, 0)[0].raw(), 0x00ff_ffff);
+        assert_eq!(after.key_get_syms_by_level(e, 0, 1)[0].raw(), 0x45);
+        assert_untouched(&before, &after, &[26]);
     }
 }

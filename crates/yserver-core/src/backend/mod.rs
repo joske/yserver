@@ -21,9 +21,10 @@ pub use params::{
 };
 pub use trait_def::{
     ActiveCursorImage, Backend, BackendFdKind, CompletedPresentEvent, CrtcConfigApply,
-    CrtcConfigToken, Dri3Caps, Dri3ImportModifier, Dri3PixmapExport, HostSocketStatus, KeymapLoad,
-    ModeSpec, PresentCaps, PresentClockSample, PresentClockSource, PresentScanoutCandidate,
-    PresentSourceWait, PresentWake, SyncobjHandle, XkbNewKeyboardInfo, XshmfenceHandle,
+    CrtcConfigToken, Dri3Caps, Dri3ImportModifier, Dri3PixmapExport, HostSocketStatus,
+    KeyboardMappingChange, KeymapLoad, ModeSpec, PresentCaps, PresentClockSample,
+    PresentClockSource, PresentScanoutCandidate, PresentSourceWait, PresentWake, SyncobjHandle,
+    XkbNewKeyboardInfo, XshmfenceHandle,
 };
 
 use yserver_protocol::x11::ClientId;

@@ -1945,8 +1945,12 @@ pub(crate) struct KmsCore {
     #[allow(dead_code)]
     pub(crate) xkb_context: XkbContext,
     pub(crate) xkb_keymap: XkbKeymap,
-    /// Keys rewritten by `ChangeKeyboardMapping`, in Xorg's XKB form; dropped with the keymap.
-    pub(crate) core_map_overrides: crate::kms::xkb::CoreMapOverrides,
+    /// Xorg's explicit-type mask per key (`XkbExplicitKeyTypesMask` bits,
+    /// see [`crate::kms::xkb::explicit_type_masks`]) of the loaded keymap.
+    /// xkbcommon doesn't keep it and a mapping change must not change it,
+    /// so it is taken from the keymap as loaded (lazily, always before the
+    /// first edit) and carried across edits; a reload drops it.
+    xkb_explicit_types: Option<Box<[u8; 256]>>,
     pub(crate) xkb_state: XkbState,
     /// The RMLVO the active keymap was compiled from, or, for an edited
     /// keymap, the one it was edited from. Read by GetNames (`symbolsName`)
@@ -2097,7 +2101,7 @@ impl KmsCore {
             top_level_order: Vec::new(),
             xkb_context,
             xkb_keymap,
-            core_map_overrides: crate::kms::xkb::CoreMapOverrides::new(),
+            xkb_explicit_types: None,
             xkb_state,
             xkb_rmlvo: rmlvo,
             keymap_source: KeymapSource::Rmlvo,
@@ -2180,7 +2184,7 @@ impl KmsCore {
             top_level_order: Vec::new(),
             xkb_context,
             xkb_keymap,
-            core_map_overrides: crate::kms::xkb::CoreMapOverrides::new(),
+            xkb_explicit_types: None,
             xkb_state,
             xkb_rmlvo: XkbRmlvo::default(),
             keymap_source: KeymapSource::Rmlvo,
@@ -2287,6 +2291,7 @@ impl KmsCore {
         rmlvo: &XkbRmlvo,
     ) -> (u8, u8) {
         let bounds = self.swap_keymap(keymap, 0);
+        self.xkb_explicit_types = None;
         self.xkb_rmlvo = rmlvo.clone();
         self.keymap_source = KeymapSource::Rmlvo;
         log::info!(
@@ -2333,6 +2338,9 @@ impl KmsCore {
             return Err(err);
         };
         let compiled = started.elapsed();
+        // The explicit types belong to the keymap as loaded: take them
+        // before its first edit replaces it.
+        let _ = self.explicit_key_types();
         let locked = locked_real_mods(&self.xkb_state.0, &self.xkb_keymap.0);
         let bounds = self.swap_keymap(keymap, locked);
         self.locked_group = self.locked_group.min(self.keymap_group_count() - 1);
@@ -2342,6 +2350,14 @@ impl KmsCore {
             started.elapsed()
         );
         Ok(bounds)
+    }
+
+    /// Xorg's explicit-type mask per key for the active keymap
+    /// ([`Self::xkb_explicit_types`]).
+    pub(crate) fn explicit_key_types(&mut self) -> &[u8; 256] {
+        let keymap = &self.xkb_keymap.0;
+        self.xkb_explicit_types
+            .get_or_insert_with(|| Box::new(crate::kms::xkb::explicit_type_masks(keymap)))
     }
 
     /// Groups in the active keymap, 1..=4.
@@ -2371,7 +2387,6 @@ impl KmsCore {
         }
         self.xkb_state = XkbState(new_state);
         self.xkb_keymap = XkbKeymap(keymap);
-        self.core_map_overrides.clear();
         bounds
     }
 }

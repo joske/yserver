@@ -33,6 +33,24 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-25 ChangeKeyboardMapping edits the real keymap (#171 phase 2,
+  branch `feat/171-xkb-keymap-mutation`):** core `ChangeKeyboardMapping` and
+  XI1 `ChangeDeviceKeyMapping` no longer write the `core_map_overrides`
+  overlay (removed). `xkb::core_mapping_change` (the `XkbUpdateKeyTypesFromCore`
+  port) yields each changed key's groups with explicit type names;
+  `xkb_edit::set_key` writes them into the live keymap text, which is
+  recompiled and installed. Cooking, XKB GetMap and GetKeyboardMapping read
+  the one keymap. Xorg's explicit-type mask lives in `KmsCore` (taken from
+  the loaded keymap, kept across edits); implicitly typed protected groups
+  get their type name from a probe compile. XKB `MapNotify(0x0012)` →
+  core `MappingNotify` → `ControlsNotify(PerKeyRepeat)` in Xorg's order; the
+  per-key repeat is seeded from the keymap at startup (Xorg
+  `XkbFinishInit`), re-derived for changed keys, and GetControls reports it.
+  The XKB keycode range is 8..=255 (was xkbcommon's lowest named keycode, 9).
+  Golden: `xorg-xkb-change-keyboard-mapping.txt`, test
+  `xkb_view_of_change_keyboard_mapping_matches_xorg`. Phase 3
+  (SetModifierMapping) next.
+
 - **2026-09-17 on-screen reads follow the directly-flipped buffer:** while a
   CRTC scans out a client buffer directly, the compositor's pool BOs are not
   painted at all (`retire_direct_output` calls `invalidate_all_scanout_damage`
