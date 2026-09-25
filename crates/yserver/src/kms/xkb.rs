@@ -45,29 +45,35 @@ fn put(core: &mut [u32], i: usize, v: u32) {
     }
 }
 
-/// Port of Xorg's `XkbGetCoreMap` over an xkbcommon keymap.
-pub(super) fn core_keyboard_map(keymap: &Keymap) -> CoreKeyMap {
+/// A key's groups (≤ 4) in the keymap, each its own level count wide.
+fn key_groups(keymap: &Keymap, kc_raw: u8) -> Vec<Vec<u32>> {
+    let kc = Keycode::new(u32::from(kc_raw));
+    let n = keymap
+        .num_layouts_for_key(kc)
+        .min(u32::from(XKB_NUM_KBD_GROUPS));
+    (0..n)
+        .map(|g| {
+            (0..keymap.num_levels_for_key(kc, g))
+                .map(|l| {
+                    keymap
+                        .key_get_syms_by_level(kc, g, l)
+                        .first()
+                        .map_or(0, |s| s.raw())
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Port of Xorg's `XkbGetCoreMap` over an xkbcommon keymap plus `ChangeKeyboardMapping` keys.
+pub(super) fn core_keyboard_map(keymap: &Keymap, overrides: &CoreMapOverrides) -> CoreKeyMap {
     // The connection setup's keycode range (Xorg: 8..=255), not xkbcommon's.
     let (min_kc, max_kc) = (8u8, 255u8);
     // Per key: one Vec per group (≤ 4), each group's own level count wide.
     let groups: Vec<Vec<Vec<u32>>> = (min_kc..=max_kc)
-        .map(|kc_raw| {
-            let kc = Keycode::new(u32::from(kc_raw));
-            let n = keymap
-                .num_layouts_for_key(kc)
-                .min(u32::from(XKB_NUM_KBD_GROUPS));
-            (0..n)
-                .map(|g| {
-                    (0..keymap.num_levels_for_key(kc, g))
-                        .map(|l| {
-                            keymap
-                                .key_get_syms_by_level(kc, g, l)
-                                .first()
-                                .map_or(0, |s| s.raw())
-                        })
-                        .collect()
-                })
-                .collect()
+        .map(|kc| match overrides.get(&kc) {
+            Some(key) => key.iter().map(|g| g.syms.clone()).collect(),
+            None => key_groups(keymap, kc),
         })
         .collect();
 
@@ -159,6 +165,385 @@ pub(super) fn core_keyboard_map(keymap: &Keymap) -> CoreKeyMap {
         min_keycode: min_kc,
         width: u8::try_from(width).unwrap_or(u8::MAX),
         syms,
+    }
+}
+
+/// An XKB key type as `XkbKeyTypesForCoreSymbols` compares it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct CoreKeyType {
+    /// Identity: the type name, or a derived-table index for an unnamed type.
+    name: String,
+    num_levels: u8,
+    /// One of the four required types (index ≤ `XkbLastRequiredType`).
+    required: bool,
+}
+
+impl CoreKeyType {
+    fn required(name: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            num_levels: if name == "ONE_LEVEL" { 1 } else { 2 },
+            required: true,
+        }
+    }
+}
+
+/// One group of a key rewritten by `ChangeKeyboardMapping`.
+#[derive(Clone, Debug)]
+pub(crate) struct CoreKeyGroup {
+    ty: CoreKeyType,
+    syms: Vec<u32>,
+}
+
+/// Keys rewritten by `ChangeKeyboardMapping`, in XKB form (Xorg keeps them in its XKB map).
+pub(crate) type CoreMapOverrides = std::collections::HashMap<u8, Vec<CoreKeyGroup>>;
+
+/// Port of Xorg's `XkbConvertCase` (xkb/xkbUtils.c): `(lower, upper)`.
+fn convert_case(sym: u32) -> (u32, u32) {
+    let (mut lower, mut upper) = (sym, sym);
+    match sym >> 8 {
+        0 => match sym {
+            0x41..=0x5a | 0xc0..=0xd6 | 0xd8..=0xde => lower += 0x20,
+            0x61..=0x7a | 0xe0..=0xf6 | 0xf8..=0xfe => upper -= 0x20,
+            _ => {}
+        },
+        1 => match sym {
+            0x1a1 => lower = 0x1b1,
+            0x1a3..=0x1a6 | 0x1a9..=0x1ac | 0x1ae..=0x1af => lower += 0x10,
+            0x1b1 => upper = 0x1a1,
+            0x1b3..=0x1b6 | 0x1b9..=0x1bc | 0x1be..=0x1bf => upper -= 0x10,
+            0x1c0..=0x1de => lower += 0x20,
+            0x1e0..=0x1fe => upper -= 0x20,
+            _ => {}
+        },
+        2 => match sym {
+            0x2a1..=0x2a6 | 0x2ab..=0x2ac => lower += 0x10,
+            0x2b1..=0x2b6 | 0x2bb..=0x2bc => upper -= 0x10,
+            0x2c5..=0x2de => lower += 0x20,
+            0x2e5..=0x2fe => upper -= 0x20,
+            _ => {}
+        },
+        3 => match sym {
+            0x3a3..=0x3ac => lower += 0x10,
+            0x3b3..=0x3bc => upper -= 0x10,
+            0x3bd => lower = 0x3bf,
+            0x3bf => upper = 0x3bd,
+            0x3c0..=0x3de => lower += 0x20,
+            0x3e0..=0x3fe => upper -= 0x20,
+            _ => {}
+        },
+        6 => match sym {
+            0x6b1..=0x6bf => lower -= 0x10,
+            0x6a1..=0x6af => upper += 0x10,
+            0x6e0..=0x6ff => lower -= 0x20,
+            0x6c0..=0x6df => upper += 0x20,
+            _ => {}
+        },
+        7 => match sym {
+            0x7a1..=0x7ab => lower += 0x10,
+            0x7b1..=0x7bb if sym != 0x7b6 && sym != 0x7ba => upper -= 0x10,
+            0x7c1..=0x7d9 => lower += 0x20,
+            0x7e1..=0x7f9 if sym != 0x7f3 => upper -= 0x20,
+            _ => {}
+        },
+        _ => {}
+    }
+    (lower, upper)
+}
+
+/// `XkbKSIsKeypad`: `XK_KP_Space..=XK_KP_Equal`.
+fn is_keypad(sym: u32) -> bool {
+    (0xff80..=0xffbd).contains(&sym)
+}
+
+/// xkbcommon's explicit key types (`type=` / `type[N]=`), per key and group, from its keymap text.
+fn explicit_type_names(keymap: &Keymap) -> std::collections::HashMap<u8, [Option<String>; 4]> {
+    let mut out = std::collections::HashMap::new();
+    let text = keymap.get_as_string(xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1);
+    let Some(start) = text.find("xkb_symbols") else {
+        return out;
+    };
+    let mut rest = &text[start..];
+    while let Some(pos) = rest.find("key <") {
+        rest = &rest[pos + 5..];
+        let Some((name, after)) = rest.split_once('>') else {
+            break;
+        };
+        let body = after.split("};").next().unwrap_or_default();
+        let Some(kc) = keymap
+            .key_by_name(name)
+            .and_then(|kc| u8::try_from(kc.raw()).ok())
+        else {
+            continue;
+        };
+        let mut names: [Option<String>; 4] = Default::default();
+        for (i, _) in body.match_indices("type") {
+            let tail = &body[i + 4..];
+            if !body[..i].ends_with(|c: char| c.is_whitespace() || c == '{' || c == ',') {
+                continue;
+            }
+            let (groups, tail) = if let Some(t) = tail.strip_prefix('[') {
+                let Some((g, t)) = t.split_once(']') else {
+                    continue;
+                };
+                let g = g.trim().trim_start_matches("Group").parse::<usize>().ok();
+                (g.map(|g| g.saturating_sub(1)..g), t)
+            } else {
+                (Some(0..4), tail)
+            };
+            let Some(ty) = tail
+                .trim_start()
+                .strip_prefix('=')
+                .and_then(|t| t.split('"').nth(1))
+            else {
+                continue;
+            };
+            for g in groups.into_iter().flatten().filter(|&g| g < 4) {
+                names[g] = Some(ty.to_owned());
+            }
+        }
+        out.insert(kc, names);
+    }
+    out
+}
+
+/// Xorg's explicit type mask + types: xkbcomp also marks >2-level and lower/upper ALPHABETIC auto types explicit (verified on Xvfb us/gb/de/us,ru).
+fn key_explicit_types(
+    keymap: &Keymap,
+    kc: u8,
+    names: Option<&[Option<String>; 4]>,
+    table: &KeyTypeTable,
+) -> (u8, [CoreKeyType; 4]) {
+    let mut explicit = 0u8;
+    let mut types: [CoreKeyType; 4] = std::array::from_fn(|_| CoreKeyType::required("TWO_LEVEL"));
+    for (g, syms) in key_groups(keymap, kc).iter().enumerate() {
+        let levels = u8::try_from(syms.len()).unwrap_or(u8::MAX);
+        let named = names.and_then(|n| n[g].clone());
+        let ty = if let Some(name) = named {
+            let required = matches!(
+                name.as_str(),
+                "ONE_LEVEL" | "TWO_LEVEL" | "ALPHABETIC" | "KEYPAD"
+            );
+            Some(CoreKeyType {
+                name,
+                num_levels: levels,
+                required,
+            })
+        } else if levels > 2 {
+            Some(CoreKeyType {
+                name: format!(
+                    "#{}",
+                    table.type_index_for(kc, u8::try_from(g).unwrap_or(0))
+                ),
+                num_levels: levels,
+                required: false,
+            })
+        } else if levels == 2
+            && convert_case(syms[0]).1 != syms[0]
+            && convert_case(syms[1]).0 != syms[1]
+        {
+            Some(CoreKeyType::required("ALPHABETIC"))
+        } else {
+            None
+        };
+        if let Some(ty) = ty {
+            explicit |= 1 << g;
+            types[g] = ty;
+        }
+    }
+    (explicit, types)
+}
+
+/// Port of Xorg's `XkbKeyTypesForCoreSymbols` (xkb/XKBMisc.c, §12.2/§12.4): group count + symbols `groupsWidth` apart.
+fn key_types_for_core_symbols(
+    core: &[u32],
+    protected: u8,
+    types: &mut [CoreKeyType; 4],
+) -> (usize, Vec<u32>) {
+    let map_width = core.len();
+    let cs = |i: usize| core.get(i).copied().unwrap_or(0);
+    let unprotected = |i: usize| protected & (1 << i) == 0;
+    // Step 1: symbols per group.
+    let mut n_syms = [2usize; 4];
+    let mut gw = 2usize;
+    for i in 0..4 {
+        if unprotected(i) {
+            types[i] = CoreKeyType::required("TWO_LEVEL");
+        } else {
+            n_syms[i] = usize::from(types[i].num_levels);
+            gw = gw.max(n_syms[i]);
+        }
+    }
+    n_syms[0] = n_syms[0].max(2);
+    n_syms[1] = n_syms[1].max(2);
+    let off = |g: usize, l: usize| g * gw + l;
+    let mut out = vec![0u32; 4 * gw];
+    // Step 2: core order G1L1 G1L2 G2L1 G2L2 [G1L3..] [G2L3..] [G3..] [G4..] to XKB order.
+    out[off(0, 0)] = cs(0);
+    out[off(0, 1)] = cs(1);
+    for i in 2..n_syms[0] {
+        out[off(0, i)] = cs(2 + i);
+    }
+    out[off(1, 0)] = cs(2);
+    out[off(1, 1)] = cs(3);
+    for i in 2..n_syms[1] {
+        out[off(1, i)] = cs(n_syms[0] + i);
+    }
+    // §12.4: only group 1 explicit and the row is ABABCDECDEABCDE → one group.
+    let mut replicated = false;
+    if protected & !1 == 0 {
+        let width = n_syms[0];
+        replicated = cs(0) == cs(2) && cs(1) == cs(3);
+        replicated &= (2..width).all(|i| cs(2 + i) == cs(i + width));
+        let mut j = 2;
+        while replicated && j < 4 && map_width >= width * (j + 1) {
+            replicated &=
+                (0..width).all(|i| cs(if i < 2 { i } else { 2 + i }) == cs(i + width * j));
+            j += 1;
+        }
+    }
+    let mut n_groups;
+    if replicated {
+        n_groups = 1;
+    } else {
+        let mut tmp = n_syms[0] + n_syms[1];
+        if tmp >= map_width && protected & 0b1100 == 0 {
+            n_groups = 2;
+        } else {
+            n_groups = 3;
+            for i in 0..n_syms[2] {
+                out[off(2, i)] = cs(tmp);
+                tmp += 1;
+            }
+            if tmp < map_width || protected & 0b1000 != 0 {
+                n_groups = 4;
+                for i in 0..n_syms[3] {
+                    out[off(3, i)] = cs(tmp);
+                    tmp += 1;
+                }
+            }
+        }
+    }
+    // Steps 3 & 4: alphabetic expansion, canonical types.
+    let mut empty = 0u8;
+    for i in 0..n_groups {
+        let b = off(i, 0);
+        if n_syms[i] > 1 && out[b + 1] == 0 && out[b] != 0 {
+            let (lower, upper) = convert_case(out[b]);
+            if upper != lower {
+                out[b] = lower;
+                out[b + 1] = upper;
+                if unprotected(i) {
+                    types[i] = CoreKeyType::required("ALPHABETIC");
+                }
+            } else if unprotected(i) {
+                types[i] = CoreKeyType::required("ONE_LEVEL");
+            }
+        }
+        if unprotected(i) && types[i].name == "TWO_LEVEL" {
+            if is_keypad(out[b]) || is_keypad(out[b + 1]) {
+                types[i] = CoreKeyType::required("KEYPAD");
+            } else if convert_case(out[b]) == (out[b], out[b + 1]) {
+                types[i] = CoreKeyType::required("ALPHABETIC");
+            }
+        }
+        if out[b] == 0 && (1..n_syms[i]).all(|n| out[b + n] == 0) {
+            empty |= 1 << i;
+        }
+    }
+    // Step 5: drop trailing empty groups.
+    if empty != 0 {
+        for i in (0..n_groups).rev() {
+            if empty & (1 << i) == 0 || !unprotected(i) {
+                break;
+            }
+            n_groups -= 1;
+        }
+    }
+    if n_groups < 1 {
+        return (0, out);
+    }
+    // Step 6: an empty group 2 copies group 1.
+    if n_groups > 1 && empty & 0b11 == 0b10 {
+        if protected & 0b11 == 0 {
+            types[1] = types[0].clone();
+            out.copy_within(0..2, 2);
+        } else if types[0] == types[1] {
+            out.copy_within(0..n_syms[0], n_syms[0]);
+        }
+    }
+    // Step 7: identical groups collapse; all-one-level groups pack.
+    if n_groups > 1 {
+        let (mut same, mut all_one, mut canonical) = (true, types[0].num_levels == 1, true);
+        let mut i = 1;
+        while (all_one || same) && i < n_groups {
+            same &= types[i] == types[0];
+            all_one &= types[i].num_levels == 1;
+            canonical &= types[i].required;
+            i += 1;
+        }
+        if (same || canonical) && protected & 0b1110 == 0 {
+            let identical = (1..n_groups).all(|i| {
+                n_syms[i] == n_syms[0] && (0..n_syms[i]).all(|s| out[off(i, s)] == out[s])
+            });
+            if identical {
+                n_groups = 1;
+            }
+        }
+        if all_one && n_groups > 1 {
+            let mut p = n_syms[0];
+            for i in 1..n_groups {
+                out[i] = out[p];
+                p += n_syms[i];
+            }
+        }
+    }
+    (n_groups, out)
+}
+
+/// Port of Xorg's `XkbUpdateKeyTypesFromCore` (xkb/xkbUtils.c) for one `ChangeKeyboardMapping`.
+pub(super) fn apply_core_mapping_change(
+    keymap: &Keymap,
+    overrides: &mut CoreMapOverrides,
+    first: u8,
+    kpk: u8,
+    syms: &[u32],
+) {
+    let kpk = usize::from(kpk);
+    if kpk == 0 {
+        return;
+    }
+    let names = explicit_type_names(keymap);
+    let table = key_types_from_keymap(keymap);
+    for (i, row) in syms.chunks_exact(kpk).enumerate() {
+        let Some(kc) = u8::try_from(usize::from(first) + i).ok() else {
+            break;
+        };
+        let (explicit, base_types) = key_explicit_types(keymap, kc, names.get(&kc), &table);
+        let mut types = base_types;
+        if let Some(key) = overrides.get(&kc) {
+            for (t, g) in types.iter_mut().zip(key) {
+                *t = g.ty.clone();
+            }
+        }
+        let (n_groups, xkb_syms) = key_types_for_core_symbols(row, explicit, &mut types);
+        // XkbChangeTypesOfKey: one width (the widest type) for every group.
+        let width = types[..n_groups]
+            .iter()
+            .map(|t| usize::from(t.num_levels))
+            .max()
+            .unwrap_or(0);
+        let groups = types[..n_groups]
+            .iter()
+            .enumerate()
+            .map(|(g, ty)| CoreKeyGroup {
+                ty: ty.clone(),
+                syms: (0..usize::from(ty.num_levels))
+                    .map(|l| xkb_syms.get(g * width + l).copied().unwrap_or(0))
+                    .collect(),
+            })
+            .collect();
+        overrides.insert(kc, groups);
     }
 }
 
@@ -4008,7 +4393,7 @@ mod tests {
     /// Diff our core map against an Xorg dump, key by key; returns the mismatches.
     fn core_map_diffs(km: &xkbcommon::xkb::Keymap, golden: &str) -> Vec<String> {
         let (min, width, rows) = parse_core_golden(golden);
-        let ours = core_keyboard_map(km);
+        let ours = core_keyboard_map(km, &CoreMapOverrides::new());
         let mut diffs = Vec::new();
         if (ours.min_keycode, ours.width) != (min, width) {
             diffs.push(format!(

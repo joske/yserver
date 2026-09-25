@@ -1838,6 +1838,8 @@ pub(crate) struct KmsCore {
     #[allow(dead_code)]
     pub(crate) xkb_context: XkbContext,
     pub(crate) xkb_keymap: XkbKeymap,
+    /// Keys rewritten by `ChangeKeyboardMapping`, in Xorg's XKB form; dropped with the keymap.
+    pub(crate) core_map_overrides: crate::kms::xkb::CoreMapOverrides,
     pub(crate) xkb_state: XkbState,
     // Read by GetNames to derive `symbolsName` from the active RMLVO.
     pub(crate) xkb_rmlvo: XkbRmlvo,
@@ -1984,6 +1986,7 @@ impl KmsCore {
             top_level_order: Vec::new(),
             xkb_context,
             xkb_keymap,
+            core_map_overrides: crate::kms::xkb::CoreMapOverrides::new(),
             xkb_state,
             xkb_rmlvo: rmlvo,
             locked_group: 0,
@@ -2065,6 +2068,7 @@ impl KmsCore {
             top_level_order: Vec::new(),
             xkb_context,
             xkb_keymap,
+            core_map_overrides: crate::kms::xkb::CoreMapOverrides::new(),
             xkb_state,
             xkb_rmlvo: XkbRmlvo::default(),
             locked_group: 0,
@@ -2158,6 +2162,7 @@ impl KmsCore {
         }
         self.xkb_state = XkbState(new_state);
         self.xkb_keymap = XkbKeymap(keymap);
+        self.core_map_overrides.clear();
         self.xkb_rmlvo = rmlvo.clone();
         log::info!(
             "xkb: recompiled keymap -> rules={} model={} layout={} variant={:?} options={:?}",

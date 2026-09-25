@@ -351,7 +351,7 @@ pub fn process_request(
         91 => handle_query_colors(state, client_id, sequence, body),
         92 => handle_lookup_color(state, client_id, sequence, body),
         // ── keyboard mapping (server-wide MappingNotify + backend proxy) ──
-        100 => handle_change_keyboard_mapping(state, client_id, sequence, header, body),
+        100 => handle_change_keyboard_mapping(state, backend, client_id, sequence, header, body),
         101 => handle_get_keyboard_mapping(state, backend, origin, client_id, sequence, body),
         // ── save-set + cursor lifecycle ──
         6 => handle_change_save_set(state, client_id, sequence, header, body),
@@ -19452,7 +19452,14 @@ fn handle_xi2_request(
             // Without this the round-trip silently dropped the change
             // (XTS XChangeDeviceKeyMapping-3).
             let kpk = *body.get(2).unwrap_or(&0);
-            store_keymap_overrides(state, first, kpk, count, &body[4.min(body.len())..]);
+            apply_keymap_change(
+                state,
+                backend,
+                first,
+                kpk,
+                count,
+                &body[4.min(body.len())..],
+            );
             // ChangeDeviceKeyMapping is void (no reply), so the event
             // ordering question is moot: send to originator + others.
             // request_kind=1 = MappingKeyboard.
@@ -28172,15 +28179,16 @@ fn handle_list_fonts_with_info(
 
 fn handle_change_keyboard_mapping(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
     client_id: ClientId,
     sequence: SequenceNumber,
     header: RequestHeader,
     body: &[u8],
 ) -> io::Result<RequestOutcome> {
     let first_keycode = body.first().copied().unwrap_or(8);
+    let kpk = body.get(1).copied().unwrap_or(0);
     let count = header.data;
-    // Xorg ProcChangeKeyboardMapping: first_keycode < min_keycode →
-    // BadValue; first + count - 1 > max_keycode → BadValue.
+    // Xorg ProcChangeKeyboardMapping (dix/devices.c); BadLength is checked at dispatch.
     if first_keycode < 8 {
         return emit_x11_error(
             state,
@@ -28191,20 +28199,30 @@ fn handle_change_keyboard_mapping(
             100,
         );
     }
-    if u32::from(first_keycode) + u32::from(count) > 256 {
+    // Xorg reports keySymsPerKeyCode as the error value for both conditions.
+    if u32::from(first_keycode) + u32::from(count) > 256 || kpk == 0 {
         return emit_x11_error(
             state,
             client_id,
             sequence,
             x11::error::BAD_VALUE,
-            u32::from(first_keycode) + u32::from(count) - 1,
+            u32::from(kpk),
             100,
         );
     }
-    // Store the keysym rows: body = first_keycode(1)
-    // keysyms_per_keycode(1) pad(2) then count × kpk CARD32 keysyms.
-    let kpk = body.get(1).copied().unwrap_or(0);
-    store_keymap_overrides(state, first_keycode, kpk, count, &body[4.min(body.len())..]);
+    // XkbApplyMappingChange changes nothing (and notifies nothing) for zero keys.
+    if count == 0 {
+        return Ok(RequestOutcome::Handled);
+    }
+    // Body: first_keycode(1) keysyms_per_keycode(1) pad(2) then count × kpk CARD32 keysyms.
+    apply_keymap_change(
+        state,
+        backend,
+        first_keycode,
+        kpk,
+        count,
+        &body[4.min(body.len())..],
+    );
     // Server-wide MappingNotify fanout: every connected client sees the
     // same keymap change. We collect ids first to avoid an &/&mut overlap
     // through `state.clients`.
@@ -28217,6 +28235,26 @@ fn handle_change_keyboard_mapping(
         client_id.0, sequence.0
     );
     Ok(RequestOutcome::Handled)
+}
+
+/// Hand the rows to the backend's Xorg-style conversion, else to `state.keymap_overrides`.
+fn apply_keymap_change(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    first_keycode: u8,
+    kpk: u8,
+    count: u8,
+    syms: &[u8],
+) {
+    let n = usize::from(count) * usize::from(kpk);
+    let keysyms: Vec<u32> = syms
+        .chunks_exact(4)
+        .take(n)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    if !backend.change_keyboard_mapping(first_keycode, kpk, &keysyms) {
+        store_keymap_overrides(state, first_keycode, kpk, count, syms);
+    }
 }
 
 /// Install `count` keysym rows starting at `first_keycode` into

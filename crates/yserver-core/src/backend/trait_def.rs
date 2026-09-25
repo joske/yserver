@@ -2708,6 +2708,16 @@ pub trait Backend {
 
     fn get_modifier_mapping(&mut self, origin: Option<OriginContext>) -> io::Result<(u8, Vec<u8>)>;
 
+    /// Apply `ChangeKeyboardMapping` as Xorg's `XkbApplyMappingChange`; `false` = core stores the rows.
+    fn change_keyboard_mapping(
+        &mut self,
+        _first_keycode: u8,
+        _keysyms_per_keycode: u8,
+        _keysyms: &[u32],
+    ) -> bool {
+        false
+    }
+
     /// RANDR per-output identity for the read-only output properties
     /// `EDID` / `EDID_DATA` / `ConnectorType`: returns `(raw EDID blob,
     /// ConnectorType name)` for the given RANDR output id, or `None`

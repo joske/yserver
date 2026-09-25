@@ -27331,8 +27331,27 @@ impl Backend for KmsBackend {
         count: u8,
     ) -> io::Result<(u8, Vec<u32>)> {
         // Xorg's XkbGetCoreMap layout (one width for the whole map, §12.4 group order).
-        let map = crate::kms::xkb::core_keyboard_map(&self.core.xkb_keymap.0);
+        let map = crate::kms::xkb::core_keyboard_map(
+            &self.core.xkb_keymap.0,
+            &self.core.core_map_overrides,
+        );
         Ok((map.width, map.rows(first_keycode, count)))
+    }
+
+    fn change_keyboard_mapping(
+        &mut self,
+        first_keycode: u8,
+        keysyms_per_keycode: u8,
+        keysyms: &[u32],
+    ) -> bool {
+        crate::kms::xkb::apply_core_mapping_change(
+            &self.core.xkb_keymap.0,
+            &mut self.core.core_map_overrides,
+            first_keycode,
+            keysyms_per_keycode,
+            keysyms,
+        );
+        true
     }
 
     fn get_modifier_mapping(
@@ -46710,5 +46729,340 @@ mod tests {
             "a Present that carries no update region at all is a different \
              shape and must still be logged",
         );
+    }
+
+    /// One case of `testdata/xorg-change-keyboard-mapping.txt`.
+    struct KbdMapCase {
+        name: String,
+        layout: String,
+        options: Option<String>,
+        first: u8,
+        kpk: u8,
+        count: u8,
+        syms: Vec<u32>,
+        /// Further `(first, kpk, count, syms)` requests sent before the read-back.
+        more: Vec<(u8, u8, u8, Vec<u32>)>,
+        width: u8,
+        notify: Option<(u8, u8)>,
+        rows: std::collections::BTreeMap<u8, Vec<u32>>,
+    }
+
+    /// Parse the Xvfb capture into round-trip cases and `(first, kpk, count, nsyms, outcome)` edge lines.
+    /// `(first, kpk, count, nsyms, outcome)` of one invalid/edge request line.
+    type KbdMapEdge = (u8, u8, u8, usize, String);
+
+    fn parse_kbd_map_fixture(text: &str) -> (Vec<KbdMapCase>, Vec<KbdMapEdge>) {
+        let field = |line: &str, key: &str| -> String {
+            line.split(' ')
+                .find_map(|t| t.strip_prefix(&format!("{key}=")).map(str::to_owned))
+                .unwrap_or_default()
+        };
+        let hex_list = |v: &str| -> Vec<u32> {
+            if v == "-" {
+                Vec::new()
+            } else {
+                v.split(',')
+                    .map(|h| u32::from_str_radix(h, 16).unwrap())
+                    .collect()
+            }
+        };
+        let (mut cases, mut edges): (Vec<KbdMapCase>, Vec<_>) = (Vec::new(), Vec::new());
+        for line in text.lines() {
+            if line.starts_with("## + ") {
+                cases.last_mut().unwrap().more.push((
+                    field(line, "first").parse().unwrap(),
+                    field(line, "kpk").parse().unwrap(),
+                    field(line, "count").parse().unwrap(),
+                    hex_list(&field(line, "syms")),
+                ));
+            } else if let Some(rest) = line.strip_prefix("## ") {
+                let opts = field(line, "options");
+                cases.push(KbdMapCase {
+                    name: rest.split(' ').next().unwrap().to_owned(),
+                    layout: field(line, "layout"),
+                    options: (opts != "-").then_some(opts),
+                    first: field(line, "first").parse().unwrap(),
+                    kpk: field(line, "kpk").parse().unwrap(),
+                    count: field(line, "count").parse().unwrap(),
+                    syms: hex_list(&field(line, "syms")),
+                    more: Vec::new(),
+                    width: 0,
+                    notify: None,
+                    rows: std::collections::BTreeMap::new(),
+                });
+            } else if let Some(rest) = line.strip_prefix("! ") {
+                let (req, outcome) = rest.split_once(" -> ").unwrap();
+                edges.push((
+                    field(req, "first").parse().unwrap(),
+                    field(req, "kpk").parse().unwrap(),
+                    field(req, "count").parse().unwrap(),
+                    field(req, "nsyms").parse().unwrap(),
+                    outcome.to_owned(),
+                ));
+            } else if let Some(w) = line.strip_prefix("# keysyms_per_keycode=") {
+                cases.last_mut().unwrap().width = w.parse().unwrap();
+            } else if line.starts_with("# notify") {
+                cases.last_mut().unwrap().notify = Some((
+                    field(line, "first").parse().unwrap(),
+                    field(line, "count").parse().unwrap(),
+                ));
+            } else if !line.starts_with('#') && !line.is_empty() {
+                let mut it = line.split(' ');
+                let kc: u8 = it.next().unwrap().parse().unwrap();
+                let rest: Vec<&str> = it.collect();
+                let row = if rest == ["cleared"] {
+                    Vec::new()
+                } else {
+                    rest.iter()
+                        .map(|h| u32::from_str_radix(h, 16).unwrap())
+                        .collect()
+                };
+                cases.last_mut().unwrap().rows.insert(kc, row);
+            }
+        }
+        (cases, edges)
+    }
+
+    fn kbd_map_client(
+        state: &mut yserver_core::server::ServerState,
+    ) -> std::os::unix::net::UnixStream {
+        use std::{
+            collections::{HashMap, HashSet, VecDeque},
+            os::unix::net::UnixStream,
+            sync::{Arc, Mutex, atomic::AtomicU16},
+        };
+        let (peer, writer) = UnixStream::pair().unwrap();
+        writer.set_nonblocking(true).unwrap();
+        peer.set_nonblocking(true).unwrap();
+        state.clients.insert(
+            5,
+            yserver_core::server::ClientState {
+                writer: Arc::new(Mutex::new(yserver_core::transport::Transport::Unix(writer))),
+                byte_order: yserver_protocol::x11::ClientByteOrder::LittleEndian,
+                last_sequence: Arc::new(AtomicU16::new(0)),
+                resource_id_base: 0,
+                resource_id_mask: u32::MAX,
+                event_masks: HashMap::new(),
+                save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::new(),
+                xi1_event_classes: HashSet::new(),
+                xi1_window_event_classes: HashMap::new(),
+                outbound: VecDeque::new(),
+                watching_writable: false,
+                focused_window: yserver_core::resources::ROOT_WINDOW,
+                reader_control: None,
+                is_local: true,
+                fd_passing: true,
+            },
+        );
+        peer
+    }
+
+    fn kbd_map_drain(peer: &mut std::os::unix::net::UnixStream) -> Vec<u8> {
+        use std::io::Read;
+        let mut out = Vec::new();
+        let mut buf = [0u8; 65536];
+        while let Ok(n) = peer.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        out
+    }
+
+    fn kbd_map_request(
+        state: &mut yserver_core::server::ServerState,
+        backend: &mut KmsBackend,
+        opcode: u8,
+        data: u8,
+        body: &[u8],
+    ) {
+        use yserver_core::{backend::Backend, core_loop::process_request};
+        process_request::process_request(
+            state,
+            backend as &mut dyn Backend,
+            yserver_protocol::x11::ClientId(5),
+            yserver_protocol::x11::SequenceNumber(1),
+            yserver_protocol::x11::RequestHeader {
+                opcode,
+                data,
+                length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+            },
+            body,
+            None,
+        )
+        .expect("process_request");
+    }
+
+    /// ChangeKeyboardMapping { first, kpk, count, syms } as the wire body after the header.
+    fn change_kbd_map_body(first: u8, kpk: u8, syms: &[u32]) -> Vec<u8> {
+        let mut body = vec![first, kpk, 0, 0];
+        for s in syms {
+            body.extend_from_slice(&s.to_le_bytes());
+        }
+        body
+    }
+
+    /// GetKeyboardMapping(8, 248) as `(keysyms_per_keycode, keysyms)`.
+    fn kbd_map_get(
+        state: &mut yserver_core::server::ServerState,
+        backend: &mut KmsBackend,
+        peer: &mut std::os::unix::net::UnixStream,
+    ) -> (u8, Vec<u32>) {
+        kbd_map_request(state, backend, 101, 0, &[8, 248, 0, 0]);
+        let r = kbd_map_drain(peer);
+        assert_eq!(r[0], 1, "GetKeyboardMapping reply");
+        let syms = r[32..]
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        (r[1], syms)
+    }
+
+    fn kbd_map_backend(layout: &str, options: Option<&str>) -> KmsBackend {
+        let mut backend = KmsBackend::for_tests();
+        backend.core.recompile_keymap(&crate::kms::core::XkbRmlvo {
+            rules: "evdev".into(),
+            model: "pc105".into(),
+            layout: layout.into(),
+            variant: String::new(),
+            options: options.map(str::to_owned),
+        });
+        backend
+    }
+
+    /// Golden (Xvfb 21.1.24): core and XI key maps after ChangeKeyboardMapping, plus MappingNotify.
+    #[test]
+    fn change_keyboard_mapping_round_trips_as_xorg() {
+        let (cases, _) =
+            parse_kbd_map_fixture(include_str!("../testdata/xorg-change-keyboard-mapping.txt"));
+        assert_eq!(cases.len(), 26, "fixture parsed");
+        let mut failures = Vec::new();
+        for case in &cases {
+            let mut backend = kbd_map_backend(&case.layout, case.options.as_deref());
+            let mut state = yserver_core::server::ServerState::new();
+            let mut peer = kbd_map_client(&mut state);
+            let (w0, before) = kbd_map_get(&mut state, &mut backend, &mut peer);
+            let body = change_kbd_map_body(case.first, case.kpk, &case.syms);
+            kbd_map_request(&mut state, &mut backend, 100, case.count, &body);
+            let mut ev = kbd_map_drain(&mut peer);
+            for (first, kpk, count, syms) in &case.more {
+                kbd_map_request(
+                    &mut state,
+                    &mut backend,
+                    100,
+                    *count,
+                    &change_kbd_map_body(*first, *kpk, syms),
+                );
+                ev = kbd_map_drain(&mut peer);
+            }
+            let notify =
+                (ev.len() >= 32 && ev[0] & 0x7f == 34 && ev[4] == 1).then(|| (ev[5], ev[6]));
+            if notify != case.notify {
+                failures.push(format!(
+                    "{}: MappingNotify ours {notify:?} xorg {:?}",
+                    case.name, case.notify
+                ));
+            }
+            let (w, after) = kbd_map_get(&mut state, &mut backend, &mut peer);
+            if w != case.width {
+                failures.push(format!(
+                    "{}: keysyms_per_keycode ours {w} xorg {}",
+                    case.name, case.width
+                ));
+                continue;
+            }
+            for (i, row) in after.chunks(usize::from(w)).enumerate() {
+                let kc = u8::try_from(8 + i).unwrap();
+                let want = match case.rows.get(&kc) {
+                    Some(r) if r.is_empty() => vec![0; usize::from(w)],
+                    Some(r) => r.clone(),
+                    // Unlisted rows are unchanged; across a width change only all-NoSymbol rows are unlisted.
+                    None => {
+                        let old = &before[i * usize::from(w0)..(i + 1) * usize::from(w0)];
+                        let mut r = old.to_vec();
+                        r.resize(usize::from(w), 0);
+                        r
+                    }
+                };
+                if row != want.as_slice() {
+                    failures.push(format!(
+                        "{}: keycode {kc}: ours {row:x?} xorg {want:x?}",
+                        case.name
+                    ));
+                }
+            }
+            // XI GetDeviceKeyMapping on the master keyboard reads the same map.
+            kbd_map_request(&mut state, &mut backend, 137, 24, &[3, 8, 248, 0]);
+            let xi = kbd_map_drain(&mut peer);
+            let xi_syms: Vec<u32> = xi[32..]
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            if (xi[8], xi_syms) != (w, after) {
+                failures.push(format!(
+                    "{}: XI GetDeviceKeyMapping differs from core",
+                    case.name
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// XI ChangeDeviceKeyMapping goes through the same conversion (Xorg: both reach XkbApplyMappingChange).
+    #[test]
+    fn xi_change_device_key_mapping_converts_as_core() {
+        let (cases, _) =
+            parse_kbd_map_fixture(include_str!("../testdata/xorg-change-keyboard-mapping.txt"));
+        let case = cases.iter().find(|c| c.name == "two-sterling").unwrap();
+        let mut backend = kbd_map_backend(&case.layout, None);
+        let mut state = yserver_core::server::ServerState::new();
+        let mut peer = kbd_map_client(&mut state);
+        let mut body = vec![3, case.first, case.kpk, case.count];
+        for s in &case.syms {
+            body.extend_from_slice(&s.to_le_bytes());
+        }
+        kbd_map_request(&mut state, &mut backend, 137, 25, &body);
+        let _ = kbd_map_drain(&mut peer);
+        let (w, after) = kbd_map_get(&mut state, &mut backend, &mut peer);
+        let i = usize::from(case.first - 8) * usize::from(w);
+        assert_eq!(w, case.width);
+        assert_eq!(
+            &after[i..i + usize::from(w)],
+            case.rows[&case.first].as_slice()
+        );
+    }
+
+    /// Golden (Xvfb): ProcChangeKeyboardMapping's BadLength/BadValue rules and error values.
+    #[test]
+    fn change_keyboard_mapping_errors_as_xorg() {
+        let (_, edges) =
+            parse_kbd_map_fixture(include_str!("../testdata/xorg-change-keyboard-mapping.txt"));
+        assert_eq!(edges.len(), 9, "fixture parsed");
+        let mut failures = Vec::new();
+        for (first, kpk, count, nsyms, want) in edges {
+            let mut backend = kbd_map_backend("gb", None);
+            let mut state = yserver_core::server::ServerState::new();
+            let mut peer = kbd_map_client(&mut state);
+            let body = change_kbd_map_body(first, kpk, &vec![0x61; nsyms]);
+            kbd_map_request(&mut state, &mut backend, 100, count, &body);
+            let r = kbd_map_drain(&mut peer);
+            let got = if r.first() == Some(&0) {
+                let value = u32::from_le_bytes([r[4], r[5], r[6], r[7]]);
+                format!("error={} value={value}", r[1])
+            } else if r.len() >= 32 && r[0] & 0x7f == 34 {
+                format!("ok notify={},{}", r[5], r[6])
+            } else {
+                "ok notify=none".to_owned()
+            };
+            if got != want {
+                failures.push(format!(
+                    "first={first} kpk={kpk} count={count} nsyms={nsyms}: ours {got} xorg {want}"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 }
