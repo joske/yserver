@@ -1,0 +1,41 @@
+# Xorg core GetModifierMapping golden vector: xorg-server-xvfb 21.1.24, xkeyboard-config 2.48, evdev/pc105
+[us]
+# keycodes_per_modifier=4
+0 50 62 0 0
+1 66 0 0 0
+2 37 105 0 0
+3 64 108 204 205
+4 77 0 0 0
+5 203 0 0 0
+6 133 134 206 0
+7 92 0 0 0
+[gb]
+# keycodes_per_modifier=3
+0 50 62 0
+1 66 0 0
+2 37 105 0
+3 64 204 205
+4 77 0 0
+5 203 0 0
+6 133 134 206
+7 92 0 0
+[de]
+# keycodes_per_modifier=3
+0 50 62 0
+1 66 0 0
+2 37 105 0
+3 64 204 205
+4 77 0 0
+5 203 0 0
+6 133 134 206
+7 92 0 0
+[usru]
+# keycodes_per_modifier=4
+0 50 62 0 0
+1 66 0 0 0
+2 37 105 0 0
+3 64 108 204 205
+4 77 0 0 0
+5 203 0 0 0
+6 133 134 206 0
+7 92 0 0 0

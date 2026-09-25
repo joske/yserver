@@ -339,8 +339,8 @@ pub(super) fn virtual_mods_from_keymap(keymap: &Keymap) -> VirtualModData {
         let Some(name) = vmod_name_for_keysym(sym) else {
             continue;
         };
-        // Real-modifier binding probed from THIS keymap (same source as
-        // the modmap): the lv3 chooser binds ISO_Level3_Shift→Mod5, which
+        // Real-modifier binding probed from THIS keymap (what a press
+        // activates): the lv3 chooser binds ISO_Level3_Shift→Mod5, which
         // the keysym table got wrong (it guessed Mod1).
         let real_mod = real_mod_mask_for_keycode(keymap, u32::from(kc_raw));
 
@@ -368,41 +368,69 @@ pub(super) fn virtual_mods_from_keymap(keymap: &Keymap) -> VirtualModData {
     }
 }
 
+/// The keymap's `modifier_map` statements as a per-keycode real-mod mask
+/// (Xorg's `xkb->map->modmap`). xkbcommon has no API for a key's modmap,
+/// so read it back from its own keymap text, which carries every
+/// `modifier_map <Mod> { <KEY>, ... };` line the compiler kept.
+pub(super) fn keymap_modmap(keymap: &Keymap) -> [u8; 256] {
+    let mut modmap = [0u8; 256];
+    let text = keymap.get_as_string(xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1);
+    for line in text.lines() {
+        let Some(rest) = line.trim_start().strip_prefix("modifier_map") else {
+            continue;
+        };
+        let Some((name, keys)) = rest.split_once('{') else {
+            continue;
+        };
+        let Some(bit) = real_mod_bit_for_name(name.trim()) else {
+            continue;
+        };
+        let keys = keys.split('}').next().unwrap_or_default();
+        for key in keys.split(',') {
+            let Some(key) = key
+                .trim()
+                .strip_prefix('<')
+                .and_then(|k| k.strip_suffix('>'))
+            else {
+                continue;
+            };
+            if let Some(kc) = keymap
+                .key_by_name(key)
+                .and_then(|kc| u8::try_from(kc.raw()).ok())
+            {
+                modmap[usize::from(kc)] |= bit;
+            }
+        }
+    }
+    modmap
+}
+
+/// Real-modifier bit for an XKB modifier name as `modifier_map` spells it.
+fn real_mod_bit_for_name(name: &str) -> Option<u8> {
+    const NAMES: [&str; 8] = [
+        "Shift", "Lock", "Control", "Mod1", "Mod2", "Mod3", "Mod4", "Mod5",
+    ];
+    NAMES
+        .iter()
+        .position(|n| n.eq_ignore_ascii_case(name))
+        .map(|i| 1u8 << i)
+}
+
 /// Build the core `GetModifierMapping` table from the live keymap.
 ///
 /// Returns `(keycodes_per_modifier, data)` where `data` is
 /// `8 * keycodes_per_modifier` bytes: the keycodes assigned to each
 /// of Shift, Lock, Control, Mod1, Mod2, Mod3, Mod4, Mod5 in that
-/// order, zero-padded per row. Derived by probing each keycode's
-/// real-modifier mask in the live keymap ([`real_mod_mask_for_keycode`])
-/// — the same source of truth as the XKB `GetMap` modifier-map — so the
-/// core and XKB views of "which key is Super/Alt/…" never disagree.
+/// order, zero-padded per row. A port of Xorg's `generate_modkeymap`
+/// (dix/inpututils.c) over [`keymap_modmap`]: each row lists its keycodes
+/// in ascending order and the width is the longest row.
 pub(super) fn modifier_mapping_from_keymap(keymap: &Keymap) -> (u8, Vec<u8>) {
-    // One row per standard X11 modifier bit, indexed by bit position
-    // (Shift=0, Lock=1, Control=2, Mod1=3, …, Mod5=7).
+    let modmap = keymap_modmap(keymap);
     let mut rows: [Vec<u8>; 8] = Default::default();
-
-    let (min_kc, max_kc) = clamped_keycode_bounds(keymap);
-
-    for kc_raw in min_kc..=max_kc {
-        let kc = Keycode::new(u32::from(kc_raw));
-        if keymap.num_layouts_for_key(kc) == 0 {
-            continue;
-        }
-        if keymap.key_get_syms_by_level(kc, 0, 0).is_empty() {
-            continue;
-        }
-        // Real-modifier mask probed from the live keymap (same source as
-        // the XKB GetMap modifier-map), so the core and XKB views never
-        // disagree. A key may activate more than one real-mod bit; push
-        // it into every matching row.
-        let mask = real_mod_mask_for_keycode(keymap, u32::from(kc_raw));
-        if mask == 0 {
-            continue;
-        }
+    for kc in 8..=255u8 {
         for (row, kcs) in rows.iter_mut().enumerate() {
-            if mask & (1u8 << row) != 0 {
-                kcs.push(kc_raw);
+            if modmap[usize::from(kc)] & (1u8 << row) != 0 {
+                kcs.push(kc);
             }
         }
     }
@@ -512,10 +540,7 @@ pub(super) fn reply_get_map_for_request(keymap: &Keymap, body: &[u8]) -> Vec<u8>
 ///   max level count across those groups`, and the keysyms pulled
 ///   straight from xkbcommon in group-major order. Keys with no
 ///   syms get the 8-byte header only (width=0, num_groups=0).
-/// * `ModifierMap` populated by probing each key's real-modifier mask
-///   in the live keymap (`real_mod_mask_for_keycode`) so Shift/Ctrl/Alt/
-///   Lock/AltGr translate correctly on the client — option-agnostic
-///   (e.g. ISO_Level3_Shift→Mod5 under lv3:ralt_switch, not Mod1).
+/// * `ModifierMap` is the keymap's `modifier_map` ([`keymap_modmap`]), as Xorg sends it.
 /// * `KeyActions` advertises the full `[min, max]` range with
 ///   per-key counts of zero — xkbcommon's `get_actions` requires
 ///   exact range coverage, but accepts no actions per key.
@@ -567,6 +592,7 @@ fn reply_get_map_for_parts(keymap: &Keymap, requested_parts: u16) -> Vec<u8> {
     // group's level-0 keysym (AltGr / layout switch).
     let mut keys: Vec<KeyData> = Vec::with_capacity(usize::from(n_keys));
     let mut modmap: Vec<ModMapEntry> = Vec::new();
+    let key_modmap = keymap_modmap(keymap);
     let mut total_syms: u32 = 0;
     for kc_raw in min_kc..=max_kc {
         let kc = Keycode::new(u32::from(kc_raw));
@@ -611,20 +637,19 @@ fn reply_get_map_for_parts(keymap: &Keymap, requested_parts: u16) -> Vec<u8> {
         }
         let nsyms_this = u32::from(width) * u32::from(num_groups);
         total_syms = total_syms.saturating_add(nsyms_this);
-        // Capture modmap entry from the real-modifier mask this key
-        // actually activates in the live keymap (probed via a scratch
-        // xkb state). A key is a modifier key iff that mask is non-zero.
-        // This is option-agnostic and correct where the keysym table was
-        // not (e.g. ISO_Level3_Shift→Mod5 under lv3:ralt_switch, not Mod1).
+        // ModifierMap = the keymap's modifier_map, as Xorg sends xkb->map->modmap (xkb.c:1317-1341).
+        // The SetMods/LockMods action mask is what a press activates (GH #59), not the modmap.
         let mut mod_bit = 0u8;
         let mut mod_lock = false;
+        if key_modmap[usize::from(kc_raw)] != 0 {
+            modmap.push(ModMapEntry {
+                keycode: kc_raw,
+                mods: key_modmap[usize::from(kc_raw)],
+            });
+        }
         if num_groups != 0 && !syms.is_empty() {
             let bit = real_mod_mask_for_keycode(keymap, u32::from(kc_raw));
             if bit != 0 {
-                modmap.push(ModMapEntry {
-                    keycode: kc_raw,
-                    mods: bit,
-                });
                 mod_bit = bit;
                 // Caps_Lock (0xFFE5) / Num_Lock (0xFF7F) are LOCK
                 // modifiers (LockMods); everything else is SetMods.
@@ -4042,5 +4067,93 @@ mod tests {
         let km = keymap_for("us,ru", Some("grp:alt_shift_toggle"));
         let d = core_map_diffs(&km, include_str!("testdata/xorg-core-map-usru.txt"));
         assert!(d.is_empty(), "{}", d.join("\n"));
+    }
+
+    /// `(keycodes_per_modifier, data)` for one `[layout]` of `testdata/xorg-modmap.txt`.
+    fn modmap_golden(layout: &str) -> (u8, Vec<u8>) {
+        let text = include_str!("testdata/xorg-modmap.txt");
+        let mut lines = text
+            .lines()
+            .skip_while(|l| *l != format!("[{layout}]"))
+            .skip(1);
+        let kpm: u8 = lines
+            .next()
+            .and_then(|l| l.strip_prefix("# keycodes_per_modifier="))
+            .expect("kpm header")
+            .parse()
+            .unwrap();
+        let mut data = Vec::new();
+        for (row, line) in lines.take(8).enumerate() {
+            let mut it = line.split(' ').map(|v| v.parse::<u8>().unwrap());
+            assert_eq!(it.next(), u8::try_from(row).ok());
+            data.extend(it);
+        }
+        assert_eq!(data.len(), 8 * usize::from(kpm));
+        (kpm, data)
+    }
+
+    /// Our GetModifierMapping vs Xorg's; rows `(modifier, keycodes)` on mismatch.
+    fn assert_modmap_matches_xorg(km: &xkbcommon::xkb::Keymap, layout: &str) {
+        let rows = |(kpm, d): &(u8, Vec<u8>)| -> Vec<(usize, Vec<u8>)> {
+            d.chunks(usize::from(*kpm).max(1))
+                .map(<[u8]>::to_vec)
+                .enumerate()
+                .collect()
+        };
+        let (want, got) = (modmap_golden(layout), modifier_mapping_from_keymap(km));
+        assert_eq!(
+            (got.0, rows(&got)),
+            (want.0, rows(&want)),
+            "{layout}: (kpm, rows) ours vs xorg"
+        );
+    }
+
+    #[test]
+    fn modifier_mapping_matches_xorg_us() {
+        assert_modmap_matches_xorg(&keymap_for("us", None), "us");
+    }
+
+    #[test]
+    fn modifier_mapping_matches_xorg_gb() {
+        assert_modmap_matches_xorg(&keymap_for("gb", None), "gb");
+    }
+
+    #[test]
+    fn modifier_mapping_matches_xorg_de() {
+        assert_modmap_matches_xorg(&keymap_for("de", None), "de");
+    }
+
+    #[test]
+    fn modifier_mapping_matches_xorg_us_ru() {
+        let km = keymap_for("us,ru", Some("grp:alt_shift_toggle"));
+        assert_modmap_matches_xorg(&km, "usru");
+    }
+
+    /// Xorg's XkbGetMap sends the same `xkb->map->modmap` the core map is built from.
+    #[test]
+    fn get_map_modifier_map_matches_xorg_gb() {
+        let (kpm, data) = modmap_golden("gb");
+        let mut want = std::collections::BTreeMap::<u8, u8>::new();
+        for (i, &kc) in data.iter().enumerate() {
+            if kc != 0 {
+                *want.entry(kc).or_default() |= 1 << (i / usize::from(kpm));
+            }
+        }
+        let km = keymap_for("gb", None);
+        let r = reply_get_map(&km);
+        let n_keys = usize::from(r[11] - r[10] + 1);
+        let (_types, mut off) = parse_key_types(&r);
+        for _ in 0..n_keys {
+            let nsyms = u16::from_le_bytes([r[off + 6], r[off + 7]]) as usize;
+            off += 8 + nsyms * 4;
+        }
+        let total_acts = u16::from_le_bytes([r[22], r[23]]) as usize;
+        off += n_keys + ((4 - n_keys % 4) % 4) + total_acts * 8;
+        let vmod_count = virtual_mods_from_keymap(&km).present_mask.count_ones() as usize;
+        off += vmod_count + ((4 - vmod_count % 4) % 4);
+        let got: Vec<(u8, u8)> = (0..usize::from(r[33]))
+            .map(|i| (r[off + 2 * i], r[off + 2 * i + 1]))
+            .collect();
+        assert_eq!(got, want.into_iter().collect::<Vec<_>>());
     }
 }

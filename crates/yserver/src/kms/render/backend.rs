@@ -27339,10 +27339,7 @@ impl Backend for KmsBackend {
         &mut self,
         _origin: Option<OriginContext>,
     ) -> io::Result<(u8, Vec<u8>)> {
-        // Derive the modifier→keycode table from the live keymap so
-        // it always agrees with the XKB GetMap modifier map (same
-        // `real_mod_mask_for_keycode` keymap-probe source of truth).
-        // Avoids a hand-written table drifting from the actual keymap.
+        // Xorg's generate_modkeymap over the keymap's modifier_map, the same data XKB GetMap sends.
         Ok(crate::kms::xkb::modifier_mapping_from_keymap(
             &self.core.xkb_keymap.0,
         ))
