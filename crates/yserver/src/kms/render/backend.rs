@@ -18588,6 +18588,26 @@ impl Backend for KmsBackend {
                 return;
             }
             HostInputEvent::Key(raw) => {
+                // Xorg `Xi/exevents.c` UpdateDeviceState: "don't allow
+                // ddx to generate multiple downs" and "guard against
+                // duplicates" — a press of a key already down, or a
+                // release of a key that is not, is DONT_PROCESS: it
+                // reaches neither XKB nor any client. XTEST clients do
+                // send these (`xdotool key super+5` presses Super_L
+                // three times and releases it twice), and xkbcommon
+                // counts every down, so without this guard the extra
+                // press leaves the modifier set forever (#168).
+                // Autorepeat is unaffected: `fire_pending_repeats`
+                // emits a release before each repeated press.
+                if raw.pressed == self.core.down_keys.contains(&raw.keycode) {
+                    log::debug!(
+                        "host key {} {}: key already {}, dropped (Xorg duplicate guard)",
+                        raw.keycode,
+                        if raw.pressed { "press" } else { "release" },
+                        if raw.pressed { "down" } else { "up" },
+                    );
+                    return;
+                }
                 let cooked = self.cook_host_key(raw);
                 // Maintain the held-keys set so suspend can synthesize
                 // releases (Task 10). Use the COOKED keycode so
@@ -36090,6 +36110,64 @@ mod tests {
             }
             None => panic!("Mod4+Return must activate the WM passive key grab"),
         }
+    }
+
+    /// Issue #168: `xdotool key super+5` sends Super_L press THREE
+    /// times, then 5, then Super_L release only TWICE, then 5's release
+    /// (XTEST FakeInput sequence captured from yserver's log in the vng
+    /// `xtest-super-stuck` scenario). Xorg drops a press of a key that
+    /// is already down and a release of a key that is not
+    /// (`Xi/exevents.c` "don't allow ddx to generate multiple downs" /
+    /// "guard against duplicates"), so neither reaches XKB. Fed to
+    /// xkbcommon, three downs against two ups left Mod4 set after every
+    /// key was up: Super stuck system-wide until a VT switch.
+    #[test]
+    fn duplicate_key_press_and_release_do_not_stick_modifier() {
+        use yserver_core::{
+            core_loop::HostInputEvent, host_x11::HostKeyEvent, server::ServerState,
+        };
+
+        const SUPER_L: u8 = 133;
+        const FIVE: u8 = 14;
+        const MOD4: u16 = 0x40;
+
+        let mut b = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        let key = |keycode, pressed| {
+            HostInputEvent::Key(HostKeyEvent {
+                keycode,
+                pressed,
+                state: 0,
+                root_x: 0,
+                root_y: 0,
+                event_x: 0,
+                event_y: 0,
+                time: 0,
+            })
+        };
+
+        for (keycode, pressed) in [
+            (SUPER_L, true),
+            (SUPER_L, true),
+            (SUPER_L, true),
+            (FIVE, true),
+            (SUPER_L, false),
+            (SUPER_L, false),
+            (FIVE, false),
+        ] {
+            b.on_host_input(&mut state, key(keycode, pressed));
+        }
+
+        assert_eq!(
+            b.serialize_modifiers() & MOD4,
+            0,
+            "Super_L must not stay latched once every key is released"
+        );
+        assert!(b.core.down_keys.is_empty(), "no key may remain held");
+        assert!(
+            state.keys_down.iter().all(|&byte| byte == 0),
+            "QueryKeymap must report no held keys"
+        );
     }
 
     /// Test A: a compiled `grp:alt_shift_toggle` option makes the
