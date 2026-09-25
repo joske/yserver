@@ -19478,6 +19478,15 @@ fn handle_xi2_request(
                     change.map_notify,
                 );
             }
+            // The core MappingNotify only when the master keyboard changed
+            // (Xorg XkbSendLegacyMapNotify → XIShouldNotify), as for
+            // SetDeviceModifierMapping.
+            if count != 0 && dev == crate::xinput::DEVICEID_MASTER_KEYBOARD {
+                let targets: Vec<ClientId> = state.clients.keys().map(|id| ClientId(*id)).collect();
+                let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
+                    let _ = x11::write_mapping_notify_event(buf, order, seq, 1, first, count);
+                });
+            }
             // ChangeDeviceKeyMapping is void (no reply), so the event
             // ordering question is moot: send to originator + others.
             // request_kind=1 = MappingKeyboard.
@@ -19598,54 +19607,66 @@ fn handle_xi2_request(
             // request's path: a keycode outside the keycode range (xts5
             // SetDeviceModifierMapping-8 probes MinKeyCode-1) or listed
             // twice is BadValue; a held modifier key is MappingBusy.
-            let status =
-                match change_modifier_mapping(state, backend, origin, kpm, &keycodes, Some(dev)) {
-                    ModmapChangeOutcome::Success => 0,
-                    ModmapChangeOutcome::Busy => 1,
-                    ModmapChangeOutcome::BadValue(value) => {
-                        return xi1_error(
-                            state,
-                            client_id,
-                            sequence,
-                            x11::error::BAD_VALUE,
-                            value,
-                            minor,
-                        );
-                    }
-                };
-            // Busy changed nothing and notifies nothing (Xi/setmmap.c).
-            // xts5 does `Expect_Event` then `Expect_Reply`, so emit
-            // event BEFORE the reply. request_kind=0 = MappingModifier.
-            if status == 0
-                && crate::core_loop::xi1_focus::xi1_client_wants_device_mapping_notify(
+            // Busy changed nothing and notifies nothing (Xi/setmmap.c). On
+            // success the DeviceMappingNotify goes out before the XKB and
+            // core notifications: to the requester (xts5 does
+            // `Expect_Event` then `Expect_Reply`, so ahead of the reply too)
+            // and to every other client that selected it.
+            // request_kind=0 = MappingModifier.
+            let notify_device = |state: &mut ServerState| {
+                if crate::core_loop::xi1_focus::xi1_client_wants_device_mapping_notify(
                     state, client_id, dev,
-                )
-            {
-                let time = state.timestamp_now();
-                #[allow(clippy::cast_possible_truncation)]
-                let device_byte = dev as u8;
-                crate::xinput::encode_xi1_device_mapping_notify(
-                    &mut buf,
-                    byte_order,
-                    crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET,
-                    device_byte,
-                    sequence,
-                    time,
-                    0,
-                    0,
-                    0,
+                ) {
+                    let time = state.timestamp_now();
+                    #[allow(clippy::cast_possible_truncation)]
+                    let device_byte = dev as u8;
+                    let _dropped =
+                        fanout_event_to_clients(state, &[client_id], |buf, seq, order| {
+                            crate::xinput::encode_xi1_device_mapping_notify(
+                                buf,
+                                order,
+                                crate::server::XI_FIRST_EVENT
+                                    + crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET,
+                                device_byte,
+                                seq,
+                                time,
+                                0,
+                                0,
+                                0,
+                            );
+                        });
+                }
+                crate::core_loop::xi1_focus::emit_device_mapping_notify(
+                    state, client_id, dev, 0, 0, 0,
                 );
-            }
+            };
+            let status = match change_modifier_mapping(
+                state,
+                backend,
+                origin,
+                kpm,
+                &keycodes,
+                Some(dev),
+                notify_device,
+            ) {
+                ModmapChangeOutcome::Success => 0,
+                ModmapChangeOutcome::Busy => 1,
+                ModmapChangeOutcome::BadValue(value) => {
+                    return xi1_error(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_VALUE,
+                        value,
+                        minor,
+                    );
+                }
+            };
             // xSetDeviceModifierMappingReply: RepType @1, success @8.
             let mut reply = x11::fixed_reply(byte_order, sequence, minor, 0);
             reply.push(status);
             reply.extend_from_slice(&[0u8; 23]);
             buf.extend_from_slice(&reply);
-            if status == 0 {
-                crate::core_loop::xi1_focus::emit_device_mapping_notify(
-                    state, client_id, dev, 0, 0, 0,
-                );
-            }
         }
         // GetDeviceButtonMapping: { deviceid }. Real reply: the 7-button
         // identity map the device advertises in ListInputDevices — the
@@ -24228,7 +24249,8 @@ fn handle_set_modifier_mapping(
     };
     // Xorg ProcSetModifierMapping: BadValue for a refused map, else the
     // change_modmap status in the reply.
-    let status = match change_modifier_mapping(state, backend, origin, kpm, keycodes, None) {
+    let status = match change_modifier_mapping(state, backend, origin, kpm, keycodes, None, |_| {})
+    {
         ModmapChangeOutcome::Success => 0,
         ModmapChangeOutcome::Busy => 1,
         ModmapChangeOutcome::BadValue(value) => {
@@ -24279,6 +24301,10 @@ enum ModmapChangeOutcome {
 /// and notifies, as on Xorg. Keyboard devices share the one keymap, so the XI
 /// request changes it for every device (Xorg: the device, its master or
 /// slaves).
+///
+/// `on_applied` runs once the change took effect and before any notification
+/// goes out: the XI request sends its DeviceMappingNotify there, so its
+/// clients see it ahead of the XKB and core notifications, as on Xorg.
 fn change_modifier_mapping(
     state: &mut ServerState,
     backend: &mut dyn Backend,
@@ -24286,6 +24312,7 @@ fn change_modifier_mapping(
     kpm: u8,
     keycodes: &[u8],
     xi_device: Option<u16>,
+    on_applied: impl FnOnce(&mut ServerState),
 ) -> ModmapChangeOutcome {
     const MIN_KEYCODE: usize = 8;
     const MAX_KEYCODE: usize = 255;
@@ -24320,6 +24347,11 @@ fn change_modifier_mapping(
         return ModmapChangeOutcome::Busy;
     }
 
+    // Xorg XkbSendLegacyMapNotify → XIShouldNotify: the core MappingNotify
+    // is for clients whose master keyboard changed. An XI request on a slave
+    // reaches the master only as its lastSlave, which the device an XI client
+    // remaps isn't on Xorg (XTEST drives a slave of its own there).
+    let core_notify = xi_device.is_none_or(|dev| dev == crate::xinput::DEVICEID_MASTER_KEYBOARD);
     let Some(change) = backend.set_modifier_mapping(&modmap) else {
         match xi_device {
             Some(dev) => {
@@ -24327,7 +24359,8 @@ fn change_modifier_mapping(
             }
             None => state.modifier_mapping_override = Some((kpm, keycodes.to_vec())),
         }
-        if xi_device.is_none() {
+        on_applied(state);
+        if core_notify {
             let targets: Vec<ClientId> = state.clients.keys().map(|id| ClientId(*id)).collect();
             let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
                 let _ = x11::write_mapping_notify_event(buf, order, seq, 0, 0, 0);
@@ -24338,12 +24371,15 @@ fn change_modifier_mapping(
     // The keymap is the one modifier map now: drop any stored readback.
     state.modifier_mapping_override = None;
     state.xi1_modifier_map.clear();
+    on_applied(state);
     let xkb_event_base = backend.xkb_info().map_or(0, |(_maj, ev, _err)| ev);
     crate::core_loop::xkb_layout::send_xkb_map_notify(state, xkb_event_base, change.map_notify);
-    let targets: Vec<ClientId> = state.clients.keys().map(|id| ClientId(*id)).collect();
-    let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
-        let _ = x11::write_mapping_notify_event(buf, order, seq, 0, 0, 0);
-    });
+    if core_notify {
+        let targets: Vec<ClientId> = state.clients.keys().map(|id| ClientId(*id)).collect();
+        let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
+            let _ = x11::write_mapping_notify_event(buf, order, seq, 0, 0, 0);
+        });
+    }
     crate::core_loop::xkb_layout::send_keyboard_mapping_followups(
         state,
         xkb_event_base,

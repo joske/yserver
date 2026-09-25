@@ -48786,12 +48786,56 @@ mod tests {
     /// same MapNotify, core GetModifierMapping reads the change, a held
     /// modifier makes it MappingBusy, and the reply carries RepType and the
     /// status (Xi/setmmap.c).
+    /// Xorg's XkbSendLegacyMapNotify only sends the core MappingNotify to a
+    /// client whose current master keyboard changed (`XIShouldNotify`). An XI
+    /// request on a slave reaches the master only when that slave is the
+    /// master's lastSlave, and on Xorg XTEST drives its own slave, so the
+    /// device an XI client remaps isn't. xts5 XIproto
+    /// SetDeviceModifierMapping-1 (passes on Xorg): DeviceMappingNotify, then
+    /// the reply, no core MappingNotify in between. On the master keyboard
+    /// the core MappingNotify goes out.
+    #[test]
+    fn xi_modifier_mapping_core_notify_only_for_the_master_keyboard() {
+        const MAPPING_NOTIFY: u8 = 34;
+        // Golden held-nonmodifier-unaffected, gb (`smmx:-66@1,+66@2`).
+        let keys: [u8; 24] = [
+            50, 62, 0, 0, 0, 0, 37, 105, 66, 64, 204, 205, 77, 0, 0, 203, 0, 0, 133, 134, 206, 92,
+            0, 0,
+        ];
+        for (dev, want_core) in [(5u8, false), (3u8, true)] {
+            let mut backend = kbd_map_backend("gb", None);
+            let mut state = yserver_core::server::ServerState::new();
+            let mut peer = kbd_map_client(&mut state);
+            let mut body = vec![dev, 3, 0, 0];
+            body.extend_from_slice(&keys);
+            kbd_map_request(&mut state, &mut backend, 137, 27, &body);
+            let got = kbd_map_drain(&mut peer);
+            let types: Vec<u8> = got.chunks(32).map(|e| e[0] & 0x7f).collect();
+            assert_eq!(
+                types.contains(&MAPPING_NOTIFY),
+                want_core,
+                "device {dev}: core MappingNotify expected={want_core}, got {types:02x?}"
+            );
+            let reply = got.chunks(32).last().unwrap();
+            assert_eq!((reply[0], reply[1], reply[8]), (1, 27, 0), "Success reply");
+        }
+    }
+
     #[test]
     fn xi_set_device_modifier_mapping_edits_the_keymap() {
         let mut backend = kbd_map_backend("gb", None);
         let mut state = yserver_core::server::ServerState::new();
         let mut peer = kbd_map_client(&mut state);
         state.xkb_select_event_masks.insert((5, 0x0100), 0x0002);
+        // The requester also selects DeviceMappingNotify on device 3 (class
+        // = deviceid << 8 | type; type = XI first event 66 + offset 11).
+        const DEVICE_MAPPING_NOTIFY: u8 = 66 + 11;
+        state
+            .clients
+            .get_mut(&5)
+            .unwrap()
+            .xi1_event_classes
+            .insert((3 << 8) | u32::from(DEVICE_MAPPING_NOTIFY));
         // Golden held-nonmodifier-unaffected, gb: 66 moved from Lock to
         // Control (`smmx:-66@1,+66@2`).
         let keys: [u8; 24] = [
@@ -48802,6 +48846,17 @@ mod tests {
         body.extend_from_slice(&keys);
         kbd_map_request(&mut state, &mut backend, 137, 27, &body);
         let got = kbd_map_drain(&mut peer);
+        // Xorg (Xi/setmmap.c SendDeviceMappingNotify, before the XKB
+        // notifications reach the client): the XI requester sees its
+        // DeviceMappingNotify first — xts5 XIproto SetDeviceModifierMapping-1
+        // "wanted DeviceMappingNotify, got MappingNotify", and XI
+        // SetDeviceModifierMapping-2, both pass on Xorg.
+        assert_eq!(
+            got.first().map(|b| b & 0x7f),
+            Some(DEVICE_MAPPING_NOTIFY),
+            "first event must be DeviceMappingNotify: {:02x?}",
+            got.chunks(32).map(|e| e[0]).collect::<Vec<_>>()
+        );
         let map_notify = got
             .chunks(32)
             .find(|e| e[0] == 85 && e[1] == 1)
