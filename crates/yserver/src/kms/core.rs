@@ -137,6 +137,16 @@ impl std::fmt::Display for KeymapTextError {
 
 impl std::error::Error for KeymapTextError {}
 
+/// A fresh cooking state for `keymap`, its derived state (the LEDs)
+/// computed. `xkb_state_new` leaves every LED off until the first state
+/// update, so an indicator whose map lights it in the neutral state (Xorg:
+/// e.g. effective group 1) would read off; a neutral update computes it.
+fn fresh_state(keymap: &xkbcommon::xkb::Keymap) -> xkbcommon::xkb::State {
+    let mut state = xkbcommon::xkb::State::new(keymap);
+    state.update_mask(0, 0, 0, 0, 0, 0);
+    state
+}
+
 /// Real modifiers (X11 bits 0..=7) that are locked in `state`.
 fn locked_real_mods(state: &xkbcommon::xkb::State, keymap: &xkbcommon::xkb::Keymap) -> u8 {
     crate::kms::xkb::REAL_MOD_NAMES
@@ -2175,7 +2185,7 @@ impl KmsCore {
             }
         };
         let (xkb_desc, xkb_text, keymap) = cooking_keymap_for(&xkb_context.0, keymap, &rmlvo);
-        let xkb_state = XkbState(xkbcommon::xkb::State::new(&keymap));
+        let xkb_state = XkbState(fresh_state(&keymap));
         let xkb_keymap = XkbKeymap(keymap);
 
         let mut xid_map: HostXidMap = HashMap::new();
@@ -2264,7 +2274,7 @@ impl KmsCore {
         .expect("test xkb keymap");
         let (xkb_desc, xkb_text, keymap) =
             cooking_keymap_for(&xkb_context.0, keymap, &XkbRmlvo::default());
-        let xkb_state = XkbState(xkbcommon::xkb::State::new(&keymap));
+        let xkb_state = XkbState(fresh_state(&keymap));
         let xkb_keymap = XkbKeymap(keymap);
 
         Self {
@@ -2455,7 +2465,7 @@ impl KmsCore {
     /// `relock` locked again, then every held key in `down_keys` re-applied
     /// (locks first, so the replay happens on a neutral keyboard).
     fn swap_keymap(&mut self, keymap: xkbcommon::xkb::Keymap, relock: u8) {
-        let mut new_state = xkbcommon::xkb::State::new(&keymap);
+        let mut new_state = fresh_state(&keymap);
         let dropped = relock_real_mods(&mut new_state, &keymap, relock);
         if dropped != 0 {
             log::info!(

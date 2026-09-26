@@ -104,6 +104,8 @@ const XKB_LAST_REQUEST: u8 = 25;
 const X_KB_USE_EXTENSION: u8 = 0;
 const X_KB_SELECT_EVENTS: u8 = 1;
 const X_KB_SET_MAP: u8 = 9;
+const X_KB_SET_COMPAT_MAP: u8 = 11;
+const X_KB_SET_INDICATOR_MAP: u8 = 14;
 /// FocusChangeMask
 const FOCUS_CHANGE_MASK: u32 = 0x0020_0000;
 
@@ -20536,6 +20538,8 @@ fn handle_xkb_request(
     let min_body = match minor {
         X_KB_SELECT_EVENTS => 12,
         X_KB_SET_MAP => 32,
+        X_KB_SET_COMPAT_MAP => 12,
+        X_KB_SET_INDICATOR_MAP => 8,
         _ => 0,
     };
     if body.len() < min_body {
@@ -20773,7 +20777,9 @@ fn handle_xkb_request(
 /// Send what an XKB Set* request did, in Xorg's order: each
 /// `XkbSendNewKeyboardNotify` / `XkbSendNotification` with its legacy core
 /// MappingNotify, the per-key repeat re-derivation copied to the core
-/// keyboard feedback. `major`/`minor` are the request's (the events' cause).
+/// keyboard feedback, `_XkbSetCompatMap`'s CompatMapNotify and
+/// `XkbApplyLedMapChanges`' indicator notifications. `major`/`minor` are the
+/// request's (the events' cause).
 fn send_xkb_set_events(
     state: &mut ServerState,
     backend: &dyn Backend,
@@ -20839,6 +20845,12 @@ fn send_xkb_set_events(
             }
             XkbSetEvent::Repeats(repeats) => {
                 let _ = crate::core_loop::xkb_layout::apply_repeats_to_core(state, repeats);
+            }
+            XkbSetEvent::CompatMap(notify) => {
+                crate::core_loop::xkb_layout::send_xkb_compat_map_notify(state, base, *notify);
+            }
+            XkbSetEvent::IndicatorMaps(change) => {
+                crate::core_loop::xkb_layout::send_indicator_maps_change(state, base, change);
             }
         }
     }
@@ -65034,6 +65046,8 @@ mod tests {
             repeats: vec![(64, false), (65, false)],
             indicator_map_changed: 0,
             indicator_state: 0,
+            compat_changed_groups: 0,
+            compat_total_si: 0,
         };
         crate::core_loop::xkb_layout::apply_keyboard_mapping_repeats(
             &mut state,

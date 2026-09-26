@@ -485,6 +485,26 @@ pub enum XkbSetEvent {
     /// `XkbUpdateActions`, when the request sent a NewKeyboardNotify
     /// instead): copied to the core keyboard feedback.
     Repeats(Vec<(u8, bool)>),
+    /// `_XkbSetCompatMap`'s `XkbSendCompatMapNotify`, to every client with a
+    /// compat map interest (`compatNotifyMask` ≠ 0).
+    CompatMap(yserver_protocol::x11::XkbCompatMapNotify),
+    /// `XkbApplyLedMapChanges`' notifications for new indicator maps.
+    IndicatorMaps(XkbIndicatorMapsChange),
+}
+
+/// What new indicator maps did (Xorg `XkbApplyLedMapChanges` +
+/// `XkbUpdateLedAutoState` on the core keyboard's default feedback), for
+/// its IndicatorMapNotify, IndicatorStateNotify and ExtensionDeviceNotify.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XkbIndicatorMapsChange {
+    /// The indicators whose map the request set.
+    pub maps_changed: u32,
+    /// The indicators the new maps turned on or off (0 = none).
+    pub state_changed: u32,
+    /// The indicators lit afterwards (`sli->effectiveState`).
+    pub state: u32,
+    /// `sli->namesPresent | sli->mapsPresent` afterwards.
+    pub leds_defined: u32,
 }
 
 /// What an XKB Set* request did (a port of Xorg's handler in the backend).
@@ -520,6 +540,13 @@ pub struct KeyboardMappingChange {
     pub indicator_map_changed: u32,
     /// The indicators lit (`XkbIndicatorMapNotify.state`).
     pub indicator_state: u32,
+    /// Group compat maps whose resolved mask a virtual modifier mapping
+    /// change altered (`changes->compat.changed_groups`; 0 = none): Xorg's
+    /// `XkbSendNotification` sends a CompatMapNotify for them.
+    pub compat_changed_groups: u8,
+    /// Symbol interprets in the compat map (that CompatMapNotify's
+    /// `nTotalSI`).
+    pub compat_total_si: u16,
 }
 
 /// Outcome of an XkbGetKbdByName keymap load by component names.

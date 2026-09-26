@@ -1,0 +1,500 @@
+# Xorg's XKB SetCompatMap / SetIndicatorMap semantics (issue #171 phase 4d):
+# Xvfb -noreset, fresh server per case, layout=gb
+# server: X.Org version 21.1.24 (xdpyinfo); `Xvfb -version` -> "Unrecognized option: -version" (not supported by this build)
+# pacman -Q: xkeyboard-config 2.48-1 xorg-server-xvfb 21.1.24-1
+# each case: setxkbmap -rules evdev -model pc105 -layout gb; then tools/xkb-mutation-probe.c
+# -x with the case's steps: xreq:xkb-setcompat/NAME.bin (the actor, after its XkbUseExtension),
+# for some cases after XTEST down:KC up:KC or before an smmx: SetModifierMapping.
+# The request is built by this script from the recorded identity upload's interprets (the
+# '## case' line says what it does); output grammar as in xorg-xkbcomp-steps.txt, the state
+# before is xorg-xkb-pristine.txt's layout=gb case. In raw event hex the sequence number
+# (bytes 2-3) and time (4-7) differ between runs, and CompatMapNotify bytes 16-31 are
+# uninitialised stack in Xorg (differ too).
+## case si-partial: interprets 10+2 replaced by the identity upload's 20 and 21, no truncation, no recompute
+> xreq:xkb-setcompat/si-partial.bin
+= ok
+e xkb CompatMapNotify dev=3 changedGroups=0x00 si=10+2 totalSI=124 raw=55076100e36c460803000a0002007c00801f9777d7550000c0e39577d7550000
+-si 10 sym=ffeb mods=ff match=02 vmod=3 flags=00 act=0105000000000000
++si 10 sym=fe04 mods=ff match=01 vmod=255 flags=00 act=0203000000040000
+-si 11 sym=ffec mods=ff match=02 vmod=3 flags=00 act=0105000000000000
++si 11 sym=fe05 mods=ff match=01 vmod=255 flags=00 act=0300000000040000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## case si-truncate: truncateSI at 100, no interprets, recomputeActions
+> xreq:xkb-setcompat/si-truncate.bin
+= ok
+e xkb CompatMapNotify dev=3 changedGroups=0x00 si=100+0 totalSI=100 raw=55076100676d46080300640000006400607f2d0454560000c0432c0454560000
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0010 min=8 max=255 types=0+0 syms=0+0 acts=8+75 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55016100676d46080300100008ff00000000084b000000000000000000000000
+e xkb ControlsNotify dev=3 numGroups=1 changed=0x40000000 enabled=0x000013a1 enabledChanges=0x00000000 keycode=0 eventType=0 req=135.11 raw=55036100676d46080301000000000040a1130000000000000000870b00000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0010 min=8 max=255 types=0+0 syms=0+0 acts=8+75 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55016100676d46080500100008ff00000000084b000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0010 min=8 max=255 types=0+0 syms=0+0 acts=8+75 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55016100676d46080700100008ff00000000084b000000000000000000000000
+repeat 37 0->1
+repeat 50 0->1
+repeat 62 0->1
+repeat 66 0->1
+repeat 105 0->1
+- 37 kt=0,0,0,0 gi=0x01 w=1 syms=ffe3 acts=0105040400000000 beh=00:00 expl=0x00 mm=0x04 vmm=0x0000
++ 37 kt=0,0,0,0 gi=0x01 w=1 syms=ffe3 acts=- beh=00:00 expl=0x00 mm=0x04 vmm=0x0000
+- 50 kt=0,0,0,0 gi=0x01 w=1 syms=ffe1 acts=0101010100000000 beh=00:00 expl=0x00 mm=0x01 vmm=0x0000
++ 50 kt=0,0,0,0 gi=0x01 w=1 syms=ffe1 acts=- beh=00:00 expl=0x00 mm=0x01 vmm=0x0000
+- 62 kt=0,0,0,0 gi=0x01 w=1 syms=ffe2 acts=0101010100000000 beh=00:00 expl=0x00 mm=0x01 vmm=0x0000
++ 62 kt=0,0,0,0 gi=0x01 w=1 syms=ffe2 acts=- beh=00:00 expl=0x00 mm=0x01 vmm=0x0000
+- 66 kt=0,0,0,0 gi=0x01 w=1 syms=ffe5 acts=0300020200000000 beh=00:00 expl=0x00 mm=0x02 vmm=0x0000
++ 66 kt=0,0,0,0 gi=0x01 w=1 syms=ffe5 acts=- beh=00:00 expl=0x00 mm=0x02 vmm=0x0000
+- 67 kt=9,0,0,0 gi=0x01 w=5 syms=ffbe,ffbe,ffbe,ffbe,1008fe01 acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d05010000000000 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 67 kt=9,0,0,0 gi=0x01 w=5 syms=ffbe,ffbe,ffbe,ffbe,1008fe01 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+- 68 kt=9,0,0,0 gi=0x01 w=5 syms=ffbf,ffbf,ffbf,ffbf,1008fe02 acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d05020000000000 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 68 kt=9,0,0,0 gi=0x01 w=5 syms=ffbf,ffbf,ffbf,ffbf,1008fe02 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+- 69 kt=9,0,0,0 gi=0x01 w=5 syms=ffc0,ffc0,ffc0,ffc0,1008fe03 acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d05030000000000 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 69 kt=9,0,0,0 gi=0x01 w=5 syms=ffc0,ffc0,ffc0,ffc0,1008fe03 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+- 70 kt=9,0,0,0 gi=0x01 w=5 syms=ffc1,ffc1,ffc1,ffc1,1008fe04 acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d05040000000000 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 70 kt=9,0,0,0 gi=0x01 w=5 syms=ffc1,ffc1,ffc1,ffc1,1008fe04 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+- 71 kt=9,0,0,0 gi=0x01 w=5 syms=ffc2,ffc2,ffc2,ffc2,1008fe05 acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d05050000000000 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 71 kt=9,0,0,0 gi=0x01 w=5 syms=ffc2,ffc2,ffc2,ffc2,1008fe05 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+- 72 kt=9,0,0,0 gi=0x01 w=5 syms=ffc3,ffc3,ffc3,ffc3,1008fe06 acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d05060000000000 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 72 kt=9,0,0,0 gi=0x01 w=5 syms=ffc3,ffc3,ffc3,ffc3,1008fe06 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+- 73 kt=9,0,0,0 gi=0x01 w=5 syms=ffc4,ffc4,ffc4,ffc4,1008fe07 acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d05070000000000 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 73 kt=9,0,0,0 gi=0x01 w=5 syms=ffc4,ffc4,ffc4,ffc4,1008fe07 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+- 74 kt=9,0,0,0 gi=0x01 w=5 syms=ffc5,ffc5,ffc5,ffc5,1008fe08 acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d05080000000000 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 74 kt=9,0,0,0 gi=0x01 w=5 syms=ffc5,ffc5,ffc5,ffc5,1008fe08 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+- 75 kt=9,0,0,0 gi=0x01 w=5 syms=ffc6,ffc6,ffc6,ffc6,1008fe09 acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d05090000000000 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 75 kt=9,0,0,0 gi=0x01 w=5 syms=ffc6,ffc6,ffc6,ffc6,1008fe09 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+- 76 kt=9,0,0,0 gi=0x01 w=5 syms=ffc7,ffc7,ffc7,ffc7,1008fe0a acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d050a0000000000 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 76 kt=9,0,0,0 gi=0x01 w=5 syms=ffc7,ffc7,ffc7,ffc7,1008fe0a acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+- 82 kt=9,0,0,0 gi=0x01 w=5 syms=ffad,ffad,ffad,ffad,1008fe23 acts=0a04010300000000,0a04010300000000,0a04010300000000,0a04010300000000,862d564d6f646500 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 82 kt=9,0,0,0 gi=0x01 w=5 syms=ffad,ffad,ffad,ffad,1008fe23 acts=0a04010300000000,0a04010300000000,0a04010300000000,0a04010300000000,002d564d6f646500 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+- 86 kt=9,0,0,0 gi=0x01 w=5 syms=ffab,ffab,ffab,ffab,1008fe22 acts=0800020000000000,0800020000000000,0800020000000000,0800020000000000,862b564d6f646500 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 86 kt=9,0,0,0 gi=0x01 w=5 syms=ffab,ffab,ffab,ffab,1008fe22 acts=0800020000000000,0800020000000000,0800020000000000,0800020000000000,002b564d6f646500 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+- 95 kt=9,0,0,0 gi=0x01 w=5 syms=ffc8,ffc8,ffc8,ffc8,1008fe0b acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d050b0000000000 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 95 kt=9,0,0,0 gi=0x01 w=5 syms=ffc8,ffc8,ffc8,ffc8,1008fe0b acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+- 96 kt=9,0,0,0 gi=0x01 w=5 syms=ffc9,ffc9,ffc9,ffc9,1008fe0c acts=0000000000000000,0000000000000000,0000000000000000,0000000000000000,0d050c0000000000 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 96 kt=9,0,0,0 gi=0x01 w=5 syms=ffc9,ffc9,ffc9,ffc9,1008fe0c acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+- 105 kt=0,0,0,0 gi=0x01 w=1 syms=ffe4 acts=0105040400000000 beh=00:00 expl=0x00 mm=0x04 vmm=0x0000
++ 105 kt=0,0,0,0 gi=0x01 w=1 syms=ffe4 acts=- beh=00:00 expl=0x00 mm=0x04 vmm=0x0000
+- 249 kt=0,0,0,0 gi=0x01 w=1 syms=1008fe22 acts=862b564d6f646500 beh=00:00 expl=0x00 mm=0x00 vmm=0x0000
++ 249 kt=0,0,0,0 gi=0x01 w=1 syms=1008fe22 acts=- beh=00:00 expl=0x00 mm=0x00 vmm=0x0000
+- 250 kt=0,0,0,0 gi=0x01 w=1 syms=1008fe23 acts=862d564d6f646500 beh=00:00 expl=0x00 mm=0x00 vmm=0x0000
++ 250 kt=0,0,0,0 gi=0x01 w=1 syms=1008fe23 acts=- beh=00:00 expl=0x00 mm=0x00 vmm=0x0000
+-compat - groups=0x0f firstSI=0 nSI=124 nTotalSI=124
++compat - groups=0x0f firstSI=0 nSI=100 nTotalSI=100
+-si 100 sym=ffe1 mods=ff match=01 vmod=255 flags=00 act=0101010100000000
+-si 101 sym=ffe2 mods=ff match=01 vmod=255 flags=00 act=0101010100000000
+-si 102 sym=1008fe01 mods=ff match=01 vmod=255 flags=01 act=0d05010000000000
+-si 103 sym=1008fe02 mods=ff match=01 vmod=255 flags=01 act=0d05020000000000
+-si 104 sym=1008fe03 mods=ff match=01 vmod=255 flags=01 act=0d05030000000000
+-si 105 sym=1008fe04 mods=ff match=01 vmod=255 flags=01 act=0d05040000000000
+-si 106 sym=1008fe05 mods=ff match=01 vmod=255 flags=01 act=0d05050000000000
+-si 107 sym=1008fe06 mods=ff match=01 vmod=255 flags=01 act=0d05060000000000
+-si 108 sym=1008fe07 mods=ff match=01 vmod=255 flags=01 act=0d05070000000000
+-si 109 sym=1008fe08 mods=ff match=01 vmod=255 flags=01 act=0d05080000000000
+-si 110 sym=1008fe09 mods=ff match=01 vmod=255 flags=01 act=0d05090000000000
+-si 111 sym=1008fe0a mods=ff match=01 vmod=255 flags=01 act=0d050a0000000000
+-si 112 sym=1008fe0b mods=ff match=01 vmod=255 flags=01 act=0d050b0000000000
+-si 113 sym=1008fe0c mods=ff match=01 vmod=255 flags=01 act=0d050c0000000000
+-si 114 sym=1008fe25 mods=ff match=01 vmod=255 flags=01 act=8650724772627300
+-si 115 sym=1008fe24 mods=ff match=01 vmod=255 flags=01 act=86507257696e7300
+-si 116 sym=1008fe22 mods=ff match=01 vmod=255 flags=01 act=862b564d6f646500
+-si 117 sym=1008fe23 mods=ff match=01 vmod=255 flags=01 act=862d564d6f646500
+-si 118 sym=fe11 mods=ff match=01 vmod=255 flags=00 act=0101000000100000
+-si 119 sym=fe12 mods=ff match=01 vmod=255 flags=00 act=0203000000100000
+-si 120 sym=fe13 mods=ff match=01 vmod=255 flags=00 act=0300000000100000
+-si 121 sym=ffe5 mods=ff match=01 vmod=255 flags=00 act=0300020200000000
+-si 122 sym=0 mods=02 match=04 vmod=255 flags=00 act=0300020200000000
+-si 123 sym=0 mods=ff match=02 vmod=255 flags=00 act=0105000000000000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## case si-grow: one interpret appended at 124 (a: SetMods(Shift)), recomputeActions
+> xreq:xkb-setcompat/si-grow.bin
+= ok
+e xkb CompatMapNotify dev=3 changedGroups=0x00 si=124+1 totalSI=125 raw=55076100ed6d460803007c0001007d0080cf14581a560000c09313581a560000
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0010 min=8 max=255 types=0+0 syms=0+0 acts=8+75 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55016100ed6d46080300100008ff00000000084b000000000000000000000000
+e xkb ControlsNotify dev=3 numGroups=1 changed=0x40000000 enabled=0x000013a1 enabledChanges=0x00000000 keycode=0 eventType=0 req=135.11 raw=55036100ed6d46080301000000000040a1130000000000000000870b00000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0010 min=8 max=255 types=0+0 syms=0+0 acts=8+75 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55016100ed6d46080500100008ff00000000084b000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0010 min=8 max=255 types=0+0 syms=0+0 acts=8+75 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55016100ed6d46080700100008ff00000000084b000000000000000000000000
+repeat 38 1->0
+- 38 kt=12,0,0,0 gi=0x01 w=4 syms=61,41,e6,c6 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 38 kt=12,0,0,0 gi=0x01 w=4 syms=61,41,e6,c6 acts=0100010100000000,0000000000000000,0000000000000000,0000000000000000 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+-compat - groups=0x0f firstSI=0 nSI=124 nTotalSI=124
++compat - groups=0x0f firstSI=0 nSI=125 nTotalSI=125
++si 124 sym=61 mods=00 match=01 vmod=255 flags=00 act=0100010100000000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## case si-skip-broken: interprets 0+3, the middle one the broken Any+AnyOfOrNone(all)->Private: skipped
+> xreq:xkb-setcompat/si-skip-broken.bin
+= ok
+e xkb CompatMapNotify dev=3 changedGroups=0x00 si=0+3 totalSI=123 raw=55076100706e46080300000003007b00900f67d78c550000c0d365d78c550000
+-compat - groups=0x0f firstSI=0 nSI=124 nTotalSI=124
++compat - groups=0x0f firstSI=0 nSI=123 nTotalSI=123
+-si 1 sym=ffe6 mods=03 match=02 vmod=255 flags=00 act=0300010100000000
++si 1 sym=ff7f mods=ff match=02 vmod=0 flags=00 act=0300000000010000
+-si 2 sym=ff7f mods=ff match=02 vmod=0 flags=00 act=0300000000010000
++si 2 sym=fe03 mods=ff match=82 vmod=2 flags=00 act=0101000000040000
+-si 3 sym=fe03 mods=ff match=82 vmod=2 flags=00 act=0101000000040000
++si 3 sym=fe04 mods=ff match=82 vmod=2 flags=00 act=0203000000040000
+-si 4 sym=fe04 mods=ff match=82 vmod=2 flags=00 act=0203000000040000
++si 4 sym=fe05 mods=ff match=82 vmod=2 flags=00 act=0300000000040000
+-si 5 sym=fe05 mods=ff match=82 vmod=2 flags=00 act=0300000000040000
++si 5 sym=ffe9 mods=ff match=02 vmod=1 flags=00 act=0105000000000000
+-si 6 sym=ffe9 mods=ff match=02 vmod=1 flags=00 act=0105000000000000
++si 6 sym=ffea mods=ff match=02 vmod=1 flags=00 act=0105000000000000
+-si 7 sym=ffea mods=ff match=02 vmod=1 flags=00 act=0105000000000000
++si 7 sym=ffe7 mods=ff match=02 vmod=5 flags=00 act=0105000000000000
+-si 8 sym=ffe7 mods=ff match=02 vmod=5 flags=00 act=0105000000000000
++si 8 sym=ffe8 mods=ff match=02 vmod=5 flags=00 act=0105000000000000
+-si 9 sym=ffe8 mods=ff match=02 vmod=5 flags=00 act=0105000000000000
++si 9 sym=ffeb mods=ff match=02 vmod=3 flags=00 act=0105000000000000
+-si 10 sym=ffeb mods=ff match=02 vmod=3 flags=00 act=0105000000000000
++si 10 sym=ffec mods=ff match=02 vmod=3 flags=00 act=0105000000000000
+-si 11 sym=ffec mods=ff match=02 vmod=3 flags=00 act=0105000000000000
++si 11 sym=ffed mods=ff match=02 vmod=6 flags=00 act=0105000000000000
+-si 12 sym=ffed mods=ff match=02 vmod=6 flags=00 act=0105000000000000
++si 12 sym=ffee mods=ff match=02 vmod=6 flags=00 act=0105000000000000
+-si 13 sym=ffee mods=ff match=02 vmod=6 flags=00 act=0105000000000000
++si 13 sym=ff14 mods=ff match=02 vmod=7 flags=00 act=0304000000000000
+-si 14 sym=ff14 mods=ff match=02 vmod=7 flags=00 act=0304000000000000
++si 14 sym=fe11 mods=ff match=82 vmod=4 flags=00 act=0101000000100000
+-si 15 sym=fe11 mods=ff match=82 vmod=4 flags=00 act=0101000000100000
++si 15 sym=fe12 mods=ff match=82 vmod=4 flags=00 act=0203000000100000
+-si 16 sym=fe12 mods=ff match=82 vmod=4 flags=00 act=0203000000100000
++si 16 sym=fe13 mods=ff match=82 vmod=4 flags=00 act=0300000000100000
+-si 17 sym=fe13 mods=ff match=82 vmod=4 flags=00 act=0300000000100000
++si 17 sym=ff7e mods=ff match=01 vmod=255 flags=00 act=0400010000000000
+-si 18 sym=ff7e mods=ff match=01 vmod=255 flags=00 act=0400010000000000
++si 18 sym=fe03 mods=ff match=01 vmod=255 flags=00 act=0101000000040000
+-si 19 sym=fe03 mods=ff match=01 vmod=255 flags=00 act=0101000000040000
++si 19 sym=fe04 mods=ff match=01 vmod=255 flags=00 act=0203000000040000
+-si 20 sym=fe04 mods=ff match=01 vmod=255 flags=00 act=0203000000040000
++si 20 sym=fe05 mods=ff match=01 vmod=255 flags=00 act=0300000000040000
+-si 21 sym=fe05 mods=ff match=01 vmod=255 flags=00 act=0300000000040000
++si 21 sym=fe06 mods=ff match=01 vmod=255 flags=00 act=0504010000000000
+-si 22 sym=fe06 mods=ff match=01 vmod=255 flags=00 act=0504010000000000
++si 22 sym=fe08 mods=ff match=01 vmod=255 flags=00 act=0600010000000000
+-si 23 sym=fe08 mods=ff match=01 vmod=255 flags=00 act=0600010000000000
++si 23 sym=fe0a mods=ff match=01 vmod=255 flags=00 act=0600ff0000000000
+-si 24 sym=fe0a mods=ff match=01 vmod=255 flags=00 act=0600ff0000000000
++si 24 sym=fe0c mods=ff match=01 vmod=255 flags=00 act=0604000000000000
+-si 25 sym=fe0c mods=ff match=01 vmod=255 flags=00 act=0604000000000000
++si 25 sym=fe0e mods=ff match=01 vmod=255 flags=00 act=0604010000000000
+-si 26 sym=fe0e mods=ff match=01 vmod=255 flags=00 act=0604010000000000
++si 26 sym=ffb1 mods=ff match=01 vmod=255 flags=01 act=0700ffff00010000
+-si 27 sym=ffb1 mods=ff match=01 vmod=255 flags=01 act=0700ffff00010000
++si 27 sym=ff9c mods=ff match=01 vmod=255 flags=01 act=0700ffff00010000
+-si 28 sym=ff9c mods=ff match=01 vmod=255 flags=01 act=0700ffff00010000
++si 28 sym=ffb2 mods=ff match=01 vmod=255 flags=01 act=0700000000010000
+-si 29 sym=ffb2 mods=ff match=01 vmod=255 flags=01 act=0700000000010000
++si 29 sym=ff99 mods=ff match=01 vmod=255 flags=01 act=0700000000010000
+-si 30 sym=ff99 mods=ff match=01 vmod=255 flags=01 act=0700000000010000
++si 30 sym=ffb3 mods=ff match=01 vmod=255 flags=01 act=0700000100010000
+-si 31 sym=ffb3 mods=ff match=01 vmod=255 flags=01 act=0700000100010000
++si 31 sym=ff9b mods=ff match=01 vmod=255 flags=01 act=0700000100010000
+-si 32 sym=ff9b mods=ff match=01 vmod=255 flags=01 act=0700000100010000
++si 32 sym=ffb4 mods=ff match=01 vmod=255 flags=01 act=0700ffff00000000
+-si 33 sym=ffb4 mods=ff match=01 vmod=255 flags=01 act=0700ffff00000000
++si 33 sym=ff96 mods=ff match=01 vmod=255 flags=01 act=0700ffff00000000
+-si 34 sym=ff96 mods=ff match=01 vmod=255 flags=01 act=0700ffff00000000
++si 34 sym=ffb6 mods=ff match=01 vmod=255 flags=01 act=0700000100000000
+-si 35 sym=ffb6 mods=ff match=01 vmod=255 flags=01 act=0700000100000000
++si 35 sym=ff98 mods=ff match=01 vmod=255 flags=01 act=0700000100000000
+-si 36 sym=ff98 mods=ff match=01 vmod=255 flags=01 act=0700000100000000
++si 36 sym=ffb7 mods=ff match=01 vmod=255 flags=01 act=0700ffffffff0000
+-si 37 sym=ffb7 mods=ff match=01 vmod=255 flags=01 act=0700ffffffff0000
++si 37 sym=ff95 mods=ff match=01 vmod=255 flags=01 act=0700ffffffff0000
+-si 38 sym=ff95 mods=ff match=01 vmod=255 flags=01 act=0700ffffffff0000
++si 38 sym=ffb8 mods=ff match=01 vmod=255 flags=01 act=07000000ffff0000
+-si 39 sym=ffb8 mods=ff match=01 vmod=255 flags=01 act=07000000ffff0000
++si 39 sym=ff97 mods=ff match=01 vmod=255 flags=01 act=07000000ffff0000
+-si 40 sym=ff97 mods=ff match=01 vmod=255 flags=01 act=07000000ffff0000
++si 40 sym=ffb9 mods=ff match=01 vmod=255 flags=01 act=07000001ffff0000
+-si 41 sym=ffb9 mods=ff match=01 vmod=255 flags=01 act=07000001ffff0000
++si 41 sym=ff9a mods=ff match=01 vmod=255 flags=01 act=07000001ffff0000
+-si 42 sym=ff9a mods=ff match=01 vmod=255 flags=01 act=07000001ffff0000
++si 42 sym=ffb5 mods=ff match=01 vmod=255 flags=01 act=0800000000000000
+-si 43 sym=ffb5 mods=ff match=01 vmod=255 flags=01 act=0800000000000000
++si 43 sym=ff9d mods=ff match=01 vmod=255 flags=01 act=0800000000000000
+-si 44 sym=ff9d mods=ff match=01 vmod=255 flags=01 act=0800000000000000
++si 44 sym=ff92 mods=ff match=01 vmod=255 flags=01 act=0a04010100000000
+-si 45 sym=ff92 mods=ff match=01 vmod=255 flags=01 act=0a04010100000000
++si 45 sym=ffaf mods=ff match=01 vmod=255 flags=01 act=0a04010100000000
+-si 46 sym=ffaf mods=ff match=01 vmod=255 flags=01 act=0a04010100000000
++si 46 sym=ff93 mods=ff match=01 vmod=255 flags=01 act=0a04010200000000
+-si 47 sym=ff93 mods=ff match=01 vmod=255 flags=01 act=0a04010200000000
++si 47 sym=ffaa mods=ff match=01 vmod=255 flags=01 act=0a04010200000000
+-si 48 sym=ffaa mods=ff match=01 vmod=255 flags=01 act=0a04010200000000
++si 48 sym=ff94 mods=ff match=01 vmod=255 flags=01 act=0a04010300000000
+-si 49 sym=ff94 mods=ff match=01 vmod=255 flags=01 act=0a04010300000000
++si 49 sym=ffad mods=ff match=01 vmod=255 flags=01 act=0a04010300000000
+-si 50 sym=ffad mods=ff match=01 vmod=255 flags=01 act=0a04010300000000
++si 50 sym=ffac mods=ff match=01 vmod=255 flags=01 act=0800020000000000
+-si 51 sym=ffac mods=ff match=01 vmod=255 flags=01 act=0800020000000000
++si 51 sym=ffab mods=ff match=01 vmod=255 flags=01 act=0800020000000000
+-si 52 sym=ffab mods=ff match=01 vmod=255 flags=01 act=0800020000000000
++si 52 sym=ffb0 mods=ff match=01 vmod=255 flags=01 act=0902000000000000
+-si 53 sym=ffb0 mods=ff match=01 vmod=255 flags=01 act=0902000000000000
++si 53 sym=ff9e mods=ff match=01 vmod=255 flags=01 act=0902000000000000
+-si 54 sym=ff9e mods=ff match=01 vmod=255 flags=01 act=0902000000000000
++si 54 sym=ffae mods=ff match=01 vmod=255 flags=01 act=0901000000000000
+-si 55 sym=ffae mods=ff match=01 vmod=255 flags=01 act=0901000000000000
++si 55 sym=ff9f mods=ff match=01 vmod=255 flags=01 act=0901000000000000
+-si 56 sym=ff9f mods=ff match=01 vmod=255 flags=01 act=0901000000000000
++si 56 sym=ffd6 mods=ff match=01 vmod=255 flags=01 act=0a04010100000000
+-si 57 sym=ffd6 mods=ff match=01 vmod=255 flags=01 act=0a04010100000000
++si 57 sym=ffd7 mods=ff match=01 vmod=255 flags=01 act=0a04010200000000
+-si 58 sym=ffd7 mods=ff match=01 vmod=255 flags=01 act=0a04010200000000
++si 58 sym=ffd8 mods=ff match=01 vmod=255 flags=01 act=0700ffffffff0000
+-si 59 sym=ffd8 mods=ff match=01 vmod=255 flags=01 act=0700ffffffff0000
++si 59 sym=ffda mods=ff match=01 vmod=255 flags=01 act=07000001ffff0000
+-si 60 sym=ffda mods=ff match=01 vmod=255 flags=01 act=07000001ffff0000
++si 60 sym=ffdc mods=ff match=01 vmod=255 flags=01 act=0800000000000000
+-si 61 sym=ffdc mods=ff match=01 vmod=255 flags=01 act=0800000000000000
++si 61 sym=ffde mods=ff match=01 vmod=255 flags=01 act=0700ffff00010000
+-si 62 sym=ffde mods=ff match=01 vmod=255 flags=01 act=0700ffff00010000
++si 62 sym=ffe0 mods=ff match=01 vmod=255 flags=01 act=0700000100010000
+-si 63 sym=ffe0 mods=ff match=01 vmod=255 flags=01 act=0700000100010000
++si 63 sym=fee8 mods=ff match=01 vmod=255 flags=00 act=0800000000000000
+-si 64 sym=fee8 mods=ff match=01 vmod=255 flags=00 act=0800000000000000
++si 64 sym=fee9 mods=ff match=01 vmod=255 flags=00 act=0800000100000000
+-si 65 sym=fee9 mods=ff match=01 vmod=255 flags=00 act=0800000100000000
++si 65 sym=feea mods=ff match=01 vmod=255 flags=00 act=0800000200000000
+-si 66 sym=feea mods=ff match=01 vmod=255 flags=00 act=0800000200000000
++si 66 sym=feeb mods=ff match=01 vmod=255 flags=00 act=0800000300000000
+-si 67 sym=feeb mods=ff match=01 vmod=255 flags=00 act=0800000300000000
++si 67 sym=feee mods=ff match=01 vmod=255 flags=00 act=0800020000000000
+-si 68 sym=feee mods=ff match=01 vmod=255 flags=00 act=0800020000000000
++si 68 sym=feef mods=ff match=01 vmod=255 flags=00 act=0800020100000000
+-si 69 sym=feef mods=ff match=01 vmod=255 flags=00 act=0800020100000000
++si 69 sym=fef0 mods=ff match=01 vmod=255 flags=00 act=0800020200000000
+-si 70 sym=fef0 mods=ff match=01 vmod=255 flags=00 act=0800020200000000
++si 70 sym=fef1 mods=ff match=01 vmod=255 flags=00 act=0800020300000000
+-si 71 sym=fef1 mods=ff match=01 vmod=255 flags=00 act=0800020300000000
++si 71 sym=fef4 mods=ff match=01 vmod=255 flags=00 act=0900000000000000
+-si 72 sym=fef4 mods=ff match=01 vmod=255 flags=00 act=0900000000000000
++si 72 sym=fef5 mods=ff match=01 vmod=255 flags=00 act=0900000100000000
+-si 73 sym=fef5 mods=ff match=01 vmod=255 flags=00 act=0900000100000000
++si 73 sym=fef6 mods=ff match=01 vmod=255 flags=00 act=0900000200000000
+-si 74 sym=fef6 mods=ff match=01 vmod=255 flags=00 act=0900000200000000
++si 74 sym=fef7 mods=ff match=01 vmod=255 flags=00 act=0900000300000000
+-si 75 sym=fef7 mods=ff match=01 vmod=255 flags=00 act=0900000300000000
++si 75 sym=fef9 mods=ff match=01 vmod=255 flags=00 act=0f00000000100000
+-si 76 sym=fef9 mods=ff match=01 vmod=255 flags=00 act=0f00000000100000
++si 76 sym=fefa mods=ff match=01 vmod=255 flags=00 act=0f00000000200000
+-si 77 sym=fefa mods=ff match=01 vmod=255 flags=00 act=0f00000000200000
++si 77 sym=fefb mods=ff match=01 vmod=255 flags=00 act=0a00010100000000
+-si 78 sym=fefb mods=ff match=01 vmod=255 flags=00 act=0a00010100000000
++si 78 sym=fefc mods=ff match=01 vmod=255 flags=00 act=0a0001ff00000000
+-si 79 sym=fefc mods=ff match=01 vmod=255 flags=00 act=0a0001ff00000000
++si 79 sym=fe70 mods=ff match=01 vmod=255 flags=00 act=0f00000000400000
+-si 80 sym=fe70 mods=ff match=01 vmod=255 flags=00 act=0f00000000400000
++si 80 sym=fe71 mods=ff match=01 vmod=255 flags=00 act=0f00000001000000
+-si 81 sym=fe71 mods=ff match=01 vmod=255 flags=00 act=0f00000001000000
++si 81 sym=fe72 mods=ff match=01 vmod=255 flags=00 act=0f00000000010000
+-si 82 sym=fe72 mods=ff match=01 vmod=255 flags=00 act=0f00000000010000
++si 82 sym=fe73 mods=ff match=01 vmod=255 flags=00 act=0f00000000020000
+-si 83 sym=fe73 mods=ff match=01 vmod=255 flags=00 act=0f00000000020000
++si 83 sym=fe74 mods=ff match=01 vmod=255 flags=00 act=0f00000000040000
+-si 84 sym=fe74 mods=ff match=01 vmod=255 flags=00 act=0f00000000040000
++si 84 sym=fe75 mods=ff match=01 vmod=255 flags=00 act=0f00000000080000
+-si 85 sym=fe75 mods=ff match=01 vmod=255 flags=00 act=0f00000000080000
++si 85 sym=fe76 mods=ff match=01 vmod=255 flags=00 act=0f00000000100000
+-si 86 sym=fe76 mods=ff match=01 vmod=255 flags=00 act=0f00000000100000
++si 86 sym=fe77 mods=ff match=01 vmod=255 flags=00 act=0f00000000200000
+-si 87 sym=fe77 mods=ff match=01 vmod=255 flags=00 act=0f00000000200000
++si 87 sym=fe78 mods=ff match=01 vmod=255 flags=00 act=0f00000004000000
+-si 88 sym=fe78 mods=ff match=01 vmod=255 flags=00 act=0f00000004000000
++si 88 sym=fe79 mods=ff match=01 vmod=255 flags=00 act=0f00000008000000
+-si 89 sym=fe79 mods=ff match=01 vmod=255 flags=00 act=0f00000008000000
++si 89 sym=fe7a mods=ff match=01 vmod=255 flags=00 act=0f00000002000000
+-si 90 sym=fe7a mods=ff match=01 vmod=255 flags=00 act=0f00000002000000
++si 90 sym=fed5 mods=ff match=01 vmod=255 flags=00 act=0c00000000000000
+-si 91 sym=fed5 mods=ff match=01 vmod=255 flags=00 act=0c00000000000000
++si 91 sym=ffe9 mods=ff match=01 vmod=255 flags=00 act=0101000000020000
+-si 92 sym=ffe9 mods=ff match=01 vmod=255 flags=00 act=0101000000020000
++si 92 sym=ffea mods=ff match=01 vmod=255 flags=00 act=0101000000020000
+-si 93 sym=ffea mods=ff match=01 vmod=255 flags=00 act=0101000000020000
++si 93 sym=ffe7 mods=ff match=01 vmod=255 flags=00 act=0101000000200000
+-si 94 sym=ffe7 mods=ff match=01 vmod=255 flags=00 act=0101000000200000
++si 94 sym=ffe8 mods=ff match=01 vmod=255 flags=00 act=0101000000200000
+-si 95 sym=ffe8 mods=ff match=01 vmod=255 flags=00 act=0101000000200000
++si 95 sym=ffeb mods=ff match=01 vmod=255 flags=00 act=0101000000080000
+-si 96 sym=ffeb mods=ff match=01 vmod=255 flags=00 act=0101000000080000
++si 96 sym=ffec mods=ff match=01 vmod=255 flags=00 act=0101000000080000
+-si 97 sym=ffec mods=ff match=01 vmod=255 flags=00 act=0101000000080000
++si 97 sym=ffed mods=ff match=01 vmod=255 flags=00 act=0101000000400000
+-si 98 sym=ffed mods=ff match=01 vmod=255 flags=00 act=0101000000400000
++si 98 sym=ffee mods=ff match=01 vmod=255 flags=00 act=0101000000400000
+-si 99 sym=ffee mods=ff match=01 vmod=255 flags=00 act=0101000000400000
++si 99 sym=ffe1 mods=ff match=01 vmod=255 flags=00 act=0101010100000000
+-si 100 sym=ffe1 mods=ff match=01 vmod=255 flags=00 act=0101010100000000
++si 100 sym=ffe2 mods=ff match=01 vmod=255 flags=00 act=0101010100000000
+-si 101 sym=ffe2 mods=ff match=01 vmod=255 flags=00 act=0101010100000000
++si 101 sym=1008fe01 mods=ff match=01 vmod=255 flags=01 act=0d05010000000000
+-si 102 sym=1008fe01 mods=ff match=01 vmod=255 flags=01 act=0d05010000000000
++si 102 sym=1008fe02 mods=ff match=01 vmod=255 flags=01 act=0d05020000000000
+-si 103 sym=1008fe02 mods=ff match=01 vmod=255 flags=01 act=0d05020000000000
++si 103 sym=1008fe03 mods=ff match=01 vmod=255 flags=01 act=0d05030000000000
+-si 104 sym=1008fe03 mods=ff match=01 vmod=255 flags=01 act=0d05030000000000
++si 104 sym=1008fe04 mods=ff match=01 vmod=255 flags=01 act=0d05040000000000
+-si 105 sym=1008fe04 mods=ff match=01 vmod=255 flags=01 act=0d05040000000000
++si 105 sym=1008fe05 mods=ff match=01 vmod=255 flags=01 act=0d05050000000000
+-si 106 sym=1008fe05 mods=ff match=01 vmod=255 flags=01 act=0d05050000000000
++si 106 sym=1008fe06 mods=ff match=01 vmod=255 flags=01 act=0d05060000000000
+-si 107 sym=1008fe06 mods=ff match=01 vmod=255 flags=01 act=0d05060000000000
++si 107 sym=1008fe07 mods=ff match=01 vmod=255 flags=01 act=0d05070000000000
+-si 108 sym=1008fe07 mods=ff match=01 vmod=255 flags=01 act=0d05070000000000
++si 108 sym=1008fe08 mods=ff match=01 vmod=255 flags=01 act=0d05080000000000
+-si 109 sym=1008fe08 mods=ff match=01 vmod=255 flags=01 act=0d05080000000000
++si 109 sym=1008fe09 mods=ff match=01 vmod=255 flags=01 act=0d05090000000000
+-si 110 sym=1008fe09 mods=ff match=01 vmod=255 flags=01 act=0d05090000000000
++si 110 sym=1008fe0a mods=ff match=01 vmod=255 flags=01 act=0d050a0000000000
+-si 111 sym=1008fe0a mods=ff match=01 vmod=255 flags=01 act=0d050a0000000000
++si 111 sym=1008fe0b mods=ff match=01 vmod=255 flags=01 act=0d050b0000000000
+-si 112 sym=1008fe0b mods=ff match=01 vmod=255 flags=01 act=0d050b0000000000
++si 112 sym=1008fe0c mods=ff match=01 vmod=255 flags=01 act=0d050c0000000000
+-si 113 sym=1008fe0c mods=ff match=01 vmod=255 flags=01 act=0d050c0000000000
++si 113 sym=1008fe25 mods=ff match=01 vmod=255 flags=01 act=8650724772627300
+-si 114 sym=1008fe25 mods=ff match=01 vmod=255 flags=01 act=8650724772627300
++si 114 sym=1008fe24 mods=ff match=01 vmod=255 flags=01 act=86507257696e7300
+-si 115 sym=1008fe24 mods=ff match=01 vmod=255 flags=01 act=86507257696e7300
++si 115 sym=1008fe22 mods=ff match=01 vmod=255 flags=01 act=862b564d6f646500
+-si 116 sym=1008fe22 mods=ff match=01 vmod=255 flags=01 act=862b564d6f646500
++si 116 sym=1008fe23 mods=ff match=01 vmod=255 flags=01 act=862d564d6f646500
+-si 117 sym=1008fe23 mods=ff match=01 vmod=255 flags=01 act=862d564d6f646500
++si 117 sym=fe11 mods=ff match=01 vmod=255 flags=00 act=0101000000100000
+-si 118 sym=fe11 mods=ff match=01 vmod=255 flags=00 act=0101000000100000
++si 118 sym=fe12 mods=ff match=01 vmod=255 flags=00 act=0203000000100000
+-si 119 sym=fe12 mods=ff match=01 vmod=255 flags=00 act=0203000000100000
++si 119 sym=fe13 mods=ff match=01 vmod=255 flags=00 act=0300000000100000
+-si 120 sym=fe13 mods=ff match=01 vmod=255 flags=00 act=0300000000100000
++si 120 sym=ffe5 mods=ff match=01 vmod=255 flags=00 act=0300020200000000
+-si 121 sym=ffe5 mods=ff match=01 vmod=255 flags=00 act=0300020200000000
++si 121 sym=0 mods=02 match=04 vmod=255 flags=00 act=0300020200000000
+-si 122 sym=0 mods=02 match=04 vmod=255 flags=00 act=0300020200000000
++si 122 sym=0 mods=ff match=02 vmod=255 flags=00 act=0105000000000000
+-si 123 sym=0 mods=ff match=02 vmod=255 flags=00 act=0105000000000000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## case si-skip-truncate: truncateSI, interprets 120+2 = the broken one and the identity upload's 121
+> xreq:xkb-setcompat/si-skip-truncate.bin
+= ok
+e xkb CompatMapNotify dev=3 changedGroups=0x00 si=120+2 totalSI=121 raw=55076100e56e4608030078000200790090ef3fc3f1550000c0b33ec3f1550000
+-compat - groups=0x0f firstSI=0 nSI=124 nTotalSI=124
++compat - groups=0x0f firstSI=0 nSI=121 nTotalSI=121
+-si 120 sym=fe13 mods=ff match=01 vmod=255 flags=00 act=0300000000100000
++si 120 sym=ffe5 mods=ff match=01 vmod=255 flags=00 act=0300020200000000
+-si 121 sym=ffe5 mods=ff match=01 vmod=255 flags=00 act=0300020200000000
+-si 122 sym=0 mods=02 match=04 vmod=255 flags=00 act=0300020200000000
+-si 123 sym=0 mods=ff match=02 vmod=255 flags=00 act=0105000000000000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## case groups-vmods: group compat 1 = LevelThree (vmod 2), 2 = Shift, no interprets
+> xreq:xkb-setcompat/groups-vmods.bin
+= ok
+e xkb CompatMapNotify dev=3 changedGroups=0x03 si=0+0 totalSI=124 raw=550761007d6f46080303000000007c0080afff9d39560000c073fe9d39560000
+-groupcompat 1 mask=00 real=00 vmods=0000
++groupcompat 1 mask=80 real=00 vmods=0004
+-groupcompat 2 mask=80 real=80 vmods=0000
++groupcompat 2 mask=01 real=01 vmods=0000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## case indmap-vmods: indicator 3 locked Alt (vmod 1) and indicator 1 base Shift+NumLock (vmod 0)
+> xreq:xkb-setcompat/indmap-vmods.bin
+= ok
+e xkb IndicatorMapNotify dev=3 state=0x00000000 changed=0x0000000a raw=55056100f66f460803000000000000000a000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b6100f66f46080300080000000000ff3f00000000000000001f0000000000
+-indmap 1 flags=80 whichGroups=00 groups=00 whichMods=04 mods=10 realMods=00 vmods=0001 ctrls=00000000
++indmap 1 flags=00 whichGroups=00 groups=00 whichMods=01 mods=11 realMods=01 vmods=0001 ctrls=00000000
+-indmap 3 flags=00 whichGroups=00 groups=00 whichMods=00 mods=00 realMods=00 vmods=0000 ctrls=00000000
++indmap 3 flags=00 whichGroups=00 groups=00 whichMods=04 mods=08 realMods=00 vmods=0002 ctrls=00000000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## case indmap-realmods: indicator 4 whichMods locked, mods 0x01 but realMods 0x04 on the wire
+> xreq:xkb-setcompat/indmap-realmods.bin
+= ok
+e xkb IndicatorMapNotify dev=3 state=0x00000000 changed=0x00000010 raw=550561007f704608030000000000000010000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b61007f7046080300080000000000ff3f00000000000000001f0000000000
+-indmap 4 flags=00 whichGroups=00 groups=00 whichMods=00 mods=00 realMods=00 vmods=0000 ctrls=00000000
++indmap 4 flags=00 whichGroups=00 groups=00 whichMods=04 mods=01 realMods=01 vmods=0000 ctrls=00000000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## case indmap-lights: indicator 20 (no name) lit by effective group 1: the new map lights it
+> xreq:xkb-setcompat/indmap-lights.bin
+= ok
+e xkb IndicatorMapNotify dev=3 state=0x00100000 changed=0x00100000 raw=5505610001714608030000000000100000001000000000000000000000000000
+e xkb IndicatorStateNotify dev=3 state=0x00100000 changed=0x00100000 raw=5504610001714608030000000000100000001000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b6100017146080300180000000000ff3f10000000100000001f0000000000
+-indmap 20 flags=00 whichGroups=00 groups=00 whichMods=00 mods=00 realMods=00 vmods=0000 ctrls=00000000
++indmap 20 flags=00 whichGroups=08 groups=01 whichMods=00 mods=00 realMods=00 vmods=0000 ctrls=00000000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## case indmap-which0: which 0 with one map and a length that doesn't count it: Success, no-op
+> xreq:xkb-setcompat/indmap-which0.bin
+= ok
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## case indmap-caps-off: Caps Lock locked (XTEST 66), then the compat upload's SetIndicatorMap (Caps Lock LED = locked Shift)
+> down:66
+= ok
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=55006100ef714608030308ff08ff870903000000000000000000000000000000
+e xkb StateNotify dev=3 mods=0x02 base=0x02 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x1f0b keycode=66 eventType=2 req=0.0 raw=55026100ef7146080302020002000000000000020202020200000b1f42020000
+e xkb IndicatorStateNotify dev=3 state=0x00000001 changed=0x00000001 raw=55046100ef714608030000000100000001000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b6100ef7146080300100000000000ff3f00000100000000001f0000000000
+e core MappingNotify request=1 first=8 count=248 raw=220002000108f800000000000000000000000000000000000000000000000000
+e core MappingNotify request=0 first=0 count=0 raw=2200020000000000000000000000000000000000000000000000000000000000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> up:66
+= ok
+e xkb StateNotify dev=3 mods=0x02 base=0x00 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x0002 keycode=66 eventType=3 req=0.0 raw=55026a00f3714608030200000200000000000002020202020000020042030000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setcompat/indmap-caps-off.bin
+= ok
+e xkb IndicatorMapNotify dev=3 state=0x00000000 changed=0xffffffff raw=55057300f87146080300000000000000ffffffff000000000000000000000000
+e xkb IndicatorStateNotify dev=3 state=0x00000000 changed=0x00000001 raw=55047300f8714608030000000000000001000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b7300f87146080300180000000000ff3f00000000000000001f0000000000
+-indmap 0 flags=80 whichGroups=00 groups=00 whichMods=04 mods=02 realMods=02 vmods=0000 ctrls=00000000
++indmap 0 flags=80 whichGroups=00 groups=00 whichMods=04 mods=01 realMods=01 vmods=0000 ctrls=00000000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## case indmap-none-in-use: Caps Lock locked (XTEST 66), then every indicator map cleared: no map in use
+> down:66
+= ok
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=5500610085724608030308ff08ff870903000000000000000000000000000000
+e xkb StateNotify dev=3 mods=0x02 base=0x02 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x1f0b keycode=66 eventType=2 req=0.0 raw=55026100857246080302020002000000000000020202020200000b1f42020000
+e xkb IndicatorStateNotify dev=3 state=0x00000001 changed=0x00000001 raw=5504610085724608030000000100000001000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b6100857246080300100000000000ff3f00000100000000001f0000000000
+e core MappingNotify request=1 first=8 count=248 raw=220002000108f800000000000000000000000000000000000000000000000000
+e core MappingNotify request=0 first=0 count=0 raw=2200020000000000000000000000000000000000000000000000000000000000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> up:66
+= ok
+e xkb StateNotify dev=3 mods=0x02 base=0x00 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x0002 keycode=66 eventType=3 req=0.0 raw=55026a008a724608030200000200000000000002020202020000020042030000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setcompat/indmap-none-in-use.bin
+= ok
+e xkb IndicatorMapNotify dev=3 state=0x00000001 changed=0xffffffff raw=55057300927246080300000001000000ffffffff000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b7300927246080300080000000000ff3f00000100000000001f0000000000
+-indmap 0 flags=80 whichGroups=00 groups=00 whichMods=04 mods=02 realMods=02 vmods=0000 ctrls=00000000
++indmap 0 flags=00 whichGroups=00 groups=00 whichMods=00 mods=00 realMods=00 vmods=0000 ctrls=00000000
+-indmap 1 flags=80 whichGroups=00 groups=00 whichMods=04 mods=10 realMods=00 vmods=0001 ctrls=00000000
++indmap 1 flags=00 whichGroups=00 groups=00 whichMods=00 mods=00 realMods=00 vmods=0000 ctrls=00000000
+-indmap 2 flags=00 whichGroups=00 groups=00 whichMods=04 mods=00 realMods=00 vmods=0080 ctrls=00000000
++indmap 2 flags=00 whichGroups=00 groups=00 whichMods=00 mods=00 realMods=00 vmods=0000 ctrls=00000000
+-indmap 11 flags=80 whichGroups=00 groups=00 whichMods=04 mods=01 realMods=01 vmods=0000 ctrls=00000000
++indmap 11 flags=00 whichGroups=00 groups=00 whichMods=00 mods=00 realMods=00 vmods=0000 ctrls=00000000
+-indmap 12 flags=80 whichGroups=08 groups=fe whichMods=00 mods=00 realMods=00 vmods=0000 ctrls=00000000
++indmap 12 flags=00 whichGroups=00 groups=00 whichMods=00 mods=00 realMods=00 vmods=0000 ctrls=00000000
+-indmap 13 flags=20 whichGroups=00 groups=00 whichMods=00 mods=00 realMods=00 vmods=0000 ctrls=00000010
++indmap 13 flags=00 whichGroups=00 groups=00 whichMods=00 mods=00 realMods=00 vmods=0000 ctrls=00000000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## case groups-vmods-smm: group compat 1 = LevelThree (vmod 2), then SetModifierMapping moves <LVL3> (92) from Mod5 to Mod4
+> xreq:xkb-setcompat/groups-vmods-smm.bin
+= ok
+e xkb CompatMapNotify dev=3 changedGroups=0x01 si=0+0 totalSI=124 raw=550761000c7346080301000000007c00907fb3b77d550000c043b2b77d550000
+-groupcompat 1 mask=00 real=00 vmods=0000
++groupcompat 1 mask=80 real=00 vmods=0004
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> smmx:-92@7,+92@6
+sent kpm=4 keys=50,62,0,0,66,0,0,0,37,105,0,0,64,204,205,0,77,0,0,0,203,0,0,0,133,134,206,92,0,0,0,0
+= status=0
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0055 min=8 max=255 types=9+17 syms=0+0 acts=8+101 beh=0+0 expl=0+0 modmap=8+248 vmodmap=0+0 vmods=0x0004 raw=55016a00107346080300550008ff0911000008650000000008f8000004000000
+e xkbl MappingNotify request=0 first=0 count=0 raw=22006a0000000000000000000000000000000000000000000000000000000000
+e xkb CompatMapNotify dev=3 changedGroups=0x01 si=0+0 totalSI=124 raw=55076a00107346080301000000007c0000000000000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0055 min=8 max=255 types=9+17 syms=0+0 acts=8+101 beh=0+0 expl=0+0 modmap=8+248 vmodmap=0+0 vmods=0x0004 raw=55016a00107346080500550008ff0911000008650000000008f8000004000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0055 min=8 max=255 types=9+17 syms=0+0 acts=8+101 beh=0+0 expl=0+0 modmap=8+248 vmodmap=0+0 vmods=0x0004 raw=55016a00107346080700550008ff0911000008650000000008f8000004000000
+e core MappingNotify request=0 first=0 count=0 raw=2200030000000000000000000000000000000000000000000000000000000000
+-vmods 10,08,80,40,20,08,00,00,00,00,00,00,00,00,00,00
++vmods 10,08,40,40,20,08,00,00,00,00,00,00,00,00,00,00
+- 92 kt=0,0,0,0 gi=0x01 w=1 syms=fe03 acts=0101800000040000 beh=00:00 expl=0x00 mm=0x80 vmm=0x0004
++ 92 kt=0,0,0,0 gi=0x01 w=1 syms=fe03 acts=0101400000040000 beh=00:00 expl=0x00 mm=0x40 vmm=0x0004
+- 108 kt=0,0,0,0 gi=0x01 w=1 syms=fe03 acts=0101800000040000 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 108 kt=0,0,0,0 gi=0x01 w=1 syms=fe03 acts=0101400000040000 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+-groupcompat 1 mask=80 real=00 vmods=0004
++groupcompat 1 mask=40 real=00 vmods=0004
+coremodmap kpm=4 0:50,62,0,0 1:66,0,0,0 2:37,105,0,0 3:64,204,205,0 4:77,0,0,0 5:203,0,0,0 6:92,133,134,206 7:0,0,0,0

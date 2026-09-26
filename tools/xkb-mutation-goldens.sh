@@ -12,6 +12,8 @@
 #   crates/yserver/src/kms/testdata/xkb-setmap-errors/NAME.bin
 #   crates/yserver/src/kms/testdata/xorg-xkb-setmap-resize.txt
 #   crates/yserver/src/kms/testdata/xkb-setmap-resize/NAME.bin
+#   crates/yserver/src/kms/testdata/xorg-xkb-setcompat.txt
+#   crates/yserver/src/kms/testdata/xkb-setcompat/NAME.bin
 #
 # Every value in those files is Xvfb output recorded by tools/xkb-mutation-probe.c
 # (or x11trace). Never hand-edit them; rerun this script.
@@ -21,7 +23,7 @@
 # (x11trace's fake display); both must be free. Only the Xvfb this script
 # starts is ever killed (by pid).
 #
-# usage: tools/xkb-mutation-goldens.sh [ckm|smm|xkbcomp|repeat|pristine|steps|errors|resize ...]   (default: all)
+# usage: tools/xkb-mutation-goldens.sh [ckm|smm|xkbcomp|repeat|pristine|steps|errors|resize|setcompat ...]   (default: all)
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -701,20 +703,84 @@ with open(os.path.join(out, 'cases.txt'), 'w') as f:
 EOF
 }
 
+# SetCompatMap / SetIndicatorMap error vectors (phase 4d): requests built from
+# the recorded identity SetIndicatorMap and SetCompatMap (xkbcomp-requests/
+# identity/2-SetIndicatorMap.bin, 3-SetCompatMap.bin), each aimed at one of
+# ProcXkbSetCompatMap / _XkbSetCompatMap's dry-run checks or
+# ProcXkbSetIndicatorMap's; appended to DIR/cases.txt.
+compat_error_requests() { # SRCDIR DIR -> DIR/NAME.bin + DIR/cases.txt (appended)
+    python3 - "$@" <<'EOF'
+import os, struct, sys
+src, out = sys.argv[1], sys.argv[2]
+im = open(os.path.join(src, '2-SetIndicatorMap.bin'), 'rb').read()
+cm = open(os.path.join(src, '3-SetCompatMap.bin'), 'rb').read()
+assert im[1] == 14 and cm[1] == 11
+def u16(b, o): return b[o] | b[o+1] << 8
+# xkbSetCompatMapReq: deviceSpec@4 pad@6 recomputeActions@7 truncateSI@8 groups@9
+# firstSI@10 nSI@12 pad@14, then nSI 16-byte interprets, then a 4-byte
+# xkbModsWireDesc per group bit
+nsi, groups = u16(cm, 12), cm[9]
+sis = [cm[16 + 16 * i:32 + 16 * i] for i in range(nsi)]
+gmods = cm[16 + 16 * nsi:]
+assert len(gmods) == 4 * bin(groups).count('1'), 'recorded SetCompatMap layout'
+def compat(recompute, truncate, groups, first, sis, gmods, extra=b'', length=None):
+    body = struct.pack('<HBBBBHHH', 0x100, 0, recompute, truncate, groups, first, len(sis), 0)
+    body += b''.join(sis) + gmods + extra
+    n = (len(body) + 4) // 4 if length is None else length
+    return bytes([cm[0], 11, n & 0xff, n >> 8]) + body
+assert compat(cm[7], cm[8], groups, u16(cm, 10), sis, gmods) == cm, 'rebuild SetCompatMap'
+# xkbSetIndicatorMapReq: deviceSpec@4 pad@6 which@8, then a 12-byte
+# xkbIndicatorMapWireDesc per which bit
+which = struct.unpack_from('<I', im, 8)[0]
+maps = [bytearray(im[12 + 12 * i:24 + 12 * i]) for i in range(bin(which).count('1'))]
+def indmap(which, maps, extra=b'', length=None):
+    body = struct.pack('<HHI', 0x100, 0, which) + b''.join(bytes(m) for m in maps) + extra
+    n = (len(body) + 4) // 4 if length is None else length
+    return bytes([im[0], 14, n & 0xff, n >> 8]) + body
+assert indmap(which, maps) == im, 'rebuild SetIndicatorMap'
+cases = []
+def case(name, what, data, step='xreq'):
+    cases.append((name, what, step))
+    open(os.path.join(out, name + '.bin'), 'wb').write(data)
+case('compat-access', 'the recorded identity SetCompatMap, from a client that never called XkbUseExtension', cm, 'xreq0')
+case('compat-short', 'a 12-byte SetCompatMap (xkbSetCompatMapReq is 16)', bytes([cm[0], 11, 3, 0]) + cm[4:12])
+case('compat-length', 'the identity SetCompatMap with 4 bytes too many (length + 1)', compat(1, 1, groups, 0, sis, gmods, extra=bytes(4)))
+case('compat-groupdata', 'groups 0x0f without their four group maps', compat(1, 1, groups, 0, sis, b''))
+case('compat-firstsi', 'firstSI 125 > num_si 124, one interpret', compat(1, 0, 0, 125, sis[:1], b''))
+case('compat-firstsi-truncate', 'truncateSI, no interprets, firstSI 125 > num_si 124', compat(0, 1, 0, 125, [], b''))
+case('indmap-access', 'the recorded identity SetIndicatorMap, from a client that never called XkbUseExtension', im, 'xreq0')
+case('indmap-short', 'an 8-byte SetIndicatorMap (xkbSetIndicatorMapReq is 12)', bytes([im[0], 14, 2, 0]) + im[4:8])
+case('indmap-length', 'the identity SetIndicatorMap with 4 bytes too many (length + 1)', indmap(which, maps, extra=bytes(4)))
+case('indmap-missing', 'which 0xffffffff with 31 indicator maps', indmap(which, maps[:31]))
+m = [bytearray(x) for x in maps]; m[3][1] = 0x10
+case('indmap-whichgroups', 'indicator 3 whichGroups 0x10 (not a group component)', indmap(which, m))
+m = [bytearray(x) for x in maps]; m[5][3] = 0x20
+case('indmap-whichmods', 'indicator 5 whichMods 0x20 (not a modifier component)', indmap(which, m))
+m = [bytearray(x) for x in maps]; m[7][3] = 0x60; m[2][1] = 0x30
+case('indmap-first-bad', 'indicator 2 whichGroups 0x30 and indicator 7 whichMods 0x60: the first is reported', indmap(which, m))
+with open(os.path.join(out, 'cases.txt'), 'a') as f:
+    for name, what, step in cases:
+        f.write('%s\t%s\t%s\n' % (step, name, what))
+EOF
+}
+
 gen_errors() {
     local out=$TD/xorg-xkb-setmap-errors.txt dir=$TD/xkb-setmap-errors
     rm -rf "$dir"
     setmap_error_requests "$TD/xkbcomp-requests/identity/1-SetMap.bin" "$dir"
+    compat_error_requests "$TD/xkbcomp-requests/identity" "$dir"
     {
         echo "# Xorg's errors for malformed XKB SetMap requests and for XKB requests without"
-        echo "# XkbUseExtension (issue #171 phase 4c): Xvfb -noreset, layout=gb"
+        echo "# XkbUseExtension (issue #171 phase 4c), and for malformed SetCompatMap /"
+        echo "# SetIndicatorMap requests (phase 4d): Xvfb -noreset, layout=gb"
         versions
         echo "# setxkbmap -rules evdev -model pc105 -layout gb; then one tools/xkb-mutation-probe.c run per"
         echo "# request (fresh connections each time), sending xkb-setmap-errors/NAME.bin raw:"
         echo "#   xreq:  on the actor after its XkbUseExtension; xreq0: on a connection without it."
-        echo "# Each request is built by this script from xkbcomp-requests/identity/1-SetMap.bin (the"
-        echo "# '## NAME' line says how). Lines: '= error=CODE value=V major=M minor=N' (major is"
-        echo "# this server's XKB opcode), then the (empty) XkbGetMap delta and coremodmap as usual."
+        echo "# Each request is built by this script from xkbcomp-requests/identity/1-SetMap.bin,"
+        echo "# 2-SetIndicatorMap.bin or 3-SetCompatMap.bin (the '## NAME' line says how). Lines:"
+        echo "# '= error=CODE value=V major=M minor=N' (major is this server's XKB opcode), then the"
+        echo "# (empty) XkbGetMap delta and coremodmap as usual."
         fresh gb
         while IFS=$'\t' read -r step name what; do
             echo "## $name: $what"
@@ -785,8 +851,105 @@ gen_resize() {
     rm "$dir/cases.txt"
 }
 
+# ---------------------------------------------------------------------------
+# SetCompatMap / SetIndicatorMap semantics beyond the xkbcomp uploads (phase
+# 4d): partial interpret replacement, truncation, growth, Xorg's skipping of
+# the broken Any+AnyOfOrNone(all)->Private interpret, group compat maps with
+# virtual modifiers, indicator maps with virtual modifiers, the wire realMods
+# byte Xorg ignores, an indicator the new map lights, which=0, and an
+# indicator a new map turns off. Requests built from the recorded identity
+# SetCompatMap / SetIndicatorMap interprets and maps.
+setcompat_requests() { # SRCDIR DIR -> DIR/NAME.bin + DIR/cases.txt (NAME\tSTEPS\tDESCRIPTION; REQ in STEPS = the case's request)
+    python3 - "$@" <<'EOF'
+import os, struct, sys
+src, out = sys.argv[1], sys.argv[2]
+os.makedirs(out, exist_ok=True)
+cm = open(os.path.join(src, '3-SetCompatMap.bin'), 'rb').read()
+def u16(b, o): return b[o] | b[o+1] << 8
+nsi = u16(cm, 12)
+sis = [cm[16 + 16 * i:32 + 16 * i] for i in range(nsi)]
+def compat(recompute, truncate, groups, first, sis, gmods=b''):
+    body = struct.pack('<HBBBBHHH', 0x100, 0, recompute, truncate, groups, first, len(sis), 0)
+    body += b''.join(sis) + gmods
+    n = (len(body) + 4) // 4
+    return bytes([0, 11, n & 0xff, n >> 8]) + body
+def si(sym, mods, match, vmod, flags, act):
+    return struct.pack('<IBBBB', sym, mods, match, vmod, flags) + bytes(act)
+def mods(real, vmods): return struct.pack('<BBH', real, real, vmods)
+def indmap(maps):
+    which = 0
+    body = b''
+    for i, (flags, wg, groups, wm, mods, real, vmods, ctrls) in sorted(maps.items()):
+        which |= 1 << i
+        body += struct.pack('<BBBBBBHI', flags, wg, groups, wm, mods, real, vmods, ctrls)
+    body = struct.pack('<HHI', 0x100, 0, which) + body
+    n = (len(body) + 4) // 4
+    return bytes([0, 14, n & 0xff, n >> 8]) + body
+broken = si(0, 0xff, 1, 0xff, 0, [0x86, 0, 0, 0, 0, 0, 0, 0])
+cases = [
+    ('si-partial', 'interprets 10+2 replaced by the identity upload\'s 20 and 21, no truncation, no recompute',
+     compat(0, 0, 0, 10, sis[20:22]), ''),
+    ('si-truncate', 'truncateSI at 100, no interprets, recomputeActions',
+     compat(1, 1, 0, 100, []), ''),
+    ('si-grow', 'one interpret appended at 124 (a: SetMods(Shift)), recomputeActions',
+     compat(1, 0, 0, 124, [si(0x61, 0, 1, 0xff, 0, [1, 0, 1, 1, 0, 0, 0, 0])]), ''),
+    ('si-skip-broken', 'interprets 0+3, the middle one the broken Any+AnyOfOrNone(all)->Private: skipped',
+     compat(0, 0, 0, 0, [sis[0], broken, sis[2]]), ''),
+    ('si-skip-truncate', 'truncateSI, interprets 120+2 = the broken one and the identity upload\'s 121',
+     compat(0, 1, 0, 120, [broken, sis[121]]), ''),
+    ('groups-vmods', 'group compat 1 = LevelThree (vmod 2), 2 = Shift, no interprets',
+     compat(0, 0, 0x03, 0, [], mods(0, 0x0004) + mods(0x01, 0)), ''),
+    ('indmap-vmods', 'indicator 3 locked Alt (vmod 1) and indicator 1 base Shift+NumLock (vmod 0)',
+     indmap({3: (0, 0, 0, 0x04, 0, 0, 0x0002, 0), 1: (0, 0, 0, 0x01, 0x01, 0x01, 0x0001, 0)}), ''),
+    ('indmap-realmods', 'indicator 4 whichMods locked, mods 0x01 but realMods 0x04 on the wire',
+     indmap({4: (0, 0, 0, 0x04, 0x01, 0x04, 0, 0)}), ''),
+    ('indmap-lights', 'indicator 20 (no name) lit by effective group 1: the new map lights it',
+     indmap({20: (0, 0x08, 0x01, 0, 0, 0, 0, 0)}), ''),
+    ('indmap-which0', 'which 0 with one map and a length that doesn\'t count it: Success, no-op',
+     bytes([0, 14, 6, 0]) + struct.pack('<HHI', 0x100, 0, 0) + struct.pack('<BBBBBBHI', 0, 0x08, 1, 0, 0, 0, 0, 0), ''),
+    ('indmap-caps-off', 'Caps Lock locked (XTEST 66), then the compat upload\'s SetIndicatorMap (Caps Lock LED = locked Shift)',
+     open(os.path.join(src, '../compat/2-SetIndicatorMap.bin'), 'rb').read(), 'down:66 up:66 REQ'),
+    ('indmap-none-in-use', 'Caps Lock locked (XTEST 66), then every indicator map cleared: no map in use',
+     indmap({i: (0, 0, 0, 0, 0, 0, 0, 0) for i in range(32)}), 'down:66 up:66 REQ'),
+    ('groups-vmods-smm', 'group compat 1 = LevelThree (vmod 2), then SetModifierMapping moves <LVL3> (92) from Mod5 to Mod4',
+     compat(0, 0, 0x01, 0, [], mods(0, 0x0004)), 'REQ smmx:-92@7,+92@6'),
+]
+with open(os.path.join(out, 'cases.txt'), 'w') as f:
+    for name, what, data, pre in cases:
+        open(os.path.join(out, name + '.bin'), 'wb').write(data)
+        f.write('%s\t%s\t%s\n' % (name, pre or 'REQ', what))
+EOF
+}
+
+gen_setcompat() {
+    local out=$TD/xorg-xkb-setcompat.txt dir=$TD/xkb-setcompat
+    rm -rf "$dir"
+    setcompat_requests "$TD/xkbcomp-requests/identity" "$dir"
+    {
+        echo "# Xorg's XKB SetCompatMap / SetIndicatorMap semantics (issue #171 phase 4d):"
+        echo "# Xvfb -noreset, fresh server per case, layout=gb"
+        versions
+        echo "# each case: setxkbmap -rules evdev -model pc105 -layout gb; then tools/xkb-mutation-probe.c"
+        echo "# -x with the case's steps: xreq:xkb-setcompat/NAME.bin (the actor, after its XkbUseExtension),"
+        echo "# for some cases after XTEST down:KC up:KC or before an smmx: SetModifierMapping."
+        echo "# The request is built by this script from the recorded identity upload's interprets (the"
+        echo "# '## case' line says what it does); output grammar as in xorg-xkbcomp-steps.txt, the state"
+        echo "# before is xorg-xkb-pristine.txt's layout=gb case. In raw event hex the sequence number"
+        echo "# (bytes 2-3) and time (4-7) differ between runs, and CompatMapNotify bytes 16-31 are"
+        echo "# uninitialised stack in Xorg (differ too)."
+        while IFS=$'\t' read -r name steps what; do
+            fresh gb
+            echo "## case $name: $what"
+            # shellcheck disable=SC2086
+            "$PROBE" -d ":$DISP" -x ${steps//REQ/xreq:$dir/$name.bin} | sed "s|$TD/||g"
+            stop_x
+        done <"$dir/cases.txt"
+    } >"$out"
+    rm "$dir/cases.txt"
+}
+
 targets=("$@")
-[ ${#targets[@]} -eq 0 ] && targets=(ckm smm xkbcomp repeat pristine steps errors resize)
+[ ${#targets[@]} -eq 0 ] && targets=(ckm smm xkbcomp repeat pristine steps errors resize setcompat)
 for t in "${targets[@]}"; do
     "gen_$t"
 done

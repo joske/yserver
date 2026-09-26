@@ -11536,6 +11536,101 @@ impl KmsBackend {
         }
     }
 
+    /// The request `body` (after the 4-byte header) as a whole request with
+    /// XKB minor `minor`, for the ports that read Xorg's offsets from
+    /// `stuff`.
+    fn xkb_whole_request(minor: u8, body: &[u8]) -> Vec<u8> {
+        let words = u16::try_from((body.len() + 4) / 4).unwrap_or(0);
+        let mut req = vec![0, minor];
+        req.extend_from_slice(&words.to_le_bytes());
+        req.extend_from_slice(body);
+        req
+    }
+
+    /// XKB SetCompatMap on the keyboard description: Xorg's
+    /// `ProcXkbSetCompatMap` after its size and BadAccess checks (the core
+    /// loop's): `_XkbSetCompatMap`'s dry run, then its apply pass through
+    /// the one mutation path ([`crate::kms::xkb_desc::set_compat`]). The
+    /// events are Xorg's: CompatMapNotify (changedGroups, firstSI and nSI
+    /// from the request, nTotalSI after), then for `recomputeActions` the
+    /// `XkbSendNotification` of `XkbUpdateActions` over the whole keycode
+    /// range (cause: our XKB major, minor 11).
+    fn xkb_set_compat_map(&mut self, body: &[u8]) -> yserver_core::backend::XkbSetOutcome {
+        use crate::kms::xkb_desc::set_compat;
+        use yserver_core::backend::{XkbSetEvent, XkbSetOutcome};
+        let req = Self::xkb_whole_request(11, body);
+        let h = set_compat::SetCompatMapHeader::parse(&req);
+        if let Err(e) = set_compat::check_compat_map(&self.core.xkb_desc, &h) {
+            return XkbSetOutcome {
+                error: Some((e.code, e.value)),
+                events: Vec::new(),
+            };
+        }
+        let m = set_compat::decode_compat_map(&h, &req);
+        let changes = self.mutate_keymap(|desc| desc.set_compat_map(&h, &m));
+        let mut events = vec![XkbSetEvent::CompatMap(
+            yserver_protocol::x11::XkbCompatMapNotify {
+                device_id: 1,
+                changed_groups: h.groups,
+                first_si: h.first_si,
+                n_si: h.n_si,
+                n_total_si: u16::try_from(self.core.xkb_desc.compat.len()).unwrap_or(u16::MAX),
+            },
+        )];
+        if h.recompute_actions {
+            events.push(XkbSetEvent::Notification(self.mapping_change(&changes)));
+        }
+        XkbSetOutcome {
+            error: None,
+            events,
+        }
+    }
+
+    /// XKB SetIndicatorMap on the keyboard description: Xorg's
+    /// `ProcXkbSetIndicatorMap` after its size and BadAccess checks (the core
+    /// loop's), `_XkbSetIndicatorMap`'s stores through the one mutation path
+    /// ([`crate::kms::xkb_desc::set_compat`]), then `XkbApplyLedMapChanges`:
+    /// the new maps' lit state (`XkbUpdateLedAutoState`: only the indicators
+    /// whose map was set are recomputed, and nothing when no map is in use)
+    /// and its notifications. The keyboard LEDs follow the new maps (the
+    /// install resyncs them, Xorg's `XkbDDXUpdateDeviceIndicators`).
+    fn xkb_set_indicator_map(&mut self, body: &[u8]) -> yserver_core::backend::XkbSetOutcome {
+        use crate::kms::xkb_desc::set_compat;
+        use yserver_core::backend::{XkbIndicatorMapsChange, XkbSetEvent, XkbSetOutcome};
+        let req = Self::xkb_whole_request(14, body);
+        let (which, maps) = match set_compat::check_indicator_map(&req) {
+            Ok(Some(checked)) => checked,
+            Ok(None) => return XkbSetOutcome::default(),
+            Err(e) => {
+                return XkbSetOutcome {
+                    error: Some((e.code, e.value)),
+                    events: Vec::new(),
+                };
+            }
+        };
+        let before = self.core.xkb_desc.indicators_lit(&self.core.xkb_state.0);
+        let _ = self.mutate_keymap(|desc| {
+            desc.set_indicator_map(which, &maps);
+            crate::kms::xkb_desc::XkbChanges::default()
+        });
+        let desc = &self.core.xkb_desc;
+        let lit = desc.indicators_lit(&self.core.xkb_state.0);
+        let state = if desc.maps_present() == 0 {
+            before
+        } else {
+            (lit & which) | (before & !which)
+        };
+        XkbSetOutcome {
+            error: None,
+            events: vec![XkbSetEvent::IndicatorMaps(XkbIndicatorMapsChange {
+                maps_changed: which,
+                state_changed: state ^ before,
+                state,
+                leds_defined: desc.names_present() | desc.maps_present(),
+            })],
+        }
+    }
+
     /// What a mapping change did, for the notifications the core loop sends
     /// (Xorg `XkbSendNotification`: the MapNotify fields straight from the
     /// changes).
@@ -11573,6 +11668,8 @@ impl KmsBackend {
             repeats: changes.repeats.clone(),
             indicator_map_changed: changes.indicator_map_changes,
             indicator_state: desc.indicators_lit(&self.core.xkb_state.0),
+            compat_changed_groups: changes.compat_changed_groups,
+            compat_total_si: u16::try_from(desc.compat.len()).unwrap_or(u16::MAX),
         }
     }
 
@@ -26999,6 +27096,8 @@ impl Backend for KmsBackend {
     ) -> Option<yserver_core::backend::XkbSetOutcome> {
         match minor {
             9 => Some(self.xkb_set_map(body, client_is_ancient)),
+            11 => Some(self.xkb_set_compat_map(body)),
+            14 => Some(self.xkb_set_indicator_map(body)),
             _ => None,
         }
     }
@@ -47957,12 +48056,13 @@ mod tests {
     }
 
     /// Golden (`xorg-xkb-setmap-errors.txt`, Xvfb 21.1.24): every malformed
-    /// SetMap draws Xorg's error — code, errorValue, minor 9, major = our
-    /// XKB opcode — and changes nothing; an XKB request without
-    /// XkbUseExtension draws BadAccess. Each request comes from a fresh
-    /// client (UseExtension first for `xreq`, none for `xreq0`).
+    /// SetMap, SetCompatMap and SetIndicatorMap draws Xorg's error — code,
+    /// errorValue, minor, major = our XKB opcode — and changes nothing; an
+    /// XKB request without XkbUseExtension draws BadAccess. Each request
+    /// comes from a fresh client (UseExtension first for `xreq`, none for
+    /// `xreq0`).
     #[test]
-    fn xkb_set_map_errors_match_xorg() {
+    fn xkb_set_request_errors_match_xorg() {
         let golden = include_str!("../testdata/xorg-xkb-setmap-errors.txt");
         let mut cases: Vec<(String, String, u8, u32, u8)> = Vec::new();
         let mut step = None;
@@ -47992,7 +48092,7 @@ mod tests {
                 ));
             }
         }
-        assert_eq!(cases.len(), 31, "golden parsed");
+        assert_eq!(cases.len(), 44, "golden parsed");
         let mut failures = Vec::new();
         for (kind, file, code, value, minor) in &cases {
             let mut backend = kbd_map_backend("gb", None);
@@ -48044,7 +48144,8 @@ mod tests {
     }
 
     /// A golden in `xorg-xkbcomp-steps.txt`'s grammar: case (its `## case`
-    /// name, up to a `:`) → its `xreq:` steps, by request file name.
+    /// name, up to a `:`) → its `xreq:` steps, by request file name, and its
+    /// `down:KC` / `up:KC` / `smmx:` steps, as they are.
     fn parse_xkb_request_steps(golden: &str) -> Vec<(String, Vec<(String, XkbcompStep)>)> {
         let raw = |l: &str| -> Vec<u8> {
             let h = l.rsplit("raw=").next().unwrap();
@@ -48065,8 +48166,14 @@ mod tests {
                 if let Some(st) = current.take() {
                     cases.last_mut().unwrap().1.push(st);
                 }
-                if let Some(req) = s.strip_prefix("xreq:") {
-                    let name = req.rsplit('/').next().unwrap().trim_end_matches(".bin");
+                let name = if let Some(req) = s.strip_prefix("xreq:") {
+                    Some(req.rsplit('/').next().unwrap().trim_end_matches(".bin"))
+                } else if s.starts_with("down:") || s.starts_with("up:") || s.starts_with("smmx:") {
+                    Some(s)
+                } else {
+                    None
+                };
+                if let Some(name) = name {
                     current = Some((
                         name.to_owned(),
                         XkbcompStep {
@@ -48193,183 +48300,439 @@ mod tests {
         seeded_row && crate::kms::xkb_desc::tests::tolerated(xorg, ours)
     }
 
+    /// A server on a frozen fixture as the probe sees it: an XKB listener
+    /// (UseExtension + SelectEvents all, all details), a plain core client
+    /// and an XKB-initialised actor, the recording's atoms interned at their
+    /// recorded values; and Xorg's state so far (`xorg-xkb-pristine.txt`'s
+    /// case plus the deltas of the steps replayed), with the type and key
+    /// rows the SetMaps so far wrote.
+    struct XkbReplay {
+        backend: KmsBackend,
+        state: yserver_core::server::ServerState,
+        listener: std::os::unix::net::UnixStream,
+        plain: std::os::unix::net::UnixStream,
+        actor: std::os::unix::net::UnixStream,
+        xorg: crate::kms::xkb_desc::tests::CapturedState,
+        written_types: std::collections::BTreeSet<usize>,
+        written_keys: std::collections::BTreeSet<usize>,
+    }
+
+    impl XkbReplay {
+        /// A fresh `layout` server (Xorg's: `pristine_case`) after interning
+        /// `atoms` (the recording's `0xATOM NAME` lines, in order, as the
+        /// probe's `atoms:` step does).
+        fn new(
+            what: &str,
+            (layout, options, pristine_case): (&str, Option<&str>, &str),
+            atoms: &str,
+        ) -> Self {
+            use crate::kms::xkb_desc::tests::{CapturedState, pristine_lines};
+            let mut backend = kbd_map_backend(layout, options);
+            let mut state = yserver_core::server::ServerState::new();
+            let mut listener = kbd_map_client_id(&mut state, 5);
+            let mut plain = kbd_map_client_id(&mut state, 6);
+            let mut actor = kbd_map_client_id(&mut state, 7);
+            yserver_core::core_loop::xkb_layout::seed_keyboard_auto_repeats(&mut state, &backend);
+            for atom in atoms.lines() {
+                let (v, n) = atom.split_once(' ').unwrap();
+                let v = u32::from_str_radix(v.trim_start_matches("0x"), 16).unwrap();
+                let id = yserver_protocol::x11::AtomId(v);
+                assert!(
+                    state.atoms.intern_at(id, n) || state.atoms.id_for(n) == Some(id),
+                    "{what}: atom {n} at {v:#x}"
+                );
+            }
+            for client in [5, 7] {
+                xkb_client_request(&mut state, &mut backend, client, 136, 0, &[1, 0, 0, 0]);
+            }
+            let mut select = Vec::new();
+            for v in [0x100u16, 0x0fff, 0, 0x0fff, 0xff, 0xff] {
+                select.extend_from_slice(&v.to_le_bytes());
+            }
+            xkb_client_request(&mut state, &mut backend, 5, 136, 1, &select);
+            for peer in [&mut listener, &mut plain, &mut actor] {
+                let _ = kbd_map_drain(peer);
+            }
+            Self {
+                backend,
+                state,
+                listener,
+                plain,
+                actor,
+                xorg: CapturedState::new(&pristine_lines(pristine_case)),
+                written_types: std::collections::BTreeSet::new(),
+                written_keys: std::collections::BTreeSet::new(),
+            }
+        }
+
+        /// One golden step `name` on this server, compared with Xorg's `step`:
+        /// a recorded XKB request `req` (header included) or an `smmx:`
+        /// step's SetModifierMapping (its `sent` line) from the actor,
+        /// through the core loop — its events by field on the listener and
+        /// the plain client (Xorg's device-3 events, yserver's one device 1),
+        /// the whole state afterwards (read back through the core loop)
+        /// against Xorg's so far, line for line, and the cooking gate; or a
+        /// `down:KC` / `up:KC` key (XTEST in the probe) cooked by the
+        /// backend, whose events aren't compared.
+        fn step(
+            &mut self,
+            what: &str,
+            name: &str,
+            req: Option<&[u8]>,
+            step: &XkbcompStep,
+            failures: &mut Vec<String>,
+        ) {
+            for l in &step.delta {
+                self.xorg.apply(l);
+            }
+            if name.starts_with("smmx:") {
+                let sent = step
+                    .delta
+                    .iter()
+                    .find_map(|l| l.strip_prefix("sent kpm="))
+                    .unwrap_or_else(|| panic!("{what}: sent line"));
+                assert!(
+                    step.delta.iter().any(|l| l == "= status=0"),
+                    "{what}: Xorg applied it"
+                );
+                let (kpm, keys) = sent.split_once(" keys=").unwrap();
+                let keys: Vec<u8> = keys.split(',').map(|k| k.parse().unwrap()).collect();
+                xkb_client_request(
+                    &mut self.state,
+                    &mut self.backend,
+                    7,
+                    118,
+                    kpm.parse().unwrap(),
+                    &keys,
+                );
+                let reply = kbd_map_drain(&mut self.actor);
+                if reply.len() != 32 || reply[..2] != [1, 0] {
+                    failures.push(format!("{what}: SetModifierMapping reply {reply:02x?}"));
+                }
+                self.compare(what, step, failures);
+                return;
+            }
+            let Some(req) = req else {
+                let (pressed, kc) = name
+                    .strip_prefix("down:")
+                    .map(|k| (true, k))
+                    .or_else(|| name.strip_prefix("up:").map(|k| (false, k)))
+                    .unwrap_or_else(|| panic!("{what}: step {name}"));
+                let keycode = kc.parse().unwrap();
+                let _ = self
+                    .backend
+                    .cook_host_key(yserver_core::host_x11::HostKeyEvent {
+                        keycode,
+                        pressed,
+                        state: 0,
+                        root_x: 0,
+                        root_y: 0,
+                        event_x: 0,
+                        event_y: 0,
+                        time: 0,
+                    });
+                for peer in [&mut self.listener, &mut self.plain, &mut self.actor] {
+                    let _ = kbd_map_drain(peer);
+                }
+                return;
+            };
+            assert!(step.ok, "{what}: Xorg accepted it");
+            xkb_send_recorded(&mut self.state, &mut self.backend, 7, req);
+            // The type and key rows a SetMap writes (firstType/nTypes,
+            // firstKeySym/nKeySyms, when present).
+            if req[1] == 9 {
+                let present = u16::from_le_bytes([req[6], req[7]]);
+                let range =
+                    |first: u8, num: u8| usize::from(first)..usize::from(first) + usize::from(num);
+                if present & 0x01 != 0 {
+                    self.written_types.extend(range(req[12], req[13]));
+                }
+                if present & 0x02 != 0 {
+                    self.written_keys.extend(range(req[14], req[15]));
+                }
+            }
+            let got_actor = kbd_map_drain(&mut self.actor);
+            if !got_actor.is_empty() {
+                failures.push(format!("{what}: the actor got {got_actor:02x?}"));
+            }
+            self.compare(what, step, failures);
+        }
+
+        /// A step's events on the listener and the plain client, the whole
+        /// state afterwards and the cooking gate, against Xorg's.
+        fn compare(&mut self, what: &str, step: &XkbcompStep, failures: &mut Vec<String>) {
+            let got = kbd_map_drain(&mut self.listener);
+            let got_plain = kbd_map_drain(&mut self.plain);
+
+            // Events.
+            let ours: Vec<&[u8]> = got.chunks(32).collect();
+            if ours.len() != step.listener.len() {
+                failures.push(format!(
+                    "{what}: listener got {} events, xorg {}: {ours:02x?}",
+                    ours.len(),
+                    step.listener.len()
+                ));
+            }
+            for (o, x) in ours.iter().zip(&step.listener) {
+                let same = match (x[0] & 0x7f, x[1]) {
+                    // XkbMapNotify, XkbIndicatorStateNotify,
+                    // XkbIndicatorMapNotify, XkbExtensionDeviceNotify: all
+                    // but seq/time; device 3 -> our 1.
+                    (0x55, 1 | 4 | 5 | 11) => o[..2] == x[..2] && o[8] == 1 && o[9..] == x[9..],
+                    // XkbNewKeyboardNotify: devices, ranges, cause (our XKB
+                    // major), changed; bytes 18.. are Xorg stack.
+                    (0x55, 0) => {
+                        o[..2] == x[..2]
+                            && o[8..10] == [1, 1]
+                            && o[10..14] == x[10..14]
+                            && o[14] == 136
+                            && o[15..18] == x[15..18]
+                    }
+                    // XkbControlsNotify: enabledControls is ours (GetControls
+                    // reports RepeatKeys only, the listed `keys` tolerance),
+                    // the cause our XKB major.
+                    (0x55, 3) => {
+                        o[..2] == x[..2]
+                            && o[8] == 1
+                            && o[9..16] == x[9..16]
+                            && o[16..20] == crate::kms::xkb::XKB_ENABLED_CONTROLS.to_le_bytes()
+                            && o[20..26] == x[20..26]
+                            && o[26] == 136
+                            && o[27..] == x[27..]
+                    }
+                    // XkbCompatMapNotify: bytes 16.. are Xorg stack.
+                    (0x55, 7) => o[..2] == x[..2] && o[8] == 1 && o[9..16] == x[9..16],
+                    (34, _) => o[0] & 0x7f == 34 && o[1] == x[1] && o[4..] == x[4..],
+                    other => panic!("{what}: unexpected golden event {other:?}"),
+                };
+                if !same {
+                    failures.push(format!("{what}: event ours {o:02x?} xorg {x:02x?}"));
+                }
+            }
+            let ours_plain: Vec<&[u8]> = got_plain.chunks(32).collect();
+            if ours_plain.len() != step.plain.len()
+                || ours_plain
+                    .iter()
+                    .zip(&step.plain)
+                    .any(|(o, x)| o[0] & 0x7f != x[0] & 0x7f || o[4..] != x[4..])
+            {
+                failures.push(format!(
+                    "{what}: plain client got {ours_plain:02x?}, xorg {:02x?}",
+                    step.plain
+                ));
+            }
+
+            // The whole state.
+            let mut xorg = self.xorg.lines.clone();
+            xorg.insert("coremodmap".into(), step.coremodmap.clone());
+            let mut ours = xkb_state_through_core_loop(
+                &mut self.state,
+                &mut self.backend,
+                5,
+                &mut self.listener,
+            );
+            let modmap_key = ours
+                .keys()
+                .find(|k| k.starts_with("coremodmap"))
+                .cloned()
+                .expect("coremodmap line");
+            let modmap = ours.remove(&modmap_key).unwrap_or_default();
+            ours.insert("coremodmap".into(), modmap);
+            let written = |line: &str| {
+                let mut w = line.split(' ');
+                let (kind, n) = (w.next(), w.next().and_then(|n| n.parse::<usize>().ok()));
+                match (kind, n) {
+                    (Some("type"), Some(n)) => self.written_types.contains(&n),
+                    (Some("key"), Some(n)) => self.written_keys.contains(&n),
+                    _ => true,
+                }
+            };
+            let keys: std::collections::BTreeSet<&String> =
+                xorg.keys().chain(ours.keys()).collect();
+            let mut n = 0;
+            for k in keys {
+                let (x, o) = (xorg.get(k), ours.get(k));
+                let ok = matches!((x, o), (Some(x), Some(o)) if xkb_line_matches(x, o, &written));
+                if !ok && n < 20 {
+                    n += 1;
+                    failures.push(format!(
+                        "{what}: {k}\n  xorg {}\n  ours {}",
+                        x.map_or("-", String::as_str),
+                        o.map_or("-", String::as_str)
+                    ));
+                }
+            }
+            cooking_gate(&self.backend, what, failures);
+        }
+    }
+
     /// Replay one recorded XKB request (`req`, header included) on a fresh
-    /// `layout` server through the core loop, from an XKB-initialised actor
-    /// (after interning `atoms`, the recording's `0xATOM NAME` lines, at
-    /// their recorded values, as the probe does), and compare with Xorg's
-    /// `step`: the events by field on an XKB listener (UseExtension +
-    /// SelectEvents all, all details; Xorg's device-3 events, yserver's one
-    /// device 1) and on a plain core client; the whole state afterwards
-    /// (read back through the core loop) against `pristine_case` of
-    /// `xorg-xkb-pristine.txt` plus the step's delta, line for line; and
-    /// the cooking gate. Returns the backend for further checks.
+    /// server ([`XkbReplay`]) and compare with Xorg's `step`. Returns the
+    /// backend for further checks.
     fn replay_xkb_request_step(
         what: &str,
-        (layout, options, pristine_case): (&str, Option<&str>, &str),
+        fixture: (&str, Option<&str>, &str),
         atoms: &str,
         req: &[u8],
         step: &XkbcompStep,
         failures: &mut Vec<String>,
     ) -> KmsBackend {
-        use crate::kms::xkb_desc::tests::{CapturedState, pristine_lines};
-        assert!(step.ok, "{what}: Xorg accepted it");
-        let mut backend = kbd_map_backend(layout, options);
-        let mut state = yserver_core::server::ServerState::new();
-        let mut listener = kbd_map_client_id(&mut state, 5);
-        let mut plain = kbd_map_client_id(&mut state, 6);
-        let mut actor = kbd_map_client_id(&mut state, 7);
-        yserver_core::core_loop::xkb_layout::seed_keyboard_auto_repeats(&mut state, &backend);
-        for atom in atoms.lines() {
-            let (v, n) = atom.split_once(' ').unwrap();
-            let v = u32::from_str_radix(v.trim_start_matches("0x"), 16).unwrap();
-            let id = yserver_protocol::x11::AtomId(v);
-            assert!(
-                state.atoms.intern_at(id, n) || state.atoms.id_for(n) == Some(id),
-                "{what}: atom {n} at {v:#x}"
-            );
-        }
-        for client in [5, 7] {
-            xkb_client_request(&mut state, &mut backend, client, 136, 0, &[1, 0, 0, 0]);
-        }
-        let mut select = Vec::new();
-        for v in [0x100u16, 0x0fff, 0, 0x0fff, 0xff, 0xff] {
-            select.extend_from_slice(&v.to_le_bytes());
-        }
-        xkb_client_request(&mut state, &mut backend, 5, 136, 1, &select);
-        for peer in [&mut listener, &mut plain, &mut actor] {
-            let _ = kbd_map_drain(peer);
-        }
-
-        xkb_send_recorded(&mut state, &mut backend, 7, req);
-        // The type and key rows a SetMap writes (firstType/nTypes,
-        // firstKeySym/nKeySyms, when present).
-        let in_range = |n: usize, present: u16, bit: u16, first: u8, num: u8| {
-            present & bit != 0
-                && (usize::from(first)..usize::from(first) + usize::from(num)).contains(&n)
-        };
-        let present = if req[1] == 9 {
-            u16::from_le_bytes([req[6], req[7]])
-        } else {
-            0
-        };
-        let written = |line: &str| {
-            let mut w = line.split(' ');
-            let (kind, n) = (w.next(), w.next().and_then(|n| n.parse::<usize>().ok()));
-            match (kind, n) {
-                (Some("type"), Some(n)) => in_range(n, present, 0x01, req[12], req[13]),
-                (Some("key"), Some(n)) => in_range(n, present, 0x02, req[14], req[15]),
-                _ => true,
-            }
-        };
-        let got_actor = kbd_map_drain(&mut actor);
-        if !got_actor.is_empty() {
-            failures.push(format!("{what}: the actor got {got_actor:02x?}"));
-        }
-        let got = kbd_map_drain(&mut listener);
-        let got_plain = kbd_map_drain(&mut plain);
-
-        // Events.
-        let ours: Vec<&[u8]> = got.chunks(32).collect();
-        if ours.len() != step.listener.len() {
-            failures.push(format!(
-                "{what}: listener got {} events, xorg {}: {ours:02x?}",
-                ours.len(),
-                step.listener.len()
-            ));
-        }
-        for (o, x) in ours.iter().zip(&step.listener) {
-            let same = match (x[0] & 0x7f, x[1]) {
-                // XkbMapNotify: all but seq/time; device 3 -> our 1.
-                (0x55, 1) => o[..2] == x[..2] && o[8] == 1 && o[9..] == x[9..],
-                // XkbNewKeyboardNotify: devices, ranges, cause (our XKB
-                // major), changed; bytes 18.. are Xorg stack.
-                (0x55, 0) => {
-                    o[..2] == x[..2]
-                        && o[8..10] == [1, 1]
-                        && o[10..14] == x[10..14]
-                        && o[14] == 136
-                        && o[15..18] == x[15..18]
-                }
-                (34, _) => o[0] & 0x7f == 34 && o[1] == x[1] && o[4..] == x[4..],
-                other => panic!("{what}: unexpected golden event {other:?}"),
-            };
-            if !same {
-                failures.push(format!("{what}: event ours {o:02x?} xorg {x:02x?}"));
-            }
-        }
-        let ours_plain: Vec<&[u8]> = got_plain.chunks(32).collect();
-        if ours_plain.len() != step.plain.len()
-            || ours_plain
-                .iter()
-                .zip(&step.plain)
-                .any(|(o, x)| o[0] & 0x7f != x[0] & 0x7f || o[4..] != x[4..])
-        {
-            failures.push(format!(
-                "{what}: plain client got {ours_plain:02x?}, xorg {:02x?}",
-                step.plain
-            ));
-        }
-
-        // The whole state.
-        let mut xorg = CapturedState::new(&pristine_lines(pristine_case));
-        for l in &step.delta {
-            xorg.apply(l);
-        }
-        xorg.lines
-            .insert("coremodmap".into(), step.coremodmap.clone());
-        let mut ours = xkb_state_through_core_loop(&mut state, &mut backend, 5, &mut listener);
-        let modmap_key = ours
-            .keys()
-            .find(|k| k.starts_with("coremodmap"))
-            .cloned()
-            .expect("coremodmap line");
-        let modmap = ours.remove(&modmap_key).unwrap_or_default();
-        ours.insert("coremodmap".into(), modmap);
-        let keys: std::collections::BTreeSet<&String> =
-            xorg.lines.keys().chain(ours.keys()).collect();
-        let mut n = 0;
-        for k in keys {
-            let (x, o) = (xorg.lines.get(k), ours.get(k));
-            let ok = matches!((x, o), (Some(x), Some(o)) if xkb_line_matches(x, o, &written));
-            if !ok && n < 20 {
-                n += 1;
-                failures.push(format!(
-                    "{what}: {k}\n  xorg {}\n  ours {}",
-                    x.map_or("-", String::as_str),
-                    o.map_or("-", String::as_str)
-                ));
-            }
-        }
-        cooking_gate(&backend, what, failures);
-        backend
+        let mut replay = XkbReplay::new(what, fixture, atoms);
+        replay.step(what, "", Some(req), step, failures);
+        replay.backend
     }
 
-    /// Golden (`xorg-xkbcomp-steps.txt`, Xvfb 21.1.24): step 1 (the SetMap)
-    /// of every recorded xkbcomp upload, replayed byte for byte through the
-    /// core loop ([`replay_xkb_request_step`]): Xorg's events on an XKB
-    /// listener and a plain client, Xorg's whole state afterwards (level
-    /// names Xorg left uninitialised skipped; the listed seed tolerances
-    /// only for rows the request doesn't write), and the cooking gate.
+    /// The xkbcomp upload steps the backend implements (SetMap,
+    /// SetIndicatorMap, SetCompatMap; SetNames and SetGeometry are 4e).
+    const XKBCOMP_STEPS_IMPLEMENTED: usize = 3;
+
+    /// Replay steps `1..=n` of a recorded xkbcomp upload `case` on one
+    /// server, comparing each with Xorg's (cumulative) state and events.
+    fn replay_xkbcomp_upload(
+        case: &str,
+        steps: &[(String, XkbcompStep)],
+        n: usize,
+        failures: &mut Vec<String>,
+    ) -> XkbReplay {
+        let atoms =
+            String::from_utf8(xkb_testdata(&format!("xkbcomp-requests/{case}/atoms.txt"))).unwrap();
+        let mut replay = XkbReplay::new(case, ("gb", None, "gb"), &atoms);
+        for (i, (name, step)) in steps.iter().take(n).enumerate() {
+            assert!(
+                name.starts_with(&format!("{}-", i + 1)),
+                "{case}: step {name}"
+            );
+            let req = xkb_testdata(&format!("xkbcomp-requests/{case}/{name}.bin"));
+            replay.step(&format!("{case} {name}"), name, Some(&req), step, failures);
+        }
+        replay
+    }
+
+    /// Golden (`xorg-xkbcomp-steps.txt`, Xvfb 21.1.24): every recorded
+    /// xkbcomp upload replayed byte for byte through the core loop on one
+    /// server, request after request ([`XkbReplay::step`]): after each of
+    /// SetMap, SetIndicatorMap and SetCompatMap, Xorg's events on an XKB
+    /// listener and a plain client, Xorg's whole state so far (level names
+    /// Xorg left uninitialised skipped; the listed seed tolerances only for
+    /// rows no SetMap wrote), and the cooking gate.
     #[test]
-    fn xkbcomp_set_map_matches_xorg() {
+    fn xkbcomp_uploads_match_xorg_request_by_request() {
         let cases = parse_xkb_request_steps(include_str!("../testdata/xorg-xkbcomp-steps.txt"));
         assert_eq!(cases.len(), 9, "golden parsed");
         let mut failures: Vec<String> = Vec::new();
         for (case, steps) in &cases {
-            let (name, step) = &steps[0];
-            assert_eq!(name, "1-SetMap", "{case}");
-            let atoms =
-                String::from_utf8(xkb_testdata(&format!("xkbcomp-requests/{case}/atoms.txt")))
-                    .unwrap();
-            let req = xkb_testdata(&format!("xkbcomp-requests/{case}/1-SetMap.bin"));
-            let _ = replay_xkb_request_step(
-                case,
-                ("gb", None, "gb"),
-                &atoms,
-                &req,
-                step,
-                &mut failures,
-            );
+            assert_eq!(steps.len(), 5, "{case}");
+            let _ = replay_xkbcomp_upload(case, steps, XKBCOMP_STEPS_IMPLEMENTED, &mut failures);
+        }
+        assert!(
+            failures.is_empty(),
+            "{} failures:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// After the `compat` upload's SetIndicatorMap the Caps Lock LED follows
+    /// a locked Shift instead of the locked Lock (Xorg's map after step 2,
+    /// `xorg-xkbcomp-steps.txt`) — in the cooking keymap and on the
+    /// keyboard's LEDs — and after its SetCompatMap <CAPS> sets Control
+    /// (step 3: the recompute gave it the new Caps_Lock interpret's
+    /// `SetMods(Control)`).
+    #[test]
+    fn xkbcomp_compat_upload_reaches_leds_and_cooking() {
+        use yserver_core::host_x11::HostKeyEvent;
+        let key = |keycode: u8, pressed: bool| HostKeyEvent {
+            keycode,
+            pressed,
+            state: 0,
+            root_x: 0,
+            root_y: 0,
+            event_x: 0,
+            event_y: 0,
+            time: 0,
+        };
+        let cases = parse_xkb_request_steps(include_str!("../testdata/xorg-xkbcomp-steps.txt"));
+        let (_, steps) = cases.iter().find(|(c, _)| c == "compat").unwrap();
+        // Caps Lock locked before the upload: its LED is on.
+        let atoms = String::from_utf8(xkb_testdata("xkbcomp-requests/compat/atoms.txt")).unwrap();
+        let mut replay = XkbReplay::new("compat", ("gb", None, "gb"), &atoms);
+        let _ = replay.backend.cook_host_key(key(66, true));
+        let _ = replay.backend.cook_host_key(key(66, false));
+        let caps = input::Led::CAPSLOCK.bits();
+        assert_eq!(
+            replay.backend.leds_sent, caps,
+            "precondition: Caps Lock LED on"
+        );
+        for (name, _) in steps.iter().take(2) {
+            let req = xkb_testdata(&format!("xkbcomp-requests/compat/{name}.bin"));
+            xkb_send_recorded(&mut replay.state, &mut replay.backend, 7, &req);
+        }
+        // Lock is still locked, but the LED now shows locked Shift.
+        assert_eq!(
+            replay.backend.leds_sent, 0,
+            "Caps Lock LED off: it follows Shift now"
+        );
+        let st = &mut replay.backend.core.xkb_state.0;
+        st.update_mask(0, 0, 0x01, 0, 0, 0);
+        assert!(
+            st.led_name_is_active(xkbcommon::xkb::LED_NAME_CAPS),
+            "locked Shift lights it"
+        );
+        st.update_mask(0, 0, 0x02, 0, 0, 0);
+        assert!(
+            !st.led_name_is_active(xkbcommon::xkb::LED_NAME_CAPS),
+            "locked Lock doesn't"
+        );
+        // Step 3 on a clean server: <CAPS> sets Control, locks nothing.
+        let mut failures = Vec::new();
+        let mut replay = replay_xkbcomp_upload("compat", steps, 3, &mut failures);
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        let _ = replay.backend.cook_host_key(key(66, true));
+        let mods = replay
+            .backend
+            .core
+            .xkb_state
+            .0
+            .serialize_mods(xkbcommon::xkb::STATE_MODS_EFFECTIVE);
+        assert_eq!(mods & 0x06, 0x04, "compat: <CAPS> sets Control");
+        let _ = replay.backend.cook_host_key(key(66, false));
+        let locked = replay
+            .backend
+            .core
+            .xkb_state
+            .0
+            .serialize_mods(xkbcommon::xkb::STATE_MODS_LOCKED);
+        assert_eq!(locked, 0, "compat: no Caps Lock");
+        assert_eq!(replay.backend.leds_sent, 0, "no LED");
+    }
+
+    /// Golden (`xorg-xkb-setcompat.txt`, Xvfb 21.1.24): SetCompatMap's
+    /// interpret replacement, truncation, growth and skipping of the broken
+    /// Any interpret, group compat maps with virtual modifiers (and the
+    /// CompatMapNotify a later SetModifierMapping's virtual modifier change
+    /// sends for them), and SetIndicatorMap's virtual modifiers, ignored
+    /// realMods byte, a map that lights its indicator, which=0, a map that
+    /// turns one off and maps none of which is in use (after XTEST Caps
+    /// Lock): events, whole state and cooking as [`XkbReplay::step`], one
+    /// fresh gb server per case.
+    #[test]
+    fn set_compat_and_indicator_maps_match_xorg() {
+        let cases = parse_xkb_request_steps(include_str!("../testdata/xorg-xkb-setcompat.txt"));
+        assert_eq!(cases.len(), 13, "golden parsed");
+        let mut failures: Vec<String> = Vec::new();
+        for (case, steps) in &cases {
+            let mut replay = XkbReplay::new(case, ("gb", None, "gb"), "");
+            for (name, step) in steps {
+                let req = (!name.contains(':'))
+                    .then(|| xkb_testdata(&format!("xkb-setcompat/{name}.bin")));
+                replay.step(
+                    &format!("{case} {name}"),
+                    name,
+                    req.as_deref(),
+                    step,
+                    &mut failures,
+                );
+            }
         }
         assert!(
             failures.is_empty(),

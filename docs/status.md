@@ -33,6 +33,28 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-26 XKB SetCompatMap + SetIndicatorMap on the model (#171 phase
+  4d, branch `feat/171-phase4-xkbcomp`):** `kms::xkb_desc::set_compat` ports
+  `_XkbSetCompatMap` (dry-run checks, interprets stored from firstSI with the
+  broken `Any+AnyOfOrNone(all)->Private` interpret skipped and the tail closed
+  up, truncateSI, group compat maps, `recomputeActions` →
+  `XkbUpdateActions` over the whole range) and `ProcXkbSetIndicatorMap` /
+  `_XkbSetIndicatorMap` (which=0 no-op, `CHK_MASK_LEGAL`, the wire realMods
+  byte ignored) with `XkbApplyLedMapChanges`' lit-state rules; the keyboard
+  LEDs follow the new maps. New encoders `XkbCompatMapNotify` /
+  `XkbExtensionDeviceNotify`; IndicatorMapNotify / IndicatorStateNotify /
+  ExtensionDeviceNotify / CompatMapNotify filtered on the per-device
+  interests; `XkbSendNotification`'s CompatMapNotify for group compat masks a
+  virtual modifier change altered (also after ChangeKeyboardMapping /
+  SetModifierMapping). Fixes on the way: `XkbApplyCompatMapToKey` only sets
+  the type of an unmatched slot to NoAction (its bytes stay, as Xorg), and a
+  fresh cooking state computes its LEDs (xkbcommon leaves them off until the
+  first update). Goldens: steps 1–3 of all 9 xkbcomp uploads replayed on one
+  server (cumulative state + events), 13 new SetCompatMap/SetIndicatorMap
+  error vectors in `xorg-xkb-setmap-errors.txt`, new `xorg-xkb-setcompat.txt`
+  (13 behaviour cases), from `tools/xkb-mutation-goldens.sh errors|setcompat`.
+  SetNames / SetGeometry are still accepted no-ops (4e).
+
 - **2026-09-26 XKB SetMap on the model (#171 phase 4c, branch
   `feat/171-phase4-xkbcomp`):** `kms::xkb_desc::set_map` ports Xorg's
   `ProcXkbSetMap` literally: `_XkbSetMapCheckLength`, `_XkbSetMapChecks`

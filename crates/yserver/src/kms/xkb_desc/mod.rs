@@ -20,6 +20,7 @@ pub(crate) mod gate;
 pub(crate) mod probe;
 pub(crate) mod reply;
 pub(crate) mod seed;
+pub(crate) mod set_compat;
 pub(crate) mod set_map;
 pub(crate) mod text;
 pub(crate) mod writer;
@@ -458,15 +459,6 @@ impl XkbDesc {
             .unwrap_or([0; 8])
     }
 
-    /// `XkbResizeKeyActions(key, needed)`: none for 0, else one action per
-    /// slot, keeping the existing ones.
-    fn resize_key_actions(&mut self, kc: u8, needed: usize) -> &mut Vec<Action> {
-        let slot = &mut self.acts[usize::from(kc)];
-        let v = slot.get_or_insert_with(Vec::new);
-        v.resize(needed, [0; 8]);
-        v
-    }
-
     /// Whether `kc` repeats in `per_key_repeat`.
     pub(crate) fn repeats(&self, kc: u8) -> bool {
         self.per_key_repeat[usize::from(kc >> 3)] & (1 << (kc & 7)) != 0
@@ -576,9 +568,14 @@ impl XkbDesc {
         } else {
             changed |= KEY_ACTIONS_MASK;
             let mut new_vmodmask = 0u16;
-            let mut acts = vec![[0u8; 8]; n_syms];
+            // `XkbResizeKeyActions(key, nSyms)`: a key with actions keeps
+            // them (it has one per keysym); a slot no interpret matches only
+            // gets its type set to NoAction, its other bytes stay.
+            let mut acts = self.acts[k].clone().unwrap_or_default();
+            acts.resize(n_syms, [0; 8]);
             for (n, interp) in interps.iter().enumerate() {
                 let Some(i) = *interp else {
+                    acts[n][0] = SA_NO_ACTION;
                     continue;
                 };
                 let si = self.compat[i];
@@ -594,7 +591,7 @@ impl XkbDesc {
                 self.set_action_key_mods(&mut act, eff);
                 acts[n] = act;
             }
-            *self.resize_key_actions(key, n_syms) = acts;
+            self.acts[k] = Some(acts);
             if explicit & EXPLICIT_VMODMAP == 0 && self.vmodmap[k] != new_vmodmask {
                 changed |= VIRTUAL_MOD_MAP_MASK;
                 self.vmodmap[k] = new_vmodmask;

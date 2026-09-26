@@ -222,13 +222,95 @@ pub(crate) fn send_keyboard_mapping_followups(
 ) {
     apply_keyboard_mapping_repeats(state, xkb_event_base, change, cause);
     if change.indicator_map_changed != 0 {
-        send_indicator_map_notify(
+        send_indicator_notify(
             state,
             xkb_event_base,
+            x11::XkbIndicatorNotifyKind::Map,
             change.indicator_state,
             change.indicator_map_changed,
         );
     }
+    if change.compat_changed_groups != 0 {
+        send_xkb_compat_map_notify(
+            state,
+            xkb_event_base,
+            x11::XkbCompatMapNotify {
+                device_id: XKB_DEVICE_ID,
+                changed_groups: change.compat_changed_groups,
+                first_si: 0,
+                n_si: 0,
+                n_total_si: change.compat_total_si,
+            },
+        );
+    }
+}
+
+/// `XkbSendCompatMapNotify`: to every XKB-initialised client with any
+/// compat map interest (`compatNotifyMask` ≠ 0).
+pub(crate) fn send_xkb_compat_map_notify(
+    state: &mut ServerState,
+    xkb_event_base: u8,
+    notify: x11::XkbCompatMapNotify,
+) {
+    let recipients = crate::core_loop::xkb_select::interest_recipients(state, |i| i.compat != 0);
+    let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
+        let _ = x11::write_xkb_compat_map_notify(buf, order, seq, xkb_event_base, notify);
+    });
+}
+
+/// `XkbXI_IndicatorMapsMask` / `XkbXI_IndicatorStateMask` /
+/// `XkbXI_AllFeaturesMask` (ExtensionDeviceNotify reason and features).
+const XI_INDICATOR_MAPS_MASK: u16 = 1 << 3;
+const XI_INDICATOR_STATE_MASK: u16 = 1 << 4;
+const XI_ALL_FEATURES_MASK: u16 = 0x001f;
+
+/// The notifications of new indicator maps, in Xorg's order
+/// (`XkbApplyLedMapChanges` → `XkbFlushLedEvents`: `XkbSendNotification`'s
+/// IndicatorMapNotify and, when the maps turned indicators on or off,
+/// IndicatorStateNotify; then `XkbSendExtensionDeviceNotify` with reason
+/// IndicatorMaps, plus IndicatorState when the state changed, for the core
+/// keyboard's default LED feedback: class KbdFeedbackClass (0), id 0).
+pub(crate) fn send_indicator_maps_change(
+    state: &mut ServerState,
+    xkb_event_base: u8,
+    change: &crate::backend::XkbIndicatorMapsChange,
+) {
+    send_indicator_notify(
+        state,
+        xkb_event_base,
+        x11::XkbIndicatorNotifyKind::Map,
+        change.state,
+        change.maps_changed,
+    );
+    let mut reason = XI_INDICATOR_MAPS_MASK;
+    if change.state_changed != 0 {
+        send_indicator_notify(
+            state,
+            xkb_event_base,
+            x11::XkbIndicatorNotifyKind::State,
+            change.state,
+            change.state_changed,
+        );
+        reason |= XI_INDICATOR_STATE_MASK;
+    }
+    let notify = x11::XkbExtensionDeviceNotify {
+        device_id: XKB_DEVICE_ID,
+        reason,
+        led_class: 0,
+        led_id: 0,
+        leds_defined: change.leds_defined,
+        led_state: change.state,
+        first_btn: 0,
+        n_btns: 0,
+        supported: XI_ALL_FEATURES_MASK,
+        unsupported: 0,
+    };
+    let recipients = crate::core_loop::xkb_select::interest_recipients(state, |i| {
+        i.extension_device & reason != 0
+    });
+    let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
+        let _ = x11::write_xkb_extension_device_notify(buf, order, seq, xkb_event_base, notify);
+    });
 }
 
 /// Apply the per-key auto-repeat a mapping change re-derived for its keys
@@ -287,18 +369,26 @@ pub(crate) fn apply_repeats_to_core(state: &mut ServerState, repeats: &[(u8, boo
     changed
 }
 
-/// Send `XkbIndicatorMapNotify` for the indicators in `changed` (their map
-/// changed; `lit` = the indicators on) to its subscribers, as Xorg's
-/// `XkbSendNotification` does after a virtual modifier mapping change.
-fn send_indicator_map_notify(state: &mut ServerState, xkb_event_base: u8, lit: u32, changed: u32) {
+/// Send `XkbIndicatorMapNotify` / `XkbIndicatorStateNotify` for the
+/// indicators in `changed` (`lit` = the indicators on) to the XKB-initialised
+/// clients whose indicator map / state interest includes one of them
+/// (`XkbSendIndicatorNotify`: `iMapNotifyMask` / `iStateNotifyMask`).
+fn send_indicator_notify(
+    state: &mut ServerState,
+    xkb_event_base: u8,
+    kind: x11::XkbIndicatorNotifyKind,
+    lit: u32,
+    changed: u32,
+) {
     let notify = x11::XkbIndicatorNotify {
-        kind: x11::XkbIndicatorNotifyKind::Map,
+        kind,
         device_id: XKB_DEVICE_ID,
         state: lit,
         changed,
     };
-    let recipients = crate::core_loop::xkb_select::interest_recipients(state, |i| {
-        i.indicator_map & changed != 0
+    let recipients = crate::core_loop::xkb_select::interest_recipients(state, |i| match kind {
+        x11::XkbIndicatorNotifyKind::Map => i.indicator_map & changed != 0,
+        x11::XkbIndicatorNotifyKind::State => i.indicator_state & changed != 0,
     });
     let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
         let _ = x11::write_xkb_indicator_notify(buf, order, seq, xkb_event_base, notify);

@@ -1,13 +1,15 @@
 # Xorg's errors for malformed XKB SetMap requests and for XKB requests without
-# XkbUseExtension (issue #171 phase 4c): Xvfb -noreset, layout=gb
+# XkbUseExtension (issue #171 phase 4c), and for malformed SetCompatMap /
+# SetIndicatorMap requests (phase 4d): Xvfb -noreset, layout=gb
 # server: X.Org version 21.1.24 (xdpyinfo); `Xvfb -version` -> "Unrecognized option: -version" (not supported by this build)
 # pacman -Q: xkeyboard-config 2.48-1 xorg-server-xvfb 21.1.24-1
 # setxkbmap -rules evdev -model pc105 -layout gb; then one tools/xkb-mutation-probe.c run per
 # request (fresh connections each time), sending xkb-setmap-errors/NAME.bin raw:
 #   xreq:  on the actor after its XkbUseExtension; xreq0: on a connection without it.
-# Each request is built by this script from xkbcomp-requests/identity/1-SetMap.bin (the
-# '## NAME' line says how). Lines: '= error=CODE value=V major=M minor=N' (major is
-# this server's XKB opcode), then the (empty) XkbGetMap delta and coremodmap as usual.
+# Each request is built by this script from xkbcomp-requests/identity/1-SetMap.bin,
+# 2-SetIndicatorMap.bin or 3-SetCompatMap.bin (the '## NAME' line says how). Lines:
+# '= error=CODE value=V major=M minor=N' (major is this server's XKB opcode), then the
+# (empty) XkbGetMap delta and coremodmap as usual.
 ## access: the recorded identity SetMap, from a client that never called XkbUseExtension
 > xreq0:xkb-setmap-errors/access.bin
 = error=10 value=0 major=135 minor=9
@@ -131,4 +133,56 @@ coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6
 ## access-selectevents: SelectEvents(all) from a client that never called XkbUseExtension
 > xreq0:xkb-setmap-errors/access-selectevents.bin
 = error=10 value=0 major=135 minor=1
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## compat-access: the recorded identity SetCompatMap, from a client that never called XkbUseExtension
+> xreq0:xkb-setmap-errors/compat-access.bin
+= error=10 value=0 major=135 minor=11
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## compat-short: a 12-byte SetCompatMap (xkbSetCompatMapReq is 16)
+> xreq:xkb-setmap-errors/compat-short.bin
+= error=16 value=0 major=135 minor=11
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## compat-length: the identity SetCompatMap with 4 bytes too many (length + 1)
+> xreq:xkb-setmap-errors/compat-length.bin
+= error=16 value=0 major=135 minor=11
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## compat-groupdata: groups 0x0f without their four group maps
+> xreq:xkb-setmap-errors/compat-groupdata.bin
+= error=16 value=0 major=135 minor=11
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## compat-firstsi: firstSI 125 > num_si 124, one interpret
+> xreq:xkb-setmap-errors/compat-firstsi.bin
+= error=2 value=33554556 major=135 minor=11
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## compat-firstsi-truncate: truncateSI, no interprets, firstSI 125 > num_si 124
+> xreq:xkb-setmap-errors/compat-firstsi-truncate.bin
+= error=2 value=33554556 major=135 minor=11
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## indmap-access: the recorded identity SetIndicatorMap, from a client that never called XkbUseExtension
+> xreq0:xkb-setmap-errors/indmap-access.bin
+= error=10 value=0 major=135 minor=14
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## indmap-short: an 8-byte SetIndicatorMap (xkbSetIndicatorMapReq is 12)
+> xreq:xkb-setmap-errors/indmap-short.bin
+= error=16 value=0 major=135 minor=14
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## indmap-length: the identity SetIndicatorMap with 4 bytes too many (length + 1)
+> xreq:xkb-setmap-errors/indmap-length.bin
+= error=16 value=0 major=135 minor=14
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## indmap-missing: which 0xffffffff with 31 indicator maps
+> xreq:xkb-setmap-errors/indmap-missing.bin
+= error=16 value=0 major=135 minor=14
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## indmap-whichgroups: indicator 3 whichGroups 0x10 (not a group component)
+> xreq:xkb-setmap-errors/indmap-whichgroups.bin
+= error=2 value=50331664 major=135 minor=14
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## indmap-whichmods: indicator 5 whichMods 0x20 (not a modifier component)
+> xreq:xkb-setmap-errors/indmap-whichmods.bin
+= error=2 value=83886112 major=135 minor=14
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## indmap-first-bad: indicator 2 whichGroups 0x30 and indicator 7 whichMods 0x60: the first is reported
+> xreq:xkb-setmap-errors/indmap-first-bad.bin
+= error=2 value=33554480 major=135 minor=14
 coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
