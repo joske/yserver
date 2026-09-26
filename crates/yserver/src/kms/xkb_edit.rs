@@ -1140,7 +1140,8 @@ mod tests {
         let before = compile(&dump(&compile(&crafted)));
         let input = dump(&before);
         assert!(input.contains("repeat= No") || input.contains("repeat=No"));
-        assert!(input.contains("actions[1]"), "explicit action is dumped");
+        // `actions[1]` (1.13) or `actions[Group1]` (1.6): group_index takes both.
+        assert!(input.contains("actions["), "explicit action is dumped");
 
         // Rebind the key to Control_L: the interpret for Control_L would give
         // SetMods(Control), but the explicit LockMods(Mod3) must survive.
