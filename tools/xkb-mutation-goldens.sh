@@ -1178,6 +1178,8 @@ cases = [
      indmap({i: (0, 0, 0, 0, 0, 0, 0, 0) for i in range(32)}), 'down:66 up:66 REQ'),
     ('groups-vmods-smm', 'group compat 1 = LevelThree (vmod 2), then SetModifierMapping moves <LVL3> (92) from Mod5 to Mod4',
      compat(0, 0, 0x01, 0, [], mods(0, 0x0004)), 'REQ smmx:-92@7,+92@6'),
+    ('groups-high-bits', 'groups 0x13: data for groups 1 and 2 only; bit 4 is beyond XkbNumKbdGroups, not counted in the length',
+     compat(0, 0, 0x13, 0, [], mods(0, 0x0004) + mods(0x01, 0)), ''),
 ]
 with open(os.path.join(out, 'cases.txt'), 'w') as f:
     for name, what, data, pre in cases:

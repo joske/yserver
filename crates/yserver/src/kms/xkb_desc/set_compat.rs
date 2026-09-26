@@ -96,7 +96,9 @@ pub(crate) fn check_compat_map(desc: &XkbDesc, h: &SetCompatMapHeader) -> Result
         }
         len += usize::from(h.n_si) * SYM_INTERPRET_WIRE_SIZE;
     }
-    len += h.groups.count_ones() as usize * MODS_WIRE_SIZE;
+    // Xorg counts only the XkbNumKbdGroups (4) low bits; higher bits carry
+    // no data and are ignored, though CompatMapNotify still reports them.
+    len += (h.groups & ((1 << NUM_GROUPS) - 1)).count_ones() as usize * MODS_WIRE_SIZE;
     if len / 4 != h.length / 4 {
         return Err(XkbError {
             code: BAD_LENGTH,

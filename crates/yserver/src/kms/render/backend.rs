@@ -48870,7 +48870,7 @@ mod tests {
     #[test]
     fn set_compat_and_indicator_maps_match_xorg() {
         let cases = parse_xkb_request_steps(include_str!("../testdata/xorg-xkb-setcompat.txt"));
-        assert_eq!(cases.len(), 13, "golden parsed");
+        assert_eq!(cases.len(), 14, "golden parsed");
         let mut failures: Vec<String> = Vec::new();
         for (case, steps) in &cases {
             let mut replay = XkbReplay::new(case, ("gb", None, "gb"), "");

@@ -13,7 +13,7 @@
 ## case si-partial: interprets 10+2 replaced by the identity upload's 20 and 21, no truncation, no recompute
 > xreq:xkb-setcompat/si-partial.bin
 = ok
-e xkb CompatMapNotify dev=3 changedGroups=0x00 si=10+2 totalSI=124 raw=55076100e36c460803000a0002007c00801f9777d7550000c0e39577d7550000
+e xkb CompatMapNotify dev=3 changedGroups=0x00 si=10+2 totalSI=124 raw=550761000469ce0803000a0002007c0090fff0f4c4550000c0c3eff4c4550000
 -si 10 sym=ffeb mods=ff match=02 vmod=3 flags=00 act=0105000000000000
 +si 10 sym=fe04 mods=ff match=01 vmod=255 flags=00 act=0203000000040000
 -si 11 sym=ffec mods=ff match=02 vmod=3 flags=00 act=0105000000000000
@@ -22,11 +22,11 @@ coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6
 ## case si-truncate: truncateSI at 100, no interprets, recomputeActions
 > xreq:xkb-setcompat/si-truncate.bin
 = ok
-e xkb CompatMapNotify dev=3 changedGroups=0x00 si=100+0 totalSI=100 raw=55076100676d46080300640000006400607f2d0454560000c0432c0454560000
-e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0010 min=8 max=255 types=0+0 syms=0+0 acts=8+75 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55016100676d46080300100008ff00000000084b000000000000000000000000
-e xkb ControlsNotify dev=3 numGroups=1 changed=0x40000000 enabled=0x000013a1 enabledChanges=0x00000000 keycode=0 eventType=0 req=135.11 raw=55036100676d46080301000000000040a1130000000000000000870b00000000
-e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0010 min=8 max=255 types=0+0 syms=0+0 acts=8+75 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55016100676d46080500100008ff00000000084b000000000000000000000000
-e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0010 min=8 max=255 types=0+0 syms=0+0 acts=8+75 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55016100676d46080700100008ff00000000084b000000000000000000000000
+e xkb CompatMapNotify dev=3 changedGroups=0x00 si=100+0 totalSI=100 raw=550761008169ce08030064000000640090dfca8631560000c0a3c98631560000
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0010 min=8 max=255 types=0+0 syms=0+0 acts=8+75 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=550161008169ce080300100008ff00000000084b000000000000000000000000
+e xkb ControlsNotify dev=3 numGroups=1 changed=0x40000000 enabled=0x000013a1 enabledChanges=0x00000000 keycode=0 eventType=0 req=135.11 raw=550361008169ce080301000000000040a1130000000000000000870b00000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0010 min=8 max=255 types=0+0 syms=0+0 acts=8+75 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=550161008169ce080500100008ff00000000084b000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0010 min=8 max=255 types=0+0 syms=0+0 acts=8+75 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=550161008169ce080700100008ff00000000084b000000000000000000000000
 repeat 37 0->1
 repeat 50 0->1
 repeat 62 0->1
@@ -104,11 +104,11 @@ coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6
 ## case si-grow: one interpret appended at 124 (a: SetMods(Shift)), recomputeActions
 > xreq:xkb-setcompat/si-grow.bin
 = ok
-e xkb CompatMapNotify dev=3 changedGroups=0x00 si=124+1 totalSI=125 raw=55076100ed6d460803007c0001007d0080cf14581a560000c09313581a560000
-e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0010 min=8 max=255 types=0+0 syms=0+0 acts=8+75 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55016100ed6d46080300100008ff00000000084b000000000000000000000000
-e xkb ControlsNotify dev=3 numGroups=1 changed=0x40000000 enabled=0x000013a1 enabledChanges=0x00000000 keycode=0 eventType=0 req=135.11 raw=55036100ed6d46080301000000000040a1130000000000000000870b00000000
-e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0010 min=8 max=255 types=0+0 syms=0+0 acts=8+75 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55016100ed6d46080500100008ff00000000084b000000000000000000000000
-e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0010 min=8 max=255 types=0+0 syms=0+0 acts=8+75 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55016100ed6d46080700100008ff00000000084b000000000000000000000000
+e xkb CompatMapNotify dev=3 changedGroups=0x00 si=124+1 totalSI=125 raw=550761000c6ace0803007c0001007d00805fc106a9550000c023c006a9550000
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0010 min=8 max=255 types=0+0 syms=0+0 acts=8+75 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=550161000c6ace080300100008ff00000000084b000000000000000000000000
+e xkb ControlsNotify dev=3 numGroups=1 changed=0x40000000 enabled=0x000013a1 enabledChanges=0x00000000 keycode=0 eventType=0 req=135.11 raw=550361000c6ace080301000000000040a1130000000000000000870b00000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0010 min=8 max=255 types=0+0 syms=0+0 acts=8+75 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=550161000c6ace080500100008ff00000000084b000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0010 min=8 max=255 types=0+0 syms=0+0 acts=8+75 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=550161000c6ace080700100008ff00000000084b000000000000000000000000
 repeat 38 1->0
 - 38 kt=12,0,0,0 gi=0x01 w=4 syms=61,41,e6,c6 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
 + 38 kt=12,0,0,0 gi=0x01 w=4 syms=61,41,e6,c6 acts=0100010100000000,0000000000000000,0000000000000000,0000000000000000 beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
@@ -119,7 +119,7 @@ coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6
 ## case si-skip-broken: interprets 0+3, the middle one the broken Any+AnyOfOrNone(all)->Private: skipped
 > xreq:xkb-setcompat/si-skip-broken.bin
 = ok
-e xkb CompatMapNotify dev=3 changedGroups=0x00 si=0+3 totalSI=123 raw=55076100706e46080300000003007b00900f67d78c550000c0d365d78c550000
+e xkb CompatMapNotify dev=3 changedGroups=0x00 si=0+3 totalSI=123 raw=55076100896ace080300000003007b00807f06cc5f550000c04305cc5f550000
 -compat - groups=0x0f firstSI=0 nSI=124 nTotalSI=124
 +compat - groups=0x0f firstSI=0 nSI=123 nTotalSI=123
 -si 1 sym=ffe6 mods=03 match=02 vmod=255 flags=00 act=0300010100000000
@@ -371,7 +371,7 @@ coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6
 ## case si-skip-truncate: truncateSI, interprets 120+2 = the broken one and the identity upload's 121
 > xreq:xkb-setcompat/si-skip-truncate.bin
 = ok
-e xkb CompatMapNotify dev=3 changedGroups=0x00 si=120+2 totalSI=121 raw=55076100e56e4608030078000200790090ef3fc3f1550000c0b33ec3f1550000
+e xkb CompatMapNotify dev=3 changedGroups=0x00 si=120+2 totalSI=121 raw=55076100006bce080300780002007900604ff3fc82550000c013f2fc82550000
 -compat - groups=0x0f firstSI=0 nSI=124 nTotalSI=124
 +compat - groups=0x0f firstSI=0 nSI=121 nTotalSI=121
 -si 120 sym=fe13 mods=ff match=01 vmod=255 flags=00 act=0300000000100000
@@ -383,7 +383,7 @@ coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6
 ## case groups-vmods: group compat 1 = LevelThree (vmod 2), 2 = Shift, no interprets
 > xreq:xkb-setcompat/groups-vmods.bin
 = ok
-e xkb CompatMapNotify dev=3 changedGroups=0x03 si=0+0 totalSI=124 raw=550761007d6f46080303000000007c0080afff9d39560000c073fe9d39560000
+e xkb CompatMapNotify dev=3 changedGroups=0x03 si=0+0 totalSI=124 raw=55076100716bce080303000000007c00803f88d189550000c00387d189550000
 -groupcompat 1 mask=00 real=00 vmods=0000
 +groupcompat 1 mask=80 real=00 vmods=0004
 -groupcompat 2 mask=80 real=80 vmods=0000
@@ -392,8 +392,8 @@ coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6
 ## case indmap-vmods: indicator 3 locked Alt (vmod 1) and indicator 1 base Shift+NumLock (vmod 0)
 > xreq:xkb-setcompat/indmap-vmods.bin
 = ok
-e xkb IndicatorMapNotify dev=3 state=0x00000000 changed=0x0000000a raw=55056100f66f460803000000000000000a000000000000000000000000000000
-e xkb xkbType=11 dev=3 raw=550b6100f66f46080300080000000000ff3f00000000000000001f0000000000
+e xkb IndicatorMapNotify dev=3 state=0x00000000 changed=0x0000000a raw=55056100ed6bce0803000000000000000a000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b6100ed6bce080300080000000000ff3f00000000000000001f0000000000
 -indmap 1 flags=80 whichGroups=00 groups=00 whichMods=04 mods=10 realMods=00 vmods=0001 ctrls=00000000
 +indmap 1 flags=00 whichGroups=00 groups=00 whichMods=01 mods=11 realMods=01 vmods=0001 ctrls=00000000
 -indmap 3 flags=00 whichGroups=00 groups=00 whichMods=00 mods=00 realMods=00 vmods=0000 ctrls=00000000
@@ -402,17 +402,17 @@ coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6
 ## case indmap-realmods: indicator 4 whichMods locked, mods 0x01 but realMods 0x04 on the wire
 > xreq:xkb-setcompat/indmap-realmods.bin
 = ok
-e xkb IndicatorMapNotify dev=3 state=0x00000000 changed=0x00000010 raw=550561007f704608030000000000000010000000000000000000000000000000
-e xkb xkbType=11 dev=3 raw=550b61007f7046080300080000000000ff3f00000000000000001f0000000000
+e xkb IndicatorMapNotify dev=3 state=0x00000000 changed=0x00000010 raw=55056100646cce08030000000000000010000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b6100646cce080300080000000000ff3f00000000000000001f0000000000
 -indmap 4 flags=00 whichGroups=00 groups=00 whichMods=00 mods=00 realMods=00 vmods=0000 ctrls=00000000
 +indmap 4 flags=00 whichGroups=00 groups=00 whichMods=04 mods=01 realMods=01 vmods=0000 ctrls=00000000
 coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
 ## case indmap-lights: indicator 20 (no name) lit by effective group 1: the new map lights it
 > xreq:xkb-setcompat/indmap-lights.bin
 = ok
-e xkb IndicatorMapNotify dev=3 state=0x00100000 changed=0x00100000 raw=5505610001714608030000000000100000001000000000000000000000000000
-e xkb IndicatorStateNotify dev=3 state=0x00100000 changed=0x00100000 raw=5504610001714608030000000000100000001000000000000000000000000000
-e xkb xkbType=11 dev=3 raw=550b6100017146080300180000000000ff3f10000000100000001f0000000000
+e xkb IndicatorMapNotify dev=3 state=0x00100000 changed=0x00100000 raw=55056100d36cce08030000000000100000001000000000000000000000000000
+e xkb IndicatorStateNotify dev=3 state=0x00100000 changed=0x00100000 raw=55046100d36cce08030000000000100000001000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b6100d36cce080300180000000000ff3f10000000100000001f0000000000
 -indmap 20 flags=00 whichGroups=00 groups=00 whichMods=00 mods=00 realMods=00 vmods=0000 ctrls=00000000
 +indmap 20 flags=00 whichGroups=08 groups=01 whichMods=00 mods=00 realMods=00 vmods=0000 ctrls=00000000
 coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
@@ -423,43 +423,43 @@ coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6
 ## case indmap-caps-off: Caps Lock locked (XTEST 66), then the compat upload's SetIndicatorMap (Caps Lock LED = locked Shift)
 > down:66
 = ok
-e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=55006100ef714608030308ff08ff870903000000000000000000000000000000
-e xkb StateNotify dev=3 mods=0x02 base=0x02 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x1f0b keycode=66 eventType=2 req=0.0 raw=55026100ef7146080302020002000000000000020202020200000b1f42020000
-e xkb IndicatorStateNotify dev=3 state=0x00000001 changed=0x00000001 raw=55046100ef714608030000000100000001000000000000000000000000000000
-e xkb xkbType=11 dev=3 raw=550b6100ef7146080300100000000000ff3f00000100000000001f0000000000
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=55006100bd6dce08030308ff08ff870903000000000000000000000000000000
+e xkb StateNotify dev=3 mods=0x02 base=0x02 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x1f0b keycode=66 eventType=2 req=0.0 raw=55026100bd6dce080302020002000000000000020202020200000b1f42020000
+e xkb IndicatorStateNotify dev=3 state=0x00000001 changed=0x00000001 raw=55046100bd6dce08030000000100000001000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b6100bd6dce080300100000000000ff3f00000100000000001f0000000000
 e core MappingNotify request=1 first=8 count=248 raw=220002000108f800000000000000000000000000000000000000000000000000
 e core MappingNotify request=0 first=0 count=0 raw=2200020000000000000000000000000000000000000000000000000000000000
 coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
 > up:66
 = ok
-e xkb StateNotify dev=3 mods=0x02 base=0x00 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x0002 keycode=66 eventType=3 req=0.0 raw=55026a00f3714608030200000200000000000002020202020000020042030000
+e xkb StateNotify dev=3 mods=0x02 base=0x00 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x0002 keycode=66 eventType=3 req=0.0 raw=55026a00c96dce08030200000200000000000002020202020000020042030000
 coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
 > xreq:xkb-setcompat/indmap-caps-off.bin
 = ok
-e xkb IndicatorMapNotify dev=3 state=0x00000000 changed=0xffffffff raw=55057300f87146080300000000000000ffffffff000000000000000000000000
-e xkb IndicatorStateNotify dev=3 state=0x00000000 changed=0x00000001 raw=55047300f8714608030000000000000001000000000000000000000000000000
-e xkb xkbType=11 dev=3 raw=550b7300f87146080300180000000000ff3f00000000000000001f0000000000
+e xkb IndicatorMapNotify dev=3 state=0x00000000 changed=0xffffffff raw=55057300ce6dce080300000000000000ffffffff000000000000000000000000
+e xkb IndicatorStateNotify dev=3 state=0x00000000 changed=0x00000001 raw=55047300ce6dce08030000000000000001000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b7300ce6dce080300180000000000ff3f00000000000000001f0000000000
 -indmap 0 flags=80 whichGroups=00 groups=00 whichMods=04 mods=02 realMods=02 vmods=0000 ctrls=00000000
 +indmap 0 flags=80 whichGroups=00 groups=00 whichMods=04 mods=01 realMods=01 vmods=0000 ctrls=00000000
 coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
 ## case indmap-none-in-use: Caps Lock locked (XTEST 66), then every indicator map cleared: no map in use
 > down:66
 = ok
-e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=5500610085724608030308ff08ff870903000000000000000000000000000000
-e xkb StateNotify dev=3 mods=0x02 base=0x02 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x1f0b keycode=66 eventType=2 req=0.0 raw=55026100857246080302020002000000000000020202020200000b1f42020000
-e xkb IndicatorStateNotify dev=3 state=0x00000001 changed=0x00000001 raw=5504610085724608030000000100000001000000000000000000000000000000
-e xkb xkbType=11 dev=3 raw=550b6100857246080300100000000000ff3f00000100000000001f0000000000
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=550061004b6ece08030308ff08ff870903000000000000000000000000000000
+e xkb StateNotify dev=3 mods=0x02 base=0x02 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x1f0b keycode=66 eventType=2 req=0.0 raw=550261004b6ece080302020002000000000000020202020200000b1f42020000
+e xkb IndicatorStateNotify dev=3 state=0x00000001 changed=0x00000001 raw=550461004b6ece08030000000100000001000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b61004b6ece080300100000000000ff3f00000100000000001f0000000000
 e core MappingNotify request=1 first=8 count=248 raw=220002000108f800000000000000000000000000000000000000000000000000
 e core MappingNotify request=0 first=0 count=0 raw=2200020000000000000000000000000000000000000000000000000000000000
 coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
 > up:66
 = ok
-e xkb StateNotify dev=3 mods=0x02 base=0x00 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x0002 keycode=66 eventType=3 req=0.0 raw=55026a008a724608030200000200000000000002020202020000020042030000
+e xkb StateNotify dev=3 mods=0x02 base=0x00 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x0002 keycode=66 eventType=3 req=0.0 raw=55026a00506ece08030200000200000000000002020202020000020042030000
 coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
 > xreq:xkb-setcompat/indmap-none-in-use.bin
 = ok
-e xkb IndicatorMapNotify dev=3 state=0x00000001 changed=0xffffffff raw=55057300927246080300000001000000ffffffff000000000000000000000000
-e xkb xkbType=11 dev=3 raw=550b7300927246080300080000000000ff3f00000100000000001f0000000000
+e xkb IndicatorMapNotify dev=3 state=0x00000001 changed=0xffffffff raw=55057300536ece080300000001000000ffffffff000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b7300536ece080300080000000000ff3f00000100000000001f0000000000
 -indmap 0 flags=80 whichGroups=00 groups=00 whichMods=04 mods=02 realMods=02 vmods=0000 ctrls=00000000
 +indmap 0 flags=00 whichGroups=00 groups=00 whichMods=00 mods=00 realMods=00 vmods=0000 ctrls=00000000
 -indmap 1 flags=80 whichGroups=00 groups=00 whichMods=04 mods=10 realMods=00 vmods=0001 ctrls=00000000
@@ -476,18 +476,18 @@ coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6
 ## case groups-vmods-smm: group compat 1 = LevelThree (vmod 2), then SetModifierMapping moves <LVL3> (92) from Mod5 to Mod4
 > xreq:xkb-setcompat/groups-vmods-smm.bin
 = ok
-e xkb CompatMapNotify dev=3 changedGroups=0x01 si=0+0 totalSI=124 raw=550761000c7346080301000000007c00907fb3b77d550000c043b2b77d550000
+e xkb CompatMapNotify dev=3 changedGroups=0x01 si=0+0 totalSI=124 raw=55076100d36ece080301000000007c00902fb208c5550000c0f3b008c5550000
 -groupcompat 1 mask=00 real=00 vmods=0000
 +groupcompat 1 mask=80 real=00 vmods=0004
 coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
 > smmx:-92@7,+92@6
 sent kpm=4 keys=50,62,0,0,66,0,0,0,37,105,0,0,64,204,205,0,77,0,0,0,203,0,0,0,133,134,206,92,0,0,0,0
 = status=0
-e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0055 min=8 max=255 types=9+17 syms=0+0 acts=8+101 beh=0+0 expl=0+0 modmap=8+248 vmodmap=0+0 vmods=0x0004 raw=55016a00107346080300550008ff0911000008650000000008f8000004000000
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0055 min=8 max=255 types=9+17 syms=0+0 acts=8+101 beh=0+0 expl=0+0 modmap=8+248 vmodmap=0+0 vmods=0x0004 raw=55016a00d86ece080300550008ff0911000008650000000008f8000004000000
 e xkbl MappingNotify request=0 first=0 count=0 raw=22006a0000000000000000000000000000000000000000000000000000000000
-e xkb CompatMapNotify dev=3 changedGroups=0x01 si=0+0 totalSI=124 raw=55076a00107346080301000000007c0000000000000000000000000000000000
-e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0055 min=8 max=255 types=9+17 syms=0+0 acts=8+101 beh=0+0 expl=0+0 modmap=8+248 vmodmap=0+0 vmods=0x0004 raw=55016a00107346080500550008ff0911000008650000000008f8000004000000
-e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0055 min=8 max=255 types=9+17 syms=0+0 acts=8+101 beh=0+0 expl=0+0 modmap=8+248 vmodmap=0+0 vmods=0x0004 raw=55016a00107346080700550008ff0911000008650000000008f8000004000000
+e xkb CompatMapNotify dev=3 changedGroups=0x01 si=0+0 totalSI=124 raw=55076a00d86ece080301000000007c0000000000000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0055 min=8 max=255 types=9+17 syms=0+0 acts=8+101 beh=0+0 expl=0+0 modmap=8+248 vmodmap=0+0 vmods=0x0004 raw=55016a00d86ece080500550008ff0911000008650000000008f8000004000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0055 min=8 max=255 types=9+17 syms=0+0 acts=8+101 beh=0+0 expl=0+0 modmap=8+248 vmodmap=0+0 vmods=0x0004 raw=55016a00d86ece080700550008ff0911000008650000000008f8000004000000
 e core MappingNotify request=0 first=0 count=0 raw=2200030000000000000000000000000000000000000000000000000000000000
 -vmods 10,08,80,40,20,08,00,00,00,00,00,00,00,00,00,00
 +vmods 10,08,40,40,20,08,00,00,00,00,00,00,00,00,00,00
@@ -498,3 +498,12 @@ e core MappingNotify request=0 first=0 count=0 raw=22000300000000000000000000000
 -groupcompat 1 mask=80 real=00 vmods=0004
 +groupcompat 1 mask=40 real=00 vmods=0004
 coremodmap kpm=4 0:50,62,0,0 1:66,0,0,0 2:37,105,0,0 3:64,204,205,0 4:77,0,0,0 5:203,0,0,0 6:92,133,134,206 7:0,0,0,0
+## case groups-high-bits: groups 0x13: data for groups 1 and 2 only; bit 4 is beyond XkbNumKbdGroups, not counted in the length
+> xreq:xkb-setcompat/groups-high-bits.bin
+= ok
+e xkb CompatMapNotify dev=3 changedGroups=0x13 si=0+0 totalSI=124 raw=550761004e6fce080313000000007c0080ff75b75e550000c0c374b75e550000
+-groupcompat 1 mask=00 real=00 vmods=0000
++groupcompat 1 mask=80 real=00 vmods=0004
+-groupcompat 2 mask=80 real=80 vmods=0000
++groupcompat 2 mask=01 real=01 vmods=0000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
