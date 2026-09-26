@@ -15671,14 +15671,32 @@ fn handle_xi2_request(
     let mut buf: Vec<u8> = Vec::with_capacity(64);
     match minor {
         1 => {
-            // XI GetExtensionVersion
+            // XI GetExtensionVersion, as Xorg's ProcXGetExtensionVersion
+            // (Xi/getvers.c): the length must match `nbytes`, and the reply
+            // is the server's XI version (XIVersion, 2.4) with RepType =
+            // X_GetExtensionVersion. libXi reads this version to decide
+            // whether XI 2.2 fields (a raw event's sourceid) are valid.
             debug!(
                 "client {} #{} XIGetExtensionVersion",
                 client_id.0, sequence.0
             );
-            let mut reply = x11::fixed_reply(byte_order, sequence, 0, 0);
-            x11::write_u16(ClientByteOrder::LittleEndian, &mut reply, 2);
-            x11::write_u16(ClientByteOrder::LittleEndian, &mut reply, 0);
+            let nbytes = body
+                .get(0..2)
+                .map_or(0, |b| usize::from(u16::from_le_bytes([b[0], b[1]])));
+            if usize::try_from(header.length_units).ok() != Some((8 + nbytes).div_ceil(4)) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    1,
+                    XI2_MAJOR_OPCODE,
+                );
+            }
+            let mut reply = x11::fixed_reply(byte_order, sequence, 1, 0);
+            x11::write_u16(byte_order, &mut reply, XI2_SERVER_MAJOR_VERSION);
+            x11::write_u16(byte_order, &mut reply, XI2_SERVER_MINOR_VERSION);
             reply.push(1);
             reply.extend_from_slice(&[0; 19]);
             buf.extend_from_slice(&reply);
@@ -37962,6 +37980,63 @@ mod tests {
         assert_eq!(wire.len(), 32, "XIQueryVersion reply size");
         assert_eq!(u16::from_le_bytes([wire[8], wire[9]]), 2);
         assert_eq!(u16::from_le_bytes([wire[10], wire[11]]), 3);
+    }
+
+    /// XI1 GetExtensionVersion answers the server's XI version, as Xorg's
+    /// `ProcXGetExtensionVersion` (Xi/getvers.c: `XIVersion` = 2.4; Xvfb's
+    /// `xinput --version` reports "XI version on server: 2.4"), with
+    /// RepType = X_GetExtensionVersion. libXi decides from this reply
+    /// whether XI 2.2 fields such as a raw event's `sourceid` are valid:
+    /// the old hard-coded 2.0 made `xinput test-xi2 --root` print every
+    /// raw key event as `device: 3 (0)` (#173; Xorg: `3 (5)`). A length
+    /// that doesn't match `nbytes` is BadLength.
+    #[test]
+    fn xi_get_extension_version_reports_the_server_version_like_xorg() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let name = b"XInputExtension";
+        let mut body = vec![name.len() as u8, 0, 0, 0];
+        body.extend_from_slice(name);
+        body.push(0);
+        let header = RequestHeader {
+            opcode: 131,
+            data: 1,
+            length_units: 6,
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            header,
+            &body,
+        )
+        .expect("GetExtensionVersion");
+        let wire = read_all_available(&mut peer);
+        assert_eq!(wire.len(), 32, "reply size");
+        assert_eq!((wire[0], wire[1]), (1, 1), "X_Reply, RepType");
+        assert_eq!(u16::from_le_bytes([wire[8], wire[9]]), 2, "major");
+        assert_eq!(u16::from_le_bytes([wire[10], wire[11]]), 4, "minor");
+        assert_eq!(wire[12], 1, "present");
+
+        let short = RequestHeader {
+            length_units: 5,
+            ..header
+        };
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            short,
+            &body[..16],
+        )
+        .expect("GetExtensionVersion, wrong length");
+        let wire = read_all_available(&mut peer);
+        assert_eq!((wire[0], wire[1]), (0, x11::error::BAD_LENGTH), "BadLength");
     }
 
     /// The XI version a client announced is remembered the way Xorg's
