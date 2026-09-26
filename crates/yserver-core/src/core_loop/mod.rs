@@ -35,6 +35,7 @@ pub mod xdmcp;
 pub mod xi1_focus;
 pub mod xi1_state_notify;
 pub mod xkb_layout;
+pub mod xkb_select;
 
 pub use generation::{Generation, GenerationCounter};
 pub use input_inventory::{DeviceNode, InputInventory};

@@ -470,8 +470,9 @@ pub fn process_disconnect_reporting(
     state
         .randr_select_masks
         .retain(|(owner, window), _| *owner != client_id.0 && !dead_windows.contains(window));
+    state.xkb_clients.remove(&client_id.0);
     state
-        .xkb_select_event_masks
+        .xkb_interests
         .retain(|(owner, _), _| *owner != client_id.0);
     state.dpms.selected_by.remove(&client_id);
     state.screensaver.selected_by.remove(&client_id);

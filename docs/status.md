@@ -33,6 +33,28 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-26 XKB SetMap on the model (#171 phase 4c, branch
+  `feat/171-phase4-xkbcomp`):** `kms::xkb_desc::set_map` ports Xorg's
+  `ProcXkbSetMap` literally: `_XkbSetMapCheckLength`, `_XkbSetMapChecks`
+  (with its request-bounds checks and request edits) and `_XkbSetMap`
+  (`XkbChangeKeycodeRange` + NewKeyboardNotify, `SetKeyTypes` with
+  `XkbResizeKeyType`'s level names and key-width resizing, `SetKeySyms`,
+  `SetKeyActions`, `SetKeyBehaviors`, `SetVirtualMods`, the
+  explicit/modmap/vmodmap parts that set a range but no `changed` bit, the
+  RecomputeActions recompute), through the one mutation path. New
+  `Backend::xkb_set` returns the error or Xorg's ordered events; the core loop
+  now keeps Xorg's per-client XKB state (`core_loop::xkb_select`: the
+  UseExtension flag, a `ProcXkbSelectEvents` port into per-client map/NKN and
+  per-device detail masks), answers BadAccess to every XKB request but
+  UseExtension without it, filters MapNotify/NewKeyboardNotify/ControlsNotify/
+  IndicatorMapNotify on the detail masks and sends the legacy core
+  MappingNotify as `XkbSendLegacyMapNotify` (also for ChangeKeyboardMapping /
+  SetModifierMapping). Goldens: step 1 of all 9 recorded xkbcomp uploads
+  (state + events), new `xorg-xkb-setmap-errors.txt` (31 error vectors incl.
+  BadAccess) and `xorg-xkb-setmap-resize.txt` (key-width resizing), all from
+  `tools/xkb-mutation-goldens.sh errors|resize`. SetCompatMap / SetIndicatorMap
+  / SetNames / SetGeometry are still accepted no-ops (4d/4e).
+
 - **2026-09-26 the keyboard is an Xorg `XkbDesc` model (#171 phase 4a+4b,
   branch `feat/171-phase4-xkbcomp`):** new `kms::xkb_desc` holds Xorg's
   server-side keyboard description (types by index with vmods/preserve/level

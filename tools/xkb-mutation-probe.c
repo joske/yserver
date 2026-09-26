@@ -44,7 +44,11 @@
  *                                     replayed request's atoms mean the same)
  *   xreq:FILE                         the actor (after its XkbUseExtension)
  *                                     sends the one request in binary FILE,
- *                                     byte-exact but for the XKB major opcode
+ *                                     byte-exact but for the XKB major opcode;
+ *                                     an error prints '= error=E value=V
+ *                                     major=M minor=N'
+ *   xreq0:FILE                        as xreq:, but sent on a fresh connection
+ *                                     that never called XkbUseExtension
  *   full                              (-x) print the whole current state as
  *                                     '= ' lines, no step taken
  *   total                             diff the current map against the map
@@ -676,18 +680,21 @@ static void intern_atoms(const char *path)
     printf("= ok atoms=%d\n", n);
 }
 
-/* send the one request in binary file PATH (header included) on the actor,
- * with the XKB major opcode of this server */
-static void send_xkb_request(const char *path)
+/* an XKB request's error, with its opcodes (the xreq steps) */
+static void report_xkb_error(xcb_generic_error_t *err)
 {
-    if (!actor_xkb_ready) {
-        xcb_xkb_use_extension_reply_t *ue =
-            xcb_xkb_use_extension_reply(ac, xcb_xkb_use_extension(ac, 1, 0), NULL);
-        if (!ue || !ue->supported)
-            die("actor UseExtension failed");
-        free(ue);
-        actor_xkb_ready = 1;
-    }
+    if (err) {
+        printf("= error=%d value=%u major=%d minor=%d\n", err->error_code, err->resource_id,
+               err->major_code, err->minor_code);
+        free(err);
+    } else
+        printf("= ok\n");
+}
+
+/* send the one request in binary file PATH (header included) on connection
+ * C, with the XKB major opcode of this server */
+static void send_raw_xkb(xcb_connection_t *c, const char *path)
+{
     FILE *f = fopen(path, "rb");
     if (!f)
         die("xreq: cannot open file");
@@ -701,9 +708,34 @@ static void send_xkb_request(const char *path)
     v[2].iov_base = buf;
     v[2].iov_len = n;
     xcb_protocol_request_t req = {.count = 1, .ext = NULL, .opcode = buf[1], .isvoid = 1};
-    unsigned seq = xcb_send_request(ac, XCB_REQUEST_CHECKED | XCB_REQUEST_RAW, v + 2, &req);
+    unsigned seq = xcb_send_request(c, XCB_REQUEST_CHECKED | XCB_REQUEST_RAW, v + 2, &req);
     xcb_void_cookie_t ck = {seq};
-    report_error(xcb_request_check(ac, ck));
+    report_xkb_error(xcb_request_check(c, ck));
+}
+
+/* xreq: on the actor, after its XkbUseExtension */
+static void send_xkb_request(const char *path)
+{
+    if (!actor_xkb_ready) {
+        xcb_xkb_use_extension_reply_t *ue =
+            xcb_xkb_use_extension_reply(ac, xcb_xkb_use_extension(ac, 1, 0), NULL);
+        if (!ue || !ue->supported)
+            die("actor UseExtension failed");
+        free(ue);
+        actor_xkb_ready = 1;
+    }
+    send_raw_xkb(ac, path);
+}
+
+static xcb_connection_t *open_conn(const char *d);
+static const char *display_name;
+
+/* xreq0: on a fresh connection that never calls XkbUseExtension */
+static void send_xkb_request_uninitialised(const char *path)
+{
+    xcb_connection_t *c = open_conn(display_name);
+    send_raw_xkb(c, path);
+    xcb_disconnect(c);
 }
 
 /* update level_uninit for step ARG, BEFORE = the state before it: a SetMap
@@ -974,6 +1006,10 @@ static void step(char *arg)
         send_xkb_request(arg + 5);
         return;
     }
+    if (!strncmp(arg, "xreq0:", 6)) {
+        send_xkb_request_uninitialised(arg + 6);
+        return;
+    }
     char *f[8];
     char *copy = xstrdup(arg);
     int n = split(copy, ':', f, 8);
@@ -1043,6 +1079,7 @@ int main(int argc, char **argv)
     }
     if (i >= argc)
         die("usage: xkb-mutation-probe [-d DISPLAY] [-x] STEP...");
+    display_name = disp;
     xl = open_conn(disp);
     cl = open_conn(disp);
     ac = open_conn(disp);

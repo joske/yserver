@@ -25,13 +25,17 @@ impl Atoms {
     }
 
     fn name(&self, a: u32) -> String {
-        if a == 0 {
-            return "None".to_owned();
-        }
-        self.by_id
-            .get(&a)
-            .map_or_else(|| format!("BadAtom(0x{a:x})"), |n| format!("'{n}'"))
+        atom_display(a, self.by_id.get(&a).map(String::as_str))
     }
+}
+
+/// An atom as the probe prints it: `None` for 0, `'NAME'`, or
+/// `BadAtom(0x…)` for an atom without a name.
+pub(crate) fn atom_display(a: u32, name: Option<&str>) -> String {
+    if a == 0 {
+        return "None".to_owned();
+    }
+    name.map_or_else(|| format!("BadAtom(0x{a:x})"), |n| format!("'{n}'"))
 }
 
 fn u16c(b: &[u8], o: usize) -> u16 {
@@ -216,14 +220,46 @@ pub(crate) fn map_lines(r: &[u8]) -> (Vec<String>, [u8; 16], Vec<(u8, String)>) 
 pub(crate) fn full_lines(desc: &XkbDesc) -> Vec<String> {
     let mut atoms = Atoms::default();
     let map = reply::encode_map(desc, reply::MapRequest::full(desc));
-    let ctl = reply::reply_get_controls(desc);
-    let (types, vmods, keys) = map_lines(&map);
+    let mut ctl = reply::reply_get_controls(desc);
+    ctl[60..92].copy_from_slice(&desc.per_key_repeat);
+    let compat = reply::encode_compat_map(desc, 0x0f, 0, desc.compat.len());
+    let indicators = reply::encode_indicator_map(desc, u32::MAX);
+    let names = reply::encode_names(desc, 0x3fff, &mut |n| atoms.intern(n));
+    let (kpm, data) = desc.modifier_mapping();
+    state_lines(
+        &map,
+        &ctl,
+        &compat,
+        &indicators,
+        &names,
+        &|a| atoms.name(a),
+        kpm,
+        &data,
+    )
+}
+
+/// The whole state from its replies (GetMap full, GetControls,
+/// GetCompatMap all, GetIndicatorMap all, GetNames all, core
+/// GetModifierMapping's width and keycodes), in the pristine golden's
+/// grammar; `atom_name` prints an atom as the probe does.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn state_lines(
+    map: &[u8],
+    ctl: &[u8],
+    compat: &[u8],
+    indicators: &[u8],
+    names: &[u8],
+    atom_name: &dyn Fn(u32) -> String,
+    kpm: u8,
+    modmap: &[u8],
+) -> Vec<String> {
+    let (types, vmods, keys) = map_lines(map);
     let mut out = vec![format!(
         "keys {}..{} ntypes {} enabledControls 0x{:08x}",
         map[10],
         map[11],
         types.len(),
-        u32c(&ctl, 56)
+        u32c(ctl, 56)
     )];
     for (i, t) in types.iter().enumerate() {
         out.push(format!("type {i} {t}"));
@@ -238,7 +274,7 @@ pub(crate) fn full_lines(desc: &XkbDesc) -> Vec<String> {
     ));
     out.push(format!(
         "repeat {}",
-        desc.per_key_repeat
+        ctl[60..92]
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect::<String>()
@@ -250,24 +286,14 @@ pub(crate) fn full_lines(desc: &XkbDesc) -> Vec<String> {
         "controls - numGroups={} groupsWrap=0x{:02x}",
         ctl[9], ctl[10]
     ));
-    out.extend(compat_lines(&reply::encode_compat_map(
-        desc,
-        0x0f,
-        0,
-        desc.compat.len(),
-    )));
-    out.extend(indicator_lines(&reply::encode_indicator_map(
-        desc,
-        u32::MAX,
-    )));
-    let names = reply::encode_names(desc, 0x3fff, &mut |n| atoms.intern(n));
-    out.extend(names_lines(&names, &atoms));
+    out.extend(compat_lines(compat));
+    out.extend(indicator_lines(indicators));
+    out.extend(names_lines_with(names, atom_name));
     out.push("geometry - (not modelled)".to_owned());
-    let (kpm, data) = desc.modifier_mapping();
     let rows: Vec<String> = (0..8)
         .map(|m| {
             let row: Vec<String> = (0..usize::from(kpm))
-                .map(|i| data[m * usize::from(kpm) + i].to_string())
+                .map(|i| modmap[m * usize::from(kpm) + i].to_string())
                 .collect();
             format!("{m}:{}", row.join(","))
         })
@@ -359,6 +385,11 @@ pub(crate) fn indicator_lines(b: &[u8]) -> Vec<String> {
 /// gates them with shifted bits, which only works because it always asks
 /// for all of them.)
 pub(crate) fn names_lines(b: &[u8], atoms: &Atoms) -> Vec<String> {
+    names_lines_with(b, &|a| atoms.name(a))
+}
+
+/// [`names_lines`] with the atoms printed by `atom_name`.
+pub(crate) fn names_lines_with(b: &[u8], atom_name: &dyn Fn(u32) -> String) -> Vec<String> {
     let nw = u32c(b, 8);
     let n_types = usize::from(b[14]);
     let group_names = b[15];
@@ -383,13 +414,13 @@ pub(crate) fn names_lines(b: &[u8], atoms: &Atoms) -> Vec<String> {
     ];
     for (i, c) in comp.iter().enumerate() {
         if nw & (1 << i) != 0 {
-            out.push(format!("name {c} {}", atoms.name(u32c(b, p))));
+            out.push(format!("name {c} {}", atom_name(u32c(b, p))));
             p += 4;
         }
     }
     if nw & 0x40 != 0 {
         for t in 0..n_types {
-            out.push(format!("typename {t} {}", atoms.name(u32c(b, p))));
+            out.push(format!("typename {t} {}", atom_name(u32c(b, p))));
             p += 4;
         }
     }
@@ -397,7 +428,7 @@ pub(crate) fn names_lines(b: &[u8], atoms: &Atoms) -> Vec<String> {
         let nl: Vec<usize> = b[p..p + n_types].iter().map(|&n| usize::from(n)).collect();
         p += pad4(n_types);
         for (t, &n) in nl.iter().enumerate() {
-            let names: Vec<String> = (0..n).map(|l| atoms.name(u32c(b, p + 4 * l))).collect();
+            let names: Vec<String> = (0..n).map(|l| atom_name(u32c(b, p + 4 * l))).collect();
             p += 4 * n;
             out.push(format!("levelnames {t} n={n} [{}]", names.join(" ")));
         }
@@ -405,7 +436,7 @@ pub(crate) fn names_lines(b: &[u8], atoms: &Atoms) -> Vec<String> {
     if nw & 0x100 != 0 {
         for i in 0..32 {
             if inds & (1 << i) != 0 {
-                out.push(format!("indname {i} {}", atoms.name(u32c(b, p))));
+                out.push(format!("indname {i} {}", atom_name(u32c(b, p))));
                 p += 4;
             }
         }
@@ -413,7 +444,7 @@ pub(crate) fn names_lines(b: &[u8], atoms: &Atoms) -> Vec<String> {
     if nw & 0x800 != 0 {
         for i in 0..16 {
             if vmods & (1 << i) != 0 {
-                out.push(format!("vmodname {i} {}", atoms.name(u32c(b, p))));
+                out.push(format!("vmodname {i} {}", atom_name(u32c(b, p))));
                 p += 4;
             }
         }
@@ -421,7 +452,7 @@ pub(crate) fn names_lines(b: &[u8], atoms: &Atoms) -> Vec<String> {
     if nw & 0x1000 != 0 {
         for i in 0..4 {
             if group_names & (1 << i) != 0 {
-                out.push(format!("groupname {} {}", i + 1, atoms.name(u32c(b, p))));
+                out.push(format!("groupname {} {}", i + 1, atom_name(u32c(b, p))));
                 p += 4;
             }
         }
@@ -452,7 +483,7 @@ pub(crate) fn names_lines(b: &[u8], atoms: &Atoms) -> Vec<String> {
     }
     if nw & 0x2000 != 0 {
         for r in 0..n_rg {
-            out.push(format!("rgname {r} {}", atoms.name(u32c(b, p))));
+            out.push(format!("rgname {r} {}", atom_name(u32c(b, p))));
             p += 4;
         }
     }

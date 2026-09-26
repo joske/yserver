@@ -6,19 +6,19 @@ use crate::kms::xkb::golden_keymap;
 
 /// The four frozen fixtures, as `golden_keymap` keys them, with their
 /// `xorg-xkb-pristine.txt` case names.
-pub(super) const FIXTURES: [(&str, Option<&str>, &str); 4] = [
+pub(crate) const FIXTURES: [(&str, Option<&str>, &str); 4] = [
     ("us", None, "us"),
     ("gb", None, "gb"),
     ("de", None, "de"),
     ("us,ru", Some("grp:alt_shift_toggle"), "us,ru"),
 ];
 
-pub(super) fn seeded(layout: &str, options: Option<&str>) -> XkbDesc {
+pub(crate) fn seeded(layout: &str, options: Option<&str>) -> XkbDesc {
     XkbDesc::from_keymap(&golden_keymap(layout, options)).expect("seed")
 }
 
 /// Xorg's whole-description lines for one pristine case (`= ` stripped).
-pub(super) fn pristine_lines(case: &str) -> Vec<String> {
+pub(crate) fn pristine_lines(case: &str) -> Vec<String> {
     let text = include_str!("../testdata/xorg-xkb-pristine.txt");
     let header = format!("## pristine layout={case} ");
     let mut lines = Vec::new();
@@ -68,7 +68,7 @@ pub(super) fn pristine_lines(case: &str) -> Vec<String> {
 ///   same type (us,ru `<KPDL>`: KEYPAD, explicit in group 2 only):
 ///   xkbcommon's dump writes one `type=` for all groups, so the seed marks
 ///   every group explicit.
-fn tolerated(xorg: &str, ours: &str) -> bool {
+pub(crate) fn tolerated(xorg: &str, ours: &str) -> bool {
     let key = |l: &str| l.split(' ').take(2).collect::<Vec<_>>().join(" ");
     if key(xorg) != key(ours) {
         return xorg.starts_with("alias ") && ours.starts_with("alias ");
@@ -236,12 +236,12 @@ fn seeded_cooking_keymap_cooks_as_the_model() {
 
 /// One captured whole state (Xorg's lines keyed as the probe keys them):
 /// the pristine gb description with a case's deltas applied.
-struct CapturedState {
-    lines: std::collections::BTreeMap<String, String>,
+pub(crate) struct CapturedState {
+    pub(crate) lines: std::collections::BTreeMap<String, String>,
 }
 
 impl CapturedState {
-    fn key(line: &str) -> String {
+    pub(crate) fn key(line: &str) -> String {
         let mut words = line.split(' ');
         let first = words.next().unwrap_or("");
         match first {
@@ -250,7 +250,7 @@ impl CapturedState {
         }
     }
 
-    fn new(pristine: &[String]) -> Self {
+    pub(crate) fn new(pristine: &[String]) -> Self {
         Self {
             lines: pristine
                 .iter()
@@ -261,8 +261,17 @@ impl CapturedState {
     }
 
     /// Apply one delta line of `xorg-xkbcomp-steps.txt` (the probe's `-` /
-    /// `+` lines, `repeat KC A->B`); the rest (events, results) is ignored.
-    fn apply(&mut self, line: &str) {
+    /// `+` lines, `repeat KC A->B`, `ntypes A->B`); the rest (events,
+    /// results) is ignored.
+    pub(crate) fn apply(&mut self, line: &str) {
+        if let Some(change) = line.strip_prefix("ntypes ") {
+            let (_, to) = change.split_once("->").expect("ntypes line");
+            let keys = self.lines.get("keys").expect("keys row").clone();
+            let mut words: Vec<String> = keys.split(' ').map(str::to_owned).collect();
+            words[3] = to.to_owned();
+            self.lines.insert("keys".into(), words.join(" "));
+            return;
+        }
         if let Some(rest) = line.strip_prefix("+ ") {
             let kc = rest.split(' ').next().unwrap_or("");
             self.lines
@@ -295,7 +304,7 @@ impl CapturedState {
     /// cooks except the resolved masks of the types, their entries and
     /// preserves, which are computed as Xorg's `SetKeyTypes` does
     /// (`real | XkbVirtualModsToReal(vmods)`).
-    fn desc(&self) -> XkbDesc {
+    pub(crate) fn desc(&self) -> XkbDesc {
         let mut d = XkbDesc::empty();
         let hex8 = |v: &str| u8::from_str_radix(v, 16).unwrap();
         let hex16 = |v: &str| u16::from_str_radix(v, 16).unwrap();

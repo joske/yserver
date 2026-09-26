@@ -8,6 +8,10 @@
 #   crates/yserver/src/kms/testdata/xorg-xkb-pristine.txt
 #   crates/yserver/src/kms/testdata/xorg-xkbcomp-steps.txt
 #   crates/yserver/src/kms/testdata/xkbcomp-requests/CASE/{N-Request.bin,atoms.txt}
+#   crates/yserver/src/kms/testdata/xorg-xkb-setmap-errors.txt
+#   crates/yserver/src/kms/testdata/xkb-setmap-errors/NAME.bin
+#   crates/yserver/src/kms/testdata/xorg-xkb-setmap-resize.txt
+#   crates/yserver/src/kms/testdata/xkb-setmap-resize/NAME.bin
 #
 # Every value in those files is Xvfb output recorded by tools/xkb-mutation-probe.c
 # (or x11trace). Never hand-edit them; rerun this script.
@@ -17,7 +21,7 @@
 # (x11trace's fake display); both must be free. Only the Xvfb this script
 # starts is ever killed (by pid).
 #
-# usage: tools/xkb-mutation-goldens.sh [ckm|smm|xkbcomp|repeat|pristine|steps ...]   (default: all)
+# usage: tools/xkb-mutation-goldens.sh [ckm|smm|xkbcomp|repeat|pristine|steps|errors|resize ...]   (default: all)
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -557,8 +561,232 @@ gen_steps() {
     } >"$out"
 }
 
+# ---------------------------------------------------------------------------
+# SetMap error vectors (phase 4c): requests built from the recorded identity
+# SetMap (gen_steps' xkbcomp-requests/identity/1-SetMap.bin), each aimed at one
+# of ProcXkbSetMap / _XkbSetMapCheckLength / _XkbSetMapChecks' rejections, plus
+# XKB requests from a client that never called XkbUseExtension (BadAccess).
+# One probe run per request, so every request comes from fresh connections
+# (Xorg leaves a stale client->errorValue for BadLength/BadAccess; a fresh
+# client's is 0).
+setmap_error_requests() { # SRC DIR -> DIR/NAME.bin + DIR/cases.txt (STEP\tNAME\tDESCRIPTION)
+    python3 - "$@" <<'EOF'
+import os, struct, sys
+src, out = sys.argv[1], sys.argv[2]
+b = open(src, 'rb').read()
+def u16(o): return b[o] | b[o+1] << 8
+H = {'dev': u16(4), 'present': u16(6), 'flags': u16(8), 'min': b[10], 'max': b[11],
+     'ft': b[12], 'nt': b[13], 'fs': b[14], 'ns': b[15], 'fa': b[18], 'na': b[19],
+     'fb': b[22], 'nb': b[23], 'fe': b[25], 'ne': b[26], 'fm': b[28], 'nm': b[29],
+     'fv': b[31], 'nv': b[32], 'vmods': u16(34)}
+p = 36
+types = []
+for i in range(b[13]):
+    ne, pre = b[p+5], b[p+6]
+    n = 8 + 4 * ne + (4 * ne if pre else 0)
+    types.append(bytearray(b[p:p+n])); p += n
+syms = []
+for i in range(b[15]):
+    n = 8 + 4 * u16(p+6)
+    syms.append(bytearray(b[p:p+n])); p += n
+counts = list(b[p:p+b[19]]); p += (b[19] + 3) & ~3
+acts = []
+for c in counts:
+    acts.append(bytes(b[p:p+8*c])); p += 8 * c
+behs = [bytearray(b[p+4*i:p+4*i+4]) for i in range(b[24])]; p += 4 * b[24]
+nv = bin(H['vmods']).count('1'); vmods = bytearray(b[p:p+nv]); p += (nv + 3) & ~3
+expl = [bytearray(b[p+2*i:p+2*i+2]) for i in range(b[27])]; p += (2 * b[27] + 3) & ~3
+mm = [bytearray(b[p+2*i:p+2*i+2]) for i in range(b[30])]; p += (2 * b[30] + 3) & ~3
+vmm = [bytearray(b[p+4*i:p+4*i+4]) for i in range(b[33])]; p += 4 * b[33]
+assert p == len(b), (p, len(b))
+def pad(x): return x + bytes((-len(x)) % 4)
+def build(h, types=None, syms=None, counts=None, acts=None, behs=None, vmods=None,
+          expl=None, mm=None, vmm=None, extra=b'', length=None, raw_counts=None):
+    """Only the parts given are sent; the header counts follow them unless given in h."""
+    present = h.get('present', 0)
+    body = b''
+    tot = {}
+    if types is not None:
+        body += b''.join(types)
+    if syms is not None:
+        body += b''.join(syms)
+        tot['syms'] = sum((len(s) - 8) // 4 for s in syms)
+    if counts is not None:
+        body += pad(bytes(counts)) + b''.join(acts)
+        tot['acts'] = sum(counts)
+    if behs is not None:
+        body += b''.join(behs)
+    if vmods is not None:
+        body += pad(bytes(vmods))
+    if expl is not None:
+        body += pad(b''.join(expl))
+    if mm is not None:
+        body += pad(b''.join(mm))
+    if vmm is not None:
+        body += b''.join(vmm)
+    body += extra
+    g = lambda k, d: h.get(k, d)
+    hdr = struct.pack('<HHHBBBBBBHBBHBBBBBBBBBBBBH',
+        g('dev', 0x100), present, g('flags', 0), g('min', 8), g('max', 255),
+        g('ft', 0), g('nt', len(types) if types is not None else 0),
+        g('fs', 0), g('ns', len(syms) if syms is not None else 0), g('ts', tot.get('syms', 0)),
+        g('fa', 0), g('na', len(counts) if counts is not None else 0), g('ta', tot.get('acts', 0)),
+        g('fb', 0), g('nb', 0), g('tb', len(behs) if behs is not None else 0),
+        g('fe', 0), g('ne', 0), g('te', len(expl) if expl is not None else 0),
+        g('fm', 0), g('nm', 0), g('tm', len(mm) if mm is not None else 0),
+        g('fv', 0), g('nv', 0), g('tv', len(vmm) if vmm is not None else 0),
+        g('vmods', 0))
+    assert len(hdr) == 32
+    req = hdr + body
+    n = (len(req) + 4) // 4 if length is None else length
+    return bytes([b[0], 9, n & 0xff, n >> 8]) + req
+cases = []
+def case(name, what, data, step='xreq'):
+    cases.append((name, what, step))
+    open(os.path.join(out, name + '.bin'), 'wb').write(data)
+os.makedirs(out, exist_ok=True)
+# sanity: the builder rebuilds the recorded request byte for byte
+full = dict(H, ts=u16(16), ta=u16(20), tb=b[24], te=b[27], tm=b[30], tv=b[33])
+assert build(full, types, syms, counts, acts, behs, vmods, expl, mm, vmm) == b, 'rebuild'
+T = lambda h: dict(h, present=0x01)
+case('access', 'the recorded identity SetMap, from a client that never called XkbUseExtension', b, 'xreq0')
+case('short', 'a 32-byte SetMap (xkbSetMapReq is 36)', bytes([b[0], 9, 8, 0]) + b[4:32])
+case('length', 'the identity SetMap with 4 bytes too many (length + 1)', build(full, types, syms, counts, acts, behs, vmods, expl, mm, vmm, extra=bytes(4)))
+case('present', 'present = 0x1ff (0x100 is no map component)', build(dict(full, present=0x1ff), types, syms, counts, acts, behs, vmods, expl, mm, vmm))
+case('minkeycode', 'minKeyCode = 7', build(dict(full, min=7), types, syms, counts, acts, behs, vmods, expl, mm, vmm))
+case('minmax', 'minKeyCode 9 > maxKeyCode 8', build(dict(full, min=9, max=8), types, syms, counts, acts, behs, vmods, expl, mm, vmm))
+case('firsttype', 'types only, ResizeTypes, firstType 28 > num_types 27', build(dict(T({}), flags=1, ft=28), types=[types[4]]))
+case('requiredtypes', 'types only, ResizeTypes, types 0+3 (< the 4 required)', build(dict(T({}), flags=1, ft=0), types=types[:3]))
+case('typesnoresize', 'types only, no ResizeTypes, types 26+2 past num_types 27', build(dict(T({}), flags=0, ft=26), types=types[26:27] + types[4:5]))
+t0 = bytearray(types[0]); t0[4] = 2
+case('onelevelwidth', 'type 0 (ONE_LEVEL) with 2 levels', build(dict(T({}), ft=0), types=[t0]))
+t4 = bytearray(types[4]); t4[4] = 0
+case('zerolevels', 'type 4 with 0 levels', build(dict(T({}), ft=4), types=[t4]))
+t1 = bytearray(types[1]); assert t1[5] >= 1; t1[8 + 1] = 0x05
+case('entrymods', 'type 1 entry 0 realMods 0x05 outside the type mods', build(dict(T({}), ft=1), types=[t1]))
+t1 = bytearray(types[1]); t1[8] = 2
+case('entrylevel', 'type 1 entry 0 level 2 >= numLevels 2', build(dict(T({}), ft=1), types=[t1]))
+pi = next(i for i, t in enumerate(types) if t[6] and t[5] > 0)
+tp = bytearray(types[pi]); ne = tp[5]; tp[8 + 4 * ne + 1] = 0x80
+case('preserve', 'type %d preserve 0 realMods 0x80 outside its entry' % pi, build(dict(T({}), ft=pi), types=[tp]))
+case('existingkt', 'types only, ResizeTypes, types 0+4: existing keys use type >= 4', build(dict(T({}), flags=1, ft=0), types=types[:4]))
+S = lambda kc: syms[kc - 8]
+s = bytearray(S(38)); s[0] = 40
+case('ktindex', 'syms only, key 38 ktIndex[0] 40 >= num_types', build(dict(present=0x02, fs=38), syms=[s]))
+s = bytearray(S(38)); s[5] += 1
+case('width', 'syms only, key 38 width one more than its type', build(dict(present=0x02, fs=38), syms=[s]))
+s = bytearray(S(38)); n = s[6] | s[7] << 8; s[6] += 1; s += bytes(4)
+case('nsyms', 'syms only, key 38 one keysym more than width x groups', build(dict(present=0x02, fs=38), syms=[s]))
+s = bytearray(S(38)); s[4] = (s[4] & 0xf0) | 5
+case('groups', 'syms only, key 38 with 5 groups', build(dict(present=0x02, fs=38), syms=[s]))
+case('symrange', 'syms only, keys 250+10 past maxKeyCode', build(dict(present=0x02, fs=250), syms=[S(250)] * 10))
+ns38 = S(38)[6] | S(38)[7] << 8
+case('actcount', 'actions only, key 38 with %d actions (it has %d keysyms)' % (ns38 - 1, ns38), build(dict(present=0x10, fa=38), counts=[ns38 - 1], acts=[bytes(8 * (ns38 - 1))]))
+case('behaviorkey', 'behaviors only, keys 38+1, a behavior for key 39', build(dict(present=0x20, fb=38, nb=1), behs=[bytes([39, 1, 0, 0])]))
+case('radiogroup', 'behaviors only, key 38 radio group 33 (> XkbMaxRadioGroups)', build(dict(present=0x20, fb=38, nb=1), behs=[bytes([38, 2, 33, 0])]))
+case('permanent', 'behaviors only, key 38 KB_Permanent|KB_Lock (not its current behavior)', build(dict(present=0x20, fb=38, nb=1), behs=[bytes([38, 0x81, 0, 0])]))
+case('explicitkey', 'explicit only, keys 38+1, an entry for key 39', build(dict(present=0x08, fe=38, ne=1), expl=[bytes([39, 1])]))
+case('explicitmin', 'explicit only, keys 7+1', build(dict(present=0x08, fe=7, ne=1), expl=[bytes([7, 1])]))
+case('explicitrange', 'explicit only, keys 250+10 past maxKeyCode', build(dict(present=0x08, fe=250, ne=10), expl=[bytes([250, 1])]))
+case('modmapkey', 'modmap only, keys 38+1, an entry for key 39', build(dict(present=0x04, fm=38, nm=1), mm=[bytes([39, 1])]))
+case('vmodmapkey', 'vmodmap only, keys 38+1, an entry for key 39', build(dict(present=0x80, fv=38, nv=1), vmm=[bytes([39, 0, 1, 0])]))
+gm = bytes([b[0], 8, 7, 0]) + struct.pack('<HHHBBBBBBBBHBBBBBBxx', 0x100, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+assert len(gm) == 28
+case('access-getmap', 'GetMap(full=all) from a client that never called XkbUseExtension', gm, 'xreq0')
+se = bytes([b[0], 1, 4, 0]) + struct.pack('<HHHHHH', 0x100, 0x0fff, 0, 0x0fff, 0xff, 0xff)
+case('access-selectevents', 'SelectEvents(all) from a client that never called XkbUseExtension', se, 'xreq0')
+with open(os.path.join(out, 'cases.txt'), 'w') as f:
+    for name, what, step in cases:
+        f.write('%s\t%s\t%s\n' % (step, name, what))
+EOF
+}
+
+gen_errors() {
+    local out=$TD/xorg-xkb-setmap-errors.txt dir=$TD/xkb-setmap-errors
+    rm -rf "$dir"
+    setmap_error_requests "$TD/xkbcomp-requests/identity/1-SetMap.bin" "$dir"
+    {
+        echo "# Xorg's errors for malformed XKB SetMap requests and for XKB requests without"
+        echo "# XkbUseExtension (issue #171 phase 4c): Xvfb -noreset, layout=gb"
+        versions
+        echo "# setxkbmap -rules evdev -model pc105 -layout gb; then one tools/xkb-mutation-probe.c run per"
+        echo "# request (fresh connections each time), sending xkb-setmap-errors/NAME.bin raw:"
+        echo "#   xreq:  on the actor after its XkbUseExtension; xreq0: on a connection without it."
+        echo "# Each request is built by this script from xkbcomp-requests/identity/1-SetMap.bin (the"
+        echo "# '## NAME' line says how). Lines: '= error=CODE value=V major=M minor=N' (major is"
+        echo "# this server's XKB opcode), then the (empty) XkbGetMap delta and coremodmap as usual."
+        fresh gb
+        while IFS=$'\t' read -r step name what; do
+            echo "## $name: $what"
+            "$PROBE" -d ":$DISP" "$step:$dir/$name.bin" | sed "s|$TD/||g"
+        done <"$dir/cases.txt"
+        stop_x
+    } >"$out"
+    rm "$dir/cases.txt"
+}
+
+# ---------------------------------------------------------------------------
+# SetMap's key-width resizing (phase 4c): XkbResizeKeyType when a SetMap
+# changes the level count of a type keys use and doesn't resend those keys.
+# Types-only requests (present=KeyTypes, no ResizeTypes/RecomputeActions)
+# giving FOUR_LEVEL (index 11 after setxkbmap us,ru) five or three levels,
+# its other fields as the server has them (xorg-xkb-pristine.txt): the
+# us,ru keys with a FOUR_LEVEL group are two groups wide, so a grow shows
+# Xorg's group relayout and a shrink its clearing.
+setmap_resize_requests() { # DIR -> DIR/NAME.bin + DIR/cases.txt (NAME\tDESCRIPTION)
+    python3 - "$@" <<'EOF'
+import os, struct, sys
+out = sys.argv[1]
+os.makedirs(out, exist_ok=True)
+def set_map_types(first, types):
+    body = b''
+    for real, vmods, levels, entries in types:
+        body += struct.pack('<BBHBBBB', 0, real, vmods, levels, len(entries), 0, 0)
+        for level, ereal, evmods in entries:
+            body += struct.pack('<BBH', level, ereal, evmods)
+    hdr = struct.pack('<HHHBBBBBBHBBHBBBBBBBBBBBBH', 0x100, 0x01, 0, 8, 255, first, len(types),
+                      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    req = hdr + body
+    n = (len(req) + 4) // 4
+    return bytes([0, 9, n & 0xff, n >> 8]) + req
+cases = [
+    ('grow-four-level', 'FOUR_LEVEL (type 11) with 5 levels, its entries unchanged',
+     set_map_types(11, [(0x01, 0x0004, 5, [(1, 0x01, 0), (2, 0, 0x0004), (3, 0x01, 0x0004)])])),
+    ('shrink-four-level', 'FOUR_LEVEL (type 11) with 3 levels, its level-4 entry dropped',
+     set_map_types(11, [(0x01, 0x0004, 3, [(1, 0x01, 0), (2, 0, 0x0004)])])),
+]
+with open(os.path.join(out, 'cases.txt'), 'w') as f:
+    for name, what, data in cases:
+        open(os.path.join(out, name + '.bin'), 'wb').write(data)
+        f.write('%s\t%s\n' % (name, what))
+EOF
+}
+
+gen_resize() {
+    local out=$TD/xorg-xkb-setmap-resize.txt dir=$TD/xkb-setmap-resize
+    rm -rf "$dir"
+    setmap_resize_requests "$dir"
+    {
+        echo "# Xorg's key-width resizing in XKB SetMap (XkbResizeKeyType, issue #171 phase 4c):"
+        echo "# Xvfb -noreset, fresh server per case, layout=us,ru option=grp:alt_shift_toggle"
+        versions
+        echo "# each case: setxkbmap -rules evdev -model pc105 -layout us,ru -option grp:alt_shift_toggle;"
+        echo "# then tools/xkb-mutation-probe.c -x xreq:xkb-setmap-resize/NAME.bin (the actor, after its"
+        echo "# XkbUseExtension). The request is built by this script (the '## case' line says what it"
+        echo "# changes); output grammar as in xorg-xkbcomp-steps.txt, the state before is"
+        echo "# xorg-xkb-pristine.txt's layout=us,ru case."
+        while IFS=$'\t' read -r name what; do
+            fresh us,ru grp:alt_shift_toggle
+            echo "## case $name: $what"
+            "$PROBE" -d ":$DISP" -x "xreq:$dir/$name.bin" | sed "s|$TD/||g"
+            stop_x
+        done <"$dir/cases.txt"
+    } >"$out"
+    rm "$dir/cases.txt"
+}
+
 targets=("$@")
-[ ${#targets[@]} -eq 0 ] && targets=(ckm smm xkbcomp repeat pristine steps)
+[ ${#targets[@]} -eq 0 ] && targets=(ckm smm xkbcomp repeat pristine steps errors resize)
 for t in "${targets[@]}"; do
     "gen_$t"
 done

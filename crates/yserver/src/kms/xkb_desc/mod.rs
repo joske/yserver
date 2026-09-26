@@ -20,6 +20,7 @@ pub(crate) mod gate;
 pub(crate) mod probe;
 pub(crate) mod reply;
 pub(crate) mod seed;
+pub(crate) mod set_map;
 pub(crate) mod text;
 pub(crate) mod writer;
 

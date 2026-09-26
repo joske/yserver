@@ -471,6 +471,31 @@ pub struct XkbNewKeyboardInfo {
     pub changed: u16,
 }
 
+/// One notification step of an XKB Set* request, in Xorg's order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum XkbSetEvent {
+    /// `XkbSendNewKeyboardNotify` (with its legacy core MappingNotify); the
+    /// request's opcodes are the cause.
+    NewKeyboard(XkbNewKeyboardInfo),
+    /// `XkbSendNotification`: MapNotify (when `map_notify.changed` isn't 0)
+    /// with its legacy core MappingNotify, the per-key repeat ControlsNotify
+    /// and the IndicatorMapNotify.
+    Notification(KeyboardMappingChange),
+    /// Per-key repeat bits re-derived with no notification (the end of
+    /// `XkbUpdateActions`, when the request sent a NewKeyboardNotify
+    /// instead): copied to the core keyboard feedback.
+    Repeats(Vec<(u8, bool)>),
+}
+
+/// What an XKB Set* request did (a port of Xorg's handler in the backend).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct XkbSetOutcome {
+    /// The request's error, `(code, errorValue)`. A request that fails its
+    /// checks changes nothing and sends nothing.
+    pub error: Option<(u8, u32)>,
+    pub events: Vec<XkbSetEvent>,
+}
+
 /// What an XKB backend's `ChangeKeyboardMapping` or `SetModifierMapping` did
 /// to its keymap, for the notifications the core loop sends (Xorg
 /// `XkbApplyMappingChange` → `XkbSendNotification`).
@@ -2602,6 +2627,20 @@ pub trait Backend {
         body: &[u8],
         intern_atom: &mut dyn FnMut(&str) -> u32,
     ) -> io::Result<Option<Vec<u8>>>;
+
+    /// An XKB Set* request (`minor`, `body` after the 4-byte header) on the
+    /// backend's keyboard description, as Xorg's handler does it;
+    /// `client_is_ancient` = the client asked XkbUseExtension for 0.65.
+    /// `None` when this backend doesn't implement `minor`: the request is
+    /// accepted and does nothing.
+    fn xkb_set(
+        &mut self,
+        _minor: u8,
+        _body: &[u8],
+        _client_is_ancient: bool,
+    ) -> Option<XkbSetOutcome> {
+        None
+    }
 
     /// Load a multi-group keymap from an XKB `symbols` component string
     /// (e.g. "pc+us+de:2+us:3+inet(evdev)"). Default: backends without a real

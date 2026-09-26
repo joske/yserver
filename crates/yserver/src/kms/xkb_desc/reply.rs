@@ -26,6 +26,7 @@ const NO_INDICATOR: u8 = 0xff;
 /// X11 error codes.
 pub(crate) const BAD_VALUE: u8 = 2;
 pub(crate) const BAD_MATCH: u8 = 8;
+pub(crate) const BAD_LENGTH: u8 = 16;
 
 /// An X error a request draws (Xorg's return code and `errorValue`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,17 +36,17 @@ pub(crate) struct XkbError {
 }
 
 /// `_XkbErrCode2`.
-fn err_code2(a: u32, b: u32) -> u32 {
+pub(crate) fn err_code2(a: u32, b: u32) -> u32 {
     (a << 24) | (b & 0x00ff_ffff)
 }
 
 /// `_XkbErrCode3`.
-fn err_code3(a: u32, b: u32, c: u32) -> u32 {
+pub(crate) fn err_code3(a: u32, b: u32, c: u32) -> u32 {
     err_code2(a, (b << 16) | c)
 }
 
 /// `_XkbErrCode4`.
-fn err_code4(a: u32, b: u32, c: u32, d: u32) -> u32 {
+pub(crate) fn err_code4(a: u32, b: u32, c: u32, d: u32) -> u32 {
     err_code3(a, b, (c << 8) | d)
 }
 
