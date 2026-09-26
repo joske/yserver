@@ -719,6 +719,29 @@ Every step ships on its own and keeps the phase 1–3 goldens green.
   *Accept*: steps 4–5 of all cases (so the whole upload matches per request);
   vng A/B + dump round trip; HW gate.
 
+**Review outcome (codex, 2026-09-26).**
+- 4a and 4b ship together, as one decision gate: the model must keep every
+  phase 1–3 `xmodmap` behaviour and generate a cooking keymap equivalent to the
+  model. If that gate fails, stop there and keep phases 1–3; don't build
+  4c–4e on it.
+- Cooking gate, tighter than exact readbacks: after every one of the 45
+  captured mutations (and for the phase 2–3 CKM/SMM cases), check that the
+  compiled xkbcommon keymap cooks every key/level the way the model's action
+  says, for every supported action type (SetMods/LatchMods/LockMods,
+  SetGroup/LatchGroup/LockGroup, NoAction, plus the per-key repeat and
+  modmap). Press/release each key on a fresh `xkb_state` and compare the
+  resulting mods/group with what the action prescribes. The model equals Xorg
+  (goldens) and cooking equals the model, so cooking equals Xorg. Exact GetMap
+  replies alone can pass while key events differ.
+- Actions and behaviors xkbcommon can't cook (§4.6) stay explicit
+  limitations: stored and read back exactly, not cooked, and logged once
+  (warn) per upload that uses one, naming the key and action.
+- Open questions: all answered as recommended. (1) geometry name-only for
+  #171, which leaves GetGeometry and geometry-preserving dumps incomplete, a
+  known limit; (2) None; (3) BadAccess on every XKB request, as Xorg;
+  (4) listed seed tolerance acceptable; (5) one event on device 1;
+  (6) 4a+4b together.
+
 #### 4.12 Open questions for review
 
 1. **Geometry storage**: store SetGeometry's body and serve GetGeometry from it
