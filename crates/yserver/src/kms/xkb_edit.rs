@@ -1127,12 +1127,15 @@ mod tests {
         // serializer's format.
         let km = golden_keymap("us", None);
         let text = dump(&km);
-        let caps = "\tkey <CAPS> {\t[ 0xffe5 ] };\n";
-        assert!(text.contains(caps), "fixture shape");
-        let crafted = text.replace(
-            caps,
-            "\tkey <CAPS> {\n\t\trepeat= No,\n\t\tvmods= NumLock,\n\t\t\
-             symbols[1]= [ 0xffe5 ],\n\t\tactions[1]= [ LockMods(modifiers=Mod3) ]\n\t};\n",
+        // The entry's spelling depends on the libxkbcommon version (1.13
+        // writes `0xffe5`, 1.6 `Caps_Lock`), so replace the whole entry.
+        let start = text.find("\tkey <CAPS>").expect("fixture has <CAPS>");
+        let end = start + text[start..].find("};\n").expect("entry end") + 3;
+        let crafted = format!(
+            "{}\tkey <CAPS> {{\n\t\trepeat= No,\n\t\tvmods= NumLock,\n\t\t\
+             symbols[1]= [ 0xffe5 ],\n\t\tactions[1]= [ LockMods(modifiers=Mod3) ]\n\t}};\n{}",
+            &text[..start],
+            &text[end..],
         );
         let before = compile(&dump(&compile(&crafted)));
         let input = dump(&before);
