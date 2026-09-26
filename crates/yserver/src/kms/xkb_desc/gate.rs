@@ -143,15 +143,10 @@ pub(crate) fn check(desc: &XkbDesc, keymap: &Keymap) -> (Vec<String>, Excluded) 
                 continue;
             };
             let t = usize::from(desc.keys[k].kt_index[eg]);
-            let mut masks: Vec<u8> = vec![0];
-            if let Some(ty) = desc.types.get(t) {
-                for e in &ty.map {
-                    if e.active && !masks.contains(&e.mods.mask) {
-                        masks.push(e.mods.mask);
-                    }
-                }
-            }
-            for m in masks {
+            // Every real-modifier combination, not just the type's own map
+            // entries: a chord of several entries' modifiers must cook the
+            // way the model's type resolves it too.
+            for m in 0..=u8::MAX {
                 let (level, _) = desc.type_level(t, m);
                 let slot = eg * width + usize::from(level);
                 let sym = desc.keys[k].syms.get(slot).copied().unwrap_or(0);
