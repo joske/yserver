@@ -143,6 +143,11 @@ guest=$out/guest.sh
     for kv in ${extra_env+"${extra_env[@]}"}; do
         echo "export ${kv%%=*}='${kv#*=}'"
     done
+    # The guest shares the host's /tmp/.X11-unix. A guest killed mid-run
+    # leaves X7 and its lock behind, so the listen wait below would pass on
+    # a dead socket, and the next server trips over it. The guest runs as
+    # root, so it can clear what the host user can't.
+    echo 'rm -f /tmp/.X11-unix/X7 /tmp/.X7-lock'
     if [ "$server" = xorg ]; then
         # /usr/bin/Xorg is a shim onto the setuid Xorg.wrap, which drops root
         # when the caller is not sitting on a console — and then the real
@@ -174,6 +179,7 @@ guest=$out/guest.sh
     echo 'while [ ! -e GO ] && [ $i -lt 600 ]; do i=$((i+1)); sleep 0.5; done'
     echo 'kill -TERM $server 2>/dev/null || true'
     echo 'wait $server 2>/dev/null || true'
+    echo 'rm -f /tmp/.X11-unix/X7 /tmp/.X7-lock'
     echo 'touch DONE'
 } > "$guest"
 chmod +x "$guest"
