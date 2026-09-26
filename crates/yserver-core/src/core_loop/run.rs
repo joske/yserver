@@ -3062,14 +3062,6 @@ pub fn handle_host_input(state: &mut ServerState, backend: &mut dyn Backend, ev:
     backend.on_host_input(state, ev);
 }
 
-/// Whether a keycode currently auto-repeats per core
-/// ChangeKeyboardControl state: the global flag gates everything,
-/// then the per-key bitmap decides (Xorg `kbdfeed->ctrl.autoRepeat`
-/// + `autoRepeats[]`).
-fn key_auto_repeats(kc: &crate::server::KeyboardControlState, keycode: u8) -> bool {
-    kc.global_auto_repeat && kc.auto_repeats[usize::from(keycode >> 3)] & (1 << (keycode & 7)) != 0
-}
-
 /// Arm / refresh / clear `state.repeat_state` from an incoming host
 /// input event. X11 spec: only the most recently pressed key
 /// repeats — pressing a different key replaces the armed key;
@@ -3093,7 +3085,7 @@ fn update_repeat_state(state: &mut ServerState, ev: &HostInputEvent) {
         // all repeat; otherwise the per-key bitmap decides. A
         // non-repeating press still replaces (disarms) the armed key —
         // only the most recently pressed key may repeat.
-        if !key_auto_repeats(&state.keyboard_control, key.keycode) {
+        if !state.keyboard_control.key_auto_repeats(key.keycode) {
             state.repeat_state = None;
             return;
         }
@@ -3131,7 +3123,7 @@ fn fire_pending_repeats(state: &mut ServerState, backend: &mut dyn Backend) -> b
     };
     // Repeat may have been disabled (ChangeKeyboardControl) after the
     // key was armed — disarm instead of firing.
-    if !key_auto_repeats(&state.keyboard_control, armed.event.keycode) {
+    if !state.keyboard_control.key_auto_repeats(armed.event.keycode) {
         state.repeat_state = None;
         return false;
     }
@@ -3152,8 +3144,8 @@ fn fire_pending_repeats(state: &mut ServerState, backend: &mut dyn Backend) -> b
     release.pressed = false;
     let mut press = armed.event;
     press.pressed = true;
-    backend.on_host_input(state, HostInputEvent::Key(release));
-    backend.on_host_input(state, HostInputEvent::Key(press));
+    backend.on_host_input(state, HostInputEvent::KeyRepeat(release));
+    backend.on_host_input(state, HostInputEvent::KeyRepeat(press));
     true
 }
 
@@ -5051,6 +5043,66 @@ mod tests {
         assert!(
             fire_pending_repeats(&mut state, &mut backend),
             "a due repeat must report a fire",
+        );
+    }
+
+    /// A fired repeat reaches the backend as `KeyRepeat`, not device `Key`:
+    /// it models Xorg's XKB soft repeat, which bypasses GetKeyboardEvents
+    /// and so generates no XI2 raw key event (issue #173).
+    #[test]
+    fn fire_pending_repeats_sends_key_repeat_not_device_key() {
+        use std::time::{Duration, Instant};
+
+        use crate::{
+            backend::recording::{RecordedCall, RecordingBackend},
+            host_x11::HostKeyEvent,
+        };
+
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        handle_host_input(
+            &mut state,
+            &mut backend,
+            HostInputEvent::Key(HostKeyEvent {
+                pressed: true,
+                keycode: 38,
+                time: 0,
+                root_x: 0,
+                root_y: 0,
+                event_x: 0,
+                event_y: 0,
+                state: 0,
+            }),
+        );
+        if let Some(s) = state.repeat_state.as_mut() {
+            s.next_fire = Instant::now() - Duration::from_millis(1);
+        }
+        assert!(fire_pending_repeats(&mut state, &mut backend));
+
+        let keys: Vec<RecordedCall> = backend
+            .calls()
+            .into_iter()
+            .filter(|c| matches!(c, RecordedCall::HostKey { .. }))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                RecordedCall::HostKey {
+                    keycode: 38,
+                    pressed: true,
+                    repeat: false,
+                },
+                RecordedCall::HostKey {
+                    keycode: 38,
+                    pressed: false,
+                    repeat: true,
+                },
+                RecordedCall::HostKey {
+                    keycode: 38,
+                    pressed: true,
+                    repeat: true,
+                },
+            ]
         );
     }
 

@@ -28,6 +28,11 @@ const XI2_KEYPRESS_EVTYPE: u16 = 2;
 const XI2_KEYRELEASE_EVTYPE: u16 = 3;
 const XI2_MASTER_KEYBOARD_DEVICE_ID: u16 = 3;
 const XI2_SLAVE_KEYBOARD_DEVICE_ID: u16 = 5;
+const XI2_RAW_KEY_PRESS_EVTYPE: u16 = 13;
+const XI2_RAW_KEY_RELEASE_EVTYPE: u16 = 14;
+/// XISelectEvents wildcard deviceids.
+const XI2_ALL_DEVICES: u16 = 0;
+const XI2_ALL_MASTER_DEVICES: u16 = 1;
 
 /// Fan a host key event out to nested clients.
 ///
@@ -435,6 +440,201 @@ fn encode_key_xi2(
     );
 }
 
+/// One XI2 raw key event (`XI_RawKeyPress` / `XI_RawKeyRelease`): Xorg's
+/// `ET_RawKeyPress` / `ET_RawKeyRelease` internal event. Keys carry no
+/// valuators, so the keycode, direction and timestamp are all of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawKeyEvent {
+    pub keycode: u8,
+    pub pressed: bool,
+    /// Shared with the device event generated from the same input
+    /// (Xorg `GetKeyboardEvents` stamps both with one `ms`).
+    pub time: u32,
+}
+
+impl RawKeyEvent {
+    fn evtype(self) -> u16 {
+        if self.pressed {
+            XI2_RAW_KEY_PRESS_EVTYPE
+        } else {
+            XI2_RAW_KEY_RELEASE_EVTYPE
+        }
+    }
+}
+
+/// Generate and deliver the XI2 raw key event for one piece of device key
+/// input (libinput or XTEST — never software auto-repeat, see
+/// `HostInputEvent::KeyRepeat`). Call it BEFORE the key's device-event
+/// processing, including the duplicate press/release guard: Xorg builds the
+/// raw event in `GetKeyboardEvents` (dix/getevents.c) and delivers it ahead
+/// of the device event, and `Xi/exevents.c` only drops a duplicate down or a
+/// stray up afterwards — so a release of a key that is not down still
+/// produces a raw release.
+///
+/// `key_was_down`: the key's down state before this event. `is_modifier`:
+/// the key is in the modifier map. A press of a key already down is Xorg's
+/// "core repeating" case: it produces no event at all — raw included — when
+/// auto-repeat is off globally or for the key, or the key is a modifier.
+///
+/// Delivery mirrors Xorg's two passes through `DeliverRawEvent`
+/// (dix/events.c), slave first then master (mi/mieq.c): the slave form
+/// (deviceid = sourceid = slave keyboard) goes to root selectors of the
+/// slave keyboard / `XIAllDevices`; the master form (deviceid = master
+/// keyboard) to root selectors of the master keyboard / `XIAllMasterDevices`
+/// / `XIAllDevices`, subject to the keyboard grab. The master form is queued
+/// behind a frozen keyboard like any other master event (Xorg
+/// `EnqueueEvent`) and delivered on thaw; the slave is never frozen.
+/// Keys arrive only on the master keyboard's attached slave, so an
+/// `XIAllDevices` selector receives both forms.
+pub fn raw_key_event_to_state(
+    state: &mut ServerState,
+    event: RawKeyEvent,
+    key_was_down: bool,
+    is_modifier: bool,
+) -> Vec<ClientId> {
+    if event.pressed
+        && key_was_down
+        && (is_modifier || !state.keyboard_control.key_auto_repeats(event.keycode))
+    {
+        return Vec::new();
+    }
+    // GetKeyboardEvents refuses keycodes below min_keycode.
+    if event.keycode < 8 {
+        return Vec::new();
+    }
+    let evtype = event.evtype();
+    let slave_targets = raw_key_root_selectors(
+        state,
+        &[XI2_SLAVE_KEYBOARD_DEVICE_ID, XI2_ALL_DEVICES],
+        evtype,
+    );
+    let mut dropped = send_raw_key(state, &slave_targets, event, XI2_SLAVE_KEYBOARD_DEVICE_ID);
+    if state
+        .xi1_frozen
+        .get(&crate::xinput::DEVICEID_SLAVE_KEYBOARD)
+        .is_some_and(crate::server::Xi1Freeze::frozen)
+    {
+        state
+            .sync_pending
+            .push_back(crate::server::PendingSyncEvent {
+                device: crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+                event: crate::server::QueuedInputEvent::RawKey(event),
+            });
+    } else {
+        merge_dropped(&mut dropped, deliver_raw_key_master(state, event));
+    }
+    dropped
+}
+
+/// The master-keyboard pass of Xorg `DeliverRawEvent`: first the keyboard
+/// grab (`DeliverGrabbedEvent`), then every root selector of the master
+/// keyboard, `XIAllMasterDevices` or `XIAllDevices`, filtered by
+/// `FilterRawEvents`. Also the replay entry for a raw event that was queued
+/// behind a frozen keyboard — the grab consulted is the one in effect when
+/// the event is finally processed, as on Xorg.
+pub(crate) fn deliver_raw_key_master(state: &mut ServerState, event: RawKeyEvent) -> Vec<ClientId> {
+    let evtype = event.evtype();
+    let bit = 1u32 << evtype;
+    let master_devices = [
+        XI2_MASTER_KEYBOARD_DEVICE_ID,
+        XI2_ALL_MASTER_DEVICES,
+        XI2_ALL_DEVICES,
+    ];
+    let grab = state.active_keyboard_grab;
+    let mut dropped = Vec::new();
+
+    // DeliverGrabbedEvent. A core grab gets nothing: EventToCore has no
+    // core form of a raw event. For an XI2 grab, owner_events first tries
+    // normal delivery (DeliverDeviceEvents) from the focus, or the sprite
+    // window under PointerRoot, up to the focus; raw events can only be
+    // selected on the root, so that reaches the owner only when the walk
+    // gets to the root (focus PointerRoot or the root itself) and the owner
+    // selected the event there. Failing that, the grab's own XI2 mask
+    // decides (DeliverOneGrabbedEvent).
+    if let Some(g) = grab
+        && g.via_xi2
+    {
+        // core_focus.raw: 1 = PointerRoot.
+        let focus_walk_reaches_root =
+            state.core_focus.raw == 1 || state.core_focus.raw == ROOT_WINDOW.0;
+        let natural = g.owner_events
+            && focus_walk_reaches_root
+            && state.clients.get(&g.owner.0).is_some_and(|c| {
+                xi2_mask_for_client(c, ROOT_WINDOW, ROOT_WINDOW, &master_devices) & bit != 0
+            });
+        if natural || g.xi2_mask & bit != 0 {
+            merge_dropped(
+                &mut dropped,
+                send_raw_key(state, &[g.owner], event, XI2_MASTER_KEYBOARD_DEVICE_ID),
+            );
+        }
+    }
+
+    // FilterRawEvents: with the device grabbed, an XI 2.0 client gets no
+    // raw event, and the grab owner is skipped when the grab window is the
+    // root — "we've already delivered", although a core grab or a grab
+    // mask without the raw type delivered nothing (Xorg does this too).
+    let targets: Vec<ClientId> = raw_key_root_selectors(state, &master_devices, evtype)
+        .into_iter()
+        .filter(|cid| {
+            let Some(g) = grab else {
+                return true;
+            };
+            if state.xi2_client_versions.get(cid) == Some(&(2, 0)) {
+                return false;
+            }
+            !(g.grab_window == ROOT_WINDOW && g.owner == *cid)
+        })
+        .collect();
+    merge_dropped(
+        &mut dropped,
+        send_raw_key(state, &targets, event, XI2_MASTER_KEYBOARD_DEVICE_ID),
+    );
+    dropped
+}
+
+/// Clients that selected `evtype` on the root window under any of
+/// `devices` (Xorg `GetClientsForDelivery` on the root).
+fn raw_key_root_selectors(state: &ServerState, devices: &[u16], evtype: u16) -> Vec<ClientId> {
+    state
+        .clients
+        .iter()
+        .filter(|(_, c)| {
+            xi2_mask_for_client(c, ROOT_WINDOW, ROOT_WINDOW, devices) & (1 << evtype) != 0
+        })
+        .map(|(id, _)| ClientId(*id))
+        .collect()
+}
+
+/// Write one raw key event with the given `deviceid` to each target. The
+/// source is always the slave keyboard, and keys carry no valuators — the
+/// valuator mask is two zero words (Xorg `eventToRawEvent`).
+fn send_raw_key(
+    state: &mut ServerState,
+    targets: &[ClientId],
+    event: RawKeyEvent,
+    deviceid: u16,
+) -> Vec<ClientId> {
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    fanout_event_to_clients(state, targets, |buf, seq, order| {
+        x11::encode_xi2_raw_event(
+            buf,
+            order,
+            seq,
+            XI2_MAJOR_OPCODE,
+            event.evtype(),
+            deviceid,
+            event.time,
+            u32::from(event.keycode),
+            XI2_SLAVE_KEYBOARD_DEVICE_ID,
+            0,
+            0,
+        );
+    })
+}
+
 fn merge_dropped(into: &mut Vec<ClientId>, more: Vec<ClientId>) {
     for cid in more {
         if !into.contains(&cid) {
@@ -537,20 +737,20 @@ fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
         focus
     };
     if event.pressed
-        && let Some((owner, grab_window, pointer_mode, keyboard_mode, owner_events, via_xi2)) =
-            state
-                .find_key_grab(grab_walk_start, event.keycode, event.state)
-                .map(|g| {
-                    (
-                        g.owner,
-                        g.grab_window,
-                        g.pointer_mode,
-                        g.keyboard_mode,
-                        g.owner_events,
-                        g.via_xi2,
-                    )
-                })
+        && let Some(grab) = state
+            .find_key_grab(grab_walk_start, event.keycode, event.state)
+            .cloned()
     {
+        let crate::server::KeyGrab {
+            owner,
+            grab_window,
+            pointer_mode,
+            keyboard_mode,
+            owner_events,
+            via_xi2,
+            xi2_mask,
+            ..
+        } = grab;
         state.active_keyboard_grab = Some(ActiveKeyboardGrab {
             owner,
             grab_window,
@@ -559,6 +759,7 @@ fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
             },
             owner_events,
             via_xi2,
+            xi2_mask,
         });
         // Xorg ActivateKeyboardGrab: DoFocusEvents(focus →
         // grab_window, NotifyGrab).
@@ -930,6 +1131,7 @@ mod tests {
             pointer_mode: 1,
             keyboard_mode: 0, // synchronous → freeze
             via_xi2: true,
+            xi2_mask: 0,
         });
 
         let dropped = key_event_fanout_to_state(&mut state, &mut backend, key_event(true, 33));
@@ -995,6 +1197,7 @@ mod tests {
             pointer_mode: 1,
             keyboard_mode: 1, // asynchronous → no freeze
             via_xi2: true,
+            xi2_mask: 0,
         });
         let _ = key_event_fanout_to_state(&mut state, &mut backend, key_event(true, 33));
         assert!(state.active_keyboard_grab.is_some());
@@ -1076,6 +1279,7 @@ mod tests {
             pointer_mode: 1,
             keyboard_mode: 1,
             via_xi2: false,
+            xi2_mask: 0,
         });
         // Press: activates passive grab.
         let _ = key_event_fanout_to_state(&mut state, &mut backend, key_event(true, 38));
@@ -1107,6 +1311,7 @@ mod tests {
             source: ActiveKeyboardGrabSource::Explicit,
             owner_events: false,
             via_xi2: false,
+            xi2_mask: 0,
         });
         let _ = key_event_fanout_to_state(&mut state, &mut backend, key_event(false, 38));
         // Explicit grab is NOT cleared by a key release (only passive
@@ -1324,5 +1529,450 @@ mod tests {
                 .copied(),
             Some(0)
         );
+    }
+
+    /// XI2 raw key events (issue #173). Expected bytes and delivery sets
+    /// are Xorg captures: Xvfb (xorg-server 21.1) driven by
+    /// `tools/vng-scenarios/xi2-raw-keys-probe.c` over XTEST, several
+    /// clients per run so every recipient's stream is visible, e.g.
+    ///   probe mon:m22:2:1 mon:a22:2:0 mon:m20:0:1 mon:a20:0:0 \
+    ///         grabkbd:async p38 r38 ungrabkbd
+    /// Xvfb device ids match yserver's for this path: 3 = master keyboard,
+    /// 5 = the slave the key came from (Xvfb's XTEST keyboard; yserver's
+    /// one slave keyboard).
+    mod raw_keys {
+        use super::*;
+        use crate::host_x11::HostXidMap;
+
+        const RAW_PRESS: u16 = 13;
+        const RAW_RELEASE: u16 = 14;
+        const RAW_KEY_MASK: u32 = (1 << 13) | (1 << 14);
+        const CHILD: ResourceId = ResourceId(0x0040_0001);
+
+        /// One XI_RawKeyPress/Release exactly as Xorg wrote it — a captured
+        /// wire image (sequence and time blanked in the capture, filled in
+        /// here; Xvfb's XI opcode 0x83 replaced by yserver's 137):
+        ///   2383.... 02000000 0d000300 ........ 26000000 05000200
+        ///   00000000 00000000 00000000 00000000
+        /// i.e. 40 bytes, length 2, sourceid 5, valuators_len 2, flags 0,
+        /// and an all-zero two-word valuator mask with no axis values.
+        fn xorg_raw_key(evtype: u16, deviceid: u16, keycode: u8, time: u32) -> Vec<u8> {
+            let t = time.to_le_bytes();
+            vec![
+                0x23,
+                137,
+                0x00,
+                0x00,
+                0x02,
+                0x00,
+                0x00,
+                0x00, //
+                evtype as u8,
+                0x00,
+                deviceid as u8,
+                0x00,
+                t[0],
+                t[1],
+                t[2],
+                t[3], //
+                keycode,
+                0x00,
+                0x00,
+                0x00,
+                0x05,
+                0x00,
+                0x02,
+                0x00, //
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00, //
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+            ]
+        }
+
+        /// A client selecting `mask` on the root under each of `devices`,
+        /// having announced `xi_version` (None: never called XIQueryVersion).
+        fn install_root_selector(
+            state: &mut ServerState,
+            id: u32,
+            devices: &[u16],
+            mask: u32,
+            xi_version: Option<(u16, u16)>,
+        ) -> UnixStream {
+            let peer = install_kf(state, id, ROOT_WINDOW, 0, 0);
+            let client = state.clients.get_mut(&id).unwrap();
+            client.xi2_masks.clear();
+            for d in devices {
+                client.xi2_masks.insert((ROOT_WINDOW, *d), mask);
+            }
+            if let Some(v) = xi_version {
+                state.xi2_client_versions.insert(ClientId(id), v);
+            }
+            peer
+        }
+
+        /// Every XI2 raw event in what `peer` received, whole.
+        fn raw_events(peer: &mut UnixStream) -> Vec<Vec<u8>> {
+            let bytes = read_all_available(peer);
+            let mut out = Vec::new();
+            let mut i = 0;
+            while i + 32 <= bytes.len() {
+                let len = if bytes[i] & 0x7f == 35 {
+                    32 + 4 * u32::from_le_bytes(bytes[i + 4..i + 8].try_into().unwrap()) as usize
+                } else {
+                    32
+                };
+                let ev = bytes[i..i + len].to_vec();
+                if ev[0] == 35 && matches!(u16::from_le_bytes([ev[8], ev[9]]), 13 | 14) {
+                    out.push(ev);
+                }
+                i += len;
+            }
+            out
+        }
+
+        fn raw(keycode: u8, pressed: bool, time: u32) -> RawKeyEvent {
+            RawKeyEvent {
+                keycode,
+                pressed,
+                time,
+            }
+        }
+
+        fn press_release(state: &mut ServerState, keycode: u8) {
+            let _ = raw_key_event_to_state(state, raw(keycode, true, 100), false, false);
+            let _ = raw_key_event_to_state(state, raw(keycode, false, 101), true, false);
+        }
+
+        fn keyboard_grab(
+            owner: u32,
+            window: ResourceId,
+            via_xi2: bool,
+            owner_events: bool,
+            xi2_mask: u32,
+        ) -> ActiveKeyboardGrab {
+            ActiveKeyboardGrab {
+                owner: ClientId(owner),
+                grab_window: window,
+                source: ActiveKeyboardGrabSource::Explicit,
+                owner_events,
+                via_xi2,
+                xi2_mask,
+            }
+        }
+
+        /// No grab. Capture: XIAllMasterDevices and the master keyboard get
+        /// the master form; XIAllDevices gets the slave form THEN the master
+        /// form (slave processed first, mi/mieq.c); a slave selector gets
+        /// the slave form; an XI 2.0 client is not filtered without a grab.
+        #[test]
+        fn raw_key_forms_per_selection_match_xorg() {
+            let mut state = ServerState::new();
+            let mut all_master =
+                install_root_selector(&mut state, 1, &[1], RAW_KEY_MASK, Some((2, 2)));
+            let mut all = install_root_selector(&mut state, 2, &[0], RAW_KEY_MASK, Some((2, 2)));
+            let mut vck = install_root_selector(&mut state, 3, &[3], RAW_KEY_MASK, Some((2, 2)));
+            let mut slave = install_root_selector(&mut state, 4, &[5], RAW_KEY_MASK, Some((2, 2)));
+            let mut xi20 = install_root_selector(&mut state, 5, &[1], RAW_KEY_MASK, Some((2, 0)));
+            // A client selecting only RawKeyRelease gets only releases.
+            let mut release_only = install_root_selector(&mut state, 6, &[1], 1 << 14, None);
+
+            press_release(&mut state, 38);
+
+            let master = vec![
+                xorg_raw_key(RAW_PRESS, 3, 38, 100),
+                xorg_raw_key(RAW_RELEASE, 3, 38, 101),
+            ];
+            assert_eq!(raw_events(&mut all_master), master);
+            assert_eq!(raw_events(&mut vck), master);
+            assert_eq!(raw_events(&mut xi20), master);
+            assert_eq!(
+                raw_events(&mut all),
+                vec![
+                    xorg_raw_key(RAW_PRESS, 5, 38, 100),
+                    xorg_raw_key(RAW_PRESS, 3, 38, 100),
+                    xorg_raw_key(RAW_RELEASE, 5, 38, 101),
+                    xorg_raw_key(RAW_RELEASE, 3, 38, 101),
+                ]
+            );
+            assert_eq!(
+                raw_events(&mut slave),
+                vec![
+                    xorg_raw_key(RAW_PRESS, 5, 38, 100),
+                    xorg_raw_key(RAW_RELEASE, 5, 38, 101)
+                ]
+            );
+            assert_eq!(
+                raw_events(&mut release_only),
+                vec![xorg_raw_key(RAW_RELEASE, 3, 38, 101)]
+            );
+        }
+
+        /// Xorg GetKeyboardEvents: a press of a key already down yields a
+        /// raw press for an auto-repeating non-modifier (capture: `p38 p38`
+        /// → two raw presses) and nothing for a modifier (`p50 p50` → one)
+        /// or with auto-repeat off (dix/getevents.c "Handle core repeating").
+        /// A release of a key that is not down still yields a raw release
+        /// (capture: a lone `r38` → RawKeyRelease).
+        #[test]
+        fn raw_key_press_while_down_follows_get_keyboard_events() {
+            let mut state = ServerState::new();
+            let mut peer = install_root_selector(&mut state, 1, &[1], RAW_KEY_MASK, None);
+
+            let _ = raw_key_event_to_state(&mut state, raw(38, true, 7), true, false);
+            assert_eq!(
+                raw_events(&mut peer),
+                vec![xorg_raw_key(RAW_PRESS, 3, 38, 7)]
+            );
+
+            let _ = raw_key_event_to_state(&mut state, raw(50, true, 8), true, true);
+            assert!(
+                raw_events(&mut peer).is_empty(),
+                "modifier press while down: no raw event"
+            );
+
+            let _ = raw_key_event_to_state(&mut state, raw(38, false, 9), false, false);
+            assert_eq!(
+                raw_events(&mut peer),
+                vec![xorg_raw_key(RAW_RELEASE, 3, 38, 9)]
+            );
+
+            state.keyboard_control.auto_repeats[38 >> 3] &= !(1 << (38 & 7));
+            let _ = raw_key_event_to_state(&mut state, raw(38, true, 10), true, false);
+            assert!(
+                raw_events(&mut peer).is_empty(),
+                "per-key auto-repeat off: no raw event"
+            );
+            let _ = raw_key_event_to_state(&mut state, raw(38, true, 11), false, false);
+            assert_eq!(
+                raw_events(&mut peer).len(),
+                1,
+                "a first press still yields one"
+            );
+
+            state.keyboard_control.auto_repeats[38 >> 3] |= 1 << (38 & 7);
+            state.keyboard_control.global_auto_repeat = false;
+            let _ = raw_key_event_to_state(&mut state, raw(38, true, 12), true, false);
+            assert!(
+                raw_events(&mut peer).is_empty(),
+                "global auto-repeat off: no raw event"
+            );
+        }
+
+        /// Core GrabKeyboard(root), async. Capture G1 + C1: the XI 2.0
+        /// XIAllMasterDevices client loses the master form, the XI 2.0
+        /// XIAllDevices client keeps only the slave form (the slave is not
+        /// grabbed), XI 2.2 clients and a client that never queried the
+        /// version are unaffected, and the grabbing client — although it
+        /// selected raw keys on the root — gets nothing: a core grab has no
+        /// raw form, and FilterRawEvents skips the owner of a root grab.
+        #[test]
+        fn raw_key_under_core_grab_matches_xorg() {
+            let mut state = ServerState::new();
+            let mut owner = install_root_selector(&mut state, 1, &[1], RAW_KEY_MASK, Some((2, 2)));
+            let mut m22 = install_root_selector(&mut state, 2, &[1], RAW_KEY_MASK, Some((2, 2)));
+            let mut a22 = install_root_selector(&mut state, 3, &[0], RAW_KEY_MASK, Some((2, 2)));
+            let mut m20 = install_root_selector(&mut state, 4, &[1], RAW_KEY_MASK, Some((2, 0)));
+            let mut a20 = install_root_selector(&mut state, 5, &[0], RAW_KEY_MASK, Some((2, 0)));
+            let mut never = install_root_selector(&mut state, 6, &[1], RAW_KEY_MASK, None);
+            state.active_keyboard_grab = Some(keyboard_grab(1, ROOT_WINDOW, false, false, 0));
+
+            let _ = raw_key_event_to_state(&mut state, raw(38, true, 5), false, false);
+
+            let master = vec![xorg_raw_key(RAW_PRESS, 3, 38, 5)];
+            let slave = vec![xorg_raw_key(RAW_PRESS, 5, 38, 5)];
+            assert!(raw_events(&mut owner).is_empty());
+            assert_eq!(raw_events(&mut m22), master);
+            assert_eq!(
+                raw_events(&mut a22),
+                [slave.clone(), master.clone()].concat()
+            );
+            assert!(raw_events(&mut m20).is_empty());
+            assert_eq!(raw_events(&mut a20), slave);
+            assert_eq!(raw_events(&mut never), master);
+        }
+
+        /// XIGrabDevice(master keyboard) async. Captures G2/G3/G3b/O1-O4:
+        /// how many master-form raw presses the grabbing client receives,
+        /// by grab window, owner_events, whether the grab mask selects raw
+        /// keys, and whether the owner also selected raw keys on the root.
+        /// Bystanders are unaffected (XI 2.2) in every case.
+        #[test]
+        fn raw_key_under_xi2_grab_matches_xorg() {
+            // (grab window, owner_events, grab mask has raw, owner selects on root, owner copies)
+            let cases = [
+                (ROOT_WINDOW, false, true, true, 1), // G2: via grab; root copy skipped
+                (ROOT_WINDOW, false, true, false, 1), // G3b: via grab only
+                (CHILD, false, true, true, 2),       // G3: via grab + root copy
+                (CHILD, true, false, true, 2),       // O1: owner_events + root copy
+                (CHILD, false, false, true, 1),      // O2: root copy only
+                (ROOT_WINDOW, true, false, true, 1), // O3: owner_events; root copy skipped
+                (ROOT_WINDOW, false, false, true, 0), // O4: none at all
+            ];
+            for (i, (window, owner_events, mask_has_raw, owner_selects, expect)) in
+                cases.into_iter().enumerate()
+            {
+                let mut state = ServerState::new();
+                // Xvfb's default focus: PointerRoot.
+                state.core_focus.raw = 1;
+                let mut owner = install_root_selector(
+                    &mut state,
+                    1,
+                    &[1],
+                    if owner_selects { RAW_KEY_MASK } else { 0 },
+                    Some((2, 2)),
+                );
+                let mut bystander =
+                    install_root_selector(&mut state, 2, &[1], RAW_KEY_MASK, Some((2, 2)));
+                let grab_mask = (1 << 2) | (1 << 3) | if mask_has_raw { RAW_KEY_MASK } else { 0 };
+                state.active_keyboard_grab =
+                    Some(keyboard_grab(1, window, true, owner_events, grab_mask));
+
+                let _ = raw_key_event_to_state(&mut state, raw(38, true, 5), false, false);
+
+                assert_eq!(
+                    raw_events(&mut owner),
+                    vec![xorg_raw_key(RAW_PRESS, 3, 38, 5); expect],
+                    "case {i}"
+                );
+                assert_eq!(
+                    raw_events(&mut bystander),
+                    vec![xorg_raw_key(RAW_PRESS, 3, 38, 5)],
+                    "case {i}"
+                );
+            }
+        }
+
+        /// owner_events delivery walks from the focus; raw keys are only
+        /// selectable on the root, so with focus on a window it never gets
+        /// there and the grab mask alone decides (dix/events.c
+        /// DeliverGrabbedEvent → DeliverDeviceEvents(focus, .., stopAt=focus)).
+        #[test]
+        fn raw_key_owner_events_needs_focus_walk_to_reach_root() {
+            let mut state = ServerState::new();
+            state.core_focus.raw = CHILD.0;
+            let mut owner = install_root_selector(&mut state, 1, &[1], RAW_KEY_MASK, Some((2, 2)));
+            state.active_keyboard_grab = Some(keyboard_grab(1, ROOT_WINDOW, true, true, 1 << 2));
+
+            let _ = raw_key_event_to_state(&mut state, raw(38, true, 5), false, false);
+
+            assert!(raw_events(&mut owner).is_empty());
+        }
+
+        /// Core GrabKeyboard(root) with keyboard_mode Sync, then
+        /// AllowEvents(AsyncKeyboard). Capture G4: while frozen only the
+        /// slave form is delivered; the master forms are held in input
+        /// order and delivered on thaw, filtered by the grab still in
+        /// effect then (the XI 2.0 client gets none).
+        #[test]
+        fn raw_key_master_form_waits_for_thaw() {
+            let mut state = ServerState::new();
+            let mut backend = crate::backend::recording::RecordingBackend::default();
+            let mut m22 = install_root_selector(&mut state, 2, &[1], RAW_KEY_MASK, Some((2, 2)));
+            let mut a22 = install_root_selector(&mut state, 3, &[0], RAW_KEY_MASK, Some((2, 2)));
+            let mut m20 = install_root_selector(&mut state, 4, &[1], RAW_KEY_MASK, Some((2, 0)));
+            state.active_keyboard_grab = Some(keyboard_grab(1, ROOT_WINDOW, false, false, 0));
+            state
+                .xi1_frozen
+                .entry(crate::xinput::DEVICEID_SLAVE_KEYBOARD)
+                .or_default()
+                .state = crate::server::Xi1SyncState::FrozenNoEvent;
+
+            press_release(&mut state, 38);
+
+            assert!(
+                raw_events(&mut m22).is_empty(),
+                "master form held while frozen"
+            );
+            assert!(raw_events(&mut m20).is_empty());
+            assert_eq!(
+                raw_events(&mut a22),
+                vec![
+                    xorg_raw_key(RAW_PRESS, 5, 38, 100),
+                    xorg_raw_key(RAW_RELEASE, 5, 38, 101)
+                ],
+                "slave form is not frozen"
+            );
+
+            crate::core_loop::pointer_fanout::xi1_thaw_device(
+                &mut state,
+                &mut backend,
+                &HostXidMap::new(),
+                crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+            );
+
+            let master = vec![
+                xorg_raw_key(RAW_PRESS, 3, 38, 100),
+                xorg_raw_key(RAW_RELEASE, 3, 38, 101),
+            ];
+            assert_eq!(raw_events(&mut m22), master);
+            assert_eq!(raw_events(&mut a22), master);
+            assert!(
+                raw_events(&mut m20).is_empty(),
+                "grab still active at thaw: XI 2.0 filtered"
+            );
+        }
+
+        /// Capture G5 (passive sync GrabKey, AllowEvents(ReplayKeyboard)):
+        /// the release queued behind the freeze is processed after the
+        /// replay released the grab, so its master form also reaches the
+        /// XI 2.0 client — the grab consulted is the one at processing time.
+        #[test]
+        fn raw_key_queued_master_form_sees_grab_at_processing_time() {
+            let mut state = ServerState::new();
+            let mut backend = crate::backend::recording::RecordingBackend::default();
+            let mut m20 = install_root_selector(&mut state, 4, &[1], RAW_KEY_MASK, Some((2, 0)));
+            state.active_keyboard_grab = Some(ActiveKeyboardGrab {
+                source: ActiveKeyboardGrabSource::PassiveKey { keycode: 38 },
+                ..keyboard_grab(1, ROOT_WINDOW, false, false, 0)
+            });
+            state
+                .xi1_frozen
+                .entry(crate::xinput::DEVICEID_SLAVE_KEYBOARD)
+                .or_default()
+                .state = crate::server::Xi1SyncState::FrozenWithEvent;
+            let _ = raw_key_event_to_state(&mut state, raw(38, false, 101), true, false);
+            assert!(raw_events(&mut m20).is_empty());
+
+            state.active_keyboard_grab = None;
+            crate::core_loop::pointer_fanout::xi1_thaw_device(
+                &mut state,
+                &mut backend,
+                &HostXidMap::new(),
+                crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+            );
+
+            assert_eq!(
+                raw_events(&mut m20),
+                vec![xorg_raw_key(RAW_RELEASE, 3, 38, 101)]
+            );
+        }
+
+        /// The activating press of a passive grab is replayed (ReplayKeyboard)
+        /// without regenerating its raw event: raw describes the physical
+        /// input and went out before the grab activated (capture G5: one
+        /// RawKeyPress per client in total).
+        #[test]
+        fn replayed_key_does_not_repeat_raw_event() {
+            let mut state = ServerState::new();
+            let mut m22 = install_root_selector(&mut state, 2, &[1], RAW_KEY_MASK, Some((2, 2)));
+            state.core_focus.raw = 1;
+
+            let _ = replay_frozen_key_to_focus(&mut state, key_event(true, 38));
+
+            assert!(raw_events(&mut m22).is_empty());
+        }
     }
 }

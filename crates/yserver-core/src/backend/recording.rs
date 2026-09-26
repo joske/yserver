@@ -34,6 +34,13 @@ use crate::{
 /// assert against `Vec<RecordedCall>` snapshots.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordedCall {
+    /// A key event handed to `on_host_input`; `repeat` distinguishes
+    /// `HostInputEvent::KeyRepeat` from device `HostInputEvent::Key`.
+    HostKey {
+        keycode: u8,
+        pressed: bool,
+        repeat: bool,
+    },
     CreateSubwindow {
         parent: u32,
         x: i16,
@@ -1069,8 +1076,19 @@ impl Backend for RecordingBackend {
     fn on_host_input(
         &mut self,
         _state: &mut crate::server::ServerState,
-        _ev: crate::core_loop::HostInputEvent,
+        ev: crate::core_loop::HostInputEvent,
     ) {
+        use crate::core_loop::HostInputEvent;
+        let (key, repeat) = match ev {
+            HostInputEvent::Key(key) => (key, false),
+            HostInputEvent::KeyRepeat(key) => (key, true),
+            _ => return,
+        };
+        self.record(RecordedCall::HostKey {
+            keycode: key.keycode,
+            pressed: key.pressed,
+            repeat,
+        });
     }
 
     fn on_page_flip_ready(

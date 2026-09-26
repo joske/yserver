@@ -90,7 +90,7 @@ impl Backend for HostX11Backend {
 
         let container = self.window_id();
         match ev {
-            HostInputEvent::Key(raw) => {
+            HostInputEvent::Key(raw) | HostInputEvent::KeyRepeat(raw) => {
                 self.push_pending_host_event(HostEvent::Key(HostKeyEvent {
                     pressed: raw.pressed,
                     keycode: raw.keycode,

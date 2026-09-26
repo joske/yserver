@@ -284,6 +284,10 @@ pub struct KeyGrab {
     /// grab) rather than core GrabKey — see
     /// [`PassiveButtonGrab::via_xi2`] for the delivery-protocol rule.
     pub via_xi2: bool,
+    /// First word of the XIPassiveGrabDevice event mask (XI2 event types
+    /// 0..=31, which covers every key and raw key type); 0 for a core
+    /// GrabKey. Becomes the activated grab's [`ActiveKeyboardGrab::xi2_mask`].
+    pub xi2_mask: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -308,6 +312,11 @@ pub struct ActiveKeyboardGrab {
     /// keyboard, or an activated XI2 passive key grab) — see
     /// [`PassiveButtonGrab::via_xi2`] for the delivery-protocol rule.
     pub via_xi2: bool,
+    /// The grab's XI2 event mask (Xorg `GrabRec.xi2mask`, first word:
+    /// event types 0..=31). Consulted where Xorg's `DeliverOneGrabbedEvent`
+    /// reads it — today the XI2 raw key events, which reach an XI2 grab
+    /// owner only if its grab mask selects them. 0 for core grabs.
+    pub xi2_mask: u32,
 }
 
 /// XI 1.x passive device grab (GrabDeviceKey / GrabDeviceButton).
@@ -399,6 +408,10 @@ pub enum QueuedInputEvent {
     HostPointer(crate::host_x11::HostPointerEvent),
     HostKey(crate::host_x11::HostKeyEvent),
     Xi1Routed(Xi1QueuedEvent),
+    /// The master-keyboard form of an XI2 raw key event, queued behind a
+    /// frozen keyboard in input order (Xorg enqueues the master's
+    /// `ET_RawKeyPress` / `ET_RawKeyRelease` like any other event).
+    RawKey(crate::core_loop::key_fanout::RawKeyEvent),
 }
 
 /// One device-tagged entry in Xorg's global `syncEvents.pending` equivalent.
@@ -831,6 +844,15 @@ impl KeyboardControlState {
             led_mask: 0,
         }
     }
+
+    /// Whether `keycode` auto-repeats: the global flag gates everything,
+    /// then the per-key bitmap decides (Xorg `kbdfeed->ctrl.autoRepeat`
+    /// + `autoRepeats[]`, `key_autorepeats` in dix/getevents.c).
+    #[must_use]
+    pub fn key_auto_repeats(&self, keycode: u8) -> bool {
+        self.global_auto_repeat
+            && self.auto_repeats[usize::from(keycode >> 3)] & (1 << (keycode & 7)) != 0
+    }
 }
 
 impl Default for KeyboardControlState {
@@ -1248,6 +1270,13 @@ pub struct ServerState {
     /// `SetClientVersion`. Missing means the legacy v0 reply layout, matching
     /// Xorg's `ClientMajorVersion`.
     pub vidmode_client_versions: HashMap<ClientId, (u16, u16)>,
+    /// XI version each client announced with XIQueryVersion (Xorg
+    /// `XIClientRec.major_version/minor_version`), kept by Xorg's rules:
+    /// the first query sets it; a later one raises it only when both are
+    /// 2.2 or newer. Absent = never queried (Xorg's 0.0). Xorg consults it
+    /// to filter XI2 raw events under a grab (`FilterRawEvents`: an XI 2.0
+    /// client gets no raw event from a grabbed device).
+    pub xi2_client_versions: HashMap<ClientId, (u16, u16)>,
     /// `GLX_EXT_texture_from_pixmap` is advertised only when the backend
     /// confirmed at init that it can allocate and export a BGRA8 dma-buf.
     /// Set once from `backend.supports_dmabuf_export()` during startup;
@@ -1558,6 +1587,7 @@ impl ServerState {
             glx_next_context_tag: 1,
             glx_drawables: HashMap::new(),
             vidmode_client_versions: HashMap::new(),
+            xi2_client_versions: HashMap::new(),
             glx_tfp_supported: false,
             glx_vendor_names: glx::VENDOR_NAMES.to_string(),
             sync_pending_awaits: Vec::new(),
@@ -5033,6 +5063,7 @@ mod tests {
             pointer_mode: 1,
             keyboard_mode: 1,
             via_xi2: false,
+            xi2_mask: 0,
         });
         let hit = s.find_key_grab(win, 24, 0x0040);
         assert!(hit.is_some());
@@ -5052,6 +5083,7 @@ mod tests {
             pointer_mode: 1,
             keyboard_mode: 1,
             via_xi2: false,
+            xi2_mask: 0,
         });
         assert!(s.find_key_grab(win, 24, 0x0040).is_some());
         assert!(s.find_key_grab(win, 24, 0x0000).is_some());
@@ -5071,6 +5103,7 @@ mod tests {
             pointer_mode: 1,
             keyboard_mode: 1,
             via_xi2: false,
+            xi2_mask: 0,
         });
         assert!(s.find_key_grab(win, 24, 0x0040).is_some());
         assert!(s.find_key_grab(win, 99, 0x0040).is_some());
@@ -5087,6 +5120,7 @@ mod tests {
             source: ActiveKeyboardGrabSource::Explicit,
             owner_events: false,
             via_xi2: false,
+            xi2_mask: 0,
         });
         assert_eq!(s.active_keyboard_grab.unwrap().owner, ClientId(7));
         s.active_keyboard_grab = None;

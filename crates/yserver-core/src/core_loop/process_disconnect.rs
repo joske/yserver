@@ -467,6 +467,7 @@ pub fn process_disconnect_reporting(
         .mit_shm_segments
         .retain(|_, seg| seg.owner != client_id);
     state.vidmode_client_versions.remove(&client_id);
+    state.xi2_client_versions.remove(&client_id);
     state
         .randr_select_masks
         .retain(|(owner, window), _| *owner != client_id.0 && !dead_windows.contains(window));
@@ -1608,6 +1609,23 @@ mod tests {
             Some(&(1, 0)),
             "a surviving client must keep its negotiated version"
         );
+    }
+
+    #[test]
+    fn disconnect_removes_only_the_dead_clients_xi2_version() {
+        // A recycled id must not inherit a dead client's XI 2.0 version:
+        // it would lose XI2 raw events under every keyboard grab.
+        let mut state = ServerState::new();
+        install_client(&mut state, 7);
+        install_client(&mut state, 8);
+        state.xi2_client_versions.insert(ClientId(7), (2, 0));
+        state.xi2_client_versions.insert(ClientId(8), (2, 2));
+
+        let mut backend = RecordingBackend::new();
+        process_disconnect(&mut state, &mut backend, ClientId(7));
+
+        assert!(!state.xi2_client_versions.contains_key(&ClientId(7)));
+        assert_eq!(state.xi2_client_versions.get(&ClientId(8)), Some(&(2, 2)));
     }
 
     #[test]

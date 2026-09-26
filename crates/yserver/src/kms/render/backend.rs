@@ -18959,7 +18959,27 @@ impl Backend for KmsBackend {
                 );
                 return;
             }
-            HostInputEvent::Key(raw) => {
+            HostInputEvent::Key(raw) | HostInputEvent::KeyRepeat(raw) => {
+                // One timestamp for the raw event and the device event
+                // (Xorg GetKeyboardEvents stamps both with the same ms).
+                let time = crate::clock::server_time_ms();
+                // Device input (not a software repeat) generates the XI2 raw
+                // key event first — ahead of the duplicate guard below, as
+                // Xorg builds it in GetKeyboardEvents before exevents drops
+                // a duplicate. `raw_key_event_to_state` applies Xorg's own
+                // press-while-down rule.
+                if matches!(ev, HostInputEvent::Key(_)) {
+                    let _dropped = yserver_core::core_loop::key_fanout::raw_key_event_to_state(
+                        state,
+                        yserver_core::core_loop::key_fanout::RawKeyEvent {
+                            keycode: raw.keycode,
+                            pressed: raw.pressed,
+                            time,
+                        },
+                        self.core.down_keys.contains(&raw.keycode),
+                        self.core.xkb_desc.modmap[usize::from(raw.keycode)] != 0,
+                    );
+                }
                 // Xorg `Xi/exevents.c` UpdateDeviceState: "don't allow
                 // ddx to generate multiple downs" and "guard against
                 // duplicates" — a press of a key already down, or a
@@ -18980,7 +19000,8 @@ impl Backend for KmsBackend {
                     );
                     return;
                 }
-                let cooked = self.cook_host_key(raw);
+                let mut cooked = self.cook_host_key(raw);
+                cooked.time = time;
                 // Maintain the held-keys set so suspend can synthesize
                 // releases (Task 10). Use the COOKED keycode so
                 // synthesized releases carry the same value clients see.
@@ -36460,6 +36481,7 @@ mod tests {
             pointer_mode: 1,
             keyboard_mode: 1,
             via_xi2: false,
+            xi2_mask: 0,
         });
 
         let key = |keycode, pressed| {
@@ -36554,6 +36576,203 @@ mod tests {
             state.keys_down.iter().all(|&byte| byte == 0),
             "QueryKeymap must report no held keys"
         );
+    }
+
+    /// Every XI2 event in `bytes` as (evtype, deviceid, sourceid, detail,
+    /// time) — raw and device events alike, in arrival order.
+    fn xi2_events(bytes: &[u8]) -> Vec<(u16, u16, u16, u32, u32)> {
+        let rd16 = |o: usize| u16::from_le_bytes([bytes[o], bytes[o + 1]]);
+        let rd32 = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 32 <= bytes.len() {
+            if bytes[i] & 0x7f != 35 {
+                i += 32;
+                continue;
+            }
+            let evtype = rd16(i + 8);
+            // Raw events carry sourceid at byte 20, device events at 52.
+            let sourceid = if (13..=17).contains(&evtype) {
+                rd16(i + 20)
+            } else {
+                rd16(i + 52)
+            };
+            out.push((evtype, rd16(i + 10), sourceid, rd32(i + 16), rd32(i + 12)));
+            i += 32 + 4 * rd32(i + 4) as usize;
+        }
+        out
+    }
+
+    /// Issue #173: a key from the device path produces XI2 raw key events
+    /// for a root XIAllMasterDevices selector — deviceid 3 (master), sourceid
+    /// 5, detail = keycode — delivered BEFORE the key's XI2 device event and
+    /// with the same timestamp (Xorg GetKeyboardEvents: one `ms`, raw first;
+    /// the reporter's Xlibre `xinput test-xi2 --root` log and the Xvfb
+    /// capture in key_fanout's raw_keys tests show both).
+    #[test]
+    fn device_key_emits_raw_key_events_before_the_device_event() {
+        use yserver_core::{
+            core_loop::HostInputEvent, host_x11::HostKeyEvent, resources::ROOT_WINDOW,
+            server::ServerState,
+        };
+        let mut b = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        let mut peer = kbd_map_client_id(&mut state, 9);
+        let client = state.clients.get_mut(&9).unwrap();
+        client
+            .xi2_masks
+            .insert((ROOT_WINDOW, 1), (1 << 13) | (1 << 14));
+        client
+            .xi2_masks
+            .insert((ROOT_WINDOW, 3), (1 << 2) | (1 << 3));
+        let key = |pressed| {
+            HostInputEvent::Key(HostKeyEvent {
+                keycode: 71, // F5, as in the report
+                pressed,
+                state: 0,
+                root_x: 0,
+                root_y: 0,
+                event_x: 0,
+                event_y: 0,
+                time: 0,
+            })
+        };
+
+        b.on_host_input(&mut state, key(true));
+        b.on_host_input(&mut state, key(false));
+
+        let events = xi2_events(&kbd_map_drain(&mut peer));
+        let kinds: Vec<_> = events.iter().map(|e| (e.0, e.1, e.2, e.3)).collect();
+        assert_eq!(
+            kinds,
+            vec![(13, 3, 5, 71), (2, 3, 5, 71), (14, 3, 5, 71), (3, 3, 5, 71)],
+            "RawKeyPress, KeyPress, RawKeyRelease, KeyRelease"
+        );
+        assert_eq!(
+            events[0].4, events[1].4,
+            "raw press and KeyPress share one time"
+        );
+        assert_eq!(
+            events[2].4, events[3].4,
+            "raw release and KeyRelease share one time"
+        );
+    }
+
+    /// The duplicate guard (#168) drops a press of a key already down and
+    /// a release of a key that is not down before any delivery — but the
+    /// raw event is generated ahead of it, as on Xorg (Xvfb capture, XTEST):
+    /// `p38 p38` → two RawKeyPress; `p50 p50` (Shift_L, a modifier) → one;
+    /// a lone `r38` → one RawKeyRelease. No device event for the dropped ones.
+    #[test]
+    fn duplicate_guard_keeps_xorg_raw_key_events() {
+        use yserver_core::{
+            core_loop::HostInputEvent, host_x11::HostKeyEvent, resources::ROOT_WINDOW,
+            server::ServerState,
+        };
+        const A: u8 = 38;
+        const SHIFT_L: u8 = 50;
+        let mut b = KmsBackend::for_tests();
+        assert_ne!(
+            b.core.xkb_desc.modmap[usize::from(SHIFT_L)],
+            0,
+            "precondition: Shift_L is a modifier"
+        );
+        let mut state = ServerState::new();
+        let mut peer = kbd_map_client_id(&mut state, 9);
+        let client = state.clients.get_mut(&9).unwrap();
+        client
+            .xi2_masks
+            .insert((ROOT_WINDOW, 1), (1 << 13) | (1 << 14));
+        client
+            .xi2_masks
+            .insert((ROOT_WINDOW, 3), (1 << 2) | (1 << 3));
+        let key = |keycode, pressed| {
+            HostInputEvent::Key(HostKeyEvent {
+                keycode,
+                pressed,
+                state: 0,
+                root_x: 0,
+                root_y: 0,
+                event_x: 0,
+                event_y: 0,
+                time: 0,
+            })
+        };
+
+        for (keycode, pressed) in [
+            (A, true),
+            (A, true),
+            (A, false),
+            (SHIFT_L, true),
+            (SHIFT_L, true),
+            (SHIFT_L, false),
+            (A, false),
+        ] {
+            b.on_host_input(&mut state, key(keycode, pressed));
+        }
+
+        let kinds: Vec<_> = xi2_events(&kbd_map_drain(&mut peer))
+            .iter()
+            .map(|e| (e.0, e.3))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (13, 38),
+                (2, 38),
+                (13, 38), // duplicate press: raw only
+                (14, 38),
+                (3, 38),
+                (13, 50),
+                (2, 50),
+                // duplicate modifier press: nothing
+                (14, 50),
+                (3, 50),
+                (14, 38), // release of a key that is not down: raw only
+            ]
+        );
+    }
+
+    /// Software auto-repeat is not device input: Xorg's XKB repeat builds
+    /// the device event directly (AccessXKeyboardEvent) and never passes
+    /// GetKeyboardEvents, so a repeat pair produces no raw key events.
+    #[test]
+    fn key_repeat_emits_no_raw_key_events() {
+        use yserver_core::{
+            core_loop::HostInputEvent, host_x11::HostKeyEvent, resources::ROOT_WINDOW,
+            server::ServerState,
+        };
+        let mut b = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        let mut peer = kbd_map_client_id(&mut state, 9);
+        let client = state.clients.get_mut(&9).unwrap();
+        client
+            .xi2_masks
+            .insert((ROOT_WINDOW, 1), (1 << 13) | (1 << 14));
+        client
+            .xi2_masks
+            .insert((ROOT_WINDOW, 3), (1 << 2) | (1 << 3));
+        let ev = |pressed| HostKeyEvent {
+            keycode: 38,
+            pressed,
+            state: 0,
+            root_x: 0,
+            root_y: 0,
+            event_x: 0,
+            event_y: 0,
+            time: 0,
+        };
+
+        b.on_host_input(&mut state, HostInputEvent::Key(ev(true)));
+        b.on_host_input(&mut state, HostInputEvent::KeyRepeat(ev(false)));
+        b.on_host_input(&mut state, HostInputEvent::KeyRepeat(ev(true)));
+        b.on_host_input(&mut state, HostInputEvent::Key(ev(false)));
+
+        let kinds: Vec<_> = xi2_events(&kbd_map_drain(&mut peer))
+            .iter()
+            .map(|e| e.0)
+            .collect();
+        assert_eq!(kinds, vec![13, 2, 3, 2, 14, 3]);
     }
 
     /// Test A: a compiled `grp:alt_shift_toggle` option makes the

@@ -15861,6 +15861,7 @@ fn handle_xi2_request(
             } else {
                 (XI2_SERVER_MAJOR_VERSION, XI2_SERVER_MINOR_VERSION)
             };
+            record_xi2_client_version(state, client_id, (reply_major, reply_minor));
             let mut reply = x11::fixed_reply(byte_order, sequence, 0, 0);
             x11::write_u16(byte_order, &mut reply, reply_major);
             x11::write_u16(byte_order, &mut reply, reply_minor);
@@ -16625,6 +16626,14 @@ fn handle_xi2_request(
             } else {
                 (0, 0, 0, 0, false)
             };
+            // First word of the grab's event mask (mask_len at body[18..20],
+            // mask words from body[20]) — event types 0..=31.
+            let grab_xi2_mask = match body.get(18..24) {
+                Some(b) if u16::from_le_bytes([b[0], b[1]]) > 0 => {
+                    u32::from_le_bytes([b[2], b[3], b[4], b[5]])
+                }
+                _ => 0,
+            };
             // Xorg `dix/events.c:5240` (GrabDevice): a device already
             // grabbed by ANOTHER client → AlreadyGrabbed(1); do NOT
             // overwrite the grab. Same-client re-grab still replaces
@@ -16682,6 +16691,7 @@ fn handle_xi2_request(
                         source: crate::server::ActiveKeyboardGrabSource::Explicit,
                         owner_events,
                         via_xi2: true,
+                        xi2_mask: grab_xi2_mask,
                     });
                 } else {
                     state.set_pointer_grab(crate::server::ActivePointerGrab {
@@ -17076,6 +17086,13 @@ fn handle_xi2_request(
             // Modifiers tail starts after the header (28) and the mask
             // (mask_len * 4 bytes).
             let mods_start = 28 + mask_len * 4;
+            // First mask word: event types 0..=31.
+            let grab_xi2_mask = if mask_len > 0 {
+                body.get(28..32)
+                    .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            } else {
+                0
+            };
             let mut modifier_masks: Vec<u16> = Vec::with_capacity(num_modifiers.max(1).into());
             if num_modifiers == 0 {
                 // "no modifiers" — single grab with modifier-mask 0.
@@ -17140,6 +17157,7 @@ fn handle_xi2_request(
                             pointer_mode: paired_device_mode,
                             keyboard_mode: grab_mode,
                             via_xi2: true,
+                            xi2_mask: grab_xi2_mask,
                         });
                     }
                 }
@@ -18969,6 +18987,14 @@ fn handle_xi2_request(
                                 }
                                 crate::server::QueuedInputEvent::HostKey(event) => {
                                     let _ = replay_frozen_key_to_focus(state, event);
+                                }
+                                // Only a device event activates a grab, so
+                                // the stored slot never holds a raw event;
+                                // processing one is plain master delivery.
+                                crate::server::QueuedInputEvent::RawKey(event) => {
+                                    let _ = crate::core_loop::key_fanout::deliver_raw_key_master(
+                                        state, event,
+                                    );
                                 }
                             }
                         }
@@ -26427,6 +26453,27 @@ fn apply_allow_events(
     Ok(RequestOutcome::Handled)
 }
 
+/// Record a client's XI version the way Xorg `ProcXIQueryVersion` stores
+/// it in `XIClientRec`: the first query sets it; a later query raises it
+/// only when both the stored and the new version are 2.2 or newer
+/// ("Peter promises to never again break backward compatibility").
+/// Otherwise the stored version stays — Xorg then answers a lower request
+/// with BadValue and a higher one with the stored version; yserver keeps
+/// answering with the negotiated version, so only the stored value (what
+/// `FilterRawEvents` reads) follows Xorg here.
+fn record_xi2_client_version(state: &mut ServerState, client_id: ClientId, version: (u16, u16)) {
+    match state.xi2_client_versions.get(&client_id) {
+        None => {
+            state.xi2_client_versions.insert(client_id, version);
+        }
+        Some(&stored) => {
+            if version >= (2, 2) && stored >= (2, 2) && version > stored {
+                state.xi2_client_versions.insert(client_id, version);
+            }
+        }
+    }
+}
+
 fn handle_set_input_focus(
     state: &mut ServerState,
     client_id: ClientId,
@@ -31133,6 +31180,7 @@ fn handle_grab_keyboard(
                 source: crate::server::ActiveKeyboardGrabSource::Explicit,
                 owner_events: header.data != 0,
                 via_xi2: false,
+                xi2_mask: 0,
             });
             state.last_keyboard_grab_time = if time == 0 { now } else { time };
             // Core↔XI bridge — see handle_grab_pointer. GrabKeyboard wire:
@@ -31356,6 +31404,7 @@ fn handle_grab_key(
             pointer_mode: req.pointer_mode,
             keyboard_mode: req.keyboard_mode,
             via_xi2: false,
+            xi2_mask: 0,
         });
         debug!(
             "client {} GrabKey window=0x{:x} keycode={} modifiers=0x{:x}",
@@ -37915,6 +37964,112 @@ mod tests {
         assert_eq!(u16::from_le_bytes([wire[10], wire[11]]), 3);
     }
 
+    /// The XI version a client announced is remembered the way Xorg's
+    /// `ProcXIQueryVersion` stores it, because `FilterRawEvents` reads it.
+    /// Xvfb capture (probe mon:…:0,2 / 2,0 / 3,2, then a keyboard grab):
+    /// 2.0 then 2.2 stays 2.0 (still filtered as XI 2.0); 2.2 then 2.0
+    /// keeps 2.2 (Xorg answers the 2.0 query with BadValue); 2.3 then 2.2
+    /// keeps 2.3; a client that never asks has no version (not filtered).
+    #[test]
+    fn xi_query_version_records_client_version_like_xorg() {
+        let header = RequestHeader {
+            opcode: 131,
+            data: 47,
+            length_units: 2,
+        };
+        let stored_after = |minors: &[u16]| {
+            let mut state = ServerState::new();
+            let _peer = install_client(&mut state, 1);
+            let mut backend = RecordingBackend::new();
+            for (i, minor) in minors.iter().enumerate() {
+                let m = minor.to_le_bytes();
+                handle_xi2_request(
+                    &mut state,
+                    &mut backend,
+                    None,
+                    ClientId(1),
+                    SequenceNumber(u16::try_from(i + 1).unwrap()),
+                    header,
+                    &[2, 0, m[0], m[1]],
+                )
+                .expect("XIQueryVersion");
+            }
+            state.xi2_client_versions.get(&ClientId(1)).copied()
+        };
+        assert_eq!(stored_after(&[]), None);
+        assert_eq!(stored_after(&[0]), Some((2, 0)));
+        assert_eq!(stored_after(&[0, 2]), Some((2, 0)));
+        assert_eq!(stored_after(&[2, 0]), Some((2, 2)));
+        assert_eq!(stored_after(&[3, 2]), Some((2, 3)));
+        assert_eq!(stored_after(&[2, 3]), Some((2, 3)));
+        // Capped at the server's version, as the reply is.
+        assert_eq!(stored_after(&[9]), Some((2, 4)));
+    }
+
+    /// XIGrabDevice(keyboard) and an XI2 passive key grab keep the grab's
+    /// event mask: Xorg delivers an XI2 raw key event to the grab owner
+    /// only when that mask selects it (DeliverOneGrabbedEvent reads
+    /// `grab->xi2mask`).
+    #[test]
+    fn xi2_keyboard_grabs_keep_their_event_mask() {
+        const MASK: u32 = (1 << 2) | (1 << 3) | (1 << 13) | (1 << 14);
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes()); // window
+        body.extend_from_slice(&0u32.to_le_bytes()); // time
+        body.extend_from_slice(&0u32.to_le_bytes()); // cursor
+        body.extend_from_slice(&3u16.to_le_bytes()); // master keyboard
+        body.extend_from_slice(&[1, 1, 0, 0]); // async, async, owner_events=0, pad
+        body.extend_from_slice(&1u16.to_le_bytes()); // mask_len
+        body.extend_from_slice(&MASK.to_le_bytes());
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 131,
+                data: 51,
+                length_units: 7,
+            },
+            &body,
+        )
+        .expect("XIGrabDevice keyboard");
+        assert_eq!(state.active_keyboard_grab.map(|g| g.xi2_mask), Some(MASK));
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u32.to_le_bytes()); // time
+        body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes()); // grab_window
+        body.extend_from_slice(&0u32.to_le_bytes()); // cursor
+        body.extend_from_slice(&38u32.to_le_bytes()); // detail
+        body.extend_from_slice(&3u16.to_le_bytes()); // deviceid
+        body.extend_from_slice(&1u16.to_le_bytes()); // num_modifiers
+        body.extend_from_slice(&1u16.to_le_bytes()); // mask_len
+        body.extend_from_slice(&[1, 1, 1, 0]); // Keycode, async, async, owner_events
+        body.extend_from_slice(&0u16.to_le_bytes()); // pad
+        body.extend_from_slice(&MASK.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // modifier 0
+        handle_xi2_request(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(2),
+            RequestHeader {
+                opcode: 131,
+                data: 54,
+                length_units: 9,
+            },
+            &body,
+        )
+        .expect("XIPassiveGrabDevice keycode");
+        assert_eq!(state.key_grabs.last().map(|g| g.xi2_mask), Some(MASK));
+    }
+
     #[test]
     fn xi_select_events_on_root_bootstraps_device_changed() {
         let mut state = ServerState::new();
@@ -41640,6 +41795,7 @@ mod tests {
                     owner_events: false,
                     source: ActiveKeyboardGrabSource::PassiveKey { keycode: 36 },
                     via_xi2: false,
+                    xi2_mask: 0,
                 });
             }
 
@@ -56777,6 +56933,7 @@ mod tests {
             pointer_mode: 1,
             keyboard_mode: 0, // synchronous → freeze
             via_xi2: true,
+            xi2_mask: 0,
         });
 
         // 1. Alt+Tab press: passive grab activates + keyboard freezes.
@@ -57034,6 +57191,7 @@ mod tests {
             owner_events: false,
             source: ActiveKeyboardGrabSource::PassiveKey { keycode: 33 },
             via_xi2: true,
+            xi2_mask: 0,
         });
         {
             let f = state
@@ -57138,6 +57296,7 @@ mod tests {
             pointer_mode: 1,
             keyboard_mode: 0, // synchronous → freeze
             via_xi2: false,
+            xi2_mask: 0,
         });
 
         let key = |pressed, keycode| HostKeyEvent {
@@ -57230,6 +57389,7 @@ mod tests {
             owner_events: false,
             source: ActiveKeyboardGrabSource::Explicit,
             via_xi2: false,
+            xi2_mask: 0,
         });
         {
             let f = state

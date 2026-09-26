@@ -260,19 +260,25 @@ pub enum HostInputEvent {
     /// delta-0 XI2 scroll motion so GDK sets `scroll.is_stop`, which
     /// commits a Firefox history-swipe (bug 1539730). XI2 smooth-scroll
     /// selectors only — no core event, no button.
-    PointerScrollStop {
-        time: u32,
-    },
+    PointerScrollStop { time: u32 },
+    /// Key input from a device: libinput, or an XTEST fake (XTEST keys
+    /// come from a device of their own on Xorg). Generates the XI2 raw
+    /// key event (Xorg `GetKeyboardEvents`).
     Key(HostKeyEvent),
+    /// One half of a software auto-repeat pair fired by the core's repeat
+    /// timer. Processed like [`Self::Key`], except that it is not device
+    /// input: Xorg's XKB soft repeat (`AccessXRepeatKeyExpire` →
+    /// `AccessXKeyboardEvent`) builds the device event directly and never
+    /// passes through `GetKeyboardEvents`, so a repeat generates no XI2 raw
+    /// key event.
+    KeyRepeat(HostKeyEvent),
     /// A new input device has been enumerated by libinput.  Carries a
     /// snapshot of its identity and touchpad configuration so the core can
     /// seed per-device state (Task 2: XI2 property registry).
     DeviceAdded(DeviceInfo),
     /// An input device has been removed.  `device_node` is the evdev path
     /// that was reported at add time and can be used to look up the device.
-    DeviceRemoved {
-        device_node: String,
-    },
+    DeviceRemoved { device_node: String },
 }
 
 /// Synthetic Linux-style input codes for scroll-wheel "buttons" carried

@@ -33,6 +33,33 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-26 XI2 raw key events (#173, branch `fix/173-xi2-raw-keys`):**
+  `XI_RawKeyPress` / `XI_RawKeyRelease` were never generated (only the pointer
+  path had raw events), so global-hotkey clients selecting them on the root
+  saw nothing. Keys from the device path (libinput and XTEST) now produce them
+  the way Xorg's `GetKeyboardEvents` + `DeliverRawEvent` do: generated before
+  the #168 duplicate guard (a stray release still yields a raw release; a
+  press while down yields one only for an auto-repeating non-modifier),
+  sharing the device event's timestamp and delivered ahead of it; a slave form
+  (deviceid 5) then a master form (deviceid 3), both sourceid 5, 40 bytes with
+  an empty two-word valuator mask; the master form queued behind a frozen
+  keyboard and delivered on thaw; `FilterRawEvents` under a grab (XI 2.0
+  clients lose the master form, the owner of a root grab is skipped) and
+  `DeliverGrabbedEvent` for XI2 grabs (owner_events, then the grab's own mask
+  — `XIGrabDevice` / XI2 passive key grabs now keep their event mask). Software
+  auto-repeat arrives as `HostInputEvent::KeyRepeat` and makes none, like XKB
+  soft repeat. XIQueryVersion now records each client's version with Xorg's
+  storage rules (replies unchanged). Ground truth: Xvfb captures with
+  `tools/vng-scenarios/xi2-raw-keys-probe.c`; vng A/B
+  (`tools/vng-scenarios/xi2-raw-keys-host.sh yserver|xorg`) matches Xorg on
+  every raw event, XTEST and physical PS/2 keys, auto-repeat included; the
+  physical keyboard's slave id differs (Xorg 7, yserver 5). Divergences seen
+  in the same run, not addressed: the pointer raw path has no slave form and
+  no grab filtering; auto-repeat reaches XI2 clients as release+press pairs
+  instead of a press with `XIKeyRepeat`; `XIGrabDevice(keyboard)` sends the
+  grabber unselected XI_FocusIn/Out; XIQueryVersion replies do not follow
+  Xorg's stored version / BadValue.
+
 - **2026-09-26 XKB SetNames + SetGeometry on the model (#171 phase 4e,
   branch `feat/171-phase4-xkbcomp`):** `kms::xkb_desc::set_names` ports
   `ProcXkbSetNames` / `_XkbSetNamesCheck` / `_XkbSetNames` literally (the

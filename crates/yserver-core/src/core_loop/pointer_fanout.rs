@@ -2331,6 +2331,9 @@ pub(crate) fn xi1_compute_freezes(
             crate::server::QueuedInputEvent::Xi1Routed(event) => {
                 let _ = xi1_route_device_event(state, event, true);
             }
+            crate::server::QueuedInputEvent::RawKey(event) => {
+                let _ = crate::core_loop::key_fanout::deliver_raw_key_master(state, event);
+            }
         }
     }
 }
