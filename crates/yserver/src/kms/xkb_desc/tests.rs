@@ -539,8 +539,14 @@ fn uncookable_actions_and_behaviors_are_stored_and_reported() {
 /// (`LockGroup(group=-1)` on a one-layout keymap): 1.6 wraps the negative
 /// locked group to 1 until the next state update, the RMLVO keymap alike.
 #[test]
-#[ignore = "exploratory: iterates the host's xkeyboard-config"]
+#[ignore = "exploratory: iterates the host's xkeyboard-config; YSERVER_EXPLORATORY=1"]
 fn every_host_layout_cooks_as_the_model() {
+    // CI runs every ignored lib test (`--ignored`, for the lavapipe render
+    // tests); this one needs host tools/data, so it only runs on request.
+    if std::env::var_os("YSERVER_EXPLORATORY").is_none() {
+        eprintln!("skipped: set YSERVER_EXPLORATORY=1 to run");
+        return;
+    }
     let ctx = xkbcommon::xkb::Context::new(xkbcommon::xkb::CONTEXT_NO_FLAGS);
     let layouts: Vec<String> = std::fs::read_dir("/usr/share/X11/xkb/symbols")
         .map(|d| {

@@ -500,8 +500,14 @@ fn loopback_tcp_is_refused_the_fd_bearing_mit_shm_minors() {
 /// both tools and a writable `/tmp/.X11-unix`. (Caught the GetNames part
 /// bits: libxdo's `XGetAtomName` of a vmod name died on BadAtom 0.)
 #[test]
-#[ignore = "exploratory: runs xmodmap/xdotool from the host"]
+#[ignore = "exploratory: runs xmodmap/xdotool from the host; YSERVER_EXPLORATORY=1"]
 fn xmodmap_then_xdotool_against_the_core_loop() {
+    // CI runs every ignored lib test (`--ignored`, for the lavapipe render
+    // tests); this one needs host tools/data, so it only runs on request.
+    if std::env::var_os("YSERVER_EXPLORATORY").is_none() {
+        eprintln!("skipped: set YSERVER_EXPLORATORY=1 to run");
+        return;
+    }
     let path = PathBuf::from("/tmp/.X11-unix/X95");
     let _ = fs::remove_file(&path);
     let unix = UnixListener::bind(&path).unwrap();
