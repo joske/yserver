@@ -5,6 +5,9 @@
 #   crates/yserver/src/kms/testdata/xorg-xkb-set-modifier-mapping.txt
 #   crates/yserver/src/kms/testdata/xorg-xkbcomp-upload-trace.txt
 #   crates/yserver/src/kms/testdata/xorg-per-key-repeat.txt
+#   crates/yserver/src/kms/testdata/xorg-xkb-pristine.txt
+#   crates/yserver/src/kms/testdata/xorg-xkbcomp-steps.txt
+#   crates/yserver/src/kms/testdata/xkbcomp-requests/CASE/{N-Request.bin,atoms.txt}
 #
 # Every value in those files is Xvfb output recorded by tools/xkb-mutation-probe.c
 # (or x11trace). Never hand-edit them; rerun this script.
@@ -14,7 +17,7 @@
 # (x11trace's fake display); both must be free. Only the Xvfb this script
 # starts is ever killed (by pid).
 #
-# usage: tools/xkb-mutation-goldens.sh [ckm|smm|xkbcomp|repeat ...]   (default: all)
+# usage: tools/xkb-mutation-goldens.sh [ckm|smm|xkbcomp|repeat|pristine|steps ...]   (default: all)
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -350,8 +353,212 @@ gen_repeat() {
     } >"$out"
 }
 
+# ---------------------------------------------------------------------------
+# Xorg's whole XKB description (probe -x full) of the fixture layouts, as
+# setxkbmap leaves a fresh server: the state every xkbcomp-steps case starts
+# from, and the reference for a keymap model seeded from xkbcommon.
+gen_pristine() {
+    local out=$TD/xorg-xkb-pristine.txt
+    {
+        echo "# Xorg's whole XKB description after setxkbmap (issue #171 phase 4): Xvfb -noreset, fresh server per layout"
+        versions
+        echo "# each case: setxkbmap -rules evdev -model pc105 -layout L [-option O]; then"
+        echo "# tools/xkb-mutation-probe.c -x full. Lines ('= ' prefixed, see the probe header):"
+        echo "#   keys MIN..MAX ntypes N enabledControls C | type N <type> | vmods | repeat <32 bytes hex>"
+        echo "#   key KC <key>            XkbGetMap row, grammar as in xorg-xkb-change-keyboard-mapping.txt"
+        echo "#   compat/si/groupcompat   XkbGetCompatMap(getAllSI, groups=0x0f); si act = 8 raw bytes"
+        echo "#   indicators/indmap       XkbGetIndicatorMap(which=all)"
+        echo "#   names/name/typename/levelnames/indname/vmodname/groupname/keyname/alias/rgname"
+        echo "#                           XkbGetNames(which=all), atoms printed by name ('None' = 0)"
+        echo "#   geometry                XkbGetGeometry(name=None) reply header"
+        echo "#   coremodmap              core GetModifierMapping"
+        for spec in us:- gb:- de:- us,ru:grp:alt_shift_toggle; do
+            local L=${spec%%:*} O=${spec#*:}
+            fresh "$L" "$O"
+            echo "## pristine layout=$L options=$O"
+            "$PROBE" -d ":$DISP" -x full
+            stop_x
+        done
+    } >"$out"
+}
+
+# the edits of the xkbcomp-steps cases, applied to an `xkbcomp -xkb` dump
+xkbcomp_edit() { # MODE SRC DST
+    python3 - "$@" <<'EOF'
+import re, sys
+mode, src, dst = sys.argv[1], sys.argv[2], sys.argv[3]
+t = open(src).read()
+def sub1(pat, rep, s, flags=0):
+    s, n = re.subn(pat, rep, s, count=1, flags=flags)
+    assert n == 1, pat
+    return s
+if mode in ('identity', 'usru'):
+    pass
+elif mode == 'swap':
+    # <AC01>/<AC02> symbols swapped (as xorg-xkbcomp-upload-trace.txt)
+    a = re.search(r'key <AC01> \{(.*?)\};', t, re.S)
+    b = re.search(r'key <AC02> \{(.*?)\};', t, re.S)
+    assert a and b and a.start() < b.start()
+    t = t[:a.start(1)] + b.group(1) + t[a.end(1):b.start(1)] + a.group(1) + t[b.end(1):]
+elif mode == 'newtype':
+    # a new first non-required type (Xorg index 4: the old types 4.. shift up by one),
+    # used by <AC01> with three levels
+    t = sub1(r'(xkb_types "[^"]*" \{\n\n    virtual_modifiers[^\n]*\n\n)',
+             r'\1    type "YS_SHIFT_CTRL" {\n        modifiers= Shift+Control;\n'
+             r'        map[Shift]= Level2;\n        map[Control]= Level3;\n'
+             r'        level_name[Level1]= "Base";\n        level_name[Level2]= "Shift";\n'
+             r'        level_name[Level3]= "Ctrl";\n    };\n', t)
+    t = sub1(r'key <AC01> \{.*?\};',
+             'key <AC01> {\n        type= "YS_SHIFT_CTRL",\n'
+             '        symbols[Group1]= [ a, A, ae ]\n    };', t, re.S)
+elif mode == 'compat':
+    # the Caps_Lock interpret sets Control instead of locking Lock; the Caps Lock LED
+    # follows Shift
+    t = sub1(r'(interpret Caps_Lock\+AnyOfOrNone\(all\) \{\s*action= )LockMods\(modifiers=Lock\);',
+             r'\1SetMods(modifiers=Control);', t)
+    t = sub1(r'(indicator "Caps Lock" \{\s*!allowExplicit;\s*whichModState= locked;\s*modifiers= )Lock;',
+             r'\1Shift;', t)
+elif mode == 'capsctrl':
+    # caps as control the xkb way: <CAPS> is Control_L and under Control
+    t = sub1(r'key <CAPS> \{[^\n]*\};', 'key <CAPS> {         [       Control_L ] };', t)
+    t = sub1(r'modifier_map Lock \{ <CAPS> \};', 'modifier_map Control { <CAPS> };', t)
+elif mode == 'droptype':
+    # an unused type (SHIFT+ALT, the last) removed: xkbcomp sends one type fewer
+    t = sub1(r'\n    type "SHIFT\+ALT" \{.*?\};', '', t, re.S)
+elif mode == 'explicit':
+    # per-key explicit properties: <COMP> gets its own action, <RCTL> its own
+    # auto-repeat and virtual modifier map
+    t = sub1(r'key <COMP> \{[^\n]*\};',
+             'key <COMP> {\n        symbols[Group1]= [ Menu ],\n'
+             '        actions[Group1]= [ LockGroup(group=+1) ]\n    };', t)
+    t = sub1(r'key <RCTL> \{[^\n]*\};',
+             'key <RCTL> {\n        repeat= No,\n        virtualMods= Alt,\n'
+             '        symbols[Group1]= [ Control_R ]\n    };', t)
+elif mode == 'range':
+    # the keycode range shrinks: maximum 255 -> 247, keycodes 248..255 dropped
+    t = sub1(r'maximum = 255;', 'maximum = 247;', t)
+    t = re.sub(r'\n    <I2(4[89]|5[0-5])> = \d+;', '', t)
+    t = re.sub(r'\n    key <I2(4[89]|5[0-5])> \{[^\n]*\};', '', t)
+else:
+    sys.exit('xkbcomp_edit: bad mode ' + mode)
+open(dst, 'w').write(t)
+EOF
+}
+
+# an upload trace (x11trace -m big) -> DIR/N-Request.bin (each XKB request after
+# UseExtension, header included, byte-exact) + DIR/atoms.txt (xkbcomp's
+# InternAtom replies "0xVALUE NAME", in order)
+xkbcomp_extract() { # TRACE DIR
+    python3 - "$@" <<'EOF'
+import os, re, sys
+trace, out = sys.argv[1], sys.argv[2]
+os.makedirs(out, exist_ok=True)
+atoms, n = [], 0
+for line in open(trace):
+    line = line.rstrip('\n')
+    m = re.match(r'^\d+:>:[0-9a-f]+:\d+: Reply to InternAtom: atom=(0x[0-9a-f]+)\("(.*)"\)$', line)
+    if m:
+        atoms.append((m.group(1), m.group(2)))
+        continue
+    m = re.match(r'^\d+:<:[0-9a-f]+:\s*(\d+): XKEYBOARD-Request\((\d+),(\d+)\): (\w+) '
+                 r'.*unparsed-data=([0-9a-fx,]+);$', line)
+    if m and int(m.group(3)) != 0:
+        size, major, minor = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        body = bytes(int(x, 16) for x in m.group(5).strip(',').split(','))
+        req = bytes([major, minor, (size // 4) & 0xff, (size // 4) >> 8]) + body
+        assert len(req) == size, (m.group(4), len(req), size)
+        n += 1
+        with open(os.path.join(out, '%d-%s.bin' % (n, m.group(4))), 'wb') as f:
+            f.write(req)
+with open(os.path.join(out, 'atoms.txt'), 'w') as f:
+    for a, name in atoms:
+        f.write('%s %s\n' % (a, name))
+EOF
+}
+
+# probe output -> its '> total' section without the raw event hex
+total_of() {
+    sed -n '/^> total$/,$p' "$1"
+}
+
+gen_steps() {
+    local out=$TD/xorg-xkbcomp-steps.txt reqs=$TD/xkbcomp-requests
+    rm -rf "$reqs"
+    mkdir -p "$reqs"
+    fresh gb
+    xkbcomp -xkb ":$DISP" "$WORK/gb.xkb" >/dev/null 2>&1
+    stop_x
+    fresh us,ru grp:alt_shift_toggle
+    xkbcomp -xkb ":$DISP" "$WORK/usru.xkb" >/dev/null 2>&1
+    stop_x
+    {
+        echo "# xkbcomp uploads replayed one request at a time against Xorg (issue #171 phase 4):"
+        echo "# Xvfb -noreset, fresh server per run, every case on layout=gb"
+        versions
+        echo "# per case CASE:"
+        echo "#  1. record: fresh server, setxkbmap -rules evdev -model pc105 -layout gb, then"
+        echo "#     x11trace -n -m 1000000 -- xkbcomp CASE.xkb \$DISPLAY. Every XKB request after"
+        echo "#     UseExtension is saved byte-exact as xkbcomp-requests/CASE/N-Request.bin, xkbcomp's"
+        echo "#     InternAtom replies as xkbcomp-requests/CASE/atoms.txt ('0xATOM NAME', in order)."
+        echo "#  2. replay: fresh server, same setxkbmap, then tools/xkb-mutation-probe.c -x with steps"
+        echo "#     atoms:atoms.txt (the actor interns the names in order and checks every atom has the"
+        echo "#     recorded value, so the recorded requests mean the same here), then xreq:N-Request.bin"
+        echo "#     for each request (sent raw by the actor after its XkbUseExtension), then total"
+        echo "#     (used by the check below, not listed)."
+        echo "#  3. check: fresh server, same setxkbmap, the probe runs xkbcomp CASE.xkb itself (run:);"
+        echo "#     its total delta must equal the replay's (the script fails otherwise)."
+        echo "# CASE.xkb = \`xkbcomp -xkb\` dump of that fresh gb server, edited (the diff is listed), or"
+        echo "# for usru the unedited dump of a fresh 'us,ru' + grp:alt_shift_toggle server."
+        echo "# After each request: its result, the events on the probe's listeners, the XkbGetMap delta"
+        echo "# (grammar as in xorg-xkb-change-keyboard-mapping.txt) and, from -x, the delta of"
+        echo "# GetCompatMap / GetIndicatorMap / GetNames / GetGeometry lines ('-'/'+' + the line;"
+        echo "# grammar as in xorg-xkb-pristine.txt, whose layout=gb case is the state before)."
+        echo "# In raw event hex the sequence number (bytes 2-3) and time (4-7) differ between runs, and"
+        echo "# NewKeyboardNotify bytes 18-31 are uninitialised stack in Xorg (differ too). A level name"
+        echo "# printed '?' is one Xorg has not initialised (a type SetMap gave more levels, until SetNames"
+        echo "# writes its level names; see take_xsnap in the probe)."
+        for c in identity swap newtype droptype compat capsctrl explicit range usru; do
+            local src=$WORK/gb.xkb
+            [ "$c" = usru ] && src=$WORK/usru.xkb
+            xkbcomp_edit "$c" "$src" "$WORK/$c.xkb"
+            fresh gb
+            x11trace -n -d ":$DISP" -D ":$PROXY" -m 1000000 -o "$WORK/$c.trace" -- \
+                xkbcomp "$WORK/$c.xkb" ":$PROXY" >"$WORK/$c.xkbcomp.log" 2>&1 || true
+            stop_x
+            xkbcomp_extract "$WORK/$c.trace" "$reqs/$c"
+            local steps=("atoms:$reqs/$c/atoms.txt")
+            for f in $(ls "$reqs/$c" | grep '\.bin$' | sort -n); do
+                steps+=("xreq:$reqs/$c/$f")
+            done
+            fresh gb
+            "$PROBE" -d ":$DISP" -x "${steps[@]}" total >"$WORK/$c.replay"
+            stop_x
+            fresh gb
+            "$PROBE" -d ":$DISP" -x "run:xkbcomp $WORK/$c.xkb :$DISP >/dev/null 2>&1" total \
+                >"$WORK/$c.direct"
+            stop_x
+            if ! diff <(total_of "$WORK/$c.replay") <(total_of "$WORK/$c.direct") >"$WORK/$c.cmp"; then
+                echo "xkbcomp-steps: case $c: replay and direct xkbcomp totals differ:" >&2
+                cat "$WORK/$c.cmp" >&2
+                exit 1
+            fi
+            echo "## case $c"
+            if [ "$c" = usru ]; then
+                echo "# uploaded: the us,ru dump unedited"
+            else
+                echo "# edit of the gb dump:"
+                diff "$WORK/gb.xkb" "$WORK/$c.xkb" | sed 's/^/# /' || true
+            fi
+            echo "# xkbcomp requests (seq bytes decoded-request):"
+            decode_trace "$WORK/$c.trace" xkb | sed 's/^/#   /'
+            # the total only served the check: it is the sum of the steps
+            sed -e "s|$reqs/||g" -e '/^> total$/,$d' "$WORK/$c.replay"
+        done
+    } >"$out"
+}
+
 targets=("$@")
-[ ${#targets[@]} -eq 0 ] && targets=(ckm smm xkbcomp repeat)
+[ ${#targets[@]} -eq 0 ] && targets=(ckm smm xkbcomp repeat pristine steps)
 for t in "${targets[@]}"; do
     "gen_$t"
 done
