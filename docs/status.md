@@ -33,6 +33,33 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-26 XKB SetNames + SetGeometry on the model (#171 phase 4e,
+  branch `feat/171-phase4-xkbcomp`):** `kms::xkb_desc::set_names` ports
+  `ProcXkbSetNames` / `_XkbSetNamesCheck` / `_XkbSetNames` literally (the
+  one-more-word bounds check before every component name, sent or not; atom
+  validation through the core loop's atom table → BadAtom; type, level,
+  indicator, vmod, group, key, alias and radio-group names; `XkbAllocNames`'
+  level-name arrays and counts) with Xorg's NamesNotify field slips
+  (`nLevelNames` = the request's nTypes, `changedVirtualMods` overwritten by
+  the group mask, `changedGroupNames` never set) and the IndicatorNames
+  ExtensionDeviceNotify. `set_geometry` ports `_CheckSetGeom`'s whole walk
+  (counted strings, colors/shapes/sections/rows/keys/doodads/overlays/aliases
+  with the allocators' name lookups) but keeps only the geometry **name**
+  (review decision): NamesNotify(GeometryName) when it changes, then
+  NewKeyboardNotify(Geometry); GetGeometry still answers found=False. The
+  keyboard LEDs now follow the indicators by index (as Xorg's drivers do), so
+  a renamed indicator keeps its LED; duplicate indicator names are written
+  apart in the cooking keymap. New `XkbNamesNotify` encoder; the probe's
+  GetNames parser had bits 9–12 permuted (harmless while all were present).
+  Goldens: all 5 steps of all 9 xkbcomp uploads on one server, 58 new
+  SetNames/SetGeometry vectors in `xorg-xkb-setmap-errors.txt` (incl. 3 odd
+  requests Xorg accepts), new `xorg-xkb-setnames.txt` (11 behaviour cases).
+  One captured deviation from the 21.1.22 source: Xvfb 21.1.24 refuses an
+  overlay row over row == num_rows. vng A/B `tools/vng-scenarios/
+  xkbcomp-upload.sh` (dump → upload → dump round trip, then swapped
+  <AC01>/<AC02> + Caps as Control, keys through Xlib-XKB and xkbcommon-x11)
+  matches Xorg. Open: HW gate.
+
 - **2026-09-26 XKB SetCompatMap + SetIndicatorMap on the model (#171 phase
   4d, branch `feat/171-phase4-xkbcomp`):** `kms::xkb_desc::set_compat` ports
   `_XkbSetCompatMap` (dry-run checks, interprets stored from firstSI with the

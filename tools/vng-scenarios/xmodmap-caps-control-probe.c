@@ -7,7 +7,8 @@
  *                    XkbLookupKeySym, XLookupString) and every XkbMapNotify /
  *                    MappingNotify, re-reading the keymap via XkbGetMap on
  *                    each XkbMapNotify. Runs until killed (SIGTERM).
- *   probe xkbmap   — one-shot XkbGetMap dump of keycode 66 / 38.
+ *   probe xkbmap [TAG [KC..]] — one-shot XkbGetMap dump of keycodes 66 and
+ *                    37, or of the keycodes given.
  *   probe xkbcommon — builds a keymap with xkb_x11_keymap_new_from_device (what
  *                    GTK/Qt do) and prints keycode 66's level-1 keysym and the
  *                    modifiers it sets when pressed, whether press+release of
@@ -50,6 +51,11 @@ static void dump_xkb_key(Display *d, XkbDescPtr xkb, const char *tag, int kc)
     printf("\n");
 }
 
+/* The keycodes dump_xkbmap prints: 66 and 37 unless `probe xkbmap TAG KC..`
+ * names others. */
+static int dump_kcs[16] = {66, 37};
+static int n_dump_kcs = 2;
+
 static void dump_xkbmap(Display *d, const char *tag)
 {
     XkbDescPtr xkb = XkbGetMap(d, XkbAllMapComponentsMask, XkbUseCoreKbd);
@@ -57,8 +63,8 @@ static void dump_xkbmap(Display *d, const char *tag)
         printf("%s XkbGetMap failed\n", tag);
         return;
     }
-    dump_xkb_key(d, xkb, tag, 66);
-    dump_xkb_key(d, xkb, tag, 37);
+    for (int i = 0; i < n_dump_kcs; i++)
+        dump_xkb_key(d, xkb, tag, dump_kcs[i]);
     XkbFreeKeyboard(xkb, 0, True);
 }
 
@@ -227,8 +233,15 @@ int main(int argc, char **argv)
     setvbuf(stdout, NULL, _IOLBF, 0);
     const char *mode = argc > 1 ? argv[1] : "listen";
     if (!strcmp(mode, "listen")) return listen_mode();
-    if (!strcmp(mode, "xkbmap")) return xkbmap_mode(argc > 2 ? argv[2] : "xkbmap");
+    if (!strcmp(mode, "xkbmap")) {
+        if (argc > 3) {
+            n_dump_kcs = 0;
+            for (int i = 3; i < argc && n_dump_kcs < 16; i++)
+                dump_kcs[n_dump_kcs++] = atoi(argv[i]);
+        }
+        return xkbmap_mode(argc > 2 ? argv[2] : "xkbmap");
+    }
     if (!strcmp(mode, "xkbcommon")) return xkbcommon_mode();
-    fprintf(stderr, "usage: %s listen|xkbmap [tag]|xkbcommon\n", argv[0]);
+    fprintf(stderr, "usage: %s listen|xkbmap [tag [kc..]]|xkbcommon\n", argv[0]);
     return 2;
 }

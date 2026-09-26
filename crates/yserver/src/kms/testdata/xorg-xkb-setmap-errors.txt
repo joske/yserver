@@ -1,15 +1,20 @@
 # Xorg's errors for malformed XKB SetMap requests and for XKB requests without
-# XkbUseExtension (issue #171 phase 4c), and for malformed SetCompatMap /
-# SetIndicatorMap requests (phase 4d): Xvfb -noreset, layout=gb
+# XkbUseExtension (issue #171 phase 4c), for malformed SetCompatMap /
+# SetIndicatorMap requests (phase 4d) and for malformed SetNames / SetGeometry
+# requests (phase 4e): Xvfb -noreset, layout=gb
 # server: X.Org version 21.1.24 (xdpyinfo); `Xvfb -version` -> "Unrecognized option: -version" (not supported by this build)
 # pacman -Q: xkeyboard-config 2.48-1 xorg-server-xvfb 21.1.24-1
 # setxkbmap -rules evdev -model pc105 -layout gb; then one tools/xkb-mutation-probe.c run per
 # request (fresh connections each time), sending xkb-setmap-errors/NAME.bin raw:
-#   xreq:  on the actor after its XkbUseExtension; xreq0: on a connection without it.
+#   xreq:  on the actor after its XkbUseExtension; xreq0: on a connection without it;
+#   atoms:xkbcomp-requests/identity/atoms.txt first for the SetNames / SetGeometry requests
+#   (built from the recorded identity upload, whose atoms they use).
 # Each request is built by this script from xkbcomp-requests/identity/1-SetMap.bin,
-# 2-SetIndicatorMap.bin or 3-SetCompatMap.bin (the '## NAME' line says how). Lines:
-# '= error=CODE value=V major=M minor=N' (major is this server's XKB opcode), then the
-# (empty) XkbGetMap delta and coremodmap as usual.
+# 2-SetIndicatorMap.bin, 3-SetCompatMap.bin, 4-SetNames.bin or 5-SetGeometry.bin (the
+# '## NAME' line says how). Lines: '= error=CODE value=V major=M minor=N' (major is this
+# server's XKB opcode) or '= ok' for the few requests Xorg accepts, then the (empty)
+# XkbGetMap delta and coremodmap as usual. The accepted ones come last (they change
+# only names on this one server).
 ## access: the recorded identity SetMap, from a client that never called XkbUseExtension
 > xreq0:xkb-setmap-errors/access.bin
 = error=10 value=0 major=135 minor=9
@@ -185,4 +190,412 @@ coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6
 ## indmap-first-bad: indicator 2 whichGroups 0x30 and indicator 7 whichMods 0x60: the first is reported
 > xreq:xkb-setmap-errors/indmap-first-bad.bin
 = error=2 value=33554480 major=135 minor=14
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## names-access: the recorded identity SetNames, from a client that never called XkbUseExtension
+> xreq0:xkb-setmap-errors/names-access.bin
+= error=10 value=0 major=135 minor=18
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## names-short: a 24-byte SetNames (xkbSetNamesReq is 28)
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/names-short.bin
+= error=16 value=0 major=135 minor=18
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## names-which: the identity SetNames with which | 0x4000 (not a names component)
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/names-which.bin
+= error=2 value=16793600 major=135 minor=18
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## names-which0: which 0, one data word
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/names-which0.bin
+= error=16 value=8 major=135 minor=18
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## names-which0-nodata: which 0, no data
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/names-which0-nodata.bin
+= error=16 value=0 major=135 minor=18
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## names-keycodes-only: which KeycodesName, just its atom (Xorg wants one more word before each unsent component)
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/names-keycodes-only.bin
+= error=16 value=0 major=135 minor=18
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## names-keycodes-badatom: the identity SetNames with keycodes name atom 0x7fffffff
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/names-keycodes-badatom.bin
+= error=5 value=2147483647 major=135 minor=18
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## names-geometry-badatom: the identity SetNames with geometry name atom 0x7fffffff
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/names-geometry-badatom.bin
+= error=5 value=2147483647 major=135 minor=18
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## names-types-zero: KeyTypeNames with nTypes 0
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/names-types-zero.bin
+= error=2 value=33554432 major=135 minor=18
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## names-types-range: KeyTypeNames 4+24 past num_types 27
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/names-types-range.bin
+= error=2 value=50599963 major=135 minor=18
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## names-types-required: KeyTypeNames 3+1 (a required type)
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/names-types-required.bin
+= error=10 value=67108867 major=135 minor=18
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## names-types-badatom: KeyTypeNames 4+2, the second atom 0x7fffffff
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/names-types-badatom.bin
+= error=5 value=2147483647 major=135 minor=18
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## names-types-stale: KeyTypeNames 4+1 named ONE_LEVEL, KTLevelNames 0+27 with no data left: BadLength keeps the errorValue
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/names-types-stale.bin
+= error=16 value=83886080 major=135 minor=18
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## names-ktlevels-zero: KTLevelNames with nKTLevels 0
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/names-ktlevels-zero.bin
+= error=2 value=83886080 major=135 minor=18
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## names-ktlevels-range: KTLevelNames 1+27 past num_types 27
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/names-ktlevels-range.bin
+= error=2 value=100735771 major=135 minor=18
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## names-ktlevels-width: the identity SetNames with type 5 level width 3 (it has 2 levels)
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/names-ktlevels-width.bin
+= error=8 value=117768707 major=135 minor=18
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## names-ktlevels-badatom: the identity SetNames with type 9 level 1 name atom 0x7fffffff
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/names-ktlevels-badatom.bin
+= error=5 value=2147483647 major=135 minor=18
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## names-indicators-zero: IndicatorNames with indicators 0
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/names-indicators-zero.bin
+= error=8 value=8 major=135 minor=18
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## names-indicators-badatom: the identity SetNames with indicator 3 name atom 0x7fffffff
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/names-indicators-badatom.bin
+= error=5 value=2147483647 major=135 minor=18
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## names-vmods-zero: VirtualModNames with virtualMods 0
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/names-vmods-zero.bin
+= error=8 value=9 major=135 minor=18
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## names-groups-zero: GroupNames with groupNames 0
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/names-groups-zero.bin
+= error=8 value=10 major=135 minor=18
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## names-groups-highbit: GroupNames 0x11 with two words (bit 4 is past the 4 groups)
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/names-groups-highbit.bin
+= error=16 value=9 major=135 minor=18
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## names-keys-min: KeyNames 7+1
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/names-keys-min.bin
+= error=2 value=185073671 major=135 minor=18
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## names-keys-range: KeyNames 250+7 past maxKeyCode
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/names-keys-range.bin
+= error=2 value=218102279 major=135 minor=18
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## names-keys-zero: KeyNames 8+0
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/names-keys-zero.bin
+= error=2 value=218040320 major=135 minor=18
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## names-rg-zero: RGNames with nRadioGroups 0
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/names-rg-zero.bin
+= error=2 value=218103808 major=135 minor=18
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## names-rg-badatom: RGNames 1, atom 0x7fffffff
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/names-rg-badatom.bin
+= error=5 value=2147483647 major=135 minor=18
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## names-length: the identity SetNames with 4 bytes too many (length + 1)
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/names-length.bin
+= error=16 value=573 major=135 minor=18
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## names-truncated: the identity SetNames without its last key alias (nKeyAliases 73 kept)
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/names-truncated.bin
+= error=16 value=0 major=135 minor=18
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## geom-access: the recorded identity SetGeometry, from a client that never called XkbUseExtension
+> xreq0:xkb-setmap-errors/geom-access.bin
+= error=10 value=0 major=135 minor=20
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## geom-short: a 24-byte SetGeometry (xkbSetGeometryReq is 28)
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/geom-short.bin
+= error=16 value=0 major=135 minor=20
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## geom-name-badatom: the identity SetGeometry named 0x7fffffff
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/geom-name-badatom.bin
+= error=5 value=2147483647 major=135 minor=20
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## geom-font-overrun: label font length 0x7ff0, past the request
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/geom-font-overrun.bin
+= error=2 value=0 major=135 minor=20
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## geom-colors-one: nColors 1
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/geom-colors-one.bin
+= error=2 value=16908289 major=135 minor=20
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## geom-basecolor: baseColorNdx 7 > nColors 6
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/geom-basecolor.bin
+= error=8 value=50724871 major=135 minor=20
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## geom-labelcolor: labelColorNdx 7 > nColors 6
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/geom-labelcolor.bin
+= error=8 value=50724871 major=135 minor=20
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## geom-samecolor: labelColorNdx = baseColorNdx = 1
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/geom-samecolor.bin
+= error=8 value=67174401 major=135 minor=20
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## geom-color-dup: color 5 spec "black", as color 0
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/geom-color-dup.bin
+= error=8 value=84279301 major=135 minor=20
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## geom-shapes-zero: nShapes 0
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/geom-shapes-zero.bin
+= error=2 value=100663296 major=135 minor=20
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## geom-shape-dup: shape 1 named as shape 0
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/geom-shape-dup.bin
+= error=8 value=118358031 major=135 minor=20
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## geom-shape-none: shape 0 named None
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/geom-shape-none.bin
+= error=11 value=0 major=135 minor=20
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## geom-section-badatom: section 0 named 0x7fffffff
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/geom-section-badatom.bin
+= error=5 value=2147483647 major=135 minor=20
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## geom-section-none: section 2 named None
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/geom-section-none.bin
+= error=5 value=0 major=135 minor=20
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## geom-key-shape: section 1 row 0 key 3 shapeNdx 15 = nShapes
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/geom-key-shape.bin
+= error=8 value=269418511 major=135 minor=20
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## geom-key-color: section 3 row 0 key 0 colorNdx 6 = nColors
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/geom-key-color.bin
+= error=8 value=285605894 major=135 minor=20
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## geom-doodad-type: doodad 0 of type 9
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/geom-doodad-type.bin
+= error=2 value=1325400073 major=135 minor=20
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## geom-doodad-badatom: doodad 0 named 0x7fffffff
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/geom-doodad-badatom.bin
+= error=5 value=2147483647 major=135 minor=20
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## geom-doodad-shape: doodad 0 (solid) shapeNdx 15
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/geom-doodad-shape.bin
+= error=8 value=1091502095 major=135 minor=20
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## geom-indicator-color: doodad 1 (indicator) onColorNdx 6
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/geom-indicator-color.bin
+= error=8 value=1124466694 major=135 minor=20
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## geom-text-color: doodad 4 (text) colorNdx 6
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/geom-text-color.bin
+= error=8 value=1107689478 major=135 minor=20
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## geom-overlay-rowunder: section 1 overlay row 0 over row 6 (the section has 5)
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/geom-overlay-rowunder.bin
+= error=8 value=536872198 major=135 minor=20
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## geom-overlay-pastlast: section 1 overlay row 0 over row 5 (past the last), one key
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/geom-overlay-pastlast.bin
+= error=8 value=536872197 major=135 minor=20
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## geom-overlay-nokey: section 1 overlay row 0 over row 0, key under <ZZZZ> (not in row 0)
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/geom-overlay-nokey.bin
+= error=8 value=553648128 major=135 minor=20
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## geom-alias-empty: key alias 1 with an empty alias name
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/geom-alias-empty.bin
+= error=11 value=0 major=135 minor=20
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## geom-truncated: the identity SetGeometry cut after its first two sections (counts kept)
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/geom-truncated.bin
+= error=16 value=0 major=135 minor=20
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## names-compat-only: which CompatName, just its atom (the last component: accepted)
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/names-compat-only.bin
+= ok
+e xkb NamesNotify dev=3 changed=0x0020 types=0+0 levelNames=0+0 nRadioGroups=0 nKeyAliases=0 changedGroupNames=0x00 changedVMods=0x0000 keys=0+0 changedIndicators=0x00000000 raw=55060d0070795a08030020000000000000000000000000000000000000000000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## geom-trailing: the identity SetGeometry with 8 bytes too many (no length check: accepted)
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/geom-trailing.bin
+= ok
+e xkb NamesNotify dev=3 changed=0x0002 types=0+0 levelNames=0+0 nRadioGroups=0 nKeyAliases=0 changedGroupNames=0x00 changedVMods=0x0000 keys=0+0 changedIndicators=0x00000000 raw=55060d0076795a08030002000000000000000000000000000000000000000000
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.20 changed=0x0002 raw=55000d0076795a08030308ff08ff871402000000000000000000000000000000
+e xkb NewKeyboardNotify dev=5 oldDev=5 min=8 max=255 oldMin=8 oldMax=255 req=135.20 changed=0x0002 raw=55000d0076795a08050508ff08ff871402000000000000000000000000000000
+e xkb NewKeyboardNotify dev=7 oldDev=7 min=8 max=255 oldMin=8 oldMax=255 req=135.20 changed=0x0002 raw=55000d0076795a08070708ff08ff871402000000000000000000000000000000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## geom-overlay-ok: section 1 overlay row 0 over row 0, key <FK01> under <TLDE>
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setmap-errors/geom-overlay-ok.bin
+= ok
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.20 changed=0x0002 raw=55000d007d795a08030308ff08ff871402000f27fd7f0000c0ae52aa52560000
+e xkb NewKeyboardNotify dev=5 oldDev=5 min=8 max=255 oldMin=8 oldMax=255 req=135.20 changed=0x0002 raw=55000d007d795a08050508ff08ff871402000f27fd7f0000c0ae52aa52560000
+e xkb NewKeyboardNotify dev=7 oldDev=7 min=8 max=255 oldMin=8 oldMax=255 req=135.20 changed=0x0002 raw=55000d007d795a08070708ff08ff871402000f27fd7f0000c0ae52aa52560000
 coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0

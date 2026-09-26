@@ -258,6 +258,52 @@ pub(crate) fn send_xkb_compat_map_notify(
     });
 }
 
+/// `XkbSendNamesNotify`: to every XKB-initialised client whose names
+/// interest includes a changed name (`namesNotifyMask & changed`).
+pub(crate) fn send_xkb_names_notify(
+    state: &mut ServerState,
+    xkb_event_base: u8,
+    notify: x11::XkbNamesNotify,
+) {
+    let recipients =
+        crate::core_loop::xkb_select::interest_recipients(state, |i| i.names & notify.changed != 0);
+    let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
+        let _ = x11::write_xkb_names_notify(buf, order, seq, xkb_event_base, notify);
+    });
+}
+
+/// `_XkbSetNames`' ExtensionDeviceNotify after new indicator names: reason
+/// IndicatorNames for the core keyboard's default LED feedback (class
+/// KbdFeedbackClass, id 0), `leds_defined` = names ∪ maps present,
+/// `led_state` = the lit indicators.
+pub(crate) fn send_indicator_names_change(
+    state: &mut ServerState,
+    xkb_event_base: u8,
+    leds_defined: u32,
+    led_state: u32,
+) {
+    let notify = x11::XkbExtensionDeviceNotify {
+        device_id: XKB_DEVICE_ID,
+        reason: XI_INDICATOR_NAMES_MASK,
+        led_class: 0,
+        led_id: 0,
+        leds_defined,
+        led_state,
+        first_btn: 0,
+        n_btns: 0,
+        supported: XI_ALL_FEATURES_MASK,
+        unsupported: 0,
+    };
+    let recipients = crate::core_loop::xkb_select::interest_recipients(state, |i| {
+        i.extension_device & XI_INDICATOR_NAMES_MASK != 0
+    });
+    let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
+        let _ = x11::write_xkb_extension_device_notify(buf, order, seq, xkb_event_base, notify);
+    });
+}
+
+/// `XkbXI_IndicatorNamesMask`.
+const XI_INDICATOR_NAMES_MASK: u16 = 1 << 2;
 /// `XkbXI_IndicatorMapsMask` / `XkbXI_IndicatorStateMask` /
 /// `XkbXI_AllFeaturesMask` (ExtensionDeviceNotify reason and features).
 const XI_INDICATOR_MAPS_MASK: u16 = 1 << 3;

@@ -12,20 +12,26 @@ use super::{
 /// `XkbAllMapComponentsMask`.
 const ALL_MAP_COMPONENTS: u16 = 0xff;
 /// `XkbAllNamesMask`.
-const ALL_NAMES: u32 = 0x3fff;
-/// GetNames parts (XKB.h `Xkb*NamesMask`); note the section order in a
-/// reply differs from the bit order for the last five.
-const INDICATOR_NAMES: u32 = 1 << 8;
-const KEY_NAMES: u32 = 1 << 9;
-const KEY_ALIASES: u32 = 1 << 10;
-const VIRTUAL_MOD_NAMES: u32 = 1 << 11;
-const GROUP_NAMES: u32 = 1 << 12;
-const RG_NAMES: u32 = 1 << 13;
+pub(crate) const ALL_NAMES: u32 = 0x3fff;
+/// GetNames / SetNames parts (XKB.h `Xkb*NamesMask`); note the section
+/// order in a reply differs from the bit order for the last five.
+pub(crate) const GEOMETRY_NAME: u32 = 1 << 1;
+pub(crate) const KEY_TYPE_NAMES: u32 = 1 << 6;
+pub(crate) const KT_LEVEL_NAMES: u32 = 1 << 7;
+pub(crate) const INDICATOR_NAMES: u32 = 1 << 8;
+pub(crate) const KEY_NAMES: u32 = 1 << 9;
+pub(crate) const KEY_ALIASES: u32 = 1 << 10;
+pub(crate) const VIRTUAL_MOD_NAMES: u32 = 1 << 11;
+pub(crate) const GROUP_NAMES: u32 = 1 << 12;
+pub(crate) const RG_NAMES: u32 = 1 << 13;
 /// `XkbNoIndicator`.
 const NO_INDICATOR: u8 = 0xff;
 /// X11 error codes.
 pub(crate) const BAD_VALUE: u8 = 2;
+pub(crate) const BAD_ATOM: u8 = 5;
 pub(crate) const BAD_MATCH: u8 = 8;
+pub(crate) const BAD_ACCESS: u8 = 10;
+pub(crate) const BAD_ALLOC: u8 = 11;
 pub(crate) const BAD_LENGTH: u8 = 16;
 
 /// An X error a request draws (Xorg's return code and `errorValue`).

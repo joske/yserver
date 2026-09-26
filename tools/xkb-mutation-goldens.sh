@@ -14,6 +14,8 @@
 #   crates/yserver/src/kms/testdata/xkb-setmap-resize/NAME.bin
 #   crates/yserver/src/kms/testdata/xorg-xkb-setcompat.txt
 #   crates/yserver/src/kms/testdata/xkb-setcompat/NAME.bin
+#   crates/yserver/src/kms/testdata/xorg-xkb-setnames.txt
+#   crates/yserver/src/kms/testdata/xkb-setnames/NAME.bin
 #
 # Every value in those files is Xvfb output recorded by tools/xkb-mutation-probe.c
 # (or x11trace). Never hand-edit them; rerun this script.
@@ -23,7 +25,7 @@
 # (x11trace's fake display); both must be free. Only the Xvfb this script
 # starts is ever killed (by pid).
 #
-# usage: tools/xkb-mutation-goldens.sh [ckm|smm|xkbcomp|repeat|pristine|steps|errors|resize|setcompat ...]   (default: all)
+# usage: tools/xkb-mutation-goldens.sh [ckm|smm|xkbcomp|repeat|pristine|steps|errors|resize|setcompat|setnames ...]   (default: all)
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -764,27 +766,290 @@ with open(os.path.join(out, 'cases.txt'), 'a') as f:
 EOF
 }
 
+# ---------------------------------------------------------------------------
+# SetNames / SetGeometry requests (phase 4e), built from the recorded identity
+# SetNames and SetGeometry (xkbcomp-requests/identity/4-SetNames.bin,
+# 5-SetGeometry.bin), whose atoms mean what they mean after the probe's
+# atoms:xkbcomp-requests/identity/atoms.txt step. MODE errors: one request per
+# ProcXkbSetNames / _XkbSetNamesCheck / ProcXkbSetGeometry / _CheckSetGeom
+# rejection (plus the few requests Xorg's odd checks accept), appended to
+# DIR/cases.txt (STEP\tNAME\tDESCRIPTION; xreqa = atoms step, then xreq:).
+# MODE semantics: what accepted requests do, DIR/cases.txt =
+# NAME\tSTEPS\tDESCRIPTION (REQ in STEPS = the case's request).
+names_geometry_requests() { # MODE SRCDIR DIR
+    python3 - "$@" <<'EOF'
+import os, struct, sys
+mode, src, out = sys.argv[1], sys.argv[2], sys.argv[3]
+os.makedirs(out, exist_ok=True)
+nm = open(os.path.join(src, '4-SetNames.bin'), 'rb').read()
+gm = open(os.path.join(src, '5-SetGeometry.bin'), 'rb').read()
+assert nm[1] == 18 and gm[1] == 20
+def u16(b, o): return b[o] | b[o+1] << 8
+def u32(b, o): return struct.unpack_from('<I', b, o)[0]
+def words(*atoms): return b''.join(struct.pack('<I', a) for a in atoms)
+def pad(x): return x + bytes((-len(x)) % 4)
+BAD = 0x7fffffff   # never a valid atom
+
+# --- SetNames: xkbSetNamesReq deviceSpec@4 virtualMods@6 which@8 firstType@12
+# nTypes@13 firstKTLevel@14 nKTLevels@15 indicators@16 groupNames@20
+# nRadioGroups@21 firstKey@22 nKeys@23 nKeyAliases@24 pad@25
+# totalKTLevelNames@26, then the parts in which-bit order.
+H = dict(dev=u16(nm, 4), vmods=u16(nm, 6), which=u32(nm, 8), ft=nm[12], nt=nm[13],
+         fkl=nm[14], nkl=nm[15], ind=u32(nm, 16), gn=nm[20], nrg=nm[21], fk=nm[22],
+         nk=nm[23], nka=nm[24], tkl=u16(nm, 26))
+p = 28
+P = {}
+comps = []
+for bit in range(6):
+    if H['which'] & (1 << bit):
+        comps.append(u32(nm, p)); p += 4
+P['comps'] = comps
+P['types'] = [u32(nm, p + 4 * i) for i in range(H['nt'])]; p += 4 * H['nt']
+widths = list(nm[p:p + H['nkl']]); p += (H['nkl'] + 3) & ~3
+levels = []
+for w in widths:
+    levels.append([u32(nm, p + 4 * i) for i in range(w)]); p += 4 * w
+P['widths'], P['levels'] = widths, levels
+ni = bin(H['ind']).count('1'); P['ind'] = [u32(nm, p + 4 * i) for i in range(ni)]; p += 4 * ni
+nv = bin(H['vmods']).count('1'); P['vmods'] = [u32(nm, p + 4 * i) for i in range(nv)]; p += 4 * nv
+ng = bin(H['gn']).count('1'); P['groups'] = [u32(nm, p + 4 * i) for i in range(ng)]; p += 4 * ng
+P['keys'] = nm[p:p + 4 * H['nk']]; p += 4 * H['nk']
+P['aliases'] = nm[p:p + 8 * H['nka']]; p += 8 * H['nka']
+assert p == len(nm), (p, len(nm))
+def names(h, parts, extra=b'', length=None):
+    """The request: header fields from h, then the given parts, in order."""
+    body = b''
+    body += words(*parts.get('comps', []))
+    body += words(*parts.get('types', []))
+    if 'widths' in parts:
+        body += pad(bytes(parts['widths']))
+        body += b''.join(words(*l) for l in parts['levels'])
+    for k in ('ind', 'vmods', 'groups'):
+        body += words(*parts.get(k, []))
+    body += parts.get('keys', b'') + parts.get('aliases', b'') + words(*parts.get('rg', []))
+    body += extra
+    g = lambda k: h.get(k, 0)
+    hdr = struct.pack('<HHIBBBBIBBBBBxH', g('dev') or 0x100, g('vmods'), g('which'), g('ft'), g('nt'),
+                      g('fkl'), g('nkl'), g('ind'), g('gn'), g('nrg'), g('fk'), g('nk'), g('nka'), g('tkl'))
+    req = hdr + body
+    n = (len(req) + 4) // 4 if length is None else length
+    return bytes([nm[0], 18, n & 0xff, n >> 8]) + req
+assert names(H, P) == nm, 'rebuild SetNames'
+
+# --- SetGeometry: xkbSetGeometryReq deviceSpec@4 nShapes@6 nSections@7 name@8
+# widthMM@12 heightMM@14 nProperties@16 nColors@18 nDoodads@20 nKeyAliases@22
+# baseColorNdx@24 labelColorNdx@25 pad@26, then label font, properties,
+# colors (counted strings), shapes, sections, doodads, key aliases.
+G = dict(dev=u16(gm, 4), nshapes=gm[6], nsections=gm[7], name=u32(gm, 8), w=u16(gm, 12),
+         h=u16(gm, 14), nprops=u16(gm, 16), ncolors=u16(gm, 18), ndoodads=u16(gm, 20),
+         naliases=u16(gm, 22), base=gm[24], label=gm[25])
+q = 28
+def cstr(at):
+    n = u16(gm, at)
+    return gm[at + 2:at + 2 + n], at + ((n + 2 + 3) & ~3)
+font, q = cstr(q)
+props = []
+for _ in range(G['nprops']):
+    k, q = cstr(q); v, q = cstr(q); props.append((k, v))
+colors = []
+for _ in range(G['ncolors']):
+    c, q = cstr(q); colors.append(c)
+shapes = []
+for _ in range(G['nshapes']):
+    s0 = q; no = gm[q + 4]; q += 8
+    for _ in range(no):
+        q += 4 + 4 * gm[q]
+    shapes.append(bytearray(gm[s0:q]))
+sections = []
+for _ in range(G['nsections']):
+    s0 = q; nr, nd, no = gm[q + 15], gm[q + 16], gm[q + 17]
+    assert nd == 0 and no == 0, 'identity sections carry rows only'
+    q += 20
+    for _ in range(nr):
+        q += 8 + 8 * gm[q + 4]
+    sections.append(bytearray(gm[s0:q]))
+doodads = []
+for _ in range(G['ndoodads']):
+    d0 = q; t = gm[q + 4]; q += 20
+    if t == 3:
+        _, q = cstr(q); _, q = cstr(q)
+    if t == 5:
+        _, q = cstr(q)
+    doodads.append(bytearray(gm[d0:q]))
+aliases = [bytearray(gm[q + 8 * i:q + 8 * i + 8]) for i in range(G['naliases'])]; q += 8 * G['naliases']
+assert q == len(gm), (q, len(gm))
+def counted(s): return pad(struct.pack('<H', len(s)) + s)
+def geometry(g, font=font, props=props, colors=colors, shapes=shapes, sections=sections,
+             doodads=doodads, aliases=aliases, extra=b'', length=None):
+    body = counted(font) + b''.join(counted(k) + counted(v) for k, v in props)
+    body += b''.join(counted(c) for c in colors)
+    body += b''.join(bytes(s) for s in shapes) + b''.join(bytes(s) for s in sections)
+    body += b''.join(bytes(d) for d in doodads) + b''.join(bytes(a) for a in aliases) + extra
+    x = lambda k, d: g.get(k, d)
+    hdr = struct.pack('<HBBIHHHHHHBBH', x('dev', 0x100), x('nshapes', len(shapes)),
+                      x('nsections', len(sections)), x('name', 0), x('w', 0), x('h', 0),
+                      x('nprops', len(props)), x('ncolors', len(colors)),
+                      x('ndoodads', len(doodads)), x('naliases', len(aliases)),
+                      x('base', 0), x('label', 0), 0)
+    req = hdr + body
+    n = (len(req) + 4) // 4 if length is None else length
+    return bytes([gm[0], 20, n & 0xff, n >> 8]) + req
+GH = {k: G[k] for k in ('dev', 'name', 'w', 'h', 'base', 'label')}
+assert geometry(GH) == gm, 'rebuild SetGeometry'
+def with_overlay(sec_ndx, name, rows):
+    """Section sec_ndx with one overlay of rows [(rowUnder, [(over, under)...])]."""
+    s = bytearray(sections[sec_ndx]); s[17] = 1
+    s += struct.pack('<IBxxx', name, len(rows))
+    for under, keys in rows:
+        s += struct.pack('<BBxx', under, len(keys))
+        for over, un in keys:
+            s += over.ljust(4, b'\0') + un.ljust(4, b'\0')
+    return [bytes(x) if i != sec_ndx else bytes(s) for i, x in enumerate(sections)]
+# section 1 ('Alpha') row 0 starts with <TLDE>; it has 5 rows
+assert sections[1][20 + 8:20 + 12] == b'TLDE' and sections[1][15] == 5
+
+cases = []
+def case(name, what, data, step):
+    cases.append((name, what, step))
+    open(os.path.join(out, name + '.bin'), 'wb').write(data)
+
+if mode == 'errors':
+    A = 'xreqa'
+    case('names-access', 'the recorded identity SetNames, from a client that never called XkbUseExtension', nm, 'xreq0')
+    case('names-short', 'a 24-byte SetNames (xkbSetNamesReq is 28)', bytes([nm[0], 18, 6, 0]) + nm[4:24], A)
+    case('names-which', 'the identity SetNames with which | 0x4000 (not a names component)', names(dict(H, which=H['which'] | 0x4000), P), A)
+    case('names-which0', 'which 0, one data word', names({}, {'comps': [0]}), A)
+    case('names-which0-nodata', 'which 0, no data', names({}, {}), A)
+    case('names-keycodes-only', 'which KeycodesName, just its atom (Xorg wants one more word before each unsent component)', names(dict(which=0x01), {'comps': [0xe9]}), A)
+    case('names-keycodes-badatom', 'the identity SetNames with keycodes name atom 0x7fffffff', names(H, dict(P, comps=[BAD] + comps[1:])), A)
+    case('names-geometry-badatom', 'the identity SetNames with geometry name atom 0x7fffffff', names(H, dict(P, comps=comps[:1] + [BAD] + comps[2:])), A)
+    case('names-types-zero', 'KeyTypeNames with nTypes 0', names(dict(which=0x40, ft=4, nt=0), {'comps': [0]}), A)
+    case('names-types-range', 'KeyTypeNames 4+24 past num_types 27', names(dict(which=0x40, ft=4, nt=24), {'types': P['types'] + [0]}), A)
+    case('names-types-required', 'KeyTypeNames 3+1 (a required type)', names(dict(which=0x40, ft=3, nt=1), {'types': [0x8f]}), A)
+    case('names-types-badatom', 'KeyTypeNames 4+2, the second atom 0x7fffffff', names(dict(which=0x40, ft=4, nt=2), {'types': [0x8f, BAD]}), A)
+    case('names-types-stale', 'KeyTypeNames 4+1 named ONE_LEVEL, KTLevelNames 0+27 with no data left: BadLength keeps the errorValue', names(dict(which=0xc0, ft=4, nt=1, nkl=27), {'types': [0x86]}), A)
+    case('names-ktlevels-zero', 'KTLevelNames with nKTLevels 0', names(dict(which=0x80, nkl=0), {'comps': [0]}), A)
+    case('names-ktlevels-range', 'KTLevelNames 1+27 past num_types 27', names(dict(which=0x80, fkl=1, nkl=27), {'widths': [0] * 27, 'levels': [[]] * 27}), A)
+    w = list(widths); assert w[5] == 2; w[5] = 3
+    case('names-ktlevels-width', 'the identity SetNames with type 5 level width 3 (it has 2 levels)', names(H, dict(P, widths=w)), A)
+    lv = [list(l) for l in levels]; lv[9][1] = BAD
+    case('names-ktlevels-badatom', 'the identity SetNames with type 9 level 1 name atom 0x7fffffff', names(H, dict(P, levels=lv)), A)
+    case('names-indicators-zero', 'IndicatorNames with indicators 0', names(dict(which=0x100, ind=0), {'comps': [0]}), A)
+    case('names-indicators-badatom', 'the identity SetNames with indicator 3 name atom 0x7fffffff', names(H, dict(P, ind=P['ind'][:3] + [BAD] + P['ind'][4:])), A)
+    case('names-vmods-zero', 'VirtualModNames with virtualMods 0', names(dict(which=0x800, vmods=0), {'comps': [0]}), A)
+    case('names-groups-zero', 'GroupNames with groupNames 0', names(dict(which=0x1000, gn=0), {'comps': [0]}), A)
+    case('names-groups-highbit', 'GroupNames 0x11 with two words (bit 4 is past the 4 groups)', names(dict(which=0x1000, gn=0x11), {'groups': [0xe8, 0]}), A)
+    case('names-keys-min', 'KeyNames 7+1', names(dict(which=0x200, fk=7, nk=1), {'keys': b'ESC\0'}), A)
+    case('names-keys-range', 'KeyNames 250+7 past maxKeyCode', names(dict(which=0x200, fk=250, nk=7), {'keys': bytes(28)}), A)
+    case('names-keys-zero', 'KeyNames 8+0', names(dict(which=0x200, fk=8, nk=0), {'comps': [0]}), A)
+    case('names-rg-zero', 'RGNames with nRadioGroups 0', names(dict(which=0x2000, nrg=0), {'comps': [0]}), A)
+    case('names-rg-badatom', 'RGNames 1, atom 0x7fffffff', names(dict(which=0x2000, nrg=1), {'rg': [BAD]}), A)
+    case('names-length', 'the identity SetNames with 4 bytes too many (length + 1)', names(H, P, extra=bytes(4)), A)
+    case('names-truncated', 'the identity SetNames without its last key alias (nKeyAliases 73 kept)', names(H, dict(P, aliases=P['aliases'][:-8])), A)
+    case('geom-access', 'the recorded identity SetGeometry, from a client that never called XkbUseExtension', gm, 'xreq0')
+    case('geom-short', 'a 24-byte SetGeometry (xkbSetGeometryReq is 28)', bytes([gm[0], 20, 6, 0]) + gm[4:24], A)
+    case('geom-name-badatom', 'the identity SetGeometry named 0x7fffffff', geometry(dict(GH, name=BAD)), A)
+    g0 = geometry(GH)
+    case('geom-font-overrun', 'label font length 0x7ff0, past the request', g0[:28] + struct.pack('<H', 0x7ff0) + g0[30:], A)
+    case('geom-colors-one', 'nColors 1', geometry(dict(GH, ncolors=1)), A)
+    case('geom-basecolor', 'baseColorNdx 7 > nColors 6', geometry(dict(GH, base=7)), A)
+    case('geom-labelcolor', 'labelColorNdx 7 > nColors 6', geometry(dict(GH, label=7)), A)
+    case('geom-samecolor', 'labelColorNdx = baseColorNdx = 1', geometry(dict(GH, base=1, label=1)), A)
+    case('geom-color-dup', 'color 5 spec "black", as color 0', geometry(GH, colors=colors[:5] + [b'black']), A)
+    case('geom-shapes-zero', 'nShapes 0', geometry(dict(GH, nshapes=0)), A)
+    sh = [bytearray(s) for s in shapes]; sh[1][0:4] = sh[0][0:4]
+    case('geom-shape-dup', 'shape 1 named as shape 0', geometry(GH, shapes=sh), A)
+    sh = [bytearray(s) for s in shapes]; sh[0][0:4] = bytes(4)
+    case('geom-shape-none', 'shape 0 named None', geometry(GH, shapes=sh), A)
+    se = [bytearray(s) for s in sections]; se[0][0:4] = struct.pack('<I', BAD)
+    case('geom-section-badatom', 'section 0 named 0x7fffffff', geometry(GH, sections=se), A)
+    se = [bytearray(s) for s in sections]; se[2][0:4] = bytes(4)
+    case('geom-section-none', 'section 2 named None', geometry(GH, sections=se), A)
+    se = [bytearray(s) for s in sections]; se[1][20 + 8 + 8 * 3 + 6] = 15
+    case('geom-key-shape', 'section 1 row 0 key 3 shapeNdx 15 = nShapes', geometry(GH, sections=se), A)
+    se = [bytearray(s) for s in sections]; se[3][20 + 8 + 7] = 6
+    case('geom-key-color', 'section 3 row 0 key 0 colorNdx 6 = nColors', geometry(GH, sections=se), A)
+    dd = [bytearray(d) for d in doodads]; assert dd[0][4] == 2; dd[0][4] = 9
+    case('geom-doodad-type', 'doodad 0 of type 9', geometry(GH, doodads=dd), A)
+    dd = [bytearray(d) for d in doodads]; dd[0][0:4] = struct.pack('<I', BAD)
+    case('geom-doodad-badatom', 'doodad 0 named 0x7fffffff', geometry(GH, doodads=dd), A)
+    dd = [bytearray(d) for d in doodads]; dd[0][13] = 15
+    case('geom-doodad-shape', 'doodad 0 (solid) shapeNdx 15', geometry(GH, doodads=dd), A)
+    dd = [bytearray(d) for d in doodads]; assert dd[1][4] == 4; dd[1][13] = 6
+    case('geom-indicator-color', 'doodad 1 (indicator) onColorNdx 6', geometry(GH, doodads=dd), A)
+    dd = [bytearray(d) for d in doodads]; assert dd[4][4] == 3; dd[4][16] = 6
+    case('geom-text-color', 'doodad 4 (text) colorNdx 6', geometry(GH, doodads=dd), A)
+    case('geom-overlay-rowunder', 'section 1 overlay row 0 over row 6 (the section has 5)', geometry(GH, sections=with_overlay(1, 0xd9, [(6, [(b'FK01', b'TLDE')])])), A)
+    case('geom-overlay-pastlast', 'section 1 overlay row 0 over row 5 (past the last), one key', geometry(GH, sections=with_overlay(1, 0xd9, [(5, [(b'FK01', b'TLDE')])])), A)
+    case('geom-overlay-nokey', 'section 1 overlay row 0 over row 0, key under <ZZZZ> (not in row 0)', geometry(GH, sections=with_overlay(1, 0xd9, [(0, [(b'FK01', b'ZZZZ')])])), A)
+    al = [bytearray(a) for a in aliases]; al[1][4:8] = bytes(4)
+    case('geom-alias-empty', 'key alias 1 with an empty alias name', geometry(GH, aliases=al), A)
+    case('geom-truncated', 'the identity SetGeometry cut after its first two sections (counts kept)', geometry(dict(GH, nsections=4, ndoodads=7, naliases=2), sections=sections[:2], doodads=[], aliases=[]), A)
+    # accepted by Xorg's checks, whatever they look like
+    case('names-compat-only', 'which CompatName, just its atom (the last component: accepted)', names(dict(which=0x20), {'comps': [0x85]}), A)
+    case('geom-trailing', 'the identity SetGeometry with 8 bytes too many (no length check: accepted)', geometry(GH, extra=bytes(8)), A)
+    case('geom-overlay-ok', 'section 1 overlay row 0 over row 0, key <FK01> under <TLDE>', geometry(GH, sections=with_overlay(1, 0xd9, [(0, [(b'FK01', b'TLDE')])])), A)
+    with open(os.path.join(out, 'cases.txt'), 'a') as f:
+        for name, what, step in cases:
+            f.write('%s\t%s\t%s\n' % (step, name, what))
+else:
+    S = 'REQ'
+    case('names-vmods-groups', 'VirtualModNames 0x0003 (Meta, Super) and GroupNames 0x03 (English (UK), Group 2): changedVirtualMods is the group mask',
+         names(dict(which=0x1800, vmods=0x0003, gn=0x03), {'vmods': [0x81, 0x7f], 'groups': [0xe8, 0xc6]}), S)
+    case('names-vmods', 'VirtualModNames 0x0081 (Hyper, None)',
+         names(dict(which=0x0800, vmods=0x0081), {'vmods': [0x82, 0]}), S)
+    case('names-levels-only', 'KTLevelNames 4+2 (Shift Level3 / Ctrl, Base / Caps) with the unused nTypes field 9: nLevelNames 9',
+         names(dict(which=0x80, nt=9, fkl=4, nkl=2), {'widths': [2, 2], 'levels': [[0xb2, 0xb3], [0x89, 0x8c]]}), S)
+    case('names-types', 'KeyTypeNames 4+2 swapped (PC_SUPER_LEVEL2, PC_ALT_LEVEL2)',
+         names(dict(which=0x40, ft=4, nt=2), {'types': [0x90, 0x8f]}), S)
+    case('names-indicators', 'IndicatorNames 0x8001: indicator 0 (Caps Lock) renamed Function, indicator 15 named Keypad; then XTEST Caps Lock',
+         names(dict(which=0x100, ind=0x8001), {'ind': [0xd8, 0xdb]}), 'REQ down:66 up:66')
+    case('names-aliases-rg', 'KeyAliases with nKeyAliases 0 (clears them) and RGNames 1 (Function)',
+         names(dict(which=0x2400, nka=0, nrg=1), {'rg': [0xd8]}), S)
+    case('names-keys', 'KeyNames 38+2 swapped (AC02, AC01)',
+         names(dict(which=0x200, fk=38, nk=2), {'keys': b'AC02AC01'}), S)
+    case('names-components', 'all six component names (keycodes Base, geometry None, symbols Any, phys_symbols Shift, types Caps, compat complete)',
+         names(dict(which=0x3f), {'comps': [0x89, 0, 0x87, 0x8a, 0x8c, 0x85]}), S)
+    case('geom-alone', 'the identity SetGeometry on its own: the geometry name None -> pc(pc105)', gm, S)
+    case('geom-none', 'the identity SetGeometry named None: the name stays None', geometry(dict(GH, name=0)), S)
+    case('geom-renamed', 'the identity SetGeometry after it, named Alpha', geometry(dict(GH, name=0xd9)), 'xreq:%s/geom-alone.bin REQ' % out)
+    with open(os.path.join(out, 'cases.txt'), 'w') as f:
+        for name, what, steps in cases:
+            f.write('%s\t%s\t%s\n' % (name, steps, what))
+EOF
+}
+
 gen_errors() {
     local out=$TD/xorg-xkb-setmap-errors.txt dir=$TD/xkb-setmap-errors
     rm -rf "$dir"
     setmap_error_requests "$TD/xkbcomp-requests/identity/1-SetMap.bin" "$dir"
     compat_error_requests "$TD/xkbcomp-requests/identity" "$dir"
+    names_geometry_requests errors "$TD/xkbcomp-requests/identity" "$dir"
     {
         echo "# Xorg's errors for malformed XKB SetMap requests and for XKB requests without"
-        echo "# XkbUseExtension (issue #171 phase 4c), and for malformed SetCompatMap /"
-        echo "# SetIndicatorMap requests (phase 4d): Xvfb -noreset, layout=gb"
+        echo "# XkbUseExtension (issue #171 phase 4c), for malformed SetCompatMap /"
+        echo "# SetIndicatorMap requests (phase 4d) and for malformed SetNames / SetGeometry"
+        echo "# requests (phase 4e): Xvfb -noreset, layout=gb"
         versions
         echo "# setxkbmap -rules evdev -model pc105 -layout gb; then one tools/xkb-mutation-probe.c run per"
         echo "# request (fresh connections each time), sending xkb-setmap-errors/NAME.bin raw:"
-        echo "#   xreq:  on the actor after its XkbUseExtension; xreq0: on a connection without it."
+        echo "#   xreq:  on the actor after its XkbUseExtension; xreq0: on a connection without it;"
+        echo "#   atoms:xkbcomp-requests/identity/atoms.txt first for the SetNames / SetGeometry requests"
+        echo "#   (built from the recorded identity upload, whose atoms they use)."
         echo "# Each request is built by this script from xkbcomp-requests/identity/1-SetMap.bin,"
-        echo "# 2-SetIndicatorMap.bin or 3-SetCompatMap.bin (the '## NAME' line says how). Lines:"
-        echo "# '= error=CODE value=V major=M minor=N' (major is this server's XKB opcode), then the"
-        echo "# (empty) XkbGetMap delta and coremodmap as usual."
+        echo "# 2-SetIndicatorMap.bin, 3-SetCompatMap.bin, 4-SetNames.bin or 5-SetGeometry.bin (the"
+        echo "# '## NAME' line says how). Lines: '= error=CODE value=V major=M minor=N' (major is this"
+        echo "# server's XKB opcode) or '= ok' for the few requests Xorg accepts, then the (empty)"
+        echo "# XkbGetMap delta and coremodmap as usual. The accepted ones come last (they change"
+        echo "# only names on this one server)."
         fresh gb
         while IFS=$'\t' read -r step name what; do
             echo "## $name: $what"
-            "$PROBE" -d ":$DISP" "$step:$dir/$name.bin" | sed "s|$TD/||g"
+            if [ "$step" = xreqa ]; then
+                "$PROBE" -d ":$DISP" "atoms:$TD/xkbcomp-requests/identity/atoms.txt" "xreq:$dir/$name.bin"
+            else
+                "$PROBE" -d ":$DISP" "$step:$dir/$name.bin"
+            fi | sed "s|$TD/||g"
         done <"$dir/cases.txt"
         stop_x
     } >"$out"
@@ -948,8 +1213,36 @@ gen_setcompat() {
     rm "$dir/cases.txt"
 }
 
+gen_setnames() {
+    local out=$TD/xorg-xkb-setnames.txt dir=$TD/xkb-setnames
+    rm -rf "$dir"
+    names_geometry_requests semantics "$TD/xkbcomp-requests/identity" "$dir"
+    {
+        echo "# Xorg's XKB SetNames / SetGeometry semantics (issue #171 phase 4e):"
+        echo "# Xvfb -noreset, fresh server per case, layout=gb"
+        versions
+        echo "# each case: setxkbmap -rules evdev -model pc105 -layout gb; then tools/xkb-mutation-probe.c"
+        echo "# -x atoms:xkbcomp-requests/identity/atoms.txt, then the case's steps: xreq:xkb-setnames/NAME.bin"
+        echo "# (the actor, after its XkbUseExtension), for one case followed by XTEST down:KC up:KC."
+        echo "# The request is built by this script from the recorded identity upload's SetNames /"
+        echo "# SetGeometry and atoms (the '## case' line says what it does); output grammar as in"
+        echo "# xorg-xkbcomp-steps.txt, the state before is xorg-xkb-pristine.txt's layout=gb case. In raw"
+        echo "# event hex the sequence number (bytes 2-3) and time (4-7) differ between runs, and"
+        echo "# NewKeyboardNotify bytes 18-31 are uninitialised stack in Xorg (differ too)."
+        while IFS=$'\t' read -r name steps what; do
+            fresh gb
+            echo "## case $name: $what"
+            # shellcheck disable=SC2086
+            "$PROBE" -d ":$DISP" -x "atoms:$TD/xkbcomp-requests/identity/atoms.txt" \
+                ${steps//REQ/xreq:$dir/$name.bin} | sed "s|$TD/||g"
+            stop_x
+        done <"$dir/cases.txt"
+    } >"$out"
+    rm "$dir/cases.txt"
+}
+
 targets=("$@")
-[ ${#targets[@]} -eq 0 ] && targets=(ckm smm xkbcomp repeat pristine steps errors resize setcompat)
+[ ${#targets[@]} -eq 0 ] && targets=(ckm smm xkbcomp repeat pristine steps errors resize setcompat setnames)
 for t in "${targets[@]}"; do
     "gen_$t"
 done

@@ -541,22 +541,25 @@ static void take_xsnap(struct xsnap *s)
                 xs_add(s, "indname %d %s", i, atom_name(u32c(p, 0)));
                 p += 4;
             }
-    if (nw & 0x200)
+    /* XKB.h bits: KeyNames 0x200, KeyAliases 0x400, VirtualModNames 0x800,
+     * GroupNames 0x1000, RGNames 0x2000; the reply's sections come in
+     * XkbSendNames order: vmods, groups, keys, aliases, radio groups. */
+    if (nw & 0x800)
         for (int i = 0; i < 16; i++)
             if (vmods & (1 << i)) {
                 xs_add(s, "vmodname %d %s", i, atom_name(u32c(p, 0)));
                 p += 4;
             }
-    if (nw & 0x400)
+    if (nw & 0x1000)
         for (int i = 0; i < 4; i++)
             if (groupNames & (1 << i)) {
                 xs_add(s, "groupname %d %s", i + 1, atom_name(u32c(p, 0)));
                 p += 4;
             }
-    if (nw & 0x800)
+    if (nw & 0x200)
         for (int k = 0; k < nKeys; k++, p += 4)
             xs_add(s, "keyname %d '%.4s'", firstKey + k, (const char *)p);
-    if (nw & 0x1000)
+    if (nw & 0x400)
         for (int a = 0; a < nAliases; a++, p += 8)
             xs_add(s, "alias %d '%.4s'->'%.4s'", a, (const char *)p + 4, (const char *)p);
     if (nw & 0x2000)

@@ -18,8 +18,8 @@
 use xkbcommon::xkb::{self, KeyDirection, Keycode, Keymap};
 
 use super::{
-    Action, NUM_INDICATORS, SA_LATCH_GROUP, SA_LATCH_MODS, SA_LOCK_GROUP, SA_LOCK_MODS,
-    SA_SET_GROUP, SA_SET_MODS, XkbDesc, action, writer,
+    Action, SA_LATCH_GROUP, SA_LATCH_MODS, SA_LOCK_GROUP, SA_LOCK_MODS, SA_SET_GROUP, SA_SET_MODS,
+    XkbDesc, action, writer,
 };
 
 /// `XkbSA_ClearLocks`, `XkbSA_LatchToLock`, `XkbSA_GroupAbsolute`,
@@ -288,12 +288,12 @@ fn prescribed(
 /// Each indicator driven by locked or effective modifiers only lights for
 /// those modifiers and not without them.
 fn check_leds(desc: &XkbDesc, keymap: &Keymap, out: &mut Vec<String>) {
-    for i in 0..NUM_INDICATORS {
-        let map = desc.indicators[i];
+    let names = writer::indicator_names(desc);
+    for (i, (&map, name)) in desc.indicators.iter().zip(&names).enumerate() {
         if map.which_mods == 0 || map.mods.mask == 0 || map.which_groups != 0 || map.ctrls != 0 {
             continue;
         }
-        let Some(name) = writer::indicator_name(desc, i) else {
+        let Some(name) = name.clone() else {
             continue;
         };
         let mut st = xkb::State::new(keymap);
@@ -367,9 +367,9 @@ pub(crate) fn cooking_view(desc: &XkbDesc) -> Vec<String> {
             out.push(line);
         }
     }
-    for i in 0..NUM_INDICATORS {
-        let map = desc.indicators[i];
-        if let Some(name) = writer::indicator_name(desc, i)
+    let names = writer::indicator_names(desc);
+    for (map, name) in desc.indicators.iter().zip(&names) {
+        if let Some(name) = name
             && (map.which_mods != 0 || map.which_groups != 0 || map.ctrls != 0)
         {
             out.push(format!(

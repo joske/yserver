@@ -490,6 +490,17 @@ pub enum XkbSetEvent {
     CompatMap(yserver_protocol::x11::XkbCompatMapNotify),
     /// `XkbApplyLedMapChanges`' notifications for new indicator maps.
     IndicatorMaps(XkbIndicatorMapsChange),
+    /// `XkbSendNamesNotify`, to every client whose names interest ∩
+    /// `changed` ≠ 0.
+    Names(yserver_protocol::x11::XkbNamesNotify),
+    /// `_XkbSetNames`' ExtensionDeviceNotify for new indicator names
+    /// (reason IndicatorNames) on the core keyboard's default LED feedback.
+    IndicatorNames {
+        /// `sli->namesPresent | sli->mapsPresent` afterwards.
+        leds_defined: u32,
+        /// The indicators lit (`sli->effectiveState`).
+        state: u32,
+    },
 }
 
 /// What new indicator maps did (Xorg `XkbApplyLedMapChanges` +
@@ -2657,14 +2668,17 @@ pub trait Backend {
 
     /// An XKB Set* request (`minor`, `body` after the 4-byte header) on the
     /// backend's keyboard description, as Xorg's handler does it;
-    /// `client_is_ancient` = the client asked XkbUseExtension for 0.65.
-    /// `None` when this backend doesn't implement `minor`: the request is
-    /// accepted and does nothing.
+    /// `client_is_ancient` = the client asked XkbUseExtension for 0.65;
+    /// `atom_name` resolves an atom of the request (`None`: not a valid
+    /// atom, Xorg's `!ValidAtom`; atoms live in the core loop). `None`
+    /// when this backend doesn't implement `minor`: the request is accepted
+    /// and does nothing.
     fn xkb_set(
         &mut self,
         _minor: u8,
         _body: &[u8],
         _client_is_ancient: bool,
+        _atom_name: &dyn Fn(u32) -> Option<String>,
     ) -> Option<XkbSetOutcome> {
         None
     }

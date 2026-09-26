@@ -106,6 +106,8 @@ const X_KB_SELECT_EVENTS: u8 = 1;
 const X_KB_SET_MAP: u8 = 9;
 const X_KB_SET_COMPAT_MAP: u8 = 11;
 const X_KB_SET_INDICATOR_MAP: u8 = 14;
+const X_KB_SET_NAMES: u8 = 18;
+const X_KB_SET_GEOMETRY: u8 = 20;
 /// FocusChangeMask
 const FOCUS_CHANGE_MASK: u32 = 0x0020_0000;
 
@@ -20540,6 +20542,7 @@ fn handle_xkb_request(
         X_KB_SET_MAP => 32,
         X_KB_SET_COMPAT_MAP => 12,
         X_KB_SET_INDICATOR_MAP => 8,
+        X_KB_SET_NAMES | X_KB_SET_GEOMETRY => 24,
         _ => 0,
     };
     if body.len() < min_body {
@@ -20591,7 +20594,12 @@ fn handle_xkb_request(
     // The Set* requests the backend's keyboard description implements (a
     // port of Xorg's handler): its events, then its error.
     let ancient = crate::core_loop::xkb_select::xkb_ancient(state, client_id);
-    if let Some(outcome) = backend.xkb_set(minor, body, ancient) {
+    let set_outcome = {
+        let atoms = &state.atoms;
+        let atom_name = |atom: u32| atoms.name(x11::AtomId(atom)).map(str::to_owned);
+        backend.xkb_set(minor, body, ancient, &atom_name)
+    };
+    if let Some(outcome) = set_outcome {
         send_xkb_set_events(state, &*backend, header.opcode, minor, &outcome.events);
         if let Some((code, value)) = outcome.error {
             return emit_x11_error_with_minor(
@@ -20851,6 +20859,20 @@ fn send_xkb_set_events(
             }
             XkbSetEvent::IndicatorMaps(change) => {
                 crate::core_loop::xkb_layout::send_indicator_maps_change(state, base, change);
+            }
+            XkbSetEvent::Names(notify) => {
+                crate::core_loop::xkb_layout::send_xkb_names_notify(state, base, *notify);
+            }
+            XkbSetEvent::IndicatorNames {
+                leds_defined,
+                state: lit,
+            } => {
+                crate::core_loop::xkb_layout::send_indicator_names_change(
+                    state,
+                    base,
+                    *leds_defined,
+                    *lit,
+                );
             }
         }
     }

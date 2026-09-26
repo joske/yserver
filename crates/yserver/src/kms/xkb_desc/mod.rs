@@ -21,7 +21,9 @@ pub(crate) mod probe;
 pub(crate) mod reply;
 pub(crate) mod seed;
 pub(crate) mod set_compat;
+pub(crate) mod set_geometry;
 pub(crate) mod set_map;
+pub(crate) mod set_names;
 pub(crate) mod text;
 pub(crate) mod writer;
 
@@ -1212,11 +1214,11 @@ impl XkbDesc {
     /// The indicators whose map lights in the effective `lit` state from a
     /// cooking state, by name: bit N = indicator N (Xorg `effectiveState`).
     pub(crate) fn indicators_lit(&self, state: &xkbcommon::xkb::State) -> u32 {
-        (0..NUM_INDICATORS)
-            .filter(|&i| {
-                writer::indicator_name(self, i).is_some_and(|name| state.led_name_is_active(&name))
-            })
-            .fold(0, |bits, i| bits | (1 << i))
+        writer::indicator_names(self)
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| name.as_ref().is_some_and(|n| state.led_name_is_active(n)))
+            .fold(0, |bits, (i, _)| bits | (1 << i))
     }
 
     /// Port of Xorg's `XkbGetCoreMap` (xkb/xkbUtils.c): the core

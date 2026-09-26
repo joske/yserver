@@ -11384,18 +11384,22 @@ impl KmsBackend {
     /// Current lock-LED state derived from `xkb_state`, as
     /// `input::Led` bits. Split from [`Self::sync_keyboard_leds`] so
     /// the no-Vk test fixture can pin the XKB→LED mapping without a
-    /// libinput device.
+    /// libinput device. As on Xorg the keyboard LEDs follow the lit
+    /// indicators by index (`XkbDDXUpdateIndicators` hands the driver the
+    /// effective state; xf86-input-libinput/evdev light Caps Lock for bit
+    /// 0, Num Lock for bit 1, Scroll Lock for bit 2), not by name, so an
+    /// indicator renamed by SetNames keeps its LED.
     fn current_led_bits(&self) -> u32 {
-        let state = &self.core.xkb_state.0;
+        let lit = self.core.xkb_desc.indicators_lit(&self.core.xkb_state.0);
         let mut leds = input::Led::empty();
-        if state.led_name_is_active(xkbcommon::xkb::LED_NAME_CAPS) {
-            leds |= input::Led::CAPSLOCK;
-        }
-        if state.led_name_is_active(xkbcommon::xkb::LED_NAME_NUM) {
-            leds |= input::Led::NUMLOCK;
-        }
-        if state.led_name_is_active(xkbcommon::xkb::LED_NAME_SCROLL) {
-            leds |= input::Led::SCROLLLOCK;
+        for (bit, led) in [
+            (0, input::Led::CAPSLOCK),
+            (1, input::Led::NUMLOCK),
+            (2, input::Led::SCROLLLOCK),
+        ] {
+            if lit & (1 << bit) != 0 {
+                leds |= led;
+            }
         }
         leds.bits()
     }
@@ -11628,6 +11632,106 @@ impl KmsBackend {
                 state,
                 leds_defined: desc.names_present() | desc.maps_present(),
             })],
+        }
+    }
+
+    /// XKB SetNames on the keyboard description: Xorg's `ProcXkbSetNames`
+    /// after its size and BadAccess checks (the core loop's): its checks and
+    /// `_XkbSetNamesCheck` ([`crate::kms::xkb_desc::set_names`]), then
+    /// `_XkbSetNames` through the one mutation path (a new indicator name
+    /// recompiles the cooking keymap, whose LEDs are read by name). The
+    /// events are Xorg's: NamesNotify, then for indicator names an
+    /// ExtensionDeviceNotify (IndicatorNames) with the names and maps
+    /// present and the lit indicators.
+    fn xkb_set_names(
+        &mut self,
+        body: &[u8],
+        atom_name: &dyn Fn(u32) -> Option<String>,
+    ) -> yserver_core::backend::XkbSetOutcome {
+        use crate::kms::xkb_desc::{reply::INDICATOR_NAMES, set_names};
+        use yserver_core::backend::{XkbSetEvent, XkbSetOutcome};
+        let req = Self::xkb_whole_request(18, body);
+        let h = set_names::SetNamesHeader::parse(&req);
+        let m = match set_names::check_set_names(&self.core.xkb_desc, &h, &req, atom_name) {
+            Ok(m) => m,
+            Err(e) => {
+                return XkbSetOutcome {
+                    error: Some((e.code, e.value)),
+                    events: Vec::new(),
+                };
+            }
+        };
+        let mut notify = yserver_protocol::x11::XkbNamesNotify::default();
+        let _ = self.mutate_keymap(|desc| {
+            notify = desc.set_names(&h, &m);
+            crate::kms::xkb_desc::XkbChanges::default()
+        });
+        notify.device_id = 1;
+        let mut events = vec![XkbSetEvent::Names(notify)];
+        if h.which & INDICATOR_NAMES != 0 {
+            let desc = &self.core.xkb_desc;
+            events.push(XkbSetEvent::IndicatorNames {
+                leds_defined: desc.names_present() | desc.maps_present(),
+                state: desc.indicators_lit(&self.core.xkb_state.0),
+            });
+        }
+        XkbSetOutcome {
+            error: None,
+            events,
+        }
+    }
+
+    /// XKB SetGeometry on the keyboard description, name only (review
+    /// outcome for #171): Xorg's `ProcXkbSetGeometry` after its size and
+    /// BadAccess checks (the core loop's) — the name's atom and
+    /// `_CheckSetGeom`'s whole walk ([`crate::kms::xkb_desc::set_geometry`])
+    /// decide acceptance as on Xorg — then `_XkbSetGeometry`'s visible
+    /// effects: the geometry name stored, NamesNotify(GeometryName) when it
+    /// changed, and NewKeyboardNotify(Geometry) over the unchanged keycode
+    /// range. The geometry body isn't kept, so GetGeometry keeps answering
+    /// found=False.
+    fn xkb_set_geometry(
+        &mut self,
+        body: &[u8],
+        atom_name: &dyn Fn(u32) -> Option<String>,
+    ) -> yserver_core::backend::XkbSetOutcome {
+        use crate::kms::xkb_desc::{reply::GEOMETRY_NAME, set_geometry};
+        use yserver_core::backend::{XkbNewKeyboardInfo, XkbSetEvent, XkbSetOutcome};
+        let req = Self::xkb_whole_request(20, body);
+        let h = set_geometry::SetGeometryHeader::parse(&req);
+        if let Err(e) =
+            set_geometry::check_set_geometry(&h, &req, &|atom| atom_name(atom).is_some())
+        {
+            return XkbSetOutcome {
+                error: Some((e.code, e.value)),
+                events: Vec::new(),
+            };
+        }
+        let name = if h.name == 0 { None } else { atom_name(h.name) };
+        let new_name = self.core.xkb_desc.names.geometry != name;
+        let _ = self.mutate_keymap(|desc| {
+            desc.names.geometry = name;
+            crate::kms::xkb_desc::XkbChanges::default()
+        });
+        let mut events = Vec::new();
+        if new_name {
+            events.push(XkbSetEvent::Names(yserver_protocol::x11::XkbNamesNotify {
+                device_id: 1,
+                changed: u16::try_from(GEOMETRY_NAME).unwrap_or(0),
+                ..Default::default()
+            }));
+        }
+        let desc = &self.core.xkb_desc;
+        events.push(XkbSetEvent::NewKeyboard(XkbNewKeyboardInfo {
+            min_keycode: desc.min_key_code,
+            max_keycode: desc.max_key_code,
+            old_min_keycode: desc.min_key_code,
+            old_max_keycode: desc.max_key_code,
+            changed: 0x0002, // XkbNKN_GeometryMask
+        }));
+        XkbSetOutcome {
+            error: None,
+            events,
         }
     }
 
@@ -27093,11 +27197,14 @@ impl Backend for KmsBackend {
         minor: u8,
         body: &[u8],
         client_is_ancient: bool,
+        atom_name: &dyn Fn(u32) -> Option<String>,
     ) -> Option<yserver_core::backend::XkbSetOutcome> {
         match minor {
             9 => Some(self.xkb_set_map(body, client_is_ancient)),
             11 => Some(self.xkb_set_compat_map(body)),
             14 => Some(self.xkb_set_indicator_map(body)),
+            18 => Some(self.xkb_set_names(body, atom_name)),
+            20 => Some(self.xkb_set_geometry(body, atom_name)),
             _ => None,
         }
     }
@@ -48055,59 +48162,111 @@ mod tests {
         std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
     }
 
+    /// Intern a recording's atoms (`0xATOM NAME` lines, in order) at their
+    /// recorded values, as the probe's `atoms:` step checks Xorg gives them.
+    fn intern_recorded_atoms(
+        state: &mut yserver_core::server::ServerState,
+        atoms: &str,
+        what: &str,
+    ) {
+        for atom in atoms.lines() {
+            let (v, n) = atom.split_once(' ').unwrap();
+            let v = u32::from_str_radix(v.trim_start_matches("0x"), 16).unwrap();
+            let id = yserver_protocol::x11::AtomId(v);
+            assert!(
+                state.atoms.intern_at(id, n) || state.atoms.id_for(n) == Some(id),
+                "{what}: atom {n} at {v:#x}"
+            );
+        }
+    }
+
     /// Golden (`xorg-xkb-setmap-errors.txt`, Xvfb 21.1.24): every malformed
-    /// SetMap, SetCompatMap and SetIndicatorMap draws Xorg's error — code,
-    /// errorValue, minor, major = our XKB opcode — and changes nothing; an
-    /// XKB request without XkbUseExtension draws BadAccess. Each request
-    /// comes from a fresh client (UseExtension first for `xreq`, none for
-    /// `xreq0`).
+    /// SetMap, SetCompatMap, SetIndicatorMap, SetNames and SetGeometry draws
+    /// Xorg's error — code, errorValue, minor, major = our XKB opcode — and
+    /// changes nothing; an XKB request without XkbUseExtension draws
+    /// BadAccess; the few odd requests Xorg's checks accept are accepted.
+    /// Each request comes from a fresh client (UseExtension first for
+    /// `xreq`, none for `xreq0`) on a fresh server, the identity upload's
+    /// atoms interned first where the golden's probe run interned them.
     #[test]
     fn xkb_set_request_errors_match_xorg() {
+        struct Case {
+            atoms: bool,
+            kind: String,
+            file: String,
+            /// `(code, errorValue, minor)`, `None` = accepted.
+            error: Option<(u8, u32, u8)>,
+        }
         let golden = include_str!("../testdata/xorg-xkb-setmap-errors.txt");
-        let mut cases: Vec<(String, String, u8, u32, u8)> = Vec::new();
-        let mut step = None;
+        let mut cases: Vec<Case> = Vec::new();
+        let (mut atoms, mut step) = (false, None::<String>);
         for line in golden.lines() {
-            if let Some(s) = line.strip_prefix("> ") {
-                step = Some(s.to_owned());
-            } else if let Some(r) = line.strip_prefix("= error=") {
-                let field = |k: &str| {
-                    r.split(' ')
-                        .find_map(|t| t.strip_prefix(k))
-                        .unwrap()
-                        .parse::<u32>()
-                        .unwrap()
-                };
+            if line.starts_with("## ") {
+                atoms = false;
+            } else if let Some(s) = line.strip_prefix("> ") {
+                if s.starts_with("atoms:") {
+                    atoms = true;
+                } else {
+                    step = Some(s.to_owned());
+                }
+            } else if line == "= ok" || line.starts_with("= error=") {
+                let error = line.strip_prefix("= error=").map(|r| {
+                    let field = |k: &str| {
+                        r.split(' ')
+                            .find_map(|t| t.strip_prefix(k))
+                            .unwrap()
+                            .parse::<u32>()
+                            .unwrap()
+                    };
+                    (
+                        u8::try_from(r.split(' ').next().unwrap().parse::<u32>().unwrap()).unwrap(),
+                        field("value="),
+                        u8::try_from(field("minor=")).unwrap(),
+                    )
+                });
                 let (kind, file) = step
                     .take()
                     .unwrap()
                     .split_once(':')
                     .map(|(a, b)| (a.to_owned(), b.to_owned()))
                     .unwrap();
-                cases.push((
+                cases.push(Case {
+                    atoms,
                     kind,
                     file,
-                    u8::try_from(r.split(' ').next().unwrap().parse::<u32>().unwrap()).unwrap(),
-                    field("value="),
-                    u8::try_from(field("minor=")).unwrap(),
-                ));
+                    error,
+                });
             }
         }
-        assert_eq!(cases.len(), 44, "golden parsed");
+        assert_eq!(cases.len(), 102, "golden parsed");
+        assert_eq!(cases.iter().filter(|c| c.error.is_none()).count(), 3);
+        let identity_atoms =
+            String::from_utf8(xkb_testdata("xkbcomp-requests/identity/atoms.txt")).unwrap();
         let mut failures = Vec::new();
-        for (kind, file, code, value, minor) in &cases {
+        for c in &cases {
+            let file = &c.file;
             let mut backend = kbd_map_backend("gb", None);
             let mut state = yserver_core::server::ServerState::new();
             let mut actor = kbd_map_client_id(&mut state, 7);
-            if kind == "xreq" {
+            if c.atoms {
+                intern_recorded_atoms(&mut state, &identity_atoms, file);
+            }
+            if c.kind == "xreq" {
                 xkb_client_request(&mut state, &mut backend, 7, 136, 0, &[1, 0, 0, 0]);
                 let _ = kbd_map_drain(&mut actor);
             }
             let before = backend.core.xkb_desc.clone();
             let req = xkb_testdata(file);
-            assert_eq!(req[1], *minor, "{file}");
             xkb_send_recorded(&mut state, &mut backend, 7, &req);
             let got = kbd_map_drain(&mut actor);
-            let want = (0u8, *code, *value, u16::from(*minor), 136u8);
+            let Some((code, value, minor)) = c.error else {
+                if !got.is_empty() {
+                    failures.push(format!("{file}: accepted by Xorg, ours {got:02x?}"));
+                }
+                continue;
+            };
+            assert_eq!(req[1], minor, "{file}");
+            let want = (0u8, code, value, u16::from(minor), 136u8);
             let ours = (got.len() == 32).then(|| {
                 (
                     got[0],
@@ -48333,15 +48492,7 @@ mod tests {
             let mut plain = kbd_map_client_id(&mut state, 6);
             let mut actor = kbd_map_client_id(&mut state, 7);
             yserver_core::core_loop::xkb_layout::seed_keyboard_auto_repeats(&mut state, &backend);
-            for atom in atoms.lines() {
-                let (v, n) = atom.split_once(' ').unwrap();
-                let v = u32::from_str_radix(v.trim_start_matches("0x"), 16).unwrap();
-                let id = yserver_protocol::x11::AtomId(v);
-                assert!(
-                    state.atoms.intern_at(id, n) || state.atoms.id_for(n) == Some(id),
-                    "{what}: atom {n} at {v:#x}"
-                );
-            }
+            intern_recorded_atoms(&mut state, atoms, what);
             for client in [5, 7] {
                 xkb_client_request(&mut state, &mut backend, client, 136, 0, &[1, 0, 0, 0]);
             }
@@ -48476,9 +48627,10 @@ mod tests {
             for (o, x) in ours.iter().zip(&step.listener) {
                 let same = match (x[0] & 0x7f, x[1]) {
                     // XkbMapNotify, XkbIndicatorStateNotify,
-                    // XkbIndicatorMapNotify, XkbExtensionDeviceNotify: all
-                    // but seq/time; device 3 -> our 1.
-                    (0x55, 1 | 4 | 5 | 11) => o[..2] == x[..2] && o[8] == 1 && o[9..] == x[9..],
+                    // XkbIndicatorMapNotify, XkbNamesNotify,
+                    // XkbExtensionDeviceNotify: all but seq/time; device 3
+                    // -> our 1.
+                    (0x55, 1 | 4 | 5 | 6 | 11) => o[..2] == x[..2] && o[8] == 1 && o[9..] == x[9..],
                     // XkbNewKeyboardNotify: devices, ranges, cause (our XKB
                     // major), changed; bytes 18.. are Xorg stack.
                     (0x55, 0) => {
@@ -48582,9 +48734,9 @@ mod tests {
         replay.backend
     }
 
-    /// The xkbcomp upload steps the backend implements (SetMap,
-    /// SetIndicatorMap, SetCompatMap; SetNames and SetGeometry are 4e).
-    const XKBCOMP_STEPS_IMPLEMENTED: usize = 3;
+    /// The xkbcomp upload steps the backend implements: all five (SetMap,
+    /// SetIndicatorMap, SetCompatMap, SetNames, SetGeometry).
+    const XKBCOMP_STEPS_IMPLEMENTED: usize = 5;
 
     /// Replay steps `1..=n` of a recorded xkbcomp upload `case` on one
     /// server, comparing each with Xorg's (cumulative) state and events.
@@ -48611,8 +48763,8 @@ mod tests {
     /// Golden (`xorg-xkbcomp-steps.txt`, Xvfb 21.1.24): every recorded
     /// xkbcomp upload replayed byte for byte through the core loop on one
     /// server, request after request ([`XkbReplay::step`]): after each of
-    /// SetMap, SetIndicatorMap and SetCompatMap, Xorg's events on an XKB
-    /// listener and a plain client, Xorg's whole state so far (level names
+    /// SetMap, SetIndicatorMap, SetCompatMap, SetNames and SetGeometry,
+    /// Xorg's events on an XKB listener and a plain client, Xorg's whole state so far (level names
     /// Xorg left uninitialised skipped; the listed seed tolerances only for
     /// rows no SetMap wrote), and the cooking gate.
     #[test]
@@ -48734,6 +48886,82 @@ mod tests {
                 );
             }
         }
+        assert!(
+            failures.is_empty(),
+            "{} failures:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// Golden (`xorg-xkb-setnames.txt`, Xvfb 21.1.24): SetNames' parts
+    /// beyond xkbcomp's upload — virtual modifier and group names
+    /// (NamesNotify's changedVirtualMods is the group mask), level names
+    /// alone (nLevelNames = the request's unused nTypes), type names,
+    /// indicator names (ExtensionDeviceNotify IndicatorNames; the renamed
+    /// indicator still lights by its map, by index), clearing the key
+    /// aliases with radio group names, key names, the six component names —
+    /// and SetGeometry changing the geometry name (NamesNotify
+    /// GeometryName, then NewKeyboardNotify) or not (NewKeyboardNotify
+    /// only): events, whole state and cooking as [`XkbReplay::step`], one
+    /// fresh gb server per case with the identity upload's atoms. After the
+    /// indicator rename, XTEST Caps Lock lights indicator 0 as on Xorg
+    /// (its IndicatorStateNotify state); the rest of what Xvfb sends on
+    /// that key (a slave device switch) isn't compared.
+    #[test]
+    fn set_names_and_geometry_match_xorg() {
+        let cases = parse_xkb_request_steps(include_str!("../testdata/xorg-xkb-setnames.txt"));
+        assert_eq!(cases.len(), 11, "golden parsed");
+        let atoms = String::from_utf8(xkb_testdata("xkbcomp-requests/identity/atoms.txt")).unwrap();
+        let mut failures: Vec<String> = Vec::new();
+        let mut lit_checked = 0;
+        for (case, steps) in &cases {
+            let mut replay = XkbReplay::new(case, ("gb", None, "gb"), &atoms);
+            for (name, step) in steps {
+                let req = (!name.contains(':'))
+                    .then(|| xkb_testdata(&format!("xkb-setnames/{name}.bin")));
+                let what = format!("{case} {name}");
+                replay.step(&what, name, req.as_deref(), step, &mut failures);
+                // Xorg's lit indicators after the step, where it says:
+                // IndicatorStateNotify's state, else ExtensionDeviceNotify's
+                // ledState.
+                let xorg_lit = step
+                    .listener
+                    .iter()
+                    .find(|e| e[0] & 0x7f == 0x55 && e[1] == 4)
+                    .map(|e| u32::from_le_bytes([e[12], e[13], e[14], e[15]]))
+                    .or_else(|| {
+                        step.listener
+                            .iter()
+                            .find(|e| e[0] & 0x7f == 0x55 && e[1] == 11)
+                            .map(|e| u32::from_le_bytes([e[20], e[21], e[22], e[23]]))
+                    });
+                if let Some(xorg) = xorg_lit {
+                    // The keyboard LEDs follow the indicators by index, as
+                    // Xorg's input drivers do: bit 0 lights Caps Lock.
+                    let caps = u32::from(xorg & 1 != 0) * input::Led::CAPSLOCK.bits();
+                    if replay.backend.leds_sent & input::Led::CAPSLOCK.bits() != caps {
+                        failures.push(format!(
+                            "{what}: keyboard LEDs {:#x}, Caps Lock LED expected {caps:#x}",
+                            replay.backend.leds_sent
+                        ));
+                    }
+                }
+                if name.starts_with("down:") {
+                    let xorg = xorg_lit.unwrap_or_else(|| panic!("{what}: IndicatorStateNotify"));
+                    let ours = replay
+                        .backend
+                        .core
+                        .xkb_desc
+                        .indicators_lit(&replay.backend.core.xkb_state.0);
+                    if ours != xorg {
+                        failures.push(format!("{what}: lit {ours:#x}, xorg {xorg:#x}"));
+                    }
+                    lit_checked += 1;
+                }
+            }
+        }
+        assert_eq!(lit_checked, 1);
         assert!(
             failures.is_empty(),
             "{} failures:\n{}",

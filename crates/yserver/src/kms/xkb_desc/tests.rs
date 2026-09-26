@@ -841,3 +841,31 @@ fn libx11_decodes_the_names_xdotool_asks_for() {
         }
     }
 }
+
+/// SetNames can give two indicators one name (Xorg keeps its indicators by
+/// index; the names are only labels). The cooking keymap still lights each
+/// by its own map: the later duplicate is written under a synthetic name,
+/// so xkbcommon doesn't merge the two.
+#[test]
+fn duplicate_indicator_names_keep_their_own_maps() {
+    let mut desc = seeded("gb", None);
+    assert_eq!(desc.names.indicators[0].as_deref(), Some("Caps Lock"));
+    desc.names.indicators[5] = Some("Caps Lock".to_owned());
+    desc.indicators[5] = IndicatorMap {
+        which_mods: 0x04, // locked
+        mods: Mods {
+            mask: 0x01,
+            real: 0x01,
+            vmods: 0,
+        },
+        ..IndicatorMap::default()
+    };
+    let keymap = super::gate::compile(&desc.to_v1_text().0);
+    let mut state = xkbcommon::xkb::State::new(&keymap);
+    state.update_mask(0, 0, 0x02, 0, 0, 0);
+    // (Other indicators, e.g. Shift Lock, follow their own maps.)
+    let both = |state: &xkbcommon::xkb::State| desc.indicators_lit(state) & 0x21;
+    assert_eq!(both(&state), 0x01, "locked Lock: indicator 0");
+    state.update_mask(0, 0, 0x01, 0, 0, 0);
+    assert_eq!(both(&state), 0x20, "locked Shift: indicator 5");
+}

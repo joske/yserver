@@ -3844,6 +3844,71 @@ pub fn write_xkb_compat_map_notify(
     writer.write_all(&buf)
 }
 
+/// Fields of an [`write_xkb_names_notify`] event (XKBproto.h
+/// `xkbNamesNotify`), as the server fills them in (Xorg's `_XkbSetNames`
+/// puts the request's `nTypes` in `n_level_names` and its group names mask
+/// in `changed_virtual_mods`; the encoder writes what it is given).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct XkbNamesNotify {
+    pub device_id: u8,
+    /// `XkbNamesMask` bits.
+    pub changed: u16,
+    pub first_type: u8,
+    pub n_types: u8,
+    pub first_level_name: u8,
+    pub n_level_names: u8,
+    pub n_radio_groups: u8,
+    pub n_aliases: u8,
+    pub changed_group_names: u8,
+    pub changed_virtual_mods: u16,
+    pub first_key: u8,
+    pub n_keys: u8,
+    pub changed_indicators: u32,
+}
+
+/// `XkbNamesNotify` (xkbType=6). Layout per XKBproto.h `xkbNamesNotify`:
+/// deviceID @8, changed @10, firstType @12, nTypes @13, firstLevelName @14,
+/// nLevelNames @15, nRadioGroups @17, nAliases @18, changedGroupNames @19,
+/// changedVirtualMods @20, firstKey @22, nKeys @23, changedIndicators @24,
+/// pads zero (Xorg memsets the event). Time is 0, like our other XKB events.
+pub fn write_xkb_names_notify(
+    writer: &mut impl Write,
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    xkb_event_base: u8,
+    n: XkbNamesNotify,
+) -> io::Result<()> {
+    let mut buf = [0u8; 32];
+    buf[0] = xkb_event_base;
+    buf[1] = 6; // xkbType = XkbNamesNotify
+    let mut b = Vec::with_capacity(2);
+    write_u16(byte_order, &mut b, sequence.0);
+    buf[2..4].copy_from_slice(&b);
+    // buf[4..8] time = 0
+    buf[8] = n.device_id;
+    // buf[9] pad1
+    for (at, v) in [(10, n.changed), (20, n.changed_virtual_mods)] {
+        let mut b = Vec::with_capacity(2);
+        write_u16(byte_order, &mut b, v);
+        buf[at..at + 2].copy_from_slice(&b);
+    }
+    buf[12] = n.first_type;
+    buf[13] = n.n_types;
+    buf[14] = n.first_level_name;
+    buf[15] = n.n_level_names;
+    // buf[16] pad2
+    buf[17] = n.n_radio_groups;
+    buf[18] = n.n_aliases;
+    buf[19] = n.changed_group_names;
+    buf[22] = n.first_key;
+    buf[23] = n.n_keys;
+    let mut b = Vec::with_capacity(4);
+    write_u32(byte_order, &mut b, n.changed_indicators);
+    buf[24..28].copy_from_slice(&b);
+    // buf[28..32] pad3
+    writer.write_all(&buf)
+}
+
 /// Fields of an [`write_xkb_extension_device_notify`] event (XKBproto.h
 /// `xkbExtensionDeviceNotify`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -4629,6 +4694,91 @@ mod tests {
         let xorg = xorg_event("550b7300f4ab68070300080000000000ff3f00000000000000001f0000000000");
         assert_eq!(buf[..4], xorg[..4]);
         assert_eq!(buf[8..], xorg[8..]);
+    }
+
+    /// Golden (Xvfb 21.1.24, `xorg-xkbcomp-steps.txt` identity and usru
+    /// step 4): the NamesNotify of xkbcomp's SetNames, byte for byte except
+    /// seq/time (Xorg memsets it, so its pads are zero).
+    #[test]
+    fn xkb_names_notify_wire_layout() {
+        let n = XkbNamesNotify {
+            device_id: 3,
+            changed: 0x1fff,
+            first_type: 4,
+            n_types: 23,
+            first_level_name: 0,
+            n_level_names: 23,
+            n_radio_groups: 0,
+            n_aliases: 73,
+            changed_group_names: 0,
+            changed_virtual_mods: 0x0001,
+            first_key: 8,
+            n_keys: 248,
+            changed_indicators: 0x3fff,
+        };
+        let mut buf = Vec::new();
+        write_xkb_names_notify(
+            &mut buf,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(0x85),
+            0x55,
+            n,
+        )
+        .unwrap();
+        let xorg = xorg_event("5506850001ac68070300ff1f0417001700004900010008f8ff3f000000000000");
+        assert_eq!(buf[..4], xorg[..4]);
+        assert_eq!(buf[8..], xorg[8..]);
+        buf.clear();
+        write_xkb_names_notify(
+            &mut buf,
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(0x85),
+            0x55,
+            XkbNamesNotify {
+                changed_virtual_mods: 0x0003,
+                ..n
+            },
+        )
+        .unwrap();
+        let xorg = xorg_event("5506850081bb68070300ff1f0417001700004900030008f8ff3f000000000000");
+        assert_eq!(buf[..4], xorg[..4]);
+        assert_eq!(buf[8..], xorg[8..]);
+    }
+
+    /// Every `XkbNamesNotify` field at its offset, distinct values,
+    /// big-endian client.
+    #[test]
+    fn xkb_names_notify_field_offsets_big_endian() {
+        let mut buf = Vec::new();
+        write_xkb_names_notify(
+            &mut buf,
+            ClientByteOrder::BigEndian,
+            SequenceNumber(0x0102),
+            0x55,
+            XkbNamesNotify {
+                device_id: 3,
+                changed: 0x0405,
+                first_type: 6,
+                n_types: 7,
+                first_level_name: 8,
+                n_level_names: 9,
+                n_radio_groups: 0x0a,
+                n_aliases: 0x0b,
+                changed_group_names: 0x0c,
+                changed_virtual_mods: 0x0d0e,
+                first_key: 0x0f,
+                n_keys: 0x10,
+                changed_indicators: 0x1112_1314,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            buf,
+            [
+                0x55, 6, 1, 2, 0, 0, 0, 0, 3, 0, 4, 5, 6, 7, 8, 9, 0, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+                0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0, 0, 0, 0
+            ]
+        );
     }
 
     /// Every `XkbExtensionDeviceNotify` field at its offset, distinct

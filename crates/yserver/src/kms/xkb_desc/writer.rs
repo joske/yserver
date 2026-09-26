@@ -47,21 +47,39 @@ pub(crate) fn type_name(index: usize) -> String {
         .map_or_else(|| format!("T{index}"), |n| (*n).to_owned())
 }
 
-/// The name indicator `i` is written with, `None` when it has neither a
-/// name nor a map: the model's name when it can be written as a string,
-/// else `yserver-led<i>`.
-pub(crate) fn indicator_name(desc: &XkbDesc, i: usize) -> Option<String> {
-    let map = desc.indicators[i];
-    let name = desc.names.indicators[i].as_deref();
-    if name.is_none() && map == IndicatorMap::default() {
-        return None;
-    }
-    Some(match name {
-        Some(n) if !n.is_empty() && n.chars().all(|c| c != '"' && c != '\\' && !c.is_control()) => {
-            n.to_owned()
+/// The names the indicators are written with, `None` for one with neither
+/// a name nor a map: the model's name when it can be written as a string
+/// and no lower indicator is written with it (SetNames may repeat a name;
+/// xkbcommon would merge the two indicators), else `yserver-led<i>`.
+pub(crate) fn indicator_names(desc: &XkbDesc) -> Vec<Option<String>> {
+    let mut out: Vec<Option<String>> = Vec::with_capacity(NUM_INDICATORS);
+    for i in 0..NUM_INDICATORS {
+        let map = desc.indicators[i];
+        let name = desc.names.indicators[i].as_deref();
+        if name.is_none() && map == IndicatorMap::default() {
+            out.push(None);
+            continue;
         }
-        _ => format!("yserver-led{i}"),
-    })
+        let taken = |n: &str| out.iter().flatten().any(|o| o == n);
+        let written = match name {
+            Some(n)
+                if !n.is_empty()
+                    && n.chars().all(|c| c != '"' && c != '\\' && !c.is_control())
+                    && !taken(n) =>
+            {
+                n.to_owned()
+            }
+            _ => {
+                let mut synthetic = format!("yserver-led{i}");
+                while taken(&synthetic) {
+                    synthetic.push('_');
+                }
+                synthetic
+            }
+        };
+        out.push(Some(written));
+    }
+    out
 }
 
 /// A keysym as every libxkbcommon parses it: hex from 10 up. The integers
@@ -124,8 +142,9 @@ impl XkbDesc {
         for kc in u32::from(min)..=top {
             let _ = writeln!(out, "\t<K{kc:03}> = {kc};");
         }
-        for i in 0..NUM_INDICATORS {
-            if let Some(name) = indicator_name(self, i) {
+        let indicator_names = indicator_names(self);
+        for (i, name) in indicator_names.iter().enumerate() {
+            if let Some(name) = name {
                 let _ = writeln!(out, "\tindicator {} = \"{name}\";", i + 1);
             }
         }
@@ -164,12 +183,11 @@ impl XkbDesc {
             out.push_str("\t};\n");
         }
         out.push_str("};\n\nxkb_compatibility \"yserver\" {\n");
-        for i in 0..NUM_INDICATORS {
-            let map = self.indicators[i];
-            if map == IndicatorMap::default() {
+        for (map, name) in self.indicators.iter().zip(&indicator_names) {
+            if *map == IndicatorMap::default() {
                 continue;
             }
-            let Some(name) = indicator_name(self, i) else {
+            let Some(name) = name else {
                 continue;
             };
             let _ = writeln!(out, "\tindicator \"{name}\" {{");

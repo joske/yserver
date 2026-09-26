@@ -1,7 +1,8 @@
 # Plan: runtime keymap mutation reaches XKB (#171)
 
 Status: phases 1–3 implemented (branch `feat/171-xkb-keymap-mutation`); phases
-4a–4d implemented (branch `feat/171-phase4-xkbcomp`); 4e open.
+4a–4e implemented (branch `feat/171-phase4-xkbcomp`); the HW gate (§4.10) is
+open.
 Issue: #171 — `xmodmap` (ChangeKeyboardMapping / SetModifierMapping) and
 `xkbcomp keymap.xkb $DISPLAY` (XKB SetMap & co) don't change the keymap that
 XKB clients and yserver's own key cooking use. On Xorg they do.
