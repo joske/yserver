@@ -17,6 +17,5 @@ pub(crate) mod render_node;
 pub(crate) mod scanout_route;
 pub mod vk;
 pub(super) mod xkb;
-pub(super) mod xkb_derive;
-pub(super) mod xkb_edit;
+pub(super) mod xkb_desc;
 pub(crate) mod xshmfence;

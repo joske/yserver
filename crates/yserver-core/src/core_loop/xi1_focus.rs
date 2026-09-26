@@ -592,14 +592,15 @@ pub(crate) fn emit_device_focus(
 /// reply buffer (event-after-reply on the wire), so we don't fanout to
 /// it here — doing so would either duplicate the event or land it
 /// before the reply, which xts5 SetDeviceButtonMapping rejects with
-/// `wanted REPLY got EVENT`.
+/// `wanted REPLY got EVENT`. `None` (a void request, e.g. XKB SetMap)
+/// sends to every client that selected it.
 ///
 /// `request_kind` is the mapping flavour (0=Modifier, 1=Keyboard,
 /// 2=Pointer); `first_keycode`/`count` are non-zero only for the
 /// Keyboard variant.
 pub(crate) fn emit_device_mapping_notify(
     state: &mut ServerState,
-    originator: ClientId,
+    originator: Option<ClientId>,
     deviceid: u16,
     request_kind: u8,
     first_keycode: u8,
@@ -610,7 +611,7 @@ pub(crate) fn emit_device_mapping_notify(
     let targets: Vec<ClientId> = state
         .clients
         .iter()
-        .filter(|(id, _)| **id != originator.0)
+        .filter(|(id, _)| originator.is_none_or(|o| **id != o.0))
         .filter(|(_, c)| c.xi1_event_classes.contains(&class))
         .map(|(id, _)| ClientId(*id))
         .collect();

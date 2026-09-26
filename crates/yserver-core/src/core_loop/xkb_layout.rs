@@ -172,14 +172,15 @@ pub fn apply_rules_names_change(state: &mut ServerState, backend: &mut dyn Backe
     );
 }
 
-/// Send an `XkbMapNotify` carrying `notify` to every client that selected
-/// XkbMapNotify (`XkbSelectEvents` bit 0x0002). Returns the recipients.
+/// Send an `XkbMapNotify` carrying `notify` to every client whose map
+/// details include one of its changes (Xorg `XkbSendMapNotify`:
+/// `mapNotifyMask & changed`). Returns the recipients.
 pub(crate) fn send_xkb_map_notify(
     state: &mut ServerState,
     xkb_event_base: u8,
     notify: x11::XkbMapNotify,
 ) -> Vec<ClientId> {
-    let recipients = subscribers(state, 0x0002); // XkbMapNotifyMask
+    let recipients = crate::core_loop::xkb_select::map_notify_recipients(state, notify.changed);
     let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
         let _ = x11::write_xkb_map_notify(buf, order, seq, xkb_event_base, notify);
     });
@@ -188,8 +189,6 @@ pub(crate) fn send_xkb_map_notify(
 
 /// yserver's one XKB keyboard, as every XKB reply and event names it.
 const XKB_DEVICE_ID: u8 = 1;
-/// `XkbSelectEvents` bit of `XkbControlsNotify`.
-const XKB_CONTROLS_NOTIFY_MASK: u16 = 1 << 3;
 /// `XkbPerKeyRepeatMask` in `XkbControlsNotify.changedControls`.
 const XKB_PER_KEY_REPEAT_MASK: u32 = 1 << 30;
 /// Core `X_ChangeKeyboardMapping`: the cause Xorg's `XkbApplyMappingChange`
@@ -198,8 +197,6 @@ pub(crate) const X_CHANGE_KEYBOARD_MAPPING: u8 = 100;
 /// Core `X_SetModifierMapping`: the cause of a modifier-map change's events,
 /// for the core and the XI request alike (`XkbApplyMappingChange`).
 pub(crate) const X_SET_MODIFIER_MAPPING: u8 = 118;
-/// `XkbSelectEvents` bit of `XkbIndicatorMapNotify`.
-const XKB_INDICATOR_MAP_NOTIFY_MASK: u16 = 1 << 5;
 
 /// Seed the core per-key auto-repeat from the backend's keymap, as Xorg's
 /// `XkbFinishInit` copies the keymap's `per_key_repeat` into the keyboard
@@ -214,41 +211,195 @@ pub fn seed_keyboard_auto_repeats(state: &mut ServerState, backend: &dyn Backend
 /// The notifications of a keymap mapping change that follow its
 /// `XkbMapNotify` and core `MappingNotify`, in Xorg's order
 /// (`XkbSendNotification`): `XkbControlsNotify` for a per-key repeat change
-/// (`cause_major` = the core request), then `XkbIndicatorMapNotify` for the
-/// indicator maps a virtual modifier change altered.
+/// (`cause` = the request's major and minor opcode), then
+/// `XkbIndicatorMapNotify` for the indicator maps a virtual modifier change
+/// altered.
 pub(crate) fn send_keyboard_mapping_followups(
     state: &mut ServerState,
     xkb_event_base: u8,
     change: &KeyboardMappingChange,
-    cause_major: u8,
+    cause: (u8, u8),
 ) {
-    apply_keyboard_mapping_repeats(state, xkb_event_base, change, cause_major);
+    apply_keyboard_mapping_repeats(state, xkb_event_base, change, cause);
     if change.indicator_map_changed != 0 {
-        send_indicator_map_notify(
+        send_indicator_notify(
             state,
             xkb_event_base,
+            x11::XkbIndicatorNotifyKind::Map,
             change.indicator_state,
             change.indicator_map_changed,
         );
     }
+    if change.compat_changed_groups != 0 {
+        send_xkb_compat_map_notify(
+            state,
+            xkb_event_base,
+            x11::XkbCompatMapNotify {
+                device_id: XKB_DEVICE_ID,
+                changed_groups: change.compat_changed_groups,
+                first_si: 0,
+                n_si: 0,
+                n_total_si: change.compat_total_si,
+            },
+        );
+    }
+}
+
+/// `XkbSendCompatMapNotify`: to every XKB-initialised client with any
+/// compat map interest (`compatNotifyMask` ≠ 0).
+pub(crate) fn send_xkb_compat_map_notify(
+    state: &mut ServerState,
+    xkb_event_base: u8,
+    notify: x11::XkbCompatMapNotify,
+) {
+    let recipients = crate::core_loop::xkb_select::interest_recipients(state, |i| i.compat != 0);
+    let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
+        let _ = x11::write_xkb_compat_map_notify(buf, order, seq, xkb_event_base, notify);
+    });
+}
+
+/// `XkbSendNamesNotify`: to every XKB-initialised client whose names
+/// interest includes a changed name (`namesNotifyMask & changed`).
+pub(crate) fn send_xkb_names_notify(
+    state: &mut ServerState,
+    xkb_event_base: u8,
+    notify: x11::XkbNamesNotify,
+) {
+    let recipients =
+        crate::core_loop::xkb_select::interest_recipients(state, |i| i.names & notify.changed != 0);
+    let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
+        let _ = x11::write_xkb_names_notify(buf, order, seq, xkb_event_base, notify);
+    });
+}
+
+/// `_XkbSetNames`' ExtensionDeviceNotify after new indicator names: reason
+/// IndicatorNames for the core keyboard's default LED feedback (class
+/// KbdFeedbackClass, id 0), `leds_defined` = names ∪ maps present,
+/// `led_state` = the lit indicators.
+pub(crate) fn send_indicator_names_change(
+    state: &mut ServerState,
+    xkb_event_base: u8,
+    leds_defined: u32,
+    led_state: u32,
+) {
+    let notify = x11::XkbExtensionDeviceNotify {
+        device_id: XKB_DEVICE_ID,
+        reason: XI_INDICATOR_NAMES_MASK,
+        led_class: 0,
+        led_id: 0,
+        leds_defined,
+        led_state,
+        first_btn: 0,
+        n_btns: 0,
+        supported: XI_ALL_FEATURES_MASK,
+        unsupported: 0,
+    };
+    let recipients = crate::core_loop::xkb_select::interest_recipients(state, |i| {
+        i.extension_device & XI_INDICATOR_NAMES_MASK != 0
+    });
+    let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
+        let _ = x11::write_xkb_extension_device_notify(buf, order, seq, xkb_event_base, notify);
+    });
+}
+
+/// `XkbXI_IndicatorNamesMask`.
+const XI_INDICATOR_NAMES_MASK: u16 = 1 << 2;
+/// `XkbXI_IndicatorMapsMask` / `XkbXI_IndicatorStateMask` /
+/// `XkbXI_AllFeaturesMask` (ExtensionDeviceNotify reason and features).
+const XI_INDICATOR_MAPS_MASK: u16 = 1 << 3;
+const XI_INDICATOR_STATE_MASK: u16 = 1 << 4;
+const XI_ALL_FEATURES_MASK: u16 = 0x001f;
+
+/// The notifications of new indicator maps, in Xorg's order
+/// (`XkbApplyLedMapChanges` → `XkbFlushLedEvents`: `XkbSendNotification`'s
+/// IndicatorMapNotify and, when the maps turned indicators on or off,
+/// IndicatorStateNotify; then `XkbSendExtensionDeviceNotify` with reason
+/// IndicatorMaps, plus IndicatorState when the state changed, for the core
+/// keyboard's default LED feedback: class KbdFeedbackClass (0), id 0).
+pub(crate) fn send_indicator_maps_change(
+    state: &mut ServerState,
+    xkb_event_base: u8,
+    change: &crate::backend::XkbIndicatorMapsChange,
+) {
+    send_indicator_notify(
+        state,
+        xkb_event_base,
+        x11::XkbIndicatorNotifyKind::Map,
+        change.state,
+        change.maps_changed,
+    );
+    let mut reason = XI_INDICATOR_MAPS_MASK;
+    if change.state_changed != 0 {
+        send_indicator_notify(
+            state,
+            xkb_event_base,
+            x11::XkbIndicatorNotifyKind::State,
+            change.state,
+            change.state_changed,
+        );
+        reason |= XI_INDICATOR_STATE_MASK;
+    }
+    let notify = x11::XkbExtensionDeviceNotify {
+        device_id: XKB_DEVICE_ID,
+        reason,
+        led_class: 0,
+        led_id: 0,
+        leds_defined: change.leds_defined,
+        led_state: change.state,
+        first_btn: 0,
+        n_btns: 0,
+        supported: XI_ALL_FEATURES_MASK,
+        unsupported: 0,
+    };
+    let recipients = crate::core_loop::xkb_select::interest_recipients(state, |i| {
+        i.extension_device & reason != 0
+    });
+    let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
+        let _ = x11::write_xkb_extension_device_notify(buf, order, seq, xkb_event_base, notify);
+    });
 }
 
 /// Apply the per-key auto-repeat a mapping change re-derived for its keys
 /// (Xorg `XkbUpdateActions`: `per_key_repeat` is copied from the core bits,
 /// the changed keys are recomputed, and the result is copied back), then
 /// send `XkbControlsNotify(PerKeyRepeat)` when a bit actually changed, with
-/// `cause_major` (the core request) as its cause. Keys a client set with
-/// `ChangeKeyboardControl` keep their bit (Xorg marks them
-/// `XkbExplicitAutoRepeatMask`).
+/// `cause` (the request's major and minor opcode) as its cause.
 pub(crate) fn apply_keyboard_mapping_repeats(
     state: &mut ServerState,
     xkb_event_base: u8,
     change: &KeyboardMappingChange,
-    cause_major: u8,
+    cause: (u8, u8),
 ) {
+    if !apply_repeats_to_core(state, &change.repeats) {
+        return;
+    }
+    let notify = x11::XkbControlsNotify {
+        device_id: XKB_DEVICE_ID,
+        num_groups: change.num_groups,
+        changed_controls: XKB_PER_KEY_REPEAT_MASK,
+        enabled_controls: change.enabled_controls,
+        enabled_control_changes: 0,
+        keycode: 0,
+        event_type: 0,
+        request_major: cause.0,
+        request_minor: cause.1,
+    };
+    let recipients = crate::core_loop::xkb_select::interest_recipients(state, |i| {
+        i.controls & XKB_PER_KEY_REPEAT_MASK != 0
+    });
+    let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
+        let _ = x11::write_xkb_controls_notify(buf, order, seq, xkb_event_base, notify);
+    });
+}
+
+/// Copy re-derived per-key repeat bits into the core keyboard feedback
+/// (the end of Xorg's `XkbUpdateActions`); whether a bit changed. Keys a
+/// client set with `ChangeKeyboardControl` keep their bit (Xorg marks them
+/// `XkbExplicitAutoRepeatMask`).
+pub(crate) fn apply_repeats_to_core(state: &mut ServerState, repeats: &[(u8, bool)]) -> bool {
     let control = &mut state.keyboard_control;
     let mut changed = false;
-    for &(kc, repeats) in &change.repeats {
+    for &(kc, repeats) in repeats {
         let (i, bit) = (usize::from(kc >> 3), 1u8 << (kc & 7));
         if control.auto_repeats_explicit[i] & bit != 0 {
             continue;
@@ -261,51 +412,33 @@ pub(crate) fn apply_keyboard_mapping_repeats(
         }
         changed |= control.auto_repeats[i] != old;
     }
-    if !changed {
-        return;
-    }
-    let notify = x11::XkbControlsNotify {
-        device_id: XKB_DEVICE_ID,
-        num_groups: change.num_groups,
-        changed_controls: XKB_PER_KEY_REPEAT_MASK,
-        enabled_controls: change.enabled_controls,
-        enabled_control_changes: 0,
-        keycode: 0,
-        event_type: 0,
-        request_major: cause_major,
-        request_minor: 0,
-    };
-    let recipients = subscribers(state, XKB_CONTROLS_NOTIFY_MASK);
-    let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
-        let _ = x11::write_xkb_controls_notify(buf, order, seq, xkb_event_base, notify);
-    });
+    changed
 }
 
-/// Send `XkbIndicatorMapNotify` for the indicators in `changed` (their map
-/// changed; `lit` = the indicators on) to its subscribers, as Xorg's
-/// `XkbSendNotification` does after a virtual modifier mapping change.
-fn send_indicator_map_notify(state: &mut ServerState, xkb_event_base: u8, lit: u32, changed: u32) {
+/// Send `XkbIndicatorMapNotify` / `XkbIndicatorStateNotify` for the
+/// indicators in `changed` (`lit` = the indicators on) to the XKB-initialised
+/// clients whose indicator map / state interest includes one of them
+/// (`XkbSendIndicatorNotify`: `iMapNotifyMask` / `iStateNotifyMask`).
+fn send_indicator_notify(
+    state: &mut ServerState,
+    xkb_event_base: u8,
+    kind: x11::XkbIndicatorNotifyKind,
+    lit: u32,
+    changed: u32,
+) {
     let notify = x11::XkbIndicatorNotify {
-        kind: x11::XkbIndicatorNotifyKind::Map,
+        kind,
         device_id: XKB_DEVICE_ID,
         state: lit,
         changed,
     };
-    let recipients = subscribers(state, XKB_INDICATOR_MAP_NOTIFY_MASK);
+    let recipients = crate::core_loop::xkb_select::interest_recipients(state, |i| match kind {
+        x11::XkbIndicatorNotifyKind::Map => i.indicator_map & changed != 0,
+        x11::XkbIndicatorNotifyKind::State => i.indicator_state & changed != 0,
+    });
     let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
         let _ = x11::write_xkb_indicator_notify(buf, order, seq, xkb_event_base, notify);
     });
-}
-
-/// Merge an `XkbSelectEvents` request into the stored per-(client, device)
-/// mask. `affect_which` names the events this request touches; `clear` names
-/// (within `affect_which`) the ones to deselect. Events in `affect_which` and
-/// not in `clear` become selected; events outside `affect_which` keep their
-/// prior selection. This covers BOTH the `selectAll` path (first request) and
-/// the detail-refinement path (second request) of the real client handshake.
-#[must_use]
-pub fn xkb_select_merge(old: u16, affect_which: u16, clear: u16) -> u16 {
-    (old & !affect_which) | (affect_which & !clear)
 }
 
 /// Decode the group-lock target from an `xkbLatchLockStateReq` body (the bytes
@@ -323,23 +456,7 @@ pub fn parse_latch_lock_group(body: &[u8]) -> Option<u8> {
     if body[4] != 0 { Some(body[5]) } else { None }
 }
 
-/// Clients whose XkbSelectEvents top mask (any device-spec) includes `bit`.
-/// NOTE: the stored value is a `u16` today; a later task (D2b) changes it to
-/// a struct, after which this reads `m.top & bit`.
-pub(crate) fn subscribers(state: &ServerState, bit: u16) -> Vec<ClientId> {
-    let mut out: Vec<ClientId> = state
-        .xkb_select_event_masks
-        .iter()
-        .filter(|((_cid, _dev), mask)| **mask & bit != 0)
-        .map(|((cid, _dev), _)| ClientId(*cid))
-        .collect();
-    // A client may select under multiple device-specs; collapse to one id.
-    // (fanout_event_to_clients also dedups internally — this keeps the
-    // returned list clean for the caller's log count, not load-bearing.)
-    out.sort_by_key(|c| c.0);
-    out.dedup_by_key(|c| c.0);
-    out
-}
+pub(crate) use crate::core_loop::xkb_select::subscribers;
 
 #[cfg(test)]
 mod tests {
@@ -509,9 +626,9 @@ mod tests {
         let mut map_sub = install_client(&mut state, 5);
         let mut state_sub = install_client(&mut state, 6);
         let mut both_sub = install_client(&mut state, 7);
-        state.xkb_select_event_masks.insert((5, 0x0100), 0x0002);
-        state.xkb_select_event_masks.insert((6, 0x0100), 0x0004);
-        state.xkb_select_event_masks.insert((7, 0x0003), 0x0007);
+        crate::core_loop::xkb_select::xkb_select_events(&mut state, 5, 0x0100, 0x0002);
+        crate::core_loop::xkb_select::xkb_select_events(&mut state, 6, 0x0100, 0x0004);
+        crate::core_loop::xkb_select::xkb_select_events(&mut state, 7, 0x0003, 0x0007);
 
         let notify = x11::XkbMapNotify {
             device_id: 3,
@@ -550,7 +667,7 @@ mod tests {
     fn apply_rules_names_change_sends_whole_keymap_map_notify() {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 5);
-        state.xkb_select_event_masks.insert((5, 0x0100), 0x0002);
+        crate::core_loop::xkb_select::xkb_select_events(&mut state, 5, 0x0100, 0x0002);
         let mut backend = RecordingBackend::new().with_keymap_rmlvo_result((8, 255));
 
         apply_rules_names_change(&mut state, &mut backend, b"evdev\0pc105\0de\0\0\0");
@@ -592,19 +709,38 @@ mod tests {
         assert!(parse_rules_names(b"evdev\0pc105\0").is_none());
     }
 
+    /// The real client handshake: SelectEvents(selectAll 0x07), then a
+    /// StateNotify detail refinement: the first request's selections stay.
     #[test]
     fn xkb_select_events_two_request_handshake_keeps_statenotify() {
-        // Req1: affectWhich=0x07, clear=0, (selectAll handled by affectWhich&!clear)
-        let m1 = xkb_select_merge(0x0000, 0x0007, 0x0000);
-        assert_eq!(m1, 0x0007);
-        // Req2: affectWhich=0x04 (StateNotify), clear=0 — must NOT drop the prior 0x07
-        let m2 = xkb_select_merge(m1, 0x0004, 0x0000);
-        assert_eq!(
-            m2 & 0x04,
-            0x04,
-            "StateNotify selection survives the detail-refine request"
-        );
-        assert_eq!(m2, 0x0007, "other selections preserved");
+        use crate::core_loop::xkb_select::{select_events, subscribers, use_extension};
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 5);
+        assert!(use_extension(&mut state, ClientId(5), &[1, 0, 0, 0]));
+        let req = |affect: u16, all: u16, rest: &[u8]| {
+            let mut b = Vec::new();
+            for v in [0x100u16, affect, 0, all, 0xff, 0xff] {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            b.extend_from_slice(rest);
+            b
+        };
+        select_events(&mut state, ClientId(5), &req(0x0007, 0x0007, &[])).unwrap();
+        // StateNotify: affect GroupState|ModifierState, value the same.
+        select_events(
+            &mut state,
+            ClientId(5),
+            &req(0x0004, 0, &[0x11, 0, 0x11, 0]),
+        )
+        .unwrap();
+        for bit in [0x0001, 0x0002, 0x0004] {
+            assert_eq!(
+                subscribers(&state, bit),
+                vec![ClientId(5)],
+                "event bit {bit:#x}"
+            );
+        }
+        assert_eq!(state.xkb_interests[&(5, 0x100)].state, 0xffff);
     }
 
     #[test]

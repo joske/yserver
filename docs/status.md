@@ -33,6 +33,103 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-26 XKB SetNames + SetGeometry on the model (#171 phase 4e,
+  branch `feat/171-phase4-xkbcomp`):** `kms::xkb_desc::set_names` ports
+  `ProcXkbSetNames` / `_XkbSetNamesCheck` / `_XkbSetNames` literally (the
+  one-more-word bounds check before every component name, sent or not; atom
+  validation through the core loop's atom table → BadAtom; type, level,
+  indicator, vmod, group, key, alias and radio-group names; `XkbAllocNames`'
+  level-name arrays and counts) with Xorg's NamesNotify field slips
+  (`nLevelNames` = the request's nTypes, `changedVirtualMods` overwritten by
+  the group mask, `changedGroupNames` never set) and the IndicatorNames
+  ExtensionDeviceNotify. `set_geometry` ports `_CheckSetGeom`'s whole walk
+  (counted strings, colors/shapes/sections/rows/keys/doodads/overlays/aliases
+  with the allocators' name lookups) but keeps only the geometry **name**
+  (review decision): NamesNotify(GeometryName) when it changes, then
+  NewKeyboardNotify(Geometry); GetGeometry still answers found=False. The
+  keyboard LEDs now follow the indicators by index (as Xorg's drivers do), so
+  a renamed indicator keeps its LED; duplicate indicator names are written
+  apart in the cooking keymap. New `XkbNamesNotify` encoder; the probe's
+  GetNames parser had bits 9–12 permuted (harmless while all were present).
+  Goldens: all 5 steps of all 9 xkbcomp uploads on one server, 58 new
+  SetNames/SetGeometry vectors in `xorg-xkb-setmap-errors.txt` (incl. 3 odd
+  requests Xorg accepts), new `xorg-xkb-setnames.txt` (11 behaviour cases).
+  One captured deviation from the 21.1.22 source: Xvfb 21.1.24 refuses an
+  overlay row over row == num_rows. vng A/B `tools/vng-scenarios/
+  xkbcomp-upload.sh` (dump → upload → dump round trip, then swapped
+  <AC01>/<AC02> + Caps as Control, keys through Xlib-XKB and xkbcommon-x11)
+  matches Xorg. Open: HW gate.
+
+- **2026-09-26 XKB SetCompatMap + SetIndicatorMap on the model (#171 phase
+  4d, branch `feat/171-phase4-xkbcomp`):** `kms::xkb_desc::set_compat` ports
+  `_XkbSetCompatMap` (dry-run checks, interprets stored from firstSI with the
+  broken `Any+AnyOfOrNone(all)->Private` interpret skipped and the tail closed
+  up, truncateSI, group compat maps, `recomputeActions` →
+  `XkbUpdateActions` over the whole range) and `ProcXkbSetIndicatorMap` /
+  `_XkbSetIndicatorMap` (which=0 no-op, `CHK_MASK_LEGAL`, the wire realMods
+  byte ignored) with `XkbApplyLedMapChanges`' lit-state rules; the keyboard
+  LEDs follow the new maps. New encoders `XkbCompatMapNotify` /
+  `XkbExtensionDeviceNotify`; IndicatorMapNotify / IndicatorStateNotify /
+  ExtensionDeviceNotify / CompatMapNotify filtered on the per-device
+  interests; `XkbSendNotification`'s CompatMapNotify for group compat masks a
+  virtual modifier change altered (also after ChangeKeyboardMapping /
+  SetModifierMapping). Fixes on the way: `XkbApplyCompatMapToKey` only sets
+  the type of an unmatched slot to NoAction (its bytes stay, as Xorg), and a
+  fresh cooking state computes its LEDs (xkbcommon leaves them off until the
+  first update). Goldens: steps 1–3 of all 9 xkbcomp uploads replayed on one
+  server (cumulative state + events), 13 new SetCompatMap/SetIndicatorMap
+  error vectors in `xorg-xkb-setmap-errors.txt`, new `xorg-xkb-setcompat.txt`
+  (13 behaviour cases), from `tools/xkb-mutation-goldens.sh errors|setcompat`.
+  SetNames / SetGeometry are still accepted no-ops (4e).
+
+- **2026-09-26 XKB SetMap on the model (#171 phase 4c, branch
+  `feat/171-phase4-xkbcomp`):** `kms::xkb_desc::set_map` ports Xorg's
+  `ProcXkbSetMap` literally: `_XkbSetMapCheckLength`, `_XkbSetMapChecks`
+  (with its request-bounds checks and request edits) and `_XkbSetMap`
+  (`XkbChangeKeycodeRange` + NewKeyboardNotify, `SetKeyTypes` with
+  `XkbResizeKeyType`'s level names and key-width resizing, `SetKeySyms`,
+  `SetKeyActions`, `SetKeyBehaviors`, `SetVirtualMods`, the
+  explicit/modmap/vmodmap parts that set a range but no `changed` bit, the
+  RecomputeActions recompute), through the one mutation path. New
+  `Backend::xkb_set` returns the error or Xorg's ordered events; the core loop
+  now keeps Xorg's per-client XKB state (`core_loop::xkb_select`: the
+  UseExtension flag, a `ProcXkbSelectEvents` port into per-client map/NKN and
+  per-device detail masks), answers BadAccess to every XKB request but
+  UseExtension without it, filters MapNotify/NewKeyboardNotify/ControlsNotify/
+  IndicatorMapNotify on the detail masks and sends the legacy core
+  MappingNotify as `XkbSendLegacyMapNotify` (also for ChangeKeyboardMapping /
+  SetModifierMapping). Goldens: step 1 of all 9 recorded xkbcomp uploads
+  (state + events), new `xorg-xkb-setmap-errors.txt` (31 error vectors incl.
+  BadAccess) and `xorg-xkb-setmap-resize.txt` (key-width resizing), all from
+  `tools/xkb-mutation-goldens.sh errors|resize`. SetCompatMap / SetIndicatorMap
+  / SetNames / SetGeometry are still accepted no-ops (4d/4e).
+
+- **2026-09-26 the keyboard is an Xorg `XkbDesc` model (#171 phase 4a+4b,
+  branch `feat/171-phase4-xkbcomp`):** new `kms::xkb_desc` holds Xorg's
+  server-side keyboard description (types by index with vmods/preserve/level
+  names, per-key syms/acts/behaviors/explicit/modmap/vmodmap, vmods, compat
+  SIs, indicator maps, names, num_groups, per-key repeat) and is authoritative
+  for GetMap / GetCompatMap (real SIs) / GetNames / GetIndicatorMap /
+  GetNamedIndicator / GetControls numGroups / GetKbdByName's blocks /
+  GetKeyboardMapping / GetModifierMapping, all encoded as Xorg's
+  `ProcXkbGet*`/`XkbSend*` do (request parts and ranges, BadValue/BadMatch).
+  It is seeded from xkbcommon's compile on every by-name load (xkbcomp's type
+  normalisation incl. its `DeleteLevel1MapEntries` and preserve-vmod bugs,
+  libX11 `XConvertCase` for automatic types, identical-group collapse), then
+  Xorg's `XkbUpdateDescActions` over all keys. xkbcommon only cooks: the model
+  is written as V1 text (resolved real modifiers, per-key actions, explicit
+  types and repeat, no interprets) and compiled after every mutation
+  (`KmsCore::install_desc`). ChangeKeyboardMapping / SetModifierMapping are
+  literal ports on the model (`XkbUpdateKeyTypesFromCore`,
+  `XkbChangeTypesOfKey`, `XkbApplyCompatMapToKey`, `XkbUpdateDescActions`,
+  `XkbApplyVirtualModChanges`); `xkb_edit`, `xkb_derive`, the explicit-type /
+  stale-vmodmap side tables, the vmod pin re-install and the type probes are
+  gone. Goldens: `xorg-xkb-pristine.txt` (us/gb/de/us,ru, listed seed
+  tolerances), CKM/SMM goldens now compared exactly by type index incl.
+  explicit/behaviors/all actions, and a cooking gate (press/release on fresh
+  `xkb_state`s) after every golden mutation and on all 45 captured xkbcomp
+  states. SetMap & co (4c–4e) next.
+
 - **2026-09-25 SetModifierMapping edits the real keymap (#171 phase 3,
   branch `feat/171-xkb-keymap-mutation`):** core `SetModifierMapping` and XI1
   `SetDeviceModifierMapping` share Xorg's `change_modmap` in the core loop

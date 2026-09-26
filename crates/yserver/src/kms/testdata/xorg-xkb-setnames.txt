@@ -1,0 +1,252 @@
+# Xorg's XKB SetNames / SetGeometry semantics (issue #171 phase 4e):
+# Xvfb -noreset, fresh server per case, layout=gb
+# server: X.Org version 21.1.24 (xdpyinfo); `Xvfb -version` -> "Unrecognized option: -version" (not supported by this build)
+# pacman -Q: xkeyboard-config 2.48-1 xorg-server-xvfb 21.1.24-1
+# each case: setxkbmap -rules evdev -model pc105 -layout gb; then tools/xkb-mutation-probe.c
+# -x atoms:xkbcomp-requests/identity/atoms.txt, then the case's steps: xreq:xkb-setnames/NAME.bin
+# (the actor, after its XkbUseExtension), for one case followed by XTEST down:KC up:KC.
+# The request is built by this script from the recorded identity upload's SetNames /
+# SetGeometry and atoms (the '## case' line says what it does); output grammar as in
+# xorg-xkbcomp-steps.txt, the state before is xorg-xkb-pristine.txt's layout=gb case. In raw
+# event hex the sequence number (bytes 2-3) and time (4-7) differ between runs, and
+# NewKeyboardNotify bytes 18-31 are uninitialised stack in Xorg (differ too).
+## case names-vmods-groups: VirtualModNames 0x0003 (Meta, Super) and GroupNames 0x03 (English (UK), Group 2): changedVirtualMods is the group mask
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setnames/names-vmods-groups.bin
+= ok
+e xkb NamesNotify dev=3 changed=0x1800 types=0+0 levelNames=0+0 nRadioGroups=0 nKeyAliases=0 changedGroupNames=0x00 changedVMods=0x0003 keys=0+0 changedIndicators=0x00000000 raw=55066a005c035b08030000180000000000000000030000000000000000000000
+-names - which=0x1fff min=8 max=255 nTypes=27 groupNames=0x01 virtualMods=0x00ff keys=8+248 indicators=0x00003fff nRadioGroups=0 nKeyAliases=73 nKTLevels=112
++names - which=0x1fff min=8 max=255 nTypes=27 groupNames=0x03 virtualMods=0x00ff keys=8+248 indicators=0x00003fff nRadioGroups=0 nKeyAliases=73 nKTLevels=112
+-vmodname 0 'NumLock'
++vmodname 0 'Meta'
+-vmodname 1 'Alt'
++vmodname 1 'Super'
++groupname 2 'Group 2'
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## case names-vmods: VirtualModNames 0x0081 (Hyper, None)
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setnames/names-vmods.bin
+= ok
+e xkb NamesNotify dev=3 changed=0x0800 types=0+0 levelNames=0+0 nRadioGroups=0 nKeyAliases=0 changedGroupNames=0x00 changedVMods=0x0081 keys=0+0 changedIndicators=0x00000000 raw=55066a00e0035b08030000080000000000000000810000000000000000000000
+-names - which=0x1fff min=8 max=255 nTypes=27 groupNames=0x01 virtualMods=0x00ff keys=8+248 indicators=0x00003fff nRadioGroups=0 nKeyAliases=73 nKTLevels=112
++names - which=0x1fff min=8 max=255 nTypes=27 groupNames=0x01 virtualMods=0x007f keys=8+248 indicators=0x00003fff nRadioGroups=0 nKeyAliases=73 nKTLevels=112
+-vmodname 0 'NumLock'
++vmodname 0 'Hyper'
+-vmodname 7 'ScrollLock'
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## case names-levels-only: KTLevelNames 4+2 (Shift Level3 / Ctrl, Base / Caps) with the unused nTypes field 9: nLevelNames 9
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setnames/names-levels-only.bin
+= ok
+e xkb NamesNotify dev=3 changed=0x0080 types=0+0 levelNames=0+9 nRadioGroups=0 nKeyAliases=0 changedGroupNames=0x00 changedVMods=0x0000 keys=0+0 changedIndicators=0x00000000 raw=55066a0063045b08030080000000000900000000000000000000000000000000
+-levelnames 4 n=2 ['Base' 'Alt']
++levelnames 4 n=2 ['Shift Level3' 'Ctrl']
+-levelnames 5 n=2 ['Base' 'Super']
++levelnames 5 n=2 ['Base' 'Caps']
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## case names-types: KeyTypeNames 4+2 swapped (PC_SUPER_LEVEL2, PC_ALT_LEVEL2)
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setnames/names-types.bin
+= ok
+e xkb NamesNotify dev=3 changed=0x0040 types=4+2 levelNames=0+0 nRadioGroups=0 nKeyAliases=0 changedGroupNames=0x00 changedVMods=0x0000 keys=0+0 changedIndicators=0x00000000 raw=55066a00f0045b08030040000402000000000000000000000000000000000000
+-typename 4 'PC_ALT_LEVEL2'
++typename 4 'PC_SUPER_LEVEL2'
+-typename 5 'PC_SUPER_LEVEL2'
++typename 5 'PC_ALT_LEVEL2'
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## case names-indicators: IndicatorNames 0x8001: indicator 0 (Caps Lock) renamed Function, indicator 15 named Keypad; then XTEST Caps Lock
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setnames/names-indicators.bin
+= ok
+e xkb NamesNotify dev=3 changed=0x0100 types=0+0 levelNames=0+0 nRadioGroups=0 nKeyAliases=0 changedGroupNames=0x00 changedVMods=0x0000 keys=0+0 changedIndicators=0x00008001 raw=55066a0067055b08030000010000000000000000000000000180000000000000
+e xkb xkbType=11 dev=3 raw=550b6a0067055b080300040000000000ffbf00000000000000001f0000000000
+-names - which=0x1fff min=8 max=255 nTypes=27 groupNames=0x01 virtualMods=0x00ff keys=8+248 indicators=0x00003fff nRadioGroups=0 nKeyAliases=73 nKTLevels=112
++names - which=0x1fff min=8 max=255 nTypes=27 groupNames=0x01 virtualMods=0x00ff keys=8+248 indicators=0x0000bfff nRadioGroups=0 nKeyAliases=73 nKTLevels=112
+-indname 0 'Caps Lock'
++indname 0 'Function'
++indname 15 'Keypad'
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> down:66
+= ok
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=550075006b055b08030308ff08ff870903000000000000000000000000000000
+e xkb StateNotify dev=3 mods=0x02 base=0x02 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x1f0b keycode=66 eventType=2 req=0.0 raw=550275006b055b080302020002000000000000020202020200000b1f42020000
+e xkb IndicatorStateNotify dev=3 state=0x00000001 changed=0x00000001 raw=550475006b055b08030000000100000001000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b75006b055b080300100000000000ffbf00000100000000001f0000000000
+e core MappingNotify request=1 first=8 count=248 raw=220004000108f800000000000000000000000000000000000000000000000000
+e core MappingNotify request=0 first=0 count=0 raw=2200040000000000000000000000000000000000000000000000000000000000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> up:66
+= ok
+e xkb StateNotify dev=3 mods=0x02 base=0x00 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x0002 keycode=66 eventType=3 req=0.0 raw=55027e0070055b08030200000200000000000002020202020000020042030000
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## case names-aliases-rg: KeyAliases with nKeyAliases 0 (clears them) and RGNames 1 (Function)
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setnames/names-aliases-rg.bin
+= ok
+e xkb NamesNotify dev=3 changed=0x2400 types=0+0 levelNames=0+0 nRadioGroups=1 nKeyAliases=0 changedGroupNames=0x00 changedVMods=0x0000 keys=0+0 changedIndicators=0x00000000 raw=55066a00eb055b08030000240000000000010000000000000000000000000000
+-names - which=0x1fff min=8 max=255 nTypes=27 groupNames=0x01 virtualMods=0x00ff keys=8+248 indicators=0x00003fff nRadioGroups=0 nKeyAliases=73 nKTLevels=112
++names - which=0x3bff min=8 max=255 nTypes=27 groupNames=0x01 virtualMods=0x00ff keys=8+248 indicators=0x00003fff nRadioGroups=1 nKeyAliases=0 nKTLevels=112
+-alias 0 'AC12'->'BKSL'
+-alias 1 'ALGR'->'RALT'
+-alias 2 'MENU'->'COMP'
+-alias 3 'HZTG'->'TLDE'
+-alias 4 'LMTA'->'LWIN'
+-alias 5 'RMTA'->'RWIN'
+-alias 6 'OUTP'->'I235'
+-alias 7 'KITG'->'I236'
+-alias 8 'KIDN'->'I237'
+-alias 9 'KIUP'->'I238'
+-alias 10 'I121'->'MUTE'
+-alias 11 'I122'->'VOL-'
+-alias 12 'I123'->'VOL+'
+-alias 13 'I124'->'POWR'
+-alias 14 'I125'->'KPEQ'
+-alias 15 'I127'->'PAUS'
+-alias 16 'I130'->'HNGL'
+-alias 17 'I131'->'HJCV'
+-alias 18 'I132'->'AE13'
+-alias 19 'I133'->'LWIN'
+-alias 20 'I134'->'RWIN'
+-alias 21 'I135'->'COMP'
+-alias 22 'I136'->'STOP'
+-alias 23 'I137'->'AGAI'
+-alias 24 'I138'->'PROP'
+-alias 25 'I139'->'UNDO'
+-alias 26 'I140'->'FRNT'
+-alias 27 'I141'->'COPY'
+-alias 28 'I142'->'OPEN'
+-alias 29 'I143'->'PAST'
+-alias 30 'I144'->'FIND'
+-alias 31 'I145'->'CUT'
+-alias 32 'I146'->'HELP'
+-alias 33 'I191'->'FK13'
+-alias 34 'I192'->'FK14'
+-alias 35 'I193'->'FK15'
+-alias 36 'I194'->'FK16'
+-alias 37 'I195'->'FK17'
+-alias 38 'I196'->'FK18'
+-alias 39 'I197'->'FK19'
+-alias 40 'I198'->'FK20'
+-alias 41 'I199'->'FK21'
+-alias 42 'I200'->'FK22'
+-alias 43 'I201'->'FK23'
+-alias 44 'I202'->'FK24'
+-alias 45 'MDSW'->'LVL5'
+-alias 46 'KPPT'->'I129'
+-alias 47 'LatQ'->'AD01'
+-alias 48 'LatW'->'AD02'
+-alias 49 'LatE'->'AD03'
+-alias 50 'LatR'->'AD04'
+-alias 51 'LatT'->'AD05'
+-alias 52 'LatY'->'AD06'
+-alias 53 'LatU'->'AD07'
+-alias 54 'LatI'->'AD08'
+-alias 55 'LatO'->'AD09'
+-alias 56 'LatP'->'AD10'
+-alias 57 'LatA'->'AC01'
+-alias 58 'LatS'->'AC02'
+-alias 59 'LatD'->'AC03'
+-alias 60 'LatF'->'AC04'
+-alias 61 'LatG'->'AC05'
+-alias 62 'LatH'->'AC06'
+-alias 63 'LatJ'->'AC07'
+-alias 64 'LatK'->'AC08'
+-alias 65 'LatL'->'AC09'
+-alias 66 'LatZ'->'AB01'
+-alias 67 'LatX'->'AB02'
+-alias 68 'LatC'->'AB03'
+-alias 69 'LatV'->'AB04'
+-alias 70 'LatB'->'AB05'
+-alias 71 'LatN'->'AB06'
+-alias 72 'LatM'->'AB07'
++rgname 0 'Function'
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## case names-keys: KeyNames 38+2 swapped (AC02, AC01)
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setnames/names-keys.bin
+= ok
+e xkb NamesNotify dev=3 changed=0x0200 types=0+0 levelNames=0+0 nRadioGroups=0 nKeyAliases=0 changedGroupNames=0x00 changedVMods=0x0000 keys=38+2 changedIndicators=0x00000000 raw=55066a0070065b08030000020000000000000000000026020000000000000000
+-keyname 38 'AC01'
++keyname 38 'AC02'
+-keyname 39 'AC02'
++keyname 39 'AC01'
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## case names-components: all six component names (keycodes Base, geometry None, symbols Any, phys_symbols Shift, types Caps, compat complete)
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setnames/names-components.bin
+= ok
+e xkb NamesNotify dev=3 changed=0x003f types=0+0 levelNames=0+0 nRadioGroups=0 nKeyAliases=0 changedGroupNames=0x00 changedVMods=0x0000 keys=0+0 changedIndicators=0x00000000 raw=55066a00ec065b0803003f000000000000000000000000000000000000000000
+-name keycodes 'evdev+aliases(qwerty)'
++name keycodes 'Base'
+-name symbols 'pc+gb+inet(evdev)'
++name symbols 'Any'
+-name phys_symbols 'pc+gb+inet(evdev)'
++name phys_symbols 'Shift'
+-name types 'complete'
++name types 'Caps'
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## case geom-alone: the identity SetGeometry on its own: the geometry name None -> pc(pc105)
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setnames/geom-alone.bin
+= ok
+e xkb NamesNotify dev=3 changed=0x0002 types=0+0 levelNames=0+0 nRadioGroups=0 nKeyAliases=0 changedGroupNames=0x00 changedVMods=0x0000 keys=0+0 changedIndicators=0x00000000 raw=55066a006c075b08030002000000000000000000000000000000000000000000
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.20 changed=0x0002 raw=55006a006c075b08030308ff08ff871402000000000000000000000000000000
+e xkb NewKeyboardNotify dev=5 oldDev=5 min=8 max=255 oldMin=8 oldMax=255 req=135.20 changed=0x0002 raw=55006a006c075b08050508ff08ff871402000000000000000000000000000000
+e xkb NewKeyboardNotify dev=7 oldDev=7 min=8 max=255 oldMin=8 oldMax=255 req=135.20 changed=0x0002 raw=55006a006c075b08070708ff08ff871402000000000000000000000000000000
+-name geometry None
++name geometry 'pc(pc105)'
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## case geom-none: the identity SetGeometry named None: the name stays None
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setnames/geom-none.bin
+= ok
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.20 changed=0x0002 raw=55006a00fb075b08030308ff08ff87140200580cfd7f0000c08e7eb548560000
+e xkb NewKeyboardNotify dev=5 oldDev=5 min=8 max=255 oldMin=8 oldMax=255 req=135.20 changed=0x0002 raw=55006a00fb075b08050508ff08ff87140200580cfd7f0000c08e7eb548560000
+e xkb NewKeyboardNotify dev=7 oldDev=7 min=8 max=255 oldMin=8 oldMax=255 req=135.20 changed=0x0002 raw=55006a00fb075b08070708ff08ff87140200580cfd7f0000c08e7eb548560000
+-geometry - name='pc(pc105)' found=1 widthMM=4700 heightMM=1800 nProperties=1 nColors=6 nShapes=15 nSections=4 nDoodads=7 nKeyAliases=2 length=498
++geometry - name=None found=1 widthMM=4700 heightMM=1800 nProperties=1 nColors=6 nShapes=15 nSections=4 nDoodads=7 nKeyAliases=2 length=498
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+## case geom-renamed: the identity SetGeometry after it, named Alpha
+> atoms:xkbcomp-requests/identity/atoms.txt
+= ok atoms=105
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setnames/geom-alone.bin
+= ok
+e xkb NamesNotify dev=3 changed=0x0002 types=0+0 levelNames=0+0 nRadioGroups=0 nKeyAliases=0 changedGroupNames=0x00 changedVMods=0x0000 keys=0+0 changedIndicators=0x00000000 raw=55066a007e085b08030002000000000000000000000000000000000000000000
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.20 changed=0x0002 raw=55006a007e085b08030308ff08ff871402000000000000000000000000000000
+e xkb NewKeyboardNotify dev=5 oldDev=5 min=8 max=255 oldMin=8 oldMax=255 req=135.20 changed=0x0002 raw=55006a007e085b08050508ff08ff871402000000000000000000000000000000
+e xkb NewKeyboardNotify dev=7 oldDev=7 min=8 max=255 oldMin=8 oldMax=255 req=135.20 changed=0x0002 raw=55006a007e085b08070708ff08ff871402000000000000000000000000000000
+-name geometry None
++name geometry 'pc(pc105)'
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0
+> xreq:xkb-setnames/geom-renamed.bin
+= ok
+e xkb NamesNotify dev=3 changed=0x0002 types=0+0 levelNames=0+0 nRadioGroups=0 nKeyAliases=0 changedGroupNames=0x00 changedVMods=0x0000 keys=0+0 changedIndicators=0x00000000 raw=5506730083085b08030002000000000000000000000000000000000000000000
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.20 changed=0x0002 raw=5500730083085b08030308ff08ff871402000000000000000000000000000000
+e xkb NewKeyboardNotify dev=5 oldDev=5 min=8 max=255 oldMin=8 oldMax=255 req=135.20 changed=0x0002 raw=5500730083085b08050508ff08ff871402000000000000000000000000000000
+e xkb NewKeyboardNotify dev=7 oldDev=7 min=8 max=255 oldMin=8 oldMax=255 req=135.20 changed=0x0002 raw=5500730083085b08070708ff08ff871402000000000000000000000000000000
+-name geometry 'pc(pc105)'
++name geometry 'Alpha'
+-geometry - name='pc(pc105)' found=1 widthMM=4700 heightMM=1800 nProperties=1 nColors=6 nShapes=15 nSections=4 nDoodads=7 nKeyAliases=2 length=498
++geometry - name='Alpha' found=1 widthMM=4700 heightMM=1800 nProperties=1 nColors=6 nShapes=15 nSections=4 nDoodads=7 nKeyAliases=2 length=498
+coremodmap kpm=3 0:50,62,0 1:66,0,0 2:37,105,0 3:64,204,205 4:77,0,0 5:203,0,0 6:133,134,206 7:92,0,0

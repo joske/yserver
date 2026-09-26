@@ -114,6 +114,39 @@ impl Default for IdAllocator {
     }
 }
 
+/// Xorg's per-client XKB state (`ClientRec`, xkb/xkb.c): whether the
+/// client called XkbUseExtension, and the two XkbSelectEvents detail masks
+/// Xorg keeps per client rather than per device.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct XkbClientState {
+    /// `_XkbClientInitialized`: a successful XkbUseExtension. Every other
+    /// XKB request answers BadAccess without it.
+    pub initialized: bool,
+    /// `_XkbClientIsAncient`: XkbUseExtension asked for version 0.65.
+    pub ancient: bool,
+    /// `mapNotifyMask`: the XkbMapNotify details (map parts) selected.
+    pub map_notify_mask: u16,
+    /// `newKeyboardNotifyMask`: the XkbNewKeyboardNotify details selected.
+    pub new_keyboard_notify_mask: u16,
+}
+
+/// One client's interest in one XKB device (`XkbInterestRec`): the
+/// XkbSelectEvents detail mask of every event but MapNotify and
+/// NewKeyboardNotify (which Xorg keeps per client, [`XkbClientState`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct XkbInterest {
+    pub state: u16,
+    pub controls: u32,
+    pub indicator_state: u32,
+    pub indicator_map: u32,
+    pub names: u16,
+    pub compat: u8,
+    pub bell: u8,
+    pub action_message: u8,
+    pub access_x: u16,
+    pub extension_device: u16,
+}
+
 #[derive(Debug, Default)]
 pub struct AtomTable {
     by_name: HashMap<String, AtomId>,
@@ -165,6 +198,27 @@ impl AtomTable {
     pub fn exists(&self, atom: AtomId) -> bool {
         atom.0 != 0
             && (x11::well_known_atom_name(atom).is_some() || self.names.contains_key(&atom.0))
+    }
+
+    /// Intern `name` as atom `atom`, as a server that already interned it
+    /// at that id would have: false (and nothing changes) when the name or
+    /// the id is taken, or the id is a predefined one. Replaying recorded
+    /// requests (#171's xkbcomp captures) needs their atoms to mean the
+    /// same names.
+    pub fn intern_at(&mut self, atom: AtomId, name: &str) -> bool {
+        if atom.0 < 69
+            || x11::well_known_atom(name).is_some()
+            || self.by_name.contains_key(name)
+            || self.names.contains_key(&atom.0)
+        {
+            return false;
+        }
+        self.by_name.insert(name.to_owned(), atom);
+        self.names.insert(atom.0, name.to_owned());
+        if atom.0 >= self.next_id {
+            self.next_id = atom.0 + 1;
+        }
+        true
     }
 
     /// Register a synthetic name-atom pair at a caller-chosen id. Used
@@ -954,8 +1008,12 @@ pub struct ServerState {
     /// produced a warning. Repeated requests remain visible at debug level
     /// without flooding ordinary desktop layout reapplication logs.
     pub(crate) randr_unsupported_warned_mask: u64,
-    /// XKB SelectEvents masks: (client, device spec) -> selected event mask.
-    pub xkb_select_event_masks: HashMap<(u32, u16), u16>,
+    /// Xorg's per-client XKB state (`ClientRec.xkbClientFlags`,
+    /// `mapNotifyMask`, `newKeyboardNotifyMask`), by client.
+    pub xkb_clients: HashMap<u32, XkbClientState>,
+    /// Xorg's per-device XKB interest (`XkbInterestRec`, the other
+    /// XkbSelectEvents detail masks): (client, device spec) -> masks.
+    pub xkb_interests: HashMap<(u32, u16), XkbInterest>,
     /// Selection ownership: maps selection atom → (owning window,
     /// `lastTimeChanged` in ms). `lastTimeChanged` is the timestamp
     /// from the `SetSelectionOwner` request that produced this entry;
@@ -1434,7 +1492,8 @@ impl ServerState {
             randr_primary_output_explicit: false,
             randr_output_properties: HashMap::new(),
             randr_unsupported_warned_mask: 0,
-            xkb_select_event_masks: HashMap::new(),
+            xkb_clients: HashMap::new(),
+            xkb_interests: HashMap::new(),
             selections: HashMap::new(),
             pointer_root: (0, 0),
             active_pointer_grab: None,

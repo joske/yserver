@@ -22,7 +22,10 @@
  * new GetMap snapshot diffed against the one taken before the step.
  *
  * Usage:
- *   xkb-mutation-probe [-d DISPLAY] STEP [STEP ...]
+ *   xkb-mutation-probe [-d DISPLAY] [-x] STEP [STEP ...]
+ * -x (extended) also snapshots GetCompatMap / GetIndicatorMap / GetNames /
+ * the GetGeometry header after every step and prints their delta (see
+ * "Extended output" below).
  * steps (one argv word each, fields ':'-separated, keysyms hex):
  *   ckm:FIRST:KPK:COUNT:SYM,SYM,...   raw ChangeKeyboardMapping (nsyms =
  *                                     number of syms listed, may be empty)
@@ -35,6 +38,19 @@
  *   down:KC / up:KC                   XTEST FakeInput KeyPress / KeyRelease
  *   run:SHELL COMMAND                 run an external client (e.g. xkbcomp
  *                                     upload) as the actor; exit status recorded
+ *   atoms:FILE                        the actor interns every "0xATOM NAME"
+ *                                     line of FILE in order and dies unless
+ *                                     each gets the recorded value (so a
+ *                                     replayed request's atoms mean the same)
+ *   xreq:FILE                         the actor (after its XkbUseExtension)
+ *                                     sends the one request in binary FILE,
+ *                                     byte-exact but for the XKB major opcode;
+ *                                     an error prints '= error=E value=V
+ *                                     major=M minor=N'
+ *   xreq0:FILE                        as xreq:, but sent on a fresh connection
+ *                                     that never called XkbUseExtension
+ *   full                              (-x) print the whole current state as
+ *                                     '= ' lines, no step taken
  *   total                             diff the current map against the map
  *                                     taken before the first step
  *
@@ -56,6 +72,23 @@
  *   repeat KC A->B                    XkbGetControls per-key repeat bit changed
  *   coremodmap kpm=K 0:k,k.. 1:.. ... 7:..   GetModifierMapping after step
  *
+ * Extended output (-x): the rest of the description as keyed lines
+ * "KIND ID VALUE..." (key = first two words), atoms by name ('None' = 0),
+ * printed as "-LINE" / "+LINE" when a key's line changed, appeared or went:
+ *   controls - numGroups= groupsWrap=             GetControls (the rest is in the base lines)
+ *   compat - groups= firstSI= nSI= nTotalSI=      GetCompatMap(getAllSI, groups 0x0f)
+ *   si N sym= mods= match= vmod= flags= act=16hex one sym interpret
+ *   groupcompat G mask= real= vmods=
+ *   indicators - which= realIndicators= nIndicators=   GetIndicatorMap(all)
+ *   indmap N flags= whichGroups= groups= whichMods= mods= realMods= vmods= ctrls=
+ *   names - which= min= max= nTypes= ...           GetNames(all) header
+ *   name keycodes|geometry|symbols|phys_symbols|types|compat NAME
+ *   typename N NAME / levelnames N n=L [NAME ...]  ('?' = a slot Xorg has
+ *                                                  not initialised, see take_xsnap)
+ *   indname N / vmodname N / groupname G NAME, keyname KC 'NAME',
+ *   alias N 'ALIAS'->'REAL', rgname N NAME
+ *   geometry - name= found= widthMM= heightMM= nProperties= ... length=
+ *
  * Build:
  *   cc -O1 -Wall -o xkb-mutation-probe tools/xkb-mutation-probe.c \
  *      $(pkg-config --cflags --libs xcb xcb-xkb xcb-xtest)
@@ -64,8 +97,10 @@
  * xorg-xkb-change-keyboard-mapping.txt, xorg-xkb-set-modifier-mapping.txt,
  * xorg-xkbcomp-upload-trace.txt):
  *
- *   tools/xkb-mutation-goldens.sh            # all three
- *   tools/xkb-mutation-goldens.sh smm        # or ckm / smm / xkbcomp
+ *   tools/xkb-mutation-goldens.sh            # all of them
+ *   tools/xkb-mutation-goldens.sh smm        # or ckm / smm / xkbcomp / repeat /
+ *                                            # pristine / steps (phase 4: -x,
+ *                                            # atoms:, xreq:, full)
  *
  * It builds this probe, and for each case starts a fresh `Xvfb :92 -noreset`,
  * runs `setxkbmap -rules evdev -model pc105 -layout L [-option O]`, then one
@@ -74,6 +109,7 @@
  * Never hand-edit the goldens; rerun the script. In raw event hex the
  * sequence number (bytes 2-3) and timestamp (bytes 4-7) differ between runs.
  */
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -316,6 +352,441 @@ static void core_modmap(void)
     free(r);
 }
 
+/* ---- extended state (-x): compat map, names, indicator maps, geometry --- */
+
+/* The rest of the XKB description, as keyed lines "KIND ID VALUE..." (the
+ * key is the first two words). Atoms are printed by name, so the lines
+ * compare across servers. */
+struct xsnap {
+    int n;
+    char **line;
+    int valid;          /* taken (nlevels meaningful) */
+    int ntypes;
+    int nlevels[256];   /* GetNames level count per type */
+};
+
+static int extended; /* -x: also snapshot/diff the xsnap parts */
+static uint8_t xkb_major;
+
+static unsigned u16c(const uint8_t *e, int o) { return e[o] | e[o + 1] << 8; }
+static unsigned u32c(const uint8_t *e, int o)
+{
+    return e[o] | e[o + 1] << 8 | e[o + 2] << 16 | (unsigned)e[o + 3] << 24;
+}
+static void report_error(xcb_generic_error_t *err);
+
+static void xs_add(struct xsnap *s, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+static void xs_add(struct xsnap *s, const char *fmt, ...)
+{
+    char buf[8192];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    s->line = realloc(s->line, (s->n + 1) * sizeof *s->line);
+    if (!s->line)
+        die("oom");
+    s->line[s->n++] = xstrdup(buf);
+}
+
+static void xs_free(struct xsnap *s)
+{
+    for (int i = 0; i < s->n; i++)
+        free(s->line[i]);
+    free(s->line);
+    memset(s, 0, sizeof *s);
+}
+
+/* atom -> name, cached per run (atoms are never freed while the server runs) */
+static struct {
+    uint32_t atom;
+    char *name;
+} atom_cache[4096];
+static int n_atom_cache;
+
+static const char *atom_name(uint32_t a)
+{
+    if (!a)
+        return "None";
+    for (int i = 0; i < n_atom_cache; i++)
+        if (atom_cache[i].atom == a)
+            return atom_cache[i].name;
+    xcb_get_atom_name_reply_t *r = xcb_get_atom_name_reply(xl, xcb_get_atom_name(xl, a), NULL);
+    char buf[512];
+    if (r) {
+        int len = xcb_get_atom_name_name_length(r);
+        snprintf(buf, sizeof buf, "'%.*s'", len, xcb_get_atom_name_name(r));
+        free(r);
+    } else
+        snprintf(buf, sizeof buf, "BadAtom(0x%x)", a);
+    if (n_atom_cache == 4096)
+        die("atom cache full");
+    atom_cache[n_atom_cache].atom = a;
+    atom_cache[n_atom_cache].name = xstrdup(buf);
+    return atom_cache[n_atom_cache++].name;
+}
+
+/* Level names Xorg has not initialised, printed as '?': XkbResizeKeyType
+ * reallocarray()s a type's level_names when SetMap gives it more levels
+ * than it had (a type index SetMap adds starts with none) and never fills
+ * the new slots, so until SetNames writes that type's level names they are
+ * uninitialised memory that differs run to run (seen: None, 'PRIMARY',
+ * BadAtom). Tracked for the xreq: steps (the probe knows their requests);
+ * a run: step is assumed to finish with SetNames, as xkbcomp does. */
+static unsigned char level_uninit[256][256];
+
+static void take_xsnap(struct xsnap *s)
+{
+    memset(s, 0, sizeof *s);
+    s->valid = 1;
+    const uint8_t *b, *p;
+
+    /* GetControls fields the base snapshot does not print */
+    xcb_xkb_get_controls_reply_t *ct =
+        xcb_xkb_get_controls_reply(xl, xcb_xkb_get_controls(xl, DEV_CORE), NULL);
+    if (!ct)
+        die("GetControls failed");
+    xs_add(s, "controls - numGroups=%d groupsWrap=0x%02x", ct->numGroups, ct->groupsWrap);
+    free(ct);
+
+    /* GetCompatMap: all interprets, all four groups */
+    xcb_xkb_get_compat_map_reply_t *c = xcb_xkb_get_compat_map_reply(
+        xl, xcb_xkb_get_compat_map(xl, DEV_CORE, 0x0f, 1, 0, 0), NULL);
+    if (!c)
+        die("GetCompatMap failed");
+    b = (const uint8_t *)c;
+    int groups = b[8], nsi = u16c(b, 12);
+    xs_add(s, "compat - groups=0x%02x firstSI=%d nSI=%d nTotalSI=%d", groups, u16c(b, 10), nsi,
+           u16c(b, 14));
+    p = b + 32;
+    for (int i = 0; i < nsi; i++, p += 16)
+        xs_add(s, "si %d sym=%x mods=%02x match=%02x vmod=%d flags=%02x act=%02x%02x%02x%02x%02x%02x%02x%02x",
+               i, u32c(p, 0), p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12], p[13],
+               p[14], p[15]);
+    for (int g = 0; g < 4; g++)
+        if (groups & (1 << g)) {
+            xs_add(s, "groupcompat %d mask=%02x real=%02x vmods=%04x", g + 1, p[0], p[1],
+                   u16c(p, 2));
+            p += 4;
+        }
+    if (p - b != 32 + 4 * (long)c->length)
+        die("GetCompatMap reply parse did not end at the reply length");
+    free(c);
+
+    /* GetIndicatorMap: all 32 */
+    xcb_xkb_get_indicator_map_reply_t *im = xcb_xkb_get_indicator_map_reply(
+        xl, xcb_xkb_get_indicator_map(xl, DEV_CORE, 0xffffffff), NULL);
+    if (!im)
+        die("GetIndicatorMap failed");
+    b = (const uint8_t *)im;
+    uint32_t which = u32c(b, 8);
+    xs_add(s, "indicators - which=0x%08x realIndicators=0x%08x nIndicators=%d", which, u32c(b, 12),
+           b[16]);
+    p = b + 32;
+    for (int i = 0; i < 32; i++)
+        if (which & (1u << i)) {
+            xs_add(s, "indmap %d flags=%02x whichGroups=%02x groups=%02x whichMods=%02x mods=%02x "
+                      "realMods=%02x vmods=%04x ctrls=%08x",
+                   i, p[0], p[1], p[2], p[3], p[4], p[5], u16c(p, 6), u32c(p, 8));
+            p += 12;
+        }
+    if (p - b != 32 + 4 * (long)im->length)
+        die("GetIndicatorMap reply parse did not end at the reply length");
+    free(im);
+
+    /* GetNames: everything */
+    xcb_xkb_get_names_reply_t *nm =
+        xcb_xkb_get_names_reply(xl, xcb_xkb_get_names(xl, DEV_CORE, 0x3fff), NULL);
+    if (!nm)
+        die("GetNames failed");
+    b = (const uint8_t *)nm;
+    uint32_t nw = u32c(b, 8);
+    int nTypes = b[14], groupNames = b[15], vmods = u16c(b, 16), firstKey = b[18], nKeys = b[19];
+    uint32_t inds = u32c(b, 20);
+    int nRG = b[24], nAliases = b[25], nKTLevels = u16c(b, 26);
+    xs_add(s, "names - which=0x%04x min=%d max=%d nTypes=%d groupNames=0x%02x virtualMods=0x%04x "
+              "keys=%d+%d indicators=0x%08x nRadioGroups=%d nKeyAliases=%d nKTLevels=%d",
+           nw, b[12], b[13], nTypes, groupNames, vmods, firstKey, nKeys, inds, nRG, nAliases,
+           nKTLevels);
+    p = b + 32;
+    static const char *const comp[6] = {"keycodes", "geometry", "symbols",
+                                        "phys_symbols", "types", "compat"};
+    for (int i = 0; i < 6; i++)
+        if (nw & (1u << i)) {
+            xs_add(s, "name %s %s", comp[i], atom_name(u32c(p, 0)));
+            p += 4;
+        }
+    if (nw & 0x40)
+        for (int t = 0; t < nTypes; t++, p += 4)
+            xs_add(s, "typename %d %s", t, atom_name(u32c(p, 0)));
+    if (nw & 0x80) {
+        const uint8_t *nl = p;
+        p += (nTypes + 3) & ~3;
+        s->ntypes = nTypes;
+        for (int t = 0; t < nTypes; t++) {
+            char buf[4096], *q = buf;
+            s->nlevels[t] = nl[t];
+            q += sprintf(q, "n=%d [", nl[t]);
+            for (int l = 0; l < nl[t]; l++, p += 4)
+                q += snprintf(q, sizeof buf - (q - buf), "%s%s", l ? " " : "",
+                              level_uninit[t][l] ? "?" : atom_name(u32c(p, 0)));
+            sprintf(q, "]");
+            xs_add(s, "levelnames %d %s", t, buf);
+        }
+    }
+    if (nw & 0x100)
+        for (int i = 0; i < 32; i++)
+            if (inds & (1u << i)) {
+                xs_add(s, "indname %d %s", i, atom_name(u32c(p, 0)));
+                p += 4;
+            }
+    /* XKB.h bits: KeyNames 0x200, KeyAliases 0x400, VirtualModNames 0x800,
+     * GroupNames 0x1000, RGNames 0x2000; the reply's sections come in
+     * XkbSendNames order: vmods, groups, keys, aliases, radio groups. */
+    if (nw & 0x800)
+        for (int i = 0; i < 16; i++)
+            if (vmods & (1 << i)) {
+                xs_add(s, "vmodname %d %s", i, atom_name(u32c(p, 0)));
+                p += 4;
+            }
+    if (nw & 0x1000)
+        for (int i = 0; i < 4; i++)
+            if (groupNames & (1 << i)) {
+                xs_add(s, "groupname %d %s", i + 1, atom_name(u32c(p, 0)));
+                p += 4;
+            }
+    if (nw & 0x200)
+        for (int k = 0; k < nKeys; k++, p += 4)
+            xs_add(s, "keyname %d '%.4s'", firstKey + k, (const char *)p);
+    if (nw & 0x400)
+        for (int a = 0; a < nAliases; a++, p += 8)
+            xs_add(s, "alias %d '%.4s'->'%.4s'", a, (const char *)p + 4, (const char *)p);
+    if (nw & 0x2000)
+        for (int r = 0; r < nRG; r++, p += 4)
+            xs_add(s, "rgname %d %s", r, atom_name(u32c(p, 0)));
+    if (p - b != 32 + 4 * (long)nm->length)
+        die("GetNames reply parse did not end at the reply length");
+    free(nm);
+
+    /* GetGeometry: header only (what SetGeometry replaced). xcb-xkb has no
+     * GetGeometry, so it goes out raw: deviceSpec, pad, name=None */
+    uint8_t greq[12] = {xkb_major, 19, 3, 0, DEV_CORE & 0xff, DEV_CORE >> 8, 0, 0, 0, 0, 0, 0};
+    struct iovec gv[3];
+    gv[2].iov_base = greq;
+    gv[2].iov_len = sizeof greq;
+    xcb_protocol_request_t greqd = {.count = 1, .ext = NULL, .opcode = 19, .isvoid = 0};
+    unsigned gseq = xcb_send_request(xl, XCB_REQUEST_CHECKED | XCB_REQUEST_RAW, gv + 2, &greqd);
+    xcb_generic_error_t *gerr = NULL;
+    uint8_t *g = xcb_wait_for_reply(xl, gseq, &gerr);
+    if (!g)
+        die("GetGeometry failed");
+    b = g;
+    xs_add(s, "geometry - name=%s found=%d widthMM=%d heightMM=%d nProperties=%d nColors=%d "
+              "nShapes=%d nSections=%d nDoodads=%d nKeyAliases=%d length=%u",
+           atom_name(u32c(b, 8)), b[12], u16c(b, 14), u16c(b, 16), u16c(b, 18), u16c(b, 20),
+           u16c(b, 22), u16c(b, 24), u16c(b, 26), u16c(b, 28), u32c(b, 4));
+    free(g);
+}
+
+/* key of a line = its first two words */
+static int xs_keylen(const char *l)
+{
+    const char *sp = strchr(l, ' ');
+    if (!sp)
+        return strlen(l);
+    sp = strchr(sp + 1, ' ');
+    return sp ? sp - l : (int)strlen(l);
+}
+
+static int xs_find(const struct xsnap *s, const char *l)
+{
+    int k = xs_keylen(l);
+    for (int i = 0; i < s->n; i++)
+        if (xs_keylen(s->line[i]) == k && !strncmp(s->line[i], l, k))
+            return i;
+    return -1;
+}
+
+static void diff_xsnap(const struct xsnap *a, const struct xsnap *b)
+{
+    for (int i = 0; i < a->n; i++) {
+        int j = xs_find(b, a->line[i]);
+        if (j < 0)
+            printf("-%s\n", a->line[i]);
+        else if (strcmp(a->line[i], b->line[j])) {
+            printf("-%s\n", a->line[i]);
+            printf("+%s\n", b->line[j]);
+        }
+    }
+    for (int j = 0; j < b->n; j++)
+        if (xs_find(a, b->line[j]) < 0)
+            printf("+%s\n", b->line[j]);
+}
+
+/* the whole current state: GetMap, GetControls, core modmap, and the xsnap */
+static void print_full(const struct snap *s, const struct xsnap *x)
+{
+    printf("= keys %d..%d ntypes %d enabledControls 0x%08x\n", s->min, s->max, s->ntypes,
+           s->enabled);
+    for (int t = 0; t < s->ntypes; t++)
+        printf("= type %d %s\n", t, s->types[t] ? s->types[t] : "-");
+    printf("= vmods ");
+    for (int i = 0; i < 16; i++)
+        printf("%s%02x", i ? "," : "", s->vmods[i]);
+    printf("\n= repeat ");
+    for (int i = 0; i < 32; i++)
+        printf("%02x", s->repeat[i]);
+    printf("\n");
+    for (int k = s->min; k <= s->max; k++)
+        printf("= key %d %s\n", k, s->keys[k]);
+    for (int i = 0; i < x->n; i++)
+        printf("= %s\n", x->line[i]);
+}
+
+/* ---- raw XKB requests (xkbcomp replay) --------------------------------- */
+
+static int actor_xkb_ready;
+
+/* intern every "0xVALUE NAME" line of PATH on the actor, in order, and die
+ * unless each atom gets the value recorded: a replayed request carries the
+ * recording server's atoms, so they must mean the same names here */
+static void intern_atoms(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f)
+        die("atoms: cannot open file");
+    char line[1024];
+    int n = 0;
+    while (fgets(line, sizeof line, f)) {
+        char *nl = strchr(line, '\n');
+        if (nl)
+            *nl = 0;
+        char *sp = strchr(line, ' ');
+        if (!sp)
+            continue;
+        uint32_t want = strtoul(line, NULL, 16);
+        const char *name = sp + 1;
+        xcb_intern_atom_reply_t *r = xcb_intern_atom_reply(
+            ac, xcb_intern_atom(ac, 0, strlen(name), name), NULL);
+        if (!r)
+            die("atoms: InternAtom failed");
+        if (r->atom != want) {
+            fprintf(stderr, "xkb-mutation-probe: atom '%s' is 0x%x here, 0x%x recorded\n", name,
+                    r->atom, want);
+            exit(1);
+        }
+        free(r);
+        n++;
+    }
+    fclose(f);
+    printf("= ok atoms=%d\n", n);
+}
+
+/* an XKB request's error, with its opcodes (the xreq steps) */
+static void report_xkb_error(xcb_generic_error_t *err)
+{
+    if (err) {
+        printf("= error=%d value=%u major=%d minor=%d\n", err->error_code, err->resource_id,
+               err->major_code, err->minor_code);
+        free(err);
+    } else
+        printf("= ok\n");
+}
+
+/* send the one request in binary file PATH (header included) on connection
+ * C, with the XKB major opcode of this server */
+static void send_raw_xkb(xcb_connection_t *c, const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        die("xreq: cannot open file");
+    static uint8_t buf[1 << 18];
+    size_t n = fread(buf, 1, sizeof buf, f);
+    fclose(f);
+    if (n < 4 || n % 4 || (size_t)(buf[2] | buf[3] << 8) * 4 != n)
+        die("xreq: file is not one request");
+    buf[0] = xkb_major;
+    struct iovec v[3];
+    v[2].iov_base = buf;
+    v[2].iov_len = n;
+    xcb_protocol_request_t req = {.count = 1, .ext = NULL, .opcode = buf[1], .isvoid = 1};
+    unsigned seq = xcb_send_request(c, XCB_REQUEST_CHECKED | XCB_REQUEST_RAW, v + 2, &req);
+    xcb_void_cookie_t ck = {seq};
+    report_xkb_error(xcb_request_check(c, ck));
+}
+
+/* xreq: on the actor, after its XkbUseExtension */
+static void send_xkb_request(const char *path)
+{
+    if (!actor_xkb_ready) {
+        xcb_xkb_use_extension_reply_t *ue =
+            xcb_xkb_use_extension_reply(ac, xcb_xkb_use_extension(ac, 1, 0), NULL);
+        if (!ue || !ue->supported)
+            die("actor UseExtension failed");
+        free(ue);
+        actor_xkb_ready = 1;
+    }
+    send_raw_xkb(ac, path);
+}
+
+static xcb_connection_t *open_conn(const char *d);
+static const char *display_name;
+
+/* xreq0: on a fresh connection that never calls XkbUseExtension */
+static void send_xkb_request_uninitialised(const char *path)
+{
+    xcb_connection_t *c = open_conn(display_name);
+    send_raw_xkb(c, path);
+    xcb_disconnect(c);
+}
+
+/* update level_uninit for step ARG, BEFORE = the state before it: a SetMap
+ * with key types marks the slots past each type's old level count, a SetNames
+ * with level names clears the types it writes, a run: step clears all */
+static void track_level_names(const char *arg, const struct xsnap *before)
+{
+    if (!strncmp(arg, "run:", 4)) {
+        memset(level_uninit, 0, sizeof level_uninit);
+        return;
+    }
+    if (strncmp(arg, "xreq:", 5))
+        return;
+    FILE *f = fopen(arg + 5, "rb");
+    if (!f)
+        die("xreq: cannot open file");
+    static uint8_t b[1 << 18];
+    size_t n = fread(b, 1, sizeof b, f);
+    fclose(f);
+    if (n >= 36 && b[1] == 9 && (u16c(b, 6) & 0x01)) {
+        /* SetMap: firstType@12 nTypes@13; each xkbKeyTypeWireDesc is 8 bytes
+         * (numLevels@4 nMapEntries@5 preserve@6), then nMapEntries 4-byte
+         * xkbKTSetMapEntryWireDesc, then as many xkbModsWireDesc if preserve */
+        int first = b[12], nt = b[13];
+        const uint8_t *p = b + 36;
+        for (int i = 0; i < nt && p + 8 <= b + n; i++) {
+            int ty = first + i, lv = p[4], ne = p[5], pre = p[6];
+            int old = ty < before->ntypes ? before->nlevels[ty] : 0;
+            for (int l = old; l < lv; l++)
+                level_uninit[ty][l] = 1;
+            p += 8 + ne * 4 + (pre ? ne * 4 : 0);
+        }
+    } else if (n >= 28 && b[1] == 18 && (u32c(b, 8) & 0x80)) {
+        /* SetNames with KTLevelNames: widths after the component atoms and
+         * the type names; a type with width 0 keeps its level names */
+        uint32_t which = u32c(b, 8);
+        int ntn = b[13], firstKT = b[14], nKT = b[15], off = 28;
+        for (int i = 0; i < 6; i++)
+            if (which & (1u << i))
+                off += 4;
+        if (which & 0x40)
+            off += 4 * ntn;
+        for (int i = 0; i < nKT && off + i < (int)n; i++)
+            if (b[off + i])
+                memset(level_uninit[firstKT + i], 0, sizeof level_uninit[0]);
+    }
+}
+
 /* ---- events ------------------------------------------------------------ */
 
 static void hex32(const uint8_t *e)
@@ -530,6 +1001,18 @@ static void step(char *arg)
         printf("= exit=%d\n", WIFEXITED(rc) ? WEXITSTATUS(rc) : -1);
         return;
     }
+    if (!strncmp(arg, "atoms:", 6)) {
+        intern_atoms(arg + 6);
+        return;
+    }
+    if (!strncmp(arg, "xreq:", 5)) {
+        send_xkb_request(arg + 5);
+        return;
+    }
+    if (!strncmp(arg, "xreq0:", 6)) {
+        send_xkb_request_uninitialised(arg + 6);
+        return;
+    }
     char *f[8];
     char *copy = xstrdup(arg);
     int n = split(copy, ':', f, 8);
@@ -593,8 +1076,13 @@ int main(int argc, char **argv)
         disp = argv[2];
         i = 3;
     }
+    if (i < argc && !strcmp(argv[i], "-x")) {
+        extended = 1;
+        i++;
+    }
     if (i >= argc)
-        die("usage: xkb-mutation-probe [-d DISPLAY] STEP...");
+        die("usage: xkb-mutation-probe [-d DISPLAY] [-x] STEP...");
+    display_name = disp;
     xl = open_conn(disp);
     cl = open_conn(disp);
     ac = open_conn(disp);
@@ -603,6 +1091,7 @@ int main(int argc, char **argv)
     if (!qe || !qe->present)
         die("no XKB");
     xkb_event_base = qe->first_event;
+    xkb_major = qe->major_opcode;
     xcb_xkb_use_extension_reply_t *ue =
         xcb_xkb_use_extension_reply(xl, xcb_xkb_use_extension(xl, 1, 0), NULL);
     if (!ue || !ue->supported)
@@ -620,18 +1109,42 @@ int main(int argc, char **argv)
     drain();
 
     struct snap first, before, after;
+    struct xsnap xfirst = {0}, xbefore = {0}, xafter = {0};
     take_snap(&first);
     take_snap(&before);
+    if (extended) {
+        take_xsnap(&xfirst);
+        take_xsnap(&xbefore);
+    }
     for (; i < argc; i++) {
         if (!strcmp(argv[i], "total")) {
             printf("> total\n");
             diff_snap(&first, &before);
+            if (extended)
+                diff_xsnap(&xfirst, &xbefore);
+            continue;
+        }
+        if (!strcmp(argv[i], "full")) {
+            /* the whole current state (needs -x) */
+            if (!extended)
+                die("full needs -x");
+            printf("> full\n");
+            print_full(&before, &xbefore);
+            core_modmap();
             continue;
         }
         step(argv[i]);
         drain();
         take_snap(&after);
         diff_snap(&before, &after);
+        if (extended) {
+            track_level_names(argv[i], &xbefore);
+            take_xsnap(&xafter);
+            diff_xsnap(&xbefore, &xafter);
+            xs_free(&xbefore);
+            xbefore = xafter;
+            memset(&xafter, 0, sizeof xafter);
+        }
         core_modmap();
         snap_free(&before);
         before = after;

@@ -1,0 +1,41 @@
+# Xorg's key-width resizing in XKB SetMap (XkbResizeKeyType, issue #171 phase 4c):
+# Xvfb -noreset, fresh server per case, layout=us,ru option=grp:alt_shift_toggle
+# server: X.Org version 21.1.24 (xdpyinfo); `Xvfb -version` -> "Unrecognized option: -version" (not supported by this build)
+# pacman -Q: xkeyboard-config 2.48-1 xorg-server-xvfb 21.1.24-1
+# each case: setxkbmap -rules evdev -model pc105 -layout us,ru -option grp:alt_shift_toggle;
+# then tools/xkb-mutation-probe.c -x xreq:xkb-setmap-resize/NAME.bin (the actor, after its
+# XkbUseExtension). The request is built by this script (the '## case' line says what it
+# changes); output grammar as in xorg-xkbcomp-steps.txt, the state before is
+# xorg-xkb-pristine.txt's layout=us,ru case.
+## case grow-four-level: FOUR_LEVEL (type 11) with 5 levels, its entries unchanged
+> xreq:xkb-setmap-resize/grow-four-level.bin
+= ok
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0001 min=8 max=255 types=11+1 syms=0+0 acts=0+0 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55016200d4b52d080300010008ff0b0100000000000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0001 min=8 max=255 types=11+1 syms=0+0 acts=0+0 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55016200d4b52d080500010008ff0b0100000000000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0001 min=8 max=255 types=11+1 syms=0+0 acts=0+0 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=55016200d4b52d080700010008ff0b0100000000000000000000000000000000
+-type 11 mods=01/0004 lv=4 map=[1:01/0000->1 1:00/0004->2 1:01/0004->3]
++type 11 mods=01/0004 lv=5 map=[1:01/0000->1 1:00/0004->2 1:01/0004->3]
+- 17 kt=1,11,0,0 gi=0x02 w=4 syms=38,2a,0,0,38,2a,10020bd,0 acts=- beh=00:00 expl=0x02 mm=0x00 vmm=0x0000
++ 17 kt=1,11,0,0 gi=0x02 w=4 syms=38,2a,0,0,0,38,2a,10020bd acts=- beh=00:00 expl=0x02 mm=0x00 vmm=0x0000
+- 94 kt=11,1,0,0 gi=0x02 w=4 syms=3c,3e,7c,a6,2f,7c,0,0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 94 kt=11,1,0,0 gi=0x02 w=4 syms=3c,3e,7c,a6,0,2f,7c,0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+-names - which=0x1fff min=8 max=255 nTypes=27 groupNames=0x03 virtualMods=0x00ff keys=8+248 indicators=0x00003fff nRadioGroups=0 nKeyAliases=73 nKTLevels=112
++names - which=0x1fff min=8 max=255 nTypes=27 groupNames=0x03 virtualMods=0x00ff keys=8+248 indicators=0x00003fff nRadioGroups=0 nKeyAliases=73 nKTLevels=113
+-levelnames 11 n=4 ['Base' 'Shift' 'AltGr' 'Shift AltGr']
++levelnames 11 n=5 ['Base' 'Shift' 'AltGr' 'Shift AltGr' ?]
+coremodmap kpm=4 0:50,62,0,0 1:66,0,0,0 2:37,105,0,0 3:64,108,204,205 4:77,0,0,0 5:203,0,0,0 6:133,134,206,0 7:92,0,0,0
+## case shrink-four-level: FOUR_LEVEL (type 11) with 3 levels, its level-4 entry dropped
+> xreq:xkb-setmap-resize/shrink-four-level.bin
+= ok
+e xkb MapNotify dev=3 ptrBtnActions=0 changed=0x0001 min=8 max=255 types=11+1 syms=0+0 acts=0+0 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=550162005db62d080300010008ff0b0100000000000000000000000000000000
+e xkb MapNotify dev=5 ptrBtnActions=0 changed=0x0001 min=8 max=255 types=11+1 syms=0+0 acts=0+0 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=550162005db62d080500010008ff0b0100000000000000000000000000000000
+e xkb MapNotify dev=7 ptrBtnActions=0 changed=0x0001 min=8 max=255 types=11+1 syms=0+0 acts=0+0 beh=0+0 expl=0+0 modmap=0+0 vmodmap=0+0 vmods=0x0000 raw=550162005db62d080700010008ff0b0100000000000000000000000000000000
+-type 11 mods=01/0004 lv=4 map=[1:01/0000->1 1:00/0004->2 1:01/0004->3]
++type 11 mods=01/0004 lv=3 map=[1:01/0000->1 1:00/0004->2]
+- 94 kt=11,1,0,0 gi=0x02 w=4 syms=3c,3e,7c,a6,2f,7c,0,0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
++ 94 kt=11,1,0,0 gi=0x02 w=4 syms=3c,3e,7c,0,2f,7c,0,0 acts=- beh=00:00 expl=0x01 mm=0x00 vmm=0x0000
+-names - which=0x1fff min=8 max=255 nTypes=27 groupNames=0x03 virtualMods=0x00ff keys=8+248 indicators=0x00003fff nRadioGroups=0 nKeyAliases=73 nKTLevels=112
++names - which=0x1fff min=8 max=255 nTypes=27 groupNames=0x03 virtualMods=0x00ff keys=8+248 indicators=0x00003fff nRadioGroups=0 nKeyAliases=73 nKTLevels=111
+-levelnames 11 n=4 ['Base' 'Shift' 'AltGr' 'Shift AltGr']
++levelnames 11 n=3 ['Base' 'Shift' 'AltGr']
+coremodmap kpm=4 0:50,62,0,0 1:66,0,0,0 2:37,105,0,0 3:64,108,204,205 4:77,0,0,0 5:203,0,0,0 6:133,134,206,0 7:92,0,0,0

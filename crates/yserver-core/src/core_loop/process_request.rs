@@ -100,6 +100,14 @@ const PRESENT_ALL_OPTIONS: u32 = 0x1f;
 // lease lookup reports BadValue. See the FreeLease arm.
 const XINPUT_LAST_REQUEST: u8 = 61;
 const XKB_LAST_REQUEST: u8 = 25;
+/// XKB request minors (`X_kb*`).
+const X_KB_USE_EXTENSION: u8 = 0;
+const X_KB_SELECT_EVENTS: u8 = 1;
+const X_KB_SET_MAP: u8 = 9;
+const X_KB_SET_COMPAT_MAP: u8 = 11;
+const X_KB_SET_INDICATOR_MAP: u8 = 14;
+const X_KB_SET_NAMES: u8 = 18;
+const X_KB_SET_GEOMETRY: u8 = 20;
 /// FocusChangeMask
 const FOCUS_CHANGE_MASK: u32 = 0x0020_0000;
 
@@ -19482,10 +19490,7 @@ fn handle_xi2_request(
             // (Xorg XkbSendLegacyMapNotify → XIShouldNotify), as for
             // SetDeviceModifierMapping.
             if count != 0 && dev == crate::xinput::DEVICEID_MASTER_KEYBOARD {
-                let targets: Vec<ClientId> = state.clients.keys().map(|id| ClientId(*id)).collect();
-                let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
-                    let _ = x11::write_mapping_notify_event(buf, order, seq, 1, first, count);
-                });
+                legacy_keyboard_mapping_notify(state, xkb_change.as_ref(), first, count);
             }
             // ChangeDeviceKeyMapping is void (no reply), so the event
             // ordering question is moot: send to originator + others.
@@ -19509,14 +19514,19 @@ fn handle_xi2_request(
                 );
             }
             crate::core_loop::xi1_focus::emit_device_mapping_notify(
-                state, client_id, dev, 1, first, count,
+                state,
+                Some(client_id),
+                dev,
+                1,
+                first,
+                count,
             );
             if let Some(change) = &xkb_change {
                 crate::core_loop::xkb_layout::send_keyboard_mapping_followups(
                     state,
                     xkb_event_base,
                     change,
-                    crate::core_loop::xkb_layout::X_CHANGE_KEYBOARD_MAPPING,
+                    (crate::core_loop::xkb_layout::X_CHANGE_KEYBOARD_MAPPING, 0),
                 );
             }
             debug!(
@@ -19637,7 +19647,12 @@ fn handle_xi2_request(
                         });
                 }
                 crate::core_loop::xi1_focus::emit_device_mapping_notify(
-                    state, client_id, dev, 0, 0, 0,
+                    state,
+                    Some(client_id),
+                    dev,
+                    0,
+                    0,
+                    0,
                 );
             };
             let status = match change_modifier_mapping(
@@ -19792,7 +19807,14 @@ fn handle_xi2_request(
                     0,
                 );
             }
-            crate::core_loop::xi1_focus::emit_device_mapping_notify(state, client_id, dev, 2, 0, 0);
+            crate::core_loop::xi1_focus::emit_device_mapping_notify(
+                state,
+                Some(client_id),
+                dev,
+                2,
+                0,
+                0,
+            );
         }
         // QueryDeviceState: { deviceid }. Snapshot of the device's
         // key / button / valuator state (Xorg Xi/queryst.c) — the same
@@ -20512,25 +20534,85 @@ fn handle_xkb_request(
         "client {} #{} XkbProxy minor={}",
         client_id.0, sequence.0, minor
     );
-    if minor == 1 && body.len() >= 12 {
-        let device_spec = u16::from_le_bytes([body[0], body[1]]);
-        let affect_which = u16::from_le_bytes([body[2], body[3]]);
-        let clear = u16::from_le_bytes([body[4], body[5]]);
-        let old = state
-            .xkb_select_event_masks
-            .get(&(client_id.0, device_spec))
-            .copied()
-            .unwrap_or(0);
-        let new_mask = crate::core_loop::xkb_layout::xkb_select_merge(old, affect_which, clear);
-        if new_mask == 0 {
-            state
-                .xkb_select_event_masks
-                .remove(&(client_id.0, device_spec));
-        } else {
-            state
-                .xkb_select_event_masks
-                .insert((client_id.0, device_spec), new_mask);
+    // Xorg's per-request order: the request size (REQUEST_AT_LEAST_SIZE,
+    // for the handlers ported so far), then BadAccess for a client that
+    // hasn't called XkbUseExtension (every XKB request but UseExtension).
+    let min_body = match minor {
+        X_KB_SELECT_EVENTS => 12,
+        X_KB_SET_MAP => 32,
+        X_KB_SET_COMPAT_MAP => 12,
+        X_KB_SET_INDICATOR_MAP => 8,
+        X_KB_SET_NAMES | X_KB_SET_GEOMETRY => 24,
+        _ => 0,
+    };
+    if body.len() < min_body {
+        return emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_LENGTH,
+            0,
+            u16::from(minor),
+            header.opcode,
+        );
+    }
+    if minor != X_KB_USE_EXTENSION
+        && !crate::core_loop::xkb_select::xkb_initialized(state, client_id)
+    {
+        return emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_ACCESS,
+            0,
+            u16::from(minor),
+            header.opcode,
+        );
+    }
+    let mut use_extension_supported = None;
+    if minor == X_KB_USE_EXTENSION {
+        use_extension_supported = Some(crate::core_loop::xkb_select::use_extension(
+            state, client_id, body,
+        ));
+    }
+    // SelectEvents is applied here; on success the request still reaches
+    // the backend (a nested backend forwards it to its host).
+    if minor == X_KB_SELECT_EVENTS
+        && let Err((code, value)) =
+            crate::core_loop::xkb_select::select_events(state, client_id, body)
+    {
+        return emit_x11_error_with_minor(
+            state,
+            client_id,
+            sequence,
+            code,
+            value,
+            u16::from(minor),
+            header.opcode,
+        );
+    }
+    // The Set* requests the backend's keyboard description implements (a
+    // port of Xorg's handler): its events, then its error.
+    let ancient = crate::core_loop::xkb_select::xkb_ancient(state, client_id);
+    let set_outcome = {
+        let atoms = &state.atoms;
+        let atom_name = |atom: u32| atoms.name(x11::AtomId(atom)).map(str::to_owned);
+        backend.xkb_set(minor, body, ancient, &atom_name)
+    };
+    if let Some(outcome) = set_outcome {
+        send_xkb_set_events(state, &*backend, header.opcode, minor, &outcome.events);
+        if let Some((code, value)) = outcome.error {
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                code,
+                value,
+                u16::from(minor),
+                header.opcode,
+            );
         }
+        return Ok(RequestOutcome::Handled);
     }
     // XkbLatchLockState (minor 5): a group lock switches the authoritative
     // keyboard group and broadcasts XkbStateNotify to subscribed clients.
@@ -20678,6 +20760,13 @@ fn handle_xkb_request(
         if bytes.len() >= 4 {
             bytes[2..4].copy_from_slice(&sequence.0.to_le_bytes());
         }
+        // UseExtension: whether the requested version is supported is the
+        // core loop's decision (it tracks the client's XKB state).
+        if let Some(supported) = use_extension_supported
+            && bytes.len() >= 2
+        {
+            bytes[1] = u8::from(supported);
+        }
         // GetControls: the per-key repeat is the core keyboard feedback's
         // (Xorg keeps XKB `per_key_repeat` and `autoRepeats` in sync), which
         // lives here, not in the backend.
@@ -20691,6 +20780,102 @@ fn handle_xkb_request(
         return Ok(write_to_client(client, client_id, &bytes));
     }
     Ok(RequestOutcome::Handled)
+}
+
+/// Send what an XKB Set* request did, in Xorg's order: each
+/// `XkbSendNewKeyboardNotify` / `XkbSendNotification` with its legacy core
+/// MappingNotify, the per-key repeat re-derivation copied to the core
+/// keyboard feedback, `_XkbSetCompatMap`'s CompatMapNotify and
+/// `XkbApplyLedMapChanges`' indicator notifications. `major`/`minor` are the
+/// request's (the events' cause).
+fn send_xkb_set_events(
+    state: &mut ServerState,
+    backend: &dyn Backend,
+    major: u8,
+    minor: u8,
+    events: &[crate::backend::XkbSetEvent],
+) {
+    use crate::{
+        backend::XkbSetEvent,
+        core_loop::xkb_select::{self, LegacyCause},
+    };
+    let base = backend.xkb_info().map_or(0, |(_maj, ev, _err)| ev);
+    for event in events {
+        match event {
+            XkbSetEvent::NewKeyboard(info) => {
+                let recipients = xkb_select::new_keyboard_recipients(state, info.changed);
+                let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
+                    let _ = x11::write_xkb_new_keyboard_notify(
+                        buf,
+                        order,
+                        seq,
+                        base,
+                        1,
+                        info.min_keycode,
+                        info.max_keycode,
+                        info.old_min_keycode,
+                        info.old_max_keycode,
+                        major,
+                        minor,
+                        info.changed,
+                    );
+                });
+                let num = info
+                    .max_keycode
+                    .wrapping_sub(info.min_keycode)
+                    .wrapping_add(1);
+                xkb_select::send_legacy_map_notify(
+                    state,
+                    LegacyCause::NewKeyboardNotify,
+                    info.changed,
+                    info.min_keycode,
+                    num,
+                );
+            }
+            XkbSetEvent::Notification(change) => {
+                let m = change.map_notify;
+                if m.changed != 0 {
+                    crate::core_loop::xkb_layout::send_xkb_map_notify(state, base, m);
+                    xkb_select::send_legacy_map_notify(
+                        state,
+                        LegacyCause::MapNotify,
+                        m.changed,
+                        m.first_key_sym,
+                        m.n_key_syms,
+                    );
+                }
+                crate::core_loop::xkb_layout::send_keyboard_mapping_followups(
+                    state,
+                    base,
+                    change,
+                    (major, minor),
+                );
+            }
+            XkbSetEvent::Repeats(repeats) => {
+                let _ = crate::core_loop::xkb_layout::apply_repeats_to_core(state, repeats);
+            }
+            XkbSetEvent::CompatMap(notify) => {
+                crate::core_loop::xkb_layout::send_xkb_compat_map_notify(state, base, *notify);
+            }
+            XkbSetEvent::IndicatorMaps(change) => {
+                crate::core_loop::xkb_layout::send_indicator_maps_change(state, base, change);
+            }
+            XkbSetEvent::Names(notify) => {
+                crate::core_loop::xkb_layout::send_xkb_names_notify(state, base, *notify);
+            }
+            XkbSetEvent::IndicatorNames {
+                leds_defined,
+                state: lit,
+            } => {
+                crate::core_loop::xkb_layout::send_indicator_names_change(
+                    state,
+                    base,
+                    *leds_defined,
+                    *lit,
+                );
+            }
+        }
+    }
 }
 
 fn handle_reparent_window(
@@ -24375,16 +24560,21 @@ fn change_modifier_mapping(
     let xkb_event_base = backend.xkb_info().map_or(0, |(_maj, ev, _err)| ev);
     crate::core_loop::xkb_layout::send_xkb_map_notify(state, xkb_event_base, change.map_notify);
     if core_notify {
-        let targets: Vec<ClientId> = state.clients.keys().map(|id| ClientId(*id)).collect();
-        let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
-            let _ = x11::write_mapping_notify_event(buf, order, seq, 0, 0, 0);
-        });
+        // Xorg XkbSendLegacyMapNotify: MapNotify's changes decide who gets
+        // the core MappingNotify(Modifier).
+        crate::core_loop::xkb_select::send_legacy_core_map_notify(
+            state,
+            crate::core_loop::xkb_select::LegacyCause::MapNotify,
+            change.map_notify.changed,
+            change.map_notify.first_key_sym,
+            change.map_notify.n_key_syms,
+        );
     }
     crate::core_loop::xkb_layout::send_keyboard_mapping_followups(
         state,
         xkb_event_base,
         &change,
-        crate::core_loop::xkb_layout::X_SET_MODIFIER_MAPPING,
+        (crate::core_loop::xkb_layout::X_SET_MODIFIER_MAPPING, 0),
     );
     ModmapChangeOutcome::Success
 }
@@ -28417,19 +28607,15 @@ fn handle_change_keyboard_mapping(
     if let Some(change) = &xkb_change {
         crate::core_loop::xkb_layout::send_xkb_map_notify(state, xkb_event_base, change.map_notify);
     }
-    // Server-wide MappingNotify fanout: every connected client sees the
-    // same keymap change. We collect ids first to avoid an &/&mut overlap
-    // through `state.clients`.
-    let targets: Vec<ClientId> = state.clients.keys().map(|id| ClientId(*id)).collect();
-    let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
-        let _ = x11::write_mapping_notify_event(buf, order, seq, 1, first_keycode, count);
-    });
+    // The core MappingNotify (Xorg XkbSendLegacyMapNotify): every client
+    // but an XKB client that didn't select the change as a MapNotify detail.
+    legacy_keyboard_mapping_notify(state, xkb_change.as_ref(), first_keycode, count);
     if let Some(change) = &xkb_change {
         crate::core_loop::xkb_layout::send_keyboard_mapping_followups(
             state,
             xkb_event_base,
             change,
-            crate::core_loop::xkb_layout::X_CHANGE_KEYBOARD_MAPPING,
+            (crate::core_loop::xkb_layout::X_CHANGE_KEYBOARD_MAPPING, 0),
         );
     }
     debug!(
@@ -28461,6 +28647,30 @@ fn apply_keymap_change(
         store_keymap_overrides(state, first_keycode, kpk, count, syms);
     }
     change
+}
+
+/// The core MappingNotify(Keyboard) of a keyboard mapping change, as Xorg's
+/// `XkbSendLegacyMapNotify` sends it from the change's MapNotify: to every
+/// client but an XKB-initialised one whose map details miss the change.
+/// Without an XKB keymap (`None`) the change counts as KeySyms over the
+/// request's keys.
+fn legacy_keyboard_mapping_notify(
+    state: &mut ServerState,
+    change: Option<&crate::backend::KeyboardMappingChange>,
+    first_keycode: u8,
+    count: u8,
+) {
+    let (changed, first, num) = change.map_or((0x0002, first_keycode, count), |c| {
+        let m = c.map_notify;
+        (m.changed, m.first_key_sym, m.n_key_syms)
+    });
+    crate::core_loop::xkb_select::send_legacy_core_map_notify(
+        state,
+        crate::core_loop::xkb_select::LegacyCause::MapNotify,
+        changed,
+        first,
+        num,
+    );
 }
 
 /// Install `count` keysym rows starting at `first_keycode` into
@@ -64840,7 +65050,7 @@ mod tests {
     fn per_key_auto_repeat_set_by_a_client_survives_a_mapping_change() {
         let mut state = ServerState::new();
         let mut peer = install_client(&mut state, 1);
-        state.xkb_select_event_masks.insert((1, 0x0100), 0x0008);
+        crate::core_loop::xkb_select::xkb_select_events(&mut state, 1, 0x0100, 0x0008);
         // key=64 auto-repeat-mode=On (already on by default).
         let body = kbctrl_body(0xc0, &[64, 1]);
         let _ = handle_change_keyboard_control(
@@ -64858,12 +65068,14 @@ mod tests {
             repeats: vec![(64, false), (65, false)],
             indicator_map_changed: 0,
             indicator_state: 0,
+            compat_changed_groups: 0,
+            compat_total_si: 0,
         };
         crate::core_loop::xkb_layout::apply_keyboard_mapping_repeats(
             &mut state,
             85,
             &change,
-            crate::core_loop::xkb_layout::X_CHANGE_KEYBOARD_MAPPING,
+            (crate::core_loop::xkb_layout::X_CHANGE_KEYBOARD_MAPPING, 0),
         );
         assert_eq!(
             state.keyboard_control.auto_repeats[8] & 0x03,
@@ -64880,7 +65092,7 @@ mod tests {
             &mut state,
             85,
             &change,
-            crate::core_loop::xkb_layout::X_CHANGE_KEYBOARD_MAPPING,
+            (crate::core_loop::xkb_layout::X_CHANGE_KEYBOARD_MAPPING, 0),
         );
         assert!(read_all_available(&mut peer).is_empty());
     }
@@ -71915,6 +72127,11 @@ mod tests {
 
         let mut reply = vec![0u8; 32];
         reply[0] = 1; // X_Reply
+        assert!(crate::core_loop::xkb_select::use_extension(
+            &mut state,
+            ClientId(1),
+            &[1, 0, 0, 0]
+        ));
         let mut backend = RecordingBackend::new().with_kbd_by_name_result(
             reply,
             Some(crate::backend::XkbNewKeyboardInfo {
@@ -71965,6 +72182,119 @@ mod tests {
             keyboard_mapping_notify.is_some(),
             "expected a MappingNotify with request=Keyboard(1): {bytes:02x?}"
         );
+    }
+
+    fn xkb_request(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        client: u32,
+        minor: u8,
+        body: &[u8],
+    ) {
+        handle_xkb_request(
+            state,
+            backend,
+            None,
+            ClientId(client),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 136,
+                data: minor,
+                length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+            },
+            body,
+        )
+        .expect("XKB request");
+    }
+
+    /// Golden (`xorg-xkb-setmap-errors.txt`, Xvfb 21.1.24: `access`,
+    /// `access-getmap`, `access-selectevents`): an XKB request from a client
+    /// that never called XkbUseExtension answers BadAccess (value 0, minor =
+    /// the request's), and changes nothing; after UseExtension the same
+    /// requests go through.
+    #[test]
+    fn xkb_requests_need_use_extension() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let select_all = [0x00, 0x01, 0xff, 0x0f, 0, 0, 0xff, 0x0f, 0xff, 0, 0xff, 0];
+        for (minor, body) in [
+            (8u8, vec![0u8; 24]),
+            (1, select_all.to_vec()),
+            (9, vec![0; 32]),
+        ] {
+            xkb_request(&mut state, &mut backend, 1, minor, &body);
+            let err = read_all_available(&mut peer);
+            assert_eq!(err.len(), 32, "minor {minor}: one error");
+            assert_eq!(
+                (err[0], err[1], &err[4..8], err[8], err[10]),
+                (0, x11::error::BAD_ACCESS, &[0u8, 0, 0, 0][..], minor, 136),
+                "minor {minor}"
+            );
+        }
+        assert!(
+            state
+                .xkb_clients
+                .get(&1)
+                .is_none_or(|c| c.map_notify_mask == 0)
+        );
+        xkb_request(&mut state, &mut backend, 1, 0, &[1, 0, 0, 0]);
+        assert!(crate::core_loop::xkb_select::xkb_initialized(
+            &state,
+            ClientId(1)
+        ));
+        let _ = read_all_available(&mut peer);
+        xkb_request(&mut state, &mut backend, 1, 1, &select_all);
+        assert!(
+            read_all_available(&mut peer).is_empty(),
+            "SelectEvents: no error"
+        );
+        assert_eq!(state.xkb_clients[&1].map_notify_mask, 0xff);
+    }
+
+    /// `ProcXkbUseExtension`: an unsupported version (2.0) leaves the client
+    /// uninitialised.
+    #[test]
+    fn xkb_use_extension_unsupported_version_stays_uninitialised() {
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        xkb_request(&mut state, &mut backend, 1, 0, &[2, 0, 0, 0]);
+        assert!(!crate::core_loop::xkb_select::xkb_initialized(
+            &state,
+            ClientId(1)
+        ));
+    }
+
+    /// `XkbSendLegacyMapNotify` (xkb/xkbEvents.c): a MapNotify's core
+    /// MappingNotify goes to non-XKB clients and to XKB clients whose map
+    /// details include a change; a NewKeyboardNotify's only to non-XKB
+    /// clients.
+    #[test]
+    fn legacy_map_notify_filters_xkb_clients() {
+        use crate::core_loop::xkb_select::{
+            LegacyCause, send_legacy_core_map_notify, xkb_select_events,
+        };
+        let mut state = ServerState::new();
+        let mut plain = install_client(&mut state, 1);
+        let mut xkb_keysyms = install_client(&mut state, 2);
+        let mut xkb_none = install_client(&mut state, 3);
+        xkb_select_events(&mut state, 2, 0x100, 0x0002);
+        xkb_select_events(&mut state, 3, 0x100, 0x0004);
+        let _ = send_legacy_core_map_notify(&mut state, LegacyCause::MapNotify, 0x0002, 8, 248);
+        let count = |b: Vec<u8>| b.chunks(32).filter(|e| e[0] == 34).count();
+        assert_eq!(count(read_all_available(&mut plain)), 1);
+        assert_eq!(count(read_all_available(&mut xkb_keysyms)), 1);
+        assert_eq!(count(read_all_available(&mut xkb_none)), 0);
+        let _ =
+            send_legacy_core_map_notify(&mut state, LegacyCause::NewKeyboardNotify, 0x0001, 8, 248);
+        assert_eq!(
+            count(read_all_available(&mut plain)),
+            2,
+            "Keyboard + Modifier"
+        );
+        assert_eq!(count(read_all_available(&mut xkb_keysyms)), 0);
+        assert_eq!(count(read_all_available(&mut xkb_none)), 0);
     }
 
     // ── Step 3 (window-storage lifecycle): Pictures on windows ──────────

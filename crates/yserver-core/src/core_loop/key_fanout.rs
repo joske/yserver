@@ -1020,7 +1020,7 @@ mod tests {
         let mut backend = crate::backend::recording::RecordingBackend::new();
         // Client selected XKB StateNotify (bit 0x0004) on the core keyboard.
         let mut peer = install_kf(&mut state, 5, ROOT_WINDOW, 0, 0);
-        state.xkb_select_event_masks.insert((5, 0), 0x0004);
+        crate::core_loop::xkb_select::xkb_select_events(&mut state, 5, 0, 0x0004);
 
         // Super held → effective Mod4 (0x40). Announced on the next key.
         backend.xkb_mods = (0x40, 0x40, 0, 0);
