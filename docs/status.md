@@ -33,6 +33,32 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-26 the keyboard is an Xorg `XkbDesc` model (#171 phase 4a+4b,
+  branch `feat/171-phase4-xkbcomp`):** new `kms::xkb_desc` holds Xorg's
+  server-side keyboard description (types by index with vmods/preserve/level
+  names, per-key syms/acts/behaviors/explicit/modmap/vmodmap, vmods, compat
+  SIs, indicator maps, names, num_groups, per-key repeat) and is authoritative
+  for GetMap / GetCompatMap (real SIs) / GetNames / GetIndicatorMap /
+  GetNamedIndicator / GetControls numGroups / GetKbdByName's blocks /
+  GetKeyboardMapping / GetModifierMapping, all encoded as Xorg's
+  `ProcXkbGet*`/`XkbSend*` do (request parts and ranges, BadValue/BadMatch).
+  It is seeded from xkbcommon's compile on every by-name load (xkbcomp's type
+  normalisation incl. its `DeleteLevel1MapEntries` and preserve-vmod bugs,
+  libX11 `XConvertCase` for automatic types, identical-group collapse), then
+  Xorg's `XkbUpdateDescActions` over all keys. xkbcommon only cooks: the model
+  is written as V1 text (resolved real modifiers, per-key actions, explicit
+  types and repeat, no interprets) and compiled after every mutation
+  (`KmsCore::install_desc`). ChangeKeyboardMapping / SetModifierMapping are
+  literal ports on the model (`XkbUpdateKeyTypesFromCore`,
+  `XkbChangeTypesOfKey`, `XkbApplyCompatMapToKey`, `XkbUpdateDescActions`,
+  `XkbApplyVirtualModChanges`); `xkb_edit`, `xkb_derive`, the explicit-type /
+  stale-vmodmap side tables, the vmod pin re-install and the type probes are
+  gone. Goldens: `xorg-xkb-pristine.txt` (us/gb/de/us,ru, listed seed
+  tolerances), CKM/SMM goldens now compared exactly by type index incl.
+  explicit/behaviors/all actions, and a cooking gate (press/release on fresh
+  `xkb_state`s) after every golden mutation and on all 45 captured xkbcomp
+  states. SetMap & co (4c–4e) next.
+
 - **2026-09-25 SetModifierMapping edits the real keymap (#171 phase 3,
   branch `feat/171-xkb-keymap-mutation`):** core `SetModifierMapping` and XI1
   `SetDeviceModifierMapping` share Xorg's `change_modmap` in the core loop

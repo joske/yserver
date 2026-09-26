@@ -36,7 +36,10 @@ use yserver_protocol::x11::{
     CharInfo as ProtocolCharInfo, FontMetrics, FontPropValue, ResourceId, xfixes,
 };
 
-use crate::kms::cpu_types::{PictTransform, Rectangle16, Repeat};
+use crate::kms::{
+    cpu_types::{PictTransform, Rectangle16, Repeat},
+    xkb_desc::XkbDesc,
+};
 
 // ───────────────────────────────────────────────────────────────
 // Newtype wrappers around `!Send` third-party types.
@@ -100,20 +103,22 @@ impl Default for XkbRmlvo {
 /// Where the active keymap came from.
 ///
 /// A keymap compiled from `KmsCore::xkb_rmlvo` is pristine; a runtime mapping
-/// change (ChangeKeyboardMapping, SetModifierMapping) installs an edited copy
-/// of it. `xkb_rmlvo` stays the base either way: Xorg doesn't touch the names
-/// on a mapping change, so `_XKB_RULES_NAMES` and GetNames keep reporting it.
+/// change (ChangeKeyboardMapping, SetModifierMapping) installs a mutated copy
+/// of its description. `xkb_rmlvo` stays the base either way: Xorg doesn't
+/// touch the names on a mapping change, so `_XKB_RULES_NAMES` keeps reporting
+/// it.
 /// Only a pristine keymap may skip a reload for an equal RMLVO; `setxkbmap`
 /// with the base RMLVO after an `xmodmap` must reload (Xorg always does).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KeymapSource {
     /// Compiled from `xkb_rmlvo` as it stands.
     Rmlvo,
-    /// Installed from edited keymap text on top of the `xkb_rmlvo` keymap.
+    /// A mutation of the `xkb_rmlvo` keymap's description.
     Edited,
 }
 
-/// Keymap text that xkbcommon refused to compile. The current keymap stays.
+/// Cooking keymap text that xkbcommon refused to compile (a writer bug; never
+/// expected). The current keymap and description stay.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KeymapTextError {
     /// Size of the refused text, for the log line.
@@ -124,7 +129,7 @@ impl std::fmt::Display for KeymapTextError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "keymap text ({} bytes) failed to compile; xkbcommon logged the reason",
+            "cooking keymap text ({} bytes) failed to compile; xkbcommon logged the reason",
             self.text_len
         )
     }
@@ -202,6 +207,86 @@ fn relock_real_mods(
         let (kc, _) = candidates.swap_remove(pos);
         press_release_key(state, kc);
     }
+}
+
+/// Seed the description from a keymap loaded by name and compile its
+/// cooking keymap: `(description, text, cooking keymap)`. Should the written
+/// text not compile (a writer bug; never expected), the keymap as loaded
+/// cooks instead, and it's logged as an error.
+fn cooking_keymap_for(
+    ctx: &xkbcommon::xkb::Context,
+    keymap: xkbcommon::xkb::Keymap,
+    rmlvo: &XkbRmlvo,
+) -> (XkbDesc, String, xkbcommon::xkb::Keymap) {
+    let mut desc = match XkbDesc::from_keymap(&keymap) {
+        Ok(desc) => desc,
+        Err(e) => {
+            log::error!("xkb: can't read the keymap back ({e}); an empty description");
+            return (XkbDesc::empty(), String::new(), keymap);
+        }
+    };
+    let [keycodes, symbols, types, compat] =
+        crate::kms::xkb_desc::seed::component_names_from_rmlvo(rmlvo);
+    let names = &mut desc.names;
+    names.keycodes.get_or_insert(keycodes);
+    names.phys_symbols.get_or_insert_with(|| symbols.clone());
+    names.symbols.get_or_insert(symbols);
+    names.types.get_or_insert(types);
+    names.compat.get_or_insert(compat);
+    let (text, uncooked) = desc.to_v1_text();
+    match xkbcommon::xkb::Keymap::new_from_string(
+        ctx,
+        text.clone(),
+        xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1,
+        xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
+    ) {
+        Some(cooking) => {
+            log_uncooked(&uncooked);
+            (desc, text, cooking)
+        }
+        None => {
+            log::error!(
+                "xkb: the cooking keymap ({} bytes) doesn't compile; cooking with the keymap as \
+                 loaded",
+                text.len()
+            );
+            (desc, String::new(), keymap)
+        }
+    }
+}
+
+/// One warning per install for what the cooking keymap can't carry (§4.6):
+/// stored and read back exactly, not cooked.
+fn log_uncooked(uncooked: &crate::kms::xkb_desc::writer::Uncooked) {
+    if uncooked.is_empty() {
+        return;
+    }
+    let mut what: Vec<String> = uncooked
+        .actions
+        .iter()
+        .map(|(kc, slot, a)| {
+            format!(
+                "keycode {kc} slot {slot} {}",
+                crate::kms::xkb_desc::action::type_name(a[0])
+            )
+        })
+        .collect();
+    what.extend(
+        uncooked
+            .behaviors
+            .iter()
+            .map(|(kc, t, d)| format!("keycode {kc} behavior {t:#04x}:{d:#04x}")),
+    );
+    what.extend(
+        uncooked
+            .keysyms
+            .iter()
+            .map(|(kc, slot, s)| format!("keycode {kc} slot {slot} keysym {s:#x}")),
+    );
+    log::warn!(
+        "xkb: not cooked (xkbcommon can't carry them): {}",
+        what.join(", ")
+    );
 }
 
 /// Pure RMLVO resolution: explicit `layout_arg` (from `-layout`) wins,
@@ -1944,18 +2029,15 @@ pub(crate) struct KmsCore {
     // Keyboard protocol state
     #[allow(dead_code)]
     pub(crate) xkb_context: XkbContext,
+    /// The cooking keymap: `xkb_desc` written out and compiled
+    /// ([`crate::kms::xkb_desc::writer`]). Only `xkb_state` reads it.
     pub(crate) xkb_keymap: XkbKeymap,
-    /// Xorg's explicit-type mask per key (`XkbExplicitKeyTypesMask` bits,
-    /// see [`crate::kms::xkb::explicit_type_masks`]) of the loaded keymap.
-    /// xkbcommon doesn't keep it and a mapping change must not change it,
-    /// so it is taken from the keymap as loaded (lazily, always before the
-    /// first edit) and carried across edits; a reload drops it.
-    xkb_explicit_types: Option<Box<[u8; 256]>>,
-    /// The vmodmap Xorg keeps for keys that no interpret matches any more
-    /// after a mapping change (`XkbApplyCompatMapToKey` leaves it alone;
-    /// see [`crate::kms::xkb_derive::KeymapModel::with_stale_vmodmap`]).
-    /// xkbcommon has no such state; carried across edits, dropped on reload.
-    pub(crate) xkb_stale_vmodmap: std::collections::BTreeMap<u8, u16>,
+    /// Xorg's keyboard description, authoritative for every XKB and core
+    /// keymap readback and mutated by every mapping change (#171 phase 4).
+    pub(crate) xkb_desc: XkbDesc,
+    /// The text `xkb_keymap` was compiled from, so an install that writes
+    /// the same text skips the compile.
+    xkb_text: String,
     pub(crate) xkb_state: XkbState,
     /// The RMLVO the active keymap was compiled from, or, for an edited
     /// keymap, the one it was edited from. Read by GetNames (`symbolsName`)
@@ -2092,6 +2174,7 @@ impl KmsCore {
                 (km, fallback)
             }
         };
+        let (xkb_desc, xkb_text, keymap) = cooking_keymap_for(&xkb_context.0, keymap, &rmlvo);
         let xkb_state = XkbState(xkbcommon::xkb::State::new(&keymap));
         let xkb_keymap = XkbKeymap(keymap);
 
@@ -2106,13 +2189,13 @@ impl KmsCore {
             top_level_order: Vec::new(),
             xkb_context,
             xkb_keymap,
-            xkb_explicit_types: None,
+            xkb_desc,
+            xkb_text,
             xkb_state,
             xkb_rmlvo: rmlvo,
             keymap_source: KeymapSource::Rmlvo,
             locked_group: 0,
             down_keys: HashSet::new(),
-            xkb_stale_vmodmap: std::collections::BTreeMap::new(),
             font_loader: FontLoader::new()?,
             fonts: HashMap::new(),
             bg_pixel: None,
@@ -2179,6 +2262,8 @@ impl KmsCore {
             )
         })
         .expect("test xkb keymap");
+        let (xkb_desc, xkb_text, keymap) =
+            cooking_keymap_for(&xkb_context.0, keymap, &XkbRmlvo::default());
         let xkb_state = XkbState(xkbcommon::xkb::State::new(&keymap));
         let xkb_keymap = XkbKeymap(keymap);
 
@@ -2190,13 +2275,13 @@ impl KmsCore {
             top_level_order: Vec::new(),
             xkb_context,
             xkb_keymap,
-            xkb_explicit_types: None,
+            xkb_desc,
+            xkb_text,
             xkb_state,
             xkb_rmlvo: XkbRmlvo::default(),
             keymap_source: KeymapSource::Rmlvo,
             locked_group: 0,
             down_keys: HashSet::new(),
-            xkb_stale_vmodmap: std::collections::BTreeMap::new(),
             font_loader: FontLoader::new().expect("test font loader"),
             fonts: HashMap::new(),
             bg_pixel: None,
@@ -2266,7 +2351,7 @@ impl KmsCore {
     /// together" with `update_key`. Mixing it in would risk an incoherent
     /// master state for subsequent real key events. This matches the
     /// VT-acquire path's fresh-state behavior. (An in-place edit,
-    /// [`Self::install_keymap_text`], does carry the locks, by replay.)
+    /// [`Self::install_desc`], does carry the locks, by replay.)
     pub(crate) fn recompile_keymap(&mut self, rmlvo: &XkbRmlvo) -> Option<(u8, u8)> {
         if self.keymap_is_pristine(rmlvo) {
             return None;
@@ -2289,17 +2374,19 @@ impl KmsCore {
         self.keymap_source == KeymapSource::Rmlvo && self.xkb_rmlvo == *rmlvo
     }
 
-    /// Make `keymap` (compiled from `rmlvo`) the active one; returns its
-    /// clamped keycode bounds. The tail of [`Self::recompile_keymap`], split
-    /// out so tests can install a keymap frozen from a known xkeyboard-config.
+    /// Make `keymap` (compiled from `rmlvo`) the active one: seed the
+    /// description from it and install its cooking keymap. Returns the
+    /// keycode bounds. The tail of [`Self::recompile_keymap`], split out so
+    /// tests can install a keymap frozen from a known xkeyboard-config.
     pub(crate) fn install_keymap(
         &mut self,
         keymap: xkbcommon::xkb::Keymap,
         rmlvo: &XkbRmlvo,
     ) -> (u8, u8) {
-        let bounds = self.swap_keymap(keymap, 0);
-        self.xkb_explicit_types = None;
-        self.xkb_stale_vmodmap.clear();
+        let (desc, text, cooking) = cooking_keymap_for(&self.xkb_context.0, keymap, rmlvo);
+        self.xkb_desc = desc;
+        self.xkb_text = text;
+        self.swap_keymap(cooking, 0);
         self.xkb_rmlvo = rmlvo.clone();
         self.keymap_source = KeymapSource::Rmlvo;
         log::info!(
@@ -2310,76 +2397,64 @@ impl KmsCore {
             rmlvo.variant,
             rmlvo.options
         );
-        bounds
+        (self.xkb_desc.min_key_code, self.xkb_desc.max_key_code)
     }
 
-    /// Compile V1 keymap `text` (an edit of the live keymap's own dump, see
-    /// `kms::xkb_edit`) and install it in place of the current keymap;
-    /// returns its clamped keycode bounds.
+    /// Make `desc` (a mutation of the current description) authoritative:
+    /// write its cooking keymap, compile it and swap it in; returns the
+    /// keycode bounds.
     ///
-    /// Fail-closed: when xkbcommon refuses the text, the current keymap and
-    /// state are kept and the error is returned (xkbcommon writes the
-    /// compiler's message to its log; the crate exposes no log hook to
-    /// capture it here).
+    /// Fail-closed: when xkbcommon refuses the text (a writer bug), the
+    /// current description, keymap and state are kept and the error is
+    /// returned (xkbcommon writes the compiler's message to its log). Text
+    /// identical to the installed keymap's skips the compile.
     ///
     /// Unlike an RMLVO reload this is an in-place mapping change, and Xorg
     /// keeps the keyboard state through those: the locked real modifiers
     /// are restored by replaying the keymap's own lock keys (see
     /// `relock_real_mods`), held keys are re-asserted, and `locked_group`
     /// (tracked here, not in `xkb_state`) is kept, clamped to the new
-    /// keymap's group count. The keymap becomes [`KeymapSource::Edited`];
+    /// group count. The keymap becomes [`KeymapSource::Edited`];
     /// `xkb_rmlvo` keeps naming its base.
     ///
     /// The caller resyncs anything derived from the state (lock LEDs).
-    pub(crate) fn install_keymap_text(&mut self, text: &str) -> Result<(u8, u8), KeymapTextError> {
+    pub(crate) fn install_desc(&mut self, desc: XkbDesc) -> Result<(u8, u8), KeymapTextError> {
         let started = std::time::Instant::now();
-        let Some(keymap) = xkbcommon::xkb::Keymap::new_from_string(
-            &self.xkb_context.0,
-            text.to_owned(),
-            xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1,
-            xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
-        ) else {
-            let err = KeymapTextError {
-                text_len: text.len(),
+        let (text, uncooked) = desc.to_v1_text();
+        if text != self.xkb_text {
+            let Some(keymap) = xkbcommon::xkb::Keymap::new_from_string(
+                &self.xkb_context.0,
+                text.clone(),
+                xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1,
+                xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
+            ) else {
+                let err = KeymapTextError {
+                    text_len: text.len(),
+                };
+                log::warn!("xkb: {err}; keeping the current keymap");
+                return Err(err);
             };
-            log::warn!("xkb: {err}; keeping the current keymap");
-            return Err(err);
-        };
-        let compiled = started.elapsed();
-        // The explicit types belong to the keymap as loaded: take them
-        // before its first edit replaces it.
-        let _ = self.explicit_key_types();
-        let locked = locked_real_mods(&self.xkb_state.0, &self.xkb_keymap.0);
-        let bounds = self.swap_keymap(keymap, locked);
+            let locked = locked_real_mods(&self.xkb_state.0, &self.xkb_keymap.0);
+            self.swap_keymap(keymap, locked);
+            self.xkb_text = text;
+            log_uncooked(&uncooked);
+        }
+        self.xkb_desc = desc;
         self.locked_group = self.locked_group.min(self.keymap_group_count() - 1);
         self.keymap_source = KeymapSource::Edited;
-        log::debug!(
-            "xkb: installed edited keymap (compile {compiled:?}, total {:?})",
-            started.elapsed()
-        );
-        Ok(bounds)
+        log::debug!("xkb: installed mutated keymap ({:?})", started.elapsed());
+        Ok((self.xkb_desc.min_key_code, self.xkb_desc.max_key_code))
     }
 
-    /// Xorg's explicit-type mask per key for the active keymap
-    /// ([`Self::xkb_explicit_types`]).
-    pub(crate) fn explicit_key_types(&mut self) -> &[u8; 256] {
-        let keymap = &self.xkb_keymap.0;
-        self.xkb_explicit_types
-            .get_or_insert_with(|| Box::new(crate::kms::xkb::explicit_type_masks(keymap)))
-    }
-
-    /// Groups in the active keymap, 1..=4.
+    /// Groups in the keyboard description (`ctrls->num_groups`), 1..=4.
     pub(crate) fn keymap_group_count(&self) -> u8 {
-        u8::try_from(self.xkb_keymap.0.num_layouts())
-            .unwrap_or(1)
-            .clamp(1, 4)
+        self.xkb_desc.num_groups.clamp(1, 4)
     }
 
     /// Replace keymap and state: a fresh state with the real modifiers
     /// `relock` locked again, then every held key in `down_keys` re-applied
     /// (locks first, so the replay happens on a neutral keyboard).
-    fn swap_keymap(&mut self, keymap: xkbcommon::xkb::Keymap, relock: u8) -> (u8, u8) {
-        let bounds = crate::kms::xkb::clamped_keycode_bounds(&keymap);
+    fn swap_keymap(&mut self, keymap: xkbcommon::xkb::Keymap, relock: u8) {
         let mut new_state = xkbcommon::xkb::State::new(&keymap);
         let dropped = relock_real_mods(&mut new_state, &keymap, relock);
         if dropped != 0 {
@@ -2395,7 +2470,6 @@ impl KmsCore {
         }
         self.xkb_state = XkbState(new_state);
         self.xkb_keymap = XkbKeymap(keymap);
-        bounds
     }
 }
 
@@ -2470,10 +2544,6 @@ mod xkb_rmlvo_tests {
             .mod_name_is_active(name, xkbcommon::xkb::STATE_MODS_LOCKED)
     }
 
-    fn live_text(core: &KmsCore) -> String {
-        crate::kms::xkb_edit::keymap_text(&core.xkb_keymap.0)
-    }
-
     fn usru_rmlvo() -> XkbRmlvo {
         XkbRmlvo {
             rules: "evdev".into(),
@@ -2484,52 +2554,36 @@ mod xkb_rmlvo_tests {
         }
     }
 
-    /// `<AC01>` (keycode 38) rebound to what `<AB02>` (keycode 53, `x X`)
-    /// carries in the live keymap: an in-place edit of the current text.
-    fn edited_text(core: &KmsCore) -> String {
-        let km = &core.xkb_keymap.0;
-        let key = xkbcommon::xkb::Keycode::new(53);
-        let groups: Vec<crate::kms::xkb_edit::KeyGroupSpec> = (0..km.num_layouts_for_key(key))
-            .map(|g| crate::kms::xkb_edit::KeyGroupSpec {
-                type_name: None,
-                keysyms: (0..km.num_levels_for_key(key, g))
-                    .map(|l| km.key_get_syms_by_level(key, g, l)[0].raw())
-                    .collect(),
-            })
-            .collect();
-        crate::kms::xkb_edit::set_key(&live_text(core), "AC01", &groups).expect("edit")
+    /// The live description with `<AC01>` (keycode 38) given `x X` by a
+    /// ChangeKeyboardMapping: an in-place mutation.
+    fn edited_desc(core: &KmsCore) -> XkbDesc {
+        let mut desc = core.xkb_desc.clone();
+        let _ = desc.apply_keyboard_mapping(
+            38,
+            2,
+            1,
+            &[
+                xkbcommon::xkb::keysyms::KEY_x,
+                xkbcommon::xkb::keysyms::KEY_X,
+            ],
+        );
+        desc
     }
 
     #[test]
-    fn install_keymap_text_installs_the_text() {
+    fn install_desc_installs_the_description() {
         // External truth: the frozen de fixture puts `z` on keycode 29.
         let mut core = KmsCore::for_tests();
-        let de = crate::kms::xkb::golden_keymap("de", None)
-            .get_as_string(xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1);
-        let range = core.install_keymap_text(&de).expect("de text compiles");
-        assert_eq!(
-            range,
-            crate::kms::xkb::clamped_keycode_bounds(&core.xkb_keymap.0)
-        );
+        let de = XkbDesc::from_keymap(&crate::kms::xkb::golden_keymap("de", None)).expect("seed");
+        let range = core.install_desc(de.clone()).expect("de compiles");
+        assert_eq!(range, (8, 255));
+        assert_eq!(core.xkb_desc, de);
         assert_eq!(
             core.xkb_state
                 .0
                 .key_get_one_sym(xkbcommon::xkb::Keycode::new(29)),
             xkbcommon::xkb::keysyms::KEY_z.into()
         );
-    }
-
-    #[test]
-    fn install_keymap_text_failure_keeps_the_current_keymap() {
-        let mut core = KmsCore::for_tests();
-        press_release(&mut core, 66); // Caps Lock on
-        let before = live_text(&core);
-        let broken = before.replacen("xkb_symbols", "xkb_symbols {{{", 1);
-        assert!(core.install_keymap_text(&broken).is_err());
-        assert!(core.install_keymap_text("").is_err());
-        assert_eq!(live_text(&core), before, "old keymap kept");
-        assert!(locked(&core, "Lock"), "old state kept");
-        assert_eq!(core.keymap_source, KeymapSource::Rmlvo);
     }
 
     #[test]
@@ -2553,8 +2607,8 @@ mod xkb_rmlvo_tests {
         core.down_keys.insert(50);
         core.locked_group = 1;
 
-        let text = edited_text(&core);
-        core.install_keymap_text(&text).expect("edit compiles");
+        let desc = edited_desc(&core);
+        core.install_desc(desc).expect("edit compiles");
 
         // The edit took effect ...
         assert_eq!(
@@ -2609,10 +2663,9 @@ mod xkb_rmlvo_tests {
             &usru_rmlvo(),
         );
         core.locked_group = 1;
-        let us = crate::kms::xkb::golden_keymap("us", None)
-            .get_as_string(xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1);
-        core.install_keymap_text(&us).expect("us text compiles");
-        assert_eq!(core.xkb_keymap.0.num_layouts(), 1, "precondition");
+        let us = XkbDesc::from_keymap(&crate::kms::xkb::golden_keymap("us", None)).expect("seed");
+        core.install_desc(us).expect("us compiles");
+        assert_eq!(core.keymap_group_count(), 1, "precondition");
         assert_eq!(core.locked_group, 0, "group 2 no longer exists");
     }
 
@@ -2651,8 +2704,8 @@ mod xkb_rmlvo_tests {
             "pristine: same RMLVO is a no-op"
         );
 
-        let text = edited_text(&core);
-        core.install_keymap_text(&text).expect("edit");
+        let desc = edited_desc(&core);
+        core.install_desc(desc).expect("edit");
         assert_eq!(sym38(&core), xkbcommon::xkb::keysyms::KEY_x);
         assert_eq!(core.keymap_source, KeymapSource::Edited);
         assert_eq!(core.xkb_rmlvo, base, "the base RMLVO is still reported");
