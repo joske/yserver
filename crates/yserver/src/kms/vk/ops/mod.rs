@@ -96,7 +96,16 @@ pub fn run_one_shot_op<F>(
 where
     F: FnOnce(&VkContext, vk::CommandBuffer) -> Result<(), vk::Result>,
 {
-    run_one_shot_op_with_wait(vk, pool, None, record)
+    run_one_shot_op_with_wait(vk, pool, None, record).map_err(|e| e.result)
+}
+
+/// Failure of [`run_one_shot_op_with_wait`]. `in_flight` is true only when
+/// the submission's fence wait failed: the work may still be running, so
+/// anything it writes must be abandoned rather than freed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OneShotError {
+    pub(crate) result: vk::Result,
+    pub(crate) in_flight: bool,
 }
 
 /// [`run_one_shot_op`] with one optional binary semaphore wait. The caller
@@ -108,15 +117,23 @@ pub(crate) fn run_one_shot_op_with_wait<F>(
     pool: vk::CommandPool,
     wait_semaphore: Option<vk::Semaphore>,
     record: F,
-) -> Result<(), vk::Result>
+) -> Result<(), OneShotError>
 where
     F: FnOnce(&VkContext, vk::CommandBuffer) -> Result<(), vk::Result>,
 {
+    let not_submitted = |result| OneShotError {
+        result,
+        in_flight: false,
+    };
     let alloc_info = vk::CommandBufferAllocateInfo::default()
         .command_pool(pool)
         .level(vk::CommandBufferLevel::PRIMARY)
         .command_buffer_count(1);
-    let cb = unsafe { vk.device.allocate_command_buffers(&alloc_info)?[0] };
+    let cb = unsafe {
+        vk.device
+            .allocate_command_buffers(&alloc_info)
+            .map_err(not_submitted)?[0]
+    };
 
     // 5-T1: per-op fence instead of vkQueueWaitIdle. Same
     // blocking semantics for the caller (data is back on return)
@@ -223,7 +240,10 @@ where
     if cb_safe_to_free {
         unsafe { vk.device.free_command_buffers(pool, &[cb]) };
     }
-    result
+    result.map_err(|result| OneShotError {
+        result,
+        in_flight: !cb_safe_to_free,
+    })
 }
 
 /// Host-mapped, growable staging buffer used by image-transfer ops

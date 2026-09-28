@@ -17397,10 +17397,16 @@ fn read_scanout_region_named(
         Ok(())
     });
 
-    if let Err(e) = run_result {
-        // The copy may still be writing the readback buffer: abandon it
-        // rather than free memory the GPU may be using.
-        std::mem::forget(backend.platform.scanout_readback.take());
+    if let Err(crate::kms::vk::ops::OneShotError {
+        result: e,
+        in_flight,
+    }) = run_result
+    {
+        if in_flight {
+            // The copy may still be writing the readback buffer: abandon it
+            // rather than free memory the GPU may be using.
+            std::mem::forget(backend.platform.scanout_readback.take());
+        }
         if copied_route || e == ash::vk::Result::ERROR_DEVICE_LOST {
             // The one-shot helper cannot distinguish a post-submit wait
             // failure from earlier errors at this boundary. Fail closed: the
