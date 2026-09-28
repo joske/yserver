@@ -2267,6 +2267,10 @@ pub(crate) struct PlatformBackend {
     /// declaration order).
     pub(crate) ops_command_pool: Option<OpsCommandPool>,
     pub(crate) fence_pool: Option<FencePool>,
+    /// Reused `HOST_CACHED`-preferred destination for synchronous scanout
+    /// reads (root GetImage / ShmGetImage). Idle between reads, which wait
+    /// on their own fence; grown on demand. Holds its own `Arc<VkContext>`.
+    pub(crate) scanout_readback: Option<crate::kms::render::engine::StagingBuffer>,
 
     /// Stage 3f.10: recycled `(image, view, memory)` triples for
     /// CreatePixmap. Reuses v1's `PixmapPool` verbatim — its
@@ -3025,6 +3029,7 @@ impl PlatformBackend {
             vk: Some(vk),
             ops_command_pool: Some(ops_command_pool),
             fence_pool: Some(fence_pool),
+            scanout_readback: None,
             pixmap_pool,
             copy_vk_contexts,
             scanout_pools,
@@ -3140,6 +3145,7 @@ impl PlatformBackend {
             vk: None,
             ops_command_pool: None,
             fence_pool: None,
+            scanout_readback: None,
             pixmap_pool: None,
             copy_vk_contexts: HashMap::new(),
             scanout_pools: vec![None],
