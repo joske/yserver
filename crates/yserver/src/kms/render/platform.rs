@@ -2261,6 +2261,9 @@ pub(crate) struct PlatformBackend {
     // skip Vk init (`for_tests`). Production `open_with_commit`
     // always returns `Some`. v2 has no pixman fallback.
     pub(crate) vk: Option<Arc<VkContext>>,
+    /// Command buffer + fence reused by scanout reads; allocated from
+    /// `ops_command_pool`, so declared before it to drop first.
+    pub(crate) scanout_readback_op: Option<crate::kms::vk::ops::ReusableOneShot>,
     /// Wrapped in `Option` for the same reason. Drop order
     /// matters: ops_command_pool BEFORE fence_pool BEFORE vk
     /// (handled by struct field order — Rust drops fields in
@@ -3027,6 +3030,7 @@ impl PlatformBackend {
             pending_scanout_render_completions: std::collections::VecDeque::new(),
             next_scanout_render_job_id: 1,
             vk: Some(vk),
+            scanout_readback_op: None,
             ops_command_pool: Some(ops_command_pool),
             fence_pool: Some(fence_pool),
             scanout_readback: None,
@@ -3143,6 +3147,7 @@ impl PlatformBackend {
             pending_scanout_render_completions: std::collections::VecDeque::new(),
             next_scanout_render_job_id: 1,
             vk: None,
+            scanout_readback_op: None,
             ops_command_pool: None,
             fence_pool: None,
             scanout_readback: None,

@@ -246,6 +246,101 @@ where
     })
 }
 
+/// One command buffer and fence re-recorded for a stream of synchronous
+/// one-shot ops (scanout readback), so each op skips the allocate/free and
+/// create/destroy [`run_one_shot_op_with_wait`] pays. Must be dropped
+/// before its command pool.
+pub(crate) struct ReusableOneShot {
+    vk: Arc<VkContext>,
+    pool: vk::CommandPool,
+    cb: vk::CommandBuffer,
+    fence: vk::Fence,
+}
+
+impl ReusableOneShot {
+    /// `pool` must have `RESET_COMMAND_BUFFER` (as [`OpsCommandPool`] does).
+    pub(crate) fn new(vk: Arc<VkContext>, pool: vk::CommandPool) -> Result<Self, vk::Result> {
+        let alloc_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let cb = unsafe { vk.device.allocate_command_buffers(&alloc_info)?[0] };
+        let fence = match unsafe {
+            vk.device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+        } {
+            Ok(f) => f,
+            Err(e) => {
+                unsafe { vk.device.free_command_buffers(pool, &[cb]) };
+                return Err(e);
+            }
+        };
+        Ok(Self {
+            vk,
+            pool,
+            cb,
+            fence,
+        })
+    }
+
+    pub(crate) fn matches(&self, vk: &Arc<VkContext>, pool: vk::CommandPool) -> bool {
+        Arc::ptr_eq(&self.vk, vk) && self.pool == pool
+    }
+
+    /// Record, submit and wait, like [`run_one_shot_op_with_wait`] without a
+    /// wait semaphore. On an `in_flight` error the caller must abandon
+    /// `self` (`mem::forget`): the CB and fence may still be in use.
+    pub(crate) fn run<F>(&mut self, record: F) -> Result<(), OneShotError>
+    where
+        F: FnOnce(&VkContext, vk::CommandBuffer) -> Result<(), vk::Result>,
+    {
+        let vk = &*self.vk;
+        let cb = self.cb;
+        let not_submitted = |result| OneShotError {
+            result,
+            in_flight: false,
+        };
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        crate::vk_count!(begin_command_buffer);
+        unsafe { vk.device.begin_command_buffer(cb, &begin) }.map_err(not_submitted)?;
+        record(vk, cb).map_err(not_submitted)?;
+        crate::vk_count!(end_command_buffer);
+        unsafe { vk.device.end_command_buffer(cb) }.map_err(not_submitted)?;
+        unsafe { vk.device.reset_fences(&[self.fence]) }.map_err(not_submitted)?;
+
+        let cb_info = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
+        let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cb_info)];
+        crate::vk_count!(queue_submit2);
+        crate::vk_count!(submit_one_shot);
+        unsafe {
+            vk.device
+                .queue_submit2(vk.graphics_queue, &submit, self.fence)
+        }
+        .map_err(not_submitted)?;
+        unsafe { vk.device.wait_for_fences(&[self.fence], true, u64::MAX) }.map_err(|result| {
+            log::error!(
+                "ReusableOneShot: wait_for_fences failed ({result:?}); CB and fence abandoned"
+            );
+            OneShotError {
+                result,
+                in_flight: true,
+            }
+        })
+    }
+}
+
+impl Drop for ReusableOneShot {
+    fn drop(&mut self) {
+        // Idle: every `run` waits on the fence, and an in-flight failure is
+        // abandoned with `mem::forget` instead of dropped.
+        unsafe {
+            self.vk.device.destroy_fence(self.fence, None);
+            self.vk.device.free_command_buffers(self.pool, &[self.cb]);
+        }
+    }
+}
+
 /// Host-mapped, growable staging buffer used by image-transfer ops
 /// (`PutImage`, `GetImage`, `MitShmPutImage`, `MitShmGetImage`,
 /// `MitShmCreatePixmap`). One per backend, reused across ops.
