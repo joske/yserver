@@ -17408,11 +17408,11 @@ fn read_scanout_region_named(
             std::mem::forget(backend.platform.scanout_readback.take());
         }
         if copied_route || e == ash::vk::Result::ERROR_DEVICE_LOST {
-            // The one-shot helper cannot distinguish a post-submit wait
-            // failure from earlier errors at this boundary. Fail closed: the
-            // copied source may have executed work (including an ownership
-            // acquire) and must not be reused or destroyed under an uncertain
-            // live submission. DEVICE_LOST is fatal on the shared path too.
+            // Deliberately fatal on any copied-route error, even pre-submit
+            // ones `in_flight` would clear: the copied source may have
+            // executed work (including an ownership acquire) and is not
+            // reused under an uncertain state. DEVICE_LOST is fatal on the
+            // shared path too.
             backend.platform.renderer_failed = true;
         }
         return Err(io::Error::other(format!("scanout copy submit: {e:?}")));
