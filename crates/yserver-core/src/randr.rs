@@ -890,6 +890,263 @@ pub struct CrtcInfoData {
     pub possible_outputs: Vec<u32>,
 }
 
+/// A client-defined monitor (RANDR 1.5 `SetMonitor`, Xorg `RRMonitorRec`
+/// with `automatic = FALSE`).
+///
+/// Lives in `ServerState::randr_client_monitors`, not here: hotplug and
+/// `SetCrtcConfig` rebuild `RandrState` wholesale, while Xorg keeps the list
+/// in the screen private until the screen closes (`RRMonitorClose`, i.e. a
+/// server reset). No client owns it — it outlives the connection that set it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientMonitor {
+    pub name: u32,
+    pub primary: bool,
+    /// Not validated against the output list, as in Xorg.
+    pub outputs: Vec<u32>,
+    pub x: i16,
+    pub y: i16,
+    pub width: u16,
+    pub height: u16,
+    pub width_mm: u32,
+    pub height_mm: u32,
+}
+
+impl ClientMonitor {
+    /// A 0x0+0+0 box asks for the geometry of its outputs' CRTCs
+    /// (`RRMonitorAutomaticGeometry`, rrmonitor.c).
+    fn automatic_geometry(&self) -> bool {
+        self.x == 0 && self.y == 0 && self.width == 0 && self.height == 0
+    }
+}
+
+/// How a merged monitor is named on the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MonitorName {
+    /// A client monitor's atom.
+    Atom(u32),
+    /// An automatic monitor is named after its CRTC's first output
+    /// (`RRMonitorCrtcName`), interned when the reply is built.
+    Output(String),
+}
+
+/// One protocol-visible monitor: what `GetMonitors` reports and XINERAMA
+/// derives its heads from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Monitor {
+    pub name: MonitorName,
+    pub primary: bool,
+    pub automatic: bool,
+    pub outputs: Vec<u32>,
+    pub x: i16,
+    pub y: i16,
+    pub width: u16,
+    pub height: u16,
+    pub width_mm: u32,
+    pub height_mm: u32,
+}
+
+/// `RRMonitorGeometryRec`: an x1/y1/x2/y2 box plus physical size.
+#[derive(Clone, Copy, Default)]
+struct MonitorGeometry {
+    x1: i32,
+    y1: i32,
+    x2: i32,
+    y2: i32,
+    width_mm: u32,
+    height_mm: u32,
+}
+
+impl MonitorGeometry {
+    fn is_empty(&self) -> bool {
+        self.x2 == self.x1 || self.y2 == self.y1
+    }
+}
+
+impl RandrState {
+    /// `RRMonitorGetCrtcGeometry` for the CRTC driving `output`: its
+    /// transformed footprint, and the output's physical size or a 96-DPI
+    /// synthesis.
+    fn crtc_monitor_geometry(output: &RandrOutput) -> MonitorGeometry {
+        let (width, height) = output.footprint();
+        let width_mm = if output.mm_width > 0 {
+            output.mm_width
+        } else {
+            ((u32::from(width) * 254 + 480) / 960).max(1)
+        };
+        let height_mm = if output.mm_height > 0 {
+            output.mm_height
+        } else {
+            ((u32::from(height) * 254 + 480) / 960).max(1)
+        };
+        MonitorGeometry {
+            x1: i32::from(output.x),
+            y1: i32::from(output.y),
+            x2: i32::from(output.x) + i32::from(width),
+            y2: i32::from(output.y) + i32::from(height),
+            width_mm,
+            height_mm,
+        }
+    }
+
+    /// `RRMonitorGetGeometry` as shipped in Xorg 21.1: an explicit box is
+    /// reported verbatim; an automatic one is the union of the active CRTCs
+    /// driving its outputs. The multi-CRTC physical size is the 21.1
+    /// formula, integer arithmetic on the LAST CRTC's width over the
+    /// first's (xserver main fixed it to use the union in 190320795; the
+    /// 21.1 branch never took that) — measured by
+    /// `tools/vng-scenarios/xrandr-monitors.sh --outputs 2`.
+    fn client_monitor_geometry(&self, monitor: &ClientMonitor) -> MonitorGeometry {
+        if !monitor.automatic_geometry() || monitor.outputs.is_empty() {
+            return MonitorGeometry {
+                x1: i32::from(monitor.x),
+                y1: i32::from(monitor.y),
+                x2: i32::from(monitor.x) + i32::from(monitor.width),
+                y2: i32::from(monitor.y) + i32::from(monitor.height),
+                width_mm: monitor.width_mm,
+                height_mm: monitor.height_mm,
+            };
+        }
+        let mut geometry = MonitorGeometry::default();
+        let mut first = MonitorGeometry::default();
+        let mut last = MonitorGeometry::default();
+        let mut active_crtcs = 0;
+        for &id in &monitor.outputs {
+            let Some(output) = self.enabled_outputs().find(|o| o.output_id == id) else {
+                continue;
+            };
+            let this = Self::crtc_monitor_geometry(output);
+            if active_crtcs == 0 {
+                first = this;
+                geometry = this;
+            } else {
+                geometry.x1 = geometry.x1.min(this.x1);
+                geometry.x2 = geometry.x2.max(this.x2);
+                geometry.y1 = geometry.y1.min(this.y1);
+                geometry.y2 = geometry.y2.max(this.y2);
+            }
+            last = this;
+            active_crtcs += 1;
+        }
+        if active_crtcs > 1 && first.x2 != first.x1 && first.y2 != first.y1 {
+            let scale = |this: i32, first: i32, mm: u32| {
+                #[allow(clippy::cast_sign_loss)]
+                let ratio = (this / first) as u32;
+                ratio.wrapping_mul(mm)
+            };
+            geometry.width_mm = scale(last.x2 - last.x1, first.x2 - first.x1, first.width_mm);
+            geometry.height_mm = scale(last.y2 - last.y1, first.y2 - first.y1, first.height_mm);
+        }
+        geometry
+    }
+
+    /// `RRMonitorMakeList` (rrmonitor.c): the client monitors, then one
+    /// automatic monitor per active CRTC that no counted client monitor
+    /// claims an output of. The first primary client monitor — or failing
+    /// that the primary output's CRTC — leads the list. `get_active` drops
+    /// monitors with an empty box (and they then claim no CRTC).
+    ///
+    /// Primary is Xorg's, quirks included: the leading entry does not count
+    /// towards `has_primary`, so a client primary and the primary output's
+    /// uncovered CRTC are BOTH reported primary.
+    #[must_use]
+    pub fn monitors(&self, client: &[ClientMonitor], get_active: bool) -> Vec<Monitor> {
+        let geometries: Vec<MonitorGeometry> = client
+            .iter()
+            .map(|monitor| self.client_monitor_geometry(monitor))
+            .collect();
+        let counted = |m: usize| !get_active || !geometries[m].is_empty();
+
+        // One CRTC per enabled output here, so "the CRTC drives output o"
+        // is "the output is o".
+        let mut server_crtcs: Vec<Option<&RandrOutput>> =
+            self.enabled_outputs().map(Some).collect();
+        let mut client_primary = None;
+        for (m, monitor) in client.iter().enumerate() {
+            if !counted(m) {
+                continue;
+            }
+            if monitor.primary && client_primary.is_none() {
+                client_primary = Some(m);
+            }
+            for crtc in &mut server_crtcs {
+                if crtc.is_some_and(|output| monitor.outputs.contains(&output.output_id)) {
+                    *crtc = None;
+                }
+            }
+        }
+        let server_primary = server_crtcs
+            .iter()
+            .position(|crtc| crtc.is_some_and(|output| output.output_id == self.primary_output));
+
+        let from_client = |m: usize| {
+            let monitor = &client[m];
+            let geometry = geometries[m];
+            Monitor {
+                name: MonitorName::Atom(monitor.name),
+                primary: monitor.primary,
+                automatic: false,
+                outputs: monitor.outputs.clone(),
+                ..Self::monitor_box(geometry)
+            }
+        };
+        let from_server = |output: &RandrOutput| Monitor {
+            name: MonitorName::Output(output.name.clone()),
+            primary: output.output_id == self.primary_output,
+            automatic: true,
+            outputs: vec![output.output_id],
+            ..Self::monitor_box(Self::crtc_monitor_geometry(output))
+        };
+
+        let mut list = Vec::new();
+        if let Some(m) = client_primary {
+            list.push(from_client(m));
+        } else if let Some(c) = server_primary {
+            list.extend(server_crtcs[c].map(from_server));
+        }
+        let mut has_primary = false;
+        let mut push = |list: &mut Vec<Monitor>, mut monitor: Monitor| {
+            if has_primary {
+                monitor.primary = false;
+            } else if monitor.primary {
+                has_primary = true;
+            }
+            list.push(monitor);
+        };
+        for m in 0..client.len() {
+            if Some(m) != client_primary && counted(m) {
+                push(&mut list, from_client(m));
+            }
+        }
+        for (c, crtc) in server_crtcs.iter().enumerate() {
+            if c == server_primary.unwrap_or(usize::MAX) && client_primary.is_none() {
+                continue;
+            }
+            if let Some(output) = crtc {
+                push(&mut list, from_server(output));
+            }
+        }
+        list
+    }
+
+    /// The wire box of a geometry. Xorg's `BoxRec` holds shorts, so the
+    /// width/height truncate exactly as `x2 - x1` does into a CARD16.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn monitor_box(geometry: MonitorGeometry) -> Monitor {
+        Monitor {
+            name: MonitorName::Atom(0),
+            primary: false,
+            automatic: false,
+            outputs: Vec::new(),
+            x: geometry.x1 as i16,
+            y: geometry.y1 as i16,
+            width: (geometry.x2 - geometry.x1) as u16,
+            height: (geometry.y2 - geometry.y1) as u16,
+            width_mm: geometry.width_mm,
+            height_mm: geometry.height_mm,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

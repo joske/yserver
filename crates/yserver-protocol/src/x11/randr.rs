@@ -72,6 +72,8 @@ pub const RR_CHANGE_PROVIDER_PROPERTY: u8 = 39;
 pub const RR_DELETE_PROVIDER_PROPERTY: u8 = 40;
 pub const RR_GET_PROVIDER_PROPERTY: u8 = 41;
 pub const RR_GET_MONITORS: u8 = 42;
+pub const RR_SET_MONITOR: u8 = 43;
+pub const RR_DELETE_MONITOR: u8 = 44;
 
 pub const NOTIFY_MASK_SCREEN_CHANGE: u16 = 1 << 0;
 pub const NOTIFY_MASK_CRTC_CHANGE: u16 = 1 << 1;
@@ -519,6 +521,51 @@ pub fn parse_set_crtc_transform_request(body: &[u8]) -> Option<SetCrtcTransformR
         filter_name_len,
         filter,
     })
+}
+
+/// RANDR 1.5 `SetMonitor` body: `window(4)` then an `xRRMonitorInfo`
+/// (`name(4) primary(1) automatic(1) noutput(2) x(2) y(2) width(2)
+/// height(2) widthInMillimeters(4) heightInMillimeters(4)`) and the output
+/// list. `noutput` is the client's count; the tail is whatever followed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetMonitorRequest {
+    pub window: u32,
+    pub name: u32,
+    pub primary: bool,
+    pub noutput: u16,
+    pub x: i16,
+    pub y: i16,
+    pub width: u16,
+    pub height: u16,
+    pub width_mm: u32,
+    pub height_mm: u32,
+    pub outputs: Vec<u32>,
+}
+
+/// Parse `RRSetMonitor`. `None` for a body shorter than the fixed part
+/// (`REQUEST_AT_LEAST_SIZE`); the caller checks `noutput` against the tail.
+pub fn parse_set_monitor_request(body: &[u8]) -> Option<SetMonitorRequest> {
+    if body.len() < 28 {
+        return None;
+    }
+    Some(SetMonitorRequest {
+        window: read_u32_le(body),
+        name: read_u32_le(&body[4..]),
+        primary: body[8] != 0,
+        noutput: read_u16_le(&body[10..]),
+        x: i16::from_le_bytes([body[12], body[13]]),
+        y: i16::from_le_bytes([body[14], body[15]]),
+        width: read_u16_le(&body[16..]),
+        height: read_u16_le(&body[18..]),
+        width_mm: read_u32_le(&body[20..]),
+        height_mm: read_u32_le(&body[24..]),
+        outputs: body[28..].chunks_exact(4).map(read_u32_le).collect(),
+    })
+}
+
+/// Parse the fixed-size `RRDeleteMonitor` body: `(window, name)`.
+pub fn parse_delete_monitor_request(body: &[u8]) -> Option<(u32, u32)> {
+    (body.len() == 8).then(|| (read_u32_le(body), read_u32_le(&body[4..])))
 }
 
 /// Parse the fixed-size `RRSetPanning` request body.

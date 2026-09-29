@@ -388,6 +388,24 @@ const fn randr_request_swap_table(minor: u8) -> Option<&'static [FieldEntry]> {
         33..=35 => &[u32f!(0), u32f!(4), u32f!(8)],
         // GetMonitors: window + get_active byte.
         42 => &[u32f!(0)],
+        // SetMonitor: window, then xRRMonitorInfo (name, two BOOLs, noutput,
+        // x, y, width, height, mm width/height) and its RROutput tail
+        // (Xorg `SProcRRSetMonitor`, `SwapRestL`).
+        super::randr::RR_SET_MONITOR => &[
+            u32f!(0),
+            u32f!(4),
+            u16f!(10),
+            i16f!(12),
+            i16f!(14),
+            u16f!(16),
+            u16f!(18),
+            u32f!(20),
+            u32f!(24),
+            ElementArrayTail {
+                from: 28,
+                kind: U32,
+            },
+        ],
         _ => return None,
     })
 }
@@ -1355,7 +1373,7 @@ mod tests {
         const XID: u32 = 0x00de_ad01;
         for minor in [
             2u8, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 20, 21, 22, 23, 25, 26, 27, 28, 29, 30,
-            31, 32, 33, 42, 46,
+            31, 32, 33, 42, 43, 44, 46,
         ] {
             let mut body = vec![0u8; 32];
             body[0..4].copy_from_slice(&XID.to_be_bytes());
@@ -1368,11 +1386,48 @@ mod tests {
         }
     }
 
+    /// `SProcRRSetMonitor`: every numeric xRRMonitorInfo field and the
+    /// RROutput tail are swapped; the primary/automatic BOOLs are bytes.
+    #[test]
+    fn randr_set_monitor_swaps_monitor_info_and_output_tail() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x0000_0123u32.to_be_bytes()); // window
+        body.extend_from_slice(&0x0000_0456u32.to_be_bytes()); // name
+        body.extend_from_slice(&[1, 0]); // primary, automatic
+        body.extend_from_slice(&2u16.to_be_bytes()); // noutput
+        body.extend_from_slice(&(-5i16).to_be_bytes()); // x
+        body.extend_from_slice(&7i16.to_be_bytes()); // y
+        body.extend_from_slice(&640u16.to_be_bytes()); // width
+        body.extend_from_slice(&800u16.to_be_bytes()); // height
+        body.extend_from_slice(&170u32.to_be_bytes()); // mm width
+        body.extend_from_slice(&211u32.to_be_bytes()); // mm height
+        body.extend_from_slice(&0x41u32.to_be_bytes());
+        body.extend_from_slice(&0x0001_0042u32.to_be_bytes());
+        swap_request_body(128, 43, ClientByteOrder::BigEndian, &mut body);
+        let req = crate::x11::randr::parse_set_monitor_request(&body).unwrap();
+        assert_eq!(
+            req,
+            crate::x11::randr::SetMonitorRequest {
+                window: 0x123,
+                name: 0x456,
+                primary: true,
+                noutput: 2,
+                x: -5,
+                y: 7,
+                width: 640,
+                height: 800,
+                width_mm: 170,
+                height_mm: 211,
+                outputs: vec![0x41, 0x0001_0042],
+            }
+        );
+    }
+
     /// A little-endian client's body must be left byte-for-byte alone, so the
     /// new entries cannot corrupt the common path.
     #[test]
     fn randr_little_endian_bodies_are_untouched() {
-        for minor in [2u8, 4, 7, 12, 13, 15, 21, 26, 29, 30, 42, 46] {
+        for minor in [2u8, 4, 7, 12, 13, 15, 21, 26, 29, 30, 42, 43, 46] {
             let mut body: Vec<u8> = (0..32u8).collect();
             let original = body.clone();
             swap_request_body(128, minor, ClientByteOrder::LittleEndian, &mut body);

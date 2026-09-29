@@ -2927,59 +2927,48 @@ fn handle_render_request(
     Ok(RequestOutcome::Handled)
 }
 
-/// One monitor as reported by both RANDR `GetMonitors` and the XINERAMA
-/// extension. This is the single source of truth so their counts/order cannot
-/// diverge.
-#[derive(Clone)]
-pub(crate) struct ActiveMonitor {
-    pub name: String,
-    pub output_id: u32,
-    pub primary: bool,
-    pub x: i16,
-    pub y: i16,
-    pub width: u16,
-    pub height: u16,
-    pub width_mm: u32,
-    pub height_mm: u32,
-}
-
-fn active_monitors(state: &ServerState) -> Vec<ActiveMonitor> {
-    // One automatic monitor per ASSIGNED output (Xorg builds an automatic
-    // monitor for an output with a current CRTC). A lightweight connection
-    // query does not detach that CRTC, so a transient disconnected+assigned
-    // output remains present until the heavy topology path turns it off.
-    // `primary` is the RANDR primary output, which itself prefers an assigned
-    // output — the first output in the list may be off, so `i == 0` is wrong.
-    let primary = state.randr.primary_output;
+/// The protocol-visible monitor list (`RRMonitorMakeList`), shared by RANDR
+/// `GetMonitors` and XINERAMA so their counts/order cannot diverge.
+fn active_monitors(state: &ServerState, get_active: bool) -> Vec<crate::randr::Monitor> {
     state
         .randr
-        .enabled_outputs()
-        .map(|output| {
-            // The CRTC's footprint (`RRMonitorGetCrtcGeometry`, rrmonitor.c:71).
-            let (width, height) = output.footprint();
-            let width_mm = if output.mm_width > 0 {
-                output.mm_width
-            } else {
-                ((u32::from(width) * 254 + 480) / 960).max(1)
-            };
-            let height_mm = if output.mm_height > 0 {
-                output.mm_height
-            } else {
-                ((u32::from(height) * 254 + 480) / 960).max(1)
-            };
-            ActiveMonitor {
-                name: output.name.clone(),
-                output_id: output.output_id,
-                primary: output.output_id == primary,
-                x: output.x,
-                y: output.y,
-                width,
-                height,
-                width_mm,
-                height_mm,
-            }
-        })
-        .collect()
+        .monitors(&state.randr_client_monitors, get_active)
+}
+
+/// `RRSendConfigNotify` (rrscreen.c): a core ConfigureNotify on the root
+/// carrying its current geometry — all `SetMonitor`/`DeleteMonitor` send.
+/// No RANDR event: the monitor list has none of its own.
+fn send_root_config_notify(state: &mut ServerState) {
+    let Some(root) = state.resources.window(crate::resources::ROOT_WINDOW) else {
+        return;
+    };
+    let geometry = x11::Geometry {
+        root: crate::resources::ROOT_WINDOW,
+        x: 0,
+        y: 0,
+        width: root.width,
+        height: root.height,
+        border_width: root.border_width,
+        depth: root.depth,
+    };
+    let override_redirect = root.override_redirect;
+    let _dropped = crate::core_loop::fanout::emit_window_event_to_state(
+        state,
+        crate::resources::ROOT_WINDOW,
+        0x0002_0000, // StructureNotifyMask
+        |buf, seq, order| {
+            x11::encode_configure_notify_event(
+                buf,
+                seq,
+                order,
+                crate::resources::ROOT_WINDOW,
+                crate::resources::ROOT_WINDOW,
+                None,
+                geometry,
+                override_redirect,
+            );
+        },
+    );
 }
 
 /// Record an unsupported RANDR minor and report whether this is the first
@@ -4196,7 +4185,11 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             }
+            // RRMonitorTimestamp: lastConfigTime, which Set/DeleteMonitor
+            // leave alone ("XXX should take client monitor changes into
+            // account", rrmonitor.c).
             let t = state.randr.timestamp;
+            let get_active = body.get(4).is_some_and(|&b| b != 0);
             struct MonitorRow {
                 name_atom: u32,
                 primary: bool,
@@ -4209,20 +4202,25 @@ fn handle_randr_request(
                 height_mm: u32,
                 outputs: Vec<u32>,
             }
-            let monitors_list = active_monitors(state);
+            let monitors_list = active_monitors(state, get_active);
             let rows: Vec<MonitorRow> = monitors_list
-                .iter()
+                .into_iter()
                 .map(|monitor| MonitorRow {
-                    name_atom: state.atoms.intern(&monitor.name, false).0,
+                    name_atom: match monitor.name {
+                        crate::randr::MonitorName::Atom(atom) => atom,
+                        crate::randr::MonitorName::Output(name) => {
+                            state.atoms.intern(&name, false).0
+                        }
+                    },
                     primary: monitor.primary,
-                    automatic: true,
+                    automatic: monitor.automatic,
                     x: monitor.x,
                     y: monitor.y,
                     width: monitor.width,
                     height: monitor.height,
                     width_mm: monitor.width_mm,
                     height_mm: monitor.height_mm,
-                    outputs: vec![monitor.output_id],
+                    outputs: monitor.outputs,
                 })
                 .collect();
             let monitors: Vec<x11randr::MonitorInfo<'_>> = rows
@@ -4246,6 +4244,100 @@ fn handle_randr_request(
             };
             let _byte_order = client.byte_order;
             return Ok(write_to_client(client, client_id, &buf));
+        }
+        x11randr::RR_SET_MONITOR => {
+            // ProcRRSetMonitor + RRMonitorAdd as shipped in Xorg 21.1
+            // (rrmonitor.c), measured by tools/vng-scenarios/xrandr-monitors.sh.
+            let error = |state: &mut ServerState, code: u8, value: u32| {
+                emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    code,
+                    value,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                )
+            };
+            let Some(req) = x11randr::parse_set_monitor_request(body) else {
+                return error(state, x11::error::BAD_LENGTH, 0);
+            };
+            if usize::from(req.noutput) != req.outputs.len() {
+                return error(state, x11::error::BAD_LENGTH, 0);
+            }
+            if state.resources.window(ResourceId(req.window)).is_none() {
+                return error(state, x11::error::BAD_WINDOW, req.window);
+            }
+            // !ValidAtom: Xorg sets no errorValue here, so the wire carries
+            // the window id the successful lookup just left in it.
+            if req.name == 0 || state.atoms.name(AtomId(req.name)).is_none() {
+                return error(state, x11::error::BAD_ATOM, req.window);
+            }
+            let name = state.atoms.name(AtomId(req.name)).unwrap_or_default();
+            // 'name' must match neither an Output nor an existing Monitor.
+            // (xserver main replaces a same-named monitor instead, 146bb9b2c;
+            // 21.1 refuses it.)
+            if state.randr.outputs.iter().any(|output| output.name == name)
+                || state
+                    .randr_client_monitors
+                    .iter()
+                    .any(|monitor| monitor.name == req.name)
+            {
+                return error(state, x11::error::BAD_VALUE, req.name);
+            }
+            if req.primary {
+                for monitor in &mut state.randr_client_monitors {
+                    monitor.primary = false;
+                }
+            }
+            state
+                .randr_client_monitors
+                .push(crate::randr::ClientMonitor {
+                    name: req.name,
+                    primary: req.primary,
+                    outputs: req.outputs,
+                    x: req.x,
+                    y: req.y,
+                    width: req.width,
+                    height: req.height,
+                    width_mm: req.width_mm,
+                    height_mm: req.height_mm,
+                });
+            send_root_config_notify(state);
+            return Ok(RequestOutcome::Handled);
+        }
+        x11randr::RR_DELETE_MONITOR => {
+            // ProcRRDeleteMonitor + RRMonitorDelete (rrmonitor.c).
+            let error = |state: &mut ServerState, code: u8, value: u32| {
+                emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    code,
+                    value,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                )
+            };
+            let Some((window, name)) = x11randr::parse_delete_monitor_request(body) else {
+                return error(state, x11::error::BAD_LENGTH, 0);
+            };
+            if state.resources.window(ResourceId(window)).is_none() {
+                return error(state, x11::error::BAD_WINDOW, window);
+            }
+            if name == 0 || state.atoms.name(AtomId(name)).is_none() {
+                return error(state, x11::error::BAD_ATOM, name);
+            }
+            let Some(index) = state
+                .randr_client_monitors
+                .iter()
+                .position(|monitor| monitor.name == name)
+            else {
+                return error(state, x11::error::BAD_VALUE, name);
+            };
+            state.randr_client_monitors.remove(index);
+            send_root_config_notify(state);
+            return Ok(RequestOutcome::Handled);
         }
         x11randr::RR_GET_CRTC_GAMMA_SIZE => {
             let Some(req) = x11randr::parse_crtc_id_request(body) else {
@@ -5155,8 +5247,6 @@ fn handle_randr_request(
                 17 => "DestroyMode",
                 18 => "AddOutputMode",
                 19 => "DeleteOutputMode",
-                43 => "SetMonitor",
-                44 => "DeleteMonitor",
                 _ => "known request",
             };
             warn_randr_unsupported_once(
@@ -6087,7 +6177,11 @@ fn handle_xinerama_request(
         .map_or(ClientByteOrder::LittleEndian, |c| c.byte_order);
     let minor = header.data;
 
-    let screens: Vec<xin::ScreenInfo> = active_monitors(state)
+    // RRXineramaScreenCount counts every monitor (`RRMonitorCountList`,
+    // get_active FALSE); QueryScreens lists only the non-empty ones
+    // (rrxinerama.c) — a 0x0 client monitor is counted but not listed.
+    let screen_count = active_monitors(state, false).len();
+    let screens: Vec<xin::ScreenInfo> = active_monitors(state, true)
         .into_iter()
         .map(|monitor| xin::ScreenInfo {
             x_org: monitor.x,
@@ -6120,7 +6214,7 @@ fn handle_xinerama_request(
         }
         xin::IS_ACTIVE => {
             require_len!(0);
-            xin::encode_is_active_reply(byte_order, sequence, !screens.is_empty())
+            xin::encode_is_active_reply(byte_order, sequence, screen_count > 0)
         }
         xin::QUERY_SCREENS => {
             require_len!(0);
@@ -6157,7 +6251,7 @@ fn handle_xinerama_request(
                 );
             }
             #[allow(clippy::cast_possible_truncation)]
-            let count = screens.len() as u8;
+            let count = screen_count as u8;
             xin::encode_get_screen_count_reply(byte_order, sequence, count, window)
         }
         xin::GET_SCREEN_SIZE => {
@@ -34646,7 +34740,7 @@ mod tests {
             },
         ];
 
-        let monitors = active_monitors(&state);
+        let monitors = active_monitors(&state, true);
         assert_eq!(monitors.len(), state.randr.outputs.len());
         assert_eq!(monitors.len(), 2);
         assert!(monitors[0].primary);
@@ -34657,6 +34751,711 @@ mod tests {
             (677, 381),
             "automatic monitor geometry still derives physical size from its retained CRTC",
         );
+    }
+
+    /// The two-output guest of `tools/vng-scenarios/xrandr-monitors.sh
+    /// --outputs 2` after `--right-of`: Virtual-1 1920x1440+0+0 (primary),
+    /// Virtual-2 1360x768+1920+0, both 325x203 mm.
+    fn monitor_fixture(byte_order: ClientByteOrder) -> (ServerState, UnixStream) {
+        let output =
+            |name: &str, id: u32, x: i16, width: u16, height: u16| crate::randr::RandrOutput {
+                name: name.into(),
+                output_id: id,
+                crtc_id: id + 2,
+                mode_id: id + 4,
+                connected: true,
+                x,
+                y: 0,
+                width,
+                height,
+                vrefresh: 60,
+                timing: None,
+                mm_width: 325,
+                mm_height: 203,
+                mode_ids: vec![id + 4],
+                num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
+            };
+        let mut state = ServerState::new();
+        state.randr = crate::randr::RandrState::from_outputs(
+            7,
+            vec![
+                output("Virtual-1", 1, 0, 1920, 1440),
+                output("Virtual-2", 2, 1920, 1360, 768),
+            ],
+        );
+        let peer = install_client(&mut state, 1);
+        state.clients.get_mut(&1).unwrap().byte_order = byte_order;
+        (state, peer)
+    }
+
+    /// A request body in the client's byte order.
+    struct WireBody(ClientByteOrder, Vec<u8>);
+
+    impl WireBody {
+        fn u32(mut self, v: u32) -> Self {
+            match self.0 {
+                ClientByteOrder::LittleEndian => self.1.extend_from_slice(&v.to_le_bytes()),
+                ClientByteOrder::BigEndian => self.1.extend_from_slice(&v.to_be_bytes()),
+            }
+            self
+        }
+        fn u16(mut self, v: u16) -> Self {
+            match self.0 {
+                ClientByteOrder::LittleEndian => self.1.extend_from_slice(&v.to_le_bytes()),
+                ClientByteOrder::BigEndian => self.1.extend_from_slice(&v.to_be_bytes()),
+            }
+            self
+        }
+        fn bytes(mut self, v: &[u8]) -> Self {
+            self.1.extend_from_slice(v);
+            self
+        }
+    }
+
+    fn wire_u32(bo: ClientByteOrder, b: &[u8]) -> u32 {
+        let b: [u8; 4] = b[..4].try_into().unwrap();
+        match bo {
+            ClientByteOrder::LittleEndian => u32::from_le_bytes(b),
+            ClientByteOrder::BigEndian => u32::from_be_bytes(b),
+        }
+    }
+
+    fn wire_u16(bo: ClientByteOrder, b: &[u8]) -> u16 {
+        let b: [u8; 2] = b[..2].try_into().unwrap();
+        match bo {
+            ClientByteOrder::LittleEndian => u16::from_le_bytes(b),
+            ClientByteOrder::BigEndian => u16::from_be_bytes(b),
+        }
+    }
+
+    /// Swap `body` as the reader would, then dispatch it as RANDR `minor`.
+    fn randr_wire_request(
+        state: &mut ServerState,
+        peer: &mut UnixStream,
+        minor: u8,
+        body: WireBody,
+    ) -> Vec<u8> {
+        let WireBody(byte_order, mut body) = body;
+        yserver_protocol::x11::request_swap::swap_request_body(128, minor, byte_order, &mut body);
+        handle_randr_request(
+            state,
+            &mut RecordingBackend::new(),
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 128,
+                data: minor,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            &body,
+        )
+        .expect("RANDR request");
+        read_all_available(peer)
+    }
+
+    /// `SetMonitor` body: window, then name primary automatic noutput x y
+    /// width height mm-width mm-height outputs.
+    #[allow(clippy::too_many_arguments)]
+    fn set_monitor_body(
+        bo: ClientByteOrder,
+        window: u32,
+        name: u32,
+        primary: bool,
+        noutput: u16,
+        geometry: (i16, i16, u16, u16),
+        mm: (u32, u32),
+        outputs: &[u32],
+    ) -> WireBody {
+        #[allow(clippy::cast_sign_loss)]
+        let mut body = WireBody(bo, Vec::new())
+            .u32(window)
+            .u32(name)
+            .bytes(&[u8::from(primary), 0])
+            .u16(noutput)
+            .u16(geometry.0 as u16)
+            .u16(geometry.1 as u16)
+            .u16(geometry.2)
+            .u16(geometry.3)
+            .u32(mm.0)
+            .u32(mm.1);
+        for &output in outputs {
+            body = body.u32(output);
+        }
+        body
+    }
+
+    fn set_monitor(
+        state: &mut ServerState,
+        peer: &mut UnixStream,
+        name: &str,
+        primary: bool,
+        geometry: (i16, i16, u16, u16),
+        mm: (u32, u32),
+        outputs: &[u32],
+    ) -> Vec<u8> {
+        let bo = state.clients[&1].byte_order;
+        let atom = state.atoms.intern(name, false).0;
+        #[allow(clippy::cast_possible_truncation)]
+        let body = set_monitor_body(
+            bo,
+            ROOT_WINDOW.0,
+            atom,
+            primary,
+            outputs.len() as u16,
+            geometry,
+            mm,
+            outputs,
+        );
+        randr_wire_request(state, peer, x11randr_minor::SET_MONITOR, body)
+    }
+
+    fn delete_monitor(state: &mut ServerState, peer: &mut UnixStream, name: u32) -> Vec<u8> {
+        let bo = state.clients[&1].byte_order;
+        let body = WireBody(bo, Vec::new()).u32(ROOT_WINDOW.0).u32(name);
+        randr_wire_request(state, peer, x11randr_minor::DELETE_MONITOR, body)
+    }
+
+    mod x11randr_minor {
+        pub const SET_MONITOR: u8 = yserver_protocol::x11::randr::RR_SET_MONITOR;
+        pub const DELETE_MONITOR: u8 = yserver_protocol::x11::randr::RR_DELETE_MONITOR;
+    }
+
+    /// One decoded `GetMonitors` entry: name, primary, automatic,
+    /// "WxH+X+Y", "mmWxmmH", outputs.
+    type WireMonitor = (String, bool, bool, String, (u32, u32), Vec<u32>);
+
+    fn get_monitors(
+        state: &mut ServerState,
+        peer: &mut UnixStream,
+        get_active: bool,
+    ) -> Vec<WireMonitor> {
+        let bo = state.clients[&1].byte_order;
+        let body =
+            WireBody(bo, Vec::new())
+                .u32(ROOT_WINDOW.0)
+                .bytes(&[u8::from(get_active), 0, 0, 0]);
+        let r = randr_wire_request(
+            state,
+            peer,
+            yserver_protocol::x11::randr::RR_GET_MONITORS,
+            body,
+        );
+        assert_eq!(r[0], 1, "GetMonitors reply: {r:02x?}");
+        assert_eq!(
+            wire_u32(bo, &r[4..]) as usize * 4 + 32,
+            r.len(),
+            "reply length"
+        );
+        let count = wire_u32(bo, &r[12..]);
+        let mut total_outputs = 0;
+        let mut offset = 32;
+        let mut monitors = Vec::new();
+        for _ in 0..count {
+            let m = &r[offset..];
+            let n_out = usize::from(wire_u16(bo, &m[6..]));
+            #[allow(clippy::cast_possible_wrap)]
+            let geometry = format!(
+                "{}x{}+{}+{}",
+                wire_u16(bo, &m[12..]),
+                wire_u16(bo, &m[14..]),
+                wire_u16(bo, &m[8..]) as i16,
+                wire_u16(bo, &m[10..]) as i16,
+            );
+            let name = state
+                .atoms
+                .name(AtomId(wire_u32(bo, m)))
+                .unwrap_or("?")
+                .to_string();
+            let outputs = (0..n_out).map(|i| wire_u32(bo, &m[24 + i * 4..])).collect();
+            monitors.push((
+                name,
+                m[4] != 0,
+                m[5] != 0,
+                geometry,
+                (wire_u32(bo, &m[16..]), wire_u32(bo, &m[20..])),
+                outputs,
+            ));
+            total_outputs += n_out;
+            offset += 24 + n_out * 4;
+        }
+        assert_eq!(offset, r.len());
+        assert_eq!(wire_u32(bo, &r[16..]) as usize, total_outputs, "noutputs");
+        monitors
+    }
+
+    fn wm(
+        name: &str,
+        primary: bool,
+        automatic: bool,
+        geometry: &str,
+        mm: (u32, u32),
+        outputs: &[u32],
+    ) -> WireMonitor {
+        (
+            name.into(),
+            primary,
+            automatic,
+            geometry.into(),
+            mm,
+            outputs.to_vec(),
+        )
+    }
+
+    /// XINERAMA `(GetScreenCount, QueryScreens)` in the client's order.
+    fn xinerama_heads(state: &mut ServerState, peer: &mut UnixStream) -> (u8, Vec<String>) {
+        use yserver_protocol::x11::xinerama as xin;
+        let bo = state.clients[&1].byte_order;
+        let mut send = |state: &mut ServerState, minor: u8, body: &[u8]| {
+            handle_xinerama_request(
+                state,
+                ClientId(1),
+                SequenceNumber(1),
+                RequestHeader {
+                    opcode: 151,
+                    data: minor,
+                    length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+                },
+                body,
+            )
+            .expect("XINERAMA request");
+            read_all_available(peer)
+        };
+        let window = WireBody(bo, Vec::new()).u32(ROOT_WINDOW.0).1;
+        let count = send(state, xin::GET_SCREEN_COUNT, &window);
+        let screens = send(state, xin::QUERY_SCREENS, &[]);
+        let n = wire_u32(bo, &screens[8..]) as usize;
+        #[allow(clippy::cast_possible_wrap)]
+        let heads = (0..n)
+            .map(|i| {
+                let s = &screens[32 + i * 8..];
+                format!(
+                    "{}x{}+{}+{}",
+                    wire_u16(bo, &s[4..]),
+                    wire_u16(bo, &s[6..]),
+                    wire_u16(bo, s) as i16,
+                    wire_u16(bo, &s[2..]) as i16,
+                )
+            })
+            .collect();
+        (count[1], heads)
+    }
+
+    const BOTH_ORDERS: [ClientByteOrder; 2] =
+        [ClientByteOrder::LittleEndian, ClientByteOrder::BigEndian];
+
+    /// Measured split: `--setmonitor left 960/170x1440/211+0+0 Virtual-1`
+    /// and `right ...+960+0 none` hide Virtual-1's automatic monitor, keep
+    /// Virtual-2's, and nobody is primary (the primary output is covered).
+    #[test]
+    fn set_monitor_split_replaces_the_covered_automatic_monitor() {
+        for bo in BOTH_ORDERS {
+            let (mut state, mut peer) = monitor_fixture(bo);
+            let r = set_monitor(
+                &mut state,
+                &mut peer,
+                "left",
+                false,
+                (0, 0, 960, 1440),
+                (170, 211),
+                &[1],
+            );
+            assert!(r.is_empty(), "{r:02x?}");
+            let r = set_monitor(
+                &mut state,
+                &mut peer,
+                "right",
+                false,
+                (960, 0, 960, 1440),
+                (170, 211),
+                &[],
+            );
+            assert!(r.is_empty(), "{r:02x?}");
+            let want = vec![
+                wm("left", false, false, "960x1440+0+0", (170, 211), &[1]),
+                wm("right", false, false, "960x1440+960+0", (170, 211), &[]),
+                wm(
+                    "Virtual-2",
+                    false,
+                    true,
+                    "1360x768+1920+0",
+                    (325, 203),
+                    &[2],
+                ),
+            ];
+            assert_eq!(get_monitors(&mut state, &mut peer, false), want, "{bo:?}");
+            assert_eq!(get_monitors(&mut state, &mut peer, true), want, "{bo:?}");
+            assert_eq!(
+                xinerama_heads(&mut state, &mut peer),
+                (
+                    3,
+                    vec![
+                        "960x1440+0+0".into(),
+                        "960x1440+960+0".into(),
+                        "1360x768+1920+0".into()
+                    ]
+                ),
+            );
+        }
+    }
+
+    /// Measured: a 0x0+0+0 monitor over both outputs is their union, and
+    /// its physical size is Xorg 21.1's integer `last_w / first_w *
+    /// first_mm` — 1360/1920 = 0 — so 0x0 mm. With Virtual-2 off it is
+    /// Virtual-1's geometry alone.
+    #[test]
+    fn automatic_geometry_client_monitor_follows_the_crtc_layout() {
+        for bo in BOTH_ORDERS {
+            let (mut state, mut peer) = monitor_fixture(bo);
+            set_monitor(
+                &mut state,
+                &mut peer,
+                "both",
+                false,
+                (0, 0, 0, 0),
+                (0, 0),
+                &[1, 2],
+            );
+            assert_eq!(
+                get_monitors(&mut state, &mut peer, false),
+                vec![wm("both", false, false, "3280x1440+0+0", (0, 0), &[1, 2])],
+            );
+            state.randr.outputs[1].mode_id = 0;
+            assert_eq!(
+                get_monitors(&mut state, &mut peer, false),
+                vec![wm(
+                    "both",
+                    false,
+                    false,
+                    "1920x1440+0+0",
+                    (325, 203),
+                    &[1, 2]
+                )],
+            );
+        }
+    }
+
+    /// Measured `cprim`: a primary client monitor leads the list, and the
+    /// uncovered CRTC of the primary output is ALSO reported primary —
+    /// Xorg's leading entry does not count towards `has_primary`.
+    #[test]
+    fn client_primary_and_uncovered_primary_output_are_both_primary() {
+        for bo in BOTH_ORDERS {
+            let (mut state, mut peer) = monitor_fixture(bo);
+            state.randr.primary_output = 2;
+            set_monitor(
+                &mut state,
+                &mut peer,
+                "autogeo",
+                false,
+                (0, 0, 0, 0),
+                (0, 0),
+                &[1],
+            );
+            set_monitor(
+                &mut state,
+                &mut peer,
+                "cprim",
+                true,
+                (0, 0, 0, 0),
+                (0, 0),
+                &[1],
+            );
+            assert_eq!(
+                get_monitors(&mut state, &mut peer, true),
+                vec![
+                    wm("cprim", true, false, "1920x1440+0+0", (325, 203), &[1]),
+                    wm("autogeo", false, false, "1920x1440+0+0", (325, 203), &[1]),
+                    wm("Virtual-2", true, true, "1360x768+1920+0", (325, 203), &[2]),
+                ],
+            );
+        }
+    }
+
+    /// Measured `extra-primary`: a new primary monitor clears the old one's
+    /// flag; deleting it leaves no primary client monitor behind.
+    #[test]
+    fn a_new_primary_client_monitor_clears_the_previous_one() {
+        for bo in BOTH_ORDERS {
+            let (mut state, mut peer) = monitor_fixture(bo);
+            set_monitor(
+                &mut state,
+                &mut peer,
+                "left",
+                false,
+                (0, 0, 960, 1440),
+                (170, 211),
+                &[1],
+            );
+            set_monitor(
+                &mut state,
+                &mut peer,
+                "right",
+                true,
+                (960, 0, 960, 1440),
+                (100, 50),
+                &[],
+            );
+            set_monitor(
+                &mut state,
+                &mut peer,
+                "extra",
+                true,
+                (0, 0, 10, 10),
+                (100, 50),
+                &[],
+            );
+            let names = |m: Vec<WireMonitor>| m.into_iter().map(|m| (m.0, m.1)).collect::<Vec<_>>();
+            assert_eq!(
+                names(get_monitors(&mut state, &mut peer, false)),
+                vec![
+                    ("extra".into(), true),
+                    ("left".into(), false),
+                    ("right".into(), false),
+                    ("Virtual-2".into(), false),
+                ],
+            );
+            let extra = state.atoms.intern("extra", true).0;
+            assert!(delete_monitor(&mut state, &mut peer, extra).is_empty());
+            assert_eq!(
+                names(get_monitors(&mut state, &mut peer, false)),
+                vec![
+                    ("left".into(), false),
+                    ("right".into(), false),
+                    ("Virtual-2".into(), false),
+                ],
+            );
+        }
+    }
+
+    /// Measured `empty`: a 0x0 monitor with no outputs is listed by
+    /// `GetMonitors(get_active=0)` and counted by XINERAMA GetScreenCount,
+    /// but neither `get_active=1` nor QueryScreens reports it.
+    #[test]
+    fn an_empty_monitor_is_counted_but_not_active() {
+        for bo in BOTH_ORDERS {
+            let (mut state, mut peer) = monitor_fixture(bo);
+            set_monitor(
+                &mut state,
+                &mut peer,
+                "empty",
+                false,
+                (0, 0, 0, 0),
+                (100, 50),
+                &[],
+            );
+            let all = get_monitors(&mut state, &mut peer, false);
+            assert_eq!(all.len(), 3);
+            assert_eq!(all[1], wm("empty", false, false, "0x0+0+0", (100, 50), &[]));
+            assert_eq!(get_monitors(&mut state, &mut peer, true).len(), 2);
+            let (count, heads) = xinerama_heads(&mut state, &mut peer);
+            assert_eq!((count, heads.len()), (3, 2));
+        }
+    }
+
+    /// The error table measured on Xorg 21.1 (`mon.py errors`): codes and
+    /// wire values, no state change on failure, and no validation of the
+    /// output ids.
+    #[test]
+    fn set_and_delete_monitor_errors_match_xorg() {
+        use yserver_protocol::x11::error;
+        for bo in BOTH_ORDERS {
+            let (mut state, mut peer) = monitor_fixture(bo);
+            let err = |r: &[u8]| {
+                assert_eq!(r.len(), 32, "one error: {r:02x?}");
+                assert_eq!(r[0], 0);
+                (r[1], wire_u32(bo, &r[4..]), wire_u16(bo, &r[8..]), r[10])
+            };
+            let output_atom = state.atoms.intern("Virtual-1", false).0;
+            let name = state.atoms.intern("errmon", false).0;
+            let root = ROOT_WINDOW.0;
+            let set = |state: &mut ServerState,
+                       peer: &mut UnixStream,
+                       window,
+                       name,
+                       noutput,
+                       outputs: &[u32]| {
+                let body = set_monitor_body(
+                    bo,
+                    window,
+                    name,
+                    false,
+                    noutput,
+                    (0, 0, 10, 10),
+                    (100, 50),
+                    outputs,
+                );
+                randr_wire_request(state, peer, x11randr_minor::SET_MONITOR, body)
+            };
+            let cases: Vec<(&str, Vec<u8>, (u8, u32))> = vec![
+                (
+                    "name=output",
+                    set(&mut state, &mut peer, root, output_atom, 0, &[]),
+                    (error::BAD_VALUE, output_atom),
+                ),
+                (
+                    "name=None",
+                    set(&mut state, &mut peer, root, 0, 0, &[]),
+                    (error::BAD_ATOM, root),
+                ),
+                (
+                    "name=0x7fffff",
+                    set(&mut state, &mut peer, root, 0x7f_ffff, 0, &[]),
+                    (error::BAD_ATOM, root),
+                ),
+                (
+                    "bad window",
+                    set(&mut state, &mut peer, 0x7ff_fffe, name, 0, &[]),
+                    (error::BAD_WINDOW, 0x7ff_fffe),
+                ),
+                (
+                    "noutput=1, none sent",
+                    set(&mut state, &mut peer, root, name, 1, &[]),
+                    (error::BAD_LENGTH, 0),
+                ),
+                (
+                    "noutput=0, one sent",
+                    set(&mut state, &mut peer, root, name, 0, &[1]),
+                    (error::BAD_LENGTH, 0),
+                ),
+            ];
+            for (label, r, (code, value)) in cases {
+                assert_eq!(err(&r), (code, value, 43, 128), "SetMonitor {label} {bo:?}");
+            }
+            let short = randr_wire_request(
+                &mut state,
+                &mut peer,
+                x11randr_minor::SET_MONITOR,
+                WireBody(bo, Vec::new()).u32(root).u32(name),
+            );
+            assert_eq!(err(&short).0, error::BAD_LENGTH);
+            assert!(state.randr_client_monitors.is_empty());
+
+            // Output ids are not validated (measured: `bogusout` succeeded).
+            let bogus = state.atoms.intern("bogusout", false).0;
+            assert!(set(&mut state, &mut peer, root, bogus, 1, &[0x7777]).is_empty());
+            assert_eq!(
+                err(&set(&mut state, &mut peer, root, bogus, 0, &[])),
+                (error::BAD_VALUE, bogus, 43, 128),
+                "21.1 refuses a name already in use",
+            );
+
+            let never = state.atoms.intern("nosuchmon", false).0;
+            let del = |state: &mut ServerState, peer: &mut UnixStream, window: u32, name: u32| {
+                let body = WireBody(bo, Vec::new()).u32(window).u32(name);
+                randr_wire_request(state, peer, x11randr_minor::DELETE_MONITOR, body)
+            };
+            let cases: Vec<(&str, Vec<u8>, (u8, u32))> = vec![
+                (
+                    "never set",
+                    del(&mut state, &mut peer, root, never),
+                    (error::BAD_VALUE, never),
+                ),
+                (
+                    "None",
+                    del(&mut state, &mut peer, root, 0),
+                    (error::BAD_ATOM, 0),
+                ),
+                (
+                    "0x7fffff",
+                    del(&mut state, &mut peer, root, 0x7f_ffff),
+                    (error::BAD_ATOM, 0x7f_ffff),
+                ),
+                (
+                    "bad window",
+                    del(&mut state, &mut peer, 0x7ff_fffe, bogus),
+                    (error::BAD_WINDOW, 0x7ff_fffe),
+                ),
+                (
+                    "output name",
+                    del(&mut state, &mut peer, root, output_atom),
+                    (error::BAD_VALUE, output_atom),
+                ),
+            ];
+            for (label, r, (code, value)) in cases {
+                assert_eq!(
+                    err(&r),
+                    (code, value, 44, 128),
+                    "DeleteMonitor {label} {bo:?}"
+                );
+            }
+            let long = randr_wire_request(
+                &mut state,
+                &mut peer,
+                x11randr_minor::DELETE_MONITOR,
+                WireBody(bo, Vec::new()).u32(root).u32(bogus).u32(0),
+            );
+            assert_eq!(err(&long).0, error::BAD_LENGTH);
+            assert_eq!(
+                state.randr_client_monitors.len(),
+                1,
+                "bogusout survived every failure"
+            );
+            assert!(del(&mut state, &mut peer, root, bogus).is_empty());
+            assert!(state.randr_client_monitors.is_empty());
+        }
+    }
+
+    /// Measured `mon.py events`: each successful Set/DeleteMonitor sends one
+    /// core ConfigureNotify on the root (`RRSendConfigNotify`) and no RANDR
+    /// event; a failed one sends nothing.
+    #[test]
+    fn set_and_delete_monitor_notify_with_a_root_configure_notify() {
+        for bo in BOTH_ORDERS {
+            let (mut state, mut peer) = monitor_fixture(bo);
+            state
+                .clients
+                .get_mut(&1)
+                .unwrap()
+                .event_masks
+                .insert(ROOT_WINDOW, 0x0002_0000);
+            state.randr_select_masks.insert((1, ROOT_WINDOW), 0x1f);
+            let root = state
+                .resources
+                .window(ROOT_WINDOW)
+                .map(|w| (w.width, w.height))
+                .unwrap();
+            let configure_notify = |r: &[u8]| {
+                assert_eq!(r.len(), 32, "exactly one event: {r:02x?}");
+                assert_eq!(r[0], 22, "ConfigureNotify");
+                assert_eq!(wire_u32(bo, &r[4..]), ROOT_WINDOW.0, "event window");
+                assert_eq!(wire_u32(bo, &r[8..]), ROOT_WINDOW.0, "window");
+                assert_eq!(wire_u32(bo, &r[12..]), 0, "above-sibling None");
+                assert_eq!((wire_u16(bo, &r[20..]), wire_u16(bo, &r[22..])), root);
+            };
+            configure_notify(&set_monitor(
+                &mut state,
+                &mut peer,
+                "evmon",
+                false,
+                (0, 0, 100, 100),
+                (100, 50),
+                &[],
+            ));
+            let again = set_monitor(
+                &mut state,
+                &mut peer,
+                "evmon",
+                false,
+                (0, 0, 200, 100),
+                (100, 50),
+                &[],
+            );
+            assert_eq!(
+                (again.len(), again[0]),
+                (32, 0),
+                "reused name: an error, no event"
+            );
+            let evmon = state.atoms.intern("evmon", true).0;
+            configure_notify(&delete_monitor(&mut state, &mut peer, evmon));
+            let again = delete_monitor(&mut state, &mut peer, evmon);
+            assert_eq!(
+                (again.len(), again[0]),
+                (32, 0),
+                "unknown name: an error, no event"
+            );
+        }
     }
 
     #[test]
