@@ -7142,6 +7142,7 @@ impl KmsBackend {
         if !plain {
             return Ok(false);
         }
+        self.prime_transformed_root_reads();
         // Root space: a transformed output covers its footprint (spec D6).
         let outputs = self.crtc_root_rects();
         if outputs.is_empty() {
@@ -7514,7 +7515,44 @@ impl KmsBackend {
         Some(scratch_xid)
     }
 
+    /// Before a root read: compose any transformed output that has not
+    /// composed since its transform became current, so the read returns root
+    /// content rather than a zero-filled piece.
+    fn prime_transformed_root_reads(&mut self) {
+        if !self
+            .scene
+            .has_unprimed_transform_intermediate(&self.platform)
+        {
+            return;
+        }
+        if let Err(e) = self.engine.close_open_frame(
+            &mut self.store,
+            &mut self.platform,
+            crate::kms::render::frame_builder::CloseReason::LegacyScCompose,
+        ) {
+            log::warn!("render root read: close_open_frame failed: {e:?}");
+        }
+        if let Err(e) = self.engine.flush_submit_group(
+            &mut self.store,
+            &mut self.platform,
+            crate::kms::render::submit_group::FlushReason::SceneCompose,
+        ) {
+            log::warn!("render root read: flush_submit_group failed: {e:?}");
+        }
+        let cow_host_xid = self.cow_host_xid();
+        if let Err(e) = self.scene.prime_transform_intermediates(
+            &self.core,
+            &mut self.store,
+            &self.windows,
+            &self.platform,
+            cow_host_xid,
+        ) {
+            log::warn!("render root read: transform intermediate compose failed: {e}");
+        }
+    }
+
     fn read_root_scanout_assembled(&mut self, region: vk::Rect2D) -> Option<Vec<u8>> {
+        self.prime_transformed_root_reads();
         // Root space: a transformed output covers its footprint (spec D6).
         let outputs = self.crtc_root_rects();
         if outputs.is_empty() {
@@ -44819,7 +44857,10 @@ mod tests {
     /// have a real `ClientState` to operate on. Uses
     /// `resource_id_mask = u32::MAX` so the fixture xids are
     /// trivially in-range.
-    fn install_client_for_render(state: &mut yserver_core::server::ServerState, id: u32) {
+    pub(super) fn install_client_for_render(
+        state: &mut yserver_core::server::ServerState,
+        id: u32,
+    ) {
         use std::{
             collections::{HashMap, HashSet, VecDeque},
             os::unix::net::UnixStream,

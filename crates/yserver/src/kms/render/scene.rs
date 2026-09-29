@@ -7692,6 +7692,226 @@ fn project_onto_output(
 // handling stay identical to v1.
 // ────────────────────────────────────────────────────────────────
 
+/// A one-shot compose of a transformed output's intermediate alone, for a
+/// root read that comes before the output's first frame.
+struct IntermediatePrimeTarget {
+    vk: Arc<crate::kms::vk::device::VkContext>,
+    image: vk::Image,
+    view: vk::ImageView,
+    extent: vk::Extent2D,
+    command_pool: vk::CommandPool,
+    command_buffer: vk::CommandBuffer,
+}
+
+impl IntermediatePrimeTarget {
+    fn new(
+        vk: Arc<crate::kms::vk::device::VkContext>,
+        intermediate: &TransformIntermediate,
+    ) -> Result<Self, vk::Result> {
+        let pool_info = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(vk.graphics_queue_family)
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let command_pool = unsafe { vk.device.create_command_pool(&pool_info, None)? };
+        let cb_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let command_buffer = match unsafe { vk.device.allocate_command_buffers(&cb_info) } {
+            Ok(buffers) => buffers[0],
+            Err(error) => {
+                unsafe { vk.device.destroy_command_pool(command_pool, None) };
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            image: intermediate.image,
+            view: intermediate.view,
+            extent: intermediate.extent,
+            vk,
+            command_pool,
+            command_buffer,
+        })
+    }
+}
+
+impl Drop for IntermediatePrimeTarget {
+    /// The owner waits for the compose fence first.
+    fn drop(&mut self) {
+        unsafe { self.vk.device.destroy_command_pool(self.command_pool, None) };
+    }
+}
+
+impl ComposeRenderTarget for IntermediatePrimeTarget {
+    fn image(&self) -> vk::Image {
+        self.image
+    }
+
+    fn image_view(&self) -> vk::ImageView {
+        self.view
+    }
+
+    fn command_buffer(&self) -> vk::CommandBuffer {
+        self.command_buffer
+    }
+
+    fn completion_semaphore(&self) -> vk::Semaphore {
+        vk::Semaphore::null()
+    }
+
+    fn width(&self) -> u32 {
+        self.extent.width
+    }
+
+    fn height(&self) -> u32 {
+        self.extent.height
+    }
+
+    fn timestamp_pool(&self) -> vk::QueryPool {
+        vk::QueryPool::null()
+    }
+
+    fn timestamps_written(&self) -> bool {
+        false
+    }
+
+    fn mark_timestamps_written(&mut self) {}
+
+    fn set_last_gpu_render_ns(&mut self, _value: Option<u64>) {}
+
+    fn post_compose_preparation(&self) -> Result<PostComposePreparation, PresentError> {
+        Ok(PostComposePreparation::Shared)
+    }
+
+    /// The scale pass step already left the intermediate in `GENERAL`.
+    fn record_post_compose(
+        &self,
+        _vk: &crate::kms::vk::device::VkContext,
+        _command_buffer: vk::CommandBuffer,
+        _preparation: PostComposePreparation,
+    ) {
+    }
+}
+
+impl SceneCompositor {
+    /// Whether a transformed output's intermediate is missing or uncomposed.
+    pub(crate) fn has_unprimed_transform_intermediate(&self, platform: &PlatformBackend) -> bool {
+        let Some(inner) = self.inner.as_ref() else {
+            return false;
+        };
+        inner.outputs.iter().enumerate().any(|(i, o)| {
+            platform.output_transform(i).is_some()
+                && o.intermediate.as_ref().is_none_or(|im| !im.has_content)
+        })
+    }
+
+    /// Compose every transformed output whose intermediate has never been
+    /// composed, and wait, so a root read never sees an undefined one (D6).
+    /// The caller has flushed pending paint, as before a scene tick.
+    pub(crate) fn prime_transform_intermediates(
+        &mut self,
+        core: &KmsCore,
+        store: &mut DrawableStore,
+        windows: &super::backend::WindowsMap,
+        platform: &PlatformBackend,
+        cow_host_xid: Option<u32>,
+    ) -> Result<(), SceneError> {
+        let Some(inner) = self.inner.as_mut() else {
+            return Ok(());
+        };
+        ensure_intermediates(inner, platform)?;
+        for output_idx in 0..inner.outputs.len() {
+            let Some(transform) = platform.output_transform(output_idx) else {
+                continue;
+            };
+            let state = &inner.outputs[output_idx];
+            let Some(intermediate) = state.intermediate.as_ref() else {
+                continue;
+            };
+            if intermediate.has_content {
+                continue;
+            }
+            let built = build_scene(
+                core,
+                store,
+                windows,
+                output_idx,
+                platform,
+                inner.cursor.clone(),
+                None,
+                cow_host_xid,
+                false,
+                Visibility::On,
+            );
+            let mut scale = ScalePass::new(
+                intermediate,
+                inner
+                    .scale_pipeline
+                    .as_ref()
+                    .expect("an intermediate implies the pipeline"),
+                transform,
+                platform.output_root_rect(output_idx),
+                (u32::from(platform.fb_w), u32::from(platform.fb_h)),
+            );
+            scale.into_target = false;
+            let extent = intermediate.extent;
+            let mut target = IntermediatePrimeTarget::new(Arc::clone(&inner.vk), intermediate)
+                .map_err(SceneError::Vk)?;
+            let cursor_rect = built
+                .software_cursor_tail
+                .and(built.scene.draws.last())
+                .and_then(draw_dst_rect_inward)
+                .and_then(|rect| clip_rect_to_output_extent(rect, extent));
+            let vk = Arc::clone(&inner.vk);
+            let state = &mut inner.outputs[output_idx];
+            let cursor_save = state.cursor_saves.prepare(&vk, scale.image, cursor_rect);
+            let pool = create_audit_descriptor_pool(&vk, built.scene.draws.len())?;
+            let ticket = platform.acquire_fence_ticket().map_err(SceneError::Vk)?;
+            let mut submitted = false;
+            let result = record_and_submit_render(
+                &vk,
+                &mut target,
+                &inner.pipeline,
+                pool,
+                &built.scene,
+                Repaint::Full(extent),
+                &[],
+                ticket.fence(),
+                &mut submitted,
+                &[],
+                vk::Pipeline::null(),
+                vk::PipelineLayout::null(),
+                Some(&scale),
+                cursor_save,
+            );
+            let waited = if submitted {
+                ticket.wait(&vk).map_err(SceneError::Vk)
+            } else {
+                Ok(())
+            };
+            state.cursor_saves.finish(
+                scale.image,
+                cursor_save,
+                submitted.then_some(&ticket),
+                result.is_ok() && waited.is_ok(),
+            );
+            if waited.is_err() {
+                // The GPU may still use the pool and command buffer.
+                std::mem::forget(target);
+                return waited;
+            }
+            unsafe { vk.device.destroy_descriptor_pool(pool, None) };
+            result?;
+            for id in &built.sampled_ids {
+                store.touch_render_fence(*id, ticket.clone());
+            }
+            if let Some(intermediate) = state.intermediate.as_mut() {
+                intermediate.has_content = true;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The transformed-output half of a compose (spec D4): the scene renders into
 /// the intermediate, then one full-screen draw scales it into the target.
 #[derive(Clone, Copy)]
@@ -7705,6 +7925,8 @@ struct ScalePass {
     push: ScalePushConsts,
     /// Footprint ∩ root, intermediate-local; the rest stays transparent black.
     composite_rect: Option<vk::Rect2D>,
+    /// Scale into the target; `false` composes the intermediate alone.
+    into_target: bool,
 }
 
 impl ScalePass {
@@ -7724,6 +7946,7 @@ impl ScalePass {
             layout: pipeline.pipeline_layout,
             push: super::transform_intermediate::scale_push(transform, intermediate.extent),
             composite_rect: super::transform_intermediate::composite_rect(footprint, root),
+            into_target: true,
         }
     }
 }
@@ -8933,16 +9156,27 @@ unsafe fn record_scale_pass(
         .aspect_mask(vk::ImageAspectFlags::COLOR)
         .level_count(1)
         .layer_count(1);
+    let intermediate_done = vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+        .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+        .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+        .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .new_layout(vk::ImageLayout::GENERAL)
+        .image(sp.image)
+        .subresource_range(color);
+    if !sp.into_target {
+        crate::vk_count!(cmd_pipeline_barrier2);
+        unsafe {
+            device.cmd_pipeline_barrier2(
+                cb,
+                &vk::DependencyInfo::default().image_memory_barriers(&[intermediate_done]),
+            );
+        }
+        return;
+    }
     let barriers = [
-        vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-            .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-            .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .image(sp.image)
-            .subresource_range(color),
+        intermediate_done,
         vk::ImageMemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
             .src_access_mask(vk::AccessFlags2::empty())

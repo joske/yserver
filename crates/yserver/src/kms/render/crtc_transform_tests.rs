@@ -569,3 +569,102 @@ fn direct_scanout_unflips_and_stays_off_while_another_output_is_transformed() {
     assert!(b.scanout_m2.unflip_requested);
     assert_eq!(b.scanout_m2.unflip_reason, Some("crtc_transform_changed"));
 }
+
+/// One RANDR request from client 5, through the core dispatcher.
+fn randr_request(b: &mut KmsBackend, state: &mut ServerState, minor: u8, body: &[u8]) {
+    use yserver_core::core_loop::process_request;
+    process_request::process_request(
+        state,
+        b as &mut dyn Backend,
+        yserver_protocol::x11::ClientId(5),
+        yserver_protocol::x11::SequenceNumber(1),
+        yserver_protocol::x11::RequestHeader {
+            opcode: 128,
+            data: minor,
+            length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+        },
+        body,
+        None,
+    )
+    .expect("process_request");
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_root_read_right_after_a_transform_becomes_current_sees_the_root() {
+    use yserver_protocol::x11::randr as x11randr;
+    let root = (192u16, 96u16);
+    let Some(mut b) = transformed_pair(scale(0x20000, Some(Filter::Nearest)), root) else {
+        return;
+    };
+    // Start at identity: the transform arrives through the protocol.
+    b.platform.output_transforms.clear();
+    b.scene.sync_output_layouts(&b.platform).unwrap();
+    for output in &mut b.platform.outputs {
+        output.output.picked.width = MODE.0;
+        output.output.picked.height = MODE.1;
+        output.output.modes = vec![output.output.picked.clone()];
+    }
+    // The fixture's KMS device takes this renderer's output, as startup's
+    // automatic PRIME Output Source does.
+    let sink = b.platform.outputs[1].key.device_key;
+    let source = b.selected_render_provider_endpoint().expect("renderer");
+    b.provider_output_sources.insert(sink, source);
+    let mut state = ServerState::new();
+    super::tests::install_client_for_render(&mut state, 5);
+    b.rebuild_randr_state(&mut state, None, false);
+    (state.randr.screen_width, state.randr.screen_height) = root;
+    let right = state
+        .randr
+        .outputs
+        .iter()
+        .find(|o| o.x == i16::try_from(MODE.0).unwrap())
+        .expect("right-hand output")
+        .clone();
+
+    let mut transform = right.crtc_id.to_le_bytes().to_vec();
+    for cell in [0x20000i32, 0, 0, 0, 0x20000, 0, 0, 0, FIXED_ONE] {
+        transform.extend_from_slice(&cell.to_le_bytes());
+    }
+    transform.extend_from_slice(&7u16.to_le_bytes());
+    transform.extend_from_slice(&[0; 2]);
+    transform.extend_from_slice(b"nearest\0");
+    randr_request(
+        &mut b,
+        &mut state,
+        x11randr::RR_SET_CRTC_TRANSFORM,
+        &transform,
+    );
+    let mut config = right.crtc_id.to_le_bytes().to_vec();
+    config.extend_from_slice(&[0; 4]);
+    config.extend_from_slice(&state.randr.config_timestamp.to_le_bytes());
+    config.extend_from_slice(&right.x.to_le_bytes());
+    config.extend_from_slice(&right.y.to_le_bytes());
+    config.extend_from_slice(&right.mode_id.to_le_bytes());
+    config.extend_from_slice(&1u16.to_le_bytes());
+    config.extend_from_slice(&[0; 2]);
+    config.extend_from_slice(&right.output_id.to_le_bytes());
+    randr_request(&mut b, &mut state, x11randr::RR_SET_CRTC_CONFIG, &config);
+    assert!(
+        b.platform.output_transform(1).is_some(),
+        "transform current"
+    );
+
+    // No scene tick in between: the read itself composes the output.
+    let root_xid = b.core.window_id;
+    let got = b
+        .get_image_pixels_for_tests(root_xid, 2, 64, 0, 128, 96, !0)
+        .expect("get_image")
+        .expect("bytes");
+    for y in 0..96u32 {
+        for x in 0..128u32 {
+            let i = ((y * 128 + x) * 4) as usize;
+            assert_eq!(
+                got[i..i + 3],
+                pattern(64 + x, y)[..3],
+                "root ({}, {y})",
+                64 + x
+            );
+        }
+    }
+}
