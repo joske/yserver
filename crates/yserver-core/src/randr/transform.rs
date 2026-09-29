@@ -186,28 +186,6 @@ impl CrtcTransform {
             (i32::from(bbox.y2) - i32::from(bbox.y1)) as u16,
         )
     }
-
-    /// `M · d`: a mode-local scanout position to the intermediate-local
-    /// (footprint-local) position it shows. No CRTC origin participates.
-    #[must_use]
-    pub fn scanout_to_intermediate(&self, x: f64, y: f64) -> (f64, f64) {
-        apply(&self.forward, x, y)
-    }
-
-    /// `M⁻¹ · i`: the inverse of [`Self::scanout_to_intermediate`].
-    #[must_use]
-    pub fn intermediate_to_scanout(&self, x: f64, y: f64) -> (f64, f64) {
-        apply(&self.inverse, x, y)
-    }
-}
-
-/// A row-major homogeneous matrix applied to `(x, y, 1)`.
-fn apply(m: &[f64; 9], x: f64, y: f64) -> (f64, f64) {
-    let w = m[6] * x + m[7] * y + m[8];
-    (
-        (m[0] * x + m[1] * y + m[2]) / w,
-        (m[3] * x + m[4] * y + m[5]) / w,
-    )
 }
 
 fn matrix_is_identity(m: &[i32; 9]) -> bool {

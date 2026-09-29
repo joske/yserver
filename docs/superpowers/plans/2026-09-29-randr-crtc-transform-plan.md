@@ -25,12 +25,10 @@ One equation, split between two types and reused everywhere:
 - **Root** position: `r = i + (crtc.x, crtc.y)`. The CRTC origin is added only
   when going to root space (scene, input, GetImage) — never inside the scale
   shader, which works purely intermediate-local.
-- Inverse (cursor placement, hit-testing, absolute devices):
-  `d = M⁻¹ · (r − crtc_origin)`.
-- Ownership: `CrtcTransform` knows no origin and provides only
-  `scanout_to_intermediate(d) = M · d` and `intermediate_to_scanout(i) =
-  M⁻¹ · i`. `RandrOutput`, which owns (x, y), provides `scanout_to_root` /
-  `root_to_scanout` by adding / subtracting its origin around those.
+- No inverse is needed: the software cursor is drawn in root space, and
+  absolute devices map over the whole root extent (D5b); per-output input
+  mapping is out of scope. The scale pass takes `M` from the transform as
+  push constants; nothing else maps between scanout and root.
 - GetImage source rect in the intermediate:
   `(requested_root ∩ footprint_root) − crtc_origin`.
 
@@ -152,15 +150,11 @@ One equation, split between two types and reused everywhere:
   before cursor update and event delivery; `push_position` resync after a
   hole clamp and after RANDR relocates the pointer. Input thread keeps its
   rectangular root clamp (`input_thread.rs:91`), fed from the root extent.
-- `RandrOutput::scanout_to_root` / `root_to_scanout` (built on
-  `CrtcTransform`'s origin-free helpers) for absolute devices and cursor
-  placement.
+- Absolute devices keep mapping over the whole root extent, as Xorg's
+  default; per-output mapping is out of scope (D5b).
 - Warps (WarpPointer, XIWarpPointer, XTEST) through the same confinement.
 - Tests: pointer in the scale-up layout's hole moves to the nearest CRTC;
-  warp into the hole likewise; relative motion unscaled (Q6); a **round trip
-  on a non-zero-origin output** (scaled CRTC at 2560,0): `root_to_scanout`
-  then `scanout_to_root` returns the root position, and a known root position
-  maps to the expected mode-local pixel.
+  warp into the hole likewise; relative motion unscaled (Q6).
 
 ### 12. Root GetImage in framebuffer space
 - `read_root_scanout_assembled` (`backend.rs` ~7516): per output overlap, read

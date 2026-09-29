@@ -202,12 +202,12 @@ All from `../xserver`, 21.1 branch.
 - The pointer lives in root (framebuffer) space, as on Xorg. Relative motion
   is applied in root space, unscaled: on a 2.0 output it covers half the
   physical distance per device unit, as Xorg (measured, Q6).
-- Two directions, one utility over `current`:
-  - scanout → root (the wire matrix plus the CRTC offset): anything that
-    starts from a physical position on a CRTC (absolute devices mapped to an
-    output, touch).
-  - root → scanout (the inverse): where the cursor appears on the physical
-    output, hit-testing a root position against an output.
+- Absolute devices (tablets, touch) map over the **whole root extent**, as
+  Xorg's default does without a Coordinate Transformation Matrix
+  (`input_thread.rs`, fed the root extent). Per-output mapping, and with it
+  any scanout ↔ root mapping on the input side, is out of scope. The scale
+  pass is the only consumer of `M` outside geometry, and a software cursor
+  drawn in root space needs no inverse.
 - **Where confinement runs.** The input thread only knows a rectangular
   root extent (`input_thread.rs:91`) and keeps clamping to it as a safety
   bound. Nearest-footprint confinement runs in the backend/core, where the
