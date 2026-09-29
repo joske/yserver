@@ -1,6 +1,6 @@
 # RANDR CRTC transforms (fractional scaling)
 
-> **Status: draft, reviewed by codex rounds 1–2 (2026-09-29), changes applied.**
+> **Status: draft, reviewed by codex rounds 1–3 (2026-09-29), changes applied.**
 > Issue #185.
 
 ## Problem
@@ -135,17 +135,22 @@ All from `../xserver`, 21.1 branch.
   `(0, 0, w, h)` through the **fixed-point** `current` matrix, as Xorg's
   `RRModeGetScanoutSize` (`rrcrtc.c:1028-1048`); goldens: 1280 × 1.333328 →
   1707, 1280 × 1.599991 → 2048. Never a rounded float scale.
-- Every geometry consumer switches to it — **except** SetScreenSize's crop
-  check (below): `crtc_info`, `active_monitors` (GetMonitors, XINERAMA),
-  `enabled_output_bbox`,
-  Present's CRTC selection, the logical scene/root extent (not the KMS
-  scanout images, which stay mode-sized), the input thread's pointer bounds.
-  CrtcChangeNotify keeps the mode size.
+- **Two extents, kept separate.** A client may set the root smaller than a
+  footprint (Q3; Cinnamon does so transiently while changing scale):
+  - the **footprint** serves CRTC and monitor geometry: `crtc_info`,
+    `active_monitors` (GetMonitors, XINERAMA), Present's CRTC selection,
+    output composition (D4) and nearest-CRTC confinement (D5b);
+  - the **root extent** stays exactly what `RRSetScreenSize` set: root
+    storage and protocol geometry, `enabled_output_bbox`-style root sizing,
+    and the input thread's rectangular safety clamp.
+  The KMS scanout images stay mode-sized. CrtcChangeNotify keeps the mode
+  size.
 - SetCrtcConfig skips `screen_encompasses` when transforms are supported, as
   Xorg does. This is what un-darkens the scale-up sequence.
-- SetScreenSize's crop check keeps using the **untransformed** box
-  `crtc.x + mode.width`, `crtc.y + mode.height`, transformed or not
-  (measured, Q3): a screen may crop a scaled CRTC's footprint.
+- SetScreenSize's crop check keeps using the **untransformed** box: BadMatch
+  iff `width < crtc.x + mode.width` or `height < crtc.y + mode.height`, for
+  every enabled CRTC, transformed or not (measured at the exact boundaries,
+  Q3). A screen may therefore crop a scaled CRTC's footprint.
 - Pointer confinement follows Xorg's `RRPointerMoved` (`rrpointer.c:35-60`,
   settles Q2): a position outside every CRTC footprint moves to the nearest
   CRTC, so the holes of a scale-up layout are never reachable. See D5.
@@ -159,6 +164,12 @@ All from `../xserver`, 21.1 branch.
   intermediate through `current` (scanout pixel → root pixel, i.e. the wire
   matrix, minus the CRTC offset), with a nearest or linear sampler. A full
   pass every frame the output repaints; no damage transform in phase 1.
+- **Outside the root extent.** The intermediate covers only footprint ∩ root.
+  Any sample outside the root reads **transparent black** (clamp-to-border,
+  transparent-black border) and is written as black, as Xorg's shadow pass
+  does: `PictOpSrc` from a source picture on the screen drawable with the
+  default `repeat = None` (`xf86Rotate.c:59-89`). Bilinear filtering at the
+  root edge blends toward black, as pixman does.
 - Identity outputs keep today's path: no intermediate, no pass, no cost.
 - Intermediate lifetime: allocated when a transform becomes current, freed
   when it goes back to identity or the output is disabled; accounted under
@@ -237,7 +248,11 @@ All from `../xserver`, 21.1 branch.
   end (screen size, CRTC info, monitors after each step), including the
   scale-up sequence that currently goes dark.
 - Pixels: a lavapipe test scaling a known pattern through the pass (nearest
-  exact, bilinear within tolerance); vng: root GetImage A/B against Xorg
+  exact, bilinear within tolerance), including a root smaller than the
+  footprint (the cropped part black, the edge blended toward black). Xorg's
+  scanout cannot be dumped in vng, so that crop golden comes from the source
+  rule above plus yserver's own scanout dump, and root GetImage (which only
+  covers the root) is A/B'd against Xorg; vng: root GetImage A/B against Xorg
   after `xrandr --scale` (framebuffer space, should be identical); yserver's
   scanout dump vs root GetImage scaled on the CPU.
 - Hardware: Cinnamon scale-down 100/125/150% and scale-up 125% on silence,
@@ -251,9 +266,10 @@ All from `../xserver`, 21.1 branch.
 - **Q2** *Settled:* Xorg moves the pointer to the nearest CRTC footprint
   (`rrpointer.c:35-60`); D3/D5b adopt it.
 - **Q3** *Settled by measurement* (`tools/vng-scenarios/xrandr-scale-crop.sh`,
-  two outputs, B at x = 1920, 1920×1440, `--scale 2x2`, footprint to x = 5760):
-  Xorg applies 5759 and 3841, rejects 3839 and below; the identity control has
-  the same 3840 threshold. The check is the untransformed
+  two outputs, B at x = 1920, 1920×1440, `--scale 2x2`, footprint to x = 5760
+  and y = 2880): Xorg applies 5759, 3841 and **3840** wide, rejects **3839**;
+  applies 1441 and **1440** high, rejects **1439** (width and height
+  independently); the identity control has the same 3840 / 1440 thresholds. The check is the untransformed
   `crtc.x + mode.width` box, not the footprint and not the doubled offset the
   source reading (`rrscreen.c:266-281` through the translating `f_transform`)
   predicts. Why the source reads differently is untraced; the measured rule is

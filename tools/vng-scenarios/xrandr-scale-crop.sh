@@ -45,7 +45,7 @@ root = d.screen().root
 g = root.get_geometry()
 w, h = g.width, g.height
 print("=== SetScreenSize probes from", w, "x", h)
-for (tw, th) in [(w, h), (w - 1, h), (3841, h), (3839, h), (3000, h), (1921, 1440), (1919, 1440)]:
+for (tw, th) in [(w, h), (w - 1, h), (3841, h), (3840, h), (3839, h), (w, 1441), (w, 1440), (w, 1439), (3840, 1440), (3840, 1439)]:
     try:
         randr.set_screen_size(root, tw, th, 300, 200)
     except Exception as e:
