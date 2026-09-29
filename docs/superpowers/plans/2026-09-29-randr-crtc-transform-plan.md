@@ -77,9 +77,11 @@ One equation, defined once in `CrtcTransform` and reused everywhere:
   no transform support → BadValue (via the `transforms_supported()` flag
   set false in the test; unreachable in production after task 13); unknown
   filter BadName; filter parameter validation (`convolution`, which D2 then
-  rejects with BadMatch; `nearest`/`bilinear` with parameters → BadMatch as
-  Xorg's paramless filters); params without a filter BadMatch; then D2's own
-  BadMatch for non-pure-scale.
+  rejects with BadMatch; `nearest`/`bilinear` have no validator, so Xorg
+  **accepts** parameters for them, stores and echoes them in
+  GetCrtcTransform (`rrtransform.c:66-87`) — do the same, rendering ignores
+  them); params without a filter BadMatch; then D2's own BadMatch for
+  non-pure-scale.
 
 ### 5. SetCrtcConfig applies pending → current
 - In the SetCrtcConfig path (`process_request.rs`, `begin_crtc_config`): a
