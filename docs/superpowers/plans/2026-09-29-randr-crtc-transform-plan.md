@@ -89,10 +89,12 @@ One equation, split between two types and reused everywhere:
 - In `Supported` (and `Unsupported`, up to its BadValue) mode: Xorg's order
   (spec, "Validation order"), storing `pending`. Filter validation (BadName,
   parameter checks, params without filter) runs only in these modes, never in
-  `Legacy`. The BadMatch
-  for non-pure-scale (D2) and, until task 13, for every non-identity matrix,
-  come **after** Xorg's own checks so error codes match Xorg where both
-  reject.
+  `Legacy`. In `Supported`, D2's BadMatch for non-pure-scale comes **after**
+  Xorg's own checks, so error codes match Xorg where both reject. `Legacy`
+  keeps today's handler as-is (see "Transform support modes").
+- Tests for `Legacy`: identity with an unknown filter and with a
+  parameter-only tail → Success, nothing stored; non-identity → BadMatch;
+  GetCrtcTransform unchanged afterwards.
 - Tests, one per branch of the spec's validation order, in order:
   BadCrtc; BadAccess for a leased CRTC — **not applicable**, yserver has no
   RANDR leases (assert and document); non-invertible matrix BadMatch;
