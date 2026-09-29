@@ -33,6 +33,19 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-29 RANDR CRTC rotation and reflection (branch
+  `feat/randr-rotation`):** SetCrtcConfig accepts modesetting's
+  `rotations = 0x3f`; GetCrtcInfo/GetScreenInfo and the three RANDR events
+  carry the rotation. The rotation is combined with the client transform as
+  `RRTransformCompute` (`randr::crtc_matrix`, fixed point) and runs through
+  #185's intermediate + scale pass (now a full affine pass, pixman-exact
+  nearest), SW cursor, confinement and framebuffer-space GetImage.
+  SetScreenSize's crop box swaps for 90/270 (measured). Client matrices stay
+  pure scale (D2). Divergence: Xorg keeps a rotated HW cursor for rotation
+  without a client transform; we use the SW cursor. Probes
+  `tools/vng-scenarios/xrandr-rotate*.sh`, `pointer-rotate*.sh`; spec
+  addendum in the #185 design doc.
+
 - **2026-09-29 RANDR CRTC transforms / fractional scaling, partial (#185,
   branch `feat/185-crtc-transform`):** `hasTransforms = 1`; SetCrtcTransform
   / GetCrtcTransform with Xorg's validation order and pending→current on

@@ -124,6 +124,8 @@ All from `../xserver`, 21.1 branch.
   matrices → `BadMatch` on purpose (translation would need its own source
   origin, clipping, damage, cursor and readback rules; nothing measured sends
   it). Xorg accepts these; the divergence is documented in `docs/status.md`.
+  CRTC rotation and reflection (SetCrtcConfig's `rotation`) are accepted and
+  composed with this matrix: see the addendum.
 - **Filters:** `nearest`, `bilinear`, `fast`, `good`, `best` render as named.
   `convolution` → `BadMatch` on purpose rather than
   being silently drawn as bilinear.
@@ -309,3 +311,54 @@ One feature branch, squashed on merge; merged only when all phases work.
   reject them.
 - Do not derive the footprint from a rounded float scale.
 - Do not transform output damage in phase 1; repaint the pass fully.
+
+## Addendum — rotation and reflection
+
+`xrandr --rotate left|right|inverted|normal` and `--reflect x|y|xy` reuse
+D3–D6 unchanged; only the matrix they are fed changes.
+
+- **Accepted.** Every CRTC advertises modesetting's `rotations = 0x3f`
+  (`RR_Rotate_0/90/180/270 | RR_Reflect_X/Y`, `xf86Crtc.c:832`, measured).
+  SetCrtcConfig checks `(~rotations) & rotation` → BadMatch
+  (`rrcrtc.c:1403`); a changed rotation is a change with identical
+  mode/x/y (`rrcrtc.c:749`); a disable keeps the rotation, as
+  `xf86RandR12CrtcSet` does. D2 is unchanged for the *client* matrix (pure
+  scale only): rotation arrives through SetCrtcConfig, not SetCrtcTransform.
+- **One matrix.** `crtc_matrix` (`randr/transform.rs`) is
+  `RRTransformCompute` (`rrtransform.c:137-270`) in pixman fixed point, less
+  the CRTC x/y: `M = C · T_refl · S_refl · T_rot · R`, with the translations
+  that keep the image in the positive quadrant. `RandrOutput::crtc_transform`
+  feeds it to the footprint (GetCrtcInfo, GetMonitors, XINERAMA, Present,
+  confinement), the intermediate size, the scale pass, the SW cursor and root
+  GetImage. GetCrtcTransform still returns the client matrix only (measured:
+  identity under `--rotate left`, 2.0 under `--rotate left --scale 2x2`).
+  A combination whose fixed-point multiply overflows (Xorg's rescaled
+  projective fallback) is BadMatch.
+- **Scale pass.** Push constants carry the two affine rows; nearest is
+  pixman's exact centre sample `(a + b + 1) >> 1` rounding, split into
+  whole/fraction words so no product needs 64 bits. Every rotation and
+  reflection, and left × 2.0, is pixel-exact against pixman (lavapipe,
+  `crtc_transform_tests.rs`). A pure rotation is nearest unless the client
+  set a filter (Xorg's default picture filter).
+- **Geometry, measured** (`tools/vng-scenarios/xrandr-rotate.sh`, Xorg
+  21.1.24, 1280×800): left/right → CRTC = monitor = screen 800×1280;
+  inverted and reflections keep 1280×800; left + scale 2 → 1600×2560.
+  Monitor mm stay unrotated (325/203). With two outputs, the right one
+  rotated left at x = 1920 is 1440×1920 there, screen 3360×1920.
+  CrtcChangeNotify carries the rotation with the **mode** size; an
+  OutputChangeNotify without a CRTC carries `RR_Rotate_0`; ScreenChangeNotify
+  carries `crtcs[0]`'s rotation with pixels and mm swapped for 90/270
+  (`rrscreen.c:95-121`, measured). RANDR 1.0 GetScreenInfo reports
+  `RRFirstOutput`'s rotation and 0x3f.
+- **SetScreenSize crop** uses the mode box **swapped** for 90/270, still
+  never scaled (`rrscreen.c:271-279`, measured: rotated 1280×800 accepts
+  800×1280, rejects 799×1280, 800×1279 and 1280×800; left × 2.0 accepts
+  1599×2560 and 2560×1600 against a 1600×2560 footprint).
+- **Pointer**: relative motion stays in root space, unrotated (measured,
+  `pointer-rotate-host.sh`: +53..56, +21..22 for 4 × `mouse_move 25 10` in
+  every rotation).
+- **Cursor divergence.** Xorg keeps the hardware cursor for a rotation
+  without a client transform (`transformPresent` is only set by one,
+  `xf86Crtc.c:311`, `xf86Cursors.c:569`) and rotates its image; yserver uses
+  the software cursor, as for any transform. Same picture, no protocol
+  difference.
