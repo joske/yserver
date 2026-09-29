@@ -9,16 +9,28 @@ Gates for every task: `cargo +nightly fmt`, `cargo clippy --all-targets -- -D wa
 (`VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json`). Goldens only from the
 measured tables in the spec or new Xorg vng captures, never invented.
 
-Until task 13, `SetCrtcTransform` keeps answering `BadMatch` for any
-non-identity transform and `hasTransforms` stays 0: every intermediate commit
-is behaviour-neutral for clients. This deliberately keeps today's answers
-rather than Xorg's no-transform-support `BadValue` for every request,
-identity included (`rrcrtc.c:1101-1102`): muffin sends identity transforms
-even with `hasTransforms = 0` (captured), and those succeed today.
+## Transform support modes
+
+A server-wide `TransformSupport` decides SetCrtcTransform admission:
+
+- **`Legacy`** — production until task 13, `hasTransforms = 0`. Keeps today's
+  answers exactly: after the structural checks (length, BadCrtc,
+  non-invertible, unknown filter, params without filter), an **identity**
+  request is a `Success` **no-op** — nothing is stored, GetCrtcTransform keeps
+  returning identity with no filter — and any non-identity request is
+  `BadMatch`. muffin sends identity transforms with `hasTransforms = 0`
+  (captured), and those must keep succeeding.
+- **`Unsupported`** — test-only: Xorg's no-transform-support state, `BadValue`
+  for every request, identity included (`rrcrtc.c:1101-1102`). Exists only to
+  cover that validation branch.
+- **`Supported`** — task 13 onwards: D1/D2 in full, `hasTransforms = 1`.
+
+Task 13 removes `Legacy` and switches production to `Supported` in one
+commit, so no intermediate commit changes what clients see.
 
 ## Coordinate spaces (used by tasks 8, 11, 12)
 
-One equation, defined once in `CrtcTransform` and reused everywhere:
+One equation, split between two types and reused everywhere:
 
 - `d` = a **mode-local scanout pixel** of the CRTC, `(0,0)` at its top-left.
 - `M` = `current` as received (no translation, D2).
@@ -30,6 +42,10 @@ One equation, defined once in `CrtcTransform` and reused everywhere:
   shader, which works purely intermediate-local.
 - Inverse (cursor placement, hit-testing, absolute devices):
   `d = M⁻¹ · (r − crtc_origin)`.
+- Ownership: `CrtcTransform` knows no origin and provides only
+  `scanout_to_intermediate(d) = M · d` and `intermediate_to_scanout(i) =
+  M⁻¹ · i`. `RandrOutput`, which owns (x, y), provides `scanout_to_root` /
+  `root_to_scanout` by adding / subtracting its origin around those.
 - GetImage source rect in the intermediate:
   `(requested_root ∩ footprint_root) − crtc_origin`.
 
@@ -74,8 +90,7 @@ One equation, defined once in `CrtcTransform` and reused everywhere:
   BadCrtc; BadAccess for a leased CRTC — **not applicable**, yserver has no
   RANDR leases (assert and document); non-invertible matrix BadMatch;
   a request whose length leaves a negative parameter count → BadLength;
-  no transform support → BadValue (via the `transforms_supported()` flag
-  set false in the test; unreachable in production after task 13); unknown
+  no transform support → BadValue (the test-only `Unsupported` mode); unknown
   filter BadName; filter parameter validation (`convolution`, which D2 then
   rejects with BadMatch; `nearest`/`bilinear` have no validator, so Xorg
   **accepts** parameters for them, stores and echoes them in
@@ -87,8 +102,8 @@ One equation, defined once in `CrtcTransform` and reused everywhere:
 - In the SetCrtcConfig path (`process_request.rs`, `begin_crtc_config`): a
   differing `pending` makes an otherwise identical config a real change;
   on success copy pending → current.
-- Skip `screen_encompasses` when transforms are supported (after task 13;
-  gate on the same `transforms_supported()` flag as `hasTransforms`).
+- Skip `screen_encompasses` only in `Supported` mode (task 13), the same
+  switch that sets `hasTransforms`.
 - Tests: identical mode/x/y + new pending → reconfigures and notifies;
   CrtcChangeNotify carries the mode size.
 
@@ -123,8 +138,9 @@ One equation, defined once in `CrtcTransform` and reused everywhere:
 
 ### 8. Scale pass into the scanout image
 - One full-screen draw per repaint of a transformed output: scanout image as
-  colour attachment (it has `COLOR_ATTACHMENT`, Q4), intermediate sampled
-  through `current` minus the CRTC offset, nearest or linear sampler,
+  colour attachment (it has `COLOR_ATTACHMENT`, Q4); each mode-local pixel `d`
+  samples the intermediate at `i = M · d` (see "Coordinate spaces") — **no
+  origin participates in the shader**; nearest or linear sampler,
   clamp-to-edge. New pipeline next to the existing composite pipelines.
 - Both scanout routes: shared pool and the copied (PRIME) route.
 - Tests (lavapipe): a known pattern at 2.0 / 0.5 nearest is exact; 1.6 / 0.8
@@ -151,11 +167,15 @@ One equation, defined once in `CrtcTransform` and reused everywhere:
   before cursor update and event delivery; `push_position` resync after a
   hole clamp and after RANDR relocates the pointer. Input thread keeps its
   rectangular root clamp (`input_thread.rs:91`), fed from the root extent.
-- Scanout → root / root → scanout helpers on `CrtcTransform` for absolute
-  devices and cursor placement.
+- `RandrOutput::scanout_to_root` / `root_to_scanout` (built on
+  `CrtcTransform`'s origin-free helpers) for absolute devices and cursor
+  placement.
 - Warps (WarpPointer, XIWarpPointer, XTEST) through the same confinement.
 - Tests: pointer in the scale-up layout's hole moves to the nearest CRTC;
-  warp into the hole likewise; relative motion unscaled (Q6).
+  warp into the hole likewise; relative motion unscaled (Q6); a **round trip
+  on a non-zero-origin output** (scaled CRTC at 2560,0): `root_to_scanout`
+  then `scanout_to_root` returns the root position, and a known root position
+  maps to the expected mode-local pixel.
 
 ### 12. Root GetImage in framebuffer space
 - `read_root_scanout_assembled` (`backend.rs` ~7516): per output overlap, read
@@ -168,8 +188,8 @@ One equation, defined once in `CrtcTransform` and reused everywhere:
 ## Phase 3 — advertise
 
 ### 13. Enable
-- Accept D2's forms in SetCrtcTransform, `hasTransforms = 1`, enable the
-  `screen_encompasses` skip (task 5).
+- One commit: remove `Legacy`, production `Supported` — accept D2's forms,
+  `hasTransforms = 1`, the `screen_encompasses` skip (task 5).
 - `docs/status.md`: partial RANDR transform support (pure scale,
   nearest/bilinear; rotation/translation/convolution BadMatch on purpose).
 - vng: `xrandr --scale` 1.6 / 0.8 / 2 against the Xorg goldens
