@@ -115,8 +115,7 @@ All from `../xserver`, 21.1 branch.
 - `SetCrtcConfig`: applies `pending` → `current`; a differing `pending` makes
   an otherwise identical config a real change (reconfigure + notifies).
 - `GetCrtcTransform`: the full reply (pending and current, names, params).
-- `hasTransforms = 1` is advertised **only in the last commit**, when D3–D6
-  work, as RECORD did. Until then the old BadMatch stays.
+- `hasTransforms = 1`. The branch merges only once D4–D6 render correctly.
 
 ### D2 — Accepted forms (phase 1 contract)
 
@@ -231,12 +230,12 @@ All from `../xserver`, 21.1 branch.
 
 ## Phases
 
-1. **Protocol, state, geometry** (D1–D3), still rejecting non-identity
-   transforms at the end of SetCrtcTransform so nothing changes for clients.
-   Unit tests against the goldens.
-2. **Rendering** (D4–D6) behind the same rejection.
-3. **Advertise**: accept D2's forms, `hasTransforms = 1`, status.md.
-   Hardware smoke in both Cinnamon modes on silence's two outputs.
+One feature branch, squashed on merge; merged only when all phases work.
+
+1. **Protocol, state, geometry** (D1–D3), unit tests against the goldens.
+2. **Rendering, cursor, input, readback** (D4–D6).
+3. `docs/status.md`, vng runs, hardware smoke in both Cinnamon modes on
+   silence's two outputs.
 
 ## Invariants
 
@@ -303,7 +302,7 @@ All from `../xserver`, 21.1 branch.
 
 ## Do not
 
-- Do not advertise `hasTransforms = 1` before D4–D6 render correctly.
+- Do not merge before D4–D6 render correctly.
 - Do not render accepted-but-unsupported matrices or filters approximately:
   reject them.
 - Do not derive the footprint from a rounded float scale.

@@ -9,28 +9,9 @@ Gates for every task: `cargo +nightly fmt`, `cargo clippy --all-targets -- -D wa
 (`VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json`). Goldens only from the
 measured tables in the spec or new Xorg vng captures, never invented.
 
-## Transform support modes
-
-A server-wide `TransformSupport` decides SetCrtcTransform admission:
-
-- **`Legacy`** — production until task 13, `hasTransforms = 0`. Keeps today's
-  answers exactly (`process_request.rs:3302-3345`): only today's structural
-  parse (BadLength) and CRTC lookup (BadCrtc), then an **identity** request
-  is a `Success` **no-op regardless of its filter payload** (an unknown filter
-  or a parameter-only tail still succeeds, as today), and any non-identity
-  request is `BadMatch`. No pending/current storage; GetCrtcTransform keeps
-  returning identity with no filter. No Xorg filter or invertibility
-  validation runs in this mode. muffin sends identity transforms with
-  `hasTransforms = 0` (captured), and those must keep succeeding.
-- **`Unsupported`** — test-only: Xorg's no-transform-support state. Runs
-  Xorg's order up to and including the transform-support check
-  (`rrcrtc.c:1755-1785`): BadCrtc, (leases n/a), non-invertible BadMatch,
-  negative-param BadLength, **then** `BadValue` (`rrcrtc.c:1101-1102`), for
-  identity requests too. Exists only to cover that branch.
-- **`Supported`** — task 13 onwards: D1/D2 in full, `hasTransforms = 1`.
-
-Task 13 removes `Legacy` and switches production to `Supported` in one
-commit, so no intermediate commit changes what clients see.
+The branch is squashed on merge: commits need not be independently
+buildable, run the gates on the final state. Transforms are real from phase 1
+on (`hasTransforms = 1`); the branch merges only once rendering works.
 
 ## Coordinate spaces (used by tasks 8, 11, 12)
 
@@ -86,20 +67,15 @@ One equation, split between two types and reused everywhere:
   bytes) and for a pending ≠ current state.
 
 ### 4. SetCrtcTransform validation and storage
-- In `Supported` (and `Unsupported`, up to its BadValue) mode: Xorg's order
-  (spec, "Validation order"), storing `pending`. Filter validation (BadName,
-  parameter checks, params without filter) runs only in these modes, never in
-  `Legacy`. In `Supported`, D2's BadMatch for non-pure-scale comes **after**
-  Xorg's own checks, so error codes match Xorg where both reject. `Legacy`
-  keeps today's handler as-is (see "Transform support modes").
-- Tests for `Legacy`: identity with an unknown filter and with a
-  parameter-only tail → Success, nothing stored; non-identity → BadMatch;
-  GetCrtcTransform unchanged afterwards.
+- Xorg's order (spec, "Validation order"), storing `pending`. D2's BadMatch
+  for non-pure-scale comes **after** Xorg's own checks, so error codes match
+  Xorg where both reject.
 - Tests, one per branch of the spec's validation order, in order:
   BadCrtc; BadAccess for a leased CRTC — **not applicable**, yserver has no
   RANDR leases (assert and document); non-invertible matrix BadMatch;
   a request whose length leaves a negative parameter count → BadLength;
-  no transform support → BadValue (the test-only `Unsupported` mode); unknown
+  (no-transform-support BadValue: not modelled, every CRTC supports
+  transforms); unknown
   filter BadName; filter parameter validation (`convolution`, which D2 then
   rejects with BadMatch; `nearest`/`bilinear` have no validator, so Xorg
   **accepts** parameters for them, stores and echoes them in
@@ -111,8 +87,8 @@ One equation, split between two types and reused everywhere:
 - In the SetCrtcConfig path (`process_request.rs`, `begin_crtc_config`): a
   differing `pending` makes an otherwise identical config a real change;
   on success copy pending → current.
-- Skip `screen_encompasses` only in `Supported` mode (task 13), the same
-  switch that sets `hasTransforms`.
+- Drop the `screen_encompasses` check, as Xorg does for CRTCs with transform
+  support.
 - Tests: identical mode/x/y + new pending → reconfigures and notifies;
   CrtcChangeNotify carries the mode size.
 
@@ -197,8 +173,8 @@ One equation, split between two types and reused everywhere:
 ## Phase 3 — advertise
 
 ### 13. Enable
-- One commit: remove `Legacy`, production `Supported` — accept D2's forms,
-  `hasTransforms = 1`, the `screen_encompasses` skip (task 5).
+- Nothing left to switch on (transforms are live since phase 1): the vng runs
+  below and `docs/status.md`.
 - `docs/status.md`: partial RANDR transform support (pure scale,
   nearest/bilinear; rotation/translation/convolution BadMatch on purpose).
 - vng: `xrandr --scale` 1.6 / 0.8 / 2 against the Xorg goldens
