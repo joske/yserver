@@ -285,9 +285,11 @@ All from `../xserver`, 21.1 branch.
   source reading (`rrscreen.c:266-281` through the translating `f_transform`)
   predicts. Why the source reads differently is untraced; the measured rule is
   what D3 adopts.
-- **Q4** Scanout image format/modifier must be a colour attachment (or
-  storage image) for the pass; true for the pool today? Otherwise the pass
-  writes a linear/optimal intermediate-sized copy target.
+- **Q4** *Settled:* scanout images are `COLOR_ATTACHMENT | TRANSFER_SRC |
+  TRANSFER_DST` (`scanout.rs:5801-5811`, pinned by
+  `scanout_usage_matches_render_and_readback_paths`), so the scale pass renders
+  into them as a colour attachment; they are deliberately not `SAMPLED`, which
+  the pass does not need. The intermediate is `SAMPLED | COLOR_ATTACHMENT`.
 - **Q5** VRAM: the transformed CRTC of the scale-down 100% capture needs a
   5120×2880 intermediate, 56.25 MiB at 32 bpp, on top of its scanout images;
   identity CRTCs need none. Acceptable, or allocate lazily on first repaint?
