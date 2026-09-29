@@ -494,6 +494,7 @@ pub fn process_disconnect_reporting(
         .mit_shm_segments
         .retain(|_, seg| seg.owner != client_id);
     state.vidmode_client_versions.remove(&client_id);
+    state.randr_client_versions.remove(&client_id);
     state.xi2_client_versions.remove(&client_id);
     state
         .randr_select_masks

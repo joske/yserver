@@ -638,6 +638,7 @@ impl PendingBackendRequests {
                     byte_order: yserver_protocol::x11::ClientByteOrder::LittleEndian,
                     apply_transform: None,
                     apply_rotation: None,
+                    reply: crate::core_loop::process_request::CrtcConfigReply::CrtcConfig,
                 },
             },
             request_wire_bytes: 0,
@@ -4121,6 +4122,7 @@ mod tests {
                         byte_order: ClientByteOrder::LittleEndian,
                         apply_transform: None,
                         apply_rotation: None,
+                        reply: crate::core_loop::process_request::CrtcConfigReply::CrtcConfig,
                     },
                 },
                 request_wire_bytes: 28,
@@ -4255,6 +4257,7 @@ mod tests {
             byte_order: ClientByteOrder::LittleEndian,
             apply_transform: None,
             apply_rotation: None,
+            reply: crate::core_loop::process_request::CrtcConfigReply::CrtcConfig,
         };
         let continuation = PendingCrtcConfig {
             token,

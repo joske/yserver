@@ -694,54 +694,96 @@ pub fn encode_query_version_reply(
     out
 }
 
-/// Encodes a `GetScreenInfo` reply for the single synthetic mode.
-///
-/// Layout (RANDR 1.1+): 32-byte header followed by one `ScreenSize` (8 bytes)
-/// and one `RefreshRates` list (`nRates` u16 + `nRates` * 2 bytes, padded to 4
-/// bytes). `nInfo = nSizes + nRefreshLists` so libXrandr can iterate the
-/// trailing refresh-list section.
+/// One `xScreenSizes` of a `GetScreenInfo` reply and its rates.
+pub struct ScreenInfoSize<'a> {
+    pub width: u16,
+    pub height: u16,
+    pub mm_width: u16,
+    pub mm_height: u16,
+    pub rates: &'a [u16],
+}
+
+/// The body of a `GetScreenInfo` reply (`ProcRRGetScreenInfo`,
+/// rrscreen.c:760-898).
+pub struct ScreenInfoReply<'a> {
+    pub root: u32,
+    pub timestamp: u32,
+    pub config_timestamp: u32,
+    /// `setOfRotations`, a CARD8.
+    pub rotations: u8,
+    pub rotation: u16,
+    pub size_id: u16,
+    pub rate: u16,
+    pub sizes: &'a [ScreenInfoSize<'a>],
+    /// `RRClientKnowsRates`: the rate lists follow the sizes only then;
+    /// `nrateEnts` is sent either way.
+    pub has_rate: bool,
+}
+
+/// Encodes a `GetScreenInfo` reply: the sizes, then for a 1.1+ client each
+/// size's `nRates` and rates, the whole padded to 4 bytes.
 #[must_use]
 pub fn encode_get_screen_info_reply(
     byte_order: ClientByteOrder,
     sequence: SequenceNumber,
-    root: u32,
-    timestamp: u32,
-    config_timestamp: u32,
-    width: u16,
-    height: u16,
-    mwidth: u16,
-    mheight: u16,
-    rotation: u16,
-    rotations: u8,
+    info: &ScreenInfoReply<'_>,
 ) -> Vec<u8> {
-    let n_sizes: u16 = 1;
-    let n_rates: u16 = 1;
-    let n_info: u16 = n_sizes * 2; // one refresh list per size
-    let refresh_record_padded = pad4(2 + 2 * usize::from(n_rates));
-    let extra = usize::from(n_sizes) * 8 + usize::from(n_sizes) * refresh_record_padded;
+    let n_rate_ents: usize = info.sizes.iter().map(|s| 1 + s.rates.len()).sum();
+    let mut extra = info.sizes.len() * 8;
+    if info.has_rate {
+        extra += n_rate_ents * 2;
+    }
     #[allow(clippy::cast_possible_truncation)]
-    let length = (extra / 4) as u32;
-    let mut out = fixed_reply(byte_order, sequence, rotations, length);
-    put(byte_order, &mut out, root);
-    put(byte_order, &mut out, timestamp);
-    put(byte_order, &mut out, config_timestamp);
-    put(byte_order, &mut out, n_sizes);
-    put(byte_order, &mut out, 0u16); // sizeID = 0 (current)
-    put(byte_order, &mut out, rotation);
-    put(byte_order, &mut out, 60u16); // current rate = 60 Hz
-    put(byte_order, &mut out, n_info);
+    let length = (pad4(extra) / 4) as u32;
+    let mut out = fixed_reply(byte_order, sequence, info.rotations, length);
+    put(byte_order, &mut out, info.root);
+    put(byte_order, &mut out, info.timestamp);
+    put(byte_order, &mut out, info.config_timestamp);
+    #[allow(clippy::cast_possible_truncation)]
+    put(byte_order, &mut out, info.sizes.len() as u16);
+    put(byte_order, &mut out, info.size_id);
+    put(byte_order, &mut out, info.rotation);
+    put(byte_order, &mut out, info.rate);
+    #[allow(clippy::cast_possible_truncation)]
+    put(byte_order, &mut out, n_rate_ents as u16);
     out.extend_from_slice(&[0u8; 2]);
     debug_assert_eq!(out.len(), 32);
-
-    put(byte_order, &mut out, width);
-    put(byte_order, &mut out, height);
-    put(byte_order, &mut out, mwidth);
-    put(byte_order, &mut out, mheight);
-
-    put(byte_order, &mut out, n_rates);
-    put(byte_order, &mut out, 60u16);
+    for size in info.sizes {
+        put(byte_order, &mut out, size.width);
+        put(byte_order, &mut out, size.height);
+        put(byte_order, &mut out, size.mm_width);
+        put(byte_order, &mut out, size.mm_height);
+    }
+    if info.has_rate {
+        for size in info.sizes {
+            #[allow(clippy::cast_possible_truncation)]
+            put(byte_order, &mut out, size.rates.len() as u16);
+            for &rate in size.rates {
+                put(byte_order, &mut out, rate);
+            }
+        }
+    }
     pad_vec4(&mut out);
+    out
+}
 
+/// Encodes a `SetScreenConfig` reply (32 bytes).
+#[must_use]
+pub fn encode_set_screen_config_reply(
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    status: u8,
+    new_timestamp: u32,
+    new_config_timestamp: u32,
+    root: u32,
+) -> Vec<u8> {
+    let mut out = fixed_reply(byte_order, sequence, status, 0);
+    put(byte_order, &mut out, new_timestamp);
+    put(byte_order, &mut out, new_config_timestamp);
+    put(byte_order, &mut out, root);
+    put(byte_order, &mut out, SUBPIXEL_UNKNOWN);
+    out.extend_from_slice(&[0u8; 10]);
+    debug_assert_eq!(out.len(), 32);
     out
 }
 
@@ -2881,15 +2923,23 @@ mod tests {
             let info = encode_get_screen_info_reply(
                 byte_order,
                 SequenceNumber(9),
-                0x100,
-                1,
-                1,
-                1280,
-                800,
-                338,
-                211,
-                2,
-                0x3f,
+                &ScreenInfoReply {
+                    root: 0x100,
+                    timestamp: 1,
+                    config_timestamp: 1,
+                    rotations: 0x3f,
+                    rotation: 2,
+                    size_id: 0,
+                    rate: 75,
+                    sizes: &[ScreenInfoSize {
+                        width: 1280,
+                        height: 800,
+                        mm_width: 325,
+                        mm_height: 203,
+                        rates: &[75],
+                    }],
+                    has_rate: true,
+                },
             );
             assert_eq!(info[1], 0x3f, "setOfRotations, a CARD8");
             assert_eq!(u16_at(&info, 24), 2, "rotation");

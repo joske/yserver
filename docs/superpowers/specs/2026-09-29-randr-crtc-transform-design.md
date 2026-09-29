@@ -348,8 +348,15 @@ D3–D6 unchanged; only the matrix they are fed changes.
   CrtcChangeNotify carries the rotation with the **mode** size; an
   OutputChangeNotify without a CRTC carries `RR_Rotate_0`; ScreenChangeNotify
   carries `crtcs[0]`'s rotation with pixels and mm swapped for 90/270
-  (`rrscreen.c:95-121`, measured). RANDR 1.0 GetScreenInfo reports
-  `RRFirstOutput`'s rotation and 0x3f.
+  (`rrscreen.c:95-121`, measured).
+- **RANDR 1.0** (`tools/vng-scenarios/xrandr-orientation.sh`): GetScreenInfo
+  is `RR10GetData` over `RRFirstOutput` (mode sizes unswapped while rotated,
+  0x3f, rates for ≥ 1.1 clients). SetScreenConfig (`xrandr -o`) is
+  `ProcRRSetScreenConfig` applied through the SetCrtcConfig path at 0,0;
+  measured on Xorg: `-o left` gives screen and CRTC 800×1280, mm unchanged;
+  statuses 1 (stale config time) and 2 (old time), BadValue for size, rate
+  and rotation 3, BadMatch for 0x41, BadLength for a 1.0-sized request from
+  a 1.5 client, and every success moves the timestamp.
 - **SetScreenSize crop** uses the mode box **swapped** for 90/270, still
   never scaled (`rrscreen.c:271-279`, measured: rotated 1280×800 accepts
   800×1280, rejects 799×1280, 800×1279 and 1280×800; left × 2.0 accepts
