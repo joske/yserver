@@ -754,9 +754,9 @@ impl RandrState {
     }
 
     /// Validate arity + output/mode resolution for `SetCrtcConfig` (Xorg
-    /// `rrcrtc.c` order, EXCLUDING rotation + bounds — the handler does
-    /// those after, in that order). `Ok(None)` = disable;
-    /// `Ok(Some(mode))` = enable with this resolved mode;
+    /// `rrcrtc.c` order, EXCLUDING rotation — the handler does that
+    /// after). `Ok(None)` = disable; `Ok(Some(mode))` = enable with this
+    /// resolved mode;
     /// `Err((code, error_value))` = protocol error + field-specific
     /// `errorValue`.
     pub fn validate_set_crtc_config(
@@ -802,24 +802,6 @@ impl RandrState {
             .copied()
             .ok_or((error::BAD_MATCH, mode_id))?;
         Ok(Some(mode))
-    }
-
-    /// Bounds check: does `mode` placed at `(x, y)` fit the current
-    /// (logical) screen? Xorg `rrcrtc.c`: `x + width > screen.width` ⇒
-    /// `BadValue(errorValue=x)`; then `y + height > screen.height` ⇒
-    /// `BadValue(errorValue=y)`.
-    pub fn screen_encompasses(&self, mode: &RandrMode, x: i16, y: i16) -> Result<(), (u8, u32)> {
-        use yserver_protocol::x11::error;
-        // Xorg rrcrtc.c: `x + width > screen.width` ⇒ BadValue(x), then
-        // `y + height > screen.height` ⇒ BadValue(y). errorValue carries
-        // the raw INT16 sign-extended into the CARD32 field.
-        if i32::from(x) + i32::from(mode.width) > i32::from(self.screen_width) {
-            return Err((error::BAD_VALUE, i32::from(x) as u32));
-        }
-        if i32::from(y) + i32::from(mode.height) > i32::from(self.screen_height) {
-            return Err((error::BAD_VALUE, i32::from(y) as u32));
-        }
-        Ok(())
     }
 
     fn current_mode_table(outputs: &[RandrOutput]) -> Vec<RandrMode> {
@@ -2110,30 +2092,6 @@ mod tests {
             st.validate_set_crtc_config(2, 555, &[1]),
             Err((x11_err::BAD_MATCH, 555))
         );
-    }
-
-    #[test]
-    fn screen_encompasses_rejects_overflow_x_then_y() {
-        let st = one_output_state(); // screen 1920x1080
-        let m1080 = RandrMode {
-            mode_id: 7,
-            width: 1920,
-            height: 1080,
-            vrefresh: 60,
-            timing: None,
-        };
-        // Place 1920x1080 at x=100 → 2020 > 1920. errorValue = x.
-        assert_eq!(
-            st.screen_encompasses(&m1080, 100, 0),
-            Err((x11_err::BAD_VALUE, 100))
-        );
-        // x ok, y overflow: at y=100 → 1180 > 1080. errorValue = y.
-        assert_eq!(
-            st.screen_encompasses(&m1080, 0, 100),
-            Err((x11_err::BAD_VALUE, 100))
-        );
-        // exact fit (x+w == screen.width) is allowed (Xorg uses `>`).
-        assert_eq!(st.screen_encompasses(&m1080, 0, 0), Ok(()));
     }
 
     #[test]

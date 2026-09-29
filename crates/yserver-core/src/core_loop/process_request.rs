@@ -143,6 +143,9 @@ pub struct CrtcConfigCompletion {
     pub set_time: u32,
     pub output_bbox_before: Option<(u16, u16)>,
     pub byte_order: yserver_protocol::x11::ClientByteOrder,
+    /// The CRTC's pending transform differs from its current one and this
+    /// enable applies it (`RRCrtcPendingTransform`, rrcrtc.c:765).
+    pub apply_transform: bool,
 }
 
 /// Dispatch one X11 request entirely on the core thread.
@@ -4824,8 +4827,8 @@ fn handle_randr_request(
                 }
                 Ok(r) => r,
             };
-            // (2)+(3) rotation + bounds only when enabling.
-            if let Some(ref m) = resolved {
+            // (2) rotation only when enabling.
+            if resolved.is_some() {
                 if !matches!(rotation & 0xf, 1 | 2 | 4 | 8) {
                     return emit_x11_error_with_minor(
                         state,
@@ -4849,17 +4852,9 @@ fn handle_randr_request(
                         RANDR_MAJOR_OPCODE,
                     );
                 }
-                if let Err((code, error_value)) = state.randr.screen_encompasses(m, x, y) {
-                    return emit_x11_error_with_minor(
-                        state,
-                        client_id,
-                        sequence,
-                        code,
-                        error_value,
-                        u16::from(header.data),
-                        RANDR_MAJOR_OPCODE,
-                    );
-                }
+                // No screen-bounds check: Xorg skips it for a CRTC with
+                // transform support (rrcrtc.c:1436), and every yserver CRTC
+                // has it; a screen may crop a CRTC.
             }
 
             // Resolve connector name from crtc_id (validated above →
@@ -4878,6 +4873,12 @@ fn handle_randr_request(
             };
             let output_id = output_row.output_id;
             let connector = output_row.name.clone();
+            // A disable keeps the current transform (xf86RandR12CrtcSet
+            // only installs one with a mode).
+            let apply_transform = resolved.is_some()
+                && !output_row
+                    .pending_transform
+                    .equivalent(&output_row.current_transform);
             let mode_spec = resolved.map(|m| ModeSpec {
                 width: m.width,
                 height: m.height,
@@ -4895,6 +4896,7 @@ fn handle_randr_request(
                 set_time,
                 output_bbox_before,
                 byte_order,
+                apply_transform,
             };
             match backend.begin_crtc_config(
                 output_id,
@@ -5169,11 +5171,22 @@ pub(crate) fn complete_crtc_config(
     result: io::Result<bool>,
 ) -> io::Result<RequestOutcome> {
     let status = match result {
-        Ok(true) => {
+        // A new transform is a change even with identical mode/x/y.
+        Ok(changed) if changed || completion.apply_transform => {
             // Something actually changed. Single rebuild path: a CRTC set
             // bumps lastSetTime (to the client timestamp) but NOT
             // lastConfigTime.
             backend.refresh_randr_state_set_time(state, completion.set_time);
+            if completion.apply_transform
+                && let Some(output) = state
+                    .randr
+                    .outputs
+                    .iter_mut()
+                    .find(|o| o.output_id == completion.output_id)
+            {
+                // RRCrtcNotify: RRTransformCopy of pending into current.
+                output.current_transform = output.pending_transform.applied();
+            }
             let changed: Vec<(u32, u32, u32)> = state
                 .randr
                 .outputs
@@ -5189,7 +5202,7 @@ pub(crate) fn complete_crtc_config(
             );
             0
         }
-        Ok(false) => {
+        Ok(_) => {
             // A no-op succeeds without a rebuild or change notification.
             0
         }
@@ -36803,6 +36816,125 @@ mod tests {
             state.randr.outputs[0].pending_transform.matrix,
             rr_scale(104_857)
         );
+    }
+
+    fn randr_crtc_config_body(crtc: u32, x: i16, y: i16, mode: u32, outputs: &[u32]) -> Vec<u8> {
+        let mut body = Vec::with_capacity(24 + outputs.len() * 4);
+        body.extend_from_slice(&crtc.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // timestamp
+        body.extend_from_slice(&0u32.to_le_bytes()); // config_timestamp
+        body.extend_from_slice(&x.to_le_bytes());
+        body.extend_from_slice(&y.to_le_bytes());
+        body.extend_from_slice(&mode.to_le_bytes());
+        body.extend_from_slice(&1u16.to_le_bytes()); // RR_Rotate_0
+        body.extend_from_slice(&[0u8; 2]);
+        for output in outputs {
+            body.extend_from_slice(&output.to_le_bytes());
+        }
+        body
+    }
+
+    fn randr_set_crtc_config(
+        state: &mut ServerState,
+        backend: &mut dyn Backend,
+        body: &[u8],
+    ) -> io::Result<RequestOutcome> {
+        handle_randr_request(
+            state,
+            backend,
+            ClientId(1),
+            SequenceNumber(3),
+            RequestHeader {
+                opcode: 128,
+                data: yserver_protocol::x11::randr::RR_SET_CRTC_CONFIG,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            body,
+        )
+    }
+
+    /// `(width, height)` of every CrtcChangeNotify in `wire`, and whether a
+    /// SetCrtcConfig Success reply is present.
+    fn randr_crtc_notifies_and_success(wire: &[u8]) -> (Vec<(u16, u16)>, bool) {
+        let u16_at = |c: &[u8], o: usize| u16::from_le_bytes(c[o..o + 2].try_into().unwrap());
+        let notifies = wire
+            .chunks_exact(32)
+            .filter(|c| c[0] == 89 + 1 && c[1] == yserver_protocol::x11::randr::NOTIFY_CRTC_CHANGE)
+            .map(|c| (u16_at(c, 28), u16_at(c, 30)))
+            .collect();
+        let success = wire.chunks_exact(32).any(|c| c[0] == 1 && c[1] == 0);
+        (notifies, success)
+    }
+
+    #[test]
+    fn randr_set_crtc_config_applies_a_pending_transform_as_a_change() {
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].clone();
+        let (crtc, mode) = (output.crtc_id, output.mode_id);
+        let mut peer = install_client(&mut state, 1);
+        state.randr_select_masks.insert(
+            (1, crate::resources::ROOT_WINDOW),
+            yserver_protocol::x11::randr::NOTIFY_MASK_CRTC_CHANGE,
+        );
+        let mut backend = RecordingBackend::new();
+        let same_config =
+            randr_crtc_config_body(crtc, output.x, output.y, mode, &[output.output_id]);
+
+        // Nothing pending: the backend's no-op stays a no-op.
+        randr_set_crtc_config(&mut state, &mut backend, &same_config).unwrap();
+        let (notifies, success) = randr_crtc_notifies_and_success(&read_all_available(&mut peer));
+        assert!(success);
+        assert!(notifies.is_empty());
+
+        // xrandr --scale 2 (spec, "What Xorg does").
+        let body = randr_transform_body(crtc, rr_scale(131_072), b"");
+        assert_eq!(randr_set_crtc_transform(&mut state, &mut peer, &body), None);
+        randr_set_crtc_config(&mut state, &mut backend, &same_config).unwrap();
+        let (notifies, success) = randr_crtc_notifies_and_success(&read_all_available(&mut peer));
+        assert!(success);
+        assert_eq!(
+            notifies,
+            vec![(output.width, output.height)],
+            "one CrtcChangeNotify carrying the mode size"
+        );
+        let applied = &state.randr.outputs[0];
+        assert_eq!(applied.current_transform.matrix, rr_scale(131_072));
+        assert_eq!(applied.footprint(), (output.width * 2, output.height * 2));
+
+        // Applied: the same config is a no-op again.
+        randr_set_crtc_config(&mut state, &mut backend, &same_config).unwrap();
+        let (notifies, _) = randr_crtc_notifies_and_success(&read_all_available(&mut peer));
+        assert!(notifies.is_empty());
+
+        // A disable leaves the current transform in place.
+        let body = randr_transform_body(crtc, rr_scale(32_768), b"");
+        assert_eq!(randr_set_crtc_transform(&mut state, &mut peer, &body), None);
+        randr_set_crtc_config(
+            &mut state,
+            &mut backend,
+            &randr_crtc_config_body(crtc, 0, 0, 0, &[]),
+        )
+        .unwrap();
+        let _ = read_all_available(&mut peer);
+        assert_eq!(
+            state.randr.outputs[0].current_transform.matrix,
+            rr_scale(131_072)
+        );
+    }
+
+    #[test]
+    fn randr_set_crtc_config_does_not_bound_a_crtc_by_the_screen() {
+        // rrcrtc.c:1436 skips the bounds check for transform-capable CRTCs.
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].clone();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let x = i16::try_from(state.randr.screen_width).unwrap();
+        let body =
+            randr_crtc_config_body(output.crtc_id, x, 0, output.mode_id, &[output.output_id]);
+        randr_set_crtc_config(&mut state, &mut backend, &body).unwrap();
+        let (_, success) = randr_crtc_notifies_and_success(&read_all_available(&mut peer));
+        assert!(success, "past the screen edge is not BadValue");
     }
 
     #[test]

@@ -636,6 +636,7 @@ impl PendingBackendRequests {
                     set_time: 0,
                     output_bbox_before: None,
                     byte_order: yserver_protocol::x11::ClientByteOrder::LittleEndian,
+                    apply_transform: false,
                 },
             },
             request_wire_bytes: 0,
@@ -4076,6 +4077,7 @@ mod tests {
                         set_time: 0,
                         output_bbox_before: None,
                         byte_order: ClientByteOrder::LittleEndian,
+                        apply_transform: false,
                     },
                 },
                 request_wire_bytes: 28,
@@ -4208,6 +4210,7 @@ mod tests {
             set_time: 123,
             output_bbox_before: enabled_output_bbox(&state),
             byte_order: ClientByteOrder::LittleEndian,
+            apply_transform: false,
         };
         let continuation = PendingCrtcConfig { token, completion };
         let mut pending = PendingBackendRequests::default();
