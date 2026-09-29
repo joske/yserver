@@ -150,6 +150,7 @@ pub struct Bucket {
     pub full_no_opaque_cover: u64,
     pub full_threshold: u64,
     pub full_copied_route: u64,
+    pub full_transformed: u64,
     pub storage_allocations: u64,
     pub descriptor_allocations: u64,
     pub image_view_creates: u64,
@@ -575,7 +576,7 @@ impl Telemetry {
              overdraw={overdraw:.2} \
              clipped_repaint/s={} \
              full_reason/s[empty_draws={} unloadable_bo={} no_opaque_cover={} \
-             threshold={} copied_route={}] \
+             threshold={} copied_route={} transformed={}] \
              scene_entries_visited={} scene_entries_drawn={} \
              visibility_collapses/s[mine={} claim={} taken={} taken_skipped={}] \
              hidden_participants/s={} \
@@ -639,6 +640,7 @@ impl Telemetry {
             b.full_no_opaque_cover,
             b.full_threshold,
             b.full_copied_route,
+            b.full_transformed,
             b.scene_entries_visited,
             b.scene_entries_drawn,
             b.visibility_collapses[0],
@@ -1036,6 +1038,10 @@ impl Telemetry {
             "copied_route" => (
                 &mut self.bucket.full_copied_route,
                 &mut self.lifetime.full_copied_route,
+            ),
+            "transformed" => (
+                &mut self.bucket.full_transformed,
+                &mut self.lifetime.full_transformed,
             ),
             other => {
                 debug_assert!(false, "unknown Full fallback reason {other:?}");

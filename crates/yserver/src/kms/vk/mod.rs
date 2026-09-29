@@ -27,6 +27,7 @@ pub mod pixmap_pool;
 pub(crate) mod probe_digest;
 pub(crate) mod probe_pattern;
 pub mod render_pipeline;
+pub(crate) mod scale_pipeline;
 pub mod scanout;
 pub mod sync;
 pub mod target;

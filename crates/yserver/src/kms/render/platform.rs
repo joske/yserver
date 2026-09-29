@@ -2204,6 +2204,10 @@ pub(crate) struct PlatformBackend {
     pub(crate) outputs: Vec<ActiveOutput>,
     pub(crate) fb_w: u16,
     pub(crate) fb_h: u16,
+    /// Non-identity current CRTC transforms (RANDR `SetCrtcTransform`),
+    /// client-owned like the logical screen size, so keyed by output and
+    /// kept across the `outputs` rebuilds of a topology change.
+    pub(crate) output_transforms: HashMap<OutputKey, yserver_core::randr::CrtcTransform>,
     /// Latest general kernel `(msc, ust_micros)` per device-qualified CRTC, updated
     /// by pageflip retirements and standalone sequence events. Drives
     /// `PresentNotifyMSC` (`present_get_ust_msc`): a compositor's
@@ -3018,6 +3022,7 @@ impl PlatformBackend {
             outputs,
             fb_w,
             fb_h,
+            output_transforms: HashMap::new(),
             ust_msc: std::collections::HashMap::new(),
             completion_clocks: std::collections::HashMap::new(),
             software_msc: std::collections::HashMap::new(),
@@ -3135,6 +3140,7 @@ impl PlatformBackend {
             )],
             fb_w: 800,
             fb_h: 600,
+            output_transforms: HashMap::new(),
             ust_msc: std::collections::HashMap::new(),
             completion_clocks: std::collections::HashMap::new(),
             software_msc: std::collections::HashMap::new(),
@@ -3852,6 +3858,31 @@ impl PlatformBackend {
 
     pub(crate) fn take_input_ctx(&mut self) -> Option<crate::input::SendContext> {
         self.input_ctx.take()
+    }
+
+    /// The current CRTC transform of live output `idx`, `None` at identity.
+    pub(crate) fn output_transform(
+        &self,
+        idx: usize,
+    ) -> Option<&yserver_core::randr::CrtcTransform> {
+        self.output_transforms.get(&self.outputs.get(idx)?.key)
+    }
+
+    /// Whether any live output scans out through a transform.
+    pub(crate) fn any_output_transformed(&self) -> bool {
+        (0..self.outputs.len()).any(|idx| self.output_transform(idx).is_some())
+    }
+
+    /// The root rectangle live output `idx` shows: its mode at the CRTC
+    /// origin, or the transformed footprint there (spec D3).
+    pub(crate) fn output_root_rect(&self, idx: usize) -> (i32, i32, u32, u32) {
+        let layout = &self.outputs[idx];
+        let (w, h) = self
+            .output_transform(idx)
+            .map_or((layout.width, layout.height), |t| {
+                t.footprint(layout.width, layout.height)
+            });
+        (layout.x, layout.y, u32::from(w), u32::from(h))
     }
 
     pub(crate) fn primary_device(&self) -> Option<&KmsDevice> {

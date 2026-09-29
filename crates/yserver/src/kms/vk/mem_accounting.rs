@@ -46,6 +46,8 @@ pub enum MemCategory {
     RedirectExport,
     /// Scanout buffers and copied-scanout sources.
     Scanout,
+    /// Intermediate images of CRTCs scanned out through a RANDR transform.
+    Transform,
     /// Per-op scratch images (copy, mask, dst readback, engine scratch).
     Scratch,
     /// Host-visible staging / upload / readback buffers.
@@ -58,7 +60,7 @@ pub enum MemCategory {
 
 impl MemCategory {
     /// Every category, in log order.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::WindowStorage,
         Self::RedirectBacking,
         Self::Pixmap,
@@ -67,6 +69,7 @@ impl MemCategory {
         Self::TfpExport,
         Self::RedirectExport,
         Self::Scanout,
+        Self::Transform,
         Self::Scratch,
         Self::Staging,
         Self::Glyph,
@@ -85,6 +88,7 @@ impl MemCategory {
             Self::TfpExport => "tfp_export",
             Self::RedirectExport => "redirect_export",
             Self::Scanout => "scanout",
+            Self::Transform => "transform",
             Self::Scratch => "scratch",
             Self::Staging => "staging",
             Self::Glyph => "glyph",
@@ -134,6 +138,8 @@ pub enum ChurnClass {
     Redirect,
     /// Scanout buffers.
     Scanout,
+    /// RANDR transform intermediates.
+    Transform,
     /// Gradient LUT images and their upload staging.
     Gradient,
     /// Per-op scratch images.
@@ -150,7 +156,7 @@ pub enum ChurnClass {
 
 impl ChurnClass {
     /// Every class, in log order.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::GlyphRun,
         Self::ImageText,
         Self::Traps,
@@ -164,6 +170,7 @@ impl ChurnClass {
         Self::Window,
         Self::Redirect,
         Self::Scanout,
+        Self::Transform,
         Self::Gradient,
         Self::Scratch,
         Self::DmabufImport,
@@ -189,6 +196,7 @@ impl ChurnClass {
             Self::Window => "window",
             Self::Redirect => "redirect",
             Self::Scanout => "scanout",
+            Self::Transform => "transform",
             Self::Gradient => "gradient",
             Self::Scratch => "scratch",
             Self::DmabufImport => "dmabuf_import",
@@ -220,6 +228,7 @@ impl ChurnClass {
             MemCategory::Dri3Import => Self::DmabufImport,
             MemCategory::TfpExport | MemCategory::RedirectExport => Self::DmabufExport,
             MemCategory::Scanout => Self::Scanout,
+            MemCategory::Transform => Self::Transform,
             MemCategory::Scratch => Self::Scratch,
             MemCategory::Staging => Self::StagingOther,
             MemCategory::Glyph => Self::GlyphCache,

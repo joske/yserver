@@ -19,6 +19,7 @@ pub(crate) mod glyph_pixels;
 pub(crate) mod imported_syncobj;
 pub(crate) mod owned_semaphore;
 pub(crate) mod platform;
+pub(crate) mod pointer_confine;
 pub(crate) mod present_completion;
 pub(crate) mod present_source_wait;
 pub(crate) mod probe_executor;
@@ -33,6 +34,7 @@ pub(crate) mod submit_group;
 pub(crate) mod submit_trace;
 pub(crate) mod target;
 pub(crate) mod telemetry;
+pub(crate) mod transform_intermediate;
 pub(crate) mod upload_arena;
 
 pub use backend::KmsBackend;

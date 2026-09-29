@@ -82,6 +82,7 @@ use super::{
     },
     store::{DamageSnapshot, DrawableKind, DrawableStore, RegionSet},
     telemetry::Telemetry,
+    transform_intermediate::TransformIntermediate,
 };
 use crate::kms::{
     core::KmsCore,
@@ -90,6 +91,7 @@ use crate::kms::{
         compositor::{CompositeDraw, CompositeScene, PresentError},
         damage_audit_compare::{DamageAuditComparePipeline, DamageAuditTileSummary},
         pipeline::{CompositePushConsts, CompositorPipeline, MAX_DESCRIPTOR_SETS_PER_FRAME},
+        scale_pipeline::{ScalePassPipeline, ScalePushConsts},
         scanout::{
             BoPhase, BoState, CopiedRenderSource, CopiedTransportPreparation, OutputScanout,
             ScanoutBo,
@@ -556,6 +558,9 @@ struct OutputSceneState {
     /// (startup, `rebuild_outputs`) starts empty, and a drawable in NO output's
     /// set is treated as unknown ⇒ every output walks — conservative.
     last_pieces: std::collections::HashSet<super::store::DrawableId>,
+    /// The footprint-sized image a RANDR-transformed output composites into
+    /// before the scale pass; `None` at identity (spec D4).
+    intermediate: Option<TransformIntermediate>,
 }
 
 struct OutputDamageAudit {
@@ -940,6 +945,8 @@ pub(crate) struct SceneCompositor {
 struct SceneCompositorInner {
     vk: Arc<crate::kms::vk::device::VkContext>,
     pipeline: CompositorPipeline,
+    /// The RANDR transform scale pass, built when an output first needs it.
+    scale_pipeline: Option<ScalePassPipeline>,
     /// XOR-logic-op fill pipeline cache used to apply the retained
     /// root-`IncludeInferiors` overlay as a final pass into each
     /// freshly-composited scanout BO (see [`super::root_overlay`]).
@@ -1239,6 +1246,8 @@ pub(crate) enum SceneError {
     NoVk,
     #[error("compositor present failed: {0}")]
     Present(PresentError),
+    #[error("output {0} is transformed but has no intermediate")]
+    NoIntermediate(usize),
 }
 
 impl From<PresentError> for SceneError {
@@ -1287,16 +1296,19 @@ impl SceneCompositor {
         for i in 0..platform.outputs.len() {
             outputs.push(Self::build_output_state(&vk, platform, i)?);
         }
+        let mut inner = SceneCompositorInner {
+            vk,
+            pipeline,
+            scale_pipeline: None,
+            overlay_xor_cache,
+            outputs,
+            damage_audit_ledger: VecDeque::new(),
+            damage_audit_next_event_id: 0,
+            cursor: None,
+        };
+        ensure_intermediates(&mut inner, platform)?;
         Ok(Self {
-            inner: Some(SceneCompositorInner {
-                vk,
-                pipeline,
-                overlay_xor_cache,
-                outputs,
-                damage_audit_ledger: VecDeque::new(),
-                damage_audit_next_event_id: 0,
-                cursor: None,
-            }),
+            inner: Some(inner),
             root_overlay: super::root_overlay::RootOverlay::default(),
             scene_structure_dirty: true,
             #[cfg(test)]
@@ -1310,6 +1322,8 @@ impl SceneCompositor {
         i: usize,
     ) -> Result<OutputSceneState, SceneError> {
         let layout = &platform.outputs[i];
+        // What the scene walk covers: the footprint of a transformed output.
+        let (root_x, root_y, root_w, root_h) = platform.output_root_rect(i);
         let ring = CompositePoolRing::new(Arc::clone(vk), MAX_DESCRIPTOR_SETS_PER_FRAME)
             .map_err(SceneError::Vk)?;
         let bo_depth = platform
@@ -1322,8 +1336,8 @@ impl SceneCompositor {
             damage_audit: build_output_damage_audit(
                 vk,
                 vk::Extent2D {
-                    width: u32::from(layout.width),
-                    height: u32::from(layout.height),
+                    width: root_w,
+                    height: root_h,
                 },
             )?,
             pool_ring: ring,
@@ -1336,10 +1350,10 @@ impl SceneCompositor {
             scene_structure_damage: RegionSet::new(),
             pending_repaint_after_failed_submit: RegionSet::new(),
             output_extent: vk::Extent2D {
-                width: u32::from(layout.width),
-                height: u32::from(layout.height),
+                width: root_w,
+                height: root_h,
             },
-            output_origin: (layout.x, layout.y),
+            output_origin: (root_x, root_y),
             next_submit_retry_at: None,
             last_frame_cursor_mode: OutputCursorMode::Hidden,
             cursor_prev_pos: None,
@@ -1353,6 +1367,8 @@ impl SceneCompositor {
             // shaped `missing` vector — see the plan's 3.4.
             prev_presented: Vec::new(),
             last_pieces: std::collections::HashSet::new(),
+            intermediate: None,
+            // Per scanout BO, so in mode (BO) pixels even when transformed.
             damage: ScanoutDamage::new(
                 bo_depth,
                 vk::Extent2D {
@@ -1389,7 +1405,12 @@ impl SceneCompositor {
         for i in 0..platform.outputs.len() {
             outputs.push(Self::build_output_state(&vk, platform, i)?);
         }
+        for old in &mut inner.outputs {
+            release_intermediate(old, &vk);
+        }
         inner.outputs = outputs;
+        // Intermediates come with the next tick or `sync_output_layouts`: a
+        // CRTC set rebuilds here before the core applies its new transform.
         self.scene_structure_dirty = true;
         // root-overlay is root-absolute + layout-dependent; drop it on
         // topology change. Covers both connector hotplug
@@ -1397,6 +1418,58 @@ impl SceneCompositor {
         // (`apply_crtc_config`) — the two callers of `rebuild_outputs`.
         self.root_overlay_clear();
         Ok(())
+    }
+
+    /// Follow the RANDR transforms in `platform` without a topology rebuild:
+    /// an output whose root rect changed gets its scene extent, BO damage and
+    /// intermediate redone; an identity output keeps today's state untouched.
+    pub(crate) fn sync_output_layouts(
+        &mut self,
+        platform: &PlatformBackend,
+    ) -> Result<(), SceneError> {
+        let Some(inner) = self.inner.as_mut() else {
+            return Ok(());
+        };
+        let mut changed = false;
+        for (i, o) in inner.outputs.iter_mut().enumerate() {
+            let (x, y, width, height) = platform.output_root_rect(i);
+            let extent = vk::Extent2D { width, height };
+            let wanted = platform.output_transform(i).map(|_| extent);
+            let held = o.intermediate.as_ref().map(|im| im.extent);
+            if o.output_origin == (x, y) && o.output_extent == extent && held == wanted {
+                continue;
+            }
+            changed = true;
+            release_intermediate(o, &inner.vk);
+            o.output_origin = (x, y);
+            o.output_extent = extent;
+            o.damage_audit = build_output_damage_audit(&inner.vk, extent)?;
+            // The BOs hold the previous transform's pixels.
+            o.damage.invalidate();
+            o.prev_presented.clear();
+            o.last_pieces.clear();
+        }
+        ensure_intermediates(inner, platform)?;
+        if changed {
+            self.scene_structure_dirty = true;
+        }
+        Ok(())
+    }
+
+    /// The intermediate of transformed output `output_idx`, once a compose has
+    /// filled it: `(image, footprint extent)`, in `GENERAL`.
+    pub(crate) fn transform_intermediate(
+        &self,
+        output_idx: usize,
+    ) -> Option<(vk::Image, vk::Extent2D)> {
+        let im = self
+            .inner
+            .as_ref()?
+            .outputs
+            .get(output_idx)?
+            .intermediate
+            .as_ref()?;
+        im.has_content.then_some((im.image, im.extent))
     }
 
     /// Stage 3f.8: register the software cursor sprite after the
@@ -1976,6 +2049,10 @@ impl SceneCompositor {
         // went dormant — the root's covered damage was re-peeked and
         // re-classified Hidden ~1000×/s (silence/MATE, 2026-09-04).
         let mut walked_outputs: Vec<bool> = vec![false; inner.outputs.len()];
+        if let Err(e) = ensure_intermediates(inner, platform) {
+            log::warn!("render scene tick: transform intermediate allocation failed: {e}");
+        }
+        let hw_cursor = hw_cursor_allowed(platform);
         if damage_audit_enabled() {
             emit_damage_audit_heartbeat(inner);
         }
@@ -2019,7 +2096,7 @@ impl SceneCompositor {
                 platform,
                 windows,
                 telemetry,
-                true,
+                hw_cursor,
                 cow_host_xid,
                 root_overlay,
                 &elsewhere,
@@ -2863,6 +2940,72 @@ fn drain_pending_pool_releases(
 /// `YSERVER_TICK_SKIP_LOG=1` (or true/yes) to enable it; when unset,
 /// `record_tick_skip` / `record_tick_success` are no-ops (no logging,
 /// no `last_skip_reason` book-keeping).
+/// Xorg refuses the HW cursor while any CRTC is transformed
+/// (xf86Cursors.c:569): software on every output, so it scales with the
+/// content and never vanishes crossing to an identity output (spec D5).
+fn hw_cursor_allowed(platform: &PlatformBackend) -> bool {
+    !platform.any_output_transformed()
+}
+
+/// Allocate the intermediate of every transformed output that lacks one of
+/// its footprint's size (spec D4, Q5: only transformed outputs pay).
+fn ensure_intermediates(
+    inner: &mut SceneCompositorInner,
+    platform: &PlatformBackend,
+) -> Result<(), SceneError> {
+    for (i, o) in inner.outputs.iter_mut().enumerate() {
+        if platform.output_transform(i).is_none() {
+            continue;
+        }
+        if o.intermediate.as_ref().map(|im| im.extent) == Some(o.output_extent) {
+            continue;
+        }
+        release_intermediate(o, &inner.vk);
+        if inner.scale_pipeline.is_none() {
+            inner.scale_pipeline = Some(
+                ScalePassPipeline::new(Arc::clone(&inner.vk), vk::Format::B8G8R8A8_UNORM)
+                    .map_err(SceneError::PipelineInit)?,
+            );
+        }
+        let pipeline = inner.scale_pipeline.as_ref().expect("built above");
+        o.intermediate = Some(
+            TransformIntermediate::new(Arc::clone(&inner.vk), o.output_extent, pipeline)
+                .map_err(SceneError::Vk)?,
+        );
+        log::info!(
+            "render scene: output {i} transform intermediate {}x{}",
+            o.output_extent.width,
+            o.output_extent.height
+        );
+    }
+    Ok(())
+}
+
+/// Drop `o`'s intermediate once every compose that may use it has finished.
+fn release_intermediate(o: &mut OutputSceneState, vk: &crate::kms::vk::device::VkContext) {
+    let Some(intermediate) = o.intermediate.take() else {
+        return;
+    };
+    let tickets = o
+        .pending_acks
+        .iter()
+        .filter_map(|ack| ack.ticket.as_ref())
+        .chain(o.failed_submit_bos.iter().map(|f| &f.ticket))
+        .chain(o.pending_pool_releases.iter().map(|(_, t)| t));
+    for ticket in tickets {
+        if let Err(error) = ticket.wait(vk) {
+            log::error!(
+                "render scene: output {} transform intermediate fence wait failed: {error:?}; \
+                 leaking it",
+                o.output_idx
+            );
+            std::mem::forget(intermediate);
+            return;
+        }
+    }
+    drop(intermediate);
+}
+
 fn tick_skip_log_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -3178,6 +3321,12 @@ fn run_damage_audit(
     if !damage_audit_enabled() {
         return Ok(());
     }
+    if platform.output_transform(output_idx).is_some() {
+        log::debug!(
+            "damage-audit: output {output_idx} skipped; transformed scanout is out of scope"
+        );
+        return Ok(());
+    }
     if !matches!(
         platform
             .scanout_pools
@@ -3408,6 +3557,7 @@ fn submit_audit_compose(
         overlay_ops,
         xor_pipeline,
         xor_layout,
+        None,
     );
     let wait = if result.is_ok() {
         ticket.wait(vk).map_err(SceneError::Vk)
@@ -4052,6 +4202,13 @@ fn tick_one_output(
         }
     }
 
+    // A transformed output composites its footprint into the intermediate
+    // and scales that into the BO (spec D4).
+    let transform = platform.output_transform(output_idx).cloned();
+    if transform.is_some() && inner.outputs[output_idx].intermediate.is_none() {
+        return Err(SceneError::NoIntermediate(output_idx));
+    }
+
     // 1. Snapshot live output state so we can fold cleanly
     //    into pending_ack later (codex round 2 point 2 —
     //    transactional generation advance).
@@ -4301,13 +4458,8 @@ fn tick_one_output(
             if audit_has_unretired_event(inner, output_idx)
                 || audit_idle_recompare_due(inner, output_idx)
             {
-                let layout = &platform.outputs[output_idx];
-                let overlay_ops = root_overlay.apply_list_for_output((
-                    layout.x,
-                    layout.y,
-                    u32::from(layout.width),
-                    u32::from(layout.height),
-                ));
+                let overlay_ops =
+                    root_overlay.apply_list_for_output(platform.output_root_rect(output_idx));
                 let (xor_pipeline, xor_layout) =
                     audit_overlay_pipeline(inner, !overlay_ops.is_empty())?;
                 let reference = audit_reference_scene(
@@ -4374,7 +4526,9 @@ fn tick_one_output(
             .and_then(Option::as_ref),
         Some(OutputScanout::Shared(_))
     );
-    if shared_output {
+    // A transformed frame repaints the whole BO, so its damage (in
+    // intermediate pixels) never enters the per-BO model.
+    if shared_output && transform.is_none() {
         let mut damage_region = Region::from_rects(output_damage.rects().iter().copied());
         // Clip to the output. Damage outside it cannot be presented, and letting
         // it through would trip `commit_submitted`'s "painted covers repaint"
@@ -4433,12 +4587,7 @@ fn tick_one_output(
     // frame whose scissor misses the overlay rects would XOR them a SECOND time
     // onto a pooled BO that already has them baked in from a prior compose,
     // cancelling them or leaving remnants — the #90 rubber-band residual.
-    for (_, rect) in root_overlay.apply_list_for_output((
-        platform.outputs[output_idx].x,
-        platform.outputs[output_idx].y,
-        u32::from(platform.outputs[output_idx].width),
-        u32::from(platform.outputs[output_idx].height),
-    )) {
+    for (_, rect) in root_overlay.apply_list_for_output(platform.output_root_rect(output_idx)) {
         requested.add_rect(rect);
     }
 
@@ -4460,13 +4609,17 @@ fn tick_one_output(
         extent,
     });
 
-    let plan = plan_repaint(
-        &requested,
-        &built.scene.draws,
-        extent,
-        bo_loadable,
-        shared_output,
-    );
+    let plan = if transform.is_some() {
+        RepaintPlan::full(extent, FullReason::Transformed)
+    } else {
+        plan_repaint(
+            &requested,
+            &built.scene.draws,
+            extent,
+            bo_loadable,
+            shared_output,
+        )
+    };
     let repaint = plan.repaint;
 
     // The culled draw list is a SEPARATE product; `built.scene` stays whole for
@@ -4498,6 +4651,7 @@ fn tick_one_output(
                 FullReason::NoOpaqueCover => "no_opaque_cover",
                 FullReason::Threshold => "threshold",
                 FullReason::CopiedRoute => "copied_route",
+                FullReason::Transformed => "transformed",
             });
         }
         None => telemetry.record_clipped_repaint(),
@@ -4514,13 +4668,7 @@ fn tick_one_output(
     // Same denominator as `damage_fraction`: one output area per compose.
     telemetry.record_scene_draw_pixels(scene_draw_pixels);
 
-    let layout = &platform.outputs[output_idx];
-    let overlay_ops = root_overlay.apply_list_for_output((
-        layout.x,
-        layout.y,
-        u32::from(layout.width),
-        u32::from(layout.height),
-    ));
+    let overlay_ops = root_overlay.apply_list_for_output(platform.output_root_rect(output_idx));
     let (xor_pipeline, xor_layout) = audit_overlay_pipeline(inner, !overlay_ops.is_empty())?;
     let reference = audit_reference_scene(
         built.software_cursor_tail.is_some(),
@@ -4579,6 +4727,23 @@ fn tick_one_output(
             return Err(SceneError::Present(PresentError::Vk(error)));
         }
     };
+    let scale_pass = transform.as_ref().map(|t| {
+        let intermediate = inner.outputs[output_idx]
+            .intermediate
+            .as_ref()
+            .expect("checked at the top");
+        let pipeline = inner
+            .scale_pipeline
+            .as_ref()
+            .expect("an intermediate implies the pipeline");
+        ScalePass::new(
+            intermediate,
+            pipeline,
+            t,
+            platform.output_root_rect(output_idx),
+            (u32::from(platform.fb_w), u32::from(platform.fb_h)),
+        )
+    });
     let output_key = platform.outputs[output_idx].key.clone();
     let drm_device = platform
         .device_for_output(&output_key)
@@ -4638,6 +4803,7 @@ fn tick_one_output(
                 &overlay_ops,
                 xor_pipeline,
                 xor_layout,
+                scale_pass.as_ref(),
             )
             .map(|submitted| {
                 compose_complete = compose_submit_was_complete(submitted, render_scene.draws.len());
@@ -4660,13 +4826,18 @@ fn tick_one_output(
                 &inner.pipeline,
                 descriptor_pool,
                 render_scene,
-                Repaint::Full(token.extent),
+                Repaint::Full(if transform.is_some() {
+                    extent
+                } else {
+                    token.extent
+                }),
                 &[],
                 compose_ticket.fence(),
                 &mut gpu_submitted,
                 &overlay_ops,
                 xor_pipeline,
                 xor_layout,
+                scale_pass.as_ref(),
             );
             let copied_prepare_failed = result
                 .as_ref()
@@ -4709,6 +4880,9 @@ fn tick_one_output(
     match compose_result {
         Ok(stage) => {
             state.next_submit_retry_at = None;
+            if let Some(intermediate) = state.intermediate.as_mut() {
+                intermediate.has_content = true;
+            }
             for id in &built.sampled_ids {
                 store.touch_render_fence(*id, compose_ticket.clone());
             }
@@ -4739,7 +4913,20 @@ fn tick_one_output(
             // returns `Repaint::Full`; step 4 replaces it with what the recorder
             // actually covered. It must always be a superset of `bo_repaint` —
             // `commit_submitted` asserts exactly that.
-            if shared_output {
+            if shared_output && transform.is_some() {
+                // The scale pass wrote every BO pixel.
+                let whole = Region::from_rect(vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: token.extent,
+                });
+                stage_submitted_frame(
+                    &mut state.damage,
+                    compose_complete,
+                    token.bo_idx,
+                    &bo_repaint,
+                    &whole,
+                );
+            } else if shared_output {
                 stage_submitted_frame(
                     &mut state.damage,
                     compose_complete,
@@ -4854,6 +5041,8 @@ enum FullReason {
     Threshold,
     /// Copied (reverse-PRIME) route: always Full, never tracked.
     CopiedRoute,
+    /// RANDR-transformed output: the scale pass repaints fully (spec D4).
+    Transformed,
 }
 
 /// The step-4 decision: how to render, and what that will actually paint.
@@ -5005,6 +5194,21 @@ fn opaque_cover_exists(draws: &[CompositeDraw], rect: vk::Rect2D) -> bool {
 ///
 /// Every gate here is a documented way to corrupt the screen under
 /// `loadOp = LOAD`; each one falls back to Full rather than trying to be clever.
+impl RepaintPlan {
+    fn full(extent: vk::Extent2D, reason: FullReason) -> Self {
+        let whole = vk::Rect2D {
+            offset: vk::Offset2D::default(),
+            extent,
+        };
+        Self {
+            repaint: Repaint::Full(extent),
+            scissors: vec![whole],
+            painted: Region::from_rect(whole),
+            full_reason: Some(reason),
+        }
+    }
+}
+
 fn plan_repaint(
     requested: &Region,
     draws: &[CompositeDraw],
@@ -5012,18 +5216,7 @@ fn plan_repaint(
     loadable: bool,
     shared_route: bool,
 ) -> RepaintPlan {
-    let full = |reason: FullReason| {
-        let whole = vk::Rect2D {
-            offset: vk::Offset2D::default(),
-            extent,
-        };
-        RepaintPlan {
-            repaint: Repaint::Full(extent),
-            scissors: vec![whole],
-            painted: Region::from_rect(whole),
-            full_reason: Some(reason),
-        }
-    };
+    let full = |reason: FullReason| RepaintPlan::full(extent, reason);
 
     if !shared_route {
         return full(FullReason::CopiedRoute);
@@ -5361,11 +5554,8 @@ fn build_scene_with(
     elsewhere: &std::collections::HashSet<super::store::DrawableId>,
 ) -> SceneBuild {
     let bg = [0.0, 0.0, 0.0, 1.0];
-    let layout = &platform.outputs[output_idx];
-    let layout_x0 = layout.x;
-    let layout_y0 = layout.y;
-    let layout_w = u32::from(layout.width);
-    let layout_h = u32::from(layout.height);
+    // A transformed output walks its whole footprint (spec D4).
+    let (layout_x0, layout_y0, layout_w, layout_h) = platform.output_root_rect(output_idx);
 
     let mut sink = WalkSink::new(output_idx, elsewhere);
     // Stage 4c.3 — the root samples through `redirected_target` like any other
@@ -7443,6 +7633,42 @@ fn project_onto_output(
 // handling stay identical to v1.
 // ────────────────────────────────────────────────────────────────
 
+/// The transformed-output half of a compose (spec D4): the scene renders into
+/// the intermediate, then one full-screen draw scales it into the target.
+#[derive(Clone, Copy)]
+struct ScalePass {
+    image: vk::Image,
+    view: vk::ImageView,
+    extent: vk::Extent2D,
+    descriptor_set: vk::DescriptorSet,
+    pipeline: vk::Pipeline,
+    layout: vk::PipelineLayout,
+    push: ScalePushConsts,
+    /// Footprint ∩ root, intermediate-local; the rest stays transparent black.
+    composite_rect: Option<vk::Rect2D>,
+}
+
+impl ScalePass {
+    fn new(
+        intermediate: &TransformIntermediate,
+        pipeline: &ScalePassPipeline,
+        transform: &yserver_core::randr::CrtcTransform,
+        footprint: (i32, i32, u32, u32),
+        root: (u32, u32),
+    ) -> Self {
+        Self {
+            image: intermediate.image,
+            view: intermediate.view,
+            extent: intermediate.extent,
+            descriptor_set: intermediate.descriptor_set,
+            pipeline: pipeline.pipeline,
+            layout: pipeline.pipeline_layout,
+            push: super::transform_intermediate::scale_push(transform, intermediate.extent),
+            composite_rect: super::transform_intermediate::composite_rect(footprint, root),
+        }
+    }
+}
+
 trait ComposeRenderTarget {
     fn image(&self) -> vk::Image;
     fn image_view(&self) -> vk::ImageView;
@@ -7716,6 +7942,7 @@ fn submit_shared_scanout_frame(
     overlay_ops: &[(u32, vk::Rect2D)],
     xor_pipeline: vk::Pipeline,
     xor_layout: vk::PipelineLayout,
+    scale: Option<&ScalePass>,
 ) -> Result<ComposeSubmit, PresentError> {
     use std::os::fd::{FromRawFd, IntoRawFd};
 
@@ -7737,6 +7964,7 @@ fn submit_shared_scanout_frame(
         overlay_ops,
         xor_pipeline,
         xor_layout,
+        scale,
     )?;
 
     let fd = bo
@@ -7788,6 +8016,7 @@ fn submit_copied_scanout_render(
     overlay_ops: &[(u32, vk::Rect2D)],
     xor_pipeline: vk::Pipeline,
     xor_layout: vk::PipelineLayout,
+    scale: Option<&ScalePass>,
 ) -> Result<Option<std::os::fd::OwnedFd>, CopiedRenderSubmitError> {
     if destination_state.phase != BoPhase::Free {
         return Err(CopiedRenderSubmitError::Present(PresentError::WrongPhase(
@@ -7811,6 +8040,7 @@ fn submit_copied_scanout_render(
         overlay_ops,
         xor_pipeline,
         xor_layout,
+        scale,
     )
     .map(|_| ())
     .map_err(CopiedRenderSubmitError::Present)?;
@@ -7833,6 +8063,7 @@ fn record_and_submit_render(
     overlay_ops: &[(u32, vk::Rect2D)],
     xor_pipeline: vk::Pipeline,
     xor_layout: vk::PipelineLayout,
+    scale: Option<&ScalePass>,
 ) -> Result<ComposeSubmit, PresentError> {
     // Compose GPU-render telemetry. Read the PREVIOUS compose's
     // timestamps BEFORE the CB overwrites them; the read is
@@ -7911,6 +8142,7 @@ fn record_and_submit_render(
         overlay_ops,
         xor_pipeline,
         xor_layout,
+        scale,
     )?;
 
     let cb = target.command_buffer();
@@ -7962,9 +8194,16 @@ fn record_command_buffer<T: ComposeRenderTarget + ?Sized>(
     overlay_ops: &[(u32, vk::Rect2D)],
     xor_pipeline: vk::Pipeline,
     xor_layout: vk::PipelineLayout,
+    scale: Option<&ScalePass>,
 ) -> Result<(), PresentError> {
     let device = &vk.device;
     let cb = bo.command_buffer();
+    // A transformed output composites into its intermediate; the scale pass
+    // then writes the whole BO.
+    let (compose_image, compose_view, compose_w, compose_h) = scale.map_or(
+        (bo.image(), bo.image_view(), bo.width(), bo.height()),
+        |sp| (sp.image, sp.view, sp.extent.width, sp.extent.height),
+    );
     // Mirror the timestamp gate `record_and_submit_render` uses so we can bracket the
     // CB with TOP/BOTTOM timestamp writes; caller already read the
     // previous pool contents before we reset the pool below.
@@ -8014,7 +8253,11 @@ fn record_command_buffer<T: ComposeRenderTarget + ?Sized>(
         },
         Repaint::Clipped(rect) | Repaint::AuditClearClipped(rect) => rect,
     };
-    let scissors: &[vk::Rect2D] = if scissors.is_empty() {
+    let scissors: &[vk::Rect2D] = if let Some(sp) = scale {
+        // Only footprint ∩ root is composited (spec D3); none at all when
+        // the root does not reach the CRTC.
+        sp.composite_rect.as_slice()
+    } else if scissors.is_empty() {
         std::slice::from_ref(&default_scissor)
     } else {
         scissors
@@ -8047,8 +8290,15 @@ fn record_command_buffer<T: ComposeRenderTarget + ?Sized>(
         } else {
             vk::AccessFlags2::empty()
         };
+        // The intermediate was last sampled by the previous frame's scale
+        // pass or copied by a root readback: wait for those reads.
+        let to_color_src_stage = if scale.is_some() {
+            vk::PipelineStageFlags2::ALL_COMMANDS
+        } else {
+            vk::PipelineStageFlags2::TOP_OF_PIPE
+        };
         let to_color = vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+            .src_stage_mask(to_color_src_stage)
             .src_access_mask(to_color_src_access)
             .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
             // B.2 fix (vkdebug READ_AFTER_WRITE at vkCmdBeginRendering):
@@ -8062,7 +8312,7 @@ fn record_command_buffer<T: ComposeRenderTarget + ?Sized>(
             )
             .old_layout(old_layout)
             .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .image(bo.image())
+            .image(compose_image)
             .subresource_range(
                 vk::ImageSubresourceRange::default()
                     .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -8074,14 +8324,21 @@ fn record_command_buffer<T: ComposeRenderTarget + ?Sized>(
         crate::vk_count!(cmd_pipeline_barrier2);
         device.cmd_pipeline_barrier2(cb, &to_color_dep);
 
+        // Outside the root the intermediate is transparent black, which the
+        // scale pass's bilinear edge blends toward (spec D4).
+        let clear_color = if scale.is_some() {
+            [0.0; 4]
+        } else {
+            scene.bg_color
+        };
         let color_attachment = [vk::RenderingAttachmentInfo::default()
-            .image_view(bo.image_view())
+            .image_view(compose_view)
             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .load_op(load_op)
             .store_op(vk::AttachmentStoreOp::STORE)
             .clear_value(vk::ClearValue {
                 color: vk::ClearColorValue {
-                    float32: scene.bg_color,
+                    float32: clear_color,
                 },
             })];
         let rendering_info = vk::RenderingInfo::default()
@@ -8095,17 +8352,32 @@ fn record_command_buffer<T: ComposeRenderTarget + ?Sized>(
             x: 0.0,
             y: 0.0,
             #[allow(clippy::cast_precision_loss)]
-            width: bo.width() as f32,
+            width: compose_w as f32,
             #[allow(clippy::cast_precision_loss)]
-            height: bo.height() as f32,
+            height: compose_h as f32,
             min_depth: 0.0,
             max_depth: 1.0,
         }];
         crate::vk_count!(cmd_set_viewport);
         device.cmd_set_viewport(cb, 0, &viewport);
 
+        if let Some(rect) = scale.and_then(|sp| sp.composite_rect) {
+            // The root's part gets the clear colour the untransformed path
+            // clears the whole BO to.
+            let clear = [vk::ClearAttachment::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .color_attachment(0)
+                .clear_value(vk::ClearValue {
+                    color: vk::ClearColorValue {
+                        float32: scene.bg_color,
+                    },
+                })];
+            let rects = [vk::ClearRect::default().rect(rect).layer_count(1)];
+            device.cmd_clear_attachments(cb, &clear, &rects);
+        }
+
         #[allow(clippy::cast_precision_loss)]
-        let viewport_size = [bo.width() as f32, bo.height() as f32];
+        let viewport_size = [compose_w as f32, compose_h as f32];
         let mut last_pipeline: Option<vk::Pipeline> = None;
         // Scissor-major: for each rect, replay the draws that touch it. A draw
         // spanning two rects is issued twice, which is correct because the rects
@@ -8181,6 +8453,18 @@ fn record_command_buffer<T: ComposeRenderTarget + ?Sized>(
         crate::vk_count!(cmd_end_rendering);
         device.cmd_end_rendering(cb);
 
+        if let Some(sp) = scale {
+            record_scale_pass(
+                vk,
+                cb,
+                bo.image(),
+                bo.image_view(),
+                bo.width(),
+                bo.height(),
+                sp,
+            );
+        }
+
         bo.record_post_compose(vk, cb, post_compose_preparation);
 
         // GPU-render timer: stamp BOTTOM-of-pipe after all compose work.
@@ -8193,6 +8477,290 @@ fn record_command_buffer<T: ComposeRenderTarget + ?Sized>(
     }
     let _ = render_area;
     Ok(())
+}
+
+impl SceneCompositor {
+    /// Test-only: the cursor assignment the production tick would make for
+    /// `output_idx`.
+    #[cfg(test)]
+    pub(crate) fn cursor_assignment_for_tests(
+        &self,
+        core: &KmsCore,
+        store: &mut DrawableStore,
+        windows: &super::backend::WindowsMap,
+        platform: &PlatformBackend,
+        output_idx: usize,
+    ) -> CursorAssignment {
+        let cursor = self.inner.as_ref().and_then(|inner| inner.cursor.clone());
+        build_scene(
+            core,
+            store,
+            windows,
+            output_idx,
+            platform,
+            cursor,
+            None,
+            None,
+            hw_cursor_allowed(platform),
+            Visibility::On,
+        )
+        .cursor_assignment
+    }
+
+    /// Test-only: output `output_idx`'s intermediate memory and extent.
+    #[cfg(test)]
+    pub(crate) fn intermediate_for_tests(
+        &self,
+        output_idx: usize,
+    ) -> Option<(vk::DeviceMemory, vk::Extent2D)> {
+        let im = self
+            .inner
+            .as_ref()?
+            .outputs
+            .get(output_idx)?
+            .intermediate
+            .as_ref()?;
+        Some((im.memory(), im.extent))
+    }
+
+    /// Test-only: compose `output_idx` exactly as `tick_one_output` does for a
+    /// transformed output — the scene walk into its live intermediate, then
+    /// the scale pass — with a plain offscreen image standing in for the
+    /// scanout BO (lavapipe cannot allocate one). Returns that image's BGRA
+    /// bytes, mode-sized.
+    #[cfg(test)]
+    pub(crate) fn compose_transformed_for_tests(
+        &mut self,
+        core: &KmsCore,
+        store: &mut DrawableStore,
+        windows: &super::backend::WindowsMap,
+        platform: &PlatformBackend,
+        output_idx: usize,
+    ) -> Vec<u8> {
+        let inner = self.inner.as_mut().expect("live scene");
+        let transform = platform
+            .output_transform(output_idx)
+            .expect("transformed output")
+            .clone();
+        let cursor = inner.cursor.clone();
+        let built = build_scene(
+            core,
+            store,
+            windows,
+            output_idx,
+            platform,
+            cursor,
+            None,
+            None,
+            false,
+            Visibility::On,
+        );
+        let layout = &platform.outputs[output_idx];
+        let mode = vk::Extent2D {
+            width: u32::from(layout.width),
+            height: u32::from(layout.height),
+        };
+        let mut target = DamageAuditTarget::new(Arc::clone(&inner.vk), mode).expect("target");
+        let state = &mut inner.outputs[output_idx];
+        let intermediate = state.intermediate.as_mut().expect("intermediate");
+        let scale = ScalePass::new(
+            intermediate,
+            inner.scale_pipeline.as_ref().expect("scale pipeline"),
+            &transform,
+            platform.output_root_rect(output_idx),
+            (u32::from(platform.fb_w), u32::from(platform.fb_h)),
+        );
+        let vk = &inner.vk;
+        let pool = create_audit_descriptor_pool(vk, built.scene.draws.len()).expect("pool");
+        let ticket = platform.acquire_fence_ticket().expect("fence");
+        let mut submitted = false;
+        record_and_submit_render(
+            vk,
+            &mut target,
+            &inner.pipeline,
+            pool,
+            &built.scene,
+            Repaint::Full(intermediate.extent),
+            &[],
+            ticket.fence(),
+            &mut submitted,
+            &[],
+            vk::Pipeline::null(),
+            vk::PipelineLayout::null(),
+            Some(&scale),
+        )
+        .expect("compose");
+        ticket.wait(vk).expect("compose fence");
+        intermediate.has_content = true;
+        unsafe { vk.device.destroy_descriptor_pool(pool, None) };
+        read_general_image_for_tests(vk, platform, target.image, mode)
+    }
+}
+
+/// Test-only: the BGRA bytes of a `GENERAL`-layout colour image.
+#[cfg(test)]
+fn read_general_image_for_tests(
+    vk: &Arc<crate::kms::vk::device::VkContext>,
+    platform: &PlatformBackend,
+    image: vk::Image,
+    extent: vk::Extent2D,
+) -> Vec<u8> {
+    let bytes = u64::from(extent.width) * u64::from(extent.height) * 4;
+    let staging =
+        super::engine::StagingBuffer::new_for_readback(Arc::clone(vk), bytes).expect("staging");
+    let mut op = crate::kms::vk::ops::ReusableOneShot::new(
+        Arc::clone(vk),
+        platform.ops_command_pool_handle().expect("ops pool"),
+    )
+    .expect("one-shot");
+    let buffer = staging.buffer();
+    op.run(|vk, cb| {
+        let color = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .level_count(1)
+            .layer_count(1);
+        let barrier = [vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+            .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
+            .old_layout(vk::ImageLayout::GENERAL)
+            .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .image(image)
+            .subresource_range(color)];
+        let region = [vk::BufferImageCopy::default()
+            .image_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .layer_count(1),
+            )
+            .image_extent(vk::Extent3D {
+                width: extent.width,
+                height: extent.height,
+                depth: 1,
+            })];
+        unsafe {
+            vk.device.cmd_pipeline_barrier2(
+                cb,
+                &vk::DependencyInfo::default().image_memory_barriers(&barrier),
+            );
+            vk.device.cmd_copy_image_to_buffer(
+                cb,
+                image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                buffer,
+                &region,
+            );
+        }
+        Ok(())
+    })
+    .map_err(|e| e.result)
+    .expect("readback");
+    staging.invalidate_for_read().expect("invalidate");
+    let len = usize::try_from(bytes).expect("size");
+    // SAFETY: mapped for `bytes`, the copy's fence has signalled.
+    unsafe { std::slice::from_raw_parts(staging.mapped().as_ptr(), len) }.to_vec()
+}
+
+/// Scale the just-composited intermediate into the BO (spec D4): leaves the
+/// intermediate in `GENERAL` for the next frame and root readback, and the BO
+/// in `COLOR_ATTACHMENT_OPTIMAL` for `record_post_compose`.
+///
+/// # Safety
+///
+/// `cb` is recording, outside a rendering scope, after the compose into
+/// `sp.image`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn record_scale_pass(
+    vk: &crate::kms::vk::device::VkContext,
+    cb: vk::CommandBuffer,
+    target: vk::Image,
+    target_view: vk::ImageView,
+    width: u32,
+    height: u32,
+    sp: &ScalePass,
+) {
+    let device = &vk.device;
+    let color = vk::ImageSubresourceRange::default()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .level_count(1)
+        .layer_count(1);
+    let barriers = [
+        vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+            .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .image(sp.image)
+            .subresource_range(color),
+        vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+            .src_access_mask(vk::AccessFlags2::empty())
+            .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .image(target)
+            .subresource_range(color),
+    ];
+    crate::vk_count!(cmd_pipeline_barrier2);
+    unsafe {
+        device.cmd_pipeline_barrier2(
+            cb,
+            &vk::DependencyInfo::default().image_memory_barriers(&barriers),
+        );
+    }
+    let whole = vk::Rect2D {
+        offset: vk::Offset2D::default(),
+        extent: vk::Extent2D { width, height },
+    };
+    // Every pixel is written, so nothing needs loading.
+    let attachment = [vk::RenderingAttachmentInfo::default()
+        .image_view(target_view)
+        .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .store_op(vk::AttachmentStoreOp::STORE)];
+    let rendering = vk::RenderingInfo::default()
+        .render_area(whole)
+        .layer_count(1)
+        .color_attachments(&attachment);
+    #[allow(clippy::cast_precision_loss)]
+    let viewport = [vk::Viewport {
+        x: 0.0,
+        y: 0.0,
+        width: width as f32,
+        height: height as f32,
+        min_depth: 0.0,
+        max_depth: 1.0,
+    }];
+    unsafe {
+        crate::vk_count!(cmd_begin_rendering);
+        device.cmd_begin_rendering(cb, &rendering);
+        device.cmd_set_viewport(cb, 0, &viewport);
+        device.cmd_set_scissor(cb, 0, &[whole]);
+        device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, sp.pipeline);
+        device.cmd_bind_descriptor_sets(
+            cb,
+            vk::PipelineBindPoint::GRAPHICS,
+            sp.layout,
+            0,
+            &[sp.descriptor_set],
+            &[],
+        );
+        device.cmd_push_constants(
+            cb,
+            sp.layout,
+            vk::ShaderStageFlags::FRAGMENT,
+            0,
+            sp.push.as_bytes(),
+        );
+        crate::vk_count!(cmd_draw);
+        device.cmd_draw(cb, 3, 1, 0, 0);
+        crate::vk_count!(cmd_end_rendering);
+        device.cmd_end_rendering(cb);
+    }
 }
 
 #[cfg(test)]

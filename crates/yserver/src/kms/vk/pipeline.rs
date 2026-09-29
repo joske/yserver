@@ -375,7 +375,7 @@ fn build_pipeline_variant(
     }
 }
 
-fn create_shader_module(
+pub(crate) fn create_shader_module(
     device: &ash::Device,
     spv_bytes: &[u8],
 ) -> Result<vk::ShaderModule, PipelineError> {
