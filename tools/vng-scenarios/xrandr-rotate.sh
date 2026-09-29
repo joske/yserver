@@ -1,7 +1,7 @@
 # Sourced by tools/vng-shot.sh INSIDE the guest (DISPLAY=:7, cwd = artifacts).
 # CRTC rotation/reflection: geometry, GetCrtcInfo, monitors, Xinerama, the
 # SetScreenSize crop rule and a root capture over a known pattern, per step.
-# With --outputs 2 the second output (right of the first) is rotated too.
+# With --outputs 2 only the second output, right of the first, is rotated.
 #   tools/vng-shot.sh [--outputs 2] --server xorg --dump none --name rotate-xorg \
 #       --scenario tools/vng-scenarios/xrandr-rotate.sh
 set -u
@@ -109,19 +109,21 @@ root_clear() { python3 -c "
 from Xlib import display
 d = display.Display(); d.screen().root.clear_area(0, 0, 0, 0); d.sync()"; }
 {
-    step normal --output "$out1" --rotate normal
-    step left --output "$out1" --rotate left
-    step right --output "$out1" --rotate right
-    step inverted --output "$out1" --rotate inverted
-    step reflect-x --output "$out1" --rotate normal --reflect x
-    step reflect-y --output "$out1" --reflect y
-    step reflect-xy --output "$out1" --reflect xy
-    step left-reflect-x --output "$out1" --rotate left --reflect x
-    step left-scale2 --output "$out1" --reflect normal --rotate left --scale 2x2
-    step left-scale2-pos --output "$out1" --rotate left --scale 2x2 --pos 0x0
-    step restore --output "$out1" --rotate normal --scale 1x1
-    if [ -n "$out2" ]; then
+    if [ -z "$out2" ]; then
+        step normal --output "$out1" --rotate normal
+        step left --output "$out1" --rotate left
+        step right --output "$out1" --rotate right
+        step inverted --output "$out1" --rotate inverted
+        step reflect-x --output "$out1" --rotate normal --reflect x
+        step reflect-y --output "$out1" --reflect y
+        step reflect-xy --output "$out1" --reflect xy
+        step left-reflect-x --output "$out1" --rotate left --reflect x
+        step left-scale2 --output "$out1" --reflect normal --rotate left --scale 2x2
+        step left-scale2-pos --output "$out1" --rotate left --scale 2x2 --pos 0x0
+        step restore --output "$out1" --rotate normal --scale 1x1
+    else
         xrandr --output "$out1" --pos 0x0 --output "$out2" --right-of "$out1" 2>&1
+        step dual-normal --output "$out2" --rotate normal
         step dual-right-left --output "$out2" --rotate left
         step dual-right-inverted --output "$out2" --rotate inverted
         step dual-restore --output "$out2" --rotate normal
