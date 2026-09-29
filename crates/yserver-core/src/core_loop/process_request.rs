@@ -3300,7 +3300,9 @@ fn handle_randr_request(
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_SET_CRTC_TRANSFORM => {
-            let Some(req) = x11randr::parse_set_crtc_transform_request(body) else {
+            let Some(req) =
+                x11randr::parse_set_crtc_transform_request(body).filter(|req| req.filter.is_some())
+            else {
                 return emit_x11_error_with_minor(
                     state,
                     client_id,
@@ -3344,7 +3346,8 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             }
-            if req.filter_name_len != 0 || req.filter_param_count != 0 {
+            if req.filter_name_len != 0 || req.filter.as_ref().is_some_and(|f| !f.params.is_empty())
+            {
                 // The filter has no observable effect for an identity
                 // transform, but yserver does not retain it for GetCrtcTransform.
                 warn_randr_unsupported_once(
@@ -3371,7 +3374,24 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             }
-            let buf = x11randr::encode_get_crtc_transform_reply(byte_order, sequence);
+            let Some(output) = state.randr.outputs.iter().find(|o| o.crtc_id == crtc) else {
+                return Ok(RequestOutcome::Handled);
+            };
+            // `transform_filter_encode`: no filter, no name and no params.
+            fn part(t: &crate::randr::CrtcTransform) -> x11randr::CrtcTransformReplyPart<'_> {
+                x11randr::CrtcTransformReplyPart {
+                    matrix: t.matrix,
+                    filter_name: t.filter.map_or(&[][..], |f| f.canonical_name().as_bytes()),
+                    params: if t.filter.is_some() { &t.params } else { &[] },
+                }
+            }
+            let buf = x11randr::encode_get_crtc_transform_reply(
+                byte_order,
+                sequence,
+                false,
+                part(&output.pending_transform),
+                part(&output.current_transform),
+            );
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
             };

@@ -211,9 +211,21 @@ pub struct SetScreenSizeRequest {
 #[derive(Debug, PartialEq, Eq)]
 pub struct SetCrtcTransformRequest {
     pub crtc: u32,
+    /// Row-major 16.16 matrix.
     pub transform: [i32; 9],
+    /// `nbytesFilter`.
     pub filter_name_len: u16,
-    pub filter_param_count: usize,
+    /// Filter name and parameters; `None` when the padded name overruns
+    /// the request (Xorg's negative `nparams`, BadLength).
+    pub filter: Option<TransformFilterSpec>,
+}
+
+/// `SetCrtcTransform`'s variable part: the filter name bytes as sent and
+/// the trailing `FIXED` parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TransformFilterSpec {
+    pub name: Vec<u8>,
+    pub params: Vec<i32>,
 }
 
 impl SetCrtcTransformRequest {
@@ -483,6 +495,9 @@ pub fn parse_set_screen_size_request(body: &[u8]) -> Option<SetScreenSizeRequest
 ///
 /// Bytes after the padded filter name are zero or more 16.16 `FIXED`
 /// filter parameters. Their count is implicit in the X11 request length.
+/// `None` only for a body shorter than the fixed part (`REQUEST_AT_LEAST_SIZE`);
+/// a malformed tail is reported through `filter`. Big-endian bodies arrive
+/// here already swapped (`request_swap`).
 pub fn parse_set_crtc_transform_request(body: &[u8]) -> Option<SetCrtcTransformRequest> {
     if body.len() < 44 {
         return None;
@@ -493,15 +508,23 @@ pub fn parse_set_crtc_transform_request(body: &[u8]) -> Option<SetCrtcTransformR
         *cell = i32::from_le_bytes(body[offset..offset + 4].try_into().ok()?);
     }
     let filter_name_len = read_u16_le(&body[40..]);
-    let filter_end = 44usize.checked_add(pad4(usize::from(filter_name_len)))?;
-    if filter_end > body.len() || !(body.len() - filter_end).is_multiple_of(4) {
-        return None;
-    }
+    let name_end = 44 + usize::from(filter_name_len);
+    let filter_end = 44 + pad4(usize::from(filter_name_len));
+    let filter =
+        (filter_end <= body.len() && (body.len() - filter_end).is_multiple_of(4)).then(|| {
+            TransformFilterSpec {
+                name: body[44..name_end].to_vec(),
+                params: body[filter_end..]
+                    .chunks_exact(4)
+                    .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                    .collect(),
+            }
+        });
     Some(SetCrtcTransformRequest {
         crtc: read_u32_le(body),
         transform,
         filter_name_len,
-        filter_param_count: (body.len() - filter_end) / 4,
+        filter,
     })
 }
 
@@ -942,28 +965,58 @@ pub fn encode_get_crtc_info_reply(
     out
 }
 
-/// Encodes a `GetCrtcTransform` reply (96 bytes) with identity transforms and no filter.
+/// One of `GetCrtcTransform`'s two transforms: matrix, canonical filter
+/// name (empty = no filter) and parameters.
+#[derive(Debug, Clone, Copy)]
+pub struct CrtcTransformReplyPart<'a> {
+    pub matrix: [i32; 9],
+    pub filter_name: &'a [u8],
+    pub params: &'a [i32],
+}
+
+/// Encodes a `GetCrtcTransform` reply (`ProcRRGetCrtcTransform`).
 ///
 /// Wire layout: standard 8-byte header + pendingTransform(36) + hasTransforms(1)+pad(3) +
-/// currentTransform(36) + pad(4) + four u16 filter-length fields.
-/// Identity matrix in 16.16 fixed-point: diagonal = 0x0001_0000, off-diagonal = 0.
+/// currentTransform(36) + pad(4) + four u16 filter-length fields (96 bytes), then the
+/// pending and current filters, each a padded name followed by its `FIXED` parameters.
 pub fn encode_get_crtc_transform_reply(
     byte_order: ClientByteOrder,
     sequence: SequenceNumber,
+    has_transforms: bool,
+    pending: CrtcTransformReplyPart<'_>,
+    current: CrtcTransformReplyPart<'_>,
 ) -> Vec<u8> {
-    const IDENTITY: [u32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x0001_0000];
-    let mut out = fixed_reply(byte_order, sequence, 0, 16); // 64 extra bytes = 16 CARD32s
-    for &v in &IDENTITY {
-        put(byte_order, &mut out, v); // bytes 8-43: pendingTransform
+    let filter_len =
+        |part: &CrtcTransformReplyPart<'_>| pad4(part.filter_name.len()) + part.params.len() * 4;
+    let extra = filter_len(&pending) + filter_len(&current);
+    #[allow(clippy::cast_possible_truncation)]
+    let length = ((64 + extra) / 4) as u32;
+    let mut out = fixed_reply(byte_order, sequence, 0, length);
+    for v in pending.matrix {
+        put(byte_order, &mut out, v as u32); // bytes 8-43: pendingTransform
     }
-    out.push(0); // byte 44: hasTransforms = false
+    out.push(u8::from(has_transforms)); // byte 44
     out.extend_from_slice(&[0u8; 3]); // bytes 45-47: pad
-    for &v in &IDENTITY {
-        put(byte_order, &mut out, v); // bytes 48-83: currentTransform
+    for v in current.matrix {
+        put(byte_order, &mut out, v as u32); // bytes 48-83: currentTransform
     }
     out.extend_from_slice(&[0u8; 4]); // bytes 84-87: pad
-    out.extend_from_slice(&[0u8; 8]); // bytes 88-95: four u16 filter lengths (all 0)
+    #[allow(clippy::cast_possible_truncation)]
+    for part in [&pending, &current] {
+        put(byte_order, &mut out, part.filter_name.len() as u16);
+        put(byte_order, &mut out, part.params.len() as u16);
+    }
     debug_assert_eq!(out.len(), 96);
+    for part in [&pending, &current] {
+        out.extend_from_slice(part.filter_name);
+        out.resize(
+            out.len() + pad4(part.filter_name.len()) - part.filter_name.len(),
+            0,
+        );
+        for &param in part.params {
+            put(byte_order, &mut out, param as u32);
+        }
+    }
     out
 }
 
@@ -1493,8 +1546,15 @@ mod tests {
 
         let request = parse_set_crtc_transform_request(&body).expect("valid transform");
         assert_eq!(request.crtc, 2);
+        assert_eq!(request.transform, matrix);
         assert_eq!(request.filter_name_len, 3);
-        assert_eq!(request.filter_param_count, 1);
+        assert_eq!(
+            request.filter,
+            Some(TransformFilterSpec {
+                name: b"box".to_vec(),
+                params: vec![-0x0000_8000],
+            })
+        );
         assert!(request.is_identity_transform());
 
         let mut nonidentity = body.clone();
@@ -1507,16 +1567,158 @@ mod tests {
     }
 
     #[test]
-    fn parse_set_crtc_transform_rejects_malformed_variable_tail() {
+    fn parse_set_crtc_transform_reports_malformed_variable_tail() {
         assert!(parse_set_crtc_transform_request(&[0u8; 43]).is_none());
 
+        // A name running past the request is Xorg's negative nparams.
         let mut missing_filter = vec![0u8; 44];
         missing_filter[40..42].copy_from_slice(&4u16.to_le_bytes());
-        assert!(parse_set_crtc_transform_request(&missing_filter).is_none());
+        let request = parse_set_crtc_transform_request(&missing_filter).unwrap();
+        assert_eq!(request.filter_name_len, 4);
+        assert_eq!(request.filter, None);
 
         let mut partial_parameter = vec![0u8; 45];
         partial_parameter[40..42].copy_from_slice(&0u16.to_le_bytes());
-        assert!(parse_set_crtc_transform_request(&partial_parameter).is_none());
+        assert_eq!(
+            parse_set_crtc_transform_request(&partial_parameter)
+                .unwrap()
+                .filter,
+            None
+        );
+
+        let empty = parse_set_crtc_transform_request(&[0u8; 44]).unwrap();
+        assert_eq!(empty.filter, Some(TransformFilterSpec::default()));
+    }
+
+    /// muffin's scale-down 125% request for CRTC 6 (spec, "What muffin
+    /// sends"): 1.599991 as the 16.16 word 104857, filter `good`.
+    fn muffin_transform_body(byte_order: ClientByteOrder) -> Vec<u8> {
+        let u32b = |v: u32| match byte_order {
+            ClientByteOrder::LittleEndian => v.to_le_bytes(),
+            ClientByteOrder::BigEndian => v.to_be_bytes(),
+        };
+        let mut body = Vec::new();
+        body.extend_from_slice(&u32b(6));
+        for cell in [104_857u32, 0, 0, 0, 104_857, 0, 0, 0, 0x0001_0000] {
+            body.extend_from_slice(&u32b(cell));
+        }
+        let len = match byte_order {
+            ClientByteOrder::LittleEndian => 4u16.to_le_bytes(),
+            ClientByteOrder::BigEndian => 4u16.to_be_bytes(),
+        };
+        body.extend_from_slice(&len);
+        body.extend_from_slice(&[0u8; 2]);
+        body.extend_from_slice(b"good");
+        body.extend_from_slice(&u32b(0x0001_8000));
+        body
+    }
+
+    #[test]
+    fn parse_set_crtc_transform_reads_both_byte_orders() {
+        let little = muffin_transform_body(ClientByteOrder::LittleEndian);
+        let mut big = muffin_transform_body(ClientByteOrder::BigEndian);
+        assert_ne!(little, big);
+        crate::x11::request_swap::swap_request_body(
+            128,
+            RR_SET_CRTC_TRANSFORM,
+            ClientByteOrder::BigEndian,
+            &mut big,
+        );
+        let expected = SetCrtcTransformRequest {
+            crtc: 6,
+            transform: [104_857, 0, 0, 0, 104_857, 0, 0, 0, 0x0001_0000],
+            filter_name_len: 4,
+            filter: Some(TransformFilterSpec {
+                name: b"good".to_vec(),
+                params: vec![0x0001_8000],
+            }),
+        };
+        assert_eq!(parse_set_crtc_transform_request(&little), Some(expected));
+        assert_eq!(
+            parse_set_crtc_transform_request(&big),
+            parse_set_crtc_transform_request(&little)
+        );
+    }
+
+    const IDENTITY: [i32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x0001_0000];
+
+    #[test]
+    fn get_crtc_transform_reply_default_state_has_no_filter_bytes() {
+        let none = CrtcTransformReplyPart {
+            matrix: IDENTITY,
+            filter_name: b"",
+            params: &[],
+        };
+        for byte_order in [ClientByteOrder::LittleEndian, ClientByteOrder::BigEndian] {
+            let out =
+                encode_get_crtc_transform_reply(byte_order, SequenceNumber(7), true, none, none);
+            assert_eq!(out.len(), 96);
+            let u32_at = |o: usize| {
+                let b: [u8; 4] = out[o..o + 4].try_into().unwrap();
+                match byte_order {
+                    ClientByteOrder::LittleEndian => u32::from_le_bytes(b),
+                    ClientByteOrder::BigEndian => u32::from_be_bytes(b),
+                }
+            };
+            assert_eq!(out[0], 1);
+            assert_eq!(u32_at(4), 16, "length");
+            assert_eq!(u32_at(8), 0x0001_0000, "pending m11");
+            assert_eq!(u32_at(24), 0x0001_0000, "pending m22");
+            assert_eq!(out[44], 1, "hasTransforms");
+            assert_eq!(u32_at(48), 0x0001_0000, "current m11");
+            assert_eq!(u32_at(80), 0x0001_0000, "current m33");
+            assert_eq!(&out[88..96], &[0u8; 8], "filter lengths");
+        }
+    }
+
+    #[test]
+    fn get_crtc_transform_reply_carries_pending_and_current_filters() {
+        let scale2 = [131_072, 0, 0, 0, 131_072, 0, 0, 0, 0x0001_0000];
+        let pending = CrtcTransformReplyPart {
+            matrix: scale2,
+            filter_name: b"bilinear",
+            params: &[0x0001_8000, -1],
+        };
+        let current = CrtcTransformReplyPart {
+            matrix: IDENTITY,
+            filter_name: b"nearest",
+            params: &[],
+        };
+        let le = encode_get_crtc_transform_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(7),
+            true,
+            pending,
+            current,
+        );
+        // 96 + "bilinear"(8) + 2 params(8) + "nearest"(7→8).
+        assert_eq!(le.len(), 120);
+        assert_eq!(u32::from_le_bytes(le[4..8].try_into().unwrap()), 22);
+        assert_eq!(u32::from_le_bytes(le[8..12].try_into().unwrap()), 131_072);
+        assert_eq!(
+            u32::from_le_bytes(le[48..52].try_into().unwrap()),
+            0x0001_0000
+        );
+        assert_eq!(&le[88..96], &[8, 0, 2, 0, 7, 0, 0, 0]);
+        assert_eq!(&le[96..104], b"bilinear");
+        assert_eq!(&le[104..108], &0x0001_8000i32.to_le_bytes());
+        assert_eq!(&le[108..112], &(-1i32).to_le_bytes());
+        assert_eq!(&le[112..120], b"nearest\0");
+
+        let be = encode_get_crtc_transform_reply(
+            ClientByteOrder::BigEndian,
+            SequenceNumber(7),
+            true,
+            pending,
+            current,
+        );
+        assert_eq!(be.len(), 120);
+        assert_eq!(u32::from_be_bytes(be[4..8].try_into().unwrap()), 22);
+        assert_eq!(u32::from_be_bytes(be[8..12].try_into().unwrap()), 131_072);
+        assert_eq!(&be[88..96], &[0, 8, 0, 2, 0, 7, 0, 0]);
+        assert_eq!(&be[96..104], b"bilinear");
+        assert_eq!(&be[104..108], &0x0001_8000i32.to_be_bytes());
+        assert_eq!(&be[112..120], b"nearest\0");
     }
 
     #[test]
