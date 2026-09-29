@@ -3638,7 +3638,7 @@ mod tests {
     fn setup_allocate_reports_randr_screen_mm() {
         let mut state = ServerState::new();
         let (w, h) = (state.randr.screen_width, state.randr.screen_height);
-        state.randr.set_logical_size(1, w, h, 301, 188);
+        state.randr.set_logical_size(w, h, 301, 188);
         let (tx, rx) = crossbeam_channel::bounded(1);
         handle_setup_allocate(&mut state, yserver_protocol::x11::ClientId(1), tx);
         let resp = rx.try_recv().expect("setup allocate response");
