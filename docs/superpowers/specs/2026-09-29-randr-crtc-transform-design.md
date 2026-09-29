@@ -157,12 +157,13 @@ All from `../xserver`, 21.1 branch.
   iff `width < crtc.x + mode.width` or `height < crtc.y + mode.height`, for
   every enabled CRTC, transformed or not (measured at the exact boundaries,
   Q3). A screen may therefore crop a scaled CRTC's footprint.
-- Pointer confinement follows Xorg's `RRPointerMoved` (`rrpointer.c:35-60`,
-  settles Q2): a position outside every CRTC footprint moves to the nearest
-  CRTC, so the holes of a scale-up layout are never reachable. See D5.
-
-### D4 — Rendering a transformed output
-
+- Pointer confinement follows what Xorg 21.1 actually runs (`RRPointerMoved`
+  exists but has no caller): `RRConstrainCursorHarder` on every move and warp
+  (`randr.c:356`, `rrcrtc.c:1942`) keeps a move that would leave every CRTC on
+  the CRTC it came from, only when the CRTCs touch — in a non-touching layout
+  (Cinnamon scale-up) the pointer can enter the hole; after a layout change,
+  `RRPointerScreenConfigured` (`randr.c:665`) moves a pointer outside every
+  CRTC to the nearest one. This also applies to identity layouts with holes.
 - The scene composites a transformed output into an **intermediate image**
   allocated at the full footprint size, in root space, origin = the CRTC's
   (x, y): the existing walk, damage and buffer-age work unchanged, with the
@@ -273,8 +274,9 @@ One feature branch, squashed on merge; merged only when all phases work.
 
 - **Q1** *Settled:* `pixman_transform_bounds` over the fixed-point
   `crtc->transform` (`rrcrtc.c:1028-1048`); D3 names it.
-- **Q2** *Settled:* Xorg moves the pointer to the nearest CRTC footprint
-  (`rrpointer.c:35-60`); D3/D5b adopt it.
+- **Q2** *Settled (corrected in phase 2):* `RRConstrainCursorHarder` per
+  move/warp plus `RRPointerScreenConfigured` after a layout change, not
+  `RRPointerMoved` (no caller in 21.1); see D3.
 - **Q3** *Settled by measurement* (`tools/vng-scenarios/xrandr-scale-crop.sh`,
   two outputs, B at x = 1920, 1920×1440, `--scale 2x2`, footprint to x = 5760
   and y = 2880): Xorg applies 5759, 3841 and **3840** wide, rejects **3839**;
