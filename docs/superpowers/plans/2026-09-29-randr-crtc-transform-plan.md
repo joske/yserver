@@ -14,15 +14,19 @@ measured tables in the spec or new Xorg vng captures, never invented.
 A server-wide `TransformSupport` decides SetCrtcTransform admission:
 
 - **`Legacy`** — production until task 13, `hasTransforms = 0`. Keeps today's
-  answers exactly: after the structural checks (length, BadCrtc,
-  non-invertible, unknown filter, params without filter), an **identity**
-  request is a `Success` **no-op** — nothing is stored, GetCrtcTransform keeps
-  returning identity with no filter — and any non-identity request is
-  `BadMatch`. muffin sends identity transforms with `hasTransforms = 0`
-  (captured), and those must keep succeeding.
-- **`Unsupported`** — test-only: Xorg's no-transform-support state, `BadValue`
-  for every request, identity included (`rrcrtc.c:1101-1102`). Exists only to
-  cover that validation branch.
+  answers exactly (`process_request.rs:3302-3345`): only today's structural
+  parse (BadLength) and CRTC lookup (BadCrtc), then an **identity** request
+  is a `Success` **no-op regardless of its filter payload** (an unknown filter
+  or a parameter-only tail still succeeds, as today), and any non-identity
+  request is `BadMatch`. No pending/current storage; GetCrtcTransform keeps
+  returning identity with no filter. No Xorg filter or invertibility
+  validation runs in this mode. muffin sends identity transforms with
+  `hasTransforms = 0` (captured), and those must keep succeeding.
+- **`Unsupported`** — test-only: Xorg's no-transform-support state. Runs
+  Xorg's order up to and including the transform-support check
+  (`rrcrtc.c:1755-1785`): BadCrtc, (leases n/a), non-invertible BadMatch,
+  negative-param BadLength, **then** `BadValue` (`rrcrtc.c:1101-1102`), for
+  identity requests too. Exists only to cover that branch.
 - **`Supported`** — task 13 onwards: D1/D2 in full, `hasTransforms = 1`.
 
 Task 13 removes `Legacy` and switches production to `Supported` in one
@@ -82,7 +86,10 @@ One equation, split between two types and reused everywhere:
   bytes) and for a pending ≠ current state.
 
 ### 4. SetCrtcTransform validation and storage
-- Xorg's order (spec, "Validation order"), storing `pending`. The BadMatch
+- In `Supported` (and `Unsupported`, up to its BadValue) mode: Xorg's order
+  (spec, "Validation order"), storing `pending`. Filter validation (BadName,
+  parameter checks, params without filter) runs only in these modes, never in
+  `Legacy`. The BadMatch
   for non-pure-scale (D2) and, until task 13, for every non-identity matrix,
   come **after** Xorg's own checks so error codes match Xorg where both
   reject.
