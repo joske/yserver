@@ -3757,7 +3757,6 @@ fn handle_randr_request(
             // — only the unrelated `RRNoticePropertyChange` driver hook is
             // gated on `is_pending`. The wire notify fires regardless of
             // whether this write landed in `.current` or `.pending`.
-            state.randr.timestamp = state.timestamp_now();
             super::run::notify_randr_output_property_changed(
                 state,
                 req.output,
@@ -3831,7 +3830,6 @@ fn handle_randr_request(
                 );
             }
             entries.remove(index);
-            state.randr.timestamp = state.timestamp_now();
             super::run::notify_randr_output_property_changed(
                 state,
                 req.output,
@@ -4730,10 +4728,9 @@ fn handle_randr_request(
                     RANDR_MAJOR_OPCODE,
                 );
             }
-            let ts = state.timestamp_now();
             state
                 .randr
-                .set_logical_size(ts, req.width, req.height, req.mm_width, req.mm_height);
+                .set_logical_size(req.width, req.height, req.mm_width, req.mm_height);
             // Pure screen-size change: fire root ConfigureNotify +
             // ScreenChangeNotify ONLY — no per-CRTC/Output change
             // (CRTC positions are unchanged). Pass an empty changed
@@ -38479,6 +38476,60 @@ mod tests {
             .expect("property stored");
         assert_eq!(stored.current.as_ref().unwrap().data, 42u32.to_le_bytes());
         assert_eq!(stored.current.as_ref().unwrap().r#type, prop_type);
+    }
+
+    /// #185: an output property write must not move lastSetTime/lastConfigTime
+    /// (Xorg `rrproperty.c`). muffin treats a lastSetTime that no longer
+    /// matches its own SetCrtcConfig reply as an external reconfiguration and
+    /// rebuilds its monitor config (Cinnamon then comes back at 200%).
+    #[test]
+    fn randr_change_output_property_leaves_randr_timestamps_alone() {
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].output_id;
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.randr.timestamp = 29_342;
+        state.randr.config_timestamp = 29_133;
+        let property = state.atoms.intern("TEST_PROP", false);
+        let prop_type = state.atoms.intern("CARDINAL", false);
+        for (seq, mode) in [(1, 0u8), (2, 2u8)] {
+            let body = change_output_property_body(
+                output,
+                property.0,
+                prop_type.0,
+                32,
+                mode,
+                &42u32.to_le_bytes(),
+            );
+            handle_randr_request(
+                &mut state,
+                &mut backend,
+                ClientId(1),
+                SequenceNumber(seq),
+                change_output_property_header(body.len()),
+                &body,
+            )
+            .expect("ChangeOutputProperty");
+        }
+        let mut delete = output.to_le_bytes().to_vec();
+        delete.extend_from_slice(&property.0.to_le_bytes());
+        handle_randr_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(3),
+            RequestHeader {
+                opcode: 128,
+                data: yserver_protocol::x11::randr::RR_DELETE_OUTPUT_PROPERTY,
+                length_units: 3,
+            },
+            &delete,
+        )
+        .expect("DeleteOutputProperty");
+        assert_eq!(
+            (state.randr.timestamp, state.randr.config_timestamp),
+            (29_342, 29_133)
+        );
     }
 
     #[test]

@@ -31836,8 +31836,7 @@ mod tests {
             yserver_core::server::BackendCapabilities::from_backend(&backend),
         );
         // The desktop shrank the logical screen around the survivor.
-        let ts = state.timestamp_now();
-        state.randr.set_logical_size(ts, 1920, 1080, 508, 286);
+        state.randr.set_logical_size(1920, 1080, 508, 286);
 
         backend.rebuild_randr_state(&mut state, None, true);
 

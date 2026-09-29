@@ -2630,7 +2630,11 @@ pub(crate) fn notify_randr_output_property_changed(
 
     const RANDR_FIRST_EVENT: u8 = 89;
 
-    let timestamp = state.randr.timestamp;
+    // Xorg stamps property notifies with the current time and leaves
+    // lastSetTime alone (`rrproperty.c:75`): mutter/muffin compare
+    // lastSetTime with their own SetCrtcConfig reply to tell their
+    // configuration from an external one.
+    let timestamp = state.timestamp_now();
     let subscribers: Vec<(u32, yserver_protocol::x11::ResourceId, u16)> = state
         .randr_select_masks
         .iter()

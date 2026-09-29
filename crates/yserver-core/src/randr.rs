@@ -637,14 +637,14 @@ impl RandrState {
     /// Set the logical (reported) screen size after validation. Uses
     /// the CLIENT-supplied physical mm verbatim (Xorg `RRScreenSizeSet`
     /// passes `stuff->widthInMillimeters`/`heightInMillimeters` — it does
-    /// NOT recompute from pixels). Does not touch outputs.
-    pub fn set_logical_size(&mut self, timestamp: u32, w: u16, h: u16, mm_w: u32, mm_h: u32) {
+    /// NOT recompute from pixels). Does not touch outputs, nor either
+    /// timestamp: Xorg's SetScreenSize moves neither lastSetTime nor
+    /// lastConfigTime (only SetCrtcConfig/SetScreenConfig set the former).
+    pub fn set_logical_size(&mut self, w: u16, h: u16, mm_w: u32, mm_h: u32) {
         self.screen_width = w;
         self.screen_height = h;
         self.width_mm = mm_w;
         self.height_mm = mm_h;
-        self.timestamp = timestamp.max(1);
-        self.config_timestamp = self.timestamp;
     }
 
     /// Monitors for RANDR `GetMonitors` / XINERAMA: one per output with a
@@ -1257,7 +1257,7 @@ mod tests {
         );
         assert_eq!(st.screen_width, 5120);
 
-        st.set_logical_size(7, 2560, 1440, 677, 381);
+        st.set_logical_size(2560, 1440, 677, 381);
         assert_eq!(
             (st.screen_width, st.screen_height, st.width_mm, st.height_mm),
             (2560, 1440, 677, 381),
@@ -2006,15 +2006,18 @@ mod tests {
     #[test]
     fn set_logical_size_stores_client_mm_verbatim() {
         let mut st = RandrState::nested(1, 1920, 1080);
+        st.timestamp = 40;
+        st.config_timestamp = 30;
         // Caller passes client-supplied mm values; the impl must NOT
         // recompute them from pixels.
-        st.set_logical_size(42, 2560, 1440, 597, 336);
+        st.set_logical_size(2560, 1440, 597, 336);
         assert_eq!(st.screen_width, 2560);
         assert_eq!(st.screen_height, 1440);
         assert_eq!(st.width_mm, 597, "mm verbatim from client");
         assert_eq!(st.height_mm, 336, "mm verbatim from client");
-        assert_eq!(st.timestamp, 42);
-        assert_eq!(st.config_timestamp, 42);
+        // Xorg's SetScreenSize moves neither timestamp; muffin treats a moved
+        // lastSetTime as an external reconfiguration (#185).
+        assert_eq!((st.timestamp, st.config_timestamp), (40, 30));
     }
 
     use yserver_protocol::x11::error as x11_err;
