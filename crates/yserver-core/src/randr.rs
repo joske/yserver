@@ -4,6 +4,10 @@ use yserver_protocol::x11::randr as proto;
 
 use crate::properties::PropertyValue;
 
+mod transform;
+
+pub use transform::{CrtcTransform, FIXED_ONE, Filter, IDENTITY_MATRIX};
+
 /// A client-settable RANDR output property (`RRChangeOutputProperty` /
 /// `RRConfigureOutputProperty` / `RRDeleteOutputProperty`,
 /// randr/rrproperty.c `RRPropertyRec`). Distinct from the backend-
