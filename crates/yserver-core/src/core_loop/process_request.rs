@@ -128,7 +128,7 @@ pub enum RequestOutcome {
 
 /// Continuation data needed to finish an asynchronous `RRSetCrtcConfig`
 /// without redispatching the original request.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PendingCrtcConfig {
     pub token: CrtcConfigToken,
     pub completion: CrtcConfigCompletion,
@@ -137,15 +137,16 @@ pub struct PendingCrtcConfig {
 /// Protocol continuation shared by synchronous and asynchronous CRTC apply
 /// paths. It contains no backend token, so immediate completion never needs a
 /// sentinel token value.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct CrtcConfigCompletion {
     pub output_id: u32,
     pub set_time: u32,
     pub output_bbox_before: Option<(u16, u16)>,
     pub byte_order: yserver_protocol::x11::ClientByteOrder,
-    /// The CRTC's pending transform differs from its current one and this
-    /// enable applies it (`RRCrtcPendingTransform`, rrcrtc.c:765).
-    pub apply_transform: bool,
+    /// The pending transform this enable applies, snapshotted at request
+    /// time, when it differs from the current one (`RRCrtcPendingTransform`,
+    /// rrcrtc.c:765).
+    pub apply_transform: Option<Box<crate::randr::CrtcTransform>>,
 }
 
 /// Dispatch one X11 request entirely on the core thread.
@@ -4726,6 +4727,7 @@ fn handle_randr_request(
             // (CRTC positions are unchanged). Pass an empty changed
             // list so only ScreenChangeNotify + root ConfigureNotify fire.
             super::run::apply_screen_size_side_effects(state, backend, req.width, req.height, &[]);
+            backend.randr_layout_changed(state);
             // RRSetScreenSize has NO reply (it is a void request).
             return Ok(RequestOutcome::Handled);
         }
@@ -4877,10 +4879,11 @@ fn handle_randr_request(
             let connector = output_row.name.clone();
             // A disable keeps the current transform (xf86RandR12CrtcSet
             // only installs one with a mode).
-            let apply_transform = resolved.is_some()
+            let apply_transform = (resolved.is_some()
                 && !output_row
                     .pending_transform
-                    .equivalent(&output_row.current_transform);
+                    .equivalent(&output_row.current_transform))
+            .then(|| Box::new(output_row.pending_transform.applied()));
             let mode_spec = resolved.map(|m| ModeSpec {
                 width: m.width,
                 height: m.height,
@@ -5174,12 +5177,12 @@ pub(crate) fn complete_crtc_config(
 ) -> io::Result<RequestOutcome> {
     let status = match result {
         // A new transform is a change even with identical mode/x/y.
-        Ok(changed) if changed || completion.apply_transform => {
+        Ok(changed) if changed || completion.apply_transform.is_some() => {
             // Something actually changed. Single rebuild path: a CRTC set
             // bumps lastSetTime (to the client timestamp) but NOT
             // lastConfigTime.
             backend.refresh_randr_state_set_time(state, completion.set_time);
-            if completion.apply_transform
+            if let Some(transform) = completion.apply_transform
                 && let Some(output) = state
                     .randr
                     .outputs
@@ -5187,8 +5190,9 @@ pub(crate) fn complete_crtc_config(
                     .find(|o| o.output_id == completion.output_id)
             {
                 // RRCrtcNotify: RRTransformCopy of pending into current.
-                output.current_transform = output.pending_transform.applied();
+                output.current_transform = *transform;
             }
+            backend.randr_layout_changed(state);
             let changed: Vec<(u32, u32, u32)> = state
                 .randr
                 .outputs
@@ -36923,6 +36927,39 @@ mod tests {
             state.randr.outputs[0].current_transform.matrix,
             rr_scale(131_072)
         );
+    }
+
+    #[test]
+    fn an_asynchronous_crtc_config_applies_the_transform_pending_at_request_time() {
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].clone();
+        let (crtc, mode) = (output.crtc_id, output.mode_id);
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let body = randr_transform_body(crtc, rr_scale(131_072), b"");
+        assert_eq!(randr_set_crtc_transform(&mut state, &mut peer, &body), None);
+        backend.pending_crtc_config = Some(CrtcConfigToken(7));
+        let config = randr_crtc_config_body(crtc, output.x, output.y, mode, &[output.output_id]);
+        let RequestOutcome::PendingCrtcConfig(pending) =
+            randr_set_crtc_config(&mut state, &mut backend, &config).unwrap()
+        else {
+            panic!("the enable must park");
+        };
+        // A new SetCrtcTransform while the enable is in flight stays pending.
+        let body = randr_transform_body(crtc, rr_scale(32_768), b"");
+        assert_eq!(randr_set_crtc_transform(&mut state, &mut peer, &body), None);
+        complete_crtc_config(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(3),
+            pending.completion,
+            Ok(true),
+        )
+        .unwrap();
+        let output = &state.randr.outputs[0];
+        assert_eq!(output.current_transform.matrix, rr_scale(131_072));
+        assert_eq!(output.pending_transform.matrix, rr_scale(32_768));
     }
 
     #[test]

@@ -816,6 +816,12 @@ pub trait Backend {
     /// not change). Default no-op for nested/recording backends.
     fn refresh_randr_state_set_time(&mut self, _state: &mut ServerState, _set_time: u32) {}
 
+    /// The RANDR layout changed (a CRTC set, a screen resize or a server
+    /// reset): take the CRTC transforms and root extent from `state.randr`
+    /// and move the pointer onto a CRTC (`RRPointerScreenConfigured`).
+    /// Default no-op.
+    fn randr_layout_changed(&mut self, _state: &mut ServerState) {}
+
     /// Resize the logical (virtual) screen to `w`×`h`: reallocate the
     /// root + Composite-overlay backing storage and update the pointer
     /// clamp / logical extent. Default no-op `Ok(())` for nested

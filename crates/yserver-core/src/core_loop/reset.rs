@@ -424,6 +424,8 @@ pub(crate) fn reset_generation(
 
     // -- 7. Re-attach the backend to the new state. -----------------
     install_backend_root_bindings(state, backend);
+    // The fresh state carries identity transforms, as Xorg's reset does.
+    backend.randr_layout_changed(state);
 
     // -- 8. Repaint the root. ---------------------------------------
     // The fresh constructor creates a root window, but that leaves the

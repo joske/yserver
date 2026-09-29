@@ -275,6 +275,22 @@ impl RandrOutput {
     pub fn footprint(&self) -> (u16, u16) {
         self.current_transform.footprint(self.width, self.height)
     }
+
+    /// A mode-local scanout position to the root position it shows:
+    /// `M · d + (x, y)`.
+    #[must_use]
+    pub fn scanout_to_root(&self, x: f64, y: f64) -> (f64, f64) {
+        let (ix, iy) = self.current_transform.scanout_to_intermediate(x, y);
+        (ix + f64::from(self.x), iy + f64::from(self.y))
+    }
+
+    /// A root position to the mode-local scanout position showing it:
+    /// `M⁻¹ · (r − (x, y))`.
+    #[must_use]
+    pub fn root_to_scanout(&self, x: f64, y: f64) -> (f64, f64) {
+        self.current_transform
+            .intermediate_to_scanout(x - f64::from(self.x), y - f64::from(self.y))
+    }
 }
 
 /// A virtual-screen slot held by a route that is physically gone but
@@ -2217,5 +2233,22 @@ mod tests {
         outputs[1].current_transform = scale_transform(131_072);
         let derived = RandrState::from_outputs(1, outputs);
         assert_eq!((derived.screen_width, derived.screen_height), (5760, 2880));
+    }
+
+    #[test]
+    fn root_and_scanout_round_trip_on_a_non_zero_origin_output() {
+        // Cinnamon scale-down 100%: CRTC 6 at 2560,0, wire matrix 2.0.
+        let mut st = crop_probe_state(131_072);
+        st.outputs[1].x = 2560;
+        let out = &st.outputs[1];
+        // Mode-local pixel (100, 50) shows root (2560 + 200, 100).
+        assert_eq!(out.scanout_to_root(100.0, 50.0), (2760.0, 100.0));
+        assert_eq!(out.root_to_scanout(2760.0, 100.0), (100.0, 50.0));
+        for (x, y) in [(2560.0, 0.0), (3000.5, 777.25), (6399.0, 2879.0)] {
+            let (dx, dy) = out.root_to_scanout(x, y);
+            assert_eq!(out.scanout_to_root(dx, dy), (x, y));
+        }
+        // No origin inside the transform: the identity CRTC at 0,0 is a no-op.
+        assert_eq!(st.outputs[0].scanout_to_root(7.0, 9.0), (7.0, 9.0));
     }
 }
