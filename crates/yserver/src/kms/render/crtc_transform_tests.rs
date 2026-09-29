@@ -310,12 +310,11 @@ fn root_get_image_reads_the_transformed_output_in_root_space() {
     }
 }
 
-#[test]
-#[ignore = "needs live Vulkan ICD"]
-fn the_cursor_is_software_on_every_output_and_scales_with_the_content() {
-    let Some(mut b) = transformed_pair(scale(0x20000, Some(Filter::Nearest)), (192, 96)) else {
-        return;
-    };
+/// The opaque colour of the 4×4 test cursor.
+const SPRITE: [u8; 3] = [0x11, 0x22, 0xee];
+
+/// Register an opaque 4×4 [`SPRITE`] cursor with its hotspot at the top left.
+fn register_test_cursor(b: &mut KmsBackend) {
     let sprite = b.create_pixmap(None, 32, 4, 4).expect("sprite").as_raw();
     b.put_image(
         None,
@@ -340,6 +339,15 @@ fn the_cursor_is_software_on_every_output_and_scales_with_the_content() {
         record_version: 1,
         bgra_bytes: None,
     });
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn the_cursor_is_software_on_every_output_and_scales_with_the_content() {
+    let Some(mut b) = transformed_pair(scale(0x20000, Some(Filter::Nearest)), (192, 96)) else {
+        return;
+    };
+    register_test_cursor(&mut b);
     for (output_idx, at) in [(0, (10.0, 10.0)), (1, (72.0, 8.0))] {
         (b.core.cursor_x, b.core.cursor_y) = at;
         let assignment = b.scene.cursor_assignment_for_tests(
@@ -357,8 +365,73 @@ fn the_cursor_is_software_on_every_output_and_scales_with_the_content() {
     // Drawn into the intermediate at root (72, 8), so scanout (4, 4) shows
     // it and scanout (6, 6) — root (76, 12) — does not.
     let out = compose_right(&mut b);
-    assert_eq!(scanout_px(&out, 4, 4)[..3], [0x11, 0x22, 0xee]);
+    assert_eq!(scanout_px(&out, 4, 4)[..3], SPRITE);
     assert_eq!(scanout_px(&out, 6, 6)[..3], pattern(76, 12)[..3]);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn root_reads_never_see_the_software_cursor() {
+    // Xorg's misprite takes a software cursor off the screen before any
+    // window read that overlaps it (`miSpriteSourceValidate`).
+    let Some(mut b) = transformed_pair(scale(0x20000, Some(Filter::Nearest)), (192, 96)) else {
+        return;
+    };
+    register_test_cursor(&mut b);
+    let root_xid = b.core.window_id;
+
+    // Transformed: the sprite at root (72, 8) is on the scanout, scaled, but
+    // a root GetImage over and around it returns the pattern.
+    (b.core.cursor_x, b.core.cursor_y) = (72.0, 8.0);
+    let out = compose_right(&mut b);
+    assert_eq!(scanout_px(&out, 4, 4)[..3], SPRITE, "scanout keeps it");
+    assert_eq!(scanout_px(&out, 5, 5)[..3], SPRITE);
+    let got = b
+        .get_image_pixels_for_tests(root_xid, 2, 70, 6, 8, 8, !0)
+        .expect("get_image")
+        .expect("bytes");
+    for y in 0..8u32 {
+        for x in 0..8u32 {
+            let i = ((y * 8 + x) * 4) as usize;
+            assert_eq!(
+                got[i..i + 3],
+                pattern(70 + x, 6 + y)[..3],
+                "root ({}, {})",
+                70 + x,
+                6 + y
+            );
+        }
+    }
+    // Moved off: the next compose's save replaces the old one.
+    (b.core.cursor_x, b.core.cursor_y) = (100.0, 40.0);
+    let _ = compose_right(&mut b);
+    let got = b
+        .get_image_pixels_for_tests(root_xid, 2, 100, 40, 4, 4, !0)
+        .expect("get_image")
+        .expect("bytes");
+    assert_eq!(got[..3], pattern(100, 40)[..3]);
+
+    // Identity: the BO shows it at (10, 10); a read of the BO does not.
+    (b.core.cursor_x, b.core.cursor_y) = (10.0, 10.0);
+    let (bo, read) =
+        b.scene
+            .compose_identity_for_tests(&b.core, &mut b.store, &b.windows, &b.platform, 0);
+    for y in 8..16u32 {
+        for x in 8..16u32 {
+            let under = (10..14).contains(&x) && (10..14).contains(&y);
+            let want = if under {
+                SPRITE
+            } else {
+                pattern(x, y)[..3].try_into().unwrap()
+            };
+            assert_eq!(scanout_px(&bo, x, y)[..3], want, "BO ({x}, {y})");
+            assert_eq!(
+                scanout_px(&read, x, y)[..3],
+                pattern(x, y)[..3],
+                "read ({x}, {y})"
+            );
+        }
+    }
 }
 
 /// Two 2560×1440 outputs side by side with their RANDR rows, as muffin

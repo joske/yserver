@@ -10,6 +10,7 @@ pub(crate) mod batch_resource;
 pub(crate) mod completion_poller;
 pub(crate) mod composite_pool_ring;
 pub(crate) mod cursor;
+pub(crate) mod cursor_save;
 pub(crate) mod descriptor_pool_ring;
 pub(crate) mod engine;
 pub(crate) mod export_holders;

@@ -17520,7 +17520,15 @@ fn read_scanout_region_named(
     // SAFETY: the buffer is mapped for at least `needed_bytes`, the copy's
     // fence has signalled, and `invalidate_for_read` made its writes visible.
     let raw = unsafe { std::slice::from_raw_parts(staging_mapped.as_ptr(), needed_bytes) };
-    Ok((raw.to_vec(), source))
+    let mut bytes = raw.to_vec();
+    // Reads never see a software cursor, as on Xorg (mi/misprite.c); a dump
+    // shows the screen as it is.
+    if selection == ScanoutReadSelection::OnScreenOnly {
+        backend
+            .scene
+            .restore_under_cursor(image, local_rect, &mut bytes);
+    }
+    Ok((bytes, source))
 }
 
 /// Return the platform's reusable scanout-readback command buffer and fence,
