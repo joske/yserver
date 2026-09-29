@@ -915,6 +915,7 @@ mod tests {
             num_preferred: 1,
             pending_transform: Default::default(),
             current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         }];
         backend.randr_modes = vec![RandrMode {
             mode_id: 0x42,

@@ -188,6 +188,91 @@ impl CrtcTransform {
     }
 }
 
+/// `RR_Rotate_0` … `RR_Reflect_Y` (randr.h).
+pub const RR_ROTATE_0: u16 = 1;
+pub const RR_ROTATE_90: u16 = 2;
+pub const RR_ROTATE_180: u16 = 4;
+pub const RR_ROTATE_270: u16 = 8;
+pub const RR_REFLECT_X: u16 = 16;
+pub const RR_REFLECT_Y: u16 = 32;
+
+/// Every CRTC's `rotations`: what modesetting advertises through
+/// `xf86RandR12SetRotations` (xf86Crtc.c:832), measured 0x3f
+/// (`tools/vng-scenarios/xrandr-rotate.sh`).
+pub const SUPPORTED_ROTATIONS: u16 =
+    RR_ROTATE_0 | RR_ROTATE_90 | RR_ROTATE_180 | RR_ROTATE_270 | RR_REFLECT_X | RR_REFLECT_Y;
+
+/// Whether `rotation` swaps the mode's width and height.
+#[must_use]
+pub fn rotation_swaps_axes(rotation: u16) -> bool {
+    rotation & (RR_ROTATE_90 | RR_ROTATE_270) != 0
+}
+
+/// `RRTransformCompute` (rrtransform.c:137-270) without the CRTC's x/y
+/// translation: the rotation and reflection of a `mode_w`×`mode_h` CRTC,
+/// then the client transform, in pixman's fixed point. Scanout pixel →
+/// framebuffer pixel relative to the CRTC origin; filter and params are the
+/// client's. `None` when pixman's multiply overflows (Xorg then falls back
+/// to a rescaled projective matrix, which is not rendered here).
+#[must_use]
+pub fn crtc_matrix(
+    rotation: u16,
+    mode_w: u16,
+    mode_h: u16,
+    client: &CrtcTransform,
+) -> Option<CrtcTransform> {
+    if rotation == RR_ROTATE_0 {
+        return Some(client.clone());
+    }
+    let f = |v: i32| v << 16;
+    let (w, h) = (i32::from(mode_w), i32::from(mode_h));
+    // (cos, sin, dx, dy) per rotation; default is Rotate_0.
+    let (cos, sin, rot_dx, rot_dy) = match rotation & 0xf {
+        RR_ROTATE_90 => (0, 1, h, 0),
+        RR_ROTATE_180 => (-1, 0, w, h),
+        RR_ROTATE_270 => (0, -1, 0, w),
+        _ => (1, 0, 0, 0),
+    };
+    let upright = rotation & (RR_ROTATE_0 | RR_ROTATE_180) != 0;
+    let (scale_x, scale_dx) = if rotation & RR_REFLECT_X != 0 {
+        (-1, if upright { w } else { h })
+    } else {
+        (1, 0)
+    };
+    let (scale_y, scale_dy) = if rotation & RR_REFLECT_Y != 0 {
+        (-1, if upright { h } else { w })
+    } else {
+        (1, 0)
+    };
+    // pixman_transform_rotate/translate/scale pre-multiply `forward`.
+    let rotate = [f(cos), -f(sin), 0, f(sin), f(cos), 0, 0, 0, FIXED_ONE];
+    let translate = |dx: i32, dy: i32| [FIXED_ONE, 0, f(dx), 0, FIXED_ONE, f(dy), 0, 0, FIXED_ONE];
+    let reflect = [f(scale_x), 0, 0, 0, f(scale_y), 0, 0, 0, FIXED_ONE];
+    let mut m = rotate;
+    m = fixed_multiply(&translate(rot_dx, rot_dy), &m)?;
+    m = fixed_multiply(&reflect, &m)?;
+    m = fixed_multiply(&translate(scale_dx, scale_dy), &m)?;
+    m = fixed_multiply(&client.matrix, &m)?;
+    CrtcTransform::new(m, client.filter, client.params.clone())
+}
+
+/// `pixman_transform_multiply`: `l · r`, each product rounded to 16.16,
+/// `None` outside 48.16's `pixman_fixed_t` range.
+fn fixed_multiply(l: &[i32; 9], r: &[i32; 9]) -> Option<[i32; 9]> {
+    let mut d = [0i32; 9];
+    for dy in 0..3 {
+        for dx in 0..3 {
+            let mut v = 0i64;
+            for o in 0..3 {
+                let partial = i64::from(l[dy * 3 + o]) * i64::from(r[o * 3 + dx]);
+                v += (partial + 0x8000) >> 16;
+            }
+            d[dy * 3 + dx] = i32::try_from(v).ok()?;
+        }
+    }
+    Some(d)
+}
+
 fn matrix_is_identity(m: &[i32; 9]) -> bool {
     let within = |a: i32, b: i32| (i64::from(a) - i64::from(b)).abs() <= 2;
     within(m[0], m[4])
@@ -516,6 +601,75 @@ mod tests {
         assert!(!a.equivalent(&b));
         assert!(!a.equivalent(&CrtcTransform::identity()));
         assert_eq!(a.applied(), a);
+    }
+
+    /// `RRTransformCompute`'s matrix for `rotation` over identity, row-major
+    /// affine rows in whole pixels.
+    fn rotated(rotation: u16, client: &CrtcTransform) -> [i32; 9] {
+        crtc_matrix(rotation, 1280, 800, client).unwrap().matrix
+    }
+
+    #[test]
+    fn rotation_matrices_follow_rrtransform_compute() {
+        // rrtransform.c:167-253 for a 1280×800 mode, derived by hand: the
+        // rotation (cos, sin) with its (dx, dy), then the reflection's scale
+        // and translation, each pre-multiplied (pixman_transform_rotate etc.).
+        let id = CrtcTransform::identity();
+        let (o, w, h) = (FIXED_ONE, 1280 << 16, 800 << 16);
+        for (rotation, want) in [
+            (RR_ROTATE_90, [0, -o, h, o, 0, 0]),
+            (RR_ROTATE_180, [-o, 0, w, 0, -o, h]),
+            (RR_ROTATE_270, [0, o, 0, -o, 0, w]),
+            (RR_ROTATE_0 | RR_REFLECT_X, [-o, 0, w, 0, o, 0]),
+            (RR_ROTATE_0 | RR_REFLECT_Y, [o, 0, 0, 0, -o, h]),
+            (
+                RR_ROTATE_0 | RR_REFLECT_X | RR_REFLECT_Y,
+                [-o, 0, w, 0, -o, h],
+            ),
+            // Reflections of a 90° CRTC translate by the swapped extent.
+            (RR_ROTATE_90 | RR_REFLECT_X, [0, o, 0, o, 0, 0]),
+            (RR_ROTATE_90 | RR_REFLECT_Y, [0, -o, h, -o, 0, w]),
+        ] {
+            let m = rotated(rotation, &id);
+            assert_eq!(m[..6], want, "rotation {rotation:#x}");
+            assert_eq!(m[6..], [0, 0, FIXED_ONE], "rotation {rotation:#x}");
+        }
+        assert_eq!(rotated(RR_ROTATE_0, &id), IDENTITY_MATRIX);
+        // The client transform applies after the rotation: C · R.
+        let m = rotated(RR_ROTATE_90, &scale(XRANDR_2, XRANDR_2));
+        assert_eq!(m[..6], [0, -2 * o, 2 * h, 2 * o, 0, 0]);
+    }
+
+    #[test]
+    fn rotated_footprints_match_xorg() {
+        // tools/vng-scenarios/xrandr-rotate.sh on Xorg 21.1.24, 1280×800:
+        // GetCrtcInfo 800×1280 for left/right, 1280×800 for inverted and
+        // every reflection, 1600×2560 for `--rotate left --scale 2x2`.
+        let id = CrtcTransform::identity();
+        for (rotation, want) in [
+            (RR_ROTATE_90, (800, 1280)),
+            (RR_ROTATE_270, (800, 1280)),
+            (RR_ROTATE_180, (1280, 800)),
+            (RR_ROTATE_0 | RR_REFLECT_X, (1280, 800)),
+            (RR_ROTATE_0 | RR_REFLECT_Y, (1280, 800)),
+            (RR_ROTATE_0 | RR_REFLECT_X | RR_REFLECT_Y, (1280, 800)),
+            (RR_ROTATE_90 | RR_REFLECT_X, (800, 1280)),
+        ] {
+            let t = crtc_matrix(rotation, 1280, 800, &id).unwrap();
+            assert!(!t.is_identity(), "rotation {rotation:#x}");
+            assert_eq!(t.footprint(1280, 800), want, "rotation {rotation:#x}");
+        }
+        let t = crtc_matrix(RR_ROTATE_90, 1280, 800, &scale(XRANDR_2, XRANDR_2)).unwrap();
+        assert_eq!(t.footprint(1280, 800), (1600, 2560));
+        assert_eq!(t.filter, None, "the client's filter, none here");
+    }
+
+    #[test]
+    fn a_rotated_matrix_that_overflows_fixed_point_is_refused() {
+        // 4 × 8192 = 32768 whole pixels leaves pixman_fixed_t.
+        let four = scale(4 * FIXED_ONE, 4 * FIXED_ONE);
+        assert!(crtc_matrix(RR_ROTATE_90, 8192, 8192, &four).is_none());
+        assert!(crtc_matrix(RR_ROTATE_90, 4096, 4096, &four).is_some());
     }
 
     #[test]

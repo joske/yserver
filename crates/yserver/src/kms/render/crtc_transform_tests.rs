@@ -464,6 +464,7 @@ fn silence_pair(transforms: [CrtcTransform; 2], root: (u16, u16)) -> (KmsBackend
             num_preferred: 1,
             pending_transform: current_transform.clone(),
             current_transform,
+            rotation: yserver_core::randr::RR_ROTATE_0,
         })
         .collect();
     (state.randr.screen_width, state.randr.screen_height) = root;
@@ -710,4 +711,200 @@ fn a_truncated_priming_compose_is_not_read() {
         pattern(80, 10)[..3],
         "without the sprite"
     );
+}
+
+/// Where scanout pixel `d` of a [`MODE`] CRTC reads, intermediate-local:
+/// `RRTransformCompute`'s matrix for `rotation` (rrtransform.c:167-253,
+/// derived by hand) through the pixel centre, nearest.
+fn rotated_source(rotation: u16, (dx, dy): (u32, u32)) -> (u32, u32) {
+    use yserver_core::randr::{
+        RR_REFLECT_X as X, RR_REFLECT_Y as Y, RR_ROTATE_0 as R0, RR_ROTATE_90 as R90,
+        RR_ROTATE_180 as R180, RR_ROTATE_270 as R270,
+    };
+    let (w, h) = (u32::from(MODE.0), u32::from(MODE.1));
+    match rotation {
+        R90 => (h - 1 - dy, dx),
+        R180 => (w - 1 - dx, h - 1 - dy),
+        R270 => (dy, w - 1 - dx),
+        r if r == R0 | X => (w - 1 - dx, dy),
+        r if r == R0 | Y => (dx, h - 1 - dy),
+        r if r == R0 | X | Y => (w - 1 - dx, h - 1 - dy),
+        r if r == R90 | X => (dy, dx),
+        r if r == R90 | Y => (h - 1 - dy, w - 1 - dx),
+        other => panic!("no reference for rotation {other:#x}"),
+    }
+}
+
+/// The right-hand output through `rotation` with `filter`: every scanout
+/// pixel shows the root pixel [`rotated_source`] names.
+fn assert_rotated_exact(rotation: u16, filter: Option<Filter>) {
+    let client =
+        CrtcTransform::new(yserver_core::randr::IDENTITY_MATRIX, filter, Vec::new()).unwrap();
+    let transform = yserver_core::randr::crtc_matrix(rotation, MODE.0, MODE.1, &client).unwrap();
+    let (fw, fh) = transform.footprint(MODE.0, MODE.1);
+    let root = (MODE.0 + fw, fh.max(MODE.1));
+    let Some(mut b) = transformed_pair(transform, root) else {
+        return;
+    };
+    let out = compose_right(&mut b);
+    for dy in 0..u32::from(MODE.1) {
+        for dx in 0..u32::from(MODE.0) {
+            let (sx, sy) = rotated_source(rotation, (dx, dy));
+            let want = pattern(u32::from(MODE.0) + sx, sy);
+            assert_eq!(
+                scanout_px(&out, dx, dy)[..3],
+                want[..3],
+                "rotation {rotation:#x} {filter:?}: scanout ({dx},{dy}) should show \
+                 intermediate ({sx},{sy})"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn rotations_and_reflections_land_where_the_matrix_says() {
+    use yserver_core::randr::{
+        RR_REFLECT_X as X, RR_REFLECT_Y as Y, RR_ROTATE_0 as R0, RR_ROTATE_90 as R90,
+        RR_ROTATE_180 as R180, RR_ROTATE_270 as R270,
+    };
+    // Unfiltered (nearest, Xorg's default picture filter) and bilinear, which
+    // samples texel centres exactly under a whole-pixel rotation.
+    for filter in [None, Some(Filter::Bilinear)] {
+        for rotation in [
+            R90,
+            R180,
+            R270,
+            R0 | X,
+            R0 | Y,
+            R0 | X | Y,
+            R90 | X,
+            R90 | Y,
+        ] {
+            assert_rotated_exact(rotation, filter);
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn rotate_left_with_scale_2_samples_as_pixman() {
+    // `xrandr --rotate left --scale 2x2`: the matrix [[0,-2,2h],[2,0,0]];
+    // pixman's centre sample of scanout (dx, dy) is (2h − 2 − 2dy, 2dx).
+    let transform = yserver_core::randr::crtc_matrix(
+        yserver_core::randr::RR_ROTATE_90,
+        MODE.0,
+        MODE.1,
+        &scale(0x20000, Some(Filter::Nearest)),
+    )
+    .unwrap();
+    assert_eq!(transform.footprint(MODE.0, MODE.1), (96, 128));
+    let Some(mut b) = transformed_pair(transform, (64 + 96, 128)) else {
+        return;
+    };
+    let out = compose_right(&mut b);
+    let h = u32::from(MODE.1);
+    for dy in 0..h {
+        for dx in 0..u32::from(MODE.0) {
+            let (sx, sy) = (2 * h - 2 - 2 * dy, 2 * dx);
+            assert_eq!(
+                scanout_px(&out, dx, dy)[..3],
+                pattern(64 + sx, sy)[..3],
+                "scanout ({dx},{dy})"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn set_crtc_config_rotates_the_right_hand_output() {
+    use yserver_protocol::x11::randr as x11randr;
+    let root = (192u16, 96u16);
+    let Some(mut b) = transformed_pair(CrtcTransform::identity(), root) else {
+        return;
+    };
+    b.platform.output_transforms.clear();
+    b.scene.sync_output_layouts(&b.platform).unwrap();
+    for output in &mut b.platform.outputs {
+        output.output.picked.width = MODE.0;
+        output.output.picked.height = MODE.1;
+        output.output.modes = vec![output.output.picked.clone()];
+    }
+    let sink = b.platform.outputs[1].key.device_key;
+    let source = b.selected_render_provider_endpoint().expect("renderer");
+    b.provider_output_sources.insert(sink, source);
+    let mut state = ServerState::new();
+    super::tests::install_client_for_render(&mut state, 5);
+    b.rebuild_randr_state(&mut state, None, false);
+    (state.randr.screen_width, state.randr.screen_height) = root;
+    let right = state
+        .randr
+        .outputs
+        .iter()
+        .find(|o| o.x == i16::try_from(MODE.0).unwrap())
+        .expect("right-hand output")
+        .clone();
+    let mut config = right.crtc_id.to_le_bytes().to_vec();
+    config.extend_from_slice(&1234u32.to_le_bytes());
+    config.extend_from_slice(&state.randr.config_timestamp.to_le_bytes());
+    config.extend_from_slice(&right.x.to_le_bytes());
+    config.extend_from_slice(&right.y.to_le_bytes());
+    config.extend_from_slice(&right.mode_id.to_le_bytes());
+    config.extend_from_slice(&yserver_core::randr::RR_ROTATE_90.to_le_bytes());
+    config.extend_from_slice(&[0; 2]);
+    config.extend_from_slice(&right.output_id.to_le_bytes());
+    randr_request(&mut b, &mut state, x11randr::RR_SET_CRTC_CONFIG, &config);
+
+    let output = state
+        .randr
+        .outputs
+        .iter()
+        .find(|o| o.crtc_id == right.crtc_id)
+        .unwrap();
+    assert_eq!(output.rotation, yserver_core::randr::RR_ROTATE_90);
+    assert!(
+        output.current_transform.is_identity(),
+        "no client transform"
+    );
+    assert_eq!(state.randr.timestamp, 1234, "lastSetTime = the request's");
+    let info = state.randr.crtc_info(right.crtc_id, 0).unwrap();
+    assert_eq!(
+        (info.width, info.height),
+        (MODE.1, MODE.0),
+        "rotated footprint"
+    );
+    assert_eq!(
+        b.platform.output_transform(1).map(|t| t.matrix),
+        Some(output.crtc_transform().matrix),
+        "the CRTC matrix drives the pass"
+    );
+    assert_eq!(b.platform.output_root_rect(1), (64, 0, 48, 64));
+
+    let out = compose_right(&mut b);
+    for (dx, dy) in [(0, 0), (63, 0), (0, 47), (63, 47), (20, 30)] {
+        let (sx, sy) = rotated_source(yserver_core::randr::RR_ROTATE_90, (dx, dy));
+        assert_eq!(
+            scanout_px(&out, dx, dy)[..3],
+            pattern(64 + sx, sy)[..3],
+            "scanout ({dx},{dy})"
+        );
+    }
+    // Root GetImage stays in framebuffer space: the unrotated root.
+    let root_xid = b.core.window_id;
+    let got = b
+        .get_image_pixels_for_tests(root_xid, 2, 64, 0, 48, 64, !0)
+        .expect("get_image")
+        .expect("bytes");
+    for y in 0..64u32 {
+        for x in 0..48u32 {
+            let i = ((y * 48 + x) * 4) as usize;
+            assert_eq!(
+                got[i..i + 3],
+                pattern(64 + x, y)[..3],
+                "root ({}, {y})",
+                64 + x
+            );
+        }
+    }
 }

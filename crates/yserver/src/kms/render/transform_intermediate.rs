@@ -218,17 +218,21 @@ pub(crate) fn composite_rect(
 }
 
 /// The scale pass constants for `transform` over an intermediate of
-/// `extent`. `transform` is a pure scale (spec D2); a missing filter samples
-/// nearest, as Xorg's default picture filter.
+/// `extent`. `transform` is the CRTC matrix: an axis-aligned rotation or
+/// reflection of a pure scale (spec D2 and its rotation addendum), so its
+/// last row is `0 0 1`. A missing filter samples nearest, as Xorg's default
+/// picture filter.
 pub(crate) fn scale_push(
     transform: &yserver_core::randr::CrtcTransform,
     extent: vk::Extent2D,
 ) -> ScalePushConsts {
     use yserver_core::randr::Filter;
+    let m = &transform.matrix;
+    let f = &transform.forward;
     #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     ScalePushConsts {
-        matrix: [transform.matrix[0] as u32, transform.matrix[4] as u32],
-        scale: [transform.forward[0] as f32, transform.forward[4] as f32],
+        matrix: [m[0], m[1], m[2], m[3], m[4], m[5]],
+        forward: [f[0], f[1], f[2], f[3], f[4], f[5]].map(|v| v as f32),
         src_size: [extent.width as f32, extent.height as f32],
         nearest: u32::from(!matches!(transform.filter, Some(Filter::Bilinear))),
         _pad: 0,

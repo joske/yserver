@@ -16,10 +16,11 @@ const FRAGMENT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/scale_pass
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ScalePushConsts {
-    /// `m11`, `m22` as the 16.16 words the client sent.
-    pub matrix: [u32; 2],
-    /// The same diagonal as floats.
-    pub scale: [f32; 2],
+    /// The affine rows `m11 m12 m13 m21 m22 m23` of the CRTC matrix
+    /// (rotation, reflection and client transform combined) as 16.16 words.
+    pub matrix: [i32; 6],
+    /// The same rows as floats.
+    pub forward: [f32; 6],
     /// Intermediate extent.
     pub src_size: [f32; 2],
     /// 1 = nearest, 0 = bilinear.
@@ -39,7 +40,7 @@ impl ScalePushConsts {
     }
 }
 
-const _: () = assert!(std::mem::size_of::<ScalePushConsts>() == 32);
+const _: () = assert!(std::mem::size_of::<ScalePushConsts>() == 64);
 
 /// The scale pass pipeline: one combined image sampler (linear,
 /// clamp-to-edge; the nearest path uses `texelFetch`), no blending.

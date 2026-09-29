@@ -711,6 +711,8 @@ pub fn encode_get_screen_info_reply(
     height: u16,
     mwidth: u16,
     mheight: u16,
+    rotation: u16,
+    rotations: u8,
 ) -> Vec<u8> {
     let n_sizes: u16 = 1;
     let n_rates: u16 = 1;
@@ -719,15 +721,13 @@ pub fn encode_get_screen_info_reply(
     let extra = usize::from(n_sizes) * 8 + usize::from(n_sizes) * refresh_record_padded;
     #[allow(clippy::cast_possible_truncation)]
     let length = (extra / 4) as u32;
-    let rotations: u8 = 1; // RR_Rotate_0 only
-
     let mut out = fixed_reply(byte_order, sequence, rotations, length);
     put(byte_order, &mut out, root);
     put(byte_order, &mut out, timestamp);
     put(byte_order, &mut out, config_timestamp);
     put(byte_order, &mut out, n_sizes);
     put(byte_order, &mut out, 0u16); // sizeID = 0 (current)
-    put(byte_order, &mut out, 1u16); // rotation = RR_Rotate_0
+    put(byte_order, &mut out, rotation);
     put(byte_order, &mut out, 60u16); // current rate = 60 Hz
     put(byte_order, &mut out, n_info);
     out.extend_from_slice(&[0u8; 2]);
@@ -1365,6 +1365,9 @@ pub fn encode_get_crtc_gamma_reply(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ScreenChangeNotify {
+    /// The first CRTC's rotation (`crtcs[0]`, rrscreen.c:100); the caller
+    /// swaps the sizes for 90/270, as `RRDeliverScreenEvent` does.
+    pub rotation: u8,
     pub timestamp: u32,
     pub config_timestamp: u32,
     pub root: u32,
@@ -1381,6 +1384,7 @@ pub struct CrtcChangeNotify {
     pub request_window: u32,
     pub crtc: u32,
     pub mode: u32,
+    pub rotation: u16,
     pub x: i16,
     pub y: i16,
     pub width: u16,
@@ -1408,6 +1412,8 @@ pub struct OutputChangeNotify {
     pub output: u32,
     pub crtc: u32,
     pub mode: u32,
+    /// The output's CRTC rotation, `RR_Rotate_0` without one.
+    pub rotation: u16,
     pub connection: u8,
 }
 
@@ -1428,7 +1434,7 @@ pub fn encode_screen_change_notify_event(
 ) -> [u8; 32] {
     let mut buf: Vec<u8> = Vec::with_capacity(32);
     buf.push(first_event + EVENT_SCREEN_CHANGE_NOTIFY);
-    buf.push(ROTATION_ROTATE_0 as u8);
+    buf.push(event.rotation);
     put(byte_order, &mut buf, sequence.0);
     put(byte_order, &mut buf, event.timestamp);
     put(byte_order, &mut buf, event.config_timestamp);
@@ -1458,7 +1464,7 @@ pub fn encode_crtc_change_notify_event(
     put(byte_order, &mut buf, event.request_window);
     put(byte_order, &mut buf, event.crtc);
     put(byte_order, &mut buf, event.mode);
-    put(byte_order, &mut buf, ROTATION_ROTATE_0);
+    put(byte_order, &mut buf, event.rotation);
     // 2 bytes of pad before x/y per spec (CRTC change notify is 32 bytes total).
     buf.extend_from_slice(&[0u8; 2]);
     put(byte_order, &mut buf, event.x);
@@ -1485,7 +1491,7 @@ pub fn encode_output_change_notify_event(
     put(byte_order, &mut buf, event.output);
     put(byte_order, &mut buf, event.crtc);
     put(byte_order, &mut buf, event.mode);
-    put(byte_order, &mut buf, ROTATION_ROTATE_0);
+    put(byte_order, &mut buf, event.rotation);
     buf.push(event.connection);
     buf.push(SUBPIXEL_UNKNOWN as u8);
     buf.try_into().expect("32-byte event")
@@ -2714,6 +2720,7 @@ mod tests {
             89,
             SequenceNumber(11),
             ScreenChangeNotify {
+                rotation: 1,
                 timestamp: 100,
                 config_timestamp: 101,
                 root: 0x100,
@@ -2746,6 +2753,7 @@ mod tests {
                 request_window: 0x100,
                 crtc: 2,
                 mode: 3,
+                rotation: 1,
                 x: 4,
                 y: 5,
                 width: 1280,
@@ -2774,6 +2782,7 @@ mod tests {
                 output: 1,
                 crtc: 2,
                 mode: 3,
+                rotation: 1,
                 connection: CONNECTION_CONNECTED,
             },
         );
@@ -2784,6 +2793,107 @@ mod tests {
         assert_eq!(&event[16..20], &1u32.to_le_bytes());
         assert_eq!(event[30], CONNECTION_CONNECTED);
         assert_eq!(event[31], 0);
+    }
+
+    #[test]
+    fn rotation_fields_encode_in_both_byte_orders() {
+        // Xorg's `--rotate left` CRTC of a 1280×800 mode (xrandr-rotate.sh):
+        // 800×1280, rotation RR_Rotate_90, rotations 0x3f.
+        for byte_order in [ClientByteOrder::LittleEndian, ClientByteOrder::BigEndian] {
+            let u16_at = |b: &[u8], o: usize| {
+                let v = [b[o], b[o + 1]];
+                match byte_order {
+                    ClientByteOrder::LittleEndian => u16::from_le_bytes(v),
+                    ClientByteOrder::BigEndian => u16::from_be_bytes(v),
+                }
+            };
+            let reply = encode_get_crtc_info_reply(
+                byte_order,
+                SequenceNumber(9),
+                &CrtcInfoReply {
+                    timestamp: 1,
+                    x: 0,
+                    y: 0,
+                    width: 800,
+                    height: 1280,
+                    mode: 0x41,
+                    rotation: 2,
+                    rotations: 0x3f,
+                    outputs: &[],
+                    possible: &[],
+                },
+            );
+            assert_eq!(
+                [16, 18, 24, 26].map(|o| u16_at(&reply, o)),
+                [800, 1280, 2, 0x3f],
+                "{byte_order:?}"
+            );
+            let crtc = encode_crtc_change_notify_event(
+                byte_order,
+                89,
+                SequenceNumber(9),
+                CrtcChangeNotify {
+                    timestamp: 1,
+                    request_window: 0x100,
+                    crtc: 0x3e,
+                    mode: 0x41,
+                    rotation: 0x12,
+                    x: 0,
+                    y: 0,
+                    width: 1280,
+                    height: 800,
+                },
+            );
+            assert_eq!(u16_at(&crtc, 20), 0x12, "{byte_order:?}");
+            let output = encode_output_change_notify_event(
+                byte_order,
+                89,
+                SequenceNumber(9),
+                OutputChangeNotify {
+                    timestamp: 1,
+                    config_timestamp: 1,
+                    request_window: 0x100,
+                    output: 0x40,
+                    crtc: 0x3e,
+                    mode: 0x41,
+                    rotation: 8,
+                    connection: CONNECTION_CONNECTED,
+                },
+            );
+            assert_eq!(u16_at(&output, 28), 8, "{byte_order:?}");
+            let screen = encode_screen_change_notify_event(
+                byte_order,
+                89,
+                SequenceNumber(9),
+                ScreenChangeNotify {
+                    rotation: 2,
+                    timestamp: 1,
+                    config_timestamp: 1,
+                    root: 0x100,
+                    request_window: 0x100,
+                    width: 1280,
+                    height: 800,
+                    width_mm: 338,
+                    height_mm: 211,
+                },
+            );
+            assert_eq!(screen[1], 2, "a CARD8");
+            let info = encode_get_screen_info_reply(
+                byte_order,
+                SequenceNumber(9),
+                0x100,
+                1,
+                1,
+                1280,
+                800,
+                338,
+                211,
+                2,
+                0x3f,
+            );
+            assert_eq!(info[1], 0x3f, "setOfRotations, a CARD8");
+            assert_eq!(u16_at(&info, 24), 2, "rotation");
+        }
     }
 
     #[test]
@@ -2799,6 +2909,7 @@ mod tests {
                 output: 1,
                 crtc: 0,
                 mode: 0,
+                rotation: 1,
                 connection: CONNECTION_DISCONNECTED,
             },
         );

@@ -147,6 +147,10 @@ pub struct CrtcConfigCompletion {
     /// time, when it differs from the current one (`RRCrtcPendingTransform`,
     /// rrcrtc.c:765).
     pub apply_transform: Option<Box<crate::randr::CrtcTransform>>,
+    /// The rotation this enable sets, when it differs from the CRTC's
+    /// (`RRCrtcSet`'s `rotation != crtc->rotation`, rrcrtc.c:749). A
+    /// disable keeps the rotation, as `xf86RandR12CrtcSet` does.
+    pub apply_rotation: Option<u16>,
 }
 
 /// Dispatch one X11 request entirely on the core thread.
@@ -3282,8 +3286,8 @@ fn handle_randr_request(
                     width: crtc_data.width,
                     height: crtc_data.height,
                     mode: crtc_data.mode_id,
-                    rotation: 1,
-                    rotations: 1,
+                    rotation: state.randr.crtc_rotation(req.crtc),
+                    rotations: crate::randr::SUPPORTED_ROTATIONS,
                     outputs: &crtc_data.outputs,
                     possible: &crtc_data.possible_outputs,
                 },
@@ -4715,6 +4719,15 @@ fn handle_randr_request(
             let height = state.randr.screen_height;
             let mwidth = u16::try_from(state.randr.width_mm).unwrap_or(u16::MAX);
             let mheight = u16::try_from(state.randr.height_mm).unwrap_or(u16::MAX);
+            // `RRFirstOutput`'s CRTC rotation, and the unrotated size
+            // (RR10GetData lists mode sizes) for 90/270.
+            let rotation = state.randr.first_output_rotation();
+            let (width, height, mwidth, mheight) = if crate::randr::rotation_swaps_axes(rotation) {
+                (height, width, mheight, mwidth)
+            } else {
+                (width, height, mwidth, mheight)
+            };
+            #[allow(clippy::cast_possible_truncation)]
             let buf = x11randr::encode_get_screen_info_reply(
                 byte_order,
                 sequence,
@@ -4725,6 +4738,9 @@ fn handle_randr_request(
                 height,
                 mwidth,
                 mheight,
+                rotation,
+                // setOfRotations is a CARD8.
+                crate::randr::SUPPORTED_ROTATIONS as u8,
             );
             let Some(client) = state.clients.get_mut(&client_id.0) else {
                 return Ok(RequestOutcome::Handled);
@@ -4945,8 +4961,8 @@ fn handle_randr_request(
                         RANDR_MAJOR_OPCODE,
                     );
                 }
-                if rotation != 1 {
-                    // RR_Rotate_0 only — our CRTC is identity-only.
+                if !crate::randr::SUPPORTED_ROTATIONS & rotation != 0 {
+                    // `(~crtc->rotations) & rotation` (rrcrtc.c:1403).
                     return emit_x11_error_with_minor(
                         state,
                         client_id,
@@ -4985,6 +5001,30 @@ fn handle_randr_request(
                     .pending_transform
                     .equivalent(&output_row.current_transform))
             .then(|| Box::new(output_row.pending_transform.applied()));
+            let apply_rotation =
+                (resolved.is_some() && rotation != output_row.rotation).then_some(rotation);
+            // The combined matrix drives the footprint and the scale pass; a
+            // pixman overflow (Xorg's rescaled projective fallback) is not
+            // rendered.
+            if let Some(m) = resolved
+                && crate::randr::crtc_matrix(
+                    rotation,
+                    m.width,
+                    m.height,
+                    &output_row.pending_transform.applied(),
+                )
+                .is_none()
+            {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_MATCH,
+                    u32::from(rotation),
+                    u16::from(header.data),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
             let mode_spec = resolved.map(|m| ModeSpec {
                 width: m.width,
                 height: m.height,
@@ -5003,6 +5043,7 @@ fn handle_randr_request(
                 output_bbox_before,
                 byte_order,
                 apply_transform,
+                apply_rotation,
             };
             match backend.begin_crtc_config(
                 output_id,
@@ -5276,7 +5317,11 @@ pub(crate) fn complete_crtc_config(
 ) -> io::Result<RequestOutcome> {
     let status = match result {
         // A new transform is a change even with identical mode/x/y.
-        Ok(changed) if changed || completion.apply_transform.is_some() => {
+        Ok(changed)
+            if changed
+                || completion.apply_transform.is_some()
+                || completion.apply_rotation.is_some() =>
+        {
             // Something actually changed. Single rebuild path: a CRTC set
             // bumps lastSetTime (to the client timestamp) but NOT
             // lastConfigTime.
@@ -5290,6 +5335,15 @@ pub(crate) fn complete_crtc_config(
             {
                 // RRCrtcNotify: RRTransformCopy of pending into current.
                 output.current_transform = *transform;
+            }
+            if let Some(rotation) = completion.apply_rotation
+                && let Some(output) = state
+                    .randr
+                    .outputs
+                    .iter_mut()
+                    .find(|o| o.output_id == completion.output_id)
+            {
+                output.rotation = rotation;
             }
             backend.randr_layout_changed(state);
             let changed: Vec<(u32, u32, u32)> = state
@@ -33696,6 +33750,7 @@ mod tests {
             num_preferred: 1,
             pending_transform: Default::default(),
             current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         }
     }
 
@@ -34718,6 +34773,7 @@ mod tests {
                 num_preferred: 1,
                 pending_transform: Default::default(),
                 current_transform: Default::default(),
+                rotation: crate::randr::RR_ROTATE_0,
             },
             crate::randr::RandrOutput {
                 name: "HDMI-A-1".into(),
@@ -34737,6 +34793,7 @@ mod tests {
                 num_preferred: 1,
                 pending_transform: Default::default(),
                 current_transform: Default::default(),
+                rotation: crate::randr::RR_ROTATE_0,
             },
         ];
 
@@ -34776,6 +34833,7 @@ mod tests {
                 num_preferred: 1,
                 pending_transform: Default::default(),
                 current_transform: Default::default(),
+                rotation: crate::randr::RR_ROTATE_0,
             };
         let mut state = ServerState::new();
         state.randr = crate::randr::RandrState::from_outputs(
@@ -37776,6 +37834,99 @@ mod tests {
         );
     }
 
+    fn randr_get_crtc_info(state: &mut ServerState, peer: &mut UnixStream, crtc: u32) -> Vec<u8> {
+        let mut backend = RecordingBackend::new();
+        let body = [crtc.to_le_bytes(), 0u32.to_le_bytes()].concat();
+        handle_randr_request(
+            state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(4),
+            RequestHeader {
+                opcode: 128,
+                data: yserver_protocol::x11::randr::RR_GET_CRTC_INFO,
+                length_units: 3,
+            },
+            &body,
+        )
+        .expect("GetCrtcInfo");
+        read_all_available(peer)
+    }
+
+    #[test]
+    fn randr_set_crtc_config_rotation_is_a_change_reported_as_xorg() {
+        use crate::randr::{RR_REFLECT_X, RR_ROTATE_0, RR_ROTATE_90};
+        let mut state = ServerState::new();
+        let output = state.randr.outputs[0].clone();
+        let (crtc, mode) = (output.crtc_id, output.mode_id);
+        let mut peer = install_client(&mut state, 1);
+        state.randr_select_masks.insert(
+            (1, crate::resources::ROOT_WINDOW),
+            yserver_protocol::x11::randr::NOTIFY_MASK_CRTC_CHANGE,
+        );
+        let mut backend = RecordingBackend::new();
+        let rotated = |rotation: u16| {
+            let mut body =
+                randr_crtc_config_body(crtc, output.x, output.y, mode, &[output.output_id]);
+            body[20..22].copy_from_slice(&rotation.to_le_bytes());
+            body
+        };
+        let u16_at = |c: &[u8], o: usize| u16::from_le_bytes(c[o..o + 2].try_into().unwrap());
+
+        // `xrandr --rotate left`: same mode and origin, a new rotation.
+        randr_set_crtc_config(&mut state, &mut backend, &rotated(RR_ROTATE_90)).unwrap();
+        let wire = read_all_available(&mut peer);
+        let (notifies, success) = randr_crtc_notifies_and_success(&wire);
+        assert!(success);
+        assert_eq!(
+            notifies,
+            vec![(output.width, output.height)],
+            "CrtcChangeNotify keeps the mode size (rrcrtc.c:249)"
+        );
+        let notify = wire.chunks_exact(32).find(|c| c[0] == 90).unwrap();
+        assert_eq!(u16_at(notify, 20), RR_ROTATE_90, "and carries the rotation");
+        assert_eq!(state.randr.outputs[0].rotation, RR_ROTATE_90);
+        assert!(state.randr.outputs[0].current_transform.is_identity());
+
+        // GetCrtcInfo: the rotated footprint, rotation and modesetting's
+        // rotations 0x3f (measured, tools/vng-scenarios/xrandr-rotate.sh).
+        let reply = randr_get_crtc_info(&mut state, &mut peer, crtc);
+        assert_eq!(reply[0], 1);
+        assert_eq!(
+            (u16_at(&reply, 16), u16_at(&reply, 18)),
+            (output.height, output.width)
+        );
+        assert_eq!(u16_at(&reply, 24), RR_ROTATE_90);
+        assert_eq!(u16_at(&reply, 26), 0x3f);
+
+        // The same rotation again is a no-op.
+        randr_set_crtc_config(&mut state, &mut backend, &rotated(RR_ROTATE_90)).unwrap();
+        let (notifies, _) = randr_crtc_notifies_and_success(&read_all_available(&mut peer));
+        assert!(notifies.is_empty());
+
+        // A reflection bit is a change too.
+        randr_set_crtc_config(
+            &mut state,
+            &mut backend,
+            &rotated(RR_ROTATE_90 | RR_REFLECT_X),
+        )
+        .unwrap();
+        let (notifies, _) = randr_crtc_notifies_and_success(&read_all_available(&mut peer));
+        assert_eq!(notifies.len(), 1);
+        assert_eq!(state.randr.outputs[0].rotation, RR_ROTATE_90 | RR_REFLECT_X);
+
+        // A disable keeps the rotation, as xf86RandR12CrtcSet does.
+        randr_set_crtc_config(
+            &mut state,
+            &mut backend,
+            &randr_crtc_config_body(crtc, 0, 0, 0, &[]),
+        )
+        .unwrap();
+        let _ = read_all_available(&mut peer);
+        assert_eq!(state.randr.outputs[0].rotation, RR_ROTATE_90 | RR_REFLECT_X);
+        assert_ne!(state.randr.outputs[0].rotation, RR_ROTATE_0);
+    }
+
     #[test]
     fn an_asynchronous_crtc_config_applies_the_transform_pending_at_request_time() {
         let mut state = ServerState::new();
@@ -37848,6 +37999,7 @@ mod tests {
             num_preferred: 1,
             pending_transform: Default::default(),
             current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         }
     }
 
@@ -47664,6 +47816,7 @@ mod tests {
                 num_preferred: 1,
                 pending_transform: Default::default(),
                 current_transform: Default::default(),
+                rotation: crate::randr::RR_ROTATE_0,
             }],
         );
         let expected = current_vidmode_mode_line(&state).expect("active RandR mode");
@@ -64013,8 +64166,8 @@ mod tests {
     ///    → reply status=0.
     /// 3. bad mode (555 not in output's mode_ids)
     ///    → X11 error BadMatch (type byte = 0).
-    /// 4. bad rotation (rotation=2, i.e. RR_Rotate_90 which we don't support)
-    ///    → X11 error BadMatch (type byte = 0; rotation valid but not identity).
+    /// 4. bad rotation (0x41: a bit outside the CRTC's `rotations` 0x3f)
+    ///    → X11 error BadMatch (type byte = 0).
     #[test]
     fn randr_set_crtc_config_validates_mode_id() {
         use crate::randr::{RandrMode, RandrOutput, RandrState};
@@ -64046,6 +64199,7 @@ mod tests {
                 num_preferred: 1,
                 pending_transform: Default::default(),
                 current_transform: Default::default(),
+                rotation: crate::randr::RR_ROTATE_0,
             },
             // Equal connector names are legal across different DRM devices.
             // Address this second row by CRTC/XID to prove the core never
@@ -64068,6 +64222,7 @@ mod tests {
                 num_preferred: 1,
                 pending_transform: Default::default(),
                 current_transform: Default::default(),
+                rotation: crate::randr::RR_ROTATE_0,
             },
         ];
         let mut state = ServerState::new();
@@ -64131,17 +64286,16 @@ mod tests {
         )
         .expect("bad mode → error");
 
-        // (4) Bad rotation (valid code but not RR_Rotate_0):
-        // rotation=2 (RR_Rotate_90) is valid but our CRTC is identity-only.
-        // validate_set_crtc_config succeeds (mode 3 known), then rotation check
-        // fires BadMatch.
+        // (4) Bad rotation: RR_Rotate_0 plus bit 6, which no CRTC
+        // advertises. validate_set_crtc_config succeeds (mode 3 known), then
+        // `(~crtc->rotations) & rotation` fires BadMatch (rrcrtc.c:1403).
         handle_randr_request(
             &mut state,
             &mut backend,
             ClientId(CLIENT_ID),
             SequenceNumber(4),
             header,
-            &build_body(3, 2, &[4]),
+            &build_body(3, 0x41, &[4]),
         )
         .expect("bad rotation → error");
 
@@ -64249,6 +64403,7 @@ mod tests {
             num_preferred: 1,
             pending_transform: Default::default(),
             current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         }];
         let mut state = ServerState::new();
         state.randr = RandrState::from_outputs(1, outputs);
@@ -64311,6 +64466,7 @@ mod tests {
             num_preferred: 1,
             pending_transform: Default::default(),
             current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         }];
         let mut state = ServerState::new();
         state.randr = RandrState::from_outputs(1, outputs);
@@ -64393,6 +64549,7 @@ mod tests {
             num_preferred: 1,
             pending_transform: Default::default(),
             current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         }];
         let mut state = ServerState::new();
         state.randr = RandrState::from_outputs(1, outputs);
@@ -76907,6 +77064,7 @@ mod tests {
             num_preferred: 1,
             pending_transform: Default::default(),
             current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         }];
         let mut state = ServerState::new();
         state.randr = RandrState::from_outputs(0, outputs);
@@ -76997,6 +77155,7 @@ mod tests {
             num_preferred: 1,
             pending_transform: Default::default(),
             current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         }];
         let mut state = ServerState::new();
         state.randr = RandrState::from_outputs(0, outputs);
@@ -77222,6 +77381,7 @@ mod tests {
             num_preferred: 1,
             pending_transform: Default::default(),
             current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         }];
         let mut state = ServerState::new();
         state.randr = RandrState::from_outputs(0, outputs);

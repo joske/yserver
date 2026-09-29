@@ -8878,6 +8878,7 @@ impl KmsBackend {
                 num_preferred,
                 pending_transform: Default::default(),
                 current_transform: Default::default(),
+                rotation: yserver_core::randr::RR_ROTATE_0,
             });
         }
 
@@ -8987,6 +8988,7 @@ impl KmsBackend {
                 num_preferred,
                 pending_transform: Default::default(),
                 current_transform: Default::default(),
+                rotation: yserver_core::randr::RR_ROTATE_0,
             });
         }
         outs.sort_by_key(|o| o.output_id);
@@ -21469,14 +21471,17 @@ impl Backend for KmsBackend {
             (self.platform.fb_w, self.platform.fb_h) = root;
             self.update_input_extent(root.0, root.1);
         }
+        // Rotation and reflection combined with the client transform, as
+        // `RRTransformCompute`: one matrix for footprint, pass and readback.
         let transforms: HashMap<OutputKey, yserver_core::randr::CrtcTransform> = state
             .randr
             .outputs
             .iter()
-            .filter(|o| !o.current_transform.is_identity())
-            .filter_map(|o| {
+            .map(|o| (o, o.crtc_transform()))
+            .filter(|(_, t)| !t.is_identity())
+            .filter_map(|(o, t)| {
                 let key = self.output_key_by_id.get(&o.output_id)?.clone();
-                Some((key, o.current_transform.clone()))
+                Some((key, t))
             })
             .collect();
         let transforms_changed = transforms != self.platform.output_transforms;

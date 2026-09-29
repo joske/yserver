@@ -491,6 +491,7 @@ impl HostX11Backend {
             num_preferred: 1,
             pending_transform: Default::default(),
             current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         }];
         // Exactly what `ServerState::with_randr_outputs` used to derive
         // for this output set, so the nested screen is byte-identical.

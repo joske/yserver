@@ -637,6 +637,7 @@ impl PendingBackendRequests {
                     output_bbox_before: None,
                     byte_order: yserver_protocol::x11::ClientByteOrder::LittleEndian,
                     apply_transform: None,
+                    apply_rotation: None,
                 },
             },
             request_wire_bytes: 0,
@@ -2483,12 +2484,9 @@ pub(crate) fn notify_randr_layout_changed(state: &mut ServerState, changed_outpu
 
     let timestamp = state.randr.timestamp;
     let config_timestamp = state.randr.config_timestamp;
-    let width = state.randr.screen_width;
-    let height = state.randr.screen_height;
-    let width_mm = u16::try_from(state.randr.width_mm).unwrap_or(u16::MAX);
-    let height_mm = u16::try_from(state.randr.height_mm).unwrap_or(u16::MAX);
+    let (screen_rotation, width, height, width_mm, height_mm) = state.randr.screen_change_fields();
     // Resolve each changed output's current crtc/mode for the notify payload.
-    let changed: Vec<(u32, u32, u32, u8)> = changed_outputs
+    let changed: Vec<(u32, u32, u32, u8, u16)> = changed_outputs
         .iter()
         .filter_map(|id| {
             state
@@ -2505,6 +2503,11 @@ pub(crate) fn notify_randr_layout_changed(state: &mut ServerState, changed_outpu
                             x11randr::CONNECTION_CONNECTED
                         } else {
                             x11randr::CONNECTION_DISCONNECTED
+                        },
+                        if o.mode_id != 0 {
+                            o.rotation
+                        } else {
+                            crate::randr::RR_ROTATE_0
                         },
                     )
                 })
@@ -2527,6 +2530,7 @@ pub(crate) fn notify_randr_layout_changed(state: &mut ServerState, changed_outpu
                 RANDR_FIRST_EVENT,
                 sequence,
                 x11randr::ScreenChangeNotify {
+                    rotation: screen_rotation,
                     timestamp,
                     config_timestamp,
                     root: crate::resources::ROOT_WINDOW.0,
@@ -2545,7 +2549,7 @@ pub(crate) fn notify_randr_layout_changed(state: &mut ServerState, changed_outpu
             let _ = client_io::write_or_buffer(client, &event);
         }
         if mask & x11randr::NOTIFY_MASK_OUTPUT_CHANGE != 0 {
-            for &(output, crtc, mode, connection) in &changed {
+            for &(output, crtc, mode, connection, rotation) in &changed {
                 let event = x11randr::encode_output_change_notify_event(
                     client.byte_order,
                     RANDR_FIRST_EVENT,
@@ -2557,6 +2561,7 @@ pub(crate) fn notify_randr_layout_changed(state: &mut ServerState, changed_outpu
                         output,
                         crtc,
                         mode,
+                        rotation,
                         connection,
                     },
                 );
@@ -2891,21 +2896,18 @@ fn emit_randr_change_notifications_split(
 
     let timestamp = state.randr.timestamp;
     let config_timestamp = state.randr.config_timestamp;
-    let width = state.randr.screen_width;
-    let height = state.randr.screen_height;
-    let width_mm = u16::try_from(state.randr.width_mm).unwrap_or(u16::MAX);
-    let height_mm = u16::try_from(state.randr.height_mm).unwrap_or(u16::MAX);
+    let (screen_rotation, width, height, width_mm, height_mm) = state.randr.screen_change_fields();
     // Per-CRTC geometry (position AND mode size). CrtcChangeNotify must
     // report each CRTC's own mode dimensions — NOT the logical screen
     // size — or a multi-monitor client sees every CRTC as e.g. 5120×1440
     // instead of its real 2560×1440. An off CRTC (no mode) reports 0×0.
-    let crtc_geom: std::collections::HashMap<u32, (i16, i16, u16, u16)> = state
+    let crtc_geom: std::collections::HashMap<u32, (i16, i16, u16, u16, u16)> = state
         .randr
         .outputs
         .iter()
-        .map(|o| (o.crtc_id, (o.x, o.y, o.width, o.height)))
+        .map(|o| (o.crtc_id, (o.x, o.y, o.width, o.height, o.rotation)))
         .collect();
-    let output_states: std::collections::HashMap<u32, (u8, u32)> = state
+    let output_states: std::collections::HashMap<u32, (u8, u32, u16)> = state
         .randr
         .outputs
         .iter()
@@ -2922,6 +2924,11 @@ fn emit_randr_change_notifications_split(
                         output.crtc_id
                     } else {
                         0
+                    },
+                    if output.mode_id != 0 {
+                        output.rotation
+                    } else {
+                        crate::randr::RR_ROTATE_0
                     },
                 ),
             )
@@ -2944,6 +2951,7 @@ fn emit_randr_change_notifications_split(
                 RANDR_FIRST_EVENT,
                 sequence,
                 x11randr::ScreenChangeNotify {
+                    rotation: screen_rotation,
                     timestamp,
                     config_timestamp,
                     root: crate::resources::ROOT_WINDOW.0,
@@ -2965,7 +2973,13 @@ fn emit_randr_change_notifications_split(
         // subscriber; do not interleave the two event classes per output.
         if mask & x11randr::NOTIFY_MASK_CRTC_CHANGE != 0 {
             for &(_output, crtc, mode) in crtc_changed {
-                let (x, y, crtc_w, crtc_h) = crtc_geom.get(&crtc).copied().unwrap_or((0, 0, 0, 0));
+                let (x, y, crtc_w, crtc_h, rotation) = crtc_geom.get(&crtc).copied().unwrap_or((
+                    0,
+                    0,
+                    0,
+                    0,
+                    crate::randr::RR_ROTATE_0,
+                ));
                 let event = x11randr::encode_crtc_change_notify_event(
                     client.byte_order,
                     RANDR_FIRST_EVENT,
@@ -2975,6 +2989,7 @@ fn emit_randr_change_notifications_split(
                         request_window: request_window.0,
                         crtc,
                         mode,
+                        rotation,
                         x,
                         y,
                         width: crtc_w,
@@ -2991,10 +3006,12 @@ fn emit_randr_change_notifications_split(
         }
         if mask & x11randr::NOTIFY_MASK_OUTPUT_CHANGE != 0 {
             for &(output, projected_crtc, projected_mode) in output_changed {
-                let (connection, current_crtc) = output_states
-                    .get(&output)
-                    .copied()
-                    .unwrap_or((x11randr::CONNECTION_CONNECTED, projected_crtc));
+                let (connection, current_crtc, rotation) =
+                    output_states.get(&output).copied().unwrap_or((
+                        x11randr::CONNECTION_CONNECTED,
+                        projected_crtc,
+                        crate::randr::RR_ROTATE_0,
+                    ));
                 let event = x11randr::encode_output_change_notify_event(
                     client.byte_order,
                     RANDR_FIRST_EVENT,
@@ -3006,6 +3023,7 @@ fn emit_randr_change_notifications_split(
                         output,
                         crtc: current_crtc,
                         mode: projected_mode,
+                        rotation,
                         connection,
                     },
                 );
@@ -4102,6 +4120,7 @@ mod tests {
                         output_bbox_before: None,
                         byte_order: ClientByteOrder::LittleEndian,
                         apply_transform: None,
+                        apply_rotation: None,
                     },
                 },
                 request_wire_bytes: 28,
@@ -4235,6 +4254,7 @@ mod tests {
             output_bbox_before: enabled_output_bbox(&state),
             byte_order: ClientByteOrder::LittleEndian,
             apply_transform: None,
+            apply_rotation: None,
         };
         let continuation = PendingCrtcConfig {
             token,
