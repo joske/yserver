@@ -33546,6 +33546,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![crtc_id.wrapping_add(0x1000)],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         }
     }
 
@@ -34566,6 +34568,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![1],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
             crate::randr::RandrOutput {
                 name: "HDMI-A-1".into(),
@@ -34583,6 +34587,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![1],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
         ];
 
@@ -46137,6 +46143,8 @@ mod tests {
                 mm_height: 340,
                 mode_ids: vec![3],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             }],
         );
         let expected = current_vidmode_mode_line(&state).expect("active RandR mode");
@@ -62517,6 +62525,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![3],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
             // Equal connector names are legal across different DRM devices.
             // Address this second row by CRTC/XID to prove the core never
@@ -62537,6 +62547,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![3],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
         ];
         let mut state = ServerState::new();
@@ -62716,6 +62728,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         }];
         let mut state = ServerState::new();
         state.randr = RandrState::from_outputs(1, outputs);
@@ -62776,6 +62790,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         }];
         let mut state = ServerState::new();
         state.randr = RandrState::from_outputs(1, outputs);
@@ -62856,6 +62872,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         }];
         let mut state = ServerState::new();
         state.randr = RandrState::from_outputs(1, outputs);
@@ -75368,6 +75386,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         }];
         let mut state = ServerState::new();
         state.randr = RandrState::from_outputs(0, outputs);
@@ -75456,6 +75476,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         }];
         let mut state = ServerState::new();
         state.randr = RandrState::from_outputs(0, outputs);
@@ -75679,6 +75701,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         }];
         let mut state = ServerState::new();
         state.randr = RandrState::from_outputs(0, outputs);

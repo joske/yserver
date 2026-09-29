@@ -489,6 +489,8 @@ impl HostX11Backend {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         }];
         // Exactly what `ServerState::with_randr_outputs` used to derive
         // for this output set, so the nested screen is byte-identical.

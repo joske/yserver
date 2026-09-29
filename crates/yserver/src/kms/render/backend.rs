@@ -8841,6 +8841,8 @@ impl KmsBackend {
                 mm_height: if connected { mm_height } else { 0 },
                 mode_ids,
                 num_preferred,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             });
         }
 
@@ -8948,6 +8950,8 @@ impl KmsBackend {
                 },
                 mode_ids,
                 num_preferred,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             });
         }
         outs.sort_by_key(|o| o.output_id);
@@ -8992,6 +8996,7 @@ impl KmsBackend {
             state.randr.width_mm,
             state.randr.height_mm,
         );
+        let prev_transforms = state.randr.crtc_transforms();
         let (outputs, mode_table) = self.randr_outputs_and_modes();
         let providers = self.randr_providers();
         let reserved = self.reserved_layout_slots();
@@ -9000,6 +9005,8 @@ impl KmsBackend {
         state.randr = yserver_core::randr::RandrState::from_outputs_with_modes_and_reservations(
             new_ts, outputs, mode_table, &reserved,
         );
+        // CRTC transforms are client-owned, like the logical size below.
+        state.randr.restore_crtc_transforms(prev_transforms);
         let associations = self
             .randr_id_alloc
             .entries()

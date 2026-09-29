@@ -75,6 +75,11 @@ pub struct RandrOutput {
     /// Count of leading entries in `mode_ids` that are preferred modes
     /// (Xorg `GetOutputInfo` `nPreferred`).
     pub num_preferred: u16,
+    /// `SetCrtcTransform`'s stored transform, applied by the next
+    /// `SetCrtcConfig` (`client_pending_transform`).
+    pub pending_transform: CrtcTransform,
+    /// The transform in effect (`client_current_transform`).
+    pub current_transform: CrtcTransform,
 }
 
 /// Real per-mode timing carried through from the kernel DRM mode, so
@@ -263,6 +268,13 @@ impl RandrOutput {
     pub fn effective_timing(&self) -> EffectiveTiming {
         EffectiveTiming::resolve(self.width, self.height, self.vrefresh, self.timing)
     }
+
+    /// The CRTC's framebuffer footprint: its mode through
+    /// `current_transform` (spec D3); the mode size for identity.
+    #[must_use]
+    pub fn footprint(&self) -> (u16, u16) {
+        self.current_transform.footprint(self.width, self.height)
+    }
 }
 
 /// A virtual-screen slot held by a route that is physically gone but
@@ -450,6 +462,36 @@ impl RandrState {
         self.output_crtc_associations = associations.into_iter().collect();
     }
 
+    /// Every CRTC's `(crtc_id, pending, current)` transforms, to carry
+    /// over a rebuild from backend outputs (which start at identity).
+    #[must_use]
+    pub fn crtc_transforms(&self) -> Vec<(u32, CrtcTransform, CrtcTransform)> {
+        self.outputs
+            .iter()
+            .map(|o| {
+                (
+                    o.crtc_id,
+                    o.pending_transform.clone(),
+                    o.current_transform.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// Restore transforms taken by [`Self::crtc_transforms`] onto the
+    /// CRTCs that still exist.
+    pub fn restore_crtc_transforms(
+        &mut self,
+        transforms: Vec<(u32, CrtcTransform, CrtcTransform)>,
+    ) {
+        for (crtc_id, pending, current) in transforms {
+            if let Some(output) = self.outputs.iter_mut().find(|o| o.crtc_id == crtc_id) {
+                output.pending_transform = pending;
+                output.current_transform = current;
+            }
+        }
+    }
+
     /// Look up a provider by its protocol XID.
     #[must_use]
     pub fn provider(&self, provider_id: u32) -> Option<&RandrProvider> {
@@ -545,6 +587,8 @@ impl RandrState {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         };
         Self::from_outputs(timestamp, vec![synthetic])
     }
@@ -1092,6 +1136,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![7, 8, 9],
             num_preferred: 2,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         }];
         let st = RandrState::from_outputs(0, outs);
         let info = st.output_info(1, 0).expect("output 1");
@@ -1119,6 +1165,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![5],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
             RandrOutput {
                 name: "HDMI-2".into(),
@@ -1136,6 +1184,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![6],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
         ];
         let st = RandrState::from_outputs(0, outs);
@@ -1164,6 +1214,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![21],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         }
     }
 
@@ -1245,6 +1297,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![7, 8],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         }];
         let mode_table = vec![
             RandrMode {
@@ -1288,6 +1342,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![5],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
             RandrOutput {
                 name: "B".into(),
@@ -1305,6 +1361,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![5],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
         ];
         let st = RandrState::from_outputs(0, outs);
@@ -1330,6 +1388,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![5],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
             RandrOutput {
                 name: "B".into(),
@@ -1347,6 +1407,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![6],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
         ];
         let st = RandrState::from_outputs(0, outs);
@@ -1373,6 +1435,8 @@ mod tests {
             mm_height: 336,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         }];
         let st = RandrState::from_outputs(0, outs);
         let info = st.output_info(1, 0).expect("output 1 exists");
@@ -1398,6 +1462,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         }];
         let st = RandrState::from_outputs(0, outs);
         let info = st.output_info(1, 0).expect("output 1 exists");
@@ -1425,6 +1491,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![5],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
             RandrOutput {
                 name: "B".into(),
@@ -1442,6 +1510,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![5],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
         ];
         let st = RandrState::from_outputs(0, outs);
@@ -1466,6 +1536,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         }];
         outs.push(RandrOutput {
             name: "HDMI-A-1".into(),
@@ -1483,6 +1555,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![],
             num_preferred: 0,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         });
         let st = RandrState::from_outputs(1, outs);
         let info = st
@@ -1514,6 +1588,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![],
                 num_preferred: 0,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
             RandrOutput {
                 name: "HDMI-A-1".into(),
@@ -1531,6 +1607,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![6],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
         ];
         assert_eq!(RandrState::from_outputs(1, outs).primary_output, 4);
@@ -1558,6 +1636,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![3],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
             RandrOutput {
                 name: "HDMI-A-1".into(),
@@ -1575,6 +1655,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![6],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
         ];
         let st = RandrState::from_outputs(0, outs);
@@ -1605,6 +1687,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![12, 13],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         }];
         let st = RandrState::from_outputs(0, outs);
 
@@ -1653,6 +1737,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![13],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         };
         let state = RandrState::from_outputs(41, vec![output]);
 
@@ -1702,6 +1788,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         }];
         let st = RandrState::from_outputs(0, outs);
         assert_eq!(st.outputs[0].y, 1080, "y must not be flattened");
@@ -1733,6 +1821,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![7],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         };
         let mode_table = vec![RandrMode {
             mode_id: 7,
@@ -1791,6 +1881,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![7],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         };
         let mode_table = vec![RandrMode {
             mode_id: 7,
@@ -1838,6 +1930,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![3],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
             RandrOutput {
                 // connected but OFF (mode_id 0)
@@ -1856,6 +1950,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![6],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
             RandrOutput {
                 // disconnected
@@ -1874,6 +1970,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![],
                 num_preferred: 0,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             },
         ];
         let st = RandrState::from_outputs(0, outs);
@@ -1905,6 +2003,8 @@ mod tests {
             mm_height: 0,
             mode_ids: vec![3],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         }];
         let st = RandrState::from_outputs(0, outs);
         assert!(
@@ -1952,6 +2052,8 @@ mod tests {
                 mm_height: 0,
                 mode_ids: vec![7, 8],
                 num_preferred: 1,
+                pending_transform: Default::default(),
+                current_transform: Default::default(),
             }],
             vec![
                 RandrMode {
@@ -2048,5 +2150,56 @@ mod tests {
     fn set_crtc_config_valid_disable() {
         let st = one_output_state();
         assert_eq!(st.validate_set_crtc_config(2, 0, &[]), Ok(None));
+    }
+
+    fn scale_transform(word: i32) -> CrtcTransform {
+        CrtcTransform::new([word, 0, 0, 0, word, 0, 0, 0, FIXED_ONE], None, Vec::new()).unwrap()
+    }
+
+    #[test]
+    fn crtc_transforms_default_to_identity_without_a_filter() {
+        let st = one_output_state();
+        let out = &st.outputs[0];
+        for t in [&out.pending_transform, &out.current_transform] {
+            assert_eq!(t.matrix, IDENTITY_MATRIX);
+            assert_eq!(t.filter, None);
+            assert!(t.params.is_empty());
+        }
+        assert_eq!(out.footprint(), (1920, 1080));
+    }
+
+    #[test]
+    fn footprint_follows_the_current_transform_only() {
+        let mut st = one_output_state();
+        // xrandr --scale 2 (spec, "What Xorg does").
+        st.outputs[0].pending_transform = scale_transform(131_072);
+        assert_eq!(st.outputs[0].footprint(), (1920, 1080));
+        st.outputs[0].current_transform = scale_transform(131_072);
+        assert_eq!(st.outputs[0].footprint(), (3840, 2160));
+    }
+
+    #[test]
+    fn crtc_transforms_survive_a_rebuild_by_crtc_id() {
+        let mut st = one_output_state();
+        st.outputs[0].pending_transform = scale_transform(32_768);
+        st.outputs[0].current_transform = scale_transform(131_072);
+        let saved = st.crtc_transforms();
+        let mut rebuilt = one_output_state();
+        rebuilt.restore_crtc_transforms(saved);
+        assert_eq!(
+            rebuilt.outputs[0].pending_transform,
+            scale_transform(32_768)
+        );
+        assert_eq!(
+            rebuilt.outputs[0].current_transform,
+            scale_transform(131_072)
+        );
+        // A CRTC that vanished takes its transform with it.
+        let mut other = one_output_state();
+        other.restore_crtc_transforms(vec![(99, scale_transform(32_768), scale_transform(32_768))]);
+        assert_eq!(
+            other.outputs[0].current_transform,
+            CrtcTransform::identity()
+        );
     }
 }

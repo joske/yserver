@@ -911,6 +911,8 @@ mod tests {
             mm_height: 290,
             mode_ids: vec![0x42],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
         }];
         backend.randr_modes = vec![RandrMode {
             mode_id: 0x42,
