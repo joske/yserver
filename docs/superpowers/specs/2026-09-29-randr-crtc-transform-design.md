@@ -190,7 +190,7 @@ All from `../xserver`, 21.1 branch.
 
 - The pointer lives in root (framebuffer) space, as on Xorg. Relative motion
   is applied in root space, unscaled: on a 2.0 output it covers half the
-  physical distance per device unit. Assumed to match Xorg, not verified (Q6).
+  physical distance per device unit, as Xorg (measured, Q6).
 - Two directions, one utility over `current`:
   - scanout → root (the wire matrix plus the CRTC offset): anything that
     starts from a physical position on a CRTC (absolute devices mapped to an
@@ -281,10 +281,12 @@ All from `../xserver`, 21.1 branch.
   5120×2880 intermediate, 56.25 MiB at 32 bpp, on top of its scanout images;
   identity CRTCs need none. Acceptable, or allocate lazily on first repaint?
 
-- **Q6** Does Xorg scale relative pointer motion by the CRTC transform?
-  Measure in vng with the QEMU relative mouse (or evdev/libinput injection)
-  under `--scale 2x2` before implementing D5b. `xdotool mousemove_relative`
-  is a warp request, not device motion: keep it as a warp/confinement test.
+- **Q6** *Settled by measurement* (`tools/vng-scenarios/pointer-scale-host.sh`,
+  QEMU PS/2 mouse, 4 × `mouse_move 25 10`): Xorg moves the root pointer
+  +53,+21 at identity and +56,+22 under `--scale 2x2` — the same within
+  acceleration noise, so relative motion is not scaled by the transform.
+  yserver's identity phase: +53,+21. `xdotool mousemove_relative` remains a
+  warp/confinement test only.
 
 ## Do not
 
