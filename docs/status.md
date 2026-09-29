@@ -33,6 +33,28 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-09-29 RANDR CRTC transforms / fractional scaling, partial (#185,
+  branch `feat/185-crtc-transform`):** `hasTransforms = 1`; SetCrtcTransform
+  / GetCrtcTransform with Xorg's validation order and pending→current on
+  SetCrtcConfig; footprint = `pixman_transform_bounds` port
+  (`randr/transform.rs`). Accepted: pure scale, filters nearest/bilinear
+  (+ fast/good/best); translation, rotation, shear, projective and
+  convolution → BadMatch on purpose. A transformed output composites into a
+  footprint-sized intermediate, then a scale pass writes the mode-sized
+  scanout; direct scanout off and SW cursor on every output while any CRTC is
+  transformed; root reads in framebuffer space with the SW cursor removed
+  (save-under, as misprite). SetScreenSize's crop check stays on the
+  untransformed box (measured). Design + measurements:
+  `docs/superpowers/specs/2026-09-29-randr-crtc-transform-design.md`; probes
+  `tools/vng-scenarios/xrandr-scale*.sh`, `pointer-scale*.sh`. ★ RANDR
+  timestamps: muffin compares `timestamp` with its last SetCrtcConfig reply
+  (`meta-monitor-manager-xrandr.c:1427`) and rebuilds its config on a
+  mismatch (Cinnamon came back at 200%); only SetCrtcConfig/SetScreenConfig
+  may move `timestamp`, never SetScreenSize or output-property writes, as
+  Xorg. Also: GetMonitors/GetScreenResources replies now honour the client's
+  byte order. HW: silence, two 2560×1440, Cinnamon scale-down 100/125/150%
+  and back, screenshot without pointer.
+
 - **2026-09-28 RECORD 1.13, partial (#180, branch `feat/180-record`):**
   advertised (major 154, first error 189) so python-xlib/pynput find it.
   All eight requests with Xorg's validation order and GetContext range
