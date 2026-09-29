@@ -228,13 +228,6 @@ pub struct TransformFilterSpec {
     pub params: Vec<i32>,
 }
 
-impl SetCrtcTransformRequest {
-    #[must_use]
-    pub fn is_identity_transform(&self) -> bool {
-        self.transform == [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x0001_0000]
-    }
-}
-
 #[derive(Debug, PartialEq, Eq)]
 pub struct SetPanningRequest {
     pub crtc: u32,
@@ -1555,14 +1548,14 @@ mod tests {
                 params: vec![-0x0000_8000],
             })
         );
-        assert!(request.is_identity_transform());
 
         let mut nonidentity = body.clone();
         nonidentity[4..8].copy_from_slice(&0x0002_0000i32.to_le_bytes());
-        assert!(
-            !parse_set_crtc_transform_request(&nonidentity)
+        assert_eq!(
+            parse_set_crtc_transform_request(&nonidentity)
                 .unwrap()
-                .is_identity_transform()
+                .transform[0],
+            0x0002_0000
         );
     }
 

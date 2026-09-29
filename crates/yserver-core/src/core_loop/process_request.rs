@@ -3300,64 +3300,69 @@ fn handle_randr_request(
             return Ok(write_to_client(client, client_id, &buf));
         }
         x11randr::RR_SET_CRTC_TRANSFORM => {
-            let Some(req) =
-                x11randr::parse_set_crtc_transform_request(body).filter(|req| req.filter.is_some())
-            else {
-                return emit_x11_error_with_minor(
+            // ProcRRSetCrtcTransform (rrcrtc.c:1755-1785) + RRCrtcTransformSet
+            // (rrcrtc.c:1091-1128), then the spec's D2 contract. Every yserver
+            // CRTC supports transforms, so Xorg's `!crtc->transforms`
+            // BadValue has no counterpart.
+            let error = |state: &mut ServerState, code: u8, value: u32| {
+                emit_x11_error_with_minor(
                     state,
                     client_id,
                     sequence,
-                    x11::error::BAD_LENGTH,
-                    0,
+                    code,
+                    value,
                     u16::from(minor),
                     RANDR_MAJOR_OPCODE,
-                );
+                )
+            };
+            let Some(req) = x11randr::parse_set_crtc_transform_request(body) else {
+                return error(state, x11::error::BAD_LENGTH, 0);
             };
             if !crtc_exists(state, req.crtc) {
-                return emit_x11_error_with_minor(
-                    state,
-                    client_id,
-                    sequence,
-                    RANDR_BAD_CRTC,
-                    req.crtc,
-                    u16::from(minor),
-                    RANDR_MAJOR_OPCODE,
-                );
+                return error(state, RANDR_BAD_CRTC, req.crtc);
             }
-            if !req.is_identity_transform() {
-                // Arbitrary projective transforms need an internal
-                // composition path; they cannot be represented as direct
-                // KMS CRTC state.
-                warn_randr_unsupported_once(
-                    state,
-                    client_id,
-                    sequence,
-                    minor,
-                    "SetCrtcTransform",
-                    "rejecting non-identity transform with BadMatch",
-                );
-                return emit_x11_error_with_minor(
-                    state,
-                    client_id,
-                    sequence,
-                    x11::error::BAD_MATCH,
-                    req.crtc,
-                    u16::from(minor),
-                    RANDR_MAJOR_OPCODE,
-                );
+            if crtc_is_leased(state, req.crtc) {
+                return error(state, x11::error::BAD_ACCESS, 0);
             }
-            if req.filter_name_len != 0 || req.filter.as_ref().is_some_and(|f| !f.params.is_empty())
+            if !crate::randr::CrtcTransform::invertible(&req.transform) {
+                return error(state, x11::error::BAD_MATCH, 0);
+            }
+            let Some(spec) = req.filter else {
+                return error(state, x11::error::BAD_LENGTH, 0);
+            };
+            let filter = if spec.name.is_empty() {
+                if !spec.params.is_empty() {
+                    return error(state, x11::error::BAD_MATCH, 0);
+                }
+                None
+            } else {
+                let Some(filter) = crate::randr::Filter::from_name(&spec.name) else {
+                    return error(state, x11::error::BAD_NAME, 0);
+                };
+                if !filter.params_valid(&spec.params) {
+                    return error(state, x11::error::BAD_MATCH, 0);
+                }
+                Some(filter)
+            };
+            let Some(transform) =
+                crate::randr::CrtcTransform::new(req.transform, filter, spec.params)
+            else {
+                return error(state, x11::error::BAD_MATCH, 0);
+            };
+            // D2: pure scale, nearest/bilinear only; the rest is refused on
+            // purpose rather than rendered approximately.
+            if !(transform.is_identity() || transform.is_pure_scale())
+                || filter == Some(crate::randr::Filter::Convolution)
             {
-                // The filter has no observable effect for an identity
-                // transform, but yserver does not retain it for GetCrtcTransform.
-                warn_randr_unsupported_once(
-                    state,
-                    client_id,
-                    sequence,
-                    minor,
-                    "SetCrtcTransform",
-                    "accepting identity transform but not retaining its filter",
-                );
+                return error(state, x11::error::BAD_MATCH, 0);
+            }
+            if let Some(output) = state
+                .randr
+                .outputs
+                .iter_mut()
+                .find(|o| o.crtc_id == req.crtc)
+            {
+                output.pending_transform = transform;
             }
             return Ok(RequestOutcome::Handled);
         }
@@ -3388,7 +3393,7 @@ fn handle_randr_request(
             let buf = x11randr::encode_get_crtc_transform_reply(
                 byte_order,
                 sequence,
-                false,
+                true,
                 part(&output.pending_transform),
                 part(&output.current_transform),
             );
@@ -36589,91 +36594,215 @@ mod tests {
         assert!(mark_randr_unsupported_warned(&mut state, 19));
     }
 
-    #[test]
-    fn randr_set_crtc_transform_accepts_only_direct_identity_state() {
-        use yserver_protocol::x11::randr as x11randr;
+    const RR_IDENTITY: [i32; 9] = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x0001_0000];
 
-        let mut state = ServerState::new();
-        let crtc = state.randr.outputs[0].crtc_id;
-        let mut peer = install_client(&mut state, 1);
+    fn rr_scale(word: i32) -> [i32; 9] {
+        [word, 0, 0, 0, word, 0, 0, 0, 0x0001_0000]
+    }
+
+    fn randr_transform_body_with_params(
+        crtc: u32,
+        matrix: [i32; 9],
+        filter_name: &[u8],
+        params: &[i32],
+    ) -> Vec<u8> {
+        let mut body = randr_transform_body(crtc, matrix, filter_name);
+        for param in params {
+            body.extend_from_slice(&param.to_le_bytes());
+        }
+        body
+    }
+
+    /// Send one SetCrtcTransform; the error code it produced, if any.
+    fn randr_set_crtc_transform(
+        state: &mut ServerState,
+        peer: &mut UnixStream,
+        body: &[u8],
+    ) -> Option<u8> {
         let mut backend = RecordingBackend::new();
-        let identity = [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x0001_0000];
         let header = RequestHeader {
             opcode: 128,
-            data: x11randr::RR_SET_CRTC_TRANSFORM,
-            length_units: 12,
+            data: yserver_protocol::x11::randr::RR_SET_CRTC_TRANSFORM,
+            length_units: u32::try_from(1 + body.len() / 4).unwrap(),
         };
-
         handle_randr_request(
-            &mut state,
+            state,
             &mut backend,
             ClientId(1),
             SequenceNumber(1),
             header,
-            &randr_transform_body(crtc, identity, &[]),
+            body,
         )
-        .expect("identity transform");
-        assert!(read_all_available(&mut peer).is_empty(), "void no-op");
-        assert_eq!(
-            state.randr_unsupported_warned_mask & (1 << x11randr::RR_SET_CRTC_TRANSFORM),
-            0,
-        );
+        .expect("SetCrtcTransform");
+        let out = read_all_available(peer);
+        if out.is_empty() {
+            return None;
+        }
+        assert_eq!(out.len(), 32, "one error");
+        assert_eq!(out[0], 0, "error packet");
+        assert_eq!(out[10], 128, "major = RANDR");
+        Some(out[1])
+    }
 
-        // An identity filter is harmless and remains a wire-success no-op,
-        // but its parameters are not retained for GetCrtcTransform, so even
-        // an empty filter name with a parameter tail must warn.
-        let mut parameter_only = randr_transform_body(crtc, identity, &[]);
-        parameter_only.extend_from_slice(&0x0001_0000i32.to_le_bytes());
+    #[test]
+    fn randr_set_crtc_transform_validates_in_xorg_order() {
+        // rrcrtc.c:1755-1785 and RRCrtcTransformSet, then D2. Each case
+        // also carries the fault of every later step, so it shows the
+        // earlier check wins. BadAccess (leased CRTC) is not reachable:
+        // yserver has no RANDR leases.
+        let mut state = ServerState::new();
+        let crtc = state.randr.outputs[0].crtc_id;
+        let mut peer = install_client(&mut state, 1);
+        let bad_crtc = RANDR_BAD_CRTC;
+        let singular = [0i32; 9];
+        let rotate = [0, -0x0001_0000, 0, 0x0001_0000, 0, 0, 0, 0, 0x0001_0000];
+        let mut overrun = randr_transform_body(crtc, singular, b"");
+        overrun[40..42].copy_from_slice(&8u16.to_le_bytes());
+        let mut overrun_bad_crtc = overrun.clone();
+        overrun_bad_crtc[0..4].copy_from_slice(&0xdeadu32.to_le_bytes());
+        let mut overrun_invertible = randr_transform_body(crtc, RR_IDENTITY, b"");
+        overrun_invertible[40..42].copy_from_slice(&8u16.to_le_bytes());
+        let one = 0x0001_0000;
+        let cases: Vec<(&str, Vec<u8>, Option<u8>)> = vec![
+            ("BadCrtc", overrun_bad_crtc, Some(bad_crtc)),
+            ("non-invertible", overrun, Some(x11::error::BAD_MATCH)),
+            (
+                "negative nparams",
+                overrun_invertible,
+                Some(x11::error::BAD_LENGTH),
+            ),
+            (
+                "unknown filter",
+                randr_transform_body(crtc, rotate, b"box"),
+                Some(x11::error::BAD_NAME),
+            ),
+            (
+                "convolution parameter check",
+                randr_transform_body_with_params(crtc, RR_IDENTITY, b"convolution", &[one]),
+                Some(x11::error::BAD_MATCH),
+            ),
+            (
+                "params without a filter",
+                randr_transform_body_with_params(crtc, rotate, b"", &[one]),
+                Some(x11::error::BAD_MATCH),
+            ),
+            (
+                "D2: valid convolution",
+                randr_transform_body_with_params(
+                    crtc,
+                    RR_IDENTITY,
+                    b"convolution",
+                    &[one, one, one],
+                ),
+                Some(x11::error::BAD_MATCH),
+            ),
+            (
+                "D2: rotation",
+                randr_transform_body(crtc, rotate, b"good"),
+                Some(x11::error::BAD_MATCH),
+            ),
+            (
+                "D2: translation",
+                randr_transform_body(crtc, [one, 0, 5 * one, 0, one, 0, 0, 0, one], b""),
+                Some(x11::error::BAD_MATCH),
+            ),
+            (
+                "pure scale",
+                randr_transform_body(crtc, rr_scale(104_857), b"good"),
+                None,
+            ),
+            (
+                "bilinear keeps its parameters",
+                randr_transform_body_with_params(crtc, rr_scale(131_072), b"bilinear", &[one]),
+                None,
+            ),
+            (
+                "identity with a filter",
+                randr_transform_body(crtc, RR_IDENTITY, b"FAST"),
+                None,
+            ),
+        ];
+        for (name, body, expected) in cases {
+            assert_eq!(
+                randr_set_crtc_transform(&mut state, &mut peer, &body),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    fn randr_get_crtc_transform(
+        state: &mut ServerState,
+        peer: &mut UnixStream,
+        crtc: u32,
+    ) -> Vec<u8> {
+        let mut backend = RecordingBackend::new();
         handle_randr_request(
-            &mut state,
+            state,
             &mut backend,
             ClientId(1),
             SequenceNumber(2),
             RequestHeader {
-                length_units: 13,
-                ..header
+                opcode: 128,
+                data: yserver_protocol::x11::randr::RR_GET_CRTC_TRANSFORM,
+                length_units: 2,
             },
-            &parameter_only,
+            &crtc.to_le_bytes(),
         )
-        .expect("identity transform with filter parameter");
-        assert!(read_all_available(&mut peer).is_empty(), "void no-op");
-        assert_ne!(
-            state.randr_unsupported_warned_mask & (1 << x11randr::RR_SET_CRTC_TRANSFORM),
-            0,
+        .expect("GetCrtcTransform");
+        read_all_available(peer)
+    }
+
+    #[test]
+    fn randr_set_crtc_transform_stores_pending_for_get_crtc_transform() {
+        let mut state = ServerState::new();
+        let crtc = state.randr.outputs[0].crtc_id;
+        let mut peer = install_client(&mut state, 1);
+
+        let reply = randr_get_crtc_transform(&mut state, &mut peer, crtc);
+        assert_eq!(reply.len(), 96, "default: no filter bytes");
+        assert_eq!(reply[44], 1, "hasTransforms");
+        assert_eq!(&reply[88..96], &[0u8; 8]);
+
+        // muffin's scale-down 125% CRTC 6 request (spec table): `good`.
+        let body = randr_transform_body_with_params(crtc, rr_scale(104_857), b"good", &[0x8000]);
+        assert_eq!(randr_set_crtc_transform(&mut state, &mut peer, &body), None);
+        let output = &state.randr.outputs[0];
+        assert_eq!(output.pending_transform.matrix, rr_scale(104_857));
+        assert_eq!(
+            output.pending_transform.filter,
+            Some(crate::randr::Filter::Bilinear)
+        );
+        assert_eq!(
+            output.current_transform,
+            crate::randr::CrtcTransform::identity()
         );
 
-        handle_randr_request(
-            &mut state,
-            &mut backend,
-            ClientId(1),
-            SequenceNumber(3),
-            RequestHeader {
-                length_units: 13,
-                ..header
-            },
-            &randr_transform_body(crtc, identity, b"box"),
-        )
-        .expect("identity transform with named filter");
-        assert!(read_all_available(&mut peer).is_empty(), "void no-op");
+        let reply = randr_get_crtc_transform(&mut state, &mut peer, crtc);
+        assert_eq!(reply.len(), 108);
+        assert_eq!(
+            u32::from_le_bytes(reply[8..12].try_into().unwrap()),
+            104_857
+        );
+        assert_eq!(
+            u32::from_le_bytes(reply[48..52].try_into().unwrap()),
+            0x0001_0000
+        );
+        assert_eq!(&reply[88..96], &[8, 0, 1, 0, 0, 0, 0, 0]);
+        assert_eq!(&reply[96..104], b"bilinear", "canonical name, not `good`");
+        assert_eq!(&reply[104..108], &0x8000i32.to_le_bytes());
 
-        let mut projective = identity;
-        projective[6] = 1;
-        handle_randr_request(
-            &mut state,
-            &mut backend,
-            ClientId(1),
-            SequenceNumber(4),
-            header,
-            &randr_transform_body(crtc, projective, &[]),
-        )
-        .expect("reject non-identity transform");
-        let error = read_all_available(&mut peer);
-        assert_eq!(error.len(), 32);
-        assert_eq!(error[0], 0);
-        assert_eq!(error[1], x11::error::BAD_MATCH);
-        assert_eq!(u32::from_le_bytes(error[4..8].try_into().unwrap()), crtc);
-        assert_eq!(&error[8..10], &u16::from(header.data).to_le_bytes());
-        assert_eq!(error[10], 128);
+        // A rejected request leaves the pending transform alone.
+        let rotate = [0, -0x0001_0000, 0, 0x0001_0000, 0, 0, 0, 0, 0x0001_0000];
+        let body = randr_transform_body(crtc, rotate, b"");
+        assert_eq!(
+            randr_set_crtc_transform(&mut state, &mut peer, &body),
+            Some(x11::error::BAD_MATCH)
+        );
+        assert_eq!(
+            state.randr.outputs[0].pending_transform.matrix,
+            rr_scale(104_857)
+        );
     }
 
     #[test]
