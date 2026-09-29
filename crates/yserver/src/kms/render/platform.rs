@@ -440,7 +440,7 @@ impl FencePool {
         }
     }
 
-    fn acquire(&self) -> Result<FenceTicket, vk::Result> {
+    pub(crate) fn acquire(&self) -> Result<FenceTicket, vk::Result> {
         let mut pool = self.inner.borrow_mut();
         let fence = if let Some(f) = pool.free.pop() {
             f

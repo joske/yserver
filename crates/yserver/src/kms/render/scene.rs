@@ -944,6 +944,10 @@ pub(crate) struct SceneCompositor {
     /// states without a live Vulkan device.
     #[cfg(test)]
     test_flip_in_flight_override: Option<bool>,
+    /// Test-only: the most draws a priming compose reports recorded, standing
+    /// in for an exhausted descriptor pool.
+    #[cfg(test)]
+    pub(crate) test_prime_descriptor_sets: Option<usize>,
 }
 
 struct SceneCompositorInner {
@@ -1317,6 +1321,8 @@ impl SceneCompositor {
             scene_structure_dirty: true,
             #[cfg(test)]
             test_flip_in_flight_override: None,
+            #[cfg(test)]
+            test_prime_descriptor_sets: None,
         })
     }
 
@@ -1525,6 +1531,8 @@ impl SceneCompositor {
             scene_structure_dirty: false,
             #[cfg(test)]
             test_flip_in_flight_override: None,
+            #[cfg(test)]
+            test_prime_descriptor_sets: None,
         }
     }
 
@@ -4903,11 +4911,12 @@ fn tick_one_output(
         }
     };
     if let Some(image) = compose_image {
+        // A compose that reached the GPU rewrote the image even when the
+        // flip after it failed.
         inner.outputs[output_idx].cursor_saves.finish(
             image,
             cursor_save,
             gpu_submitted.then_some(&compose_ticket),
-            render_result.is_ok(),
         );
     }
     if copied_prepare_failed {
@@ -7815,6 +7824,10 @@ impl SceneCompositor {
         platform: &PlatformBackend,
         cow_host_xid: Option<u32>,
     ) -> Result<(), SceneError> {
+        #[cfg(test)]
+        let descriptor_limit = self.test_prime_descriptor_sets;
+        #[cfg(not(test))]
+        let descriptor_limit: Option<usize> = None;
         let Some(inner) = self.inner.as_mut() else {
             return Ok(());
         };
@@ -7864,7 +7877,8 @@ impl SceneCompositor {
             let vk = Arc::clone(&inner.vk);
             let state = &mut inner.outputs[output_idx];
             let cursor_save = state.cursor_saves.prepare(&vk, scale.image, cursor_rect);
-            let pool = create_audit_descriptor_pool(&vk, built.scene.draws.len())?;
+            let draws = built.scene.draws.len();
+            let pool = create_audit_descriptor_pool(&vk, draws)?;
             let ticket = platform.acquire_fence_ticket().map_err(SceneError::Vk)?;
             let mut submitted = false;
             let result = record_and_submit_render(
@@ -7888,24 +7902,33 @@ impl SceneCompositor {
             } else {
                 Ok(())
             };
-            state.cursor_saves.finish(
-                scale.image,
-                cursor_save,
-                submitted.then_some(&ticket),
-                result.is_ok() && waited.is_ok(),
-            );
+            state
+                .cursor_saves
+                .finish(scale.image, cursor_save, submitted.then_some(&ticket));
             if waited.is_err() {
                 // The GPU may still use the pool and command buffer.
                 std::mem::forget(target);
                 return waited;
             }
             unsafe { vk.device.destroy_descriptor_pool(pool, None) };
-            result?;
+            let recorded = result?.descriptor_count;
+            // Drivers may over-allocate a pool, so the test caps the count.
+            let recorded = descriptor_limit.map_or(recorded, |n| recorded.min(n));
             for id in &built.sampled_ids {
                 store.touch_render_fence(*id, ticket.clone());
             }
-            if let Some(intermediate) = state.intermediate.as_mut() {
-                intermediate.has_content = true;
+            // A truncated compose painted less than the scene, as the tick's
+            // own check says: the read then zero-fills that output as for any
+            // unreadable piece, and the next tick repaints it in full.
+            if recorded == draws {
+                if let Some(intermediate) = state.intermediate.as_mut() {
+                    intermediate.has_content = true;
+                }
+            } else {
+                log::warn!(
+                    "render root read: output {output_idx} priming composed {recorded} of \
+                     {draws} draws (descriptor pool exhausted); not read"
+                );
             }
         }
         Ok(())
@@ -8960,7 +8983,7 @@ impl SceneCompositor {
         ticket.wait(vk).expect("compose fence");
         state
             .cursor_saves
-            .finish(compose_image, cursor_save, Some(&ticket), true);
+            .finish(compose_image, cursor_save, Some(&ticket));
         if let Some(intermediate) = state.intermediate.as_mut() {
             intermediate.has_content = true;
         }

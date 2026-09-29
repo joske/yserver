@@ -668,3 +668,46 @@ fn a_root_read_right_after_a_transform_becomes_current_sees_the_root() {
         }
     }
 }
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_truncated_priming_compose_is_not_read() {
+    let root = (192u16, 96u16);
+    let Some(mut b) = transformed_pair(scale(0x20000, Some(Filter::Nearest)), root) else {
+        return;
+    };
+    // Root + cursor is two draws; an exhausted pool records only the root.
+    register_test_cursor(&mut b);
+    (b.core.cursor_x, b.core.cursor_y) = (80.0, 10.0);
+    b.scene.test_prime_descriptor_sets = Some(1);
+    let root_xid = b.core.window_id;
+    let got = b
+        .get_image_pixels_for_tests(root_xid, 2, 64, 0, 128, 96, !0)
+        .expect("get_image")
+        .expect("bytes");
+    assert!(
+        got.iter().all(|&byte| byte == 0),
+        "zero-filled, not a partial frame"
+    );
+    assert!(
+        b.scene.transform_intermediate(1).is_none(),
+        "not marked composed"
+    );
+
+    b.scene.test_prime_descriptor_sets = None;
+    let got = b
+        .get_image_pixels_for_tests(root_xid, 2, 64, 0, 128, 96, !0)
+        .expect("get_image")
+        .expect("bytes");
+    assert_eq!(
+        got[..3],
+        pattern(64, 0)[..3],
+        "a complete priming compose is read"
+    );
+    let under = ((10 * 128 + 16) * 4) as usize;
+    assert_eq!(
+        got[under..under + 3],
+        pattern(80, 10)[..3],
+        "without the sprite"
+    );
+}

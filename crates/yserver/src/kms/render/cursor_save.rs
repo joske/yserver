@@ -38,6 +38,9 @@ struct CursorSave {
     buffer: ManuallyDrop<StagingBuffer>,
     /// The last compose that wrote `buffer`.
     ticket: Option<FenceTicket>,
+    /// A larger buffer for a compose in progress; replaces `buffer` only once
+    /// that compose reached the GPU.
+    replacement: Option<StagingBuffer>,
 }
 
 impl Drop for CursorSave {
@@ -64,7 +67,8 @@ pub(crate) struct CursorSaves {
 impl CursorSaves {
     /// Start a compose into `image` whose software cursor covers `rect`, or
     /// none. Returns where to save, or `None` when there is no cursor or the
-    /// buffer cannot be allocated (reads then show the sprite).
+    /// buffer cannot be allocated (reads then show the sprite). Nothing a read
+    /// sees changes until [`Self::finish`].
     pub(crate) fn prepare(
         &mut self,
         vk: &Arc<VkContext>,
@@ -72,64 +76,80 @@ impl CursorSaves {
         rect: Option<vk::Rect2D>,
     ) -> Option<CursorSaveTarget> {
         let index = self.saves.iter().position(|s| s.image == image);
-        if let Some(i) = index {
-            self.saves[i].rect = None;
-        }
         let rect = rect?;
         let needed = u64::from(rect.extent.width) * u64::from(rect.extent.height) * 4;
-        let i = match index {
-            Some(i) if self.saves[i].buffer.size() >= needed => i,
-            _ => {
-                let buffer = match StagingBuffer::new_for_readback(
-                    Arc::clone(vk),
-                    needed.next_multiple_of(GRANULE),
-                ) {
-                    Ok(buffer) => buffer,
-                    Err(error) => {
-                        log::warn!("render cursor save: {needed}-byte buffer: {error:?}");
-                        return None;
-                    }
-                };
-                // Dropping the old entry waits for the compose still writing it.
-                if let Some(i) = index {
-                    self.saves.remove(i);
-                } else if self.saves.len() == MAX_SAVES {
-                    self.saves.remove(0);
+        if let Some(i) = index
+            && self.saves[i].buffer.size() >= needed
+        {
+            return Some(CursorSaveTarget {
+                buffer: self.saves[i].buffer.buffer(),
+                rect,
+            });
+        }
+        let buffer =
+            match StagingBuffer::new_for_readback(Arc::clone(vk), needed.next_multiple_of(GRANULE))
+            {
+                Ok(buffer) => buffer,
+                Err(error) => {
+                    log::warn!("render cursor save: {needed}-byte buffer: {error:?}");
+                    return None;
                 }
-                self.saves.push(CursorSave {
-                    image,
-                    rect: None,
-                    buffer: ManuallyDrop::new(buffer),
-                    ticket: None,
-                });
-                self.saves.len() - 1
+            };
+        let target = buffer.buffer();
+        if let Some(i) = index {
+            self.saves[i].replacement = Some(buffer);
+        } else {
+            if self.saves.len() == MAX_SAVES {
+                self.saves.remove(0);
             }
-        };
+            // A new entry has no save yet, which is what its image holds.
+            self.saves.push(CursorSave {
+                image,
+                rect: None,
+                buffer: ManuallyDrop::new(buffer),
+                ticket: None,
+                replacement: None,
+            });
+        }
         Some(CursorSaveTarget {
-            buffer: self.saves[i].buffer.buffer(),
+            buffer: target,
             rect,
         })
     }
 
-    /// Finish the compose [`Self::prepare`] returned `save` for: `ticket` is
-    /// its fence once submitted, and `composed` whether it succeeded.
+    /// Finish the compose [`Self::prepare`] returned `save` for. `executed` is
+    /// its fence when it reached the GPU: the image then holds that compose,
+    /// whatever became of the flip after it, so its save (or absence of one)
+    /// replaces the old. A compose that never ran leaves the old save.
     pub(crate) fn finish(
         &mut self,
         image: vk::Image,
         save: Option<CursorSaveTarget>,
-        ticket: Option<&FenceTicket>,
-        composed: bool,
+        executed: Option<&FenceTicket>,
     ) {
-        let Some(save) = save else {
-            return;
-        };
         let Some(entry) = self.saves.iter_mut().find(|s| s.image == image) else {
             return;
         };
-        if let Some(ticket) = ticket {
-            entry.ticket = Some(ticket.clone());
+        let replacement = entry.replacement.take();
+        let Some(ticket) = executed else {
+            // Unsubmitted: the GPU never touched the replacement.
+            drop(replacement);
+            return;
+        };
+        if let Some(buffer) = replacement {
+            if let Some(old) = entry.ticket.take()
+                && let Err(error) = old.wait(buffer.vk())
+            {
+                log::error!("render cursor save: fence wait failed: {error:?}; leaking its buffer");
+                entry.buffer = ManuallyDrop::new(buffer);
+            } else {
+                // SAFETY: the compose that last wrote it has completed.
+                unsafe { ManuallyDrop::drop(&mut entry.buffer) };
+                entry.buffer = ManuallyDrop::new(buffer);
+            }
         }
-        entry.rect = composed.then_some(save.rect);
+        entry.ticket = Some(ticket.clone());
+        entry.rect = save.map(|s| s.rect);
     }
 
     /// Put the saved pixels back into `bytes`, a tightly packed BGRA8 read of
@@ -188,6 +208,8 @@ pub(crate) fn restore_rect(bytes: &mut [u8], read: vk::Rect2D, rect: vk::Rect2D,
 
 #[cfg(test)]
 mod tests {
+    use ash::vk::Handle;
+
     use super::*;
 
     fn r(x: i32, y: i32, w: u32, h: u32) -> vk::Rect2D {
@@ -218,6 +240,81 @@ mod tests {
         for (x, y) in [(0, 0), (1, 1), (2, 0), (3, 0), (0, 2), (1, 2)] {
             assert_eq!(px(x, y), vec![0; 4], "({x}, {y}) is outside the save");
         }
+    }
+
+    /// A fence ticket whose (empty) submit has already been queued, as a
+    /// compose that reached the GPU leaves it.
+    fn executed(vk: &Arc<VkContext>, pool: &super::super::platform::FencePool) -> FenceTicket {
+        let ticket = pool.acquire().expect("fence");
+        unsafe {
+            vk.device
+                .queue_submit2(vk.graphics_queue, &[], ticket.fence())
+                .expect("submit");
+        }
+        ticket
+    }
+
+    /// Stand-in for the compose's copy: the GPU writes `fill` into the save.
+    fn gpu_writes(target: CursorSaveTarget, saves: &CursorSaves, fill: u8) {
+        let entry = saves.saves.iter().find(|s| {
+            s.buffer.buffer() == target.buffer
+                || s.replacement
+                    .as_ref()
+                    .is_some_and(|b| b.buffer() == target.buffer)
+        });
+        let entry = entry.expect("target belongs to an entry");
+        let buffer = entry
+            .replacement
+            .as_ref()
+            .filter(|b| b.buffer() == target.buffer)
+            .unwrap_or(&entry.buffer);
+        let len = (target.rect.extent.width * target.rect.extent.height * 4) as usize;
+        unsafe { std::ptr::write_bytes(buffer.mapped().as_ptr(), fill, len) };
+    }
+
+    fn read(saves: &CursorSaves, image: vk::Image) -> Vec<u8> {
+        let mut bytes = vec![0u8; 16 * 16 * 4];
+        saves.restore(image, r(0, 0, 16, 16), &mut bytes);
+        bytes
+    }
+
+    /// The save follows what the image holds: a compose that reached the GPU
+    /// replaces it (its flip's fate does not enter), one that never ran keeps
+    /// the old one, including across a buffer reallocation.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn a_save_changes_only_when_its_compose_reached_the_gpu() {
+        let vk = VkContext::new().expect("vk");
+        let pool = super::super::platform::FencePool::new(Arc::clone(&vk));
+        let image = vk::Image::from_raw(0x1234);
+        let mut saves = CursorSaves::default();
+        let px = |bytes: &[u8], x: usize, y: usize| bytes[(y * 16 + x) * 4];
+
+        // Frame 1 draws the cursor at (2, 2) and runs.
+        let t = saves.prepare(&vk, image, Some(r(2, 2, 4, 4))).unwrap();
+        gpu_writes(t, &saves, 0x11);
+        saves.finish(image, Some(t), Some(&executed(&vk, &pool)));
+        assert_eq!(px(&read(&saves, image), 3, 3), 0x11);
+
+        // Frame 2 moves it to (8, 8) and runs, but its flip fails: the image
+        // holds frame 2, so the read must restore frame 2's rect.
+        let t = saves.prepare(&vk, image, Some(r(8, 8, 4, 4))).unwrap();
+        gpu_writes(t, &saves, 0x22);
+        saves.finish(image, Some(t), Some(&executed(&vk, &pool)));
+        let got = read(&saves, image);
+        assert_eq!((px(&got, 9, 9), px(&got, 3, 3)), (0x22, 0));
+
+        // Frame 3 never reaches the GPU, with a sprite too large for the
+        // buffer: frame 2's save stands.
+        let t = saves.prepare(&vk, image, Some(r(0, 0, 200, 200))).unwrap();
+        saves.finish(image, Some(t), None);
+        let got = read(&saves, image);
+        assert_eq!((px(&got, 9, 9), px(&got, 0, 0)), (0x22, 0));
+
+        // Frame 4 runs cursorless: nothing to restore any more.
+        assert!(saves.prepare(&vk, image, None).is_none());
+        saves.finish(image, None, Some(&executed(&vk, &pool)));
+        assert_eq!(px(&read(&saves, image), 9, 9), 0);
     }
 
     #[test]
