@@ -736,9 +736,9 @@ pub fn encode_get_screen_resources_current_reply(
 
     let mut out = fixed_reply(byte_order, sequence, 0, length);
     // bytes 8-11: timestamp
-    out.extend_from_slice(&resources.timestamp.to_le_bytes());
+    put(byte_order, &mut out, resources.timestamp);
     // bytes 12-15: config_timestamp
-    out.extend_from_slice(&resources.config_timestamp.to_le_bytes());
+    put(byte_order, &mut out, resources.config_timestamp);
     // bytes 16-17: num_crtcs
     #[allow(clippy::cast_possible_truncation)]
     put(byte_order, &mut out, num_crtcs as u16);
@@ -764,19 +764,19 @@ pub fn encode_get_screen_resources_current_reply(
     }
     // mode info structs (xRRModeInfo, each 32 bytes)
     for mode in &resources.modes {
-        out.extend_from_slice(&mode.id.to_le_bytes());
-        out.extend_from_slice(&mode.width.to_le_bytes());
-        out.extend_from_slice(&mode.height.to_le_bytes());
-        out.extend_from_slice(&mode.dot_clock.to_le_bytes());
-        out.extend_from_slice(&mode.hsync_start.to_le_bytes());
-        out.extend_from_slice(&mode.hsync_end.to_le_bytes());
-        out.extend_from_slice(&mode.htotal.to_le_bytes());
-        out.extend_from_slice(&mode.hskew.to_le_bytes());
-        out.extend_from_slice(&mode.vsync_start.to_le_bytes());
-        out.extend_from_slice(&mode.vsync_end.to_le_bytes());
-        out.extend_from_slice(&mode.vtotal.to_le_bytes());
-        out.extend_from_slice(&mode.name_len.to_le_bytes());
-        out.extend_from_slice(&mode.mode_flags.to_le_bytes());
+        put(byte_order, &mut out, mode.id);
+        put(byte_order, &mut out, mode.width);
+        put(byte_order, &mut out, mode.height);
+        put(byte_order, &mut out, mode.dot_clock);
+        put(byte_order, &mut out, mode.hsync_start);
+        put(byte_order, &mut out, mode.hsync_end);
+        put(byte_order, &mut out, mode.htotal);
+        put(byte_order, &mut out, mode.hskew);
+        put(byte_order, &mut out, mode.vsync_start);
+        put(byte_order, &mut out, mode.vsync_end);
+        put(byte_order, &mut out, mode.vtotal);
+        put(byte_order, &mut out, mode.name_len);
+        put(byte_order, &mut out, mode.mode_flags);
     }
     // mode names (padded to 4)
     out.extend_from_slice(&resources.mode_names);
@@ -1259,16 +1259,16 @@ pub fn encode_get_monitors_reply(
     for m in monitors {
         #[allow(clippy::cast_possible_truncation)]
         let n_out = m.outputs.len() as u16;
-        out.extend_from_slice(&m.name.to_le_bytes()); // 4: name (Atom)
+        put(byte_order, &mut out, m.name); // 4: name (Atom)
         out.push(u8::from(m.primary)); // 1: primary
         out.push(u8::from(m.automatic)); // 1: automatic
         put(byte_order, &mut out, n_out); // 2: nOutput
-        out.extend_from_slice(&m.x.to_le_bytes()); // 2: x
-        out.extend_from_slice(&m.y.to_le_bytes()); // 2: y
-        out.extend_from_slice(&m.width.to_le_bytes()); // 2: width
-        out.extend_from_slice(&m.height.to_le_bytes()); // 2: height
-        out.extend_from_slice(&m.width_mm.to_le_bytes()); // 4: widthInMillimeters
-        out.extend_from_slice(&m.height_mm.to_le_bytes()); // 4: heightInMillimeters
+        put(byte_order, &mut out, m.x); // 2: x
+        put(byte_order, &mut out, m.y); // 2: y
+        put(byte_order, &mut out, m.width); // 2: width
+        put(byte_order, &mut out, m.height); // 2: height
+        put(byte_order, &mut out, m.width_mm); // 4: widthInMillimeters
+        put(byte_order, &mut out, m.height_mm); // 4: heightInMillimeters
         for &oid in m.outputs {
             put(byte_order, &mut out, oid);
         }
@@ -2496,6 +2496,133 @@ mod tests {
         assert_eq!(&buf[32..36], &[1, 0, 2, 0]);
         assert_eq!(&buf[36..40], &[3, 0, 4, 0]);
         assert_eq!(&buf[40..44], &[5, 0, 6, 0]);
+    }
+
+    /// Reverse `len`-byte fields at `offsets` in `buf` (Xorg's swapl/swaps).
+    fn swap_fields(buf: &mut [u8], fields: &[(usize, usize)]) {
+        for &(off, len) in fields {
+            buf[off..off + len].reverse();
+        }
+    }
+
+    /// A big-endian GetMonitors reply is the little-endian one with exactly the
+    /// fields Xorg's `ProcRRGetMonitors` swaps reversed (`rrmonitor.c:617-649`).
+    #[test]
+    fn encode_get_monitors_big_endian_swaps_every_field() {
+        let outputs = [0x0102_0304u32];
+        let monitors = [MonitorInfo {
+            name: 0x0A0B_0C0D,
+            primary: true,
+            automatic: false,
+            x: 0x0102,
+            y: -2,
+            width: 0x0A00,
+            height: 0x05A0,
+            width_mm: 0x0000_0258,
+            height_mm: 0x0000_0152,
+            outputs: &outputs,
+        }];
+        let mut want = encode_get_monitors_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(0x1234),
+            0x0506_0708,
+            &monitors,
+        );
+        let got = encode_get_monitors_reply(
+            ClientByteOrder::BigEndian,
+            SequenceNumber(0x1234),
+            0x0506_0708,
+            &monitors,
+        );
+        swap_fields(
+            &mut want,
+            &[
+                (2, 2),
+                (4, 4),
+                (8, 4),
+                (12, 4),
+                (16, 4), // header
+                (32, 4),
+                (38, 2),
+                (40, 2),
+                (42, 2),
+                (44, 2),
+                (46, 2), // name, noutput, x, y, w, h
+                (48, 4),
+                (52, 4),
+                (56, 4), // mm, output
+            ],
+        );
+        assert_eq!(got, want);
+    }
+
+    /// Same for GetScreenResources[Current]: the mode infos are swapped field by
+    /// field as `rrscreen.c:310-322` does.
+    #[test]
+    fn encode_get_screen_resources_big_endian_swaps_every_field() {
+        let name = b"2560x1440";
+        let resources = ScreenResources {
+            timestamp: 0x0102_0304,
+            config_timestamp: 0x0506_0708,
+            crtcs: vec![0x11],
+            outputs: vec![0x22],
+            modes: vec![ModeInfo {
+                id: 0x13,
+                width: 2560,
+                height: 1440,
+                dot_clock: 241_500_000,
+                hsync_start: 2608,
+                hsync_end: 2640,
+                htotal: 2720,
+                hskew: 0,
+                vsync_start: 1443,
+                vsync_end: 1448,
+                vtotal: 1481,
+                name_len: name.len() as u16,
+                mode_flags: 0x0000_000A,
+            }],
+            mode_names: name.to_vec(),
+        };
+        let mut want = encode_get_screen_resources_current_reply(
+            ClientByteOrder::LittleEndian,
+            SequenceNumber(7),
+            &resources,
+        );
+        let got = encode_get_screen_resources_current_reply(
+            ClientByteOrder::BigEndian,
+            SequenceNumber(7),
+            &resources,
+        );
+        let m = 40; // header 32 + one crtc + one output
+        swap_fields(
+            &mut want,
+            &[
+                (2, 2),
+                (4, 4),
+                (8, 4),
+                (12, 4),
+                (16, 2),
+                (18, 2),
+                (20, 2),
+                (22, 2),
+                (32, 4),
+                (36, 4),
+                (m, 4),
+                (m + 4, 2),
+                (m + 6, 2),
+                (m + 8, 4),
+                (m + 12, 2),
+                (m + 14, 2),
+                (m + 16, 2),
+                (m + 18, 2),
+                (m + 20, 2),
+                (m + 22, 2),
+                (m + 24, 2),
+                (m + 26, 2),
+                (m + 28, 4),
+            ],
+        );
+        assert_eq!(got, want);
     }
 
     #[test]
