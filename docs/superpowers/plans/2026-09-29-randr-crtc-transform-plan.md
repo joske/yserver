@@ -11,7 +11,27 @@ measured tables in the spec or new Xorg vng captures, never invented.
 
 Until task 13, `SetCrtcTransform` keeps answering `BadMatch` for any
 non-identity transform and `hasTransforms` stays 0: every intermediate commit
-is behaviour-neutral for clients.
+is behaviour-neutral for clients. This deliberately keeps today's answers
+rather than Xorg's no-transform-support `BadValue` for every request,
+identity included (`rrcrtc.c:1101-1102`): muffin sends identity transforms
+even with `hasTransforms = 0` (captured), and those succeed today.
+
+## Coordinate spaces (used by tasks 8, 11, 12)
+
+One equation, defined once in `CrtcTransform` and reused everywhere:
+
+- `d` = a **mode-local scanout pixel** of the CRTC, `(0,0)` at its top-left.
+- `M` = `current` as received (no translation, D2).
+- **Intermediate-local** sample for `d`: `i = M · d`. The intermediate's
+  `(0,0)` is the CRTC's root origin, so this is also the footprint-local
+  position.
+- **Root** position: `r = i + (crtc.x, crtc.y)`. The CRTC origin is added only
+  when going to root space (scene, input, GetImage) — never inside the scale
+  shader, which works purely intermediate-local.
+- Inverse (cursor placement, hit-testing, absolute devices):
+  `d = M⁻¹ · (r − crtc_origin)`.
+- GetImage source rect in the intermediate:
+  `(requested_root ∩ footprint_root) − crtc_origin`.
 
 ## Phase 1 — protocol, state, geometry (D1–D3)
 
@@ -50,8 +70,16 @@ is behaviour-neutral for clients.
   for non-pure-scale (D2) and, until task 13, for every non-identity matrix,
   come **after** Xorg's own checks so error codes match Xorg where both
   reject.
-- Tests: each error in order (BadCrtc, non-invertible BadMatch, unknown filter
-  BadName, params without filter BadMatch, convolution BadMatch).
+- Tests, one per branch of the spec's validation order, in order:
+  BadCrtc; BadAccess for a leased CRTC — **not applicable**, yserver has no
+  RANDR leases (assert and document); non-invertible matrix BadMatch;
+  a request whose length leaves a negative parameter count → BadLength;
+  no transform support → BadValue (via the `transforms_supported()` flag
+  set false in the test; unreachable in production after task 13); unknown
+  filter BadName; filter parameter validation (`convolution`, which D2 then
+  rejects with BadMatch; `nearest`/`bilinear` with parameters → BadMatch as
+  Xorg's paramless filters); params without a filter BadMatch; then D2's own
+  BadMatch for non-pure-scale.
 
 ### 5. SetCrtcConfig applies pending → current
 - In the SetCrtcConfig path (`process_request.rs`, `begin_crtc_config`): a
@@ -98,7 +126,10 @@ is behaviour-neutral for clients.
   clamp-to-edge. New pipeline next to the existing composite pipelines.
 - Both scanout routes: shared pool and the copied (PRIME) route.
 - Tests (lavapipe): a known pattern at 2.0 / 0.5 nearest is exact; 1.6 / 0.8
-  bilinear within tolerance; the cropped edge blends toward black.
+  bilinear within tolerance; the cropped edge blends toward black; **a
+  transformed right-hand output at non-zero x** (Cinnamon's layout: identity
+  at 0,0, scaled at 2560,0) shows its own content, not black or shifted by
+  the origin.
 
 ### 9. Direct scanout off while transformed
 - `m1_gate_open` / `direct_scanout_topology_eligible` (`backend.rs` ~3528,
@@ -129,7 +160,8 @@ is behaviour-neutral for clients.
   the intermediate for transformed outputs, the scanout image otherwise; a
   request crossing both is assembled from both; holes zero-filled as today.
 - Tests: GetImage across a transformed + identity pair returns root-space
-  pixels; vng A/B against Xorg after `xrandr --scale` (root content only).
+  pixels, with the transformed output on the **right at non-zero x**; vng A/B
+  against Xorg after `xrandr --scale` (root content only).
 
 ## Phase 3 — advertise
 
