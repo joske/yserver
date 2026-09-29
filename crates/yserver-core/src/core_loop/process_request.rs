@@ -2954,15 +2954,17 @@ fn active_monitors(state: &ServerState) -> Vec<ActiveMonitor> {
         .randr
         .enabled_outputs()
         .map(|output| {
+            // The CRTC's footprint (`RRMonitorGetCrtcGeometry`, rrmonitor.c:71).
+            let (width, height) = output.footprint();
             let width_mm = if output.mm_width > 0 {
                 output.mm_width
             } else {
-                ((u32::from(output.width) * 254 + 480) / 960).max(1)
+                ((u32::from(width) * 254 + 480) / 960).max(1)
             };
             let height_mm = if output.mm_height > 0 {
                 output.mm_height
             } else {
-                ((u32::from(output.height) * 254 + 480) / 960).max(1)
+                ((u32::from(height) * 254 + 480) / 960).max(1)
             };
             ActiveMonitor {
                 name: output.name.clone(),
@@ -2970,8 +2972,8 @@ fn active_monitors(state: &ServerState) -> Vec<ActiveMonitor> {
                 primary: output.output_id == primary,
                 x: output.x,
                 y: output.y,
-                width: output.width,
-                height: output.height,
+                width,
+                height,
                 width_mm,
                 height_mm,
             }
@@ -11043,8 +11045,9 @@ fn default_present_crtc_for_window(state: &ServerState, window: ResourceId) -> u
     for output in state.randr.enabled_outputs() {
         let output_x = i32::from(output.x);
         let output_y = i32::from(output.y);
-        let output_right = output_x.saturating_add(i32::from(output.width));
-        let output_bottom = output_y.saturating_add(i32::from(output.height));
+        let (footprint_w, footprint_h) = output.footprint();
+        let output_right = output_x.saturating_add(i32::from(footprint_w));
+        let output_bottom = output_y.saturating_add(i32::from(footprint_h));
         let width = window_right.min(output_right) - window_x.max(output_x);
         let height = window_bottom.min(output_bottom) - window_y.max(output_y);
         let area = if width > 0 && height > 0 {
@@ -36935,6 +36938,303 @@ mod tests {
         randr_set_crtc_config(&mut state, &mut backend, &body).unwrap();
         let (_, success) = randr_crtc_notifies_and_success(&read_all_available(&mut peer));
         assert!(success, "past the screen edge is not BadValue");
+    }
+
+    /// The two 2560×1440 outputs of the muffin capture (spec, "What muffin
+    /// sends"): CRTC 4 at 0,0 and CRTC 6 at 2560,0, both mode 0x13.
+    const MUFFIN_MODE: u32 = 0x13;
+    const MUFFIN_MM: (u32, u32) = (597, 336);
+
+    fn muffin_output(output_id: u32, crtc_id: u32, x: i16) -> crate::randr::RandrOutput {
+        crate::randr::RandrOutput {
+            name: format!("DP-{output_id}"),
+            output_id,
+            crtc_id,
+            mode_id: MUFFIN_MODE,
+            connected: true,
+            x,
+            y: 0,
+            width: 2560,
+            height: 1440,
+            vrefresh: 60,
+            timing: None,
+            mm_width: MUFFIN_MM.0,
+            mm_height: MUFFIN_MM.1,
+            mode_ids: vec![MUFFIN_MODE],
+            num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+        }
+    }
+
+    struct MuffinReplay {
+        state: ServerState,
+        peer: UnixStream,
+        backend: RecordingBackend,
+    }
+
+    type Rect = (i16, i16, u16, u16);
+
+    impl MuffinReplay {
+        const OUTPUT_4: u32 = 3;
+        const OUTPUT_6: u32 = 5;
+
+        fn new() -> Self {
+            let mut state = ServerState::new();
+            state.randr = crate::randr::RandrState::from_outputs_with_modes(
+                1,
+                vec![
+                    muffin_output(Self::OUTPUT_4, 4, 0),
+                    muffin_output(Self::OUTPUT_6, 6, 2560),
+                ],
+                vec![crate::randr::RandrMode {
+                    mode_id: MUFFIN_MODE,
+                    width: 2560,
+                    height: 1440,
+                    vrefresh: 60,
+                    timing: None,
+                }],
+            );
+            let root = state.resources.window_mut(ROOT_WINDOW).unwrap();
+            (root.width, root.height) = (5120, 1440);
+            let peer = install_client(&mut state, 1);
+            let mut backend = RecordingBackend::new();
+            backend.apply_crtc_configs = true;
+            Self {
+                state,
+                peer,
+                backend,
+            }
+        }
+
+        fn send(&mut self, minor: u8, body: &[u8]) -> Vec<u8> {
+            handle_randr_request(
+                &mut self.state,
+                &mut self.backend,
+                ClientId(1),
+                SequenceNumber(1),
+                RequestHeader {
+                    opcode: 128,
+                    data: minor,
+                    length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+                },
+                body,
+            )
+            .expect("RANDR request");
+            read_all_available(&mut self.peer)
+        }
+
+        fn set_screen_size(&mut self, w: u16, h: u16, mm_w: u32, mm_h: u32) {
+            let mut body = ROOT_WINDOW.0.to_le_bytes().to_vec();
+            body.extend_from_slice(&w.to_le_bytes());
+            body.extend_from_slice(&h.to_le_bytes());
+            body.extend_from_slice(&mm_w.to_le_bytes());
+            body.extend_from_slice(&mm_h.to_le_bytes());
+            let out = self.send(yserver_protocol::x11::randr::RR_SET_SCREEN_SIZE, &body);
+            assert!(
+                out.chunks_exact(32).all(|c| c[0] != 0),
+                "SetScreenSize {w}x{h} failed: {out:02x?}"
+            );
+        }
+
+        /// SetCrtcTransform then SetCrtcConfig, as muffin orders them.
+        fn configure(&mut self, crtc: u32, output: u32, x: i16, scale: i32, filter: &[u8]) {
+            let out = self.send(
+                yserver_protocol::x11::randr::RR_SET_CRTC_TRANSFORM,
+                &randr_transform_body(crtc, rr_scale(scale), filter),
+            );
+            assert!(out.is_empty(), "SetCrtcTransform crtc {crtc}: {out:02x?}");
+            self.set_crtc_config(crtc, x, MUFFIN_MODE, &[output]);
+        }
+
+        fn set_crtc_config(&mut self, crtc: u32, x: i16, mode: u32, outputs: &[u32]) {
+            let out = self.send(
+                yserver_protocol::x11::randr::RR_SET_CRTC_CONFIG,
+                &randr_crtc_config_body(crtc, x, 0, mode, outputs),
+            );
+            let reply = out.chunks_exact(32).find(|c| c[0] != 0 && c[0] < 2);
+            assert_eq!(
+                reply.map(|c| (c[0], c[1])),
+                Some((1, 0)),
+                "SetCrtcConfig crtc {crtc} succeeds: {out:02x?}"
+            );
+        }
+
+        fn screen(&self) -> (u16, u16) {
+            let root = self.state.resources.window(ROOT_WINDOW).unwrap();
+            assert_eq!(
+                (root.width, root.height),
+                (
+                    self.state.randr.screen_width,
+                    self.state.randr.screen_height
+                ),
+                "root follows the RANDR screen"
+            );
+            (root.width, root.height)
+        }
+
+        /// GetCrtcInfo's `(x, y, width, height)`.
+        fn crtc_info(&mut self, crtc: u32) -> Rect {
+            let mut body = crtc.to_le_bytes().to_vec();
+            body.extend_from_slice(&0u32.to_le_bytes());
+            let r = self.send(yserver_protocol::x11::randr::RR_GET_CRTC_INFO, &body);
+            assert_eq!(r[0], 1, "GetCrtcInfo reply");
+            let i16_at = |o: usize| i16::from_le_bytes(r[o..o + 2].try_into().unwrap());
+            let u16_at = |o: usize| u16::from_le_bytes(r[o..o + 2].try_into().unwrap());
+            (i16_at(12), i16_at(14), u16_at(16), u16_at(18))
+        }
+
+        /// GetMonitors' `(x, y, width, height)` per monitor; asserts the
+        /// EDID mm are untouched by any transform.
+        fn monitors(&mut self) -> Vec<Rect> {
+            let mut body = ROOT_WINDOW.0.to_le_bytes().to_vec();
+            body.extend_from_slice(&[1, 0, 0, 0]);
+            let r = self.send(yserver_protocol::x11::randr::RR_GET_MONITORS, &body);
+            assert_eq!(r[0], 1, "GetMonitors reply");
+            let count = u32::from_le_bytes(r[12..16].try_into().unwrap());
+            let mut offset = 32;
+            let mut rects = Vec::new();
+            for _ in 0..count {
+                let m = &r[offset..];
+                let n_out = usize::from(u16::from_le_bytes(m[6..8].try_into().unwrap()));
+                let i16_at = |o: usize| i16::from_le_bytes(m[o..o + 2].try_into().unwrap());
+                let u16_at = |o: usize| u16::from_le_bytes(m[o..o + 2].try_into().unwrap());
+                let u32_at = |o: usize| u32::from_le_bytes(m[o..o + 4].try_into().unwrap());
+                assert_eq!((u32_at(16), u32_at(20)), MUFFIN_MM);
+                rects.push((i16_at(8), i16_at(10), u16_at(12), u16_at(14)));
+                offset += 24 + n_out * 4;
+            }
+            rects
+        }
+
+        fn assert_layout(
+            &mut self,
+            screen: (u16, u16),
+            crtc4: Rect,
+            crtc6: Rect,
+            monitors: &[Rect],
+        ) {
+            assert_eq!(self.screen(), screen, "screen");
+            assert_eq!(self.crtc_info(4), crtc4, "GetCrtcInfo 4");
+            assert_eq!(self.crtc_info(6), crtc6, "GetCrtcInfo 6");
+            assert_eq!(self.monitors(), monitors, "GetMonitors");
+        }
+    }
+
+    const MUFFIN_IDENTITY: i32 = 0x0001_0000;
+    const MUFFIN_2_0: i32 = 131_072;
+    const MUFFIN_1_599991: i32 = 104_857;
+    const MUFFIN_1_337494: i32 = 87_654;
+    const MUFFIN_0_5: i32 = 32_768;
+    const MUFFIN_0_799988: i32 = 52_428;
+
+    #[test]
+    fn randr_replays_muffin_scale_down_100_125_150() {
+        let mut r = MuffinReplay::new();
+        let left = (0, 0, 2560, 1440);
+        r.assert_layout(
+            (5120, 1440),
+            left,
+            (2560, 0, 2560, 1440),
+            &[left, (2560, 0, 2560, 1440)],
+        );
+
+        // Each row of the spec table: SetScreenSize, then CRTC 4, then CRTC 6.
+        for (screen, mm, scale6, crtc6) in [
+            ((7680, 2880), (1355, 508), MUFFIN_2_0, (2560, 0, 5120, 2880)),
+            (
+                (6656, 2304),
+                (1084, 375),
+                MUFFIN_1_599991,
+                (2560, 0, 4096, 2304),
+            ),
+            (
+                (5984, 1926),
+                (906, 292),
+                MUFFIN_1_337494,
+                (2560, 0, 3424, 1926),
+            ),
+        ] {
+            let before6 = r.crtc_info(6);
+            r.set_screen_size(screen.0, screen.1, mm.0, mm.1);
+            // A screen may crop the previous scaled footprint for a moment.
+            r.assert_layout(screen, left, before6, &[left, before6]);
+            r.configure(4, MuffinReplay::OUTPUT_4, 0, MUFFIN_IDENTITY, b"fast");
+            r.assert_layout(screen, left, before6, &[left, before6]);
+            r.configure(6, MuffinReplay::OUTPUT_6, 2560, scale6, b"good");
+            r.assert_layout(screen, left, crtc6, &[left, crtc6]);
+        }
+    }
+
+    #[test]
+    fn randr_replays_muffin_scale_up_125_through_both_crtcs_off() {
+        let mut r = MuffinReplay::new();
+        r.set_crtc_config(4, 0, 0, &[]);
+        r.assert_layout(
+            (5120, 1440),
+            (0, 0, 0, 0),
+            (2560, 0, 2560, 1440),
+            &[(2560, 0, 2560, 1440)],
+        );
+        r.set_crtc_config(6, 0, 0, &[]);
+        r.assert_layout((5120, 1440), (0, 0, 0, 0), (0, 0, 0, 0), &[]);
+        r.set_screen_size(4608, 1152, 750, 188);
+        r.assert_layout((4608, 1152), (0, 0, 0, 0), (0, 0, 0, 0), &[]);
+        // The mode is taller than the screen: this is what went dark.
+        r.configure(4, MuffinReplay::OUTPUT_4, 0, MUFFIN_0_5, b"nearest");
+        let left = (0, 0, 1280, 720);
+        r.assert_layout((4608, 1152), left, (0, 0, 0, 0), &[left]);
+        // CRTC 6 stays at 2560 although CRTC 4 is only 1280 wide.
+        r.configure(6, MuffinReplay::OUTPUT_6, 2560, MUFFIN_0_799988, b"good");
+        let right = (2560, 0, 2048, 1152);
+        r.assert_layout((4608, 1152), left, right, &[left, right]);
+        assert_eq!(
+            super::super::run::enabled_output_bbox(&r.state),
+            Some((4608, 1152))
+        );
+    }
+
+    #[test]
+    fn randr_client_screen_size_survives_a_larger_transformed_bbox() {
+        let mut r = MuffinReplay::new();
+        r.configure(6, MuffinReplay::OUTPUT_6, 2560, MUFFIN_2_0, b"good");
+        assert_eq!(
+            super::super::run::enabled_output_bbox(&r.state),
+            Some((7680, 2880))
+        );
+        let right = (2560, 0, 5120, 2880);
+        r.assert_layout(
+            (5120, 1440),
+            (0, 0, 2560, 1440),
+            right,
+            &[(0, 0, 2560, 1440), right],
+        );
+    }
+
+    #[test]
+    fn present_default_crtc_uses_the_transformed_footprint() {
+        const WINDOW: u32 = 0x0001_1001;
+        let mut state = ServerState::new();
+        state.randr = crate::randr::RandrState::from_outputs(
+            1,
+            vec![
+                present_test_output(1, 11, 0, 0, 2560, 1440, true),
+                present_test_output(2, 22, 2560, 0, 2560, 1440, true),
+            ],
+        );
+        state.randr.primary_output = 1;
+        // Below CRTC 22's mode but inside its 2.0 footprint.
+        create_present_test_window(&mut state, WINDOW, 2600, 1500, 500, 500);
+        assert_eq!(
+            default_present_crtc_for_window(&state, ResourceId(WINDOW)),
+            11
+        );
+        state.randr.outputs[1].current_transform =
+            crate::randr::CrtcTransform::new(rr_scale(MUFFIN_2_0), None, Vec::new()).unwrap();
+        assert_eq!(
+            default_present_crtc_for_window(&state, ResourceId(WINDOW)),
+            22
+        );
     }
 
     #[test]

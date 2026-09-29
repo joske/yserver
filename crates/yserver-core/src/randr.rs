@@ -392,7 +392,7 @@ impl RandrState {
         let screen_width: u16 = screen_extent(
             outputs
                 .iter()
-                .map(|o| i32::from(o.x).saturating_add(i32::from(o.width)))
+                .map(|o| i32::from(o.x).saturating_add(i32::from(o.footprint().0)))
                 .chain(
                     reserved
                         .iter()
@@ -402,7 +402,7 @@ impl RandrState {
         let screen_height: u16 = screen_extent(
             outputs
                 .iter()
-                .map(|o| i32::from(o.y).saturating_add(i32::from(o.height)))
+                .map(|o| i32::from(o.y).saturating_add(i32::from(o.footprint().1)))
                 .chain(
                     reserved
                         .iter()
@@ -623,7 +623,9 @@ impl RandrState {
     }
 
     /// Would shrinking the logical screen to `w`×`h` crop any enabled
-    /// output? (Xorg `RRSetScreenSize` BadMatch, rrscreen.c:266.)
+    /// output? (Xorg `RRSetScreenSize` BadMatch, rrscreen.c:266.) The box
+    /// is the untransformed mode even for a scaled CRTC, as measured
+    /// (spec Q3, `tools/vng-scenarios/xrandr-scale-crop.sh`).
     #[must_use]
     pub fn screen_size_would_crop(&self, w: u16, h: u16) -> bool {
         self.outputs.iter().filter(|o| o.mode_id != 0).any(|o| {
@@ -842,12 +844,14 @@ impl RandrState {
             .filter(|o| o.crtc_id == crtc_id)
             .map(|o| o.output_id)
             .collect();
+        // `RRCrtcGetScanoutSize`: the transformed footprint (rrcrtc.c:1212).
+        let (width, height) = out.footprint();
         Some(CrtcInfoData {
             timestamp: self.timestamp,
             x: out.x,
             y: out.y,
-            width: out.width,
-            height: out.height,
+            width,
+            height,
             mode_id: out.mode_id,
             outputs,
             possible_outputs,
@@ -2159,5 +2163,59 @@ mod tests {
             other.outputs[0].current_transform,
             CrtcTransform::identity()
         );
+    }
+
+    /// Two 1920×1440 outputs, B right of A (`xrandr-scale-crop.sh`).
+    fn crop_probe_state(b_scale: i32) -> RandrState {
+        let output = |output_id: u32, crtc_id: u32, x: i16| RandrOutput {
+            name: format!("Virtual-{output_id}"),
+            output_id,
+            crtc_id,
+            mode_id: 9,
+            connected: true,
+            x,
+            y: 0,
+            width: 1920,
+            height: 1440,
+            vrefresh: 60,
+            timing: None,
+            mm_width: 0,
+            mm_height: 0,
+            mode_ids: vec![9],
+            num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+        };
+        let mut st = RandrState::from_outputs(1, vec![output(1, 3, 0), output(2, 4, 1920)]);
+        st.outputs[1].current_transform = scale_transform(b_scale);
+        st
+    }
+
+    #[test]
+    fn screen_size_crop_uses_the_untransformed_mode_box() {
+        // spec Q3: the same thresholds scaled 2x2 and at identity.
+        for b_scale in [131_072, FIXED_ONE] {
+            let st = crop_probe_state(b_scale);
+            assert!(!st.screen_size_would_crop(3840, 1440), "{b_scale}");
+            assert!(st.screen_size_would_crop(3839, 1440), "{b_scale}");
+            assert!(st.screen_size_would_crop(3840, 1439), "{b_scale}");
+            assert!(!st.screen_size_would_crop(5759, 3841), "{b_scale}");
+        }
+    }
+
+    #[test]
+    fn crtc_info_and_derived_extent_use_the_footprint() {
+        let st = crop_probe_state(131_072);
+        let info = st.crtc_info(4, 0).unwrap();
+        assert_eq!(
+            (info.x, info.y, info.width, info.height),
+            (1920, 0, 3840, 2880)
+        );
+        let info = st.crtc_info(3, 0).unwrap();
+        assert_eq!((info.width, info.height), (1920, 1440));
+        let mut outputs = st.outputs.clone();
+        outputs[1].current_transform = scale_transform(131_072);
+        let derived = RandrState::from_outputs(1, outputs);
+        assert_eq!((derived.screen_width, derived.screen_height), (5760, 2880));
     }
 }

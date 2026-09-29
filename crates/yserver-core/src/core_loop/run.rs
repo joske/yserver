@@ -2845,8 +2845,9 @@ pub(crate) fn enabled_output_bbox(state: &ServerState) -> Option<(u16, u16)> {
     let mut max_y = 0i32;
     for output in state.randr.outputs.iter().filter(|o| o.mode_id != 0) {
         any = true;
-        max_x = max_x.max(i32::from(output.x).saturating_add(i32::from(output.width)));
-        max_y = max_y.max(i32::from(output.y).saturating_add(i32::from(output.height)));
+        let (width, height) = output.footprint();
+        max_x = max_x.max(i32::from(output.x).saturating_add(i32::from(width)));
+        max_y = max_y.max(i32::from(output.y).saturating_add(i32::from(height)));
     }
     any.then(|| {
         (
