@@ -3373,6 +3373,18 @@ fn handle_randr_request(
             return Ok(RequestOutcome::Handled);
         }
         x11randr::RR_GET_CRTC_TRANSFORM => {
+            // REQUEST_SIZE_MATCH(xRRGetCrtcTransformReq) before the lookup.
+            if body.len() != 4 {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(minor),
+                    RANDR_MAJOR_OPCODE,
+                );
+            }
             let crtc = request_xid(body);
             if !crtc_exists(state, crtc) {
                 return emit_x11_error_with_minor(
@@ -36756,6 +36768,14 @@ mod tests {
         peer: &mut UnixStream,
         crtc: u32,
     ) -> Vec<u8> {
+        randr_get_crtc_transform_body(state, peer, &crtc.to_le_bytes())
+    }
+
+    fn randr_get_crtc_transform_body(
+        state: &mut ServerState,
+        peer: &mut UnixStream,
+        body: &[u8],
+    ) -> Vec<u8> {
         let mut backend = RecordingBackend::new();
         handle_randr_request(
             state,
@@ -36765,12 +36785,43 @@ mod tests {
             RequestHeader {
                 opcode: 128,
                 data: yserver_protocol::x11::randr::RR_GET_CRTC_TRANSFORM,
-                length_units: 2,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
             },
-            &crtc.to_le_bytes(),
+            body,
         )
         .expect("GetCrtcTransform");
         read_all_available(peer)
+    }
+
+    #[test]
+    fn get_crtc_transform_of_the_wrong_length_is_bad_length_before_bad_crtc() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let crtc = state.randr.outputs[0].crtc_id;
+        // Short (header only) and oversized, for a real and a bogus CRTC.
+        for body in [
+            Vec::new(),
+            [crtc.to_le_bytes(), 0u32.to_le_bytes()].concat(),
+            [0xdead_u32.to_le_bytes(), 0u32.to_le_bytes()].concat(),
+        ] {
+            let reply = randr_get_crtc_transform_body(&mut state, &mut peer, &body);
+            assert_eq!(reply.len(), 32, "{body:?}");
+            assert_eq!(
+                (reply[0], reply[1]),
+                (0, x11::error::BAD_LENGTH),
+                "{body:?}"
+            );
+            assert_eq!(
+                (reply[8], reply[10]),
+                (yserver_protocol::x11::randr::RR_GET_CRTC_TRANSFORM, 128)
+            );
+        }
+        let reply = randr_get_crtc_transform(&mut state, &mut peer, 0xdead);
+        assert_eq!(
+            (reply[0], reply[1]),
+            (0, RANDR_BAD_CRTC),
+            "the right size looks up"
+        );
     }
 
     #[test]
