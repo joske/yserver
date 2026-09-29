@@ -3093,7 +3093,8 @@ impl KmsBackend {
         coverage: ScanoutM0Coverage,
         candidate: PresentScanoutCandidate,
     ) {
-        if !self.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch)
+        if self.platform.any_output_transformed()
+            || !self.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch)
             || !scanout_m1_probe_eligible(
                 self.scanout_allowed(),
                 self.kms_outputs_active,
@@ -3525,12 +3526,16 @@ impl KmsBackend {
         let cursor_mode = self.scene.cursor_mode();
         let cursor_hw = matches!(cursor_mode, crate::kms::render::scene::CursorPlaneMode::Hw);
         let root_overlay_empty = self.scene.root_overlay.is_empty();
+        // Page flipping is off while any CRTC is transformed
+        // (modesetting/present.c:266).
+        let untransformed = !self.platform.any_output_transformed();
         let m1_gate_open = m1_shape_candidate
             && crtc_eligible
             && scanout_allowed
             && kms_outputs_active
             && cursor_hw
             && root_overlay_empty
+            && untransformed
             && source_id.is_some();
         self.maybe_probe_scanout_m1(source_id, target, coverage, candidate);
         let diag = &mut self.scanout_m0;
@@ -7137,12 +7142,8 @@ impl KmsBackend {
         if !plain {
             return Ok(false);
         }
-        let outputs: Vec<(i32, i32, u32, u32)> = self
-            .platform
-            .outputs
-            .iter()
-            .map(|o| (o.x, o.y, u32::from(o.width), u32::from(o.height)))
-            .collect();
+        // Root space: a transformed output covers its footprint (spec D6).
+        let outputs = self.crtc_root_rects();
         if outputs.is_empty() {
             return Ok(false);
         }
@@ -7514,12 +7515,8 @@ impl KmsBackend {
     }
 
     fn read_root_scanout_assembled(&mut self, region: vk::Rect2D) -> Option<Vec<u8>> {
-        let outputs: Vec<(i32, i32, u32, u32)> = self
-            .platform
-            .outputs
-            .iter()
-            .map(|o| (o.x, o.y, u32::from(o.width), u32::from(o.height)))
-            .collect();
+        // Root space: a transformed output covers its footprint (spec D6).
+        let outputs = self.crtc_root_rects();
         if outputs.is_empty() {
             return None;
         }
@@ -13881,6 +13878,28 @@ impl KmsBackend {
         self.emit_motion_only(host_xid, mask, raw_dx, raw_dy);
     }
 
+    /// Every live CRTC's root rectangle (its footprint at its origin).
+    fn crtc_root_rects(&self) -> Vec<crate::kms::render::pointer_confine::CrtcRect> {
+        (0..self.platform.outputs.len())
+            .map(|idx| self.platform.output_root_rect(idx))
+            .collect()
+    }
+
+    /// `RRPointerScreenConfigured`: after a layout change, a pointer outside
+    /// every CRTC moves to the nearest one, with the events of a warp.
+    fn move_pointer_to_nearest_crtc(&mut self, state: &mut ServerState) {
+        #[allow(clippy::cast_possible_truncation)]
+        let (x, y) = (self.core.cursor_x as i32, self.core.cursor_y as i32);
+        let Some((nx, ny)) = crate::kms::render::pointer_confine::nearest_crtc_position(
+            &self.crtc_root_rects(),
+            x,
+            y,
+        ) else {
+            return;
+        };
+        self.warp_pointer_root(state, nx, ny);
+    }
+
     fn process_pointer_absolute(
         &mut self,
         server_state: &mut ServerState,
@@ -13926,8 +13945,15 @@ impl KmsBackend {
         // `process_pointer_absolute_uses_union_fb_extent_for_multi_output`.
         let fb_w = f32::from(self.platform.fb_w.max(1));
         let fb_h = f32::from(self.platform.fb_h.max(1));
-        let new_x = x.clamp(0.0, (fb_w - 1.0).max(0.0));
-        let new_y = y.clamp(0.0, (fb_h - 1.0).max(0.0));
+        let root_x = x.clamp(0.0, (fb_w - 1.0).max(0.0));
+        let root_y = y.clamp(0.0, (fb_h - 1.0).max(0.0));
+        // Then onto the CRTCs, before any hit-test or event (spec D5b).
+        let (new_x, new_y) = crate::kms::render::pointer_confine::constrain_to_crtcs(
+            &self.crtc_root_rects(),
+            (self.core.cursor_x, self.core.cursor_y),
+            (root_x, root_y),
+        );
+        confined |= (new_x, new_y) != (root_x, root_y);
         if new_x != self.core.cursor_x || new_y != self.core.cursor_y {
             self.core.cursor_x = new_x;
             self.core.cursor_y = new_y;
@@ -16928,6 +16954,12 @@ enum ScanoutReadRoute {
         bo_idx: usize,
         local: vk::Rect2D,
     },
+    /// A transformed output's intermediate, which holds root pixels. `local`
+    /// is `requested_root ∩ footprint_root − crtc_origin` (spec D6).
+    Intermediate {
+        output_idx: usize,
+        local: vk::Rect2D,
+    },
     /// A client drawable flipped directly onto this output's CRTC. `source` is
     /// the rect rebased into that drawable's own coordinate space.
     Direct {
@@ -16948,6 +16980,9 @@ enum ScanoutReadOrigin {
         pool_idx: usize,
         bo_idx: usize,
     },
+    TransformIntermediate {
+        output_idx: usize,
+    },
     DirectSource {
         source_xid: u32,
     },
@@ -16960,6 +16995,9 @@ impl ScanoutReadOrigin {
             Self::Empty => "empty".to_string(),
             Self::ComposedPool { pool_idx, bo_idx } => {
                 format!("composed-pool{pool_idx}-bo{bo_idx}")
+            }
+            Self::TransformIntermediate { output_idx } => {
+                format!("transform-intermediate-out{output_idx}")
             }
             Self::DirectSource { source_xid } => format!("direct-src-0x{source_xid:x}"),
         }
@@ -17036,10 +17074,24 @@ fn select_scanout_read_route(
     let phases = scanout_selection_phases(selection);
 
     for (pool_idx, layout) in backend.platform.outputs.iter().enumerate() {
-        let lx0 = i64::from(layout.x);
-        let ly0 = i64::from(layout.y);
-        let lx1 = lx0 + i64::from(layout.width);
-        let ly1 = ly0 + i64::from(layout.height);
+        // Root reads of a transformed output come from its intermediate, in
+        // root space; the dump still reads the scanout, in mode space.
+        let transformed = selection == ScanoutReadSelection::OnScreenOnly
+            && backend.platform.output_transform(pool_idx).is_some();
+        let (lx, ly, lw, lh) = if transformed {
+            backend.platform.output_root_rect(pool_idx)
+        } else {
+            (
+                layout.x,
+                layout.y,
+                u32::from(layout.width),
+                u32::from(layout.height),
+            )
+        };
+        let lx0 = i64::from(lx);
+        let ly0 = i64::from(ly);
+        let lx1 = lx0 + i64::from(lw);
+        let ly1 = ly0 + i64::from(lh);
         if rx0 < lx0 || ry0 < ly0 || rx1 > lx1 || ry1 > ly1 {
             continue;
         }
@@ -17049,6 +17101,18 @@ fn select_scanout_read_route(
         // not a licence to return stale composed pixels.
         if let Some(frame) = backend.direct_scanout_frame_for_output(pool_idx) {
             return direct_scanout_route_for_rect(backend, pool_idx, frame, rect);
+        }
+        if transformed {
+            return Ok(ScanoutReadRoute::Intermediate {
+                output_idx: pool_idx,
+                local: vk::Rect2D {
+                    offset: vk::Offset2D {
+                        x: i32::try_from(rx0 - lx0).unwrap_or(i32::MAX),
+                        y: i32::try_from(ry0 - ly0).unwrap_or(i32::MAX),
+                    },
+                    extent: rect.extent,
+                },
+            });
         }
         let Some(pool) = backend
             .platform
@@ -17230,13 +17294,16 @@ fn read_scanout_region_named(
         return Ok((Vec::new(), ScanoutReadOrigin::Empty));
     }
 
-    let (pool_idx, bo_idx, local_rect) = match select_scanout_read_route(backend, rect, selection)?
-    {
+    let (source, local_rect) = match select_scanout_read_route(backend, rect, selection)? {
         ScanoutReadRoute::Pool {
             pool_idx,
             bo_idx,
             local,
-        } => (pool_idx, bo_idx, local),
+        } => (ScanoutReadOrigin::ComposedPool { pool_idx, bo_idx }, local),
+        ScanoutReadRoute::Intermediate { output_idx, local } => (
+            ScanoutReadOrigin::TransformIntermediate { output_idx },
+            local,
+        ),
         ScanoutReadRoute::Direct {
             source_id,
             source_xid,
@@ -17299,32 +17366,52 @@ fn read_scanout_region_named(
         })
         .and_then(|px| px.checked_mul(4))
         .ok_or_else(|| io::Error::other("scanout copy size overflow"))?;
-    let Some(pool) = backend
-        .platform
-        .scanout_pools
-        .get_mut(pool_idx)
-        .and_then(|p| p.as_mut())
-    else {
-        return Err(io::Error::other("scanout pool vanished"));
-    };
-    // KMS phase selection above is always against B's display pool, but the
-    // composited pixels live in A's paired optimal target on a copied route.
-    // Readback must therefore use that local image/staging allocation with A's
-    // live Vk context; the external transport is not acquired or synchronized,
-    // while display, M2 retention, and pageflip retirement keep using B.
-    let (image, copied_route) = match pool {
-        crate::kms::vk::scanout::OutputScanout::Shared(pool) => {
-            let Some(bo) = pool.bos.get(bo_idx) else {
-                return Err(io::Error::other("scanout bo vanished"));
+    let (image, copied_route) = match source {
+        ScanoutReadOrigin::ComposedPool { pool_idx, bo_idx } => {
+            let Some(pool) = backend
+                .platform
+                .scanout_pools
+                .get_mut(pool_idx)
+                .and_then(|p| p.as_mut())
+            else {
+                return Err(io::Error::other("scanout pool vanished"));
             };
-            (bo.vk_image, false)
+            // KMS phase selection above is always against B's display pool,
+            // but the composited pixels live in A's paired optimal target on
+            // a copied route. Readback must therefore use that local
+            // image/staging allocation with A's live Vk context; the external
+            // transport is not acquired or synchronized, while display, M2
+            // retention, and pageflip retirement keep using B.
+            match pool {
+                crate::kms::vk::scanout::OutputScanout::Shared(pool) => {
+                    let Some(bo) = pool.bos.get(bo_idx) else {
+                        return Err(io::Error::other("scanout bo vanished"));
+                    };
+                    (bo.vk_image, false)
+                }
+                crate::kms::vk::scanout::OutputScanout::Copied(pool) => {
+                    let Some(source) = pool.sources.get(bo_idx) else {
+                        return Err(io::Error::other("copied scanout source vanished"));
+                    };
+                    source.validate_renderer_readback()?;
+                    (source.image(), true)
+                }
+            }
         }
-        crate::kms::vk::scanout::OutputScanout::Copied(pool) => {
-            let Some(source) = pool.sources.get(bo_idx) else {
-                return Err(io::Error::other("copied scanout source vanished"));
-            };
-            source.validate_renderer_readback()?;
-            (source.image(), true)
+        // Renderer A composes into it on either route, and leaves it GENERAL.
+        ScanoutReadOrigin::TransformIntermediate { output_idx } => {
+            let (image, _) = backend
+                .scene
+                .transform_intermediate(output_idx)
+                .ok_or_else(|| {
+                    io::Error::other(format!(
+                        "output {output_idx} transform intermediate has not been composed"
+                    ))
+                })?;
+            (image, false)
+        }
+        ScanoutReadOrigin::Empty | ScanoutReadOrigin::DirectSource { .. } => {
+            unreachable!("returned above")
         }
     };
     // The per-BO transfer staging is device-local write-combined memory,
@@ -17433,10 +17520,7 @@ fn read_scanout_region_named(
     // SAFETY: the buffer is mapped for at least `needed_bytes`, the copy's
     // fence has signalled, and `invalidate_for_read` made its writes visible.
     let raw = unsafe { std::slice::from_raw_parts(staging_mapped.as_ptr(), needed_bytes) };
-    Ok((
-        raw.to_vec(),
-        ScanoutReadOrigin::ComposedPool { pool_idx, bo_idx },
-    ))
+    Ok((raw.to_vec(), source))
 }
 
 /// Return the platform's reusable scanout-readback command buffer and fence,
@@ -19560,7 +19644,11 @@ impl Backend for KmsBackend {
         if self.scanout_m2.active() {
             use crate::kms::render::scene::CursorPlaneMode;
             let cursor_mode = self.scene.cursor_mode();
-            if !matches!(cursor_mode, CursorPlaneMode::Hw) || !self.scene.root_overlay.is_empty() {
+            if self.platform.any_output_transformed() {
+                self.request_direct_unflip("composite_tick_crtc_transform");
+            } else if !matches!(cursor_mode, CursorPlaneMode::Hw)
+                || !self.scene.root_overlay.is_empty()
+            {
                 let reason = match cursor_mode {
                     CursorPlaneMode::Mixed => "composite_tick_mixed_cursor",
                     CursorPlaneMode::Sw => "composite_tick_software_or_hidden_cursor",
@@ -19815,7 +19903,9 @@ impl Backend for KmsBackend {
         // longer starts at storage (0, 0). A candidate that does not
         // resolve at all is rejected further down.
         let unbordered = paint_target.is_none_or(|t| !t.has_border_clip());
-        let eligible = self.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch)
+        // No transformed CRTC is ever flipped directly (spec D5).
+        let eligible = !self.platform.any_output_transformed()
+            && self.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch)
             && scanout_direct_eligible(
                 self.scanout_allowed(),
                 self.kms_outputs_active,
@@ -21318,6 +21408,48 @@ impl Backend for KmsBackend {
         // A CRTC set bumps lastSetTime (to the client timestamp) but NOT
         // lastConfigTime (the available configuration didn't change).
         self.rebuild_randr_state(state, Some(set_time), false);
+    }
+
+    fn randr_layout_changed(&mut self, state: &mut ServerState) {
+        // The root extent is the client's (spec D3, "Two extents"); a CRTC
+        // set recomputes `fb_w`/`fb_h` from the modes, which is neither the
+        // root nor any footprint.
+        let root = (
+            state.randr.screen_width.max(1),
+            state.randr.screen_height.max(1),
+        );
+        let root_changed = root != (self.platform.fb_w, self.platform.fb_h);
+        if root_changed {
+            (self.platform.fb_w, self.platform.fb_h) = root;
+            self.update_input_extent(root.0, root.1);
+        }
+        let transforms: HashMap<OutputKey, yserver_core::randr::CrtcTransform> = state
+            .randr
+            .outputs
+            .iter()
+            .filter(|o| !o.current_transform.is_identity())
+            .filter_map(|o| {
+                let key = self.output_key_by_id.get(&o.output_id)?.clone();
+                Some((key, o.current_transform.clone()))
+            })
+            .collect();
+        let transforms_changed = transforms != self.platform.output_transforms;
+        if transforms_changed {
+            // No transformed CRTC is ever flipped directly (spec D5).
+            self.request_direct_unflip("crtc_transform_changed");
+            self.platform.output_transforms = transforms;
+            log::info!(
+                "kms: CRTC transforms now on {} output(s)",
+                self.platform.output_transforms.len()
+            );
+        }
+        if root_changed || transforms_changed {
+            if let Err(error) = self.scene.sync_output_layouts(&self.platform) {
+                log::error!("kms: scene could not follow the RANDR layout: {error}");
+            }
+            self.scene.wake_for_damage();
+        }
+        self.move_pointer_to_nearest_crtc(state);
     }
 
     fn output_identity(&self, output_id: u32) -> Option<(Vec<u8>, String)> {
@@ -37953,19 +38085,22 @@ mod tests {
     /// cross from monitor 0 onto monitor 1 in a side-by-side
     /// layout.
     ///
-    /// Simulate two side-by-side 2560×1440 monitors by leaving the
-    /// fixture's single 800×600 output entry in place but bumping
-    /// `platform.fb_w` to 5120 (this is what `core_platform_init`
-    /// computes as `max(x + width)` across all outputs in
-    /// production — see `kms/backend.rs:1063-1072`). The input
-    /// thread already targets that union extent at thread spawn,
-    /// so v2 receives `PointerMotion { x, y }` already in
-    /// virtual-screen coords; the only divergence was v2's
+    /// Two side-by-side 2560×1440 monitors and the `fb_w` of 5120 that
+    /// `core_platform_init` computes as `max(x + width)` across them
+    /// (`kms/backend.rs:1063-1072`). The input thread already targets that
+    /// union extent at thread spawn, so v2 receives `PointerMotion { x, y }`
+    /// already in virtual-screen coords; the only divergence was v2's
     /// re-clamp.
     #[test]
     fn process_pointer_absolute_uses_union_fb_extent_for_multi_output() {
         use yserver_core::server::ServerState;
         let mut b = KmsBackend::for_tests();
+        push_test_output(&mut b, 2);
+        for (i, output) in b.platform.outputs.iter_mut().enumerate() {
+            output.x = 2560 * i32::try_from(i).unwrap();
+            output.width = 2560;
+            output.height = 1440;
+        }
         b.platform.fb_w = 5120;
         b.platform.fb_h = 1440;
         let mut state = ServerState::new();
@@ -38706,7 +38841,7 @@ mod tests {
     /// entry, returning the new DrawableId. Used by the 4a
     /// resolver tests so the ancestor walk has something to chew
     /// on without touching Vk.
-    fn seed_window(
+    pub(super) fn seed_window(
         b: &mut KmsBackend,
         xid: u32,
         parent: Option<u32>,
@@ -46862,7 +46997,7 @@ mod tests {
     /// Push a second live output onto the fixture, with its own selected raw
     /// CRTC handle. Mirrors `PlatformBackend::for_tests()`'s single-output
     /// literal.
-    fn push_test_output(b: &mut super::KmsBackend, crtc_id: u32) {
+    pub(super) fn push_test_output(b: &mut super::KmsBackend, crtc_id: u32) {
         use crate::kms::backend::ActiveOutput;
         let device_key = b
             .platform
@@ -46923,7 +47058,7 @@ mod tests {
         ));
     }
 
-    fn install_direct_frame_for_target_test(
+    pub(super) fn install_direct_frame_for_target_test(
         b: &mut super::KmsBackend,
         target_xid: u32,
         fallback_id: crate::kms::render::store::DrawableId,
@@ -50994,3 +51129,7 @@ mod tests {
         assert_eq!(after, map);
     }
 }
+
+#[cfg(test)]
+#[path = "crtc_transform_tests.rs"]
+mod crtc_transform_tests;
