@@ -1,6 +1,7 @@
 # RANDR CRTC transforms (fractional scaling)
 
-> **Status: draft, reviewed by codex rounds 1–3 (2026-09-29), changes applied.**
+> **Status: implementation-ready — reviewed by codex rounds 1–4 (2026-09-29),
+> changes applied.**
 > Issue #185.
 
 ## Problem
@@ -141,8 +142,14 @@ All from `../xserver`, 21.1 branch.
     `active_monitors` (GetMonitors, XINERAMA), Present's CRTC selection,
     output composition (D4) and nearest-CRTC confinement (D5b);
   - the **root extent** stays exactly what `RRSetScreenSize` set: root
-    storage and protocol geometry, `enabled_output_bbox`-style root sizing,
-    and the input thread's rectangular safety clamp.
+    storage and protocol geometry, and the input thread's rectangular safety
+    clamp. The footprint-based output bbox derives the root extent only where
+    it does today — before any client logical size (startup, hotplug
+    recompute) — and feeds the "outputs caught up" notification check
+    (`run.rs:2819-2839`). Once a client has set a logical size, that override
+    survives later SetCrtcConfig calls, as it already does
+    (`randr.rs:1209`, `an_explicit_client_logical_size_overrides_a_reserved_slot`);
+    a transformed bbox larger than a cropped root never resizes root storage.
   The KMS scanout images stay mode-sized. CrtcChangeNotify keeps the mode
   size.
 - SetCrtcConfig skips `screen_encompasses` when transforms are supported, as
@@ -158,16 +165,20 @@ All from `../xserver`, 21.1 branch.
 ### D4 — Rendering a transformed output
 
 - The scene composites a transformed output into an **intermediate image**
-  the size of its footprint, in root space: the existing walk, damage and
-  buffer-age work unchanged, with the output's layout rect = the footprint.
+  allocated at the full footprint size, in root space, origin = the CRTC's
+  (x, y): the existing walk, damage and buffer-age work unchanged, with the
+  output's layout rect = the footprint.
 - A **scale pass** then draws the whole mode-sized scanout image, sampling the
   intermediate through `current` (scanout pixel → root pixel, i.e. the wire
   matrix, minus the CRTC offset), with a nearest or linear sampler. A full
   pass every frame the output repaints; no damage transform in phase 1.
-- **Outside the root extent.** The intermediate covers only footprint ∩ root.
-  Any sample outside the root reads **transparent black** (clamp-to-border,
-  transparent-black border) and is written as black, as Xorg's shadow pass
-  does: `PictOpSrc` from a source picture on the screen drawable with the
+- **Outside the root extent.** Only footprint ∩ root is composited; the rest
+  of the intermediate is explicitly cleared to transparent black whenever the
+  root or the footprint changes. The pass samples the whole intermediate with
+  clamp-to-edge (in bounds by construction), so the UV origin is fixed and the
+  bilinear edge at the root boundary blends toward that black, matching
+  Xorg's shadow pass, where every sample outside the root reads transparent
+  black and is written as black: `PictOpSrc` from a source picture on the screen drawable with the
   default `repeat = None` (`xf86Rotate.c:59-89`). Bilinear filtering at the
   root edge blends toward black, as pixman does.
 - Identity outputs keep today's path: no intermediate, no pass, no cost.
