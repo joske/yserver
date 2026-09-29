@@ -303,6 +303,10 @@ pub struct SetupAllocateResponse {
     pub resource_id_mask: u32,
     pub screen_width_px: u16,
     pub screen_height_px: u16,
+    /// Physical size as RANDR last set it (`RRSetScreenSize` mm, e.g.
+    /// `xrandr --dpi`); Xft derives DPI from these.
+    pub screen_width_mm: u16,
+    pub screen_height_mm: u16,
     pub current_input_masks: u32,
 }
 

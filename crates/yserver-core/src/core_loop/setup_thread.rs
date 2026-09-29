@@ -203,18 +203,12 @@ fn run_setup(
         id.0, setup.protocol_major, setup.protocol_minor, resp.resource_id_base
     );
 
-    // mm = px * 25.4 / 96 (integer form: (px*254 + 480) / 960).
-    // Matches Xorg's and Xwayland's SETUP-reply convention: 5120 px →
-    // 1354 mm, 1440 px → 381 mm. Matches xts5's tetexec.cfg
-    // XT_WIDTH_MM/XT_HEIGHT_MM expectations. Real per-monitor mm
-    // (from EDID via DRM connector) is reported separately via RANDR
-    // GetOutputInfo.
-    let screen_width_mm = ((u32::from(resp.screen_width_px) * 254 + 480) / 960)
-        .max(1)
-        .min(u32::from(u16::MAX)) as u16;
-    let screen_height_mm = ((u32::from(resp.screen_height_px) * 254 + 480) / 960)
-        .max(1)
-        .min(u32::from(u16::MAX)) as u16;
+    // The screen's physical size as RANDR holds it: 96 DPI at startup,
+    // then whatever `RRSetScreenSize` set (`xrandr --dpi`), as Xorg's
+    // `pScreen->mmWidth` (dispatch.c SendConnSetup). Real per-monitor mm
+    // (EDID) is reported separately via RANDR GetOutputInfo.
+    let screen_width_mm = resp.screen_width_mm.max(1);
+    let screen_height_mm = resp.screen_height_mm.max(1);
 
     let setup_reply = x11::encode_setup_success(
         setup.byte_order,
@@ -406,6 +400,8 @@ mod tests {
                 resource_id_mask: 0x000F_FFFF,
                 screen_width_px: 800,
                 screen_height_px: 600,
+                screen_width_mm: 212,
+                screen_height_mm: 159,
                 current_input_masks: 0,
             })
             .unwrap();
@@ -482,6 +478,8 @@ mod tests {
                 resource_id_mask: 0x000F_FFFF,
                 screen_width_px: 800,
                 screen_height_px: 600,
+                screen_width_mm: 212,
+                screen_height_mm: 159,
                 current_input_masks: 0,
             })
             .unwrap();
@@ -581,6 +579,8 @@ mod tests {
                 resource_id_mask: 0x000F_FFFF,
                 screen_width_px: 800,
                 screen_height_px: 600,
+                screen_width_mm: 212,
+                screen_height_mm: 159,
                 current_input_masks: 0,
             })
             .unwrap();

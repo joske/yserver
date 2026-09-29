@@ -3090,6 +3090,8 @@ fn handle_setup_allocate(
             resource_id_mask: mask,
             screen_width_px: state.randr.screen_width,
             screen_height_px: state.randr.screen_height,
+            screen_width_mm: u16::try_from(state.randr.width_mm).unwrap_or(u16::MAX),
+            screen_height_mm: u16::try_from(state.randr.height_mm).unwrap_or(u16::MAX),
             current_input_masks: state
                 .clients
                 .values()
@@ -3101,6 +3103,8 @@ fn handle_setup_allocate(
             resource_id_mask: 0,
             screen_width_px: 0,
             screen_height_px: 0,
+            screen_width_mm: 0,
+            screen_height_mm: 0,
             current_input_masks: 0,
         },
     };
@@ -3625,6 +3629,21 @@ fn _hint(_: Transport) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #132: `xrandr --dpi` (RRSetScreenSize with the same pixels, new mm)
+    /// reaches NEW clients' setup reply, as Xorg's `pScreen->mmWidth`.
+    /// Measured in vng (tools/vng-scenarios/xrandr-dpi.sh): 1280x800 at
+    /// `--dpi 108` → 301x188 mm on Xorg 21.1.24 and on yserver.
+    #[test]
+    fn setup_allocate_reports_randr_screen_mm() {
+        let mut state = ServerState::new();
+        let (w, h) = (state.randr.screen_width, state.randr.screen_height);
+        state.randr.set_logical_size(1, w, h, 301, 188);
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        handle_setup_allocate(&mut state, yserver_protocol::x11::ClientId(1), tx);
+        let resp = rx.try_recv().expect("setup allocate response");
+        assert_eq!((resp.screen_width_mm, resp.screen_height_mm), (301, 188));
+    }
     use std::os::unix::net::UnixStream;
 
     #[test]
