@@ -675,6 +675,12 @@ pub(crate) struct Drawable {
     /// [`ack_presentation_damage`].
     pub(crate) presentation_damage: RegionSet,
     pub(crate) presentation_damage_epoch: u64,
+    /// Per rect of `presentation_damage`, the epoch that added it, so an ack
+    /// removes exactly the rects its snapshot saw. Subtracting the snapshot's
+    /// rects instead removed a newer paint of the same rect whenever two
+    /// outputs acked overlapping snapshots: both carried the one rect, and the
+    /// second ack took the next paint's copy with it.
+    presentation_damage_epochs: Vec<u64>,
 
     /// Idle free-run fix (cut 2b): set when this drawable is
     /// scene-participating and holds presentation damage but was NOT
@@ -952,6 +958,7 @@ impl DrawableStore {
             last_render_ticket: None,
             presentation_damage: RegionSet::new(),
             presentation_damage_epoch: 0,
+            presentation_damage_epochs: Vec::new(),
             dormant: None,
             content_version: 0,
             content_offset: 0,
@@ -1168,6 +1175,7 @@ impl DrawableStore {
         d.scene_participating = v;
         if was && !v {
             d.presentation_damage.clear();
+            d.presentation_damage_epochs.clear();
             d.presentation_damage_epoch = d.presentation_damage_epoch.checked_add(1).unwrap_or(0);
         }
     }
@@ -1186,8 +1194,17 @@ impl DrawableStore {
             return;
         };
         if d.scene_participating {
+            let before = d.presentation_damage.rects().len();
             d.presentation_damage.add(rect);
             d.presentation_damage_epoch = d.presentation_damage_epoch.checked_add(1).unwrap_or(0);
+            let after = d.presentation_damage.rects().len();
+            if after == before + 1 {
+                d.presentation_damage_epochs
+                    .push(d.presentation_damage_epoch);
+            } else if after != before {
+                // Collapsed to the bounding box: it holds this paint too.
+                d.presentation_damage_epochs = vec![d.presentation_damage_epoch; after];
+            }
             // A window whose last paint was under a cover may be painting its
             // visible part now: re-arm. A window nothing of which is drawn
             // cannot become visible by painting, so it stays dormant.
@@ -1291,20 +1308,36 @@ impl DrawableStore {
 
     /// Ack: if `snap.epoch == current_epoch`, clear live
     /// damage. If `snap.epoch < current_epoch`, paint arrived
-    /// between peek and ack — subtract only the snapshot's
-    /// region so post-peek damage survives.
+    /// between peek and ack — drop only the rects added at or
+    /// before `snap.epoch`, so post-peek damage survives however
+    /// many outputs ack overlapping snapshots.
     ///
     /// Per codex round 1 point 5: if scene_participating
     /// flipped to false since the snapshot, the live damage
-    /// is already empty and the subtract is a no-op.
+    /// is already empty and the ack is a no-op.
     pub(crate) fn ack_presentation_damage(&mut self, snap: DamageSnapshot) {
         let Some(d) = self.entries.get_mut(&snap.id) else {
             return;
         };
         if snap.epoch == d.presentation_damage_epoch {
             d.presentation_damage.clear();
+            d.presentation_damage_epochs.clear();
         } else {
-            d.presentation_damage.subtract(&snap.region);
+            let mut kept = RegionSet::new();
+            let mut epochs = Vec::new();
+            for (rect, epoch) in d
+                .presentation_damage
+                .rects()
+                .iter()
+                .zip(&d.presentation_damage_epochs)
+            {
+                if *epoch > snap.epoch {
+                    kept.add(*rect);
+                    epochs.push(*epoch);
+                }
+            }
+            d.presentation_damage = kept;
+            d.presentation_damage_epochs = epochs;
         }
     }
 
@@ -1670,6 +1703,34 @@ mod tests {
         let live = &s.get(id).unwrap().presentation_damage;
         assert_eq!(live.rects().len(), 1);
         assert_eq!(live.rects()[0].offset, vk::Offset2D { x: 8, y: 8 });
+    }
+
+    /// Two outputs carried overlapping snapshots of one full-window paint
+    /// rect; the second ack must not take the next paint of that rect with it
+    /// (vng two-output span-paint: both outputs left one fill behind).
+    #[test]
+    fn overlapping_acks_keep_a_newer_paint_of_the_same_rect() {
+        let mut s = DrawableStore::new();
+        let id = s
+            .allocate(0x1, DrawableKind::Window, 24, true, stub_storage())
+            .unwrap();
+        let r = rect(0, 0, 64, 64);
+        s.damage(id, r);
+        let out1 = s.peek_presentation_damage(id).unwrap();
+        s.damage(id, r);
+        let out0 = s.peek_presentation_damage(id).unwrap();
+        s.ack_presentation_damage(out1);
+        s.damage(id, r);
+        s.ack_presentation_damage(out0);
+        let d = s.get(id).unwrap();
+        assert_eq!(
+            d.presentation_damage.rects(),
+            &[r],
+            "the third paint is unpresented"
+        );
+        let last = s.peek_presentation_damage(id).unwrap();
+        s.ack_presentation_damage(last);
+        assert!(s.get(id).unwrap().presentation_damage.is_empty());
     }
 
     #[test]

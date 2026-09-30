@@ -559,6 +559,12 @@ struct OutputSceneState {
     /// (startup, `rebuild_outputs`) starts empty, and a drawable in NO output's
     /// set is treated as unknown ⇒ every output walks — conservative.
     last_pieces: std::collections::HashSet<super::store::DrawableId>,
+    /// The presentation-damage epoch of every drawable this output's most
+    /// recent submitted compose carried. Another output's compose of a
+    /// drawable at a newer epoch hands this one the damage
+    /// ([`fan_out_carried_damage`]), because that output's retire acks it in
+    /// the store for everyone.
+    presented_epochs: std::collections::HashMap<super::store::DrawableId, u64>,
     /// The footprint-sized image a RANDR-transformed output composites into
     /// before the scale pass; `None` at identity (spec D4).
     intermediate: Option<TransformIntermediate>,
@@ -1117,6 +1123,19 @@ impl WalkStats {
     }
 }
 
+/// Content damage a compose carried, in root coordinates.
+///
+/// Its output's retire acks the drawable's damage in the store, which is
+/// global, so an output that has not composed that epoch yet (flip-pending
+/// while the paint landed) would never see it. The compose therefore hands it
+/// to the other outputs as structure damage: [`fan_out_carried_damage`].
+#[derive(Clone, Debug)]
+struct CarriedDamage {
+    id: super::store::DrawableId,
+    epoch: u64,
+    root: Vec<vk::Rect2D>,
+}
+
 /// Everything the walk produces, threaded through the recursion.
 ///
 /// Pushed in **computation** order (children top → bottom, then self) and
@@ -1127,6 +1146,8 @@ impl WalkStats {
 struct WalkSink<'a> {
     /// Which output this walk is for — only for the gated diagnostics.
     output_idx: usize,
+    /// Root position of this output's layout: output-local + origin = root.
+    origin: (i32, i32),
     /// Sampled sources that emitted pieces on some OTHER output at its last
     /// walk (the union of the other outputs' retained `last_pieces`). Decides
     /// `ContentDamage::OtherOutput` vs `OffOutput`. Empty when unknown (single
@@ -1134,6 +1155,8 @@ struct WalkSink<'a> {
     elsewhere: &'a std::collections::HashSet<super::store::DrawableId>,
     draws: Vec<CompositeDraw>,
     snapshots: Vec<DamageSnapshot>,
+    /// The non-empty carried snapshots again, in root coordinates. Unordered.
+    carried: Vec<CarriedDamage>,
     sampled_ids: Vec<super::store::DrawableId>,
     projected: RegionSet,
     participants: Vec<ScenePresence>,
@@ -1166,13 +1189,16 @@ struct WalkSink<'a> {
 impl<'a> WalkSink<'a> {
     fn new(
         output_idx: usize,
+        origin: (i32, i32),
         elsewhere: &'a std::collections::HashSet<super::store::DrawableId>,
     ) -> Self {
         Self {
             output_idx,
+            origin,
             elsewhere,
             draws: Vec::new(),
             snapshots: Vec::new(),
+            carried: Vec::new(),
             sampled_ids: Vec::new(),
             projected: RegionSet::new(),
             participants: Vec::new(),
@@ -1197,6 +1223,8 @@ impl<'a> WalkSink<'a> {
 struct SceneBuild {
     scene: CompositeScene,
     snapshots: Vec<DamageSnapshot>,
+    /// See [`WalkSink::carried`].
+    carried: Vec<CarriedDamage>,
     sampled_ids: Vec<super::store::DrawableId>,
     projected_damage: RegionSet,
     /// Stage 5 Phase C — pure cursor strategy decision. The outer
@@ -1377,6 +1405,7 @@ impl SceneCompositor {
             // shaped `missing` vector — see the plan's 3.4.
             prev_presented: Vec::new(),
             last_pieces: std::collections::HashSet::new(),
+            presented_epochs: std::collections::HashMap::new(),
             intermediate: None,
             cursor_saves: CursorSaves::default(),
             // Per scanout BO, so in mode (BO) pixels even when transformed.
@@ -2077,6 +2106,7 @@ impl SceneCompositor {
         // went dormant — the root's covered damage was re-peeked and
         // re-classified Hidden ~1000×/s (silence/MATE, 2026-09-04).
         let mut walked_outputs: Vec<bool> = vec![false; inner.outputs.len()];
+        let mut carried = Vec::new();
         if let Err(e) = ensure_intermediates(inner, platform) {
             log::warn!("render scene tick: transform intermediate allocation failed: {e}");
         }
@@ -2130,12 +2160,18 @@ impl SceneCompositor {
                 &elsewhere,
                 &mut drawn,
                 &mut had_pieces,
+                &mut carried,
                 structure_dirty,
                 pending_presentation,
             ) {
                 Ok(outcome) => {
                     if outcome == TickOutcome::Composed {
                         composed.push(output_idx);
+                        // The other outputs' damage is handed over as
+                        // structure damage; keep the scheduler awake for it.
+                        if fan_out_carried_damage(inner, output_idx, &carried) {
+                            clear_dirty = false;
+                        }
                     } else {
                         clear_dirty &= outcome.clears_scene_structure_dirty();
                     }
@@ -4169,6 +4205,9 @@ fn tick_one_output(
     // Sampled sources that emitted at least one piece on this output — with
     // `drawn` this picks the dormancy reason (see `DormantReason`).
     had_pieces: &mut std::collections::HashSet<super::store::DrawableId>,
+    // This output's carried content damage in root coordinates, replaced on a
+    // compose (`Composed`) for `tick` to fan out to the other outputs.
+    carried: &mut Vec<CarriedDamage>,
     // Pre-walk predicate inputs read once per tick by `tick` — see
     // `walk_needed`.
     structure_dirty: bool,
@@ -4955,6 +4994,8 @@ fn tick_one_output(
                 store.touch_render_fence(*id, compose_ticket.clone());
             }
             state.pool_slots.push_back(slot);
+            state.presented_epochs = built.snapshots.iter().map(|s| (s.id, s.epoch)).collect();
+            *carried = std::mem::take(&mut built.carried);
             state.pending_acks.push_back(PendingAck {
                 bo_idx: token.bo_idx,
                 generation: frame_gen,
@@ -5625,7 +5666,7 @@ fn build_scene_with(
     // A transformed output walks its whole footprint (spec D4).
     let (layout_x0, layout_y0, layout_w, layout_h) = platform.output_root_rect(output_idx);
 
-    let mut sink = WalkSink::new(output_idx, elsewhere);
+    let mut sink = WalkSink::new(output_idx, (layout_x0, layout_y0), elsewhere);
     // Stage 4c.3 — the root samples through `redirected_target` like any other
     // node; geometry stays the host drawable's. Decided up front, emitted last
     // (see below).
@@ -5858,9 +5899,11 @@ fn build_scene_with(
     sink.reverse();
     let WalkSink {
         output_idx: _,
+        origin: _,
         elsewhere: _,
         mut draws,
         snapshots,
+        carried,
         mut sampled_ids,
         projected,
         participants,
@@ -5967,6 +6010,7 @@ fn build_scene_with(
     SceneBuild {
         scene,
         snapshots,
+        carried,
         sampled_ids,
         projected_damage: projected,
         cursor_assignment,
@@ -6310,6 +6354,25 @@ fn emit_node(
             sink.presented_ids.push(source_id);
         }
         if carry {
+            if !snap.region.is_empty() {
+                let (ox, oy) = (dx + sink.origin.0, dy + sink.origin.1);
+                sink.carried.push(CarriedDamage {
+                    id: source_id,
+                    epoch: snap.epoch,
+                    root: snap
+                        .region
+                        .rects()
+                        .iter()
+                        .map(|r| vk::Rect2D {
+                            offset: vk::Offset2D {
+                                x: r.offset.x + ox,
+                                y: r.offset.y + oy,
+                            },
+                            extent: r.extent,
+                        })
+                        .collect(),
+                });
+            }
             sink.snapshots.push(snap);
         }
     } else {
@@ -7571,6 +7634,58 @@ fn visit_window_subtree(
     if let Some((out, participant)) = emitted_presence {
         push_presence(sink, node.place, out, participant);
     }
+}
+
+/// Hand the content damage output `from` just composed to every other output
+/// that has not composed it, as structure damage. Returns whether any output
+/// took some.
+///
+/// `from`'s retire acks the drawable's damage in the store, which is global:
+/// an output that was flip-pending when the paint landed, and walks only after
+/// that retire, would find nothing and keep the old pixels on screen (a caja
+/// desktop repaint after a RANDR change, lost on the other monitor). An output
+/// whose own compose carried the drawable at this epoch or newer already shows
+/// it, and one on which the drawable had no pieces cannot show it.
+fn fan_out_carried_damage(
+    inner: &mut SceneCompositorInner,
+    from: usize,
+    carried: &[CarriedDamage],
+) -> bool {
+    let mut took = false;
+    for (idx, o) in inner.outputs.iter_mut().enumerate() {
+        if idx != from {
+            took |= fan_out_to_output(
+                o.output_origin,
+                o.output_extent,
+                &o.last_pieces,
+                &o.presented_epochs,
+                &mut o.scene_structure_damage,
+                carried,
+            );
+        }
+    }
+    took
+}
+
+/// One output's share of [`fan_out_carried_damage`].
+fn fan_out_to_output(
+    origin: (i32, i32),
+    extent: vk::Extent2D,
+    last_pieces: &std::collections::HashSet<super::store::DrawableId>,
+    presented_epochs: &std::collections::HashMap<super::store::DrawableId, u64>,
+    damage: &mut RegionSet,
+    carried: &[CarriedDamage],
+) -> bool {
+    let before = damage.rects().len();
+    for c in carried {
+        if !last_pieces.contains(&c.id)
+            || presented_epochs.get(&c.id).is_some_and(|e| *e >= c.epoch)
+        {
+            continue;
+        }
+        dispatch_clip_rects_to_outputs(std::iter::once((origin, extent, &mut *damage)), &c.root);
+    }
+    damage.rects().len() != before
 }
 
 /// Stage 4c.1 — for each `(extent, damage)` pair in `outputs`, clip
@@ -9655,6 +9770,7 @@ mod tests {
                 }],
             },
             snapshots: Vec::new(),
+            carried: Vec::new(),
             sampled_ids: vec![cursor_id],
             presented_ids: vec![cursor_id],
             pieces_ids: vec![cursor_id],
@@ -9738,6 +9854,7 @@ mod tests {
                 }],
             },
             snapshots: Vec::new(),
+            carried: Vec::new(),
             sampled_ids: vec![cursor_id],
             presented_ids: vec![cursor_id],
             pieces_ids: vec![cursor_id],
@@ -15411,6 +15528,108 @@ mod tests {
                 .iter()
                 .any(|s| s.id == w && !s.region.is_empty())
         );
+    }
+
+    /// The multi-output ack race for a paint spanning both outputs: output 0
+    /// is flip-pending when it lands, output 1 composes it, and output 1's
+    /// retire acks it for everyone. The compose carries it in root
+    /// coordinates, and output 0 is handed its share as structure damage.
+    #[test]
+    fn a_spanning_paint_is_handed_to_the_output_that_did_not_compose_it() {
+        let (core, mut store, windows) = two_windows((700, 100, 200, 100), (0, 0, 10, 10));
+        let w = drawable_of(&store, 0x100);
+        let warm = build_with(
+            Visibility::On,
+            &core,
+            &mut store,
+            &windows,
+            (0, 0, 800, 600),
+            None,
+        );
+        let out0_pieces: std::collections::HashSet<_> = warm.pieces_ids.iter().copied().collect();
+        let out0_presented: std::collections::HashMap<_, _> =
+            warm.snapshots.iter().map(|s| (s.id, s.epoch)).collect();
+        store.damage(w, rect(0, 0, 200, 100));
+        let out1 = build_with_elsewhere(
+            Visibility::On,
+            &core,
+            &mut store,
+            &windows,
+            (800, 0, 800, 600),
+            None,
+            &out0_pieces,
+        );
+        let carried: Vec<_> = out1.carried.iter().filter(|c| c.id == w).collect();
+        assert_eq!(carried.len(), 1);
+        assert_eq!(carried[0].root, vec![rect(700, 100, 200, 100)]);
+        let mut out0_damage = RegionSet::new();
+        assert!(fan_out_to_output(
+            (0, 0),
+            extent(800, 600),
+            &out0_pieces,
+            &out0_presented,
+            &mut out0_damage,
+            &out1.carried,
+        ));
+        assert_eq!(out0_damage.rects(), &[rect(700, 100, 100, 100)]);
+        for snap in out1.snapshots {
+            store.ack_presentation_damage(snap);
+        }
+        let out0 = build_with(
+            Visibility::On,
+            &core,
+            &mut store,
+            &windows,
+            (0, 0, 800, 600),
+            None,
+        );
+        assert!(
+            projected_sorted(&out0).is_empty(),
+            "the store no longer holds it: the structure damage is all output 0 gets"
+        );
+    }
+
+    /// An output that composed the drawable at that epoch or newer, or on
+    /// which it had no pieces, takes nothing.
+    #[test]
+    fn fan_out_skips_outputs_that_show_it_or_cannot() {
+        let (_, store, _) = two_windows((700, 100, 200, 100), (0, 0, 10, 10));
+        let w = drawable_of(&store, 0x100);
+        let carried = [CarriedDamage {
+            id: w,
+            epoch: 5,
+            root: vec![rect(700, 100, 200, 100)],
+        }];
+        let pieces: std::collections::HashSet<_> = [w].into_iter().collect();
+        let mut damage = RegionSet::new();
+        let at = |e: u64| -> std::collections::HashMap<_, _> { [(w, e)].into_iter().collect() };
+        for presented in [at(5), at(6)] {
+            assert!(!fan_out_to_output(
+                (0, 0),
+                extent(800, 600),
+                &pieces,
+                &presented,
+                &mut damage,
+                &carried,
+            ));
+        }
+        assert!(!fan_out_to_output(
+            (0, 0),
+            extent(800, 600),
+            &std::collections::HashSet::new(),
+            &at(4),
+            &mut damage,
+            &carried,
+        ));
+        assert!(damage.is_empty());
+        assert!(fan_out_to_output(
+            (0, 0),
+            extent(800, 600),
+            &pieces,
+            &at(4),
+            &mut damage,
+            &carried,
+        ));
     }
 
     /// `Off` keeps the unclipped projection: what the legacy emitter damaged.
