@@ -220,15 +220,45 @@ fn submit_flip_inner(
     )
 }
 
+/// Returns without reading when no event is queued: the DRM fd is blocking,
+/// and readiness the core loop polled can already have been consumed by
+/// `discard_old_drm_events_after_all_off` earlier in the same iteration.
 pub fn drain_events<A, S>(device: &Device, mut on_advance: A, mut on_sequence: S) -> io::Result<()>
 where
     A: FnMut(crtc::Handle, u32, std::time::Duration),
     S: FnMut(u64, i64, u64),
 {
+    if !event_pending(device)? {
+        return Ok(());
+    }
     for event in device.receive_events()? {
         dispatch_event(event, &mut on_advance, &mut on_sequence);
     }
     Ok(())
+}
+
+/// Zero-timeout poll of the DRM fd. Sound as a guard for the blocking read
+/// because this process is the fd's only event reader.
+fn event_pending(device: &Device) -> io::Result<bool> {
+    use std::os::{fd::AsFd, unix::io::AsRawFd};
+
+    let mut poll_fd = libc::pollfd {
+        fd: device.as_fd().as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: one initialized pollfd, live for the call; the fd is held
+        // open by `device`.
+        let ready = unsafe { libc::poll(&raw mut poll_fd, 1, 0) };
+        if ready >= 0 {
+            return Ok(poll_fd.revents & libc::POLLIN != 0);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
 }
 
 /// Dispatch a single drm event.
@@ -431,5 +461,58 @@ mod tests {
         let mut seq_calls = 0usize;
         dispatch_event(event, &mut |_, _, _| {}, &mut |_, _, _| seq_calls += 1);
         assert_eq!(seq_calls, 0);
+    }
+
+    /// A `Device` over one end of a socket pair: `read` on it behaves like the
+    /// DRM fd's (blocks while empty), and the peer injects raw event bytes.
+    fn device_with_event_feed() -> (crate::drm::Device, std::os::unix::net::UnixStream) {
+        let (ours, feed) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let device =
+            crate::drm::Device::from_inherited_kms_fd(std::os::fd::OwnedFd::from(ours), "<test>");
+        (device, feed)
+    }
+
+    /// Readiness reported by the core loop's poll can be consumed by
+    /// `discard_old_drm_events_after_all_off` earlier in the same iteration;
+    /// the later drain must see an empty fd and return, not block in `read`.
+    #[test]
+    fn drain_events_returns_when_no_event_is_pending() {
+        let (device, feed) = device_with_event_feed();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut flips, mut sequences) = (0usize, 0usize);
+            let result =
+                super::drain_events(&device, |_, _, _| flips += 1, |_, _, _| sequences += 1);
+            let _ = tx.send((result.is_ok(), flips + sequences));
+        });
+        let outcome = rx.recv_timeout(Duration::from_secs(2));
+        drop(feed);
+        assert_eq!(
+            outcome.ok(),
+            Some((true, 0)),
+            "drain blocked on an empty DRM fd"
+        );
+    }
+
+    #[test]
+    fn drain_events_dispatches_a_pending_flip_complete() {
+        use std::io::Write;
+        let (device, mut feed) = device_with_event_feed();
+        // struct drm_event_vblank (drm.h): type=DRM_EVENT_FLIP_COMPLETE,
+        // length, user_data, tv_sec, tv_usec, sequence, crtc_id.
+        let mut raw = Vec::with_capacity(32);
+        raw.extend_from_slice(&2u32.to_ne_bytes());
+        raw.extend_from_slice(&32u32.to_ne_bytes());
+        raw.extend_from_slice(&0u64.to_ne_bytes());
+        raw.extend_from_slice(&3u32.to_ne_bytes());
+        raw.extend_from_slice(&500u32.to_ne_bytes());
+        raw.extend_from_slice(&77u32.to_ne_bytes());
+        raw.extend_from_slice(&42u32.to_ne_bytes());
+        feed.write_all(&raw).expect("inject event");
+
+        let mut seen: Vec<(crtc::Handle, u32, Duration)> = Vec::new();
+        super::drain_events(&device, |c, f, d| seen.push((c, f, d)), |_, _, _| {}).expect("drain");
+        let handle: crtc::Handle = from_u32(42).expect("non-zero raw handle");
+        assert_eq!(seen, vec![(handle, 77, Duration::new(3, 500_000))]);
     }
 }
