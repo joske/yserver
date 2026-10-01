@@ -14036,6 +14036,7 @@ impl KmsBackend {
             child,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         self.emit_pointer(ev);
     }
@@ -14056,6 +14057,7 @@ impl KmsBackend {
             child: 0,
             raw_dx,
             raw_dy,
+            tree_change: false,
         };
         self.emit_pointer(ev);
     }
@@ -14413,6 +14415,7 @@ impl KmsBackend {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         self.emit_pointer(ptr_event);
         // Implicit-grab crossings (G3). Direct v1 port.
@@ -28155,6 +28158,29 @@ impl Backend for KmsBackend {
         // closes the pre-existing confine-drift gap. No-op in test fixtures
         // where `input_thread_control` is None.
         self.resync_input_position();
+    }
+
+    fn windows_restructured(&mut self, state: &mut ServerState) {
+        // Xorg `CheckMotion(NULL)`: the sprite starts on the root, and only a
+        // changed pointer window generates crossings — one hit-test otherwise.
+        let host_xid = self.resource_pointer_host_xid(state);
+        let prev = *self
+            .core
+            .prev_pointer_window
+            .get_or_insert(self.core.window_id);
+        if prev == host_xid {
+            return;
+        }
+        let mask = self.serialize_modifiers() | self.core.button_mask;
+        self.update_pointer_window(state, host_xid, mask);
+        let pending = std::mem::take(&mut self.core.pending_pointer_events);
+        let xid_map = self.core.xid_map.clone();
+        for mut ev in pending {
+            ev.tree_change = true;
+            let _dropped = yserver_core::core_loop::pointer_fanout::pointer_event_fanout_to_state(
+                state, self, &xid_map, ev, true, false,
+            );
+        }
     }
 
     fn resync_input_position(&mut self) {
@@ -51623,6 +51649,190 @@ mod tests {
         assert_eq!((got[0], got[1], got[8]), (1, 27, 1), "MappingBusy");
         let (_, after) = get_modifier_mapping_reply(&mut state, &mut backend, &mut peer);
         assert_eq!(after, map);
+    }
+
+    /// Windows for the tree-change crossing tests: `A` (0,0 200x200) with
+    /// child `C` (50,50 100x100), and a top-level `B` (50,50 100x100) above
+    /// `A`, all unmapped; the pointer rests at (100,100) on the root. Client
+    /// 14 selects crossings and StructureNotify on each and on the root.
+    fn tree_crossing_fixture() -> (
+        yserver_core::server::ServerState,
+        KmsBackend,
+        std::os::unix::net::UnixStream,
+    ) {
+        use yserver_core::{resources::ROOT_WINDOW, server::ServerState};
+        let mut state = ServerState::new();
+        let mut b = KmsBackend::for_tests();
+        let peer = kbd_map_client_id(&mut state, 14);
+        seed_state_window(&mut state, &mut b, TREE_A, ROOT_WINDOW, 0, 0, 200, 200);
+        seed_state_window(&mut state, &mut b, TREE_C, TREE_A, 50, 50, 100, 100);
+        seed_state_window(&mut state, &mut b, TREE_B, ROOT_WINDOW, 50, 50, 100, 100);
+        let masks = &mut state.clients.get_mut(&14).unwrap().event_masks;
+        masks.insert(ROOT_WINDOW, 0x30);
+        for w in [TREE_A, TREE_B, TREE_C] {
+            masks.insert(w, 0x0002_0030);
+            b.core.xid_map.insert(synth_host_xid(w), w);
+        }
+        b.core.xid_map.insert(b.core.window_id, ROOT_WINDOW);
+        b.core.cursor_x = 100.0;
+        b.core.cursor_y = 100.0;
+        b.core.prev_pointer_window = Some(b.core.window_id);
+        (state, b, peer)
+    }
+
+    const TREE_A: yserver_protocol::x11::ResourceId =
+        yserver_protocol::x11::ResourceId(0x0010_0a01);
+    const TREE_B: yserver_protocol::x11::ResourceId =
+        yserver_protocol::x11::ResourceId(0x0010_0a02);
+    const TREE_C: yserver_protocol::x11::ResourceId =
+        yserver_protocol::x11::ResourceId(0x0010_0a03);
+
+    /// The events client 14 got, one line each: Map/Unmap/Configure/Destroy
+    /// by window, crossings as `Enter|Leave <event> <detail> child=<child>`.
+    fn tree_events(peer: &mut std::os::unix::net::UnixStream) -> Vec<String> {
+        let name = |xid: u32| match xid {
+            0 => "None".to_string(),
+            x if x == TREE_A.0 => "A".to_string(),
+            x if x == TREE_B.0 => "B".to_string(),
+            x if x == TREE_C.0 => "C".to_string(),
+            x if x == yserver_core::resources::ROOT_WINDOW.0 => "root".to_string(),
+            x => format!("{x:#x}"),
+        };
+        let word = |e: &[u8], at: usize| u32::from_le_bytes(e[at..at + 4].try_into().unwrap());
+        let details = [
+            "Ancestor",
+            "Virtual",
+            "Inferior",
+            "Nonlinear",
+            "NonlinearVirtual",
+        ];
+        kbd_map_drain(peer)
+            .chunks(32)
+            .filter_map(|e| match e[0] & 0x7f {
+                7 | 8 => Some(format!(
+                    "{} {} {} child={} mode={}",
+                    if e[0] & 0x7f == 7 { "Enter" } else { "Leave" },
+                    name(word(e, 12)),
+                    details[usize::from(e[1])],
+                    name(word(e, 16)),
+                    e[30],
+                )),
+                17 => Some(format!("Destroy {}", name(word(e, 8)))),
+                18 => Some(format!("Unmap {}", name(word(e, 8)))),
+                19 => Some(format!("Map {}", name(word(e, 8)))),
+                22 => Some(format!("Configure {}", name(word(e, 8)))),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn tree_request(
+        state: &mut yserver_core::server::ServerState,
+        b: &mut KmsBackend,
+        opcode: u8,
+        window: yserver_protocol::x11::ResourceId,
+    ) {
+        dispatch_raw(state, b, opcode, 0, &window.0.to_le_bytes());
+    }
+
+    /// Xvfb, pointer still at the centre: MapWindow of a window under it
+    /// sends MapNotify, then Leave(root, Inferior) / Enter(A, Ancestor), in
+    /// the same request (Xorg MapWindow → WindowsRestructured).
+    #[test]
+    fn map_under_a_still_pointer_crosses_within_the_request() {
+        let (mut state, mut b, mut peer) = tree_crossing_fixture();
+        tree_request(&mut state, &mut b, 8, TREE_A);
+        assert_eq!(
+            tree_events(&mut peer),
+            [
+                "Map A",
+                "Leave root Inferior child=None mode=0",
+                "Enter A Ancestor child=None mode=0",
+            ],
+        );
+        assert_eq!(b.core.prev_pointer_window, Some(synth_host_xid(TREE_A)));
+    }
+
+    /// Xvfb: unmapping the window under the pointer hands it to the window
+    /// it revealed — UnmapNotify, then Leave(B) / Enter(A), both Nonlinear.
+    #[test]
+    fn unmap_under_a_still_pointer_enters_the_revealed_window() {
+        let (mut state, mut b, mut peer) = tree_crossing_fixture();
+        tree_request(&mut state, &mut b, 8, TREE_A);
+        tree_request(&mut state, &mut b, 8, TREE_B);
+        let _ = tree_events(&mut peer);
+        tree_request(&mut state, &mut b, 10, TREE_B);
+        assert_eq!(
+            tree_events(&mut peer),
+            [
+                "Unmap B",
+                "Leave B Nonlinear child=None mode=0",
+                "Enter A Nonlinear child=None mode=0",
+            ],
+        );
+    }
+
+    /// Xvfb: moving a window out from under the pointer leaves its child
+    /// (Ancestor), the window itself (Virtual, child = C) and enters the
+    /// root (Inferior), after the ConfigureNotify; moving it to where it
+    /// already is sends no crossing.
+    #[test]
+    fn configure_under_a_still_pointer_crosses_after_configure_notify() {
+        let (mut state, mut b, mut peer) = tree_crossing_fixture();
+        tree_request(&mut state, &mut b, 8, TREE_A);
+        dispatch_raw(&mut state, &mut b, 9, 0, &TREE_A.0.to_le_bytes());
+        let _ = tree_events(&mut peer);
+        dispatch_configure_window(&mut state, &mut b, TREE_A, Some(0), Some(0), None);
+        assert_eq!(tree_events(&mut peer), Vec::<String>::new());
+        dispatch_configure_window(&mut state, &mut b, TREE_A, Some(300), Some(300), None);
+        assert_eq!(
+            tree_events(&mut peer),
+            [
+                "Configure A",
+                "Leave C Ancestor child=None mode=0",
+                "Leave A Virtual child=C mode=0",
+                "Enter root Inferior child=None mode=0",
+            ],
+        );
+    }
+
+    /// Xvfb: destroying a window whose child holds the pointer unmaps it
+    /// first — UnmapNotify(A), the crossings out of C and A while both still
+    /// exist, and only then the DestroyNotifys. The pointer never refers to
+    /// a destroyed window afterwards.
+    #[test]
+    fn destroy_under_a_still_pointer_leaves_before_destroy_notify() {
+        let (mut state, mut b, mut peer) = tree_crossing_fixture();
+        tree_request(&mut state, &mut b, 8, TREE_A);
+        dispatch_raw(&mut state, &mut b, 9, 0, &TREE_A.0.to_le_bytes());
+        let _ = tree_events(&mut peer);
+        tree_request(&mut state, &mut b, 4, TREE_A);
+        let events = tree_events(&mut peer);
+        let first_destroy = events.iter().position(|e| e.starts_with("Destroy"));
+        assert_eq!(
+            &events[..4],
+            [
+                "Unmap A",
+                "Leave C Ancestor child=None mode=0",
+                "Leave A Virtual child=C mode=0",
+                "Enter root Inferior child=None mode=0",
+            ],
+            "{events:?}",
+        );
+        assert!(first_destroy.is_some_and(|i| i >= 4), "{events:?}");
+        assert_eq!(b.core.prev_pointer_window, Some(b.core.window_id));
+    }
+
+    /// A tree change is not user input: its crossings leave the idle clock
+    /// (and with it DPMS and the screen saver) alone.
+    #[test]
+    fn tree_change_crossings_do_not_count_as_activity() {
+        let (mut state, mut b, mut peer) = tree_crossing_fixture();
+        let idle_since = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        state.dpms.last_activity = idle_since;
+        tree_request(&mut state, &mut b, 8, TREE_A);
+        assert_eq!(tree_events(&mut peer).len(), 3);
+        assert_eq!(state.dpms.last_activity, idle_since);
     }
 }
 

@@ -307,6 +307,16 @@ pub fn process_disconnect_reporting(
                 on_parent,
             });
         }
+        // Xorg DeleteWindow unmaps first (`dix/window.c:1075`): the pointer
+        // leaves the dying subtree while it still exists.
+        if state
+            .resources
+            .window(root)
+            .is_some_and(|w| w.map_state != MapState::Unmapped)
+        {
+            let _ = state.resources.unmap_window(root);
+            backend.windows_restructured(state);
+        }
         attr_pixmap_xids.extend(state.resources.collect_attribute_pixmap_host_xids(root));
         crate::core_loop::process_request::free_pictures_on_destroyed_windows(
             state, backend, None, &order,
@@ -798,6 +808,16 @@ pub fn destroy_zombie_resources_reporting(
                 on_window,
                 on_parent,
             });
+        }
+        // Xorg DeleteWindow unmaps first (`dix/window.c:1075`): the pointer
+        // leaves the dying subtree while it still exists.
+        if state
+            .resources
+            .window(root)
+            .is_some_and(|w| w.map_state != MapState::Unmapped)
+        {
+            let _ = state.resources.unmap_window(root);
+            backend.windows_restructured(state);
         }
         attr_pixmap_xids.extend(state.resources.collect_attribute_pixmap_host_xids(root));
         crate::core_loop::process_request::free_pictures_on_destroyed_windows(

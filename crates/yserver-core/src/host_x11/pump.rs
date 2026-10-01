@@ -160,6 +160,7 @@ pub(super) fn decode_host_event(event: &[u8; 32]) -> Option<HostEvent> {
                 child: read_u32(&event[16..20]),
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             }))
         }
         7 | 8 => {
@@ -184,6 +185,7 @@ pub(super) fn decode_host_event(event: &[u8; 32]) -> Option<HostEvent> {
                 child: read_u32(&event[16..20]),
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             }))
         }
         12 => {
@@ -282,6 +284,10 @@ pub struct HostPointerEvent {
     /// (#96 follow-up: chromium-bsu ship-pins-to-corner bug)
     pub raw_dx: i32,
     pub raw_dy: i32,
+    /// A crossing from a window-tree change under a still pointer, not from
+    /// device motion. Its XI2 form names the master pointer as `sourceid`,
+    /// as Xorg's `CheckMotion(NULL)` does (`dix/events.c:3244`).
+    pub tree_change: bool,
 }
 
 #[derive(Clone, Copy, Debug)]

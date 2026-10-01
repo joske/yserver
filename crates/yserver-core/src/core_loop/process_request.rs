@@ -427,7 +427,7 @@ pub fn process_request(
         94 => handle_create_glyph_cursor(state, backend, origin, client_id, sequence, body),
         // ── window queries / circulation ──
         3 => handle_get_window_attributes(state, client_id, sequence, body),
-        13 => handle_circulate_window(state, client_id, sequence, header, body),
+        13 => handle_circulate_window(state, backend, client_id, sequence, header, body),
         // ── extension extension-protocol arms (standalone, not full
         //    extension dispatchers) ──
         138 => handle_ge_request(state, client_id, sequence, header), // GE
@@ -1952,6 +1952,24 @@ fn destroy_window_subtree(
             on_window,
             on_parent,
         });
+    }
+    // Xorg DeleteWindow unmaps the window first (`dix/window.c:1075`):
+    // UnmapNotify, then WindowsRestructured while the subtree still exists,
+    // so the pointer's Leave reaches the dying windows before any
+    // DestroyNotify. `order` ends with `root`.
+    if let Some(top) = pending.last_mut()
+        && top.was_mapped
+    {
+        top.was_mapped = false;
+        let (window, parent) = (top.window, top.parent);
+        let _dropped = fanout_event_to_clients(state, &top.on_window, |buf, seq, order| {
+            x11::encode_unmap_notify_event(buf, seq, order, window, window, false);
+        });
+        let _dropped = fanout_event_to_clients(state, &top.on_parent, |buf, seq, order| {
+            x11::encode_unmap_notify_event(buf, seq, order, parent, window, false);
+        });
+        let _ = state.resources.unmap_window(window);
+        backend.windows_restructured(state);
     }
     let attr_pixmap_xids = state.resources.collect_attribute_pixmap_host_xids(root);
     free_pictures_on_destroyed_windows(state, backend, origin, &order);
@@ -6900,6 +6918,9 @@ fn handle_shape_request(
                 let changed =
                     crate::nested::set_shape_rects(state, window, req.dest_kind, new_rects);
                 mirror_shape_to_host_state(state, backend, origin, window, req.dest_kind);
+                // Xorg miSetShape re-evaluates the pointer before ShapeNotify
+                // goes out (`mi/miwindow.c:680`); so do the other SHAPE ops.
+                backend.windows_restructured(state);
                 if changed {
                     emit_shape_notify(state, window, req.dest_kind);
                 }
@@ -6915,6 +6936,7 @@ fn handle_shape_request(
                 if req.src == 0 {
                     let changed = crate::nested::clear_shape_rects(state, window, req.dest_kind);
                     mirror_shape_to_host_state(state, backend, origin, window, req.dest_kind);
+                    backend.windows_restructured(state);
                     if changed {
                         emit_shape_notify(state, window, req.dest_kind);
                     }
@@ -6986,6 +7008,7 @@ fn handle_shape_request(
                 let changed =
                     crate::nested::set_shape_rects(state, window, req.dest_kind, new_rects);
                 mirror_shape_to_host_state(state, backend, origin, window, req.dest_kind);
+                backend.windows_restructured(state);
                 if changed {
                     emit_shape_notify(state, window, req.dest_kind);
                 }
@@ -7027,6 +7050,7 @@ fn handle_shape_request(
                 );
                 let changed = crate::nested::set_shape_rects(state, dest, req.dest_kind, new_rects);
                 mirror_shape_to_host_state(state, backend, origin, dest, req.dest_kind);
+                backend.windows_restructured(state);
                 if changed {
                     emit_shape_notify(state, dest, req.dest_kind);
                 }
@@ -7045,6 +7069,7 @@ fn handle_shape_request(
                 }
                 if translated {
                     mirror_shape_to_host_state(state, backend, origin, dest, req.dest_kind);
+                    backend.windows_restructured(state);
                     emit_shape_notify(state, dest, req.dest_kind);
                 }
             }
@@ -8109,6 +8134,8 @@ fn handle_xfixes_request(
                     crate::nested::set_shape_rects(state, window, req.dest_kind, source);
                 }
                 mirror_shape_to_host_state(state, backend, origin, window, req.dest_kind);
+                // Xorg SetWindowShapeRegion goes through miSetShape too.
+                backend.windows_restructured(state);
             }
         }
         x11xfixes::SET_PICTURE_CLIP_REGION => {
@@ -22756,6 +22783,9 @@ fn handle_reparent_window(
             override_redirect,
         );
     });
+    // The window moved in the tree; Xorg's ReparentWindow re-evaluates the
+    // pointer through its UnmapWindow / MapWindow.
+    backend.windows_restructured(state);
     Ok(RequestOutcome::Handled)
 }
 
@@ -23971,6 +24001,9 @@ fn handle_configure_window(
             }
         }
     }
+    // Xorg miMoveWindow / miResizeWindow / ReflectStackChange end in
+    // WindowsRestructured (`mi/miwindow.c:302,620`, `dix/window.c:2179`).
+    backend.windows_restructured(state);
     // A confined pointer follows its confine window — re-clamp after
     // any geometry change (Xorg ConfineCursorToWindow on configure;
     // XGrabButton-25 moves confine_to and expects the pointer pulled
@@ -26975,6 +27008,9 @@ fn handle_map_window(
         }
         accumulate_damage_viewable_descendants_to_state(state, window);
     }
+    // Xorg MapWindow ends in WindowsRestructured (`dix/window.c:2695`): the
+    // pointer's crossings follow MapNotify and Expose within the request.
+    backend.windows_restructured(state);
     debug!(
         "client {} #{} MapWindow 0x{:x} viewable+{}",
         client_id.0,
@@ -27098,6 +27134,9 @@ fn map_subwindows_with_delta(
             let _dropped = emit_expose_subtree_to_state(state, child);
         }
     }
+    // Xorg MapSubwindows: one WindowsRestructured after the batch
+    // (`dix/window.c:2775`).
+    backend.windows_restructured(state);
     debug!(
         "client {} #{} MapSubwindows viewable+{}",
         client_id.0,
@@ -27189,6 +27228,8 @@ fn handle_unmap_window(
             // Active grabs on a window that just became unviewable
             // deactivate too (same Xorg path).
             release_core_grabs_for_unviewable(state, backend);
+            // Then WindowsRestructured (`dix/window.c:2871`).
+            backend.windows_restructured(state);
         }
     }
     debug!("client {} #{} UnmapWindow", client_id.0, sequence.0);
@@ -27269,6 +27310,8 @@ fn unmap_subwindows_with_delta(
     crate::core_loop::xi1_focus::revert_unviewable_focus(state);
     revert_core_focus_if_unviewable(state);
     release_core_grabs_for_unviewable(state, backend);
+    // Xorg UnmapSubwindows: one WindowsRestructured (`dix/window.c:2939`).
+    backend.windows_restructured(state);
     debug!(
         "client {} #{} UnmapSubwindows viewable-{}",
         client_id.0,
@@ -27432,6 +27475,7 @@ fn window_attributes(
 
 fn handle_circulate_window(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
     client_id: ClientId,
     sequence: SequenceNumber,
     header: RequestHeader,
@@ -27494,6 +27538,8 @@ fn handle_circulate_window(
         let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
             let _ = x11::write_circulate_notify_event(buf, order, seq, child, child, direction);
         });
+        // Xorg ReflectStackChange (`dix/window.c:2179`).
+        backend.windows_restructured(state);
     }
     debug!("client {} #{} CirculateWindow", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
@@ -59306,6 +59352,7 @@ mod tests {
                     child: 0,
                     raw_dx: 0,
                     raw_dy: 0,
+                    tree_change: false,
                 },
             ));
         }
@@ -59484,6 +59531,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let xid_map = backend.xid_map().clone();
         let _ =
@@ -59621,6 +59669,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         {
             let f = state
@@ -59847,6 +59896,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         {
             let f = state
@@ -60128,6 +60178,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             }),
         });
 
@@ -60246,6 +60297,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             }),
         });
 
@@ -60367,6 +60419,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let _ = crate::core_loop::pointer_fanout::pointer_event_fanout_to_state(
             &mut state,
@@ -60509,6 +60562,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         {
             let f = state
@@ -60662,6 +60716,7 @@ mod tests {
                     child: 0,
                     raw_dx: 0,
                     raw_dy: 0,
+                    tree_change: false,
                 },
             ));
         }
@@ -60777,6 +60832,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let xid_map = backend.xid_map().clone();
         let _dropped =
@@ -60904,6 +60960,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let xid_map = backend.xid_map().clone();
         let _dropped =
@@ -61080,6 +61137,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let xid_map = backend.xid_map().clone();
         let _dropped =
@@ -61232,6 +61290,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let xid_map = backend.xid_map().clone();
         let _dropped =
@@ -61350,6 +61409,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let xid_map = backend.xid_map().clone();
         let _dropped =
@@ -78687,6 +78747,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         {
             let f = state
@@ -78993,6 +79054,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         {
             let f = state
@@ -79185,6 +79247,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let _ =
             pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
@@ -79378,6 +79441,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             };
             let _ = pointer_event_fanout_to_state(
                 &mut state,
@@ -79600,6 +79664,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let _ =
             pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
@@ -79735,6 +79800,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let _ =
             pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);
@@ -79993,6 +80059,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let _ =
             pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);

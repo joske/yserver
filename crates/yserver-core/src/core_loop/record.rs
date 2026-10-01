@@ -2203,6 +2203,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let xid_map = HostXidMap::default();
         let mut backend = RecordingBackend::new();

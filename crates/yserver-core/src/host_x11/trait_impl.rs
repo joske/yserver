@@ -121,6 +121,7 @@ impl Backend for HostX11Backend {
                     // here (0). Real relative deltas come from the KMS path.
                     raw_dx: 0,
                     raw_dy: 0,
+                    tree_change: false,
                 }));
             }
             // ynest is a nested backend fed by the parent X server's input,
@@ -171,6 +172,7 @@ impl Backend for HostX11Backend {
                     child: 0,
                     raw_dx: 0,
                     raw_dy: 0,
+                    tree_change: false,
                 }));
             }
             // Device add/remove are plumbing-only in the host-X11 backend;

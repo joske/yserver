@@ -105,6 +105,8 @@ pub(crate) fn materialize_overlay(
     // the top. Must run AFTER materialize_cow_resource — the backend COW
     // hook no longer pushes to top_level_order itself.
     backend.sync_top_level_order(state);
+    // The MapWindow ends in WindowsRestructured (`dix/window.c:2695`).
+    backend.windows_restructured(state);
     Ok(())
 }
 
@@ -154,6 +156,10 @@ pub(crate) fn teardown_overlay(
                 );
             });
         }
+        // DeleteWindow's UnmapWindow re-evaluates the pointer while the
+        // overlay still exists (`dix/window.c:2871`).
+        let _ = state.resources.unmap_window(COMPOSITE_OVERLAY_WINDOW);
+        backend.windows_restructured(state);
     }
     for (event_window, mask) in targets {
         let _dropped = emit_window_event_to_state(state, event_window, mask, |buf, seq, o| {

@@ -243,8 +243,10 @@ fn pointer_event_fanout_to_state_inner(
     // Pointer confinement (Xorg CheckPhysLimits): while a confined
     // grab is active, motion outside the confine rectangle is
     // replaced by a warp to the nearest inside point; press/release
-    // coordinates clamp in place.
+    // coordinates clamp in place. A tree-change crossing is no motion:
+    // the request that moved the confine window re-clamps after it.
     if !is_replay
+        && !event.tree_change
         && state.pointer_confine_to.0 != 0
         && let Some(w) = state.resources.window(state.pointer_confine_to)
         && w.map_state == crate::resources::MapState::Viewable
@@ -488,61 +490,65 @@ fn pointer_event_fanout_to_state_inner(
             }
         }
     }
-    let now = std::time::Instant::now();
-    // Capture priors BEFORE mutating; needed by the IDLETIME wake handler.
-    #[allow(clippy::cast_possible_truncation)]
-    let prior_global = now
-        .duration_since(state.dpms.last_activity)
-        .as_millis()
-        .min(u128::from(u32::MAX)) as i64;
-    // XI2 master device IDs are always small (2 here); cast u16 → u8 is safe.
-    // Per-device prior: fall back to global if no per-device entry yet.
-    // Matches `idletime_baseline`'s fallback (server.rs Task 1) — without
-    // this, the very first input event for a device whose baseline isn't
-    // recorded would compute prior_device=0 and a per-device Negative
-    // alarm (whose wait_value > 0) would not see the `old > wait` half of
-    // its trigger.
-    let prior_device = state
-        .per_device_last_activity
-        .get(&(XI2_MASTER_POINTER_DEVICE_ID as u8))
-        .copied()
-        .map(|t| {
-            #[allow(clippy::cast_possible_truncation)]
-            let v = now.duration_since(t).as_millis().min(u128::from(u32::MAX)) as i64;
-            v
-        })
-        .unwrap_or(prior_global);
+    // A tree-change crossing is not user input: it neither resets the idle
+    // clocks nor wakes DPMS or the screen saver.
+    if !event.tree_change {
+        let now = std::time::Instant::now();
+        // Capture priors BEFORE mutating; needed by the IDLETIME wake handler.
+        #[allow(clippy::cast_possible_truncation)]
+        let prior_global = now
+            .duration_since(state.dpms.last_activity)
+            .as_millis()
+            .min(u128::from(u32::MAX)) as i64;
+        // XI2 master device IDs are always small (2 here); cast u16 → u8 is safe.
+        // Per-device prior: fall back to global if no per-device entry yet.
+        // Matches `idletime_baseline`'s fallback (server.rs Task 1) — without
+        // this, the very first input event for a device whose baseline isn't
+        // recorded would compute prior_device=0 and a per-device Negative
+        // alarm (whose wait_value > 0) would not see the `old > wait` half of
+        // its trigger.
+        let prior_device = state
+            .per_device_last_activity
+            .get(&(XI2_MASTER_POINTER_DEVICE_ID as u8))
+            .copied()
+            .map(|t| {
+                #[allow(clippy::cast_possible_truncation)]
+                let v = now.duration_since(t).as_millis().min(u128::from(u32::MAX)) as i64;
+                v
+            })
+            .unwrap_or(prior_global);
 
-    state.dpms.last_activity = now;
-    state
-        .per_device_last_activity
-        .insert(XI2_MASTER_POINTER_DEVICE_ID as u8, now);
+        state.dpms.last_activity = now;
+        state
+            .per_device_last_activity
+            .insert(XI2_MASTER_POINTER_DEVICE_ID as u8, now);
 
-    // IDLETIME wake: fires Negative-* alarms before the input event itself
-    // reaches clients (predictable ordering).
-    crate::core_loop::process_request::evaluate_idletime_negative_alarms_on_input_wake(
-        state,
-        XI2_MASTER_POINTER_DEVICE_ID as u8,
-        prior_global,
-        prior_device,
-    );
-
-    if state.dpms.enabled && state.dpms.power_level != 0 {
-        crate::core_loop::process_request::apply_dpms_transition(state, backend, 0);
-        // DPMS coupling tail already flipped SS Off if it was On.
-    }
-    if matches!(
-        state.screensaver.active,
-        crate::server::ScreenSaverActive::On
-    ) {
-        // Standalone SS activation (DPMS was On already; SS came up
-        // via idle timer or ForceScreenSaver) — input wakes it.
-        crate::core_loop::process_request::apply_screen_saver_transition(
+        // IDLETIME wake: fires Negative-* alarms before the input event itself
+        // reaches clients (predictable ordering).
+        crate::core_loop::process_request::evaluate_idletime_negative_alarms_on_input_wake(
             state,
-            backend,
-            crate::server::ScreenSaverActive::Off,
-            /*forced=*/ false,
+            XI2_MASTER_POINTER_DEVICE_ID as u8,
+            prior_global,
+            prior_device,
         );
+
+        if state.dpms.enabled && state.dpms.power_level != 0 {
+            crate::core_loop::process_request::apply_dpms_transition(state, backend, 0);
+            // DPMS coupling tail already flipped SS Off if it was On.
+        }
+        if matches!(
+            state.screensaver.active,
+            crate::server::ScreenSaverActive::On
+        ) {
+            // Standalone SS activation (DPMS was On already; SS came up
+            // via idle timer or ForceScreenSaver) — input wakes it.
+            crate::core_loop::process_request::apply_screen_saver_transition(
+                state,
+                backend,
+                crate::server::ScreenSaverActive::Off,
+                /*forced=*/ false,
+            );
+        }
     }
 
     let mut dropped = Vec::new();
@@ -1691,7 +1697,11 @@ fn pointer_event_fanout_to_state_inner(
                             event.state,
                             event.crossing_mode,
                             event.detail,
-                            XI2_SLAVE_POINTER_DEVICE_ID,
+                            if event.tree_change {
+                                XI2_MASTER_POINTER_DEVICE_ID
+                            } else {
+                                XI2_SLAVE_POINTER_DEVICE_ID
+                            },
                         );
                     } else {
                         if let Some((axis, value)) = scroll_axis_info {
@@ -1889,6 +1899,7 @@ pub fn emit_scroll_stop_to_state(
         child: 0,
         raw_dx: 0,
         raw_dy: 0,
+        tree_change: false,
     };
     let root_hit = resolve_pointer_hit(state, xid_map, &probe);
     let top_level_id = root_hit
@@ -3439,6 +3450,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         }
     }
 
@@ -3825,6 +3837,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             },
             true,
             false,
@@ -4051,6 +4064,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
 
         // Precondition: A is on top; the press resolves to A.
@@ -4531,6 +4545,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             },
             true,
             false,
@@ -4684,6 +4699,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             },
             true,
             false,
@@ -4818,6 +4834,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             },
             true,
             false,
@@ -4924,6 +4941,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             },
             true,
             false,
@@ -4946,6 +4964,7 @@ mod tests {
                 child: 0,
                 raw_dx: 0,
                 raw_dy: 0,
+                tree_change: false,
             },
             true,
             false,
@@ -5144,6 +5163,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let xid_map = backend.xid_map().clone();
         let dropped =
@@ -5283,6 +5303,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let dropped = pointer_event_fanout_to_state(
             &mut state,
@@ -5319,6 +5340,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let dropped = pointer_event_fanout_to_state(
             &mut state,
@@ -5357,6 +5379,7 @@ mod tests {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         let dropped =
             pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, press, true, false);

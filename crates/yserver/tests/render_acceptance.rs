@@ -12740,6 +12740,7 @@ fn border_press_reports_negative_content_coords_on_the_wire() {
             child: 0,
             raw_dx: 0,
             raw_dy: 0,
+            tree_change: false,
         };
         yserver_core::core_loop::pointer_fanout::pointer_event_fanout_to_state(
             &mut f.state,

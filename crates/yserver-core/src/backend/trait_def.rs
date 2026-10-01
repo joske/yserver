@@ -2837,6 +2837,14 @@ pub trait Backend {
     /// its test window ("Expected event not received" en masse).
     fn warp_pointer_root(&mut self, _state: &mut ServerState, _x: i32, _y: i32) {}
 
+    /// The window tree changed under a pointer that did not move: a map,
+    /// unmap, configure, restack, reparent, shape change or a destroy (called
+    /// before the dying windows leave the tree). Re-resolve the window under
+    /// the pointer and fan out the crossings within the request, as Xorg's
+    /// `WindowsRestructured` does (`dix/events.c:3269`). Default no-op: a
+    /// host-forwarding backend gets these crossings from the host.
+    fn windows_restructured(&mut self, _state: &mut ServerState) {}
+
     /// After the server moved the pointer on its own (XTEST fake motion),
     /// hand the new position to whatever tracks physical pointer input, so
     /// the next real motion continues from there instead of jumping back.
