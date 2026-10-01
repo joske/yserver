@@ -45,7 +45,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential gcc libxshmfence-dev libxkbcommon-dev libinput-dev glslc libudev-dev libgbm-dev libfontconfig-dev xfonts-base xfonts-100dpi xfonts-75dpi \
             qemu-system-x86 busybox-static mesa-vulkan-drivers xterm x11-xserver-utils x11-utils xdotool python3-xlib python3-pil imagemagick dbus \
-            libx11-dev libxcb1-dev libxcb-record0-dev libxcb-xinput-dev libxcb-xkb-dev libxcb-xtest0-dev libxkbcommon-x11-dev \
+            libx11-dev libxcb1-dev libxcb-composite0-dev libxcb-damage0-dev libxcb-dri3-dev libxcb-present-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-record0-dev libxcb-xinput-dev libxcb-xkb-dev libxcb-xtest0-dev libxkbcommon-x11-dev \
             wmctrl xinput x11-xkb-utils xserver-xorg-core xserver-xorg-input-libinput
           # virtme-ng with virtiofsd: memfd guest RAM, needed for blob=on.
           sudo apt-get install -y virtme-ng virtiofsd
