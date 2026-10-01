@@ -51720,6 +51720,11 @@ mod tests {
                 17 => Some(format!("Destroy {}", name(word(e, 8)))),
                 18 => Some(format!("Unmap {}", name(word(e, 8)))),
                 19 => Some(format!("Map {}", name(word(e, 8)))),
+                21 => Some(format!(
+                    "Reparent {} to {}",
+                    name(word(e, 8)),
+                    name(word(e, 12))
+                )),
                 22 => Some(format!("Configure {}", name(word(e, 8)))),
                 _ => None,
             })
@@ -51852,6 +51857,41 @@ mod tests {
         assert_eq!(
             tree_events(&mut peer),
             [
+                "Leave A Nonlinear child=None mode=0",
+                "Enter B Nonlinear child=None mode=0",
+            ],
+        );
+    }
+
+    /// Xvfb: ReparentWindow of a mapped window is an UnmapWindow, the
+    /// reparent and a MapWindow — the pointer leaves the window at its old
+    /// place before ReparentNotify, and enters it at its new one after
+    /// MapNotify.
+    #[test]
+    fn reparent_of_a_mapped_window_unmaps_and_maps_it_around_the_pointer() {
+        let (mut state, mut b, mut peer) = tree_crossing_fixture();
+        tree_request(&mut state, &mut b, 8, TREE_A);
+        tree_request(&mut state, &mut b, 8, TREE_B);
+        let _ = tree_events(&mut peer);
+        dispatch_reparent_window(&mut state, &mut b, TREE_B, TREE_A, 150, 150);
+        assert_eq!(
+            tree_events(&mut peer),
+            [
+                "Unmap B",
+                "Leave B Nonlinear child=None mode=0",
+                "Enter A Nonlinear child=None mode=0",
+                "Reparent B to A",
+                "Map B",
+            ],
+        );
+        let root = yserver_core::resources::ROOT_WINDOW;
+        dispatch_reparent_window(&mut state, &mut b, TREE_B, root, 50, 50);
+        assert_eq!(
+            tree_events(&mut peer),
+            [
+                "Unmap B",
+                "Reparent B to root",
+                "Map B",
                 "Leave A Nonlinear child=None mode=0",
                 "Enter B Nonlinear child=None mode=0",
             ],

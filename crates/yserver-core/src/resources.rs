@@ -1746,22 +1746,39 @@ impl ResourceTable {
         }
     }
 
-    pub fn reparent_window(
-        &mut self,
+    /// The errors [`Self::reparent_window`] would return, without reparenting.
+    ///
+    /// # Errors
+    ///
+    /// `BadMatch` for the root, the window itself or one of its inferiors as
+    /// the new parent; `BadWindow` for an unknown window or parent.
+    pub fn check_reparent_window(
+        &self,
         request: ReparentWindowRequest,
-    ) -> Result<ReparentResult, ReparentWindowError> {
+    ) -> Result<(), ReparentWindowError> {
         if request.window == ROOT_WINDOW
             || request.window == request.parent
             || self.is_descendant_of(request.parent, request.window)
         {
             return Err(ReparentWindowError::BadMatch);
         }
-        let Some(window) = self.windows.get(&request.window.0) else {
-            return Err(ReparentWindowError::BadWindow);
-        };
-        if !self.windows.contains_key(&request.parent.0) {
+        if !self.windows.contains_key(&request.window.0)
+            || !self.windows.contains_key(&request.parent.0)
+        {
             return Err(ReparentWindowError::BadWindow);
         }
+        Ok(())
+    }
+
+    pub fn reparent_window(
+        &mut self,
+        request: ReparentWindowRequest,
+    ) -> Result<ReparentResult, ReparentWindowError> {
+        self.check_reparent_window(request)?;
+        let window = self
+            .windows
+            .get(&request.window.0)
+            .expect("window validated above");
 
         let old_parent = window.parent;
         let override_redirect = window.override_redirect;

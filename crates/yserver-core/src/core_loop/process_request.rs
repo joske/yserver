@@ -22613,6 +22613,39 @@ fn handle_reparent_window(
     let Some(request) = x11::reparent_window_request(body) else {
         return Ok(RequestOutcome::Handled);
     };
+    // Xorg ReparentWindow unmaps a mapped window first (`dix/window.c:2519`):
+    // UnmapNotify, and the pointer leaves it while it is still in the old
+    // place. Its map state is only hidden for that hit-test; the reparent
+    // below keeps the window mapped, and the MapNotify after ReparentNotify
+    // stands for Xorg's MapWindow.
+    let unmapped = if state.resources.check_reparent_window(request).is_ok() {
+        state.resources.window(request.window).and_then(|w| {
+            (w.map_state != MapState::Unmapped).then_some((
+                w.parent,
+                w.map_state,
+                w.override_redirect,
+            ))
+        })
+    } else {
+        None
+    };
+    if let Some((old_parent, map_state, _)) = unmapped {
+        let window = request.window;
+        let _dropped = emit_window_event_to_state(state, window, 0x0002_0000, |buf, seq, order| {
+            x11::encode_unmap_notify_event(buf, seq, order, window, window, false);
+        });
+        let _dropped =
+            emit_window_event_to_state(state, old_parent, 0x0008_0000, |buf, seq, order| {
+                x11::encode_unmap_notify_event(buf, seq, order, old_parent, window, false);
+            });
+        if let Some(w) = state.resources.window_mut(window) {
+            w.map_state = MapState::Unmapped;
+        }
+        backend.windows_restructured(state);
+        if let Some(w) = state.resources.window_mut(window) {
+            w.map_state = map_state;
+        }
+    }
     let result = match state.resources.reparent_window(request) {
         Ok(result) => result,
         Err(crate::resources::ReparentWindowError::BadWindow) => {
@@ -22789,8 +22822,24 @@ fn handle_reparent_window(
             override_redirect,
         );
     });
+    if let Some((_, _, override_redirect)) = unmapped {
+        let _dropped = emit_window_event_to_state(state, window, 0x0002_0000, |buf, seq, order| {
+            x11::encode_map_notify_event(buf, seq, order, window, window, override_redirect);
+        });
+        let _dropped =
+            emit_window_event_to_state(state, new_parent, 0x0008_0000, |buf, seq, order| {
+                x11::encode_map_notify_event(
+                    buf,
+                    seq,
+                    order,
+                    new_parent,
+                    window,
+                    override_redirect,
+                );
+            });
+    }
     // The window moved in the tree; Xorg's ReparentWindow re-evaluates the
-    // pointer through its UnmapWindow / MapWindow.
+    // pointer through its MapWindow (`dix/window.c:2695`).
     backend.windows_restructured(state);
     Ok(RequestOutcome::Handled)
 }
