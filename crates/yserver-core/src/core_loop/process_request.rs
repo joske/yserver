@@ -32572,7 +32572,8 @@ pub(crate) fn confine_pointer_now(state: &mut ServerState, backend: &mut dyn Bac
 /// Xorg `ActivatePointerGrab`/`DeactivatePointerGrab` →
 /// `DoEnterLeaveEvents(sprite.win ↔ grab window, NotifyGrab/Ungrab)`.
 /// Events flow through the normal per-window mask filter (EnterWindow
-/// 0x10 / LeaveWindow 0x20) to every selecting client.
+/// 0x10 / LeaveWindow 0x20) to every selecting client, then the same chain
+/// in XI2 form (`DeviceEnterLeaveEvents`), from the master pointer.
 pub(crate) fn emit_core_pointer_grab_chain(
     state: &mut ServerState,
     from_win: ResourceId,
@@ -32585,7 +32586,7 @@ pub(crate) fn emit_core_pointer_grab_chain(
     let chain = crate::crossings::normal_mode_crossings(state, from_win, to_win);
     let (root_x, root_y) = state.pointer_root;
     let server_time = state.timestamp_now();
-    for e in chain {
+    for e in &chain {
         let (mask, enter) = match e.kind {
             crate::crossings::CrossingKind::Enter => (0x10u32, true),
             crate::crossings::CrossingKind::Leave => (0x20u32, false),
@@ -32615,6 +32616,45 @@ pub(crate) fn emit_core_pointer_grab_chain(
             } else {
                 x11::encode_leave_notify_event(buf, order, crossing);
             }
+        });
+    }
+    for e in chain {
+        let evtype: u16 = match e.kind {
+            crate::crossings::CrossingKind::Enter => 7,
+            crate::crossings::CrossingKind::Leave => 8,
+        };
+        // Xorg sends these before the grab is installed and after it is
+        // gone, so the window's selections get them, whatever the grab.
+        let targets =
+            crate::core_loop::pointer_fanout::xi2_master_selectors(state, e.window, evtype);
+        if targets.is_empty() {
+            continue;
+        }
+        let (ox, oy) = state.resources.window_absolute_position(e.window);
+        let event_x = i16::try_from(i32::from(root_x) - ox).unwrap_or(i16::MAX);
+        let event_y = i16::try_from(i32::from(root_y) - oy).unwrap_or(i16::MAX);
+        let focus = state.crossing_has_focus(e.window);
+        let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
+            x11::encode_xi2_crossing_event(
+                buf,
+                order,
+                seq,
+                XI2_MAJOR_OPCODE,
+                evtype,
+                2,
+                server_time,
+                ROOT_WINDOW,
+                e.window,
+                root_x,
+                root_y,
+                event_x,
+                event_y,
+                0,
+                mode,
+                e.detail,
+                2,
+                focus,
+            );
         });
     }
 }

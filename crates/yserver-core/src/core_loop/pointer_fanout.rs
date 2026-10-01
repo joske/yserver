@@ -1377,17 +1377,10 @@ fn pointer_event_fanout_to_state_inner(
         let (ox, oy) = state.resources.window_absolute_position(crossing_win);
         event_x = clamp_grab_coord(event.root_x, ox);
         event_y = clamp_grab_coord(event.root_y, oy);
-        // Xorg `DeviceEnterLeaveEvent`: under an XI2 grab only the grab
-        // client gets the crossing, through the grab's mask; any other grab
-        // leaves XI2 delivery to the window's selections.
-        let targets = match state.active_pointer_grab {
-            Some(grab) if grab.via_xi2 => client_target_id(state, grab.owner)
-                .filter(|_| grab.xi2_mask & (1 << xi2_evtype) != 0)
-                .into_iter()
-                .collect(),
-            _ => compute_xi2_exact_targets(state, crossing_win, xi2_evtype),
-        };
-        (targets, Vec::new())
+        (
+            xi2_crossing_targets(state, crossing_win, xi2_evtype),
+            Vec::new(),
+        )
     } else {
         compute_xi2_targets(state, target, top_level_id, xi2_evtype, xi2_raw_evtype)
     };
@@ -3058,6 +3051,29 @@ fn xi2_form_targets(
             xi2_form_selected_on(client, window, form, evtype).then_some(ClientId(*id))
         })
         .collect()
+}
+
+/// Recipients of an XI2 Enter/Leave on `window` — Xorg
+/// `DeviceEnterLeaveEvent` (`dix/events.c:4866`): under an XI2 grab only the
+/// grab client, through the grab's mask; otherwise the selections on
+/// `window`, never propagated.
+fn xi2_crossing_targets(state: &ServerState, window: ResourceId, evtype: u16) -> Vec<ClientId> {
+    match state.active_pointer_grab {
+        Some(grab) if grab.via_xi2 => client_target_id(state, grab.owner)
+            .filter(|_| grab.xi2_mask & (1 << evtype) != 0)
+            .into_iter()
+            .collect(),
+        _ => compute_xi2_exact_targets(state, window, evtype),
+    }
+}
+
+/// The clients that selected the master pointer's XI2 `evtype` on `window`.
+pub(crate) fn xi2_master_selectors(
+    state: &ServerState,
+    window: ResourceId,
+    evtype: u16,
+) -> Vec<ClientId> {
+    xi2_form_targets(state, window, Xi2PointerForm::Master, evtype)
 }
 
 fn compute_xi2_exact_targets(

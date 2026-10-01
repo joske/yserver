@@ -51937,6 +51937,73 @@ mod tests {
         );
     }
 
+    /// XI2 crossings of client 15, which selected XI_Enter|XI_Leave on the
+    /// master pointers of `windows`: (evtype, deviceid, sourceid, mode,
+    /// detail, event window).
+    fn tree_xi2_crossings(
+        state: &mut yserver_core::server::ServerState,
+        windows: &[yserver_protocol::x11::ResourceId],
+    ) -> std::os::unix::net::UnixStream {
+        let peer = kbd_map_client_id(state, 15);
+        let masks = &mut state.clients.get_mut(&15).unwrap().xi2_masks;
+        for w in windows {
+            masks.insert((*w, 1), (1 << 7) | (1 << 8));
+        }
+        peer
+    }
+
+    fn drain_xi2_crossings(
+        peer: &mut std::os::unix::net::UnixStream,
+    ) -> Vec<(u16, u16, u16, u8, u8, u32)> {
+        let bytes = kbd_map_drain(peer);
+        let half = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+        let mut out = Vec::new();
+        let mut at = 0;
+        while at + 32 <= bytes.len() {
+            let len =
+                32 + 4 * u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+            if bytes[at] == 35 {
+                out.push((
+                    half(at + 8),
+                    half(at + 10),
+                    half(at + 16),
+                    bytes[at + 18],
+                    bytes[at + 19],
+                    u32::from_le_bytes(bytes[at + 24..at + 28].try_into().unwrap()),
+                ));
+            }
+            at += if bytes[at] == 35 { len } else { 32 };
+        }
+        out
+    }
+
+    /// Xvfb: GrabPointer's Grab-mode crossings and a tree change's Normal
+    /// ones reach XI2 selectors too, from the master pointer (sourceid 2:
+    /// Xorg passes the master's id when no device event caused them).
+    #[test]
+    fn grab_and_tree_change_crossings_have_an_xi2_form_from_the_master() {
+        let (mut state, mut b, _peer) = tree_crossing_fixture();
+        let mut xi2 = tree_xi2_crossings(&mut state, &[TREE_A, TREE_B]);
+        let (a, bb) = (TREE_A.0, TREE_B.0);
+        tree_request(&mut state, &mut b, 8, TREE_A);
+        assert_eq!(drain_xi2_crossings(&mut xi2), [(7, 2, 2, 0, 0, a)]);
+        tree_request(&mut state, &mut b, 8, TREE_B);
+        assert_eq!(
+            drain_xi2_crossings(&mut xi2),
+            [(8, 2, 2, 0, 3, a), (7, 2, 2, 0, 3, bb)],
+            "map B over A: Leave(A) Enter(B), Nonlinear",
+        );
+        // GrabPointer(A) by client 14: the Grab-mode chain B -> A.
+        let mut body = TREE_A.0.to_le_bytes().to_vec();
+        body.extend_from_slice(&0x30u16.to_le_bytes());
+        body.extend_from_slice(&[1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        dispatch_raw(&mut state, &mut b, 26, 0, &body);
+        assert_eq!(
+            drain_xi2_crossings(&mut xi2),
+            [(8, 2, 2, 1, 3, bb), (7, 2, 2, 1, 3, a)],
+        );
+    }
+
     /// Xorg `CoreEnterLeaveEvent`: the `focus` flag is set only on the
     /// focus window and its inferiors (or everywhere under PointerRoot).
     #[test]
