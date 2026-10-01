@@ -2562,6 +2562,30 @@ impl ServerState {
             .map(|(child, _, _)| child)
     }
 
+    /// The `focus` flag of a crossing on `window` (core and XI2): the core
+    /// focus is PointerRoot, or `window` or one of its ancestors (Xorg
+    /// `CoreEnterLeaveEvent` / `DeviceEnterLeaveEvent`, `dix/events.c:4772`).
+    #[must_use]
+    pub fn crossing_has_focus(&self, window: ResourceId) -> bool {
+        match self.core_focus.raw {
+            0 => false,
+            1 => true,
+            focus => {
+                let mut current = window;
+                for _ in 0..256 {
+                    if current.0 == focus {
+                        return true;
+                    }
+                    match self.resources.window(current) {
+                        Some(w) if w.parent != current => current = w.parent,
+                        _ => return false,
+                    }
+                }
+                false
+            }
+        }
+    }
+
     #[must_use]
     pub fn top_level_for_target(&self, target: ResourceId) -> ResourceId {
         let mut current = target;
@@ -3483,6 +3507,7 @@ fn pointer_event_fanout_inner(
         }
         Err(_) => return,
     };
+    let focus = state.lock().is_ok_and(|g| g.crossing_has_focus(nested_id));
 
     for target in core_targets {
         let seq = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
@@ -3555,6 +3580,7 @@ fn pointer_event_fanout_inner(
                     state: event.state,
                     detail: event.detail,
                     mode: event.crossing_mode,
+                    focus,
                 },
             ),
             PointerEventKind::LeaveNotify => x11::encode_leave_notify_event(
@@ -3573,6 +3599,7 @@ fn pointer_event_fanout_inner(
                     state: event.state,
                     detail: event.detail,
                     mode: event.crossing_mode,
+                    focus,
                 },
             ),
         }
@@ -3631,6 +3658,7 @@ fn pointer_event_fanout_inner(
                 0,
                 0,
                 2,
+                focus,
             );
         } else {
             // Pre-D3 legacy emitter (state.fanout_pointer). Mirror the

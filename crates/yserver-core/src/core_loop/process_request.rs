@@ -18463,6 +18463,8 @@ fn handle_xi2_request(
                         .unwrap_or(i16::MAX);
                     let event_y = i16::try_from(i32::from(root_y).saturating_sub(origin_y))
                         .unwrap_or(i16::MAX);
+                    let focus =
+                        !matches!(evtype, 9 | 10) && state.crossing_has_focus(target_window);
                     let _dropped =
                         fanout_event_to_clients(state, &[client_id], |out, seq, order| {
                             x11::encode_xi2_crossing_event(
@@ -18483,6 +18485,7 @@ fn handle_xi2_request(
                                 1, // mode = NotifyGrab
                                 detail,
                                 deviceid,
+                                focus,
                             );
                         });
                 };
@@ -18624,6 +18627,8 @@ fn handle_xi2_request(
                         .unwrap_or(i16::MAX);
                     let event_y = i16::try_from(i32::from(root_y).saturating_sub(origin_y))
                         .unwrap_or(i16::MAX);
+                    let focus =
+                        !matches!(evtype, 9 | 10) && state.crossing_has_focus(target_window);
                     let _dropped =
                         fanout_event_to_clients(state, &[client_id], |out, seq, order| {
                             x11::encode_xi2_crossing_event(
@@ -18644,6 +18649,7 @@ fn handle_xi2_request(
                                 2, // mode = NotifyUngrab
                                 detail,
                                 deviceid,
+                                focus,
                             );
                         });
                 };
@@ -32544,6 +32550,7 @@ pub(crate) fn emit_core_pointer_grab_chain(
         let (ox, oy) = state.resources.window_absolute_position(e.window);
         let event_x = i16::try_from(i32::from(root_x) - ox).unwrap_or(i16::MAX);
         let event_y = i16::try_from(i32::from(root_y) - oy).unwrap_or(i16::MAX);
+        let focus = state.crossing_has_focus(e.window);
         let _dropped = emit_window_event_to_state(state, e.window, mask, |buf, seq, order| {
             let crossing = yserver_protocol::x11::CrossingEvent {
                 sequence: seq,
@@ -32558,6 +32565,7 @@ pub(crate) fn emit_core_pointer_grab_chain(
                 state: 0,
                 detail: e.detail,
                 mode,
+                focus,
             };
             if enter {
                 x11::encode_enter_notify_event(buf, order, crossing);

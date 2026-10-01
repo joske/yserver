@@ -51823,6 +51823,45 @@ mod tests {
         assert_eq!(b.core.prev_pointer_window, Some(b.core.window_id));
     }
 
+    /// Xorg `CoreEnterLeaveEvent`: the `focus` flag is set only on the
+    /// focus window and its inferiors (or everywhere under PointerRoot).
+    #[test]
+    fn crossing_focus_flag_follows_the_focus_window() {
+        let (mut state, mut b, mut peer) = tree_crossing_fixture();
+        state.core_focus.raw = TREE_A.0;
+        tree_request(&mut state, &mut b, 8, TREE_A);
+        dispatch_raw(&mut state, &mut b, 9, 0, &TREE_A.0.to_le_bytes());
+        let flags = |peer: &mut std::os::unix::net::UnixStream| -> Vec<(u8, u32, u8)> {
+            kbd_map_drain(peer)
+                .chunks(32)
+                .filter(|e| matches!(e[0] & 0x7f, 7 | 8))
+                .map(|e| {
+                    (
+                        e[0],
+                        u32::from_le_bytes(e[12..16].try_into().unwrap()),
+                        e[31],
+                    )
+                })
+                .collect()
+        };
+        let root = yserver_core::resources::ROOT_WINDOW.0;
+        assert_eq!(
+            flags(&mut peer),
+            [
+                (8, root, 2),
+                (7, TREE_A.0, 3),
+                (8, TREE_A.0, 3),
+                (7, TREE_C.0, 3)
+            ],
+        );
+        // Xvfb: a window over the focus window, not inside it, has no focus.
+        tree_request(&mut state, &mut b, 8, TREE_B);
+        assert_eq!(
+            flags(&mut peer),
+            [(8, TREE_C.0, 3), (8, TREE_A.0, 3), (7, TREE_B.0, 2)],
+        );
+    }
+
     /// A tree change is not user input: its crossings leave the idle clock
     /// (and with it DPMS and the screen saver) alone.
     #[test]

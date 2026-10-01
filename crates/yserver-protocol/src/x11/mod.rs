@@ -178,6 +178,9 @@ pub struct CrossingEvent {
     pub detail: u8,
     /// X11 mode: 0=NotifyNormal, 1=NotifyGrab, 2=NotifyUngrab.
     pub mode: u8,
+    /// The `focus` flag: the event window is the keyboard focus or an
+    /// inferior of it, or the focus is PointerRoot.
+    pub focus: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -2596,6 +2599,7 @@ pub fn encode_xi2_crossing_event(
     mode: u8,
     detail: u8,
     sourceid: u16,
+    focus: bool,
 ) {
     out.push(35); // GenericEvent
     out.push(major_opcode);
@@ -2618,7 +2622,7 @@ pub fn encode_xi2_crossing_event(
     write_u32(byte_order, out, (i32::from(event_y) << 16) as u32);
 
     out.push(1); // same_screen
-    out.push(u8::from(matches!(evtype, 9 | 10))); // focus
+    out.push(u8::from(focus));
     write_u16(byte_order, out, 1); // buttons_len
 
     // mods: base, latched, locked, effective — KEYBOARD modifier bits
@@ -2672,6 +2676,7 @@ pub fn encode_xi2_focus_event(
         mode,
         detail,
         deviceid,
+        false,
     );
 }
 
@@ -3431,7 +3436,7 @@ fn encode_crossing_event(
     write_i16(order, out, event.event_y);
     write_u16(order, out, event.state);
     out.push(event.mode);
-    out.push(0x03); // same_screen + focus
+    out.push(0x02 | u8::from(event.focus)); // ELFlagSameScreen | ELFlagFocus
 }
 
 pub fn encode_enter_notify_event(out: &mut Vec<u8>, order: ClientByteOrder, event: CrossingEvent) {
@@ -5732,6 +5737,7 @@ mod tests {
             0,
             0,
             2,
+            false,
         );
 
         assert_eq!(out.len(), 76);
@@ -6313,6 +6319,7 @@ mod tests {
                     state: 0,
                     detail: 0,
                     mode: 0,
+                    focus: true,
                 },
             );
             assert_eq!(buf.len(), 32);
@@ -6329,7 +6336,7 @@ mod tests {
             assert_eq!(&buf[26..28], &20i16.to_le_bytes());
             assert_eq!(&buf[28..30], &0u16.to_le_bytes());
             assert_eq!(buf[30], 0); // mode = NotifyNormal
-            assert_eq!(buf[31], 0x03); // same_screen,focus = 0x01 | 0x02
+            assert_eq!(buf[31], 0x03); // ELFlagSameScreen 0x02 | ELFlagFocus 0x01
         }
 
         #[test]
@@ -6351,6 +6358,7 @@ mod tests {
                     state: 0,
                     detail: 0,
                     mode: 0,
+                    focus: true,
                 },
             );
             assert_eq!(buf.len(), 32);
@@ -6469,6 +6477,7 @@ mod tests {
                                 state,
                                 detail: 0,
                                 mode: 0,
+                                focus: true,
                             },
                         );
                     }
@@ -6491,6 +6500,7 @@ mod tests {
                                 state,
                                 detail: 0,
                                 mode: 0,
+                                focus: true,
                             },
                         );
                     }

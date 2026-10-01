@@ -800,6 +800,7 @@ fn pointer_event_fanout_to_state_inner(
         let redirect_to_grab = !owner_events || natural_for_grab_client.is_none();
         if let Some((natural_window, natural_x, natural_y, child)) = natural_for_grab_client {
             if !via_xi2 {
+                let focus = state.crossing_has_focus(natural_window);
                 let extras = fanout_event_to_clients(state, &[grab_client], |buf, seq, order| {
                     encode_pointer_event(
                         buf,
@@ -813,6 +814,7 @@ fn pointer_event_fanout_to_state_inner(
                         event,
                         natural_x,
                         natural_y,
+                        focus,
                     );
                 });
                 merge_dropped(&mut dropped, extras);
@@ -862,6 +864,7 @@ fn pointer_event_fanout_to_state_inner(
             // (handled_core_via_grab below) — never leaked to the natural
             // target.
             if !via_xi2 && grab_event_mask & mask_bit != 0 {
+                let focus = state.crossing_has_focus(grab_window);
                 let extras = fanout_event_to_clients(state, &[grab_client], |buf, seq, order| {
                     encode_pointer_event(
                         buf,
@@ -875,6 +878,7 @@ fn pointer_event_fanout_to_state_inner(
                         event,
                         event_x,
                         event_y,
+                        focus,
                     );
                 });
                 merge_dropped(&mut dropped, extras);
@@ -1003,6 +1007,7 @@ fn pointer_event_fanout_to_state_inner(
         };
         let mut delivered = false;
         if let Some((natural_window, event_x, event_y, child)) = natural {
+            let focus = state.crossing_has_focus(natural_window);
             let extras = fanout_event_to_clients(state, &[grab.owner], |buf, seq, order| {
                 encode_pointer_event(
                     buf,
@@ -1016,6 +1021,7 @@ fn pointer_event_fanout_to_state_inner(
                     event,
                     event_x,
                     event_y,
+                    focus,
                 );
             });
             merge_dropped(&mut dropped, extras);
@@ -1034,6 +1040,7 @@ fn pointer_event_fanout_to_state_inner(
             let (gx, gy) = state.resources.window_absolute_position(grab.grab_window);
             let event_x = clamp_grab_coord(event.root_x, gx);
             let event_y = clamp_grab_coord(event.root_y, gy);
+            let focus = state.crossing_has_focus(grab.grab_window);
             let extras = fanout_event_to_clients(state, &[grab_target], |buf, seq, order| {
                 encode_pointer_event(
                     buf,
@@ -1047,6 +1054,7 @@ fn pointer_event_fanout_to_state_inner(
                     event,
                     event_x,
                     event_y,
+                    focus,
                 );
             });
             merge_dropped(&mut dropped, extras);
@@ -1202,6 +1210,8 @@ fn pointer_event_fanout_to_state_inner(
             );
         }
 
+        let focus = state.crossing_has_focus(nested_id);
+
         let extras = fanout_event_to_clients(state, &core_targets, |buf, seq, order| {
             encode_pointer_event(
                 buf,
@@ -1215,6 +1225,7 @@ fn pointer_event_fanout_to_state_inner(
                 event,
                 event_x,
                 event_y,
+                focus,
             );
         });
         // Capture the core candidate. The final resolver compares it with
@@ -1677,6 +1688,7 @@ fn pointer_event_fanout_to_state_inner(
                     )
                 }
             });
+            let focus = state.crossing_has_focus(ev_win);
             let extras =
                 fanout_event_to_clients(state, std::slice::from_ref(cid), |buf, seq, order| {
                     if is_crossing_evt {
@@ -1702,6 +1714,7 @@ fn pointer_event_fanout_to_state_inner(
                             } else {
                                 XI2_SLAVE_POINTER_DEVICE_ID
                             },
+                            focus,
                         );
                     } else {
                         if let Some((axis, value)) = scroll_axis_info {
@@ -3220,6 +3233,7 @@ fn encode_pointer_event(
     event: HostPointerEvent,
     event_x: i16,
     event_y: i16,
+    focus: bool,
 ) {
     let pointer = x11::PointerEvent {
         sequence: seq,
@@ -3272,6 +3286,7 @@ fn encode_pointer_event(
                 state: event.state,
                 detail: event.detail,
                 mode: event.crossing_mode,
+                focus,
             },
         ),
         PointerEventKind::LeaveNotify => x11::encode_leave_notify_event(
@@ -3290,6 +3305,7 @@ fn encode_pointer_event(
                 state: event.state,
                 detail: event.detail,
                 mode: event.crossing_mode,
+                focus,
             },
         ),
     }
