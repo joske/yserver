@@ -540,6 +540,154 @@ pub fn focus_transition_events(
     ev
 }
 
+/// The XI2 FocusOut/FocusIn sequence of the same transition — Xorg
+/// `DeviceFocusEvents` (`dix/enterleave.c:1420`). It differs from the core
+/// one: its intermediate runs exclude both ends (`DeviceFocusOutEvents` /
+/// `DeviceFocusInEvents`), so for instance the root gets no NotifyPointer
+/// or NotifyNonlinearVirtual leg when the focus leaves or enters
+/// PointerRoot, and a same-window transition sends nothing.
+#[must_use]
+pub fn device_focus_transition_events(
+    state: &ServerState,
+    from_raw: u32,
+    to_raw: u32,
+    pointer_win: ResourceId,
+) -> Vec<FocusEvent> {
+    use crate::resources::ROOT_WINDOW;
+
+    let mut ev: Vec<FocusEvent> = Vec::new();
+    if from_raw == to_raw {
+        return ev;
+    }
+    let root = ROOT_WINDOW;
+    let p = pointer_win;
+    let is_parent = |a: ResourceId, b: ResourceId| -> bool {
+        a != b && ancestor_chain(state, b).iter().skip(1).any(|w| *w == a)
+    };
+    let push = |ev: &mut Vec<FocusEvent>, window: ResourceId, focus_in: bool, detail: u8| {
+        ev.push(FocusEvent {
+            window,
+            focus_in,
+            detail,
+        });
+    };
+    // `DeviceFocusOutEvents(child, ancestor)`: child's ancestors below
+    // `ancestor`, upwards; `None` runs through the root.
+    let out_run =
+        |ev: &mut Vec<FocusEvent>, child: ResourceId, ancestor: Option<ResourceId>, detail: u8| {
+            if ancestor == Some(child) {
+                return;
+            }
+            for w in ancestor_chain(state, child).into_iter().skip(1) {
+                if Some(w) == ancestor {
+                    break;
+                }
+                push(ev, w, false, detail);
+            }
+        };
+    // `DeviceFocusInEvents(ancestor, child)`: child's ancestors below
+    // `ancestor`, downwards.
+    let in_run = |ev: &mut Vec<FocusEvent>, ancestor: ResourceId, child: ResourceId, detail: u8| {
+        let mut run: Vec<ResourceId> = Vec::new();
+        for w in ancestor_chain(state, child).into_iter().skip(1) {
+            if w == ancestor {
+                break;
+            }
+            run.push(w);
+        }
+        for w in run.into_iter().rev() {
+            push(ev, w, true, detail);
+        }
+    };
+    let special = |r: u32| r == 0 || r == 1;
+    let out_detail = if from_raw == 0 {
+        NOTIFY_DETAIL_NONE
+    } else {
+        NOTIFY_POINTER_ROOT
+    };
+    let in_detail = if to_raw == 0 {
+        NOTIFY_DETAIL_NONE
+    } else {
+        NOTIFY_POINTER_ROOT
+    };
+    if special(to_raw) {
+        if special(from_raw) {
+            if from_raw == 1 {
+                push(&mut ev, p, false, NOTIFY_POINTER);
+                out_run(&mut ev, p, Some(root), NOTIFY_POINTER);
+            }
+            push(&mut ev, root, false, out_detail);
+        } else {
+            let from = ResourceId(from_raw);
+            if is_parent(from, p) {
+                push(&mut ev, p, false, NOTIFY_POINTER);
+                out_run(&mut ev, p, Some(from), NOTIFY_POINTER);
+            }
+            push(&mut ev, from, false, NOTIFY_NONLINEAR);
+            out_run(&mut ev, from, None, NOTIFY_NONLINEAR_VIRTUAL);
+        }
+        push(&mut ev, root, true, in_detail);
+        if to_raw == 1 {
+            in_run(&mut ev, root, p, NOTIFY_POINTER);
+            push(&mut ev, p, true, NOTIFY_POINTER);
+        }
+        return ev;
+    }
+    let to = ResourceId(to_raw);
+    if special(from_raw) {
+        if from_raw == 1 {
+            push(&mut ev, p, false, NOTIFY_POINTER);
+            out_run(&mut ev, p, Some(root), NOTIFY_POINTER);
+        }
+        push(&mut ev, root, false, out_detail);
+        if to != root {
+            in_run(&mut ev, root, to, NOTIFY_NONLINEAR_VIRTUAL);
+        }
+        push(&mut ev, to, true, NOTIFY_NONLINEAR);
+        if is_parent(to, p) {
+            in_run(&mut ev, to, p, NOTIFY_POINTER);
+        }
+        return ev;
+    }
+    let from = ResourceId(from_raw);
+    if is_parent(to, from) {
+        push(&mut ev, from, false, NOTIFY_ANCESTOR);
+        out_run(&mut ev, from, Some(to), NOTIFY_VIRTUAL);
+        push(&mut ev, to, true, NOTIFY_INFERIOR);
+        if is_parent(to, p) && p != from && !is_parent(from, p) && !is_parent(p, from) {
+            in_run(&mut ev, to, p, NOTIFY_POINTER);
+        }
+    } else if is_parent(from, to) {
+        if is_parent(from, p) && p != from && !is_parent(to, p) && !is_parent(p, to) {
+            push(&mut ev, p, false, NOTIFY_POINTER);
+            out_run(&mut ev, p, Some(from), NOTIFY_POINTER);
+        }
+        push(&mut ev, from, false, NOTIFY_INFERIOR);
+        in_run(&mut ev, from, to, NOTIFY_VIRTUAL);
+        push(&mut ev, to, true, NOTIFY_ANCESTOR);
+    } else {
+        let common =
+            lowest_common_ancestor(&ancestor_chain(state, from), &ancestor_chain(state, to));
+        if is_parent(from, p) {
+            out_run(&mut ev, p, Some(from), NOTIFY_POINTER);
+        }
+        push(&mut ev, from, false, NOTIFY_NONLINEAR);
+        if from != root {
+            out_run(&mut ev, from, common, NOTIFY_NONLINEAR_VIRTUAL);
+        }
+        if to != root
+            && let Some(common) = common
+        {
+            in_run(&mut ev, common, to, NOTIFY_NONLINEAR_VIRTUAL);
+        }
+        push(&mut ev, to, true, NOTIFY_NONLINEAR);
+        if is_parent(to, p) {
+            in_run(&mut ev, to, p, NOTIFY_POINTER);
+        }
+    }
+    ev
+}
+
 /// `[start, parent_of_start, parent_of_parent, ..., root]`, terminated
 /// when a window is its own parent (X11's root convention) or when a
 /// missing/cyclic parent is reached. Capped at 256 hops as a defense
@@ -806,6 +954,34 @@ mod tests {
                 fe(b, true, NOTIFY_NONLINEAR),
             ],
         );
+    }
+
+    /// Xvfb, the pointer in a root child E: SetInputFocus(E) from
+    /// PointerRoot and back sends XI2 FocusOut/FocusIn on E and the root's
+    /// PointerRoot leg only — none of the core sequence's NotifyPointer and
+    /// NotifyNonlinearVirtual events on the root.
+    #[test]
+    fn device_focus_to_and_from_pointerroot_skips_the_root_legs() {
+        let mut state = ServerState::new();
+        let e = make_window(&mut state, 0x0010_0220, ROOT_WINDOW);
+        assert_eq!(
+            device_focus_transition_events(&state, 1, e.0, e),
+            vec![
+                fe(e, false, NOTIFY_POINTER),
+                fe(ROOT_WINDOW, false, NOTIFY_POINTER_ROOT),
+                fe(e, true, NOTIFY_NONLINEAR),
+            ],
+        );
+        assert_eq!(
+            device_focus_transition_events(&state, e.0, 1, e),
+            vec![
+                fe(e, false, NOTIFY_NONLINEAR),
+                fe(ROOT_WINDOW, false, NOTIFY_NONLINEAR_VIRTUAL),
+                fe(ROOT_WINDOW, true, NOTIFY_POINTER_ROOT),
+                fe(e, true, NOTIFY_POINTER),
+            ],
+        );
+        assert_eq!(device_focus_transition_events(&state, e.0, e.0, e), vec![]);
     }
 
     #[test]

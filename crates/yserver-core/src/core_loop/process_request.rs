@@ -28423,8 +28423,11 @@ pub(crate) fn emit_core_focus_transition(
                     buf, seq, order, e.focus_in, e.window, mode, e.detail,
                 );
             });
-        // XI2 mirrors only the real FocusIn/FocusOut pairs (evtype
-        // 9/10) on the windows the core chain touches.
+    }
+    // Xorg DoFocusEvents: the whole core sequence, then the XI2 one
+    // (DeviceFocusEvents), which has its own windows.
+    for e in crate::crossings::device_focus_transition_events(state, from_raw, to_raw, pointer_win)
+    {
         let evtype = if e.focus_in { 9 } else { 10 };
         let _dropped = emit_xi2_focus_event_to_state(
             state,
@@ -46457,40 +46460,23 @@ mod tests {
         let bytes = read_all_available(&mut peer);
 
         assert_eq!(bytes.len(), 216, "expected core + XI2 focus out/in");
+        // Xorg DoFocusEvents: the core sequence first, then the XI2 one.
+        let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        let half = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
         assert_eq!(bytes[0], 10, "first event should be core FocusOut");
         assert_eq!(bytes[1], 2, "parent FocusOut should be NotifyInferior");
-        assert_eq!(
-            u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
-            TOP
-        );
-        assert_eq!(bytes[32], 35, "second event should be XI2 GenericEvent");
-        assert_eq!(
-            u16::from_le_bytes([bytes[40], bytes[41]]),
-            10,
-            "XI2 FocusOut evtype"
-        );
-        assert_eq!(bytes[51], 2, "XI2 parent FocusOut should be NotifyInferior");
-        assert_eq!(
-            u32::from_le_bytes([bytes[56], bytes[57], bytes[58], bytes[59]]),
-            TOP
-        );
-        assert_eq!(bytes[108], 9, "third event should be core FocusIn");
-        assert_eq!(bytes[109], 0, "child FocusIn should be NotifyAncestor");
-        assert_eq!(
-            u32::from_le_bytes([bytes[112], bytes[113], bytes[114], bytes[115]]),
-            CHILD
-        );
+        assert_eq!(word(4), TOP);
+        assert_eq!(bytes[32], 9, "second event should be core FocusIn");
+        assert_eq!(bytes[33], 0, "child FocusIn should be NotifyAncestor");
+        assert_eq!(word(36), CHILD);
+        assert_eq!(bytes[64], 35, "third event should be XI2 GenericEvent");
+        assert_eq!(half(72), 10, "XI2 FocusOut evtype");
+        assert_eq!(bytes[83], 2, "XI2 parent FocusOut should be NotifyInferior");
+        assert_eq!(word(88), TOP);
         assert_eq!(bytes[140], 35, "fourth event should be XI2 GenericEvent");
-        assert_eq!(
-            u16::from_le_bytes([bytes[148], bytes[149]]),
-            9,
-            "XI2 FocusIn evtype"
-        );
+        assert_eq!(half(148), 9, "XI2 FocusIn evtype");
         assert_eq!(bytes[159], 0, "XI2 child FocusIn should be NotifyAncestor");
-        assert_eq!(
-            u32::from_le_bytes([bytes[164], bytes[165], bytes[166], bytes[167]]),
-            CHILD
-        );
+        assert_eq!(word(164), CHILD);
         assert_eq!(
             state.core_focus.raw, CHILD,
             "keyboard focus should track child"
