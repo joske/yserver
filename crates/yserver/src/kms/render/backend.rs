@@ -22999,16 +22999,10 @@ impl Backend for KmsBackend {
             // can keep the caller's claim and let the compositor retry, or
             // fail safely without freeing a scanned buffer.
             self.materialize_direct_shadow_for_unflip()?;
-            self.core
-                .xid_map
-                .remove(&yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0);
             self.request_direct_unflip("release_last_overlay_window");
             self.deferred_cow_release = true;
             return Ok(true);
         }
-        self.core
-            .xid_map
-            .remove(&yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0);
         self.finish_cow_release();
         Ok(true)
     }
@@ -45819,8 +45813,8 @@ mod tests {
             "cow_host_xid getter returns None after final release"
         );
         assert!(
-            !b.core.xid_map.contains_key(&cow_host_xid),
-            "COW leaves the pointer xid map on final release"
+            b.core.xid_map.contains_key(&cow_host_xid),
+            "COW stays in the pointer xid map until core unregisters it"
         );
     }
 
@@ -51695,6 +51689,7 @@ mod tests {
             x if x == TREE_A.0 => "A".to_string(),
             x if x == TREE_B.0 => "B".to_string(),
             x if x == TREE_C.0 => "C".to_string(),
+            x if x == yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0 => "COW".to_string(),
             x if x == yserver_core::resources::ROOT_WINDOW.0 => "root".to_string(),
             x => format!("{x:#x}"),
         };
@@ -51800,6 +51795,34 @@ mod tests {
                 "Enter root Inferior child=None mode=0",
             ],
         );
+    }
+
+    /// Xvfb: the last ReleaseOverlayWindow with the pointer on the COW
+    /// unmaps it, leaves it for the root while it still exists, and only
+    /// then destroys it (Xorg compDestroyOverlayWindow → DeleteWindow).
+    #[test]
+    fn release_overlay_under_a_still_pointer_leaves_before_destroy_notify() {
+        use yserver_core::resources::{COMPOSITE_OVERLAY_WINDOW, ROOT_WINDOW};
+        let (mut state, mut b, mut peer) = tree_crossing_fixture();
+        let masks = &mut state.clients.get_mut(&14).unwrap().event_masks;
+        masks.insert(ROOT_WINDOW, 0x0008_0030);
+        masks.insert(COMPOSITE_OVERLAY_WINDOW, 0x0002_0030);
+        dispatch_raw(&mut state, &mut b, 144, 7, &ROOT_WINDOW.0.to_le_bytes());
+        assert_eq!(b.core.prev_pointer_window, Some(COMPOSITE_OVERLAY_WINDOW.0));
+        let _ = tree_events(&mut peer);
+        dispatch_raw(&mut state, &mut b, 144, 8, &ROOT_WINDOW.0.to_le_bytes());
+        assert_eq!(
+            tree_events(&mut peer),
+            [
+                "Unmap COW",
+                "Unmap COW",
+                "Leave COW Ancestor child=None mode=0",
+                "Enter root Inferior child=None mode=0",
+                "Destroy COW",
+                "Destroy COW",
+            ],
+        );
+        assert_eq!(b.core.prev_pointer_window, Some(b.core.window_id));
     }
 
     /// Xvfb: destroying a window whose child holds the pointer unmaps it

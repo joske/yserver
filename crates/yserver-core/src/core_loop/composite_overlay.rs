@@ -126,6 +126,7 @@ pub(crate) fn teardown_overlay(
     backend: &mut dyn Backend,
     origin: Option<OriginContext>,
 ) -> std::io::Result<()> {
+    let cow_host_xid = backend.cow_host_xid();
     if !backend.release_overlay_window(origin)? {
         // Backend never materialized a COW (v1, ynest, trait default):
         // nothing to mirror down either, because nothing ever reached
@@ -185,6 +186,10 @@ pub(crate) fn teardown_overlay(
         &[COMPOSITE_OVERLAY_WINDOW],
     );
     state.resources.destroy_cow_resource();
+    // Unregistered only now: the unmap's crossings above still name the COW.
+    if let Some(xid) = cow_host_xid {
+        backend.unregister_host_window(xid);
+    }
     state.destroy_cow_input_shape();
     // The COW is no longer a core root child; reproject so it leaves the
     // backend top-level order.
