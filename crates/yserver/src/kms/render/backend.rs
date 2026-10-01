@@ -208,6 +208,17 @@ fn migrated_content_copy(
     ))
 }
 
+/// A moving window's place in an ancestor's shared redirect backing,
+/// taken before the configure: see
+/// [`KmsBackend::shared_backing_move_source`].
+struct SharedBackingMoveSource {
+    /// Where the window drew before the move.
+    target: PaintTarget,
+    /// Higher siblings over the window at its OLD position, in its
+    /// local content space: those pixels are theirs, not the window's.
+    occluders: Vec<ash::vk::Rect2D>,
+}
+
 /// #133 step 6 (P8) — what [`KmsBackend::sync_window_leaf_storage`]
 /// does with the pixels a window's leaf storage already holds when it
 /// has to reallocate.
@@ -7138,6 +7149,133 @@ impl KmsBackend {
         let mut clip = super::target::ContentClipAccum::default();
         clip.intersect(super::target::content_rect((b, b), geom.width, geom.height));
         self.finish_content_clip(clip, id)
+    }
+
+    /// What a pure move of `host_xid` has to carry along, captured
+    /// BEFORE the configure mutates its geometry: `None` unless the
+    /// window draws into an ANCESTOR's redirect backing.
+    ///
+    /// A window under a redirected ancestor has no pixels of its own on
+    /// screen: it (and every non-redirected inferior) paints straight
+    /// into the shared backing at its offset, so moving it leaves those
+    /// pixels behind. Xorg moves them inside that one pixmap:
+    /// `miMoveWindow` calls `CopyWindow` (`mi/miwindow.c:293`), and
+    /// `compCopyWindow` falls through for a window that is not itself
+    /// redirected (`composite/compwindow.c:548-552`) to `fbCopyWindow`,
+    /// which copies the old `borderClip` to the new origin. The client
+    /// is not asked to repaint the part that copy covers, so a client
+    /// that drew once — the MATE notification area composites each
+    /// tray icon into its window and then waits for Damage — shows
+    /// whatever the backing held at the new position. A window that
+    /// paints into its own leaf (no redirected ancestor), or owns its
+    /// own backing, moves with its storage and needs nothing.
+    ///
+    /// Only a pure move qualifies: a resize or border-width change
+    /// reallocates or re-tiles the window and goes through the paths
+    /// below it instead.
+    fn shared_backing_move_source(
+        &self,
+        host_xid: u32,
+        config: &HostSubwindowConfig,
+    ) -> Option<SharedBackingMoveSource> {
+        let geom = self.windows.get(&host_xid)?;
+        let moved = config.x.is_some_and(|x| x != geom.x) || config.y.is_some_and(|y| y != geom.y);
+        let resized = config.width.is_some_and(|w| w != geom.width)
+            || config.height.is_some_and(|h| h != geom.height)
+            || config
+                .border_width
+                .is_some_and(|bw| bw != geom.border_width);
+        if !moved || resized {
+            return None;
+        }
+        let leaf = self.store.lookup(host_xid);
+        if leaf
+            .and_then(|id| self.store.redirected_target(id))
+            .is_some()
+        {
+            return None;
+        }
+        let target = self.resolve_paint_target(host_xid)?;
+        if Some(target.backing_id()) == leaf {
+            return None;
+        }
+        Some(SharedBackingMoveSource {
+            occluders: self.copy_area_shared_backing_occluders(host_xid, &target),
+            target,
+        })
+    }
+
+    /// Copy what [`Self::shared_backing_move_source`] captured to the
+    /// window's new position in the same backing: the window's whole
+    /// outer extent, inferiors included, minus higher siblings at the
+    /// old position (not the window's pixels) and at the new one (not
+    /// the window's to overwrite) — `fbCopyWindow`'s old `borderClip`
+    /// intersected with the new one. Whatever the copy cannot cover is
+    /// exposed by the core configure path, as in Xorg.
+    fn carry_shared_backing_pixels_on_move(
+        &mut self,
+        host_xid: u32,
+        source: SharedBackingMoveSource,
+    ) {
+        let Some(geom) = self.windows.get(&host_xid).copied() else {
+            return;
+        };
+        let Some(target) = self.resolve_paint_target(host_xid) else {
+            return;
+        };
+        let backing = target.backing_id();
+        if backing != source.target.backing_id() {
+            return;
+        }
+        let old_origin = source.target.offset();
+        let new_origin = target.offset();
+        if old_origin == new_origin {
+            return;
+        }
+        // Window-local CONTENT space, the occluders' frame: the outer
+        // extent starts a border width up and left of the content.
+        let bw = i32::from(geom.border_width);
+        let outer = ash::vk::Rect2D {
+            offset: ash::vk::Offset2D { x: -bw, y: -bw },
+            extent: ash::vk::Extent2D {
+                width: u32::from(geom.width) + 2 * u32::from(geom.border_width),
+                height: u32::from(geom.height) + 2 * u32::from(geom.border_width),
+            },
+        };
+        let new_occluders = self.copy_area_shared_backing_occluders(host_xid, &target);
+        let still_visible = compute_copy_area_dst_rects(outer, &new_occluders);
+        let pieces: Vec<ash::vk::Rect2D> = compute_copy_area_dst_rects(outer, &source.occluders)
+            .into_iter()
+            .flat_map(|r| intersect_rect_with_clip(r, &still_visible))
+            .collect();
+        let delta = (new_origin.0 - old_origin.0, new_origin.1 - old_origin.1);
+        for piece in order_pieces_for_in_place_move(pieces, delta) {
+            let src_rect = ash::vk::Rect2D {
+                offset: ash::vk::Offset2D {
+                    x: old_origin.0 + piece.offset.x,
+                    y: old_origin.1 + piece.offset.y,
+                },
+                extent: piece.extent,
+            };
+            let dst_pos = ash::vk::Offset2D {
+                x: new_origin.0 + piece.offset.x,
+                y: new_origin.1 + piece.offset.y,
+            };
+            if let Err(e) = self.engine.copy_area(
+                &mut self.store,
+                &mut self.platform,
+                Src::server_internal(backing),
+                Dst::server_internal(backing),
+                src_rect,
+                dst_pos,
+            ) {
+                log::warn!(
+                    "render configure_subwindow: carrying moved window 0x{host_xid:x} \
+                     inside its shared backing failed: {e:?}"
+                );
+                return;
+            }
+        }
     }
 
     /// When window branches share one redirected backing, painting a lower
@@ -22019,6 +22157,7 @@ impl Backend for KmsBackend {
         if self.direct_frame_references_host_drawable(host_xid) {
             self.request_direct_unflip("configure_direct_frame_drawable");
         }
+        let move_source = self.shared_backing_move_source(host_xid, &config);
         let Some(geom) = self.windows.get_mut(&host_xid) else {
             // Window not tracked — log + skip (e.g., configure
             // before register). v1 tolerates this.
@@ -22129,6 +22268,12 @@ impl Backend for KmsBackend {
             if is_subwindow {
                 self.restack_subwindow(host_xid, stack_mode, config.sibling);
             }
+        }
+        // After the restack, so the destination clip sees the new
+        // stacking, as Xorg's `CopyWindow` runs against the validated
+        // tree.
+        if let Some(source) = move_source {
+            self.carry_shared_backing_pixels_on_move(host_xid, source);
         }
         self.scene.wake_for_damage();
         Ok(())
@@ -28831,6 +28976,60 @@ fn compute_render_composite_clip(
     fold(src_in_dst);
     fold(mask_in_dst);
     acc
+}
+
+/// Order the disjoint pieces of an in-place move by `delta` so that no
+/// piece is read after another piece has written over it. Each copy is
+/// individually overlap-safe (`RenderEngine::copy_area` stages a
+/// same-image copy through a scratch image), but the pieces are separate
+/// copies: piece `j` must go before piece `i` whenever `i`'s destination
+/// covers `j`'s source. Xorg's `miCopyRegion` gets the same guarantee by
+/// walking its YX-banded boxes against the direction of the move
+/// (`mi/micopy.c:54-140`); these pieces are not banded, so the order is
+/// derived from the overlaps directly. Should the remaining pieces ever
+/// form a cycle, they are appended as they are; the common case — no
+/// higher sibling over the window — is a single piece.
+fn order_pieces_for_in_place_move(
+    pieces: Vec<ash::vk::Rect2D>,
+    delta: (i32, i32),
+) -> Vec<ash::vk::Rect2D> {
+    fn overlaps(a: ash::vk::Rect2D, b: ash::vk::Rect2D) -> bool {
+        let right = |r: ash::vk::Rect2D| r.offset.x + i32::try_from(r.extent.width).unwrap_or(0);
+        let bottom = |r: ash::vk::Rect2D| r.offset.y + i32::try_from(r.extent.height).unwrap_or(0);
+        a.offset.x < right(b)
+            && b.offset.x < right(a)
+            && a.offset.y < bottom(b)
+            && b.offset.y < bottom(a)
+    }
+    if pieces.len() < 2 {
+        return pieces;
+    }
+    let moved = |r: ash::vk::Rect2D| ash::vk::Rect2D {
+        offset: ash::vk::Offset2D {
+            x: r.offset.x + delta.0,
+            y: r.offset.y + delta.1,
+        },
+        extent: r.extent,
+    };
+    let mut left: Vec<ash::vk::Rect2D> = pieces;
+    let mut ordered = Vec::with_capacity(left.len());
+    while !left.is_empty() {
+        // A piece is safe to copy now when its destination covers no
+        // other remaining piece's source.
+        let ready = (0..left.len()).find(|&i| {
+            let dst = moved(left[i]);
+            left.iter()
+                .enumerate()
+                .all(|(j, src)| j == i || !overlaps(dst, *src))
+        });
+        match ready {
+            Some(i) => ordered.push(left.swap_remove(i)),
+            None => {
+                ordered.append(&mut left);
+            }
+        }
+    }
+    ordered
 }
 
 fn compute_copy_area_dst_rects(
