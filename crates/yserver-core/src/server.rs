@@ -2681,23 +2681,26 @@ impl ServerState {
         Some((child_id, child_x, child_y))
     }
 
+    /// Xorg `miSpriteTrace` (`mi/miwindow.c:767`): a set bounding shape
+    /// (`PointInBorderSize`) and a set input shape must both hold the point.
     fn window_input_contains(&self, window: ResourceId, x: i16, y: i16) -> bool {
-        let Some(rects) = self
-            .shape_windows
-            .get(&window)
-            .and_then(|state| state.input.as_ref())
-        else {
+        let Some(shape) = self.shape_windows.get(&window) else {
             return true;
         };
-        rects.iter().any(|rect| {
-            let rx = i32::from(rect.x);
-            let ry = i32::from(rect.y);
-            let rr = rx + i32::from(rect.width);
-            let rb = ry + i32::from(rect.height);
-            let px = i32::from(x);
-            let py = i32::from(y);
-            px >= rx && py >= ry && px < rr && py < rb
-        })
+        let holds = |rects: &Option<Vec<xfixes::RegionRect>>| {
+            rects.as_ref().is_none_or(|rects| {
+                rects.iter().any(|rect| {
+                    let rx = i32::from(rect.x);
+                    let ry = i32::from(rect.y);
+                    let rr = rx + i32::from(rect.width);
+                    let rb = ry + i32::from(rect.height);
+                    let px = i32::from(x);
+                    let py = i32::from(y);
+                    px >= rx && py >= ry && px < rr && py < rb
+                })
+            })
+        };
+        holds(&shape.bounding) && holds(&shape.input)
     }
 
     /// Diagnostic label for a window: `0x<id>[<WM_CLASS>]`. WM_CLASS is

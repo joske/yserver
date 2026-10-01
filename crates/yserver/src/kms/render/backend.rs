@@ -51823,6 +51823,41 @@ mod tests {
         assert_eq!(b.core.prev_pointer_window, Some(b.core.window_id));
     }
 
+    /// Xvfb: a bounding shape that misses the pointer takes the window out
+    /// from under it as an input shape would (`miSpriteTrace` checks
+    /// `PointInBorderSize`), and resetting it brings the pointer back.
+    #[test]
+    fn bounding_shape_off_the_pointer_leaves_the_window() {
+        let (mut state, mut b, mut peer) = tree_crossing_fixture();
+        tree_request(&mut state, &mut b, 8, TREE_A);
+        tree_request(&mut state, &mut b, 8, TREE_B);
+        let _ = tree_events(&mut peer);
+        // SHAPE Rectangles(Set, Bounding, B, 0,0, [0,0 10x10]).
+        let mut body = vec![0u8, 0, 0, 0];
+        body.extend_from_slice(&TREE_B.0.to_le_bytes());
+        body.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 10, 0, 10, 0]);
+        dispatch_raw(&mut state, &mut b, 141, 1, &body);
+        assert_eq!(
+            tree_events(&mut peer),
+            [
+                "Leave B Nonlinear child=None mode=0",
+                "Enter A Nonlinear child=None mode=0",
+            ],
+        );
+        // SHAPE Mask(Set, Bounding, B, None) resets it.
+        let mut body = vec![0u8, 0, 0, 0];
+        body.extend_from_slice(&TREE_B.0.to_le_bytes());
+        body.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+        dispatch_raw(&mut state, &mut b, 141, 2, &body);
+        assert_eq!(
+            tree_events(&mut peer),
+            [
+                "Leave A Nonlinear child=None mode=0",
+                "Enter B Nonlinear child=None mode=0",
+            ],
+        );
+    }
+
     /// Xorg `CoreEnterLeaveEvent`: the `focus` flag is set only on the
     /// focus window and its inferiors (or everywhere under PointerRoot).
     #[test]
