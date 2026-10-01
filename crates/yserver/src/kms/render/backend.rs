@@ -355,6 +355,79 @@ fn scanout_direct_eligible(
     // source crop proven valid.
 }
 
+/// Whether no Bounding or Clip shape on `leaf_xid` or any ancestor up to the
+/// root (the COW included) removes part of the `root` rect.
+///
+/// Xorg flips a Present only when the window's `clipList` equals the root's
+/// `winSize` (`present/present_scmd.c:102`), and every shape in the chain
+/// narrows that clip list (`SetWinSize`, `dix/window.c:1713`, propagated to
+/// descendants by `miComputeClips`). Muffin's lock screen is the load-bearing
+/// case: it shapes the COW to an EMPTY region and unredirects the locker, so
+/// its stage's Presents are clipped to nothing and the locker below shows.
+/// Shape rects are relative to each window's content origin.
+fn direct_shape_chain_covers_root(
+    windows: &WindowsMap,
+    root_window_id: u32,
+    shape_bounding: &HashMap<u32, Vec<xfixes::RegionRect>>,
+    shape_clip: &HashMap<u32, Vec<xfixes::RegionRect>>,
+    leaf_xid: u32,
+    root: (u32, u32),
+) -> bool {
+    use crate::kms::render::region::Region;
+
+    let mut chain = Vec::new();
+    let mut xid = leaf_xid;
+    // Resource validation prevents cycles in production; stay bounded anyway.
+    for _ in 0..=windows.len() {
+        let Some(geometry) = windows.get(&xid) else {
+            return false;
+        };
+        let bw = i32::from(geometry.border_width);
+        chain.push((xid, i32::from(geometry.x) + bw, i32::from(geometry.y) + bw));
+        match geometry.parent {
+            None => break,
+            Some(parent) if parent == root_window_id => break,
+            Some(parent) => xid = parent,
+        }
+    }
+    let root_rect = vk::Rect2D {
+        offset: vk::Offset2D::default(),
+        extent: vk::Extent2D {
+            width: root.0,
+            height: root.1,
+        },
+    };
+    let (mut abs_x, mut abs_y) = (0, 0);
+    for &(xid, x, y) in chain.iter().rev() {
+        abs_x += x;
+        abs_y += y;
+        for shapes in [shape_bounding, shape_clip] {
+            let Some(rects) = shapes.get(&xid) else {
+                continue;
+            };
+            // Subtract rect by rect: a capped remainder only grows, so the
+            // answer can err towards "not covered", never towards a flip.
+            let mut uncovered = Region::from_rect(root_rect);
+            for rect in rects {
+                uncovered.subtract(&Region::from_rect(vk::Rect2D {
+                    offset: vk::Offset2D {
+                        x: abs_x + i32::from(rect.x),
+                        y: abs_y + i32::from(rect.y),
+                    },
+                    extent: vk::Extent2D {
+                        width: u32::from(rect.width),
+                        height: u32::from(rect.height),
+                    },
+                }));
+            }
+            if !uncovered.is_empty() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Which retained direct frame a single CRTC is scanning out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DirectFrameSlot {
@@ -3346,6 +3419,34 @@ impl KmsBackend {
         } else {
             ScanoutM0Target::Other
         }
+    }
+
+    fn direct_shape_chain_covers_root(&self, leaf_xid: u32, root: (u32, u32)) -> bool {
+        direct_shape_chain_covers_root(
+            &self.windows,
+            self.core.window_id,
+            &self.core.shape_bounding,
+            &self.core.shape_clip,
+            leaf_xid,
+            root,
+        )
+    }
+
+    /// Whether a retained direct frame now presents through a Bounding or
+    /// Clip shape that no longer covers the root. A compositor may shape the
+    /// COW without presenting again, so the shape change itself must unflip.
+    fn direct_frames_shaped_off_root(&self) -> bool {
+        let root = (u32::from(self.platform.fb_w), u32::from(self.platform.fb_h));
+        let shaped_off = |frame: &DirectPresentFrame| {
+            !self.direct_shape_chain_covers_root(frame.candidate.paint_dst_host_xid, root)
+        };
+        self.scanout_m2.pending.as_ref().is_some_and(shaped_off)
+            || self
+                .scanout_m2
+                .queued_successor
+                .as_ref()
+                .is_some_and(shaped_off)
+            || self.scanout_m2.current.as_ref().is_some_and(shaped_off)
     }
 
     /// Whether an unredirected Present target is still the window which the
@@ -20110,8 +20211,9 @@ impl Backend for KmsBackend {
                     ) == root
             });
         let authoritative_root = scanout_m2_is_authoritative_root(target, root_coverage);
-        let scene_eligible = !matches!(target, ScanoutM0Target::Unredirected)
-            || self.unredirected_direct_scene_eligible(candidate.paint_dst_host_xid, root);
+        let scene_eligible = (!matches!(target, ScanoutM0Target::Unredirected)
+            || self.unredirected_direct_scene_eligible(candidate.paint_dst_host_xid, root))
+            && self.direct_shape_chain_covers_root(candidate.paint_dst_host_xid, root);
         // #133 step 3 (3.5): reject any candidate whose resolved paint
         // chain carries a border clip. `has_border_clip()` is true iff
         // some window between the presented drawable and its backing has
@@ -27994,6 +28096,9 @@ impl Backend for KmsBackend {
         // fix cut 2b — the compose scheduler otherwise excludes it).
         // Input shape (2) only affects hit-testing — no redraw needed.
         if kind == 0 || kind == 1 {
+            if self.direct_frames_shaped_off_root() {
+                self.request_direct_unflip("shape_clips_direct_frame");
+            }
             self.scene.wake_for_damage();
         }
         Ok(())
@@ -48553,6 +48658,112 @@ mod tests {
         assert!(!super::scanout_direct_eligible(
             true, true, true, true, true, true, 1, 0, 0
         ));
+    }
+
+    /// A root-sized stage under the COW, as muffin lays it out.
+    fn seed_cow_stage(b: &mut super::KmsBackend, stage: u32) -> (u32, u32) {
+        let cow = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+        let (w, h) = (b.platform.fb_w, b.platform.fb_h);
+        let root_window = b.core.window_id;
+        seed_window(b, cow, Some(root_window), 0, 0);
+        seed_window(b, stage, Some(cow), 0, 0);
+        for xid in [cow, stage] {
+            let geometry = b.windows.get_mut(&xid).unwrap();
+            geometry.width = w;
+            geometry.height = h;
+        }
+        (u32::from(w), u32::from(h))
+    }
+
+    /// Xorg flips a Present only when the window's clip list is the root's
+    /// `winSize` (`present/present_scmd.c:102`), and a Bounding or Clip shape
+    /// on the window or any ancestor narrows that clip list (`SetWinSize`,
+    /// `dix/window.c:1713`; `miComputeClips`). Muffin's lock screen shapes
+    /// the COW to an EMPTY region while its stage keeps presenting.
+    #[test]
+    fn direct_shape_chain_requires_every_shape_to_cover_the_root() {
+        use yserver_protocol::x11::xfixes::RegionRect;
+
+        let cow = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+        let stage = 0x0040_0003;
+        let mut b = super::KmsBackend::for_tests();
+        let root = seed_cow_stage(&mut b, stage);
+        let (w, h) = (
+            u16::try_from(root.0).unwrap(),
+            u16::try_from(root.1).unwrap(),
+        );
+        let rect = |x: i16, width: u16| RegionRect {
+            x,
+            y: 0,
+            width,
+            height: h,
+        };
+        let half = i16::try_from(w / 2).unwrap();
+        let covers = |b: &super::KmsBackend| b.direct_shape_chain_covers_root(stage, root);
+
+        assert!(covers(&b), "unshaped chain");
+        b.core.shape_bounding.insert(cow, Vec::new());
+        assert!(!covers(&b), "empty COW Bounding shape clips the stage away");
+        b.core.shape_bounding.insert(cow, vec![rect(0, w)]);
+        assert!(covers(&b), "a root-sized COW shape");
+        b.core
+            .shape_bounding
+            .insert(cow, vec![rect(0, w / 2), rect(half, w - w / 2)]);
+        assert!(covers(&b), "two rects that tile the root");
+        b.core.shape_bounding.insert(cow, vec![rect(0, w / 2)]);
+        assert!(!covers(&b), "a hole punched in the COW");
+        b.core.shape_bounding.remove(&cow);
+        b.core.shape_clip.insert(stage, Vec::new());
+        assert!(!covers(&b), "an empty Clip shape on the presented window");
+        b.core.shape_clip.insert(stage, vec![rect(0, w)]);
+        assert!(covers(&b));
+        // Shape rects are window-relative: a stage shifted right by `half`
+        // with a shape starting at `-half` still covers the root.
+        b.windows.get_mut(&stage).unwrap().x = half;
+        b.core.shape_clip.insert(stage, vec![rect(-half, w)]);
+        assert!(covers(&b), "window-relative shape on an offset window");
+        b.core.shape_clip.insert(stage, vec![rect(0, w)]);
+        assert!(!covers(&b), "the same rect, not translated back");
+    }
+
+    /// The shape change itself must hand a direct frame back to the composed
+    /// scene: muffin shapes the COW and need not Present again before the
+    /// locker is expected on screen.
+    #[test]
+    fn an_empty_cow_bounding_shape_unflips_the_direct_stage_frame() {
+        use yserver_core::backend::Backend;
+        use yserver_protocol::x11::xfixes::RegionRect;
+
+        let cow = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+        let (stage, source) = (0x0040_0003, 0x0040_0007);
+        let mut b = super::KmsBackend::for_tests();
+        let (w, h) = seed_cow_stage(&mut b, stage);
+        seed_window(&mut b, source, None, 0, 0);
+        let (w, h) = (u16::try_from(w).unwrap(), u16::try_from(h).unwrap());
+        retain_direct_frame_from_source_test(&mut b, source, stage, w, h);
+        assert!(b.scanout_m2.active());
+
+        b.set_shape_rectangles(None, cow, 2, Some(&[])).unwrap();
+        b.set_shape_rectangles(
+            None,
+            cow,
+            0,
+            Some(&[RegionRect {
+                x: 0,
+                y: 0,
+                width: w,
+                height: h,
+            }]),
+        )
+        .unwrap();
+        assert!(
+            !b.scanout_m2.unflip_requested,
+            "an input shape or a root-covering bounding shape keeps the flip"
+        );
+
+        b.set_shape_rectangles(None, cow, 0, Some(&[])).unwrap();
+        assert!(b.scanout_m2.unflip_requested);
+        assert_eq!(b.scanout_m2.unflip_reason, Some("shape_clips_direct_frame"));
     }
 
     /// #133 step 3 (3.5) — a bordered paint chain is rejected outright,
