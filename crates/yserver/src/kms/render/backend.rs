@@ -51812,19 +51812,17 @@ mod tests {
         dispatch_raw(&mut state, &mut b, 9, 0, &TREE_A.0.to_le_bytes());
         let _ = tree_events(&mut peer);
         tree_request(&mut state, &mut b, 4, TREE_A);
-        let events = tree_events(&mut peer);
-        let first_destroy = events.iter().position(|e| e.starts_with("Destroy"));
         assert_eq!(
-            &events[..4],
+            tree_events(&mut peer),
             [
                 "Unmap A",
                 "Leave C Ancestor child=None mode=0",
                 "Leave A Virtual child=C mode=0",
                 "Enter root Inferior child=None mode=0",
+                "Destroy C",
+                "Destroy A",
             ],
-            "{events:?}",
         );
-        assert!(first_destroy.is_some_and(|i| i >= 4), "{events:?}");
         assert_eq!(b.core.prev_pointer_window, Some(b.core.window_id));
     }
 
@@ -51934,6 +51932,35 @@ mod tests {
         assert_eq!(
             flags(&mut peer),
             [(8, TREE_C.0, 3), (8, TREE_A.0, 3), (7, TREE_B.0, 2)],
+        );
+    }
+
+    /// Xvfb: DestroyWindow sends UnmapNotify for the destroyed window only,
+    /// and DestroyNotify for its inferiors topmost first (Xorg CrushTree).
+    #[test]
+    fn destroy_notifies_inferiors_topmost_first_without_unmap_notify() {
+        use yserver_protocol::x11::ResourceId;
+        let (mut state, mut b, mut peer) = tree_crossing_fixture();
+        let top = ResourceId(0x0010_0a04);
+        seed_state_window(&mut state, &mut b, top, TREE_A, 0, 0, 10, 10);
+        state
+            .clients
+            .get_mut(&14)
+            .unwrap()
+            .event_masks
+            .insert(top, 0x0002_0000);
+        tree_request(&mut state, &mut b, 8, TREE_A);
+        dispatch_raw(&mut state, &mut b, 9, 0, &TREE_A.0.to_le_bytes());
+        let _ = tree_events(&mut peer);
+        tree_request(&mut state, &mut b, 4, TREE_A);
+        let events = tree_events(&mut peer);
+        let structure: Vec<&String> = events
+            .iter()
+            .filter(|e| !e.starts_with("Enter") && !e.starts_with("Leave"))
+            .collect();
+        assert_eq!(
+            structure,
+            ["Unmap A", "Destroy 0x100a04", "Destroy C", "Destroy A"],
         );
     }
 

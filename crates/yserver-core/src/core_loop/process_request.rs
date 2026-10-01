@@ -1741,23 +1741,18 @@ fn collect_destroy_order(
     let Some(w) = table.window(root) else {
         return;
     };
-    for child in w.children.clone() {
+    // Xorg CrushTree (`dix/window.c:1023`): inferiors first, topmost first.
+    for child in w.children.clone().into_iter().rev() {
         collect_destroy_order(table, child, out);
     }
     out.push(root);
 }
 
+/// DestroyNotify only: the destroyed window's UnmapNotify went out before the
+/// teardown, and its inferiors get none (Xorg CrushTree).
 fn fanout_destroy_sequence_to_state(state: &mut ServerState, pending: &PendingDestroy) {
     let window = pending.window;
     let parent = pending.parent;
-    if pending.was_mapped {
-        let _dropped = fanout_event_to_clients(state, &pending.on_window, |buf, seq, order| {
-            x11::encode_unmap_notify_event(buf, seq, order, window, window, false);
-        });
-        let _dropped = fanout_event_to_clients(state, &pending.on_parent, |buf, seq, order| {
-            x11::encode_unmap_notify_event(buf, seq, order, parent, window, false);
-        });
-    }
     let _dropped = fanout_event_to_clients(state, &pending.on_window, |buf, seq, order| {
         x11::encode_destroy_notify_event(buf, seq, order, window, window);
     });
@@ -1957,10 +1952,9 @@ fn destroy_window_subtree(
     // UnmapNotify, then WindowsRestructured while the subtree still exists,
     // so the pointer's Leave reaches the dying windows before any
     // DestroyNotify. `order` ends with `root`.
-    if let Some(top) = pending.last_mut()
+    if let Some(top) = pending.last()
         && top.was_mapped
     {
-        top.was_mapped = false;
         let (window, parent) = (top.window, top.parent);
         let _dropped = fanout_event_to_clients(state, &top.on_window, |buf, seq, order| {
             x11::encode_unmap_notify_event(buf, seq, order, window, window, false);

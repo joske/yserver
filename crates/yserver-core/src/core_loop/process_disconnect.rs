@@ -37,7 +37,8 @@ fn collect_destroy_order(
     let Some(w) = table.window(root) else {
         return;
     };
-    for child in w.children.clone() {
+    // Xorg CrushTree (`dix/window.c:1023`): inferiors first, topmost first.
+    for child in w.children.clone().into_iter().rev() {
         collect_destroy_order(table, child, out);
     }
     out.push(root);
@@ -292,7 +293,9 @@ pub fn process_disconnect_reporting(
                     .map_or((ROOT_WINDOW, false, None), |win| {
                         (
                             win.parent,
-                            win.map_state != MapState::Unmapped,
+                            // Xorg DeleteWindow unmaps only the window it
+                            // deletes; CrushTree sends its inferiors none.
+                            *w == root && win.map_state != MapState::Unmapped,
                             win.host_xid,
                         )
                     });
@@ -794,7 +797,9 @@ pub fn destroy_zombie_resources_reporting(
                     .map_or((ROOT_WINDOW, false, None), |win| {
                         (
                             win.parent,
-                            win.map_state != MapState::Unmapped,
+                            // Xorg DeleteWindow unmaps only the window it
+                            // deletes; CrushTree sends its inferiors none.
+                            *w == root && win.map_state != MapState::Unmapped,
                             win.host_xid,
                         )
                     });
