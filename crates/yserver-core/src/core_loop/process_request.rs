@@ -78158,6 +78158,98 @@ mod tests {
         );
     }
 
+    /// Cinnamon's lock screen, as muffin sends it: an XFIXES region that
+    /// `InvertRegion` empties, set as the COW's Bounding shape, must reach the
+    /// backend as an explicit EMPTY region, and region None as unset — the
+    /// two stay distinct (`ProcXFixesSetWindowShapeRegion`, `xfixes/region.c`:
+    /// a NULL region pointer unshapes, a copied empty region shapes to
+    /// nothing).
+    #[test]
+    fn xfixes_set_window_shape_region_keeps_empty_distinct_from_none() {
+        use yserver_protocol::x11::{shape as x11shape, xfixes as x11xfixes};
+
+        const REGION: u32 = 0x0010_0042;
+        let cow = crate::resources::COMPOSITE_OVERLAY_WINDOW;
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state
+            .resources
+            .materialize_cow_resource(crate::backend::WindowHandle::from_raw_for_test(cow.0));
+
+        let mut send = |state: &mut ServerState, minor: u8, body: Vec<u8>| {
+            let header = yserver_protocol::x11::RequestHeader {
+                opcode: XFIXES_MAJOR_OPCODE,
+                data: minor,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            };
+            handle_xfixes_request(
+                state,
+                &mut backend,
+                None,
+                ClientId(1),
+                SequenceNumber(1),
+                header,
+                &body,
+            )
+            .expect("XFIXES request");
+        };
+        let full = [0_i16, 0, 5120, 1440]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<u8>>();
+        let shape_body = |region: u32| {
+            let mut body = cow.0.to_le_bytes().to_vec();
+            body.extend_from_slice(&[x11shape::KIND_BOUNDING, 0, 0, 0, 0, 0, 0, 0]);
+            body.extend_from_slice(&region.to_le_bytes());
+            body
+        };
+
+        let mut create = REGION.to_le_bytes().to_vec();
+        create.extend_from_slice(&full);
+        send(&mut state, x11xfixes::CREATE_REGION, create);
+        let mut invert = REGION.to_le_bytes().to_vec();
+        invert.extend_from_slice(&full);
+        invert.extend_from_slice(&REGION.to_le_bytes());
+        send(&mut state, x11xfixes::INVERT_REGION, invert);
+        send(
+            &mut state,
+            x11xfixes::SET_WINDOW_SHAPE_REGION,
+            shape_body(REGION),
+        );
+        assert!(crate::nested::shape_kind_is_set(
+            &state,
+            cow,
+            x11shape::KIND_BOUNDING
+        ));
+        assert!(crate::nested::shape_rects_for(&state, cow, x11shape::KIND_BOUNDING).is_empty());
+
+        send(
+            &mut state,
+            x11xfixes::SET_WINDOW_SHAPE_REGION,
+            shape_body(0),
+        );
+        assert!(!crate::nested::shape_kind_is_set(
+            &state,
+            cow,
+            x11shape::KIND_BOUNDING
+        ));
+
+        let mirrored: Vec<_> = backend
+            .calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                crate::backend::recording::RecordedCall::SetShapeRectangles {
+                    host_xid,
+                    kind: x11shape::KIND_BOUNDING,
+                    rects,
+                } if host_xid == cow.0 => Some(rects),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(mirrored, vec![Some(0), None]);
+    }
+
     // #133: the CLIP mirror must make the same unset/empty/concrete
     // distinction as Bounding. Before step 5 the scene only consulted the
     // bounding shape, so freezing the geometry rect for an unset clip shape
