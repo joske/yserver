@@ -1,0 +1,286 @@
+==> probe.log <==
+pointer at the centre, focus PointerRoot
+map A over the pointer
+  core MapNotify event=A window=A
+  core Leave event=root child=None detail=Inferior mode=Normal focus=1 at=640,400
+  core Enter event=A child=None detail=Ancestor mode=Normal focus=1 at=100,100
+  xi2 Leave dev=master src=master event=root child=None detail=Inferior mode=Normal focus=1 at=640,400
+  xi2 Enter dev=master src=master event=A child=None detail=Ancestor mode=Normal focus=1 at=100,100
+map B over A
+  core MapNotify event=B window=B
+  core Leave event=A child=None detail=Nonlinear mode=Normal focus=1 at=100,100
+  core Enter event=B child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  xi2 Leave dev=master src=master event=A child=None detail=Nonlinear mode=Normal focus=1 at=100,100
+  xi2 Enter dev=master src=master event=B child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+unmap B, revealing A
+  core UnmapNotify event=B window=B
+  core Leave event=B child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  core Enter event=A child=None detail=Nonlinear mode=Normal focus=1 at=100,100
+  xi2 Leave dev=master src=master event=B child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  xi2 Enter dev=master src=master event=A child=None detail=Nonlinear mode=Normal focus=1 at=100,100
+MapSubwindows(A) maps its child C under the pointer
+  core MapNotify event=C window=C
+  core Leave event=A child=None detail=Inferior mode=Normal focus=1 at=100,100
+  core Enter event=C child=None detail=Ancestor mode=Normal focus=1 at=50,50
+  xi2 Leave dev=master src=master event=A child=None detail=Inferior mode=Normal focus=1 at=100,100
+  xi2 Enter dev=master src=master event=C child=None detail=Ancestor mode=Normal focus=1 at=50,50
+move A off the pointer
+  core ConfigureNotify event=A window=A
+  core Leave event=C child=None detail=Ancestor mode=Normal focus=1 at=-60,-60
+  core Leave event=A child=C detail=Virtual mode=Normal focus=1 at=-10,-10
+  core Enter event=root child=None detail=Inferior mode=Normal focus=1 at=640,400
+  xi2 Leave dev=master src=master event=C child=None detail=Ancestor mode=Normal focus=1 at=-60,-60
+  xi2 Leave dev=master src=master event=A child=None detail=Virtual mode=Normal focus=1 at=-10,-10
+  xi2 Enter dev=master src=master event=root child=None detail=Inferior mode=Normal focus=1 at=640,400
+move A back
+  core ConfigureNotify event=A window=A
+  core Leave event=root child=None detail=Inferior mode=Normal focus=1 at=640,400
+  core Enter event=A child=C detail=Virtual mode=Normal focus=1 at=100,100
+  core Enter event=C child=None detail=Ancestor mode=Normal focus=1 at=50,50
+  xi2 Leave dev=master src=master event=root child=None detail=Inferior mode=Normal focus=1 at=640,400
+  xi2 Enter dev=master src=master event=A child=None detail=Virtual mode=Normal focus=1 at=100,100
+  xi2 Enter dev=master src=master event=C child=None detail=Ancestor mode=Normal focus=1 at=50,50
+shrink A off the pointer
+  core ConfigureNotify event=A window=A
+  core Leave event=C child=None detail=Ancestor mode=Normal focus=1 at=50,50
+  core Leave event=A child=C detail=Virtual mode=Normal focus=1 at=100,100
+  core Enter event=root child=None detail=Inferior mode=Normal focus=1 at=640,400
+  xi2 Leave dev=master src=master event=C child=None detail=Ancestor mode=Normal focus=1 at=50,50
+  xi2 Leave dev=master src=master event=A child=None detail=Virtual mode=Normal focus=1 at=100,100
+  xi2 Enter dev=master src=master event=root child=None detail=Inferior mode=Normal focus=1 at=640,400
+grow A back
+  core ConfigureNotify event=A window=A
+  core Leave event=root child=None detail=Inferior mode=Normal focus=1 at=640,400
+  core Enter event=A child=C detail=Virtual mode=Normal focus=1 at=100,100
+  core Enter event=C child=None detail=Ancestor mode=Normal focus=1 at=50,50
+  xi2 Leave dev=master src=master event=root child=None detail=Inferior mode=Normal focus=1 at=640,400
+  xi2 Enter dev=master src=master event=A child=None detail=Virtual mode=Normal focus=1 at=100,100
+  xi2 Enter dev=master src=master event=C child=None detail=Ancestor mode=Normal focus=1 at=50,50
+move A to where it is
+map B over C
+  core MapNotify event=B window=B
+  core Leave event=C child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  core Leave event=A child=C detail=NonlinearVirtual mode=Normal focus=1 at=100,100
+  core Enter event=B child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  xi2 Leave dev=master src=master event=C child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  xi2 Leave dev=master src=master event=A child=None detail=NonlinearVirtual mode=Normal focus=1 at=100,100
+  xi2 Enter dev=master src=master event=B child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+lower B under A
+  core ConfigureNotify event=B window=B
+  core Leave event=B child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  core Enter event=A child=C detail=NonlinearVirtual mode=Normal focus=1 at=100,100
+  core Enter event=C child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  xi2 Leave dev=master src=master event=B child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  xi2 Enter dev=master src=master event=A child=None detail=NonlinearVirtual mode=Normal focus=1 at=100,100
+  xi2 Enter dev=master src=master event=C child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+raise B
+  core ConfigureNotify event=B window=B
+  core Leave event=C child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  core Leave event=A child=C detail=NonlinearVirtual mode=Normal focus=1 at=100,100
+  core Enter event=B child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  xi2 Leave dev=master src=master event=C child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  xi2 Leave dev=master src=master event=A child=None detail=NonlinearVirtual mode=Normal focus=1 at=100,100
+  xi2 Enter dev=master src=master event=B child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+CirculateWindow(root, LowerHighest)
+  core CirculateNotify event=B window=B
+  core Leave event=B child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  core Enter event=A child=C detail=NonlinearVirtual mode=Normal focus=1 at=100,100
+  core Enter event=C child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  xi2 Leave dev=master src=master event=B child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  xi2 Enter dev=master src=master event=A child=None detail=NonlinearVirtual mode=Normal focus=1 at=100,100
+  xi2 Enter dev=master src=master event=C child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+CirculateWindow(root, RaiseLowest)
+  core CirculateNotify event=B window=B
+  core Leave event=C child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  core Leave event=A child=C detail=NonlinearVirtual mode=Normal focus=1 at=100,100
+  core Enter event=B child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  xi2 Leave dev=master src=master event=C child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  xi2 Leave dev=master src=master event=A child=None detail=NonlinearVirtual mode=Normal focus=1 at=100,100
+  xi2 Enter dev=master src=master event=B child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+bounding shape of B misses the pointer
+  core Leave event=B child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  core Enter event=A child=C detail=NonlinearVirtual mode=Normal focus=1 at=100,100
+  core Enter event=C child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  xi2 Leave dev=master src=master event=B child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  xi2 Enter dev=master src=master event=A child=None detail=NonlinearVirtual mode=Normal focus=1 at=100,100
+  xi2 Enter dev=master src=master event=C child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+bounding shape of B reset
+  core Leave event=C child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  core Leave event=A child=C detail=NonlinearVirtual mode=Normal focus=1 at=100,100
+  core Enter event=B child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  xi2 Leave dev=master src=master event=C child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  xi2 Leave dev=master src=master event=A child=None detail=NonlinearVirtual mode=Normal focus=1 at=100,100
+  xi2 Enter dev=master src=master event=B child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+input shape of B emptied
+  core Leave event=B child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  core Enter event=A child=C detail=NonlinearVirtual mode=Normal focus=1 at=100,100
+  core Enter event=C child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  xi2 Leave dev=master src=master event=B child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  xi2 Enter dev=master src=master event=A child=None detail=NonlinearVirtual mode=Normal focus=1 at=100,100
+  xi2 Enter dev=master src=master event=C child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+input shape of B offset (still empty)
+input shape of B reset
+  core Leave event=C child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  core Leave event=A child=C detail=NonlinearVirtual mode=Normal focus=1 at=100,100
+  core Enter event=B child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  xi2 Leave dev=master src=master event=C child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  xi2 Leave dev=master src=master event=A child=None detail=NonlinearVirtual mode=Normal focus=1 at=100,100
+  xi2 Enter dev=master src=master event=B child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+XFixes input region of B emptied
+  core Leave event=B child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  core Enter event=A child=C detail=NonlinearVirtual mode=Normal focus=1 at=100,100
+  core Enter event=C child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  xi2 Leave dev=master src=master event=B child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  xi2 Enter dev=master src=master event=A child=None detail=NonlinearVirtual mode=Normal focus=1 at=100,100
+  xi2 Enter dev=master src=master event=C child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+XFixes input region of B reset
+  core Leave event=C child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  core Leave event=A child=C detail=NonlinearVirtual mode=Normal focus=1 at=100,100
+  core Enter event=B child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  xi2 Leave dev=master src=master event=C child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  xi2 Leave dev=master src=master event=A child=None detail=NonlinearVirtual mode=Normal focus=1 at=100,100
+  xi2 Enter dev=master src=master event=B child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+reparent B into D, off the pointer
+  core UnmapNotify event=B window=B
+  core Leave event=B child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  core Enter event=A child=C detail=NonlinearVirtual mode=Normal focus=1 at=100,100
+  core Enter event=C child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  core ReparentNotify event=B window=B parent=D
+  core MapNotify event=B window=B
+  xi2 Leave dev=master src=master event=B child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  xi2 Enter dev=master src=master event=A child=None detail=NonlinearVirtual mode=Normal focus=1 at=100,100
+  xi2 Enter dev=master src=master event=C child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+reparent B into A, under the pointer
+  core UnmapNotify event=B window=B
+  core ReparentNotify event=B window=B parent=A
+  core MapNotify event=B window=B
+  core Leave event=C child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  core Enter event=B child=None detail=Nonlinear mode=Normal focus=1 at=40,40
+  xi2 Leave dev=master src=master event=C child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  xi2 Enter dev=master src=master event=B child=None detail=Nonlinear mode=Normal focus=1 at=40,40
+destroy B under the pointer
+  core UnmapNotify event=B window=B
+  core Leave event=B child=None detail=Nonlinear mode=Normal focus=1 at=40,40
+  core Enter event=C child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  core DestroyNotify event=B window=B
+  xi2 Leave dev=master src=master event=B child=None detail=Nonlinear mode=Normal focus=1 at=40,40
+  xi2 Enter dev=master src=master event=C child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+DestroySubwindows(A) with the pointer in C
+  core UnmapNotify event=C window=C
+  core Leave event=C child=None detail=Ancestor mode=Normal focus=1 at=50,50
+  core Enter event=A child=None detail=Inferior mode=Normal focus=1 at=100,100
+  core DestroyNotify event=C window=C
+  xi2 Leave dev=master src=master event=C child=None detail=Ancestor mode=Normal focus=1 at=50,50
+  xi2 Enter dev=master src=master event=A child=None detail=Inferior mode=Normal focus=1 at=100,100
+map a new C in A
+  core MapNotify event=C window=C
+  core Leave event=A child=None detail=Inferior mode=Normal focus=1 at=100,100
+  core Enter event=C child=None detail=Ancestor mode=Normal focus=1 at=50,50
+  xi2 Leave dev=master src=master event=A child=None detail=Inferior mode=Normal focus=1 at=100,100
+  xi2 Enter dev=master src=master event=C child=None detail=Ancestor mode=Normal focus=1 at=50,50
+destroy A with the pointer in its child C
+  core UnmapNotify event=A window=A
+  core Leave event=C child=None detail=Ancestor mode=Normal focus=1 at=50,50
+  core Leave event=A child=C detail=Virtual mode=Normal focus=1 at=100,100
+  core Enter event=root child=None detail=Inferior mode=Normal focus=1 at=640,400
+  core DestroyNotify event=C window=C
+  core DestroyNotify event=A window=A
+  xi2 Leave dev=master src=master event=C child=None detail=Ancestor mode=Normal focus=1 at=50,50
+  xi2 Leave dev=master src=master event=A child=None detail=Virtual mode=Normal focus=1 at=100,100
+  xi2 Enter dev=master src=master event=root child=None detail=Inferior mode=Normal focus=1 at=640,400
+map E over the pointer
+  core MapNotify event=E window=E
+  core Leave event=root child=None detail=Inferior mode=Normal focus=1 at=640,400
+  core Enter event=E child=None detail=Ancestor mode=Normal focus=1 at=100,100
+  xi2 Leave dev=master src=master event=root child=None detail=Inferior mode=Normal focus=1 at=640,400
+  xi2 Enter dev=master src=master event=E child=None detail=Ancestor mode=Normal focus=1 at=100,100
+focus E
+  core FocusOut event=E detail=Pointer mode=Normal
+  core FocusOut event=root detail=Pointer mode=Normal
+  core FocusOut event=root detail=PointerRoot mode=Normal
+  core FocusIn event=root detail=NonlinearVirtual mode=Normal
+  core FocusIn event=E detail=Nonlinear mode=Normal
+  xi2 FocusOut dev=master src=master event=E child=None detail=Pointer mode=Normal focus=0 at=100,100
+  xi2 FocusOut dev=master src=master event=root child=None detail=PointerRoot mode=Normal focus=0 at=640,400
+  xi2 FocusIn dev=master src=master event=E child=None detail=Nonlinear mode=Normal focus=0 at=100,100
+map F over E, focus on E
+  core MapNotify event=F window=F
+  core Leave event=E child=None detail=Nonlinear mode=Normal focus=1 at=100,100
+  core Enter event=F child=None detail=Nonlinear mode=Normal focus=0 at=50,50
+  xi2 Leave dev=master src=master event=E child=None detail=Nonlinear mode=Normal focus=1 at=100,100
+  xi2 Enter dev=master src=master event=F child=None detail=Nonlinear mode=Normal focus=0 at=50,50
+unmap F, focus on E
+  core UnmapNotify event=F window=F
+  core Leave event=F child=None detail=Nonlinear mode=Normal focus=0 at=50,50
+  core Enter event=E child=None detail=Nonlinear mode=Normal focus=1 at=100,100
+  xi2 Leave dev=master src=master event=F child=None detail=Nonlinear mode=Normal focus=0 at=50,50
+  xi2 Enter dev=master src=master event=E child=None detail=Nonlinear mode=Normal focus=1 at=100,100
+focus PointerRoot
+  core FocusOut event=E detail=Nonlinear mode=Normal
+  core FocusOut event=root detail=NonlinearVirtual mode=Normal
+  core FocusIn event=root detail=PointerRoot mode=Normal
+  core FocusIn event=root detail=Pointer mode=Normal
+  core FocusIn event=E detail=Pointer mode=Normal
+  xi2 FocusOut dev=master src=master event=E child=None detail=Nonlinear mode=Normal focus=0 at=100,100
+  xi2 FocusOut dev=master src=master event=root child=None detail=NonlinearVirtual mode=Normal focus=0 at=640,400
+  xi2 FocusIn dev=master src=master event=root child=None detail=PointerRoot mode=Normal focus=0 at=640,400
+  xi2 FocusIn dev=master src=master event=E child=None detail=Pointer mode=Normal focus=0 at=100,100
+GrabPointer(E), owner_events false
+  GrabPointer status=0
+grabbed: map F over E
+  core MapNotify event=F window=F
+  core Leave event=E child=None detail=Nonlinear mode=Normal focus=1 at=100,100
+  xi2 Leave dev=master src=master event=E child=None detail=Nonlinear mode=Normal focus=1 at=100,100
+  xi2 Enter dev=master src=master event=F child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+grabbed: unmap F
+  core UnmapNotify event=F window=F
+  core Enter event=E child=None detail=Nonlinear mode=Normal focus=1 at=100,100
+  xi2 Leave dev=master src=master event=F child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  xi2 Enter dev=master src=master event=E child=None detail=Nonlinear mode=Normal focus=1 at=100,100
+grabbed: map F again
+  core MapNotify event=F window=F
+  core Leave event=E child=None detail=Nonlinear mode=Normal focus=1 at=100,100
+  xi2 Leave dev=master src=master event=E child=None detail=Nonlinear mode=Normal focus=1 at=100,100
+  xi2 Enter dev=master src=master event=F child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+UngrabPointer
+  core Leave event=E child=None detail=Nonlinear mode=Ungrab focus=1 at=100,100
+  core Enter event=F child=None detail=Nonlinear mode=Ungrab focus=1 at=50,50
+  xi2 Leave dev=master src=master event=E child=None detail=Nonlinear mode=Ungrab focus=1 at=100,100
+  xi2 Enter dev=master src=master event=F child=None detail=Nonlinear mode=Ungrab focus=1 at=50,50
+GrabPointer(E), owner_events true
+  GrabPointer status=0
+  core Leave event=F child=None detail=Nonlinear mode=Grab focus=1 at=50,50
+  core Enter event=E child=None detail=Nonlinear mode=Grab focus=1 at=100,100
+  xi2 Leave dev=master src=master event=F child=None detail=Nonlinear mode=Grab focus=1 at=50,50
+  xi2 Enter dev=master src=master event=E child=None detail=Nonlinear mode=Grab focus=1 at=100,100
+grabbed with owner_events: unmap F
+  core UnmapNotify event=F window=F
+  core Leave event=F child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  core Enter event=E child=None detail=Nonlinear mode=Normal focus=1 at=100,100
+  xi2 Leave dev=master src=master event=F child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  xi2 Enter dev=master src=master event=E child=None detail=Nonlinear mode=Normal focus=1 at=100,100
+grabbed with owner_events: map F
+  core MapNotify event=F window=F
+  core Leave event=E child=None detail=Nonlinear mode=Normal focus=1 at=100,100
+  core Enter event=F child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  xi2 Leave dev=master src=master event=E child=None detail=Nonlinear mode=Normal focus=1 at=100,100
+  xi2 Enter dev=master src=master event=F child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+UngrabPointer
+  core Leave event=E child=None detail=Nonlinear mode=Ungrab focus=1 at=100,100
+  core Enter event=F child=None detail=Nonlinear mode=Ungrab focus=1 at=50,50
+  xi2 Leave dev=master src=master event=E child=None detail=Nonlinear mode=Ungrab focus=1 at=100,100
+  xi2 Enter dev=master src=master event=F child=None detail=Nonlinear mode=Ungrab focus=1 at=50,50
+destroy F and E
+  core UnmapNotify event=F window=F
+  core Leave event=F child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  core Enter event=E child=None detail=Nonlinear mode=Normal focus=1 at=100,100
+  core DestroyNotify event=F window=F
+  core UnmapNotify event=E window=E
+  core Leave event=E child=None detail=Ancestor mode=Normal focus=1 at=100,100
+  core Enter event=root child=None detail=Inferior mode=Normal focus=1 at=640,400
+  core DestroyNotify event=E window=E
+  xi2 Leave dev=master src=master event=F child=None detail=Nonlinear mode=Normal focus=1 at=50,50
+  xi2 Enter dev=master src=master event=E child=None detail=Nonlinear mode=Normal focus=1 at=100,100
+  xi2 Leave dev=master src=master event=E child=None detail=Ancestor mode=Normal focus=1 at=100,100
+  xi2 Enter dev=master src=master event=root child=None detail=Inferior mode=Normal focus=1 at=640,400
+done
