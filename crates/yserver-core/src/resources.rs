@@ -1484,36 +1484,11 @@ impl ResourceTable {
     /// On `ROOT_WINDOW`, the Composite Overlay Window (COW) is excluded from
     /// the rotation — it stays pinned at the top, mirroring Xorg's
     /// `CompositeRealChildHead` semantics.
-    pub fn circulate_window(&mut self, container: ResourceId, direction: u8) -> Option<ResourceId> {
-        let parent = self.windows.get_mut(&container.0)?;
-        // Slice end: exclude COW when operating on root. Anywhere else this
-        // is just `children.len()`.
-        let top = if container == ROOT_WINDOW {
-            cow_aware_top_index(parent)
-        } else {
-            parent.children.len()
-        };
-        let kids = &mut parent.children;
-        if top < 2 {
-            return None;
-        }
-        match direction {
-            0 => {
-                let last = kids.remove(top - 1);
-                kids.insert(0, last);
-                Some(last)
-            }
-            1 => {
-                let first = kids.remove(0);
-                // `top` was the slice end before the remove; after removing
-                // index 0 the slice end shifts left by one, so insert at
-                // `top - 1` to land just below COW (or at the very end when
-                // COW is absent).
-                kids.insert(top - 1, first);
-                Some(first)
-            }
-            _ => None,
-        }
+    /// Restack `child` to the top of its siblings (below the overlay window
+    /// on the root) or to the bottom — the move CirculateWindow makes once
+    /// `ServerState::circulate_candidate` picked the child.
+    pub fn circulate_child(&mut self, child: ResourceId, to_top: bool) {
+        self.restack_window(child, None, Some(if to_top { 0 } else { 1 }));
     }
 
     pub fn mapped_children_bottom_to_top(&self, parent: ResourceId) -> Option<Vec<ResourceId>> {
@@ -5232,58 +5207,34 @@ mod tests {
     }
 
     #[test]
-    fn circulate_window_raises_lowest_to_top() {
+    fn circulate_child_restacks_to_the_top_or_the_bottom() {
         let mut t = ResourceTable::new();
         make_child(&mut t, 0x200, ROOT_WINDOW.0, 0, 0);
         make_child(&mut t, 0x300, ROOT_WINDOW.0, 0, 0);
         make_child(&mut t, 0x400, ROOT_WINDOW.0, 0, 0);
-        let moved = t.circulate_window(ROOT_WINDOW, 0).unwrap();
-        assert_eq!(moved, ResourceId(0x400));
+        t.circulate_child(ResourceId(0x200), true);
         assert_eq!(
             t.children(ROOT_WINDOW),
-            &[ResourceId(0x400), ResourceId(0x200), ResourceId(0x300)]
+            &[ResourceId(0x300), ResourceId(0x400), ResourceId(0x200)]
         );
-    }
-
-    #[test]
-    fn circulate_window_lowers_highest_to_bottom() {
-        let mut t = ResourceTable::new();
-        make_child(&mut t, 0x200, ROOT_WINDOW.0, 0, 0);
-        make_child(&mut t, 0x300, ROOT_WINDOW.0, 0, 0);
-        let moved = t.circulate_window(ROOT_WINDOW, 1).unwrap();
-        assert_eq!(moved, ResourceId(0x200));
+        t.circulate_child(ResourceId(0x200), false);
         assert_eq!(
             t.children(ROOT_WINDOW),
-            &[ResourceId(0x300), ResourceId(0x200)]
+            &[ResourceId(0x200), ResourceId(0x300), ResourceId(0x400)]
         );
-    }
-
-    #[test]
-    fn circulate_window_noop_with_lt_two_children() {
-        let mut t = ResourceTable::new();
-        make_child(&mut t, 0x200, ROOT_WINDOW.0, 0, 0);
-        assert!(t.circulate_window(ROOT_WINDOW, 0).is_none());
     }
 
     #[test]
     fn circulate_raise_on_root_skips_cow() {
         let mut t = ResourceTable::new();
-        // Root children, bottom-to-top: [A=0x200 (occluded), B=0x300, COW].
-        // We need positions where A is occluded by B for Raise to act on A;
-        // for the geometry-free unit test, set both A and B at (0,0,50x50) so
-        // B occludes A.
         make_child(&mut t, 0x200, ROOT_WINDOW.0, 0, 0);
         make_child(&mut t, 0x300, ROOT_WINDOW.0, 0, 0);
-        let _ = t.map_window(ResourceId(0x200));
-        let _ = t.map_window(ResourceId(0x300));
         t.windows
             .get_mut(&ROOT_WINDOW.0)
             .unwrap()
             .children
             .push(COMPOSITE_OVERLAY_WINDOW);
-        // Circulate Raise on root: A should rise to "top of the non-COW slice",
-        // i.e. just below COW. COW stays last.
-        let _ = t.circulate_window(ROOT_WINDOW, 0);
+        t.circulate_child(ResourceId(0x200), true);
         let kids = &t.window(ROOT_WINDOW).unwrap().children;
         assert_eq!(
             kids.last().copied(),

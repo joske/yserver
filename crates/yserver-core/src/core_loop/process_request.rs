@@ -27552,41 +27552,49 @@ fn handle_circulate_window(
             13,
         );
     }
-    let chosen_child = {
-        let kids = state.resources.children(container);
-        match (direction, kids.first(), kids.last()) {
-            (0, _, Some(&back)) => Some(back),
-            (1, Some(&front), _) => Some(front),
-            _ => None,
-        }
-    };
-    let Some(child) = chosen_child else {
+    let Some(child) = state.circulate_candidate(container, direction) else {
         return Ok(RequestOutcome::Handled);
     };
-    // SubstructureRedirect on container takes priority — redirect the
-    // request to the first subscriber instead of performing the
-    // circulate.
+    // SubstructureRedirect on the container by another client turns it into
+    // a CirculateRequest (Xorg MaybeDeliverEventsToClient skips the
+    // requester).
     let redirect_target = subscribers_by_id(state, container, 0x0010_0000)
         .into_iter()
-        .next();
+        .find(|c| *c != client_id);
     if let Some(target) = redirect_target {
         let _dropped = fanout_event_to_clients(state, &[target], |buf, seq, order| {
             let _ =
                 x11::write_circulate_request_event(buf, order, seq, container, child, direction);
         });
     } else {
-        let _ = state.resources.circulate_window(container, direction);
-        let on_child = subscribers_by_id(state, child, 0x0002_0000);
-        let on_container = subscribers_by_id(state, container, 0x0008_0000);
-        let mut targets = on_child;
-        for cid in on_container {
-            if !targets.contains(&cid) {
-                targets.push(cid);
-            }
+        state.resources.circulate_child(child, direction == 0);
+        if let Some(xid) = state.resources.window(child).and_then(|w| w.host_xid) {
+            let _ = backend.configure_subwindow(
+                None,
+                xid.as_raw(),
+                crate::host_x11::HostSubwindowConfig {
+                    x: None,
+                    y: None,
+                    width: None,
+                    height: None,
+                    border_width: None,
+                    sibling: None,
+                    stack_mode: Some(if direction == 0 { 0 } else { 1 }),
+                },
+            );
         }
-        let _dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
+        backend.sync_top_level_order(state);
+        // CirculateNotify to the window's StructureNotify and the parent's
+        // SubstructureNotify selectors, each with its own event window; the
+        // place (OnTop 0 / OnBottom 1) equals the direction.
+        let _dropped = emit_window_event_to_state(state, child, 0x0002_0000, |buf, seq, order| {
             let _ = x11::write_circulate_notify_event(buf, order, seq, child, child, direction);
         });
+        let _dropped =
+            emit_window_event_to_state(state, container, 0x0008_0000, |buf, seq, order| {
+                let _ =
+                    x11::write_circulate_notify_event(buf, order, seq, container, child, direction);
+            });
         // Xorg ReflectStackChange (`dix/window.c:2179`).
         backend.windows_restructured(state);
     }

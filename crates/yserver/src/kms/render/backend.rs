@@ -51726,6 +51726,7 @@ mod tests {
                     name(word(e, 12))
                 )),
                 22 => Some(format!("Configure {}", name(word(e, 8)))),
+                26 => Some(format!("Circulate {} place={}", name(word(e, 8)), e[16])),
                 _ => None,
             })
             .collect()
@@ -52001,6 +52002,39 @@ mod tests {
         assert_eq!(
             drain_xi2_crossings(&mut xi2),
             [(8, 2, 2, 1, 3, bb), (7, 2, 2, 1, 3, a)],
+        );
+    }
+
+    /// Xvfb: CirculateWindow(LowerHighest) lowers the highest MAPPED child
+    /// that overlaps a sibling below it (an unmapped one above is skipped),
+    /// RaiseLowest raises the lowest one a sibling above overlaps; each sends
+    /// CirculateNotify, then the crossings of the restack.
+    #[test]
+    fn circulate_picks_the_overlapping_mapped_child() {
+        let (mut state, mut b, mut peer) = tree_crossing_fixture();
+        let unmapped = yserver_protocol::x11::ResourceId(0x0010_0a05);
+        let root = yserver_core::resources::ROOT_WINDOW;
+        seed_state_window(&mut state, &mut b, unmapped, root, 0, 0, 300, 300);
+        tree_request(&mut state, &mut b, 8, TREE_A);
+        tree_request(&mut state, &mut b, 8, TREE_B);
+        let _ = tree_events(&mut peer);
+        dispatch_raw(&mut state, &mut b, 13, 1, &root.0.to_le_bytes());
+        assert_eq!(
+            tree_events(&mut peer),
+            [
+                "Circulate B place=1",
+                "Leave B Nonlinear child=None mode=0",
+                "Enter A Nonlinear child=None mode=0",
+            ],
+        );
+        dispatch_raw(&mut state, &mut b, 13, 0, &root.0.to_le_bytes());
+        assert_eq!(
+            tree_events(&mut peer),
+            [
+                "Circulate B place=0",
+                "Leave A Nonlinear child=None mode=0",
+                "Enter B Nonlinear child=None mode=0",
+            ],
         );
     }
 

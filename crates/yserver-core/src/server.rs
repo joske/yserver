@@ -2562,6 +2562,87 @@ impl ServerState {
             .map(|(child, _, _)| child)
     }
 
+    /// The child CirculateWindow restacks — Xorg `CirculateWindow`
+    /// (`dix/window.c:2443`): RaiseLowest (0) takes the lowest mapped child a
+    /// mapped sibling above overlaps, LowerHighest (1) the highest mapped
+    /// child that overlaps a mapped sibling below. The overlay window stays
+    /// out of it, capped on top.
+    #[must_use]
+    pub fn circulate_candidate(&self, parent: ResourceId, direction: u8) -> Option<ResourceId> {
+        let kids: Vec<ResourceId> = self
+            .resources
+            .children(parent)
+            .iter()
+            .copied()
+            .filter(|w| *w != crate::resources::COMPOSITE_OVERLAY_WINDOW)
+            .collect();
+        let mapped = |w: ResourceId| {
+            self.resources
+                .window(w)
+                .is_some_and(|w| w.map_state != crate::resources::MapState::Unmapped)
+        };
+        let overlaps_any = |w: ResourceId, others: &[ResourceId]| {
+            others
+                .iter()
+                .any(|s| mapped(*s) && self.siblings_overlap(w, *s))
+        };
+        if direction == 0 {
+            (0..kids.len())
+                .find(|&i| mapped(kids[i]) && overlaps_any(kids[i], &kids[i + 1..]))
+                .map(|i| kids[i])
+        } else {
+            (0..kids.len())
+                .rev()
+                .find(|&i| mapped(kids[i]) && overlaps_any(kids[i], &kids[..i]))
+                .map(|i| kids[i])
+        }
+    }
+
+    /// Xorg `BOXES_OVERLAP` of two siblings' border-inclusive extents, cut by
+    /// their bounding shapes (`ShapeOverlap`, `dix/window.c:1975`).
+    fn siblings_overlap(&self, a: ResourceId, b: ResourceId) -> bool {
+        let (ra, rb) = (self.sibling_region(a), self.sibling_region(b));
+        ra.iter().any(|p| {
+            rb.iter()
+                .any(|q| p.0 < q.2 && q.0 < p.2 && p.1 < q.3 && q.1 < p.3)
+        })
+    }
+
+    /// A window's bounding region in its parent's coordinates, as
+    /// `(x1, y1, x2, y2)` boxes.
+    fn sibling_region(&self, window: ResourceId) -> Vec<(i32, i32, i32, i32)> {
+        let Some(w) = self.resources.window(window) else {
+            return Vec::new();
+        };
+        let bw = i32::from(w.border_width);
+        let (x1, y1) = (i32::from(w.x), i32::from(w.y));
+        let (x2, y2) = (
+            x1 + i32::from(w.width) + 2 * bw,
+            y1 + i32::from(w.height) + 2 * bw,
+        );
+        let Some(shape) = self
+            .shape_windows
+            .get(&window)
+            .and_then(|s| s.bounding.as_ref())
+        else {
+            return vec![(x1, y1, x2, y2)];
+        };
+        let (ox, oy) = (x1 + bw, y1 + bw);
+        shape
+            .iter()
+            .map(|r| {
+                let (rx, ry) = (ox + i32::from(r.x), oy + i32::from(r.y));
+                (
+                    rx.max(x1),
+                    ry.max(y1),
+                    (rx + i32::from(r.width)).min(x2),
+                    (ry + i32::from(r.height)).min(y2),
+                )
+            })
+            .filter(|b| b.0 < b.2 && b.1 < b.3)
+            .collect()
+    }
+
     /// The `focus` flag of a crossing on `window` (core and XI2): the core
     /// focus is PointerRoot, or `window` or one of its ancestors (Xorg
     /// `CoreEnterLeaveEvent` / `DeviceEnterLeaveEvent`, `dix/events.c:4772`).
