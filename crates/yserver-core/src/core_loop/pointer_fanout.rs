@@ -1132,7 +1132,15 @@ fn pointer_event_fanout_to_state_inner(
         } else {
             (target, target_x, target_y)
         };
-        let (nested_id, event_x, event_y, mut core_targets, propagation_child) =
+        let (nested_id, event_x, event_y, mut core_targets, propagation_child) = if is_crossing {
+            (
+                cross_start,
+                cross_x,
+                cross_y,
+                core_crossing_targets(state, cross_start, mask_bit),
+                ResourceId(0),
+            )
+        } else {
             pointer_propagation_target_by_id(
                 state,
                 cross_start,
@@ -1141,7 +1149,8 @@ fn pointer_event_fanout_to_state_inner(
                 mask_bit,
                 xi2_absorbing_evtype(event.kind),
             )
-            .unwrap_or((cross_start, cross_x, cross_y, Vec::new(), ResourceId(0)));
+            .unwrap_or((cross_start, cross_x, cross_y, Vec::new(), ResourceId(0)))
+        };
 
         // XI2 shadows core per client (Xorg behaviour, mirrors
         // `deliver_key_to_window`): a client that receives the XI2
@@ -1368,10 +1377,17 @@ fn pointer_event_fanout_to_state_inner(
         let (ox, oy) = state.resources.window_absolute_position(crossing_win);
         event_x = clamp_grab_coord(event.root_x, ox);
         event_y = clamp_grab_coord(event.root_y, oy);
-        (
-            compute_xi2_exact_targets(state, crossing_win, xi2_evtype),
-            Vec::new(),
-        )
+        // Xorg `DeviceEnterLeaveEvent`: under an XI2 grab only the grab
+        // client gets the crossing, through the grab's mask; any other grab
+        // leaves XI2 delivery to the window's selections.
+        let targets = match state.active_pointer_grab {
+            Some(grab) if grab.via_xi2 => client_target_id(state, grab.owner)
+                .filter(|_| grab.xi2_mask & (1 << xi2_evtype) != 0)
+                .into_iter()
+                .collect(),
+            _ => compute_xi2_exact_targets(state, crossing_win, xi2_evtype),
+        };
+        (targets, Vec::new())
     } else {
         compute_xi2_targets(state, target, top_level_id, xi2_evtype, xi2_raw_evtype)
     };
@@ -2587,6 +2603,35 @@ fn translate_host_event(
         root_x: rx,
         root_y: ry,
         ..event
+    }
+}
+
+/// Recipients of a core Enter/Leave on `window` — Xorg `CoreEnterLeaveEvent`
+/// (`dix/events.c:4748`). A crossing never propagates. Under a pointer grab
+/// only the grab client gets it: on the grab window through the grab's mask,
+/// and with `owner_events` through its own selection on `window`.
+fn core_crossing_targets(state: &ServerState, window: ResourceId, mask_bit: u32) -> Vec<ClientId> {
+    let Some((grab_window, grab_client, _, _, owner_events, via_xi2, grab_mask)) =
+        active_grab_target(state)
+    else {
+        return crate::core_loop::fanout::subscribers_by_id(state, window, mask_bit);
+    };
+    let mut mask = if window == grab_window && !via_xi2 {
+        grab_mask
+    } else {
+        0
+    };
+    if owner_events {
+        mask |= state
+            .clients
+            .get(&grab_client.0)
+            .and_then(|c| c.event_masks.get(&window).copied())
+            .unwrap_or(0);
+    }
+    if mask & mask_bit == 0 {
+        Vec::new()
+    } else {
+        vec![grab_client]
     }
 }
 

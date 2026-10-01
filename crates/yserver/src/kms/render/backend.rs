@@ -51896,6 +51896,47 @@ mod tests {
         );
     }
 
+    /// Xorg `CoreEnterLeaveEvent`: a crossing goes to the selections on
+    /// its own window and never propagates — a parent that selected
+    /// crossings gets its Leave(Inferior), not its child's Enter as well.
+    #[test]
+    fn core_crossings_do_not_propagate_to_the_parent() {
+        let (mut state, mut b, mut peer) = tree_crossing_fixture();
+        state
+            .clients
+            .get_mut(&14)
+            .unwrap()
+            .event_masks
+            .remove(&TREE_C);
+        tree_request(&mut state, &mut b, 8, TREE_A);
+        let _ = tree_events(&mut peer);
+        dispatch_raw(&mut state, &mut b, 9, 0, &TREE_A.0.to_le_bytes());
+        assert_eq!(
+            tree_events(&mut peer),
+            ["Leave A Inferior child=None mode=0"],
+        );
+    }
+
+    /// Xvfb, GrabPointer(E, owner_events=false, Enter|Leave): a window
+    /// mapped over E sends the grab client its Leave on E only — the
+    /// Enter on the new window is not the grab window's, so nobody gets it.
+    #[test]
+    fn crossings_under_a_grab_reach_only_the_grab_window() {
+        let (mut state, mut b, mut peer) = tree_crossing_fixture();
+        tree_request(&mut state, &mut b, 8, TREE_A);
+        let _ = tree_events(&mut peer);
+        let mut body = TREE_A.0.to_le_bytes().to_vec();
+        body.extend_from_slice(&0x30u16.to_le_bytes());
+        body.extend_from_slice(&[1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        dispatch_raw(&mut state, &mut b, 26, 0, &body);
+        let _ = tree_events(&mut peer);
+        tree_request(&mut state, &mut b, 8, TREE_B);
+        assert_eq!(
+            tree_events(&mut peer),
+            ["Map B", "Leave A Nonlinear child=None mode=0"],
+        );
+    }
+
     /// Xorg `CoreEnterLeaveEvent`: the `focus` flag is set only on the
     /// focus window and its inferiors (or everywhere under PointerRoot).
     #[test]
