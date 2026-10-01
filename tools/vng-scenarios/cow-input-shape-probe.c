@@ -139,9 +139,9 @@ static void input_rects(void)
     free(r);
 }
 
-/* Settle the pointer at (4, 4) and log what the tree change sent as
- * "settle": Xorg crosses when the tree changes under a still pointer,
- * yserver only on the next motion. Then probe the point (px, py), inside A:
+/* Settle the pointer at (4, 4) and log as "settle" what crossed since the
+ * last phase, the tree change under the still pointer included. Then probe
+ * the point (px, py), inside A:
  * tree answers first, then real input, then back to (5, 5). */
 static void phase(const char *what, int shaped, int16_t px, int16_t py)
 {

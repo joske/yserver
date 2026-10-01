@@ -1,5 +1,7 @@
 ==> probe.log <==
 without the COW
+  settle app: EnterNotify event=A child=none detail=Ancestor mode=0
+  settle app: LeaveNotify event=A child=none detail=Ancestor mode=0
   TranslateCoordinates(root, root) child=A
   QueryPointer(root) child=A
   app: EnterNotify event=A child=none detail=Ancestor mode=0
@@ -8,6 +10,7 @@ without the COW
   app: ButtonRelease event=A child=none at=pointer
   app: LeaveNotify event=A child=none detail=Ancestor mode=0
 COW taken, no input shape set
+  settle compositor: MotionNotify event=COW child=none at=pointer
   GetRectangles(COW, Input): 1 screen
   TranslateCoordinates(root, root) child=COW
   QueryPointer(root) child=COW
@@ -16,6 +19,7 @@ COW taken, no input shape set
   compositor: ButtonRelease event=COW child=none at=pointer
   compositor: MotionNotify event=COW child=none at=pointer
 compositor set a strip COW input region
+  settle compositor: MotionNotify event=COW child=none at=pointer
   GetRectangles(COW, Input): 1 1280x100+0+0
   TranslateCoordinates(root, root) child=A
   QueryPointer(root) child=A
@@ -28,6 +32,7 @@ compositor set a strip COW input region
   compositor: EnterNotify event=COW child=none detail=Nonlinear mode=0
   compositor: MotionNotify event=COW child=none at=pointer
 compositor set an empty COW input region
+  settle compositor: LeaveNotify event=COW child=none detail=Ancestor mode=0
   GetRectangles(COW, Input): 0
   TranslateCoordinates(root, root) child=A
   QueryPointer(root) child=A
@@ -37,6 +42,8 @@ compositor set an empty COW input region
   app: ButtonRelease event=A child=none at=pointer
   app: LeaveNotify event=A child=none detail=Ancestor mode=0
 COW input region reset to None
+  settle compositor: EnterNotify event=COW child=none detail=Ancestor mode=0
+  settle compositor: MotionNotify event=COW child=none at=pointer
   GetRectangles(COW, Input): 1 screen
   TranslateCoordinates(root, root) child=COW
   QueryPointer(root) child=COW
@@ -45,6 +52,7 @@ COW input region reset to None
   compositor: ButtonRelease event=COW child=none at=pointer
   compositor: MotionNotify event=COW child=none at=pointer
 COW released
+  settle compositor: LeaveNotify event=COW child=none detail=Ancestor mode=0
   TranslateCoordinates(root, root) child=A
   QueryPointer(root) child=A
   app: EnterNotify event=A child=none detail=Ancestor mode=0
