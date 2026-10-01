@@ -77,7 +77,7 @@ jobs:
           ls /usr/share/vulkan/icd.d/
       - name: vng suite (gpu none)
         env:
-          QUICK: '^(xterm|span-paint|pixel-oracle|xrandr-(scale|scale-crop|dpi|monitors|monitors-2|orientation|scale-cursor)|xmodmap-caps-control|xkbcomp-upload)$'
+          QUICK: '^(xterm|span-paint|pixel-oracle|xrandr-(scale|scale-crop|dpi|monitors|monitors-2|orientation|scale-cursor)|xmodmap-caps-control|xkbcomp-upload|subwindow-move)$'
           SCENARIOS: ${{ inputs.scenarios }}
         run: |
           case "${{ github.event_name }}" in

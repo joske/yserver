@@ -1,0 +1,11 @@
+==> probe.log <==
+icon drawn, C at 300: 140-295 gray 300-330 blue 335-345 gray
+C moved to 200: 140-195 gray 200-230 blue 235-345 gray
+damage covers C at 200: yes
+damage covers what C left at 200: yes
+C at 190, strip repainted: 140-185 gray 190-220 blue 225-345 gray
+C dragged to 150, strip repainted after each move: 140-145 gray 150-180 blue 185-345 gray
+plug got Expose: yes
+switcher passed over C to 260, Expose handled: 140-145 gray 150-180 blue 185-255 gray 260-315 green 320-345 gray
+switcher got Expose: yes
+switcher jumped from under H to 200, Expose handled: 140-145 gray 150-180 blue 185-195 gray 200-255 green 260-285 gray 290-305 magenta 310-345 gray

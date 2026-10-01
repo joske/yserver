@@ -447,40 +447,30 @@ from.
       persists outside the tray region it's a separate scene-damage
       issue.
 
-- [ ] **Tray icons intermittently blank / bottom-sliver — manual-redirect
-      paint-routing race (2026-06-01, open; still reproducing as of
-      2026-06-12).** Distinct from the storm fix
-      above: after `e7a1ba0` icons *can* render, but intermittently come
-      up blank or as a thin bottom line; varies run-to-run (1–3 icons
-      affected). `YSERVER_TRAY_DEBUG=1` proved it's NOT geometry/clip —
-      socket 26×27, plug child 26×27@0,0 Viewable, backing 26×27, and the
-      panel's Clear is correctly a no-op (`clipped=[]`). The icon is blank
-      because the plug's paint doesn't land in the socket's redirect
-      backing *that the panel reads*. The initial paint-routing-race
-      hypothesis was **refuted** by a historical
-      `yserver::kms::v2::paint=trace` probe:
-      `NO_REDIRECT_FOUND=0`, `REDIRECT_FOUND=116` — plug paints DO route to
-      a backing). So capture works; the bug is **downstream in the
-      read/composite of the backing**. Leading candidates: (1) **source-read
-      asymmetry** — the panel reads each socket as a Composite SOURCE; if
-      that samples the live (empty) socket not the backing → blank. This is
-      what the parked `fix/applet` `resolve_source_picture` redirect-walk
-      fix addressed (it "didn't fix icons" then only because the storm was
-      still wiping; revisit NOW on top of `e7a1ba0`). (2) **backing rotate**
-      — sockets alloc `1×1` then grow `26×27`; if rotate doesn't recapture,
-      a read around it could yield artifacts. NOTE (user, 2026-06-01): the
-      failing icon is **fully blank**, NOT a clipped/sliver icon — a
-      correctly-drawn applet has no bottom line. The "1px bottom line" seen
-      in failures is a SEPARATE minor artifact (stray composited row /
-      edge), not a partial icon. Blank-not-partial favors candidate (1)
-      (source-read returns empty live socket) over (2). scene_walk
-      `skip_reason="no_intersect_with_output"` decisions also worth
-      auditing. NEXT: rebase parked `fix/applet`
-      `resolve_source_picture` onto `clip-by-children` and re-test;
-      instrument source-read + backing-rotate if not. Fragile/black-screen-
-      prone subsystem — HW smoke before commit. Banked traces:
-      `mate-working.xtrace` (all 3), `mate-sliver.xtrace` (failing). Diag
-      (`YSERVER_TRAY_DEBUG`) in working tree, marked REMOVE.
+- [x] **Tray icons blank, half-drawn or smeared under a compositor —
+      subwindow moves inside a redirected top-level (2026-10-01,
+      resolved).** Not a paint-routing or source-read problem, as earlier
+      notes here assumed: the icon was drawn correctly and then lost when
+      mate-panel moved the applet. Under a compositor every panel applet
+      is an unredirected subwindow drawing into the panel's one redirect
+      backing, and yserver handled a move there as if each window still
+      had its own storage. Four Xorg behaviours were missing, each seen on
+      hardware (MATE + picom/marco):
+      1. the moved window's pixels were not copied to its new position in
+         the backing (Xorg `compCopyWindow` → `fbCopyWindow`); the tray
+         draws once and waits for Expose, so the icon vanished on every
+         drag and every startup layout move (the old "intermittent blank");
+      2. the move was not reported as damage on the ancestor
+         (`damageCopyWindow`), so the compositor's region was only the
+         panel's ClipByChildren repaint, which excludes the applet;
+      3. what the move uncovered beneath it was not exposed: the workspace
+         switcher's buttons stayed painted over the tray after it passed;
+      4. the part of the moved window hidden under a higher sibling before
+         the move was not exposed to the moved window itself: a tray-sized
+         hole in the switcher after it slid under the tray.
+      Still open in the same family: an area uncovered by UNMAP or RESTACK
+      inside a redirected top-level is not exposed either. Covered by the
+      `subwindow-move` vng scenario (Xorg golden).
 
 - [ ] **Per-client GC mirroring** (Phase 3.7 task #26). The shared
       host GC creates subtle bugs when GC state leaks between clients.
