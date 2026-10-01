@@ -1,0 +1,55 @@
+==> probe.log <==
+without the COW
+  TranslateCoordinates(root, root) child=A
+  QueryPointer(root) child=A
+  app: EnterNotify event=A child=none detail=Ancestor mode=0
+  app: MotionNotify event=A child=none at=pointer
+  app: ButtonPress event=A child=none at=pointer
+  app: ButtonRelease event=A child=none at=pointer
+  app: LeaveNotify event=A child=none detail=Ancestor mode=0
+COW taken, no input shape set
+  GetRectangles(COW, Input): 1 screen
+  TranslateCoordinates(root, root) child=COW
+  QueryPointer(root) child=COW
+  compositor: MotionNotify event=COW child=none at=pointer
+  compositor: ButtonPress event=COW child=none at=pointer
+  compositor: ButtonRelease event=COW child=none at=pointer
+  compositor: MotionNotify event=COW child=none at=pointer
+compositor set a strip COW input region
+  GetRectangles(COW, Input): 1 1280x100+0+0
+  TranslateCoordinates(root, root) child=A
+  QueryPointer(root) child=A
+  app: EnterNotify event=A child=none detail=Nonlinear mode=0
+  app: MotionNotify event=A child=none at=pointer
+  app: ButtonPress event=A child=none at=pointer
+  app: ButtonRelease event=A child=none at=pointer
+  compositor: LeaveNotify event=COW child=none detail=Nonlinear mode=0
+  app: LeaveNotify event=A child=none detail=Nonlinear mode=0
+  compositor: EnterNotify event=COW child=none detail=Nonlinear mode=0
+  compositor: MotionNotify event=COW child=none at=pointer
+compositor set an empty COW input region
+  GetRectangles(COW, Input): 0
+  TranslateCoordinates(root, root) child=A
+  QueryPointer(root) child=A
+  app: EnterNotify event=A child=none detail=Ancestor mode=0
+  app: MotionNotify event=A child=none at=pointer
+  app: ButtonPress event=A child=none at=pointer
+  app: ButtonRelease event=A child=none at=pointer
+  app: LeaveNotify event=A child=none detail=Ancestor mode=0
+COW input region reset to None
+  GetRectangles(COW, Input): 1 screen
+  TranslateCoordinates(root, root) child=COW
+  QueryPointer(root) child=COW
+  compositor: MotionNotify event=COW child=none at=pointer
+  compositor: ButtonPress event=COW child=none at=pointer
+  compositor: ButtonRelease event=COW child=none at=pointer
+  compositor: MotionNotify event=COW child=none at=pointer
+COW released
+  TranslateCoordinates(root, root) child=A
+  QueryPointer(root) child=A
+  app: EnterNotify event=A child=none detail=Ancestor mode=0
+  app: MotionNotify event=A child=none at=pointer
+  app: ButtonPress event=A child=none at=pointer
+  app: ButtonRelease event=A child=none at=pointer
+  app: LeaveNotify event=A child=none detail=Ancestor mode=0
+done

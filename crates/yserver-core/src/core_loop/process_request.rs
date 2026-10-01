@@ -34718,8 +34718,10 @@ mod tests {
     }
 
     /// ProcTranslateCoords applies child input shapes. The Composite Overlay
-    /// Window is the top root child but has an empty input shape by default,
-    /// so a mapped popup below it must be returned as `child`, as on Xorg.
+    /// Window is the top root child and, like Xorg's, starts unshaped, so it
+    /// is the `child` over a popup until the compositor empties its input
+    /// region; then the popup below it is (measured on Xvfb 21.1,
+    /// tools/vng-scenarios/cow-input-shape).
     #[test]
     fn translate_coordinates_skips_empty_input_shaped_cow() {
         use crate::{backend::WindowHandle, resources::COMPOSITE_OVERLAY_WINDOW};
@@ -34744,27 +34746,38 @@ mod tests {
         state
             .resources
             .materialize_cow_resource(WindowHandle::from_raw_for_test(COMPOSITE_OVERLAY_WINDOW.0));
-        state.materialize_cow_input_shape();
         let _ = read_all_available(&mut peer);
 
-        let mut body = Vec::with_capacity(12);
-        body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
-        body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
-        body.extend_from_slice(&715i16.to_le_bytes());
-        body.extend_from_slice(&327i16.to_le_bytes());
-        handle_translate_coordinates(&mut state, ClientId(1), SequenceNumber(1), &body)
-            .expect("handle_translate_coordinates");
-
-        let bytes = read_all_available(&mut peer);
-        assert_eq!(bytes.len(), 32);
-        assert_eq!(bytes[0], 1, "reply");
+        let mut translate = |state: &mut ServerState| {
+            let mut body = Vec::with_capacity(12);
+            body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+            body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+            body.extend_from_slice(&715i16.to_le_bytes());
+            body.extend_from_slice(&327i16.to_le_bytes());
+            handle_translate_coordinates(state, ClientId(1), SequenceNumber(1), &body)
+                .expect("handle_translate_coordinates");
+            let bytes = read_all_available(&mut peer);
+            assert_eq!(bytes.len(), 32);
+            assert_eq!(bytes[0], 1, "reply");
+            assert_eq!(i16::from_le_bytes(bytes[12..14].try_into().unwrap()), 715);
+            assert_eq!(i16::from_le_bytes(bytes[14..16].try_into().unwrap()), 327);
+            u32::from_le_bytes(bytes[8..12].try_into().unwrap())
+        };
         assert_eq!(
-            u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            translate(&mut state),
+            COMPOSITE_OVERLAY_WINDOW.0,
+            "an unshaped COW is the child over the popup",
+        );
+        state
+            .shape_windows
+            .entry(COMPOSITE_OVERLAY_WINDOW)
+            .or_default()
+            .input = Some(Vec::new());
+        assert_eq!(
+            translate(&mut state),
             popup.0,
             "empty-input COW must not hide the popup child",
         );
-        assert_eq!(i16::from_le_bytes(bytes[12..14].try_into().unwrap()), 715);
-        assert_eq!(i16::from_le_bytes(bytes[14..16].try_into().unwrap()), 327);
     }
 
     #[test]
@@ -55449,6 +55462,105 @@ mod tests {
             "each GET records its own claim — what moved to the core claim \
              list is exactly what the backend refcount used to count",
         );
+    }
+
+    /// Xorg `compCreateOverlayWindow` (`composite/compoverlay.c:149`) gives the
+    /// overlay no input shape, so it takes the pointer over the whole screen
+    /// until the compositor empties its input region, and again after a reset
+    /// to None (measured on Xvfb 21.1, tools/vng-scenarios/cow-input-shape).
+    #[test]
+    fn overlay_window_takes_the_pointer_until_its_input_region_is_emptied() {
+        use yserver_protocol::x11::{shape as x11shape, xfixes as x11xfixes};
+
+        const APP: ResourceId = ResourceId(0x0020_0001);
+        const REGION: u32 = 0x0010_0042;
+        let cow = crate::resources::COMPOSITE_OVERLAY_WINDOW;
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window: APP,
+                parent: ROOT_WINDOW,
+                x: 100,
+                y: 100,
+                width: 200,
+                height: 200,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(APP);
+        let hit = |state: &ServerState| state.root_pointer_target_at(150, 150).map(|h| h.0);
+        assert_eq!(hit(&state), Some(APP));
+
+        let mut body = ROOT_WINDOW.0.to_le_bytes().to_vec();
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            1,
+            yserver_protocol::x11::composite::GET_OVERLAY_WINDOW,
+            &body,
+        );
+        assert_eq!(hit(&state), Some(cow), "an unshaped COW takes the pointer");
+
+        let mut xfixes = |state: &mut ServerState, minor: u8, body: Vec<u8>| {
+            let header = yserver_protocol::x11::RequestHeader {
+                opcode: XFIXES_MAJOR_OPCODE,
+                data: minor,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            };
+            handle_xfixes_request(
+                state,
+                &mut backend,
+                None,
+                ClientId(1),
+                SequenceNumber(2),
+                header,
+                &body,
+            )
+            .expect("XFIXES request");
+        };
+        let input_region = |region: u32| {
+            let mut body = cow.0.to_le_bytes().to_vec();
+            body.extend_from_slice(&[x11shape::KIND_INPUT, 0, 0, 0, 0, 0, 0, 0]);
+            body.extend_from_slice(&region.to_le_bytes());
+            body
+        };
+        xfixes(
+            &mut state,
+            x11xfixes::CREATE_REGION,
+            REGION.to_le_bytes().to_vec(),
+        );
+        xfixes(
+            &mut state,
+            x11xfixes::SET_WINDOW_SHAPE_REGION,
+            input_region(REGION),
+        );
+        assert_eq!(
+            hit(&state),
+            Some(APP),
+            "an empty input region passes through"
+        );
+        xfixes(
+            &mut state,
+            x11xfixes::SET_WINDOW_SHAPE_REGION,
+            input_region(0),
+        );
+        assert_eq!(hit(&state), Some(cow), "None restores the default region");
+
+        body[0..4].copy_from_slice(&cow.0.to_le_bytes());
+        dispatch_composite_minor(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            3,
+            yserver_protocol::x11::composite::RELEASE_OVERLAY_WINDOW,
+            &body,
+        );
+        assert_eq!(hit(&state), Some(APP));
     }
 
     #[test]
@@ -77781,7 +77893,6 @@ mod tests {
         state
             .resources
             .materialize_cow_resource(WindowHandle::from_raw_for_test(COMPOSITE_OVERLAY_WINDOW.0));
-        state.materialize_cow_input_shape();
         state
             .clients
             .get_mut(&CLIENT_ID)

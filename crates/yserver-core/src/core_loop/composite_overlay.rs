@@ -57,10 +57,11 @@ pub(crate) fn materialize_overlay(
         .materialize_cow_resource(crate::backend::WindowHandle::from_raw_panicking(
             cow_host_xid,
         ));
-    state.materialize_cow_input_shape();
     // Xorg compCreateOverlayWindow (composite/compoverlay.c:125-141) is a
     // CreateWindow and a MapWindow of an override-redirect root child, so
     // root's SubstructureNotify listeners see CreateNotify then MapNotify.
+    // It has no input shape: it takes the pointer until the compositor
+    // empties its input region.
     if let Some(geometry) =
         state
             .resources

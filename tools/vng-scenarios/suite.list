@@ -29,3 +29,4 @@ xkbcomp-upload       guest=xkbcomp-upload.sh         timeout=300 golden=live
 root-bg-resize       guest=root-background-resize.sh timeout=300 gpu=none
 cow-empty-shape      guest=cow-empty-shape.sh        host=cow-empty-shape-host.sh        outputs=2 timeout=400 gpu=none
 composite-reredirect guest=composite-reredirect.sh   host=composite-reredirect-host.sh   timeout=400 gpu=none
+cow-input-shape      guest=cow-input-shape.sh        timeout=300

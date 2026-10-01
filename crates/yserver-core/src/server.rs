@@ -2520,23 +2520,9 @@ pub struct EventTarget {
 }
 
 impl ServerState {
-    /// Stage 4e — set the COW's input shape to empty (click-through) at
-    /// materialization. Mirrors Xorg's compositor convention where the
-    /// COW's default input region passes pointer events through to
-    /// underlying root children, with descendants like the compositor's
-    /// stage receiving input directly.
-    ///
-    /// Pairs with `ResourceTable::materialize_cow_resource` — both run
-    /// from the `GetOverlayWindow` handler on the 0→1 transition.
-    pub fn materialize_cow_input_shape(&mut self) {
-        self.shape_windows
-            .entry(COMPOSITE_OVERLAY_WINDOW)
-            .or_default()
-            .input = Some(Vec::<xfixes::RegionRect>::new());
-    }
-
-    /// Symmetric teardown for [`Self::materialize_cow_input_shape`]. Called
-    /// from the `ReleaseOverlayWindow` handler on the 1→0 transition.
+    /// Drop the COW's shapes with the overlay: Xorg frees them in
+    /// DeleteWindow, so the next overlay starts unshaped. Called from the
+    /// `ReleaseOverlayWindow` handler on the 1→0 transition.
     pub fn destroy_cow_input_shape(&mut self) {
         self.shape_windows.remove(&COMPOSITE_OVERLAY_WINDOW);
     }
@@ -2616,13 +2602,9 @@ impl ServerState {
     ) -> Option<(ResourceId, i16, i16)> {
         // Strict-Xorg miSpriteTrace: iterate children top-to-bottom and
         // let hit_test_child's window_input_contains gate decide each one.
-        // The COW is no longer special once it's a real root child
-        // (Phase 2 materialization). With its default empty input shape,
-        // hit_test_child(COW) returns None and the trace continues to
-        // the next sibling — exactly matching Xorg's mi/misprite.c.
-        // When a compositor populates the COW input region via XFIXES,
-        // the gate descends naturally via pointer_target_at_inner's
-        // recursive walk.
+        // The COW is no special case: like Xorg's it is created unshaped,
+        // so it takes the pointer until the compositor empties its input
+        // region, and the trace then continues to the next sibling.
         let parent_window = self.resources.window(parent)?;
         for child_id in parent_window.children.iter().rev() {
             if let Some(hit) = self.hit_test_child(*child_id, x, y) {
@@ -5458,10 +5440,15 @@ mod tests {
         );
         let _ = state.resources.map_window(sib);
 
-        // Materialize COW (full-screen, empty input shape per Task 2.8).
+        // Materialize the full-screen COW; the compositor empties its
+        // input region.
         let host_xid = crate::backend::WindowHandle::from_raw_panicking(0x4000_0103);
         state.resources.materialize_cow_resource(host_xid);
-        state.materialize_cow_input_shape();
+        state
+            .shape_windows
+            .entry(crate::resources::COMPOSITE_OVERLAY_WINDOW)
+            .or_default()
+            .input = Some(Vec::new());
 
         // Click at (50, 50): inside both sibling and COW geometry. COW's
         // empty input shape → hit_test_child(COW) = None → iteration
@@ -5762,30 +5749,6 @@ mod tests {
         assert_eq!(
             target, stage,
             "non-empty COW input shape lets the trace descend to stage"
-        );
-    }
-
-    #[test]
-    fn cow_default_input_shape_is_empty() {
-        use crate::resources::COMPOSITE_OVERLAY_WINDOW;
-
-        let mut state = ServerState::new();
-        let host_xid = crate::backend::WindowHandle::from_raw_panicking(0x4000_0103);
-        state.resources.materialize_cow_resource(host_xid);
-        state.materialize_cow_input_shape();
-
-        let shape = state
-            .shape_windows
-            .get(&COMPOSITE_OVERLAY_WINDOW)
-            .expect("COW must have a shape_windows entry after materialization");
-        assert!(
-            shape.input.is_some(),
-            "COW must have a non-default input shape (set, but empty)"
-        );
-        assert_eq!(
-            shape.input.as_ref().unwrap().len(),
-            0,
-            "COW's default input shape rects are empty (click-through)"
         );
     }
 

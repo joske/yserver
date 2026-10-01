@@ -22958,6 +22958,12 @@ impl Backend for KmsBackend {
             cursor: None,
         };
         self.windows.insert(cow_host_xid, geom);
+        // The COW takes the pointer until its input region is emptied, so
+        // crossings resolve it like any window (Nonlinear to a sibling).
+        self.core.xid_map.insert(
+            cow_host_xid,
+            yserver_core::resources::COMPOSITE_OVERLAY_WINDOW,
+        );
         self.deferred_cow_release = false;
         // Step 2 (DRIFT 2): the COW's place in top_level_order is no longer
         // set here — the GetOverlayWindow core handler reprojects from core
@@ -22990,10 +22996,16 @@ impl Backend for KmsBackend {
             // can keep the caller's claim and let the compositor retry, or
             // fail safely without freeing a scanned buffer.
             self.materialize_direct_shadow_for_unflip()?;
+            self.core
+                .xid_map
+                .remove(&yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0);
             self.request_direct_unflip("release_last_overlay_window");
             self.deferred_cow_release = true;
             return Ok(true);
         }
+        self.core
+            .xid_map
+            .remove(&yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0);
         self.finish_cow_release();
         Ok(true)
     }
@@ -45779,6 +45791,60 @@ mod tests {
         assert!(
             b.cow_host_xid().is_none(),
             "cow_host_xid getter returns None after final release"
+        );
+        assert!(
+            !b.core.xid_map.contains_key(&cow_host_xid),
+            "COW leaves the pointer xid map on final release"
+        );
+    }
+
+    /// An unshaped COW takes the pointer (Xorg `compCreateOverlayWindow`), so
+    /// moving between it and a root sibling crosses Nonlinear both ways, as
+    /// measured on Xvfb 21.1 (tools/vng-scenarios/cow-input-shape).
+    #[test]
+    fn pointer_crossing_between_cow_and_a_sibling_is_nonlinear() {
+        use yserver_core::{backend::Backend, host_x11::PointerEventKind, server::ServerState};
+        let cow = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW;
+        let mut b = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        let app = create_live_window(
+            &mut state,
+            &mut b,
+            yserver_protocol::x11::ResourceId(0x0020_0001),
+            yserver_core::resources::ROOT_WINDOW,
+            100,
+            100,
+            200,
+            200,
+        )
+        .as_raw();
+        b.get_overlay_window(None).expect("get");
+        state.resources.materialize_cow_resource(
+            yserver_core::backend::WindowHandle::from_raw_panicking(cow.0),
+        );
+
+        let crossings = |b: &mut KmsBackend| -> Vec<(PointerEventKind, u32, u8)> {
+            std::mem::take(&mut b.core.pending_pointer_events)
+                .into_iter()
+                .map(|e| (e.kind, e.host_xid, e.detail))
+                .collect()
+        };
+        b.core.prev_pointer_window = Some(app);
+        b.update_pointer_window(&state, cow.0, 0);
+        assert_eq!(
+            crossings(&mut b),
+            vec![
+                (PointerEventKind::LeaveNotify, app, 3),
+                (PointerEventKind::EnterNotify, cow.0, 3),
+            ],
+        );
+        b.update_pointer_window(&state, app, 0);
+        assert_eq!(
+            crossings(&mut b),
+            vec![
+                (PointerEventKind::LeaveNotify, cow.0, 3),
+                (PointerEventKind::EnterNotify, app, 3),
+            ],
         );
     }
 
