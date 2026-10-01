@@ -1,0 +1,11 @@
+==> probe.log <==
+RedirectSubwindows(root, Manual): ok
+GetOverlayWindow: ok
+map stage (child of the COW): ok
+map locker (override-redirect, fullscreen): ok
+InvertRegion -> empty: ok
+SetWindowShapeRegion(COW, Bounding, empty): ok
+UnredirectWindow(locker): ok
+SetWindowShapeRegion(COW, Bounding, None): ok
+unmap locker: ok
+done

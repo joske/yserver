@@ -27,3 +27,4 @@ xi2-raw-keys         guest=xi2-raw-keys.sh           host=xi2-raw-keys-host.sh  
 xmodmap-caps-control guest=xmodmap-caps-control.sh   timeout=300
 xkbcomp-upload       guest=xkbcomp-upload.sh         timeout=300 golden=live
 root-bg-resize       guest=root-background-resize.sh timeout=300 gpu=none
+cow-empty-shape      guest=cow-empty-shape.sh        host=cow-empty-shape-host.sh        outputs=2 timeout=400 gpu=none
