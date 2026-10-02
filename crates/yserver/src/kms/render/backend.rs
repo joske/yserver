@@ -19953,6 +19953,11 @@ impl Backend for KmsBackend {
         // queue, so running it every iteration costs nothing at idle.
         self.engine.poll_retired(&self.platform);
         self.poll_pending_retire_with_invalidate();
+        // #196: destroy pixmap-pool entries idle past the eviction age, so
+        // a burst drains back down; `next_wakeup` wakes us for it.
+        if let Some(pool) = self.platform.pixmap_pool.as_ref() {
+            pool.trim_idle(std::time::Instant::now());
+        }
         // Diagnostic: drive the 1Hz telemetry emit from here too,
         // publishing the live `submitted`-queue depth. maybe_emit()
         // self-gates to 1Hz and is a no-op below threshold, but running
@@ -20026,6 +20031,12 @@ impl Backend for KmsBackend {
             // Not gated on `allow_kms_timers`: `maybe_composite` closes the
             // paint frame on its timeout while dark too (#177).
             .chain(self.engine.open_frame_timeout_deadline())
+            .chain(
+                self.platform
+                    .pixmap_pool
+                    .as_ref()
+                    .and_then(|pool| pool.next_trim_deadline()),
+            )
             .chain(
                 allow_kms_timers
                     .then(|| self.cursor_anim_deadline())
@@ -34056,6 +34067,113 @@ mod tests {
         b.destroy_subwindow(None, w).expect("destroy");
         settle(&mut b);
         pool.drain();
+    }
+
+    /// #196: eviction and the idle trim really free the pooled Vk memory,
+    /// and the ledger stops counting it as `pool_idle`.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn pixmap_pool_eviction_and_idle_trim_free_the_memory() {
+        use crate::kms::vk::{
+            mem_accounting::{self, MemCategory},
+            pixmap_pool::{PixmapPool, PixmapPoolLimits},
+        };
+        use yserver_core::backend::Backend;
+        let mut b = match KmsBackend::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        fn settle(b: &mut KmsBackend) {
+            b.engine
+                .close_open_frame(
+                    &mut b.store,
+                    &mut b.platform,
+                    crate::kms::render::frame_builder::CloseReason::SyncWait,
+                )
+                .expect("close frame");
+            b.engine
+                .flush_submit_group(
+                    &mut b.store,
+                    &mut b.platform,
+                    crate::kms::render::submit_group::FlushReason::SyncBoundary,
+                )
+                .expect("flush");
+            b.platform.wait_idle_bounded();
+            b.poll_pending_retire_with_invalidate();
+        }
+        let memory_of = |b: &KmsBackend, xid: u32| {
+            let id = b.store.lookup(xid).expect("pixmap in store");
+            b.store.get(id).expect("drawable").storage.memory
+        };
+        // Odd extents no other test allocates: the ledger is process-global.
+        let sizes: [(u16, u16); 4] = [(97, 89), (101, 83), (103, 79), (107, 73)];
+        let entry_bytes = |w: u16, h: u16| u64::from(w) * u64::from(h) * 4;
+        // Room for about two entries; the third return crosses the budget
+        // and evicts down to one.
+        let budget = 2 * entry_bytes(107, 73) * 2;
+        let vk = std::sync::Arc::clone(b.platform.vk.as_ref().expect("vk"));
+        let pool = std::sync::Arc::new(PixmapPool::with_limits(
+            vk,
+            PixmapPoolLimits {
+                budget_bytes: budget,
+                low_water_bytes: budget / 2,
+                ..PixmapPoolLimits::default()
+            },
+        ));
+        b.platform.pixmap_pool = Some(std::sync::Arc::clone(&pool));
+        let xids: Vec<u32> = sizes
+            .iter()
+            .map(|&(w, h)| b.create_pixmap(None, 32, w, h).expect("pixmap").as_raw())
+            .collect();
+        let mems: Vec<_> = xids.iter().map(|&x| memory_of(&b, x)).collect();
+        let real: u64 = mems
+            .iter()
+            .map(|&m| mem_accounting::entry_of(m).expect("tracked").0)
+            .sum();
+        for &x in &xids {
+            b.free_pixmap(None, x).expect("free");
+            settle(&mut b);
+        }
+        let held: Vec<_> = mems
+            .iter()
+            .filter(|&&m| mem_accounting::entry_of(m).map(|e| e.1) == Some(MemCategory::PoolIdle))
+            .copied()
+            .collect();
+        let gone = mems
+            .iter()
+            .filter(|&&m| mem_accounting::entry_of(m).is_none())
+            .count();
+        assert_eq!(held.len() + gone, mems.len(), "each one parked or freed");
+        assert!(gone > 0, "the budget evicted something ({real} B returned)");
+        assert_eq!(
+            held.last(),
+            mems.last(),
+            "the most recent return survives eviction"
+        );
+        let r = pool.residency();
+        let held_bytes: u64 = held
+            .iter()
+            .map(|&m| mem_accounting::entry_of(m).expect("held").0)
+            .sum();
+        assert_eq!(r.entries as usize, held.len());
+        assert_eq!(r.bytes, held_bytes, "budgeted on the real allocation size");
+        assert!(r.bytes <= budget);
+        assert_eq!(pool.stats().total_evicted_budget as usize, gone);
+
+        // The idle trim frees the rest once they outlive the age.
+        let due = pool.next_trim_deadline().expect("entries held");
+        pool.trim_idle(due - std::time::Duration::from_secs(5));
+        assert_eq!(pool.residency().entries as usize, held.len(), "not yet due");
+        pool.trim_idle(due);
+        assert_eq!(pool.residency(), Default::default());
+        assert_eq!(pool.next_trim_deadline(), None);
+        for &m in &held {
+            assert_eq!(mem_accounting::entry_of(m), None, "trimmed memory freed");
+        }
+        assert_eq!(pool.stats().total_evicted_idle as usize, held.len());
     }
 
     /// `picture_solid_fill_premul_correct` per plan §3b. NB: the

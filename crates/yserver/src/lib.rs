@@ -520,24 +520,25 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
                 // Absent (no `VK_EXT_memory_budget`, or Vulkan not up
                 // yet) the line is omitted rather than printed as
                 // zeros, which would read as "we use no memory".
-                // Live pool occupancy. The cumulative counters above
-                // cannot answer "how much is the pool holding right
-                // now" — entries leave only via takes_hit, so
-                // residency is a difference of two large numbers.
-                // The pool has no eviction and drains only at
-                // shutdown, so this is a high-water mark by
-                // construction; `nominal_bytes` is a FLOOR (real
-                // cost is mem_reqs.size per OPTIMAL-tiled image, each
-                // its own BO — there is no suballocator).
+                // Live pool occupancy, which the cumulative counters
+                // above cannot answer. `bytes` is the real allocation
+                // size the budget is enforced on; `nominal_bytes` is a
+                // FLOOR. The evicted totals are cumulative: budget
+                // evictions climbing under steady load mean the budget
+                // is below the working set.
                 if let Some(r) = crate::kms::vk::pixmap_pool::residency_snapshot() {
+                    let s = crate::kms::vk::pixmap_pool::telemetry_snapshot().unwrap_or_default();
                     log::info!(
                         target: RESOURCE_TELEMETRY_TARGET,
-                        "pixmap pool live: buckets={} empty_buckets={} entries={} \
-                         nominal_bytes_floor={:.1}MiB",
+                        "pixmap pool live: buckets={} entries={} bytes={:.1}MiB \
+                         nominal_bytes_floor={:.1}MiB evicted_budget_total={} \
+                         evicted_idle_total={}",
                         r.buckets,
-                        r.empty_buckets,
                         r.entries,
+                        r.bytes as f64 / (1024.0 * 1024.0),
                         r.nominal_bytes as f64 / (1024.0 * 1024.0),
+                        s.total_evicted_budget,
+                        s.total_evicted_idle,
                     );
                 }
                 // Per-process GPU engine time, from DRM fdinfo —

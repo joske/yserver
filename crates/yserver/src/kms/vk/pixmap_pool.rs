@@ -20,6 +20,12 @@
 //! return and on take) since they exhibit much lower reuse rates
 //! and have quadratically larger backing memory.
 //!
+//! Bounds across buckets (#196): a global byte budget and entry cap,
+//! enforced by evicting least-recently-returned entries down to a
+//! low-water mark, and an idle-age trim driven from the backend's
+//! `before_block`. Takes are LIFO, so a bucket's working set keeps
+//! fresh return stamps and only the tail a burst left behind ages out.
+//!
 //! Lifetime: pool entries are returned via a `BatchResource`
 //! adopted into the currently-open paint batch (Phase 5 T2
 //! defer-release mechanism). When the batch retires, the
@@ -27,8 +33,9 @@
 //! bucket has room, else destroys it directly.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     sync::{Arc, Mutex, Weak},
+    time::{Duration, Instant},
 };
 
 use ash::vk;
@@ -78,6 +85,57 @@ pub const PIXMAP_POOL_BUCKET_CAP_MAX: usize = 256;
 /// reuse rates collapse and per-entry cost is 4 MB+.
 pub const MAX_POOLED_DIM: u32 = 256;
 
+/// Global budget on idle entries, in real allocation bytes (#196).
+/// 64 MiB is ~18× the reporter's 3-day pre-burst residency (≤3.5 MiB)
+/// and ~2× the measured drag working set (three full 8 MiB menu-row
+/// buckets, ~33 MiB at the observed 1.37× allocation overhead); the
+/// #169 burst parked 970 MiB.
+pub const PIXMAP_POOL_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Over-budget eviction stops here, so a pool sitting at the budget
+/// edge evicts in batches instead of once per return.
+pub const PIXMAP_POOL_LOW_WATER_BYTES: u64 = 48 * 1024 * 1024;
+
+/// Global cap on idle entries: ~10× the reporter's steady state (389).
+/// Bounds live BO / VA-range count where tiny entries fit the byte
+/// budget thousands at a time (each makes amdgpu allocation dearer).
+pub const PIXMAP_POOL_MAX_ENTRIES: usize = 4096;
+
+/// Entry-count counterpart to [`PIXMAP_POOL_LOW_WATER_BYTES`].
+pub const PIXMAP_POOL_LOW_WATER_ENTRIES: usize = 3072;
+
+/// An entry not taken this long after its return is destroyed. The
+/// churn the pool exists for reuses within milliseconds (thousands of
+/// cycles/s); a minute spares anything redrawn even occasionally.
+pub const PIXMAP_POOL_IDLE_EVICT_AFTER: Duration = Duration::from_secs(60);
+
+/// Slack on the idle-trim wakeup, so a pool draining entries returned
+/// over a long stretch wakes the loop at most ~once a second.
+pub const PIXMAP_POOL_TRIM_SLACK: Duration = Duration::from_secs(1);
+
+/// The pool's cross-bucket bounds. [`Default`] is the production
+/// policy; tests construct tighter ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PixmapPoolLimits {
+    pub budget_bytes: u64,
+    pub low_water_bytes: u64,
+    pub max_entries: usize,
+    pub low_water_entries: usize,
+    pub idle_evict_after: Duration,
+}
+
+impl Default for PixmapPoolLimits {
+    fn default() -> Self {
+        Self {
+            budget_bytes: PIXMAP_POOL_BUDGET_BYTES,
+            low_water_bytes: PIXMAP_POOL_LOW_WATER_BYTES,
+            max_entries: PIXMAP_POOL_MAX_ENTRIES,
+            low_water_entries: PIXMAP_POOL_LOW_WATER_ENTRIES,
+            idle_evict_after: PIXMAP_POOL_IDLE_EVICT_AFTER,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PixmapPoolKey {
     pub width: u32,
@@ -113,14 +171,14 @@ pub struct PooledPixmapImage {
 /// Live occupancy of the pool. See [`PixmapPool::residency`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PixmapPoolResidency {
-    /// Distinct `(w, h, format)` buckets, including emptied ones —
-    /// nothing ever removes a bucket from the map.
+    /// Distinct `(w, h, format)` buckets holding entries — a bucket is
+    /// removed when its last entry leaves.
     pub buckets: u64,
-    /// Of those, how many currently hold no entries.
-    pub empty_buckets: u64,
     /// Entries held across all buckets.
     pub entries: u64,
-    /// Lower bound on bytes held: see [`PixmapPool::residency`].
+    /// Allocation bytes held, as budgeted (`mem_reqs.size` per entry).
+    pub bytes: u64,
+    /// `w * h * bytes_per_pixel` over live entries: see [`PixmapPool::residency`].
     pub nominal_bytes: u64,
 }
 
@@ -132,19 +190,27 @@ pub struct PixmapPoolStats {
     pub total_returns_rejected_bucket_full: u64,
     pub total_returns_rejected_oversize: u64,
     pub total_returns_rejected_oversize_by_bucket: [u64; 4],
+    /// Entries destroyed to bring the pool back under its budget.
+    pub total_evicted_budget: u64,
+    /// Entries destroyed by the idle-age trim.
+    pub total_evicted_idle: u64,
 }
 
 impl PixmapPoolStats {
     /// The counters `vram churn` reports: a hit or an accepted return is
     /// a `vkAllocateMemory` / `vkFreeMemory` the pool saved; a rejected
-    /// return (bucket full, or larger than `MAX_POOLED_DIM`) is a free.
+    /// return (bucket full, or larger than `MAX_POOLED_DIM`) or an
+    /// eviction is a free.
     #[must_use]
     pub fn pool_counters(&self) -> crate::kms::vk::mem_accounting::PoolCounters {
         crate::kms::vk::mem_accounting::PoolCounters {
             hits: self.total_takes_hit,
             misses: self.total_takes_miss,
             kept: self.total_returns_accepted,
-            dropped: self.total_returns_rejected_bucket_full + self.total_returns_rejected_oversize,
+            dropped: self.total_returns_rejected_bucket_full
+                + self.total_returns_rejected_oversize
+                + self.total_evicted_budget
+                + self.total_evicted_idle,
         }
     }
 }
@@ -206,14 +272,172 @@ pub fn telemetry_snapshot() -> Option<PixmapPoolStats> {
 /// Live-occupancy counterpart to [`telemetry_snapshot`].
 ///
 /// Reported separately from the cumulative stats because residency
-/// is the question the stats cannot answer: entries leave a bucket
-/// only via `try_take`, so `returns_accepted - takes_hit` is the
-/// only way to infer it from counters, and that is a difference of
-/// two large numbers rather than a measurement.
+/// is the question the stats cannot answer: inferring it from the
+/// counters is a difference of large numbers rather than a
+/// measurement.
 #[must_use]
 pub fn residency_snapshot() -> Option<PixmapPoolResidency> {
     let g = GLOBAL_LATEST_POOL.lock().ok()?;
     Some(g.upgrade()?.residency())
+}
+
+/// One idle entry plus what the cross-bucket bounds need to know
+/// about it.
+#[derive(Debug)]
+struct Slot<E> {
+    entry: E,
+    bytes: u64,
+    seq: u64,
+}
+
+/// The pool's bookkeeping, generic over the entry so the eviction
+/// policy is unit tested without a Vulkan device. Never destroys
+/// anything itself: entries leaving by eviction are handed back for
+/// the caller to destroy outside the lock.
+///
+/// Within a bucket, slots sit in return order (`seq` ascending), so a
+/// bucket's front is its least recently returned slot and `lru`'s
+/// first key always names some bucket's front.
+#[derive(Debug)]
+struct PoolCore<E> {
+    limits: PixmapPoolLimits,
+    buckets: HashMap<PixmapPoolKey, VecDeque<Slot<E>>>,
+    /// Every held slot by return sequence → its bucket and return time.
+    lru: BTreeMap<u64, (PixmapPoolKey, Instant)>,
+    next_seq: u64,
+    bytes: u64,
+}
+
+/// Why [`PoolCore::put`] declined an entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reject {
+    Oversize,
+    BucketFull,
+}
+
+impl<E> PoolCore<E> {
+    fn new(limits: PixmapPoolLimits) -> Self {
+        Self {
+            limits,
+            buckets: HashMap::new(),
+            lru: BTreeMap::new(),
+            next_seq: 0,
+            bytes: 0,
+        }
+    }
+
+    fn entries(&self) -> usize {
+        self.lru.len()
+    }
+
+    /// Most recently returned entry for `key`: LIFO keeps a bucket's
+    /// working set fresh, so only what it did not reuse ages out.
+    fn take(&mut self, key: PixmapPoolKey) -> Option<E> {
+        let bucket = self.buckets.get_mut(&key)?;
+        let slot = bucket.pop_back()?;
+        if bucket.is_empty() {
+            self.buckets.remove(&key);
+        }
+        self.lru.remove(&slot.seq);
+        self.bytes -= slot.bytes;
+        Some(slot.entry)
+    }
+
+    /// Accept `entry` (costing `bytes`) at `now`. On acceptance, returns
+    /// whatever had to be evicted to get back under the limits.
+    fn put(
+        &mut self,
+        key: PixmapPoolKey,
+        entry: E,
+        bytes: u64,
+        now: Instant,
+    ) -> Result<Vec<E>, (E, Reject)> {
+        if !PixmapPool::eligible(key) {
+            return Err((entry, Reject::Oversize));
+        }
+        let bucket = self.buckets.entry(key).or_default();
+        if bucket.len() >= PixmapPool::bucket_cap(key) {
+            return Err((entry, Reject::BucketFull));
+        }
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        bucket.push_back(Slot { entry, bytes, seq });
+        self.lru.insert(seq, (key, now));
+        self.bytes += bytes;
+        let mut evicted = Vec::new();
+        if self.bytes > self.limits.budget_bytes || self.entries() > self.limits.max_entries {
+            // Down to the low-water mark, not just under the limit: at
+            // the edge a per-return eviction would turn every return
+            // into a free.
+            while self.bytes > self.limits.low_water_bytes
+                || self.entries() > self.limits.low_water_entries
+            {
+                let Some(e) = self.evict_oldest() else { break };
+                evicted.push(e);
+            }
+        }
+        Ok(evicted)
+    }
+
+    fn evict_oldest(&mut self) -> Option<E> {
+        let (seq, (key, _)) = self.lru.pop_first()?;
+        let bucket = self.buckets.get_mut(&key)?;
+        let slot = bucket.pop_front()?;
+        debug_assert_eq!(slot.seq, seq, "bucket front is its oldest slot");
+        if bucket.is_empty() {
+            self.buckets.remove(&key);
+        }
+        self.bytes -= slot.bytes;
+        Some(slot.entry)
+    }
+
+    /// Evict every entry returned `idle_evict_after` or longer before
+    /// `now` — by construction none of them was taken in that time.
+    fn trim_idle(&mut self, now: Instant) -> Vec<E> {
+        let mut evicted = Vec::new();
+        while self.lru.first_key_value().is_some_and(|(_, (_, at))| {
+            now.saturating_duration_since(*at) >= self.limits.idle_evict_after
+        }) {
+            let Some(e) = self.evict_oldest() else { break };
+            evicted.push(e);
+        }
+        evicted
+    }
+
+    /// When the oldest entry becomes trimmable, plus
+    /// [`PIXMAP_POOL_TRIM_SLACK`]. `None` while empty.
+    fn next_trim_deadline(&self) -> Option<Instant> {
+        self.lru
+            .first_key_value()
+            .map(|(_, (_, at))| *at + self.limits.idle_evict_after + PIXMAP_POOL_TRIM_SLACK)
+    }
+
+    fn drain(&mut self) -> Vec<E> {
+        self.lru.clear();
+        self.bytes = 0;
+        self.buckets
+            .drain()
+            .flat_map(|(_, bucket)| bucket.into_iter().map(|slot| slot.entry))
+            .collect()
+    }
+
+    fn residency(&self) -> PixmapPoolResidency {
+        let mut out = PixmapPoolResidency {
+            buckets: self.buckets.len() as u64,
+            entries: self.entries() as u64,
+            bytes: self.bytes,
+            ..Default::default()
+        };
+        for (key, bucket) in &self.buckets {
+            let entry_bytes = u64::from(key.width)
+                .saturating_mul(u64::from(key.height))
+                .saturating_mul(u64::from(format_bytes_per_pixel(key.format)));
+            out.nominal_bytes = out
+                .nominal_bytes
+                .saturating_add(entry_bytes * bucket.len() as u64);
+        }
+        out
+    }
 }
 
 pub struct PixmapPool {
@@ -222,7 +446,7 @@ pub struct PixmapPool {
     // satisfies BatchResource's Send bound. Single-threaded core
     // loop means contention is zero; Mutex is the cheapest Send-safe
     // option (one atomic CAS per pool op).
-    buckets: Mutex<HashMap<PixmapPoolKey, VecDeque<PooledPixmapImage>>>,
+    core: Mutex<PoolCore<PooledPixmapImage>>,
     stats: Mutex<PixmapPoolStats>,
 }
 
@@ -231,7 +455,11 @@ impl std::fmt::Debug for PixmapPool {
         // VkContext does not implement Debug; show bucket count +
         // stats so logs are still useful without trying to print
         // raw Vulkan handles.
-        let buckets_len = self.buckets.lock().map(|b| b.len()).unwrap_or(usize::MAX);
+        let buckets_len = self
+            .core
+            .lock()
+            .map(|c| c.buckets.len())
+            .unwrap_or(usize::MAX);
         f.debug_struct("PixmapPool")
             .field("buckets", &buckets_len)
             .field("stats", &self.stats())
@@ -241,9 +469,14 @@ impl std::fmt::Debug for PixmapPool {
 
 impl PixmapPool {
     pub fn new(vk: Arc<VkContext>) -> Self {
+        Self::with_limits(vk, PixmapPoolLimits::default())
+    }
+
+    /// [`Self::new`] with explicit cross-bucket bounds.
+    pub fn with_limits(vk: Arc<VkContext>, limits: PixmapPoolLimits) -> Self {
         Self {
             vk,
-            buckets: Mutex::new(HashMap::new()),
+            core: Mutex::new(PoolCore::new(limits)),
             stats: Mutex::new(PixmapPoolStats::default()),
         }
     }
@@ -265,9 +498,7 @@ impl PixmapPool {
     /// tested without a Vulkan device.
     #[must_use]
     pub fn bucket_cap(key: PixmapPoolKey) -> usize {
-        let entry_bytes = u64::from(key.width)
-            .saturating_mul(u64::from(key.height))
-            .saturating_mul(u64::from(format_bytes_per_pixel(key.format)))
+        let entry_bytes = Self::nominal_bytes(key)
             // A zero-extent key costs no memory; `max(1)` keeps the
             // division defined and lands it on the ceiling below.
             .max(1);
@@ -276,47 +507,23 @@ impl PixmapPool {
         by_budget.clamp(PIXMAP_POOL_BUCKET_CAP_MIN, PIXMAP_POOL_BUCKET_CAP_MAX)
     }
 
+    fn nominal_bytes(key: PixmapPoolKey) -> u64 {
+        u64::from(key.width)
+            .saturating_mul(u64::from(key.height))
+            .saturating_mul(u64::from(format_bytes_per_pixel(key.format)))
+    }
+
     /// What the pool is holding *right now*, as opposed to the
     /// cumulative counters in [`PixmapPoolStats`].
     ///
-    /// Why this exists: the pool has no eviction, no global cap and
-    /// no bucket-count cap, and `drain` runs only at shutdown, so
-    /// everything it accepts stays resident for the session. That
-    /// makes it a candidate for the ~1.4 GiB floor reported in GH
-    /// discussion 56, and the cumulative counters cannot answer it —
-    /// residency is `returns_accepted - takes_hit`, which is a
-    /// difference of two large numbers rather than a measurement.
-    ///
-    /// `nominal_bytes` is `w * h * bytes_per_pixel` summed over live
-    /// entries. It is a FLOOR, not the true cost: the allocation is
-    /// `mem_reqs.size` for an OPTIMAL-tiled image, and with no
-    /// suballocator each entry is its own kernel BO subject to a
-    /// minimum granularity. Treat it as "at least this much".
+    /// `bytes` is what the budget is enforced against: the ledger's
+    /// size for each entry's memory, i.e. `mem_reqs.size` of an
+    /// OPTIMAL-tiled image, each its own kernel BO (no suballocator).
+    /// `nominal_bytes` is `w * h * bytes_per_pixel`, a floor; the gap
+    /// between the two is the allocation overhead (~1.37× in #169).
     #[must_use]
     pub fn residency(&self) -> PixmapPoolResidency {
-        let Ok(buckets) = self.buckets.lock() else {
-            return PixmapPoolResidency::default();
-        };
-        let mut out = PixmapPoolResidency {
-            buckets: buckets.len() as u64,
-            ..Default::default()
-        };
-        for (key, bucket) in buckets.iter() {
-            let n = bucket.len() as u64;
-            if n == 0 {
-                // A bucket emptied by `try_take` is never removed —
-                // counted separately so an all-empty map is not
-                // mistaken for held memory.
-                out.empty_buckets += 1;
-                continue;
-            }
-            out.entries += n;
-            let entry_bytes = u64::from(key.width)
-                .saturating_mul(u64::from(key.height))
-                .saturating_mul(u64::from(format_bytes_per_pixel(key.format)));
-            out.nominal_bytes = out.nominal_bytes.saturating_add(entry_bytes * n);
-        }
-        out
+        self.core.lock().map(|c| c.residency()).unwrap_or_default()
     }
 
     /// Take a recycled entry for `key`, or `None` if the bucket is
@@ -325,12 +532,12 @@ impl PixmapPool {
         if !Self::eligible(key) {
             return None;
         }
-        let mut buckets = self
-            .buckets
+        let entry = self
+            .core
             .lock()
-            .expect("pixmap pool buckets mutex poisoned");
+            .expect("pixmap pool mutex poisoned")
+            .take(key);
         let mut stats = self.stats.lock().expect("pixmap pool stats mutex poisoned");
-        let entry = buckets.get_mut(&key).and_then(VecDeque::pop_front);
         if let Some(e) = entry.as_ref() {
             // The caller recategorises again if it is not a pixmap.
             crate::kms::vk::mem_accounting::recategorise(
@@ -347,56 +554,95 @@ impl PixmapPool {
     /// Try to return `entry` to the pool. Returns `Ok(())` if
     /// accepted; `Err(entry)` if the bucket was full or the key is
     /// ineligible — caller must destroy the entry.
+    ///
+    /// **Caller guarantees the GPU is done with `entry`** (the
+    /// drawable's last render ticket has signalled), the same
+    /// guarantee a rejected return relies on to destroy it at once.
+    /// That is what lets an accepted entry be destroyed later by
+    /// eviction or [`Self::trim_idle`] without a fence.
     pub fn try_return(
         &self,
         key: PixmapPoolKey,
         entry: PooledPixmapImage,
     ) -> Result<(), PooledPixmapImage> {
-        if !Self::eligible(key) {
-            let max_dim = key.width.max(key.height);
-            let bin = oversize_bin_index(max_dim);
-            let mut stats = self.stats.lock().expect("pixmap pool stats mutex poisoned");
-            stats.total_returns_rejected_oversize += 1;
-            stats.total_returns_rejected_oversize_by_bucket[bin] += 1;
-            return Err(entry);
-        }
-        let mut buckets = self
-            .buckets
-            .lock()
-            .expect("pixmap pool buckets mutex poisoned");
-        let cap = Self::bucket_cap(key);
-        let bucket = buckets.entry(key).or_default();
-        if bucket.len() >= cap {
-            self.stats
-                .lock()
-                .expect("pixmap pool stats mutex poisoned")
-                .total_returns_rejected_bucket_full += 1;
-            return Err(entry);
-        }
-        crate::kms::vk::mem_accounting::recategorise(
-            entry.memory,
-            crate::kms::vk::mem_accounting::MemCategory::PoolIdle,
+        // Budget against the real allocation, not the nominal extent:
+        // the ledger knows `mem_reqs.size`.
+        let bytes = crate::kms::vk::mem_accounting::entry_of(entry.memory)
+            .map_or_else(|| Self::nominal_bytes(key), |(size, _)| size);
+        let memory = entry.memory;
+        let result = self.core.lock().expect("pixmap pool mutex poisoned").put(
+            key,
+            entry,
+            bytes,
+            Instant::now(),
         );
-        bucket.push_back(entry);
+        let mut stats = self.stats.lock().expect("pixmap pool stats mutex poisoned");
+        match result {
+            Ok(evicted) => {
+                crate::kms::vk::mem_accounting::recategorise(
+                    memory,
+                    crate::kms::vk::mem_accounting::MemCategory::PoolIdle,
+                );
+                stats.total_returns_accepted += 1;
+                stats.total_evicted_budget += evicted.len() as u64;
+                drop(stats);
+                for e in evicted {
+                    self.destroy_entry(e);
+                }
+                Ok(())
+            }
+            Err((entry, Reject::Oversize)) => {
+                let bin = oversize_bin_index(key.width.max(key.height));
+                stats.total_returns_rejected_oversize += 1;
+                stats.total_returns_rejected_oversize_by_bucket[bin] += 1;
+                Err(entry)
+            }
+            Err((entry, Reject::BucketFull)) => {
+                stats.total_returns_rejected_bucket_full += 1;
+                Err(entry)
+            }
+        }
+    }
+
+    /// Destroy every entry idle for [`PixmapPoolLimits::idle_evict_after`].
+    /// Cheap when nothing is due (one map lookup); the backend calls it
+    /// every dispatch iteration from `before_block`.
+    pub fn trim_idle(&self, now: Instant) {
+        let evicted = self
+            .core
+            .lock()
+            .expect("pixmap pool mutex poisoned")
+            .trim_idle(now);
+        if evicted.is_empty() {
+            return;
+        }
         self.stats
             .lock()
             .expect("pixmap pool stats mutex poisoned")
-            .total_returns_accepted += 1;
-        Ok(())
+            .total_evicted_idle += evicted.len() as u64;
+        for e in evicted {
+            self.destroy_entry(e);
+        }
+    }
+
+    /// When [`Self::trim_idle`] next has work, so an otherwise idle
+    /// server still wakes to drain a burst. `None` while empty.
+    #[must_use]
+    pub fn next_trim_deadline(&self) -> Option<Instant> {
+        self.core.lock().ok()?.next_trim_deadline()
     }
 
     /// Synchronously destroy every pooled entry. Called on backend
     /// shutdown after the scheduler has drained its in-flight
     /// batches (so no `BatchResource` can still hold a back-ref).
     pub fn drain(&self) {
-        let mut buckets = self
-            .buckets
+        let entries = self
+            .core
             .lock()
-            .expect("pixmap pool buckets mutex poisoned");
-        for (_, bucket) in buckets.drain() {
-            for entry in bucket {
-                self.destroy_entry(entry);
-            }
+            .expect("pixmap pool mutex poisoned")
+            .drain();
+        for entry in entries {
+            self.destroy_entry(entry);
         }
     }
 
@@ -424,16 +670,7 @@ impl Drop for PixmapPool {
         unsafe {
             let _ = self.vk.device.queue_wait_idle(self.vk.graphics_queue);
         }
-        let entries: Vec<_> = self
-            .buckets
-            .lock()
-            .expect("pixmap pool buckets mutex poisoned")
-            .drain()
-            .flat_map(|(_, bucket)| bucket.into_iter())
-            .collect();
-        for entry in entries {
-            self.destroy_entry(entry);
-        }
+        self.drain();
     }
 }
 
@@ -477,6 +714,8 @@ mod tests {
             total_returns_rejected_bucket_full: 2,
             total_returns_rejected_oversize: 4,
             total_returns_rejected_oversize_by_bucket: [0, 1, 1, 2],
+            total_evicted_budget: 10,
+            total_evicted_idle: 20,
         };
         assert_eq!(
             stats.pool_counters(),
@@ -484,9 +723,246 @@ mod tests {
                 hits: 7,
                 misses: 3,
                 kept: 5,
-                dropped: 6,
+                dropped: 36,
             }
         );
+    }
+
+    fn key(width: u32, height: u32) -> PixmapPoolKey {
+        PixmapPoolKey {
+            width,
+            height,
+            format: vk::Format::B8G8R8A8_UNORM,
+        }
+    }
+
+    const KIB: u64 = 1024;
+
+    /// Byte bounds in KiB, entry bounds generous, a 60 s idle age.
+    fn limits(budget_kib: u64, low_kib: u64) -> PixmapPoolLimits {
+        PixmapPoolLimits {
+            budget_bytes: budget_kib * KIB,
+            low_water_bytes: low_kib * KIB,
+            max_entries: 1000,
+            low_water_entries: 1000,
+            idle_evict_after: Duration::from_secs(60),
+        }
+    }
+
+    fn put(core: &mut PoolCore<u32>, k: PixmapPoolKey, id: u32, kib: u64, at: Instant) -> Vec<u32> {
+        core.put(k, id, kib * KIB, at).expect("accepted")
+    }
+
+    #[test]
+    fn take_is_lifo_and_an_emptied_bucket_is_removed() {
+        let t0 = Instant::now();
+        let mut core = PoolCore::new(limits(1024, 512));
+        put(&mut core, key(10, 10), 1, 1, t0);
+        put(&mut core, key(10, 10), 2, 1, t0);
+        assert_eq!(core.take(key(10, 10)), Some(2), "most recent return first");
+        assert_eq!(core.take(key(10, 10)), Some(1));
+        assert_eq!(core.take(key(10, 10)), None);
+        assert!(core.buckets.is_empty(), "no empty bucket left behind");
+        assert_eq!((core.entries(), core.bytes), (0, 0));
+    }
+
+    #[test]
+    fn over_budget_evicts_least_recently_returned_across_buckets_to_low_water() {
+        let t0 = Instant::now();
+        let mut core = PoolCore::new(limits(10, 6));
+        // Ten 1 KiB entries over three buckets, returned in id order.
+        for id in 0..10u32 {
+            let evicted = put(&mut core, key(1 + id % 3, 1), id, 1, t0);
+            assert!(evicted.is_empty(), "at the budget is not over it");
+        }
+        assert_eq!(core.bytes, 10 * KIB);
+        // The eleventh crosses the budget: evict oldest-first to 6 KiB.
+        let evicted = put(&mut core, key(1, 1), 10, 1, t0);
+        assert_eq!(evicted, vec![0, 1, 2, 3, 4]);
+        assert_eq!((core.entries(), core.bytes), (6, 6 * KIB));
+        // Hysteresis: refilling to the budget evicts nothing.
+        for id in 11..15u32 {
+            assert!(put(&mut core, key(4, 1), id, 1, t0).is_empty());
+        }
+        assert_eq!(core.bytes, 10 * KIB);
+        // Residency agrees with the bookkeeping; no empty bucket lingers.
+        let r = core.residency();
+        assert_eq!((r.entries, r.bytes), (10, 10 * KIB));
+        assert_eq!(r.buckets as usize, core.buckets.len());
+        assert!(core.buckets.values().all(|b| !b.is_empty()));
+    }
+
+    #[test]
+    fn eviction_removes_buckets_it_empties() {
+        let t0 = Instant::now();
+        let mut core = PoolCore::new(limits(2, 1));
+        put(&mut core, key(1, 1), 0, 1, t0);
+        put(&mut core, key(2, 2), 1, 1, t0);
+        assert_eq!(put(&mut core, key(3, 3), 2, 1, t0), vec![0, 1]);
+        assert_eq!(
+            core.buckets.keys().copied().collect::<Vec<_>>(),
+            vec![key(3, 3)]
+        );
+    }
+
+    #[test]
+    fn a_taken_entry_no_longer_counts_toward_the_budget() {
+        let t0 = Instant::now();
+        let mut core = PoolCore::new(limits(2, 1));
+        put(&mut core, key(1, 1), 0, 1, t0);
+        put(&mut core, key(1, 1), 1, 1, t0);
+        assert_eq!(core.take(key(1, 1)), Some(1));
+        assert!(put(&mut core, key(2, 2), 2, 1, t0).is_empty());
+        assert_eq!(core.bytes, 2 * KIB);
+    }
+
+    #[test]
+    fn the_entry_cap_evicts_like_the_byte_budget() {
+        let t0 = Instant::now();
+        let mut core = PoolCore::new(PixmapPoolLimits {
+            max_entries: 4,
+            low_water_entries: 2,
+            ..limits(1 << 20, 1 << 20)
+        });
+        for id in 0..4u32 {
+            assert!(put(&mut core, key(1 + id, 1), id, 1, t0).is_empty());
+        }
+        assert_eq!(put(&mut core, key(9, 1), 4, 1, t0), vec![0, 1, 2]);
+        assert_eq!(core.entries(), 2);
+    }
+
+    #[test]
+    fn rejections_leave_the_pool_untouched() {
+        let t0 = Instant::now();
+        let mut core = PoolCore::new(limits(1 << 20, 1 << 20));
+        let big = key(MAX_POOLED_DIM + 1, 1);
+        assert_eq!(core.put(big, 7, KIB, t0), Err((7, Reject::Oversize)));
+        let k = key(MAX_POOLED_DIM, MAX_POOLED_DIM);
+        for id in 0..PixmapPool::bucket_cap(k) {
+            put(&mut core, k, u32::try_from(id).unwrap(), 1, t0);
+        }
+        assert_eq!(core.put(k, 99, KIB, t0), Err((99, Reject::BucketFull)));
+        assert_eq!(core.entries(), PixmapPool::bucket_cap(k));
+    }
+
+    #[test]
+    fn idle_trim_evicts_only_entries_unused_for_the_age() {
+        let t0 = Instant::now();
+        let age = Duration::from_secs(60);
+        let mut core = PoolCore::new(limits(1 << 20, 1 << 20));
+        put(&mut core, key(5, 5), 1, 1, t0);
+        put(&mut core, key(6, 6), 2, 1, t0 + Duration::from_secs(10));
+        assert!(
+            core.trim_idle(t0 + age - Duration::from_millis(1))
+                .is_empty()
+        );
+        assert_eq!(core.trim_idle(t0 + age), vec![1]);
+        assert_eq!(
+            core.buckets.keys().copied().collect::<Vec<_>>(),
+            vec![key(6, 6)]
+        );
+        assert_eq!(core.trim_idle(t0 + age + Duration::from_secs(10)), vec![2]);
+        assert_eq!((core.entries(), core.bytes), (0, 0));
+        assert!(core.buckets.is_empty());
+    }
+
+    /// The steady-state working set must survive: a bucket cycled
+    /// every few seconds keeps its entries, while the tail a burst
+    /// left in the SAME bucket ages out (LIFO takes never touch it).
+    #[test]
+    fn idle_trim_spares_a_bucket_reused_every_few_seconds() {
+        let t0 = Instant::now();
+        let mut core = PoolCore::new(limits(1 << 20, 1 << 20));
+        let hot = key(230, 51);
+        // A burst parks 20 entries; afterwards the client cycles 2 at a time.
+        for id in 0..20u32 {
+            put(&mut core, hot, id, 1, t0);
+        }
+        put(&mut core, key(7, 7), 100, 1, t0); // never reused
+        let mut evicted = Vec::new();
+        for step in 1..=60u32 {
+            let now = t0 + Duration::from_secs(u64::from(step) * 5);
+            let a = core.take(hot).expect("hit");
+            let b = core.take(hot).expect("hit");
+            put(&mut core, hot, b, 1, now);
+            put(&mut core, hot, a, 1, now);
+            evicted.extend(core.trim_idle(now));
+        }
+        // Every take hit; only the burst tail and the unused bucket went.
+        assert_eq!(core.buckets.get(&hot).map(VecDeque::len), Some(2));
+        assert_eq!(evicted.len(), 19);
+        assert!(evicted.contains(&100));
+        assert!(!core.buckets.contains_key(&key(7, 7)));
+    }
+
+    #[test]
+    fn next_trim_deadline_tracks_the_oldest_entry() {
+        let t0 = Instant::now();
+        let mut core = PoolCore::new(limits(1 << 20, 1 << 20));
+        assert_eq!(core.next_trim_deadline(), None);
+        put(&mut core, key(1, 1), 1, 1, t0);
+        put(&mut core, key(2, 2), 2, 1, t0 + Duration::from_secs(3));
+        let due = t0 + Duration::from_secs(60) + PIXMAP_POOL_TRIM_SLACK;
+        assert_eq!(core.next_trim_deadline(), Some(due));
+        // Waking at the deadline drains everything due by then.
+        assert_eq!(core.trim_idle(due), vec![1]);
+        assert_eq!(
+            core.next_trim_deadline(),
+            Some(due + Duration::from_secs(3))
+        );
+        assert_eq!(core.take(key(2, 2)), Some(2));
+        assert_eq!(core.next_trim_deadline(), None);
+    }
+
+    /// The reporter's pre-burst steady state (#169: ~390 entries over
+    /// ~104 buckets, ≤3.5 MiB) cycled under the production limits:
+    /// every take must hit and nothing may be evicted.
+    #[test]
+    fn production_limits_never_evict_the_reported_steady_state() {
+        let t0 = Instant::now();
+        let mut core = PoolCore::new(PixmapPoolLimits::default());
+        let keys: Vec<_> = (0..104u32).map(|i| key(16 + i, 16 + i % 7)).collect();
+        let mut id = 0u32;
+        for &k in &keys {
+            for _ in 0..4 {
+                // ~9 KiB each, the reporter's 3.5 MiB / 389 entries.
+                put(&mut core, k, id, 9, t0);
+                id += 1;
+            }
+        }
+        for step in 1..=600u32 {
+            let now = t0 + Duration::from_secs(u64::from(step));
+            for &k in &keys {
+                // The client holds its whole working set, then frees it.
+                let held: Vec<_> = (0..4)
+                    .map(|_| core.take(k).expect("steady state always hits"))
+                    .collect();
+                for e in held {
+                    assert!(core.put(k, e, 9 * KIB, now).expect("accepted").is_empty());
+                }
+            }
+            assert!(core.trim_idle(now).is_empty(), "step {step}");
+        }
+        assert_eq!(core.entries(), 416);
+    }
+
+    #[test]
+    fn production_limits_cap_the_reported_burst() {
+        // #169: 9723 entries over 2736 buckets, ~100 KiB each real.
+        let t0 = Instant::now();
+        let mut core = PoolCore::new(PixmapPoolLimits::default());
+        let mut id = 0u32;
+        for b in 0..2736u32 {
+            for _ in 0..4 {
+                let _ = core.put(key(1 + b % 256, 1 + b / 256), id, 100 * KIB, t0);
+                id += 1;
+            }
+        }
+        assert!(core.bytes <= PIXMAP_POOL_BUDGET_BYTES);
+        assert!(core.entries() <= PIXMAP_POOL_MAX_ENTRIES);
+        let drained = core.trim_idle(t0 + PIXMAP_POOL_IDLE_EVICT_AFTER);
+        assert!(!drained.is_empty());
+        assert_eq!((core.entries(), core.bytes), (0, 0));
     }
 
     #[test]
