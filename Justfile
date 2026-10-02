@@ -1059,7 +1059,7 @@ yserver-awesome-hw-audit log="info" interval="30" idle="5":
 # Long-run resource telemetry (vram / vram by use / gpu load / pixmap pool live) only, for
 # leaving a session up for a day; plain `log=info` recipes grow by GB/hour.
 # Contributors send the log (`gzip -k`), they don't read it. The last sample
-# is post-teardown (pool drained): read the floor from `grep -v 'entries=0'`.
+# is post-teardown; idle pool entries are trimmed after 60 s, so entries=0 mid-run is real.
 yserver-awesome-hw-resources:
     cargo build --release --bin yserver
     bash -c '\
