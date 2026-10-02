@@ -394,10 +394,10 @@ pub fn process_request(
         50 => handle_list_fonts_with_info(state, backend, origin, client_id, sequence, body),
         // ── GContext (pure state mutation) ──
         55 => handle_create_gc(state, client_id, sequence, body),
-        56 => handle_change_gc(state, client_id, sequence, body),
-        57 => handle_copy_gc(state, client_id, sequence, body),
-        59 => handle_set_clip_rectangles(state, client_id, sequence, header, body),
-        60 => handle_free_gc(state, client_id, sequence, body),
+        56 => handle_change_gc(state, backend, origin, client_id, sequence, body),
+        57 => handle_copy_gc(state, backend, origin, client_id, sequence, body),
+        59 => handle_set_clip_rectangles(state, backend, origin, client_id, sequence, header, body),
+        60 => handle_free_gc(state, backend, origin, client_id, sequence, body),
         // ── drawing (state read + backend RPC + damage) ──
         61 => handle_clear_area(state, backend, origin, client_id, sequence, header, body),
         62 => handle_copy_area(state, backend, origin, client_id, sequence, body),
@@ -30175,8 +30175,28 @@ fn handle_create_gc(
     Ok(RequestOutcome::Handled)
 }
 
+/// Host-free the pixmaps a GC change displaced once nothing else references
+/// them — the client may have freed them while the GC still held them
+/// (`handle_free_pixmap` defers that free). Same orphan rule as the
+/// ChangeWindowAttributes release.
+fn release_displaced_gc_pixmaps(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    displaced: Vec<crate::backend::PixmapHandle>,
+) {
+    for handle in displaced {
+        if !state.resources.host_xid_still_referenced(handle) {
+            let _ = backend.free_pixmap(origin, handle.as_raw());
+            state.resources.host_pixmap_freed(handle.as_raw());
+        }
+    }
+}
+
 fn handle_change_gc(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
     body: &[u8],
@@ -30185,7 +30205,8 @@ fn handle_change_gc(
         if let Err((code, bad_value)) = validate_gc_only(state, request.gc) {
             return emit_x11_error(state, client_id, sequence, code, bad_value, 56);
         }
-        state.resources.change_gc(client_id, request);
+        let displaced = state.resources.change_gc(client_id, request);
+        release_displaced_gc_pixmaps(state, backend, origin, displaced);
     }
     debug!("client {} #{} ChangeGC", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
@@ -30193,6 +30214,8 @@ fn handle_change_gc(
 
 fn handle_copy_gc(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
     body: &[u8],
@@ -30201,7 +30224,8 @@ fn handle_copy_gc(
         let src_gc = ResourceId(u32::from_le_bytes([body[0], body[1], body[2], body[3]]));
         let dst_gc = ResourceId(u32::from_le_bytes([body[4], body[5], body[6], body[7]]));
         let value_mask = u32::from_le_bytes([body[8], body[9], body[10], body[11]]);
-        state.resources.copy_gc(src_gc, dst_gc, value_mask);
+        let displaced = state.resources.copy_gc(src_gc, dst_gc, value_mask);
+        release_displaced_gc_pixmaps(state, backend, origin, displaced);
     }
     debug!("client {} #{} CopyGC", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
@@ -30209,6 +30233,8 @@ fn handle_copy_gc(
 
 fn handle_set_clip_rectangles(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
     header: RequestHeader,
@@ -30218,7 +30244,8 @@ fn handle_set_clip_rectangles(
         if let Err((code, bad_value)) = validate_gc_only(state, request.gc) {
             return emit_x11_error(state, client_id, sequence, code, bad_value, 59);
         }
-        state.resources.set_clip_rectangles(client_id, request);
+        let displaced = state.resources.set_clip_rectangles(client_id, request);
+        release_displaced_gc_pixmaps(state, backend, origin, displaced);
     }
     debug!("client {} #{} SetClipRectangles", client_id.0, sequence.0);
     Ok(RequestOutcome::Handled)
@@ -30235,6 +30262,8 @@ fn handle_set_clip_rectangles(
 /// that client uncompleted.
 fn handle_free_gc(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
     client_id: ClientId,
     sequence: SequenceNumber,
     body: &[u8],
@@ -30260,7 +30289,8 @@ fn handle_free_gc(
             FREE_GC_OPCODE,
         );
     }
-    state.resources.free_gc(gc);
+    let displaced = state.resources.free_gc(gc);
+    release_displaced_gc_pixmaps(state, backend, origin, displaced);
     debug!(
         "client {} #{} FreeGC gc=0x{:x} freed",
         client_id.0, sequence.0, gc.0
@@ -42080,6 +42110,257 @@ mod tests {
                 .iter()
                 .any(|call| matches!(call, RecordedCall::FreePixmap(0xcafe))),
             "host pixmap must stay alive while retained by GC clip mask"
+        );
+    }
+
+    /// #196 fixture: client 1 owns GC 0x2100 and depth-24 tile / depth-1
+    /// stipple / depth-1 clip pixmaps, host xids 0xd001..=0xd003.
+    fn gc_with_freed_pixmaps(state: &mut ServerState, mask: u32, values: &[u32]) {
+        for (i, depth) in [24u8, 1, 1].into_iter().enumerate() {
+            let pixmap = ResourceId(0x3100 + i as u32);
+            state.resources.create_pixmap(
+                ClientId(1),
+                CreatePixmapRequest {
+                    depth,
+                    pixmap,
+                    drawable: ROOT_WINDOW,
+                    width: 8,
+                    height: 8,
+                },
+            );
+            assert!(state.resources.set_pixmap_host_xid(
+                pixmap,
+                crate::backend::PixmapHandle::from_raw(0xd001 + i as u32).unwrap(),
+            ));
+        }
+        create_plain_gc(state, ResourceId(0x2100));
+        change_gc(state, &mut RecordingBackend::new(), 0x2100, mask, values);
+    }
+
+    fn create_plain_gc(state: &mut ServerState, gc: ResourceId) {
+        state.resources.create_gc(
+            ClientId(1),
+            CreateGcRequest {
+                gc,
+                drawable: ROOT_WINDOW,
+                function: None,
+                plane_mask: None,
+                foreground: None,
+                background: None,
+                line_width: None,
+                line_style: None,
+                cap_style: None,
+                join_style: None,
+                fill_style: None,
+                fill_rule: None,
+                tile: None,
+                stipple: None,
+                tile_x_origin: None,
+                tile_y_origin: None,
+                font: None,
+                subwindow_mode: None,
+                graphics_exposures: None,
+                clip_x_origin: None,
+                clip_y_origin: None,
+                clip_mask: None,
+                dash_offset: None,
+                dashes: None,
+                arc_mode: None,
+            },
+        );
+    }
+
+    fn change_gc(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        gc: u32,
+        mask: u32,
+        values: &[u32],
+    ) {
+        let mut body = gc.to_le_bytes().to_vec();
+        body.extend(mask.to_le_bytes());
+        for v in values {
+            body.extend(v.to_le_bytes());
+        }
+        handle_change_gc(state, backend, None, ClientId(1), SequenceNumber(1), &body)
+            .expect("change gc");
+    }
+
+    fn free_pixmaps(state: &mut ServerState, backend: &mut RecordingBackend, ids: &[u32]) {
+        for &id in ids {
+            handle_free_pixmap(
+                state,
+                backend,
+                None,
+                ClientId(1),
+                SequenceNumber(1),
+                &free_pixmap_body(id),
+            )
+            .expect("free pixmap");
+        }
+    }
+
+    fn host_frees(backend: &RecordingBackend) -> Vec<u32> {
+        let mut out: Vec<u32> = backend
+            .calls()
+            .iter()
+            .filter_map(|call| match call {
+                RecordedCall::FreePixmap(xid) => Some(*xid),
+                _ => None,
+            })
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    const GC_TILE: u32 = 0x0000_0400;
+    const GC_STIPPLE: u32 = 0x0000_0800;
+    const GC_CLIP_MASK: u32 = 0x0008_0000;
+
+    /// #196: a GC's tile / stipple / clip-mask ref dies when ChangeGC replaces
+    /// it (Xorg `dix/gc.c:256`/`:273` DestroyPixmap the old tile / stipple;
+    /// `mi/migc.c:68` drops a clip mask as soon as it is a region). Once the
+    /// client has freed the pixmap, that was the last reference: the host
+    /// storage must go, exactly once. It leaked for the session.
+    #[test]
+    fn change_gc_releases_a_freed_pixmap_it_replaces() {
+        for (mask, host) in [
+            (GC_TILE, 0xd001),
+            (GC_STIPPLE, 0xd002),
+            (GC_CLIP_MASK, 0xd003),
+        ] {
+            let mut state = ServerState::new();
+            let mut backend = RecordingBackend::new();
+            let pixmap = 0x3100 + (host - 0xd001);
+            gc_with_freed_pixmaps(&mut state, mask, &[pixmap]);
+            free_pixmaps(&mut state, &mut backend, &[pixmap]);
+            assert_eq!(
+                host_frees(&backend),
+                Vec::<u32>::new(),
+                "mask {mask:#x}: GC still holds it"
+            );
+            // Tile can't be None: replace it with another pixmap; the rest clear.
+            let replacement = if mask == GC_TILE { 0x3102 } else { 0 };
+            change_gc(&mut state, &mut backend, 0x2100, mask, &[replacement]);
+            assert_eq!(host_frees(&backend), vec![host], "mask {mask:#x}");
+            change_gc(&mut state, &mut backend, 0x2100, mask, &[replacement]);
+            assert_eq!(
+                host_frees(&backend),
+                vec![host],
+                "mask {mask:#x}: exactly once"
+            );
+        }
+    }
+
+    /// The positive control: a displaced pixmap the client still owns stays.
+    #[test]
+    fn change_gc_keeps_a_replaced_pixmap_the_client_still_owns() {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        gc_with_freed_pixmaps(&mut state, GC_TILE | GC_STIPPLE, &[0x3100, 0x3101]);
+        change_gc(
+            &mut state,
+            &mut backend,
+            0x2100,
+            GC_TILE | GC_STIPPLE,
+            &[0x3102, 0x3102],
+        );
+        assert_eq!(host_frees(&backend), Vec::<u32>::new());
+        free_pixmaps(&mut state, &mut backend, &[0x3100, 0x3101]);
+        assert_eq!(
+            host_frees(&backend),
+            vec![0xd001, 0xd002],
+            "unreferenced: freed at FreePixmap"
+        );
+    }
+
+    #[test]
+    fn set_clip_rectangles_releases_a_freed_clip_mask() {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        gc_with_freed_pixmaps(&mut state, GC_CLIP_MASK, &[0x3102]);
+        free_pixmaps(&mut state, &mut backend, &[0x3102]);
+        let mut body = 0x2100u32.to_le_bytes().to_vec();
+        body.extend([0u8; 4]); // clip x/y origin
+        body.extend([0u8, 0, 0, 0, 8, 0, 8, 0]); // one rectangle
+        handle_set_clip_rectangles(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 59,
+                data: 0,
+                length_units: 5,
+            },
+            &body,
+        )
+        .expect("set clip rectangles");
+        assert_eq!(host_frees(&backend), vec![0xd003]);
+    }
+
+    /// Xorg `CopyGC` drops dst's old tile / stipple (`dix/gc.c:673`/`:685`);
+    /// one the source GC also holds survives.
+    #[test]
+    fn copy_gc_releases_freed_pixmaps_it_overwrites() {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        gc_with_freed_pixmaps(&mut state, GC_TILE | GC_STIPPLE, &[0x3100, 0x3101]);
+        create_plain_gc(&mut state, ResourceId(0x2101));
+        change_gc(
+            &mut state,
+            &mut backend,
+            0x2101,
+            GC_TILE | GC_STIPPLE,
+            &[0x3100, 0x3102],
+        );
+        free_pixmaps(&mut state, &mut backend, &[0x3100, 0x3101, 0x3102]);
+        assert_eq!(
+            host_frees(&backend),
+            Vec::<u32>::new(),
+            "both GCs hold them"
+        );
+        let mut body = 0x2101u32.to_le_bytes().to_vec();
+        body.extend(0x2100u32.to_le_bytes());
+        body.extend((GC_TILE | GC_STIPPLE).to_le_bytes());
+        handle_copy_gc(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            &body,
+        )
+        .expect("copy gc");
+        // 0x2100 now holds tile 0xd001 + stipple 0xd003; its old stipple 0xd002 went.
+        assert_eq!(host_frees(&backend), vec![0xd002]);
+    }
+
+    /// Xorg `FreeGC` drops the tile / stipple / clip (`dix/gc.c:776-781`).
+    #[test]
+    fn free_gc_releases_the_freed_pixmaps_it_held() {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        gc_with_freed_pixmaps(
+            &mut state,
+            GC_TILE | GC_STIPPLE | GC_CLIP_MASK,
+            &[0x3100, 0x3101, 0x3102],
+        );
+        free_pixmaps(&mut state, &mut backend, &[0x3100, 0x3101]);
+        handle_free_gc(
+            &mut state,
+            &mut backend,
+            None,
+            ClientId(1),
+            SequenceNumber(1),
+            &0x2100u32.to_le_bytes(),
+        )
+        .expect("free gc");
+        assert_eq!(
+            host_frees(&backend),
+            vec![0xd001, 0xd002],
+            "0x3102 is still the client's"
         );
     }
 

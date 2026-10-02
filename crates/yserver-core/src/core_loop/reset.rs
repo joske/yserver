@@ -241,9 +241,8 @@ pub fn force_destroy_all_clients(state: &mut ServerState, backend: &mut dyn Back
     // is per-reference, not per-client: client A's tile stays allocated while
     // client B's GC or window border still names it. In a normal disconnect
     // that is the whole answer — B is still running. In a reset B is destroyed
-    // too, and nothing reports the tile a second time (a GC teardown yields no
-    // freeable candidates), so without this sweep it survives the session that
-    // owned it.
+    // too, and a reference its teardown does not hand back as a candidate
+    // would, without this sweep, survive the session that owned it.
     let freed: std::collections::BTreeSet<u32> = frees.freed.into_iter().collect();
     let mut leftovers: Vec<u32> = frees
         .deferred

@@ -1416,6 +1416,86 @@ mod tests {
         }
     }
 
+    /// #196: a pixmap the client freed while its GC still held it (as tile,
+    /// stipple or clip mask) dies with the GC at disconnect — Xorg's `FreeGC`
+    /// drops those refs (`dix/gc.c:776-781`). The pixmap resource was already
+    /// gone, so `freed_pixmaps` never named it and it leaked for the session.
+    #[test]
+    fn disconnect_releases_pixmaps_its_gc_held_past_free_pixmap() {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        install_client(&mut state, 7);
+        let mut hosts = Vec::new();
+        for (i, depth) in [24u8, 1, 1].into_iter().enumerate() {
+            let pixmap = ResourceId(0x0070_0051 + i as u32);
+            let host = 0x9999_0051 + i as u32;
+            state.resources.create_pixmap(
+                ClientId(7),
+                CreatePixmapRequest {
+                    pixmap,
+                    drawable: ROOT_WINDOW,
+                    width: 16,
+                    height: 16,
+                    depth,
+                },
+            );
+            assert!(state.resources.set_pixmap_host_xid(
+                pixmap,
+                crate::backend::PixmapHandle::from_raw(host).expect("non-zero")
+            ));
+            hosts.push(host);
+        }
+        state.resources.create_gc(
+            ClientId(7),
+            yserver_protocol::x11::CreateGcRequest {
+                gc: ResourceId(0x0070_0050),
+                drawable: ROOT_WINDOW,
+                function: None,
+                plane_mask: None,
+                foreground: None,
+                background: None,
+                line_width: None,
+                line_style: None,
+                cap_style: None,
+                join_style: None,
+                fill_style: None,
+                fill_rule: None,
+                tile: Some(ResourceId(0x0070_0051)),
+                stipple: Some(ResourceId(0x0070_0052)),
+                tile_x_origin: None,
+                tile_y_origin: None,
+                font: None,
+                subwindow_mode: None,
+                graphics_exposures: None,
+                clip_x_origin: None,
+                clip_y_origin: None,
+                clip_mask: Some(Some(ResourceId(0x0070_0053))),
+                dash_offset: None,
+                dashes: None,
+                arc_mode: None,
+            },
+        );
+        for i in 0..3 {
+            assert!(
+                state
+                    .resources
+                    .free_pixmap(ResourceId(0x0070_0051 + i))
+                    .is_some()
+            );
+        }
+        process_disconnect(&mut state, &mut backend, ClientId(7));
+        let mut freed: Vec<u32> = backend
+            .calls()
+            .iter()
+            .filter_map(|call| match call {
+                RecordedCall::FreePixmap(xid) => Some(*xid),
+                _ => None,
+            })
+            .collect();
+        freed.sort_unstable();
+        assert_eq!(freed, hosts, "each released exactly once");
+    }
+
     /// The zombie variant: a RetainPermanent client's pixmap survives its
     /// disconnect, and `KillClient` later runs `destroy_zombie_resources`.
     /// That release path must apply the same gate — another client's window
