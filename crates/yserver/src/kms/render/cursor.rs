@@ -177,9 +177,12 @@ pub(crate) fn color_roles_to_bgra(
 
 /// One frame of a RENDER animated cursor (spec
 /// `2026-06-10-animated-cursors-design.md`). Snapshotted at
-/// `create_anim_cursor` time so constituent-cursor lifetime is a
-/// non-issue (Xorg refcounts; we snapshot).
+/// `create_anim_cursor` time; `source` keeps the frame's cursor (and
+/// so its sprite pixmap) alive while the animated cursor lives, as
+/// Xorg's `AnimCursorCreate` refs each frame.
 pub(crate) struct AnimFrame {
+    /// Host handle of the frame's cursor.
+    pub(crate) source: u32,
     pub(crate) record: Arc<CursorRecord>,
     /// Sprite pixmap the SW scene path samples. `None` when the
     /// sub-cursor's sprite alloc was skipped (Vk-less test
