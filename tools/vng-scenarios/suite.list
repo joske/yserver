@@ -32,3 +32,4 @@ composite-reredirect guest=composite-reredirect.sh   host=composite-reredirect-h
 cow-input-shape      guest=cow-input-shape.sh        timeout=300
 crossing-tree        guest=crossing-tree.sh          timeout=300
 subwindow-move       guest=subwindow-move.sh         timeout=300
+pixmap-pool          guest=pixmap-pool.sh            host=pixmap-pool-host.sh            timeout=500 gpu=none
