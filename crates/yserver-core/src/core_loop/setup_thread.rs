@@ -157,6 +157,8 @@ fn run_setup(
     let auth_transport = match &stream {
         Transport::Unix(_) => AuthTransport::Unix,
         Transport::Tcp(_) => AuthTransport::Tcp,
+        #[cfg(test)]
+        Transport::Capture(_) => panic!("test capture transport cannot perform setup"),
     };
     // The generation handed to `check` is THIS thread's producer binding,
     // captured at accept — never the counter's current value. An XDMCP

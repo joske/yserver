@@ -8,8 +8,8 @@
 //! the [`Binding`] that maps to a libinput setter.
 //!
 //! Used by:
-//!   * `xinput::seed_touchpad` — iterates the table to populate the XI2
-//!     property registry from a [`LibinputConfigSnapshot`] (T2).
+//!   * `xinput::seed_pointer_properties` — iterates the table to populate
+//!     each pointer facet from a [`LibinputConfigSnapshot`] (T2/T6).
 //!   * `core_loop::process_request` XI2 / XI1 property dispatch arms —
 //!     validates incoming writes ([`validate_value`]) and decodes them
 //!     to [`DeviceConfigChange`] ([`decode_change`]) for the backend's
@@ -20,7 +20,7 @@
 /// A typed device-config write target (one variant per libinput setter).
 ///
 /// Produced by [`decode_change`] after a successful [`validate_value`]
-/// pass; consumed by `Backend::apply_device_config` to write through to
+/// pass; consumed by `Backend::start_device_config` to write through to
 /// the live libinput device. `PartialEq` only (no `Eq`) because
 /// `AccelSpeed` carries an `f32`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -76,6 +76,20 @@ pub enum DeviceConfigError {
     Unsupported,
     /// Value out of range / not a legal one-hot / wrong byte count.
     Invalid,
+    /// The runtime input source is no longer bound to a live libinput handle.
+    SourceGone,
+}
+
+/// Opaque identity for one input-thread configuration application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DeviceConfigToken(pub u64);
+
+/// Whether a backend applied a source configuration synchronously or
+/// submitted it to an asynchronous owner such as the KMS input thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceConfigStart {
+    Applied,
+    Pending(DeviceConfigToken),
 }
 
 /// X11 property value type for a descriptor row.
@@ -686,6 +700,58 @@ pub fn encode_card32(value: u32) -> Vec<u8> {
 #[must_use]
 pub fn encode_float(value: f32) -> Vec<u8> {
     value.to_le_bytes().to_vec()
+}
+
+/// Resolve the writable property descriptor affected by a confirmed
+/// libinput change. This is used after a server reset, when the submitted
+/// protocol request and its old atom ID have intentionally been discarded.
+#[must_use]
+pub fn descriptor_for_change(change: DeviceConfigChange) -> &'static PropDescriptor {
+    let binding = match change {
+        DeviceConfigChange::Tap(_) => Binding::Tap,
+        DeviceConfigChange::TapDrag(_) => Binding::TapDrag,
+        DeviceConfigChange::TapDragLock(_) => Binding::TapDragLock,
+        DeviceConfigChange::TapButtonMap(_) => Binding::TapButtonMap,
+        DeviceConfigChange::NaturalScroll(_) => Binding::NaturalScroll,
+        DeviceConfigChange::Dwt(_) => Binding::Dwt,
+        DeviceConfigChange::LeftHanded(_) => Binding::LeftHanded,
+        DeviceConfigChange::MiddleEmulation(_) => Binding::MiddleEmulation,
+        DeviceConfigChange::ScrollMethod(_) => Binding::ScrollMethod,
+        DeviceConfigChange::ClickMethod(_) => Binding::ClickMethod,
+        DeviceConfigChange::SendEvents(_) => Binding::SendEvents,
+        DeviceConfigChange::AccelSpeed(_) => Binding::AccelSpeed,
+        DeviceConfigChange::AccelProfile(_) => Binding::AccelProfile,
+        DeviceConfigChange::ScrollButton(_) => Binding::ScrollButton,
+        DeviceConfigChange::ScrollButtonLock(_) => Binding::ScrollButtonLock,
+    };
+    DESCRIPTORS
+        .iter()
+        .find(|descriptor| descriptor.binding == Some(binding))
+        .expect("every DeviceConfigChange has a writable property descriptor")
+}
+
+/// Encode the canonical property value for a confirmed libinput change.
+/// Typed format-32 values use little-endian bytes, matching XI property
+/// storage after Task 7's frontend normalization.
+#[must_use]
+pub fn encode_change_value(change: DeviceConfigChange) -> Vec<u8> {
+    match change {
+        DeviceConfigChange::Tap(value)
+        | DeviceConfigChange::TapDrag(value)
+        | DeviceConfigChange::TapDragLock(value)
+        | DeviceConfigChange::NaturalScroll(value)
+        | DeviceConfigChange::Dwt(value)
+        | DeviceConfigChange::LeftHanded(value)
+        | DeviceConfigChange::MiddleEmulation(value)
+        | DeviceConfigChange::ScrollButtonLock(value) => encode_bool(value),
+        DeviceConfigChange::TapButtonMap(value) => encode_onehot(Some(value), 2),
+        DeviceConfigChange::ScrollMethod(value) => encode_onehot(value, 3),
+        DeviceConfigChange::ClickMethod(value) => encode_onehot(value, 2),
+        DeviceConfigChange::SendEvents(mask) => encode_bitflags(mask, 2),
+        DeviceConfigChange::AccelSpeed(value) => encode_float(value),
+        DeviceConfigChange::AccelProfile(value) => encode_onehot(value, 3),
+        DeviceConfigChange::ScrollButton(value) => encode_card32(value),
+    }
 }
 
 // ---------------------------------------------------------------------------

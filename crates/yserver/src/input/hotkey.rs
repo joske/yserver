@@ -2,6 +2,8 @@
 //! translation. Used by the direct-mode input thread.
 
 use crate::input::InputEvent;
+use std::collections::{HashMap, HashSet};
+use yserver_core::xinput::InputSourceId;
 
 // Linux evdev keycodes (raw, before the X11 +8 translation).
 pub(crate) const LINUX_KEY_ENTER: u32 = 28;
@@ -33,10 +35,9 @@ pub enum Hotkey {
 /// Tracks Ctrl/Alt held state off the raw kernel scancodes and matches
 /// the fixed hotkey combos. Off-X-side on purpose: a grabbing client or
 /// remapped keymap must not be able to swallow zap or the VT switch.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct HotkeyDetector {
-    ctrl_pressed: bool,
-    alt_pressed: bool,
+    modifier_keys_by_source: HashMap<InputSourceId, HashSet<u32>>,
 }
 
 impl HotkeyDetector {
@@ -52,55 +53,84 @@ impl HotkeyDetector {
     /// (observed: at the greeter, plain F6 → TTY6). Mirrors Xorg's
     /// VT-enter "forget held keys" resync.
     pub fn reset(&mut self) {
-        self.ctrl_pressed = false;
-        self.alt_pressed = false;
+        self.modifier_keys_by_source.clear();
     }
 
     /// Update modifier state for `ev`; return the hotkey it fires, if any.
     /// Only key *presses* fire; releases just update modifier state.
     pub fn check(&mut self, ev: &InputEvent) -> Option<Hotkey> {
-        match *ev {
-            InputEvent::KeyPress { keycode } => match keycode {
-                LINUX_KEY_LEFTCTRL | LINUX_KEY_RIGHTCTRL => {
-                    self.ctrl_pressed = true;
-                    None
+        match ev {
+            InputEvent::KeyPress { source_id, keycode } => {
+                match *keycode {
+                    LINUX_KEY_LEFTCTRL | LINUX_KEY_RIGHTCTRL | LINUX_KEY_LEFTALT
+                    | LINUX_KEY_RIGHTALT => {
+                        self.modifier_keys_by_source
+                            .entry(*source_id)
+                            .or_default()
+                            .insert(*keycode);
+                        None
+                    }
+                    _ if !(self.ctrl_pressed() && self.alt_pressed()) => None,
+                    LINUX_KEY_BACKSPACE => Some(Hotkey::Zap),
+                    LINUX_KEY_ENTER => Some(Hotkey::DumpScanout),
+                    LINUX_KEY_F1..=LINUX_KEY_F10 => {
+                        Some(Hotkey::SwitchVt(*keycode - LINUX_KEY_F1 + 1))
+                    }
+                    LINUX_KEY_F11 => Some(Hotkey::SwitchVt(11)),
+                    // F12 is not a VT key (VT12 typically doesn't exist), so
+                    // it's a free slot for the per-drawable storage dump.
+                    LINUX_KEY_F12 => Some(Hotkey::DumpDrawables),
+                    _ => None,
                 }
-                LINUX_KEY_LEFTALT | LINUX_KEY_RIGHTALT => {
-                    self.alt_pressed = true;
-                    None
+            }
+            InputEvent::KeyRelease { source_id, keycode } => {
+                if let Some(keys) = self.modifier_keys_by_source.get_mut(source_id) {
+                    keys.remove(keycode);
+                    if keys.is_empty() {
+                        self.modifier_keys_by_source.remove(source_id);
+                    }
                 }
-                _ if !(self.ctrl_pressed && self.alt_pressed) => None,
-                LINUX_KEY_BACKSPACE => Some(Hotkey::Zap),
-                LINUX_KEY_ENTER => Some(Hotkey::DumpScanout),
-                LINUX_KEY_F1..=LINUX_KEY_F10 => Some(Hotkey::SwitchVt(keycode - LINUX_KEY_F1 + 1)),
-                LINUX_KEY_F11 => Some(Hotkey::SwitchVt(11)),
-                // F12 is not a VT key (VT12 typically doesn't exist), so
-                // it's a free slot for the per-drawable storage dump.
-                LINUX_KEY_F12 => Some(Hotkey::DumpDrawables),
-                _ => None,
-            },
-            InputEvent::KeyRelease { keycode } => {
-                match keycode {
-                    LINUX_KEY_LEFTCTRL | LINUX_KEY_RIGHTCTRL => self.ctrl_pressed = false,
-                    LINUX_KEY_LEFTALT | LINUX_KEY_RIGHTALT => self.alt_pressed = false,
-                    _ => {}
-                }
+                None
+            }
+            InputEvent::DeviceSuspended { source_id } | InputEvent::DeviceRemoved { source_id } => {
+                self.modifier_keys_by_source.remove(source_id);
                 None
             }
             _ => None,
         }
+    }
+
+    fn ctrl_pressed(&self) -> bool {
+        self.modifier_keys_by_source
+            .values()
+            .any(|keys| keys.contains(&LINUX_KEY_LEFTCTRL) || keys.contains(&LINUX_KEY_RIGHTCTRL))
+    }
+
+    fn alt_pressed(&self) -> bool {
+        self.modifier_keys_by_source
+            .values()
+            .any(|keys| keys.contains(&LINUX_KEY_LEFTALT) || keys.contains(&LINUX_KEY_RIGHTALT))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use yserver_core::xinput::InputSourceId;
+
+    const TEST_SOURCE_ID: InputSourceId = InputSourceId(1);
 
     fn press(d: &mut HotkeyDetector, kc: u32) -> Option<Hotkey> {
-        d.check(&InputEvent::KeyPress { keycode: kc })
+        d.check(&InputEvent::KeyPress {
+            source_id: TEST_SOURCE_ID,
+            keycode: kc,
+        })
     }
     fn release(d: &mut HotkeyDetector, kc: u32) {
-        d.check(&InputEvent::KeyRelease { keycode: kc });
+        d.check(&InputEvent::KeyRelease {
+            source_id: TEST_SOURCE_ID,
+            keycode: kc,
+        });
     }
 
     #[test]
@@ -144,6 +174,7 @@ mod tests {
         press(&mut d, LINUX_KEY_LEFTCTRL);
         press(&mut d, LINUX_KEY_LEFTALT);
         d.reset();
+        assert!(d.modifier_keys_by_source.is_empty());
         assert_eq!(press(&mut d, 64 /* F6 */), None);
     }
 
@@ -163,5 +194,87 @@ mod tests {
         press(&mut d, LINUX_KEY_LEFTCTRL);
         press(&mut d, LINUX_KEY_LEFTALT);
         assert_eq!(press(&mut d, LINUX_KEY_F12), Some(Hotkey::DumpDrawables));
+    }
+
+    #[test]
+    fn two_physical_sources_keep_independent_ctrl_holders() {
+        let mut d = HotkeyDetector::new();
+        let source_a = InputSourceId(1);
+        let source_b = InputSourceId(2);
+        d.check(&InputEvent::KeyPress {
+            source_id: source_a,
+            keycode: LINUX_KEY_LEFTCTRL,
+        });
+        d.check(&InputEvent::KeyPress {
+            source_id: source_b,
+            keycode: LINUX_KEY_LEFTCTRL,
+        });
+        d.check(&InputEvent::KeyRelease {
+            source_id: source_a,
+            keycode: LINUX_KEY_LEFTCTRL,
+        });
+        d.check(&InputEvent::KeyPress {
+            source_id: source_b,
+            keycode: LINUX_KEY_LEFTALT,
+        });
+        assert_eq!(
+            d.check(&InputEvent::KeyPress {
+                source_id: source_b,
+                keycode: 60, // F2
+            }),
+            Some(Hotkey::SwitchVt(2)),
+            "releasing A's Ctrl must leave B's held Ctrl active",
+        );
+        assert_eq!(d.modifier_keys_by_source.len(), 1);
+        assert_eq!(
+            d.modifier_keys_by_source.get(&source_b),
+            Some(&HashSet::from([LINUX_KEY_LEFTCTRL, LINUX_KEY_LEFTALT])),
+        );
+    }
+
+    #[test]
+    fn suspending_one_source_clears_only_its_hotkey_holders() {
+        let mut d = HotkeyDetector::new();
+        let source_a = InputSourceId(1);
+        let source_b = InputSourceId(2);
+        d.check(&InputEvent::KeyPress {
+            source_id: source_a,
+            keycode: LINUX_KEY_LEFTCTRL,
+        });
+        d.check(&InputEvent::DeviceSuspended {
+            source_id: source_a,
+        });
+        assert_eq!(
+            d.check(&InputEvent::KeyPress {
+                source_id: source_b,
+                keycode: 60,
+            }),
+            None,
+            "a suspended source's Ctrl must not remain stuck",
+        );
+        d.check(&InputEvent::KeyPress {
+            source_id: source_b,
+            keycode: LINUX_KEY_LEFTCTRL,
+        });
+        d.check(&InputEvent::KeyPress {
+            source_id: source_a,
+            keycode: LINUX_KEY_LEFTALT,
+        });
+        d.check(&InputEvent::DeviceRemoved {
+            source_id: source_a,
+        });
+        assert_eq!(
+            d.check(&InputEvent::KeyPress {
+                source_id: source_b,
+                keycode: 60,
+            }),
+            None,
+            "removal clears that source's Alt without clearing B's Ctrl",
+        );
+        assert_eq!(d.modifier_keys_by_source.len(), 1);
+        assert_eq!(
+            d.modifier_keys_by_source.get(&source_b),
+            Some(&HashSet::from([LINUX_KEY_LEFTCTRL])),
+        );
     }
 }

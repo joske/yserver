@@ -3,27 +3,25 @@
 //! The thread owns the `SendContext` and an `epoll` set wrapping the
 //! libinput fd. Each batch of `crate::input::InputEvent`s gets mapped
 //! to `HostInputEvent`s and pushed onto the core's message channel.
-//! Consecutive `PointerMotion` events are coalesced — at most one
-//! motion stays in flight to the core at any given moment, and the
-//! latest position wins. Buttons and keys are never coalesced and
-//! flush any pending motion immediately.
+//! Consecutive `PointerMotion` events from the same origin and motion mode
+//! are coalesced — at most one compatible motion stays in flight to the core
+//! at any given moment. Deltas sum, while the latest absolute position wins.
+//! Buttons and keys are never coalesced and flush any pending motion
+//! immediately.
 //!
-//! Cursor accumulation lives on this thread (relative deltas + clamped
-//! absolute mappings). The backend keeps its own cursor mirror updated
-//! when it receives `HostInputEvent::PointerMotion`. A brief skew is
-//! tolerable.
+//! Absolute-device mapping and the current virtual framebuffer extent live
+//! on this thread. Physical relative motion carries its fractional delta to
+//! KMS, which integrates it against the authoritative cursor position.
 //!
 //! Spec: `docs/superpowers/specs/2026-05-05-single-threaded-core-design.md`
 //! Plan: `docs/superpowers/plans/2026-05-06-single-threaded-core.md` §E2.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     io,
     os::fd::{AsFd, AsRawFd},
-    sync::{
-        Mutex,
-        atomic::{AtomicU8, Ordering},
-    },
+    sync::Mutex,
+    time::Instant,
 };
 
 #[cfg(target_os = "linux")]
@@ -33,11 +31,14 @@ use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 use nix::sys::eventfd::{EfdFlags, EventFd};
 use yserver_core::{
     core_loop::{
-        CoreSender, HostInputEvent, Message, SYNTH_SCROLL_DOWN, SYNTH_SCROLL_LEFT,
+        CoreSender, HostInputEvent, InputOrigin, Message, SYNTH_SCROLL_DOWN, SYNTH_SCROLL_LEFT,
         SYNTH_SCROLL_RIGHT, SYNTH_SCROLL_UP,
     },
     host_x11::HostKeyEvent,
-    xinput::libinput_props::DeviceConfigChange,
+    xinput::{
+        InputSourceId,
+        libinput_props::{DeviceConfigChange, DeviceConfigError, DeviceConfigToken},
+    },
 };
 
 use crate::input::{
@@ -45,9 +46,9 @@ use crate::input::{
     hotkey::{Hotkey, HotkeyDetector},
 };
 
-/// Cursor accumulator + framebuffer dimensions held on the libinput
-/// thread.
-#[derive(Debug, Clone, Copy)]
+/// Absolute pointer mapping position + framebuffer dimensions held on the
+/// libinput thread.
+#[derive(Debug, Clone)]
 pub struct LibinputThreadState {
     cursor_x: f64,
     cursor_y: f64,
@@ -65,8 +66,7 @@ pub struct LibinputThreadState {
     /// press+release pair each time the absolute accumulator crosses
     /// 120. Sign convention matches libinput: positive Y = scroll down,
     /// positive X = scroll right.
-    scroll_accum_x_v120: i32,
-    scroll_accum_y_v120: i32,
+    scroll_accum_by_source: HashMap<InputSourceId, (i32, i32)>,
 }
 
 impl LibinputThreadState {
@@ -78,8 +78,7 @@ impl LibinputThreadState {
             fb_w,
             fb_h,
             hotkey: HotkeyDetector::new(),
-            scroll_accum_x_v120: 0,
-            scroll_accum_y_v120: 0,
+            scroll_accum_by_source: HashMap::new(),
         }
     }
 
@@ -91,26 +90,11 @@ impl LibinputThreadState {
     /// Update the virtual framebuffer extent used for pointer clamping.
     ///
     /// Called whenever the logical screen size changes (hotplug or
-    /// `RRSetScreenSize`).  The cursor position is NOT re-clamped here;
-    /// it will be clamped to the new extent on the next motion event.
+    /// `RRSetScreenSize`). The last mapped position is not reclamped here;
+    /// absolute input is mapped against the new extent on the next event.
     pub fn set_extent(&mut self, fb_w: u32, fb_h: u32) {
         self.fb_w = fb_w;
         self.fb_h = fb_h;
-    }
-
-    /// Overwrite the cursor accumulator with an absolute position the core
-    /// thread has authoritatively decided (a `WarpPointer`, a confine
-    /// reclamp, or a pointer-barrier clamp). Clamped to the current extent.
-    ///
-    /// Without this, the input thread keeps accumulating relative deltas
-    /// from its own stale position, so a barrier/confine correction in the
-    /// core would not physically hold — the next delta would march the
-    /// cursor straight back past the wall. The caller MUST also drop any
-    /// coalesced `pending_motion` (see the control-wakeup handler) so a
-    /// stale pre-correction delta isn't replayed after the resync.
-    pub fn set_position(&mut self, x: i32, y: i32) {
-        self.cursor_x = f64::from(x).clamp(0.0, f64::from(self.fb_w).max(1.0) - 1.0);
-        self.cursor_y = f64::from(y).clamp(0.0, f64::from(self.fb_h).max(1.0) - 1.0);
     }
 
     /// Translate one libinput event into a `HostInputEvent`.
@@ -119,7 +103,8 @@ impl LibinputThreadState {
     /// the wall clock.
     pub(crate) fn map(&mut self, ev: InputEvent, time_ms: u32) -> HostInputEvent {
         match ev {
-            InputEvent::KeyPress { keycode } => HostInputEvent::Key(HostKeyEvent {
+            InputEvent::KeyPress { source_id, keycode } => HostInputEvent::Key(HostKeyEvent {
+                origin: InputOrigin::Physical(source_id),
                 pressed: true,
                 keycode: ((keycode + 8) & 0xff) as u8,
                 time: time_ms,
@@ -129,7 +114,8 @@ impl LibinputThreadState {
                 event_y: self.cursor_y as i16,
                 state: 0,
             }),
-            InputEvent::KeyRelease { keycode } => HostInputEvent::Key(HostKeyEvent {
+            InputEvent::KeyRelease { source_id, keycode } => HostInputEvent::Key(HostKeyEvent {
+                origin: InputOrigin::Physical(source_id),
                 pressed: false,
                 keycode: ((keycode + 8) & 0xff) as u8,
                 time: time_ms,
@@ -139,12 +125,9 @@ impl LibinputThreadState {
                 event_y: self.cursor_y as i16,
                 state: 0,
             }),
-            InputEvent::PointerMotion { dx, dy } => {
-                self.cursor_x =
-                    (self.cursor_x + dx).clamp(0.0, f64::from(self.fb_w).max(1.0) - 1.0);
-                self.cursor_y =
-                    (self.cursor_y + dy).clamp(0.0, f64::from(self.fb_h).max(1.0) - 1.0);
+            InputEvent::PointerMotion { source_id, dx, dy } => {
                 HostInputEvent::PointerMotion {
+                    origin: InputOrigin::Physical(source_id),
                     x: self.cursor_x as i32,
                     y: self.cursor_y as i32,
                     time: time_ms,
@@ -155,13 +138,19 @@ impl LibinputThreadState {
                     // rounded per-event; acceptable for relative-mode apps.)
                     dx: dx.round() as i32,
                     dy: dy.round() as i32,
+                    motion_delta: Some([dx, dy]),
                 }
             }
-            InputEvent::PointerMotionAbsolute { x_norm, y_norm } => {
+            InputEvent::PointerMotionAbsolute {
+                source_id,
+                x_norm,
+                y_norm,
+            } => {
                 let (old_cx, old_cy) = (self.cursor_x, self.cursor_y);
                 self.cursor_x = x_norm.clamp(0.0, 1.0) * (f64::from(self.fb_w).max(1.0) - 1.0);
                 self.cursor_y = y_norm.clamp(0.0, 1.0) * (f64::from(self.fb_h).max(1.0) - 1.0);
                 HostInputEvent::PointerMotion {
+                    origin: InputOrigin::Physical(source_id),
                     x: self.cursor_x as i32,
                     y: self.cursor_y as i32,
                     time: time_ms,
@@ -171,9 +160,15 @@ impl LibinputThreadState {
                     // absolute-device raw events).
                     dx: (self.cursor_x - old_cx).round() as i32,
                     dy: (self.cursor_y - old_cy).round() as i32,
+                    motion_delta: None,
                 }
             }
-            InputEvent::Button { code, pressed } => HostInputEvent::PointerButton {
+            InputEvent::Button {
+                source_id,
+                code,
+                pressed,
+            } => HostInputEvent::PointerButton {
+                origin: InputOrigin::Physical(source_id),
                 button: u16::try_from(code).unwrap_or(u16::MAX),
                 pressed,
                 time: time_ms,
@@ -182,19 +177,23 @@ impl LibinputThreadState {
             // because it can map to N (≥ 0) press+release pairs depending
             // on accumulated v120. Reaching here means a caller forgot
             // to route it; map to a no-op-ish placeholder.
-            InputEvent::PointerScroll { .. } => HostInputEvent::PointerButton {
+            InputEvent::PointerScroll { source_id, .. } => HostInputEvent::PointerButton {
+                origin: InputOrigin::Physical(source_id),
                 button: u16::MAX,
                 pressed: false,
                 time: time_ms,
             },
             // Handled in process_batch (flushes motion + resets the scroll
             // accumulator) before map() is reached.
-            InputEvent::PointerScrollStop => {
+            InputEvent::PointerScrollStop { .. } => {
                 unreachable!("PointerScrollStop is routed in process_batch before map()")
             }
             // DeviceAdded/Removed are forwarded by process_batch before
             // reaching map(); reaching here is a routing bug, so fail loud.
-            InputEvent::DeviceAdded(_) | InputEvent::DeviceRemoved { .. } => {
+            InputEvent::DeviceAdded(_)
+            | InputEvent::DeviceSuspended { .. }
+            | InputEvent::DeviceResumed(_)
+            | InputEvent::DeviceRemoved { .. } => {
                 unreachable!("device events are forwarded before map(); must not reach map()")
             }
         }
@@ -212,65 +211,56 @@ impl LibinputThreadState {
     /// first then X clicks within a single call.
     pub(crate) fn drain_scroll(
         &mut self,
+        source_id: InputSourceId,
         dx_v120: i32,
         dy_v120: i32,
         time_ms: u32,
         out: &mut Vec<HostInputEvent>,
     ) {
-        self.scroll_accum_x_v120 = self.scroll_accum_x_v120.saturating_add(dx_v120);
-        self.scroll_accum_y_v120 = self.scroll_accum_y_v120.saturating_add(dy_v120);
+        let (accum_x, accum_y) = self.scroll_accum_by_source.entry(source_id).or_default();
+        *accum_x = accum_x.saturating_add(dx_v120);
+        *accum_y = accum_y.saturating_add(dy_v120);
 
         // Vertical first (more common; matches X11 button-4/5 priority).
-        while self.scroll_accum_y_v120 >= Self::V120_PER_CLICK {
-            self.scroll_accum_y_v120 -= Self::V120_PER_CLICK;
-            push_button_click(out, SYNTH_SCROLL_DOWN, time_ms);
+        while *accum_y >= Self::V120_PER_CLICK {
+            *accum_y -= Self::V120_PER_CLICK;
+            push_button_click(out, SYNTH_SCROLL_DOWN, time_ms, source_id);
         }
-        while self.scroll_accum_y_v120 <= -Self::V120_PER_CLICK {
-            self.scroll_accum_y_v120 += Self::V120_PER_CLICK;
-            push_button_click(out, SYNTH_SCROLL_UP, time_ms);
+        while *accum_y <= -Self::V120_PER_CLICK {
+            *accum_y += Self::V120_PER_CLICK;
+            push_button_click(out, SYNTH_SCROLL_UP, time_ms, source_id);
         }
-        while self.scroll_accum_x_v120 >= Self::V120_PER_CLICK {
-            self.scroll_accum_x_v120 -= Self::V120_PER_CLICK;
-            push_button_click(out, SYNTH_SCROLL_RIGHT, time_ms);
+        while *accum_x >= Self::V120_PER_CLICK {
+            *accum_x -= Self::V120_PER_CLICK;
+            push_button_click(out, SYNTH_SCROLL_RIGHT, time_ms, source_id);
         }
-        while self.scroll_accum_x_v120 <= -Self::V120_PER_CLICK {
-            self.scroll_accum_x_v120 += Self::V120_PER_CLICK;
-            push_button_click(out, SYNTH_SCROLL_LEFT, time_ms);
+        while *accum_x <= -Self::V120_PER_CLICK {
+            *accum_x += Self::V120_PER_CLICK;
+            push_button_click(out, SYNTH_SCROLL_LEFT, time_ms, source_id);
         }
     }
 }
 
-#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InputThreadCommand {
-    Pause = 1,
-    Resume = 2,
-}
-
-impl InputThreadCommand {
-    fn from_raw(raw: u8) -> Option<Self> {
-        match raw {
-            1 => Some(Self::Pause),
-            2 => Some(Self::Resume),
-            _ => None,
-        }
-    }
+    Pause,
+    Resume,
 }
 
 /// Direct-mode input-thread control channel.
 ///
 /// Carries three kinds of message to the input thread, multiplexed on a
-/// single `eventfd` wakeup: the latched pause/resume `command` (for
-/// VT-switch suspend/resume), a queue of `configs` — client
-/// `xinput set-prop` device-config writes that must be applied on the
+/// single `eventfd` wakeup: the FIFO pause/resume `commands` (for
+/// VT-switch suspend/resume), a queue of `configs` — source-targeted
+/// client `xinput set-prop` device-config writes that must be applied on the
 /// thread that owns the libinput handles, and a
 /// latched `pending_resize` — the latest virtual framebuffer extent to
-/// apply to the cursor accumulator (only the newest value matters, so
+/// apply to the absolute-device mapping extent (only the newest value matters, so
 /// this uses a pair of atomics rather than a queue).
 #[derive(Debug)]
 pub(crate) struct InputThreadControl {
-    command: AtomicU8,
-    configs: Mutex<VecDeque<(String, DeviceConfigChange)>>,
+    commands: Mutex<VecDeque<InputThreadCommand>>,
+    configs: Mutex<VecDeque<(DeviceConfigToken, InputSourceId, DeviceConfigChange)>>,
     efd: EventFd,
     /// Latched pending resize. Written by the core thread via
     /// `push_resize`; read+cleared by the input thread via `take_resize`.
@@ -281,13 +271,6 @@ pub(crate) struct InputThreadControl {
     /// against a wrong extent. The resize path is rare (resize/hotplug),
     /// so the lock cost is irrelevant.
     pending_resize: Mutex<Option<(u32, u32)>>,
-    /// Latched pending absolute cursor position. Written by the core
-    /// thread via `push_position` after a `WarpPointer` / confine reclamp /
-    /// pointer-barrier clamp; read+cleared by the input thread via
-    /// `take_position`, which overwrites its cursor accumulator and drops
-    /// the coalesced motion. `Mutex<Option<(i32,i32)>>` mirrors
-    /// `pending_resize`: only the newest position matters.
-    pending_position: Mutex<Option<(i32, i32)>>,
 }
 
 impl InputThreadControl {
@@ -295,23 +278,31 @@ impl InputThreadControl {
         let efd = EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK | EfdFlags::EFD_CLOEXEC)
             .map_err(|e| io::Error::other(format!("InputThreadControl eventfd: {e}")))?;
         Ok(Self {
-            command: AtomicU8::new(0),
+            commands: Mutex::new(VecDeque::new()),
             configs: Mutex::new(VecDeque::new()),
             efd,
             pending_resize: Mutex::new(None),
-            pending_position: Mutex::new(None),
         })
     }
 
     pub(crate) fn pause(&self) {
-        self.command
-            .store(InputThreadCommand::Pause as u8, Ordering::Release);
-        self.wake();
+        self.enqueue(InputThreadCommand::Pause);
     }
 
     pub(crate) fn resume(&self) {
-        self.command
-            .store(InputThreadCommand::Resume as u8, Ordering::Release);
+        self.enqueue(InputThreadCommand::Resume);
+    }
+
+    fn enqueue(&self, command: InputThreadCommand) {
+        let mut queue = match self.commands.lock() {
+            Ok(queue) => queue,
+            Err(poisoned) => {
+                log::error!("InputThreadControl: command queue mutex poisoned; recovering it");
+                poisoned.into_inner()
+            }
+        };
+        queue.push_back(command);
+        drop(queue);
         self.wake();
     }
 
@@ -319,9 +310,14 @@ impl InputThreadControl {
     /// own libinput device map. Async by nature: the apply (and any
     /// libinput rejection) happens on the next thread wakeup, so callers
     /// cannot observe the result here.
-    pub(crate) fn push_config(&self, device_node: String, change: DeviceConfigChange) {
+    pub(crate) fn push_config(
+        &self,
+        token: DeviceConfigToken,
+        source: InputSourceId,
+        change: DeviceConfigChange,
+    ) {
         if let Ok(mut q) = self.configs.lock() {
-            q.push_back((device_node, change));
+            q.push_back((token, source, change));
         }
         self.wake();
     }
@@ -330,16 +326,25 @@ impl InputThreadControl {
         self.efd.as_fd().as_raw_fd()
     }
 
-    pub(crate) fn drain(&self) -> Option<InputThreadCommand> {
+    pub(crate) fn drain(&self) -> Vec<InputThreadCommand> {
         let _ = self.efd.read();
-        InputThreadCommand::from_raw(self.command.swap(0, Ordering::AcqRel))
+        let mut queue = match self.commands.lock() {
+            Ok(queue) => queue,
+            Err(poisoned) => {
+                log::error!("InputThreadControl: command queue mutex poisoned; recovering it");
+                poisoned.into_inner()
+            }
+        };
+        queue.drain(..).collect()
     }
 
     /// Drain all queued device-config writes. The eventfd is consumed by
     /// [`drain`]; this only empties the config queue, so the caller must
     /// invoke it on every control wakeup (a config-only push latches no
     /// `command`, so `drain` alone would skip it).
-    pub(crate) fn take_configs(&self) -> Vec<(String, DeviceConfigChange)> {
+    pub(crate) fn take_configs(
+        &self,
+    ) -> Vec<(DeviceConfigToken, InputSourceId, DeviceConfigChange)> {
         self.configs
             .lock()
             .map(|mut q| q.drain(..).collect())
@@ -347,7 +352,7 @@ impl InputThreadControl {
     }
 
     /// Push a new virtual framebuffer extent to the input thread so its
-    /// cursor accumulator clamps to the correct range after a resize or
+    /// absolute-device mapping uses the correct range after a resize or
     /// hotplug.  Only the latest value matters; subsequent calls before
     /// the thread drains the event overwrite the previous value.
     ///
@@ -374,25 +379,6 @@ impl InputThreadControl {
             .and_then(|mut slot| slot.take())
     }
 
-    /// Push an absolute cursor position to the input thread so its
-    /// accumulator resyncs after a core-side `WarpPointer` / confine
-    /// reclamp / pointer-barrier clamp. Only the latest value matters.
-    pub(crate) fn push_position(&self, x: i32, y: i32) {
-        if let Ok(mut slot) = self.pending_position.lock() {
-            *slot = Some((x, y));
-        }
-        self.wake();
-    }
-
-    /// Read and clear any pending position pushed by [`push_position`].
-    /// Called on the input thread inside the control-wakeup handler.
-    pub(crate) fn take_position(&self) -> Option<(i32, i32)> {
-        self.pending_position
-            .lock()
-            .ok()
-            .and_then(|mut slot| slot.take())
-    }
-
     fn wake(&self) {
         loop {
             match self.efd.write(1) {
@@ -407,13 +393,20 @@ impl InputThreadControl {
     }
 }
 
-fn push_button_click(out: &mut Vec<HostInputEvent>, button: u16, time_ms: u32) {
+fn push_button_click(
+    out: &mut Vec<HostInputEvent>,
+    button: u16,
+    time_ms: u32,
+    source_id: InputSourceId,
+) {
     out.push(HostInputEvent::PointerButton {
+        origin: InputOrigin::Physical(source_id),
         button,
         pressed: true,
         time: time_ms,
     });
     out.push(HostInputEvent::PointerButton {
+        origin: InputOrigin::Physical(source_id),
         button,
         pressed: false,
         time: time_ms,
@@ -492,27 +485,53 @@ pub fn process_batch(
         // Device add/remove are forwarded directly — they carry their
         // own data and bypass the motion/scroll mapping entirely.
         // Flush any pending motion first to preserve chronological order.
-        if let InputEvent::DeviceAdded(info) = raw {
-            if let Some(m) = pending_motion.take() {
-                sender.send(Message::HostInput(m))?;
+        match raw {
+            InputEvent::DeviceAdded(info) => {
+                if let Some(m) = pending_motion.take() {
+                    sender.send(Message::HostInput(m))?;
+                }
+                sender.send(Message::HostInput(HostInputEvent::DeviceAdded(info)))?;
+                continue;
             }
-            sender.send(Message::HostInput(HostInputEvent::DeviceAdded(info)))?;
-            continue;
-        }
-        if let InputEvent::DeviceRemoved { device_node } = raw {
-            if let Some(m) = pending_motion.take() {
-                sender.send(Message::HostInput(m))?;
+            InputEvent::DeviceResumed(info) => {
+                if let Some(m) = pending_motion.take() {
+                    sender.send(Message::HostInput(m))?;
+                }
+                sender.send(Message::HostInput(HostInputEvent::DeviceResumed(info)))?;
+                continue;
             }
-            sender.send(Message::HostInput(HostInputEvent::DeviceRemoved {
-                device_node,
-            }))?;
-            continue;
+            InputEvent::DeviceSuspended { source_id } => {
+                if let Some(m) = pending_motion.take() {
+                    sender.send(Message::HostInput(m))?;
+                }
+                state.scroll_accum_by_source.remove(&source_id);
+                sender.send(Message::HostInput(HostInputEvent::DeviceSuspended {
+                    source_id,
+                }))?;
+                continue;
+            }
+            InputEvent::DeviceRemoved { source_id } => {
+                if let Some(m) = pending_motion.take() {
+                    sender.send(Message::HostInput(m))?;
+                }
+                state.scroll_accum_by_source.remove(&source_id);
+                sender.send(Message::HostInput(HostInputEvent::DeviceRemoved {
+                    source_id,
+                }))?;
+                continue;
+            }
+            _ => {}
         }
         // Scroll fans out separately because one InputEvent may map to
         // zero or many press+release pairs depending on accumulated v120.
-        if let InputEvent::PointerScroll { dx_v120, dy_v120 } = raw {
+        if let InputEvent::PointerScroll {
+            source_id,
+            dx_v120,
+            dy_v120,
+        } = raw
+        {
             scroll_buf.clear();
-            state.drain_scroll(dx_v120, dy_v120, time_ms, &mut scroll_buf);
+            state.drain_scroll(source_id, dx_v120, dy_v120, time_ms, &mut scroll_buf);
             if !scroll_buf.is_empty() {
                 if let Some(m) = pending_motion.take() {
                     sender.send(Message::HostInput(m))?;
@@ -528,13 +547,13 @@ pub fn process_batch(
         // forward the stop so the backend emits a delta-0 XI2 scroll motion.
         // GDK reads that as `scroll.is_stop`, which commits a Firefox
         // history-swipe (bug 1539730).
-        if matches!(raw, InputEvent::PointerScrollStop) {
-            state.scroll_accum_x_v120 = 0;
-            state.scroll_accum_y_v120 = 0;
+        if let InputEvent::PointerScrollStop { source_id } = raw {
+            state.scroll_accum_by_source.remove(&source_id);
             if let Some(m) = pending_motion.take() {
                 sender.send(Message::HostInput(m))?;
             }
             sender.send(Message::HostInput(HostInputEvent::PointerScrollStop {
+                origin: InputOrigin::Physical(source_id),
                 time: time_ms,
             }))?;
             continue;
@@ -548,23 +567,59 @@ pub fn process_batch(
                 relative,
                 dx,
                 dy,
+                origin,
+                motion_delta,
             } => {
-                // Coalesce consecutive motions: keep the latest absolute
-                // position, but SUM the raw relative deltas so XI2 RawMotion
-                // doesn't lose distance when merged into one event.
-                let (sum_dx, sum_dy) = match pending_motion.as_ref() {
-                    Some(HostInputEvent::PointerMotion {
-                        dx: pdx, dy: pdy, ..
-                    }) => (dx + pdx, dy + pdy),
-                    _ => (dx, dy),
+                // Coalesce only within one producer and motion mode. Keep
+                // the latest absolute position while preserving both raw
+                // integer deltas and the fractional physical delta.
+                let compatible = pending_motion.as_ref().is_some_and(|pending| {
+                    matches!(pending,
+                        HostInputEvent::PointerMotion {
+                            origin: pending_origin,
+                            relative: pending_relative,
+                            motion_delta: pending_delta,
+                            ..
+                        } if *pending_origin == origin
+                            && *pending_relative == relative
+                            && pending_delta.is_some() == motion_delta.is_some())
+                });
+                let (sum_dx, sum_dy, sum_motion_delta) = if compatible {
+                    let Some(HostInputEvent::PointerMotion {
+                        dx: previous_dx,
+                        dy: previous_dy,
+                        motion_delta: previous_delta,
+                        ..
+                    }) = pending_motion.as_ref()
+                    else {
+                        unreachable!("compatible pending motion must be a motion")
+                    };
+                    (
+                        dx + previous_dx,
+                        dy + previous_dy,
+                        match (previous_delta, motion_delta) {
+                            (Some(previous), Some(current)) => {
+                                Some([previous[0] + current[0], previous[1] + current[1]])
+                            }
+                            (None, None) => None,
+                            _ => unreachable!("compatible motion deltas have matching modes"),
+                        },
+                    )
+                } else {
+                    if let Some(m) = pending_motion.take() {
+                        sender.send(Message::HostInput(m))?;
+                    }
+                    (dx, dy, motion_delta)
                 };
                 *pending_motion = Some(HostInputEvent::PointerMotion {
+                    origin,
                     x,
                     y,
                     time,
                     relative,
                     dx: sum_dx,
                     dy: sum_dy,
+                    motion_delta: sum_motion_delta,
                 });
             }
             non_motion => {
@@ -576,6 +631,10 @@ pub fn process_batch(
         }
     }
     Ok(())
+}
+
+fn reset_hotkeys_after_vt_pause(state: &mut LibinputThreadState) {
+    state.hotkey.reset();
 }
 
 /// Long-running libinput thread body. Owns `input_ctx`, drives an
@@ -709,6 +768,8 @@ pub(crate) fn run(
     // would block until unrelated input arrives. While armed, give the poller
     // a ~250ms timeout so we re-dispatch and complete the deferred open.
     let mut hotplug_retry_until: Option<std::time::Instant> = None;
+    let mut resume_retry_window: Option<(crate::input::context::ResumeWindowToken, Instant)> = None;
+    let mut waiting_device_configs = VecDeque::new();
 
     // Platform-specific event buffer.
     #[cfg(target_os = "linux")]
@@ -727,21 +788,36 @@ pub(crate) fn run(
     ];
 
     loop {
+        finish_expired_resume_window(
+            &mut input_ctx,
+            &mut resume_retry_window,
+            &mut state,
+            &sender,
+            &mut pending_motion,
+            &mut waiting_device_configs,
+        )?;
+        if hotplug_retry_until.is_some_and(|until| Instant::now() >= until) {
+            hotplug_retry_until = None;
+        }
         // --- poll wait ---
         let (got_control, got_leds);
 
+        let poll_until = match (hotplug_retry_until, resume_retry_window) {
+            (Some(hotplug), Some((_, resume))) => Some(hotplug.max(resume)),
+            (Some(hotplug), None) => Some(hotplug),
+            (None, Some((_, resume))) => Some(resume),
+            (None, None) => None,
+        };
+
         #[cfg(target_os = "linux")]
         {
-            let timeout = match hotplug_retry_until {
+            let timeout = match poll_until {
                 Some(until) => {
                     let now = std::time::Instant::now();
-                    if now >= until {
-                        hotplug_retry_until = None;
-                        EpollTimeout::NONE
-                    } else {
-                        let ms = u16::try_from((until - now).as_millis().min(250)).unwrap_or(250);
-                        EpollTimeout::from(ms.max(1))
-                    }
+                    let ms =
+                        u16::try_from(until.saturating_duration_since(now).as_millis().min(250))
+                            .unwrap_or(250);
+                    EpollTimeout::from(ms.max(1))
                 }
                 None => EpollTimeout::NONE,
             };
@@ -760,20 +836,15 @@ pub(crate) fn run(
 
         #[cfg(target_os = "freebsd")]
         {
-            let timeout = match hotplug_retry_until {
+            let timeout = match poll_until {
                 Some(until) => {
                     let now = std::time::Instant::now();
-                    if now >= until {
-                        hotplug_retry_until = None;
-                        None
-                    } else {
-                        let dur = until - now;
-                        let ms = dur.as_millis().min(250) as i64;
-                        Some(libc::timespec {
-                            tv_sec: ms / 1000,
-                            tv_nsec: (ms % 1000) * 1_000_000,
-                        })
-                    }
+                    let dur = until.saturating_duration_since(now);
+                    let ms = dur.as_millis().min(250) as i64;
+                    Some(libc::timespec {
+                        tv_sec: ms / 1000,
+                        tv_nsec: (ms % 1000) * 1_000_000,
+                    })
                 }
                 None => None,
             };
@@ -794,53 +865,83 @@ pub(crate) fn run(
 
         // --- common dispatch (platform-independent) ---
         if got_control {
-            let command = control.drain();
-            for (node, change) in control.take_configs() {
-                if let Err(err) = input_ctx.apply_device_config(&node, change) {
-                    log::debug!(
-                        "input thread: apply_device_config({node}) rejected by \
-                         libinput: {err:?}"
-                    );
-                }
-            }
+            let commands = control.drain();
+            process_config_commands(
+                control.take_configs(),
+                &sender,
+                &mut waiting_device_configs,
+                |source, change| {
+                    let result = input_ctx.apply_device_config(source, change);
+                    let may_wait = matches!(result, Err(DeviceConfigError::SourceGone))
+                        && input_ctx.can_wait_for_device_config(source);
+                    (result, may_wait)
+                },
+            )?;
             if let Some((fw, fh)) = control.take_resize() {
                 log::debug!("input thread: updating cursor extent to {fw}×{fh}");
                 state.set_extent(fw, fh);
             }
-            if let Some((px, py)) = control.take_position() {
-                // Core-authoritative resync (warp / confine / barrier clamp).
-                // Overwrite the accumulator AND drop any coalesced motion —
-                // otherwise a stale pre-clamp delta replays after the
-                // correction and drives the cursor back across the barrier.
-                log::debug!("input thread: resync cursor to ({px}, {py})");
-                state.set_position(px, py);
-                pending_motion = None;
-            }
-            if let Some(command) = command {
+            for command in commands {
                 paused = match command {
                     InputThreadCommand::Pause if !paused => {
-                        input_ctx.suspend();
+                        if let Some(m) = pending_motion.take() {
+                            sender.send(Message::HostInput(m))?;
+                        }
+                        let events = input_ctx.suspend();
+                        process_batch(
+                            &mut state,
+                            &sender,
+                            &mut pending_motion,
+                            events,
+                            current_time_ms(),
+                        )?;
+                        if let Some(m) = pending_motion.take() {
+                            sender.send(Message::HostInput(m))?;
+                        }
+                        resume_retry_window = None;
+                        hotplug_retry_until = None;
                         pending_motion = None;
-                        state.hotkey.reset();
+                        reset_hotkeys_after_vt_pause(&mut state);
                         true
                     }
                     InputThreadCommand::Resume if paused => match input_ctx.resume() {
-                        Ok(()) => {
+                        Ok(events) => {
+                            resume_retry_window = input_ctx.resume_window();
+                            hotplug_retry_until = resume_retry_window.map(|(_, deadline)| deadline);
+                            // Context::resume performs the initial libinput
+                            // dispatch internally. If that dispatch returned
+                            // after the fixed continuation deadline, retire
+                            // unmatched sources before forwarding its batch.
+                            finish_expired_resume_window(
+                                &mut input_ctx,
+                                &mut resume_retry_window,
+                                &mut state,
+                                &sender,
+                                &mut pending_motion,
+                                &mut waiting_device_configs,
+                            )?;
                             state.hotkey.reset();
-                            let _ = input_ctx.dispatch();
-                            for kc in [37u8, 105, 64, 108, 50, 62, 133, 134] {
-                                let _ = sender.send(Message::HostInput(HostInputEvent::Key(
-                                    HostKeyEvent {
-                                        pressed: false,
-                                        keycode: kc,
-                                        time: current_time_ms(),
-                                        root_x: state.cursor_x as i16,
-                                        root_y: state.cursor_y as i16,
-                                        event_x: state.cursor_x as i16,
-                                        event_y: state.cursor_y as i16,
-                                        state: 0,
-                                    },
-                                )));
+                            let lifecycle_events = snapshot_lifecycle_events_for_waiters(
+                                &waiting_device_configs,
+                                &events,
+                            );
+                            process_batch(
+                                &mut state,
+                                &sender,
+                                &mut pending_motion,
+                                events,
+                                current_time_ms(),
+                            )?;
+                            if let Some(lifecycle_events) = lifecycle_events {
+                                service_waiting_device_configs(
+                                    &sender,
+                                    &mut waiting_device_configs,
+                                    &lifecycle_events,
+                                    |source, change| input_ctx.apply_device_config(source, change),
+                                )?;
+                            }
+                            if let Some(m) = pending_motion.take() {
+                                sender.send(Message::HostInput(m))?;
                             }
                             false
                         }
@@ -858,6 +959,15 @@ pub(crate) fn run(
             input_ctx.update_leds(leds);
         }
 
+        finish_expired_resume_window(
+            &mut input_ctx,
+            &mut resume_retry_window,
+            &mut state,
+            &sender,
+            &mut pending_motion,
+            &mut waiting_device_configs,
+        )?;
+
         if !should_dispatch_batch(paused) {
             let _ = input_ctx.dispatch();
             continue;
@@ -871,14 +981,33 @@ pub(crate) fn run(
             }
         };
 
+        finish_expired_resume_window(
+            &mut input_ctx,
+            &mut resume_retry_window,
+            &mut state,
+            &sender,
+            &mut pending_motion,
+            &mut waiting_device_configs,
+        )?;
+
         let device_change = events.iter().any(|e| {
             matches!(
                 e,
                 InputEvent::DeviceAdded(_) | InputEvent::DeviceRemoved { .. }
             )
         });
+        let lifecycle_events =
+            snapshot_lifecycle_events_for_waiters(&waiting_device_configs, &events);
         let time_ms = current_time_ms();
         process_batch(&mut state, &sender, &mut pending_motion, events, time_ms)?;
+        if let Some(lifecycle_events) = lifecycle_events {
+            service_waiting_device_configs(
+                &sender,
+                &mut waiting_device_configs,
+                &lifecycle_events,
+                |source, change| input_ctx.apply_device_config(source, change),
+            )?;
+        }
         if device_change {
             hotplug_retry_until =
                 Some(std::time::Instant::now() + std::time::Duration::from_millis(2500));
@@ -893,6 +1022,119 @@ fn should_dispatch_batch(paused: bool) -> bool {
     !paused
 }
 
+fn finish_expired_resume_window(
+    input_ctx: &mut SendContext,
+    window: &mut Option<(crate::input::context::ResumeWindowToken, Instant)>,
+    state: &mut LibinputThreadState,
+    sender: &CoreSender,
+    pending_motion: &mut Option<HostInputEvent>,
+    waiting_device_configs: &mut VecDeque<(DeviceConfigToken, InputSourceId, DeviceConfigChange)>,
+) -> io::Result<()> {
+    let Some((token, deadline)) = *window else {
+        return Ok(());
+    };
+    let now = Instant::now();
+    if now < deadline {
+        return Ok(());
+    }
+    let events = input_ctx.finish_resume_window(token, now);
+    *window = None;
+    let lifecycle_events = snapshot_lifecycle_events_for_waiters(waiting_device_configs, &events);
+    process_batch(state, sender, pending_motion, events, current_time_ms())?;
+    if let Some(lifecycle_events) = lifecycle_events {
+        service_waiting_device_configs(
+            sender,
+            waiting_device_configs,
+            &lifecycle_events,
+            |source, change| input_ctx.apply_device_config(source, change),
+        )?;
+    }
+    if let Some(motion) = pending_motion.take() {
+        sender.send(Message::HostInput(motion))?;
+    }
+    Ok(())
+}
+
+fn process_config_commands(
+    configs: Vec<(DeviceConfigToken, InputSourceId, DeviceConfigChange)>,
+    sender: &CoreSender,
+    waiting: &mut VecDeque<(DeviceConfigToken, InputSourceId, DeviceConfigChange)>,
+    mut apply: impl FnMut(InputSourceId, DeviceConfigChange) -> (Result<(), DeviceConfigError>, bool),
+) -> io::Result<()> {
+    for (token, source, change) in configs {
+        let (result, may_wait) = apply(source, change);
+        match result {
+            Ok(()) => sender.send(Message::DeviceConfigResult {
+                token,
+                source,
+                result: Ok(()),
+            })?,
+            Err(DeviceConfigError::SourceGone) if may_wait => {
+                waiting.push_back((token, source, change));
+            }
+            Err(error) => sender.send(Message::DeviceConfigResult {
+                token,
+                source,
+                result: Err(error),
+            })?,
+        }
+    }
+    Ok(())
+}
+
+fn service_waiting_device_configs(
+    sender: &CoreSender,
+    waiting: &mut VecDeque<(DeviceConfigToken, InputSourceId, DeviceConfigChange)>,
+    lifecycle_events: &[InputEvent],
+    mut apply: impl FnMut(InputSourceId, DeviceConfigChange) -> Result<(), DeviceConfigError>,
+) -> io::Result<()> {
+    let mut resumed = std::collections::HashSet::new();
+    let mut removed = std::collections::HashSet::new();
+    for event in lifecycle_events {
+        match event {
+            InputEvent::DeviceResumed(info) => {
+                resumed.insert(info.source_id);
+            }
+            InputEvent::DeviceRemoved { source_id } => {
+                removed.insert(*source_id);
+            }
+            _ => {}
+        }
+    }
+    if resumed.is_empty() && removed.is_empty() {
+        return Ok(());
+    }
+
+    let mut remaining = VecDeque::new();
+    while let Some((token, source, change)) = waiting.pop_front() {
+        if removed.contains(&source) {
+            sender.send(Message::DeviceConfigResult {
+                token,
+                source,
+                result: Err(DeviceConfigError::SourceGone),
+            })?;
+        } else if resumed.contains(&source) {
+            let result = apply(source, change);
+            sender.send(Message::DeviceConfigResult {
+                token,
+                source,
+                result,
+            })?;
+        } else {
+            remaining.push_back((token, source, change));
+        }
+    }
+    *waiting = remaining;
+    Ok(())
+}
+
+fn snapshot_lifecycle_events_for_waiters(
+    waiting: &VecDeque<(DeviceConfigToken, InputSourceId, DeviceConfigChange)>,
+    events: &[InputEvent],
+) -> Option<Vec<InputEvent>> {
+    (!waiting.is_empty()).then(|| events.to_vec())
+}
+
 fn current_time_ms() -> u32 {
     crate::clock::server_time_ms()
 }
@@ -900,19 +1142,41 @@ fn current_time_ms() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resumed_info(source_id: InputSourceId) -> yserver_core::core_loop::DeviceInfo {
+        yserver_core::core_loop::DeviceInfo {
+            source_id,
+            enabled: true,
+            resume_key: None,
+            capabilities: yserver_core::xinput::InputCapabilities {
+                pointer: true,
+                ..Default::default()
+            },
+            name: "test pointer".into(),
+            device_node: "/dev/input/event99".into(),
+            sysname: "event99".into(),
+            vendor_id: 1,
+            product_id: 2,
+            is_touchpad: false,
+            config: Default::default(),
+        }
+    }
     use crate::input::hotkey::{
         LINUX_KEY_BACKSPACE, LINUX_KEY_ENTER, LINUX_KEY_F12, LINUX_KEY_LEFTALT, LINUX_KEY_LEFTCTRL,
         LINUX_KEY_RIGHTALT, LINUX_KEY_RIGHTCTRL,
     };
-    use yserver_core::core_loop::channel;
+    use yserver_core::{core_loop::channel, xinput::InputSourceId};
+
+    const TEST_SOURCE_ID: InputSourceId = InputSourceId(1);
 
     #[test]
-    fn maps_relative_motion_to_clamped_absolute() {
+    fn maps_relative_motion_without_cursor_accumulation() {
         let mut s = LibinputThreadState::new(800, 600);
         // Center: (400, 300)
         assert_eq!(s.cursor(), (400.0, 300.0));
         let ev = s.map(
             InputEvent::PointerMotion {
+                source_id: TEST_SOURCE_ID,
                 dx: 50.0,
                 dy: -100.0,
             },
@@ -920,34 +1184,54 @@ mod tests {
         );
         assert!(matches!(
             ev,
-            HostInputEvent::PointerMotion { x: 450, y: 200, .. }
+            HostInputEvent::PointerMotion {
+                x: 400,
+                y: 300,
+                relative: true,
+                dx: 50,
+                dy: -100,
+                motion_delta: Some([50.0, -100.0]),
+                ..
+            }
         ));
-        // Walk past the right edge — clamps to fb_w-1.
-        let _ = s.map(
+        // A large relative move is passed through without making the input
+        // thread a second cursor authority or clamping the physical delta.
+        let large = s.map(
             InputEvent::PointerMotion {
+                source_id: TEST_SOURCE_ID,
                 dx: 1000.0,
                 dy: 0.0,
             },
             0,
         );
-        let (cx, _) = s.cursor();
-        assert!((cx - 799.0).abs() < 0.5, "cursor_x = {cx}");
+        assert!(matches!(
+            large,
+            HostInputEvent::PointerMotion {
+                x: 400,
+                y: 300,
+                dx: 1000,
+                motion_delta: Some([1000.0, 0.0]),
+                ..
+            }
+        ));
+        assert_eq!(s.cursor(), (400.0, 300.0));
     }
 
-    /// After `set_extent` is called with the new virtual screen size, the
-    /// cursor accumulator must allow motion past the *old* right edge.
+    /// After `set_extent` is called with the new virtual screen size, absolute
+    /// device mapping must cover the *new* virtual extent.
     /// Regression guard for the 2-monitor hotplug bug: boot on a single
     /// 2560-wide screen, plug in a second screen → virtual width becomes
     /// 5120; cursor was stuck at x=2559 until the server restarted.
     #[test]
-    fn set_extent_allows_motion_past_old_right_edge() {
+    fn set_extent_updates_absolute_mapping_past_old_right_edge() {
         // Boot on a single 2560×1440 display.
         let mut s = LibinputThreadState::new(2560, 1440);
-        // Walk cursor to the right edge of the single-monitor boot extent.
+        // An absolute event reaches the right edge of the single-monitor extent.
         let _ = s.map(
-            InputEvent::PointerMotion {
-                dx: 10000.0,
-                dy: 0.0,
+            InputEvent::PointerMotionAbsolute {
+                source_id: TEST_SOURCE_ID,
+                x_norm: 1.0,
+                y_norm: 0.5,
             },
             0,
         );
@@ -962,9 +1246,10 @@ mod tests {
 
         // Move right: must now cross 2560 and reach the new far edge.
         let ev = s.map(
-            InputEvent::PointerMotion {
-                dx: 1000.0,
-                dy: 0.0,
+            InputEvent::PointerMotionAbsolute {
+                source_id: TEST_SOURCE_ID,
+                x_norm: 0.8,
+                y_norm: 0.5,
             },
             0,
         );
@@ -982,11 +1267,12 @@ mod tests {
             other => panic!("expected PointerMotion, got {other:?}"),
         }
 
-        // Walk all the way to the new right edge.
+        // Absolute devices map to the full new extent.
         let _ = s.map(
-            InputEvent::PointerMotion {
-                dx: 10000.0,
-                dy: 0.0,
+            InputEvent::PointerMotionAbsolute {
+                source_id: TEST_SOURCE_ID,
+                x_norm: 1.0,
+                y_norm: 0.5,
             },
             0,
         );
@@ -1018,46 +1304,77 @@ mod tests {
         );
     }
 
-    /// `push_position` / `take_position` round-trip (T12 barrier/confine
-    /// resync): deliver the latest position, consume it, latest wins.
     #[test]
-    fn push_position_take_position_round_trip() {
+    fn resize_control_preserves_queued_relative_motion() {
         let ctrl = InputThreadControl::new().expect("control");
-        assert_eq!(ctrl.take_position(), None, "no pending position initially");
-        ctrl.push_position(100, 50);
-        ctrl.push_position(99, 50); // a later clamp overwrites
+        let mut state = LibinputThreadState::new(800, 600);
+        let (poll, sender, rx) = channel().expect("channel");
+        let mut pending = None;
+        process_batch(
+            &mut state,
+            &sender,
+            &mut pending,
+            [InputEvent::PointerMotion {
+                source_id: TEST_SOURCE_ID,
+                dx: 0.4,
+                dy: 0.0,
+            }],
+            0,
+        )
+        .unwrap();
+        ctrl.push_resize(5120, 1440);
         assert_eq!(
-            ctrl.take_position(),
-            Some((99, 50)),
-            "take_position returns the latest pushed position"
+            ctrl.take_resize(),
+            Some((5120, 1440)),
+            "resize control remains available"
         );
-        assert_eq!(ctrl.take_position(), None, "position consumed after take");
+        let Some(HostInputEvent::PointerMotion {
+            x,
+            y,
+            motion_delta: Some([dx, dy]),
+            ..
+        }) = pending
+        else {
+            panic!("relative motion remains pending across resize control");
+        };
+        assert_eq!((x, y), (400, 300));
+        assert!((dx - 0.4).abs() < f64::EPSILON);
+        assert_eq!(dy, 0.0);
+        assert!(rx.try_recv_all().next().is_none());
+        drop(poll);
     }
 
-    /// `set_position` overwrites the accumulator and clamps to the extent,
-    /// so a subsequent relative delta integrates from the corrected base
-    /// (this is what makes a barrier/confine clamp physically hold).
+    /// An absolute/touch event updates the mapped position, while later
+    /// relative input leaves that position alone for KMS to integrate.
     #[test]
-    fn set_position_overwrites_and_clamps_accumulator() {
+    fn absolute_then_relative_mapping_keeps_relative_position_kms_owned() {
         let mut s = LibinputThreadState::new(800, 600);
-        s.set_position(99, 50);
-        assert_eq!(s.cursor(), (99.0, 50.0), "accumulator overwritten");
-        // Out-of-range request clamps to the extent (799×599).
-        s.set_position(10_000, 10_000);
-        assert_eq!(s.cursor(), (799.0, 599.0), "clamped to extent");
-        // A relative delta now integrates from the corrected base, not a
-        // stale position.
+        let absolute = s.map(
+            InputEvent::PointerMotionAbsolute {
+                source_id: TEST_SOURCE_ID,
+                x_norm: 99.0 / 799.0,
+                y_norm: 50.0 / 599.0,
+            },
+            0,
+        );
+        assert!(matches!(
+            absolute,
+            HostInputEvent::PointerMotion { x: 99, y: 50, .. }
+        ));
+        let absolute_position = s.cursor();
         let ev = s.map(
             InputEvent::PointerMotion {
+                source_id: TEST_SOURCE_ID,
                 dx: -100.0,
                 dy: 0.0,
             },
             0,
         );
         match ev {
-            HostInputEvent::PointerMotion { x, .. } => assert_eq!(x, 699),
+            HostInputEvent::PointerMotion { x, y, .. } => assert_eq!((x, y), (99, 50)),
             other => panic!("expected PointerMotion, got {other:?}"),
         }
+        assert_eq!(s.cursor(), absolute_position);
     }
 
     /// Only the latest push_resize survives — older values are overwritten.
@@ -1078,6 +1395,7 @@ mod tests {
         let mut s = LibinputThreadState::new(800, 600);
         let ev = s.map(
             InputEvent::PointerMotionAbsolute {
+                source_id: TEST_SOURCE_ID,
                 x_norm: 0.5,
                 y_norm: 0.25,
             },
@@ -1101,6 +1419,7 @@ mod tests {
         let before = s.cursor();
         let btn = s.map(
             InputEvent::Button {
+                source_id: TEST_SOURCE_ID,
                 code: 0x110,
                 pressed: true,
             },
@@ -1111,6 +1430,7 @@ mod tests {
                 button,
                 pressed,
                 time,
+                ..
             } => {
                 assert_eq!(button, 0x110);
                 assert!(pressed);
@@ -1118,7 +1438,13 @@ mod tests {
             }
             other => panic!("expected PointerButton, got {other:?}"),
         }
-        let key = s.map(InputEvent::KeyPress { keycode: 30 }, 8);
+        let key = s.map(
+            InputEvent::KeyPress {
+                source_id: TEST_SOURCE_ID,
+                keycode: 30,
+            },
+            8,
+        );
         match key {
             HostInputEvent::Key(ev) => {
                 assert!(ev.pressed);
@@ -1139,18 +1465,51 @@ mod tests {
         let mut state = LibinputThreadState::new(800, 600);
         let mut pending: Option<HostInputEvent> = None;
         let batch = vec![
-            InputEvent::PointerMotion { dx: 1.0, dy: 1.0 },
-            InputEvent::PointerMotion { dx: 1.0, dy: 1.0 },
-            InputEvent::PointerMotion { dx: 1.0, dy: 1.0 },
-            InputEvent::PointerMotion { dx: 1.0, dy: 1.0 },
-            InputEvent::PointerMotion { dx: 1.0, dy: 1.0 },
+            InputEvent::PointerMotion {
+                source_id: TEST_SOURCE_ID,
+                dx: 1.0,
+                dy: 1.0,
+            },
+            InputEvent::PointerMotion {
+                source_id: TEST_SOURCE_ID,
+                dx: 1.0,
+                dy: 1.0,
+            },
+            InputEvent::PointerMotion {
+                source_id: TEST_SOURCE_ID,
+                dx: 1.0,
+                dy: 1.0,
+            },
+            InputEvent::PointerMotion {
+                source_id: TEST_SOURCE_ID,
+                dx: 1.0,
+                dy: 1.0,
+            },
+            InputEvent::PointerMotion {
+                source_id: TEST_SOURCE_ID,
+                dx: 1.0,
+                dy: 1.0,
+            },
             InputEvent::Button {
+                source_id: TEST_SOURCE_ID,
                 code: 1,
                 pressed: true,
             },
-            InputEvent::PointerMotion { dx: 1.0, dy: 1.0 },
-            InputEvent::PointerMotion { dx: 1.0, dy: 1.0 },
-            InputEvent::PointerMotion { dx: 1.0, dy: 1.0 },
+            InputEvent::PointerMotion {
+                source_id: TEST_SOURCE_ID,
+                dx: 1.0,
+                dy: 1.0,
+            },
+            InputEvent::PointerMotion {
+                source_id: TEST_SOURCE_ID,
+                dx: 1.0,
+                dy: 1.0,
+            },
+            InputEvent::PointerMotion {
+                source_id: TEST_SOURCE_ID,
+                dx: 1.0,
+                dy: 1.0,
+            },
         ];
         process_batch(&mut state, &sender, &mut pending, batch, 100).unwrap();
         // End-of-batch flush (matches the production loop in `run`).
@@ -1167,13 +1526,15 @@ mod tests {
         );
         // Coalesced raw deltas must SUM (5 motions of dx=dy=1 → 5,5), not
         // collapse to the last one — else XI2 RawMotion loses distance and
-        // SDL2 relative-mouse apps under-track. (#96 follow-up: chromium-bsu)
+        // SDL2 relative-mouse apps under-track. The producer position stays
+        // fixed because KMS integrates physical relative deltas. (#96 follow-up)
         match &collected[0] {
             Message::HostInput(HostInputEvent::PointerMotion {
-                x: 405,
-                y: 305,
+                x: 400,
+                y: 300,
                 dx: 5,
                 dy: 5,
+                motion_delta: Some([5.0, 5.0]),
                 ..
             }) => {}
             other => panic!("first message: {other:?}"),
@@ -1188,16 +1549,67 @@ mod tests {
         }
         match &collected[2] {
             Message::HostInput(HostInputEvent::PointerMotion {
-                x: 408,
-                y: 308,
+                x: 400,
+                y: 300,
                 dx: 3,
                 dy: 3,
+                motion_delta: Some([3.0, 3.0]),
                 ..
             }) => {}
             other => panic!("third message: {other:?}"),
         }
         // Silence unused warning on `poll` — we just need its waker
         // alive for the channel to function.
+        drop(poll);
+    }
+
+    #[test]
+    fn kms_pointer_authority_input_thread_preserves_fractional_relative_motion() {
+        let (poll, sender, rx) = channel().expect("channel");
+        let mut state = LibinputThreadState::new(800, 600);
+        let mut pending: Option<HostInputEvent> = None;
+        process_batch(
+            &mut state,
+            &sender,
+            &mut pending,
+            [0.4, 0.4, 0.4].map(|dx| InputEvent::PointerMotion {
+                source_id: TEST_SOURCE_ID,
+                dx,
+                dy: 0.0,
+            }),
+            100,
+        )
+        .unwrap();
+        if let Some(motion) = pending.take() {
+            sender.send(Message::HostInput(motion)).unwrap();
+        }
+
+        assert_eq!(state.cursor(), (400.0, 300.0));
+        let messages: Vec<Message> = rx.try_recv_all().collect();
+        assert_eq!(messages.len(), 1);
+        match &messages[0] {
+            Message::HostInput(HostInputEvent::PointerMotion {
+                origin,
+                x,
+                y,
+                dx,
+                dy,
+                motion_delta,
+                relative,
+                ..
+            }) => {
+                assert_eq!(*origin, InputOrigin::Physical(TEST_SOURCE_ID));
+                assert_eq!((*x, *y), (400, 300));
+                assert_eq!((*dx, *dy), (0, 0));
+                let Some([motion_dx, motion_dy]) = motion_delta else {
+                    panic!("relative motion must retain the fractional delta");
+                };
+                assert!((*motion_dx - 1.2).abs() < 1e-12);
+                assert_eq!(*motion_dy, 0.0);
+                assert!(*relative);
+            }
+            other => panic!("expected a relative pointer motion, got {other:?}"),
+        }
         drop(poll);
     }
 
@@ -1211,7 +1623,11 @@ mod tests {
             &mut state,
             &sender,
             &mut pending,
-            [InputEvent::PointerMotion { dx: 5.0, dy: 0.0 }],
+            [InputEvent::PointerMotion {
+                source_id: TEST_SOURCE_ID,
+                dx: 5.0,
+                dy: 0.0,
+            }],
             1,
         )
         .unwrap();
@@ -1220,14 +1636,19 @@ mod tests {
         assert!(immediate.is_empty(), "no flush yet, got {immediate:?}");
 
         // Batch B: motion then button — only the latest combined
-        // motion + button get sent.
+        // motion + button get sent, while deltas stay separate from x/y.
         process_batch(
             &mut state,
             &sender,
             &mut pending,
             [
-                InputEvent::PointerMotion { dx: 10.0, dy: 0.0 },
+                InputEvent::PointerMotion {
+                    source_id: TEST_SOURCE_ID,
+                    dx: 10.0,
+                    dy: 0.0,
+                },
                 InputEvent::Button {
+                    source_id: TEST_SOURCE_ID,
                     code: 1,
                     pressed: true,
                 },
@@ -1238,7 +1659,13 @@ mod tests {
         let collected: Vec<Message> = rx.try_recv_all().collect();
         assert_eq!(collected.len(), 2);
         match &collected[0] {
-            Message::HostInput(HostInputEvent::PointerMotion { x: 415, y: 300, .. }) => {}
+            Message::HostInput(HostInputEvent::PointerMotion {
+                x: 400,
+                y: 300,
+                dx: 15,
+                motion_delta: Some([15.0, 0.0]),
+                ..
+            }) => {}
             other => panic!("first message: {other:?}"),
         }
         match &collected[1] {
@@ -1263,18 +1690,22 @@ mod tests {
             &mut pending,
             [
                 InputEvent::KeyPress {
+                    source_id: TEST_SOURCE_ID,
                     keycode: LINUX_KEY_LEFTCTRL,
                 },
                 InputEvent::KeyPress {
+                    source_id: TEST_SOURCE_ID,
                     keycode: LINUX_KEY_LEFTALT,
                 },
                 InputEvent::KeyPress {
+                    source_id: TEST_SOURCE_ID,
                     keycode: LINUX_KEY_BACKSPACE,
                 },
                 // Anything after the zap is dropped — the server is
                 // already shutting down. This press must NOT reach
                 // the core.
                 InputEvent::KeyPress {
+                    source_id: TEST_SOURCE_ID,
                     keycode: 30, /* a */
                 },
             ],
@@ -1309,6 +1740,7 @@ mod tests {
             &sender,
             &mut pending,
             [InputEvent::KeyPress {
+                source_id: TEST_SOURCE_ID,
                 keycode: LINUX_KEY_BACKSPACE,
             }],
             0,
@@ -1333,15 +1765,19 @@ mod tests {
             &mut pending,
             [
                 InputEvent::KeyPress {
+                    source_id: TEST_SOURCE_ID,
                     keycode: LINUX_KEY_LEFTCTRL,
                 },
                 InputEvent::KeyPress {
+                    source_id: TEST_SOURCE_ID,
                     keycode: LINUX_KEY_LEFTALT,
                 },
                 InputEvent::KeyRelease {
+                    source_id: TEST_SOURCE_ID,
                     keycode: LINUX_KEY_LEFTCTRL,
                 },
                 InputEvent::KeyPress {
+                    source_id: TEST_SOURCE_ID,
                     keycode: LINUX_KEY_BACKSPACE,
                 },
             ],
@@ -1367,12 +1803,15 @@ mod tests {
             &mut pending,
             [
                 InputEvent::KeyPress {
+                    source_id: TEST_SOURCE_ID,
                     keycode: LINUX_KEY_RIGHTCTRL,
                 },
                 InputEvent::KeyPress {
+                    source_id: TEST_SOURCE_ID,
                     keycode: LINUX_KEY_RIGHTALT,
                 },
                 InputEvent::KeyPress {
+                    source_id: TEST_SOURCE_ID,
                     keycode: LINUX_KEY_BACKSPACE,
                 },
             ],
@@ -1388,6 +1827,54 @@ mod tests {
     }
 
     #[test]
+    fn vt_pause_clears_hotkeys_without_forwarding_key_releases() {
+        let (poll, sender, rx) = channel().expect("channel");
+        let mut state = LibinputThreadState::new(800, 600);
+        let mut pending: Option<HostInputEvent> = None;
+        let other_source = InputSourceId(2);
+        state.hotkey.check(&InputEvent::KeyPress {
+            source_id: other_source,
+            keycode: LINUX_KEY_LEFTCTRL,
+        });
+        state.hotkey.check(&InputEvent::KeyPress {
+            source_id: other_source,
+            keycode: LINUX_KEY_LEFTALT,
+        });
+
+        process_batch(
+            &mut state,
+            &sender,
+            &mut pending,
+            [InputEvent::DeviceSuspended {
+                source_id: TEST_SOURCE_ID,
+            }],
+            0,
+        )
+        .unwrap();
+        // This is the reset performed by the production Pause command after
+        // forwarding the suspend lifecycle batch.
+        reset_hotkeys_after_vt_pause(&mut state);
+
+        assert_eq!(
+            state.hotkey.check(&InputEvent::KeyPress {
+                source_id: other_source,
+                keycode: 60,
+            }),
+            None,
+            "a bare F2 after VT pause must not inherit Ctrl+Alt",
+        );
+        let messages: Vec<_> = rx.try_recv_all().collect();
+        assert_eq!(messages.len(), 1, "pause only forwards suspend lifecycle");
+        assert!(matches!(
+            messages.as_slice(),
+            [Message::HostInput(HostInputEvent::DeviceSuspended { source_id })]
+                if *source_id == TEST_SOURCE_ID
+        ));
+        assert!(state.scroll_accum_by_source.is_empty());
+        drop(poll);
+    }
+
+    #[test]
     fn ctrl_alt_enter_emits_dump_scanout_and_drops_keypress() {
         let (poll, sender, rx) = channel().expect("channel");
         let mut state = LibinputThreadState::new(800, 600);
@@ -1398,12 +1885,15 @@ mod tests {
             &mut pending,
             [
                 InputEvent::KeyPress {
+                    source_id: TEST_SOURCE_ID,
                     keycode: LINUX_KEY_LEFTCTRL,
                 },
                 InputEvent::KeyPress {
+                    source_id: TEST_SOURCE_ID,
                     keycode: LINUX_KEY_LEFTALT,
                 },
                 InputEvent::KeyPress {
+                    source_id: TEST_SOURCE_ID,
                     keycode: LINUX_KEY_ENTER,
                 },
             ],
@@ -1439,12 +1929,15 @@ mod tests {
             &mut pending,
             [
                 InputEvent::KeyPress {
+                    source_id: TEST_SOURCE_ID,
                     keycode: LINUX_KEY_LEFTCTRL,
                 },
                 InputEvent::KeyPress {
+                    source_id: TEST_SOURCE_ID,
                     keycode: LINUX_KEY_LEFTALT,
                 },
                 InputEvent::KeyPress {
+                    source_id: TEST_SOURCE_ID,
                     keycode: LINUX_KEY_F12,
                 },
             ],
@@ -1470,16 +1963,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_input_thread_command_and_batch_gate() {
-        assert!(matches!(
-            InputThreadCommand::from_raw(1),
-            Some(InputThreadCommand::Pause)
-        ));
-        assert!(matches!(
-            InputThreadCommand::from_raw(2),
-            Some(InputThreadCommand::Resume)
-        ));
-        assert!(InputThreadCommand::from_raw(0).is_none());
+    fn input_thread_batch_gate() {
         assert!(!should_dispatch_batch(true));
         assert!(should_dispatch_batch(false));
     }
@@ -1494,6 +1978,7 @@ mod tests {
             &sender,
             &mut pending,
             [InputEvent::KeyPress {
+                source_id: TEST_SOURCE_ID,
                 keycode: LINUX_KEY_ENTER,
             }],
             0,
@@ -1528,6 +2013,7 @@ mod tests {
             &sender,
             &mut pending,
             [InputEvent::PointerScroll {
+                source_id: TEST_SOURCE_ID,
                 dx_v120: 0,
                 dy_v120: 120,
             }],
@@ -1548,11 +2034,11 @@ mod tests {
         let mut state = LibinputThreadState::new(800, 600);
         let mut out = Vec::new();
         // 60 + 30 + 40 = 130 → one click; remainder 10 banked.
-        state.drain_scroll(0, 60, 0, &mut out);
+        state.drain_scroll(TEST_SOURCE_ID, 0, 60, 0, &mut out);
         assert!(out.is_empty(), "60 < 120, no emission yet");
-        state.drain_scroll(0, 30, 0, &mut out);
+        state.drain_scroll(TEST_SOURCE_ID, 0, 30, 0, &mut out);
         assert!(out.is_empty(), "60 + 30 = 90 < 120");
-        state.drain_scroll(0, 40, 0, &mut out);
+        state.drain_scroll(TEST_SOURCE_ID, 0, 40, 0, &mut out);
         assert_eq!(
             out.len(),
             2,
@@ -1572,7 +2058,7 @@ mod tests {
     fn scroll_negative_v120_emits_scroll_up() {
         let mut state = LibinputThreadState::new(800, 600);
         let mut out = Vec::new();
-        state.drain_scroll(0, -120, 0, &mut out);
+        state.drain_scroll(TEST_SOURCE_ID, 0, -120, 0, &mut out);
         assert_eq!(out.len(), 2);
         assert!(matches!(
             out[0],
@@ -1589,7 +2075,7 @@ mod tests {
         let mut state = LibinputThreadState::new(800, 600);
         let mut out = Vec::new();
         // 480 v120 = exactly 4 clicks down.
-        state.drain_scroll(0, 480, 0, &mut out);
+        state.drain_scroll(TEST_SOURCE_ID, 0, 480, 0, &mut out);
         assert_eq!(out.len(), 8, "4 clicks × (press + release)");
         for chunk in out.chunks_exact(2) {
             assert!(matches!(
@@ -1615,7 +2101,7 @@ mod tests {
     fn scroll_horizontal_emits_buttons_6_7() {
         let mut state = LibinputThreadState::new(800, 600);
         let mut out = Vec::new();
-        state.drain_scroll(120, 0, 0, &mut out);
+        state.drain_scroll(TEST_SOURCE_ID, 120, 0, 0, &mut out);
         assert!(matches!(
             out[0],
             HostInputEvent::PointerButton {
@@ -1625,7 +2111,7 @@ mod tests {
             }
         ));
         out.clear();
-        state.drain_scroll(-120, 0, 0, &mut out);
+        state.drain_scroll(TEST_SOURCE_ID, -120, 0, 0, &mut out);
         assert!(matches!(
             out[0],
             HostInputEvent::PointerButton {
@@ -1645,17 +2131,19 @@ mod tests {
     fn config_push_survives_command_drain() {
         let control = InputThreadControl::new().expect("control");
         control.push_config(
-            "/dev/input/event2".into(),
+            DeviceConfigToken(1),
+            InputSourceId(2),
             DeviceConfigChange::NaturalScroll(false),
         );
         // No pause/resume was published, so the latched command is empty.
-        assert_eq!(control.drain(), None);
+        assert!(control.drain().is_empty());
         // The config write is still pending and drains FIFO.
         let configs = control.take_configs();
         assert_eq!(configs.len(), 1);
-        assert_eq!(configs[0].0, "/dev/input/event2");
+        assert_eq!(configs[0].0, DeviceConfigToken(1));
+        assert_eq!(configs[0].1, InputSourceId(2));
         assert!(matches!(
-            configs[0].1,
+            configs[0].2,
             DeviceConfigChange::NaturalScroll(false)
         ));
         // Queue is emptied by the take.
@@ -1667,19 +2155,178 @@ mod tests {
     #[test]
     fn config_queue_is_fifo_and_independent_of_command() {
         let control = InputThreadControl::new().expect("control");
+        let source = InputSourceId(2);
         control.push_config(
-            "/dev/input/event2".into(),
+            DeviceConfigToken(1),
+            source,
             DeviceConfigChange::NaturalScroll(true),
         );
-        control.push_config("/dev/input/event2".into(), DeviceConfigChange::Tap(false));
+        control.push_config(DeviceConfigToken(2), source, DeviceConfigChange::Tap(false));
         control.pause();
-        assert_eq!(control.drain(), Some(InputThreadCommand::Pause));
+        assert_eq!(control.drain(), vec![InputThreadCommand::Pause]);
         let configs = control.take_configs();
         assert_eq!(configs.len(), 2);
         assert!(matches!(
-            configs[0].1,
+            configs[0].2,
             DeviceConfigChange::NaturalScroll(true)
         ));
-        assert!(matches!(configs[1].1, DeviceConfigChange::Tap(false)));
+        assert!(matches!(configs[1].2, DeviceConfigChange::Tap(false)));
+    }
+
+    #[test]
+    fn xi_config_completion_reports_the_input_thread_apply_result() {
+        let (_poll, sender, receiver) = yserver_core::core_loop::channel().unwrap();
+        let control = InputThreadControl::new().expect("control");
+        let source = InputSourceId(91);
+        let token = DeviceConfigToken(17);
+        let change = DeviceConfigChange::AccelSpeed(0.5);
+        control.push_config(token, source, change);
+        let mut waiting = VecDeque::new();
+
+        process_config_commands(
+            control.take_configs(),
+            &sender,
+            &mut waiting,
+            |actual_source, actual_change| {
+                assert_eq!(actual_source, source);
+                assert_eq!(actual_change, change);
+                (Ok(()), false)
+            },
+        )
+        .expect("send confirmed result");
+
+        assert!(waiting.is_empty());
+        assert!(matches!(
+            receiver.try_recv_all().next(),
+            Some(Message::DeviceConfigResult {
+                token: actual_token,
+                source: actual_source,
+                result: Ok(()),
+            }) if actual_token == token && actual_source == source
+        ));
+        assert!(receiver.try_recv_all().next().is_none());
+    }
+
+    #[test]
+    fn submitted_config_waits_for_proven_resume_then_reports_success() {
+        let (_poll, sender, receiver) = yserver_core::core_loop::channel().unwrap();
+        let source = InputSourceId(92);
+        let token = DeviceConfigToken(18);
+        let change = DeviceConfigChange::NaturalScroll(true);
+        let mut waiting = VecDeque::new();
+
+        process_config_commands(
+            vec![(token, source, change)],
+            &sender,
+            &mut waiting,
+            |_, _| (Err(DeviceConfigError::SourceGone), true),
+        )
+        .expect("queue the proven-continuation wait");
+        assert_eq!(waiting, VecDeque::from([(token, source, change)]));
+        assert!(receiver.try_recv_all().next().is_none());
+
+        let resumed = resumed_info(source);
+        service_waiting_device_configs(
+            &sender,
+            &mut waiting,
+            &[InputEvent::DeviceResumed(resumed)],
+            |actual_source, actual_change| {
+                assert_eq!(actual_source, source);
+                assert_eq!(actual_change, change);
+                Ok(())
+            },
+        )
+        .expect("apply to the proven rebind and report it");
+
+        assert!(waiting.is_empty());
+        assert!(matches!(
+            receiver.try_recv_all().next(),
+            Some(Message::DeviceConfigResult {
+                token: actual_token,
+                source: actual_source,
+                result: Ok(()),
+            }) if actual_token == token && actual_source == source
+        ));
+    }
+
+    #[test]
+    fn waiting_config_snapshot_keeps_resume_events_after_batch_consumption() {
+        let (_poll, sender, receiver) = yserver_core::core_loop::channel().unwrap();
+        let source = InputSourceId(94);
+        let token = DeviceConfigToken(20);
+        let change = DeviceConfigChange::NaturalScroll(true);
+        let events = vec![InputEvent::DeviceResumed(resumed_info(source))];
+        let waiting = VecDeque::from([(token, source, change)]);
+
+        let snapshot = snapshot_lifecycle_events_for_waiters(&waiting, &events)
+            .expect("a pending config keeps the lifecycle events beside the consumed batch");
+        assert!(matches!(
+            snapshot.as_slice(),
+            [InputEvent::DeviceResumed(info)] if info.source_id == source
+        ));
+        assert!(
+            snapshot_lifecycle_events_for_waiters(&VecDeque::new(), &events).is_none(),
+            "the common path without a waiting config needs no batch clone"
+        );
+        drop(events); // process_batch consumes the original input vector.
+
+        let mut waiting = waiting;
+        service_waiting_device_configs(
+            &sender,
+            &mut waiting,
+            &snapshot,
+            |actual_source, actual_change| {
+                assert_eq!(actual_source, source);
+                assert_eq!(actual_change, change);
+                Ok(())
+            },
+        )
+        .expect("resume lifecycle event retries the waiting config");
+
+        assert!(waiting.is_empty());
+        assert!(matches!(
+            receiver.try_recv_all().next(),
+            Some(Message::DeviceConfigResult {
+                token: actual_token,
+                source: actual_source,
+                result: Ok(()),
+            }) if actual_token == token && actual_source == source
+        ));
+    }
+
+    #[test]
+    fn submitted_config_expiring_without_rebind_reports_source_gone() {
+        let (_poll, sender, receiver) = yserver_core::core_loop::channel().unwrap();
+        let source = InputSourceId(93);
+        let token = DeviceConfigToken(19);
+        let change = DeviceConfigChange::Tap(false);
+        let mut waiting = VecDeque::new();
+
+        process_config_commands(
+            vec![(token, source, change)],
+            &sender,
+            &mut waiting,
+            |_, _| (Err(DeviceConfigError::SourceGone), true),
+        )
+        .expect("queue the proven-continuation wait");
+        assert_eq!(waiting.len(), 1);
+
+        service_waiting_device_configs(
+            &sender,
+            &mut waiting,
+            &[InputEvent::DeviceRemoved { source_id: source }],
+            |_, _| panic!("removed source must not be applied"),
+        )
+        .expect("report source expiry");
+
+        assert!(waiting.is_empty());
+        assert!(matches!(
+            receiver.try_recv_all().next(),
+            Some(Message::DeviceConfigResult {
+                token: actual_token,
+                source: actual_source,
+                result: Err(DeviceConfigError::SourceGone),
+            }) if actual_token == token && actual_source == source
+        ));
     }
 }

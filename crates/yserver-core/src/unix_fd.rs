@@ -200,6 +200,8 @@ impl FdReader {
         match stream {
             Transport::Unix(stream) => Self::Unix(UnixFdReader::new(stream)),
             Transport::Tcp(stream) => Self::Tcp(stream),
+            #[cfg(test)]
+            Transport::Capture(_) => panic!("test capture transport cannot read client requests"),
         }
     }
 

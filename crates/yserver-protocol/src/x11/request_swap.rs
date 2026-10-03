@@ -176,6 +176,90 @@ fn swap_xi_change_device_control(byte_order: ClientByteOrder, body: &mut [u8]) {
     );
 }
 
+/// Swap each XISelectEvents record header while leaving its event mask bytes
+/// in their protocol-defined bit-array order. The record count and fixed
+/// request fields have already been converted to LE by the table entries.
+fn swap_xi_select_events_records(_byte_order: ClientByteOrder, body: &mut [u8]) {
+    let Some(num_masks) = body.get(4..6).map(|b| u16::from_le_bytes([b[0], b[1]])) else {
+        return;
+    };
+    let mut pos = 8usize;
+    for _ in 0..num_masks {
+        let Some(header_end) = pos.checked_add(4) else {
+            return;
+        };
+        let Some(record_header) = body.get_mut(pos..header_end) else {
+            return;
+        };
+        record_header[..2].reverse(); // deviceid
+        record_header[2..4].reverse(); // mask_len
+        let mask_words = usize::from(u16::from_le_bytes([record_header[2], record_header[3]]));
+        let Some(mask_bytes) = mask_words.checked_mul(4) else {
+            return;
+        };
+        let Some(mask_end) = header_end.checked_add(mask_bytes) else {
+            return;
+        };
+        if mask_end > body.len() {
+            return;
+        }
+        pos = mask_end;
+    }
+}
+
+/// XIPassiveGrabDevice's mask is a byte array. Its modifiers begin after the
+/// declared mask words and are CARD32s in client byte order. Xorg validates
+/// the complete fixed-size tail before entering its modifier swap loop, so
+/// malformed tails are left untouched here for the request dispatcher to
+/// reject as BadLength.
+fn swap_xi_passive_grab_modifiers(_byte_order: ClientByteOrder, body: &mut [u8]) {
+    let (Some(num_modifiers), Some(mask_len)) = (
+        body.get(18..20).map(|b| u16::from_le_bytes([b[0], b[1]])),
+        body.get(20..22).map(|b| u16::from_le_bytes([b[0], b[1]])),
+    ) else {
+        return;
+    };
+    let Some(mask_bytes) = usize::from(mask_len).checked_mul(4) else {
+        return;
+    };
+    let Some(modifier_bytes) = usize::from(num_modifiers).checked_mul(4) else {
+        return;
+    };
+    let Some(modifiers_start) = 28usize.checked_add(mask_bytes) else {
+        return;
+    };
+    let Some(modifiers_end) = modifiers_start.checked_add(modifier_bytes) else {
+        return;
+    };
+    let Some(modifiers) = body.get_mut(modifiers_start..modifiers_end) else {
+        return;
+    };
+    for modifier in modifiers.chunks_exact_mut(4) {
+        modifier.reverse();
+    }
+}
+
+/// XIPassiveUngrabDevice has a CARD32 modifier array immediately after its
+/// 16-byte fixed body. Swap only the declared array; any trailing request
+/// bytes are not part of this field.
+fn swap_xi_passive_ungrab_modifiers(_byte_order: ClientByteOrder, body: &mut [u8]) {
+    let Some(num_modifiers) = body.get(10..12).map(|b| u16::from_le_bytes([b[0], b[1]])) else {
+        return;
+    };
+    let Some(modifier_bytes) = usize::from(num_modifiers).checked_mul(4) else {
+        return;
+    };
+    let Some(modifiers_end) = 16usize.checked_add(modifier_bytes) else {
+        return;
+    };
+    let Some(modifiers) = body.get_mut(16..modifiers_end) else {
+        return;
+    };
+    for modifier in modifiers.chunks_exact_mut(4) {
+        modifier.reverse();
+    }
+}
+
 /// Dispatch to a per-extension swap table by major opcode. yserver
 /// assigns a fixed major to every supported extension (see the
 /// `XI2_MAJOR_OPCODE` / `XFIXES_MAJOR_OPCODE` constants in
@@ -754,7 +838,7 @@ const fn core_request_swap_table(opcode: u8) -> Option<&'static [FieldEntry]> {
 /// `XIproto.h` / `XI2proto.h` struct definitions.
 #[allow(clippy::too_many_lines)]
 const fn xi_request_swap_table(minor: u8) -> Option<&'static [FieldEntry]> {
-    use FieldEntry::{ElementArrayTail, Fixed, OpaqueTail};
+    use FieldEntry::{Custom, ElementArrayTail, Fixed, OpaqueTail};
     use FieldKind::{U16, U32};
 
     macro_rules! u32f {
@@ -922,7 +1006,7 @@ const fn xi_request_swap_table(minor: u8) -> Option<&'static [FieldEntry]> {
         // 46 XISelectEvents: window(u32) num_masks(u16) [u16 pad]
         //   masks(opaque event-mask records, each: deviceid(u16) mask_len(u16)
         //   mask(u8 × pad32(mask_len)))
-        46 => &[u32f!(0), u16f!(4), OpaqueTail { from: 8 }],
+        46 => &[u32f!(0), u16f!(4), Custom(swap_xi_select_events_records)],
         // 47 XIQueryVersion: major(u16) minor(u16)
         47 => &[u16f!(0), u16f!(2)],
         // 48 XIQueryDevice: deviceid(u16) [u16 pad]
@@ -952,7 +1036,7 @@ const fn xi_request_swap_table(minor: u8) -> Option<&'static [FieldEntry]> {
             u16f!(16),
             u16f!(18),
             u16f!(20),
-            OpaqueTail { from: 28 },
+            Custom(swap_xi_passive_grab_modifiers),
         ],
         // 55 XIPassiveUngrabDevice: grab_window(u32) detail(u32) deviceid(u16)
         //   num_modifiers(u16) grab_type(u8) [u8 pad u16 pad] modifiers(u32[])
@@ -961,10 +1045,7 @@ const fn xi_request_swap_table(minor: u8) -> Option<&'static [FieldEntry]> {
             u32f!(4),
             u16f!(8),
             u16f!(10),
-            ElementArrayTail {
-                from: 16,
-                kind: U32,
-            },
+            Custom(swap_xi_passive_ungrab_modifiers),
         ],
         // 56 XIListProperties: deviceid(u16) [u16 pad]
         56 => &[u16f!(0)],

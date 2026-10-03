@@ -13,13 +13,66 @@ use std::{
     time::Duration,
 };
 
+#[cfg(test)]
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+};
+
 #[derive(Debug)]
 pub enum Transport {
     Unix(UnixStream),
     Tcp(TcpStream),
+    #[cfg(test)]
+    Capture(Arc<Mutex<VecDeque<u8>>>),
+}
+
+#[cfg(test)]
+pub(crate) struct CapturedPeer {
+    bytes: Arc<Mutex<VecDeque<u8>>>,
+    nonblocking: bool,
+}
+
+#[cfg(test)]
+impl CapturedPeer {
+    pub(crate) fn set_nonblocking(&mut self, nonblocking: bool) -> io::Result<()> {
+        self.nonblocking = nonblocking;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl Read for CapturedPeer {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut bytes = self.bytes.lock().unwrap();
+        if bytes.is_empty() {
+            return if self.nonblocking {
+                Err(io::ErrorKind::WouldBlock.into())
+            } else {
+                Ok(0)
+            };
+        }
+        let count = buf.len().min(bytes.len());
+        for slot in &mut buf[..count] {
+            *slot = bytes.pop_front().expect("count is within capture length");
+        }
+        Ok(count)
+    }
 }
 
 impl Transport {
+    #[cfg(test)]
+    pub(crate) fn capture_pair() -> (Self, CapturedPeer) {
+        let bytes = Arc::new(Mutex::new(VecDeque::new()));
+        (
+            Self::Capture(bytes.clone()),
+            CapturedPeer {
+                bytes,
+                nonblocking: false,
+            },
+        )
+    }
+
     pub fn pair() -> io::Result<(Self, UnixStream)> {
         UnixStream::pair().map(|(stream, peer)| (Self::Unix(stream), peer))
     }
@@ -28,6 +81,8 @@ impl Transport {
         match self {
             Self::Unix(stream) => stream.set_nonblocking(nonblocking),
             Self::Tcp(stream) => stream.set_nonblocking(nonblocking),
+            #[cfg(test)]
+            Self::Capture(_) => Ok(()),
         }
     }
 
@@ -35,6 +90,8 @@ impl Transport {
         match self {
             Self::Unix(stream) => stream.try_clone().map(Self::Unix),
             Self::Tcp(stream) => stream.try_clone().map(Self::Tcp),
+            #[cfg(test)]
+            Self::Capture(bytes) => Ok(Self::Capture(bytes.clone())),
         }
     }
 
@@ -42,6 +99,8 @@ impl Transport {
         match self {
             Self::Unix(stream) => stream.shutdown(how),
             Self::Tcp(stream) => stream.shutdown(how),
+            #[cfg(test)]
+            Self::Capture(_) => Ok(()),
         }
     }
 
@@ -49,6 +108,8 @@ impl Transport {
         match self {
             Self::Unix(stream) => stream.set_read_timeout(timeout),
             Self::Tcp(stream) => stream.set_read_timeout(timeout),
+            #[cfg(test)]
+            Self::Capture(_) => Ok(()),
         }
     }
 
@@ -56,6 +117,8 @@ impl Transport {
         match self {
             Self::Unix(stream) => stream.set_write_timeout(timeout),
             Self::Tcp(stream) => stream.set_write_timeout(timeout),
+            #[cfg(test)]
+            Self::Capture(_) => Ok(()),
         }
     }
 }
@@ -71,6 +134,8 @@ impl Read for Transport {
         match self {
             Self::Unix(stream) => stream.read(buf),
             Self::Tcp(stream) => stream.read(buf),
+            #[cfg(test)]
+            Self::Capture(_) => Ok(0),
         }
     }
 }
@@ -80,6 +145,11 @@ impl Write for Transport {
         match self {
             Self::Unix(stream) => stream.write(buf),
             Self::Tcp(stream) => stream.write(buf),
+            #[cfg(test)]
+            Self::Capture(bytes) => {
+                bytes.lock().unwrap().extend(buf.iter().copied());
+                Ok(buf.len())
+            }
         }
     }
 
@@ -87,6 +157,8 @@ impl Write for Transport {
         match self {
             Self::Unix(stream) => stream.flush(),
             Self::Tcp(stream) => stream.flush(),
+            #[cfg(test)]
+            Self::Capture(_) => Ok(()),
         }
     }
 }
@@ -96,6 +168,8 @@ impl AsRawFd for Transport {
         match self {
             Self::Unix(stream) => stream.as_raw_fd(),
             Self::Tcp(stream) => stream.as_raw_fd(),
+            #[cfg(test)]
+            Self::Capture(_) => -1,
         }
     }
 }

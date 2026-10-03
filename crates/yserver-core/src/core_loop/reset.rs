@@ -336,6 +336,14 @@ pub(crate) fn reset_generation(
     // against the destroyed session.
     setup_thread::shutdown_all(setup_registry);
 
+    // -- 2a. Retire backend-owned input-session state. ---------------
+    // This runs after the generation bump quarantines old producers,
+    // while the old facets and resources still exist, and before forced
+    // client teardown. KMS sends guarded releases through the old XI
+    // topology here; the subsequent disconnect path sees empty held-state
+    // maps.
+    backend.reset_input_session(state);
+
     // -- 3. Force-close every established client. -------------------
     // Deregister first: `epoll_ctl(DEL)` needs a live fd, and the
     // teardown below drops the last `ClientState` reference to the
@@ -410,15 +418,11 @@ pub(crate) fn reset_generation(
     // go backwards: a client reconnecting a millisecond after a reset
     // would otherwise see the server clock jump.
     fresh.start_instant = state.start_instant;
-    // Input is seeded from the process-lifetime inventory, not
-    // re-probed: `probe_input_devices` is a no-op in Direct mode
-    // (libinput's enumeration burst is one-shot, at process start), so
-    // a generation that re-probed would come back with no devices at
-    // all. Property-name atoms are interned HERE, against the fresh
-    // table -- carrying `xi_devices` across instead would leave every
-    // device property pointing at an atom id that no longer exists.
-    for info in inventory.devices_by_node() {
-        fresh.xi_seed_touchpad(info);
+    // Rebuild physical facets from the process-lifetime inventory. Disabled
+    // continuation facts remain registered but disabled, matching their live
+    // state before the server-generation reset.
+    for info in inventory.devices_by_source() {
+        fresh.xi_register_source(info);
     }
     *state = fresh;
 
@@ -865,10 +869,18 @@ mod tests {
     }
 
     /// Mirrors `xinput::tests::touchpad_info`: tap must be *available*
-    /// for `seed_touchpad` to intern `libinput Tapping Enabled`, which
+    /// for source registration to intern `libinput Tapping Enabled`, which
     /// is the property this module's atom assertion turns on.
     fn touchpad(node: &str, name: &str) -> DeviceInfo {
         DeviceInfo {
+            source_id: crate::xinput::InputSourceId(u64::from(line!())),
+            enabled: true,
+            resume_key: None,
+            capabilities: crate::xinput::InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
             name: name.into(),
             device_node: node.into(),
             sysname: node.trim_start_matches("/dev/input/").into(),
@@ -886,6 +898,40 @@ mod tests {
                     current: false,
                     default: true,
                 },
+                ..Default::default()
+            },
+        }
+    }
+
+    fn dynamic_source(
+        source_id: u64,
+        name: &str,
+        keyboard: bool,
+        pointer: bool,
+        enabled: bool,
+    ) -> DeviceInfo {
+        DeviceInfo {
+            source_id: crate::xinput::InputSourceId(source_id),
+            enabled,
+            resume_key: None,
+            capabilities: crate::xinput::InputCapabilities {
+                keyboard,
+                pointer,
+                touch: false,
+            },
+            name: name.into(),
+            device_node: format!("/dev/input/event{source_id}"),
+            sysname: format!("event{source_id}"),
+            vendor_id: 0x046d,
+            product_id: u32::try_from(source_id).unwrap_or_default(),
+            is_touchpad: false,
+            config: LibinputConfigSnapshot {
+                accel_profile: crate::core_loop::message::OneHot2 {
+                    available: pointer,
+                    current: Some(0),
+                    default: Some(0),
+                },
+                accel_profile_available_mask: if pointer { 0b011 } else { 0 },
                 ..Default::default()
             },
         }
@@ -1048,12 +1094,10 @@ mod tests {
         );
     }
 
-    /// The devices come back — from the process-lifetime inventory, not
-    /// a re-probe — and their property-name atoms are interned in the
-    /// NEW atom table. Carrying `xi_devices` instead would leave those
-    /// properties pointing at ids the fresh table never issued.
+    /// Reset replays the live physical touchpad onto its registry-allocated
+    /// facet while leaving virtual XTEST pointer 4 independent.
     #[test]
-    fn reset_generation_reseeds_devices_with_atoms_in_the_new_table() {
+    fn reset_generation_keeps_virtual_xtest_pointer_intact() {
         let mut state = ServerState::new();
         let mut backend = backend_with_topology();
         // Burn atom ids in the OLD table so a carried-over property atom
@@ -1084,27 +1128,195 @@ mod tests {
         let slave = state
             .xi_devices
             .iter()
-            .find(|d| d.id == crate::xinput::DEVICEID_SLAVE_POINTER)
-            .expect("slave pointer");
+            .find(|d| d.id == crate::xinput::DEVICEID_XTEST_POINTER)
+            .expect("XTEST pointer");
         assert_eq!(
-            slave.name, "SynPS/2 Touchpad",
-            "the device set must be present again after a reset"
+            slave.name,
+            crate::xinput::registry::NAME_XTEST_POINTER,
+            "reset must keep the virtual device as XTEST instead of publishing a source there"
         );
-        assert!(slave.is_touchpad);
-
-        // `intern(only_if_exists = true)` returns the live id: the
-        // property must resolve through the NEW table.
+        assert!(!slave.is_touchpad);
+        assert!(slave.properties.contains_key(&state.xtest_device_atom));
         let tap = state.atoms.intern("libinput Tapping Enabled", true);
+        let holders = state
+            .xi_devices
+            .iter()
+            .filter(|device| device.properties.contains_key(&tap))
+            .map(|device| device.id)
+            .collect::<Vec<_>>();
+        println!(
+            "AtomId({}) is {} and is held by XI device maps {:?}",
+            tap.0,
+            state.atoms.name(tap).unwrap_or("<unknown>"),
+            holders
+        );
+        assert_eq!(state.atoms.name(tap), Some("libinput Tapping Enabled"));
+        assert_eq!(
+            holders,
+            [6],
+            "the physical touchpad pointer facet owns the property"
+        );
+        assert!(!slave.properties.contains_key(&tap));
+    }
+
+    #[test]
+    fn xi_dynamic_reset_replays_current_live_inventory_and_recreates_property_atoms() {
+        let mut state = ServerState::new();
+        let mut backend = backend_with_topology();
+        for i in 0..32 {
+            state.atoms.intern(&format!("_PRE_RESET_ATOM_{i}"), false);
+        }
+
+        let source_20 = dynamic_source(20, "Mouse twenty", false, true, true);
+        let source_10 = dynamic_source(10, "Mouse ten", false, true, true);
+        let mixed_suspended = dynamic_source(30, "Mixed keyboard pointer", true, true, false);
+        let removed = dynamic_source(40, "Removed mouse", false, true, true);
+        let old_profile_atom = state.atoms.intern("libinput Accel Profile Enabled", true);
+
+        // The old generation observed devices in a different order from the
+        // inventory's source order, and still contains the source removed
+        // before reset. The new generation must allocate from current facts.
+        let mut inventory = InputInventory::new();
+        for info in [&source_20, &source_10, &mixed_suspended, &removed] {
+            inventory.add(info.clone());
+        }
+        inventory.update_config(
+            source_20.source_id,
+            crate::xinput::libinput_props::DeviceConfigChange::AccelProfile(Some(1)),
+        );
+        state.xi_register_source(&source_20);
+        state.xi_register_source(&source_10);
+        state.xi_register_source(&mixed_suspended);
+        state.xi_register_source(&removed);
+        let old_id_6_source = state
+            .xi_devices
+            .device(6)
+            .and_then(|device| device.source_id);
+        assert_eq!(old_id_6_source, Some(source_20.source_id));
+        inventory.remove(removed.source_id);
+        state.xi_unregister_source(removed.source_id);
+
+        let generations = GenerationCounter::new();
+        let registry = setup_thread::make_registry();
+        let mut locals = Locals::new();
+        let p = poll();
+        reset_generation(
+            &mut state,
+            &mut backend,
+            p.registry(),
+            &generations,
+            &registry,
+            &inventory,
+            locals.borrow(),
+        )
+        .expect("reset must proceed without a retained overlay");
+
+        let source_10_id = state
+            .xi_devices
+            .facet(
+                source_10.source_id,
+                crate::xinput::XiFacetKind::PointerTouch,
+            )
+            .expect("mouse ten pointer facet");
+        let source_20_id = state
+            .xi_devices
+            .facet(
+                source_20.source_id,
+                crate::xinput::XiFacetKind::PointerTouch,
+            )
+            .expect("mouse twenty pointer facet");
+        assert_eq!(source_10_id, 6);
+        assert_eq!(source_20_id, 7);
+        assert_ne!(source_10_id, source_20_id);
+        assert_eq!(
+            state.xi_devices.device(6).unwrap().source_id,
+            Some(source_10.source_id)
+        );
         assert_ne!(
-            tap,
-            yserver_protocol::x11::AtomId(0),
-            "the property atom must exist in the new table"
+            old_id_6_source,
+            state.xi_devices.device(6).unwrap().source_id
+        );
+        assert!(state.xi_devices.source(removed.source_id).is_none());
+        assert!(
+            state
+                .xi_devices
+                .facet(
+                    mixed_suspended.source_id,
+                    crate::xinput::XiFacetKind::Keyboard
+                )
+                .is_some()
         );
         assert!(
-            slave.properties.contains_key(&tap),
-            "device properties must be keyed by atoms interned in the new \
-             table, not ids carried from the destroyed one"
+            state
+                .xi_devices
+                .facet(
+                    mixed_suspended.source_id,
+                    crate::xinput::XiFacetKind::PointerTouch
+                )
+                .is_some()
         );
+        assert!(
+            !state
+                .xi_devices
+                .source(mixed_suspended.source_id)
+                .unwrap()
+                .enabled
+        );
+
+        let current_profile_atom = state
+            .atoms
+            .id_for("libinput Accel Profile Enabled")
+            .expect("new generation interns the profile property");
+        assert_ne!(old_profile_atom, current_profile_atom);
+        assert_eq!(
+            state.atoms.name(current_profile_atom),
+            Some("libinput Accel Profile Enabled")
+        );
+        let profile = state.xi_devices.device(source_20_id).unwrap();
+        assert_eq!(profile.properties[&current_profile_atom].data, [0, 1, 0]);
+        assert!(!profile.properties.contains_key(&old_profile_atom));
+        assert!(profile.properties.contains_key(&current_profile_atom));
+        assert_eq!(state.xi_devices.source_ids().len(), 3);
+    }
+
+    #[test]
+    fn xi_dynamic_reset_runs_backend_input_cleanup_before_client_teardown() {
+        let mut state = ServerState::new();
+        let mut backend = backend_with_topology();
+        let fixture = seed_client_session(&mut state, &mut backend, 7);
+        backend.calls.lock().unwrap().clear();
+
+        let generations = GenerationCounter::new();
+        let registry = setup_thread::make_registry();
+        let inventory = InputInventory::new();
+        let mut locals = Locals::new();
+        let p = poll();
+        reset_generation(
+            &mut state,
+            &mut backend,
+            p.registry(),
+            &generations,
+            &registry,
+            &inventory,
+            locals.borrow(),
+        )
+        .expect("reset must proceed without a retained overlay");
+
+        let calls = backend.calls.lock().unwrap().clone();
+        let reset_at = calls
+            .iter()
+            .position(|call| matches!(call, RecordedCall::ResetInputSession))
+            .expect("reset must invoke the backend input-session cleanup hook");
+        let teardown_at = calls
+            .iter()
+            .position(|call| matches!(call, RecordedCall::DestroySubwindow(xid) if *xid == fixture.host_window))
+            .expect("forced reset teardown must destroy the old client window");
+        assert!(
+            reset_at < teardown_at,
+            "held input is retired before client resources are destroyed: {calls:#?}"
+        );
+        assert!(state.clients.is_empty());
+        assert!(!state.resources.xid_in_use(fixture.window));
     }
 
     /// The quarantine case with teeth. `release_server_grab_waiters`
@@ -1206,10 +1418,12 @@ mod tests {
 
         // A worker completion racing the reset arrives now.
         backend.ready_crtc_configs = vec![token];
+        let mut xi_config_lane = crate::core_loop::run::XiConfigLane::default();
         drain_ready_crtc_configs(
             &mut state,
             &mut backend,
             &mut locals.pending_backend_requests,
+            &mut xi_config_lane,
             &mut ResetTrigger::new(ResetPolicy::NoReset),
         );
         assert!(

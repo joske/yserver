@@ -92,6 +92,7 @@ impl Backend for HostX11Backend {
         match ev {
             HostInputEvent::Key(raw) | HostInputEvent::KeyRepeat(raw) => {
                 self.push_pending_host_event(HostEvent::Key(HostKeyEvent {
+                    origin: raw.origin,
                     pressed: raw.pressed,
                     keycode: raw.keycode,
                     time: raw.time,
@@ -102,8 +103,15 @@ impl Backend for HostX11Backend {
                     state: raw.state,
                 }));
             }
-            HostInputEvent::PointerMotion { x, y, time, .. } => {
+            HostInputEvent::PointerMotion {
+                origin, x, y, time, ..
+            } => {
                 self.push_pending_host_event(HostEvent::Pointer(HostPointerEvent {
+                    // XTEST selects its virtual device with GetXTestDevice
+                    // (Xext/xtest.c:351); preserve that source ID through
+                    // nested host fanout. Physical nested input arrives as
+                    // NestedHost on the same path.
+                    origin,
                     kind: PointerEventKind::MotionNotify,
                     host_xid: container,
                     detail: 0,
@@ -129,9 +137,11 @@ impl Backend for HostX11Backend {
             // has no XI2 smooth-scroll valuators to signal one. No-op.
             HostInputEvent::PointerScrollStop { .. } => {}
             HostInputEvent::PointerButton {
+                origin,
                 button,
                 pressed,
                 time,
+                ..
             } => {
                 // `button` is a Linux input code (BTN_LEFT = 0x110, …).
                 // Translate to X11 button numbers — same mapping as
@@ -159,6 +169,7 @@ impl Backend for HostX11Backend {
                     PointerEventKind::ButtonRelease
                 };
                 self.push_pending_host_event(HostEvent::Pointer(HostPointerEvent {
+                    origin,
                     kind,
                     host_xid: container,
                     detail,
@@ -177,7 +188,10 @@ impl Backend for HostX11Backend {
             }
             // Device add/remove are plumbing-only in the host-X11 backend;
             // the nested backend has no XI2 device registry of its own.
-            HostInputEvent::DeviceAdded(_) | HostInputEvent::DeviceRemoved { .. } => {}
+            HostInputEvent::DeviceAdded(_)
+            | HostInputEvent::DeviceSuspended { .. }
+            | HostInputEvent::DeviceResumed(_)
+            | HostInputEvent::DeviceRemoved { .. } => {}
         }
     }
 

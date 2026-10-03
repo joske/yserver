@@ -520,6 +520,34 @@ pub fn process_disconnect_reporting(
     }
     state.button_grabs.retain(|g| g.owner != client_id);
     state.key_grabs.retain(|g| g.owner != client_id);
+    let dynamic_pointer_grabs: Vec<u16> = state
+        .xi2_pointer_grabs
+        .iter()
+        .filter_map(|(device, grab)| (grab.owner == client_id).then_some(*device))
+        .collect();
+    let dynamic_keyboard_grabs: Vec<u16> = state
+        .xi2_keyboard_grabs
+        .iter()
+        .filter_map(|(device, grab)| (grab.owner == client_id).then_some(*device))
+        .collect();
+    for device in dynamic_pointer_grabs {
+        state.xi2_pointer_grabs.remove(&device);
+        if let Some(freeze) = state.xi1_frozen.get_mut(&device) {
+            freeze.state = crate::server::Xi1SyncState::Thawed;
+            freeze.stored = None;
+        }
+        crate::core_loop::pointer_fanout::xi1_core_grab_bridge_release(state, device, client_id);
+        state.reattach_xi2_slave(device);
+    }
+    for device in dynamic_keyboard_grabs {
+        state.xi2_keyboard_grabs.remove(&device);
+        if let Some(freeze) = state.xi1_frozen.get_mut(&device) {
+            freeze.state = crate::server::Xi1SyncState::Thawed;
+            freeze.stored = None;
+        }
+        crate::core_loop::pointer_fanout::xi1_core_grab_bridge_release(state, device, client_id);
+        state.reattach_xi2_slave(device);
+    }
     let released_pointer_grab = state
         .active_pointer_grab
         .is_some_and(|grab| grab.owner == client_id);
@@ -527,12 +555,17 @@ pub fn process_disconnect_reporting(
         state.clear_pointer_grab();
         if let Some(freeze) = state
             .xi1_frozen
-            .get_mut(&crate::xinput::DEVICEID_SLAVE_POINTER)
+            .get_mut(&crate::xinput::DEVICEID_MASTER_POINTER)
         {
             freeze.stored = None;
             freeze.state = crate::server::Xi1SyncState::Thawed;
             freeze.other = None;
         }
+        crate::core_loop::pointer_fanout::xi1_core_grab_bridge_release(
+            state,
+            crate::xinput::DEVICEID_MASTER_POINTER,
+            client_id,
+        );
     }
     // Xorg ReleaseActiveGrabs (CloseDownClient): a disconnecting
     // client's ACTIVE grabs must go too, or the stale record makes
@@ -549,10 +582,17 @@ pub fn process_disconnect_reporting(
         state.active_keyboard_grab = None;
         if let Some(freeze) = state
             .xi1_frozen
-            .get_mut(&crate::xinput::DEVICEID_SLAVE_KEYBOARD)
+            .get_mut(&crate::xinput::DEVICEID_MASTER_KEYBOARD)
         {
             freeze.stored = None;
+            freeze.state = crate::server::Xi1SyncState::Thawed;
+            freeze.other = None;
         }
+        crate::core_loop::pointer_fanout::xi1_core_grab_bridge_release(
+            state,
+            crate::xinput::DEVICEID_MASTER_KEYBOARD,
+            client_id,
+        );
     }
     // XI 1.x grab teardown: drop the client's passive grabs, release
     // its active device grabs, and thaw any devices its grabs froze —
@@ -587,6 +627,8 @@ pub fn process_disconnect_reporting(
             crate::core_loop::pointer_fanout::xi1_thaw_device(state, backend, &xid_map, dev);
         }
     }
+    let xid_map = backend.xid_map().clone();
+    crate::core_loop::pointer_fanout::xi1_compute_freezes(state, backend, &xid_map);
     state
         .selections
         .retain(|_, entry| !dead_windows.contains(&entry.0));
@@ -656,6 +698,7 @@ pub fn process_disconnect_reporting(
     // clears the scene's `root_overlay` contribution: a different concept
     // with a confusingly similar name.
     crate::core_loop::composite_overlay::release_client_overlay_claims(state, backend, client_id);
+    backend.sync_floating_keyboard_states(state);
     // Drop any per-client transient backend state (e.g. the root-overlay
     // contribution) so a crashed/killed client can't strand it.
     backend.client_disconnected(client_id);

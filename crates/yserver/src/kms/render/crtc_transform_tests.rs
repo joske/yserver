@@ -512,12 +512,14 @@ fn motion(b: &mut KmsBackend, state: &mut ServerState, to: (i32, i32), delta: (i
     b.on_host_input(
         state,
         yserver_core::core_loop::HostInputEvent::PointerMotion {
+            origin: yserver_core::core_loop::InputOrigin::NestedHost,
             x: to.0,
             y: to.1,
             time: 0,
             relative: true,
             dx: delta.0,
             dy: delta.1,
+            motion_delta: None,
         },
     );
 }

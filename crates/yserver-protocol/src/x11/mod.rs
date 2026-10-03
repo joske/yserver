@@ -2350,178 +2350,118 @@ pub fn write_xi_barrier_event(
     writer.write_all(&buf)
 }
 
-/// XInput 1.x `ListInputDevices` (opcode minor 2) reply.
-///
-/// Real clients call `XListInputDevices` (XI 1.x) AND `XIQueryDevice`
-/// (XI2) and cross-check the two. Chromium/Electron's Ozone-X11
-/// device-list cache fatal-`CHECK`s (SIGTRAP) if XI2 reports a master
-/// pointer while XI1 reports zero devices — which an empty stub reply
-/// does. This mirrors the 4-device model emitted by the XIQueryDevice
-/// handler so the two agree: core pointer (2), core keyboard (3),
-/// slave pointer (4), slave keyboard (5).
-///
-/// Wire layout per the XInput 1.x protocol (NOTE: class `length`
-/// fields here are in BYTES, unlike the 4-byte-unit lengths in XI2):
-/// ```text
-///   reply header (32B): type=1, ndevices, sequence, length(4B units of data)
-///   data:
-///     [xDeviceInfo; ndevices]      8B each: type ATOM(4), id, num_classes, use, pad
-///     [class infos, per device, concatenated]
-///         xButtonInfo   (4B):  class=1, length=4, num_buttons:u16
-///         xKeyInfo      (8B):  class=0, length=8, min_kc:u8, max_kc:u8, num_keys:u16, pad:u16
-///         xValuatorInfo (8+12n): class=2, length, num_axes:u8, mode:u8,
-///                                motion_buffer_size:u32, [resolution:u32, min:i32, max:i32]×n
-///     [name STR list, per device]  1 length byte + name bytes
-///     pad to 4-byte boundary
-/// ```
-/// Constants from `XI.h`: `use` codes IsXPointer=0, IsXKeyboard=1,
-/// IsXExtensionKeyboard=3, IsXExtensionPointer=4; class ids KeyClass=0,
-/// ButtonClass=1, ValuatorClass=2; valuator mode Relative=0, Absolute=1.
-/// `names` supplies the device names for ids `[2, 3, 4, 5]` (master
-/// pointer, master keyboard, slave pointer, slave keyboard) in that
-/// order. They MUST come from the same source the XI2 `XIQueryDevice`
-/// handler reads (the `ServerState::xi_devices` registry) so the two
-/// enumerations report identical names — clients cross-check them and
-/// fatal-`CHECK` on a mismatch.
-///
-/// `types` supplies the XI 1.x device-type `Atom` value for each of the
-/// same four devices in the same order (`[2, 3, 4, 5]`).  Pass the atom
-/// ids interned at server startup: `MOUSE` for pointer devices,
-/// `KEYBOARD` for keyboard devices, and `TOUCHPAD` for the slave pointer
-/// when a touchpad is active.  The atom ids are looked up from
-/// `ServerState::atoms` by name at the call site.
+/// One XI 1.x device class. Class `length` fields are in bytes (unlike the
+/// 4-byte-unit class lengths in XI2).
+#[derive(Debug, Clone, Copy)]
+pub enum Xi1DeviceClass<'a> {
+    Key {
+        min_keycode: u8,
+        max_keycode: u8,
+        num_keys: u16,
+    },
+    Button {
+        num_buttons: u16,
+    },
+    Valuator {
+        mode: u8,
+        axes: &'a [(i32, i32)],
+    },
+}
+
+/// One descriptor in an XI 1.x `ListInputDevices` reply. `attachment` is
+/// represented so the descriptor follows the registry snapshot; Xorg's XI1
+/// `ListDeviceInfo` currently leaves `xDeviceInfo.attached` zero, so the wire
+/// encoder preserves that compatibility value.
+#[derive(Debug, Clone, Copy)]
+pub struct Xi1DeviceDescriptor<'a> {
+    pub id: u16,
+    pub use_code: u8,
+    pub attachment: u16,
+    pub type_atom: AtomId,
+    pub name: &'a str,
+    pub classes: &'a [Xi1DeviceClass<'a>],
+}
+
+/// XInput 1.x `ListInputDevices` (opcode minor 2) reply. Devices are
+/// serialized in the order selected from the XI registry; names, classes,
+/// type atoms, count and attachment metadata travel with each descriptor.
+/// The reply retains Xorg's array layout: device records, class blocks per
+/// device, then the length-prefixed name strings and four-byte padding.
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn encode_list_input_devices_reply(
     byte_order: ClientByteOrder,
     sequence: SequenceNumber,
-    names: [&str; 4],
-    types: [u32; 4],
+    devices: &[Xi1DeviceDescriptor<'_>],
 ) -> Vec<u8> {
-    // Pointer button/axis shape mirrors the XIQueryDevice handler:
-    // 7 buttons (left/middle/right + 4 wheel directions), 4 relative
-    // valuators (X, Y, vert-scroll, horiz-scroll). min/max −1/−1 (and
-    // −1/0 for scroll) and mode=Relative match what Xorg's modesetting
-    // core pointer reports for relative axes.
-    const NUM_BUTTONS: u16 = 7;
-    const MODE_RELATIVE: u8 = 0;
-    // Relative pointer axes carry no fixed range; Xorg reports −1/−1.
-    const POINTER_AXES: [(i32, i32); 4] = [(-1, -1), (-1, -1), (-1, 0), (-1, 0)];
-    // Core keyboard: keycodes 8..=255 (matches the setup reply's
-    // min/max-keycode and the XIQueryDevice key class).
-    const KEY_MIN: u8 = 8;
-    const KEY_MAX: u8 = 255;
-    const NUM_KEYS: u16 = 248;
-
-    // Device descriptor: id, XI-1.x `use` code, name, and class count.
-    struct Dev<'a> {
-        id: u8,
-        use_code: u8,
-        name: &'a str,
-        num_classes: u8,
-    }
-
-    fn push_button_info(out: &mut Vec<u8>, bo: ClientByteOrder, num_buttons: u16) {
-        out.push(1); // class = ButtonClass
-        out.push(4); // length in BYTES
-        write_u16(bo, out, num_buttons);
-    }
-
-    fn push_key_info(
-        out: &mut Vec<u8>,
-        bo: ClientByteOrder,
-        min_kc: u8,
-        max_kc: u8,
-        num_keys: u16,
-    ) {
-        out.push(0); // class = KeyClass
-        out.push(8); // length in BYTES
-        out.push(min_kc);
-        out.push(max_kc);
-        write_u16(bo, out, num_keys);
-        write_u16(bo, out, 0); // pad
-    }
-
-    fn push_valuator_info(out: &mut Vec<u8>, bo: ClientByteOrder, mode: u8, axes: &[(i32, i32)]) {
-        let num_axes = u8::try_from(axes.len()).unwrap_or(u8::MAX);
-        let byte_len = 8 + 12 * axes.len();
-        out.push(2); // class = ValuatorClass
-        out.push(u8::try_from(byte_len).unwrap_or(u8::MAX)); // length in BYTES
-        out.push(num_axes);
-        out.push(mode);
-        write_u32(bo, out, 0); // motion_buffer_size
-        for &(min, max) in axes {
-            write_u32(bo, out, 0); // resolution
-            write_u32(bo, out, min.cast_unsigned());
-            write_u32(bo, out, max.cast_unsigned());
-        }
-    }
-
-    // Names are threaded in from the XI2 registry (ids 2, 3, 4, 5 in
-    // order) so XI1 and XI2 never disagree on a device name.
-    let [name2, name3, name4, name5] = names;
-    let [type2, type3, type4, type5] = types;
-    let devices = [
-        Dev {
-            id: 2,
-            use_code: 0,
-            name: name2,
-            num_classes: 2,
-        },
-        Dev {
-            id: 3,
-            use_code: 1,
-            name: name3,
-            num_classes: 1,
-        },
-        Dev {
-            id: 4,
-            use_code: 4,
-            name: name4,
-            num_classes: 2,
-        },
-        Dev {
-            id: 5,
-            use_code: 3,
-            name: name5,
-            num_classes: 1,
-        },
-    ];
-    let type_atoms = [type2, type3, type4, type5];
-
-    // Class-info block for a given device id (matches num_classes above).
-    let push_classes = |out: &mut Vec<u8>, id: u8| match id {
-        2 | 4 => {
-            push_button_info(out, byte_order, NUM_BUTTONS);
-            push_valuator_info(out, byte_order, MODE_RELATIVE, &POINTER_AXES);
-        }
-        _ => push_key_info(out, byte_order, KEY_MIN, KEY_MAX, NUM_KEYS),
+    let listed_count = devices.len().min(usize::from(u8::MAX));
+    let devices = &devices[..listed_count];
+    let class_count = |classes: &[Xi1DeviceClass<'_>]| {
+        classes
+            .iter()
+            .map(|class| match class {
+                Xi1DeviceClass::Valuator { axes, .. } => axes.len().div_ceil(20),
+                Xi1DeviceClass::Key { .. } | Xi1DeviceClass::Button { .. } => 1,
+            })
+            .sum::<usize>()
     };
 
     // 1. Device-info array.
     let mut data = Vec::new();
-    for (d, &type_atom) in devices.iter().zip(type_atoms.iter()) {
-        write_u32(byte_order, &mut data, type_atom); // type ATOM (XI device-type)
-        data.push(d.id);
-        data.push(d.num_classes);
-        data.push(d.use_code);
-        data.push(0); // attached (master device id; 0 = none, per XIproto.h)
+    for device in devices {
+        write_u32(byte_order, &mut data, device.type_atom.0); // type ATOM
+        data.push(u8::try_from(device.id).unwrap_or(u8::MAX));
+        data.push(u8::try_from(class_count(device.classes)).unwrap_or(u8::MAX));
+        data.push(device.use_code);
+        // Xorg's XI1 ListDeviceInfo leaves this legacy field zero. XI2
+        // carries the live registry attachment explicitly.
+        data.push(0);
     }
     // 2. Class-info blocks, per device, concatenated.
-    for d in &devices {
-        push_classes(&mut data, d.id);
+    for device in devices {
+        for class in device.classes {
+            match class {
+                Xi1DeviceClass::Key {
+                    min_keycode,
+                    max_keycode,
+                    num_keys,
+                } => {
+                    data.extend_from_slice(&[0, 8, *min_keycode, *max_keycode]);
+                    write_u16(byte_order, &mut data, *num_keys);
+                    write_u16(byte_order, &mut data, 0);
+                }
+                Xi1DeviceClass::Button { num_buttons } => {
+                    data.extend_from_slice(&[1, 4]);
+                    write_u16(byte_order, &mut data, *num_buttons);
+                }
+                Xi1DeviceClass::Valuator { mode, axes } => {
+                    for chunk in axes.chunks(20) {
+                        data.push(2); // ValuatorClass
+                        data.push(u8::try_from(8 + 12 * chunk.len()).unwrap_or(u8::MAX));
+                        data.push(u8::try_from(chunk.len()).unwrap_or(u8::MAX));
+                        data.push(*mode);
+                        write_u32(byte_order, &mut data, 0); // motion_buffer_size
+                        for &(min, max) in chunk {
+                            write_u32(byte_order, &mut data, 0); // resolution
+                            write_u32(byte_order, &mut data, min.cast_unsigned());
+                            write_u32(byte_order, &mut data, max.cast_unsigned());
+                        }
+                    }
+                }
+            }
+        }
     }
     // 3. Device names as a STR list (1 length byte + bytes each), in
     //    device order. Xorg's `CopyDeviceName` leaves one trailing NUL
     //    after the last name (its `strcpy` NUL is not overwritten by a
     //    following length byte); match that for byte-for-byte parity
     //    before the 4-byte pad.
-    for d in &devices {
+    for device in devices {
         // XI1's STR length is a single byte; clamp the emitted bytes to it
         // so the length and the payload always agree on the wire (a real
         // libinput device name is far below 255 bytes, but a name longer
         // than that must not desync the reply).
-        let bytes = d.name.as_bytes();
+        let bytes = device.name.as_bytes();
         let len = bytes.len().min(usize::from(u8::MAX));
         data.push(u8::try_from(len).unwrap_or(u8::MAX));
         data.extend_from_slice(&bytes[..len]);
@@ -2539,7 +2479,7 @@ pub fn encode_list_input_devices_reply(
     // (the first device-info `type` ATOM byte) and ignore the whole
     // list. `fixed_reply` fills bytes 0-7; we then place ndevices at
     // byte 8 explicitly.
-    let mut reply = fixed_reply(byte_order, sequence, 0, length);
+    let mut reply = fixed_reply(byte_order, sequence, 2, length);
     reply.push(ndevices); // byte 8
     reply.extend_from_slice(&[0u8; 23]); // bytes 9-31 pad
     reply.extend_from_slice(&data);
@@ -2578,6 +2518,63 @@ pub fn encode_xi2_device_changed_event(
     write_u32(byte_order, out, 0); // pad3
     out.extend_from_slice(classes);
     debug_assert_eq!(out.len(), 32 + classes.len());
+}
+
+/// One live or just-removed device entry in an XI2 hierarchy notification.
+/// `use_` is one of `XIMasterPointer`, `XIMasterKeyboard`, `XISlavePointer`,
+/// `XISlaveKeyboard`, or zero for a removed descriptor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct XiHierarchyInfo {
+    pub device_id: u16,
+    pub attachment: u16,
+    pub use_: u8,
+    pub enabled: bool,
+    pub flags: u32,
+}
+
+/// Encode XI2 `XI_HierarchyChanged` (XI2proto.h's `xXIHierarchyEvent` plus
+/// its trailing `xXIHierarchyInfo[]`). Each info record is 12 bytes; the
+/// GenericEvent length counts only the trailing records in 4-byte units.
+pub fn encode_xi2_hierarchy_changed_event(
+    out: &mut Vec<u8>,
+    byte_order: ClientByteOrder,
+    sequence: SequenceNumber,
+    major_opcode: u8,
+    time: u32,
+    infos: &[XiHierarchyInfo],
+) {
+    const XI_HIERARCHY_CHANGED: u16 = 11;
+
+    let event_flags = infos.iter().fold(0, |flags, info| flags | info.flags);
+    out.push(35); // GenericEvent
+    out.push(major_opcode);
+    write_u16(byte_order, out, sequence.0);
+    write_u32(
+        byte_order,
+        out,
+        u32::try_from(infos.len().saturating_mul(12) / 4).unwrap_or(u32::MAX),
+    );
+    write_u16(byte_order, out, XI_HIERARCHY_CHANGED);
+    write_u16(byte_order, out, 0); // XIAllDevices
+    write_u32(byte_order, out, time);
+    write_u32(byte_order, out, event_flags);
+    write_u16(
+        byte_order,
+        out,
+        u16::try_from(infos.len()).unwrap_or(u16::MAX),
+    );
+    write_u16(byte_order, out, 0); // pad0
+    write_u32(byte_order, out, 0); // pad1
+    write_u32(byte_order, out, 0); // pad2
+    for info in infos {
+        write_u16(byte_order, out, info.device_id);
+        write_u16(byte_order, out, info.attachment);
+        out.push(info.use_);
+        out.push(u8::from(info.enabled));
+        write_u16(byte_order, out, 0); // pad
+        write_u32(byte_order, out, info.flags);
+    }
+    debug_assert_eq!(out.len(), 32 + infos.len() * 12);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3296,6 +3293,28 @@ pub fn encode_property_notify_event(
     write_u32(order, out, timestamp);
     out.push(u8::from(deleted));
     out.extend_from_slice(&[0; 15]);
+}
+
+/// Encode the XI1 `DevicePresenceNotify` event (`XIproto.h`, event 15).
+/// Device presence uses the core event's 32-byte wire size and carries the
+/// device transition code and the affected eight-bit XI device id.
+pub fn encode_xi1_device_presence_notify_event(
+    out: &mut Vec<u8>,
+    order: ClientByteOrder,
+    sequence: SequenceNumber,
+    event_type: u8,
+    time: u32,
+    change: u8,
+    device_id: u8,
+) {
+    out.push(event_type);
+    out.push(0); // detail
+    write_u16(order, out, sequence.0);
+    write_u32(order, out, time);
+    out.push(change);
+    out.push(device_id);
+    write_u16(order, out, 0); // control
+    out.extend_from_slice(&[0; 20]);
 }
 
 pub fn write_property_notify_event(
@@ -6830,17 +6849,54 @@ mod tests {
             // here we pass them explicitly to keep the test self-contained).
             const MOUSE: u32 = 69;
             const KEYBOARD: u32 = 70;
-            let buf = encode_list_input_devices_reply(
-                le,
-                SequenceNumber(0x1234),
-                [
-                    "Virtual core pointer",
-                    "Virtual core keyboard",
-                    "Virtual core slave pointer",
-                    "Virtual core slave keyboard",
-                ],
-                [MOUSE, KEYBOARD, MOUSE, KEYBOARD],
-            );
+            let pointer_axes = [(-1, -1), (-1, -1), (-1, 0), (-1, 0)];
+            let pointer_classes = [
+                Xi1DeviceClass::Button { num_buttons: 7 },
+                Xi1DeviceClass::Valuator {
+                    mode: 0,
+                    axes: &pointer_axes,
+                },
+            ];
+            let keyboard_classes = [Xi1DeviceClass::Key {
+                min_keycode: 8,
+                max_keycode: 255,
+                num_keys: 248,
+            }];
+            let devices = [
+                Xi1DeviceDescriptor {
+                    id: 2,
+                    use_code: 0,
+                    attachment: 3,
+                    type_atom: AtomId(MOUSE),
+                    name: "Virtual core pointer",
+                    classes: &pointer_classes,
+                },
+                Xi1DeviceDescriptor {
+                    id: 3,
+                    use_code: 1,
+                    attachment: 2,
+                    type_atom: AtomId(KEYBOARD),
+                    name: "Virtual core keyboard",
+                    classes: &keyboard_classes,
+                },
+                Xi1DeviceDescriptor {
+                    id: 4,
+                    use_code: 4,
+                    attachment: 2,
+                    type_atom: AtomId(MOUSE),
+                    name: "Virtual core XTEST pointer",
+                    classes: &pointer_classes,
+                },
+                Xi1DeviceDescriptor {
+                    id: 5,
+                    use_code: 3,
+                    attachment: 3,
+                    type_atom: AtomId(KEYBOARD),
+                    name: "Virtual core XTEST keyboard",
+                    classes: &keyboard_classes,
+                },
+            ];
+            let buf = encode_list_input_devices_reply(le, SequenceNumber(0x1234), &devices);
 
             // Header. Per XIproto.h, ndevices is at byte 8 — NOT the
             // standard reply "data" byte (byte 1). Byte 1 is RepType,
@@ -6923,8 +6979,8 @@ mod tests {
             let names = [
                 "Virtual core pointer",
                 "Virtual core keyboard",
-                "Virtual core slave pointer",
-                "Virtual core slave keyboard",
+                "Virtual core XTEST pointer",
+                "Virtual core XTEST keyboard",
             ];
             for name in names {
                 let n = buf[off] as usize;
@@ -6942,43 +6998,90 @@ mod tests {
             );
         }
 
-        /// A seeded touchpad renames the slave pointer (device 4); the
-        /// XI1 reply must carry that name in the STR list (and the
-        /// length byte must match), proving names thread through from
-        /// the registry rather than being hardcoded.
+        /// A seeded physical touchpad keeps its registry-assigned ID
+        /// after the two XTEST devices; the XI1 reply must carry its
+        /// name in the STR list (and matching length byte), proving
+        /// names thread through from the registry rather than being
+        /// hardcoded.
         #[test]
-        fn list_input_devices_reply_reflects_seeded_slave_pointer_name() {
+        fn list_input_devices_reply_reflects_seeded_pointer_facet_name() {
             let le = ClientByteOrder::LittleEndian;
             let touchpad = "SynPS/2 Synaptics TouchPad";
-            let buf = encode_list_input_devices_reply(
-                le,
-                SequenceNumber(1),
-                [
-                    "Virtual core pointer",
-                    "Virtual core keyboard",
-                    touchpad,
-                    "Virtual core slave keyboard",
-                ],
-                [69, 70, 71, 70], // MOUSE=69, KBD=70, TOUCHPAD=71
-            );
+            let pointer_axes = [(-1, -1), (-1, -1), (-1, 0), (-1, 0)];
+            let pointer_classes = [
+                Xi1DeviceClass::Button { num_buttons: 7 },
+                Xi1DeviceClass::Valuator {
+                    mode: 0,
+                    axes: &pointer_axes,
+                },
+            ];
+            let keyboard_classes = [Xi1DeviceClass::Key {
+                min_keycode: 8,
+                max_keycode: 255,
+                num_keys: 248,
+            }];
+            let devices = [
+                Xi1DeviceDescriptor {
+                    id: 2,
+                    use_code: 0,
+                    attachment: 3,
+                    type_atom: AtomId(69),
+                    name: "Virtual core pointer",
+                    classes: &pointer_classes,
+                },
+                Xi1DeviceDescriptor {
+                    id: 3,
+                    use_code: 1,
+                    attachment: 2,
+                    type_atom: AtomId(70),
+                    name: "Virtual core keyboard",
+                    classes: &keyboard_classes,
+                },
+                Xi1DeviceDescriptor {
+                    id: 4,
+                    use_code: 4,
+                    attachment: 2,
+                    type_atom: AtomId(69),
+                    name: "Virtual core XTEST pointer",
+                    classes: &pointer_classes,
+                },
+                Xi1DeviceDescriptor {
+                    id: 5,
+                    use_code: 3,
+                    attachment: 3,
+                    type_atom: AtomId(70),
+                    name: "Virtual core XTEST keyboard",
+                    classes: &keyboard_classes,
+                },
+                Xi1DeviceDescriptor {
+                    id: 6,
+                    use_code: 4,
+                    attachment: 2,
+                    type_atom: AtomId(71),
+                    name: touchpad,
+                    classes: &pointer_classes,
+                },
+            ];
+            let buf = encode_list_input_devices_reply(le, SequenceNumber(1), &devices);
             let ndevices = buf[8] as usize;
-            assert_eq!(ndevices, 4);
+            assert_eq!(ndevices, 5);
 
             // Skip the device-info array.
             let mut off = 32 + 8 * ndevices;
             // Skip the class-info blocks (walk by byte length).
-            for &num_classes in &[2u8, 1, 2, 1] {
+            for &num_classes in &[2u8, 1, 2, 1, 2] {
                 for _ in 0..num_classes {
                     let len = buf[off + 1] as usize;
                     off += len;
                 }
             }
-            // Name STR list, device order: the 3rd name is the touchpad.
+            // Name STR list, device order: the 5th name is the touchpad.
             let expected = [
                 "Virtual core pointer",
                 "Virtual core keyboard",
+                "Virtual core XTEST pointer",
+                "Virtual core XTEST keyboard",
                 touchpad,
-                "Virtual core slave keyboard",
             ];
             for name in expected {
                 let n = buf[off] as usize;

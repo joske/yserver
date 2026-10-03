@@ -40,7 +40,7 @@ pub fn update(state: &mut State, dt: f32, events: &[InputEvent], width: u16, hei
     let cmax_x = f32::from(width.saturating_sub(CURSOR_SIZE));
     let cmax_y = f32::from(height.saturating_sub(CURSOR_SIZE));
     for ev in events {
-        if let InputEvent::PointerMotion { dx, dy } = ev {
+        if let InputEvent::PointerMotion { dx, dy, .. } = ev {
             state.cursor_x = (state.cursor_x + *dx as f32).clamp(0.0, cmax_x);
             state.cursor_y = (state.cursor_y + *dy as f32).clamp(0.0, cmax_y);
         }
@@ -89,7 +89,11 @@ mod tests {
         update(
             &mut s,
             0.0,
-            &[InputEvent::PointerMotion { dx: 5.0, dy: 3.0 }],
+            &[InputEvent::PointerMotion {
+                source_id: yserver_core::xinput::InputSourceId(1),
+                dx: 5.0,
+                dy: 3.0,
+            }],
             1024,
             768,
         );

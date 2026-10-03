@@ -2,7 +2,7 @@
 //!
 //! See `docs/superpowers/plans/2026-05-06-single-threaded-core.md` Phase B.
 
-use std::{os::fd::OwnedFd, time::Instant};
+use std::{os::fd::OwnedFd, path::PathBuf, time::Instant};
 
 use yserver_protocol::x11::{ClientByteOrder, ClientId, RequestHeader, SequenceNumber};
 
@@ -11,9 +11,20 @@ use crate::{core_loop::generation::Generation, host_x11::HostKeyEvent, transport
 /// Snapshot of a libinput device's identity and touchpad configuration at
 /// device-add time.  Plain data — no libinput handles, safe to send across
 /// thread boundaries.  Collected by the input layer and forwarded to the core
-/// so that Task 2 can seed the XI2 device-property registry.
+/// so the process-lifetime inventory and later XI generations can retain
+/// source identity, endpoint proof, capabilities, and recognized settings.
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {
+    /// Process-local identity for this physical source attachment.
+    pub source_id: crate::xinput::InputSourceId,
+    /// Whether libinput currently has an open handle for this source.
+    /// Suspended facts stay in the process inventory with this set false.
+    pub enabled: bool,
+    /// Canonical kernel input endpoint identity captured at first add.
+    /// Used only to prove a continuation during one explicit VT cycle.
+    pub resume_key: Option<EndpointInstanceKey>,
+    /// Input functions libinput reports for this source.
+    pub capabilities: crate::xinput::InputCapabilities,
     /// Human-readable name (e.g. `"SynPS/2 Synaptics TouchPad"`).
     pub name: String,
     /// Evdev device node (e.g. `/dev/input/event4`).
@@ -25,8 +36,22 @@ pub struct DeviceInfo {
     /// True when libinput classifies the device as a touchpad
     /// (tap finger count > 0).
     pub is_touchpad: bool,
-    /// Full libinput config snapshot (meaningful only when is_touchpad).
+    /// Full recognized libinput configuration snapshot for this source.
     pub config: LibinputConfigSnapshot,
+}
+
+/// Canonical `/sys/class/input/<sysname>` target, including its kernel
+/// `inputN/eventM` instance. This is continuation proof metadata, not a
+/// normal device selector.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EndpointInstanceKey(pub PathBuf);
+
+/// Identifies the producer of host input while it crosses the core channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InputOrigin {
+    Physical(crate::xinput::InputSourceId),
+    XTest(u16),
+    NestedHost,
 }
 
 /// One libinput boolean config item: whether it's available on the device,
@@ -109,8 +134,59 @@ pub struct LibinputConfigSnapshot {
     pub click_method: OneHot2,
     /// Accel profiles: bit0=adaptive, bit1=flat (custom excluded — feature-gated).
     pub accel_profile: OneHot2,
+    /// Actual libinput acceleration profiles: bit0=adaptive, bit1=flat,
+    /// bit2=custom. This is kept separate from `accel_profile` so
+    /// availability is not inferred from the current/default profile slots.
+    pub accel_profile_available_mask: u8,
     /// Send-events: bitflags bit0=disabled, bit1=disabled-on-external-mouse.
     pub send_events: BitFlags2,
+}
+
+impl LibinputConfigSnapshot {
+    /// Reflect a configuration change that the live libinput handle has
+    /// confirmed. Availability and default values come from the device
+    /// snapshot and are deliberately left untouched.
+    pub fn apply_confirmed(&mut self, change: crate::xinput::libinput_props::DeviceConfigChange) {
+        use crate::xinput::libinput_props::DeviceConfigChange as C;
+
+        match change {
+            C::Tap(value) => self.tap.current = value,
+            C::TapDrag(value) => self.tap_drag.current = value,
+            C::TapDragLock(value) => self.tap_drag_lock.current = value,
+            C::TapButtonMap(value) => self.tap_button_map.current = Some(value),
+            C::NaturalScroll(value) => self.natural_scroll.current = value,
+            C::Dwt(value) => self.dwt.current = value,
+            C::LeftHanded(value) => self.left_handed.current = value,
+            C::MiddleEmulation(value) => self.middle_emulation.current = value,
+            C::ScrollMethod(value) => self.scroll_method.current = value,
+            C::ClickMethod(value) => self.click_method.current = value,
+            C::SendEvents(value) => self.send_events.current_mask = value,
+            C::AccelSpeed(value) => self.accel.current = value,
+            C::AccelProfile(value) => self.accel_profile.current = value.filter(|slot| *slot < 2),
+            C::ScrollButton(value) => self.scroll_button.current = value,
+            C::ScrollButtonLock(value) => self.scroll_button_lock.current = value,
+        }
+    }
+}
+
+/// An owned recognized XI property write, suitable for validation after it
+/// crosses from request parsing into the core configuration lane.
+#[derive(Debug, Clone)]
+pub struct XiConfigRequest {
+    pub client: ClientId,
+    pub sequence: SequenceNumber,
+    pub minor_opcode: u16,
+    pub deviceid: u16,
+    /// Source identity captured when the request was received. This prevents
+    /// an XI ID reused after unplug from redirecting a queued write.
+    pub expected_source: crate::xinput::InputSourceId,
+    pub property: yserver_protocol::x11::AtomId,
+    pub type_atom: yserver_protocol::x11::AtomId,
+    pub format: u8,
+    pub mode: u8,
+    /// Canonical little-endian property value bytes, with format-8 payloads
+    /// unchanged.
+    pub data: Vec<u8>,
 }
 
 /// All inbound messages multiplexed onto the core thread.
@@ -181,6 +257,14 @@ pub enum Message {
     /// the core drains opaque tokens through `Backend` and finishes them on
     /// its own thread.
     CrtcConfigReady,
+    /// The input thread finished applying one source-targeted libinput
+    /// configuration request. Process-lifetime so reset cannot strand the
+    /// runner's submitted configuration lane.
+    DeviceConfigResult {
+        token: crate::xinput::libinput_props::DeviceConfigToken,
+        source: crate::xinput::InputSourceId,
+        result: Result<(), crate::xinput::libinput_props::DeviceConfigError>,
+    },
     /// signalfd readable.
     Shutdown,
     /// SIGHUP under a policy other than `-noreset` → cross the
@@ -229,6 +313,7 @@ pub enum Message {
 #[derive(Debug)]
 pub enum HostInputEvent {
     PointerMotion {
+        origin: InputOrigin,
         x: i32,
         y: i32,
         time: u32,
@@ -241,8 +326,12 @@ pub enum HostInputEvent {
         /// motions SUM these. (#96 follow-up: chromium-bsu)
         dx: i32,
         dy: i32,
+        /// Accelerated fractional libinput delta for physical relative
+        /// input. Absolute, nested, and XTEST motion leave this absent.
+        motion_delta: Option<[f64; 2]>,
     },
     PointerButton {
+        origin: InputOrigin,
         /// Linux input button code (`BTN_LEFT = 0x110`, `BTN_RIGHT = 0x111`,
         /// `BTN_MIDDLE = 0x112`, etc.). u16 because libinput codes are
         /// always < 0x200 and u8 would silently truncate `BTN_LEFT` to
@@ -263,7 +352,7 @@ pub enum HostInputEvent {
     /// delta-0 XI2 scroll motion so GDK sets `scroll.is_stop`, which
     /// commits a Firefox history-swipe (bug 1539730). XI2 smooth-scroll
     /// selectors only — no core event, no button.
-    PointerScrollStop { time: u32 },
+    PointerScrollStop { origin: InputOrigin, time: u32 },
     /// Key input from a device: libinput, or an XTEST fake (XTEST keys
     /// come from a device of their own on Xorg). Generates the XI2 raw
     /// key event (Xorg `GetKeyboardEvents`).
@@ -275,13 +364,20 @@ pub enum HostInputEvent {
     /// passes through `GetKeyboardEvents`, so a repeat generates no XI2 raw
     /// key event.
     KeyRepeat(HostKeyEvent),
-    /// A new input device has been enumerated by libinput.  Carries a
-    /// snapshot of its identity and touchpad configuration so the core can
-    /// seed per-device state (Task 2: XI2 property registry).
+    /// A new input device has been enumerated by libinput. Carries a snapshot
+    /// of its physical source identity, capabilities, and configuration.
     DeviceAdded(DeviceInfo),
-    /// An input device has been removed.  `device_node` is the evdev path
-    /// that was reported at add time and can be used to look up the device.
-    DeviceRemoved { device_node: String },
+    /// A physical source was suspended for VT release. Its identity and
+    /// properties remain live while its facets become disabled.
+    DeviceSuspended {
+        source_id: crate::xinput::InputSourceId,
+    },
+    /// A suspended physical source continued on the same kernel endpoint.
+    DeviceResumed(DeviceInfo),
+    /// An input device has been removed by runtime source identity.
+    DeviceRemoved {
+        source_id: crate::xinput::InputSourceId,
+    },
 }
 
 /// Synthetic Linux-style input codes for scroll-wheel "buttons" carried
@@ -346,6 +442,14 @@ mod tests {
     #[test]
     fn device_info_is_clone_and_debug() {
         let info = DeviceInfo {
+            source_id: crate::xinput::InputSourceId(u64::from(line!())),
+            enabled: true,
+            resume_key: None,
+            capabilities: crate::xinput::InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
             name: "Test Touchpad".into(),
             device_node: "/dev/input/event4".into(),
             sysname: "event4".into(),
@@ -375,6 +479,14 @@ mod tests {
     #[test]
     fn host_input_event_device_variants() {
         let info = DeviceInfo {
+            source_id: crate::xinput::InputSourceId(u64::from(line!())),
+            enabled: true,
+            resume_key: None,
+            capabilities: crate::xinput::InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
             name: "Mouse".into(),
             device_node: "/dev/input/event1".into(),
             sysname: "event1".into(),
@@ -388,11 +500,11 @@ mod tests {
             HostInputEvent::DeviceAdded(_)
         ));
         let removed = HostInputEvent::DeviceRemoved {
-            device_node: "/dev/input/event1".into(),
+            source_id: crate::xinput::InputSourceId(1),
         };
         match removed {
-            HostInputEvent::DeviceRemoved { device_node } => {
-                assert_eq!(device_node, "/dev/input/event1");
+            HostInputEvent::DeviceRemoved { source_id } => {
+                assert_eq!(source_id, crate::xinput::InputSourceId(1));
             }
             other => panic!("expected DeviceRemoved, got {other:?}"),
         }

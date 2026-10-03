@@ -3,28 +3,33 @@
 //! Deliberately minimal: keycodes, pointer deltas, button + state.
 //! No keysym translation — that's xkbcommon's job and lives in C.
 
-use yserver_core::core_loop::DeviceInfo;
+use yserver_core::{core_loop::DeviceInfo, xinput::InputSourceId};
 
 #[derive(Debug, Clone)]
 pub enum InputEvent {
     KeyPress {
+        source_id: InputSourceId,
         keycode: u32,
     },
     KeyRelease {
+        source_id: InputSourceId,
         keycode: u32,
     },
     /// Relative pointer motion (mouse).
     PointerMotion {
+        source_id: InputSourceId,
         dx: f64,
         dy: f64,
     },
     /// Absolute pointer motion (tablet).  Coordinates are in 0..1 over the
     /// device's logical surface; the backend scales to scanout dimensions.
     PointerMotionAbsolute {
+        source_id: InputSourceId,
         x_norm: f64,
         y_norm: f64,
     },
     Button {
+        source_id: InputSourceId,
         code: u32,
         pressed: bool,
     },
@@ -33,6 +38,7 @@ pub enum InputEvent {
     /// `dx_v120 > 0` is scroll-right, `dy_v120 > 0` is scroll-down (matches
     /// libinput's convention).
     PointerScroll {
+        source_id: InputSourceId,
         dx_v120: i32,
         dy_v120: i32,
     },
@@ -43,14 +49,16 @@ pub enum InputEvent {
     /// commit a horizontal-swipe history navigation (bug 1539730); without it
     /// the swipe arrow appears but never fires. Only `ScrollFinger` produces
     /// this — `ScrollContinuous`/`ScrollWheel` have no finger-lift.
-    PointerScrollStop,
+    PointerScrollStop { source_id: InputSourceId },
     /// A new input device has been enumerated by libinput.  Carries a
-    /// snapshot of its identity and configuration; forwarded to the core for
-    /// Task 2's XI2 device-property registry.
+    /// snapshot of its identity and configuration; forwarded to the
+    /// process-lifetime source inventory.
     DeviceAdded(DeviceInfo),
-    /// An input device has been removed; matched by the evdev device node
-    /// that was reported at add time.
-    DeviceRemoved {
-        device_node: String,
-    },
+    /// The source remains present but its libinput attachment was retired
+    /// for VT release.
+    DeviceSuspended { source_id: InputSourceId },
+    /// A paused source continued on its original kernel endpoint.
+    DeviceResumed(DeviceInfo),
+    /// An input device has been removed. The source ID is its runtime identity.
+    DeviceRemoved { source_id: InputSourceId },
 }

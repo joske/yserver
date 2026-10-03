@@ -323,9 +323,9 @@ where
 /// State-borrowing replacement for `nested::emit_xi2_focus_event`.
 ///
 /// Emits an XI2 FocusIn / FocusOut on `window` to clients selecting
-/// the matching XI2 evtype on `(window, deviceid)` for any of the
-/// fallback device candidates `[5, 3, 1, 0]` (slave keyboard, then
-/// master keyboard, then AllMasterDevices, then AllDevices). The
+/// the matching XI2 evtype on the master keyboard or either wildcard
+/// selector. Focus transitions carry master keyboard deviceid 3, so
+/// the XTEST keyboard's exact-device selector is not eligible. The
 /// encoding is byte-order agnostic, matching the pre-lift helper.
 ///
 /// `xi2_major_opcode` is the XI extension's runtime-assigned major
@@ -344,14 +344,15 @@ pub fn emit_xi2_focus_event_to_state(
         .clients
         .iter()
         .filter_map(|(id, client)| {
-            let mask = client
-                .xi2_masks
-                .get(&(window, 5))
-                .or_else(|| client.xi2_masks.get(&(window, 3)))
-                .or_else(|| client.xi2_masks.get(&(window, 1)))
-                .or_else(|| client.xi2_masks.get(&(window, 0)))
-                .copied()
-                .unwrap_or(0);
+            let mask = [
+                crate::xinput::DEVICEID_MASTER_KEYBOARD,
+                1, // XIAllMasterDevices applies to this master device.
+                0, // XIAllDevices applies to every device.
+            ]
+            .into_iter()
+            .filter_map(|device_id| client.xi2_masks.get(&(window, device_id)))
+            .copied()
+            .fold(0, |combined, selected| combined | selected);
             if mask & (1 << evtype) != 0 {
                 Some(ClientId(*id))
             } else {
@@ -392,19 +393,14 @@ pub fn emit_xi2_focus_event_to_state(
 /// active slave swap).
 const XI_REASON_DEVICE_CHANGE: u8 = 2;
 
-/// Emit an XI2 `XI_DeviceChanged` for the slave pointer (device 4) to
-/// every client that selected `XI_DeviceChanged` on it.
+/// Emit an XI2 `XI_DeviceChanged` for the bootstrapped virtual XTEST
+/// pointer to clients that selected that device or `XIAllDevices`.
+/// Physical registry facets are never represented by device 4 here.
+/// The carried class set keeps the query-compatible button + 4 valuator
+/// + 2 scroll shape.
 ///
-/// Called after `xi_seed_touchpad` / `xi_clear_touchpad` so a running
-/// desktop re-reads device 4 (picking up the new name + libinput
-/// properties when a touchpad appears, or the reverted defaults when it
-/// disappears). The carried class set mirrors the device-4 classes the
-/// XIQueryDevice handler reports (button + 4 valuators + 2 scroll), so a
-/// client re-querying after the event sees a consistent device.
-///
-/// Selection matches device 4 explicitly, plus the `XIAllDevices` (0)
-/// and `XIAllMasterDevices` (1) wildcards a client may have used. If no
-/// client selected, this is a no-op. Returns clients whose outbound
+/// `XIAllMasterDevices` does not select this slave event. If no client
+/// selected, this is a no-op. Returns clients whose outbound
 /// buffer overflowed (for `ClientDisconnected` reporting).
 ///
 /// `xi2_major_opcode` is the XI extension's runtime-assigned major
@@ -413,27 +409,23 @@ pub fn emit_xi2_device_changed_slave_pointer(
     state: &mut ServerState,
     xi2_major_opcode: u8,
 ) -> Vec<ClientId> {
-    const SLAVE_POINTER: u16 = 4;
+    const XTEST_POINTER: u16 = crate::xinput::DEVICEID_XTEST_POINTER;
 
     // Clients select on (window, deviceid). DeviceChanged is a
     // hierarchy-wide event clients select on the ROOT window (the same
     // window `process_request`'s XISelectEvents bootstrap requires before
     // it sends the initial DeviceChanged). Match the root window only —
     // matching any window would spuriously deliver to a client that
-    // selected DeviceChanged on some unrelated child. Device-id match
-    // covers device 4 plus the AllDevices(0)/AllMasterDevices(1)
-    // wildcards.
+    // selected DeviceChanged on some unrelated child. The XTEST device
+    // matches its exact selector and XIAllDevices(0); it is not a master,
+    // so XIAllMasterDevices(1) does not match.
     let targets: Vec<ClientId> = state
         .clients
         .iter()
         .filter_map(|(id, client)| {
             let selected = client.xi2_masks.iter().any(|(&(window, dev), &mask)| {
                 window == ROOT_WINDOW
-                    // NOTE: XIAllMasterDevices(1) technically covers
-                    // masters only; device 4 is a slave. Kept for
-                    // delivery breadth; real clients select via
-                    // XIAllDevices(0).
-                    && matches!(dev, SLAVE_POINTER | 0 | 1)
+                    && matches!(dev, XTEST_POINTER | 0)
                     && (mask & u64::from(XI2_DEVICE_CHANGED_MASK)) != 0
             });
             selected.then_some(ClientId(*id))
@@ -451,164 +443,70 @@ pub fn emit_xi2_device_changed_slave_pointer(
             order,
             seq,
             xi2_major_opcode,
-            SLAVE_POINTER,
+            XTEST_POINTER,
             time,
             num_classes,
-            SLAVE_POINTER, // sourceid = the device itself
+            XTEST_POINTER, // sourceid = the XTEST device itself
             XI_REASON_DEVICE_CHANGE,
             &classes,
         );
     })
 }
 
-/// Build the XI2 device-class block for the slave pointer (device 4),
-/// returning `(class_bytes, num_classes)`.
+/// Build the XI2 device-class block for the virtual XTEST pointer.
 ///
-/// This is the SINGLE source of truth for device 4's class shape:
-/// Button(7) + Valuator×4 (X, Y, vert-scroll, horiz-scroll) + Scroll×2
-/// (vert, horiz). Both XIQueryDevice's device-4 path (opcode 48) and the
-/// touchpad-add/remove `XI_DeviceChanged` fanout call it, so the bytes can
-/// never drift apart (asserted byte-identical by
-/// `query_device_4_matches_device_changed_block`). `num_classes` is
-/// derived from the writes below, not hardcoded at the call sites.
-///
-/// The scroll valuators MUST stay declared — dropping them fires a
-/// Gdk-CRITICAL (`_gdk_x11_device_xi2_add_scroll_valuator` asserts the
-/// scroll axis index is within the valuator count).
+/// The query encoder owns the shared button/valuator/scroll class layout;
+/// both XIQueryDevice and DeviceChanged use it so their class blocks remain
+/// byte-identical for little-endian clients.
 pub(crate) fn build_slave_pointer_class_block(state: &mut ServerState) -> (Vec<u8>, u16) {
-    const DEVICEID: u16 = 4;
+    build_pointer_class_block_for_device(state, crate::xinput::DEVICEID_XTEST_POINTER)
+}
 
-    fn write_button_class(buf: &mut Vec<u8>, sourceid: u16, label_atoms: &[x11::AtomId]) {
-        let le = ClientByteOrder::LittleEndian;
-        let num_buttons = u16::try_from(label_atoms.len()).unwrap_or(u16::MAX);
-        let state_words = num_buttons.div_ceil(32) as usize;
-        let byte_len = 8 + 4 * state_words + 4 * num_buttons as usize;
-        x11::write_u16(le, buf, 1); // type = Button
-        x11::write_u16(le, buf, (byte_len / 4) as u16);
-        x11::write_u16(le, buf, sourceid);
-        x11::write_u16(le, buf, num_buttons);
-        buf.extend(std::iter::repeat_n(0u8, 4 * state_words));
-        for atom in label_atoms {
-            x11::write_u32(le, buf, atom.0);
-        }
+pub(crate) fn build_pointer_class_block_for_device(
+    state: &mut ServerState,
+    device_id: u16,
+) -> (Vec<u8>, u16) {
+    let class_data = pointer_class_data_for_device(state, device_id);
+    crate::xinput::query::build_pointer_classes(
+        ClientByteOrder::LittleEndian,
+        device_id,
+        class_data,
+    )
+}
+
+pub(crate) fn pointer_class_data_for_device(
+    state: &mut ServerState,
+    device_id: u16,
+) -> crate::xinput::query::XiQueryClassData {
+    crate::xinput::query::XiQueryClassData {
+        button_labels: [
+            state.atoms.intern("Button Left", false),
+            state.atoms.intern("Button Middle", false),
+            state.atoms.intern("Button Right", false),
+            state.atoms.intern("Button Wheel Up", false),
+            state.atoms.intern("Button Wheel Down", false),
+            state.atoms.intern("Button Horiz Wheel Left", false),
+            state.atoms.intern("Button Horiz Wheel Right", false),
+        ],
+        axis_labels: [
+            state.atoms.intern("Rel X", false),
+            state.atoms.intern("Rel Y", false),
+            state.atoms.intern("Rel Vert Scroll", false),
+            state.atoms.intern("Rel Horiz Scroll", false),
+        ],
+        pointer: (
+            i32::from(state.randr.screen_width) / 2,
+            i32::from(state.randr.screen_height) / 2,
+        ),
+        scroll: if device_id == crate::xinput::DEVICEID_MASTER_POINTER {
+            state.scroll_axis_value
+        } else {
+            state
+                .xi_devices
+                .device(device_id)
+                .map_or(state.scroll_axis_value, |device| device.scroll_axis_values)
+        },
     }
-
-    fn write_valuator_class(
-        buf: &mut Vec<u8>,
-        sourceid: u16,
-        number: u16,
-        label_atom: x11::AtomId,
-        min_int: i32,
-        max_int: i32,
-        mode: u8,
-        value: i32,
-    ) {
-        let le = ClientByteOrder::LittleEndian;
-        x11::write_u16(le, buf, 2); // type = Valuator
-        x11::write_u16(le, buf, 11);
-        x11::write_u16(le, buf, sourceid);
-        x11::write_u16(le, buf, number);
-        x11::write_u32(le, buf, label_atom.0);
-        x11::write_u32(le, buf, min_int as u32);
-        x11::write_u32(le, buf, 0);
-        x11::write_u32(le, buf, max_int as u32);
-        x11::write_u32(le, buf, 0);
-        x11::write_u32(le, buf, value as u32);
-        x11::write_u32(le, buf, 0);
-        x11::write_u32(le, buf, 0); // resolution
-        buf.push(mode);
-        buf.extend_from_slice(&[0u8; 3]);
-    }
-
-    fn write_scroll_class(buf: &mut Vec<u8>, sourceid: u16, number: u16, scroll_type: u16) {
-        let le = ClientByteOrder::LittleEndian;
-        x11::write_u16(le, buf, 3); // type = Scroll
-        x11::write_u16(le, buf, 6);
-        x11::write_u16(le, buf, sourceid);
-        x11::write_u16(le, buf, number);
-        x11::write_u16(le, buf, scroll_type);
-        x11::write_u16(le, buf, 0); // pad
-        x11::write_u32(le, buf, 0); // flags
-        x11::write_u32(le, buf, 1); // increment = 1.0
-        x11::write_u32(le, buf, 0);
-    }
-
-    let pointer = (
-        i32::from(state.randr.screen_width) / 2,
-        i32::from(state.randr.screen_height) / 2,
-    );
-    let button_labels = [
-        state.atoms.intern("Button Left", false),
-        state.atoms.intern("Button Middle", false),
-        state.atoms.intern("Button Right", false),
-        state.atoms.intern("Button Wheel Up", false),
-        state.atoms.intern("Button Wheel Down", false),
-        state.atoms.intern("Button Horiz Wheel Left", false),
-        state.atoms.intern("Button Horiz Wheel Right", false),
-    ];
-    let axis_labels = [
-        state.atoms.intern("Rel X", false),
-        state.atoms.intern("Rel Y", false),
-        state.atoms.intern("Rel Vert Scroll", false),
-        state.atoms.intern("Rel Horiz Scroll", false),
-    ];
-    let scroll = state.scroll_axis_value;
-
-    // `num_classes` is incremented per class written below so the count
-    // can never drift from the actual byte content.
-    let mut classes = Vec::new();
-    let mut num_classes = 0u16;
-    write_button_class(&mut classes, DEVICEID, &button_labels);
-    num_classes += 1;
-    write_valuator_class(
-        &mut classes,
-        DEVICEID,
-        0,
-        axis_labels[0],
-        -1,
-        -1,
-        0,
-        pointer.0,
-    );
-    num_classes += 1;
-    write_valuator_class(
-        &mut classes,
-        DEVICEID,
-        1,
-        axis_labels[1],
-        -1,
-        -1,
-        0,
-        pointer.1,
-    );
-    num_classes += 1;
-    write_valuator_class(
-        &mut classes,
-        DEVICEID,
-        2,
-        axis_labels[2],
-        -1,
-        0,
-        0,
-        scroll[0],
-    );
-    num_classes += 1;
-    write_valuator_class(
-        &mut classes,
-        DEVICEID,
-        3,
-        axis_labels[3],
-        -1,
-        0,
-        0,
-        scroll[1],
-    );
-    num_classes += 1;
-    write_scroll_class(&mut classes, DEVICEID, 2, 1); // vertical
-    num_classes += 1;
-    write_scroll_class(&mut classes, DEVICEID, 3, 2); // horizontal
-    num_classes += 1;
-    (classes, num_classes)
 }
 
 /// State-borrowing replacement for `nested::expose_event_fanout`.
@@ -813,9 +711,12 @@ mod tests {
         server::{ClientState, ServerState},
     };
 
-    fn make_client(writer: UnixStream, mask_for_root: u32) -> ClientState {
+    fn make_client_with_transport(
+        writer: crate::transport::Transport,
+        mask_for_root: u32,
+    ) -> ClientState {
         ClientState {
-            writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(writer))),
+            writer: Arc::new(Mutex::new(writer)),
             byte_order: ClientByteOrder::LittleEndian,
             last_sequence: Arc::new(AtomicU16::new(0)),
             resource_id_base: 0,
@@ -835,11 +736,38 @@ mod tests {
         }
     }
 
+    fn make_client(writer: UnixStream, mask_for_root: u32) -> ClientState {
+        make_client_with_transport(crate::transport::Transport::Unix(writer), mask_for_root)
+    }
+
     fn install(state: &mut ServerState, id: u32, mask: u32) -> UnixStream {
         let (a, b) = UnixStream::pair().unwrap();
         let client = make_client(a, mask);
         state.clients.insert(id, client);
         b
+    }
+
+    fn install_capture(state: &mut ServerState, id: u32) -> crate::transport::CapturedPeer {
+        let (writer, peer) = crate::transport::Transport::capture_pair();
+        state
+            .clients
+            .insert(id, make_client_with_transport(writer, 0));
+        peer
+    }
+
+    fn read_all_capture(peer: &mut crate::transport::CapturedPeer) -> Vec<u8> {
+        peer.set_nonblocking(true).expect("set capture nonblocking");
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 128];
+        loop {
+            match peer.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("capture read failed: {error}"),
+            }
+        }
+        bytes
     }
 
     /// Issue #141 — a reparenting WM must not be handed a core press that
@@ -1077,6 +1005,87 @@ mod tests {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             other => panic!("client 2 unexpectedly received: {other:?}"),
         }
+    }
+
+    #[test]
+    fn xi2_focus_event_for_master_does_not_target_xtest_keyboard() {
+        let mut state = ServerState::new();
+        let window = ROOT_WINDOW;
+        let mut xtest_peer = install_capture(&mut state, 1);
+        let mut master_peer = install_capture(&mut state, 2);
+        let mut all_masters_peer = install_capture(&mut state, 3);
+        let mut all_devices_peer = install_capture(&mut state, 4);
+        for (client_id, device_id) in [
+            (1, crate::xinput::DEVICEID_XTEST_KEYBOARD),
+            (2, crate::xinput::DEVICEID_MASTER_KEYBOARD),
+            (3, 1),
+            (4, 0),
+        ] {
+            state
+                .clients
+                .get_mut(&client_id)
+                .expect("registered focus client")
+                .xi2_masks
+                .insert((window, device_id), 1 << 9);
+        }
+        state
+            .clients
+            .get_mut(&2)
+            .expect("registered master focus client")
+            .xi2_masks
+            .insert((window, crate::xinput::DEVICEID_MASTER_KEYBOARD), 1 << 2);
+        state
+            .clients
+            .get_mut(&2)
+            .expect("registered master focus client")
+            .xi2_masks
+            .insert((window, 1), 1 << 9);
+
+        assert!(emit_xi2_focus_event_to_state(&mut state, window, 9, 137, 0, 0, 0, 0).is_empty());
+
+        assert!(
+            read_all_capture(&mut xtest_peer).is_empty(),
+            "the focus transition is for master keyboard 3, not XTEST keyboard 5"
+        );
+        for (peer, label) in [
+            (&mut master_peer, "master keyboard"),
+            (&mut all_masters_peer, "XIAllMasterDevices"),
+            (&mut all_devices_peer, "XIAllDevices"),
+        ] {
+            let event = read_all_capture(peer);
+            assert_eq!(event.len(), 76, "{label} receives one focus event");
+            assert_eq!(u16::from_le_bytes(event[8..10].try_into().unwrap()), 9);
+            assert_eq!(
+                u16::from_le_bytes(event[10..12].try_into().unwrap()),
+                crate::xinput::DEVICEID_MASTER_KEYBOARD,
+                "focus event deviceid is the master keyboard"
+            );
+            assert_eq!(
+                u16::from_le_bytes(event[16..18].try_into().unwrap()),
+                crate::xinput::DEVICEID_MASTER_KEYBOARD,
+                "focus event sourceid is the master keyboard"
+            );
+        }
+        assert_eq!(state.clients.len(), 4);
+        assert_eq!(
+            state.clients[&1].xi2_masks,
+            HashMap::from([((window, crate::xinput::DEVICEID_XTEST_KEYBOARD), 1 << 9)])
+        );
+        assert_eq!(
+            state.clients[&2].xi2_masks,
+            HashMap::from([
+                ((window, crate::xinput::DEVICEID_MASTER_KEYBOARD), 1 << 2),
+                ((window, 1), 1 << 9),
+            ])
+        );
+        assert_eq!(
+            state.clients[&3].xi2_masks,
+            HashMap::from([((window, 1), 1 << 9)])
+        );
+        assert_eq!(
+            state.clients[&4].xi2_masks,
+            HashMap::from([((window, 0), 1 << 9)])
+        );
     }
 
     #[test]

@@ -33,6 +33,19 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-10-02 dynamic XI device registry implemented (branch
+  `feat/xi-dynamic-registry-implementation`):** KMS/libinput publishes
+  source-owned keyboard, pointer, and touchpad facets with independent
+  properties; recognized property writes commit only after libinput confirms
+  them. XI1 and XI2 expose hotplug through presence and hierarchy notifications.
+  VT continuation preserves proven source identities and settings, and server
+  reset replays the current enabled and suspended inventory into a fresh XI
+  registry. Direct touch and a server-wide acceleration default are not
+  provided. Known limitations: under an owner-events XI grab, wheel smooth-scroll
+  Motion can be lost when the client selected ButtonPress but not Motion on the window under the pointer;
+  a `LockMods` action with `affect=lock` (lock without unlock) unlocks if its keyboard floats under an XI
+  grab while that key is held. Hardware verification: see PR.
+
 - **2026-09-29 RANDR CRTC rotation and reflection (branch
   `feat/randr-rotation`):** SetCrtcConfig accepts modesetting's
   `rotations = 0x3f`; GetCrtcInfo and the three RANDR events carry the

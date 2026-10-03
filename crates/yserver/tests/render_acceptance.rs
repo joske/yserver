@@ -12836,6 +12836,7 @@ fn border_press_reports_negative_content_coords_on_the_wire() {
         // `resolve_pointer_hit` takes the live-root path and the hit is
         // resolved from `root_x`/`root_y` alone.
         let press = HostPointerEvent {
+            origin: yserver_core::core_loop::InputOrigin::XTest(4),
             kind: PointerEventKind::ButtonPress,
             host_xid: 0,
             detail: 1,

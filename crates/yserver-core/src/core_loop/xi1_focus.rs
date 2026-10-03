@@ -721,7 +721,7 @@ mod tests {
     };
     use yserver_protocol::x11::{ClientByteOrder, ClientId, CreateWindowRequest};
 
-    const DEV: u16 = crate::xinput::DEVICEID_SLAVE_KEYBOARD;
+    const DEV: u16 = crate::xinput::DEVICEID_XTEST_KEYBOARD;
 
     // Duplicated from pointer_fanout.rs::tests (shared test_fixtures
     // module is a tracked follow-up).

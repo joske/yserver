@@ -8,10 +8,7 @@
 //! `docs/superpowers/specs/2026-09-09-server-reset-design.md`,
 //! "`InputInventory` — the seed source for input, and who owns it".
 //!
-//! Populated purely from `Message::HostInput`'s `DeviceAdded`/
-//! `DeviceRemoved` (see `crates/yserver/src/input/context.rs:314,331` for
-//! the event shapes). Nothing consumes it yet — this step is additive
-//! only, and does not change any existing behaviour.
+//! Populated from process-lifetime `Message::HostInput` lifecycle events.
 //!
 //! Deliberately atom-free: `DeviceInfo` carries device facts only — no
 //! interned property atoms, no XI device ids. That is what will let a
@@ -22,41 +19,13 @@
 use std::collections::HashMap;
 
 use super::message::DeviceInfo;
-
-/// Evdev device-node key (e.g. `/dev/input/event4`), as reported at
-/// `DeviceAdded` time and used again verbatim at `DeviceRemoved`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct DeviceNode(String);
-
-impl DeviceNode {
-    #[must_use]
-    pub fn new(device_node: impl Into<String>) -> Self {
-        Self(device_node.into())
-    }
-
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl From<&str> for DeviceNode {
-    fn from(value: &str) -> Self {
-        Self::new(value)
-    }
-}
-
-impl From<String> for DeviceNode {
-    fn from(value: String) -> Self {
-        Self::new(value)
-    }
-}
+use crate::xinput::{InputSourceId, libinput_props::DeviceConfigChange};
 
 /// Process-lifetime input device inventory, owned beside the core loop
 /// (a local binding in `run_core`, never a field of `ServerState`).
 #[derive(Debug, Default)]
 pub struct InputInventory {
-    devices: HashMap<DeviceNode, DeviceInfo>,
+    devices: HashMap<InputSourceId, DeviceInfo>,
 }
 
 impl InputInventory {
@@ -65,40 +34,62 @@ impl InputInventory {
         Self::default()
     }
 
-    /// Record (or re-record) a device. A duplicate `DeviceAdded` for a
-    /// node already present replaces the entry rather than duplicating
-    /// it — plain `HashMap::insert` semantics, called out because it is
-    /// this step's stated proof obligation.
+    /// Record or refresh the facts for one runtime source.
     pub fn add(&mut self, info: DeviceInfo) {
-        let node = DeviceNode::new(info.device_node.clone());
-        self.devices.insert(node, info);
+        self.devices.insert(info.source_id, info);
     }
 
-    /// Drop a device by node. No-op if the node isn't present.
-    pub fn remove(&mut self, device_node: &str) {
-        self.devices.remove(&DeviceNode::new(device_node));
+    /// Mark a source disabled while preserving its facts for server reset.
+    pub fn suspend(&mut self, source_id: InputSourceId) {
+        if let Some(info) = self.devices.get_mut(&source_id) {
+            info.enabled = false;
+        }
+    }
+
+    /// Mark every known source unavailable in the same core-loop dispatch as
+    /// VT release. The backend performs synchronous held-state cleanup before
+    /// the VT handoff; later per-device suspend messages remain idempotent.
+    pub fn suspend_all(&mut self) {
+        for info in self.devices.values_mut() {
+            info.enabled = false;
+        }
+    }
+
+    /// Refresh a continued source after libinput has restored its settings.
+    pub fn resume(&mut self, mut info: DeviceInfo) {
+        info.enabled = true;
+        self.add(info);
+    }
+
+    /// Record a configuration value only after the source's live libinput
+    /// handle confirms it. Returns false when that source has already been
+    /// removed from the process-lifetime inventory.
+    pub fn update_config(&mut self, source: InputSourceId, change: DeviceConfigChange) -> bool {
+        let Some(info) = self.devices.get_mut(&source) else {
+            return false;
+        };
+        info.config.apply_confirmed(change);
+        true
+    }
+
+    /// Drop one source. No-op if it is already absent.
+    pub fn remove(&mut self, source_id: InputSourceId) {
+        self.devices.remove(&source_id);
     }
 
     #[must_use]
-    pub fn get(&self, device_node: &str) -> Option<&DeviceInfo> {
-        self.devices.get(&DeviceNode::new(device_node))
+    pub fn get(&self, source_id: InputSourceId) -> Option<&DeviceInfo> {
+        self.devices.get(&source_id)
     }
 
-    /// Every recorded device, ordered by device node.
-    ///
-    /// Sorted rather than in `HashMap` order because the consumer —
-    /// the server-reset boundary — replays these into
-    /// `ServerState::xi_seed_touchpad`, which writes a single
-    /// latest-wins slave-pointer slot. Iteration order therefore
-    /// decides which device wins, and a reset must not produce a
-    /// different XI model each time it runs.
+    /// Every recorded source, ordered by runtime identity.
     #[must_use]
-    pub fn devices_by_node(&self) -> Vec<&DeviceInfo> {
-        let mut nodes: Vec<&DeviceNode> = self.devices.keys().collect();
-        nodes.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-        nodes
+    pub fn devices_by_source(&self) -> Vec<&DeviceInfo> {
+        let mut sources: Vec<InputSourceId> = self.devices.keys().copied().collect();
+        sources.sort_unstable_by_key(|source_id| source_id.0);
+        sources
             .into_iter()
-            .filter_map(|node| self.devices.get(node))
+            .filter_map(|source_id| self.devices.get(&source_id))
             .collect()
     }
 
@@ -118,8 +109,16 @@ mod tests {
     use super::*;
     use crate::core_loop::message::LibinputConfigSnapshot;
 
-    fn device(node: &str, name: &str) -> DeviceInfo {
+    fn device(source: u64, node: &str, name: &str) -> DeviceInfo {
         DeviceInfo {
+            source_id: crate::xinput::InputSourceId(source),
+            enabled: true,
+            resume_key: None,
+            capabilities: crate::xinput::InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
             name: name.into(),
             device_node: node.into(),
             sysname: node.trim_start_matches("/dev/input/").into(),
@@ -140,39 +139,54 @@ mod tests {
     #[test]
     fn add_then_remove_leaves_the_expected_set() {
         let mut inventory = InputInventory::new();
-        inventory.add(device("/dev/input/event3", "Mouse"));
-        inventory.add(device("/dev/input/event4", "Touchpad"));
+        inventory.add(device(3, "/dev/input/event3", "Mouse"));
+        inventory.add(device(4, "/dev/input/event4", "Touchpad"));
         assert_eq!(inventory.len(), 2);
-        assert!(inventory.get("/dev/input/event3").is_some());
-        assert!(inventory.get("/dev/input/event4").is_some());
+        assert!(inventory.get(InputSourceId(3)).is_some());
+        assert!(inventory.get(InputSourceId(4)).is_some());
 
-        inventory.remove("/dev/input/event3");
+        inventory.remove(InputSourceId(3));
         assert_eq!(inventory.len(), 1);
-        assert!(inventory.get("/dev/input/event3").is_none());
-        assert!(inventory.get("/dev/input/event4").is_some());
+        assert!(inventory.get(InputSourceId(3)).is_none());
+        assert!(inventory.get(InputSourceId(4)).is_some());
     }
 
     #[test]
     fn removing_an_absent_node_is_a_no_op() {
         let mut inventory = InputInventory::new();
-        inventory.add(device("/dev/input/event3", "Mouse"));
-        inventory.remove("/dev/input/event9");
+        inventory.add(device(3, "/dev/input/event3", "Mouse"));
+        inventory.remove(InputSourceId(9));
         assert_eq!(inventory.len(), 1);
     }
 
     #[test]
-    fn duplicate_device_added_for_one_node_replaces_rather_than_duplicates() {
+    fn suspend_all_marks_every_inventory_source_unavailable() {
         let mut inventory = InputInventory::new();
-        inventory.add(device("/dev/input/event4", "Touchpad v1"));
-        inventory.add(device("/dev/input/event4", "Touchpad v2"));
+        inventory.add(device(3, "/dev/input/event3", "Mouse"));
+        inventory.add(device(4, "/dev/input/event4", "Keyboard"));
+
+        inventory.suspend_all();
+
+        assert_eq!(inventory.len(), 2);
+        assert_eq!(inventory.devices_by_source().len(), 2);
+        assert!(
+            inventory
+                .devices_by_source()
+                .iter()
+                .all(|info| !info.enabled)
+        );
+    }
+
+    #[test]
+    fn duplicate_device_added_for_one_source_replaces_rather_than_duplicates() {
+        let mut inventory = InputInventory::new();
+        inventory.add(device(4, "/dev/input/event4", "Touchpad v1"));
+        inventory.add(device(4, "/dev/input/event9", "Touchpad v2"));
         assert_eq!(
             inventory.len(),
             1,
-            "a second DeviceAdded for the same node must replace, not duplicate"
+            "a second DeviceAdded for the same source must replace, not duplicate"
         );
-        assert_eq!(
-            inventory.get("/dev/input/event4").unwrap().name,
-            "Touchpad v2"
-        );
+        assert_eq!(inventory.get(InputSourceId(4)).unwrap().name, "Touchpad v2");
     }
 }

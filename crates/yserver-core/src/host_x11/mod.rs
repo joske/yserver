@@ -1442,6 +1442,216 @@ mod tests {
     }
 
     #[test]
+    fn xtest_fake_pointer_keeps_virtual_source_while_nested_host_stays_master_only() {
+        use crate::{
+            backend::Backend,
+            core_loop::{
+                HostInputEvent, InputOrigin, pointer_fanout::pointer_event_fanout_to_state,
+            },
+            host_x11::{HostEvent, HostXidMap},
+            resources::ROOT_WINDOW,
+            server::{ClientState, ServerState},
+            transport::Transport,
+        };
+        use std::{
+            collections::{HashMap, HashSet, VecDeque},
+            io::{ErrorKind, Read},
+            sync::{Arc, Mutex, atomic::AtomicU16},
+        };
+        use yserver_protocol::x11::{ClientByteOrder, ClientId, RequestHeader, SequenceNumber};
+
+        fn request(
+            state: &mut ServerState,
+            backend: &mut HostX11Backend,
+            sequence: u16,
+            opcode: u8,
+            data: u8,
+            body: &[u8],
+        ) {
+            crate::core_loop::process_request::process_request(
+                state,
+                backend,
+                ClientId(1),
+                SequenceNumber(sequence),
+                RequestHeader {
+                    opcode,
+                    data,
+                    length_units: u32::try_from((body.len() + 4) / 4).unwrap(),
+                },
+                body,
+                None,
+            )
+            .expect("process production request");
+        }
+
+        fn drain(peer: &mut crate::transport::CapturedPeer) -> Vec<u8> {
+            peer.set_nonblocking(true).expect("nonblocking peer");
+            let mut bytes = Vec::new();
+            let mut buffer = [0u8; 256];
+            loop {
+                match peer.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("read capture: {error}"),
+                }
+            }
+            peer.set_nonblocking(false).expect("blocking peer");
+            bytes
+        }
+
+        fn event_forms(bytes: &[u8]) -> Vec<(u16, u16, u16)> {
+            let mut forms = Vec::new();
+            let mut offset = 0;
+            while offset < bytes.len() {
+                assert_eq!(bytes[offset], 35, "XI2 GenericEvent");
+                let units = usize::try_from(u32::from_le_bytes(
+                    bytes[offset + 4..offset + 8].try_into().unwrap(),
+                ))
+                .unwrap();
+                let event_type = u16::from_le_bytes([bytes[offset + 8], bytes[offset + 9]]);
+                let device_id = u16::from_le_bytes([bytes[offset + 10], bytes[offset + 11]]);
+                let source_id = u16::from_le_bytes([bytes[offset + 52], bytes[offset + 53]]);
+                forms.push((event_type, device_id, source_id));
+                offset += 32 + units * 4;
+            }
+            assert_eq!(offset, bytes.len(), "complete event stream");
+            forms
+        }
+
+        let mut state = ServerState::new();
+        let (writer, mut peer) = Transport::capture_pair();
+        state.clients.insert(
+            1,
+            ClientState {
+                writer: Arc::new(Mutex::new(writer)),
+                is_local: true,
+                fd_passing: true,
+                byte_order: ClientByteOrder::LittleEndian,
+                last_sequence: Arc::new(AtomicU16::new(0)),
+                resource_id_base: 0,
+                resource_id_mask: u32::MAX,
+                event_masks: HashMap::new(),
+                save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::new(),
+                xi1_event_classes: HashSet::new(),
+                xi1_window_event_classes: HashMap::new(),
+                outbound: VecDeque::new(),
+                watching_writable: false,
+                focused_window: ROOT_WINDOW,
+                reader_control: None,
+            },
+        );
+        let mut backend = dummy_backend();
+        backend.xid_map.insert(backend.window_id, ROOT_WINDOW);
+
+        // Select press/release on virtual XTEST pointer 4 and master pointer 2
+        // through the same XISelectEvents request path a client uses.
+        let mut select = Vec::new();
+        select.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        select.extend_from_slice(&2u16.to_le_bytes());
+        select.extend_from_slice(&[0; 2]);
+        for device_id in [4u16, 2] {
+            select.extend_from_slice(&device_id.to_le_bytes());
+            select.extend_from_slice(&1u16.to_le_bytes());
+            select.extend_from_slice(&((1u32 << 4) | (1u32 << 5) | (1u32 << 6)).to_le_bytes());
+        }
+        request(&mut state, &mut backend, 1, 137, 46, &select);
+
+        for (sequence, event_type) in [
+            (2, yserver_protocol::x11::xtest::FAKE_BUTTON_PRESS),
+            (3, yserver_protocol::x11::xtest::FAKE_BUTTON_RELEASE),
+        ] {
+            let mut fake = [0u8; 28];
+            fake[0] = event_type;
+            fake[1] = 1; // Button 1
+            request(&mut state, &mut backend, sequence, 146, 2, &fake);
+            let HostEvent::Pointer(event) = backend
+                .pop_pending_host_event()
+                .expect("XTEST request enqueues a host pointer event")
+            else {
+                panic!("XTEST pointer input was not queued as a pointer event");
+            };
+            let xid_map: HostXidMap = backend.xid_map.clone();
+            let dropped = pointer_event_fanout_to_state(
+                &mut state,
+                &mut backend,
+                &xid_map,
+                event,
+                true,
+                false,
+            );
+            assert!(dropped.is_empty());
+        }
+        let mut fake_motion = [0u8; 28];
+        fake_motion[0] = yserver_protocol::x11::xtest::FAKE_MOTION_NOTIFY;
+        fake_motion[20..22].copy_from_slice(&10i16.to_le_bytes());
+        fake_motion[22..24].copy_from_slice(&20i16.to_le_bytes());
+        request(&mut state, &mut backend, 4, 146, 2, &fake_motion);
+        let HostEvent::Pointer(event) = backend
+            .pop_pending_host_event()
+            .expect("XTEST motion request enqueues a host pointer event")
+        else {
+            panic!("XTEST motion input was not queued as a pointer event");
+        };
+        let xid_map: HostXidMap = backend.xid_map.clone();
+        let dropped =
+            pointer_event_fanout_to_state(&mut state, &mut backend, &xid_map, event, true, false);
+        assert!(dropped.is_empty());
+
+        let xtest_forms = event_forms(&drain(&mut peer));
+        assert!(
+            xtest_forms.contains(&(4, 4, 4)),
+            "XTEST button press carries virtual slave deviceid/sourceid 4: {xtest_forms:?}"
+        );
+        assert!(
+            xtest_forms.contains(&(5, 4, 4)),
+            "XTEST button release carries virtual slave deviceid/sourceid 4: {xtest_forms:?}"
+        );
+        assert!(xtest_forms.contains(&(4, 2, 4)));
+        assert!(xtest_forms.contains(&(5, 2, 4)));
+        assert!(xtest_forms.contains(&(6, 4, 4)));
+        assert!(xtest_forms.contains(&(6, 2, 4)));
+
+        for (pressed, time) in [(true, 5), (false, 6)] {
+            Backend::on_host_input(
+                &mut backend,
+                &mut state,
+                HostInputEvent::PointerButton {
+                    origin: InputOrigin::NestedHost,
+                    button: 0x110,
+                    pressed,
+                    time,
+                },
+            );
+            let HostEvent::Pointer(event) = backend
+                .pop_pending_host_event()
+                .expect("nested host pointer event is queued")
+            else {
+                panic!("nested host input was not queued as a pointer event");
+            };
+            let xid_map: HostXidMap = backend.xid_map.clone();
+            let dropped = pointer_event_fanout_to_state(
+                &mut state,
+                &mut backend,
+                &xid_map,
+                event,
+                true,
+                false,
+            );
+            assert!(dropped.is_empty());
+        }
+        let nested_forms = event_forms(&drain(&mut peer));
+        assert_eq!(nested_forms, vec![(4, 2, 2), (5, 2, 2)]);
+        assert_eq!(state.buttons_down, 0);
+        assert_eq!(state.xi_devices.device(2).unwrap().buttons_down, 0);
+        assert_eq!(state.xi_devices.device(4).unwrap().buttons_down, 0);
+        assert!(state.sync_pending.is_empty());
+        assert!(state.unpublished_pointer_buttons_down.is_empty());
+    }
+
+    #[test]
     fn promote_sequence_handles_wrap_against_latest_full_counter() {
         let mut backend = dummy_backend();
         let (wire0, full0) = backend.issue_sequence();

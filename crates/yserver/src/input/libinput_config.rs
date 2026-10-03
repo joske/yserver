@@ -14,9 +14,9 @@
 //! * [`apply`] — route a decoded [`DeviceConfigChange`] to the matching
 //!   `config_*_set_*` setter on the live device, then collapse
 //!   libinput's [`input::DeviceConfigError`] onto yserver's
-//!   [`DeviceConfigError`]. Caller is responsible for keying the live
-//!   handle by devnode and gating absent-device writes (a no-op
-//!   `Ok(())` is the standard contract — see [`super::Context::apply_device_config`]).
+//!   [`DeviceConfigError`]. Caller keys the live handle by source ID and
+//!   reports an absent source as `SourceGone` (see
+//!   [`super::Context::apply_device_config`]).
 //!
 //! The six bit-mapping helpers (`*_bit` / `send_events_*_mask`) are
 //! private to this module — they encode the snapshot's slot order,
@@ -32,7 +32,7 @@
 //! default variant.
 
 use input::{
-    AccelProfile, ClickMethod, Device, DragLockState, ScrollButtonLockState, ScrollMethod,
+    AccelProfile, AsRaw, ClickMethod, Device, DragLockState, ScrollButtonLockState, ScrollMethod,
     SendEventsMode, TapButtonMap,
 };
 use yserver_core::{
@@ -42,9 +42,9 @@ use yserver_core::{
     xinput::libinput_props::{DeviceConfigChange, DeviceConfigError},
 };
 
-/// Map [`AccelProfile`] to the bit index used by the `accel_profile`
-/// `OneHot2` slot (Adaptive=0, Flat=1). Returns `None` for `Custom`,
-/// which is feature-gated and out of scope.
+/// Map [`AccelProfile`] to the bit index used by the current/default
+/// `accel_profile` slots (Adaptive=0, Flat=1). `Custom` remains out of
+/// scope for writes on this build.
 fn accel_profile_bit(profile: AccelProfile) -> Option<u8> {
     match profile {
         AccelProfile::Adaptive => Some(0),
@@ -255,15 +255,31 @@ pub(crate) fn gather(dev: &Device) -> LibinputConfigSnapshot {
         default: dev.config_click_default_method().and_then(click_method_bit),
     };
 
-    // Accel profiles: walk the libinput list, OR in bits for those
-    // we represent in the snapshot (Adaptive=0, Flat=1; Custom ignored).
-    let accel_profiles_vec = dev.config_accel_profiles();
-    let mut accel_profile_mask: u8 = 0;
-    for p in &accel_profiles_vec {
-        if let Some(b) = accel_profile_bit(*p) {
-            accel_profile_mask |= 1 << b;
-        }
-    }
+    // Accel profiles: keep current/default in the established two-slot
+    // snapshot, but capture the actual supported profile mask separately.
+    // The XI property remains three bytes wide; Custom stays unsupported
+    // for writes on this build.
+    // This getter predates libinput 1.23 and its raw bitmask also preserves
+    // the custom capability even when input's safe enum wrapper omits that
+    // variant under the workspace's older API feature set. `dev` owns a live
+    // libinput_device handle for this call; the getter only reads its config.
+    // Native C bits are Flat=0, Adaptive=1, Custom=2; XI wire slots are
+    // Adaptive=0, Flat=1, Custom=2.
+    let native_accel_profile_mask =
+        unsafe { input::ffi::libinput_device_config_accel_get_profiles(dev.as_raw_mut()) };
+    let accel_profile_available_mask = u8::from(
+        native_accel_profile_mask
+            & input::ffi::libinput_config_accel_profile_LIBINPUT_CONFIG_ACCEL_PROFILE_ADAPTIVE
+            != 0,
+    ) | (u8::from(
+        native_accel_profile_mask
+            & input::ffi::libinput_config_accel_profile_LIBINPUT_CONFIG_ACCEL_PROFILE_FLAT
+            != 0,
+    ) << 1)
+        // LIBINPUT_CONFIG_ACCEL_PROFILE_CUSTOM = (1 << 2), introduced in
+        // libinput 1.23; the getter itself is available in the 1.21 bindings.
+        | (u8::from(native_accel_profile_mask & (1 << 2) != 0) << 2);
+    let accel_profile_mask = accel_profile_available_mask & 0b011;
     let accel_profile = OneHot2 {
         available: accel_profile_mask != 0,
         current: dev.config_accel_profile().and_then(accel_profile_bit),
@@ -302,6 +318,7 @@ pub(crate) fn gather(dev: &Device) -> LibinputConfigSnapshot {
         scroll_method,
         click_method,
         accel_profile,
+        accel_profile_available_mask,
         send_events,
     }
 }
