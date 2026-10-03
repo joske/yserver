@@ -7,7 +7,6 @@
 # client's plug inside the first's socket, as xfce4-settings-manager does.
 # shellcheck shell=sh
 # golden: direct.log probe.log xembed-direct.log xembed.log
-# drop: ^  (GraphicsExpose|NoExpose) -- yserver bounds the exposed region by the source only, not by the destination's clip
 set -u
 set +e
 src=${YSERVER_REPO:?}/tools/vng-scenarios/child-clip-probe.c

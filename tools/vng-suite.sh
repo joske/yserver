@@ -14,7 +14,9 @@
 # vng-shot) exited 0, the guest ran under KVM and finished, the server was
 # still alive at the end, and no crash or GPU fault shows in the logs. Each
 # scenario runs in its own session; whatever is left of it is killed by
-# session id afterwards, and on timeout or Ctrl+C.
+# session id afterwards, and on timeout or Ctrl+C. A guest RESULT "skip:
+# <reason>" (a prerequisite the host lacks) is tallied as skip, not a pass
+# or a failure.
 #
 # A guest script with a `# golden:` line (see tools/vng-scenarios/golden.py)
 # must also match tools/vng-scenarios/goldens/<name>.txt after normalisation;
@@ -142,6 +144,7 @@ trap on_signal INT TERM HUP
 
 declare -a rows=()
 failed=0
+skips=0
 row() { rows+=("$(printf '%-20s %-6s %-8s %-7s %5s  %s' "$@")"); }
 
 # Only the guest's own RESULT and complete artifacts gate an Xorg run; $1 is
@@ -212,6 +215,7 @@ run_leg() {
     find "$legdir" \( -type s -o -name monitor.sock \) -delete 2> /dev/null || true
 
     why=()
+    skipped=
     [ -z "$interrupted" ] || why+=("interrupted")
     [ -z "$timed_out" ] || why+=("timeout after ${timeout_s}s")
     [ ! -e "$legdir/NOT-KVM" ] || why+=("guest not under KVM")
@@ -221,6 +225,7 @@ run_leg() {
         result=$(head -1 "$legdir/RESULT")
         case $result in
             pass) ;;
+            skip:*) skipped=${result#skip: };;
             fail:*) why+=("guest: ${result#fail: }");;
             *) why+=("bad RESULT '$result'");;
         esac
@@ -284,11 +289,12 @@ for i in "${!names[@]}"; do
     dir=$run/$name
     rm -rf "$dir"
     # golden=live: boot Xorg first in this same environment, as the reference.
-    xorg_why='' xorg_secs=0
+    xorg_why='' xorg_secs=0 xorg_skipped=
     if [ "$golden" = live ]; then
         xdir=$run/$name.xorg
         run_leg "$name.xorg" --server xorg
         xorg_secs=$secs
+        xorg_skipped=$skipped
         "$regdir/golden.py" "$guest" "$xdir" > "$xdir/golden.txt" || why+=("golden.py failed")
         xorg_gate "$xdir/golden.txt"
         [ -z "$tolerated" ] || echo "vng-suite: $name: live Xorg run tolerated: ${tolerated//;/; }"
@@ -307,7 +313,10 @@ for i in "${!names[@]}"; do
     fi
 
     diff_file=
-    if has_golden "$guest"; then
+    [ -z "$xorg_skipped" ] || skipped=$xorg_skipped
+    if [ -n "$skipped" ] && [ ${#why[@]} -eq 0 ]; then
+        :
+    elif has_golden "$guest"; then
         "$regdir/golden.py" "$guest" "$dir" > "$dir/golden.txt" || why+=("golden.py failed")
         if [ -n "$regen" ]; then
             xorg_gate "$dir/golden.txt"
@@ -329,7 +338,10 @@ for i in "${!names[@]}"; do
         fi
     fi
 
-    if [ ${#why[@]} -eq 0 ]; then
+    if [ -n "$skipped" ] && [ ${#why[@]} -eq 0 ]; then
+        status=skip reason=$skipped
+        skips=$((skips + 1))
+    elif [ ${#why[@]} -eq 0 ]; then
         status=pass reason=
     else
         failed=1
@@ -348,6 +360,7 @@ done
     printf '%-20s %-6s %-8s %-7s %5s  %s\n' scenario mode result kvm secs reason
     printf '%s\n' "${rows[@]}"
 } | tee -a "$summary"
+[ "$skips" -eq 0 ] || echo "vng-suite: $skips scenario(s) skipped (guest RESULT skip)" | tee -a "$summary"
 echo "vng-suite: artifacts in $run"
 [ -z "$interrupted" ] || exit 130
 exit "$failed"

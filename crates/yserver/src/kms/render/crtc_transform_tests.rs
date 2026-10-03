@@ -707,10 +707,11 @@ fn a_truncated_priming_compose_is_not_read() {
     let Some(mut b) = transformed_pair(scale(0x20000, Some(Filter::Nearest)), root) else {
         return;
     };
-    // Root + cursor is two draws; an exhausted pool records only the root.
+    // An exhausted pool records no draw: neither the readback compose nor
+    // the priming one behind it is read.
     register_test_cursor(&mut b);
     (b.core.cursor_x, b.core.cursor_y) = (80.0, 10.0);
-    b.scene.test_prime_descriptor_sets = Some(1);
+    b.scene.test_prime_descriptor_sets = Some(0);
     let root_xid = b.core.window_id;
     let got = b
         .get_image_pixels_for_tests(root_xid, 2, 64, 0, 128, 96, !0)
@@ -936,5 +937,33 @@ fn set_crtc_config_rotates_the_right_hand_output() {
                 64 + x
             );
         }
+    }
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_root_read_sees_a_draw_no_compose_has_shown_yet() {
+    // Xorg's GetImage reads the screen pixmap every earlier request painted
+    // (`DoGetImage`, `dix/dispatch.c:2176`); measured by
+    // tools/vng-scenarios/draw-clip-probe.c (`GetImage root at once`).
+    let Some(mut b) = transformed_pair(scale(0x20000, Some(Filter::Nearest)), (192, 96)) else {
+        return;
+    };
+    let root_xid = b.core.window_id;
+    let _ = compose_right(&mut b);
+    let read = |b: &mut KmsBackend| {
+        b.get_image_pixels_for_tests(root_xid, 2, 70, 6, 8, 8, !0)
+            .expect("get_image")
+            .expect("bytes")
+    };
+    assert_eq!(read(&mut b)[..3], pattern(70, 6)[..3], "as composed");
+    b.fill_rectangle(None, root_xid, 0xFF00_FF00, 64, 0, 64, 48)
+        .expect("green");
+    for (i, px) in read(&mut b).chunks_exact(4).enumerate() {
+        assert_eq!(
+            px[..3],
+            [0x00, 0xFF, 0x00],
+            "pixel #{i} green before any compose"
+        );
     }
 }

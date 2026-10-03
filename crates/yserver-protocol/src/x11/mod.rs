@@ -221,6 +221,8 @@ pub struct CreateWindowRequest {
     /// `Some(None)` = explicit `CopyFromParent` (XID 0); `Some(Some(_))` =
     /// concrete colormap; `None` = bit not set.
     pub colormap: Option<Option<ResourceId>>,
+    /// CW bit 14. 0 = None.
+    pub cursor: Option<ResourceId>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -974,6 +976,7 @@ pub fn create_window_request(depth: u8, body: &[u8]) -> Option<CreateWindowReque
         colormap: values
             .value(13)
             .map(|v| if v == 0 { None } else { Some(ResourceId(v)) }),
+        cursor: values.value(14).map(ResourceId),
     })
 }
 

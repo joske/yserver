@@ -1,5 +1,7 @@
-# Runner self-tests (tools/vng-scenarios/suite-selftest/run.sh): every one must FAIL.
+# Runner self-tests (tools/vng-scenarios/suite-selftest/run.sh): every one must FAIL
+# but selftest-skip, which must skip.
 selftest-fail       guest=fail.sh   timeout=300
 selftest-crash      guest=crash.sh  root-hook=crash-root.sh  timeout=300
 selftest-hang       guest=hang.sh   timeout=60
 selftest-interrupt  guest=hang.sh   timeout=600
+selftest-skip       guest=skip.sh   timeout=300

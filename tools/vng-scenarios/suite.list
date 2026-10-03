@@ -1,5 +1,5 @@
 # Scenarios run by tools/vng-suite.sh, one per line: name, then key=value.
-#   guest=   script sourced in the guest; must write RESULT (pass | fail: <reason>)
+#   guest=   script sourced in the guest; must write RESULT (pass | fail: <reason> | skip: <reason>)
 #   host=    optional host driver: host.sh <name> [vng-shot args...], exit 1 on failure
 #   outputs= heads (default 1)   timeout= seconds (default 300)
 #   gpu=     supported modes (default none,venus)   root-hook= see vng-shot --root-hook
@@ -33,3 +33,9 @@ cow-input-shape      guest=cow-input-shape.sh        timeout=300
 crossing-tree        guest=crossing-tree.sh          timeout=300
 subwindow-move       guest=subwindow-move.sh         timeout=300
 child-clip           guest=child-clip.sh             timeout=300
+draw-clip            guest=draw-clip.sh              timeout=300
+legacy-apps          guest=legacy-apps.sh            timeout=400 golden=live
+screensaver          guest=screensaver.sh            timeout=300
+cde-apps             guest=cde-apps.sh               timeout=700 golden=live root-hook=cde-apps-root.sh
+passive-grab         guest=passive-grab.sh           timeout=300
+cursor               guest=cursor.sh                 timeout=300

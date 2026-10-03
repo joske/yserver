@@ -89,6 +89,22 @@ use crate::{
 /// `change_subwindow_attributes`; the bg-pixel is painted into
 /// storage at allocate + configure resize so freshly-mapped windows
 /// have a defined initial colour.
+/// See `input_only_pointer_hosts`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InputOnlyPointerHost {
+    window: ResourceId,
+    /// Host of the nearest ancestor with a backend window, where the
+    /// cursor walk carries on when no InputOnly window on the way up has
+    /// a cursor.
+    parent_host: u32,
+    /// The first cursor set on the InputOnly windows from `window` up to
+    /// that ancestor.
+    cursor: Option<u32>,
+    /// `window`'s parent-relative origin, which `event_relative_coords`
+    /// subtracts as it does a backend window's (the core adds it back).
+    origin: (i16, i16),
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct WindowGeometry {
     pub(crate) x: i16,
@@ -131,6 +147,42 @@ pub(crate) struct WindowGeometry {
 }
 
 pub(crate) type WindowsMap = HashMap<u32, WindowGeometry>;
+
+/// [`WindowsMap`] counting its mutable borrows, so a clip computed from
+/// it can tell it is still current ([`KmsBackend::subwindow_mode_clip`]).
+#[derive(Debug, Default)]
+pub(crate) struct TrackedWindows {
+    map: WindowsMap,
+    generation: u64,
+}
+
+impl TrackedWindows {
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+impl std::ops::Deref for TrackedWindows {
+    type Target = WindowsMap;
+    fn deref(&self) -> &WindowsMap {
+        &self.map
+    }
+}
+
+impl<'a> IntoIterator for &'a TrackedWindows {
+    type Item = (&'a u32, &'a WindowGeometry);
+    type IntoIter = std::collections::hash_map::Iter<'a, u32, WindowGeometry>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.map.iter()
+    }
+}
+
+impl std::ops::DerefMut for TrackedWindows {
+    fn deref_mut(&mut self) -> &mut WindowsMap {
+        self.generation = self.generation.wrapping_add(1);
+        &mut self.map
+    }
+}
 
 /// Test-only (#133): one scene participant's placement — its host xid and
 /// its output-local rects as `(x, y, w, h)`. Named so
@@ -1367,7 +1419,7 @@ pub struct KmsBackend {
     /// `create_subwindow` / `configure_subwindow` /
     /// `map_subwindow` / `unmap_subwindow` /
     /// `destroy_subwindow`.
-    pub(crate) windows: WindowsMap,
+    pub(crate) windows: TrackedWindows,
     /// Monotonic allocator for per-parent sibling ordering. V2 scene
     /// assembly still stores windows in a flat map, so child z-order
     /// needs an explicit stable rank instead of relying on HashMap
@@ -1524,6 +1576,18 @@ pub struct KmsBackend {
     /// Paces the root-readback warning, which a client reading the root while no output is lit repeats thousands of times a second.
     root_readback_warn: WarnThrottle,
 
+    /// The last [`KmsBackend::subwindow_mode_clip`]: for which window and
+    /// mode, at which generations of the window tree, of the store's
+    /// redirect routing and of the shapes, and what it was.
+    subwindow_clip_cache: std::cell::RefCell<Option<SubwindowClipCacheEntry>>,
+    /// Counts SHAPE changes, for that cache.
+    shape_generation: u64,
+
+    /// Set while a RENDER op repeats itself on a destination's inferiors
+    /// ([`KmsBackend::include_inferiors_dst_fanout`]), so the repeats do
+    /// not fan out again.
+    dst_fanout_active: bool,
+
     /// DRI3 `FenceFromFD` xshmfence-backed fences keyed by the
     /// client's xid. Mesa's loader_dri3 uses xshmfence (memfd +
     /// futex) for idle/sync fences; the mmap'd mapping lets us
@@ -1634,6 +1698,12 @@ pub struct KmsBackend {
     /// `define_cursor(_, 0)` (X11 `None`) falls back to this; the
     /// scene's `register_cursor` swaps to the entry recorded here.
     pub(crate) default_cursor_xid: Option<u32>,
+    /// InputOnly windows the pointer has reached, by the synthetic host
+    /// xid that stands in for them (they have no backend window). Xorg's
+    /// sprite enters InputOnly windows like any other (`XYToWindow`) and
+    /// shows their cursor; the pointer model here is host-keyed, so each
+    /// gets a host xid mapped back to it in `core.xid_map`.
+    pub(crate) input_only_pointer_hosts: HashMap<u32, InputOnlyPointerHost>,
     /// Xid of the currently-effective cursor — the one whose sprite
     /// is shown on screen. Driven by `update_effective_cursor`;
     /// `define_cursor` + `update_pointer_window` re-evaluate it.
@@ -5358,7 +5428,9 @@ impl KmsBackend {
             store: DrawableStore::new(),
             engine,
             scene,
-            windows: WindowsMap::new(),
+            windows: TrackedWindows::default(),
+            subwindow_clip_cache: std::cell::RefCell::new(None),
+            shape_generation: 0,
             next_window_stack_rank: 1,
             telemetry: Telemetry::new(),
             last_observed_pool_creates: 0,
@@ -5383,6 +5455,7 @@ impl KmsBackend {
             picture_drawable_ids: HashMap::new(),
             pending_picture_drawable_refs: HashMap::new(),
             root_readback_warn: WarnThrottle::default(),
+            dst_fanout_active: false,
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
             dri3_syncobjs: HashMap::new(),
@@ -5399,6 +5472,7 @@ impl KmsBackend {
             cursor_pixmaps: HashMap::new(),
             next_cursor_version: 1,
             default_cursor_xid: None,
+            input_only_pointer_hosts: HashMap::new(),
             effective_cursor_xid: None,
             grab_cursor_override: None,
             cursor_hidden: false,
@@ -5474,16 +5548,21 @@ impl KmsBackend {
         // scene registration happen via the shared
         // `insert_cursor_record` path so subsequent client cursors
         // and the default sit on the same plumbing.
-        let xid = self.core.next_host_xid();
-        let bytes = crate::kms::render::cursor::default_arrow_bgra();
-        self.insert_cursor_record(
-            xid,
-            crate::kms::render::cursor::DEFAULT_ARROW_W,
-            crate::kms::render::cursor::DEFAULT_ARROW_H,
-            crate::kms::render::cursor::DEFAULT_ARROW_HOT_X,
-            crate::kms::render::cursor::DEFAULT_ARROW_HOT_Y,
-            bytes,
-        );
+        let xid = if let Some(xid) = self.xorg_root_cursor() {
+            xid
+        } else {
+            let xid = self.core.next_host_xid();
+            let bytes = crate::kms::render::cursor::default_arrow_bgra();
+            self.insert_cursor_record(
+                xid,
+                crate::kms::render::cursor::DEFAULT_ARROW_W,
+                crate::kms::render::cursor::DEFAULT_ARROW_H,
+                crate::kms::render::cursor::DEFAULT_ARROW_HOT_X,
+                crate::kms::render::cursor::DEFAULT_ARROW_HOT_Y,
+                bytes,
+            );
+            xid
+        };
         self.default_cursor_xid = Some(xid);
         // Force the effective cursor to resolve against the new
         // default so the scene picks it up at boot (otherwise
@@ -5493,6 +5572,24 @@ impl KmsBackend {
         self.refresh_effective_cursor();
         log::info!("render: default cursor sprite registered (xid 0x{xid:x})");
         Ok(())
+    }
+
+    /// Xorg's root cursor (`CreateRootCursor`, dix/cursor.c): glyph 0
+    /// (`X_cursor`) of the "cursor" font over mask glyph 1, black on white.
+    /// It is what the screen shows wherever no window sets a cursor.
+    fn xorg_root_cursor(&mut self) -> Option<u32> {
+        let (font, _) = self.open_font(None, "cursor").ok()?;
+        let cursor = self.create_glyph_cursor(
+            None,
+            font,
+            Some(font),
+            0,
+            1,
+            (0, 0, 0),
+            (0xffff, 0xffff, 0xffff),
+        );
+        let _ = self.close_font(None, font.as_raw());
+        cursor.ok().map(CursorHandle::as_raw)
     }
 
     fn arm_direct_vt_switching(&mut self) {
@@ -5793,6 +5890,13 @@ impl KmsBackend {
         // Bound the walk so a corrupted parent loop can't burn the
         // event loop. windows fits in u32 xids; 64 is generous.
         for _ in 0..64 {
+            if let Some(io) = self.input_only_pointer_hosts.get(&cur) {
+                if let Some(c) = io.cursor {
+                    return Some(c);
+                }
+                cur = io.parent_host;
+                continue;
+            }
             if let Some(geom) = self.windows.get(&cur) {
                 if let Some(c) = geom.cursor {
                     return Some(c);
@@ -6372,7 +6476,9 @@ impl KmsBackend {
             store: DrawableStore::new(),
             engine: RenderEngine::stub(),
             scene: SceneCompositor::stub(),
-            windows: WindowsMap::new(),
+            windows: TrackedWindows::default(),
+            subwindow_clip_cache: std::cell::RefCell::new(None),
+            shape_generation: 0,
             next_window_stack_rank: 1,
             telemetry: Telemetry::new(),
             last_observed_pool_creates: 0,
@@ -6397,6 +6503,7 @@ impl KmsBackend {
             picture_drawable_ids: HashMap::new(),
             pending_picture_drawable_refs: HashMap::new(),
             root_readback_warn: WarnThrottle::default(),
+            dst_fanout_active: false,
             dri3_xshmfences: HashMap::new(),
             dri3_sync_resources: HashMap::new(),
             dri3_syncobjs: HashMap::new(),
@@ -6413,6 +6520,7 @@ impl KmsBackend {
             cursor_pixmaps: HashMap::new(),
             next_cursor_version: 1,
             default_cursor_xid: None,
+            input_only_pointer_hosts: HashMap::new(),
             effective_cursor_xid: None,
             grab_cursor_override: None,
             cursor_hidden: false,
@@ -7878,34 +7986,32 @@ impl KmsBackend {
         Ok(local_rects_to_region(cliplist_local))
     }
 
-    /// #135 — materialise the COMPOSITED root as a sampleable drawable, for a
-    /// RENDER source Picture on the root with `subwindow-mode =
-    /// IncludeInferiors`.
+    /// What a RENDER source Picture on a window reads, as a sampleable
+    /// drawable, when the window's own storage does not hold it: Xorg
+    /// samples the pixmap the window draws into, its inferiors and all,
+    /// whatever the picture's subwindow mode — only a client clip limits
+    /// a source (`miClipPictureSrc`, `render/mipict.c:265-284`; fb builds
+    /// it without a composite clip, `fb/fbpict.c:57`). Measured by
+    /// tools/vng-scenarios/draw-clip-probe.c in both modes.
     ///
-    /// Returns `None` for every other picture, which leaves the normal source
-    /// routing untouched.
-    ///
-    /// The root's own storage holds only the backdrop — windows are composited
-    /// at scanout time — so nothing in the store contains the composed tree.
-    /// `GetImage` on the root already solves this by reading the presented
-    /// scanout (`read_root_scanout_assembled`), which is why `import` captures
-    /// correctly while maim, whose whole capture is one such Composite, gets
-    /// bare backdrop. This borrows that same read and uploads it into a
-    /// short-lived pixmap so the compositor has something to sample.
-    ///
-    /// Staleness matches `GetImage(root)` exactly — the presented frame, not a
-    /// freshly walked scene. That is the accepted behaviour on the working
-    /// route, so the two agree by construction. Composing the live scene into
-    /// an arbitrary drawable instead is the canonical-scene-copy design
-    /// (`docs/superpowers/specs/2026-09-01-canonical-scene-copy-design.md`),
-    /// which is a much larger change; read its status header before starting.
+    /// The root: its own storage holds only the backdrop (#135; maim's
+    /// whole capture is one such Composite), so this borrows the read
+    /// `GetImage` of the root does (`read_root_scanout_assembled`) and
+    /// uploads it into a short-lived pixmap. Any other window: its storage
+    /// with [`Self::inferior_pieces`] copied over it, when there are any.
+    /// `None` leaves the normal source routing untouched.
     ///
     /// The scratch pixmap is freed by the caller through the ordinary
     /// `free_pixmap` path, so its storage retires behind the fence like any
     /// other drawable rather than being destroyed under in-flight GPU work.
-    fn include_inferiors_root_snapshot(&mut self, host_pic: u32) -> Option<u32> {
-        if !picture_is_include_inferiors_root(&self.core, host_pic) {
+    fn source_inferiors_snapshot(&mut self, host_pic: u32) -> Option<u32> {
+        let Some(PictureRecord::Drawable { host_xid, .. }) = self.core.pictures.get(&host_pic)
+        else {
             return None;
+        };
+        let host_xid = *host_xid;
+        if host_xid != self.core.window_id {
+            return self.window_inferiors_snapshot(host_xid, None);
         }
         let root_xid = self.core.window_id;
         let root_id = self.store.lookup(root_xid)?;
@@ -7945,6 +8051,129 @@ impl KmsBackend {
             depth_plane_mask(depth),
         );
         Some(scratch_xid)
+    }
+
+    /// [`Self::source_inferiors_snapshot`] for a window other than the
+    /// root: `area` of it (its content space; `None` for all of it) as a
+    /// scratch pixmap whose `(0, 0)` is `area`'s origin. `None` when its
+    /// storage holds all it shows there already.
+    fn window_inferiors_snapshot(
+        &mut self,
+        host_xid: u32,
+        area: Option<vk::Rect2D>,
+    ) -> Option<u32> {
+        let geom = *self.windows.get(&host_xid)?;
+        let target = self.resolve_paint_target(host_xid)?;
+        let whole = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: vk::Extent2D {
+                width: u32::from(geom.width),
+                height: u32::from(geom.height),
+            },
+        };
+        let area = area.unwrap_or(whole);
+        let content = intersect_rect_with_clip(area, &[whole])
+            .into_iter()
+            .next()?;
+        let mut pieces = Vec::new();
+        self.inferior_pieces(
+            host_xid,
+            (0, 0),
+            &[content],
+            target.backing_id(),
+            &mut pieces,
+        );
+        if pieces.is_empty() {
+            return None;
+        }
+        let scratch = self
+            .create_pixmap(
+                None,
+                geom.depth,
+                u16::try_from(area.extent.width).ok()?,
+                u16::try_from(area.extent.height).ok()?,
+            )
+            .ok()?
+            .as_raw();
+        let Some(dst) = self.resolve_paint_target(scratch) else {
+            let _ = self.free_pixmap(None, scratch);
+            return None;
+        };
+        let copy = |b: &mut Self, src: PaintTarget, origin: (i32, i32), r: vk::Rect2D| {
+            let src_rect = vk::Rect2D {
+                offset: vk::Offset2D {
+                    x: r.offset.x - origin.0 + src.offset().0,
+                    y: r.offset.y - origin.1 + src.offset().1,
+                },
+                extent: r.extent,
+            };
+            let at = vk::Offset2D {
+                x: r.offset.x - area.offset.x,
+                y: r.offset.y - area.offset.y,
+            };
+            if let Err(e) = b.engine.copy_area(
+                &mut b.store,
+                &mut b.platform,
+                src.src_including_border(),
+                dst.server_backing_dst(),
+                src_rect,
+                at,
+            ) {
+                log::debug!("render source snapshot of {host_xid:#x}: copy {r:?}: {e:?}");
+            }
+        };
+        copy(self, target, (0, 0), content);
+        for piece in pieces {
+            for r in &piece.rects {
+                copy(self, piece.target, piece.origin, *r);
+            }
+        }
+        Some(scratch)
+    }
+
+    /// The image a root read of `local` on output `output_idx` copies from,
+    /// composed from the scene as every earlier request left it
+    /// ([`SceneCompositor::root_readback`]); `None` without a live scene,
+    /// leaving the read on the scanout.
+    fn fresh_root_readback(&mut self, output_idx: usize, local: vk::Rect2D) -> Option<vk::Image> {
+        if !self.scene.is_live() {
+            return None;
+        }
+        if !self
+            .scene
+            .root_readback_is_current(&self.store, &self.platform, output_idx, local)
+        {
+            if let Err(e) = self.engine.close_open_frame(
+                &mut self.store,
+                &mut self.platform,
+                crate::kms::render::frame_builder::CloseReason::LegacyScCompose,
+            ) {
+                log::warn!("render root read: close_open_frame failed: {e:?}");
+            }
+            if let Err(e) = self.engine.flush_submit_group(
+                &mut self.store,
+                &mut self.platform,
+                crate::kms::render::submit_group::FlushReason::SceneCompose,
+            ) {
+                log::warn!("render root read: flush_submit_group failed: {e:?}");
+            }
+        }
+        let cow_host_xid = self.cow_host_xid();
+        match self.scene.root_readback(
+            &self.core,
+            &mut self.store,
+            &self.windows,
+            &self.platform,
+            cow_host_xid,
+            output_idx,
+            local,
+        ) {
+            Ok(image) => image,
+            Err(e) => {
+                log::warn!("render root read: output {output_idx} readback compose failed: {e}");
+                None
+            }
+        }
     }
 
     /// Before a root read: compose any transformed output that has not
@@ -14180,12 +14409,16 @@ impl KmsBackend {
     /// inputs. Falls back to the root container when the cursor resolves to
     /// the root window or the hit window has no host backing.
     #[allow(clippy::cast_possible_truncation)]
-    fn resource_pointer_host_xid(&self, server_state: &ServerState) -> u32 {
+    fn resource_pointer_host_xid(&mut self, server_state: &ServerState) -> u32 {
+        self.prune_input_only_pointer_hosts(server_state);
         let Some((mut resid, _, _)) = server_state
             .root_pointer_target_at(self.core.cursor_x as i16, self.core.cursor_y as i16)
         else {
             return self.core.window_id;
         };
+        if let Some(host) = self.input_only_pointer_host(server_state, resid) {
+            return host;
+        }
         // Walk up to the nearest host-backed window so a non-hosted
         // sub-window resolves to the deepest *hosted* ancestor — matching
         // the granularity of the host walk this replaces, rather than
@@ -14203,6 +14436,103 @@ impl KmsBackend {
             resid = w.parent;
         }
         self.core.window_id
+    }
+
+    /// The synthetic host standing in for `window` when it is an InputOnly
+    /// window with no backend window, allocated on first use. Refreshes the
+    /// entry's parent host and cursor from the core tree.
+    fn input_only_pointer_host(
+        &mut self,
+        server_state: &ServerState,
+        window: ResourceId,
+    ) -> Option<u32> {
+        let w = server_state.resources.window(window)?;
+        if w.class != yserver_core::resources::WindowClass::InputOnly || w.host_xid.is_some() {
+            return None;
+        }
+        let mut cursor = None;
+        let mut parent_host = self.core.window_id;
+        let mut cur = window;
+        for _ in 0..256 {
+            if cur == yserver_core::resources::ROOT_WINDOW {
+                break;
+            }
+            let Some(cw) = server_state.resources.window(cur) else {
+                break;
+            };
+            if let Some(h) = cw.host_xid {
+                parent_host = h.as_raw();
+                break;
+            }
+            if cursor.is_none()
+                && let Some(c) = cw.cursor.filter(|c| c.0 != 0)
+            {
+                cursor = server_state.resources.cursor_host_xid(c);
+            }
+            cur = cw.parent;
+        }
+        let host = self
+            .input_only_pointer_hosts
+            .iter()
+            .find_map(|(h, e)| (e.window == window).then_some(*h))
+            .unwrap_or_else(|| {
+                let h = self.core.next_host_xid();
+                self.core.xid_map.insert(h, window);
+                h
+            });
+        self.input_only_pointer_hosts.insert(
+            host,
+            InputOnlyPointerHost {
+                window,
+                parent_host,
+                cursor,
+                origin: (w.x, w.y),
+            },
+        );
+        Some(host)
+    }
+
+    /// Drop the stand-in hosts of InputOnly windows that are gone (or no
+    /// longer InputOnly without a backend window), as a destroyed window's
+    /// host leaves `xid_map`.
+    fn prune_input_only_pointer_hosts(&mut self, server_state: &ServerState) {
+        let stale: Vec<u32> = self
+            .input_only_pointer_hosts
+            .iter()
+            .filter(|(_, e)| {
+                !server_state.resources.window(e.window).is_some_and(|w| {
+                    w.class == yserver_core::resources::WindowClass::InputOnly
+                        && w.host_xid.is_none()
+                })
+            })
+            .map(|(h, _)| *h)
+            .collect();
+        for h in stale {
+            self.input_only_pointer_hosts.remove(&h);
+            self.core.xid_map.remove(&h);
+        }
+    }
+
+    /// The host a crossing event on `window` is stamped with: its backend
+    /// window, the stand-in of an InputOnly window, else `fallback`.
+    fn crossing_host_for(
+        &mut self,
+        server_state: &ServerState,
+        window: ResourceId,
+        fallback: u32,
+    ) -> u32 {
+        if window == yserver_core::resources::ROOT_WINDOW {
+            return self.core.window_id;
+        }
+        if let Some(h) = server_state
+            .resources
+            .window(window)
+            .and_then(|w| w.host_xid)
+        {
+            return h.as_raw();
+        }
+        self.input_only_pointer_host(server_state, window)
+            .unwrap_or(fallback)
     }
 
     #[allow(dead_code)] // retained for A/B comparison vs the resource-tree producer + unit tests
@@ -14325,9 +14655,14 @@ impl KmsBackend {
     /// coords when `host_xid` isn't tracked (the dispatcher
     /// re-derives target coords from its own tree walk anyway).
     fn event_relative_coords(&self, host_xid: u32) -> (i16, i16) {
-        if let Some(w) = self.windows.get(&host_xid) {
-            let ex = (self.core.cursor_x as i32) - i32::from(w.x);
-            let ey = (self.core.cursor_y as i32) - i32::from(w.y);
+        let origin = self.windows.get(&host_xid).map(|w| (w.x, w.y)).or_else(|| {
+            self.input_only_pointer_hosts
+                .get(&host_xid)
+                .map(|e| e.origin)
+        });
+        if let Some((x, y)) = origin {
+            let ex = (self.core.cursor_x as i32) - i32::from(x);
+            let ey = (self.core.cursor_y as i32) - i32::from(y);
             (
                 ex.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
                 ey.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
@@ -14430,15 +14765,7 @@ impl KmsBackend {
                 from.0, to.0, events.len()
             );
             for ev in events {
-                let win_host_xid = if ev.window == yserver_core::resources::ROOT_WINDOW {
-                    self.core.window_id
-                } else {
-                    server_state
-                        .resources
-                        .window(ev.window)
-                        .and_then(|w| w.host_xid.map(|h| h.as_raw()))
-                        .unwrap_or(new_xid)
-                };
+                let win_host_xid = self.crossing_host_for(server_state, ev.window, new_xid);
                 let kind = match ev.kind {
                     yserver_core::crossings::CrossingKind::Enter => PointerEventKind::EnterNotify,
                     yserver_core::crossings::CrossingKind::Leave => PointerEventKind::LeaveNotify,
@@ -14759,11 +15086,15 @@ impl KmsBackend {
             let events =
                 yserver_core::crossings::implicit_grab_crossings(server_state, focus, grab);
             for ev in events {
-                let win_host_xid = server_state
-                    .resources
-                    .window(ev.window)
-                    .and_then(|w| w.host_xid.map(|h| h.as_raw()))
-                    .unwrap_or(host_xid);
+                let win_host_xid = if ev.window == yserver_core::resources::ROOT_WINDOW {
+                    server_state
+                        .resources
+                        .window(ev.window)
+                        .and_then(|w| w.host_xid.map(|h| h.as_raw()))
+                        .unwrap_or(host_xid)
+                } else {
+                    self.crossing_host_for(server_state, ev.window, host_xid)
+                };
                 let kind = match ev.kind {
                     yserver_core::crossings::CrossingKind::Enter => PointerEventKind::EnterNotify,
                     yserver_core::crossings::CrossingKind::Leave => PointerEventKind::LeaveNotify,
@@ -15255,8 +15586,43 @@ impl KmsBackend {
         host_xid: u32,
         rects: &[Rectangle16],
     ) -> Vec<Rectangle16> {
-        if rects.is_empty() || !self.windows.contains_key(&host_xid) {
-            return rects.to_vec();
+        if rects.is_empty() {
+            return Vec::new();
+        }
+        match self.subwindow_mode_clip(host_xid) {
+            Some(clip) => apply_subwindow_mode_clip(&clip, rects),
+            None => rects.to_vec(),
+        }
+    }
+
+    /// What [`Self::clip_fill_rects_by_subwindow_mode`] cuts `host_xid`'s
+    /// rects with, computed once for a request whatever its rect count:
+    /// the children it takes out, and where it may draw in a shared
+    /// backing. `None` when nothing does.
+    fn subwindow_mode_clip(&self, host_xid: u32) -> Option<SubwindowModeClip> {
+        let key = (
+            host_xid,
+            self.core.current_subwindow_mode,
+            self.windows.generation(),
+            self.store.topology_generation(),
+            self.shape_generation,
+        );
+        if let Some(entry) = self.subwindow_clip_cache.borrow().as_ref()
+            && entry.key == key
+        {
+            return entry.clip.clone();
+        }
+        let clip = self.compute_subwindow_mode_clip(host_xid);
+        *self.subwindow_clip_cache.borrow_mut() = Some(SubwindowClipCacheEntry {
+            key,
+            clip: clip.clone(),
+        });
+        clip
+    }
+
+    fn compute_subwindow_mode_clip(&self, host_xid: u32) -> Option<SubwindowModeClip> {
+        if !self.windows.contains_key(&host_xid) {
+            return None;
         }
         let mut cut: Vec<ash::vk::Rect2D> = Vec::new();
         if matches!(
@@ -15310,42 +15676,9 @@ impl KmsBackend {
             .resolve_paint_target(host_xid)
             .and_then(|t| self.shared_backing_draw_clip(host_xid, &t));
         if cut.is_empty() && keep.is_none() {
-            return rects.to_vec();
+            return None;
         }
-        let mut out = Vec::new();
-        for r in rects {
-            if r.width == 0 || r.height == 0 {
-                continue;
-            }
-            let rect = ash::vk::Rect2D {
-                offset: ash::vk::Offset2D {
-                    x: i32::from(r.x),
-                    y: i32::from(r.y),
-                },
-                extent: ash::vk::Extent2D {
-                    width: u32::from(r.width),
-                    height: u32::from(r.height),
-                },
-            };
-            let pieces = match &keep {
-                Some(keep) => intersect_rect_with_clip(rect, keep),
-                None => vec![rect],
-            };
-            out.extend(
-                pieces
-                    .into_iter()
-                    .flat_map(|piece| compute_copy_area_dst_rects(piece, &cut))
-                    .filter_map(|piece| {
-                        Some(Rectangle16 {
-                            x: i16::try_from(piece.offset.x).ok()?,
-                            y: i16::try_from(piece.offset.y).ok()?,
-                            width: u16::try_from(piece.extent.width).ok()?,
-                            height: u16::try_from(piece.extent.height).ok()?,
-                        })
-                    }),
-            );
-        }
-        out
+        Some(SubwindowModeClip { cut, keep })
     }
 
     /// Compute the destination window's RENDER clipList for one paint op
@@ -15505,6 +15838,257 @@ impl KmsBackend {
                 height: u16::try_from(ext.height).unwrap_or(u16::MAX),
             }
         }
+    }
+
+    /// What a window's inferiors add to the pixmap it draws into, which
+    /// Xorg's GetImage and RENDER source reads see (`DoGetImage`,
+    /// `dix/dispatch.c:2176-2189`): the screen's or a redirected
+    /// ancestor's, where its children have drawn over it. Here a window
+    /// keeps its own storage unless it shares a redirected ancestor's,
+    /// so list every viewable child, bottom to top, that does not draw
+    /// into `parent_backing` already, with its paint target, its content
+    /// origin and the pieces of it inside its bounding shape and its
+    /// ancestors' rects (`clip`), all in the content space `parent_origin`
+    /// is in; then its own such children. A Manual-redirected child is
+    /// not drawn into its parent (`TreatAsTransparent`,
+    /// `mi/mivaltree.c:171`).
+    fn inferior_pieces(
+        &self,
+        parent: u32,
+        parent_origin: (i32, i32),
+        clip: &[ash::vk::Rect2D],
+        parent_backing: DrawableId,
+        out: &mut Vec<InferiorPiece>,
+    ) {
+        let mut children: Vec<(u32, WindowGeometry)> = self
+            .windows
+            .iter()
+            .filter(|(_, g)| g.parent == Some(parent) && g.mapped && g.viewable)
+            .map(|(xid, g)| (*xid, *g))
+            .collect();
+        children.sort_by_key(|(_, g)| g.stack_rank);
+        for (child, g) in children {
+            let participating = self
+                .store
+                .lookup(child)
+                .and_then(|id| self.store.get(id))
+                .is_some_and(|d| d.scene_participating);
+            if !participating {
+                continue;
+            }
+            let Some(target) = self.resolve_paint_target(child) else {
+                continue;
+            };
+            let bw = i32::from(g.border_width);
+            let outer = ash::vk::Rect2D {
+                offset: ash::vk::Offset2D {
+                    x: i32::from(g.x),
+                    y: i32::from(g.y),
+                },
+                extent: ash::vk::Extent2D {
+                    width: u32::from(g.width) + 2 * u32::from(g.border_width),
+                    height: u32::from(g.height) + 2 * u32::from(g.border_width),
+                },
+            };
+            let visible: Vec<ash::vk::Rect2D> = self
+                .child_clip_region(child, &g, outer)
+                .into_iter()
+                .map(|r| ash::vk::Rect2D {
+                    offset: ash::vk::Offset2D {
+                        x: r.offset.x + parent_origin.0,
+                        y: r.offset.y + parent_origin.1,
+                    },
+                    extent: r.extent,
+                })
+                .flat_map(|r| intersect_rect_with_clip(r, clip))
+                .collect();
+            if visible.is_empty() {
+                continue;
+            }
+            let origin = (
+                parent_origin.0 + i32::from(g.x) + bw,
+                parent_origin.1 + i32::from(g.y) + bw,
+            );
+            let content = ash::vk::Rect2D {
+                offset: ash::vk::Offset2D {
+                    x: origin.0,
+                    y: origin.1,
+                },
+                extent: ash::vk::Extent2D {
+                    width: u32::from(g.width),
+                    height: u32::from(g.height),
+                },
+            };
+            let inner: Vec<ash::vk::Rect2D> = visible
+                .iter()
+                .flat_map(|r| intersect_rect_with_clip(*r, &[content]))
+                .collect();
+            if target.backing_id() != parent_backing {
+                out.push(InferiorPiece {
+                    window: child,
+                    target,
+                    origin,
+                    rects: visible,
+                });
+            }
+            if !inner.is_empty() {
+                self.inferior_pieces(child, origin, &inner, target.backing_id(), out);
+            }
+        }
+    }
+
+    /// Paste [`Self::inferior_pieces`] of `host` over `buf`, its `area`
+    /// read in `host`'s content space (4-byte pixels).
+    fn paste_inferiors(
+        &mut self,
+        host: u32,
+        backing: DrawableId,
+        area: ash::vk::Rect2D,
+        depth: u8,
+        buf: &mut [u8],
+    ) {
+        let mut pieces = Vec::new();
+        self.inferior_pieces(host, (0, 0), &[area], backing, &mut pieces);
+        for piece in pieces {
+            let Some(bbox) = vk_rects_bbox(&piece.rects) else {
+                continue;
+            };
+            let storage = ash::vk::Rect2D {
+                offset: ash::vk::Offset2D {
+                    x: bbox.offset.x - piece.origin.0 + piece.target.offset().0,
+                    y: bbox.offset.y - piece.origin.1 + piece.target.offset().1,
+                },
+                extent: bbox.extent,
+            };
+            match self.engine.get_image(
+                &mut self.store,
+                &mut self.platform,
+                piece.target.src_including_border(),
+                storage,
+                depth,
+            ) {
+                Ok(bytes) => {
+                    for r in &piece.rects {
+                        blit_rows_4bpp(&bytes, bbox, buf, area, *r);
+                    }
+                }
+                Err(e) => {
+                    log::debug!(
+                        "render get_image: inferior {:#x} readback: {e:?}",
+                        piece.window
+                    );
+                }
+            }
+        }
+    }
+
+    /// IncludeInferiors on a destination Picture whose window draws into
+    /// storage of its own: Xorg clips the op to the window's borderClip
+    /// in the pixmap it shares with its inferiors (`miValidatePicture`,
+    /// `render/mipict.c:114-118`), so it lands on them too. Each such
+    /// inferior with storage of its own ([`Self::inferior_pieces`]), its
+    /// content origin in the window's space, and the clip it takes the op
+    /// through, in its own space. Empty for every other picture.
+    fn include_inferiors_dst_fanout(
+        &self,
+        host_pic: u32,
+    ) -> Vec<(u32, (i32, i32), Vec<Rectangle16>)> {
+        if self.dst_fanout_active {
+            return Vec::new();
+        }
+        let Some(PictureRecord::Drawable {
+            host_xid,
+            clip,
+            subwindow_mode: 1,
+            ..
+        }) = self.core.pictures.get(&host_pic)
+        else {
+            return Vec::new();
+        };
+        let Some(geom) = self.windows.get(host_xid) else {
+            return Vec::new();
+        };
+        let Some(target) = self.resolve_paint_target(*host_xid) else {
+            return Vec::new();
+        };
+        let content = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: vk::Extent2D {
+                width: u32::from(geom.width),
+                height: u32::from(geom.height),
+            },
+        };
+        let base: Vec<vk::Rect2D> = match clip {
+            Some(rects) => rects
+                .iter()
+                .filter(|r| r.width > 0 && r.height > 0)
+                .flat_map(|r| {
+                    intersect_rect_with_clip(
+                        vk::Rect2D {
+                            offset: vk::Offset2D {
+                                x: i32::from(r.x),
+                                y: i32::from(r.y),
+                            },
+                            extent: vk::Extent2D {
+                                width: u32::from(r.width),
+                                height: u32::from(r.height),
+                            },
+                        },
+                        &[content],
+                    )
+                })
+                .collect(),
+            None => vec![content],
+        };
+        let mut pieces = Vec::new();
+        self.inferior_pieces(*host_xid, (0, 0), &base, target.backing_id(), &mut pieces);
+        pieces
+            .into_iter()
+            .map(|p| {
+                let local: Vec<vk::Rect2D> = p
+                    .rects
+                    .iter()
+                    .map(|r| vk::Rect2D {
+                        offset: vk::Offset2D {
+                            x: r.offset.x - p.origin.0,
+                            y: r.offset.y - p.origin.1,
+                        },
+                        extent: r.extent,
+                    })
+                    .collect();
+                let unclipped = [Rectangle16 {
+                    x: i16::MIN,
+                    y: i16::MIN,
+                    width: u16::MAX,
+                    height: u16::MAX,
+                }];
+                (p.window, p.origin, clip_rects16(&unclipped, &local))
+            })
+            .collect()
+    }
+
+    /// Run `op` with Picture `host_pic` pointing at `window` through
+    /// `clip` (both in `window`'s space), then put the picture back.
+    fn with_dst_picture_on<R>(
+        &mut self,
+        host_pic: u32,
+        window: u32,
+        clip: Vec<Rectangle16>,
+        op: impl FnOnce(&mut Self) -> R,
+    ) -> Option<R> {
+        let saved = self.core.pictures.get(&host_pic).cloned()?;
+        if let Some(PictureRecord::Drawable {
+            host_xid, clip: c, ..
+        }) = self.core.pictures.get_mut(&host_pic)
+        {
+            *host_xid = window;
+            *c = Some(clip);
+        }
+        self.dst_fanout_active = true;
+        let r = op(self);
+        self.dst_fanout_active = false;
+        self.core.pictures.insert(host_pic, saved);
+        Some(r)
     }
 
     fn collect_fill_rects_for_inferiors(
@@ -15828,12 +16412,24 @@ impl KmsBackend {
             Vec::new()
         };
 
-        // Host's own backing.
-        if !fg_clipped.is_empty() {
-            self.fill_solid_rects(target, foreground, &fg_clipped);
+        // Host's own backing, through its clip list: its children out
+        // under ClipByChildren, and what of a backing it shares with its
+        // ancestors it may not paint — the same clip every fill takes.
+        let clip = if fg_clipped.is_empty() && bg_clipped.is_empty() {
+            None
+        } else {
+            self.subwindow_mode_clip(host_xid)
+        };
+        let own = |rects: &[Rectangle16]| match &clip {
+            Some(clip) if !rects.is_empty() => apply_subwindow_mode_clip(clip, rects),
+            _ => rects.to_vec(),
+        };
+        let (fg_own, bg_own) = (own(&fg_clipped), own(&bg_clipped));
+        if !fg_own.is_empty() {
+            self.fill_solid_rects(target, foreground, &fg_own);
         }
-        if !bg_clipped.is_empty() {
-            self.fill_solid_rects(target, background, &bg_clipped);
+        if !bg_own.is_empty() {
+            self.fill_solid_rects(target, background, &bg_own);
         }
 
         // Each distinct inferior backing, exactly once (XOR-safe).
@@ -16899,6 +17495,7 @@ impl KmsBackend {
     /// translation point (no per-glyph pre-shift here).
     fn render_text_chars(
         &mut self,
+        origin: Option<OriginContext>,
         host_xid: u32,
         foreground: u32,
         x: i32,
@@ -16950,9 +17547,35 @@ impl KmsBackend {
         if spans.is_empty() {
             return Ok(());
         }
-        let clipped = self.intersect_with_current_clip_live(&spans);
-        self.fill_solid_rects(target, foreground, &clipped);
+        self.paint_solid_spans(origin, host_xid, target, foreground, spans);
         Ok(())
+    }
+
+    /// Solid spans in `host_xid`'s coordinates, clipped as a stroke is:
+    /// the GC clip, the subwindow mode (inferiors included or cut out)
+    /// and the window's clip in a backing it shares. Core text and
+    /// points: Xorg draws them through the GC's composite clip like
+    /// every other op (`fb/fbglyph.c`, `fb/fbpoint.c`).
+    fn paint_solid_spans(
+        &mut self,
+        origin: Option<OriginContext>,
+        host_xid: u32,
+        target: PaintTarget,
+        color: u32,
+        spans: Vec<Rectangle16>,
+    ) {
+        let background = self.core.current_background;
+        self.emit_stroke_output(
+            origin,
+            host_xid,
+            target,
+            color,
+            background,
+            crate::kms::render::stroke::StrokeOutput {
+                fg_rects: spans,
+                bg_rects: Vec::new(),
+            },
+        );
     }
 
     /// Legacy GPU-atlas text path — unreachable from the core
@@ -17169,6 +17792,7 @@ impl KmsBackend {
     /// temporarily forced to Copy.
     fn image_text_common(
         &mut self,
+        origin: Option<OriginContext>,
         host_xid: u32,
         foreground: u32,
         background: u32,
@@ -17193,15 +17817,203 @@ impl KmsBackend {
                     height: u16::try_from(bg_h).unwrap_or(u16::MAX),
                 };
                 if let Some(target) = self.resolve_paint_target(host_xid) {
-                    let clipped = self.intersect_with_current_clip_live(&[bg]);
-                    self.fill_solid_rects(target, background, &clipped);
+                    self.paint_solid_spans(origin, host_xid, target, background, vec![bg]);
                 }
             }
         }
-        let result = self.render_text_chars(host_xid, foreground, x, y, chars);
+        let result = self.render_text_chars(origin, host_xid, foreground, x, y, chars);
         self.core.current_function = saved_function;
         result
     }
+}
+
+/// `v + by`, saturated to the wire's `INT16`.
+fn shift_i16(v: i16, by: i32) -> i16 {
+    (i32::from(v) + by).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
+}
+
+/// The cut of [`KmsBackend::subwindow_mode_clip`].
+#[derive(Clone)]
+struct SubwindowModeClip {
+    cut: Vec<ash::vk::Rect2D>,
+    keep: Option<Vec<ash::vk::Rect2D>>,
+}
+
+struct SubwindowClipCacheEntry {
+    key: (u32, yserver_core::backend::SubwindowMode, u64, u64, u64),
+    clip: Option<SubwindowModeClip>,
+}
+
+/// `rects` through `clip`.
+fn apply_subwindow_mode_clip(clip: &SubwindowModeClip, rects: &[Rectangle16]) -> Vec<Rectangle16> {
+    let (cut, keep) = (&clip.cut, &clip.keep);
+    // Text and lines come as many small spans: when the clip leaves
+    // their bounding box whole, take them as they are.
+    if let Some(bbox) = rects16_bbox(rects) {
+        let (bx1, by1) = (
+            bbox.offset.x + bbox.extent.width as i32,
+            bbox.offset.y + bbox.extent.height as i32,
+        );
+        let misses = |c: &ash::vk::Rect2D| {
+            c.offset.x >= bx1
+                || c.offset.y >= by1
+                || c.offset.x + c.extent.width as i32 <= bbox.offset.x
+                || c.offset.y + c.extent.height as i32 <= bbox.offset.y
+        };
+        let covers = |k: &ash::vk::Rect2D| {
+            k.offset.x <= bbox.offset.x
+                && k.offset.y <= bbox.offset.y
+                && k.offset.x + k.extent.width as i32 >= bx1
+                && k.offset.y + k.extent.height as i32 >= by1
+        };
+        if cut.iter().all(misses) && keep.as_ref().is_none_or(|k| k.iter().any(covers)) {
+            return rects.to_vec();
+        }
+    }
+    let mut out = Vec::with_capacity(rects.len());
+    for r in rects {
+        if r.width == 0 || r.height == 0 {
+            continue;
+        }
+        // The same test per rect: most spans need no cutting.
+        let (rx0, ry0) = (i32::from(r.x), i32::from(r.y));
+        let (rx1, ry1) = (rx0 + i32::from(r.width), ry0 + i32::from(r.height));
+        let clear = cut.iter().all(|c| {
+            c.offset.x >= rx1
+                || c.offset.y >= ry1
+                || c.offset.x + c.extent.width as i32 <= rx0
+                || c.offset.y + c.extent.height as i32 <= ry0
+        }) && keep.as_ref().is_none_or(|k| {
+            k.iter().any(|k| {
+                k.offset.x <= rx0
+                    && k.offset.y <= ry0
+                    && k.offset.x + k.extent.width as i32 >= rx1
+                    && k.offset.y + k.extent.height as i32 >= ry1
+            })
+        });
+        if clear {
+            out.push(*r);
+            continue;
+        }
+        let rect = ash::vk::Rect2D {
+            offset: ash::vk::Offset2D {
+                x: i32::from(r.x),
+                y: i32::from(r.y),
+            },
+            extent: ash::vk::Extent2D {
+                width: u32::from(r.width),
+                height: u32::from(r.height),
+            },
+        };
+        let pieces = match &keep {
+            Some(keep) => intersect_rect_with_clip(rect, keep),
+            None => vec![rect],
+        };
+        out.extend(
+            pieces
+                .into_iter()
+                .flat_map(|piece| compute_copy_area_dst_rects(piece, cut))
+                .filter_map(|piece| {
+                    Some(Rectangle16 {
+                        x: i16::try_from(piece.offset.x).ok()?,
+                        y: i16::try_from(piece.offset.y).ok()?,
+                        width: u16::try_from(piece.extent.width).ok()?,
+                        height: u16::try_from(piece.extent.height).ok()?,
+                    })
+                }),
+        );
+    }
+    out
+}
+
+/// One inferior of a window that draws into storage of its own: see
+/// [`KmsBackend::inferior_pieces`].
+struct InferiorPiece {
+    window: u32,
+    target: PaintTarget,
+    /// Its content origin, in the content space of the window asked about.
+    origin: (i32, i32),
+    /// What of it shows there, in that same space.
+    rects: Vec<ash::vk::Rect2D>,
+}
+
+/// The bounding box of the non-empty `rects`, or `None` when there are none.
+fn vk_rects_bbox(rects: &[ash::vk::Rect2D]) -> Option<ash::vk::Rect2D> {
+    let mut it = rects
+        .iter()
+        .filter(|r| r.extent.width > 0 && r.extent.height > 0);
+    let first = it.next()?;
+    let (mut x0, mut y0) = (first.offset.x, first.offset.y);
+    let (mut x1, mut y1) = (
+        x0 + first.extent.width as i32,
+        y0 + first.extent.height as i32,
+    );
+    for r in it {
+        x0 = x0.min(r.offset.x);
+        y0 = y0.min(r.offset.y);
+        x1 = x1.max(r.offset.x + r.extent.width as i32);
+        y1 = y1.max(r.offset.y + r.extent.height as i32);
+    }
+    Some(ash::vk::Rect2D {
+        offset: ash::vk::Offset2D { x: x0, y: y0 },
+        extent: ash::vk::Extent2D {
+            width: (x1 - x0) as u32,
+            height: (y1 - y0) as u32,
+        },
+    })
+}
+
+/// Copy `piece` (same space as both images) from `src`, a tightly packed
+/// 4-byte-per-pixel image of `src_rect`, into `dst`, one of `dst_rect`.
+fn blit_rows_4bpp(
+    src: &[u8],
+    src_rect: ash::vk::Rect2D,
+    dst: &mut [u8],
+    dst_rect: ash::vk::Rect2D,
+    piece: ash::vk::Rect2D,
+) {
+    let clip = |a: ash::vk::Rect2D, b: ash::vk::Rect2D| {
+        intersect_rect_with_clip(a, &[b]).into_iter().next()
+    };
+    let Some(piece) = clip(piece, src_rect).and_then(|p| clip(p, dst_rect)) else {
+        return;
+    };
+    let row = piece.extent.width as usize * 4;
+    let (src_stride, dst_stride) = (
+        src_rect.extent.width as usize * 4,
+        dst_rect.extent.width as usize * 4,
+    );
+    for line in 0..piece.extent.height as i32 {
+        let y = piece.offset.y + line;
+        let s = (y - src_rect.offset.y) as usize * src_stride
+            + (piece.offset.x - src_rect.offset.x) as usize * 4;
+        let d = (y - dst_rect.offset.y) as usize * dst_stride
+            + (piece.offset.x - dst_rect.offset.x) as usize * 4;
+        if let (Some(from), Some(to)) = (src.get(s..s + row), dst.get_mut(d..d + row)) {
+            to.copy_from_slice(from);
+        }
+    }
+}
+
+/// The bounding box of the non-empty `rects`, or `None` when there are none.
+fn rects16_bbox(rects: &[Rectangle16]) -> Option<ash::vk::Rect2D> {
+    let mut it = rects.iter().filter(|r| r.width > 0 && r.height > 0);
+    let first = it.next()?;
+    let (mut x0, mut y0) = (i32::from(first.x), i32::from(first.y));
+    let (mut x1, mut y1) = (x0 + i32::from(first.width), y0 + i32::from(first.height));
+    for r in it {
+        x0 = x0.min(i32::from(r.x));
+        y0 = y0.min(i32::from(r.y));
+        x1 = x1.max(i32::from(r.x) + i32::from(r.width));
+        y1 = y1.max(i32::from(r.y) + i32::from(r.height));
+    }
+    Some(ash::vk::Rect2D {
+        offset: ash::vk::Offset2D { x: x0, y: y0 },
+        extent: ash::vk::Extent2D {
+            width: (x1 - x0) as u32,
+            height: (y1 - y0) as u32,
+        },
+    })
 }
 
 /// Sum of character advances for a run, with the X11 nonexistent-
@@ -17642,6 +18454,10 @@ enum ScanoutReadOrigin {
     TransformIntermediate {
         output_idx: usize,
     },
+    /// The scene composed afresh for a root read (`fresh_root_readback`).
+    RootReadback {
+        output_idx: usize,
+    },
     DirectSource {
         source_xid: u32,
     },
@@ -17658,6 +18474,7 @@ impl ScanoutReadOrigin {
             Self::TransformIntermediate { output_idx } => {
                 format!("transform-intermediate-out{output_idx}")
             }
+            Self::RootReadback { output_idx } => format!("root-readback-out{output_idx}"),
             Self::DirectSource { source_xid } => format!("direct-src-0x{source_xid:x}"),
         }
     }
@@ -17987,7 +18804,7 @@ fn read_scanout_region_named(
         return Ok((Vec::new(), ScanoutReadOrigin::Empty));
     }
 
-    let (source, local_rect) = match select_scanout_read_route(backend, rect, selection)? {
+    let (mut source, local_rect) = match select_scanout_read_route(backend, rect, selection)? {
         ScanoutReadRoute::Pool {
             pool_idx,
             bo_idx,
@@ -18040,6 +18857,22 @@ fn read_scanout_region_named(
             return Ok((bytes, ScanoutReadOrigin::DirectSource { source_xid }));
         }
     };
+
+    // A root read sees every earlier request, not the last composed frame.
+    let mut fresh = None;
+    if selection == ScanoutReadSelection::OnScreenOnly {
+        let output_idx = match source {
+            ScanoutReadOrigin::ComposedPool { pool_idx, .. } => Some(pool_idx),
+            ScanoutReadOrigin::TransformIntermediate { output_idx } => Some(output_idx),
+            _ => None,
+        };
+        if let Some(output_idx) = output_idx
+            && let Some(image) = backend.fresh_root_readback(output_idx, local_rect)
+        {
+            source = ScanoutReadOrigin::RootReadback { output_idx };
+            fresh = Some(image);
+        }
+    }
 
     let Some(vk) = backend.platform.vk.as_ref().cloned() else {
         return Err(io::Error::other("no vulkan context"));
@@ -18103,6 +18936,8 @@ fn read_scanout_region_named(
                 })?;
             (image, false)
         }
+        // Composed for this read and left `GENERAL`, like the intermediate.
+        ScanoutReadOrigin::RootReadback { .. } => (fresh.expect("set with the origin"), false),
         ScanoutReadOrigin::Empty | ScanoutReadOrigin::DirectSource { .. } => {
             unreachable!("returned above")
         }
@@ -23995,7 +24830,7 @@ impl Backend for KmsBackend {
     ) -> io::Result<()> {
         self.core.current_clip = match clip {
             Some(rects) => ClipState::Rectangles {
-                origin: (0, 0),
+                origin: (rects.x_origin, rects.y_origin),
                 rects,
             },
             None => ClipState::None,
@@ -24201,6 +25036,43 @@ impl Backend for KmsBackend {
         height: u16,
     ) -> io::Result<()> {
         self.telemetry.record_copy_area_call();
+        // IncludeInferiors copies what the source shows, its inferiors'
+        // pixels too (`miHandleExposures` exposes only what falls outside
+        // `NotClippedByChildren`); a window keeping its own storage holds
+        // only its own.
+        if src_host_xid != self.core.window_id
+            && matches!(
+                self.core.current_subwindow_mode,
+                yserver_core::backend::SubwindowMode::IncludeInferiors
+            )
+            && self.windows.contains_key(&src_host_xid)
+        {
+            let area = vk::Rect2D {
+                offset: vk::Offset2D {
+                    x: i32::from(src_x),
+                    y: i32::from(src_y),
+                },
+                extent: vk::Extent2D {
+                    width: u32::from(width),
+                    height: u32::from(height),
+                },
+            };
+            if let Some(scratch) = self.window_inferiors_snapshot(src_host_xid, Some(area)) {
+                let result = self.copy_area(
+                    _origin,
+                    scratch,
+                    dst_host_xid,
+                    0,
+                    0,
+                    dst_x,
+                    dst_y,
+                    width,
+                    height,
+                );
+                let _ = self.free_pixmap(None, scratch);
+                return result;
+            }
+        }
         // Resolve the SOURCE the same way as the destination. A window
         // that is Composite-redirected (or whose ancestor is) has its
         // pixels in the redirect *backing*; its own leaf storage is
@@ -25189,6 +26061,25 @@ impl Backend for KmsBackend {
                     );
                     pixel_bytes.resize(expected, 0);
                 }
+                if matches!(depth, 24 | 32) && self.windows.contains_key(&host_xid) {
+                    let area = ash::vk::Rect2D {
+                        offset: ash::vk::Offset2D {
+                            x: i32::from(x),
+                            y: i32::from(y),
+                        },
+                        extent: ash::vk::Extent2D {
+                            width: u32::from(width),
+                            height: u32::from(height),
+                        },
+                    };
+                    self.paste_inferiors(
+                        host_xid,
+                        target.backing_id(),
+                        area,
+                        depth,
+                        &mut pixel_bytes,
+                    );
+                }
                 if format == GET_IMAGE_FORMAT_XY_PIXMAP {
                     pixel_bytes = z_to_xy_planes(
                         &pixel_bytes,
@@ -25550,7 +26441,7 @@ impl Backend for KmsBackend {
 
     fn poly_point(
         &mut self,
-        _origin: Option<OriginContext>,
+        origin: Option<OriginContext>,
         host_xid: u32,
         foreground: u32,
         coordinate_mode: u8,
@@ -25580,8 +26471,18 @@ impl Backend for KmsBackend {
                 height: 1,
             });
         }
-        let rects = self.intersect_with_current_clip_live(&rects);
-        self.fill_solid_rects(target, foreground, &rects);
+        let background = self.core.current_background;
+        self.emit_stroke_output(
+            origin,
+            host_xid,
+            target,
+            foreground,
+            background,
+            crate::kms::render::stroke::StrokeOutput {
+                fg_rects: rects,
+                bg_rects: Vec::new(),
+            },
+        );
         Ok(())
     }
 
@@ -25723,7 +26624,7 @@ impl Backend for KmsBackend {
 
     fn poly_text8(
         &mut self,
-        _origin: Option<OriginContext>,
+        origin: Option<OriginContext>,
         host_xid: u32,
         foreground: u32,
         body: &[u8],
@@ -25759,7 +26660,7 @@ impl Backend for KmsBackend {
             cursor_x = cursor_x.saturating_add(i32::from(delta));
             if !text.is_empty() {
                 let chars: Vec<char> = text.iter().map(|&b| b as char).collect();
-                self.render_text_chars(host_xid, foreground, cursor_x, y, &chars)?;
+                self.render_text_chars(origin, host_xid, foreground, cursor_x, y, &chars)?;
                 if let Some(font_state) =
                     self.core.current_font.and_then(|f| self.core.fonts.get(&f))
                 {
@@ -25773,7 +26674,7 @@ impl Backend for KmsBackend {
 
     fn poly_text16(
         &mut self,
-        _origin: Option<OriginContext>,
+        origin: Option<OriginContext>,
         host_xid: u32,
         foreground: u32,
         body: &[u8],
@@ -25813,7 +26714,7 @@ impl Backend for KmsBackend {
                 chars.push(char::from_u32(codepoint).unwrap_or('\u{fffd}'));
             }
             if !chars.is_empty() {
-                self.render_text_chars(host_xid, foreground, cursor_x, y, &chars)?;
+                self.render_text_chars(origin, host_xid, foreground, cursor_x, y, &chars)?;
                 if let Some(font_state) =
                     self.core.current_font.and_then(|f| self.core.fonts.get(&f))
                 {
@@ -25827,7 +26728,7 @@ impl Backend for KmsBackend {
 
     fn image_text8(
         &mut self,
-        _origin: Option<OriginContext>,
+        origin: Option<OriginContext>,
         host_xid: u32,
         foreground: u32,
         background: u32,
@@ -25842,12 +26743,12 @@ impl Backend for KmsBackend {
         let y = i16::from_le_bytes([body[10], body[11]]) as i32;
         let end = (12usize + text_len as usize).min(body.len());
         let chars: Vec<char> = body[12..end].iter().map(|&b| b as char).collect();
-        self.image_text_common(host_xid, foreground, background, x, y, &chars)
+        self.image_text_common(origin, host_xid, foreground, background, x, y, &chars)
     }
 
     fn image_text16(
         &mut self,
-        _origin: Option<OriginContext>,
+        origin: Option<OriginContext>,
         host_xid: u32,
         foreground: u32,
         background: u32,
@@ -25869,7 +26770,7 @@ impl Backend for KmsBackend {
             pos += 2;
             chars.push(char::from_u32(codepoint).unwrap_or('\u{fffd}'));
         }
-        self.image_text_common(host_xid, foreground, background, x, y, &chars)
+        self.image_text_common(origin, host_xid, foreground, background, x, y, &chars)
     }
 
     // ── RENDER ──────────────────────────────────────────────────
@@ -26102,7 +27003,7 @@ impl Backend for KmsBackend {
     /// instead of testing for it.
     fn render_composite(
         &mut self,
-        origin: Option<OriginContext>,
+        _origin: Option<OriginContext>,
         op: u8,
         host_src: u32,
         host_mask: u32,
@@ -26116,17 +27017,47 @@ impl Backend for KmsBackend {
         width: u16,
         height: u16,
     ) -> io::Result<Vec<xfixes::RegionRect>> {
-        let _ = origin;
+        // A source or mask that is the destination would follow it onto
+        // the inferiors; such a self-composite keeps to the window.
+        let fanout = if host_src == host_dst || host_mask == host_dst {
+            Vec::new()
+        } else {
+            self.include_inferiors_dst_fanout(host_dst)
+        };
+        if !fanout.is_empty() {
+            self.dst_fanout_active = true;
+            let mut painted = self.render_composite(
+                _origin, op, host_src, host_mask, host_dst, src_x, src_y, mask_x, mask_y, dst_x,
+                dst_y, width, height,
+            );
+            self.dst_fanout_active = false;
+            for (window, (ox, oy), clip) in fanout {
+                let (x, y) = (shift_i16(dst_x, -ox), shift_i16(dst_y, -oy));
+                let more = self.with_dst_picture_on(host_dst, window, clip, |b| {
+                    b.render_composite(
+                        _origin, op, host_src, host_mask, host_dst, src_x, src_y, mask_x, mask_y,
+                        x, y, width, height,
+                    )
+                });
+                if let (Ok(painted), Some(Ok(more))) = (painted.as_mut(), more) {
+                    painted.extend(more.into_iter().map(|r| xfixes::RegionRect {
+                        x: shift_i16(r.x, ox),
+                        y: shift_i16(r.y, oy),
+                        ..r
+                    }));
+                }
+            }
+            return painted;
+        }
         // Taken BEFORE the composite, because the substitution replaces the
         // source drawable entirely — but only when the request can paint at
         // all, so a zero-area Composite stays as free as it was before the
         // acquisition was hoisted out here.
-        let inferiors_snapshot =
-            if composite_needs_inferiors_snapshot(&self.core, host_src, width, height) {
-                self.include_inferiors_root_snapshot(host_src)
-            } else {
-                None
-            };
+        let inferiors_snapshot = if composite_needs_source_snapshot(width, height) {
+            self.source_inferiors_snapshot(host_src)
+        } else {
+            None
+        };
         let result = self.render_composite_inner(
             inferiors_snapshot,
             op,
@@ -26466,6 +27397,14 @@ impl Backend for KmsBackend {
         Ok(local_rects_to_region(cliplist_local))
     }
 
+    fn picture_includes_inferiors(&self, host_pic: u32) -> bool {
+        !dst_picture_clip_by_children(&self.core, host_pic)
+            && matches!(
+                self.core.pictures.get(&host_pic),
+                Some(PictureRecord::Drawable { .. })
+            )
+    }
+
     fn render_fill_rectangles(
         &mut self,
         _origin: Option<OriginContext>,
@@ -26476,6 +27415,20 @@ impl Backend for KmsBackend {
         x_off: i16,
         y_off: i16,
     ) -> io::Result<()> {
+        let fanout = self.include_inferiors_dst_fanout(host_dst);
+        if !fanout.is_empty() {
+            self.dst_fanout_active = true;
+            let result =
+                self.render_fill_rectangles(_origin, host_dst, op, color, rects, x_off, y_off);
+            self.dst_fanout_active = false;
+            for (window, (ox, oy), clip) in fanout {
+                let (x, y) = (shift_i16(x_off, -ox), shift_i16(y_off, -oy));
+                self.with_dst_picture_on(host_dst, window, clip, |b| {
+                    b.render_fill_rectangles(_origin, host_dst, op, color, rects, x, y)
+                });
+            }
+            return result;
+        }
         let Some((dst_host_xid, dst_clip)) = resolve_dst_picture_for_render(&self.core, host_dst)
         else {
             log::debug!(
@@ -28477,6 +29430,7 @@ impl Backend for KmsBackend {
         // empty → click-through for input, drawn-as-nothing for bounding).
         // `cursor_inside_shape` and the scene's bounding clip already read
         // `Some([])` correctly; the old API deleted on empty and lost it.
+        self.shape_generation = self.shape_generation.wrapping_add(1);
         let dst = match kind {
             0 => &mut self.core.shape_bounding,
             1 => &mut self.core.shape_clip,
@@ -28560,6 +29514,10 @@ impl Backend for KmsBackend {
             .prev_pointer_window
             .get_or_insert(self.core.window_id);
         if prev == host_xid {
+            // The window under the pointer is the same, but an InputOnly
+            // window's cursor (kept here, not by `define_cursor`) may
+            // have changed.
+            self.refresh_effective_cursor();
             return;
         }
         let mask = self.serialize_modifiers() | self.core.button_mask;
@@ -28612,14 +29570,6 @@ impl Backend for KmsBackend {
         // catalog — ONE global max_names budget across the ordered
         // walk (Xorg traverses FPEs in path order with one count).
         let mut names: Vec<String> = self.core.font_loader.path_font_names(pattern);
-        names.extend(
-            self.core
-                .font_loader
-                .catalog
-                .iter()
-                .filter(|name| xlfd_pattern_matches(pattern, name))
-                .cloned(),
-        );
         names.truncate(cap);
 
         let mut name_data: Vec<u8> = Vec::new();
@@ -28651,14 +29601,6 @@ impl Backend for KmsBackend {
         // (mirrors list_fonts_proxy ordering so the two requests
         // agree on the visible font set).
         let mut matched: Vec<String> = self.core.font_loader.path_font_names(pattern);
-        matched.extend(
-            self.core
-                .font_loader
-                .catalog
-                .iter()
-                .filter(|name| xlfd_pattern_matches(pattern, name))
-                .cloned(),
-        );
         matched.truncate(cap);
 
         let mut entries: Vec<(String, FontMetrics)> = Vec::with_capacity(matched.len());
@@ -28963,38 +29905,6 @@ impl Backend for KmsBackend {
     }
 }
 
-/// XLFD glob match per X11 ListFonts semantics: `*` matches zero or more
-/// characters (including `-`), `?` matches exactly one. Comparison is
-/// ASCII case-insensitive because clients legitimately mix case.
-fn xlfd_pattern_matches(pattern: &str, name: &str) -> bool {
-    let pat = pattern.as_bytes();
-    let s = name.as_bytes();
-    let mut pi = 0usize;
-    let mut si = 0usize;
-    let mut star_pi: Option<usize> = None;
-    let mut star_si: usize = 0;
-    while si < s.len() {
-        if pi < pat.len() && (pat[pi] == b'?' || pat[pi].eq_ignore_ascii_case(&s[si])) {
-            pi += 1;
-            si += 1;
-        } else if pi < pat.len() && pat[pi] == b'*' {
-            star_pi = Some(pi);
-            star_si = si;
-            pi += 1;
-        } else if let Some(sp) = star_pi {
-            pi = sp + 1;
-            star_si += 1;
-            si = star_si;
-        } else {
-            return false;
-        }
-    }
-    while pi < pat.len() && pat[pi] == b'*' {
-        pi += 1;
-    }
-    pi == pat.len()
-}
-
 /// Stage 4d Manual-redirect fix: when a window has mapped child
 /// windows and is drawn into via a `ClipByChildren` GC (the X11
 /// default), the draw must NOT touch the area covered by each
@@ -29145,43 +30055,16 @@ fn intersect_clip_lists(a: &[Rectangle16], b: &[Rectangle16]) -> Vec<Rectangle16
 /// `mask_clip` should be `None` when no mask is used.
 ///
 /// Pure / no Vulkan; tested below against hand-traced Xorg vectors.
-/// #135 — is this the one source-picture shape that must be substituted for
-/// the composited root: a Picture on the ROOT window with
-/// `subwindow-mode = IncludeInferiors`?
-///
-/// Pure and separate from the readback on purpose. The readback needs a live
-/// scene, which no fixture available here can start, so this decision is the
-/// part that gets unit-tested; the plumbing behind it is covered end to end by
-/// the vng oracle (`tools/vng-scenarios/render-root-source-client.c`).
-/// #135 — should this Composite acquire the IncludeInferiors root snapshot?
+/// #135 — should this Composite acquire a source snapshot at all?
 ///
 /// The size check belongs HERE rather than being left to the zero-area early
 /// return inside `render_composite_inner`. Acquisition moved into the wrapper
 /// so the release could have a single site, which put it AHEAD of that early
-/// return: a `width == 0` Composite with a root IncludeInferiors source then
-/// did a full scanout readback and a full-screen scratch upload before
-/// returning nothing. Caught by codex on review of that refactor.
-///
-/// Pure, so the ordering property is unit-testable without a live scanout —
-/// which is the only way to test it, since acquisition itself needs one.
-fn composite_needs_inferiors_snapshot(
-    core: &KmsCore,
-    host_pic: u32,
-    width: u16,
-    height: u16,
-) -> bool {
-    width != 0 && height != 0 && picture_is_include_inferiors_root(core, host_pic)
-}
-
-fn picture_is_include_inferiors_root(core: &KmsCore, host_pic: u32) -> bool {
-    matches!(
-        core.pictures.get(&host_pic),
-        Some(PictureRecord::Drawable {
-            host_xid,
-            subwindow_mode,
-            ..
-        }) if *host_xid == core.window_id && *subwindow_mode == 1
-    )
+/// return: a `width == 0` Composite with a root source then did a full
+/// scanout readback and a full-screen scratch upload before returning
+/// nothing. Caught by codex on review of that refactor.
+fn composite_needs_source_snapshot(width: u16, height: u16) -> bool {
+    width != 0 && height != 0
 }
 
 fn dst_picture_clip_by_children(core: &KmsCore, host_pic: u32) -> bool {
@@ -29472,11 +30355,11 @@ mod tests {
     use super::{
         CrtcConfigProbeCompletion, CrtcConfigProbeExecutor, CrtcConfigProbeJob, KmsBackend,
         PaintTarget, PictureRecord, RandrIdAllocator, RandrProviderEndpoint,
-        composite_needs_inferiors_snapshot, compute_copy_area_dst_rects,
+        composite_needs_source_snapshot, compute_copy_area_dst_rects,
         compute_render_composite_clip, dri3_import_supported_for_topology, dri3_version_for,
         dst_picture_clip_by_children, glx_vendor_names_for_driver, intersect_rect_with_clip,
-        mode_timing, picture_is_include_inferiors_root, reconcile_connector_probe,
-        restore_primary_output_after_rebuild, shared_backing_move_pieces,
+        mode_timing, reconcile_connector_probe, restore_primary_output_after_rebuild,
+        shared_backing_move_pieces,
     };
     use crate::{
         internal_probe::{ProbeKmsHandles, RouteProbeRequest},
@@ -36555,6 +37438,29 @@ mod tests {
         );
     }
 
+    /// With no root cursor set the screen shows Xorg's: `X_cursor` from the
+    /// cursor font, black on white. Size, hotspot and the FNV-1a hash of
+    /// the ARGB pixels as XFixesGetCursorImage reports them on Xorg
+    /// (tools/vng-scenarios/goldens/cursor.txt, "bare root").
+    #[test]
+    fn default_cursor_is_xorg_root_cursor() {
+        let b = KmsBackend::for_tests();
+        let record = b
+            .cursor_records
+            .get(&b.default_cursor_xid.expect("default cursor"))
+            .expect("default record");
+        assert_eq!(
+            (record.width, record.height, record.hot_x, record.hot_y),
+            (16, 16, 7, 7)
+        );
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for px in record.bgra_bytes.chunks_exact(4) {
+            h ^= u64::from(u32::from_le_bytes([px[0], px[1], px[2], px[3]]));
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        assert_eq!(h, 0x1ae7_d436_690f_ff69);
+    }
+
     /// CursorRecord versions are monotonically increasing — each
     /// `create_cursor` allocates a fresh version, and the boot-time
     /// default sits at version 1.
@@ -40561,6 +41467,31 @@ mod tests {
         assert_eq!(got, want);
     }
 
+    /// The per-request clip is cached; any change to the window tree
+    /// (a child moved, here) computes it again.
+    #[test]
+    fn clip_fill_rects_by_subwindow_mode_follows_a_moved_child() {
+        let mut b = KmsBackend::for_tests();
+        let _parent = seed_window(&mut b, 0x100, None, 0, 0);
+        let _child = seed_window(&mut b, 0x200, Some(0x100), 10, 20);
+        b.core.current_subwindow_mode = yserver_core::backend::SubwindowMode::ClipByChildren;
+        let span = [Rectangle16 {
+            x: 0,
+            y: 25,
+            width: 40,
+            height: 1,
+        }];
+        let child = b.windows.get_mut(&0x200).expect("child geom");
+        (child.width, child.height) = (15, 10);
+        let before = b.clip_fill_rects_by_subwindow_mode(0x100, &span);
+        assert_eq!(before.len(), 2, "split around the child: {before:?}");
+        b.windows.get_mut(&0x200).expect("child geom").y = 100;
+        assert_eq!(
+            b.clip_fill_rects_by_subwindow_mode(0x100, &span),
+            span.to_vec()
+        );
+    }
+
     #[test]
     fn clip_fill_rects_by_subwindow_mode_include_inferiors_is_passthrough() {
         let mut b = KmsBackend::for_tests();
@@ -40614,102 +41545,19 @@ mod tests {
         );
     }
 
-    /// #135 — the source-picture substitution decision. maim's whole screen
-    /// capture is one RENDER Composite sourcing a Picture on the root with
-    /// `subwindow-mode = IncludeInferiors`, and that read used to return the
-    /// root's own storage: the backdrop. `subwindow_mode` was parsed and
-    /// stored, but the only place it was ever READ is
-    /// `dst_picture_clip_by_children`, a destination-side clip decision — so
-    /// the source path silently ignored it.
-    ///
-    /// This pins the decision only. The readback behind it needs a live scene,
-    /// and an acceptance test written against `for_tests_with_vk_live_scene`
-    /// turned out VACUOUS — it passed with the substitution disabled, because
-    /// on a degraded fixture (`MESA-LOADER: failed to retrieve device
-    /// information`) `allocate_drawable_storage` fails and a child window has
-    /// no storage of its own, so the assertion held for the wrong reason. The
-    /// end-to-end guard is the vng oracle instead
-    /// (`tools/vng-scenarios/render-root-source-client.c`), which measured
-    /// 0 -> 60000 matching pixels against Xorg on the same client.
+    /// #135 — a zero-area Composite must not pay for a source snapshot:
+    /// acquisition sits in the wrapper, ahead of the inner function's
+    /// zero-area return, so without this gate a width==0 request did a full
+    /// scanout readback and a full-screen scratch upload and then returned
+    /// nothing. Which pictures take one is end to end only (it needs a live
+    /// scanout or storage): tools/vng-scenarios/draw-clip-probe.c measures
+    /// the root and a window with children against Xorg.
     #[test]
-    fn include_inferiors_root_source_is_the_only_substituted_picture() {
-        use yserver_core::backend::{AnyHandle, PixmapHandle, WindowHandle};
-        let mut b = KmsBackend::for_tests();
-        let root = b.core.window_id;
-        let other = 0x4242;
-
-        let root_clip = b
-            .render_create_picture(
-                None,
-                AnyHandle::Window(WindowHandle::from_raw(root).expect("root handle")),
-                0,
-                0,
-                &[],
-            )
-            .expect("root picture")
-            .expect("root picture handle")
-            .as_raw();
-        let root_inferiors = b
-            .render_create_picture(
-                None,
-                AnyHandle::Window(WindowHandle::from_raw(root).expect("root handle")),
-                0,
-                0,
-                &[],
-            )
-            .expect("root picture")
-            .expect("root picture handle")
-            .as_raw();
-        let non_root = b
-            .render_create_picture(
-                None,
-                AnyHandle::Pixmap(PixmapHandle::from_raw(other).expect("pixmap handle")),
-                0,
-                0,
-                &[],
-            )
-            .expect("pixmap picture")
-            .expect("pixmap picture handle")
-            .as_raw();
-
-        // Only the root picture that asked for IncludeInferiors flips.
-        for pic in [root_inferiors, non_root] {
-            if let Some(crate::kms::core::PictureRecord::Drawable { subwindow_mode, .. }) =
-                b.core.pictures.get_mut(&pic)
-            {
-                *subwindow_mode = 1;
-            }
-        }
-
-        assert!(
-            picture_is_include_inferiors_root(&b.core, root_inferiors),
-            "a root picture with IncludeInferiors must be substituted"
-        );
-        assert!(
-            !picture_is_include_inferiors_root(&b.core, root_clip),
-            "ClipByChildren on the root must keep the ordinary source routing"
-        );
-        assert!(
-            !picture_is_include_inferiors_root(&b.core, non_root),
-            "IncludeInferiors on a NON-root drawable is different semantics \
-             (window plus descendants) and is deliberately not handled here"
-        );
-        assert!(
-            !picture_is_include_inferiors_root(&b.core, 0xdead_beef),
-            "an unknown picture must not be substituted"
-        );
-
-        // A zero-area Composite must not pay for a snapshot: acquisition sits
-        // in the wrapper, ahead of the inner function's zero-area return, so
-        // without this gate a width==0 request did a full scanout readback and
-        // a full-screen scratch upload and then returned nothing.
-        assert!(
-            composite_needs_inferiors_snapshot(&b.core, root_inferiors, 8, 8),
-            "a paintable root IncludeInferiors Composite needs the snapshot"
-        );
+    fn a_zero_area_composite_takes_no_source_snapshot() {
+        assert!(composite_needs_source_snapshot(8, 8));
         for (w, h) in [(0u16, 8u16), (8, 0), (0, 0)] {
             assert!(
-                !composite_needs_inferiors_snapshot(&b.core, root_inferiors, w, h),
+                !composite_needs_source_snapshot(w, h),
                 "a {w}x{h} Composite must not acquire the snapshot"
             );
         }
@@ -52467,6 +53315,115 @@ mod tests {
         window: yserver_protocol::x11::ResourceId,
     ) {
         dispatch_raw(state, b, opcode, 0, &window.0.to_le_bytes());
+    }
+
+    /// An InputOnly child (no backend window) of `A` at (100,20) 40x40
+    /// with a cursor: the pointer enters it, shows its cursor and clicks
+    /// on it, as on Xorg (tools/vng-scenarios/goldens/cursor.txt: dtwm's
+    /// frame resize handles are such windows).
+    #[test]
+    fn pointer_enters_input_only_window_and_shows_its_cursor() {
+        use yserver_core::{backend::Backend, core_loop::message::HostInputEvent};
+        use yserver_protocol::x11::{ClientId, CreateWindowRequest, ResourceId};
+        const ONLY: ResourceId = ResourceId(0x0010_0a07);
+        const CURSOR: ResourceId = ResourceId(0x0010_0a08);
+        const CURSOR_HOST: u32 = 0x00ab_0001;
+        let (mut state, mut b, mut peer) = tree_crossing_fixture();
+        tree_request(&mut state, &mut b, 8, TREE_A);
+        state.resources.create_glyph_cursor(ClientId(14), CURSOR);
+        state.resources.set_cursor_host_xid(
+            CURSOR,
+            yserver_core::backend::CursorHandle::from_raw(CURSOR_HOST).unwrap(),
+        );
+        state.resources.create_window(
+            ClientId(14),
+            CreateWindowRequest {
+                window: ONLY,
+                parent: TREE_A,
+                x: 100,
+                y: 20,
+                width: 40,
+                height: 40,
+                class: 2,
+                cursor: Some(CURSOR),
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(ONLY);
+        state
+            .clients
+            .get_mut(&14)
+            .unwrap()
+            .event_masks
+            .insert(ONLY, 0x0000_003c);
+        b.core.cursor_x = 180.0;
+        b.core.cursor_y = 150.0;
+        b.windows_restructured(&mut state);
+        let _ = tree_events(&mut peer);
+        let root_cursor = b.effective_cursor_xid;
+
+        let motion = |x: i32, y: i32| HostInputEvent::PointerMotion {
+            x,
+            y,
+            time: 0,
+            relative: false,
+            dx: 0,
+            dy: 0,
+        };
+        b.on_host_input(&mut state, motion(120, 40));
+        assert_eq!(
+            tree_events(&mut peer),
+            [
+                "Leave A Inferior child=None mode=0",
+                "Enter 0x100a07 Ancestor child=None mode=0",
+            ],
+        );
+        assert_eq!(b.effective_cursor_xid, Some(CURSOR_HOST));
+
+        b.on_host_input(
+            &mut state,
+            HostInputEvent::PointerButton {
+                button: 0x110,
+                pressed: true,
+                time: 0,
+            },
+        );
+        let press = kbd_map_drain(&mut peer);
+        let press = press
+            .chunks(32)
+            .find(|e| e[0] & 0x7f == 4)
+            .expect("ButtonPress");
+        assert_eq!(
+            &press[12..16],
+            &ONLY.0.to_le_bytes(),
+            "on the InputOnly window"
+        );
+        assert_eq!(
+            (
+                i16::from_le_bytes([press[24], press[25]]),
+                i16::from_le_bytes([press[26], press[27]])
+            ),
+            (20, 20),
+            "event coordinates relative to it"
+        );
+        b.on_host_input(
+            &mut state,
+            HostInputEvent::PointerButton {
+                button: 0x110,
+                pressed: false,
+                time: 0,
+            },
+        );
+
+        b.on_host_input(&mut state, motion(180, 150));
+        assert_eq!(
+            tree_events(&mut peer),
+            [
+                "Leave 0x100a07 Ancestor child=None mode=0",
+                "Enter A Inferior child=None mode=0"
+            ],
+        );
+        assert_eq!(b.effective_cursor_xid, root_cursor);
     }
 
     /// Xvfb, pointer still at the centre: MapWindow of a window under it

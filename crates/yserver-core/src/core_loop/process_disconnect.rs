@@ -499,6 +499,7 @@ pub fn process_disconnect_reporting(
         .retain(|(owner, _), _| *owner != client_id.0);
     state.dpms.selected_by.remove(&client_id);
     state.screensaver.selected_by.remove(&client_id);
+    crate::core_loop::process_request::unset_screen_saver_attributes(state, backend, client_id);
     let was_suspending = state
         .screensaver
         .suspend_counts

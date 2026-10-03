@@ -1,6 +1,6 @@
 # Embedded X11 core fonts
 
-These two PCF files are compiled into the server with `include_bytes!` and serve
+These PCF files are compiled into the server with `include_bytes!` and serve
 the `built-ins` font-path element, mirroring Xorg's built-in font FPE (libXfont2
 embeds `fixed` and `cursor` the same way).
 
@@ -16,6 +16,11 @@ character codes carry meaning that no text font can stand in for:
   cursor (xterm hides the pointer with it while you type). Substituting a visible
   text font is the exact opposite of the intent.
 
+`6x13-ISO8859-1.pcf` is libXfont2's own built-in `fixed`: Xorg answers `fixed`,
+`6x13` and `-misc-fixed-medium-r-semicondensed--13-120-75-75-c-60-iso8859-1`
+from it on a host with no core font packages, and clients (CDE's dthello) rely
+on `fixed` always opening, with its metrics.
+
 ## Provenance
 
 Extracted from Arch Linux `xorg-fonts-misc` (upstream `font-cursor-misc` and
@@ -23,6 +28,7 @@ Extracted from Arch Linux `xorg-fonts-misc` (upstream `font-cursor-misc` and
 
     zcat /usr/share/fonts/misc/cursor.pcf.gz > cursor.pcf
     zcat /usr/share/fonts/misc/nil2.pcf.gz   > nil2.pcf
+    zcat /usr/share/fonts/misc/6x13-ISO8859-1.pcf.gz > 6x13-ISO8859-1.pcf
 
 ## Licence
 
@@ -30,5 +36,5 @@ Extracted from Arch Linux `xorg-fonts-misc` (upstream `font-cursor-misc` and
 
     "These "glyphs" are unencumbered"
 
-`font-misc-misc` (`nil2.pcf`) is distributed under the MIT/X11 licence used by
+`font-misc-misc` (`nil2.pcf`, `6x13-ISO8859-1.pcf`) is distributed under the MIT/X11 licence used by
 the X.Org font packages.

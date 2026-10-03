@@ -110,6 +110,7 @@ C: CopyArea 0,0 -> 0,40 100x200 (scroll down)
   y=60:  0-0 frame 5-100 red 105-180 blue 185-190 gray 195-195 frame
   y=137: 0-195 green
   damage covers every change
+  NoExpose
 C: CopyArea 0,50 -> 0,0 100x200 (scroll up)
   x=50:  0-15 magenta 20-35 gray 40-65 red 70-115 gray 120-120 frame 125-145 green
   x=145: 0-10 magenta 15-30 cyan 35-115 blue 120-120 frame 125-145 green
@@ -118,6 +119,7 @@ C: CopyArea 0,50 -> 0,0 100x200 (scroll up)
   y=60:  0-0 frame 5-100 red 105-180 blue 185-190 gray 195-195 frame
   y=137: 0-195 green
   damage covers every change
+  GraphicsExpose 0,50 100x50 count 0
 C: CopyArea 0,0 -> -20,-40 100x140
   x=50:  0-15 magenta 20-115 gray 120-120 frame 125-145 green
   x=145: 0-10 magenta 15-30 cyan 35-115 blue 120-120 frame 125-145 green
@@ -126,6 +128,7 @@ C: CopyArea 0,0 -> -20,-40 100x140
   y=60:  0-0 frame 5-100 gray 105-180 blue 185-190 gray 195-195 frame
   y=137: 0-195 green
   damage covers every change
+  GraphicsExpose 0,60 80x40 count 0
 VG: viewport shaped to its top 60 rows, CG's buttons below it
   x=100: 0-15 frame 20-25 gray 30-65 blue 70-75 red 80-85 blue 90-90 gray 95-110 yellow 115-115 gray 120-145 frame
   y=40:  0-0 frame 5-10 gray 15-180 blue 185-190 gray 195-195 frame
@@ -295,6 +298,7 @@ C: CopyArea 0,0 -> 0,40 100x200 (scroll down)
   y=60:  0-0 frame 5-100 red 105-180 blue 185-190 gray 195-195 frame
   y=137: 0-195 green
   damage covers every change
+  NoExpose
 C: CopyArea 0,50 -> 0,0 100x200 (scroll up)
   x=50:  0-15 magenta 20-35 gray 40-65 red 70-115 gray 120-120 frame 125-145 green
   x=145: 0-10 magenta 15-30 cyan 35-115 blue 120-120 frame 125-145 green
@@ -303,6 +307,7 @@ C: CopyArea 0,50 -> 0,0 100x200 (scroll up)
   y=60:  0-0 frame 5-100 red 105-180 blue 185-190 gray 195-195 frame
   y=137: 0-195 green
   damage covers every change
+  GraphicsExpose 0,50 100x50 count 0
 C: CopyArea 0,0 -> -20,-40 100x140
   x=50:  0-15 magenta 20-115 gray 120-120 frame 125-145 green
   x=145: 0-10 magenta 15-30 cyan 35-115 blue 120-120 frame 125-145 green
@@ -311,6 +316,7 @@ C: CopyArea 0,0 -> -20,-40 100x140
   y=60:  0-0 frame 5-100 gray 105-180 blue 185-190 gray 195-195 frame
   y=137: 0-195 green
   damage covers every change
+  GraphicsExpose 0,60 80x40 count 0
 VG: viewport shaped to its top 60 rows, CG's buttons below it
   x=100: 0-15 frame 20-25 gray 30-65 blue 70-75 red 80-85 blue 90-90 gray 95-110 yellow 115-115 gray 120-145 frame
   y=40:  0-0 frame 5-10 gray 15-180 blue 185-190 gray 195-195 frame

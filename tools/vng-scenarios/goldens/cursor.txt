@@ -1,0 +1,14 @@
+==> probe.log <==
+bare root: cursor 16x16 hot 7,7 pixels 1ae7d436690fff69
+over W: none
+over W: cursor 16x16 hot 7,7 pixels 1ae7d436690fff69
+over the IO child: Enter(IO detail 0)
+over the IO child: cursor 16x16 hot 8,8 pixels 6f2f225678f33402
+over the InputOnly child: Leave(IO detail 3) Enter(InputOnly detail 3)
+over the InputOnly child: cursor 16x16 hot 1,1 pixels 5426425f4bd67e93
+clicked the InputOnly child: ButtonPress(InputOnly at 20,20) ButtonRelease(InputOnly at 20,20)
+back over W: Leave(InputOnly detail 0)
+back over W: cursor 16x16 hot 7,7 pixels 1ae7d436690fff69
+over the input-shaped-away InputOnly child: none
+over the input-shaped-away InputOnly child: cursor 16x16 hot 7,7 pixels 1ae7d436690fff69
+bare root again: cursor 16x16 hot 7,7 pixels 1ae7d436690fff69

@@ -45,6 +45,12 @@ pub const ARGB_COLORMAP: ResourceId = ResourceId(0x104);
 /// Opaque depth-24 visual dedicated to the stencil-free GLX FBConfig used by
 /// glmark2. It must not share ROOT_VISUAL with the stencil-8 configuration.
 pub const GLMARK_VISUAL: ResourceId = ResourceId(0x105);
+/// The MIT-SCREEN-SAVER window, server-owned: Xorg allocates
+/// `pScreen->screensaver.wid` once per screen and reports it in
+/// `QueryInfo` and `ScreenSaverNotify` whether or not it exists
+/// (`Xext/saver.c:665`, `:424`); it does while a client's
+/// `SetAttributes` are shown.
+pub const SCREEN_SAVER_WINDOW: ResourceId = ResourceId(0x106);
 
 /// The X11 depth of the root window, as advertised in the setup reply.
 ///
@@ -676,7 +682,7 @@ impl ResourceTable {
                 Some(Some(id)) => id,
                 Some(None) | None => parent.map_or(ROOT_COLORMAP, |p| p.colormap),
             },
-            cursor: None,
+            cursor: request.cursor,
             owner,
             properties: HashMap::new(),
             host_xid: None,
@@ -2397,10 +2403,23 @@ impl ResourceTable {
         let Some(gc) = self.gcs.get_mut(&request.gc.0) else {
             return;
         };
-        // SetClipRectangles supersedes any prior clip-mask pixmap.
+        // SetClipRectangles supersedes any prior clip-mask pixmap, and its
+        // origin is the GC's clip origin (`SetClipRects`, `dix/gc.c:1021`):
+        // a later ChangeGC of the origin moves the same rectangles.
         gc.clip_pixmap = None;
         gc.clip_pixmap_host_xid = None;
+        gc.clip_x_origin = request.clip.x_origin;
+        gc.clip_y_origin = request.clip.y_origin;
         gc.clip_rectangles = Some(request.clip);
+    }
+
+    /// The GC's clip origin alone, as XFixesSetGCClipRegion sets it even
+    /// for region None (`xfixes/region.c:617-619`).
+    pub fn set_gc_clip_origin(&mut self, gc: ResourceId, x: i16, y: i16) {
+        if let Some(g) = self.gcs.get_mut(&gc.0) {
+            g.clip_x_origin = x;
+            g.clip_y_origin = y;
+        }
     }
 
     pub fn clear_gc_clip(&mut self, gc: ResourceId) {
@@ -6385,6 +6404,43 @@ mod tests {
             }
             other => panic!("expected Rectangles, got {other:?}"),
         }
+    }
+
+    /// SetClipRectangles' origin is the GC's clip origin: Xorg's
+    /// `SetClipRects` stores it in `clipOrg` (`dix/gc.c:1021-1024`), and
+    /// tools/vng-scenarios/draw-clip-probe.c measures a 40x40 clip at
+    /// origin (20,50) filling C's x 20-59, y 50-89. CopyGC carries it.
+    #[test]
+    fn set_clip_rectangles_origin_is_the_gc_clip_origin() {
+        let mut t = ResourceTable::new();
+        install_dummy_gc(&mut t, 0x500);
+        install_dummy_gc(&mut t, 0x501);
+        t.set_clip_rectangles(
+            yserver_protocol::x11::ClientId(1),
+            SetClipRectanglesRequest {
+                gc: ResourceId(0x500),
+                clip: ClipRectangles {
+                    ordering: 0,
+                    x_origin: 20,
+                    y_origin: 50,
+                    rectangles: vec![0, 0, 0, 0, 40, 0, 40, 0],
+                },
+            },
+        );
+        let origin =
+            |t: &ResourceTable, gc| match t.resolve_draw_state(ResourceId(gc)).unwrap().clip {
+                ClipState::Rectangles { origin, .. } => origin,
+                other => panic!("expected Rectangles, got {other:?}"),
+            };
+        assert_eq!(origin(&t, 0x500), (20, 50));
+        t.copy_gc(
+            ResourceId(0x500),
+            ResourceId(0x501),
+            0x0002_0000 | 0x0004_0000 | 0x0008_0000,
+        );
+        assert_eq!(origin(&t, 0x501), (20, 50));
+        t.set_gc_clip_origin(ResourceId(0x500), 30, 10);
+        assert_eq!(origin(&t, 0x500), (30, 10));
     }
 
     #[test]

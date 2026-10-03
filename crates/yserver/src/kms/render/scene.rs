@@ -946,6 +946,10 @@ pub(crate) struct SceneCompositor {
     /// change. Cleared at tick end. Stage 2e narrows to a
     /// per-region scene_structure_damage `RegionSet`.
     pub(crate) scene_structure_dirty: bool,
+    /// Counts the changes that set `scene_structure_dirty`: with the
+    /// store's [`DrawableStore::scene_damage_generation`], what a root
+    /// readback was composed at ([`Self::root_readback`]).
+    structure_generation: u64,
     /// Test-only override for [`has_pending_page_flips`](Self::has_pending_page_flips).
     /// `KmsBackend::for_tests()` builds a `stub()` scene with `inner: None`,
     /// so there is no live `PendingAck` queue to populate; this lets
@@ -983,6 +987,23 @@ struct SceneCompositorInner {
     /// is just a default-arrow fallback so hardware smoke has
     /// visible pointer feedback.
     cursor: Option<CursorEntry>,
+    /// Per output, what a root read sees: [`SceneCompositor::root_readback`].
+    root_readbacks: Vec<Option<RootReadback>>,
+}
+
+/// The screen of one output as it stands, composed for a root read.
+struct RootReadback {
+    target: DamageAuditTarget,
+    /// `(structure_generation, scene_damage_generation)` it was composed at.
+    generation: (u64, u64),
+    /// What of it is current at `generation`, target-local.
+    valid: Vec<vk::Rect2D>,
+    /// It has been composed into whole once, so a clipped compose may load it.
+    whole: bool,
+    /// Reads at `generation`, and at the one before: a poller reading many
+    /// rects between two changes gets one whole compose per change.
+    reads: u32,
+    prev_reads: u32,
 }
 
 /// Stage 3f.8 cursor sprite registration. The sprite lives as a
@@ -1344,12 +1365,14 @@ impl SceneCompositor {
             damage_audit_ledger: VecDeque::new(),
             damage_audit_next_event_id: 0,
             cursor: None,
+            root_readbacks: Vec::new(),
         };
         ensure_intermediates(&mut inner, platform)?;
         Ok(Self {
             inner: Some(inner),
             root_overlay: super::root_overlay::RootOverlay::default(),
             scene_structure_dirty: true,
+            structure_generation: 0,
             #[cfg(test)]
             test_flip_in_flight_override: None,
             #[cfg(test)]
@@ -1455,7 +1478,7 @@ impl SceneCompositor {
         inner.outputs = outputs;
         // Intermediates come with the next tick or `sync_output_layouts`: a
         // CRTC set rebuilds here before the core applies its new transform.
-        self.scene_structure_dirty = true;
+        self.note_structure_change();
         // root-overlay is root-absolute + layout-dependent; drop it on
         // topology change. Covers both connector hotplug
         // (`fire_randr_changes`) and per-CRTC reconfiguration
@@ -1503,7 +1526,7 @@ impl SceneCompositor {
         }
         ensure_intermediates(inner, platform)?;
         if changed {
-            self.scene_structure_dirty = true;
+            self.note_structure_change();
         }
         Ok(())
     }
@@ -1546,7 +1569,7 @@ impl SceneCompositor {
     pub(crate) fn register_cursor(&mut self, entry: CursorEntry) {
         if let Some(inner) = self.inner.as_mut() {
             inner.cursor = Some(entry);
-            self.scene_structure_dirty = true;
+            self.note_structure_change();
         }
     }
 
@@ -1558,7 +1581,7 @@ impl SceneCompositor {
         if let Some(inner) = self.inner.as_mut()
             && inner.cursor.take().is_some()
         {
-            self.scene_structure_dirty = true;
+            self.note_structure_change();
         }
     }
 
@@ -1570,6 +1593,7 @@ impl SceneCompositor {
             inner: None,
             root_overlay: super::root_overlay::RootOverlay::default(),
             scene_structure_dirty: false,
+            structure_generation: 0,
             #[cfg(test)]
             test_flip_in_flight_override: None,
             #[cfg(test)]
@@ -1630,6 +1654,11 @@ impl SceneCompositor {
             })
     }
 
+    fn note_structure_change(&mut self) {
+        self.scene_structure_dirty = true;
+        self.structure_generation = self.structure_generation.wrapping_add(1);
+    }
+
     /// Mark the scene as needing a redraw. Cheap bool flip;
     /// callable from any mutation path that wants the next tick
     /// to inspect drawable/cursor damage. This deliberately does
@@ -1641,6 +1670,7 @@ impl SceneCompositor {
         if self.damage_audit_active() {
             self.record_damage_audit_event(Location::caller(), self.full_output_audit_area());
         }
+        // A paint's own presentation damage tells a root readback it changed.
         self.scene_structure_dirty = true;
     }
 
@@ -1655,7 +1685,7 @@ impl SceneCompositor {
         } else {
             None
         };
-        self.scene_structure_dirty = true;
+        self.note_structure_change();
         if let Some(inner) = self.inner.as_mut() {
             let mut contributed = Vec::with_capacity(inner.outputs.len());
             for o in &mut inner.outputs {
@@ -1680,7 +1710,7 @@ impl SceneCompositor {
         } else {
             None
         };
-        self.scene_structure_dirty = true;
+        self.note_structure_change();
         if let Some(inner) = self.inner.as_mut()
             && let Some(o) = inner.outputs.get_mut(output_idx)
         {
@@ -1712,7 +1742,7 @@ impl SceneCompositor {
         } else {
             None
         };
-        self.scene_structure_dirty = true;
+        self.note_structure_change();
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
@@ -1932,7 +1962,7 @@ impl SceneCompositor {
                 refreshes_hw_binding = true;
             }
         }
-        self.scene_structure_dirty = true;
+        self.note_structure_change();
         refreshes_hw_binding
     }
 
@@ -3025,6 +3055,37 @@ fn hw_cursor_allowed(platform: &PlatformBackend) -> bool {
 
 /// Allocate the intermediate of every transformed output that lacks one of
 /// its footprint's size (spec D4, Q5: only transformed outputs pay).
+/// The space a root read of `output_idx` uses: the root footprint of a
+/// transformed output (D6), else the mode.
+fn root_readback_extent(platform: &PlatformBackend, output_idx: usize) -> vk::Extent2D {
+    if platform.output_transform(output_idx).is_some() {
+        let (_, _, w, h) = platform.output_root_rect(output_idx);
+        return vk::Extent2D {
+            width: w,
+            height: h,
+        };
+    }
+    platform
+        .outputs
+        .get(output_idx)
+        .map_or(vk::Extent2D::default(), |layout| vk::Extent2D {
+            width: u32::from(layout.width),
+            height: u32::from(layout.height),
+        })
+}
+
+/// Whether one of `valid` holds all of `rect`.
+fn root_readback_covers(valid: &[vk::Rect2D], rect: vk::Rect2D) -> bool {
+    valid.iter().any(|v| {
+        v.offset.x <= rect.offset.x
+            && v.offset.y <= rect.offset.y
+            && i64::from(v.offset.x) + i64::from(v.extent.width)
+                >= i64::from(rect.offset.x) + i64::from(rect.extent.width)
+            && i64::from(v.offset.y) + i64::from(v.extent.height)
+                >= i64::from(rect.offset.y) + i64::from(rect.extent.height)
+    })
+}
+
 fn ensure_intermediates(
     inner: &mut SceneCompositorInner,
     platform: &PlatformBackend,
@@ -7938,6 +7999,180 @@ impl SceneCompositor {
             platform.output_transform(i).is_some()
                 && o.intermediate.as_ref().is_none_or(|im| !im.has_content)
         })
+    }
+
+    /// What output `output_idx` shows under `local` now, for a root read:
+    /// Xorg's GetImage reads the screen pixmap, which every earlier
+    /// request has painted (`DoGetImage`, `dix/dispatch.c:2176`), while a
+    /// scanout BO holds the last composed frame. Composes the scene into
+    /// a private image — just `local` for a lone read after a change once
+    /// it holds a whole frame, else all of it — when anything changed
+    /// since, and waits. `local` and the image are in the
+    /// space a root read of this output uses: the mode for an identity
+    /// output, the root footprint for a transformed one (D6). No software
+    /// cursor: Xorg lifts the sprite off a GetImage (`miSpriteGetImage`).
+    /// `Ok(None)` without a live scene. The caller has flushed pending
+    /// paint when [`Self::root_readback_is_current`] said it was not.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn root_readback(
+        &mut self,
+        core: &KmsCore,
+        store: &mut DrawableStore,
+        windows: &super::backend::WindowsMap,
+        platform: &PlatformBackend,
+        cow_host_xid: Option<u32>,
+        output_idx: usize,
+        local: vk::Rect2D,
+    ) -> Result<Option<vk::Image>, SceneError> {
+        let generation = (self.structure_generation, store.scene_damage_generation());
+        let overlay_ops = self
+            .root_overlay
+            .apply_list_for_output(platform.output_root_rect(output_idx));
+        let Some(inner) = self.inner.as_mut() else {
+            return Ok(None);
+        };
+        let extent = root_readback_extent(platform, output_idx);
+        if extent.width == 0 || extent.height == 0 {
+            return Ok(None);
+        }
+        if inner.root_readbacks.len() <= output_idx {
+            inner.root_readbacks.resize_with(output_idx + 1, || None);
+        }
+        if inner.root_readbacks[output_idx]
+            .as_ref()
+            .is_none_or(|rb| rb.target.extent != extent)
+        {
+            inner.root_readbacks[output_idx] = Some(RootReadback {
+                target: DamageAuditTarget::new(Arc::clone(&inner.vk), extent)
+                    .map_err(SceneError::Vk)?,
+                generation,
+                valid: Vec::new(),
+                whole: false,
+                reads: 0,
+                prev_reads: 0,
+            });
+        }
+        let rb = inner.root_readbacks[output_idx]
+            .as_mut()
+            .expect("allocated above");
+        if rb.generation != generation {
+            rb.generation = generation;
+            rb.valid.clear();
+            rb.prev_reads = rb.reads;
+            rb.reads = 0;
+        }
+        rb.reads = rb.reads.saturating_add(1);
+        if root_readback_covers(&rb.valid, local) {
+            return Ok(Some(rb.target.image));
+        }
+        let built = build_scene(
+            core,
+            store,
+            windows,
+            output_idx,
+            platform,
+            None,
+            None,
+            cow_host_xid,
+            false,
+            Visibility::On,
+        );
+        // The overlay XOR is not idempotent: only a full compose applies it
+        // exactly once (see `record_command_buffer`).
+        let one_read = rb.reads == 1 && rb.prev_reads <= 1;
+        let (repaint, scissors) = if rb.whole && overlay_ops.is_empty() && one_read {
+            (Repaint::Clipped(local), vec![local])
+        } else {
+            (Repaint::Full(extent), Vec::new())
+        };
+        let (xor_pipeline, xor_layout) = if overlay_ops.is_empty() {
+            (vk::Pipeline::null(), vk::PipelineLayout::null())
+        } else {
+            let pl = inner.overlay_xor_cache.get(
+                yserver_core::backend::GcFunction::Xor,
+                crate::kms::vk::logic_fill_pipeline::LogicFillChannels::Color,
+            )?;
+            (pl, inner.overlay_xor_cache.pipeline_layout())
+        };
+        let vk = Arc::clone(&inner.vk);
+        let rb = inner.root_readbacks[output_idx]
+            .as_mut()
+            .expect("allocated above");
+        let draws = built.scene.draws.len();
+        let pool = create_audit_descriptor_pool(&vk, draws)?;
+        let ticket = platform.acquire_fence_ticket().map_err(SceneError::Vk)?;
+        let mut submitted = false;
+        let result = record_and_submit_render(
+            &vk,
+            &mut rb.target,
+            &inner.pipeline,
+            pool,
+            &built.scene,
+            repaint,
+            &scissors,
+            ticket.fence(),
+            &mut submitted,
+            &overlay_ops,
+            xor_pipeline,
+            xor_layout,
+            None,
+            None,
+        );
+        if submitted {
+            ticket.wait(&vk).map_err(SceneError::Vk)?;
+        }
+        unsafe { vk.device.destroy_descriptor_pool(pool, None) };
+        let recorded = result?.descriptor_count;
+        // Drivers may over-allocate a pool, so the test caps the count.
+        #[cfg(test)]
+        let recorded = self
+            .test_prime_descriptor_sets
+            .map_or(recorded, |n| recorded.min(n));
+        for id in &built.sampled_ids {
+            store.touch_render_fence(*id, ticket.clone());
+        }
+        // A truncated compose painted less than the scene: not read, as a
+        // truncated priming compose is not.
+        if recorded == draws {
+            match repaint {
+                Repaint::Full(_) => {
+                    rb.whole = true;
+                    rb.valid = vec![vk::Rect2D {
+                        offset: vk::Offset2D::default(),
+                        extent,
+                    }];
+                }
+                _ => rb.valid.push(local),
+            }
+            Ok(Some(rb.target.image))
+        } else {
+            log::warn!(
+                "render root read: output {output_idx} readback composed {recorded} of {draws} \
+                 draws (descriptor pool exhausted); not read"
+            );
+            Ok(None)
+        }
+    }
+
+    /// Whether [`Self::root_readback`] of `local` would read without
+    /// composing, so the caller need not flush pending paint first.
+    pub(crate) fn root_readback_is_current(
+        &self,
+        store: &DrawableStore,
+        platform: &PlatformBackend,
+        output_idx: usize,
+        local: vk::Rect2D,
+    ) -> bool {
+        let generation = (self.structure_generation, store.scene_damage_generation());
+        self.inner
+            .as_ref()
+            .and_then(|inner| inner.root_readbacks.get(output_idx))
+            .and_then(Option::as_ref)
+            .is_some_and(|rb| {
+                rb.generation == generation
+                    && rb.target.extent == root_readback_extent(platform, output_idx)
+                    && root_readback_covers(&rb.valid, local)
+            })
     }
 
     /// Compose every transformed output whose intermediate has never been

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Self-test of tools/vng-suite.sh: a failing assertion, a crashed server, a
 # hang past its timeout and a SIGINT to the runner must each be reported as a
-# failure and leave no process behind.
+# failure and leave no process behind; a guest skip is a skip and exits 0.
 #   tools/vng-scenarios/suite-selftest/run.sh [gpu] [vng-suite args...]
 set -euo pipefail
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -32,6 +32,17 @@ for c in "selftest-fail|guest: deliberate" "selftest-crash|server died" "selftes
     "${suite[@]}" --out "$root/$name" "^$name\$" > "$root-$name.log" 2>&1 || rc=$?
     check "$name" "$rc" "${c#*|}" "$root/$name"
 done
+
+name=selftest-skip
+rc=0
+"${suite[@]}" --out "$root/$name" "^$name\$" > "$root-$name.log" 2>&1 || rc=$?
+verdict=$(cat "$root/$name/$name/verdict.txt" 2> /dev/null || echo "no verdict")
+if [ "$rc" -eq 0 ] && [[ $verdict == skip:* ]]; then
+    echo "selftest: ok   $name (exit 0): $verdict"
+else
+    echo "selftest: FAIL $name (exit $rc, want a skip): $verdict"
+    bad=1
+fi
 
 # Job control gives the runner a default SIGINT instead of an ignored one.
 name=selftest-interrupt

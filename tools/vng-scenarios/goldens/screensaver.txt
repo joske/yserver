@@ -1,0 +1,22 @@
+==> probe.log <==
+before: state 0 kind 0, window the saver's
+A SetAttributes 200x100+10+20: ok
+B SetAttributes 1x1: error 10
+A SetAttributes 0x10: error 2
+attributes set: state 0 kind 2, window the saver's
+before activation: no saver window
+  A: ScreenSaverNotify state 1 kind 2 forced 1 window the saver's
+activated: state 1 kind 2, window the saver's
+activated: saver window 200x100+10+20 map state 2 override 0
+  A: ScreenSaverNotify state 0 kind 2 forced 1 window the saver's
+reset: state 0 kind 2, window the saver's
+reset: no saver window
+A UnsetAttributes: ok
+B SetAttributes 1x1: ok
+  A: ScreenSaverNotify state 1 kind 2 forced 1 window the saver's
+B's activated: saver window 1x1+0+0 map state 2 override 1
+B gone: state 1 kind 0, window the saver's
+B gone: no saver window
+  A: ScreenSaverNotify state 0 kind 0 forced 1 window the saver's
+  A: ScreenSaverNotify state 1 kind 0 forced 1 window the saver's
+  A: ScreenSaverNotify state 0 kind 0 forced 1 window the saver's

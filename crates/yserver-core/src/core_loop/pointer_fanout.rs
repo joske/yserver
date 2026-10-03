@@ -1026,9 +1026,13 @@ fn pointer_event_fanout_to_state_inner(
             });
             merge_dropped(&mut dropped, extras);
             delivered = true;
-        } else if grab.event_mask & mask_bit != 0
-            && let Some(grab_target) = client_target_id(state, grab.owner)
-        {
+        } else if let Some(grab_target) = client_target_id(state, grab.owner) {
+            // Xorg ActivatePassiveGrab hands the activating event to the
+            // grabbing client with the event's own filter as the mask
+            // (dix/events.c TryClientEvents(..., GetEventFilter(device, xE),
+            // ...)), so it arrives even when the grab's event mask lacks
+            // ButtonPress — dtwm's front panel grabs ButtonRelease only in
+            // sync mode and thaws on the press it is handed.
             // Xorg DeliverOneGrabbedEvent -> FixUpEventFromWindow always
             // rewrites eventX/Y from the root coordinates and the grab
             // window's screen-absolute origin.  The producer's event_x/y
@@ -4824,6 +4828,85 @@ mod tests {
                 .map(|grab| (grab.owner, grab.grab_window)),
             Some((ClientId(1), container)),
             "passive grab must be active for client 1",
+        );
+    }
+
+    /// CDE dtwm's front panel: a sync passive grab whose event mask holds
+    /// ButtonRelease only. Xorg ActivatePassiveGrab hands the activating
+    /// press to the grabbing client regardless of the grab's mask (measured:
+    /// tools/vng-scenarios/goldens/passive-grab.txt); without it dtwm never
+    /// AllowEvents and both devices stay frozen.
+    #[test]
+    fn passive_sync_grab_delivers_activating_press_outside_grab_mask() {
+        use yserver_protocol::x11::ResourceId;
+
+        let mut state = ServerState::new();
+        let panel = ResourceId(0x0020_0001);
+        let mut wm_peer = install_client(&mut state, 1);
+        state.resources.create_window(
+            ClientId(1),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window: panel,
+                parent: crate::resources::ROOT_WINDOW,
+                width: 200,
+                height: 200,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(panel);
+        state.button_grabs.push(crate::server::PassiveButtonGrab {
+            owner: ClientId(1),
+            grab_window: panel,
+            button: 0,         // AnyButton
+            modifiers: 0x8000, // AnyModifier
+            owner_events: false,
+            event_mask: 0x0000_0008, // ButtonReleaseMask
+            pointer_mode: 0,         // GrabModeSync
+            keyboard_mode: 0,        // GrabModeSync
+            confine_to: ResourceId(0),
+            via_xi2: false,
+        });
+        let mut xid_map = HostXidMap::new();
+        xid_map.insert(0xCAFE_u32, panel);
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+
+        let _ = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &xid_map,
+            HostPointerEvent {
+                kind: PointerEventKind::ButtonPress,
+                host_xid: 0xCAFE,
+                detail: 1,
+                time: 0,
+                root_x: 50,
+                root_y: 50,
+                event_x: 50,
+                event_y: 50,
+                state: 0,
+                crossing_mode: 0,
+                child: 0,
+                raw_dx: 0,
+                raw_dy: 0,
+                tree_change: false,
+            },
+            true,
+            false,
+        );
+
+        let wm_bytes = read_all_available(&mut wm_peer);
+        assert!(wm_bytes.len() >= 32, "grab client must receive the press");
+        assert_eq!(wm_bytes[0], 4, "event type should be ButtonPress");
+        assert_eq!(&wm_bytes[12..16], &panel.0.to_le_bytes());
+        assert!(
+            state
+                .xi1_frozen
+                .get(&crate::xinput::DEVICEID_SLAVE_POINTER)
+                .is_some_and(|f| f.stored.is_some()),
+            "the press is stored for a ReplayPointer",
         );
     }
 

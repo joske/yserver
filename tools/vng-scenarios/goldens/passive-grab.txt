@@ -1,0 +1,12 @@
+==> probe.log <==
+mapped, focused: FocusIn
+V (no grab) clicked: ButtonPress(button 1 at 50,50 state 0x0) ButtonRelease(button 1 at 50,50 state 0x100)
+pointer moved into W: none
+button 1 pressed: ButtonPress(button 1 at 50,50 state 0x0)
+released, key a typed, still frozen: none
+AllowEvents AsyncBoth: ButtonRelease(button 1 at 50,50 state 0x100) KeyPress KeyRelease
+key a typed: KeyPress KeyRelease
+button 1 pressed again: ButtonPress(button 1 at 50,50 state 0x0)
+AllowEvents ReplayPointer: none
+released: none
+AllowEvents AsyncBoth, key a typed: KeyPress KeyRelease

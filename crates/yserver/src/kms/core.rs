@@ -375,13 +375,27 @@ pub(crate) struct FontDir {
 }
 
 impl FontDir {
-    /// Parse `<dir>/fonts.dir` (required) and `<dir>/fonts.alias`
-    /// (optional). fonts.dir: first line = entry count, then
+    /// Parse `<dir>/fonts.dir` and `<dir>/fonts.alias`, either of which
+    /// may be missing but not both: libXfont's `FontFileReadDirectory`
+    /// takes a directory of aliases alone, as CDE's
+    /// `/usr/dt/etc/cde/fontaliases` is. fonts.dir: first line = entry count, then
     /// `<file> <name>` per line (name may contain spaces — split at
     /// the FIRST space). fonts.alias: `<alias> <name>` with optional
     /// double quotes around either; `!` starts a comment line.
     pub(crate) fn load(dir: &std::path::Path) -> io::Result<Self> {
-        let dir_listing = std::fs::read_to_string(dir.join("fonts.dir"))?;
+        let dir_listing = match std::fs::read_to_string(dir.join("fonts.dir")) {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        let alias_text = std::fs::read_to_string(dir.join("fonts.alias")).ok();
+        if dir_listing.is_none() && alias_text.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "neither fonts.dir nor fonts.alias",
+            ));
+        }
+        let dir_listing = dir_listing.unwrap_or_default();
         let mut entries = Vec::new();
         for line in dir_listing.lines().skip(1) {
             let line = line.trim_end();
@@ -393,7 +407,7 @@ impl FontDir {
             }
         }
         let mut aliases = Vec::new();
-        if let Ok(alias_text) = std::fs::read_to_string(dir.join("fonts.alias")) {
+        if let Some(alias_text) = alias_text {
             for line in alias_text.lines() {
                 let line = line.trim();
                 if line.is_empty() || line.starts_with('!') {
@@ -432,19 +446,49 @@ fn split_alias_token(s: &str) -> Option<(&str, &str)> {
 }
 
 /// Case-insensitive `*`/`?` glob for X11 font name patterns.
-/// Greedy backtracking matcher — font names and patterns are short.
+///
+/// Single-pass with one backtrack point (the last `*`), so cost is
+/// O(|pattern| x |name|). The obvious recursive form — `'*' =>
+/// (0..=n.len()).any(|k| rec(&p[1..], &n[k..]))` — is exponential in the
+/// number of STARS, not the length, so "font names are short" does not save
+/// it. Toolkits ask `-*-*-*-*-*-*-*-*-*-*-*-*-iso8859-1`; a name that fails
+/// on the charset forces every split of every star. That cost `ListFonts`
+/// 514ms per call in issue #155, because `path_font_names` runs this once
+/// per font-path entry. `font_pattern_glob_is_not_exponential` guards it.
+///
+/// `?` matches one char, not one byte, hence `Vec<char>` — the byte-based
+/// `xlfd_pattern_matches` is not a drop-in here.
 pub(crate) fn font_pattern_matches(pattern: &str, name: &str) -> bool {
     let p: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
     let n: Vec<char> = name.to_ascii_lowercase().chars().collect();
-    fn rec(p: &[char], n: &[char]) -> bool {
-        match p.first() {
-            None => n.is_empty(),
-            Some('*') => (0..=n.len()).any(|k| rec(&p[1..], &n[k..])),
-            Some('?') => !n.is_empty() && rec(&p[1..], &n[1..]),
-            Some(c) => n.first() == Some(c) && rec(&p[1..], &n[1..]),
+    let mut pi = 0usize;
+    let mut ni = 0usize;
+    // Position of the most recent `*` in the pattern, and the name offset
+    // it was first tried at. On a mismatch we return here and let that
+    // star swallow one more char — the only backtrack the grammar needs.
+    let mut star: Option<usize> = None;
+    let mut star_ni = 0usize;
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            star_ni = ni;
+            pi += 1;
+        } else if let Some(sp) = star {
+            pi = sp + 1;
+            star_ni += 1;
+            ni = star_ni;
+        } else {
+            return false;
         }
     }
-    rec(&p, &n)
+    // Name exhausted: any trailing stars match empty, anything else fails.
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 /// Resolution outcome for a font name against the font path.
@@ -471,6 +515,8 @@ pub(crate) enum FontResolution {
 pub(crate) struct EmbeddedFont {
     /// The bare font name clients ask for (`OpenFont` / `fonts.dir` key).
     pub(crate) name: &'static str,
+    /// Further names it answers to.
+    pub(crate) aliases: &'static [&'static str],
     /// PCF file contents.
     pub(crate) bytes: &'static [u8],
 }
@@ -490,23 +536,56 @@ pub(crate) struct EmbeddedFont {
 /// `fixed` is deliberately absent: it is ordinary text, so fontconfig's
 /// substitution is a reasonable (if not byte-faithful) stand-in, and clients
 /// already depend on that behaviour.
+///
+/// `fixed`: libXfont2's built-in FPE serves `fixed` and `6x13` as aliases of
+/// its embedded `6x13-ISO8859-1.pcf`, so Xorg answers them, and CDE's
+/// dthello and friends start, on a host with no core font packages. A
+/// fontconfig face has other metrics (10 wide, not 6).
 pub(crate) static EMBEDDED_FONTS: &[EmbeddedFont] = &[
     EmbeddedFont {
         name: "cursor",
+        aliases: &[],
         bytes: include_bytes!("../../fonts/cursor.pcf"),
     },
     EmbeddedFont {
         name: "nil2",
+        aliases: &[],
         bytes: include_bytes!("../../fonts/nil2.pcf"),
     },
+    EmbeddedFont {
+        name: XORG_BUILTIN_FIXED,
+        aliases: &[
+            "fixed",
+            "6x13",
+            "-misc-fixed-medium-r-semicondensed--13-100-100-100-c-60-iso8859-1",
+            "-misc-fixed-medium-r-semicondensed--0-0-75-75-c-0-iso8859-1",
+        ],
+        bytes: include_bytes!("../../fonts/6x13-ISO8859-1.pcf"),
+    },
+];
+
+/// The XLFD of libXfont2's built-in `fixed`.
+pub(crate) const XORG_BUILTIN_FIXED: &str =
+    "-misc-fixed-medium-r-semicondensed--13-120-75-75-c-60-iso8859-1";
+
+/// What `ListFonts` finds in Xorg's `built-ins` element, in its order
+/// (measured on Xorg 21.1 with the path set to `built-ins` alone; the
+/// 100-dpi and 0-0 names are its bitmap scaler's).
+pub(crate) const XORG_BUILTIN_NAMES: &[&str] = &[
+    "-misc-fixed-medium-r-semicondensed--13-100-100-100-c-60-iso8859-1",
+    XORG_BUILTIN_FIXED,
+    "6x13",
+    "cursor",
+    "fixed",
+    "-misc-fixed-medium-r-semicondensed--0-0-75-75-c-0-iso8859-1",
 ];
 
 /// The embedded font `name` refers to, if any (case-insensitive, as
 /// X font names are).
 pub(crate) fn embedded_font(name: &str) -> Option<&'static EmbeddedFont> {
-    EMBEDDED_FONTS
-        .iter()
-        .find(|f| f.name.eq_ignore_ascii_case(name))
+    EMBEDDED_FONTS.iter().find(|f| {
+        f.name.eq_ignore_ascii_case(name) || f.aliases.iter().any(|a| a.eq_ignore_ascii_case(name))
+    })
 }
 
 pub(crate) struct FontLoader {
@@ -577,7 +656,7 @@ impl FontLoader {
     }
 
     /// Validate and install a new font path. Every element must be
-    /// "built-ins" or a directory with a readable fonts.dir; on any
+    /// "built-ins" or a directory with a readable fonts.dir or fonts.alias; on any
     /// invalid element the old path is kept and Err carries the bad
     /// element (handler → BadValue). Empty list resets to default
     /// (Xorg SetFontPath semantics).
@@ -623,7 +702,12 @@ impl FontLoader {
             let Some(dir) = dir else {
                 // "built-ins": embedded fonts first — a fontconfig
                 // substitute for `cursor`/`nil2` is always wrong (#79).
-                if let Some(f) = embedded_font(name) {
+                if let Some(f) = embedded_font(name).or_else(|| {
+                    XORG_BUILTIN_NAMES
+                        .iter()
+                        .find(|n| font_pattern_matches(name, n))
+                        .and_then(|n| embedded_font(n))
+                }) {
                     return Some(FontResolution::Embedded(f));
                 }
                 // then the alias set, then catalog XLFD match.
@@ -661,6 +745,22 @@ impl FontLoader {
                 .map(|(n, p)| (n.clone(), p.clone()))
             {
                 return Some(FontResolution::File { path, entry_name });
+            }
+            // A pattern matches aliases too: libXfont looks a name up in
+            // one table of a directory's fonts and aliases
+            // (`FontFileFindNameInDir`), so CDE's `-dt-interface …-m*-…`
+            // opens through `/usr/dt/etc/cde/fontaliases`, a directory of
+            // aliases alone.
+            // An alias whose target is not on this system (CDE's
+            // fonts.alias names fonts for every charset) gives way to the
+            // next one that matches.
+            if let Some(found) = dir
+                .aliases
+                .iter()
+                .filter(|(a, _)| font_pattern_matches(name, a))
+                .find_map(|(_, target)| self.resolve_inner(target, hops - 1))
+            {
+                return Some(found);
             }
         }
         None
@@ -752,12 +852,29 @@ impl FontLoader {
         Self::alias_to_xlfd(alias, &metrics).eq_ignore_ascii_case(name)
     }
 
-    /// All fonts.dir/alias names on the current path matching
-    /// `pattern`, in path order — feed for ListFonts ahead of the
-    /// built-ins catalog. Aliases are reported by their alias name.
+    /// Every name on the current path matching `pattern`, element by
+    /// element as Xorg's ListFonts walks them: a directory's fonts.dir
+    /// and alias names; for `built-ins`, Xorg's own built-in names, then
+    /// the fontconfig catalog this server adds there. Nothing from
+    /// `built-ins` when the path does not hold it, as on Xorg.
     pub(crate) fn path_font_names(&self, pattern: &str) -> Vec<String> {
         let mut out = Vec::new();
-        for dir in self.path_dirs.iter().flatten() {
+        for dir in &self.path_dirs {
+            let Some(dir) = dir else {
+                out.extend(
+                    XORG_BUILTIN_NAMES
+                        .iter()
+                        .filter(|n| font_pattern_matches(pattern, n))
+                        .map(|n| (*n).to_string()),
+                );
+                out.extend(
+                    self.catalog
+                        .iter()
+                        .filter(|n| font_pattern_matches(pattern, n))
+                        .cloned(),
+                );
+                continue;
+            };
             for (name, _) in &dir.entries {
                 if font_pattern_matches(pattern, name) {
                     out.push(name.clone());
@@ -1607,8 +1724,9 @@ pub(crate) fn build_font_catalog(fc: &fontconfig::Fontconfig) -> Vec<String> {
     const PIXEL_SIZES: &[u32] = &[8, 10, 12, 14, 16, 18, 24];
     const CHARSETS: &[&str] = &["iso8859-1", "iso10646-1"];
 
-    // Aliases the loader handles directly without an XLFD parse pass.
-    let mut entries: Vec<String> = vec!["fixed".into(), "cursor".into(), "nil2".into()];
+    // `fixed`, `cursor` and the rest of Xorg's own built-ins are listed
+    // from `XORG_BUILTIN_NAMES`, ahead of these.
+    let mut entries: Vec<String> = Vec::new();
 
     // fontconfig 0.11 wraps construction/queries in `Result`; this fn
     // is infallible, so on any setup failure fall back to just the
@@ -2824,6 +2942,69 @@ mod font_tests {
         assert!(!font_pattern_matches("nope", "xtfont0"));
     }
 
+    /// Edge cases that distinguish a correct glob from a plausible one:
+    /// trailing stars, empty inputs, a star giving back chars so a later
+    /// literal can land, and `?` against a multibyte char (#155).
+    #[test]
+    fn font_pattern_glob_edge_cases() {
+        // Trailing stars match empty; a bare star matches empty.
+        assert!(font_pattern_matches("abc*", "abc"));
+        assert!(font_pattern_matches("abc***", "abc"));
+        assert!(font_pattern_matches("*", ""));
+        assert!(font_pattern_matches("***", ""));
+        assert!(font_pattern_matches("", ""));
+        // A non-star pattern cannot match an empty name, and vice versa.
+        assert!(!font_pattern_matches("", "a"));
+        assert!(!font_pattern_matches("?", ""));
+        // The whole name must be consumed.
+        assert!(!font_pattern_matches("abc", "abcd"));
+        // Backtracking: the star must give back chars so a later literal
+        // can land. A single-pass matcher without a backtrack point fails
+        // these.
+        assert!(font_pattern_matches("*b", "abab"));
+        assert!(font_pattern_matches("*ab", "aab"));
+        assert!(font_pattern_matches("a*b*c", "axxbyyc"));
+        assert!(!font_pattern_matches("*ab", "aba"));
+        // `?` matches exactly one CHAR, not one byte — a byte-based
+        // matcher (e.g. `xlfd_pattern_matches`) diverges here.
+        assert!(font_pattern_matches("?", "é"));
+        assert!(font_pattern_matches("*é*", "xéy"));
+        // The shape real toolkits send: all-wildcard XLFD with a literal
+        // charset tail. Matching and non-matching must both be right.
+        let name = "-misc-fixed-medium-r-normal--20-200-75-75-c-100-iso8859-1";
+        assert!(font_pattern_matches(
+            "-*-*-*-*-*-*-*-*-*-*-*-*-iso8859-1",
+            name
+        ));
+        assert!(!font_pattern_matches(
+            "-*-*-*-*-*-*-*-*-*-*-*-*-iso10646-1",
+            name
+        ));
+        assert!(font_pattern_matches("-*-*-*-*-*-*-*-*-*-*-*-*-*-*", name));
+    }
+
+    /// Complexity guard for #155: the matcher must not be exponential in
+    /// the star count. The worst case is a fully-wildcarded XLFD with a
+    /// literal charset tail against a name that does NOT match, so every
+    /// split of every star is explored before the answer is known. The
+    /// bound is loose enough that only a return to exponential can trip
+    /// it, so a wall-clock assertion is safe here.
+    #[test]
+    fn font_pattern_glob_is_not_exponential() {
+        let pattern = "-*-*-*-*-*-*-*-*-*-*-*-*-iso8859-1";
+        let name = "-misc-fixed-medium-r-normal--20-200-75-75-c-100-iso10646-1";
+        let start = std::time::Instant::now();
+        for _ in 0..5000 {
+            assert!(!font_pattern_matches(pattern, name));
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "5000 worst-case font glob matches took {elapsed:?}; the matcher \
+             has regressed to exponential backtracking (see #155)"
+        );
+    }
+
     /// The built-ins escape hatch for our own synthesized alias XLFD
     /// (#107) must not turn into "any name whose family field is an
     /// alias": `parse_xlfd` reads field 2 without validating the rest,
@@ -2977,10 +3158,10 @@ mod font_tests {
             "nil2 must resolve to the embedded font — a visible substitute \
              inverts its whole purpose (invisible cursors)"
         );
-        // `fixed` is ordinary text; fontconfig substitution stays.
+        // `fixed` is libXfont2's built-in 6x13, as on Xorg.
         assert!(
-            matches!(loader.resolve("fixed"), Some(FontResolution::BuiltIn)),
-            "fixed keeps its fontconfig fallback"
+            matches!(loader.resolve("fixed"), Some(FontResolution::Embedded(f)) if f.name == XORG_BUILTIN_FIXED),
+            "fixed is the embedded 6x13"
         );
 
         // XC_left_ptr: the arrow the reporter saw as an `E`.
@@ -3022,7 +3203,7 @@ mod font_tests {
     fn builtin_alias_xlfd_identity_not_just_shape() {
         let mut loader = FontLoader::new().unwrap();
         loader.set_font_path(&["built-ins".into()]).unwrap();
-        let (_, metrics, _) = loader.open_font_builtin("fixed").unwrap();
+        let (_, metrics, _) = loader.open_builtin_or_embedded("fixed").unwrap();
         let real = FontLoader::alias_to_xlfd("fixed", &metrics);
         assert!(
             matches!(loader.resolve(&real), Some(FontResolution::BuiltIn)),
@@ -3083,11 +3264,99 @@ mod font_tests {
         // built-ins alias survives any path
         assert!(matches!(
             loader.resolve("fixed"),
-            Some(FontResolution::BuiltIn)
+            Some(FontResolution::Embedded(_))
         ));
         // unknown bare name → None → BadName at the request layer
         assert!(loader.resolve("definitely-not-a-font").is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Xorg's `built-ins` element alone (measured, Xorg 21.1): `fixed`,
+    /// `6x13` and the 6x13 XLFD open as one 6-wide font with ascent 11
+    /// and descent 2; `*` lists its six names first; and a path without
+    /// `built-ins` has none of them.
+    #[test]
+    fn built_ins_are_xorgs_fixed_and_cursor() {
+        let mut loader = FontLoader::new().unwrap();
+        loader.set_font_path(&["built-ins".into()]).unwrap();
+        for name in [
+            "fixed",
+            "FIXED",
+            "6x13",
+            XORG_BUILTIN_FIXED,
+            "-*-*-*-R-*-*-*-120-*-*-*-*",
+        ] {
+            let Some(FontResolution::Embedded(f)) = loader.resolve(name) else {
+                panic!("{name} must resolve to the built-in 6x13");
+            };
+            assert_eq!(f.name, XORG_BUILTIN_FIXED);
+        }
+        let (_, metrics, _) = loader.open_builtin_or_embedded("fixed").unwrap();
+        assert_eq!(
+            (
+                metrics.max_bounds.character_width,
+                metrics.font_ascent,
+                metrics.font_descent
+            ),
+            (6, 11, 2)
+        );
+        assert_eq!(&loader.path_font_names("*")[..6], XORG_BUILTIN_NAMES);
+        let aliases = std::env::temp_dir().join(format!(
+            "yserver-font-test-no-builtins-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&aliases);
+        std::fs::write(aliases.join("fonts.alias"), "other fixed\n").unwrap();
+        loader
+            .set_font_path(&[aliases.to_string_lossy().into_owned()])
+            .unwrap();
+        assert!(loader.path_font_names("fixed").is_empty());
+        let _ = std::fs::remove_dir_all(aliases);
+    }
+
+    /// CDE's Xsession adds `/usr/dt/etc/cde/fontaliases`, a directory
+    /// with a fonts.alias and no fonts.dir, which Xorg takes
+    /// (`FontFileReadDirectory`); its patterns then open through the
+    /// aliases (`FontFileFindNameInDir`), past one whose target is not
+    /// installed. Measured with CDE's
+    /// `-dt-interface system-medium-r-normal-s*-…-ISO8859-1` in vng.
+    #[test]
+    fn an_alias_only_directory_joins_the_path_and_opens_by_pattern() {
+        let fonts = write_test_font_dir("alias-target");
+        let aliases = std::env::temp_dir().join(format!(
+            "yserver-font-test-alias-only-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&aliases);
+        std::fs::write(
+            aliases.join("fonts.alias"),
+            "\"-dt-interface system-medium-r-normal-s gone-13-130-75-75-m-70-iso8859-1\" no-such-font\n\
+             \"-dt-interface system-medium-r-normal-s serif-13-130-75-75-m-70-iso8859-1\" testfont0\n",
+        )
+        .unwrap();
+        let mut loader = FontLoader::new().unwrap();
+        loader
+            .set_font_path(&[
+                fonts.to_string_lossy().into_owned(),
+                aliases.to_string_lossy().into_owned(),
+            ])
+            .expect("an alias-only directory is a valid path element");
+        assert!(matches!(
+            loader.resolve("-dt-interface system-medium-r-normal-s*-*-*-*-*-*-*-ISO8859-1"),
+            Some(FontResolution::File { .. })
+        ));
+        let empty =
+            std::env::temp_dir().join(format!("yserver-font-test-empty-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&empty);
+        assert!(
+            loader
+                .set_font_path(&[empty.to_string_lossy().into_owned()])
+                .is_err(),
+            "neither fonts.dir nor fonts.alias"
+        );
+        for d in [fonts, aliases, empty] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 
     #[test]

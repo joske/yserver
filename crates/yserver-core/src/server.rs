@@ -763,6 +763,29 @@ pub struct ScreenSaverState {
     /// cleared when `active` returns to `Off`. Mirrors Xorg
     /// `WaitFor.c:473-476`.
     pub next_cycle: Option<Instant>,
+
+    /// `SetAttributes`: the window one client wants shown while the saver
+    /// is on (Xorg `ScreenSaverAttrRec`, `Xext/saver.c:734-1073`).
+    pub attributes: Option<SaverAttributes>,
+    /// That window ([`crate::resources::SCREEN_SAVER_WINDOW`]) exists.
+    pub window_shown: bool,
+}
+
+/// What `ScreenSaverSetAttributes` stores: a `CreateWindow` for the saver
+/// window, child of the root, owned by the server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaverAttributes {
+    pub client: ClientId,
+    pub x: i16,
+    pub y: i16,
+    pub width: u16,
+    pub height: u16,
+    pub border_width: u16,
+    pub class: u8,
+    pub depth: u8,
+    pub visual: u32,
+    pub value_mask: u32,
+    pub values: Vec<u32>,
 }
 
 impl ScreenSaverState {
@@ -782,6 +805,8 @@ impl ScreenSaverState {
             selected_by: HashMap::new(),
             suspend_counts: HashMap::new(),
             next_cycle: None,
+            attributes: None,
+            window_shown: false,
         }
     }
 }

@@ -2135,6 +2135,13 @@ pub trait Backend {
         None
     }
 
+    /// Whether a Picture's subwindow mode is IncludeInferiors, which
+    /// keeps a destination's children inside its clip
+    /// (`miValidatePicture`, `render/mipict.c:114-118`).
+    fn picture_includes_inferiors(&self, _host_pic: u32) -> bool {
+        false
+    }
+
     fn render_change_picture(
         &mut self,
         origin: Option<OriginContext>,

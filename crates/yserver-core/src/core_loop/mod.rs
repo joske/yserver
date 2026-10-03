@@ -9,6 +9,7 @@ pub mod auth;
 pub mod barriers;
 pub mod client_io;
 pub mod client_reader;
+pub mod clip_list;
 pub mod composite_overlay;
 pub mod damage_fanout;
 pub mod fanout;

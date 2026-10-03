@@ -1,0 +1,483 @@
+==> direct.log <==
+C: PolyPoint ClipByChildren
+  T 0  H 0  B 0  F 0  C changed  V same
+C: PolyPoint IncludeInferiors
+  T 0  H 0  B 0  F 0  C changed  V changed
+V: PolyPoint
+  T 0  H 0  B 0  F 0  C same  V changed
+C: PolyLine ClipByChildren
+  T 0  H 0  B 0  F 0  C changed  V same
+C: PolyLine IncludeInferiors
+  T 0  H 0  B 0  F 0  C changed  V changed
+V: PolyLine
+  T 0  H 0  B 0  F 0  C same  V changed
+C: PolyLine width 7 ClipByChildren
+  T 0  H 0  B 0  F 0  C changed  V same
+C: PolyLine width 7 IncludeInferiors
+  T 0  H 0  B 0  F 0  C changed  V changed
+V: PolyLine width 7
+  T 0  H 0  B 0  F 0  C same  V changed
+C: PolySegment ClipByChildren
+  T 0  H 0  B 0  F 0  C changed  V same
+C: PolySegment IncludeInferiors
+  T 0  H 0  B 0  F 0  C changed  V changed
+V: PolySegment
+  T 0  H 0  B 0  F 0  C same  V changed
+C: PolySegment width 5 ClipByChildren
+  T 0  H 0  B 0  F 0  C changed  V same
+C: PolySegment width 5 IncludeInferiors
+  T 0  H 0  B 0  F 0  C changed  V changed
+V: PolySegment width 5
+  T 0  H 0  B 0  F 0  C same  V changed
+C: PolyRectangle ClipByChildren
+  T 0  H 0  B 0  F 0  C changed  V same
+C: PolyRectangle IncludeInferiors
+  T 0  H 0  B 0  F 0  C changed  V changed
+V: PolyRectangle
+  T 0  H 0  B 0  F 0  C same  V changed
+C: PolyRectangle width 6 ClipByChildren
+  T 0  H 0  B 0  F 0  C changed  V same
+C: PolyRectangle width 6 IncludeInferiors
+  T 0  H 0  B 0  F 0  C changed  V changed
+V: PolyRectangle width 6
+  T 0  H 0  B 0  F 0  C same  V changed
+C: PolyArc ClipByChildren
+  T 0  H 0  B 0  F 0  C changed  V same
+C: PolyArc IncludeInferiors
+  T 0  H 0  B 0  F 0  C changed  V changed
+V: PolyArc
+  T 0  H 0  B 0  F 0  C same  V changed
+C: PolyArc width 5 ClipByChildren
+  T 0  H 0  B 0  F 0  C changed  V same
+C: PolyArc width 5 IncludeInferiors
+  T 0  H 0  B 0  F 0  C changed  V changed
+V: PolyArc width 5
+  T 0  H 0  B 0  F 0  C same  V changed
+C: FillPoly ClipByChildren
+  T 0  H 0  B 0  F 0  C changed  V same
+C: FillPoly IncludeInferiors
+  T 0  H 0  B 0  F 0  C changed  V changed
+V: FillPoly
+  T 0  H 0  B 0  F 0  C same  V changed
+C: PolyFillArc ClipByChildren
+  T 0  H 0  B 0  F 0  C changed  V same
+C: PolyFillArc IncludeInferiors
+  T 0  H 0  B 0  F 0  C changed  V changed
+V: PolyFillArc
+  T 0  H 0  B 0  F 0  C same  V changed
+C: PolyText8 ClipByChildren
+  T 0  H 0  B 0  F 0  C changed  V same
+C: PolyText8 IncludeInferiors
+  T 0  H 0  B 0  F 0  C changed  V changed
+V: PolyText8
+  T 0  H 0  B 0  F 0  C same  V changed
+C: PolyText16 ClipByChildren
+  T 0  H 0  B 0  F 0  C changed  V same
+C: PolyText16 IncludeInferiors
+  T 0  H 0  B 0  F 0  C changed  V changed
+V: PolyText16
+  T 0  H 0  B 0  F 0  C same  V changed
+C: ImageText8 ClipByChildren
+  T 0  H 0  B 0  F 0  C changed  V same
+C: ImageText8 IncludeInferiors
+  T 0  H 0  B 0  F 0  C changed  V changed
+V: ImageText8
+  T 0  H 0  B 0  F 0  C same  V changed
+C: ImageText16 ClipByChildren
+  T 0  H 0  B 0  F 0  C changed  V same
+C: ImageText16 IncludeInferiors
+  T 0  H 0  B 0  F 0  C changed  V changed
+V: ImageText16
+  T 0  H 0  B 0  F 0  C same  V changed
+C: PolyFillRectangle tiled -50,-50 400x400
+  T 0  H 0  B 0  F 0  C changed  V same
+C: CopyPlane -40,-40 300x200
+  T 0  H 0  B 0  F 0  C changed  V same
+C: PolyFillRectangle IncludeInferiors, then ClearArea C
+  T 0  H 0  B 0  F 0  C same  V changed
+C: fill, clip 0,0 40x40 at origin 20,50
+  changed 1600: x 20-59 y 50-89
+C: fill, then ChangeGC clip origin 30,10
+  changed 1600: x 30-69 y 10-49
+C: PolySegment, clip 0,0 40x40 at origin 20,50
+  changed 79: x 20-59 y 50-89
+C: PolyText8, clip 0,0 40x40 at origin 20,50
+  changed 263: x 20-58 y 50-89
+C: CopyArea, clip 0,0 40x40 at origin 20,50
+  changed 1600: x 20-59 y 50-89
+C: fill, CopyGC of the clip at origin 20,50
+  changed 1600: x 20-59 y 50-89
+C: fill, 40x40 clip mask at origin 20,50
+  changed 1600: x 20-59 y 50-89
+C: fill, XFixesSetGCClipRegion 0,0 40x40 at 20,50
+  changed 1600: x 20-59 y 50-89
+GetImage C
+  x=40:  0-95 gray
+  x=140: 15-95 blue
+  y=50:  0-95 gray 100-175 blue 180-185 gray
+  y=95:  0-95 gray 100-175 blue 180-185 gray
+GetImage F
+  x=50:  0-15 magenta 20-115 gray 120-120 frame 125-145 green
+  x=145: 0-10 magenta 15-30 cyan 35-115 blue 120-120 frame 125-145 green
+  y=60:  0-0 frame 5-100 gray 105-180 blue 185-190 gray 195-195 frame
+  y=137: 0-195 green
+F at x=-50: GetImage F
+  GetImage failed
+RENDER Composite from C ClipByChildren into a pixmap
+  x=40:  0-95 gray
+  x=140: 15-95 blue
+  y=50:  0-95 gray 100-175 blue 180-185 gray
+  y=95:  0-95 gray 100-175 blue 180-185 gray
+RENDER Composite from C IncludeInferiors into a pixmap
+  x=40:  0-95 gray
+  x=140: 15-95 blue
+  y=50:  0-95 gray 100-175 blue 180-185 gray
+  y=95:  0-95 gray 100-175 blue 180-185 gray
+RENDER Composite from the root ClipByChildren into a pixmap
+  x=50:  0-15 magenta 20-115 gray 120-120 frame 125-145 green
+  x=145: 0-10 magenta 15-30 cyan 35-115 blue 120-120 frame 125-145 green
+  y=60:  0-0 frame 5-100 gray 105-180 blue 185-190 gray 195-195 frame
+  y=137: 0-195 green
+RENDER Composite from the root IncludeInferiors into a pixmap
+  x=50:  0-15 magenta 20-115 gray 120-120 frame 125-145 green
+  x=145: 0-10 magenta 15-30 cyan 35-115 blue 120-120 frame 125-145 green
+  y=60:  0-0 frame 5-100 gray 105-180 blue 185-190 gray 195-195 frame
+  y=137: 0-195 green
+C: RENDER FillRectangles ClipByChildren
+  T 0  H 0  B 0  F 0  C changed  V same
+C: RENDER Composite ClipByChildren
+  T 0  H 0  B 0  F 0  C changed  V same
+C: RENDER FillRectangles IncludeInferiors
+  T 0  H 0  B 0  F 0  C changed  V changed
+C: RENDER Composite IncludeInferiors
+  T 0  H 0  B 0  F 0  C changed  V changed
+C: fill IncludeInferiors, GetImage root at once
+  x=50:  0-15 magenta 20-115 orange 120-120 frame 125-145 green
+  x=145: 0-10 magenta 15-30 cyan 35-115 orange 120-120 frame 125-145 green
+  y=60:  0-0 frame 5-190 orange 195-195 frame
+  y=137: 0-195 green
+reset, GetImage root at once
+  x=50:  0-15 magenta 20-115 gray 120-120 frame 125-145 green
+  x=145: 0-10 magenta 15-30 cyan 35-115 blue 120-120 frame 125-145 green
+  y=60:  0-0 frame 5-100 gray 105-180 blue 185-190 gray 195-195 frame
+  y=137: 0-195 green
+==> probe.log <==
+C: PolyPoint ClipByChildren
+  T 0  H 0  B 0  F 0  C changed  V same
+C: PolyPoint IncludeInferiors
+  T 0  H 0  B 0  F 0  C changed  V changed
+V: PolyPoint
+  T 0  H 0  B 0  F 0  C same  V changed
+C: PolyLine ClipByChildren
+  T 0  H 0  B 0  F 0  C changed  V same
+C: PolyLine IncludeInferiors
+  T 0  H 0  B 0  F 0  C changed  V changed
+V: PolyLine
+  T 0  H 0  B 0  F 0  C same  V changed
+C: PolyLine width 7 ClipByChildren
+  T 0  H 0  B 0  F 0  C changed  V same
+C: PolyLine width 7 IncludeInferiors
+  T 0  H 0  B 0  F 0  C changed  V changed
+V: PolyLine width 7
+  T 0  H 0  B 0  F 0  C same  V changed
+C: PolySegment ClipByChildren
+  T 0  H 0  B 0  F 0  C changed  V same
+C: PolySegment IncludeInferiors
+  T 0  H 0  B 0  F 0  C changed  V changed
+V: PolySegment
+  T 0  H 0  B 0  F 0  C same  V changed
+C: PolySegment width 5 ClipByChildren
+  T 0  H 0  B 0  F 0  C changed  V same
+C: PolySegment width 5 IncludeInferiors
+  T 0  H 0  B 0  F 0  C changed  V changed
+V: PolySegment width 5
+  T 0  H 0  B 0  F 0  C same  V changed
+C: PolyRectangle ClipByChildren
+  T 0  H 0  B 0  F 0  C changed  V same
+C: PolyRectangle IncludeInferiors
+  T 0  H 0  B 0  F 0  C changed  V changed
+V: PolyRectangle
+  T 0  H 0  B 0  F 0  C same  V changed
+C: PolyRectangle width 6 ClipByChildren
+  T 0  H 0  B 0  F 0  C changed  V same
+C: PolyRectangle width 6 IncludeInferiors
+  T 0  H 0  B 0  F 0  C changed  V changed
+V: PolyRectangle width 6
+  T 0  H 0  B 0  F 0  C same  V changed
+C: PolyArc ClipByChildren
+  T 0  H 0  B 0  F 0  C changed  V same
+C: PolyArc IncludeInferiors
+  T 0  H 0  B 0  F 0  C changed  V changed
+V: PolyArc
+  T 0  H 0  B 0  F 0  C same  V changed
+C: PolyArc width 5 ClipByChildren
+  T 0  H 0  B 0  F 0  C changed  V same
+C: PolyArc width 5 IncludeInferiors
+  T 0  H 0  B 0  F 0  C changed  V changed
+V: PolyArc width 5
+  T 0  H 0  B 0  F 0  C same  V changed
+C: FillPoly ClipByChildren
+  T 0  H 0  B 0  F 0  C changed  V same
+C: FillPoly IncludeInferiors
+  T 0  H 0  B 0  F 0  C changed  V changed
+V: FillPoly
+  T 0  H 0  B 0  F 0  C same  V changed
+C: PolyFillArc ClipByChildren
+  T 0  H 0  B 0  F 0  C changed  V same
+C: PolyFillArc IncludeInferiors
+  T 0  H 0  B 0  F 0  C changed  V changed
+V: PolyFillArc
+  T 0  H 0  B 0  F 0  C same  V changed
+C: PolyText8 ClipByChildren
+  T 0  H 0  B 0  F 0  C changed  V same
+C: PolyText8 IncludeInferiors
+  T 0  H 0  B 0  F 0  C changed  V changed
+V: PolyText8
+  T 0  H 0  B 0  F 0  C same  V changed
+C: PolyText16 ClipByChildren
+  T 0  H 0  B 0  F 0  C changed  V same
+C: PolyText16 IncludeInferiors
+  T 0  H 0  B 0  F 0  C changed  V changed
+V: PolyText16
+  T 0  H 0  B 0  F 0  C same  V changed
+C: ImageText8 ClipByChildren
+  T 0  H 0  B 0  F 0  C changed  V same
+C: ImageText8 IncludeInferiors
+  T 0  H 0  B 0  F 0  C changed  V changed
+V: ImageText8
+  T 0  H 0  B 0  F 0  C same  V changed
+C: ImageText16 ClipByChildren
+  T 0  H 0  B 0  F 0  C changed  V same
+C: ImageText16 IncludeInferiors
+  T 0  H 0  B 0  F 0  C changed  V changed
+V: ImageText16
+  T 0  H 0  B 0  F 0  C same  V changed
+C: PolyFillRectangle tiled -50,-50 400x400
+  T 0  H 0  B 0  F 0  C changed  V same
+C: CopyPlane -40,-40 300x200
+  T 0  H 0  B 0  F 0  C changed  V same
+C: PolyFillRectangle IncludeInferiors, then ClearArea C
+  T 0  H 0  B 0  F 0  C same  V changed
+C: fill, clip 0,0 40x40 at origin 20,50
+  changed 1600: x 20-59 y 50-89
+C: fill, then ChangeGC clip origin 30,10
+  changed 1600: x 30-69 y 10-49
+C: PolySegment, clip 0,0 40x40 at origin 20,50
+  changed 79: x 20-59 y 50-89
+C: PolyText8, clip 0,0 40x40 at origin 20,50
+  changed 263: x 20-58 y 50-89
+C: CopyArea, clip 0,0 40x40 at origin 20,50
+  changed 1600: x 20-59 y 50-89
+C: fill, CopyGC of the clip at origin 20,50
+  changed 1600: x 20-59 y 50-89
+C: fill, 40x40 clip mask at origin 20,50
+  changed 1600: x 20-59 y 50-89
+C: fill, XFixesSetGCClipRegion 0,0 40x40 at 20,50
+  changed 1600: x 20-59 y 50-89
+GetImage C
+  x=40:  0-95 gray
+  x=140: 15-95 blue
+  y=50:  0-95 gray 100-175 blue 180-185 gray
+  y=95:  0-95 gray 100-175 blue 180-185 gray
+GetImage F
+  x=50:  0-15 magenta 20-115 gray 120-120 frame 125-145 green
+  x=145: 0-10 magenta 15-30 cyan 35-115 blue 120-120 frame 125-145 green
+  y=60:  0-0 frame 5-100 gray 105-180 blue 185-190 gray 195-195 frame
+  y=137: 0-195 green
+F at x=-50: GetImage F
+  x=50:  0-15 magenta 20-115 gray 120-120 frame 125-145 green
+  x=145: 0-10 magenta 15-30 cyan 35-115 blue 120-120 frame 125-145 green
+  y=60:  0-0 frame 5-100 gray 105-180 blue 185-190 gray 195-195 frame
+  y=137: 0-195 green
+RENDER Composite from C ClipByChildren into a pixmap
+  x=40:  0-95 gray
+  x=140: 15-95 blue
+  y=50:  0-95 gray 100-175 blue 180-185 gray
+  y=95:  0-95 gray 100-175 blue 180-185 gray
+RENDER Composite from C IncludeInferiors into a pixmap
+  x=40:  0-95 gray
+  x=140: 15-95 blue
+  y=50:  0-95 gray 100-175 blue 180-185 gray
+  y=95:  0-95 gray 100-175 blue 180-185 gray
+C: RENDER FillRectangles ClipByChildren
+  T 0  H 0  B 0  F 0  C changed  V same
+C: RENDER Composite ClipByChildren
+  T 0  H 0  B 0  F 0  C changed  V same
+C: RENDER FillRectangles IncludeInferiors
+  T 0  H 0  B 0  F 0  C changed  V changed
+C: RENDER Composite IncludeInferiors
+  T 0  H 0  B 0  F 0  C changed  V changed
+==> expose-direct.log <==
+C: CopyArea 0,0 -> 0,40 100x200 (source past C's bottom)
+  NoExpose
+  C background 0
+C: CopyArea 0,50 -> 0,0 100x200 (scroll up)
+  GraphicsExpose 0,50 100x50 count 0
+  C background 5000: x 0-99 y 50-99
+C: CopyArea 0,0 -> -20,-40 100x140
+  GraphicsExpose 0,60 80x40 count 0
+  C background 3200: x 0-79 y 60-99
+C: CopyArea 90,20 -> 10,20 40x40 (source under V)
+  GraphicsExpose 20,20 30x40 count 0
+  C background 1200: x 20-49 y 20-59
+C: CopyArea 90,20 -> 10,20 40x40 IncludeInferiors
+  NoExpose
+  C background 0
+C: CopyArea 120,0 -> 10,50 40x30 (source under H)
+  GraphicsExpose 15,50 30x10 count 1
+  GraphicsExpose 10,60 40x20 count 0
+  C background 1100: x 10-49 y 50-79
+C: CopyArea 120,0 -> 10,50 40x30 IncludeInferiors
+  GraphicsExpose 15,50 30x15 count 0
+  C background 450: x 15-44 y 50-64
+C: CopyArea 0,0 -> 100,0 80x60 (onto V)
+  NoExpose
+  C background 0
+C: CopyArea to a pixmap 0,0 190x100
+  GraphicsExpose 125,0 30x10 count 1
+  GraphicsExpose 100,10 80x90 count 0
+  C background 0
+C: CopyArea to a pixmap 0,0 190x100 IncludeInferiors
+  GraphicsExpose 125,0 30x15 count 0
+  C background 0
+pixmap 50x50: CopyArea 0,0 -> C 10,10 80x80
+  GraphicsExpose 60,10 30x50 count 1
+  GraphicsExpose 10,60 80x30 count 0
+  C background 3900: x 10-89 y 10-89
+pixmap 50x50: CopyArea 0,0 -> C 150,50 100x100
+  NoExpose
+  C background 0
+pixmap 50x50: CopyArea 0,0 -> C 70,0 80x80 (over V)
+  GraphicsExpose 120,0 5x10 count 1
+  GraphicsExpose 70,50 30x30 count 0
+  C background 950: x 70-124 y 0-79
+pixmap 50x50: CopyArea 0,0 -> C 70,0 80x80 IncludeInferiors
+  GraphicsExpose 120,0 5x15 count 2
+  GraphicsExpose 120,15 30x35 count 1
+  GraphicsExpose 70,50 80x30 count 0
+  C background 950: x 70-124 y 0-79
+pixmap 50x50: CopyArea 0,0 -> C 10,10 80x80, clip 0,0 70x70
+  GraphicsExpose 60,10 10x50 count 1
+  GraphicsExpose 10,60 60x10 count 0
+  C background 1100: x 10-69 y 10-69
+P: children mapped while P is not
+P: MapWindow
+  Expose P 40,0 260x10 count 6
+  Expose P 110,10 190x30 count 5
+  Expose P 150,40 150x20 count 4
+  Expose P 40,60 10x60 count 3
+  Expose P 150,60 150x60 count 2
+  Expose P 40,120 260x30 count 1
+  Expose P 40,150 160x50 count 0
+  Expose P4 0,0 100x50 count 0
+  Expose P2 0,0 100x80 count 0
+  Expose P1 30,0 70x30 count 1
+  Expose P1 30,30 10x20 count 0
+P5: MapWindow
+  Expose P5 20,0 40x60 count 0
+P2: UnmapWindow
+  Expose P 110,40 40x20 count 2
+  Expose P 80,60 70x40 count 1
+  Expose P 50,100 100x20 count 0
+  Expose P1 70,30 30x20 count 0
+P1: raised over P5
+  Expose P1 30,30 40x20 count 0
+P: UnmapSubwindows
+  Expose P 40,10 70x50 count 2
+  Expose P 40,60 40x40 count 1
+  Expose P 200,150 100x50 count 0
+P: MapSubwindows
+  Expose P1 30,0 70x50 count 0
+  Expose P5 20,20 40x40 count 0
+  Expose P4 0,0 100x50 count 0
+  Expose P2 60,0 40x20 count 2
+  Expose P2 30,20 70x40 count 1
+  Expose P2 0,60 100x20 count 0
+==> expose.log <==
+C: CopyArea 0,0 -> 0,40 100x200 (source past C's bottom)
+  NoExpose
+  C background 0
+C: CopyArea 0,50 -> 0,0 100x200 (scroll up)
+  GraphicsExpose 0,50 100x50 count 0
+  C background 5000: x 0-99 y 50-99
+C: CopyArea 0,0 -> -20,-40 100x140
+  GraphicsExpose 0,60 80x40 count 0
+  C background 3200: x 0-79 y 60-99
+C: CopyArea 90,20 -> 10,20 40x40 (source under V)
+  GraphicsExpose 20,20 30x40 count 0
+  C background 1200: x 20-49 y 20-59
+C: CopyArea 90,20 -> 10,20 40x40 IncludeInferiors
+  NoExpose
+  C background 0
+C: CopyArea 120,0 -> 10,50 40x30 (source under H)
+  GraphicsExpose 15,50 30x10 count 1
+  GraphicsExpose 10,60 40x20 count 0
+  C background 1100: x 10-49 y 50-79
+C: CopyArea 120,0 -> 10,50 40x30 IncludeInferiors
+  GraphicsExpose 15,50 30x15 count 0
+  C background 450: x 15-44 y 50-64
+C: CopyArea 0,0 -> 100,0 80x60 (onto V)
+  NoExpose
+  C background 0
+C: CopyArea to a pixmap 0,0 190x100
+  GraphicsExpose 125,0 30x10 count 1
+  GraphicsExpose 100,10 80x90 count 0
+  C background 0
+C: CopyArea to a pixmap 0,0 190x100 IncludeInferiors
+  GraphicsExpose 125,0 30x15 count 0
+  C background 0
+pixmap 50x50: CopyArea 0,0 -> C 10,10 80x80
+  GraphicsExpose 60,10 30x50 count 1
+  GraphicsExpose 10,60 80x30 count 0
+  C background 3900: x 10-89 y 10-89
+pixmap 50x50: CopyArea 0,0 -> C 150,50 100x100
+  NoExpose
+  C background 0
+pixmap 50x50: CopyArea 0,0 -> C 70,0 80x80 (over V)
+  GraphicsExpose 120,0 5x10 count 1
+  GraphicsExpose 70,50 30x30 count 0
+  C background 950: x 70-124 y 0-79
+pixmap 50x50: CopyArea 0,0 -> C 70,0 80x80 IncludeInferiors
+  GraphicsExpose 120,0 5x15 count 2
+  GraphicsExpose 120,15 30x35 count 1
+  GraphicsExpose 70,50 80x30 count 0
+  C background 950: x 70-124 y 0-79
+pixmap 50x50: CopyArea 0,0 -> C 10,10 80x80, clip 0,0 70x70
+  GraphicsExpose 60,10 10x50 count 1
+  GraphicsExpose 10,60 60x10 count 0
+  C background 1100: x 10-69 y 10-69
+P: children mapped while P is not
+P: MapWindow
+  Expose P 0,0 300x10 count 8
+  Expose P 0,10 10x30 count 7
+  Expose P 110,10 190x30 count 6
+  Expose P 0,40 10x20 count 5
+  Expose P 150,40 150x20 count 4
+  Expose P 0,60 50x60 count 3
+  Expose P 150,60 150x60 count 2
+  Expose P 0,120 300x30 count 1
+  Expose P 0,150 200x50 count 0
+  Expose P4 0,0 100x50 count 0
+  Expose P2 0,0 100x80 count 0
+  Expose P1 0,0 100x30 count 1
+  Expose P1 0,30 40x20 count 0
+P5: MapWindow
+  Expose P5 0,0 60x60 count 0
+P2: UnmapWindow
+  Expose P 110,40 40x20 count 2
+  Expose P 80,60 70x40 count 1
+  Expose P 50,100 100x20 count 0
+  Expose P1 70,30 30x20 count 0
+P1: raised over P5
+  Expose P1 10,30 60x20 count 0
+P: UnmapSubwindows
+  Expose P 10,10 100x50 count 2
+  Expose P 20,60 60x40 count 1
+  Expose P 200,150 100x50 count 0
+P: MapSubwindows
+  Expose P1 0,0 100x50 count 0
+  Expose P5 0,20 60x40 count 0
+  Expose P4 0,0 100x50 count 0
+  Expose P2 60,0 40x20 count 2
+  Expose P2 30,20 70x40 count 1
+  Expose P2 0,60 100x20 count 0
