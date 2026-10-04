@@ -41,3 +41,4 @@ passive-grab         guest=passive-grab.sh           timeout=300
 cursor               guest=cursor.sh                 timeout=300
 pixmap-pool          guest=pixmap-pool.sh            host=pixmap-pool-host.sh            timeout=500 gpu=none
 pixmap-refs          guest=pixmap-refs.sh            host=pixmap-refs-host.sh            timeout=400 gpu=none
+bg-gc                guest=bg-gc.sh                  timeout=300

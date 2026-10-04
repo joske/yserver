@@ -1,0 +1,79 @@
+==> probe.log <==
+GXxor, by B
+ cleared
+  W: eda870=27600
+  K: 0000ff=2400
+ M mapped, K unmapped
+  W: eda870=27600
+  M: 40c040=2400
+plane mask 0x00ff00, by B
+ cleared
+  W: eda870=27600
+  K: 0000ff=2400
+ M mapped, K unmapped
+  W: eda870=27600
+  M: 40c040=2400
+FillStippled, by B
+ cleared
+  W: eda870=27600
+  K: 0000ff=2400
+ M mapped, K unmapped
+  W: eda870=27600
+  M: 40c040=2400
+IncludeInferiors, by B
+ cleared
+  W: eda870=27600
+  K: 0000ff=2400
+ M mapped, K unmapped
+  W: eda870=27600
+  M: 40c040=2400
+GXxor, by B, tiled
+ cleared
+  W: eda870=20600 0000ff=7000
+  K: 0000ff=2400
+ M mapped, K unmapped
+  W: eda870=20600 0000ff=7000
+  M: 40c040=2400
+GXxor, by A
+ cleared
+  W: eda870=27600
+  K: 0000ff=2400
+ M mapped, K unmapped
+  W: eda870=27600
+  M: 40c040=2400
+plane mask 0x00ff00, by A
+ cleared
+  W: eda870=27600
+  K: 0000ff=2400
+ M mapped, K unmapped
+  W: eda870=27600
+  M: 40c040=2400
+FillStippled, by A
+ cleared
+  W: eda870=27600
+  K: 0000ff=2400
+ M mapped, K unmapped
+  W: eda870=27600
+  M: 40c040=2400
+IncludeInferiors, by A
+ cleared
+  W: eda870=27600
+  K: 0000ff=2400
+ M mapped, K unmapped
+  W: eda870=27600
+  M: 40c040=2400
+GXxor, by A, tiled
+ cleared
+  W: eda870=20600 0000ff=7000
+  K: 0000ff=2400
+ M mapped, K unmapped
+  W: eda870=20600 0000ff=7000
+  M: 40c040=2400
+GXxor, by B, ShmCreatePixmap
+  P: 123456=1024
+plane mask 0x00ff00, by B, ShmCreatePixmap
+  P: 123456=1024
+GXxor, by A, ShmCreatePixmap
+  P: 123456=1024
+plane mask 0x00ff00, by A, ShmCreatePixmap
+  P: 123456=1024
