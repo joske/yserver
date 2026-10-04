@@ -9706,7 +9706,12 @@ fn handle_mit_shm_create_pixmap(
         bytes[start..end].to_vec()
     };
     if let Some(host_xid) = host_xid {
-        let _ = backend.clear_clip_rectangles(origin);
+        // The new pixmap takes the segment's bytes as they are: no client
+        // GC, so not the function or plane mask the last draw left behind.
+        let copy_gc = crate::backend::DrawState::default();
+        let _ = backend
+            .apply_clip_state(origin, &copy_gc.clip)
+            .and_then(|()| backend.apply_draw_state(origin, &copy_gc));
         if let Err(err) = backend.put_image(
             origin,
             host_xid.as_raw(),

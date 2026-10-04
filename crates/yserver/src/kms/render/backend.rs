@@ -4825,7 +4825,6 @@ impl KmsBackend {
         };
 
         self.clear_window_area_calls = self.clear_window_area_calls.wrapping_add(1);
-        self.clear_clip_rectangles(None)?;
         let Some(dst_target) = self.resolve_paint_target(host_xid) else {
             return Ok(());
         };
@@ -4943,7 +4942,34 @@ impl KmsBackend {
                 }
             }
         }
-        self.fill_rectangle(None, host_xid, background_pixel, x, y, width, height)
+        let rect = Rectangle16 {
+            x,
+            y,
+            width,
+            height,
+        };
+        self.fill_window_background_solid(host_xid, dst_target, background_pixel, &[rect]);
+        Ok(())
+    }
+
+    /// Paint `rects` (window-local) of `host_xid` in its solid
+    /// background `pixel` with the server's own state, never the last
+    /// client GC's: Xorg's `miPaintWindow` (`mi/miexpose.c:475-524`)
+    /// fills through a scratch GC set to GXcopy, all planes, FillSolid,
+    /// clipped to the window's clipList — its mapped children out.
+    fn fill_window_background_solid(
+        &mut self,
+        host_xid: u32,
+        target: PaintTarget,
+        pixel: u32,
+        rects: &[Rectangle16],
+    ) {
+        use yserver_core::backend::{GcFunction, SubwindowMode};
+        let rects = match self.subwindow_mode_clip(host_xid, SubwindowMode::ClipByChildren) {
+            Some(clip) => apply_subwindow_mode_clip(&clip, rects),
+            None => rects.to_vec(),
+        };
+        self.fill_solid_rects_with(target, pixel, &rects, GcFunction::Copy, u32::MAX);
     }
 
     /// #133 step 4 (P5) — paint the border ring. PRIVILEGED,
@@ -15641,7 +15667,7 @@ impl KmsBackend {
         if rects.is_empty() {
             return Vec::new();
         }
-        match self.subwindow_mode_clip(host_xid) {
+        match self.subwindow_mode_clip(host_xid, self.core.current_subwindow_mode) {
             Some(clip) => apply_subwindow_mode_clip(&clip, rects),
             None => rects.to_vec(),
         }
@@ -15651,10 +15677,14 @@ impl KmsBackend {
     /// rects with, computed once for a request whatever its rect count:
     /// the children it takes out, and where it may draw in a shared
     /// backing. `None` when nothing does.
-    fn subwindow_mode_clip(&self, host_xid: u32) -> Option<SubwindowModeClip> {
+    fn subwindow_mode_clip(
+        &self,
+        host_xid: u32,
+        mode: yserver_core::backend::SubwindowMode,
+    ) -> Option<SubwindowModeClip> {
         let key = (
             host_xid,
-            self.core.current_subwindow_mode,
+            mode,
             self.windows.generation(),
             self.store.topology_generation(),
             self.shape_generation,
@@ -15664,7 +15694,7 @@ impl KmsBackend {
         {
             return entry.clip.clone();
         }
-        let clip = self.compute_subwindow_mode_clip(host_xid);
+        let clip = self.compute_subwindow_mode_clip(host_xid, mode);
         *self.subwindow_clip_cache.borrow_mut() = Some(SubwindowClipCacheEntry {
             key,
             clip: clip.clone(),
@@ -15672,15 +15702,16 @@ impl KmsBackend {
         clip
     }
 
-    fn compute_subwindow_mode_clip(&self, host_xid: u32) -> Option<SubwindowModeClip> {
+    fn compute_subwindow_mode_clip(
+        &self,
+        host_xid: u32,
+        mode: yserver_core::backend::SubwindowMode,
+    ) -> Option<SubwindowModeClip> {
         if !self.windows.contains_key(&host_xid) {
             return None;
         }
         let mut cut: Vec<ash::vk::Rect2D> = Vec::new();
-        if matches!(
-            self.core.current_subwindow_mode,
-            yserver_core::backend::SubwindowMode::ClipByChildren,
-        ) {
+        if matches!(mode, yserver_core::backend::SubwindowMode::ClipByChildren) {
             cut = self
                 .windows
                 .iter()
@@ -16470,7 +16501,7 @@ impl KmsBackend {
         let clip = if fg_clipped.is_empty() && bg_clipped.is_empty() {
             None
         } else {
-            self.subwindow_mode_clip(host_xid)
+            self.subwindow_mode_clip(host_xid, self.core.current_subwindow_mode)
         };
         let own = |rects: &[Rectangle16]| match &clip {
             Some(clip) if !rects.is_empty() => apply_subwindow_mode_clip(clip, rects),
@@ -16494,11 +16525,30 @@ impl KmsBackend {
     }
 
     fn fill_solid_rects(&mut self, target: PaintTarget, fg: u32, rects: &[Rectangle16]) {
+        self.fill_solid_rects_with(
+            target,
+            fg,
+            rects,
+            self.core.current_function,
+            self.core.current_plane_mask,
+        );
+    }
+
+    /// [`Self::fill_solid_rects`] with the raster op and plane mask
+    /// given rather than taken from the last client GC, so a
+    /// server-internal paint can state its own.
+    fn fill_solid_rects_with(
+        &mut self,
+        target: PaintTarget,
+        fg: u32,
+        rects: &[Rectangle16],
+        function: yserver_core::backend::GcFunction,
+        plane_mask: u32,
+    ) {
         use yserver_core::backend::GcFunction;
         if rects.is_empty() {
             return;
         }
-        let function = self.core.current_function;
         if matches!(function, GcFunction::NoOp) {
             return;
         }
@@ -16513,7 +16563,7 @@ impl KmsBackend {
             return;
         };
         let full_mask = depth_plane_mask(logical_depth);
-        let plane_mask = self.core.current_plane_mask & full_mask;
+        let plane_mask = plane_mask & full_mask;
         if plane_mask == 0 {
             return;
         }
@@ -45839,6 +45889,105 @@ mod tests {
             .border_width;
         assert_eq!(core_bw, 0);
         assert_eq!(backend.windows[&host_xid].border_width, core_bw);
+    }
+
+    /// A window background clear paints like Xorg's `miPaintWindow`
+    /// (GXcopy, all planes, FillSolid, children clipped out) whatever
+    /// state the last client GC left in the backend.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn clear_area_ignores_leftover_client_draw_state() {
+        use yserver_core::{
+            backend::{Backend, ClipState, GcFunction, SubwindowMode},
+            resources::ROOT_WINDOW,
+        };
+        use yserver_protocol::x11::ResourceId;
+
+        const OLD: u32 = 0x0012_3456;
+        const NEW: u32 = 0x00ed_a870;
+        const CHILD: u32 = 0x0000_00ff;
+        type Leave = fn(&mut KmsBackend);
+        let leftovers: [(&str, Leave); 5] = [
+            ("GXxor", |b| b.core.current_function = GcFunction::Xor),
+            ("plane mask", |b| b.core.current_plane_mask = 0x0000_ff00),
+            ("NoOp", |b| b.core.current_function = GcFunction::NoOp),
+            ("IncludeInferiors", |b| {
+                b.core.current_subwindow_mode = SubwindowMode::IncludeInferiors;
+            }),
+            ("clip", |b| {
+                b.core.current_clip = ClipState::Rectangles {
+                    origin: (0, 0),
+                    rects: yserver_protocol::x11::ClipRectangles {
+                        ordering: 0,
+                        x_origin: 0,
+                        y_origin: 0,
+                        // One 4x4 rect at the origin: x, y, w, h.
+                        rectangles: [0u16, 0, 4, 4]
+                            .iter()
+                            .flat_map(|v| v.to_le_bytes())
+                            .collect(),
+                    },
+                };
+            }),
+        ];
+        for (i, (name, leave)) in leftovers.into_iter().enumerate() {
+            let mut state = yserver_core::server::ServerState::new();
+            let mut backend = match KmsBackend::for_tests_with_vk() {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("skipping: no Vk: {e}");
+                    return;
+                }
+            };
+            install_client_for_render(&mut state, 14);
+            state
+                .resources
+                .window_mut(ROOT_WINDOW)
+                .expect("root")
+                .host_xid = yserver_core::backend::WindowHandle::from_raw(backend.core.window_id);
+            let base = 0x0134_0000 + u32::try_from(i).expect("index") * 0x10;
+            let top = ResourceId(base + 1);
+            let child = ResourceId(base + 2);
+            let top_xid =
+                create_live_window(&mut state, &mut backend, top, ROOT_WINDOW, 10, 20, 64, 48)
+                    .as_raw();
+            let child_xid =
+                create_live_window(&mut state, &mut backend, child, top, 40, 30, 16, 12).as_raw();
+            backend
+                .fill_rectangle(None, top_xid, OLD, 0, 0, 64, 48)
+                .expect("fill top");
+            backend
+                .fill_rectangle(None, child_xid, CHILD, 0, 0, 16, 12)
+                .expect("fill child");
+
+            leave(&mut backend);
+            backend
+                .clear_area(None, top_xid, NEW, None, 0, 0, 64, 48, (0, 0))
+                .expect("clear_area");
+
+            let pixels = |backend: &mut KmsBackend, xid, w, h| -> Vec<u32> {
+                backend
+                    .get_image_pixels_for_tests(xid, 2, 0, 0, w, h, !0)
+                    .expect("get_image")
+                    .expect("bytes")
+                    .chunks_exact(4)
+                    .map(|p| u32::from_le_bytes([p[0], p[1], p[2], p[3]]) & 0x00ff_ffff)
+                    .collect()
+            };
+            let top_px = pixels(&mut backend, top_xid, 64, 48);
+            for (n, px) in top_px.iter().enumerate() {
+                let (x, y) = (n % 64, n / 64);
+                if (40..56).contains(&x) && (30..42).contains(&y) {
+                    continue;
+                }
+                assert_eq!(*px, NEW, "{name}: top ({x},{y}) is 0x{px:06x}");
+            }
+            let child_px = pixels(&mut backend, child_xid, 16, 12);
+            assert!(
+                child_px.iter().all(|&px| px == CHILD),
+                "{name}: the clear reached the child"
+            );
+        }
     }
 
     #[test]
