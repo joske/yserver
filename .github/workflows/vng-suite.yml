@@ -1,11 +1,17 @@
 name: vng suite
 # Real yserver in a KVM guest (2D virtio-gpu + lavapipe): tools/vng-suite.sh.
-# PRs and pushes run the quick set; nightly and manual runs the whole suite.
+# PRs and pushes run the quick set; nightly, manual and release runs the whole suite.
 on:
   workflow_dispatch:
     inputs:
       scenarios:
         description: scenario regex (all = everything)
+        default: all
+  workflow_call:
+    inputs:
+      scenarios:
+        description: scenario regex (all = everything)
+        type: string
         default: all
   pull_request:
   push:
@@ -81,11 +87,9 @@ jobs:
           QUICK: '^(xterm|span-paint|pixel-oracle|xrandr-(scale|scale-crop|dpi|monitors|monitors-2|orientation|scale-cursor)|xmodmap-caps-control|xkbcomp-upload|subwindow-move|child-clip|draw-clip)$'
           SCENARIOS: ${{ inputs.scenarios }}
         run: |
-          case "${{ github.event_name }}" in
-            schedule) filter=all ;;
-            workflow_dispatch) filter=$SCENARIOS ;;
-            *) filter=$QUICK ;;
-          esac
+          if [ -n "$SCENARIOS" ]; then filter=$SCENARIOS
+          elif [ "${{ github.event_name }}" = schedule ]; then filter=all
+          else filter=$QUICK; fi
           SPAN_ROUNDS=3 tools/vng-suite.sh --gpu none --binary target/debug/yserver --out target/vng-suite/ci "$filter"
       - name: Drop sockets before upload
         if: always()

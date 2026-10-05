@@ -246,11 +246,17 @@ jobs:
     needs: checks
     uses: ./.github/workflows/ci.yml
 
+  vng:
+    needs: checks
+    uses: ./.github/workflows/vng-suite.yml
+    with:
+      scenarios: all
+
   # Build the distro packages BEFORE anything is published, and fail the
   # release if they do not build. The packaging workflow takes the upstream ref
   # as an input and generates its own tarball, so it does not need the release.
   packages:
-    needs: [checks, ci]
+    needs: [checks, ci, vng]
     runs-on: ubuntu-latest
     # GITHUB_TOKEN is unused here; all cross-repo work uses the fine-grained PAT.
     permissions: {}
