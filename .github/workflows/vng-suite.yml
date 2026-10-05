@@ -92,7 +92,7 @@ jobs:
         run: find target/vng-suite -type s -delete 2>/dev/null || true
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: vng-suite
           path: target/vng-suite/**
