@@ -506,3 +506,108 @@ fn hierarchy_descriptor(state: &ServerState, device_id: u16) -> (u8, u16) {
         None => (0, 0),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::{HashMap, HashSet, VecDeque},
+        io::Read,
+        os::unix::net::UnixStream,
+        sync::{Arc, Mutex, atomic::AtomicU16},
+    };
+
+    use super::*;
+    use crate::{
+        core_loop::{DeviceInfo, client_io},
+        resources::ROOT_WINDOW,
+        server::ClientState,
+        xinput::{InputCapabilities, InputSourceId, XI1_DEVICE_PRESENCE_CLASS},
+    };
+
+    /// A client selecting XI2 hierarchy (XIAllDevices) and XI1
+    /// DevicePresence on the root.
+    fn install_client(state: &mut ServerState, id: u32) -> UnixStream {
+        let (a, b) = UnixStream::pair().unwrap();
+        state.clients.insert(
+            id,
+            ClientState {
+                writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(a))),
+                byte_order: ClientByteOrder::LittleEndian,
+                last_sequence: Arc::new(AtomicU16::new(0)),
+                resource_id_base: 0,
+                resource_id_mask: u32::MAX,
+                event_masks: HashMap::new(),
+                save_set: HashSet::new(),
+                big_requests_enabled: false,
+                xi2_masks: HashMap::from([(
+                    (ROOT_WINDOW, 0),
+                    u64::from(XI2_HIERARCHY_CHANGED_MASK),
+                )]),
+                xi1_event_classes: HashSet::new(),
+                xi1_window_event_classes: HashMap::from([(
+                    ROOT_WINDOW,
+                    HashSet::from([XI1_DEVICE_PRESENCE_CLASS]),
+                )]),
+                outbound: VecDeque::new(),
+                watching_writable: false,
+                write_failed: false,
+                focused_window: ROOT_WINDOW,
+                reader_control: None,
+                is_local: true,
+                fd_passing: true,
+            },
+        );
+        b
+    }
+
+    /// Hotplug family: a hierarchy / DevicePresence subscriber over
+    /// `OUTBOUND_CAP` must not stay connected having missed a removal
+    /// (the id is reused by the next device), so it is flagged for the
+    /// core loop to disconnect; the reading subscriber gets both events.
+    #[test]
+    fn overflowing_hierarchy_subscriber_is_flagged_on_device_removal() {
+        let mut state = ServerState::new();
+        let source = InputSourceId(0xA71);
+        let info = DeviceInfo {
+            source_id: source,
+            enabled: true,
+            resume_key: None,
+            capabilities: InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
+            name: "test mouse".to_owned(),
+            device_node: "/dev/input/event-test".to_owned(),
+            sysname: "event-test".to_owned(),
+            vendor_id: 1,
+            product_id: 2,
+            is_touchpad: false,
+            config: Default::default(),
+        };
+        let id = state.xi_register_source(&info)[0];
+        let _slow = install_client(&mut state, 1);
+        let mut fast = install_client(&mut state, 2);
+        client_io::saturate_for_test(state.clients.get_mut(&1).unwrap());
+
+        let removed = state.xi_unregister_facet(id).expect("registered facet");
+        let presence = emit_xi1_device_presence(&mut state, id, DevicePresenceChange::Removed);
+        let hierarchy = emit_xi_hierarchy_changed(
+            &mut state,
+            XiHierarchyStep::SlaveRemoved,
+            id,
+            Some(&removed),
+            None,
+        );
+        assert_eq!(presence, [ClientId(1)]);
+        assert_eq!(hierarchy, [ClientId(1)]);
+        assert_eq!(state.clients[&1].outbound.len(), client_io::OUTBOUND_CAP);
+        assert_eq!(client_io::failed_writers(&state.clients), [ClientId(1)]);
+
+        fast.set_nonblocking(true).unwrap();
+        let mut bytes = vec![0u8; 4096];
+        let n = fast.read(&mut bytes).unwrap();
+        assert!(n > 64, "presence + hierarchy, got {n} bytes");
+        assert_eq!(bytes[32], 35, "the hierarchy GenericEvent follows");
+    }
+}

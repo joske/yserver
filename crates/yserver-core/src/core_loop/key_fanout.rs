@@ -1507,6 +1507,7 @@ mod tests {
                 xi1_window_event_classes: HashMap::new(),
                 outbound: VecDeque::new(),
                 watching_writable: false,
+                write_failed: false,
                 focused_window: ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -1597,6 +1598,7 @@ mod tests {
                     xi1_window_event_classes: HashMap::new(),
                     outbound: VecDeque::new(),
                     watching_writable: false,
+                    write_failed: false,
                     focused_window: ROOT_WINDOW,
                     reader_control: None,
                     is_local: true,
@@ -2021,6 +2023,7 @@ mod tests {
             xi1_window_event_classes: HashMap::new(),
             outbound: VecDeque::new(),
             watching_writable: false,
+            write_failed: false,
             focused_window: ROOT_WINDOW,
             reader_control: None,
             is_local: true,
@@ -2041,6 +2044,29 @@ mod tests {
     /// selection, only the grab), and freezes the event for replay.
     /// This is the dead-`p`-in-wezterm fix: previously the press was
     /// delivered via window selection on the grab window, so a grab
+    /// Key family: a focus-window key subscriber over `OUTBOUND_CAP` is
+    /// flagged for the core loop to disconnect, and the reading subscriber
+    /// still gets the press.
+    #[test]
+    fn overflowing_key_subscriber_is_flagged_for_disconnect() {
+        const WIN: u32 = 0x0020_0001;
+        let mut state = ServerState::new();
+        let _slow = install_kf(&mut state, 8, ResourceId(WIN), KEY_PRESS_MASK, 0);
+        let mut fast = install_kf(&mut state, 9, ResourceId(WIN), KEY_PRESS_MASK, 0);
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+        state.core_focus.raw = WIN;
+        crate::core_loop::client_io::saturate_for_test(state.clients.get_mut(&8).unwrap());
+        let _ = key_event_fanout_to_state(&mut state, &mut backend, key_event(true, 38));
+        assert_eq!(
+            crate::core_loop::client_io::failed_writers(&state.clients),
+            [ClientId(8)]
+        );
+        fast.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 64];
+        assert!(fast.read(&mut buf).unwrap_or(0) >= 32);
+        assert_eq!(buf[0] & 0x7f, 2, "KeyPress");
+    }
+
     /// Regression: an unmodified keypress (cooked `state == 0`) must
     /// be delivered with `state == 0` — the fanout must NOT OR in any
     /// server-tracked modifier state. Pre-fix, a stale modifier

@@ -4526,6 +4526,7 @@ mod tests {
                 xi1_window_event_classes: HashMap::new(),
                 outbound: VecDeque::new(),
                 watching_writable: false,
+                write_failed: false,
                 focused_window: ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -4555,6 +4556,7 @@ mod tests {
                 xi1_window_event_classes: HashMap::new(),
                 outbound: VecDeque::new(),
                 watching_writable: false,
+                write_failed: false,
                 focused_window: ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -6967,6 +6969,44 @@ mod tests {
              form BEFORE the master-stamped form (Xorg mi/mieq.c order); \
              master-first silently breaks Qt smooth-scroll + hover"
         );
+    }
+
+    /// Pointer family: a core-motion and an XI2-motion subscriber over
+    /// `OUTBOUND_CAP` are flagged for the core loop to disconnect, and the
+    /// reading subscriber still gets the motion.
+    #[test]
+    fn overflowing_motion_subscribers_are_flagged_for_disconnect() {
+        for xi2 in [false, true] {
+            let mut state = ServerState::new();
+            let mut backend = crate::backend::recording::RecordingBackend::new();
+            let _slow = install_client(&mut state, 1);
+            let mut fast = install_client(&mut state, 2);
+            for id in [1, 2] {
+                let client = state.clients.get_mut(&id).expect("client");
+                if xi2 {
+                    client.xi2_masks.insert((ROOT_WINDOW, 1), 1 << 6);
+                } else {
+                    client.event_masks.insert(ROOT_WINDOW, 1 << 6);
+                }
+            }
+            crate::core_loop::client_io::saturate_for_test(
+                state.clients.get_mut(&1).expect("client"),
+            );
+            let _ = pointer_event_fanout_to_state(
+                &mut state,
+                &mut backend,
+                &HostXidMap::new(),
+                motion_event(),
+                true,
+                false,
+            );
+            assert_eq!(
+                crate::core_loop::client_io::failed_writers(&state.clients),
+                [ClientId(1)],
+                "xi2={xi2}"
+            );
+            assert!(!read_all_available(&mut fast).is_empty(), "xi2={xi2}");
+        }
     }
 
     #[test]

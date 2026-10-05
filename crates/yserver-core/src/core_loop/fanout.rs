@@ -6,9 +6,9 @@
 //! client's `last_sequence`, encode against the client's
 //! `byte_order`, and push bytes through `client_io::write_or_buffer`
 //! — the same path opcode dispatch will use after the D3 lift.
-//! Disconnect outcomes are reported back to the caller as a
-//! `Vec<ClientId>` so the core's request-loop can issue
-//! `Message::ClientDisconnected` for each one.
+//! Clients whose write failed are returned as a `Vec<ClientId>` for
+//! information only: `client_io` has already flagged them, and the core
+//! loop disconnects them (`run::disconnect_failed_writers`).
 //!
 //! The pre-lift `EventTarget`-based helpers in `server.rs` remain in
 //! place; D3 migrates callers off them.
@@ -737,6 +737,7 @@ mod tests {
             xi1_window_event_classes: HashMap::new(),
             outbound: VecDeque::new(),
             watching_writable: false,
+            write_failed: false,
             focused_window: ROOT_WINDOW,
             reader_control: None,
             is_local: true,
@@ -1165,5 +1166,37 @@ mod tests {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             other => panic!("unsubscribed peer2 unexpectedly received: {other:?}"),
         }
+    }
+
+    /// Property / structure notify family: a subscriber over
+    /// `OUTBOUND_CAP` is reported and flagged for the core loop to
+    /// disconnect, gets nothing more, and the other subscriber still gets
+    /// every event; the raw (SendEvent / server-built) fanout too.
+    #[test]
+    fn overflowing_subscriber_is_flagged_and_the_others_still_receive() {
+        const PROPERTY_CHANGE: u32 = 1 << 22;
+        let mut state = ServerState::new();
+        let _slow = install(&mut state, 1, PROPERTY_CHANGE);
+        let mut fast = install(&mut state, 2, PROPERTY_CHANGE);
+        fast.set_nonblocking(true).unwrap();
+        client_io::saturate_for_test(state.clients.get_mut(&1).unwrap());
+
+        let encode = |buf: &mut Vec<u8>, _: SequenceNumber, _: ClientByteOrder| {
+            buf.extend_from_slice(&[28u8; 32]);
+        };
+        let dropped = emit_window_event_to_state(&mut state, ROOT_WINDOW, PROPERTY_CHANGE, encode);
+        assert_eq!(dropped, [ClientId(1)]);
+        assert_eq!(client_io::failed_writers(&state.clients), [ClientId(1)]);
+        let _ = emit_window_event_to_state(&mut state, ROOT_WINDOW, PROPERTY_CHANGE, encode);
+        let _ = fanout_raw_event_to_clients(
+            &mut state,
+            &[ClientId(1), ClientId(2)],
+            &[28u8; 32],
+            ClientByteOrder::LittleEndian,
+        );
+        assert_eq!(state.clients[&1].outbound.len(), client_io::OUTBOUND_CAP);
+        let mut got = [0u8; 128];
+        assert_eq!(fast.read(&mut got).unwrap(), 96);
+        assert_eq!(client_io::failed_writers(&state.clients), [ClientId(1)]);
     }
 }

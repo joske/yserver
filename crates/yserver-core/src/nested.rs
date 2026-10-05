@@ -1480,6 +1480,7 @@ mod tests {
                     xi1_window_event_classes: HashMap::new(),
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
+                    write_failed: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
                     is_local: true,

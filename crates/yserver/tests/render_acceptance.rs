@@ -12922,6 +12922,7 @@ impl ProtoFixture {
             xi1_window_event_classes: HashMap::new(),
             outbound: VecDeque::new(),
             watching_writable: false,
+            write_failed: false,
             focused_window: ROOT_WINDOW,
             reader_control: None,
             is_local: true,

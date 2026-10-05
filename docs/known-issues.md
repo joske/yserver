@@ -124,18 +124,7 @@ from.
       upstream. Until then, downgrade priority — MATE is the
       validated desktop, Cinnamon's click activation works on the
       wire and the next step is process-side diagnosis.
-- [ ] **Event fanouts ignore their dropped-client list (2026-09-28).**
-      `fanout_event_to_clients` and the damage fanouts return the
-      clients whose write failed or hit `OUTBOUND_CAP`, but every caller
-      discards it (`let _dropped = …`, e.g. `xkb_layout.rs`,
-      `sync_await.rs`, `xi1_state_notify.rs`). A client over the cap is
-      not disconnected: that event is silently lost and later ones still
-      go out. Xorg never drops: a write error is a deferred close
-      (`MarkClientException`, `os/io.c:948`), and a slow client's output
-      buffer just grows (`io.c:915-928`), so the cap itself is ours.
-      RECORD routes its failures through `take_failed_recorders` →
-      `disconnect_with_pending_cleanup`; the other fanouts need the same.
-      Found in static review; not yet observed at runtime.
+- [x] **Event fanouts ignored their dropped-client list** — fixed: a failed write flags the client and the core loop disconnects it (`client_io::failed_writers`); vng `slow-client`.
 - [ ] **`UnmapNotify.from_configure = true` never wired.** Encoder
       accepts the byte for wire correctness; every call site currently
       passes `false`. The `true` path fires when a parent's

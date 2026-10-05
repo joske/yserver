@@ -36398,6 +36398,7 @@ mod tests {
                 xi1_window_event_classes: HashMap::new(),
                 outbound: VecDeque::new(),
                 watching_writable: false,
+                write_failed: false,
                 focused_window: ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -36997,6 +36998,47 @@ mod tests {
             Vec::new(),
             "a move is not a resize and must not expose the window",
         );
+    }
+
+    /// Present family: a Present ConfigureNotify selector over
+    /// `OUTBOUND_CAP` is flagged for the core loop to disconnect, and the
+    /// reading selector still gets the event.
+    #[test]
+    fn overflowing_present_selector_is_flagged_for_disconnect() {
+        use crate::server::PresentEventSelection;
+        use yserver_protocol::x11::present as x11present;
+
+        const WINDOW: ResourceId = ResourceId(0x200);
+        let mut state = ServerState::new();
+        let _slow = install_client(&mut state, 1);
+        let mut fast = install_client(&mut state, 2);
+        for (eid, owner) in [(0x0010_0042, 1), (0x0020_0042, 2)] {
+            state.present_event_selections.insert(
+                eid,
+                PresentEventSelection {
+                    owner: ClientId(owner),
+                    window: WINDOW,
+                    event_mask: x11present::EVENT_MASK_CONFIGURE_NOTIFY,
+                },
+            );
+        }
+        client_io::saturate_for_test(state.clients.get_mut(&1).unwrap());
+        fire_present_configure_notify_for_window(
+            &mut state,
+            WINDOW,
+            yserver_protocol::x11::Geometry {
+                root: crate::resources::ROOT_WINDOW,
+                x: 1,
+                y: 2,
+                width: 30,
+                height: 40,
+                border_width: 0,
+                depth: 24,
+            },
+        );
+        assert_eq!(client_io::failed_writers(&state.clients), [ClientId(1)]);
+        let bytes = read_all_available(&mut fast);
+        assert_eq!(bytes.first(), Some(&35), "Present GenericEvent");
     }
 
     /// Xorg's Present screen hook receives every real ConfigNotify, including

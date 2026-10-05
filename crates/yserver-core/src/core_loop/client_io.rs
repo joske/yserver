@@ -5,8 +5,12 @@
 //! on `EAGAIN`/partial write it buffers the remainder on
 //! `ClientState::outbound` and returns `WouldBlock` so the caller can
 //! arrange `WRITABLE` interest in the poller (I2). When the buffer is
-//! about to exceed `OUTBOUND_CAP` we return `Disconnect` and let the
-//! caller tear the client down.
+//! about to exceed `OUTBOUND_CAP` we return `Disconnect`.
+//!
+//! Every failed write also marks the client `write_failed`: later writes
+//! to it are refused without touching the socket, and the core loop
+//! disconnects it through the normal path (`failed_writers`). Callers may
+//! act on the outcome, but ignoring it can no longer keep the client.
 //!
 //! Today's `ClientState::writer` is still `Arc<Mutex<UnixStream>>`
 //! (A1 left it untouched; D2 demotes it). The helper transparently
@@ -14,6 +18,8 @@
 //! call sites.
 
 use std::io::{self, ErrorKind, Write};
+
+use yserver_protocol::x11::ClientId;
 
 use crate::server::ClientState;
 
@@ -36,17 +42,46 @@ pub enum WriteOutcome {
     /// Some bytes are buffered on `client.outbound`. Caller should
     /// register `WRITABLE` interest if not already.
     WouldBlock,
-    /// Peer is gone or buffer exceeded `OUTBOUND_CAP`. Caller must
-    /// drop the client.
+    /// Peer is gone or buffer exceeded `OUTBOUND_CAP`. The client is
+    /// marked `write_failed`, so the core loop drops it.
     Disconnect,
 }
 
 /// Write `bytes` to the client. Drains any already-buffered outbound
 /// first so wire ordering is preserved.
 pub fn write_or_buffer(client: &mut ClientState, bytes: &[u8]) -> io::Result<WriteOutcome> {
+    if client.write_failed {
+        return Ok(WriteOutcome::Disconnect);
+    }
+    let outcome = write_or_buffer_inner(client, bytes);
+    note_failure(client, outcome)
+}
+
+/// Clients whose writes failed and that the core loop must disconnect.
+pub fn failed_writers(clients: &std::collections::HashMap<u32, ClientState>) -> Vec<ClientId> {
+    let mut failed: Vec<ClientId> = clients
+        .iter()
+        .filter(|(_, client)| client.write_failed)
+        .map(|(id, _)| ClientId(*id))
+        .collect();
+    failed.sort_unstable_by_key(|id| id.0);
+    failed
+}
+
+fn note_failure(
+    client: &mut ClientState,
+    outcome: io::Result<WriteOutcome>,
+) -> io::Result<WriteOutcome> {
+    if !matches!(outcome, Ok(WriteOutcome::Done | WriteOutcome::WouldBlock)) {
+        client.write_failed = true;
+    }
+    outcome
+}
+
+fn write_or_buffer_inner(client: &mut ClientState, bytes: &[u8]) -> io::Result<WriteOutcome> {
     // Drain pending bytes first.
     if !client.outbound.is_empty() {
-        match drain_outbound(client)? {
+        match drain_outbound_inner(client)? {
             WriteOutcome::Done => {} // fall through to write `bytes`
             WriteOutcome::WouldBlock => {
                 return Ok(buffer_or_disconnect(client, bytes));
@@ -100,6 +135,14 @@ fn buffer_or_disconnect(client: &mut ClientState, bytes: &[u8]) -> WriteOutcome 
 /// blocking. Returns `Done` if the queue is now empty, `WouldBlock` if
 /// some bytes remain, `Disconnect` if the peer is gone.
 pub fn drain_outbound(client: &mut ClientState) -> io::Result<WriteOutcome> {
+    if client.write_failed {
+        return Ok(WriteOutcome::Disconnect);
+    }
+    let outcome = drain_outbound_inner(client);
+    note_failure(client, outcome)
+}
+
+fn drain_outbound_inner(client: &mut ClientState) -> io::Result<WriteOutcome> {
     let writer_arc = client.writer.clone();
     let mut writer = writer_arc.lock().unwrap();
     while !client.outbound.is_empty() {
@@ -131,6 +174,20 @@ fn disconnect_kind(k: ErrorKind) -> bool {
     )
 }
 
+/// Test support: fill `client`'s socket, then its outbound buffer to
+/// `OUTBOUND_CAP`, so its next write overflows.
+#[cfg(test)]
+pub(crate) fn saturate_for_test(client: &mut ClientState) {
+    client.writer.lock().unwrap().set_nonblocking(true).unwrap();
+    client
+        .outbound
+        .extend(std::iter::repeat_n(0u8, OUTBOUND_CAP));
+    let _ = drain_outbound(client);
+    let missing = OUTBOUND_CAP - client.outbound.len();
+    client.outbound.extend(std::iter::repeat_n(0u8, missing));
+    assert!(!client.write_failed);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,6 +215,7 @@ mod tests {
             xi1_window_event_classes: HashMap::new(),
             outbound: VecDeque::new(),
             watching_writable: false,
+            write_failed: false,
             focused_window: ResourceId(0),
             reader_control: None,
             is_local: true,
@@ -233,6 +291,52 @@ mod tests {
         let huge = vec![0u8; OUTBOUND_CAP + 1];
         let outcome = write_or_buffer(&mut c, &huge).unwrap();
         assert_eq!(outcome, WriteOutcome::Disconnect);
+    }
+
+    /// An overflow marks the client failed; nothing more reaches its socket
+    /// or buffer, even after its peer catches up, and `failed_writers`
+    /// names it for the core loop.
+    #[test]
+    fn overflow_marks_client_failed_and_refuses_later_writes() {
+        let (a, mut b) = UnixStream::pair().unwrap();
+        let mut c = make_client(a);
+        saturate_for_test(&mut c);
+        assert_eq!(
+            write_or_buffer(&mut c, &[1u8; 32]).unwrap(),
+            WriteOutcome::Disconnect
+        );
+        assert!(c.write_failed);
+        assert_eq!(c.outbound.len(), OUTBOUND_CAP);
+
+        b.set_nonblocking(true).unwrap();
+        let mut sink = vec![0u8; 1 << 20];
+        while b.read(&mut sink).is_ok_and(|n| n > 0) {}
+        assert_eq!(
+            write_or_buffer(&mut c, &[1u8; 32]).unwrap(),
+            WriteOutcome::Disconnect
+        );
+        assert_eq!(drain_outbound(&mut c).unwrap(), WriteOutcome::Disconnect);
+        assert_eq!(c.outbound.len(), OUTBOUND_CAP);
+        assert!(b.read(&mut sink).is_err(), "no byte after the failure");
+
+        let mut clients = HashMap::new();
+        clients.insert(9, c);
+        let (ok, _ok_peer) = UnixStream::pair().unwrap();
+        clients.insert(3, make_client(ok));
+        assert_eq!(failed_writers(&clients), [ClientId(9)]);
+    }
+
+    /// A peer that hung up marks the client failed too.
+    #[test]
+    fn peer_gone_marks_client_failed() {
+        let (a, b) = UnixStream::pair().unwrap();
+        drop(b);
+        let mut c = make_client(a);
+        assert_eq!(
+            write_or_buffer(&mut c, &[1u8; 32]).unwrap(),
+            WriteOutcome::Disconnect
+        );
+        assert!(c.write_failed);
     }
 
     #[test]

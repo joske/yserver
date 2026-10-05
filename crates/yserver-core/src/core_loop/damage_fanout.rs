@@ -925,6 +925,7 @@ mod tests {
                 xi1_window_event_classes: HashMap::new(),
                 outbound: VecDeque::new(),
                 watching_writable: false,
+                write_failed: false,
                 focused_window: ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -1011,6 +1012,7 @@ mod tests {
                 xi1_window_event_classes: HashMap::new(),
                 outbound: VecDeque::new(),
                 watching_writable: false,
+                write_failed: false,
                 focused_window: ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -1399,6 +1401,33 @@ mod tests {
         );
     }
 
+    /// Damage family: a damage owner over `OUTBOUND_CAP` is flagged for
+    /// the core loop to disconnect, and another owner's damage on the same
+    /// window still reports.
+    #[test]
+    fn overflowing_damage_owner_is_flagged_for_disconnect() {
+        let mut state = ServerState::new();
+        let _slow = add_client_with_reader(&mut state, 1, 0x0010_0000);
+        let mut fast = add_client_with_reader(&mut state, 2, 0x0020_0000);
+        let w_id = add_window(&mut state, 1, 0x0010_0001, ROOT_WINDOW, 0, 0, 500, 400);
+        for (client, damage) in [(1, 0x0010_0002), (2, 0x0020_0002)] {
+            add_damage_on_with_level(
+                &mut state,
+                client,
+                damage,
+                w_id,
+                x11damage::report_level::RAW_RECTANGLES,
+            );
+        }
+        crate::core_loop::client_io::saturate_for_test(state.clients.get_mut(&1).unwrap());
+        let _ = accumulate_damage_to_state(&mut state, w_id, 5, 5, 30, 40);
+        assert_eq!(
+            crate::core_loop::client_io::failed_writers(&state.clients),
+            [ClientId(1)]
+        );
+        assert_eq!(count_damage_notify_events(&mut fast, &state, 2), 1);
+    }
+
     /// Companion: NonEmpty (level 3) keeps its spec-correct one-shot
     /// semantics — emit once on empty→non-empty transition, silent
     /// until Subtract. Ensures the fix doesn't over-reach.
@@ -1644,6 +1673,7 @@ mod tests {
                 xi1_window_event_classes: HashMap::new(),
                 outbound: VecDeque::new(),
                 watching_writable: false,
+                write_failed: false,
                 focused_window: ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,

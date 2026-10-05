@@ -876,8 +876,9 @@ pub(crate) fn deferred_request_for_test(id: u32) -> DeferredRequest {
 /// A client's queued requests may be dispatched unless it waits on
 /// asynchronous backend work, a SYNC `Await` / `AwaitFence` suspended it, or
 /// it is the data connection of an enabled RECORD context (Xorg
-/// `IgnoreClient`). Either way its requests keep their order and
-/// every other client keeps running.
+/// `IgnoreClient`), or a write to it failed and the core loop has yet to
+/// disconnect it (Xorg closes its fd at once, `AbortClient`). Either way
+/// its requests keep their order and every other client keeps running.
 fn client_runnable(
     pending: &PendingBackendRequests,
     state: &ServerState,
@@ -886,6 +887,7 @@ fn client_runnable(
     !pending.client_is_blocked(client)
         && !crate::core_loop::sync_await::client_is_suspended(state, client)
         && !crate::core_loop::record::client_blocks_requests(state, client)
+        && !state.clients.get(&client.0).is_some_and(|c| c.write_failed)
 }
 
 fn blocked_by_server_grab(state: &ServerState, req: &DeferredRequest) -> bool {
@@ -977,6 +979,80 @@ pub(super) fn disconnect_with_pending_cleanup(
     pending.unblock_xi_config(client);
     crate::core_loop::process_disconnect::process_disconnect(state, backend, client);
     reset_trigger.note_client_departed(state.clients.len());
+}
+
+/// Disconnect every client a write failed on (`client_io` flags it; the
+/// fan-out that hit the failure keeps iterating). Runs between dispatch
+/// rounds, never inside one, and repeats because a disconnect fans out
+/// events of its own that can fail further clients.
+pub(super) fn disconnect_failed_writers(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    pending: &mut PendingBackendRequests,
+    xi_config_lane: &mut XiConfigLane,
+    reset_trigger: &mut ResetTrigger,
+) {
+    loop {
+        let failed = client_io::failed_writers(&state.clients);
+        if failed.is_empty() {
+            return;
+        }
+        for client in failed {
+            warn!(
+                "client {}: output could not be written (peer gone or {} bytes unread); disconnecting",
+                client.0,
+                client_io::OUTBOUND_CAP
+            );
+            disconnect_with_pending_cleanup(
+                state,
+                backend,
+                pending,
+                xi_config_lane,
+                reset_trigger,
+                client,
+            );
+        }
+    }
+}
+
+/// Disconnect every client whose output failed (RECORD data connections
+/// and flagged writers), then drain and reconcile WRITABLE interest for
+/// the rest. Repeats until a pass disconnects nobody: a disconnect's own
+/// notifications can buffer output for, or fail, other clients.
+fn settle_client_output(
+    registry: &mio::Registry,
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    pending: &mut PendingBackendRequests,
+    xi_config_lane: &mut XiConfigLane,
+    reset_trigger: &mut ResetTrigger,
+) {
+    loop {
+        // RECORD failures are queued, since that write can happen inside
+        // another client's disconnect.
+        let recorders = crate::core_loop::record::take_failed_recorders(state);
+        let failed = if recorders.is_empty() && client_io::failed_writers(&state.clients).is_empty()
+        {
+            let failed = reconcile_client_writable_interest(registry, state);
+            if failed.is_empty() {
+                return;
+            }
+            failed
+        } else {
+            recorders
+        };
+        for disc_id in failed {
+            disconnect_with_pending_cleanup(
+                state,
+                backend,
+                pending,
+                xi_config_lane,
+                reset_trigger,
+                disc_id,
+            );
+        }
+        disconnect_failed_writers(state, backend, pending, xi_config_lane, reset_trigger);
+    }
 }
 
 pub(super) fn cancel_unsubmitted_xi_configs(
@@ -2828,30 +2904,26 @@ fn run_core_with_inventory(
         // reregister errors that mean "fd already deregistered" so a
         // disconnect that ran during this iteration doesn't break
         // the next one.
-        // RECORD data connections whose stream write failed (queued, since
-        // the write can happen inside another client's disconnect).
-        for disc_id in crate::core_loop::record::take_failed_recorders(state) {
-            disconnect_with_pending_cleanup(
-                state,
-                backend,
-                &mut pending_backend_requests,
-                &mut xi_config_lane,
-                &mut reset_trigger,
-                disc_id,
-            );
-        }
-        for disc_id in reconcile_client_writable_interest(poll.registry(), state) {
-            disconnect_with_pending_cleanup(
-                state,
-                backend,
-                &mut pending_backend_requests,
-                &mut xi_config_lane,
-                &mut reset_trigger,
-                disc_id,
-            );
-        }
+        settle_client_output(
+            poll.registry(),
+            state,
+            backend,
+            &mut pending_backend_requests,
+            &mut xi_config_lane,
+            &mut reset_trigger,
+        );
 
         run_iteration_tail(state, backend);
+        // The tail delivers deferred input and Present events too: settle
+        // again so nothing it buffered waits without WRITABLE interest.
+        settle_client_output(
+            poll.registry(),
+            state,
+            backend,
+            &mut pending_backend_requests,
+            &mut xi_config_lane,
+            &mut reset_trigger,
+        );
 
         // Diagnostic: per-iteration accounting + per-second telemetry
         // emit. Both are no-ops when `YSERVER_LOOP_TELEMETRY` is unset.
@@ -4436,6 +4508,7 @@ fn handle_client_setup_complete(
             xi1_window_event_classes: std::collections::HashMap::new(),
             outbound: std::collections::VecDeque::new(),
             watching_writable: false,
+            write_failed: false,
             focused_window: crate::resources::ROOT_WINDOW,
             reader_control: Some(reader_control_tx),
             is_local,
@@ -4734,6 +4807,7 @@ mod tests {
                 xi1_window_event_classes: HashMap::new(),
                 outbound: VecDeque::new(),
                 watching_writable: false,
+                write_failed: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -4741,6 +4815,165 @@ mod tests {
             },
         );
         peer
+    }
+
+    /// A client on `writer` whose root event mask is `root_mask`.
+    fn unix_client(
+        writer: std::os::unix::net::UnixStream,
+        id: u32,
+        root_mask: u32,
+    ) -> crate::server::ClientState {
+        use std::sync::{Arc, Mutex, atomic::AtomicU16};
+        crate::server::ClientState {
+            writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(writer))),
+            byte_order: yserver_protocol::x11::ClientByteOrder::LittleEndian,
+            last_sequence: Arc::new(AtomicU16::new(0)),
+            resource_id_base: id << 21,
+            resource_id_mask: 0x001f_ffff,
+            event_masks: if root_mask == 0 {
+                HashMap::new()
+            } else {
+                HashMap::from([(crate::resources::ROOT_WINDOW, root_mask)])
+            },
+            save_set: HashSet::new(),
+            big_requests_enabled: false,
+            xi2_masks: HashMap::new(),
+            xi1_event_classes: HashSet::new(),
+            xi1_window_event_classes: HashMap::new(),
+            outbound: VecDeque::new(),
+            watching_writable: false,
+            write_failed: false,
+            focused_window: crate::resources::ROOT_WINDOW,
+            reader_control: None,
+            is_local: true,
+            fd_passing: true,
+        }
+    }
+
+    /// Client `owner`'s 10x10 child of the root.
+    fn create_child_window(
+        state: &mut ServerState,
+        owner: u32,
+    ) -> yserver_protocol::x11::ResourceId {
+        let window = yserver_protocol::x11::ResourceId(owner << 21 | 1);
+        state.resources.create_window(
+            yserver_protocol::x11::ClientId(owner),
+            yserver_protocol::x11::CreateWindowRequest {
+                depth: 24,
+                window,
+                parent: crate::resources::ROOT_WINDOW,
+                width: 10,
+                height: 10,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        window
+    }
+
+    /// The core loop disconnects every client a write failed on, and
+    /// repeats: here the slow client's own teardown (its window's
+    /// DestroyNotify) overflows a second slow client, which goes too. The
+    /// reading client stays and sees the DestroyNotify.
+    #[test]
+    fn failed_writers_are_disconnected_including_ones_failed_by_a_disconnect() {
+        use crate::backend::recording::RecordingBackend;
+        use std::{io::Read, os::unix::net::UnixStream};
+        const SUBSTRUCTURE_NOTIFY: u32 = 1 << 19;
+
+        let mut state = ServerState::new();
+        let mut peers = Vec::new();
+        for (id, mask) in [(1, 0), (2, SUBSTRUCTURE_NOTIFY), (3, SUBSTRUCTURE_NOTIFY)] {
+            let (a, b) = UnixStream::pair().unwrap();
+            peers.push(b);
+            state.clients.insert(id, unix_client(a, id, mask));
+        }
+        let window = create_child_window(&mut state, 1);
+        for id in [1, 2] {
+            client_io::saturate_for_test(state.clients.get_mut(&id).unwrap());
+        }
+        state.clients.get_mut(&1).unwrap().write_failed = true;
+
+        disconnect_failed_writers(
+            &mut state,
+            &mut RecordingBackend::new(),
+            &mut PendingBackendRequests::default(),
+            &mut XiConfigLane::default(),
+            &mut ResetTrigger::new(ResetPolicy::NoReset),
+        );
+        assert!(!state.clients.contains_key(&1));
+        assert!(
+            !state.clients.contains_key(&2),
+            "failed by 1's DestroyNotify"
+        );
+        assert!(state.clients.contains_key(&3));
+        assert!(state.resources.window(window).is_none());
+        let reader = &mut peers[2];
+        reader.set_nonblocking(true).unwrap();
+        let mut event = [0u8; 32];
+        reader.read_exact(&mut event).unwrap();
+        assert_eq!(event[0], 17, "DestroyNotify");
+    }
+
+    /// Output a forced disconnect produces for a healthy client whose
+    /// socket is full gets WRITABLE interest before the loop blocks again;
+    /// otherwise those bytes would wait for a wakeup that never comes.
+    #[test]
+    fn output_buffered_by_a_disconnect_gets_writable_interest() {
+        use crate::backend::recording::RecordingBackend;
+        use std::{
+            io::{ErrorKind, Write},
+            os::{fd::AsRawFd, unix::net::UnixStream},
+        };
+        const SUBSTRUCTURE_NOTIFY: u32 = 1 << 19;
+
+        let poll = Poll::new().unwrap();
+        let mut state = ServerState::new();
+        let mut peers = Vec::new();
+        for (id, mask) in [(1, 0), (2, SUBSTRUCTURE_NOTIFY)] {
+            let (a, b) = UnixStream::pair().unwrap();
+            a.set_nonblocking(true).unwrap();
+            poll.registry()
+                .register(
+                    &mut SourceFd(&a.as_raw_fd()),
+                    client_token(yserver_protocol::x11::ClientId(id)),
+                    Interest::READABLE,
+                )
+                .unwrap();
+            peers.push(b);
+            state.clients.insert(id, unix_client(a, id, mask));
+        }
+        let window = create_child_window(&mut state, 1);
+        // Fill client 2's socket: the DestroyNotify must buffer.
+        {
+            let mut writer = state.clients[&2].writer.lock().unwrap();
+            let chunk = [0u8; 4096];
+            loop {
+                match writer.write(&chunk) {
+                    Ok(_) => {}
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => break,
+                    Err(err) => panic!("filling the socket: {err}"),
+                }
+            }
+        }
+        state.clients.get_mut(&1).unwrap().write_failed = true;
+
+        settle_client_output(
+            poll.registry(),
+            &mut state,
+            &mut RecordingBackend::new(),
+            &mut PendingBackendRequests::default(),
+            &mut XiConfigLane::default(),
+            &mut ResetTrigger::new(ResetPolicy::NoReset),
+        );
+        assert!(!state.clients.contains_key(&1));
+        assert!(state.resources.window(window).is_none());
+        let healthy = &state.clients[&2];
+        assert!(!healthy.write_failed);
+        assert_eq!(healthy.outbound.len(), 32, "the DestroyNotify");
+        assert!(healthy.watching_writable);
+        drop(peers);
     }
 
     fn xi_vt_config_fixture(
@@ -6041,6 +6274,7 @@ mod tests {
                 xi1_window_event_classes: HashMap::new(),
                 outbound: VecDeque::new(),
                 watching_writable: false,
+                write_failed: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -6389,6 +6623,31 @@ mod tests {
         );
     }
 
+    /// A client a write failed on must not run its pipelined requests
+    /// (GrabServer, SetCloseDownMode…) before the core loop disconnects
+    /// it; other clients keep running.
+    #[test]
+    fn failed_writer_keeps_its_queued_requests_parked() {
+        let failed = yserver_protocol::x11::ClientId(57);
+        let other = yserver_protocol::x11::ClientId(12);
+        let pending = PendingBackendRequests::default();
+        let mut state = ServerState::new();
+        for id in [failed.0, other.0] {
+            let (a, _) = std::os::unix::net::UnixStream::pair().unwrap();
+            state.clients.insert(id, unix_client(a, id, 0));
+        }
+        state.clients.get_mut(&failed.0).unwrap().write_failed = true;
+
+        let mut queue = FairRequestQueue::default();
+        queue.push_back(deferred_request(failed.0, 2));
+        queue.push_back(deferred_request(other.0, 10));
+
+        let runnable = queue.pop_front_unblocked(&pending, &state).unwrap();
+        assert_eq!((runnable.id, runnable.header.opcode), (other, 10));
+        assert!(queue.pop_front_unblocked(&pending, &state).is_none());
+        assert!(!queue.has_runnable(&pending, &state));
+    }
+
     #[test]
     fn ready_crtc_completion_replies_unblocks_and_returns_reader_credit() {
         use crate::{backend::recording::RecordingBackend, server::ClientState};
@@ -6422,6 +6681,7 @@ mod tests {
                 xi1_window_event_classes: HashMap::new(),
                 outbound: VecDeque::new(),
                 watching_writable: false,
+                write_failed: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: Some(control_tx),
                 is_local: true,
@@ -6587,6 +6847,7 @@ mod tests {
                 xi1_window_event_classes: HashMap::new(),
                 outbound: VecDeque::new(),
                 watching_writable: false,
+                write_failed: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
