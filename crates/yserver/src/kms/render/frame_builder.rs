@@ -150,6 +150,14 @@ impl FrameBuilder {
         matches!(self.state, FrameState::OpenForPaint)
     }
 
+    /// Ops are still being recorded into an open frame. False once
+    /// [`Self::take_open_for_close`] took the frame for submission, while
+    /// [`Self::is_open`] stays true until the close completes: the frame
+    /// being closed is part of the submission, not still recording.
+    pub(crate) fn is_recording(&self) -> bool {
+        self.open.is_some()
+    }
+
     pub(crate) fn lifetime_opens(&self) -> u64 {
         self.lifetime_opens
     }

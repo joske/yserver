@@ -2472,10 +2472,12 @@ impl RenderEngine {
         // recorded exported writes and the eventual real submit would skip
         // their wait/publish. Leaving them queued lets the next non-empty
         // flush pick them up.
+        // A frame being closed is in this submission: `is_recording`, not
+        // `is_open`, which stays true until the close completes (#100).
         let recording_open = self
             .inner
             .as_ref()
-            .is_some_and(|i| i.frame_builder.is_open() || i.pending_render_batch.is_some());
+            .is_some_and(|i| i.frame_builder.is_recording() || i.pending_render_batch.is_some());
         let exported = if platform.submit_group_size() > 0 {
             store.take_exported_writes(recording_open)
         } else {
@@ -3320,7 +3322,7 @@ impl RenderEngine {
     pub fn has_pending_batches_for_tests(&self) -> bool {
         self.inner
             .as_ref()
-            .is_some_and(|i| i.frame_builder.is_open() || i.pending_render_batch.is_some())
+            .is_some_and(|i| i.frame_builder.is_recording() || i.pending_render_batch.is_some())
     }
 
     /// Stage 5 Task 4 layer 1: lifetime count of `vkCreateDescriptorPool`
@@ -14279,6 +14281,79 @@ mod tests {
             assert_eq!(px[2], 0xFF, "R");
             assert_eq!(px[3], 0xFF, "A");
         }
+
+        engine.drain_all(&mut platform);
+    }
+
+    /// #100: a write recorded into the open frame to an exported drawable
+    /// is published by the flush that closes that frame. The closing frame
+    /// is part of that submission, so its writes must not stay pending:
+    /// the core holds every DamageNotify while they do, and the damage
+    /// barrier would release events while the store still counts them
+    /// unpublished.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn closing_frame_publishes_its_exported_writes() {
+        use nix::sys::eventfd::{EfdFlags, EventFd};
+        use std::sync::atomic::Ordering;
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no VkContext available — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+        let storage = platform.allocate_drawable_storage(4, 4, 32).expect("alloc");
+        let id = store
+            .allocate(
+                0x1,
+                super::super::store::DrawableKind::Pixmap,
+                32,
+                false,
+                storage,
+            )
+            .unwrap();
+        // Stand-in export fd: the store only needs it registered.
+        let fd: std::os::fd::OwnedFd =
+            EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK | EfdFlags::EFD_CLOEXEC)
+                .expect("eventfd")
+                .into();
+        store.set_exported_sync_fd(id, std::sync::Arc::new(fd));
+        let flag = store.export_writes_pending_flag();
+
+        engine
+            .fill_rect(
+                &mut store,
+                &mut platform,
+                Dst::server_internal(id),
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 4,
+                        height: 4,
+                    },
+                },
+                decode_x11_pixel_bgra(0xFF_FF_00_00),
+            )
+            .expect("fill_rect");
+        assert!(
+            engine.inner.as_ref().unwrap().frame_builder.is_open(),
+            "fill_rect records into the frame"
+        );
+        assert!(flag.load(Ordering::Relaxed), "recorded, not yet published");
+
+        engine
+            .close_open_frame(
+                &mut store,
+                &mut platform,
+                super::super::frame_builder::CloseReason::SyncWait,
+            )
+            .expect("close");
+        assert!(
+            !store.has_unpublished_export_writes(),
+            "the frame-close flush published the frame's exported write"
+        );
+        assert!(!flag.load(Ordering::Relaxed));
 
         engine.drain_all(&mut platform);
     }

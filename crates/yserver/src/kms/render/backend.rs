@@ -22178,6 +22178,9 @@ impl Backend for KmsBackend {
         {
             log::warn!("render DamageNotify submit-group flush failed: {error:?}");
         }
+        if self.store.has_unpublished_export_writes() {
+            log::debug!("render DamageNotify barrier left exported writes unpublished");
+        }
     }
 
     fn export_writes_pending_flag(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
@@ -38560,6 +38563,93 @@ mod tests {
             compose_closes_before + 1,
             "{what}: control — the compose boundary closes the frame"
         );
+    }
+
+    /// #100: for each real write path into an exported drawable, the
+    /// damage barrier (`flush_before_damage_notify`) publishes the write
+    /// fence, so a DamageNotify put on the wire after it classifies after
+    /// the fence. The control shows the probe does see the write: on the
+    /// wire without the barrier, it is before the fence.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn damage_barrier_publishes_exported_writes_before_damage_notify() {
+        use nix::sys::eventfd::{EfdFlags, EventFd};
+        use std::sync::atomic::Ordering;
+        use yserver_core::backend::DamageNotifyProbe;
+        let mut b = match KmsBackend::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        if b.frame_builder_is_open_for_tests() {
+            b.engine_close_open_frame_for_timeout_for_tests()
+                .expect("close construction frame");
+        }
+        let src = b.create_pixmap(None, 24, 8, 8).expect("src").as_raw();
+        let dst = b.create_pixmap(None, 24, 8, 8).expect("dst").as_raw();
+        let dst_id = b.store.lookup(dst).expect("dst id");
+        let fd: std::os::fd::OwnedFd =
+            EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK | EfdFlags::EFD_CLOEXEC)
+                .expect("eventfd")
+                .into();
+        b.store
+            .set_exported_sync_fd(dst_id, std::sync::Arc::new(fd));
+        let flag = b.export_writes_pending_flag().expect("kms flag");
+        let probe = |b: &mut KmsBackend| {
+            b.note_damage_notify_probes(vec![DamageNotifyProbe {
+                host_xid: Some(dst),
+                on_wire_at: Some(std::time::Instant::now()),
+            }]);
+        };
+        // Each read closes the probe's one-second window; step past it.
+        let mut due = std::time::Instant::now();
+        let mut window = |b: &mut KmsBackend| {
+            due += std::time::Duration::from_secs(2);
+            b.store
+                .damage_fence_probe_mut()
+                .take_window_if_due(due)
+                .expect("window")
+        };
+        let pixels = vec![0x80u8; 8 * 8 * 4];
+        type Write = fn(&mut KmsBackend, u32, u32, &[u8]);
+        let writes: [(&str, Write); 3] = [
+            ("fill_rectangle", |b, _, dst, _| {
+                b.fill_rectangle(None, dst, 0x00FF_0000, 0, 0, 8, 8)
+                    .expect("fill");
+            }),
+            ("put_image", |b, _, dst, px| {
+                b.put_image(None, dst, 24, 8, 8, 0, 0, px).expect("put");
+            }),
+            ("copy_area", |b, src, dst, _| {
+                b.copy_area(None, src, dst, 0, 0, 0, 0, 8, 8).expect("copy");
+            }),
+        ];
+
+        // Control: on the wire with the write still unpublished.
+        b.fill_rectangle(None, dst, 0x0000_FF00, 0, 0, 8, 8)
+            .expect("fill");
+        assert!(flag.load(Ordering::Relaxed), "control: write pending");
+        probe(&mut b);
+        b.flush_before_damage_notify();
+        assert_eq!(window(&mut b).before_fence, 1, "control seen");
+
+        for (what, write) in writes {
+            write(&mut b, src, dst, &pixels);
+            assert!(flag.load(Ordering::Relaxed), "{what}: hold engages");
+            b.flush_before_damage_notify();
+            assert!(!flag.load(Ordering::Relaxed), "{what}: barrier published");
+            probe(&mut b);
+            let w = window(&mut b);
+            assert_eq!(
+                (w.exported, w.before_fence),
+                (1, 0),
+                "{what}: DamageNotify after the barrier is after the fence"
+            );
+        }
+        b.store.clear_exported_sync_fd(dst_id);
     }
 
     #[test]

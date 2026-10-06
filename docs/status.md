@@ -1154,6 +1154,12 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   releases the hold early. A submit-group flush while a frame/render batch
   is still recording no longer counts as publishing that recording's exported
   writes (they stay pending, so the flush that submits them publishes again).
+  HW (bee, 2f6b6e25) still read 100% before_fence with gaps up to 0.6 s: the
+  frame-close flush tested `FrameBuilder::is_open`, which stays true until the
+  close completes, so the closing frame's own writes were kept "pending"; the
+  flag never cleared and the probe only saw them published at the next flush
+  with nothing open. "Still recording" is now `is_recording` (frame not yet
+  taken for close); the same predicate gates foreign-queue releases.
 
 - **2026-09-10 #138 Chrome hardware-decoded video scrambled — FIXED, hardware
   confirmed:** ads, video and fullscreen all correct on silence (RX 6800,
