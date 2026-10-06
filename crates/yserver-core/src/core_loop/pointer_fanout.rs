@@ -1801,7 +1801,7 @@ fn pointer_event_fanout_to_state_inner(
         let (ox, oy) = state.resources.window_absolute_position(crossing_win);
         event_x = clamp_grab_coord(event.root_x, ox);
         event_y = clamp_grab_coord(event.root_y, oy);
-        xi2_crossing_targets_for_source(state, crossing_win, xi2_evtype, xi_source.slave_deviceid)
+        xi2_crossing_targets_for_source(state, crossing_win, xi2_evtype, xi_source)
     } else {
         compute_xi2_targets_for_source(
             state,
@@ -2339,7 +2339,14 @@ fn pointer_event_fanout_to_state_inner(
             None
         };
         let mut forms = Vec::with_capacity(2);
-        if let Some(slave_deviceid) = xi_source.slave_deviceid {
+        if is_crossing_evt {
+            // A crossing exists in exactly one form (`xi2_crossing_form`):
+            // an attached slave never gets its own Enter/Leave, so a client
+            // selecting XIAllDevices sees one crossing, not a second,
+            // unbalanced per-slave hover (#100 Plasma double highlight).
+            let (form, deviceid) = xi2_crossing_form(xi_source);
+            forms.push((deviceid, true, form));
+        } else if let Some(slave_deviceid) = xi_source.slave_deviceid {
             forms.push((
                 slave_deviceid,
                 wants_slave && button_transition.source_accepted,
@@ -2351,12 +2358,14 @@ fn pointer_event_fanout_to_state_inner(
         // window selection (grab owners receive via their grab mask, not
         // `XISelectEvents`, and that funnel is master-routed). A source with
         // no published slave can only deliver its master form.
-        let wants_master_form = wants_master || !wants_slave;
-        forms.push((
-            XI2_MASTER_POINTER_DEVICE_ID,
-            wants_master_form && button_transition.master_accepted,
-            Xi2PointerForm::Master,
-        ));
+        if !is_crossing_evt {
+            let wants_master_form = wants_master || !wants_slave;
+            forms.push((
+                XI2_MASTER_POINTER_DEVICE_ID,
+                wants_master_form && button_transition.master_accepted,
+                Xi2PointerForm::Master,
+            ));
+        }
         for (deviceid, button_want, form) in forms {
             if !button_want {
                 continue;
@@ -3954,22 +3963,40 @@ fn xi2_form_targets_for_source(
         .collect()
 }
 
+/// The one XI2 form a crossing is delivered in. Xorg computes Enter/Leave
+/// only for a device that owns a sprite: `ProcessDeviceEvent` calls
+/// `CheckMotion` only `if (IsMaster(device) || IsFloating(device))`
+/// (`Xi/exevents.c:1854`), and `CheckMotion` passes the slave as `sourceid`
+/// to `DoEnterLeaveEvents` (`dix/events.c:3244-3252`). So a crossing caused by
+/// an attached slave carries deviceid = master, sourceid = slave; only a
+/// floating slave gets crossings stamped with its own id.
+fn xi2_crossing_form(xi_source: PointerXiSource) -> (Xi2PointerForm, u16) {
+    match xi_source.slave_deviceid {
+        Some(slave) if xi_source.attached_master.is_none() => (Xi2PointerForm::Slave, slave),
+        _ => (Xi2PointerForm::Master, XI2_MASTER_POINTER_DEVICE_ID),
+    }
+}
+
 /// Recipients of an XI2 Enter/Leave on `window` — Xorg
 /// `DeviceEnterLeaveEvent` (`dix/events.c:4866`): under an XI2 grab only the
 /// grab client, through the grab's mask; otherwise the selections on
-/// `window`, never propagated.
+/// `window` for the crossing's one device form (`xi2_crossing_form`), never
+/// propagated.
 fn xi2_crossing_targets_for_source(
     state: &ServerState,
     window: ResourceId,
     evtype: u16,
-    slave_deviceid: Option<u16>,
+    xi_source: PointerXiSource,
 ) -> Vec<ClientId> {
     match state.active_pointer_grab {
         Some(grab) if grab.via_xi2 => client_target_id(state, grab.owner)
             .filter(|_| grab.xi2_mask & (1 << evtype) != 0)
             .into_iter()
             .collect(),
-        _ => compute_xi2_exact_targets_for_source(state, window, evtype, slave_deviceid),
+        _ => {
+            let (form, _) = xi2_crossing_form(xi_source);
+            xi2_form_targets_for_source(state, window, form, evtype, xi_source.slave_deviceid)
+        }
     }
 }
 
@@ -3980,28 +4007,6 @@ pub(crate) fn xi2_master_selectors(
     evtype: u16,
 ) -> Vec<ClientId> {
     xi2_form_targets_for_source(state, window, Xi2PointerForm::Master, evtype, None)
-}
-
-fn compute_xi2_exact_targets_for_source(
-    state: &ServerState,
-    window: ResourceId,
-    evtype: u16,
-    slave_deviceid: Option<u16>,
-) -> Vec<ClientId> {
-    let mut targets = Vec::new();
-    let forms = if slave_deviceid.is_some() {
-        [Some(Xi2PointerForm::Slave), Some(Xi2PointerForm::Master)]
-    } else {
-        [None, Some(Xi2PointerForm::Master)]
-    };
-    for form in forms.into_iter().flatten() {
-        for cid in xi2_form_targets_for_source(state, window, form, evtype, slave_deviceid) {
-            if !targets.contains(&cid) {
-                targets.push(cid);
-            }
-        }
-    }
-    targets
 }
 
 fn compute_xi2_targets_for_source(
@@ -8291,6 +8296,7 @@ mod tests {
 
         let mut peer = install_client(&mut state, 1);
         let mut xi_peer = install_client(&mut state, 2);
+        let mut slave_only_peer = install_client(&mut state, 3);
 
         for (win, parent, x, y, w, h) in [
             (client_win, crate::resources::ROOT_WINDOW, 0, 0, 400, 24),
@@ -8329,6 +8335,13 @@ mod tests {
                 .unwrap()
                 .xi2_masks
                 .insert((win, 0), (1 << 7) | (1 << 8));
+            // A third selects the crossings for the XTEST slave alone.
+            state
+                .clients
+                .get_mut(&3)
+                .unwrap()
+                .xi2_masks
+                .insert((win, 4), (1 << 7) | (1 << 8));
         }
 
         let mut xid_map = HostXidMap::new();
@@ -8436,10 +8449,29 @@ mod tests {
 
         let xi_bytes = read_all_available(&mut xi_peer);
         let xi_events: Vec<&[u8]> = xi_bytes.chunks(76).collect();
+        // Xorg (goldens/xi2-crossing-devices.txt): an attached slave owns no
+        // sprite, so XIAllDevices gets ONE Leave and ONE Enter, deviceid =
+        // master pointer, sourceid = the XTEST slave that moved it.
         assert_eq!(
             xi_events.len(),
-            4,
-            "XIAllDevices receives slave + master forms of Leave + Enter"
+            2,
+            "XIAllDevices receives only the master form of Leave + Enter"
+        );
+        for e in &xi_events {
+            assert_eq!(
+                u16::from_le_bytes(e[10..12].try_into().unwrap()),
+                2,
+                "deviceid"
+            );
+            assert_eq!(
+                u16::from_le_bytes(e[16..18].try_into().unwrap()),
+                4,
+                "sourceid"
+            );
+        }
+        assert!(
+            read_all_available(&mut slave_only_peer).is_empty(),
+            "a selection on the attached XTEST slave alone gets no crossings"
         );
         let xi_leave = xi_events
             .iter()
@@ -8467,6 +8499,40 @@ mod tests {
             i32::from_le_bytes(xi_enter[44..48].try_into().unwrap()) >> 16,
             5
         );
+    }
+
+    /// Xorg `Xi/exevents.c:1854` runs `CheckMotion` (and so crossings) only
+    /// for a master or a floating slave; `dix/events.c:3244-3252` stamps the
+    /// slave as `sourceid`.
+    #[test]
+    fn xi2_crossings_belong_to_the_device_that_owns_the_sprite() {
+        let attached = PointerXiSource {
+            slave_deviceid: Some(7),
+            sourceid: 7,
+            attached_master: Some(XI2_MASTER_POINTER_DEVICE_ID),
+        };
+        let floating = PointerXiSource {
+            slave_deviceid: Some(7),
+            sourceid: 7,
+            attached_master: None,
+        };
+        let master = PointerXiSource {
+            slave_deviceid: None,
+            sourceid: XI2_MASTER_POINTER_DEVICE_ID,
+            attached_master: Some(XI2_MASTER_POINTER_DEVICE_ID),
+        };
+        assert!(matches!(
+            xi2_crossing_form(attached),
+            (Xi2PointerForm::Master, XI2_MASTER_POINTER_DEVICE_ID)
+        ));
+        assert!(matches!(
+            xi2_crossing_form(floating),
+            (Xi2PointerForm::Slave, 7)
+        ));
+        assert!(matches!(
+            xi2_crossing_form(master),
+            (Xi2PointerForm::Master, XI2_MASTER_POINTER_DEVICE_ID)
+        ));
     }
 
     /// openbox resize regression: an active core grab can live on a
