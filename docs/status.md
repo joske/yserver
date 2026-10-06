@@ -1114,6 +1114,33 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ## Where we are
 
+- **2026-10-06 #100 Plasma/Dolphin stale-frame flicker — exported backings
+  allocated through GBM (branch `fix/100-implicit-sync-exports`, HW untested):**
+  `amdgpu_gem_info` on silence showed exactly the Vulkan-allocated exported
+  window backings carrying `EXPLICIT_SYNC` (RADV creates every BO that way;
+  GBM's do not). KWin imports the same GEM object, so its submissions ignored
+  the dma-buf write fences `publish_export_write_fences` attaches, and it
+  TFP-sampled backings before our writes landed. Promotion
+  (`promote_drawable_exportable`, the single path every DRI3
+  `BufferFromPixmap(s)` and GLX bind goes through) now allocates via
+  `kms/vk/export_alloc.rs`: GBM on the renderer's own render node, modifier =
+  Vulkan IMPORTABLE (`EXPORT_IMAGE_USAGE`, one plane) ∩ GBM one plane, LINEAR
+  alone when it qualifies, imported with an explicit modifier layout; without
+  the modifier extension only an advertised `TILING_LINEAR` import whose
+  layout equals GBM's. Anything else (lavapipe: no render node; RADV GFX8: no
+  advertised combination) keeps the Vulkan allocation, still explicit-sync on
+  amdgpu. Exports dup the BO's dma-buf (imported memory may not be
+  `vkGetMemoryFdKHR`-exported) and report GBM's offset. Shared images are
+  released to `VK_QUEUE_FAMILY_FOREIGN_EXT` (else `EXTERNAL`) in `GENERAL` at
+  the end of every submission that touched them and acquired back at the
+  start: the submit-group flush brackets its CBs (held, not released, while a
+  frame/render batch is still recording), the scene compose CB brackets its
+  sampled shared backings, and promotion's copy ends with the first release.
+  Layout tracking keeps the terminal `SHADER_READ_ONLY_OPTIMAL`; the acquire
+  restores it. The first GBM export on RADV logs its kernel flags
+  (`export allocator: amdgpu export BO flags=… explicit_sync=…`). Client
+  PixmapFromBuffer imports are untouched.
+
 - **2026-09-10 #138 Chrome hardware-decoded video scrambled — FIXED, hardware
   confirmed:** ads, video and fullscreen all correct on silence (RX 6800,
   Mesa 26.2.2, Chromium, AV1 via `VaapiVideoDecoder`). Two server-side lies,
