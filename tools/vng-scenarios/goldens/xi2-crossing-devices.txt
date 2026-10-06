@@ -1,0 +1,40 @@
+==> probe.log <==
+pointer on root at 20,20; A at 100,100 and B at 300,100, both 200x200
+XTEST motion into A
+  X Leave dev=master-ptr src=xtest-ptr event=root detail=Inferior mode=0
+  X Enter dev=master-ptr src=xtest-ptr event=A detail=Ancestor mode=0
+  X Motion dev=master-ptr src=xtest-ptr event=A detail=0 at=50,50
+  M Enter dev=master-ptr src=xtest-ptr event=A detail=Ancestor mode=0
+XTEST motion inside A
+  X Motion dev=master-ptr src=xtest-ptr event=A detail=0 at=60,60
+XTEST motion from A into B
+  X Leave dev=master-ptr src=xtest-ptr event=A detail=Nonlinear mode=0
+  X Enter dev=master-ptr src=xtest-ptr event=B detail=Nonlinear mode=0
+  X Motion dev=master-ptr src=xtest-ptr event=B detail=0 at=50,50
+  M Leave dev=master-ptr src=xtest-ptr event=A detail=Nonlinear mode=0
+XTEST press button 1 in B
+  X ButtonPress dev=xtest-ptr src=xtest-ptr event=B detail=1 at=50,50
+  X ButtonPress dev=master-ptr src=xtest-ptr event=B detail=1 at=50,50
+XTEST release button 1 in B
+  X ButtonRelease dev=xtest-ptr src=xtest-ptr event=B detail=1 at=50,50
+  X ButtonRelease dev=master-ptr src=xtest-ptr event=B detail=1 at=50,50
+XTEST motion from B into A
+  X Leave dev=master-ptr src=xtest-ptr event=B detail=Nonlinear mode=0
+  X Enter dev=master-ptr src=xtest-ptr event=A detail=Nonlinear mode=0
+  X Motion dev=master-ptr src=xtest-ptr event=A detail=0 at=50,50
+  M Enter dev=master-ptr src=xtest-ptr event=A detail=Nonlinear mode=0
+XTEST motion from A onto root
+  X Leave dev=master-ptr src=xtest-ptr event=A detail=Ancestor mode=0
+  X Enter dev=master-ptr src=xtest-ptr event=root detail=Inferior mode=0
+  X Motion dev=master-ptr src=xtest-ptr event=root detail=0 at=20,20
+  M Leave dev=master-ptr src=xtest-ptr event=A detail=Ancestor mode=0
+focus A
+  X FocusOut dev=master-kbd src=master-kbd event=root detail=Pointer mode=0
+  X FocusOut dev=master-kbd src=master-kbd event=root detail=PointerRoot mode=0
+  X FocusIn dev=master-kbd src=master-kbd event=A detail=Nonlinear mode=0
+focus PointerRoot
+  X FocusOut dev=master-kbd src=master-kbd event=A detail=Nonlinear mode=0
+  X FocusOut dev=master-kbd src=master-kbd event=root detail=NonlinearVirtual mode=0
+  X FocusIn dev=master-kbd src=master-kbd event=root detail=PointerRoot mode=0
+  X FocusIn dev=master-kbd src=master-kbd event=root detail=Pointer mode=0
+done
