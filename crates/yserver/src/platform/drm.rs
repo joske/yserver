@@ -356,6 +356,14 @@ fn node_for_path(path: PathBuf, kind: DrmNodeKind) -> io::Result<DrmNode> {
     })
 }
 
+/// The render node whose `st_rdev` is exactly `key` (as reported by
+/// `VK_EXT_physical_device_drm`), or `None` when no such node exists.
+pub(crate) fn render_node_for_key(key: DrmDeviceKey) -> io::Result<Option<DrmNode>> {
+    Ok(enumerate_nodes("renderD", DrmNodeKind::Render)?
+        .into_iter()
+        .find(|node| node.key == key))
+}
+
 /// Identify one explicit render-node path by stable `st_rdev` identity.
 pub(crate) fn render_node_from_path(path: PathBuf) -> io::Result<DrmNode> {
     node_for_path(path, DrmNodeKind::Render)

@@ -4767,6 +4767,14 @@ fn tick_one_output(
         Repaint::Clipped(_) => Some(cull_scene_to_region(&built.scene, &plan.painted)),
         Repaint::Full(_) | Repaint::AuditClearClipped(_) => None,
     };
+    let mut render_scene_owned = culled;
+    let foreign_images = store.foreign_sampled_images(&built.sampled_ids);
+    if !foreign_images.is_empty() {
+        render_scene_owned
+            .get_or_insert_with(|| built.scene.clone())
+            .foreign_images = foreign_images;
+    }
+    let culled = render_scene_owned;
     let render_scene: &CompositeScene = culled.as_ref().unwrap_or(&built.scene);
     if let (Repaint::Clipped(_), Some(c)) = (repaint, culled.as_ref()) {
         // Per scissor rect, not once against the bbox: with 4.5's per-rect
@@ -5478,6 +5486,7 @@ fn cull_scene_to_region(scene: &CompositeScene, keep: &Region) -> CompositeScene
             .filter(|d| draw_dst_rect_inward(d).is_none_or(|dst| keep.intersects_rect(dst)))
             .copied()
             .collect(),
+        foreign_images: scene.foreign_images.clone(),
     }
 }
 
@@ -6077,6 +6086,7 @@ fn build_scene_with(
     let scene = CompositeScene {
         bg_color: bg,
         draws,
+        foreign_images: Vec::new(),
     };
     SceneBuild {
         scene,
@@ -8996,6 +9006,29 @@ fn record_command_buffer<T: ComposeRenderTarget + ?Sized>(
         crate::vk_count!(cmd_pipeline_barrier2);
         device.cmd_pipeline_barrier2(cb, &to_color_dep);
 
+        // Externally shared backings sampled by this frame: acquire them
+        // from the foreign queue family before the draws, release after.
+        let foreign_family = super::store::foreign_queue_family(vk.queue_family_foreign);
+        if !scene.foreign_images.is_empty() {
+            let acquires: Vec<_> = scene
+                .foreign_images
+                .iter()
+                .map(|&(image, layout)| {
+                    super::store::foreign_acquire_barrier(
+                        image,
+                        layout,
+                        vk.graphics_queue_family,
+                        foreign_family,
+                    )
+                })
+                .collect();
+            crate::vk_count!(cmd_pipeline_barrier2);
+            device.cmd_pipeline_barrier2(
+                cb,
+                &vk::DependencyInfo::default().image_memory_barriers(&acquires),
+            );
+        }
+
         // Outside the root the intermediate is transparent black, which the
         // scale pass's bilinear edge blends toward (spec D4).
         let clear_color = if scale.is_some() {
@@ -9168,6 +9201,26 @@ fn record_command_buffer<T: ComposeRenderTarget + ?Sized>(
         }
 
         bo.record_post_compose(vk, cb, post_compose_preparation);
+
+        if !scene.foreign_images.is_empty() {
+            let releases: Vec<_> = scene
+                .foreign_images
+                .iter()
+                .map(|&(image, layout)| {
+                    super::store::foreign_release_barrier(
+                        image,
+                        layout,
+                        vk.graphics_queue_family,
+                        foreign_family,
+                    )
+                })
+                .collect();
+            crate::vk_count!(cmd_pipeline_barrier2);
+            device.cmd_pipeline_barrier2(
+                cb,
+                &vk::DependencyInfo::default().image_memory_barriers(&releases),
+            );
+        }
 
         // GPU-render timer: stamp BOTTOM-of-pipe after all compose work.
         if ts_enabled {
@@ -10005,6 +10058,7 @@ mod tests {
         let mut built = SceneBuild {
             scene: CompositeScene {
                 bg_color: [0.0, 0.0, 0.0, 1.0],
+                foreign_images: Vec::new(),
                 draws: vec![CompositeDraw {
                     image_view: vk::ImageView::null(),
                     dst_origin: [10.0, 20.0],
@@ -10089,6 +10143,7 @@ mod tests {
         let mut built = SceneBuild {
             scene: CompositeScene {
                 bg_color: [0.0, 0.0, 0.0, 1.0],
+                foreign_images: Vec::new(),
                 draws: vec![CompositeDraw {
                     image_view: vk::ImageView::null(),
                     dst_origin: [10.0, 20.0],
@@ -11205,6 +11260,7 @@ mod tests {
     fn culling_drops_draws_outside_the_rect_and_keeps_order() {
         let scene = CompositeScene {
             bg_color: [0.0, 0.0, 0.0, 1.0],
+            foreign_images: Vec::new(),
             draws: vec![
                 opaque_root(800.0, 600.0),
                 draw_at(400.0, 400.0, 50.0, 50.0, true),

@@ -198,6 +198,14 @@ pub struct VkContext {
     /// modifier path and caches that. Empty until the first
     /// allocation attempt.
     pub tfp_tiling_strategy: std::sync::OnceLock<super::target::TilingStrategy>,
+    /// GBM device on this renderer's own DRM render node, opened on the
+    /// first exportable allocation. Exported backings are allocated here
+    /// and imported into Vulkan so the buffer object is created by the
+    /// GBM (GL) driver with kernel implicit synchronisation; a
+    /// Vulkan-allocated export on amdgpu is an explicit-sync BO whose
+    /// dma-buf fences importers ignore (#100). `None` inside when the
+    /// renderer has no render node (lavapipe) or GBM refuses it.
+    export_gbm: std::sync::OnceLock<Option<gbm::Device<std::os::fd::OwnedFd>>>,
     pub graphics_queue_family: u32,
     pub graphics_queue: vk::Queue,
     /// Whether the selected graphics+transfer queue family can also execute
@@ -683,6 +691,7 @@ impl VkContext {
             queue_family_foreign,
             memory_budget,
             tfp_tiling_strategy: std::sync::OnceLock::new(),
+            export_gbm: std::sync::OnceLock::new(),
             graphics_queue_family,
             graphics_queue,
             graphics_queue_supports_compute,
@@ -735,6 +744,45 @@ impl VkContext {
     #[must_use]
     pub(crate) const fn max_storage_buffer_range(&self) -> u64 {
         self.max_storage_buffer_range
+    }
+
+    /// The GBM device on this renderer's render node (see the
+    /// `export_gbm` field). Opened once; a failure is logged once and
+    /// cached as `None`.
+    pub(crate) fn export_gbm_device(&self) -> Option<&gbm::Device<std::os::fd::OwnedFd>> {
+        self.export_gbm
+            .get_or_init(|| {
+                let key = self.selected_drm_identity.and_then(|id| id.render)?;
+                let opened = crate::platform::drm::render_node_for_key(key)
+                    .and_then(|node| {
+                        node.ok_or_else(|| {
+                            std::io::Error::other(format!("no render node with rdev {key}"))
+                        })
+                    })
+                    .and_then(|node| {
+                        let fd = crate::platform::drm::open_node(&node)?;
+                        let device = gbm::Device::new(fd)?;
+                        Ok((node, device))
+                    });
+                match opened {
+                    Ok((node, device)) => {
+                        log::info!(
+                            "export allocator: GBM ({}) on {}",
+                            device.backend_name(),
+                            node.path.display()
+                        );
+                        Some(device)
+                    }
+                    Err(e) => {
+                        log::info!(
+                            "export allocator: no GBM device for render node {key} ({e}); \
+                             exported backings stay Vulkan-allocated"
+                        );
+                        None
+                    }
+                }
+            })
+            .as_ref()
     }
 }
 

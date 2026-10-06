@@ -14,6 +14,7 @@ pub(crate) mod damage_audit_compare;
 pub mod device;
 pub mod dri3;
 pub mod dst_readback;
+pub(crate) mod export_alloc;
 pub mod glyph;
 pub mod gradient;
 pub mod instance;

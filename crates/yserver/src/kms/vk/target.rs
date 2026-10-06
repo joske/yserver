@@ -1279,8 +1279,26 @@ pub struct ExportableImage {
     pub size: u64,
     /// DRM format modifier; `DRM_FORMAT_MOD_LINEAR` (0) for the LINEAR path.
     pub modifier: u64,
+    /// The buffer object's own dma-buf when the memory was allocated by GBM
+    /// and imported ([`super::export_alloc`]). Exports dup this fd: the
+    /// imported `VkDeviceMemory` was not allocated with
+    /// `VkExportMemoryAllocateInfo`, so `vkGetMemoryFdKHR` may not be used on
+    /// it. `None` for Vulkan-allocated memory.
+    pub(crate) dmabuf: Option<std::os::fd::OwnedFd>,
     /// Kept so `Drop` can call `vkFreeMemory` / `vkDestroyImage`.
     vk: Arc<VkContext>,
+}
+
+/// The raw handles and export metadata of an [`ExportableImage`] whose
+/// ownership moved to the caller (see [`ExportableImage::into_raw_parts`]).
+pub(crate) struct ExportableParts {
+    pub image: vk::Image,
+    pub memory: vk::DeviceMemory,
+    pub stride: u32,
+    pub offset: u64,
+    pub size: u64,
+    pub modifier: u64,
+    pub dmabuf: Option<std::os::fd::OwnedFd>,
 }
 
 impl ExportableImage {
@@ -1297,17 +1315,55 @@ impl ExportableImage {
     /// the struct is wrapped in `ManuallyDrop` so `Drop` never fires on
     /// the Vk handles, then the `Arc<VkContext>` is read out and
     /// dropped normally, decrementing the strong-count as it should.
-    pub fn into_raw_parts(self) -> (vk::Image, vk::DeviceMemory, u32, u64, u64) {
+    pub(crate) fn into_raw_parts(self) -> ExportableParts {
         let mut md = std::mem::ManuallyDrop::new(self);
-        let image = md.image;
-        let memory = md.memory;
-        let stride = md.stride;
-        let size = md.size;
-        let modifier = md.modifier;
+        let parts = ExportableParts {
+            image: md.image,
+            memory: md.memory,
+            stride: md.stride,
+            offset: md.offset,
+            size: md.size,
+            modifier: md.modifier,
+            dmabuf: md.dmabuf.take(),
+        };
         // Drop the Arc<VkContext> normally (decrement strong-count)
         // without destroying the Vk handles the caller now owns.
         unsafe { std::ptr::drop_in_place(&mut md.vk) };
-        (image, memory, stride, size, modifier)
+        parts
+    }
+
+    /// Wrap handles produced by [`super::export_alloc`]'s GBM route.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_imported_parts(
+        vk: &Arc<VkContext>,
+        image: vk::Image,
+        memory: vk::DeviceMemory,
+        extent: vk::Extent2D,
+        format: vk::Format,
+        stride: u32,
+        offset: u64,
+        size: u64,
+        modifier: u64,
+        dmabuf: std::os::fd::OwnedFd,
+    ) -> Self {
+        Self {
+            image,
+            memory,
+            extent,
+            format,
+            stride,
+            offset,
+            size,
+            modifier,
+            dmabuf: Some(dmabuf),
+            vk: Arc::clone(vk),
+        }
+    }
+
+    /// True when the memory came from GBM (implicit-sync capable BO).
+    #[must_use]
+    pub fn is_gbm_allocated(&self) -> bool {
+        self.dmabuf.is_some()
     }
 }
 
@@ -1375,6 +1431,22 @@ pub enum TilingStrategy {
 /// Mirrors the modifier/linear plan dispatch in [`super::scanout`]
 /// (`allocate_vk_scanout_image`).
 pub fn allocate_exportable(
+    vk: &Arc<VkContext>,
+    width: u32,
+    height: u32,
+    format: vk::Format,
+) -> Result<ExportableImage, vk::Result> {
+    if let Some(img) = super::export_alloc::allocate_gbm_exportable(vk, width, height, format) {
+        return Ok(img);
+    }
+    allocate_exportable_vulkan(vk, width, height, format)
+}
+
+/// The Vulkan-allocated exportable image ([`allocate_exportable`]'s fallback
+/// when the GBM route is unavailable). On amdgpu RADV creates this memory as
+/// an explicit-sync buffer object, so the dma-buf fences published on it do
+/// not order an importer's reads (#100).
+pub fn allocate_exportable_vulkan(
     vk: &Arc<VkContext>,
     width: u32,
     height: u32,
@@ -1630,6 +1702,7 @@ fn allocate_exportable_modifier(
         offset: layout.offset,
         size: layout.size,
         modifier: mod_props.drm_format_modifier,
+        dmabuf: None,
         vk: Arc::clone(vk),
     })
 }
@@ -1690,6 +1763,7 @@ fn allocate_exportable_linear(
         offset: layout.offset,
         size: layout.size,
         modifier: 0, // DRM_FORMAT_MOD_LINEAR
+        dmabuf: None,
         vk: Arc::clone(vk),
     })
 }

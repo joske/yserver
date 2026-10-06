@@ -4865,6 +4865,16 @@ impl PlatformBackend {
         self.submit_group.size()
     }
 
+    /// Bracket the open group's entries with foreign-ownership acquire /
+    /// release command buffers (see [`super::submit_group::SubmitGroup::bracket`]).
+    pub(crate) fn submit_group_bracket(
+        &mut self,
+        acquire: Option<vk::CommandBuffer>,
+        release: Option<vk::CommandBuffer>,
+    ) {
+        self.submit_group.bracket(acquire, release);
+    }
+
     /// Phase A: true if any CB has been appended since the last flush.
     pub(crate) fn submit_group_is_open(&self) -> bool {
         self.submit_group.is_open()

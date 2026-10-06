@@ -191,6 +191,113 @@ pub(crate) struct Storage {
     /// non-promoted storage. Carried into the `BuffersFromPixmap` (op 8)
     /// reply — a modifier-tiled buffer is unusable by the client without it.
     pub(crate) export_modifier: u64,
+    /// Plane-0 byte offset of the exportable image (GBM may place it past 0).
+    pub(crate) export_offset: u64,
+    /// The GBM buffer object's dma-buf when the exportable image was
+    /// allocated through GBM; exports dup it. `None` for Vulkan-allocated
+    /// exports (exported with `vkGetMemoryFdKHR`) and non-promoted storage.
+    pub(crate) export_dmabuf: Option<std::os::fd::OwnedFd>,
+    /// The image is shared with an external (foreign) consumer: every
+    /// submission that touches it acquires it from
+    /// `VK_QUEUE_FAMILY_FOREIGN_EXT` and releases it back in `GENERAL`
+    /// (see [`ForeignOwnership`]). Set at promotion, never cleared — an
+    /// importer may hold the dma-buf after its export entry is gone.
+    pub(crate) foreign_shared: bool,
+    /// `Some(layout)` while the image is released to the foreign queue
+    /// family (physically `GENERAL`); `layout` is the layout yserver's own
+    /// tracking (`current_layout`) assumes, which the acquire restores.
+    /// `None` while yserver owns it.
+    pub(crate) foreign_released_from: Option<vk::ImageLayout>,
+}
+
+/// Queue-family ownership state a promoted (externally shared) image starts
+/// in: `logical_layout` is what yserver's layout tracking records, and
+/// `released` says whether the image was handed to the foreign queue family
+/// (physically `GENERAL`) at the end of the promotion copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ForeignOwnership {
+    pub(crate) logical_layout: vk::ImageLayout,
+    pub(crate) released: bool,
+}
+
+/// The queue family index that names "outside this Vulkan instance" for a
+/// dma-buf shared with another process: `VK_QUEUE_FAMILY_FOREIGN_EXT` when
+/// `VK_EXT_queue_family_foreign` is enabled (the importer is a different
+/// driver — e.g. radeonsi GL beside RADV), else the core
+/// `VK_QUEUE_FAMILY_EXTERNAL`.
+#[must_use]
+pub(crate) const fn foreign_queue_family(has_queue_family_foreign: bool) -> u32 {
+    if has_queue_family_foreign {
+        vk::QUEUE_FAMILY_FOREIGN_EXT
+    } else {
+        vk::QUEUE_FAMILY_EXTERNAL
+    }
+}
+
+fn color_range() -> vk::ImageSubresourceRange {
+    vk::ImageSubresourceRange::default()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .level_count(1)
+        .layer_count(1)
+}
+
+/// Acquire a released image from the foreign queue family at the start of
+/// a submission: `GENERAL` → `restore_layout` (the layout yserver's tracking
+/// assumed when it released it). The source scope of an acquire is ignored.
+pub(crate) fn foreign_acquire_barrier(
+    image: vk::Image,
+    restore_layout: vk::ImageLayout,
+    graphics_queue_family: u32,
+    foreign_queue_family: u32,
+) -> vk::ImageMemoryBarrier2<'static> {
+    vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::NONE)
+        .src_access_mask(vk::AccessFlags2::NONE)
+        .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+        .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE)
+        .old_layout(vk::ImageLayout::GENERAL)
+        .new_layout(restore_layout)
+        .src_queue_family_index(foreign_queue_family)
+        .dst_queue_family_index(graphics_queue_family)
+        .image(image)
+        .subresource_range(color_range())
+}
+
+/// Release an image to the foreign queue family at the end of a
+/// submission, in `GENERAL` — the layout an external dma-buf consumer
+/// reads. The destination scope of a release is ignored.
+pub(crate) fn foreign_release_barrier(
+    image: vk::Image,
+    from_layout: vk::ImageLayout,
+    graphics_queue_family: u32,
+    foreign_queue_family: u32,
+) -> vk::ImageMemoryBarrier2<'static> {
+    vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+        .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags2::NONE)
+        .dst_access_mask(vk::AccessFlags2::NONE)
+        .old_layout(from_layout)
+        .new_layout(vk::ImageLayout::GENERAL)
+        .src_queue_family_index(graphics_queue_family)
+        .dst_queue_family_index(foreign_queue_family)
+        .image(image)
+        .subresource_range(color_range())
+}
+
+/// The ownership transfers one submission must bracket its command buffers
+/// with: acquires first, releases last. Each entry is `(image, layout)` —
+/// the restored layout for an acquire, the current layout for a release.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ForeignTransfers {
+    pub(crate) acquires: Vec<(vk::Image, vk::ImageLayout)>,
+    pub(crate) releases: Vec<(vk::Image, vk::ImageLayout)>,
+}
+
+impl ForeignTransfers {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.acquires.is_empty() && self.releases.is_empty()
+    }
 }
 
 /// Old Vk handles displaced by promotion ([`Storage::adopt_exportable`]).
@@ -233,6 +340,10 @@ impl Storage {
             export_stride: 0,
             export_size: 0,
             export_modifier: 0,
+            export_offset: 0,
+            export_dmabuf: None,
+            foreign_shared: false,
+            foreign_released_from: None,
         }
     }
 
@@ -270,6 +381,10 @@ impl Storage {
             export_stride: 0,
             export_size: 0,
             export_modifier: 0,
+            export_offset: 0,
+            export_dmabuf: None,
+            foreign_shared: false,
+            foreign_released_from: None,
         }
     }
 
@@ -300,6 +415,10 @@ impl Storage {
             export_stride: 0,
             export_size: 0,
             export_modifier: 0,
+            export_offset: 0,
+            export_dmabuf: None,
+            foreign_shared: false,
+            foreign_released_from: None,
         }
     }
 
@@ -331,6 +450,10 @@ impl Storage {
             export_stride: 0,
             export_size: 0,
             export_modifier: 0,
+            export_offset: 0,
+            export_dmabuf: None,
+            foreign_shared: false,
+            foreign_released_from: None,
         }
     }
 
@@ -352,14 +475,10 @@ impl Storage {
     /// so the DRI3 export reply (Task 1.3) never has to re-query them.
     pub(crate) fn adopt_exportable(
         &mut self,
-        new_image: vk::Image,
-        new_memory: vk::DeviceMemory,
+        parts: crate::kms::vk::target::ExportableParts,
         new_sample_view: vk::ImageView,
         new_image_view: vk::ImageView,
-        new_layout: vk::ImageLayout,
-        export_stride: u32,
-        export_size: u64,
-        export_modifier: u64,
+        ownership: ForeignOwnership,
     ) -> RetiredImage {
         let retired = RetiredImage {
             image: self.image,
@@ -367,15 +486,19 @@ impl Storage {
             image_view: self.image_view,
             sample_view: self.sample_view,
         };
-        self.image = new_image;
-        self.memory = new_memory;
+        self.image = parts.image;
+        self.memory = parts.memory;
         self.image_view = new_image_view;
         self.sample_view = new_sample_view;
-        self.current_layout = new_layout;
+        self.current_layout = ownership.logical_layout;
+        self.foreign_shared = true;
+        self.foreign_released_from = ownership.released.then_some(ownership.logical_layout);
         self.promoted_exportable = true;
-        self.export_stride = export_stride;
-        self.export_size = export_size;
-        self.export_modifier = export_modifier;
+        self.export_stride = parts.stride;
+        self.export_size = parts.size;
+        self.export_modifier = parts.modifier;
+        self.export_offset = parts.offset;
+        self.export_dmabuf = parts.dmabuf;
         retired
     }
 
@@ -849,6 +972,13 @@ pub(crate) struct DrawableStore {
     /// by the deferred Present gate. Consumed by the next flush containing a
     /// write to that drawable; the flush still publishes its new WRITE fence.
     prewaited_exported_writes: std::collections::HashSet<DrawableId>,
+    /// Externally shared drawables (`Storage::foreign_shared`) touched since
+    /// the last submit-group flush; drained by [`Self::plan_foreign_transfers`].
+    foreign_touched: Vec<DrawableId>,
+    /// Externally shared drawables acquired by an earlier flush but not yet
+    /// released, because a frame or render batch that touched them was still
+    /// recording (its command buffer lands in a later submission).
+    foreign_held: Vec<DrawableId>,
     /// Counts the paints the scene composites (presentation damage) and
     /// scene-participation changes: whether a composed root readback is
     /// still current (`SceneCompositor::root_readback`).
@@ -868,6 +998,8 @@ impl DrawableStore {
             exported_sync: HashMap::new(),
             exported_writes: Vec::new(),
             prewaited_exported_writes: std::collections::HashSet::new(),
+            foreign_touched: Vec::new(),
+            foreign_held: Vec::new(),
             scene_damage_generation: 0,
             topology_generation: 0,
         }
@@ -1431,6 +1563,9 @@ impl DrawableStore {
     pub(crate) fn touch_render_fence(&mut self, id: DrawableId, ticket: FenceTicket) {
         if let Some(d) = self.entries.get_mut(&id) {
             d.last_render_ticket = Some(ticket);
+            if d.storage.foreign_shared {
+                self.foreign_touched.push(id);
+            }
         }
         // GLX-TFP (Task 2.3): every write stamps its destination here, so
         // this is the single point that catches ALL mutation paths
@@ -1440,6 +1575,72 @@ impl DrawableStore {
         if self.exported_sync.contains_key(&id) {
             self.exported_writes.push(id);
         }
+    }
+
+    /// Decide the queue-family ownership transfers for the submission a
+    /// submit-group flush is about to make, and record the resulting state.
+    ///
+    /// Every externally shared drawable touched since the last flush is
+    /// acquired (if it is released) by a barrier ahead of the group's
+    /// command buffers. Then every shared drawable yserver owns is released
+    /// back to the foreign queue family after them — unless
+    /// `recording_open`: a frame or render batch still recording may have
+    /// touched it, and its command buffer will land in a later submission,
+    /// so those stay owned (`foreign_held`) until a flush with nothing open.
+    pub(crate) fn plan_foreign_transfers(&mut self, recording_open: bool) -> ForeignTransfers {
+        let mut transfers = ForeignTransfers::default();
+        if self.foreign_touched.is_empty() && self.foreign_held.is_empty() {
+            return transfers;
+        }
+        let mut owned: Vec<DrawableId> = std::mem::take(&mut self.foreign_held);
+        for id in std::mem::take(&mut self.foreign_touched) {
+            if owned.contains(&id) {
+                continue;
+            }
+            let Some(d) = self.entries.get_mut(&id) else {
+                continue;
+            };
+            if let Some(layout) = d.storage.foreign_released_from.take() {
+                transfers.acquires.push((d.storage.image, layout));
+            }
+            owned.push(id);
+        }
+        if recording_open {
+            self.foreign_held = owned;
+            return transfers;
+        }
+        for id in owned {
+            let Some(d) = self.entries.get_mut(&id) else {
+                continue;
+            };
+            if d.storage.foreign_shared && d.storage.foreign_released_from.is_none() {
+                let layout = d.storage.current_layout;
+                transfers.releases.push((d.storage.image, layout));
+                d.storage.foreign_released_from = Some(layout);
+            }
+        }
+        transfers
+    }
+
+    /// Released shared images among `sampled` that a scene compose command
+    /// buffer must acquire before sampling and release after, as
+    /// `(image, layout)`. State is unchanged: the image is released again by
+    /// the end of that command buffer. Images yserver currently holds are
+    /// skipped (no transfer needed).
+    pub(crate) fn foreign_sampled_images(
+        &self,
+        sampled: &[DrawableId],
+    ) -> Vec<(vk::Image, vk::ImageLayout)> {
+        let mut out: Vec<(vk::Image, vk::ImageLayout)> = Vec::new();
+        for id in sampled {
+            if let Some(d) = self.entries.get(id)
+                && let Some(layout) = d.storage.foreign_released_from
+                && !out.iter().any(|(image, _)| *image == d.storage.image)
+            {
+                out.push((d.storage.image, layout));
+            }
+        }
+        out
     }
 
     /// Sweep `pending_retire`. Drawables whose ticket has
@@ -1586,6 +1787,171 @@ mod tests {
         live.subtract(&submitted);
 
         assert_eq!(live.rects(), &[full]);
+    }
+
+    fn shared_pixmap(s: &mut DrawableStore, xid: u32, image: u64) -> DrawableId {
+        use ash::vk::Handle as _;
+        let id = s
+            .allocate(xid, DrawableKind::Pixmap, 32, false, stub_storage())
+            .expect("allocate");
+        let d = s.get_mut(id).expect("get");
+        let _retired = d.storage.adopt_exportable(
+            crate::kms::vk::target::ExportableParts {
+                image: vk::Image::from_raw(image),
+                memory: vk::DeviceMemory::null(),
+                stride: 64,
+                offset: 0,
+                size: 1024,
+                modifier: 0,
+                dmabuf: None,
+            },
+            vk::ImageView::null(),
+            vk::ImageView::null(),
+            ForeignOwnership {
+                logical_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                released: true,
+            },
+        );
+        id
+    }
+
+    #[test]
+    fn promotion_leaves_storage_shared_and_released_for_its_first_export() {
+        let mut s = DrawableStore::new();
+        let id = shared_pixmap(&mut s, 0x10, 7);
+        let st = &s.get(id).expect("get").storage;
+        assert!(st.is_exportable(), "promotion is not repeated");
+        assert!(st.foreign_shared);
+        assert_eq!(
+            st.current_layout,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            "tracking keeps the terminal layout"
+        );
+        assert_eq!(
+            st.foreign_released_from,
+            Some(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        );
+        assert_eq!((st.export_stride, st.export_size), (64, 1024));
+    }
+
+    #[test]
+    fn imported_client_storage_is_exportable_so_never_promoted_or_shared() {
+        let mut st = stub_storage();
+        assert!(!st.is_exportable());
+        st.promoted_exportable = true;
+        assert!(st.is_exportable());
+        assert!(!st.foreign_shared, "only adopt_exportable marks sharing");
+    }
+
+    #[test]
+    fn touched_shared_drawable_is_acquired_then_released_in_one_submission() {
+        use ash::vk::Handle as _;
+        let mut s = DrawableStore::new();
+        let id = shared_pixmap(&mut s, 0x10, 7);
+        let plain = s
+            .allocate(0x11, DrawableKind::Pixmap, 32, false, stub_storage())
+            .expect("allocate");
+        s.touch_render_fence(id, FenceTicket::for_tests_stub());
+        s.touch_render_fence(id, FenceTicket::for_tests_stub());
+        s.touch_render_fence(plain, FenceTicket::for_tests_stub());
+        let t = s.plan_foreign_transfers(false);
+        let sr = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        assert_eq!(t.acquires, vec![(vk::Image::from_raw(7), sr)]);
+        assert_eq!(t.releases, vec![(vk::Image::from_raw(7), sr)]);
+        assert_eq!(
+            s.get(id).expect("get").storage.foreign_released_from,
+            Some(sr)
+        );
+        assert!(s.plan_foreign_transfers(false).is_empty(), "drained");
+    }
+
+    #[test]
+    fn open_recording_holds_the_image_until_a_flush_with_nothing_open() {
+        use ash::vk::Handle as _;
+        let mut s = DrawableStore::new();
+        let id = shared_pixmap(&mut s, 0x10, 7);
+        s.touch_render_fence(id, FenceTicket::for_tests_stub());
+        let t = s.plan_foreign_transfers(true);
+        assert_eq!(t.acquires.len(), 1);
+        assert!(t.releases.is_empty());
+        assert_eq!(s.get(id).expect("get").storage.foreign_released_from, None);
+        // Held: a compose meanwhile must not transfer it.
+        assert!(s.foreign_sampled_images(&[id]).is_empty());
+        // Touched again while held: no second acquire.
+        s.touch_render_fence(id, FenceTicket::for_tests_stub());
+        let t = s.plan_foreign_transfers(false);
+        assert!(t.acquires.is_empty());
+        assert_eq!(
+            t.releases,
+            vec![(
+                vk::Image::from_raw(7),
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+            )]
+        );
+    }
+
+    #[test]
+    fn release_uses_the_layout_the_submission_left() {
+        let mut s = DrawableStore::new();
+        let id = shared_pixmap(&mut s, 0x10, 7);
+        s.touch_render_fence(id, FenceTicket::for_tests_stub());
+        s.get_mut(id).expect("get").storage.current_layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+        let t = s.plan_foreign_transfers(false);
+        assert_eq!(t.releases[0].1, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        s.touch_render_fence(id, FenceTicket::for_tests_stub());
+        let t = s.plan_foreign_transfers(false);
+        assert_eq!(
+            t.acquires[0].1,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            "the acquire restores what the release left"
+        );
+    }
+
+    #[test]
+    fn compose_transfers_only_released_images_once_each() {
+        use ash::vk::Handle as _;
+        let mut s = DrawableStore::new();
+        let a = shared_pixmap(&mut s, 0x10, 7);
+        let b = shared_pixmap(&mut s, 0x11, 8);
+        let plain = s
+            .allocate(0x12, DrawableKind::Pixmap, 32, false, stub_storage())
+            .expect("allocate");
+        let got = s.foreign_sampled_images(&[a, plain, b, a]);
+        let sr = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        assert_eq!(
+            got,
+            vec![(vk::Image::from_raw(7), sr), (vk::Image::from_raw(8), sr)]
+        );
+    }
+
+    #[test]
+    fn ownership_barriers_hand_the_image_over_in_general() {
+        use ash::vk::Handle as _;
+        let image = vk::Image::from_raw(7);
+        let foreign = foreign_queue_family(true);
+        assert_eq!(foreign, vk::QUEUE_FAMILY_FOREIGN_EXT);
+        assert_eq!(foreign_queue_family(false), vk::QUEUE_FAMILY_EXTERNAL);
+        let sr = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        let acq = foreign_acquire_barrier(image, sr, 0, foreign);
+        assert_eq!(
+            (acq.src_queue_family_index, acq.dst_queue_family_index),
+            (foreign, 0)
+        );
+        assert_eq!(
+            (acq.old_layout, acq.new_layout),
+            (vk::ImageLayout::GENERAL, sr)
+        );
+        let rel = foreign_release_barrier(image, sr, 0, foreign);
+        assert_eq!(
+            (rel.src_queue_family_index, rel.dst_queue_family_index),
+            (0, foreign)
+        );
+        assert_eq!(
+            (rel.old_layout, rel.new_layout),
+            (sr, vk::ImageLayout::GENERAL)
+        );
+        assert!(rel.src_access_mask.contains(vk::AccessFlags2::MEMORY_WRITE));
+        assert_eq!(rel.image, image);
     }
 
     #[test]

@@ -2477,6 +2477,18 @@ impl RenderEngine {
         } else {
             Vec::new()
         };
+        // Externally shared images: acquire from / release to the foreign
+        // queue family around this submission's command buffers.
+        if platform.submit_group_size() > 0 {
+            let recording_open = self
+                .inner
+                .as_ref()
+                .is_some_and(|i| i.frame_builder.is_open() || i.pending_render_batch.is_some());
+            let transfers = store.plan_foreign_transfers(recording_open);
+            if !transfers.is_empty() {
+                self.bracket_foreign_transfers(platform, &transfers);
+            }
+        }
         let exported_borrows: Vec<(std::os::fd::BorrowedFd<'_>, bool)> = {
             use std::os::fd::AsFd as _;
             exported
@@ -2512,6 +2524,75 @@ impl RenderEngine {
                 // Arc clones drop together.
                 inner.pending_group_ops.clear();
                 Err(e)
+            }
+        }
+    }
+
+    /// Record `transfers` into an acquire and a release command buffer and
+    /// bracket the open submit group with them, so they execute first and
+    /// last in the submission being flushed. Both retire with the group's
+    /// ticket like any other op. A recording failure is logged and the
+    /// transfers are dropped: the drawable state already records them, so
+    /// the next submission's barriers still name the right layouts.
+    fn bracket_foreign_transfers(
+        &mut self,
+        platform: &mut PlatformBackend,
+        transfers: &super::store::ForeignTransfers,
+    ) {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        let graphics = inner.vk.graphics_queue_family;
+        let foreign = super::store::foreign_queue_family(inner.vk.queue_family_foreign);
+        let acquires: Vec<_> = transfers
+            .acquires
+            .iter()
+            .map(|&(image, layout)| {
+                super::store::foreign_acquire_barrier(image, layout, graphics, foreign)
+            })
+            .collect();
+        let releases: Vec<_> = transfers
+            .releases
+            .iter()
+            .map(|&(image, layout)| {
+                super::store::foreign_release_barrier(image, layout, graphics, foreign)
+            })
+            .collect();
+        let mut record = |barriers: &[vk::ImageMemoryBarrier2<'static>]| {
+            if barriers.is_empty() {
+                return Ok(None);
+            }
+            let (cb, ticket) = begin_op_cb(inner, platform)?;
+            let dep = vk::DependencyInfo::default().image_memory_barriers(barriers);
+            unsafe {
+                inner.vk.device.cmd_pipeline_barrier2(cb, &dep);
+                inner.vk.device.end_command_buffer(cb)?;
+            }
+            inner.pending_group_ops.push(SubmittedOp {
+                cb,
+                ticket,
+                staging: None,
+                scratch: Vec::new(),
+                sampled_scratch: Vec::new(),
+                atlas_ticket: None,
+                generation: 0,
+                retired_resources: Vec::new(),
+            });
+            Ok::<_, RenderError>(Some(cb))
+        };
+        let acquire = record(&acquires);
+        let release = record(&releases);
+        match (acquire, release) {
+            (Ok(acquire), Ok(release)) => platform.submit_group_bracket(acquire, release),
+            (acquire, release) => {
+                log::warn!(
+                    "foreign ownership: recording {} acquire / {} release barriers failed; \
+                     submitting without them",
+                    acquires.len(),
+                    releases.len()
+                );
+                // Keep whichever recorded: its SubmittedOp is already parked.
+                platform.submit_group_bracket(acquire.ok().flatten(), release.ok().flatten());
             }
         }
     }
@@ -3855,9 +3936,16 @@ impl RenderEngine {
         let exp =
             crate::kms::vk::target::allocate_exportable(&vk, extent.width, extent.height, format)?;
 
-        // (b)+(c) copy old content → new image, block until complete.
+        // (b)+(c) copy old content → new image, block until complete. The
+        //     copy ends by releasing the image to the foreign queue family
+        //     in GENERAL — it is about to be exported — while yserver's
+        //     layout tracking records the terminal SHADER_READ_ONLY_OPTIMAL
+        //     that the first acquire restores.
         self.copy_image_blocking(platform, old_image, old_layout, exp.image, extent)?;
-        let new_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        let ownership = super::store::ForeignOwnership {
+            logical_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            released: true,
+        };
 
         // (d) build new views (same depth-aware swizzle the store uses).
         let sample_view = PlatformBackend::build_sample_view(&vk, exp.image, format, depth)?;
@@ -3878,24 +3966,16 @@ impl RenderEngine {
         //     but cheap to make leak-proof.
         let retired = {
             let d = store.get_mut(id).ok_or(RenderError::UnknownDrawable(id))?;
-            let (exp_image, exp_memory, exp_stride, exp_size, exp_modifier) = exp.into_raw_parts();
+            let parts = exp.into_raw_parts();
             // A promoted redirect backing stays distinguishable from other exports.
             crate::kms::vk::mem_accounting::recategorise(
-                exp_memory,
+                parts.memory,
                 crate::kms::vk::mem_accounting::export_category_for(
                     crate::kms::vk::mem_accounting::category_of(d.storage.memory),
                 ),
             );
-            d.storage.adopt_exportable(
-                exp_image,
-                exp_memory,
-                sample_view,
-                image_view,
-                new_layout,
-                exp_stride,
-                exp_size,
-                exp_modifier,
-            )
+            d.storage
+                .adopt_exportable(parts, sample_view, image_view, ownership)
         };
 
         // (f) invalidate the view cache for this DrawableId.
@@ -3914,7 +3994,8 @@ impl RenderEngine {
     ///   - `src`: `src_layout` → `TRANSFER_SRC_OPTIMAL`
     ///   - `dst`: `UNDEFINED` → `TRANSFER_DST_OPTIMAL`
     ///   - `vkCmdCopyImage` (full `extent`, COLOR, 1 mip / 1 layer)
-    ///   - `dst`: `TRANSFER_DST_OPTIMAL` → `SHADER_READ_ONLY_OPTIMAL`
+    ///   - `dst`: `TRANSFER_DST_OPTIMAL` → `GENERAL`, released to the foreign
+    ///     queue family (the image is exported next)
     ///
     /// Promotion is rare (once per pixmap, on first GLX bind), so a
     /// dedicated fence wait is acceptable.
@@ -3990,15 +4071,15 @@ impl RenderEngine {
                 );
             }
 
-            let post = [vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::COPY)
-                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .image(dst)
-                .subresource_range(full_range)];
+            // Release the new (external) image to the foreign queue family.
+            let post = [super::store::foreign_release_barrier(
+                dst,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk.graphics_queue_family,
+                super::store::foreign_queue_family(vk.queue_family_foreign),
+            )
+            .src_stage_mask(vk::PipelineStageFlags2::COPY)
+            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)];
             let dep = vk::DependencyInfo::default().image_memory_barriers(&post);
             unsafe { vk.device.cmd_pipeline_barrier2(cb, &dep) };
             Ok(())

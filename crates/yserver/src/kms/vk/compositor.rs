@@ -97,4 +97,9 @@ pub struct CompositeScene {
     /// first, then visible windows + descendants depth-first, then
     /// cursor last.
     pub draws: Vec<CompositeDraw>,
+    /// Sampled images shared with a foreign consumer and currently released
+    /// to it, as `(image, layout yserver tracks)`: the compose command buffer
+    /// acquires them before its draws and releases them after. Empty except
+    /// for promoted (dma-buf exported) backings; filled just before compose.
+    pub foreign_images: Vec<(vk::Image, vk::ImageLayout)>,
 }

@@ -119,6 +119,24 @@ impl SubmitGroup {
         self.entries.push(GroupEntry { cb, signal });
     }
 
+    /// Bracket the buffered entries with queue-family ownership command
+    /// buffers: `acquire` runs before every buffered entry and `release`
+    /// after, inside the same submission. Called by the flush right before
+    /// [`Self::take`]; ignores the size cap (the bracket is part of the
+    /// submission being flushed, not new work).
+    pub(crate) fn bracket(
+        &mut self,
+        acquire: Option<vk::CommandBuffer>,
+        release: Option<vk::CommandBuffer>,
+    ) {
+        if let Some(cb) = acquire {
+            self.entries.insert(0, GroupEntry { cb, signal: None });
+        }
+        if let Some(cb) = release {
+            self.entries.push(GroupEntry { cb, signal: None });
+        }
+    }
+
     /// Take all buffered entries + the shared ticket, leaving the
     /// group empty. Caller (PlatformBackend::flush_submit_group)
     /// performs the `vkQueueSubmit2` against the returned data.
@@ -160,6 +178,20 @@ mod tests {
         assert_eq!(entries[0].signal, None);
         assert_eq!(entries[1].cb, fake_cb(22));
         assert_eq!(entries[1].signal, Some(fake_sem(99)));
+    }
+
+    #[test]
+    fn bracket_puts_acquire_first_and_release_last() {
+        let mut g = SubmitGroup::new();
+        g.append(fake_cb(11), None);
+        g.append(fake_cb(22), Some(fake_sem(99)));
+        g.bracket(Some(fake_cb(1)), Some(fake_cb(2)));
+        let cbs: Vec<_> = g.peek_entries().iter().map(|e| e.cb).collect();
+        assert_eq!(cbs, [fake_cb(1), fake_cb(11), fake_cb(22), fake_cb(2)]);
+        // The signal stays on the entry that carried it.
+        assert_eq!(g.peek_entries()[2].signal, Some(fake_sem(99)));
+        g.bracket(None, None);
+        assert_eq!(g.size(), 4);
     }
 
     #[test]

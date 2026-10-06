@@ -1981,6 +1981,27 @@ fn glx_vendor_names_for_driver(driver_id: ash::vk::DriverId) -> &'static str {
     }
 }
 
+/// Export a promoted storage's backing: a dup of the GBM buffer object's
+/// dma-buf when it has one, else `vkGetMemoryFdKHR` on its memory.
+fn export_promoted_storage(
+    vk: &crate::kms::vk::device::VkContext,
+    storage: &crate::kms::render::store::Storage,
+) -> Result<crate::kms::vk::dri3::DmabufExport, ash::vk::Result> {
+    use std::os::fd::AsFd as _;
+    crate::kms::vk::dri3::export_promoted(
+        vk,
+        storage.memory,
+        storage
+            .export_dmabuf
+            .as_ref()
+            .map(std::os::fd::OwnedFd::as_fd),
+        storage.export_stride,
+        storage.export_offset,
+        storage.export_size,
+        storage.export_modifier,
+    )
+}
+
 fn probe_dmabuf_export_support(vk: &std::sync::Arc<crate::kms::vk::device::VkContext>) -> bool {
     use crate::kms::vk::{
         dri3::export_backing,
@@ -6514,23 +6535,15 @@ impl KmsBackend {
             .vk
             .as_ref()
             .ok_or_else(|| io::Error::other("promote: no VkContext"))?;
-        let (memory, stride, size, modifier) = {
-            let d = self
-                .store
-                .get(id)
-                .ok_or_else(|| io::Error::other("promote: drawable vanished"))?;
-            (
-                d.storage.memory,
-                d.storage.export_stride,
-                d.storage.export_size,
-                d.storage.export_modifier,
-            )
-        };
+        let d = self
+            .store
+            .get(id)
+            .ok_or_else(|| io::Error::other("promote: drawable vanished"))?;
         // Export the promoted memory directly (the Storage now owns the
         // exportable image's handles; we don't have the ExportableImage
-        // wrapper any more, so build the export from the raw memory handle
-        // + the stride/size/modifier adopt_exportable stored).
-        crate::kms::vk::dri3::export_promoted(vk, memory, stride, size, modifier)
+        // wrapper any more, so build the export from what adopt_exportable
+        // stored).
+        export_promoted_storage(vk, &d.storage)
             .map_err(|e| io::Error::other(format!("export_promoted: {e:?}")))
     }
 
@@ -29856,14 +29869,8 @@ impl Backend for KmsBackend {
                 drawable.storage.export_stride,
                 drawable.storage.export_size,
             );
-            crate::kms::vk::dri3::export_promoted(
-                vk,
-                drawable.storage.memory,
-                drawable.storage.export_stride,
-                drawable.storage.export_size,
-                drawable.storage.export_modifier,
-            )
-            .map_err(|e| io::Error::other(format!("DRI3 export_promoted: {e:?}")))?
+            export_promoted_storage(vk, &drawable.storage)
+                .map_err(|e| io::Error::other(format!("DRI3 export_promoted: {e:?}")))?
         };
 
         // GLX-TFP (Tasks 2.3 + 2.4): record/refresh the export tracking

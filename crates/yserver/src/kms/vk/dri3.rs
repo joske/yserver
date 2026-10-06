@@ -391,9 +391,9 @@ pub struct DmabufExport {
     pub fd: std::os::fd::OwnedFd,
     pub size: u32,
     pub stride: u32,
-    /// Byte offset of plane 0 in the dma-buf. Always 0 for yserver's
-    /// single-plane, dedicated-allocation exports; carried so the
-    /// `BuffersFromPixmap` (op 8) reply can report it per-plane.
+    /// Byte offset of plane 0 in the dma-buf, as the allocator laid it out
+    /// (GBM may place it past 0); the `BuffersFromPixmap` (op 8) reply
+    /// reports it per-plane.
     pub offset: u32,
     /// DRM format modifier of the exported buffer. `DRM_FORMAT_MOD_LINEAR`
     /// (0) for LINEAR-tiled exports; the driver-chosen modifier for the
@@ -413,22 +413,16 @@ pub fn export_backing(
     vk: &VkContext,
     img: &super::target::ExportableImage,
 ) -> Result<DmabufExport, vk::Result> {
-    let ext = vk
-        .external_memory_fd
-        .as_ref()
-        .ok_or(vk::Result::ERROR_EXTENSION_NOT_PRESENT)?;
-    let info = vk::MemoryGetFdInfoKHR::default()
-        .memory(img.memory)
-        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-    let raw_fd = unsafe { ext.get_memory_fd(&info)? };
-    let fd = super::owned_fd_from_vk(raw_fd, "vkGetMemoryFdKHR(DMA_BUF) export_backing")?;
-    Ok(DmabufExport {
-        fd,
-        size: u32::try_from(img.size).unwrap_or(u32::MAX),
-        stride: img.stride,
-        offset: 0,
-        modifier: img.modifier,
-    })
+    use std::os::fd::AsFd as _;
+    export_promoted(
+        vk,
+        img.memory,
+        img.dmabuf.as_ref().map(std::os::fd::OwnedFd::as_fd),
+        img.stride,
+        img.offset,
+        img.size,
+        img.modifier,
+    )
 }
 
 /// Export a promoted pixmap's exportable memory as a fresh dma-buf fd.
@@ -436,31 +430,42 @@ pub fn export_backing(
 /// GLX-TFP (Task 1.2/1.3): once a pixmap has been promoted onto
 /// exportable storage, its raw `vk::DeviceMemory` handle lives on the
 /// `Storage` (the `ExportableImage` wrapper was decomposed via
-/// `into_raw_parts`), and the `stride`/`size` were captured at
-/// allocation time. This exports that memory directly without
-/// reconstructing an `ExportableImage`. Requires
-/// `VK_KHR_external_memory_fd`.
+/// `into_raw_parts`), and the layout was captured at allocation time.
+///
+/// GBM-allocated storage (`dmabuf` is `Some`) exports a dup of the buffer
+/// object's own dma-buf: its memory was imported, not allocated with
+/// `VkExportMemoryAllocateInfo`, so `vkGetMemoryFdKHR` is not valid on it.
+/// Vulkan-allocated storage exports through `vkGetMemoryFdKHR`, which
+/// requires `VK_KHR_external_memory_fd`.
 pub fn export_promoted(
     vk: &VkContext,
     memory: vk::DeviceMemory,
+    dmabuf: Option<std::os::fd::BorrowedFd<'_>>,
     stride: u32,
+    offset: u64,
     size: u64,
     modifier: u64,
 ) -> Result<DmabufExport, vk::Result> {
-    let ext = vk
-        .external_memory_fd
-        .as_ref()
-        .ok_or(vk::Result::ERROR_EXTENSION_NOT_PRESENT)?;
-    let info = vk::MemoryGetFdInfoKHR::default()
-        .memory(memory)
-        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-    let raw_fd = unsafe { ext.get_memory_fd(&info)? };
-    let fd = super::owned_fd_from_vk(raw_fd, "vkGetMemoryFdKHR(DMA_BUF) export_promoted")?;
+    let fd = if let Some(dmabuf) = dmabuf {
+        dmabuf
+            .try_clone_to_owned()
+            .map_err(|_| vk::Result::ERROR_TOO_MANY_OBJECTS)?
+    } else {
+        let ext = vk
+            .external_memory_fd
+            .as_ref()
+            .ok_or(vk::Result::ERROR_EXTENSION_NOT_PRESENT)?;
+        let info = vk::MemoryGetFdInfoKHR::default()
+            .memory(memory)
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let raw_fd = unsafe { ext.get_memory_fd(&info)? };
+        super::owned_fd_from_vk(raw_fd, "vkGetMemoryFdKHR(DMA_BUF) export_promoted")?
+    };
     Ok(DmabufExport {
         fd,
         size: u32::try_from(size).unwrap_or(u32::MAX),
         stride,
-        offset: 0,
+        offset: u32::try_from(offset).unwrap_or(u32::MAX),
         modifier,
     })
 }
