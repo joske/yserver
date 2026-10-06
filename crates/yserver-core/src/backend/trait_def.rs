@@ -980,6 +980,15 @@ pub trait Backend {
     /// Immediate-rendering backends keep the default no-op.
     fn flush_before_damage_notify(&mut self) {}
 
+    /// #100: a flag the backend keeps set while a GPU write to a
+    /// dma-buf-exported drawable is recorded but not yet submitted with its
+    /// export write fence. The core holds a DamageNotify's client output
+    /// while it is set, until [`Self::flush_before_damage_notify`] ran.
+    /// Default: `None` (immediate-rendering backends never defer).
+    fn export_writes_pending_flag(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        None
+    }
+
     /// Diagnostic (#100): the DamageNotify events sent since the last
     /// damage boundary, handed over just before
     /// [`Self::flush_before_damage_notify`]. Default: ignored.

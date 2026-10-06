@@ -1141,6 +1141,20 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   (`export allocator: amdgpu export BO flags=… explicit_sync=…`). Client
   PixmapFromBuffer imports are untouched.
 
+  *DamageNotify ahead of the fence (HW untested).* `damage_fence_probe`
+  (df6110fb) measured every DamageNotify about an exported drawable reaching
+  the compositor's socket before the write it announces was submitted with its
+  export fence. Xorg only flushes client output in `FlushAllOutput`, after the
+  BlockHandler's glamor flush. Now, while the store's `export_writes_pending`
+  flag is set, the DamageNotify owner's whole output tail is held in
+  `outbound` (`ClientState::output_held`, so event/reply order is untouched)
+  until `run::damage_notify_barrier` has run `flush_before_damage_notify`
+  (render batch, frame close, then submit group) — at each request end, the
+  iteration tail and every `settle_client_output` pass. An fd-carrying reply
+  releases the hold early. A submit-group flush while a frame/render batch
+  is still recording no longer counts as publishing that recording's exported
+  writes (they stay pending, so the flush that submits them publishes again).
+
 - **2026-09-10 #138 Chrome hardware-decoded video scrambled — FIXED, hardware
   confirmed:** ads, video and fullscreen all correct on silence (RX 6800,
   Mesa 26.2.2, Chromium, AV1 via `VaapiVideoDecoder`). Two server-side lies,

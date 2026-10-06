@@ -2472,18 +2472,18 @@ impl RenderEngine {
         // recorded exported writes and the eventual real submit would skip
         // their wait/publish. Leaving them queued lets the next non-empty
         // flush pick them up.
+        let recording_open = self
+            .inner
+            .as_ref()
+            .is_some_and(|i| i.frame_builder.is_open() || i.pending_render_batch.is_some());
         let exported = if platform.submit_group_size() > 0 {
-            store.take_exported_writes()
+            store.take_exported_writes(recording_open)
         } else {
             Vec::new()
         };
         // Externally shared images: acquire from / release to the foreign
         // queue family around this submission's command buffers.
         if platform.submit_group_size() > 0 {
-            let recording_open = self
-                .inner
-                .as_ref()
-                .is_some_and(|i| i.frame_builder.is_open() || i.pending_render_batch.is_some());
             let transfers = store.plan_foreign_transfers(recording_open);
             if !transfers.is_empty() {
                 self.bracket_foreign_transfers(platform, &transfers);

@@ -9382,6 +9382,12 @@ fn send_reply_with_fd(
             "file descriptor passing is unavailable on this transport",
         ));
     }
+    // An fd cannot ride the outbound queue, so a damage barrier cannot
+    // hold this reply: release the held tail ahead of it, in order.
+    if client.output_held {
+        log::debug!("fd reply releases a damage-barrier hold early");
+        client.output_held = false;
+    }
     // Drain whatever's pending so the SCM_RIGHTS frame lands in order.
     while !client.outbound.is_empty() {
         match client_io::drain_outbound(client)? {
@@ -36404,6 +36410,7 @@ mod tests {
                 outbound: VecDeque::new(),
                 watching_writable: false,
                 write_failed: false,
+                output_held: false,
                 focused_window: ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,

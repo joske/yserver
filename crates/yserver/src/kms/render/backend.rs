@@ -22149,8 +22149,19 @@ impl Backend for KmsBackend {
 
     fn flush_before_damage_notify(&mut self) {
         // A compositor may sample a redirected backing as soon as it receives
-        // DamageNotify. Close+submit the frame first so dma-buf implicit sync
-        // contains the producer fence before the notification is observable.
+        // DamageNotify, so every write it announces must be submitted with
+        // its export write fence on the dma-buf first (#100; Xorg: glamor's
+        // BlockHandler glFlush before FlushAllOutput). Pending render-batch
+        // CBs go before the frame, as for a non-ported op; the frame close
+        // flushes the group; a write recorded outside a frame (per-op CBs
+        // parked in the group) needs the explicit flush.
+        if let Err(error) = self.engine.flush_render_batch(
+            &mut self.store,
+            &mut self.platform,
+            crate::kms::render::engine::RenderFlushReason::Other,
+        ) {
+            log::warn!("render DamageNotify render-batch flush failed: {error:?}");
+        }
         if let Err(error) = self.engine.close_open_frame(
             &mut self.store,
             &mut self.platform,
@@ -22158,6 +22169,19 @@ impl Backend for KmsBackend {
         ) {
             log::warn!("render DamageNotify submission boundary failed: {error:?}");
         }
+        if self.store.has_unpublished_export_writes()
+            && let Err(error) = self.engine.flush_submit_group(
+                &mut self.store,
+                &mut self.platform,
+                crate::kms::render::submit_group::FlushReason::SyncBoundary,
+            )
+        {
+            log::warn!("render DamageNotify submit-group flush failed: {error:?}");
+        }
+    }
+
+    fn export_writes_pending_flag(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        Some(self.store.export_writes_pending_flag())
     }
 
     fn next_wakeup(&self) -> Option<std::time::Instant> {
@@ -32262,6 +32286,7 @@ mod tests {
                     outbound: VecDeque::new(),
                     watching_writable: false,
                     write_failed: false,
+                    output_held: false,
                     focused_window: yserver_core::resources::ROOT_WINDOW,
                     reader_control: None,
                 },
@@ -32794,6 +32819,7 @@ mod tests {
                     outbound: VecDeque::new(),
                     watching_writable: false,
                     write_failed: false,
+                    output_held: false,
                     focused_window: yserver_core::resources::ROOT_WINDOW,
                     reader_control: None,
                 },
@@ -33052,6 +33078,7 @@ mod tests {
                     outbound: VecDeque::new(),
                     watching_writable: false,
                     write_failed: false,
+                    output_held: false,
                     focused_window: yserver_core::resources::ROOT_WINDOW,
                     reader_control: None,
                 },
@@ -33299,6 +33326,7 @@ mod tests {
                     outbound: VecDeque::new(),
                     watching_writable: false,
                     write_failed: false,
+                    output_held: false,
                     focused_window: yserver_core::resources::ROOT_WINDOW,
                     reader_control: None,
                 },
@@ -33816,6 +33844,7 @@ mod tests {
                     outbound: VecDeque::new(),
                     watching_writable: false,
                     write_failed: false,
+                    output_held: false,
                     focused_window: yserver_core::resources::ROOT_WINDOW,
                     reader_control: None,
                 },
@@ -37958,6 +37987,7 @@ mod tests {
                 outbound: VecDeque::new(),
                 watching_writable: false,
                 write_failed: false,
+                output_held: false,
                 focused_window: yserver_core::resources::ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -40548,6 +40578,7 @@ mod tests {
                 outbound: VecDeque::new(),
                 watching_writable: false,
                 write_failed: false,
+                output_held: false,
                 focused_window: yserver_core::resources::ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -59835,6 +59866,7 @@ mod tests {
                 outbound: VecDeque::new(),
                 watching_writable: false,
                 write_failed: false,
+                output_held: false,
                 focused_window: ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -65241,6 +65273,7 @@ mod tests {
                 outbound: VecDeque::new(),
                 watching_writable: false,
                 write_failed: false,
+                output_held: false,
                 focused_window: yserver_core::resources::ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,

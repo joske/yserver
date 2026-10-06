@@ -53,8 +53,27 @@ pub fn write_or_buffer(client: &mut ClientState, bytes: &[u8]) -> io::Result<Wri
     if client.write_failed {
         return Ok(WriteOutcome::Disconnect);
     }
-    let outcome = write_or_buffer_inner(client, bytes);
+    let outcome = if client.output_held {
+        Ok(buffer_or_disconnect(client, bytes))
+    } else {
+        write_or_buffer_inner(client, bytes)
+    };
     note_failure(client, outcome)
+}
+
+/// Hold `client`'s output behind a damage barrier (#100): everything
+/// written from now on, and anything already queued, stays in `outbound`
+/// until [`release_output`]. Holding the whole tail, not one event, keeps
+/// the client's events, replies and errors in generation order.
+pub fn hold_output(client: &mut ClientState) {
+    client.output_held = true;
+}
+
+/// Lift [`hold_output`] and push the held bytes toward the socket. A
+/// failure marks the client `write_failed`, as any other write does.
+pub fn release_output(client: &mut ClientState) -> io::Result<WriteOutcome> {
+    client.output_held = false;
+    drain_outbound(client)
 }
 
 /// Clients whose writes failed and that the core loop must disconnect.
@@ -138,6 +157,13 @@ pub fn drain_outbound(client: &mut ClientState) -> io::Result<WriteOutcome> {
     if client.write_failed {
         return Ok(WriteOutcome::Disconnect);
     }
+    if client.output_held {
+        return Ok(if client.outbound.is_empty() {
+            WriteOutcome::Done
+        } else {
+            WriteOutcome::WouldBlock
+        });
+    }
     let outcome = drain_outbound_inner(client);
     note_failure(client, outcome)
 }
@@ -216,6 +242,7 @@ mod tests {
             outbound: VecDeque::new(),
             watching_writable: false,
             write_failed: false,
+            output_held: false,
             focused_window: ResourceId(0),
             reader_control: None,
             is_local: true,

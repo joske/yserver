@@ -1030,6 +1030,16 @@ pub struct PresentWindowMsc {
     pub last_raw_msc: u64,
 }
 
+/// Diagnostic (#100): one DamageNotify awaiting classification. `held`
+/// events have their wire time stamped when the damage barrier releases
+/// the owner's output.
+#[derive(Debug, Clone, Copy)]
+pub struct DamageNotifyProbeEntry {
+    pub client: yserver_protocol::x11::ClientId,
+    pub held: bool,
+    pub probe: crate::backend::DamageNotifyProbe,
+}
+
 #[derive(Debug)]
 pub struct ServerState {
     pub atoms: AtomTable,
@@ -1270,7 +1280,14 @@ pub struct ServerState {
     pub damage_notify_flush_pending: bool,
     /// Diagnostic (#100): DamageNotify events sent since the last damage
     /// boundary; drained to the backend just before that boundary.
-    pub damage_notify_probes: Vec<crate::backend::DamageNotifyProbe>,
+    pub damage_notify_probes: Vec<DamageNotifyProbeEntry>,
+    /// Set by the backend while a GPU write to a dma-buf-exported drawable
+    /// is recorded but its export write fence is not yet published. `None`
+    /// for backends that render immediately.
+    pub export_writes_pending: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Clients whose output a DamageNotify holds until the damage barrier
+    /// publishes the writes it announces (#100).
+    pub damage_held_clients: Vec<yserver_protocol::x11::ClientId>,
     pub composite_redirects: crate::composite_redirects::CompositeRedirects,
     pub present_event_selections: HashMap<u32, PresentEventSelection>,
     /// `PresentNotifyMSC` requests parked for a future MSC, fired when a
@@ -1810,6 +1827,8 @@ impl ServerState {
             damage_objects: HashMap::new(),
             damage_notify_flush_pending: false,
             damage_notify_probes: Vec::new(),
+            export_writes_pending: None,
+            damage_held_clients: Vec::new(),
             composite_redirects: crate::composite_redirects::CompositeRedirects::default(),
             present_event_selections: HashMap::new(),
             present_pending_msc: Vec::new(),
@@ -3017,6 +3036,11 @@ pub struct ClientState {
     /// flagged client (`client_io::failed_writers`) and nothing more is
     /// written to it meanwhile.
     pub write_failed: bool,
+    /// Output is held behind a damage barrier (#100): a DamageNotify was
+    /// queued while the GPU writes it announces were still unsubmitted.
+    /// Writes append to `outbound` without touching the socket until
+    /// `client_io::release_output` runs after the backend publishes them.
+    pub output_held: bool,
     /// Window the client's pointer/key events route through; demoted off
     /// `Arc<Mutex<ResourceId>>` in D3.
     pub focused_window: ResourceId,
@@ -4621,6 +4645,7 @@ mod tests {
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 write_failed: false,
+                output_held: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -4644,6 +4669,7 @@ mod tests {
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 write_failed: false,
+                output_held: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -4675,6 +4701,7 @@ mod tests {
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 write_failed: false,
+                output_held: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -4703,6 +4730,7 @@ mod tests {
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 write_failed: false,
+                output_held: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -4745,6 +4773,7 @@ mod tests {
             outbound: std::collections::VecDeque::new(),
             watching_writable: false,
             write_failed: false,
+            output_held: false,
             focused_window: crate::resources::ROOT_WINDOW,
             reader_control: None,
             is_local: true,
@@ -4783,6 +4812,7 @@ mod tests {
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 write_failed: false,
+                output_held: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -4816,6 +4846,7 @@ mod tests {
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 write_failed: false,
+                output_held: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -4847,6 +4878,7 @@ mod tests {
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 write_failed: false,
+                output_held: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -4870,6 +4902,7 @@ mod tests {
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 write_failed: false,
+                output_held: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -4916,6 +4949,7 @@ mod tests {
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 write_failed: false,
+                output_held: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -4961,6 +4995,7 @@ mod tests {
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     write_failed: false,
+                    output_held: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
                     is_local: true,
@@ -5107,6 +5142,7 @@ mod tests {
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 write_failed: false,
+                output_held: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -5130,6 +5166,7 @@ mod tests {
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 write_failed: false,
+                output_held: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -5199,6 +5236,7 @@ mod tests {
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 write_failed: false,
+                output_held: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -5309,6 +5347,7 @@ mod tests {
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     write_failed: false,
+                    output_held: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
                     is_local: true,
@@ -5332,6 +5371,7 @@ mod tests {
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     write_failed: false,
+                    output_held: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
                     is_local: true,
@@ -5476,6 +5516,7 @@ mod tests {
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     write_failed: false,
+                    output_held: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
                     is_local: true,
@@ -5499,6 +5540,7 @@ mod tests {
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     write_failed: false,
+                    output_held: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
                     is_local: true,
@@ -5645,6 +5687,7 @@ mod tests {
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     write_failed: false,
+                    output_held: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
                     is_local: true,
@@ -5668,6 +5711,7 @@ mod tests {
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     write_failed: false,
+                    output_held: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
                     is_local: true,
@@ -5773,6 +5817,7 @@ mod tests {
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     write_failed: false,
+                    output_held: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
                     is_local: true,
@@ -5796,6 +5841,7 @@ mod tests {
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     write_failed: false,
+                    output_held: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
                     is_local: true,
@@ -5819,6 +5865,7 @@ mod tests {
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     write_failed: false,
+                    output_held: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
                     is_local: true,
@@ -5923,6 +5970,7 @@ mod tests {
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     write_failed: false,
+                    output_held: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
                     is_local: true,
@@ -5946,6 +5994,7 @@ mod tests {
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     write_failed: false,
+                    output_held: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
                     is_local: true,
@@ -6052,6 +6101,7 @@ mod tests {
                     outbound: std::collections::VecDeque::new(),
                     watching_writable: false,
                     write_failed: false,
+                    output_held: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
                     is_local: true,
@@ -6246,6 +6296,7 @@ mod tests {
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 write_failed: false,
+                output_held: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -6709,6 +6760,7 @@ mod tests {
                 outbound: std::collections::VecDeque::new(),
                 watching_writable: false,
                 write_failed: false,
+                output_held: false,
                 focused_window: ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,

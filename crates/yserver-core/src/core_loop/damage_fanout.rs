@@ -444,6 +444,7 @@ pub fn accumulate_damage_to_state(
     for n in pending {
         let geometry = n.geometry;
         let area = n.area;
+        hold_output_for_damage_notify(state, n.owner);
         let extras = fanout_event_to_clients(state, &[n.owner], |buf, seq, order| {
             encode_damage_notify(buf, order, seq, &n, timestamp, area, geometry);
         });
@@ -577,6 +578,7 @@ pub fn report_existing_damage_to_state(state: &mut ServerState, damage_id: u32) 
     for n in pending {
         let geometry = n.geometry;
         let area = n.area;
+        hold_output_for_damage_notify(state, n.owner);
         let extras = fanout_event_to_clients(state, &[n.owner], |buf, seq, order| {
             encode_damage_notify(buf, order, seq, &n, timestamp, area, geometry);
         });
@@ -590,26 +592,58 @@ pub fn report_existing_damage_to_state(state: &mut ServerState, damage_id: u32) 
     dropped
 }
 
-/// Diagnostic (#100): note where a just-sent DamageNotify's drawable paints
-/// and whether its bytes reached the socket now. `write_or_buffer` writes
-/// straight to the socket unless bytes are already queued or the kernel
-/// buffer is full; an empty outbound queue afterwards means the event is
-/// on the wire.
+/// #100: a DamageNotify must not reach its client before the GPU writes it
+/// announces are submitted with their dma-buf write fences, or a
+/// compositor sampling the exported backing on receipt reads stale pixels.
+/// Xorg gets this for free: events only leave in `FlushAllOutput`, after
+/// the BlockHandler's glamor flush. While the backend reports unpublished
+/// exported writes, hold the owner's whole output tail (so its events,
+/// replies and errors stay in order) until the damage barrier
+/// (`run::damage_notify_barrier`) has flushed. Without pending writes the
+/// event goes straight out, as before.
+fn hold_output_for_damage_notify(state: &mut ServerState, owner: ClientId) {
+    let pending = state
+        .export_writes_pending
+        .as_ref()
+        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
+    if !pending {
+        return;
+    }
+    let Some(client) = state.clients.get_mut(&owner.0) else {
+        return;
+    };
+    if !client.output_held {
+        crate::core_loop::client_io::hold_output(client);
+        state.damage_held_clients.push(owner);
+    }
+}
+
+/// Diagnostic (#100): note where a just-queued DamageNotify's drawable
+/// paints and whether its bytes reached the socket now. `write_or_buffer`
+/// writes straight to the socket unless output is held, bytes are already
+/// queued or the kernel buffer is full; an empty outbound queue afterwards
+/// means the event is on the wire. A held event is stamped when the
+/// barrier releases it.
 fn record_damage_notify_probe(state: &mut ServerState, owner: ClientId, drawable: u32) {
     let Some(client) = state.clients.get(&owner.0) else {
         return;
     };
+    let held = client.output_held;
     let on_wire_at =
-        (client.outbound.is_empty() && !client.write_failed).then(std::time::Instant::now);
+        (!held && client.outbound.is_empty() && !client.write_failed).then(std::time::Instant::now);
     let host_xid = state
         .resources
         .host_drawable_target(ResourceId(drawable))
         .map(crate::resources::HostDrawableTarget::host_xid);
     state
         .damage_notify_probes
-        .push(crate::backend::DamageNotifyProbe {
-            host_xid,
-            on_wire_at,
+        .push(crate::server::DamageNotifyProbeEntry {
+            client: owner,
+            held,
+            probe: crate::backend::DamageNotifyProbe {
+                host_xid,
+                on_wire_at,
+            },
         });
 }
 
@@ -951,6 +985,7 @@ mod tests {
                 outbound: VecDeque::new(),
                 watching_writable: false,
                 write_failed: false,
+                output_held: false,
                 focused_window: ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -1038,6 +1073,7 @@ mod tests {
                 outbound: VecDeque::new(),
                 watching_writable: false,
                 write_failed: false,
+                output_held: false,
                 focused_window: ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -1699,6 +1735,7 @@ mod tests {
                 outbound: VecDeque::new(),
                 watching_writable: false,
                 write_failed: false,
+                output_held: false,
                 focused_window: ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -1979,5 +2016,162 @@ mod tests {
         // backing), so the full-window rect is (0,0)–(100,50).
         let r = dmg.rects[0];
         assert_eq!((r.x, r.y, r.width, r.height), (0, 0, 100, 50));
+    }
+
+    /// #100 fixture: client 1 owns a BoundingBox damage on a viewable
+    /// window and writes into a captured stream; the backend holds the
+    /// shared unpublished-exported-writes flag.
+    struct BarrierFixture {
+        state: ServerState,
+        backend: crate::backend::recording::RecordingBackend,
+        wire: Arc<Mutex<VecDeque<u8>>>,
+        flag: Arc<std::sync::atomic::AtomicBool>,
+        window: ResourceId,
+    }
+
+    fn barrier_fixture(writes_pending: bool) -> BarrierFixture {
+        let mut state = ServerState::new();
+        let _reader = add_client_with_reader(&mut state, 1, 0x0010_0000);
+        let wire = Arc::new(Mutex::new(VecDeque::new()));
+        state.clients.get_mut(&1).unwrap().writer = Arc::new(Mutex::new(
+            crate::transport::Transport::Capture(Arc::clone(&wire)),
+        ));
+        let window = add_window(&mut state, 1, 0x0010_0001, ROOT_WINDOW, 0, 0, 100, 100);
+        add_damage_on_with_level(
+            &mut state,
+            1,
+            0xe000_0001,
+            window,
+            x11damage::report_level::BOUNDING_BOX,
+        );
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(writes_pending));
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        backend.export_writes_pending = Some(Arc::clone(&flag));
+        backend.damage_flush_wire = Some(Arc::clone(&wire));
+        crate::backend::install_backend_root_bindings(&mut state, &backend);
+        BarrierFixture {
+            state,
+            backend,
+            wire,
+            flag,
+            window,
+        }
+    }
+
+    fn wire_codes(wire: &Mutex<VecDeque<u8>>) -> Vec<u8> {
+        let bytes: Vec<u8> = wire.lock().unwrap().iter().copied().collect();
+        bytes.chunks_exact(32).map(|c| c[0]).collect()
+    }
+
+    /// Xorg flushes client output only after glamor's BlockHandler flush,
+    /// so a compositor never receives DamageNotify ahead of the drawing's
+    /// fence. With exported writes unpublished, the event must stay off
+    /// the socket until the damage flush has run.
+    #[test]
+    fn damage_notify_with_unpublished_export_writes_waits_for_the_flush() {
+        let mut f = barrier_fixture(true);
+        let _ = accumulate_damage_to_state(&mut f.state, f.window, 0, 0, 10, 10);
+        assert!(f.wire.lock().unwrap().is_empty(), "held off the socket");
+        let client = &f.state.clients[&1];
+        assert!(client.output_held);
+        assert_eq!(client.outbound.len(), 32);
+
+        crate::core_loop::run::damage_notify_barrier(&mut f.state, &mut f.backend);
+
+        assert_eq!(
+            f.backend.damage_flush_wire_lens,
+            vec![0],
+            "nothing reached the socket before the flush"
+        );
+        assert_eq!(wire_codes(&f.wire), vec![DAMAGE_FIRST_EVENT]);
+        assert!(!f.state.clients[&1].output_held);
+        assert!(f.state.damage_held_clients.is_empty());
+        assert!(!f.flag.load(Ordering::Relaxed));
+    }
+
+    /// The hold covers the client's whole output tail, so a reply written
+    /// after a held DamageNotify stays behind it, and output written before
+    /// the hold stays ahead of it.
+    #[test]
+    fn damage_hold_preserves_the_clients_event_reply_order() {
+        let mut f = barrier_fixture(false);
+        let earlier = [2u8; 32];
+        let reply = [1u8; 32];
+        {
+            let client = f.state.clients.get_mut(&1).unwrap();
+            crate::core_loop::client_io::write_or_buffer(client, &earlier).unwrap();
+        }
+        f.flag.store(true, Ordering::Relaxed);
+        let _ = accumulate_damage_to_state(&mut f.state, f.window, 0, 0, 10, 10);
+        {
+            let client = f.state.clients.get_mut(&1).unwrap();
+            crate::core_loop::client_io::write_or_buffer(client, &reply).unwrap();
+        }
+        assert_eq!(wire_codes(&f.wire), vec![2], "only pre-hold output is out");
+
+        crate::core_loop::run::damage_notify_barrier(&mut f.state, &mut f.backend);
+
+        assert_eq!(wire_codes(&f.wire), vec![2, DAMAGE_FIRST_EVENT, 1]);
+    }
+
+    /// Without unpublished writes nothing is held: each DamageNotify is on
+    /// the socket as it is generated, and none is lost or duplicated
+    /// across barriers, held or not.
+    #[test]
+    fn damage_notify_without_pending_writes_is_not_delayed_and_none_lost() {
+        let mut f = barrier_fixture(false);
+        for i in 0..3 {
+            let _ = accumulate_damage_to_state(&mut f.state, f.window, i, i, 5, 5);
+            assert_eq!(
+                wire_codes(&f.wire).len(),
+                usize::try_from(i + 1).unwrap(),
+                "on the wire immediately"
+            );
+            assert!(!f.state.clients[&1].output_held);
+            crate::core_loop::run::damage_notify_barrier(&mut f.state, &mut f.backend);
+        }
+        for i in 3..6 {
+            f.flag.store(true, Ordering::Relaxed);
+            let _ = accumulate_damage_to_state(&mut f.state, f.window, i, i, 5, 5);
+            let _ = accumulate_damage_to_state(&mut f.state, f.window, i + 10, i, 5, 5);
+            crate::core_loop::run::damage_notify_barrier(&mut f.state, &mut f.backend);
+        }
+        assert_eq!(wire_codes(&f.wire), vec![DAMAGE_FIRST_EVENT; 9]);
+        assert!(f.state.clients[&1].outbound.is_empty());
+    }
+
+    /// The probe hears about a held event only after the barrier, stamped
+    /// with its release (post-flush) time rather than counted as buffered.
+    #[test]
+    fn held_damage_notify_probe_is_stamped_at_release() {
+        let mut f = barrier_fixture(true);
+        let before = std::time::Instant::now();
+        let _ = accumulate_damage_to_state(&mut f.state, f.window, 0, 0, 10, 10);
+        assert!(f.backend.noted_damage_notify_probes.is_empty());
+
+        crate::core_loop::run::damage_notify_barrier(&mut f.state, &mut f.backend);
+
+        let probes = &f.backend.noted_damage_notify_probes;
+        assert_eq!(probes.len(), 1);
+        let on_wire = probes[0].on_wire_at.expect("released onto the wire");
+        assert!(on_wire >= before);
+    }
+
+    /// A client gone while held, or a write failure on release, must not
+    /// leave a hold behind; the failure flags the client as any write does.
+    #[test]
+    fn release_of_a_failed_held_client_marks_it_write_failed() {
+        let mut f = barrier_fixture(true);
+        let _ = accumulate_damage_to_state(&mut f.state, f.window, 0, 0, 10, 10);
+        // Swap the stream for a closed socket: the release write fails.
+        let (a, b) = UnixStream::pair().unwrap();
+        drop(b);
+        f.state.clients.get_mut(&1).unwrap().writer =
+            Arc::new(Mutex::new(crate::transport::Transport::Unix(a)));
+        crate::core_loop::run::damage_notify_barrier(&mut f.state, &mut f.backend);
+        let client = &f.state.clients[&1];
+        assert!(!client.output_held);
+        assert!(client.write_failed);
+        assert!(f.state.damage_held_clients.is_empty());
     }
 }

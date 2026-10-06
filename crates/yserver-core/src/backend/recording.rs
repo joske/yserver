@@ -242,6 +242,15 @@ type GammaTriplet = (Vec<u16>, Vec<u16>, Vec<u16>);
 /// counter so create-then-destroy round trips read back the same xid.
 pub struct RecordingBackend {
     pub calls: Mutex<Vec<RecordedCall>>,
+    /// #100: stands in for KMS's unpublished-exported-writes flag; the
+    /// damage flush clears it. `None` behaves like an immediate renderer.
+    pub export_writes_pending: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// #100: a captured client stream; each damage flush records how many
+    /// bytes had reached it (`damage_flush_wire_lens`).
+    pub damage_flush_wire: Option<std::sync::Arc<Mutex<std::collections::VecDeque<u8>>>>,
+    pub damage_flush_wire_lens: Vec<usize>,
+    /// #100: DamageNotify probes handed over at each damage barrier.
+    pub noted_damage_notify_probes: Vec<crate::backend::DamageNotifyProbe>,
     /// Queued "the sprite now shows this cursor" report handed out by
     /// `take_displayed_cursor_change`. Tests set it to stand in for a KMS
     /// sprite change.
@@ -571,6 +580,10 @@ impl RecordingBackend {
     pub fn new() -> Self {
         Self {
             calls: Mutex::new(Vec::new()),
+            export_writes_pending: None,
+            damage_flush_wire: None,
+            damage_flush_wire_lens: Vec::new(),
+            noted_damage_notify_probes: Vec::new(),
             displayed_cursor_change: None,
             next_handle: Mutex::new(0x0001_0000),
             fake_window_id: 0x0000_0100,
@@ -1083,6 +1096,22 @@ impl Backend for RecordingBackend {
 
     fn flush_before_damage_notify(&mut self) {
         self.record(RecordedCall::FlushBeforeDamageNotify);
+        if let Some(wire) = &self.damage_flush_wire {
+            let len = wire.lock().map_or(0, |bytes| bytes.len());
+            self.damage_flush_wire_lens.push(len);
+        }
+        // The flush publishes every recorded exported write.
+        if let Some(flag) = &self.export_writes_pending {
+            flag.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn export_writes_pending_flag(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        self.export_writes_pending.clone()
+    }
+
+    fn note_damage_notify_probes(&mut self, probes: Vec<crate::backend::DamageNotifyProbe>) {
+        self.noted_damage_notify_probes.extend(probes);
     }
 
     fn note_present_skip(&mut self) {

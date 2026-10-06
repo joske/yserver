@@ -1015,6 +1015,43 @@ pub(super) fn disconnect_failed_writers(
     }
 }
 
+/// #100 damage barrier, the analog of Xorg flushing client output only
+/// after the BlockHandler's glamor flush. If a DamageNotify was queued, the
+/// backend submits the writes it announces and publishes their export
+/// fences; only then is the output of every client a DamageNotify held
+/// (`damage_fanout::hold_output_for_damage_notify`) released toward its
+/// socket. A failed release marks the client `write_failed` for the
+/// normal disconnect path.
+pub(crate) fn damage_notify_barrier(state: &mut ServerState, backend: &mut dyn Backend) {
+    if std::mem::take(&mut state.damage_notify_flush_pending) {
+        backend.flush_before_damage_notify();
+    }
+    for client_id in std::mem::take(&mut state.damage_held_clients) {
+        if let Some(client) = state.clients.get_mut(&client_id.0) {
+            let _ = client_io::release_output(client);
+        }
+    }
+    if state.damage_notify_probes.is_empty() {
+        return;
+    }
+    let released_at = Instant::now();
+    let probes = std::mem::take(&mut state.damage_notify_probes)
+        .into_iter()
+        .map(|entry| {
+            let mut probe = entry.probe;
+            if entry.held {
+                probe.on_wire_at = state
+                    .clients
+                    .get(&entry.client.0)
+                    .is_some_and(|c| c.outbound.is_empty() && !c.write_failed)
+                    .then_some(released_at);
+            }
+            probe
+        })
+        .collect();
+    backend.note_damage_notify_probes(probes);
+}
+
 /// Disconnect every client whose output failed (RECORD data connections
 /// and flagged writers), then drain and reconcile WRITABLE interest for
 /// the rest. Repeats until a pass disconnects nobody: a disconnect's own
@@ -1028,6 +1065,9 @@ fn settle_client_output(
     reset_trigger: &mut ResetTrigger,
 ) {
     loop {
+        // Nothing may wait for WRITABLE behind a damage hold: a disconnect's
+        // own notifications can queue DamageNotify too.
+        damage_notify_barrier(state, backend);
         // RECORD failures are queued, since that write can happen inside
         // another client's disconnect.
         let recorders = crate::core_loop::record::take_failed_recorders(state);
@@ -1934,10 +1974,7 @@ fn process_request_inline(
         &outcome,
         RequestOutcome::PendingCrtcConfig(_) | RequestOutcome::PendingXiConfig(_)
     ) {
-        if std::mem::take(&mut state.damage_notify_flush_pending) {
-            backend.note_damage_notify_probes(std::mem::take(&mut state.damage_notify_probes));
-            backend.flush_before_damage_notify();
-        }
+        damage_notify_barrier(state, backend);
         backend.mark_dirty();
     }
     // A request that changed the displayed cursor (DefineCursor, a grab,
@@ -1989,10 +2026,7 @@ pub(crate) fn drain_ready_crtc_configs(
             }
         };
 
-        if std::mem::take(&mut state.damage_notify_flush_pending) {
-            backend.note_damage_notify_probes(std::mem::take(&mut state.damage_notify_probes));
-            backend.flush_before_damage_notify();
-        }
+        damage_notify_barrier(state, backend);
         backend.mark_dirty();
         match outcome {
             RequestOutcome::Disconnect(client) => {
@@ -3054,10 +3088,7 @@ pub(crate) fn run_iteration_tail(state: &mut ServerState, backend: &mut dyn Back
     // Damage can also originate outside a directly-dispatched request (for
     // example deferred Present execution). Preserve the same write-before-
     // observer boundary before the next poll can drain client output.
-    if std::mem::take(&mut state.damage_notify_flush_pending) {
-        backend.note_damage_notify_probes(std::mem::take(&mut state.damage_notify_probes));
-        backend.flush_before_damage_notify();
-    }
+    damage_notify_barrier(state, backend);
 
     // Service time-based backend work that is not tied to an fd edge. The
     // backend reports its cadence via `next_wakeup`.
@@ -4512,6 +4543,7 @@ fn handle_client_setup_complete(
             outbound: std::collections::VecDeque::new(),
             watching_writable: false,
             write_failed: false,
+            output_held: false,
             focused_window: crate::resources::ROOT_WINDOW,
             reader_control: Some(reader_control_tx),
             is_local,
@@ -4811,6 +4843,7 @@ mod tests {
                 outbound: VecDeque::new(),
                 watching_writable: false,
                 write_failed: false,
+                output_held: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -4846,6 +4879,7 @@ mod tests {
             outbound: VecDeque::new(),
             watching_writable: false,
             write_failed: false,
+            output_held: false,
             focused_window: crate::resources::ROOT_WINDOW,
             reader_control: None,
             is_local: true,
@@ -6278,6 +6312,7 @@ mod tests {
                 outbound: VecDeque::new(),
                 watching_writable: false,
                 write_failed: false,
+                output_held: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -6685,6 +6720,7 @@ mod tests {
                 outbound: VecDeque::new(),
                 watching_writable: false,
                 write_failed: false,
+                output_held: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: Some(control_tx),
                 is_local: true,
@@ -6851,6 +6887,7 @@ mod tests {
                 outbound: VecDeque::new(),
                 watching_writable: false,
                 write_failed: false,
+                output_held: false,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,

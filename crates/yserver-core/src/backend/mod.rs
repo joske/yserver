@@ -166,6 +166,7 @@ pub fn install_backend_root_bindings(
     if let Some(root) = state.resources.window_mut(ROOT_WINDOW) {
         root.host_xid = WindowHandle::from_raw(backend.window_id());
     }
+    state.export_writes_pending = backend.export_writes_pending_flag();
     state
         .resources
         .set_visual_host_xid(ROOT_VISUAL, backend.root_visual_xid());
