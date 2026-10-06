@@ -1935,6 +1935,7 @@ fn process_request_inline(
         RequestOutcome::PendingCrtcConfig(_) | RequestOutcome::PendingXiConfig(_)
     ) {
         if std::mem::take(&mut state.damage_notify_flush_pending) {
+            backend.note_damage_notify_probes(std::mem::take(&mut state.damage_notify_probes));
             backend.flush_before_damage_notify();
         }
         backend.mark_dirty();
@@ -1989,6 +1990,7 @@ pub(crate) fn drain_ready_crtc_configs(
         };
 
         if std::mem::take(&mut state.damage_notify_flush_pending) {
+            backend.note_damage_notify_probes(std::mem::take(&mut state.damage_notify_probes));
             backend.flush_before_damage_notify();
         }
         backend.mark_dirty();
@@ -3053,6 +3055,7 @@ pub(crate) fn run_iteration_tail(state: &mut ServerState, backend: &mut dyn Back
     // example deferred Present execution). Preserve the same write-before-
     // observer boundary before the next poll can drain client output.
     if std::mem::take(&mut state.damage_notify_flush_pending) {
+        backend.note_damage_notify_probes(std::mem::take(&mut state.damage_notify_probes));
         backend.flush_before_damage_notify();
     }
 

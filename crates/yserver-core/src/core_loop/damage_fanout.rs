@@ -447,6 +447,7 @@ pub fn accumulate_damage_to_state(
         let extras = fanout_event_to_clients(state, &[n.owner], |buf, seq, order| {
             encode_damage_notify(buf, order, seq, &n, timestamp, area, geometry);
         });
+        record_damage_notify_probe(state, n.owner, n.drawable);
         for cid in extras {
             if !dropped.contains(&cid) {
                 dropped.push(cid);
@@ -579,6 +580,7 @@ pub fn report_existing_damage_to_state(state: &mut ServerState, damage_id: u32) 
         let extras = fanout_event_to_clients(state, &[n.owner], |buf, seq, order| {
             encode_damage_notify(buf, order, seq, &n, timestamp, area, geometry);
         });
+        record_damage_notify_probe(state, n.owner, n.drawable);
         for cid in extras {
             if !dropped.contains(&cid) {
                 dropped.push(cid);
@@ -586,6 +588,29 @@ pub fn report_existing_damage_to_state(state: &mut ServerState, damage_id: u32) 
         }
     }
     dropped
+}
+
+/// Diagnostic (#100): note where a just-sent DamageNotify's drawable paints
+/// and whether its bytes reached the socket now. `write_or_buffer` writes
+/// straight to the socket unless bytes are already queued or the kernel
+/// buffer is full; an empty outbound queue afterwards means the event is
+/// on the wire.
+fn record_damage_notify_probe(state: &mut ServerState, owner: ClientId, drawable: u32) {
+    let Some(client) = state.clients.get(&owner.0) else {
+        return;
+    };
+    let on_wire_at =
+        (client.outbound.is_empty() && !client.write_failed).then(std::time::Instant::now);
+    let host_xid = state
+        .resources
+        .host_drawable_target(ResourceId(drawable))
+        .map(crate::resources::HostDrawableTarget::host_xid);
+    state
+        .damage_notify_probes
+        .push(crate::backend::DamageNotifyProbe {
+            host_xid,
+            on_wire_at,
+        });
 }
 
 /// Per-level helper: match damage objects keyed on `level_drawable`,

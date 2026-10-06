@@ -228,6 +228,17 @@ impl PresentCaps {
 /// this struct: it retains the `Arc`-pinned wake and fires it only
 /// when core calls [`Backend::signal_present_wake`] with `present_id`
 /// at the target vblank (vblank-paced completion, Task 4/7).
+/// Diagnostic (#100): one DamageNotify as it left for its client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DamageNotifyProbe {
+    /// Host xid the damaged drawable paints into (a redirected window's
+    /// backing pixmap), or `None` when it has no paint target.
+    pub host_xid: Option<u32>,
+    /// When the event's bytes reached the socket; `None` when they were
+    /// left queued in the client's outbound buffer.
+    pub on_wire_at: Option<std::time::Instant>,
+}
+
 #[derive(Debug, Clone)]
 pub struct CompletedPresentEvent {
     pub client_id: yserver_protocol::x11::ClientId,
@@ -968,6 +979,11 @@ pub trait Backend {
     /// this before the notification can drain to an external compositor.
     /// Immediate-rendering backends keep the default no-op.
     fn flush_before_damage_notify(&mut self) {}
+
+    /// Diagnostic (#100): the DamageNotify events sent since the last
+    /// damage boundary, handed over just before
+    /// [`Self::flush_before_damage_notify`]. Default: ignored.
+    fn note_damage_notify_probes(&mut self, _probes: Vec<DamageNotifyProbe>) {}
 
     /// Earliest backend-owned deadline the core loop must wake for
     /// even when no fd is readable. Backends use this for retry

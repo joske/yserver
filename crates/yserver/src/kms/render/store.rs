@@ -972,6 +972,9 @@ pub(crate) struct DrawableStore {
     /// by the deferred Present gate. Consumed by the next flush containing a
     /// write to that drawable; the flush still publishes its new WRITE fence.
     prewaited_exported_writes: std::collections::HashSet<DrawableId>,
+    /// Diagnostic (#100): DamageNotify sent before the damaged export's
+    /// write fence was published.
+    damage_fence_probe: super::damage_fence_probe::DamageFenceProbe<DrawableId>,
     /// Externally shared drawables (`Storage::foreign_shared`) touched since
     /// the last submit-group flush; drained by [`Self::plan_foreign_transfers`].
     foreign_touched: Vec<DrawableId>,
@@ -998,6 +1001,7 @@ impl DrawableStore {
             exported_sync: HashMap::new(),
             exported_writes: Vec::new(),
             prewaited_exported_writes: std::collections::HashSet::new(),
+            damage_fence_probe: super::damage_fence_probe::DamageFenceProbe::new(),
             foreign_touched: Vec::new(),
             foreign_held: Vec::new(),
             scene_damage_generation: 0,
@@ -1029,6 +1033,7 @@ impl DrawableStore {
         self.exported_sync.remove(&id);
         self.exported_writes.retain(|&w| w != id);
         self.prewaited_exported_writes.remove(&id);
+        self.damage_fence_probe.forget(id);
     }
 
     /// GLX-TFP (Task 2.3): true iff `id` currently has a sync-only dma-buf
@@ -1049,14 +1054,36 @@ impl DrawableStore {
     pub(crate) fn take_exported_writes(&mut self) -> Vec<(Arc<OwnedFd>, bool)> {
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
+        let published_at = std::time::Instant::now();
         for id in self.exported_writes.drain(..) {
             if seen.insert(id)
                 && let Some(fd) = self.exported_sync.get(&id)
             {
                 out.push((Arc::clone(fd), self.prewaited_exported_writes.remove(&id)));
+                self.damage_fence_probe.note_published(id, published_at);
             }
         }
         out
+    }
+
+    /// Diagnostic (#100): classify a DamageNotify whose drawable paints into
+    /// `host_xid`, sent to the socket at `on_wire_at`.
+    pub(crate) fn classify_damage_notify(
+        &mut self,
+        host_xid: Option<u32>,
+        on_wire_at: Option<std::time::Instant>,
+    ) -> super::damage_fence_probe::DamageNotifyClass {
+        let exported = host_xid.and_then(|xid| self.lookup(xid)).and_then(|id| {
+            let target = self.redirected_target(id).unwrap_or(id);
+            self.is_exported(target).then_some(target)
+        });
+        self.damage_fence_probe.classify(exported, on_wire_at)
+    }
+
+    pub(crate) fn damage_fence_probe_mut(
+        &mut self,
+    ) -> &mut super::damage_fence_probe::DamageFenceProbe<DrawableId> {
+        &mut self.damage_fence_probe
     }
 
     /// Authorize one exported write to bypass the queue-level old-reader
@@ -1574,6 +1601,7 @@ impl DrawableStore {
         // at the flush chokepoint.
         if self.exported_sync.contains_key(&id) {
             self.exported_writes.push(id);
+            self.damage_fence_probe.note_export_write(id);
         }
     }
 

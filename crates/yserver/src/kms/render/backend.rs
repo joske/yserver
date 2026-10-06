@@ -22128,6 +22128,9 @@ impl Backend for KmsBackend {
         // the only other maybe_emit caller is on the compose path, which
         // is gated off when dark, so telemetry went silent in the window.
         self.telemetry.maybe_emit(self.engine.pending_count());
+        self.store
+            .damage_fence_probe_mut()
+            .maybe_log(std::time::Instant::now());
     }
 
     fn mark_dirty(&mut self) {
@@ -22135,6 +22138,13 @@ impl Backend for KmsBackend {
         // Paint paths already record per-drawable presentation
         // damage, and cursor motion is projected by build_scene.
         self.scene.wake_for_damage();
+    }
+
+    fn note_damage_notify_probes(&mut self, probes: Vec<yserver_core::backend::DamageNotifyProbe>) {
+        for probe in probes {
+            self.store
+                .classify_damage_notify(probe.host_xid, probe.on_wire_at);
+        }
     }
 
     fn flush_before_damage_notify(&mut self) {

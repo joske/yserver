@@ -1268,6 +1268,9 @@ pub struct ServerState {
     /// output is allowed to drain, the core asks the backend to submit that
     /// drawing so an external compositor cannot sample ahead of it.
     pub damage_notify_flush_pending: bool,
+    /// Diagnostic (#100): DamageNotify events sent since the last damage
+    /// boundary; drained to the backend just before that boundary.
+    pub damage_notify_probes: Vec<crate::backend::DamageNotifyProbe>,
     pub composite_redirects: crate::composite_redirects::CompositeRedirects,
     pub present_event_selections: HashMap<u32, PresentEventSelection>,
     /// `PresentNotifyMSC` requests parked for a future MSC, fired when a
@@ -1806,6 +1809,7 @@ impl ServerState {
             sync_fences: HashMap::new(),
             damage_objects: HashMap::new(),
             damage_notify_flush_pending: false,
+            damage_notify_probes: Vec::new(),
             composite_redirects: crate::composite_redirects::CompositeRedirects::default(),
             present_event_selections: HashMap::new(),
             present_pending_msc: Vec::new(),
