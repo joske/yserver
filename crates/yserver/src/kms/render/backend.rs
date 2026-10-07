@@ -28915,6 +28915,11 @@ impl Backend for KmsBackend {
         }
         let dst_clip =
             Self::shift_dst_picture_clip(Some(cliplist_local.clone()), dst_target.offset());
+        let Some((bx, by, bw, bh)) =
+            clip_trap_bbox_to_extents((bx, by, bx1, by1), dst_clip.as_deref().unwrap_or(&[]))
+        else {
+            return Ok(Vec::new());
+        };
 
         // Pack instance bytes (40 bytes per trap; no padding —
         // asserted by `const _:()` in trap_pipeline.rs).
@@ -29134,6 +29139,11 @@ impl Backend for KmsBackend {
         }
         let dst_clip =
             Self::shift_dst_picture_clip(Some(cliplist_local.clone()), dst_target.offset());
+        let Some((bx, by, bw, bh)) =
+            clip_trap_bbox_to_extents((bx, by, bx1, by1), dst_clip.as_deref().unwrap_or(&[]))
+        else {
+            return Ok(Vec::new());
+        };
 
         let stride = std::mem::size_of::<crate::kms::vk::trap_pipeline::TriangleInstanceData>();
         let mut instance_bytes = vec![0u8; stride * tris.len()];
@@ -31338,6 +31348,34 @@ fn dst_picture_clip_by_children(core: &KmsCore, host_pic: u32) -> bool {
     }
 }
 
+/// #214: shrink a RENDER Trapezoids/Triangles union bbox `(x0, y0, x1,
+/// y1)` to the extents of the clip it composites through (target
+/// coords, already within the dst extent). The composite is scissored
+/// to that clip anyway, so the coverage mask only needs to exist there;
+/// `None` when nothing is left.
+fn clip_trap_bbox_to_extents(
+    bbox: (i32, i32, i32, i32),
+    clip: &[Rectangle16],
+) -> Option<(i32, i32, u32, u32)> {
+    let mut ext: Option<(i32, i32, i32, i32)> = None;
+    for r in clip.iter().filter(|r| r.width > 0 && r.height > 0) {
+        let (x0, y0) = (i32::from(r.x), i32::from(r.y));
+        let (x1, y1) = (x0 + i32::from(r.width), y0 + i32::from(r.height));
+        ext = Some(match ext {
+            None => (x0, y0, x1, y1),
+            Some(e) => (e.0.min(x0), e.1.min(y0), e.2.max(x1), e.3.max(y1)),
+        });
+    }
+    let e = ext?;
+    let (x0, y0) = (bbox.0.max(e.0), bbox.1.max(e.1));
+    let (x1, y1) = (bbox.2.min(e.2), bbox.3.min(e.3));
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    #[allow(clippy::cast_sign_loss)]
+    Some((x0, y0, (x1 - x0) as u32, (y1 - y0) as u32))
+}
+
 fn local_rects_to_region(rects: Vec<Rectangle16>) -> Vec<xfixes::RegionRect> {
     rects
         .into_iter()
@@ -31603,6 +31641,37 @@ impl WarnThrottle {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn trap_bbox_shrinks_to_the_clip_extents() {
+        use super::{Rectangle16, clip_trap_bbox_to_extents};
+        let r = |x, y, width, height| Rectangle16 {
+            x,
+            y,
+            width,
+            height,
+        };
+        // Union bbox far larger than a 100×50 dst: only the dst part stays.
+        assert_eq!(
+            clip_trap_bbox_to_extents((0, 0, 2400, 1800), &[r(0, 0, 100, 50)]),
+            Some((0, 0, 100, 50))
+        );
+        // Extents of a split clip, not just its first rect.
+        assert_eq!(
+            clip_trap_bbox_to_extents((10, 10, 300, 300), &[r(0, 0, 40, 20), r(200, 100, 50, 400)]),
+            Some((10, 10, 240, 290))
+        );
+        // Disjoint or empty clip: nothing to draw.
+        assert_eq!(
+            clip_trap_bbox_to_extents((0, 0, 10, 10), &[r(20, 20, 5, 5)]),
+            None
+        );
+        assert_eq!(
+            clip_trap_bbox_to_extents((0, 0, 10, 10), &[r(0, 0, 0, 5)]),
+            None
+        );
+        assert_eq!(clip_trap_bbox_to_extents((0, 0, 10, 10), &[]), None);
+    }
+
     #[test]
     fn warn_throttle_logs_once_per_period_and_counts_the_rest() {
         use super::WarnThrottle;
