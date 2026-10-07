@@ -33554,99 +33554,46 @@ fn handle_send_event(
         );
         return Ok(RequestOutcome::Handled);
     };
+    // Xorg `ProcSendEvent` (dix/events.c:5563-5590) validates the template
+    // and mask before resolving the destination.
+    let event_type = req.event[0] & 0x7f;
+    if !matches!(event_type, 2..=34 | 64..) {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            u32::from(event_type),
+            25,
+        );
+    }
+    if event_type == 33 && !matches!(req.event[1], 8 | 16 | 32) {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            u32::from(req.event[1]),
+            25,
+        );
+    }
+    if req.event_mask & !ALL_EVENT_MASKS != 0 {
+        return emit_x11_error(
+            state,
+            client_id,
+            sequence,
+            x11::error::BAD_VALUE,
+            req.event_mask,
+            25,
+        );
+    }
+    let targets = match send_event_recipients(state, req.destination, req.event_mask, header.data) {
+        Ok(targets) => targets,
+        Err((code, value)) => return emit_x11_error(state, client_id, sequence, code, value, 25),
+    };
     // Set the sent-event bit (bit 7 of first byte).
     let mut event_copy = *req.event;
     event_copy[0] |= 0x80;
-
-    let mut targets: Vec<ClientId> = if req.destination.0 == 0xffff_ffff {
-        subscribers_by_id(state, ROOT_WINDOW, req.event_mask)
-    } else if req.event_mask == 0 {
-        state
-            .resources
-            .window_owner(req.destination)
-            .and_then(|owner| client_target_id(state, owner))
-            .into_iter()
-            .collect()
-    } else {
-        let mut current = req.destination;
-        loop {
-            let t = subscribers_by_id(state, current, req.event_mask);
-            if !t.is_empty() || !req.propagate {
-                break t;
-            }
-            let Some(parent) = state.resources.parent_of(current) else {
-                break Vec::new();
-            };
-            if parent == current {
-                break Vec::new();
-            }
-            current = parent;
-        }
-    };
-    // GDK3 has a NULL-device crash in `proxy_button_event` when its
-    // XI2 wrapper's `get_client_pointer()` returns NULL for a
-    // synthetic core ButtonPress/Release/Motion/Enter/Leave: the
-    // ensuing `_gdk_display_get_pointer_info(display, NULL)` returns
-    // NULL and the next line dereferences it. The crash fires on the
-    // master-pointer alias even when XIQueryDevice and
-    // XIGetClientPointer both report device 2 — somewhere the
-    // id_table lookup miscarries. Mate-panel hits it on every
-    // workspace-switch click because wnck-applet SendEvents a
-    // synthetic ButtonRelease into the panel.
-    //
-    // For event types that have XI2 counterparts (4–8 = Button*,
-    // Motion, Enter, Leave), drop any target client that has an XI2
-    // selection covering the destination (or any ancestor) for the
-    // matching XI2 type bit. The XI2 bit index equals the core type
-    // for these five events. Core-only clients (fvwm, wmaker, e16,
-    // legacy X apps) still receive the event unchanged.
-    //
-    // ONLY for mask-based (passive-selection) delivery. An empty
-    // `event_mask` addresses the event to the client that *created* the
-    // destination window (X11 SendEvent semantics) — the XEmbed
-    // input-forwarding contract a systray manager (cinnamon) uses to
-    // forward a real tray-icon click to the embedded client. That
-    // client explicitly needs the synthetic core event (Xorg delivers
-    // it); dropping it left pamac's tray icon unclickable. The GDK3
-    // guard targets the wnck/mate-panel case, which delivers by mask.
-    let core_type = req.event[0] & 0x7f;
-    if req.event_mask != 0 && matches!(core_type, 4..=8) {
-        let xi2_bit = 1u64 << core_type;
-        let before = targets.len();
-        targets.retain(|target| {
-            let Some(target_client) = state.clients.get(&target.0) else {
-                return true;
-            };
-            let mut current = req.destination;
-            loop {
-                for deviceid in [0u16, 1, 2, 3] {
-                    if let Some(m) = target_client.xi2_masks.get(&(current, deviceid))
-                        && (m & xi2_bit) != 0
-                    {
-                        return false;
-                    }
-                }
-                let Some(parent) = state.resources.parent_of(current) else {
-                    return true;
-                };
-                if parent == current {
-                    return true;
-                }
-                current = parent;
-            }
-        });
-        if targets.len() != before {
-            debug!(
-                "client {} #{} SendEvent core type={} dest=0x{:x} dropped \
-                 {} target(s) with overlapping XI2 selection (GDK3 NULL-device guard)",
-                client_id.0,
-                sequence.0,
-                core_type,
-                req.destination.0,
-                before - targets.len(),
-            );
-        }
-    }
     let _dropped = fanout_raw_event_to_clients(state, &targets, &event_copy, sender_byte_order);
     let core_type_logged = req.event[0] & 0x7f;
     // For synthetic ConfigureNotify (type=22), decode and log x/y/w/h
@@ -33697,6 +33644,98 @@ fn handle_send_event(
         );
     }
     Ok(RequestOutcome::Handled)
+}
+
+/// Xorg `AllEventMasks` (`include/inputstr.h`): the 25 core event-mask bits.
+const ALL_EVENT_MASKS: u32 = 0x01FF_FFFF;
+
+/// The clients a `SendEvent` reaches — Xorg `ProcSendEvent`
+/// (`dix/events.c:5592-5640`) with `DeliverEventsToWindow`
+/// (`dix/events.c:2364`). A core event template is matched against CORE
+/// event masks only: `GetClientsForDelivery` (`dix/events.c:2241`) takes the
+/// window's core `OtherClients` for any core type, so an XI2 selection never
+/// filters a synthetic core event, and `SendEvent` never produces XI2 events.
+///
+/// `Err((code, value))` is the X error to raise.
+fn send_event_recipients(
+    state: &ServerState,
+    destination: ResourceId,
+    event_mask: u32,
+    propagate: u8,
+) -> Result<Vec<ClientId>, (u8, u32)> {
+    let sprite = state
+        .root_pointer_target_at(state.pointer_root.0, state.pointer_root.1)
+        .map_or(ROOT_WINDOW, |(w, _, _)| w);
+    let mut effective_focus = None;
+    let mut window = match destination.0 {
+        0 => sprite,
+        1 => {
+            let focus = match state.core_focus.raw {
+                0 => return Ok(Vec::new()),
+                1 => ROOT_WINDOW,
+                w => ResourceId(w),
+            };
+            // `IsParent(inputFocus, pSprite->win)`: the pointer is in a
+            // strict inferior of the focus window.
+            let window = if is_strict_ancestor(state, focus, sprite) {
+                sprite
+            } else {
+                focus
+            };
+            effective_focus = Some(focus);
+            window
+        }
+        _ => {
+            if state.resources.window(destination).is_none() {
+                return Err((x11::error::BAD_WINDOW, destination.0));
+            }
+            destination
+        }
+    };
+    if propagate > 1 {
+        return Err((x11::error::BAD_VALUE, u32::from(propagate)));
+    }
+    let mut mask = event_mask;
+    loop {
+        let targets: Vec<ClientId> = if mask == 0 {
+            // `CantBeFiltered`: only the window's creator, never the server.
+            state
+                .resources
+                .window_owner(window)
+                .filter(|_| window != ROOT_WINDOW)
+                .and_then(|owner| client_target_id(state, owner))
+                .into_iter()
+                .collect()
+        } else {
+            subscribers_by_id(state, window, mask)
+        };
+        if !targets.is_empty() || propagate == 0 || effective_focus == Some(window) {
+            return Ok(targets);
+        }
+        let Some(win) = state.resources.window(window) else {
+            return Ok(Vec::new());
+        };
+        mask &= !u32::from(win.do_not_propagate_mask);
+        if mask == 0 || win.parent == window {
+            return Ok(Vec::new());
+        }
+        window = win.parent;
+    }
+}
+
+/// Xorg `IsParent(a, b)`: `a` is a strict ancestor of `b`.
+fn is_strict_ancestor(state: &ServerState, ancestor: ResourceId, window: ResourceId) -> bool {
+    let mut current = window;
+    while let Some(parent) = state.resources.parent_of(current) {
+        if parent == current {
+            return false;
+        }
+        if parent == ancestor {
+            return true;
+        }
+        current = parent;
+    }
+    false
 }
 
 fn handle_get_atom_name(
@@ -67717,11 +67756,8 @@ mod tests {
     /// semantics). That is the XEmbed input-forwarding contract: a
     /// systray manager (cinnamon) forwards the synthetic core
     /// ButtonPress of a user click on the tray icon to the embedded
-    /// client. The GDK3 NULL-device guard must NOT drop it even though
-    /// the owner has an overlapping XI2 selection on the destination —
-    /// the guard is only for mask-based (passive-selection) delivery
-    /// (mate-panel/wnck). Pre-fix this dropped every XEmbed-forwarded
-    /// button, so pamac's tray icon was unclickable (HW air 2026-06-22).
+    /// client, which also holds an XI2 selection on the window; dropping
+    /// it left pamac's tray icon unclickable (HW air 2026-06-22).
     #[test]
     fn send_event_empty_mask_delivers_synthetic_button_to_owner_despite_xi2_selection() {
         use std::io::Read;
@@ -67801,6 +67837,218 @@ mod tests {
             wire.len(),
             &wire[..wire.len().min(40)],
         );
+    }
+
+    /// Windows for the `SendEvent` tests: W (owned by `owner`, child of the
+    /// root) and its child C, neither mapped, so the pointer sprite is the
+    /// root.
+    fn send_event_tree(state: &mut ServerState, owner: u32, w: u32, c: u32) {
+        for (id, parent) in [(w, ROOT_WINDOW.0), (c, w)] {
+            state.resources.create_window(
+                yserver_protocol::x11::ClientId(owner),
+                yserver_protocol::x11::CreateWindowRequest {
+                    depth: 24,
+                    window: ResourceId(id),
+                    parent: ResourceId(parent),
+                    width: 100,
+                    height: 100,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+        }
+    }
+
+    fn send_event_body(destination: u32, mask: u32, event_type: u8) -> Vec<u8> {
+        let mut body = Vec::with_capacity(40);
+        body.extend_from_slice(&destination.to_le_bytes());
+        body.extend_from_slice(&mask.to_le_bytes());
+        let mut tmpl = [0u8; 32];
+        tmpl[0] = event_type;
+        body.extend_from_slice(&tmpl);
+        body
+    }
+
+    fn run_send_event(state: &mut ServerState, sender: u32, propagate: u8, body: &[u8]) {
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 25,
+            data: propagate,
+            length_units: 11,
+        };
+        handle_send_event(state, ClientId(sender), SequenceNumber(1), header, body)
+            .expect("SendEvent");
+    }
+
+    fn drain_wire(peer: &mut UnixStream) -> Vec<u8> {
+        use std::io::Read;
+        peer.set_nonblocking(true).unwrap();
+        let mut wire = Vec::new();
+        let mut tmp = [0u8; 256];
+        while let Ok(n) = peer.read(&mut tmp) {
+            if n == 0 {
+                break;
+            }
+            wire.extend_from_slice(&tmp[..n]);
+        }
+        wire
+    }
+
+    /// The first byte of each 32-byte packet on the wire.
+    fn wire_types(wire: &[u8]) -> Vec<u8> {
+        wire.chunks(32).map(|p| p[0]).collect()
+    }
+
+    /// #212: a synthetic core Motion/Press/Release reaches the client whose
+    /// CORE mask matches even when it also selected the XI2 form of the
+    /// event on the window (master or all-devices) and on the root. Xorg
+    /// `GetClientsForDelivery` (`dix/events.c:2241`) takes the core
+    /// `OtherClients` for a core type; XI2 masks never enter. Measured:
+    /// goldens/sendevent-xi2.txt, the "XI2 AllMasterDevices" steps.
+    #[test]
+    fn send_event_core_mask_delivers_despite_xi2_selection() {
+        const SENDER: u32 = 1;
+        const OWNER: u32 = 2;
+        const W: u32 = 0x0020_0001;
+        const C: u32 = 0x0020_0002;
+        let mut state = ServerState::new();
+        let mut sender_peer = install_client(&mut state, SENDER);
+        let mut owner_peer = install_client(&mut state, OWNER);
+        send_event_tree(&mut state, OWNER, W, C);
+        let owner = state.clients.get_mut(&OWNER).unwrap();
+        owner.event_masks.insert(ResourceId(W), 0x4C); // ButtonPress|Release|PointerMotion
+        owner.xi2_masks.insert((ResourceId(W), 1), 0x70); // XI_ButtonPress|Release|Motion
+        owner.xi2_masks.insert((ROOT_WINDOW, 0), 0x70);
+        for (event_type, mask) in [(6u8, 0x40u32), (4, 0x0C), (5, 0x0C)] {
+            run_send_event(&mut state, SENDER, 0, &send_event_body(W, mask, event_type));
+        }
+        assert_eq!(
+            wire_types(&drain_wire(&mut owner_peer)),
+            vec![0x86, 0x84, 0x85]
+        );
+        assert!(drain_wire(&mut sender_peer).is_empty());
+    }
+
+    /// Propagation (Xorg `ProcSendEvent`, `dix/events.c:5622-5636`): no
+    /// selector on C, so propagate=True carries the event to W; False stops
+    /// at C; C's do-not-propagate mask strips its bits, and an empty
+    /// remainder ends the walk. Measured: goldens/sendevent-xi2.txt.
+    #[test]
+    fn send_event_propagates_by_core_masks_and_do_not_propagate() {
+        const SENDER: u32 = 1;
+        const OWNER: u32 = 2;
+        const W: u32 = 0x0020_0001;
+        const C: u32 = 0x0020_0002;
+        let mut state = ServerState::new();
+        let _sender_peer = install_client(&mut state, SENDER);
+        let mut owner_peer = install_client(&mut state, OWNER);
+        send_event_tree(&mut state, OWNER, W, C);
+        let owner = state.clients.get_mut(&OWNER).unwrap();
+        owner.event_masks.insert(ResourceId(W), 0x0C); // ButtonPress|ButtonRelease
+        owner.xi2_masks.insert((ResourceId(W), 1), 0x70);
+
+        run_send_event(&mut state, SENDER, 0, &send_event_body(C, 0x04, 4));
+        assert!(
+            drain_wire(&mut owner_peer).is_empty(),
+            "propagate False stops at C"
+        );
+
+        run_send_event(&mut state, SENDER, 1, &send_event_body(C, 0x04, 4));
+        assert_eq!(wire_types(&drain_wire(&mut owner_peer)), vec![0x84]);
+
+        state
+            .resources
+            .window_mut(ResourceId(C))
+            .unwrap()
+            .do_not_propagate_mask = 0x04;
+        run_send_event(&mut state, SENDER, 1, &send_event_body(C, 0x04, 4));
+        assert!(
+            drain_wire(&mut owner_peer).is_empty(),
+            "DNP strips the only bit"
+        );
+        // ButtonPress|ButtonRelease minus DNP ButtonPress still matches W.
+        run_send_event(&mut state, SENDER, 1, &send_event_body(C, 0x0C, 4));
+        assert_eq!(wire_types(&drain_wire(&mut owner_peer)), vec![0x84]);
+    }
+
+    /// InputFocus (`dix/events.c:5594-5611`): with the pointer outside the
+    /// focus window the walk starts AND ends at the focus window, so W's
+    /// selection is never reached from focus C; focus W gets it. Focus None
+    /// delivers nothing and raises no error. Measured:
+    /// goldens/sendevent-xi2.txt, the "focus" steps.
+    #[test]
+    fn send_event_input_focus_stops_at_the_focus_window() {
+        const SENDER: u32 = 1;
+        const OWNER: u32 = 2;
+        const W: u32 = 0x0020_0001;
+        const C: u32 = 0x0020_0002;
+        let mut state = ServerState::new();
+        let mut sender_peer = install_client(&mut state, SENDER);
+        let mut owner_peer = install_client(&mut state, OWNER);
+        send_event_tree(&mut state, OWNER, W, C);
+        state
+            .clients
+            .get_mut(&OWNER)
+            .unwrap()
+            .event_masks
+            .insert(ResourceId(W), 0x01); // KeyPress
+
+        state.core_focus.raw = C;
+        run_send_event(&mut state, SENDER, 1, &send_event_body(1, 0x01, 2));
+        assert!(
+            drain_wire(&mut owner_peer).is_empty(),
+            "walk ends at focus C"
+        );
+
+        state.core_focus.raw = W;
+        run_send_event(&mut state, SENDER, 1, &send_event_body(1, 0x01, 2));
+        assert_eq!(wire_types(&drain_wire(&mut owner_peer)), vec![0x82]);
+
+        state.core_focus.raw = 0;
+        run_send_event(&mut state, SENDER, 1, &send_event_body(1, 0x01, 2));
+        assert!(drain_wire(&mut owner_peer).is_empty());
+        assert!(
+            drain_wire(&mut sender_peer).is_empty(),
+            "focus None is not an error"
+        );
+    }
+
+    /// `ProcSendEvent` errors (`dix/events.c:5563-5619`), each measured on
+    /// Xorg (goldens/sendevent-xi2.txt): an unknown destination is
+    /// BadWindow; event types outside 2..=34 and 64.. (GenericEvent too),
+    /// a ClientMessage format other than 8/16/32, and mask bits above
+    /// `AllEventMasks` are BadValue carrying the offending value.
+    #[test]
+    fn send_event_rejects_like_xorg() {
+        const SENDER: u32 = 1;
+        const OWNER: u32 = 2;
+        const W: u32 = 0x0020_0001;
+        const C: u32 = 0x0020_0002;
+        let mut state = ServerState::new();
+        let mut sender_peer = install_client(&mut state, SENDER);
+        let mut owner_peer = install_client(&mut state, OWNER);
+        send_event_tree(&mut state, OWNER, W, C);
+        let mut client_message = send_event_body(W, 0, 33);
+        client_message[9] = 7;
+        let cases: [(Vec<u8>, u8, u32); 6] = [
+            (send_event_body(0x7fff_fff0, 0, 4), 3, 0x7fff_fff0),
+            (send_event_body(W, 0x0200_0000, 4), 2, 0x0200_0000),
+            (send_event_body(W, 0, 1), 2, 1),
+            (send_event_body(W, 0, 35), 2, 35),
+            (send_event_body(W, 0, 40), 2, 40),
+            (client_message, 2, 7),
+        ];
+        for (body, code, value) in cases {
+            run_send_event(&mut state, SENDER, 0, &body);
+            let wire = drain_wire(&mut sender_peer);
+            assert_eq!(wire.len(), 32, "one error for {body:?}");
+            assert_eq!((wire[0], wire[1]), (0, code));
+            assert_eq!(
+                u32::from_le_bytes([wire[4], wire[5], wire[6], wire[7]]),
+                value
+            );
+        }
+        assert!(drain_wire(&mut owner_peer).is_empty());
     }
 
     /// `XIPassiveGrabDevice` with grab_type=Button(0) installs entries
