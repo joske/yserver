@@ -969,3 +969,54 @@ fn a_root_read_sees_a_draw_no_compose_has_shown_yet() {
         );
     }
 }
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn an_exported_root_is_acquired_by_the_priming_and_root_readback_composes() {
+    // A dma-buf-exported drawable is released to the foreign queue family
+    // in GENERAL between submissions; every compose that samples it must
+    // acquire it first, not only the scene tick's.
+    let Some(mut b) = transformed_pair(scale(0x20000, Some(Filter::Nearest)), (192, 96)) else {
+        return;
+    };
+    let root_xid = b.core.window_id;
+    let root_id = b.store.lookup(root_xid).expect("root drawable");
+    b.engine
+        .promote_drawable_exportable(&mut b.platform, &mut b.store, root_id)
+        .expect("promote");
+    let image = b.store.get(root_id).expect("root").storage.image;
+    let released = |b: &KmsBackend| {
+        b.store
+            .get(root_id)
+            .expect("root")
+            .storage
+            .foreign_released_from
+    };
+    assert!(released(&b).is_some(), "promotion releases it");
+    let _ = crate::kms::render::scene::take_foreign_acquires_recorded();
+
+    // Unprimed intermediate: the read primes it, then composes the readback.
+    let got = b
+        .get_image_pixels_for_tests(root_xid, 2, 64, 0, 128, 96, !0)
+        .expect("get_image")
+        .expect("bytes");
+    assert_eq!(got[..3], pattern(64, 0)[..3], "the exported root is read");
+    let acquired = crate::kms::render::scene::take_foreign_acquires_recorded();
+    let by = |target: &str| {
+        acquired
+            .iter()
+            .any(|&(ty, img)| img == image && ty.ends_with(target))
+    };
+    assert!(
+        by("IntermediatePrimeTarget"),
+        "priming acquired it: {acquired:?}"
+    );
+    assert!(
+        by("DamageAuditTarget"),
+        "root readback acquired it: {acquired:?}"
+    );
+    assert!(
+        released(&b).is_some(),
+        "each compose releases what it acquired"
+    );
+}

@@ -4767,14 +4767,6 @@ fn tick_one_output(
         Repaint::Clipped(_) => Some(cull_scene_to_region(&built.scene, &plan.painted)),
         Repaint::Full(_) | Repaint::AuditClearClipped(_) => None,
     };
-    let mut render_scene_owned = culled;
-    let foreign_images = store.foreign_sampled_images(&built.sampled_ids);
-    if !foreign_images.is_empty() {
-        render_scene_owned
-            .get_or_insert_with(|| built.scene.clone())
-            .foreign_images = foreign_images;
-    }
-    let culled = render_scene_owned;
     let render_scene: &CompositeScene = culled.as_ref().unwrap_or(&built.scene);
     if let (Repaint::Clipped(_), Some(c)) = (repaint, culled.as_ref()) {
         // Per scissor rect, not once against the bbox: with 4.5's per-rect
@@ -6083,10 +6075,13 @@ fn build_scene_with(
         (CursorAssignment::Hidden, None, None)
     };
 
+    // Every submission of this scene — compose, root readback, transform
+    // priming, the audit reference — brackets its sampling with these.
+    let foreign_images = store.foreign_sampled_images(&sampled_ids);
     let scene = CompositeScene {
         bg_color: bg,
         draws,
-        foreign_images: Vec::new(),
+        foreign_images,
     };
     SceneBuild {
         scene,
@@ -8863,6 +8858,20 @@ fn record_and_submit_render(
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Every foreign acquire a compose command buffer recorded on this
+    /// thread, as (render target type, image).
+    static FOREIGN_ACQUIRES_RECORDED: std::cell::RefCell<Vec<(&'static str, vk::Image)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Test-only: drain [`FOREIGN_ACQUIRES_RECORDED`].
+#[cfg(test)]
+pub(crate) fn take_foreign_acquires_recorded() -> Vec<(&'static str, vk::Image)> {
+    FOREIGN_ACQUIRES_RECORDED.with_borrow_mut(std::mem::take)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_command_buffer<T: ComposeRenderTarget + ?Sized>(
     vk: &crate::kms::vk::device::VkContext,
@@ -9009,6 +9018,17 @@ fn record_command_buffer<T: ComposeRenderTarget + ?Sized>(
         // Externally shared backings sampled by this frame: acquire them
         // from the foreign queue family before the draws, release after.
         let foreign_family = super::store::foreign_queue_family(vk.queue_family_foreign);
+        #[cfg(test)]
+        if !scene.foreign_images.is_empty() {
+            FOREIGN_ACQUIRES_RECORDED.with_borrow_mut(|log| {
+                log.extend(
+                    scene
+                        .foreign_images
+                        .iter()
+                        .map(|&(image, _)| (std::any::type_name::<T>(), image)),
+                );
+            });
+        }
         if !scene.foreign_images.is_empty() {
             let acquires: Vec<_> = scene
                 .foreign_images
