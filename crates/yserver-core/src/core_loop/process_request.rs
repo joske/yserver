@@ -460,7 +460,7 @@ pub fn process_request(
         145 => handle_present_request(state, backend, origin, client_id, sequence, header, body),
         151 => handle_xinerama_request(state, client_id, sequence, header, body), // XINERAMA
         // ── DAMAGE extension dispatcher ──
-        143 => handle_damage_request(state, client_id, sequence, header, body),
+        143 => handle_damage_request(state, backend, client_id, sequence, header, body),
         // ── MIT-SHM extension dispatcher ──
         130 => handle_mit_shm_request(
             state,
@@ -8544,6 +8544,9 @@ fn handle_xfixes_request(
                 .get(0..4)
                 .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
                 .unwrap_or(0);
+            // A region filled by DamageSubtract carries damage whose pixels
+            // must be published before the reply (#100).
+            flush_exported_writes_for_damage_reply(state, backend, "FetchRegion");
             let rects = state
                 .xfixes_regions
                 .get(&region)
@@ -9364,6 +9367,27 @@ fn handle_composite_request(
     Ok(RequestOutcome::Handled)
 }
 
+/// #100: a request that hands a compositor accumulated damage
+/// (`DamageSubtract`, `FetchRegion`) publishes every unpublished exported
+/// write first, so the damage it reports never runs ahead of its pixels,
+/// independently of the export gate holding the reply. Returns whether it
+/// had to.
+fn flush_exported_writes_for_damage_reply(
+    state: &ServerState,
+    backend: &mut dyn Backend,
+    request: &str,
+) -> bool {
+    let pending = state
+        .output_gate
+        .as_deref()
+        .is_some_and(crate::server::ExportOutputGate::writes_pending);
+    if pending {
+        log::debug!("damage reply flush: {request} publishes exported writes first");
+        backend.flush_before_damage_notify();
+    }
+    pending
+}
+
 /// #100: an fd-carrying reply bypasses the outbound queue, so publish
 /// every unpublished exported write and release held output before it.
 fn flush_output_before_fd_reply(state: &mut ServerState, backend: &mut dyn Backend) {
@@ -10169,6 +10193,7 @@ fn handle_mit_shm_create_segment(
 
 fn handle_damage_request(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
     client_id: ClientId,
     sequence: SequenceNumber,
     header: RequestHeader,
@@ -10280,6 +10305,11 @@ fn handle_damage_request(
         }
         x11damage::SUBTRACT => {
             if let Some((damage_id, repair, parts)) = x11damage::parse_subtract(body) {
+                // The consumed damage reaches the compositor only through a
+                // later reply, which the export gate already holds; publish
+                // here too so no path can hand out damage ahead of its
+                // pixels (#100).
+                flush_exported_writes_for_damage_reply(state, backend, "Subtract");
                 // Per X11 DAMAGE spec (cf. Xorg damageext.c:419 +
                 // miext/damage/damage.c:1854):
                 //   if repair == None: parts ← old damage; damage ← empty
@@ -64848,6 +64878,7 @@ mod tests {
         };
         handle_damage_request(
             &mut state,
+            &mut crate::backend::recording::RecordingBackend::new(),
             ClientId(CLIENT_ID),
             SequenceNumber(1),
             header,
@@ -75050,6 +75081,7 @@ mod tests {
         };
         handle_damage_request(
             &mut state,
+            &mut crate::backend::recording::RecordingBackend::new(),
             ClientId(CLIENT_ID),
             SequenceNumber(1),
             header,
