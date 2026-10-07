@@ -33,6 +33,12 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-10-07 #100 fix:** submit paint before
+  DamageSubtract consumes coalesced damage and before XFixes FetchRegion
+  publishes it. The KMS boundary drains render batches, open frames and queued
+  submissions. HW-confirmed (jos, silence, upstream Plasma X11): the stale
+  Dolphin hover highlight reproduces on master and is gone with this change.
+
 - **2026-10-02 dynamic XI device registry implemented (branch
   `feat/xi-dynamic-registry-implementation`):** KMS/libinput publishes
   source-owned keyboard, pointer, and touchpad facets with independent

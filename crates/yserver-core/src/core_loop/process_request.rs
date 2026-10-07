@@ -460,7 +460,7 @@ pub fn process_request(
         145 => handle_present_request(state, backend, origin, client_id, sequence, header, body),
         151 => handle_xinerama_request(state, client_id, sequence, header, body), // XINERAMA
         // ── DAMAGE extension dispatcher ──
-        143 => handle_damage_request(state, client_id, sequence, header, body),
+        143 => handle_damage_request(state, backend, client_id, sequence, header, body),
         // ── MIT-SHM extension dispatcher ──
         130 => handle_mit_shm_request(
             state,
@@ -8544,6 +8544,10 @@ fn handle_xfixes_request(
                 .get(0..4)
                 .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
                 .unwrap_or(0);
+            // A fetched damage region can include coalesced paint that did
+            // not generate another DamageNotify. Submit it before the reply
+            // lets an external compositor sample the corresponding pixels.
+            backend.flush_before_damage_notify();
             let rects = state
                 .xfixes_regions
                 .get(&region)
@@ -10149,6 +10153,7 @@ fn handle_mit_shm_create_segment(
 
 fn handle_damage_request(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
     client_id: ClientId,
     sequence: SequenceNumber,
     header: RequestHeader,
@@ -10260,6 +10265,10 @@ fn handle_damage_request(
         }
         x11damage::SUBTRACT => {
             if let Some((damage_id, repair, parts)) = x11damage::parse_subtract(body) {
+                // NonEmpty damage coalesces later paints without notifying
+                // again. Submit those writes before acknowledging/consuming
+                // the damage, not only before the initial DamageNotify.
+                backend.flush_before_damage_notify();
                 // Per X11 DAMAGE spec (cf. Xorg damageext.c:419 +
                 // miext/damage/damage.c:1854):
                 //   if repair == None: parts ← old damage; damage ← empty
@@ -64822,6 +64831,7 @@ mod tests {
         };
         handle_damage_request(
             &mut state,
+            &mut backend,
             ClientId(CLIENT_ID),
             SequenceNumber(1),
             header,
@@ -74976,6 +74986,106 @@ mod tests {
     }
 
     #[test]
+    fn damage_subtract_flushes_coalesced_paint_before_consuming_damage() {
+        use yserver_protocol::x11::{damage, xfixes::RegionRect};
+
+        let mut state = ServerState::new();
+        let _peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let rects = vec![RegionRect {
+            x: 10,
+            y: 20,
+            width: 30,
+            height: 40,
+        }];
+        // NonEmpty damage has already notified the compositor; later paints
+        // accumulate without another notification/submission boundary.
+        state.damage_objects.insert(
+            0x100,
+            crate::server::DamageObject {
+                owner: ClientId(1),
+                drawable: ROOT_WINDOW,
+                level: damage::report_level::NON_EMPTY,
+                rects: rects.clone(),
+                pending_notify_fired: true,
+                last_reported_geometry: None,
+            },
+        );
+        let body: Vec<u8> = [0x100_u32, 0, 0x200]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode: 143,
+                data: damage::SUBTRACT,
+                length_units: 4,
+            },
+            &body,
+            None,
+        )
+        .expect("Subtract");
+
+        assert_eq!(state.xfixes_regions[&0x200].rects, rects);
+        assert!(state.damage_objects[&0x100].rects.is_empty());
+        assert_eq!(
+            backend.calls(),
+            vec![RecordedCall::FlushBeforeDamageNotify],
+            "Subtract must submit paint even when there is no new DamageNotify"
+        );
+    }
+
+    #[test]
+    fn fetch_region_flushes_paint_before_exposing_damage_rectangles() {
+        use yserver_protocol::x11::xfixes;
+
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.xfixes_client_major.insert(1, 5);
+        let mut backend = RecordingBackend::new();
+        state.xfixes_regions.insert(
+            0x200,
+            crate::server::XFixesRegion {
+                owner: ClientId(1),
+                rects: vec![xfixes::RegionRect {
+                    x: 10,
+                    y: 20,
+                    width: 30,
+                    height: 40,
+                }],
+            },
+        );
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(2),
+            RequestHeader {
+                opcode: XFIXES_MAJOR_OPCODE,
+                data: xfixes::FETCH_REGION,
+                length_units: 2,
+            },
+            &0x200_u32.to_le_bytes(),
+            None,
+        )
+        .expect("FetchRegion");
+
+        let bytes = read_all_available(&mut peer);
+        assert_eq!(bytes.len(), 40);
+        assert_eq!(bytes[0], 1, "reply, not an error");
+        assert_eq!(&bytes[32..], &[10, 0, 20, 0, 30, 0, 40, 0]);
+        assert_eq!(
+            backend.calls(),
+            vec![RecordedCall::FlushBeforeDamageNotify],
+            "FetchRegion must submit paint before publishing its damage region"
+        );
+    }
+
+    #[test]
     fn damage_create_on_viewable_window_seeds_full_damage() {
         use yserver_protocol::x11::{RequestHeader, damage as x11damage};
 
@@ -75024,6 +75134,7 @@ mod tests {
         };
         handle_damage_request(
             &mut state,
+            &mut RecordingBackend::new(),
             ClientId(CLIENT_ID),
             SequenceNumber(1),
             header,

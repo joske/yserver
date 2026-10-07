@@ -964,8 +964,9 @@ pub trait Backend {
     /// (e.g. host-X11) that don't drive their own composite loop.
     fn mark_dirty(&mut self) {}
 
-    /// Submit drawing that precedes a queued DamageNotify. The core invokes
-    /// this before the notification can drain to an external compositor.
+    /// Submit drawing before exposing its damage to an external compositor,
+    /// through DamageNotify or the Subtract/FetchRegion requests that retrieve
+    /// coalesced damage without another notification.
     /// Immediate-rendering backends keep the default no-op.
     fn flush_before_damage_notify(&mut self) {}
 

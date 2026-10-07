@@ -22125,15 +22125,31 @@ impl Backend for KmsBackend {
     }
 
     fn flush_before_damage_notify(&mut self) {
-        // A compositor may sample a redirected backing as soon as it receives
-        // DamageNotify. Close+submit the frame first so dma-buf implicit sync
-        // contains the producer fence before the notification is observable.
+        // A compositor may sample a redirected backing after DamageNotify
+        // or after retrieving coalesced damage via Subtract/FetchRegion.
+        // Close all recording paths before publishing their producer fences.
+        if let Err(error) = self.engine.flush_render_batch(
+            &mut self.store,
+            &mut self.platform,
+            crate::kms::render::engine::RenderFlushReason::Other,
+        ) {
+            log::warn!("render damage boundary batch flush failed: {error:?}");
+        }
         if let Err(error) = self.engine.close_open_frame(
             &mut self.store,
             &mut self.platform,
             crate::kms::render::frame_builder::CloseReason::RedirectSourceBoundary,
         ) {
             log::warn!("render DamageNotify submission boundary failed: {error:?}");
+        }
+        // Closing an already-closed frame does not drain command buffers
+        // parked in the submit group (including the render batch above).
+        if let Err(error) = self.engine.flush_submit_group(
+            &mut self.store,
+            &mut self.platform,
+            crate::kms::render::submit_group::FlushReason::SyncBoundary,
+        ) {
+            log::warn!("render damage boundary submit flush failed: {error:?}");
         }
     }
 
@@ -41867,6 +41883,89 @@ mod tests {
             b.logged_gaps.borrow().is_empty(),
             "no render gap was logged"
         );
+    }
+
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn damage_boundary_submits_render_batches_and_queued_commands() {
+        use crate::kms::{
+            cpu_types::Repeat,
+            render::{
+                engine::{RenderFlushReason, ResolvedSource, SourceDrawable},
+                target::Dst,
+            },
+            vk::ops::render::CompositeRect,
+        };
+        use yserver_core::backend::Backend;
+
+        for already_queued in [false, true] {
+            let mut b = KmsBackend::for_tests_with_vk().expect("live Vulkan ICD");
+            let src = b.create_pixmap(None, 32, 4, 4).expect("source");
+            let dst = b.create_pixmap(None, 32, 4, 4).expect("destination");
+            b.engine
+                .close_open_frame(
+                    &mut b.store,
+                    &mut b.platform,
+                    crate::kms::render::frame_builder::CloseReason::SyncWait,
+                )
+                .expect("submit initial clears");
+            b.platform.submit_group_set_max_size_for_tests(16);
+            let src_id = b.store.lookup(src.as_raw()).expect("source storage");
+            let dst_id = b.store.lookup(dst.as_raw()).expect("destination storage");
+            let appended = b
+                .engine
+                .try_append_render_batch(
+                    &mut b.store,
+                    &mut b.platform,
+                    1, // PictOpSrc
+                    ResolvedSource::Drawable(SourceDrawable::whole(src_id)),
+                    ResolvedSource::None,
+                    Dst::server_internal(dst_id),
+                    &[CompositeRect {
+                        src_x: 0,
+                        src_y: 0,
+                        mask_x: 0,
+                        mask_y: 0,
+                        dst_x: 0,
+                        dst_y: 0,
+                        width: 4,
+                        height: 4,
+                    }],
+                    None,
+                    Repeat::None,
+                    Repeat::None,
+                    None,
+                    None,
+                    false,
+                    0,
+                    0,
+                    0,
+                )
+                .expect("record composite");
+            assert!(appended.is_some(), "composite takes the batch path");
+            if already_queued {
+                b.engine
+                    .flush_render_batch(&mut b.store, &mut b.platform, RenderFlushReason::Other)
+                    .expect("close batch without submitting");
+                assert!(b.platform.submit_group_size() > 0);
+            } else {
+                assert!(b.engine.has_pending_batches_for_tests());
+            }
+
+            b.flush_before_damage_notify();
+
+            assert!(
+                !b.engine.has_pending_batches_for_tests(),
+                "damage boundary must close a pending render batch"
+            );
+            assert_eq!(
+                b.platform.submit_group_size(),
+                0,
+                "damage boundary must submit even without an open frame"
+            );
+            assert_eq!(b.engine.pending_group_ops_count_for_tests(), 0);
+            b.platform.wait_idle_bounded();
+        }
     }
 
     /// Window-storage step 5: the root and the COW own their storage outside the lifecycle.
