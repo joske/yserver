@@ -1015,41 +1015,107 @@ pub(super) fn disconnect_failed_writers(
     }
 }
 
-/// #100 damage barrier, the analog of Xorg flushing client output only
-/// after the BlockHandler's glamor flush. If a DamageNotify was queued, the
-/// backend submits the writes it announces and publishes their export
-/// fences; only then is the output of every client a DamageNotify held
-/// (`damage_fanout::hold_output_for_damage_notify`) released toward its
-/// socket. A failed release marks the client `write_failed` for the
-/// normal disconnect path.
+/// Where [`output_barrier`] runs (#100).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputBarrier {
+    /// After a request: flushes only for a DamageNotify it queued (as
+    /// before the export gate); output the gate held for anything else
+    /// waits for the loop's block point, so a burst of requests shares one
+    /// flush, as glamor's BlockHandler flush does in Xorg.
+    RequestEnd,
+    /// Before the loop polls again (and around its tail), the analog of
+    /// Xorg's BlockHandler + `FlushAllOutput`: anything held is flushed
+    /// and released.
+    Block,
+    /// An fd-carrying reply is about to bypass the outbound queue: every
+    /// unpublished exported write is flushed first, then held output is
+    /// released ahead of it.
+    BeforeFdReply,
+}
+
+/// #100 damage barrier at request end (see [`OutputBarrier::RequestEnd`]).
 pub(crate) fn damage_notify_barrier(state: &mut ServerState, backend: &mut dyn Backend) {
-    if std::mem::take(&mut state.damage_notify_flush_pending) {
+    output_barrier(state, backend, OutputBarrier::RequestEnd);
+}
+
+/// #100 output barrier, the analog of Xorg writing client output only in
+/// `FlushAllOutput`, after the BlockHandler's glamor flush. While the
+/// backend has unpublished exported writes, `client_io::write_or_buffer`
+/// holds every client's output (replies, events, errors alike, each
+/// client's tail in order). Here the backend submits those writes and
+/// publishes their export fences; only then is held output released
+/// toward the sockets. Without a gate, or with nothing pending or held,
+/// this is two atomic loads. A failed release marks the client
+/// `write_failed` for the normal disconnect path.
+pub(crate) fn output_barrier(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    at: OutputBarrier,
+) {
+    let (pending, held) = state.output_gate.as_deref().map_or((false, false), |gate| {
+        (gate.writes_pending(), gate.any_held())
+    });
+    let flush = std::mem::take(&mut state.damage_notify_flush_pending)
+        || match at {
+            OutputBarrier::RequestEnd => false,
+            OutputBarrier::Block => held && pending,
+            OutputBarrier::BeforeFdReply => pending,
+        };
+    if flush {
         backend.flush_before_damage_notify();
     }
-    for client_id in std::mem::take(&mut state.damage_held_clients) {
-        if let Some(client) = state.clients.get_mut(&client_id.0) {
+    // At request end, held output stays held unless this barrier flushed
+    // or something else (a readback, a frame) already published the writes.
+    let release = held
+        && (flush
+            || at != OutputBarrier::RequestEnd
+            || !state
+                .output_gate
+                .as_deref()
+                .is_some_and(crate::server::ExportOutputGate::writes_pending));
+    if release {
+        release_held_output(state);
+    }
+    note_output_probes(state, backend);
+}
+
+fn release_held_output(state: &mut ServerState) {
+    if let Some(gate) = state.output_gate.as_deref() {
+        gate.take_held();
+    }
+    for client in state.clients.values_mut() {
+        if client.output_held {
             let _ = client_io::release_output(client);
         }
     }
+}
+
+/// Hand the backend every probe whose output has left (or was released);
+/// probes for output still held wait for the barrier that releases it.
+fn note_output_probes(state: &mut ServerState, backend: &mut dyn Backend) {
     if state.damage_notify_probes.is_empty() {
         return;
     }
     let released_at = Instant::now();
-    let probes = std::mem::take(&mut state.damage_notify_probes)
-        .into_iter()
-        .map(|entry| {
-            let mut probe = entry.probe;
-            if entry.held {
-                probe.on_wire_at = state
-                    .clients
-                    .get(&entry.client.0)
-                    .is_some_and(|c| c.outbound.is_empty() && !c.write_failed)
-                    .then_some(released_at);
-            }
-            probe
-        })
-        .collect();
-    backend.note_damage_notify_probes(probes);
+    let mut ready = Vec::new();
+    let clients = &state.clients;
+    state.damage_notify_probes.retain(|entry| {
+        let client = clients.get(&entry.client.0);
+        if entry.held && client.is_some_and(|c| c.output_held) {
+            return true;
+        }
+        let mut probe = entry.probe;
+        if entry.held {
+            probe.on_wire_at = client
+                .is_some_and(|c| c.outbound.is_empty() && !c.write_failed)
+                .then_some(released_at);
+        }
+        ready.push(probe);
+        false
+    });
+    if !ready.is_empty() {
+        backend.note_damage_notify_probes(ready);
+    }
 }
 
 /// Disconnect every client whose output failed (RECORD data connections
@@ -1065,9 +1131,9 @@ fn settle_client_output(
     reset_trigger: &mut ResetTrigger,
 ) {
     loop {
-        // Nothing may wait for WRITABLE behind a damage hold: a disconnect's
-        // own notifications can queue DamageNotify too.
-        damage_notify_barrier(state, backend);
+        // Nothing may wait for WRITABLE behind an export hold: a
+        // disconnect's own notifications can be held too.
+        output_barrier(state, backend, OutputBarrier::Block);
         // RECORD failures are queued, since that write can happen inside
         // another client's disconnect.
         let recorders = crate::core_loop::record::take_failed_recorders(state);
@@ -3088,7 +3154,7 @@ pub(crate) fn run_iteration_tail(state: &mut ServerState, backend: &mut dyn Back
     // Damage can also originate outside a directly-dispatched request (for
     // example deferred Present execution). Preserve the same write-before-
     // observer boundary before the next poll can drain client output.
-    damage_notify_barrier(state, backend);
+    output_barrier(state, backend, OutputBarrier::Block);
 
     // Service time-based backend work that is not tied to an fd edge. The
     // backend reports its cadence via `next_wakeup`.
@@ -4544,6 +4610,7 @@ fn handle_client_setup_complete(
             watching_writable: false,
             write_failed: false,
             output_held: false,
+            output_gate: state.output_gate.clone(),
             focused_window: crate::resources::ROOT_WINDOW,
             reader_control: Some(reader_control_tx),
             is_local,
@@ -4844,6 +4911,7 @@ mod tests {
                 watching_writable: false,
                 write_failed: false,
                 output_held: false,
+                output_gate: None,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -4880,6 +4948,7 @@ mod tests {
             watching_writable: false,
             write_failed: false,
             output_held: false,
+            output_gate: None,
             focused_window: crate::resources::ROOT_WINDOW,
             reader_control: None,
             is_local: true,
@@ -6313,6 +6382,7 @@ mod tests {
                 watching_writable: false,
                 write_failed: false,
                 output_held: false,
+                output_gate: None,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -6721,6 +6791,7 @@ mod tests {
                 watching_writable: false,
                 write_failed: false,
                 output_held: false,
+                output_gate: None,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: Some(control_tx),
                 is_local: true,
@@ -6888,6 +6959,7 @@ mod tests {
                 watching_writable: false,
                 write_failed: false,
                 output_held: false,
+                output_gate: None,
                 focused_window: crate::resources::ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,

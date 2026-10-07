@@ -9364,6 +9364,16 @@ fn handle_composite_request(
     Ok(RequestOutcome::Handled)
 }
 
+/// #100: an fd-carrying reply bypasses the outbound queue, so publish
+/// every unpublished exported write and release held output before it.
+fn flush_output_before_fd_reply(state: &mut ServerState, backend: &mut dyn Backend) {
+    crate::core_loop::run::output_barrier(
+        state,
+        backend,
+        crate::core_loop::run::OutputBarrier::BeforeFdReply,
+    );
+}
+
 /// Special-case writer for MIT-SHM CreateSegment: sends a normal X11
 /// reply alongside an SCM_RIGHTS file descriptor. This is the one path
 /// where the lifted code reaches around `client_io::write_or_buffer`
@@ -9382,10 +9392,12 @@ fn send_reply_with_fd(
             "file descriptor passing is unavailable on this transport",
         ));
     }
-    // An fd cannot ride the outbound queue, so a damage barrier cannot
-    // hold this reply: release the held tail ahead of it, in order.
+    // An fd cannot ride the outbound queue, so the export barrier cannot
+    // hold this reply. Callers run `OutputBarrier::BeforeFdReply` first,
+    // which publishes exported writes and releases held output; should a
+    // hold still be set, it is released ahead of the reply, in order.
     if client.output_held {
-        log::debug!("fd reply releases a damage-barrier hold early");
+        log::debug!("fd reply releases an export-barrier hold early");
         client.output_held = false;
     }
     // Drain whatever's pending so the SCM_RIGHTS frame lands in order.
@@ -9591,7 +9603,7 @@ fn handle_mit_shm_request(
                     MIT_SHM_MAJOR_OPCODE,
                 );
             };
-            return handle_mit_shm_create_segment(state, client_id, sequence, req);
+            return handle_mit_shm_create_segment(state, backend, client_id, sequence, req);
         }
         other => {
             return emit_x11_error_with_minor(
@@ -10043,6 +10055,7 @@ fn handle_mit_shm_get_image(
 
 fn handle_mit_shm_create_segment(
     state: &mut ServerState,
+    backend: &mut dyn Backend,
     client_id: ClientId,
     sequence: SequenceNumber,
     req: yserver_protocol::x11::mit_shm::CreateSegmentRequest,
@@ -10113,6 +10126,7 @@ fn handle_mit_shm_create_segment(
         }
     };
     state.mit_shm_segments.insert(req.shmseg, segment);
+    flush_output_before_fd_reply(state, backend);
     let send_res = match state.clients.get_mut(&client_id.0) {
         Some(client) => {
             let reply = yserver_protocol::x11::mit_shm::encode_create_segment_reply(
@@ -14985,6 +14999,7 @@ fn handle_dri3_request(
                         std::os::fd::AsRawFd::as_raw_fd(&fd)
                     );
                     let reply = x11dri3::encode_open_reply(byte_order, sequence);
+                    flush_output_before_fd_reply(state, backend);
                     let Some(client) = state.clients.get_mut(&client_id.0) else {
                         return Ok(RequestOutcome::Handled);
                     };
@@ -15258,6 +15273,7 @@ fn handle_dri3_request(
                     let reply = x11dri3::encode_buffer_from_pixmap_reply(
                         byte_order, sequence, size, width, height, stride, depth, bpp,
                     );
+                    flush_output_before_fd_reply(state, backend);
                     let Some(client) = state.clients.get_mut(&client_id.0) else {
                         return Ok(RequestOutcome::Handled);
                     };
@@ -15351,6 +15367,7 @@ fn handle_dri3_request(
                         &[export.stride],
                         &[export.offset],
                     );
+                    flush_output_before_fd_reply(state, backend);
                     let Some(client) = state.clients.get_mut(&client_id.0) else {
                         return Ok(RequestOutcome::Handled);
                     };
@@ -15513,6 +15530,7 @@ fn handle_dri3_request(
             match backend.dri3_fd_from_fence(req.fence) {
                 Ok(fd) => {
                     let reply = x11dri3::encode_fd_from_fence_reply(byte_order, sequence);
+                    flush_output_before_fd_reply(state, backend);
                     let Some(client) = state.clients.get_mut(&client_id.0) else {
                         return Ok(RequestOutcome::Handled);
                     };
@@ -36411,6 +36429,7 @@ mod tests {
                 watching_writable: false,
                 write_failed: false,
                 output_held: false,
+                output_gate: None,
                 focused_window: ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,

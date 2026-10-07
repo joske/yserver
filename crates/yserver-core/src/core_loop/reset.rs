@@ -538,6 +538,7 @@ mod tests {
                 watching_writable: false,
                 write_failed: false,
                 output_held: false,
+                output_gate: None,
                 focused_window: ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,

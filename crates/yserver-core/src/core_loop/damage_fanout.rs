@@ -444,7 +444,6 @@ pub fn accumulate_damage_to_state(
     for n in pending {
         let geometry = n.geometry;
         let area = n.area;
-        hold_output_for_damage_notify(state, n.owner);
         let extras = fanout_event_to_clients(state, &[n.owner], |buf, seq, order| {
             encode_damage_notify(buf, order, seq, &n, timestamp, area, geometry);
         });
@@ -578,7 +577,6 @@ pub fn report_existing_damage_to_state(state: &mut ServerState, damage_id: u32) 
     for n in pending {
         let geometry = n.geometry;
         let area = n.area;
-        hold_output_for_damage_notify(state, n.owner);
         let extras = fanout_event_to_clients(state, &[n.owner], |buf, seq, order| {
             encode_damage_notify(buf, order, seq, &n, timestamp, area, geometry);
         });
@@ -590,32 +588,6 @@ pub fn report_existing_damage_to_state(state: &mut ServerState, damage_id: u32) 
         }
     }
     dropped
-}
-
-/// #100: a DamageNotify must not reach its client before the GPU writes it
-/// announces are submitted with their dma-buf write fences, or a
-/// compositor sampling the exported backing on receipt reads stale pixels.
-/// Xorg gets this for free: events only leave in `FlushAllOutput`, after
-/// the BlockHandler's glamor flush. While the backend reports unpublished
-/// exported writes, hold the owner's whole output tail (so its events,
-/// replies and errors stay in order) until the damage barrier
-/// (`run::damage_notify_barrier`) has flushed. Without pending writes the
-/// event goes straight out, as before.
-fn hold_output_for_damage_notify(state: &mut ServerState, owner: ClientId) {
-    let pending = state
-        .export_writes_pending
-        .as_ref()
-        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
-    if !pending {
-        return;
-    }
-    let Some(client) = state.clients.get_mut(&owner.0) else {
-        return;
-    };
-    if !client.output_held {
-        crate::core_loop::client_io::hold_output(client);
-        state.damage_held_clients.push(owner);
-    }
 }
 
 /// Diagnostic (#100): note where a just-queued DamageNotify's drawable
@@ -986,6 +958,7 @@ mod tests {
                 watching_writable: false,
                 write_failed: false,
                 output_held: false,
+                output_gate: None,
                 focused_window: ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -1074,6 +1047,7 @@ mod tests {
                 watching_writable: false,
                 write_failed: false,
                 output_held: false,
+                output_gate: None,
                 focused_window: ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -1736,6 +1710,7 @@ mod tests {
                 watching_writable: false,
                 write_failed: false,
                 output_held: false,
+                output_gate: None,
                 focused_window: ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
@@ -2085,7 +2060,7 @@ mod tests {
         );
         assert_eq!(wire_codes(&f.wire), vec![DAMAGE_FIRST_EVENT]);
         assert!(!f.state.clients[&1].output_held);
-        assert!(f.state.damage_held_clients.is_empty());
+        assert!(!f.state.output_gate.as_deref().unwrap().any_held());
         assert!(!f.flag.load(Ordering::Relaxed));
     }
 
@@ -2172,6 +2147,6 @@ mod tests {
         let client = &f.state.clients[&1];
         assert!(!client.output_held);
         assert!(client.write_failed);
-        assert!(f.state.damage_held_clients.is_empty());
+        assert!(!f.state.output_gate.as_deref().unwrap().any_held());
     }
 }

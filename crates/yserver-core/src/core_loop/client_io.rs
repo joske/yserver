@@ -48,10 +48,20 @@ pub enum WriteOutcome {
 }
 
 /// Write `bytes` to the client. Drains any already-buffered outbound
-/// first so wire ordering is preserved.
+/// first so wire ordering is preserved. While the server's export gate
+/// reports unpublished exported writes (#100), the client's output is
+/// held instead: these and all later bytes queue in `outbound` until the
+/// output barrier flushes and calls [`release_output`].
 pub fn write_or_buffer(client: &mut ClientState, bytes: &[u8]) -> io::Result<WriteOutcome> {
     if client.write_failed {
         return Ok(WriteOutcome::Disconnect);
+    }
+    if !client.output_held
+        && let Some(gate) = &client.output_gate
+        && gate.writes_pending()
+    {
+        gate.note_held();
+        client.output_held = true;
     }
     let outcome = if client.output_held {
         Ok(buffer_or_disconnect(client, bytes))
@@ -61,16 +71,9 @@ pub fn write_or_buffer(client: &mut ClientState, bytes: &[u8]) -> io::Result<Wri
     note_failure(client, outcome)
 }
 
-/// Hold `client`'s output behind a damage barrier (#100): everything
-/// written from now on, and anything already queued, stays in `outbound`
-/// until [`release_output`]. Holding the whole tail, not one event, keeps
-/// the client's events, replies and errors in generation order.
-pub fn hold_output(client: &mut ClientState) {
-    client.output_held = true;
-}
-
-/// Lift [`hold_output`] and push the held bytes toward the socket. A
-/// failure marks the client `write_failed`, as any other write does.
+/// Lift an export-barrier hold (#100) and push the held bytes toward the
+/// socket. A failure marks the client `write_failed`, as any other write
+/// does.
 pub fn release_output(client: &mut ClientState) -> io::Result<WriteOutcome> {
     client.output_held = false;
     drain_outbound(client)
@@ -243,6 +246,7 @@ mod tests {
             watching_writable: false,
             write_failed: false,
             output_held: false,
+            output_gate: None,
             focused_window: ResourceId(0),
             reader_control: None,
             is_local: true,

@@ -975,23 +975,25 @@ pub trait Backend {
     /// (e.g. host-X11) that don't drive their own composite loop.
     fn mark_dirty(&mut self) {}
 
-    /// Submit drawing that precedes a queued DamageNotify. The core invokes
-    /// this before the notification can drain to an external compositor.
-    /// Immediate-rendering backends keep the default no-op.
+    /// Submit drawing that precedes a queued DamageNotify, or any client
+    /// output held behind unpublished exported writes (#100), and publish
+    /// its export write fences. The core invokes this before that output
+    /// can drain to a client. Immediate-rendering backends keep the
+    /// default no-op.
     fn flush_before_damage_notify(&mut self) {}
 
     /// #100: a flag the backend keeps set while a GPU write to a
     /// dma-buf-exported drawable is recorded but not yet submitted with its
-    /// export write fence. The core holds a DamageNotify's client output
+    /// export write fence. The core holds every client's output written
     /// while it is set, until [`Self::flush_before_damage_notify`] ran.
     /// Default: `None` (immediate-rendering backends never defer).
     fn export_writes_pending_flag(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
         None
     }
 
-    /// Diagnostic (#100): the DamageNotify events sent since the last
-    /// damage boundary, handed over just before
-    /// [`Self::flush_before_damage_notify`]. Default: ignored.
+    /// Diagnostic (#100): the DamageNotify events that left (or were
+    /// released toward) their sockets since the last output barrier.
+    /// Default: ignored.
     fn note_damage_notify_probes(&mut self, _probes: Vec<DamageNotifyProbe>) {}
 
     /// Earliest backend-owned deadline the core loop must wake for

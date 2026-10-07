@@ -166,7 +166,12 @@ pub fn install_backend_root_bindings(
     if let Some(root) = state.resources.window_mut(ROOT_WINDOW) {
         root.host_xid = WindowHandle::from_raw(backend.window_id());
     }
-    state.export_writes_pending = backend.export_writes_pending_flag();
+    state.output_gate = backend
+        .export_writes_pending_flag()
+        .map(|pending| std::sync::Arc::new(crate::server::ExportOutputGate::new(pending)));
+    for client in state.clients.values_mut() {
+        client.output_gate.clone_from(&state.output_gate);
+    }
     state
         .resources
         .set_visual_host_xid(ROOT_VISUAL, backend.root_visual_xid());
