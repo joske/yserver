@@ -296,11 +296,121 @@ pub(crate) fn clip_lists_under(
     out
 }
 
+/// `w`'s outer rect in its parent's content space, border included.
+fn outer_rect(state: &ServerState, w: ResourceId) -> Option<RegionRect> {
+    let win = state.resources.window(w)?;
+    let bw2 = win.border_width.saturating_mul(2);
+    Some(RegionRect {
+        x: win.x,
+        y: win.y,
+        width: win.width.saturating_add(bw2),
+        height: win.height.saturating_add(bw2),
+    })
+}
+
+fn overlaps(a: RegionRect, b: RegionRect) -> bool {
+    let (ax, ay, bx, by) = (
+        i32::from(a.x),
+        i32::from(a.y),
+        i32::from(b.x),
+        i32::from(b.y),
+    );
+    ax < bx + i32::from(b.width)
+        && bx < ax + i32::from(a.width)
+        && ay < by + i32::from(b.height)
+        && by < ay + i32::from(a.height)
+}
+
+/// The clip lists of `parent` and of those of its children in `members`
+/// with their subtrees, in exposure order (`miHandleValidateExposures`
+/// from the layer's parent): the parent, then the members top-most first.
+fn clip_lists_of(
+    state: &ServerState,
+    parent: ResourceId,
+    members: &[ResourceId],
+) -> Vec<(ResourceId, Vec<RegionRect>)> {
+    let universe = not_clipped_by_children(state, parent);
+    let mut out = vec![(parent, clip_list_from(state, parent, universe.clone()))];
+    for c in state.resources.children(parent).iter().rev() {
+        if members.contains(c) {
+            let u = child_universe(state, &universe, parent, *c);
+            walk(state, *c, u, &mut out);
+        }
+    }
+    out
+}
+
+/// A change to a viewable window's geometry, stacking or shape, as Xorg
+/// validates one (`ValidateTree` + `HandleExposures` from the parent,
+/// `dix/window.c:2149-2176`, `mi/miwindow.c`): the clip lists it can
+/// alter, taken before the change, so that [`TreeChange::exposed`] can
+/// diff them against the ones after. Those are the parent's and those of
+/// the siblings (the window included) that meet the window's outer rect
+/// before or after, with their subtrees; no other window's clip list
+/// depends on the change.
+pub(crate) struct TreeChange {
+    parent: ResourceId,
+    members: Vec<ResourceId>,
+    before: Vec<(ResourceId, Vec<RegionRect>)>,
+}
+
+impl TreeChange {
+    /// Snapshot before changing `w`; `reach` is the outer rect (parent
+    /// content space) the change moves or sizes it to, if any. `None` for
+    /// a window that is not viewable: its change exposes nothing.
+    pub(crate) fn begin(
+        state: &ServerState,
+        w: ResourceId,
+        reach: Option<RegionRect>,
+    ) -> Option<Self> {
+        if w == ROOT_WINDOW || !viewable(state, w) {
+            return None;
+        }
+        let parent = state.resources.window(w)?.parent;
+        let mut extent = vec![outer_rect(state, w)?];
+        extent.extend(reach);
+        let members: Vec<ResourceId> = state
+            .resources
+            .children(parent)
+            .iter()
+            .copied()
+            .filter(|s| {
+                *s == w
+                    || (viewable(state, *s)
+                        && outer_rect(state, *s)
+                            .is_some_and(|r| extent.iter().any(|e| overlaps(r, *e))))
+            })
+            .collect();
+        let before = clip_lists_of(state, parent, &members);
+        Some(Self {
+            parent,
+            members,
+            before,
+        })
+    }
+
+    /// Per window, in exposure order, what it shows now that it did not
+    /// before (`miComputeClips`: the new clip list less the old one, both
+    /// in the window's own space, `mi/mivaltree.c:453-458`). `whole` gets
+    /// its entire clip list instead: a resized window's contents are
+    /// forfeit (`mi/miwindow.c:466-472`).
+    pub(crate) fn exposed(
+        self,
+        state: &ServerState,
+        whole: Option<ResourceId>,
+    ) -> Vec<(ResourceId, Vec<RegionRect>)> {
+        let after = clip_lists_of(state, self.parent, &self.members);
+        newly_exposed(&self.before, after, whole)
+    }
+}
+
 /// Per window, what `after` shows that `before` did not: the exposures a
 /// change between the two makes, in `after`'s order.
+/// `whole`, if any, gains its entire clip list.
 pub(crate) fn newly_exposed(
     before: &[(ResourceId, Vec<RegionRect>)],
     after: Vec<(ResourceId, Vec<RegionRect>)>,
+    whole: Option<ResourceId>,
 ) -> Vec<(ResourceId, Vec<RegionRect>)> {
     after
         .into_iter()
@@ -308,7 +418,8 @@ pub(crate) fn newly_exposed(
             let old = before
                 .iter()
                 .find(|(b, _)| *b == w)
-                .map(|(_, r)| r.as_slice());
+                .map(|(_, r)| r.as_slice())
+                .filter(|_| Some(w) != whole);
             let gained = match old {
                 Some(old) => subtract(&region, old),
                 None => region,
@@ -420,5 +531,153 @@ mod tests {
         assert_eq!(got[1].1, vec![r(0, 0, 100, 50)]);
         assert_eq!(got[2].1, vec![r(0, 0, 100, 80)]);
         assert_eq!(got[3].1, vec![r(30, 0, 70, 30), r(30, 30, 10, 20)]);
+    }
+
+    fn configure(
+        state: &mut ServerState,
+        id: u32,
+        geom: Option<(i16, i16, u16, u16)>,
+        stack: Option<(u8, Option<u32>)>,
+    ) {
+        state
+            .resources
+            .configure_window(yserver_protocol::x11::ConfigureWindowRequest {
+                window: ResourceId(id),
+                value_mask: 0,
+                x: geom.map(|g| g.0),
+                y: geom.map(|g| g.1),
+                width: geom.map(|g| g.2),
+                height: geom.map(|g| g.3),
+                border_width: None,
+                sibling: stack.and_then(|s| s.1).map(ResourceId),
+                stack_mode: stack.map(|s| s.0),
+            });
+    }
+
+    fn change(
+        state: &mut ServerState,
+        id: u32,
+        geom: Option<(i16, i16, u16, u16)>,
+        stack: Option<(u8, Option<u32>)>,
+        whole: bool,
+    ) -> Vec<(u32, Vec<RegionRect>)> {
+        let reach = geom.map(|g| r(g.0, g.1, g.2, g.3));
+        let change = TreeChange::begin(state, ResourceId(id), reach).unwrap();
+        configure(state, id, geom, stack);
+        change
+            .exposed(state, whole.then_some(ResourceId(id)))
+            .into_iter()
+            .map(|(w, region)| (w.0, region))
+            .collect()
+    }
+
+    /// tools/vng-scenarios/restack-expose-probe.c's top-levels, measured
+    /// on Xorg without a compositor (goldens/restack-expose.txt): A and B
+    /// at (40,40) 200x150, A stacked under B, C at (180,120) 120x100 on
+    /// top. Each restack, move and resize exposes the new clip list less
+    /// the old one, a resized window its whole clip list, the higher
+    /// window first.
+    #[test]
+    fn tree_changes_expose_what_xorg_exposes() {
+        const ABOVE: u8 = 0;
+        const BELOW: u8 = 1;
+        let mut state = ServerState::with_geometry(1024, 768);
+        let (a, b, c) = (0x0020_0001, 0x0020_0002, 0x0020_0003);
+        window(&mut state, b, ROOT_WINDOW, (40, 40, 200, 150), 1);
+        window(&mut state, a, ROOT_WINDOW, (40, 40, 200, 150), 1);
+        configure(&mut state, a, None, Some((BELOW, None)));
+        let root = ROOT_WINDOW.0;
+
+        let got = change(&mut state, a, None, Some((ABOVE, None)), false);
+        assert_eq!(got, vec![(a, vec![r(0, 0, 200, 150)])], "A raised");
+        let got = change(&mut state, a, None, Some((BELOW, None)), false);
+        assert_eq!(got, vec![(b, vec![r(0, 0, 200, 150)])], "A lowered");
+
+        window(&mut state, c, ROOT_WINDOW, (180, 120, 120, 100), 1);
+        let got = change(&mut state, a, None, Some((BELOW, Some(c))), false);
+        assert_eq!(
+            got,
+            vec![(a, vec![r(0, 0, 200, 80), r(0, 80, 140, 70)])],
+            "A raised to just below C"
+        );
+        let got = change(&mut state, a, None, Some((ABOVE, None)), false);
+        assert_eq!(got, vec![(a, vec![r(140, 80, 60, 70)])], "A raised over C");
+        let got = change(&mut state, a, None, Some((BELOW, None)), false);
+        assert_eq!(
+            got,
+            vec![
+                (c, vec![r(0, 0, 60, 70)]),
+                (b, vec![r(0, 0, 200, 80), r(0, 80, 140, 70)]),
+            ],
+            "A lowered under B and C"
+        );
+
+        let got = change(&mut state, b, Some((70, 60, 200, 150)), None, false);
+        assert_eq!(
+            got.iter()
+                .filter(|(w, _)| *w != root)
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![(a, vec![r(0, 0, 200, 20), r(0, 20, 30, 130)])],
+            "B moved by 30,20"
+        );
+        let got = change(&mut state, b, Some((70, 60, 230, 170)), None, true);
+        assert_eq!(
+            got,
+            vec![(
+                b,
+                vec![r(0, 0, 230, 60), r(0, 60, 110, 100), r(0, 160, 230, 10)]
+            )],
+            "B grown to 230x170"
+        );
+        let got = change(&mut state, b, Some((70, 60, 150, 100)), None, true);
+        assert_eq!(
+            got.iter()
+                .filter(|(w, _)| *w != root)
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![
+                (b, vec![r(0, 0, 150, 60), r(0, 60, 110, 40)]),
+                (a, vec![r(180, 20, 20, 60), r(30, 120, 110, 30)]),
+            ],
+            "B shrunk to 150x100"
+        );
+    }
+
+    /// The same under an Automatic RedirectSubwindows of the root, measured
+    /// on Xorg: a redirected window's clip list is its own shape, so a
+    /// restack exposes nothing and a resize the whole window.
+    #[test]
+    fn redirected_top_levels_are_not_exposed_by_restacks() {
+        let mut state = ServerState::with_geometry(1024, 768);
+        let (a, b) = (0x0020_0001, 0x0020_0002);
+        window(&mut state, b, ROOT_WINDOW, (40, 40, 200, 150), 1);
+        window(&mut state, a, ROOT_WINDOW, (40, 40, 200, 150), 1);
+        configure(&mut state, a, None, Some((1, None)));
+        for w in [a, b] {
+            state
+                .composite_redirects
+                .redirect_window(
+                    ResourceId(w),
+                    crate::server::RedirectRecord {
+                        owner: yserver_protocol::x11::ClientId(1),
+                        mode: CompositeRedirectMode::Automatic,
+                    },
+                )
+                .unwrap();
+        }
+        let got = change(&mut state, a, None, Some((0, None)), false);
+        assert!(
+            got.iter().all(|(w, _)| *w == ROOT_WINDOW.0),
+            "A raised: {got:?}"
+        );
+        let got = change(&mut state, b, Some((40, 40, 230, 170)), None, true);
+        assert_eq!(
+            got.iter()
+                .filter(|(w, _)| *w != ROOT_WINDOW.0)
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![(b, vec![r(0, 0, 230, 170)])]
+        );
     }
 }

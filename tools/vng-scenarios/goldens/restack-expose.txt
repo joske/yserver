@@ -1,0 +1,289 @@
+==> direct.log <==
+mode direct
+B mapped:
+  Expose B 0,0 200x150 count=0
+  B@100,75: yellow
+A mapped under B:
+  no Expose
+A raised:
+  Expose A 0,0 200x150 count=0
+  A@100,75: blue
+A lowered:
+  Expose B 0,0 200x150 count=0
+  B@100,75: red
+C mapped over A and B:
+  Expose C 0,0 120x100 count=0
+A raised to just below C:
+  Expose A 0,0 200x80 count=1
+  Expose A 0,80 140x70 count=0
+  A@20,20: blue
+A raised over C:
+  Expose A 140,80 60x70 count=0
+  A@160,100: blue
+A lowered under B and C:
+  Expose C 0,0 60x70 count=0
+  Expose B 0,0 200x80 count=1
+  Expose B 0,80 140x70 count=0
+  B@20,20: red
+  C@20,20: green
+B unmapped:
+  Expose A 0,0 200x80 count=1
+  Expose A 0,80 140x70 count=0
+  A@20,20: blue
+B mapped again:
+  Expose B 0,0 200x80 count=1
+  Expose B 0,80 140x70 count=0
+B moved by 30,20:
+  Expose A 0,0 200x20 count=1
+  Expose A 0,20 30x130 count=0
+  A@10,10: blue
+B grown to 230x170:
+  Expose B 0,0 230x60 count=2
+  Expose B 0,60 110x100 count=1
+  Expose B 0,160 230x10 count=0
+B shrunk to 150x100:
+  Expose B 0,0 150x60 count=1
+  Expose B 0,60 110x40 count=0
+  Expose A 180,20 20x60 count=1
+  Expose A 30,120 110x30 count=0
+  A@190,40: blue
+C destroyed:
+  Expose B 110,60 40x40 count=0
+  Expose A 180,80 20x40 count=1
+  Expose A 140,120 60x30 count=0
+A and B unmapped:
+  no Expose
+P mapped:
+  Expose P 0,0 260x10 count=9
+  Expose P 0,10 10x40 count=8
+  Expose P 130,10 130x40 count=7
+  Expose P 0,50 10x50 count=6
+  Expose P 180,50 80x50 count=5
+  Expose P 0,100 60x40 count=4
+  Expose P 250,100 10x40 count=3
+  Expose P 0,140 150x50 count=2
+  Expose P 250,140 10x50 count=1
+  Expose P 0,190 260x10 count=0
+  Expose S3 0,0 100x90 count=0
+  Expose S2 0,0 120x50 count=1
+  Expose S2 0,50 90x40 count=0
+  Expose S1 0,0 120x40 count=1
+  Expose S1 0,40 50x50 count=0
+S1 raised:
+  Expose S1 50,40 70x50 count=0
+  S1@100,70: blue
+circulate P RaiseLowest:
+  Expose S2 0,0 70x50 count=1
+  Expose S2 90,50 30x40 count=0
+  S2@10,10: magenta
+circulate P LowerHighest:
+  Expose S1 50,40 70x50 count=0
+  Expose S3 0,0 30x40 count=0
+  S3@20,10: cyan
+S3 moved by -30,10:
+  Expose P 180,100 70x10 count=1
+  Expose P 220,110 30x80 count=0
+  Expose S2 90,50 30x10 count=0
+  S2@115,55: magenta
+S2 shaped to its left half:
+  Expose P 130,50 50x50 count=1
+  Expose P 120,100 60x10 count=0
+S2 shape removed:
+  Expose S2 70,0 50x50 count=1
+  Expose S2 60,50 60x10 count=0
+S1 unmapped:
+  Expose P 10,10 120x40 count=1
+  Expose P 10,50 50x50 count=0
+  Expose S2 0,0 70x50 count=0
+S3 reparented to the root:
+  Expose P 180,110 40x30 count=1
+  Expose P 120,140 100x60 count=0
+  Expose S2 60,60 60x30 count=0
+  Expose S3 0,0 100x90 count=0
+  S3@50,45: cyan
+S3 destroyed, P unmapped:
+  no Expose
+==> automatic.log <==
+mode automatic
+B mapped:
+  Expose B 0,0 200x150 count=0
+  B@100,75: yellow
+A mapped under B:
+  Expose A 0,0 200x150 count=0
+A raised:
+  no Expose
+  A@100,75: blue
+A lowered:
+  no Expose
+  B@100,75: yellow
+C mapped over A and B:
+  Expose C 0,0 120x100 count=0
+A raised to just below C:
+  no Expose
+  A@20,20: blue
+A raised over C:
+  no Expose
+  A@160,100: blue
+A lowered under B and C:
+  no Expose
+  B@20,20: yellow
+  C@20,20: orange
+B unmapped:
+  no Expose
+  A@20,20: blue
+B mapped again:
+  Expose B 0,0 200x150 count=0
+B moved by 30,20:
+  no Expose
+  A@10,10: blue
+B grown to 230x170:
+  Expose B 0,0 230x170 count=0
+B shrunk to 150x100:
+  Expose B 0,0 150x100 count=0
+  A@190,40: blue
+C destroyed:
+  no Expose
+A and B unmapped:
+  no Expose
+P mapped:
+  Expose P 0,0 260x10 count=9
+  Expose P 0,10 10x40 count=8
+  Expose P 130,10 130x40 count=7
+  Expose P 0,50 10x50 count=6
+  Expose P 180,50 80x50 count=5
+  Expose P 0,100 60x40 count=4
+  Expose P 250,100 10x40 count=3
+  Expose P 0,140 150x50 count=2
+  Expose P 250,140 10x50 count=1
+  Expose P 0,190 260x10 count=0
+  Expose S3 0,0 100x90 count=0
+  Expose S2 0,0 120x50 count=1
+  Expose S2 0,50 90x40 count=0
+  Expose S1 0,0 120x40 count=1
+  Expose S1 0,40 50x50 count=0
+S1 raised:
+  Expose S1 50,40 70x50 count=0
+  S1@100,70: blue
+circulate P RaiseLowest:
+  Expose S2 0,0 70x50 count=1
+  Expose S2 90,50 30x40 count=0
+  S2@10,10: magenta
+circulate P LowerHighest:
+  Expose S1 50,40 70x50 count=0
+  Expose S3 0,0 30x40 count=0
+  S3@20,10: cyan
+S3 moved by -30,10:
+  Expose P 180,100 70x10 count=1
+  Expose P 220,110 30x80 count=0
+  Expose S2 90,50 30x10 count=0
+  S2@115,55: magenta
+S2 shaped to its left half:
+  Expose P 130,50 50x50 count=1
+  Expose P 120,100 60x10 count=0
+S2 shape removed:
+  Expose S2 70,0 50x50 count=1
+  Expose S2 60,50 60x10 count=0
+S1 unmapped:
+  Expose P 10,10 120x40 count=1
+  Expose P 10,50 50x50 count=0
+  Expose S2 0,0 70x50 count=0
+S3 reparented to the root:
+  Expose P 180,110 40x30 count=1
+  Expose P 120,140 100x60 count=0
+  Expose S2 60,60 60x30 count=0
+  Expose S3 0,0 100x90 count=0
+  S3@50,45: cyan
+S3 destroyed, P unmapped:
+  no Expose
+==> manual.log <==
+mode manual
+B mapped:
+  Expose B 0,0 200x150 count=0
+  B@100,75: yellow
+A mapped under B:
+  Expose A 0,0 200x150 count=0
+A raised:
+  no Expose
+  A@100,75: blue
+A lowered:
+  no Expose
+  B@100,75: yellow
+C mapped over A and B:
+  Expose C 0,0 120x100 count=0
+A raised to just below C:
+  no Expose
+  A@20,20: blue
+A raised over C:
+  no Expose
+  A@160,100: blue
+A lowered under B and C:
+  no Expose
+  B@20,20: yellow
+  C@20,20: orange
+B unmapped:
+  no Expose
+  A@20,20: blue
+B mapped again:
+  Expose B 0,0 200x150 count=0
+B moved by 30,20:
+  no Expose
+  A@10,10: blue
+B grown to 230x170:
+  Expose B 0,0 230x170 count=0
+B shrunk to 150x100:
+  Expose B 0,0 150x100 count=0
+  A@190,40: blue
+C destroyed:
+  no Expose
+A and B unmapped:
+  no Expose
+P mapped:
+  Expose P 0,0 260x10 count=9
+  Expose P 0,10 10x40 count=8
+  Expose P 130,10 130x40 count=7
+  Expose P 0,50 10x50 count=6
+  Expose P 180,50 80x50 count=5
+  Expose P 0,100 60x40 count=4
+  Expose P 250,100 10x40 count=3
+  Expose P 0,140 150x50 count=2
+  Expose P 250,140 10x50 count=1
+  Expose P 0,190 260x10 count=0
+  Expose S3 0,0 100x90 count=0
+  Expose S2 0,0 120x50 count=1
+  Expose S2 0,50 90x40 count=0
+  Expose S1 0,0 120x40 count=1
+  Expose S1 0,40 50x50 count=0
+S1 raised:
+  Expose S1 50,40 70x50 count=0
+  S1@100,70: blue
+circulate P RaiseLowest:
+  Expose S2 0,0 70x50 count=1
+  Expose S2 90,50 30x40 count=0
+  S2@10,10: magenta
+circulate P LowerHighest:
+  Expose S1 50,40 70x50 count=0
+  Expose S3 0,0 30x40 count=0
+  S3@20,10: cyan
+S3 moved by -30,10:
+  Expose P 180,100 70x10 count=1
+  Expose P 220,110 30x80 count=0
+  Expose S2 90,50 30x10 count=0
+  S2@115,55: magenta
+S2 shaped to its left half:
+  Expose P 130,50 50x50 count=1
+  Expose P 120,100 60x10 count=0
+S2 shape removed:
+  Expose S2 70,0 50x50 count=1
+  Expose S2 60,50 60x10 count=0
+S1 unmapped:
+  Expose P 10,10 120x40 count=1
+  Expose P 10,50 50x50 count=0
+  Expose S2 0,0 70x50 count=0
+S3 reparented to the root:
+  Expose P 180,110 40x30 count=1
+  Expose P 120,140 100x60 count=0
+  Expose S2 60,60 60x30 count=0
+  Expose S3 0,0 100x90 count=0
+  S3@50,45: cyan
+S3 destroyed, P unmapped:
+  no Expose

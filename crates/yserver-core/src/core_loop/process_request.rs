@@ -42,10 +42,9 @@ use crate::{
             report_existing_damage_to_state,
         },
         fanout::{
-            client_target_id, emit_expose_subtree_to_state,
-            emit_visibility_unobscured_subtree_to_state, emit_window_event_to_state,
-            emit_xi2_focus_event_to_state, fanout_event_to_clients, fanout_raw_event_to_clients,
-            selection_owner_target_id, subscribers_by_id,
+            client_target_id, emit_visibility_unobscured_subtree_to_state,
+            emit_window_event_to_state, emit_xi2_focus_event_to_state, fanout_event_to_clients,
+            fanout_raw_event_to_clients, selection_owner_target_id, subscribers_by_id,
         },
         key_fanout::replay_frozen_key_to_focus,
         pointer_fanout::replay_frozen_pointer_event_to_state,
@@ -1769,193 +1768,6 @@ fn current_bounding_in_parent(
     })
 }
 
-/// Expose what `moved` uncovered when it left `vacated` (in `parent`'s
-/// content space): Xorg's `miHandleValidateExposures` after a
-/// `ConfigureWindow`, for the case where nothing else restores those
-/// pixels.
-///
-/// Every window here draws into one redirect backing shared with its
-/// redirected ancestor, so the backing still holds the moved window's
-/// old pixels over whatever it was covering. (Without that sharing each
-/// window keeps its own storage and the scene composites the uncovered
-/// part from it, which is why this is only reached under a redirected
-/// ancestor.) MATE's panel shows it when the workspace switcher is
-/// dragged across the notification area: the switcher's buttons stay
-/// painted over the tray icon after the switcher moves on.
-///
-/// The walk is Xorg's clip-list split, top to bottom: a sibling stacked
-/// ABOVE `moved` was never covered by it and only takes its share out
-/// of the region; a sibling BELOW gets its share exposed, recursively
-/// through its own children; the parent gets what is left. Exposing a
-/// window paints its background over its share (unless it is `None`,
-/// `mi/miexpose.c:438-440`) and sends it Expose events — the client
-/// repaints the rest. A Manual-redirected child does not clip its
-/// parent (`TreatAsTransparent`, `mi/mivaltree.c:171`); an Automatic
-/// one clips but keeps its own backing, so it needs no exposure.
-fn expose_vacated_area(
-    state: &mut ServerState,
-    backend: &mut dyn Backend,
-    origin: Option<OriginContext>,
-    parent: ResourceId,
-    moved: ResourceId,
-    vacated: Vec<x11::xfixes::RegionRect>,
-) {
-    let Some(p) = state.resources.window(parent) else {
-        return;
-    };
-    let content = content_within_ancestors(state, parent);
-    let mut region = crate::nested::intersect_regions(&vacated, &[content]);
-    // Top-most first; `children` is bottom-to-top.
-    let siblings: Vec<ResourceId> = p.children.iter().rev().copied().collect();
-    let mut below_moved = false;
-    for sibling in siblings {
-        if region.is_empty() {
-            return;
-        }
-        if sibling == moved {
-            below_moved = true;
-            continue;
-        }
-        region = expose_child_share(state, backend, origin, sibling, region, below_moved);
-    }
-    expose_own_region(state, backend, origin, parent, &region);
-}
-
-/// Outer rects (parent content space) of the mapped siblings stacked
-/// above `window` that hide it: what the backend's in-backing copy
-/// treats as occluders (`copy_area_shared_backing_occluders`). A
-/// Manual-redirected sibling is transparent (`TreatAsTransparent`).
-fn higher_sibling_rects(state: &ServerState, window: ResourceId) -> Vec<x11::xfixes::RegionRect> {
-    let Some(parent) = state.resources.window(window).map(|w| w.parent) else {
-        return Vec::new();
-    };
-    let Some(p) = state.resources.window(parent) else {
-        return Vec::new();
-    };
-    let Some(at) = p.children.iter().position(|c| *c == window) else {
-        return Vec::new();
-    };
-    p.children[at + 1..]
-        .iter()
-        .filter_map(|s| state.resources.window(*s).map(|w| (*s, w)))
-        .filter(|(s, w)| {
-            w.map_state == crate::resources::MapState::Viewable
-                && !matches!(w.class, crate::resources::WindowClass::InputOnly)
-                && state.composite_redirects.window_mode(*s)
-                    != Some(crate::server::CompositeRedirectMode::Manual)
-        })
-        .flat_map(|(s, _)| current_bounding_in_parent(state, s))
-        .collect()
-}
-
-/// Take `child`'s share out of `region` (its parent's content space) and,
-/// when `expose` is set, expose that share in the child's subtree.
-/// Returns what is left of `region` for the windows beneath.
-fn expose_child_share(
-    state: &mut ServerState,
-    backend: &mut dyn Backend,
-    origin: Option<OriginContext>,
-    child: ResourceId,
-    region: Vec<x11::xfixes::RegionRect>,
-    expose: bool,
-) -> Vec<x11::xfixes::RegionRect> {
-    let Some(c) = state.resources.window(child) else {
-        return region;
-    };
-    if c.map_state != crate::resources::MapState::Viewable
-        || matches!(c.class, crate::resources::WindowClass::InputOnly)
-    {
-        return region;
-    }
-    let mode = state.composite_redirects.window_mode(child);
-    if mode == Some(crate::server::CompositeRedirectMode::Manual) {
-        return region;
-    }
-    let outer = current_bounding_in_parent(state, child);
-    let share = crate::nested::intersect_regions(&region, &outer);
-    if share.is_empty() {
-        return region;
-    }
-    let rest = crate::nested::subtract_regions(&region, &outer);
-    if expose && mode.is_none() {
-        // Into the child's content space; the border ring is not
-        // repainted here.
-        let bw = i16::try_from(c.border_width).unwrap_or(i16::MAX);
-        let (dx, dy) = (
-            c.x.saturating_add(bw).saturating_neg(),
-            c.y.saturating_add(bw).saturating_neg(),
-        );
-        let content = x11::xfixes::RegionRect {
-            x: 0,
-            y: 0,
-            width: c.width,
-            height: c.height,
-        };
-        let mut inner = share;
-        crate::nested::translate_region(&mut inner, dx, dy);
-        let mut inner = crate::nested::intersect_regions(&inner, &[content]);
-        let grandchildren: Vec<ResourceId> = c.children.iter().rev().copied().collect();
-        for grandchild in grandchildren {
-            if inner.is_empty() {
-                break;
-            }
-            inner = expose_child_share(state, backend, origin, grandchild, inner, true);
-        }
-        expose_own_region(state, backend, origin, child, &inner);
-    }
-    rest
-}
-
-/// Paint `window`'s background over `region` (its content space) and
-/// send it the Expose events for it.
-fn expose_own_region(
-    state: &mut ServerState,
-    backend: &mut dyn Backend,
-    origin: Option<OriginContext>,
-    window: ResourceId,
-    region: &[x11::xfixes::RegionRect],
-) {
-    if region.is_empty() {
-        return;
-    }
-    if let Some(bg) = state.resources.window_resolved_background(window)
-        && let Some(target) = state.resources.host_drawable_target(window)
-    {
-        for r in region {
-            let _ = backend.clear_area(
-                origin,
-                target.host_xid(),
-                bg.background_pixel,
-                bg.background_pixmap_host_xid.map(|h| h.as_raw()),
-                r.x,
-                r.y,
-                r.width,
-                r.height,
-                bg.tile_origin_offset,
-            );
-            let _dropped = accumulate_damage_to_state(state, window, r.x, r.y, r.width, r.height);
-        }
-    }
-    let last = region.len() - 1;
-    for (i, r) in region.iter().enumerate() {
-        let count = u16::try_from(last - i).unwrap_or(u16::MAX);
-        let r = *r;
-        let _dropped = emit_window_event_to_state(state, window, 0x0000_8000, |buf, seq, order| {
-            x11::encode_expose_event(
-                buf,
-                seq,
-                order,
-                window,
-                u16::try_from(r.x).unwrap_or(0),
-                u16::try_from(r.y).unwrap_or(0),
-                r.width,
-                r.height,
-                count,
-            );
-        });
-    }
-}
-
 /// Xorg's `miWindowExposures` (`mi/miexpose.c:375-410`) for `region` of
 /// `window` (its content space): its background over the region when
 /// `paint` (unless None), and Expose events to the clients that selected
@@ -2037,61 +1849,6 @@ fn send_map_exposures(
             send_window_exposures(state, backend, origin, w, &region, false);
         }
     }
-}
-
-/// `window`'s content rect in its own content space, intersected with
-/// each ancestor's up to the nearest redirected one: what of it can be
-/// in a clip list at all, since a child's never leaves its parent's
-/// (`mi/mivaltree.c:390`) and a redirected window's is not clipped by
-/// ITS parent (`mi/mivaltree.c:233-239`, `SetWinSize` `dix/window.c:1716`).
-fn content_within_ancestors(state: &ServerState, window: ResourceId) -> x11::xfixes::RegionRect {
-    let Some(w) = state.resources.window(window) else {
-        return x11::xfixes::RegionRect {
-            x: 0,
-            y: 0,
-            width: 0,
-            height: 0,
-        };
-    };
-    let mut clip = vec![x11::xfixes::RegionRect {
-        x: 0,
-        y: 0,
-        width: w.width,
-        height: w.height,
-    }];
-    // The current ancestor's content origin, in `window`'s content space.
-    let (mut ox, mut oy) = (0i32, 0i32);
-    let mut cur = window;
-    while state.composite_redirects.window_mode(cur).is_none() {
-        let Some(c) = state.resources.window(cur) else {
-            break;
-        };
-        let Some(p) = state.resources.window(c.parent).filter(|_| cur != c.parent) else {
-            break;
-        };
-        let bw = i32::from(c.border_width);
-        ox -= i32::from(c.x) + bw;
-        oy -= i32::from(c.y) + bw;
-        let (Ok(x), Ok(y)) = (i16::try_from(ox), i16::try_from(oy)) else {
-            break;
-        };
-        clip = crate::nested::intersect_regions(
-            &clip,
-            &[x11::xfixes::RegionRect {
-                x,
-                y,
-                width: p.width,
-                height: p.height,
-            }],
-        );
-        cur = c.parent;
-    }
-    clip.first().copied().unwrap_or(x11::xfixes::RegionRect {
-        x: 0,
-        y: 0,
-        width: 0,
-        height: 0,
-    })
 }
 
 /// The nearest window at or above `window`, short of the root, that is
@@ -2373,7 +2130,25 @@ fn destroy_window_subtree(
         let _dropped = fanout_event_to_clients(state, &top.on_parent, |buf, seq, order| {
             x11::encode_unmap_notify_event(buf, seq, order, parent, window, false);
         });
+        let viewable_before = state
+            .resources
+            .window(window)
+            .is_some_and(|w| w.map_state == MapState::Viewable);
+        let clips_before = if viewable_before {
+            crate::core_loop::clip_list::clip_lists_under(state, window)
+        } else {
+            Vec::new()
+        };
         let _ = state.resources.unmap_window(window);
+        // UnmapWindow exposes what the window covered (`dix/window.c:2856-2866`).
+        if viewable_before {
+            let after = crate::core_loop::clip_list::clip_lists_under(state, window);
+            for (w, region) in
+                crate::core_loop::clip_list::newly_exposed(&clips_before, after, None)
+            {
+                send_window_exposures(state, backend, origin, w, &region, true);
+            }
+        }
         backend.windows_restructured(state);
     }
     let attr_pixmap_xids = state.resources.collect_attribute_pixmap_host_xids(root);
@@ -7296,7 +7071,7 @@ fn fmt_shape_rects(rects: &[yserver_protocol::x11::xfixes::RegionRect]) -> Strin
     s
 }
 
-/// SHAPE requests, and the exposures a viewable window's new bounding
+/// SHAPE requests, and the exposures a viewable window's new bounding or clip
 /// shape makes: Xorg's `miSetShape` (`mi/miwindow.c:637-677`) revalidates
 /// the tree, so what the window no longer covers is exposed beneath it
 /// and what it newly covers is exposed to it. GDK clips a native window
@@ -7320,38 +7095,19 @@ fn handle_shape_request(
         x11shape::OFFSET => Some(0),
         _ => None,
     };
-    let reshaped = kind_at
-        .filter(|at| body.get(*at) == Some(&x11shape::KIND_BOUNDING))
+    let tree_change = kind_at
+        .filter(|at| {
+            body.get(*at)
+                .is_some_and(|k| *k == x11shape::KIND_BOUNDING || *k == x11shape::KIND_CLIP)
+        })
         .and_then(|_| body.get(4..8))
         .map(|b| ResourceId(u32::from_le_bytes([b[0], b[1], b[2], b[3]])))
-        .filter(|w| {
-            state
-                .resources
-                .window(*w)
-                .is_some_and(|w| w.map_state == crate::resources::MapState::Viewable)
-        })
-        .and_then(|w| {
-            let parent = state.resources.window(w)?.parent;
-            // A top-level keeps its own storage, and the scene recomposites
-            // what its shape uncovers — as for a move.
-            (parent != crate::resources::ROOT_WINDOW || has_redirected_ancestor(state, w))
-                .then(|| (w, parent, current_bounding_in_parent(state, w)))
-        });
+        .and_then(|w| crate::core_loop::clip_list::TreeChange::begin(state, w, None));
     let outcome =
         handle_shape_request_ops(state, backend, origin, client_id, sequence, header, body)?;
-    if let Some((window, parent, before)) = reshaped {
-        let inside = content_within_ancestors(state, parent);
-        let before = crate::nested::intersect_regions(&before, &[inside]);
-        let after =
-            crate::nested::intersect_regions(&current_bounding_in_parent(state, window), &[inside]);
-        let vacated = crate::nested::subtract_regions(&before, &after);
-        if !vacated.is_empty() {
-            expose_vacated_area(state, backend, origin, parent, window, vacated);
-        }
-        let gained = crate::nested::subtract_regions(&after, &before);
-        let gained = crate::nested::subtract_regions(&gained, &higher_sibling_rects(state, window));
-        if !gained.is_empty() {
-            let _rest = expose_child_share(state, backend, origin, window, gained, true);
+    if let Some(change) = tree_change {
+        for (w, region) in change.exposed(state, None) {
+            send_window_exposures(state, backend, origin, w, &region, true);
         }
     }
     Ok(outcome)
@@ -23811,6 +23567,11 @@ fn handle_reparent_window(
     };
     if let Some((old_parent, map_state, _)) = unmapped {
         let window = request.window;
+        let clips_before = if map_state == MapState::Viewable {
+            crate::core_loop::clip_list::clip_lists_under(state, window)
+        } else {
+            Vec::new()
+        };
         let _dropped = emit_window_event_to_state(state, window, 0x0002_0000, |buf, seq, order| {
             x11::encode_unmap_notify_event(buf, seq, order, window, window, false);
         });
@@ -23820,6 +23581,16 @@ fn handle_reparent_window(
             });
         if let Some(w) = state.resources.window_mut(window) {
             w.map_state = MapState::Unmapped;
+        }
+        // What it covered in the old place is exposed (`UnmapWindow`,
+        // `dix/window.c:2856-2866`).
+        if map_state == MapState::Viewable {
+            let after = crate::core_loop::clip_list::clip_lists_under(state, window);
+            for (w, region) in
+                crate::core_loop::clip_list::newly_exposed(&clips_before, after, None)
+            {
+                send_window_exposures(state, backend, origin, w, &region, true);
+            }
         }
         backend.windows_restructured(state);
         if let Some(w) = state.resources.window_mut(window) {
@@ -24017,6 +23788,11 @@ fn handle_reparent_window(
                     override_redirect,
                 );
             });
+        // MapWindow exposes it in the new place, its background painted
+        // there: the storage it kept is not what Xorg shows.
+        for (w, region) in crate::core_loop::clip_list::subtree_clip_lists(state, window) {
+            send_window_exposures(state, backend, origin, w, &region, true);
+        }
     }
     // The window moved in the tree; Xorg's ReparentWindow re-evaluates the
     // pointer through its MapWindow (`dix/window.c:2695`).
@@ -24955,10 +24731,17 @@ fn handle_configure_window(
         .and_then(|sibling| state.resources.window(sibling))
         .and_then(|w| w.host_xid)
         .map(|h| h.as_raw());
-    // What covered the window before the move, for the part of it the
-    // backend's in-backing copy cannot carry (see `expose_child_share`'s
-    // caller below).
-    let higher_before = higher_sibling_rects(state, request.window);
+    // The clip lists the change can alter, for its exposures below.
+    let tree_change = before_geom.and_then(|(x, y, w, h, bw)| {
+        let bw2 = request.border_width.unwrap_or(bw).saturating_mul(2);
+        let reach = x11::xfixes::RegionRect {
+            x: request.x.unwrap_or(x),
+            y: request.y.unwrap_or(y),
+            width: request.width.unwrap_or(w).saturating_add(bw2),
+            height: request.height.unwrap_or(h).saturating_add(bw2),
+        };
+        crate::core_loop::clip_list::TreeChange::begin(state, request.window, Some(reach))
+    });
     let configure = state
         .resources
         .configure_window(request)
@@ -25226,120 +25009,20 @@ fn handle_configure_window(
                 request.value_mask,
             );
         }
-        // What the window left behind, exposed beneath it as Xorg's
-        // `miMoveWindow` does — inside a shared redirect backing, and for
-        // a subwindow anywhere (a top-level keeps its own storage and the
-        // scene recomposites what it uncovers).
-        let shared = has_redirected_ancestor(state, window_id);
-        if viewable
-            && let Some((old_x, old_y, old_w, old_h, old_bw)) = before_geom
-            && let Some(parent) = parent
-            && (shared || parent != crate::resources::ROOT_WINDOW)
-        {
-            // Both ends as far as the parent's clip reaches: the part of
-            // the window outside it was never drawn, nor carried.
-            let inside = content_within_ancestors(state, parent);
-            let old_outer = crate::nested::intersect_regions(
-                &bounding_in_parent(state, window_id, (old_x, old_y, old_w, old_h, old_bw)),
-                &[inside],
-            );
-            let new_outer = crate::nested::intersect_regions(
-                &current_bounding_in_parent(state, window_id),
-                &[inside],
-            );
-            let vacated = crate::nested::subtract_regions(&old_outer, &new_outer);
-            if !vacated.is_empty() {
-                expose_vacated_area(state, backend, origin, parent, window_id, vacated);
-            }
-            // The moved window's own holes. The backend copies only the
-            // part that was the window's to begin with (not under a
-            // higher sibling) to the part that is still the window's
-            // (not under one now); Xorg exposes the rest of the new
-            // position — `miMoveWindow` → `ValidateTree` →
-            // `miHandleValidateExposures`, where `CopyWindow` filled only
-            // the translated old `borderClip`. MATE: dragging the
-            // workspace switcher under the (higher) notification area
-            // left a tray-sized hole in the switcher.
-            // A resize already exposes the whole window (below).
-            if !resized {
-                let (dx, dy) = (
-                    geometry.x.saturating_sub(old_x),
-                    geometry.y.saturating_sub(old_y),
-                );
-                let mut carried = crate::nested::subtract_regions(&old_outer, &higher_before);
-                crate::nested::translate_region(&mut carried, dx, dy);
-                let higher_now = higher_sibling_rects(state, window_id);
-                let visible_now = crate::nested::subtract_regions(&new_outer, &higher_now);
-                let holes = crate::nested::subtract_regions(&visible_now, &carried);
-                if !holes.is_empty() {
-                    let _rest = expose_child_share(state, backend, origin, window_id, holes, true);
-                }
-            }
-        }
-        // A resize exposes the window in EITHER direction. Xorg draws no
-        // grow/shrink distinction: `miResizeWindow` copies the whole NEW
-        // clip list into the exposed region — "the entire window is
-        // trashed unless bitGravity recovers portions of it",
-        // `RegionCopy(&pWin->valdata->after.exposed, &pWin->clipList)`
-        // (`mi/miwindow.c:466-472`) — and only the bits a non-Forget
-        // `bitGravity` actually moved are subtracted from it afterwards
-        // (`mi/miwindow.c:596-599`). Under the default ForgetGravity
-        // `oldWinClip` stays NULL (`mi/miwindow.c:403-406`), nothing is
-        // subtracted, and the full window is reported for a shrink just
-        // as for a grow. The background state does not gate the event
-        // either: `miWindowExposures` paints first and sends second, and
-        // the `case None: return;` early-out lives in the PAINT
-        // (`mi/miexpose.c:387-389` and `:438-440`), so a background-None
-        // window keeps its pixels AND still receives the Expose.
-        //
-        // We used to emit this for a grow only, and that is #143's
-        // "already open windows get broken rendering": awesome retiles an
-        // xterm smaller, `configure_subwindow` re-tiles the leaf from the
-        // window's background (black on a dark terminal), and with no
-        // Expose nothing ever asks xterm to repaint. The prompt line came
-        // back because xterm redraws it anyway; the static rows of the
-        // shell banner stayed black for good.
-        //
-        // The region is the whole window for every gravity, not only
-        // ForgetGravity. Xorg would report just the newly-added strip
-        // under e.g. NorthWestGravity, because it really moved the old
-        // bits; this server has no bit-gravity path at all (the attribute
-        // reaches the render backend by no route — see `LeafContent` and
-        // `configure_subwindow`), so the pixels are gone whatever the
-        // attribute says and a narrower Expose would leave the window
-        // black. That narrowing is a separate, tracked divergence.
-        if resized {
-            // Per X11 spec, Expose fires only for visible regions. A
-            // resize-configure on an unmapped (or Unviewable) window has no
-            // visible region, so suppress the Expose until the window
-            // becomes Viewable (MapWindow's own viewable-gated Expose path
-            // covers that case). Without this gate, marco-style
-            // reparenting WMs make Firefox react to a phantom Expose ~50
-            // requests before MapNotify lands: FF paints its
-            // transparent-black background into the redirected backing,
-            // marks the window clean, and the actual content never reaches
-            // the compositor — visible as "empty shadow / blank profile
-            // chooser." Xorg only emits Expose post-Map.
-            let viewable = state
-                .resources
-                .window(window_id)
-                .is_some_and(|w| w.map_state == crate::resources::MapState::Viewable);
-            if viewable {
-                let _dropped =
-                    emit_window_event_to_state(state, window_id, 0x0000_8000, |buf, seq, order| {
-                        x11::encode_expose_event(
-                            buf,
-                            seq,
-                            order,
-                            window_id,
-                            0,
-                            0,
-                            geometry.width,
-                            geometry.height,
-                            0,
-                        );
-                    });
-                let _dropped = emit_expose_subtree_to_state(state, window_id);
+        // Xorg validates the tree after a move, resize, restack or border
+        // change and exposes what each window shows that it did not
+        // (`miMoveWindow`, `miResizeWindow`, `ReflectStackChange`): its
+        // background painted there, unless None, and Expose sent
+        // (`miWindowExposures`, `mi/miexpose.c:375-410`). A resized window
+        // gets its whole clip list: "the entire window is trashed unless
+        // bitGravity recovers portions of it" (`mi/miwindow.c:466-472`);
+        // this server keeps no bit-gravity bits, so its window is exposed
+        // whole for every gravity. A top-level that is raised from under
+        // another is exposed like any other window (#213: awesome maps
+        // mpv's frame under the terminal, then raises it).
+        if let Some(change) = tree_change {
+            for (w, region) in change.exposed(state, resized.then_some(window_id)) {
+                send_window_exposures(state, backend, origin, w, &region, true);
             }
         }
     }
@@ -25407,6 +25090,9 @@ fn handle_destroy_subwindows(
                 5,
             );
         }
+        // Xorg unmaps them all first, so all UnmapNotifies and one exposure
+        // of the parent precede the DestroyNotifies (`dix/window.c:1104-1124`).
+        unmap_subwindows_with_delta(state, backend, origin, client_id, sequence, body)?;
         let kids: Vec<ResourceId> = state.resources.children(parent).to_vec();
         for k in kids {
             destroy_window_subtree(state, backend, origin, k);
@@ -29017,7 +28703,8 @@ fn handle_unmap_window(
             // (`UnmapWindow`, `dix/window.c:2856-2866`).
             if viewable_before {
                 let after = crate::core_loop::clip_list::clip_lists_under(state, window);
-                for (w, region) in crate::core_loop::clip_list::newly_exposed(&clips_before, after)
+                for (w, region) in
+                    crate::core_loop::clip_list::newly_exposed(&clips_before, after, None)
                 {
                     send_window_exposures(state, backend, origin, w, &region, true);
                 }
@@ -29403,6 +29090,7 @@ fn handle_circulate_window(
                 x11::write_circulate_request_event(buf, order, seq, container, child, direction);
         });
     } else {
+        let tree_change = crate::core_loop::clip_list::TreeChange::begin(state, child, None);
         state.resources.circulate_child(child, direction == 0);
         if let Some(xid) = state.resources.window(child).and_then(|w| w.host_xid) {
             let _ = backend.configure_subwindow(
@@ -29431,6 +29119,12 @@ fn handle_circulate_window(
                 let _ =
                     x11::write_circulate_notify_event(buf, order, seq, container, child, direction);
             });
+        // Then ReflectStackChange validates and exposes (`dix/window.c:2149-2176`).
+        if let Some(change) = tree_change {
+            for (w, region) in change.exposed(state, None) {
+                send_window_exposures(state, backend, None, w, &region, true);
+            }
+        }
         // Xorg ReflectStackChange (`dix/window.c:2179`).
         backend.windows_restructured(state);
     }
@@ -90521,54 +90215,6 @@ mod tests {
             vec![(x11::error::BAD_DRAWABLE, 0x00DE_AD00)],
         );
         assert!(state.resources.picture(ResourceId(PIC)).is_none());
-    }
-
-    /// A GTK bin window taller than its viewport, inside an xfwm4 frame
-    /// under the compositor: frame F (756x534, Manual-redirected through
-    /// root), client C at (5,29) 746x500, bin window V at (8,8) 730x531.
-    /// Xorg clips a child's clip list to its parent's
-    /// (`mi/mivaltree.c:390`), so V can hold only its rows above C's
-    /// bottom edge, 500 - 8 = 492 of them; a redirected window stops the
-    /// walk, being clipped to itself only.
-    #[test]
-    fn content_within_ancestors_stops_at_the_parents_edge() {
-        use crate::server::{CompositeRedirectMode, RedirectRecord};
-        let mut state = make_test_state();
-        state
-            .composite_redirects
-            .redirect_subwindows(
-                ROOT_WINDOW,
-                &[],
-                RedirectRecord {
-                    mode: CompositeRedirectMode::Manual,
-                    owner: ClientId(1),
-                },
-            )
-            .unwrap();
-        let (f, c, v) = (
-            ResourceId(0x0040_0001),
-            ResourceId(0x0040_0002),
-            ResourceId(0x0040_0003),
-        );
-        seed_window(&mut state, f, ROOT_WINDOW, 756, 534);
-        seed_window(&mut state, c, f, 746, 500);
-        seed_window(&mut state, v, c, 730, 531);
-        for (w, x, y) in [(f, 900, 400), (c, 5, 29), (v, 8, 8)] {
-            let w = state.resources.window_mut(w).unwrap();
-            (w.x, w.y) = (x, y);
-        }
-        let rect = |width, height| x11::xfixes::RegionRect {
-            x: 0,
-            y: 0,
-            width,
-            height,
-        };
-        assert_eq!(content_within_ancestors(&state, v), rect(730, 492));
-        assert_eq!(content_within_ancestors(&state, c), rect(746, 500));
-        // F's own redirect ends the walk before the root's edge.
-        state.resources.window_mut(f).unwrap().x = 32000;
-        assert_eq!(content_within_ancestors(&state, f), rect(756, 534));
-        assert_eq!(content_within_ancestors(&state, v), rect(730, 492));
     }
 
     /// GDK clips a native child of a client-side window with its bounding

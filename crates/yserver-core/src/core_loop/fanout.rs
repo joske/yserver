@@ -575,34 +575,6 @@ pub fn expose_event_fanout_to_state(
     dropped
 }
 
-/// State-borrowing replacement for `nested::emit_expose_subtree`.
-///
-/// Walks every mapped descendant of `root` and emits Expose to those
-/// that selected `ExposureMask`. Used after a top-level becomes
-/// viewable so deeply-nested widgets repaint immediately.
-pub fn emit_expose_subtree_to_state(state: &mut ServerState, root: ResourceId) -> Vec<ClientId> {
-    let mut dropped = Vec::new();
-    let children: Vec<ResourceId> = state.resources.children(root).to_vec();
-    for child in children {
-        let extents = state
-            .resources
-            .window(child)
-            .filter(|w| w.map_state == MapState::Viewable)
-            .map(|w| (w.width, w.height));
-        if let Some((w, h)) = extents {
-            let target = child;
-            let more =
-                emit_window_event_to_state(state, target, EXPOSURE_MASK_BIT, |buf, seq, order| {
-                    x11::encode_expose_event(buf, seq, order, target, 0, 0, w, h, 0);
-                });
-            merge_dropped(&mut dropped, more);
-            let recursed = emit_expose_subtree_to_state(state, child);
-            merge_dropped(&mut dropped, recursed);
-        }
-    }
-    dropped
-}
-
 /// Walks every now-Viewable descendant of `root` and emits
 /// `VisibilityNotify(Unobscured)` to those that selected
 /// `VisibilityChangeMask`. Used after a top-level is mapped: any
