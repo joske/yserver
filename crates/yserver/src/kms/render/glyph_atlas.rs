@@ -19,23 +19,28 @@
 //!   a one-shot `StagingBuffer` per glyph upload, hand it to
 //!   `record_upload`, and park the buffer on the upload's
 //!   `SubmittedOp` so it lives until the CB's `FenceTicket` retires.
-//! - Cache / shelf state is monotonic — freed glyphs (when
-//!   `FreeGlyphs`/`FreeGlyphSet` from Stage 3d eventually lands)
-//!   don't reclaim their atlas slot. Stage 5's grow + LRU pass
-//!   owns slot reclamation. The fixed 4096² R8 atlas comfortably
-//!   holds typical desktop sessions (~14k glyphs).
-//! - When the atlas is full, `pack` returns `None`; the engine
-//!   drops the glyph (pen advances by `character_width`, no draw),
-//!   increments `glyphs_dropped_atlas_full`, and logs `atlas_full`
-//!   once per session. No pixman fallback (v1's path is gone per
-//!   the v2 spec).
+//! - The shelf packer only moves forward. Space is reclaimed by
+//!   [`ShelfPacker::reset`]: when a request's misses no longer fit,
+//!   the engine closes the open frame and empties the atlas, and every
+//!   glyph still in use re-uploads on its next draw. Dropping cache
+//!   entries ([`ShelfPacker::forget`], [`ShelfPacker::forget_font`] on
+//!   FreeGlyphs / FreeGlyphSet / CloseFont / a redefined glyph id) does
+//!   not reuse their space by itself; it keeps stale images from being
+//!   served and leaves the next reset less to repopulate.
+//! - A glyph that cannot fit even an empty atlas is dropped (pen
+//!   advances, no draw) and logged with [`ShelfPacker::note_dropped`],
+//!   rate limited.
 
 #![allow(
     dead_code,
     reason = "Stage 3a consumers (text + RENDER glyphs) wire up incrementally"
 )]
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use ash::vk;
 
@@ -45,6 +50,9 @@ pub(crate) use crate::kms::vk::glyph::{AtlasEntry, GlyphKey};
 /// Side length (px) of the fixed atlas allocation. 4096² R8 = 16 MiB.
 pub(crate) const ATLAS_SIDE: u32 = 4096;
 
+/// Minimum spacing of the dropped-glyph warning.
+const DROP_WARN_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Pure-logic shelf packer + cache. Factored out of
 /// [`GlyphAtlas`] so unit tests can exercise pack / cache
 /// semantics without a live VkContext.
@@ -52,7 +60,10 @@ pub(crate) struct ShelfPacker {
     extent: vk::Extent2D,
     cache: HashMap<GlyphKey, AtlasEntry>,
     shelves: Vec<Shelf>,
-    atlas_full_logged: bool,
+    resets: u64,
+    drops: u64,
+    drops_since_warn: u64,
+    last_drop_warn: Option<Instant>,
 }
 
 impl ShelfPacker {
@@ -61,7 +72,10 @@ impl ShelfPacker {
             extent,
             cache: HashMap::new(),
             shelves: Vec::new(),
-            atlas_full_logged: false,
+            resets: 0,
+            drops: 0,
+            drops_since_warn: 0,
+            last_drop_warn: None,
         }
     }
 
@@ -76,56 +90,119 @@ impl ShelfPacker {
     /// want to cache an entry so subsequent pen-advance calls
     /// don't re-pack).
     pub(crate) fn pack(&mut self, w: u32, h: u32) -> Option<(u32, u32)> {
-        if w == 0 || h == 0 {
-            return Some((0, 0));
-        }
-        if w > self.extent.width || h > self.extent.height {
-            return None;
-        }
-        for shelf in &mut self.shelves {
-            if shelf.height >= h && shelf.x_used + w <= self.extent.width {
-                let x = shelf.x_used;
-                let y = shelf.y_top;
-                shelf.x_used += w;
-                return Some((x, y));
-            }
-        }
-        let next_y = self.shelves.last().map(|s| s.y_top + s.height).unwrap_or(0);
-        if next_y + h > self.extent.height {
-            return None;
-        }
-        self.shelves.push(Shelf {
-            y_top: next_y,
-            height: h,
-            x_used: w,
-        });
-        Some((0, next_y))
+        pack_shelves(&mut self.shelves, self.extent, w, h)
+    }
+
+    /// Whether every `(w, h)` in `sizes` would pack, in order, into
+    /// the atlas as it stands. Does not change the packer.
+    pub(crate) fn fits(&self, sizes: &[(u32, u32)]) -> bool {
+        let mut shelves = self.shelves.clone();
+        sizes
+            .iter()
+            .all(|&(w, h)| pack_shelves(&mut shelves, self.extent, w, h).is_some())
+    }
+
+    /// Whether `(w, h)` fits an EMPTY atlas at all.
+    pub(crate) fn fits_empty(&self, w: u32, h: u32) -> bool {
+        w <= self.extent.width && h <= self.extent.height
     }
 
     pub(crate) fn insert_entry(&mut self, key: GlyphKey, entry: AtlasEntry) {
         self.cache.insert(key, entry);
     }
 
-    /// Latch + log the first time pack refuses a glyph. Returns
-    /// `true` exactly once per packer.
-    pub(crate) fn note_full_once(&mut self) -> bool {
-        if self.atlas_full_logged {
+    /// Drop the cache entry for `key`. Returns whether it was cached.
+    pub(crate) fn forget(&mut self, key: GlyphKey) -> bool {
+        self.cache.remove(&key).is_some()
+    }
+
+    /// Drop every cache entry of glyphset / core font `font_xid`.
+    /// Returns how many were cached.
+    pub(crate) fn forget_font(&mut self, font_xid: u32) -> usize {
+        let before = self.cache.len();
+        self.cache.retain(|k, _| k.font_xid != font_xid);
+        before - self.cache.len()
+    }
+
+    /// Empty the atlas: every cache entry and every shelf. The caller
+    /// must have closed any open frame that recorded entries of the
+    /// old layout (its pending inserts would land in the new one).
+    pub(crate) fn reset(&mut self) {
+        self.cache.clear();
+        self.shelves.clear();
+        self.resets += 1;
+    }
+
+    pub(crate) fn resets(&self) -> u64 {
+        self.resets
+    }
+
+    /// Count a glyph dropped because it cannot be placed, and warn —
+    /// the first time, then at most once per [`DROP_WARN_INTERVAL`]
+    /// with the drops since the last warning. Returns whether it
+    /// warned.
+    pub(crate) fn note_dropped(&mut self, w: u32, h: u32, now: Instant) -> bool {
+        self.drops += 1;
+        self.drops_since_warn += 1;
+        if self
+            .last_drop_warn
+            .is_some_and(|t| now.duration_since(t) < DROP_WARN_INTERVAL)
+        {
             return false;
         }
-        self.atlas_full_logged = true;
         log::warn!(
-            "render glyph atlas full ({}×{} R8 exhausted); affected glyphs drop until \
-             Stage 5 grow/LRU lands",
+            "render glyph atlas: dropped {} glyph(s) since the last warning ({} total); \
+             latest {w}×{h} texels cannot be placed in the {}×{} atlas",
+            self.drops_since_warn,
+            self.drops,
             self.extent.width,
             self.extent.height,
         );
+        self.drops_since_warn = 0;
+        self.last_drop_warn = Some(now);
         true
     }
 
-    #[cfg(test)]
     pub(crate) fn cache_len(&self) -> usize {
         self.cache.len()
     }
+
+    /// Texels below the shelves in use — the packer's high-water mark.
+    pub(crate) fn rows_used(&self) -> u32 {
+        self.shelves.last().map_or(0, |s| s.y_top + s.height)
+    }
+}
+
+fn pack_shelves(
+    shelves: &mut Vec<Shelf>,
+    extent: vk::Extent2D,
+    w: u32,
+    h: u32,
+) -> Option<(u32, u32)> {
+    if w == 0 || h == 0 {
+        return Some((0, 0));
+    }
+    if w > extent.width || h > extent.height {
+        return None;
+    }
+    for shelf in shelves.iter_mut() {
+        if shelf.height >= h && shelf.x_used + w <= extent.width {
+            let x = shelf.x_used;
+            let y = shelf.y_top;
+            shelf.x_used += w;
+            return Some((x, y));
+        }
+    }
+    let next_y = shelves.last().map_or(0, |s| s.y_top + s.height);
+    if next_y + h > extent.height {
+        return None;
+    }
+    shelves.push(Shelf {
+        y_top: next_y,
+        height: h,
+        x_used: w,
+    });
+    Some((0, next_y))
 }
 
 /// V2-side glyph atlas. Owns the atlas image; recording an upload
@@ -298,8 +375,49 @@ impl GlyphAtlas {
         self.packer.pack(w, h)
     }
 
-    pub(crate) fn note_full_once(&mut self) -> bool {
-        self.packer.note_full_once()
+    /// See [`ShelfPacker::fits`].
+    pub(crate) fn fits(&self, sizes: &[(u32, u32)]) -> bool {
+        self.packer.fits(sizes)
+    }
+
+    /// See [`ShelfPacker::fits_empty`].
+    pub(crate) fn fits_empty(&self, w: u32, h: u32) -> bool {
+        self.packer.fits_empty(w, h)
+    }
+
+    /// See [`ShelfPacker::note_dropped`].
+    pub(crate) fn note_dropped(&mut self, w: u32, h: u32) -> bool {
+        self.packer.note_dropped(w, h, Instant::now())
+    }
+
+    /// See [`ShelfPacker::forget`].
+    pub(crate) fn forget(&mut self, key: GlyphKey) -> bool {
+        self.packer.forget(key)
+    }
+
+    /// See [`ShelfPacker::forget_font`].
+    pub(crate) fn forget_font(&mut self, font_xid: u32) -> usize {
+        self.packer.forget_font(font_xid)
+    }
+
+    /// See [`ShelfPacker::reset`]. The image keeps its layout and
+    /// contents; slots are simply handed out again, and each re-upload
+    /// is ordered after earlier samplers of the slot by the upload's
+    /// own `ALL_COMMANDS → COPY` barrier (same queue, submission order).
+    pub(crate) fn reset(&mut self) {
+        let live = self.packer.cache_len();
+        let rows = self.packer.rows_used();
+        self.packer.reset();
+        log::info!(
+            "render glyph atlas full: reset #{} ({live} cached glyphs, {rows} of {} rows); \
+             glyphs in use re-upload on their next draw",
+            self.packer.resets(),
+            self.packer.extent.height,
+        );
+    }
+
+    pub(crate) fn resets(&self) -> u64 {
+        self.packer.resets()
     }
 
     /// Commit a packed slot into the lookup cache.
@@ -419,8 +537,6 @@ impl GlyphAtlas {
         self.current_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
     }
 
-    /// Test-helper: count of cached glyphs.
-    #[cfg(test)]
     pub(crate) fn cache_len(&self) -> usize {
         self.packer.cache_len()
     }
@@ -492,9 +608,6 @@ mod tests {
         assert!(packer.pack(32, 16).is_some());
         // Third shelf would exceed extent — None.
         assert!(packer.pack(32, 16).is_none());
-        // note_full_once latches.
-        assert!(packer.note_full_once());
-        assert!(!packer.note_full_once());
     }
 
     #[test]
@@ -525,5 +638,106 @@ mod tests {
         assert_eq!(got.packed_w, 8);
         assert_eq!(got.logical_w, 8);
         assert_eq!(got.h, 16);
+    }
+
+    fn entry(atlas_x: u32, atlas_y: u32, w: u32, h: u32) -> AtlasEntry {
+        AtlasEntry {
+            atlas_x,
+            atlas_y,
+            packed_w: w,
+            logical_w: w,
+            h,
+            pen_left: 0,
+            pen_top: 0,
+            layout: crate::kms::vk::glyph::GlyphLayout::A8,
+        }
+    }
+
+    fn key(font_xid: u32, codepoint: u32) -> GlyphKey {
+        GlyphKey {
+            font_xid,
+            codepoint,
+        }
+    }
+
+    #[test]
+    fn reset_reuses_the_whole_atlas() {
+        let mut packer = ShelfPacker::new(vk::Extent2D {
+            width: 64,
+            height: 32,
+        });
+        for _ in 0..4 {
+            packer.pack(32, 16).expect("fits");
+        }
+        packer.insert_entry(key(1, 1), entry(0, 0, 32, 16));
+        assert!(packer.pack(32, 16).is_none());
+        packer.reset();
+        assert_eq!(packer.resets(), 1);
+        assert_eq!(packer.cache_len(), 0, "reset drops every entry");
+        assert!(packer.lookup(key(1, 1)).is_none());
+        assert_eq!(
+            packer.pack(32, 16),
+            Some((0, 0)),
+            "slots are handed out again"
+        );
+    }
+
+    #[test]
+    fn fits_simulates_without_packing() {
+        let mut packer = ShelfPacker::new(vk::Extent2D {
+            width: 64,
+            height: 32,
+        });
+        packer.pack(64, 16).expect("fits");
+        assert!(packer.fits(&[(32, 16), (32, 16)]));
+        assert!(!packer.fits(&[(32, 16), (32, 16), (1, 1)]));
+        assert_eq!(packer.rows_used(), 16, "fits must not move the packer");
+        assert_eq!(packer.pack(32, 16), Some((0, 16)));
+        assert!(packer.fits(&[]));
+    }
+
+    #[test]
+    fn component_alpha_footprint_is_four_planes_wide() {
+        // A ComponentAlpha glyph reserves 4 × its width: 1024-wide
+        // subpixel glyphs fill a 4096-wide shelf one per shelf, so two
+        // 2048 tall fill the atlas, and one 1025 wide cannot be placed.
+        let packer = ShelfPacker::new(full_size());
+        let planes = crate::kms::render::glyph_pixels::PLANES;
+        let ca = (1024 * planes, 2048);
+        assert!(packer.fits(&[ca, ca]));
+        assert!(!packer.fits(&[ca, ca, (1, 1)]));
+        assert!(
+            packer.fits(&[(1024, 2048); 8]),
+            "the same glyphs as A8 take a quarter"
+        );
+        assert!(!packer.fits_empty(1025 * planes, 8));
+        assert!(packer.fits_empty(1024 * planes, 8));
+    }
+
+    #[test]
+    fn forget_drops_one_key_and_forget_font_a_whole_set() {
+        let mut packer = ShelfPacker::new(full_size());
+        for (font, cp) in [(1, 1), (1, 2), (1, 3), (2, 1)] {
+            packer.insert_entry(key(font, cp), entry(0, 0, 8, 8));
+        }
+        assert!(packer.forget(key(1, 2)));
+        assert!(!packer.forget(key(1, 2)), "already gone");
+        assert!(packer.lookup(key(1, 2)).is_none());
+        assert_eq!(packer.forget_font(1), 2);
+        assert!(packer.lookup(key(1, 1)).is_none());
+        assert!(packer.lookup(key(2, 1)).is_some(), "other sets keep theirs");
+        assert_eq!(packer.cache_len(), 1);
+    }
+
+    #[test]
+    fn note_dropped_warns_first_then_rate_limited() {
+        let mut packer = ShelfPacker::new(full_size());
+        let t0 = Instant::now();
+        assert!(packer.note_dropped(5000, 8, t0));
+        assert!(!packer.note_dropped(5000, 8, t0 + Duration::from_secs(1)));
+        assert!(!packer.note_dropped(5000, 8, t0 + Duration::from_secs(9)));
+        assert!(packer.note_dropped(5000, 8, t0 + DROP_WARN_INTERVAL));
+        assert_eq!(packer.drops, 4);
+        assert_eq!(packer.drops_since_warn, 0);
     }
 }

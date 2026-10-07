@@ -72,6 +72,10 @@ pub(crate) enum CloseReason {
     /// 2026-07-13). Ordinary composites stay batched. See
     /// `RenderEngine::render_composite`.
     RedirectSourceBoundary,
+    /// A glyph draw's atlas misses no longer fit the glyph atlas. The
+    /// frame closes so its pending glyph inserts commit against the old
+    /// atlas layout before the atlas is emptied and repacked.
+    GlyphAtlasFull,
 }
 
 /// `FrameBuilder` lifecycle. `Closed` is the hot path for X11 traffic
@@ -428,7 +432,7 @@ mod state_tests {
     }
 
     #[test]
-    fn close_reason_has_ten_variants() {
+    fn close_reason_has_eleven_variants() {
         fn _exhaustive(r: CloseReason) -> &'static str {
             match r {
                 CloseReason::SceneCompose => "scene_compose",
@@ -441,6 +445,7 @@ mod state_tests {
                 CloseReason::PinCeiling => "pin_ceiling",
                 CloseReason::ScratchGrow => "scratch_grow",
                 CloseReason::RedirectSourceBoundary => "redirect_source_boundary",
+                CloseReason::GlyphAtlasFull => "glyph_atlas_full",
             }
         }
         assert_eq!(_exhaustive(CloseReason::SceneCompose), "scene_compose");

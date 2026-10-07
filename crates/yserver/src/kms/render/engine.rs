@@ -1385,6 +1385,41 @@ struct RenderEngineInner {
 }
 
 impl RenderEngineInner {
+    /// Whether the glyph atlas can take every glyph of a request that
+    /// is not resident yet — not committed, not pending in the open
+    /// frame — each key once, at its packed `(w, h)`, in request order.
+    /// A glyph too large for even an empty atlas is left out: it drops
+    /// either way, and counting it would empty the atlas on every draw.
+    fn glyph_atlas_misses_fit(&self, glyphs: impl Iterator<Item = (GlyphKey, u32, u32)>) -> bool {
+        let Some(atlas) = self.glyph_atlas.as_ref() else {
+            return true;
+        };
+        let mut misses: Vec<(GlyphKey, u32, u32)> = glyphs
+            .filter(|&(key, w, h)| {
+                w != 0 && h != 0 && atlas.fits_empty(w, h) && atlas.lookup(key).is_none()
+            })
+            .collect();
+        if misses.is_empty() {
+            return true;
+        }
+        if let Some(open) = self.frame_builder.open.as_ref() {
+            let pending: HashSet<GlyphKey> = open
+                .pending_glyph_inserts
+                .entries
+                .iter()
+                .map(|(k, _)| *k)
+                .collect();
+            misses.retain(|(k, _, _)| !pending.contains(k));
+        }
+        let mut seen = HashSet::new();
+        let sizes: Vec<(u32, u32)> = misses
+            .into_iter()
+            .filter(|(k, _, _)| seen.insert(*k))
+            .map(|(_, w, h)| (w, h))
+            .collect();
+        atlas.fits(&sizes)
+    }
+
     /// #177: copy one request's upload data into the open frame's upload
     /// arena and pin it, returning the pin its recorded op replays from.
     /// `align` is the offset alignment the data's use needs
@@ -6164,6 +6199,23 @@ impl RenderEngine {
                 }
             }
         }
+        // (4a) Atlas room, before the frame opens: when this run's
+        //      misses no longer fit, close the open frame and empty
+        //      the atlas; every glyph in use re-uploads on its next draw.
+        let fits = inner.glyph_atlas_misses_fit(rendered.iter().map(|g| {
+            (
+                GlyphKey {
+                    font_xid,
+                    codepoint: g.codepoint,
+                },
+                u32::try_from(g.w).unwrap_or(u32::MAX),
+                u32::try_from(g.h).unwrap_or(u32::MAX),
+            )
+        }));
+        if !fits {
+            self.reset_glyph_atlas(store, platform)?;
+        }
+        let inner = self.inner.as_mut().expect("inner");
         // Core ImageText is always the Over+BGRA8 blend — the
         // legacy singleton entry, bit-identical blend state.
         //
@@ -6324,7 +6376,11 @@ impl RenderEngine {
                 let Some((atlas_x, atlas_y)) =
                     inner.glyph_atlas.as_mut().expect("init").pack(w_u, h_u)
                 else {
-                    inner.glyph_atlas.as_mut().expect("init").note_full_once();
+                    inner
+                        .glyph_atlas
+                        .as_mut()
+                        .expect("init")
+                        .note_dropped(w_u, h_u);
                     stats.glyphs_dropped += 1;
                     continue;
                 };
@@ -6502,6 +6558,64 @@ impl RenderEngine {
         Ok(stats)
     }
 
+    /// Close the open frame (its pending glyph inserts commit against
+    /// the current atlas layout) and empty the glyph atlas.
+    ///
+    /// Safe against in-flight work: every recorded or submitted draw
+    /// that samples an old slot runs before the re-upload that reuses
+    /// it, which is ordered behind those samplers by its own
+    /// `ALL_COMMANDS → COPY` barrier on the same queue.
+    fn reset_glyph_atlas(
+        &mut self,
+        store: &mut DrawableStore,
+        platform: &mut PlatformBackend,
+    ) -> Result<(), RenderError> {
+        self.close_open_frame(
+            store,
+            platform,
+            super::frame_builder::CloseReason::GlyphAtlasFull,
+        )?;
+        if let Some(atlas) = self.inner.as_mut().and_then(|i| i.glyph_atlas.as_mut()) {
+            atlas.reset();
+        }
+        Ok(())
+    }
+
+    /// Forget the atlas entries of glyphset / core font `font_xid`:
+    /// all of them (`None`: FreeGlyphSet, CloseFont) or just
+    /// `glyph_ids` (FreeGlyphs, or AddGlyphs redefining a live id).
+    /// Also drops matching inserts still pending in the open frame, so
+    /// the old image cannot be committed and served for a reused id.
+    pub(crate) fn forget_glyphs(&mut self, font_xid: u32, glyph_ids: Option<&[u32]>) {
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+        let ids: Option<HashSet<u32>> = glyph_ids.map(|ids| ids.iter().copied().collect());
+        let doomed = |k: &GlyphKey| {
+            k.font_xid == font_xid && ids.as_ref().is_none_or(|ids| ids.contains(&k.codepoint))
+        };
+        if let Some(atlas) = inner.glyph_atlas.as_mut() {
+            match &ids {
+                None => {
+                    atlas.forget_font(font_xid);
+                }
+                Some(ids) => {
+                    for &codepoint in ids {
+                        atlas.forget(GlyphKey {
+                            font_xid,
+                            codepoint,
+                        });
+                    }
+                }
+            }
+        }
+        if let Some(open) = inner.frame_builder.open.as_mut() {
+            open.pending_glyph_inserts
+                .entries
+                .retain(|(k, _)| !doomed(k));
+        }
+    }
+
     // ── Op: composite_glyphs (Stage 3d) ─────────────────────────
 
     /// Record a RENDER `CompositeGlyphs` against `dst`. Backend
@@ -6676,6 +6790,32 @@ impl RenderEngine {
         // runs bind are built after the per-glyph walk, from the
         // layouts the ATLAS ENTRIES actually carry; see step (8a).
         let component_alpha_supported = inner.vk.component_alpha_supported;
+
+        // (2a) Atlas room, before the frame opens: when this request's
+        //      misses (at their PACKED footprint) no longer fit, close
+        //      the open frame and empty the atlas; every glyph in use
+        //      re-uploads on its next draw.
+        let fits = inner.glyph_atlas_misses_fit(glyphs.iter().map(|g| {
+            let packed_w = match Self::effective_glyph_layout(
+                g.pixels.source_format(),
+                component_alpha_supported,
+            ) {
+                GlyphLayout::A8 => g.w,
+                GlyphLayout::ComponentAlpha => g.w.saturating_mul(super::glyph_pixels::PLANES),
+            };
+            (
+                GlyphKey {
+                    font_xid: g.gs_xid,
+                    codepoint: g.glyph_id,
+                },
+                packed_w,
+                g.h,
+            )
+        }));
+        if !fits {
+            self.reset_glyph_atlas(store, platform)?;
+        }
+        let inner = self.inner.as_mut().expect("inner");
 
         // (3) Open the frame if not open. `submit_group_ticket_or_open`
         //     either returns the existing shared ticket (if a sibling
@@ -6989,7 +7129,11 @@ impl RenderEngine {
                     .expect("init")
                     .pack(packed_w, g.h)
                 else {
-                    inner.glyph_atlas.as_mut().expect("init").note_full_once();
+                    inner
+                        .glyph_atlas
+                        .as_mut()
+                        .expect("init")
+                        .note_dropped(packed_w, g.h);
                     stats.glyphs_dropped += 1;
                     continue;
                 };
@@ -15280,23 +15424,83 @@ mod tests {
         engine.drain_all(&mut platform);
     }
 
+    fn atlas_resets(engine: &RenderEngine) -> u64 {
+        engine
+            .inner
+            .as_ref()
+            .and_then(|i| i.glyph_atlas.as_ref())
+            .map_or(0, GlyphAtlas::resets)
+    }
+
+    fn atlas_has(engine: &RenderEngine, font_xid: u32, codepoint: u32) -> bool {
+        engine
+            .inner
+            .as_ref()
+            .and_then(|i| i.glyph_atlas.as_ref())
+            .and_then(|a| {
+                a.lookup(GlyphKey {
+                    font_xid,
+                    codepoint,
+                })
+            })
+            .is_some()
+    }
+
+    /// A `w × h` glyph whose coverage is 0xFF in columns `cols` of its
+    /// top four rows and 0 everywhere else.
+    fn corner_glyph(
+        codepoint: u32,
+        dst_x: i32,
+        dst_y: i32,
+        w: usize,
+        h: usize,
+        cols: std::ops::Range<usize>,
+    ) -> PreparedGlyph {
+        let mut g = build_glyph(codepoint, dst_x, dst_y, w, h);
+        g.pixels.fill(0);
+        for y in 0..4 {
+            for x in cols.clone() {
+                g.pixels[y * w + x] = 0xFF;
+            }
+        }
+        g
+    }
+
+    /// Two 2049² glyphs cannot share the 4096² atlas. The second draw
+    /// arrives while the first one's upload and draw are still only
+    /// recorded in the open frame: the atlas must close that frame,
+    /// reset, and hand the second glyph the slot the first one used —
+    /// and both draws must still show their own glyph.
     #[test]
     #[ignore = "needs live Vulkan ICD"]
-    fn atlas_full_drops_glyph_and_increments_counter() {
-        // Drive the atlas to exhaustion via the engine's image_text
-        // pipeline. 4096² atlas; two 2049×2049 glyphs don't both
-        // fit — the second exceeds the remaining vertical room.
+    fn atlas_full_resets_behind_the_recorded_draw() {
         let Some(mut platform) = live_platform() else {
             eprintln!("no VkContext available — skipping");
             return;
         };
         let mut store = DrawableStore::new();
         let mut engine = RenderEngine::new(&platform).expect("engine");
-        let target = alloc_drawable_3a(&platform, &mut store, 0x1, 4, 4);
-        // First glyph fits.
-        let g0 = build_glyph(1, 0, 0, 2049, 2049);
-        let g1 = build_glyph(2, 0, 0, 2049, 2049);
+        let target = alloc_drawable_3a(&platform, &mut store, 0x1, 32, 8);
+        let full = vk::Rect2D {
+            offset: vk::Offset2D::default(),
+            extent: vk::Extent2D {
+                width: 32,
+                height: 8,
+            },
+        };
+        engine
+            .fill_rect(
+                &mut store,
+                &mut platform,
+                Dst::server_internal(target),
+                full,
+                [0.0, 0.0, 0.0, 1.0],
+            )
+            .expect("clear");
 
+        // Covered: g0 columns 0..4 at x 1..5; g1 columns 4..8 at x 16..20.
+        let g0 = corner_glyph(1, 1, 1, 2049, 2049, 0..4);
+        let g1 = corner_glyph(2, 12, 1, 2049, 2049, 4..8);
         let stats = engine
             .image_text(
                 &mut store,
@@ -15307,10 +15511,18 @@ mod tests {
                 &[g0],
             )
             .expect("first image_text");
-        assert_eq!(stats.atlas_interns, 1);
-        assert_eq!(stats.glyphs_dropped, 0);
+        assert_eq!((stats.atlas_interns, stats.glyphs_dropped), (1, 0));
+        assert!(
+            engine
+                .inner
+                .as_ref()
+                .expect("inner")
+                .frame_builder
+                .is_open(),
+            "the first draw must still be unsubmitted for this test to mean anything",
+        );
 
-        let stats2 = engine
+        let stats = engine
             .image_text(
                 &mut store,
                 &mut platform,
@@ -15320,9 +15532,142 @@ mod tests {
                 &[g1],
             )
             .expect("second image_text");
-        assert_eq!(stats2.atlas_interns, 0);
-        assert_eq!(stats2.glyphs_dropped, 1);
+        assert_eq!((stats.atlas_interns, stats.glyphs_dropped), (1, 0));
+        assert_eq!(atlas_resets(&engine), 1);
+        assert!(
+            !atlas_has(&engine, 1, 1),
+            "the reset dropped the first glyph"
+        );
+        let pending = engine
+            .inner
+            .as_ref()
+            .and_then(|i| i.frame_builder.open.as_ref())
+            .map(|o| o.pending_glyph_inserts.entries.clone())
+            .expect("the second draw opened a new frame");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            (pending[0].1.atlas_x, pending[0].1.atlas_y),
+            (0, 0),
+            "the second glyph reuses the first one's slot",
+        );
 
+        let out = engine
+            .get_image(
+                &mut store,
+                &mut platform,
+                Src::server_internal(target),
+                full,
+                32,
+            )
+            .expect("get_image");
+        for y in 0..8 {
+            for x in 0..32 {
+                let want = (1..5).contains(&y) && ((1..5).contains(&x) || (16..20).contains(&x));
+                let off = (y * 32 + x) * 4;
+                let px = (out[off], out[off + 1], out[off + 2]);
+                let expect = if want { (0xFF, 0xFF, 0xFF) } else { (0, 0, 0) };
+                assert_eq!(px, expect, "pixel ({x},{y})");
+            }
+        }
+        engine.drain_all(&mut platform);
+    }
+
+    /// A glyph wider than the whole atlas can never be placed: it
+    /// drops (rate-limited warning) and must NOT empty the atlas.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn glyph_larger_than_atlas_drops_without_reset() {
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no VkContext available — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+        let target = alloc_drawable_3a(&platform, &mut store, 0x1, 4, 4);
+        let small = build_glyph(1, 0, 0, 4, 4);
+        let huge = build_glyph(2, 0, 0, 4097, 1);
+        let stats = engine
+            .image_text(
+                &mut store,
+                &mut platform,
+                Dst::server_internal(target),
+                1,
+                [1.0, 1.0, 1.0, 1.0],
+                &[small, huge],
+            )
+            .expect("image_text");
+        assert_eq!((stats.atlas_interns, stats.glyphs_dropped), (1, 1));
+        assert_eq!(atlas_resets(&engine), 0);
+        engine
+            .close_open_frame(
+                &mut store,
+                &mut platform,
+                super::super::frame_builder::CloseReason::SyncWait,
+            )
+            .expect("close");
+        assert!(atlas_has(&engine, 1, 1));
+        engine.drain_all(&mut platform);
+    }
+
+    /// `forget_glyphs` drops committed entries AND inserts still
+    /// pending in the open frame, so a redefined glyph id cannot be
+    /// served its old image once that frame commits.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn forget_glyphs_drops_committed_and_pending_entries() {
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no VkContext available — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+        let target = alloc_drawable_3a(&platform, &mut store, 0x1, 16, 4);
+        let close = |engine: &mut RenderEngine,
+                     store: &mut DrawableStore,
+                     platform: &mut PlatformBackend| {
+            engine
+                .close_open_frame(
+                    store,
+                    platform,
+                    super::super::frame_builder::CloseReason::SyncWait,
+                )
+                .expect("close");
+        };
+        let draw = |engine: &mut RenderEngine,
+                    store: &mut DrawableStore,
+                    platform: &mut PlatformBackend,
+                    font: u32| {
+            let glyphs = [build_glyph(1, 0, 0, 2, 2), build_glyph(2, 4, 0, 2, 2)];
+            engine
+                .image_text(
+                    store,
+                    platform,
+                    Dst::server_internal(target),
+                    font,
+                    [1.0, 1.0, 1.0, 1.0],
+                    &glyphs,
+                )
+                .expect("image_text");
+        };
+        // Committed: font 10's glyphs land in the atlas, then go.
+        draw(&mut engine, &mut store, &mut platform, 10);
+        close(&mut engine, &mut store, &mut platform);
+        assert!(atlas_has(&engine, 10, 1) && atlas_has(&engine, 10, 2));
+        engine.forget_glyphs(10, Some(&[1]));
+        assert!(!atlas_has(&engine, 10, 1));
+        assert!(atlas_has(&engine, 10, 2), "only the named id goes");
+        engine.forget_glyphs(10, None);
+        assert!(!atlas_has(&engine, 10, 2));
+
+        // Pending: font 11's inserts are still in the open frame.
+        draw(&mut engine, &mut store, &mut platform, 11);
+        engine.forget_glyphs(11, Some(&[2]));
+        close(&mut engine, &mut store, &mut platform);
+        assert!(atlas_has(&engine, 11, 1));
+        assert!(
+            !atlas_has(&engine, 11, 2),
+            "a forgotten pending insert never commits"
+        );
         engine.drain_all(&mut platform);
     }
 
