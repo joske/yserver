@@ -1,0 +1,76 @@
+==> probe.log <==
+mapped
+  R: none
+  O: none
+core only: motion, press, release to W
+  R: sent MotionNotify(event W) sent ButtonPress(event W) sent ButtonRelease(event W)
+  O: none
+XI2 AllMasterDevices on W: motion, press, release to W
+  R: sent MotionNotify(event W) sent ButtonPress(event W) sent ButtonRelease(event W)
+  O: none
+XI2 AllDevices on the root too: motion, press, release to W
+  R: sent MotionNotify(event W) sent ButtonPress(event W) sent ButtonRelease(event W)
+  O: none
+O selects PointerMotion on W: motion to W
+  R: sent MotionNotify(event W)
+  O: sent MotionNotify(event W)
+motion to W with mask ButtonPress
+  R: sent MotionNotify(event W)
+  O: none
+to C, propagate False
+  R: none
+  O: none
+to C, propagate True
+  R: sent MotionNotify(event C) sent ButtonPress(event C) sent ButtonRelease(event C)
+  O: sent MotionNotify(event C)
+C do-not-propagate ButtonPress: to C, propagate True
+  R: sent MotionNotify(event C) sent ButtonPress(event C) sent ButtonRelease(event C)
+  O: sent MotionNotify(event C)
+press to C with mask ButtonPress|PointerMotion, propagate True
+  R: sent ButtonPress(event C)
+  O: sent ButtonPress(event C)
+press to C with an empty mask, propagate False then True
+  R: sent ButtonPress(event C) sent ButtonPress(event C)
+  O: none
+press to the root with an empty mask
+  R: none
+  O: none
+pointer warped into C
+  R: XI2(evtype 6 event W)
+  O: none
+press to PointerWindow, propagate False
+  R: none
+  O: none
+press to PointerWindow, propagate True
+  R: sent ButtonPress(event C)
+  O: none
+  (focus change) R: none
+focus W, pointer in C: key to InputFocus, propagate False
+  R: none
+  O: none
+focus W, pointer in C: key to InputFocus, propagate True
+  R: sent KeyPress(event C)
+  O: none
+  (focus change) R: none
+focus C, pointer in C: key to InputFocus, propagate True
+  R: none
+  O: none
+  (focus change) R: none
+focus None: key to InputFocus, propagate True
+  R: none
+  O: none
+  (focus PointerRoot) R: none
+BadWindow destination: error 3 value 0x7ffffff0
+propagate 2: error 2 value 0x2
+mask bit 25: error 2 value 0x2000000
+event type 1: error 2 value 0x1
+event type 35: error 2 value 0x23
+event type 40: error 2 value 0x28
+ClientMessage format 7: error 2 value 0x7
+ClientMessage format 32: no error
+after the errors
+  R: sent event 33
+  O: none
+real XTEST click in C (XI2 + core on W)
+  R: XI2(evtype 4 event W) XI2(evtype 5 event W)
+  O: none

@@ -40,6 +40,7 @@ screensaver          guest=screensaver.sh            timeout=300
 cde-apps             guest=cde-apps.sh               timeout=700 golden=live root-hook=cde-apps-root.sh
 font-list            guest=font-list.sh              timeout=400 golden=live
 passive-grab         guest=passive-grab.sh           timeout=300
+sendevent-xi2        guest=sendevent-xi2.sh          timeout=300
 cursor               guest=cursor.sh                 timeout=300
 pixmap-pool          guest=pixmap-pool.sh            host=pixmap-pool-host.sh            timeout=500 gpu=none
 pixmap-refs          guest=pixmap-refs.sh            host=pixmap-refs-host.sh            timeout=400 gpu=none
