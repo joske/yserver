@@ -69048,6 +69048,56 @@ mod tests {
         assert_eq!(tree_events(&mut peer).len(), 3);
         assert_eq!(state.dpms.last_activity, idle_since);
     }
+
+    /// An ownership barrier that fails to record aborts the submission as a
+    /// failed `vkQueueSubmit2` does, and the image stays released exactly as
+    /// tracked: nothing reached the GPU, so nothing was acquired.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn a_failed_ownership_barrier_aborts_the_submission_and_keeps_ownership_as_tracked() {
+        use crate::kms::render::{frame_builder::CloseReason, submit_group::FlushReason};
+        let mut b = match KmsBackend::for_tests_with_vk() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no Vk: {e}");
+                return;
+            }
+        };
+        let pix = b.create_pixmap(None, 24, 4, 4).expect("pixmap").as_raw();
+        b.promote_and_export_pixmap_for_tests(pix).expect("promote");
+        let id = b.store.lookup(pix).expect("pixmap drawable");
+        let image = b.store.get(id).expect("drawable").storage.image;
+        let released = |b: &KmsBackend| {
+            b.store
+                .get(id)
+                .expect("drawable")
+                .storage
+                .foreign_released_from
+        };
+        let before = released(&b).expect("promotion releases it");
+        b.fill_rectangle(None, pix, 0xFF00_FF00, 0, 0, 4, 4)
+            .expect("fill");
+
+        crate::kms::render::engine::fail_next_foreign_bracket_for_tests();
+        let closed =
+            b.engine
+                .close_open_frame(&mut b.store, &mut b.platform, CloseReason::SyncWait);
+        let flushed =
+            b.engine
+                .flush_submit_group(&mut b.store, &mut b.platform, FlushReason::SyncBoundary);
+        assert!(
+            closed.is_err() || flushed.is_err(),
+            "the failure surfaces: {closed:?} / {flushed:?}"
+        );
+        assert_eq!(b.platform.submit_group_size(), 0, "nothing left to submit");
+        assert!(b.platform.renderer_failed, "as for a failed submit");
+        assert_eq!(released(&b), Some(before), "still released, unchanged");
+        assert_eq!(
+            b.store.plan_foreign_transfers(false).acquires,
+            vec![(image, before)],
+            "the next submission still acquires it from the layout tracked"
+        );
+    }
 }
 
 #[cfg(test)]

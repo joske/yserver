@@ -2484,11 +2484,30 @@ impl RenderEngine {
             Vec::new()
         };
         // Externally shared images: acquire from / release to the foreign
-        // queue family around this submission's command buffers.
+        // queue family around this submission's command buffers. Ownership
+        // state advances only once both barriers are recorded and the
+        // submission is queued. A recording failure aborts the submission
+        // exactly as a failed `vkQueueSubmit2` does — the group's command
+        // buffers are dropped and the error surfaces — so the images stay
+        // released as tracked.
+        let mut bracket_failed = None;
+        let mut transfers = None;
         if platform.submit_group_size() > 0 {
-            let transfers = store.plan_foreign_transfers(recording_open);
-            if !transfers.is_empty() {
-                self.bracket_foreign_transfers(platform, &transfers);
+            let planned = store.plan_foreign_transfers(recording_open);
+            match self.bracket_foreign_transfers(platform, &planned) {
+                Ok(()) => transfers = Some(planned),
+                Err(e) => {
+                    log::warn!(
+                        "foreign ownership: recording {} acquire / {} release barriers \
+                         failed ({e:?}); submission aborted",
+                        planned.acquires.len(),
+                        planned.releases.len()
+                    );
+                    bracket_failed = Some(match e {
+                        RenderError::Vk(r) => r,
+                        _ => vk::Result::ERROR_INITIALIZATION_FAILED,
+                    });
+                }
             }
         }
         let exported_borrows: Vec<(std::os::fd::BorrowedFd<'_>, bool)> = {
@@ -2498,7 +2517,10 @@ impl RenderEngine {
                 .map(|(f, prewaited)| (f.as_fd(), *prewaited))
                 .collect()
         };
-        let result = platform.flush_submit_group_with_exports(reason, &exported_borrows);
+        let result = match bracket_failed {
+            Some(e) => platform.abort_submit_group(reason, e),
+            None => platform.flush_submit_group_with_exports(reason, &exported_borrows),
+        };
         // Drain the platform's last_flush_outcome regardless of Ok/Err
         // — both branches in platform's flush_submit_group populate it
         // before returning. The engine queues it for backend telemetry
@@ -2507,6 +2529,11 @@ impl RenderEngine {
             && let Some(inner) = self.inner.as_mut()
         {
             inner.pending_flush_outcomes.push(outcome);
+        }
+        if result.is_ok()
+            && let Some(transfers) = transfers
+        {
+            store.commit_foreign_transfers(&transfers);
         }
         let Some(inner) = self.inner.as_mut() else {
             return result;
@@ -2533,16 +2560,18 @@ impl RenderEngine {
     /// Record `transfers` into an acquire and a release command buffer and
     /// bracket the open submit group with them, so they execute first and
     /// last in the submission being flushed. Both retire with the group's
-    /// ticket like any other op. A recording failure is logged and the
-    /// transfers are dropped: the drawable state already records them, so
-    /// the next submission's barriers still name the right layouts.
+    /// ticket like any other op. All or nothing: on a recording failure
+    /// neither command buffer joins the group and both are freed.
     fn bracket_foreign_transfers(
         &mut self,
         platform: &mut PlatformBackend,
         transfers: &super::store::ForeignTransfers,
-    ) {
+    ) -> Result<(), RenderError> {
+        if transfers.is_empty() {
+            return Ok(());
+        }
         let Some(inner) = self.inner.as_mut() else {
-            return;
+            return Ok(());
         };
         let graphics = inner.vk.graphics_queue_family;
         let foreign = super::store::foreign_queue_family(inner.vk.queue_family_foreign);
@@ -2560,43 +2589,62 @@ impl RenderEngine {
                 super::store::foreign_release_barrier(image, layout, graphics, foreign)
             })
             .collect();
+        let pool = platform
+            .ops_command_pool_handle()
+            .ok_or(RenderError::NoVk)?;
         let mut record = |barriers: &[vk::ImageMemoryBarrier2<'static>]| {
             if barriers.is_empty() {
                 return Ok(None);
             }
             let (cb, ticket) = begin_op_cb(inner, platform)?;
             let dep = vk::DependencyInfo::default().image_memory_barriers(barriers);
-            unsafe {
+            let ended = unsafe {
                 inner.vk.device.cmd_pipeline_barrier2(cb, &dep);
-                inner.vk.device.end_command_buffer(cb)?;
+                inner.vk.device.end_command_buffer(cb)
+            };
+            #[cfg(test)]
+            let ended = if FAIL_NEXT_FOREIGN_BRACKET.replace(false) {
+                Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
+            } else {
+                ended
+            };
+            if let Err(e) = ended {
+                // SAFETY: never submitted.
+                unsafe { inner.vk.device.free_command_buffers(pool, &[cb]) };
+                return Err(RenderError::Vk(e));
             }
-            inner.pending_group_ops.push(SubmittedOp {
-                cb,
-                ticket,
-                staging: None,
-                scratch: Vec::new(),
-                sampled_scratch: Vec::new(),
-                atlas_ticket: None,
-                generation: 0,
-                retired_resources: Vec::new(),
-            });
-            Ok::<_, RenderError>(Some(cb))
+            Ok::<_, RenderError>(Some((cb, ticket)))
         };
-        let acquire = record(&acquires);
-        let release = record(&releases);
-        match (acquire, release) {
-            (Ok(acquire), Ok(release)) => platform.submit_group_bracket(acquire, release),
-            (acquire, release) => {
-                log::warn!(
-                    "foreign ownership: recording {} acquire / {} release barriers failed; \
-                     submitting without them",
-                    acquires.len(),
-                    releases.len()
-                );
-                // Keep whichever recorded: its SubmittedOp is already parked.
-                platform.submit_group_bracket(acquire.ok().flatten(), release.ok().flatten());
+        let acquire = record(&acquires)?;
+        let release = match record(&releases) {
+            Ok(release) => release,
+            Err(e) => {
+                if let Some((cb, _)) = acquire {
+                    // SAFETY: never submitted.
+                    unsafe { inner.vk.device.free_command_buffers(pool, &[cb]) };
+                }
+                return Err(e);
             }
-        }
+        };
+        let mut park = |op: Option<(vk::CommandBuffer, FenceTicket)>| {
+            op.map(|(cb, ticket)| {
+                inner.pending_group_ops.push(SubmittedOp {
+                    cb,
+                    ticket,
+                    staging: None,
+                    scratch: Vec::new(),
+                    sampled_scratch: Vec::new(),
+                    atlas_ticket: None,
+                    generation: 0,
+                    retired_resources: Vec::new(),
+                });
+                cb
+            })
+        };
+        let acquire = park(acquire);
+        let release = park(release);
+        platform.submit_group_bracket(acquire, release);
+        Ok(())
     }
 
     /// Phase A: check whether the platform's SubmitGroup has hit its
@@ -9663,6 +9711,17 @@ impl Drop for RenderEngine {
 // ────────────────────────────────────────────────────────────────
 // Helpers: CB lifecycle, byte conversion, rect clipping.
 // ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: the next foreign-ownership barrier recording fails.
+    static FAIL_NEXT_FOREIGN_BRACKET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_foreign_bracket_for_tests() {
+    FAIL_NEXT_FOREIGN_BRACKET.set(true);
+}
 
 /// Allocate a fresh primary CB from the platform's
 /// `OpsCommandPool`, begin recording, and acquire a

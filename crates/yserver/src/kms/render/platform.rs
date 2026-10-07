@@ -5124,6 +5124,19 @@ impl PlatformBackend {
         }
     }
 
+    /// Abort the open group without submitting it, as a failed
+    /// `vkQueueSubmit2` would: its command buffers are freed, the renderer
+    /// is marked failed, and `err` surfaces.
+    pub(crate) fn abort_submit_group(
+        &mut self,
+        reason: FlushReason,
+        err: vk::Result,
+    ) -> Result<FlushOutcome, vk::Result> {
+        let (entries, _ticket) = self.submit_group.take();
+        let n = entries.len();
+        self.abort_flush(entries, n, reason, err)
+    }
+
     /// Phase A: shared abort path. Frees the just-taken CBs, stashes
     /// the `aborted: true` `FlushOutcome`, sets `renderer_failed`, and
     /// surfaces the underlying `vk::Result`. Both the real

@@ -292,6 +292,12 @@ pub(crate) fn foreign_release_barrier(
 pub(crate) struct ForeignTransfers {
     pub(crate) acquires: Vec<(vk::Image, vk::ImageLayout)>,
     pub(crate) releases: Vec<(vk::Image, vk::ImageLayout)>,
+    /// Drawables behind `acquires`, in order.
+    acquired: Vec<DrawableId>,
+    /// Drawables behind `releases`, in order.
+    released: Vec<DrawableId>,
+    /// `Some(owned)`: a recording is open, so `owned` stays held.
+    hold: Option<Vec<DrawableId>>,
 }
 
 impl ForeignTransfers {
@@ -979,7 +985,7 @@ pub(crate) struct DrawableStore {
     /// holds a DamageNotify's client output while it is set.
     export_writes_pending: Arc<std::sync::atomic::AtomicBool>,
     /// Externally shared drawables (`Storage::foreign_shared`) touched since
-    /// the last submit-group flush; drained by [`Self::plan_foreign_transfers`].
+    /// the last submit-group flush; drained by [`Self::commit_foreign_transfers`].
     foreign_touched: Vec<DrawableId>,
     /// Externally shared drawables acquired by an earlier flush but not yet
     /// released, because a frame or render batch that touched them was still
@@ -1654,7 +1660,9 @@ impl DrawableStore {
     }
 
     /// Decide the queue-family ownership transfers for the submission a
-    /// submit-group flush is about to make, and record the resulting state.
+    /// submit-group flush is about to make. State is unchanged until
+    /// [`Self::commit_foreign_transfers`], which the flush calls only once
+    /// the barriers are recorded.
     ///
     /// Every externally shared drawable touched since the last flush is
     /// acquired (if it is released) by a barrier ahead of the group's
@@ -1663,39 +1671,60 @@ impl DrawableStore {
     /// `recording_open`: a frame or render batch still recording may have
     /// touched it, and its command buffer will land in a later submission,
     /// so those stay owned (`foreign_held`) until a flush with nothing open.
-    pub(crate) fn plan_foreign_transfers(&mut self, recording_open: bool) -> ForeignTransfers {
+    pub(crate) fn plan_foreign_transfers(&self, recording_open: bool) -> ForeignTransfers {
         let mut transfers = ForeignTransfers::default();
         if self.foreign_touched.is_empty() && self.foreign_held.is_empty() {
             return transfers;
         }
-        let mut owned: Vec<DrawableId> = std::mem::take(&mut self.foreign_held);
-        for id in std::mem::take(&mut self.foreign_touched) {
+        let mut owned: Vec<DrawableId> = self.foreign_held.clone();
+        for &id in &self.foreign_touched {
             if owned.contains(&id) {
                 continue;
             }
-            let Some(d) = self.entries.get_mut(&id) else {
+            let Some(d) = self.entries.get(&id) else {
                 continue;
             };
-            if let Some(layout) = d.storage.foreign_released_from.take() {
+            if let Some(layout) = d.storage.foreign_released_from {
                 transfers.acquires.push((d.storage.image, layout));
+                transfers.acquired.push(id);
             }
             owned.push(id);
         }
         if recording_open {
-            self.foreign_held = owned;
+            transfers.hold = Some(owned);
             return transfers;
         }
         for id in owned {
-            let Some(d) = self.entries.get_mut(&id) else {
+            let Some(d) = self.entries.get(&id) else {
                 continue;
             };
-            if d.storage.foreign_shared && d.storage.foreign_released_from.is_none() {
-                let layout = d.storage.current_layout;
-                transfers.releases.push((d.storage.image, layout));
-                d.storage.foreign_released_from = Some(layout);
+            let owned_now =
+                d.storage.foreign_released_from.is_none() || transfers.acquired.contains(&id);
+            if d.storage.foreign_shared && owned_now {
+                transfers
+                    .releases
+                    .push((d.storage.image, d.storage.current_layout));
+                transfers.released.push(id);
             }
         }
         transfers
+    }
+
+    /// Record that `transfers` (from [`Self::plan_foreign_transfers`], with
+    /// no store change in between) are in the submission being flushed.
+    pub(crate) fn commit_foreign_transfers(&mut self, transfers: &ForeignTransfers) {
+        self.foreign_touched.clear();
+        for id in &transfers.acquired {
+            if let Some(d) = self.entries.get_mut(id) {
+                d.storage.foreign_released_from = None;
+            }
+        }
+        self.foreign_held = transfers.hold.clone().unwrap_or_default();
+        for (id, &(_, layout)) in transfers.released.iter().zip(&transfers.releases) {
+            if let Some(d) = self.entries.get_mut(id) {
+                d.storage.foreign_released_from = Some(layout);
+            }
+        }
     }
 
     /// Released shared images among `sampled` that a scene compose command
@@ -1865,6 +1894,34 @@ mod tests {
         assert_eq!(live.rects(), &[full]);
     }
 
+    fn plan_and_commit(s: &mut DrawableStore, recording_open: bool) -> ForeignTransfers {
+        let t = s.plan_foreign_transfers(recording_open);
+        s.commit_foreign_transfers(&t);
+        t
+    }
+
+    #[test]
+    fn an_uncommitted_plan_leaves_ownership_as_it_was() {
+        let mut s = DrawableStore::new();
+        let id = shared_pixmap(&mut s, 0x10, 7);
+        s.touch_render_fence(id, FenceTicket::for_tests_stub());
+        let sr = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        // Barrier recording failed: the flush drops the plan.
+        let first = s.plan_foreign_transfers(false);
+        assert_eq!(first.acquires.len(), 1);
+        assert_eq!(
+            s.get(id).expect("get").storage.foreign_released_from,
+            Some(sr)
+        );
+        // The retry plans the same transfers, as the image still is released.
+        assert_eq!(plan_and_commit(&mut s, false), first);
+        assert_eq!(
+            s.get(id).expect("get").storage.foreign_released_from,
+            Some(sr)
+        );
+        assert!(plan_and_commit(&mut s, false).is_empty(), "drained");
+    }
+
     fn shared_pixmap(s: &mut DrawableStore, xid: u32, image: u64) -> DrawableId {
         use ash::vk::Handle as _;
         let id = s
@@ -1930,7 +1987,7 @@ mod tests {
         s.touch_render_fence(id, FenceTicket::for_tests_stub());
         s.touch_render_fence(id, FenceTicket::for_tests_stub());
         s.touch_render_fence(plain, FenceTicket::for_tests_stub());
-        let t = s.plan_foreign_transfers(false);
+        let t = plan_and_commit(&mut s, false);
         let sr = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
         assert_eq!(t.acquires, vec![(vk::Image::from_raw(7), sr)]);
         assert_eq!(t.releases, vec![(vk::Image::from_raw(7), sr)]);
@@ -1938,7 +1995,7 @@ mod tests {
             s.get(id).expect("get").storage.foreign_released_from,
             Some(sr)
         );
-        assert!(s.plan_foreign_transfers(false).is_empty(), "drained");
+        assert!(plan_and_commit(&mut s, false).is_empty(), "drained");
     }
 
     #[test]
@@ -1947,7 +2004,7 @@ mod tests {
         let mut s = DrawableStore::new();
         let id = shared_pixmap(&mut s, 0x10, 7);
         s.touch_render_fence(id, FenceTicket::for_tests_stub());
-        let t = s.plan_foreign_transfers(true);
+        let t = plan_and_commit(&mut s, true);
         assert_eq!(t.acquires.len(), 1);
         assert!(t.releases.is_empty());
         assert_eq!(s.get(id).expect("get").storage.foreign_released_from, None);
@@ -1955,7 +2012,7 @@ mod tests {
         assert!(s.foreign_sampled_images(&[id]).is_empty());
         // Touched again while held: no second acquire.
         s.touch_render_fence(id, FenceTicket::for_tests_stub());
-        let t = s.plan_foreign_transfers(false);
+        let t = plan_and_commit(&mut s, false);
         assert!(t.acquires.is_empty());
         assert_eq!(
             t.releases,
@@ -1972,10 +2029,10 @@ mod tests {
         let id = shared_pixmap(&mut s, 0x10, 7);
         s.touch_render_fence(id, FenceTicket::for_tests_stub());
         s.get_mut(id).expect("get").storage.current_layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
-        let t = s.plan_foreign_transfers(false);
+        let t = plan_and_commit(&mut s, false);
         assert_eq!(t.releases[0].1, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
         s.touch_render_fence(id, FenceTicket::for_tests_stub());
-        let t = s.plan_foreign_transfers(false);
+        let t = plan_and_commit(&mut s, false);
         assert_eq!(
             t.acquires[0].1,
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
