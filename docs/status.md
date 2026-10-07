@@ -1169,6 +1169,30 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   dma-buf (`import_ok/s import_unsupported/s import_failed/s` on the probe
   line, each failure kind warned once).
 
+  *Silently accumulated damage handed out by DamageSubtract (HW untested).*
+  With `damage_notify_before_fence=0` and every import OK, one of KWin's
+  three back buffers still kept a stale frame. KWin selects NonEmpty and
+  reads damage with `DamageSubtract` into a parts region + `FetchRegion`
+  (`surfaceitem_x11.cpp`): paint A notifies and is flushed, paint B on the
+  same backing only accumulates (no DamageNotify, so no hold and no
+  flush), and the FetchRegion reply carrying A+B left while B was still
+  unsubmitted. The hold is now structural, as in Xorg (every reply/event
+  leaves in `FlushAllOutput` after glamor's BlockHandler flush):
+  `client_io::write_or_buffer` holds any client's output while
+  `ServerState::output_gate` reports unpublished exported writes, and
+  `run::output_barrier` flushes then releases — at request end only for a
+  queued DamageNotify (or when something else already published), at the
+  loop's block point (settle/tail) for everything held, and before an
+  fd-carrying reply (`BeforeFdReply`) whenever writes are pending. Cost
+  without dirty exports: one atomic load per write, two per barrier.
+  `DamageSubtract`/`FetchRegion` additionally flush first. The re-report
+  after a subtract (`report_existing_damage_to_state`) used to be
+  released at request end without any flush; the gate covers it now.
+  Probe line: `subtract_total/s subtract_exported/s
+  subtract_before_fence/s subtract_buffered/s damage_reply_flushes/s`,
+  a subtract classified when its parts region's `FetchRegion` reply hits
+  the socket (at the subtract itself without a parts region).
+
 - **2026-09-10 #138 Chrome hardware-decoded video scrambled — FIXED, hardware
   confirmed:** ads, video and fullscreen all correct on silence (RX 6800,
   Mesa 26.2.2, Chromium, AV1 via `VaapiVideoDecoder`). Two server-side lies,
