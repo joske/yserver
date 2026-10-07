@@ -34,6 +34,7 @@ crossing-tree        guest=crossing-tree.sh          timeout=300
 xi2-crossing-devices guest=xi2-crossing-devices.sh   timeout=300
 subwindow-move       guest=subwindow-move.sh         timeout=300
 child-clip           guest=child-clip.sh             timeout=300
+restack-expose       guest=restack-expose.sh         timeout=300
 draw-clip            guest=draw-clip.sh              timeout=300
 legacy-apps          guest=legacy-apps.sh            timeout=400 golden=live
 screensaver          guest=screensaver.sh            timeout=300
