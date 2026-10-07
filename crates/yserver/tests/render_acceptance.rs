@@ -16470,3 +16470,458 @@ fn a_rename_while_a_background_holds_the_backing_does_not_leak() {
         eprintln!("skipping: no Vk");
     }
 }
+
+/// Deterministic xorshift for the trap/triangle stress sets.
+struct StressRng(u64);
+
+impl StressRng {
+    fn next_f32(&mut self) -> f32 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        #[allow(clippy::cast_precision_loss)]
+        let v = (self.0 >> 40) as f32 / (1u64 << 24) as f32;
+        v
+    }
+    fn range(&mut self, lo: f32, hi: f32) -> f32 {
+        lo + (hi - lo) * self.next_f32()
+    }
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn stress_fixed(v: f32) -> i32 {
+    (f64::from(v) * 65536.0).round() as i32
+}
+
+const STRESS_W: u32 = 2600;
+const STRESS_H: u32 = 2000;
+
+/// #214 shape: thousands of thin slanted trapezoids over a ~2400×1800
+/// bbox, plus large ones and the degenerate shapes the shader still
+/// paints or zeroes (flat, inverted, zero-length/horizontal/upward
+/// edges, crossed sides, partly off the pixmap). 16.16 fields in wire
+/// order: top, bottom, left p1/p2, right p1/p2.
+fn trap_stress_set() -> Vec<[i32; 10]> {
+    let mut rng = StressRng(0x9E37_79B9_7F4A_7C15);
+    let mut out: Vec<[f32; 10]> = Vec::new();
+    for _ in 0..8000 {
+        let x = rng.range(-20.0, 2420.0);
+        let y = rng.range(-20.0, 1820.0);
+        let h = rng.range(0.25, 6.0);
+        let w = rng.range(0.2, 3.0);
+        let slant = rng.range(-15.0, 15.0);
+        let (e1, e2) = (rng.range(0.0, 8.0), rng.range(0.0, 8.0));
+        let k = slant / h;
+        out.push([
+            y,
+            y + h,
+            x - k * e1,
+            y - e1,
+            x + slant + k * e2,
+            y + h + e2,
+            x + w - k * e1,
+            y - e1,
+            x + w + slant + k * e2,
+            y + h + e2,
+        ]);
+    }
+    for _ in 0..24 {
+        let x = rng.range(0.0, 2000.0);
+        let y = rng.range(0.0, 1500.0);
+        let h = rng.range(100.0, 400.0);
+        let w = rng.range(50.0, 500.0);
+        let (sl, sr) = (rng.range(-200.0, 200.0), rng.range(-200.0, 200.0));
+        out.push([y, y + h, x, y, x + sl, y + h, x + w, y, x + w + sr, y + h]);
+    }
+    // Near-horizontal sides: the AA band runs far along x.
+    for i in 0..16 {
+        #[allow(clippy::cast_precision_loss)]
+        let y = 100.0 + 90.0 * i as f32;
+        out.push([
+            y,
+            y + 3.0,
+            300.0,
+            y,
+            700.0,
+            y + 0.7,
+            900.0,
+            y,
+            1300.0,
+            y + 2.0,
+        ]);
+    }
+    out.extend_from_slice(&[
+        // flat (top == bottom) and inverted (bottom < top)
+        [
+            500.25, 500.25, 100.0, 490.0, 100.0, 510.0, 400.0, 490.0, 400.0, 510.0,
+        ],
+        [
+            600.5, 600.0, 100.0, 590.0, 100.0, 610.0, 400.0, 590.0, 400.0, 610.0,
+        ],
+        // zero-length left edge
+        [
+            700.0, 720.0, 150.0, 710.0, 150.0, 710.0, 300.0, 700.0, 300.0, 720.0,
+        ],
+        // horizontal left edge
+        [
+            800.0, 830.0, 100.0, 815.0, 140.0, 815.0, 300.0, 800.0, 300.0, 830.0,
+        ],
+        // upward-directed edges, each side and both
+        [
+            900.0, 940.0, 200.0, 940.0, 180.0, 900.0, 400.0, 900.0, 420.0, 940.0,
+        ],
+        [
+            1000.0, 1040.0, 200.0, 1000.0, 180.0, 1040.0, 400.0, 1040.0, 420.0, 1000.0,
+        ],
+        [
+            1100.0, 1140.0, 200.0, 1140.0, 180.0, 1100.0, 400.0, 1140.0, 420.0, 1100.0,
+        ],
+        // crossed sides (left right of right)
+        [
+            1200.0, 1240.0, 600.0, 1200.0, 610.0, 1240.0, 500.0, 1200.0, 505.0, 1240.0,
+        ],
+        // sides crossing mid-trapezoid
+        [
+            1300.0, 1360.0, 500.0, 1300.0, 700.0, 1360.0, 700.0, 1300.0, 500.0, 1360.0,
+        ],
+        // partly off the pixmap on every side
+        [
+            -30.0, 40.0, -50.0, -30.0, -20.0, 40.0, 60.0, -30.0, 90.0, 40.0,
+        ],
+        [
+            1960.0, 2030.0, 2550.0, 1960.0, 2580.0, 2030.0, 2650.0, 1960.0, 2690.0, 2030.0,
+        ],
+        // a 1/65536-wide sliver and a sub-pixel speck
+        [
+            1500.0, 1510.0, 800.0, 1500.0, 800.0, 1510.0, 800.000_02, 1500.0, 800.000_02, 1510.0,
+        ],
+        [
+            1520.3, 1520.6, 810.2, 1520.0, 810.2, 1521.0, 810.7, 1520.0, 810.7, 1521.0,
+        ],
+    ]);
+    out.iter().map(|t| t.map(stress_fixed)).collect()
+}
+
+/// Thin, large, sharp-angled and collinear triangles (wire order
+/// p1, p2, p3 as 16.16 x/y pairs).
+fn triangle_stress_set() -> Vec<[i32; 6]> {
+    let mut rng = StressRng(0xD1B5_4A32_D192_ED03);
+    let mut out: Vec<[f32; 6]> = Vec::new();
+    for _ in 0..8000 {
+        let x = rng.range(-20.0, 2420.0);
+        let y = rng.range(-20.0, 1820.0);
+        out.push([
+            x,
+            y,
+            x + rng.range(-12.0, 12.0),
+            y + rng.range(-12.0, 12.0),
+            x + rng.range(-3.0, 3.0),
+            y + rng.range(-3.0, 3.0),
+        ]);
+    }
+    for _ in 0..16 {
+        let x = rng.range(0.0, 2000.0);
+        let y = rng.range(0.0, 1500.0);
+        out.push([
+            x,
+            y,
+            x + rng.range(-400.0, 400.0),
+            y + rng.range(0.0, 400.0),
+            x + rng.range(-400.0, 400.0),
+            y + rng.range(0.0, 400.0),
+        ]);
+    }
+    out.extend_from_slice(&[
+        // needle: the dilated tip reaches far past the vertex bbox
+        [100.0, 1900.0, 1100.0, 1900.3, 100.0, 1900.6],
+        [1200.0, 1700.0, 1200.4, 1900.0, 1200.8, 1700.0],
+        // collinear and coincident
+        [300.0, 300.0, 400.0, 400.0, 500.0, 500.0],
+        [600.0, 600.0, 600.0, 600.0, 600.0, 600.0],
+        // partly off the pixmap
+        [-40.0, -40.0, 60.0, -10.0, 10.0, 70.0],
+        [2560.0, 1950.0, 2700.0, 1990.0, 2590.0, 2100.0],
+    ]);
+    out.iter().map(|t| t.map(stress_fixed)).collect()
+}
+
+/// CPU mirror of `trap.frag.glsl` / `triangle.frag.glsl`'s
+/// `edge_coverage_linear`.
+fn stress_edge_cov(p: (f32, f32), a: (f32, f32), b: (f32, f32), inside: f32) -> f32 {
+    let d = (b.0 - a.0, b.1 - a.1);
+    let len = (d.0 * d.0 + d.1 * d.1).sqrt();
+    if len < 1e-6 {
+        return 0.0;
+    }
+    let n = (-d.1 / len, d.0 / len);
+    let sd = ((p.0 - a.0) * n.0 + (p.1 - a.1) * n.1) * inside;
+    (0.5 - sd).clamp(0.0, 1.0)
+}
+
+fn stress_fx(v: i32) -> f32 {
+    #[allow(clippy::cast_precision_loss)]
+    let f = v as f32 / 65536.0;
+    f
+}
+
+/// Accumulate one primitive into the CPU oracle mask the way the GPU's
+/// ONE+ONE blend into R8 does (clamp, quantize per add). Evaluates the
+/// primitive over EVERY column of the rows `rows`, so it does not share
+/// the per-instance extent logic under test.
+fn stress_accumulate(acc: &mut [u8], rows: std::ops::Range<i64>, cov: impl Fn((f32, f32)) -> f32) {
+    let w = i64::from(STRESS_W);
+    for y in rows.start.max(0)..rows.end.min(i64::from(STRESS_H)) {
+        for x in 0..w {
+            #[allow(clippy::cast_precision_loss)]
+            let c = cov((x as f32 + 0.5, y as f32 + 0.5));
+            if c > 0.0 {
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                let i = (y * w + x) as usize;
+                let v = (c + f32::from(acc[i]) / 255.0).min(1.0);
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                {
+                    acc[i] = (v * 255.0).round() as u8;
+                }
+            }
+        }
+    }
+}
+
+fn trap_oracle(traps: &[[i32; 10]]) -> Vec<u8> {
+    let mut acc = vec![0u8; (STRESS_W * STRESS_H) as usize];
+    for t in traps {
+        let f = t.map(stress_fx);
+        let (top, bot) = (f[0], f[1]);
+        let (lp1, lp2, rp1, rp2) = ((f[2], f[3]), (f[4], f[5]), (f[6], f[7]), (f[8], f[9]));
+        // c_top * c_bot > 0 only for pixel centres in (top-0.5, bottom+0.5).
+        #[allow(clippy::cast_possible_truncation)]
+        let rows = (top.floor() as i64 - 2)..(bot.ceil() as i64 + 2);
+        stress_accumulate(&mut acc, rows, |p| {
+            let c_top = (0.5 + (p.1 - top)).clamp(0.0, 1.0);
+            let c_bot = (0.5 + (bot - p.1)).clamp(0.0, 1.0);
+            c_top * c_bot * stress_edge_cov(p, lp1, lp2, 1.0) * stress_edge_cov(p, rp1, rp2, -1.0)
+        });
+    }
+    acc
+}
+
+fn triangle_oracle(tris: &[[i32; 6]]) -> Vec<u8> {
+    let mut acc = vec![0u8; (STRESS_W * STRESS_H) as usize];
+    for t in tris {
+        let f = t.map(stress_fx);
+        let (p1, p2, p3) = ((f[0], f[1]), (f[2], f[3]), (f[4], f[5]));
+        let area2 = (p2.0 - p1.0) * (p3.1 - p1.1) - (p2.1 - p1.1) * (p3.0 - p1.0);
+        if area2.abs() < 1e-3 {
+            continue;
+        }
+        let orient = if area2 > 0.0 { -1.0 } else { 1.0 };
+        // Rows: the shader's 0.5px-dilated triangle is the triangle
+        // scaled about its incentre by (r + 0.5) / r (r = inradius).
+        let (a, bb, c) = (
+            f64::from((p2.0 - p3.0).hypot(p2.1 - p3.1)),
+            f64::from((p3.0 - p1.0).hypot(p3.1 - p1.1)),
+            f64::from((p1.0 - p2.0).hypot(p1.1 - p2.1)),
+        );
+        let per = a + bb + c;
+        let iy = (a * f64::from(p1.1) + bb * f64::from(p2.1) + c * f64::from(p3.1)) / per;
+        let r = f64::from(area2.abs()) / per;
+        let s = (r + 0.5) / r;
+        let ys = [p1.1, p2.1, p3.1].map(|y| iy + s * (f64::from(y) - iy));
+        let lo = ys.iter().copied().fold(f64::INFINITY, f64::min).max(-1.0);
+        let hi = ys
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max)
+            .min(f64::from(STRESS_H) + 1.0);
+        #[allow(clippy::cast_possible_truncation)]
+        let rows = (lo.floor() as i64 - 2)..(hi.ceil() as i64 + 2);
+        stress_accumulate(&mut acc, rows, |p| {
+            stress_edge_cov(p, p1, p2, orient)
+                * stress_edge_cov(p, p2, p3, orient)
+                * stress_edge_cov(p, p3, p1, orient)
+        });
+    }
+    acc
+}
+
+/// Paint `wire` (Trapezoids or Triangles bytes) with op=Add, white
+/// solid src, into a cleared A8 pixmap and read the coverage back.
+/// Prints the wall time of the op (submit + wait, minus a bare readback).
+fn stress_paint(b: &mut KmsBackend, triangles: bool, wire: &[u8]) -> Vec<u8> {
+    let dst_pix = b
+        .create_pixmap(None, 8, STRESS_W as u16, STRESS_H as u16)
+        .expect("create_pixmap");
+    let dst_xid = dst_pix.as_raw();
+    let src_pic = b
+        .render_create_solid_fill(None, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
+        .expect("solid_fill")
+        .expect("Some");
+    let dst_pic = b
+        .render_create_picture(None, AnyHandle::Pixmap(dst_pix), 0, 0, &[])
+        .expect("dst_pic")
+        .expect("Some");
+    let (w, h) = (STRESS_W as u16, STRESS_H as u16);
+    // Warm-up: the first primitive alone, so pipeline creation and
+    // scratch growth stay out of the timed op.
+    let first = if triangles { &wire[..24] } else { &wire[..40] };
+    if triangles {
+        b.render_triangles_op(
+            None,
+            11,
+            12,
+            src_pic.as_raw(),
+            dst_pic.as_raw(),
+            0,
+            0,
+            0,
+            first,
+            0,
+            0,
+        )
+        .expect("warm-up");
+    } else {
+        b.render_trapezoids(
+            None,
+            12,
+            src_pic.as_raw(),
+            dst_pic.as_raw(),
+            0,
+            0,
+            0,
+            first,
+            0,
+            0,
+        )
+        .expect("warm-up");
+    }
+    b.fill_rectangle(None, dst_xid, 0, 0, 0, w, h)
+        .expect("clear");
+    // Drain the warm-up and the clear before the timed op.
+    let _ = b
+        .get_image_pixels_for_tests(dst_xid, 2, 0, 0, 1, 1, !0)
+        .expect("get_image");
+    let t1 = std::time::Instant::now();
+    if triangles {
+        b.render_triangles_op(
+            None,
+            11,
+            12,
+            src_pic.as_raw(),
+            dst_pic.as_raw(),
+            0,
+            0,
+            0,
+            wire,
+            0,
+            0,
+        )
+        .expect("render_triangles");
+    } else {
+        b.render_trapezoids(
+            None,
+            12,
+            src_pic.as_raw(),
+            dst_pic.as_raw(),
+            0,
+            0,
+            0,
+            wire,
+            0,
+            0,
+        )
+        .expect("render_trapezoids");
+    }
+    let out = b
+        .get_image_pixels_for_tests(dst_xid, 2, 0, 0, w, h, !0)
+        .expect("get_image")
+        .expect("Some");
+    let total = t1.elapsed();
+    let t2 = std::time::Instant::now();
+    let _ = b
+        .get_image_pixels_for_tests(dst_xid, 2, 0, 0, w, h, !0)
+        .expect("get_image");
+    let readback = t2.elapsed();
+    eprintln!(
+        "#214 stress {}: op+readback {:.1} ms (idle readback alone {:.1} ms)",
+        if triangles { "triangles" } else { "trapezoids" },
+        total.as_secs_f64() * 1e3,
+        readback.as_secs_f64() * 1e3,
+    );
+    out
+}
+
+/// Compare the painted coverage against the CPU oracle and optionally
+/// dump the raw bytes (`YSERVER_TRAP_STRESS_DUMP=<dir>`) for an
+/// out-of-band A/B between builds.
+fn stress_check(name: &str, got: &[u8], want: &[u8]) {
+    if let Some(dir) = std::env::var_os("YSERVER_TRAP_STRESS_DUMP") {
+        let path = std::path::Path::new(&dir).join(format!("{name}.r8"));
+        std::fs::write(&path, got).expect("dump");
+        eprintln!("dumped {}", path.display());
+    }
+    assert_eq!(got.len(), want.len());
+    let mut worst = (0u8, 0usize);
+    let mut off = 0usize;
+    let mut painted = 0usize;
+    for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+        let d = g.abs_diff(w);
+        if d > worst.0 {
+            worst = (d, i);
+        }
+        if d > 2 {
+            off += 1;
+        }
+        if g > 0 {
+            painted += 1;
+        }
+    }
+    let (x, y) = (worst.1 % STRESS_W as usize, worst.1 / STRESS_W as usize);
+    eprintln!(
+        "#214 stress {name}: {painted} painted px, {off} px off the oracle by >2, \
+         worst {} at ({x},{y}) got {} want {}",
+        worst.0, got[worst.1], want[worst.1]
+    );
+    assert_eq!(off, 0, "{name}: coverage diverges from the CPU oracle");
+}
+
+/// #214: a CompositeTrapezoids with ~8000 thin trapezoids must paint the
+/// same coverage as the shader math evaluated per pixel — in particular
+/// no AA edge pixel may be lost by the per-instance raster extent.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn trapezoid_stress_matches_cpu_coverage_oracle() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let traps = trap_stress_set();
+    let wire: Vec<u8> = traps
+        .iter()
+        .flat_map(|t| t.iter().flat_map(|v| v.to_le_bytes()))
+        .collect();
+    let got = stress_paint(&mut b, false, &wire);
+    stress_check("trapezoids", &got, &trap_oracle(&traps));
+}
+
+/// #214 sibling: the Triangles path shares the instanced mask pass.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn triangle_stress_matches_cpu_coverage_oracle() {
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return;
+        }
+    };
+    let tris = triangle_stress_set();
+    let wire: Vec<u8> = tris
+        .iter()
+        .flat_map(|t| t.iter().flat_map(|v| v.to_le_bytes()))
+        .collect();
+    let got = stress_paint(&mut b, true, &wire);
+    stress_check("triangles", &got, &triangle_oracle(&tris));
+}
