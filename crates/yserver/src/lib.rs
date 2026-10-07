@@ -860,6 +860,13 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
                 match signal_fd.read_signal() {
                     Ok(Some(siginfo)) => {
                         let signo = siginfo.ssi_signo as i32;
+                        if signo == drawable_dump_signal() {
+                            log::info!("drawable dump requested by signal");
+                            if signal_sender.send(Message::DumpDrawables).is_err() {
+                                return;
+                            }
+                            continue;
+                        }
                         if signo == nix::libc::SIGUSR1 {
                             log::info!("yserver: received SIGUSR1, forwarding VT release");
                             if signal_sender.send(Message::VtRelease).is_err() {
@@ -1046,8 +1053,25 @@ fn signal_action(signo: i32, policy: ResetPolicy) -> (Message, &'static str) {
     (Message::Shutdown, "shutdown")
 }
 
+/// `SIGRTMIN+3` requests the drawable dump the Ctrl+Alt+F12 hotkey does
+/// (`kill -RTMIN+3 $(pidof yserver)`), for sessions where a client reacts to
+/// the modifiers.
+#[cfg(target_os = "linux")]
+fn drawable_dump_signal() -> i32 {
+    nix::libc::SIGRTMIN() + 3
+}
+
 #[cfg(target_os = "linux")]
 fn block_termination_signals() -> io::Result<SignalFd> {
+    let mask = signalfd_mask();
+    sigprocmask(SigmaskHow::SIG_BLOCK, Some(&mask), None)
+        .map_err(|err| io::Error::other(format!("sigprocmask SIG_BLOCK: {err}")))?;
+    SignalFd::new(&mask).map_err(|err| io::Error::other(format!("signalfd: {err}")))
+}
+
+/// The signals the signalfd thread consumes; all are blocked process-wide.
+#[cfg(target_os = "linux")]
+fn signalfd_mask() -> SigSet {
     let mut mask = SigSet::empty();
     mask.add(Signal::SIGINT);
     mask.add(Signal::SIGTERM);
@@ -1064,9 +1088,14 @@ fn block_termination_signals() -> io::Result<SignalFd> {
     mask.add(Signal::SIGUSR1);
     // SIGUSR2 → VT acquire. Same blocking rationale as SIGUSR1.
     mask.add(Signal::SIGUSR2);
-    sigprocmask(SigmaskHow::SIG_BLOCK, Some(&mask), None)
-        .map_err(|err| io::Error::other(format!("sigprocmask SIG_BLOCK: {err}")))?;
-    SignalFd::new(&mask).map_err(|err| io::Error::other(format!("signalfd: {err}")))
+    // SIGRTMIN+3 → drawable dump; its default action would terminate us.
+    let mut raw = *mask.as_ref();
+    // SAFETY: `raw` is an initialised sigset and the signal number is a
+    // valid real-time signal.
+    unsafe {
+        nix::libc::sigaddset(&raw mut raw, drawable_dump_signal());
+        SigSet::from_sigset_t_unchecked(raw)
+    }
 }
 
 /// FreeBSD: ignore the same signals and return a kqueue fd with
@@ -1160,6 +1189,24 @@ mod tests {
         resources::{ARGB_COLORMAP, ARGB_VISUAL, ROOT_VISUAL, ROOT_WINDOW},
         server::ServerState,
     };
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn signalfd_consumes_the_drawable_dump_signal_and_the_vt_signals() {
+        let mask = super::signalfd_mask();
+        let dump = super::drawable_dump_signal();
+        assert_eq!(dump, nix::libc::SIGRTMIN() + 3);
+        for signo in [
+            dump,
+            nix::libc::SIGUSR1,
+            nix::libc::SIGUSR2,
+            nix::libc::SIGTERM,
+        ] {
+            // SAFETY: `mask` holds an initialised sigset.
+            let member = unsafe { nix::libc::sigismember(mask.as_ref(), signo) };
+            assert_eq!(member, 1, "signal {signo} not in the signalfd mask");
+        }
+    }
 
     #[test]
     fn sighup_still_shuts_down_under_the_default_policy() {
