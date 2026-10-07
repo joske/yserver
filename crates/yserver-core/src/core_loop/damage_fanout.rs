@@ -2027,6 +2027,10 @@ mod tests {
     }
 
     fn barrier_fixture(writes_pending: bool) -> BarrierFixture {
+        barrier_fixture_at_level(writes_pending, x11damage::report_level::BOUNDING_BOX)
+    }
+
+    fn barrier_fixture_at_level(writes_pending: bool, level: u8) -> BarrierFixture {
         let mut state = ServerState::new();
         let _reader = add_client_with_reader(&mut state, 1, 0x0010_0000);
         let wire = Arc::new(Mutex::new(VecDeque::new()));
@@ -2034,13 +2038,7 @@ mod tests {
             crate::transport::Transport::Capture(Arc::clone(&wire)),
         ));
         let window = add_window(&mut state, 1, 0x0010_0001, ROOT_WINDOW, 0, 0, 100, 100);
-        add_damage_on_with_level(
-            &mut state,
-            1,
-            0xe000_0001,
-            window,
-            x11damage::report_level::BOUNDING_BOX,
-        );
+        add_damage_on_with_level(&mut state, 1, 0xe000_0001, window, level);
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(writes_pending));
         let mut backend = crate::backend::recording::RecordingBackend::new();
         backend.export_writes_pending = Some(Arc::clone(&flag));
@@ -2170,5 +2168,288 @@ mod tests {
         assert!(!client.output_held);
         assert!(client.write_failed);
         assert!(!f.state.output_gate.as_deref().unwrap().any_held());
+    }
+
+    /// Split a captured stream into (first byte, length) per X11 packet:
+    /// replies carry their extra length, events are 32 bytes.
+    fn wire_packets(wire: &Mutex<VecDeque<u8>>) -> Vec<(u8, usize)> {
+        let bytes: Vec<u8> = wire.lock().unwrap().iter().copied().collect();
+        let mut out = Vec::new();
+        let mut at = 0;
+        while at + 32 <= bytes.len() {
+            let len = if bytes[at] == 1 {
+                32 + 4 * u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize
+            } else {
+                32
+            };
+            out.push((bytes[at], len));
+            at += len;
+        }
+        assert_eq!(at, bytes.len(), "whole packets only");
+        out
+    }
+
+    fn flushes(backend: &crate::backend::recording::RecordingBackend) -> usize {
+        backend
+            .calls()
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    crate::backend::recording::RecordedCall::FlushBeforeDamageNotify
+                )
+            })
+            .count()
+    }
+
+    fn request(f: &mut BarrierFixture, opcode: u8, minor: u8, sequence: u16, words: &[u32]) {
+        let body: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode,
+            data: minor,
+            length_units: u32::try_from(1 + words.len()).unwrap(),
+        };
+        f.state.clients[&1]
+            .last_sequence
+            .store(sequence, Ordering::Relaxed);
+        // As after the compositor's XFIXES QueryVersion.
+        f.state.xfixes_client_major.insert(1, 5);
+        crate::core_loop::process_request::process_request(
+            &mut f.state,
+            &mut f.backend,
+            ClientId(1),
+            yserver_protocol::x11::SequenceNumber(sequence),
+            header,
+            &body,
+            None,
+        )
+        .expect("request handled");
+    }
+
+    const DAMAGE_OPCODE: u8 = 143;
+    const XFIXES_OPCODE: u8 = 140;
+    const DAMAGE_ID: u32 = 0xe000_0001;
+    const PARTS: u32 = 0x0010_0042;
+
+    /// The remaining #100 route (KWin, NonEmpty + DamageSubtract into a
+    /// parts region + FetchRegion): paint A notifies, paint B on the same
+    /// exported backing only accumulates, then the compositor subtracts
+    /// A+B and fetches the region. The FetchRegion reply must not reach
+    /// the socket before B's writes are published, as in Xorg where the
+    /// reply leaves only in FlushAllOutput after glamor's flush.
+    #[test]
+    fn fetch_region_of_silently_accumulated_damage_waits_for_its_publish() {
+        let mut f = barrier_fixture_at_level(true, x11damage::report_level::NON_EMPTY);
+        // Paint A: DamageNotify, held until the request-end flush.
+        let _ = accumulate_damage_to_state(&mut f.state, f.window, 0, 0, 10, 10);
+        crate::core_loop::run::damage_notify_barrier(&mut f.state, &mut f.backend);
+        assert_eq!(wire_packets(&f.wire), vec![(DAMAGE_FIRST_EVENT, 32)]);
+        assert_eq!(flushes(&f.backend), 1);
+
+        // Paint B: recorded but unpublished, and NonEmpty stays silent.
+        f.flag.store(true, Ordering::Relaxed);
+        let _ = accumulate_damage_to_state(&mut f.state, f.window, 20, 20, 10, 10);
+        crate::core_loop::run::damage_notify_barrier(&mut f.state, &mut f.backend);
+        assert_eq!(flushes(&f.backend), 1, "no DamageNotify, no flush yet");
+        assert!(f.flag.load(Ordering::Relaxed), "B still unpublished");
+
+        f.state.xfixes_regions.insert(
+            PARTS,
+            crate::server::XFixesRegion {
+                owner: ClientId(1),
+                rects: Vec::new(),
+            },
+        );
+        request(
+            &mut f,
+            DAMAGE_OPCODE,
+            x11damage::SUBTRACT,
+            7,
+            &[DAMAGE_ID, 0, PARTS],
+        );
+        request(&mut f, XFIXES_OPCODE, xfixes::FETCH_REGION, 8, &[PARTS]);
+        crate::core_loop::run::damage_notify_barrier(&mut f.state, &mut f.backend);
+        crate::core_loop::run::output_barrier(
+            &mut f.state,
+            &mut f.backend,
+            crate::core_loop::run::OutputBarrier::Block,
+        );
+
+        assert_eq!(
+            f.backend.damage_flush_wire_lens,
+            vec![0, 32],
+            "B's flush ran before any byte of the FetchRegion reply was written"
+        );
+        let packets = wire_packets(&f.wire);
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[1].0, 1, "the FetchRegion reply follows");
+        assert!(!f.flag.load(Ordering::Relaxed));
+
+        // The subtract's damage reached the client after its publish.
+        let subtract: Vec<_> = f
+            .backend
+            .noted_damage_notify_probes
+            .iter()
+            .filter(|p| matches!(p.kind, crate::backend::DamageProbeKind::Subtract { .. }))
+            .collect();
+        assert_eq!(subtract.len(), 1);
+        assert_eq!(
+            subtract[0].kind,
+            crate::backend::DamageProbeKind::Subtract { flushed: true }
+        );
+        assert!(subtract[0].on_wire_at.is_some());
+        assert!(f.state.subtract_parts_probes.is_empty());
+    }
+
+    /// Structural half, without the subtract's own flush: any reply
+    /// written while exported writes are unpublished is held, survives a
+    /// request end that does not flush, and is released only after the
+    /// block-point flush.
+    #[test]
+    fn reply_written_while_exported_writes_are_unpublished_waits_for_the_block_flush() {
+        let mut f = barrier_fixture(true);
+        let reply = [1u8; 32];
+        crate::core_loop::client_io::write_or_buffer(f.state.clients.get_mut(&1).unwrap(), &reply)
+            .unwrap();
+        assert!(f.wire.lock().unwrap().is_empty());
+        assert!(f.state.output_gate.as_deref().unwrap().any_held());
+
+        crate::core_loop::run::damage_notify_barrier(&mut f.state, &mut f.backend);
+        assert!(
+            f.wire.lock().unwrap().is_empty(),
+            "request end does not flush it"
+        );
+        assert_eq!(flushes(&f.backend), 0);
+
+        crate::core_loop::run::output_barrier(
+            &mut f.state,
+            &mut f.backend,
+            crate::core_loop::run::OutputBarrier::Block,
+        );
+        assert_eq!(f.backend.damage_flush_wire_lens, vec![0]);
+        assert_eq!(wire_codes(&f.wire), vec![1]);
+        assert!(!f.state.clients[&1].output_held);
+        assert!(!f.state.output_gate.as_deref().unwrap().any_held());
+    }
+
+    /// Held replies, events and errors keep their generation order, and
+    /// output from before the writes goes out at once.
+    #[test]
+    fn export_hold_preserves_reply_event_error_order() {
+        let mut f = barrier_fixture(false);
+        let write = |f: &mut BarrierFixture, code: u8| {
+            crate::core_loop::client_io::write_or_buffer(
+                f.state.clients.get_mut(&1).unwrap(),
+                &[code; 32],
+            )
+            .unwrap();
+        };
+        write(&mut f, 2);
+        f.flag.store(true, Ordering::Relaxed);
+        write(&mut f, 1);
+        let _ = accumulate_damage_to_state(&mut f.state, f.window, 0, 0, 10, 10);
+        write(&mut f, 0);
+        write(&mut f, 1);
+        assert_eq!(wire_codes(&f.wire), vec![2]);
+
+        crate::core_loop::run::damage_notify_barrier(&mut f.state, &mut f.backend);
+
+        assert_eq!(wire_codes(&f.wire), vec![2, 1, DAMAGE_FIRST_EVENT, 0, 1]);
+    }
+
+    /// A request end releases held output without flushing when something
+    /// else (a readback, a frame) already published the writes.
+    #[test]
+    fn request_end_releases_once_the_writes_were_published_elsewhere() {
+        let mut f = barrier_fixture(true);
+        crate::core_loop::client_io::write_or_buffer(
+            f.state.clients.get_mut(&1).unwrap(),
+            &[1; 32],
+        )
+        .unwrap();
+        f.flag.store(false, Ordering::Relaxed);
+        crate::core_loop::run::damage_notify_barrier(&mut f.state, &mut f.backend);
+        assert_eq!(wire_codes(&f.wire), vec![1]);
+        assert_eq!(flushes(&f.backend), 0);
+    }
+
+    /// No unpublished exported writes: replies leave immediately and no
+    /// barrier flushes; without a gate at all, likewise.
+    #[test]
+    fn without_unpublished_exports_replies_are_not_delayed_and_nothing_flushes() {
+        let mut f = barrier_fixture(false);
+        f.state.xfixes_regions.insert(
+            PARTS,
+            crate::server::XFixesRegion {
+                owner: ClientId(1),
+                rects: Vec::new(),
+            },
+        );
+        request(
+            &mut f,
+            DAMAGE_OPCODE,
+            x11damage::SUBTRACT,
+            3,
+            &[DAMAGE_ID, 0, PARTS],
+        );
+        request(&mut f, XFIXES_OPCODE, xfixes::FETCH_REGION, 4, &[PARTS]);
+        assert_eq!(wire_codes(&f.wire), vec![1], "on the wire at once");
+        for at in [
+            crate::core_loop::run::OutputBarrier::RequestEnd,
+            crate::core_loop::run::OutputBarrier::Block,
+            crate::core_loop::run::OutputBarrier::BeforeFdReply,
+        ] {
+            crate::core_loop::run::output_barrier(&mut f.state, &mut f.backend, at);
+        }
+        assert_eq!(flushes(&f.backend), 0);
+        assert_eq!(
+            f.backend.noted_damage_notify_probes[0].kind,
+            crate::backend::DamageProbeKind::Subtract { flushed: false }
+        );
+
+        let mut state = ServerState::new();
+        let _reader = add_client_with_reader(&mut state, 1, 0x0010_0000);
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        crate::backend::install_backend_root_bindings(&mut state, &backend);
+        assert!(state.output_gate.is_none());
+        crate::core_loop::client_io::write_or_buffer(state.clients.get_mut(&1).unwrap(), &[1; 32])
+            .unwrap();
+        assert!(!state.clients[&1].output_held);
+        crate::core_loop::run::output_barrier(
+            &mut state,
+            &mut backend,
+            crate::core_loop::run::OutputBarrier::Block,
+        );
+        assert_eq!(flushes(&backend), 0);
+    }
+
+    /// An fd-carrying reply cannot be queued, so its barrier publishes
+    /// pending exported writes and releases held output before it, even
+    /// when nothing was held yet.
+    #[test]
+    fn fd_reply_barrier_flushes_before_the_reply() {
+        let mut f = barrier_fixture(true);
+        crate::core_loop::run::output_barrier(
+            &mut f.state,
+            &mut f.backend,
+            crate::core_loop::run::OutputBarrier::BeforeFdReply,
+        );
+        assert_eq!(flushes(&f.backend), 1);
+        assert!(!f.flag.load(Ordering::Relaxed));
+
+        f.flag.store(true, Ordering::Relaxed);
+        crate::core_loop::client_io::write_or_buffer(
+            f.state.clients.get_mut(&1).unwrap(),
+            &[1; 32],
+        )
+        .unwrap();
+        crate::core_loop::run::output_barrier(
+            &mut f.state,
+            &mut f.backend,
+            crate::core_loop::run::OutputBarrier::BeforeFdReply,
+        );
+        assert_eq!(f.backend.damage_flush_wire_lens, vec![0, 0]);
+        assert_eq!(wire_codes(&f.wire), vec![1]);
+        assert!(!f.state.clients[&1].output_held);
     }
 }
