@@ -1160,6 +1160,14 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   flag never cleared and the probe only saw them published at the next flush
   with nothing open. "Still recording" is now `is_recording` (frame not yet
   taken for close); the same predicate gates foreign-queue releases.
+  Codex review of de6f69a1: `build_scene` now collects the released shared
+  backings it samples, so root readback, transform priming and the audit
+  reference bracket them like the compose; ownership state commits only after
+  both barriers are recorded and the submit queued (a recording failure aborts
+  the submission like a failed `vkQueueSubmit2`); and the probe counts a write
+  published only when `DMA_BUF_IOCTL_IMPORT_SYNC_FILE` succeeded on its
+  dma-buf (`import_ok/s import_unsupported/s import_failed/s` on the probe
+  line, each failure kind warned once).
 
 - **2026-09-10 #138 Chrome hardware-decoded video scrambled — FIXED, hardware
   confirmed:** ads, video and fullscreen all correct on silence (RX 6800,

@@ -539,6 +539,18 @@ pub(crate) struct PageFlipRetirement {
 /// Phase A: result of a `flush_submit_group` call. Same shape on
 /// both Ok and Err paths; the `aborted` flag distinguishes them.
 /// Task 3.5 hooks the deferred-queue drain that consumes this.
+/// What became of the write fence a flush owed one exported dma-buf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExportFencePublish {
+    /// `DMA_BUF_IOCTL_IMPORT_SYNC_FILE` attached the submission's fence (or
+    /// the submission had already completed) at this instant.
+    Published(std::time::Instant),
+    /// The kernel or driver lacks `DMA_BUF_IOCTL_IMPORT_SYNC_FILE`.
+    Unsupported,
+    /// The submission was queued but its fence never reached the dma-buf.
+    Failed,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FlushOutcome {
     pub(crate) flushed_entries: usize,
@@ -2327,6 +2339,11 @@ pub(crate) struct PlatformBackend {
     /// Consumed exactly once by `take_last_flush_outcome`.
     last_flush_outcome: Option<FlushOutcome>,
 
+    /// Per entry of the last flush's `exported_writes`, what became of its
+    /// write fence; empty when that flush did not queue a submission.
+    /// Consumed by `take_export_fence_publish`.
+    export_fence_publish: Vec<ExportFencePublish>,
+
     /// Test-only: when true, the next `flush_submit_group` call will
     /// route through `abort_flush` instead of the real
     /// `vkQueueSubmit2`. Reset to false after consumption.
@@ -3049,6 +3066,7 @@ impl PlatformBackend {
             shutting_down: false,
             submit_group,
             last_flush_outcome: None,
+            export_fence_publish: Vec::new(),
             force_next_submit_failure: false,
         })
     }
@@ -3167,6 +3185,7 @@ impl PlatformBackend {
             shutting_down: false,
             submit_group: SubmitGroup::new(),
             last_flush_outcome: None,
+            export_fence_publish: Vec::new(),
             force_next_submit_failure: false,
         }
     }
@@ -4944,6 +4963,7 @@ impl PlatformBackend {
         reason: FlushReason,
         exported_writes: &[(std::os::fd::BorrowedFd<'_>, bool)],
     ) -> Result<FlushOutcome, vk::Result> {
+        self.export_fence_publish.clear();
         // Empty-group fast path: do NOT consume the ticket.  An open
         // cow/render_batch may still be mid-recording (ticket Some,
         // entries empty).  Dropping the ticket here would force the
@@ -5071,13 +5091,17 @@ impl PlatformBackend {
                 // completion sync_file and import it onto every exported
                 // dma-buf the group wrote.
                 if let Some(sig) = export_signal {
-                    Self::publish_export_write_fences(&sig, exported_writes);
+                    self.export_fence_publish =
+                        Self::publish_export_write_fences(&sig, exported_writes);
                     // The semaphore is a signal operation of the submit
                     // just queued. Dropping it here — as this did before —
                     // destroyed it while the queue was still using it,
                     // once per write to any exported pixmap. The ticket
                     // destroys it when the fence retires.
                     ticket.retain_signal_semaphore(sig.into_raw());
+                } else {
+                    self.export_fence_publish =
+                        vec![ExportFencePublish::Failed; exported_writes.len()];
                 }
                 let outcome = FlushOutcome {
                     flushed_entries: n,
@@ -5101,27 +5125,68 @@ impl PlatformBackend {
     /// GLX-TFP (Task 2.3 Step 3): export `signal`'s completed-write
     /// sync_file and IMPORT it as a WRITE fence onto each exported
     /// dma-buf, so an implicit-sync GL read on the imported texture waits
-    /// on yserver's write before sampling. `Unsupported` (old
-    /// kernel/driver) is silently tolerated; other errors warn.
+    /// on yserver's write before sampling. Returns, per entry, whether the
+    /// import succeeded; an unsupported ioctl and any other failure each
+    /// warn once per process.
     fn publish_export_write_fences(
         signal: &PresentCompletionSignal,
         exported_writes: &[(std::os::fd::BorrowedFd<'_>, bool)],
-    ) {
+    ) -> Vec<ExportFencePublish> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static WARNED_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
+        static WARNED_FAILED: AtomicBool = AtomicBool::new(false);
         let sync_fd = match signal.export_sync_file_fd() {
             Ok(Some(fd)) => fd,
-            Ok(None) => return,
+            // Already signalled: the writes are complete, nothing to wait on.
+            Ok(None) => {
+                let now = std::time::Instant::now();
+                return vec![ExportFencePublish::Published(now); exported_writes.len()];
+            }
             Err(e) => {
-                log::warn!("glx-tfp: export_sync_file for write-fence publish failed: {e:?}");
-                return;
+                if !WARNED_FAILED.swap(true, Ordering::Relaxed) {
+                    log::warn!(
+                        "glx-tfp: export_sync_file for write-fence publish failed: {e:?} \
+                         (warned once; counted in damage_fence_probe import_failed)"
+                    );
+                }
+                return vec![ExportFencePublish::Failed; exported_writes.len()];
             }
         };
-        for &(fd, _) in exported_writes {
-            match crate::kms::vk::dri3::import_dmabuf_write_fence(fd, sync_fd.as_fd()) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::Unsupported => {}
-                Err(e) => log::warn!("glx-tfp: import write fence failed: {e}"),
-            }
-        }
+        exported_writes
+            .iter()
+            .map(|&(fd, _)| {
+                match crate::kms::vk::dri3::import_dmabuf_write_fence(fd, sync_fd.as_fd()) {
+                    Ok(()) => ExportFencePublish::Published(std::time::Instant::now()),
+                    Err(e) if e.kind() == io::ErrorKind::Unsupported => {
+                        if !WARNED_UNSUPPORTED.swap(true, Ordering::Relaxed) {
+                            log::warn!(
+                                "glx-tfp: DMA_BUF_IOCTL_IMPORT_SYNC_FILE unsupported on fd {}; \
+                                 importers get no write fence (warned once; counted in \
+                                 damage_fence_probe import_unsupported)",
+                                fd.as_raw_fd()
+                            );
+                        }
+                        ExportFencePublish::Unsupported
+                    }
+                    Err(e) => {
+                        if !WARNED_FAILED.swap(true, Ordering::Relaxed) {
+                            log::warn!(
+                                "glx-tfp: import write fence failed on fd {}: {e} (warned \
+                                 once; counted in damage_fence_probe import_failed)",
+                                fd.as_raw_fd()
+                            );
+                        }
+                        ExportFencePublish::Failed
+                    }
+                }
+            })
+            .collect()
+    }
+
+    /// Per entry of the last flush's `exported_writes`, what became of its
+    /// write fence; empty when that flush queued no submission.
+    pub(crate) fn take_export_fence_publish(&mut self) -> Vec<ExportFencePublish> {
+        std::mem::take(&mut self.export_fence_publish)
     }
 
     /// Abort the open group without submitting it, as a failed

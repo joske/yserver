@@ -7,7 +7,9 @@
 //! the batch still waiting for a submit-group flush, plus the last flushed
 //! batch, so a probe stamped at socket-write time `t` is classified exactly:
 //! before the fence iff a batch with a write at or before `t` was published
-//! after `t` (or is still unpublished).
+//! after `t` (or is still unpublished). Published means the write fence was
+//! imported onto the dma-buf (`DMA_BUF_IOCTL_IMPORT_SYNC_FILE` succeeded),
+//! not merely that a flush collected the write.
 
 use std::{
     collections::HashMap,
@@ -42,6 +44,12 @@ pub(crate) struct ProbeWindow {
     pub(crate) gap_max_us: u64,
     /// `<100µs`, `<1ms`, `<4ms`, `<16ms`, `>=16ms`.
     pub(crate) gap_hist: [u64; 5],
+    /// Write-fence imports onto exported dma-bufs that succeeded.
+    pub(crate) import_ok: u64,
+    /// ... that the kernel or driver does not support.
+    pub(crate) import_unsupported: u64,
+    /// ... that failed otherwise (or whose fence never existed).
+    pub(crate) import_failed: u64,
 }
 
 impl ProbeWindow {
@@ -97,7 +105,23 @@ impl<K: Copy + Eq + Hash> DamageFenceProbe<K> {
         }
     }
 
-    /// The submit-group flush carrying `id`'s writes publishes its fence.
+    /// A write fence import onto an exported dma-buf succeeded.
+    pub(crate) fn note_import_ok(&mut self) {
+        self.window.import_ok += 1;
+    }
+
+    /// A write fence import onto an exported dma-buf failed: its writes stay
+    /// unpublished, so DamageNotify for them keeps counting before the fence.
+    pub(crate) fn note_import_failed(&mut self, unsupported: bool) {
+        if unsupported {
+            self.window.import_unsupported += 1;
+        } else {
+            self.window.import_failed += 1;
+        }
+    }
+
+    /// `DMA_BUF_IOCTL_IMPORT_SYNC_FILE` put the fence of a submission that
+    /// carried every write recorded to `id` so far onto its dma-buf at `at`.
     pub(crate) fn note_published(&mut self, id: K, at: Instant) {
         if let Some(batch) = self.batches.get_mut(&id)
             && let Some(first) = batch.open_first_write.take()
@@ -169,7 +193,7 @@ impl<K: Copy + Eq + Hash> DamageFenceProbe<K> {
         let Some(w) = self.take_window_if_due(now) else {
             return;
         };
-        if w.total == 0 && w.gap_count == 0 {
+        if w.total == 0 && w.gap_count == 0 && w.import_unsupported == 0 && w.import_failed == 0 {
             return;
         }
         let gap_avg_us = w.gap_sum_us / w.gap_count.max(1);
@@ -177,7 +201,8 @@ impl<K: Copy + Eq + Hash> DamageFenceProbe<K> {
             "damage_fence_probe: damage_notify_total/s={} damage_notify_exported/s={} \
              damage_notify_before_fence/s={} damage_notify_buffered/s={} \
              gap_us[n={} avg={gap_avg_us} max={}] \
-             gap_hist_us[<100={} <1000={} <4000={} <16000={} >=16000={}]",
+             gap_hist_us[<100={} <1000={} <4000={} <16000={} >=16000={}] \
+             import_ok/s={} import_unsupported/s={} import_failed/s={}",
             w.total,
             w.exported,
             w.before_fence,
@@ -189,6 +214,9 @@ impl<K: Copy + Eq + Hash> DamageFenceProbe<K> {
             w.gap_hist[2],
             w.gap_hist[3],
             w.gap_hist[4],
+            w.import_ok,
+            w.import_unsupported,
+            w.import_failed,
         );
     }
 }
@@ -282,6 +310,34 @@ mod tests {
         assert_eq!(p.classify(Some(7), None), DamageNotifyClass::Buffered);
         assert_eq!(p.window.buffered, 1);
         assert_eq!(p.window.before_fence, 0);
+    }
+
+    #[test]
+    fn a_failed_import_leaves_the_write_before_the_fence() {
+        let mut p = probe();
+        let t0 = Instant::now();
+        p.note_export_write_with(7, || t0);
+        p.note_import_failed(false);
+        p.note_import_failed(true);
+        assert_eq!(
+            p.classify(Some(7), Some(at(t0, 10))),
+            DamageNotifyClass::BeforeFence
+        );
+        assert_eq!(
+            (
+                p.window.import_ok,
+                p.window.import_unsupported,
+                p.window.import_failed
+            ),
+            (0, 1, 1)
+        );
+        p.note_import_ok();
+        p.note_published(7, at(t0, 20));
+        assert_eq!(p.window.import_ok, 1);
+        assert_eq!(
+            p.classify(Some(7), Some(at(t0, 30))),
+            DamageNotifyClass::AfterFence
+        );
     }
 
     #[test]

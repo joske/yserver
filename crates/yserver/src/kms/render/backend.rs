@@ -38591,10 +38591,10 @@ mod tests {
         let src = b.create_pixmap(None, 24, 8, 8).expect("src").as_raw();
         let dst = b.create_pixmap(None, 24, 8, 8).expect("dst").as_raw();
         let dst_id = b.store.lookup(dst).expect("dst id");
-        let fd: std::os::fd::OwnedFd =
-            EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK | EfdFlags::EFD_CLOEXEC)
-                .expect("eventfd")
-                .into();
+        let fd = b
+            .promote_and_export_pixmap_for_tests(dst)
+            .expect("export")
+            .fd;
         b.store
             .set_exported_sync_fd(dst_id, std::sync::Arc::new(fd));
         let flag = b.export_writes_pending_flag().expect("kms flag");
@@ -38648,7 +38648,30 @@ mod tests {
                 (1, 0),
                 "{what}: DamageNotify after the barrier is after the fence"
             );
+            assert_eq!(
+                (w.import_ok, w.import_unsupported, w.import_failed),
+                (1, 0, 0),
+                "{what}: the fence reached the dma-buf"
+            );
         }
+
+        // Not a dma-buf: the barrier flushes, but no fence reaches the
+        // buffer, so the DamageNotify is still before the fence.
+        let not_dmabuf: std::os::fd::OwnedFd =
+            EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK | EfdFlags::EFD_CLOEXEC)
+                .expect("eventfd")
+                .into();
+        b.store
+            .set_exported_sync_fd(dst_id, std::sync::Arc::new(not_dmabuf));
+        b.fill_rectangle(None, dst, 0x0000_00FF, 0, 0, 8, 8)
+            .expect("fill");
+        b.flush_before_damage_notify();
+        assert!(!flag.load(Ordering::Relaxed), "the write was submitted");
+        probe(&mut b);
+        let w = window(&mut b);
+        assert_eq!(w.before_fence, 1, "an import failure publishes nothing");
+        assert_eq!(w.import_ok, 0);
+        assert_eq!(w.import_unsupported + w.import_failed, 1);
         b.store.clear_exported_sync_fd(dst_id);
     }
 

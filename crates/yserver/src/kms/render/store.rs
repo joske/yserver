@@ -306,6 +306,16 @@ impl ForeignTransfers {
     }
 }
 
+/// One exported drawable a flush owes a write fence:
+/// [`DrawableStore::take_exported_writes`].
+#[derive(Debug)]
+pub(crate) struct ExportedWrite {
+    pub(crate) id: DrawableId,
+    pub(crate) fd: Arc<OwnedFd>,
+    /// The Present gate already waited for this write's old readers.
+    pub(crate) prewaited: bool,
+}
+
 /// Old Vk handles displaced by promotion ([`Storage::adopt_exportable`]).
 /// Destroyed by the engine only once the fence guarding the old image's
 /// last render has signaled.
@@ -1061,7 +1071,9 @@ impl DrawableStore {
     /// resolve each id to its sync fd `Arc`, deduped. Returned at the
     /// flush chokepoint so the platform can wait/publish around the
     /// `vkQueueSubmit2`. Entries whose fd was cleared between stamp and
-    /// flush are skipped.
+    /// flush are skipped. Publication is recorded separately, per dma-buf,
+    /// once the platform reports the fence import succeeded
+    /// ([`Self::note_export_fence_published`]).
     ///
     /// `recording_open`: a frame or render batch is still recording, and
     /// writes it stamped here are not in this submission, so this flush's
@@ -1069,13 +1081,9 @@ impl DrawableStore {
     /// the flush that submits the recording, which publishes again; its
     /// one-shot prewait authorization is spent here, so that later flush
     /// waits for readers in full.
-    pub(crate) fn take_exported_writes(
-        &mut self,
-        recording_open: bool,
-    ) -> Vec<(Arc<OwnedFd>, bool)> {
+    pub(crate) fn take_exported_writes(&mut self, recording_open: bool) -> Vec<ExportedWrite> {
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
-        let published_at = std::time::Instant::now();
         let ids: Vec<DrawableId> = if recording_open {
             self.exported_writes.clone()
         } else {
@@ -1085,10 +1093,11 @@ impl DrawableStore {
             if seen.insert(id)
                 && let Some(fd) = self.exported_sync.get(&id)
             {
-                out.push((Arc::clone(fd), self.prewaited_exported_writes.remove(&id)));
-                if !recording_open {
-                    self.damage_fence_probe.note_published(id, published_at);
-                }
+                out.push(ExportedWrite {
+                    id,
+                    fd: Arc::clone(fd),
+                    prewaited: self.prewaited_exported_writes.remove(&id),
+                });
             }
         }
         if recording_open {
@@ -1097,6 +1106,25 @@ impl DrawableStore {
         }
         self.sync_export_writes_pending();
         out
+    }
+
+    /// Diagnostic (#100): the write fence of a flush that covered every
+    /// write recorded to `id` so far was imported onto its dma-buf at `at`.
+    pub(crate) fn note_export_fence_published(&mut self, id: DrawableId, at: std::time::Instant) {
+        self.damage_fence_probe.note_published(id, at);
+    }
+
+    /// Diagnostic (#100): count what became of one write fence import.
+    pub(crate) fn note_export_fence_import(
+        &mut self,
+        publish: super::platform::ExportFencePublish,
+    ) {
+        use super::platform::ExportFencePublish;
+        match publish {
+            ExportFencePublish::Published(_) => self.damage_fence_probe.note_import_ok(),
+            ExportFencePublish::Unsupported => self.damage_fence_probe.note_import_failed(true),
+            ExportFencePublish::Failed => self.damage_fence_probe.note_import_failed(false),
+        }
     }
 
     /// #100: the flag the core reads to hold a DamageNotify until the
@@ -2172,9 +2200,8 @@ mod tests {
         assert!(!flag.load(Ordering::Relaxed));
     }
 
-    /// #100: with the damage barrier, a DamageNotify reaches the socket
-    /// after the flush that publishes its writes; the probe must classify
-    /// that as after the fence.
+    /// #100: a DamageNotify is after the fence only once the write fence
+    /// was imported onto the dma-buf, not when a flush collected the write.
     #[cfg(target_os = "linux")]
     #[test]
     fn damage_notify_released_after_publish_is_after_fence() {
@@ -2182,7 +2209,14 @@ mod tests {
         let mut s = DrawableStore::new();
         let id = exported_pixmap(&mut s, 0x20);
         s.touch_render_fence(id, FenceTicket::for_tests_stub());
-        let _ = s.take_exported_writes(false);
+        let taken = s.take_exported_writes(false);
+        // Collected for the flush, but no fence on the dma-buf yet.
+        assert_eq!(
+            s.damage_fence_probe
+                .classify(Some(id), Some(std::time::Instant::now())),
+            DamageNotifyClass::BeforeFence
+        );
+        s.note_export_fence_published(taken[0].id, std::time::Instant::now());
         let released = std::time::Instant::now();
         assert_eq!(
             s.damage_fence_probe.classify(Some(id), Some(released)),
@@ -2192,7 +2226,7 @@ mod tests {
             .damage_fence_probe
             .take_window_if_due(released + std::time::Duration::from_secs(2))
             .expect("window due");
-        assert_eq!((window.exported, window.before_fence), (1, 0));
+        assert_eq!((window.exported, window.before_fence), (2, 1));
     }
 
     #[cfg(target_os = "linux")]
@@ -2215,13 +2249,19 @@ mod tests {
         s.end_prewaited_exported_write(id);
         let first = s.take_exported_writes(false);
         assert_eq!(first.len(), 1);
-        assert!(first[0].1, "authorization survives until the write flush");
+        assert!(
+            first[0].prewaited,
+            "authorization survives until the write flush"
+        );
 
         s.exported_writes.push(id);
         s.begin_prewaited_exported_write(id);
         let second = s.take_exported_writes(false);
         assert_eq!(second.len(), 1);
-        assert!(!second[0].1, "an earlier pending write cannot be covered");
+        assert!(
+            !second[0].prewaited,
+            "an earlier pending write cannot be covered"
+        );
     }
 
     #[test]

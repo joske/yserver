@@ -2514,7 +2514,7 @@ impl RenderEngine {
             use std::os::fd::AsFd as _;
             exported
                 .iter()
-                .map(|(f, prewaited)| (f.as_fd(), *prewaited))
+                .map(|w| (w.fd.as_fd(), w.prewaited))
                 .collect()
         };
         let result = match bracket_failed {
@@ -2534,6 +2534,17 @@ impl RenderEngine {
             && let Some(transfers) = transfers
         {
             store.commit_foreign_transfers(&transfers);
+        }
+        // #100 diagnostic: a write counts as published only once its fence
+        // import onto the dma-buf succeeded, after a queued submit; and not
+        // while a recording holds later writes this submission lacks.
+        for (write, publish) in exported.iter().zip(platform.take_export_fence_publish()) {
+            store.note_export_fence_import(publish);
+            if let super::platform::ExportFencePublish::Published(at) = publish
+                && !recording_open
+            {
+                store.note_export_fence_published(write.id, at);
+            }
         }
         let Some(inner) = self.inner.as_mut() else {
             return result;
