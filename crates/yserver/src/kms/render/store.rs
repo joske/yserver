@@ -1153,11 +1153,29 @@ impl DrawableStore {
         host_xid: Option<u32>,
         on_wire_at: Option<std::time::Instant>,
     ) -> super::damage_fence_probe::DamageNotifyClass {
-        let exported = host_xid.and_then(|xid| self.lookup(xid)).and_then(|id| {
+        let exported = self.exported_paint_target(host_xid);
+        self.damage_fence_probe.classify(exported, on_wire_at)
+    }
+
+    /// Diagnostic (#100): classify the reply handing a compositor the
+    /// damage a `DamageSubtract` consumed on `host_xid`; `flushed`: the
+    /// request had to publish exported writes first.
+    pub(crate) fn classify_damage_subtract(
+        &mut self,
+        host_xid: Option<u32>,
+        on_wire_at: Option<std::time::Instant>,
+        flushed: bool,
+    ) -> super::damage_fence_probe::DamageNotifyClass {
+        let exported = self.exported_paint_target(host_xid);
+        self.damage_fence_probe
+            .classify_subtract(exported, on_wire_at, flushed)
+    }
+
+    fn exported_paint_target(&self, host_xid: Option<u32>) -> Option<DrawableId> {
+        host_xid.and_then(|xid| self.lookup(xid)).and_then(|id| {
             let target = self.redirected_target(id).unwrap_or(id);
             self.is_exported(target).then_some(target)
-        });
-        self.damage_fence_probe.classify(exported, on_wire_at)
+        })
     }
 
     pub(crate) fn damage_fence_probe_mut(

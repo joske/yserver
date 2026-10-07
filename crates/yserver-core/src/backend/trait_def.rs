@@ -237,6 +237,23 @@ pub struct DamageNotifyProbe {
     /// When the event's bytes reached the socket; `None` when they were
     /// left queued in the client's outbound buffer.
     pub on_wire_at: Option<std::time::Instant>,
+    pub kind: DamageProbeKind,
+}
+
+/// Diagnostic (#100): what a [`DamageNotifyProbe`] stands for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DamageProbeKind {
+    /// A DamageNotify event.
+    Notify,
+    /// The reply that hands a compositor the damage a `DamageSubtract`
+    /// consumed (the `FetchRegion` of its parts region, or the subtract
+    /// itself when it has no parts region). `flushed` says whether the
+    /// request had to publish exported writes first.
+    Subtract { flushed: bool },
+    /// A `FetchRegion` not tied to a subtract had to publish exported
+    /// writes before its reply; only counted (`host_xid`/`on_wire_at`
+    /// are unset).
+    RegionReplyFlush,
 }
 
 #[derive(Debug, Clone)]
@@ -991,9 +1008,9 @@ pub trait Backend {
         None
     }
 
-    /// Diagnostic (#100): the DamageNotify events that left (or were
-    /// released toward) their sockets since the last output barrier.
-    /// Default: ignored.
+    /// Diagnostic (#100): the DamageNotify events, and the replies handing
+    /// out `DamageSubtract`ed damage, that left (or were released toward)
+    /// their sockets since the last output barrier. Default: ignored.
     fn note_damage_notify_probes(&mut self, _probes: Vec<DamageNotifyProbe>) {}
 
     /// Earliest backend-owned deadline the core loop must wake for

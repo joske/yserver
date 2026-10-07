@@ -8400,9 +8400,11 @@ fn handle_xfixes_request(
         x11xfixes::DESTROY_REGION => {
             if let Some((region, _)) = x11xfixes::parse_u32_pair(body) {
                 state.xfixes_regions.remove(&region);
+                state.subtract_parts_probes.remove(&region);
             } else if body.len() >= 4 {
                 let region = u32::from_le_bytes(body[0..4].try_into().unwrap());
                 state.xfixes_regions.remove(&region);
+                state.subtract_parts_probes.remove(&region);
             }
         }
         x11xfixes::SET_REGION => {
@@ -8546,7 +8548,7 @@ fn handle_xfixes_request(
                 .unwrap_or(0);
             // A region filled by DamageSubtract carries damage whose pixels
             // must be published before the reply (#100).
-            flush_exported_writes_for_damage_reply(state, backend, "FetchRegion");
+            let flushed = flush_exported_writes_for_damage_reply(state, backend, "FetchRegion");
             let rects = state
                 .xfixes_regions
                 .get(&region)
@@ -8558,7 +8560,9 @@ fn handle_xfixes_request(
                 return Ok(RequestOutcome::Handled);
             };
             let _byte_order = client.byte_order;
-            return Ok(write_to_client(client, client_id, &reply));
+            let outcome = write_to_client(client, client_id, &reply);
+            note_fetch_region_probe(state, client_id, region, flushed);
+            return Ok(outcome);
         }
         x11xfixes::CHANGE_SAVE_SET => {
             if let Some(req) = x11xfixes::parse_change_save_set(body)
@@ -9386,6 +9390,69 @@ fn flush_exported_writes_for_damage_reply(
         backend.flush_before_damage_notify();
     }
     pending
+}
+
+/// Diagnostic (#100): a `DamageSubtract` by `client_id` on `drawable`.
+/// With a parts region its damage reaches the client through that
+/// region's `FetchRegion` reply, probed there; without one there is no
+/// reply, so it is probed at the subtract.
+fn note_damage_subtract_probe(
+    state: &mut ServerState,
+    client_id: ClientId,
+    drawable: u32,
+    parts: u32,
+    flushed: bool,
+) {
+    let host_xid = crate::core_loop::damage_fanout::drawable_paint_target(state, drawable);
+    if parts == 0 {
+        crate::core_loop::damage_fanout::record_output_probe(
+            state,
+            client_id,
+            host_xid,
+            crate::backend::DamageProbeKind::Subtract { flushed },
+        );
+        return;
+    }
+    if state.subtract_parts_probes.len() >= 256 {
+        let regions = &state.xfixes_regions;
+        state
+            .subtract_parts_probes
+            .retain(|region, _| regions.contains_key(region));
+    }
+    state
+        .subtract_parts_probes
+        .insert(parts, (host_xid, flushed));
+}
+
+/// Diagnostic (#100): the `FetchRegion` reply just written to `client_id`.
+fn note_fetch_region_probe(
+    state: &mut ServerState,
+    client_id: ClientId,
+    region: u32,
+    flushed: bool,
+) {
+    if let Some((host_xid, subtract_flushed)) = state.subtract_parts_probes.remove(&region) {
+        crate::core_loop::damage_fanout::record_output_probe(
+            state,
+            client_id,
+            host_xid,
+            crate::backend::DamageProbeKind::Subtract {
+                flushed: subtract_flushed || flushed,
+            },
+        );
+    } else if flushed {
+        state
+            .damage_notify_probes
+            .push(crate::server::DamageNotifyProbeEntry {
+                client: client_id,
+                held: false,
+                probe: crate::backend::DamageNotifyProbe {
+                    host_xid: None,
+                    on_wire_at: None,
+                    kind: crate::backend::DamageProbeKind::RegionReplyFlush,
+                },
+            });
+    }
 }
 
 /// #100: an fd-carrying reply bypasses the outbound queue, so publish
@@ -10309,7 +10376,7 @@ fn handle_damage_request(
                 // later reply, which the export gate already holds; publish
                 // here too so no path can hand out damage ahead of its
                 // pixels (#100).
-                flush_exported_writes_for_damage_reply(state, backend, "Subtract");
+                let flushed = flush_exported_writes_for_damage_reply(state, backend, "Subtract");
                 // Per X11 DAMAGE spec (cf. Xorg damageext.c:419 +
                 // miext/damage/damage.c:1854):
                 //   if repair == None: parts ← old damage; damage ← empty
@@ -10382,6 +10449,9 @@ fn handle_damage_request(
                         .is_some_and(|d| !d.rects.is_empty())
                 {
                     let _dropped = report_existing_damage_to_state(state, damage_id);
+                }
+                if state.damage_objects.contains_key(&damage_id) {
+                    note_damage_subtract_probe(state, client_id, drawable, parts, flushed);
                 }
                 let parts_owner = if parts == 0 {
                     0

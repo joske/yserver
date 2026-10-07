@@ -591,22 +591,43 @@ pub fn report_existing_damage_to_state(state: &mut ServerState, damage_id: u32) 
 }
 
 /// Diagnostic (#100): note where a just-queued DamageNotify's drawable
-/// paints and whether its bytes reached the socket now. `write_or_buffer`
-/// writes straight to the socket unless output is held, bytes are already
-/// queued or the kernel buffer is full; an empty outbound queue afterwards
-/// means the event is on the wire. A held event is stamped when the
-/// barrier releases it.
+/// paints and whether its bytes reached the socket now.
 fn record_damage_notify_probe(state: &mut ServerState, owner: ClientId, drawable: u32) {
+    let host_xid = drawable_paint_target(state, drawable);
+    record_output_probe(
+        state,
+        owner,
+        host_xid,
+        crate::backend::DamageProbeKind::Notify,
+    );
+}
+
+/// Host xid `drawable` paints into (a redirected window's backing).
+pub(crate) fn drawable_paint_target(state: &ServerState, drawable: u32) -> Option<u32> {
+    state
+        .resources
+        .host_drawable_target(ResourceId(drawable))
+        .map(crate::resources::HostDrawableTarget::host_xid)
+}
+
+/// Diagnostic (#100): note the output just written to `owner` (a
+/// DamageNotify, or a reply carrying subtracted damage) and whether its
+/// bytes reached the socket now. `write_or_buffer` writes straight to the
+/// socket unless output is held, bytes are already queued or the kernel
+/// buffer is full; an empty outbound queue afterwards means the bytes are
+/// on the wire. Held output is stamped when the barrier releases it.
+pub(crate) fn record_output_probe(
+    state: &mut ServerState,
+    owner: ClientId,
+    host_xid: Option<u32>,
+    kind: crate::backend::DamageProbeKind,
+) {
     let Some(client) = state.clients.get(&owner.0) else {
         return;
     };
     let held = client.output_held;
     let on_wire_at =
         (!held && client.outbound.is_empty() && !client.write_failed).then(std::time::Instant::now);
-    let host_xid = state
-        .resources
-        .host_drawable_target(ResourceId(drawable))
-        .map(crate::resources::HostDrawableTarget::host_xid);
     state
         .damage_notify_probes
         .push(crate::server::DamageNotifyProbeEntry {
@@ -615,6 +636,7 @@ fn record_damage_notify_probe(state: &mut ServerState, owner: ClientId, drawable
             probe: crate::backend::DamageNotifyProbe {
                 host_xid,
                 on_wire_at,
+                kind,
             },
         });
 }

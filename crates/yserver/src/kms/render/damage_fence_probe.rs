@@ -1,6 +1,7 @@
-//! Diagnostic (#100): how many DamageNotify events reach a compositor's
-//! socket while the damaged exported backing still has GPU writes whose
-//! WRITE fence is not yet on the dma-buf.
+//! Diagnostic (#100): how many DamageNotify events, and replies handing
+//! out `DamageSubtract`ed damage, reach a compositor's socket while the
+//! damaged exported backing still has GPU writes whose WRITE fence is not
+//! yet on the dma-buf.
 //!
 //! Implicit sync only orders a reader after fences already attached when
 //! the reader submits. Per exported drawable this tracks the first write of
@@ -50,6 +51,16 @@ pub(crate) struct ProbeWindow {
     pub(crate) import_unsupported: u64,
     /// ... that failed otherwise (or whose fence never existed).
     pub(crate) import_failed: u64,
+    /// `DamageSubtract`s whose consumed damage reached the client (through
+    /// the parts region's `FetchRegion` reply, or the subtract itself
+    /// without one), classified like DamageNotify.
+    pub(crate) subtract_total: u64,
+    pub(crate) subtract_exported: u64,
+    pub(crate) subtract_buffered: u64,
+    pub(crate) subtract_before_fence: u64,
+    /// `DamageSubtract`/`FetchRegion` requests that had to publish
+    /// exported writes before handing out damage.
+    pub(crate) damage_reply_flushes: u64,
 }
 
 impl ProbeWindow {
@@ -64,6 +75,15 @@ impl ProbeWindow {
             .unwrap_or(GAP_BUCKETS_US.len());
         self.gap_hist[bucket] += 1;
     }
+}
+
+enum FenceAt {
+    /// Every write recorded by then was already published.
+    After,
+    /// A write recorded by then is still unpublished.
+    Unpublished,
+    /// A write recorded by then was published this much later.
+    PublishedLater(Duration),
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -161,21 +181,71 @@ impl<K: Copy + Eq + Hash> DamageFenceProbe<K> {
             self.window.buffered += 1;
             return DamageNotifyClass::Buffered;
         };
+        match self.fence_state_at(id, sent) {
+            FenceAt::After => DamageNotifyClass::AfterFence,
+            FenceAt::Unpublished => {
+                self.window.before_fence += 1;
+                self.waiters.push((id, sent));
+                DamageNotifyClass::BeforeFence
+            }
+            FenceAt::PublishedLater(gap) => {
+                self.window.before_fence += 1;
+                self.window.record_gap(gap);
+                DamageNotifyClass::BeforeFence
+            }
+        }
+    }
+
+    /// Classify one `DamageSubtract` by when its damage reached the
+    /// client, as [`Self::classify`] does a DamageNotify, on the
+    /// `subtract_*` counters (no gap histogram). `flushed`: the request
+    /// had to publish exported writes first.
+    pub(crate) fn classify_subtract(
+        &mut self,
+        exported: Option<K>,
+        on_wire_at: Option<Instant>,
+        flushed: bool,
+    ) -> DamageNotifyClass {
+        self.window.subtract_total += 1;
+        if flushed {
+            self.window.damage_reply_flushes += 1;
+        }
+        let Some(id) = exported else {
+            return DamageNotifyClass::NotExported;
+        };
+        self.window.subtract_exported += 1;
+        let Some(sent) = on_wire_at else {
+            self.window.subtract_buffered += 1;
+            return DamageNotifyClass::Buffered;
+        };
+        if matches!(self.fence_state_at(id, sent), FenceAt::After) {
+            DamageNotifyClass::AfterFence
+        } else {
+            self.window.subtract_before_fence += 1;
+            DamageNotifyClass::BeforeFence
+        }
+    }
+
+    /// A `FetchRegion` not tied to a probed subtract had to publish
+    /// exported writes before its reply.
+    pub(crate) fn note_region_reply_flush(&mut self) {
+        self.window.damage_reply_flushes += 1;
+    }
+
+    /// Whether every write to `id` recorded at or before `sent` was
+    /// published by then.
+    fn fence_state_at(&self, id: K, sent: Instant) -> FenceAt {
         let batch = self.batches.get(&id).copied().unwrap_or_default();
         if batch.open_first_write.is_some_and(|first| first <= sent) {
-            self.window.before_fence += 1;
-            self.waiters.push((id, sent));
-            return DamageNotifyClass::BeforeFence;
+            return FenceAt::Unpublished;
         }
         if let Some((first, published)) = batch.last_published
             && first <= sent
             && sent < published
         {
-            self.window.before_fence += 1;
-            self.window.record_gap(published.duration_since(sent));
-            return DamageNotifyClass::BeforeFence;
+            return FenceAt::PublishedLater(published.duration_since(sent));
         }
-        DamageNotifyClass::AfterFence
+        FenceAt::After
     }
 
     /// The counters of a window at least a second old, resetting them.
@@ -193,7 +263,13 @@ impl<K: Copy + Eq + Hash> DamageFenceProbe<K> {
         let Some(w) = self.take_window_if_due(now) else {
             return;
         };
-        if w.total == 0 && w.gap_count == 0 && w.import_unsupported == 0 && w.import_failed == 0 {
+        if w.total == 0
+            && w.gap_count == 0
+            && w.import_unsupported == 0
+            && w.import_failed == 0
+            && w.subtract_total == 0
+            && w.damage_reply_flushes == 0
+        {
             return;
         }
         let gap_avg_us = w.gap_sum_us / w.gap_count.max(1);
@@ -202,7 +278,9 @@ impl<K: Copy + Eq + Hash> DamageFenceProbe<K> {
              damage_notify_before_fence/s={} damage_notify_buffered/s={} \
              gap_us[n={} avg={gap_avg_us} max={}] \
              gap_hist_us[<100={} <1000={} <4000={} <16000={} >=16000={}] \
-             import_ok/s={} import_unsupported/s={} import_failed/s={}",
+             import_ok/s={} import_unsupported/s={} import_failed/s={} \
+             subtract_total/s={} subtract_exported/s={} subtract_before_fence/s={} \
+             subtract_buffered/s={} damage_reply_flushes/s={}",
             w.total,
             w.exported,
             w.before_fence,
@@ -217,6 +295,11 @@ impl<K: Copy + Eq + Hash> DamageFenceProbe<K> {
             w.import_ok,
             w.import_unsupported,
             w.import_failed,
+            w.subtract_total,
+            w.subtract_exported,
+            w.subtract_before_fence,
+            w.subtract_buffered,
+            w.damage_reply_flushes,
         );
     }
 }
@@ -338,6 +421,44 @@ mod tests {
             p.classify(Some(7), Some(at(t0, 30))),
             DamageNotifyClass::AfterFence
         );
+    }
+
+    #[test]
+    fn subtract_reply_counts_on_its_own_counters() {
+        let mut p = probe();
+        let t0 = Instant::now();
+        p.note_export_write_with(7, || t0);
+        assert_eq!(
+            p.classify_subtract(Some(7), Some(at(t0, 10)), false),
+            DamageNotifyClass::BeforeFence
+        );
+        p.note_published(7, at(t0, 20));
+        assert_eq!(
+            p.classify_subtract(Some(7), Some(at(t0, 30)), true),
+            DamageNotifyClass::AfterFence
+        );
+        assert_eq!(
+            p.classify_subtract(Some(7), None, false),
+            DamageNotifyClass::Buffered
+        );
+        assert_eq!(
+            p.classify_subtract(None, Some(t0), false),
+            DamageNotifyClass::NotExported
+        );
+        p.note_region_reply_flush();
+        let w = p.window;
+        assert_eq!(
+            (
+                w.subtract_total,
+                w.subtract_exported,
+                w.subtract_before_fence,
+                w.subtract_buffered,
+                w.damage_reply_flushes
+            ),
+            (4, 3, 1, 1, 2)
+        );
+        assert_eq!((w.total, w.before_fence, w.gap_count), (0, 0, 0));
+        assert!(p.waiters.is_empty());
     }
 
     #[test]

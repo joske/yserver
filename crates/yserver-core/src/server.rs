@@ -1328,6 +1328,10 @@ pub struct ServerState {
     /// to dma-buf-exported drawables recorded but not yet published with
     /// their write fences. `None` for backends that render immediately.
     pub output_gate: Option<std::sync::Arc<ExportOutputGate>>,
+    /// Diagnostic (#100): `DamageSubtract` parts regions awaiting their
+    /// `FetchRegion`, keyed by region, with the subtracted drawable's paint
+    /// target and whether the subtract had to flush exported writes.
+    pub subtract_parts_probes: HashMap<u32, (Option<u32>, bool)>,
     pub composite_redirects: crate::composite_redirects::CompositeRedirects,
     pub present_event_selections: HashMap<u32, PresentEventSelection>,
     /// `PresentNotifyMSC` requests parked for a future MSC, fired when a
@@ -1868,6 +1872,7 @@ impl ServerState {
             damage_notify_flush_pending: false,
             damage_notify_probes: Vec::new(),
             output_gate: None,
+            subtract_parts_probes: HashMap::new(),
             composite_redirects: crate::composite_redirects::CompositeRedirects::default(),
             present_event_selections: HashMap::new(),
             present_pending_msc: Vec::new(),

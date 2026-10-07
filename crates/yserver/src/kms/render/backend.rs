@@ -22141,9 +22141,22 @@ impl Backend for KmsBackend {
     }
 
     fn note_damage_notify_probes(&mut self, probes: Vec<yserver_core::backend::DamageNotifyProbe>) {
+        use yserver_core::backend::DamageProbeKind;
         for probe in probes {
-            self.store
-                .classify_damage_notify(probe.host_xid, probe.on_wire_at);
+            match probe.kind {
+                DamageProbeKind::Notify => {
+                    self.store
+                        .classify_damage_notify(probe.host_xid, probe.on_wire_at);
+                }
+                DamageProbeKind::Subtract { flushed } => {
+                    self.store
+                        .classify_damage_subtract(probe.host_xid, probe.on_wire_at, flushed);
+                }
+                DamageProbeKind::RegionReplyFlush => self
+                    .store
+                    .damage_fence_probe_mut()
+                    .note_region_reply_flush(),
+            }
         }
     }
 
@@ -38608,6 +38621,7 @@ mod tests {
             b.note_damage_notify_probes(vec![DamageNotifyProbe {
                 host_xid: Some(dst),
                 on_wire_at: Some(std::time::Instant::now()),
+                kind: yserver_core::backend::DamageProbeKind::Notify,
             }]);
         };
         // Each read closes the probe's one-second window; step past it.
