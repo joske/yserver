@@ -1,9 +1,9 @@
 # Source layout cleanup: split the oversized files, then the crates
 
 **Branch:** `plan/source-layout-cleanup` (plan only). Execution branches are per
-phase. **Revised 2026-10-08** after codex review: render dependency inventory
-redone from code, store boundary, test-identity mapping, move verification,
-branch porting, FreeBSD gates. Open questions are now decisions (end of file).
+phase. **Revised twice 2026-10-08** after codex reviews (inventory, store,
+test identity, item-level move verification, GpuCore lifetimes, FreeBSD gates;
+branch porting dropped by jos). Decisions at the end of the file.
 
 **Goal, in priority order:**
 1. Maintainability: no hand-edited source file over the size ceilings.
@@ -28,10 +28,9 @@ workspace crates rebuilt. "4 cpu" = `taskset -c 0-3`, a lower bound for fuji
 | dev | 4 | 9.5 | 0.4+4.5 | 2.8+6.5 | – | – |
 | test --no-run | 4 | 20.5 | 0.4+6.1 | 3.5+10.2 | 0.7+15.1 | 6.5+13.9 |
 
-- The critical path is the `yserver` crate: it starts ~3–4 s in (pipelined on
-  core's metadata) and then runs 15 s (32 cpus) / 31 s (4 cpus) alone.
-- Splitting `yserver-core` buys almost nothing; file splits change nothing
-  (the crate is the unit). Only phase 3 can move the numbers.
+- The critical path is the `yserver` crate (starts ~3–4 s in, then runs alone
+  15 s / 31 s). File splits change nothing (the crate is the unit); splitting
+  `yserver-core` buys almost nothing. Only phase 3 can move the numbers.
 - Inline tests dominate test builds (`process_request.rs` has 54k test lines).
 
 ## Inventory (from code, 2026-10-08)
@@ -65,11 +64,16 @@ comments), **visibility** (`pub(super)`/`pub(in path)` and `use` lines only),
 **delegate** (trait body → `self.<subsystem>_<name>(..)`), or **seam** (a real
 small logic change, own review, HW smoke).
 
-**2. No new `pub` or `pub(crate)` in phases 1–2.** `foo.rs` becomes
-`foo/mod.rs` + children; children see ancestors' privates. Only sibling→sibling
-and mod.rs→child calls need `pub(super)`. mod.rs does `use child::*;` so
-existing paths and `use super::*` test modules compile unchanged. Check:
-`git diff -U0 | grep -E '^\+.*pub(\(crate\))? (fn|struct|enum|mod)'` is empty.
+**2. No widened visibility in phases 1–2.** `foo.rs` becomes `foo/mod.rs` +
+children; children see ancestors' privates. Only sibling→sibling and
+mod.rs→child calls need `pub(super)`. mod.rs does `use child::*;` so existing
+paths and `use super::*` test modules compile unchanged. A line grep for added
+`pub` is wrong (every relocated public item is an added line). Check by item
+identity instead: `split verify` (rule 3) compares each mapped leaf's old
+visibility with its new one; a change is allowed only to `pub(super)` /
+`pub(in <path>)` and only if the manifest lists it. New `pub use` /
+`pub(crate) use` re-exports are allowed only from the commit's manifest
+allowlist (`reexports = [...]`); any other visibility change fails.
 
 **3. Move verification (item level, not line level).** A line multiset diff is
 kept only as a cheap smoke check: it cannot see reordered statements inside a
@@ -79,42 +83,61 @@ body or a line that ended up in the wrong fn. The proof is item-based:
   included), and writes items to target files per the manifest. It never edits
   item text; the only text it emits itself is `mod`/`use` lines and
   `pub(super)` insertions listed in the manifest.
-- `split verify <rev>` parses every `.rs` the commit touches, before and after.
-  Each item gets a key (`kind`, `name`, enclosing impl self-type and trait,
-  `cfg` attrs) and a hash of its token stream with visibility tokens removed.
-  The keyed multisets must be equal: no item lost, duplicated, or changed.
-  Items inside split `impl` blocks are keyed per member fn.
+- `split verify <rev>` parses every `.rs` the commit touches (following
+  `mod x;` to its file), before and after, and compares **leaf items**.
+  Normalization contract:
+  - *Leaves:* `fn`, `const`, `static`, `type`, `struct`, `enum`, `union`,
+    `trait`, `macro_rules!`/macro defs, and each impl-associated item (fn,
+    const, type) individually. `mod` and `impl` are *wrappers*, not leaves, so
+    inline `mod x { }` → `mod x;` + file and one `impl` → several `impl`s with
+    the same header are both no-ops for the leaf set. `use` items are not
+    leaves (generated imports may differ); see residual risk below.
+  - *Key:* new path (via the move script's explicit **old path → new path
+    table**, e.g. `backend::KmsBackend::foo` → `backend::portable::draw::
+    KmsBackend::foo`), kind, name, and for associated items the impl header
+    (generics, trait, self type, where clause) as tokens.
+  - *Hash:* the leaf's tokens **including its own attributes, derives and doc
+    comments**, visibility removed (checked separately, rule 2). Whitespace is
+    not significant (token stream). **Plain comments are part of the item and
+    must be preserved:** the hash also covers the leaf's source text with
+    whitespace runs collapsed, so a dropped `//` comment fails.
+  - *Effective cfg:* each leaf's cfg set = its own `#[cfg]`s ∪ every enclosing
+    `mod`/`impl` `#[cfg]` (incl. `#[cfg(test)]` on `mod tests` and on the
+    `mod tests;` declaration). Before == after per leaf, so a `#[cfg(test)]`
+    or feature gate lost when an inline mod or impl wrapper moves fails.
+    Other wrapper attributes (`#[allow]`, `#[path]`, `#[expect]`) are compared
+    per wrapper: each new wrapper must carry its source wrapper's set.
+  - The mapped keyed multisets must be equal: nothing lost, duplicated, or
+    changed.
 - Delegate commits (2.11b) use `split verify --delegate`: every changed trait
   method must be one forwarding call with the same arguments in the same order,
   and the moved body must hash-equal the old trait body.
 - Then the gate (rule 5).
 
-**Residual risk** (stated, not hidden): name resolution can change without a
-token change — a glob import (`use child::*`) is shadowed by a same-named
-local item, or a `macro_rules!` is now textually after its use. Ambiguities and
-missing items are compile errors; silent shadowing is not. `split verify`
-therefore also lists every name defined in more than one module of the moved
-tree, and reviewers check that list. `include_*!`/`#[path]` relative paths
-break loudly (compile error).
+**Residual risk:** name resolution can change without a token change (a glob
+`use child::*` shadowed by a same-named local item; a `macro_rules!` now after
+its use). Ambiguities are compile errors, silent shadowing is not, so `split
+verify` lists every name defined in more than one module of the moved tree for
+review. `include_*!`/`#[path]` breakage is loud.
 
 **4. Test identity: an explicit old→new name mapping.** Test names change when
-`mod tests` gains topic submodules (`…::tests::foo` → `…::tests::xi2::foo`), so
-"identical lists" is the wrong check. Per commit and per feature configuration
-(**default** = Unix-socket transport only, **`tcp-transport`**, **`xdmcp`**):
-1. Before: `cargo test --workspace <features> -- --list` and
-   `-- --ignored --list`, normalised to `binary::path::name`.
-2. The split manifest yields a deterministic rename map (old module path → new
-   module path per test fn). `split verify --tests` applies it to the "before"
-   lists.
-3. The mapped before-lists must equal the after-lists exactly: same count per
-   binary, same names, and each test's ignored status unchanged.
+`mod tests` gains topic submodules (`…::tests::foo` → `…::tests::xi2::foo`).
+Per commit and per feature config (default, `tcp-transport`, `xdmcp`):
+`cargo test --all-targets $F -- --list` and `-- --ignored --list`, normalised
+to `binary::path::name`, before and after; `split verify --tests` applies the
+manifest's path table to the before-lists, which must then equal the
+after-lists exactly (count per binary, names, ignored status). Integration
+tests (`render_acceptance` → modules) use the same mapping.
 
-Integration tests (`render_acceptance` → modules) follow the same mapping.
-
-**5. Gate per commit:** `cargo +nightly fmt --check`;
-`cargo clippy --all-targets -- -D warnings` in all three feature configs;
-`cargo test --workspace` (default and `--features xdmcp`); lavapipe
-`cargo test -p yserver --features xdmcp -- --ignored`; rules 3 and 4.
+**5. Gate per commit** (copied from `.github/workflows/ci.yml:54–135`; `F` =
+`""`, `--features tcp-transport`, `--features xdmcp`):
+`cargo +nightly fmt -- --check`; per `F`: `cargo clippy --all-targets $F --
+-D warnings` and `cargo test --all-targets $F --locked`; lavapipe, exactly
+CI's step plus the local ICD pin:
+`VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json
+YSERVER_ALLOW_SOFTWARE_VULKAN=1 cargo test -p yserver --locked --features
+xdmcp --no-fail-fast -- --ignored`; rules 2–4. "lavapipe" below means this
+command.
 
 **6. Blame.** Move SHAs go into `.git-blame-ignore-revs` in a follow-up commit;
 cross-file moves still need `git blame -C -C` (one line in the file header).
@@ -122,7 +145,7 @@ cross-file moves still need `git blame -C -C` (one line in the file header).
 **7. Scripted, deterministic splits.** Manifest = TOML `item key → target file`
 per source file. Unassigned items make the tool fail with the list, never
 default somewhere. Review reads the manifest; the commit is tool output plus
-`cargo +nightly fmt`. Tools stay until the last open branch has crossed.
+`cargo +nightly fmt`.
 
 ## Phase 1: extract inline tests (~125k lines, zero visibility change)
 
@@ -146,8 +169,7 @@ all of `yserver` with debuginfo). CI's lavapipe step needs no change.
 
 ## Phase 2: split production code (moves)
 
-Least-contended files first; a file moves only once the work touching it has
-settled (see "Branches").
+Least-contended files first.
 
 | step | file → dir | target modules (≈ code lines) |
 |---|---|---|
@@ -247,9 +269,41 @@ flush/submit-group 10, `vk` 2, `allocate_drawable_storage` 1,
 `platform.pixmap_pool` (store.rs:446), and `decref` (1101),
 `destroy_now` (1172), `poll_pending_retire` (1453) and `shutdown_destroy_all`
 (1038) take `PlatformBackend` to poll `FenceTicket`s and destroy.
-- Move those fields into a render-crate `GpuCore` with the **same declaration
-  order** (the drop order ops pool → fence pool → vk is load-bearing,
-  platform.rs:2299). `PlatformBackend` owns `gpu: GpuCore`.
+- **Ownership audit (2026-10-08).** Declared order (platform.rs:2294–2351):
+  `vk` → `scanout_readback_op` → `ops_command_pool` → `fence_pool` →
+  `scanout_readback` → `pixmap_pool` → `copy_vk_contexts` → `scanout_pools` →
+  `submit_group`. `vk` drops *first*: the comment at platform.rs:2298–2301
+  ("ops pool BEFORE fence pool BEFORE vk, handled by field order") is
+  **stale** (separate one-line comment fix, not part of this plan). It is
+  harmless because every Vulkan owner holds its own `Arc<VkContext>`
+  (`OpsCommandPool`, `ReusableOneShot`, `FencePoolInner`, `PixmapPool`,
+  `StagingBuffer`, `FenceTicketInner`, engine `inner.vk`, scanout and copy
+  pools), and `VkContext::drop` (vk/device.rs:897) idles and destroys the
+  device at the last `Arc`. The real dependencies:
+  1. `scanout_readback_op` before `ops_command_pool`: its CB comes from that
+     pool (backend.rs:19299, 19494) and is freed into it (vk/ops/mod.rs:353).
+  2. `FenceTicket`s outlive `FencePool`: `KmsBackend` drops `platform` before
+     `store`/`engine`/`scene` (backend.rs:1401); a ticket keeps a `Weak` pool
+     plus a strong `vk` and destroys its own fence (platform.rs:289).
+  3. `OpsCommandPool::drop` idles the queue, then destroys the pool (freeing
+     engine CBs); `RenderEngine::drop` (engine.rs:9566) never touches it.
+  4. Shutdown (lib.rs:981 → backend.rs `disable_output`): `flush_render_batch`
+     → `engine.shutdown` (close frame, `drain_all`) → `scene.drain_all` →
+     present drains → `platform.disable_output` (`wait_idle_bounded`,
+     `pixmap_pool.drain()`, modeset off) → `store.shutdown_destroy_all`
+     (lib.rs:1014). Device loss latches `renderer_failed`; `FencePool` keeps
+     unsignalled fences in `leaked_fences` until its drop.
+  5. KMS-side Vulkan objects (`scanout_pools`, `copy_vk_contexts`, cursor
+     save, `scanout_readback`) stay in `PlatformBackend` with their own `Arc`s.
+- **Boundary = lifetime rules, not field order.** `GpuCore` holds `vk`,
+  `ops_command_pool`, `fence_pool`, `pixmap_pool`, `submit_group`,
+  `last_flush_outcome`, `renderer_failed`, `force_next_submit_failure`.
+  `scanout_readback_op` is reset by an explicit `PlatformBackend::drop` step
+  before `gpu` drops. Anything allocated from a `GpuCore` pool is released
+  before that pool, or holds an `Arc` keeping its parent alive. Order (4)
+  becomes one `KmsBackend::teardown` ending in `GpuCore::drain_and_idle`. A
+  drop-spy unit test (like platform.rs:7148) pins (1)–(4).
+  `PlatformBackend` owns `gpu: GpuCore`.
 - `FencePool`/`FenceTicket`, `PresentCompletionSignal`, the submit group and
   `allocate_drawable_storage*` (platform.rs:4617–4750, which takes from the pool)
   move with it. Allocation and return of pooled images then live in one place.
@@ -283,8 +337,15 @@ review with the re-run inventory:
 **C. Present-completion batches in engine.** Engine stores
 `PendingPresentBatch` (engine.rs:1334) whose entries carry core's
 `CompletedPresentEvent` and sync-fd waits. Boundary: engine keeps the batch
-container and wait kind, generic over an opaque entry type supplied by the KMS
-side; `present_completion.rs` stays in `yserver`.
+container and wait kind over an opaque entry supplied by the KMS side;
+`present_completion.rs` stays in `yserver`. Opaque is not enough: when the
+batch wait is a sync fd, engine publishes it into each entry
+(`completion.publish_release_fence(fd)`, engine.rs:2957;
+present_completion.rs:42). So the entry needs a release-fence publication
+interface. Prefer `Box<dyn PresentEntry>` (or a stored fn pointer) at this
+edge: making engine generic over a present trait would monomorphise engine
+code inside `yserver` and give back the compile-time win. **Resolved in the
+phase-3 review.**
 
 **D. `vk/dri3.rs` split.** Lines 15–520 are Vulkan external-memory work on
 dma-buf fds (modifier queries, export/import); `vk/target.rs` needs these.
@@ -342,61 +403,25 @@ behind a `dyn DisplayPlatform`. Blocked today by KMS input glue
 `xinput::{hotplug, libinput_props}`) and RANDR mixing X11 view with DRM state.
 No further crates until then (decision 5).
 
-## Branches and landing order
+## Branches
 
-| branch | touches |
-|---|---|
-| `fix/100-implicit-sync-exports` (16) | process_request, backend, engine, scene, pointer_fanout, run, platform, server |
-| `diag/214-slow-submits` (6) | process_request, backend, engine, scene, run, platform, scanout, render_acceptance |
-| `fix/glyph-atlas-reclaim` (2) | backend, engine |
-| `fix/214-trap-per-instance-bbox` (2) | backend, render_acceptance |
-| `fix/direct-scanout-scene-revocation` (3) | backend |
-| PR #112 / `test/pr112-rebased` | scene (+1215/−146), backend |
-| `fix/shape-canonicalise-rects` (3) | scene, backend |
-
-**Order (decision 7):** settle the work touching a file before that file moves;
-files no open branch touches go first and are not blocked on unrelated
-branches. Branches are never deleted on the basis of apparent squash ancestry
-alone; jos decides. For PR #112, erpalma is told before phase 1 touches
-`scene.rs`/`backend.rs` (jos writes that message).
-
-### Porting a branch across a split (requires a dry run first)
-
-The first draft's recipe was wrong: `git rebase --onto master <split-commit>`
-replays only commits after the branch's own split commit, i.e. drops every
-feature commit before it. Replacement, per branch. Let `S` be master's split
-commit and `M0 = S^`:
-1. Precondition: `split apply <manifest>` on `M0`'s tree reproduces `S`'s
-   tree exactly (determinism check; abort otherwise).
-2. `git rebase M0` the branch (ordinary conflicts, old layout).
-3. For each branch commit `Ci` in order: check out `Ci`'s tree, run
-   `split apply`; items the branch added fail as unassigned — add them to a
-   branch-local manifest. Commit the result with parent = previous new commit
-   (first: `S`), same message and author. (A small script over
-   `git rev-list --reverse M0..branch`.)
-4. `git rebase master` the new chain; conflicts now arise only from post-split
-   master work, in the new layout.
-5. Check: `git diff <old tip> <new tip>` after normalising with
-   `split apply` on the old tip is empty, and the branch's own tests pass.
-   Fallback for phase-1/2 moves of whole files: `git rebase -X find-renames=40%`
-   with `merge.renameLimit` raised can carry edits across pure renames; it
-   does not help for files split in many parts.
-
-**Before using it on a real branch:** demonstrate on a disposable copy
-(`git branch tmp/port-dryrun fix/glyph-atlas-reclaim`) against a trial split of
-`resources.rs`, and record the commands and result in the phase-1 PR.
+The cleanup starts only after the two open branches, `fix/glyph-atlas-reclaim`
+and `diag/214-slow-submits`, are merged or closed. Every other branch is kept
+for reference, not direct reuse: anything reused later is re-applied by hand
+onto the new layout. No porting tooling. For PR #112, erpalma is told before
+phase 1 starts (jos writes that message).
 
 ## Risks
 
 | risk | mitigation |
 |---|---|
-| Merge conflicts with in-flight work | settle per file before moving it; deterministic port procedure (dry-run first) |
-| Visibility creep | rule 2 grep; counted `pub` delta in phase 3 |
+| Merge conflicts with in-flight work | start after the two open branches land; others re-applied by hand |
+| Visibility creep | rule 2 per-item visibility compare + re-export allowlist; counted `pub` delta in phase 3 |
 | Accidental behaviour change | whole-item moves; per-item hash verify; residual shadowing list reviewed; seam commits isolated and HW-smoked |
 | Lost / renamed tests | rule 4 mapping per feature config, counts + ignored status |
 | `cfg`/`#[path]` modules (xdmcp, crtc_transform_tests) | three feature configs in the gate; `#[path]` children moved explicitly |
 | FreeBSD regression from new gates | no blanket `cfg(linux)`; narrow gates only where the code is Linux-only today |
-| GpuCore borrow split changes ordering | seam commit, lavapipe + HW smoke (bee amdgpu, eiger Asahi) |
+| GpuCore borrow split changes ordering / teardown | lifetime rules + drop-spy test (boundary A); seam commit, lavapipe + HW smoke (bee amdgpu, eiger Asahi) |
 | Compile-time claims wrong | all estimates are hypotheses until the fuji before/after measurement |
 
 ## Acceptance
@@ -413,11 +438,11 @@ commit and `M0 = S^`:
 
 ## Phase-0 checklist
 
-1. Branch work settled for the first files to move.
+1. `fix/glyph-atlas-reclaim` and `diag/214-slow-submits` merged or closed.
 2. Baseline timings on fuji.
 3. Test-list snapshot for all three feature configs (normal and `--ignored`).
 4. `tools/split` (`apply`, `verify`, `verify --tests`, `verify --delegate`)
-   proven end to end on `resources.rs`, including the porting dry run.
+   proven end to end on `resources.rs`.
 
 ## Decisions (codex review, 2026-10-08; replaces the open questions)
 
@@ -430,8 +455,7 @@ commit and `M0 = S^`:
    inventory above, as its own separately reviewed phase.
 5. **Further crates** (e.g. `yserver-xrender`): deferred until nested work.
 6. **Size limits:** 5k code / 6k tests are ceilings; split by responsibility.
-7. **Branch order:** settle work touching each file before moving it; do not
-   block unrelated cleanup on every branch; never delete branches based solely
-   on apparent squash ancestry.
+7. **Branches (jos, 2026-10-08):** start after the two open branches land;
+   other branches are reference only, re-applied by hand; no porting tool.
 8. **Platform gates:** narrow gates plus existing runtime capability checks;
    FreeBSD behaviour preserved; abstractions only for demonstrated needs.
