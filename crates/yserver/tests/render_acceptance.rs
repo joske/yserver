@@ -5844,6 +5844,55 @@ fn non_cow_present_completion_without_the_copy_in_the_frame_keeps_the_signal_sub
     assert_eq!(delivered_serials(&mut b), vec![0x215]);
 }
 
+/// #214: a Present into a non-redirected child of a redirected parent (a
+/// client window inside a reparenting WM's redirected frame) copies into
+/// the PARENT's backing; the completion must key on that backing too and
+/// ride the paint submit, not fall back to a signal-only submit.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn present_into_child_of_redirected_parent_rides_the_paint_submit() {
+    use yserver_core::{backend::WindowHandle, host_x11::HostSubwindowVisual};
+
+    let Some((mut b, src, _)) = present_fixture() else {
+        return;
+    };
+    let visual = HostSubwindowVisual::Explicit {
+        depth: 32,
+        visual_xid: 0,
+        colormap_xid: 0,
+    };
+    let root = WindowHandle::from_raw(1).expect("root");
+    let frame = b
+        .create_subwindow(None, root, 10, 10, 16, 16, 0, visual, None, None)
+        .expect("frame");
+    b.map_window_for_tests(frame.as_raw()).expect("map frame");
+    let backing = b.create_pixmap(None, 32, 16, 16).expect("frame backing");
+    assert!(b.test_set_redirected_target(frame.as_raw(), backing.as_raw()));
+    let client = b
+        .create_subwindow(None, frame, 2, 2, 8, 8, 0, visual, None, None)
+        .expect("client");
+    let client_xid = client.as_raw();
+    b.map_window_for_tests(client_xid).expect("map client");
+    if b.frame_builder_is_open_for_tests() {
+        b.engine_close_open_frame_for_timeout_for_tests()
+            .expect("close setup frame");
+    }
+    b.engine_flush_submit_group_for_tests().expect("drain");
+
+    b.copy_area(None, src, client_xid, 0, 0, 0, 0, 4, 4)
+        .expect("copy_area");
+    assert!(b.frame_builder_is_open_for_tests());
+    let before = b.platform_queue_submit_count_for_tests();
+    b.enqueue_present_completion(non_cow_present_event(0x216, client_xid), client_xid);
+    assert_eq!(
+        b.platform_queue_submit_count_for_tests() - before,
+        1,
+        "the completion signal rides the paint submit into the parent's backing"
+    );
+    assert!(!b.frame_builder_is_open_for_tests());
+    assert_eq!(delivered_serials(&mut b), vec![0x216]);
+}
+
 /// #214 failure path: a frame close that fails while recording (before any
 /// submit) must not drop the completion attached to it.
 #[test]

@@ -30212,6 +30212,15 @@ impl Backend for KmsBackend {
             }
         }
 
+        // The copy wrote wherever `resolve_paint_target` routed it: a window
+        // inside a redirected parent shares that ancestor's backing, not its
+        // own leaf storage. Unviewable windows resolve to None (copy dropped).
+        // A shared backing may also match another writer's op when this
+        // copy clipped to nothing; harmless, the signal still follows it.
+        let completion_target = self
+            .resolve_paint_target(dst_host_xid)
+            .map(PaintTarget::backing_id);
+
         // Phase A: close any open render batch FIRST so its CBs land
         // in the group under the same ticket the flush will consume.
         // Then ensure all prior paint is on the queue BEFORE the
@@ -30234,7 +30243,7 @@ impl Backend for KmsBackend {
         // that fails keeps the entry as a ready batch (never dropped).
         // Otherwise (copy already submitted, clipped to nothing, or recorded
         // another way) fall through to the signal-only submit.
-        if let Some(dst_id) = self.store.lookup(dst_host_xid) {
+        if let Some(dst_id) = completion_target {
             match self.engine.attach_present_completion(dst_id, entry) {
                 Ok(()) => {
                     if let Err(e) = self.engine.close_open_frame(
@@ -30276,9 +30285,8 @@ impl Backend for KmsBackend {
             // renderer_failed and the caller's error handling kicks in.
         }
 
-        let fallback_ticket = self
-            .store
-            .lookup(dst_host_xid)
+        let fallback_ticket = completion_target
+            .or_else(|| self.store.lookup(dst_host_xid))
             .and_then(|id| self.store.get(id))
             .and_then(|d| d.last_render_ticket.clone());
 
