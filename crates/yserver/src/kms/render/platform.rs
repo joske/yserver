@@ -2360,6 +2360,13 @@ pub(crate) struct PlatformBackend {
     /// Always compiled (not cfg(test)) so integration-test pub wrappers
     /// on `KmsBackend` can reach it from the external test crate.
     force_next_submit_failure: bool,
+    /// #214 telemetry: the cause the next group flush is counted under
+    /// (set by a frame close); `None` maps the `FlushReason`.
+    next_submit_cause: Option<crate::kms::vk::submit_stats::SubmitCause>,
+    /// Real `vkQueueSubmit2` calls made through this platform's paint
+    /// group and Present signal paths (per instance, so parallel tests
+    /// can assert exact counts).
+    queue_submits: u64,
 }
 
 fn build_render_device_inventory(
@@ -3077,6 +3084,8 @@ impl PlatformBackend {
             submit_group,
             last_flush_outcome: None,
             force_next_submit_failure: false,
+            next_submit_cause: None,
+            queue_submits: 0,
         })
     }
 
@@ -3195,6 +3204,8 @@ impl PlatformBackend {
             submit_group: SubmitGroup::new(),
             last_flush_outcome: None,
             force_next_submit_failure: false,
+            next_submit_cause: None,
+            queue_submits: 0,
         }
     }
 
@@ -4872,10 +4883,16 @@ impl PlatformBackend {
             .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
         let submit = [vk::SubmitInfo2::default().signal_semaphore_infos(&sig_info)];
         crate::vk_count!(queue_submit2);
-        match unsafe {
-            vk.device
-                .queue_submit2(vk.graphics_queue, &submit, signal_fence)
-        } {
+        self.queue_submits += 1;
+        match crate::kms::vk::submit_stats::timed(
+            crate::kms::vk::submit_stats::SubmitCause::PresentSignal,
+            0,
+            false,
+            || unsafe {
+                vk.device
+                    .queue_submit2(vk.graphics_queue, &submit, signal_fence)
+            },
+        ) {
             Ok(()) => Ok(()),
             Err(e) => {
                 self.renderer_failed = true;
@@ -4885,6 +4902,15 @@ impl PlatformBackend {
     }
 
     // ── Phase A: SubmitGroup API ─────────────────────────────────
+
+    /// Count the next group flush (#214 telemetry) under `cause` instead of the
+    /// cause its `FlushReason` maps to. Consumed by that flush.
+    pub(crate) fn set_next_submit_cause(
+        &mut self,
+        cause: crate::kms::vk::submit_stats::SubmitCause,
+    ) {
+        self.next_submit_cause = Some(cause);
+    }
 
     /// Phase A: count of CBs pending in the open submit group. Tests
     /// + telemetry consult this; 0 when the group is empty.
@@ -4966,6 +4992,17 @@ impl PlatformBackend {
         // entries empty).  Dropping the ticket here would force the
         // batch's eventual append to land in a ticket-less group,
         // tripping the "non-empty group has ticket" expect below.
+        let cause = self.next_submit_cause.take().unwrap_or(match reason {
+            FlushReason::SyncBoundary => crate::kms::vk::submit_stats::SubmitCause::GroupSync,
+            FlushReason::SceneCompose => crate::kms::vk::submit_stats::SubmitCause::GroupCompose,
+            FlushReason::PresentCompletionSignal => {
+                crate::kms::vk::submit_stats::SubmitCause::GroupPresent
+            }
+            FlushReason::FrameBuilder => crate::kms::vk::submit_stats::SubmitCause::FrameOther,
+            FlushReason::PageflipRetire | FlushReason::MaxSize | FlushReason::Shutdown => {
+                crate::kms::vk::submit_stats::SubmitCause::GroupOther
+            }
+        });
         if self.submit_group.size() == 0 {
             let outcome = FlushOutcome {
                 flushed_entries: 0,
@@ -5078,10 +5115,11 @@ impl PlatformBackend {
             }
         }];
         crate::vk_count!(queue_submit2);
-        match unsafe {
+        self.queue_submits += 1;
+        match crate::kms::vk::submit_stats::timed(cause, n, export_signal.is_some(), || unsafe {
             vk.device
                 .queue_submit2(vk.graphics_queue, &submit, ticket.fence())
-        } {
+        }) {
             Ok(()) => {
                 ticket.retain_imported_wait_semaphores(imported_wait_semaphores);
                 // GLX-TFP write→read publish: export the submit's

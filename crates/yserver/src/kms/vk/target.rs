@@ -938,9 +938,14 @@ impl DrawableImage {
             let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cb_info)];
             crate::vk_count!(queue_submit2);
             crate::vk_count!(submit_other);
-            if let Err(e) =
-                unsafe { device.queue_submit2(self.vk.graphics_queue, &submit, vk::Fence::null()) }
-            {
+            if let Err(e) = crate::kms::vk::submit_stats::timed(
+                crate::kms::vk::submit_stats::SubmitCause::Other,
+                1,
+                false,
+                || unsafe {
+                    device.queue_submit2(self.vk.graphics_queue, &submit, vk::Fence::null())
+                },
+            ) {
                 cb_pending = super::ops::submit_error_may_leave_pending(e);
                 return Err(e);
             }

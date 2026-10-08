@@ -76,6 +76,35 @@ pub(crate) enum CloseReason {
     /// frame closes so its pending glyph inserts commit against the old
     /// atlas layout before the atlas is emptied and repacked.
     GlyphAtlasFull,
+    /// A root read needs the composed root: the frame closes before the
+    /// readback compose (same ordering need as `LegacyScCompose`).
+    LegacyRootRead,
+    /// #100/#216 damage boundary: paint is submitted before DamageNotify,
+    /// DAMAGE Subtract or XFIXES FetchRegion reaches a client, so a dma-buf
+    /// reader finds the write fence. See `flush_before_damage_notify`.
+    DamageBoundary,
+}
+
+impl CloseReason {
+    /// The `vk submit cost` cause a close for this reason is counted under.
+    pub(crate) const fn submit_cause(self) -> crate::kms::vk::submit_stats::SubmitCause {
+        use crate::kms::vk::submit_stats::SubmitCause as C;
+        match self {
+            Self::LegacyScCompose => C::FrameLegacySc,
+            Self::LegacyRootRead => C::FrameRootRead,
+            Self::RedirectSourceBoundary => C::FrameRedirectIsolation,
+            Self::DamageBoundary => C::FrameDamageBoundary,
+            Self::PresentCompletionSignal => C::FramePresent,
+            Self::SyncWait => C::FrameSyncWait,
+            Self::NonPortedPaintOp => C::FrameNonPorted,
+            Self::Timeout => C::FrameTimeout,
+            Self::SceneCompose
+            | Self::Shutdown
+            | Self::PinCeiling
+            | Self::ScratchGrow
+            | Self::GlyphAtlasFull => C::FrameOther,
+        }
+    }
 }
 
 /// `FrameBuilder` lifecycle. `Closed` is the hot path for X11 traffic
@@ -432,7 +461,29 @@ mod state_tests {
     }
 
     #[test]
-    fn close_reason_has_eleven_variants() {
+    fn split_close_reasons_count_under_distinct_submit_causes() {
+        use crate::kms::vk::submit_stats::SubmitCause as C;
+        assert_eq!(
+            CloseReason::RedirectSourceBoundary.submit_cause(),
+            C::FrameRedirectIsolation
+        );
+        assert_eq!(
+            CloseReason::DamageBoundary.submit_cause(),
+            C::FrameDamageBoundary
+        );
+        assert_eq!(
+            CloseReason::LegacyScCompose.submit_cause(),
+            C::FrameLegacySc
+        );
+        assert_eq!(CloseReason::LegacyRootRead.submit_cause(), C::FrameRootRead);
+        assert_eq!(
+            CloseReason::PresentCompletionSignal.submit_cause(),
+            C::FramePresent
+        );
+    }
+
+    #[test]
+    fn close_reason_has_thirteen_variants() {
         fn _exhaustive(r: CloseReason) -> &'static str {
             match r {
                 CloseReason::SceneCompose => "scene_compose",
@@ -446,6 +497,8 @@ mod state_tests {
                 CloseReason::ScratchGrow => "scratch_grow",
                 CloseReason::RedirectSourceBoundary => "redirect_source_boundary",
                 CloseReason::GlyphAtlasFull => "glyph_atlas_full",
+                CloseReason::LegacyRootRead => "legacy_root_read",
+                CloseReason::DamageBoundary => "damage_boundary",
             }
         }
         assert_eq!(_exhaustive(CloseReason::SceneCompose), "scene_compose");

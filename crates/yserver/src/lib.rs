@@ -373,6 +373,16 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
                     s.begin_command_buffer,
                     s.end_command_buffer,
                 );
+                // Real submits by cause, thread CPU inside them, and the
+                // live allocation / idle pool counts they scale with (#214).
+                log::info!(
+                    "{}",
+                    crate::kms::vk::submit_stats::format_line(
+                        &crate::kms::vk::submit_stats::SUBMITS.snapshot_and_reset(),
+                        crate::kms::vk::mem_accounting::churn_snapshot().live_count(),
+                        crate::kms::vk::pixmap_pool::residency_snapshot().map_or(0, |r| r.entries),
+                    ),
+                );
                 // Submit attribution: which call sites drive
                 // queue_submit2. Sum should approximately equal
                 // queue_submit2 above (off by ≤ Idle-flush count from

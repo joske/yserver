@@ -1777,10 +1777,17 @@ impl CopiedScanoutPool {
                 .wait_semaphore_infos(&waits)
                 .command_buffer_infos(&commands)
                 .signal_semaphore_infos(&signals)];
-            self.sink_vk
-                .device
-                .queue_submit2(self.sink_vk.graphics_queue, &submits, fence)
-                .map_err(|result| scanout_vk_error("submit copied sink transfer", result))?;
+            crate::kms::vk::submit_stats::timed(
+                crate::kms::vk::submit_stats::SubmitCause::Scanout,
+                1,
+                false,
+                || {
+                    self.sink_vk
+                        .device
+                        .queue_submit2(self.sink_vk.graphics_queue, &submits, fence)
+                },
+            )
+            .map_err(|result| scanout_vk_error("submit copied sink transfer", result))?;
         }
         source.note_sink_submit_succeeded();
         *destination_ownership = CopiedDestinationOwnership::ForeignPendingKmsFromSink;
@@ -3365,9 +3372,12 @@ impl ScanoutBo {
             let submits = [vk::SubmitInfo2::default().command_buffer_infos(&command_buffers)];
             crate::vk_count!(queue_submit2);
             crate::vk_count!(submit_other);
-            if let Err(result) =
-                device.queue_submit2(self.vk.graphics_queue, &submits, fence.handle())
-            {
+            if let Err(result) = crate::kms::vk::submit_stats::timed(
+                crate::kms::vk::submit_stats::SubmitCause::Scanout,
+                1,
+                false,
+                || device.queue_submit2(self.vk.graphics_queue, &submits, fence.handle()),
+            ) {
                 fence.abandon_pending();
                 return Err(DisposableProbeError::quarantined(scanout_vk_error(
                     "submit disposable scanout rendering probe",
@@ -4587,14 +4597,18 @@ fn submit_copied_source_probe(
         let submits = [submit];
         crate::vk_count!(queue_submit2);
         crate::vk_count!(submit_other);
-        device
-            .queue_submit2(source.render_vk.graphics_queue, &submits, fence)
-            .map_err(|result| {
-                DisposableProbeError::quarantined(scanout_vk_error(
-                    "submit copied renderer probe",
-                    result,
-                ))
-            })?;
+        crate::kms::vk::submit_stats::timed(
+            crate::kms::vk::submit_stats::SubmitCause::Scanout,
+            1,
+            false,
+            || device.queue_submit2(source.render_vk.graphics_queue, &submits, fence),
+        )
+        .map_err(|result| {
+            DisposableProbeError::quarantined(scanout_vk_error(
+                "submit copied renderer probe",
+                result,
+            ))
+        })?;
     }
 
     source.note_renderer_submit_succeeded();

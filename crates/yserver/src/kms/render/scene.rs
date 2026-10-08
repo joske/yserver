@@ -3816,9 +3816,16 @@ fn submit_damage_audit_compare(
         vk.device.end_command_buffer(cb).map_err(SceneError::Vk)?;
         let cb_info = [vk::CommandBufferSubmitInfo::default().command_buffer(cb)];
         let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cb_info)];
-        vk.device
-            .queue_submit2(vk.graphics_queue, &submit, ticket.fence())
-            .map_err(SceneError::Vk)?;
+        crate::kms::vk::submit_stats::timed(
+            crate::kms::vk::submit_stats::SubmitCause::Other,
+            1,
+            false,
+            || {
+                vk.device
+                    .queue_submit2(vk.graphics_queue, &submit, ticket.fence())
+            },
+        )
+        .map_err(SceneError::Vk)?;
     }
     ticket.wait(vk).map_err(SceneError::Vk)
 }
@@ -8838,8 +8845,15 @@ fn record_and_submit_render(
     unsafe {
         crate::vk_count!(queue_submit2);
         crate::vk_count!(submit_compositor);
-        vk.device
-            .queue_submit2(vk.graphics_queue, &submit, signal_fence)?;
+        crate::kms::vk::submit_stats::timed(
+            crate::kms::vk::submit_stats::SubmitCause::Compose,
+            cb_info.len(),
+            false,
+            || {
+                vk.device
+                    .queue_submit2(vk.graphics_queue, &submit, signal_fence)
+            },
+        )?;
     }
     target.note_submit_succeeded();
     *gpu_submitted = true;

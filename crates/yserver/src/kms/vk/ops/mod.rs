@@ -215,7 +215,12 @@ where
         let submit = [submit];
         crate::vk_count!(queue_submit2);
         crate::vk_count!(submit_one_shot);
-        if let Err(e) = unsafe { vk.device.queue_submit2(vk.graphics_queue, &submit, fence) } {
+        if let Err(e) = crate::kms::vk::submit_stats::timed(
+            crate::kms::vk::submit_stats::SubmitCause::OneShot,
+            1,
+            false,
+            || unsafe { vk.device.queue_submit2(vk.graphics_queue, &submit, fence) },
+        ) {
             if submit_error_may_leave_pending(e) {
                 cb_safe_to_free = false;
             } else {
@@ -330,10 +335,15 @@ impl ReusableOneShot {
         let submit = [vk::SubmitInfo2::default().command_buffer_infos(&cb_info)];
         crate::vk_count!(queue_submit2);
         crate::vk_count!(submit_one_shot);
-        unsafe {
-            vk.device
-                .queue_submit2(vk.graphics_queue, &submit, self.fence)
-        }
+        crate::kms::vk::submit_stats::timed(
+            crate::kms::vk::submit_stats::SubmitCause::OneShot,
+            1,
+            false,
+            || unsafe {
+                vk.device
+                    .queue_submit2(vk.graphics_queue, &submit, self.fence)
+            },
+        )
         .map_err(|result| OneShotError {
             result,
             in_flight: submit_error_may_leave_pending(result),

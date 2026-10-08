@@ -2945,6 +2945,7 @@ impl RenderEngine {
         }
 
         // Drive the actual vkQueueSubmit2 via engine's flush_submit_group wrapper.
+        platform.set_next_submit_cause(reason.submit_cause());
         let flush_outcome = self.flush_submit_group(
             store,
             platform,

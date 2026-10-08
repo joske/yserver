@@ -8274,7 +8274,7 @@ impl KmsBackend {
             if let Err(e) = self.engine.close_open_frame(
                 &mut self.store,
                 &mut self.platform,
-                crate::kms::render::frame_builder::CloseReason::LegacyScCompose,
+                crate::kms::render::frame_builder::CloseReason::LegacyRootRead,
             ) {
                 log::warn!("render root read: close_open_frame failed: {e:?}");
             }
@@ -8317,7 +8317,7 @@ impl KmsBackend {
         if let Err(e) = self.engine.close_open_frame(
             &mut self.store,
             &mut self.platform,
-            crate::kms::render::frame_builder::CloseReason::LegacyScCompose,
+            crate::kms::render::frame_builder::CloseReason::LegacyRootRead,
         ) {
             log::warn!("render root read: close_open_frame failed: {e:?}");
         }
@@ -22150,7 +22150,7 @@ impl Backend for KmsBackend {
         if let Err(error) = self.engine.close_open_frame(
             &mut self.store,
             &mut self.platform,
-            crate::kms::render::frame_builder::CloseReason::RedirectSourceBoundary,
+            crate::kms::render::frame_builder::CloseReason::DamageBoundary,
         ) {
             log::warn!("render DamageNotify submission boundary failed: {error:?}");
         }
@@ -22351,6 +22351,9 @@ impl Backend for KmsBackend {
         self.telemetry.advance_frame();
         let can_submit_scene =
             self.scene_wants_compose() && self.scene.has_output_ready_for_submit();
+        // #214 telemetry: did this tick's compose close submit paint, and
+        // did the tick then compose anything?
+        let mut legacy_close_submitted = false;
         if can_submit_scene {
             // Stage 5 Task 3 (render-composite generalization): flush
             // the render batch — scene.tick samples dst.
@@ -22371,12 +22374,16 @@ impl Backend for KmsBackend {
             // smoke (frame_builder_mixed_sequence_smoke); Task 13 only adds
             // the wiring. Until Task 15 ports composite_glyphs into the frame
             // builder, no frame can be open, so this call is a no-op.
-            if let Err(e) = self.engine.close_open_frame(
+            match self.engine.close_open_frame(
                 &mut self.store,
                 &mut self.platform,
                 crate::kms::render::frame_builder::CloseReason::LegacyScCompose,
             ) {
-                log::warn!("render maybe_composite: close_open_frame failed: {e:?}");
+                Ok(crate::kms::render::frame_builder::CloseOutcome::Submitted { .. }) => {
+                    legacy_close_submitted = true;
+                }
+                Ok(crate::kms::render::frame_builder::CloseOutcome::AlreadyClosed) => {}
+                Err(e) => log::warn!("render maybe_composite: close_open_frame failed: {e:?}"),
             }
             // Phase A Task 4: flush the SubmitGroup so scene.tick
             // observes all paint CBs already submitted to the queue.
@@ -22405,6 +22412,10 @@ impl Backend for KmsBackend {
                 cow_host_xid,
             ) {
                 Ok(composed_outputs) => {
+                    if legacy_close_submitted {
+                        crate::kms::vk::submit_stats::SUBMITS
+                            .record_legacy_sc_tick(!composed_outputs.is_empty());
+                    }
                     if self.scanout_m2.reentry_blocked_until_composed
                         && composed_outputs.len() == self.platform.outputs.len()
                     {
@@ -22433,6 +22444,9 @@ impl Backend for KmsBackend {
                     Ok(())
                 }
                 Err(e) => {
+                    if legacy_close_submitted {
+                        crate::kms::vk::submit_stats::SUBMITS.record_legacy_sc_tick(false);
+                    }
                     log::warn!("render maybe_composite: scene.tick failed: {e:?}");
                     Ok(())
                 }
