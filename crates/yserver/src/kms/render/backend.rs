@@ -5003,6 +5003,14 @@ impl KmsBackend {
             Some(clip) => apply_subwindow_mode_clip(&clip, rects),
             None => rects.to_vec(),
         };
+        // The root is a depth-24 window kept in depth-32 storage: its
+        // background is opaque, as `init_root_storage` fills it.
+        let target =
+            if self.store.get(target.backing_id()).map(|d| d.kind) == Some(DrawableKind::Root) {
+                target.with_x11_depth(24)
+            } else {
+                target
+            };
         self.fill_solid_rects_with(target, pixel, &rects, GcFunction::Copy, u32::MAX);
     }
 
@@ -6761,7 +6769,9 @@ impl KmsBackend {
             Dst::server_internal(id),
             rect,
             decode_x11_pixel_for_storage(
-                self.core.bg_pixel.unwrap_or(0x0050_5050),
+                self.core
+                    .bg_pixel
+                    .unwrap_or(yserver_core::resources::ROOT_DEFAULT_BACKGROUND_PIXEL),
                 24,
                 PlatformBackend::format_for_depth(24),
             ),
@@ -14069,7 +14079,9 @@ impl KmsBackend {
                                 Dst::server_internal(new_id),
                                 rect,
                                 decode_x11_pixel_for_storage(
-                                    self.core.bg_pixel.unwrap_or(0x0050_5050),
+                                    self.core.bg_pixel.unwrap_or(
+                                        yserver_core::resources::ROOT_DEFAULT_BACKGROUND_PIXEL,
+                                    ),
                                     24,
                                     PlatformBackend::format_for_depth(24),
                                 ),

@@ -13622,6 +13622,13 @@ fn border_width_set_after_create_reallocates_migrates_and_paints_the_ring() {
 /// makes the new content sample the old ring along its leading edge and
 /// leaves the old content's trailing pixels inside the new ring; both
 /// are caught by the whole-backing sweep below.
+///
+/// The window keeps the default ForgetGravity, and a size change is a
+/// resize: Xorg exposes the whole new clip list (`mi/miwindow.c:466-472`,
+/// nothing recovered without a bit gravity) and paints it with the
+/// background (`miWindowExposures`), so the marks do not survive and the
+/// content reads background. The migration of surviving content is pinned
+/// by the border-only change above, which Xorg handles as a move.
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn border_change_with_unchanged_outer_extent_migrates_the_content() {
@@ -13699,40 +13706,29 @@ fn border_change_with_unchanged_outer_extent_migrates_the_content() {
         "the content origin must follow the new border width",
     );
 
-    // Every pixel of the storage: the marks at the CONTENT coordinates
-    // the client drew them at, background elsewhere inside the content,
-    // and the border pixel everywhere in the new ring.
+    // Every pixel of the storage: background over the whole content,
+    // marks included, and the border pixel everywhere in the new ring.
     or_for_each_backing_pixel(&mut f, WID, BW1, W1, H1, |x, y, inside, bgr| {
         let cx = x - i32::from(BW1);
         let cy = y - i32::from(BW1);
         let marked = MARKS
             .iter()
             .any(|(mx, my)| cx == i32::from(*mx) && cy == i32::from(*my));
-        let want = if !inside {
-            P8_BORDER
-        } else if marked {
-            OR_W_FG
-        } else {
-            OR_W_BG
-        };
+        let want = if inside { OR_W_BG } else { P8_BORDER };
         assert_eq!(
             bgr,
             or_bgr(want),
-            "backing ({x}, {y}) (inside={inside}, marked={marked}) — content \
-             must have migrated from offset {BW0} to offset {BW1} with no \
-             stale pixel left in the new ring",
+            "backing ({x}, {y}) (inside={inside}, marked={marked}) — the resized \
+             content is repainted with the background and no stale pixel is \
+             left in the new ring",
         );
     });
 
     // …and back the other way, in one request again: the border shrinks
     // to 2 while the content grows to 100x60, outer extent still 104.
     // The relocation runs in the opposite direction (offset 3 → 2), and
-    // the two content columns and rows the copy cannot fill are NEWLY
-    // EXPOSED — they held ring pixels a moment ago. Xorg repaints an
-    // exposure with the window's background
-    // (`miPaintWindow(..., PW_BACKGROUND)`, `mi/miexpose.c:445-470`),
-    // so they must read W_BG, not the border pixel and not stale
-    // content.
+    // the whole content is exposed again: it must read W_BG, including
+    // the two columns and rows that held ring pixels a moment ago.
     let mut body = Vec::new();
     body.extend_from_slice(&WID.to_le_bytes());
     body.extend_from_slice(&0x001Cu16.to_le_bytes()); // CWWidth|CWHeight|CWBorderWidth
@@ -13753,19 +13749,12 @@ fn border_change_with_unchanged_outer_extent_migrates_the_content() {
         let marked = MARKS
             .iter()
             .any(|(mx, my)| cx == i32::from(*mx) && cy == i32::from(*my));
-        let want = if !inside {
-            P8_BORDER
-        } else if marked {
-            OR_W_FG
-        } else {
-            OR_W_BG
-        };
+        let want = if inside { OR_W_BG } else { P8_BORDER };
         assert_eq!(
             bgr,
             or_bgr(want),
             "backing ({x}, {y}) (inside={inside}, marked={marked}) — the \
-             round trip must restore the marks at their own content \
-             coordinates and background-fill the newly exposed content",
+             round trip repaints the whole content with the background",
         );
     });
 }

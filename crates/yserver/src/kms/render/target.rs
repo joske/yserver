@@ -225,6 +225,14 @@ impl PaintTarget {
         }
     }
 
+    /// The same target, painted as an X drawable of `depth`.
+    pub(crate) fn with_x11_depth(self, depth: u8) -> Self {
+        Self {
+            x11_depth: depth,
+            ..self
+        }
+    }
+
     /// The translation from the drawable's own content coordinates into
     /// storage coordinates. Callers add this to every local rect origin.
     pub(crate) fn offset(self) -> (i32, i32) {

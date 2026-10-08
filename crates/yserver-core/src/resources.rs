@@ -36,6 +36,9 @@ pub struct ClientRemovedResources {
 pub const ROOT_WINDOW: ResourceId = ResourceId(0x100);
 pub const ROOT_COLORMAP: ResourceId = ResourceId(0x101);
 pub const ROOT_VISUAL: ResourceId = ResourceId(0x102);
+/// The root's background until a client sets one: what the backend fills
+/// the root storage with, so that root exposures repaint the same colour.
+pub const ROOT_DEFAULT_BACKGROUND_PIXEL: u32 = 0x0050_5050;
 /// Composite overlay window returned by `XCompositeGetOverlayWindow`.
 /// A real, distinct XID is required — marco's compositor calls
 /// `XSelectInput(overlay, ExposureMask)`, which would otherwise clobber
@@ -288,7 +291,7 @@ impl Default for ResourceTable {
                 visual: ROOT_VISUAL,
                 class: WindowClass::InputOutput,
                 map_state: MapState::Viewable,
-                background_pixel: 0x00ff_ffff,
+                background_pixel: ROOT_DEFAULT_BACKGROUND_PIXEL,
                 background_pixmap: None,
                 background_none: false,
                 background_pixmap_host_xid: None,
