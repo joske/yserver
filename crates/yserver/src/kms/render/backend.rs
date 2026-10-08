@@ -11134,6 +11134,18 @@ impl KmsBackend {
             })
     }
 
+    /// #214: real `vkQueueSubmit2` calls made by this backend's platform
+    /// for paint groups and Present signals (per instance: parallel-safe).
+    pub fn platform_queue_submit_count_for_tests(&self) -> u64 {
+        self.platform.queue_submit_count()
+    }
+
+    /// #214: arm a recording failure in the next frame close.
+    pub fn force_next_frame_record_failure_for_tests(&mut self) {
+        self.platform
+            .force_next_frame_record_failure_for_integration_tests();
+    }
+
     /// Phase A T6: size of the current SubmitGroup (number of CBs
     /// buffered and not yet submitted to the Vulkan queue).
     /// Exposed for acceptance regression tests.
@@ -11633,9 +11645,7 @@ impl KmsBackend {
                 emit_idle: true,
             },
         };
-        self.engine
-            .attach_cow_present_completion(dst_id, entry)
-            .is_ok()
+        self.engine.attach_present_completion(dst_id, entry).is_ok()
     }
 
     /// Phase B.3 Task 12 (N5): drive `engine.render_traps_or_tris` directly
@@ -11807,7 +11817,7 @@ impl KmsBackend {
     }
 
     /// B.3 Task 4 — test-only: attach a synthetic PRESENT completion
-    /// to the open frame's cow slot (via `engine.attach_cow_present_completion`)
+    /// to the open frame's cow slot (via `engine.attach_present_completion`)
     /// without a real X PRESENT client. Returns `true` if the attach
     /// succeeded (the cow_id is written in the open frame's ops list),
     /// `false` if attach returned Err (no open frame, or frame doesn't
@@ -11851,9 +11861,7 @@ impl KmsBackend {
                 emit_idle: true,
             },
         };
-        self.engine
-            .attach_cow_present_completion(cow_id, entry)
-            .is_ok()
+        self.engine.attach_present_completion(cow_id, entry).is_ok()
     }
 
     /// B.3 Task 4 — test-only: call `engine.drain_all` (waits on all
@@ -30160,8 +30168,10 @@ impl Backend for KmsBackend {
     /// dedicated export-only semaphore in the same queue submission;
     /// the exported sync_file FD drives completion without touching the
     /// `FenceTicket` used for yserver's internal lifetime tracking.
-    /// Non-COW PRESENT falls back to one signal-only queue submit after
-    /// the already-submitted copy, relying on same-queue ordering.
+    /// Non-COW PRESENT whose copy is still in the open frame does the same
+    /// and closes that frame at once (#214). Otherwise it falls back to one
+    /// signal-only queue submit after the already-submitted copy, relying
+    /// on same-queue ordering.
     fn enqueue_present_completion(
         &mut self,
         event: yserver_core::backend::CompletedPresentEvent,
@@ -30196,7 +30206,7 @@ impl Backend for KmsBackend {
         if let Some(cow_id) = self.cow_id
             && self.store.lookup(dst_host_xid) == Some(cow_id)
         {
-            match self.engine.attach_cow_present_completion(cow_id, entry) {
+            match self.engine.attach_present_completion(cow_id, entry) {
                 Ok(()) => return,
                 Err(returned) => entry = returned,
             }
@@ -30205,7 +30215,7 @@ impl Backend for KmsBackend {
         // Phase A: close any open render batch FIRST so its CBs land
         // in the group under the same ticket the flush will consume.
         // Then ensure all prior paint is on the queue BEFORE the
-        // signal-only submit. Engine-driven so any parked pending_group_ops
+        // completion signal. Engine-driven so any parked pending_group_ops
         // graduate to `submitted` atomically with the submit.
         // Spec § "Phase A — concrete scope" trigger 2 (Codex pass-3 fix).
         if let Err(e) = self.engine.flush_render_batch(
@@ -30214,6 +30224,34 @@ impl Backend for KmsBackend {
             crate::kms::render::engine::RenderFlushReason::Present,
         ) {
             log::warn!("render enqueue_present_completion: flush_render_batch failed: {e:?}");
+        }
+
+        // #214: when the open frame holds the copy (an op writing the
+        // destination), attach the completion to it and close it now: the
+        // export signal rides the paint submit, one vkQueueSubmit2 instead
+        // of paint + a signal-only submit. The close publishes the release
+        // fence and hands the batch to the completion scheduler; a close
+        // that fails keeps the entry as a ready batch (never dropped).
+        // Otherwise (copy already submitted, clipped to nothing, or recorded
+        // another way) fall through to the signal-only submit.
+        if let Some(dst_id) = self.store.lookup(dst_host_xid) {
+            match self.engine.attach_present_completion(dst_id, entry) {
+                Ok(()) => {
+                    if let Err(e) = self.engine.close_open_frame(
+                        &mut self.store,
+                        &mut self.platform,
+                        crate::kms::render::frame_builder::CloseReason::PresentCompletionSignal,
+                    ) {
+                        log::warn!(
+                            "render enqueue_present_completion: close_open_frame failed: {e:?}"
+                        );
+                    }
+                    self.drain_frame_builder_telemetry();
+                    self.drain_engine_present_batches();
+                    return;
+                }
+                Err(returned) => entry = returned,
+            }
         }
         // Phase B.1 close trigger 1b: close any open frame before the
         // signal-only submit so the semaphore-export's SYNC_FD captures a

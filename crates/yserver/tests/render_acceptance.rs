@@ -5739,6 +5739,152 @@ fn submit_group_flushes_before_non_cow_present_completion_signal() {
     );
 }
 
+fn non_cow_present_event(serial: u32, xid: u32) -> yserver_core::backend::CompletedPresentEvent {
+    yserver_core::backend::CompletedPresentEvent {
+        client_id: yserver_protocol::x11::ClientId(0),
+        serial,
+        host_xid: xid,
+        dst_host_xid: xid,
+        options: 0,
+        present_id: 0,
+        window_generation: 0,
+        crtc_id: 0,
+        crtc_epoch: 0,
+        msc_offset: 0,
+        completion_clock: None,
+        wake: yserver_core::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
+        completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+        emit_idle: true,
+    }
+}
+
+/// A Vk backend with the construction frame closed and the group drained,
+/// plus a `src` and a `dst` 4×4 depth-32 pixmap.
+fn present_fixture() -> Option<(KmsBackend, u32, u32)> {
+    let mut b = match KmsBackend::for_tests_with_vk() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e}");
+            return None;
+        }
+    };
+    let src = b.create_pixmap(None, 32, 4, 4).expect("src").as_raw();
+    let dst = b.create_pixmap(None, 32, 4, 4).expect("dst").as_raw();
+    if b.frame_builder_is_open_for_tests() {
+        b.engine_close_open_frame_for_timeout_for_tests()
+            .expect("close construction frame");
+    }
+    b.engine_flush_submit_group_for_tests().expect("drain");
+    Some((b, src, dst))
+}
+
+/// Retire everything in flight and return the delivered serials.
+fn delivered_serials(b: &mut KmsBackend) -> Vec<u32> {
+    b.engine_drain_all_for_tests();
+    b.drain_completed_present_events_for_tests()
+        .iter()
+        .map(|e| e.serial)
+        .collect()
+}
+
+/// #214: a non-COW Present whose copy is still in the open frame attaches
+/// its completion to that frame and closes it — ONE vkQueueSubmit2 (the
+/// paint submit carries the export signal), not paint + signal-only — and
+/// the completion is still delivered.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn non_cow_present_completion_rides_the_paint_submit() {
+    let Some((mut b, src, dst)) = present_fixture() else {
+        return;
+    };
+    b.copy_area(None, src, dst, 0, 0, 0, 0, 4, 4)
+        .expect("copy_area");
+    assert!(
+        b.frame_builder_is_open_for_tests(),
+        "the Present copy is recorded into the open frame"
+    );
+    let before = b.platform_queue_submit_count_for_tests();
+    b.enqueue_present_completion(non_cow_present_event(0x214, dst), dst);
+    assert_eq!(
+        b.platform_queue_submit_count_for_tests() - before,
+        1,
+        "the completion signal rides the paint submit"
+    );
+    assert!(
+        !b.frame_builder_is_open_for_tests(),
+        "the frame closed at once"
+    );
+    assert_eq!(delivered_serials(&mut b), vec![0x214]);
+}
+
+/// #214 fallback: when the open frame does not hold a write to the
+/// destination (the copy was already submitted), the completion keeps the
+/// signal-only submit after the frame close, and is still delivered.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn non_cow_present_completion_without_the_copy_in_the_frame_keeps_the_signal_submit() {
+    let Some((mut b, src, dst)) = present_fixture() else {
+        return;
+    };
+    b.copy_area(None, src, dst, 0, 0, 0, 0, 4, 4)
+        .expect("copy_area");
+    b.engine_close_open_frame_for_timeout_for_tests()
+        .expect("submit the copy");
+    // Unrelated paint keeps a frame open that does not write `dst`.
+    b.copy_area(None, dst, src, 0, 0, 0, 0, 4, 4)
+        .expect("copy_area");
+    assert!(b.frame_builder_is_open_for_tests());
+    let before = b.platform_queue_submit_count_for_tests();
+    b.enqueue_present_completion(non_cow_present_event(0x215, dst), dst);
+    assert_eq!(
+        b.platform_queue_submit_count_for_tests() - before,
+        2,
+        "frame close + signal-only submit"
+    );
+    assert_eq!(delivered_serials(&mut b), vec![0x215]);
+}
+
+/// #214 failure path: a frame close that fails while recording (before any
+/// submit) must not drop the completion attached to it.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn non_cow_present_completion_survives_a_frame_record_failure() {
+    let Some((mut b, src, dst)) = present_fixture() else {
+        return;
+    };
+    b.copy_area(None, src, dst, 0, 0, 0, 0, 4, 4)
+        .expect("copy_area");
+    b.force_next_frame_record_failure_for_tests();
+    let before = b.platform_queue_submit_count_for_tests();
+    b.enqueue_present_completion(non_cow_present_event(0x216, dst), dst);
+    assert_eq!(
+        b.platform_queue_submit_count_for_tests() - before,
+        0,
+        "nothing submitted"
+    );
+    assert_eq!(
+        b.pending_present_events_len_for_tests(),
+        1,
+        "the entry is queued for delivery, not dropped"
+    );
+    assert_eq!(delivered_serials(&mut b), vec![0x216]);
+}
+
+/// #214 failure path: a frame whose submit fails keeps the completion too.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn non_cow_present_completion_survives_a_frame_submit_failure() {
+    let Some((mut b, src, dst)) = present_fixture() else {
+        return;
+    };
+    b.copy_area(None, src, dst, 0, 0, 0, 0, 4, 4)
+        .expect("copy_area");
+    b.platform_force_next_submit_failure_for_tests();
+    b.enqueue_present_completion(non_cow_present_event(0x217, dst), dst);
+    assert_eq!(b.pending_present_events_len_for_tests(), 1);
+    assert_eq!(delivered_serials(&mut b), vec![0x217]);
+}
+
 /// Phase A T8 successor: the SubmitGroup must never accumulate
 /// unsubmitted paint across frame closes.
 ///
@@ -7102,7 +7248,7 @@ fn frame_builder_cow_copy_area_collapses_two_in_one_frame() {
 }
 
 /// B.3 Task 4 acceptance gate (PRESENT-completion N10): a
-/// `cow_copy_area` followed by `attach_cow_present_completion` inside
+/// `cow_copy_area` followed by `attach_present_completion` inside
 /// an open frame correctly delivers a `CompletedPresentEvent` when
 /// the frame retires (the event is NOT dropped on flush-success).
 ///

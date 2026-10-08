@@ -2657,6 +2657,7 @@ impl RenderEngine {
                         open_frame.atlas_prev_ticket_snapshot.clone(),
                     );
                     rollback_snapshots(inner_post, &mut open_frame.snapshot_touch);
+                    rescue_present_completions(inner_post, &mut open_frame);
                     // Phase B.2 Mechanism 3 (defensive): release any
                     // retired BatchResources attached to the open
                     // frame's pin set. Structurally empty under B.2's
@@ -2748,6 +2749,11 @@ impl RenderEngine {
             acc
         };
 
+        let record_result = if platform.take_forced_frame_record_failure() {
+            Err(RenderError::RendererFailed)
+        } else {
+            record_result
+        };
         if let Err(e) = record_result {
             // CB never appended to SubmitGroup. Free it ourselves.
             {
@@ -2768,6 +2774,7 @@ impl RenderEngine {
                 open_frame.atlas_prev_ticket_snapshot.clone(),
             );
             rollback_snapshots(inner_post, &mut open_frame.snapshot_touch);
+            rescue_present_completions(inner_post, &mut open_frame);
             // Phase B.2 Mechanism 3 (defensive): release any retired
             // BatchResources attached to the open frame's pin set.
             // See path 1 above for rationale.
@@ -2802,41 +2809,14 @@ impl RenderEngine {
                 match platform.acquire_present_completion_signal() {
                     Ok(s) => Some(s),
                     Err(e) => {
-                        // Signal-acquire failure: route through the same
-                        // append-failure rollback (free CB + rollback + mark failed).
-                        {
-                            let inner = self.inner.as_mut().expect("inner");
-                            let device = &inner.vk.device;
-                            if let Some(pool) = platform.ops_command_pool_handle() {
-                                unsafe { device.free_command_buffers(pool, &[cb]) };
-                            }
-                        }
-                        rollback_pre_submit(store, &mut open_frame);
-                        platform.renderer_failed = true;
-                        let inner_post = self.inner.as_mut().expect("inner");
-                        rollback_atlas(
-                            inner_post,
-                            open_frame.layouts.atlas,
-                            open_frame.atlas_prev_ticket_snapshot.clone(),
+                        // The frame still submits; its completions fall
+                        // back to polling the frame's fence (post-flush
+                        // `None` arm) instead of a sync_file.
+                        log::warn!(
+                            "close_open_frame: Present completion semaphore allocation \
+                             failed: {e:?}; falling back to FenceTicket polling"
                         );
-                        rollback_snapshots(inner_post, &mut open_frame.snapshot_touch);
-                        for r in open_frame.pins.retired_resources.drain(..) {
-                            r.release(&inner_post.vk);
-                        }
-                        if inner_post.pending_frame_close_events.len() < 1024 {
-                            inner_post.pending_frame_close_events.push(
-                                super::frame_builder::FrameCloseEvent {
-                                    reason,
-                                    ops_in_frame: open_frame.ops.len(),
-                                    glyph_uploads_in_frame: open_frame.glyph_uploads_in_frame,
-                                    renders_in_frame,
-                                    pin_count: open_frame.pins.len(),
-                                    aborted: true,
-                                },
-                            );
-                        }
-                        inner_post.frame_builder.complete_close_failure();
-                        return Err(RenderError::Vk(e));
+                        None
                     }
                 }
             }
@@ -2869,6 +2849,7 @@ impl RenderEngine {
                 open_frame.atlas_prev_ticket_snapshot.clone(),
             );
             rollback_snapshots(inner_post, &mut open_frame.snapshot_touch);
+            rescue_present_completions(inner_post, &mut open_frame);
             // Phase B.2 Mechanism 3 (defensive): release any retired
             // BatchResources attached to the open frame's pin set.
             // See path 1 above for rationale.
@@ -2981,12 +2962,9 @@ impl RenderEngine {
                                     (PresentBatchWait::Poll, Some(signal))
                                 }
                             },
-                            None => {
-                                // Non-empty completions but no signal — only possible if
-                                // the pending_count check above returned 0 but something
-                                // was pushed between the check and here. Treat as Ready.
-                                (PresentBatchWait::Ready, None)
-                            }
+                            // No signal: its allocation failed. Poll the
+                            // frame's fence (the batch ticket below).
+                            None => (PresentBatchWait::Poll, None),
                         };
                         if let PresentBatchWait::Fd(fd) = &wait {
                             for completion in &mut drained_completions {
@@ -5095,17 +5073,19 @@ impl RenderEngine {
     }
 
     /// Phase B.3 (N10): attach a PRESENT-completion entry to the open frame
-    /// if and only if the frame has an op that WRITES to `cow_id`. Returns
-    /// `Err(entry)` if no open frame exists or the frame doesn't write to
-    /// `cow_id` (predicate is `RecordedOp::dst_id() == Some(cow_id)`, NOT
-    /// `touched` — touched includes sampled-only references that would
-    /// attach completions to frames that never wrote the cow).
+    /// if and only if the frame has an op that WRITES to `dst` (the COW, or
+    /// a non-COW Present's destination storage). Its completion signal then
+    /// rides the frame's own submit. Returns `Err(entry)` if no open frame
+    /// exists or the frame doesn't write to `dst` (predicate is
+    /// `RecordedOp::dst_id() == Some(dst)`, NOT `touched` — touched includes
+    /// sampled-only references that would attach completions to frames that
+    /// never wrote it).
     // This Result is an ownership hand-back, not a conventional error path;
     // boxing the entry would add an allocation to every COW Present.
     #[allow(clippy::result_large_err)]
-    pub(crate) fn attach_cow_present_completion(
+    pub(crate) fn attach_present_completion(
         &mut self,
-        cow_id: DrawableId,
+        dst: DrawableId,
         entry: PendingPresentEntry,
     ) -> Result<(), PendingPresentEntry> {
         let Some(inner) = self.inner.as_mut() else {
@@ -5115,8 +5095,8 @@ impl RenderEngine {
             return Err(entry);
         };
         // N10 predicate: writes, NOT just touched.
-        let writes_to_cow = open.ops.iter().any(|op| op.dst_id() == Some(cow_id));
-        if !writes_to_cow {
+        let writes_to_dst = open.ops.iter().any(|op| op.dst_id() == Some(dst));
+        if !writes_to_dst {
             return Err(entry);
         }
         open.pending_present_completions.push(entry);
@@ -12059,6 +12039,25 @@ fn snapshot_first_touch(inner: &mut RenderEngineInner, sid: SnapshotId) {
 /// mandatory: a failed close where append already advanced the version (WRITE
 /// path, Task 13) must restore the OLD version or the next frame skips a needed
 /// re-refresh and samples stale bytes. Mirrors `rollback_atlas`.
+/// A frame close that fails before its submit drops the frame: hand its
+/// Present completions to the completion scheduler as an immediately ready
+/// batch instead, like the post-flush failure path. X PRESENT must deliver
+/// the events whether or not the copy ran.
+fn rescue_present_completions(
+    inner: &mut RenderEngineInner,
+    open_frame: &mut super::frame_builder::OpenFrame,
+) {
+    let events = std::mem::take(&mut open_frame.pending_present_completions);
+    if !events.is_empty() {
+        inner.pending_present_batches.push(PendingPresentBatch {
+            wait: PresentBatchWait::Ready,
+            ticket: None,
+            signal: None,
+            events,
+        });
+    }
+}
+
 fn rollback_snapshots(
     inner: &mut RenderEngineInner,
     snapshot_touch: &mut std::collections::HashMap<

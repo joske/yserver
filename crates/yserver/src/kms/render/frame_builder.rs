@@ -385,7 +385,7 @@ pub(crate) struct OpenFrame {
     /// Used by `open_for_at_least` to drive the timeout close trigger.
     pub(crate) opened_at: Instant,
     /// Phase B.3 (N10): X PRESENT completions attached to this open frame
-    /// via `attach_cow_present_completion`. Drained at close-success into
+    /// via `attach_present_completion`. Drained at close-success into
     /// `pending_present_batches` (alongside the acquired
     /// `PresentCompletionSignal`'s semaphore queued on the submit).
     /// Force-enqueued as a degraded `PendingPresentBatch { wait: Ready,
@@ -394,7 +394,7 @@ pub(crate) struct OpenFrame {
     /// regardless of submit success.
     #[allow(
         dead_code,
-        reason = "Phase B.3 Task 4 wires up attach_cow_present_completion + close-path \
+        reason = "Phase B.3 Task 4 wires up attach_present_completion + close-path \
                   drain; the slot lands in Task 1 so the OpenFrame shape is stable \
                   before Task 4's atomic cow_copy_area rewrite."
     )]
@@ -1102,13 +1102,13 @@ pub(crate) enum RecordedOp {
 impl RecordedOp {
     /// Phase B.3 (N10): the drawable this op WRITES to, or `None` for
     /// utility variants without a writable drawable destination.
-    /// `attach_cow_present_completion`'s predicate uses this to decide
+    /// `attach_present_completion`'s predicate uses this to decide
     /// whether to attach the completion to the open frame (per the spec's
     /// N10 — `touched` is the wrong predicate because it includes sampled-
     /// only references).
     #[allow(
         dead_code,
-        reason = "Phase B.3 Task 4 wires up attach_cow_present_completion to call this \
+        reason = "Phase B.3 Task 4 wires up attach_present_completion to call this \
                   helper; the predicate lands in Task 1 so the exhaustive match \
                   catches a future variant addition at compile time before Task 4."
     )]

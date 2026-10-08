@@ -2363,6 +2363,9 @@ pub(crate) struct PlatformBackend {
     /// #214 telemetry: the cause the next group flush is counted under
     /// (set by a frame close); `None` maps the `FlushReason`.
     next_submit_cause: Option<crate::kms::vk::submit_stats::SubmitCause>,
+    /// Fault injection like `force_next_submit_failure`: the next frame
+    /// close fails while recording, before anything is submitted.
+    force_next_frame_record_failure: bool,
     /// Real `vkQueueSubmit2` calls made through this platform's paint
     /// group and Present signal paths (per instance, so parallel tests
     /// can assert exact counts).
@@ -3085,6 +3088,7 @@ impl PlatformBackend {
             last_flush_outcome: None,
             force_next_submit_failure: false,
             next_submit_cause: None,
+            force_next_frame_record_failure: false,
             queue_submits: 0,
         })
     }
@@ -3205,6 +3209,7 @@ impl PlatformBackend {
             last_flush_outcome: None,
             force_next_submit_failure: false,
             next_submit_cause: None,
+            force_next_frame_record_failure: false,
             queue_submits: 0,
         }
     }
@@ -4952,6 +4957,23 @@ impl PlatformBackend {
     /// `acceptance` integration-test crate.
     pub(crate) fn force_next_submit_failure_for_integration_tests(&mut self) {
         self.force_next_submit_failure = true;
+    }
+
+    /// Arm a recording failure in the next frame close (integration tests).
+    pub(crate) fn force_next_frame_record_failure_for_integration_tests(&mut self) {
+        self.force_next_frame_record_failure = true;
+    }
+
+    /// Consume the latch armed by
+    /// [`Self::force_next_frame_record_failure_for_integration_tests`].
+    pub(crate) fn take_forced_frame_record_failure(&mut self) -> bool {
+        std::mem::take(&mut self.force_next_frame_record_failure)
+    }
+
+    /// Real `vkQueueSubmit2` calls this platform made for paint groups and
+    /// Present signals.
+    pub(crate) fn queue_submit_count(&self) -> u64 {
+        self.queue_submits
     }
 
     /// Phase A: explicit flush of any buffered submit group. Issues one
