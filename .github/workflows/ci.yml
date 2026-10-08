@@ -121,7 +121,8 @@ jobs:
         # GPU-less runner: Mesa's lavapipe is the only Vulkan ICD, so
         # the `#[ignore = "needs live Vulkan ICD"]` render tests run on
         # it. They self-skip if no Vulkan device is present. KMS/scanout
-        # tests aren't in this set (no /dev/dri on the runner).
+        # tests aren't in this set (no /dev/dri on the runner). All targets,
+        # not only the lib: render_acceptance and the other integration tests.
         #
         # On the xdmcp leg, with --features xdmcp, for the same reason as the
         # step above: rendering is orthogonal to TCP and XDMCP, but these are
@@ -131,4 +132,4 @@ jobs:
         if: matrix.name == 'xdmcp'
         env:
           YSERVER_ALLOW_SOFTWARE_VULKAN: "1"
-        run: cargo test -p yserver --lib --locked --features xdmcp -- --ignored
+        run: cargo test -p yserver --locked --features xdmcp -- --ignored
