@@ -8,6 +8,14 @@
 //! transform handles the dst → gradient-space projection so gradients
 //! don't need a custom shader.
 //!
+//! Construction does no GPU work: it allocates the image and returns
+//! the evaluated pixels. The caller records the upload
+//! ([`GradientPicture::record_initial_upload`]) into a command buffer
+//! that is submitted before — or is — the first one that samples the
+//! picture, and keeps both the pixels' staging memory and a picture
+//! clone alive until that command buffer retires (#214: a synchronous
+//! upload cost one GPU round trip per `CreateLinearGradient`).
+//!
 //! ## Linear gradient
 //!
 //! Stored as a `256×1` LUT keyed on the gradient parameter `t ∈ [0, 1]`.
@@ -41,10 +49,7 @@ use std::sync::Arc;
 
 use ash::vk;
 
-use super::{
-    device::VkContext,
-    ops::{render::AffineXform, run_one_shot_op},
-};
+use super::{device::VkContext, ops::render::AffineXform};
 
 #[derive(Debug, thiserror::Error)]
 pub enum GradientError {
@@ -156,16 +161,28 @@ impl GradientPicture {
         self.0.axis_projection
     }
 
+    pub fn image(&self) -> vk::Image {
+        self.0.image
+    }
+
+    /// Weak handle to the shared resources, for tests that prove the
+    /// Vk handles are released once every clone is gone.
+    #[cfg(test)]
+    pub(crate) fn downgrade(&self) -> std::sync::Weak<impl Sized + use<>> {
+        Arc::downgrade(&self.0)
+    }
+
     /// Create a linear gradient between `p1` and `p2` (both X11
     /// fixed-point 16.16) with the given stops. Renders the colour
-    /// LUT and returns a sampleable `GradientPicture`.
+    /// LUT on the CPU and returns the picture together with the LUT
+    /// bytes; the image is NOT initialized until the caller records
+    /// [`Self::record_initial_upload`] with those bytes.
     pub fn new_linear(
         vk: Arc<VkContext>,
-        pool: vk::CommandPool,
         p1: (i32, i32),
         p2: (i32, i32),
         stops: &[Stop],
-    ) -> Result<Self, GradientError> {
+    ) -> Result<(Self, Vec<u8>), GradientError> {
         let (image, view, memory) = allocate_image(
             &vk,
             vk::Extent2D {
@@ -189,8 +206,6 @@ impl GradientPicture {
             lut[i * 4 + 3] = (a >> 8) as u8;
         }
 
-        upload_initial(&vk, pool, image, LUT_LEN, 1, &lut)?;
-
         // Build axis-projection affine: t(P) = ((P - p1) · v) / |v|²,
         // u_in_pixels = LUT_LEN * t.
         let p1x = (p1.0 as f32) / 65536.0;
@@ -206,7 +221,7 @@ impl GradientPicture {
         // the sample on that row to dodge any fp rounding into row 1.
         let row1 = [0.0, 0.0, 0.5, 0.0];
 
-        Ok(Self(Arc::new(GradientPictureResources {
+        let picture = Self(Arc::new(GradientPictureResources {
             vk,
             image,
             view,
@@ -216,7 +231,8 @@ impl GradientPicture {
                 height: 1,
             },
             axis_projection: AffineXform { row0, row1 },
-        })))
+        }));
+        Ok((picture, lut))
     }
 
     /// Create a radial gradient. `inner = (cx, cy, r)` and
@@ -224,13 +240,13 @@ impl GradientPicture {
     /// evaluated CPU-side into a `256×256` square whose internal
     /// pixel space spans the outer-circle bbox; the axis-projection
     /// transform then maps dst-pixel coordinates into that bbox.
+    /// Returns the picture and its pixels, like [`Self::new_linear`].
     pub fn new_radial(
         vk: Arc<VkContext>,
-        pool: vk::CommandPool,
         inner: (i32, i32, i32),
         outer: (i32, i32, i32),
         stops: &[Stop],
-    ) -> Result<Self, GradientError> {
+    ) -> Result<(Self, Vec<u8>), GradientError> {
         let (image, view, memory) = allocate_image(
             &vk,
             vk::Extent2D {
@@ -276,15 +292,13 @@ impl GradientPicture {
             }
         }
 
-        upload_initial(&vk, pool, image, RADIAL_SIDE, RADIAL_SIDE, &img)?;
-
         // Affine: dst-pixel → image pixel.
         // image_x = (dst_x - (ocx - or)) * RADIAL_SIDE / span
         let s = RADIAL_SIDE as f32 / span;
         let row0 = [s, 0.0, -s * (ocx - or), 0.0];
         let row1 = [0.0, s, -s * (ocy - or), 0.0];
 
-        Ok(Self(Arc::new(GradientPictureResources {
+        let picture = Self(Arc::new(GradientPictureResources {
             vk,
             image,
             view,
@@ -294,7 +308,8 @@ impl GradientPicture {
                 height: RADIAL_SIDE,
             },
             axis_projection: AffineXform { row0, row1 },
-        })))
+        }));
+        Ok((picture, img))
     }
 }
 
@@ -508,86 +523,28 @@ fn allocate_image(
     Ok((image, view, memory))
 }
 
-/// One-shot upload + layout transition for the gradient image. Uses a
-/// throwaway staging buffer (gradients are created infrequently — no
-/// reuse needed). Image ends in `SHADER_READ_ONLY_OPTIMAL`.
-fn upload_initial(
-    vk: &VkContext,
-    pool: vk::CommandPool,
-    image: vk::Image,
-    width: u32,
-    height: u32,
-    bytes: &[u8],
-) -> Result<(), GradientError> {
-    use std::ptr::NonNull;
-
-    let needed = bytes.len() as u64;
-    let buf_info = vk::BufferCreateInfo::default()
-        .size(needed)
-        .usage(vk::BufferUsageFlags::TRANSFER_SRC)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
-    let buffer = unsafe { vk.device.create_buffer(&buf_info, None)? };
-    let mem_reqs = unsafe { vk.device.get_buffer_memory_requirements(buffer) };
-    let mem_props = unsafe {
-        vk.instance
-            .get_physical_device_memory_properties(vk.physical_device)
-    };
-    let want = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-    let mt = (0..mem_props.memory_type_count).find(|&i| {
-        mem_reqs.memory_type_bits & (1 << i) != 0
-            && mem_props.memory_types[i as usize]
-                .property_flags
-                .contains(want)
-    });
-    let mt = match mt {
-        Some(i) => i,
-        None => {
-            unsafe { vk.device.destroy_buffer(buffer, None) };
-            return Err(GradientError::NoMemoryType);
-        }
-    };
-    let alloc = vk::MemoryAllocateInfo::default()
-        .allocation_size(mem_reqs.size)
-        .memory_type_index(mt);
-    let memory = match crate::kms::vk::mem_accounting::allocate_memory_as(
-        &vk.device,
-        &alloc,
-        crate::kms::vk::mem_accounting::MemCategory::Staging,
-        crate::kms::vk::mem_accounting::ChurnClass::Gradient,
-        &mem_props,
+impl GradientPicture {
+    /// Record the picture's one-time initialization into `cb`: the image
+    /// goes `UNDEFINED → TRANSFER_DST`, receives the whole extent from
+    /// `buffer` at `offset` (tightly packed BGRA, as returned by the
+    /// constructor), and ends in `SHADER_READ_ONLY_OPTIMAL` with the copy
+    /// made visible to fragment-shader sampling. The barrier's second
+    /// scope covers every later command on the queue, so a sampler in
+    /// this command buffer or in any later submission is ordered after
+    /// the copy. Record it exactly once, before the first sampler.
+    pub fn record_initial_upload(
+        &self,
+        device: &ash::Device,
+        cb: vk::CommandBuffer,
+        buffer: vk::Buffer,
+        offset: vk::DeviceSize,
     ) {
-        Ok(m) => m,
-        Err(e) => {
-            unsafe { vk.device.destroy_buffer(buffer, None) };
-            return Err(e.into());
-        }
-    };
-    if let Err(e) = unsafe { vk.device.bind_buffer_memory(buffer, memory, 0) } {
-        unsafe {
-            crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
-            vk.device.destroy_buffer(buffer, None);
-        }
-        return Err(e.into());
-    }
-    let mapped = match unsafe {
-        vk.device
-            .map_memory(memory, 0, needed, vk::MemoryMapFlags::empty())
-    } {
-        Ok(p) => p,
-        Err(e) => {
-            unsafe {
-                crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
-                vk.device.destroy_buffer(buffer, None);
-            }
-            return Err(e.into());
-        }
-    };
-    let mapped = NonNull::new(mapped.cast::<u8>()).expect("non-null");
-    // SAFETY: mapped is valid and writable for `needed` bytes.
-    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.as_ptr(), bytes.len()) };
-
-    let result = run_one_shot_op(vk, pool, |vk, cb| {
-        let device = &vk.device;
+        let image = self.0.image;
+        let extent = self.0.extent;
+        let range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .level_count(1)
+            .layer_count(1);
         let to_dst = [vk::ImageMemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
             .src_access_mask(vk::AccessFlags2::empty())
@@ -596,18 +553,13 @@ fn upload_initial(
             .old_layout(vk::ImageLayout::UNDEFINED)
             .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .image(image)
-            .subresource_range(
-                vk::ImageSubresourceRange::default()
-                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                    .level_count(1)
-                    .layer_count(1),
-            )];
+            .subresource_range(range)];
         let dep = vk::DependencyInfo::default().image_memory_barriers(&to_dst);
         crate::vk_count!(cmd_pipeline_barrier2);
         unsafe { device.cmd_pipeline_barrier2(cb, &dep) };
 
-        let region = vk::BufferImageCopy::default()
-            .buffer_offset(0)
+        let regions = [vk::BufferImageCopy::default()
+            .buffer_offset(offset)
             .buffer_row_length(0)
             .buffer_image_height(0)
             .image_subresource(
@@ -617,11 +569,10 @@ fn upload_initial(
             )
             .image_offset(vk::Offset3D::default())
             .image_extent(vk::Extent3D {
-                width,
-                height,
+                width: extent.width,
+                height: extent.height,
                 depth: 1,
-            });
-        let regions = [region];
+            })];
         unsafe {
             crate::vk_count!(cmd_copy_buffer_to_image);
             device.cmd_copy_buffer_to_image(
@@ -640,25 +591,11 @@ fn upload_initial(
             .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
             .image(image)
-            .subresource_range(
-                vk::ImageSubresourceRange::default()
-                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                    .level_count(1)
-                    .layer_count(1),
-            )];
+            .subresource_range(range)];
         let dep = vk::DependencyInfo::default().image_memory_barriers(&to_read);
         crate::vk_count!(cmd_pipeline_barrier2);
         unsafe { device.cmd_pipeline_barrier2(cb, &dep) };
-        Ok(())
-    });
-
-    unsafe {
-        vk.device.unmap_memory(memory);
-        vk.device.destroy_buffer(buffer, None);
-        crate::kms::vk::mem_accounting::free_memory(&vk.device, memory);
     }
-    result?;
-    Ok(())
 }
 
 #[cfg(test)]

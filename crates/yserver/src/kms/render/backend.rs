@@ -11689,7 +11689,7 @@ impl KmsBackend {
         use crate::kms::vk::gradient::Stop;
         self.engine
             .build_and_insert_linear_gradient(
-                &self.platform,
+                &mut self.platform,
                 grad_xid,
                 (0, 0),
                 (64 << 16, 0),
@@ -29290,7 +29290,7 @@ impl Backend for KmsBackend {
             })
             .collect();
         if let Err(e) = self.engine.build_and_insert_linear_gradient(
-            &self.platform,
+            &mut self.platform,
             picture_xid,
             (p1x, p1y),
             (p2x, p2y),
@@ -29349,7 +29349,7 @@ impl Backend for KmsBackend {
             })
             .collect();
         if let Err(e) = self.engine.build_and_insert_radial_gradient(
-            &self.platform,
+            &mut self.platform,
             picture_xid,
             (icx, icy, ir),
             (ocx, ocy, or_),

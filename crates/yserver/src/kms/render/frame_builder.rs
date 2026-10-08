@@ -213,6 +213,7 @@ impl FrameBuilder {
             opened_at: Instant::now(),
             pending_present_completions: Vec::new(), // NEW (B.3 N10)
             snapshot_touch: std::collections::HashMap::new(), // NEW (Phase 2 clip)
+            gradient_inits: Vec::new(),
         }));
     }
 
@@ -374,6 +375,28 @@ pub(crate) struct OpenFrame {
         super::engine::SnapshotId,
         (ash::vk::ImageLayout, Option<FenceTicket>, u64),
     >,
+    /// #214: gradient pictures created while this frame was open, whose
+    /// one-time pixel upload is recorded at the HEAD of the frame's
+    /// command buffer — before every op, so before any sampler of the
+    /// picture. The pixels ride `pins.upload_slices`; a picture clone
+    /// rides `pins.retired_resources`, so the image outlives the copy
+    /// even when the client frees the picture at once.
+    pub(crate) gradient_inits: Vec<RecordedGradientInit>,
+}
+
+/// #214: a gradient picture's deferred initial upload (see
+/// [`OpenFrame::gradient_inits`]).
+#[derive(Debug)]
+pub(crate) struct RecordedGradientInit {
+    pub(crate) picture: crate::kms::vk::gradient::GradientPicture,
+    pub(crate) upload_pin: PinnedUploadIdx,
+}
+
+impl OpenFrame {
+    /// Whether the frame has recorded any GPU work at all.
+    pub(crate) fn has_recorded_work(&self) -> bool {
+        !self.ops.is_empty() || !self.gradient_inits.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -1896,6 +1919,7 @@ mod open_frame_tests {
             opened_at: std::time::Instant::now(),
             pending_present_completions: Vec::new(),
             snapshot_touch: std::collections::HashMap::new(),
+            gradient_inits: Vec::new(),
         };
         assert!(frame.ops.is_empty());
         assert_eq!(frame.pins.len(), 0);

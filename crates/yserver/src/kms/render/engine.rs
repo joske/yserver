@@ -2667,6 +2667,13 @@ impl RenderEngine {
             // don't alias `&inner.vk` against `&mut inner` (Phase-1 pattern).
             let vk = inner.vk.clone();
             let mut session: Option<DstPassSession> = None;
+            // #214: gradient initial uploads go first — nothing earlier in
+            // the frame can sample a picture created while it was open.
+            for gi in &open_frame.gradient_inits {
+                let src = open_frame.pins.upload_slices[gi.upload_pin.0 as usize];
+                gi.picture
+                    .record_initial_upload(&vk.device, cb, src.buffer, src.offset);
+            }
             for op in &open_frame.ops {
                 let class = classify_recorded_op(op);
                 let step = session_step(session.as_ref().map(|s| s.dst_id), &class);
@@ -3475,45 +3482,32 @@ impl RenderEngine {
     /// as src or mask sample this LUT instead of falling back to
     /// the 3f.12 first-stop SolidFill collapse.
     ///
+    /// #214: no GPU round trip — the LUT upload is deferred into the
+    /// open frame (see [`Self::insert_gradient_with_deferred_upload`]).
+    ///
     /// # Errors
     ///
     /// Returns `NoVk` on the test fixture; `Vk` if the LUT image /
-    /// view / memory allocation fails.
+    /// view / memory or the upload staging allocation fails.
     pub(crate) fn build_and_insert_linear_gradient(
         &mut self,
-        platform: &PlatformBackend,
+        platform: &mut PlatformBackend,
         host_pic: u32,
         p1: (i32, i32),
         p2: (i32, i32),
         stops: &[crate::kms::vk::gradient::Stop],
     ) -> Result<(), RenderError> {
-        let inner = self.inner.as_mut().ok_or(RenderError::NoVk)?;
-        let pool = platform
-            .ops_command_pool_handle()
-            .ok_or(RenderError::NoVk)?;
-        let gradient = crate::kms::vk::gradient::GradientPicture::new_linear(
-            inner.vk.clone(),
-            pool,
-            p1,
-            p2,
-            stops,
-        )
-        .map_err(|e| match e {
-            crate::kms::vk::gradient::GradientError::Vk(r) => RenderError::Vk(r),
-            crate::kms::vk::gradient::GradientError::NoMemoryType => {
-                RenderError::Vk(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
-            }
-        })?;
-        inner
-            .picture_paint
-            .insert(host_pic, PicturePaintState::Gradient(gradient));
-        Ok(())
+        let vk = self.inner.as_ref().ok_or(RenderError::NoVk)?.vk.clone();
+        let (gradient, pixels) =
+            crate::kms::vk::gradient::GradientPicture::new_linear(vk, p1, p2, stops)
+                .map_err(gradient_error)?;
+        self.insert_gradient_with_deferred_upload(platform, host_pic, gradient, &pixels)
     }
 
     /// Stage 3f.13: radial-gradient companion of
     /// [`build_and_insert_linear_gradient`]. Sizes the LUT image
     /// at `RADIAL_SIDE × RADIAL_SIDE` and renders the two-circle
-    /// radial CPU-side, then uploads.
+    /// radial CPU-side; the upload is deferred like the linear one.
     ///
     /// # Errors
     ///
@@ -3521,32 +3515,77 @@ impl RenderEngine {
     /// failure.
     pub(crate) fn build_and_insert_radial_gradient(
         &mut self,
-        platform: &PlatformBackend,
+        platform: &mut PlatformBackend,
         host_pic: u32,
         inner_circle: (i32, i32, i32),
         outer_circle: (i32, i32, i32),
         stops: &[crate::kms::vk::gradient::Stop],
     ) -> Result<(), RenderError> {
-        let inner = self.inner.as_mut().ok_or(RenderError::NoVk)?;
-        let pool = platform
-            .ops_command_pool_handle()
-            .ok_or(RenderError::NoVk)?;
-        let gradient = crate::kms::vk::gradient::GradientPicture::new_radial(
-            inner.vk.clone(),
-            pool,
+        let vk = self.inner.as_ref().ok_or(RenderError::NoVk)?.vk.clone();
+        let (gradient, pixels) = crate::kms::vk::gradient::GradientPicture::new_radial(
+            vk,
             inner_circle,
             outer_circle,
             stops,
         )
-        .map_err(|e| match e {
-            crate::kms::vk::gradient::GradientError::Vk(r) => RenderError::Vk(r),
-            crate::kms::vk::gradient::GradientError::NoMemoryType => {
-                RenderError::Vk(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
-            }
-        })?;
-        inner
+        .map_err(gradient_error)?;
+        self.insert_gradient_with_deferred_upload(platform, host_pic, gradient, &pixels)
+    }
+
+    /// #214: register a freshly allocated (still uninitialized) gradient
+    /// picture and queue its pixel upload into the open frame, opening
+    /// one if needed — instead of a blocking one-shot submit + fence
+    /// wait per gradient.
+    ///
+    /// Ordering: every sampler of the picture is a frame op recorded
+    /// after this call, so it lands later in this frame's command
+    /// buffer (after the upload, which close emits at the frame head)
+    /// or in a later submission on the same queue; the upload's
+    /// closing barrier makes the copy visible to fragment sampling for
+    /// both. Lifetime: the pixels live in the frame's upload arena and
+    /// a picture clone is adopted into the frame's pin set; both are
+    /// released only when the frame's fence retires, so a FreePicture
+    /// before (or without) any use cannot free the image under the copy.
+    fn insert_gradient_with_deferred_upload(
+        &mut self,
+        platform: &mut PlatformBackend,
+        host_pic: u32,
+        gradient: crate::kms::vk::gradient::GradientPicture,
+        pixels: &[u8],
+    ) -> Result<(), RenderError> {
+        if platform.renderer_failed {
+            return Err(RenderError::RendererFailed);
+        }
+        let inner = self.inner.as_mut().ok_or(RenderError::NoVk)?;
+        if !inner.frame_builder.is_open() {
+            let ticket = platform.submit_group_ticket_or_open()?;
+            inner.acquire_generation = inner.acquire_generation.saturating_add(1);
+            let frame_generation = inner.acquire_generation;
+            inner.frame_builder.open_for_paint(ticket, frame_generation);
+        }
+        // Allocation failure leaves the frame untouched; the unused
+        // gradient drops here (never referenced by any command buffer).
+        let upload_pin = inner.upload_to_frame(
+            pixels,
+            inner.upload_copy_align,
+            crate::kms::vk::mem_accounting::ChurnClass::Gradient,
+        )?;
+        let open = inner.frame_builder.open.as_mut().expect("opened above");
+        open.pins.adopt_retired(Box::new(gradient.clone())
+            as Box<dyn crate::kms::render::batch_resource::BatchResource>);
+        open.gradient_inits
+            .push(super::frame_builder::RecordedGradientInit {
+                picture: gradient.clone(),
+                upload_pin,
+            });
+        if let Some(PicturePaintState::Gradient(old)) = inner
             .picture_paint
-            .insert(host_pic, PicturePaintState::Gradient(gradient));
+            .insert(host_pic, PicturePaintState::Gradient(gradient))
+        {
+            inner.adopt_retired_resource_for_gpu_retirement(Some(
+                Box::new(old) as Box<dyn crate::kms::render::batch_resource::BatchResource>
+            ));
+        }
         Ok(())
     }
 
@@ -7676,7 +7715,7 @@ impl RenderEngine {
                 .frame_builder
                 .open
                 .as_ref()
-                .is_some_and(|o| !o.ops.is_empty())
+                .is_some_and(|o| o.has_recorded_work())
         } {
             self.close_open_frame(
                 store,
@@ -8439,7 +8478,7 @@ impl RenderEngine {
                 .frame_builder
                 .open
                 .as_ref()
-                .is_some_and(|o| !o.ops.is_empty())
+                .is_some_and(|o| o.has_recorded_work())
         {
             self.close_open_frame(
                 store,
@@ -8483,7 +8522,7 @@ impl RenderEngine {
                     .frame_builder
                     .open
                     .as_ref()
-                    .is_some_and(|o| !o.ops.is_empty())
+                    .is_some_and(|o| o.has_recorded_work())
             {
                 self.close_open_frame(
                     store,
@@ -9651,6 +9690,15 @@ fn end_and_submit_op_with_signal(
     platform.submit_paint_cb_with_semaphore(cb, ticket.fence(), completion_signal)?;
     let _ = device;
     Ok(())
+}
+
+fn gradient_error(e: crate::kms::vk::gradient::GradientError) -> RenderError {
+    match e {
+        crate::kms::vk::gradient::GradientError::Vk(r) => RenderError::Vk(r),
+        crate::kms::vk::gradient::GradientError::NoMemoryType => {
+            RenderError::Vk(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
+        }
+    }
 }
 
 /// Phase B.1 Task 12: replay a single `RecordedOp` into `cb`. Caller
@@ -16093,7 +16141,7 @@ mod tests {
         let grad_xid = 0xABBA_FACE_u32;
         engine
             .build_and_insert_linear_gradient(
-                &platform,
+                &mut platform,
                 grad_xid,
                 (0, 0),
                 (256_i32 << 16, 0),
@@ -16216,7 +16264,7 @@ mod tests {
         let grad_xid = 0xDEAD_BEEF_u32;
         engine
             .build_and_insert_radial_gradient(
-                &platform,
+                &mut platform,
                 grad_xid,
                 (32_i32 << 16, 32_i32 << 16, 0),
                 (32_i32 << 16, 32_i32 << 16, 32_i32 << 16),
@@ -16301,6 +16349,316 @@ mod tests {
         );
 
         engine.picture_paint_remove(grad_xid);
+        engine.drain_all(&mut platform);
+    }
+
+    /// #214: black → white two-stop ramp over x ∈ [0, 256).
+    fn bw_ramp_stops() -> [crate::kms::vk::gradient::Stop; 2] {
+        use crate::kms::vk::gradient::Stop;
+        [
+            Stop {
+                pos: 0,
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 0xFFFF,
+            },
+            Stop {
+                pos: 0x10000,
+                r: 0xFFFF,
+                g: 0xFFFF,
+                b: 0xFFFF,
+                a: 0xFFFF,
+            },
+        ]
+    }
+
+    /// #214: Src-composite gradient `xid` over the 256×1 `dst`, read it
+    /// back and check the ramp (black at 0, mid-grey at 128, white at
+    /// 255) — an uninitialized or not-yet-uploaded LUT fails this.
+    fn composite_and_check_bw_ramp(
+        engine: &mut RenderEngine,
+        store: &mut DrawableStore,
+        platform: &mut PlatformBackend,
+        dst: DrawableId,
+        xid: u32,
+    ) {
+        let stats = engine
+            .render_composite(
+                store,
+                platform,
+                1, // Src
+                ResolvedSource::Gradient(xid),
+                ResolvedSource::None,
+                Dst::server_internal(dst),
+                &[full_rect(256, 1)],
+                None,
+                Repeat::None,
+                Repeat::None,
+                None,
+                None,
+                false,
+                0,
+                0,
+                0,
+            )
+            .expect("render_composite gradient");
+        assert_eq!(stats.recorded_draws, 1);
+        let out = engine
+            .get_image(
+                store,
+                platform,
+                Src::server_internal(dst),
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 256,
+                        height: 1,
+                    },
+                },
+                32,
+            )
+            .expect("get_image");
+        let px = |x: usize| [out[x * 4], out[x * 4 + 1], out[x * 4 + 2], out[x * 4 + 3]];
+        assert!(px(0)[..3].iter().all(|&c| c <= 4), "x=0 BGRA={:?}", px(0));
+        assert!(
+            px(255)[..3].iter().all(|&c| c >= 0xF0),
+            "x=255 BGRA={:?}",
+            px(255)
+        );
+        assert!(
+            px(128)[..3].iter().all(|&c| (0x40..=0xC0).contains(&c)),
+            "x=128 BGRA={:?}",
+            px(128)
+        );
+        assert!((0..256).all(|x| px(x)[3] == 0xFF), "alpha must be opaque");
+    }
+
+    fn close_for_tests(
+        engine: &mut RenderEngine,
+        store: &mut DrawableStore,
+        platform: &mut PlatformBackend,
+    ) {
+        engine
+            .close_open_frame(
+                store,
+                platform,
+                super::super::frame_builder::CloseReason::Timeout,
+            )
+            .expect("close frame");
+    }
+
+    /// #214: CreateLinearGradient must not submit + wait; the upload is
+    /// queued on the open frame. A picture freed before any use stays
+    /// alive until the frame carrying its upload retires, then releases.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn gradient_create_then_free_before_use_defers_release_to_frame_retire() {
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no Vk — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+        let xid = 0x0214_0001_u32;
+        engine
+            .build_and_insert_linear_gradient(
+                &mut platform,
+                xid,
+                (0, 0),
+                (256_i32 << 16, 0),
+                &bw_ramp_stops(),
+            )
+            .expect("build gradient");
+        let weak = {
+            let inner = engine.inner.as_ref().expect("inner");
+            let open = inner
+                .frame_builder
+                .open
+                .as_ref()
+                .expect("upload opens a frame");
+            assert_eq!(open.gradient_inits.len(), 1, "upload queued, not run");
+            assert!(open.ops.is_empty());
+            match inner.picture_paint.get(&xid) {
+                Some(PicturePaintState::Gradient(g)) => g.downgrade(),
+                None => panic!("gradient not registered"),
+            }
+        };
+        engine.picture_paint_remove(xid);
+        assert!(
+            weak.upgrade().is_some(),
+            "image freed while its upload is still unsubmitted"
+        );
+        close_for_tests(&mut engine, &mut store, &mut platform);
+        assert!(
+            weak.upgrade().is_some(),
+            "image freed while its upload may be in flight"
+        );
+        engine.drain_all(&mut platform);
+        assert!(
+            weak.upgrade().is_none(),
+            "gradient resources leaked past frame retirement"
+        );
+    }
+
+    /// #214: create, composite and free in ONE frame — the upload is
+    /// emitted at the frame head, ahead of the sampling op.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn gradient_create_composite_free_in_one_frame_renders_and_releases() {
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no Vk — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+        let dst = alloc_filled_pixmap(
+            &mut platform,
+            &mut store,
+            &mut engine,
+            0x1,
+            256,
+            1,
+            [1.0, 0.0, 0.0, 1.0],
+        );
+        // The pixmap fill must not share the frame: prove the gradient
+        // itself opens (or joins) a frame and is ordered inside it.
+        close_for_tests(&mut engine, &mut store, &mut platform);
+        let xid = 0x0214_0002_u32;
+        engine
+            .build_and_insert_linear_gradient(
+                &mut platform,
+                xid,
+                (0, 0),
+                (256_i32 << 16, 0),
+                &bw_ramp_stops(),
+            )
+            .expect("build gradient");
+        let weak = match engine
+            .inner
+            .as_ref()
+            .expect("inner")
+            .picture_paint
+            .get(&xid)
+        {
+            Some(PicturePaintState::Gradient(g)) => g.downgrade(),
+            None => panic!("gradient not registered"),
+        };
+        // Record the composite, then free the picture while the frame is
+        // still open; get_image closes and submits that frame.
+        let stats = engine
+            .render_composite(
+                &mut store,
+                &mut platform,
+                1,
+                ResolvedSource::Gradient(xid),
+                ResolvedSource::None,
+                Dst::server_internal(dst),
+                &[full_rect(256, 1)],
+                None,
+                Repeat::None,
+                Repeat::None,
+                None,
+                None,
+                false,
+                0,
+                0,
+                0,
+            )
+            .expect("render_composite gradient");
+        assert_eq!(stats.recorded_draws, 1);
+        {
+            let open = engine
+                .inner
+                .as_ref()
+                .expect("inner")
+                .frame_builder
+                .open
+                .as_ref()
+                .expect("open");
+            assert_eq!(open.gradient_inits.len(), 1);
+            assert_eq!(open.ops.len(), 1, "composite shares the upload's frame");
+        }
+        engine.picture_paint_remove(xid);
+        let out = engine
+            .get_image(
+                &mut store,
+                &mut platform,
+                Src::server_internal(dst),
+                vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: 256,
+                        height: 1,
+                    },
+                },
+                32,
+            )
+            .expect("get_image");
+        let px = |x: usize| [out[x * 4], out[x * 4 + 1], out[x * 4 + 2]];
+        assert!(px(0).iter().all(|&c| c <= 4), "x=0 BGR={:?}", px(0));
+        assert!(
+            px(255).iter().all(|&c| c >= 0xF0),
+            "x=255 BGR={:?}",
+            px(255)
+        );
+        assert!(
+            px(128).iter().all(|&c| (0x40..=0xC0).contains(&c)),
+            "x=128 BGR={:?}",
+            px(128)
+        );
+        engine.drain_all(&mut platform);
+        assert!(
+            weak.upgrade().is_none(),
+            "gradient resources leaked past frame retirement"
+        );
+    }
+
+    /// #214: a gradient whose upload frame was already submitted is
+    /// sampled correctly by a LATER frame (same-queue order + the
+    /// upload's closing barrier), and many creates stay correct.
+    #[test]
+    #[ignore = "needs live Vulkan ICD"]
+    fn gradient_sampled_in_a_later_frame_sees_the_upload() {
+        let Some(mut platform) = live_platform() else {
+            eprintln!("no Vk — skipping");
+            return;
+        };
+        let mut store = DrawableStore::new();
+        let mut engine = RenderEngine::new(&platform).expect("engine");
+        let dst = alloc_filled_pixmap(
+            &mut platform,
+            &mut store,
+            &mut engine,
+            0x1,
+            256,
+            1,
+            [1.0, 0.0, 0.0, 1.0],
+        );
+        // A burst of creates in one frame (a GTK repaint), then use one.
+        for i in 0..32_u32 {
+            engine
+                .build_and_insert_linear_gradient(
+                    &mut platform,
+                    0x0214_0100 + i,
+                    (0, 0),
+                    (256_i32 << 16, 0),
+                    &bw_ramp_stops(),
+                )
+                .expect("build gradient");
+        }
+        close_for_tests(&mut engine, &mut store, &mut platform);
+        composite_and_check_bw_ramp(
+            &mut engine,
+            &mut store,
+            &mut platform,
+            dst,
+            0x0214_0100 + 17,
+        );
+        for i in 0..32_u32 {
+            engine.picture_paint_remove(0x0214_0100 + i);
+        }
+        assert_eq!(engine.picture_paint_len(), 0);
         engine.drain_all(&mut platform);
     }
 
