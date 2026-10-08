@@ -132,4 +132,4 @@ jobs:
         if: matrix.name == 'xdmcp'
         env:
           YSERVER_ALLOW_SOFTWARE_VULKAN: "1"
-        run: cargo test -p yserver --locked --features xdmcp -- --ignored
+        run: cargo test -p yserver --locked --features xdmcp --no-fail-fast -- --ignored

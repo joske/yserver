@@ -29,6 +29,16 @@ fn dri3_import_loop_does_not_leak_fds() {
 
     let vk = VkContext::new().expect("VkContext init failed — install lavapipe or run under vng");
 
+    // Some lavapipe builds (e.g. GitHub's Ubuntu runner) advertise dma-buf
+    // export but cannot back it; skip there instead of failing.
+    match create_dmabuf_export(&vk, 64, 64) {
+        Ok(probe) => drop(probe),
+        Err(e) => {
+            eprintln!("skipping: this Vulkan ICD cannot export dma-bufs ({e})");
+            return;
+        }
+    }
+
     let baseline = fd_count();
     let iterations = 10_000usize;
     let mut peak = baseline;
