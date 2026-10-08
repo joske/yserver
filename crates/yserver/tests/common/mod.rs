@@ -10,6 +10,32 @@
 use std::os::fd::OwnedFd;
 use yserver::kms::vk::device::VkContext;
 
+/// True (after an `eprintln!("skipping: ...")`) when this Vulkan ICD cannot
+/// back a dma-buf export. Some lavapipe builds (GitHub's Ubuntu runner)
+/// advertise the extensions but fail the exportable allocation.
+pub fn skip_without_dmabuf_export(vk: &std::sync::Arc<VkContext>) -> bool {
+    use yserver::kms::vk::{dri3::export_backing, target};
+    let probe = target::allocate_exportable(vk, 16, 16, target::EXPORT_FORMAT_BGRA8)
+        .and_then(|img| export_backing(vk, &img).map(drop));
+    match probe {
+        Ok(()) => false,
+        Err(e) => {
+            eprintln!("skipping: this Vulkan ICD cannot export dma-bufs ({e:?})");
+            true
+        }
+    }
+}
+
+/// True (after an `eprintln!("skipping: ...")`) when the device lacks
+/// `VK_KHR_external_semaphore_fd`, so no `SYNC_FD` import/export exists.
+pub fn skip_without_sync_fd(vk: &VkContext) -> bool {
+    if vk.supports_sync_fd() {
+        return false;
+    }
+    eprintln!("skipping: this Vulkan device lacks VK_KHR_external_semaphore_fd");
+    true
+}
+
 /// Create an already-signaled `sync_file` fd by exporting a Vulkan binary
 /// semaphore that was signaled via a signal-only `vkQueueSubmit2`.
 ///

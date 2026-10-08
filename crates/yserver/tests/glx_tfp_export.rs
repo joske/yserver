@@ -22,6 +22,9 @@ use yserver_core::backend::Backend;
 #[ignore = "requires a Vulkan device"]
 fn allocate_exportable_yields_valid_dmabuf_fd() {
     let vk = VkContext::new().expect("VkContext init failed — install lavapipe or run on HW");
+    if common::skip_without_dmabuf_export(&vk) {
+        return;
+    }
 
     let img = yserver::kms::vk::target::allocate_exportable(
         &vk,
@@ -114,8 +117,9 @@ impl PromoteHarness {
     }
 }
 
-/// Build the harness, or `None` if no Vulkan device is present.
-fn test_engine_harness() -> Option<PromoteHarness> {
+/// A Vulkan-backed `KmsBackend`, or `None` (with a skip message) when no
+/// Vulkan device is present or it cannot export dma-bufs.
+fn export_capable_backend() -> Option<KmsBackend> {
     let backend = match KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
@@ -123,6 +127,16 @@ fn test_engine_harness() -> Option<PromoteHarness> {
             return None;
         }
     };
+    let vk = backend.test_vk_arc().expect("vk arc present");
+    if common::skip_without_dmabuf_export(&vk) {
+        return None;
+    }
+    Some(backend)
+}
+
+/// Build the harness, or `None` if no Vulkan device is present.
+fn test_engine_harness() -> Option<PromoteHarness> {
+    let backend = export_capable_backend()?;
     let vk = backend.test_vk_arc().expect("vk arc present");
     Some(PromoteHarness { backend, vk })
 }
@@ -414,6 +428,9 @@ fn export_sync_file_write_scope_is_idle_on_fresh_buffer() {
     use std::os::fd::{AsFd, AsRawFd};
     use yserver::kms::vk::dri3::ExportedSyncFile;
     let vk = VkContext::new().expect("VkContext init failed — install lavapipe or run on HW");
+    if common::skip_without_dmabuf_export(&vk) {
+        return;
+    }
     let img = yserver::kms::vk::target::allocate_exportable(
         &vk,
         16,
@@ -461,12 +478,8 @@ fn dri3_export_promotes_server_owned_pixmap() {
     use std::os::fd::AsRawFd;
     use yserver_core::backend::Backend;
 
-    let mut backend = match KmsBackend::for_tests_with_vk() {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("skipping: no Vk: {e}");
-            return;
-        }
+    let Some(mut backend) = export_capable_backend() else {
+        return;
     };
 
     // allocate_test_pixmap_bgra creates a plain server-owned pixmap
@@ -515,6 +528,9 @@ fn import_sync_file_accepts_a_signaled_fence() {
     use std::os::fd::AsFd;
 
     let vk = VkContext::new().expect("VkContext init failed — install lavapipe or run on HW");
+    if common::skip_without_dmabuf_export(&vk) || common::skip_without_sync_fd(&vk) {
+        return;
+    }
 
     let img = yserver::kms::vk::target::allocate_exportable(
         &vk,
@@ -552,12 +568,8 @@ fn import_sync_file_accepts_a_signaled_fence() {
 fn exported_backing_retained_until_glx_ref_released_then_torn_down() {
     use std::os::fd::AsFd;
 
-    let mut backend = match KmsBackend::for_tests_with_vk() {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("skipping: no Vk: {e}");
-            return;
-        }
+    let Some(mut backend) = export_capable_backend() else {
+        return;
     };
     let vk = backend.test_vk_arc().expect("vk arc present");
 
@@ -616,12 +628,8 @@ fn exported_backing_retained_until_glx_ref_released_then_torn_down() {
 #[test]
 #[ignore = "requires a Vulkan device"]
 fn export_only_entry_is_cleaned_up_at_free_pixmap() {
-    let mut backend = match KmsBackend::for_tests_with_vk() {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("skipping: no Vk: {e}");
-            return;
-        }
+    let Some(mut backend) = export_capable_backend() else {
+        return;
     };
 
     let host_xid = backend
@@ -654,12 +662,8 @@ fn export_only_entry_is_cleaned_up_at_free_pixmap() {
 fn exported_drawable_write_then_flush_runs_sync_publish() {
     use yserver_core::backend::Backend;
 
-    let mut backend = match KmsBackend::for_tests_with_vk() {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("skipping: no Vk: {e}");
-            return;
-        }
+    let Some(mut backend) = export_capable_backend() else {
+        return;
     };
 
     let host_xid = backend
