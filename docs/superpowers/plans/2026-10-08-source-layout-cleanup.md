@@ -1,439 +1,437 @@
 # Source layout cleanup: split the oversized files, then the crates
 
 **Branch:** `plan/source-layout-cleanup` (plan only). Execution branches are per
-phase, listed below.
+phase. **Revised 2026-10-08** after codex review: render dependency inventory
+redone from code, store boundary, test-identity mapping, move verification,
+branch porting, FreeBSD gates. Open questions are now decisions (end of file).
+
 **Goal, in priority order:**
-1. Maintainability: no hand-edited source file over ~5k lines.
+1. Maintainability: no hand-edited source file over the size ceilings.
 2. Compile parallelism: a shorter crate critical path on slow laptops.
 3. A crate seam that lets a future nested backend for macOS/Windows reuse the
    Vulkan renderer.
 
-**Start condition:** jos settles the open branches first (see "Branches"). No
-logic changes are allowed in any move commit.
+**Phase order:** 1 test extraction → 2 production modules → 3 render crate
+(separately reviewed, only after 1–2 and the inventory below is re-checked) →
+4 deferred. No logic changes in any move commit.
 
 ## Measured baseline (master `4db91343`, 2026-10-08)
 
-Taken on silence (i9-13900K). sccache was bypassed with a passthrough
-`RUSTC_WRAPPER` and `CARGO_INCREMENTAL=0`. Only the three workspace crates were
-rebuilt; dependencies were warm. The "4 cpu" runs use `taskset -c 0-3`, which
-only gives a lower bound for fuji (i5-7200U, 2c/4t, roughly 2–2.5× slower per
-core). Format is start+duration in seconds, from `cargo build --timings`.
+silence (i9-13900K), sccache bypassed, `CARGO_INCREMENTAL=0`, only the three
+workspace crates rebuilt. "4 cpu" = `taskset -c 0-3`, a lower bound for fuji
+(i5-7200U). start+duration in s, from `cargo build --timings`.
 
-| profile | cpus | total | protocol | core | yserver | core lib(test) | yserver lib(test) |
-|---|---|---|---|---|---|---|---|
-| release | 32 | 18.9 | 0.0+1.0 | 0.5+11.1 | 3.6+15.0 | – | – |
-| release | 4 | 35.0 | 0.0+1.7 | 0.5+20.1 | 4.0+30.8 | – | – |
-| dev | 32 | 8.4 | – | 0.4+3.5 | 2.7+5.4 | – | – |
-| dev | 4 | 9.5 | 0.0+0.6 | 0.4+4.5 | 2.8+6.5 | – | – |
-| test --no-run | 32 | 14.6 | – | 0.5+3.7 | 2.9+5.9 | 0.6+8.6 | 4.2+10.4 |
-| test --no-run | 4 | 20.5 | 0.0+0.7 | 0.4+6.1 | 3.5+10.2 | 0.7+15.1 | 6.5+13.9 |
+| profile | cpus | total | core | yserver | core lib(test) | yserver lib(test) |
+|---|---|---|---|---|---|---|
+| release | 32 | 18.9 | 0.5+11.1 | 3.6+15.0 | – | – |
+| release | 4 | 35.0 | 0.5+20.1 | 4.0+30.8 | – | – |
+| dev | 4 | 9.5 | 0.4+4.5 | 2.8+6.5 | – | – |
+| test --no-run | 4 | 20.5 | 0.4+6.1 | 3.5+10.2 | 0.7+15.1 | 6.5+13.9 |
 
-A clean full release build including dependencies took 28.9 s at 32 cpus.
-
-**What the numbers say:**
-- **The critical path is the `yserver` crate, not `yserver-core`.** Cargo
-  pipelines on metadata, so `yserver` starts about 3–4 s in while core is still
-  in codegen. Core adds only its metadata time (about 3 s) to the path.
-  `yserver` itself takes 15 s release at 32 cpus and 31 s at 4 cpus, and that is
-  the long single-crate tail jos sees.
-- **Splitting `yserver-core` buys almost nothing.** Splitting `yserver` into a
-  part that does not depend on core plus a thinner top crate is the only cut
-  that shortens the path.
-- **Inline tests dominate test builds.** core lib(test) takes 15 s on 4 cpus;
-  `process_request.rs` alone is 54k lines of tests.
-- **File splits do not change compile time.** The crate is the compilation
-  unit, so phases 1–2 are pure maintainability work. Only phase 3 can move the
-  numbers.
+- The critical path is the `yserver` crate: it starts ~3–4 s in (pipelined on
+  core's metadata) and then runs 15 s (32 cpus) / 31 s (4 cpus) alone.
+- Splitting `yserver-core` buys almost nothing; file splits change nothing
+  (the crate is the unit). Only phase 3 can move the numbers.
+- Inline tests dominate test builds (`process_request.rs` has 54k test lines).
 
 ## Inventory (from code, 2026-10-08)
 
-Test/code ratios: `yserver` is 76k test of 195k lines, `yserver-core` 99k of
-175k, `yserver-protocol` 11k of 28k.
-
 | file | code | inline tests | structure |
 |---|---|---|---|
-| core `core_loop/process_request.rs` | 35.8k | 54.4k (816 tests) | **free fns** `(state: &mut ServerState, backend: &mut dyn Backend, ..)`; one `match header.opcode` (297–~500) → `handle_*` / `handle_<ext>_request` |
-| yserver `kms/render/backend.rs` | 31.6k | 37.4k (565 tests) | `KmsBackend` struct (1401–1873); inherent impl 16.2k; **`impl Backend for KmsBackend` 10.3k (230 of 247 trait methods)** |
-| `kms/render/engine.rs` | 12.9k | 6.4k | `impl RenderEngine` 7.1k, recording `emit_*` free fns 4k |
-| `kms/render/scene.rs` | 9.6k | 7.6k | `SceneCompositor`, walk free fns, `tick_one_output` (1,052-line single fn), `ComposeRenderTarget` |
-| `tests/render_acceptance.rs` | – | 16.9k (186 tests, all `#[ignore]`, lavapipe) | topic blocks, helpers kept next to their tests, no shared harness |
-| `core_loop/pointer_fanout.rs` | 4.4k | 6.0k | free fns; `pointer_event_fanout_to_state_inner` is a 2,009-line single fn |
-| `core_loop/run.rs` | 4.8k | 4.7k | `run_core_with_inventory` (~990 lines), telemetry, queues, XI config lane |
-| `kms/render/platform.rs` | 7.0k | 2.2k | `PlatformBackend`: DRM device, outputs, libinput, fences, scanout pools, cursor plane |
-| `kms/vk/scanout.rs` | 6.6k | 2.0k | GBM/dma-buf scanout BOs, copied PRIME pool, probes; fully Linux |
-| protocol `x11/mod.rs` | 4.9k | 2.8k | flat `pub fn` encoders and parsers, no impls |
-| core `server.rs` | 4.4k | 3.1k | ~25 state types, `ServerState` with 2 impl blocks, fanout fns |
-| core `resources.rs` | 3.9k | 3.2k | `impl ResourceTable` 2.9k contiguous, plus types |
+| core `core_loop/process_request.rs` | 35.8k | 54.4k (816 tests) | free `handle_*` fns behind one `match header.opcode` |
+| `kms/render/backend.rs` | 31.6k | 37.4k (565) | `KmsBackend`; inherent impl 16.2k; `impl Backend` 10.3k (230 of 247 methods) |
+| `kms/render/engine.rs` | 12.9k | 6.4k | `impl RenderEngine` 7.1k, recording `emit_*` 4k |
+| `kms/render/scene.rs` | 9.6k | 7.6k | `SceneCompositor`, walk, `tick_one_output` (1,052-line fn), `ComposeRenderTarget` |
+| `tests/render_acceptance.rs` | – | 16.9k (186, all `#[ignore]`) | topic blocks, helpers next to their tests |
+| `core_loop/pointer_fanout.rs` | 4.4k | 6.0k | `pointer_event_fanout_to_state_inner` is 2,009 lines |
+| `core_loop/run.rs` | 4.8k | 4.7k | `run_core_with_inventory` ~990 lines |
+| `kms/render/platform.rs` | 7.0k | 2.2k | `PlatformBackend` (platform.rs:2219): DRM, outputs, fences, pools, scanout, cursor plane |
+| `kms/vk/scanout.rs` | 6.6k | 2.0k | GBM/dma-buf scanout BOs, copied PRIME pool, probes |
+| protocol `x11/mod.rs`, core `server.rs`, core `resources.rs` | 4.9k / 4.4k / 3.9k | 2.8k / 3.1k / 3.2k | flat encoders; ~25 state types; `impl ResourceTable` |
 
-**Core is `dyn Backend` everywhere.** There are 225 `dyn Backend` uses and no
-`<B: Backend>`, so nothing in core is monomorphised into `yserver`. The generic
-fns in `kms` are few and stay crate-internal (`assemble_root_scanout<F>`, the
-probe helpers). A split does not risk a compile-time regression from generics.
+Core is `dyn Backend` everywhere (225 uses, no `<B: Backend>`), so no split
+risks monomorphisation cost moving across crates.
 
-**Pure-move blockers** (single bodies that only shrink if they are edited):
-
-| fn | lines |
-|---|---|
-| `handle_xi2_request` | 5,140 |
-| `handle_randr_request` | 2,277 |
-| `pointer_event_fanout_to_state_inner` | 2,009 |
-| `tick_one_output` | 1,052 |
-| `run_core_with_inventory` | ~990 |
-
-These move whole in phase 2. Phase 2c is optional.
+**Bodies that only shrink if edited:** `handle_xi2_request` 5,140,
+`handle_randr_request` 2,277, `pointer_event_fanout_to_state_inner` 2,009,
+`tick_one_output` 1,052, `run_core_with_inventory` ~990. They move whole in
+phase 2; XI2/RANDR are split later (phase 2c, decided).
 
 ## Rules for every commit
 
-**1. One file, one kind of change.** Each commit is exactly one of the
-following, and the subject line says which:
-- **move:** cut/paste of whole items, keeping their order within each new file.
-- **visibility:** only `pub(super)` / `pub(in path)` additions and `use` lines.
-- **delegate:** trait method bodies → `self.<subsystem>_<name>(..)`.
-- **seam:** a real but tiny logic change, needing a HW smoke.
+**1. One file, one kind of change.** Subject says which: **move** (whole items
+only — fn, impl, struct/enum, mod, const, macro, with attributes and doc
+comments), **visibility** (`pub(super)`/`pub(in path)` and `use` lines only),
+**delegate** (trait body → `self.<subsystem>_<name>(..)`), or **seam** (a real
+small logic change, own review, HW smoke).
 
-**2. No new `pub` or `pub(crate)` in phases 1–2.** Rust lets child modules see
-their ancestors' private items. So `foo.rs` becomes `foo/mod.rs` with children,
-and children need no visibility change to reach mod.rs privates. Only calls
-between sibling children, and from mod.rs into a child, need `pub(super)`. mod.rs
-re-exports each child with a private `use child::*;`, so existing `use super::*`
-test modules and outside `crate::…::fn` paths compile unchanged. Check with
-`git diff -U0 | grep -E '^\+.*pub(\(crate\))? (fn|struct|enum|mod)'`, which
-must be empty.
+**2. No new `pub` or `pub(crate)` in phases 1–2.** `foo.rs` becomes
+`foo/mod.rs` + children; children see ancestors' privates. Only sibling→sibling
+and mod.rs→child calls need `pub(super)`. mod.rs does `use child::*;` so
+existing paths and `use super::*` test modules compile unchanged. Check:
+`git diff -U0 | grep -E '^\+.*pub(\(crate\))? (fn|struct|enum|mod)'` is empty.
 
-**3. Mechanical move proof.** Add `tools/split/verify-move.sh <rev>`. For the
-commit, it takes the multiset of removed lines minus the multiset of added
-lines, and the reverse. It ignores blank lines, `use`/`mod` lines and
-`pub(super)` tokens, and must print nothing. Reviewers use
-`git show --color-moved=dimmed-zebra --color-moved-ws=allow-indentation-change`
-(and `--no-ext-diff`, because difftastic is the configured differ).
+**3. Move verification (item level, not line level).** A line multiset diff is
+kept only as a cheap smoke check: it cannot see reordered statements inside a
+body or a line that ended up in the wrong fn. The proof is item-based:
+- `tools/split/` is a small Rust tool using `syn` (`span-locations`). It parses
+  the source file, extracts each item by span (attributes + doc comments
+  included), and writes items to target files per the manifest. It never edits
+  item text; the only text it emits itself is `mod`/`use` lines and
+  `pub(super)` insertions listed in the manifest.
+- `split verify <rev>` parses every `.rs` the commit touches, before and after.
+  Each item gets a key (`kind`, `name`, enclosing impl self-type and trait,
+  `cfg` attrs) and a hash of its token stream with visibility tokens removed.
+  The keyed multisets must be equal: no item lost, duplicated, or changed.
+  Items inside split `impl` blocks are keyed per member fn.
+- Delegate commits (2.11b) use `split verify --delegate`: every changed trait
+  method must be one forwarding call with the same arguments in the same order,
+  and the moved body must hash-equal the old trait body.
+- Then the gate (rule 5).
 
-**4. Gate per commit:**
-- `cargo +nightly fmt --check`
-- `cargo clippy --all-targets -- -D warnings`
-- `cargo test --workspace`
-- lavapipe `cargo test -p yserver --features xdmcp -- --ignored`
-- `cargo build` in the three feature configs (none, `tcp-transport`, `xdmcp`)
+**Residual risk** (stated, not hidden): name resolution can change without a
+token change — a glob import (`use child::*`) is shadowed by a same-named
+local item, or a `macro_rules!` is now textually after its use. Ambiguities and
+missing items are compile errors; silent shadowing is not. `split verify`
+therefore also lists every name defined in more than one module of the moved
+tree, and reviewers check that list. `include_*!`/`#[path]` relative paths
+break loudly (compile error).
 
-Plus a **test-count invariant**: `cargo test --workspace -- --list` (and the
-`--ignored` list) must be identical before and after, sorted. A lost
-`#[cfg(test)]` or `mod` line otherwise looks green.
+**4. Test identity: an explicit old→new name mapping.** Test names change when
+`mod tests` gains topic submodules (`…::tests::foo` → `…::tests::xi2::foo`), so
+"identical lists" is the wrong check. Per commit and per feature configuration
+(**default** = Unix-socket transport only, **`tcp-transport`**, **`xdmcp`**):
+1. Before: `cargo test --workspace <features> -- --list` and
+   `-- --ignored --list`, normalised to `binary::path::name`.
+2. The split manifest yields a deterministic rename map (old module path → new
+   module path per test fn). `split verify --tests` applies it to the "before"
+   lists.
+3. The mapped before-lists must equal the after-lists exactly: same count per
+   binary, same names, and each test's ignored status unchanged.
 
-**5. Blame.** Every move commit's SHA is appended to `.git-blame-ignore-revs` in
-a follow-up commit; GitHub honours that file. Locally, run
-`git config blame.ignoreRevsFile .git-blame-ignore-revs`. Moves across files
-still need `git blame -C -C`, so one line saying so goes into the file header.
+Integration tests (`render_acceptance` → modules) follow the same mapping.
 
-**6. Scripted, re-runnable splits.** Each split is generated by
-`tools/split/split.py <manifest>`. A manifest is a TOML list of
-`item-name → target file` per source file, and items are found by top-level
-`fn`/`impl`/`struct` start lines with their attributes and doc comments
-attached. The move commit is the script's output plus `cargo +nightly fmt`.
+**5. Gate per commit:** `cargo +nightly fmt --check`;
+`cargo clippy --all-targets -- -D warnings` in all three feature configs;
+`cargo test --workspace` (default and `--features xdmcp`); lavapipe
+`cargo test -p yserver --features xdmcp -- --ignored`; rules 3 and 4.
 
-Two reasons for this:
-- Review becomes "read the manifest", not a 30k-line diff.
-- An open branch can port itself across the split by running the same
-  manifest on its own tip (see "Branches").
+**6. Blame.** Move SHAs go into `.git-blame-ignore-revs` in a follow-up commit;
+cross-file moves still need `git blame -C -C` (one line in the file header).
 
-The tools stay until the last open branch has crossed, then are deleted.
+**7. Scripted, deterministic splits.** Manifest = TOML `item key → target file`
+per source file. Unassigned items make the tool fail with the list, never
+default somewhere. Review reads the manifest; the commit is tool output plus
+`cargo +nightly fmt`. Tools stay until the last open branch has crossed.
 
-## Phase 1: extract inline tests (about 125k lines, zero visibility change)
+## Phase 1: extract inline tests (~125k lines, zero visibility change)
 
-This is the cheapest and largest win. 50–60% of every giant file is
-`#[cfg(test)] mod tests { use super::*; … }`. It runs in two commits per file:
+Two commits per file:
+- **1a (move):** `mod tests { … }` → `#[cfg(test)] mod tests;` + `foo/tests/mod.rs`
+  (or `#[path]` to `foo_tests/` while `foo.rs` is still one file). Body
+  byte-identical; test names unchanged (rule 4 map is the identity).
+- **1b (move):** `tests/mod.rs` keeps fixtures and `mod <topic>;`; each topic
+  file starts `use super::*;`. Names gain the topic segment (rule 4 map).
 
-**1a (move).** `mod tests { … }` becomes `#[cfg(test)] mod tests;` plus
-`foo/tests/mod.rs` (or `foo_tests/` next to it while `foo.rs` is still a single
-file, via `#[path]`). The body is byte-identical, and `use super::*` still sees
-everything.
-
-**1b (move).** Split `tests/mod.rs` into topical files:
-- `tests/mod.rs` keeps the fixtures and declares `mod <topic>;`.
-- Each topic file starts with `use super::*;`, and through the glob re-export it
-  sees both the fixtures and the parent's items.
-
-Targets (test lines, file sizes ≤ ~6k):
-
-| file | tests/ topics |
+| file | tests/ topics (≤ ~6k each) |
 |---|---|
-| process_request (54.4k) | `xi2_config`, `xi2_dynamic`, `xi2_grabs_allow`, `xi1` (≈20k across 4), `randr` 6k, `present` 8k (split `present_supersede`), `composite_redirect` 5k, `sync` 3k, `window` 4k, `copy_area` 3k, `glx`, `saver_dpms`, `shm_cow`, `misc` |
-| backend.rs (37.4k) | `fixtures` (31654–37164, 5.5k), `xi_input` (~14k, split into `xi_source`/`xi_dynamic`/`keyboard`), `randr_provider_gamma` 4k, `render_composite_clip` 6k, `present_scanout_direct` 8k, `dri3_resolve_paint` 5k; `crtc_transform_tests.rs` is already separate |
-| engine (6.4k) | the existing nested mods: `clamp_copy`, `uniform_glyph_source`, `premul_from_wire`, `coalescing`, `session` |
-| scene (7.6k) | `walk`, `damage_audit`, `cursor`, `compose`, plus `test_helpers.rs` (the existing 9360–9631 cfg(test) helpers) |
-| pointer_fanout 6k, run 4.7k (+ `server_reset` 0.7k), server 3.1k, resources 3.2k, platform 2.2k, vk/scanout 2.0k, x11/mod 2.8k | 2–4 files each |
+| process_request (54.4k) | `xi2_config`, `xi2_dynamic`, `xi2_grabs_allow`, `xi1`, `randr`, `present`, `present_supersede`, `composite_redirect`, `sync`, `window`, `copy_area`, `glx`, `saver_dpms`, `shm_cow`, `misc` — by test-name prefix, not line range |
+| backend.rs (37.4k) | `fixtures`, `xi_source`, `xi_dynamic`, `keyboard`, `randr_provider_gamma`, `render_composite_clip`, `present_scanout_direct`, `dri3_resolve_paint` |
+| engine (6.4k) / scene (7.6k) | engine's existing nested mods; scene `walk`, `damage_audit`, `cursor`, `compose`, `test_helpers` |
+| pointer_fanout, run, server, resources, platform, vk/scanout, x11/mod | 2–4 files each |
 
-The process_request tests are interleaved by topic, so 1b is driven by test name
-prefix, not line range. The manifest lists names.
+`render_acceptance.rs` becomes `tests/render_acceptance/{main.rs, common.rs, <14
+topic files>}`: **one binary with modules**, not 14 binaries (each binary links
+all of `yserver` with debuginfo). CI's lavapipe step needs no change.
 
-**render_acceptance.rs (16.9k)** becomes
-`tests/render_acceptance/{main.rs, common.rs, put_copy.rs, glyphs.rs, copy_plane_fill_traps.rs, redirect_backing.rs, depth_pool.rs, present_submit.rs, frame_builder.rs, view_cache_depth1.rs, masked_copy.rs, cursor_border.rs, xts_wz_windows.rs, compositor_exports.rs, trap_stress.rs}`,
-following the topic map at lines 39–16916.
+## Phase 2: split production code (moves)
 
-It stays **one test binary with modules, not 14 binaries.** Every integration
-binary links all of `yserver` plus its dependencies with debuginfo. The
-`render_acceptance` unit alone costs about 1 s per test build today, and 14
-binaries would multiply that on every `cargo test`. The CI lavapipe step (`cargo test -p yserver -- --ignored`)
-needs no change.
-
-## Phase 2: split production code (moves), conflict-light files first
-
-The order runs from least- to most-touched by open branches, so the
-contentious files go last, after their branches land.
+Least-contended files first; a file moves only once the work touching it has
+settled (see "Branches").
 
 | step | file → dir | target modules (≈ code lines) |
 |---|---|---|
-| 2.1 | protocol `x11/mod.rs` | `types` 0.55k, `setup` 0.35k, `request_parsers` 1.0k, `events_core` 0.6k, `events_input` 0.5k, `replies_core` 1.2k, `xi` 0.9k, `xkb_events` 0.9k, `render` 0.5k; `mod.rs` ≈ 0.3k of `pub use` (no downstream path change) |
-| 2.2 | core `resources.rs` | `mod.rs` 0.5k (table, ctors), `types` 0.7k, `window` 1.3k, `tree` 0.5k, `gc` 0.6k, `pixmap_props` 0.35k, `picture_font_cursor` 0.45k, `cleanup` 0.25k: `impl ResourceTable` spread over the files |
-| 2.3 | core `server.rs` | `mod.rs` 0.7k (`ServerState`, `new`), `types_grabs` 0.7k, `types_ext` 0.9k, `xi_registry` 0.4k, `idle` 0.25k, `hit_test` 0.65k, `fanout` 0.75k |
-| 2.4 | `core_loop/run.rs` | `mod.rs` 1.1k (`run_core*`), `telemetry` 0.45k, `queues` 0.6k, `xi_config` 0.65k, `requests` 0.35k, `present_tail` 0.4k, `randr_notify` 0.7k, `accept` 0.45k, `repeat` 0.2k |
-| 2.5 | `core_loop/pointer_fanout.rs` | `mod.rs` 0.7k, `fanout_inner` 2.1k (the 2k fn), `xi1` 0.65k, `grabs` 0.65k, `xi2_targets` 0.7k |
-| 2.6 | `core_loop/process_request.rs` → `core_loop/request/` (keep `process_request` as the re-exported entry) | see tree below |
-| 2.7 | `kms/vk/scanout.rs` | `bo` 1.4k, `bo_pool` 0.5k, `copied` 2.0k, `dmabuf_metadata` 0.5k, `probe` 1.5k, `probe_verify` 0.4k, `alloc_plan` 1.3k, `image_alloc` 0.75k |
-| 2.8 | `kms/render/platform.rs` | `fence` 0.75k, `cursor_plane` 1.8k, `qualify` 1.5k, `device` 1.3k, `init` 0.9k, `scanout` 1.2k, `connectors` 1.4k, `submit` 0.7k, `page_flip` 0.6k |
-| 2.9 | `kms/render/scene.rs` | `mod.rs` 1.4k, `cursor` 0.95k, `damage_audit` 2.0k, `tick_output` 1.8k, `walk` 2.6k, `fan_out` 0.2k, `targets` 1.1k (`ComposeRenderTarget` + impls), `root_readback` 0.35k |
-| 2.10 | `kms/render/engine.rs` | `mod.rs` 1.3k, `types` 0.8k, `staging` 0.5k, `frame` 1.3k, `clip_snapshot` 0.6k, `gradient_assets` 0.7k, `fill_copy` 1.5k, `put_get` 0.9k, `text` 0.5k, `glyphs` 1.4k, `composite` 1.2k, `traps` 0.5k, `batch` 0.6k, `rollback` 0.6k, `record/{copy,render,traps,text,fill}` ≈3k |
-| 2.11 | `kms/render/backend.rs` | along the portable/KMS seam, tree below |
+| 2.1 | protocol `x11/mod.rs` | `types`, `setup`, `request_parsers` 1.0k, `events_core`, `events_input`, `replies_core` 1.2k, `xi`, `xkb_events`, `render`; mod.rs `pub use` |
+| 2.2 | core `resources.rs` | `types`, `window` 1.3k, `tree`, `gc`, `pixmap_props`, `picture_font_cursor`, `cleanup` (`impl ResourceTable` spread) |
+| 2.3 | core `server.rs` | `types_grabs`, `types_ext`, `xi_registry`, `idle`, `hit_test`, `fanout` |
+| 2.4 | `core_loop/run.rs` | `telemetry`, `queues`, `xi_config`, `requests`, `present_tail`, `randr_notify`, `accept`, `repeat` |
+| 2.5 | `core_loop/pointer_fanout.rs` | `fanout_inner` (the 2k fn), `xi1`, `grabs`, `xi2_targets` |
+| 2.6 | `process_request.rs` → `core_loop/request/` | tree below |
+| 2.7 | `kms/vk/scanout.rs` | `bo`, `bo_pool`, `copied` 2.0k, `dmabuf_metadata`, `probe` 1.5k, `alloc_plan` 1.3k, `image_alloc` |
+| 2.8 | `kms/render/platform.rs` | `fence`, `cursor_plane` 1.8k, `qualify` 1.5k, `device`, `init`, `scanout`, `connectors`, `submit`, `page_flip` |
+| 2.9 | `kms/render/scene.rs` | `cursor`, `damage_audit` 2.0k, `tick_output` 1.8k, `walk` 2.6k, `fan_out`, `targets`, `root_readback` |
+| 2.10 | `kms/render/engine.rs` | `types`, `staging`, `frame`, `clip_snapshot`, `gradient_assets`, `fill_copy`, `put_get`, `text`, `glyphs`, `composite`, `traps`, `batch`, `rollback`, `record/*` |
+| 2.11 | `kms/render/backend.rs` | tree below |
 
-**2.6 `core_loop/request/`:**
-- `mod.rs` 0.7k: consts, `RequestOutcome`, `process_request` + the opcode match.
-- Core requests:
-  - `common` 0.7k: `emit_x11_error*`, `drawable_lookup`, the `validate_*` fns, `write_to_client`.
-  - `window` 1.6k, `redirect` 1.6k, `property` 1.0k, `selection` 0.55k.
-  - `drawing` 2.4k, `gc_pixmap_font` 1.2k, `input_focus_grab` 2.3k, `core_misc` 2.4k.
-- Extensions:
-  - `render` 0.95k, `randr` 2.7k, `sync` 1.0k (+ xinerama 0.15k), `present` 2.95k, `dri3` 0.8k, `glx` 1.5k (two chunks today).
-  - `xfixes` 1.3k, `shape` 0.4k, `composite` 0.45k, `damage` 0.25k, `shm` 0.8k, `xtest` 0.6k, `xres` 0.25k, `xcmisc` 0.13k, `vidmode` 0.5k.
-  - `dpms_saver` 1.0k, `xkb` 0.4k (+ keymap fns 0.25k), `xinput/{xi1 0.7k, xi2 5.3k, property 0.8k}`.
-- Visibility: about 40 handlers are `pub(crate)` today and called from `run.rs`/`pointer_fanout`. They stay `pub(crate)` and are re-exported from `mod.rs`.
-- The cross-group helpers (`emit_x11_error`, `write_to_client`, `emit_property_change`, …) become `pub(super)` in `common`.
-- Interleaved regions get reordered in the move: DPMS/saver, XI1/XI2 AllowEvents, the two GLX chunks, XTEST/cursor.
+Split by responsibility; the line figures are ceilings to respect, not targets.
 
-**2.11 `kms/render/backend/`.** Structure the split by the seam, so the crate
-work in phase 4 is a directory move:
+**2.6 `core_loop/request/`:** `mod.rs` (consts, `RequestOutcome`,
+`process_request` + opcode match); `common` (`emit_x11_error*`, lookups,
+`validate_*`, `write_to_client`, `pub(super)`); core `window`, `redirect`,
+`property`, `selection`, `drawing`, `gc_pixmap_font`, `input_focus_grab`,
+`core_misc`; extensions `render`, `randr`, `sync`, `present`, `dri3`, `glx`,
+`xfixes`, `shape`, `composite`, `damage`, `shm`, `xtest`, `xres`, `xcmisc`,
+`vidmode`, `dpms_saver`, `xkb`, `xinput/{xi1, xi2, property}`. The ~40
+handlers that are `pub(crate)` today stay so and are re-exported. Interleaved
+regions (DPMS/saver, XI1/XI2 AllowEvents, two GLX chunks, XTEST/cursor) are
+regrouped by the move.
+
+**2.11 `kms/render/backend/`:**
 ```
 backend/
-  mod.rs            ~0.8k  header types, KmsBackend struct, open()
-  trait_impl.rs     ~1.4k  impl Backend for KmsBackend: 230 3–6-line delegators (step 2.11b)
-  portable/         ~19k   renders X semantics into the GPU crate; no drm/gbm/fd/libc imports
-    windows.rs 2.2k  redirect.rs 0.7k  pixmaps.rs 0.5k  cursors.rs 1.3k (records only)
-    gc_clip.rs 1.7k  draw.rs 2.7k  render_ops.rs 3.5k  get_image.rs 1.5k  fonts_text.rs 0.5k
-    input_logic.rs 1.6k (xkb/keymap/cook_host_key: no thread/libinput types)
-  kms/              ~12k   Linux display + device side
-    scanout.rs 3.0k (direct scanout, unflip, M0/M1/M2, crtc probes)  randr_hw.rs 2.6k
-    present.rs 1.5k  dri3_glx.rs 0.9k  vt.rs 0.7k  input_thread.rs 1.0k  cursor_plane.rs 0.3k
-  for_tests.rs      ~2.9k  the pub *_for_tests helpers (integration tests use them)
-  telemetry.rs      ~0.4k
-  tests/            phase 1
+  mod.rs          header types, KmsBackend struct, open()
+  trait_impl.rs   impl Backend for KmsBackend (10.3k after 2.11a; delegators after 2.11b)
+  portable/       windows, redirect, pixmaps, cursors, gc_clip, draw, render_ops,
+                  get_image, fonts_text, input_logic   (no drm/gbm/fd/libc imports)
+  kms/            scanout, randr_hw, present, dri3_glx, vt, input_thread, cursor_plane
+  for_tests.rs    pub *_for_tests helpers;  telemetry.rs;  tests/ (phase 1)
 ```
-- **2.11a (move):** the inherent impl and the free fns go into the tree. Child
-  modules see the private `KmsBackend` fields, so no field visibility changes.
-- **2.11b (delegate):** each trait method body moves to an inherent
-  `<subsystem>_<name>` method in its group file, and the trait method becomes a
-  one-line call.
-  - **Not a pure move.** `verify-move.sh` gets a delegate mode that checks every
-    trait method body is a single forwarding call with identical arguments.
-  - **Name collisions to rename on the inherent side:** `fb_dimensions`,
-    `randr_outputs_and_modes`, `randr_providers`,
-    `acquire_glx_pixmap_export`/`release_glx_pixmap_export`,
-    `vt_switching_armed`, `promote_pixmap_exportable`, `present_get_ust_msc`.
-  - **Alternative if jos prefers:** keep a single 10.3k `trait_impl.rs` and skip
-    2.11b. It is the one file left over the limit.
-- **Seam check after 2.11, as a CI grep:** `backend/portable/**` contains no
-  `crate::drm`, `gbm`, `OwnedFd|RawFd`, `libc::`, `nix::`, `platform::` or
-  `backend::kms::`. Each violation found during the split is listed and moved,
-  not waived.
+- **2.11a (move):** inherent impl and free fns into the tree. The 10.3k
+  `trait_impl.rs` is accepted temporarily (decision 1).
+- **2.11b (delegate), its own commits grouped by subsystem:** each trait body
+  moves to an inherent `<subsystem>_<name>` in its group file; inherent-side
+  renames for collisions (`fb_dimensions`, `randr_outputs_and_modes`,
+  `randr_providers`, `acquire/release_glx_pixmap_export`,
+  `vt_switching_armed`, `promote_pixmap_exportable`, `present_get_ust_msc`).
+  Verified by `split verify --delegate`.
+- CI grep after 2.11: `backend/portable/**` has no `crate::drm`, `gbm`,
+  `OwnedFd|RawFd`, `libc::`, `nix::`, `platform::`, `backend::kms::`.
 
-**Phase 2c (optional, edits, not moves).** Split the arms of
-`handle_xi2_request` and `handle_randr_request` into `handle_xi2_<minor>` /
-`handle_randr_<minor>` fns. Then `xi2.rs` goes from 5.3k to `xi2/{events,
-devices, grabs, props, focus}.rs`. Each arm moves as its own body, so this is
-checkable but not byte-pure: review it as a refactor, with HW XI smoke on
-eiger. Do it only on jos's go.
+**Phase 2c (decided: yes, later, separate refactor):** split the arms of
+`handle_xi2_request` / `handle_randr_request` into per-minor fns, `xi2/` into
+`{events, devices, grabs, props, focus}`. Reviewed as a refactor (bodies move
+per arm, not byte-pure), HW XI smoke on eiger. Not part of the move series.
 
-## Phase 3: crate split (the only phase that changes build time)
+## Phase 3: `yserver-render` crate (separate review, after phases 1–2)
 
-### Target graph
-```
-                yserver-protocol
-               /        |        \
-     yserver-core   yserver-render   (render: no core, no drm/gbm/udev/libinput)
-               \        |
-                \       |      future: yserver-nested (WSI present + host input)
-                 \      |     /
-               yserver-kms   (bin "yserver": drm, gbm, libinput, udev, VT, DRI3,
-                              scanout, KmsBackend incl. backend/portable)
-   future (when nested starts): backend/portable → yserver-xrender (core + render),
-                                shared by yserver-kms and yserver-nested
-```
-- **`yserver-render`** (~55k code + ~20k tests) contains:
-  - `kms/vk` minus `scanout.rs` and `dri3.rs`; `ops/`, pipelines, `pixmap_pool`,
-    `vram`, `mem_accounting`, `device`, `instance`, `target`.
-  - `kms/render/{engine, scene, store, frame_builder, upload_arena, glyph_atlas,
-    glyph_pixels, region, stroke, scene_diff, descriptor_pool_ring, batch_resource,
-    transform_intermediate, root_overlay, cursor, cursor_save, submit_*, telemetry,
-    scanout_damage}`.
-- **The parallelism gain:** render does not depend on `yserver-core`. It
-  compiles alongside core, starting right after protocol's metadata, so roughly
-  half of today's `yserver` unit leaves the critical path.
-- **Honest estimate:** release at 32 cpus goes from 18.9 s to about 12–14 s.
-  On 4 cpus the two crates compete for the same cores; expect 10–25% (35 s to
-  about 27–31 s). That is unverified: phase 0 and the end of phase 3 measure it
-  on fuji.
-- **Why not split `yserver-core`:** one strongly connected component spans
-  `{core_loop, server, resources, backend, xinput, host_x11, nested, crossings,
-  composite_redirects}`. `server` and `xinput` call back into `core_loop`. Only
-  leaves totalling about 4.4k lines (`randr`, `properties`, `transport`,
-  `xauth`, `unix_fd`, `present_scheduler`) sit outside it. And per the timings,
-  core already sits off the critical path.
+The first draft treated this as "one `PresentTarget` seam". It is not. Counts
+below are from non-test code of the would-be render set — `kms/vk/*` minus
+`scanout.rs`/`dri3.rs`, `vk/ops/*`, and `kms/render/{engine, scene, store,
+frame_builder, upload_arena, glyph_atlas, glyph_pixels, region, stroke,
+scene_diff, descriptor_pool_ring, batch_resource, transform_intermediate,
+root_overlay, cursor, cursor_save, submit_group, submit_trace, telemetry,
+scanout_damage, composite_pool_ring, target, owned_semaphore}` — by resolving
+`use` trees and counting each imported name's uses (token counts; re-run the
+script before phase 3 starts).
 
-### Blockers to clear before `git mv` (each its own small commit)
+### Dependency inventory (what render would import from outside itself)
 
-| blocker | fix |
+| from | names | uses | where | boundary needed |
+|---|---|---|---|---|
+| `platform::{PlatformBackend, FenceTicket, FlushOutcome, PresentCompletionSignal, ReadyScanoutRenderCompletion}` | 5 | 152 | engine 78, scene 37, store 15, frame_builder 11, submit_group 6, glyph_atlas 3, cursor_save 2 | `GpuCore` (below) + scene output seam |
+| `platform.<member>` calls/fields | 30 distinct | 161 | engine 59, scene 96, store 5, frame_builder 1 | same |
+| `vk::scanout::{OutputScanout, ScanoutBo, BoPhase, BoState, CopiedRenderSource, CopiedTransportPreparation}` | 6 | 16 | scene 14 (scene.rs:96–99, 4896–4982, 8371, 8447, 8599–8689), `vk/compositor.rs:13`, `vk/target.rs` 1 | scene output seam; `BoPhase` used by compositor's error type |
+| `kms::core::KmsCore` | 1 type, 6 fields | 12 type refs, 15 field reads | scene.rs:89, 2103–9277 (`top_level_order`, `shape_bounding`, `shape_clip`, `window_id`, `cursor_x/y`) | a read-only scene-input view |
+| `render::backend::{WindowsMap, WindowGeometry}` | 2 | 12 | scene | move the types into render |
+| `render::present_completion::{PendingPresentBatch, PendingPresentEntry, PresentBatchWait}` | 3 | 19 | engine 18 (engine.rs:51, 1334, 2763–3048, 5070), frame_builder 1 | present-completion seam; the module itself imports `yserver_core::backend::{CompletedPresentEvent, SyncobjHandle, XshmfenceHandle}` and `OwnedFd` |
+| `vk::dri3` | 4 | 13 | `vk/target.rs` (414, 1261, 1408–1516) | split dri3.rs (below) |
+| `crate::drm` | 2 | 2 | scene.rs:8597, 8644 (`submit_flip_with_fences`) | scene output seam |
+| `crate::platform::drm::{DrmDeviceKey, Output}` | 2 | 10 | `vk/device.rs:17` 9, scene 1 | `DrmDeviceKey` is a plain `(major, minor)`: move down |
+| `kms::backend` helpers (`scanline_fill_polygon`, `repeat_to_shader_const`, `pixman_transform_to_affine`, `bresenham_segment`, `compose_affines`) | 5 | 25 | engine 14, stroke 11 | move into render |
+| `kms::cpu_types::{Repeat, Rectangle16, PictTransform}` | 3 | 70 | engine 55, stroke 9, target 5, frame_builder 1 | move into render (missed by the first draft) |
+| `yserver_core::backend::{GcFunction, params::{ArcMode, CapStyle, JoinStyle, LineStyle}}`, `yserver_core::randr::{CrtcTransform, Filter}` | 7 | ~100 | stroke 42, `vk/logic_fill_pipeline` 38, engine 8, scene 5, root_overlay 4, transform_intermediate 2 | plain data: move to `yserver-protocol`, core re-exports |
+| `crate::vk_count!` | 1 macro | 132 | 16 files | `#[macro_export]` from render |
+
+### Boundaries, per group
+
+**A. `GpuCore` — the pooling and resource-lifetime boundary (engine, store,
+frame_builder, submit_group).** Today `PlatformBackend` owns the GPU-only state
+next to the DRM state (platform.rs:2294–2316, 2351–2362): `vk`,
+`ops_command_pool`, `fence_pool`, `pixmap_pool`, `submit_group`,
+`last_flush_outcome`, `renderer_failed`, `force_next_submit_failure`. Engine's
+59 platform calls are all on this subset (`renderer_failed` 24,
+`submit_group_ticket_or_open` 13, `ops_command_pool_handle` 8,
+flush/submit-group 10, `vk` 2, `allocate_drawable_storage` 1,
+`acquire_present_completion_signal` 1, …). Store needs more than a
+`&VkContext`: `Storage::destroy` (store.rs:391) returns images to
+`platform.pixmap_pool` (store.rs:446), and `decref` (1101),
+`destroy_now` (1172), `poll_pending_retire` (1453) and `shutdown_destroy_all`
+(1038) take `PlatformBackend` to poll `FenceTicket`s and destroy.
+- Move those fields into a render-crate `GpuCore` with the **same declaration
+  order** (the drop order ops pool → fence pool → vk is load-bearing,
+  platform.rs:2299). `PlatformBackend` owns `gpu: GpuCore`.
+- `FencePool`/`FenceTicket`, `PresentCompletionSignal`, the submit group and
+  `allocate_drawable_storage*` (platform.rs:4617–4750, which takes from the pool)
+  move with it. Allocation and return of pooled images then live in one place.
+- Store/engine/frame_builder signatures change `&mut PlatformBackend` →
+  `&mut GpuCore`; KMS callers pass `&mut platform.gpu`. Disjoint field borrows
+  replace the whole-platform borrow, which is the one behaviour-adjacent risk:
+  a **seam** commit, lavapipe + HW smoke.
+- `flush_submit_group_with_exports` (platform.rs:4959) runs dma-buf sync-file
+  ioctls (via `dri3::export_dmabuf_write_access_sync_file`). Its ioctl half
+  stays KMS-side; `GpuCore::flush` takes already-imported wait semaphores and
+  an optional export signal.
+
+**B. Scene output seam (scene ↔ KMS output driving).** Of scene's 96
+`platform.*` uses only 25 are `GpuCore` (`renderer_failed` 16,
+`acquire_fence_ticket` 6, …). The rest drive outputs: geometry 39 (`outputs`,
+`output_root_rect`, `output_transform`, `fb_w/h`, …), scanout-BO lifecycle 21
+(`scanout_pools`, `acquire_scanout_bo`, `invalidate_bo`, `commit_bo_present`,
+`on_page_flip_complete`, render-completion register/drain, …), cursor plane 11.
+Plus the direct DRM flip and the scanout types. `tick_one_output` is a KMS
+output driver, not a renderer. Phase-3 options, to be decided in the phase-3
+review with the re-run inventory:
+- **(a, default)** scene stays in `yserver`; render gets vk + engine + store +
+  frame_builder + the small modules. Smaller gain, no new trait.
+- **(b)** split scene into compose (walk, damage, `ComposeRenderTarget`
+  impls for plain images) in render and output driving in KMS, behind a narrow
+  `OutputSink` trait sized to the calls listed above. Only if (a)'s measured
+  gain is too small; it is an edit-heavy refactor with HW smoke on bee and
+  eiger.
+`KmsCore` reads (6 fields) become a borrowed `SceneInput` struct either way.
+
+**C. Present-completion batches in engine.** Engine stores
+`PendingPresentBatch` (engine.rs:1334) whose entries carry core's
+`CompletedPresentEvent` and sync-fd waits. Boundary: engine keeps the batch
+container and wait kind, generic over an opaque entry type supplied by the KMS
+side; `present_completion.rs` stays in `yserver`.
+
+**D. `vk/dri3.rs` split.** Lines 15–520 are Vulkan external-memory work on
+dma-buf fds (modifier queries, export/import); `vk/target.rs` needs these.
+Lines 521–749 are `DMA_BUF_IOCTL_{EXPORT,IMPORT}_SYNC_FILE` ioctls plus
+`poll`. The first part moves to render; the ioctl part stays in KMS.
+
+**E. Visibility.** `pub(crate)` items used across the new crate edge become
+`pub` in private modules, exposed via a facade `pub use` list in
+`render/lib.rs`. Count before/after in the phase-3 PR.
+
+### Platform gates (FreeBSD is supported — no blanket `cfg(linux)`)
+
+`kms/mod.rs:2,9` gates on `any(linux, freebsd)`; `completion_poller.rs:23–133`
+has epoll/kqueue arms; `imported_syncobj.rs:31–32` includes freebsd;
+`vk/dri3.rs:550–553,701–704` already defines the ioctl numbers for non-Linux
+targets. Rules:
+- **Linux-only ioctls/syscalls** (epoll/eventfd/timerfd, VT, udev) keep their
+  existing narrow gates. Do not add new gates around code that compiles on
+  FreeBSD today.
+- **fd-based Vulkan** (`external_memory_fd`, `dma_buf`, `external_semaphore_fd`,
+  `image_drm_format_modifier`, `queue_family_foreign`, `vk/device.rs`
+  446–450; `vk/sync.rs`; dri3 part D) is **not** Linux-only. It stays
+  unconditional on `unix` targets, guarded at runtime by the existing capability
+  checks (e.g. 17d29c5b: no `VK_KHR_external_semaphore_fd` ⇒ no DRI3 fences).
+- No `ExternalMemory` trait until a nested backend demonstrates the need.
+
+### Expected gain (hypothesis until measured)
+
+Render does not depend on `yserver-core`, so it compiles alongside core. With
+option (a) roughly a third of today's `yserver` unit leaves the critical path;
+with (b) about half. **Hypothesis:** 32-cpu release 18.9 s → ~13–15 s; 4-cpu
+10–25%. Measured on fuji and silence before phase 1 and after phase 3 with the
+baseline recipe; recorded in the phase-3 PR and `docs/status.md`. Target ≥ 20%
+on fuji's release critical path; if missed, report, do not tune without jos.
+
+**Why not split `yserver-core`:** `{core_loop, server, resources, backend,
+xinput, host_x11, nested, crossings, composite_redirects}` is one strongly
+connected component, and core is already off the critical path.
+
+**The `git mv` commit** (after A–E): moves the files into
+`crates/yserver-render/src/`; `yserver` keeps `pub use yserver_render::{vk, …}`
+aliases under `kms::` so kms paths compile. Package and directory stay
+`yserver` (decision 3). `render_acceptance` stays in `yserver` (needs
+`KmsBackend`).
+
+**Core-side Unix leaks (recorded for nested, not phase 3):** `Backend` exposes
+`RawFd` (`poll_fds`), `on_page_flip_ready(drm_fd)`, `OwnedFd` in `dri3_*`;
+`unix_fd.rs` SCM_RIGHTS; `server.rs` `shmat`; Unix-socket transport.
+
+## Phase 4 (deferred until nested work starts)
+
+`yserver-xrender` (`backend/portable` + store/engine/scene/caches + `KmsCore`)
+behind a `dyn DisplayPlatform`. Blocked today by KMS input glue
+(`process_request`, `run::handle_host_input`, `fire_pending_repeats`,
+`xinput::{hotplug, libinput_props}`) and RANDR mixing X11 view with DRM state.
+No further crates until then (decision 5).
+
+## Branches and landing order
+
+| branch | touches |
 |---|---|
-| `yserver_core::backend::GcFunction` (engine 4, scene 3, vk `logic_fill_pipeline` 1) and `backend::params` (stroke) | move the plain data types to `yserver-protocol` (or a `types` module there); core re-exports them, so its paths are unchanged |
-| `yserver_core::randr::CrtcTransform` (scene 2) | same: plain data, move down |
-| `BatchResource` (render) is implemented by vk; `DescriptorPoolRing` is taken by `vk/render_pipeline.rs:516`; `decode_x11_pixel_for_storage` (engine.rs:12864) is called from `vk/ops/scanout_logic_fill.rs` | they move with render anyway; this only matters if vk is extracted alone |
-| `crate::vk_count!` (render 49, vk 98 uses) | `#[macro_export]` from render |
-| `crate::kms::backend` helpers (engine 14, stroke 11: `ClipMaskCache`, `scanline_fill_polygon`, `bresenham_segment`, `pixman_transform_to_affine`) | move the helpers from `kms/backend.rs` (1.5k) into render |
-| scene → `super::backend::{WindowsMap, WindowGeometry}` (16 refs) | move these types from `KmsBackend`'s header into `render::scene::types` |
-| `store.rs` → `platform::{FenceTicket, PlatformBackend}` (only `platform.vk`) | `FencePool`/`FenceTicket` move to render; `destroy` takes `&VkContext` |
-| scene.rs:8597–8644 `crate::drm::page_flip::submit_flip_with_fences`, the only hard DRM call in scene | **seam commit:** generalise the private `ComposeRenderTarget` into a pub `PresentTarget` trait in render; KMS implements its submit, and later a swapchain image implements it for nested. HW smoke: flip, unflip, direct scanout on bee and eiger |
-| `vk/device.rs` `DrmDeviceKey`, `VulkanDrmIdentity`, `PhysicalDeviceSelection::{RenderEndpoint, Exact}`, and the extension tail at 446–450 (`external_memory_fd`, `dma_buf`, `external_semaphore_fd`, `image_drm_format_modifier`, `queue_family_foreign`) | `DrmDeviceKey` is a plain `(major, minor)`, so it moves to render; the extension tail goes behind `#[cfg(target_os = "linux")]` (a cfg, not a feature — no kill switch) |
-| `pub(crate)` used outside the module, needing `pub` (vk ≈74 fns/39 fields/12 structs; render ≈87 fns/12 structs/140 field names, by-name over-counts) | make them `pub` but keep modules private where possible, and expose a facade `pub use` list in `render/lib.rs`. Count before and after; review any increase over the inventory |
+| `fix/100-implicit-sync-exports` (16) | process_request, backend, engine, scene, pointer_fanout, run, platform, server |
+| `diag/214-slow-submits` (6) | process_request, backend, engine, scene, run, platform, scanout, render_acceptance |
+| `fix/glyph-atlas-reclaim` (2) | backend, engine |
+| `fix/214-trap-per-instance-bbox` (2) | backend, render_acceptance |
+| `fix/direct-scanout-scene-revocation` (3) | backend |
+| PR #112 / `test/pr112-rebased` | scene (+1215/−146), backend |
+| `fix/shape-canonicalise-rects` (3) | scene, backend |
 
-**The `git mv` commit.** It moves `kms/vk` and the files listed above into
-`crates/yserver-render/src/`. `yserver-kms` keeps
-`pub use yserver_render::{vk, …}` aliases under `kms::`, so the
-`crate::kms::vk::…` paths in kms code keep working. `render_acceptance` stays
-in `yserver-kms` because it needs `KmsBackend`. Renaming the `crates/yserver`
-directory to `yserver-kms` is optional, and so is the package name; the binary
-stays `yserver`.
+**Order (decision 7):** settle the work touching a file before that file moves;
+files no open branch touches go first and are not blocked on unrelated
+branches. Branches are never deleted on the basis of apparent squash ancestry
+alone; jos decides. For PR #112, erpalma is told before phase 1 touches
+`scene.rs`/`backend.rs` (jos writes that message).
 
-### Linux-only surface to fence (inventory for nested; not all needed in phase 3)
+### Porting a branch across a split (requires a dry run first)
 
-| where | what | in phase 3 |
-|---|---|---|
-| `vk/dri3.rs` 766 | dma-buf import/export, `DMA_BUF_IOCTL_*_SYNC_FILE`, `libc::poll` | → kms |
-| `vk/scanout.rs` 8.6k | GBM BOs, scanout images, PRIME | → kms |
-| `vk/sync.rs` 100 | sync-fd semaphore wrapper (`OwnedFd`) | render, `cfg(linux)` |
-| `vk/target.rs` 1.9k | dma-buf-backed `DrawableImage` (fd 15, modifier 118) | render; external-memory constructors in `cfg(linux)` submodule |
-| `vk/mem_accounting.rs` | export buckets | render (data only) |
-| `vk/instance.rs`, `device.rs` | `external_*_capabilities`, DRM physical-device identity | `cfg(linux)` |
-| `render/store.rs` 2.3k | import/export hooks (fd 8) | render; hooks behind `cfg(linux)` |
-| `render/{platform, imported_syncobj, completion_poller (epoll), present_completion, present_source_wait, export_holders, probe_executor}` | DRM, syncobj, epoll | → kms |
-| totals in vk+render today | `std::os::fd` 63, `std::os::unix` 27, `libc::` 91, `nix::` 59, epoll/eventfd/timerfd 85, `ash::khr::external_*_fd` 56 | mostly in files that go to kms |
+The first draft's recipe was wrong: `git rebase --onto master <split-commit>`
+replays only commits after the branch's own split commit, i.e. drops every
+feature commit before it. Replacement, per branch. Let `S` be master's split
+commit and `M0 = S^`:
+1. Precondition: `split apply <manifest>` on `M0`'s tree reproduces `S`'s
+   tree exactly (determinism check; abort otherwise).
+2. `git rebase M0` the branch (ordinary conflicts, old layout).
+3. For each branch commit `Ci` in order: check out `Ci`'s tree, run
+   `split apply`; items the branch added fail as unassigned — add them to a
+   branch-local manifest. Commit the result with parent = previous new commit
+   (first: `S`), same message and author. (A small script over
+   `git rev-list --reverse M0..branch`.)
+4. `git rebase master` the new chain; conflicts now arise only from post-split
+   master work, in the new layout.
+5. Check: `git diff <old tip> <new tip>` after normalising with
+   `split apply` on the old tip is empty, and the branch's own tests pass.
+   Fallback for phase-1/2 moves of whole files: `git rebase -X find-renames=40%`
+   with `merge.renameLimit` raised can carry edits across pure renames; it
+   does not help for files split in many parts.
 
-On the core side (not blocking render, but blocking nested on Windows):
-- The `Backend` trait leaks `RawFd` (`poll_fds`), `on_page_flip_ready(drm_fd)`
-  and `OwnedFd` in the `dri3_*` methods.
-- `unix_fd.rs` (SCM_RIGHTS), `server.rs:2863` `shmat` and the Unix-socket
-  transport.
-
-macOS is close: BSD sockets, `shmat` and SCM_RIGHTS all exist. Windows needs a
-transport and MIT-SHM rework. Out of scope here, just recorded.
-
-## Phase 4 (deferred until nested work starts): `yserver-xrender`
-
-Extract `backend/portable/` together with the portable `KmsBackend` fields:
-- `store`, `engine`, `scene`, `windows`, the caches, cursor records and
-  `core: KmsCore` (XKB/fonts, 15.8k with `xkb`/`xkb_desc`).
-
-They form a `RenderBackend` that holds a `Box<dyn DisplayPlatform>`. Use dyn,
-not generic, so it compiles in its own crate and not in the binaries. The
-roughly 45 KMS fields stay in `KmsPlatform`, in their four clusters: scanout,
-vblank/CRTC/RANDR-hw, DRI3/Present/dma-buf, and VT/input threads.
-
-What blocks phase 4 today:
-- `KmsBackend` calls core glue for input: `process_request`,
-  `run::handle_host_input`, `fire_pending_repeats`, `InputOrigin`, and
-  `xinput::{hotplug, libinput_props}`. The input paths belong on the platform
-  side.
-- RANDR output code mixes the X11 view with DRM state.
-
-Doing this now would be speculative. Phase 2.11's directory seam plus the CI
-grep keeps it cheap later.
-
-## Branches (state 2026-10-08) and landing order
-
-**Unmerged branches, by big files touched:**
-
-| branch | tip | touches |
-|---|---|---|
-| `fix/100-implicit-sync-exports` (16 commits) | 10-07 | process_request, backend, engine, scene, pointer_fanout, run, platform, server |
-| `diag/214-slow-submits` (6) | 10-08 | process_request, backend, engine, scene, run, platform, scanout, render_acceptance |
-| `fix/glyph-atlas-reclaim` (2) | 10-07 | backend, engine |
-| `fix/214-trap-per-instance-bbox` (2) | 10-07 | backend, render_acceptance |
-| `fix/direct-scanout-scene-revocation` (3) | 09-21 | backend |
-| PR #112 (erpalma) / `test/pr112-rebased` | 09-11 | scene (+1215/−146), backend |
-| `fix/shape-canonicalise-rects` (3) | 09-11 | scene, backend |
-| `fix/213-expose-on-restack`, `pr-198` | – | stale pre-squash copies (#213 and #198 are on master), deletable |
-
-**Landing order:**
-1. Land or park all of the above (jos decides which).
-2. For PR #112, tell erpalma before phase 1 touches `scene.rs`/`backend.rs`
-   (jos writes that message).
-
-**Porting a branch that missed the window:**
-1. `git rebase <last master commit before the split>`.
-2. Run `tools/split/split.py` with the same manifests on the branch tip.
-3. Commit the result.
-4. `git rebase --onto master <that-split-commit>`. The diff now applies to the
-   same layout.
-
-Phase-1 test moves only conflict with test edits, so phase 1 can start once the
-branches touching `process_request`/`backend` tests have landed.
+**Before using it on a real branch:** demonstrate on a disposable copy
+(`git branch tmp/port-dryrun fix/glyph-atlas-reclaim`) against a trial split of
+`resources.rs`, and record the commands and result in the phase-1 PR.
 
 ## Risks
 
 | risk | mitigation |
 |---|---|
-| Merge conflicts with in-flight work | start only after branches settle; scripted manifests for porting; one file per commit, so a conflict is local |
-| Visibility creep (`pub(crate)` everywhere) | rule 2 grep; in phase 3, a counted `pub` delta in the PR body |
-| Accidental behaviour change | moves only; `verify-move.sh`; test-list invariant; seam commits isolated and HW-smoked |
-| Lost tests (dropped `mod` line) | test-list invariant per commit |
-| `cfg`/`#[path]` modules (xdmcp, crtc_transform_tests) | three feature configs in the gate; `#[path]` children are kept and moved explicitly |
-| Compile-time regression | measure at the end of phases 1, 2 and 3 with the same recipe; core is `dyn`, so generics are no risk |
-| Blame churn | `.git-blame-ignore-revs` plus `-C -C` |
-| Seam commits (PresentTarget, delegators) hide real changes | each is its own commit with its own review; PresentTarget needs HW smoke on bee (amdgpu) and eiger (Asahi) |
+| Merge conflicts with in-flight work | settle per file before moving it; deterministic port procedure (dry-run first) |
+| Visibility creep | rule 2 grep; counted `pub` delta in phase 3 |
+| Accidental behaviour change | whole-item moves; per-item hash verify; residual shadowing list reviewed; seam commits isolated and HW-smoked |
+| Lost / renamed tests | rule 4 mapping per feature config, counts + ignored status |
+| `cfg`/`#[path]` modules (xdmcp, crtc_transform_tests) | three feature configs in the gate; `#[path]` children moved explicitly |
+| FreeBSD regression from new gates | no blanket `cfg(linux)`; narrow gates only where the code is Linux-only today |
+| GpuCore borrow split changes ordering | seam commit, lavapipe + HW smoke (bee amdgpu, eiger Asahi) |
+| Compile-time claims wrong | all estimates are hypotheses until the fuji before/after measurement |
 
 ## Acceptance
 
-- **File size:**
-  - No non-test `.rs` over 5,000 lines, except `request/xinput/xi2.rs` (~5.3k)
-    unless 2c is done, and `backend/trait_impl.rs` if 2.11b is skipped.
-  - No test `.rs` over 6,000 lines.
-  - Checked by a CI step: `find crates -name '*.rs' | xargs wc -l` against a
-    list of exceptions.
-- **Tests:** test lists (normal and `--ignored`) identical to the phase-0
-  snapshot, plus any tests added meanwhile.
-- **Seam:** the `backend/portable/**` grep check passes. `yserver-render`
-  builds with no `drm`, `gbm`, `input`, `udev` or `yserver-core` in
-  `cargo tree -p yserver-render`.
-- **Timings:** the phase-0 recipe (`--timings`, passthrough wrapper,
-  `CARGO_INCREMENTAL=0`, workspace crates only) is run on fuji and silence
-  before phase 1 and after phase 3. The numbers are recorded in the phase-3 PR
-  and in `docs/status.md`. The phase-3 target is a release critical path on
-  fuji at least 20% shorter; if it is not, report it and do not tune further
-  without jos.
+- **File size:** no non-test `.rs` over 5,000 lines and no test `.rs` over 6,000
+  (ceilings; split by responsibility, not to hit a number). Exceptions until
+  their own steps land: `request/xinput/xi2.rs` (until 2c) and
+  `backend/trait_impl.rs` (until 2.11b). CI step with an exception list.
+- **Tests:** rule 4 mapping holds against the phase-0 snapshot, plus tests
+  added meanwhile.
+- **Seam:** the `backend/portable/**` grep passes; `cargo tree -p
+  yserver-render` has no `drm`, `gbm`, `input`, `udev`, `yserver-core`.
+- **Timings:** fuji + silence measured before phase 1 and after phase 3.
 
 ## Phase-0 checklist
 
-1. Branches settled (above).
+1. Branch work settled for the first files to move.
 2. Baseline timings on fuji.
-3. Snapshot the test list.
-4. `tools/split/{split.py, verify-move.sh}` on a branch, proven on one small
-   file (`resources.rs`) end to end.
+3. Test-list snapshot for all three feature configs (normal and `--ignored`).
+4. `tools/split` (`apply`, `verify`, `verify --tests`, `verify --delegate`)
+   proven end to end on `resources.rs`, including the porting dry run.
 
-## Open questions (jos / codex)
+## Decisions (codex review, 2026-10-08; replaces the open questions)
 
-1. Trait impl: 230 delegators (2.11b), or one 10.3k `trait_impl.rs` left as a
-   known exception?
-2. Phase 2c: split the arms of the XI2/RANDR matches, or keep the 5.1k/2.3k
-   bodies?
-3. Crate names: `yserver-render` (vk + engine + scene), keep `crates/yserver`
-   as the KMS binary crate, or rename it to `yserver-kms`?
-4. Should phase 3 also cover the ~12k `backend/kms/` vs `portable/` crate cut
-   now (phase 4), or wait for real nested work as proposed?
-5. `cfg(target_os = "linux")` for external memory/sync-fd in render, or an
-   `ExternalMemory` trait now? The cfg is cheaper; the trait is needed only once
-   MoltenVK/KosmicKrisp interop (Metal shared events) is real.
-6. The size limits (5k code / 6k tests): right numbers?
+1. **Trait impl:** explicit delegators grouped by subsystem (2.11b). The 10.3k
+   `trait_impl.rs` is acceptable temporarily during the mechanical phase.
+2. **XI2/RANDR handler extraction:** yes, as a separate later refactor (2c).
+3. **Names:** crate `yserver-render`; package and directory stay `yserver` for
+   now.
+4. **Render extraction:** only after phases 1–2 and a re-run of the dependency
+   inventory above, as its own separately reviewed phase.
+5. **Further crates** (e.g. `yserver-xrender`): deferred until nested work.
+6. **Size limits:** 5k code / 6k tests are ceilings; split by responsibility.
+7. **Branch order:** settle work touching each file before moving it; do not
+   block unrelated cleanup on every branch; never delete branches based solely
+   on apparent squash ancestry.
+8. **Platform gates:** narrow gates plus existing runtime capability checks;
+   FreeBSD behaviour preserved; abstractions only for demonstrated needs.
