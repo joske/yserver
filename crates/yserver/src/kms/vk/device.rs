@@ -168,7 +168,9 @@ pub struct VkContext {
     /// `RenderDevice` endpoints for later PRIME routing.
     pub(crate) drm_physical_devices: Vec<VulkanDrmPhysicalDevice>,
     pub device: ash::Device,
-    pub external_semaphore_fd: ash::khr::external_semaphore_fd::Device,
+    /// `None` when the device lacks `VK_KHR_external_semaphore_fd`; reach it
+    /// through [`Self::semaphore_fd_ext`], which turns that into an error.
+    pub external_semaphore_fd: Option<ash::khr::external_semaphore_fd::Device>,
     pub external_memory_fd: Option<ash::khr::external_memory_fd::Device>,
     pub image_drm_format_modifier_ext: Option<ash::ext::image_drm_format_modifier::Device>,
     /// True when `VK_EXT_image_drm_format_modifier` is enabled on the
@@ -620,8 +622,9 @@ impl VkContext {
         let graphics_queue_supports_compute = selected_queue_family
             .queue_flags
             .contains(vk::QueueFlags::COMPUTE);
-        let external_semaphore_fd =
-            ash::khr::external_semaphore_fd::Device::new(&instance, &device);
+        let external_semaphore_fd = device_extension_names
+            .contains(&ash::khr::external_semaphore_fd::NAME)
+            .then(|| ash::khr::external_semaphore_fd::Device::new(&instance, &device));
         let external_memory_fd_supported =
             device_extension_names.contains(&ash::khr::external_memory_fd::NAME);
         let external_memory_fd = if external_memory_fd_supported {
@@ -710,6 +713,22 @@ impl VkContext {
     #[must_use]
     pub fn is_software_rasterizer(&self) -> bool {
         self.device_type == vk::PhysicalDeviceType::CPU
+    }
+
+    /// The `VK_KHR_external_semaphore_fd` loader, or
+    /// `ERROR_EXTENSION_NOT_PRESENT` when the device does not expose it.
+    /// Calling through an unloaded ash entry point panics, so every
+    /// sync-fd import/export goes through here and fails as a `vk::Result`.
+    pub fn semaphore_fd_ext(&self) -> Result<&ash::khr::external_semaphore_fd::Device, vk::Result> {
+        self.external_semaphore_fd
+            .as_ref()
+            .ok_or(vk::Result::ERROR_EXTENSION_NOT_PRESENT)
+    }
+
+    /// Whether `SYNC_FD` semaphore import/export is available.
+    #[must_use]
+    pub fn supports_sync_fd(&self) -> bool {
+        self.external_semaphore_fd.is_some()
     }
 
     /// Mark a disposable context as fence-proven quiescent.

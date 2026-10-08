@@ -387,7 +387,7 @@ impl PresentCompletionSignal {
         let info = vk::SemaphoreGetFdInfoKHR::default()
             .semaphore(self.semaphore)
             .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
-        let raw = unsafe { self.vk.external_semaphore_fd.get_semaphore_fd(&info)? };
+        let raw = unsafe { self.vk.semaphore_fd_ext()?.get_semaphore_fd(&info)? };
         crate::kms::vk::optional_sync_fd_from_vk(raw, "vkGetSemaphoreFdKHR(SYNC_FD)")
     }
 }

@@ -40,6 +40,7 @@ pub(crate) fn import_optional_sync_file(
     vk: &VkContext,
     fd: Option<OwnedFd>,
 ) -> Result<vk::Semaphore, vk::Result> {
+    let ext = vk.semaphore_fd_ext()?;
     let create_info = vk::SemaphoreCreateInfo::default();
     let semaphore = unsafe { vk.device.create_semaphore(&create_info, None)? };
     let raw = optional_sync_file_raw(fd.as_ref().map(AsRawFd::as_raw_fd));
@@ -49,7 +50,7 @@ pub(crate) fn import_optional_sync_file(
         // SYNC_FD import is required to be TEMPORARY by spec.
         .flags(vk::SemaphoreImportFlags::TEMPORARY)
         .fd(raw);
-    let result = unsafe { vk.external_semaphore_fd.import_semaphore_fd(&import_info) };
+    let result = unsafe { ext.import_semaphore_fd(&import_info) };
     match result {
         Ok(()) => {
             if let Some(fd) = fd {
@@ -82,7 +83,7 @@ pub fn export_sync_file(vk: &VkContext, semaphore: vk::Semaphore) -> Result<Owne
     let info = vk::SemaphoreGetFdInfoKHR::default()
         .semaphore(semaphore)
         .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
-    let raw = unsafe { vk.external_semaphore_fd.get_semaphore_fd(&info)? };
+    let raw = unsafe { vk.semaphore_fd_ext()?.get_semaphore_fd(&info)? };
     super::owned_fd_from_vk(raw, "vkGetSemaphoreFdKHR(SYNC_FD)")
 }
 

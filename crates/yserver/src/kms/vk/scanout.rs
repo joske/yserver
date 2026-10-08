@@ -874,11 +874,7 @@ impl CopiedRenderSource {
         let info = vk::SemaphoreGetFdInfoKHR::default()
             .semaphore(self.completion_semaphore)
             .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
-        let raw = unsafe {
-            self.render_vk
-                .external_semaphore_fd
-                .get_semaphore_fd(&info)?
-        };
+        let raw = unsafe { self.render_vk.semaphore_fd_ext()?.get_semaphore_fd(&info)? };
         let completion =
             super::optional_sync_fd_from_vk(raw, "vkGetSemaphoreFdKHR(copied render SYNC_FD)")?;
         self.completion_semaphore_reuse.finish_successful_export();
@@ -3390,7 +3386,7 @@ impl ScanoutBo {
     #[allow(dead_code)] // wired in by Task 2.5 (atomic-commit fence path).
     pub fn export_signaled_fd(&mut self) -> Result<Option<OwnedFd>, vk::Result> {
         self.export_semaphore_reuse.begin_post_submit_export();
-        let ext = self.vk.external_semaphore_fd.clone();
+        let ext = self.vk.semaphore_fd_ext()?.clone();
         let info = vk::SemaphoreGetFdInfoKHR::default()
             .semaphore(self.vk_semaphore)
             .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);

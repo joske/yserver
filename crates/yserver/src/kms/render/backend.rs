@@ -29614,9 +29614,8 @@ impl Backend for KmsBackend {
             return Dri3Caps::unsupported();
         }
         let modifiers = vk.image_drm_format_modifier;
-        // VK_KHR_external_semaphore_fd is unconditionally enabled at device
-        // init; fence_fd / SYNC_FD handle type rides along with it.
-        let fence_fd = true;
+        // FenceFromFD / FDFromFence need SYNC_FD semaphore import/export.
+        let fence_fd = vk.supports_sync_fd();
         // Syncobj support is a property of the KERNEL, not of the Vulkan
         // driver. The previous NVIDIA blacklist here was a correct response
         // to vkImportSemaphoreFdKHR rejecting DRM syncobj fds, which no
