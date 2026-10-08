@@ -459,3 +459,12 @@ phase 1 starts (jos writes that message).
    other branches are reference only, re-applied by hand; no porting tool.
 8. **Platform gates:** narrow gates plus existing runtime capability checks;
    FreeBSD behaviour preserved; abstractions only for demonstrated needs.
+
+## Resolve while proving the splitter on a small file (codex, third review)
+
+- **Hash tokens, not text.** Compare normalized code tokens (visibility
+  excluded, checked by the identity-mapped rule) and verify comments
+  separately; collapsed whitespace is not invariant under rustfmt.
+- **Path literals.** Moving tests changes `include_str!("../testdata/…")`
+  and `#[path]` targets. Allow manifest-listed path edits (or relocate the
+  fixtures) and check each still resolves to byte-identical content.
