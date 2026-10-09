@@ -1,0 +1,45 @@
+# Phase 1a for engine.rs: its inline #[cfg(test)] module(s) go out
+# of line at the same logical paths; production items stay in place.
+source = "crates/yserver/src/kms/render/engine.rs"
+module = "kms::render::engine"
+dir = "crates/yserver/src/kms/render/engine"
+root_form = "file"
+table = "engine.paths"
+
+[[modules]]
+name = ""
+items = [
+  "const *",
+  "enum *",
+  "fn *",
+  "impl CompositeTarget for RecordedCompositeTarget",
+  "impl CompositeTarget for StorageCompositeTarget",
+  "impl CompositeTarget for StorageTextTarget",
+  "impl Drop for ClipSnapshot",
+  "impl Drop for RenderEngine",
+  "impl Drop for SampledScratchImage",
+  "impl Drop for ScratchImage",
+  "impl Drop for StagingBuffer",
+  "impl From < vk :: Result > for RenderError",
+  "impl RenderEngine",
+  "impl RenderEngineInner",
+  "impl RenderFlushReason",
+  "impl ScratchImage",
+  "impl SourceDrawable",
+  "impl StagingBuffer#1",
+  "impl StagingBuffer#2",
+  "impl StagingPool",
+  "impl std :: fmt :: Debug for SampledScratchImage",
+  "impl std :: fmt :: Debug for ScratchImage",
+  "impl std :: fmt :: Debug for StagingBuffer",
+  "impl SubmittedOp",
+  "impl TextRunTarget for StorageTextTarget",
+  "struct *",
+  "unsafe impl Send for StagingBuffer",
+  "unsafe impl Sync for StagingBuffer",
+  "use *",
+]
+
+[[modules]]
+name = "tests"
+items = ["tests::*"]
