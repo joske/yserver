@@ -1,9 +1,9 @@
 # Phase 2.10 proposal: split `kms/render/engine.rs` (production code)
 
 Step 2.10 of `2026-10-08-source-layout-cleanup.md`. Manifest:
-`tools/split/manifests/engine_2.toml` (+ `.paths`). **Proposal + dry run;
-not yet approved or executed.** Sizes below are from the dry run (after
-`cargo +nightly fmt`).
+`tools/split/manifests/engine_2.toml` (+ `.paths`). Accepted by jos
+2026-10-09 and executed (decisions at the end); sizes below are the final
+tree (after `cargo +nightly fmt`).
 
 ## Structure today (13,034 lines, tests already in `engine/tests/`)
 
@@ -34,7 +34,7 @@ not yet approved or executed.** Sizes below are from the dry run (after
   `glyph_pixels`/`platform`, 2 `descriptor_pool_ring`/`present_completion`,
   1 `store`/`telemetry`; 2 of them in doc links).
 
-## Target tree (dry-run lines after fmt)
+## Final tree (lines after fmt)
 
 All under `kms/render/engine/`, depth 1 (so `pub(super)` = old private
 reach). Names avoid every first path segment used in the file (`vk`,
@@ -42,13 +42,14 @@ reach). Names avoid every first path segment used in the file (`vk`,
 `store`, `platform`, `telemetry`, …) and `tests`.
 
 ```
-engine.rs     1103  //! doc, imports, mod decls, root re-exports, every type,
+engine.rs     1104  //! doc, imports, mod decls, root re-exports, every type,
                     From/Debug/Send/Sync impls, mod tests
-lifecycle.rs   888  new/stub/is_live, poll_retired, retire/destroy image,
+lifecycle.rs   666  new/stub/is_live, poll_retired, retire/destroy image,
                     shutdown, drain_all, Drop for RenderEngine, SubmittedOp,
                     adopt_retired_resource, create_pixmap, notify_retired,
-                    active_resource_bytes, promote_drawable_exportable,
-                    copy_image_blocking
+                    active_resource_bytes
+export.rs      225  promote_drawable_exportable, copy_image_blocking (GLX-TFP
+                    promotion onto dma-buf-exportable storage)
 frame.rs      1498  frame builder open/close/submit: trace filter + trace_ops,
                     flush_submit_group, close_open_frame(+_if_timed_out,
                     _for_non_ported_op), frame/descriptor-pool counters,
@@ -79,30 +80,30 @@ emit.rs       2155  close-time replay: emit_recorded_*_into_cb, dst colour
 for_tests.rs   181  the 11 *_for_tests methods
 ```
 
-Total 13,193 (13,034 before; `mod`/`use` lines and fmt). All ≤ 5k; largest
+Total 13,197 (13,034 before; `mod`/`use` lines and fmt). All ≤ 5k; largest
 `emit.rs`. Types stay in the root: `RenderEngineInner`/`StagingBuffer`/
 scratch fields are read across files, and a child cannot see a sibling's
 private fields. Inherent impls are spread per member (`impl X::fn *`), so
 `apply` re-opens one `impl X {}` per file.
 
-Root `//!` doc: the Stage-2c history becomes a short ownership line plus
-this module map (move commit or right after).
+Root `//!` doc: the Stage-2c history became a short ownership description
+plus this module map (its own commit, right after the move).
 
-## Dry-run results
+## Results
 
-Prep (uncommitted, throwaway commit for verify): the 155 `super::` paths →
-`crate::kms::render::…` (sed outside the root import, + fmt: +287/−227).
-Then `split apply`, fmt, `env -u RUSTC_WRAPPER cargo build -p yserver` and
-`cargo clippy -p yserver --all-targets -- -D warnings`: green; fmt
-`--check` clean. `split verify --manifest` → **OK**: 426/426 leaves
-identical, 45 manifest visibility changes, 0 audited exceptions, 0 location
+Prep commit: the 155 `super::` paths → `crate::kms::render::…` (sed
+outside the root import, + fmt: +287/−227; engine tests green). Then
+`split apply`, fmt, `split verify --manifest` → **OK**: 426/426 leaves
+identical, 46 manifest visibility changes, 0 audited exceptions, 0 location
 audits, 18 leaves with log targets moved to descendants, no shadowed names
-outside the existing test helpers. Logs: `target/gate-engine-dry-*.log`.
-Not run: `--features` configs, `verify --tests`, tests, lavapipe (rule 5).
+outside the existing test helpers. `verify --tests` against fresh pre-move
+snapshots: 4008 / 4013 / 4121 tests mapped (default / tcp-transport /
+xdmcp). Rule-5 gate green: fmt, clippy ×3, tests ×3 (3693 / 3698 / 3806
+passed), lavapipe 317 passed. Logs: `target/gate-engine-*.log`.
 
-**Visibility delta (45, all private → `pub(super)` = the old reach):**
-13 methods, 30 free fns, 2 consts. 29 are needed by the lib (cross-file
-callers), 16 only by `engine/tests` (`clamp_copy_rects(_to)`,
+**Visibility delta (46, all private → `pub(super)` = the old reach):**
+14 methods, 30 free fns, 2 consts. 30 are needed by the lib (cross-file
+callers; `retire_image_after` was added for `export.rs`), 16 only by `engine/tests` (`clamp_copy_rects(_to)`,
 `clamp_put_rect(_to)`, `coalescing_counts`, `session_step`,
 `x11_src_row_stride`, `UPLOAD_COPY_ALIGN_MAX`, `resolve_force_opaque`,
 `StagingBuffer::{new_with_usage, pick_memory_type}`,
@@ -112,11 +113,11 @@ existing `pub(super)`/`pub(in …)` items moved; `pub(crate)` items unchanged.
 
 **Re-exports (root `lines`):** `use` globs for frame, staging, scratch,
 composite, emit; `pub(crate) use` for fill_copy, pixels, glyphs (outside
-users, e.g. `decode_x11_pixel_for_storage`). Method-only children: none.
+users, e.g. `decode_x11_pixel_for_storage`). No glob for the
+method-only children (lifecycle, export, text, batch, traps, for_tests).
 
 **Refusals and handling:**
-1. Relative paths (sound): prep commit, 155 sites (alternative: import the
-   modules once in the root and drop `super::`, a smaller diff; open q. 1).
+1. Relative paths (sound): prep commit, 155 sites (decision 1).
 2. Unused glob (compiler, not the tool): `put_get` and `gradients` free fns
    are file-local in the lib, so their globs warn. `gradients` gets none;
    `put_get`'s two test-only clamps get an explicit
@@ -128,23 +129,21 @@ users, e.g. `decode_x11_pixel_for_storage`). Method-only children: none.
    explicitly.
 4. Log targets, locations, macros, imports/traits in scope, includes: none.
 
-## Open questions
+## Decisions (jos, 2026-10-09)
 
-1. Prep style: full `crate::kms::render::` paths (as backend, done in the dry
-   run) or root `use super::{frame_builder, submit_group, …}` + bare paths?
-2. `emit.rs` at 2.2k as one file, or `emit/{mod, copy, fill, composite,
-   text_traps}` (needs `pub(in crate::kms::render::engine)` at depth 2)?
-3. Types all in the root (1.1k) vs a `types.rs` (plan's 2.10 row): a child
-   would need `pub(super)` on the private fields it owns; proposal: root.
-4. The 16 test-only `pub(super)` changes: accept (as in 2.6/2.11)?
-5. `copy_image_blocking` + `promote_drawable_exportable` in `lifecycle` (DRI3
-   export realloc) or their own `export.rs` (~220 lines)?
+1. Prep uses full `crate::kms::render::…` paths (as backend).
+2. `emit.rs` stays one file (2.2k).
+3. All types stay in `engine.rs`.
+4. The 16 test-only visibility changes (same reach) are accepted.
+5. `promote_drawable_exportable` + `copy_image_blocking` go to their own
+   `export.rs` (no other dma-buf export helper lives in engine.rs).
 
-## Commit sequence (after approval)
+## Commit sequence
 
 1. `refactor(kms): qualify engine super:: paths (prep)`: 155 sites + fmt.
 2. `refactor(kms): split engine into lifecycle/frame/op modules (move)`:
    `split apply` + fmt, `split verify --manifest …` and `--tests`, then the
    full gate (rule 5).
-3. `chore: blame-ignore` for 1 and 2.
-4. This doc and the plan updated to the final tree.
+3. `docs(kms): engine root doc is an ownership line and module map`.
+4. `chore: blame-ignore` for 1 and 2.
+5. This doc and the plan updated to the final tree.

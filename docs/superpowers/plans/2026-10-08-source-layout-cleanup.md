@@ -187,7 +187,7 @@ Least-contended files first.
 | 2.7 | `kms/vk/scanout.rs` | `bo`, `bo_pool`, `copied` 2.0k, `dmabuf_metadata`, `probe` 1.5k, `alloc_plan` 1.3k, `image_alloc` |
 | 2.8 | `kms/render/platform.rs` | `fence`, `cursor_plane` 1.8k, `qualify` 1.5k, `device`, `init`, `scanout`, `connectors`, `submit`, `page_flip` |
 | 2.9 | `kms/render/scene.rs` | `cursor`, `damage_audit` 2.0k, `tick_output` 1.8k, `walk` 2.6k, `fan_out`, `targets`, `root_readback` |
-| 2.10 | `kms/render/engine.rs` | `types`, `staging`, `frame`, `clip_snapshot`, `gradient_assets`, `fill_copy`, `put_get`, `text`, `glyphs`, `composite`, `traps`, `batch`, `rollback`, `record/*` |
+| 2.10 | `kms/render/engine.rs` | done (`2026-10-09-phase2-engine.md`): types stay in the root; `lifecycle`, `export`, `frame`, `staging`, `scratch`, `fill_copy`, `put_get`, `pixels`, `text`, `glyphs`, `composite`, `batch`, `gradients`, `traps`, `emit` 2.2k, `for_tests` |
 | 2.11 | `kms/render/backend.rs` | tree below |
 
 Split by responsibility; the line figures are ceilings to respect, not targets.
