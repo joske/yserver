@@ -10,6 +10,7 @@ use syn::{Expr, FnArg, ImplItemFn, Pat, Stmt, Visibility};
 
 use crate::{
     apply::Manifest,
+    scope::{self, Names},
     tree::{self, Leaf, Res, Source, Tree, dir_of, includes, join, tok},
 };
 
@@ -190,6 +191,7 @@ pub fn check(
         groups.entry(l.key()).or_default().1.push(l);
     }
 
+    let rx = Resolution::new(&before, &after, &map);
     let norm_tokens = |key: &str, l: &Leaf| {
         let mut t = l.tokens.clone();
         for (from, to) in edits.get(key).into_iter().flatten() {
@@ -211,6 +213,7 @@ pub fn check(
                 Some(i) => {
                     let (na, _) = a.remove(i);
                     matched += 1;
+                    errs.extend(rx.check(ob, na));
                     if na.vis != ob.vis {
                         if ob.vis.is_empty()
                             && allowed_vis(&na.vis)
@@ -314,40 +317,43 @@ pub fn check(
         errs.push(format!("{}: new leaf ({}:{})", n.key(), n.file, n.line));
     }
 
-    // Re-exports and other non-private `use` items.
-    let pub_uses = |t: &Tree| -> BTreeMap<(String, String), usize> {
+    // Every `use`, per module: only manifest lines may be added, none lost.
+    let uses = |t: &Tree| -> BTreeMap<(String, String), usize> {
         let mut m = BTreeMap::new();
-        for u in t.uses.iter().filter(|u| !u.vis.is_empty()) {
-            *m.entry((u.module.clone(), format!("{} {}", u.vis, u.tokens)))
-                .or_default() += 1;
+        for u in &t.uses {
+            *m.entry((u.module.clone(), u.text())).or_default() += 1;
         }
         m
     };
-    let allow: BTreeSet<(String, String)> = spec
-        .manifest
-        .map(|m| {
-            m.modules
-                .iter()
-                .flat_map(|x| x.lines.iter().map(move |l| (m.full(&x.name), l)))
-                .filter_map(|(module, l)| {
-                    let mut u: syn::ItemUse = syn::parse_str(l).ok()?;
-                    let vis = tok(&u.vis);
-                    u.vis = Visibility::Inherited;
-                    (!vis.is_empty()).then(|| (module, format!("{vis} {}", tok(&u))))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let (ub, ua) = (pub_uses(&before), pub_uses(&after));
+    let mut allow: BTreeMap<(String, String), usize> = BTreeMap::new();
+    if let Some(m) = spec.manifest {
+        for x in &m.modules {
+            for l in &x.lines {
+                let u: syn::ItemUse =
+                    syn::parse_str(l).map_err(|e| format!("manifest line {l:?}: {e}"))?;
+                let mut v = Vec::new();
+                tree::flatten_use(&u, &m.full(&x.name), &mut v);
+                for u in v {
+                    *allow.entry((u.module.clone(), u.text())).or_default() += 1;
+                }
+            }
+        }
+    }
+    let (ub, ua) = (uses(&before), uses(&after));
     for (k, n) in &ua {
         let had = ub.get(k).copied().unwrap_or(0);
-        if *n > had && !allow.contains(k) {
-            errs.push(format!("{}: re-export `{}` not in the manifest", k.0, k.1));
+        if *n > had + allow.get(k).copied().unwrap_or(0) {
+            let what = if k.1.starts_with("use") {
+                "import"
+            } else {
+                "re-export"
+            };
+            errs.push(format!("{}: {what} `{}` not in the manifest", k.0, k.1));
         }
     }
     for (k, n) in &ub {
         if ua.get(k).copied().unwrap_or(0) < *n {
-            errs.push(format!("{}: re-export `{}` removed", k.0, k.1));
+            errs.push(format!("{}: `{}` removed", k.0, k.1));
         }
     }
 
@@ -408,6 +414,66 @@ pub fn check(
         ));
     }
     Ok((info, errs))
+}
+
+/// Macro and name resolution of both trees, comparable through the table.
+struct Resolution<'a> {
+    macros: [Vec<Vec<String>>; 2],
+    names: [Names; 2],
+    map: &'a BTreeMap<String, String>,
+}
+
+fn hash(s: &str) -> u64 {
+    s.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+impl<'a> Resolution<'a> {
+    fn new(before: &Tree, after: &Tree, map: &'a BTreeMap<String, String>) -> Self {
+        let old = |l: &Leaf| map.get(&l.okey()).cloned().unwrap_or_else(|| l.okey());
+        let new = |l: &Leaf| l.key();
+        let def_old = |l: &Leaf| format!("{} {:x}", old(l), hash(&l.tokens));
+        let def_new = |l: &Leaf| format!("{} {:x}", new(l), hash(&l.tokens));
+        Resolution {
+            macros: [
+                scope::macro_sites(before, &def_old),
+                scope::macro_sites(after, &def_new),
+            ],
+            names: [Names::new(before, &old), Names::new(after, &new)],
+            map,
+        }
+    }
+
+    fn check(&self, ob: &Leaf, na: &Leaf) -> Vec<String> {
+        let key = self.map.get(&ob.okey()).cloned().unwrap_or_default();
+        let mut errs = Vec::new();
+        let (mb, ma) = (&self.macros[0][ob.idx], &self.macros[1][na.idx]);
+        if mb != ma {
+            errs.push(format!(
+                "{key}: macro resolution changed\n      before: {mb:?}\n      after:  {ma:?}"
+            ));
+        }
+        let (names, rel) = scope::free_names(&ob.tokens);
+        if rel && ob.module != na.module {
+            errs.push(format!(
+                "{key}: moved from {} to {} with a `self::`/`super::` path",
+                ob.module, na.module
+            ));
+        }
+        for (n, ns) in names {
+            let (b, a) = (
+                self.names[0].resolve(&ob.module, &n, ns),
+                self.names[1].resolve(&na.module, &n, ns),
+            );
+            if b != a {
+                errs.push(format!(
+                    "{key}: name `{n}` resolves differently\n      before: {b:?}\n      after:  {a:?}"
+                ));
+            }
+        }
+        errs
+    }
 }
 
 fn norm_vis(v: &str) -> String {

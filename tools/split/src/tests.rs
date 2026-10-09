@@ -48,11 +48,18 @@ fn manifest(dir: &str, edits: Vec<PathEdit>) -> Manifest {
         table: "a.paths".into(),
         visibility: [("fn data".to_string(), "pub(super)".to_string())].into(),
         path_edits: edits,
-        modules: vec![crate::apply::ModSpec {
-            name: String::new(),
-            lines: vec!["pub use inner::*;".into()],
-            items: vec![],
-        }],
+        modules: vec![
+            crate::apply::ModSpec {
+                name: String::new(),
+                lines: vec!["pub use inner::*;".into()],
+                items: vec![],
+            },
+            crate::apply::ModSpec {
+                name: "inner".into(),
+                lines: vec!["use super::*;".into()],
+                items: vec![],
+            },
+        ],
         path: tmp.join("a.toml"),
     }
 }
@@ -230,4 +237,143 @@ fn layout_commas_are_not_significant() {
     let before = "fn f<T: Copy,>(a: T, b: (T, T,),) -> [T; 2] where T: Eq, {\n    let S { x, .. } = g(a, b.0,);\n    match x { 1 => {}, _ => (), }\n    [a, b.1,]\n}\n";
     let after = "fn f<T: Copy>(a: T, b: (T, T)) -> [T; 2] where T: Eq {\n    let S { x, .. } = g(a, b.0);\n    match x { 1 => {} _ => () }\n    [a, b.1]\n}\n";
     assert_eq!(same_file(before, after, false), Vec::<String>::new());
+}
+
+/// `src/a.rs` (module `a`) split into `src/a/mod.rs` + `src/a/inner.rs`;
+/// `lines` are the manifest's (root, inner) use lines.
+fn split(
+    tag: &str,
+    before: &str,
+    files: &[(&str, &str)],
+    table: &str,
+    lines: [&[&str]; 2],
+) -> Vec<String> {
+    let tmp = std::env::temp_dir().join(format!("split-test-{}-{tag}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(tmp.join("a.paths"), table).unwrap();
+    let spec_of = |name: &str, l: &[&str]| crate::apply::ModSpec {
+        name: name.into(),
+        lines: l.iter().map(|s| s.to_string()).collect(),
+        items: vec![],
+    };
+    let m = Manifest {
+        source: "src/a.rs".into(),
+        module: "a".into(),
+        dir: "src/a".into(),
+        table: "a.paths".into(),
+        visibility: [("fn f".to_string(), "pub(super)".to_string())].into(),
+        path_edits: vec![],
+        modules: vec![spec_of("", lines[0]), spec_of("inner", lines[1])],
+        path: tmp.join("a.toml"),
+    };
+    let spec = Spec {
+        manifest: Some(&m),
+        old_root: m.source.clone(),
+        new_root: m.new_root(),
+        module: m.module.clone(),
+        delegate: false,
+    };
+    let base = mem(&[("src/a.rs", before)]);
+    let head = mem(files);
+    check(&spec, &base, &head, &[]).unwrap().1
+}
+
+#[test]
+fn private_use_change_fails() {
+    let before = "use std::cmp::min as pick;\n\nfn f() -> u32 {\n    pick(1, 2)\n}\n";
+    let after = before.replace("min as pick", "max as pick");
+    has(
+        &same_file(before, &after, false),
+        "use std :: cmp :: max as pick",
+    );
+}
+
+const MACRO_ORDER: &str = "macro_rules! m {\n    () => { 1 };\n}\n\nfn a() -> u32 {\n    m!()\n}\n\nmacro_rules! m {\n    () => { 2 };\n}\n\nfn b() -> u32 {\n    m!()\n}\n";
+
+#[test]
+fn macro_definition_reordered_fails() {
+    let after = "macro_rules! m {\n    () => { 1 };\n}\n\nmacro_rules! m {\n    () => { 2 };\n}\n\nfn a() -> u32 {\n    m!()\n}\n\nfn b() -> u32 {\n    m!()\n}\n";
+    has(&same_file(MACRO_ORDER, after, false), "macro m");
+}
+
+#[test]
+fn macro_scope_lost_by_mod_declaration_order_fails() {
+    let before = "macro_rules! m {\n    () => { 1 };\n}\n\nfn f() -> u32 {\n    m!()\n}\n";
+    let mod_rs = "mod inner;\npub use inner::*;\n\nmacro_rules! m {\n    () => { 1 };\n}\n";
+    let inner = "use super::*;\n\npub(super) fn f() -> u32 {\n    m!()\n}\n";
+    let table = "a::macro m => a::macro m\na::fn f => a::inner::fn f\n";
+    let errs = split(
+        "macro-scope",
+        before,
+        &[("src/a/mod.rs", mod_rs), ("src/a/inner.rs", inner)],
+        table,
+        [&["pub use inner::*;"], &["use super::*;"]],
+    );
+    has(&errs, "macro m");
+}
+
+const NR_BEFORE: &str = "mod other {\n    pub fn helper() -> u32 {\n        2\n    }\n}\n\nfn helper() -> u32 {\n    1\n}\n\nfn f() -> u32 {\n    helper()\n}\n";
+const NR_MOD: &str = "mod inner;\npub use inner::*;\n\nmod other {\n    pub fn helper() -> u32 {\n        2\n    }\n}\n\nfn helper() -> u32 {\n    1\n}\n";
+const NR_TABLE: &str = "a::other::fn helper => a::other::fn helper\na::fn helper => a::fn helper\na::fn f => a::inner::fn f\n";
+
+#[test]
+fn moved_item_gaining_a_shadowing_import_fails() {
+    let inner =
+        "use super::*;\nuse super::other::helper;\n\npub(super) fn f() -> u32 {\n    helper()\n}\n";
+    let errs = split(
+        "shadow",
+        NR_BEFORE,
+        &[("src/a/mod.rs", NR_MOD), ("src/a/inner.rs", inner)],
+        NR_TABLE,
+        [
+            &["pub use inner::*;"],
+            &["use super::*;", "use super::other::helper;"],
+        ],
+    );
+    has(&errs, "helper");
+}
+
+#[test]
+fn moved_item_gaining_a_glob_fails() {
+    let inner =
+        "use super::*;\nuse super::other::*;\n\npub(super) fn f() -> u32 {\n    helper()\n}\n";
+    let errs = split(
+        "glob",
+        NR_BEFORE,
+        &[("src/a/mod.rs", NR_MOD), ("src/a/inner.rs", inner)],
+        NR_TABLE,
+        [
+            &["pub use inner::*;"],
+            &["use super::*;", "use super::other::*;"],
+        ],
+    );
+    has(&errs, "helper");
+}
+
+#[test]
+fn moved_item_with_relative_path_fails() {
+    let before = "fn f() -> u32 {\n    super::g()\n}\n";
+    let mod_rs = "mod inner;\npub use inner::*;\n";
+    let inner = "use super::*;\n\npub(super) fn f() -> u32 {\n    super::g()\n}\n";
+    let errs = split(
+        "relpath",
+        before,
+        &[("src/a/mod.rs", mod_rs), ("src/a/inner.rs", inner)],
+        "a::fn f => a::inner::fn f\n",
+        [&["pub use inner::*;"], &["use super::*;"]],
+    );
+    has(&errs, "super ::");
+}
+
+#[test]
+fn clean_split_passes() {
+    let inner = "use super::*;\n\npub(super) fn f() -> u32 {\n    helper()\n}\n";
+    let errs = split(
+        "clean",
+        NR_BEFORE,
+        &[("src/a/mod.rs", NR_MOD), ("src/a/inner.rs", inner)],
+        NR_TABLE,
+        [&["pub use inner::*;"], &["use super::*;"]],
+    );
+    assert_eq!(errs, Vec::<String>::new());
 }

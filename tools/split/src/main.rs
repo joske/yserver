@@ -3,6 +3,7 @@
 //! Paths are repo-relative; run from anywhere inside the repo.
 
 mod apply;
+mod scope;
 mod testlist;
 #[cfg(test)]
 mod tests;

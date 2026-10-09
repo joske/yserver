@@ -327,6 +327,8 @@ pub struct Leaf {
     /// Ordinal among leaves with the same key, when the key is not unique.
     pub ord: Option<usize>,
     pub func: Option<ImplItemFn>,
+    /// Index in `Tree::leaves`.
+    pub idx: usize,
 }
 
 impl Leaf {
@@ -347,10 +349,69 @@ impl Leaf {
     }
 }
 
+/// One flattened `use` path: `a::{b, c as d}` gives `a::b` and `a::c as d`.
 pub struct UseItem {
     pub module: String,
     pub vis: String,
-    pub tokens: String,
+    pub attrs: String,
+    pub path: String,
+    /// Bound name; `None` for globs and `_`.
+    pub name: Option<String>,
+}
+
+impl UseItem {
+    pub fn text(&self) -> String {
+        format!("{}{} use {}", self.attrs, self.vis, self.path)
+            .trim_start()
+            .to_string()
+    }
+}
+
+pub fn flatten_use(u: &syn::ItemUse, module: &str, out: &mut Vec<UseItem>) {
+    fn walk(t: &syn::UseTree, prefix: &str, out: &mut Vec<(String, Option<String>)>) {
+        match t {
+            syn::UseTree::Path(p) => walk(&p.tree, &format!("{prefix}{} :: ", p.ident), out),
+            syn::UseTree::Name(n) if n.ident == "self" => {
+                let path = prefix.trim_end_matches(" :: ").to_string();
+                let name = path.rsplit(" :: ").next().map(str::to_string);
+                out.push((path, name));
+            }
+            syn::UseTree::Name(n) => {
+                out.push((format!("{prefix}{}", n.ident), Some(n.ident.to_string())))
+            }
+            syn::UseTree::Rename(r) => out.push((
+                format!("{prefix}{} as {}", r.ident, r.rename),
+                (r.rename != "_").then(|| r.rename.to_string()),
+            )),
+            syn::UseTree::Glob(_) => out.push((format!("{prefix}*"), None)),
+            syn::UseTree::Group(g) => g.items.iter().for_each(|i| walk(i, prefix, out)),
+        }
+    }
+    let mut v = Vec::new();
+    let lead = if u.leading_colon.is_some() { ":: " } else { "" };
+    walk(&u.tree, lead, &mut v);
+    let attrs: String = sem_attrs(&u.attrs).map(|a| format!("#[{a}] ")).collect();
+    for (path, name) in v {
+        out.push(UseItem {
+            module: module.to_string(),
+            vis: tok(&u.vis),
+            attrs: attrs.clone(),
+            path,
+            name,
+        });
+    }
+}
+
+/// Textual walk order: module entry (with `#[macro_use]`), exit, leaf.
+pub enum Ev {
+    Enter(bool),
+    Exit,
+    Leaf(usize),
+}
+
+pub struct ModInfo {
+    /// Visibility tokens of the declaration; `?` for the root.
+    pub vis: String,
 }
 
 pub trait Source {
@@ -428,6 +489,8 @@ fn path_attr(attrs: &[Attribute]) -> Option<String> {
 pub struct Tree {
     pub leaves: Vec<Leaf>,
     pub uses: Vec<UseItem>,
+    pub mods: BTreeMap<String, ModInfo>,
+    pub events: Vec<Ev>,
     /// Every comment and wrapper doc attribute in the tree.
     pub pool: Vec<String>,
     pub files: Vec<String>,
@@ -444,6 +507,8 @@ struct FileCx<'a> {
 /// `mod x;` declarations.
 pub fn load(src: &dyn Source, root: &str, module: &str) -> Res<Tree> {
     let mut t = Tree::default();
+    t.mods
+        .insert(module.to_string(), ModInfo { vis: "?".into() });
     t.file(src, root, module, &BTreeSet::new())?;
     let mut total: BTreeMap<String, usize> = BTreeMap::new();
     for l in &t.leaves {
@@ -510,6 +575,9 @@ impl Tree {
                     let mut mctx = ctx.clone();
                     mctx.extend(sem_attrs(&m.attrs));
                     let sub = format!("{module}::{}", m.ident);
+                    self.mods.insert(sub.clone(), ModInfo { vis: tok(&m.vis) });
+                    let macro_use = m.attrs.iter().any(|a| a.path().is_ident("macro_use"));
+                    self.events.push(Ev::Enter(macro_use));
                     if let Some((brace, inner)) = &m.content {
                         let open = cx.f.off(brace.span.open().end());
                         let subdir = format!("{dir}/{}", m.ident);
@@ -527,6 +595,7 @@ impl Tree {
                         };
                         self.file(cx.src, &p, &sub, &mctx)?;
                     }
+                    self.events.push(Ev::Exit);
                 }
                 Item::Impl(i) => {
                     self.pool.extend(doc_attrs(&i.attrs));
@@ -553,15 +622,7 @@ impl Tree {
                         p = e;
                     }
                 }
-                Item::Use(u) => {
-                    let mut u = u.clone();
-                    let vis = take_vis(&mut u.vis);
-                    self.uses.push(UseItem {
-                        module: module.to_string(),
-                        vis,
-                        tokens: tok(&u),
-                    });
-                }
+                Item::Use(u) => flatten_use(u, module, &mut self.uses),
                 _ => {
                     if let Some(p) = item_parts(item) {
                         self.leaf(cx, module, None, p, ctx, prev, end, None);
@@ -591,6 +652,7 @@ impl Tree {
             .filter(|c| c.at >= from && c.at < to)
             .map(|c| c.text.clone())
             .collect();
+        self.events.push(Ev::Leaf(self.leaves.len()));
         self.leaves.push(Leaf {
             module: module.to_string(),
             owner,
@@ -604,6 +666,7 @@ impl Tree {
             line: cx.f.line_of(from),
             ord: None,
             func,
+            idx: self.leaves.len(),
         });
     }
 }
