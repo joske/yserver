@@ -1,0 +1,52 @@
+# Phase 1a for scanout.rs: its inline #[cfg(test)] module(s) go out
+# of line at the same logical paths; production items stay in place.
+source = "crates/yserver/src/kms/vk/scanout.rs"
+module = "kms::vk::scanout"
+dir = "crates/yserver/src/kms/vk/scanout"
+root_form = "file"
+table = "vk_scanout.paths"
+
+[[modules]]
+name = ""
+items = [
+  "const *",
+  "enum *",
+  "fn *",
+  "impl < 'a > ProbeFence < 'a >",
+  "impl BoState",
+  "impl CopiedDestinationOwnership",
+  "impl CopiedProbeReadback < '_ >",
+  "impl CopiedRenderSource",
+  "impl CopiedRenderTargetContents",
+  "impl CopiedScanoutPlan",
+  "impl CopiedScanoutPool",
+  "impl CopiedSourceOwnership",
+  "impl DisposableProbeAttempt for CopiedDisposableProbeAttempt",
+  "impl DisposableProbeAttempt for CopiedScanoutPool",
+  "impl DisposableProbeAttempt for ScanoutBoPool",
+  "impl DisposableProbeError",
+  "impl DisposableProbeFence for ProbeFence < '_ >",
+  "impl DrmPlanarBuffer for VkScanoutFb",
+  "impl Drop for CopiedRenderSource",
+  "impl Drop for CopiedScanoutPool",
+  "impl Drop for ProbeFence < '_ >",
+  "impl Drop for ScanoutBo",
+  "impl ExportSemaphoreReuseState",
+  "impl From < io :: Error > for DisposableProbeError",
+  "impl OutputScanout",
+  "impl PartialScanoutBoAllocation",
+  "impl RetainedSyncFile",
+  "impl ScanoutAllocationPlan",
+  "impl ScanoutBo",
+  "impl ScanoutBoPool",
+  "impl ScanoutModifierOverride",
+  "impl std :: fmt :: Display for GbmScanoutError",
+  "struct *",
+  "trait *",
+  "type *",
+  "use *",
+]
+
+[[modules]]
+name = "tests"
+items = ["tests::*"]
