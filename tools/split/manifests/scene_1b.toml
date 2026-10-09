@@ -1,0 +1,241 @@
+# Phase 1b for kms/render/scene/tests.rs: the flat test module becomes
+# tests/mod.rs (imports and the fixtures shared by several topics: stub
+# windows, the legacy emitter and differential fixture, the pixel oracle)
+# plus one topic module per scene stage; each topic starts `use super::*;`.
+# Tests by stage (name + file block), helpers with the only topic using
+# them.
+source = "crates/yserver/src/kms/render/scene/tests.rs"
+module = "kms::render::scene::tests"
+dir = "crates/yserver/src/kms/render/scene/tests"
+table = "scene_1b.paths"
+
+[[modules]]
+name = ""
+items = [
+  "use *",
+  "fn audit_rect",
+  "fn rect",
+  "fn extent",
+  "fn draw_at",
+  "fn region_of",
+  "fn alloc_stub_window",
+  "fn legacy_emit_window_subtree",
+  "struct DrawKey",
+  "fn draw_key",
+  "struct WalkOut",
+  "fn legacy_presence_from_draws",
+  "fn platform_with_layout",
+  "fn build_with",
+  "fn sorted_rects",
+  "fn walk_out_of",
+  "fn walk_with",
+  "fn set_rank",
+  "fn alloc_backing",
+  "fn differential_fixture",
+  "type PixelStack",
+  "fn rasterise",
+  "fn stacks_equal",
+  "fn assert_oracle",
+  "fn alloc_root",
+  "fn area_of",
+  "fn draws_of",
+  "fn win_view",
+  "impl WalkOut",
+  "fn two_windows",
+  "fn set",
+  "fn r",
+]
+
+[[modules]]
+name = "borders"
+lines = ["use super::*;"]
+items = [
+  "fn alloc_stub_window_bordered",
+  "fn dst_rects_of",
+  "fn a_bordered_node_samples_its_whole_outer_extent",
+  "fn a_bordered_parents_child_is_placed_from_the_content_origin",
+  "fn a_child_cannot_overlap_its_parents_border",
+  "fn a_bordered_shaped_windows_mask_is_read_in_content_coordinates",
+  "fn a_clip_shape_narrows_the_child_clip_but_not_the_nodes_own_place",
+  "fn a_redirected_window_is_not_clipped_to_its_parent_and_neither_are_its_children",
+  "fn a_bordered_child_under_a_redirected_ancestor_is_not_displaced",
+  "fn a_borderless_node_needs_no_separate_child_region",
+  "fn the_awesome_two_tile_layout_rings_all_four_sides",
+  "fn the_child_clip_bound_is_absolute_not_storage_local",
+  "fn resize_stub_window_bordered",
+  "fn a_grow_damages_the_full_new_outer_rect",
+  "fn the_bee_tree_with_a_higher_wibar_sibling_matches_the_unclipped_scene",
+]
+
+[[modules]]
+name = "build_scene"
+lines = ["use super::*;"]
+items = [
+  "fn build_scene_recurses_into_mapped_children",
+  "fn build_scene_clips_child_to_parent_bounds",
+  "fn build_scene_clips_window_to_shape_bounding",
+  "fn build_scene_empty_bounding_emits_no_draw",
+  "fn build_scene_absent_bounding_emits_full_window",
+  "fn build_scene_unmapped_parent_hides_subtree",
+  "fn build_scene_appends_cursor_draw_at_top_of_z",
+  "fn build_scene_automatic_redirect_keeps_window_via_backing_storage",
+  "fn build_scene_skips_manual_redirected_window",
+  "fn build_scene_prunes_descendants_of_manual_redirected_ancestor",
+  "fn build_scene_emits_automatic_descendant_under_manual_ancestor",
+  "fn build_scene_cow_none_emits_top_levels",
+  "fn build_scene_cow_none_cursor_at_top",
+  "fn cow_subtree_draws_inherit_alpha_passthrough_true",
+  "fn build_scene_does_not_append_cow_after_top_level_walk",
+  "fn manual_redirected_top_level_skips_emit_unconditional",
+  "fn offscreen_helper_above_fullscreen_still_suppresses_cow",
+  "fn on_output_non_covering_window_above_fullscreen_keeps_cow",
+  "fn automatic_redirected_top_level_still_emits",
+  "fn compositor_stage_under_cow_emits_via_recursion_and_manual_siblings_skip",
+]
+
+[[modules]]
+name = "cursor"
+lines = ["use super::*;"]
+items = [
+  "fn derive_sw_to_hw_queues_show_on_retire",
+  "fn actual_hw_visibility_forces_cursorless_fallback_but_not_hw_rebind",
+  "fn live_source_device_lost_is_the_only_fatal_vulkan_present_error",
+  "fn copied_renderer_acquire_failure_is_fail_stop_before_submit",
+  "fn upload_failure_hides_only_a_recorded_live_binding",
+  "fn retire_hide_skips_ioctl_when_fast_path_already_unbound_the_plane",
+  "fn actual_visible_hw_plus_desired_sw_omits_every_software_cursor_artifact",
+  "fn hw_to_sw_uses_cursorless_hide_then_one_frame_gap_progression",
+  "fn cursorless_hide_phase_removes_sw_draw_sample_and_presented_metadata",
+  "fn repeated_hide_failure_keeps_hw_over_cursorless_frames_and_retries",
+  "fn derive_hw_to_hidden_queues_hide_on_retire",
+  "fn stationary_cursor_same_rect_mode_and_version_adds_no_damage",
+  "fn moved_sw_cursor_damages_old_and_new_rects",
+  "fn sprite_swap_on_stationary_cursor_damages_once",
+  "fn pure_hw_hide_still_damages_last_present_rect",
+  "fn derive_hw_to_hw_no_transition",
+  "fn pending_show_output_receives_later_sprite_retry",
+  "fn failed_unbound_show_records_hidden_and_clears_claimed_metadata",
+  "fn failed_hide_retains_actual_hw_and_last_known_metadata",
+  "fn failed_visible_rebind_forces_full_show_retry_without_claiming_version",
+  "fn unrelated_old_ack_cannot_clear_newer_show_retry",
+  "fn older_show_retirement_cannot_clear_newer_sprite_retry",
+  "fn matching_show_success_clears_only_its_retry_generation",
+  "fn lifecycle_reset_discards_stale_retry_before_fresh_hidden_show",
+  "fn derive_sw_or_hidden_to_sw_advances_mode_no_transition",
+  "fn classify_cursor_mode_dual_output_cursor_on_one_monitor_is_hw",
+  "fn classify_cursor_mode_single_output_cases",
+  "fn classify_cursor_mode_hw_and_sw_is_mixed",
+  "fn classify_cursor_mode_no_outputs_is_sw",
+  "fn cursor_mode_mixed_when_transition_pending",
+]
+
+[[modules]]
+name = "partial_compose"
+lines = ["use super::*;"]
+items = [
+  "fn dispatch_clip_rects_lands_per_output_clipped",
+  "fn clip_rect_to_output_extent_handles_all_cases",
+  "fn buffer_age_ring_trims_to_depth",
+  "fn buffer_age_contains_all_strict_window",
+  "fn opaque_root",
+  "fn small_damage",
+  "fn clipped_path_is_taken_for_small_damage_under_an_opaque_root",
+  "fn painted_always_covers_what_was_requested",
+  "fn empty_draw_list_forces_full",
+  "fn unloadable_bo_forces_full",
+  "fn copied_route_forces_full",
+  "fn a_blended_bottom_layer_forces_full",
+  "fn an_opaque_draw_that_does_not_reach_the_damage_forces_full",
+  "fn a_fractional_edge_does_not_count_as_covering",
+  "fn damage_above_the_threshold_renders_full",
+  "fn the_threshold_is_measured_on_what_will_be_painted",
+  "fn a_single_contiguous_damage_rect_renders_under_one_scissor",
+  "fn two_separated_rects_render_per_rect_and_painted_excludes_the_gap",
+  "fn adjacent_rects_stay_under_one_scissor",
+  "fn per_rect_rendering_keeps_frames_off_the_full_path",
+  "fn a_fragmented_region_still_renders_per_rect",
+  "fn a_region_past_its_own_cap_arrives_already_collapsed",
+  "fn scissors_are_disjoint_which_the_overlay_xor_depends_on",
+  "fn a_full_fallback_still_claims_the_whole_output",
+  "fn culling_drops_draws_outside_the_rect_and_keeps_order",
+]
+
+[[modules]]
+name = "projection"
+lines = ["use super::*;"]
+items = [
+  "fn build_with_elsewhere",
+  "fn drawable_of",
+  "fn projected_sorted",
+  "fn hidden_paint_projects_nothing_and_does_not_force",
+  "fn hidden_damage_is_not_presented_so_the_scheduler_can_go_dormant",
+  "fn damage_visible_on_one_output_keeps_the_drawable_armed",
+  "fn paint_across_a_cover_edge_projects_only_the_visible_side",
+  "fn off_output_paint_still_forces_a_compose",
+  "fn uncovering_a_window_surfaces_its_accumulated_hidden_paint",
+  "fn hidden_on_one_output_visible_on_the_other",
+  "fn dormancy_keeps_a_drawable_armed_when_a_skipped_output_may_present_it",
+  "fn dormancy_flags_hidden_damage_when_every_walked_output_declined_it",
+  "fn dormancy_flags_no_pieces_when_no_output_shows_it",
+  "fn dormancy_runs_without_every_output_walking",
+  "fn other_output_damage_is_neither_forced_nor_carried_here",
+  "fn damage_off_output_forces_a_compose_but_is_never_carried",
+  "fn an_output_never_acks_damage_it_did_not_present",
+  "fn a_spanning_paint_is_handed_to_the_output_that_did_not_compose_it",
+  "fn fan_out_skips_outputs_that_show_it_or_cannot",
+  "fn off_mode_projection_is_unchanged_by_stage_c",
+  "fn only_off_output_damage_forces",
+  "fn intersect_rects_clips_and_rejects_disjoint",
+  "fn e16_like_fixture",
+  "fn walk_bench",
+]
+
+[[modules]]
+name = "tick"
+lines = ["use super::*;"]
+items = [
+  "fn damage_audit_attribution_filters_to_episode_event_range",
+  "fn damage_audit_partial_compose_is_detectable",
+  "fn copied_completion_requires_exact_job_and_paired_bo",
+  "fn copied_frame_cannot_retire_before_sink_kms_submission",
+  "fn kms_retirement_requires_the_exact_paired_bo",
+  "fn global_drain_waits_and_releases_every_deferred_scene_resource",
+  "fn global_drain_retains_every_resource_whose_fence_wait_fails",
+  "fn tick_outcome_only_clears_dirty_for_compose_or_empty_skip",
+  "fn nothing_pending_skip_did_not_walk",
+  "fn walk_needed_for_each_input_alone_and_not_otherwise",
+  "fn pending_presentation_is_decided_per_output_from_retained_pieces",
+  "fn dormant_only_damage_does_not_walk_until_a_paint_rearms_it",
+  "fn empty_projection_force_compose_gates_on_real_captured_damage",
+  "fn stub_scene_is_not_live_and_declines_tick",
+  "fn mark_scene_structure_dirty_is_idempotent",
+  "fn mark_scene_structure_damage_rects_sets_dirty_on_stub",
+  "fn root_overlay_toggle_marks_structure_damage",
+]
+
+[[modules]]
+name = "walk"
+lines = ["use super::*;"]
+items = [
+  "fn refactored_emitter_matches_the_legacy_emitter_exactly",
+  "fn differential_fixture_exercises_every_gate",
+  "fn opaque_cover_accepts_a_union_of_draws_across_a_window_edge",
+  "fn opaque_cover_rejects_a_one_pixel_gap_in_the_union",
+  "fn clipped_path_with_two_scissors_covered_by_different_draws",
+  "fn an_owed_repaint_is_not_an_empty_damage_skip",
+  "fn incomplete_submit_invalidates_instead_of_staging",
+  "fn off_mode_reproduces_the_legacy_root_and_emitter_exactly",
+  "fn visibility_shows_the_same_pixels_as_the_unclipped_scene",
+  "fn a_fully_covered_window_emits_nothing_and_stays_a_participant",
+  "fn a_partly_covered_window_emits_only_its_visible_pieces",
+  "fn an_empty_parent_shape_suppresses_its_children",
+  "fn a_partial_parent_shape_clips_its_children",
+  "fn a_cow_subtree_claims_nothing",
+  "fn an_opaque_automatic_child_claims_through_a_manual_parent",
+  "fn straddling_windows_and_layout_origins_sample_the_right_texels",
+  "fn a_redirected_backing_larger_than_its_host_is_sampled_unstretched",
+  "fn a_collapsed_universe_over_emits_but_shows_the_same_pixels",
+  "fn hiding_a_window_by_moving_another_over_it_damages_only_the_mover",
+  "fn swapping_two_overlapping_top_levels_damages_only_their_overlap",
+  "fn off_mode_presences_are_fully_visible",
+]
