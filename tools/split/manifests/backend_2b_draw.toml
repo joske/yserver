@@ -1,0 +1,21 @@
+# Phase 2.11b (draw): trait bodies of `impl Backend for KmsBackend` move to
+# inherent `backend_<subsystem>_<method>` helpers; the trait methods forward.
+# Identity path table shared by all 2.11b commits.
+source = "crates/yserver/src/kms/render/backend.rs"
+module = "kms::render::backend"
+dir = "crates/yserver/src/kms/render/backend"
+root_form = "file"
+table = "backend_2b.paths"
+modules = []
+
+[locations]
+"portable::draw::impl KmsBackend::fn backend_draw_copy_area" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage) whose recorded caller file:line moves with the delegated body (backend/trait_impl.rs → backend/portable/draw.rs); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"portable::draw::impl KmsBackend::fn backend_draw_put_image" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage) whose recorded caller file:line moves with the delegated body (backend/trait_impl.rs → backend/portable/draw.rs); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"trait_impl::impl Backend for KmsBackend::fn set_dpms_power" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage) whose recorded caller line shifts inside backend/trait_impl.rs (bodies above it became delegators); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+
+[log_targets]
+"portable::draw::impl KmsBackend::fn backend_draw_copy_area" = "log macros without target: the delegated body moves from kms::render::backend::trait_impl (a module only since 2.11a) to kms::render::backend::portable::draw; both stay under kms::render::backend, so backend-level RUST_LOG filters still match"
+"portable::draw::impl KmsBackend::fn backend_draw_copy_plane" = "log macros without target: the delegated body moves from kms::render::backend::trait_impl (a module only since 2.11a) to kms::render::backend::portable::draw; both stay under kms::render::backend, so backend-level RUST_LOG filters still match"
+"portable::draw::impl KmsBackend::fn backend_draw_get_image" = "log macros without target: the delegated body moves from kms::render::backend::trait_impl (a module only since 2.11a) to kms::render::backend::portable::draw; both stay under kms::render::backend, so backend-level RUST_LOG filters still match"
+"portable::draw::impl KmsBackend::fn backend_draw_put_image" = "log macros without target: the delegated body moves from kms::render::backend::trait_impl (a module only since 2.11a) to kms::render::backend::portable::draw; both stay under kms::render::backend, so backend-level RUST_LOG filters still match"
+"portable::draw::impl KmsBackend::fn backend_draw_read_depth1_pixmap" = "log macros without target: the delegated body moves from kms::render::backend::trait_impl (a module only since 2.11a) to kms::render::backend::portable::draw; both stay under kms::render::backend, so backend-level RUST_LOG filters still match"

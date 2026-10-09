@@ -3845,11 +3845,8 @@ impl Backend for KmsBackend {
         Self::backend_windows_set_container_background_pixmap(self, _origin, host_pixmap_xid)
     }
 
-    // ── GC state ────────────────────────────────────────────────
-
     fn clear_clip_rectangles(&mut self, _origin: Option<OriginContext>) -> io::Result<()> {
-        self.core.current_clip = ClipState::None;
-        Ok(())
+        Self::backend_clip_clear_clip_rectangles(self, _origin)
     }
 
     fn set_clip_rectangles(
@@ -3857,18 +3854,7 @@ impl Backend for KmsBackend {
         _origin: Option<OriginContext>,
         clip: Option<ClipRectangles>,
     ) -> io::Result<()> {
-        self.core.current_clip = match clip {
-            Some(rects) => ClipState::Rectangles {
-                origin: (rects.x_origin, rects.y_origin),
-                rects,
-            },
-            None => ClipState::None,
-        };
-        // Do NOT clear clip_mask_cache: frozen-snapshot contract keeps the
-        // bytes valid across clip changes (X11 retain-after-free). The cache
-        // is invalidated by content_version change or DrawableId mismatch on
-        // next Pixmap install.
-        Ok(())
+        Self::backend_clip_set_clip_rectangles(self, _origin, clip)
     }
 
     fn set_clip_pixmap(
@@ -3878,32 +3864,11 @@ impl Backend for KmsBackend {
         clip_x_origin: i16,
         clip_y_origin: i16,
     ) -> io::Result<()> {
-        let Some(handle) = PixmapHandle::from_raw(host_pixmap) else {
-            self.core.current_clip = ClipState::None;
-            // Do NOT clear clip_mask_cache: the frozen-snapshot contract
-            // (X11 retain-after-free) keeps the bytes valid even when the
-            // clip is cleared. The cache is invalidated only by a content_version
-            // change or a DrawableId mismatch on next use.
-            return Ok(());
-        };
-        self.core.current_clip = ClipState::Pixmap {
-            origin: (clip_x_origin, clip_y_origin),
-            pixmap: handle,
-        };
-        // Install the clip metadata + eagerly refresh the GPU snapshot here.
-        // The CPU bytes are deferred until a run-based clip consumer actually
-        // needs them. wmaker's title-bar buttons still work because
-        // `poly_fill_rectangle` routes through
-        // `intersect_with_current_clip_live`, which materializes the bytes on
-        // first use.
-        self.install_clip_mask_cache(host_pixmap, (clip_x_origin, clip_y_origin));
-        Ok(())
+        Self::backend_clip_set_clip_pixmap(self, _origin, host_pixmap, clip_x_origin, clip_y_origin)
     }
 
     fn set_gc_fill_solid(&mut self, _origin: Option<OriginContext>) -> io::Result<()> {
-        self.core.current_fill = FillState::Solid;
-        self.fill_pattern_cache = None;
-        Ok(())
+        Self::backend_draw_set_gc_fill_solid(self, _origin)
     }
 
     fn set_gc_fill_tiled(
@@ -3913,24 +3878,13 @@ impl Backend for KmsBackend {
         tile_x_origin: i16,
         tile_y_origin: i16,
     ) -> io::Result<()> {
-        // Stage 3f.3: store the FillState::Tiled record so subsequent
-        // fill paths route through the tiled-fill RENDER composite.
-        // The dispatcher also pushes the same state via
-        // `apply_fill_state` before every fill op, so this entry
-        // point is mostly used by ynest's host-X11 flow; preserving
-        // both keeps the Backend trait surface uniform.
-        let Some(handle) = PixmapHandle::from_raw(host_pixmap) else {
-            self.core.current_fill = FillState::Solid;
-            self.fill_pattern_cache = None;
-            return Ok(());
-        };
-        self.core.current_fill = FillState::Tiled {
-            pixmap: handle,
-            origin: (tile_x_origin, tile_y_origin),
-        };
-        self.fill_pattern_cache =
-            self.read_fill_pattern_cache(host_pixmap, (tile_x_origin, tile_y_origin));
-        Ok(())
+        Self::backend_draw_set_gc_fill_tiled(
+            self,
+            _origin,
+            host_pixmap,
+            tile_x_origin,
+            tile_y_origin,
+        )
     }
 
     fn apply_clip_state(
@@ -3938,33 +3892,7 @@ impl Backend for KmsBackend {
         _origin: Option<OriginContext>,
         clip: &ClipState,
     ) -> io::Result<()> {
-        self.core.current_clip = clip.clone();
-        // X11 ChangeGC clip-mask=<pixmap> propagates through
-        // `resolve_draw_state` → here, not `set_clip_pixmap`. Install
-        // the clip metadata so `intersect_with_current_clip_live` can gate
-        // paint to the mask shape. wmaker title-bar buttons are the
-        // canonical client: the title bar uses the same GC, alternating
-        // clip-mask=<glyph> with clip-mask=None for solid fills.
-        //
-        // Frozen-snapshot policy: the cache survives clip→None transitions
-        // (X11 retain-after-free — XSetClipMask snapshots the bitmap) and
-        // reuse is validated by DrawableId + content_version on next Pixmap
-        // apply. Re-reading via engine.get_image on every GC apply is the
-        // gkrellm submit-storm (project_client_scheduling_fairness), so the
-        // CPU bytes stay deferred until a CPU-clipped op really needs them.
-        match clip {
-            ClipState::Pixmap { origin, pixmap } => {
-                let xid = pixmap.as_raw();
-                self.install_clip_mask_cache(xid, *origin);
-            }
-            _ => {
-                // Do NOT clear clip_mask_cache: the frozen-snapshot contract
-                // keeps the bytes valid across clip→None and clip→Rectangles
-                // transitions. The cache is invalidated by content_version
-                // change or DrawableId mismatch when next re-installed.
-            }
-        }
-        Ok(())
+        Self::backend_clip_apply_clip_state(self, _origin, clip)
     }
 
     fn apply_fill_state(
@@ -3972,29 +3900,7 @@ impl Backend for KmsBackend {
         _origin: Option<OriginContext>,
         fill: &FillState,
     ) -> io::Result<()> {
-        self.core.current_fill = fill.clone();
-        match fill {
-            FillState::Tiled { pixmap, origin }
-            | FillState::Stippled { pixmap, origin }
-            | FillState::OpaqueStippled { pixmap, origin } => {
-                let xid = pixmap.as_raw();
-                if let Some(fresh) = self.read_fill_pattern_cache(xid, *origin) {
-                    self.fill_pattern_cache = Some(fresh);
-                } else if let Some(cache) = self.fill_pattern_cache.as_mut() {
-                    if cache.pixmap_xid == xid {
-                        cache.origin = *origin;
-                    } else {
-                        self.fill_pattern_cache = None;
-                    }
-                } else {
-                    self.fill_pattern_cache = None;
-                }
-            }
-            FillState::Solid => {
-                self.fill_pattern_cache = None;
-            }
-        }
-        Ok(())
+        Self::backend_draw_apply_fill_state(self, _origin, fill)
     }
 
     fn apply_draw_state(
@@ -4002,55 +3908,8 @@ impl Backend for KmsBackend {
         _origin: Option<OriginContext>,
         state: &DrawState,
     ) -> io::Result<()> {
-        if let Some(font) = state.font {
-            self.core.current_font = Some(font.as_raw());
-        }
-        self.core.current_function = state.function;
-        self.core.current_plane_mask = state.plane_mask;
-        self.core.current_foreground = state.foreground;
-        self.core.current_background = state.background;
-        self.core.current_fill = state.fill.clone();
-        self.core.current_clip = state.clip.clone();
-        match &state.fill {
-            FillState::Tiled { pixmap, origin }
-            | FillState::Stippled { pixmap, origin }
-            | FillState::OpaqueStippled { pixmap, origin } => {
-                let xid = pixmap.as_raw();
-                if let Some(fresh) = self.read_fill_pattern_cache(xid, *origin) {
-                    self.fill_pattern_cache = Some(fresh);
-                } else if let Some(cache) = self.fill_pattern_cache.as_mut() {
-                    if cache.pixmap_xid == xid {
-                        cache.origin = *origin;
-                    } else {
-                        self.fill_pattern_cache = None;
-                    }
-                } else {
-                    self.fill_pattern_cache = None;
-                }
-            }
-            FillState::Solid => {
-                self.fill_pattern_cache = None;
-            }
-        }
-        // Stage 4d Manual-redirect fix: drawing through a
-        // `ClipByChildren` GC into a window must exclude every
-        // mapped child window's area. Capture the mode here so
-        // `copy_area` (and any other future op that consults it)
-        // can split the destination rect against the child rects.
-        self.core.current_subwindow_mode = state.subwindow_mode;
-        // Stroke state — consumed by poly_line / poly_segment /
-        // poly_rectangle / poly_arc via `kms::render::stroke::stroke_path`.
-        self.core.current_line_width = state.line_width;
-        self.core.current_line_style = state.line_style;
-        self.core.current_cap_style = state.cap_style;
-        self.core.current_join_style = state.join_style;
-        self.core.current_dashes = state.dashes.clone();
-        self.core.current_dash_offset = u16::try_from(state.dash_offset).unwrap_or(0);
-        self.core.current_arc_mode = state.arc_mode;
-        Ok(())
+        Self::backend_draw_apply_draw_state(self, _origin, state)
     }
-
-    // ── Drawing primitives (paint paths) ────────────────────────
 
     fn copy_area(
         &mut self,
@@ -4064,491 +3923,18 @@ impl Backend for KmsBackend {
         width: u16,
         height: u16,
     ) -> io::Result<()> {
-        self.telemetry.record_copy_area_call();
-        // IncludeInferiors copies what the source shows, its inferiors'
-        // pixels too (`miHandleExposures` exposes only what falls outside
-        // `NotClippedByChildren`); a window keeping its own storage holds
-        // only its own.
-        if src_host_xid != self.core.window_id
-            && matches!(
-                self.core.current_subwindow_mode,
-                yserver_core::backend::SubwindowMode::IncludeInferiors
-            )
-            && self.windows.contains_key(&src_host_xid)
-        {
-            let area = vk::Rect2D {
-                offset: vk::Offset2D {
-                    x: i32::from(src_x),
-                    y: i32::from(src_y),
-                },
-                extent: vk::Extent2D {
-                    width: u32::from(width),
-                    height: u32::from(height),
-                },
-            };
-            if let Some(scratch) = self.window_inferiors_snapshot(src_host_xid, Some(area)) {
-                let result = self.copy_area(
-                    _origin,
-                    scratch,
-                    dst_host_xid,
-                    0,
-                    0,
-                    dst_x,
-                    dst_y,
-                    width,
-                    height,
-                );
-                let _ = self.free_pixmap(None, scratch);
-                return result;
-            }
-        }
-        // Resolve the SOURCE the same way as the destination. A window
-        // that is Composite-redirected (or whose ancestor is) has its
-        // pixels in the redirect *backing*; its own leaf storage is
-        // never painted into. So a window→window self-copy — exactly
-        // what a Tk text widget does to scroll its diff pane — MUST
-        // read from the backing. Reading the raw leaf storage copies
-        // blank/background pixels over the live content, progressively
-        // blanking the widget (gitk diff-pane bug).
-        // `src_off` is the source window's offset within its backing;
-        // it converts the wire window-local src coords into backing
-        // coords.
-        let Some(src_target) = self.resolve_paint_target(src_host_xid) else {
-            if !self.windows.contains_key(&src_host_xid) {
-                log::warn!(
-                    "render copy_area dropped — src unresolvable: src=0x{src_host_xid:x} \
-                     dst=0x{dst_host_xid:x} src_xy=({src_x},{src_y}) dst_xy=({dst_x},{dst_y}) {width}x{height}",
-                );
-            }
-            self.log_unresolved_target(src_host_xid, "copy_area_unknown_xid");
-            return Ok(());
-        };
-        let (src, src_off): (crate::kms::render::store::DrawableId, (i32, i32)) =
-            (src_target.backing_id(), src_target.offset());
-        // #133 step 3 (P4): the CLIENT handles. `src` above stays for
-        // identity comparisons (self-copy, COW routing) and tracing —
-        // it cannot paint, since every engine op takes `Src`/`Dst`.
-        let src_h = src_target.src();
-        // Stage 4a — dst resolves through `resolve_paint_target` so
-        // copy_area into a redirected window lands in the backing
-        // with the descendant offset applied.
-        let Some(dst_target) = self.resolve_paint_target(dst_host_xid) else {
-            if !self.windows.contains_key(&dst_host_xid) {
-                log::warn!(
-                    "render copy_area dropped — dst unresolvable: src=0x{src_host_xid:x} dst=0x{dst_host_xid:x} \
-                     src_xy=({src_x},{src_y}) dst_xy=({dst_x},{dst_y}) {width}x{height}",
-                );
-            }
-            self.log_unresolved_target(dst_host_xid, "copy_area_unknown_xid");
-            return Ok(());
-        };
-        // Screenshot fast-path: `CopyArea(src=root, …, IncludeInferiors)` must
-        // copy the COMPOSITED desktop (all mapped windows), not the root's own
-        // storage (background only). Handled by reading the on-screen scanout,
-        // mirroring `get_image`'s root special-case. Returns `true` when it took
-        // the copy; `false` falls through to the ordinary root-storage path
-        // (non-plain GC state, or no live outputs).
-        if self.try_copy_area_root_scanout(
+        Self::backend_draw_copy_area(
+            self,
+            _origin,
             src_host_xid,
             dst_host_xid,
-            &dst_target,
             src_x,
             src_y,
             dst_x,
             dst_y,
             width,
             height,
-        )? {
-            return Ok(());
-        }
-        // Stage 4d Manual-redirect fix: split the copy by
-        // `subwindow_mode = ClipByChildren` rules when dst is a
-        // window. Each surviving sub-rect is in dst-window-local
-        // coords; we issue one engine.copy_area per sub-rect,
-        // adjusting src offsets by the sub-rect's delta from the
-        // original dst_xy. IncludeInferiors (mode=1) keeps the
-        // single-rect fast path. Pixmap destinations also keep the
-        // fast path (no children to clip against). The non-mask scissor
-        // machinery lives in `compute_copy_area_scissors`.
-        // Step 1: GC clip intersection (X11 GC `clip-mask` /
-        // `SetClipRectangles`). When the GC has explicit clip
-        // rectangles, every paint is masked against them first;
-        // `ClipState::None` means "no GC clip", and we keep the
-        // single-rect fast path. `ClipState::Pixmap` intersects with
-        // the rasterized mask (pixel runs via
-        // intersect_with_current_clip_live).
-        if matches!(
-            self.core.current_clip,
-            yserver_core::backend::ClipState::Pixmap { .. }
-        ) {
-            use yserver_core::backend::GcFunction;
-            // ── GPU masked-blit route (Task 14) ──────────────────────
-            // Insert BEFORE `intersect_with_current_clip_live` — that call
-            // materializes CPU clip bytes for the run-based path. For
-            // in-scope clip-masked GXcopy copies, route ONE masked draw
-            // (mask = the eagerly-populated GPU snapshot,
-            // non-mask scissors = compute_copy_area_scissors). Out-of-scope
-            // cases fall through to the run-based path unchanged.
-            let route_fn = self.core.current_function;
-            // The drawable's own depth, not its storage's: a depth-24 child
-            // painting into a depth-32 ancestor backing still has 24 planes,
-            // and its CPU fallback must force its alpha like any depth-24 write.
-            let route_dst_depth = dst_target.x11_depth();
-            let route_full_mask = depth_plane_mask(route_dst_depth);
-            let route_plane_mask = self.core.current_plane_mask & route_full_mask;
-            let route_snapshot = if copy_area_masked_blit_eligible(
-                route_fn,
-                route_plane_mask,
-                route_full_mask,
-                route_dst_depth,
-            ) {
-                self.clip_mask_snapshot
-                    .as_ref()
-                    .map(|s| (s.id, s.pixmap_xid))
-            } else {
-                None
-            };
-            if let Some((sid, snap_xid)) = route_snapshot {
-                // COORDINATE SPACES: the masked draw runs in dst BACKING/IMAGE
-                // space (gl_FragCoord = image pixel). Mirror the run path's
-                // shifts: src by `src_off`, dst by `dst_target.offset()`, clip
-                // origin by `dst_target.offset()`, scissors (local) by
-                // `dst_target.offset()`. `src_off` and `dst_target.offset()` are
-                // both `(i32, i32)` tuples accessed via `.0`/`.1`.
-                let (sox, soy) = src_off;
-                let (tox, toy) = dst_target.offset();
-                let scissors: Vec<ash::vk::Rect2D> = self
-                    .compute_copy_area_scissors(
-                        dst_host_xid,
-                        &dst_target,
-                        dst_x,
-                        dst_y,
-                        width,
-                        height,
-                    )
-                    .into_iter()
-                    .map(|r| ash::vk::Rect2D {
-                        offset: ash::vk::Offset2D {
-                            x: r.offset.x + tox,
-                            y: r.offset.y + toy,
-                        },
-                        extent: r.extent,
-                    })
-                    .collect();
-                if scissors.is_empty() {
-                    // Fully clipped away — spec-correct no-op.
-                    return Ok(());
-                }
-
-                // Single refresh mechanism (Task 11/13): re-snapshot only when
-                // the live mask changed since the snapshot AND the source
-                // pixmap is still alive. If freed, the snapshot (populated at
-                // install) is authoritative — retain-after-free.
-                if let Some(did) = self.store.lookup(snap_xid) {
-                    let live_ver = self.store.get(did).map(|d| d.content_version);
-                    if let Some(v) = live_ver
-                        && self.engine.clip_snapshot_version(sid) != live_ver
-                    {
-                        self.engine
-                            .refresh_clip_snapshot(&mut self.store, &mut self.platform, sid, did, v)
-                            .map_err(|e| {
-                                io::Error::other(format!("refresh_clip_snapshot: {e:?}"))
-                            })?;
-                    }
-                }
-
-                let (origin_x, origin_y) = match &self.core.current_clip {
-                    yserver_core::backend::ClipState::Pixmap { origin, .. } => *origin,
-                    _ => (0, 0),
-                };
-                let mask = crate::kms::render::engine::MaskedCopyMask {
-                    image: self.engine.clip_snapshot_image(sid).unwrap(),
-                    view: self.engine.clip_snapshot_view(sid).unwrap(),
-                    old_layout: self.engine.clip_snapshot_layout(sid).unwrap(),
-                    extent: self.engine.clip_snapshot_extent(sid).unwrap(),
-                    // Clip origin shifted into image space (see COORDINATE
-                    // SPACES): frag mask_texel = image_pixel - clip_origin.
-                    clip_origin: [i32::from(origin_x) + tox, i32::from(origin_y) + toy],
-                    snapshot_id: Some(sid),
-                };
-                let dst = dst_target.dst();
-                // Task 15: count the single masked draw. This path issues ONE
-                // masked blit (no per-sub-rect fan-out → does NOT call
-                // record_copy_area_gpu_subrect_at(true)) and reads the clip from
-                // the eagerly-populated GPU snapshot (no per-copy
-                // read_clip_mask_bytes → does NOT bump get_image_by_site[ClipMask]).
-                self.telemetry.record_copy_area_masked_draw();
-                self.engine
-                    .masked_copy_area(
-                        &mut self.store,
-                        &mut self.platform,
-                        src_h,
-                        dst,
-                        ash::vk::Offset2D {
-                            x: i32::from(src_x) + sox,
-                            y: i32::from(src_y) + soy,
-                        },
-                        ash::vk::Offset2D {
-                            x: i32::from(dst_x) + tox,
-                            y: i32::from(dst_y) + toy,
-                        },
-                        ash::vk::Extent2D {
-                            width: width.into(),
-                            height: height.into(),
-                        },
-                        mask,
-                        &scissors,
-                    )
-                    .map_err(|e| io::Error::other(format!("masked_copy_area: {e:?}")))?;
-                // Every pixel of a depth-24 child's area is opaque in a
-                // depth-32 backing, so stamping the whole scissor (not only
-                // the mask's pixels) is exact, not an approximation.
-                self.stamp_opaque_alpha_if_shared(dst_target, &scissors);
-                self.scene.wake_for_damage();
-                // ONE masked draw replaces the run fan-out. Telemetry: Task 15.
-                return Ok(());
-            }
-
-            let local = Rectangle16 {
-                x: dst_x,
-                y: dst_y,
-                width,
-                height,
-            };
-            // #133 step 3 (P4): content clip first (local space), then the
-            // bitmap clip runs. Identity with no border clip.
-            let local_clipped = dst_target.clip_local_rects(&[local]);
-            let runs = self.intersect_with_current_clip_live(&local_clipped);
-            // Mask runs honor function/plane-mask via the CPU path
-            // (Copy through apply_gc_function = src — bitwise exact).
-            let function = self.core.current_function;
-            if matches!(function, GcFunction::NoOp) {
-                return Ok(());
-            }
-            // As `route_dst_depth` above: the drawable's depth, not its storage's.
-            let dst_depth = dst_target.x11_depth();
-            let full_mask = depth_plane_mask(dst_depth);
-            let plane_mask = self.core.current_plane_mask & full_mask;
-            if plane_mask == 0 {
-                return Ok(());
-            }
-            // Fast path: GXcopy + full plane-mask is a plain copy clipped
-            // to the mask runs — each run is a rectangle, so blit it on the
-            // GPU instead of the read-modify-write `copy_area_rop_cpu` path
-            // (2 readbacks + per-pixel loop + upload PER RUN). gkrellm
-            // draws clip-masked GXcopy at ~250 calls/s × ~6 runs → ~1500
-            // CPU runs/s, each stalling on uncached GPU readbacks, which
-            // pinned the core loop (2026-06-20 investigation). Only the CPU
-            // RMW is needed for genuine non-Copy rops / partial plane masks.
-            let gpu_fast = copy_area_clip_gpu_eligible(function, plane_mask, full_mask);
-            let routes_to_cow =
-                self.cow_id == Some(dst_target.backing_id()) && src != dst_target.backing_id();
-            let mut any_gpu = false;
-            let mut copied: Vec<ash::vk::Rect2D> = Vec::new();
-            for run in runs {
-                let sub_src = ash::vk::Rect2D {
-                    offset: ash::vk::Offset2D {
-                        x: i32::from(src_x) + src_off.0 + (i32::from(run.x) - i32::from(dst_x)),
-                        y: i32::from(src_y) + src_off.1 + (i32::from(run.y) - i32::from(dst_y)),
-                    },
-                    extent: ash::vk::Extent2D {
-                        width: u32::from(run.width),
-                        height: u32::from(run.height),
-                    },
-                };
-                let dst_pos = ash::vk::Offset2D {
-                    x: i32::from(run.x) + dst_target.offset().0,
-                    y: i32::from(run.y) + dst_target.offset().1,
-                };
-                if gpu_fast {
-                    self.engine_copy_area_calls = self.engine_copy_area_calls.wrapping_add(1);
-                    self.telemetry.record_copy_area_gpu_subrect_at(true);
-                    let res = if routes_to_cow {
-                        self.engine.cow_copy_area(
-                            &mut self.store,
-                            &mut self.platform,
-                            dst_target.dst(),
-                            src_h,
-                            sub_src,
-                            dst_pos,
-                        )
-                    } else {
-                        self.engine.copy_area(
-                            &mut self.store,
-                            &mut self.platform,
-                            src_h,
-                            dst_target.dst(),
-                            sub_src,
-                            dst_pos,
-                        )
-                    };
-                    if let Err(e) = res {
-                        log::warn!(
-                            "render copy_area: clip-masked engine.copy_area failed \
-                             (src=0x{src_host_xid:x} dst=0x{dst_host_xid:x} run={sub_src:?} \
-                             cow_routed={routes_to_cow}): {e:?}",
-                        );
-                    } else {
-                        any_gpu = true;
-                        copied.push(ash::vk::Rect2D {
-                            offset: dst_pos,
-                            extent: sub_src.extent,
-                        });
-                    }
-                } else {
-                    self.telemetry.record_copy_area_cpu_pixmap_clip();
-                    self.copy_area_rop_cpu(
-                        src_h,
-                        dst_target.dst(),
-                        sub_src,
-                        dst_pos,
-                        function,
-                        plane_mask,
-                        dst_depth,
-                    );
-                }
-            }
-            self.stamp_opaque_alpha_if_shared(dst_target, &copied);
-            if any_gpu && !routes_to_cow {
-                self.telemetry.record_paint_submit();
-                self.trace_simple(SubmitKind::CopyArea, dst_target.backing_id(), 1);
-            }
-            self.scene.wake_for_damage();
-            return Ok(());
-        }
-        // Non-mask clip machinery (GC clip-rect intersect + ClipByChildren
-        // child subtraction + higher-sibling occluder subtraction), in
-        // drawable-LOCAL space. Extracted into `compute_copy_area_scissors`
-        // and shared with the GPU masked path (Task 14). Behaviour is
-        // identical: an empty result (GC clip empty OR fully occluded) is a
-        // spec-correct no-op handled by the `sub_rects.is_empty()` guard.
-        let sub_rects: Vec<ash::vk::Rect2D> =
-            self.compute_copy_area_scissors(dst_host_xid, &dst_target, dst_x, dst_y, width, height);
-        if sub_rects.is_empty() {
-            // Whole copy is fully clipped away (empty GC clip, or fully
-            // covered by mapped children / higher siblings).
-            return Ok(());
-        }
-        // GC function + plane-mask on copies (X11 §CopyArea uses the
-        // full rop set). The engine blit is raw GXcopy; anything else
-        // (or a partial plane mask) takes the CPU read-modify-write
-        // path. NoOp = spec-correct no-op.
-        {
-            use yserver_core::backend::GcFunction;
-            let function = self.core.current_function;
-            if matches!(function, GcFunction::NoOp) {
-                return Ok(());
-            }
-            let dst_depth = dst_target.x11_depth();
-            let full_mask = depth_plane_mask(dst_depth);
-            let plane_mask = self.core.current_plane_mask & full_mask;
-            if plane_mask == 0 {
-                return Ok(());
-            }
-            if !matches!(function, GcFunction::Copy) || plane_mask != full_mask {
-                for sub in &sub_rects {
-                    let sub_src = ash::vk::Rect2D {
-                        offset: ash::vk::Offset2D {
-                            x: i32::from(src_x) + src_off.0 + (sub.offset.x - i32::from(dst_x)),
-                            y: i32::from(src_y) + src_off.1 + (sub.offset.y - i32::from(dst_y)),
-                        },
-                        extent: sub.extent,
-                    };
-                    let dst_pos = ash::vk::Offset2D {
-                        x: sub.offset.x + dst_target.offset().0,
-                        y: sub.offset.y + dst_target.offset().1,
-                    };
-                    self.telemetry.record_copy_area_cpu_rop();
-                    self.copy_area_rop_cpu(
-                        src_h,
-                        dst_target.dst(),
-                        sub_src,
-                        dst_pos,
-                        function,
-                        plane_mask,
-                        dst_depth,
-                    );
-                }
-                self.scene.wake_for_damage();
-                return Ok(());
-            }
-        }
-        // Stage 5 Task 3 POC: route copy_area to COW through the
-        // frame-builder path. Marco's compositor pump is the hot
-        // workload (silence trace: 47k of 62k copy_areas target
-        // COW). Telemetry for cow-routed copies is deferred.
-        let routes_to_cow =
-            self.cow_id == Some(dst_target.backing_id()) && src != dst_target.backing_id();
-
-        let mut all_ok = true;
-        let mut copied: Vec<ash::vk::Rect2D> = Vec::with_capacity(sub_rects.len());
-        for sub in &sub_rects {
-            let sub_dst_x = sub.offset.x;
-            let sub_dst_y = sub.offset.y;
-            // src coords shift by the same delta the dst sub-rect
-            // shifted from the original dst_xy, plus the source
-            // window's offset within its backing (`src_off`).
-            let sub_src_x = i32::from(src_x) + src_off.0 + (sub_dst_x - i32::from(dst_x));
-            let sub_src_y = i32::from(src_y) + src_off.1 + (sub_dst_y - i32::from(dst_y));
-            let src_sub_rect = ash::vk::Rect2D {
-                offset: ash::vk::Offset2D {
-                    x: sub_src_x,
-                    y: sub_src_y,
-                },
-                extent: sub.extent,
-            };
-            let dst_pos = ash::vk::Offset2D {
-                x: sub_dst_x + dst_target.offset().0,
-                y: sub_dst_y + dst_target.offset().1,
-            };
-            self.engine_copy_area_calls = self.engine_copy_area_calls.wrapping_add(1);
-            self.telemetry.record_copy_area_gpu_subrect_at(false);
-            let res = if routes_to_cow {
-                self.engine.cow_copy_area(
-                    &mut self.store,
-                    &mut self.platform,
-                    dst_target.dst(),
-                    src_h,
-                    src_sub_rect,
-                    dst_pos,
-                )
-            } else {
-                self.engine.copy_area(
-                    &mut self.store,
-                    &mut self.platform,
-                    src_h,
-                    dst_target.dst(),
-                    src_sub_rect,
-                    dst_pos,
-                )
-            };
-            if let Err(e) = res {
-                log::warn!(
-                    "render copy_area: engine.copy_area failed (src=0x{src_host_xid:x} \
-                     dst=0x{dst_host_xid:x} sub_rect={sub:?} cow_routed={routes_to_cow}): {e:?}",
-                );
-                all_ok = false;
-            } else {
-                copied.push(ash::vk::Rect2D {
-                    offset: dst_pos,
-                    extent: sub.extent,
-                });
-            }
-        }
-        // The PresentPixmap path lands here: a raw image copy that carries
-        // the source's X byte into the backing verbatim.
-        self.stamp_opaque_alpha_if_shared(dst_target, &copied);
-        if all_ok {
-            if !routes_to_cow {
-                self.telemetry.record_paint_submit();
-                self.trace_simple(SubmitKind::CopyArea, dst_target.backing_id(), 1);
-            }
-            // Present Copy into COW/backings must wake the scene
-            // compositor immediately; otherwise the damage can sit
-            // until an unrelated input event arrives.
-            self.scene.wake_for_damage();
-        }
-        Ok(())
+        )
     }
 
     fn copy_plane(
@@ -4564,202 +3950,19 @@ impl Backend for KmsBackend {
         height: u16,
         plane: u32,
     ) -> io::Result<()> {
-        // copy_plane decomposes into bg-first + fg-second
-        // `poly_fill_rectangle` calls below; non-`GXcopy` GC.function
-        // is honoured by the underlying `fill_solid_rects` →
-        // `engine.logic_fill` path landed in Stage 3f.2.
-        if width == 0 || height == 0 {
-            return Ok(());
-        }
-
-        // #133 step 3 (P4) — resolve the SOURCE through
-        // `resolve_paint_target` like every other read does, BEFORE
-        // touching storage. A raw `store.lookup` was tolerable while
-        // storage and logical drawable space coincided; with borders it
-        // is neither: it misses COMPOSITE redirect routing (a redirected
-        // source's pixels live in the backing, its leaf is stale — the
-        // same reason `copy_area` resolves its source) and no
-        // hand-reconstructed offset can express nested ancestry. The
-        // handle gives all three: the drawable that HOLDS the pixels,
-        // the content origin inside it, and the content bounds.
-        let Some(src_target) = self.resolve_paint_target(src_host_xid) else {
-            log::debug!("render copy_plane gap: src 0x{src_host_xid:x} has no paint target");
-            return Ok(());
-        };
-        let src_id = src_target.backing_id();
-        let Some(_dst_id) = self.store.lookup(dst_host_xid) else {
-            log::debug!("render copy_plane gap: dst 0x{dst_host_xid:x} not in store");
-            return Ok(());
-        };
-
-        let src_depth = match self.store.get(src_id) {
-            Some(d) => d.depth,
-            None => return Ok(()),
-        };
-
-        // Read the full src extent via the engine. We pull the
-        // whole pixmap once (rather than only `src_rect`) because
-        // the wire format's row stride is computed from the
-        // pixmap's width; reading a sub-rect would still produce a
-        // wire-shaped reply but with a different row stride per
-        // pixmap.width. Easier to pull everything, index inside
-        // the (src_x, src_y, width, height) window, and let v2's
-        // per-op CB amortise the synchronous get_image cost. xfd
-        // / xfontsel CopyPlane the entire glyph pixmap each draw
-        // anyway, so the "full extent" overhead matches the call
-        // pattern.
-        let src_extent = match self.store.get(src_id) {
-            Some(d) => d.storage.extent,
-            None => return Ok(()),
-        };
-        let src_w = src_extent.width;
-        let src_h = src_extent.height;
-        if src_w == 0 || src_h == 0 {
-            return Ok(());
-        }
-        // The sampling window comes from the resolved handle: the
-        // content origin (`offset()`) plus the wire `(src_x, src_y)`,
-        // bounded by the content rect (`content_bounds()`; `None` =
-        // the whole storage, which is every pixmap and every
-        // `bw == 0` window). The READ itself stays the whole storage
-        // and therefore PRIVILEGED — the wire row stride is computed
-        // from the drawable width, so a sub-rect read would change the
-        // row geometry the indexing loop below depends on. Resolution
-        // happens first (above); this is a full-storage read of the
-        // ALREADY-RESOLVED drawable, not an unresolved escape hatch.
-        let src_bounds = crate::kms::render::engine::resolve_recorded_bounds(
-            src_target.content_bounds(),
-            src_extent,
-        );
-        let (src_off_x, src_off_y) = src_target.offset();
-        self.telemetry
-            .record_get_image_site(crate::kms::render::telemetry::GetImageSite::CopyPlane);
-        let src_bytes = match self.engine.get_image(
-            &mut self.store,
-            &mut self.platform,
-            src_target.server_backing_src(),
-            ash::vk::Rect2D {
-                offset: ash::vk::Offset2D::default(),
-                extent: src_extent,
-            },
-            src_depth,
-        ) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                log::warn!("render copy_plane: src get_image failed: {e:?}");
-                return Ok(());
-            }
-        };
-        self.telemetry.record_one_shot_submit();
-        self.trace_simple(SubmitKind::CopyPlaneRb, src_id, 1);
-
-        // Wire row stride for the src depth (matches pack_from_storage).
-        let row_bytes: usize = match src_depth {
-            1 => src_w.div_ceil(32) as usize * 4,
-            4 => src_w.div_ceil(8) as usize * 4,
-            8 => (src_w as usize + 3) & !3,
-            24 | 32 => src_w as usize * 4,
-            _ => {
-                log::debug!("render copy_plane gap: src depth {src_depth} unsupported");
-                return Ok(());
-            }
-        };
-
-        // For each (sx, sy) in the requested src window, classify
-        // the pixel into foreground / background and emit a 1×1
-        // fill rect at the corresponding dst position. Caller
-        // saturates over i16 because dst coords are protocol-i16.
-        let mut fg_rects: Vec<u8> = Vec::new();
-        let mut bg_rects: Vec<u8> = Vec::new();
-        // Content window in STORAGE coordinates, straight off the
-        // resolved bounds: `[bw, bw + w)` for a bordered window,
-        // `[0, extent)` for everything else.
-        let sx_lo = src_bounds.offset.x;
-        let sy_lo = src_bounds.offset.y;
-        let sx_hi = (src_bounds
-            .offset
-            .x
-            .saturating_add_unsigned(src_bounds.extent.width))
-        .min(i32::try_from(src_w).unwrap_or(i32::MAX));
-        let sy_hi = (src_bounds
-            .offset
-            .y
-            .saturating_add_unsigned(src_bounds.extent.height))
-        .min(i32::try_from(src_h).unwrap_or(i32::MAX));
-        for row in 0..height {
-            let sy = i32::from(src_y)
-                .saturating_add(i32::from(row))
-                .saturating_add(src_off_y);
-            let dy = dst_y.saturating_add(row as i16);
-            if sy < sy_lo || sy >= sy_hi {
-                continue;
-            }
-            for col in 0..width {
-                let sx = i32::from(src_x)
-                    .saturating_add(i32::from(col))
-                    .saturating_add(src_off_x);
-                let dx = dst_x.saturating_add(col as i16);
-                if sx < sx_lo || sx >= sx_hi {
-                    continue;
-                }
-                let pixel: u32 = match src_depth {
-                    1 => {
-                        // LSB-first: bit 0 of byte = leftmost pixel.
-                        // Matches `pack_from_storage` depth=1 emit.
-                        let row_off = sy as usize * row_bytes;
-                        let byte = src_bytes[row_off + (sx as usize) / 8];
-                        let bit = (byte >> (sx as usize & 7)) & 1;
-                        u32::from(bit)
-                    }
-                    4 => {
-                        let row_off = sy as usize * row_bytes;
-                        let byte = src_bytes[row_off + (sx as usize) / 2];
-                        u32::from(if (sx as usize).is_multiple_of(2) {
-                            byte & 0x0f
-                        } else {
-                            (byte >> 4) & 0x0f
-                        })
-                    }
-                    8 => {
-                        let row_off = sy as usize * row_bytes;
-                        u32::from(src_bytes[row_off + sx as usize])
-                    }
-                    24 | 32 => {
-                        let off = sy as usize * row_bytes + sx as usize * 4;
-                        u32::from_le_bytes([
-                            src_bytes[off],
-                            src_bytes[off + 1],
-                            src_bytes[off + 2],
-                            src_bytes[off + 3],
-                        ])
-                    }
-                    _ => 0,
-                };
-                let mut rect = Vec::with_capacity(8);
-                rect.extend_from_slice(&i16::to_le_bytes(dx));
-                rect.extend_from_slice(&i16::to_le_bytes(dy));
-                rect.extend_from_slice(&u16::to_le_bytes(1));
-                rect.extend_from_slice(&u16::to_le_bytes(1));
-                if pixel & plane != 0 {
-                    fg_rects.extend_from_slice(&rect);
-                } else {
-                    bg_rects.extend_from_slice(&rect);
-                }
-            }
-        }
-
-        let foreground = self.core.current_foreground;
-        let background = self.core.current_background;
-
-        // Bg first, then fg — matches v1's overlap ordering so the
-        // foreground wins on any aliased rect.
-        if !bg_rects.is_empty() {
-            self.poly_fill_rectangle(None, dst_host_xid, background, &bg_rects)?;
-        }
-        if !fg_rects.is_empty() {
-            self.poly_fill_rectangle(None, dst_host_xid, foreground, &fg_rects)?;
-        }
-        Ok(())
+        Self::backend_draw_copy_plane(
+            self,
+            _origin,
+            src_host_xid,
+            dst_host_xid,
+            src_x,
+            src_y,
+            dst_x,
+            dst_y,
+            width,
+            height,
+            plane,
+        )
     }
 
     fn put_image(
@@ -4773,119 +3976,9 @@ impl Backend for KmsBackend {
         dst_y: i16,
         data: &[u8],
     ) -> io::Result<()> {
-        let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_unresolved_target(host_xid, "put_image_unknown_xid");
-            return Ok(());
-        };
-        // GC function + plane-mask (X11 §PutImage combines the wire
-        // image with the destination through the full rop set):
-        // non-Copy or partial plane-mask takes the CPU
-        // read-modify-write path; NoOp is a spec no-op.
-        {
-            use yserver_core::backend::GcFunction;
-            let function = self.core.current_function;
-            if matches!(function, GcFunction::NoOp) {
-                return Ok(());
-            }
-            let dst_depth = target.x11_depth();
-            let full_mask = depth_plane_mask(dst_depth);
-            let plane_mask = self.core.current_plane_mask & full_mask;
-            if plane_mask == 0 {
-                return Ok(());
-            }
-            let has_clip = !matches!(
-                self.core.current_clip,
-                yserver_core::backend::ClipState::None
-            );
-            let local = Rectangle16 {
-                x: dst_x,
-                y: dst_y,
-                width,
-                height,
-            };
-            // Storage shared with the window's children (a redirect
-            // backing) holds their pixels too: ClipByChildren must leave
-            // them, as the GC's composite clip does in Xorg. A window's
-            // own leaf storage holds none, and keeps the fast path.
-            let children_clip = (self.store.lookup(host_xid) != Some(target.backing_id()))
-                .then(|| self.clip_fill_rects_by_subwindow_mode(host_xid, &[local]))
-                .filter(|pieces| pieces.as_slice() != [local]);
-            if has_clip || children_clip.is_some() {
-                // A clipped upload must use per-run source offsets: the GPU
-                // fast path accepts only a whole wire image and would paint
-                // stale rows outside a rectangle clip. Bitmap clips likewise
-                // lower to pixel runs here. Copy through apply_gc_function is
-                // still exactly the source value.
-                let pieces = children_clip.unwrap_or_else(|| vec![local]);
-                let runs = self.intersect_with_current_clip_live(&pieces);
-                for run in runs {
-                    self.put_image_rop_cpu(
-                        target.dst(),
-                        ash::vk::Offset2D {
-                            x: i32::from(run.x) + target.offset().0,
-                            y: i32::from(run.y) + target.offset().1,
-                        },
-                        width,
-                        (
-                            i32::from(run.x) - i32::from(dst_x),
-                            i32::from(run.y) - i32::from(dst_y),
-                        ),
-                        run.width,
-                        run.height,
-                        data,
-                        depth,
-                        function,
-                        plane_mask,
-                    );
-                }
-                self.telemetry.record_paint_submit();
-                self.trace_simple(SubmitKind::PutImage, target.backing_id(), 1);
-                self.scene.wake_for_damage();
-                return Ok(());
-            }
-            if !matches!(function, GcFunction::Copy) || plane_mask != full_mask {
-                self.put_image_rop_cpu(
-                    target.dst(),
-                    ash::vk::Offset2D {
-                        x: i32::from(dst_x) + target.offset().0,
-                        y: i32::from(dst_y) + target.offset().1,
-                    },
-                    width,
-                    (0, 0),
-                    width,
-                    height,
-                    data,
-                    depth,
-                    function,
-                    plane_mask,
-                );
-                self.telemetry.record_paint_submit();
-                self.trace_simple(SubmitKind::PutImage, target.backing_id(), 1);
-                self.scene.wake_for_damage();
-                return Ok(());
-            }
-        }
-        if let Err(e) = self.engine.put_image(
-            &mut self.store,
-            &mut self.platform,
-            target.dst(),
-            ash::vk::Offset2D {
-                x: i32::from(dst_x) + target.offset().0,
-                y: i32::from(dst_y) + target.offset().1,
-            },
-            ash::vk::Extent2D {
-                width: u32::from(width),
-                height: u32::from(height),
-            },
-            data,
-            depth,
-        ) {
-            log::warn!("render put_image: engine.put_image failed for xid {host_xid:#x}: {e:?}",);
-        } else {
-            self.telemetry.record_paint_submit();
-            self.trace_simple(SubmitKind::PutImage, target.backing_id(), 1);
-        }
-        Ok(())
+        Self::backend_draw_put_image(
+            self, _origin, host_xid, depth, width, height, dst_x, dst_y, data,
+        )
     }
 
     fn get_image(
@@ -4899,257 +3992,9 @@ impl Backend for KmsBackend {
         height: u16,
         plane_mask: u32,
     ) -> io::Result<Option<Vec<u8>>> {
-        // Stage 4a — resolve through redirect routing per spec Risk 1
-        // ("GetImage reads what the X server considers W's content,
-        // which under redirect is B").
-        //
-        // THE INVARIANT (2026-09-11): the reply's depth and plane-mask
-        // semantics come from the REQUESTED DRAWABLE, never from the
-        // redirected backing or the scanout storage. Where the pixels
-        // are read from and what depth the drawable is are two
-        // different questions, and only the first one follows the
-        // redirect routing.
-        //
-        // The comment this replaces assumed "backing is allocated to
-        // match W's depth, so v1 / v2 see the same wire shape". Both
-        // halves of that are false in the field:
-        //
-        //   root       the root DRAWABLE is depth 24
-        //              (`resources::ROOT_DEPTH`), while its readback
-        //              storage is 32-bit BGRA — we replied depth 32.
-        //   routed     a depth-32 child of a redirected depth-24 frame
-        //   child      paints into the FRAME's depth-24 backing, so the
-        //              backing depth is 24 while the drawable is 32 —
-        //              we replied depth 24.
-        //
-        // Measured against Xorg 21.1.24, which answers 24 and 32
-        // respectively (`tools/depth32-bg-probe.c`, reply-depth line).
-        //
-        // This is a reply-header and plane-mask fix ONLY. The stored
-        // CONTENT needs no reconstruction: the same probe, reading raw
-        // image bytes rather than XGetPixel, shows our stored words are
-        // already byte-identical to Xorg's for all six background cases
-        // including the routed depth-32 child, whose alpha survives in
-        // the depth-24 frame backing exactly as it does on Xorg.
-        if host_xid == self.core.window_id {
-            let Some(root_id) = self.store.lookup(self.core.window_id) else {
-                self.log_render_gap("get_image_root_unknown_root");
-                return Ok(None);
-            };
-            // The drawable is the ROOT WINDOW, whose X11 depth is a
-            // protocol constant; `root_id`'s storage is the 32-bit
-            // scanout readback buffer and says nothing about it.
-            if self.store.get(root_id).is_none() {
-                return Ok(None);
-            }
-            let depth = yserver_core::resources::ROOT_DEPTH;
-            let mask = plane_mask & depth_plane_mask(depth);
-            if format == GET_IMAGE_FORMAT_XY_PIXMAP && mask == 0 {
-                return Ok(Some(wrap_get_image_reply(depth, Vec::new())));
-            }
-            // Root GetImage reads the composited scanout. The requested region
-            // can span multiple outputs (multi-monitor root), so split it per
-            // output and assemble; a single `read_scanout_region` rejects a
-            // cross-output rect and yields an all-black reply. The rect is
-            // already validated on-screen by the request handler, so it is not
-            // re-clamped to root storage (which need not span the whole layout).
-            let region = ash::vk::Rect2D {
-                offset: ash::vk::Offset2D {
-                    x: i32::from(x),
-                    y: i32::from(y),
-                },
-                extent: ash::vk::Extent2D {
-                    width: u32::from(width),
-                    height: u32::from(height),
-                },
-            };
-            let start = std::time::Instant::now();
-            let readback = self.read_root_scanout_assembled(region);
-            // Split at the readback boundary: everything above is the
-            // pipeline drain + fence wait an asynchronous readback could
-            // move off the loop thread; everything below is CPU packing
-            // that has to happen either way. See `record_get_image_phases`.
-            let readback_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            let pack_start = std::time::Instant::now();
-            let result = match readback {
-                Some(mut pixel_bytes) => {
-                    if format == GET_IMAGE_FORMAT_XY_PIXMAP {
-                        pixel_bytes = z_to_xy_planes(
-                            &pixel_bytes,
-                            region.extent.width,
-                            region.extent.height,
-                            depth,
-                            mask,
-                        );
-                    } else if mask != depth_plane_mask(depth) {
-                        apply_z_plane_mask(&mut pixel_bytes, depth, mask);
-                    }
-                    let pack_ns =
-                        u64::try_from(pack_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                    let ns = readback_ns.saturating_add(pack_ns);
-                    self.telemetry.record_one_shot_submit();
-                    self.telemetry.record_fence_wait(ns);
-                    self.telemetry.record_get_image_phases(readback_ns, pack_ns);
-                    self.trace_simple(SubmitKind::GetImage, root_id, 1);
-                    Ok(Some(wrap_get_image_reply(depth, pixel_bytes)))
-                }
-                None => Ok(None),
-            };
-            self.drain_frame_builder_telemetry();
-            return result;
-        }
-        let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_unresolved_target(host_xid, "get_image_unknown_xid");
-            return Ok(None);
-        };
-        // `x11_depth()` is the depth of the drawable the CLIENT named;
-        // `store.get(backing).depth` is the depth of whatever storage the
-        // redirect routing landed on. The extent must come from the
-        // storage (that is what is being read); the depth must not.
-        let storage_extent = match self.store.get(target.backing_id()) {
-            Some(d) => d.storage.extent,
-            None => return Ok(None),
-        };
-        let depth = target.x11_depth();
-        let mask = plane_mask & depth_plane_mask(depth);
-        if format == GET_IMAGE_FORMAT_XY_PIXMAP && mask == 0 {
-            // No planes requested: Xorg replies with zero data. This
-            // path is load-bearing for Xlib — libX11's _XGetImage has
-            // a NULL deref (`planes = image->depth` before the NULL
-            // check) when an XYPixmap reply with plane_mask=0 carries
-            // a non-zero length (xts5 Xlib9/XGetImage TP2 crashes,
-            // poisons the display mutex, and hangs the whole TCM).
-            return Ok(Some(wrap_get_image_reply(depth, Vec::new())));
-        }
-        let rect = ash::vk::Rect2D {
-            offset: ash::vk::Offset2D {
-                x: i32::from(x) + target.offset().0,
-                y: i32::from(y) + target.offset().1,
-            },
-            extent: ash::vk::Extent2D {
-                width: u32::from(width),
-                height: u32::from(height),
-            },
-        };
-        // Mirror the engine's clamp so the XY repack below knows the
-        // row geometry of the bytes it gets back.
-        //
-        // #133 step 3 round 4: the bound is the STORAGE, not the content
-        // rect. `GetImage` on a window is BORDER-INCLUSIVE in X11 — the
-        // rectangle may reach `±bw` and the read is bounded by the
-        // containing pixmap: Xorg `DoGetImage` checks exactly
-        // `x >= -wBorderWidth(pWin) && x + width <= wBorderWidth(pWin) +
-        // pDraw->width` (`dix/dispatch.c:2373-2377`), converts with
-        // `relx = x + pDraw->x - pPix->screen_x` (`:2382-2390`) — this
-        // target's content offset — and reads the BOUNDING drawable
-        // (`:2405-2419`). Our own handler already allows `±bw`
-        // (`process_request.rs:25566`, "xts XGetImage-7 reads (-1,-1)").
-        //
-        // So what keeps `x = 0` off the ring is the content OFFSET
-        // applied above, never a clamp. Clamping to the content instead
-        // returned fewer pixels than the client asked for, and libX11
-        // sizes the XImage buffer from the reply length while indexing
-        // it with the REQUESTED width and height — an out-of-bounds read
-        // inside the client.
-        let clipped = crate::kms::render::engine::clamp_rect(rect, storage_extent);
-        let start = std::time::Instant::now();
-        // SyncBoundary-flush attribution: this drawable-path readback does
-        // 2 SyncBoundary flushes inside engine.get_image (gkrellm submit
-        // storm, project_client_scheduling_fairness).
-        self.telemetry
-            .record_get_image_site(crate::kms::render::telemetry::GetImageSite::ClientGetImage);
-        let readback = self.engine.get_image(
-            &mut self.store,
-            &mut self.platform,
-            target.src_including_border(),
-            rect,
-            depth,
-        );
-        // Split at the readback boundary — see the root path above.
-        let readback_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        let pack_start = std::time::Instant::now();
-        let result = match readback {
-            Ok(mut pixel_bytes) => {
-                // INVARIANT: the reply must always describe the rectangle
-                // the client asked for — Xorg computes the length as
-                // `PixmapBytePad(width, depth) * height` up front
-                // (`dix/dispatch.c:2227-2228`), before reading a pixel. A
-                // short reply is an out-of-bounds read in the client, so
-                // no bounds bug may ever be able to shorten one: pad here
-                // rather than trusting every read path to stay in range.
-                // Unreachable with the storage bound above plus the
-                // handler's `±bw` check, hence the warning.
-                let expected = wire_image_len(depth, u32::from(width), u32::from(height));
-                if pixel_bytes.len() < expected {
-                    log::warn!(
-                        "render get_image: short read for xid {host_xid:#x} ({} of \
-                         {expected} bytes for {width}x{height} d{depth}, requested \
-                         {rect:?}, clipped {clipped:?}) — padding to the requested \
-                         rectangle",
-                        pixel_bytes.len(),
-                    );
-                    pixel_bytes.resize(expected, 0);
-                }
-                if matches!(depth, 24 | 32) && self.windows.contains_key(&host_xid) {
-                    let area = ash::vk::Rect2D {
-                        offset: ash::vk::Offset2D {
-                            x: i32::from(x),
-                            y: i32::from(y),
-                        },
-                        extent: ash::vk::Extent2D {
-                            width: u32::from(width),
-                            height: u32::from(height),
-                        },
-                    };
-                    self.paste_inferiors(
-                        host_xid,
-                        target.backing_id(),
-                        area,
-                        depth,
-                        &mut pixel_bytes,
-                    );
-                }
-                if format == GET_IMAGE_FORMAT_XY_PIXMAP {
-                    pixel_bytes = z_to_xy_planes(
-                        &pixel_bytes,
-                        u32::from(width),
-                        u32::from(height),
-                        depth,
-                        mask,
-                    );
-                } else if mask != depth_plane_mask(depth) {
-                    apply_z_plane_mask(&mut pixel_bytes, depth, mask);
-                }
-                let pack_ns = u64::try_from(pack_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                let ns = readback_ns.saturating_add(pack_ns);
-                self.telemetry.record_one_shot_submit();
-                self.telemetry.record_fence_wait(ns);
-                self.telemetry.record_get_image_phases(readback_ns, pack_ns);
-                self.trace_simple(SubmitKind::GetImage, target.backing_id(), 1);
-                // X11 GetImage reply: 32-byte header + pixel rows.
-                // The handler in `process_request.rs:handle_get_image`
-                // patches `sequence` at [2..4] and `visual` at [8..12];
-                // the rest of the header (depth, reply length in u32
-                // units, padding) is the backend's job. Mirrors v1's
-                // `KmsBackend::get_image` (kms/backend.rs:10400) — when
-                // this returns just the pixel slice (no header), the
-                // handler corrupts the first 32 bytes by writing into
-                // them, and clients reading depth/length/sequence from
-                // the wire see garbage.
-                Ok(Some(wrap_get_image_reply(depth, pixel_bytes)))
-            }
-            Err(e) => {
-                log::warn!(
-                    "render get_image: engine.get_image failed for xid {host_xid:#x}: {e:?}",
-                );
-                Ok(None)
-            }
-        };
-        // Phase B.1 Task 21: engine.get_image calls close_open_frame
-        // (SyncWait reason) before blocking on the fence; drain the
-        // resulting close event into telemetry.
-        self.drain_frame_builder_telemetry();
-        result
+        Self::backend_draw_get_image(
+            self, _origin, host_xid, format, x, y, width, height, plane_mask,
+        )
     }
 
     fn read_depth1_pixmap(
@@ -5157,109 +4002,7 @@ impl Backend for KmsBackend {
         _origin: Option<OriginContext>,
         host_xid: u32,
     ) -> io::Result<Option<(u32, u32, Vec<u8>)>> {
-        // SHAPE::Mask introspection — read a depth-1 mask pixmap
-        // back as the tightly packed byte-per-pixel triple
-        // `bitmap_to_yx_banded_rects` consumes. Mirrors v1's
-        // `read_mirror_pixels` path (commit c5959af); without this
-        // override the trait default returns `None` and every
-        // ShapeMask degrades to a bounding-box rect — and since
-        // the scene clips window draws to the bounding shape,
-        // shaped popups render wrong (e16 hover clouds).
-        let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_unresolved_target(host_xid, "read_depth1_pixmap_unknown_xid");
-            return Ok(None);
-        };
-        let (depth, extent, content_version) = match self.store.get(target.backing_id()) {
-            Some(d) => (d.depth, d.storage.extent, d.content_version),
-            None => return Ok(None),
-        };
-        if depth != 1 {
-            return Ok(None);
-        }
-        // #32/#96: serve an unchanged depth-1 SHAPE::Mask from the CPU
-        // cache instead of re-reading it from VRAM — the readback stalls
-        // the single-threaded loop on discrete NVIDIA, and ~60% of these
-        // reads re-fetch a mask that has not changed. `content_version`
-        // is bumped on every draw into this pixmap, so a same-version hit
-        // is guaranteed current; any draw forces a miss + fresh read.
-        // `DrawableId` is never recycled, so a stale entry cannot alias a
-        // reallocated pixmap.
-        if let Some((w, h, bytes)) = self.depth1_mask_cache.get(
-            target.backing_id(),
-            content_version,
-            extent.width,
-            extent.height,
-        ) {
-            return Ok(Some((w, h, bytes)));
-        }
-        // #133 step 3 round 4: a whole-drawable read bounded by the
-        // STORAGE, like `get_image` (SHAPE masks are pixmaps, so the
-        // offset is `(0, 0)` in practice). The unpack loop below is
-        // sized from `extent`, so the read must return exactly that
-        // many rows — a content clamp here would hand it fewer.
-        let rect = ash::vk::Rect2D {
-            offset: ash::vk::Offset2D {
-                x: target.offset().0,
-                y: target.offset().1,
-            },
-            extent,
-        };
-        let start = std::time::Instant::now();
-        self.telemetry
-            .record_get_image_site(crate::kms::render::telemetry::GetImageSite::ReadDepth1);
-        let result = match self.engine.get_image(
-            &mut self.store,
-            &mut self.platform,
-            target.src_including_border(),
-            rect,
-            1,
-        ) {
-            Ok(packed) => {
-                let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                self.telemetry.record_one_shot_submit();
-                self.telemetry.record_fence_wait(ns);
-                self.trace_simple(SubmitKind::GetImage, target.backing_id(), 1);
-                // engine.get_image returns wire-format depth-1
-                // rows (LSBFirst bits, 32-bit scanline pad);
-                // unpack to one byte per pixel, 0xFF = set.
-                let pack_start = std::time::Instant::now();
-                let w = extent.width as usize;
-                let row_bytes = extent.width.div_ceil(32) as usize * 4;
-                let mut bytes = vec![0u8; w * extent.height as usize];
-                for row in 0..extent.height as usize {
-                    let src = &packed[row * row_bytes..];
-                    for col in 0..w {
-                        if src[col / 8] & (1 << (col % 8)) != 0 {
-                            bytes[row * w + col] = 0xFF;
-                        }
-                    }
-                }
-                self.telemetry.record_get_image_phases(
-                    ns,
-                    u64::try_from(pack_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                );
-                // #32/#96: cache this readback so the next unchanged
-                // read of the same mask skips the VRAM round-trip.
-                self.depth1_mask_cache.insert(
-                    target.backing_id(),
-                    content_version,
-                    extent.width,
-                    extent.height,
-                    bytes.clone(),
-                );
-                Ok(Some((extent.width, extent.height, bytes)))
-            }
-            Err(e) => {
-                log::warn!(
-                    "render read_depth1_pixmap: engine.get_image failed for xid \
-                         {host_xid:#x}: {e:?}",
-                );
-                Ok(None)
-            }
-        };
-        // Same SyncWait close-event drain as get_image above.
-        self.drain_frame_builder_telemetry();
-        result
+        Self::backend_draw_read_depth1_pixmap(self, _origin, host_xid)
     }
 
     fn clear_area(
@@ -5294,37 +4037,7 @@ impl Backend for KmsBackend {
         coordinate_mode: u8,
         points: &[u8],
     ) -> io::Result<()> {
-        let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_unresolved_target(host_xid, "poly_line_unknown_xid");
-            return Ok(());
-        };
-        // Cook the polyline vertices (coordinate_mode 0 = Origin
-        // absolute, 1 = Previous deltas).
-        let mut verts: Vec<(i32, i32)> = Vec::new();
-        let mut prev: Option<(i32, i32)> = None;
-        let mut offset = 0;
-        while let Some((x, y)) = crate::kms::backend::read_i16_pair(points, offset) {
-            offset += 4;
-            let (xi, yi) = if coordinate_mode == 1 {
-                if let Some((px, py)) = prev {
-                    (px + i32::from(x), py + i32::from(y))
-                } else {
-                    (i32::from(x), i32::from(y))
-                }
-            } else {
-                (i32::from(x), i32::from(y))
-            };
-            verts.push((xi, yi));
-            prev = Some((xi, yi));
-        }
-        let stroke = self.current_stroke_state(foreground);
-        let out = crate::kms::render::stroke::stroke_path(
-            &verts,
-            crate::kms::render::stroke::StrokeShape::Polyline,
-            &stroke,
-        );
-        self.emit_stroke_output(origin, host_xid, target, foreground, stroke.background, out);
-        Ok(())
+        Self::backend_draw_poly_line(self, origin, host_xid, foreground, coordinate_mode, points)
     }
 
     fn poly_segment(
@@ -5334,34 +4047,7 @@ impl Backend for KmsBackend {
         foreground: u32,
         segments: &[u8],
     ) -> io::Result<()> {
-        let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_unresolved_target(host_xid, "poly_segment_unknown_xid");
-            return Ok(());
-        };
-        // Each segment is (x1:i16, y1:i16, x2:i16, y2:i16). Cook into
-        // a flat (p0, p1, p0, p1, ...) vertex list for stroke_path's
-        // DisjointSegments shape.
-        let mut verts: Vec<(i32, i32)> = Vec::new();
-        let mut offset = 0;
-        while offset + 8 <= segments.len() {
-            let Some((x1, y1)) = crate::kms::backend::read_i16_pair(segments, offset) else {
-                break;
-            };
-            let Some((x2, y2)) = crate::kms::backend::read_i16_pair(segments, offset + 4) else {
-                break;
-            };
-            offset += 8;
-            verts.push((i32::from(x1), i32::from(y1)));
-            verts.push((i32::from(x2), i32::from(y2)));
-        }
-        let stroke = self.current_stroke_state(foreground);
-        let out = crate::kms::render::stroke::stroke_path(
-            &verts,
-            crate::kms::render::stroke::StrokeShape::DisjointSegments,
-            &stroke,
-        );
-        self.emit_stroke_output(origin, host_xid, target, foreground, stroke.background, out);
-        Ok(())
+        Self::backend_draw_poly_segment(self, origin, host_xid, foreground, segments)
     }
 
     fn poly_rectangle(
@@ -5371,47 +4057,7 @@ impl Backend for KmsBackend {
         foreground: u32,
         rectangles: &[u8],
     ) -> io::Result<()> {
-        let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_unresolved_target(host_xid, "poly_rectangle_unknown_xid");
-            return Ok(());
-        };
-        let stroke = self.current_stroke_state(foreground);
-        let mut fg_rects: Vec<Rectangle16> = Vec::new();
-        let mut bg_rects: Vec<Rectangle16> = Vec::new();
-        let mut offset = 0;
-        while offset + 8 <= rectangles.len() {
-            let Some(r) = crate::kms::backend::read_rect(rectangles, offset) else {
-                break;
-            };
-            offset += 8;
-            if r.width == 0 || r.height == 0 {
-                continue;
-            }
-            // Per-rectangle polyline: 5 vertices, closes back to start
-            // so the corner joins fire. fast-path width≤1 keeps this
-            // bit-identical to the prior 4-edge-rect emission.
-            let x0 = i32::from(r.x);
-            let y0 = i32::from(r.y);
-            let x1 = x0 + i32::from(r.width) - 1;
-            let y1 = y0 + i32::from(r.height) - 1;
-            let verts = [(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)];
-            let out = crate::kms::render::stroke::stroke_path(
-                &verts,
-                crate::kms::render::stroke::StrokeShape::Polyline,
-                &stroke,
-            );
-            fg_rects.extend(out.fg_rects);
-            bg_rects.extend(out.bg_rects);
-        }
-        self.emit_stroke_output(
-            origin,
-            host_xid,
-            target,
-            foreground,
-            stroke.background,
-            crate::kms::render::stroke::StrokeOutput { fg_rects, bg_rects },
-        );
-        Ok(())
+        Self::backend_draw_poly_rectangle(self, origin, host_xid, foreground, rectangles)
     }
 
     fn poly_arc(
@@ -5421,51 +4067,7 @@ impl Backend for KmsBackend {
         foreground: u32,
         arcs: &[u8],
     ) -> io::Result<()> {
-        let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_unresolved_target(host_xid, "poly_arc_unknown_xid");
-            return Ok(());
-        };
-        // Each arc: x(i16) y(i16) w(u16) h(u16) angle1(i16) angle2(i16).
-        // Walk each arc parametrically (honouring angle1/angle2 — partial
-        // arcs no longer fall back to a full ellipse) into a chord
-        // polyline, then run it through the stroke rasterizer so
-        // line_width / cap_style / dashes apply. JoinStyle is irrelevant
-        // within a single smooth arc.
-        let stroke = self.current_stroke_state(foreground);
-        let mut fg_rects: Vec<Rectangle16> = Vec::new();
-        let mut bg_rects: Vec<Rectangle16> = Vec::new();
-        for chunk in arcs.chunks_exact(12) {
-            let ax = i32::from(i16::from_le_bytes([chunk[0], chunk[1]]));
-            let ay = i32::from(i16::from_le_bytes([chunk[2], chunk[3]]));
-            let aw = i32::from(u16::from_le_bytes([chunk[4], chunk[5]]));
-            let ah = i32::from(u16::from_le_bytes([chunk[6], chunk[7]]));
-            let angle1 = i16::from_le_bytes([chunk[8], chunk[9]]);
-            let angle2 = i16::from_le_bytes([chunk[10], chunk[11]]);
-            if aw <= 0 || ah <= 0 || angle2 == 0 {
-                continue;
-            }
-            let cx = f64::from(ax) + f64::from(aw) * 0.5;
-            let cy = f64::from(ay) + f64::from(ah) * 0.5;
-            let rx = f64::from(aw) * 0.5;
-            let ry = f64::from(ah) * 0.5;
-            let verts = crate::kms::render::stroke::arc_polyline(cx, cy, rx, ry, angle1, angle2);
-            let out = crate::kms::render::stroke::stroke_path(
-                &verts,
-                crate::kms::render::stroke::StrokeShape::Polyline,
-                &stroke,
-            );
-            fg_rects.extend(out.fg_rects);
-            bg_rects.extend(out.bg_rects);
-        }
-        self.emit_stroke_output(
-            origin,
-            host_xid,
-            target,
-            foreground,
-            stroke.background,
-            crate::kms::render::stroke::StrokeOutput { fg_rects, bg_rects },
-        );
-        Ok(())
+        Self::backend_draw_poly_arc(self, origin, host_xid, foreground, arcs)
     }
 
     fn poly_point(
@@ -5476,43 +4078,7 @@ impl Backend for KmsBackend {
         coordinate_mode: u8,
         points: &[u8],
     ) -> io::Result<()> {
-        let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_unresolved_target(host_xid, "poly_point_unknown_xid");
-            return Ok(());
-        };
-        let mut rects = Vec::new();
-        let mut prev = (0i32, 0i32);
-        let mut first = true;
-        let mut offset = 0;
-        while let Some((x, y)) = crate::kms::backend::read_i16_pair(points, offset) {
-            offset += 4;
-            let (xi, yi) = if coordinate_mode == 1 && !first {
-                (prev.0 + i32::from(x), prev.1 + i32::from(y))
-            } else {
-                (i32::from(x), i32::from(y))
-            };
-            first = false;
-            prev = (xi, yi);
-            rects.push(Rectangle16 {
-                x: xi.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
-                y: yi.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
-                width: 1,
-                height: 1,
-            });
-        }
-        let background = self.core.current_background;
-        self.emit_stroke_output(
-            origin,
-            host_xid,
-            target,
-            foreground,
-            background,
-            crate::kms::render::stroke::StrokeOutput {
-                fg_rects: rects,
-                bg_rects: Vec::new(),
-            },
-        );
-        Ok(())
+        Self::backend_draw_poly_point(self, origin, host_xid, foreground, coordinate_mode, points)
     }
 
     fn poly_fill_rectangle(
@@ -5522,23 +4088,7 @@ impl Backend for KmsBackend {
         foreground: u32,
         rectangles: &[u8],
     ) -> io::Result<()> {
-        // Each X11 Rectangle is 8 bytes: { i16 x, i16 y, u16 w, u16 h }.
-        let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_unresolved_target(host_xid, "poly_fill_rectangle_unknown_xid");
-            return Ok(());
-        };
-        let mut rects = Vec::new();
-        let mut offset = 0;
-        while offset + 8 <= rectangles.len() {
-            let Some(r) = crate::kms::backend::read_rect(rectangles, offset) else {
-                break;
-            };
-            offset += 8;
-            rects.push(r);
-        }
-        let rects = self.intersect_with_current_clip_live(&rects);
-        self.fill_rects_honoring_fill_state(origin, host_xid, target, foreground, &rects);
-        Ok(())
+        Self::backend_draw_poly_fill_rectangle(self, origin, host_xid, foreground, rectangles)
     }
 
     fn poly_fill_arc(
@@ -5548,45 +4098,7 @@ impl Backend for KmsBackend {
         foreground: u32,
         arcs: &[u8],
     ) -> io::Result<()> {
-        let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_unresolved_target(host_xid, "poly_fill_arc_unknown_xid");
-            return Ok(());
-        };
-        // Each arc is 12 bytes: x(i16) y(i16) w(u16) h(u16) angle1(i16) angle2(i16).
-        // Build the closed fill polygon per the GC's ArcMode (Chord vs
-        // PieSlice), honouring angle1/angle2 (partial arcs no longer
-        // fill the full ellipse), then scanline-fill it.
-        let arc_mode = self.core.current_arc_mode;
-        let (img_w, img_h) = self
-            .drawable_dims(host_xid)
-            .map(|(w, h)| (w as i32, h as i32))
-            .unwrap_or((0, 0));
-        let mut rects: Vec<Rectangle16> = Vec::new();
-        for chunk in arcs.chunks_exact(12) {
-            let ax = i32::from(i16::from_le_bytes([chunk[0], chunk[1]]));
-            let ay = i32::from(i16::from_le_bytes([chunk[2], chunk[3]]));
-            let aw = i32::from(u16::from_le_bytes([chunk[4], chunk[5]]));
-            let ah = i32::from(u16::from_le_bytes([chunk[6], chunk[7]]));
-            let angle1 = i16::from_le_bytes([chunk[8], chunk[9]]);
-            let angle2 = i16::from_le_bytes([chunk[10], chunk[11]]);
-            if aw <= 0 || ah <= 0 || angle2 == 0 {
-                continue;
-            }
-            let cx = f64::from(ax) + f64::from(aw) * 0.5;
-            let cy = f64::from(ay) + f64::from(ah) * 0.5;
-            let rx = f64::from(aw) * 0.5;
-            let ry = f64::from(ah) * 0.5;
-            let verts = crate::kms::render::stroke::fill_arc_polygon(
-                cx, cy, rx, ry, angle1, angle2, arc_mode,
-            );
-            crate::kms::backend::scanline_fill_polygon(&verts, &mut rects);
-        }
-        if !rects.is_empty() {
-            let clipped = crate::kms::backend::clip_rects_to_image(&rects, img_w, img_h);
-            let rects = self.intersect_with_current_clip_live(&clipped);
-            self.fill_rects_honoring_fill_state(origin, host_xid, target, foreground, &rects);
-        }
-        Ok(())
+        Self::backend_draw_poly_fill_arc(self, origin, host_xid, foreground, arcs)
     }
 
     fn fill_poly(
@@ -5597,34 +4109,7 @@ impl Backend for KmsBackend {
         coord_mode: u8,
         points: &[u8],
     ) -> io::Result<()> {
-        let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_unresolved_target(host_xid, "fill_poly_unknown_xid");
-            return Ok(());
-        };
-        // i16 vertex pairs. coord_mode 0 = Origin (absolute), 1 = Previous.
-        let mut verts: Vec<(i32, i32)> = Vec::with_capacity(points.len() / 4);
-        let mut offset = 0;
-        let mut last = (0i32, 0i32);
-        while let Some((x, y)) = crate::kms::backend::read_i16_pair(points, offset) {
-            offset += 4;
-            let (xi, yi) = if coord_mode == 1 && !verts.is_empty() {
-                (last.0 + i32::from(x), last.1 + i32::from(y))
-            } else {
-                (i32::from(x), i32::from(y))
-            };
-            verts.push((xi, yi));
-            last = (xi, yi);
-        }
-        let mut rects: Vec<Rectangle16> = Vec::new();
-        crate::kms::backend::scanline_fill_polygon(&verts, &mut rects);
-        let (img_w, img_h) = self
-            .drawable_dims(host_xid)
-            .map(|(w, h)| (w as i32, h as i32))
-            .unwrap_or((0, 0));
-        let clipped = crate::kms::backend::clip_rects_to_image(&rects, img_w, img_h);
-        let rects = self.intersect_with_current_clip_live(&clipped);
-        self.fill_rects_honoring_fill_state(origin, host_xid, target, foreground, &rects);
-        Ok(())
+        Self::backend_draw_fill_poly(self, origin, host_xid, foreground, coord_mode, points)
     }
 
     fn fill_rectangle(
@@ -5637,18 +4122,7 @@ impl Backend for KmsBackend {
         width: u16,
         height: u16,
     ) -> io::Result<()> {
-        let Some(target) = self.resolve_paint_target(host_xid) else {
-            self.log_unresolved_target(host_xid, "fill_rectangle_unknown_xid");
-            return Ok(());
-        };
-        let rects = self.intersect_with_current_clip_live(&[Rectangle16 {
-            x,
-            y,
-            width,
-            height,
-        }]);
-        self.fill_rects_honoring_fill_state(origin, host_xid, target, foreground, &rects);
-        Ok(())
+        Self::backend_draw_fill_rectangle(self, origin, host_xid, foreground, x, y, width, height)
     }
 
     fn poly_text8(

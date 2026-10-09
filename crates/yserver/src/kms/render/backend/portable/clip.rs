@@ -913,3 +913,96 @@ pub(in crate::kms::render::backend) fn subtract_one_rect_clip(
     }
     result
 }
+
+impl KmsBackend {
+    // ── GC state ────────────────────────────────────────────────
+    pub(in crate::kms::render::backend) fn backend_clip_clear_clip_rectangles(
+        &mut self,
+        _origin: Option<OriginContext>,
+    ) -> io::Result<()> {
+        self.core.current_clip = ClipState::None;
+        Ok(())
+    }
+
+    pub(in crate::kms::render::backend) fn backend_clip_set_clip_rectangles(
+        &mut self,
+        _origin: Option<OriginContext>,
+        clip: Option<ClipRectangles>,
+    ) -> io::Result<()> {
+        self.core.current_clip = match clip {
+            Some(rects) => ClipState::Rectangles {
+                origin: (rects.x_origin, rects.y_origin),
+                rects,
+            },
+            None => ClipState::None,
+        };
+        // Do NOT clear clip_mask_cache: frozen-snapshot contract keeps the
+        // bytes valid across clip changes (X11 retain-after-free). The cache
+        // is invalidated by content_version change or DrawableId mismatch on
+        // next Pixmap install.
+        Ok(())
+    }
+
+    pub(in crate::kms::render::backend) fn backend_clip_set_clip_pixmap(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_pixmap: u32,
+        clip_x_origin: i16,
+        clip_y_origin: i16,
+    ) -> io::Result<()> {
+        let Some(handle) = PixmapHandle::from_raw(host_pixmap) else {
+            self.core.current_clip = ClipState::None;
+            // Do NOT clear clip_mask_cache: the frozen-snapshot contract
+            // (X11 retain-after-free) keeps the bytes valid even when the
+            // clip is cleared. The cache is invalidated only by a content_version
+            // change or a DrawableId mismatch on next use.
+            return Ok(());
+        };
+        self.core.current_clip = ClipState::Pixmap {
+            origin: (clip_x_origin, clip_y_origin),
+            pixmap: handle,
+        };
+        // Install the clip metadata + eagerly refresh the GPU snapshot here.
+        // The CPU bytes are deferred until a run-based clip consumer actually
+        // needs them. wmaker's title-bar buttons still work because
+        // `poly_fill_rectangle` routes through
+        // `intersect_with_current_clip_live`, which materializes the bytes on
+        // first use.
+        self.install_clip_mask_cache(host_pixmap, (clip_x_origin, clip_y_origin));
+        Ok(())
+    }
+
+    pub(in crate::kms::render::backend) fn backend_clip_apply_clip_state(
+        &mut self,
+        _origin: Option<OriginContext>,
+        clip: &ClipState,
+    ) -> io::Result<()> {
+        self.core.current_clip = clip.clone();
+        // X11 ChangeGC clip-mask=<pixmap> propagates through
+        // `resolve_draw_state` → here, not `set_clip_pixmap`. Install
+        // the clip metadata so `intersect_with_current_clip_live` can gate
+        // paint to the mask shape. wmaker title-bar buttons are the
+        // canonical client: the title bar uses the same GC, alternating
+        // clip-mask=<glyph> with clip-mask=None for solid fills.
+        //
+        // Frozen-snapshot policy: the cache survives clip→None transitions
+        // (X11 retain-after-free — XSetClipMask snapshots the bitmap) and
+        // reuse is validated by DrawableId + content_version on next Pixmap
+        // apply. Re-reading via engine.get_image on every GC apply is the
+        // gkrellm submit-storm (project_client_scheduling_fairness), so the
+        // CPU bytes stay deferred until a CPU-clipped op really needs them.
+        match clip {
+            ClipState::Pixmap { origin, pixmap } => {
+                let xid = pixmap.as_raw();
+                self.install_clip_mask_cache(xid, *origin);
+            }
+            _ => {
+                // Do NOT clear clip_mask_cache: the frozen-snapshot contract
+                // keeps the bytes valid across clip→None and clip→Rectangles
+                // transitions. The cache is invalidated by content_version
+                // change or DrawableId mismatch when next re-installed.
+            }
+        }
+        Ok(())
+    }
+}
