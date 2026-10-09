@@ -749,3 +749,254 @@ impl KmsBackend {
         }
     }
 }
+
+impl KmsBackend {
+    pub(in crate::kms::render::backend) fn backend_session_set_input_sender(
+        &mut self,
+        sender: yserver_core::core_loop::CoreSender,
+    ) {
+        if let Some(executor) = self.crtc_config_probe_executor.as_mut() {
+            executor.set_core_sender(sender.clone_handle());
+        }
+        self.input_sender = Some(sender);
+        if !self.ready_crtc_config_announcements.is_empty() {
+            self.wake_crtc_config_ready();
+        }
+    }
+
+    pub(in crate::kms::render::backend) fn backend_session_request_vt_switch(&mut self, vt: u32) {
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        {
+            let Some(console_guard) = self.console_guard.as_ref() else {
+                log::warn!("kms: request_vt_switch({vt}) — no console guard; ignoring");
+                return;
+            };
+            log::info!("kms: VT_ACTIVATE({vt}) — requesting switch");
+            if let Err(err) = console_guard.vt_activate(vt) {
+                log::warn!("kms: VT_ACTIVATE({vt}) failed: {err}");
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+        {
+            log::warn!("kms: request_vt_switch({vt}) — not supported on this platform");
+        }
+        // No VT_WAITACTIVE: the kernel now sends us the release signal,
+        // which the core loop services next (on_vt_release). Blocking here
+        // would deadlock that handshake.
+    }
+
+    pub(in crate::kms::render::backend) fn backend_session_begin_vt_release(&mut self) -> bool {
+        log::info!("kms: VT release — begin (pause input)");
+        self.pause_input_thread()
+    }
+
+    pub(in crate::kms::render::backend) fn backend_session_finish_vt_release(
+        &mut self,
+        state: &mut ServerState,
+        _input_inventory: &yserver_core::core_loop::input_inventory::InputInventory,
+    ) {
+        use crate::vt::state::VtEventKind;
+        use ::drm::Device as _;
+
+        // Step logging is load-bearing: if a switch wedges, the last line
+        // printed pinpoints which step stalled (kernel blocks the VT switch
+        // until VT_RELDISP, so a stall here freezes the whole session).
+        log::info!("kms: VT release — input paused; run_suspend");
+        self.drive_vt_event(state, VtEventKind::Disable);
+        log::info!("kms: VT release — suspended; drmDropMaster");
+        for device in &self.platform.devices {
+            if let Err(err) = device.device.release_master_lock() {
+                log::warn!("kms: drmDropMaster failed on {}: {err}", device.key);
+            }
+        }
+        log::info!("kms: VT release — master dropped; VT_RELDISP(1)");
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        if let Some(console_guard) = self.console_guard.as_ref()
+            && let Err(err) = console_guard.vt_reldisp(1)
+        {
+            log::warn!("kms: VT_RELDISP(1) failed: {err}");
+        }
+        log::info!("kms: VT release — done (switch should complete now)");
+    }
+
+    pub(in crate::kms::render::backend) fn backend_session_poll_deferred_input(
+        &mut self,
+        state: &mut ServerState,
+    ) {
+        if let Some(deadline) = self.hotplug_rescan_deadline
+            && std::time::Instant::now() >= deadline
+        {
+            self.hotplug_rescan_deadline = None;
+            self.run_display_rescan(state);
+        }
+    }
+
+    pub(in crate::kms::render::backend) fn backend_session_start_device_config(
+        &mut self,
+        source: yserver_core::xinput::InputSourceId,
+        change: yserver_core::xinput::libinput_props::DeviceConfigChange,
+        cancel: yserver_core::xinput::libinput_props::DeviceConfigCancelToken,
+    ) -> Result<
+        yserver_core::xinput::libinput_props::DeviceConfigStart,
+        yserver_core::xinput::libinput_props::DeviceConfigError,
+    > {
+        // libinput lives on the separate
+        // input thread, so forward the write over the control channel —
+        // the thread applies it to its own device map on the next wakeup.
+        // The apply is async, so libinput's Unsupported/Invalid can't be
+        // surfaced here; report success and let the input thread log any
+        // rejection. Without this the write would be silently dropped and
+        // every client device-config knob (natural scroll, tap, accel…)
+        // would be a no-op under lightdm.
+        let Some(control) = self.input_thread_control.as_ref() else {
+            return Err(yserver_core::xinput::libinput_props::DeviceConfigError::SourceGone);
+        };
+        let token = yserver_core::xinput::libinput_props::DeviceConfigToken(
+            self.next_device_config_token.max(1),
+        );
+        self.next_device_config_token = token.0.wrapping_add(1).max(1);
+        control.push_config(token, source, change, cancel);
+        Ok(yserver_core::xinput::libinput_props::DeviceConfigStart::Pending(token))
+    }
+
+    pub(in crate::kms::render::backend) fn backend_session_set_dpms_power(
+        &mut self,
+        level: u8,
+    ) -> std::io::Result<()> {
+        // Levels 1/2/3 collapse to "outputs off"; only 0 is "on".
+        let want_active = level == 0;
+        // Every path below issues a modeset/atomic commit, which requires DRM
+        // master. `scanout_allowed()`'s contract is "gate every
+        // master-requiring operation on this", and DPMS was not gated: on a
+        // VT switch away we drop master, and a screensaver blank arriving
+        // after that fails with EACCES mid-way through
+        // `dpms_set_outputs_active`, leaving some outputs disabled and the
+        // cached `kms_outputs_active` disagreeing with the hardware.
+        //
+        // Seen in the wild (discussion #79, Alpine/AMD GX-424CC, 2026-07-27):
+        //   kms: run_suspend libseat disable() ok
+        //   dpms: apply_dpms_transition 0 -> 3
+        //   disable_output for eDP-1 failed: atomic commit rejected:
+        //       Permission denied (os error 13)
+        // While suspended the outputs are already dark and whoever owns the
+        // VT drives its own DPMS, so skipping is also the correct behaviour,
+        // not merely the safe one. `run_resume` re-establishes output state on
+        // the way back, so nothing needs deferring.
+        if !self.scanout_allowed() {
+            log::info!(
+                "kms: set_dpms_power(level={level}) — session not active \
+                 (vt_state={:?}); skipping, outputs are already dark",
+                self.vt_state,
+            );
+            return Ok(());
+        }
+        if want_active == self.kms_outputs_active {
+            log::info!(
+                "kms: set_dpms_power(level={level}) — same binary state \
+                 (kms_outputs_active={}), no-op",
+                self.kms_outputs_active,
+            );
+            return Ok(()); // same binary state (e.g. Standby → Suspend)
+        }
+        self.bump_crtc_config_topology_epoch("DPMS output state changed");
+        log::info!(
+            "kms: set_dpms_power(level={level}) — transition active={} → {want_active}",
+            self.kms_outputs_active,
+        );
+
+        if want_active {
+            // ── Wake side. Mirrors KmsBackend::run_resume around the
+            //    modeset commit: commit_modeset, then re-arm the cursor
+            //    plane via legacy ioctl. Without rearm_cursor the cursor
+            //    plane stays bound to a CRTC that was disabled — the
+            //    first subsequent atomic page-flip then EINVALs because
+            //    the kernel sees a stale plane→CRTC reference. See
+            //    project_einval_atomic_commit_storm_wedge memory entry.
+            //
+            // ALWAYS run rearm_cursor + wake_for_damage regardless of
+            // dpms_set_outputs_active's result. That helper is best-
+            // effort: it returns the FIRST per-output failure but keeps
+            // attempting the rest, so a partial-success scenario (one
+            // output came up, another didn't) returns Err — but the
+            // outputs that DID come up still need their cursor plane
+            // rebound and damage queued. Cache flip is conservative —
+            // only mark fully-on if every output succeeded; on partial
+            // failure, the next set_dpms_power(On) retry sees
+            // kms_outputs_active=false and re-attempts (idempotent on
+            // the outputs that already came up).
+            let res = self.platform.dpms_set_outputs_active(true);
+            self.reapply_gamma_for_live_outputs();
+            let (hot_x, hot_y) = self
+                .effective_cursor_xid
+                .and_then(|xid| self.cursor_records.get(&xid))
+                .map(|rec| (rec.hot_x, rec.hot_y))
+                .unwrap_or((0, 0));
+            #[allow(clippy::cast_possible_truncation)]
+            let cx = self.core.cursor_x as i32;
+            #[allow(clippy::cast_possible_truncation)]
+            let cy = self.core.cursor_y as i32;
+            log::info!("kms: dpms wake — rearm_cursor hot=({hot_x},{hot_y}) pos=({cx},{cy})");
+            self.platform.rearm_cursor(hot_x, hot_y, cx, cy);
+            // Outputs were dark; any incremental damage tracking is
+            // stale. Force a fresh full frame on the next composite tick.
+            self.scene.wake_for_damage();
+            if res.is_ok() {
+                self.kms_outputs_active = !self.platform.outputs.is_empty();
+            }
+            res
+        } else {
+            // ── Sleep side. The complete old CRTC set must be disabled and
+            //    its queued flip events consumed before scene acknowledgements
+            //    or BO phases are reset. Otherwise a live front buffer can be
+            //    reused, or a stale event can retire a fresh post-wake flip.
+            let direct_shadow_error = if self.scanout_m2.active() {
+                self.materialize_direct_shadow_for_unflip().err()
+            } else {
+                None
+            };
+            let old_pending_pageflips = self.pending_pageflip_crtcs();
+            log::info!("kms: dpms sleep — wait_idle_bounded");
+            self.platform.wait_idle_bounded();
+            log::info!("kms: dpms sleep — disable_output per output");
+            if let Err(error) = self.platform.dpms_set_outputs_active(false) {
+                // The helper attempted every CRTC, so this may be a partial
+                // all-off. Without a transactional rollback the only safe
+                // policy is to keep allocations/direct pins and fail-stop.
+                self.kms_outputs_active = false;
+                log::error!("kms: DPMS off could not disable every output: {error}; exiting");
+                self.request_exit();
+                return Err(error);
+            }
+            self.clear_all_armed_vblank_targets();
+            if let Err(error) = self.platform.discard_old_drm_events_after_all_off(
+                &old_pending_pageflips,
+                std::time::Duration::from_secs(1),
+            ) {
+                log::error!("kms: DPMS off could not drain old DRM events: {error}; exiting");
+                self.request_exit();
+                return Err(error);
+            }
+            self.stop_direct_after_scanout_replaced("DPMS off");
+            self.scanout_m1.clear("DPMS off");
+            log::info!("kms: dpms sleep — scene.drain_all");
+            self.scene.drain_all(&mut self.platform);
+            log::info!("kms: dpms sleep — reset_scanout_bos_for_suspend");
+            if let Err(error) = self.platform.reset_scanout_bos_for_suspend() {
+                self.kms_outputs_active = false;
+                log::error!(
+                    "kms: DPMS off could not quiesce copied scanout devices after all outputs \
+                     were disabled: {error}; preserving quarantine and exiting"
+                );
+                self.request_exit();
+                return Err(error);
+            }
+            self.kms_outputs_active = false;
+            if let Some(error) = direct_shadow_error {
+                log::error!("scanout_m2: DPMS-off lazy fallback Copy failed: {error}; exiting");
+                self.request_exit();
+                return Err(error);
+            }
+            Ok(())
+        }
+    }
+}

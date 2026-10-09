@@ -1,0 +1,20 @@
+# Phase 2.11b (input): trait bodies of `impl Backend for KmsBackend` move to
+# inherent `backend_<subsystem>_<method>` helpers; the trait methods forward.
+# Identity path table shared by all 2.11b commits.
+source = "crates/yserver/src/kms/render/backend.rs"
+module = "kms::render::backend"
+dir = "crates/yserver/src/kms/render/backend"
+root_form = "file"
+table = "backend_2b.paths"
+modules = []
+
+[locations]
+"kms::session::impl KmsBackend::fn backend_session_set_dpms_power" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage) whose recorded caller file:line moves with the delegated body (backend/trait_impl.rs → backend/kms/session.rs); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"trait_impl::impl Backend for KmsBackend::fn mark_dirty" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage) whose recorded caller line shifts inside backend/trait_impl.rs (bodies above it became delegators); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+
+[log_targets]
+"kms::session::impl KmsBackend::fn backend_session_begin_vt_release" = "log macros without target: the delegated body moves from kms::render::backend::trait_impl (a module only since 2.11a) to kms::render::backend::kms::session; both stay under kms::render::backend, so backend-level RUST_LOG filters still match"
+"kms::session::impl KmsBackend::fn backend_session_finish_vt_release" = "log macros without target: the delegated body moves from kms::render::backend::trait_impl (a module only since 2.11a) to kms::render::backend::kms::session; both stay under kms::render::backend, so backend-level RUST_LOG filters still match"
+"kms::session::impl KmsBackend::fn backend_session_request_vt_switch" = "log macros without target: the delegated body moves from kms::render::backend::trait_impl (a module only since 2.11a) to kms::render::backend::kms::session; both stay under kms::render::backend, so backend-level RUST_LOG filters still match"
+"kms::session::impl KmsBackend::fn backend_session_set_dpms_power" = "log macros without target: the delegated body moves from kms::render::backend::trait_impl (a module only since 2.11a) to kms::render::backend::kms::session; both stay under kms::render::backend, so backend-level RUST_LOG filters still match"
+"portable::devices::impl KmsBackend::fn backend_devices_on_host_input" = "log macros without target: the delegated body moves from kms::render::backend::trait_impl (a module only since 2.11a) to kms::render::backend::portable::devices; both stay under kms::render::backend, so backend-level RUST_LOG filters still match"

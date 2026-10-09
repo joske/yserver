@@ -868,3 +868,54 @@ impl KmsBackend {
         }
     }
 }
+
+impl KmsBackend {
+    pub(in crate::kms::render::backend) fn backend_pointer_warp_pointer_root(
+        &mut self,
+        state: &mut ServerState,
+        x: i32,
+        y: i32,
+    ) {
+        // Route through the absolute-motion input path: updates the
+        // tracked cursor (and HW cursor plane) and fans out the
+        // motion/crossing events WarpPointer is specified to generate
+        // ("as if the user had instantaneously moved the pointer").
+        self.on_host_input(
+            state,
+            yserver_core::core_loop::HostInputEvent::PointerMotion {
+                origin: yserver_core::core_loop::InputOrigin::NestedHost,
+                x,
+                y,
+                time: 0,
+                relative: false,
+                dx: 0,
+                dy: 0,
+                motion_delta: None,
+            },
+        );
+    }
+
+    pub(in crate::kms::render::backend) fn backend_pointer_query_pointer(
+        &mut self,
+        _origin: Option<OriginContext>,
+    ) -> io::Result<PointerPosition> {
+        // Return the current core-tracked cursor position. No
+        // window-focus lookup — Stage 1b doesn't model focus.
+        //
+        // The mask is a full X11 KeyButMask: live keyboard modifiers
+        // (xkb state, low byte) | held buttons (0x100+). Xorg's
+        // QueryPointer/XIQueryPointer report the paired keyboard's
+        // modifier state here; pre-fix only buttons were included, so
+        // cinnamon's alt-tab switcher (global.get_pointer() via
+        // XIQueryPointer) read "Alt not held" mid-alt-tab and
+        // instantly cancelled the popup.
+        Ok(PointerPosition {
+            same_screen: true,
+            #[allow(clippy::cast_possible_truncation)]
+            win_x: self.core.cursor_x as i16,
+            #[allow(clippy::cast_possible_truncation)]
+            win_y: self.core.cursor_y as i16,
+            mask: self.core.button_mask | self.serialize_modifiers(),
+        })
+    }
+}

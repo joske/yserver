@@ -1710,7 +1710,6 @@ kms::render::backend::kms::session::impl KmsBackend::fn backend_session_set_inpu
 kms::render::backend::kms::session::impl KmsBackend::fn backend_session_request_vt_switch => kms::render::backend::kms::session::impl KmsBackend::fn backend_session_request_vt_switch
 kms::render::backend::kms::session::impl KmsBackend::fn backend_session_begin_vt_release => kms::render::backend::kms::session::impl KmsBackend::fn backend_session_begin_vt_release
 kms::render::backend::kms::session::impl KmsBackend::fn backend_session_finish_vt_release => kms::render::backend::kms::session::impl KmsBackend::fn backend_session_finish_vt_release
-kms::render::backend::kms::session::impl KmsBackend::fn backend_session_on_vt_acquire => kms::render::backend::kms::session::impl KmsBackend::fn backend_session_on_vt_acquire
 kms::render::backend::kms::session::impl KmsBackend::fn backend_session_poll_deferred_input => kms::render::backend::kms::session::impl KmsBackend::fn backend_session_poll_deferred_input
 kms::render::backend::kms::session::impl KmsBackend::fn backend_session_start_device_config => kms::render::backend::kms::session::impl KmsBackend::fn backend_session_start_device_config
 kms::render::backend::kms::session::impl KmsBackend::fn backend_session_set_dpms_power => kms::render::backend::kms::session::impl KmsBackend::fn backend_session_set_dpms_power
