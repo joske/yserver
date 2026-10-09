@@ -430,6 +430,34 @@ pub struct Leaf {
     pub func: Option<ImplItemFn>,
     /// Index in `Tree::leaves`.
     pub idx: usize,
+    /// Source position of every macro invocation, call and `Location` in
+    /// the leaf.
+    pub sites: Vec<(String, LineColumn)>,
+}
+
+/// Name and position of every `name!(..)` and `name(..)` (qualified or
+/// not) and every `Location` ident in `ts`, in token order.
+fn sites(ts: TokenStream) -> Vec<(String, LineColumn)> {
+    fn walk(ts: TokenStream, out: &mut Vec<(String, LineColumn)>) {
+        let v: Vec<TokenTree> = ts.into_iter().collect();
+        for (i, t) in v.iter().enumerate() {
+            match t {
+                TokenTree::Group(g) => walk(g.stream(), out),
+                TokenTree::Ident(id)
+                    if id == "Location"
+                        || matches!(v.get(i + 1), Some(TokenTree::Group(g)) if g.delimiter() == proc_macro2::Delimiter::Parenthesis)
+                        || (matches!(v.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!')
+                            && matches!(v.get(i + 2), Some(TokenTree::Group(_)))) =>
+                {
+                    out.push((id.to_string(), id.span().start()));
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(ts, &mut out);
+    out
 }
 
 impl Leaf {
@@ -517,6 +545,8 @@ pub struct ModInfo {
 
 pub trait Source {
     fn read(&self, path: &str) -> Option<Vec<u8>>;
+    /// Every file under `dir` ("" for all), repo-relative.
+    fn list(&self, dir: &str) -> Vec<String>;
 }
 
 pub struct Disk(pub PathBuf);
@@ -524,6 +554,29 @@ pub struct Disk(pub PathBuf);
 impl Source for Disk {
     fn read(&self, path: &str) -> Option<Vec<u8>> {
         std::fs::read(self.0.join(path)).ok()
+    }
+
+    fn list(&self, dir: &str) -> Vec<String> {
+        fn walk(root: &std::path::Path, rel: &str, out: &mut Vec<String>) {
+            for e in std::fs::read_dir(root.join(rel))
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                let name = e.file_name().to_string_lossy().to_string();
+                let path = join(rel, &name);
+                match e.file_type() {
+                    Ok(t) if t.is_dir() && !name.starts_with('.') && name != "target" => {
+                        walk(root, &path, out);
+                    }
+                    Ok(t) if t.is_file() => out.push(path),
+                    _ => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.0, dir, &mut out);
+        out
     }
 }
 
@@ -536,6 +589,24 @@ impl Source for Git {
             .output()
             .ok()?;
         out.status.success().then_some(out.stdout)
+    }
+
+    fn list(&self, dir: &str) -> Vec<String> {
+        let mut args = vec!["ls-tree", "-r", "--name-only", &self.0];
+        let spec = format!("{dir}/");
+        if !dir.is_empty() {
+            args.extend(["--", &spec]);
+        }
+        Command::new("git")
+            .args(&args)
+            .output()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -743,7 +814,10 @@ impl Tree {
                     let mctx = ctx.nested(&m.attrs);
                     let sub = child(module, &m.ident.to_string());
                     self.mods.insert(sub.clone(), ModInfo { vis: tok(&m.vis) });
-                    let macro_use = m.attrs.iter().any(|a| a.path().is_ident("macro_use"));
+                    let macro_use = m.attrs.iter().any(|a| {
+                        a.path().is_ident("macro_use")
+                            || (a.path().is_ident("cfg_attr") && tok(a).contains("macro_use"))
+                    });
                     self.events.push(Ev::Enter(macro_use));
                     if let Some((brace, inner)) = &m.content {
                         let open = cx.f.off(brace.span.open().end());
@@ -781,9 +855,9 @@ impl Tree {
                             Some(o.clone()),
                             member_parts(ii),
                             &ictx,
-                            p,
-                            e,
+                            (p, e),
                             func,
+                            ii.to_token_stream(),
                         );
                         p = e;
                     }
@@ -791,7 +865,16 @@ impl Tree {
                 Item::Use(u) => flatten_use(u, module, &mut self.uses),
                 _ => {
                     if let Some(p) = item_parts(item) {
-                        self.leaf(cx, module, None, p, ctx, prev, end, None);
+                        self.leaf(
+                            cx,
+                            module,
+                            None,
+                            p,
+                            ctx,
+                            (prev, end),
+                            None,
+                            item.to_token_stream(),
+                        );
                     }
                 }
             }
@@ -808,9 +891,9 @@ impl Tree {
         owner: Option<Owner>,
         p: Parts,
         ctx: &Ctx,
-        from: usize,
-        to: usize,
+        (from, to): (usize, usize),
         func: Option<ImplItemFn>,
+        spanned: TokenStream,
     ) {
         let comments = cx
             .cm
@@ -833,6 +916,7 @@ impl Tree {
             ord: None,
             func,
             idx: self.leaves.len(),
+            sites: sites(spanned),
         });
     }
 }

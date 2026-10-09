@@ -12,6 +12,14 @@ impl Source for Mem {
     fn read(&self, path: &str) -> Option<Vec<u8>> {
         self.0.get(path).map(|s| s.clone().into_bytes())
     }
+
+    fn list(&self, dir: &str) -> Vec<String> {
+        self.0
+            .keys()
+            .filter(|k| dir.is_empty() || k.starts_with(&format!("{dir}/")))
+            .cloned()
+            .collect()
+    }
 }
 
 fn mem(files: &[(&str, &str)]) -> Mem {
@@ -51,6 +59,7 @@ fn manifest(dir: &str, edits: Vec<PathEdit>) -> Manifest {
         visibility: [("fn data".to_string(), "pub(super)".to_string())].into(),
         path_edits: edits,
         exceptions: BTreeMap::new(),
+        locations: BTreeMap::new(),
         modules: vec![
             crate::apply::ModSpec {
                 name: String::new(),
@@ -279,6 +288,7 @@ fn split_with(
         root_form: crate::apply::RootForm::Dir,
         path_edits: vec![],
         exceptions: BTreeMap::new(),
+        locations: BTreeMap::new(),
         modules: vec![spec_of("", lines[0]), spec_of("inner", lines[1])],
         path: tmp.join("a.toml"),
     };
@@ -717,6 +727,7 @@ fn apply_and_verify_as(
         root_form,
         path_edits: edits,
         exceptions: BTreeMap::new(),
+        locations: BTreeMap::new(),
         modules: vec![
             spec_of_mod("", modules[0]),
             spec_of_mod("inner", modules[1]),
@@ -1235,5 +1246,212 @@ fn layout_inside_std_macro_arguments_is_not_significant() {
     has(
         &same_file(&fn_body("vec![(1,)]"), &fn_body("vec![(1)]"), false),
         "tokens changed",
+    );
+}
+
+fn same_file_in(crate_files: &[(&str, &str)], before: &str, after: &str) -> Vec<String> {
+    let spec = Spec {
+        manifest: None,
+        old_root: "src/k.rs".into(),
+        new_root: "src/k.rs".into(),
+        module: "k".into(),
+        delegate: false,
+    };
+    let side = |k: &str| {
+        let mut v = crate_files.to_vec();
+        v.push(("src/k.rs", k));
+        mem(&v)
+    };
+    check(&spec, &side(before), &side(after), &[]).unwrap().1
+}
+
+const CARGO: (&str, &str) = ("Cargo.toml", "[package]\nname = \"k\"\n");
+
+#[test]
+fn std_macro_name_from_elsewhere_in_the_crate_is_exact() {
+    let (before, after) = (fn_body("vec![1,]"), fn_body("vec![1]"));
+    assert_eq!(
+        same_file_in(&[CARGO, ("src/lib.rs", "mod k;\n")], &before, &after),
+        Vec::<String>::new()
+    );
+    for lib in [
+        "#[macro_use]\nextern crate custom;\n\nmod k;\n",
+        "#[cfg_attr(all(), macro_use)]\npub(crate) extern crate custom;\n\nmod k;\n",
+        "mod k;\n\nmod other {\n    macro_rules! vec {\n        ($a:expr,) => {\n            1\n        };\n    }\n}\n",
+    ] {
+        has(
+            &same_file_in(&[CARGO, ("src/lib.rs", lib)], &before, &after),
+            "tokens changed",
+        );
+    }
+}
+
+#[test]
+fn std_macro_name_imported_inside_the_leaf_is_exact() {
+    for import in [
+        "use other::vec;",
+        "use other::{x, vec as vec};",
+        "use other::*;",
+    ] {
+        has(
+            &same_file(
+                &fn_body(&format!("{{ {import} vec![1,] }}")),
+                &fn_body(&format!("{{ {import} vec![1] }}")),
+                false,
+            ),
+            "tokens changed",
+        );
+    }
+}
+
+#[test]
+fn cfg_attr_on_a_wrapper_may_disable_a_macro() {
+    let p = "#[macro_use]\nmod p {\n    macro_rules! m {\n        () => { 1 };\n    }\n}\n\n";
+    let q = "#[macro_use]\nmod q {\n    macro_rules! m {\n        () => { 2 };\n    }\n}\n\n";
+    let tail = "#[cfg_attr(all(), cfg(any()))]\n#[macro_use]\nmod disabled {\n    macro_rules! m {\n        () => { 3 };\n    }\n}\n\nfn f() -> u32 {\n    m!()\n}\n";
+    has(
+        &same_file(&format!("{p}{q}{tail}"), &format!("{q}{p}{tail}"), false),
+        "macro resolution changed",
+    );
+}
+
+const SWAP_BEFORE: &str = "mod one {\n    pub fn helper() -> u32 {\n        1\n    }\n}\n\nmod two {\n    pub fn helper() -> u32 {\n        2\n    }\n}\n\nuse one::helper;\n\nfn f() -> u32 {\n    BODY\n}\n";
+const SWAP_TABLE: &str = "a::one::fn helper => a::two::fn helper\na::two::fn helper => a::one::fn helper\na::fn f => a::inner::fn f\n";
+
+fn swap(tag: &str, body: &str, swapped: bool) -> Vec<String> {
+    let before = SWAP_BEFORE.replace("BODY", body);
+    let (x, y) = if swapped { ("2", "1") } else { ("1", "2") };
+    let mod_rs = format!(
+        "mod inner;\npub use inner::*;\n\nmod one {{\n    pub fn helper() -> u32 {{\n        {x}\n    }}\n}}\n\nmod two {{\n    pub fn helper() -> u32 {{\n        {y}\n    }}\n}}\n\nuse one::helper;\n"
+    );
+    let inner = format!("use super::*;\n\npub(super) fn f() -> u32 {{\n    {body}\n}}\n");
+    let table = if swapped {
+        SWAP_TABLE.to_string()
+    } else {
+        "a::one::fn helper => a::one::fn helper\na::two::fn helper => a::two::fn helper\na::fn f => a::inner::fn f\n".to_string()
+    };
+    split(
+        tag,
+        &before,
+        &[("src/a/mod.rs", &mod_rs), ("src/a/inner.rs", &inner)],
+        &table,
+        [&["pub use inner::*;"], &["use super::*;"]],
+    )
+}
+
+#[test]
+fn import_referring_to_another_item_fails() {
+    assert_eq!(swap("swap-ok", "helper()", false), Vec::<String>::new());
+    has(
+        &swap("swap-use", "helper()", true),
+        "name `helper` resolves differently",
+    );
+    assert_eq!(
+        swap("swap-path-ok", "one::helper()", false),
+        Vec::<String>::new()
+    );
+    has(
+        &swap("swap-path", "one::helper()", true),
+        "path `one::helper` resolves differently",
+    );
+    let local = "{ use one::helper as h; h() }";
+    assert_eq!(swap("swap-local-ok", local, false), Vec::<String>::new());
+    has(
+        &swap("swap-local", local, true),
+        "path `one::helper` resolves differently",
+    );
+}
+
+fn same_file_info(before: &str, after: &str) -> (Vec<String>, Vec<String>) {
+    let spec = Spec {
+        manifest: None,
+        old_root: "src/k.rs".into(),
+        new_root: "src/k.rs".into(),
+        module: "k".into(),
+        delegate: false,
+    };
+    check(
+        &spec,
+        &mem(&[("src/k.rs", before)]),
+        &mem(&[("src/k.rs", after)]),
+        &[],
+    )
+    .unwrap()
+}
+
+#[test]
+fn positional_code_at_a_new_position_is_refused_outside_tests() {
+    for body in [
+        "line!()",
+        "column!()",
+        "file!().len() as u32",
+        "std::panic::Location::caller().line()",
+    ] {
+        let before = format!("fn f() -> u32 {{\n    {body}\n}}\n");
+        has(
+            &same_file_info(&before, &format!("\n\n{before}")).1,
+            "production code with line!",
+        );
+        assert_eq!(same_file_info(&before, &before).1, Vec::<String>::new());
+    }
+    let tracked =
+        "#[track_caller]\nfn site() -> u32 {\n    std::panic::Location::caller().line()\n}\n\n";
+    let before = format!("{tracked}fn f() -> u32 {{\n    site()\n}}\n");
+    let after = format!("{tracked}\n\nfn f() -> u32 {{\n    site()\n}}\n");
+    let errs = same_file_info(&before, &after).1;
+    has(&errs, "fn f: production code with line!");
+    assert!(errs.iter().all(|e| !e.contains("fn site")), "{errs:?}");
+    let test = "#[cfg(test)]\nmod tests {\n    fn t() -> u32 {\n        line!()\n    }\n}\n";
+    let (info, errs) = same_file_info(test, &format!("\n\n{test}"));
+    assert_eq!(errs, Vec::<String>::new());
+    has(&info, "1 test leaves with line!");
+}
+
+fn moved_f(tag: &str, body: &str, locations: &[(&str, &str)]) -> Vec<String> {
+    let mut m = manifest(tag, vec![]);
+    std::fs::write(m.table_path(), "a::fn f => a::inner::fn f\n").unwrap();
+    m.visibility = [("fn f".to_string(), "pub(super)".to_string())].into();
+    m.locations = locations
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let before = format!("fn f() {{\n    {body}\n}}\n");
+    let inner = format!("use super::*;\n\npub(super) fn f() {{\n    {body}\n}}\n");
+    let base = mem(&[("src/a.rs", &before)]);
+    let head = mem(&[
+        ("src/a/mod.rs", "mod inner;\npub use inner::*;\n"),
+        ("src/a/inner.rs", &inner),
+    ]);
+    check(&spec_of(&m), &base, &head, &[]).unwrap().1
+}
+
+#[test]
+fn module_sensitive_code_in_a_new_module_is_refused_outside_tests() {
+    for body in [
+        "let _ = module_path!();",
+        "log::info!(\"x\");",
+        "warn!(\"x {}\", 1);",
+        "log::log!(log::Level::Info, \"x\");",
+    ] {
+        has(
+            &moved_f("modp", body, &[]),
+            "module_path!/log macros without target:",
+        );
+    }
+    assert_eq!(
+        moved_f("modp-target", "log::info!(target: \"a\", \"x\");", &[]),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        moved_f(
+            "modp-exc",
+            "log::info!(\"x\");",
+            &[("fn f", "target change accepted")]
+        ),
+        Vec::<String>::new()
+    );
+    has(
+        &moved_f("modp-unused", "let _ = 1;", &[("fn f", "x")]),
+        "location exception not needed",
     );
 }

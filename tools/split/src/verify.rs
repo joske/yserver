@@ -212,9 +212,8 @@ pub fn check(
         groups.entry(l.key()).or_default().1.push(l);
     }
 
-    let exceptions: BTreeMap<String, String> = match spec.manifest {
-        Some(m) => m
-            .exceptions
+    let audited = |table: fn(&Manifest) -> &BTreeMap<String, String>| match spec.manifest {
+        Some(m) => table(m)
             .iter()
             .map(|(k, why)| {
                 let old = tree::child(&m.full(""), k);
@@ -224,10 +223,16 @@ pub fn check(
                     None => Err(format!("exception: unknown item {k}")),
                 }
             })
-            .collect::<Res<_>>()?,
-        None => BTreeMap::new(),
+            .collect::<Res<BTreeMap<String, String>>>(),
+        None => Ok(BTreeMap::new()),
     };
-    let rx = Resolution::new(&before, &after, &map, &exceptions);
+    let exceptions = audited(|m| &m.exceptions)?;
+    let locations = audited(|m| &m.locations)?;
+    let not_std: BTreeSet<String> = scope::crate_not_std(base, &spec.old_root)
+        .into_iter()
+        .chain(scope::crate_not_std(head, &spec.new_root))
+        .collect();
+    let rx = Resolution::new(&before, &after, &map, [&exceptions, &locations], not_std);
     let inc_macros = scope::including_macros(&before);
     let btok: Vec<String> = before
         .leaves
@@ -256,6 +261,7 @@ pub fn check(
                     let (na, _) = a.remove(i);
                     matched += 1;
                     errs.extend(rx.check(ob, na, ob.owner.as_ref().map(|o| o.header.as_str())));
+                    errs.extend(rx.location(ob, na));
                     let (so, sn) = (scope(&ob.vis, &ob.module), scope(&na.vis, &na.module));
                     if na.vis != ob.vis {
                         if ob.vis.is_empty()
@@ -394,6 +400,7 @@ pub fn check(
             let n = news.remove(named[0]);
             delegated += 1;
             errs.extend(rx.check(old, n, Some(&oo.inherent)));
+            errs.extend(rx.location(old, n));
             errs.extend(rx.self_ty(old, &oo.self_ty));
             if n.comments != old.comments {
                 errs.push(format!(
@@ -425,8 +432,10 @@ pub fn check(
         errs.push(format!("{}: new leaf ({}:{})", n.key(), n.file, n.line));
     }
     let used = rx.used.borrow();
-    for k in exceptions.keys().filter(|k| !used.contains(*k)) {
-        errs.push(format!("{k}: exception not needed"));
+    for (i, what) in ["exception", "location exception"].iter().enumerate() {
+        for k in rx.exceptions[i].keys().filter(|k| !used[i].contains(*k)) {
+            errs.push(format!("{k}: {what} not needed"));
+        }
     }
 
     // Every `use`, per module: only manifest lines may be added, none lost.
@@ -511,7 +520,7 @@ pub fn check(
             "leaves: {} before, {} after, {matched} identical; {vis_changes} manifest visibility changes; {incl} include paths same bytes; {delegated} delegations; {} audited exceptions",
             before.leaves.len(),
             after.leaves.len(),
-            used.len()
+            used[0].len()
         ),
         format!(
             "files: {} → {}; line smoke (info): -{removed} +{added} lines",
@@ -519,6 +528,11 @@ pub fn check(
             after.files.len()
         ),
     ];
+    let [pos, modp] = *rx.tests.borrow();
+    info.push(format!(
+        "location-sensitive: {pos} test leaves with line!/column!/file!/Location at a new position, {modp} with module_path!/log macros without target: in a new module (allowed in test code); {} audited location exceptions",
+        used[1].len()
+    ));
     if !shadow.is_empty() {
         info.push(format!(
             "review, names defined in more than one module: {}",
@@ -588,9 +602,16 @@ struct Resolution<'a> {
     macros: [Vec<scope::Site>; 2],
     names: [Names; 2],
     map: &'a BTreeMap<String, String>,
-    /// New leaf key → audited reason for moving macro invocations.
-    exceptions: &'a BTreeMap<String, String>,
-    used: std::cell::RefCell<BTreeSet<String>>,
+    /// New leaf key → audited reason: for moving macro invocations, for
+    /// moving location-sensitive code.
+    exceptions: [&'a BTreeMap<String, String>; 2],
+    used: std::cell::RefCell<[BTreeSet<String>; 2]>,
+    /// Macro names that are not positively std's in either crate.
+    not_std: BTreeSet<String>,
+    /// `#[track_caller]` fns that pass their caller's position on.
+    tracked: BTreeSet<String>,
+    /// Test leaves moved with positional / module-sensitive code.
+    tests: std::cell::RefCell<[usize; 2]>,
 }
 
 fn hash(s: &str) -> u64 {
@@ -604,7 +625,8 @@ impl<'a> Resolution<'a> {
         before: &'a Tree,
         after: &Tree,
         map: &'a BTreeMap<String, String>,
-        exceptions: &'a BTreeMap<String, String>,
+        exceptions: [&'a BTreeMap<String, String>; 2],
+        not_std: BTreeSet<String>,
     ) -> Self {
         let old = |l: &Leaf| map.get(&l.okey()).cloned().unwrap_or_else(|| l.okey());
         let new = |l: &Leaf| l.key();
@@ -621,6 +643,9 @@ impl<'a> Resolution<'a> {
             map,
             exceptions,
             used: Default::default(),
+            not_std,
+            tracked: scope::tracked(&[before, after]),
+            tests: Default::default(),
         }
     }
 
@@ -661,8 +686,8 @@ impl<'a> Resolution<'a> {
             } else {
                 " in a macro expansion"
             };
-            let (names, rb) = scope::free_names(t, &ob.module);
-            let (_, ra) = scope::free_names(t, &na.module);
+            let (names, rb, paths) = scope::free_names(t, &ob.module);
+            let (_, ra, _) = scope::free_names(t, &na.module);
             if rb != ra {
                 errs.push(format!(
                     "{key}: moved from {} to {} with a `self::`/`super::` path{what}, which now names another module; keep the module depth, or qualify the path in a separate reviewed preparatory commit",
@@ -674,6 +699,19 @@ impl<'a> Resolution<'a> {
                     .iter()
                     .filter_map(|(n, ns)| self.diff(&key, what, ob, na, n, *ns)),
             );
+            for p in &paths {
+                let ns = scope::TYPE | scope::VALUE;
+                let (b, a) = (
+                    self.names[0].resolve_path(&ob.module, p, ns),
+                    self.names[1].resolve_path(&na.module, p, ns),
+                );
+                if b != a {
+                    errs.push(format!(
+                        "{key}: path `{}`{what} resolves differently\n      before: {b:?}\n      after:  {a:?}",
+                        p.join("::")
+                    ));
+                }
+            }
         }
         let (tb, ta) = (
             self.names[0].traits(&ob.module),
@@ -685,8 +723,8 @@ impl<'a> Resolution<'a> {
             ));
         }
         if ob.module != na.module && (sb.local || !sb.defs.is_empty()) {
-            if self.exceptions.contains_key(&na.key()) {
-                self.used.borrow_mut().insert(na.key());
+            if self.exceptions[0].contains_key(&na.key()) {
+                self.used.borrow_mut()[0].insert(na.key());
             } else {
                 let what = if sb.local {
                     "defines and invokes a local macro_rules!".to_string()
@@ -712,8 +750,58 @@ impl<'a> Resolution<'a> {
     fn commas(&self, side: usize, l: &Leaf, tokens: &str) -> String {
         scope::std_commas(
             tokens,
-            &scope::std_macros(&l.tokens, &self.macros[side][l.idx]),
+            &scope::std_macros(&l.tokens, &self.macros[side][l.idx], &self.not_std),
         )
+    }
+
+    /// `na` (or a delegated helper) runs `line!`/`column!`/`file!`/
+    /// `Location` (in its body or the macros it reaches) at a new position,
+    /// or `module_path!`/a log macro without `target:` in a new module:
+    /// counted in test code, refused elsewhere without an audited exception.
+    fn location(&self, ob: &Leaf, na: &Leaf) -> Option<String> {
+        let key = self.map.get(&ob.okey()).cloned().unwrap_or_default();
+        let texts: Vec<&str> = std::iter::once(ob.tokens.as_str())
+            .chain(
+                self.macros[0][ob.idx]
+                    .defs
+                    .iter()
+                    .map(|d| self.before.leaves[*d].tokens.as_str()),
+            )
+            .collect();
+        let at = |l: &Leaf| {
+            let v: Vec<(String, usize, usize)> = l
+                .sites
+                .iter()
+                .map(|(n, p)| (n.clone(), p.line, p.column))
+                .collect();
+            (l.file.clone(), v)
+        };
+        let pos = texts.iter().any(|t| scope::positional(t, &self.tracked)) && at(ob) != at(na);
+        let modp = ob.module != na.module && texts.iter().any(|t| scope::module_sensitive(t) > 0);
+        if !pos && !modp {
+            return None;
+        }
+        if scope::is_test(ob) {
+            let mut t = self.tests.borrow_mut();
+            t[0] += usize::from(pos);
+            t[1] += usize::from(modp);
+            return None;
+        }
+        if self.exceptions[1].contains_key(&na.key()) {
+            self.used.borrow_mut()[1].insert(na.key());
+            return None;
+        }
+        let what = match (pos, modp) {
+            (true, true) => {
+                "line!/column!/file!/Location and module_path!/log macros without target:"
+            }
+            (true, false) => "line!/column!/file!/Location",
+            _ => "module_path!/log macros without target:",
+        };
+        Some(format!(
+            "{key}: production code with {what} moves ({}:{} {} → {}:{} {}); its value or log target changes: add explicit targets in a separate reviewed commit, or list the item under [locations] with an audited reason",
+            ob.file, ob.line, ob.module, na.file, na.line, na.module
+        ))
     }
 
     /// The delegated helper's impl names the old impl's self type.

@@ -38,6 +38,11 @@ pub struct Manifest {
     /// another module (name and trait checks still apply).
     #[serde(default)]
     pub exceptions: BTreeMap<String, String>,
+    /// Old item key → audited reason it may run `line!`/`column!`/`file!`/
+    /// `Location` at a new position, or `module_path!`/a log macro without
+    /// `target:` in a new module, outside test code.
+    #[serde(default)]
+    pub locations: BTreeMap<String, String>,
     pub modules: Vec<ModSpec>,
     #[serde(skip)]
     pub path: PathBuf,

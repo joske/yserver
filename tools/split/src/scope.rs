@@ -2,17 +2,23 @@
 //! `macro_rules!` scope, what a leaf's free names bind to, traits in scope.
 //!
 //! Names: every module's bindings are its top-level leaves, child modules and
-//! `use` names (paths made absolute); `use x::*` of an in-tree module is
+//! `use` names, a named import standing for the items its path reaches
+//! through in-tree modules (its absolute spelling when it reaches none);
+//! `use x::*` of an in-tree module is
 //! followed (visibility and local-over-glob shadowing applied), any other
 //! glob is an opaque marker that only counts when nothing in the tree binds
 //! the name. A leaf's names are the first segments of its paths (impl head
 //! included), classified by shape (`a::` type, `A` type or value, `a`
 //! value); fields, methods, macro names, `$` metavariables and names bound
-//! after a keyword or in a `use … as` are skipped.
+//! after a keyword or in a `use … as` are skipped. Every path of two or
+//! more segments (`crate::`/`self::`/`super::` included) is also walked
+//! through in-tree modules to the item it names.
 //!
 //! Checked per moved leaf and per delegated helper, before against after:
-//! those names; the textual macro chain of each invocation down to the first
-//! definition active wherever the caller is (cfg'd ones listed), else the
+//! those names and paths, by the identity (mapped through the path table) of
+//! the item they reach; the textual macro chain of each invocation down to
+//! the first definition active wherever the caller is (ones under a cfg the
+//! caller lacks or any `cfg_attr`, own or a wrapper's, listed), else the
 //! macro's path binding; the free names in every arm of the reached
 //! definitions, resolved at the caller; the module each `self::`/`super::`
 //! path starts from; the traits in scope (named, `_` and glob imports,
@@ -20,25 +26,38 @@
 //! that the self type resolves to one in-tree item.
 //!
 //! Normalized before comparing tokens: the arguments of the
-//! `STD_COMMA_MACROS` that resolve to nothing in the tree (std's) at every
-//! invocation in the leaf, when they parse as the macro's grammar: trailing
+//! `STD_COMMA_MACROS` that are positively std's at every invocation in the
+//! leaf (no binding in the tree, no import of the name in the leaf, no
+//! `macro_rules!` of the name and no `#[macro_use] extern crate` anywhere in
+//! the package), when they parse as the macro's grammar: trailing
 //! comma dropped, and the same layout normalization as code outside macros;
 //! other macros' input and attributes stay exact. Closure and match arm
 //! bodies `{ e }` compare as `e` (see `tree::Commas`).
 //!
 //! Refused: moving a leaf that invokes an in-tree `macro_rules!`, or defines
 //! and invokes its own, to another module, unless the manifest lists it under
-//! `exceptions` with a reason (the checks above still apply).
+//! `exceptions` with a reason (the checks above still apply). Production
+//! code (not under `#[cfg(test)]`) whose value depends on where it is,
+//! unless listed under `locations` with a reason: `line!`/`column!`/`file!`,
+//! `Location::caller()` and calls of in-tree `#[track_caller]` fns that
+//! pass it on, at a new position; `module_path!` and log macros without
+//! `target:` (default target `module_path!()`) in a new module. Test code
+//! is counted, not refused.
 //!
 //! Not modelled: preludes, extern crates, local `let` and item shadowing,
 //! names inside macro input, inherent-vs-trait method priority, macros named
 //! by path (`a::m!`), `#[macro_export]`, cfg values.
+//!
+//! Outside the equivalence guarantee: diagnostic text std macros derive
+//! from their input (the stringified condition of `assert!(… |x| { x } …)`
+//! in a panic message differs once the input is normalized), and panic
+//! locations (`unwrap`, `panic!`, `#[track_caller]` callers) of moved code.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use proc_macro2::{TokenStream, TokenTree};
 
-use crate::tree::{Commas, Ev, Leaf, Tree};
+use crate::tree::{Commas, Ev, Leaf, Source, Tree};
 
 /// Absolute reach of a visibility written in `module`: `pub`, `crate`, or
 /// `in <module path>`.
@@ -163,18 +182,127 @@ pub const STD_COMMA_MACROS: [&str; 20] = [
     "matches",
 ];
 
-/// The `STD_COMMA_MACROS` a leaf invokes that bind nothing in the tree at
-/// every invocation (neither textually nor by path), per its macro site.
-pub fn std_macros(tokens: &str, site: &Site) -> BTreeSet<String> {
+/// The `STD_COMMA_MACROS` a leaf invokes that are positively std's at every
+/// invocation: no binding in the tree (neither textually nor by path), not
+/// in `crate_not_std`, and not named by an import in the leaf itself.
+pub fn std_macros(tokens: &str, site: &Site, crate_not_std: &BTreeSet<String>) -> BTreeSet<String> {
+    let Some(local) = use_bound(tokens) else {
+        return BTreeSet::new();
+    };
     let (mut ok, mut not) = (BTreeSet::new(), BTreeSet::new());
     for (n, t) in invocations(tokens).into_iter().zip(&site.text) {
-        if STD_COMMA_MACROS.contains(&n.as_str()) && *t == format!("{n} = path {{}}") {
+        if STD_COMMA_MACROS.contains(&n.as_str())
+            && *t == format!("{n} = path {{}}")
+            && !crate_not_std.contains(&n)
+            && !local.contains(&n)
+        {
             ok.insert(n);
         } else {
             not.insert(n);
         }
     }
     ok.difference(&not).cloned().collect()
+}
+
+/// Every ident in the `use` items inside `tokens` (function- or block-local
+/// imports); `None` when one is a glob.
+fn use_bound(tokens: &str) -> Option<BTreeSet<String>> {
+    fn idents(v: &[TokenTree], out: &mut BTreeSet<String>) -> bool {
+        v.iter().all(|t| match t {
+            TokenTree::Ident(id) => {
+                out.insert(id.to_string());
+                true
+            }
+            TokenTree::Group(g) => idents(&g.stream().into_iter().collect::<Vec<_>>(), out),
+            TokenTree::Punct(p) => p.as_char() != '*',
+            TokenTree::Literal(_) => true,
+        })
+    }
+    fn walk(v: &[TokenTree], out: &mut BTreeSet<String>) -> bool {
+        let mut i = 0;
+        while i < v.len() {
+            match &v[i] {
+                TokenTree::Ident(id) if id == "use" => {
+                    let end = (i..v.len())
+                        .find(|&j| is_punct(v.get(j), ';'))
+                        .unwrap_or(v.len());
+                    if !idents(&v[i + 1..end], out) {
+                        return false;
+                    }
+                    i = end;
+                }
+                TokenTree::Group(g) if !walk(&g.stream().into_iter().collect::<Vec<_>>(), out) => {
+                    return false;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        true
+    }
+    let mut out = BTreeSet::new();
+    walk(&tts(tokens), &mut out).then_some(out)
+}
+
+/// Macro names that are not positively std's anywhere in the crate holding
+/// `root`: every `STD_COMMA_MACROS` when a `#[macro_use] extern crate` (or a
+/// file that does not lex) is in the package, and every `macro_rules!` name
+/// defined in it. The package is the directory of the nearest Cargo.toml
+/// (the whole source without one); every `.rs` under it is scanned.
+pub fn crate_not_std(src: &dyn Source, root: &str) -> BTreeSet<String> {
+    fn walk(v: &[TokenTree], out: &mut BTreeSet<String>, macro_use: &mut bool) {
+        let mut pending = false;
+        for (i, t) in v.iter().enumerate() {
+            match t {
+                TokenTree::Group(g) if is_punct(i.checked_sub(1).and_then(|j| v.get(j)), '#') => {
+                    pending |= g.stream().to_string().contains("macro_use");
+                    walk(&g.stream().into_iter().collect::<Vec<_>>(), out, macro_use);
+                    continue;
+                }
+                TokenTree::Group(g) => {
+                    walk(&g.stream().into_iter().collect::<Vec<_>>(), out, macro_use);
+                    if matches!(i.checked_sub(1).and_then(|j| v.get(j)), Some(TokenTree::Ident(p)) if p == "pub")
+                    {
+                        continue;
+                    }
+                }
+                TokenTree::Ident(id) if id == "extern" => {
+                    let krate = matches!(v.get(i + 1), Some(TokenTree::Ident(c)) if c == "crate");
+                    *macro_use |= krate && pending;
+                }
+                TokenTree::Ident(id) if id == "macro_rules" && is_punct(v.get(i + 1), '!') => {
+                    if let Some(TokenTree::Ident(n)) = v.get(i + 2) {
+                        out.insert(n.to_string());
+                    }
+                }
+                TokenTree::Ident(id) if id == "pub" => continue,
+                TokenTree::Punct(p) if p.as_char() == '#' || p.as_char() == '!' => continue,
+                _ => {}
+            }
+            pending = false;
+        }
+    }
+    let mut dir = crate::tree::dir_of(root);
+    while src.read(&crate::tree::join(dir, "Cargo.toml")).is_none() && !dir.is_empty() {
+        dir = crate::tree::dir_of(dir);
+    }
+    let mut out = BTreeSet::new();
+    let mut macro_use = false;
+    for f in src.list(dir).iter().filter(|f| f.ends_with(".rs")) {
+        let text = String::from_utf8_lossy(&src.read(f).unwrap_or_default()).to_string();
+        match text.parse::<TokenStream>() {
+            Ok(ts) => walk(
+                &ts.into_iter().collect::<Vec<_>>(),
+                &mut out,
+                &mut macro_use,
+            ),
+            Err(_) => macro_use = true,
+        }
+    }
+    if macro_use {
+        out.extend(STD_COMMA_MACROS.iter().map(|s| (*s).to_string()));
+    }
+    out
 }
 
 /// The arguments of std macro `name`, when they parse as its grammar,
@@ -258,6 +386,115 @@ pub fn std_commas(tokens: &str, std: &BTreeSet<String>) -> String {
     walk(tokens.parse().unwrap_or_default(), std).to_string()
 }
 
+/// Every `name!(..)` in `tokens`, qualified or not: name and arguments.
+fn calls(tokens: &str) -> Vec<(String, TokenStream)> {
+    fn walk(v: &[TokenTree], out: &mut Vec<(String, TokenStream)>) {
+        for (i, t) in v.iter().enumerate() {
+            match (t, v.get(i + 2)) {
+                (TokenTree::Group(g), _) => walk(&g.stream().into_iter().collect::<Vec<_>>(), out),
+                (TokenTree::Ident(id), Some(TokenTree::Group(g)))
+                    if is_punct(v.get(i + 1), '!') =>
+                {
+                    out.push((id.to_string(), g.stream()));
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&tts(tokens), &mut out);
+    out
+}
+
+/// `line!`, `column!`, `file!` in `tokens`, or a source position taken
+/// from the caller: `Location::caller()` outside a `#[track_caller]` fn, or
+/// a call of one of `tracked` (fns that pass their caller's position on).
+pub fn positional(tokens: &str, tracked: &BTreeSet<String>) -> bool {
+    fn walk(v: &[TokenTree], tracked: &BTreeSet<String>, own: bool) -> bool {
+        v.iter().enumerate().any(|(i, t)| match t {
+            TokenTree::Group(g) => walk(&g.stream().into_iter().collect::<Vec<_>>(), tracked, own),
+            TokenTree::Ident(id) => {
+                let s = id.to_string();
+                let next = v.get(i + 1);
+                (matches!(s.as_str(), "line" | "column" | "file")
+                    && is_punct(next, '!')
+                    && matches!(v.get(i + 2), Some(TokenTree::Group(_))))
+                    || (!own
+                        && s == "Location"
+                        && is_punct(next, ':')
+                        && matches!(v.get(i + 3), Some(TokenTree::Ident(c)) if c == "caller"))
+                    || (!own
+                        && tracked.contains(&s)
+                        && (matches!(next, Some(TokenTree::Group(g)) if g.delimiter() == proc_macro2::Delimiter::Parenthesis)
+                            || is_punct(next, ':')))
+            }
+            _ => false,
+        })
+    }
+    let v = tts(tokens);
+    walk(&v, tracked, has_attr(&v, "track_caller"))
+}
+
+/// The leading outer attributes of an item's tokens include `#[name]`.
+fn has_attr(v: &[TokenTree], name: &str) -> bool {
+    v.chunks(2)
+        .take_while(|c| is_punct(c.first(), '#'))
+        .any(|c| matches!(c.get(1), Some(TokenTree::Group(g)) if g.stream().to_string() == name))
+}
+
+/// Names of `#[track_caller]` fns that take `Location::caller()` or call
+/// another such fn: their callers' positions reach their result.
+pub fn tracked(trees: &[&Tree]) -> BTreeSet<String> {
+    let fns: Vec<(&str, &str)> = trees
+        .iter()
+        .flat_map(|t| &t.leaves)
+        .filter(|l| l.kind == "fn" && has_attr(&tts(&l.tokens), "track_caller"))
+        .map(|l| (l.name.as_str(), l.tokens.as_str()))
+        .collect();
+    let mut set = BTreeSet::new();
+    loop {
+        let before = set.len();
+        for (name, tokens) in &fns {
+            let as_caller = tokens.replace("# [track_caller]", "");
+            if positional(&as_caller, &set) {
+                set.insert((*name).to_string());
+            }
+        }
+        if set.len() == before {
+            return set;
+        }
+    }
+}
+
+/// Log macros (`log`'s, qualified or not, whatever they resolve to).
+pub const LOG_MACROS: [&str; 7] = [
+    "trace",
+    "debug",
+    "info",
+    "warn",
+    "error",
+    "log",
+    "log_enabled",
+];
+
+/// `module_path!` and log macro calls without an explicit `target:` in
+/// `tokens` (their default target is `module_path!()`).
+pub fn module_sensitive(tokens: &str) -> usize {
+    calls(tokens)
+        .iter()
+        .filter(|(n, args)| {
+            n == "module_path"
+                || (LOG_MACROS.contains(&n.as_str()) && !args.to_string().starts_with("target :"))
+        })
+        .count()
+}
+
+/// Test-only code: under `#[cfg(test)]`, or a `#[test]`/`#[cfg(test)]` item.
+pub fn is_test(l: &Leaf) -> bool {
+    let v = tts(&l.tokens);
+    l.ctx.cfg.contains("cfg (test)") || has_attr(&v, "test") || has_attr(&v, "cfg (test)")
+}
+
 /// `macro_rules!` definitions anywhere in `tokens`: name and transcribers.
 pub fn macro_defs(tokens: &str) -> Vec<(String, Vec<String>)> {
     fn walk(v: &[TokenTree], out: &mut Vec<(String, Vec<String>)>) {
@@ -301,9 +538,17 @@ pub struct Site {
     pub local: bool,
 }
 
-/// Whether a definition may be inactive where `caller` is compiled.
+/// Whether a definition may be inactive where `caller` is compiled: a cfg
+/// the caller does not share, or any `cfg_attr` on it or a wrapper (it may
+/// expand to a cfg).
 fn conditional(def: &Leaf, caller: &Leaf) -> bool {
     !def.ctx.cfg.is_subset(&caller.ctx.cfg)
+        || def
+            .ctx
+            .levels
+            .iter()
+            .flatten()
+            .any(|a| a.starts_with("cfg_attr"))
         || def
             .tokens
             .split("macro_rules")
@@ -412,13 +657,17 @@ pub const MACRO: u8 = 4;
 
 const SKIP_AFTER: [&str; 7] = ["fn", "struct", "enum", "union", "trait", "type", "mod"];
 
-/// Free names of a leaf with their namespace mask, and the module each
-/// leading `self::`/`super::` path starts from when written in `module`.
-pub fn free_names(tokens: &str, module: &str) -> (BTreeSet<(String, u8)>, Vec<String>) {
+type FreeNames = (BTreeSet<(String, u8)>, Vec<String>, BTreeSet<Vec<String>>);
+
+/// Free names of a leaf with their namespace mask, the module each leading
+/// `self::`/`super::` path starts from when written in `module`, and every
+/// path of two or more segments (macro paths excepted).
+pub fn free_names(tokens: &str, module: &str) -> FreeNames {
     struct W<'a> {
         module: &'a str,
         out: BTreeSet<(String, u8)>,
         rel: Vec<String>,
+        paths: BTreeSet<Vec<String>>,
     }
     impl W<'_> {
         fn walk(&mut self, v: &[TokenTree], mut in_use: bool) {
@@ -450,6 +699,26 @@ pub fn free_names(tokens: &str, module: &str) -> (BTreeSet<(String, u8)>, Vec<St
                 let prev = i.checked_sub(1).and_then(|j| v.get(j));
                 let after_kw = matches!(prev, Some(TokenTree::Ident(p))
                     if SKIP_AFTER.contains(&p.to_string().as_str()) || (in_use && p == "as"));
+                if path_next
+                    && !after_path
+                    && !after_kw
+                    && !is_punct(prev, '.')
+                    && !is_punct(prev, '$')
+                    && (!is_keyword(&s) || matches!(s.as_str(), "crate" | "self" | "super"))
+                {
+                    let mut segs = vec![s.clone()];
+                    let mut j = i;
+                    while is_punct(v.get(j + 1), ':') && is_punct(v.get(j + 2), ':') {
+                        let Some(TokenTree::Ident(n)) = v.get(j + 3) else {
+                            break;
+                        };
+                        segs.push(n.to_string());
+                        j += 3;
+                    }
+                    if segs.len() > 1 && !is_punct(v.get(j + 1), '!') {
+                        self.paths.insert(segs);
+                    }
+                }
                 if is_keyword(&s)
                     || after_kw
                     || is_punct(prev, '.')
@@ -476,9 +745,10 @@ pub fn free_names(tokens: &str, module: &str) -> (BTreeSet<(String, u8)>, Vec<St
         module,
         out: BTreeSet::new(),
         rel: Vec::new(),
+        paths: BTreeSet::new(),
     };
     w.walk(&tts(tokens), false);
-    (w.out, w.rel)
+    (w.out, w.rel, w.paths)
 }
 
 fn is_keyword(s: &str) -> bool {
@@ -533,6 +803,10 @@ struct Binding {
     /// May name a trait: in-tree traits and imports not known to be anything
     /// else.
     tr: bool,
+    /// A named import: the module it is written in and its path, resolved
+    /// to the referenced items on lookup (`id`, its spelling, when that
+    /// finds nothing).
+    link: Option<(String, Vec<String>)>,
 }
 
 enum Target {
@@ -544,8 +818,12 @@ enum Target {
 pub struct Names {
     locals: BTreeMap<String, BTreeMap<String, Vec<Binding>>>,
     globs: BTreeMap<String, Vec<(Target, String)>>,
-    /// `use path as _`, per module: id and scope.
-    anon: BTreeMap<String, Vec<(String, String)>>,
+    /// `use path as _`, per module.
+    anon: BTreeMap<String, Vec<Binding>>,
+    /// In-tree modules.
+    mods: BTreeSet<String>,
+    /// Imports being resolved (cycle guard).
+    busy: std::cell::RefCell<BTreeSet<(String, Vec<String>)>>,
 }
 
 type TraitScope = (BTreeMap<String, BTreeSet<String>>, BTreeSet<String>);
@@ -556,6 +834,8 @@ impl Names {
             locals: BTreeMap::new(),
             globs: BTreeMap::new(),
             anon: BTreeMap::new(),
+            mods: t.mods.keys().cloned().collect(),
+            busy: Default::default(),
         };
         let mut bind = |m: &str, name: &str, b: Binding| {
             n.locals
@@ -580,6 +860,7 @@ impl Names {
                     id: id(l),
                     scope: scope(&l.vis, &l.module),
                     tr: l.kind == "trait",
+                    link: None,
                 },
             );
         }
@@ -594,6 +875,7 @@ impl Names {
                         id: format!("mod {path}"),
                         scope: scope(&info.vis, p),
                         tr: false,
+                        link: None,
                     },
                 );
             }
@@ -611,6 +893,7 @@ impl Names {
                             id,
                             scope,
                             tr,
+                            link: link(&u.module, &u.path),
                         },
                     );
                 }
@@ -624,16 +907,80 @@ impl Names {
                 None => {
                     let (id, tr) = use_target(t, &u.module, &u.path);
                     if tr {
-                        n.anon
-                            .entry(u.module.clone())
-                            .or_default()
-                            .push((id, scope));
+                        n.anon.entry(u.module.clone()).or_default().push(Binding {
+                            ns: TYPE,
+                            id,
+                            scope,
+                            tr,
+                            link: link(&u.module, &u.path),
+                        });
                     }
                 }
             }
         }
         n
     }
+    /// The items an import refers to, else its spelling.
+    fn ids(&self, b: &Binding, ns: u8) -> BTreeSet<String> {
+        let r = b
+            .link
+            .as_ref()
+            .map(|(m, segs)| self.resolve_path(m, segs, ns))
+            .unwrap_or_default();
+        if r.is_empty() {
+            BTreeSet::from([b.id.clone()])
+        } else {
+            r
+        }
+    }
+
+    /// What path `segs` (last segment in namespaces `ns`) means to code in
+    /// `module`: in-tree modules are walked segment by segment; the walk
+    /// stops at anything else and keeps the rest as text. Empty when an
+    /// in-tree module lacks the next segment.
+    pub fn resolve_path(&self, module: &str, segs: &[String], ns: u8) -> BTreeSet<String> {
+        let key = (module.to_string(), segs.to_vec());
+        if segs.is_empty() || !self.busy.borrow_mut().insert(key.clone()) {
+            return BTreeSet::new();
+        }
+        let at = |i: usize| if i + 1 < segs.len() { TYPE } else { ns };
+        let mut i = 1;
+        let mut cur = match segs[0].as_str() {
+            "crate" => BTreeSet::from(["mod ".to_string()]),
+            "self" => BTreeSet::from([format!("mod {module}")]),
+            "super" => {
+                let mut m = split(module);
+                i = 0;
+                while segs.get(i).is_some_and(|s| s == "super") {
+                    m.pop();
+                    i += 1;
+                }
+                BTreeSet::from([format!("mod {}", m.join("::"))])
+            }
+            s => self.resolve(module, s, at(0)),
+        };
+        while i < segs.len() {
+            let [one] = Vec::from_iter(&cur)[..] else {
+                break;
+            };
+            let Some(m) = one.strip_prefix("mod ") else {
+                break;
+            };
+            if !self.mods.contains(m) {
+                break;
+            }
+            let (f, o) = self.exported(m, &segs[i], at(i), module, &mut Vec::new());
+            cur = if f.is_empty() { o } else { f };
+            i += 1;
+        }
+        if i < segs.len() {
+            let rest = segs[i..].join("::");
+            cur = cur.into_iter().map(|c| format!("{c}::{rest}")).collect();
+        }
+        self.busy.borrow_mut().remove(&key);
+        cur
+    }
+
     /// What `name` (namespaces `ns`) means to code in `module`.
     pub fn resolve(&self, module: &str, name: &str, ns: u8) -> BTreeSet<String> {
         let (found, opaque) = self.exported(module, name, ns, module, &mut Vec::new());
@@ -663,7 +1010,7 @@ impl Names {
                 local
                     .iter()
                     .filter(|b| admits(&b.scope, viewer))
-                    .map(|b| b.id.clone()),
+                    .flat_map(|b| self.ids(b, ns)),
             );
             return (found, opaque);
         }
@@ -708,7 +1055,10 @@ impl Names {
             if !bs.is_empty() {
                 named.insert(
                     name.clone(),
-                    bs.iter().filter(|b| b.tr).map(|b| b.id.clone()).collect(),
+                    bs.iter()
+                        .filter(|b| b.tr)
+                        .flat_map(|b| self.ids(b, TYPE))
+                        .collect(),
                 );
             }
         }
@@ -717,8 +1067,8 @@ impl Names {
                 .get(m)
                 .into_iter()
                 .flatten()
-                .filter(|(_, s)| admits(s, viewer))
-                .map(|(id, _)| id.clone()),
+                .filter(|b| admits(&b.scope, viewer))
+                .flat_map(|b| self.ids(b, TYPE)),
         );
         path.push(m.to_string());
         let mut globbed: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -745,6 +1095,18 @@ impl Names {
         }
         (named, anon)
     }
+}
+
+/// The module and segments of a named import of a relative or `crate::`
+/// path; `None` for `::extern` paths.
+fn link(module: &str, path: &str) -> Option<(String, Vec<String>)> {
+    let p = path.split_once(" as ").map_or(path, |(p, _)| p);
+    (!p.starts_with(":: ")).then(|| {
+        (
+            module.to_string(),
+            p.split(" :: ").map(str::to_string).collect(),
+        )
+    })
 }
 
 /// A `use` path made absolute (`crate::…` for in-tree modules, the path
