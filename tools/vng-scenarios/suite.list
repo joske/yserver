@@ -47,3 +47,4 @@ pixmap-pool          guest=pixmap-pool.sh            host=pixmap-pool-host.sh   
 pixmap-refs          guest=pixmap-refs.sh            host=pixmap-refs-host.sh            timeout=400 gpu=none
 bg-gc                guest=bg-gc.sh                  timeout=300
 slow-client          guest=slow-client.sh            timeout=400
+glyph-atlas          guest=glyph-atlas.sh            timeout=400

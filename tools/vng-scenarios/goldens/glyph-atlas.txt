@@ -1,0 +1,56 @@
+==> probe.log <==
+redefine before churn: new glyphset: bad_pixels=0 bad_glyphs=0
+redefine before churn: after FreeGlyphs + AddGlyphs: bad_pixels=0 bad_glyphs=0
+redefine before churn: AddGlyphs over a live id: bad_pixels=0 bad_glyphs=0
+round 0 a8: bad_pixels=0 bad_glyphs=0
+round 0 argb32: bad_pixels=0 bad_glyphs=0
+round 0 kept a8: bad_pixels=0 bad_glyphs=0
+round 1 a8: bad_pixels=0 bad_glyphs=0
+round 1 argb32: bad_pixels=0 bad_glyphs=0
+round 1 kept a8: bad_pixels=0 bad_glyphs=0
+round 2 a8: bad_pixels=0 bad_glyphs=0
+round 2 argb32: bad_pixels=0 bad_glyphs=0
+round 2 kept a8: bad_pixels=0 bad_glyphs=0
+round 3 a8: bad_pixels=0 bad_glyphs=0
+round 3 argb32: bad_pixels=0 bad_glyphs=0
+round 3 kept a8: bad_pixels=0 bad_glyphs=0
+round 4 a8: bad_pixels=0 bad_glyphs=0
+round 4 argb32: bad_pixels=0 bad_glyphs=0
+round 4 kept a8: bad_pixels=0 bad_glyphs=0
+round 5 a8: bad_pixels=0 bad_glyphs=0
+round 5 argb32: bad_pixels=0 bad_glyphs=0
+round 5 kept a8: bad_pixels=0 bad_glyphs=0
+round 6 a8: bad_pixels=0 bad_glyphs=0
+round 6 argb32: bad_pixels=0 bad_glyphs=0
+round 6 kept a8: bad_pixels=0 bad_glyphs=0
+round 7 a8: bad_pixels=0 bad_glyphs=0
+round 7 argb32: bad_pixels=0 bad_glyphs=0
+round 7 kept a8: bad_pixels=0 bad_glyphs=0
+round 8 a8: bad_pixels=0 bad_glyphs=0
+round 8 argb32: bad_pixels=0 bad_glyphs=0
+round 8 kept a8: bad_pixels=0 bad_glyphs=0
+round 9 a8: bad_pixels=0 bad_glyphs=0
+round 9 argb32: bad_pixels=0 bad_glyphs=0
+round 9 kept a8: bad_pixels=0 bad_glyphs=0
+round 10 a8: bad_pixels=0 bad_glyphs=0
+round 10 argb32: bad_pixels=0 bad_glyphs=0
+round 10 kept a8: bad_pixels=0 bad_glyphs=0
+round 11 a8: bad_pixels=0 bad_glyphs=0
+round 11 argb32: bad_pixels=0 bad_glyphs=0
+round 11 kept a8: bad_pixels=0 bad_glyphs=0
+round 12 a8: bad_pixels=0 bad_glyphs=0
+round 12 argb32: bad_pixels=0 bad_glyphs=0
+round 12 kept a8: bad_pixels=0 bad_glyphs=0
+round 13 a8: bad_pixels=0 bad_glyphs=0
+round 13 argb32: bad_pixels=0 bad_glyphs=0
+round 13 kept a8: bad_pixels=0 bad_glyphs=0
+round 14 a8: bad_pixels=0 bad_glyphs=0
+round 14 argb32: bad_pixels=0 bad_glyphs=0
+round 14 kept a8: bad_pixels=0 bad_glyphs=0
+round 15 a8: bad_pixels=0 bad_glyphs=0
+round 15 argb32: bad_pixels=0 bad_glyphs=0
+round 15 kept a8: bad_pixels=0 bad_glyphs=0
+redefine after churn: new glyphset: bad_pixels=0 bad_glyphs=0
+redefine after churn: after FreeGlyphs + AddGlyphs: bad_pixels=0 bad_glyphs=0
+redefine after churn: AddGlyphs over a live id: bad_pixels=0 bad_glyphs=0
+total bad_pixels=0

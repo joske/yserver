@@ -25681,6 +25681,8 @@ impl Backend for KmsBackend {
 
     fn close_font(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
         self.core.fonts.remove(&host_xid);
+        // Core text keys its atlas entries by the font's host xid.
+        self.engine.forget_glyphs(host_xid, None);
         Ok(())
     }
 
@@ -28229,10 +28231,10 @@ impl Backend for KmsBackend {
         _origin: Option<OriginContext>,
         host_gs: u32,
     ) -> io::Result<()> {
-        // Drop the glyphset record. Atlas-side slot reclamation
-        // is Stage 5 (per Stage 3a glyph atlas: shelf packer is
-        // monotonic), so the atlas pixels stay until atlas-full.
+        // Host glyphset xids are never reused, but the atlas entries
+        // would otherwise outlive the set until the next atlas reset.
         self.core.glyphsets.remove(&host_gs);
+        self.engine.forget_glyphs(host_gs, None);
         Ok(())
     }
 
@@ -28245,8 +28247,25 @@ impl Backend for KmsBackend {
         // Reuses v1's parse_add_glyphs — purely CPU-side, operates
         // on the KmsCore.glyphsets entry. Atlas-side upload (the
         // Vk part) is Stage 3d's render_composite_glyphs path.
-        if let Some(gs) = self.core.glyphsets.get_mut(&host_gs) {
-            crate::kms::backend::parse_add_glyphs(gs, body_tail);
+        let Some(gs) = self.core.glyphsets.get_mut(&host_gs) else {
+            return Ok(());
+        };
+        // AddGlyphs over a live id replaces its image (Xorg's AddGlyph);
+        // the atlas copy of the old one must go with it.
+        let redefined: Vec<u32> = body_tail
+            .get(..4)
+            .map(|n| u32::from_le_bytes([n[0], n[1], n[2], n[3]]) as usize)
+            .and_then(|n| body_tail.get(4..4 + n.checked_mul(4)?))
+            .map(|ids| {
+                ids.chunks_exact(4)
+                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .filter(|id| gs.glyphs.contains_key(id))
+                    .collect()
+            })
+            .unwrap_or_default();
+        crate::kms::backend::parse_add_glyphs(gs, body_tail);
+        if !redefined.is_empty() {
+            self.engine.forget_glyphs(host_gs, Some(&redefined));
         }
         Ok(())
     }
@@ -28260,10 +28279,15 @@ impl Backend for KmsBackend {
         let Some(gs) = self.core.glyphsets.get_mut(&host_gs) else {
             return Ok(());
         };
-        for chunk in glyph_ids.chunks_exact(4) {
-            let id = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-            gs.glyphs.remove(&id);
+        let ids: Vec<u32> = glyph_ids
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        for id in &ids {
+            gs.glyphs.remove(id);
         }
+        // A freed id can be added again with a different image.
+        self.engine.forget_glyphs(host_gs, Some(&ids));
         Ok(())
     }
 
