@@ -30,7 +30,9 @@ pub struct Manifest {
     /// `name:bin`, `name:test`), when the Cargo layout does not tell.
     #[serde(default)]
     pub target: Option<String>,
-    /// Old item key → new visibility (only `pub(super)` / `pub(in …)`).
+    /// Old item key → new visibility (only `pub(super)` / `pub(in …)`); it
+    /// replaces the item's own visibility, if any. `verify` still refuses a
+    /// resolved reach wider than the old one.
     #[serde(default)]
     pub visibility: BTreeMap<String, String>,
     #[serde(default)]
@@ -190,6 +192,9 @@ struct Unit<'a> {
     end: usize,
     blank: bool,
     vis_at: usize,
+    /// End of the item's own visibility (`vis_at` when it has none): a
+    /// manifest visibility replaces `vis_at..vis_end`.
+    vis_end: usize,
     depth: usize,
     wrap: Option<usize>,
     item: UnitItem<'a>,
@@ -255,6 +260,41 @@ fn item_vis_at(f: &SrcFile, item: &Item) -> usize {
         _ => {}
     }
     vis_at(f, it.to_token_stream())
+}
+
+/// End of the written visibility of `item`, or `at` when it has none.
+fn item_vis_end(f: &SrcFile, item: &Item, at: usize) -> usize {
+    let vis = match item {
+        Item::Const(i) => &i.vis,
+        Item::Enum(i) => &i.vis,
+        Item::Fn(i) => &i.vis,
+        Item::Static(i) => &i.vis,
+        Item::Struct(i) => &i.vis,
+        Item::Trait(i) => &i.vis,
+        Item::Type(i) => &i.vis,
+        Item::Union(i) => &i.vis,
+        Item::Mod(i) => &i.vis,
+        Item::Use(i) => &i.vis,
+        Item::ExternCrate(i) => &i.vis,
+        _ => return at,
+    };
+    vis_end(f, vis, at)
+}
+
+fn member_vis_end(f: &SrcFile, item: &syn::ImplItem, at: usize) -> usize {
+    match item {
+        syn::ImplItem::Const(i) => vis_end(f, &i.vis, at),
+        syn::ImplItem::Fn(i) => vis_end(f, &i.vis, at),
+        syn::ImplItem::Type(i) => vis_end(f, &i.vis, at),
+        _ => at,
+    }
+}
+
+fn vis_end(f: &SrcFile, vis: &syn::Visibility, at: usize) -> usize {
+    match vis {
+        syn::Visibility::Inherited => at,
+        v => range(f, v.to_token_stream()).1,
+    }
 }
 
 fn member_vis_at(f: &SrcFile, item: &syn::ImplItem) -> usize {
@@ -358,6 +398,7 @@ impl<'a> Src<'a> {
                             end: me,
                             blank: mblank,
                             vis_at: member_vis_at(f, ii),
+                            vis_end: member_vis_end(f, ii, member_vis_at(f, ii)),
                             depth: 1,
                             wrap: Some(w),
                             item: UnitItem::Member(ii, i),
@@ -399,6 +440,7 @@ impl<'a> Src<'a> {
                     end: e,
                     blank,
                     vis_at: item_vis_at(f, item),
+                    vis_end: item_vis_end(f, item, item_vis_at(f, item)),
                     depth,
                     wrap: None,
                     item: UnitItem::Item(item),
@@ -409,10 +451,14 @@ impl<'a> Src<'a> {
         Ok(prev)
     }
 
-    /// Unit text, with an inserted visibility and reindented to `depth`.
+    /// Unit text, with the manifest visibility in place of its own (inserted
+    /// when it has none) and reindented to `depth`.
     fn text(&self, u: &Unit, vis: Option<&str>, depth: usize) -> String {
         let t = &self.f.text;
         let mut s = match vis {
+            Some(v) if u.vis_end > u.vis_at => {
+                format!("{}{v}{}", &t[u.start..u.vis_at], &t[u.vis_end..u.end])
+            }
             Some(v) => format!("{}{v} {}", &t[u.start..u.vis_at], &t[u.vis_at..u.end]),
             None => t[u.start..u.end].to_string(),
         };

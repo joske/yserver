@@ -271,10 +271,7 @@ pub fn check(
                     errs.extend(rx.location(ob, na));
                     let (so, sn) = (scope(&ob.vis, &ob.module), scope(&na.vis, &na.module));
                     if na.vis != ob.vis {
-                        if ob.vis.is_empty()
-                            && allowed_vis(&na.vis)
-                            && vis_ok.get(key) == Some(&na.vis)
-                        {
+                        if allowed_vis(&na.vis) && vis_ok.get(key) == Some(&na.vis) {
                             vis_changes += 1;
                         } else {
                             errs.push(format!(

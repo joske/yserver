@@ -1730,3 +1730,124 @@ fn integration_test_root_splits_into_a_main_rs_directory() {
         Vec::<String>::new()
     );
 }
+
+/// `split apply` with a manifest given as TOML text, in a scratch repo, then
+/// `verify` of the result.
+fn apply_toml(tag: &str, files: &[(&str, &str)], toml: &str) -> Result<Vec<String>, String> {
+    let repo = tmpdir(&format!("apply-toml-{tag}"));
+    let _ = std::fs::remove_dir_all(&repo);
+    for (p, t) in files {
+        let p = repo.join(p);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, t).unwrap();
+    }
+    std::fs::write(repo.join("m.toml"), toml).unwrap();
+    let m = Manifest::load(&repo.join("m.toml")).unwrap();
+    crate::apply::run(&m, &repo)?;
+    let errs = check(
+        &spec_of(&m),
+        &mem(files),
+        &crate::tree::Disk(repo.clone()),
+        &[],
+    )
+    .unwrap()
+    .1;
+    let inner = std::fs::read_to_string(repo.join("src/x/a/inner.rs")).unwrap();
+    assert!(!inner.contains(") pub("), "{inner}");
+    Ok(errs)
+}
+
+const REPLACE_SRC: &str =
+    "pub(super) fn f() -> u32 {\n    1\n}\n\npub fn g() -> u32 {\n    f()\n}\n";
+
+fn replace_manifest(vis: &str) -> String {
+    format!(
+        "source = \"src/x/a.rs\"\nmodule = \"x::a\"\ndir = \"src/x/a\"\ntable = \"a.paths\"\n\n[visibility]\n\"fn f\" = \"{vis}\"\n\n[[modules]]\nname = \"\"\nlines = [\"pub(in crate::x) use inner::*;\"]\nitems = [\"fn g\"]\n\n[[modules]]\nname = \"inner\"\nlines = [\"use super::*;\"]\nitems = [\"fn f\"]\n"
+    )
+}
+
+#[test]
+fn apply_replaces_an_existing_visibility() {
+    let errs = apply_toml(
+        "replace-vis",
+        &[("src/x/a.rs", REPLACE_SRC)],
+        &replace_manifest("pub(in crate::x)"),
+    )
+    .unwrap();
+    assert_eq!(errs, Vec::<String>::new());
+}
+
+#[test]
+fn replaced_visibility_that_widens_fails() {
+    let errs = apply_toml(
+        "replace-vis-widen",
+        &[("src/x/a.rs", REPLACE_SRC)],
+        &replace_manifest("pub(in crate)"),
+    )
+    .unwrap();
+    has(&errs, "widened");
+}
+
+#[test]
+fn unlisted_change_of_an_existing_visibility_fails() {
+    let tmp = tmpdir("replace-vis-unlisted");
+    std::fs::write(
+        tmp.join("a.paths"),
+        "x::a::fn f => x::a::inner::fn f\nx::a::fn g => x::a::fn g\n",
+    )
+    .unwrap();
+    let toml = replace_manifest("pub(in crate::x)")
+        .replace("[visibility]\n\"fn f\" = \"pub(in crate::x)\"\n", "");
+    std::fs::write(tmp.join("m.toml"), toml).unwrap();
+    let m = Manifest::load(&tmp.join("m.toml")).unwrap();
+    let head = mem(&[
+        (
+            "src/x/a/mod.rs",
+            "mod inner;\npub(in crate::x) use inner::*;\n\npub fn g() -> u32 {\n    f()\n}\n",
+        ),
+        (
+            "src/x/a/inner.rs",
+            "use super::*;\n\npub(in crate::x) fn f() -> u32 {\n    1\n}\n",
+        ),
+    ]);
+    let errs = check(
+        &spec_of(&m),
+        &mem(&[("src/x/a.rs", REPLACE_SRC)]),
+        &head,
+        &[],
+    )
+    .unwrap()
+    .1;
+    has(&errs, "not allowed by the manifest");
+}
+
+#[test]
+fn import_of_a_moved_fn_through_the_root_glob_is_not_a_trait() {
+    let before = "fn f() -> u32 {\n    1\n}\n\nmod t {\n    use super::f;\n\n    fn g() -> u32 {\n        f()\n    }\n}\n";
+    let mod_rs = "mod inner;\nuse inner::*;\n\nmod t {\n    use super::f;\n\n    fn g() -> u32 {\n        f()\n    }\n}\n";
+    let inner = "use super::*;\n\npub(super) fn f() -> u32 {\n    1\n}\n";
+    let errs = split(
+        "glob-import-not-trait",
+        before,
+        &[("src/a/mod.rs", mod_rs), ("src/a/inner.rs", inner)],
+        "a::fn f => a::inner::fn f\na::t::fn g => a::t::fn g\n",
+        [&["use inner::*;"], &["use super::*;"]],
+    );
+    assert_eq!(errs, Vec::<String>::new());
+}
+
+#[test]
+fn import_of_a_moved_trait_through_the_root_glob_still_counts() {
+    let before =
+        "trait f {}\n\nmod t {\n    use super::f;\n\n    fn g() -> u32 {\n        1\n    }\n}\n";
+    let mod_rs = "mod inner;\nuse inner::*;\n\nmod t {\n    fn g() -> u32 {\n        1\n    }\n}\n";
+    let inner = "use super::*;\n\npub(super) trait f {}\n";
+    let errs = split(
+        "glob-import-trait",
+        before,
+        &[("src/a/mod.rs", mod_rs), ("src/a/inner.rs", inner)],
+        "a::trait f => a::inner::trait f\na::t::fn g => a::t::fn g\n",
+        [&["use inner::*;"], &["use super::*;"]],
+    );
+    has(&errs, "traits in scope");
+}

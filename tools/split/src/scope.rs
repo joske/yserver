@@ -1690,18 +1690,61 @@ fn use_target(t: &Tree, module: &str, path: &str) -> (String, bool) {
     let name = cur.pop().unwrap_or_default();
     let parent = cur.join("::");
     let item = crate::tree::child(&parent, &name);
-    let kinds: Vec<&str> = t
+    let mut kinds: Vec<&str> = t
         .leaves
         .iter()
         .filter(|l| l.owner.is_none() && l.module == parent && l.name == name)
         .map(|l| l.kind)
         .collect();
+    if kinds.is_empty() && !t.mods.contains_key(&item) {
+        glob_kinds(t, &parent, &name, &mut Vec::new(), &mut kinds);
+    }
     let tr = if kinds.is_empty() {
         !t.mods.contains_key(&item)
     } else {
-        kinds.contains(&"trait")
+        kinds.iter().any(|k| *k == "trait" || *k == "?")
     };
     (format!("use crate::{item}{alias}"), tr)
+}
+
+/// Kinds of the items named `name` that in-tree globs of `module` bring in,
+/// transitively; `"?"` for anything else that might (an opaque glob, a named
+/// import), so the caller keeps treating the import as a possible trait.
+fn glob_kinds<'t>(
+    t: &'t Tree,
+    module: &str,
+    name: &str,
+    seen: &mut Vec<String>,
+    out: &mut Vec<&'t str>,
+) {
+    if seen.iter().any(|m| m == module) {
+        return;
+    }
+    seen.push(module.to_string());
+    for u in t.uses.iter().filter(|u| u.module == module) {
+        match &u.name {
+            Some(n) if n == name => out.push("?"),
+            None if u.path.ends_with('*') => match glob_target(t, module, &u.path) {
+                Target::Module(m) => {
+                    let n = out.len();
+                    out.extend(
+                        t.leaves
+                            .iter()
+                            .filter(|l| l.owner.is_none() && l.module == m && l.name == name)
+                            .map(|l| l.kind),
+                    );
+                    if t.mods.contains_key(&crate::tree::child(&m, name)) {
+                        out.push("mod");
+                    }
+                    if out.len() == n {
+                        glob_kinds(t, &m, name, seen, out);
+                    }
+                }
+                Target::Opaque(_) => out.push("?"),
+            },
+            _ => {}
+        }
+    }
 }
 
 fn glob_target(t: &Tree, module: &str, path: &str) -> Target {
