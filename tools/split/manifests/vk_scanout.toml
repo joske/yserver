@@ -50,3 +50,9 @@ items = [
 [[modules]]
 name = "tests"
 items = ["tests::*"]
+
+[locations]
+"fn exact_copied_source_plans" = "calls a #[track_caller] format query that reaches vk::image_format_properties2, whose caller line shifts by 3; only the `asked from file:line` of the yserver::format_query debug log changes, not the query or its result"
+"fn probe_directional_modifiers" = "calls a #[track_caller] format query that reaches vk::image_format_properties2, whose caller line shifts by 3; only the `asked from file:line` of the yserver::format_query debug log changes, not the query or its result"
+"fn probe_dmabuf_scanout_metadata" = "calls a #[track_caller] format query that reaches vk::image_format_properties2, whose caller line shifts by 3; only the `asked from file:line` of the yserver::format_query debug log changes, not the query or its result"
+"fn scanout_modifier_single_plane_supports_feature" = "calls a #[track_caller] format query that reaches vk::image_format_properties2, whose caller line shifts by 3; only the `asked from file:line` of the yserver::format_query debug log changes, not the query or its result"
