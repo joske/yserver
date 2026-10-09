@@ -1,0 +1,962 @@
+# Phase 2 (2.6) for process_request.rs: production items move into
+# descendant modules of core_loop::process_request (log targets keep the
+# old prefix), one per request family; process_request.rs keeps the
+# imports, opcode consts, RequestOutcome, the dispatch match and the
+# helpers shared by several families. Each child starts `use super::*;`;
+# the root glob-imports every child at the widest visibility one of its
+# items has (`pub use` / `pub(crate) use` / `use`; a glob caps each name
+# at the item's own visibility), so every existing `process_request::name`
+# path, in this crate and in `yserver`, keeps resolving unchanged.
+# Needs the prep commit first: `super::run::` / `super::process_disconnect::`
+# (15 sites) qualified to `crate::core_loop::…` so they mean the same
+# module from a child. Visibility: 140 dispatch targets + ~37 sibling
+# helpers + ~43 helpers that only tests reach (all pub(super));
+# handle_xi2_request is pub(in crate::core_loop::process_request).
+source = "crates/yserver-core/src/core_loop/process_request.rs"
+module = "core_loop::process_request"
+dir = "crates/yserver-core/src/core_loop/process_request"
+root_form = "file"
+table = "process_request_2.paths"
+
+[exceptions]
+"fn handle_render_request" = "verify_pictures! is defined and used only inside this fn; its transcriber names fn locals (state, client_id, sequence, minor, header), crate::nested (absolute), u16, first_missing_picture (moves with it) and emit_x11_error_with_minor (root, reached through use super::*): same items at the new call site"
+"fn handle_xinerama_request" = "require_len! is defined and used only inside this fn; its transcriber names fn locals (body, state, client_id, sequence, minor), the fn-local const XINERAMA_MAJOR_OPCODE and fn-local import error, and emit_x11_error_with_minor (root, reached through use super::*): same items at the new call site"
+
+[visibility]
+"const XI1_ERROR_BAD_DEVICE" = "pub(super)"
+"enum ModmapChangeOutcome" = "pub(super)"
+"enum WarpSrcRule" = "pub(super)"
+"fn activate_redirect_backing_for" = "pub(super)"
+"fn active_monitors" = "pub(super)"
+"fn advertised_extension_names" = "pub(super)"
+"fn apply_allow_events" = "pub(super)"
+"fn apply_core_input_focus" = "pub(super)"
+"fn apply_keymap_change" = "pub(super)"
+"fn apply_pointer_warp" = "pub(super)"
+"fn apply_viewability_delta_to_redirects" = "pub(super)"
+"fn apply_xi2_allow_events_for_slave" = "pub(super)"
+"fn arm_present_pixmap_synced_source_then_supersede" = "pub(super)"
+"fn arrival_execute_or_park_present_pixmap" = "pub(super)"
+"fn change_modifier_mapping" = "pub(super)"
+"fn completed_event_for_pending" = "pub(super)"
+"fn copy_area_effective_dst_rects" = "pub(super)"
+"fn copy_area_source_split" = "pub(super)"
+"fn core_focus_window_error" = "pub(super)"
+"fn current_bounding_in_parent" = "pub(super)"
+"fn current_vidmode_mode_line" = "pub(super)"
+"fn current_vidmode_output" = "pub(super)"
+"fn deactivate_core_pointer_grab" = "pub(super)"
+"fn deactivate_passive_pointer_grab_crossings" = "pub(super)"
+"fn default_present_crtc_for_window" = "pub(super)"
+"fn destroy_window_subtree" = "pub(super)"
+"fn dispatch_change_property" = "pub(super)"
+"fn dispatch_xfixes_request" = "pub(super)"
+"fn drawable_attributes_for" = "pub(super)"
+"fn drawable_full_rect_xfixes" = "pub(super)"
+"fn drop_selections_owned_by_windows" = "pub(super)"
+"fn effective_present_target_raw" = "pub(super)"
+"fn effective_redirect_mode_for_window" = "pub(super)"
+"fn emit_shape_notify" = "pub(super)"
+"fn execute_present_pixmap_copy" = "pub(super)"
+"fn execute_present_pixmap_copy_or_reroute" = "pub(super)"
+"fn extension_query_reply" = "pub(super)"
+"fn extract_shm_zpixmap_region" = "pub(super)"
+"fn fetch_merged_keymap" = "pub(super)"
+"fn format_region_rects" = "pub(super)"
+"fn glx_extension_string" = "pub(super)"
+"fn glx_fbconfig_depth" = "pub(super)"
+"fn glx_fbconfig_visual" = "pub(super)"
+"fn glx_visual_fbconfig" = "pub(super)"
+"fn handle_alloc_color" = "pub(super)"
+"fn handle_alloc_color_cells" = "pub(super)"
+"fn handle_alloc_color_planes" = "pub(super)"
+"fn handle_alloc_named_color" = "pub(super)"
+"fn handle_allow_events" = "pub(super)"
+"fn handle_bell" = "pub(super)"
+"fn handle_big_requests_request" = "pub(super)"
+"fn handle_change_active_pointer_grab" = "pub(super)"
+"fn handle_change_gc" = "pub(super)"
+"fn handle_change_keyboard_control" = "pub(super)"
+"fn handle_change_keyboard_mapping" = "pub(super)"
+"fn handle_change_pointer_control" = "pub(super)"
+"fn handle_change_property" = "pub(super)"
+"fn handle_change_save_set" = "pub(super)"
+"fn handle_change_window_attributes" = "pub(super)"
+"fn handle_circulate_window" = "pub(super)"
+"fn handle_clear_area" = "pub(super)"
+"fn handle_close_font" = "pub(super)"
+"fn handle_composite_request" = "pub(super)"
+"fn handle_configure_window" = "pub(super)"
+"fn handle_convert_selection" = "pub(super)"
+"fn handle_copy_area" = "pub(super)"
+"fn handle_copy_colormap_and_free" = "pub(super)"
+"fn handle_copy_gc" = "pub(super)"
+"fn handle_copy_plane" = "pub(super)"
+"fn handle_create_colormap" = "pub(super)"
+"fn handle_create_cursor" = "pub(super)"
+"fn handle_create_gc" = "pub(super)"
+"fn handle_create_glyph_cursor" = "pub(super)"
+"fn handle_create_pixmap" = "pub(super)"
+"fn handle_create_window" = "pub(super)"
+"fn handle_damage_request" = "pub(super)"
+"fn handle_delete_property" = "pub(super)"
+"fn handle_destroy_subwindows" = "pub(super)"
+"fn handle_destroy_window" = "pub(super)"
+"fn handle_dpms_request" = "pub(super)"
+"fn handle_dri3_request" = "pub(super)"
+"fn handle_fill_poly" = "pub(super)"
+"fn handle_force_screen_saver" = "pub(super)"
+"fn handle_free_colormap" = "pub(super)"
+"fn handle_free_colors" = "pub(super)"
+"fn handle_free_cursor" = "pub(super)"
+"fn handle_free_gc" = "pub(super)"
+"fn handle_free_pixmap" = "pub(super)"
+"fn handle_ge_request" = "pub(super)"
+"fn handle_get_atom_name" = "pub(super)"
+"fn handle_get_font_path" = "pub(super)"
+"fn handle_get_geometry" = "pub(super)"
+"fn handle_get_image" = "pub(super)"
+"fn handle_get_input_focus" = "pub(super)"
+"fn handle_get_keyboard_control" = "pub(super)"
+"fn handle_get_keyboard_mapping" = "pub(super)"
+"fn handle_get_modifier_mapping" = "pub(super)"
+"fn handle_get_motion_events" = "pub(super)"
+"fn handle_get_pointer_control" = "pub(super)"
+"fn handle_get_pointer_mapping" = "pub(super)"
+"fn handle_get_property" = "pub(super)"
+"fn handle_get_screen_saver" = "pub(super)"
+"fn handle_get_selection_owner" = "pub(super)"
+"fn handle_get_window_attributes" = "pub(super)"
+"fn handle_glx_request" = "pub(super)"
+"fn handle_grab_button" = "pub(super)"
+"fn handle_grab_key" = "pub(super)"
+"fn handle_grab_keyboard" = "pub(super)"
+"fn handle_grab_pointer" = "pub(super)"
+"fn handle_grab_server" = "pub(super)"
+"fn handle_image_text16" = "pub(super)"
+"fn handle_image_text8" = "pub(super)"
+"fn handle_install_colormap" = "pub(super)"
+"fn handle_intern_atom" = "pub(super)"
+"fn handle_kill_client" = "pub(super)"
+"fn handle_list_extensions" = "pub(super)"
+"fn handle_list_fonts" = "pub(super)"
+"fn handle_list_fonts_with_info" = "pub(super)"
+"fn handle_list_hosts" = "pub(super)"
+"fn handle_list_installed_colormaps" = "pub(super)"
+"fn handle_list_properties" = "pub(super)"
+"fn handle_lookup_color" = "pub(super)"
+"fn handle_map_subwindows" = "pub(super)"
+"fn handle_map_window" = "pub(super)"
+"fn handle_mit_shm_put_image" = "pub(super)"
+"fn handle_mit_shm_request" = "pub(super)"
+"fn handle_open_font" = "pub(super)"
+"fn handle_poly_arc" = "pub(super)"
+"fn handle_poly_fill_arc" = "pub(super)"
+"fn handle_poly_fill_rectangle" = "pub(super)"
+"fn handle_poly_line" = "pub(super)"
+"fn handle_poly_point" = "pub(super)"
+"fn handle_poly_rectangle" = "pub(super)"
+"fn handle_poly_segment" = "pub(super)"
+"fn handle_poly_text16" = "pub(super)"
+"fn handle_poly_text8" = "pub(super)"
+"fn handle_present_request" = "pub(super)"
+"fn handle_put_image" = "pub(super)"
+"fn handle_query_best_size" = "pub(super)"
+"fn handle_query_colors" = "pub(super)"
+"fn handle_query_extension" = "pub(super)"
+"fn handle_query_font" = "pub(super)"
+"fn handle_query_keymap" = "pub(super)"
+"fn handle_query_pointer" = "pub(super)"
+"fn handle_query_text_extents" = "pub(super)"
+"fn handle_query_tree" = "pub(super)"
+"fn handle_randr_request" = "pub(super)"
+"fn handle_recolor_cursor" = "pub(super)"
+"fn handle_render_request" = "pub(super)"
+"fn handle_reparent_window" = "pub(super)"
+"fn handle_screen_saver_request" = "pub(super)"
+"fn handle_send_event" = "pub(super)"
+"fn handle_set_clip_rectangles" = "pub(super)"
+"fn handle_set_close_down_mode" = "pub(super)"
+"fn handle_set_dashes" = "pub(super)"
+"fn handle_set_font_path" = "pub(super)"
+"fn handle_set_input_focus" = "pub(super)"
+"fn handle_set_modifier_mapping" = "pub(super)"
+"fn handle_set_pointer_mapping" = "pub(super)"
+"fn handle_set_screen_saver" = "pub(super)"
+"fn handle_set_selection_owner" = "pub(super)"
+"fn handle_shape_request" = "pub(super)"
+"fn handle_store_colors" = "pub(super)"
+"fn handle_store_named_color" = "pub(super)"
+"fn handle_sync_request" = "pub(super)"
+"fn handle_translate_coordinates" = "pub(super)"
+"fn handle_ungrab_button" = "pub(super)"
+"fn handle_ungrab_key" = "pub(super)"
+"fn handle_ungrab_keyboard" = "pub(super)"
+"fn handle_ungrab_pointer" = "pub(super)"
+"fn handle_ungrab_server" = "pub(super)"
+"fn handle_uninstall_colormap" = "pub(super)"
+"fn handle_unmap_subwindows" = "pub(super)"
+"fn handle_unmap_window" = "pub(super)"
+"fn handle_warp_pointer" = "pub(super)"
+"fn handle_x_resource_request" = "pub(super)"
+"fn handle_xcmisc_request" = "pub(super)"
+"fn handle_xf86vidmode_request" = "pub(super)"
+"fn handle_xfixes_request" = "pub(super)"
+"fn handle_xi2_request" = "pub(in crate::core_loop::process_request)"
+"fn handle_xi_warp_pointer" = "pub(super)"
+"fn handle_xinerama_request" = "pub(super)"
+"fn handle_xkb_request" = "pub(super)"
+"fn handle_xtest_request" = "pub(super)"
+"fn has_redirected_ancestor" = "pub(super)"
+"fn legacy_keyboard_mapping_notify" = "pub(super)"
+"fn map_subwindows_with_delta" = "pub(super)"
+"fn mark_randr_unsupported_warned" = "pub(super)"
+"fn mirror_shape_to_host_state" = "pub(super)"
+"fn normalize_region_rects" = "pub(super)"
+"fn present_supersession_covers" = "pub(super)"
+"fn present_wire_clock" = "pub(super)"
+"fn realize_storage_for_delta" = "pub(super)"
+"fn reapply_redirect_mode_after_map" = "pub(super)"
+"fn redirected_ancestor_or_self" = "pub(super)"
+"fn release_core_grabs_for_unviewable" = "pub(super)"
+"fn release_displaced_gc_pixmaps" = "pub(super)"
+"fn release_storage_for_delta" = "pub(super)"
+"fn render_picture_damage_drawable" = "pub(super)"
+"fn retarget_glx_pixmap_export" = "pub(super)"
+"fn revert_core_focus_from" = "pub(super)"
+"fn revert_core_focus_if_unviewable" = "pub(super)"
+"fn rotate_redirected_backing_on_resize" = "pub(super)"
+"fn select_present_domain" = "pub(super)"
+"fn send_window_exposures" = "pub(super)"
+"fn storage_lifecycle_host_xid" = "pub(super)"
+"fn supersede_covered_pending_presents" = "pub(super)"
+"fn synthesise_glx_fb_configs" = "pub(super)"
+"fn synthesise_glx_visual_configs" = "pub(super)"
+"fn unmap_subwindows_with_delta" = "pub(super)"
+"fn vidmode_monitor_identity" = "pub(super)"
+"fn warp_pointer_bad_window" = "pub(super)"
+"fn warp_pointer_src_allows" = "pub(super)"
+"fn window_host_xid" = "pub(super)"
+"fn xi1_device_button_count" = "pub(super)"
+"fn xi1_error" = "pub(super)"
+"fn xi2_allow_mode_to_core" = "pub(super)"
+"fn xybitmap_to_target_zpixmap" = "pub(super)"
+"fn xybitmap_to_zpixmap" = "pub(super)"
+"fn zpixmap_row_stride" = "pub(super)"
+"struct WarpRequest" = "pub(super)"
+
+[[modules]]
+name = ""
+lines = [
+  "pub(crate) use redirect::*;",
+  "pub(crate) use windows::*;",
+  "use render::*;",
+  "pub use randr_ext::*;",
+  "pub(crate) use sync_ext::*;",
+  "pub(crate) use shape_xfixes::*;",
+  "use composite_damage::*;",
+  "use xshm::*;",
+  "use xtest::*;",
+  "pub(crate) use saver_dpms::*;",
+  "pub use present_ext::*;",
+  "use dri3::*;",
+  "use glx::*;",
+  "use vidmode::*;",
+  "use misc::*;",
+  "use xkb::*;",
+  "pub(crate) use xi::*;",
+  "pub(crate) use grabs::*;",
+  "pub(crate) use focus_pointer::*;",
+  "use input_ctl::*;",
+  "use colormaps::*;",
+  "use fonts::*;",
+  "use gc_pixmap_cursor::*;",
+  "use drawing::*;",
+  "pub(crate) use props::*;",
+  "pub(crate) use selection::*;",
+]
+items = [
+  "use *",
+  "mod get_image_reply_tests",
+  "mod largest_free_xid_gap_tests",
+  "mod tests",
+  "const XI2_MAJOR_OPCODE",
+  "const XI2_FIRST_ERROR",
+  "const XFIXES_MAJOR_OPCODE",
+  "const FREE_PIXMAP_OPCODE",
+  "const FREE_GC_OPCODE",
+  "const FREE_CURSOR_OPCODE",
+  "const XI2_SERVER_MAJOR_VERSION",
+  "const XI2_SERVER_MINOR_VERSION",
+  "const RENDER_LAST_REQUEST",
+  "const RANDR_REQUEST_COUNT",
+  "const RANDR_BAD_OUTPUT",
+  "const RANDR_BAD_CRTC",
+  "const RANDR_BAD_PROVIDER",
+  "const XFIXES_BAD_REGION",
+  "const SYNC_BAD_FENCE",
+  "const PRESENT_ALL_OPTIONS",
+  "const XINPUT_LAST_REQUEST",
+  "const XKB_LAST_REQUEST",
+  "const X_KB_USE_EXTENSION",
+  "const X_KB_SELECT_EVENTS",
+  "const X_KB_SET_MAP",
+  "const X_KB_SET_COMPAT_MAP",
+  "const X_KB_SET_INDICATOR_MAP",
+  "const X_KB_SET_NAMES",
+  "const X_KB_SET_GEOMETRY",
+  "const FOCUS_CHANGE_MASK",
+  "enum RequestOutcome",
+  "fn process_request",
+  "fn reject_non_local_extension_request",
+  "fn emit_x11_error",
+  "fn emit_x11_error_with_minor",
+  "fn write_to_client",
+  "fn log_void",
+  "fn send_reply_with_fd",
+  "fn drawable_exists",
+  "enum DrawableLookup",
+  "fn drawable_lookup",
+  "fn validate_drawable_and_gc",
+  "fn validate_drawable_only",
+  "fn validate_gc_only",
+  "fn xid_out_of_client_range",
+  "fn supported_pixmap_depth",
+  "fn window_unviewable",
+  "fn zpixmap_expected_len",
+  "fn motion_history_range",
+  "enum PropertyDispatchError",
+  "struct ValidatedXiChange",
+  "enum PropertyChangeOutcome",
+  "fn canonicalize_xi_property_data",
+  "fn validate_xi_change",
+  "fn commit_validated_xi_change",
+  "fn commit_confirmed_xi_change",
+  "fn is_xtest_marker_property",
+  "fn emit_property_dispatch_error",
+  "struct CopyAreaSubRect",
+  "struct CurrentVidModeOutput",
+  "struct PresentDomainSelection",
+  "fn patch_get_image_reply_header",
+  "fn largest_free_xid_gap",
+]
+
+[[modules]]
+name = "redirect"
+lines = [
+  "use super::*;",
+]
+items = [
+  "fn activate_redirect_backing_for",
+  "fn flip_redirect_target_mode",
+  "fn sync_redirect_backing",
+  "fn retarget_glx_pixmap_export",
+  "fn realize_redirect_backing",
+  "fn apply_viewability_delta_to_redirects",
+  "fn storage_lifecycle_host_xid",
+  "fn realize_storage_for_delta",
+  "fn release_storage_for_delta",
+  "fn reapply_redirect_mode_after_map",
+  "fn bordered_backing_extent",
+  "fn rotate_redirected_backing_on_resize",
+  "fn outer_rect",
+  "fn bounding_in_parent",
+  "fn current_bounding_in_parent",
+  "fn redirected_ancestor_or_self",
+  "fn has_redirected_ancestor",
+  "fn effective_redirect_mode_for_window",
+]
+
+[[modules]]
+name = "windows"
+lines = [
+  "use super::*;",
+]
+items = [
+  "struct PendingDestroy",
+  "fn resolve_host_subwindow_visual_to_state",
+  "fn send_window_exposures",
+  "fn send_map_exposures",
+  "fn collect_destroy_order",
+  "fn fanout_destroy_sequence_to_state",
+  "fn purge_present_for_destroyed_windows",
+  "fn free_pictures_on_destroyed_windows",
+  "fn release_redirects_on_destroyed_windows",
+  "fn destroy_window_subtree",
+  "fn release_dropped_cursors",
+  "fn handle_reparent_window",
+  "fn handle_create_window",
+  "fn handle_change_window_attributes",
+  "fn border_source_cwa_values",
+  "fn reset_damage_notify_cycle_for_drawable",
+  "fn handle_configure_window",
+  "fn handle_destroy_window",
+  "fn handle_destroy_subwindows",
+  "fn handle_map_window",
+  "fn accumulate_damage_viewable_descendants_to_state",
+  "fn handle_map_subwindows",
+  "fn map_subwindows_with_delta",
+  "fn handle_unmap_window",
+  "fn handle_unmap_subwindows",
+  "fn unmap_subwindows_with_delta",
+  "fn handle_get_window_attributes",
+  "fn window_attributes",
+  "fn handle_circulate_window",
+  "fn handle_get_geometry",
+  "fn handle_query_tree",
+  "fn handle_translate_coordinates",
+  "fn window_geometry",
+  "fn pixmap_geometry",
+  "fn glx_pbuffer_geometry",
+  "fn handle_change_save_set",
+]
+
+[[modules]]
+name = "render"
+lines = [
+  "use super::*;",
+]
+items = [
+  "fn handle_render_request",
+  "fn dst_picture_is_sourceless",
+  "fn render_picture_damage_drawable",
+  "fn first_missing_picture",
+  "fn dst_picture_window_unviewable",
+  "fn clip_fill_rects_by_children",
+]
+
+[[modules]]
+name = "randr_ext"
+lines = [
+  "use super::*;",
+]
+items = [
+  "struct PendingCrtcConfig",
+  "struct CrtcConfigCompletion",
+  "enum CrtcConfigReply",
+  "fn active_monitors",
+  "fn send_root_config_notify",
+  "fn mark_randr_unsupported_warned",
+  "fn warn_randr_unsupported_once",
+  "fn handle_randr_request",
+  "fn set_screen_config",
+  "fn start_crtc_config",
+  "fn randr_client_knows_rates",
+  "fn complete_crtc_config",
+  "fn x11randr_encode_set_screen_config",
+  "fn reply_set_crtc_config",
+  "fn handle_xinerama_request",
+]
+
+[[modules]]
+name = "sync_ext"
+lines = [
+  "use super::*;",
+]
+items = [
+  "fn sync_error",
+  "fn sync_writable_counter",
+  "fn sync_known_fence",
+  "fn sync_known_alarm",
+  "fn handle_sync_request",
+  "fn change_alarm_attributes",
+  "fn alarm_value_words",
+  "fn sync_counter_name",
+  "fn sync_test_type_name",
+  "fn sync_alarm_state_name",
+  "fn evaluate_alarms_for_counter",
+  "fn check_new_alarm_trigger",
+  "fn alarm_trigger_fired",
+]
+
+[[modules]]
+name = "shape_xfixes"
+lines = [
+  "use super::*;",
+]
+items = [
+  "fn mirror_shape_to_host_state",
+  "fn drawable_full_rect_xfixes",
+  "fn normalize_region_rects",
+  "fn format_region_rects",
+  "fn emit_shape_notify",
+  "fn fmt_shape_rects",
+  "fn handle_shape_request",
+  "fn handle_shape_request_ops",
+  "fn dispatch_xfixes_request",
+  "fn xfixes_verify_cursor",
+  "fn xfixes_replace_cursor",
+  "fn xfixes_expand_region_rects",
+  "fn emit_xfixes_cursor_notify",
+  "fn release_xfixes_client_state",
+  "fn handle_xfixes_request",
+  "fn xfixes_region_xid_already_taken",
+]
+
+[[modules]]
+name = "composite_damage"
+lines = [
+  "use super::*;",
+]
+items = [
+  "fn handle_composite_request",
+  "fn handle_damage_request",
+]
+
+[[modules]]
+name = "xshm"
+lines = [
+  "use super::*;",
+]
+items = [
+  "fn handle_mit_shm_request",
+  "fn handle_mit_shm_create_pixmap",
+  "fn handle_mit_shm_put_image",
+  "fn handle_mit_shm_get_image",
+  "fn handle_mit_shm_create_segment",
+  "fn extract_shm_zpixmap_region",
+]
+
+[[modules]]
+name = "xtest"
+lines = [
+  "use super::*;",
+]
+items = [
+  "fn effective_window_cursor",
+  "fn current_pointer_cursor",
+  "fn handle_xtest_request",
+  "fn dispatch_fake_input_with_body",
+  "fn fake_input_keycode_valid",
+  "fn fake_input_button_count",
+  "fn fake_input_button_valid",
+  "fn fake_input_button_code",
+  "fn fake_input_device_id",
+]
+
+[[modules]]
+name = "saver_dpms"
+lines = [
+  "use super::*;",
+]
+items = [
+  "fn apply_dpms_transition",
+  "fn emit_dpms_notify",
+  "fn screen_saver_set_attributes",
+  "fn u32_at_slice",
+  "fn unset_screen_saver_attributes",
+  "fn create_screen_saver_window",
+  "fn destroy_screen_saver_window",
+  "fn apply_screen_saver_transition",
+  "fn screen_saver_kind",
+  "fn emit_screen_saver_notify",
+  "fn idletime_current_idle",
+  "fn evaluate_idletime_negative_alarms_on_input_wake",
+  "fn reset_idletime_state_after_suspend_release",
+  "fn handle_dpms_request",
+  "fn handle_screen_saver_request",
+  "fn handle_get_screen_saver",
+  "fn handle_set_screen_saver",
+  "fn handle_force_screen_saver",
+]
+
+[[modules]]
+name = "present_ext"
+lines = [
+  "use super::*;",
+]
+items = [
+  "fn successor_presents_full_extent",
+  "fn present_supersession_covers",
+  "fn completed_event_for_pending",
+  "fn fire_present_idle_notify_now",
+  "fn supersede_covered_pending_presents",
+  "fn arm_present_pixmap_source_then_supersede",
+  "fn arm_present_pixmap_synced_source_then_supersede",
+  "fn present_crtc_is_enabled",
+  "fn present_crtc_exists",
+  "fn default_present_crtc_for_window",
+  "fn cached_present_crtc_clock",
+  "fn refresh_present_crtc_general_clock",
+  "fn refresh_present_crtc_completion_clock",
+  "fn advance_present_crtc_completion_clock",
+  "fn present_wire_clock",
+  "fn bind_present_window_domain",
+  "fn select_present_domain",
+  "fn effective_present_target_raw",
+  "fn execute_parked_present_ids",
+  "fn drain_due_present_pending_exec",
+  "fn accumulate_present_execution_damage",
+  "fn execute_present_pixmap_copy",
+  "fn execute_present_pixmap_copy_or_reroute",
+  "fn arrival_execute_or_park_present_pixmap",
+  "fn drain_ready_present_pixmaps",
+  "fn shutdown_drain_present_pending_exec",
+  "fn present_remainder_invalid",
+  "fn present_remainder_error_value",
+  "fn present_pixmap_common_validation_error",
+  "fn handle_present_request",
+  "fn notify_msc_satisfied",
+  "fn fire_present_completion_events",
+  "fn fire_present_completion_events_at",
+  "fn fire_present_configure_notify_for_window",
+  "fn fire_present_notify_msc_complete_events",
+  "fn fire_due_present_notify_msc",
+  "fn fire_due_present_notify_msc_for_domain",
+  "fn pace_instr_ms",
+  "fn complete_present_now",
+  "fn present_event_window_is_current",
+  "fn discard_stale_present_event",
+  "fn complete_present_with_clock",
+  "fn retire_present_idle",
+  "fn fire_due_present_completions",
+  "fn fire_due_present_completions_for_domain",
+  "fn fire_all_present_completions_now",
+  "fn fire_present_completions_sweep",
+]
+
+[[modules]]
+name = "dri3"
+lines = [
+  "use super::*;",
+]
+items = [
+  "fn handle_dri3_request",
+]
+
+[[modules]]
+name = "glx"
+lines = [
+  "use super::*;",
+]
+items = [
+  "fn drawable_attributes_for",
+  "fn synthesise_glx_visual_configs",
+  "fn glx_extension_string",
+  "fn synthesise_glx_fb_configs",
+  "fn handle_glx_request",
+  "fn insert_glx_pixmap_record",
+  "fn glx_request_context",
+  "fn glx_visual_fbconfig",
+  "fn glx_fbconfig_visual",
+  "fn glx_fbconfig_depth",
+]
+
+[[modules]]
+name = "vidmode"
+lines = [
+  "use super::*;",
+]
+items = [
+  "fn current_vidmode_output",
+  "fn current_vidmode_mode_line",
+  "fn vidmode_timing_order_is_valid",
+  "fn vidmode_monitor_identity",
+  "fn vidmode_sync_ranges",
+  "fn vidmode_screen_number",
+  "fn vidmode_screen",
+  "fn write_vidmode_reply",
+  "fn handle_xf86vidmode_request",
+]
+
+[[modules]]
+name = "misc"
+lines = [
+  "use super::*;",
+]
+items = [
+  "fn handle_x_resource_request",
+  "fn handle_ge_request",
+  "fn handle_big_requests_request",
+  "fn handle_xcmisc_request",
+  "fn extension_query_reply",
+  "fn advertised_extension_names",
+  "fn handle_query_extension",
+  "fn handle_list_extensions",
+  "fn handle_kill_client",
+  "fn handle_set_close_down_mode",
+  "fn handle_list_hosts",
+  "fn handle_grab_server",
+  "fn handle_ungrab_server",
+  "fn handle_get_motion_events",
+]
+
+[[modules]]
+name = "xkb"
+lines = [
+  "use super::*;",
+]
+items = [
+  "fn handle_xkb_request",
+  "fn stamp_reply_sequence",
+  "fn send_xkb_set_events",
+]
+
+[[modules]]
+name = "xi"
+lines = [
+  "use super::*;",
+  "pub(super) use dispatch::*;",
+]
+items = [
+  "const XI1_ERROR_BAD_DEVICE",
+  "const XI1_ERROR_BAD_MODE",
+  "const XI1_ERROR_BAD_CLASS",
+  "const XI1_KEY_MIN",
+  "const XI1_KEY_MAX",
+  "const XI1_USE_X_KEYBOARD",
+  "fn xi1_device_valid",
+  "fn xi1_device_button_count",
+  "fn xi1_device_valuator_count",
+  "fn xi1_device_is_master",
+  "const XI2_LAST_EVENT",
+  "fn xi2_first_invalid_mask_bit",
+  "fn xi1_device_has_keys",
+  "fn xi1_device_has_buttons",
+  "fn xi1_device_has_valuators",
+  "fn xi1_modifiers_valid",
+  "fn xi1_event_class_device",
+  "fn xi1_zero_reply",
+  "fn xi1_error",
+  "fn xi1_window_exists",
+  "fn xi1_send_extension_event_resolve_targets",
+  "fn handle_xi_set_focus",
+  "fn handle_xi_change_hierarchy",
+  "fn xi2_request_has_complete_dynamic_tail",
+  "fn record_xi2_client_version",
+  "fn emit_xi2_device_changed_bootstrap",
+]
+
+[[modules]]
+name = "xi::dispatch"
+lines = [
+  "use super::*;",
+]
+items = [
+  "fn handle_xi2_request",
+]
+
+[[modules]]
+name = "grabs"
+lines = [
+  "use super::*;",
+]
+items = [
+  "const POINTER_GRAB_MASK",
+  "const ANY_MODIFIER",
+  "const ALL_MODIFIERS_MASK",
+  "fn handle_grab_pointer",
+  "fn handle_ungrab_pointer",
+  "fn deactivate_passive_pointer_grab_crossings",
+  "fn deactivate_core_pointer_grab",
+  "fn confine_pointer_now",
+  "fn emit_core_pointer_grab_chain",
+  "fn handle_grab_button",
+  "fn handle_ungrab_button",
+  "fn handle_change_active_pointer_grab",
+  "fn handle_grab_keyboard",
+  "fn handle_ungrab_keyboard",
+  "fn deactivate_core_keyboard_grab",
+  "fn release_core_grabs_for_unviewable",
+  "fn handle_grab_key",
+  "fn handle_ungrab_key",
+  "fn handle_allow_events",
+  "fn xi2_allow_mode_to_core",
+  "fn apply_xi2_allow_events_for_slave",
+  "fn apply_allow_events",
+]
+
+[[modules]]
+name = "focus_pointer"
+lines = [
+  "use super::*;",
+]
+items = [
+  "enum WarpSrcRule",
+  "struct WarpRequest",
+  "fn handle_xi_warp_pointer",
+  "fn handle_set_input_focus",
+  "fn core_focus_window_error",
+  "fn apply_core_input_focus",
+  "fn revert_core_focus_from",
+  "fn revert_core_focus_if_unviewable",
+  "fn emit_core_focus_transition",
+  "fn handle_get_input_focus",
+  "fn handle_query_pointer",
+  "fn handle_warp_pointer",
+  "fn warp_pointer_bad_window",
+  "fn warp_pointer_src_allows",
+  "fn point_in_window_is_visible",
+  "fn apply_pointer_warp",
+]
+
+[[modules]]
+name = "input_ctl"
+lines = [
+  "use super::*;",
+]
+items = [
+  "enum ModmapChangeOutcome",
+  "fn handle_query_keymap",
+  "fn handle_get_pointer_mapping",
+  "fn handle_get_keyboard_control",
+  "fn handle_change_keyboard_control",
+  "fn handle_bell",
+  "fn handle_change_pointer_control",
+  "fn handle_get_pointer_control",
+  "fn handle_set_pointer_mapping",
+  "fn handle_set_modifier_mapping",
+  "fn change_modifier_mapping",
+  "fn handle_change_keyboard_mapping",
+  "fn apply_keymap_change",
+  "fn legacy_keyboard_mapping_notify",
+  "fn store_keymap_overrides",
+  "fn fetch_merged_keymap",
+  "fn handle_get_keyboard_mapping",
+  "fn handle_get_modifier_mapping",
+  "fn stub_reply_32",
+]
+
+[[modules]]
+name = "colormaps"
+lines = [
+  "use super::*;",
+]
+items = [
+  "fn handle_store_colors",
+  "fn handle_store_named_color",
+  "fn handle_alloc_color_cells",
+  "fn handle_alloc_color_planes",
+  "fn handle_create_colormap",
+  "fn handle_copy_colormap_and_free",
+  "fn emit_colormap_notify_for",
+  "fn ensure_default_colormap_installed",
+  "fn handle_install_colormap",
+  "fn handle_free_colormap",
+  "fn handle_uninstall_colormap",
+  "fn handle_list_installed_colormaps",
+  "fn handle_alloc_color",
+  "fn handle_free_colors",
+  "fn handle_alloc_named_color",
+  "fn handle_query_colors",
+  "fn handle_lookup_color",
+]
+
+[[modules]]
+name = "fonts"
+lines = [
+  "use super::*;",
+]
+items = [
+  "fn handle_get_font_path",
+  "fn handle_set_font_path",
+  "fn handle_list_fonts",
+  "fn handle_list_fonts_with_info",
+  "fn handle_open_font",
+  "fn synthesize_font_properties",
+  "fn handle_close_font",
+  "fn handle_query_font",
+  "fn handle_query_text_extents",
+  "fn rewrite_reply_sequence",
+]
+
+[[modules]]
+name = "gc_pixmap_cursor"
+lines = [
+  "use super::*;",
+]
+items = [
+  "fn handle_set_dashes",
+  "fn handle_create_gc",
+  "fn release_displaced_gc_pixmaps",
+  "fn handle_change_gc",
+  "fn handle_copy_gc",
+  "fn handle_set_clip_rectangles",
+  "fn handle_free_gc",
+  "fn handle_create_pixmap",
+  "fn handle_free_pixmap",
+  "fn handle_query_best_size",
+  "fn handle_recolor_cursor",
+  "fn handle_create_cursor",
+  "fn handle_create_glyph_cursor",
+  "fn handle_free_cursor",
+]
+
+[[modules]]
+name = "drawing"
+lines = [
+  "use super::*;",
+]
+items = [
+  "fn handle_put_image",
+  "fn zpixmap_row_stride",
+  "fn xybitmap_expected_len",
+  "fn xybitmap_to_zpixmap",
+  "fn depth_plane_mask",
+  "fn write_zpixmap_pixel",
+  "fn xybitmap_to_target_zpixmap",
+  "fn handle_image_text8",
+  "fn handle_image_text16",
+  "fn handle_get_image",
+  "fn translate_poly_text_fonts",
+  "fn handle_poly_text8",
+  "fn handle_poly_text16",
+  "fn handle_poly_point",
+  "fn handle_poly_line",
+  "fn handle_poly_segment",
+  "fn handle_poly_rectangle",
+  "fn handle_poly_arc",
+  "fn handle_fill_poly",
+  "fn handle_poly_fill_rectangle",
+  "fn handle_poly_fill_arc",
+  "fn handle_clear_area",
+  "fn clear_extent",
+  "fn drawable_size",
+  "fn copy_area_source_split",
+  "fn copy_exposed_region",
+  "fn finish_copy_exposures",
+  "fn emit_copy_exposures",
+  "fn handle_copy_area",
+  "fn copy_area_effective_dst_rects",
+  "fn intersect_sub_rects",
+  "fn subtract_sub_rect",
+  "fn handle_copy_plane",
+]
+
+[[modules]]
+name = "props"
+lines = [
+  "use super::*;",
+]
+items = [
+  "fn dispatch_change_property",
+  "fn dispatch_device_enabled_property_write",
+  "fn apply_enabled_property_value",
+  "fn emit_property_change",
+  "fn handle_change_property",
+  "fn handle_get_property",
+  "fn handle_delete_property",
+  "fn handle_list_properties",
+  "fn handle_intern_atom",
+  "fn handle_get_atom_name",
+  "fn window_host_xid",
+]
+
+[[modules]]
+name = "selection"
+lines = [
+  "use super::*;",
+]
+items = [
+  "const ALL_EVENT_MASKS",
+  "fn handle_set_selection_owner",
+  "fn drop_selections_owned_by_windows",
+  "fn fanout_xfixes_selection_client_close_for_client",
+  "fn fanout_xfixes_selection_notify",
+  "fn handle_convert_selection",
+  "fn handle_get_selection_owner",
+  "fn handle_send_event",
+  "fn send_event_recipients",
+  "fn is_strict_ancestor",
+]
+
