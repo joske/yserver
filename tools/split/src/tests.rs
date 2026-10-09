@@ -666,3 +666,118 @@ fn test_targets_from_cargo_layout() {
     assert_eq!(t("crates/y/examples/demo.rs"), "demo:bin");
     assert_eq!(t("crates/z/src/state.rs"), "z:bin");
 }
+
+/// Runs `apply` on `files` in a scratch repo, then `verify` against them.
+fn apply_and_verify(
+    tag: &str,
+    files: &[(&str, &str)],
+    modules: [(&[&str], &[&str]); 2],
+    edits: Vec<PathEdit>,
+) -> Result<(Vec<String>, std::path::PathBuf), String> {
+    let repo = tmpdir(&format!("apply-{tag}"));
+    let _ = std::fs::remove_dir_all(&repo);
+    for (p, t) in files {
+        let p = repo.join(p);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, t).unwrap();
+    }
+    let spec_of_mod = |name: &str, (items, lines): (&[&str], &[&str])| crate::apply::ModSpec {
+        name: name.into(),
+        lines: lines.iter().map(|s| s.to_string()).collect(),
+        items: items.iter().map(|s| s.to_string()).collect(),
+    };
+    let m = Manifest {
+        source: "src/a.rs".into(),
+        module: "a".into(),
+        dir: "src/a".into(),
+        table: "a.paths".into(),
+        target: None,
+        visibility: [("fn f".to_string(), "pub(super)".to_string())].into(),
+        path_edits: edits,
+        modules: vec![
+            spec_of_mod("", modules[0]),
+            spec_of_mod("inner", modules[1]),
+        ],
+        path: repo.join("a.toml"),
+    };
+    crate::apply::run(&m, &repo)?;
+    let base = mem(files);
+    let errs = check(&spec_of(&m), &base, &crate::tree::Disk(repo.clone()), &[])
+        .unwrap()
+        .1;
+    Ok((errs, repo))
+}
+
+const WITH_CHILD: &str = "mod helpers;\n\nfn f() -> u32 {\n    helpers::g()\n}\n";
+const HELPERS: &str = "pub fn g() -> u32 {\n    1\n}\n";
+
+#[test]
+fn apply_keeps_out_of_line_child_modules() {
+    let (errs, _) = apply_and_verify(
+        "child",
+        &[("src/a.rs", WITH_CHILD), ("src/a/helpers.rs", HELPERS)],
+        [
+            (&["mod helpers"], &["pub use inner::*;"]),
+            (&["fn f"], &["use super::*;"]),
+        ],
+        vec![],
+    )
+    .unwrap();
+    assert_eq!(errs, Vec::<String>::new());
+}
+
+#[test]
+fn apply_refuses_child_module_that_would_resolve_elsewhere() {
+    let r = apply_and_verify(
+        "child-moved",
+        &[("src/a.rs", WITH_CHILD), ("src/a/helpers.rs", HELPERS)],
+        [
+            (&[], &["pub use inner::*;"]),
+            (&["fn f", "mod helpers"], &["use super::*;"]),
+        ],
+        vec![],
+    );
+    assert!(
+        r.as_ref().is_err_and(|e| e.contains("add a path edit")),
+        "{r:?}"
+    );
+}
+
+#[test]
+fn apply_performs_path_edits() {
+    let src = "#[path = \"other_tests.rs\"]\nmod other_tests;\n\nfn f() -> &'static str {\n    include_str!(\"fixtures/x.txt\")\n}\n";
+    let edits = vec![
+        PathEdit {
+            item: "fn f".into(),
+            from: "fixtures/x.txt".into(),
+            to: "../fixtures/x.txt".into(),
+        },
+        PathEdit {
+            item: "mod other_tests".into(),
+            from: "other_tests.rs".into(),
+            to: "../other_tests.rs".into(),
+        },
+    ];
+    let (errs, repo) = apply_and_verify(
+        "edits",
+        &[
+            ("src/a.rs", src),
+            ("src/other_tests.rs", HELPERS),
+            ("src/fixtures/x.txt", "X"),
+        ],
+        [
+            (&["mod other_tests"], &["pub use inner::*;"]),
+            (&["fn f"], &["use super::*;"]),
+        ],
+        edits,
+    )
+    .unwrap();
+    assert_eq!(errs, Vec::<String>::new());
+    let inner = std::fs::read_to_string(repo.join("src/a/inner.rs")).unwrap();
+    assert!(
+        inner.contains("include_str!(\"../fixtures/x.txt\")"),
+        "{inner}"
+    );
+    let root = std::fs::read_to_string(repo.join("src/a/mod.rs")).unwrap();
+    assert!(root.contains("#[path = \"../other_tests.rs\"]"), "{root}");
+}

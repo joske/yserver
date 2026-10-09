@@ -361,11 +361,6 @@ impl<'a> Src<'a> {
                         trailer: (last, f.off(brace.span.close().start())),
                     });
                 }
-                Item::Mod(ItemMod { content: None, .. }) => {
-                    return Err(format!(
-                        "{wkey}: out-of-line child modules are not supported"
-                    ));
-                }
                 _ => self.units.push(Unit {
                     key: wkey,
                     module: module.to_string(),
@@ -410,6 +405,75 @@ impl<'a> Src<'a> {
                 .join("\n");
         }
         s
+    }
+}
+
+/// `text` with the manifest's path edits for `key` applied to
+/// `include_str!`/`include_bytes!` arguments and `#[path]` values.
+fn edited(m: &Manifest, key: &str, text: String, done: &mut [usize]) -> Res<String> {
+    let mut text = text;
+    for (k, e) in m
+        .path_edits
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.item == key)
+    {
+        let f = SrcFile::new(text.clone());
+        let ts: proc_macro2::TokenStream = f.text.parse().map_err(|e| format!("{key}: {e}"))?;
+        let mut spans = Vec::new();
+        path_literals(ts, &e.from, &mut spans);
+        let mut ranges: Vec<(usize, usize)> = spans
+            .iter()
+            .map(|s| (f.off(s.start()), f.off(s.end())))
+            .collect();
+        ranges.sort_unstable();
+        for (a, b) in ranges.into_iter().rev() {
+            text.replace_range(a..b, &format!("{:?}", e.to));
+            done[k] += 1;
+        }
+    }
+    Ok(text)
+}
+
+fn path_literals(ts: proc_macro2::TokenStream, from: &str, out: &mut Vec<proc_macro2::Span>) {
+    use proc_macro2::TokenTree as T;
+    let v: Vec<T> = ts.into_iter().collect();
+    let lit = |t: Option<&T>| match t {
+        Some(T::Literal(l)) => syn::parse_str::<syn::LitStr>(&l.to_string())
+            .ok()
+            .filter(|s| s.value() == from)
+            .map(|_| l.span()),
+        _ => None,
+    };
+    let punct = |t: Option<&T>, c: char| matches!(t, Some(T::Punct(p)) if p.as_char() == c);
+    for (i, t) in v.iter().enumerate() {
+        match t {
+            T::Ident(id)
+                if (id == "include_str" || id == "include_bytes") && punct(v.get(i + 1), '!') =>
+            {
+                if let Some(T::Group(g)) = v.get(i + 2) {
+                    let inner: Vec<T> = g.stream().into_iter().collect();
+                    if inner.len() == 1
+                        && let Some(s) = lit(inner.first())
+                    {
+                        out.push(s);
+                    }
+                }
+            }
+            T::Group(g) => {
+                let inner: Vec<T> = g.stream().into_iter().collect();
+                let attr = g.delimiter() == proc_macro2::Delimiter::Bracket
+                    && i > 0
+                    && punct(v.get(i - 1), '#');
+                match inner.as_slice() {
+                    [T::Ident(id), eq, l] if attr && id == "path" && punct(Some(eq), '=') => {
+                        out.extend(lit(Some(l)));
+                    }
+                    _ => path_literals(g.stream(), from, out),
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -557,6 +621,7 @@ pub fn run(m: &Manifest, repo: &Path) -> Res<()> {
     // Emit each module file.
     let t = &f.text;
     let mut written = Vec::new();
+    let mut edits_done = vec![0; m.path_edits.len()];
     for spec in &m.modules {
         let mut out = String::new();
         let push = |out: &mut String, s: &str, blank: bool| {
@@ -603,10 +668,20 @@ pub fn run(m: &Manifest, repo: &Path) -> Res<()> {
                 let wr = &src.wraps[w];
                 push(&mut out, &t[wr.head.0..wr.head.1], wr.blank || n > 0);
                 out.push('\n');
-                out.push_str(&src.text(u, m.visibility.get(&u.key).map(String::as_str), 1));
+                out.push_str(&edited(
+                    m,
+                    &u.key,
+                    src.text(u, m.visibility.get(&u.key).map(String::as_str), 1),
+                    &mut edits_done,
+                )?);
             } else {
                 let depth = usize::from(u.wrap.is_some());
-                let body = src.text(u, m.visibility.get(&u.key).map(String::as_str), depth);
+                let body = edited(
+                    m,
+                    &u.key,
+                    src.text(u, m.visibility.get(&u.key).map(String::as_str), depth),
+                    &mut edits_done,
+                )?;
                 push(&mut out, &body, u.blank);
             }
             if let Some(w) = u.wrap
@@ -635,6 +710,47 @@ pub fn run(m: &Manifest, repo: &Path) -> Res<()> {
         out.push('\n');
         written.push((m.file_of(&spec.name), out));
     }
+    for (e, n) in m.path_edits.iter().zip(&edits_done) {
+        if *n == 0 {
+            return Err(format!(
+                "path edit {:?} → {:?} matches no include or #[path] in {}",
+                e.from, e.to, e.item
+            ));
+        }
+    }
+    for (u, t) in src.units.iter().zip(&target) {
+        if let UnitItem::Item(Item::Mod(md @ ItemMod { content: None, .. })) = u.item {
+            let file = |dir: &tree::Dir, attrs: &[syn::Attribute]| {
+                dir.out_of_line(&md.ident.to_string(), tree::path_attr(attrs).as_deref())
+                    .into_iter()
+                    .map(|(p, _)| p)
+                    .find(|p| repo.join(p).exists())
+            };
+            let old_dir = tree::Dir::of_file(&m.source, tree::Dir::root_rel(&m.source, &m.module));
+            let old_dir = match u.module.as_str() {
+                "" => old_dir,
+                sm => old_dir.inline(sm, None),
+            };
+            let new_path = m.file_of(t);
+            let new_dir = tree::Dir::of_file(&new_path, tree::Dir::root_rel(&new_path, "x"));
+            let text = edited(
+                m,
+                &u.key,
+                f.text[u.start..u.end].to_string(),
+                &mut vec![0; m.path_edits.len()],
+            )?;
+            let new_attrs = syn::parse_str::<ItemMod>(text.trim())
+                .map(|x| x.attrs)
+                .unwrap_or_default();
+            let (a, b) = (file(&old_dir, &md.attrs), file(&new_dir, &new_attrs));
+            if a.is_none() || a != b {
+                return Err(format!(
+                    "{}: loads {a:?} from {}, would load {b:?} from {new_path}; add a path edit",
+                    u.key, m.source
+                ));
+            }
+        }
+    }
     for (path, _) in &written {
         if repo.join(path).exists() && path != &m.source {
             return Err(format!("{path} already exists"));
@@ -647,6 +763,20 @@ pub fn run(m: &Manifest, repo: &Path) -> Res<()> {
     for (u, t) in src.units.iter().zip(&target) {
         let (mut a, mut b) = (Vec::new(), Vec::new());
         match u.item {
+            UnitItem::Item(Item::Mod(md @ ItemMod { content: None, .. })) => {
+                let (from, to) = (
+                    tree::child(&m.full(&u.module), &md.ident.to_string()),
+                    tree::child(&m.full(t), &md.ident.to_string()),
+                );
+                for l in old
+                    .leaves
+                    .iter()
+                    .filter(|l| l.module == from || l.module.starts_with(&format!("{from}::")))
+                {
+                    a.push(l.key());
+                    b.push(format!("{to}{}", &l.key()[from.len()..]));
+                }
+            }
             UnitItem::Item(item) => {
                 item_keys(item, &m.full(&u.module), &mut a);
                 item_keys(item, &m.full(t), &mut b);
