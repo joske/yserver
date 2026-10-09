@@ -1,7 +1,8 @@
 # Phase 2.6 proposal: split `process_request.rs` (production code)
 
 Step 2.6 of `2026-10-08-source-layout-cleanup.md`. Manifest:
-`tools/split/manifests/process_request_2.toml` (+ `.paths`). Dry run only.
+`tools/split/manifests/process_request_2.toml` (+ `.paths`). Accepted by jos
+2026-10-09 and executed (decisions at the end); sizes below are the final tree.
 
 ## Structure today (35,796 lines, tests already out)
 
@@ -27,7 +28,7 @@ Step 2.6 of `2026-10-08-source-layout-cleanup.md`. Manifest:
 - **Outside users:** 7 `core_loop` siblings call ~45 `pub(crate)`/`pub(super)`
   items; `yserver` calls two `pub` present fns.
 
-## Target tree (lines after `cargo +nightly fmt`, dry run)
+## Target tree (lines after `cargo +nightly fmt`)
 
 All files sit under `core_loop/process_request/`, so they are descendants and
 `env_logger` filters on `core_loop::process_request` still match. Module names
@@ -35,24 +36,25 @@ avoid any name that this file or its tests use as a path (`damage`, `present`,
 `randr`, `xfixes`, `sync`, `shm`, `xinput`, `error`, `properties`).
 
 ```
-process_request.rs  1473  imports, opcode consts, RequestOutcome, process_request + match,
-                          reject_non_local…, shared helpers (above), XI property validation
-                          (pub(super) today), 3 types with private fields, 2 fns of the
-                          get_image/xid_gap test mods
+process_request.rs   979  imports, opcode consts, RequestOutcome, process_request + match,
+                          reject_non_local…, shared helpers (above), 3 types with private
+                          fields (CopyAreaSubRect, CurrentVidModeOutput, PresentDomainSelection)
 windows.rs          2938  create/configure/reparent/destroy(+subtree)/map/unmap/circulate,
                           attributes, query_tree, geometry, translate, exposures, save-set
 redirect.rs          913  composite redirect backing lifecycle
-drawing.rs          1865  poly*, fill, clear, copy_area/plane, put/get_image, image/poly text
+drawing.rs          1893  poly*, fill, clear, copy_area/plane, put/get_image, image/poly text,
+                          get_image reply header patch
 gc_pixmap_cursor.rs  641  GC, pixmap, cursor create/free/change, query_best_size
 fonts.rs             491  open/close/query font, list fonts, font path
 colormaps.rs         488  colormaps and colour allocation
-props.rs             839  core property requests, atoms, dispatch_change_property
+props.rs            1265  core property requests, atoms, dispatch_change_property, XI
+                          property validation/commit (run.rs calls it)
 selection.rs         578  selections, SendEvent
 grabs.rs            1583  core pointer/keyboard/button/key grabs, AllowEvents (core + XI2 slave)
 focus_pointer.rs     620  input focus, QueryPointer, WarpPointer (core + XI)
 input_ctl.rs         925  keyboard/pointer control and mapping, keymap, bell
-misc.rs              775  kill client, close-down mode, hosts, extensions, BIG-REQ, GE,
-                          XC-MISC, X-Resource, grab server, motion events
+misc.rs              819  kill client, close-down mode, hosts, extensions, BIG-REQ, GE,
+                          XC-MISC (+ largest free XID gap), X-Resource, grab server, motion events
 render.rs           1038  RENDER
 randr_ext.rs        2900  RANDR + Xinerama, crtc-config completion types
 present_ext.rs      2976  PRESENT pacing, supersede, completion
@@ -70,31 +72,30 @@ xi/mod.rs            575  XI1 helpers/consts, XI hierarchy/focus, XI2 version/bo
 xi/dispatch.rs      5140  handle_xi2_request alone (over the 5k ceiling: one fn; phase 2c)
 ```
 
-## Dry run results
+## Results
 
-The dry run sat on top of a temporary prep commit, which was dropped afterwards.
-Steps: `split apply`, `cargo +nightly fmt`,
-`clippy -p yserver-core --all-targets -D warnings` (clean),
-`clippy -p yserver --all-targets --features xdmcp -D warnings` (clean),
-`cargo test -p yserver-core --lib core_loop::` (1201 passed), and
-`split verify` → **OK**: 1630/1630 leaves identical, 221 visibility changes, 2
-audited exceptions, 164 leaves with log targets moved to descendants, no
-shadowed names.
+Prep commit (15 paths qualified), then `split apply`, `cargo +nightly fmt`,
+`split verify` → **OK**: 1630/1630 leaves identical, 232 visibility changes,
+2 audited exceptions, 164 leaves with log targets moved to descendants, no
+shadowed names. `verify --tests` against fresh pre-move snapshots: 4008 / 4013
+/ 4121 tests (default / tcp-transport / xdmcp) mapped. Full rule-5 gate green.
 
-**Visibility delta (221, all from the manifest):**
-- 220 items go from private to `pub(super)`:
+**Visibility delta (232, all from the manifest; resolved reach never wider):**
+- 224 items go from private to `pub(super)`:
   - 140 `handle_*` dispatch targets called by the root match.
-  - ~37 helpers shared between siblings.
-  - ~43 helpers that only tests reach (the tests call private helpers
+  - ~39 helpers shared between siblings.
+  - ~45 helpers that only tests reach (the tests call private helpers
     directly).
 - 1 item becomes `pub(in crate::core_loop::process_request)`:
   `handle_xi2_request`, which is a grandchild of the root.
+- 7 XI property items go from `pub(super)` (root, = `core_loop`) to
+  `pub(in crate::core_loop)` in `props`: same reach.
 - **Re-exports** (manifest lines): root `pub use` for `present_ext`/`randr_ext`,
   `pub(crate) use` for 10 children with `pub(crate)` items, plain `use` for the
   rest; `xi/mod.rs` has `pub(super) use dispatch::*`. Each level matches the
   widest item in that child; a broader glob warns and fails `-D warnings`.
 
-**Refusals and how the dry run handled them:**
+**Refusals and how they were handled:**
 1. **Relative paths (sound refusal).** There are 12 `super::run::` and 3
    `super::process_disconnect::` paths, in RANDR and KillClient. From a child,
    `super` names a different module. Fix: a **prep commit** that rewrites them
@@ -102,49 +103,43 @@ shadowed names.
 2. **Local macros (sound refusal).** `handle_render_request` and
    `handle_xinerama_request` define and invoke a fn-local `macro_rules!`. Both
    are listed under `exceptions`, with the transcriber's free names written out.
-3. **Traits in scope (false positive, worked around).** The test mods
+3. **Traits in scope (false positive, fixed in the tool).** The test mods
    `get_image_reply_tests` and `largest_free_xid_gap_tests` do
    `use super::<fn>;`. Once the fn moves, that import reaches it through the
-   root's glob. The model does not follow that glob, so it treats the import as
-   a possible trait. Workaround: `patch_get_image_reply_header` and
-   `largest_free_xid_gap` stay in the root.
+   root's glob, and the model took it for a possible trait. `split` now
+   follows in-tree globs for such an import (an opaque glob or a named
+   re-export still counts as a possible trait), so both fns moved
+   (`drawing`, `misc`).
 4. **Things the tool cannot do yet:**
    - Private fields: tests and siblings read the private fields of
-     `CopyAreaSubRect`, `PresentDomainSelection`, `CurrentVidModeOutput` and
-     `WarpRequest`. Fields are module-private, so these types stay in the root
-     (or their users move with them: `handle_xi_warp_pointer` goes to
+     `CopyAreaSubRect`, `PresentDomainSelection` and `CurrentVidModeOutput`.
+     Fields are module-private, so these types stay in the root
+     (`WarpRequest` moved with its only user, `handle_xi_warp_pointer`, to
      `focus_pointer`).
-   - Already-`pub(super)` items: the XI property validation helpers are
-     `pub(super)` because `run.rs` calls them. Moving them would need
-     `pub(in crate::core_loop)`, and `apply` can only insert a visibility, not
-     replace one: it emits `pub(in …) pub(super) enum …`. So they stay in the
-     root.
+   - Already-`pub(super)` items: fixed in the tool. `apply` now replaces an
+     item's own visibility with the manifest's; `verify` accepts the change
+     only when listed and the resolved reach is not wider. The XI property
+     validation moved to `props.rs` as `pub(in crate::core_loop)`.
 5. **Log targets, locations, includes:** no refusals (every target is a
    descendant).
 
-## Open questions for jos
+## Decisions (jos, 2026-10-09)
 
-1. **`xi/dispatch.rs` is 5,140 lines.** It is one fn and cannot be split by a
-   move. Options: accept it until phase 2c splits the arms, or do the
-   per-minor split (2c) before 2.6.
-2. **The ~43 test-only `pub(super)` items.** Options: accept them, or move the
-   matching test topics to sit under their production module (this changes
-   test names, so it needs a rule-4 mapping).
-3. **Root extras (~600 lines).** These are the XI property validation and the
-   types with private fields. Options: accept them, or teach `apply` to replace
-   an existing visibility so the validation can live in `props.rs` /
-   `xi/mod.rs` as `pub(in crate::core_loop)`.
-4. **Module names.** The `_ext` suffix only marks names already taken
-   (`randr`, `present`, `sync`). The alternative is the bare names plus fixing
-   the test globs.
-5. **Plan wording.** Change the plan's `core_loop/request/` to
-   `core_loop/process_request/` (descendant rule) once this is accepted.
+1. `xi/dispatch.rs` at 5,140 lines is accepted until phase 2c splits
+   `handle_xi2_request` by minor.
+2. The ~45 test-only `pub(super)` items are accepted.
+3. `apply` was extended to replace an existing visibility (red→green
+   fixtures), and the root extras it blocked moved out (root 1473 → 979).
+4. The `_ext` suffixes stay.
+5. The plan now says `core_loop/process_request/` (descendant rule).
 
-## Commit sequence (when accepted)
+## Commit sequence
 
-1. `refactor(core): qualify process_request super:: paths (prep)`: 15
+1. `fix(tools/split): …`: visibility replacement + the glob-import trait fix.
+2. `refactor(core): qualify process_request super:: paths (prep)`: 15
    sites, plus fmt.
-2. `refactor(core): split process_request into request-family modules (move)`:
+3. `refactor(core): split process_request into request-family modules (move)`:
    `split apply` + fmt, `split verify --manifest …` and the rule-4 test lists,
    then the full gate (rule 5).
-3. `chore: blame-ignore` for both.
+4. `chore: blame-ignore` for 2 and 3.
+5. This doc and the plan updated to the final tree.

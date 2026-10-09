@@ -178,7 +178,7 @@ Least-contended files first.
 | 2.3 | core `server.rs` | `types_grabs`, `types_ext`, `xi_registry`, `idle`, `hit_test`, `fanout` |
 | 2.4 | `core_loop/run.rs` | `telemetry`, `queues`, `xi_config`, `requests`, `present_tail`, `randr_notify`, `accept`, `repeat` |
 | 2.5 | `core_loop/pointer_fanout.rs` | `fanout_inner` (the 2k fn), `xi1`, `grabs`, `xi2_targets` |
-| 2.6 | `process_request.rs` → `core_loop/request/` | tree below |
+| 2.6 | `process_request.rs` → `core_loop/process_request/` | tree below |
 | 2.7 | `kms/vk/scanout.rs` | `bo`, `bo_pool`, `copied` 2.0k, `dmabuf_metadata`, `probe` 1.5k, `alloc_plan` 1.3k, `image_alloc` |
 | 2.8 | `kms/render/platform.rs` | `fence`, `cursor_plane` 1.8k, `qualify` 1.5k, `device`, `init`, `scanout`, `connectors`, `submit`, `page_flip` |
 | 2.9 | `kms/render/scene.rs` | `cursor`, `damage_audit` 2.0k, `tick_output` 1.8k, `walk` 2.6k, `fan_out`, `targets`, `root_readback` |
@@ -187,16 +187,19 @@ Least-contended files first.
 
 Split by responsibility; the line figures are ceilings to respect, not targets.
 
-**2.6 `core_loop/request/`:** `mod.rs` (consts, `RequestOutcome`,
-`process_request` + opcode match); `common` (`emit_x11_error*`, lookups,
-`validate_*`, `write_to_client`, `pub(super)`); core `window`, `redirect`,
-`property`, `selection`, `drawing`, `gc_pixmap_font`, `input_focus_grab`,
-`core_misc`; extensions `render`, `randr`, `sync`, `present`, `dri3`, `glx`,
-`xfixes`, `shape`, `composite`, `damage`, `shm`, `xtest`, `xres`, `xcmisc`,
-`vidmode`, `dpms_saver`, `xkb`, `xinput/{xi1, xi2, property}`. The ~40
-handlers that are `pub(crate)` today stay so and are re-exported. Interleaved
-regions (DPMS/saver, XI1/XI2 AllowEvents, two GLX chunks, XTEST/cursor) are
-regrouped by the move.
+**2.6 `core_loop/process_request/`** (a descendant of the old module, so
+`core_loop::process_request` log-target filters still match; final tree in
+`2026-10-09-phase2-process-request.md`): `process_request.rs` keeps the
+consts, `RequestOutcome`, `process_request` + opcode match and the shared
+helpers (`emit_x11_error*`, lookups, `validate_*`, `write_to_client`); core
+`windows`, `redirect`, `props`, `selection`, `drawing`, `gc_pixmap_cursor`,
+`fonts`, `colormaps`, `grabs`, `focus_pointer`, `input_ctl`, `misc`;
+extensions `render`, `randr_ext`, `sync_ext`, `present_ext`, `dri3`, `glx`,
+`shape_xfixes`, `composite_damage`, `xshm`, `xtest`, `vidmode`, `saver_dpms`,
+`xkb`, `xi/{mod, dispatch}` (`_ext` only where the bare name is a protocol
+module the code imports). The ~40 handlers that are `pub(crate)` today stay
+so and are re-exported. Interleaved regions (DPMS/saver, XI1/XI2
+AllowEvents, two GLX chunks, XTEST/cursor) are regrouped by the move.
 
 **2.11 `kms/render/backend/`:**
 ```
@@ -428,7 +431,7 @@ phase 1 starts (jos writes that message).
 
 - **File size:** no non-test `.rs` over 5,000 lines and no test `.rs` over 6,000
   (ceilings; split by responsibility, not to hit a number). Exceptions until
-  their own steps land: `request/xinput/xi2.rs` (until 2c) and
+  their own steps land: `process_request/xi/dispatch.rs` (until 2c) and
   `backend/trait_impl.rs` (until 2.11b). CI step with an exception list.
 - **Tests:** rule 4 mapping holds against the phase-0 snapshot, plus tests
   added meanwhile.
