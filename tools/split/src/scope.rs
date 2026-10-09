@@ -19,10 +19,11 @@
 //! imports of unknown kind and opaque globs as tokens); for delegations,
 //! that the self type resolves to one in-tree item.
 //!
-//! Normalized before comparing tokens: the trailing comma of the
+//! Normalized before comparing tokens: the arguments of the
 //! `STD_COMMA_MACROS` that resolve to nothing in the tree (std's) at every
-//! invocation in the leaf, when their arguments parse as the macro's
-//! grammar; other macros' input and attributes stay exact. Closure bodies
+//! invocation in the leaf, when they parse as the macro's grammar: trailing
+//! comma dropped, and the same layout normalization as code outside macros;
+//! other macros' input and attributes stay exact. Closure bodies
 //! `{ e }` compare as `e` (see `tree::Commas`).
 //!
 //! Refused: moving a leaf that invokes an in-tree `macro_rules!`, or defines
@@ -37,7 +38,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use proc_macro2::{TokenStream, TokenTree};
 
-use crate::tree::{Ev, Leaf, Tree};
+use crate::tree::{Commas, Ev, Leaf, Tree};
 
 /// Absolute reach of a visibility written in `module`: `pub`, `crate`, or
 /// `in <module path>`.
@@ -176,43 +177,52 @@ pub fn std_macros(tokens: &str, site: &Site) -> BTreeSet<String> {
     ok.difference(&not).cloned().collect()
 }
 
-/// The arguments of std macro `name` without their trailing comma, when they
-/// parse as its grammar.
+/// The arguments of std macro `name`, when they parse as its grammar,
+/// without their trailing comma and layout-normalized (`tree::Commas`).
 fn std_args(name: &str, ts: TokenStream) -> Option<TokenStream> {
+    use quote::ToTokens;
     use syn::{
         Token,
         parse::{ParseStream, Parser},
+        visit_mut::VisitMut,
     };
-    let parsed = if name == "matches" {
-        (|p: ParseStream| {
-            p.parse::<syn::Expr>()?;
+    if name == "matches" {
+        let (mut e, mut pat, mut guard) = (|p: ParseStream| {
+            let e = p.parse::<syn::Expr>()?;
             p.parse::<Token![,]>()?;
-            syn::Pat::parse_multi_with_leading_vert(p)?;
-            if p.peek(Token![if]) {
+            let pat = syn::Pat::parse_multi_with_leading_vert(p)?;
+            let guard = if p.peek(Token![if]) {
                 p.parse::<Token![if]>()?;
-                p.parse::<syn::Expr>()?;
-            }
+                Some(p.parse::<syn::Expr>()?)
+            } else {
+                None
+            };
             if !p.is_empty() {
                 p.parse::<Token![,]>()?;
             }
-            Ok(())
+            Ok((e, pat, guard))
         })
-        .parse2(ts.clone())
-    } else {
-        syn::punctuated::Punctuated::<syn::Expr, Token![,]>::parse_terminated
-            .parse2(ts.clone())
-            .map(drop)
-    };
-    parsed.ok()?;
-    let mut v: Vec<TokenTree> = ts.into_iter().collect();
-    if is_punct(v.last(), ',') {
-        v.pop();
+        .parse2(ts)
+        .ok()?;
+        Commas.visit_expr_mut(&mut e);
+        Commas.visit_pat_mut(&mut pat);
+        let mut out = quote::quote!(#e, #pat);
+        if let Some(g) = guard.as_mut() {
+            Commas.visit_expr_mut(g);
+            out.extend(quote::quote!(if #g));
+        }
+        return Some(out);
     }
-    Some(v.into_iter().collect())
+    let mut args = syn::punctuated::Punctuated::<syn::Expr, Token![,]>::parse_terminated
+        .parse2(ts)
+        .ok()?;
+    args.pop_punct();
+    args.iter_mut().for_each(|e| Commas.visit_expr_mut(e));
+    Some(args.to_token_stream())
 }
 
-/// `tokens` with the trailing comma dropped from invocations of the `std`
-/// macros, outside attributes and other macros' input.
+/// `tokens` with the arguments of invocations of the `std` macros
+/// normalized, outside attributes and other macros' input.
 pub fn std_commas(tokens: &str, std: &BTreeSet<String>) -> String {
     fn walk(ts: TokenStream, std: &BTreeSet<String>) -> TokenStream {
         let v: Vec<TokenTree> = ts.into_iter().collect();

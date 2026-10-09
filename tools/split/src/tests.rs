@@ -1187,3 +1187,24 @@ fn apply_writes_a_file_form_root() {
     assert!(repo.join("src/a.rs").exists() && repo.join("src/a/inner.rs").exists());
     assert!(!repo.join("src/a/mod.rs").exists());
 }
+
+#[test]
+fn layout_inside_std_macro_arguments_is_not_significant() {
+    let before = fn_body(
+        "let w = vec![(\"a\", g(1, &[2, 3,],), |x| { x },),]; \
+         assert!(matches!(w[0], (\"a\", S { a, .. },),))",
+    );
+    let after = fn_body(
+        "let w = vec![(\"a\", g(1, &[2, 3]), |x| x)]; \
+         assert!(matches!(w[0], (\"a\", S { a, .. })))",
+    );
+    assert_eq!(same_file(&before, &after, false), Vec::<String>::new());
+    has(
+        &same_file(&fn_body("m!(g(1, 2,))"), &fn_body("m!(g(1, 2))"), false),
+        "tokens changed",
+    );
+    has(
+        &same_file(&fn_body("vec![(1,)]"), &fn_body("vec![(1)]"), false),
+        "tokens changed",
+    );
+}
