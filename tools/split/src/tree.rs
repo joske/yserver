@@ -187,6 +187,52 @@ pub fn sem_attrs(attrs: &[Attribute]) -> impl Iterator<Item = String> + '_ {
         .map(|a| tok(&a.meta))
 }
 
+/// Attribute context of the enclosing wrappers: the union of their `cfg`s,
+/// and every other semantic attribute in order, one list per nesting level
+/// (a module's declaration and inner attributes are one level). Empty levels
+/// are dropped, so new attribute-free modules do not count.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+pub struct Ctx {
+    pub cfg: BTreeSet<String>,
+    pub levels: Vec<Vec<String>>,
+}
+
+impl Ctx {
+    fn add(&mut self, attrs: &[Attribute], new_level: bool) {
+        if new_level || self.levels.is_empty() {
+            self.levels.push(Vec::new());
+        }
+        for a in attrs
+            .iter()
+            .filter(|a| !a.path().is_ident("doc") && !a.path().is_ident("path"))
+        {
+            if a.path().is_ident("cfg") {
+                self.cfg.insert(tok(&a.meta));
+            } else {
+                self.levels.last_mut().expect("level").push(tok(&a.meta));
+            }
+        }
+    }
+
+    fn nested(&self, attrs: &[Attribute]) -> Self {
+        let mut c = self.clone();
+        c.add(attrs, true);
+        c
+    }
+
+    fn normal(&self) -> Self {
+        Ctx {
+            cfg: self.cfg.clone(),
+            levels: self
+                .levels
+                .iter()
+                .filter(|l| !l.is_empty())
+                .cloned()
+                .collect(),
+        }
+    }
+}
+
 pub fn doc_attrs(attrs: &[Attribute]) -> impl Iterator<Item = String> + '_ {
     attrs
         .iter()
@@ -266,6 +312,8 @@ pub struct Owner {
     pub inherent: String,
     pub self_ty: String,
     pub is_trait: bool,
+    /// Docs and comments of the impl head, copied with every split piece.
+    pub notes: Vec<String>,
 }
 
 pub fn owner(i: &ItemImpl) -> Owner {
@@ -282,6 +330,7 @@ pub fn owner(i: &ItemImpl) -> Owner {
         inherent: tok(&h).trim_end_matches(['{', '}', ' ']).to_string(),
         self_ty: tok(&i.self_ty),
         is_trait: i.trait_.is_some(),
+        notes: Vec::new(),
     }
 }
 
@@ -326,7 +375,7 @@ pub struct Leaf {
     pub vis: String,
     pub tokens: String,
     /// Semantic attributes of every enclosing wrapper (effective cfg etc.).
-    pub ctx: BTreeSet<String>,
+    pub ctx: Ctx,
     pub comments: Vec<String>,
     pub file: String,
     pub line: usize,
@@ -552,6 +601,7 @@ struct FileCx<'a> {
     path: &'a str,
     f: &'a SrcFile,
     cm: &'a [Comment],
+    claimed: std::cell::RefCell<BTreeSet<usize>>,
 }
 
 /// Loads the module tree rooted at `root` (module path `module`), following
@@ -564,7 +614,7 @@ pub fn load(src: &dyn Source, root: &str, module: &str) -> Res<Tree> {
         src,
         root,
         module,
-        &BTreeSet::new(),
+        &Ctx::default(),
         Dir::root_rel(root, module),
     )?;
     let mut total: BTreeMap<String, usize> = BTreeMap::new();
@@ -589,17 +639,16 @@ impl Tree {
         src: &dyn Source,
         path: &str,
         module: &str,
-        ctx: &BTreeSet<String>,
+        ctx: &Ctx,
         rel: Option<String>,
     ) -> Res<()> {
         let bytes = src.read(path).ok_or_else(|| format!("{path}: not found"))?;
         let f = SrcFile::new(String::from_utf8(bytes).map_err(|e| format!("{path}: {e}"))?);
         let ast = syn::parse_file(&f.text).map_err(|e| format!("{path}: {e}"))?;
         let cm = comments(&f)?;
-        self.pool.extend(cm.iter().map(|c| c.text.clone()));
         self.pool.extend(doc_attrs(&ast.attrs));
         let mut ctx = ctx.clone();
-        ctx.extend(sem_attrs(&ast.attrs));
+        ctx.add(&ast.attrs, false);
         let start = ast
             .attrs
             .iter()
@@ -611,6 +660,7 @@ impl Tree {
             path,
             f: &f,
             cm: &cm,
+            claimed: Default::default(),
         };
         self.files.push(path.to_string());
         self.items(
@@ -620,7 +670,14 @@ impl Tree {
             &ctx,
             start,
             &Dir::of_file(path, rel),
-        )
+        )?;
+        let claimed = cx.claimed.borrow();
+        self.pool.extend(
+            cm.iter()
+                .filter(|c| !claimed.contains(&c.at))
+                .map(|c| c.text.clone()),
+        );
+        Ok(())
     }
 
     fn items(
@@ -628,7 +685,7 @@ impl Tree {
         cx: &FileCx,
         items: &[Item],
         module: &str,
-        ctx: &BTreeSet<String>,
+        ctx: &Ctx,
         mut prev: usize,
         dir: &Dir,
     ) -> Res<()> {
@@ -637,8 +694,7 @@ impl Tree {
             match item {
                 Item::Mod(m) => {
                     self.pool.extend(doc_attrs(&m.attrs));
-                    let mut mctx = ctx.clone();
-                    mctx.extend(sem_attrs(&m.attrs));
+                    let mctx = ctx.nested(&m.attrs);
                     let sub = format!("{module}::{}", m.ident);
                     self.mods.insert(sub.clone(), ModInfo { vis: tok(&m.vis) });
                     let macro_use = m.attrs.iter().any(|a| a.path().is_ident("macro_use"));
@@ -659,11 +715,14 @@ impl Tree {
                     self.events.push(Ev::Exit);
                 }
                 Item::Impl(i) => {
-                    self.pool.extend(doc_attrs(&i.attrs));
-                    let mut ictx = ctx.clone();
-                    ictx.extend(sem_attrs(&i.attrs));
-                    let o = owner(i);
+                    let ictx = ctx.nested(&i.attrs);
+                    let mut o = owner(i);
                     let mut p = cx.f.off(i.brace_token.span.open().end());
+                    o.notes.extend(doc_attrs(&i.attrs));
+                    for c in cx.cm.iter().filter(|c| c.at >= prev && c.at < p) {
+                        o.notes.push(c.text.clone());
+                        cx.claimed.borrow_mut().insert(c.at);
+                    }
                     for ii in &i.items {
                         let e = range(cx.f, ii.to_token_stream()).1;
                         let func = match ii {
@@ -702,7 +761,7 @@ impl Tree {
         module: &str,
         owner: Option<Owner>,
         p: Parts,
-        ctx: &BTreeSet<String>,
+        ctx: &Ctx,
         from: usize,
         to: usize,
         func: Option<ImplItemFn>,
@@ -721,7 +780,7 @@ impl Tree {
             name: p.name,
             vis: p.vis,
             tokens: p.tokens,
-            ctx: ctx.clone(),
+            ctx: ctx.normal(),
             comments,
             file: cx.path.to_string(),
             line: cx.f.line_of(from),

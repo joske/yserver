@@ -10,7 +10,7 @@ use syn::{Expr, FnArg, ImplItemFn, Pat, Stmt, Visibility, visit_mut::VisitMut};
 
 use crate::{
     apply::Manifest,
-    scope::{self, Names},
+    scope::{self, Names, scope},
     tree::{self, Leaf, Res, Source, Tree, dir_of, includes, join, tok},
 };
 
@@ -230,6 +230,7 @@ pub fn check(
                     let (na, _) = a.remove(i);
                     matched += 1;
                     errs.extend(rx.check(ob, na));
+                    let (so, sn) = (scope(&ob.vis, &ob.module), scope(&na.vis, &na.module));
                     if na.vis != ob.vis {
                         if ob.vis.is_empty()
                             && allowed_vis(&na.vis)
@@ -242,6 +243,26 @@ pub fn check(
                                 ob.vis, na.vis
                             ));
                         }
+                    }
+                    if !scope::within(&sn, &so) {
+                        errs.push(format!("{key}: visibility widened from {so} to {sn}"));
+                    }
+                    let (cb, ca) = (
+                        mod_chain(&before, &ob.module),
+                        mod_chain(&after, &na.module),
+                    );
+                    if cb != ca {
+                        errs.push(format!(
+                            "{key}: enclosing module visibility changed\n      before: {cb:?}\n      after:  {ca:?}"
+                        ));
+                    }
+                    let notes = |l: &Leaf| l.owner.as_ref().map(|o| o.notes.clone());
+                    if notes(ob) != notes(na) {
+                        errs.push(format!(
+                            "{key}: impl head comments changed\n      before: {:?}\n      after:  {:?}",
+                            notes(ob),
+                            notes(na)
+                        ));
                     }
                     if na.comments != ob.comments {
                         errs.push(format!(
@@ -398,20 +419,19 @@ pub fn check(
         }
     }
 
-    // Comments outside leaves: none lost, none invented.
+    // Comments and wrapper docs outside leaves and impl heads: same multiset.
     let mut pool: BTreeMap<&str, i64> = BTreeMap::new();
     for c in &before.pool {
         *pool.entry(c).or_default() += 1;
     }
-    let after_set: BTreeSet<&str> = after.pool.iter().map(String::as_str).collect();
     for c in &after.pool {
         *pool.entry(c).or_default() -= 1;
     }
     for (c, n) in &pool {
-        if *n > 0 {
-            errs.push(format!("comment lost: {c:?}"));
-        } else if !before.pool.iter().any(|x| x == c) && after_set.contains(c) {
-            errs.push(format!("comment added: {c:?}"));
+        match n.signum() {
+            1 => errs.push(format!("comment lost ({n}x): {c:?}")),
+            -1 => errs.push(format!("comment added ({}x): {c:?}", -n)),
+            _ => {}
         }
     }
 
@@ -568,6 +588,27 @@ impl<'a> Resolution<'a> {
         }
         errs
     }
+}
+
+/// Resolved reach of every enclosing module that is not private.
+fn mod_chain(t: &Tree, module: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for seg in module.split("::") {
+        let parent = cur.clone();
+        cur = if cur.is_empty() {
+            seg.to_string()
+        } else {
+            format!("{cur}::{seg}")
+        };
+        if let Some(m) = t.mods.get(&cur).filter(|m| m.vis != "?") {
+            let s = scope(&m.vis, &parent);
+            if s != scope("", &parent) {
+                out.push(s);
+            }
+        }
+    }
+    out
 }
 
 fn norm_vis(v: &str) -> String {

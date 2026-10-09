@@ -536,3 +536,52 @@ fn moved_dynamic_include_path_fails() {
     let body = "include_str!(concat!(\"fixtures/\", \"x.txt\"))";
     has(&moved_data("dynamic", body, body), "include");
 }
+
+#[test]
+fn wrapper_attribute_order_is_significant() {
+    let before = "#[allow(unused)]\n#[deny(unused)]\nmod m {\n    fn f() {}\n}\n";
+    let after = "#[deny(unused)]\n#[allow(unused)]\nmod m {\n    fn f() {}\n}\n";
+    has(
+        &same_file(before, after, false),
+        "effective cfg/attributes changed",
+    );
+}
+
+#[test]
+fn wrapper_attribute_nesting_is_significant() {
+    let before = "#[allow(unused)]\nmod a {\n    #[deny(unused)]\n    mod b {\n        fn f() {}\n    }\n}\n";
+    let after = "#[deny(unused)]\nmod a {\n    #[allow(unused)]\n    mod b {\n        fn f() {}\n    }\n}\n";
+    has(
+        &same_file(before, after, false),
+        "effective cfg/attributes changed",
+    );
+}
+
+#[test]
+fn module_visibility_is_significant() {
+    let before = "pub mod x {\n    pub fn f() {}\n}\n";
+    let after = "mod x {\n    pub fn f() {}\n}\n";
+    has(&same_file(before, after, false), "module visibility");
+}
+
+#[test]
+fn relative_visibility_widened_by_relocation_fails() {
+    let before = "mod m {\n    mod n {\n        pub(super) fn f() {}\n    }\n}\n";
+    let mod_rs = "mod inner;\npub use inner::*;\n\nmod m {\n    mod n {}\n}\n";
+    let inner = "use super::*;\n\npub(super) fn f() {}\n";
+    let errs = split(
+        "widen",
+        before,
+        &[("src/a/mod.rs", mod_rs), ("src/a/inner.rs", inner)],
+        "a::m::n::fn f => a::inner::fn f\n",
+        [&["pub use inner::*;"], &["use super::*;"]],
+    );
+    has(&errs, "widened");
+}
+
+#[test]
+fn duplicated_comment_fails() {
+    let before = "// note\nuse a::b;\nuse c::d;\n";
+    let after = "// note\nuse a::b;\n// note\nuse c::d;\n";
+    has(&same_file(before, after, false), "comment added");
+}

@@ -16,10 +16,6 @@ use proc_macro2::{TokenStream, TokenTree};
 
 use crate::tree::{Ev, Leaf, Tree};
 
-pub fn parent(m: &str) -> &str {
-    m.rsplit_once("::").map_or("", |(p, _)| p)
-}
-
 /// Absolute reach of a visibility written in `module`: `pub`, `crate`, or
 /// `in <module path>`.
 pub fn scope(vis: &str, module: &str) -> String {
