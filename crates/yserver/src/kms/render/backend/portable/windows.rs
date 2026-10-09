@@ -1717,3 +1717,808 @@ pub(in crate::kms::render::backend) fn default_window_init_color(depth: u8) -> [
         [0.0, 0.0, 0.0, 1.0]
     }
 }
+
+impl KmsBackend {
+    // ── Single-threaded core hooks ──────────────────────────────
+
+    // Step 2 (DRIFT 2, findings 2026-06-18): the backend no longer
+    // imposes server-side EWMH/focus stacking. Xorg restacks only via
+    // ConfigureWindow/CirculateWindow (the WM drives EWMH stacking
+    // through those), never from `_NET_WM_STATE`/_NET_WM_WINDOW_TYPE in
+    // the server. The old `on_window_property_changed` /
+    // `on_window_became_top_level` overrides called
+    // `apply_top_level_stack_hint`, an independent z-order authority that
+    // drifted from core (and `_NET_WM_STATE_FOCUSED → raise-to-top` was a
+    // prime suspect for the wrong-raise bug). Both now fall back to the
+    // trait's default no-op; top-level order is a pure projection of core
+    // children via `sync_top_level_order`.
+    pub(in crate::kms::render::backend) fn backend_windows_sync_top_level_order(
+        &mut self,
+        state: &ServerState,
+    ) {
+        use yserver_core::resources::ROOT_WINDOW;
+        let mut order = Vec::new();
+        for &child in state.resources.children(ROOT_WINDOW) {
+            // Only host-backed children are drawable/orderable by the
+            // backend; non-host-backed root children are reached (if ever)
+            // by other means. Do NOT filter on map state — X11 stacking
+            // order includes unmapped windows and must survive unmap/remap.
+            let Some(host) = state
+                .resources
+                .window(child)
+                .and_then(|w| w.host_xid)
+                .map(|h| h.as_raw())
+            else {
+                continue;
+            };
+            if !self.windows.contains_key(&host) {
+                // Benign transient: a core root child whose backend
+                // registration/storage hasn't completed yet (or a failure
+                // path). Project it anyway — order must survive — and LOG;
+                // never panic (the scene + hit-test already skip xids
+                // missing from windows). Codex review 2026-06-18.
+                log::debug!(
+                    target: "yserver::kms::render::stacking",
+                    "sync_top_level_order: root child 0x{host:x} not (yet) in windows"
+                );
+            }
+            order.push(host);
+        }
+        if self.core.top_level_order != order && !self.direct_frames_are_under_cow() {
+            // A direct frame bypasses the composed root scene. A real
+            // top-level restack changes that scene even when the direct
+            // Present target itself is untouched, so retire it through the
+            // normal composed replacement path before accepting another
+            // direct Present.
+            //
+            // Not when every direct frame is the compositor's overlay window
+            // or a descendant of it: the COW stacks above every top-level, so
+            // a restack beneath it cannot change the screen. A compositing
+            // desktop restacks constantly (raises, tooltips, notifications),
+            // and each needless unflip showed a stale frame on Cinnamon.
+            self.request_direct_unflip("top_level_stack_changed");
+        }
+        self.core.top_level_order = order;
+        self.scene.wake_for_damage();
+    }
+
+    pub(in crate::kms::render::backend) fn backend_windows_create_subwindow(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_parent: WindowHandle,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+        border_width: u16,
+        visual: HostSubwindowVisual,
+        background_pixel: Option<u32>,
+        background_pixmap: Option<u32>,
+    ) -> io::Result<WindowHandle> {
+        let xid = self.core.next_host_xid();
+        let parent_xid = host_parent.as_raw();
+        let parent_depth = if parent_xid == self.core.window_id {
+            Some(24)
+        } else {
+            self.windows.get(&parent_xid).map(|g| g.depth)
+        };
+        let depth = depth_for_visual(visual, parent_depth);
+        // Created unmapped, so no storage: `realize_window_storage` allocates it on viewability.
+        self.register_window_geometry(
+            xid,
+            x,
+            y,
+            width.max(1),
+            height.max(1),
+            border_width,
+            depth,
+            Some(parent_xid),
+            background_pixel,
+        );
+        if let Some(geom) = self.windows.get_mut(&xid)
+            && let Some(bg_pix) = background_pixmap
+        {
+            geom.bg_pixmap = Some(bg_pix);
+        }
+        self.scene.wake_for_damage();
+        WindowHandle::from_raw(xid).ok_or_else(|| io::Error::other("create_subwindow: xid was 0"))
+    }
+
+    pub(in crate::kms::render::backend) fn backend_windows_destroy_subwindow(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_xid: u32,
+    ) -> io::Result<()> {
+        // A direct frame may still scan a source whose Copy fallback targets
+        // this window. Request the composed replacement before dropping that
+        // storage ownership; the frame's pins deliberately remain alive until
+        // the replacement retires. An unrelated client-window destroy does
+        // not invalidate the compositor's authoritative root-stage Present:
+        // Cinnamon will replace it with its next Present, and forcing an
+        // intermediate composed frame exposes the retained pre-direct BO.
+        if self.direct_frame_references_host_drawable(host_xid) {
+            self.request_direct_unflip("destroy_direct_frame_drawable");
+        }
+        if let Some(id) = self.store.lookup(host_xid) {
+            self.store_decref_with_invalidate(id);
+        }
+        if self
+            .windows
+            .remove(&host_xid)
+            .is_some_and(|geom| geom.cursor.is_some())
+        {
+            // Xorg `DeleteWindow` drops the window's cursor ref (`dix/window.c:968`).
+            self.refresh_effective_cursor();
+            self.collect_released_cursors();
+        }
+        // Step 2 (DRIFT 2): top_level_order is no longer mutated here — it
+        // is a projection of core children, reprojected by the destroy
+        // core handler via `sync_top_level_order` after the resource child
+        // is removed. (Scene already skips xids absent from windows, so
+        // a transient stale entry between teardown and sync is harmless.)
+        self.scene.wake_for_damage();
+        Ok(())
+    }
+
+    pub(in crate::kms::render::backend) fn backend_windows_map_subwindow(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_xid: u32,
+    ) -> io::Result<()> {
+        if self.direct_frame_references_host_drawable(host_xid) {
+            self.request_direct_unflip("map_direct_frame_drawable");
+        }
+        if let Some(geom) = self.windows.get_mut(&host_xid) {
+            geom.mapped = true;
+        }
+        if let Some(id) = self.store.lookup(host_xid) {
+            self.store.set_scene_participating(id, true);
+        }
+        // The map-time background paint lives in `realize_window_storage`, driven by the delta.
+        self.scene.wake_for_damage();
+        Ok(())
+    }
+
+    pub(in crate::kms::render::backend) fn backend_windows_realize_window_storage(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_xid: u32,
+    ) -> io::Result<()> {
+        if self.storage_lifecycle_exempt(host_xid) {
+            return Ok(());
+        }
+        let Some(geom) = self.windows.get_mut(&host_xid) else {
+            return Ok(());
+        };
+        geom.viewable = true;
+        let geom = *geom;
+        let leaf = self.allocate_window_leaf(host_xid);
+        if let Some(id) = leaf {
+            self.store.set_scene_participating(id, geom.mapped);
+        }
+        // Xorg miPaintWindow on RealizeTree: tile the background wherever the window paints.
+        if geom.bg_pixel.is_some() || geom.bg_pixmap.is_some() {
+            if let Err(e) = self.clear_window_area_with_background(
+                host_xid,
+                geom.bg_pixel.unwrap_or(0),
+                geom.bg_pixmap,
+                0,
+                0,
+                geom.width.max(1),
+                geom.height.max(1),
+                (0, 0),
+            ) {
+                log::debug!(
+                    "render realize_window_storage: bg paint failed for 0x{host_xid:x}: {e:?}"
+                );
+            }
+        } else if let Some(id) = leaf
+            && self
+                .resolve_paint_target(host_xid)
+                .is_some_and(|t| t.backing_id() == id)
+        {
+            // Background None shows what is underneath: seed from the parent (no lower siblings).
+            self.seed_backing_from_parent(host_xid, id);
+        }
+        // The ring, once core has sent the border source (it does right after CreateWindow).
+        if geom.border_pixel.is_some() || geom.border_pixmap.is_some() {
+            let tile_origin = self.border_tile_origin(host_xid);
+            let _ = self.paint_window_border(host_xid, tile_origin);
+        }
+        self.scene.wake_for_damage();
+        Ok(())
+    }
+
+    pub(in crate::kms::render::backend) fn backend_windows_release_window_storage(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_xid: u32,
+    ) -> io::Result<()> {
+        if self.storage_lifecycle_exempt(host_xid) {
+            return Ok(());
+        }
+        let Some(geom) = self.windows.get_mut(&host_xid) else {
+            return Ok(());
+        };
+        geom.viewable = false;
+        // A direct frame may still scan this leaf; its pins keep the image alive past the decref.
+        if self.direct_frame_references_host_drawable(host_xid) {
+            self.request_direct_unflip("release_direct_frame_drawable");
+        }
+        if let Some(id) = self.store.lookup(host_xid) {
+            // Detach first: a pinned leaf survives the decref but must not stay the window's.
+            self.store.detach_xid(host_xid);
+            self.store_decref_with_invalidate(id);
+        }
+        self.scene.wake_for_damage();
+        Ok(())
+    }
+
+    pub(in crate::kms::render::backend) fn backend_windows_unmap_subwindow(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_xid: u32,
+    ) -> io::Result<()> {
+        if self.direct_frame_references_host_drawable(host_xid) {
+            self.request_direct_unflip("unmap_direct_frame_drawable");
+        }
+        if let Some(geom) = self.windows.get_mut(&host_xid) {
+            geom.mapped = false;
+        }
+        if let Some(id) = self.store.lookup(host_xid) {
+            self.store.set_scene_participating(id, false);
+        }
+        self.scene.wake_for_damage();
+        Ok(())
+    }
+
+    pub(in crate::kms::render::backend) fn backend_windows_configure_subwindow(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_xid: u32,
+        config: HostSubwindowConfig,
+    ) -> io::Result<()> {
+        // The compositor's root-stage Present remains authoritative while an
+        // unrelated client window moves. The updated desktop arrives in its
+        // next root Present, so replacing direct scanout for every
+        // ConfigureWindow only creates direct/composed churn. Unwind when the
+        // mutation touches storage retained by the active direct frame.
+        if self.direct_frame_references_host_drawable(host_xid) {
+            self.request_direct_unflip("configure_direct_frame_drawable");
+        }
+        let move_source = self.shared_backing_move_source(host_xid, &config);
+        let Some(geom) = self.windows.get_mut(&host_xid) else {
+            // Window not tracked — log + skip (e.g., configure
+            // before register). v1 tolerates this.
+            return Ok(());
+        };
+        let mut size_changed = false;
+        if let Some(x) = config.x {
+            geom.x = x;
+        }
+        if let Some(y) = config.y {
+            geom.y = y;
+        }
+        if let Some(w) = config.width
+            && w != geom.width
+        {
+            geom.width = w;
+            size_changed = true;
+        }
+        if let Some(h) = config.height
+            && h != geom.height
+        {
+            geom.height = h;
+            size_changed = true;
+        }
+        // #133 step 2 (P3): mirror `border_width` from the configure.
+        // Deliberately NOT folded into `size_changed`: the two need
+        // different treatment of the pixels already in the storage, so
+        // step 6 gives the border-width change its own path below.
+        let mut border_width_changed = false;
+        if let Some(bw) = config.border_width {
+            border_width_changed = bw != geom.border_width;
+            geom.border_width = bw;
+        }
+        // #133 step 6 (P8) — a `border_width` change is checked FIRST
+        // and takes the whole configure with it, including a combined
+        // `w`/`h` + `border_width` change. That combination is the
+        // spec's worked case (`w=100,bw=2 → w=98,bw=3`, outer 104
+        // either way): the resize path's compare-and-skip would find
+        // the extent unchanged and leave the content at offset 2 while
+        // every reader now expects 3.
+        //
+        // The two paths differ in what happens to the pixels, on
+        // purpose (`LeafContent`): a border-width change always
+        // preserves the client's drawable, because only the content's
+        // position inside the storage moved; a resize preserves it only
+        // for a window with no background, per the #143 block below.
+        if border_width_changed {
+            self.relayout_window_leaf_storage_for_border_change(host_xid);
+        } else if size_changed
+            && let Some(old_id) = self.store.lookup(host_xid)
+            && self.store.redirected_target(old_id).is_none()
+        {
+            // #143 — a window with NO background keeps its pixels
+            // across the reallocation. X11 says so for the default
+            // gravity in the same breath as the discard: "The window is
+            // tiled with its background. If no background is defined,
+            // the existing screen contents are not altered"
+            // (ForgetGravity, ChangeWindowAttributes), and Xorg
+            // implements exactly that — the resize marks the whole
+            // window exposed (`mi/miwindow.c:466-472`) and the paint
+            // that follows returns without touching a pixel when the
+            // window has none (`switch (pWin->backgroundState) { case
+            // None: return; }`, `mi/miexpose.c:438-440`).
+            //
+            // This is the path an already-open window takes when the WM
+            // retiles it, and discarding here is what made "already open
+            // windows get broken rendering" when a compositor started
+            // (#143): the window was wiped long before the redirect, and
+            // the backing seed (`overlay_backing_inferiors`) then
+            // faithfully copied the blank leaf. A shrink used to be
+            // unrecoverable on top of that, because we emitted no Expose
+            // for one; `handle_configure_window` now reports the whole
+            // window exposed in either direction, as Xorg does
+            // (`mi/miwindow.c:466-472`), so a discarded window WITH a
+            // background gets asked to repaint.
+            //
+            // A window WITH a background is still discarded and re-tiled:
+            // that IS the ForgetGravity rule, and it is what the
+            // xeyes-resize regression (2026-05-16,
+            // `subwindow_resize_clears_old_paint`) needs. Honouring a
+            // non-Forget `bit_gravity` would keep those pixels too, but
+            // the attribute does not reach this backend today.
+            //
+            // Reallocates and repaints the ring itself — see
+            // `sync_window_leaf_storage`.
+            let content = if self
+                .windows
+                .get(&host_xid)
+                .is_some_and(|g| g.bg_pixel.is_none() && g.bg_pixmap.is_none())
+            {
+                LeafContent::Migrate
+            } else {
+                LeafContent::Discard
+            };
+            self.sync_window_leaf_storage(host_xid, content);
+        }
+        if let Some(stack_mode) = config.stack_mode {
+            // Top-level z-order is no longer mutated here: it is a pure
+            // projection of core children, reprojected by the core
+            // ConfigureWindow handler via `sync_top_level_order` (Step 2,
+            // DRIFT 2). Only subwindow sibling order (`stack_rank`) stays
+            // backend-maintained here (Step 2b). A subwindow is one with a
+            // tracked parent.
+            let is_subwindow = self
+                .windows
+                .get(&host_xid)
+                .is_some_and(|g| g.parent.is_some());
+            if is_subwindow {
+                self.restack_subwindow(host_xid, stack_mode, config.sibling);
+            }
+        }
+        // After the restack, so the destination clip sees the new
+        // stacking, as Xorg's `CopyWindow` runs against the validated
+        // tree.
+        if let Some(source) = move_source {
+            self.carry_shared_backing_pixels_on_move(host_xid, source);
+        }
+        self.scene.wake_for_damage();
+        Ok(())
+    }
+
+    pub(in crate::kms::render::backend) fn backend_windows_reparent_subwindow(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_xid: u32,
+        host_parent: u32,
+        x: i16,
+        y: i16,
+    ) -> io::Result<()> {
+        // Stage 3f.6: update the parent xid so build_scene's
+        // descendant traversal sees the new tree shape on the next
+        // tick. BOTH `host_parent == 0` and `host_parent ==
+        // core.window_id` (root's real host xid; root is never tracked
+        // in `windows`) mean the window becomes a top-level under
+        // root; we record `None` so the recurse treats it as a top-
+        // level entry. A genuinely-unknown non-root xid is projection
+        // drift between resources and backend and panics below.
+        //
+        // Stage 3f.11 bug-fix: also reconcile `core.top_level_order`
+        // with the new parent. Pre-3f.11, an xid that was originally
+        // registered as a top-level (parent=root) stayed in
+        // `top_level_order` even after being reparented under
+        // another window. `build_scene` then emitted the same xid
+        // TWICE: once via the `top_level_order` walk (at its now-
+        // child-relative coords interpreted as absolute → typically
+        // (0,0)) and once via the recurse from its real parent (at
+        // its correct screen position). Observable as MATE's clock
+        // applet rendered at BOTH ends of the panel: the right edge
+        // is the real position, the left edge is the ghost.
+        let parent = if host_parent == 0 || host_parent == self.core.window_id {
+            // BOTH sentinels mean "top-level under root": `0` is the
+            // legacy convention; `core.window_id` is root's real host
+            // xid (root is never tracked in windows). The reparent-
+            // to-root path passes backend.window_id() (== core.window_id),
+            // NOT 0 — so this second clause is load-bearing. (Same root-
+            // sentinel check as backend.rs:1668.)
+            None
+        } else if self.windows.contains_key(&host_parent) {
+            Some(host_parent)
+        } else {
+            // Per spec §"Remove the missing-parent fallback": backend
+            // projection drift after protocol-level validation is a
+            // fatal internal-consistency failure, not a silent
+            // recovery. If the resources tree says the parent exists
+            // but windows doesn't, that's drift — surface it.
+            panic!(
+                "reparent_subwindow: host_parent 0x{host_parent:x} missing from \
+                 windows (and is neither 0 nor root/core.window_id); resources \
+                 layer must validate ReparentWindow before dispatching to backend"
+            );
+        };
+        let new_rank = self.alloc_window_stack_rank();
+        if let Some(geom) = self.windows.get_mut(&host_xid) {
+            geom.x = x;
+            geom.y = y;
+            // The parent update is load-bearing — `build_scene` recurses by
+            // `windows.parent`, so this is what prevents a reparented
+            // window from being double-emitted (once via the top-level walk
+            // and once via the recurse).
+            geom.parent = parent;
+            geom.stack_rank = new_rank;
+        }
+        // Step 2 (DRIFT 2): top_level_order is no longer reconciled here —
+        // it projects core children, reprojected by the reparent core
+        // handler via `sync_top_level_order` after the core tree moves the
+        // window (across the root boundary).
+        self.scene.wake_for_damage();
+        Ok(())
+    }
+
+    pub(in crate::kms::render::backend) fn backend_windows_change_subwindow_attributes(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_xid: u32,
+        value_mask: u32,
+        values: &[u32],
+    ) -> io::Result<()> {
+        // Stage 3f.6: v1-shape parse of the CWA value-mask.
+        // CWBackPixmap (0x01), CWBackPixel (0x02), CWBorderPixmap
+        // (0x04) and CWBorderPixel (0x08) are the four we honour —
+        // they decide what fresh / cleared regions of the window
+        // storage and (from step 4) the border ring look like. Other
+        // CW bits (CWBitGravity, CWEventMask, CWCursor, ...) flow
+        // through other Backend methods or get folded into broader
+        // window state; storing only what `windows` needs.
+        //
+        // The value list is positional: X11 orders values by ascending
+        // mask bit (`dix/window.c:1182` walks the mask with
+        // `lowbit(tmask)`), so `idx` must advance in the same order.
+        // Adding a bit out of order would silently mis-read every
+        // later value in a multi-attribute CWA.
+        let Some(geom) = self.windows.get_mut(&host_xid) else {
+            return Ok(());
+        };
+        let mut idx = 0;
+        if value_mask & 0x01 != 0 && idx < values.len() {
+            // CWBackPixmap. 0 = None / inherit-from-parent.
+            let v = values[idx];
+            geom.bg_pixmap = if v == 0 { None } else { Some(v) };
+            idx += 1;
+        }
+        if value_mask & 0x02 != 0 && idx < values.len() {
+            // CWBackPixel — opaque ARGB-or-XRGB pixel value.
+            geom.bg_pixel = Some(values[idx]);
+            idx += 1;
+        }
+        // #133 step 2 (P3): the border source. Xorg's border is an
+        // either/or (`PixUnion border` + `borderIsPixel`,
+        // `include/windowstr.h:146`), and core resolves CopyFromParent
+        // and pixel-overrides-pixmap before forwarding, so exactly one
+        // of these bits arrives per change and the other slot is
+        // cleared to keep the mirror an either/or too.
+        if value_mask & 0x04 != 0 && idx < values.len() {
+            // CWBorderPixmap — raw host pixmap xid of the border tile.
+            let v = values[idx];
+            geom.border_pixmap = if v == 0 { None } else { Some(v) };
+            if geom.border_pixmap.is_some() {
+                geom.border_pixel = None;
+            }
+            idx += 1;
+        }
+        if value_mask & 0x08 != 0 && idx < values.len() {
+            // CWBorderPixel — solid border colour.
+            geom.border_pixel = Some(values[idx]);
+            geom.border_pixmap = None;
+        }
+        // X11 spec: CWA's background attribute change does NOT
+        // repaint the window. The bg setting only affects future
+        // `ClearArea` / Expose handling. v2's pre-2026-05-30 eager
+        // clear here was a Stage 3f.6 over-reach: the Stage 4d
+        // guard (`routes_via_redirect`) skipped the clear for
+        // windows under COMPOSITE redirect (avoiding the
+        // "CC opaque black on drag with compositing" and
+        // "tray applets disappear" symptoms), but the
+        // non-redirected path still cleared — visible as
+        // non-composited MATE's CC sidebar going black when caja
+        // took focus over it (marco re-asserts CWA per configure;
+        // yserver wiped CC's pixmap to bg=0; GTK got no Expose so
+        // bg never repainted; widgets came back only on
+        // per-widget hover redraw). Removing the clear matches
+        // X11 in both modes.
+        //
+        // #133 step 4 (4.4) — the BORDER is the opposite case: X11 says
+        // a border-attribute change DOES repaint the border. Xorg does
+        // it right here, in `ChangeWindowAttributes` itself, after the
+        // ddx hook and gated on `(CWBorderPixel | CWBorderPixmap)`
+        // (`dix/window.c:1584-1591`, comment: "If the border contents
+        // have changed, redraw the border"). This is also the CREATION
+        // trigger: core forwards the resolved border source through
+        // this same route immediately after `create_subwindow`
+        // (`process_request.rs:20541`), including the CreateWindow
+        // inherit-from-parent case (`dix/window.c:879`).
+        if value_mask & 0x0c != 0 {
+            let tile_origin = self.border_tile_origin(host_xid);
+            let _ = self.paint_window_border(host_xid, tile_origin);
+        }
+        Ok(())
+    }
+
+    pub(in crate::kms::render::backend) fn backend_windows_register_top_level(
+        &mut self,
+        _origin: Option<OriginContext>,
+        nested_id: ResourceId,
+        host_xid: u32,
+    ) -> io::Result<()> {
+        // Bookkeeping mutation — same shape as v1. The XID map is in
+        // KmsCore and shared.
+        self.core.xid_map.insert(host_xid, nested_id);
+        // Top-level visible-window tracking for the scene
+        // assembler. register_top_level doesn't carry geometry;
+        // start at 1x1 (Stage 2 plan compromise) and resize on
+        // first configure_subwindow.
+        if !self.windows.contains_key(&host_xid) {
+            // Top-level: parent = None (root), no bg_pixel known yet
+            // (set later via change_subwindow_attributes).
+            self.register_window_geometry(host_xid, 0, 0, 1, 1, 0, 24, None, None);
+        }
+        // Step 2 (DRIFT 2): top_level_order membership is no longer set
+        // here — the create / reparent-to-root core handlers reproject it
+        // from core children via `sync_top_level_order` after this call.
+        self.scene.wake_for_damage();
+        Ok(())
+    }
+
+    pub(in crate::kms::render::backend) fn backend_windows_register_subwindow(
+        &mut self,
+        _origin: Option<OriginContext>,
+        nested_id: ResourceId,
+        host_xid: u32,
+    ) -> io::Result<()> {
+        self.core.xid_map.insert(host_xid, nested_id);
+        if !self.windows.contains_key(&host_xid) {
+            // register_subwindow doesn't carry parent xid (Backend
+            // trait doesn't expose it here — the trait shape was
+            // built around v1's flat windows table). Parent is set
+            // when `create_subwindow` fires for the same host_xid
+            // (it's the entry point that knows the parent). If
+            // register_subwindow runs first (e.g. ynest's wire
+            // ordering), we'll get `None` and the scene treats this
+            // window as a top-level until a `create_subwindow`
+            // catches up. Matches v1's "no parent tracking" status
+            // — v1 simply doesn't compose children either.
+            self.register_window_geometry(host_xid, 0, 0, 1, 1, 0, 32, None, None);
+        }
+        self.scene.wake_for_damage();
+        Ok(())
+    }
+
+    pub(in crate::kms::render::backend) fn backend_windows_paint_window_background_rect(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_xid: u32,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+    ) -> io::Result<()> {
+        let Some(geom) = self.windows.get(&host_xid) else {
+            return Ok(());
+        };
+        let (bg_pixel, bg_pixmap) = (geom.bg_pixel, geom.bg_pixmap);
+        if bg_pixel.is_none() && bg_pixmap.is_none() {
+            // Background None: contents stay undefined (miPaintWindow
+            // early-out).
+            return Ok(());
+        }
+        self.clear_window_area_with_background(
+            host_xid,
+            bg_pixel.unwrap_or(0),
+            bg_pixmap,
+            x,
+            y,
+            width,
+            height,
+            (0, 0),
+        )
+    }
+
+    // ── Container background ────────────────────────────────────
+    pub(in crate::kms::render::backend) fn backend_windows_set_container_background_pixel(
+        &mut self,
+        _origin: Option<OriginContext>,
+        pixel: u32,
+    ) -> io::Result<()> {
+        self.core.bg_pixel = Some(pixel);
+        self.core.bg_pixmap = None;
+        // Stage 4a — root paint resolves through redirect routing.
+        // In the common (unredirected) case this is the leaf root
+        // drawable; if a compositor has redirected root, paint
+        // lands in its backing instead. `resolve_paint_target`
+        // returns `None` only when the root xid isn't in the
+        // store, which is a fixture-init bug.
+        if let Some(target) = self.resolve_paint_target(self.core.window_id) {
+            let rect = ash::vk::Rect2D {
+                offset: ash::vk::Offset2D {
+                    x: target.offset().0,
+                    y: target.offset().1,
+                },
+                extent: ash::vk::Extent2D {
+                    width: u32::from(self.platform.fb_w.max(1)),
+                    height: u32::from(self.platform.fb_h.max(1)),
+                },
+            };
+            // L1 server-α invariant: root storage is depth-24, so
+            // force the stored α byte to 0xFF for the scene
+            // compositor's pass-through draw to read opaque.
+            let depth = self
+                .store
+                .get(target.backing_id())
+                .map(|d| d.depth)
+                .unwrap_or(24);
+            let format = self
+                .store
+                .get(target.backing_id())
+                .map(|d| d.storage.format)
+                .unwrap_or_else(|| PlatformBackend::format_for_depth(depth));
+            if let Err(e) = self.engine.fill_rect(
+                &mut self.store,
+                &mut self.platform,
+                target.dst(),
+                rect,
+                decode_x11_pixel_for_storage(pixel, depth, format),
+            ) {
+                log::warn!("render set_container_background_pixel: root fill failed: {e:?}");
+            } else {
+                self.telemetry.record_paint_submit();
+                self.trace_simple(SubmitKind::FillOne, target.backing_id(), 1);
+            }
+        }
+        self.scene.wake_for_damage();
+        Ok(())
+    }
+
+    pub(in crate::kms::render::backend) fn backend_windows_set_container_background_pixmap(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_pixmap_xid: u32,
+    ) -> io::Result<()> {
+        self.core.bg_pixmap = PixmapHandle::from_raw(host_pixmap_xid);
+        self.core.bg_pixel = None;
+        self.tile_root_background_pixmap(host_pixmap_xid);
+        self.scene.wake_for_damage();
+        Ok(())
+    }
+
+    pub(in crate::kms::render::backend) fn backend_windows_set_shape_rectangles(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_xid: u32,
+        kind: u8,
+        rects: Option<&[xfixes::RegionRect]>,
+    ) -> io::Result<()> {
+        // DIAG(#98): a compositor that unredirects a fullscreen window is
+        // expected to punch a matching hole in the COW (mutter-lineage
+        // `shape_cow_for_window` → XFixesSetWindowShapeRegion with the
+        // inverse of the window rect). Log every shape mutation so a
+        // failing fullscreen run distinguishes the two candidate
+        // mechanisms: muffin shapes the COW, versus muffin shapes nothing
+        // and the server's own COW-suppression probe is the only thing that
+        // can reveal the window.
+        //
+        // The parenthetical this comment used to carry — "the scene clips
+        // children by the parent RECT, never by the parent's bounding SHAPE"
+        // — is no longer true and was corrected while auditing #133 step 5.
+        // Under `Visibility::On` the walk clips a node's children to the
+        // parent's `mine` region, which is built from its shape-clipped
+        // place rects (`scene.rs`, `visit_window_subtree` step 2), so an
+        // empty bounding shape prunes the whole subtree and a partial one
+        // clips it — see `build_scene_empty_bounding_emits_no_draw` and
+        // `a_partial_parent_shape_clips_its_children`. #133 step 5 narrowed
+        // that region further, from the parent's `borderSize` to its
+        // `winSize`.
+        log::debug!(
+            "cow_diag: set_shape_rectangles host_xid=0x{host_xid:x} kind={kind} \
+             n_rects={n:?} rects={first:?}",
+            n = rects.map(<[xfixes::RegionRect]>::len),
+            first = rects.map(|r| &r[..r.len().min(4)]),
+        );
+        // Bookkeeping mutation: SHAPE rects live in KmsCore as a faithful
+        // projection of the core resource tree. The `Option` preserves
+        // the empty-vs-absent distinction (DRIFT 1): `None` removes the
+        // entry (unset → full window / live geometry); `Some(rects)`
+        // stores the region verbatim, INCLUDING `Some([])` (explicit
+        // empty → click-through for input, drawn-as-nothing for bounding).
+        // `cursor_inside_shape` and the scene's bounding clip already read
+        // `Some([])` correctly; the old API deleted on empty and lost it.
+        self.shape_generation = self.shape_generation.wrapping_add(1);
+        let dst = match kind {
+            0 => &mut self.core.shape_bounding,
+            1 => &mut self.core.shape_clip,
+            2 => &mut self.core.shape_input,
+            _ => {
+                self.log_render_gap("set_shape_rectangles_invalid_kind");
+                return Ok(());
+            }
+        };
+        match rects {
+            None => {
+                dst.remove(&host_xid);
+            }
+            Some(rects) => {
+                dst.insert(host_xid, rects.to_vec());
+            }
+        }
+        // Bounding (0) and clip (1) shapes change what the scene draws,
+        // so wake the compositor. Without this a shape change didn't
+        // repaint until an unrelated event (latent bug); and it un-
+        // strands a window flagged `offscreen_no_draw` for an empty
+        // bounding shape once the shape becomes non-empty (idle free-run
+        // fix cut 2b — the compose scheduler otherwise excludes it).
+        // Input shape (2) only affects hit-testing — no redraw needed.
+        if kind == 0 || kind == 1 {
+            if self.direct_frames_shaped_off_root() {
+                self.request_direct_unflip("shape_clips_direct_frame");
+            }
+            self.scene.wake_for_damage();
+        }
+        Ok(())
+    }
+
+    pub(in crate::kms::render::backend) fn backend_windows_windows_restructured(
+        &mut self,
+        state: &mut ServerState,
+    ) {
+        // Xorg `CheckMotion(NULL)`: the sprite starts on the root, and only a
+        // changed pointer window generates crossings — one hit-test otherwise.
+        let host_xid = self.resource_pointer_host_xid(state);
+        let prev = *self
+            .core
+            .prev_pointer_window
+            .get_or_insert(self.core.window_id);
+        if prev == host_xid {
+            // The window under the pointer is the same, but an InputOnly
+            // window's cursor (kept here, not by `define_cursor`) may
+            // have changed.
+            self.refresh_effective_cursor();
+            return;
+        }
+        let mask = self.serialize_modifiers() | self.core.button_mask;
+        self.update_pointer_window(
+            state,
+            host_xid,
+            mask,
+            yserver_core::core_loop::InputOrigin::NestedHost,
+        );
+        let pending = std::mem::take(&mut self.core.pending_pointer_events);
+        let xid_map = self.core.xid_map.clone();
+        for mut ev in pending {
+            ev.tree_change = true;
+            let _dropped = yserver_core::core_loop::pointer_fanout::pointer_event_fanout_to_state(
+                state, self, &xid_map, ev, true, false,
+            );
+        }
+    }
+}
