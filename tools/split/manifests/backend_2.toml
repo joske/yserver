@@ -1,0 +1,1108 @@
+# Phase 2 (2.11a) PROPOSAL / DRY RUN for kms/render/backend.rs: production
+# items move into descendant modules of kms::render::backend (log targets
+# keep the old prefix), split along the portable-render vs KMS seam:
+# backend/portable/<topic>.rs, backend/kms/<topic>.rs, backend/for_tests.rs
+# and backend/trait_impl.rs (the whole `impl Backend for KmsBackend`, kept as
+# one block: a trait impl cannot be spread over files without delegation,
+# which is step 2.11b). backend.rs keeps the imports, every type (private
+# fields stay readable from all children), the small helper-type impls and
+# the test module declarations. Inherent `impl KmsBackend` members are
+# spread per topic. Needs a prep commit first: 32 relative `super::` paths
+# (engine/store/target/platform/probe_executor/super::super::vk) qualified
+# to `crate::kms::…` so they mean the same module from a child.
+source = "crates/yserver/src/kms/render/backend.rs"
+module = "kms::render::backend"
+dir = "crates/yserver/src/kms/render/backend"
+root_form = "file"
+table = "backend_2.paths"
+
+[locations]
+"impl Backend for KmsBackend::fn allocate_redirected_backing" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl Backend for KmsBackend::fn apply_crtc_config" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl Backend for KmsBackend::fn configure_subwindow" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl Backend for KmsBackend::fn copy_area" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl Backend for KmsBackend::fn create_subwindow" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl Backend for KmsBackend::fn destroy_subwindow" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl Backend for KmsBackend::fn finish_crtc_config" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl Backend for KmsBackend::fn get_overlay_window" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl Backend for KmsBackend::fn map_subwindow" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl Backend for KmsBackend::fn mark_dirty" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl Backend for KmsBackend::fn maybe_composite" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl Backend for KmsBackend::fn put_image" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl Backend for KmsBackend::fn randr_layout_changed" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl Backend for KmsBackend::fn realize_window_storage" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl Backend for KmsBackend::fn register_subwindow" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl Backend for KmsBackend::fn register_top_level" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl Backend for KmsBackend::fn release_redirected_backing" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl Backend for KmsBackend::fn release_window_storage" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl Backend for KmsBackend::fn reparent_subwindow" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl Backend for KmsBackend::fn set_container_background_pixel" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl Backend for KmsBackend::fn set_container_background_pixmap" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl Backend for KmsBackend::fn set_dpms_power" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl Backend for KmsBackend::fn set_shape_rectangles" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl Backend for KmsBackend::fn set_window_scene_participation" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl Backend for KmsBackend::fn sync_top_level_order" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl Backend for KmsBackend::fn unmap_subwindow" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl KmsBackend::fn apply_virtual_screen_extent" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl KmsBackend::fn drive_vt_event" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl KmsBackend::fn finish_cow_release" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl KmsBackend::fn fire_randr_changes" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl KmsBackend::fn handle_cursor_move_outcome" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl KmsBackend::fn paint_window_border" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl KmsBackend::fn process_pointer_absolute" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl KmsBackend::fn relayout_window_leaf_storage_for_border_change" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl KmsBackend::fn relocate_leaf_content_in_place" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl KmsBackend::fn retire_direct_output" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl KmsBackend::fn sync_window_leaf_storage" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"impl KmsBackend::fn try_copy_area_root_scanout" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage / mark_scene_structure_dirty / mark_scene_structure_damage_rects) whose recorded caller file:line moves (backend.rs → its backend/ child); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+
+[visibility]
+"fn absolute_seq_user_data" = "pub(in crate::kms::render::backend)"
+"fn apply_gc_function" = "pub(in crate::kms::render::backend)"
+"fn apply_subwindow_mode_clip" = "pub(in crate::kms::render::backend)"
+"fn apply_z_plane_mask" = "pub(in crate::kms::render::backend)"
+"fn assemble_root_scanout" = "pub(in crate::kms::render::backend)"
+"fn blit_rows_4bpp" = "pub(in crate::kms::render::backend)"
+"fn border_ring_rects" = "pub(in crate::kms::render::backend)"
+"fn bordered_storage_extent" = "pub(in crate::kms::render::backend)"
+"fn change_picture_apply_mask" = "pub(in crate::kms::render::backend)"
+"fn classify_scanout_m0_coverage" = "pub(in crate::kms::render::backend)"
+"fn clip_rects16" = "pub(in crate::kms::render::backend)"
+"fn clip_trap_bbox_to_extents" = "pub(in crate::kms::render::backend)"
+"fn composite_needs_source_snapshot" = "pub(in crate::kms::render::backend)"
+"fn compute_copy_area_dst_rects" = "pub(in crate::kms::render::backend)"
+"fn compute_render_composite_clip" = "pub(in crate::kms::render::backend)"
+"fn copy_area_clip_gpu_eligible" = "pub(in crate::kms::render::backend)"
+"fn copy_area_masked_blit_eligible" = "pub(in crate::kms::render::backend)"
+"fn default_window_init_color" = "pub(in crate::kms::render::backend)"
+"fn depth_for_visual" = "pub(in crate::kms::render::backend)"
+"fn depth_plane_mask" = "pub(in crate::kms::render::backend)"
+"fn direct_frame_slot_on_output" = "pub(in crate::kms::render::backend)"
+"fn do_dump_drawables" = "pub(in crate::kms::render::backend)"
+"fn do_dump_scanout" = "pub(in crate::kms::render::backend)"
+"fn dri3_import_supported_for_topology" = "pub(in crate::kms::render::backend)"
+"fn dri3_version_for" = "pub(in crate::kms::render::backend)"
+"fn dst_picture_clip_by_children" = "pub(in crate::kms::render::backend)"
+"fn dump_cursor_record_to_ppm" = "pub(in crate::kms::render::backend)"
+"fn effective_refresh_matches" = "pub(in crate::kms::render::backend)"
+"fn first_stop_premul_of_gradient" = "pub(in crate::kms::render::backend)"
+"fn glx_vendor_names_for_driver" = "pub(in crate::kms::render::backend)"
+"fn intersect_clip_lists" = "pub(in crate::kms::render::backend)"
+"fn intersect_rect_with_clip" = "pub(in crate::kms::render::backend)"
+"fn kms_outputs_active_after_crtc_config" = "pub(in crate::kms::render::backend)"
+"fn local_rects_to_region" = "pub(in crate::kms::render::backend)"
+"fn migrated_content_copy" = "pub(in crate::kms::render::backend)"
+"fn mode_timing" = "pub(in crate::kms::render::backend)"
+"fn parse_composite_glyph_items" = "pub(in crate::kms::render)"
+"fn parse_gradient_stops" = "pub(in crate::kms::render::backend)"
+"fn phase_b_flip_in_flight_for_scheduler" = "pub(in crate::kms::render::backend)"
+"fn picture_pict_format" = "pub(in crate::kms::render::backend)"
+"fn picture_source_domain_clip" = "pub(in crate::kms::render::backend)"
+"fn probe_dmabuf_export_support" = "pub(in crate::kms::render::backend)"
+"fn read_scanout_region" = "pub(in crate::kms::render::backend)"
+"fn read_z_pixmap_pixel" = "pub(in crate::kms::render::backend)"
+"fn reconcile_connector_probe" = "pub(in crate::kms::render::backend)"
+"fn rects16_bbox" = "pub(in crate::kms::render::backend)"
+"fn resolve_dst_picture_for_render" = "pub(in crate::kms::render::backend)"
+"fn restore_primary_output_after_rebuild" = "pub(in crate::kms::render::backend)"
+"fn scanout_direct_eligible" = "pub(in crate::kms::render::backend)"
+"fn scanout_m1_outputs_cover_root" = "pub(in crate::kms::render::backend)"
+"fn scanout_m1_probe_eligible" = "pub(in crate::kms::render::backend)"
+"fn scanout_m2_is_authoritative_root" = "pub(in crate::kms::render::backend)"
+"fn select_scanout_read_route" = "pub(in crate::kms::render::backend)"
+"fn shift_i16" = "pub(in crate::kms::render::backend)"
+"fn split_root_scanout_reads" = "pub(in crate::kms::render::backend)"
+"fn subtract_one_rect_clip" = "pub(in crate::kms::render::backend)"
+"fn take_first_occurrence" = "pub(in crate::kms::render::backend)"
+"fn text_advance" = "pub(in crate::kms::render::backend)"
+"fn translate_clip_rects" = "pub(in crate::kms::render::backend)"
+"fn try_acquire_master_bounded" = "pub(in crate::kms::render::backend)"
+"fn vk_rects_bbox" = "pub(in crate::kms::render::backend)"
+"fn wire_image_len" = "pub(in crate::kms::render::backend)"
+"fn wrap_get_image_reply" = "pub(in crate::kms::render::backend)"
+"fn write_z_pixmap_pixel" = "pub(in crate::kms::render::backend)"
+"fn z_to_xy_planes" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn alloc_window_stack_rank" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn allocate_window_leaf" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn apply_cursor_hidden" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn apply_gamma_to_live_output" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn apply_keyboard_mapping" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn apply_modifier_mapping" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn apply_virtual_screen_extent" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn arm_idle_vblanks_ioctl" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn border_ring_thickness" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn border_solid_pixel" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn border_tile_origin" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn bump_crtc_config_topology_epoch" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn button_diagnostic" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn cached_gamma" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn cached_gamma_for_current_size" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn capture_root_overlay" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn carry_shared_backing_pixels_on_move" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn child_clip_region" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn clamp_group_to_keymap" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn clear_window_area_with_background" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn clip_cache_reusable" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn clip_fill_rects_by_subwindow_mode" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn collect_fill_rects_for_inferiors" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn collect_released_cursors" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn collect_stroke_inferior_targets" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn commit_relit_route" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn compute_copy_area_scissors" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn cook_floating_host_key" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn cook_host_key" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn copy_area_rop_cpu" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn copy_area_shared_backing_occluders" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn crtc_enable_needs_async_qualification" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn crtc_root_rects" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn current_led_bits" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn current_provider_endpoint_for_id" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn current_stroke_state" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn cursor_anim_deadline" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn direct_frame_references_host_drawable" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn direct_frames_are_under_cow" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn direct_frames_shaped_off_root" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn direct_present_crtc_eligible" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn direct_scanout_frame_for_output" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn direct_scanout_topology_eligible" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn direct_shape_chain_covers_root" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn discover_crtc_config_output" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn display_cursor_by_handle" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn drain_completed_present_events_impl" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn drain_engine_present_batches" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn drain_frame_builder_telemetry" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn drain_paint_submit_telemetry" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn drain_render_telemetry" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn drawable_dims" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn drive_vt_event" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn dst_local_extent" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn effective_cursor_walking_chain" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn effective_locked_group" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn emit_floating_pointer_event_at" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn emit_stroke_output" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn enqueue_prepared_crtc_config_probe" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn ensure_exported_entry" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn fill_rects_honoring_fill_state" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn fill_solid_rects" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn fill_solid_rects_with" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn finish_cow_release" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn fire_randr_changes" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn force_drain_all_present_batches" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn handle_cursor_move_outcome" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn handle_host_key" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn image_text_common" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn include_inferiors_dst_fanout" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn inferior_pieces" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn init_cursor_sprite" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn init_root_storage" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn initialize_provider_output_sources" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn insert_cursor_record" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn insert_monochrome_cursor_record" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn install_clip_mask_cache" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn intersect_with_current_clip_live" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn is_root_overlay_draw" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn keymap_group_count" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn live_crtc_and_gamma_size" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn lock_modifiers_action" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn log_render_gap" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn log_unresolved_target" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn materialize_direct_shadow_for_unflip" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn materialize_pending_clip_mask_cache_on_free" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn maybe_probe_scanout_m1" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn maybe_teardown_export" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn move_pointer_to_nearest_crtc" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn narrow_dst_clip_to_shared_backing" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn nominal_gamma_size" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn observe_scanout_m0" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn overlay_backing_inferiors" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn paint_window_border" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn paste_inferiors" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn pause_input_thread" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn pending_pageflip_crtcs" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn picture_src_class_by_xid" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn pin_direct_source" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn plan_backing_inferiors" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn present_completion_is_idle_for" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn present_crtc_key" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn present_crtc_output" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn present_flip_in_flight_for_output" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn process_pointer_absolute" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn process_pointer_button" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn provider_output_source_allows" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn publish_connector_probes" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn publish_disabled_xi_facet" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn put_image_rop_cpu" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn queue_direct_successor" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn quiesce_before_topology_mutation" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn read_cursor_bgra_pixmap" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn read_cursor_depth1_pixmap" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn read_fill_pattern_cache" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn read_root_scanout_assembled" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn reapply_gamma_for_live_outputs" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn rebuild_randr_state" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn reconcile_connector_registry" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn record_composite_glyphs_drop" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn recover_failed_crtc_config" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn refresh_direct_cursor_on_all_outputs" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn refresh_effective_cursor" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn refresh_present_crtc_clock_epochs" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn register_pending_present_batch" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn register_window_geometry" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn relayout_window_leaf_storage_for_border_change" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn release_backing_lifetime_ref" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn release_device_facet_holds" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn release_device_holds" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn relight_after_direct_teardown" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn remove_crtc_config_ready_announcement" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn render_composite_inner" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn render_dst_cliplist_local" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn render_glyph_for_cursor" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn render_text_chars" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn request_direct_unflip" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn request_exit" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn reserved_layout_slots" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn resolve_picture_for_render" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn resolve_window_paint_target" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn resource_pointer_host_xid" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn restack_subwindow" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn restore_leaves_from_backing" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn resume_input_thread" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn retain_direct_present_wake" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn retire_direct_output" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn root_storage_extent" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn run_display_rescan" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn scanout_allowed" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn scanout_m0_target" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn scanout_m1_topology_signature" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn scene_wants_compose" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn seed_backing_from_parent" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn seed_connector_topology_from_probes" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn seed_initial_connector_topology" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn selected_render_provider_endpoint" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn serialize_modifiers" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn serialize_xkb_modifiers" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn shared_backing_draw_clip" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn shared_backing_move_source" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn shift_dst_picture_clip" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn shift_rectangles_for_paint" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn should_route_root_overlay" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn source_inferiors_snapshot" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn stale_crtc_config_probe_reason" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn stamp_opaque_alpha_if_shared" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn stop_direct_after_scanout_replaced" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn storage_content_offset" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn storage_lifecycle_exempt" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn store_alloc" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn submit_composed_unflip" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn submit_direct_frame" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn submit_target_kind" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn subwindow_mode_clip" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn sync_descriptor_pool_telemetry" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn sync_keyboard_leds" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn sync_window_leaf_storage" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn sync_window_leaf_storage_to_geometry" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn synchronize_floating_keyboard_states" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn synthesize_held_releases" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn take_backing_lifetime_ref" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn take_relight_requests" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn teardown_direct_before_topology_requery" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn tile_root_background_pixmap" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn trace_render" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn trace_simple" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn try_copy_area_root_scanout" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn uniform_glyph_source_premul" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn unredirected_direct_scene_eligible" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn update_input_extent" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn update_pointer_window" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn wake_crtc_config_ready" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn window_border_width" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn window_inferiors_snapshot" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn window_under_cursor" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn with_dst_picture_on" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn xkb_set_compat_map" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn xkb_set_geometry" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn xkb_set_indicator_map" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn xkb_set_map" = "pub(in crate::kms::render::backend)"
+"impl KmsBackend::fn xkb_set_names" = "pub(in crate::kms::render::backend)"
+
+[[modules]]
+name = ""
+lines = [
+  "pub(super) use portable::*;",
+  "use kms::*;",
+]
+items = [
+  "mod tests",
+  "use std::{any::Any,cell::{Cell,RefCell},collections::{HashMap,HashSet,VecDeque},io,os::fd::{AsFd,OwnedFd},rc::Rc,}",
+  "use ash::vk",
+  "use yserver_core::{backend::{AnyHandle,Backend,BackendFdKind,ClipState,CrtcConfigApply,CrtcConfigToken,CursorHandle,DrawState,Dri3Caps,Dri3ImportModifier,Dri3PixmapExport,FillState,FontHandle,GlyphSetHandle,KeymapLoad,OriginContext,PictureHandle,PixmapHandle,PresentCaps,PresentScanoutCandidate,PresentSourceWait,WindowHandle,identity_ramp,resample_channel,},core_loop::HostInputEvent,host_x11::{HostKeyEvent,HostPointerEvent,HostSubwindowConfig,HostSubwindowVisual,HostXidMap,PointerEventKind,PointerPosition,},resources::{ARGB_COLORMAP,ARGB_VISUAL},server::ServerState,}",
+  "use yserver_protocol::x11::{ClipRectangles,FontMetrics,RENDER_FMT_A1,RENDER_FMT_A8,RENDER_FMT_ARGB32,ResourceId,xfixes,}",
+  "use crate::{drm,internal_probe::{ProbeKmsHandles,RouteProbeRequest},kms::{backend::OutputKey,core::{GradientStop,KmsCore,PictureFilter,PictureRecord},cpu_types::{PictTransform,Rectangle16,Repeat},render::{engine::{RenderEngine,decode_x11_pixel_for_storage},glyph_pixels::GlyphSourceFormat,platform::{ConnectorSnapshot,CrtcKey,PlatformBackend,QualifiedScanoutPlan,is_terminal_disposable_probe_error,},scene::SceneCompositor,store::{AllocError,DrawableId,DrawableKind,DrawableStore,ImportedDmabufMetadata,ImportedDmabufPlane,Storage,},submit_trace::{FlagsasSubmitFlags,OpasSubmitOp,SrcClass,SubmitEvent,SubmitKind,TargetKind,},target::{Dst,PaintTarget,Src},telemetry::Telemetry,},scanout_route::{RenderDeviceId,RenderKmsRelationship,ScanoutRoute},},platform::drm::ModeIdentity,}",
+  "struct InputOnlyPointerHost",
+  "struct WindowGeometry",
+  "type WindowsMap",
+  "struct TrackedWindows",
+  "impl TrackedWindows",
+  "impl std :: ops :: Deref for TrackedWindows",
+  "impl < 'a > IntoIterator for & 'a TrackedWindows",
+  "impl std :: ops :: DerefMut for TrackedWindows",
+  "type ScenePlacement",
+  "type PaintTargetShape",
+  "struct SharedBackingMoveSource",
+  "struct FloatingKeyboardState",
+  "struct LockFilterPriv",
+  "const XKB_SA_LOCK_NO_UNLOCK",
+  "enum LeafContent",
+  "enum ScanoutM0Target",
+  "enum ScanoutM0Coverage",
+  "enum DirectFrameSlot",
+  "struct ScanoutM0Shape",
+  "struct ScanoutM0Telemetry",
+  "impl Default for ScanoutM0Telemetry",
+  "struct ScanoutM1ProbeEntry",
+  "impl ScanoutM1ProbeEntry",
+  "struct ScanoutM1ProbeCache",
+  "impl ScanoutM1ProbeCache",
+  "struct DirectPresentFrame",
+  "const SCANOUT_M2_ELIGIBLE_ROOT_PROBATION",
+  "struct ScanoutM2State",
+  "impl ScanoutM2State",
+  "struct ScanoutM1OutputGeometry",
+  "struct SeedInferiorDraw",
+  "struct RandrIdAllocator",
+  "enum RandrProviderEndpoint",
+  "struct ConnectorIds",
+  "struct NotLiveConnector",
+  "type ProjectedRandrOutputState",
+  "enum ConnectorConfig",
+  "struct RememberedRoute",
+  "impl ConnectorConfig",
+  "struct RelightRequest",
+  "struct CrtcConfigProbeJob",
+  "struct CrtcConfigProbeCompletion",
+  "trait CrtcConfigProbeExecutor",
+  "struct PendingCrtcConfigProbe",
+  "struct ConnectorEntry",
+  "struct ConnectorRegistryDelta",
+  "impl ConnectorRegistryDelta",
+  "struct GammaLut",
+  "impl GammaLut",
+  "impl RandrIdAllocator",
+  "struct KmsBackend",
+  "struct ExportedBacking",
+  "struct FillPatternCache",
+  "struct ClipMaskSnapshot",
+  "const ABSOLUTE_SEQ_TAG",
+  "enum KmsButtonDiagnostic",
+  "struct SubwindowModeClip",
+  "struct SubwindowClipCacheEntry",
+  "struct InferiorPiece",
+  "static COMPOSITE_GLYPHS_DROP_WARNED",
+  "enum ScanoutReadSelection",
+  "enum ScanoutReadRoute",
+  "enum ScanoutReadOrigin",
+  "impl ScanoutReadOrigin",
+  "struct RootScanoutRead",
+  "enum RootReadSource",
+  "const SCANOUT_READBACK_GRANULE",
+  "const PENDING_RETIRE_POLL_INTERVAL",
+  "struct ParsedGlyph",
+  "struct ParsedGlyphItems",
+  "const GET_IMAGE_FORMAT_XY_PIXMAP",
+  "struct WarnThrottle",
+  "impl WarnThrottle",
+  "mod crtc_transform_tests",
+  "fn shared_backing_move_pieces",
+  "fn order_pieces_for_in_place_move",
+]
+
+[[modules]]
+name = "portable"
+lines = [
+  "use super::*;",
+  "pub(super) use windows::*;",
+  "pub(super) use render_ops::*;",
+  "pub(in crate::kms::render) use text::*;",
+  "pub(super) use clip::*;",
+  "pub(super) use draw::*;",
+  "pub(super) use dump::*;",
+]
+items = []
+
+[[modules]]
+name = "portable::windows"
+lines = [
+  "use super::*;",
+]
+items = [
+  "fn bordered_storage_extent",
+  "fn migrated_content_copy",
+  "fn border_ring_rects",
+  "impl KmsBackend::fn alloc_window_stack_rank",
+  "impl KmsBackend::fn sync_window_leaf_storage_to_geometry",
+  "impl KmsBackend::fn restore_leaves_from_backing",
+  "impl KmsBackend::fn relayout_window_leaf_storage_for_border_change",
+  "impl KmsBackend::fn sync_window_leaf_storage",
+  "impl KmsBackend::fn relocate_leaf_content_in_place",
+  "impl KmsBackend::fn migrate_leaf_content_across_realloc",
+  "impl KmsBackend::fn clear_window_area_with_background",
+  "impl KmsBackend::fn fill_window_background_solid",
+  "impl KmsBackend::fn paint_window_border",
+  "impl KmsBackend::fn border_ring_thickness",
+  "impl KmsBackend::fn border_solid_pixel",
+  "impl KmsBackend::fn border_tile_origin",
+  "impl KmsBackend::fn paint_border_ring_tiled",
+  "impl KmsBackend::fn restack_subwindow",
+  "impl KmsBackend::fn tile_root_background_pixmap",
+  "impl KmsBackend::fn register_window_geometry",
+  "impl KmsBackend::fn allocate_window_leaf",
+  "impl KmsBackend::fn storage_lifecycle_exempt",
+  "impl KmsBackend::fn log_unresolved_target",
+  "fn default_window_init_color",
+]
+
+[[modules]]
+name = "portable::redirect"
+lines = [
+  "use super::*;",
+]
+items = [
+  "impl KmsBackend::fn window_absolute_rect",
+  "impl KmsBackend::fn seed_backing_from_parent",
+  "impl KmsBackend::fn overlay_backing_inferiors",
+  "impl KmsBackend::fn plan_backing_inferiors",
+  "impl KmsBackend::fn collect_backing_inferiors",
+  "impl KmsBackend::fn push_inferior_rects",
+  "impl KmsBackend::fn store_decref_with_invalidate",
+  "impl KmsBackend::fn store_alloc",
+  "impl KmsBackend::fn apply_pending_picture_refs",
+  "impl KmsBackend::fn take_backing_lifetime_ref",
+  "impl KmsBackend::fn release_backing_lifetime_ref",
+  "impl KmsBackend::fn poll_pending_retire_with_invalidate",
+]
+
+[[modules]]
+name = "portable::paint_target"
+lines = [
+  "use super::*;",
+]
+items = [
+  "impl KmsBackend::fn init_root_storage",
+  "impl KmsBackend::fn stamp_opaque_alpha_if_shared",
+  "impl KmsBackend::fn resolve_paint_target",
+  "impl KmsBackend::fn resolve_non_window_paint_target",
+  "impl KmsBackend::fn resolve_window_paint_target",
+  "impl KmsBackend::fn window_border_width",
+  "impl KmsBackend::fn finish_content_clip",
+  "impl KmsBackend::fn storage_content_offset",
+  "impl KmsBackend::fn leaf_paint_target",
+  "impl KmsBackend::fn leaf_content_clip",
+  "impl KmsBackend::fn shared_backing_move_source",
+  "impl KmsBackend::fn carry_shared_backing_pixels_on_move",
+  "impl KmsBackend::fn copy_area_shared_backing_occluders",
+  "impl KmsBackend::fn bounding_shape_local",
+  "impl KmsBackend::fn child_clip_region",
+  "impl KmsBackend::fn shared_backing_draw_clip",
+]
+
+[[modules]]
+name = "portable::cursor"
+lines = [
+  "use super::*;",
+]
+items = [
+  "impl KmsBackend::fn init_cursor_sprite",
+  "impl KmsBackend::fn xorg_root_cursor",
+  "impl KmsBackend::fn insert_cursor_record",
+  "impl KmsBackend::fn insert_monochrome_cursor_record",
+  "impl KmsBackend::fn allocate_cursor_sprite_pixmap",
+  "impl KmsBackend::fn read_cursor_depth1_pixmap",
+  "impl KmsBackend::fn read_cursor_bgra_pixmap",
+  "impl KmsBackend::fn render_glyph_for_cursor",
+  "impl KmsBackend::fn effective_cursor_walking_chain",
+  "impl KmsBackend::fn refresh_effective_cursor",
+  "impl KmsBackend::fn cursor_referenced",
+  "impl KmsBackend::fn collect_released_cursors",
+  "impl KmsBackend::fn apply_cursor_hidden",
+  "impl KmsBackend::fn sync_cursor_animation",
+  "impl KmsBackend::fn tick_cursor_animation",
+  "impl KmsBackend::fn cursor_anim_deadline",
+  "impl KmsBackend::fn swap_anim_frame_into_maps",
+  "impl KmsBackend::fn display_cursor_by_handle",
+]
+
+[[modules]]
+name = "portable::render_ops"
+lines = [
+  "use super::*;",
+]
+items = [
+  "impl KmsBackend::fn resolve_picture_for_render",
+  "impl KmsBackend::fn record_composite_glyphs_drop",
+  "impl KmsBackend::fn uniform_glyph_source_premul",
+  "impl KmsBackend::fn render_composite_inner",
+  "impl KmsBackend::fn source_inferiors_snapshot",
+  "impl KmsBackend::fn window_inferiors_snapshot",
+  "fn parse_gradient_stops",
+  "fn take_first_occurrence",
+  "fn change_picture_apply_mask",
+  "fn first_stop_premul_of_gradient",
+  "fn resolve_dst_picture_for_render",
+  "fn picture_source_domain_clip",
+  "fn picture_client_clip",
+  "fn composite_needs_source_snapshot",
+  "fn dst_picture_clip_by_children",
+  "fn clip_trap_bbox_to_extents",
+  "fn compute_render_composite_clip",
+]
+
+[[modules]]
+name = "portable::text"
+lines = [
+  "use super::*;",
+]
+items = [
+  "impl KmsBackend::fn render_text_chars",
+  "impl KmsBackend::fn paint_solid_spans",
+  "impl KmsBackend::fn render_text_chars_atlas",
+  "impl KmsBackend::fn fill_text_background",
+  "impl KmsBackend::fn image_text_common",
+  "fn text_advance",
+  "fn rasterize_glyph_mono_spans",
+  "fn translate_glyph_spans",
+  "fn glyph_mono_spans",
+  "fn parse_composite_glyph_items",
+]
+
+[[modules]]
+name = "portable::inferiors"
+lines = [
+  "use super::*;",
+]
+items = [
+  "impl KmsBackend::fn render_dst_cliplist_local",
+  "impl KmsBackend::fn dst_local_extent",
+  "impl KmsBackend::fn inferior_pieces",
+  "impl KmsBackend::fn paste_inferiors",
+  "impl KmsBackend::fn include_inferiors_dst_fanout",
+  "impl KmsBackend::fn with_dst_picture_on",
+  "impl KmsBackend::fn collect_fill_rects_for_inferiors",
+  "impl KmsBackend::fn collect_stroke_inferior_targets",
+  "impl KmsBackend::fn walk_stroke_inferiors",
+  "impl KmsBackend::fn current_stroke_state",
+  "impl KmsBackend::fn is_root_overlay_draw",
+  "impl KmsBackend::fn should_route_root_overlay",
+  "impl KmsBackend::fn capture_root_overlay",
+  "impl KmsBackend::fn emit_stroke_output",
+]
+
+[[modules]]
+name = "portable::clip"
+lines = [
+  "use super::*;",
+]
+items = [
+  "impl KmsBackend::fn current_clip_rects_in_dst_space",
+  "impl KmsBackend::fn intersect_with_current_clip",
+  "impl KmsBackend::fn intersect_with_current_clip_live",
+  "impl KmsBackend::fn clip_mask_row_stride",
+  "impl KmsBackend::fn pending_clip_mask_cache",
+  "impl KmsBackend::fn read_fill_pattern_cache",
+  "impl KmsBackend::fn read_clip_mask_bytes",
+  "impl KmsBackend::fn clip_cache_reusable",
+  "impl KmsBackend::fn install_clip_mask_cache",
+  "impl KmsBackend::fn ensure_clip_mask_cache_cpu_bytes",
+  "impl KmsBackend::fn materialize_pending_clip_mask_cache_on_free",
+  "impl KmsBackend::fn refresh_clip_mask_snapshot_for",
+  "impl KmsBackend::fn drawable_dims",
+  "impl KmsBackend::fn shift_rectangles_for_paint",
+  "impl KmsBackend::fn narrow_dst_clip_to_shared_backing",
+  "impl KmsBackend::fn shift_dst_picture_clip",
+  "impl KmsBackend::fn clip_fill_rects_by_subwindow_mode",
+  "impl KmsBackend::fn subwindow_mode_clip",
+  "impl KmsBackend::fn compute_subwindow_mode_clip",
+  "fn shift_i16",
+  "fn apply_subwindow_mode_clip",
+  "fn intersect_rect_with_clip",
+  "fn translate_clip_rects",
+  "fn intersect_clip_lists",
+  "fn local_rects_to_region",
+  "fn clip_rects16",
+  "fn subtract_one_rect_clip",
+]
+
+[[modules]]
+name = "portable::draw"
+lines = [
+  "use super::*;",
+]
+items = [
+  "impl KmsBackend::fn compute_copy_area_scissors",
+  "impl KmsBackend::fn fill_solid_rects",
+  "impl KmsBackend::fn fill_solid_rects_with",
+  "impl KmsBackend::fn fill_solid_rects_cpu_fallback",
+  "impl KmsBackend::fn copy_area_rop_cpu",
+  "impl KmsBackend::fn put_image_rop_cpu",
+  "impl KmsBackend::fn fill_rects_honoring_fill_state",
+  "impl KmsBackend::fn fill_pattern_rects_cpu_fallback",
+  "impl KmsBackend::fn try_tiled_fill",
+  "fn vk_rects_bbox",
+  "fn blit_rows_4bpp",
+  "fn rects16_bbox",
+  "fn copy_area_clip_gpu_eligible",
+  "fn copy_area_masked_blit_eligible",
+  "fn compute_copy_area_dst_rects",
+  "fn wire_image_len",
+  "fn wrap_get_image_reply",
+  "fn depth_plane_mask",
+  "fn apply_z_plane_mask",
+  "fn z_pixmap_row_stride",
+  "fn read_z_pixmap_pixel",
+  "fn write_z_pixmap_pixel",
+  "fn apply_gc_function",
+  "fn z_to_xy_planes",
+  "fn depth_for_visual",
+]
+
+[[modules]]
+name = "portable::keyboard"
+lines = [
+  "use super::*;",
+]
+items = [
+  "impl KmsBackend::fn serialize_modifiers",
+  "impl KmsBackend::fn serialize_xkb_modifiers",
+  "impl KmsBackend::fn current_key_action",
+  "impl KmsBackend::fn lock_modifiers_action",
+  "impl KmsBackend::fn synchronize_floating_keyboard_states",
+  "impl KmsBackend::fn cook_floating_host_key",
+  "impl KmsBackend::fn keymap_group_count",
+  "impl KmsBackend::fn clamp_group_to_keymap",
+  "impl KmsBackend::fn effective_locked_group",
+  "impl KmsBackend::fn set_led_relay",
+  "impl KmsBackend::fn current_led_bits",
+  "impl KmsBackend::fn sync_keyboard_leds",
+  "impl KmsBackend::fn apply_keyboard_mapping",
+  "impl KmsBackend::fn apply_modifier_mapping",
+  "impl KmsBackend::fn mutate_keymap",
+  "impl KmsBackend::fn xkb_set_map",
+  "impl KmsBackend::fn xkb_whole_request",
+  "impl KmsBackend::fn xkb_set_compat_map",
+  "impl KmsBackend::fn xkb_set_indicator_map",
+  "impl KmsBackend::fn xkb_set_names",
+  "impl KmsBackend::fn xkb_set_geometry",
+  "impl KmsBackend::fn mapping_change",
+  "impl KmsBackend::fn install_desc",
+  "impl KmsBackend::fn cook_host_key",
+  "impl KmsBackend::fn synthesize_held_releases",
+]
+
+[[modules]]
+name = "portable::devices"
+lines = [
+  "use super::*;",
+]
+items = [
+  "impl KmsBackend::fn stamp_host_key_without_master_transition",
+  "impl KmsBackend::fn handle_host_key",
+  "impl KmsBackend::fn release_keyboard_source_keys",
+  "impl KmsBackend::fn release_pointer_source_buttons",
+  "impl KmsBackend::fn release_device_holds",
+  "impl KmsBackend::fn release_device_facet_holds",
+  "impl KmsBackend::fn publish_disabled_xi_facet",
+  "impl KmsBackend::fn release_device_state",
+]
+
+[[modules]]
+name = "portable::pointer"
+lines = [
+  "use super::*;",
+]
+items = [
+  "impl KmsBackend::fn resource_pointer_host_xid",
+  "impl KmsBackend::fn input_only_pointer_host",
+  "impl KmsBackend::fn prune_input_only_pointer_hosts",
+  "impl KmsBackend::fn crossing_host_for",
+  "impl KmsBackend::fn window_under_cursor",
+  "impl KmsBackend::fn cursor_inside_shape",
+  "impl KmsBackend::fn event_relative_coords",
+  "impl KmsBackend::fn emit_pointer",
+  "impl KmsBackend::fn emit_crossing",
+  "impl KmsBackend::fn emit_motion_only",
+  "impl KmsBackend::fn emit_floating_pointer_event_at",
+  "impl KmsBackend::fn update_pointer_window",
+  "impl KmsBackend::fn dispatch_motion_event",
+  "impl KmsBackend::fn crtc_root_rects",
+  "impl KmsBackend::fn move_pointer_to_nearest_crtc",
+  "impl KmsBackend::fn process_pointer_absolute",
+  "impl KmsBackend::fn button_diagnostic",
+  "impl KmsBackend::fn process_pointer_button",
+]
+
+[[modules]]
+name = "portable::stats"
+lines = [
+  "use super::*;",
+]
+items = [
+  "impl KmsBackend::fn telemetry",
+  "impl KmsBackend::fn submit_target_kind",
+  "impl KmsBackend::fn trace_simple",
+  "impl KmsBackend::fn trace_render",
+  "impl KmsBackend::fn picture_src_class",
+  "impl KmsBackend::fn picture_src_class_by_xid",
+  "impl KmsBackend::fn drain_paint_submit_telemetry",
+  "impl KmsBackend::fn drain_render_telemetry",
+  "impl KmsBackend::fn drain_frame_builder_telemetry",
+  "impl KmsBackend::fn descriptor_pool_ring_pool_count",
+  "impl KmsBackend::fn drawable_view_cache_len",
+  "impl KmsBackend::fn sync_descriptor_pool_telemetry",
+  "impl KmsBackend::fn log_render_gap",
+]
+
+[[modules]]
+name = "portable::dump"
+lines = [
+  "use super::*;",
+]
+items = [
+  "fn dump_cursor_record_to_ppm",
+  "fn picture_pict_format",
+  "fn do_dump_drawables",
+  "fn write_drawable_ppm",
+]
+
+[[modules]]
+name = "kms"
+lines = [
+  "use super::*;",
+  "pub(super) use scanout::*;",
+  "pub(super) use readback::*;",
+  "pub(super) use crtc_config::*;",
+  "pub(super) use randr::*;",
+  "pub(super) use present::*;",
+  "pub(super) use export::*;",
+  "pub(super) use session::*;",
+]
+items = []
+
+[[modules]]
+name = "kms::scanout"
+lines = [
+  "use super::*;",
+]
+items = [
+  "fn scanout_m2_is_authoritative_root",
+  "fn scanout_direct_eligible",
+  "fn direct_shape_chain_covers_root",
+  "fn direct_frame_slot_on_output",
+  "fn phase_b_flip_in_flight_for_scheduler",
+  "fn scanout_m1_probe_eligible",
+  "fn classify_scanout_m0_coverage",
+  "fn scanout_m1_outputs_cover_root",
+  "impl KmsBackend::fn handle_cursor_move_outcome",
+  "impl KmsBackend::fn direct_frames_are_under_cow",
+  "impl KmsBackend::fn request_direct_unflip",
+  "impl KmsBackend::fn direct_frame_references_host_drawable",
+  "impl KmsBackend::fn finish_cow_release",
+  "impl KmsBackend::fn finish_deferred_cow_release",
+  "impl KmsBackend::fn bind_direct_cursor_on_all_outputs",
+  "impl KmsBackend::fn refresh_direct_cursor_on_all_outputs",
+  "impl KmsBackend::fn pin_present_wake_for_direct",
+  "impl KmsBackend::fn pin_direct_source",
+  "impl KmsBackend::fn retain_direct_present_wake",
+  "impl KmsBackend::fn submit_direct_frame",
+  "impl KmsBackend::fn submit_queued_direct_successor",
+  "impl KmsBackend::fn release_direct_frame",
+  "impl KmsBackend::fn defer_direct_successor_skip",
+  "impl KmsBackend::fn queue_direct_successor",
+  "impl KmsBackend::fn stop_direct_after_scanout_replaced",
+  "impl KmsBackend::fn relight_after_direct_teardown",
+  "impl KmsBackend::fn teardown_direct_before_topology_requery",
+  "impl KmsBackend::fn direct_scanout_frame_for_output",
+  "impl KmsBackend::fn materialize_direct_shadow_for_unflip",
+  "impl KmsBackend::fn submit_composed_unflip",
+  "impl KmsBackend::fn retire_direct_output",
+  "impl KmsBackend::fn direct_scanout_topology_eligible",
+  "impl KmsBackend::fn direct_present_crtc_eligible",
+  "impl KmsBackend::fn maybe_probe_scanout_m1",
+  "impl KmsBackend::fn scanout_m0_target",
+  "impl KmsBackend::fn direct_shape_chain_covers_root",
+  "impl KmsBackend::fn direct_frames_shaped_off_root",
+  "impl KmsBackend::fn unredirected_direct_scene_eligible",
+  "impl KmsBackend::fn observe_scanout_m0",
+  "impl KmsBackend::fn scanout_allowed",
+  "impl KmsBackend::fn scene_wants_compose",
+]
+
+[[modules]]
+name = "kms::readback"
+lines = [
+  "use super::*;",
+]
+items = [
+  "impl KmsBackend::fn try_copy_area_root_scanout",
+  "impl KmsBackend::fn fresh_root_readback",
+  "impl KmsBackend::fn prime_transformed_root_reads",
+  "impl KmsBackend::fn read_root_scanout_assembled",
+  "fn scanout_selection_phases",
+  "fn direct_scanout_route_for_rect",
+  "fn select_scanout_read_route",
+  "fn split_root_scanout_reads",
+  "fn assemble_root_scanout",
+  "fn read_scanout_region",
+  "fn read_scanout_region_named",
+  "fn ensure_scanout_readback_op",
+  "fn ensure_scanout_readback",
+  "fn do_dump_scanout",
+]
+
+[[modules]]
+name = "kms::crtc_config"
+lines = [
+  "use super::*;",
+]
+items = [
+  "fn kms_outputs_active_after_crtc_config",
+  "impl KmsBackend::fn pending_pageflip_crtcs",
+  "impl KmsBackend::fn quiesce_before_topology_mutation",
+  "impl KmsBackend::fn recover_failed_crtc_config",
+  "impl KmsBackend::fn scanout_m1_topology_signature",
+  "impl KmsBackend::fn crtc_config_topology_signature",
+  "impl KmsBackend::fn bump_crtc_config_topology_epoch",
+  "impl KmsBackend::fn wake_crtc_config_ready",
+  "impl KmsBackend::fn remove_crtc_config_ready_announcement",
+  "impl KmsBackend::fn next_crtc_config_token",
+  "impl KmsBackend::fn crtc_enable_needs_async_qualification",
+  "impl KmsBackend::fn enqueue_prepared_crtc_config_probe",
+  "impl KmsBackend::fn discover_crtc_config_output",
+  "impl KmsBackend::fn stale_crtc_config_probe_reason",
+  "impl KmsBackend::fn set_crtc_config_probe_executor",
+]
+
+[[modules]]
+name = "kms::randr"
+lines = [
+  "use super::*;",
+]
+items = [
+  "fn reconcile_connector_probe",
+  "fn mode_timing",
+  "fn effective_refresh_matches",
+  "fn restore_primary_output_after_rebuild",
+  "impl KmsBackend::fn fb_dimensions",
+  "impl KmsBackend::fn initial_pointer_position",
+  "impl KmsBackend::fn seed_initial_connector_topology",
+  "impl KmsBackend::fn seed_connector_topology_from_probes",
+  "impl KmsBackend::fn reconcile_connector_registry",
+  "impl KmsBackend::fn publish_connector_probes",
+  "impl KmsBackend::fn randr_outputs",
+  "impl KmsBackend::fn selected_render_provider_endpoint",
+  "impl KmsBackend::fn current_provider_endpoint_for_id",
+  "impl KmsBackend::fn provider_output_source_allows",
+  "impl KmsBackend::fn initialize_provider_output_sources",
+  "impl KmsBackend::fn randr_provider_endpoints",
+  "impl KmsBackend::fn reserve_randr_provider_ids",
+  "impl KmsBackend::fn kms_provider_name",
+  "impl KmsBackend::fn render_provider_name",
+  "impl KmsBackend::fn randr_providers",
+  "impl KmsBackend::fn randr_outputs_and_modes",
+  "impl KmsBackend::fn rebuild_randr_state",
+  "impl KmsBackend::fn fire_randr_changes",
+  "impl KmsBackend::fn apply_virtual_screen_extent",
+  "impl KmsBackend::fn root_storage_extent",
+  "impl KmsBackend::fn reserved_layout_slots",
+  "impl KmsBackend::fn take_relight_requests",
+  "impl KmsBackend::fn relight_remembered_route",
+  "impl KmsBackend::fn commit_relit_route",
+  "impl KmsBackend::fn run_display_rescan",
+  "impl KmsBackend::fn live_crtc_and_gamma_size",
+  "impl KmsBackend::fn nominal_gamma_size",
+  "impl KmsBackend::fn cached_gamma",
+  "impl KmsBackend::fn cached_gamma_for_current_size",
+  "impl KmsBackend::fn apply_gamma_to_live_output",
+  "impl KmsBackend::fn reapply_gamma_for_output",
+  "impl KmsBackend::fn reapply_gamma_for_live_outputs",
+]
+
+[[modules]]
+name = "kms::present"
+lines = [
+  "use super::*;",
+]
+items = [
+  "fn absolute_seq_user_data",
+  "impl KmsBackend::fn take_shutdown_present_events",
+  "impl KmsBackend::fn shutdown_destroy_drawables",
+  "impl KmsBackend::fn signal_all_retained_present_wakes",
+  "impl KmsBackend::fn fire_pending_present_entry",
+  "impl KmsBackend::fn poke_present_completion_wakeup",
+  "impl KmsBackend::fn register_pending_present_batch",
+  "impl KmsBackend::fn drain_engine_present_batches",
+  "impl KmsBackend::fn pending_present_batch_ready",
+  "impl KmsBackend::fn unregister_present_batch_fd",
+  "impl KmsBackend::fn force_drain_all_present_batches",
+  "impl KmsBackend::fn drain_completed_present_events_impl",
+  "impl KmsBackend::fn present_flip_in_flight_for_output",
+  "impl KmsBackend::fn present_completion_is_idle_for",
+  "impl KmsBackend::fn clear_all_armed_vblank_targets",
+  "impl KmsBackend::fn prune_armed_targets_to_live_outputs",
+  "impl KmsBackend::fn on_crtc_sequence_event",
+  "impl KmsBackend::fn arm_idle_vblanks_with",
+  "impl KmsBackend::fn arm_present_absolute_vblank_with",
+  "impl KmsBackend::fn arm_idle_vblanks_ioctl",
+  "impl KmsBackend::fn present_crtc_output",
+  "impl KmsBackend::fn present_crtc_key",
+  "impl KmsBackend::fn refresh_present_crtc_clock_epochs",
+]
+
+[[modules]]
+name = "kms::export"
+lines = [
+  "use super::*;",
+]
+items = [
+  "fn glx_vendor_names_for_driver",
+  "fn probe_dmabuf_export_support",
+  "impl KmsBackend::fn ensure_exported_entry",
+  "impl KmsBackend::fn export_holder_rows",
+  "impl KmsBackend::fn acquire_glx_pixmap_export",
+  "impl KmsBackend::fn release_glx_pixmap_export",
+  "impl KmsBackend::fn maybe_teardown_export",
+  "impl KmsBackend::fn promote_pixmap_exportable",
+  "impl KmsBackend::fn has_export_entry",
+  "fn dri3_version_for",
+  "fn dri3_import_supported_for_topology",
+]
+
+[[modules]]
+name = "kms::session"
+lines = [
+  "use super::*;",
+]
+items = [
+  "fn try_acquire_master_bounded",
+  "impl KmsBackend::fn open",
+  "impl KmsBackend::fn open_with_commit",
+  "impl KmsBackend::fn arm_direct_vt_switching",
+  "impl KmsBackend::fn take_input_ctx",
+  "impl KmsBackend::fn vt_switching_armed",
+  "impl KmsBackend::fn set_input_thread_control",
+  "impl KmsBackend::fn pause_input_thread",
+  "impl KmsBackend::fn resume_input_thread",
+  "impl KmsBackend::fn update_input_extent",
+  "impl KmsBackend::fn composite_and_flip",
+  "impl KmsBackend::fn disable_output",
+  "impl KmsBackend::fn run_suspend",
+  "impl KmsBackend::fn run_resume",
+  "impl KmsBackend::fn request_exit",
+  "impl KmsBackend::fn drive_vt_event",
+]
+
+[[modules]]
+name = "for_tests"
+lines = [
+  "use super::*;",
+]
+items = [
+  "impl KmsBackend::fn get_image_pixels_for_tests",
+  "impl KmsBackend::fn backing_pixels_for_tests",
+  "impl KmsBackend::fn scene_participant_places_for_tests",
+  "impl KmsBackend::fn scene_draw_rects_for_tests",
+  "impl KmsBackend::fn map_window_for_tests",
+  "impl KmsBackend::fn unmap_window_for_tests",
+  "impl KmsBackend::fn storage_extent_for_tests",
+  "impl KmsBackend::fn paint_target_shape_for_tests",
+  "impl KmsBackend::fn fill_backing_rect_for_tests",
+  "impl KmsBackend::fn cursor_record_bgra_for_tests",
+  "impl KmsBackend::fn for_tests_with_vk",
+  "impl KmsBackend::fn for_tests_with_vk_live_scene",
+  "impl KmsBackend::fn test_alias_registry_get",
+  "impl KmsBackend::fn test_host_window_to_backing",
+  "impl KmsBackend::fn test_peek_presentation_damage_nonempty",
+  "impl KmsBackend::fn test_storage_views",
+  "impl KmsBackend::fn test_vk_arc",
+  "impl KmsBackend::fn promote_and_export_pixmap_for_tests",
+  "impl KmsBackend::fn test_set_redirected_target",
+  "impl KmsBackend::fn for_tests",
+  "impl KmsBackend::fn for_tests_seed",
+  "impl KmsBackend::fn drain_frame_builder_telemetry_for_tests",
+  "impl KmsBackend::fn for_tests_poll_retired",
+  "impl KmsBackend::fn pending_present_events_len_for_tests",
+  "impl KmsBackend::fn drain_completed_present_events_for_tests",
+  "impl KmsBackend::fn set_renderer_failed_for_tests",
+  "impl KmsBackend::fn engine_flush_submit_group_for_tests",
+  "impl KmsBackend::fn engine_pending_group_ops_count_for_tests",
+  "impl KmsBackend::fn engine_most_recent_submitted_op_scratch_len_for_tests",
+  "impl KmsBackend::fn engine_create_clip_snapshot_for_tests",
+  "impl KmsBackend::fn engine_clip_snapshot_extent_for_tests",
+  "impl KmsBackend::fn engine_retire_clip_snapshot_for_tests",
+  "impl KmsBackend::fn engine_clip_snapshot_layout_for_tests",
+  "impl KmsBackend::fn engine_clip_snapshot_has_ticket_for_tests",
+  "impl KmsBackend::fn engine_clip_snapshot_version_for_tests",
+  "impl KmsBackend::fn masked_copy_area_with_snapshot_for_tests",
+  "impl KmsBackend::fn engine_refresh_clip_snapshot_for_tests",
+  "impl KmsBackend::fn allocate_test_pixmap_bgra",
+  "impl KmsBackend::fn drawable_content_version_for_tests",
+  "impl KmsBackend::fn render_composite_empty_for_tests",
+  "impl KmsBackend::fn render_composite_for_tests",
+  "impl KmsBackend::fn render_fill_rectangles_for_tests",
+  "impl KmsBackend::fn drawable_current_layout_for_tests",
+  "impl KmsBackend::fn frame_builder_peek_render_composite_dst_old_layouts_for_tests",
+  "impl KmsBackend::fn frame_builder_is_open_for_tests",
+  "impl KmsBackend::fn frame_builder_lifetime_closes_for_tests",
+  "impl KmsBackend::fn tick_maybe_composite_for_tests",
+  "impl KmsBackend::fn engine_frame_seq_for_tests",
+  "impl KmsBackend::fn engine_acquire_generation_set_for_tests",
+  "impl KmsBackend::fn engine_open_frame_for_paint_for_tests",
+  "impl KmsBackend::fn engine_open_frame_generation_for_tests",
+  "impl KmsBackend::fn engine_acquire_descriptor_set_for_frame_or_op_for_tests",
+  "impl KmsBackend::fn engine_create_test_descriptor_set_layout_for_tests",
+  "impl KmsBackend::fn engine_destroy_descriptor_set_layout_for_tests",
+  "impl KmsBackend::fn descriptor_pool_ring_high_water_generation_for_tests",
+  "impl KmsBackend::fn engine_close_open_frame_for_timeout_for_tests",
+  "impl KmsBackend::fn platform_queue_submit_count_for_tests",
+  "impl KmsBackend::fn force_next_frame_record_failure_for_tests",
+  "impl KmsBackend::fn platform_submit_group_size_for_tests",
+  "impl KmsBackend::fn platform_submit_group_is_open_for_tests",
+  "impl KmsBackend::fn platform_submit_group_set_max_size_for_tests",
+  "impl KmsBackend::fn platform_submit_group_max_size_for_tests",
+  "impl KmsBackend::fn platform_force_next_submit_failure_for_tests",
+  "impl KmsBackend::fn platform_renderer_failed_for_tests",
+  "impl KmsBackend::fn engine_pending_count_for_tests",
+  "impl KmsBackend::fn engine_fill_rect_is_renderer_failed_for_tests",
+  "impl KmsBackend::fn store_drawable_exists_for_tests",
+  "impl KmsBackend::fn export_holders_report_for_tests",
+  "impl KmsBackend::fn simulate_page_flip_complete_for_tests",
+  "impl KmsBackend::fn simulate_scene_page_flip_complete_for_tests",
+  "impl KmsBackend::fn platform_queue_submit2_count_for_tests",
+  "impl KmsBackend::fn telemetry_submit_group_flushes_for_tests",
+  "impl KmsBackend::fn telemetry_close_reason_non_ported_for_tests",
+  "impl KmsBackend::fn telemetry_close_reason_sync_wait_for_tests",
+  "impl KmsBackend::fn engine_copy_area_for_tests",
+  "impl KmsBackend::fn engine_cow_copy_area_for_tests",
+  "impl KmsBackend::fn engine_put_image_for_tests",
+  "impl KmsBackend::fn engine_fill_rect_batch_for_tests",
+  "impl KmsBackend::fn engine_logic_fill_for_tests",
+  "impl KmsBackend::fn engine_image_text_for_tests",
+  "impl KmsBackend::fn attach_synthetic_present_completion_for_tests",
+  "impl KmsBackend::fn engine_render_traps_or_tris_for_tests",
+  "impl KmsBackend::fn engine_build_linear_gradient_for_tests",
+  "impl KmsBackend::fn engine_picture_paint_remove_for_tests",
+  "impl KmsBackend::fn engine_render_traps_or_tris_gradient_for_tests",
+  "impl KmsBackend::fn telemetry_close_reason_scratch_grow_for_tests",
+  "impl KmsBackend::fn attach_synthetic_present_completion_to_cow_for_tests",
+  "impl KmsBackend::fn engine_drain_all_for_tests",
+  "impl KmsBackend::fn masked_copy_area_for_tests",
+  "impl KmsBackend::fn inject_seat_event_for_test",
+]
+
+[[modules]]
+name = "trait_impl"
+lines = [
+  "use super::*;",
+]
+items = [
+  "impl Backend for KmsBackend",
+]
+
