@@ -1,4 +1,4 @@
-# Phase 2 (2.11a) PROPOSAL / DRY RUN for kms/render/backend.rs: production
+# Phase 2 (2.11a) for kms/render/backend.rs (executed 2026-10-09): production
 # items move into descendant modules of kms::render::backend (log targets
 # keep the old prefix), split along the portable-render vs KMS seam:
 # backend/portable/<topic>.rs, backend/kms/<topic>.rs, backend/for_tests.rs
@@ -7,7 +7,8 @@
 # which is step 2.11b). backend.rs keeps the imports, every type (private
 # fields stay readable from all children), the small helper-type impls and
 # the test module declarations. Inherent `impl KmsBackend` members are
-# spread per topic. Needs a prep commit first: 32 relative `super::` paths
+# spread per topic; cursor goes to kms/cursor.rs (mostly cursor-plane;
+# jos decision 4). Needs a prep commit first: 32 relative `super::` paths
 # (engine/store/target/platform/probe_executor/super::super::vk) qualified
 # to `crate::kms::…` so they mean the same module from a child.
 source = "crates/yserver/src/kms/render/backend.rs"
@@ -506,32 +507,6 @@ items = [
 ]
 
 [[modules]]
-name = "portable::cursor"
-lines = [
-  "use super::*;",
-]
-items = [
-  "impl KmsBackend::fn init_cursor_sprite",
-  "impl KmsBackend::fn xorg_root_cursor",
-  "impl KmsBackend::fn insert_cursor_record",
-  "impl KmsBackend::fn insert_monochrome_cursor_record",
-  "impl KmsBackend::fn allocate_cursor_sprite_pixmap",
-  "impl KmsBackend::fn read_cursor_depth1_pixmap",
-  "impl KmsBackend::fn read_cursor_bgra_pixmap",
-  "impl KmsBackend::fn render_glyph_for_cursor",
-  "impl KmsBackend::fn effective_cursor_walking_chain",
-  "impl KmsBackend::fn refresh_effective_cursor",
-  "impl KmsBackend::fn cursor_referenced",
-  "impl KmsBackend::fn collect_released_cursors",
-  "impl KmsBackend::fn apply_cursor_hidden",
-  "impl KmsBackend::fn sync_cursor_animation",
-  "impl KmsBackend::fn tick_cursor_animation",
-  "impl KmsBackend::fn cursor_anim_deadline",
-  "impl KmsBackend::fn swap_anim_frame_into_maps",
-  "impl KmsBackend::fn display_cursor_by_handle",
-]
-
-[[modules]]
 name = "portable::render_ops"
 lines = [
   "use super::*;",
@@ -997,6 +972,32 @@ items = [
   "impl KmsBackend::fn run_resume",
   "impl KmsBackend::fn request_exit",
   "impl KmsBackend::fn drive_vt_event",
+]
+
+[[modules]]
+name = "kms::cursor"
+lines = [
+  "use super::*;",
+]
+items = [
+  "impl KmsBackend::fn init_cursor_sprite",
+  "impl KmsBackend::fn xorg_root_cursor",
+  "impl KmsBackend::fn insert_cursor_record",
+  "impl KmsBackend::fn insert_monochrome_cursor_record",
+  "impl KmsBackend::fn allocate_cursor_sprite_pixmap",
+  "impl KmsBackend::fn read_cursor_depth1_pixmap",
+  "impl KmsBackend::fn read_cursor_bgra_pixmap",
+  "impl KmsBackend::fn render_glyph_for_cursor",
+  "impl KmsBackend::fn effective_cursor_walking_chain",
+  "impl KmsBackend::fn refresh_effective_cursor",
+  "impl KmsBackend::fn cursor_referenced",
+  "impl KmsBackend::fn collect_released_cursors",
+  "impl KmsBackend::fn apply_cursor_hidden",
+  "impl KmsBackend::fn sync_cursor_animation",
+  "impl KmsBackend::fn tick_cursor_animation",
+  "impl KmsBackend::fn cursor_anim_deadline",
+  "impl KmsBackend::fn swap_anim_frame_into_maps",
+  "impl KmsBackend::fn display_cursor_by_handle",
 ]
 
 [[modules]]
