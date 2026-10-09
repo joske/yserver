@@ -350,8 +350,8 @@ fn coalescing_counts(classes: impl IntoIterator<Item = CoalesceClass>) -> Coales
     c
 }
 
-fn classify_recorded_op(op: &super::frame_builder::RecordedOp) -> CoalesceClass {
-    use super::frame_builder::RecordedOp;
+fn classify_recorded_op(op: &crate::kms::render::frame_builder::RecordedOp) -> CoalesceClass {
+    use crate::kms::render::frame_builder::RecordedOp;
     match op {
         RecordedOp::RenderComposite(rc) => {
             let self_samples = rc.src_view == rc.dst_view || rc.mask_view == rc.dst_view;
@@ -455,7 +455,7 @@ fn session_step(open_dst: Option<DrawableId>, class: &CoalesceClass) -> SessionS
     }
 }
 
-fn record_frame_coalescing_stats(ops: &[super::frame_builder::RecordedOp]) {
+fn record_frame_coalescing_stats(ops: &[crate::kms::render::frame_builder::RecordedOp]) {
     let c = coalescing_counts(ops.iter().map(classify_recorded_op));
     if c.pass_ops > 0 {
         use std::sync::atomic::Ordering::Relaxed;
@@ -1206,7 +1206,7 @@ struct RenderEngineInner {
     /// upload staging are bump-allocated from. A frame's blocks come back
     /// only from the `pending_frames` retire walk, once the frame's fence
     /// has signalled. See [`RenderEngineInner::upload_to_frame`].
-    upload_arena: super::upload_arena::UploadArena<StagingBuffer>,
+    upload_arena: crate::kms::render::upload_arena::UploadArena<StagingBuffer>,
     /// Offset alignment of glyph-atlas upload sources in the upload arena,
     /// from [`upload_copy_align`].
     upload_copy_align: u64,
@@ -1315,7 +1315,7 @@ struct RenderEngineInner {
     /// by `try_vk_render_composite` + `try_vk_render_traps_or_tris`.
     /// Replaces per-call descriptor-pool instantiation. Spec
     /// `2026-05-21-descriptor-pool-ring-design.md`.
-    descriptor_pool_ring: super::descriptor_pool_ring::DescriptorPoolRing,
+    descriptor_pool_ring: crate::kms::render::descriptor_pool_ring::DescriptorPoolRing,
     /// Stage 5 Task 4 layer 1: monotonic generation tag. Bumped on
     /// every paint-op submission; used as the watermark for ring
     /// pool recycling. The current value is passed to `acquire_set`
@@ -1354,17 +1354,18 @@ struct RenderEngineInner {
     pending_group_ops: Vec<SubmittedOp>,
     /// Phase A: FlushOutcome records produced by flush_submit_group.
     /// Drained by the backend telemetry path (Task 3.5).
-    pending_flush_outcomes: Vec<super::platform::FlushOutcome>,
+    pending_flush_outcomes: Vec<crate::kms::render::platform::FlushOutcome>,
     /// Phase B.1: in-flight frames awaiting retirement. Parallel to
     /// `submitted`; both gate on the same `FenceTicket`s when the
     /// frame builder is in play. Walked by `poll_retired` and
     /// `drain_all`.
-    pending_frames: std::collections::VecDeque<super::frame_builder::FrameSubmittedRecord>,
+    pending_frames:
+        std::collections::VecDeque<crate::kms::render::frame_builder::FrameSubmittedRecord>,
     /// Phase B.1: telemetry events from close paths. Drained by the
     /// backend via `RenderEngine::drain_frame_close_events()`. Task 21
     /// wires the consumer side. Bounded at 1024 to prevent unbounded
     /// growth if maybe_composite stops ticking.
-    pending_frame_close_events: Vec<super::frame_builder::FrameCloseEvent>,
+    pending_frame_close_events: Vec<crate::kms::render::frame_builder::FrameCloseEvent>,
     /// Phase B.1: monotonic frame sequence for telemetry attribution.
     /// Bumped on every `FrameBuilder::close_into_cb` success.
     frame_seq: u64,
@@ -1373,7 +1374,7 @@ struct RenderEngineInner {
     /// paint op (composite_glyphs in B.1) appends. Embedded so the
     /// engine can drive open/close from its existing paint entry
     /// points (Tasks 12-20 wire the transitions).
-    frame_builder: super::frame_builder::FrameBuilder,
+    frame_builder: crate::kms::render::frame_builder::FrameBuilder,
     /// Phase B.1 close trigger 4: cached timeout duration. Read once
     /// at engine construction from YSERVER_FRAME_BUILDER_TIMEOUT_MS
     /// (default 16 ms). Hot-path check in maybe_composite.
@@ -1458,8 +1459,8 @@ impl RenderEngineInner {
         data: &[u8],
         align: u64,
         churn: crate::kms::vk::mem_accounting::ChurnClass,
-    ) -> Result<super::frame_builder::PinnedUploadIdx, vk::Result> {
-        use super::upload_arena::{BlockKind, Placement};
+    ) -> Result<crate::kms::render::frame_builder::PinnedUploadIdx, vk::Result> {
+        use crate::kms::render::upload_arena::{BlockKind, Placement};
         let vk = Arc::clone(&self.vk);
         let open = self
             .frame_builder
@@ -1496,7 +1497,7 @@ impl RenderEngineInner {
                 data.len(),
             );
         }
-        let slice = super::frame_builder::UploadSlice {
+        let slice = crate::kms::render::frame_builder::UploadSlice {
             buffer: block.buffer,
             offset: sub.offset,
         };
@@ -1844,10 +1845,10 @@ impl RenderEngine {
     fn trace_frame_ops(
         store: &DrawableStore,
         frame_seq: u64,
-        ops: &[super::frame_builder::RecordedOp],
+        ops: &[crate::kms::render::frame_builder::RecordedOp],
         filter: FrameBuilderTraceFilter,
     ) {
-        use super::frame_builder::{RecordedOp, RecordedTrapSrcKind};
+        use crate::kms::render::frame_builder::{RecordedOp, RecordedTrapSrcKind};
 
         let hits = ops
             .iter()
@@ -1984,13 +1985,13 @@ impl RenderEngine {
         };
         let upload_copy_align = upload_copy_align(limits.optimal_buffer_copy_offset_alignment);
         let descriptor_pool_ring =
-            super::descriptor_pool_ring::DescriptorPoolRing::new(Arc::clone(&vk));
+            crate::kms::render::descriptor_pool_ring::DescriptorPoolRing::new(Arc::clone(&vk));
         Ok(Self {
             inner: Some(RenderEngineInner {
                 vk,
                 submitted: VecDeque::new(),
                 staging_pool: StagingPool::default(),
-                upload_arena: super::upload_arena::UploadArena::default(),
+                upload_arena: crate::kms::render::upload_arena::UploadArena::default(),
                 upload_copy_align,
                 picture_paint: HashMap::new(),
                 glyph_atlas: None,
@@ -2018,9 +2019,9 @@ impl RenderEngine {
                 pending_frames: std::collections::VecDeque::new(),
                 pending_frame_close_events: Vec::new(),
                 frame_seq: 0,
-                frame_builder: super::frame_builder::FrameBuilder::new(),
+                frame_builder: crate::kms::render::frame_builder::FrameBuilder::new(),
                 frame_builder_timeout:
-                    super::frame_builder::FrameBuilder::timeout_from_env_default_16ms(),
+                    crate::kms::render::frame_builder::FrameBuilder::timeout_from_env_default_16ms(),
                 retired_promoted_images: Vec::new(),
                 clip_snapshots: HashMap::new(),
                 next_snapshot_id: 1,
@@ -2347,9 +2348,11 @@ impl RenderEngine {
     /// Test call sites that construct a fresh engine/platform/store
     /// and never open a frame can keep using `drain_all` directly.
     pub(crate) fn shutdown(&mut self, store: &mut DrawableStore, platform: &mut PlatformBackend) {
-        if let Err(e) =
-            self.close_open_frame(store, platform, super::frame_builder::CloseReason::Shutdown)
-        {
+        if let Err(e) = self.close_open_frame(
+            store,
+            platform,
+            crate::kms::render::frame_builder::CloseReason::Shutdown,
+        ) {
             log::warn!("render shutdown: close_open_frame failed: {e:?}");
         }
         self.drain_all(platform);
@@ -2392,7 +2395,8 @@ impl RenderEngine {
         // re-publishing write fences here is pointless. The engine's
         // commit-of-parked-ops bookkeeping below is replicated from the
         // `flush_submit_group` wrapper.
-        let result = platform.flush_submit_group(super::submit_group::FlushReason::Shutdown);
+        let result =
+            platform.flush_submit_group(crate::kms::render::submit_group::FlushReason::Shutdown);
         if let Some(outcome) = platform.take_last_flush_outcome()
             && let Some(inner) = self.inner.as_mut()
         {
@@ -2507,8 +2511,8 @@ impl RenderEngine {
         &mut self,
         store: &mut DrawableStore,
         platform: &mut PlatformBackend,
-        reason: super::submit_group::FlushReason,
-    ) -> Result<super::platform::FlushOutcome, vk::Result> {
+        reason: crate::kms::render::submit_group::FlushReason,
+    ) -> Result<crate::kms::render::platform::FlushOutcome, vk::Result> {
         // GLX-TFP (Task 2.3): drain the exported drawables written since
         // the last flush; the platform waits on / publishes their dma-buf
         // implicit-sync fences around this submit. `Arc<OwnedFd>` clones
@@ -2573,8 +2577,12 @@ impl RenderEngine {
         platform: &mut PlatformBackend,
     ) -> Result<(), RenderError> {
         if platform.submit_group_size() >= platform.submit_group_max_size() {
-            self.flush_submit_group(store, platform, super::submit_group::FlushReason::MaxSize)
-                .map_err(RenderError::Vk)?;
+            self.flush_submit_group(
+                store,
+                platform,
+                crate::kms::render::submit_group::FlushReason::MaxSize,
+            )
+            .map_err(RenderError::Vk)?;
         }
         Ok(())
     }
@@ -2583,7 +2591,7 @@ impl RenderEngine {
     /// Returns empty when no events queued (or when engine is stubbed).
     pub(crate) fn drain_frame_close_events(
         &mut self,
-    ) -> Vec<super::frame_builder::FrameCloseEvent> {
+    ) -> Vec<crate::kms::render::frame_builder::FrameCloseEvent> {
         self.inner
             .as_mut()
             .map(|i| std::mem::take(&mut i.pending_frame_close_events))
@@ -2603,15 +2611,15 @@ impl RenderEngine {
         &mut self,
         store: &mut DrawableStore,
         platform: &mut PlatformBackend,
-        reason: super::frame_builder::CloseReason,
-    ) -> Result<super::frame_builder::CloseOutcome, RenderError> {
+        reason: crate::kms::render::frame_builder::CloseReason,
+    ) -> Result<crate::kms::render::frame_builder::CloseOutcome, RenderError> {
         // Take the open frame from the FrameBuilder.
         let (mut open_frame, frame_seq) = {
             let Some(inner) = self.inner.as_mut() else {
-                return Ok(super::frame_builder::CloseOutcome::AlreadyClosed);
+                return Ok(crate::kms::render::frame_builder::CloseOutcome::AlreadyClosed);
             };
             let Some(open_frame_box) = inner.frame_builder.take_open_for_close(reason) else {
-                return Ok(super::frame_builder::CloseOutcome::AlreadyClosed);
+                return Ok(crate::kms::render::frame_builder::CloseOutcome::AlreadyClosed);
             };
             inner.frame_seq = inner.frame_seq.wrapping_add(1);
             (*open_frame_box, inner.frame_seq)
@@ -2636,7 +2644,12 @@ impl RenderEngine {
             open_frame
                 .ops
                 .iter()
-                .filter(|op| matches!(op, super::frame_builder::RecordedOp::RenderComposite(_)))
+                .filter(|op| {
+                    matches!(
+                        op,
+                        crate::kms::render::frame_builder::RecordedOp::RenderComposite(_)
+                    )
+                })
                 .count(),
         )
         .unwrap_or(u32::MAX);
@@ -2679,7 +2692,7 @@ impl RenderEngine {
                     }
                     if inner_post.pending_frame_close_events.len() < 1024 {
                         inner_post.pending_frame_close_events.push(
-                            super::frame_builder::FrameCloseEvent {
+                            crate::kms::render::frame_builder::FrameCloseEvent {
                                 reason,
                                 ops_in_frame: open_frame.ops.len(),
                                 glyph_uploads_in_frame: open_frame.glyph_uploads_in_frame,
@@ -2793,16 +2806,16 @@ impl RenderEngine {
                 r.release(&inner_post.vk);
             }
             if inner_post.pending_frame_close_events.len() < 1024 {
-                inner_post
-                    .pending_frame_close_events
-                    .push(super::frame_builder::FrameCloseEvent {
+                inner_post.pending_frame_close_events.push(
+                    crate::kms::render::frame_builder::FrameCloseEvent {
                         reason,
                         ops_in_frame: open_frame.ops.len(),
                         glyph_uploads_in_frame: open_frame.glyph_uploads_in_frame,
                         renders_in_frame,
                         pin_count: open_frame.pins.len(),
                         aborted: true,
-                    });
+                    },
+                );
             }
             inner_post.frame_builder.complete_close_failure();
             return Err(e);
@@ -2868,16 +2881,16 @@ impl RenderEngine {
                 r.release(&inner_post.vk);
             }
             if inner_post.pending_frame_close_events.len() < 1024 {
-                inner_post
-                    .pending_frame_close_events
-                    .push(super::frame_builder::FrameCloseEvent {
+                inner_post.pending_frame_close_events.push(
+                    crate::kms::render::frame_builder::FrameCloseEvent {
                         reason,
                         ops_in_frame: open_frame.ops.len(),
                         glyph_uploads_in_frame: open_frame.glyph_uploads_in_frame,
                         renders_in_frame,
                         pin_count: open_frame.pins.len(),
                         aborted: true,
-                    });
+                    },
+                );
             }
             inner_post.frame_builder.complete_close_failure();
             // completion_signal drops with the local — submit never
@@ -2896,7 +2909,9 @@ impl RenderEngine {
             .ops
             .iter_mut()
             .filter_map(|op| match op {
-                super::frame_builder::RecordedOp::CopyArea(ca) => ca.self_overlap_scratch.take(),
+                crate::kms::render::frame_builder::RecordedOp::CopyArea(ca) => {
+                    ca.self_overlap_scratch.take()
+                }
                 _ => None,
             })
             .collect();
@@ -2906,7 +2921,7 @@ impl RenderEngine {
             .ops
             .iter_mut()
             .filter_map(|op| match op {
-                super::frame_builder::RecordedOp::MaskedCopyArea(m) => {
+                crate::kms::render::frame_builder::RecordedOp::MaskedCopyArea(m) => {
                     m.self_overlap_scratch.take()
                 }
                 _ => None,
@@ -2941,7 +2956,7 @@ impl RenderEngine {
         let flush_outcome = self.flush_submit_group(
             store,
             platform,
-            super::submit_group::FlushReason::FrameBuilder,
+            crate::kms::render::submit_group::FlushReason::FrameBuilder,
         );
 
         match flush_outcome {
@@ -2958,7 +2973,7 @@ impl RenderEngine {
                     // we queued on the submit. The batch keeps the signal
                     // alive until the fd fires.
                     let mut drained_completions: Vec<
-                        super::present_completion::PendingPresentEntry,
+                        crate::kms::render::present_completion::PendingPresentEntry,
                     > = std::mem::take(&mut open_frame.pending_present_completions);
                     if !drained_completions.is_empty() {
                         let (wait, signal) = match completion_signal {
@@ -3003,8 +3018,8 @@ impl RenderEngine {
                     // open_frame at the end of this function while the GPU CB
                     // is still in flight.
                     for op in &open_frame.ops {
-                        if let super::frame_builder::RecordedOp::RenderTrapsOrTris(rt) = op
-                            && let super::frame_builder::RecordedTrapSrcKind::Gradient {
+                        if let crate::kms::render::frame_builder::RecordedOp::RenderTrapsOrTris(rt) = op
+                            && let crate::kms::render::frame_builder::RecordedTrapSrcKind::Gradient {
                                 ref picture,
                                 ..
                             } = rt.src_kind
@@ -3013,13 +3028,13 @@ impl RenderEngine {
                                 as Box<dyn crate::kms::render::batch_resource::BatchResource>);
                         }
                     }
-                    inner
-                        .pending_frames
-                        .push_back(super::frame_builder::FrameSubmittedRecord {
+                    inner.pending_frames.push_back(
+                        crate::kms::render::frame_builder::FrameSubmittedRecord {
                             ticket: frame_ticket.clone(),
                             pins: std::mem::take(&mut open_frame.pins),
                             frame_seq,
-                        });
+                        },
+                    );
                     commit_close_success(
                         inner,
                         store,
@@ -3030,7 +3045,7 @@ impl RenderEngine {
                     );
                     if inner.pending_frame_close_events.len() < 1024 {
                         inner.pending_frame_close_events.push(
-                            super::frame_builder::FrameCloseEvent {
+                            crate::kms::render::frame_builder::FrameCloseEvent {
                                 reason,
                                 ops_in_frame: op_count,
                                 glyph_uploads_in_frame: glyph_uploads,
@@ -3042,7 +3057,7 @@ impl RenderEngine {
                     }
                     inner.frame_builder.complete_close_success();
                 }
-                Ok(super::frame_builder::CloseOutcome::Submitted {
+                Ok(crate::kms::render::frame_builder::CloseOutcome::Submitted {
                     frame_seq,
                     op_count,
                     pin_count,
@@ -3066,8 +3081,9 @@ impl RenderEngine {
                 // of submit success (Pitfall 8). The completion_signal drops with
                 // the local; the failed submit never queued a signal-op so the fd
                 // would never fire anyway.
-                let drained_completions: Vec<super::present_completion::PendingPresentEntry> =
-                    std::mem::take(&mut open_frame.pending_present_completions);
+                let drained_completions: Vec<
+                    crate::kms::render::present_completion::PendingPresentEntry,
+                > = std::mem::take(&mut open_frame.pending_present_completions);
                 if !drained_completions.is_empty() {
                     inner.pending_present_batches.push(PendingPresentBatch {
                         wait: PresentBatchWait::Ready,
@@ -3085,16 +3101,16 @@ impl RenderEngine {
                     r.release(&inner.vk);
                 }
                 if inner.pending_frame_close_events.len() < 1024 {
-                    inner
-                        .pending_frame_close_events
-                        .push(super::frame_builder::FrameCloseEvent {
+                    inner.pending_frame_close_events.push(
+                        crate::kms::render::frame_builder::FrameCloseEvent {
                             reason,
                             ops_in_frame,
                             glyph_uploads_in_frame,
                             renders_in_frame,
                             pin_count,
                             aborted: true,
-                        });
+                        },
+                    );
                 }
                 inner.frame_builder.complete_close_failure();
                 Err(RenderError::Vk(e))
@@ -3133,10 +3149,10 @@ impl RenderEngine {
         match self.close_open_frame(
             store,
             platform,
-            super::frame_builder::CloseReason::NonPortedPaintOp,
+            crate::kms::render::frame_builder::CloseReason::NonPortedPaintOp,
         )? {
-            super::frame_builder::CloseOutcome::Submitted { .. }
-            | super::frame_builder::CloseOutcome::AlreadyClosed => Ok(()),
+            crate::kms::render::frame_builder::CloseOutcome::Submitted { .. }
+            | crate::kms::render::frame_builder::CloseOutcome::AlreadyClosed => Ok(()),
         }
     }
 
@@ -3156,9 +3172,13 @@ impl RenderEngine {
         if !timed_out {
             return Ok(());
         }
-        match self.close_open_frame(store, platform, super::frame_builder::CloseReason::Timeout)? {
-            super::frame_builder::CloseOutcome::Submitted { .. }
-            | super::frame_builder::CloseOutcome::AlreadyClosed => Ok(()),
+        match self.close_open_frame(
+            store,
+            platform,
+            crate::kms::render::frame_builder::CloseReason::Timeout,
+        )? {
+            crate::kms::render::frame_builder::CloseOutcome::Submitted { .. }
+            | crate::kms::render::frame_builder::CloseOutcome::AlreadyClosed => Ok(()),
         }
     }
 
@@ -3232,7 +3252,9 @@ impl RenderEngine {
         open.ops
             .iter()
             .filter_map(|op| match op {
-                super::frame_builder::RecordedOp::RenderComposite(rc) => Some(rc.dst_old_layout),
+                crate::kms::render::frame_builder::RecordedOp::RenderComposite(rc) => {
+                    Some(rc.dst_old_layout)
+                }
                 _ => None,
             })
             .collect()
@@ -3386,16 +3408,22 @@ impl RenderEngine {
         {
             return Ok(());
         }
-        match self.close_open_frame(store, platform, super::frame_builder::CloseReason::Timeout)? {
-            super::frame_builder::CloseOutcome::Submitted { .. }
-            | super::frame_builder::CloseOutcome::AlreadyClosed => Ok(()),
+        match self.close_open_frame(
+            store,
+            platform,
+            crate::kms::render::frame_builder::CloseReason::Timeout,
+        )? {
+            crate::kms::render::frame_builder::CloseOutcome::Submitted { .. }
+            | crate::kms::render::frame_builder::CloseOutcome::AlreadyClosed => Ok(()),
         }
     }
 
     /// Phase A Task 3.5: drain all queued `FlushOutcome` records
     /// accumulated since the last drain. Backend calls this once
     /// per `maybe_composite` tick to route outcomes to telemetry.
-    pub(crate) fn drain_flush_outcomes(&mut self) -> Vec<super::platform::FlushOutcome> {
+    pub(crate) fn drain_flush_outcomes(
+        &mut self,
+    ) -> Vec<crate::kms::render::platform::FlushOutcome> {
         self.inner
             .as_mut()
             .map(|i| std::mem::take(&mut i.pending_flush_outcomes))
@@ -3460,7 +3488,7 @@ impl RenderEngine {
         store
             .allocate(
                 xid,
-                super::store::DrawableKind::Pixmap,
+                crate::kms::render::store::DrawableKind::Pixmap,
                 depth,
                 false,
                 storage,
@@ -3599,7 +3627,7 @@ impl RenderEngine {
         open.pins.adopt_retired(Box::new(gradient.clone())
             as Box<dyn crate::kms::render::batch_resource::BatchResource>);
         open.gradient_inits
-            .push(super::frame_builder::RecordedGradientInit {
+            .push(crate::kms::render::frame_builder::RecordedGradientInit {
                 picture: gradient.clone(),
                 upload_pin,
             });
@@ -3902,11 +3930,15 @@ impl RenderEngine {
         // `get_image`'s SyncWait close before its readback). After this,
         // `last_render_ticket` names the newest in-flight ticket that
         // touched the drawable.
-        self.close_open_frame(store, platform, super::frame_builder::CloseReason::SyncWait)?;
+        self.close_open_frame(
+            store,
+            platform,
+            crate::kms::render::frame_builder::CloseReason::SyncWait,
+        )?;
         self.flush_submit_group(
             store,
             platform,
-            super::submit_group::FlushReason::SyncBoundary,
+            crate::kms::render::submit_group::FlushReason::SyncBoundary,
         )?;
 
         // Metadata read (post-close: current_layout reflects any
@@ -4199,7 +4231,7 @@ impl RenderEngine {
 
         // Phase B.3 (N4): ONE RecordedFillRect per call carrying the entire
         // clamped rect slice. Splitting per-rect would be new behavior.
-        let payload = Box::new(super::frame_builder::RecordedFillRect {
+        let payload = Box::new(crate::kms::render::frame_builder::RecordedFillRect {
             dst_id: target,
             dst_image_view: image_view,
             dst_extent: extent,
@@ -4211,7 +4243,7 @@ impl RenderEngine {
         {
             let open = inner.frame_builder.open.as_mut().expect("open");
             open.push_op_and_set_layouts(
-                super::frame_builder::RecordedOp::FillRect(payload),
+                crate::kms::render::frame_builder::RecordedOp::FillRect(payload),
                 &[(target, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)],
             );
         }
@@ -4448,7 +4480,7 @@ impl RenderEngine {
         }
 
         // Build RecordedLogicFill payload and append to the open frame.
-        let payload = Box::new(super::frame_builder::RecordedLogicFill {
+        let payload = Box::new(crate::kms::render::frame_builder::RecordedLogicFill {
             dst_id: target,
             dst_image_view: image_view,
             dst_extent: extent,
@@ -4462,7 +4494,7 @@ impl RenderEngine {
         {
             let open = inner.frame_builder.open.as_mut().expect("open");
             open.push_op_and_set_layouts(
-                super::frame_builder::RecordedOp::LogicFill(payload),
+                crate::kms::render::frame_builder::RecordedOp::LogicFill(payload),
                 &[(target, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)],
             );
         }
@@ -4617,7 +4649,7 @@ impl RenderEngine {
         // Phase B.3 (N1 + N8): append the op + set BOTH dst and src overlays
         // to SHADER_READ_ONLY_OPTIMAL (single-terminal-layout rule). For
         // self-overlap (src == dst), only one entry needed (idempotent).
-        let payload = Box::new(super::frame_builder::RecordedCopyArea {
+        let payload = Box::new(crate::kms::render::frame_builder::RecordedCopyArea {
             dst_id: dst,
             src_id: src,
             src_rect,
@@ -4642,7 +4674,7 @@ impl RenderEngine {
         {
             let open = inner.frame_builder.open.as_mut().expect("open");
             open.push_op_and_set_layouts(
-                super::frame_builder::RecordedOp::CopyArea(payload),
+                crate::kms::render::frame_builder::RecordedOp::CopyArea(payload),
                 layout_updates,
             );
         }
@@ -4838,7 +4870,7 @@ impl RenderEngine {
 
         // Build the op + set BOTH dst and src overlays to SHADER_READ (single-
         // terminal-layout rule). For self-overlap, one entry (idempotent).
-        let payload = Box::new(super::frame_builder::RecordedMaskedCopyArea {
+        let payload = Box::new(crate::kms::render::frame_builder::RecordedMaskedCopyArea {
             dst_id: dst,
             src_id: src,
             dst_format,
@@ -4881,7 +4913,7 @@ impl RenderEngine {
         {
             let open = inner.frame_builder.open.as_mut().expect("open");
             open.push_op_and_set_layouts(
-                super::frame_builder::RecordedOp::MaskedCopyArea(payload),
+                crate::kms::render::frame_builder::RecordedOp::MaskedCopyArea(payload),
                 layout_updates,
             );
         }
@@ -5004,19 +5036,21 @@ impl RenderEngine {
         snapshot_first_touch(inner, id);
 
         // Append the standalone refresh op + set the live-mask terminal overlay.
-        let payload = Box::new(super::frame_builder::RecordedClipSnapshotRefresh {
-            snapshot_id: id,
-            snapshot_image: snap_image,
-            snapshot_old_layout: snap_old,
-            live_mask_id,
-            live_mask_image: live_image,
-            live_mask_old_layout: lm_pre,
-            copy_extent,
-        });
+        let payload = Box::new(
+            crate::kms::render::frame_builder::RecordedClipSnapshotRefresh {
+                snapshot_id: id,
+                snapshot_image: snap_image,
+                snapshot_old_layout: snap_old,
+                live_mask_id,
+                live_mask_image: live_image,
+                live_mask_old_layout: lm_pre,
+                copy_extent,
+            },
+        );
         {
             let open = inner.frame_builder.open.as_mut().expect("open");
             open.push_op_and_set_layouts(
-                super::frame_builder::RecordedOp::ClipSnapshotRefresh(payload),
+                crate::kms::render::frame_builder::RecordedOp::ClipSnapshotRefresh(payload),
                 &[(live_mask_id, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)],
             );
         }
@@ -5809,7 +5843,7 @@ impl RenderEngine {
 
         // Phase B.3 (N1): push the op and set the terminal layout
         // SHADER_READ_ONLY_OPTIMAL for the dst.
-        let payload = Box::new(super::frame_builder::RecordedPutImage {
+        let payload = Box::new(crate::kms::render::frame_builder::RecordedPutImage {
             dst_id: target,
             dst_rect,
             dst_image,
@@ -5820,7 +5854,7 @@ impl RenderEngine {
         {
             let open = inner.frame_builder.open.as_mut().expect("open");
             open.push_op_and_set_layouts(
-                super::frame_builder::RecordedOp::PutImage(payload),
+                crate::kms::render::frame_builder::RecordedOp::PutImage(payload),
                 &[(target, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)],
             );
         }
@@ -5874,7 +5908,11 @@ impl RenderEngine {
         // readback's ticket.wait(). The frame's CB must submit before the
         // readback CB records; without this, the readback would race the
         // deferred frame.
-        self.close_open_frame(store, platform, super::frame_builder::CloseReason::SyncWait)?;
+        self.close_open_frame(
+            store,
+            platform,
+            crate::kms::render::frame_builder::CloseReason::SyncWait,
+        )?;
         let t_after_close = std::time::Instant::now();
         // Phase A: drain any buffered paint group BEFORE allocating the
         // readback CB. This ensures prior paint ops are queued/submitted
@@ -5886,7 +5924,7 @@ impl RenderEngine {
         self.flush_submit_group(
             store,
             platform,
-            super::submit_group::FlushReason::SyncBoundary,
+            crate::kms::render::submit_group::FlushReason::SyncBoundary,
         )
         .map_err(RenderError::Vk)?;
         let t_after_flush1 = std::time::Instant::now();
@@ -5991,7 +6029,7 @@ impl RenderEngine {
         self.flush_submit_group(
             store,
             platform,
-            super::submit_group::FlushReason::SyncBoundary,
+            crate::kms::render::submit_group::FlushReason::SyncBoundary,
         )
         .map_err(RenderError::Vk)?;
         let t_after_flush2 = std::time::Instant::now();
@@ -6266,7 +6304,7 @@ impl RenderEngine {
             let atlas_pre_layout: vk::ImageLayout = inner
                 .glyph_atlas
                 .as_ref()
-                .map(super::glyph_atlas::GlyphAtlas::current_layout)
+                .map(crate::kms::render::glyph_atlas::GlyphAtlas::current_layout)
                 .unwrap_or(vk::ImageLayout::UNDEFINED);
             let open = inner.frame_builder.open.as_mut().expect("open");
             if open.atlas_prev_ticket_snapshot.is_none() {
@@ -6287,10 +6325,13 @@ impl RenderEngine {
             .map(|o| o.pins.len())
             .unwrap_or(0);
 
-        let mut glyphs_to_draw: Vec<super::frame_builder::RecordedTextGlyph> =
+        let mut glyphs_to_draw: Vec<crate::kms::render::frame_builder::RecordedTextGlyph> =
             Vec::with_capacity(rendered.len());
-        let mut new_uploads: Vec<(GlyphKey, AtlasEntry, super::frame_builder::PinnedUploadIdx)> =
-            Vec::new();
+        let mut new_uploads: Vec<(
+            GlyphKey,
+            AtlasEntry,
+            crate::kms::render::frame_builder::PinnedUploadIdx,
+        )> = Vec::new();
         let mut new_zero_inserts: Vec<(GlyphKey, AtlasEntry)> = Vec::new();
         let mut damage_min_x = i32::MAX;
         let mut damage_min_y = i32::MAX;
@@ -6426,7 +6467,7 @@ impl RenderEngine {
             let max_y = g.dst_y.saturating_add(entry.h as i32);
             damage_max_x = damage_max_x.max(max_x);
             damage_max_y = damage_max_y.max(max_y);
-            glyphs_to_draw.push(super::frame_builder::RecordedTextGlyph {
+            glyphs_to_draw.push(crate::kms::render::frame_builder::RecordedTextGlyph {
                 atlas_x: entry.atlas_x,
                 atlas_y: entry.atlas_y,
                 logical_w: entry.logical_w,
@@ -6441,17 +6482,18 @@ impl RenderEngine {
         {
             let open = inner.frame_builder.open.as_mut().expect("open");
             for (key, entry, upload_pin) in new_uploads.drain(..) {
-                open.ops.push(super::frame_builder::RecordedOp::GlyphUpload(
-                    super::frame_builder::RecordedGlyphUpload {
-                        upload_pin,
-                        atlas_x: entry.atlas_x,
-                        atlas_y: entry.atlas_y,
-                        packed_w: entry.packed_w,
-                        h: entry.h,
-                        insert_key: key,
-                        insert_entry: entry,
-                    },
-                ));
+                open.ops
+                    .push(crate::kms::render::frame_builder::RecordedOp::GlyphUpload(
+                        crate::kms::render::frame_builder::RecordedGlyphUpload {
+                            upload_pin,
+                            atlas_x: entry.atlas_x,
+                            atlas_y: entry.atlas_y,
+                            packed_w: entry.packed_w,
+                            h: entry.h,
+                            insert_key: key,
+                            insert_entry: entry,
+                        },
+                    ));
                 open.pending_glyph_inserts.push(key, entry);
                 open.glyph_uploads_in_frame = open.glyph_uploads_in_frame.saturating_add(1);
             }
@@ -6527,8 +6569,8 @@ impl RenderEngine {
         {
             let open = inner.frame_builder.open.as_mut().expect("open");
             open.push_op_and_set_layouts(
-                super::frame_builder::RecordedOp::ImageText(Box::new(
-                    super::frame_builder::RecordedImageText {
+                crate::kms::render::frame_builder::RecordedOp::ImageText(Box::new(
+                    crate::kms::render::frame_builder::RecordedImageText {
                         dst_id: target,
                         dst_extent: target_extent,
                         // #133 step 3 (P4): core text carries no picture
@@ -6565,7 +6607,7 @@ impl RenderEngine {
         self.close_open_frame(
             store,
             platform,
-            super::frame_builder::CloseReason::GlyphAtlasFull,
+            crate::kms::render::frame_builder::CloseReason::GlyphAtlasFull,
         )?;
         if let Some(atlas) = self.inner.as_mut().and_then(|i| i.glyph_atlas.as_mut()) {
             atlas.reset();
@@ -6793,7 +6835,9 @@ impl RenderEngine {
                 component_alpha_supported,
             ) {
                 GlyphLayout::A8 => g.w,
-                GlyphLayout::ComponentAlpha => g.w.saturating_mul(super::glyph_pixels::PLANES),
+                GlyphLayout::ComponentAlpha => {
+                    g.w.saturating_mul(crate::kms::render::glyph_pixels::PLANES)
+                }
             };
             (
                 GlyphKey {
@@ -6863,7 +6907,7 @@ impl RenderEngine {
             let atlas_pre_layout: vk::ImageLayout = inner
                 .glyph_atlas
                 .as_ref()
-                .map(super::glyph_atlas::GlyphAtlas::current_layout)
+                .map(crate::kms::render::glyph_atlas::GlyphAtlas::current_layout)
                 .unwrap_or(vk::ImageLayout::UNDEFINED);
             let open = inner.frame_builder.open.as_mut().expect("open");
             if open.atlas_prev_ticket_snapshot.is_none() {
@@ -6941,7 +6985,7 @@ impl RenderEngine {
             self.close_open_frame(
                 store,
                 platform,
-                super::frame_builder::CloseReason::PinCeiling,
+                crate::kms::render::frame_builder::CloseReason::PinCeiling,
             )?;
             // Re-open a fresh frame. Phase B.2 Mechanism 2: bump
             // acquire_generation at open and capture the value on
@@ -6965,7 +7009,7 @@ impl RenderEngine {
             let atlas_pre_layout_reopened = inner
                 .glyph_atlas
                 .as_ref()
-                .map(super::glyph_atlas::GlyphAtlas::current_layout)
+                .map(crate::kms::render::glyph_atlas::GlyphAtlas::current_layout)
                 .unwrap_or(vk::ImageLayout::UNDEFINED);
             let atlas_pre_ticket_reopened = inner
                 .glyph_atlas
@@ -7014,10 +7058,13 @@ impl RenderEngine {
         //      atlas, (b) pending_glyph_inserts in the open frame,
         //      (c) new_uploads already collected in this walk. Stop
         //      allocating once the ceiling is hit (drop excess glyphs).
-        let mut glyphs_to_draw: Vec<super::frame_builder::RecordedTextGlyph> =
+        let mut glyphs_to_draw: Vec<crate::kms::render::frame_builder::RecordedTextGlyph> =
             Vec::with_capacity(glyphs.len());
-        let mut new_uploads: Vec<(GlyphKey, AtlasEntry, super::frame_builder::PinnedUploadIdx)> =
-            Vec::new();
+        let mut new_uploads: Vec<(
+            GlyphKey,
+            AtlasEntry,
+            crate::kms::render::frame_builder::PinnedUploadIdx,
+        )> = Vec::new();
         let mut new_zero_inserts: Vec<(GlyphKey, AtlasEntry)> = Vec::new();
         let mut damage_min_x = i32::MAX;
         let mut damage_min_y = i32::MAX;
@@ -7113,7 +7160,9 @@ impl RenderEngine {
                 // its own planes (design invariant 9).
                 let packed_w = match layout {
                     GlyphLayout::A8 => g.w,
-                    GlyphLayout::ComponentAlpha => g.w.saturating_mul(super::glyph_pixels::PLANES),
+                    GlyphLayout::ComponentAlpha => {
+                        g.w.saturating_mul(crate::kms::render::glyph_pixels::PLANES)
+                    }
                 };
                 let Some((atlas_x, atlas_y)) = inner
                     .glyph_atlas
@@ -7167,7 +7216,7 @@ impl RenderEngine {
             let max_y = g.dst_y.saturating_add(entry.h as i32);
             damage_max_x = damage_max_x.max(max_x);
             damage_max_y = damage_max_y.max(max_y);
-            glyphs_to_draw.push(super::frame_builder::RecordedTextGlyph {
+            glyphs_to_draw.push(crate::kms::render::frame_builder::RecordedTextGlyph {
                 atlas_x: entry.atlas_x,
                 atlas_y: entry.atlas_y,
                 logical_w: entry.logical_w,
@@ -7193,17 +7242,18 @@ impl RenderEngine {
         {
             let open = inner.frame_builder.open.as_mut().expect("open");
             for (key, entry, upload_pin) in new_uploads.drain(..) {
-                open.ops.push(super::frame_builder::RecordedOp::GlyphUpload(
-                    super::frame_builder::RecordedGlyphUpload {
-                        upload_pin,
-                        atlas_x: entry.atlas_x,
-                        atlas_y: entry.atlas_y,
-                        packed_w: entry.packed_w,
-                        h: entry.h,
-                        insert_key: key,
-                        insert_entry: entry,
-                    },
-                ));
+                open.ops
+                    .push(crate::kms::render::frame_builder::RecordedOp::GlyphUpload(
+                        crate::kms::render::frame_builder::RecordedGlyphUpload {
+                            upload_pin,
+                            atlas_x: entry.atlas_x,
+                            atlas_y: entry.atlas_y,
+                            packed_w: entry.packed_w,
+                            h: entry.h,
+                            insert_key: key,
+                            insert_entry: entry,
+                        },
+                    ));
                 open.pending_glyph_inserts.push(key, entry);
                 open.glyph_uploads_in_frame = open.glyph_uploads_in_frame.saturating_add(1);
             }
@@ -7356,7 +7406,7 @@ impl RenderEngine {
     /// the component-alpha path needs are unavailable without it. So
     /// where it is absent, an ARGB32 glyph is REDUCED to one
     /// grayscale coverage plane at upload
-    /// ([`reduce_argb32_glyph_to_a8_coverage`](super::glyph_pixels::reduce_argb32_glyph_to_a8_coverage))
+    /// ([`reduce_argb32_glyph_to_a8_coverage`](crate::kms::render::glyph_pixels::reduce_argb32_glyph_to_a8_coverage))
     /// and is genuinely an A8 entry in the atlas — which is exactly
     /// the grayscale AA `vk/device.rs` already promises there.
     ///
@@ -7428,9 +7478,9 @@ impl RenderEngine {
     /// worst case is its normal case. Real clients switch glyphset
     /// per font or AA change, so the common case stays one run.
     fn split_glyph_runs(
-        glyphs: &[super::frame_builder::RecordedTextGlyph],
-    ) -> Vec<&[super::frame_builder::RecordedTextGlyph]> {
-        let mut runs: Vec<&[super::frame_builder::RecordedTextGlyph]> = Vec::new();
+        glyphs: &[crate::kms::render::frame_builder::RecordedTextGlyph],
+    ) -> Vec<&[crate::kms::render::frame_builder::RecordedTextGlyph]> {
+        let mut runs: Vec<&[crate::kms::render::frame_builder::RecordedTextGlyph]> = Vec::new();
         let mut start = 0usize;
         for i in 1..glyphs.len() {
             if glyphs[i].layout != glyphs[i - 1].layout {
@@ -7482,7 +7532,7 @@ impl RenderEngine {
     /// `Vk(...)` if the staging buffer cannot be allocated.
     fn record_glyph_runs(
         inner: &mut RenderEngineInner,
-        runs: &[&[super::frame_builder::RecordedTextGlyph]],
+        runs: &[&[crate::kms::render::frame_builder::RecordedTextGlyph]],
         common: &GlyphRunCommon,
     ) -> Result<u32, RenderError> {
         type Instance = crate::kms::vk::text_pipeline::GlyphInstanceData;
@@ -7558,8 +7608,8 @@ impl RenderEngine {
                 vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
             };
             open.push_op_and_set_layouts(
-                super::frame_builder::RecordedOp::CompositeGlyphs(
-                    super::frame_builder::RecordedCompositeGlyphs {
+                crate::kms::render::frame_builder::RecordedOp::CompositeGlyphs(
+                    crate::kms::render::frame_builder::RecordedCompositeGlyphs {
                         dst_id: common.dst_id,
                         dst_old_layout,
                         op: common.op,
@@ -7677,7 +7727,7 @@ impl RenderEngine {
             self.close_open_frame(
                 store,
                 platform,
-                super::frame_builder::CloseReason::RedirectSourceBoundary,
+                crate::kms::render::frame_builder::CloseReason::RedirectSourceBoundary,
             )?;
         }
         let stats = self.render_composite_via_frame_builder(
@@ -7702,7 +7752,7 @@ impl RenderEngine {
             self.close_open_frame(
                 store,
                 platform,
-                super::frame_builder::CloseReason::RedirectSourceBoundary,
+                crate::kms::render::frame_builder::CloseReason::RedirectSourceBoundary,
             )?;
         }
         Ok(stats)
@@ -7856,7 +7906,7 @@ impl RenderEngine {
             self.close_open_frame(
                 store,
                 platform,
-                super::frame_builder::CloseReason::ScratchGrow,
+                crate::kms::render::frame_builder::CloseReason::ScratchGrow,
             )?;
         }
 
@@ -8355,7 +8405,7 @@ impl RenderEngine {
         //      transition will leave dst at (SHADER_READ_ONLY_OPTIMAL).
         //      No intermediate COLOR_ATTACHMENT_OPTIMAL write — that's
         //      an in-CB transient never observable across ops.
-        let recorded = super::frame_builder::RecordedRenderComposite {
+        let recorded = crate::kms::render::frame_builder::RecordedRenderComposite {
             op,
             dst_id,
             dst_image,
@@ -8385,7 +8435,7 @@ impl RenderEngine {
             let inner = self.inner.as_mut().expect("inner");
             let open = inner.frame_builder.open.as_mut().expect("just opened");
             open.push_op_and_set_layouts(
-                super::frame_builder::RecordedOp::RenderComposite(Box::new(recorded)),
+                crate::kms::render::frame_builder::RecordedOp::RenderComposite(Box::new(recorded)),
                 &[(dst_id, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)],
             );
         }
@@ -8619,7 +8669,7 @@ impl RenderEngine {
             self.close_open_frame(
                 store,
                 platform,
-                super::frame_builder::CloseReason::ScratchGrow,
+                crate::kms::render::frame_builder::CloseReason::ScratchGrow,
             )?;
         }
         if need_grow_mask {
@@ -8663,7 +8713,7 @@ impl RenderEngine {
                 self.close_open_frame(
                     store,
                     platform,
-                    super::frame_builder::CloseReason::ScratchGrow,
+                    crate::kms::render::frame_builder::CloseReason::ScratchGrow,
                 )?;
             }
             if need_grow_rb {
@@ -8700,14 +8750,14 @@ impl RenderEngine {
                     // origin travels with the recorded source so the
                     // composite stage samples the window's content, not
                     // its border ring. `(0, 0)` for pixmaps / bw == 0.
-                    super::frame_builder::RecordedTrapSrcKind::Drawable {
+                    crate::kms::render::frame_builder::RecordedTrapSrcKind::Drawable {
                         id,
                         swizzle_class,
                         sample_offset: sd.offset(),
                     }
                 }
                 ResolvedSource::Solid(color) => {
-                    super::frame_builder::RecordedTrapSrcKind::Solid(color)
+                    crate::kms::render::frame_builder::RecordedTrapSrcKind::Solid(color)
                 }
                 ResolvedSource::Gradient(xid) => match inner.picture_paint.get(&xid) {
                     Some(PicturePaintState::Gradient(g)) => {
@@ -8717,7 +8767,7 @@ impl RenderEngine {
                         // survives until the GPU fence fires.
                         let picture = g.clone();
                         let intrinsic_axis_projection = picture.axis_projection();
-                        super::frame_builder::RecordedTrapSrcKind::Gradient {
+                        crate::kms::render::frame_builder::RecordedTrapSrcKind::Gradient {
                             picture,
                             intrinsic_axis_projection,
                         }
@@ -8739,7 +8789,7 @@ impl RenderEngine {
 
         // src_extent: needed for CompositeAttrs at emit time.
         let src_extent = match &src_kind {
-            super::frame_builder::RecordedTrapSrcKind::Drawable { id, .. } => {
+            crate::kms::render::frame_builder::RecordedTrapSrcKind::Drawable { id, .. } => {
                 drawable_for_render_view(store, *id)
                     .map(|info| info.extent)
                     .unwrap_or(vk::Extent2D {
@@ -8747,18 +8797,20 @@ impl RenderEngine {
                         height: 1,
                     })
             }
-            super::frame_builder::RecordedTrapSrcKind::Solid(_) => vk::Extent2D {
+            crate::kms::render::frame_builder::RecordedTrapSrcKind::Solid(_) => vk::Extent2D {
                 width: 1,
                 height: 1,
             },
-            super::frame_builder::RecordedTrapSrcKind::Gradient { picture, .. } => {
+            crate::kms::render::frame_builder::RecordedTrapSrcKind::Gradient {
+                picture, ..
+            } => {
                 // B.3 hotfix 2: extent is on the Arc clone; no HashMap lookup.
                 picture.extent()
             }
         };
         let src_is_synthetic_1x1 = matches!(
             src_kind,
-            super::frame_builder::RecordedTrapSrcKind::Solid(_)
+            crate::kms::render::frame_builder::RecordedTrapSrcKind::Solid(_)
         );
 
         // src_repeat: pre-resolve via repeat_to_shader_const.
@@ -8879,7 +8931,10 @@ impl RenderEngine {
 
         // src (only when Drawable): SAME three mutations on the src DrawableId.
         // Skipping these is a lifetime bug per codex round-9 CRITICAL.
-        if let super::frame_builder::RecordedTrapSrcKind::Drawable { id: src_id, .. } = src_kind {
+        if let crate::kms::render::frame_builder::RecordedTrapSrcKind::Drawable {
+            id: src_id, ..
+        } = src_kind
+        {
             let prior_src_ticket = store.get(src_id).and_then(|d| d.last_render_ticket.clone());
             let src_pre_layout = {
                 let inner = self.inner.as_ref().expect("inner");
@@ -8912,42 +8967,46 @@ impl RenderEngine {
         // Step 12: push_op_and_set_layouts. layouts_to_set includes
         // (dst, SHADER_READ_ONLY_OPTIMAL) always, AND (src, SHADER_READ_ONLY_OPTIMAL)
         // when src is Drawable.
-        let payload = Box::new(super::frame_builder::RecordedRenderTrapsOrTris {
-            dst_id,
-            dst_image,
-            dst_view,
-            dst_old_layout: dst_pre_layout,
-            dst_extent,
-            dst_format,
-            dst_has_alpha,
-            std_op,
-            op_byte: op,
-            src_kind,
-            src_extent,
-            src_is_synthetic_1x1,
-            src_repeat: src_repeat_const,
-            src_force_opaque,
-            user_src_xform,
-            src_origin_x,
-            src_origin_y,
-            prim_kind,
-            bbox_x,
-            bbox_y,
-            bbox_w,
-            bbox_h,
-            instance_count,
-            clip_scissors,
-            vertex_pin,
-        });
+        let payload = Box::new(
+            crate::kms::render::frame_builder::RecordedRenderTrapsOrTris {
+                dst_id,
+                dst_image,
+                dst_view,
+                dst_old_layout: dst_pre_layout,
+                dst_extent,
+                dst_format,
+                dst_has_alpha,
+                std_op,
+                op_byte: op,
+                src_kind,
+                src_extent,
+                src_is_synthetic_1x1,
+                src_repeat: src_repeat_const,
+                src_force_opaque,
+                user_src_xform,
+                src_origin_x,
+                src_origin_y,
+                prim_kind,
+                bbox_x,
+                bbox_y,
+                bbox_w,
+                bbox_h,
+                instance_count,
+                clip_scissors,
+                vertex_pin,
+            },
+        );
         {
             let inner = self.inner.as_mut().expect("inner");
             let open = inner.frame_builder.open.as_mut().expect("just opened");
             // Build the layouts_to_set slice. dst always; src when Drawable.
-            if let super::frame_builder::RecordedTrapSrcKind::Drawable { id: src_id, .. } =
-                payload.src_kind
+            if let crate::kms::render::frame_builder::RecordedTrapSrcKind::Drawable {
+                id: src_id,
+                ..
+            } = payload.src_kind
             {
                 open.push_op_and_set_layouts(
-                    super::frame_builder::RecordedOp::RenderTrapsOrTris(payload),
+                    crate::kms::render::frame_builder::RecordedOp::RenderTrapsOrTris(payload),
                     &[
                         (dst_id, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
                         (src_id, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
@@ -8955,7 +9014,7 @@ impl RenderEngine {
                 );
             } else {
                 open.push_op_and_set_layouts(
-                    super::frame_builder::RecordedOp::RenderTrapsOrTris(payload),
+                    crate::kms::render::frame_builder::RecordedOp::RenderTrapsOrTris(payload),
                     &[(dst_id, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)],
                 );
             }
@@ -9845,11 +9904,11 @@ fn emit_recorded_op_into_cb(
     inner: &mut RenderEngineInner,
     store: &mut DrawableStore,
     cb: vk::CommandBuffer,
-    pins: &super::frame_builder::FramePinSet,
+    pins: &crate::kms::render::frame_builder::FramePinSet,
     frame_generation: u64,
-    op: &super::frame_builder::RecordedOp,
+    op: &crate::kms::render::frame_builder::RecordedOp,
 ) -> Result<(), RenderError> {
-    use super::frame_builder::RecordedOp as Op;
+    use crate::kms::render::frame_builder::RecordedOp as Op;
     match op {
         Op::GlyphUpload(up) => {
             let atlas = inner.glyph_atlas.as_mut().ok_or(RenderError::NoVk)?;
@@ -9967,8 +10026,8 @@ fn emit_recorded_op_into_cb(
 fn emit_recorded_render_composite_into_cb(
     inner: &mut RenderEngineInner,
     cb: vk::CommandBuffer,
-    _pins: &super::frame_builder::FramePinSet,
-    rc: &super::frame_builder::RecordedRenderComposite,
+    _pins: &crate::kms::render::frame_builder::FramePinSet,
+    rc: &crate::kms::render::frame_builder::RecordedRenderComposite,
 ) -> Result<(), RenderError> {
     use crate::kms::vk::{
         ops::render as vk_render,
@@ -10159,7 +10218,7 @@ fn emit_recorded_render_composite_into_cb(
 fn emit_recorded_copy_area_into_cb(
     inner: &mut RenderEngineInner,
     cb: vk::CommandBuffer,
-    ca: &super::frame_builder::RecordedCopyArea,
+    ca: &crate::kms::render::frame_builder::RecordedCopyArea,
 ) -> Result<(), RenderError> {
     let device = &inner.vk.device;
     if let Some(scratch) = ca.self_overlap_scratch.as_ref() {
@@ -10369,7 +10428,7 @@ fn emit_recorded_masked_copyarea_into_cb(
     inner: &mut RenderEngineInner,
     cb: vk::CommandBuffer,
     generation: u64,
-    m: &super::frame_builder::RecordedMaskedCopyArea,
+    m: &crate::kms::render::frame_builder::RecordedMaskedCopyArea,
 ) -> Result<(), RenderError> {
     let device = inner.vk.device.clone();
 
@@ -10618,7 +10677,7 @@ fn emit_recorded_masked_copyarea_into_cb(
 fn emit_recorded_clip_snapshot_refresh_into_cb(
     inner: &mut RenderEngineInner,
     cb: vk::CommandBuffer,
-    r: &super::frame_builder::RecordedClipSnapshotRefresh,
+    r: &crate::kms::render::frame_builder::RecordedClipSnapshotRefresh,
 ) -> Result<(), RenderError> {
     let device = inner.vk.device.clone();
     // live → TRANSFER_SRC.
@@ -10706,8 +10765,8 @@ fn emit_recorded_clip_snapshot_refresh_into_cb(
 fn emit_recorded_put_image_into_cb(
     inner: &mut RenderEngineInner,
     cb: vk::CommandBuffer,
-    pins: &super::frame_builder::FramePinSet,
-    pi: &super::frame_builder::RecordedPutImage,
+    pins: &crate::kms::render::frame_builder::FramePinSet,
+    pi: &crate::kms::render::frame_builder::RecordedPutImage,
 ) -> Result<(), RenderError> {
     let device = &inner.vk.device;
     // N1 put_image pre-barrier (DST only — staging buffers have no layout).
@@ -10871,7 +10930,7 @@ fn emit_recorded_fill_rect_into_cb(
     inner: &mut RenderEngineInner,
     store: &DrawableStore,
     cb: vk::CommandBuffer,
-    fr: &super::frame_builder::RecordedFillRect,
+    fr: &crate::kms::render::frame_builder::RecordedFillRect,
 ) -> Result<(), RenderError> {
     // Clone the Vk handle owner so the helper calls don't alias
     // `&inner.vk` against `&mut inner`.
@@ -10928,7 +10987,7 @@ const SESSION_SRC_ACCESS: vk::AccessFlags2 = vk::AccessFlags2::from_raw(
 fn emit_fill_draws(
     vk: &VkContext,
     cb: vk::CommandBuffer,
-    fr: &super::frame_builder::RecordedFillRect,
+    fr: &crate::kms::render::frame_builder::RecordedFillRect,
 ) {
     let render_area = vk::Rect2D {
         offset: vk::Offset2D::default(),
@@ -10970,7 +11029,7 @@ fn emit_recorded_logic_fill_into_cb(
     inner: &mut RenderEngineInner,
     store: &DrawableStore,
     cb: vk::CommandBuffer,
-    lf: &super::frame_builder::RecordedLogicFill,
+    lf: &crate::kms::render::frame_builder::RecordedLogicFill,
 ) -> Result<(), RenderError> {
     // Clone the Vk handle owner so the helper calls don't alias
     // `&inner.vk` against the `&mut inner.logic_fill_caches` borrow.
@@ -11024,7 +11083,7 @@ fn emit_logic_fill_draws(
     cb: vk::CommandBuffer,
     pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
-    lf: &super::frame_builder::RecordedLogicFill,
+    lf: &crate::kms::render::frame_builder::RecordedLogicFill,
 ) {
     use crate::kms::vk::logic_fill_pipeline::LogicFillPushConsts;
     #[allow(clippy::cast_precision_loss)]
@@ -11071,7 +11130,7 @@ fn emit_composite_draws(
     inner: &mut RenderEngineInner,
     vk: &VkContext,
     cb: vk::CommandBuffer,
-    rc: &super::frame_builder::RecordedRenderComposite,
+    rc: &crate::kms::render::frame_builder::RecordedRenderComposite,
 ) -> Result<(), RenderError> {
     use crate::kms::vk::{ops::render as vk_render, render_pipeline::StdPictOp};
 
@@ -11170,10 +11229,10 @@ fn emit_session_open_and_draws(
     store: &DrawableStore,
     vk: &VkContext,
     cb: vk::CommandBuffer,
-    op: &super::frame_builder::RecordedOp,
+    op: &crate::kms::render::frame_builder::RecordedOp,
     session: &mut Option<DstPassSession>,
 ) -> Result<(), RenderError> {
-    use super::frame_builder::RecordedOp as Op;
+    use crate::kms::render::frame_builder::RecordedOp as Op;
     match op {
         Op::FillRect(fr) => {
             let dst_image = store
@@ -11272,9 +11331,9 @@ fn emit_session_open_and_draws(
 fn emit_session_continue_draws(
     inner: &mut RenderEngineInner,
     cb: vk::CommandBuffer,
-    op: &super::frame_builder::RecordedOp,
+    op: &crate::kms::render::frame_builder::RecordedOp,
 ) -> Result<(), RenderError> {
-    use super::frame_builder::RecordedOp as Op;
+    use crate::kms::render::frame_builder::RecordedOp as Op;
     // Clone the Vk handle owner so the draws call doesn't alias `&inner.vk`
     // against `&mut inner.logic_fill_caches` (logic path).
     let vk = inner.vk.clone();
@@ -11318,8 +11377,8 @@ fn emit_recorded_image_text_into_cb(
     inner: &mut RenderEngineInner,
     store: &mut DrawableStore,
     cb: vk::CommandBuffer,
-    pins: &super::frame_builder::FramePinSet,
-    it: &super::frame_builder::RecordedImageText,
+    pins: &crate::kms::render::frame_builder::FramePinSet,
+    it: &crate::kms::render::frame_builder::RecordedImageText,
 ) -> Result<(), RenderError> {
     let atlas_extent = inner
         .glyph_atlas
@@ -11428,9 +11487,9 @@ fn emit_recorded_render_traps_or_tris_into_cb(
     inner: &mut RenderEngineInner,
     store: &mut DrawableStore,
     cb: vk::CommandBuffer,
-    pins: &super::frame_builder::FramePinSet,
+    pins: &crate::kms::render::frame_builder::FramePinSet,
     frame_generation: u64,
-    rt: &super::frame_builder::RecordedRenderTrapsOrTris,
+    rt: &crate::kms::render::frame_builder::RecordedRenderTrapsOrTris,
 ) -> Result<(), RenderError> {
     use crate::kms::vk::{
         ops::render as vk_render, render_pipeline::record_solid_color_clear,
@@ -11445,7 +11504,7 @@ fn emit_recorded_render_traps_or_tris_into_cb(
         .image_view();
 
     let src_view = match &rt.src_kind {
-        super::frame_builder::RecordedTrapSrcKind::Drawable {
+        crate::kms::render::frame_builder::RecordedTrapSrcKind::Drawable {
             id,
             swizzle_class,
             sample_offset: _,
@@ -11471,7 +11530,7 @@ fn emit_recorded_render_traps_or_tris_into_cb(
                 *swizzle_class,
             )?
         }
-        super::frame_builder::RecordedTrapSrcKind::Solid(color) => {
+        crate::kms::render::frame_builder::RecordedTrapSrcKind::Solid(color) => {
             // record_solid_color_clear writes the colour into the 1×1 scratch
             // BEFORE the trap raster phase; the view is the solid_src_view.
             let solid = inner
@@ -11481,7 +11540,7 @@ fn emit_recorded_render_traps_or_tris_into_cb(
             record_solid_color_clear(&inner.vk, cb, solid, *color);
             solid_src_view
         }
-        super::frame_builder::RecordedTrapSrcKind::Gradient {
+        crate::kms::render::frame_builder::RecordedTrapSrcKind::Gradient {
             picture,
             intrinsic_axis_projection: _,
         } => {
@@ -11739,7 +11798,7 @@ fn emit_recorded_render_traps_or_tris_into_cb(
 
     // Compose src_xform: Gradient composes intrinsic; others pass user_src_xform.
     let combined_src_xform = match &rt.src_kind {
-        super::frame_builder::RecordedTrapSrcKind::Gradient {
+        crate::kms::render::frame_builder::RecordedTrapSrcKind::Gradient {
             intrinsic_axis_projection,
             ..
         } => crate::kms::backend::compose_affines(*intrinsic_axis_projection, rt.user_src_xform),
@@ -11761,9 +11820,10 @@ fn emit_recorded_render_traps_or_tris_into_cb(
         // coverage mask is authored in dst space, so only the source
         // side carries an offset here.
         src_offset: match &rt.src_kind {
-            super::frame_builder::RecordedTrapSrcKind::Drawable { sample_offset, .. } => {
-                [sample_offset.0, sample_offset.1]
-            }
+            crate::kms::render::frame_builder::RecordedTrapSrcKind::Drawable {
+                sample_offset,
+                ..
+            } => [sample_offset.0, sample_offset.1],
             _ => [0, 0],
         },
         mask_offset: [0, 0],
@@ -11787,7 +11847,7 @@ fn emit_recorded_render_traps_or_tris_into_cb(
     // behaviour change vs the prior hardcoded `0` is the picture-source
     // case (e.g. GTK CSD shadow blur-mask ramps sampled at `ySrc != 0`).
     let (src_org_x, src_org_y) = match &rt.src_kind {
-        super::frame_builder::RecordedTrapSrcKind::Drawable { .. } => (
+        crate::kms::render::frame_builder::RecordedTrapSrcKind::Drawable { .. } => (
             trap_composite_src_origin_axis(rt.src_origin_x, rt.bbox_x, needs_full_dst),
             trap_composite_src_origin_axis(rt.src_origin_y, rt.bbox_y, needs_full_dst),
         ),
@@ -11950,9 +12010,9 @@ impl CompositeTarget for RecordedCompositeTarget {
 fn commit_close_success(
     inner: &mut RenderEngineInner,
     store: &mut DrawableStore,
-    layouts: super::frame_builder::FrameLayoutTable,
-    touched: super::frame_builder::TouchedDrawables,
-    pending: super::frame_builder::PendingGlyphInserts,
+    layouts: crate::kms::render::frame_builder::FrameLayoutTable,
+    touched: crate::kms::render::frame_builder::TouchedDrawables,
+    pending: crate::kms::render::frame_builder::PendingGlyphInserts,
     frame_ticket: &FenceTicket,
 ) {
     let _ = touched;
@@ -11985,7 +12045,7 @@ fn commit_close_success(
 /// the store. Atlas-side rollback is handled by `rollback_atlas`.
 fn rollback_pre_submit(
     store: &mut DrawableStore,
-    open_frame: &mut super::frame_builder::OpenFrame,
+    open_frame: &mut crate::kms::render::frame_builder::OpenFrame,
 ) {
     for (id, entry) in open_frame.layouts.drawables.drain() {
         if let Some(d) = store.get_mut(id) {
@@ -12005,7 +12065,7 @@ fn rollback_pre_submit(
 /// snapshot (if the frame snapshotted it).
 fn rollback_atlas(
     inner: &mut RenderEngineInner,
-    layouts_atlas: Option<super::frame_builder::LayoutOverlayEntry>,
+    layouts_atlas: Option<crate::kms::render::frame_builder::LayoutOverlayEntry>,
     atlas_prev_ticket_snapshot: Option<Option<FenceTicket>>,
 ) {
     if let Some(atlas) = inner.glyph_atlas.as_mut() {
@@ -12056,7 +12116,7 @@ fn snapshot_first_touch(inner: &mut RenderEngineInner, sid: SnapshotId) {
 /// the events whether or not the copy ran.
 fn rescue_present_completions(
     inner: &mut RenderEngineInner,
-    open_frame: &mut super::frame_builder::OpenFrame,
+    open_frame: &mut crate::kms::render::frame_builder::OpenFrame,
 ) {
     let events = std::mem::take(&mut open_frame.pending_present_completions);
     if !events.is_empty() {
@@ -12452,7 +12512,7 @@ fn build_render_clip_scissors_to(
 const GET_IMAGE_SLOW_MS: f64 = 15.0;
 
 /// Whether to emit `get_image_phase:` lines — gated on the same
-/// `YSERVER_LOOP_TELEMETRY` env toggle as [`super::telemetry::Telemetry`]
+/// `YSERVER_LOOP_TELEMETRY` env toggle as [`crate::kms::render::telemetry::Telemetry`]
 /// (read once, cached). Keeps the per-phase diagnostic silent unless a
 /// deliberate telemetry session is requested.
 fn get_image_phase_telemetry_enabled() -> bool {
