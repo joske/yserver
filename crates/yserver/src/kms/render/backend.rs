@@ -1,19 +1,21 @@
-//! `KmsBackend` — Stage 1b skeleton sibling of `KmsBackend` (v1).
+//! `KmsBackend`: the `Backend` implementation on DRM/KMS.
 //!
-//! Per rendering-model-v2 spec § Stage 1b. Embeds the same
-//! `KmsCore` as v1 so protocol bookkeeping (XID maps, window
-//! metadata stripped of storage, fonts, SHAPE regions, etc.) lives
-//! exactly once. Every paint / scene / RENDER trait method stubs
-//! with a once-per-method `warn!` + `Ok(())`. Real components
-//! (`PlatformBackend`, `DrawableStore`, `RenderEngine`,
-//! `SceneCompositor`) land in Stage 2.
+//! It owns the protocol bookkeeping (`KmsCore`), the device layer
+//! (`PlatformBackend`: DRM/KMS, libinput, Vulkan), drawable storage
+//! (`DrawableStore`), the paint engine (`RenderEngine`) and the scene
+//! compositor (`SceneCompositor`), plus the cross-cutting state on top of
+//! them: tracked windows, direct scanout, Present, cursors, VT/session,
+//! RANDR/CRTC config and DRI3 export. This file holds the struct and its
+//! supporting types; the methods live in:
 //!
-//! The acceptance gate is **synthetic**: the server boots (v2 is
-//! now the only render model), opens a connection,
-//! services capability queries / atom queries / GetGeometry on
-//! root; the first paint op produces exactly one
-//! `v2: <method> not yet implemented` warn line per opcode. No
-//! real-app gates land at this stage — those wait for Stage 3.
+//! - `portable/*`: no DRM/GBM imports (windows, redirect, paint targets,
+//!   RENDER, text, clip, drawing, input devices, pointer, stats, dumps).
+//! - `kms/*`: DRM-bound behaviour (scanout, readback, CRTC config, RANDR,
+//!   Present, DMA-BUF export, VT session, hardware cursor).
+//! - `trait_impl`: `impl Backend for KmsBackend`, one file until the trait
+//!   bodies move to per-subsystem delegators.
+//! - `for_tests`: `*_for_tests` entry points for the acceptance tests.
+//! - `tests`, `crtc_transform_tests`: unit tests.
 
 mod for_tests;
 mod kms;

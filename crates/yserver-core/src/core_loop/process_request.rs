@@ -1,23 +1,31 @@
-//! Single-threaded entry point for X11 request dispatch.
+//! Single-threaded X11 request dispatch: `process_request` matches the
+//! opcode and hands the request to a handler. State mutations go through
+//! `&mut ServerState`, backend calls through `&mut dyn Backend`, reply and
+//! event bytes through `client_io::write_or_buffer`. This file keeps the
+//! dispatch `match` and the shared validation/error helpers; handlers live
+//! in:
 //!
-//! `process_request` is the new home of the opcode `match` that today
-//! still lives in `nested::handle_request`. Its signature is the one
-//! D4 wires to `Message::Request` arms in `run_core` — every state
-//! mutation goes through `&mut ServerState`, every backend call goes
-//! through `&mut dyn Backend`, and every reply/event byte is pushed
-//! out via `client_io::write_or_buffer` (no more
-//! `Arc<Mutex<UnixStream>>` snapshots).
+//! Core protocol
+//! - `windows`: window create/destroy/reparent, exposures.
+//! - `drawing`: PutImage/GetImage, image text, XY↔Z conversion.
+//! - `gc_pixmap_cursor`: GC, pixmap and cursor resources.
+//! - `colormaps`, `fonts`, `props` (properties and atoms), `selection`
+//!   (selections, SendEvent).
+//! - `focus_pointer`: input focus, QueryPointer, WarpPointer.
+//! - `grabs`: core grabs and AllowEvents.
+//! - `input_ctl`: keyboard/pointer control and mappings, Bell.
+//! - `misc`: QueryExtension, server grabs, hosts, KillClient, BIG-REQUESTS,
+//!   Generic Event, X-Resource.
 //!
-//! ## Migration status
+//! Extensions
+//! - `render`, `shape_xfixes`, `composite_damage`, `redirect` (Composite
+//!   backing storage), `present_ext`, `dri3`, `xshm`, `glx`, `sync_ext`.
+//! - `xi` (XInput), `xkb`, `xtest`.
+//! - `randr_ext` (RANDR, Xinerama), `vidmode`, `saver_dpms`
+//!   (MIT-SCREEN-SAVER, DPMS, IDLETIME counter).
 //!
-//! D2 finished the additive part of the lift: every fanout helper
-//! has a state-borrowing twin. D3 then moved every opcode dispatch
-//! arm off `Arc<Mutex<...>>` and onto `&mut`-borrowed types. Every
-//! arm `nested::handle_request` had — including all 11 extension
-//! dispatchers (RANDR / MIT-SHM / RENDER / XKB / XI2 / XFIXES /
-//! SHAPE / SYNC / DAMAGE / COMPOSITE / PRESENT) — has a
-//! state-borrowing implementation here. The `nested::handle_request`
-//! path is dead-code from D4 forward and gets retired in H1.
+//! Tests: `tests/*` per area, `get_image_reply_tests`,
+//! `largest_free_xid_gap_tests`.
 
 mod colormaps;
 mod composite_damage;
