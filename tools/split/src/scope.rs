@@ -314,9 +314,8 @@ impl Names {
             );
         }
         for (path, info) in &t.mods {
-            if let Some((p, name)) = path.rsplit_once("::")
-                && info.vis != "?"
-            {
+            if info.vis != "?" {
+                let (p, name) = path.rsplit_once("::").unwrap_or(("", path));
                 let id = format!("mod {path}");
                 bind(
                     p,
@@ -416,7 +415,7 @@ fn glob_target(t: &Tree, module: &str, path: &str) -> Target {
     let mut cur = match segs.first() {
         Some(&"crate") => Vec::new(),
         Some(&"self" | &"super") => split(module),
-        Some(s) if t.mods.contains_key(&format!("{module}::{s}")) => split(module),
+        Some(s) if t.mods.contains_key(&crate::tree::child(module, s)) => split(module),
         _ => return Target::Opaque(format!("glob {path} in {module}")),
     };
     for (i, s) in segs.iter().enumerate() {

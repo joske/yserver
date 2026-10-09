@@ -19,8 +19,10 @@ const USAGE: &str = "usage:
   split apply <manifest.toml>
   split test-list <out-dir>
   split verify [--manifest <m.toml> | --root <file.rs> --module <path>]
-               [--delegate] [--tests <before-dir> <after-dir>] [<rev>]
-verify compares <rev>^ with <rev>, or HEAD with the working tree.";
+               [--delegate] [--tests <before-dir> <after-dir> [--target <bin:kind>]]
+               [<rev>]
+verify compares <rev>^ with <rev>, or HEAD with the working tree; --tests
+also checks the test lists, snapshotted by test-list at those two trees.";
 
 fn git(args: &[&str]) -> Res<String> {
     let out = Command::new("git")
@@ -37,21 +39,90 @@ fn git(args: &[&str]) -> Res<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
 }
 
+fn toml_at(src: &dyn Source, path: &str) -> Option<toml::Value> {
+    toml::from_str(&String::from_utf8(src.read(path)?).ok()?).ok()
+}
+
+/// Test binary id (`split test-list`'s `name:kind`) of the target whose
+/// module tree holds `file`: explicit `[lib]`/`[[bin]]`/`[[test]]`/
+/// `[[example]]` paths first, then Cargo's auto-discovery layout.
 fn crate_bin(src: &dyn Source, file: &str) -> Res<String> {
-    let dir = file.split_once("/src/").map_or("", |(d, _)| d);
-    let toml_path = format!("{dir}/Cargo.toml");
-    let text = String::from_utf8(
-        src.read(&toml_path)
-            .ok_or(format!("{toml_path}: not found"))?,
-    )
-    .map_err(|e| e.to_string())?;
-    let v: toml::Value = toml::from_str(&text).map_err(|e| e.to_string())?;
-    let name = v
+    let mut dir = tree::dir_of(file);
+    let (pkg, cargo) = loop {
+        if let Some(v) = toml_at(src, &tree::join(dir, "Cargo.toml")) {
+            break (dir, v);
+        }
+        if dir.is_empty() {
+            return Err(format!("{file}: no Cargo.toml above it"));
+        }
+        dir = tree::dir_of(dir);
+    };
+    let rel = file
+        .strip_prefix(pkg)
+        .unwrap_or(file)
+        .trim_start_matches('/');
+    let us = |s: &str| s.replace('-', "_");
+    let package = cargo
         .get("package")
         .and_then(|p| p.get("name"))
         .and_then(|n| n.as_str())
         .ok_or("package name")?;
-    Ok(format!("{}:lib", name.replace('-', "_")))
+    let stem = |p: &str| {
+        p.rsplit('/')
+            .next()
+            .unwrap_or(p)
+            .trim_end_matches(".rs")
+            .to_string()
+    };
+    let mut roots: Vec<(String, String)> = Vec::new();
+    for (sect, kind) in [
+        ("lib", "lib"),
+        ("bin", "bin"),
+        ("test", "test"),
+        ("example", "bin"),
+    ] {
+        let tables = match cargo.get(sect) {
+            Some(toml::Value::Table(t)) => vec![t.clone()],
+            Some(toml::Value::Array(a)) => a.iter().filter_map(|v| v.as_table().cloned()).collect(),
+            _ => vec![],
+        };
+        for t in tables {
+            if let Some(p) = t.get("path").and_then(|p| p.as_str()) {
+                let name = t
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .map_or_else(|| stem(p), str::to_string);
+                roots.push((
+                    p.trim_start_matches("./").to_string(),
+                    format!("{}:{kind}", us(&name)),
+                ));
+            }
+        }
+    }
+    if let Some((_, id)) = roots
+        .iter()
+        .find(|(p, _)| p == rel || tree::dir_of(p) == tree::dir_of(rel) && tree::dir_of(p) != "src")
+    {
+        return Ok(id.clone());
+    }
+    let parts: Vec<&str> = rel.split('/').collect();
+    match parts.as_slice() {
+        ["tests" | "examples" | "benches", first, ..] => {
+            let kind = if parts[0] == "tests" { "test" } else { "bin" };
+            Ok(format!("{}:{kind}", us(first.trim_end_matches(".rs"))))
+        }
+        ["src", "bin", first, ..] => Ok(format!("{}:bin", us(first.trim_end_matches(".rs")))),
+        ["src", ..] => {
+            let lib = roots.iter().any(|(_, id)| id.ends_with(":lib"))
+                || src.read(&tree::join(pkg, "src/lib.rs")).is_some();
+            Ok(format!(
+                "{}:{}",
+                us(package),
+                if lib { "lib" } else { "bin" }
+            ))
+        }
+        _ => Err(format!("{file}: cannot tell its target; pass --target")),
+    }
 }
 
 fn run() -> Res<bool> {
@@ -68,6 +139,7 @@ fn run() -> Res<bool> {
         Some("verify") => {
             let (mut manifest, mut root, mut module, mut delegate, mut tests, mut rev) =
                 (None, None, None, false, None, None);
+            let mut target = None;
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
@@ -76,6 +148,7 @@ fn run() -> Res<bool> {
                     "--module" => (module, i) = (Some(arg(i + 1)?), i + 1),
                     "--delegate" => delegate = true,
                     "--tests" => (tests, i) = (Some((arg(i + 1)?, arg(i + 2)?)), i + 2),
+                    "--target" => (target, i) = (Some(arg(i + 1)?), i + 1),
                     s if !s.starts_with('-') && rev.is_none() => rev = Some(s.to_string()),
                     _ => return Err(USAGE.into()),
                 }
@@ -101,32 +174,45 @@ fn run() -> Res<bool> {
                 },
                 _ => return Err(USAGE.into()),
             };
-            let (base, head, touched): (Box<dyn Source>, Box<dyn Source>, String) = match &rev {
-                Some(r) => (
-                    Box::new(Git(format!("{r}^"))),
-                    Box::new(Git(r.clone())),
-                    git(&["diff", "--name-only", "--no-renames", &format!("{r}^"), r])?,
-                ),
-                None => {
-                    let st = git(&["status", "--porcelain=v1", "-uall", "--no-renames"])?;
-                    let files = st
-                        .lines()
-                        .filter_map(|l| l.get(3..))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    (
-                        Box::new(Git("HEAD".into())),
-                        Box::new(Disk(repo.clone())),
-                        files,
-                    )
-                }
-            };
-            if let Some((b, a)) = tests {
-                let bin = crate_bin(head.as_ref(), &spec.new_root)?;
-                return testlist::verify(&spec, base.as_ref(), &bin, b.as_ref(), a.as_ref());
-            }
+            let (base, head, touched, trees): (Box<dyn Source>, Box<dyn Source>, String, _) =
+                match &rev {
+                    Some(r) => (
+                        Box::new(Git(format!("{r}^"))),
+                        Box::new(Git(r.clone())),
+                        git(&["diff", "--name-only", "--no-renames", &format!("{r}^"), r])?,
+                        (format!("{r}^"), Some(r.clone())),
+                    ),
+                    None => {
+                        let st = git(&["status", "--porcelain=v1", "-uall", "--no-renames"])?;
+                        let files = st
+                            .lines()
+                            .filter_map(|l| l.get(3..))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        (
+                            Box::new(Git("HEAD".into())),
+                            Box::new(Disk(repo.clone())),
+                            files,
+                            ("HEAD".to_string(), None),
+                        )
+                    }
+                };
             let touched: Vec<String> = touched.lines().map(str::to_string).collect();
-            verify::run(&spec, base.as_ref(), head.as_ref(), &touched)
+            let mut ok = verify::run(&spec, base.as_ref(), head.as_ref(), &touched)?;
+            if let Some((b, a)) = tests {
+                let after_tree = match &trees.1 {
+                    Some(r) => testlist::rev_tree(&repo, r)?,
+                    None => testlist::worktree_tree(&repo)?,
+                };
+                testlist::fresh(&repo, b.as_ref(), &testlist::rev_tree(&repo, &trees.0)?)?;
+                testlist::fresh(&repo, a.as_ref(), &after_tree)?;
+                let bin = match target.or_else(|| m.as_ref().and_then(|m| m.target.clone())) {
+                    Some(t) => t,
+                    None => crate_bin(base.as_ref(), &spec.old_root)?,
+                };
+                ok &= testlist::verify(&spec, base.as_ref(), &bin, b.as_ref(), a.as_ref())?;
+            }
+            Ok(ok)
         }
         _ => Err(USAGE.into()),
     }

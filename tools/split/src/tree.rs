@@ -334,10 +334,19 @@ pub fn owner(i: &ItemImpl) -> Owner {
     }
 }
 
+/// `module::name`; the crate root is "".
+pub fn child(module: &str, name: &str) -> String {
+    if module.is_empty() {
+        name.to_string()
+    } else {
+        format!("{module}::{name}")
+    }
+}
+
 pub fn key(module: &str, owner: Option<&str>, kind: &str, name: &str) -> String {
     match owner {
-        Some(o) => format!("{module}::{o}::{kind} {name}"),
-        None => format!("{module}::{kind} {name}"),
+        Some(o) => child(module, &format!("{o}::{kind} {name}")),
+        None => child(module, &format!("{kind} {name}")),
     }
 }
 
@@ -346,7 +355,7 @@ pub fn item_keys(item: &Item, module: &str, out: &mut Vec<String>) {
     match item {
         Item::Mod(m) => {
             if let Some((_, inner)) = &m.content {
-                let sub = format!("{module}::{}", m.ident);
+                let sub = child(module, &m.ident.to_string());
                 for i in inner {
                     item_keys(i, &sub, out);
                 }
@@ -695,7 +704,7 @@ impl Tree {
                 Item::Mod(m) => {
                     self.pool.extend(doc_attrs(&m.attrs));
                     let mctx = ctx.nested(&m.attrs);
-                    let sub = format!("{module}::{}", m.ident);
+                    let sub = child(module, &m.ident.to_string());
                     self.mods.insert(sub.clone(), ModInfo { vis: tok(&m.vis) });
                     let macro_use = m.attrs.iter().any(|a| a.path().is_ident("macro_use"));
                     self.events.push(Ev::Enter(macro_use));

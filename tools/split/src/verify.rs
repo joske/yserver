@@ -172,7 +172,7 @@ pub fn check(
     let mut edits: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
     if let Some(m) = spec.manifest {
         for e in m.path_edits.iter().filter(|e| !e.item.starts_with("mod ")) {
-            let old = m.full("") + "::" + &e.item;
+            let old = tree::child(&m.full(""), &e.item);
             let new = map
                 .get(&old)
                 .ok_or_else(|| format!("path edit: unknown item {}", e.item))?;
@@ -188,7 +188,7 @@ pub fn check(
             m.visibility
                 .iter()
                 .filter_map(|(k, v)| {
-                    let old = format!("{}::{}", m.full(""), k);
+                    let old = tree::child(&m.full(""), k);
                     map.get(&old).map(|n| (n.clone(), norm_vis(v)))
                 })
                 .collect()
@@ -481,6 +481,7 @@ pub fn check(
 /// non-literal paths and macros that include are refused once the leaf
 /// changes directory, module or file. Leaves of files other than the split
 /// root must still come from the same file.
+#[allow(clippy::too_many_arguments)]
 fn includes_ok(
     spec: &Spec,
     base: &dyn Source,

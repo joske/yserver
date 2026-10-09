@@ -46,6 +46,7 @@ fn manifest(dir: &str, edits: Vec<PathEdit>) -> Manifest {
         module: "a".into(),
         dir: "src/a".into(),
         table: "a.paths".into(),
+        target: None,
         visibility: [("fn data".to_string(), "pub(super)".to_string())].into(),
         path_edits: edits,
         modules: vec![
@@ -261,6 +262,7 @@ fn split(
         module: "a".into(),
         dir: "src/a".into(),
         table: "a.paths".into(),
+        target: None,
         visibility: [("fn f".to_string(), "pub(super)".to_string())].into(),
         path_edits: vec![],
         modules: vec![spec_of("", lines[0]), spec_of("inner", lines[1])],
@@ -584,4 +586,83 @@ fn duplicated_comment_fails() {
     let before = "// note\nuse a::b;\nuse c::d;\n";
     let after = "// note\nuse a::b;\n// note\nuse c::d;\n";
     has(&same_file(before, after, false), "comment added");
+}
+
+fn tmpdir(tag: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("split-test-{}-{tag}", std::process::id()));
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+const HEAD_LINE: &str = "#\ttree=t\trev=r\tconfig=CFG\thost=h\n";
+
+fn snapshot(dir: &std::path::Path, rows: &str) {
+    for (cfg, _) in crate::testlist::CONFIGS {
+        std::fs::write(
+            dir.join(format!("{cfg}.tsv")),
+            HEAD_LINE.replace("CFG", cfg).to_string() + rows,
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn malformed_snapshot_row_fails() {
+    let d = tmpdir("malformed");
+    std::fs::write(
+        d.join("default.tsv"),
+        HEAD_LINE.replace("CFG", "default") + "c:lib\ta::t\n",
+    )
+    .unwrap();
+    assert!(crate::testlist::read(&d.join("default.tsv"), "default").is_err());
+}
+
+#[test]
+fn test_name_collision_fails() {
+    let before = "#[cfg(test)]\nmod tests {\n    #[test]\n    fn x() {}\n\n    mod inner {\n        #[test]\n        fn x() {}\n    }\n}\n";
+    let m = manifest("collide", vec![]);
+    std::fs::write(
+        m.table_path(),
+        "a::tests::fn x => a::tests::w::fn x\na::tests::inner::fn x => a::tests::w::fn x\n",
+    )
+    .unwrap();
+    let (b, a) = (tmpdir("collide-b"), tmpdir("collide-a"));
+    snapshot(
+        &b,
+        "c:lib\ta::tests::x\trun\nc:lib\ta::tests::inner::x\trun\n",
+    );
+    snapshot(&a, "c:lib\ta::tests::w::x\trun\n");
+    let r = crate::testlist::verify(&spec_of(&m), &mem(&[("src/a.rs", before)]), "c:lib", &b, &a);
+    assert!(!matches!(r, Ok(true)), "{r:?}");
+}
+
+#[test]
+fn test_targets_from_cargo_layout() {
+    let src = mem(&[
+        (
+            "crates/y/Cargo.toml",
+            "[package]\nname = \"y-core\"\n\n[[bin]]\nname = \"tool\"\npath = \"src/tool/main.rs\"\n",
+        ),
+        ("crates/y/src/lib.rs", ""),
+        ("crates/z/Cargo.toml", "[package]\nname = \"z\"\n"),
+        ("crates/z/src/main.rs", ""),
+    ]);
+    let t = |f: &str| crate::crate_bin(&src, f).unwrap();
+    assert_eq!(t("crates/y/src/resources.rs"), "y_core:lib");
+    assert_eq!(
+        t("crates/y/tests/render_acceptance.rs"),
+        "render_acceptance:test"
+    );
+    assert_eq!(
+        t("crates/y/tests/render_acceptance/main.rs"),
+        "render_acceptance:test"
+    );
+    assert_eq!(
+        t("crates/y/tests/render_acceptance/xkb.rs"),
+        "render_acceptance:test"
+    );
+    assert_eq!(t("crates/y/src/tool/main.rs"), "tool:bin");
+    assert_eq!(t("crates/y/src/bin/other.rs"), "other:bin");
+    assert_eq!(t("crates/y/examples/demo.rs"), "demo:bin");
+    assert_eq!(t("crates/z/src/state.rs"), "z:bin");
 }

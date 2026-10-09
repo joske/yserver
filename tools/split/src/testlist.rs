@@ -57,12 +57,67 @@ fn list(repo: &Path, flags: &str, ignored: bool) -> Res<BTreeSet<(String, String
     Ok(set)
 }
 
+fn git_in(repo: &Path, args: &[&str], index: Option<&Path>) -> Res<String> {
+    let mut c = Command::new("git");
+    c.args(args).current_dir(repo);
+    if let Some(i) = index {
+        c.env("GIT_INDEX_FILE", i);
+    }
+    let out = c.output().map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(format!(
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Tree id of the working tree (tracked and untracked, `.gitignore` honoured).
+pub fn worktree_tree(repo: &Path) -> Res<String> {
+    let idx = repo.join(git_in(
+        repo,
+        &["rev-parse", "--git-path", "split-index"],
+        None,
+    )?);
+    let _ = std::fs::remove_file(&idx);
+    let r = git_in(repo, &["add", "-A"], Some(&idx))
+        .and_then(|_| git_in(repo, &["write-tree"], Some(&idx)));
+    let _ = std::fs::remove_file(&idx);
+    r
+}
+
+pub fn rev_tree(repo: &Path, rev: &str) -> Res<String> {
+    git_in(repo, &["rev-parse", &format!("{rev}^{{tree}}")], None)
+}
+
+fn host() -> Res<String> {
+    let out = Command::new("rustc")
+        .arg("-vV")
+        .output()
+        .map_err(|e| e.to_string())?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("host: "))
+        .map(str::to_string)
+        .ok_or_else(|| "rustc -vV: no host".into())
+}
+
 pub fn snapshot(repo: &Path, out: &Path) -> Res<()> {
     std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
+    let (tree, rev, host) = (
+        worktree_tree(repo)?,
+        git_in(repo, &["rev-parse", "HEAD"], None)?,
+        host()?,
+    );
     for (name, flags) in CONFIGS {
         let all = list(repo, flags, false)?;
         let ign = list(repo, flags, true)?;
-        let mut text = String::new();
+        if worktree_tree(repo)? != tree {
+            return Err("the working tree changed during the snapshot".into());
+        }
+        let mut text = format!("#\ttree={tree}\trev={rev}\tconfig={name}\thost={host}\n");
         for t in &all {
             let st = if ign.contains(t) { "ignored" } else { "run" };
             text.push_str(&format!("{}\t{}\t{st}\n", t.0, t.1));
@@ -79,15 +134,85 @@ pub fn snapshot(repo: &Path, out: &Path) -> Res<()> {
     Ok(())
 }
 
-fn read(p: &Path) -> Res<Vec<(String, String, String)>> {
+type Row = (String, String, String);
+
+/// Snapshot rows of one config; the header must name that config.
+pub fn read(p: &Path, config: &str) -> Res<(BTreeMap<String, String>, Vec<Row>)> {
     let text = std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
-    Ok(text
-        .lines()
-        .filter_map(|l| {
-            let mut it = l.split('\t');
-            Some((it.next()?.into(), it.next()?.into(), it.next()?.into()))
-        })
-        .collect())
+    let mut lines = text.lines();
+    let head: BTreeMap<String, String> = lines
+        .next()
+        .and_then(|l| l.strip_prefix("#\t"))
+        .ok_or_else(|| {
+            format!(
+                "{}: no provenance header (re-run split test-list)",
+                p.display()
+            )
+        })?
+        .split('\t')
+        .filter_map(|f| f.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    for k in ["tree", "rev", "config", "host"] {
+        if !head.contains_key(k) {
+            return Err(format!("{}: header lacks {k}", p.display()));
+        }
+    }
+    if head["config"] != config {
+        return Err(format!(
+            "{}: snapshot of config {}",
+            p.display(),
+            head["config"]
+        ));
+    }
+    let rows = lines
+        .enumerate()
+        .map(
+            |(i, l)| match l.split('\t').collect::<Vec<_>>().as_slice() {
+                [bin, name, st @ ("run" | "ignored")] if !bin.is_empty() && !name.is_empty() => {
+                    Ok(((*bin).to_string(), (*name).to_string(), (*st).to_string()))
+                }
+                _ => Err(format!("{}:{}: malformed row {l:?}", p.display(), i + 2)),
+            },
+        )
+        .collect::<Res<Vec<_>>>()?;
+    Ok((head, rows))
+}
+
+/// The snapshots in `dir` were taken on this host from a tree equal to
+/// `expected` in everything cargo builds.
+pub fn fresh(repo: &Path, dir: &Path, expected: &str) -> Res<()> {
+    let host = host()?;
+    for (cfg, _) in CONFIGS {
+        let (head, _) = read(&dir.join(format!("{cfg}.tsv")), cfg)?;
+        if head["host"] != host {
+            return Err(format!("{}: taken on {}", dir.display(), head["host"]));
+        }
+        let diff = git_in(
+            repo,
+            &[
+                "diff",
+                "--name-only",
+                &head["tree"],
+                expected,
+                "--",
+                ".",
+                ":(exclude)tools/split",
+                ":(exclude)docs",
+            ],
+            None,
+        )?;
+        if !diff.is_empty() {
+            let files: Vec<&str> = diff.lines().take(5).collect();
+            return Err(format!(
+                "{}/{cfg}.tsv is stale (rev {}): differs in {}",
+                dir.display(),
+                head["rev"],
+                files.join(", ")
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Names after `fn` anywhere in a macro call (`proptest! { fn … }`).
@@ -122,17 +247,18 @@ fn test_map(spec: &Spec, base: &dyn Source) -> Res<BTreeMap<String, String>> {
     let mut map = BTreeMap::new();
     for l in before.leaves.iter().filter(|l| l.owner.is_none()) {
         let new = &table[&l.okey()];
-        let suffix = format!("::{} {}", l.kind, l.name);
+        let suffix = format!("{} {}", l.kind, l.name);
         let Some(new_mod) = new.strip_suffix(&suffix) else {
             continue;
         };
+        let new_mod = new_mod.strip_suffix("::").unwrap_or(new_mod);
         let names = match l.kind {
             "fn" => vec![l.name.clone()],
             "macro_call" => macro_fns(&l.tokens),
             _ => continue,
         };
         for n in names {
-            map.insert(format!("{}::{n}", l.module), format!("{new_mod}::{n}"));
+            map.insert(tree::child(&l.module, &n), tree::child(new_mod, &n));
         }
     }
     Ok(map)
@@ -148,18 +274,25 @@ pub fn verify(
     let map = test_map(spec, base)?;
     let mut ok = true;
     for (cfg, _) in CONFIGS {
-        let b = read(&before.join(format!("{cfg}.tsv")))?;
-        let a = read(&after.join(format!("{cfg}.tsv")))?;
-        let mapped: BTreeSet<(String, String, String)> = b
+        let (_, b) = read(&before.join(format!("{cfg}.tsv")), cfg)?;
+        let (_, a) = read(&after.join(format!("{cfg}.tsv")), cfg)?;
+        let mut into: BTreeMap<(String, String), Vec<(String, String)>> = BTreeMap::new();
+        for (bin, name, st) in b {
+            let new = if bin == crate_bin {
+                map.get(&name).cloned().unwrap_or_else(|| name.clone())
+            } else {
+                name.clone()
+            };
+            into.entry((bin, new)).or_default().push((name, st));
+        }
+        for ((bin, new), olds) in into.iter().filter(|(_, v)| v.len() > 1) {
+            let olds: Vec<&str> = olds.iter().map(|(n, _)| n.as_str()).collect();
+            println!("FAIL {cfg}: {bin} {} all map to {new}", olds.join(", "));
+            ok = false;
+        }
+        let mapped: BTreeSet<Row> = into
             .into_iter()
-            .map(|(bin, name, st)| {
-                let name = if bin == crate_bin {
-                    map.get(&name).cloned().unwrap_or(name)
-                } else {
-                    name
-                };
-                (bin, name, st)
-            })
+            .map(|((bin, new), v)| (bin, new, v[0].1.clone()))
             .collect();
         let a: BTreeSet<_> = a.into_iter().collect();
         let mut per_bin: BTreeMap<&str, (usize, usize)> = BTreeMap::new();

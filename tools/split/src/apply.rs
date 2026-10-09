@@ -22,6 +22,10 @@ pub struct Manifest {
     pub dir: String,
     /// Old → new leaf path table written by `apply`, relative to the manifest.
     pub table: String,
+    /// Test binary of `source` as `split test-list` names it (`name:lib`,
+    /// `name:bin`, `name:test`), when the Cargo layout does not tell.
+    #[serde(default)]
+    pub target: Option<String>,
     /// Old item key → new visibility (only `pub(super)` / `pub(in …)`).
     #[serde(default)]
     pub visibility: BTreeMap<String, String>,
@@ -79,7 +83,7 @@ impl Manifest {
         if rel.is_empty() {
             self.module.clone()
         } else {
-            format!("{}::{rel}", self.module)
+            tree::child(&self.module, rel)
         }
     }
 
