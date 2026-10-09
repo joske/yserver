@@ -420,3 +420,119 @@ fn delegate_into_other_generic_context_fails() {
         "no inherent fn carries the old body",
     );
 }
+
+#[test]
+fn path_edit_does_not_cover_other_literals() {
+    let before = "fn data() -> (&'static str, &'static str) {\n    (include_str!(\"fixtures/x.txt\"), \"fixtures/x.txt\")\n}\n";
+    let mod_rs = "mod inner;\npub use inner::*;\n";
+    let inner = "use super::*;\n\npub(super) fn data() -> (&'static str, &'static str) {\n    (include_str!(\"../fixtures/x.txt\"), \"../fixtures/x.txt\")\n}\n";
+    let mut m = manifest("edit-scope", edit("../fixtures/x.txt"));
+    m.table = "b.paths".into();
+    std::fs::write(m.table_path(), "a::fn data => a::inner::fn data\n").unwrap();
+    let base = mem(&[("src/a.rs", before), ("src/fixtures/x.txt", "X")]);
+    let head = mem(&[
+        ("src/a/mod.rs", mod_rs),
+        ("src/a/inner.rs", inner),
+        ("src/fixtures/x.txt", "X"),
+    ]);
+    let errs = check(&spec_of(&m), &base, &head, &[]).unwrap().1;
+    has(&errs, "tokens changed");
+}
+
+fn spec_of(m: &Manifest) -> Spec<'_> {
+    Spec {
+        manifest: Some(m),
+        old_root: m.source.clone(),
+        new_root: m.new_root(),
+        module: m.module.clone(),
+        delegate: false,
+    }
+}
+
+/// `src/k.rs` unchanged; `extra` files differ between base and head.
+fn module_files(root: &str, extra: &[(&str, &str, &str)]) -> Vec<String> {
+    let spec = Spec {
+        manifest: None,
+        old_root: "src/k.rs".into(),
+        new_root: "src/k.rs".into(),
+        module: "k".into(),
+        delegate: false,
+    };
+    let mut b = vec![("src/k.rs", root)];
+    let mut a = vec![("src/k.rs", root)];
+    for (p, x, y) in extra {
+        b.push((p, x));
+        a.push((p, y));
+    }
+    check(&spec, &mem(&b), &mem(&a), &[]).unwrap().1
+}
+
+#[test]
+fn path_attribute_on_inline_module_is_followed() {
+    let root = "#[path = \"other\"]\nmod m {\n    mod x;\n}\n";
+    let errs = module_files(
+        root,
+        &[
+            (
+                "src/k/m/x.rs",
+                "fn x() -> u32 {\n    1\n}\n",
+                "fn x() -> u32 {\n    1\n}\n",
+            ),
+            (
+                "src/other/x.rs",
+                "fn x() -> u32 {\n    1\n}\n",
+                "fn x() -> u32 {\n    2\n}\n",
+            ),
+        ],
+    );
+    has(&errs, "tokens changed");
+}
+
+#[test]
+fn path_attribute_inside_inline_module_is_relative_to_it() {
+    let root = "mod m {\n    #[path = \"y.rs\"]\n    mod x;\n}\n";
+    let errs = module_files(
+        root,
+        &[
+            (
+                "src/y.rs",
+                "fn x() -> u32 {\n    1\n}\n",
+                "fn x() -> u32 {\n    1\n}\n",
+            ),
+            (
+                "src/k/m/y.rs",
+                "fn x() -> u32 {\n    1\n}\n",
+                "fn x() -> u32 {\n    2\n}\n",
+            ),
+        ],
+    );
+    has(&errs, "tokens changed");
+}
+
+fn moved_data(tag: &str, body: &str, moved: &str) -> Vec<String> {
+    let before = format!("fn data() -> &'static str {{\n    {body}\n}}\n");
+    let inner =
+        format!("use super::*;\n\npub(super) fn data() -> &'static str {{\n    {moved}\n}}\n");
+    let m = manifest(tag, edit("../fixtures/x.txt"));
+    std::fs::write(m.table_path(), "a::fn data => a::inner::fn data\n").unwrap();
+    let base = mem(&[("src/a.rs", &before), ("src/fixtures/x.txt", "X")]);
+    let head = mem(&[
+        ("src/a/mod.rs", "mod inner;\npub use inner::*;\n"),
+        ("src/a/inner.rs", &inner),
+        ("src/fixtures/x.txt", "X"),
+        ("src/a/fixtures/x.txt", "Y"),
+    ]);
+    check(&spec_of(&m), &base, &head, &[]).unwrap().1
+}
+
+#[test]
+fn moved_include_macro_fails() {
+    let body = "include!(\"fixtures/x.txt\")";
+    has(&moved_data("include", body, body), "include!");
+}
+
+#[test]
+fn moved_dynamic_include_path_fails() {
+    let body = "include_str!(concat!(\"fixtures/\", \"x.txt\"))";
+    has(&moved_data("dynamic", body, body), "include");
+}

@@ -448,13 +448,58 @@ pub fn dir_of(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(d, _)| d)
 }
 
-/// Directory holding the out-of-line children of the module in `path`.
-pub fn child_dir(path: &str) -> String {
-    let file = path.rsplit('/').next().unwrap_or(path);
-    if matches!(file, "mod.rs" | "lib.rs" | "main.rs") {
-        dir_of(path).to_string()
-    } else {
-        path.trim_end_matches(".rs").to_string()
+/// Where a module's out-of-line children live (rustc's `dir_path` and
+/// `DirOwnership::Owned { relative }`): `foo.rs` loaded as `mod foo;` keeps
+/// its children in `foo/`; mod.rs, crate roots and `#[path]` files in their
+/// own directory.
+#[derive(Clone)]
+pub struct Dir {
+    pub path: String,
+    pub rel: Option<String>,
+}
+
+impl Dir {
+    pub fn of_file(path: &str, rel: Option<String>) -> Self {
+        Dir {
+            path: dir_of(path).to_string(),
+            rel,
+        }
+    }
+
+    /// `rel` for a split root: `None` for mod.rs/lib.rs/main.rs and crate roots.
+    pub fn root_rel(path: &str, module: &str) -> Option<String> {
+        let file = path.rsplit('/').next().unwrap_or(path);
+        (!module.is_empty() && !matches!(file, "mod.rs" | "lib.rs" | "main.rs"))
+            .then(|| file.trim_end_matches(".rs").to_string())
+    }
+
+    fn base(&self) -> String {
+        join(&self.path, self.rel.as_deref().unwrap_or(""))
+    }
+
+    /// Children of the inline `mod name { }`.
+    pub fn inline(&self, name: &str, path: Option<&str>) -> Dir {
+        Dir {
+            path: match path {
+                Some(p) => join(&self.path, p),
+                None => join(&self.base(), name),
+            },
+            rel: None,
+        }
+    }
+
+    /// Candidate files for `mod name;`, each with the child's `rel`.
+    pub fn out_of_line(&self, name: &str, path: Option<&str>) -> Vec<(String, Option<String>)> {
+        match path {
+            Some(p) => vec![(join(&self.path, p), None)],
+            None => {
+                let b = self.base();
+                vec![
+                    (join(&b, &format!("{name}.rs")), Some(name.to_string())),
+                    (join(&b, &format!("{name}/mod.rs")), None),
+                ]
+            }
+        }
     }
 }
 
@@ -472,7 +517,7 @@ pub fn join(dir: &str, rel: &str) -> String {
     parts.join("/")
 }
 
-fn path_attr(attrs: &[Attribute]) -> Option<String> {
+pub fn path_attr(attrs: &[Attribute]) -> Option<String> {
     attrs
         .iter()
         .find(|a| a.path().is_ident("path"))
@@ -515,7 +560,13 @@ pub fn load(src: &dyn Source, root: &str, module: &str) -> Res<Tree> {
     let mut t = Tree::default();
     t.mods
         .insert(module.to_string(), ModInfo { vis: "?".into() });
-    t.file(src, root, module, &BTreeSet::new())?;
+    t.file(
+        src,
+        root,
+        module,
+        &BTreeSet::new(),
+        Dir::root_rel(root, module),
+    )?;
     let mut total: BTreeMap<String, usize> = BTreeMap::new();
     for l in &t.leaves {
         *total.entry(l.key()).or_default() += 1;
@@ -539,6 +590,7 @@ impl Tree {
         path: &str,
         module: &str,
         ctx: &BTreeSet<String>,
+        rel: Option<String>,
     ) -> Res<()> {
         let bytes = src.read(path).ok_or_else(|| format!("{path}: not found"))?;
         let f = SrcFile::new(String::from_utf8(bytes).map_err(|e| format!("{path}: {e}"))?);
@@ -561,7 +613,14 @@ impl Tree {
             cm: &cm,
         };
         self.files.push(path.to_string());
-        self.items(&cx, &ast.items, module, &ctx, start, &child_dir(path))
+        self.items(
+            &cx,
+            &ast.items,
+            module,
+            &ctx,
+            start,
+            &Dir::of_file(path, rel),
+        )
     }
 
     fn items(
@@ -571,7 +630,7 @@ impl Tree {
         module: &str,
         ctx: &BTreeSet<String>,
         mut prev: usize,
-        dir: &str,
+        dir: &Dir,
     ) -> Res<()> {
         for item in items {
             let end = range(cx.f, item.to_token_stream()).1;
@@ -586,20 +645,16 @@ impl Tree {
                     self.events.push(Ev::Enter(macro_use));
                     if let Some((brace, inner)) = &m.content {
                         let open = cx.f.off(brace.span.open().end());
-                        let subdir = format!("{dir}/{}", m.ident);
+                        let subdir =
+                            dir.inline(&m.ident.to_string(), path_attr(&m.attrs).as_deref());
                         self.items(cx, inner, &sub, &mctx, open, &subdir)?;
                     } else {
-                        let p = match path_attr(&m.attrs) {
-                            Some(p) => join(dir_of(cx.path), &p),
-                            None => [
-                                format!("{dir}/{}.rs", m.ident),
-                                format!("{dir}/{}/mod.rs", m.ident),
-                            ]
+                        let (p, rel) = dir
+                            .out_of_line(&m.ident.to_string(), path_attr(&m.attrs).as_deref())
                             .into_iter()
-                            .find(|c| cx.src.read(c).is_some())
-                            .ok_or_else(|| format!("{}: mod {} not found", cx.path, m.ident))?,
-                        };
-                        self.file(cx.src, &p, &sub, &mctx)?;
+                            .find(|(c, _)| cx.src.read(c).is_some())
+                            .ok_or_else(|| format!("{}: mod {} not found", cx.path, m.ident))?;
+                        self.file(cx.src, &p, &sub, &mctx, rel)?;
                     }
                     self.events.push(Ev::Exit);
                 }
@@ -677,33 +732,70 @@ impl Tree {
     }
 }
 
-/// `include_str!`/`include_bytes!`/`include!` string-literal arguments.
-pub fn includes(tokens: &str) -> Vec<String> {
-    let ts: TokenStream = tokens.parse().unwrap_or_default();
+pub const INCLUDES: [&str; 3] = ["include_str", "include_bytes", "include"];
+
+/// One `include_str!`/`include_bytes!`/`include!`; `lit` is its path when
+/// the argument is a single string literal.
+pub struct Include {
+    pub mac: String,
+    pub lit: Option<String>,
+}
+
+pub fn includes(tokens: &str) -> Vec<Include> {
+    fn walk(ts: TokenStream, out: &mut Vec<Include>) {
+        let tts: Vec<TokenTree> = ts.into_iter().collect();
+        for (i, tt) in tts.iter().enumerate() {
+            if let TokenTree::Group(g) = tt {
+                walk(g.stream(), out);
+            }
+            let TokenTree::Ident(id) = tt else { continue };
+            if !INCLUDES.contains(&id.to_string().as_str()) {
+                continue;
+            }
+            if let (Some(TokenTree::Punct(p)), Some(TokenTree::Group(g))) =
+                (tts.get(i + 1), tts.get(i + 2))
+                && p.as_char() == '!'
+            {
+                out.push(Include {
+                    mac: id.to_string(),
+                    lit: syn::parse2::<syn::LitStr>(g.stream())
+                        .ok()
+                        .map(|l| l.value()),
+                });
+            }
+        }
+    }
     let mut out = Vec::new();
-    collect_includes(ts, &mut out);
+    walk(tokens.parse().unwrap_or_default(), &mut out);
     out
 }
 
-fn collect_includes(ts: TokenStream, out: &mut Vec<String>) {
-    let tts: Vec<TokenTree> = ts.into_iter().collect();
-    for (i, tt) in tts.iter().enumerate() {
-        if let TokenTree::Group(g) = tt {
-            collect_includes(g.stream(), out);
+/// `tokens` with the `include_str!`/`include_bytes!` path literal `from`
+/// replaced by `to`, and the number of replacements.
+pub fn edit_includes(tokens: &str, from: &str, to: &str) -> (String, usize) {
+    fn walk(ts: TokenStream, from: &str, to: &str, n: &mut usize) -> TokenStream {
+        let mut tts: Vec<TokenTree> = ts.into_iter().collect();
+        for i in 0..tts.len() {
+            if let TokenTree::Group(g) = &tts[i] {
+                let prev_inc = i >= 2
+                    && matches!(&tts[i - 2], TokenTree::Ident(id) if id == "include_str" || id == "include_bytes")
+                    && matches!(&tts[i - 1], TokenTree::Punct(p) if p.as_char() == '!');
+                let stream = if prev_inc
+                    && syn::parse2::<syn::LitStr>(g.stream()).is_ok_and(|l| l.value() == from)
+                {
+                    *n += 1;
+                    TokenStream::from(TokenTree::Literal(proc_macro2::Literal::string(to)))
+                } else {
+                    walk(g.stream(), from, to, n)
+                };
+                let mut ng = proc_macro2::Group::new(g.delimiter(), stream);
+                ng.set_span(g.span());
+                tts[i] = TokenTree::Group(ng);
+            }
         }
-        let TokenTree::Ident(id) = tt else { continue };
-        if !matches!(
-            id.to_string().as_str(),
-            "include_str" | "include_bytes" | "include"
-        ) {
-            continue;
-        }
-        if let (Some(TokenTree::Punct(p)), Some(TokenTree::Group(g))) =
-            (tts.get(i + 1), tts.get(i + 2))
-            && p.as_char() == '!'
-            && let Ok(lit) = syn::parse2::<syn::LitStr>(g.stream())
-        {
-            out.push(lit.value());
-        }
+        tts.into_iter().collect()
     }
+    let mut n = 0;
+    let ts = walk(tokens.parse().unwrap_or_default(), from, to, &mut n);
+    (ts.to_string(), n)
 }

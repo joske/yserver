@@ -171,7 +171,7 @@ pub fn check(
     // Path edits are keyed by old relative item key.
     let mut edits: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
     if let Some(m) = spec.manifest {
-        for e in &m.path_edits {
+        for e in m.path_edits.iter().filter(|e| !e.item.starts_with("mod ")) {
             let old = m.full("") + "::" + &e.item;
             let new = map
                 .get(&old)
@@ -179,7 +179,7 @@ pub fn check(
             edits
                 .entry(new.clone())
                 .or_default()
-                .push((format!("{:?}", e.from), format!("{:?}", e.to)));
+                .push((e.from.clone(), e.to.clone()));
         }
     }
     let vis_ok: BTreeMap<String, String> = spec
@@ -207,10 +207,11 @@ pub fn check(
     }
 
     let rx = Resolution::new(&before, &after, &map);
+    let inc_macros = scope::including_macros(&before);
     let norm_tokens = |key: &str, l: &Leaf| {
         let mut t = l.tokens.clone();
         for (from, to) in edits.get(key).into_iter().flatten() {
-            t = t.replace(to, from);
+            t = tree::edit_includes(&t, to, from).0;
         }
         t
     };
@@ -248,15 +249,16 @@ pub fn check(
                             ob.comments, na.comments
                         ));
                     }
-                    for (po, pn) in includes(&ob.tokens).iter().zip(includes(&na.tokens)) {
-                        let (fo, fn_) = (join(dir_of(&ob.file), po), join(dir_of(&na.file), &pn));
-                        match (base.read(&fo), head.read(&fn_)) {
-                            (Some(x), Some(y)) if x == y => incl += 1,
-                            _ => errs.push(format!(
-                                "{key}: include {po:?} ({fo}) and {pn:?} ({fn_}) do not resolve to the same bytes"
-                            )),
-                        }
-                    }
+                    errs.extend(includes_ok(
+                        spec,
+                        base,
+                        head,
+                        key,
+                        ob,
+                        na,
+                        &inc_macros,
+                        &mut incl,
+                    ));
                 }
                 None => unpaired.push(*ob),
             }
@@ -453,6 +455,59 @@ pub fn check(
         ));
     }
     Ok((info, errs))
+}
+
+/// Include paths of a moved leaf resolve to the same bytes; `include!`,
+/// non-literal paths and macros that include are refused once the leaf
+/// changes directory, module or file. Leaves of files other than the split
+/// root must still come from the same file.
+fn includes_ok(
+    spec: &Spec,
+    base: &dyn Source,
+    head: &dyn Source,
+    key: &str,
+    ob: &Leaf,
+    na: &Leaf,
+    inc_macros: &BTreeSet<String>,
+    incl: &mut usize,
+) -> Vec<String> {
+    let mut errs = Vec::new();
+    if ob.file != spec.old_root && na.file != ob.file {
+        errs.push(format!("{key}: loaded from {} (was {})", na.file, ob.file));
+    }
+    let moved = dir_of(&ob.file) != dir_of(&na.file);
+    let relocated = ob.file != na.file || ob.module != na.module;
+    for (o, n) in includes(&ob.tokens).iter().zip(includes(&na.tokens)) {
+        match (&o.lit, &n.lit) {
+            _ if o.mac == "include" && relocated => {
+                errs.push(format!("{key}: include! in a moved leaf is not supported"))
+            }
+            (Some(po), Some(pn)) => {
+                let (fo, fn_) = (join(dir_of(&ob.file), po), join(dir_of(&na.file), pn));
+                match (base.read(&fo), head.read(&fn_)) {
+                    (Some(x), Some(y)) if x == y => *incl += 1,
+                    _ => errs.push(format!(
+                        "{key}: include {po:?} ({fo}) and {pn:?} ({fn_}) do not resolve to the same bytes"
+                    )),
+                }
+            }
+            _ if moved => errs.push(format!(
+                "{key}: {}! with a non-literal path in a moved leaf is not supported",
+                o.mac
+            )),
+            _ => {}
+        }
+    }
+    if moved
+        && let Some(m) = scope::invocations(&ob.tokens)
+            .into_iter()
+            .find(|m| inc_macros.contains(m))
+    {
+        errs.push(format!(
+            "{key}: invokes {m}!, which includes a file, from a new directory"
+        ));
+    }
+    errs
 }
 
 /// Macro and name resolution of both trees, comparable through the table.

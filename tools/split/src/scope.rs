@@ -439,3 +439,32 @@ fn glob_target(t: &Tree, module: &str, path: &str) -> Target {
         Target::Opaque(format!("glob {path} in {module}"))
     }
 }
+
+/// Names of `macro_rules!` in the tree that expand to an `include*!`,
+/// directly or through another such macro.
+pub fn including_macros(t: &Tree) -> BTreeSet<String> {
+    let defs: Vec<(&str, Vec<String>, bool)> = t
+        .leaves
+        .iter()
+        .filter(|l| l.kind == "macro")
+        .map(|l| {
+            let inc = !crate::tree::includes(&l.tokens).is_empty()
+                || crate::tree::INCLUDES
+                    .iter()
+                    .any(|m| l.tokens.contains(&format!("{m} !")));
+            (l.name.as_str(), invocations(&l.tokens), inc)
+        })
+        .collect();
+    let mut set: BTreeSet<String> = BTreeSet::new();
+    loop {
+        let before = set.len();
+        for (name, calls, inc) in &defs {
+            if *inc || calls.iter().any(|c| set.contains(c)) {
+                set.insert((*name).to_string());
+            }
+        }
+        if set.len() == before {
+            return set;
+        }
+    }
+}
