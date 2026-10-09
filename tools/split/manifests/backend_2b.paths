@@ -1648,7 +1648,6 @@ kms::render::backend::kms::present::impl KmsBackend::fn backend_present_drain_re
 kms::render::backend::kms::present::impl KmsBackend::fn backend_present_begin_ready_present_destination_write => kms::render::backend::kms::present::impl KmsBackend::fn backend_present_begin_ready_present_destination_write
 kms::render::backend::kms::present::impl KmsBackend::fn backend_present_finish_present_source_wait => kms::render::backend::kms::present::impl KmsBackend::fn backend_present_finish_present_source_wait
 kms::render::backend::kms::present::impl KmsBackend::fn backend_present_present_absolute_vblank_arm_supported => kms::render::backend::kms::present::impl KmsBackend::fn backend_present_present_absolute_vblank_arm_supported
-kms::render::backend::kms::present::impl KmsBackend::fn backend_present_arm_present_absolute_vblank => kms::render::backend::kms::present::impl KmsBackend::fn backend_present_arm_present_absolute_vblank
 kms::render::backend::kms::present::impl KmsBackend::fn backend_present_pin_present_source => kms::render::backend::kms::present::impl KmsBackend::fn backend_present_pin_present_source
 kms::render::backend::kms::present::impl KmsBackend::fn backend_present_release_present_source => kms::render::backend::kms::present::impl KmsBackend::fn backend_present_release_present_source
 kms::render::backend::kms::present::impl KmsBackend::fn backend_present_enqueue_present_completion => kms::render::backend::kms::present::impl KmsBackend::fn backend_present_enqueue_present_completion

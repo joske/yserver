@@ -1106,28 +1106,7 @@ impl Backend for KmsBackend {
     }
 
     fn note_present_pixmap(&mut self, src_pixmap_xid: u32, dst_window_xid: u32) {
-        const PRESENT_CAP: usize = 32;
-
-        if self.scanout_m2.unflip_requested
-            && self
-                .store
-                .lookup(src_pixmap_xid)
-                .is_some_and(|source| Some(source) == self.scanout_m2.unflip_fallback_source)
-        {
-            self.scanout_m2.unflip_fallback_source = None;
-            self.scanout_m2.unflip_shadow_ready = true;
-            log::debug!(
-                "scanout_m2: normal Present Copy prepared composed fallback source=0x{src_pixmap_xid:x}"
-            );
-        }
-
-        if self.recent_present_pixmaps.back() != Some(&(src_pixmap_xid, dst_window_xid)) {
-            if self.recent_present_pixmaps.len() == PRESENT_CAP {
-                self.recent_present_pixmaps.pop_front();
-            }
-            self.recent_present_pixmaps
-                .push_back((src_pixmap_xid, dst_window_xid));
-        }
+        Self::backend_present_note_present_pixmap(self, src_pixmap_xid, dst_window_xid)
     }
 
     fn note_present_scanout_candidate(&mut self, candidate: PresentScanoutCandidate) {
@@ -1139,170 +1118,7 @@ impl Backend for KmsBackend {
         candidate: PresentScanoutCandidate,
         event: yserver_core::backend::CompletedPresentEvent,
     ) -> io::Result<bool> {
-        if self.scanout_m2.reentry_blocked_until_composed {
-            return Ok(false);
-        }
-        let source_id = self.store.lookup(candidate.src_host_xid);
-        let leaf_id = self.store.lookup(candidate.paint_dst_host_xid);
-        let paint_target = self.resolve_paint_target(candidate.paint_dst_host_xid);
-        let paint_id = paint_target.map(|target| target.backing_id());
-        let target = self.scanout_m0_target(candidate.paint_dst_host_xid, leaf_id, paint_id);
-        let root = (u32::from(self.platform.fb_w), u32::from(self.platform.fb_h));
-        let root_coverage = leaf_id
-            .and_then(|id| self.window_absolute_rect(id))
-            .is_some_and(|rect| {
-                rect.offset.x == 0
-                    && rect.offset.y == 0
-                    && (rect.extent.width, rect.extent.height) == root
-                    && (
-                        u32::from(candidate.src_width),
-                        u32::from(candidate.src_height),
-                    ) == root
-            });
-        let authoritative_root = scanout_m2_is_authoritative_root(target, root_coverage);
-        let scene_eligible = (!matches!(target, ScanoutM0Target::Unredirected)
-            || self.unredirected_direct_scene_eligible(candidate.paint_dst_host_xid, root))
-            && self.direct_shape_chain_covers_root(candidate.paint_dst_host_xid, root);
-        // #133 step 3 (3.5): reject any candidate whose resolved paint
-        // chain carries a border clip. `has_border_clip()` is true iff
-        // some window between the presented drawable and its backing has
-        // `border_width > 0`, which is exactly the case where content no
-        // longer starts at storage (0, 0). A candidate that does not
-        // resolve at all is rejected further down.
-        let unbordered = paint_target.is_none_or(|t| !t.has_border_clip());
-        // No transformed CRTC is ever flipped directly (spec D5).
-        let eligible = !self.platform.any_output_transformed()
-            && self.direct_present_crtc_eligible(candidate.crtc_id, candidate.crtc_epoch)
-            && scanout_direct_eligible(
-                self.scanout_allowed(),
-                self.kms_outputs_active,
-                matches!(
-                    self.scene.cursor_mode(),
-                    crate::kms::render::scene::CursorPlaneMode::Hw
-                ),
-                self.scene.root_overlay.is_empty(),
-                authoritative_root && scene_eligible,
-                unbordered,
-                candidate.x_off,
-                candidate.y_off,
-                candidate.valid_region_xid,
-            );
-        if !eligible {
-            // A child/video/game Present updates the COW shadow, but Muffin's
-            // currently scanned root-stage buffer remains authoritative until
-            // Muffin presents its next root frame. Unflipping for every child
-            // Present turns playback into direct/composed thrash. Only an
-            // ineligible authoritative-root successor invalidates the direct
-            // ownership contract and must expose the Copy fallback.
-            if authoritative_root {
-                self.scanout_m2.reset_eligible_root_probation();
-                self.request_direct_unflip("ineligible_authoritative_root_present");
-                if self.scanout_m2.active() {
-                    self.scanout_m2.unflip_fallback_source = source_id;
-                    self.scanout_m2.unflip_shadow_ready = false;
-                }
-            }
-            return Ok(false);
-        }
-        let Some((completion_output_idx, _)) = self.present_crtc_output(candidate.crtc_id) else {
-            return Ok(false);
-        };
-        debug_assert_eq!(
-            event.crtc_id, candidate.crtc_id,
-            "direct candidate and completion must share one CRTC domain"
-        );
-        debug_assert_eq!(
-            event.crtc_epoch, candidate.crtc_epoch,
-            "direct candidate and completion must share one CRTC epoch"
-        );
-
-        if !self.scanout_m2.admit_eligible_root() {
-            return Ok(false);
-        }
-
-        // Finish a previously-requested composed replacement (cursor seam,
-        // overlay, or failed direct successor) before allowing direct re-entry.
-        // Otherwise a fast Present stream can repeatedly replace a partial
-        // dual-head unflip and starve the CRTC that did not submit yet.
-        if self.scanout_m2.unflip_requested {
-            return Ok(false);
-        }
-
-        let Some(source_id) = source_id else {
-            self.request_direct_unflip("eligible_direct_successor_source_missing");
-            return Ok(false);
-        };
-        let Some(fallback_target) = paint_target else {
-            self.request_direct_unflip("eligible_direct_successor_paint_target_missing");
-            return Ok(false);
-        };
-        if self.scanout_m2.active() {
-            // Set only on an actual fallback below. An eligible successor
-            // queued behind a direct flip must leave direct ownership intact.
-            self.scanout_m2.unflip_fallback_source = None;
-        }
-        let framebuffer_ready = self
-            .scanout_m1
-            .entries
-            .get(&source_id)
-            .and_then(ScanoutM1ProbeEntry::framebuffer)
-            .is_some();
-        if !framebuffer_ready {
-            self.request_direct_unflip("eligible_direct_successor_framebuffer_missing");
-            return Ok(false);
-        }
-
-        let source_pin = self.pin_direct_source(source_id);
-        let fallback_target_pin = self.pin_direct_source(fallback_target.backing_id());
-        let present_id = candidate.present_id;
-        let mut frame = DirectPresentFrame {
-            source_pin,
-            fallback_target_pin,
-            source_id,
-            candidate,
-            fallback_target,
-            event,
-            completion_output_idx,
-            completion_clock: None,
-            awaiting_outputs: HashSet::new(),
-        };
-
-        if self.scanout_m2.pending.is_some() {
-            self.retain_direct_present_wake(&frame.event);
-            self.queue_direct_successor(frame);
-            return Ok(true);
-        }
-        if self.scene.has_pending_page_flips() {
-            self.request_direct_unflip("eligible_direct_successor_scene_flip_pending");
-            self.scanout_m2.unflip_fallback_source = Some(source_id);
-            self.scanout_m2.unflip_shadow_ready = false;
-            <Self as Backend>::release_present_source(self, source_pin);
-            <Self as Backend>::release_present_source(self, fallback_target_pin);
-            return Ok(false);
-        }
-        if let Err(error) = self.submit_direct_frame(&mut frame) {
-            self.request_direct_unflip("eligible_direct_successor_submit_failed");
-            <Self as Backend>::release_present_source(self, source_pin);
-            <Self as Backend>::release_present_source(self, fallback_target_pin);
-            self.scanout_m2.reset_eligible_root_probation();
-            return Err(error);
-        }
-
-        self.retain_direct_present_wake(&frame.event);
-        self.scanout_m2.pending = Some(frame);
-        self.scanout_m2.hold_direct = true;
-        self.scanout_m2.unflip_requested = false;
-        self.scanout_m2.unflip_reason = None;
-        self.scanout_m2.unflip_last_reason = None;
-        self.scanout_m2.unflip_fallback_source = None;
-        self.scanout_m2.unflip_shadow_ready = false;
-        log::debug!(
-            "scanout_m2: live direct submit source_id={} present_id={} outputs={}",
-            source_id.as_u64(),
-            present_id,
-            self.platform.outputs.len()
-        );
-        Ok(true)
+        Self::backend_present_try_present_direct(self, candidate, event)
     }
 
     fn note_present_skip(&mut self) {
@@ -1314,119 +1130,11 @@ impl Backend for KmsBackend {
         src_pixmap_host_xid: u32,
         dst_window_host_xid: u32,
     ) -> io::Result<PresentSourceWait> {
-        use std::os::fd::AsFd;
-
-        use crate::kms::{
-            render::present_source_wait::{PendingPresentSourceWait, PendingWaitFd},
-            vk::dri3::{
-                ExportedSyncFile, export_dmabuf_read_access_sync_file,
-                export_dmabuf_write_access_sync_file,
-            },
-        };
-
-        let Some(src_id) = self.store.lookup(src_pixmap_host_xid) else {
-            return Ok(PresentSourceWait::Ready);
-        };
-        let mut fds = Vec::new();
-        if let Some(fd) = self
-            .store
-            .get(src_id)
-            .and_then(|d| d.storage.imported_drawable.as_ref())
-            .and_then(crate::kms::vk::target::DrawableImage::imported_dma_buf_fd)
-        {
-            match export_dmabuf_read_access_sync_file(fd) {
-                ExportedSyncFile::Idle => {}
-                ExportedSyncFile::Unsupported => {
-                    if self.dmabuf_sync_file_warned.replace(true) {
-                        log::debug!(
-                            target: "yserver::kms::render::present",
-                            "present source 0x{src_pixmap_host_xid:x}: dma-buf sync-file export unsupported; copying immediately",
-                        );
-                    } else {
-                        log::warn!(
-                            target: "yserver::kms::render::present",
-                            "dma-buf sync-file export unsupported on this kernel; Present \
-                             sources and destinations will copy immediately for the rest of \
-                             this session (first seen at present source 0x{src_pixmap_host_xid:x}). Logged once; \
-                             further occurrences at debug.",
-                        );
-                    }
-                }
-                ExportedSyncFile::Fd(fd) => fds.push(PendingWaitFd {
-                    fd,
-                    registered: false,
-                    ready: false,
-                }),
-            }
-        }
-
-        let destination_id = self
-            .resolve_paint_target(dst_window_host_xid)
-            .map(|t| t.backing_id());
-        let mut prewaited_destination = None;
-        if let Some(dst_id) = destination_id
-            && let Some(fd) = self.store.exported_sync_fd(dst_id)
-        {
-            match export_dmabuf_write_access_sync_file(fd.as_fd()) {
-                ExportedSyncFile::Idle => {}
-                ExportedSyncFile::Unsupported => {
-                    if self.dmabuf_sync_file_warned.replace(true) {
-                        log::debug!(
-                            target: "yserver::kms::render::present",
-                            "present destination 0x{dst_window_host_xid:x}: dma-buf sync-file export unsupported; copying immediately",
-                        );
-                    } else {
-                        log::warn!(
-                            target: "yserver::kms::render::present",
-                            "dma-buf sync-file export unsupported on this kernel; Present \
-                             sources and destinations will copy immediately for the rest of \
-                             this session (first seen at present destination \
-                             0x{dst_window_host_xid:x}). Logged once; further occurrences at debug.",
-                        );
-                    }
-                }
-                ExportedSyncFile::Fd(fd) => {
-                    fds.push(PendingWaitFd {
-                        fd,
-                        registered: false,
-                        ready: false,
-                    });
-                    prewaited_destination = Some(dst_id);
-                }
-            }
-        }
-
-        let mut pending = PendingPresentSourceWait {
-            fds,
-            source_id: src_id,
-            prewaited_destination,
-            syncobj_pin: None,
-            timeline_value: None,
-            poll_timeline: false,
-            ready_reported: false,
-        };
-        if pending.is_ready() {
-            return Ok(PresentSourceWait::Ready);
-        }
-
-        let wait_id = self.next_present_source_wait_id;
-        self.next_present_source_wait_id = self.next_present_source_wait_id.wrapping_add(1).max(1);
-        self.store.incref(src_id);
-        for wait_fd in &mut pending.fds {
-            match self
-                .platform
-                .present_completion_epfd
-                .register(wait_fd.fd.as_fd(), wait_id)
-            {
-                Ok(()) => wait_fd.registered = true,
-                Err(e) => log::warn!(
-                    target: "yserver::kms::render::present",
-                    "present 0x{src_pixmap_host_xid:x}: readiness registration failed: {e}; polling",
-                ),
-            }
-        }
-        self.pending_present_source_waits.insert(wait_id, pending);
-        Ok(PresentSourceWait::Deferred(wait_id))
+        Self::backend_present_arm_present_source_wait(
+            self,
+            src_pixmap_host_xid,
+            dst_window_host_xid,
+        )
     }
 
     fn arm_present_syncobj_wait(
@@ -1436,217 +1144,25 @@ impl Backend for KmsBackend {
         acquire_syncobj: u32,
         acquire_value: u64,
     ) -> io::Result<PresentSourceWait> {
-        use std::os::fd::AsFd;
-
-        use crate::kms::{
-            render::present_source_wait::{PendingPresentSourceWait, PendingWaitFd},
-            vk::dri3::{ExportedSyncFile, export_dmabuf_write_access_sync_file},
-        };
-
-        let Some(src_id) = self.store.lookup(src_pixmap_host_xid) else {
-            return Ok(PresentSourceWait::Ready);
-        };
-        let (syncobj, event_fd) = if acquire_syncobj == 0 {
-            (None, None)
-        } else {
-            let syncobj = self
-                .dri3_syncobjs
-                .get(&acquire_syncobj)
-                .map(|(_, arc)| arc.clone())
-                .ok_or_else(|| {
-                    io::Error::other(format!(
-                        "PresentPixmapSynced: unknown acquire syncobj 0x{acquire_syncobj:x}"
-                    ))
-                })?;
-            // Skip the ioctl entirely once it has proven unavailable: this
-            // runs per Present, and on a kernel without the eventfd
-            // interface every call fails identically.
-            // Probe the ioctl once, with arguments we control, rather than
-            // classifying a per-Present failure by errno: FreeBSD returns
-            // EINVAL here, which is indistinguishable from a bad argument on a
-            // kernel that does support it.
-            let supported = match self.syncobj_eventfd_supported {
-                Some(v) => v,
-                None => {
-                    let v = self
-                        .platform
-                        .selected_render_device()
-                        .and_then(|device| device.render_node_device.as_ref())
-                        .is_some_and(crate::kms::render::imported_syncobj::eventfd_supported);
-                    self.syncobj_eventfd_supported = Some(v);
-                    if !v {
-                        log::warn!(
-                            target: "yserver::kms::render::present",
-                            "DRM syncobj eventfd unsupported on this kernel; EVERY \
-                             PresentPixmapSynced acquire will use the timeline poll for \
-                             the rest of this session. Logged once.",
-                        );
-                    }
-                    v
-                }
-            };
-            let event_fd = if supported {
-                match syncobj.signaled_eventfd(acquire_value) {
-                    Ok(fd) => Some(fd),
-                    Err(e) => {
-                        // The probe said the ioctl works, so this is a real
-                        // per-call failure and worth reporting every time --
-                        // it should not recur.
-                        log::warn!(
-                            target: "yserver::kms::render::present",
-                            "PresentPixmapSynced DRM eventfd registration failed ({e}); \
-                             polling this acquire",
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            (Some(syncobj), event_fd)
-        };
-        let poll_timeline = syncobj.is_some() && event_fd.is_none();
-        let mut fds: Vec<PendingWaitFd> = event_fd
-            .into_iter()
-            .map(|fd| PendingWaitFd {
-                fd,
-                registered: false,
-                ready: false,
-            })
-            .collect();
-        let destination_id = self
-            .resolve_paint_target(dst_window_host_xid)
-            .map(|t| t.backing_id());
-        let mut prewaited_destination = None;
-        if let Some(dst_id) = destination_id
-            && let Some(fd) = self.store.exported_sync_fd(dst_id)
-        {
-            match export_dmabuf_write_access_sync_file(fd.as_fd()) {
-                ExportedSyncFile::Idle => {}
-                ExportedSyncFile::Unsupported => {
-                    if self.dmabuf_sync_file_warned.replace(true) {
-                        log::debug!(
-                            target: "yserver::kms::render::present",
-                            "PresentPixmapSynced destination 0x{dst_window_host_xid:x}: dma-buf sync-file export unsupported; copying immediately",
-                        );
-                    } else {
-                        log::warn!(
-                            target: "yserver::kms::render::present",
-                            "dma-buf sync-file export unsupported on this kernel; Present \
-                             sources and destinations will copy immediately for the rest of \
-                             this session (first seen at PresentPixmapSynced destination \
-                             0x{dst_window_host_xid:x}). Logged once; further occurrences at debug.",
-                        );
-                    }
-                }
-                ExportedSyncFile::Fd(fd) => {
-                    fds.push(PendingWaitFd {
-                        fd,
-                        registered: false,
-                        ready: false,
-                    });
-                    prewaited_destination = Some(dst_id);
-                }
-            }
-        }
-        let mut pending = PendingPresentSourceWait {
-            fds,
-            source_id: src_id,
-            prewaited_destination,
-            syncobj_pin: syncobj,
-            timeline_value: (acquire_syncobj != 0).then_some(acquire_value),
-            poll_timeline,
-            ready_reported: false,
-        };
-        if pending.is_ready() {
-            log::debug!(
-                target: "present_pace",
-                "present acquire already signaled syncobj=0x{acquire_syncobj:x} value={acquire_value}"
-            );
-            return Ok(PresentSourceWait::Ready);
-        }
-
-        let wait_id = self.next_present_source_wait_id;
-        self.next_present_source_wait_id = self.next_present_source_wait_id.wrapping_add(1).max(1);
-        self.store.incref(src_id);
-        for wait_fd in &mut pending.fds {
-            match self
-                .platform
-                .present_completion_epfd
-                .register(wait_fd.fd.as_fd(), wait_id)
-            {
-                Ok(()) => wait_fd.registered = true,
-                Err(e) => log::warn!(
-                    target: "yserver::kms::render::present",
-                    "PresentPixmapSynced acquire eventfd registration failed: {e}; polling",
-                ),
-            }
-        }
-        self.pending_present_source_waits.insert(wait_id, pending);
-        Ok(PresentSourceWait::Deferred(wait_id))
+        Self::backend_present_arm_present_syncobj_wait(
+            self,
+            src_pixmap_host_xid,
+            dst_window_host_xid,
+            acquire_syncobj,
+            acquire_value,
+        )
     }
 
     fn drain_ready_present_source_waits(&mut self) -> Vec<u64> {
-        use std::os::fd::AsFd;
-
-        let mut ready = Vec::new();
-        for (&wait_id, wait) in &mut self.pending_present_source_waits {
-            if wait.ready_reported {
-                continue;
-            }
-            for wait_fd in &mut wait.fds {
-                if wait_fd.refresh_ready()
-                    && wait_fd.registered
-                    && let Err(e) = self
-                        .platform
-                        .present_completion_epfd
-                        .unregister(wait_fd.fd.as_fd())
-                {
-                    log::warn!("deferred Present source: readiness unregister failed: {e}");
-                }
-                if wait_fd.ready {
-                    wait_fd.registered = false;
-                }
-            }
-            if !wait.is_ready() {
-                continue;
-            }
-            wait.ready_reported = true;
-            ready.push(wait_id);
-        }
-        ready
+        Self::backend_present_drain_ready_present_source_waits(self)
     }
 
     fn begin_ready_present_destination_write(&mut self, wait_id: u64) {
-        if let Some(id) = self
-            .pending_present_source_waits
-            .get(&wait_id)
-            .and_then(|wait| wait.prewaited_destination)
-        {
-            self.store.begin_prewaited_exported_write(id);
-        }
+        Self::backend_present_begin_ready_present_destination_write(self, wait_id)
     }
 
     fn finish_present_source_wait(&mut self, wait_id: u64) {
-        use std::os::fd::AsFd;
-
-        let Some(wait) = self.pending_present_source_waits.remove(&wait_id) else {
-            return;
-        };
-        for wait_fd in &wait.fds {
-            if wait_fd.registered
-                && let Err(e) = self
-                    .platform
-                    .present_completion_epfd
-                    .unregister(wait_fd.fd.as_fd())
-            {
-                log::warn!("deferred Present source: readiness unregister failed: {e}");
-            }
-        }
-        if let Some(id) = wait.prewaited_destination {
-            self.store.end_prewaited_exported_write(id);
-        }
-        self.store_decref_with_invalidate(wait.source_id);
+        Self::backend_present_finish_present_source_wait(self, wait_id)
     }
 
     fn present_flip_in_flight(&self, crtc_id: u32) -> bool {
@@ -1660,11 +1176,7 @@ impl Backend for KmsBackend {
     }
 
     fn present_absolute_vblank_arm_supported(&self, crtc_id: u32) -> bool {
-        self.present_crtc_key(crtc_id).is_some_and(|key| {
-            !self
-                .crtc_queue_sequence_unsupported_devices
-                .contains(&key.device_key)
-        })
+        Self::backend_present_present_absolute_vblank_arm_supported(self, crtc_id)
     }
 
     fn arm_present_absolute_vblank(
@@ -1721,19 +1233,11 @@ impl Backend for KmsBackend {
     }
 
     fn pin_present_source(&mut self, host_xid: u32) -> Option<u64> {
-        let id = self.store.lookup(host_xid)?;
-        self.store.incref(id);
-        let pin_id = self.next_present_source_pin_id;
-        self.next_present_source_pin_id = self.next_present_source_pin_id.wrapping_add(1).max(1);
-        self.present_source_pins.insert(pin_id, id);
-        Some(pin_id)
+        Self::backend_present_pin_present_source(self, host_xid)
     }
 
     fn release_present_source(&mut self, pin_id: u64) {
-        let Some(id) = self.present_source_pins.remove(&pin_id) else {
-            return;
-        };
-        self.store_decref_with_invalidate(id);
+        Self::backend_present_release_present_source(self, pin_id)
     }
 
     fn poll_fds(&self) -> Vec<(std::os::fd::RawFd, BackendFdKind)> {
@@ -4805,182 +4309,7 @@ impl Backend for KmsBackend {
         event: yserver_core::backend::CompletedPresentEvent,
         dst_host_xid: u32,
     ) {
-        use yserver_core::backend::PresentWake;
-
-        use crate::kms::render::present_completion::{
-            PendingPresentBatch, PendingPresentEntry, PinnedWake, PresentBatchWait,
-        };
-
-        let wake_pin = match &event.wake {
-            PresentWake::Pixmap { idle_fence_xid } if *idle_fence_xid != 0 => {
-                match self.dri3_xshmfence_handle(*idle_fence_xid) {
-                    Some(h) => PinnedWake::Pixmap(h),
-                    None => PinnedWake::None,
-                }
-            }
-            PresentWake::PixmapSynced {
-                release,
-                release_syncobj,
-                release_value,
-            } if *release_syncobj != 0 => PinnedWake::PixmapSynced {
-                handle: release.clone(),
-                value: *release_value,
-            },
-            _ => PinnedWake::None,
-        };
-
-        let mut entry = PendingPresentEntry { wake_pin, event };
-
-        if let Some(cow_id) = self.cow_id
-            && self.store.lookup(dst_host_xid) == Some(cow_id)
-        {
-            match self.engine.attach_present_completion(cow_id, entry) {
-                Ok(()) => return,
-                Err(returned) => entry = returned,
-            }
-        }
-
-        // The copy wrote wherever `resolve_paint_target` routed it: a window
-        // inside a redirected parent shares that ancestor's backing, not its
-        // own leaf storage. Unviewable windows resolve to None (copy dropped).
-        // A shared backing may also match another writer's op when this
-        // copy clipped to nothing; harmless, the signal still follows it.
-        let completion_target = self
-            .resolve_paint_target(dst_host_xid)
-            .map(PaintTarget::backing_id);
-
-        // Phase A: close any open render batch FIRST so its CBs land
-        // in the group under the same ticket the flush will consume.
-        // Then ensure all prior paint is on the queue BEFORE the
-        // completion signal. Engine-driven so any parked pending_group_ops
-        // graduate to `submitted` atomically with the submit.
-        // Spec § "Phase A — concrete scope" trigger 2 (Codex pass-3 fix).
-        if let Err(e) = self.engine.flush_render_batch(
-            &mut self.store,
-            &mut self.platform,
-            crate::kms::render::engine::RenderFlushReason::Present,
-        ) {
-            log::warn!("render enqueue_present_completion: flush_render_batch failed: {e:?}");
-        }
-
-        // #214: when the open frame holds the copy (an op writing the
-        // destination), attach the completion to it and close it now: the
-        // export signal rides the paint submit, one vkQueueSubmit2 instead
-        // of paint + a signal-only submit. The close publishes the release
-        // fence and hands the batch to the completion scheduler; a close
-        // that fails keeps the entry as a ready batch (never dropped).
-        // Otherwise (copy already submitted, clipped to nothing, or recorded
-        // another way) fall through to the signal-only submit.
-        if let Some(dst_id) = completion_target {
-            match self.engine.attach_present_completion(dst_id, entry) {
-                Ok(()) => {
-                    if let Err(e) = self.engine.close_open_frame(
-                        &mut self.store,
-                        &mut self.platform,
-                        crate::kms::render::frame_builder::CloseReason::PresentCompletionSignal,
-                    ) {
-                        log::warn!(
-                            "render enqueue_present_completion: close_open_frame failed: {e:?}"
-                        );
-                    }
-                    self.drain_frame_builder_telemetry();
-                    self.drain_engine_present_batches();
-                    return;
-                }
-                Err(returned) => entry = returned,
-            }
-        }
-        // Phase B.1 close trigger 1b: close any open frame before the
-        // signal-only submit so the semaphore-export's SYNC_FD captures a
-        // queued signal-op for ANY paint work that came through the frame
-        // builder. Same hazard as Task 6.1 (VUID-VkFenceGetFdInfoKHR-handleType-01457).
-        if let Err(e) = self.engine.close_open_frame(
-            &mut self.store,
-            &mut self.platform,
-            crate::kms::render::frame_builder::CloseReason::PresentCompletionSignal,
-        ) {
-            log::warn!("render enqueue_present_completion: close_open_frame failed: {e:?}");
-        }
-        // Phase B.1 Task 21: drain frame-builder close events into telemetry.
-        self.drain_frame_builder_telemetry();
-        if let Err(e) = self.engine.flush_submit_group(
-            &mut self.store,
-            &mut self.platform,
-            crate::kms::render::submit_group::FlushReason::PresentCompletionSignal,
-        ) {
-            log::warn!("render enqueue_present_completion: flush_submit_group failed: {e:?}");
-            // Fall through; the signal-only submit will fail with
-            // renderer_failed and the caller's error handling kicks in.
-        }
-
-        let fallback_ticket = completion_target
-            .or_else(|| self.store.lookup(dst_host_xid))
-            .and_then(|id| self.store.get(id))
-            .and_then(|d| d.last_render_ticket.clone());
-
-        let mut batch_ticket = fallback_ticket;
-        let (wait, signal) = match (
-            self.platform.acquire_present_completion_signal(),
-            self.platform.acquire_fence_ticket(),
-        ) {
-            (Ok(signal), Ok(ticket)) => {
-                match self
-                    .platform
-                    .submit_present_completion_signal(&signal, ticket.fence())
-                {
-                    Ok(()) => {
-                        batch_ticket = Some(ticket);
-                        match signal.export_sync_file_fd() {
-                            Ok(Some(fd)) => {
-                                if let Err(e) = entry.publish_release_fence(&fd) {
-                                    log::warn!(
-                                        "enqueue_present_completion: publish Present release \
-                                         fence failed: {e}; falling back to host signal"
-                                    );
-                                }
-                                (PresentBatchWait::Fd(fd), Some(signal))
-                            }
-                            Ok(None) => (PresentBatchWait::Ready, Some(signal)),
-                            Err(e) => {
-                                log::warn!(
-                                    "enqueue_present_completion: vkGetSemaphoreFdKHR(SYNC_FD) failed: {e:?}; \
-                                     falling back to FenceTicket polling"
-                                );
-                                (PresentBatchWait::Poll, Some(signal))
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "enqueue_present_completion: signal-only queue submit failed: {e:?}; \
-                             falling back to prior FenceTicket polling"
-                        );
-                        (PresentBatchWait::Poll, Some(signal))
-                    }
-                }
-            }
-            (Err(e), _) => {
-                log::warn!(
-                    "enqueue_present_completion: completion semaphore allocation failed: {e:?}; \
-                     falling back to FenceTicket polling"
-                );
-                (PresentBatchWait::Poll, None)
-            }
-            (Ok(_signal), Err(e)) => {
-                log::warn!(
-                    "enqueue_present_completion: completion fence allocation failed: {e:?}; \
-                     falling back to prior FenceTicket polling"
-                );
-                (PresentBatchWait::Poll, None)
-            }
-        };
-
-        self.register_pending_present_batch(PendingPresentBatch {
-            wait,
-            ticket: batch_ticket,
-            signal,
-            events: vec![entry],
-        });
+        Self::backend_present_enqueue_present_completion(self, event, dst_host_xid)
     }
 
     /// Stage 5 Task 6.1 — drain batches whose completion semaphore has
@@ -4990,9 +4319,7 @@ impl Backend for KmsBackend {
     fn drain_completed_present_events(
         &mut self,
     ) -> Vec<yserver_core::backend::CompletedPresentEvent> {
-        let mut completed = self.drain_completed_present_events_impl();
-        completed.append(&mut self.scanout_m2.completed);
-        completed
+        Self::backend_present_drain_completed_present_events(self)
     }
 
     fn drain_retired_present_idle_events(
@@ -5002,60 +4329,22 @@ impl Backend for KmsBackend {
     }
 
     fn signal_present_wake(&mut self, present_id: u64) {
-        use crate::kms::render::present_completion::PinnedWake;
-        let Some(pin) = self.retained_present_wakes.remove(&present_id) else {
-            return;
-        };
-        match pin {
-            PinnedWake::Pixmap(h) => {
-                if let Err(e) = self.dri3_trigger_fence_via_handle(&h) {
-                    log::warn!("signal_present_wake: dri3_trigger_fence_via_handle failed: {e}");
-                }
-            }
-            PinnedWake::PixmapSynced { handle, value } => {
-                if let Err(e) = self.dri3_signal_syncobj_via_handle(&handle, value) {
-                    log::warn!("signal_present_wake: dri3_signal_syncobj_via_handle failed: {e}");
-                }
-            }
-            // The release point already carries the GPU completion fence.
-            // Consuming the pin here drops its retained handle without
-            // advancing the timeline from the host.
-            PinnedWake::PixmapSyncedFencePublished {
-                handle: _handle,
-                value: _value,
-            } => {}
-            PinnedWake::None => {}
-        }
+        Self::backend_present_signal_present_wake(self, present_id)
     }
 
     fn present_crtc_clock_epoch(&self, crtc_id: u32) -> u64 {
-        let Some(crtc_key) = self.present_crtc_key(crtc_id) else {
-            return 0;
-        };
-        self.present_crtc_clock_epochs
-            .get(&crtc_id)
-            .filter(|(epoch_key, _)| *epoch_key == crtc_key)
-            .map_or(0, |(_, epoch)| *epoch)
+        Self::backend_present_present_crtc_clock_epoch(self, crtc_id)
     }
 
     fn present_get_ust_msc(&self, crtc_id: u32) -> (u64, u64) {
-        self.present_crtc_key(crtc_id).map_or((0, 0), |crtc_key| {
-            self.platform.present_get_ust_msc(crtc_key)
-        })
+        Self::backend_present_present_get_ust_msc(self, crtc_id)
     }
 
     fn present_get_completion_clock(
         &self,
         crtc_id: u32,
     ) -> yserver_core::backend::PresentClockSample {
-        self.present_crtc_key(crtc_id).map_or(
-            yserver_core::backend::PresentClockSample {
-                msc: 0,
-                ust: 0,
-                source: yserver_core::backend::PresentClockSource::PageFlip,
-            },
-            |crtc_key| self.platform.present_get_completion_clock(crtc_key),
-        )
+        Self::backend_present_present_get_completion_clock(self, crtc_id)
     }
 
     fn arm_idle_vblanks(&mut self, crtc_id: u32, target_mscs: &[u64]) -> std::io::Result<usize> {
@@ -5067,24 +4356,11 @@ impl Backend for KmsBackend {
         crtc_id: u32,
         target_mscs: &[u64],
     ) -> std::io::Result<usize> {
-        let Some(crtc_key) = self.present_crtc_key(crtc_id) else {
-            return Ok(0);
-        };
-        if !self.present_completion_is_idle_for(crtc_key) {
-            return Ok(0);
-        }
-        self.arm_idle_vblanks_ioctl(crtc_id, target_mscs)
+        Self::backend_present_arm_present_completion_idle_vblanks(self, crtc_id, target_mscs)
     }
 
     fn present_capabilities(&self, _window: u32) -> PresentCaps {
-        // Mirror v1's conservative "Copy-path only" caps. syncobj
-        // tracks Dri3Caps::syncobj. flip_path / async_may_tear stay
-        // false until alien-BO scanout integration lands on v2.
-        PresentCaps {
-            flip_path: false,
-            async_may_tear: false,
-            syncobj: self.dri3_capabilities().syncobj,
-        }
+        Self::backend_present_present_capabilities(self, _window)
     }
 
     // ── Other extensions ────────────────────────────────────────
