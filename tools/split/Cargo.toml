@@ -1,0 +1,16 @@
+[package]
+name = "split"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Item-level file splitter and move verifier for the source layout cleanup"
+
+# Standalone: not a member of the yserver workspace.
+[workspace]
+
+[dependencies]
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
+serde = { version = "1", features = ["derive"] }
+syn = { version = "2", features = ["full", "parsing", "printing"] }
+toml = "0.8"

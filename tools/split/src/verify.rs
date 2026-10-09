@@ -1,0 +1,432 @@
+//! `split verify`: the move changed placement only.
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
+
+use quote::ToTokens;
+use syn::{Expr, FnArg, ImplItemFn, Pat, Stmt, Visibility};
+
+use crate::{
+    apply::Manifest,
+    tree::{self, Leaf, Res, Source, Tree, dir_of, includes, join, tok},
+};
+
+pub struct Spec<'a> {
+    pub manifest: Option<&'a Manifest>,
+    pub old_root: String,
+    pub new_root: String,
+    pub module: String,
+    pub delegate: bool,
+}
+
+/// Old leaf key → new leaf key, from the manifest's table or the identity.
+pub fn table(spec: &Spec, before: &Tree) -> Res<BTreeMap<String, String>> {
+    let Some(m) = spec.manifest else {
+        return Ok(before.leaves.iter().map(|l| (l.okey(), l.key())).collect());
+    };
+    let text = std::fs::read_to_string(m.table_path())
+        .map_err(|e| format!("{}: {e}", m.table_path().display()))?;
+    text.lines()
+        .map(|l| {
+            l.split_once(" => ")
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .ok_or_else(|| format!("bad table line: {l}"))
+        })
+        .collect()
+}
+
+fn first_diff(a: &str, b: &str) -> String {
+    let i = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
+    let lo = i.saturating_sub(60);
+    let cut = |s: &str| s.get(lo..(i + 60).min(s.len())).unwrap_or("").to_string();
+    format!("\n      before: …{}…\n      after:  …{}…", cut(a), cut(b))
+}
+
+fn allowed_vis(v: &str) -> bool {
+    v == "pub (super)" || v.starts_with("pub (in ")
+}
+
+/// The trait body moved to an inherent fn and the trait method is now one
+/// forwarding call: returns the callee name.
+fn delegate_callee(old: &ImplItemFn, new: &ImplItemFn) -> Option<String> {
+    let mut a = new.clone();
+    a.block = old.block.clone();
+    a.vis = Visibility::Inherited;
+    let mut b = old.clone();
+    b.vis = Visibility::Inherited;
+    if tok(&a) != tok(&b) {
+        return None;
+    }
+    let [stmt] = new.block.stmts.as_slice() else {
+        return None;
+    };
+    let Stmt::Expr(Expr::MethodCall(mc), _) = stmt else {
+        return None;
+    };
+    let Expr::Path(recv) = &*mc.receiver else {
+        return None;
+    };
+    if !recv.path.is_ident("self") || mc.turbofish.is_some() {
+        return None;
+    }
+    let params: Vec<String> = old
+        .sig
+        .inputs
+        .iter()
+        .filter_map(|i| match i {
+            FnArg::Typed(pt) => Some(match &*pt.pat {
+                Pat::Ident(pi) => pi.ident.to_string(),
+                _ => String::new(),
+            }),
+            FnArg::Receiver(_) => None,
+        })
+        .collect();
+    let args: Vec<String> = mc
+        .args
+        .iter()
+        .map(|e| match e {
+            Expr::Path(p) => p
+                .path
+                .get_ident()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            _ => String::new(),
+        })
+        .collect();
+    (params == args && params.iter().all(|p| !p.is_empty())).then(|| mc.method.to_string())
+}
+
+fn same_body(old: &ImplItemFn, new: &ImplItemFn) -> bool {
+    tok(&old.block) == tok(&new.block)
+        && tok(&old.sig.inputs) == tok(&new.sig.inputs)
+        && tok(&old.sig.output) == tok(&new.sig.output)
+}
+
+pub fn run(spec: &Spec, base: &dyn Source, head: &dyn Source, touched: &[String]) -> Res<bool> {
+    let (info, errs) = check(spec, base, head, touched)?;
+    for l in info {
+        println!("{l}");
+    }
+    for e in &errs {
+        println!("FAIL {e}");
+    }
+    println!(
+        "{}",
+        if errs.is_empty() {
+            "verify: OK"
+        } else {
+            "verify: FAILED"
+        }
+    );
+    Ok(errs.is_empty())
+}
+
+/// Summary lines and failures.
+pub fn check(
+    spec: &Spec,
+    base: &dyn Source,
+    head: &dyn Source,
+    touched: &[String],
+) -> Res<(Vec<String>, Vec<String>)> {
+    let before = tree::load(base, &spec.old_root, &spec.module)?;
+    let after = tree::load(head, &spec.new_root, &spec.module)?;
+    let map = table(spec, &before)?;
+    let mut errs: Vec<String> = Vec::new();
+
+    let mut known: BTreeSet<&str> = before
+        .files
+        .iter()
+        .chain(&after.files)
+        .map(String::as_str)
+        .collect();
+    let extra_files: Vec<String> = spec
+        .manifest
+        .map(|m| vec![rel(&m.path), rel(&m.table_path())])
+        .unwrap_or_default();
+    known.extend(extra_files.iter().map(String::as_str));
+    for t in touched {
+        if !known.contains(t.as_str()) {
+            errs.push(format!("touched file outside the moved tree: {t}"));
+        }
+    }
+
+    // Path edits are keyed by old relative item key.
+    let mut edits: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    if let Some(m) = spec.manifest {
+        for e in &m.path_edits {
+            let old = m.full("") + "::" + &e.item;
+            let new = map
+                .get(&old)
+                .ok_or_else(|| format!("path edit: unknown item {}", e.item))?;
+            edits
+                .entry(new.clone())
+                .or_default()
+                .push((format!("{:?}", e.from), format!("{:?}", e.to)));
+        }
+    }
+    let vis_ok: BTreeMap<String, String> = spec
+        .manifest
+        .map(|m| {
+            m.visibility
+                .iter()
+                .filter_map(|(k, v)| {
+                    let old = format!("{}::{}", m.full(""), k);
+                    map.get(&old).map(|n| (n.clone(), norm_vis(v)))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut groups: BTreeMap<String, (Vec<&Leaf>, Vec<&Leaf>)> = BTreeMap::new();
+    for l in &before.leaves {
+        match map.get(&l.okey()) {
+            Some(n) => groups.entry(n.clone()).or_default().0.push(l),
+            None => errs.push(format!("{}: not in the path table", l.okey())),
+        }
+    }
+    for l in &after.leaves {
+        groups.entry(l.key()).or_default().1.push(l);
+    }
+
+    let norm_tokens = |key: &str, l: &Leaf| {
+        let mut t = l.tokens.clone();
+        for (from, to) in edits.get(key).into_iter().flatten() {
+            t = t.replace(to, from);
+        }
+        t
+    };
+    let (mut matched, mut vis_changes, mut incl, mut delegated) = (0, 0, 0, 0);
+    let mut delegations: Vec<(&Leaf, String)> = Vec::new();
+    let mut extra: Vec<&Leaf> = Vec::new();
+    for (key, (b, a)) in &groups {
+        let mut a: Vec<(&Leaf, String)> = a.iter().map(|l| (*l, norm_tokens(key, l))).collect();
+        let mut unpaired = Vec::new();
+        for ob in b {
+            match a
+                .iter()
+                .position(|(l, t)| *t == ob.tokens && l.ctx == ob.ctx)
+            {
+                Some(i) => {
+                    let (na, _) = a.remove(i);
+                    matched += 1;
+                    if na.vis != ob.vis {
+                        if ob.vis.is_empty()
+                            && allowed_vis(&na.vis)
+                            && vis_ok.get(key) == Some(&na.vis)
+                        {
+                            vis_changes += 1;
+                        } else {
+                            errs.push(format!(
+                                "{key}: visibility {:?} → {:?} not allowed by the manifest",
+                                ob.vis, na.vis
+                            ));
+                        }
+                    }
+                    if na.comments != ob.comments {
+                        errs.push(format!(
+                            "{key}: comments changed\n      before: {:?}\n      after:  {:?}",
+                            ob.comments, na.comments
+                        ));
+                    }
+                    for (po, pn) in includes(&ob.tokens).iter().zip(includes(&na.tokens)) {
+                        let (fo, fn_) = (join(dir_of(&ob.file), po), join(dir_of(&na.file), &pn));
+                        match (base.read(&fo), head.read(&fn_)) {
+                            (Some(x), Some(y)) if x == y => incl += 1,
+                            _ => errs.push(format!(
+                                "{key}: include {po:?} ({fo}) and {pn:?} ({fn_}) do not resolve to the same bytes"
+                            )),
+                        }
+                    }
+                }
+                None => unpaired.push(*ob),
+            }
+        }
+        for ob in unpaired {
+            if let Some(i) = a.iter().position(|(_, t)| *t == ob.tokens) {
+                let (na, _) = a.remove(i);
+                errs.push(format!(
+                    "{key}: effective cfg/attributes changed\n      before: {:?}\n      after:  {:?}",
+                    ob.ctx, na.ctx
+                ));
+            } else if let [(na, t)] = a.as_slice() {
+                let callee = (spec.delegate && ob.owner.as_ref().is_some_and(|o| o.is_trait))
+                    .then(|| {
+                        ob.func
+                            .as_ref()
+                            .zip(na.func.as_ref())
+                            .and_then(|(o, n)| delegate_callee(o, n))
+                    })
+                    .flatten();
+                match callee {
+                    Some(c) if na.ctx == ob.ctx => delegations.push((ob, c)),
+                    _ => errs.push(format!(
+                        "{key}: tokens changed ({}:{} → {}:{}){}",
+                        ob.file,
+                        ob.line,
+                        na.file,
+                        na.line,
+                        first_diff(&ob.tokens, t)
+                    )),
+                }
+                a.clear();
+            } else {
+                errs.push(format!(
+                    "{key}: missing after the move ({}:{})",
+                    ob.file, ob.line
+                ));
+            }
+        }
+        for (na, _) in a {
+            extra.push(na);
+        }
+    }
+
+    // Delegations: each marker must be claimed by one new inherent fn whose
+    // body and signature equal the old trait body.
+    let mut news = extra;
+    for (old, callee) in delegations {
+        let ofn = old.func.as_ref().expect("trait fn");
+        let pos = news.iter().position(|n| {
+            n.kind == "fn"
+                && n.name == callee
+                && n.ctx == old.ctx
+                && n.vis != "pub"
+                && n.owner.as_ref().is_some_and(|o| {
+                    !o.is_trait && o.self_ty == old.owner.as_ref().expect("owner").self_ty
+                })
+                && n.func.as_ref().is_some_and(|f| same_body(ofn, f))
+        });
+        match pos {
+            Some(i) => {
+                news.remove(i);
+                delegated += 1;
+            }
+            None => errs.push(format!(
+                "{}: forwards to self.{}(..) but no inherent fn carries the old body",
+                old.okey(),
+                callee
+            )),
+        }
+    }
+    for n in news {
+        errs.push(format!("{}: new leaf ({}:{})", n.key(), n.file, n.line));
+    }
+
+    // Re-exports and other non-private `use` items.
+    let pub_uses = |t: &Tree| -> BTreeMap<(String, String), usize> {
+        let mut m = BTreeMap::new();
+        for u in t.uses.iter().filter(|u| !u.vis.is_empty()) {
+            *m.entry((u.module.clone(), format!("{} {}", u.vis, u.tokens)))
+                .or_default() += 1;
+        }
+        m
+    };
+    let allow: BTreeSet<(String, String)> = spec
+        .manifest
+        .map(|m| {
+            m.modules
+                .iter()
+                .flat_map(|x| x.lines.iter().map(move |l| (m.full(&x.name), l)))
+                .filter_map(|(module, l)| {
+                    let mut u: syn::ItemUse = syn::parse_str(l).ok()?;
+                    let vis = tok(&u.vis);
+                    u.vis = Visibility::Inherited;
+                    (!vis.is_empty()).then(|| (module, format!("{vis} {}", tok(&u))))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let (ub, ua) = (pub_uses(&before), pub_uses(&after));
+    for (k, n) in &ua {
+        let had = ub.get(k).copied().unwrap_or(0);
+        if *n > had && !allow.contains(k) {
+            errs.push(format!("{}: re-export `{}` not in the manifest", k.0, k.1));
+        }
+    }
+    for (k, n) in &ub {
+        if ua.get(k).copied().unwrap_or(0) < *n {
+            errs.push(format!("{}: re-export `{}` removed", k.0, k.1));
+        }
+    }
+
+    // Comments outside leaves: none lost, none invented.
+    let mut pool: BTreeMap<&str, i64> = BTreeMap::new();
+    for c in &before.pool {
+        *pool.entry(c).or_default() += 1;
+    }
+    let after_set: BTreeSet<&str> = after.pool.iter().map(String::as_str).collect();
+    for c in &after.pool {
+        *pool.entry(c).or_default() -= 1;
+    }
+    for (c, n) in &pool {
+        if *n > 0 {
+            errs.push(format!("comment lost: {c:?}"));
+        } else if !before.pool.iter().any(|x| x == c) && after_set.contains(c) {
+            errs.push(format!("comment added: {c:?}"));
+        }
+    }
+
+    // Residual risk: names defined in more than one module may shadow.
+    let mut defs: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for l in after.leaves.iter().filter(|l| l.owner.is_none()) {
+        defs.entry(&l.name).or_default().insert(&l.module);
+    }
+    let shadow: Vec<String> = defs
+        .iter()
+        .filter(|(_, m)| m.len() > 1)
+        .map(|(n, m)| format!("{n} in {m:?}"))
+        .collect();
+
+    let (lb, la) = (line_bag(base, &before.files), line_bag(head, &after.files));
+    let removed: usize = lb
+        .iter()
+        .map(|(l, n)| n.saturating_sub(*la.get(l).unwrap_or(&0)))
+        .sum();
+    let added: usize = la
+        .iter()
+        .map(|(l, n)| n.saturating_sub(*lb.get(l).unwrap_or(&0)))
+        .sum();
+
+    let mut info = vec![
+        format!(
+            "leaves: {} before, {} after, {matched} identical; {vis_changes} manifest visibility changes; {incl} include paths same bytes; {delegated} delegations",
+            before.leaves.len(),
+            after.leaves.len()
+        ),
+        format!(
+            "files: {} → {}; line smoke (info): -{removed} +{added} lines",
+            before.files.len(),
+            after.files.len()
+        ),
+    ];
+    if !shadow.is_empty() {
+        info.push(format!(
+            "review, names defined in more than one module: {}",
+            shadow.join("; ")
+        ));
+    }
+    Ok((info, errs))
+}
+
+fn norm_vis(v: &str) -> String {
+    syn::parse_str::<Visibility>(v)
+        .map_or_else(|_| v.to_string(), |x| x.to_token_stream().to_string())
+}
+
+fn rel(p: &Path) -> String {
+    let s = p.to_string_lossy().to_string();
+    s.trim_start_matches("./").to_string()
+}
+
+fn line_bag(src: &dyn Source, files: &[String]) -> BTreeMap<String, usize> {
+    let mut m = BTreeMap::new();
+    for f in files {
+        let text = String::from_utf8_lossy(&src.read(f).unwrap_or_default()).to_string();
+        for l in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            *m.entry(l.to_string()).or_default() += 1;
+        }
+    }
+    m
+}
