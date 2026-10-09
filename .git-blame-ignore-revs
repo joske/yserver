@@ -71,3 +71,39 @@ eca005eb64a454f0b36ec2ff1c6011e7a2898148
 
 # refactor(kms): split backend into portable/kms/trait_impl modules (move)
 777758f4727f4bb88f0e580851b9bb1b8dd8a7f0
+
+# refactor(kms): delegate window trait methods to portable/windows helpers
+3d4037314accf85aeb9cdb0f51ec9d911ca687d4
+
+# refactor(kms): delegate redirect, backing and pixmap trait methods to portable/redirect helpers
+f74c626fcfacf21f7148d615dcab47a78eda801d
+
+# refactor(kms): delegate GC, clip and core drawing trait methods to portable/draw and clip helpers
+5da4011b5da2ee9995932c5c426d781d1a069621
+
+# refactor(kms): delegate RENDER trait methods to portable/render_ops, clip and text helpers
+d4d6ffc6472f7e8c4446ad5699bba2541dce1668
+
+# refactor(kms): delegate core text and font trait methods to portable/draw and text helpers
+08b63c594c07c7bafa5146e643fca487de1c6c75
+
+# refactor(kms): delegate cursor trait methods to kms/cursor helpers
+7dfe88fd6a2da09c375114e9f4a91f47f6a7626f
+
+# refactor(kms): delegate Present trait methods to kms/present helpers
+caf1a33bc4f451217cfc306492df73151a441805
+
+# refactor(kms): delegate DRI3 and export trait methods to kms/export helpers
+d88bab96a1cdf17d62ac28dde4075c5849aab436
+
+# refactor(kms): delegate RANDR, gamma and crtc-config trait methods to kms/randr helpers
+9bcff23aee85d5ea6b495125be6c8012c5c5d176
+
+# refactor(kms): delegate frame loop, COW and dump trait methods to kms/scanout, readback and dump helpers
+192b77239f5bd7bba0a794f9be3612089b4586cb
+
+# refactor(kms): delegate input, VT and DPMS trait methods to devices, pointer and kms/session helpers
+8b7b9145d677ff3954ae4bbe9170e9d7265c2e7c
+
+# refactor(kms): delegate XKB and keymap trait methods to portable/keyboard helpers
+43e9ffe1d722efc6cba018d11bb4a61dbba14d54
