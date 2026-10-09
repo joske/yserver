@@ -1,0 +1,370 @@
+# Phase 2 (2.10) for kms/render/engine.rs: production items move into
+# descendant modules of kms::render::engine (log targets keep the old
+# prefix), grouped by lifecycle and responsibility: lifecycle (create,
+# retire, teardown), frame (frame builder open/close/submit, coalescing
+# stats, commit/rollback), staging (upload arena, staging buffers/pool),
+# scratch (scratch images, clip snapshots), the op-recording files
+# (fill_copy, put_get, text, glyphs, composite, batch, gradients, traps),
+# emit (close-time replay of recorded ops into the command buffer), pixels
+# (wire <-> storage pixel conversion) and for_tests. engine.rs keeps the
+# imports, every type (private fields stay readable from all children), the
+# Debug/Send/Sync/From impls and the test module declaration. Needs a prep
+# commit first: the relative `super::` paths (frame_builder, submit_group,
+# upload_arena, descriptor_pool_ring, platform, …) qualified to
+# `crate::kms::render::…` so they mean the same module from a child.
+source = "crates/yserver/src/kms/render/engine.rs"
+module = "kms::render::engine"
+dir = "crates/yserver/src/kms/render/engine"
+root_form = "file"
+table = "engine_2.paths"
+
+[visibility]
+"const UPLOAD_COPY_ALIGN_MAX" = "pub(super)"
+"fn build_render_clip_scissors" = "pub(super)"
+"fn clamp_copy_rects" = "pub(super)"
+"fn clamp_copy_rects_to" = "pub(super)"
+"fn clamp_put_rect" = "pub(super)"
+"fn clamp_put_rect_to" = "pub(super)"
+"fn coalescing_counts" = "pub(super)"
+"impl RenderEngine::fn effective_glyph_layout" = "pub(super)"
+"impl StagingBuffer::fn new_with_usage" = "pub(super)"
+"impl StagingBuffer::fn pick_memory_type" = "pub(super)"
+"impl RenderEngine::fn record_glyph_runs" = "pub(super)"
+"fn resolve_force_opaque" = "pub(super)"
+"fn session_step" = "pub(super)"
+"impl RenderEngine::fn split_glyph_runs" = "pub(super)"
+"fn trap_composite_src_origin_axis" = "pub(super)"
+"fn x11_src_row_stride" = "pub(super)"
+"const UPLOAD_VERTEX_ALIGN" = "pub(super)"
+"impl StagingPool::fn acquire" = "pub(super)"
+"fn allocate_sampled_scratch_image" = "pub(super)"
+"fn allocate_scratch_image" = "pub(super)"
+"fn begin_op_cb" = "pub(super)"
+"fn build_render_clip_scissors_to" = "pub(super)"
+"fn close_dst_color_pass" = "pub(super)"
+"impl StagingPool::fn drain" = "pub(super)"
+"fn drawable_for_render_view" = "pub(super)"
+"fn dst_has_alpha_for_pict_format" = "pub(super)"
+"fn emit_recorded_op_into_cb" = "pub(super)"
+"fn emit_session_continue_draws" = "pub(super)"
+"fn emit_session_open_and_draws" = "pub(super)"
+"fn end_and_submit_op" = "pub(super)"
+"fn ensure_drawable_view" = "pub(super)"
+"impl RenderEngineInner::fn ensure_text_pipeline" = "pub(super)"
+"impl RenderEngineInner::fn glyph_atlas_misses_fit" = "pub(super)"
+"fn pack_from_storage" = "pub(super)"
+"impl StagingPool::fn release" = "pub(super)"
+"impl RenderEngine::fn reset_glyph_atlas" = "pub(super)"
+"fn resolve_force_opaque_pict_format" = "pub(super)"
+"fn sampler_config_for_repeat" = "pub(super)"
+"fn sampler_config_for_shader_repeat" = "pub(super)"
+"impl ScratchImage::fn size_bytes" = "pub(super)"
+"fn snapshot_first_touch" = "pub(super)"
+"fn swizzle_class_for_pict_format" = "pub(super)"
+"fn unpack_to_staging" = "pub(super)"
+"fn upload_copy_align" = "pub(super)"
+"impl RenderEngineInner::fn upload_to_frame" = "pub(super)"
+
+[[modules]]
+name = ""
+lines = [
+  "use frame::*;",
+  "use staging::*;",
+  "use scratch::*;",
+  "pub(crate) use fill_copy::*;",
+  "pub(crate) use pixels::*;",
+  "pub(crate) use glyphs::*;",
+  "use composite::*;",
+  "#[cfg(test)]\nuse put_get::{clamp_put_rect, clamp_put_rect_to};",
+  "use emit::*;",
+]
+items = [
+  "mod tests",
+  "use *",
+  "struct *",
+  "enum *",
+  "impl From < vk :: Result > for RenderError",
+  "impl std :: fmt :: Debug for ScratchImage",
+  "impl std :: fmt :: Debug for SampledScratchImage",
+  "impl std :: fmt :: Debug for StagingBuffer",
+  "unsafe impl Send for StagingBuffer",
+  "unsafe impl Sync for StagingBuffer",
+]
+
+[[modules]]
+name = "lifecycle"
+lines = ["use super::*;"]
+items = [
+  "impl RenderEngine::fn new",
+  "impl RenderEngine::fn stub",
+  "impl RenderEngine::fn is_live",
+  "impl RenderEngine::fn poll_retired",
+  "impl RenderEngine::fn destroy_retired_image",
+  "impl RenderEngine::fn retire_image_after",
+  "impl RenderEngine::fn shutdown",
+  "impl RenderEngine::fn drain_all",
+  "impl RenderEngine::fn notify_drawable_retired",
+  "impl RenderEngine::fn active_resource_bytes",
+  "impl RenderEngine::fn create_pixmap",
+  "impl RenderEngine::fn promote_drawable_exportable",
+  "impl RenderEngine::fn copy_image_blocking",
+  "impl RenderEngineInner::fn adopt_retired_resource_for_gpu_retirement",
+  "impl SubmittedOp::fn *",
+  "impl Drop for RenderEngine",
+]
+
+[[modules]]
+name = "frame"
+lines = ["use super::*;"]
+items = [
+  "impl RenderEngine::fn frame_builder_trace_filter",
+  "impl RenderEngine::fn frame_builder_trace_matches_dst",
+  "impl RenderEngine::fn trace_frame_ops",
+  "impl RenderEngine::fn flush_submit_group",
+  "impl RenderEngine::fn maybe_auto_flush_submit_group",
+  "impl RenderEngine::fn drain_frame_close_events",
+  "impl RenderEngine::fn close_open_frame",
+  "impl RenderEngine::fn close_open_frame_for_non_ported_op",
+  "impl RenderEngine::fn close_open_frame_if_timed_out",
+  "impl RenderEngine::fn open_frame_timeout_deadline",
+  "impl RenderEngine::fn pending_count",
+  "impl RenderEngine::fn frame_builder_is_open",
+  "impl RenderEngine::fn frame_builder_lifetime_closes",
+  "impl RenderEngine::fn frame_builder_peek_render_composite_dst_old_layouts",
+  "impl RenderEngine::fn frame_builder_lifetime_opens",
+  "impl RenderEngine::fn engine_frame_seq",
+  "impl RenderEngine::fn descriptor_pool_creates_lifetime",
+  "impl RenderEngine::fn descriptor_pool_resets_lifetime",
+  "impl RenderEngine::fn descriptor_pool_ring_pool_count",
+  "impl RenderEngine::fn descriptor_pool_ring_high_water_generation",
+  "impl RenderEngine::fn open_frame_generation",
+  "impl RenderEngine::fn drain_flush_outcomes",
+  "impl RenderEngine::fn attach_present_completion",
+  "impl RenderEngine::fn drain_present_batches",
+  "impl RenderEngineInner::fn acquire_descriptor_set_for_frame_or_op",
+  "fn coalescing_counts",
+  "fn classify_recorded_op",
+  "fn session_eligible",
+  "fn session_step",
+  "fn record_frame_coalescing_stats",
+  "fn begin_op_cb",
+  "fn end_and_submit_op",
+  "fn end_and_submit_op_with_signal",
+  "fn commit_close_success",
+  "fn rollback_pre_submit",
+  "fn rollback_atlas",
+  "fn snapshot_first_touch",
+  "fn rescue_present_completions",
+  "fn rollback_snapshots",
+]
+
+[[modules]]
+name = "staging"
+lines = ["use super::*;"]
+items = [
+  "const UPLOAD_ARENA_USAGE",
+  "const UPLOAD_VERTEX_ALIGN",
+  "const UPLOAD_COPY_ALIGN_MAX",
+  "fn upload_copy_align",
+  "const STAGING_POOL_BUCKET_CAP",
+  "const STAGING_POOL_TOTAL_BYTES_CAP",
+  "impl StagingBuffer::fn *",
+  "impl Drop for StagingBuffer",
+  "impl StagingPool::fn *",
+  "impl RenderEngineInner::fn upload_to_frame",
+]
+
+[[modules]]
+name = "scratch"
+lines = ["use super::*;"]
+items = [
+  "impl ScratchImage::fn *",
+  "impl Drop for ScratchImage",
+  "impl Drop for SampledScratchImage",
+  "impl Drop for ClipSnapshot",
+  "impl RenderEngine::fn create_clip_snapshot",
+  "impl RenderEngine::fn clip_snapshot_extent",
+  "impl RenderEngine::fn clip_snapshot_image",
+  "impl RenderEngine::fn clip_snapshot_view",
+  "impl RenderEngine::fn clip_snapshot_layout",
+  "impl RenderEngine::fn clip_snapshot_version",
+  "impl RenderEngine::fn retire_clip_snapshot",
+  "impl RenderEngine::fn refresh_clip_snapshot",
+  "fn allocate_scratch_image",
+  "fn alloc_clip_snapshot",
+  "fn allocate_sampled_scratch_image",
+]
+
+[[modules]]
+name = "fill_copy"
+lines = ["use super::*;"]
+items = [
+  "impl RenderEngine::fn fill_rect",
+  "impl RenderEngine::fn fill_rect_batch",
+  "impl RenderEngine::fn ensure_logic_fill_cache",
+  "impl RenderEngine::fn logic_fill",
+  "impl RenderEngine::fn stamp_opaque_alpha",
+  "impl RenderEngine::fn logic_fill_channels",
+  "impl RenderEngine::fn copy_area",
+  "impl RenderEngine::fn masked_copy_area",
+  "impl RenderEngine::fn cow_copy_area",
+  "fn clamp_rect_to",
+  "fn resolve_recorded_bounds",
+  "fn clamp_rect",
+  "fn clamp_copy_rects",
+  "fn clamp_copy_rects_to",
+]
+
+[[modules]]
+name = "put_get"
+lines = ["use super::*;"]
+items = [
+  "impl RenderEngine::fn put_image",
+  "impl RenderEngine::fn get_image",
+  "impl RenderEngine::fn drain_get_image_phases",
+  "const GET_IMAGE_SLOW_MS",
+  "fn get_image_phase_telemetry_enabled",
+  "fn clamp_put_rect",
+  "fn clamp_put_rect_to",
+]
+
+[[modules]]
+name = "pixels"
+lines = ["use super::*;"]
+items = [
+  "fn x11_src_row_stride",
+  "fn unpack_to_staging",
+  "fn pack_from_storage",
+  "fn decode_x11_pixel_bgra",
+  "fn decode_x11_pixel_server_alpha",
+  "fn premul_from_wire_pixel",
+  "fn decode_x11_pixel_for_storage",
+]
+
+[[modules]]
+name = "text"
+lines = ["use super::*;"]
+items = [
+  "impl RenderEngine::fn image_text",
+  "impl RenderEngineInner::fn ensure_text_pipeline",
+  "impl TextRunTarget for StorageTextTarget",
+  "impl CompositeTarget for StorageTextTarget",
+]
+
+[[modules]]
+name = "glyphs"
+lines = ["use super::*;"]
+items = [
+  "impl RenderEngineInner::fn glyph_atlas_misses_fit",
+  "impl RenderEngine::fn reset_glyph_atlas",
+  "impl RenderEngine::fn forget_glyphs",
+  "impl RenderEngine::fn composite_glyphs",
+  "impl RenderEngine::fn composite_glyphs_via_frame_builder",
+  "impl RenderEngine::fn effective_glyph_layout",
+  "impl RenderEngine::fn split_glyph_runs",
+  "impl RenderEngine::fn record_glyph_runs",
+  "fn uniform_pixel_glyph_source",
+]
+
+[[modules]]
+name = "composite"
+lines = ["use super::*;"]
+items = [
+  "impl RenderEngine::fn render_composite",
+  "impl RenderEngine::fn render_composite_via_frame_builder",
+  "impl RenderEngine::fn render_fill_rectangles",
+  "impl RenderEngine::fn ensure_render_assets",
+  "impl RenderEngine::fn drawable_view_cache_len",
+  "impl RenderEngine::fn render_pipelines_built",
+  "impl RenderEngine::fn invalidate_drawable_views",
+  "impl RenderEngineInner::fn current_layout_for_drawable",
+  "impl SourceDrawable::fn *",
+  "impl CompositeTarget for StorageCompositeTarget",
+  "fn resolve_force_opaque",
+  "fn resolve_force_opaque_pict_format",
+  "fn build_render_composite_attrs",
+  "fn drawable_for_render_view",
+  "fn sampler_config_for_repeat",
+  "fn sampler_config_for_shader_repeat",
+  "fn swizzle_class_for",
+  "fn dst_has_alpha_for_pict_format",
+  "fn swizzle_class_for_pict_format",
+  "fn ensure_drawable_view",
+]
+
+[[modules]]
+name = "batch"
+lines = ["use super::*;"]
+items = [
+  "impl RenderEngine::fn try_append_render_batch",
+  "impl RenderEngine::fn flush_render_batch",
+  "impl RenderEngine::fn drain_render_flush_records",
+  "impl RenderFlushReason::fn *",
+]
+
+[[modules]]
+name = "gradients"
+lines = ["use super::*;"]
+items = [
+  "impl RenderEngine::fn picture_paint_remove",
+  "impl RenderEngine::fn build_and_insert_linear_gradient",
+  "impl RenderEngine::fn build_and_insert_radial_gradient",
+  "impl RenderEngine::fn insert_gradient_with_deferred_upload",
+  "impl RenderEngine::fn picture_paint_len",
+  "fn gradient_error",
+]
+
+[[modules]]
+name = "traps"
+lines = ["use super::*;"]
+items = [
+  "impl RenderEngine::fn render_traps_or_tris",
+  "impl RenderEngine::fn ensure_trap_assets",
+]
+
+[[modules]]
+name = "emit"
+lines = ["use super::*;"]
+items = [
+  "fn emit_recorded_op_into_cb",
+  "fn emit_recorded_render_composite_into_cb",
+  "fn emit_recorded_copy_area_into_cb",
+  "fn emit_recorded_masked_copyarea_into_cb",
+  "fn emit_recorded_clip_snapshot_refresh_into_cb",
+  "fn emit_recorded_put_image_into_cb",
+  "fn open_dst_color_pass",
+  "fn close_dst_color_pass",
+  "fn emit_recorded_fill_rect_into_cb",
+  "const SESSION_SRC_ACCESS",
+  "fn emit_fill_draws",
+  "fn emit_recorded_logic_fill_into_cb",
+  "fn emit_logic_fill_draws",
+  "fn emit_composite_draws",
+  "fn emit_session_open_and_draws",
+  "fn emit_session_continue_draws",
+  "fn emit_recorded_image_text_into_cb",
+  "fn trap_composite_src_origin_axis",
+  "fn emit_recorded_render_traps_or_tris_into_cb",
+  "impl CompositeTarget for RecordedCompositeTarget",
+  "fn build_render_clip_scissors",
+  "fn build_render_clip_scissors_to",
+  "fn color_layers",
+  "fn barrier_to_layout",
+]
+
+[[modules]]
+name = "for_tests"
+lines = ["use super::*;"]
+items = [
+  "impl RenderEngine::fn clip_snapshot_layout_for_tests",
+  "impl RenderEngine::fn clip_snapshot_has_ticket_for_tests",
+  "impl RenderEngine::fn masked_copy_area_with_snapshot_for_tests",
+  "impl RenderEngine::fn pending_group_ops_count_for_tests",
+  "impl RenderEngine::fn most_recent_submitted_op_scratch_len_for_tests",
+  "impl RenderEngine::fn pending_group_ops_cbs_for_tests",
+  "impl RenderEngine::fn has_pending_batches_for_tests",
+  "impl RenderEngine::fn set_acquire_generation_for_tests",
+  "impl RenderEngine::fn open_frame_for_paint_for_tests",
+  "impl RenderEngine::fn acquire_descriptor_set_for_frame_or_op_for_tests",
+  "impl RenderEngine::fn close_open_frame_for_timeout_for_tests",
+]
