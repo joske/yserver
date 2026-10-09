@@ -1,0 +1,26 @@
+# Phase 2.11b (redirect): trait bodies of `impl Backend for KmsBackend` move to
+# inherent `backend_<subsystem>_<method>` helpers; the trait methods forward.
+# Identity path table shared by all 2.11b commits.
+source = "crates/yserver/src/kms/render/backend.rs"
+module = "kms::render::backend"
+dir = "crates/yserver/src/kms/render/backend"
+root_form = "file"
+table = "backend_2b.paths"
+modules = []
+
+[locations]
+"portable::redirect::impl KmsBackend::fn backend_redirect_allocate_redirected_backing" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage) whose recorded caller file:line moves with the delegated body (backend/trait_impl.rs → backend/portable/redirect.rs); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"portable::redirect::impl KmsBackend::fn backend_redirect_release_redirected_backing" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage) whose recorded caller file:line moves with the delegated body (backend/trait_impl.rs → backend/portable/redirect.rs); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"portable::redirect::impl KmsBackend::fn backend_redirect_set_window_scene_participation" = "calls a #[track_caller] scene damage-audit helper (mark_scene_structure_damage_rects) whose recorded caller file:line moves with the delegated body (backend/trait_impl.rs → backend/portable/redirect.rs); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"trait_impl::impl Backend for KmsBackend::fn copy_area" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage) whose recorded caller line shifts inside backend/trait_impl.rs (bodies above it became delegators); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"trait_impl::impl Backend for KmsBackend::fn get_overlay_window" = "calls a #[track_caller] scene damage-audit helper (mark_scene_structure_dirty) whose recorded caller line shifts inside backend/trait_impl.rs (bodies above it became delegators); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"trait_impl::impl Backend for KmsBackend::fn put_image" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage) whose recorded caller line shifts inside backend/trait_impl.rs (bodies above it became delegators); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+"trait_impl::impl Backend for KmsBackend::fn set_dpms_power" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage) whose recorded caller line shifts inside backend/trait_impl.rs (bodies above it became delegators); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+
+[log_targets]
+"portable::redirect::impl KmsBackend::fn backend_redirect_allocate_redirected_backing" = "log macros without target: the delegated body moves from kms::render::backend::trait_impl (a module only since 2.11a) to kms::render::backend::portable::redirect; both stay under kms::render::backend, so backend-level RUST_LOG filters still match"
+"portable::redirect::impl KmsBackend::fn backend_redirect_create_pixmap" = "log macros without target: the delegated body moves from kms::render::backend::trait_impl (a module only since 2.11a) to kms::render::backend::portable::redirect; both stay under kms::render::backend, so backend-level RUST_LOG filters still match"
+"portable::redirect::impl KmsBackend::fn backend_redirect_release_window_pixmap_name" = "log macros without target: the delegated body moves from kms::render::backend::trait_impl (a module only since 2.11a) to kms::render::backend::portable::redirect; both stay under kms::render::backend, so backend-level RUST_LOG filters still match"
+"portable::redirect::impl KmsBackend::fn backend_redirect_retain_backing_storage" = "log macros without target: the delegated body moves from kms::render::backend::trait_impl (a module only since 2.11a) to kms::render::backend::portable::redirect; both stay under kms::render::backend, so backend-level RUST_LOG filters still match"
+"portable::redirect::impl KmsBackend::fn backend_redirect_set_backing_scene_participation" = "log macros without target: the delegated body moves from kms::render::backend::trait_impl (a module only since 2.11a) to kms::render::backend::portable::redirect; both stay under kms::render::backend, so backend-level RUST_LOG filters still match"
+"portable::redirect::impl KmsBackend::fn backend_redirect_set_window_scene_participation" = "log macros without target: the delegated body moves from kms::render::backend::trait_impl (a module only since 2.11a) to kms::render::backend::portable::redirect; both stay under kms::render::backend, so backend-level RUST_LOG filters still match"
