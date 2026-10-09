@@ -145,17 +145,21 @@ fn unlisted_reexport_fails() {
 const TRAIT_BEFORE: &str =
     "impl Backend for K {\n    fn f(&mut self, a: u32, b: u32) -> u32 {\n        a + b\n    }\n}\n";
 
-fn delegate(after: &str) -> Vec<String> {
+fn same_file(before: &str, after: &str, delegate: bool) -> Vec<String> {
     let spec = Spec {
         manifest: None,
         old_root: "src/k.rs".into(),
         new_root: "src/k.rs".into(),
         module: "k".into(),
-        delegate: true,
+        delegate,
     };
-    let base = mem(&[("src/k.rs", TRAIT_BEFORE)]);
+    let base = mem(&[("src/k.rs", before)]);
     let head = mem(&[("src/k.rs", after)]);
     check(&spec, &base, &head, &[]).unwrap().1
+}
+
+fn delegate(after: &str) -> Vec<String> {
+    same_file(TRAIT_BEFORE, after, true)
 }
 
 const DELEGATED: &str = "impl Backend for K {\n    fn f(&mut self, a: u32, b: u32) -> u32 {\n        self.draw_f(a, b)\n    }\n}\n\nimpl K {\n    pub(super) fn draw_f(&mut self, a: u32, b: u32) -> u32 {\n        a + b\n    }\n}\n";
@@ -183,10 +187,47 @@ fn delegate_with_changed_body_fails() {
 
 #[test]
 fn one_tuple_comma_is_significant() {
-    let a: syn::Type = syn::parse_str("(u8,)").unwrap();
-    let b: syn::Type = syn::parse_str("(u8)").unwrap();
-    let c: syn::Type = syn::parse_str("(u8, u16,)").unwrap();
-    let d: syn::Type = syn::parse_str("(u8, u16)").unwrap();
-    assert_ne!(crate::tree::canon(&a), crate::tree::canon(&b));
-    assert_eq!(crate::tree::canon(&c), crate::tree::canon(&d));
+    use syn::visit_mut::VisitMut;
+    let canon = |s: &str| {
+        let mut t: syn::Type = syn::parse_str(s).unwrap();
+        crate::tree::Commas.visit_type_mut(&mut t);
+        crate::tree::tok(&t)
+    };
+    assert_ne!(canon("(u8,)"), canon("(u8)"));
+    assert_eq!(canon("(u8, u16,)"), canon("(u8, u16)"));
+}
+
+fn has(errs: &[String], needle: &str) {
+    assert!(
+        errs.iter().any(|e| e.contains(needle)),
+        "{needle}: {errs:?}"
+    );
+}
+
+const MACRO_COMMA: &str = "macro_rules! m {\n    ($a:expr, $b:expr,) => { 1 };\n    ($a:expr, $b:expr) => { 2 };\n}\n\nfn f() -> u32 {\n    m!(1, 2,)\n}\n";
+
+#[test]
+fn macro_invocation_comma_is_significant() {
+    let after = MACRO_COMMA.replace("m!(1, 2,)", "m!(1, 2)");
+    has(&same_file(MACRO_COMMA, &after, false), "tokens changed");
+}
+
+#[test]
+fn macro_rule_comma_is_significant() {
+    let after = MACRO_COMMA.replacen("$b:expr,)", "$b:expr)", 1);
+    has(&same_file(MACRO_COMMA, &after, false), "tokens changed");
+}
+
+#[test]
+fn attribute_comma_is_significant() {
+    let before = "#[cfg(any(unix, windows,))]\nfn f() {}\n";
+    let after = "#[cfg(any(unix, windows))]\nfn f() {}\n";
+    has(&same_file(before, after, false), "tokens changed");
+}
+
+#[test]
+fn layout_commas_are_not_significant() {
+    let before = "fn f<T: Copy,>(a: T, b: (T, T,),) -> [T; 2] where T: Eq, {\n    let S { x, .. } = g(a, b.0,);\n    match x { 1 => {}, _ => (), }\n    [a, b.1,]\n}\n";
+    let after = "fn f<T: Copy>(a: T, b: (T, T)) -> [T; 2] where T: Eq {\n    let S { x, .. } = g(a, b.0);\n    match x { 1 => {} _ => () }\n    [a, b.1]\n}\n";
+    assert_eq!(same_file(before, after, false), Vec::<String>::new());
 }

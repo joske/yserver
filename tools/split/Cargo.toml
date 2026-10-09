@@ -12,5 +12,5 @@ description = "Item-level file splitter and move verifier for the source layout 
 proc-macro2 = { version = "1", features = ["span-locations"] }
 quote = "1"
 serde = { version = "1", features = ["derive"] }
-syn = { version = "2", features = ["full", "parsing", "printing"] }
+syn = { version = "2", features = ["full", "parsing", "printing", "visit", "visit-mut"] }
 toml = "0.8"

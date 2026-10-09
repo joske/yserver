@@ -8,7 +8,11 @@ use std::{
 
 use proc_macro2::{LineColumn, Span, TokenStream, TokenTree};
 use quote::ToTokens;
-use syn::{Attribute, ImplItem, ImplItemFn, Item, ItemImpl, Visibility};
+use syn::{
+    Attribute, ImplItem, ImplItemFn, Item, ItemImpl, Visibility,
+    punctuated::Punctuated,
+    visit_mut::{self, VisitMut},
+};
 
 pub type Res<T> = Result<T, String>;
 
@@ -104,35 +108,74 @@ pub fn tok(t: &impl ToTokens) -> String {
     t.to_token_stream().to_string()
 }
 
-/// Tokens with layout-dependent trailing commas dropped (rustfmt adds or
-/// removes them with line width). A 1-tuple's comma is kept.
-pub fn canon(t: &impl ToTokens) -> String {
-    fn walk(ts: TokenStream) -> TokenStream {
-        ts.into_iter()
-            .map(|tt| match tt {
-                TokenTree::Group(g) => {
-                    let mut inner: Vec<TokenTree> = walk(g.stream()).into_iter().collect();
-                    let commas = inner
-                        .iter()
-                        .filter(|t| matches!(t, TokenTree::Punct(p) if p.as_char() == ','))
-                        .count();
-                    let trailing =
-                        matches!(inner.last(), Some(TokenTree::Punct(p)) if p.as_char() == ',');
-                    if trailing
-                        && (g.delimiter() != proc_macro2::Delimiter::Parenthesis || commas > 1)
-                    {
-                        inner.pop();
-                    }
-                    let mut ng =
-                        proc_macro2::Group::new(g.delimiter(), inner.into_iter().collect());
-                    ng.set_span(g.span());
-                    TokenTree::Group(ng)
-                }
-                t => t,
-            })
-            .collect()
+/// Drops the trailing commas rustfmt adds or removes with line width, only in
+/// syntax where they carry no meaning; 1-tuples, macro and attribute tokens
+/// are left alone.
+pub struct Commas;
+
+fn trim<T, P>(p: &mut Punctuated<T, P>) {
+    p.pop_punct();
+}
+
+fn trim_multi<T, P>(p: &mut Punctuated<T, P>) {
+    if p.len() > 1 {
+        p.pop_punct();
     }
-    walk(t.to_token_stream()).to_string()
+}
+
+macro_rules! trimmed {
+    ($($visit:ident($ty:ty) $how:ident $($field:ident).+;)*) => {
+        $(fn $visit(&mut self, i: &mut $ty) {
+            $how(&mut i.$($field).+);
+            visit_mut::$visit(self, i);
+        })*
+    };
+}
+
+impl VisitMut for Commas {
+    trimmed! {
+        visit_fields_named_mut(syn::FieldsNamed) trim named;
+        visit_fields_unnamed_mut(syn::FieldsUnnamed) trim unnamed;
+        visit_item_enum_mut(syn::ItemEnum) trim variants;
+        visit_generics_mut(syn::Generics) trim params;
+        visit_where_clause_mut(syn::WhereClause) trim predicates;
+        visit_angle_bracketed_generic_arguments_mut(syn::AngleBracketedGenericArguments) trim args;
+        visit_parenthesized_generic_arguments_mut(syn::ParenthesizedGenericArguments) trim inputs;
+        visit_bound_lifetimes_mut(syn::BoundLifetimes) trim lifetimes;
+        visit_expr_call_mut(syn::ExprCall) trim args;
+        visit_expr_method_call_mut(syn::ExprMethodCall) trim args;
+        visit_expr_array_mut(syn::ExprArray) trim elems;
+        visit_expr_tuple_mut(syn::ExprTuple) trim_multi elems;
+        visit_expr_struct_mut(syn::ExprStruct) trim fields;
+        visit_expr_closure_mut(syn::ExprClosure) trim inputs;
+        visit_pat_tuple_mut(syn::PatTuple) trim_multi elems;
+        visit_pat_tuple_struct_mut(syn::PatTupleStruct) trim elems;
+        visit_pat_struct_mut(syn::PatStruct) trim fields;
+        visit_pat_slice_mut(syn::PatSlice) trim elems;
+        visit_type_tuple_mut(syn::TypeTuple) trim_multi elems;
+        visit_use_group_mut(syn::UseGroup) trim items;
+    }
+
+    fn visit_signature_mut(&mut self, i: &mut syn::Signature) {
+        if i.variadic.is_none() {
+            trim(&mut i.inputs);
+        }
+        visit_mut::visit_signature_mut(self, i);
+    }
+
+    fn visit_type_bare_fn_mut(&mut self, i: &mut syn::TypeBareFn) {
+        if i.variadic.is_none() {
+            trim(&mut i.inputs);
+        }
+        visit_mut::visit_type_bare_fn_mut(self, i);
+    }
+
+    fn visit_arm_mut(&mut self, i: &mut syn::Arm) {
+        i.comma = None;
+        visit_mut::visit_arm_mut(self, i);
+    }
+
+    fn visit_attribute_mut(&mut self, _: &mut Attribute) {}
 }
 
 /// Attributes that change meaning (cfg, lints, derives…): everything but
@@ -191,7 +234,10 @@ pub fn item_parts(item: &Item) -> Option<Parts> {
         kind,
         name,
         vis,
-        tokens: canon(&it),
+        tokens: {
+            Commas.visit_item_mut(&mut it);
+            tok(&it)
+        },
     })
 }
 
@@ -204,11 +250,12 @@ pub fn member_parts(item: &ImplItem) -> Parts {
         ImplItem::Macro(i) => ("macro_call", norm(&tok(&i.mac.path)), String::new()),
         _ => ("verbatim", String::new(), String::new()),
     };
+    Commas.visit_impl_item_mut(&mut it);
     Parts {
         kind,
         name,
         vis,
-        tokens: canon(&it),
+        tokens: tok(&it),
     }
 }
 
@@ -223,6 +270,7 @@ pub fn owner(i: &ItemImpl) -> Owner {
     let mut h = i.clone();
     h.attrs.clear();
     h.items.clear();
+    Commas.visit_item_impl_mut(&mut h);
     let header = tok(&h).trim_end_matches(['{', '}', ' ']).to_string();
     Owner {
         header,
