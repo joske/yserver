@@ -362,7 +362,7 @@ fn moved_item_with_relative_path_fails() {
         "a::fn f => a::inner::fn f\n",
         [&["pub use inner::*;"], &["use super::*;"]],
     );
-    has(&errs, "super ::");
+    has(&errs, "`super::` path");
 }
 
 #[test]
