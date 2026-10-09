@@ -5778,10 +5778,29 @@ fn present_fixture() -> Option<(KmsBackend, u32, u32)> {
     Some((b, src, dst))
 }
 
-/// Retire everything in flight and return the delivered serials.
-fn delivered_serials(b: &mut KmsBackend) -> Vec<u32> {
+/// Retire everything in flight, then collect delivered completions until
+/// `done` holds or 5 s pass. `drain_all` waits only on engine-tracked
+/// tickets; the signal-only submit's fence and the exported sync_file are
+/// checked with a zero-timeout poll, so delivery can trail the drain.
+fn drain_present_events_until(
+    b: &mut KmsBackend,
+    done: impl Fn(&[yserver_core::backend::CompletedPresentEvent]) -> bool,
+) -> Vec<yserver_core::backend::CompletedPresentEvent> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     b.engine_drain_all_for_tests();
-    b.drain_completed_present_events_for_tests()
+    let mut events = Vec::new();
+    loop {
+        events.extend(b.drain_completed_present_events_for_tests());
+        if done(&events) || std::time::Instant::now() >= deadline {
+            return events;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// The serials delivered once `expected` completions arrived (or 5 s passed).
+fn delivered_serials(b: &mut KmsBackend, expected: usize) -> Vec<u32> {
+    drain_present_events_until(b, |e| e.len() >= expected)
         .iter()
         .map(|e| e.serial)
         .collect()
@@ -5814,7 +5833,7 @@ fn non_cow_present_completion_rides_the_paint_submit() {
         !b.frame_builder_is_open_for_tests(),
         "the frame closed at once"
     );
-    assert_eq!(delivered_serials(&mut b), vec![0x214]);
+    assert_eq!(delivered_serials(&mut b, 1), vec![0x214]);
 }
 
 /// #214 fallback: when the open frame does not hold a write to the
@@ -5841,7 +5860,7 @@ fn non_cow_present_completion_without_the_copy_in_the_frame_keeps_the_signal_sub
         2,
         "frame close + signal-only submit"
     );
-    assert_eq!(delivered_serials(&mut b), vec![0x215]);
+    assert_eq!(delivered_serials(&mut b, 1), vec![0x215]);
 }
 
 /// #214: a Present into a non-redirected child of a redirected parent (a
@@ -5890,7 +5909,7 @@ fn present_into_child_of_redirected_parent_rides_the_paint_submit() {
         "the completion signal rides the paint submit into the parent's backing"
     );
     assert!(!b.frame_builder_is_open_for_tests());
-    assert_eq!(delivered_serials(&mut b), vec![0x216]);
+    assert_eq!(delivered_serials(&mut b, 1), vec![0x216]);
 }
 
 /// #214 failure path: a frame close that fails while recording (before any
@@ -5916,7 +5935,7 @@ fn non_cow_present_completion_survives_a_frame_record_failure() {
         1,
         "the entry is queued for delivery, not dropped"
     );
-    assert_eq!(delivered_serials(&mut b), vec![0x216]);
+    assert_eq!(delivered_serials(&mut b, 1), vec![0x216]);
 }
 
 /// #214 failure path: a frame whose submit fails keeps the completion too.
@@ -5931,7 +5950,7 @@ fn non_cow_present_completion_survives_a_frame_submit_failure() {
     b.platform_force_next_submit_failure_for_tests();
     b.enqueue_present_completion(non_cow_present_event(0x217, dst), dst);
     assert_eq!(b.pending_present_events_len_for_tests(), 1);
-    assert_eq!(delivered_serials(&mut b), vec![0x217]);
+    assert_eq!(delivered_serials(&mut b, 1), vec![0x217]);
 }
 
 /// Phase A T8 successor: the SubmitGroup must never accumulate
@@ -7358,12 +7377,9 @@ fn frame_builder_cow_copy_area_delivers_present_completion() {
     be.engine_close_open_frame_for_timeout_for_tests()
         .expect("force-close");
 
-    // Drain any present batches that became ready (the frame ticket
-    // retires immediately in the lavapipe environment via drain_all).
-    be.engine_drain_all_for_tests();
-
     // The synthetic completion event must appear in the drained set.
-    let events = be.drain_completed_present_events_for_tests();
+    let events =
+        drain_present_events_until(&mut be, |e| e.iter().any(|e| e.serial == synthetic_serial));
     assert!(
         events.iter().any(|e| e.serial == synthetic_serial),
         "synthetic PRESENT completion (serial=0x{synthetic_serial:x}) must be delivered \
@@ -7888,10 +7904,8 @@ fn frame_builder_image_text_delivers_present_completion() {
     be.engine_close_open_frame_for_timeout_for_tests()
         .expect("force-close");
 
-    // Drain any present batches (frame ticket retires immediately in lavapipe).
-    be.engine_drain_all_for_tests();
-
-    let events = be.drain_completed_present_events_for_tests();
+    let events =
+        drain_present_events_until(&mut be, |e| e.iter().any(|e| e.serial == synthetic_serial));
     assert!(
         events.iter().any(|e| e.serial == synthetic_serial),
         "synthetic PRESENT completion (serial=0x{synthetic_serial:x}) must be delivered \
