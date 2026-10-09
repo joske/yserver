@@ -128,11 +128,7 @@ impl Backend for KmsBackend {
     }
 
     fn render_format_for_ynest_id(&self, ynest_fmt: u32) -> Option<u32> {
-        if ynest_fmt == 0 {
-            None
-        } else {
-            Some(ynest_fmt)
-        }
+        Self::backend_render_ops_render_format_for_ynest_id(self, ynest_fmt)
     }
 
     fn ping(&mut self, _origin: Option<OriginContext>) -> io::Result<()> {
@@ -4276,8 +4272,6 @@ impl Backend for KmsBackend {
         self.image_text_common(origin, host_xid, foreground, background, x, y, &chars)
     }
 
-    // ── RENDER ──────────────────────────────────────────────────
-
     fn render_create_picture(
         &mut self,
         _origin: Option<OriginContext>,
@@ -4286,44 +4280,14 @@ impl Backend for KmsBackend {
         value_mask: u32,
         values: &[u8],
     ) -> io::Result<Option<PictureHandle>> {
-        // Stage 3b: real picture record. Insert default
-        // `PictureRecord::Drawable`, incref a PIXMAP backing in the
-        // store (so a `free_pixmap` on the backing survives while this
-        // picture wraps it — picture_record_drawable_refcount test),
-        // then delegate to render_change_picture for the value-mask
-        // body.
-        let drawable_xid = host_drawable.as_raw();
-        let picture_xid = self.core.next_host_xid();
-        self.core.pictures.insert(
-            picture_xid,
-            PictureRecord::drawable_default(drawable_xid, ynest_format),
-        );
-        // A window Picture holds no store ref: every use resolves the window's current storage.
-        if matches!(host_drawable, AnyHandle::Pixmap(_)) {
-            if let Some(id) = self.store.lookup(drawable_xid) {
-                self.store.incref(id);
-                self.picture_drawable_ids.insert(picture_xid, id);
-            } else {
-                // Backing not materialized yet (GLX-TFP / Present /
-                // DRI3 import). Defer the incref:
-                // `apply_pending_picture_refs` pins the backing the
-                // moment it materializes, so a later `free_pixmap`
-                // can't reach refcount 0 and destroy the drawable out
-                // from under this live Picture.
-                self.pending_picture_drawable_refs
-                    .insert(picture_xid, drawable_xid);
-            }
-        }
-        if value_mask != 0 {
-            // Recompose the body shape that render_change_picture
-            // expects: picture(4) + value_mask(4) + values.
-            let mut body = Vec::with_capacity(8 + values.len());
-            body.extend_from_slice(&picture_xid.to_le_bytes());
-            body.extend_from_slice(&value_mask.to_le_bytes());
-            body.extend_from_slice(values);
-            self.render_change_picture(None, picture_xid, &body)?;
-        }
-        Ok(PictureHandle::from_raw(picture_xid))
+        Self::backend_render_ops_render_create_picture(
+            self,
+            _origin,
+            host_drawable,
+            ynest_format,
+            value_mask,
+            values,
+        )
     }
 
     fn render_change_picture(
@@ -4332,8 +4296,7 @@ impl Backend for KmsBackend {
         host_pic: u32,
         body: &[u8],
     ) -> io::Result<()> {
-        change_picture_apply_mask(&mut self.core, host_pic, body);
-        Ok(())
+        Self::backend_render_ops_render_change_picture(self, _origin, host_pic, body)
     }
 
     /// Audit #8 (2026-05-19) — store the drawable-space origin of
@@ -4351,12 +4314,7 @@ impl Backend for KmsBackend {
     /// no-op so the caller doesn't need to discriminate at the
     /// call site.
     fn set_picture_drawable_origin(&mut self, host_pic: u32, origin: (i16, i16)) {
-        if let Some(PictureRecord::Drawable {
-            drawable_origin, ..
-        }) = self.core.pictures.get_mut(&host_pic)
-        {
-            *drawable_origin = origin;
-        }
+        Self::backend_render_ops_set_picture_drawable_origin(self, host_pic, origin)
     }
 
     /// Audit #8 (2026-05-19) — return the picture's `clientClip` for
@@ -4377,23 +4335,7 @@ impl Backend for KmsBackend {
         &mut self,
         host_pic: u32,
     ) -> Option<Option<Vec<yserver_protocol::x11::xfixes::RegionRect>>> {
-        let record = self.core.pictures.get(&host_pic)?;
-        match record {
-            PictureRecord::Drawable { clip, .. } => Some(clip.as_ref().map(|rects| {
-                rects
-                    .iter()
-                    .map(|r| yserver_protocol::x11::xfixes::RegionRect {
-                        x: r.x,
-                        y: r.y,
-                        width: r.width,
-                        height: r.height,
-                    })
-                    .collect()
-            })),
-            PictureRecord::SolidFill { .. }
-            | PictureRecord::LinearGradient { .. }
-            | PictureRecord::RadialGradient { .. } => None,
-        }
+        Self::backend_clip_picture_client_clip_rects(self, host_pic)
     }
 
     fn render_free_picture(
@@ -4401,30 +4343,7 @@ impl Backend for KmsBackend {
         _origin: Option<OriginContext>,
         host_pic: u32,
     ) -> io::Result<()> {
-        // Drop the record; if it was a Drawable variant, decref the
-        // backing drawable in the store. SolidFill / Gradient
-        // variants have no backing drawable — they own only the
-        // GPU-side state on RenderEngine.picture_paint (Stage 3c).
-        let retained_drawable_id = self.picture_drawable_ids.remove(&host_pic);
-        if let Some(record) = self.core.pictures.remove(&host_pic)
-            && record.drawable_host_xid().is_some()
-        {
-            if let Some(id) = retained_drawable_id {
-                self.store_decref_with_invalidate(id);
-            } else {
-                // A window Picture, or a backing that never
-                // materialized — no store ref was ever taken; just drop
-                // any deferred ref request.
-                self.pending_picture_drawable_refs.remove(&host_pic);
-            }
-        }
-        // Drop any GPU-side state cached for this picture. Stage
-        // 3b never populates the map (no gradient LUT built yet),
-        // so this is a HashMap::remove no-op today; Stage 3c lazy-
-        // builds gradient picture state through the same key, and
-        // this teardown hook becomes load-bearing once that lands.
-        self.engine.picture_paint_remove(host_pic);
-        Ok(())
+        Self::backend_render_ops_render_free_picture(self, _origin, host_pic)
     }
 
     fn render_create_glyphset(
@@ -4432,23 +4351,7 @@ impl Backend for KmsBackend {
         _origin: Option<OriginContext>,
         ynest_format: u32,
     ) -> io::Result<Option<GlyphSetHandle>> {
-        use crate::kms::core::{GlyphSetFormat, GlyphSetState};
-
-        let format = match ynest_format {
-            RENDER_FMT_A8 => GlyphSetFormat::A8,
-            RENDER_FMT_A1 => GlyphSetFormat::A1,
-            RENDER_FMT_ARGB32 => GlyphSetFormat::Argb32,
-            _ => GlyphSetFormat::Other,
-        };
-        let id = self.core.next_host_xid();
-        self.core.glyphsets.insert(
-            id,
-            GlyphSetState {
-                format,
-                glyphs: HashMap::new(),
-            },
-        );
-        Ok(GlyphSetHandle::from_raw(id))
+        Self::backend_render_ops_render_create_glyphset(self, _origin, ynest_format)
     }
 
     fn render_free_glyphset(
@@ -4456,11 +4359,7 @@ impl Backend for KmsBackend {
         _origin: Option<OriginContext>,
         host_gs: u32,
     ) -> io::Result<()> {
-        // Host glyphset xids are never reused, but the atlas entries
-        // would otherwise outlive the set until the next atlas reset.
-        self.core.glyphsets.remove(&host_gs);
-        self.engine.forget_glyphs(host_gs, None);
-        Ok(())
+        Self::backend_render_ops_render_free_glyphset(self, _origin, host_gs)
     }
 
     fn render_add_glyphs(
@@ -4469,30 +4368,7 @@ impl Backend for KmsBackend {
         host_gs: u32,
         body_tail: &[u8],
     ) -> io::Result<()> {
-        // Reuses v1's parse_add_glyphs — purely CPU-side, operates
-        // on the KmsCore.glyphsets entry. Atlas-side upload (the
-        // Vk part) is Stage 3d's render_composite_glyphs path.
-        let Some(gs) = self.core.glyphsets.get_mut(&host_gs) else {
-            return Ok(());
-        };
-        // AddGlyphs over a live id replaces its image (Xorg's AddGlyph);
-        // the atlas copy of the old one must go with it.
-        let redefined: Vec<u32> = body_tail
-            .get(..4)
-            .map(|n| u32::from_le_bytes([n[0], n[1], n[2], n[3]]) as usize)
-            .and_then(|n| body_tail.get(4..4 + n.checked_mul(4)?))
-            .map(|ids| {
-                ids.chunks_exact(4)
-                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .filter(|id| gs.glyphs.contains_key(id))
-                    .collect()
-            })
-            .unwrap_or_default();
-        crate::kms::backend::parse_add_glyphs(gs, body_tail);
-        if !redefined.is_empty() {
-            self.engine.forget_glyphs(host_gs, Some(&redefined));
-        }
-        Ok(())
+        Self::backend_render_ops_render_add_glyphs(self, _origin, host_gs, body_tail)
     }
 
     fn render_free_glyphs(
@@ -4501,19 +4377,7 @@ impl Backend for KmsBackend {
         host_gs: u32,
         glyph_ids: &[u8],
     ) -> io::Result<()> {
-        let Some(gs) = self.core.glyphsets.get_mut(&host_gs) else {
-            return Ok(());
-        };
-        let ids: Vec<u32> = glyph_ids
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        for id in &ids {
-            gs.glyphs.remove(id);
-        }
-        // A freed id can be added again with a different image.
-        self.engine.forget_glyphs(host_gs, Some(&ids));
-        Ok(())
+        Self::backend_render_ops_render_free_glyphs(self, _origin, host_gs, glyph_ids)
     }
 
     /// #135 — acquire the IncludeInferiors root snapshot, run the composite,
@@ -4542,66 +4406,10 @@ impl Backend for KmsBackend {
         width: u16,
         height: u16,
     ) -> io::Result<Vec<xfixes::RegionRect>> {
-        // A source or mask that is the destination would follow it onto
-        // the inferiors; such a self-composite keeps to the window.
-        let fanout = if host_src == host_dst || host_mask == host_dst {
-            Vec::new()
-        } else {
-            self.include_inferiors_dst_fanout(host_dst)
-        };
-        if !fanout.is_empty() {
-            self.dst_fanout_active = true;
-            let mut painted = self.render_composite(
-                _origin, op, host_src, host_mask, host_dst, src_x, src_y, mask_x, mask_y, dst_x,
-                dst_y, width, height,
-            );
-            self.dst_fanout_active = false;
-            for (window, (ox, oy), clip) in fanout {
-                let (x, y) = (shift_i16(dst_x, -ox), shift_i16(dst_y, -oy));
-                let more = self.with_dst_picture_on(host_dst, window, clip, |b| {
-                    b.render_composite(
-                        _origin, op, host_src, host_mask, host_dst, src_x, src_y, mask_x, mask_y,
-                        x, y, width, height,
-                    )
-                });
-                if let (Ok(painted), Some(Ok(more))) = (painted.as_mut(), more) {
-                    painted.extend(more.into_iter().map(|r| xfixes::RegionRect {
-                        x: shift_i16(r.x, ox),
-                        y: shift_i16(r.y, oy),
-                        ..r
-                    }));
-                }
-            }
-            return painted;
-        }
-        // Taken BEFORE the composite, because the substitution replaces the
-        // source drawable entirely — but only when the request can paint at
-        // all, so a zero-area Composite stays as free as it was before the
-        // acquisition was hoisted out here.
-        let inferiors_snapshot = if composite_needs_source_snapshot(width, height) {
-            self.source_inferiors_snapshot(host_src)
-        } else {
-            None
-        };
-        let result = self.render_composite_inner(
-            inferiors_snapshot,
-            op,
-            host_src,
-            host_mask,
-            host_dst,
-            src_x,
-            src_y,
-            mask_x,
-            mask_y,
-            dst_x,
-            dst_y,
-            width,
-            height,
-        );
-        if let Some(xid) = inferiors_snapshot {
-            let _ = self.free_pixmap(None, xid);
-        }
-        result
+        Self::backend_render_ops_render_composite(
+            self, _origin, op, host_src, host_mask, host_dst, src_x, src_y, mask_x, mask_y, dst_x,
+            dst_y, width, height,
+        )
     }
 
     fn render_composite_glyphs(
@@ -4619,315 +4427,14 @@ impl Backend for KmsBackend {
         x_off: i16,
         y_off: i16,
     ) -> io::Result<Vec<xfixes::RegionRect>> {
-        use crate::kms::render::{
-            engine::{CompositeGlyphInput, ResolvedSource},
-            glyph_pixels::GlyphPixels,
-        };
-
-        // Gating: op must be a standard fixed-function PictOp
-        // (0..=12 — Clear..Add) and the src picture must be a
-        // SolidFill. Saturate + the Disjoint/Conjoint families need
-        // dst-readback shader blending the text pipeline doesn't
-        // implement; those return Ok(()) with
-        // `composite_glyphs_dropped_unsupported` bumped. The
-        // standard family flows through per-op blend state derived
-        // from `StdPictOp::blend_factors` — notably `Add` into a
-        // depth-8 a8 mask pixmap, cairo/Pango's component-alpha
-        // text path (the i3-config-wizard black-dialog bug).
-        // `mask_fmt` is read but ignored: per-glyph compositing and
-        // accumulate-into-maskFormat differ only for OVERLAPPING
-        // glyph quads (and are identical for the associative `Add`);
-        // true component-alpha glyphsets remain out of scope.
-        // Unsupported-counter scope (plan §3d): the gate captures
-        // *protocol-supported but engine-unimplemented* shapes —
-        // op outside the standard family and source not SolidFill.
-        // Stale src/dst picture handles and missing glyphsets are
-        // protocol errors, not unsupported features; they log a gap
-        // and return Ok without bumping the counter.
-        if crate::kms::vk::render_pipeline::StdPictOp::from_u8(op).is_none() || op > 12 {
-            self.record_composite_glyphs_drop(format_args!(
-                "op={op} is outside the standard fixed-function family (0..=12)"
-            ));
-            return Ok(Vec::new());
-        }
-        let Some((src_resolved, src_repeat, _src_xform, _src_ca)) =
-            self.resolve_picture_for_render(host_src)
-        else {
-            log::debug!("render composite_glyphs gap: src 0x{host_src:x} not resolvable");
-            return Ok(Vec::new());
-        };
-        let foreground_premul = match src_resolved {
-            ResolvedSource::Solid(c) => c,
-            // Stage 3f.13: glyph paint path is still SolidFill-only
-            // (matches v1's try_vk_render_composite_glyphs). For a
-            // gradient source, collapse to first-stop premul — same
-            // shape as the pre-3f.13 fallback, just scoped here
-            // instead of in `resolve_picture_for_render`. No
-            // counter bump: gradient-on-glyphs is now considered
-            // "best effort handled" rather than "unsupported".
-            ResolvedSource::Gradient(grad_xid) => {
-                first_stop_premul_of_gradient(&self.core, grad_xid).unwrap_or_else(|| {
-                    log::debug!(
-                        "render composite_glyphs: gradient src 0x{grad_xid:x} \
-                         has no stops — treating as transparent"
-                    );
-                    [0.0, 0.0, 0.0, 0.0]
-                })
-            }
-            // #137 tier 1 — a source whose sampled domain is one pixel
-            // under a covering repeat IS a colour, so read it and take
-            // the same route as `CreateSolidFill`. Anything else stays
-            // dropped: tier 2 (general drawable sources) needs its own
-            // spec, and asserting otherwise here would assert tier 2.
-            ResolvedSource::Drawable(src_drawable) => {
-                match self.uniform_glyph_source_premul(host_src, src_drawable, src_repeat, mask_fmt)
-                {
-                    Ok(premul) => premul,
-                    Err(why) => {
-                        self.record_composite_glyphs_drop(format_args!(
-                            "src 0x{host_src:x} is a drawable ({src_drawable:?} \
-                             repeat={src_repeat:?} mask_fmt={mask_fmt}) — {why}"
-                        ));
-                        return Ok(Vec::new());
-                    }
-                }
-            }
-            ResolvedSource::None => {
-                self.record_composite_glyphs_drop(format_args!(
-                    "src 0x{host_src:x} resolved to no source picture at all"
-                ));
-                return Ok(Vec::new());
-            }
-        };
-        let Some((dst_host_xid, dst_clip)) = resolve_dst_picture_for_render(&self.core, host_dst)
-        else {
-            log::debug!("render composite_glyphs gap: dst 0x{host_dst:x} not Drawable picture");
-            return Ok(Vec::new());
-        };
-        // Stage 4a — resolve through redirect routing.
-        let Some(dst_target) = self.resolve_paint_target(dst_host_xid) else {
-            log::debug!(
-                "render composite_glyphs gap: dst drawable 0x{dst_host_xid:x} not in store"
-            );
-            return Ok(Vec::new());
-        };
-        if !self.core.glyphsets.contains_key(&host_gs) {
-            log::debug!("render composite_glyphs gap: glyphset 0x{host_gs:x} not registered");
-            return Ok(Vec::new());
-        }
-
-        // Items parser. Pass 1 (`parse_composite_glyph_items`) walks
-        // the wire stream and resolves every glyph it names, tagging
-        // each with the picture format its glyphset stores it in;
-        // pass 2 below resolves each of those to a
-        // `CompositeGlyphInput` borrowing the glyphset's stored pixel
-        // bytes as-is (dense A8, raw A1 wire or raw ARGB32 wire).
-        // Conversion to A8 is deferred to the engine's atlas-miss
-        // branch (`GlyphPixels::to_a8`) so a resident glyph is never
-        // re-converted (#2, 2026-07-08 render-optimization gaps).
-        // The two passes also keep the immutable
-        // `self.core.glyphsets` borrow off the mutable `self.engine`
-        // call below.
-        //
-        // Per X RENDER protocol, `src_x`/`src_y` are the SOURCE
-        // picture sampling origin, not the dst pen — same as v1. The
-        // first glyph-element's `dx` / `dy` sets the absolute pen
-        // position; subsequent elements accumulate.
-        let _ = (src_x, src_y);
-        let ParsedGlyphItems {
-            glyphs: parsed,
-            elements,
-            found: found_glyphs,
-            missing: missing_glyphs,
-        } = parse_composite_glyph_items(&self.core.glyphsets, minor, host_gs, x_off, y_off, items);
-
-        if parsed.is_empty() {
-            // No drawable glyphs (every entry was zero-size or
-            // missing from the glyphset). Not a gap; just nothing
-            // to record.
-            log::debug!(
-                "render composite_glyphs: NOTHING PARSED minor={minor} gs=0x{host_gs:x} \
-                 items={} elements={elements} found={found_glyphs} missing={missing_glyphs} \
-                 glyphs_in_set={}",
-                items.len(),
-                self.core
-                    .glyphsets
-                    .get(&host_gs)
-                    .map_or(0, |g| g.glyphs.len()),
-            );
-            return Ok(Vec::new());
-        }
-        let mut min_x = i32::MAX;
-        let mut min_y = i32::MAX;
-        let mut max_x = i32::MIN;
-        let mut max_y = i32::MIN;
-        for p in &parsed {
-            min_x = min_x.min(p.dst_x);
-            min_y = min_y.min(p.dst_y);
-            max_x = max_x.max(p.dst_x + i32::try_from(p.w).unwrap_or(0));
-            max_y = max_y.max(p.dst_y + i32::try_from(p.h).unwrap_or(0));
-        }
-        let glyph_union_local = Rectangle16 {
-            x: i16::try_from(min_x.max(0)).unwrap_or(i16::MAX),
-            y: i16::try_from(min_y.max(0)).unwrap_or(i16::MAX),
-            width: u16::try_from((max_x - min_x).max(0)).unwrap_or(u16::MAX),
-            height: u16::try_from((max_y - min_y).max(0)).unwrap_or(u16::MAX),
-        };
-        let clip_by_children = dst_picture_clip_by_children(&self.core, host_dst);
-        let dst_local_extent = self.dst_local_extent(dst_host_xid, dst_target.backing_id());
-        let cliplist_local = self.render_dst_cliplist_local(
-            dst_host_xid,
-            clip_by_children,
-            dst_clip.as_deref(),
-            dst_local_extent,
-            glyph_union_local,
-        );
-        if cliplist_local.is_empty() {
-            log::debug!(
-                "render composite_glyphs: CLIPPED OUT minor={minor} dst=0x{host_dst:x} glyphs={} union={:?} extent={:?} clip_by_children={clip_by_children}",
-                parsed.len(),
-                glyph_union_local,
-                dst_local_extent,
-            );
-            return Ok(Vec::new());
-        }
-        let dst_clip =
-            Self::shift_dst_picture_clip(Some(cliplist_local.clone()), dst_target.offset());
-
-        // Pass 2: resolve each `Parsed` to a `CompositeGlyphInput`
-        // with a stable slice reference. Stage 4a — apply the
-        // dst-target offset to each glyph's dst coordinates so a
-        // redirected window's glyphs land in the backing.
-        let (paint_dx, paint_dy) = dst_target.offset();
-        let inputs: Vec<CompositeGlyphInput<'_>> = parsed
-            .iter()
-            .filter_map(|p| {
-                let stored = self
-                    .core
-                    .glyphsets
-                    .get(&p.gs_xid)
-                    .and_then(|gs| gs.glyphs.get(&p.glyph_id))
-                    .map(|g| g.pixels.as_slice())?;
-                // The byte encoding IS the format tag: the engine
-                // reads it back with `GlyphPixels::source_format()`,
-                // so it can never be told "these bytes are ARGB32"
-                // and "this glyph is A8" at the same time.
-                let pixels = match p.source_format {
-                    GlyphSourceFormat::A8 => GlyphPixels::A8(stored),
-                    GlyphSourceFormat::A1 => GlyphPixels::A1Wire(stored),
-                    GlyphSourceFormat::Argb32 => GlyphPixels::Argb32Wire(stored),
-                };
-                Some(CompositeGlyphInput {
-                    gs_xid: p.gs_xid,
-                    glyph_id: p.glyph_id,
-                    w: p.w,
-                    h: p.h,
-                    pixels,
-                    dst_x: p.dst_x + paint_dx,
-                    dst_y: p.dst_y + paint_dy,
-                })
-            })
-            .collect();
-
-        if inputs.is_empty() {
-            log::debug!(
-                "render composite_glyphs: NO PIXELS minor={minor} dst=0x{host_dst:x} parsed={}",
-                parsed.len(),
-            );
-            return Ok(Vec::new());
-        }
-
-        // Dst PictFormat ID — the engine classifies the dst's alpha
-        // semantics from it (`dst_has_alpha_for_pict_format`), same
-        // as the general render_composite path. 0 for unknown xids;
-        // the engine then falls back to the depth heuristic.
-        let dst_pict_format = picture_pict_format(&self.core, host_dst);
-        let stats = self.engine.composite_glyphs(
-            &mut self.store,
-            &mut self.platform,
-            dst_target.dst(),
-            op,
-            dst_pict_format,
-            foreground_premul,
-            &inputs,
-            dst_clip.as_deref(),
-        );
-        match stats {
-            Ok(s) => {
-                if s.atlas_interns > 0 {
-                    for _ in 0..s.atlas_interns {
-                        self.telemetry.record_atlas_intern();
-                    }
-                }
-                if s.glyph_uploads > 0 {
-                    for _ in 0..s.glyph_uploads {
-                        self.telemetry.record_glyph_upload();
-                    }
-                    // One GlyphUpload event per upload submit
-                    // (paired with the text-paint CB that
-                    // follows). `dst_target.backing_id()` is the eventual
-                    // destination — keep on the dst so analysis
-                    // can correlate uploads with the dst's text
-                    // bursts.
-                    let target_kind = self.submit_target_kind(dst_target.backing_id());
-                    for _ in 0..s.glyph_uploads {
-                        self.telemetry.record_submit_event(SubmitEvent {
-                            frame_id: 0,
-                            kind: SubmitKind::GlyphUpload,
-                            target_kind,
-                            target_id: dst_target.backing_id().as_u64(),
-                            batch_size: 1,
-                            op: SubmitOp::None,
-                            src_class: SrcClass::None,
-                            mask_class: SrcClass::None,
-                            pipeline_id: None,
-                            flags: SubmitFlags {
-                                readback: false,
-                                alias: false,
-                                zero_draws: false,
-                                upload: true,
-                            },
-                        });
-                    }
-                }
-                if s.glyphs_dropped > 0 {
-                    for _ in 0..s.glyphs_dropped {
-                        self.telemetry.record_glyph_dropped_atlas_full();
-                    }
-                }
-                if s.atlas_interns > 0 || !inputs.is_empty() {
-                    // Successful composite_glyphs counts as one
-                    // paint submit (mirroring `image_text` /
-                    // `render_composite` telemetry shape).
-                    self.telemetry.record_paint_submit();
-                    let glyph_count = u32::try_from(inputs.len()).unwrap_or(u32::MAX);
-                    self.trace_render(
-                        SubmitKind::CompositeGlyphs,
-                        dst_target.backing_id(),
-                        glyph_count,
-                        op, // wire PictOp (standard family 0..=12, gated above)
-                        SrcClass::Solid,
-                        None,
-                        SubmitFlags::NONE,
-                    );
-                }
-            }
-            Err(e) => {
-                log::warn!("render composite_glyphs: engine returned {e:?} on dst 0x{host_dst:x}");
-            }
-        }
-        // Phase B.1 Task 21: composite_glyphs may open a frame;
-        // drain any resulting close events into telemetry.
-        self.drain_frame_builder_telemetry();
-        Ok(local_rects_to_region(cliplist_local))
+        Self::backend_text_render_composite_glyphs(
+            self, _origin, minor, op, host_src, host_dst, mask_fmt, host_gs, src_x, src_y, items,
+            x_off, y_off,
+        )
     }
 
     fn picture_includes_inferiors(&self, host_pic: u32) -> bool {
-        !dst_picture_clip_by_children(&self.core, host_pic)
-            && matches!(
-                self.core.pictures.get(&host_pic),
-                Some(PictureRecord::Drawable { .. })
-            )
+        Self::backend_render_ops_picture_includes_inferiors(self, host_pic)
     }
 
     fn render_fill_rectangles(
@@ -4940,115 +4447,9 @@ impl Backend for KmsBackend {
         x_off: i16,
         y_off: i16,
     ) -> io::Result<()> {
-        let fanout = self.include_inferiors_dst_fanout(host_dst);
-        if !fanout.is_empty() {
-            self.dst_fanout_active = true;
-            let result =
-                self.render_fill_rectangles(_origin, host_dst, op, color, rects, x_off, y_off);
-            self.dst_fanout_active = false;
-            for (window, (ox, oy), clip) in fanout {
-                let (x, y) = (shift_i16(x_off, -ox), shift_i16(y_off, -oy));
-                self.with_dst_picture_on(host_dst, window, clip, |b| {
-                    b.render_fill_rectangles(_origin, host_dst, op, color, rects, x, y)
-                });
-            }
-            return result;
-        }
-        let Some((dst_host_xid, dst_clip)) = resolve_dst_picture_for_render(&self.core, host_dst)
-        else {
-            log::debug!(
-                "render render_fill_rectangles gap: host_dst 0x{host_dst:x} not a Drawable picture"
-            );
-            return Ok(());
-        };
-        // Stage 4a — redirect routing for dst.
-        let Some(dst_target) = self.resolve_paint_target(dst_host_xid) else {
-            log::debug!(
-                "render render_fill_rectangles gap: dst drawable 0x{dst_host_xid:x} not in store"
-            );
-            return Ok(());
-        };
-        let dst_clip = Self::shift_dst_picture_clip(dst_clip, dst_target.offset());
-        let dst_clip = self.narrow_dst_clip_to_shared_backing(dst_host_xid, &dst_target, dst_clip);
-        let (paint_dx, paint_dy) = dst_target.offset();
-
-        // X RENDER XRenderColor is wire-premultiplied (rendercheck
-        // main.c:337-345); pass through unchanged.
-        let color_premul = [
-            f32::from(u16::from_le_bytes([color[0], color[1]])) / 65535.0,
-            f32::from(u16::from_le_bytes([color[2], color[3]])) / 65535.0,
-            f32::from(u16::from_le_bytes([color[4], color[5]])) / 65535.0,
-            f32::from(u16::from_le_bytes([color[6], color[7]])) / 65535.0,
-        ];
-
-        let mut decoded: Vec<crate::kms::vk::ops::render::CompositeRect> =
-            Vec::with_capacity(rects.len() / 8);
-        for chunk in rects.chunks_exact(8) {
-            let rx = i16::from_le_bytes([chunk[0], chunk[1]]).saturating_add(x_off);
-            let ry = i16::from_le_bytes([chunk[2], chunk[3]]).saturating_add(y_off);
-            let rw = u16::from_le_bytes([chunk[4], chunk[5]]);
-            let rh = u16::from_le_bytes([chunk[6], chunk[7]]);
-            if rw == 0 || rh == 0 {
-                continue;
-            }
-            decoded.push(crate::kms::vk::ops::render::CompositeRect {
-                src_x: 0,
-                src_y: 0,
-                mask_x: 0,
-                mask_y: 0,
-                dst_x: i32::from(rx) + paint_dx,
-                dst_y: i32::from(ry) + paint_dy,
-                width: u32::from(rw),
-                height: u32::from(rh),
-            });
-        }
-        if decoded.is_empty() {
-            return Ok(());
-        }
-
-        let stats = self.engine.render_fill_rectangles(
-            &mut self.store,
-            &mut self.platform,
-            op,
-            color_premul,
-            dst_target.dst(),
-            &decoded,
-            dst_clip.as_deref(),
-        );
-        self.sync_descriptor_pool_telemetry();
-        let n_rects = u32::try_from(decoded.len()).unwrap_or(u32::MAX);
-        if let Ok(s) = stats {
-            if s.recorded_draws > 0 {
-                self.telemetry.record_paint_submit();
-                self.trace_render(
-                    SubmitKind::RenderFill,
-                    dst_target.backing_id(),
-                    n_rects,
-                    op,
-                    SrcClass::Solid,
-                    None,
-                    SubmitFlags {
-                        readback: s.used_dst_readback,
-                        alias: s.used_src_alias_scratch,
-                        zero_draws: false,
-                        upload: false,
-                    },
-                );
-            }
-            if s.used_dst_readback {
-                self.telemetry.record_disjoint_readback();
-            }
-        } else if let Err(e) = stats {
-            log::warn!(
-                "render render_fill_rectangles: engine returned {e:?} on dst 0x{host_dst:x}"
-            );
-        }
-        // Phase B.2 Task 15: render_fill_rectangles may open a frame;
-        // drain any resulting close events into telemetry so the
-        // per-second emit picks them up without stale lag. Mirrors the
-        // B.1 drain at the composite_glyphs wrapper.
-        self.drain_frame_builder_telemetry();
-        Ok(())
+        Self::backend_render_ops_render_fill_rectangles(
+            self, _origin, host_dst, op, color, rects, x_off, y_off,
+        )
     }
 
     fn render_trapezoids(
@@ -5064,199 +4465,19 @@ impl Backend for KmsBackend {
         x_off: i16,
         y_off: i16,
     ) -> io::Result<Vec<xfixes::RegionRect>> {
-        use crate::kms::{render::engine::TrapPrimKind, vk::ops::traps as vk_traps};
-
-        // Wire layout: each trapezoid is 40 bytes (10 × i32 16.16
-        // fixed-point). Mirrors v1's try_vk_render_trapezoids_path
-        // decoder (kms/backend.rs:4286).
-        if traps.is_empty() {
-            return Ok(Vec::new());
-        }
-        let n_traps = traps.len() / 40;
-        if n_traps == 0 {
-            return Ok(Vec::new());
-        }
-        let mut decoded: Vec<vk_traps::Trapezoid> = Vec::with_capacity(n_traps);
-        for chunk in traps.chunks_exact(40) {
-            let read_i32 = |o: usize| -> i32 {
-                i32::from_le_bytes([chunk[o], chunk[o + 1], chunk[o + 2], chunk[o + 3]])
-            };
-            decoded.push(vk_traps::Trapezoid {
-                top: read_i32(0),
-                bottom: read_i32(4),
-                left_p1: (read_i32(8), read_i32(12)),
-                left_p2: (read_i32(16), read_i32(20)),
-                right_p1: (read_i32(24), read_i32(28)),
-                right_p2: (read_i32(32), read_i32(36)),
-            });
-        }
-        // Xorg's `fbTrapezoids` (fb/fbtrap.c:164-165) subtracts the
-        // first trapezoid's `left.p1` from xSrc/ySrc before forwarding
-        // to pixman. This anchors the src origin at the first trap's
-        // top-left, regardless of where the trap is in dst space. For
-        // GTK CSD shadows (which pass `xSrc=20 ySrc=-25` for the BR
-        // corner with `traps[0].left.p1 = (20, -25)`), the subtraction
-        // resolves to src=(0,0) → no out-of-bounds sampling. Without
-        // it, REPEAT_NONE returns transparent for the OOB rows and the
-        // corner shadow has an 8-row α=0 gap.
-        // Captured pre-shift; the dx/dy fold below moves the live trap
-        // coords into the redirect-target space, but the *adjustment*
-        // is from the client-supplied geometry.
-        let first_trap_left_p1_x = decoded[0].left_p1.0 >> 16;
-        let first_trap_left_p1_y = decoded[0].left_p1.1 >> 16;
-        // Resolve src + dst via the same helpers render_composite
-        // uses. The trap path doesn't read GC clip — picture clip
-        // (from dst) is what scopes the draw (plan §4).
-        let Some((src_resolved, src_repeat, src_transform, _src_ca)) =
-            self.resolve_picture_for_render(host_src)
-        else {
-            log::debug!("render render_trapezoids gap: src 0x{host_src:x} not resolvable");
-            return Ok(Vec::new());
-        };
-        let Some((dst_host_xid, dst_clip)) = resolve_dst_picture_for_render(&self.core, host_dst)
-        else {
-            log::debug!("render render_trapezoids gap: dst 0x{host_dst:x} not Drawable picture");
-            return Ok(Vec::new());
-        };
-        // Stage 4a — redirect routing for dst. The fold of
-        // `x_off`/`y_off` and the redirect offset (both in pixel
-        // units) into a single fixed-point delta keeps the
-        // 16.16-arithmetic single-pass.
-        let Some(dst_target) = self.resolve_paint_target(dst_host_xid) else {
-            log::debug!(
-                "render render_trapezoids gap: dst drawable 0x{dst_host_xid:x} not in store"
-            );
-            return Ok(Vec::new());
-        };
-        let dx = (i32::from(x_off) + dst_target.offset().0) << 16;
-        let dy = (i32::from(y_off) + dst_target.offset().1) << 16;
-        if dx != 0 || dy != 0 {
-            for t in &mut decoded {
-                t.top = t.top.wrapping_add(dy);
-                t.bottom = t.bottom.wrapping_add(dy);
-                t.left_p1.0 = t.left_p1.0.wrapping_add(dx);
-                t.left_p1.1 = t.left_p1.1.wrapping_add(dy);
-                t.left_p2.0 = t.left_p2.0.wrapping_add(dx);
-                t.left_p2.1 = t.left_p2.1.wrapping_add(dy);
-                t.right_p1.0 = t.right_p1.0.wrapping_add(dx);
-                t.right_p1.1 = t.right_p1.1.wrapping_add(dy);
-                t.right_p2.0 = t.right_p2.0.wrapping_add(dx);
-                t.right_p2.1 = t.right_p2.1.wrapping_add(dy);
-            }
-        }
-        let Some((bx, by, bx1, by1)) = vk_traps::trapezoid_bbox(&decoded) else {
-            return Ok(Vec::new());
-        };
-        let bx = bx.max(0);
-        let by = by.max(0);
-        if bx1 <= bx || by1 <= by {
-            return Ok(Vec::new());
-        }
-        #[allow(clippy::cast_sign_loss)]
-        let bw = (bx1 - bx) as u32;
-        #[allow(clippy::cast_sign_loss)]
-        let bh = (by1 - by) as u32;
-        let bbox_local = Rectangle16 {
-            x: i16::try_from((bx - dst_target.offset().0).max(0)).unwrap_or(i16::MAX),
-            y: i16::try_from((by - dst_target.offset().1).max(0)).unwrap_or(i16::MAX),
-            width: u16::try_from(bw).unwrap_or(u16::MAX),
-            height: u16::try_from(bh).unwrap_or(u16::MAX),
-        };
-        let clip_by_children = dst_picture_clip_by_children(&self.core, host_dst);
-        let dst_local_extent = self.dst_local_extent(dst_host_xid, dst_target.backing_id());
-        let cliplist_local = self.render_dst_cliplist_local(
-            dst_host_xid,
-            clip_by_children,
-            dst_clip.as_deref(),
-            dst_local_extent,
-            bbox_local,
-        );
-        if cliplist_local.is_empty() {
-            return Ok(Vec::new());
-        }
-        let dst_clip =
-            Self::shift_dst_picture_clip(Some(cliplist_local.clone()), dst_target.offset());
-        let Some((bx, by, bw, bh)) =
-            clip_trap_bbox_to_extents((bx, by, bx1, by1), dst_clip.as_deref().unwrap_or(&[]))
-        else {
-            return Ok(Vec::new());
-        };
-
-        // Pack instance bytes (40 bytes per trap; no padding —
-        // asserted by `const _:()` in trap_pipeline.rs).
-        let stride = std::mem::size_of::<crate::kms::vk::trap_pipeline::TrapInstanceData>();
-        let mut instance_bytes = vec![0u8; stride * decoded.len()];
-        for (i, t) in decoded.iter().enumerate() {
-            let inst = t.to_instance_data();
-            instance_bytes[i * stride..(i + 1) * stride].copy_from_slice(inst.as_bytes());
-        }
-
-        // Audit #4 (2026-05-19) — same pict_format threading as
-        // render_composite. Trap/tri paint into an xRGB32 dst on
-        // depth-32 storage must drive "no alpha target," and
-        // xRGB32 sources must pin α=ONE on the sample view.
-        let src_pict_format = picture_pict_format(&self.core, host_src);
-        let dst_pict_format = picture_pict_format(&self.core, host_dst);
-        // Source origin in src-pixel space. Two adjustments stacked:
-        //   - subtract `(x_off + redirect_offset)` to undo the dx/dy
-        //     fold applied to the trap coords above;
-        //   - subtract `traps[0].left.p1.{x,y}` to mirror Xorg's
-        //     `fbTrapezoids` pixman pre-step (fb/fbtrap.c:164-165) —
-        //     anchors src @ (0,0) at the first trap's top-left.
-        // The emit folds in bbox for the non-full-dst branch.
-        let src_origin_x =
-            i32::from(src_x) - (i32::from(x_off) + dst_target.offset().0) - first_trap_left_p1_x;
-        let src_origin_y =
-            i32::from(src_y) - (i32::from(y_off) + dst_target.offset().1) - first_trap_left_p1_y;
-        let stats = self.engine.render_traps_or_tris(
-            &mut self.store,
-            &mut self.platform,
+        Self::backend_render_ops_render_trapezoids(
+            self,
+            _origin,
             op,
-            src_resolved,
-            dst_target.dst(),
-            TrapPrimKind::Trapezoid,
-            &instance_bytes,
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                decoded.len() as u32
-            },
-            (bx, by, bw, bh),
-            dst_clip.as_deref(),
-            src_repeat,
-            src_transform,
-            src_origin_x,
-            src_origin_y,
-            src_pict_format,
-            dst_pict_format,
-        );
-        self.sync_descriptor_pool_telemetry();
-        let src_class = self.picture_src_class_by_xid(host_src);
-        let n_traps = u32::try_from(decoded.len()).unwrap_or(u32::MAX);
-        if let Ok(s) = stats {
-            if s.recorded_draws > 0 {
-                self.telemetry.record_paint_submit();
-                self.trace_render(
-                    SubmitKind::RenderTraps,
-                    dst_target.backing_id(),
-                    n_traps,
-                    op,
-                    src_class,
-                    None,
-                    SubmitFlags {
-                        readback: s.used_dst_readback,
-                        alias: s.used_src_alias_scratch,
-                        zero_draws: false,
-                        upload: false,
-                    },
-                );
-            }
-            if s.used_dst_readback {
-                self.telemetry.record_disjoint_readback();
-            }
-        } else if let Err(e) = stats {
-            log::warn!("render render_trapezoids: engine returned {e:?}");
-        }
-        Ok(local_rects_to_region(cliplist_local))
+            host_src,
+            host_dst,
+            _host_mask_format,
+            src_x,
+            src_y,
+            traps,
+            x_off,
+            y_off,
+        )
     }
 
     fn render_triangles_op(
@@ -5273,210 +4494,20 @@ impl Backend for KmsBackend {
         x_off: i16,
         y_off: i16,
     ) -> io::Result<Vec<xfixes::RegionRect>> {
-        use crate::kms::{render::engine::TrapPrimKind, vk::ops::traps as vk_traps};
-
-        let read_point = |off: usize, chunk: &[u8]| -> (i32, i32) {
-            let x =
-                i32::from_le_bytes([chunk[off], chunk[off + 1], chunk[off + 2], chunk[off + 3]]);
-            let y = i32::from_le_bytes([
-                chunk[off + 4],
-                chunk[off + 5],
-                chunk[off + 6],
-                chunk[off + 7],
-            ]);
-            (x, y)
-        };
-        let mut tris: Vec<vk_traps::Triangle> = match minor {
-            11 => {
-                if !primitives.len().is_multiple_of(24) {
-                    return Ok(Vec::new());
-                }
-                primitives
-                    .chunks_exact(24)
-                    .map(|c| vk_traps::Triangle {
-                        p1: read_point(0, c),
-                        p2: read_point(8, c),
-                        p3: read_point(16, c),
-                    })
-                    .collect()
-            }
-            12 => {
-                if !primitives.len().is_multiple_of(8) || primitives.len() < 24 {
-                    return Ok(Vec::new());
-                }
-                let pts: Vec<(i32, i32)> = primitives
-                    .chunks_exact(8)
-                    .map(|c| read_point(0, c))
-                    .collect();
-                (0..pts.len() - 2)
-                    .map(|i| vk_traps::Triangle {
-                        p1: pts[i],
-                        p2: pts[i + 1],
-                        p3: pts[i + 2],
-                    })
-                    .collect()
-            }
-            13 => {
-                if !primitives.len().is_multiple_of(8) || primitives.len() < 24 {
-                    return Ok(Vec::new());
-                }
-                let pts: Vec<(i32, i32)> = primitives
-                    .chunks_exact(8)
-                    .map(|c| read_point(0, c))
-                    .collect();
-                (1..pts.len() - 1)
-                    .map(|i| vk_traps::Triangle {
-                        p1: pts[0],
-                        p2: pts[i],
-                        p3: pts[i + 1],
-                    })
-                    .collect()
-            }
-            _ => return Ok(Vec::new()),
-        };
-        if tris.is_empty() {
-            return Ok(Vec::new());
-        }
-        let Some((src_resolved, src_repeat, src_transform, _src_ca)) =
-            self.resolve_picture_for_render(host_src)
-        else {
-            log::debug!("render render_triangles gap: src 0x{host_src:x} not resolvable");
-            return Ok(Vec::new());
-        };
-        let Some((dst_host_xid, dst_clip)) = resolve_dst_picture_for_render(&self.core, host_dst)
-        else {
-            log::debug!("render render_triangles gap: dst 0x{host_dst:x} not Drawable picture");
-            return Ok(Vec::new());
-        };
-        // Stage 4a — redirect routing for dst; fold the redirect
-        // offset into the same fixed-point delta as `x_off/y_off`.
-        let Some(dst_target) = self.resolve_paint_target(dst_host_xid) else {
-            log::debug!(
-                "render render_triangles gap: dst drawable 0x{dst_host_xid:x} not in store"
-            );
-            return Ok(Vec::new());
-        };
-        let dx = (i32::from(x_off) + dst_target.offset().0) << 16;
-        let dy = (i32::from(y_off) + dst_target.offset().1) << 16;
-        if dx != 0 || dy != 0 {
-            for t in &mut tris {
-                t.p1.0 = t.p1.0.wrapping_add(dx);
-                t.p1.1 = t.p1.1.wrapping_add(dy);
-                t.p2.0 = t.p2.0.wrapping_add(dx);
-                t.p2.1 = t.p2.1.wrapping_add(dy);
-                t.p3.0 = t.p3.0.wrapping_add(dx);
-                t.p3.1 = t.p3.1.wrapping_add(dy);
-            }
-        }
-        let Some((bx, by, bx1, by1)) = vk_traps::triangle_bbox(&tris) else {
-            return Ok(Vec::new());
-        };
-        let bx = bx.max(0);
-        let by = by.max(0);
-        if bx1 <= bx || by1 <= by {
-            return Ok(Vec::new());
-        }
-        #[allow(clippy::cast_sign_loss)]
-        let bw = (bx1 - bx) as u32;
-        #[allow(clippy::cast_sign_loss)]
-        let bh = (by1 - by) as u32;
-        let bbox_local = Rectangle16 {
-            x: i16::try_from((bx - dst_target.offset().0).max(0)).unwrap_or(i16::MAX),
-            y: i16::try_from((by - dst_target.offset().1).max(0)).unwrap_or(i16::MAX),
-            width: u16::try_from(bw).unwrap_or(u16::MAX),
-            height: u16::try_from(bh).unwrap_or(u16::MAX),
-        };
-        let clip_by_children = dst_picture_clip_by_children(&self.core, host_dst);
-        let dst_local_extent = self.dst_local_extent(dst_host_xid, dst_target.backing_id());
-        let cliplist_local = self.render_dst_cliplist_local(
-            dst_host_xid,
-            clip_by_children,
-            dst_clip.as_deref(),
-            dst_local_extent,
-            bbox_local,
-        );
-        if cliplist_local.is_empty() {
-            return Ok(Vec::new());
-        }
-        let dst_clip =
-            Self::shift_dst_picture_clip(Some(cliplist_local.clone()), dst_target.offset());
-        let Some((bx, by, bw, bh)) =
-            clip_trap_bbox_to_extents((bx, by, bx1, by1), dst_clip.as_deref().unwrap_or(&[]))
-        else {
-            return Ok(Vec::new());
-        };
-
-        let stride = std::mem::size_of::<crate::kms::vk::trap_pipeline::TriangleInstanceData>();
-        let mut instance_bytes = vec![0u8; stride * tris.len()];
-        for (i, t) in tris.iter().enumerate() {
-            let inst = t.to_instance_data();
-            instance_bytes[i * stride..(i + 1) * stride].copy_from_slice(inst.as_bytes());
-        }
-
-        // Audit #4 (2026-05-19) — same pict_format threading as
-        // the trapezoid path; see that call site for rationale.
-        let src_pict_format = picture_pict_format(&self.core, host_src);
-        let dst_pict_format = picture_pict_format(&self.core, host_dst);
-        // Source origin shifted by the same delta the triangle coords
-        // were (x_off + redirect offset). Also subtract the first
-        // triangle's `p1.{x,y}` to mirror Xorg's `fbTriangles` pixman
-        // pre-step (fb/fbtrap.c:179-180) — anchors src @ (0,0) at the
-        // first triangle's p1 regardless of where it sits in dst space.
-        let first_tri_p1_x = tris[0].p1.0 >> 16;
-        let first_tri_p1_y = tris[0].p1.1 >> 16;
-        let src_origin_x =
-            i32::from(src_x) - (i32::from(x_off) + dst_target.offset().0) - first_tri_p1_x;
-        let src_origin_y =
-            i32::from(src_y) - (i32::from(y_off) + dst_target.offset().1) - first_tri_p1_y;
-        let stats = self.engine.render_traps_or_tris(
-            &mut self.store,
-            &mut self.platform,
+        Self::backend_render_ops_render_triangles_op(
+            self,
+            _origin,
+            minor,
             op,
-            src_resolved,
-            dst_target.dst(),
-            TrapPrimKind::Triangle,
-            &instance_bytes,
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                tris.len() as u32
-            },
-            (bx, by, bw, bh),
-            dst_clip.as_deref(),
-            src_repeat,
-            src_transform,
-            src_origin_x,
-            src_origin_y,
-            src_pict_format,
-            dst_pict_format,
-        );
-        self.sync_descriptor_pool_telemetry();
-        let src_class = self.picture_src_class_by_xid(host_src);
-        let n_tris = u32::try_from(tris.len()).unwrap_or(u32::MAX);
-        if let Ok(s) = stats {
-            if s.recorded_draws > 0 {
-                self.telemetry.record_paint_submit();
-                self.trace_render(
-                    SubmitKind::RenderTris,
-                    dst_target.backing_id(),
-                    n_tris,
-                    op,
-                    src_class,
-                    None,
-                    SubmitFlags {
-                        readback: s.used_dst_readback,
-                        alias: s.used_src_alias_scratch,
-                        zero_draws: false,
-                        upload: false,
-                    },
-                );
-            }
-            if s.used_dst_readback {
-                self.telemetry.record_disjoint_readback();
-            }
-        } else if let Err(e) = stats {
-            log::warn!("render render_triangles: engine returned {e:?}");
-        }
-        Ok(local_rects_to_region(cliplist_local))
+            host_src,
+            host_dst,
+            _host_mask_format,
+            src_x,
+            src_y,
+            primitives,
+            x_off,
+            y_off,
+        )
     }
 
     fn render_create_solid_fill(
@@ -5484,31 +4515,7 @@ impl Backend for KmsBackend {
         _origin: Option<OriginContext>,
         color: [u8; 8],
     ) -> io::Result<Option<PictureHandle>> {
-        // X RENDER CreateSolidFill: 16-bit-per-channel colour,
-        // little-endian, already premultiplied on the wire (per
-        // rendercheck main.c:337-345). Store the channels as f32
-        // exactly as received — the pipeline samples them
-        // unchanged. Layout: r[0..2] g[2..4] b[4..6] a[6..8].
-        let r16 = u16::from_le_bytes([color[0], color[1]]);
-        let g16 = u16::from_le_bytes([color[2], color[3]]);
-        let b16 = u16::from_le_bytes([color[4], color[5]]);
-        let a16 = u16::from_le_bytes([color[6], color[7]]);
-        let premul = [
-            f32::from(r16) / 65535.0,
-            f32::from(g16) / 65535.0,
-            f32::from(b16) / 65535.0,
-            f32::from(a16) / 65535.0,
-        ];
-        let picture_xid = self.core.next_host_xid();
-        self.core.pictures.insert(
-            picture_xid,
-            PictureRecord::SolidFill {
-                premul,
-                repeat: Repeat::Normal,
-                component_alpha: false,
-            },
-        );
-        Ok(PictureHandle::from_raw(picture_xid))
+        Self::backend_render_ops_render_create_solid_fill(self, _origin, color)
     }
 
     fn render_create_linear_gradient(
@@ -5516,63 +4523,7 @@ impl Backend for KmsBackend {
         _origin: Option<OriginContext>,
         body: &[u8],
     ) -> io::Result<Option<PictureHandle>> {
-        // Wire body: p1.x(4) + p1.y(4) + p2.x(4) + p2.y(4) +
-        // n_stops(4) + n × stop_pos(4) + n × stop_color(8).
-        // Caller passes only the request payload from offset 4 —
-        // the first u32 is interpreted as p1.x (sliced at body[4..]).
-        if body.len() < 24 {
-            return Ok(None);
-        }
-        let p1x = i32::from_le_bytes(body[4..8].try_into().unwrap());
-        let p1y = i32::from_le_bytes(body[8..12].try_into().unwrap());
-        let p2x = i32::from_le_bytes(body[12..16].try_into().unwrap());
-        let p2y = i32::from_le_bytes(body[16..20].try_into().unwrap());
-        let Some(stops) = parse_gradient_stops(body, 20) else {
-            return Ok(None);
-        };
-        let picture_xid = self.core.next_host_xid();
-        // Stage 3f.13: build the LUT eagerly so the first
-        // render_composite against this picture has it ready. The
-        // record + the engine's GradientPicture have parallel
-        // lifetimes — render_free_picture drops both. Build
-        // failure (no Vk on test fixture, or allocation error) is
-        // non-fatal: the record still lands; render_composite
-        // logs a gap if it can't find the LUT. This keeps the
-        // logic-test fixture (no live Vk) usable without forcing
-        // every gradient-create test through lavapipe.
-        let engine_stops: Vec<crate::kms::vk::gradient::Stop> = stops
-            .iter()
-            .map(|s| crate::kms::vk::gradient::Stop {
-                pos: s.pos,
-                r: s.r,
-                g: s.g,
-                b: s.b,
-                a: s.a,
-            })
-            .collect();
-        if let Err(e) = self.engine.build_and_insert_linear_gradient(
-            &mut self.platform,
-            picture_xid,
-            (p1x, p1y),
-            (p2x, p2y),
-            &engine_stops,
-        ) {
-            log::debug!(
-                "render render_create_linear_gradient: engine build failed (xid=0x{picture_xid:x}): \
-                 {e:?} — record stored; paint will fall back to gap-log"
-            );
-        }
-        self.core.pictures.insert(
-            picture_xid,
-            PictureRecord::LinearGradient {
-                p1: (p1x, p1y),
-                p2: (p2x, p2y),
-                stops,
-                repeat: Repeat::None,
-                transform: None,
-            },
-        );
-        Ok(PictureHandle::from_raw(picture_xid))
+        Self::backend_render_ops_render_create_linear_gradient(self, _origin, body)
     }
 
     fn render_create_radial_gradient(
@@ -5580,58 +4531,7 @@ impl Backend for KmsBackend {
         _origin: Option<OriginContext>,
         body: &[u8],
     ) -> io::Result<Option<PictureHandle>> {
-        // Wire body: icx(4) icy(4) ocx(4) ocy(4) ir(4) or(4)
-        // n_stops(4) + stops + colors. Same offset-by-4 convention
-        // as linear (first u32 in `body` is past the request header).
-        if body.len() < 32 {
-            return Ok(None);
-        }
-        let icx = i32::from_le_bytes(body[4..8].try_into().unwrap());
-        let icy = i32::from_le_bytes(body[8..12].try_into().unwrap());
-        let ocx = i32::from_le_bytes(body[12..16].try_into().unwrap());
-        let ocy = i32::from_le_bytes(body[16..20].try_into().unwrap());
-        let ir = i32::from_le_bytes(body[20..24].try_into().unwrap());
-        let or_ = i32::from_le_bytes(body[24..28].try_into().unwrap());
-        let Some(stops) = parse_gradient_stops(body, 28) else {
-            return Ok(None);
-        };
-        let picture_xid = self.core.next_host_xid();
-        // Stage 3f.13: build the radial LUT (256×256 BGRA) eagerly.
-        // See `render_create_linear_gradient` for failure-mode
-        // rationale.
-        let engine_stops: Vec<crate::kms::vk::gradient::Stop> = stops
-            .iter()
-            .map(|s| crate::kms::vk::gradient::Stop {
-                pos: s.pos,
-                r: s.r,
-                g: s.g,
-                b: s.b,
-                a: s.a,
-            })
-            .collect();
-        if let Err(e) = self.engine.build_and_insert_radial_gradient(
-            &mut self.platform,
-            picture_xid,
-            (icx, icy, ir),
-            (ocx, ocy, or_),
-            &engine_stops,
-        ) {
-            log::debug!(
-                "render render_create_radial_gradient: engine build failed (xid=0x{picture_xid:x}): \
-                 {e:?} — record stored; paint will fall back to gap-log"
-            );
-        }
-        self.core.pictures.insert(
-            picture_xid,
-            PictureRecord::RadialGradient {
-                inner: (icx, icy, ir),
-                outer: (ocx, ocy, or_),
-                stops,
-                repeat: Repeat::None,
-                transform: None,
-            },
-        );
-        Ok(PictureHandle::from_raw(picture_xid))
+        Self::backend_render_ops_render_create_radial_gradient(self, _origin, body)
     }
 
     fn render_create_cursor(
@@ -5679,64 +4579,7 @@ impl Backend for KmsBackend {
         host_pic: u32,
         body: &[u8],
     ) -> io::Result<()> {
-        // Wire body: picture(4) + clip_x_origin(INT16) +
-        // clip_y_origin(INT16) + N × [x y w h]. Pre-shift each
-        // rectangle by the clip-origin so the stored list is in
-        // dst-coords; the per-rect scissoring path in Stage 3c
-        // doesn't track origin separately.
-        if body.len() < 8 {
-            return Ok(());
-        }
-        let x_origin = i16::from_le_bytes([body[4], body[5]]) as i32;
-        let y_origin = i16::from_le_bytes([body[6], body[7]]) as i32;
-        let rects_data = &body[8..];
-        let mut rects = Vec::with_capacity(rects_data.len() / 8);
-        for chunk in rects_data.chunks_exact(8) {
-            let x = (i16::from_le_bytes([chunk[0], chunk[1]]) as i32 + x_origin)
-                .clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-            let y = (i16::from_le_bytes([chunk[2], chunk[3]]) as i32 + y_origin)
-                .clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-            let w = u16::from_le_bytes([chunk[4], chunk[5]]);
-            let h = u16::from_le_bytes([chunk[6], chunk[7]]);
-            rects.push(Rectangle16 {
-                x,
-                y,
-                width: w,
-                height: h,
-            });
-        }
-        if let Some(PictureRecord::Drawable {
-            clip,
-            clip_x,
-            clip_y,
-            ..
-        }) = self.core.pictures.get_mut(&host_pic)
-        {
-            // X11 RENDER spec semantics:
-            //   - `SetPictureClipRectangles` with EMPTY rect list =
-            //     empty clip region = composites paint **nothing**.
-            //   - `ChangePicture(CPClipMask = None)` clears the clip
-            //     back to "no clip" = paint **everywhere** (`clip = None`).
-            // The previous implementation collapsed both to None;
-            // that broke marco-with-compositing because marco uses
-            // the empty-list form between frames as a "stop
-            // painting until I set a real clip again" gate. With
-            // the buggy collapse, the wallpaper-fill composite
-            // that should have been clipped to nothing painted
-            // everywhere and overwrote the just-drawn window
-            // contents — the Stage 4d "shadow only" symptom.
-            *clip = Some(rects);
-            // The X RENDER protocol carries clip-origin once per
-            // SetPictureClipRectangles; we fold it into the stored
-            // rects (above) but also keep clip_x/clip_y so a
-            // subsequent CPClipXOrigin / CPClipYOrigin override
-            // via ChangePicture composes correctly.
-            *clip_x = x_origin.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-            *clip_y = y_origin.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-        }
-        // SolidFill / Gradient pictures: clip is a no-op (no
-        // backing drawable to clip).
-        Ok(())
+        Self::backend_clip_render_set_picture_clip_rectangles(self, _origin, host_pic, body)
     }
 
     fn render_set_picture_filter(
@@ -5745,31 +4588,7 @@ impl Backend for KmsBackend {
         host_pic: u32,
         body: &[u8],
     ) -> io::Result<()> {
-        // Wire body: picture(4) + name_len(u16) + pad(2) + name +
-        // pad + N × FIXED(4) parameters. Stage 3 only honours
-        // `nearest`; other filters parse + store so the record-
-        // round-trip is honest but `RenderEngine` ignores them at
-        // draw time (per Risk 6).
-        if body.len() < 8 {
-            return Ok(());
-        }
-        let name_len = u16::from_le_bytes([body[4], body[5]]) as usize;
-        if body.len() < 8 + name_len {
-            return Ok(());
-        }
-        let name = &body[8..8 + name_len];
-        let filter = match name {
-            b"nearest" | b"fast" => PictureFilter::Nearest,
-            b"bilinear" | b"good" | b"best" => PictureFilter::Bilinear,
-            b"convolution" => PictureFilter::Convolution,
-            _ => PictureFilter::Nearest,
-        };
-        if let Some(PictureRecord::Drawable { filter: f, .. }) =
-            self.core.pictures.get_mut(&host_pic)
-        {
-            *f = filter;
-        }
-        Ok(())
+        Self::backend_render_ops_render_set_picture_filter(self, _origin, host_pic, body)
     }
 
     fn render_set_picture_transform(
@@ -5778,30 +4597,7 @@ impl Backend for KmsBackend {
         host_pic: u32,
         body: &[u8],
     ) -> io::Result<()> {
-        // Wire body: picture(4) + 9 × FIXED(4) matrix entries (row-
-        // major). 16.16 fixed-point; identity is [[1,0,0],[0,1,0],
-        // [0,0,1]] in floating shape, [[0x10000, 0, 0], [0, 0x10000,
-        // 0], [0, 0, 0x10000]] in fixed.
-        if body.len() < 40 {
-            return Ok(());
-        }
-        let mut matrix = [[0i32; 3]; 3];
-        for (idx, slot) in matrix.iter_mut().flatten().enumerate() {
-            let off = 4 + idx * 4;
-            *slot = i32::from_le_bytes(body[off..off + 4].try_into().unwrap());
-        }
-        let transform = if matrix == [[0x10000, 0, 0], [0, 0x10000, 0], [0, 0, 0x10000]] {
-            None
-        } else {
-            Some(PictTransform { matrix })
-        };
-        match self.core.pictures.get_mut(&host_pic) {
-            Some(PictureRecord::Drawable { transform: t, .. })
-            | Some(PictureRecord::LinearGradient { transform: t, .. })
-            | Some(PictureRecord::RadialGradient { transform: t, .. }) => *t = transform,
-            _ => {}
-        }
-        Ok(())
+        Self::backend_render_ops_render_set_picture_transform(self, _origin, host_pic, body)
     }
 
     fn render_query_version(&mut self, _origin: Option<OriginContext>) -> io::Result<(u32, u32)> {

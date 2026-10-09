@@ -620,3 +620,323 @@ pub(in crate::kms::render) fn parse_composite_glyph_items(
     }
     out
 }
+
+impl KmsBackend {
+    pub(in crate::kms::render::backend) fn backend_text_render_composite_glyphs(
+        &mut self,
+        _origin: Option<OriginContext>,
+        minor: u8,
+        op: u8,
+        host_src: u32,
+        host_dst: u32,
+        mask_fmt: u32,
+        host_gs: u32,
+        src_x: i16,
+        src_y: i16,
+        items: &[u8],
+        x_off: i16,
+        y_off: i16,
+    ) -> io::Result<Vec<xfixes::RegionRect>> {
+        use crate::kms::render::{
+            engine::{CompositeGlyphInput, ResolvedSource},
+            glyph_pixels::GlyphPixels,
+        };
+
+        // Gating: op must be a standard fixed-function PictOp
+        // (0..=12 — Clear..Add) and the src picture must be a
+        // SolidFill. Saturate + the Disjoint/Conjoint families need
+        // dst-readback shader blending the text pipeline doesn't
+        // implement; those return Ok(()) with
+        // `composite_glyphs_dropped_unsupported` bumped. The
+        // standard family flows through per-op blend state derived
+        // from `StdPictOp::blend_factors` — notably `Add` into a
+        // depth-8 a8 mask pixmap, cairo/Pango's component-alpha
+        // text path (the i3-config-wizard black-dialog bug).
+        // `mask_fmt` is read but ignored: per-glyph compositing and
+        // accumulate-into-maskFormat differ only for OVERLAPPING
+        // glyph quads (and are identical for the associative `Add`);
+        // true component-alpha glyphsets remain out of scope.
+        // Unsupported-counter scope (plan §3d): the gate captures
+        // *protocol-supported but engine-unimplemented* shapes —
+        // op outside the standard family and source not SolidFill.
+        // Stale src/dst picture handles and missing glyphsets are
+        // protocol errors, not unsupported features; they log a gap
+        // and return Ok without bumping the counter.
+        if crate::kms::vk::render_pipeline::StdPictOp::from_u8(op).is_none() || op > 12 {
+            self.record_composite_glyphs_drop(format_args!(
+                "op={op} is outside the standard fixed-function family (0..=12)"
+            ));
+            return Ok(Vec::new());
+        }
+        let Some((src_resolved, src_repeat, _src_xform, _src_ca)) =
+            self.resolve_picture_for_render(host_src)
+        else {
+            log::debug!("render composite_glyphs gap: src 0x{host_src:x} not resolvable");
+            return Ok(Vec::new());
+        };
+        let foreground_premul = match src_resolved {
+            ResolvedSource::Solid(c) => c,
+            // Stage 3f.13: glyph paint path is still SolidFill-only
+            // (matches v1's try_vk_render_composite_glyphs). For a
+            // gradient source, collapse to first-stop premul — same
+            // shape as the pre-3f.13 fallback, just scoped here
+            // instead of in `resolve_picture_for_render`. No
+            // counter bump: gradient-on-glyphs is now considered
+            // "best effort handled" rather than "unsupported".
+            ResolvedSource::Gradient(grad_xid) => {
+                first_stop_premul_of_gradient(&self.core, grad_xid).unwrap_or_else(|| {
+                    log::debug!(
+                        "render composite_glyphs: gradient src 0x{grad_xid:x} \
+                         has no stops — treating as transparent"
+                    );
+                    [0.0, 0.0, 0.0, 0.0]
+                })
+            }
+            // #137 tier 1 — a source whose sampled domain is one pixel
+            // under a covering repeat IS a colour, so read it and take
+            // the same route as `CreateSolidFill`. Anything else stays
+            // dropped: tier 2 (general drawable sources) needs its own
+            // spec, and asserting otherwise here would assert tier 2.
+            ResolvedSource::Drawable(src_drawable) => {
+                match self.uniform_glyph_source_premul(host_src, src_drawable, src_repeat, mask_fmt)
+                {
+                    Ok(premul) => premul,
+                    Err(why) => {
+                        self.record_composite_glyphs_drop(format_args!(
+                            "src 0x{host_src:x} is a drawable ({src_drawable:?} \
+                             repeat={src_repeat:?} mask_fmt={mask_fmt}) — {why}"
+                        ));
+                        return Ok(Vec::new());
+                    }
+                }
+            }
+            ResolvedSource::None => {
+                self.record_composite_glyphs_drop(format_args!(
+                    "src 0x{host_src:x} resolved to no source picture at all"
+                ));
+                return Ok(Vec::new());
+            }
+        };
+        let Some((dst_host_xid, dst_clip)) = resolve_dst_picture_for_render(&self.core, host_dst)
+        else {
+            log::debug!("render composite_glyphs gap: dst 0x{host_dst:x} not Drawable picture");
+            return Ok(Vec::new());
+        };
+        // Stage 4a — resolve through redirect routing.
+        let Some(dst_target) = self.resolve_paint_target(dst_host_xid) else {
+            log::debug!(
+                "render composite_glyphs gap: dst drawable 0x{dst_host_xid:x} not in store"
+            );
+            return Ok(Vec::new());
+        };
+        if !self.core.glyphsets.contains_key(&host_gs) {
+            log::debug!("render composite_glyphs gap: glyphset 0x{host_gs:x} not registered");
+            return Ok(Vec::new());
+        }
+
+        // Items parser. Pass 1 (`parse_composite_glyph_items`) walks
+        // the wire stream and resolves every glyph it names, tagging
+        // each with the picture format its glyphset stores it in;
+        // pass 2 below resolves each of those to a
+        // `CompositeGlyphInput` borrowing the glyphset's stored pixel
+        // bytes as-is (dense A8, raw A1 wire or raw ARGB32 wire).
+        // Conversion to A8 is deferred to the engine's atlas-miss
+        // branch (`GlyphPixels::to_a8`) so a resident glyph is never
+        // re-converted (#2, 2026-07-08 render-optimization gaps).
+        // The two passes also keep the immutable
+        // `self.core.glyphsets` borrow off the mutable `self.engine`
+        // call below.
+        //
+        // Per X RENDER protocol, `src_x`/`src_y` are the SOURCE
+        // picture sampling origin, not the dst pen — same as v1. The
+        // first glyph-element's `dx` / `dy` sets the absolute pen
+        // position; subsequent elements accumulate.
+        let _ = (src_x, src_y);
+        let ParsedGlyphItems {
+            glyphs: parsed,
+            elements,
+            found: found_glyphs,
+            missing: missing_glyphs,
+        } = parse_composite_glyph_items(&self.core.glyphsets, minor, host_gs, x_off, y_off, items);
+
+        if parsed.is_empty() {
+            // No drawable glyphs (every entry was zero-size or
+            // missing from the glyphset). Not a gap; just nothing
+            // to record.
+            log::debug!(
+                "render composite_glyphs: NOTHING PARSED minor={minor} gs=0x{host_gs:x} \
+                 items={} elements={elements} found={found_glyphs} missing={missing_glyphs} \
+                 glyphs_in_set={}",
+                items.len(),
+                self.core
+                    .glyphsets
+                    .get(&host_gs)
+                    .map_or(0, |g| g.glyphs.len()),
+            );
+            return Ok(Vec::new());
+        }
+        let mut min_x = i32::MAX;
+        let mut min_y = i32::MAX;
+        let mut max_x = i32::MIN;
+        let mut max_y = i32::MIN;
+        for p in &parsed {
+            min_x = min_x.min(p.dst_x);
+            min_y = min_y.min(p.dst_y);
+            max_x = max_x.max(p.dst_x + i32::try_from(p.w).unwrap_or(0));
+            max_y = max_y.max(p.dst_y + i32::try_from(p.h).unwrap_or(0));
+        }
+        let glyph_union_local = Rectangle16 {
+            x: i16::try_from(min_x.max(0)).unwrap_or(i16::MAX),
+            y: i16::try_from(min_y.max(0)).unwrap_or(i16::MAX),
+            width: u16::try_from((max_x - min_x).max(0)).unwrap_or(u16::MAX),
+            height: u16::try_from((max_y - min_y).max(0)).unwrap_or(u16::MAX),
+        };
+        let clip_by_children = dst_picture_clip_by_children(&self.core, host_dst);
+        let dst_local_extent = self.dst_local_extent(dst_host_xid, dst_target.backing_id());
+        let cliplist_local = self.render_dst_cliplist_local(
+            dst_host_xid,
+            clip_by_children,
+            dst_clip.as_deref(),
+            dst_local_extent,
+            glyph_union_local,
+        );
+        if cliplist_local.is_empty() {
+            log::debug!(
+                "render composite_glyphs: CLIPPED OUT minor={minor} dst=0x{host_dst:x} glyphs={} union={:?} extent={:?} clip_by_children={clip_by_children}",
+                parsed.len(),
+                glyph_union_local,
+                dst_local_extent,
+            );
+            return Ok(Vec::new());
+        }
+        let dst_clip =
+            Self::shift_dst_picture_clip(Some(cliplist_local.clone()), dst_target.offset());
+
+        // Pass 2: resolve each `Parsed` to a `CompositeGlyphInput`
+        // with a stable slice reference. Stage 4a — apply the
+        // dst-target offset to each glyph's dst coordinates so a
+        // redirected window's glyphs land in the backing.
+        let (paint_dx, paint_dy) = dst_target.offset();
+        let inputs: Vec<CompositeGlyphInput<'_>> = parsed
+            .iter()
+            .filter_map(|p| {
+                let stored = self
+                    .core
+                    .glyphsets
+                    .get(&p.gs_xid)
+                    .and_then(|gs| gs.glyphs.get(&p.glyph_id))
+                    .map(|g| g.pixels.as_slice())?;
+                // The byte encoding IS the format tag: the engine
+                // reads it back with `GlyphPixels::source_format()`,
+                // so it can never be told "these bytes are ARGB32"
+                // and "this glyph is A8" at the same time.
+                let pixels = match p.source_format {
+                    GlyphSourceFormat::A8 => GlyphPixels::A8(stored),
+                    GlyphSourceFormat::A1 => GlyphPixels::A1Wire(stored),
+                    GlyphSourceFormat::Argb32 => GlyphPixels::Argb32Wire(stored),
+                };
+                Some(CompositeGlyphInput {
+                    gs_xid: p.gs_xid,
+                    glyph_id: p.glyph_id,
+                    w: p.w,
+                    h: p.h,
+                    pixels,
+                    dst_x: p.dst_x + paint_dx,
+                    dst_y: p.dst_y + paint_dy,
+                })
+            })
+            .collect();
+
+        if inputs.is_empty() {
+            log::debug!(
+                "render composite_glyphs: NO PIXELS minor={minor} dst=0x{host_dst:x} parsed={}",
+                parsed.len(),
+            );
+            return Ok(Vec::new());
+        }
+
+        // Dst PictFormat ID — the engine classifies the dst's alpha
+        // semantics from it (`dst_has_alpha_for_pict_format`), same
+        // as the general render_composite path. 0 for unknown xids;
+        // the engine then falls back to the depth heuristic.
+        let dst_pict_format = picture_pict_format(&self.core, host_dst);
+        let stats = self.engine.composite_glyphs(
+            &mut self.store,
+            &mut self.platform,
+            dst_target.dst(),
+            op,
+            dst_pict_format,
+            foreground_premul,
+            &inputs,
+            dst_clip.as_deref(),
+        );
+        match stats {
+            Ok(s) => {
+                if s.atlas_interns > 0 {
+                    for _ in 0..s.atlas_interns {
+                        self.telemetry.record_atlas_intern();
+                    }
+                }
+                if s.glyph_uploads > 0 {
+                    for _ in 0..s.glyph_uploads {
+                        self.telemetry.record_glyph_upload();
+                    }
+                    // One GlyphUpload event per upload submit
+                    // (paired with the text-paint CB that
+                    // follows). `dst_target.backing_id()` is the eventual
+                    // destination — keep on the dst so analysis
+                    // can correlate uploads with the dst's text
+                    // bursts.
+                    let target_kind = self.submit_target_kind(dst_target.backing_id());
+                    for _ in 0..s.glyph_uploads {
+                        self.telemetry.record_submit_event(SubmitEvent {
+                            frame_id: 0,
+                            kind: SubmitKind::GlyphUpload,
+                            target_kind,
+                            target_id: dst_target.backing_id().as_u64(),
+                            batch_size: 1,
+                            op: SubmitOp::None,
+                            src_class: SrcClass::None,
+                            mask_class: SrcClass::None,
+                            pipeline_id: None,
+                            flags: SubmitFlags {
+                                readback: false,
+                                alias: false,
+                                zero_draws: false,
+                                upload: true,
+                            },
+                        });
+                    }
+                }
+                if s.glyphs_dropped > 0 {
+                    for _ in 0..s.glyphs_dropped {
+                        self.telemetry.record_glyph_dropped_atlas_full();
+                    }
+                }
+                if s.atlas_interns > 0 || !inputs.is_empty() {
+                    // Successful composite_glyphs counts as one
+                    // paint submit (mirroring `image_text` /
+                    // `render_composite` telemetry shape).
+                    self.telemetry.record_paint_submit();
+                    let glyph_count = u32::try_from(inputs.len()).unwrap_or(u32::MAX);
+                    self.trace_render(
+                        SubmitKind::CompositeGlyphs,
+                        dst_target.backing_id(),
+                        glyph_count,
+                        op, // wire PictOp (standard family 0..=12, gated above)
+                        SrcClass::Solid,
+                        None,
+                        SubmitFlags::NONE,
+                    );
+                }
+            }
+            Err(e) => {
+                log::warn!("render composite_glyphs: engine returned {e:?} on dst 0x{host_dst:x}");
+            }
+        }
+        // Phase B.1 Task 21: composite_glyphs may open a frame;
+        // drain any resulting close events into telemetry.
+        self.drain_frame_builder_telemetry();
+        Ok(local_rects_to_region(cliplist_local))
+    }
+}

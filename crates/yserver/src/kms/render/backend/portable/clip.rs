@@ -1006,3 +1006,108 @@ impl KmsBackend {
         Ok(())
     }
 }
+
+impl KmsBackend {
+    /// Audit #8 (2026-05-19) — return the picture's `clientClip` for
+    /// `CreateRegionFromPicture` (XFixes). Outer `Option` distinguishes
+    /// "picture doesn't carry a clientClip at all" (Solidfill /
+    /// gradient → `None`, dispatcher emits BadMatch) from "picture
+    /// exists and we know its clip state" (Drawable → `Some(_)`).
+    /// Inner `Option` distinguishes "no clip set yet" (`Some(None)`,
+    /// also BadMatch per X11 spec — can't extract a region from a
+    /// picture with no clip) from "clip set" (`Some(Some(rects))`,
+    /// returned as the region's rects).
+    ///
+    /// Pre-fix v2 inherited the trait default `None` so EVERY
+    /// `CreateRegionFromPicture` call returned BadMatch — even for
+    /// pictures with legitimate clipped state. Visible in clipboard
+    /// managers / window managers that use this XFixes path.
+    pub(in crate::kms::render::backend) fn backend_clip_picture_client_clip_rects(
+        &mut self,
+        host_pic: u32,
+    ) -> Option<Option<Vec<yserver_protocol::x11::xfixes::RegionRect>>> {
+        let record = self.core.pictures.get(&host_pic)?;
+        match record {
+            PictureRecord::Drawable { clip, .. } => Some(clip.as_ref().map(|rects| {
+                rects
+                    .iter()
+                    .map(|r| yserver_protocol::x11::xfixes::RegionRect {
+                        x: r.x,
+                        y: r.y,
+                        width: r.width,
+                        height: r.height,
+                    })
+                    .collect()
+            })),
+            PictureRecord::SolidFill { .. }
+            | PictureRecord::LinearGradient { .. }
+            | PictureRecord::RadialGradient { .. } => None,
+        }
+    }
+
+    pub(in crate::kms::render::backend) fn backend_clip_render_set_picture_clip_rectangles(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_pic: u32,
+        body: &[u8],
+    ) -> io::Result<()> {
+        // Wire body: picture(4) + clip_x_origin(INT16) +
+        // clip_y_origin(INT16) + N × [x y w h]. Pre-shift each
+        // rectangle by the clip-origin so the stored list is in
+        // dst-coords; the per-rect scissoring path in Stage 3c
+        // doesn't track origin separately.
+        if body.len() < 8 {
+            return Ok(());
+        }
+        let x_origin = i16::from_le_bytes([body[4], body[5]]) as i32;
+        let y_origin = i16::from_le_bytes([body[6], body[7]]) as i32;
+        let rects_data = &body[8..];
+        let mut rects = Vec::with_capacity(rects_data.len() / 8);
+        for chunk in rects_data.chunks_exact(8) {
+            let x = (i16::from_le_bytes([chunk[0], chunk[1]]) as i32 + x_origin)
+                .clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            let y = (i16::from_le_bytes([chunk[2], chunk[3]]) as i32 + y_origin)
+                .clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            let w = u16::from_le_bytes([chunk[4], chunk[5]]);
+            let h = u16::from_le_bytes([chunk[6], chunk[7]]);
+            rects.push(Rectangle16 {
+                x,
+                y,
+                width: w,
+                height: h,
+            });
+        }
+        if let Some(PictureRecord::Drawable {
+            clip,
+            clip_x,
+            clip_y,
+            ..
+        }) = self.core.pictures.get_mut(&host_pic)
+        {
+            // X11 RENDER spec semantics:
+            //   - `SetPictureClipRectangles` with EMPTY rect list =
+            //     empty clip region = composites paint **nothing**.
+            //   - `ChangePicture(CPClipMask = None)` clears the clip
+            //     back to "no clip" = paint **everywhere** (`clip = None`).
+            // The previous implementation collapsed both to None;
+            // that broke marco-with-compositing because marco uses
+            // the empty-list form between frames as a "stop
+            // painting until I set a real clip again" gate. With
+            // the buggy collapse, the wallpaper-fill composite
+            // that should have been clipped to nothing painted
+            // everywhere and overwrote the just-drawn window
+            // contents — the Stage 4d "shadow only" symptom.
+            *clip = Some(rects);
+            // The X RENDER protocol carries clip-origin once per
+            // SetPictureClipRectangles; we fold it into the stored
+            // rects (above) but also keep clip_x/clip_y so a
+            // subsequent CPClipXOrigin / CPClipYOrigin override
+            // via ChangePicture composes correctly.
+            *clip_x = x_origin.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            *clip_y = y_origin.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        }
+        // SolidFill / Gradient pictures: clip is a no-op (no
+        // backing drawable to clip).
+        Ok(())
+    }
+}
