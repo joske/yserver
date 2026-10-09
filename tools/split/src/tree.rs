@@ -262,6 +262,8 @@ pub fn member_parts(item: &ImplItem) -> Parts {
 #[derive(Clone)]
 pub struct Owner {
     pub header: String,
+    /// The header as an inherent impl: generics, self type, where clause.
+    pub inherent: String,
     pub self_ty: String,
     pub is_trait: bool,
 }
@@ -272,8 +274,12 @@ pub fn owner(i: &ItemImpl) -> Owner {
     h.items.clear();
     Commas.visit_item_impl_mut(&mut h);
     let header = tok(&h).trim_end_matches(['{', '}', ' ']).to_string();
+    h.trait_ = None;
+    h.unsafety = None;
+    h.defaultness = None;
     Owner {
         header,
+        inherent: tok(&h).trim_end_matches(['{', '}', ' ']).to_string(),
         self_ty: tok(&i.self_ty),
         is_trait: i.trait_.is_some(),
     }

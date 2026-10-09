@@ -169,7 +169,7 @@ fn delegate(after: &str) -> Vec<String> {
     same_file(TRAIT_BEFORE, after, true)
 }
 
-const DELEGATED: &str = "impl Backend for K {\n    fn f(&mut self, a: u32, b: u32) -> u32 {\n        self.draw_f(a, b)\n    }\n}\n\nimpl K {\n    pub(super) fn draw_f(&mut self, a: u32, b: u32) -> u32 {\n        a + b\n    }\n}\n";
+const DELEGATED: &str = "impl Backend for K {\n    fn f(&mut self, a: u32, b: u32) -> u32 {\n        Self::draw_f(self, a, b)\n    }\n}\n\nimpl K {\n    pub(super) fn draw_f(&mut self, a: u32, b: u32) -> u32 {\n        a + b\n    }\n}\n";
 
 #[test]
 fn delegate_forwarding_passes() {
@@ -178,7 +178,7 @@ fn delegate_forwarding_passes() {
 
 #[test]
 fn delegate_with_swapped_args_fails() {
-    let errs = delegate(&DELEGATED.replace("self.draw_f(a, b)", "self.draw_f(b, a)"));
+    let errs = delegate(&DELEGATED.replace("draw_f(self, a, b)", "draw_f(self, b, a)"));
     assert!(!errs.is_empty());
 }
 
@@ -376,4 +376,47 @@ fn clean_split_passes() {
         [&["pub use inner::*;"], &["use super::*;"]],
     );
     assert_eq!(errs, Vec::<String>::new());
+}
+
+const DELEGATE_VIA_TRAIT: &str = "use crate::other::Other;\n\nimpl Backend for K {\n    fn f(&mut self, a: u32, b: u32) -> u32 {\n        a + b\n    }\n}\n";
+
+#[test]
+fn delegate_to_cfg_disabled_helper_fails() {
+    let after = format!(
+        "use crate::other::Other;\n\n{}",
+        DELEGATED.replace(
+            "    pub(super) fn draw_f",
+            "    #[cfg(any())]\n    pub(super) fn draw_f"
+        )
+    );
+    let errs = same_file(DELEGATE_VIA_TRAIT, &after, true);
+    has(&errs, "no inherent fn carries the old body");
+}
+
+#[test]
+fn delegate_by_method_call_fails() {
+    let after = format!(
+        "use crate::other::Other;\n\n{}",
+        DELEGATED.replace("Self::draw_f(self, a, b)", "self.draw_f(a, b)")
+    );
+    let errs = same_file(DELEGATE_VIA_TRAIT, &after, true);
+    has(&errs, "tokens changed");
+}
+
+#[test]
+fn delegate_to_unsafe_helper_fails() {
+    let errs = delegate(&DELEGATED.replace("pub(super) fn draw_f", "pub(super) unsafe fn draw_f"));
+    has(&errs, "no inherent fn carries the old body");
+}
+
+#[test]
+fn delegate_into_other_generic_context_fails() {
+    let before = TRAIT_BEFORE.replace("impl Backend for K", "impl<T: Copy> Backend for K<T>");
+    let after = DELEGATED
+        .replace("impl Backend for K", "impl<T: Copy> Backend for K<T>")
+        .replace("impl K {", "impl<T> K<T> {");
+    has(
+        &same_file(&before, &after, true),
+        "no inherent fn carries the old body",
+    );
 }

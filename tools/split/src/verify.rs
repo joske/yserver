@@ -6,7 +6,7 @@ use std::{
 };
 
 use quote::ToTokens;
-use syn::{Expr, FnArg, ImplItemFn, Pat, Stmt, Visibility};
+use syn::{Expr, FnArg, ImplItemFn, Pat, Stmt, Visibility, visit_mut::VisitMut};
 
 use crate::{
     apply::Manifest,
@@ -50,7 +50,7 @@ fn allowed_vis(v: &str) -> bool {
 }
 
 /// The trait body moved to an inherent fn and the trait method is now one
-/// forwarding call: returns the callee name.
+/// call `Self::<callee>(self, <params>)`: returns the callee name.
 fn delegate_callee(old: &ImplItemFn, new: &ImplItemFn) -> Option<String> {
     let mut a = new.clone();
     a.block = old.block.clone();
@@ -60,35 +60,43 @@ fn delegate_callee(old: &ImplItemFn, new: &ImplItemFn) -> Option<String> {
     if tok(&a) != tok(&b) {
         return None;
     }
-    let [stmt] = new.block.stmts.as_slice() else {
+    let [Stmt::Expr(Expr::Call(call), None)] = new.block.stmts.as_slice() else {
         return None;
     };
-    let Stmt::Expr(Expr::MethodCall(mc), _) = stmt else {
+    let Expr::Path(f) = &*call.func else {
         return None;
     };
-    let Expr::Path(recv) = &*mc.receiver else {
+    let segs: Vec<&syn::PathSegment> = f.path.segments.iter().collect();
+    let [ty, callee] = segs.as_slice() else {
         return None;
     };
-    if !recv.path.is_ident("self") || mc.turbofish.is_some() {
+    if f.qself.is_some()
+        || f.path.leading_colon.is_some()
+        || ty.ident != "Self"
+        || !ty.arguments.is_none()
+        || !callee.arguments.is_none()
+    {
         return None;
     }
     let params: Vec<String> = old
         .sig
         .inputs
         .iter()
-        .filter_map(|i| match i {
-            FnArg::Typed(pt) => Some(match &*pt.pat {
-                Pat::Ident(pi) => pi.ident.to_string(),
+        .map(|i| match i {
+            FnArg::Receiver(_) => "self".to_string(),
+            FnArg::Typed(pt) => match &*pt.pat {
+                Pat::Ident(pi) if pi.by_ref.is_none() && pi.subpat.is_none() => {
+                    pi.ident.to_string()
+                }
                 _ => String::new(),
-            }),
-            FnArg::Receiver(_) => None,
+            },
         })
         .collect();
-    let args: Vec<String> = mc
+    let args: Vec<String> = call
         .args
         .iter()
         .map(|e| match e {
-            Expr::Path(p) => p
+            Expr::Path(p) if p.qself.is_none() => p
                 .path
                 .get_ident()
                 .map(ToString::to_string)
@@ -96,13 +104,20 @@ fn delegate_callee(old: &ImplItemFn, new: &ImplItemFn) -> Option<String> {
             _ => String::new(),
         })
         .collect();
-    (params == args && params.iter().all(|p| !p.is_empty())).then(|| mc.method.to_string())
+    (params == args && params.iter().all(|p| !p.is_empty())).then(|| callee.ident.to_string())
 }
 
-fn same_body(old: &ImplItemFn, new: &ImplItemFn) -> bool {
-    tok(&old.block) == tok(&new.block)
-        && tok(&old.sig.inputs) == tok(&new.sig.inputs)
-        && tok(&old.sig.output) == tok(&new.sig.output)
+/// Same attributes, qualifiers, generics, signature and body; only the name
+/// and visibility may differ.
+fn same_fn(old: &ImplItemFn, new: &ImplItemFn) -> bool {
+    let canon = |f: &ImplItemFn| {
+        let mut f = f.clone();
+        f.sig.ident = old.sig.ident.clone();
+        f.vis = Visibility::Inherited;
+        tree::Commas.visit_impl_item_fn_mut(&mut f);
+        tok(&f)
+    };
+    canon(old) == canon(new)
 }
 
 pub fn run(spec: &Spec, base: &dyn Source, head: &dyn Source, touched: &[String]) -> Res<bool> {
@@ -286,31 +301,55 @@ pub fn check(
         }
     }
 
-    // Delegations: each marker must be claimed by one new inherent fn whose
-    // body and signature equal the old trait body.
+    // Delegations: each marker must be claimed by the one inherent fn of that
+    // name on the type, in the trait impl's generic context and effective cfg,
+    // equal to the old trait fn but for name and visibility.
     let mut news = extra;
     for (old, callee) in delegations {
         let ofn = old.func.as_ref().expect("trait fn");
-        let pos = news.iter().position(|n| {
-            n.kind == "fn"
-                && n.name == callee
-                && n.ctx == old.ctx
-                && n.vis != "pub"
-                && n.owner.as_ref().is_some_and(|o| {
-                    !o.is_trait && o.self_ty == old.owner.as_ref().expect("owner").self_ty
-                })
-                && n.func.as_ref().is_some_and(|f| same_body(ofn, f))
-        });
-        match pos {
-            Some(i) => {
-                news.remove(i);
-                delegated += 1;
+        let oo = old.owner.as_ref().expect("owner");
+        let named: Vec<usize> = news
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| {
+                n.kind == "fn"
+                    && n.name == callee
+                    && n.owner
+                        .as_ref()
+                        .is_some_and(|o| !o.is_trait && o.self_ty == oo.self_ty)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let named_after = after
+            .leaves
+            .iter()
+            .filter(|n| {
+                n.kind == "fn"
+                    && n.name == callee
+                    && n.owner
+                        .as_ref()
+                        .is_some_and(|o| !o.is_trait && o.self_ty == oo.self_ty)
+            })
+            .count();
+        let ok = match named.as_slice() {
+            [i] if named_after == 1 => {
+                let n = news[*i];
+                n.ctx == old.ctx
+                    && n.vis != "pub"
+                    && n.owner.as_ref().is_some_and(|o| o.header == oo.inherent)
+                    && n.func.as_ref().is_some_and(|f| same_fn(ofn, f))
             }
-            None => errs.push(format!(
-                "{}: forwards to self.{}(..) but no inherent fn carries the old body",
+            _ => false,
+        };
+        if ok {
+            news.remove(named[0]);
+            delegated += 1;
+        } else {
+            errs.push(format!(
+                "{}: forwards to Self::{callee}(..) but no inherent fn carries the old body ({} candidates)",
                 old.okey(),
-                callee
-            )),
+                named_after
+            ));
         }
     }
     for n in news {
