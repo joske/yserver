@@ -5172,7 +5172,7 @@ fn randr_replays_muffin_scale_up_125_through_both_crtcs_off() {
     let right = (2560, 0, 2048, 1152);
     r.assert_layout((4608, 1152), left, right, &[left, right]);
     assert_eq!(
-        super::super::run::enabled_output_bbox(&r.state),
+        crate::core_loop::run::enabled_output_bbox(&r.state),
         Some((4608, 1152))
     );
 }
@@ -5182,7 +5182,7 @@ fn randr_client_screen_size_survives_a_larger_transformed_bbox() {
     let mut r = MuffinReplay::new();
     r.configure(6, MuffinReplay::OUTPUT_6, 2560, MUFFIN_2_0, b"good");
     assert_eq!(
-        super::super::run::enabled_output_bbox(&r.state),
+        crate::core_loop::run::enabled_output_bbox(&r.state),
         Some((7680, 2880))
     );
     let right = (2560, 0, 5120, 2880);
@@ -18637,7 +18637,7 @@ fn kill_client_by_retained_syncobj_xid_destroys_zombie_resources() {
             .register_dri3_syncobj(ResourceId(SYNCOBJ), ClientId(7))
     );
     backend.seed_dri3_syncobj_for_test(SYNCOBJ, ClientId(7));
-    super::super::process_disconnect::process_disconnect(&mut state, &mut backend, ClientId(7));
+    crate::core_loop::process_disconnect::process_disconnect(&mut state, &mut backend, ClientId(7));
     assert_eq!(state.zombie_clients.get(&7), Some(&1));
 
     let outcome = process_request(
@@ -18675,7 +18675,7 @@ fn kill_client_all_temporary_destroys_retained_syncobj() {
             .register_dri3_syncobj(ResourceId(SYNCOBJ), ClientId(7))
     );
     backend.seed_dri3_syncobj_for_test(SYNCOBJ, ClientId(7));
-    super::super::process_disconnect::process_disconnect(&mut state, &mut backend, ClientId(7));
+    crate::core_loop::process_disconnect::process_disconnect(&mut state, &mut backend, ClientId(7));
     assert_eq!(state.zombie_clients.get(&7), Some(&2));
 
     let outcome = process_request(
@@ -51347,7 +51347,7 @@ fn screen_resize_notifies_materialized_cow_present_subscriber() {
         "Present pixmap height must ask Mesa/KWin to reallocate full-size buffers",
     );
 
-    super::super::run::emit_screen_resize_window_notifications_if_outputs_caught_up(
+    crate::core_loop::run::emit_screen_resize_window_notifications_if_outputs_caught_up(
         &mut state,
         Some((1680, 1050)),
     );
@@ -51358,7 +51358,7 @@ fn screen_resize_notifies_materialized_cow_present_subscriber() {
 
     state.randr.outputs[0].width = 3440;
     state.randr.outputs[0].height = 1440;
-    super::super::run::emit_screen_resize_window_notifications_if_outputs_caught_up(
+    crate::core_loop::run::emit_screen_resize_window_notifications_if_outputs_caught_up(
         &mut state,
         Some((1680, 1050)),
     );
@@ -51379,7 +51379,7 @@ fn screen_resize_notifies_materialized_cow_present_subscriber() {
         1440,
     );
 
-    super::super::run::emit_screen_resize_window_notifications_if_outputs_caught_up(
+    crate::core_loop::run::emit_screen_resize_window_notifications_if_outputs_caught_up(
         &mut state,
         Some((3440, 1440)),
     );
