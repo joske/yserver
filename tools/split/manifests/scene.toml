@@ -43,3 +43,8 @@ items = [
 [[modules]]
 name = "tests"
 items = ["tests::*"]
+
+[locations]
+"impl SceneCompositor::fn root_overlay_clear" = "#[track_caller] damage-audit helpers record a caller line that shifts by 3; only diagnostic source attribution changes (read at scene.rs:3321 overflow report and :3985 audit attribution), not damage computation"
+"impl SceneCompositor::fn root_overlay_on_disconnect" = "#[track_caller] damage-audit helpers record a caller line that shifts by 3; only diagnostic source attribution changes (read at scene.rs:3321 overflow report and :3985 audit attribution), not damage computation"
+"impl SceneCompositor::fn root_overlay_toggle" = "#[track_caller] damage-audit helpers record a caller line that shifts by 3; only diagnostic source attribution changes (read at scene.rs:3321 overflow report and :3985 audit attribution), not damage computation"
