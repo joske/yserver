@@ -111,7 +111,8 @@ pub fn tok(t: &impl ToTokens) -> String {
 /// Drops the trailing commas rustfmt adds or removes with line width, only in
 /// syntax where they carry no meaning; 1-tuples, macro and attribute tokens
 /// are left alone. A closure body `{ e }` (no statements, attributes, label,
-/// return type; `e` not a brace macro) compares as `e`.
+/// return type; `e` not a brace macro) compares as `e`, and so does a match
+/// arm body `{ e }` (the arm body is a temporary scope either way).
 pub struct Commas;
 
 /// `e` of a plain block `{ e }`.
@@ -205,6 +206,9 @@ impl VisitMut for Commas {
 
     fn visit_arm_mut(&mut self, i: &mut syn::Arm) {
         i.comma = None;
+        if let Some(e) = tail_only(&i.body) {
+            *i.body = e;
+        }
         visit_mut::visit_arm_mut(self, i);
     }
 

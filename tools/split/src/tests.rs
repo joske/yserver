@@ -1094,6 +1094,35 @@ fn closure_block_of_another_shape_is_significant() {
 }
 
 #[test]
+fn match_arm_block_of_one_tail_expression_is_not_significant() {
+    let before = fn_body("match v.first() { Some(x) => { (*x, 1) } None => { g![v] } }");
+    let after = fn_body("match v.first() { Some(x) => (*x, 1), None => g![v], }");
+    assert_eq!(same_file(&before, &after, false), Vec::<String>::new());
+}
+
+#[test]
+fn match_arm_block_of_another_shape_is_significant() {
+    for block in [
+        "{ let y = *x; y }",
+        "{ *x; }",
+        "unsafe { g(x) }",
+        "'a: { g(x) }",
+        "#[allow(unused)] { g(x) }",
+        "{ #![allow(unused)] g(x) }",
+        "{ #[allow(unused)] g(x) }",
+        "{ g! { x } }",
+        "async { g(x) }",
+        "{ { g(x) } }",
+    ] {
+        let before = fn_body(&format!(
+            "match v.first() {{ Some(x) => {block}, None => 0 }}"
+        ));
+        let after = fn_body("match v.first() { Some(x) => g(x), None => 0 }");
+        has(&same_file(&before, &after, false), "tokens changed");
+    }
+}
+
+#[test]
 fn std_macro_trailing_commas_are_not_significant() {
     let before = fn_body(
         "let w = vec![1, 2,]; assert_eq!(w, vec![1, 2,],); debug_assert!(w.len() == 2,); \

@@ -23,8 +23,8 @@
 //! `STD_COMMA_MACROS` that resolve to nothing in the tree (std's) at every
 //! invocation in the leaf, when they parse as the macro's grammar: trailing
 //! comma dropped, and the same layout normalization as code outside macros;
-//! other macros' input and attributes stay exact. Closure bodies
-//! `{ e }` compare as `e` (see `tree::Commas`).
+//! other macros' input and attributes stay exact. Closure and match arm
+//! bodies `{ e }` compare as `e` (see `tree::Commas`).
 //!
 //! Refused: moving a leaf that invokes an in-tree `macro_rules!`, or defines
 //! and invokes its own, to another module, unless the manifest lists it under
