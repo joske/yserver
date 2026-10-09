@@ -1,35 +1,24 @@
-//! `RenderEngine` — drawing primitives into [`DrawableStore`] storage.
+//! `RenderEngine`: records paint ops into the open frame and replays them
+//! into Vulkan command buffers against [`DrawableStore`] storage.
 //!
-//! Stage 2c lands the three single-drawable paint ops the v2 model
-//! needs for offscreen pixel-correctness gates:
-//! [`fill_rect`](RenderEngine::fill_rect),
-//! [`put_image`](RenderEngine::put_image),
-//! [`get_image`](RenderEngine::get_image). Each op is a self-
-//! contained `vkQueueSubmit2` against a fresh [`FenceTicket`] from
-//! [`PlatformBackend`]. The ticket is recorded on every drawable
-//! the op touched (cross-cutting §5) so a later compose-read can
-//! see the in-flight write; and parked on
-//! [`RenderEngine::submitted`] for retirement via
-//! [`poll_retired`](RenderEngine::poll_retired).
+//! It owns the frame builder (record, coalesce, close, submit), the upload
+//! arena and staging pool, scratch images and clip snapshots, the RENDER /
+//! glyph / text / trapezoid pipelines and caches, and the retirement of the
+//! images and resources its submissions guard. This file holds the imports
+//! and every type (private fields stay visible to all children); the
+//! methods live in:
 //!
-//! What's deliberately NOT in 2c (per the Stage 2 plan):
-//!
-//! - `copy_area` (joins 2d alongside scene/blit).
-//! - RENDER / glyphs / text / poly_line / poly_segment / etc.
-//!   Logged-gap on `KmsBackend` until Stage 3.
-//! - Per-op batching across multiple ops. 2c uses one
-//!   submission per Backend method call — equivalent perf-wise to
-//!   v1's per-op shape; submit-aggregation arrives in Stage 5.
-//! - `vkQueueWaitIdle` anywhere. Only `get_image` waits on its own
-//!   `FenceTicket` (off the hot path; sync RPC by protocol design).
-//! - GC `function != GXcopy` and non-zero `planemask`. Stage 2 plan
-//!   §"What doesn't ship in Stage 2": v2 logs a gap + drops the op.
-//!   These come back in Stage 3 alongside RENDER.
-//!
-//! Layout discipline: every paint op brackets its work with two
-//! [`Drawable::record_layout_transition`] calls so the storage is
-//! returned to `SHADER_READ_ONLY_OPTIMAL` for the next consumer
-//! (compose-read in 2d, another paint op in 2c).
+//! - `lifecycle`: create, poll/retire, shutdown, drain, `Drop`.
+//! - `export`: GLX-TFP promotion of a pixmap onto dma-buf-exportable storage.
+//! - `frame`: frame builder open/close/submit, coalescing stats,
+//!   commit/rollback, present-completion batches, descriptor sets.
+//! - `staging`, `scratch`: upload arena and staging buffers; scratch images
+//!   and clip snapshots.
+//! - `fill_copy`, `put_get`, `text`, `glyphs`, `composite`, `batch`,
+//!   `gradients`, `traps`: the op-recording entry points.
+//! - `emit`: close-time replay of recorded ops into the command buffer.
+//! - `pixels`: wire <-> storage pixel conversion.
+//! - `for_tests`: `*_for_tests` entry points; `tests`: unit tests.
 
 #![allow(
     dead_code,
