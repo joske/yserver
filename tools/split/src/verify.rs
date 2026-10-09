@@ -206,7 +206,22 @@ pub fn check(
         groups.entry(l.key()).or_default().1.push(l);
     }
 
-    let rx = Resolution::new(&before, &after, &map);
+    let exceptions: BTreeMap<String, String> = match spec.manifest {
+        Some(m) => m
+            .exceptions
+            .iter()
+            .map(|(k, why)| {
+                let old = tree::child(&m.full(""), k);
+                match map.get(&old) {
+                    _ if why.trim().is_empty() => Err(format!("exception {k}: no reason given")),
+                    Some(n) => Ok((n.clone(), why.clone())),
+                    None => Err(format!("exception: unknown item {k}")),
+                }
+            })
+            .collect::<Res<_>>()?,
+        None => BTreeMap::new(),
+    };
+    let rx = Resolution::new(&before, &after, &map, &exceptions);
     let inc_macros = scope::including_macros(&before);
     let norm_tokens = |key: &str, l: &Leaf| {
         let mut t = l.tokens.clone();
@@ -229,7 +244,7 @@ pub fn check(
                 Some(i) => {
                     let (na, _) = a.remove(i);
                     matched += 1;
-                    errs.extend(rx.check(ob, na));
+                    errs.extend(rx.check(ob, na, ob.owner.as_ref().map(|o| o.header.as_str())));
                     let (so, sn) = (scope(&ob.vis, &ob.module), scope(&na.vis, &na.module));
                     if na.vis != ob.vis {
                         if ob.vis.is_empty()
@@ -365,8 +380,28 @@ pub fn check(
             _ => false,
         };
         if ok {
-            news.remove(named[0]);
+            let n = news.remove(named[0]);
             delegated += 1;
+            errs.extend(rx.check(old, n, Some(&oo.inherent)));
+            errs.extend(rx.self_ty(old, &oo.self_ty));
+            if n.comments != old.comments {
+                errs.push(format!(
+                    "{}: comments changed in the delegated helper\n      before: {:?}\n      after:  {:?}",
+                    old.okey(),
+                    old.comments,
+                    n.comments
+                ));
+            }
+            errs.extend(includes_ok(
+                spec,
+                base,
+                head,
+                &old.okey(),
+                old,
+                n,
+                &inc_macros,
+                &mut incl,
+            ));
         } else {
             errs.push(format!(
                 "{}: forwards to Self::{callee}(..) but no inherent fn carries the old body ({} candidates)",
@@ -377,6 +412,10 @@ pub fn check(
     }
     for n in news {
         errs.push(format!("{}: new leaf ({}:{})", n.key(), n.file, n.line));
+    }
+    let used = rx.used.borrow();
+    for k in exceptions.keys().filter(|k| !used.contains(*k)) {
+        errs.push(format!("{k}: exception not needed"));
     }
 
     // Every `use`, per module: only manifest lines may be added, none lost.
@@ -458,9 +497,10 @@ pub fn check(
 
     let mut info = vec![
         format!(
-            "leaves: {} before, {} after, {matched} identical; {vis_changes} manifest visibility changes; {incl} include paths same bytes; {delegated} delegations",
+            "leaves: {} before, {} after, {matched} identical; {vis_changes} manifest visibility changes; {incl} include paths same bytes; {delegated} delegations; {} audited exceptions",
             before.leaves.len(),
-            after.leaves.len()
+            after.leaves.len(),
+            used.len()
         ),
         format!(
             "files: {} → {}; line smoke (info): -{removed} +{added} lines",
@@ -533,9 +573,13 @@ fn includes_ok(
 
 /// Macro and name resolution of both trees, comparable through the table.
 struct Resolution<'a> {
-    macros: [Vec<Vec<String>>; 2],
+    before: &'a Tree,
+    macros: [Vec<scope::Site>; 2],
     names: [Names; 2],
     map: &'a BTreeMap<String, String>,
+    /// New leaf key → audited reason for moving macro invocations.
+    exceptions: &'a BTreeMap<String, String>,
+    used: std::cell::RefCell<BTreeSet<String>>,
 }
 
 fn hash(s: &str) -> u64 {
@@ -545,49 +589,129 @@ fn hash(s: &str) -> u64 {
 }
 
 impl<'a> Resolution<'a> {
-    fn new(before: &Tree, after: &Tree, map: &'a BTreeMap<String, String>) -> Self {
+    fn new(
+        before: &'a Tree,
+        after: &Tree,
+        map: &'a BTreeMap<String, String>,
+        exceptions: &'a BTreeMap<String, String>,
+    ) -> Self {
         let old = |l: &Leaf| map.get(&l.okey()).cloned().unwrap_or_else(|| l.okey());
         let new = |l: &Leaf| l.key();
         let def_old = |l: &Leaf| format!("{} {:x}", old(l), hash(&l.tokens));
         let def_new = |l: &Leaf| format!("{} {:x}", new(l), hash(&l.tokens));
+        let names = [Names::new(before, &old), Names::new(after, &new)];
         Resolution {
+            before,
             macros: [
-                scope::macro_sites(before, &def_old),
-                scope::macro_sites(after, &def_new),
+                scope::macro_sites(before, &def_old, &names[0]),
+                scope::macro_sites(after, &def_new, &names[1]),
             ],
-            names: [Names::new(before, &old), Names::new(after, &new)],
+            names,
             map,
+            exceptions,
+            used: Default::default(),
         }
     }
 
-    fn check(&self, ob: &Leaf, na: &Leaf) -> Vec<String> {
+    fn diff(&self, key: &str, what: &str, ob: &Leaf, na: &Leaf, n: &str, ns: u8) -> Option<String> {
+        let (b, a) = (
+            self.names[0].resolve(&ob.module, n, ns),
+            self.names[1].resolve(&na.module, n, ns),
+        );
+        (b != a).then(|| {
+            format!("{key}: name `{n}`{what} resolves differently\n      before: {b:?}\n      after:  {a:?}")
+        })
+    }
+
+    /// `na` (or a delegated helper) means what `ob` meant: macro sites, free
+    /// names of the body, of `header` and of the macro expansions it reaches,
+    /// relative paths, and the traits in scope.
+    fn check(&self, ob: &Leaf, na: &Leaf, header: Option<&str>) -> Vec<String> {
         let key = self.map.get(&ob.okey()).cloned().unwrap_or_default();
         let mut errs = Vec::new();
-        let (mb, ma) = (&self.macros[0][ob.idx], &self.macros[1][na.idx]);
-        if mb != ma {
+        let (sb, sa) = (&self.macros[0][ob.idx], &self.macros[1][na.idx]);
+        if sb.text != sa.text {
             errs.push(format!(
-                "{key}: macro resolution changed\n      before: {mb:?}\n      after:  {ma:?}"
+                "{key}: macro resolution changed\n      before: {:?}\n      after:  {:?}",
+                sb.text, sa.text
             ));
         }
-        let (names, rel) = scope::free_names(&ob.tokens);
-        if rel && ob.module != na.module {
-            errs.push(format!(
-                "{key}: moved from {} to {} with a `self::`/`super::` path",
-                ob.module, na.module
-            ));
-        }
-        for (n, ns) in names {
-            let (b, a) = (
-                self.names[0].resolve(&ob.module, &n, ns),
-                self.names[1].resolve(&na.module, &n, ns),
-            );
-            if b != a {
+        let mut bodies = vec![ob.tokens.clone()];
+        bodies.extend(header.map(str::to_string));
+        let expansions: Vec<String> = sb
+            .defs
+            .iter()
+            .flat_map(|d| scope::macro_defs(&self.before.leaves[*d].tokens))
+            .flat_map(|(_, t)| t)
+            .collect();
+        for (i, t) in bodies.iter().chain(&expansions).enumerate() {
+            let what = if i < bodies.len() {
+                ""
+            } else {
+                " in a macro expansion"
+            };
+            let (names, rb) = scope::free_names(t, &ob.module);
+            let (_, ra) = scope::free_names(t, &na.module);
+            if rb != ra {
                 errs.push(format!(
-                    "{key}: name `{n}` resolves differently\n      before: {b:?}\n      after:  {a:?}"
+                    "{key}: moved from {} to {} with a `self::`/`super::` path{what}, which now names another module; keep the module depth, or qualify the path in a separate reviewed preparatory commit",
+                    ob.module, na.module
+                ));
+            }
+            errs.extend(
+                names
+                    .iter()
+                    .filter_map(|(n, ns)| self.diff(&key, what, ob, na, n, *ns)),
+            );
+        }
+        let (tb, ta) = (
+            self.names[0].traits(&ob.module),
+            self.names[1].traits(&na.module),
+        );
+        if tb != ta {
+            errs.push(format!(
+                "{key}: traits in scope changed (method calls may dispatch elsewhere)\n      before: {tb:?}\n      after:  {ta:?}"
+            ));
+        }
+        if ob.module != na.module && (sb.local || !sb.defs.is_empty()) {
+            if self.exceptions.contains_key(&na.key()) {
+                self.used.borrow_mut().insert(na.key());
+            } else {
+                let what = if sb.local {
+                    "defines and invokes a local macro_rules!".to_string()
+                } else {
+                    let names: BTreeSet<&str> = sb
+                        .defs
+                        .iter()
+                        .map(|d| self.before.leaves[*d].name.as_str())
+                        .collect();
+                    format!("invokes macro_rules! {names:?}")
+                };
+                errs.push(format!(
+                    "{key}: {what} and moves from {} to {}; expansions resolve at the call site, which is not modelled: keep the module, or list the item under [exceptions] with an audited reason",
+                    ob.module, na.module
                 ));
             }
         }
         errs
+    }
+
+    /// The delegated helper's impl names the old impl's self type.
+    fn self_ty(&self, old: &Leaf, ty: &str) -> Option<String> {
+        let first = syn::parse_str::<syn::TypePath>(ty)
+            .ok()
+            .filter(|p| p.qself.is_none())
+            .and_then(|p| p.path.segments.first().map(|s| s.ident.to_string()));
+        let ok = first.is_some_and(|f| {
+            let r = self.names[0].resolve(&old.module, &f, scope::TYPE);
+            !r.is_empty() && r.iter().all(|x| !x.starts_with("glob "))
+        });
+        (!ok).then(|| {
+            format!(
+                "{}: self type `{ty}` of the delegation does not resolve to one item in the tree",
+                old.okey()
+            )
+        })
     }
 }
 

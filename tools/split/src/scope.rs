@@ -1,14 +1,31 @@
 //! Resolution guards over the in-tree model: visibility scopes, textual
-//! `macro_rules!` scope, and what a leaf's free names bind to.
+//! `macro_rules!` scope, what a leaf's free names bind to, traits in scope.
 //!
 //! Names: every module's bindings are its top-level leaves, child modules and
-//! `use` names; `use x::*` of an in-tree module is followed (visibility and
-//! local-over-glob shadowing applied), any other glob is an opaque marker that
-//! only counts when nothing in the tree binds the name. A leaf's names are the
-//! first segments of its paths, classified by shape (`a::` type, `A` type or
-//! value, `a` value); fields, methods, macro names and bound names after a
-//! keyword are skipped. Not modelled: preludes, extern crates, local `let`
-//! bindings shadowing items, names inside macro input.
+//! `use` names (paths made absolute); `use x::*` of an in-tree module is
+//! followed (visibility and local-over-glob shadowing applied), any other
+//! glob is an opaque marker that only counts when nothing in the tree binds
+//! the name. A leaf's names are the first segments of its paths (impl head
+//! included), classified by shape (`a::` type, `A` type or value, `a`
+//! value); fields, methods, macro names, `$` metavariables and names bound
+//! after a keyword or in a `use … as` are skipped.
+//!
+//! Checked per moved leaf and per delegated helper, before against after:
+//! those names; the textual macro chain of each invocation down to the first
+//! definition active wherever the caller is (cfg'd ones listed), else the
+//! macro's path binding; the free names in every arm of the reached
+//! definitions, resolved at the caller; the module each `self::`/`super::`
+//! path starts from; the traits in scope (named, `_` and glob imports,
+//! imports of unknown kind and opaque globs as tokens); for delegations,
+//! that the self type resolves to one in-tree item.
+//!
+//! Refused: moving a leaf that invokes an in-tree `macro_rules!`, or defines
+//! and invokes its own, to another module, unless the manifest lists it under
+//! `exceptions` with a reason (the checks above still apply).
+//!
+//! Not modelled: preludes, extern crates, local `let` and item shadowing,
+//! names inside macro input, inherent-vs-trait method priority, macros named
+//! by path (`a::m!`), `#[macro_export]`, cfg values.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -113,11 +130,64 @@ pub fn invocations(tokens: &str) -> Vec<String> {
     out
 }
 
+/// `macro_rules!` definitions anywhere in `tokens`: name and transcribers.
+pub fn macro_defs(tokens: &str) -> Vec<(String, Vec<String>)> {
+    fn walk(v: &[TokenTree], out: &mut Vec<(String, Vec<String>)>) {
+        for (i, t) in v.iter().enumerate() {
+            match (t, v.get(i + 2), v.get(i + 3)) {
+                (TokenTree::Ident(id), Some(TokenTree::Ident(name)), Some(TokenTree::Group(g)))
+                    if id == "macro_rules" && is_punct(v.get(i + 1), '!') =>
+                {
+                    let arms: Vec<TokenTree> = g.stream().into_iter().collect();
+                    let bodies = (0..arms.len())
+                        .filter(|&j| is_punct(arms.get(j), '=') && is_punct(arms.get(j + 1), '>'))
+                        .filter_map(|j| match arms.get(j + 2) {
+                            Some(TokenTree::Group(b)) => Some(b.stream().to_string()),
+                            _ => None,
+                        })
+                        .collect();
+                    out.push((name.to_string(), bodies));
+                }
+                (TokenTree::Group(g), ..) => {
+                    walk(&g.stream().into_iter().collect::<Vec<_>>(), out);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&tts(tokens), &mut out);
+    out
+}
+
+/// What a leaf's macro invocations reach.
+#[derive(Default)]
+pub struct Site {
+    /// Per invocation: the definitions by textual scope, from the innermost
+    /// down to the first one active whenever the caller is, or the path
+    /// binding when no definition is in textual scope.
+    pub text: Vec<String>,
+    /// Definition leaves reached, directly or through other macros.
+    pub defs: BTreeSet<usize>,
+    /// The leaf defines and invokes its own `macro_rules!`.
+    pub local: bool,
+}
+
+/// Whether a definition may be inactive where `caller` is compiled.
+fn conditional(def: &Leaf, caller: &Leaf) -> bool {
+    !def.ctx.cfg.is_subset(&caller.ctx.cfg)
+        || def
+            .tokens
+            .split("macro_rules")
+            .next()
+            .is_some_and(|attrs| attrs.contains("# [cfg"))
+}
+
 /// Per leaf: which `macro_rules!` each unqualified invocation reaches by
-/// textual scope (with the macros that definition invokes in turn). `id`
+/// textual scope, with the macros those definitions invoke in turn. `id`
 /// names a definition leaf.
-pub fn macro_sites(t: &Tree, id: &dyn Fn(&Leaf) -> String) -> Vec<Vec<String>> {
-    let mut out = vec![Vec::new(); t.leaves.len()];
+pub fn macro_sites(t: &Tree, id: &dyn Fn(&Leaf) -> String, names: &Names) -> Vec<Site> {
+    let mut out: Vec<Site> = t.leaves.iter().map(|_| Site::default()).collect();
     let mut visible: Vec<(String, usize)> = Vec::new();
     let mut stack: Vec<(usize, bool)> = Vec::new();
     for ev in &t.events {
@@ -134,11 +204,26 @@ pub fn macro_sites(t: &Tree, id: &dyn Fn(&Leaf) -> String) -> Vec<Vec<String>> {
                     visible.push((l.name.clone(), *i));
                     continue;
                 }
+                let locals: BTreeSet<String> =
+                    macro_defs(&l.tokens).into_iter().map(|(n, _)| n).collect();
+                let site = &mut out[*i];
                 for name in invocations(&l.tokens) {
+                    if locals.contains(&name) {
+                        site.local = true;
+                        site.text.push(format!("{name} = local"));
+                        continue;
+                    }
                     let mut seen = BTreeSet::new();
-                    let mut site = Vec::new();
-                    reach(t, &visible, &name, id, &mut seen, &mut site);
-                    out[*i].push(site.join(", "));
+                    let mut text = Vec::new();
+                    let cx = Reach {
+                        t,
+                        visible: &visible,
+                        caller: l,
+                        id,
+                        names,
+                    };
+                    cx.reach(&name, &mut seen, &mut text, &mut site.defs);
+                    site.text.push(text.join(", "));
                 }
             }
         }
@@ -146,77 +231,126 @@ pub fn macro_sites(t: &Tree, id: &dyn Fn(&Leaf) -> String) -> Vec<Vec<String>> {
     out
 }
 
-fn reach(
-    t: &Tree,
-    visible: &[(String, usize)],
-    name: &str,
-    id: &dyn Fn(&Leaf) -> String,
-    seen: &mut BTreeSet<String>,
-    out: &mut Vec<String>,
-) {
-    if !seen.insert(name.to_string()) {
-        return;
-    }
-    match visible.iter().rev().find(|(n, _)| n == name) {
-        Some((_, d)) => {
-            out.push(format!("{name} = {}", id(&t.leaves[*d])));
-            for inner in invocations(&t.leaves[*d].tokens) {
-                reach(t, visible, &inner, id, seen, out);
+struct Reach<'a> {
+    t: &'a Tree,
+    visible: &'a [(String, usize)],
+    caller: &'a Leaf,
+    id: &'a dyn Fn(&Leaf) -> String,
+    names: &'a Names,
+}
+
+impl Reach<'_> {
+    fn reach(
+        &self,
+        name: &str,
+        seen: &mut BTreeSet<String>,
+        out: &mut Vec<String>,
+        defs: &mut BTreeSet<usize>,
+    ) {
+        if !seen.insert(name.to_string()) {
+            return;
+        }
+        let mut chain = Vec::new();
+        for (_, d) in self.visible.iter().rev().filter(|(n, _)| n == name) {
+            chain.push(*d);
+            if !conditional(&self.t.leaves[*d], self.caller) {
+                break;
             }
         }
-        None => out.push(format!("{name} = (none in the tree)")),
+        if chain.is_empty() {
+            let b = self.names.resolve(&self.caller.module, name, MACRO);
+            out.push(format!("{name} = path {b:?}"));
+            return;
+        }
+        for d in chain {
+            let l = &self.t.leaves[d];
+            let cond = if conditional(l, self.caller) {
+                " (cfg)"
+            } else {
+                ""
+            };
+            out.push(format!("{name} = {}{cond}", (self.id)(l)));
+            defs.insert(d);
+            for inner in invocations(&l.tokens) {
+                self.reach(&inner, seen, out, defs);
+            }
+        }
     }
 }
 
 pub const TYPE: u8 = 1;
 pub const VALUE: u8 = 2;
+pub const MACRO: u8 = 4;
 
-const SKIP_AFTER: [&str; 10] = [
-    "fn", "struct", "enum", "union", "trait", "type", "mod", "as", "const", "static",
-];
+const SKIP_AFTER: [&str; 7] = ["fn", "struct", "enum", "union", "trait", "type", "mod"];
 
-/// Free names of a leaf with their namespace mask; `true` if it has a path
-/// starting with `self::`/`super::`.
-pub fn free_names(tokens: &str) -> (BTreeSet<(String, u8)>, bool) {
-    fn walk(v: &[TokenTree], out: &mut BTreeSet<(String, u8)>, rel: &mut bool) {
-        for (i, t) in v.iter().enumerate() {
-            let TokenTree::Ident(id) = t else {
-                if let TokenTree::Group(g) = t {
-                    walk(&g.stream().into_iter().collect::<Vec<_>>(), out, rel);
+/// Free names of a leaf with their namespace mask, and the module each
+/// leading `self::`/`super::` path starts from when written in `module`.
+pub fn free_names(tokens: &str, module: &str) -> (BTreeSet<(String, u8)>, Vec<String>) {
+    struct W<'a> {
+        module: &'a str,
+        out: BTreeSet<(String, u8)>,
+        rel: Vec<String>,
+    }
+    impl W<'_> {
+        fn walk(&mut self, v: &[TokenTree], mut in_use: bool) {
+            for (i, t) in v.iter().enumerate() {
+                let TokenTree::Ident(id) = t else {
+                    match t {
+                        TokenTree::Group(g) => {
+                            self.walk(&g.stream().into_iter().collect::<Vec<_>>(), in_use);
+                        }
+                        TokenTree::Punct(p) if p.as_char() == ';' => in_use = false,
+                        _ => {}
+                    }
+                    continue;
+                };
+                let s = id.to_string();
+                in_use |= s == "use";
+                let path_next = is_punct(v.get(i + 1), ':') && is_punct(v.get(i + 2), ':');
+                let after_path =
+                    i >= 2 && is_punct(v.get(i - 1), ':') && is_punct(v.get(i - 2), ':');
+                if (s == "self" || s == "super") && path_next && !after_path {
+                    let mut m = split(self.module);
+                    let mut j = i;
+                    while matches!(v.get(j), Some(TokenTree::Ident(x)) if x == "super") {
+                        m.pop();
+                        j += 3;
+                    }
+                    self.rel.push(m.join("::"));
                 }
-                continue;
-            };
-            let s = id.to_string();
-            let path_next = is_punct(v.get(i + 1), ':') && is_punct(v.get(i + 2), ':');
-            if (s == "self" || s == "super") && path_next {
-                let first = i < 2 || !(is_punct(v.get(i - 1), ':') && is_punct(v.get(i - 2), ':'));
-                *rel |= first;
+                let prev = i.checked_sub(1).and_then(|j| v.get(j));
+                let after_kw = matches!(prev, Some(TokenTree::Ident(p))
+                    if SKIP_AFTER.contains(&p.to_string().as_str()) || (in_use && p == "as"));
+                if is_keyword(&s)
+                    || after_kw
+                    || is_punct(prev, '.')
+                    || is_punct(prev, '\'')
+                    || is_punct(prev, '$')
+                    || after_path
+                    || is_punct(v.get(i + 1), '!')
+                    || (is_punct(v.get(i + 1), ':') && !path_next)
+                {
+                    continue;
+                }
+                let ns = if path_next {
+                    TYPE
+                } else if s.starts_with(char::is_uppercase) {
+                    TYPE | VALUE
+                } else {
+                    VALUE
+                };
+                self.out.insert((s, ns));
             }
-            let prev = i.checked_sub(1).and_then(|j| v.get(j));
-            let after_kw = matches!(prev, Some(TokenTree::Ident(p)) if SKIP_AFTER.contains(&p.to_string().as_str()));
-            if is_keyword(&s)
-                || after_kw
-                || is_punct(prev, '.')
-                || is_punct(prev, '\'')
-                || (is_punct(prev, ':') && i >= 2 && is_punct(v.get(i - 2), ':'))
-                || is_punct(v.get(i + 1), '!')
-                || (is_punct(v.get(i + 1), ':') && !path_next)
-            {
-                continue;
-            }
-            let ns = if path_next {
-                TYPE
-            } else if s.starts_with(char::is_uppercase) {
-                TYPE | VALUE
-            } else {
-                VALUE
-            };
-            out.insert((s, ns));
         }
     }
-    let (mut out, mut rel) = (BTreeSet::new(), false);
-    walk(&tts(tokens), &mut out, &mut rel);
-    (out, rel)
+    let mut w = W {
+        module,
+        out: BTreeSet::new(),
+        rel: Vec::new(),
+    };
+    w.walk(&tts(tokens), false);
+    (w.out, w.rel)
 }
 
 fn is_keyword(s: &str) -> bool {
@@ -268,6 +402,9 @@ struct Binding {
     ns: u8,
     id: String,
     scope: String,
+    /// May name a trait: in-tree traits and imports not known to be anything
+    /// else.
+    tr: bool,
 }
 
 enum Target {
@@ -279,13 +416,18 @@ enum Target {
 pub struct Names {
     locals: BTreeMap<String, BTreeMap<String, Vec<Binding>>>,
     globs: BTreeMap<String, Vec<(Target, String)>>,
+    /// `use path as _`, per module: id and scope.
+    anon: BTreeMap<String, Vec<(String, String)>>,
 }
+
+type TraitScope = (BTreeMap<String, BTreeSet<String>>, BTreeSet<String>);
 
 impl Names {
     pub fn new(t: &Tree, id: &dyn Fn(&Leaf) -> String) -> Self {
         let mut n = Names {
             locals: BTreeMap::new(),
             globs: BTreeMap::new(),
+            anon: BTreeMap::new(),
         };
         let mut bind = |m: &str, name: &str, b: Binding| {
             n.locals
@@ -302,28 +444,28 @@ impl Names {
                 "enum" | "union" | "trait" | "type" | "extern_crate" => TYPE,
                 _ => continue,
             };
-            let scope = scope(&l.vis, &l.module);
             bind(
                 &l.module,
                 &l.name,
                 Binding {
                     ns,
                     id: id(l),
-                    scope,
+                    scope: scope(&l.vis, &l.module),
+                    tr: l.kind == "trait",
                 },
             );
         }
         for (path, info) in &t.mods {
             if info.vis != "?" {
                 let (p, name) = path.rsplit_once("::").unwrap_or(("", path));
-                let id = format!("mod {path}");
                 bind(
                     p,
                     name,
                     Binding {
                         ns: TYPE,
-                        id,
+                        id: format!("mod {path}"),
                         scope: scope(&info.vis, p),
+                        tr: false,
                     },
                 );
             }
@@ -332,14 +474,15 @@ impl Names {
             let scope = scope(&u.vis, &u.module);
             match &u.name {
                 Some(name) => {
-                    let id = format!("use {} in {}", u.path, u.module);
+                    let (id, tr) = use_target(t, &u.module, &u.path);
                     bind(
                         &u.module,
                         name,
                         Binding {
-                            ns: TYPE | VALUE,
+                            ns: TYPE | VALUE | MACRO,
                             id,
                             scope,
+                            tr,
                         },
                     );
                 }
@@ -350,12 +493,19 @@ impl Names {
                         .or_default()
                         .push((target, scope));
                 }
-                None => {}
+                None => {
+                    let (id, tr) = use_target(t, &u.module, &u.path);
+                    if tr {
+                        n.anon
+                            .entry(u.module.clone())
+                            .or_default()
+                            .push((id, scope));
+                    }
+                }
             }
         }
         n
     }
-
     /// What `name` (namespaces `ns`) means to code in `module`.
     pub fn resolve(&self, module: &str, name: &str, ns: u8) -> BTreeSet<String> {
         let (found, opaque) = self.exported(module, name, ns, module, &mut Vec::new());
@@ -408,6 +558,116 @@ impl Names {
         path.pop();
         (found, opaque)
     }
+
+    /// Traits whose methods code in `module` can call: named and `_`
+    /// imports and local traits, through in-tree globs, locals shadowing
+    /// glob names; opaque globs and imports of unknown kind count as tokens.
+    pub fn traits(&self, module: &str) -> BTreeSet<String> {
+        let (named, anon) = self.trait_scope(module, module, &mut Vec::new());
+        named.into_values().flatten().chain(anon).collect()
+    }
+
+    fn trait_scope(&self, m: &str, viewer: &str, path: &mut Vec<String>) -> TraitScope {
+        let (mut named, mut anon): TraitScope = Default::default();
+        if path.iter().any(|p| p == m) {
+            return (named, anon);
+        }
+        for (name, bs) in self.locals.get(m).into_iter().flatten() {
+            let bs: Vec<&Binding> = bs
+                .iter()
+                .filter(|b| b.ns & TYPE != 0 && admits(&b.scope, viewer))
+                .collect();
+            if !bs.is_empty() {
+                named.insert(
+                    name.clone(),
+                    bs.iter().filter(|b| b.tr).map(|b| b.id.clone()).collect(),
+                );
+            }
+        }
+        anon.extend(
+            self.anon
+                .get(m)
+                .into_iter()
+                .flatten()
+                .filter(|(_, s)| admits(s, viewer))
+                .map(|(id, _)| id.clone()),
+        );
+        path.push(m.to_string());
+        let mut globbed: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (target, s) in self.globs.get(m).into_iter().flatten() {
+            if !admits(s, viewer) {
+                continue;
+            }
+            match target {
+                Target::Module(t) => {
+                    let (gn, ga) = self.trait_scope(t, viewer, path);
+                    for (name, ids) in gn {
+                        globbed.entry(name).or_default().extend(ids);
+                    }
+                    anon.extend(ga);
+                }
+                Target::Opaque(p) => {
+                    anon.insert(p.clone());
+                }
+            }
+        }
+        path.pop();
+        for (name, ids) in globbed {
+            named.entry(name).or_insert(ids);
+        }
+        (named, anon)
+    }
+}
+
+/// A `use` path made absolute (`crate::…` for in-tree modules, the path
+/// itself for extern crates, the path and module when it starts from another
+/// import), and whether it may name a trait.
+fn use_target(t: &Tree, module: &str, path: &str) -> (String, bool) {
+    let (p, alias) = path
+        .split_once(" as ")
+        .map_or((path, String::new()), |(p, a)| (p, format!(" as {a}")));
+    let segs: Vec<&str> = p.trim_start_matches(":: ").split(" :: ").collect();
+    let mut cur = match segs[0] {
+        _ if p.starts_with(":: ") => return (format!("use {path}"), true),
+        "crate" => Vec::new(),
+        "self" | "super" => split(module),
+        s if t.mods.contains_key(&crate::tree::child(module, s)) => split(module),
+        s if t
+            .uses
+            .iter()
+            .any(|u| u.module == module && u.name.as_deref() == Some(s))
+            || t.leaves
+                .iter()
+                .any(|l| l.owner.is_none() && l.module == module && l.name == s) =>
+        {
+            return (format!("use {path} in {module}"), true);
+        }
+        _ => return (format!("use {path}"), true),
+    };
+    for (i, s) in segs.iter().enumerate() {
+        match *s {
+            "crate" | "self" if i == 0 => {}
+            "super" => {
+                cur.pop();
+            }
+            s => cur.push(s.to_string()),
+        }
+    }
+    let name = cur.pop().unwrap_or_default();
+    let parent = cur.join("::");
+    let item = crate::tree::child(&parent, &name);
+    let kinds: Vec<&str> = t
+        .leaves
+        .iter()
+        .filter(|l| l.owner.is_none() && l.module == parent && l.name == name)
+        .map(|l| l.kind)
+        .collect();
+    let tr = if kinds.is_empty() {
+        !t.mods.contains_key(&item)
+    } else {
+        kinds.contains(&"trait")
+    };
+    (format!("use crate::{item}{alias}"), tr)
 }
 
 fn glob_target(t: &Tree, module: &str, path: &str) -> Target {

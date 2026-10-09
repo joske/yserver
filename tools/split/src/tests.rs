@@ -49,6 +49,7 @@ fn manifest(dir: &str, edits: Vec<PathEdit>) -> Manifest {
         target: None,
         visibility: [("fn data".to_string(), "pub(super)".to_string())].into(),
         path_edits: edits,
+        exceptions: BTreeMap::new(),
         modules: vec![
             crate::apply::ModSpec {
                 name: String::new(),
@@ -150,8 +151,7 @@ fn unlisted_reexport_fails() {
     assert!(errs.iter().any(|e| e.contains("re-export")), "{errs:?}");
 }
 
-const TRAIT_BEFORE: &str =
-    "impl Backend for K {\n    fn f(&mut self, a: u32, b: u32) -> u32 {\n        a + b\n    }\n}\n";
+const TRAIT_BEFORE: &str = "pub struct K;\n\nimpl Backend for K {\n    fn f(&mut self, a: u32, b: u32) -> u32 {\n        a + b\n    }\n}\n";
 
 fn same_file(before: &str, after: &str, delegate: bool) -> Vec<String> {
     let spec = Spec {
@@ -170,7 +170,7 @@ fn delegate(after: &str) -> Vec<String> {
     same_file(TRAIT_BEFORE, after, true)
 }
 
-const DELEGATED: &str = "impl Backend for K {\n    fn f(&mut self, a: u32, b: u32) -> u32 {\n        Self::draw_f(self, a, b)\n    }\n}\n\nimpl K {\n    pub(super) fn draw_f(&mut self, a: u32, b: u32) -> u32 {\n        a + b\n    }\n}\n";
+const DELEGATED: &str = "pub struct K;\n\nimpl Backend for K {\n    fn f(&mut self, a: u32, b: u32) -> u32 {\n        Self::draw_f(self, a, b)\n    }\n}\n\nimpl K {\n    pub(super) fn draw_f(&mut self, a: u32, b: u32) -> u32 {\n        a + b\n    }\n}\n";
 
 #[test]
 fn delegate_forwarding_passes() {
@@ -249,6 +249,17 @@ fn split(
     table: &str,
     lines: [&[&str]; 2],
 ) -> Vec<String> {
+    split_with(tag, before, files, table, lines, false)
+}
+
+fn split_with(
+    tag: &str,
+    before: &str,
+    files: &[(&str, &str)],
+    table: &str,
+    lines: [&[&str]; 2],
+    delegate: bool,
+) -> Vec<String> {
     let tmp = std::env::temp_dir().join(format!("split-test-{}-{tag}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
     std::fs::write(tmp.join("a.paths"), table).unwrap();
@@ -265,15 +276,13 @@ fn split(
         target: None,
         visibility: [("fn f".to_string(), "pub(super)".to_string())].into(),
         path_edits: vec![],
+        exceptions: BTreeMap::new(),
         modules: vec![spec_of("", lines[0]), spec_of("inner", lines[1])],
         path: tmp.join("a.toml"),
     };
     let spec = Spec {
-        manifest: Some(&m),
-        old_root: m.source.clone(),
-        new_root: m.new_root(),
-        module: m.module.clone(),
-        delegate: false,
+        delegate,
+        ..self::spec_of(&m)
     };
     let base = mem(&[("src/a.rs", before)]);
     let head = mem(files);
@@ -694,6 +703,7 @@ fn apply_and_verify(
         target: None,
         visibility: [("fn f".to_string(), "pub(super)".to_string())].into(),
         path_edits: edits,
+        exceptions: BTreeMap::new(),
         modules: vec![
             spec_of_mod("", modules[0]),
             spec_of_mod("inner", modules[1]),
@@ -780,4 +790,253 @@ fn apply_performs_path_edits() {
     );
     let root = std::fs::read_to_string(repo.join("src/a/mod.rs")).unwrap();
     assert!(root.contains("#[path = \"../other_tests.rs\"]"), "{root}");
+}
+
+const EXPAND_BEFORE: &str = "mod other {\n    pub fn helper() -> u32 {\n        2\n    }\n}\n\nfn helper() -> u32 {\n    1\n}\n\nmacro_rules! m {\n    () => {\n        helper()\n    };\n}\n\nfn f() -> u32 {\n    m!()\n}\n";
+const EXPAND_MOD: &str = "mod other {\n    pub fn helper() -> u32 {\n        2\n    }\n}\n\nfn helper() -> u32 {\n    1\n}\n\nmacro_rules! m {\n    () => {\n        helper()\n    };\n}\n\nmod inner;\npub use inner::*;\n";
+const EXPAND_TABLE: &str = "a::other::fn helper => a::other::fn helper\na::fn helper => a::fn helper\na::macro m => a::macro m\na::fn f => a::inner::fn f\n";
+
+#[test]
+fn macro_expanding_in_a_new_module_is_refused() {
+    let inner =
+        "use super::*;\nuse super::other::helper;\n\npub(super) fn f() -> u32 {\n    m!()\n}\n";
+    let errs = split(
+        "expand",
+        EXPAND_BEFORE,
+        &[("src/a/mod.rs", EXPAND_MOD), ("src/a/inner.rs", inner)],
+        EXPAND_TABLE,
+        [
+            &["pub use inner::*;"],
+            &["use super::*;", "use super::other::helper;"],
+        ],
+    );
+    has(&errs, "invokes macro_rules!");
+}
+
+#[test]
+fn cfg_disabled_macro_masking_a_reorder_fails() {
+    let before = "#[macro_use]\nmod p {\n    macro_rules! m {\n        () => { 1 };\n    }\n}\n\n#[macro_use]\nmod q {\n    macro_rules! m {\n        () => { 2 };\n    }\n}\n\n#[cfg(any())]\nmacro_rules! m {\n    () => { 3 };\n}\n\nfn f() -> u32 {\n    m!()\n}\n";
+    let after = "#[macro_use]\nmod q {\n    macro_rules! m {\n        () => { 2 };\n    }\n}\n\n#[macro_use]\nmod p {\n    macro_rules! m {\n        () => { 1 };\n    }\n}\n\n#[cfg(any())]\nmacro_rules! m {\n    () => { 3 };\n}\n\nfn f() -> u32 {\n    m!()\n}\n";
+    has(&same_file(before, after, false), "macro resolution changed");
+}
+
+#[test]
+fn path_imported_macro_switched_by_an_import_fails() {
+    let defs = "mod x {\n    macro_rules! pick {\n        () => { 1 };\n    }\n    pub(crate) use pick;\n}\n\nmod y {\n    macro_rules! pick {\n        () => { 2 };\n    }\n    pub(crate) use pick;\n}\n\nuse x::pick;\n";
+    let before = format!("{defs}\nfn f() -> u32 {{\n    pick!()\n}}\n");
+    let mod_rs = format!("mod inner;\npub use inner::*;\n\n{defs}");
+    let inner =
+        "use super::*;\nuse super::y::pick;\n\npub(super) fn f() -> u32 {\n    pick!()\n}\n";
+    let errs = split(
+        "macro-path",
+        &before,
+        &[("src/a/mod.rs", &mod_rs), ("src/a/inner.rs", inner)],
+        "a::x::macro pick => a::x::macro pick\na::y::macro pick => a::y::macro pick\na::fn f => a::inner::fn f\n",
+        [
+            &["pub use inner::*;"],
+            &["use super::*;", "use super::y::pick;"],
+        ],
+    );
+    has(&errs, "macro resolution changed");
+}
+
+const TRAITS: &str = "mod ta {\n    pub trait A {\n        fn pick(&self) -> u32 {\n            1\n        }\n    }\n    impl A for u32 {}\n}\n\nmod tb {\n    pub trait B {\n        fn pick(&self) -> u32 {\n            2\n        }\n    }\n    impl B for u32 {}\n}\n\nuse ta::A as T;\n";
+const TRAITS_TABLE: &str = "a::ta::trait A => a::ta::trait A\na::tb::trait B => a::tb::trait B\na::fn f => a::inner::fn f\n";
+
+#[test]
+fn trait_import_shadowed_in_destination_fails() {
+    let before = format!("{TRAITS}\nfn f() -> u32 {{\n    0u32.pick()\n}}\n");
+    let mod_rs = format!("mod inner;\npub use inner::*;\n\n{TRAITS}");
+    let inner =
+        "use super::*;\nuse super::tb::B as T;\n\npub(super) fn f() -> u32 {\n    0u32.pick()\n}\n";
+    let errs = split(
+        "trait-env",
+        &before,
+        &[("src/a/mod.rs", &mod_rs), ("src/a/inner.rs", inner)],
+        TRAITS_TABLE,
+        [
+            &["pub use inner::*;"],
+            &["use super::*;", "use super::tb::B as T;"],
+        ],
+    );
+    has(&errs, "traits in scope changed");
+}
+
+const DELEGATE_SPLIT: &str = "use std::cmp::min as pick;\n\npub struct K;\n\nimpl Backend for K {\n    fn f(&mut self, a: u32, b: u32) -> u32 {\n        pick(a, b)\n    }\n}\n";
+const FORWARDER: &str = "impl Backend for K {\n    fn f(&mut self, a: u32, b: u32) -> u32 {\n        Self::draw_f(self, a, b)\n    }\n}\n";
+const FWD_TABLE: &str =
+    "a::struct K => a::struct K\na::impl Backend for K::fn f => a::impl Backend for K::fn f\n";
+
+#[test]
+fn delegated_helper_under_another_import_fails() {
+    let mod_rs = format!(
+        "mod inner;\npub use inner::*;\n\nuse std::cmp::min as pick;\n\npub struct K;\n\n{FORWARDER}"
+    );
+    let inner = "use super::*;\nuse std::cmp::max as pick;\n\nimpl K {\n    pub(super) fn draw_f(&mut self, a: u32, b: u32) -> u32 {\n        pick(a, b)\n    }\n}\n";
+    let errs = split_with(
+        "delegate-names",
+        DELEGATE_SPLIT,
+        &[("src/a/mod.rs", &mod_rs), ("src/a/inner.rs", inner)],
+        FWD_TABLE,
+        [
+            &["pub use inner::*;"],
+            &["use super::*;", "use std::cmp::max as pick;"],
+        ],
+        true,
+    );
+    has(&errs, "name `pick` resolves differently");
+}
+
+#[test]
+fn delegated_helper_on_another_modules_type_fails() {
+    let other = "mod other {\n    pub struct K;\n}\n";
+    let before = format!("{other}\n{DELEGATE_SPLIT}");
+    let mod_rs = format!(
+        "mod inner;\npub use inner::*;\n\n{other}\nuse std::cmp::min as pick;\n\npub struct K;\n\n{FORWARDER}"
+    );
+    let inner = "use super::*;\nuse super::other::K;\n\nimpl K {\n    pub(super) fn draw_f(&mut self, a: u32, b: u32) -> u32 {\n        pick(a, b)\n    }\n}\n";
+    let errs = split_with(
+        "delegate-type",
+        &before,
+        &[("src/a/mod.rs", &mod_rs), ("src/a/inner.rs", inner)],
+        &format!("a::other::struct K => a::other::struct K\n{FWD_TABLE}"),
+        [
+            &["pub use inner::*;"],
+            &["use super::*;", "use super::other::K;"],
+        ],
+        true,
+    );
+    has(&errs, "name `K` resolves differently");
+}
+
+#[test]
+fn local_macro_moved_to_a_new_module_is_refused() {
+    let before = format!(
+        "macro_rules! m {{\n    () => {{ 0 }};\n}}\n\n{TRAITS}\nfn f() -> u32 {{\n    macro_rules! m {{\n        () => {{ 0u32.pick() }};\n    }}\n    m!()\n}}\n"
+    );
+    let mod_rs = format!(
+        "macro_rules! m {{\n    () => {{ 0 }};\n}}\n\nmod inner;\npub use inner::*;\n\n{TRAITS}"
+    );
+    let inner = "use super::*;\n\npub(super) fn f() -> u32 {\n    macro_rules! m {\n        () => { 0u32.pick() };\n    }\n    m!()\n}\n";
+    let errs = split(
+        "local-macro",
+        &before,
+        &[("src/a/mod.rs", &mod_rs), ("src/a/inner.rs", inner)],
+        &format!("a::macro m => a::macro m\n{TRAITS_TABLE}"),
+        [&["pub use inner::*;"], &["use super::*;"]],
+    );
+    has(&errs, "local macro_rules!");
+}
+
+fn expand(tag: &str, inner_uses: &[&str], exceptions: &[(&str, &str)]) -> Vec<String> {
+    let inner = format!(
+        "{}\n\npub(super) fn f() -> u32 {{\n    m!()\n}}\n",
+        inner_uses.join("\n")
+    );
+    let mut m = manifest(tag, vec![]);
+    std::fs::write(m.table_path(), EXPAND_TABLE).unwrap();
+    m.visibility = [("fn f".to_string(), "pub(super)".to_string())].into();
+    m.modules[1].lines = inner_uses.iter().map(|s| s.to_string()).collect();
+    m.exceptions = exceptions
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let base = mem(&[("src/a.rs", EXPAND_BEFORE)]);
+    let head = mem(&[("src/a/mod.rs", EXPAND_MOD), ("src/a/inner.rs", &inner)]);
+    check(&spec_of(&m), &base, &head, &[]).unwrap().1
+}
+
+#[test]
+fn audited_macro_exception_passes() {
+    let errs = expand(
+        "exc-ok",
+        &["use super::*;"],
+        &[("fn f", "m! only calls helper")],
+    );
+    assert_eq!(errs, Vec::<String>::new());
+}
+
+#[test]
+fn audited_macro_exception_still_checks_expansion_names() {
+    let errs = expand(
+        "exc-names",
+        &["use super::*;", "use super::other::helper;"],
+        &[("fn f", "m! only calls helper")],
+    );
+    has(
+        &errs,
+        "name `helper` in a macro expansion resolves differently",
+    );
+}
+
+#[test]
+fn unneeded_or_unexplained_exception_fails() {
+    let a = &[("fn f", "audited")][..];
+    let errs = expand(
+        "exc-unused",
+        &["use super::*;"],
+        &[a[0], ("fn helper", "x")],
+    );
+    has(&errs, "exception not needed");
+    let r = std::panic::catch_unwind(|| expand("exc-empty", &["use super::*;"], &[("fn f", " ")]));
+    assert!(r.is_err());
+}
+
+#[test]
+fn relative_path_refusal_names_the_remedy() {
+    let before = "mod tests {\n    fn t() {\n        super::super::run();\n    }\n}\n";
+    let mod_rs = "mod tests;\n";
+    let inner = "use super::*;\n\nfn t() {\n    super::super::run();\n}\n";
+    let errs = split(
+        "relpath-tests",
+        before,
+        &[
+            ("src/a/mod.rs", mod_rs),
+            ("src/a/tests/mod.rs", "mod inner;\n"),
+            ("src/a/tests/inner.rs", inner),
+        ],
+        "a::tests::fn t => a::tests::inner::fn t\n",
+        [&[], &["use super::*;"]],
+    );
+    has(&errs, "keep the module depth, or qualify the path");
+}
+
+#[test]
+fn relative_path_to_the_same_module_passes() {
+    let before = "mod x {\n    pub fn g() {}\n}\n\nmod y {\n    fn f() {\n        super::x::g();\n    }\n}\n";
+    let after = "mod x {\n    pub fn g() {}\n}\n\nmod z {\n    fn f() {\n        super::x::g();\n    }\n}\n";
+    let spec = Spec {
+        manifest: None,
+        old_root: "src/k.rs".into(),
+        new_root: "src/k.rs".into(),
+        module: "k".into(),
+        delegate: false,
+    };
+    let errs = check(
+        &spec,
+        &mem(&[("src/k.rs", before)]),
+        &mem(&[("src/k.rs", after)]),
+        &[],
+    )
+    .unwrap()
+    .1;
+    assert!(
+        errs.iter().all(|e| !e.contains("`super::` path")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn cast_target_is_a_free_name() {
+    let before = "type Pick = u8;\n\nfn f() -> u32 {\n    300 as Pick as u32\n}\n";
+    let mod_rs = "mod inner;\npub use inner::*;\n\ntype Pick = u8;\n";
+    let inner = "use super::*;\ntype Pick = u16;\n\npub(super) fn f() -> u32 {\n    300 as Pick as u32\n}\n";
+    let errs = split(
+        "cast",
+        before,
+        &[("src/a/mod.rs", mod_rs), ("src/a/inner.rs", inner)],
+        "a::type Pick => a::type Pick\na::fn f => a::inner::fn f\n",
+        [&["pub use inner::*;"], &["use super::*;"]],
+    );
+    has(&errs, "name `Pick` resolves differently");
 }

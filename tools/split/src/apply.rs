@@ -31,6 +31,10 @@ pub struct Manifest {
     pub visibility: BTreeMap<String, String>,
     #[serde(default)]
     pub path_edits: Vec<PathEdit>,
+    /// Old item key → audited reason it may move macro invocations to
+    /// another module (name and trait checks still apply).
+    #[serde(default)]
+    pub exceptions: BTreeMap<String, String>,
     pub modules: Vec<ModSpec>,
     #[serde(skip)]
     pub path: PathBuf,
