@@ -1,0 +1,108 @@
+# Phase 1a for backend.rs: its inline #[cfg(test)] module(s) go out
+# of line at the same logical paths; production items stay in place.
+source = "crates/yserver/src/kms/render/backend.rs"
+module = "kms::render::backend"
+dir = "crates/yserver/src/kms/render/backend"
+root_form = "file"
+table = "backend.paths"
+
+[[path_edits]]
+item = "tests::fn change_keyboard_mapping_errors_as_xorg"
+from = "../testdata/xorg-change-keyboard-mapping.txt"
+to = "../../testdata/xorg-change-keyboard-mapping.txt"
+
+[[path_edits]]
+item = "tests::fn change_keyboard_mapping_round_trips_as_xorg"
+from = "../testdata/xorg-change-keyboard-mapping.txt"
+to = "../../testdata/xorg-change-keyboard-mapping.txt"
+
+[[path_edits]]
+item = "tests::fn set_compat_and_indicator_maps_match_xorg"
+from = "../testdata/xorg-xkb-setcompat.txt"
+to = "../../testdata/xorg-xkb-setcompat.txt"
+
+[[path_edits]]
+item = "tests::fn set_map_key_width_resizing_matches_xorg"
+from = "../testdata/xorg-xkb-setmap-resize.txt"
+to = "../../testdata/xorg-xkb-setmap-resize.txt"
+
+[[path_edits]]
+item = "tests::fn set_names_and_geometry_match_xorg"
+from = "../testdata/xorg-xkb-setnames.txt"
+to = "../../testdata/xorg-xkb-setnames.txt"
+
+[[path_edits]]
+item = "tests::fn xdotool_names_resolve_after_xmodmap"
+from = "../testdata/xorg-xkb-set-modifier-mapping.txt"
+to = "../../testdata/xorg-xkb-set-modifier-mapping.txt"
+
+[[path_edits]]
+item = "tests::fn xi_change_device_key_mapping_converts_as_core"
+from = "../testdata/xorg-change-keyboard-mapping.txt"
+to = "../../testdata/xorg-change-keyboard-mapping.txt"
+
+[[path_edits]]
+item = "tests::fn xkbcomp_compat_upload_reaches_leds_and_cooking"
+from = "../testdata/xorg-xkbcomp-steps.txt"
+to = "../../testdata/xorg-xkbcomp-steps.txt"
+
+[[path_edits]]
+item = "tests::fn xkbcomp_uploads_match_xorg_request_by_request"
+from = "../testdata/xorg-xkbcomp-steps.txt"
+to = "../../testdata/xorg-xkbcomp-steps.txt"
+
+[[path_edits]]
+item = "tests::fn xkb_set_request_errors_match_xorg"
+from = "../testdata/xorg-xkb-setmap-errors.txt"
+to = "../../testdata/xorg-xkb-setmap-errors.txt"
+
+[[path_edits]]
+item = "tests::fn xkb_view_of_change_keyboard_mapping_matches_xorg"
+from = "../testdata/xorg-xkb-change-keyboard-mapping.txt"
+to = "../../testdata/xorg-xkb-change-keyboard-mapping.txt"
+
+[[path_edits]]
+item = "tests::fn xkb_view_of_set_modifier_mapping_matches_xorg"
+from = "../testdata/xorg-xkb-set-modifier-mapping.txt"
+to = "../../testdata/xorg-xkb-set-modifier-mapping.txt"
+
+[[path_edits]]
+item = "tests::fn xmodmap_caps_as_control_reaches_key_cooking"
+from = "../testdata/xorg-xkb-set-modifier-mapping.txt"
+to = "../../testdata/xorg-xkb-set-modifier-mapping.txt"
+
+[[modules]]
+name = ""
+items = [
+  "const *",
+  "enum *",
+  "fn *",
+  "impl < 'a > IntoIterator for & 'a TrackedWindows",
+  "impl Backend for KmsBackend",
+  "impl ConnectorConfig",
+  "impl ConnectorRegistryDelta",
+  "impl Default for ScanoutM0Telemetry",
+  "impl GammaLut",
+  "impl KmsBackend#1",
+  "impl KmsBackend#2",
+  "impl KmsBackend#3",
+  "impl RandrIdAllocator",
+  "impl ScanoutM1ProbeCache",
+  "impl ScanoutM1ProbeEntry",
+  "impl ScanoutM2State",
+  "impl ScanoutReadOrigin",
+  "impl std :: ops :: Deref for TrackedWindows",
+  "impl std :: ops :: DerefMut for TrackedWindows",
+  "impl TrackedWindows",
+  "impl WarnThrottle",
+  "mod crtc_transform_tests",
+  "static *",
+  "struct *",
+  "trait *",
+  "type *",
+  "use *",
+]
+
+[[modules]]
+name = "tests"
+items = ["tests::*"]
