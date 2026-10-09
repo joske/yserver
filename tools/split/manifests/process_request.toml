@@ -1,0 +1,29 @@
+# Phase 1a for process_request.rs: its three inline #[cfg(test)] modules go out
+# of line at the same logical paths; production items stay in place.
+source = "crates/yserver-core/src/core_loop/process_request.rs"
+module = "core_loop::process_request"
+dir = "crates/yserver-core/src/core_loop/process_request"
+root_form = "file"
+table = "process_request.paths"
+
+[[modules]]
+name = ""
+items = [
+  "use *",
+  "const *",
+  "enum *",
+  "fn *",
+  "struct *",
+]
+
+[[modules]]
+name = "get_image_reply_tests"
+items = ["get_image_reply_tests::*"]
+
+[[modules]]
+name = "largest_free_xid_gap_tests"
+items = ["largest_free_xid_gap_tests::*"]
+
+[[modules]]
+name = "tests"
+items = ["tests::*"]
