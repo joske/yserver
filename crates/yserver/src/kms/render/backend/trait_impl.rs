@@ -3513,54 +3513,16 @@ impl Backend for KmsBackend {
         hot_x: u16,
         hot_y: u16,
     ) -> io::Result<CursorHandle> {
-        // Stage 5 Phase A: real rasterisation. Read source + mask
-        // (both depth-1 R8) via `engine.get_image`, lower to BGRA per
-        // X11's mask/fore/back rule, allocate a CursorRecord + sprite
-        // Pixmap. The cursor is invisible (size 1×1 transparent) if
-        // the source pixmap can't be read — matches v1's degenerate
-        // shape when the source mirror is missing.
-        let xid = self.core.next_host_xid();
-        let handle = CursorHandle::from_raw(xid)
-            .ok_or_else(|| io::Error::other("create_cursor: xid was 0"))?;
-        let (bgra_bytes, color_roles, w, h) = if let Some((src_bytes, w, h)) =
-            self.read_cursor_depth1_pixmap(source_pixmap.as_raw())
-        {
-            let mask_bytes = mask_pixmap.and_then(|mp| {
-                let (mb, mw, mh) = self.read_cursor_depth1_pixmap(mp.as_raw())?;
-                if mw == w && mh == h {
-                    Some(mb)
-                } else {
-                    log::warn!(
-                        "render create_cursor: mask 0x{:x} dims {mw}x{mh} \
-                             differ from src dims {w}x{h}; ignoring mask",
-                        mp.as_raw(),
-                    );
-                    None
-                }
-            });
-            let image = crate::kms::render::cursor::rasterise_create_cursor_with_roles(
-                &src_bytes,
-                w,
-                h,
-                mask_bytes.as_deref(),
-                fore,
-                back,
-            );
-            (image.bgra_bytes, image.color_roles, w, h)
-        } else {
-            log::warn!(
-                "render create_cursor: source pixmap 0x{:x} unreadable; cursor invisible",
-                source_pixmap.as_raw(),
-            );
-            (
-                vec![0u8; 4],
-                vec![crate::kms::render::cursor::CursorColorRole::Transparent],
-                1u16,
-                1u16,
-            )
-        };
-        self.insert_monochrome_cursor_record(xid, w, h, hot_x, hot_y, bgra_bytes, color_roles);
-        Ok(handle)
+        Self::backend_cursor_create_cursor(
+            self,
+            _origin,
+            source_pixmap,
+            mask_pixmap,
+            fore,
+            back,
+            hot_x,
+            hot_y,
+        )
     }
 
     fn create_glyph_cursor(
@@ -3573,70 +3535,16 @@ impl Backend for KmsBackend {
         fore: (u16, u16, u16),
         back: (u16, u16, u16),
     ) -> io::Result<CursorHandle> {
-        // Stage 5 Phase A: real glyph-cursor rasterisation. Render
-        // source + (optional) mask glyph via FreeType, build the
-        // union bbox + derive the hotspot, then lower to BGRA via
-        // the cursor module's shared rasteriser. Same code shape as
-        // v1's `create_glyph_cursor` (`kms/backend.rs:9937-10108`).
-        let xid = self.core.next_host_xid();
-        let handle = CursorHandle::from_raw(xid)
-            .ok_or_else(|| io::Error::other("create_glyph_cursor: xid was 0"))?;
-        // Render both glyphs into owned Vec<u8>s up front so the
-        // FreeType `bitmap()` borrow doesn't span the second
-        // load_char call (FreeType invalidates the previous glyph's
-        // bitmap when a new load_char fires).
-        let src_xid = source_font.as_raw();
-        let Some((src_pix, src_w, src_h, src_lsb, src_top)) =
-            self.render_glyph_for_cursor(src_xid, source_char)
-        else {
-            log::warn!(
-                "render create_glyph_cursor: source font 0x{src_xid:x} unknown; cursor invisible"
-            );
-            self.insert_monochrome_cursor_record(
-                xid,
-                1,
-                1,
-                0,
-                0,
-                vec![0u8; 4],
-                vec![crate::kms::render::cursor::CursorColorRole::Transparent],
-            );
-            return Ok(handle);
-        };
-        let mask_data =
-            mask_font.and_then(|mf| self.render_glyph_for_cursor(mf.as_raw(), mask_char));
-        let src = crate::kms::render::cursor::GlyphBitmap {
-            pixels: &src_pix,
-            width: src_w,
-            height: src_h,
-            lsb: src_lsb,
-            top: src_top,
-        };
-        let mask_bitmap = mask_data.as_ref().map(|(pix, w, h, lsb, top)| {
-            crate::kms::render::cursor::GlyphBitmap {
-                pixels: pix.as_slice(),
-                width: *w,
-                height: *h,
-                lsb: *lsb,
-                top: *top,
-            }
-        });
-        let img = crate::kms::render::cursor::rasterise_glyph_cursor(
-            &src,
-            mask_bitmap.as_ref(),
+        Self::backend_cursor_create_glyph_cursor(
+            self,
+            _origin,
+            source_font,
+            mask_font,
+            source_char,
+            mask_char,
             fore,
             back,
-        );
-        self.insert_monochrome_cursor_record(
-            xid,
-            img.width,
-            img.height,
-            img.hot_x,
-            img.hot_y,
-            img.bgra_bytes,
-            img.color_roles,
-        );
-        Ok(handle)
+        )
     }
 
     fn recolor_cursor(
@@ -3646,53 +3554,7 @@ impl Backend for KmsBackend {
         fore: (u16, u16, u16),
         back: (u16, u16, u16),
     ) -> io::Result<()> {
-        // RENDER animated cursors are wrappers around constituent cursors.
-        // Xorg's AnimCurRecolorCursor forwards each frame with that frame's
-        // own stored colors, so recoloring the wrapper does not replace frame
-        // colors. Preserve that behavior rather than recoloring snapshots.
-        if self.anim_cursor_records.contains_key(&host_xid) {
-            return Ok(());
-        }
-        let Some(old) = self.cursor_records.get(&host_xid).cloned() else {
-            return Ok(());
-        };
-        let Some(color_roles) = old.color_roles.clone() else {
-            // Xorg explicitly ignores RecolorCursor for ARGB cursors.
-            return Ok(());
-        };
-        let version = self.next_cursor_version;
-        self.next_cursor_version = self.next_cursor_version.saturating_add(1);
-        let record = crate::kms::render::cursor::CursorRecord::new_monochrome(
-            old.width,
-            old.height,
-            old.hot_x,
-            old.hot_y,
-            color_roles,
-            fore,
-            back,
-            version,
-        );
-        if let Some(&pixmap_id) = self.cursor_pixmaps.get(&host_xid) {
-            self.engine
-                .put_image(
-                    &mut self.store,
-                    &mut self.platform,
-                    Dst::server_internal(pixmap_id),
-                    ash::vk::Offset2D::default(),
-                    ash::vk::Extent2D {
-                        width: u32::from(record.width),
-                        height: u32::from(record.height),
-                    },
-                    &record.bgra_bytes,
-                    32,
-                )
-                .map_err(|error| io::Error::other(format!("recolor cursor upload: {error:?}")))?;
-        }
-        self.cursor_records.insert(host_xid, record);
-        if self.effective_cursor_xid == Some(host_xid) {
-            self.display_cursor_by_handle(host_xid);
-        }
-        Ok(())
+        Self::backend_cursor_recolor_cursor(self, _origin, host_xid, fore, back)
     }
 
     fn create_anim_cursor(
@@ -3700,54 +3562,11 @@ impl Backend for KmsBackend {
         _origin: Option<OriginContext>,
         frames: &[(CursorHandle, u32)],
     ) -> io::Result<Option<CursorHandle>> {
-        // Spec 2026-06-10-animated-cursors-design.md. Snapshot every
-        // frame up front — no partial map state on failure.
-        if frames.is_empty() {
-            return Ok(None);
-        }
-        let mut snap = Vec::with_capacity(frames.len());
-        for (h, delay_ms) in frames {
-            let raw = h.as_raw();
-            let Some(record) = self.cursor_records.get(&raw) else {
-                return Err(io::Error::other(format!(
-                    "create_anim_cursor: unknown sub-cursor handle 0x{raw:x}"
-                )));
-            };
-            // Delay 0 → 16ms: a 0 deadline would busy-spin the
-            // poll loop (explicit Xorg deviation, see spec).
-            let ms = if *delay_ms == 0 { 16 } else { *delay_ms };
-            snap.push(crate::kms::render::cursor::AnimFrame {
-                source: raw,
-                record: std::sync::Arc::clone(record),
-                pixmap: self.cursor_pixmaps.get(&raw).copied(),
-                delay: std::time::Duration::from_millis(u64::from(ms)),
-            });
-        }
-        let xid = self.core.next_host_xid();
-        let handle = CursorHandle::from_raw(xid)
-            .ok_or_else(|| io::Error::other("create_anim_cursor: xid was 0"))?;
-        // Alias frame 0 in the canonical maps so every static-cursor
-        // code path (effective walk, XFixes, scene) works untouched.
-        self.cursor_records
-            .insert(xid, std::sync::Arc::clone(&snap[0].record));
-        if let Some(p) = snap[0].pixmap {
-            self.cursor_pixmaps.insert(xid, p);
-        }
-        self.anim_cursor_records.insert(
-            xid,
-            crate::kms::render::cursor::AnimCursorRecord { frames: snap },
-        );
-        Ok(Some(handle))
+        Self::backend_cursor_create_anim_cursor(self, _origin, frames)
     }
 
     fn free_cursor(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
-        // The core calls this when the last XID naming the cursor goes;
-        // other references may still hold it (see `cursor_referenced`).
-        if self.cursor_records.contains_key(&host_xid) {
-            self.released_cursors.insert(host_xid);
-            self.collect_released_cursors();
-        }
-        Ok(())
+        Self::backend_cursor_free_cursor(self, _origin, host_xid)
     }
 
     fn define_cursor(
@@ -3756,30 +3575,7 @@ impl Backend for KmsBackend {
         host_window_xid: u32,
         cursor_host_xid: u32,
     ) -> io::Result<()> {
-        // Stage 5 Phase A: store the cursor on the window's
-        // attribute slot. Per X11, the cursor visible on screen is
-        // the one belonging to the deepest window under the pointer
-        // that has a non-None cursor (walking up the parent chain);
-        // `cursor_host_xid == 0` is X11 `None` and means "inherit
-        // from parent".
-        //
-        // The sticky `active_cursor` fallback on `KmsCore` matches
-        // v1: a DefineCursor on the root container becomes the
-        // server-wide default for windows that don't override it.
-        let nested = if cursor_host_xid == 0 {
-            None
-        } else {
-            Some(cursor_host_xid)
-        };
-        if let Some(geom) = self.windows.get_mut(&host_window_xid) {
-            geom.cursor = nested;
-        }
-        if cursor_host_xid != 0 && host_window_xid == self.core.window_id {
-            self.core.active_cursor = Some(cursor_host_xid);
-        }
-        self.refresh_effective_cursor();
-        self.collect_released_cursors();
-        Ok(())
+        Self::backend_cursor_define_cursor(self, _origin, host_window_xid, cursor_host_xid)
     }
 
     fn set_grab_cursor(
@@ -3787,15 +3583,7 @@ impl Backend for KmsBackend {
         _origin: Option<OriginContext>,
         cursor_host_xid: Option<u32>,
     ) -> io::Result<()> {
-        // Xorg `ActivatePointerGrab`/`DeactivatePointerGrab`: install
-        // the grab cursor as the top-priority sprite override, or clear
-        // it when the grab ends. `refresh_effective_cursor` re-evaluates
-        // the chain (now short-circuited by the override) and swaps the
-        // scene `CursorEntry` when the displayed cursor changed.
-        self.grab_cursor_override = cursor_host_xid;
-        self.refresh_effective_cursor();
-        self.collect_released_cursors();
-        Ok(())
+        Self::backend_cursor_set_grab_cursor(self, _origin, cursor_host_xid)
     }
 
     fn set_container_background_pixel(
@@ -4411,36 +4199,7 @@ impl Backend for KmsBackend {
         x: u16,
         y: u16,
     ) -> io::Result<Option<CursorHandle>> {
-        // Stage 5 Phase A: themed/ARGB cursor — Picture wraps a
-        // depth-32 BGRA Pixmap. Read the pixmap bytes via
-        // `engine.get_image`, allocate a CursorRecord + sprite, and
-        // mint a cursor xid. fvwm pattern (CreatePixmap → PutImage
-        // → CreatePicture → FreePixmap → CreateCursor) means the
-        // backing pixmap may already be gone by the time we arrive,
-        // but for Stage 5 we rely on the picture record's
-        // `host_xid` resolving back to a live store entry — alias-
-        // registry-aware rescue is a follow-up.
-        let pic_xid = host_src_pic.as_raw();
-        let src_host_xid = match self.core.pictures.get(&pic_xid) {
-            Some(crate::kms::core::PictureRecord::Drawable { host_xid, .. }) => *host_xid,
-            other => {
-                log::debug!(
-                    "render render_create_cursor: pic 0x{pic_xid:x} not Drawable (got {:?})",
-                    other.map(|_| "non-Drawable"),
-                );
-                return Ok(None);
-            }
-        };
-        let Some((bgra, w, h)) = self.read_cursor_bgra_pixmap(src_host_xid) else {
-            log::debug!(
-                "render render_create_cursor: src pixmap 0x{src_host_xid:x} unreadable for pic 0x{pic_xid:x}",
-            );
-            return Ok(None);
-        };
-        let xid = self.core.next_host_xid();
-        let handle = CursorHandle::from_raw(xid);
-        self.insert_cursor_record(xid, w, h, x, y, bgra);
-        Ok(handle)
+        Self::backend_cursor_render_create_cursor(self, _origin, host_src_pic, x, y)
     }
 
     fn render_set_picture_clip_rectangles(
@@ -5519,30 +5278,7 @@ impl Backend for KmsBackend {
     }
 
     fn get_active_cursor_image(&self) -> Option<yserver_core::backend::ActiveCursorImage> {
-        // Stage 5 — unblock protocol-audit #14 (`GetCursorImage`
-        // returns 0×0). Source the bytes from the
-        // currently-effective `Arc<CursorRecord>` and stamp the
-        // current root-space pointer position.
-        let xid = self.effective_cursor_xid?;
-        let record = self.cursor_records.get(&xid)?;
-        #[allow(clippy::cast_possible_truncation)]
-        let x = self.core.cursor_x as i16;
-        #[allow(clippy::cast_possible_truncation)]
-        let y = self.core.cursor_y as i16;
-        Some(yserver_core::backend::ActiveCursorImage {
-            host_xid: xid,
-            width: record.width,
-            height: record.height,
-            hot_x: record.hot_x,
-            hot_y: record.hot_y,
-            x,
-            y,
-            // XFIXES serial is u32; CursorRecord.version is u64
-            // server-wide monotonic. Saturate; in practice we'll
-            // never roll over a u32 of cursor changes in a session.
-            serial: u32::try_from(record.version).unwrap_or(u32::MAX),
-            bgra_bytes: std::sync::Arc::new(record.bgra_bytes.clone()),
-        })
+        Self::backend_cursor_get_active_cursor_image(self)
     }
 
     fn load_keymap_by_components(&mut self, symbols: &str) -> KeymapLoad {
@@ -5598,26 +5334,7 @@ impl Backend for KmsBackend {
         old_host_xid: u32,
         new_host_xid: u32,
     ) -> io::Result<()> {
-        // Xorg `ReplaceCursor`: windows, grabs and the resource database
-        // stop referencing the old cursor. Here that is every window's
-        // cursor slot, the sticky root default and the grab override.
-        if old_host_xid == new_host_xid {
-            return Ok(());
-        }
-        for geom in self.windows.values_mut() {
-            if geom.cursor == Some(old_host_xid) {
-                geom.cursor = Some(new_host_xid);
-            }
-        }
-        if self.core.active_cursor == Some(old_host_xid) {
-            self.core.active_cursor = Some(new_host_xid);
-        }
-        if self.grab_cursor_override == Some(old_host_xid) {
-            self.grab_cursor_override = Some(new_host_xid);
-        }
-        self.refresh_effective_cursor();
-        self.collect_released_cursors();
-        Ok(())
+        Self::backend_cursor_replace_cursor(self, _origin, old_host_xid, new_host_xid)
     }
 
     fn set_cursor_hidden(&mut self, hidden: bool) {
