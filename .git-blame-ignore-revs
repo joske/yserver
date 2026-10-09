@@ -5,3 +5,30 @@
 
 # refactor(core): move process_request.rs tests out of line (move)
 c0bf9a8a8988a75d16707ac875b06282a126cb27
+
+# refactor(kms): move render/backend.rs tests out of line (move)
+1c0c7af185feed7303e0b987bb5c00303f02440b
+
+# refactor(kms): move render/engine.rs tests out of line (move)
+3009e6525145e2cae4b9044784cbf6166d8a6469
+
+# refactor(kms): move render/scene.rs tests out of line (move)
+b1fc252a0b1b26d240ba9d3140e77df967a88396
+
+# refactor(kms): move render/platform.rs tests out of line (move)
+3d2c7807e25f6fc659621ab533bb112c4fbe3ca4
+
+# refactor(kms): move vk/scanout.rs tests out of line (move)
+ca4e05f8f6e65728b9eb920d8a9e622ce17924e6
+
+# refactor(core): move core_loop/pointer_fanout.rs tests out of line (move)
+5f4f3f545d162a6c345db72b0791cde344fb2c46
+
+# refactor(core): move core_loop/run.rs tests out of line (move)
+46864d2e4814d67d7bc1404794b16b611c9ec9ca
+
+# refactor(core): move server.rs tests out of line (move)
+b34bb685edbac5b0fa940985f5309eafdfb9f55a
+
+# refactor(protocol): move x11/mod.rs tests out of line (move)
+dd5ba5da6c7d0e29907d35dad8e95eca8415d60d
