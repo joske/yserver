@@ -1,0 +1,157 @@
+# Phase 1b for kms/render/engine/tests.rs: the flat test module becomes
+# tests/mod.rs (imports, the five existing inline modules, the shared
+# platform/drawable/glyph fixtures) plus one topic module per engine area;
+# each topic starts `use super::*;`. Tests by area (name + file block),
+# helpers with the only topic using them.
+source = "crates/yserver/src/kms/render/engine/tests.rs"
+module = "kms::render::engine::tests"
+dir = "crates/yserver/src/kms/render/engine/tests"
+table = "engine_1b.paths"
+
+[[modules]]
+name = ""
+items = [
+  "use *",
+  "mod clamp_copy",
+  "mod uniform_glyph_source",
+  "mod premul_from_wire",
+  "mod coalescing",
+  "mod session",
+  "fn live_platform",
+  "fn try_for_tests_with_vk",
+  "fn drive_render_composite_same_key_for_tests",
+  "fn alloc_drawable_3a",
+  "fn alloc_drawable_3a_with_kind",
+  "fn build_glyph",
+]
+
+[[modules]]
+name = "core_ops"
+lines = ["use super::*;"]
+items = [
+  "fn depth32_put_image_get_image_round_trip",
+  "fn fill_then_get_image_observes_clear_color",
+  "fn fill_depth8_observes_r8_source_byte",
+  "fn logic_fill_xor_applies_per_pixel",
+  "fn copy_area_disjoint_pixmaps_round_trip",
+  "fn logic_fill_depth32_preserves_wire_alpha_when_not_opaque",
+  "fn logic_fill_r8_not_family_matches_x11_bytes",
+  "fn copy_area_negative_offset_copies_trailing_strip",
+  "fn copy_area_self_overlap_scratch_path",
+  "fn put_image_then_fill_overwrites",
+  "fn depth24_unpack_forces_alpha_ff",
+]
+
+[[modules]]
+name = "glyph_atlas"
+lines = ["use super::*;"]
+items = [
+  "fn image_text_run_records_damage_on_target",
+  "fn atlas_back_to_back_upload_no_corruption",
+  "fn atlas_resets",
+  "fn atlas_has",
+  "fn corner_glyph",
+  "fn atlas_full_resets_behind_the_recorded_draw",
+  "fn glyph_larger_than_atlas_drops_without_reset",
+  "fn forget_glyphs_drops_committed_and_pending_entries",
+  "fn atlas_entry_packed_vs_logical_width_feed_the_right_consumers",
+]
+
+[[modules]]
+name = "glyph_runs"
+lines = ["use super::*;"]
+items = [
+  "fn composite_glyphs_pin_ceiling_reserves_instance_buffer_pin",
+  "fn image_text_pin_ceiling_reserves_instance_buffer_pin",
+  "const RUN_SPLIT_GS",
+  "const RUN_SPLIT_OP",
+  "const RUN_SPLIT_COVERAGE",
+  "const RUN_SPLIT_DST_0",
+  "const RUN_SPLIT_DST_1",
+  "fn run_split_glyph_inputs",
+  "fn run_split_recorded_glyphs",
+  "fn a_glyph_run_upload_shows_in_churn_rates",
+  "fn a_glyph_run_split_into_two_ranges_renders_as_one_range",
+  "fn record_text_run_scissored_draws_only_the_requested_instance_range",
+  "fn mixed_format_items_fixture",
+  "fn recorded_from_parsed",
+  "fn a_mixed_format_items_stream_splits_into_ordered_homogeneous_runs",
+  "fn the_run_split_is_inert_only_where_component_alpha_is_unsupported",
+  "fn the_effective_layout_answers_component_alpha_only_for_argb32_on_a_capable_device",
+  "fn a_component_alpha_glyph_upload_records_the_packed_width",
+  "fn a_second_glyph_run_records_the_layout_the_first_run_left",
+]
+
+[[modules]]
+name = "memory_frame"
+lines = ["use super::*;"]
+items = [
+  "fn mem_props_with",
+  "fn readback_prefers_cached_coherent_no_invalidate",
+  "fn readback_falls_back_to_cached_noncoherent_needs_invalidate",
+  "fn readback_falls_back_to_coherent_when_no_cached",
+  "fn upload_ignores_cached_and_takes_coherent",
+  "fn pick_memory_type_respects_type_bits_mask",
+  "fn pick_memory_type_none_when_no_host_visible",
+  "fn close_open_frame_with_no_open_frame_returns_already_closed",
+  "fn stub_engine_declines_paint_ops",
+  "fn create_pixmap",
+  "fn engine_exposes_descriptor_pool_ring_lifetime_counters",
+  "fn current_layout_for_drawable_reads_overlay_when_first_touched",
+  "fn commit_close_success_writes_overlay_into_storage",
+  "fn sampled_scratch_image_has_view_and_sampled_usage",
+  "fn upload_blocks_are_not_reused_while_their_frame_is_in_flight",
+  "fn upload_to_frame_suballocates_aligned_slices_and_falls_back_for_oversize",
+]
+
+[[modules]]
+name = "pixel_clamp"
+lines = ["use super::*;"]
+items = [
+  "fn decode_pixel_bgra_round_trip",
+  "fn x11_row_stride_pad_to_32_bits",
+  "fn brd_extent",
+  "fn brd_rect",
+  "fn clamp_rect_to_full_extent_equals_clamp_rect",
+  "fn clamp_put_rect_to_crops_the_source_at_the_content_origin",
+  "fn clamp_copy_rects_to_clips_both_sides_and_keeps_them_aligned",
+  "fn build_render_clip_scissors_to_bounds_the_no_clip_case",
+  "fn clamp_put_rect_inside_returns_unchanged",
+  "fn clamp_put_rect_partial_clip_records_source_offset",
+  "fn clamp_put_rect_outside_returns_none",
+  "fn depth1_unpack_round_trip",
+  "fn depth32_unpack_is_memcpy",
+  "fn depth4_unpack_and_pack_follow_nibble_layout",
+]
+
+[[modules]]
+name = "render_composite"
+lines = ["use super::*;"]
+items = [
+  "fn alloc_filled_pixmap",
+  "fn full_rect",
+  "fn render_composite_over_renders_alpha_blended",
+  "fn composite_glyphs_add_accumulates_into_r8_mask",
+  "fn composite_glyphs_add_mask_then_composite_src_renders_text",
+  "fn render_composite_picture_clip_per_rect",
+  "fn render_composite_solid_fill_source_path",
+  "fn render_composite_linear_gradient_horizontal_two_stop",
+  "fn render_composite_radial_gradient_centred",
+  "fn bw_ramp_stops",
+  "fn composite_and_check_bw_ramp",
+  "fn close_for_tests",
+  "fn gradient_create_then_free_before_use_defers_release_to_frame_retire",
+  "fn gradient_create_composite_free_in_one_frame_renders_and_releases",
+  "fn gradient_sampled_in_a_later_frame_sees_the_upload",
+  "fn render_composite_missing_gradient_picture_is_gap",
+  "fn render_composite_self_alias",
+  "fn render_fill_rectangles_src_clears_to_color",
+  "fn trapezoid_decoder_x11_wire_layout",
+  "fn triangle_to_trap_degenerate",
+  "fn fill_rect_batch_one_submit_for_n_rects",
+  "fn render_composite_resolve_force_opaque_oracle",
+  "fn render_composite_resolve_force_opaque_honors_xrgb32_pict_format",
+  "fn render_composite_dst_has_alpha_honors_xrgb32_pict_format",
+  "fn render_composite_swizzle_class_for_pict_format_xrgb32_is_no_alpha",
+  "fn trap_composite_src_origin_honours_xsrc_ysrc",
+]
