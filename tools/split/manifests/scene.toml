@@ -1,0 +1,45 @@
+# Phase 1a for scene.rs: its inline #[cfg(test)] module(s) go out
+# of line at the same logical paths; production items stay in place.
+source = "crates/yserver/src/kms/render/scene.rs"
+module = "kms::render::scene"
+dir = "crates/yserver/src/kms/render/scene"
+root_form = "file"
+table = "scene.paths"
+
+[[modules]]
+name = ""
+items = [
+  "const *",
+  "enum *",
+  "fn *",
+  "impl < 'a > WalkSink < 'a >",
+  "impl BufferAgeRing",
+  "impl ComposeRenderTarget for CopiedRenderSource",
+  "impl ComposeRenderTarget for DamageAuditTarget",
+  "impl ComposeRenderTarget for IntermediatePrimeTarget",
+  "impl ComposeRenderTarget for ScanoutBo",
+  "impl CopiedRenderSubmitError",
+  "impl DamageAuditTarget",
+  "impl Drop for DamageAuditTarget",
+  "impl Drop for IntermediatePrimeTarget",
+  "impl From < crate :: kms :: vk :: logic_fill_pipeline :: LogicFillError > for SceneError",
+  "impl From < PresentError > for SceneError",
+  "impl InFlightStage",
+  "impl IntermediatePrimeTarget",
+  "impl RepaintPlan",
+  "impl ScalePass",
+  "impl SceneBuild",
+  "impl SceneCompositor#1",
+  "impl SceneCompositor#2",
+  "impl SceneCompositor#3",
+  "impl TickOutcome",
+  "impl WalkStats",
+  "struct *",
+  "trait *",
+  "type *",
+  "use *",
+]
+
+[[modules]]
+name = "tests"
+items = ["tests::*"]
