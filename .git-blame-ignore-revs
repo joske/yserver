@@ -1,0 +1,4 @@
+# Pure move commits (source layout cleanup). Moves across files still need `git blame -C -C`.
+
+# refactor(core): split resources.rs into resources/ (move)
+6897ad0aa0df0d727b74a36ba841e08c6814f5f4
