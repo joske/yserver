@@ -3121,7 +3121,7 @@ impl KmsBackend {
                 crtc: prepared_output.crtc,
                 plane: prepared_output.plane,
             },
-            fence_timeout_ns: super::platform::PRIME_RENDER_PROBE_TIMEOUT_NS,
+            fence_timeout_ns: crate::kms::render::platform::PRIME_RENDER_PROBE_TIMEOUT_NS,
         };
         let job = CrtcConfigProbeJob { kms_fd, request };
         log::debug!(
@@ -5213,7 +5213,11 @@ impl KmsBackend {
     /// other than 32 (the L1 server-α invariant,
     /// `render/engine.rs:12014`), which is what the ring fill's
     /// `vkCmdClearAttachments` writes.
-    fn border_solid_pixel(&self, geom: WindowGeometry, backing: super::store::DrawableId) -> u32 {
+    fn border_solid_pixel(
+        &self,
+        geom: WindowGeometry,
+        backing: crate::kms::render::store::DrawableId,
+    ) -> u32 {
         let pixel = geom.border_pixel.unwrap_or(0);
         // `if (drawable->depth == 32)` — the DESTINATION pixmap.
         if self.store.get(backing).map_or(geom.depth, |d| d.depth) != 32 {
@@ -5494,8 +5498,9 @@ impl KmsBackend {
             .vk
             .as_ref()
             .is_some_and(probe_dmabuf_export_support);
-        let crtc_config_probe_executor: Option<Box<dyn CrtcConfigProbeExecutor>> =
-            Some(Box::new(super::probe_executor::ProcessProbeExecutor::new()?));
+        let crtc_config_probe_executor: Option<Box<dyn CrtcConfigProbeExecutor>> = Some(Box::new(
+            crate::kms::render::probe_executor::ProcessProbeExecutor::new()?,
+        ));
         let kms_outputs_active = !platform.outputs.is_empty();
         let mut b = Self {
             core,
@@ -6875,7 +6880,7 @@ impl KmsBackend {
 
     fn resolve_non_window_paint_target(
         &self,
-        leaf_id: super::store::DrawableId,
+        leaf_id: crate::kms::render::store::DrawableId,
         leaf_depth: u8,
     ) -> Option<PaintTarget> {
         // Pixmaps have no border (`content == None`: the whole storage
@@ -6889,10 +6894,10 @@ impl KmsBackend {
     fn resolve_window_paint_target(
         &self,
         host_xid: u32,
-        leaf_id: Option<super::store::DrawableId>,
+        leaf_id: Option<crate::kms::render::store::DrawableId>,
         leaf_depth: u8,
     ) -> Option<PaintTarget> {
-        use super::target::ContentClipAccum;
+        use crate::kms::render::target::ContentClipAccum;
 
         let mut cur_xid = host_xid;
         // #133 step 3 (P4/3.3) — the walk carries TWO accumulators, both
@@ -6927,7 +6932,9 @@ impl KmsBackend {
         if let Some(g) = self.windows.get(&host_xid)
             && g.border_width > 0
         {
-            clip.intersect(super::target::content_rect(offset, g.width, g.height));
+            clip.intersect(crate::kms::render::target::content_rect(
+                offset, g.width, g.height,
+            ));
         }
         // The window's own content intersected with every ancestor's,
         // bordered or not: its clip in an ANCESTOR's backing, which it
@@ -6935,7 +6942,9 @@ impl KmsBackend {
         // `PaintTarget::within_window_bounds`). Same frames as `clip`.
         let mut bounds = ContentClipAccum::default();
         if let Some(g) = self.windows.get(&host_xid) {
-            bounds.intersect(super::target::content_rect(offset, g.width, g.height));
+            bounds.intersect(crate::kms::render::target::content_rect(
+                offset, g.width, g.height,
+            ));
         }
         loop {
             if let Some(cur_id) = self.store.lookup(cur_xid)
@@ -6967,7 +6976,7 @@ impl KmsBackend {
                     // laid out with a border: add it now, in backing
                     // coordinates.
                     if let Some(g) = self.windows.get(&cur_xid) {
-                        clip.intersect(super::target::content_rect(
+                        clip.intersect(crate::kms::render::target::content_rect(
                             (layout_bw, layout_bw),
                             g.width,
                             g.height,
@@ -7055,10 +7064,18 @@ impl KmsBackend {
                     if parent_bw > 0
                         && let Some(pg) = self.windows.get(&parent_xid)
                     {
-                        clip.intersect(super::target::content_rect((0, 0), pg.width, pg.height));
+                        clip.intersect(crate::kms::render::target::content_rect(
+                            (0, 0),
+                            pg.width,
+                            pg.height,
+                        ));
                     }
                     if let Some(pg) = self.windows.get(&parent_xid) {
-                        bounds.intersect(super::target::content_rect((0, 0), pg.width, pg.height));
+                        bounds.intersect(crate::kms::render::target::content_rect(
+                            (0, 0),
+                            pg.width,
+                            pg.height,
+                        ));
                     }
                     offset.0 += parent_bw;
                     offset.1 += parent_bw;
@@ -7333,7 +7350,7 @@ impl KmsBackend {
     /// pre-#133 arithmetic.
     fn finish_content_clip(
         &self,
-        clip: super::target::ContentClipAccum,
+        clip: crate::kms::render::target::ContentClipAccum,
         id: DrawableId,
     ) -> Option<ash::vk::Rect2D> {
         let extent = self.store.get(id).map(|d| d.storage.extent)?;
@@ -7408,8 +7425,12 @@ impl KmsBackend {
             return None;
         }
         let geom = self.windows.get(&host_xid)?;
-        let mut clip = super::target::ContentClipAccum::default();
-        clip.intersect(super::target::content_rect((b, b), geom.width, geom.height));
+        let mut clip = crate::kms::render::target::ContentClipAccum::default();
+        clip.intersect(crate::kms::render::target::content_rect(
+            (b, b),
+            geom.width,
+            geom.height,
+        ));
         self.finish_content_clip(clip, id)
     }
 
@@ -10800,8 +10821,14 @@ impl KmsBackend {
             .platform
             .allocate_drawable_storage(width, height, 32)
             .ok()?;
-        self.store_alloc(xid, super::store::DrawableKind::Pixmap, 32, false, storage)
-            .ok()?;
+        self.store_alloc(
+            xid,
+            crate::kms::render::store::DrawableKind::Pixmap,
+            32,
+            false,
+            storage,
+        )
+        .ok()?;
         Some(xid)
     }
 
@@ -10838,8 +10865,8 @@ impl KmsBackend {
                 &mut self.store,
                 &mut self.platform,
                 OP_SRC,
-                super::engine::ResolvedSource::Solid([0.0, 0.0, 0.0, 1.0]),
-                super::engine::ResolvedSource::None,
+                crate::kms::render::engine::ResolvedSource::Solid([0.0, 0.0, 0.0, 1.0]),
+                crate::kms::render::engine::ResolvedSource::None,
                 Dst::server_internal(dst_id),
                 &[],
                 None,
@@ -10894,8 +10921,8 @@ impl KmsBackend {
                 &mut self.store,
                 &mut self.platform,
                 OP_SRC,
-                super::engine::ResolvedSource::Solid(color),
-                super::engine::ResolvedSource::None,
+                crate::kms::render::engine::ResolvedSource::Solid(color),
+                crate::kms::render::engine::ResolvedSource::None,
                 Dst::server_internal(dst_id),
                 std::slice::from_ref(&rect),
                 None,
@@ -11577,13 +11604,13 @@ impl KmsBackend {
                 "engine_image_text_for_tests: dst xid 0x{dst_xid:x} not in store"
             )));
         };
-        let prepared: Vec<super::engine::PreparedGlyph> = glyphs
+        let prepared: Vec<crate::kms::render::engine::PreparedGlyph> = glyphs
             .iter()
             .map(|&(codepoint, dst_x, dst_y, w, h)| {
                 let w_us = w as usize;
                 let h_us = h as usize;
                 let pixels = vec![0xFFu8; w_us * h_us];
-                super::engine::PreparedGlyph {
+                crate::kms::render::engine::PreparedGlyph {
                     codepoint,
                     dst_x,
                     dst_y,
@@ -11681,9 +11708,9 @@ impl KmsBackend {
                 &mut self.store,
                 &mut self.platform,
                 1, // PictOp_Src
-                super::engine::ResolvedSource::Solid(color),
+                crate::kms::render::engine::ResolvedSource::Solid(color),
                 Dst::server_internal(dst_id),
-                super::engine::TrapPrimKind::Trapezoid,
+                crate::kms::render::engine::TrapPrimKind::Trapezoid,
                 &instance_data,
                 1,
                 (0, 0, bbox_w, bbox_h),
@@ -11773,9 +11800,9 @@ impl KmsBackend {
                 &mut self.store,
                 &mut self.platform,
                 1, // PictOp_Src
-                super::engine::ResolvedSource::Gradient(grad_xid),
+                crate::kms::render::engine::ResolvedSource::Gradient(grad_xid),
                 Dst::server_internal(dst_id),
-                super::engine::TrapPrimKind::Trapezoid,
+                crate::kms::render::engine::TrapPrimKind::Trapezoid,
                 &instance_data,
                 1,
                 (0, 0, bbox_w, bbox_h),
@@ -19735,7 +19762,7 @@ fn do_dump_drawables(backend: &mut KmsBackend) -> io::Result<()> {
     #[derive(Debug)]
     struct DumpTarget {
         label: String,
-        id: super::store::DrawableId,
+        id: crate::kms::render::store::DrawableId,
         depth: u8,
         width: u32,
         height: u32,
@@ -19828,7 +19855,7 @@ leaf_id={leaf_id:?} redirected_target={redirected_target:?} resolved={resolved:?
         // hover items, 2026-06-04) needs these dumped alongside the
         // manifest. Dedup against root/cow/backings pushed above.
         {
-            let seen: std::collections::HashSet<super::store::DrawableId> =
+            let seen: std::collections::HashSet<crate::kms::render::store::DrawableId> =
                 targets.iter().map(|t| t.id).collect();
             let mut win_xids: Vec<u32> = backend.windows.keys().copied().collect();
             win_xids.sort_unstable();
@@ -19860,9 +19887,9 @@ leaf_id={leaf_id:?} redirected_target={redirected_target:?} resolved={resolved:?
         // item images live ONLY here). Off by default to keep the
         // normal dump lean.
         if std::env::var("YSERVER_DUMP_ALL_DRAWABLES").is_ok_and(|v| v == "1") {
-            let seen: std::collections::HashSet<super::store::DrawableId> =
+            let seen: std::collections::HashSet<crate::kms::render::store::DrawableId> =
                 targets.iter().map(|t| t.id).collect();
-            let mut xid_pairs: Vec<(u32, super::store::DrawableId)> =
+            let mut xid_pairs: Vec<(u32, crate::kms::render::store::DrawableId)> =
                 backend.store.xid_entries().collect();
             xid_pairs.sort_unstable_by_key(|(xid, _)| *xid);
             for (xid, id) in xid_pairs {
@@ -19888,7 +19915,7 @@ leaf_id={leaf_id:?} redirected_target={redirected_target:?} resolved={resolved:?
         // already in the target list so we don't double-dump if a
         // recent offscreen happens to coincide with a registered
         // backing.
-        let already: std::collections::HashSet<super::store::DrawableId> =
+        let already: std::collections::HashSet<crate::kms::render::store::DrawableId> =
             targets.iter().map(|t| t.id).collect();
         // Recent non-COW PresentPixmap sources. This captures
         // compositor-stage pixmaps too, which matter for Cinnamon:
@@ -22741,7 +22768,7 @@ impl Backend for KmsBackend {
             .store
             .get(src_id)
             .and_then(|d| d.storage.imported_drawable.as_ref())
-            .and_then(super::super::vk::target::DrawableImage::imported_dma_buf_fd)
+            .and_then(crate::kms::vk::target::DrawableImage::imported_dma_buf_fd)
         {
             match export_dmabuf_read_access_sync_file(fd) {
                 ExportedSyncFile::Idle => {}
@@ -26397,7 +26424,7 @@ impl Backend for KmsBackend {
             self.log_unresolved_target(src_host_xid, "copy_area_unknown_xid");
             return Ok(());
         };
-        let (src, src_off): (super::store::DrawableId, (i32, i32)) =
+        let (src, src_off): (crate::kms::render::store::DrawableId, (i32, i32)) =
             (src_target.backing_id(), src_target.offset());
         // #133 step 3 (P4): the CLIENT handles. `src` above stays for
         // identity comparisons (self-copy, COW routing) and tracing —
