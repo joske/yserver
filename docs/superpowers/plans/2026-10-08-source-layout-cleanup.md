@@ -201,17 +201,21 @@ module the code imports). The ~40 handlers that are `pub(crate)` today stay
 so and are re-exported. Interleaved regions (DPMS/saver, XI1/XI2
 AllowEvents, two GLX chunks, XTEST/cursor) are regrouped by the move.
 
-**2.11 `kms/render/backend/`:**
+**2.11 `kms/render/backend/`** (descendants of the old module, so
+`kms::render::backend` log-target filters still match; final tree in
+`2026-10-09-phase2-backend.md`):
 ```
+backend.rs        imports, all types, helper-type impls, test mod decls
 backend/
-  mod.rs          header types, KmsBackend struct, open()
-  trait_impl.rs   impl Backend for KmsBackend (10.3k after 2.11a; delegators after 2.11b)
-  portable/       windows, redirect, pixmaps, cursors, gc_clip, draw, render_ops,
-                  get_image, fonts_text, input_logic   (no drm/gbm/fd/libc imports)
-  kms/            scanout, randr_hw, present, dri3_glx, vt, input_thread, cursor_plane
-  for_tests.rs    pub *_for_tests helpers;  telemetry.rs;  tests/ (phase 1)
+  trait_impl.rs   impl Backend for KmsBackend (9.9k after 2.11a; delegators after 2.11b)
+  portable/       windows, redirect, paint_target, render_ops, text, inferiors,
+                  clip, draw, keyboard, devices, pointer, stats, dump
+                  (no drm/gbm/fd/libc imports; pointer's cursor-plane calls: phase 3)
+  kms/            scanout, readback, crtc_config, randr, present, export, session,
+                  cursor
+  for_tests.rs    *_for_tests helpers;  tests/ (phase 1)
 ```
-- **2.11a (move):** inherent impl and free fns into the tree. The 10.3k
+- **2.11a (move):** inherent impl and free fns into the tree. The 9.9k
   `trait_impl.rs` is accepted temporarily (decision 1).
 - **2.11b (delegate), its own commits grouped by subsystem:** each trait body
   moves to an inherent `<subsystem>_<name>` in its group file; inherent-side

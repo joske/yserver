@@ -1,10 +1,8 @@
-# Phase 2.11a proposal: split `kms/render/backend.rs` (production code)
+# Phase 2.11a: split `kms/render/backend.rs` (production code)
 
 Step 2.11a of `2026-10-08-source-layout-cleanup.md`. Manifest:
-`tools/split/manifests/backend_2.toml` (+ `.paths`). **Proposal + dry run
-only**: the tree below was produced by `split apply` on a scratch prep commit,
-built and verified, then reverted. Nothing is committed but this doc and the
-manifest.
+`tools/split/manifests/backend_2.toml` (+ `.paths`). Accepted by jos
+2026-10-09 and executed (decisions at the end); sizes below are the final tree.
 
 ## Structure today (31,742 lines, tests already in `backend/tests/`)
 
@@ -39,7 +37,7 @@ backend.rs            1811  imports, all types (private fields stay visible to
                             alone in paint_target the glob is unused in lib)
 trait_impl.rs         9930  impl Backend for KmsBackend, whole (see below)
 for_tests.rs          2038  *_for_tests / for_tests_* / test_* helpers
-portable/mod.rs         22  globs: windows, render_ops, text, clip, draw, dump
+portable/mod.rs         21  globs: windows, render_ops, text, clip, draw, dump
 portable/windows.rs   1719  leaf storage sync/relayout, background, border,
                             restack, register/allocate leaf, root bg tile
 portable/draw.rs      1489  fills, tiled fill, CPU rop fallbacks, copy-area
@@ -51,26 +49,28 @@ portable/pointer.rs    870  pointer hosts, crossings, motion/button paths
 portable/paint_target.rs 819 resolve_*_paint_target, shared backing moves
 portable/keyboard.rs   807  xkb cooking, floating keyboards, LEDs, keymaps
 portable/inferiors.rs  774  IncludeInferiors fan-out, stroke inferiors, overlay
-portable/cursor.rs     697  cursor records, animation, display
 portable/text.rs       622  core text, glyph spans, parse_composite_glyph_items
 portable/redirect.rs   620  backing seed/inferiors, store alloc/decref, lifetimes
 portable/dump.rs       469  drawable/cursor PPM dumps
 portable/devices.rs    399  host key, device/facet hold release (impl block #3)
 portable/stats.rs      283  telemetry drains, traces, render gap log
-kms/mod.rs              16  globs: scanout, readback, crtc_config, randr,
-                            present, export, session
+kms/mod.rs              17  globs: scanout, readback, crtc_config, randr,
+                            present, export, session (cursor: methods only)
 kms/randr.rs          1943  connector registry/probes, providers, outputs,
                             rebuild, fire_randr_changes, virtual screen extent,
                             relight, display rescan, gamma, mode timing
 kms/scanout.rs        1685  direct scanout/unflip/COW, M0/M1 eligibility+probe
 kms/readback.rs        990  root scanout read routes, readback op, scanout dump
 kms/session.rs         751  open, VT, input thread, suspend/resume, disable
+kms/cursor.rs          697  cursor records, sprite, animation, display (mostly
+                            cursor-plane, decision 4)
 kms/present.rs         655  present batches/completion, vblank arming, crtc clock
 kms/crtc_config.rs     489  topology signature/epoch, crtc-config probes
 kms/export.rs          298  dma-buf export entries, GLX export, DRI3 version
 ```
 
 Every file ≤ 5k except `trait_impl.rs` (accepted until 2.11b, decision 1).
+Total 32,209 lines (31,742 before; the delta is `mod`/`use` lines and fmt).
 
 ## Delegation decision: (a) trait impl whole now, delegate in 2.11b
 
@@ -87,18 +87,18 @@ redirect/COW 1.3k, core draw+copy+GetImage 1.75k, RENDER 1.55k, RANDR/crtc
 0.85k, present 0.95k, DRI3 0.55k, input 0.5k, scanout/frame loop 0.5k,
 cursor/font/pixmap 0.5k, keymap/shape/pointer/DPMS 0.8k, misc 0.6k.
 
-## Dry-run results
+## Results
 
-Prep (scratch commit): the 32 relative paths → `crate::kms::render::…` /
-`crate::kms::vk::…`, + fmt. Then `split apply`, `cargo +nightly fmt`:
-- `cargo build -p yserver`, `cargo clippy -p yserver --all-targets -- -D
-  warnings`: clean. `cargo check --all-targets` with `tcp-transport` and
-  `xdmcp`: clean. Tests not run; `verify --tests` not run.
-- `split verify --manifest`: 1550/1550 leaves identical, 267 manifest
-  visibility changes, 13 include paths same bytes, 38 audited locations,
-  144 leaves' log targets moved to descendants, no shadowed names. Only
-  FAIL: jos's untracked `#UNTITLED#` in the worktree (absent in a commit
-  verify).
+Prep commit: the 32 relative paths → `crate::kms::render::…` /
+`crate::kms::vk::…`, + fmt (backend tests green). Then `split apply`,
+`cargo +nightly fmt`, `split verify` → **OK**: 1550/1550 leaves identical,
+267 manifest visibility changes, 13 include paths same bytes, 0 audited
+exceptions, 38 audited locations, 144 leaves' log targets moved to
+descendants, no shadowed names. `verify --tests` against fresh pre-move
+snapshots: 4008 / 4013 / 4121 tests (default / tcp-transport / xdmcp)
+mapped. Rule-5 gate green (fmt, clippy ×3, tests ×3, lavapipe), except one
+default `cargo test --all-targets` run that exited 101 with the failing test
+name lost; four reruns of that config were green.
 
 **Visibility delta (267, all to the same reach as before):**
 - 202 methods and 64 free fns private → `pub(in crate::kms::render::backend)`
@@ -130,15 +130,28 @@ lines touch `self.platform`: 42× `&mut self.platform` passed to store/engine
 (GpuCore seam A), `vk`/`fb_w`/`fb_h`/`allocate_drawable_storage_as`
 (GpuCore), and **14 KMS-only uses** — cursor-plane move/hide/hotspot and
 `outputs`/`output_root_rect` in `pointer.rs` (11) and `cursor.rs` (3).
-The CI grep as written (`platform::`) would pass; it should also ban
-`cursor_plane_` / `.outputs` in portable/ once those go behind a seam.
+`cursor.rs` now lives in `kms/` (decision 4), so its uses left portable/.
+`pointer.rs` stays in portable/ with its `cursor_plane_move` and
+`outputs`/`output_root_rect` calls: a known phase-3 item (they go behind the
+seam there). The CI grep as written (`platform::`) would pass; it should also
+ban `cursor_plane_` / `.outputs` in portable/ once those go behind a seam.
 
-## Open questions (jos / codex)
+## Decisions (jos, 2026-10-09)
 
-1. Keep all types in the root (1.8k) or move single-subsystem types with
-   their impls (needs field visibility, i.e. a visibility commit)?
-2. `for_tests.rs` at 2k: one file, or split per subsystem with the tests?
-3. `cursor.rs`/`pointer.rs` in portable/ despite cursor-plane calls (logic is
-   portable, the plane calls are the seam) — or move them to kms/ now?
-4. 36 test-only visibility widenings (same reach): accepted as in 2.6?
-5. 2.11b grouping: one delegate commit per subsystem file (≈11 commits)?
+1. Delegation later: the whole `impl Backend for KmsBackend` stays in
+   `trait_impl.rs` (9.9k, accepted until 2.11b); per-subsystem delegators
+   are a later, separate step (2.11b).
+2. All types stay in `backend.rs`.
+3. `for_tests.rs` stays one file.
+4. `cursor.rs` moves from portable/ to `kms/` (almost all cursor-plane);
+   `pointer.rs` stays in portable/ (its KMS uses are a phase-3 item, above).
+5. The 36 test-only visibility changes (same reach) are accepted.
+
+## Commit sequence
+
+1. `refactor(kms): qualify backend super:: paths (prep)`: 32 sites, plus fmt.
+2. `refactor(kms): split backend into portable/kms/trait_impl modules
+   (move)`: `split apply` + fmt, `split verify --manifest …` and the rule-4
+   test lists, then the full gate (rule 5).
+3. `chore: blame-ignore` for 1 and 2.
+4. This doc and the plan updated to the final tree.
