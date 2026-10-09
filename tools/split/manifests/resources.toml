@@ -1,0 +1,314 @@
+# Plan step 2.2 (+ phase 1 for its tests), the splitter's proving run.
+source = "crates/yserver-core/src/resources.rs"
+module = "resources"
+dir = "crates/yserver-core/src/resources"
+table = "resources.paths"
+
+[visibility]
+"fn window_bounding_box" = "pub(super)"
+"impl WindowClass::fn from_protocol" = "pub(super)"
+"impl Window::fn placeholder" = "pub(super)"
+"impl Gc::fn with_defaults" = "pub(super)"
+"impl Gc::fn held_host_pixmaps" = "pub(super)"
+"impl ResourceTable::fn debug_root_order" = "pub(super)"
+"impl ResourceTable::fn restack_window" = "pub(super)"
+"impl ResourceTable::fn promote_unviewable_descendants" = "pub(super)"
+"impl ResourceTable::fn demote_viewable_descendants" = "pub(super)"
+"impl ResourceTable::fn forget_composite_names" = "pub(super)"
+"impl ResourceTable::fn release_host_glyphset_ref" = "pub(super)"
+
+[[modules]]
+name = ""
+lines = [
+  "pub use gc::*;",
+  "pub use picture_font_cursor::*;",
+  "pub use pixmap_props::*;",
+  "pub use types::*;",
+  "pub use window::*;",
+]
+items = [
+  "use *",
+  "const *",
+  "struct ResourceTable",
+  "impl Default for ResourceTable",
+  "impl ResourceTable::fn new",
+  "impl ResourceTable::fn visual",
+  "impl ResourceTable::fn xid_in_use",
+  "impl ResourceTable::fn collect_xids_in",
+  "impl ResourceTable::fn *dri3_syncobj*",
+  "impl ResourceTable::fn seed_*_for_test",
+  "impl ResourceTable::fn visuals_iter",
+  "impl ResourceTable::fn is_known_visual",
+  "impl ResourceTable::fn set_visual_host_xid",
+  "impl ResourceTable::fn *colormap",
+  "impl ResourceTable::fn set_colormap_host_xid",
+  "impl ResourceTable::fn colormap_for_visual",
+]
+
+[[modules]]
+name = "types"
+lines = ["use super::*;"]
+items = [
+  "struct ClientRemovedResources",
+  "struct Visual",
+  "struct Colormap",
+  "enum HostDrawableTarget",
+  "impl HostDrawableTarget",
+  "struct ExposedRect",
+  "struct ViewabilityDelta",
+  "impl ViewabilityDelta",
+  "struct MapTransition",
+  "struct ReparentResult",
+  "enum ReparentWindowError",
+  "enum BorderSource",
+  "struct ResolvedWindowBackground",
+  "struct RedirectedBacking",
+  "struct ReleasedAttrPixmaps",
+  "enum WindowClass",
+  "impl WindowClass::fn *",
+  "enum MapState",
+  "impl MapState",
+]
+
+[[modules]]
+name = "window"
+lines = ["use super::*;"]
+items = [
+  "fn cow_aware_top_index",
+  "fn win_gravity_delta",
+  "impl ResourceTable::fn create_window",
+  "impl ResourceTable::fn destroy_window",
+  "impl ResourceTable::fn materialize_cow_resource",
+  "impl ResourceTable::fn destroy_cow_resource",
+  "impl ResourceTable::fn configure_notify_above_sibling",
+  "impl ResourceTable::fn collect_attribute_pixmap_host_xids*",
+  "impl ResourceTable::fn destroy_window_inner",
+  "impl ResourceTable::fn change_window_attributes",
+  "impl ResourceTable::fn configure_window",
+  "impl ResourceTable::fn apply_win_gravity",
+  "impl ResourceTable::fn debug_root_order",
+  "impl ResourceTable::fn restack_window",
+  "impl ResourceTable::fn resolve_restack_action",
+  "impl ResourceTable::fn any_sibling_occludes_window",
+  "impl ResourceTable::fn window_occludes_any_sibling",
+  "impl ResourceTable::fn map_window",
+  "impl ResourceTable::fn promote_unviewable_descendants",
+  "impl ResourceTable::fn demote_viewable_descendants",
+  "impl ResourceTable::fn unmap_window",
+  "enum RestackAction",
+  "fn window_rects_overlap",
+  "fn window_bounding_box",
+  "struct Window",
+  "impl Window::fn *",
+]
+
+[[modules]]
+name = "tree"
+lines = ["use super::*;"]
+items = [
+  "impl ResourceTable::fn window",
+  "impl ResourceTable::fn window_mut",
+  "impl ResourceTable::fn windows_iter",
+  "impl ResourceTable::fn children",
+  "impl ResourceTable::fn circulate_child",
+  "impl ResourceTable::fn mapped_children_bottom_to_top",
+  "impl ResourceTable::fn is_descendant_of",
+  "impl ResourceTable::fn window_owner",
+  "impl ResourceTable::fn parent_of",
+  "impl ResourceTable::fn descendants_in_exposed_area*",
+  "impl ResourceTable::fn pointer_target_at*",
+  "impl ResourceTable::fn check_reparent_window",
+  "impl ResourceTable::fn reparent_window",
+  "impl ResourceTable::fn window_absolute_position",
+  "impl ResourceTable::fn child_containing_point",
+]
+
+[[modules]]
+name = "pixmap_props"
+lines = ["use super::*;"]
+items = [
+  "impl ResourceTable::fn pixmaps_iter",
+  "impl ResourceTable::fn *window_property",
+  "impl ResourceTable::fn create_pixmap",
+  "impl ResourceTable::fn mark_pixmap_composite_name",
+  "impl ResourceTable::fn free_pixmap",
+  "impl ResourceTable::fn forget_composite_names",
+  "impl ResourceTable::fn host_xid_named_by_pixmap",
+  "impl ResourceTable::fn has_deferred_name_ref",
+  "impl ResourceTable::fn defer_name_ref",
+  "impl ResourceTable::fn host_pixmap_freed",
+  "impl ResourceTable::fn pixmap",
+  "impl ResourceTable::fn composite_named_pixmap_owner_window",
+  "impl ResourceTable::fn set_pixmap_host_xid",
+  "impl ResourceTable::fn update_pixmap_geometry",
+  "impl ResourceTable::fn window_background_pixmap_host_xid",
+  "impl ResourceTable::fn window_resolved_background*",
+  "impl ResourceTable::fn host_xid_referenced_by_window_*",
+  "impl ResourceTable::fn host_xid_referenced_by_gc",
+  "impl ResourceTable::fn host_xid_owned_by_pixmap",
+  "impl ResourceTable::fn host_xid_still_referenced",
+  "impl ResourceTable::fn host_drawable_target",
+  "struct NamedCompositePixmap",
+  "struct Pixmap",
+]
+
+[[modules]]
+name = "gc"
+lines = ["use super::*;"]
+items = [
+  "impl ResourceTable::fn create_gc",
+  "impl ResourceTable::fn change_gc",
+  "impl ResourceTable::fn apply_gc_change",
+  "impl ResourceTable::fn set_dashes",
+  "impl ResourceTable::fn set_clip_rectangles",
+  "impl ResourceTable::fn set_gc_clip_origin",
+  "impl ResourceTable::fn clear_gc_clip",
+  "impl ResourceTable::fn copy_gc",
+  "impl ResourceTable::fn free_gc",
+  "impl ResourceTable::fn gc",
+  "impl ResourceTable::fn gc_*",
+  "impl ResourceTable::fn resolve_draw_state",
+  "enum GcClipState",
+  "enum GcFillState",
+  "struct Gc",
+  "impl Gc::fn *",
+  "struct GcChangeView",
+]
+
+[[modules]]
+name = "picture_font_cursor"
+lines = ["use super::*;"]
+items = [
+  "enum PictureKind",
+  "struct PictureState",
+  "struct GlyphSetState",
+  "impl ResourceTable::fn *picture*",
+  "impl ResourceTable::fn *glyphset*",
+  "impl ResourceTable::fn install_font",
+  "impl ResourceTable::fn close_font",
+  "impl ResourceTable::fn set_gc_font",
+  "impl ResourceTable::fn font",
+  "impl ResourceTable::fn fontable",
+  "impl ResourceTable::fn *cursor*",
+  "struct Font",
+  "struct Cursor",
+]
+
+[[modules]]
+name = "cleanup"
+lines = ["use super::*;"]
+items = [
+  "impl ResourceTable::fn resource_counts_by_owner",
+  "impl ResourceTable::fn pixmap_bytes_by_owner",
+  "impl ResourceTable::fn windows_with_colormap",
+  "impl ResourceTable::fn collect_owned_window_roots",
+  "impl ResourceTable::fn remove_non_window_resources_owned_by",
+  "impl ResourceTable::fn resource_owner",
+]
+
+[[modules]]
+name = "tests"
+items = [
+  "tests::use *",
+  "tests::fn make_window",
+  "tests::fn make_top_level_with_host_xid",
+  "tests::fn make_child",
+  "tests::fn resource_counts_by_owner_tallies_per_type_and_skips_zero",
+  "tests::fn disconnect_cleanup_drains_every_xid_in_use_map_for_owner",
+  "tests::fn reference_glyphset_alias_frees_host_only_after_last_alias",
+  "tests::fn remove_client_frees_shared_glyphset_once",
+  "tests::fn set_pixmap_host_xid_*",
+  "tests::fn visual_table_seeds_all_advertised_visuals",
+  "tests::fn colormap_for_visual_returns_matching_entry",
+  "tests::fn set_visual_host_xid_persists",
+  "tests::fn set_colormap_host_xid_persists",
+  "tests::fn is_known_visual_distinguishes_table_entries",
+  "tests::fn resource_owner_*",
+  "tests::fn cursor_anim_flag_default_false_settable_and_freed",
+]
+
+[[modules]]
+name = "tests::window"
+lines = ["use super::*;"]
+items = [
+  "tests::fn win_gravity_*",
+  "tests::enum InitialState",
+  "tests::fn arb_initial",
+  "tests::macro_call proptest",
+  "tests::fn fresh_window_has_no_redirected_backing",
+  "tests::fn resolved_background_follows_parent_relative_links",
+  "tests::fn parent_relative_tile_origin_includes_the_border_width",
+  "tests::fn cw_fields_persist_through_create_and_change",
+  "tests::fn unmap_window_*",
+  "tests::fn host_drawable_target_*",
+  "tests::const VD_*",
+  "tests::fn ids",
+  "tests::fn viewability_fixture",
+  "tests::fn map_window_delta_is_newly_viewable_subtree_in_pre_order",
+  "tests::fn remap_of_viewable_window_has_no_transition",
+  "tests::fn mapping_changes_without_viewability_under_unmapped_ancestor",
+  "tests::fn reparent_window_delta_follows_new_parent_viewability",
+  "tests::fn copy_from_parent_visual_*",
+  "tests::fn newly_created_window_*",
+  "tests::fn an_explicit_copy_from_parent_border_resolves_to_the_parents_border",
+  "tests::fn replacing_a_pixmap_border_releases_the_old_host_handle",
+  "tests::fn cow_aware_top_index_*",
+  "tests::fn create_window_with_cow_present_inserts_below_cow",
+  "tests::fn restack_top_with_cow_present_lands_just_below_cow",
+  "tests::fn restack_above_cow_caps_to_just_below_cow",
+  "tests::fn reparent_to_root_with_cow_present_lands_below_cow",
+  "tests::fn fresh_resources_does_not_contain_cow",
+  "tests::fn materialize_cow_resource_*",
+  "tests::fn destroy_cow_resource_removes_record_and_root_child",
+  "tests::fn reparent_cow_*",
+]
+
+[[modules]]
+name = "tests::tree"
+lines = ["use super::*;"]
+items = [
+  "tests::fn is_descendant_of_handles_child_grandchild_and_unrelated",
+  "tests::fn reparent_cascades_viewability_to_descendants",
+  "tests::fn mapped_children_bottom_to_top_filters_unmapped_and_preserves_order",
+  "tests::fn reparent_window_moves_child_and_updates_position",
+  "tests::fn reparent_window_rejects_*",
+  "tests::const BW",
+  "tests::const FRAME*",
+  "tests::fn make_bordered_child",
+  "tests::fn bordered_frame_table",
+  "tests::const BORDER_PROBES",
+  "tests::const OUTSIDE_PROBES",
+  "tests::fn hit_test_*",
+  "tests::fn child_containing_point_*",
+  "tests::fn content_and_parent_coord_translations_are_inverses",
+  "tests::fn pointer_target_at_*",
+  "tests::fn circulate_*",
+  "tests::fn configure_window_stack_mode_above_raises_child",
+  "tests::fn restack_request",
+  "tests::fn three_mapped_children",
+  "tests::fn stack_mode_*",
+  "tests::fn top_if_*",
+  "tests::fn bottom_if_*",
+  "tests::fn opposite_*",
+  "tests::fn occlusion_ignores_unmapped_siblings",
+  "tests::fn pointer_hit_test_*",
+  "tests::fn configure_notify_above_sibling_tracks_restacked_order",
+  "tests::fn restack_with_sibling_not_in_parent_is_noop",
+  "tests::fn window_absolute_position_includes_the_border_width_of_every_ancestor",
+]
+
+[[modules]]
+name = "tests::gc"
+lines = ["use super::*;"]
+items = [
+  "tests::fn empty_create_gc_request",
+  "tests::fn empty_change_gc",
+  "tests::fn install_pixmap_with_host_xid",
+  "tests::fn change_gc_clip_mask_none_clears_clip_rectangles",
+  "tests::fn install_dummy_gc",
+  "tests::fn install_font_with_host_xid",
+  "tests::fn copy_gc_*",
+  "tests::fn resolve_draw_state_*",
+  "tests::fn set_clip_rectangles_origin_is_the_gc_clip_origin",
+  "tests::fn host_xid_referenced_by_gc_reports_retained_clip_tile_and_stipple",
+]
