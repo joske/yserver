@@ -33,7 +33,6 @@ not yet approved or executed.** Sizes below are from the dry run (after
   (129 `frame_builder`, 7 `submit_group`, 3 each `upload_arena`/`glyph_atlas`/
   `glyph_pixels`/`platform`, 2 `descriptor_pool_ring`/`present_completion`,
   1 `store`/`telemetry`; 2 of them in doc links).
-- **Root attribute:** `#![allow(dead_code)]` applies to the children too.
 
 ## Target tree (dry-run lines after fmt)
 
@@ -86,9 +85,8 @@ scratch fields are read across files, and a child cannot see a sibling's
 private fields. Inherent impls are spread per member (`impl X::fn *`), so
 `apply` re-opens one `impl X {}` per file.
 
-Root `//!` doc (in the move commit or right after): replace the Stage-2c
-history with "drawing primitives into `DrawableStore` storage, recorded into
-the frame builder and replayed at close" + the module map above.
+Root `//!` doc: the Stage-2c history becomes a short ownership line plus
+this module map (move commit or right after).
 
 ## Dry-run results
 
@@ -100,8 +98,7 @@ Then `split apply`, fmt, `env -u RUSTC_WRAPPER cargo build -p yserver` and
 identical, 45 manifest visibility changes, 0 audited exceptions, 0 location
 audits, 18 leaves with log targets moved to descendants, no shadowed names
 outside the existing test helpers. Logs: `target/gate-engine-dry-*.log`.
-Not run in the dry run: `--features` configs, `verify --tests`, the tests
-themselves, lavapipe (rule-5 gate is for the move commit).
+Not run: `--features` configs, `verify --tests`, tests, lavapipe (rule 5).
 
 **Visibility delta (45, all private → `pub(super)` = the old reach):**
 13 methods, 30 free fns, 2 consts. 29 are needed by the lib (cross-file
@@ -115,9 +112,7 @@ existing `pub(super)`/`pub(in …)` items moved; `pub(crate)` items unchanged.
 
 **Re-exports (root `lines`):** `use` globs for frame, staging, scratch,
 composite, emit; `pub(crate) use` for fill_copy, pixels, glyphs (outside
-users: `engine::clamp_rect`, `decode_x11_pixel_for_storage`,
-`premul_from_wire_pixel`, `uniform_pixel_glyph_source`, …). Method-only
-children get none.
+users, e.g. `decode_x11_pixel_for_storage`). Method-only children: none.
 
 **Refusals and handling:**
 1. Relative paths (sound): prep commit, 155 sites (alternative: import the
