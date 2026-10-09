@@ -1,6 +1,6 @@
 #[test]
 fn trap_bbox_shrinks_to_the_clip_extents() {
-    use super::{Rectangle16, clip_trap_bbox_to_extents};
+    use crate::kms::render::backend::{Rectangle16, clip_trap_bbox_to_extents};
     let r = |x, y, width, height| Rectangle16 {
         x,
         y,
@@ -31,7 +31,7 @@ fn trap_bbox_shrinks_to_the_clip_extents() {
 
 #[test]
 fn warn_throttle_logs_once_per_period_and_counts_the_rest() {
-    use super::WarnThrottle;
+    use crate::kms::render::backend::WarnThrottle;
     let t0 = std::time::Instant::now();
     let mut w = WarnThrottle::default();
     assert_eq!(w.check(t0), Some(0));
@@ -46,7 +46,7 @@ fn warn_throttle_logs_once_per_period_and_counts_the_rest() {
 fn kms_fake_input_button_ten_uses_btn_forward_not_btn_task() {
     // Mutation killed: map BTN_FORWARD through BTN_TASK in the KMS
     // code-to-detail table, or alias physical BTN_TASK to X button 10.
-    use super::KmsBackend;
+    use crate::kms::render::backend::KmsBackend;
     use yserver_core::{
         backend::Backend,
         core_loop::{DeviceInfo, HostInputEvent, InputOrigin, process_request},
@@ -243,7 +243,7 @@ fn kms_fake_input_button_ten_uses_btn_forward_not_btn_task() {
 
 #[test]
 fn kms_button_diagnostic_ignores_xtest_hold_for_physical_wheel_pair() {
-    use super::KmsBackend;
+    use crate::kms::render::backend::KmsBackend;
     use yserver_core::{
         core_loop::{DeviceInfo, InputOrigin, message::LibinputConfigSnapshot},
         server::ServerState,
@@ -325,7 +325,7 @@ fn kms_button_diagnostic_ignores_xtest_hold_for_physical_wheel_pair() {
 
 #[test]
 fn kms_button_diagnostic_warns_on_duplicate_physical_press() {
-    use super::{KmsBackend, KmsButtonDiagnostic};
+    use crate::kms::render::backend::{KmsBackend, KmsButtonDiagnostic};
     use yserver_core::{
         core_loop::{DeviceInfo, InputOrigin, message::LibinputConfigSnapshot},
         server::ServerState,
@@ -2588,7 +2588,7 @@ fn xi_dynamic_master_motion_only_grab_gets_input_thread_wheel_motion() {
 }
 
 fn xi_owner_events_scroll_fixture() -> (
-    super::KmsBackend,
+    crate::kms::render::backend::KmsBackend,
     yserver_core::server::ServerState,
     std::os::unix::net::UnixStream,
     yserver_core::xinput::InputSourceId,
@@ -2758,7 +2758,7 @@ fn xi_owner_events_scroll_events(bytes: &[u8]) -> Vec<(u16, u32, i16, i16)> {
 
 fn xi_owner_events_state_snapshot(
     state: &yserver_core::server::ServerState,
-    backend: &super::KmsBackend,
+    backend: &crate::kms::render::backend::KmsBackend,
     client: u32,
 ) -> String {
     let selections = &state.clients[&client];
@@ -5782,7 +5782,7 @@ fn async_crtc_config_begin_keeps_old_topology_lit() {
             source_selector: source_selector.into(),
             copied_sink: copied_sink.map(Into::into),
             kms,
-            fence_timeout_ns: super::super::platform::PRIME_RENDER_PROBE_TIMEOUT_NS,
+            fence_timeout_ns: crate::kms::render::platform::PRIME_RENDER_PROBE_TIMEOUT_NS,
         }],
         "begin must pass the exact scalar route, device identities, KMS assignment, mode, and per-fence budget",
     );
@@ -8154,7 +8154,7 @@ fn relight_test_snapshot(
 /// mode, and mark its registry entry connected and scanning out there —
 /// the state a boot auto-layout session reaches with no client request.
 fn push_enabled_test_output(
-    b: &mut super::KmsBackend,
+    b: &mut crate::kms::render::backend::KmsBackend,
     connector_name: &str,
     raw_crtc: u32,
     x: i32,
@@ -8216,7 +8216,7 @@ fn push_enabled_test_output(
     let entry = b.randr_id_alloc.entry_mut(&key);
     entry.connected = true;
     entry.modes = vec![mode];
-    entry.config = super::ConnectorConfig::Enabled {
+    entry.config = crate::kms::render::backend::ConnectorConfig::Enabled {
         mode_w: width,
         mode_h: height,
         vrefresh: 60,
@@ -8226,7 +8226,7 @@ fn push_enabled_test_output(
     key
 }
 
-fn clear_test_outputs(b: &mut super::KmsBackend) {
+fn clear_test_outputs(b: &mut crate::kms::render::backend::KmsBackend) {
     b.platform.outputs.clear();
     b.platform.scanout_pools.clear();
     b.platform.bo_generations.clear();
@@ -8264,10 +8264,13 @@ fn a_physical_disconnect_remembers_the_route_and_the_reconnect_relights_it() {
 
     let entry = backend.randr_id_alloc.entry(&key).unwrap();
     assert!(!entry.connected);
-    assert_eq!(entry.config, super::ConnectorConfig::Off);
+    assert_eq!(
+        entry.config,
+        crate::kms::render::backend::ConnectorConfig::Off
+    );
     assert_eq!(
         entry.last_enabled,
-        Some(super::ConnectorConfig::Enabled {
+        Some(crate::kms::render::backend::ConnectorConfig::Enabled {
             mode_w: 1920,
             mode_h: 1080,
             vrefresh: 60,
@@ -8310,7 +8313,7 @@ fn a_physical_disconnect_remembers_the_route_and_the_reconnect_relights_it() {
     let entry = backend.randr_id_alloc.entry(&key).unwrap();
     assert_eq!(
         entry.config,
-        super::ConnectorConfig::Enabled {
+        crate::kms::render::backend::ConnectorConfig::Enabled {
             mode_w: 1920,
             mode_h: 1080,
             vrefresh: 60,
@@ -8334,7 +8337,8 @@ fn a_route_that_was_already_off_when_it_departed_is_never_relit() {
     let mut backend = KmsBackend::for_tests();
     clear_test_outputs(&mut backend);
     let key = push_enabled_test_output(&mut backend, "HDMI-3", 7, 0, 0, 1920, 1080);
-    backend.randr_id_alloc.entry_mut(&key).config = super::ConnectorConfig::Off;
+    backend.randr_id_alloc.entry_mut(&key).config =
+        crate::kms::render::backend::ConnectorConfig::Off;
     backend.randr_id_alloc.entry_mut(&key).client_configured = true;
     let snapshot = relight_test_snapshot(&key, vec![test_advertised_mode(1920, 1080, 60, true)]);
 
@@ -8441,7 +8445,10 @@ fn an_incompatible_mode_reconnect_leaves_the_output_off_and_does_not_re_reserve(
     let _ = backend.reconcile_connector_registry(std::slice::from_ref(&replacement), &[], &[]);
     assert!(backend.take_relight_requests().is_empty());
     let entry = backend.randr_id_alloc.entry(&key).unwrap();
-    assert_eq!(entry.config, super::ConnectorConfig::Off);
+    assert_eq!(
+        entry.config,
+        crate::kms::render::backend::ConnectorConfig::Off
+    );
     assert!(
         entry.last_enabled.is_none(),
         "the remembered route is cleared, which is what releases the slot",
@@ -8455,7 +8462,7 @@ fn an_incompatible_mode_reconnect_leaves_the_output_off_and_does_not_re_reserve(
     assert!(backend.reserved_layout_slots().is_empty());
     assert_eq!(
         backend.randr_id_alloc.entry(&key).unwrap().config,
-        super::ConnectorConfig::Off,
+        crate::kms::render::backend::ConnectorConfig::Off,
     );
 }
 
@@ -8591,7 +8598,7 @@ fn dropping_a_never_enabled_output_reserves_nothing_and_survivors_compact() {
     let b = push_enabled_test_output(&mut backend, "B", 8, 1920, 0, 3200, 1440);
     // A was never enabled — it is connected-but-Off, as a runtime-added
     // connector enters the registry.
-    backend.randr_id_alloc.entry_mut(&a).config = super::ConnectorConfig::Off;
+    backend.randr_id_alloc.entry_mut(&a).config = crate::kms::render::backend::ConnectorConfig::Off;
     let snapshot_b = relight_test_snapshot(&b, vec![test_advertised_mode(3200, 1440, 60, true)]);
 
     let rescan = backend.platform.apply_connector_snapshot(
@@ -8656,7 +8663,7 @@ fn startup_inventory_reserves_xids_but_heavy_snapshot_owns_identity_and_state() 
     assert_eq!(entry.connector_type, "HDMI");
     assert!(matches!(
         entry.config,
-        super::ConnectorConfig::Enabled { .. }
+        crate::kms::render::backend::ConnectorConfig::Enabled { .. }
     ));
 
     backend.randr_id_alloc = RandrIdAllocator::default();
@@ -8670,7 +8677,10 @@ fn startup_inventory_reserves_xids_but_heavy_snapshot_owns_identity_and_state() 
         !entry.connected,
         "forced snapshot overrides cached connected state"
     );
-    assert_eq!(entry.config, super::ConnectorConfig::Off);
+    assert_eq!(
+        entry.config,
+        crate::kms::render::backend::ConnectorConfig::Off
+    );
     let output = backend
         .randr_outputs()
         .into_iter()
@@ -9068,7 +9078,7 @@ fn light_mode_change_then_heavy_connected_route_retirement_is_not_a_second_confi
     assert!(light_delta.config_changed);
     assert!(matches!(
         backend.randr_id_alloc.entry(&key).unwrap().config,
-        super::ConnectorConfig::Enabled { .. }
+        crate::kms::render::backend::ConnectorConfig::Enabled { .. }
     ));
 
     let (outputs, modes) = backend.randr_outputs_and_modes();
@@ -9100,7 +9110,7 @@ fn light_mode_change_then_heavy_connected_route_retirement_is_not_a_second_confi
     assert!(!heavy_delta.config_changed);
     assert_eq!(
         backend.randr_id_alloc.entry(&key).unwrap().config,
-        super::ConnectorConfig::Off,
+        crate::kms::render::backend::ConnectorConfig::Off,
         "the unusable live route is still retired internally",
     );
 
@@ -9265,7 +9275,7 @@ fn randr_output_mode_ids_have_no_duplicate_xids() {
     {
         let e = b.randr_id_alloc.entry_mut(&hdmi_key);
         e.connected = true;
-        e.config = super::ConnectorConfig::Off;
+        e.config = crate::kms::render::backend::ConnectorConfig::Off;
         e.modes = vec![
             test_advertised_mode(1920, 1080, 60, true),
             test_advertised_mode(1920, 1080, 60, false),
@@ -9309,7 +9319,7 @@ fn not_live_output_reports_connected_off_vs_disconnected() {
     {
         let e = b.randr_id_alloc.entry_mut(&hdmi_key);
         e.connected = true;
-        e.config = super::ConnectorConfig::Off;
+        e.config = crate::kms::render::backend::ConnectorConfig::Off;
         e.modes = vec![test_advertised_mode(1920, 1080, 60, true)];
     }
     // Physically disconnected (default connected=false).
@@ -10751,10 +10761,22 @@ fn gradient_free_picture_drops_record() {
 /// compositors that depend on alpha for blending).
 #[test]
 fn default_window_init_color_per_depth() {
-    assert_eq!(super::default_window_init_color(32), [0.0, 0.0, 0.0, 0.0]);
-    assert_eq!(super::default_window_init_color(24), [0.0, 0.0, 0.0, 1.0]);
-    assert_eq!(super::default_window_init_color(1), [0.0, 0.0, 0.0, 1.0]);
-    assert_eq!(super::default_window_init_color(8), [0.0, 0.0, 0.0, 1.0]);
+    assert_eq!(
+        crate::kms::render::backend::default_window_init_color(32),
+        [0.0, 0.0, 0.0, 0.0]
+    );
+    assert_eq!(
+        crate::kms::render::backend::default_window_init_color(24),
+        [0.0, 0.0, 0.0, 1.0]
+    );
+    assert_eq!(
+        crate::kms::render::backend::default_window_init_color(1),
+        [0.0, 0.0, 0.0, 1.0]
+    );
+    assert_eq!(
+        crate::kms::render::backend::default_window_init_color(8),
+        [0.0, 0.0, 0.0, 1.0]
+    );
 }
 
 /// `render_set_picture_clip_rectangles` parses + stores rects
@@ -11213,7 +11235,7 @@ fn install_solidfill_and_glyphset(b: &mut KmsBackend, n: u32) -> (u32, u32) {
 /// depends on test order nor consumes the real one-shot.
 #[test]
 fn the_first_occurrence_of_a_one_shot_is_claimed_once() {
-    use super::take_first_occurrence;
+    use crate::kms::render::backend::take_first_occurrence;
     use std::sync::atomic::AtomicBool;
     let flag = AtomicBool::new(false);
     assert!(
@@ -11470,8 +11492,10 @@ fn composite_glyphs_gradient_source_collapses_to_solidfill() {
 /// because the initial glyphset does not contain its id.
 #[test]
 fn composite_glyphs_inline_glyphset_change_parsed() {
-    use super::parse_composite_glyph_items;
-    use crate::kms::core::{GlyphSetFormat, GlyphSetState, StoredGlyph};
+    use crate::kms::{
+        core::{GlyphSetFormat, GlyphSetState, StoredGlyph},
+        render::backend::parse_composite_glyph_items,
+    };
 
     let mut b = KmsBackend::for_tests();
     let src_pic = b
@@ -12414,7 +12438,7 @@ fn define_cursor_records_per_window_and_root_sticky() {
     let rank = b.alloc_window_stack_rank();
     b.windows.insert(
         w,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -12453,7 +12477,7 @@ fn insert_test_window(b: &mut KmsBackend, w: u32) {
     let rank = b.alloc_window_stack_rank();
     b.windows.insert(
         w,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -12659,7 +12683,10 @@ fn idle_server_wakes_to_release_a_pixmap_freed_in_flight() {
         )
         .expect("flush");
     let wake = b.next_wakeup().expect("parked pixmap schedules a wake");
-    assert!(wake <= std::time::Instant::now() + super::PENDING_RETIRE_POLL_INTERVAL);
+    assert!(
+        wake <= std::time::Instant::now()
+            + crate::kms::render::backend::PENDING_RETIRE_POLL_INTERVAL
+    );
     b.platform.wait_idle_bounded();
     b.before_block();
     assert!(b.store.get(id).is_none(), "freed pixmap released on wake");
@@ -12690,7 +12717,7 @@ fn grab_cursor_override_wins_and_reverts() {
     let rank = b.alloc_window_stack_rank();
     b.windows.insert(
         w,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -12731,7 +12758,7 @@ fn cursor_test_window(b: &mut KmsBackend, w: u32) {
     let rank = b.alloc_window_stack_rank();
     b.windows.insert(
         w,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -12881,7 +12908,7 @@ fn effective_cursor_walks_parent_chain() {
     let rank_c = b.alloc_window_stack_rank();
     b.windows.insert(
         parent,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -12901,7 +12928,7 @@ fn effective_cursor_walks_parent_chain() {
     );
     b.windows.insert(
         child,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -13140,7 +13167,7 @@ fn cwa_on_redirected_window_does_not_clear_backing() {
     let stack_rank = b.alloc_window_stack_rank();
     b.windows.insert(
         w_xid,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -13252,7 +13279,7 @@ fn cwa_on_non_redirected_window_does_not_clear_storage() {
     let stack_rank = b.alloc_window_stack_rank();
     b.windows.insert(
         w_xid,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -13445,7 +13472,7 @@ fn copy_area_clip_by_children_skips_manually_redirected_child() {
     let parent_stack_rank = b.alloc_window_stack_rank();
     b.windows.insert(
         parent_xid,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -13486,7 +13513,7 @@ fn copy_area_clip_by_children_skips_manually_redirected_child() {
     let child_stack_rank = b.alloc_window_stack_rank();
     b.windows.insert(
         child_xid,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -13601,7 +13628,7 @@ fn copy_area_clip_by_children_still_subtracts_automatic_child_in() {
     let parent_stack_rank = b.alloc_window_stack_rank();
     b.windows.insert(
         parent_xid,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -13641,7 +13668,7 @@ fn copy_area_clip_by_children_still_subtracts_automatic_child_in() {
     let child_stack_rank = b.alloc_window_stack_rank();
     b.windows.insert(
         child_xid,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -13741,7 +13768,7 @@ fn copy_area_into_lower_sibling_excludes_higher_sibling_in_shared_backing() {
     let parent_rank = b.alloc_window_stack_rank();
     b.windows.insert(
         parent_xid,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -13794,7 +13821,7 @@ fn copy_area_into_lower_sibling_excludes_higher_sibling_in_shared_backing() {
     let lower_rank = b.alloc_window_stack_rank();
     b.windows.insert(
         lower_xid,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -13831,7 +13858,7 @@ fn copy_area_into_lower_sibling_excludes_higher_sibling_in_shared_backing() {
     let upper_rank = b.alloc_window_stack_rank();
     b.windows.insert(
         upper_xid,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -13917,7 +13944,7 @@ fn copy_area_excludes_higher_cousin_in_shared_redirect_backing() {
     let owner_rank = b.alloc_window_stack_rank();
     b.windows.insert(
         owner_xid,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -13970,7 +13997,7 @@ fn copy_area_excludes_higher_cousin_in_shared_redirect_backing() {
     let lower_rank = b.alloc_window_stack_rank();
     b.windows.insert(
         lower_branch_xid,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -14007,7 +14034,7 @@ fn copy_area_excludes_higher_cousin_in_shared_redirect_backing() {
     let present_rank = b.alloc_window_stack_rank();
     b.windows.insert(
         present_window_xid,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -14044,7 +14071,7 @@ fn copy_area_excludes_higher_cousin_in_shared_redirect_backing() {
     let upper_rank = b.alloc_window_stack_rank();
     b.windows.insert(
         upper_cousin_xid,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -14130,7 +14157,7 @@ fn change_subwindow_attributes_stores_bg_state() {
     // works in production via the no-Vk branch).
     b.windows.insert(
         0xCAFE_BABE,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -14187,7 +14214,7 @@ fn change_subwindow_attributes_stores_border_state() {
     let mut b = KmsBackend::for_tests();
     b.windows.insert(
         0xCAFE_0100,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 4,
             border_pixel: None,
             border_pixmap: None,
@@ -19592,7 +19619,7 @@ fn confined_motion_does_not_cross_into_window_below() {
         assert!(state.resources.map_window(xid).mapping_changed);
         b.windows.insert(
             host,
-            super::WindowGeometry {
+            crate::kms::render::backend::WindowGeometry {
                 border_width: 0,
                 border_pixel: None,
                 border_pixmap: None,
@@ -19870,7 +19897,7 @@ fn window_under_cursor_finds_topmost_mapped() {
     let mut b = KmsBackend::for_tests();
     b.windows.insert(
         0x1000,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -19890,7 +19917,7 @@ fn window_under_cursor_finds_topmost_mapped() {
     );
     b.windows.insert(
         0x2000,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -19947,7 +19974,7 @@ fn window_under_cursor_descends_into_subwindow_tree() {
     // Frame top-level at (100,100, 800x600), no cursor.
     b.windows.insert(
         0x1000,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -19970,7 +19997,7 @@ fn window_under_cursor_descends_into_subwindow_tree() {
     // i.e. screen (100,100, 800x10). Has its own resize cursor.
     b.windows.insert(
         0x1001,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -19992,7 +20019,7 @@ fn window_under_cursor_descends_into_subwindow_tree() {
     // screen (100,690, 800x10). Different cursor.
     b.windows.insert(
         0x1002,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -20031,7 +20058,7 @@ fn window_under_cursor_descends_into_subwindow_tree() {
     // location with higher stack_rank; topmost wins.
     b.windows.insert(
         0x1003,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -21315,7 +21342,7 @@ fn kms_pointer_authority_integrates_physical_relative_motion_in_kms() {
     assert!(state.resources.map_window(CONFINED).mapping_changed);
     backend.windows.insert(
         CONFINED_HOST,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -21639,7 +21666,7 @@ fn copy_from_parent_child_inherits_argb_parent_depth() {
     let mut b = KmsBackend::for_tests();
     b.windows.insert(
         0x2000,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -21711,7 +21738,7 @@ fn reparent_into_container_removes_from_top_level_order() {
     // child (initially registered as a top-level).
     b.windows.insert(
         0xC0FFEE,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -21731,7 +21758,7 @@ fn reparent_into_container_removes_from_top_level_order() {
     );
     b.windows.insert(
         0xCAFED00D,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -21781,7 +21808,7 @@ fn reparent_subwindow_panics_when_host_parent_missing() {
     let child_xid: u32 = 0x0040_0050;
     b.windows.insert(
         child_xid,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -21821,7 +21848,7 @@ fn reparent_subwindow_to_root_via_window_id_does_not_panic() {
     let child_xid: u32 = 0x0040_0050;
     b.windows.insert(
         child_xid,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -21865,7 +21892,7 @@ fn restack_subwindow_updates_sibling_order() {
     let mut b = KmsBackend::for_tests();
     b.windows.insert(
         0xCAFE,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -21885,7 +21912,7 @@ fn restack_subwindow_updates_sibling_order() {
     );
     b.windows.insert(
         0xD00D,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -21918,7 +21945,7 @@ fn reparent_to_root_clears_parent() {
     let mut b = KmsBackend::for_tests();
     b.windows.insert(
         0xC0FFEE,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -21938,7 +21965,7 @@ fn reparent_to_root_clears_parent() {
     );
     b.windows.insert(
         0xCAFED00D,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -22001,7 +22028,7 @@ pub(super) fn seed_window(
     use crate::kms::render::store::{DrawableKind, Storage};
     b.windows.insert(
         xid,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -22056,7 +22083,7 @@ fn seed_bordered_window(
     use crate::kms::render::store::{DrawableKind, Storage};
     b.windows.insert(
         xid,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: bw,
             border_pixel: None,
             border_pixmap: None,
@@ -22074,7 +22101,7 @@ fn seed_bordered_window(
             cursor: None,
         },
     );
-    let (sw, sh) = super::bordered_storage_extent(w.max(1), h.max(1), bw);
+    let (sw, sh) = crate::kms::render::backend::bordered_storage_extent(w.max(1), h.max(1), bw);
     let id = b
         .store
         .allocate(
@@ -22104,9 +22131,18 @@ fn seed_bordered_window(
 /// `bw == 0` desktop on the pre-#133 allocation.
 #[test]
 fn bordered_storage_extent_collapses_at_bw_zero() {
-    assert_eq!(super::bordered_storage_extent(100, 50, 0), (100, 50));
-    assert_eq!(super::bordered_storage_extent(100, 50, 16), (132, 82));
-    assert_eq!(super::bordered_storage_extent(1, 1, 1), (3, 3));
+    assert_eq!(
+        crate::kms::render::backend::bordered_storage_extent(100, 50, 0),
+        (100, 50)
+    );
+    assert_eq!(
+        crate::kms::render::backend::bordered_storage_extent(100, 50, 16),
+        (132, 82)
+    );
+    assert_eq!(
+        crate::kms::render::backend::bordered_storage_extent(1, 1, 1),
+        (3, 3)
+    );
 }
 
 // ───── #133 step 4 (P5) — the ring fill ─────
@@ -22129,7 +22165,10 @@ fn vkrect(x: i32, y: i32, w: u32, h: u32) -> ash::vk::Rect2D {
 #[test]
 fn border_ring_rects_tile_the_annulus_exactly_once() {
     // 100x50 content at (16, 16) inside 132x82 storage: bw = 16.
-    let ring = super::border_ring_rects(vkrect(0, 0, 132, 82), vkrect(16, 16, 100, 50));
+    let ring = crate::kms::render::backend::border_ring_rects(
+        vkrect(0, 0, 132, 82),
+        vkrect(16, 16, 100, 50),
+    );
     assert_eq!(
         ring,
         vec![
@@ -22168,7 +22207,13 @@ fn border_ring_rects_tile_the_annulus_exactly_once() {
 /// submit. Every WM in the smoke set is this path.
 #[test]
 fn border_ring_rects_is_empty_at_bw_zero() {
-    assert!(super::border_ring_rects(vkrect(0, 0, 100, 50), vkrect(0, 0, 100, 50)).is_empty());
+    assert!(
+        crate::kms::render::backend::border_ring_rects(
+            vkrect(0, 0, 100, 50),
+            vkrect(0, 0, 100, 50)
+        )
+        .is_empty()
+    );
 }
 
 /// A 1-px border still produces all four sides (the xts `makewin`
@@ -22179,7 +22224,7 @@ fn border_ring_rects_is_empty_at_bw_zero() {
 #[test]
 fn border_ring_rects_offset_content_and_one_pixel_border() {
     assert_eq!(
-        super::border_ring_rects(vkrect(0, 0, 3, 3), vkrect(1, 1, 1, 1)),
+        crate::kms::render::backend::border_ring_rects(vkrect(0, 0, 3, 3), vkrect(1, 1, 1, 1)),
         vec![
             vkrect(0, 0, 3, 1),
             vkrect(0, 2, 3, 1),
@@ -22188,7 +22233,10 @@ fn border_ring_rects_offset_content_and_one_pixel_border() {
         ]
     );
     // Content (40, 30, 10, 10) with bw = 5 inside a larger backing.
-    let ring = super::border_ring_rects(vkrect(35, 25, 20, 20), vkrect(40, 30, 10, 10));
+    let ring = crate::kms::render::backend::border_ring_rects(
+        vkrect(35, 25, 20, 20),
+        vkrect(40, 30, 10, 10),
+    );
     assert_eq!(
         ring,
         vec![
@@ -22237,7 +22285,7 @@ fn border_solid_pixel_applies_the_depth32_alpha_rule() {
     let mut seed = |xid: u32, parent: Option<u32>, depth: u8| {
         b.windows.insert(
             xid,
-            super::WindowGeometry {
+            crate::kms::render::backend::WindowGeometry {
                 border_width: 4,
                 border_pixel: Some(0x0012_3456),
                 border_pixmap: None,
@@ -22526,12 +22574,12 @@ fn resize_reallocates_storage_at_the_bordered_extent() {
         g.width = 200;
         g.height = 120;
     }
-    b.sync_window_leaf_storage(0x4060, super::LeafContent::Migrate);
+    b.sync_window_leaf_storage(0x4060, crate::kms::render::backend::LeafContent::Migrate);
     assert_eq!(b.storage_extent_for_tests(0x4060), Some((232, 152)));
     // A re-sync with nothing changed must NOT reallocate (the
     // compare-and-skip is against the bordered extent).
     let id_before = b.store.lookup(0x4060);
-    b.sync_window_leaf_storage(0x4060, super::LeafContent::Migrate);
+    b.sync_window_leaf_storage(0x4060, crate::kms::render::backend::LeafContent::Migrate);
     assert_eq!(b.store.lookup(0x4060), id_before, "no needless realloc");
 }
 
@@ -22555,14 +22603,24 @@ fn picture_source_domain_clip_is_identity_without_a_border() {
         },
     ));
     assert_eq!(
-        super::picture_source_domain_clip(&b.store, &plain_src, Repeat::None, None),
+        crate::kms::render::backend::picture_source_domain_clip(
+            &b.store,
+            &plain_src,
+            Repeat::None,
+            None
+        ),
         None,
         "bw == 0 must not add a clip term",
     );
     // A pixmap source carries no domain at all.
     let pix_src = ResolvedSource::Drawable(SourceDrawable::whole(plain));
     assert_eq!(
-        super::picture_source_domain_clip(&b.store, &pix_src, Repeat::None, None),
+        crate::kms::render::backend::picture_source_domain_clip(
+            &b.store,
+            &pix_src,
+            Repeat::None,
+            None
+        ),
         None,
     );
     // bw > 0: the window's own extent restricts the storage.
@@ -22576,7 +22634,12 @@ fn picture_source_domain_clip_is_identity_without_a_border() {
         },
     ));
     assert_eq!(
-        super::picture_source_domain_clip(&b.store, &bordered_src, Repeat::None, None),
+        crate::kms::render::backend::picture_source_domain_clip(
+            &b.store,
+            &bordered_src,
+            Repeat::None,
+            None
+        ),
         Some(vec![Rectangle16 {
             x: 0,
             y: 0,
@@ -22588,11 +22651,16 @@ fn picture_source_domain_clip_is_identity_without_a_border() {
     // modes wrap/clamp against the sampled image and a transformed
     // domain does not project to a rect in dst space.
     assert_eq!(
-        super::picture_source_domain_clip(&b.store, &bordered_src, Repeat::Normal, None),
+        crate::kms::render::backend::picture_source_domain_clip(
+            &b.store,
+            &bordered_src,
+            Repeat::Normal,
+            None
+        ),
         None,
     );
     assert_eq!(
-        super::picture_source_domain_clip(
+        crate::kms::render::backend::picture_source_domain_clip(
             &b.store,
             &bordered_src,
             Repeat::None,
@@ -22829,29 +22897,32 @@ fn migrated_content_copy_maps_content_origin_to_content_origin() {
     // The spec's case: 104x64 storage at offset 2 (content 100x60)
     // → content 98x58 at offset 3.
     assert_eq!(
-        super::migrated_content_copy(ext(104, 64), 2, 98, 58, 3),
+        crate::kms::render::backend::migrated_content_copy(ext(104, 64), 2, 98, 58, 3),
         Some((vkrect(2, 2, 98, 58), ash::vk::Offset2D { x: 3, y: 3 })),
     );
     // Growing the border with the content unchanged (the awesome
     // reproduction): the whole old content moves outward.
     assert_eq!(
-        super::migrated_content_copy(ext(100, 60), 0, 100, 60, 16),
+        crate::kms::render::backend::migrated_content_copy(ext(100, 60), 0, 100, 60, 16),
         Some((vkrect(0, 0, 100, 60), ash::vk::Offset2D { x: 16, y: 16 })),
     );
     // Shrinking the border to nothing (xts's bw -> 0).
     assert_eq!(
-        super::migrated_content_copy(ext(102, 62), 1, 100, 60, 0),
+        crate::kms::render::backend::migrated_content_copy(ext(102, 62), 1, 100, 60, 0),
         Some((vkrect(1, 1, 100, 60), ash::vk::Offset2D { x: 0, y: 0 })),
     );
     // The intersection, when the content shrinks by more than the
     // border grows: only the surviving part is copied.
     assert_eq!(
-        super::migrated_content_copy(ext(104, 64), 2, 40, 20, 3),
+        crate::kms::render::backend::migrated_content_copy(ext(104, 64), 2, 40, 20, 3),
         Some((vkrect(2, 2, 40, 20), ash::vk::Offset2D { x: 3, y: 3 })),
     );
     // Degenerate: an offset that swallows the whole allocation has
     // no content to move.
-    assert_eq!(super::migrated_content_copy(ext(4, 4), 2, 10, 10, 1), None);
+    assert_eq!(
+        crate::kms::render::backend::migrated_content_copy(ext(4, 4), 2, 10, 10, 1),
+        None
+    );
 }
 
 /// #133 step 3 (3.5) — the direct-scanout gate's INPUT: a bordered
@@ -22868,7 +22939,9 @@ fn bordered_fullscreen_window_reports_a_border_clip_to_the_scanout_gate() {
         .expect("resolve bordered fullscreen");
     assert!(bordered, "bordered chain must report a border clip");
     assert!(
-        !super::scanout_direct_eligible(true, true, true, true, true, !bordered, 0, 0, 0),
+        !crate::kms::render::backend::scanout_direct_eligible(
+            true, true, true, true, true, !bordered, 0, 0, 0
+        ),
         "a bordered candidate must never be admitted to direct scanout",
     );
     // The same window unbordered is admitted (so the rejection is
@@ -22878,7 +22951,7 @@ fn bordered_fullscreen_window_reports_a_border_clip_to_the_scanout_gate() {
         .paint_target_shape_for_tests(0x4071)
         .expect("resolve plain fullscreen");
     assert!(!plain);
-    assert!(super::scanout_direct_eligible(
+    assert!(crate::kms::render::backend::scanout_direct_eligible(
         true, true, true, true, true, !plain, 0, 0, 0
     ));
 }
@@ -24977,7 +25050,7 @@ fn cow_get_overlay_first_call_allocates_storage() {
         "COW must be scene_participating=true so build_scene includes it",
     );
     assert!(
-        matches!(cow.kind, super::super::store::DrawableKind::Window),
+        matches!(cow.kind, crate::kms::render::store::DrawableKind::Window),
         "COW must be DrawableKind::Window",
     );
     assert_eq!(cow.storage.extent.width, u32::from(b.platform.fb_w));
@@ -24991,7 +25064,7 @@ fn note_present_pixmap_tracks_non_cow_stage_sources_for_drawable_dump() {
         .store
         .allocate(
             0x4000_2000,
-            super::super::store::DrawableKind::Window,
+            crate::kms::render::store::DrawableKind::Window,
             32,
             true,
             Storage::for_tests_null(
@@ -25007,7 +25080,7 @@ fn note_present_pixmap_tracks_non_cow_stage_sources_for_drawable_dump() {
         .store
         .allocate(
             0x4000_3000,
-            super::super::store::DrawableKind::Pixmap,
+            crate::kms::render::store::DrawableKind::Pixmap,
             32,
             true,
             Storage::for_tests_null(
@@ -26038,7 +26111,7 @@ fn drift1_backend_empty_input_shape_is_click_through() {
     for (xid, rank) in [(0x1000_u32, 0_u64), (0x2000_u32, 1_u64)] {
         b.windows.insert(
             xid,
-            super::WindowGeometry {
+            crate::kms::render::backend::WindowGeometry {
                 border_width: 0,
                 border_pixel: None,
                 border_pixmap: None,
@@ -26545,7 +26618,7 @@ fn seed_state_window(
     };
     backend.windows.insert(
         host_xid,
-        super::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -27207,10 +27280,10 @@ fn root_get_image_reads_scanout_pixels_not_root_storage() {
             height: 16,
         },
     };
-    let scanout = super::read_scanout_region(
+    let scanout = crate::kms::render::backend::read_scanout_region(
         &mut backend,
         scan_rect,
-        super::ScanoutReadSelection::OnScreenOnly,
+        crate::kms::render::backend::ScanoutReadSelection::OnScreenOnly,
     )
     .expect("scanout readback");
     let root_out = backend
@@ -27238,7 +27311,7 @@ fn root_get_image_reads_scanout_pixels_not_root_storage() {
 /// CRTCs are scanning out; the compositor's pools are left untouched,
 /// which is exactly what happens on hardware.
 fn retain_direct_frame_from_source_test(
-    b: &mut super::KmsBackend,
+    b: &mut crate::kms::render::backend::KmsBackend,
     source_xid: u32,
     fallback_xid: u32,
     width: u16,
@@ -27258,7 +27331,7 @@ fn retain_direct_frame_from_source_test(
         ust: 300,
         source: PresentClockSource::PageFlip,
     });
-    b.scanout_m2.current = Some(super::DirectPresentFrame {
+    b.scanout_m2.current = Some(crate::kms::render::backend::DirectPresentFrame {
         source_pin,
         fallback_target_pin,
         source_id,
@@ -27465,16 +27538,16 @@ fn root_overlay_xor_pass_reaches_scanout() {
 
     backend.tick_maybe_composite_for_tests();
 
-    let overlaid = super::read_scanout_region(
+    let overlaid = crate::kms::render::backend::read_scanout_region(
         &mut backend,
         overlay_rect,
-        super::ScanoutReadSelection::OnScreenOnly,
+        crate::kms::render::backend::ScanoutReadSelection::OnScreenOnly,
     )
     .expect("scanout readback (overlay)");
-    let control = super::read_scanout_region(
+    let control = crate::kms::render::backend::read_scanout_region(
         &mut backend,
         control_rect,
-        super::ScanoutReadSelection::OnScreenOnly,
+        crate::kms::render::backend::ScanoutReadSelection::OnScreenOnly,
     )
     .expect("scanout readback (control)");
 
@@ -27760,7 +27833,7 @@ fn root_copy_area_include_inferiors_captures_window_into_pixmap() {
         .get_image_pixels_for_tests(dst.as_raw(), 2, 32, 24, 16, 16, !0)
         .expect("dst get_image window region")
         .expect("dst window bytes");
-    let scanout_win = super::read_scanout_region(
+    let scanout_win = crate::kms::render::backend::read_scanout_region(
         &mut backend,
         ash::vk::Rect2D {
             offset: ash::vk::Offset2D { x: 32, y: 24 },
@@ -27769,7 +27842,7 @@ fn root_copy_area_include_inferiors_captures_window_into_pixmap() {
                 height: 16,
             },
         },
-        super::ScanoutReadSelection::OnScreenOnly,
+        crate::kms::render::backend::ScanoutReadSelection::OnScreenOnly,
     )
     .expect("scanout readback");
     assert_eq!(
@@ -27783,7 +27856,7 @@ fn root_copy_area_include_inferiors_captures_window_into_pixmap() {
         .get_image_pixels_for_tests(dst.as_raw(), 2, 0, 0, 8, 8, !0)
         .expect("dst get_image bg region")
         .expect("dst bg bytes");
-    let scanout_bg = super::read_scanout_region(
+    let scanout_bg = crate::kms::render::backend::read_scanout_region(
         &mut backend,
         ash::vk::Rect2D {
             offset: ash::vk::Offset2D { x: 0, y: 0 },
@@ -27792,7 +27865,7 @@ fn root_copy_area_include_inferiors_captures_window_into_pixmap() {
                 height: 8,
             },
         },
-        super::ScanoutReadSelection::OnScreenOnly,
+        crate::kms::render::backend::ScanoutReadSelection::OnScreenOnly,
     )
     .expect("scanout bg readback");
     assert_eq!(
@@ -27813,7 +27886,14 @@ fn r(x: i32, y: i32, w: u32, h: u32) -> ash::vk::Rect2D {
 
 #[test]
 fn split_root_scanout_reads_single_output_whole_rect() {
-    let got = super::split_root_scanout_reads(r(0, 0, 100, 50), 0, 0, 0, 0, &[(0, 0, 200, 200)]);
+    let got = crate::kms::render::backend::split_root_scanout_reads(
+        r(0, 0, 100, 50),
+        0,
+        0,
+        0,
+        0,
+        &[(0, 0, 200, 200)],
+    );
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].read, r(0, 0, 100, 50));
     assert_eq!(got[0].dst_local, ash::vk::Offset2D { x: 0, y: 0 });
@@ -27823,7 +27903,14 @@ fn split_root_scanout_reads_single_output_whole_rect() {
 fn split_root_scanout_reads_honors_src_origin() {
     // Copy from root (32,24) into dst (0,0): read root-absolute (32,24),
     // write to dst-local (0,0).
-    let got = super::split_root_scanout_reads(r(0, 0, 16, 16), 32, 24, 0, 0, &[(0, 0, 800, 600)]);
+    let got = crate::kms::render::backend::split_root_scanout_reads(
+        r(0, 0, 16, 16),
+        32,
+        24,
+        0,
+        0,
+        &[(0, 0, 800, 600)],
+    );
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].read, r(32, 24, 16, 16));
     assert_eq!(got[0].dst_local, ash::vk::Offset2D { x: 0, y: 0 });
@@ -27832,7 +27919,7 @@ fn split_root_scanout_reads_honors_src_origin() {
 #[test]
 fn split_root_scanout_reads_spanning_two_outputs() {
     // Full 200x100 grab across two 100-wide side-by-side outputs → two reads.
-    let got = super::split_root_scanout_reads(
+    let got = crate::kms::render::backend::split_root_scanout_reads(
         r(0, 0, 200, 100),
         0,
         0,
@@ -27850,7 +27937,14 @@ fn split_root_scanout_reads_spanning_two_outputs() {
 #[test]
 fn split_root_scanout_reads_clips_partially_offscreen() {
     // Requested 200x200 but output is only 150x120: read the covered piece.
-    let got = super::split_root_scanout_reads(r(0, 0, 200, 200), 0, 0, 0, 0, &[(0, 0, 150, 120)]);
+    let got = crate::kms::render::backend::split_root_scanout_reads(
+        r(0, 0, 200, 200),
+        0,
+        0,
+        0,
+        0,
+        &[(0, 0, 150, 120)],
+    );
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].read, r(0, 0, 150, 120));
     assert_eq!(got[0].dst_local, ash::vk::Offset2D { x: 0, y: 0 });
@@ -27858,7 +27952,14 @@ fn split_root_scanout_reads_clips_partially_offscreen() {
 
 #[test]
 fn split_root_scanout_reads_fully_offscreen_is_empty() {
-    let got = super::split_root_scanout_reads(r(0, 0, 50, 50), 500, 500, 0, 0, &[(0, 0, 100, 100)]);
+    let got = crate::kms::render::backend::split_root_scanout_reads(
+        r(0, 0, 50, 50),
+        500,
+        500,
+        0,
+        0,
+        &[(0, 0, 100, 100)],
+    );
     assert!(got.is_empty());
 }
 
@@ -27870,11 +27971,12 @@ fn assemble_root_scanout_spans_two_outputs() {
     // the old single-`read_scanout_region` path returned all-black for
     // (rect spanning two outputs → no matching BO → empty reply).
     let outputs = [(0i32, 0i32, 2u32, 2u32), (2, 0, 2, 2)];
-    let got = super::assemble_root_scanout(r(0, 0, 4, 2), &outputs, |rect, _| {
-        let px = (rect.extent.width * rect.extent.height) as usize;
-        let byte = if rect.offset.x == 0 { 0x11u8 } else { 0x22u8 };
-        Some(vec![byte; px * 4])
-    });
+    let got =
+        crate::kms::render::backend::assemble_root_scanout(r(0, 0, 4, 2), &outputs, |rect, _| {
+            let px = (rect.extent.width * rect.extent.height) as usize;
+            let byte = if rect.offset.x == 0 { 0x11u8 } else { 0x22u8 };
+            Some(vec![byte; px * 4])
+        });
     assert_eq!(got.len(), 4 * 2 * 4);
     // stride = 4 px * 4 bytes = 16. Left 2 px (8 bytes) then right 2 px.
     assert_eq!(&got[0..8], &[0x11u8; 8], "row0 left half from output 0");
@@ -27890,19 +27992,23 @@ fn assemble_root_scanout_reads_uncovered_area_from_the_root_background() {
     // (Xorg answers the root background there), never from a scanout.
     let outputs = [(0i32, 0i32, 4u32, 2u32)];
     let mut background_px = 0;
-    let got = super::assemble_root_scanout(r(0, 0, 6, 3), &outputs, |rect, source| {
-        let px = (rect.extent.width * rect.extent.height) as usize;
-        match source {
-            super::RootReadSource::Scanout => {
-                assert_eq!(rect, r(0, 0, 4, 2), "scanout read stays on the output");
-                Some(vec![0x11u8; px * 4])
+    let got = crate::kms::render::backend::assemble_root_scanout(
+        r(0, 0, 6, 3),
+        &outputs,
+        |rect, source| {
+            let px = (rect.extent.width * rect.extent.height) as usize;
+            match source {
+                crate::kms::render::backend::RootReadSource::Scanout => {
+                    assert_eq!(rect, r(0, 0, 4, 2), "scanout read stays on the output");
+                    Some(vec![0x11u8; px * 4])
+                }
+                crate::kms::render::backend::RootReadSource::Background => {
+                    background_px += px;
+                    Some(vec![0x22u8; px * 4])
+                }
             }
-            super::RootReadSource::Background => {
-                background_px += px;
-                Some(vec![0x22u8; px * 4])
-            }
-        }
-    });
+        },
+    );
     assert_eq!(background_px, 6 * 3 - 4 * 2, "every uncovered pixel, once");
     let stride = 6 * 4;
     assert_eq!(&got[0..16], &[0x11u8; 16], "row0 under the output");
@@ -27915,16 +28021,17 @@ fn assemble_root_scanout_failed_read_is_zero_filled() {
     // A piece whose read fails stays zero (black) instead of aborting the
     // whole capture; the covered output still lands.
     let outputs = [(0i32, 0i32, 2u32, 2u32), (2, 0, 2, 2)];
-    let got = super::assemble_root_scanout(r(0, 0, 4, 1), &outputs, |rect, _| {
-        if rect.offset.x == 0 {
-            Some(vec![
-                0x11u8;
-                (rect.extent.width * rect.extent.height) as usize * 4
-            ])
-        } else {
-            None
-        }
-    });
+    let got =
+        crate::kms::render::backend::assemble_root_scanout(r(0, 0, 4, 1), &outputs, |rect, _| {
+            if rect.offset.x == 0 {
+                Some(vec![
+                    0x11u8;
+                    (rect.extent.width * rect.extent.height) as usize * 4
+                ])
+            } else {
+                None
+            }
+        });
     assert_eq!(&got[0..8], &[0x11u8; 8], "covered output landed");
     assert_eq!(&got[8..16], &[0x00u8; 8], "failed-read output stays black");
 }
@@ -27933,7 +28040,14 @@ fn assemble_root_scanout_failed_read_is_zero_filled() {
 fn split_root_scanout_reads_output_offset_shifts_dst_local() {
     // Output starts at x=50: the left half (root x 0..50) is off-screen and
     // dropped; the right half reads root x50.. and writes to dst-local x50.
-    let got = super::split_root_scanout_reads(r(0, 0, 100, 100), 0, 0, 0, 0, &[(50, 0, 800, 600)]);
+    let got = crate::kms::render::backend::split_root_scanout_reads(
+        r(0, 0, 100, 100),
+        0,
+        0,
+        0,
+        0,
+        &[(50, 0, 800, 600)],
+    );
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].read, r(50, 0, 50, 100));
     assert_eq!(got[0].dst_local, ash::vk::Offset2D { x: 50, y: 0 });
@@ -27943,7 +28057,14 @@ fn split_root_scanout_reads_output_offset_shifts_dst_local() {
 fn split_root_scanout_reads_carries_subrect_dst_offset() {
     // A GC-clip sub-rect at dst-local (20,10): source tracks it, dst-local
     // offset is preserved.
-    let got = super::split_root_scanout_reads(r(20, 10, 30, 30), 0, 0, 0, 0, &[(0, 0, 800, 600)]);
+    let got = crate::kms::render::backend::split_root_scanout_reads(
+        r(20, 10, 30, 30),
+        0,
+        0,
+        0,
+        0,
+        &[(0, 0, 800, 600)],
+    );
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].read, r(20, 10, 30, 30));
     assert_eq!(got[0].dst_local, ash::vk::Offset2D { x: 20, y: 10 });
@@ -27962,7 +28083,7 @@ fn outputs_set(indices: &[usize]) -> std::collections::HashSet<usize> {
 #[test]
 fn direct_frame_slot_is_composed_without_any_direct_frame() {
     assert_eq!(
-        super::direct_frame_slot_on_output(0, None, false, &outputs_set(&[])),
+        crate::kms::render::backend::direct_frame_slot_on_output(0, None, false, &outputs_set(&[])),
         None
     );
 }
@@ -27971,8 +28092,13 @@ fn direct_frame_slot_is_composed_without_any_direct_frame() {
 fn direct_frame_slot_current_covers_every_output() {
     for idx in 0..2 {
         assert_eq!(
-            super::direct_frame_slot_on_output(idx, None, true, &outputs_set(&[])),
-            Some(super::DirectFrameSlot::Current),
+            crate::kms::render::backend::direct_frame_slot_on_output(
+                idx,
+                None,
+                true,
+                &outputs_set(&[])
+            ),
+            Some(crate::kms::render::backend::DirectFrameSlot::Current),
             "a fully retired direct frame is on screen on every CRTC"
         );
     }
@@ -27983,12 +28109,22 @@ fn direct_frame_slot_pending_only_on_outputs_where_it_retired() {
     // Successor submitted to both CRTCs, retired on output 0 only.
     let awaiting = outputs_set(&[1]);
     assert_eq!(
-        super::direct_frame_slot_on_output(0, Some(&awaiting), true, &outputs_set(&[])),
-        Some(super::DirectFrameSlot::Pending)
+        crate::kms::render::backend::direct_frame_slot_on_output(
+            0,
+            Some(&awaiting),
+            true,
+            &outputs_set(&[])
+        ),
+        Some(crate::kms::render::backend::DirectFrameSlot::Pending)
     );
     assert_eq!(
-        super::direct_frame_slot_on_output(1, Some(&awaiting), true, &outputs_set(&[])),
-        Some(super::DirectFrameSlot::Current),
+        crate::kms::render::backend::direct_frame_slot_on_output(
+            1,
+            Some(&awaiting),
+            true,
+            &outputs_set(&[])
+        ),
+        Some(crate::kms::render::backend::DirectFrameSlot::Current),
         "output 1 still shows the predecessor until its flip retires"
     );
 }
@@ -27999,11 +28135,21 @@ fn direct_frame_slot_first_direct_frame_leaves_unretired_outputs_composed() {
     // flip is still compositing into its own pool.
     let awaiting = outputs_set(&[1]);
     assert_eq!(
-        super::direct_frame_slot_on_output(0, Some(&awaiting), false, &outputs_set(&[])),
-        Some(super::DirectFrameSlot::Pending)
+        crate::kms::render::backend::direct_frame_slot_on_output(
+            0,
+            Some(&awaiting),
+            false,
+            &outputs_set(&[])
+        ),
+        Some(crate::kms::render::backend::DirectFrameSlot::Pending)
     );
     assert_eq!(
-        super::direct_frame_slot_on_output(1, Some(&awaiting), false, &outputs_set(&[])),
+        crate::kms::render::backend::direct_frame_slot_on_output(
+            1,
+            Some(&awaiting),
+            false,
+            &outputs_set(&[])
+        ),
         None
     );
 }
@@ -28013,33 +28159,33 @@ fn direct_frame_slot_composed_unflip_retires_per_output() {
     // Composed unflip submitted to both CRTCs, retired on output 0 only.
     let unflip = outputs_set(&[1]);
     assert_eq!(
-        super::direct_frame_slot_on_output(0, None, true, &unflip),
+        crate::kms::render::backend::direct_frame_slot_on_output(0, None, true, &unflip),
         None,
         "output 0 is back on its composited BO"
     );
     assert_eq!(
-        super::direct_frame_slot_on_output(1, None, true, &unflip),
-        Some(super::DirectFrameSlot::Current),
+        crate::kms::render::backend::direct_frame_slot_on_output(1, None, true, &unflip),
+        Some(crate::kms::render::backend::DirectFrameSlot::Current),
         "output 1 is still scanning out the client buffer"
     );
 }
 
 #[test]
 fn scanout_read_route_follows_the_direct_source() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let target_xid = 0x5700;
     let fallback_id = seed_window(&mut b, target_xid, None, 0, 0);
     let (source_id, _, _, _) =
         install_direct_frame_for_target_test(&mut b, target_xid, fallback_id, true);
 
-    let route = super::select_scanout_read_route(
+    let route = crate::kms::render::backend::select_scanout_read_route(
         &b,
         r(10, 20, 30, 40),
-        super::ScanoutReadSelection::OnScreenOnly,
+        crate::kms::render::backend::ScanoutReadSelection::OnScreenOnly,
     )
     .expect("a flipped CRTC resolves a direct route");
     match route {
-        super::ScanoutReadRoute::Direct {
+        crate::kms::render::backend::ScanoutReadRoute::Direct {
             source_id: got,
             depth,
             source,
@@ -28059,7 +28205,7 @@ fn scanout_read_route_follows_the_direct_source() {
 
 #[test]
 fn scanout_read_route_is_composed_once_the_direct_frame_is_gone() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let target_xid = 0x5704;
     let fallback_id = seed_window(&mut b, target_xid, None, 0, 0);
     install_direct_frame_for_target_test(&mut b, target_xid, fallback_id, true);
@@ -28068,10 +28214,10 @@ fn scanout_read_route_is_composed_once_the_direct_frame_is_gone() {
     // The stub fixture has no scanout pools, so the composed branch can
     // only report "not covered by any pool" — which is still proof the
     // direct branch was not taken.
-    let err = super::select_scanout_read_route(
+    let err = crate::kms::render::backend::select_scanout_read_route(
         &b,
         r(10, 20, 30, 40),
-        super::ScanoutReadSelection::PermissiveDump,
+        crate::kms::render::backend::ScanoutReadSelection::PermissiveDump,
     )
     .expect_err("stub fixture has no pool bos");
     assert!(
@@ -28082,16 +28228,16 @@ fn scanout_read_route_is_composed_once_the_direct_frame_is_gone() {
 
 #[test]
 fn scanout_read_route_rejects_a_rect_outside_the_direct_source() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let target_xid = 0x5708;
     let fallback_id = seed_window(&mut b, target_xid, None, 0, 0);
     install_direct_frame_for_target_test(&mut b, target_xid, fallback_id, true);
 
     // The fixture source is 100x100; the output is 800x600.
-    let err = super::select_scanout_read_route(
+    let err = crate::kms::render::backend::select_scanout_read_route(
         &b,
         r(0, 0, 800, 600),
-        super::ScanoutReadSelection::PermissiveDump,
+        crate::kms::render::backend::ScanoutReadSelection::PermissiveDump,
     )
     .expect_err("an unreadable direct source must not fall back to the pool");
     assert!(
@@ -28102,7 +28248,7 @@ fn scanout_read_route_rejects_a_rect_outside_the_direct_source() {
 
 #[test]
 fn scanout_read_route_rejects_a_vanished_direct_source() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let target_xid = 0x570c;
     let fallback_id = seed_window(&mut b, target_xid, None, 0, 0);
     install_direct_frame_for_target_test(&mut b, target_xid, fallback_id, true);
@@ -28112,10 +28258,10 @@ fn scanout_read_route_rejects_a_vanished_direct_source() {
         .expect("direct frame installed")
         .source_id = crate::kms::render::store::DrawableId::for_tests(0x00ff_ffff);
 
-    let err = super::select_scanout_read_route(
+    let err = crate::kms::render::backend::select_scanout_read_route(
         &b,
         r(10, 20, 30, 40),
-        super::ScanoutReadSelection::PermissiveDump,
+        crate::kms::render::backend::ScanoutReadSelection::PermissiveDump,
     )
     .expect_err("an unresolvable direct source must be reported, not papered over");
     assert!(
@@ -28126,7 +28272,7 @@ fn scanout_read_route_rejects_a_vanished_direct_source() {
 
 #[test]
 fn scanout_read_route_is_per_output_during_a_composed_unflip() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     push_test_output(&mut b, 2);
     // Two side-by-side outputs small enough to sit inside the fixture's
     // 100x100 direct source, which stands in for the real invariant that
@@ -28155,14 +28301,14 @@ fn scanout_read_route_is_per_output_during_a_composed_unflip() {
     // A rect wholly inside output 1 still resolves to the direct source,
     // rebased into that drawable's own space (the source covers the whole
     // root, so the output origin is NOT subtracted).
-    let route = super::select_scanout_read_route(
+    let route = crate::kms::render::backend::select_scanout_read_route(
         &b,
         r(60, 10, 20, 20),
-        super::ScanoutReadSelection::PermissiveDump,
+        crate::kms::render::backend::ScanoutReadSelection::PermissiveDump,
     )
     .expect("output 1 is direct");
     match route {
-        super::ScanoutReadRoute::Direct { source, .. } => assert_eq!(
+        crate::kms::render::backend::ScanoutReadRoute::Direct { source, .. } => assert_eq!(
             source,
             r(60, 10, 20, 20),
             "the source spans the root, so the output origin is NOT subtracted"
@@ -28174,7 +28320,7 @@ fn scanout_read_route_is_per_output_during_a_composed_unflip() {
 #[test]
 fn scanout_read_origin_labels_name_the_buffer() {
     assert_eq!(
-        super::ScanoutReadOrigin::ComposedPool {
+        crate::kms::render::backend::ScanoutReadOrigin::ComposedPool {
             pool_idx: 1,
             bo_idx: 2
         }
@@ -28182,7 +28328,7 @@ fn scanout_read_origin_labels_name_the_buffer() {
         "composed-pool1-bo2"
     );
     assert_eq!(
-        super::ScanoutReadOrigin::DirectSource {
+        crate::kms::render::backend::ScanoutReadOrigin::DirectSource {
             source_xid: 0x4a0_0007
         }
         .label(),
@@ -31072,14 +31218,14 @@ fn xkb_get_kbd_by_name_parses_capture_loads_and_notifies() {
 
 #[test]
 fn armed_vblank_targets_starts_empty() {
-    let b = super::KmsBackend::for_tests();
+    let b = crate::kms::render::backend::KmsBackend::for_tests();
     assert!(b.armed_vblank_targets.is_empty());
     assert!(b.crtc_queue_sequence_unsupported_devices.is_empty());
 }
 
 #[test]
 fn clear_all_armed_vblank_targets_empties_map() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let h = test_crtc_key(test_device_key(7), 7);
     b.armed_vblank_targets.insert(h, 0);
     b.clear_all_armed_vblank_targets();
@@ -31088,7 +31234,7 @@ fn clear_all_armed_vblank_targets_empties_map() {
 
 #[test]
 fn prune_armed_targets_drops_stale_keeps_live() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let live = output_crtc_key(&b, 0);
     let stale = test_crtc_key(live.device_key, 999);
     b.armed_vblank_targets.insert(live, 0);
@@ -31100,7 +31246,7 @@ fn prune_armed_targets_drops_stale_keeps_live() {
 
 #[test]
 fn prune_armed_targets_drops_stale_absolute_entries_keeps_live() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let live = output_crtc_key(&b, 0);
     let stale = test_crtc_key(live.device_key, 999);
     b.absolute_vblank_targets
@@ -31118,7 +31264,7 @@ fn prune_armed_targets_drops_stale_absolute_entries_keeps_live() {
 
 #[test]
 fn on_crtc_sequence_event_happy_path_records_msc_and_clears_arm() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc = b.platform.outputs[0].output.crtc;
     let crtc_key = output_crtc_key(&b, 0);
     b.armed_vblank_targets.insert(crtc_key, 0);
@@ -31146,7 +31292,7 @@ fn on_crtc_sequence_event_happy_path_records_msc_and_clears_arm() {
 
 #[test]
 fn active_crtc_sequence_advances_general_clock_only() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc = b.platform.outputs[0].output.crtc;
     let crtc_key = output_crtc_key(&b, 0);
     b.armed_vblank_targets.insert(crtc_key, 0);
@@ -31164,7 +31310,7 @@ fn active_crtc_sequence_advances_general_clock_only() {
 
 #[test]
 fn active_absolute_sequence_advances_completion_clock() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc = b.platform.outputs[0].output.crtc;
     let crtc_id = u32::from(crtc);
     let crtc_key = output_crtc_key(&b, 0);
@@ -31174,7 +31320,12 @@ fn active_absolute_sequence_advances_completion_clock() {
         .insert(9);
     b.scene.scene_structure_dirty = true;
 
-    dispatch_test_sequence(&mut b, super::absolute_seq_user_data(crtc_id), 2_000_000, 9);
+    dispatch_test_sequence(
+        &mut b,
+        crate::kms::render::backend::absolute_seq_user_data(crtc_id),
+        2_000_000,
+        9,
+    );
 
     assert_eq!(b.platform.present_get_ust_msc(crtc_key), (9, 2_000));
     assert_eq!(
@@ -31188,7 +31339,7 @@ fn active_absolute_sequence_advances_completion_clock() {
 fn completion_clock_prefers_pageflip_at_equal_msc_and_never_regresses() {
     use yserver_core::backend::{PresentClockSample, PresentClockSource};
 
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc_key = output_crtc_key(&b, 0);
     b.platform.record_completion_clock(
         crtc_key,
@@ -31227,7 +31378,7 @@ fn completion_clock_prefers_pageflip_at_equal_msc_and_never_regresses() {
 
 #[test]
 fn on_crtc_sequence_event_negative_time_clears_arm_and_drops() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc = b.platform.outputs[0].output.crtc;
     let crtc_key = output_crtc_key(&b, 0);
     b.armed_vblank_targets.insert(crtc_key, 0);
@@ -31247,7 +31398,7 @@ fn on_crtc_sequence_event_negative_time_clears_arm_and_drops() {
 
 #[test]
 fn on_crtc_sequence_event_stale_crtc_clears_arm_and_drops() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let device_key = b.platform.outputs[0].key.device_key;
     let stale = test_crtc_key(device_key, 999);
     b.armed_vblank_targets.insert(stale, 0);
@@ -31263,7 +31414,7 @@ fn on_crtc_sequence_event_stale_crtc_clears_arm_and_drops() {
 
 #[test]
 fn on_crtc_sequence_event_from_wrong_device_does_not_advance_clock() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc = b.platform.outputs[0].output.crtc;
     let crtc_key = output_crtc_key(&b, 0);
     b.armed_vblank_targets.insert(crtc_key, 0);
@@ -31284,7 +31435,7 @@ fn on_crtc_sequence_event_from_wrong_device_does_not_advance_clock() {
 
 #[test]
 fn same_raw_crtc_on_two_devices_keeps_present_state_independent() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let primary = output_crtc_key(&b, 0);
     let raw_crtc = u32::from(primary.crtc);
     push_test_output(&mut b, raw_crtc);
@@ -31311,7 +31462,7 @@ fn same_raw_crtc_on_two_devices_keeps_present_state_independent() {
 
 #[test]
 fn present_get_ust_msc_keeps_output_domains_independent() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let primary = output_crtc_key(&b, 0);
     push_test_output(&mut b, 2);
     let secondary = output_crtc_key(&b, 1);
@@ -31331,7 +31482,7 @@ fn present_get_ust_msc_keeps_output_domains_independent() {
 
 #[test]
 fn present_randr_crtc_routes_equal_raw_handles_to_the_owning_device() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let raw_crtc = u32::from(b.platform.outputs[0].output.crtc);
     let primary_xid = 0x5100;
     bind_test_randr_crtc(&mut b, 0, primary_xid);
@@ -31377,7 +31528,7 @@ fn present_randr_crtc_routes_equal_raw_handles_to_the_owning_device() {
 
 #[test]
 fn present_clock_epoch_changes_on_route_removal_and_readd() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc_id = 0x5200;
     bind_test_randr_crtc(&mut b, 0, crtc_id);
     let first = b.present_crtc_clock_epoch(crtc_id);
@@ -31404,7 +31555,7 @@ fn present_clock_epoch_changes_on_route_removal_and_readd() {
 
 #[test]
 fn off_randr_crtc_has_no_present_domain_or_direct_path() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc_id = 0x5300;
     b.crtc_key_by_id
         .insert(crtc_id, test_output_key(0, "not-live"));
@@ -31425,7 +31576,7 @@ fn off_randr_crtc_has_no_present_domain_or_direct_path() {
 /// clock). Neither arm may issue the ioctl while the outputs are off.
 #[test]
 fn vblank_arms_skip_the_ioctl_while_outputs_are_off() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let primary = output_crtc_key(&b, 0);
     b.kms_outputs_active = false;
     let mut calls = 0u32;
@@ -31460,7 +31611,7 @@ fn vblank_arms_skip_the_ioctl_while_outputs_are_off() {
 
 #[test]
 fn arm_idle_vblanks_with_empty_targets_is_noop() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let primary = output_crtc_key(&b, 0);
     let mut calls = 0u32;
     let armed = b
@@ -31476,7 +31627,7 @@ fn arm_idle_vblanks_with_empty_targets_is_noop() {
 
 #[test]
 fn arm_idle_vblanks_with_arms_primary_once_then_dedups() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let primary = output_crtc_key(&b, 0);
     let mut calls = 0u32;
 
@@ -31503,7 +31654,7 @@ fn arm_idle_vblanks_with_arms_primary_once_then_dedups() {
 
 #[test]
 fn arm_idle_vblanks_skips_an_unsupported_selected_device() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let primary = output_crtc_key(&b, 0);
     push_test_output(&mut b, 2);
     b.platform.outputs[1].key.device_key = test_device_key(1);
@@ -31536,7 +31687,7 @@ fn arm_idle_vblanks_skips_an_unsupported_selected_device() {
 
 #[test]
 fn arm_idle_vblanks_transient_error_does_not_cross_domains() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let primary = output_crtc_key(&b, 0);
     push_test_output(&mut b, 2);
     b.platform.outputs[1].key.device_key = test_device_key(1);
@@ -31558,7 +31709,7 @@ fn arm_idle_vblanks_transient_error_does_not_cross_domains() {
 
 #[test]
 fn arm_idle_vblanks_with_scanout_disallowed_clears_and_returns_zero() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let primary = output_crtc_key(&b, 0);
     b.armed_vblank_targets.insert(primary, 0);
     b.vt_state = crate::vt::state::VtState::Suspended;
@@ -31582,13 +31733,13 @@ fn arm_idle_vblanks_with_scanout_disallowed_clears_and_returns_zero() {
 
 #[test]
 fn absolute_vblank_targets_starts_empty() {
-    let b = super::KmsBackend::for_tests();
+    let b = crate::kms::render::backend::KmsBackend::for_tests();
     assert!(b.absolute_vblank_targets.is_empty());
 }
 
 #[test]
 fn tagged_sequence_event_does_not_clear_relative_slot() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc = b.platform.outputs[0].output.crtc;
     let crtc_id = u32::from(crtc);
     let crtc_key = output_crtc_key(&b, 0);
@@ -31601,7 +31752,7 @@ fn tagged_sequence_event_does_not_clear_relative_slot() {
     // Tagged (absolute) event for the same CRTC.
     dispatch_test_sequence(
         &mut b,
-        super::ABSOLUTE_SEQ_TAG | u64::from(crtc_id),
+        crate::kms::render::backend::ABSOLUTE_SEQ_TAG | u64::from(crtc_id),
         1_000_000,
         50,
     );
@@ -31614,7 +31765,7 @@ fn tagged_sequence_event_does_not_clear_relative_slot() {
 
 #[test]
 fn untagged_sequence_event_does_not_retire_absolute_targets() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc = b.platform.outputs[0].output.crtc;
     let crtc_id = u32::from(crtc);
     let crtc_key = output_crtc_key(&b, 0);
@@ -31636,7 +31787,7 @@ fn untagged_sequence_event_does_not_retire_absolute_targets() {
 
 #[test]
 fn tagged_sequence_event_retires_targets_at_or_before_sequence_keeps_later() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc = b.platform.outputs[0].output.crtc;
     let crtc_id = u32::from(crtc);
     let crtc_key = output_crtc_key(&b, 0);
@@ -31647,7 +31798,7 @@ fn tagged_sequence_event_retires_targets_at_or_before_sequence_keeps_later() {
 
     dispatch_test_sequence(
         &mut b,
-        super::ABSOLUTE_SEQ_TAG | u64::from(crtc_id),
+        crate::kms::render::backend::ABSOLUTE_SEQ_TAG | u64::from(crtc_id),
         1_000_000,
         50,
     );
@@ -31667,7 +31818,7 @@ fn tagged_sequence_event_retires_targets_at_or_before_sequence_keeps_later() {
 
 #[test]
 fn absolute_seq_user_data_round_trips_through_on_crtc_sequence_event() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc = b.platform.outputs[0].output.crtc;
     let crtc_id = u32::from(crtc);
     let crtc_key = output_crtc_key(&b, 0);
@@ -31681,7 +31832,7 @@ fn absolute_seq_user_data_round_trips_through_on_crtc_sequence_event() {
     // ioctl, pinning that producer and consumer agree on the encoding.
     dispatch_test_sequence(
         &mut b,
-        super::absolute_seq_user_data(crtc_id),
+        crate::kms::render::backend::absolute_seq_user_data(crtc_id),
         1_000_000,
         50,
     );
@@ -31698,7 +31849,7 @@ fn absolute_seq_user_data_round_trips_through_on_crtc_sequence_event() {
 
 #[test]
 fn clear_all_armed_vblank_targets_clears_absolute_targets_too() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc_key = output_crtc_key(&b, 0);
     b.armed_vblank_targets.insert(crtc_key, 0);
     b.absolute_vblank_targets
@@ -31714,7 +31865,7 @@ fn clear_all_armed_vblank_targets_clears_absolute_targets_too() {
 
 #[test]
 fn arm_present_absolute_vblank_with_dedups_same_target_one_kernel_call() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc_key = output_crtc_key(&b, 0);
     let mut calls = 0u32;
 
@@ -31756,7 +31907,7 @@ fn arm_present_absolute_vblank_with_dedups_same_target_one_kernel_call() {
 
 #[test]
 fn arm_present_absolute_vblank_false_result_is_not_tracked_as_covered() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc_key = output_crtc_key(&b, 0);
     let mut calls = 0;
 
@@ -31775,7 +31926,7 @@ fn arm_present_absolute_vblank_false_result_is_not_tracked_as_covered() {
 /// Push a second live output onto the fixture, with its own selected raw
 /// CRTC handle. Mirrors `PlatformBackend::for_tests()`'s single-output
 /// literal.
-pub(super) fn push_test_output(b: &mut super::KmsBackend, crtc_id: u32) {
+pub(super) fn push_test_output(b: &mut crate::kms::render::backend::KmsBackend, crtc_id: u32) {
     use crate::kms::backend::ActiveOutput;
     let device_key = b
         .platform
@@ -31837,7 +31988,7 @@ pub(super) fn push_test_output(b: &mut super::KmsBackend, crtc_id: u32) {
 }
 
 pub(super) fn install_direct_frame_for_target_test(
-    b: &mut super::KmsBackend,
+    b: &mut crate::kms::render::backend::KmsBackend,
     target_xid: u32,
     fallback_id: crate::kms::render::store::DrawableId,
     current: bool,
@@ -31899,7 +32050,7 @@ pub(super) fn install_direct_frame_for_target_test(
         explicit_sync: false,
         options: 0,
     };
-    let frame = super::DirectPresentFrame {
+    let frame = crate::kms::render::backend::DirectPresentFrame {
         source_pin,
         fallback_target_pin,
         source_id,
@@ -31944,7 +32095,7 @@ pub(super) fn install_direct_frame_for_target_test(
 
 #[test]
 fn destroy_subwindow_without_direct_frame_does_not_request_unflip() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let target_xid = 0x5600;
     let target_id = seed_window(&mut b, target_xid, None, 0, 0);
 
@@ -31960,7 +32111,7 @@ fn destroy_subwindow_without_direct_frame_does_not_request_unflip() {
 
 #[test]
 fn destroy_unrelated_subwindow_keeps_direct_scanout_active() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let target_xid = 0x5680;
     let unrelated_xid = 0x5690;
     let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
@@ -31983,7 +32134,7 @@ fn destroy_unrelated_subwindow_keeps_direct_scanout_active() {
 
 #[test]
 fn destroy_subwindow_requests_pending_direct_unflip_without_releasing_pins() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let target_xid = 0x5700;
     let target_id = seed_window(&mut b, target_xid, None, 0, 0);
     b.get_overlay_window(None).expect("materialize COW");
@@ -32016,7 +32167,7 @@ fn destroy_subwindow_requests_pending_direct_unflip_without_releasing_pins() {
 
 #[test]
 fn destroy_subwindow_retires_current_direct_idle_once_after_replacement() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let target_xid = 0x5800;
     let target_id = seed_window(&mut b, target_xid, None, 0, 0);
     b.get_overlay_window(None).expect("materialize COW");
@@ -32052,7 +32203,7 @@ fn destroy_subwindow_retires_current_direct_idle_once_after_replacement() {
 
 #[test]
 fn final_cow_release_defers_storage_until_direct_replacement() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let target_xid = 0x5900;
     let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
     b.get_overlay_window(None).expect("materialize COW");
@@ -32093,7 +32244,7 @@ fn final_cow_release_defers_storage_until_direct_replacement() {
 
 #[test]
 fn final_cow_release_materialization_failure_keeps_cow_and_pins() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let target_xid = 0x5a00;
     let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
     b.get_overlay_window(None).expect("materialize COW");
@@ -32122,7 +32273,7 @@ fn final_cow_release_materialization_failure_keeps_cow_and_pins() {
 
 #[test]
 fn get_cow_during_deferred_release_reuses_backend_identity() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let target_xid = 0x5b00;
     let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
     b.get_overlay_window(None).expect("materialize COW");
@@ -32143,7 +32294,7 @@ fn get_cow_during_deferred_release_reuses_backend_identity() {
 
 #[test]
 fn unmap_subwindow_requests_direct_unflip_without_releasing_pins() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let target_xid = 0x5c00;
     let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
     b.get_overlay_window(None).expect("materialize COW");
@@ -32163,7 +32314,7 @@ fn unmap_subwindow_requests_direct_unflip_without_releasing_pins() {
 
 #[test]
 fn unmap_unrelated_subwindow_keeps_direct_scanout_active() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let target_xid = 0x5c40;
     let unrelated_xid = 0x5c50;
     let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
@@ -32185,7 +32336,7 @@ fn unmap_unrelated_subwindow_keeps_direct_scanout_active() {
 
 #[test]
 fn map_subwindow_requests_direct_unflip_without_releasing_pins() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let target_xid = 0x5c80;
     let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
     b.windows
@@ -32209,7 +32360,7 @@ fn map_subwindow_requests_direct_unflip_without_releasing_pins() {
 
 #[test]
 fn map_unrelated_subwindow_keeps_direct_scanout_active() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let target_xid = 0x5cc0;
     let unrelated_xid = 0x5cd0;
     let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
@@ -32237,7 +32388,7 @@ fn map_unrelated_subwindow_keeps_direct_scanout_active() {
 fn configure_subwindow_requests_direct_unflip_without_releasing_pins() {
     use yserver_core::host_x11::HostSubwindowConfig;
 
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let target_xid = 0x5d00;
     let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
     b.get_overlay_window(None).expect("materialize COW");
@@ -32271,7 +32422,7 @@ fn configure_subwindow_requests_direct_unflip_without_releasing_pins() {
 fn configure_unrelated_subwindow_keeps_direct_scanout_active() {
     use yserver_core::host_x11::HostSubwindowConfig;
 
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let target_xid = 0x5d80;
     let unrelated_xid = 0x5d90;
     let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
@@ -32305,7 +32456,7 @@ fn configure_unrelated_subwindow_keeps_direct_scanout_active() {
 
 #[test]
 fn logical_resize_keeps_old_cow_pinned_until_direct_replacement() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let target_xid = 0x5e00;
     let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
     b.get_overlay_window(None).expect("materialize COW");
@@ -32344,7 +32495,7 @@ fn logical_resize_keeps_old_cow_pinned_until_direct_replacement() {
 
 #[test]
 fn logical_resize_materialization_failure_preserves_old_dimensions_and_cow() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let target_xid = 0x5f00;
     let _target_id = seed_window(&mut b, target_xid, None, 0, 0);
     b.get_overlay_window(None).expect("materialize COW");
@@ -32380,7 +32531,7 @@ fn logical_resize_materialization_failure_preserves_old_dimensions_and_cow() {
 
 #[test]
 fn direct_scanout_topology_requires_one_drm_device() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     push_test_output(&mut b, 2);
     assert!(
         b.direct_scanout_topology_eligible(),
@@ -32401,7 +32552,7 @@ fn grouped_direct_waits_all_outputs_and_uses_selected_reference_sample() {
         PresentWake,
     };
 
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     push_test_output(&mut b, 2);
     b.scanout_m2.cursor_bound_all = true;
 
@@ -32446,7 +32597,7 @@ fn grouped_direct_waits_all_outputs_and_uses_selected_reference_sample() {
         completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
         emit_idle: true,
     };
-    b.scanout_m2.pending = Some(super::DirectPresentFrame {
+    b.scanout_m2.pending = Some(crate::kms::render::backend::DirectPresentFrame {
         source_pin: 1,
         fallback_target_pin: 2,
         source_id,
@@ -32501,7 +32652,7 @@ fn grouped_direct_waits_all_outputs_and_uses_selected_reference_sample() {
 fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
     use yserver_core::backend::{PresentClockSample, PresentClockSource};
 
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     b.scanout_m2.test_submit_direct_without_drm = true;
     b.scanout_m2.cursor_bound_all = true;
     let fallback_id = seed_window(&mut b, 0x6a00, None, 0, 0);
@@ -32609,7 +32760,7 @@ fn async_fullscreen_direct_successors_coalesce_until_flip_retirement() {
 
 #[test]
 fn direct_scanout_topology_rejects_heterogeneous_refresh() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     push_test_output(&mut b, 2);
     b.platform.outputs[1].output.picked.vrefresh = 75;
 
@@ -32621,7 +32772,7 @@ fn direct_scanout_topology_rejects_heterogeneous_refresh() {
 
 #[test]
 fn direct_scanout_topology_compares_precise_fractional_timings() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     push_test_output(&mut b, 2);
     let timing = crate::platform::drm::Mode {
         name: "1920x1080".to_string(),
@@ -32659,21 +32810,25 @@ fn direct_scanout_refresh_comparison_accounts_for_scan_multipliers() {
     let mut adjusted = base.clone();
 
     adjusted.flags = 1 << 4; // interlace doubles the effective rate
-    assert!(!super::effective_refresh_matches(&base, &adjusted));
+    assert!(!crate::kms::render::backend::effective_refresh_matches(
+        &base, &adjusted
+    ));
 
     adjusted.flags |= 1 << 5; // doublescan divides it back by two
-    assert!(super::effective_refresh_matches(&base, &adjusted));
+    assert!(crate::kms::render::backend::effective_refresh_matches(
+        &base, &adjusted
+    ));
 
     adjusted.vscan = 2;
     assert!(
-        !super::effective_refresh_matches(&base, &adjusted),
+        !crate::kms::render::backend::effective_refresh_matches(&base, &adjusted),
         "vscan > 1 divides the effective refresh"
     );
 }
 
 #[test]
 fn arm_present_absolute_vblank_with_arms_only_selected_crtc() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc0 = output_crtc_key(&b, 0);
     push_test_output(&mut b, 2);
     let crtc1 = output_crtc_key(&b, 1);
@@ -32706,7 +32861,7 @@ fn arm_present_absolute_vblank_with_arms_only_selected_crtc() {
 
 #[test]
 fn arm_present_absolute_vblank_with_uses_selected_crtc_before_first_sample() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let first = output_crtc_key(&b, 0);
     assert!(b.platform.ust_msc.is_empty());
 
@@ -32727,23 +32882,17 @@ fn arm_present_absolute_vblank_with_uses_selected_crtc_before_first_sample() {
 
 #[test]
 fn phase_b_flip_visibility_includes_all_scanout_transactions() {
-    assert!(super::phase_b_flip_in_flight_for_scheduler(
-        true, false, false
-    ));
-    assert!(super::phase_b_flip_in_flight_for_scheduler(
-        false, true, false
-    ));
-    assert!(super::phase_b_flip_in_flight_for_scheduler(
-        false, false, true
-    ));
-    assert!(!super::phase_b_flip_in_flight_for_scheduler(
-        false, false, false
-    ));
+    assert!(crate::kms::render::backend::phase_b_flip_in_flight_for_scheduler(true, false, false));
+    assert!(crate::kms::render::backend::phase_b_flip_in_flight_for_scheduler(false, true, false));
+    assert!(crate::kms::render::backend::phase_b_flip_in_flight_for_scheduler(false, false, true));
+    assert!(
+        !crate::kms::render::backend::phase_b_flip_in_flight_for_scheduler(false, false, false)
+    );
 }
 
 #[test]
 fn present_flip_in_flight_mirrors_scene_state() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc_id = 0x5000;
     bind_test_randr_crtc(&mut b, 0, crtc_id);
     assert!(
@@ -32766,7 +32915,7 @@ fn present_flip_in_flight_mirrors_scene_state() {
 
 #[test]
 fn present_display_idle_false_when_scene_wants_compose_even_with_no_flips() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc_id = 0x5000;
     bind_test_randr_crtc(&mut b, 0, crtc_id);
     assert!(!b.present_flip_in_flight(crtc_id), "no flip in flight");
@@ -32780,7 +32929,7 @@ fn present_display_idle_false_when_scene_wants_compose_even_with_no_flips() {
 
 #[test]
 fn present_scanout_blackout_true_when_kms_outputs_active_false_even_while_scanout_allowed() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     assert!(b.scanout_allowed(), "VT is Active in the test fixture");
     assert!(!b.present_scanout_blackout(), "not blacked out initially");
 
@@ -32796,17 +32945,17 @@ fn present_scanout_blackout_true_when_kms_outputs_active_false_even_while_scanou
 
 #[test]
 fn crtc_enable_from_zero_outputs_opens_kms_output_gate() {
-    assert!(super::kms_outputs_active_after_crtc_config(false, true, 1));
+    assert!(crate::kms::render::backend::kms_outputs_active_after_crtc_config(false, true, 1));
 }
 
 #[test]
 fn crtc_disable_last_output_closes_kms_output_gate() {
-    assert!(!super::kms_outputs_active_after_crtc_config(true, false, 0));
+    assert!(!crate::kms::render::backend::kms_outputs_active_after_crtc_config(true, false, 0));
 }
 
 #[test]
 fn headless_output_inventory_keeps_present_in_blackout() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     b.platform.outputs.clear();
     b.kms_outputs_active = !b.platform.outputs.is_empty();
 
@@ -32819,7 +32968,7 @@ fn headless_output_inventory_keeps_present_in_blackout() {
 
 #[test]
 fn zero_device_backend_disables_dri3_and_vblank_arms() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     b.platform.devices.clear();
     b.platform.outputs.clear();
     b.kms_outputs_active = false;
@@ -32846,7 +32995,7 @@ fn pin_present_source_survives_by_xid_invalidation() {
 
     use crate::kms::render::store::DrawableKind;
 
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let xid: u32 = 0xCAFE_1234;
     let storage = Storage::for_tests_null(
         vk::Extent2D {
@@ -32891,7 +33040,7 @@ fn pin_present_source_survives_by_xid_invalidation() {
 
 #[test]
 fn pin_present_source_unknown_xid_returns_none() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     assert!(b.pin_present_source(0xDEAD_0000).is_none());
 }
 
@@ -32899,22 +33048,22 @@ fn pin_present_source_unknown_xid_returns_none() {
 fn scanout_m0_classifies_root_and_per_output_geometry() {
     let outputs = [(0, 0, 1920, 1080), (1920, 0, 2560, 1440)];
     assert_eq!(
-        super::classify_scanout_m0_coverage(
+        crate::kms::render::backend::classify_scanout_m0_coverage(
             Some((0, 0, 4480, 1440)),
             (4480, 1440),
             (4480, 1440),
             &outputs,
         ),
-        super::ScanoutM0Coverage::Root,
+        crate::kms::render::backend::ScanoutM0Coverage::Root,
     );
     assert_eq!(
-        super::classify_scanout_m0_coverage(
+        crate::kms::render::backend::classify_scanout_m0_coverage(
             Some((1920, 0, 2560, 1440)),
             (2560, 1440),
             (4480, 1440),
             &outputs,
         ),
-        super::ScanoutM0Coverage::Output(1),
+        crate::kms::render::backend::ScanoutM0Coverage::Output(1),
     );
 }
 
@@ -32922,24 +33071,29 @@ fn scanout_m0_classifies_root_and_per_output_geometry() {
 fn scanout_m0_rejects_geometry_or_source_extent_mismatch() {
     let outputs = [(0, 0, 1920, 1080)];
     assert_eq!(
-        super::classify_scanout_m0_coverage(
+        crate::kms::render::backend::classify_scanout_m0_coverage(
             Some((0, 0, 1920, 1080)),
             (1280, 720),
             (1920, 1080),
             &outputs,
         ),
-        super::ScanoutM0Coverage::None,
+        crate::kms::render::backend::ScanoutM0Coverage::None,
     );
     assert_eq!(
-        super::classify_scanout_m0_coverage(None, (1920, 1080), (1920, 1080), &outputs),
-        super::ScanoutM0Coverage::None,
+        crate::kms::render::backend::classify_scanout_m0_coverage(
+            None,
+            (1920, 1080),
+            (1920, 1080),
+            &outputs
+        ),
+        crate::kms::render::backend::ScanoutM0Coverage::None,
     );
 }
 
 #[test]
 fn scanout_m1_accepts_exact_dual_head_root_tiling() {
     let outputs = [
-        super::ScanoutM1OutputGeometry {
+        crate::kms::render::backend::ScanoutM1OutputGeometry {
             x: 0,
             y: 0,
             width: 2560,
@@ -32947,7 +33101,7 @@ fn scanout_m1_accepts_exact_dual_head_root_tiling() {
             mode_width: 2560,
             mode_height: 1440,
         },
-        super::ScanoutM1OutputGeometry {
+        crate::kms::render::backend::ScanoutM1OutputGeometry {
             x: 2560,
             y: 0,
             width: 2560,
@@ -32956,12 +33110,15 @@ fn scanout_m1_accepts_exact_dual_head_root_tiling() {
             mode_height: 1440,
         },
     ];
-    assert!(super::scanout_m1_outputs_cover_root((5120, 1440), &outputs));
+    assert!(crate::kms::render::backend::scanout_m1_outputs_cover_root(
+        (5120, 1440),
+        &outputs
+    ));
 }
 
 #[test]
 fn scanout_m1_rejects_gap_overlap_bounds_and_mode_mismatch() {
-    let output = |x, width, mode_width| super::ScanoutM1OutputGeometry {
+    let output = |x, width, mode_width| crate::kms::render::backend::ScanoutM1OutputGeometry {
         x,
         y: 0,
         width,
@@ -32969,19 +33126,19 @@ fn scanout_m1_rejects_gap_overlap_bounds_and_mode_mismatch() {
         mode_width,
         mode_height: 1440,
     };
-    assert!(!super::scanout_m1_outputs_cover_root(
+    assert!(!crate::kms::render::backend::scanout_m1_outputs_cover_root(
         (5120, 1440),
         &[output(0, 2500, 2500), output(2560, 2560, 2560)],
     ));
-    assert!(!super::scanout_m1_outputs_cover_root(
+    assert!(!crate::kms::render::backend::scanout_m1_outputs_cover_root(
         (5120, 1440),
         &[output(0, 2600, 2600), output(2560, 2560, 2560)],
     ));
-    assert!(!super::scanout_m1_outputs_cover_root(
+    assert!(!crate::kms::render::backend::scanout_m1_outputs_cover_root(
         (5120, 1440),
         &[output(-1, 2560, 2560), output(2560, 2560, 2560)],
     ));
-    assert!(!super::scanout_m1_outputs_cover_root(
+    assert!(!crate::kms::render::backend::scanout_m1_outputs_cover_root(
         (5120, 1440),
         &[output(0, 2560, 1920), output(2560, 2560, 2560)],
     ));
@@ -32991,7 +33148,7 @@ fn scanout_m1_rejects_gap_overlap_bounds_and_mode_mismatch() {
 fn scanout_m1_redirected_game_and_region_present_never_reach_probe_cache() {
     use yserver_core::backend::PresentScanoutCandidate;
 
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let crtc_id = 0x5500;
     bind_test_randr_crtc(&mut b, 0, crtc_id);
     let candidate = PresentScanoutCandidate {
@@ -33016,14 +33173,14 @@ fn scanout_m1_redirected_game_and_region_present_never_reach_probe_cache() {
     };
     b.maybe_probe_scanout_m1(
         Some(crate::kms::render::store::DrawableId::for_tests(99)),
-        super::ScanoutM0Target::Other,
-        super::ScanoutM0Coverage::Output(0),
+        crate::kms::render::backend::ScanoutM0Target::Other,
+        crate::kms::render::backend::ScanoutM0Coverage::Output(0),
         candidate,
     );
     b.maybe_probe_scanout_m1(
         Some(crate::kms::render::store::DrawableId::for_tests(100)),
-        super::ScanoutM0Target::CowDescendant,
-        super::ScanoutM0Coverage::Root,
+        crate::kms::render::backend::ScanoutM0Target::CowDescendant,
+        crate::kms::render::backend::ScanoutM0Coverage::Root,
         PresentScanoutCandidate {
             valid_region_xid: 0xDEAD,
             ..candidate
@@ -33037,8 +33194,8 @@ fn scanout_m1_redirected_game_and_region_present_never_reach_probe_cache() {
 
 #[test]
 fn scanout_m1_probe_eligible_accepts_unredirected_fullscreen() {
-    use super::{ScanoutM0Coverage, ScanoutM0Target};
-    assert!(super::scanout_m1_probe_eligible(
+    use crate::kms::render::backend::{ScanoutM0Coverage, ScanoutM0Target};
+    assert!(crate::kms::render::backend::scanout_m1_probe_eligible(
         true,
         true,
         true,
@@ -33049,7 +33206,7 @@ fn scanout_m1_probe_eligible_accepts_unredirected_fullscreen() {
         0,
         0,
     ));
-    assert!(!super::scanout_m1_probe_eligible(
+    assert!(!crate::kms::render::backend::scanout_m1_probe_eligible(
         true,
         true,
         true,
@@ -33060,7 +33217,7 @@ fn scanout_m1_probe_eligible_accepts_unredirected_fullscreen() {
         0,
         0,
     ));
-    assert!(!super::scanout_m1_probe_eligible(
+    assert!(!crate::kms::render::backend::scanout_m1_probe_eligible(
         true,
         true,
         true,
@@ -33071,7 +33228,7 @@ fn scanout_m1_probe_eligible_accepts_unredirected_fullscreen() {
         0,
         0,
     ));
-    assert!(!super::scanout_m1_probe_eligible(
+    assert!(!crate::kms::render::backend::scanout_m1_probe_eligible(
         true,
         true,
         false,
@@ -33086,48 +33243,55 @@ fn scanout_m1_probe_eligible_accepts_unredirected_fullscreen() {
 
 #[test]
 fn scanout_m2_only_authoritative_root_present_invalidates_direct_frame() {
-    use super::ScanoutM0Target;
+    use crate::kms::render::backend::ScanoutM0Target;
 
-    assert!(super::scanout_m2_is_authoritative_root(
-        ScanoutM0Target::Cow,
-        true
-    ));
-    assert!(super::scanout_m2_is_authoritative_root(
-        ScanoutM0Target::CowDescendant,
-        true
-    ));
-    assert!(!super::scanout_m2_is_authoritative_root(
-        ScanoutM0Target::CowDescendant,
-        false
-    ));
-    assert!(super::scanout_m2_is_authoritative_root(
-        ScanoutM0Target::Unredirected,
-        true
-    ));
-    assert!(!super::scanout_m2_is_authoritative_root(
-        ScanoutM0Target::Other,
-        false
-    ));
+    assert!(
+        crate::kms::render::backend::scanout_m2_is_authoritative_root(ScanoutM0Target::Cow, true)
+    );
+    assert!(
+        crate::kms::render::backend::scanout_m2_is_authoritative_root(
+            ScanoutM0Target::CowDescendant,
+            true
+        )
+    );
+    assert!(
+        !crate::kms::render::backend::scanout_m2_is_authoritative_root(
+            ScanoutM0Target::CowDescendant,
+            false
+        )
+    );
+    assert!(
+        crate::kms::render::backend::scanout_m2_is_authoritative_root(
+            ScanoutM0Target::Unredirected,
+            true
+        )
+    );
+    assert!(
+        !crate::kms::render::backend::scanout_m2_is_authoritative_root(
+            ScanoutM0Target::Other,
+            false
+        )
+    );
 }
 
 #[test]
 fn scanout_direct_eligible_accepts_fullscreen_game_candidate() {
-    assert!(super::scanout_direct_eligible(
+    assert!(crate::kms::render::backend::scanout_direct_eligible(
         true, true, true, true, true, true, 0, 0, 0
     ));
-    assert!(!super::scanout_direct_eligible(
+    assert!(!crate::kms::render::backend::scanout_direct_eligible(
         true, true, true, true, false, true, 0, 0, 0
     ));
-    assert!(!super::scanout_direct_eligible(
+    assert!(!crate::kms::render::backend::scanout_direct_eligible(
         true, true, false, true, true, true, 0, 0, 0
     ));
-    assert!(!super::scanout_direct_eligible(
+    assert!(!crate::kms::render::backend::scanout_direct_eligible(
         true, true, true, true, true, true, 1, 0, 0
     ));
 }
 
 /// A root-sized stage under the COW, as muffin lays it out.
-fn seed_cow_stage(b: &mut super::KmsBackend, stage: u32) -> (u32, u32) {
+fn seed_cow_stage(b: &mut crate::kms::render::backend::KmsBackend, stage: u32) -> (u32, u32) {
     let cow = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
     let (w, h) = (b.platform.fb_w, b.platform.fb_h);
     let root_window = b.core.window_id;
@@ -33152,7 +33316,7 @@ fn direct_shape_chain_requires_every_shape_to_cover_the_root() {
 
     let cow = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
     let stage = 0x0040_0003;
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let root = seed_cow_stage(&mut b, stage);
     let (w, h) = (
         u16::try_from(root.0).unwrap(),
@@ -33165,7 +33329,8 @@ fn direct_shape_chain_requires_every_shape_to_cover_the_root() {
         height: h,
     };
     let half = i16::try_from(w / 2).unwrap();
-    let covers = |b: &super::KmsBackend| b.direct_shape_chain_covers_root(stage, root);
+    let covers =
+        |b: &crate::kms::render::backend::KmsBackend| b.direct_shape_chain_covers_root(stage, root);
 
     assert!(covers(&b), "unshaped chain");
     b.core.shape_bounding.insert(cow, Vec::new());
@@ -33202,7 +33367,7 @@ fn an_empty_cow_bounding_shape_unflips_the_direct_stage_frame() {
 
     let cow = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
     let (stage, source) = (0x0040_0003, 0x0040_0007);
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let (w, h) = seed_cow_stage(&mut b, stage);
     seed_window(&mut b, source, None, 0, 0);
     let (w, h) = (u16::try_from(w).unwrap(), u16::try_from(h).unwrap());
@@ -33238,28 +33403,32 @@ fn an_empty_cow_bounding_shape_unflips_the_direct_stage_frame() {
 /// the window's OUTER origin (`composite/compalloc.c:610`).
 #[test]
 fn scanout_direct_eligible_rejects_bordered_candidate() {
-    assert!(!super::scanout_direct_eligible(
+    assert!(!crate::kms::render::backend::scanout_direct_eligible(
         true, true, true, true, true, false, 0, 0, 0
     ));
 }
 
 #[test]
 fn scanout_m2_authoritative_root_accepts_unredirected_fullscreen() {
-    use super::ScanoutM0Target;
-    assert!(super::scanout_m2_is_authoritative_root(
-        ScanoutM0Target::Unredirected,
-        true
-    ));
-    assert!(!super::scanout_m2_is_authoritative_root(
-        ScanoutM0Target::Unredirected,
-        false
-    ));
+    use crate::kms::render::backend::ScanoutM0Target;
+    assert!(
+        crate::kms::render::backend::scanout_m2_is_authoritative_root(
+            ScanoutM0Target::Unredirected,
+            true
+        )
+    );
+    assert!(
+        !crate::kms::render::backend::scanout_m2_is_authoritative_root(
+            ScanoutM0Target::Unredirected,
+            false
+        )
+    );
 }
 
 #[test]
 fn scanout_m2_requires_stable_eligible_root_stream_before_entry() {
-    let mut state = super::ScanoutM2State::new();
-    for _ in 1..super::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION {
+    let mut state = crate::kms::render::backend::ScanoutM2State::new();
+    for _ in 1..crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION {
         assert!(!state.admit_eligible_root());
     }
     assert!(state.admit_eligible_root());
@@ -33271,9 +33440,9 @@ fn scanout_m2_requires_stable_eligible_root_stream_before_entry() {
 
 #[test]
 fn scanout_m2_ineligible_root_resets_short_eligible_bursts() {
-    let mut state = super::ScanoutM2State::new();
+    let mut state = crate::kms::render::backend::ScanoutM2State::new();
     for _ in 0..16 {
-        for _ in 0..(super::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1) {
+        for _ in 0..(crate::kms::render::backend::SCANOUT_M2_ELIGIBLE_ROOT_PROBATION - 1) {
             assert!(!state.admit_eligible_root());
         }
         state.reset_eligible_root_probation();
@@ -33282,7 +33451,7 @@ fn scanout_m2_ineligible_root_resets_short_eligible_bursts() {
 
 #[test]
 fn active_direct_scanout_unflips_on_cursor_output_fallback() {
-    let mut backend = super::KmsBackend::for_tests();
+    let mut backend = crate::kms::render::backend::KmsBackend::for_tests();
     backend.scanout_m2.test_force_active = true;
     backend.handle_cursor_move_outcome(crate::kms::render::platform::CursorMoveOutcome {
         ebusy_count: 0,
@@ -33295,7 +33464,7 @@ fn active_direct_scanout_unflips_on_cursor_output_fallback() {
 
 #[test]
 fn active_direct_scanout_unflips_and_wakes_for_cursor_rollback_retry() {
-    let mut backend = super::KmsBackend::for_tests();
+    let mut backend = crate::kms::render::backend::KmsBackend::for_tests();
     backend.scene.scene_structure_dirty = false;
     backend.scanout_m2.test_force_active = true;
     backend.handle_cursor_move_outcome(crate::kms::render::platform::CursorMoveOutcome {
@@ -33310,30 +33479,30 @@ fn active_direct_scanout_unflips_and_wakes_for_cursor_rollback_retry() {
 
 #[test]
 fn scanout_m0_classifies_cow_descendant_and_unredirected_targets() {
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     b.get_overlay_window(None).expect("materialize COW");
     let cow_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
     let cow_id = b.cow_id.expect("COW id");
     assert_eq!(
         b.scanout_m0_target(cow_xid, Some(cow_id), Some(cow_id)),
-        super::ScanoutM0Target::Cow,
+        crate::kms::render::backend::ScanoutM0Target::Cow,
     );
 
     let child_id = seed_window(&mut b, 0xF00D, Some(cow_xid), 0, 0);
     assert_eq!(
         b.scanout_m0_target(0xF00D, Some(child_id), Some(child_id)),
-        super::ScanoutM0Target::CowDescendant,
+        crate::kms::render::backend::ScanoutM0Target::CowDescendant,
     );
 
     let ordinary_id = seed_window(&mut b, 0xCAFE, None, 0, 0);
     assert_eq!(
         b.scanout_m0_target(0xCAFE, Some(ordinary_id), Some(ordinary_id)),
-        super::ScanoutM0Target::Unredirected,
+        crate::kms::render::backend::ScanoutM0Target::Unredirected,
     );
     b.store.set_scene_participating(ordinary_id, false);
     assert_eq!(
         b.scanout_m0_target(0xCAFE, Some(ordinary_id), Some(ordinary_id)),
-        super::ScanoutM0Target::Other,
+        crate::kms::render::backend::ScanoutM0Target::Other,
     );
 }
 
@@ -33343,7 +33512,7 @@ fn scanout_m0_steady_candidate_keeps_one_shape_and_source_record() {
     use ash::vk;
     use yserver_core::backend::PresentScanoutCandidate;
 
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     let dst_id = seed_window(&mut b, 0xD57, None, 0, 0);
     let source_id = b
         .store
@@ -33416,7 +33585,7 @@ fn scanout_m0_shape_ignores_region_xid_identity_but_not_presence() {
     use ash::vk;
     use yserver_core::backend::PresentScanoutCandidate;
 
-    let mut b = super::KmsBackend::for_tests();
+    let mut b = crate::kms::render::backend::KmsBackend::for_tests();
     seed_window(&mut b, 0xD57, None, 0, 0);
     b.store
         .allocate(
