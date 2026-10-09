@@ -1,0 +1,22 @@
+# Phase 1a for pointer_fanout.rs: its inline #[cfg(test)] module(s) go out
+# of line at the same logical paths; production items stay in place.
+source = "crates/yserver-core/src/core_loop/pointer_fanout.rs"
+module = "core_loop::pointer_fanout"
+dir = "crates/yserver-core/src/core_loop/pointer_fanout"
+root_form = "file"
+table = "pointer_fanout.paths"
+
+[[modules]]
+name = ""
+items = [
+  "const *",
+  "enum *",
+  "fn *",
+  "impl ImplicitGrabFanoutInfo",
+  "struct *",
+  "use *",
+]
+
+[[modules]]
+name = "tests"
+items = ["tests::*"]
