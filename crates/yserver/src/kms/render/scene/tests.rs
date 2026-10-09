@@ -628,7 +628,7 @@ fn walk_needed_for_each_input_alone_and_not_otherwise() {
 /// set makes every output walk; nothing armed makes none walk.
 #[test]
 fn pending_presentation_is_decided_per_output_from_retained_pieces() {
-    use super::super::store::DrawableId;
+    use crate::kms::render::store::DrawableId;
     use std::collections::HashSet;
     let a = DrawableId::for_tests(1);
     let b = DrawableId::for_tests(2);
@@ -660,7 +660,7 @@ fn pending_presentation_is_decided_per_output_from_retained_pieces() {
 /// it flips both back.
 #[test]
 fn dormant_only_damage_does_not_walk_until_a_paint_rearms_it() {
-    use super::super::store::{DormantReason, DrawableKind, DrawableStore, Storage};
+    use crate::kms::render::store::{DormantReason, DrawableKind, DrawableStore, Storage};
     let mut store = DrawableStore::new();
     let storage = Storage::for_tests_null(
         vk::Extent2D {
@@ -1025,7 +1025,7 @@ fn stub_scene_is_not_live_and_declines_tick() {
     let mut store = DrawableStore::new();
     let mut platform = PlatformBackend::for_tests();
     let mut telemetry = Telemetry::new();
-    let windows = super::super::backend::WindowsMap::new();
+    let windows = crate::kms::render::backend::WindowsMap::new();
     let err = scene
         .tick(
             &core,
@@ -1583,7 +1583,7 @@ fn culling_drops_draws_outside_the_rect_and_keeps_order() {
 
 fn alloc_stub_window(
     store: &mut DrawableStore,
-    windows: &mut super::super::backend::WindowsMap,
+    windows: &mut crate::kms::render::backend::WindowsMap,
     xid: u32,
     x: i16,
     y: i16,
@@ -1596,7 +1596,7 @@ fn alloc_stub_window(
     // rejects null views. Use a non-zero sentinel handle so the
     // traversal test exercises the recurse logic. The handle
     // never gets passed to Vk because the test never composes.
-    let mut storage = super::super::store::Storage::for_tests_null(
+    let mut storage = crate::kms::render::store::Storage::for_tests_null(
         extent(u32::from(w), u32::from(h)),
         vk::Format::B8G8R8A8_UNORM,
     );
@@ -1615,7 +1615,7 @@ fn alloc_stub_window(
         .expect("stub allocate");
     windows.insert(
         xid,
-        super::super::backend::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -1644,7 +1644,7 @@ fn build_scene_recurses_into_mapped_children() {
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
     let platform = PlatformBackend::for_tests();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
 
     // Top-level @ (50, 60), 200×100.
     alloc_stub_window(
@@ -1717,7 +1717,7 @@ fn build_scene_clips_child_to_parent_bounds() {
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
     let platform = PlatformBackend::for_tests();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
 
     // Small parent @ (100, 100), 10×10 (the holding window).
     alloc_stub_window(
@@ -1805,7 +1805,7 @@ fn build_scene_clips_window_to_shape_bounding() {
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
     let platform = PlatformBackend::for_tests();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
 
     // Top-level @ (50, 60), 200×100.
     alloc_stub_window(
@@ -1893,7 +1893,7 @@ fn build_scene_empty_bounding_emits_no_draw() {
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
     let platform = PlatformBackend::for_tests();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
 
     alloc_stub_window(
         &mut store,
@@ -1935,7 +1935,7 @@ fn build_scene_absent_bounding_emits_full_window() {
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
     let platform = PlatformBackend::for_tests();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
 
     alloc_stub_window(
         &mut store,
@@ -1987,7 +1987,7 @@ fn build_scene_unmapped_parent_hides_subtree() {
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
     let platform = PlatformBackend::for_tests();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
 
     alloc_stub_window(
         &mut store,
@@ -2044,15 +2044,17 @@ fn build_scene_appends_cursor_draw_at_top_of_z() {
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
     let platform = PlatformBackend::for_tests();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
 
     // One mapped top-level so we can verify "cursor is on top".
     alloc_stub_window(&mut store, &mut windows, 0x100, 0, 0, 400, 300, None, true);
     core.top_level_order.push(0x100);
 
     // Allocate a stub cursor storage entry (synthetic xid).
-    let mut storage =
-        super::super::store::Storage::for_tests_null(extent(16, 16), vk::Format::B8G8R8A8_UNORM);
+    let mut storage = crate::kms::render::store::Storage::for_tests_null(
+        extent(16, 16),
+        vk::Format::B8G8R8A8_UNORM,
+    );
     // SAFETY: opaque u64 Vk handle for the cursor's view; the
     // stub Storage's `is_test_stub` flag means Drop won't free
     // it. Stamp both views so scene binds the sample-side.
@@ -2118,7 +2120,7 @@ fn build_scene_automatic_redirect_keeps_window_via_backing_storage() {
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
     let platform = PlatformBackend::for_tests();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
 
     // Window W @ (50, 60), 200×100 — emits at output coords
     // (50, 60) since the test output layout origin is (0, 0).
@@ -2142,8 +2144,10 @@ fn build_scene_automatic_redirect_keeps_window_via_backing_storage() {
     // storage directly; only the peek for B's damage needs the
     // flag, which we toggle below to verify the snapshot path
     // keys off `source_id`.
-    let mut b_storage =
-        super::super::store::Storage::for_tests_null(extent(200, 100), vk::Format::B8G8R8A8_UNORM);
+    let mut b_storage = crate::kms::render::store::Storage::for_tests_null(
+        extent(200, 100),
+        vk::Format::B8G8R8A8_UNORM,
+    );
     let b_view: vk::ImageView = ash::vk::Handle::from_raw(0xB000_BEEF);
     b_storage.image_view = b_view;
     // Stub both views to the same sentinel — see
@@ -2255,7 +2259,7 @@ fn build_scene_skips_manual_redirected_window() {
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
     let platform = PlatformBackend::for_tests();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
 
     // W1 @ (10, 20), 50×40 — Automatic / unredirected
     // (scene_participating=true via `alloc_stub_window`'s
@@ -2363,7 +2367,7 @@ fn build_scene_prunes_descendants_of_manual_redirected_ancestor() {
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
     let platform = PlatformBackend::for_tests();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
 
     // Frame W @ (100, 200), 200×150 — the manually-redirected
     // ancestor (CC's marco-decorated frame in production).
@@ -2421,8 +2425,10 @@ fn build_scene_prunes_descendants_of_manual_redirected_ancestor() {
     // storage; so the child's storage stays stale, and emitting
     // it would muddy the frame_B emit underneath.
     let w_frame_id = store.lookup(0x111).expect("frame lookup");
-    let mut frame_backing =
-        super::super::store::Storage::for_tests_null(extent(200, 150), vk::Format::B8G8R8A8_UNORM);
+    let mut frame_backing = crate::kms::render::store::Storage::for_tests_null(
+        extent(200, 150),
+        vk::Format::B8G8R8A8_UNORM,
+    );
     let frame_backing_view: vk::ImageView = ash::vk::Handle::from_raw(0xBEEF_F111);
     frame_backing.image_view = frame_backing_view;
     frame_backing.sample_view = frame_backing_view;
@@ -2523,7 +2529,7 @@ fn build_scene_emits_automatic_descendant_under_manual_ancestor() {
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
     let platform = PlatformBackend::for_tests();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
 
     // Frame F at (100, 200), 200×150 — Manual-redirected
     // (scene_participating=false) with its own backing F_B.
@@ -2541,8 +2547,10 @@ fn build_scene_emits_automatic_descendant_under_manual_ancestor() {
     core.top_level_order.push(0x111);
     let frame_id = store.lookup(0x111).expect("frame lookup");
 
-    let mut frame_backing =
-        super::super::store::Storage::for_tests_null(extent(200, 150), vk::Format::B8G8R8A8_UNORM);
+    let mut frame_backing = crate::kms::render::store::Storage::for_tests_null(
+        extent(200, 150),
+        vk::Format::B8G8R8A8_UNORM,
+    );
     let frame_backing_view: vk::ImageView = ash::vk::Handle::from_raw(0xBEEF_F000);
     frame_backing.image_view = frame_backing_view;
     frame_backing.sample_view = frame_backing_view;
@@ -2567,8 +2575,10 @@ fn build_scene_emits_automatic_descendant_under_manual_ancestor() {
     );
     let child_id = store.lookup(0x112).expect("child lookup");
 
-    let mut child_backing =
-        super::super::store::Storage::for_tests_null(extent(100, 80), vk::Format::B8G8R8A8_UNORM);
+    let mut child_backing = crate::kms::render::store::Storage::for_tests_null(
+        extent(100, 80),
+        vk::Format::B8G8R8A8_UNORM,
+    );
     let child_backing_view: vk::ImageView = ash::vk::Handle::from_raw(0xBEEF_C000);
     child_backing.image_view = child_backing_view;
     child_backing.sample_view = child_backing_view;
@@ -2638,7 +2648,7 @@ fn build_scene_cow_none_emits_top_levels() {
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
     let platform = PlatformBackend::for_tests();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
 
     // Two mapped top-levels.
     alloc_stub_window(&mut store, &mut windows, 0x100, 0, 0, 100, 80, None, true);
@@ -2725,15 +2735,17 @@ fn build_scene_cow_none_cursor_at_top() {
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
     let platform = PlatformBackend::for_tests();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
 
     // One mapped top-level so the scene has anchor content.
     alloc_stub_window(&mut store, &mut windows, 0x100, 0, 0, 400, 300, None, true);
     core.top_level_order.push(0x100);
 
     // Cursor sprite.
-    let mut cursor_storage =
-        super::super::store::Storage::for_tests_null(extent(16, 16), vk::Format::B8G8R8A8_UNORM);
+    let mut cursor_storage = crate::kms::render::store::Storage::for_tests_null(
+        extent(16, 16),
+        vk::Format::B8G8R8A8_UNORM,
+    );
     let cur2_sentinel: ash::vk::ImageView = ash::vk::Handle::from_raw(0xCAFE_BABE);
     cursor_storage.image_view = cur2_sentinel;
     cursor_storage.sample_view = cur2_sentinel;
@@ -2797,7 +2809,7 @@ fn cow_subtree_draws_inherit_alpha_passthrough_true() {
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
     let platform = PlatformBackend::for_tests();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
 
     // Non-COW top-level W @ (0, 0), 200×200.
     alloc_stub_window(&mut store, &mut windows, 0xA1, 0, 0, 200, 200, None, true);
@@ -2886,7 +2898,7 @@ fn build_scene_does_not_append_cow_after_top_level_walk() {
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
     let platform = PlatformBackend::for_tests();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
 
     let cow_xid: u32 = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
     alloc_stub_window(
@@ -2946,7 +2958,7 @@ fn manual_redirected_top_level_skips_emit_unconditional() {
         let mut core = KmsCore::for_tests();
         let mut store = DrawableStore::new();
         let platform = PlatformBackend::for_tests();
-        let mut windows = super::super::backend::WindowsMap::new();
+        let mut windows = crate::kms::render::backend::WindowsMap::new();
 
         // W with a redirected backing (Manual mode:
         // scene_participating=false). Unique sentinel handle so
@@ -2954,7 +2966,7 @@ fn manual_redirected_top_level_skips_emit_unconditional() {
         let w: u32 = 0xA1;
         alloc_stub_window(&mut store, &mut windows, w, 100, 100, 50, 50, None, true);
         let w_id = store.lookup(w).expect("w lookup");
-        let mut backing = super::super::store::Storage::for_tests_null(
+        let mut backing = crate::kms::render::store::Storage::for_tests_null(
             extent(50, 50),
             PlatformBackend::format_for_depth(24),
         );
@@ -3026,7 +3038,7 @@ fn offscreen_helper_above_fullscreen_still_suppresses_cow() {
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
     let platform = PlatformBackend::for_tests();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
 
     // The unredirected fullscreen window: covers the 800x600 output,
     // opaque (depth != 32), scene-participating (drawn by us).
@@ -3094,7 +3106,7 @@ fn on_output_non_covering_window_above_fullscreen_keeps_cow() {
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
     let platform = PlatformBackend::for_tests();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
 
     let fs: u32 = 0x00F5;
     alloc_stub_window(&mut store, &mut windows, fs, 0, 0, 800, 600, None, true);
@@ -3152,12 +3164,12 @@ fn automatic_redirected_top_level_still_emits() {
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
     let platform = PlatformBackend::for_tests();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
 
     let w: u32 = 0xA2;
     alloc_stub_window(&mut store, &mut windows, w, 100, 100, 50, 50, None, true);
     let w_id = store.lookup(w).expect("w lookup");
-    let mut backing = super::super::store::Storage::for_tests_null(
+    let mut backing = crate::kms::render::store::Storage::for_tests_null(
         extent(50, 50),
         PlatformBackend::format_for_depth(24),
     );
@@ -3226,7 +3238,7 @@ fn compositor_stage_under_cow_emits_via_recursion_and_manual_siblings_skip() {
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
     let platform = PlatformBackend::for_tests();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
 
     // (1) An earlier, ordinary non-COW top-level W @ (0,0), 200×200.
     // Establishes a "before" position to anchor ordering.
@@ -3239,7 +3251,7 @@ fn compositor_stage_under_cow_emits_via_recursion_and_manual_siblings_skip() {
     let s: u32 = 0xC002;
     alloc_stub_window(&mut store, &mut windows, s, 100, 100, 50, 50, None, true);
     let s_id = store.lookup(s).expect("s lookup");
-    let mut s_backing = super::super::store::Storage::for_tests_null(
+    let mut s_backing = crate::kms::render::store::Storage::for_tests_null(
         extent(50, 50),
         PlatformBackend::format_for_depth(24),
     );
@@ -3401,7 +3413,7 @@ fn legacy_emit_window_subtree(
     parent_abs_x: i32,
     parent_abs_y: i32,
     store: &mut DrawableStore,
-    windows: &super::super::backend::WindowsMap,
+    windows: &crate::kms::render::backend::WindowsMap,
     // Per-window SHAPE bounding regions (`KmsCore::shape_bounding`).
     // When a host xid has an entry the window's scene draw is
     // clipped to those rects — marco's rounded-corner frame masks
@@ -3414,7 +3426,7 @@ fn legacy_emit_window_subtree(
     layout_h: u32,
     draws: &mut Vec<CompositeDraw>,
     snapshots: &mut Vec<DamageSnapshot>,
-    sampled_ids: &mut Vec<super::super::store::DrawableId>,
+    sampled_ids: &mut Vec<crate::kms::render::store::DrawableId>,
     projected: &mut RegionSet,
     // Step 2 — one presence per participant that emits, region derived from the
     // draws it pushed. Threaded rather than returned so the recursion can append
@@ -3970,8 +3982,8 @@ fn draw_key(d: &CompositeDraw) -> DrawKey {
 struct WalkOut {
     draws: Vec<DrawKey>,
     participants: Vec<ScenePresence>,
-    sampled: Vec<super::super::store::DrawableId>,
-    snapshots: Vec<(super::super::store::DrawableId, u64)>,
+    sampled: Vec<crate::kms::render::store::DrawableId>,
+    snapshots: Vec<(crate::kms::render::store::DrawableId, u64)>,
     projected: Vec<vk::Rect2D>,
 }
 
@@ -4042,7 +4054,7 @@ fn build_with(
     mode: Visibility,
     core: &KmsCore,
     store: &mut DrawableStore,
-    windows: &super::super::backend::WindowsMap,
+    windows: &crate::kms::render::backend::WindowsMap,
     layout: (i32, i32, u32, u32),
     cow_host_xid: Option<u32>,
 ) -> SceneBuild {
@@ -4067,10 +4079,10 @@ fn build_with_elsewhere(
     mode: Visibility,
     core: &KmsCore,
     store: &mut DrawableStore,
-    windows: &super::super::backend::WindowsMap,
+    windows: &crate::kms::render::backend::WindowsMap,
     layout: (i32, i32, u32, u32),
     cow_host_xid: Option<u32>,
-    elsewhere: &std::collections::HashSet<super::super::store::DrawableId>,
+    elsewhere: &std::collections::HashSet<crate::kms::render::store::DrawableId>,
 ) -> SceneBuild {
     let platform = platform_with_layout(layout);
     build_scene_with(
@@ -4110,7 +4122,7 @@ fn walk_with(
     legacy: bool,
     core: &KmsCore,
     store: &mut DrawableStore,
-    windows: &super::super::backend::WindowsMap,
+    windows: &crate::kms::render::backend::WindowsMap,
     layout: (i32, i32, u32, u32),
     cow_host_xid: Option<u32>,
 ) -> WalkOut {
@@ -4159,7 +4171,7 @@ fn walk_with(
     }
 }
 
-fn set_rank(windows: &mut super::super::backend::WindowsMap, xid: u32, rank: u64) {
+fn set_rank(windows: &mut crate::kms::render::backend::WindowsMap, xid: u32, rank: u64) {
     windows.get_mut(&xid).expect("window present").stack_rank = rank;
 }
 
@@ -4168,9 +4180,11 @@ fn alloc_backing(
     xid: u32,
     w: u32,
     h: u32,
-) -> super::super::store::DrawableId {
-    let mut storage =
-        super::super::store::Storage::for_tests_null(extent(w, h), vk::Format::B8G8R8A8_UNORM);
+) -> crate::kms::render::store::DrawableId {
+    let mut storage = crate::kms::render::store::Storage::for_tests_null(
+        extent(w, h),
+        vk::Format::B8G8R8A8_UNORM,
+    );
     let view: vk::ImageView = ash::vk::Handle::from_raw(u64::from(xid) | 0xB000_0000);
     storage.image_view = view;
     storage.sample_view = view;
@@ -4181,13 +4195,17 @@ fn alloc_backing(
 
 /// The tree every differential case runs on. Ranks are all distinct so
 /// sibling order does not depend on `HashMap` iteration.
-fn differential_fixture() -> (KmsCore, DrawableStore, super::super::backend::WindowsMap) {
+fn differential_fixture() -> (
+    KmsCore,
+    DrawableStore,
+    crate::kms::render::backend::WindowsMap,
+) {
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
     let mut rank = 1u64;
     let mut add = |store: &mut DrawableStore,
-                   windows: &mut super::super::backend::WindowsMap,
+                   windows: &mut crate::kms::render::backend::WindowsMap,
                    xid: u32,
                    x: i16,
                    y: i16,
@@ -4459,7 +4477,7 @@ fn differential_fixture() -> (KmsCore, DrawableStore, super::super::backend::Win
     // A window with geometry but no storage at all.
     windows.insert(
         0x900,
-        super::super::backend::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -4712,7 +4730,7 @@ fn stacks_equal(a: &PixelStack, b: &PixelStack) -> bool {
 fn assert_oracle(
     core: &KmsCore,
     store: &mut DrawableStore,
-    windows: &super::super::backend::WindowsMap,
+    windows: &crate::kms::render::backend::WindowsMap,
     layout: (i32, i32, u32, u32),
     cow: Option<u32>,
     label: &str,
@@ -4740,8 +4758,10 @@ fn assert_oracle(
 
 /// Root drawable at the logical screen size, sampled through a sentinel view.
 fn alloc_root(core: &KmsCore, store: &mut DrawableStore, w: u32, h: u32) {
-    let mut storage =
-        super::super::store::Storage::for_tests_null(extent(w, h), vk::Format::B8G8R8A8_UNORM);
+    let mut storage = crate::kms::render::store::Storage::for_tests_null(
+        extent(w, h),
+        vk::Format::B8G8R8A8_UNORM,
+    );
     let view: ash::vk::ImageView = ash::vk::Handle::from_raw(0x00A0_7000);
     storage.image_view = view;
     storage.sample_view = view;
@@ -4845,10 +4865,14 @@ fn visibility_shows_the_same_pixels_as_the_unclipped_scene() {
 fn two_windows(
     lower: (i16, i16, u16, u16),
     upper: (i16, i16, u16, u16),
-) -> (KmsCore, DrawableStore, super::super::backend::WindowsMap) {
+) -> (
+    KmsCore,
+    DrawableStore,
+    crate::kms::render::backend::WindowsMap,
+) {
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
     alloc_root(&core, &mut store, 800, 600);
     alloc_stub_window(
         &mut store,
@@ -4949,7 +4973,7 @@ fn a_partly_covered_window_emits_only_its_visible_pieces() {
 fn an_empty_parent_shape_suppresses_its_children() {
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
     alloc_root(&core, &mut store, 800, 600);
     alloc_stub_window(
         &mut store,
@@ -4999,7 +5023,7 @@ fn an_empty_parent_shape_suppresses_its_children() {
 fn a_partial_parent_shape_clips_its_children() {
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
     alloc_root(&core, &mut store, 800, 600);
     alloc_stub_window(
         &mut store,
@@ -5063,7 +5087,7 @@ fn a_partial_parent_shape_clips_its_children() {
 fn a_cow_subtree_claims_nothing() {
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
     alloc_root(&core, &mut store, 800, 600);
     alloc_stub_window(
         &mut store,
@@ -5119,7 +5143,7 @@ fn a_cow_subtree_claims_nothing() {
 fn an_opaque_automatic_child_claims_through_a_manual_parent() {
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
     alloc_root(&core, &mut store, 800, 600);
     alloc_stub_window(
         &mut store,
@@ -5240,7 +5264,7 @@ fn straddling_windows_and_layout_origins_sample_the_right_texels() {
 fn a_redirected_backing_larger_than_its_host_is_sampled_unstretched() {
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
     alloc_root(&core, &mut store, 800, 600);
     alloc_stub_window(
         &mut store,
@@ -5294,7 +5318,7 @@ fn a_redirected_backing_larger_than_its_host_is_sampled_unstretched() {
 fn a_collapsed_universe_over_emits_but_shows_the_same_pixels() {
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
     alloc_root(&core, &mut store, 800, 600);
     let mut rank = 1;
     for i in 0..7i16 {
@@ -5437,7 +5461,7 @@ fn off_mode_presences_are_fully_visible() {
 
 // ── Step 1 stage C: content damage clipped to visibility ─────────────
 
-fn drawable_of(store: &DrawableStore, xid: u32) -> super::super::store::DrawableId {
+fn drawable_of(store: &DrawableStore, xid: u32) -> crate::kms::render::store::DrawableId {
     store.lookup(xid).expect("fixture window has a drawable")
 }
 
@@ -5532,7 +5556,7 @@ fn hidden_damage_is_not_presented_so_the_scheduler_can_go_dormant() {
     store.reconcile_offscreen_no_draw(&drawn, &pieces);
     assert_eq!(
         store.get(lower).unwrap().dormant,
-        Some(super::super::store::DormantReason::NoPieces),
+        Some(crate::kms::render::store::DormantReason::NoPieces),
         "flagged out of the scheduler"
     );
     assert!(store.get(upper).unwrap().dormant.is_none());
@@ -5572,7 +5596,7 @@ fn hidden_damage_is_not_presented_so_the_scheduler_can_go_dormant() {
     store.reconcile_offscreen_no_draw(&drawn, &pieces);
     assert_eq!(
         store.get(lower).unwrap().dormant,
-        Some(super::super::store::DormantReason::HiddenDamage)
+        Some(crate::kms::render::store::DormantReason::HiddenDamage)
     );
     assert!(
         !store.has_pending_presentation_damage(),
@@ -5798,9 +5822,9 @@ fn hidden_on_one_output_visible_on_the_other() {
 
 // ── dormancy across outputs that did not walk ────────────────────────
 
-fn set(ids: &[u64]) -> std::collections::HashSet<super::super::store::DrawableId> {
+fn set(ids: &[u64]) -> std::collections::HashSet<crate::kms::render::store::DrawableId> {
     ids.iter()
-        .map(|i| super::super::store::DrawableId::for_tests(*i))
+        .map(|i| crate::kms::render::store::DrawableId::for_tests(*i))
         .collect()
 }
 
@@ -6294,10 +6318,14 @@ fn intersect_rects_clips_and_rejects_disjoint() {
 /// An e16-like tree on one 2560×1440 output: 10 unshaped top-levels, each
 /// with 6 shaped leaf children of 8 rects, plus one large opaque window
 /// covering half the screen, over a root.
-fn e16_like_fixture() -> (KmsCore, DrawableStore, super::super::backend::WindowsMap) {
+fn e16_like_fixture() -> (
+    KmsCore,
+    DrawableStore,
+    crate::kms::render::backend::WindowsMap,
+) {
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
     alloc_root(&core, &mut store, 2560, 1440);
     let mut rank = 1u64;
     for t in 0..10i16 {
@@ -6451,7 +6479,7 @@ fn walk_bench() {
 #[allow(clippy::too_many_arguments)]
 fn alloc_stub_window_bordered(
     store: &mut DrawableStore,
-    windows: &mut super::super::backend::WindowsMap,
+    windows: &mut crate::kms::render::backend::WindowsMap,
     xid: u32,
     x: i16,
     y: i16,
@@ -6466,7 +6494,7 @@ fn alloc_stub_window_bordered(
         u32::from(h) + 2 * u32::from(bw),
     );
     let mut storage =
-        super::super::store::Storage::for_tests_null(bordered, vk::Format::B8G8R8A8_UNORM);
+        crate::kms::render::store::Storage::for_tests_null(bordered, vk::Format::B8G8R8A8_UNORM);
     let sentinel: ash::vk::ImageView = ash::vk::Handle::from_raw(u64::from(xid) | 0xFF00_0000);
     storage.image_view = sentinel;
     storage.sample_view = sentinel;
@@ -6476,7 +6504,7 @@ fn alloc_stub_window_bordered(
     store.set_content_offset(id, i32::from(bw));
     windows.insert(
         xid,
-        super::super::backend::WindowGeometry {
+        crate::kms::render::backend::WindowGeometry {
             border_width: bw,
             border_pixel: None,
             border_pixmap: None,
@@ -6523,7 +6551,7 @@ fn r(x: i32, y: i32, w: u32, h: u32) -> vk::Rect2D {
 fn a_bordered_node_samples_its_whole_outer_extent() {
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
     alloc_stub_window_bordered(
         &mut store,
         &mut windows,
@@ -6572,7 +6600,7 @@ fn a_bordered_node_samples_its_whole_outer_extent() {
 fn a_bordered_parents_child_is_placed_from_the_content_origin() {
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
     alloc_stub_window_bordered(
         &mut store,
         &mut windows,
@@ -6625,7 +6653,7 @@ fn a_bordered_parents_child_is_placed_from_the_content_origin() {
 fn a_child_cannot_overlap_its_parents_border() {
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
     alloc_root(&core, &mut store, 800, 600);
     alloc_stub_window_bordered(
         &mut store,
@@ -6697,7 +6725,7 @@ fn a_child_cannot_overlap_its_parents_border() {
 fn a_bordered_shaped_windows_mask_is_read_in_content_coordinates() {
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
     alloc_stub_window_bordered(
         &mut store,
         &mut windows,
@@ -6745,7 +6773,7 @@ fn a_bordered_shaped_windows_mask_is_read_in_content_coordinates() {
 fn a_clip_shape_narrows_the_child_clip_but_not_the_nodes_own_place() {
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
     alloc_root(&core, &mut store, 800, 600);
     alloc_stub_window(&mut store, &mut windows, 0x100, 0, 0, 100, 100, None, true);
     alloc_stub_window(
@@ -6808,7 +6836,7 @@ fn a_redirected_window_is_not_clipped_to_its_parent_and_neither_are_its_children
     for participating in [true, false] {
         let mut core = KmsCore::for_tests();
         let mut store = DrawableStore::new();
-        let mut windows = super::super::backend::WindowsMap::new();
+        let mut windows = crate::kms::render::backend::WindowsMap::new();
         // Parent 100x100 at (0,0); the redirected child starts at (60,0)
         // and is 100 wide, so 60 px of it stick out past the parent.
         alloc_stub_window(&mut store, &mut windows, 0x100, 0, 0, 100, 100, None, true);
@@ -6891,7 +6919,7 @@ fn a_bordered_child_under_a_redirected_ancestor_is_not_displaced() {
     for participating in [true, false] {
         let mut core = KmsCore::for_tests();
         let mut store = DrawableStore::new();
-        let mut windows = super::super::backend::WindowsMap::new();
+        let mut windows = crate::kms::render::backend::WindowsMap::new();
         alloc_stub_window(
             &mut store,
             &mut windows,
@@ -6989,7 +7017,7 @@ fn a_bordered_child_under_a_redirected_ancestor_is_not_displaced() {
 #[test]
 fn a_borderless_node_needs_no_separate_child_region() {
     let mut store = DrawableStore::new();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
     let empty: HashMap<u32, Vec<xfixes::RegionRect>> = HashMap::new();
     let mut clip: HashMap<u32, Vec<xfixes::RegionRect>> = HashMap::new();
     alloc_stub_window(&mut store, &mut windows, 0x100, 10, 20, 100, 50, None, true);
@@ -7007,7 +7035,7 @@ fn a_borderless_node_needs_no_separate_child_region() {
     );
     let decide = |xid: u32,
                   store: &DrawableStore,
-                  windows: &super::super::backend::WindowsMap,
+                  windows: &crate::kms::render::backend::WindowsMap,
                   shape_clip: &HashMap<u32, Vec<xfixes::RegionRect>>| {
         decide_node(
             xid,
@@ -7095,7 +7123,7 @@ fn the_awesome_two_tile_layout_rings_all_four_sides() {
     const OH: u32 = CH as u32 + 2 * BW as u32; // 1421
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
     alloc_root(&core, &mut store, 5120, 1440);
     for (i, (xid, child, x)) in [(0x100u32, 0x101u32, 0i16), (0x200, 0x201, 1276)]
         .into_iter()
@@ -7212,7 +7240,7 @@ fn the_awesome_two_tile_layout_rings_all_four_sides() {
 #[test]
 fn the_child_clip_bound_is_absolute_not_storage_local() {
     let mut store = DrawableStore::new();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
     let empty: HashMap<u32, Vec<xfixes::RegionRect>> = HashMap::new();
     // awesome's frame, at the reporter's exact geometry.
     alloc_stub_window_bordered(
@@ -7279,7 +7307,7 @@ fn the_child_clip_bound_is_absolute_not_storage_local() {
 #[allow(clippy::too_many_arguments)]
 fn resize_stub_window_bordered(
     store: &mut DrawableStore,
-    windows: &mut super::super::backend::WindowsMap,
+    windows: &mut crate::kms::render::backend::WindowsMap,
     xid: u32,
     w: u16,
     h: u16,
@@ -7291,7 +7319,7 @@ fn resize_stub_window_bordered(
         u32::from(h) + 2 * u32::from(bw),
     );
     let mut storage =
-        super::super::store::Storage::for_tests_null(bordered, vk::Format::B8G8R8A8_UNORM);
+        crate::kms::render::store::Storage::for_tests_null(bordered, vk::Format::B8G8R8A8_UNORM);
     let sentinel: ash::vk::ImageView = ash::vk::Handle::from_raw(u64::from(xid) | 0xFF00_0000);
     storage.image_view = sentinel;
     storage.sample_view = sentinel;
@@ -7341,7 +7369,7 @@ fn a_grow_damages_the_full_new_outer_rect() {
 
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
     alloc_root(&core, &mut store, 800, 600);
     // frame content = client height + titlebar (awesome's rule), so the
     // client exactly fills the remaining content: the tight fit.
@@ -7477,7 +7505,7 @@ fn the_bee_tree_with_a_higher_wibar_sibling_matches_the_unclipped_scene() {
     const TITLE: i16 = 17;
     let mut core = KmsCore::for_tests();
     let mut store = DrawableStore::new();
-    let mut windows = super::super::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::backend::WindowsMap::new();
     alloc_root(&core, &mut store, 2560, 1440);
     // awesome's wibar: full width, 17 tall, at the very top.
     alloc_stub_window_bordered(
