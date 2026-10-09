@@ -805,12 +805,12 @@ fn close_open_frame_with_no_open_frame_returns_already_closed() {
         .close_open_frame(
             &mut store,
             &mut platform,
-            super::super::frame_builder::CloseReason::Shutdown,
+            crate::kms::render::frame_builder::CloseReason::Shutdown,
         )
         .expect("close on a closed frame must Ok");
     assert!(matches!(
         out,
-        super::super::frame_builder::CloseOutcome::AlreadyClosed
+        crate::kms::render::frame_builder::CloseOutcome::AlreadyClosed
     ));
 }
 
@@ -819,7 +819,7 @@ fn stub_engine_declines_paint_ops() {
     let mut engine = RenderEngine::stub();
     let mut store = DrawableStore::new();
     let mut platform = PlatformBackend::for_tests();
-    let storage = super::super::store::Storage::for_tests_null(
+    let storage = crate::kms::render::store::Storage::for_tests_null(
         vk::Extent2D {
             width: 4,
             height: 4,
@@ -829,7 +829,7 @@ fn stub_engine_declines_paint_ops() {
     let id = store
         .allocate(
             0x1,
-            super::super::store::DrawableKind::Pixmap,
+            crate::kms::render::store::DrawableKind::Pixmap,
             32,
             false,
             storage,
@@ -1143,7 +1143,7 @@ fn live_platform() -> Option<PlatformBackend> {
         Ok(o) => o,
         Err(_) => return None,
     };
-    let fence_pool = super::super::platform::FencePool::new(Arc::clone(&vk));
+    let fence_pool = crate::kms::render::platform::FencePool::new(Arc::clone(&vk));
     p.vk = Some(vk);
     p.ops_command_pool = Some(ops_pool);
     p.fence_pool = Some(fence_pool);
@@ -1171,7 +1171,7 @@ fn create_pixmap(
     store
         .allocate(
             xid,
-            super::super::store::DrawableKind::Pixmap,
+            crate::kms::render::store::DrawableKind::Pixmap,
             depth,
             false,
             storage,
@@ -1246,7 +1246,7 @@ fn depth32_put_image_get_image_round_trip() {
     let id = store
         .allocate(
             0x1,
-            super::super::store::DrawableKind::Pixmap,
+            crate::kms::render::store::DrawableKind::Pixmap,
             32,
             false,
             storage,
@@ -1313,7 +1313,7 @@ fn fill_then_get_image_observes_clear_color() {
     let id = store
         .allocate(
             0x1,
-            super::super::store::DrawableKind::Pixmap,
+            crate::kms::render::store::DrawableKind::Pixmap,
             32,
             false,
             storage,
@@ -1381,7 +1381,7 @@ fn fill_depth8_observes_r8_source_byte() {
     let id = store
         .allocate(
             0x1,
-            super::super::store::DrawableKind::Pixmap,
+            crate::kms::render::store::DrawableKind::Pixmap,
             8,
             false,
             storage,
@@ -1449,7 +1449,7 @@ fn logic_fill_xor_applies_per_pixel() {
     let id = store
         .allocate(
             0x1,
-            super::super::store::DrawableKind::Pixmap,
+            crate::kms::render::store::DrawableKind::Pixmap,
             24,
             false,
             storage,
@@ -1547,7 +1547,7 @@ fn copy_area_disjoint_pixmaps_round_trip() {
     let src = store
         .allocate(
             0x1,
-            super::super::store::DrawableKind::Pixmap,
+            crate::kms::render::store::DrawableKind::Pixmap,
             32,
             false,
             storage_src,
@@ -1556,7 +1556,7 @@ fn copy_area_disjoint_pixmaps_round_trip() {
     let dst = store
         .allocate(
             0x2,
-            super::super::store::DrawableKind::Pixmap,
+            crate::kms::render::store::DrawableKind::Pixmap,
             32,
             false,
             storage_dst,
@@ -1666,7 +1666,7 @@ fn logic_fill_depth32_preserves_wire_alpha_when_not_opaque() {
     let id = store
         .allocate(
             0x1,
-            super::super::store::DrawableKind::Pixmap,
+            crate::kms::render::store::DrawableKind::Pixmap,
             32,
             false,
             storage,
@@ -1747,7 +1747,7 @@ fn logic_fill_r8_not_family_matches_x11_bytes() {
     let id = store
         .allocate(
             0x1,
-            super::super::store::DrawableKind::Pixmap,
+            crate::kms::render::store::DrawableKind::Pixmap,
             8,
             false,
             storage,
@@ -1875,7 +1875,7 @@ fn copy_area_negative_offset_copies_trailing_strip() {
     let src = store
         .allocate(
             0x1,
-            super::super::store::DrawableKind::Pixmap,
+            crate::kms::render::store::DrawableKind::Pixmap,
             32,
             false,
             storage_src,
@@ -1884,7 +1884,7 @@ fn copy_area_negative_offset_copies_trailing_strip() {
     let dst = store
         .allocate(
             0x2,
-            super::super::store::DrawableKind::Pixmap,
+            crate::kms::render::store::DrawableKind::Pixmap,
             32,
             false,
             storage_dst,
@@ -1985,7 +1985,7 @@ fn copy_area_self_overlap_scratch_path() {
     let id = store
         .allocate(
             0x1,
-            super::super::store::DrawableKind::Pixmap,
+            crate::kms::render::store::DrawableKind::Pixmap,
             32,
             false,
             storage,
@@ -2086,7 +2086,7 @@ fn put_image_then_fill_overwrites() {
     let id = store
         .allocate(
             0x1,
-            super::super::store::DrawableKind::Pixmap,
+            crate::kms::render::store::DrawableKind::Pixmap,
             32,
             false,
             storage,
@@ -2184,7 +2184,7 @@ fn alloc_drawable_3a(
         xid,
         w,
         h,
-        super::super::store::DrawableKind::Pixmap,
+        crate::kms::render::store::DrawableKind::Pixmap,
         false,
     )
 }
@@ -2195,7 +2195,7 @@ fn alloc_drawable_3a_with_kind(
     xid: u32,
     w: u16,
     h: u16,
-    kind: super::super::store::DrawableKind,
+    kind: crate::kms::render::store::DrawableKind,
     scene_participating: bool,
 ) -> DrawableId {
     let storage = platform
@@ -2239,7 +2239,7 @@ fn image_text_run_records_damage_on_target() {
         0x1,
         64,
         32,
-        super::super::store::DrawableKind::Window,
+        crate::kms::render::store::DrawableKind::Window,
         true,
     );
     // Two glyphs spanning x=[10..22] × y=[5..17].
@@ -2568,7 +2568,7 @@ fn glyph_larger_than_atlas_drops_without_reset() {
         .close_open_frame(
             &mut store,
             &mut platform,
-            super::super::frame_builder::CloseReason::SyncWait,
+            crate::kms::render::frame_builder::CloseReason::SyncWait,
         )
         .expect("close");
     assert!(atlas_has(&engine, 1, 1));
@@ -2594,7 +2594,7 @@ fn forget_glyphs_drops_committed_and_pending_entries() {
                 .close_open_frame(
                     store,
                     platform,
-                    super::super::frame_builder::CloseReason::SyncWait,
+                    crate::kms::render::frame_builder::CloseReason::SyncWait,
                 )
                 .expect("close");
         };
@@ -2675,7 +2675,7 @@ fn atlas_entry_packed_vs_logical_width_feed_the_right_consumers() {
         0x2,
         64,
         32,
-        super::super::store::DrawableKind::Window,
+        crate::kms::render::store::DrawableKind::Window,
         true,
     );
 
@@ -2875,7 +2875,7 @@ fn alloc_filled_pixmap(
     let id = store
         .allocate(
             xid,
-            super::super::store::DrawableKind::Pixmap,
+            crate::kms::render::store::DrawableKind::Pixmap,
             32,
             false,
             storage,
@@ -3025,7 +3025,7 @@ fn composite_glyphs_add_accumulates_into_r8_mask() {
     let mask = store
         .allocate(
             0xA8A8,
-            super::super::store::DrawableKind::Pixmap,
+            crate::kms::render::store::DrawableKind::Pixmap,
             8,
             false,
             storage,
@@ -3141,7 +3141,7 @@ fn composite_glyphs_add_mask_then_composite_src_renders_text() {
     let mask = store
         .allocate(
             0xA8A9,
-            super::super::store::DrawableKind::Pixmap,
+            crate::kms::render::store::DrawableKind::Pixmap,
             8,
             false,
             storage,
@@ -3751,7 +3751,7 @@ fn close_for_tests(
         .close_open_frame(
             store,
             platform,
-            super::super::frame_builder::CloseReason::Timeout,
+            crate::kms::render::frame_builder::CloseReason::Timeout,
         )
         .expect("close frame");
 }
@@ -4039,7 +4039,7 @@ fn render_composite_self_alias() {
     let dst = store
         .allocate(
             0x1,
-            super::super::store::DrawableKind::Pixmap,
+            crate::kms::render::store::DrawableKind::Pixmap,
             32,
             false,
             storage,
@@ -4296,7 +4296,7 @@ fn fill_rect_batch_one_submit_for_n_rects() {
     let id = store
         .allocate(
             0x1,
-            super::super::store::DrawableKind::Pixmap,
+            crate::kms::render::store::DrawableKind::Pixmap,
             32,
             false,
             storage,
@@ -4334,7 +4334,7 @@ fn fill_rect_batch_one_submit_for_n_rects() {
         .flush_submit_group(
             &mut store,
             &mut platform,
-            super::super::submit_group::FlushReason::SyncBoundary,
+            crate::kms::render::submit_group::FlushReason::SyncBoundary,
         )
         .expect("setup flush");
 
@@ -4389,7 +4389,7 @@ fn fill_rect_batch_one_submit_for_n_rects() {
         .flush_submit_group(
             &mut store,
             &mut platform,
-            super::super::submit_group::FlushReason::SyncBoundary,
+            crate::kms::render::submit_group::FlushReason::SyncBoundary,
         )
         .expect("flush before count assertion");
 
@@ -4469,7 +4469,7 @@ fn fill_rect_batch_one_submit_for_n_rects() {
 #[test]
 fn render_composite_resolve_force_opaque_oracle() {
     let mut store = DrawableStore::new();
-    let storage32 = super::super::store::Storage::for_tests_null(
+    let storage32 = crate::kms::render::store::Storage::for_tests_null(
         vk::Extent2D {
             width: 4,
             height: 4,
@@ -4479,13 +4479,13 @@ fn render_composite_resolve_force_opaque_oracle() {
     let id32 = store
         .allocate(
             0xA001,
-            super::super::store::DrawableKind::Pixmap,
+            crate::kms::render::store::DrawableKind::Pixmap,
             32,
             false,
             storage32,
         )
         .unwrap();
-    let storage24 = super::super::store::Storage::for_tests_null(
+    let storage24 = crate::kms::render::store::Storage::for_tests_null(
         vk::Extent2D {
             width: 4,
             height: 4,
@@ -4495,7 +4495,7 @@ fn render_composite_resolve_force_opaque_oracle() {
     let id24 = store
         .allocate(
             0xA002,
-            super::super::store::DrawableKind::Pixmap,
+            crate::kms::render::store::DrawableKind::Pixmap,
             24,
             false,
             storage24,
@@ -4535,7 +4535,7 @@ fn render_composite_resolve_force_opaque_oracle() {
     // resolver explicitly excludes them. Only depth-24 (the
     // x8r8g8b8 / r8g8b8 case where storage's α byte is
     // server-owned padding) gets the override.
-    let storage1 = super::super::store::Storage::for_tests_null(
+    let storage1 = crate::kms::render::store::Storage::for_tests_null(
         vk::Extent2D {
             width: 4,
             height: 4,
@@ -4545,7 +4545,7 @@ fn render_composite_resolve_force_opaque_oracle() {
     let id1 = store
         .allocate(
             0xA003,
-            super::super::store::DrawableKind::Pixmap,
+            crate::kms::render::store::DrawableKind::Pixmap,
             1,
             false,
             storage1,
@@ -4555,7 +4555,7 @@ fn render_composite_resolve_force_opaque_oracle() {
         &store,
         &ResolvedSource::Drawable(SourceDrawable::whole(id1))
     ));
-    let storage8 = super::super::store::Storage::for_tests_null(
+    let storage8 = crate::kms::render::store::Storage::for_tests_null(
         vk::Extent2D {
             width: 4,
             height: 4,
@@ -4565,7 +4565,7 @@ fn render_composite_resolve_force_opaque_oracle() {
     let id8 = store
         .allocate(
             0xA004,
-            super::super::store::DrawableKind::Pixmap,
+            crate::kms::render::store::DrawableKind::Pixmap,
             8,
             false,
             storage8,
@@ -4591,7 +4591,7 @@ fn render_composite_resolve_force_opaque_honors_xrgb32_pict_format() {
 
     let mut store = DrawableStore::new();
     // Depth-32 storage (would normally sample with real α).
-    let storage32 = super::super::store::Storage::for_tests_null(
+    let storage32 = crate::kms::render::store::Storage::for_tests_null(
         vk::Extent2D {
             width: 4,
             height: 4,
@@ -4601,14 +4601,14 @@ fn render_composite_resolve_force_opaque_honors_xrgb32_pict_format() {
     let id32 = store
         .allocate(
             0xA101,
-            super::super::store::DrawableKind::Pixmap,
+            crate::kms::render::store::DrawableKind::Pixmap,
             32,
             false,
             storage32,
         )
         .unwrap();
     // Depth-24 storage (α is padding regardless of pict_format).
-    let storage24 = super::super::store::Storage::for_tests_null(
+    let storage24 = crate::kms::render::store::Storage::for_tests_null(
         vk::Extent2D {
             width: 4,
             height: 4,
@@ -4618,7 +4618,7 @@ fn render_composite_resolve_force_opaque_honors_xrgb32_pict_format() {
     let id24 = store
         .allocate(
             0xA102,
-            super::super::store::DrawableKind::Pixmap,
+            crate::kms::render::store::DrawableKind::Pixmap,
             24,
             false,
             storage24,
@@ -4756,7 +4756,7 @@ fn render_composite_swizzle_class_for_pict_format_xrgb32_is_no_alpha() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn engine_exposes_descriptor_pool_ring_lifetime_counters() {
-    let b = match super::super::backend::KmsBackend::for_tests_with_vk() {
+    let b = match crate::kms::render::backend::KmsBackend::for_tests_with_vk() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("skipping: no Vk: {e}");
@@ -4970,8 +4970,13 @@ fn sampled_scratch_image_has_view_and_sampled_usage() {
         return;
     };
     let vk = std::sync::Arc::new(vk);
-    let s = super::allocate_sampled_scratch_image(&vk, 16, 8, ash::vk::Format::B8G8R8A8_UNORM)
-        .expect("allocate sampled scratch");
+    let s = crate::kms::render::engine::allocate_sampled_scratch_image(
+        &vk,
+        16,
+        8,
+        ash::vk::Format::B8G8R8A8_UNORM,
+    )
+    .expect("allocate sampled scratch");
     assert_ne!(
         s.view,
         ash::vk::ImageView::null(),
@@ -5114,7 +5119,7 @@ fn upload_blocks_are_not_reused_while_their_frame_is_in_flight() {
                 .flush_submit_group(
                     store,
                     platform,
-                    super::super::submit_group::FlushReason::SyncBoundary,
+                    crate::kms::render::submit_group::FlushReason::SyncBoundary,
                 )
                 .expect("flush");
             platform.wait_idle_bounded();
@@ -5223,8 +5228,10 @@ fn upload_blocks_are_not_reused_while_their_frame_is_in_flight() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn upload_to_frame_suballocates_aligned_slices_and_falls_back_for_oversize() {
-    use super::super::upload_arena::{BLOCK_BYTES, Placement};
-    use crate::kms::vk::mem_accounting::{ChurnClass, thread_alloc_calls};
+    use crate::kms::{
+        render::upload_arena::{BLOCK_BYTES, Placement},
+        vk::mem_accounting::{ChurnClass, thread_alloc_calls},
+    };
     let Some(mut platform) = live_platform() else {
         eprintln!("no Vk — skipping");
         return;
@@ -5261,8 +5268,9 @@ fn upload_to_frame_suballocates_aligned_slices_and_falls_back_for_oversize() {
     );
 
     let open = inner.frame_builder.open.as_ref().expect("open");
-    let slice =
-        |i: super::super::frame_builder::PinnedUploadIdx| open.pins.upload_slices[i.0 as usize];
+    let slice = |i: crate::kms::render::frame_builder::PinnedUploadIdx| {
+        open.pins.upload_slices[i.0 as usize]
+    };
     let (s1, sg, s2) = (slice(p1), slice(pg), slice(p2));
     assert_eq!(s1.buffer, sg.buffer);
     assert_eq!(s1.buffer, s2.buffer);
@@ -5333,7 +5341,7 @@ fn image_text_pin_ceiling_reserves_instance_buffer_pin() {
         0x1,
         32,
         32,
-        super::super::store::DrawableKind::Window,
+        crate::kms::render::store::DrawableKind::Window,
         true,
     );
 
@@ -5450,7 +5458,7 @@ fn run_split_glyph_inputs(pixels: &[u8; 4]) -> [CompositeGlyphInput<'_>; 2] {
 /// `composite_glyphs_via_frame_builder` builds.
 fn run_split_recorded_glyphs(
     engine: &RenderEngine,
-) -> Vec<super::super::frame_builder::RecordedTextGlyph> {
+) -> Vec<crate::kms::render::frame_builder::RecordedTextGlyph> {
     let atlas = engine
         .inner
         .as_ref()
@@ -5467,7 +5475,7 @@ fn run_split_recorded_glyphs(
                     codepoint: glyph_id,
                 })
                 .expect("glyph committed to the atlas by the drained frame");
-            super::super::frame_builder::RecordedTextGlyph {
+            crate::kms::render::frame_builder::RecordedTextGlyph {
                 atlas_x: entry.atlas_x,
                 atlas_y: entry.atlas_y,
                 logical_w: entry.logical_w,
@@ -5722,7 +5730,7 @@ fn a_glyph_run_split_into_two_ranges_renders_as_one_range() {
             .filter(|op| {
                 matches!(
                     op,
-                    super::super::frame_builder::RecordedOp::CompositeGlyphs(_)
+                    crate::kms::render::frame_builder::RecordedOp::CompositeGlyphs(_)
                 )
             })
             .count();
@@ -6045,12 +6053,12 @@ fn mixed_format_items_fixture() -> (HashMap<u32, crate::kms::core::GlyphSetState
 /// to the splitter; `dst_x` carries the glyph's request-order
 /// index.
 fn recorded_from_parsed(
-    parsed: &[super::super::backend::ParsedGlyph],
+    parsed: &[crate::kms::render::backend::ParsedGlyph],
     component_alpha_supported: bool,
-) -> Vec<super::super::frame_builder::RecordedTextGlyph> {
+) -> Vec<crate::kms::render::frame_builder::RecordedTextGlyph> {
     parsed
         .iter()
-        .map(|p| super::super::frame_builder::RecordedTextGlyph {
+        .map(|p| crate::kms::render::frame_builder::RecordedTextGlyph {
             atlas_x: 0,
             atlas_y: 0,
             logical_w: p.w,
@@ -6086,7 +6094,7 @@ fn recorded_from_parsed(
 #[test]
 fn a_mixed_format_items_stream_splits_into_ordered_homogeneous_runs() {
     let (glyphsets, initial_gs, items) = mixed_format_items_fixture();
-    let parsed = super::super::backend::parse_composite_glyph_items(
+    let parsed = crate::kms::render::backend::parse_composite_glyph_items(
         &glyphsets, 23, initial_gs, 0, 0, &items,
     );
 
@@ -6149,7 +6157,7 @@ fn a_mixed_format_items_stream_splits_into_ordered_homogeneous_runs() {
 
     // (b) ORDER, and nothing lost or duplicated: the runs
     //     concatenated ARE the input sequence.
-    let flattened: Vec<super::super::frame_builder::RecordedTextGlyph> =
+    let flattened: Vec<crate::kms::render::frame_builder::RecordedTextGlyph> =
         runs.iter().flat_map(|r| r.iter().copied()).collect();
     assert_eq!(
         flattened, recorded,
@@ -6202,7 +6210,7 @@ fn a_mixed_format_items_stream_splits_into_ordered_homogeneous_runs() {
 #[test]
 fn the_run_split_is_inert_only_where_component_alpha_is_unsupported() {
     let (glyphsets, initial_gs, items) = mixed_format_items_fixture();
-    let parsed = super::super::backend::parse_composite_glyph_items(
+    let parsed = crate::kms::render::backend::parse_composite_glyph_items(
         &glyphsets, 23, initial_gs, 0, 0, &items,
     );
     assert_eq!(parsed.glyphs.len(), 6, "fixture must parse six glyphs");
@@ -6349,7 +6357,7 @@ fn a_component_alpha_glyph_upload_records_the_packed_width() {
         .ops
         .iter()
         .filter_map(|op| match op {
-            super::super::frame_builder::RecordedOp::GlyphUpload(up) => Some((
+            crate::kms::render::frame_builder::RecordedOp::GlyphUpload(up) => Some((
                 up.packed_w,
                 up.h,
                 up.insert_entry.layout,
@@ -6530,7 +6538,7 @@ fn a_second_glyph_run_records_the_layout_the_first_run_left() {
         .ops
         .iter()
         .filter_map(|op| match op {
-            super::super::frame_builder::RecordedOp::CompositeGlyphs(cg)
+            crate::kms::render::frame_builder::RecordedOp::CompositeGlyphs(cg)
                 if cg.dst_id == split_dst =>
             {
                 Some(cg.dst_old_layout)
