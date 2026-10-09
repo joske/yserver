@@ -39,10 +39,15 @@ pub struct Manifest {
     #[serde(default)]
     pub exceptions: BTreeMap<String, String>,
     /// Old item key → audited reason it may run `line!`/`column!`/`file!`/
-    /// `Location` at a new position, or `module_path!`/a log macro without
-    /// `target:` in a new module, outside test code.
+    /// `Location::caller()` (or call a `#[track_caller]` fn that passes it
+    /// on) at a new position, outside test code.
     #[serde(default)]
     pub locations: BTreeMap<String, String>,
+    /// Old item key → audited reason production code with `module_path!` or
+    /// a log macro without `target:` may move to a module that is not a
+    /// descendant of its own (its log target leaves the old prefix).
+    #[serde(default)]
+    pub log_targets: BTreeMap<String, String>,
     pub modules: Vec<ModSpec>,
     #[serde(skip)]
     pub path: PathBuf,

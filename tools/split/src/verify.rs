@@ -228,11 +228,18 @@ pub fn check(
     };
     let exceptions = audited(|m| &m.exceptions)?;
     let locations = audited(|m| &m.locations)?;
-    let not_std: BTreeSet<String> = scope::crate_not_std(base, &spec.old_root)
-        .into_iter()
-        .chain(scope::crate_not_std(head, &spec.new_root))
-        .collect();
-    let rx = Resolution::new(&before, &after, &map, [&exceptions, &locations], not_std);
+    let log_targets = audited(|m| &m.log_targets)?;
+    let crates = [
+        scope::Crate::scan(base, &spec.old_root, &spec.module),
+        scope::Crate::scan(head, &spec.new_root, &spec.module),
+    ];
+    let rx = Resolution::new(
+        &before,
+        &after,
+        &map,
+        [&exceptions, &locations, &log_targets],
+        crates,
+    );
     let inc_macros = scope::including_macros(&before);
     let btok: Vec<String> = before
         .leaves
@@ -432,7 +439,10 @@ pub fn check(
         errs.push(format!("{}: new leaf ({}:{})", n.key(), n.file, n.line));
     }
     let used = rx.used.borrow();
-    for (i, what) in ["exception", "location exception"].iter().enumerate() {
+    for (i, what) in ["exception", "location exception", "log target exception"]
+        .iter()
+        .enumerate()
+    {
         for k in rx.exceptions[i].keys().filter(|k| !used[i].contains(*k)) {
             errs.push(format!("{k}: {what} not needed"));
         }
@@ -528,11 +538,16 @@ pub fn check(
             after.files.len()
         ),
     ];
-    let [pos, modp] = *rx.tests.borrow();
+    let [pos, modp, desc] = *rx.tests.borrow();
     info.push(format!(
         "location-sensitive: {pos} test leaves with line!/column!/file!/Location at a new position, {modp} with module_path!/log macros without target: in a new module (allowed in test code); {} audited location exceptions",
         used[1].len()
     ));
+    info.push(format!(
+        "log targets: {desc} leaves moved to descendant modules (prefix filters preserved); {} audited log target exceptions",
+        used[2].len()
+    ));
+    info.push(NOT_COVERED.to_string());
     if !shadow.is_empty() {
         info.push(format!(
             "review, names defined in more than one module: {}",
@@ -596,6 +611,9 @@ fn includes_ok(
     errs
 }
 
+/// Printed with every verify: what an OK does not vouch for.
+const NOT_COVERED: &str = "not covered (outside the guarantee): panic!/unwrap/expect and other panic locations; #[track_caller] fns of other crates (std's, dependencies'); std::any::type_name strings of moved types; diagnostic text std macros derive from their input; bindings created by macro expansion (only refused, not modelled); log target filters longer than the old module path (a directive naming the new child overrides the parent's) and the displayed target of leaves moved to a descendant module; tracing span/event metadata (no tracing in this repo)";
+
 /// Macro and name resolution of both trees, comparable through the table.
 struct Resolution<'a> {
     before: &'a Tree,
@@ -603,15 +621,24 @@ struct Resolution<'a> {
     names: [Names; 2],
     map: &'a BTreeMap<String, String>,
     /// New leaf key → audited reason: for moving macro invocations, for
-    /// moving location-sensitive code.
-    exceptions: [&'a BTreeMap<String, String>; 2],
-    used: std::cell::RefCell<[BTreeSet<String>; 2]>,
+    /// moving positional code, for moving implicit log targets out of
+    /// their module's subtree.
+    exceptions: [&'a BTreeMap<String, String>; 3],
+    used: std::cell::RefCell<[BTreeSet<String>; 3]>,
     /// Macro names that are not positively std's in either crate.
     not_std: BTreeSet<String>,
-    /// `#[track_caller]` fns that pass their caller's position on.
+    /// The crate around each tree.
+    crates: [scope::Crate; 2],
+    /// `#[track_caller]` fns that pass their caller's position on, and
+    /// `use … as` renames, of both sides.
     tracked: BTreeSet<String>,
-    /// Test leaves moved with positional / module-sensitive code.
-    tests: std::cell::RefCell<[usize; 2]>,
+    aliases: BTreeMap<String, BTreeSet<String>>,
+    /// Per side: modules with an item-position macro invocation that may
+    /// bind a name.
+    binding_calls: [BTreeSet<String>; 2],
+    /// Test leaves moved with positional / module-sensitive code, and
+    /// production leaves with implicit log targets moved to a descendant.
+    tests: std::cell::RefCell<[usize; 3]>,
 }
 
 fn hash(s: &str) -> u64 {
@@ -623,16 +650,36 @@ fn hash(s: &str) -> u64 {
 impl<'a> Resolution<'a> {
     fn new(
         before: &'a Tree,
-        after: &Tree,
+        after: &'a Tree,
         map: &'a BTreeMap<String, String>,
-        exceptions: [&'a BTreeMap<String, String>; 2],
-        not_std: BTreeSet<String>,
+        exceptions: [&'a BTreeMap<String, String>; 3],
+        crates: [scope::Crate; 2],
     ) -> Self {
         let old = |l: &Leaf| map.get(&l.okey()).cloned().unwrap_or_else(|| l.okey());
         let new = |l: &Leaf| l.key();
         let def_old = |l: &Leaf| format!("{} {:x}", old(l), hash(&l.tokens));
         let def_new = |l: &Leaf| format!("{} {:x}", new(l), hash(&l.tokens));
         let names = [Names::new(before, &old), Names::new(after, &new)];
+        let mut aliases = crates[0].aliases.clone();
+        for (a, o) in &crates[1].aliases {
+            aliases
+                .entry(a.clone())
+                .or_default()
+                .extend(o.iter().cloned());
+        }
+        let binding_calls = [0, 1].map(|side| {
+            let t = [before, after][side];
+            t.leaves
+                .iter()
+                .filter(|l| l.kind == "macro_call" && l.owner.is_none())
+                .filter(|l| {
+                    scope::stmt_calls(&l.tokens).iter().any(|p| {
+                        !scope::inert(p, &crates[side], &Self::bound(&names[side], &l.module, p))
+                    })
+                })
+                .map(|l| l.module.clone())
+                .collect()
+        });
         Resolution {
             before,
             macros: [
@@ -643,10 +690,47 @@ impl<'a> Resolution<'a> {
             map,
             exceptions,
             used: Default::default(),
-            not_std,
-            tracked: scope::tracked(&[before, after]),
+            not_std: crates[0]
+                .not_std
+                .union(&crates[1].not_std)
+                .cloned()
+                .collect(),
+            tracked: crates[0]
+                .tracked
+                .union(&crates[1].tracked)
+                .cloned()
+                .collect(),
+            aliases,
+            binding_calls,
+            crates,
             tests: Default::default(),
         }
+    }
+
+    /// What an unqualified macro path is imported as in `module`.
+    fn bound(names: &Names, module: &str, path: &[String]) -> BTreeSet<String> {
+        match path {
+            [one] => names.resolve(module, one, scope::MACRO),
+            _ => BTreeSet::new(),
+        }
+    }
+
+    /// Leaf `l` (tree `side`) is where a macro expansion may bind a name:
+    /// the crate's enclosing modules, a module-level invocation in its
+    /// module or an ancestor, or a statement/item-position invocation in
+    /// the leaf, of a macro not known to be inert.
+    fn exposed(&self, side: usize, l: &Leaf) -> bool {
+        self.crates[side].outer_binds
+            || self.binding_calls[side]
+                .iter()
+                .any(|m| scope::under(&l.module, m))
+            || scope::stmt_calls(&l.tokens).iter().any(|p| {
+                !scope::inert(
+                    p,
+                    &self.crates[side],
+                    &Self::bound(&self.names[side], &l.module, p),
+                )
+            })
     }
 
     fn diff(&self, key: &str, what: &str, ob: &Leaf, na: &Leaf, n: &str, ns: u8) -> Option<String> {
@@ -748,26 +832,22 @@ impl<'a> Resolution<'a> {
     /// `tokens` of leaf `l` (tree `side`) with std macros' trailing commas
     /// dropped.
     fn commas(&self, side: usize, l: &Leaf, tokens: &str) -> String {
-        scope::std_commas(
-            tokens,
-            &scope::std_macros(&l.tokens, &self.macros[side][l.idx], &self.not_std),
-        )
+        let mut std = scope::std_macros(&l.tokens, &self.macros[side][l.idx], &self.not_std);
+        if !std.is_empty() && self.exposed(side, l) {
+            std.clear();
+        }
+        scope::std_commas(tokens, &std)
     }
 
     /// `na` (or a delegated helper) runs `line!`/`column!`/`file!`/
-    /// `Location` (in its body or the macros it reaches) at a new position,
-    /// or `module_path!`/a log macro without `target:` in a new module:
-    /// counted in test code, refused elsewhere without an audited exception.
-    fn location(&self, ob: &Leaf, na: &Leaf) -> Option<String> {
+    /// `Location::caller` or a tracked fn (in its body or the macros it
+    /// reaches) at a new position, or `module_path!`/a log macro without
+    /// `target:` in a new module: counted in test code; elsewhere a new
+    /// position needs a `[locations]` entry, a new module that is not a
+    /// descendant of the old one (same crate) a `[log_targets]` entry, and a
+    /// descendant is counted (log filters on the old prefix still match).
+    fn location(&self, ob: &Leaf, na: &Leaf) -> Vec<String> {
         let key = self.map.get(&ob.okey()).cloned().unwrap_or_default();
-        let texts: Vec<&str> = std::iter::once(ob.tokens.as_str())
-            .chain(
-                self.macros[0][ob.idx]
-                    .defs
-                    .iter()
-                    .map(|d| self.before.leaves[*d].tokens.as_str()),
-            )
-            .collect();
         let at = |l: &Leaf| {
             let v: Vec<(String, usize, usize)> = l
                 .sites
@@ -776,32 +856,71 @@ impl<'a> Resolution<'a> {
                 .collect();
             (l.file.clone(), v)
         };
-        let pos = texts.iter().any(|t| scope::positional(t, &self.tracked)) && at(ob) != at(na);
-        let modp = ob.module != na.module && texts.iter().any(|t| scope::module_sensitive(t) > 0);
-        if !pos && !modp {
-            return None;
+        let (shifted, rehomed) = (at(ob) != at(na), ob.module != na.module);
+        if !shifted && !rehomed {
+            return Vec::new();
         }
+        let texts: Vec<&str> = std::iter::once(ob.tokens.as_str())
+            .chain(
+                self.macros[0][ob.idx]
+                    .defs
+                    .iter()
+                    .map(|d| self.before.leaves[*d].tokens.as_str()),
+            )
+            .collect();
+        let bound = |n: &str| {
+            self.names[0].resolve(&ob.module, n, scope::TYPE | scope::VALUE | scope::MACRO)
+        };
+        let cx = scope::Idents::new(&self.aliases, &self.tracked, &bound);
+        let pos = if shifted {
+            texts.iter().find_map(|t| scope::positional(t, &cx))
+        } else {
+            None
+        };
+        let modp = rehomed && texts.iter().any(|t| scope::module_sensitive(t, &cx) > 0);
         if scope::is_test(ob) {
             let mut t = self.tests.borrow_mut();
-            t[0] += usize::from(pos);
+            t[0] += usize::from(pos.is_some());
             t[1] += usize::from(modp);
-            return None;
+            return Vec::new();
         }
-        if self.exceptions[1].contains_key(&na.key()) {
-            self.used.borrow_mut()[1].insert(na.key());
-            return None;
-        }
-        let what = match (pos, modp) {
-            (true, true) => {
-                "line!/column!/file!/Location and module_path!/log macros without target:"
-            }
-            (true, false) => "line!/column!/file!/Location",
-            _ => "module_path!/log macros without target:",
-        };
-        Some(format!(
-            "{key}: production code with {what} moves ({}:{} {} → {}:{} {}); its value or log target changes: add explicit targets in a separate reviewed commit, or list the item under [locations] with an audited reason",
+        let mut errs = Vec::new();
+        let place = format!(
+            "({}:{} {} → {}:{} {})",
             ob.file, ob.line, ob.module, na.file, na.line, na.module
-        ))
+        );
+        if let Some(via) = pos {
+            if self.exceptions[1].contains_key(&na.key()) {
+                self.used.borrow_mut()[1].insert(na.key());
+            } else {
+                errs.push(format!(
+                    "{key}: production code with line!/column!/file!/Location::caller/a #[track_caller] position (here {via}) moves {place}; the source position it reports changes: list the item under [locations] with an audited reason"
+                ));
+            }
+        }
+        if modp {
+            let (cb, ca) = (&self.crates[0].name, &self.crates[1].name);
+            let full = |c: &str, m: &str| {
+                [c, m]
+                    .iter()
+                    .filter(|s| !s.is_empty())
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join("::")
+            };
+            if cb == ca && scope::under(&na.module, &ob.module) {
+                self.tests.borrow_mut()[2] += 1;
+            } else if self.exceptions[2].contains_key(&na.key()) {
+                self.used.borrow_mut()[2].insert(na.key());
+            } else {
+                errs.push(format!(
+                    "{key}: production code with module_path!/log macros without target: moves {place} out of its module's subtree ({} is not under {}); its log target changes: add explicit targets in a separate reviewed commit, or list the item under [log_targets] with an audited reason",
+                    full(ca, &na.module),
+                    full(cb, &ob.module)
+                ));
+            }
+        }
+        errs
     }
 
     /// The delegated helper's impl names the old impl's self type.

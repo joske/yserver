@@ -60,6 +60,7 @@ fn manifest(dir: &str, edits: Vec<PathEdit>) -> Manifest {
         path_edits: edits,
         exceptions: BTreeMap::new(),
         locations: BTreeMap::new(),
+        log_targets: BTreeMap::new(),
         modules: vec![
             crate::apply::ModSpec {
                 name: String::new(),
@@ -289,6 +290,7 @@ fn split_with(
         path_edits: vec![],
         exceptions: BTreeMap::new(),
         locations: BTreeMap::new(),
+        log_targets: BTreeMap::new(),
         modules: vec![spec_of("", lines[0]), spec_of("inner", lines[1])],
         path: tmp.join("a.toml"),
     };
@@ -728,6 +730,7 @@ fn apply_and_verify_as(
         path_edits: edits,
         exceptions: BTreeMap::new(),
         locations: BTreeMap::new(),
+        log_targets: BTreeMap::new(),
         modules: vec![
             spec_of_mod("", modules[0]),
             spec_of_mod("inner", modules[1]),
@@ -1407,51 +1410,252 @@ fn positional_code_at_a_new_position_is_refused_outside_tests() {
     has(&info, "1 test leaves with line!");
 }
 
-fn moved_f(tag: &str, body: &str, locations: &[(&str, &str)]) -> Vec<String> {
+/// `fn f` moved from `a` (or `a::<from>`) to `a::inner`, with the
+/// manifest's `[locations]` and `[log_targets]`.
+fn moved_from(
+    tag: &str,
+    from: &str,
+    body: &str,
+    locations: &[(&str, &str)],
+    log_targets: &[(&str, &str)],
+) -> (Vec<String>, Vec<String>) {
     let mut m = manifest(tag, vec![]);
-    std::fs::write(m.table_path(), "a::fn f => a::inner::fn f\n").unwrap();
+    let (old, before) = if from.is_empty() {
+        (
+            "a::fn f".to_string(),
+            format!("fn f() {{\n    {body}\n}}\n"),
+        )
+    } else {
+        (
+            format!("a::{from}::fn f"),
+            format!("mod {from} {{\n    pub(super) fn f() {{\n        {body}\n    }}\n}}\n"),
+        )
+    };
+    std::fs::write(m.table_path(), format!("{old} => a::inner::fn f\n")).unwrap();
     m.visibility = [("fn f".to_string(), "pub(super)".to_string())].into();
-    m.locations = locations
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
-    let before = format!("fn f() {{\n    {body}\n}}\n");
+    let table = |t: &[(&str, &str)]| {
+        t.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    };
+    m.locations = table(locations);
+    m.log_targets = table(log_targets);
     let inner = format!("use super::*;\n\npub(super) fn f() {{\n    {body}\n}}\n");
     let base = mem(&[("src/a.rs", &before)]);
     let head = mem(&[
         ("src/a/mod.rs", "mod inner;\npub use inner::*;\n"),
         ("src/a/inner.rs", &inner),
     ]);
-    check(&spec_of(&m), &base, &head, &[]).unwrap().1
+    check(&spec_of(&m), &base, &head, &[]).unwrap()
+}
+
+fn moved_f(tag: &str, body: &str, locations: &[(&str, &str)]) -> Vec<String> {
+    moved_from(tag, "", body, locations, &[]).1
+}
+
+const MODULE_SENSITIVE: [&str; 6] = [
+    "let _ = module_path!();",
+    "log::info!(\"x\");",
+    "warn!(\"x {}\", 1);",
+    "log::log!(log::Level::Info, \"x\");",
+    "{ use log::info as note; note!(\"x\"); }",
+    "{ use std::module_path as here; let _ = here!(); }",
+];
+
+#[test]
+fn module_sensitive_code_moved_to_a_descendant_module_is_counted() {
+    for body in MODULE_SENSITIVE {
+        let (info, errs) = moved_from("modp-desc", "", body, &[], &[]);
+        assert_eq!(errs, Vec::<String>::new(), "{body}");
+        has(
+            &info,
+            "log targets: 1 leaves moved to descendant modules (prefix filters preserved)",
+        );
+    }
 }
 
 #[test]
-fn module_sensitive_code_in_a_new_module_is_refused_outside_tests() {
-    for body in [
-        "let _ = module_path!();",
-        "log::info!(\"x\");",
-        "warn!(\"x {}\", 1);",
-        "log::log!(log::Level::Info, \"x\");",
-    ] {
+fn module_sensitive_code_in_a_non_descendant_module_is_refused_outside_tests() {
+    for body in MODULE_SENSITIVE {
         has(
-            &moved_f("modp", body, &[]),
+            &moved_from("modp", "x", body, &[], &[]).1,
             "module_path!/log macros without target:",
         );
     }
     assert_eq!(
-        moved_f("modp-target", "log::info!(target: \"a\", \"x\");", &[]),
+        moved_from(
+            "modp-target",
+            "x",
+            "log::info!(target: \"a\", \"x\");",
+            &[],
+            &[]
+        )
+        .1,
         Vec::<String>::new()
     );
     assert_eq!(
-        moved_f(
+        moved_from(
             "modp-exc",
+            "x",
             "log::info!(\"x\");",
-            &[("fn f", "target change accepted")]
-        ),
+            &[],
+            &[("x::fn f", "target change accepted")]
+        )
+        .1,
         Vec::<String>::new()
     );
+    // A positional exception does not cover a log target change.
     has(
-        &moved_f("modp-unused", "let _ = 1;", &[("fn f", "x")]),
+        &moved_from(
+            "modp-wrong-table",
+            "x",
+            "log::info!(\"x\");",
+            &[("x::fn f", "x")],
+            &[],
+        )
+        .1,
+        "module_path!/log macros without target:",
+    );
+    has(
+        &moved_from("modp-unused", "x", "let _ = 1;", &[], &[("x::fn f", "x")]).1,
+        "log target exception not needed",
+    );
+    has(
+        &moved_f("pos-unused", "let _ = 1;", &[("fn f", "x")]),
         "location exception not needed",
+    );
+}
+
+#[test]
+fn std_macro_normalization_off_without_the_implicit_prelude() {
+    let (before, after) = (fn_body("vec![1,]"), fn_body("vec![1]"));
+    for lib in [
+        "#![no_implicit_prelude]\nextern crate std;\n\nmod k;\n",
+        "#![cfg_attr(all(), no_implicit_prelude)]\nextern crate std;\n\nmod k;\n",
+        "mod k;\n\n#[no_implicit_prelude]\nmod other {}\n",
+    ] {
+        has(
+            &same_file_in(&[CARGO, ("src/lib.rs", lib)], &before, &after),
+            "tokens changed",
+        );
+    }
+}
+
+#[test]
+fn std_macro_normalization_off_where_a_macro_may_expand_to_a_use() {
+    // Codex's fixture: a macro-generated `use` binds `vec` to a macro whose
+    // trailing comma matters.
+    let import = "macro_rules! import {\n    () => {\n        use custom::vec;\n    };\n}\n\n";
+    let lib = ("src/lib.rs", "mod k;\n");
+    has(
+        &same_file_in(
+            &[CARGO, lib],
+            &format!("{import}{}", fn_body("import!();\n    vec![1,]")),
+            &format!("{import}{}", fn_body("import!();\n    vec![1]")),
+        ),
+        "tokens changed",
+    );
+    for (pre, body) in [
+        ("", "custom::import!();\n    vec![1,]"),
+        ("", "{ custom::import! {} }\n    vec![1,]"),
+        ("", "#[allow(unused)]\n    import_ext!();\n    vec![1,]"),
+        ("custom::import!();\n\n", "vec![1,]"),
+        ("import!();\n\n", "vec![1,]"),
+    ] {
+        let before = format!("{pre}{}", fn_body(body));
+        let after = before.replace("vec![1,]", "vec![1]");
+        has(
+            &same_file_in(&[CARGO, lib], &before, &after),
+            "tokens changed",
+        );
+    }
+    // An external item macro in an enclosing module outside the tree.
+    has(
+        &same_file_in(
+            &[CARGO, ("src/lib.rs", "custom::import!();\n\nmod k;\n")],
+            &fn_body("vec![1,]"),
+            &fn_body("vec![1]"),
+        ),
+        "tokens changed",
+    );
+    // Known expression-only macros and in-tree macros without `use` keep it.
+    let quiet = "macro_rules! quiet {\n    () => {\n        let _ = 1;\n    };\n}\n\n";
+    for body in [
+        "log::info!(\"x\");\n    vec![1,]",
+        "assert!(true);\n    vec![1,]",
+        "std::thread_local! {}\n    vec![1,]",
+        "quiet!();\n    vec![1,]",
+    ] {
+        let before = format!("{quiet}{}", fn_body(body));
+        let after = before.replace("vec![1,]", "vec![1]");
+        assert_eq!(
+            same_file_in(&[CARGO, lib], &before, &after),
+            Vec::<String>::new(),
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn positional_code_is_found_through_aliases() {
+    for before in [
+        "use std::panic::Location as L;\n\nfn f() -> u32 {\n    L::caller().line()\n}\n",
+        "use core::panic::Location as L;\n\nfn f() -> u32 {\n    L::caller().line()\n}\n",
+        "mod m {\n    pub use std::panic::Location as Loc;\n}\n\nfn f() -> u32 {\n    m::Loc::caller().line()\n}\n",
+        "use std::panic;\nuse panic::Location as P;\n\nfn f() -> u32 {\n    <P>::caller().line()\n}\n",
+        "use std::line as here;\n\nfn f() -> u32 {\n    here!()\n}\n",
+        "#[track_caller]\nfn site() -> u32 {\n    std::panic::Location::caller().line()\n}\n\nuse self::site as alias;\n\nfn f() -> u32 {\n    alias()\n}\n",
+    ] {
+        let after = before.replace("fn f()", "\n\nfn f()");
+        let errs = same_file_info(before, &after).1;
+        has(&errs, "fn f: production code with line!");
+        assert!(errs.iter().all(|e| !e.contains("fn site")), "{errs:?}");
+    }
+}
+
+#[test]
+fn track_caller_fns_are_found_crate_wide() {
+    let lib = ("src/lib.rs", "mod k;\nmod vk;\n");
+    let before = fn_body("crate::vk::probe()");
+    let after = format!("\n\n{before}");
+    for vk in [
+        "#[track_caller]\npub fn probe() -> u32 {\n    std::panic::Location::caller().line()\n}\n",
+        "#[cfg_attr(debug_assertions, track_caller)]\npub fn probe() -> u32 {\n    std::panic::Location::caller().line()\n}\n",
+        "#[track_caller]\npub fn probe() -> u32 {\n    inner()\n}\n\n#[track_caller]\nfn inner() -> u32 {\n    core::panic::Location::caller().line()\n}\n",
+        "pub use self::deep::site as probe;\n\nmod deep {\n    #[track_caller]\n    pub fn site() -> u32 {\n        std::panic::Location::caller().line()\n    }\n}\n",
+    ] {
+        has(
+            &same_file_in(&[CARGO, lib, ("src/vk.rs", vk)], &before, &after),
+            "fn f: production code with line!",
+        );
+    }
+    // Another workspace member's tracked fn, reached by path.
+    let ws = [
+        ("Cargo.toml", "[workspace]\nmembers = [\"k\", \"vk\"]\n"),
+        ("k/Cargo.toml", "[package]\nname = \"k\"\n"),
+        ("k/src/lib.rs", "mod k;\n"),
+        ("vk/Cargo.toml", "[package]\nname = \"vk\"\n"),
+        (
+            "vk/src/lib.rs",
+            "#[track_caller]\npub fn probe() -> u32 {\n    std::panic::Location::caller().line()\n}\n",
+        ),
+    ];
+    let spec = Spec {
+        manifest: None,
+        old_root: "k/src/k.rs".into(),
+        new_root: "k/src/k.rs".into(),
+        module: "k".into(),
+        delegate: false,
+    };
+    let side = |k: &str| {
+        let mut v = ws.to_vec();
+        v.push(("k/src/k.rs", k));
+        mem(&v)
+    };
+    let before = fn_body("vk::probe()");
+    let after = format!("\n\n{before}");
+    has(
+        &check(&spec, &side(&before), &side(&after), &[]).unwrap().1,
+        "fn f: production code with line!",
     );
 }

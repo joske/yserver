@@ -22,7 +22,10 @@ const USAGE: &str = "usage:
                [--delegate] [--tests <before-dir> <after-dir> [--target <bin:kind>]]
                [<rev>]
 verify compares <rev>^ with <rev>, or HEAD with the working tree; --tests
-also checks the test lists, snapshotted by test-list at those two trees.";
+also checks the test lists, snapshotted by test-list at those two trees.
+--manifest (and its path table) is read from the working tree, not from
+<rev>: a manifest amended after its move commit (e.g. a new [locations]
+entry) applies when re-verifying that commit.";
 
 fn git(args: &[&str]) -> Res<String> {
     let out = Command::new("git")
