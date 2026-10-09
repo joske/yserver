@@ -721,6 +721,51 @@ struct FileCx<'a> {
     claimed: std::cell::RefCell<BTreeSet<usize>>,
 }
 
+/// Attribute context the declarations above the split root give it, read
+/// from the files of its enclosing modules (`#[cfg(test)] mod tests;` in the
+/// parent makes the whole tree test code). Empty when the root's path does
+/// not mirror `module` or a declaration is not found.
+fn enclosing_ctx(src: &dyn Source, root: &str, module: &str) -> Ctx {
+    let segs: Vec<&str> = module.split("::").filter(|s| !s.is_empty()).collect();
+    let mut base = root
+        .strip_suffix("/mod.rs")
+        .or_else(|| root.strip_suffix(".rs"))
+        .unwrap_or(root)
+        .to_string();
+    for s in segs.iter().rev() {
+        match base.strip_suffix(&format!("/{s}")) {
+            Some(b) => base = b.to_string(),
+            None => return Ctx::default(),
+        }
+    }
+    let parse = |alts: &[String]| {
+        alts.iter()
+            .find_map(|f| src.read(f))
+            .and_then(|b| syn::parse_file(&String::from_utf8_lossy(&b)).ok())
+            .map(|f| f.items)
+    };
+    let mut ctx = Ctx::default();
+    let mut items = parse(&[join(&base, "lib.rs"), join(&base, "main.rs")]);
+    let mut dir = base.clone();
+    for s in &segs {
+        let Some(m) = items.as_ref().and_then(|v| {
+            v.iter().find_map(|i| match i {
+                Item::Mod(m) if m.ident == s => Some(m.clone()),
+                _ => None,
+            })
+        }) else {
+            return Ctx::default();
+        };
+        ctx.add(&m.attrs, true);
+        dir = join(&dir, s);
+        items = match m.content {
+            Some((_, inner)) => Some(inner),
+            None => parse(&[format!("{dir}.rs"), join(&dir, "mod.rs")]),
+        };
+    }
+    ctx
+}
+
 /// Loads the module tree rooted at `root` (module path `module`), following
 /// `mod x;` declarations.
 pub fn load(src: &dyn Source, root: &str, module: &str) -> Res<Tree> {
@@ -731,7 +776,7 @@ pub fn load(src: &dyn Source, root: &str, module: &str) -> Res<Tree> {
         src,
         root,
         module,
-        &Ctx::default(),
+        &enclosing_ctx(src, root, module),
         Dir::root_rel(root, module),
     )?;
     let mut total: BTreeMap<String, usize> = BTreeMap::new();

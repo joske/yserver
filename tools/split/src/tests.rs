@@ -1659,3 +1659,42 @@ fn track_caller_fns_are_found_crate_wide() {
         "fn f: production code with line!",
     );
 }
+
+#[test]
+fn split_root_declared_cfg_test_in_its_parent_file_is_test_code() {
+    let mut m = manifest("cfg-test-root", vec![]);
+    std::fs::write(m.table_path(), "a::fn f => a::inner::fn f\n").unwrap();
+    m.visibility = BTreeMap::new();
+    let lib = "#[cfg(test)]\nmod a;\n";
+    let base = mem(&[
+        ("src/lib.rs", lib),
+        ("src/a.rs", "fn f() -> u32 {\n    line!()\n}\n"),
+    ]);
+    let head = mem(&[
+        ("src/lib.rs", lib),
+        ("src/a/mod.rs", "mod inner;\n"),
+        (
+            "src/a/inner.rs",
+            "use super::*;\n\nfn f() -> u32 {\n    line!()\n}\n",
+        ),
+    ]);
+    let (info, errs) = check(&spec_of(&m), &base, &head, &[]).unwrap();
+    assert_eq!(errs, Vec::<String>::new());
+    has(&info, "1 test leaves with line!");
+    let plain = mem(&[
+        ("src/lib.rs", "mod a;\n"),
+        ("src/a.rs", "fn f() -> u32 {\n    line!()\n}\n"),
+    ]);
+    let plain_head = mem(&[
+        ("src/lib.rs", "mod a;\n"),
+        ("src/a/mod.rs", "mod inner;\n"),
+        (
+            "src/a/inner.rs",
+            "use super::*;\n\nfn f() -> u32 {\n    line!()\n}\n",
+        ),
+    ]);
+    has(
+        &check(&spec_of(&m), &plain, &plain_head, &[]).unwrap().1,
+        "fn f: production code with line!",
+    );
+}
