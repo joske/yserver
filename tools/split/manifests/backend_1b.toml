@@ -1,0 +1,914 @@
+# Phase 1b for kms/render/backend/tests.rs: the flat test module becomes
+# tests/mod.rs (imports, helpers shared by several topics, the pub(super)
+# fixtures other test modules use, and the inline get_image_planes module)
+# plus one topic module per subsystem; each topic starts `use super::*;`.
+# Tests by subsystem (name + file block), helpers with the only topic using
+# them, else in mod.rs. Every include path gains one `../` (tests.rs →
+# tests/<topic>.rs).
+source = "crates/yserver/src/kms/render/backend/tests.rs"
+module = "kms::render::backend::tests"
+dir = "crates/yserver/src/kms/render/backend/tests"
+table = "backend_1b.paths"
+
+[[path_edits]]
+item = "fn xdotool_names_resolve_after_xmodmap"
+from = "../../testdata/xorg-xkb-set-modifier-mapping.txt"
+to = "../../../testdata/xorg-xkb-set-modifier-mapping.txt"
+
+[[path_edits]]
+item = "fn change_keyboard_mapping_round_trips_as_xorg"
+from = "../../testdata/xorg-change-keyboard-mapping.txt"
+to = "../../../testdata/xorg-change-keyboard-mapping.txt"
+
+[[path_edits]]
+item = "fn xi_change_device_key_mapping_converts_as_core"
+from = "../../testdata/xorg-change-keyboard-mapping.txt"
+to = "../../../testdata/xorg-change-keyboard-mapping.txt"
+
+[[path_edits]]
+item = "fn change_keyboard_mapping_errors_as_xorg"
+from = "../../testdata/xorg-change-keyboard-mapping.txt"
+to = "../../../testdata/xorg-change-keyboard-mapping.txt"
+
+[[path_edits]]
+item = "fn xkb_view_of_change_keyboard_mapping_matches_xorg"
+from = "../../testdata/xorg-xkb-change-keyboard-mapping.txt"
+to = "../../../testdata/xorg-xkb-change-keyboard-mapping.txt"
+
+[[path_edits]]
+item = "fn xkb_set_request_errors_match_xorg"
+from = "../../testdata/xorg-xkb-setmap-errors.txt"
+to = "../../../testdata/xorg-xkb-setmap-errors.txt"
+
+[[path_edits]]
+item = "fn xkbcomp_uploads_match_xorg_request_by_request"
+from = "../../testdata/xorg-xkbcomp-steps.txt"
+to = "../../../testdata/xorg-xkbcomp-steps.txt"
+
+[[path_edits]]
+item = "fn xkbcomp_compat_upload_reaches_leds_and_cooking"
+from = "../../testdata/xorg-xkbcomp-steps.txt"
+to = "../../../testdata/xorg-xkbcomp-steps.txt"
+
+[[path_edits]]
+item = "fn set_compat_and_indicator_maps_match_xorg"
+from = "../../testdata/xorg-xkb-setcompat.txt"
+to = "../../../testdata/xorg-xkb-setcompat.txt"
+
+[[path_edits]]
+item = "fn set_names_and_geometry_match_xorg"
+from = "../../testdata/xorg-xkb-setnames.txt"
+to = "../../../testdata/xorg-xkb-setnames.txt"
+
+[[path_edits]]
+item = "fn set_map_key_width_resizing_matches_xorg"
+from = "../../testdata/xorg-xkb-setmap-resize.txt"
+to = "../../../testdata/xorg-xkb-setmap-resize.txt"
+
+[[path_edits]]
+item = "fn xkb_view_of_set_modifier_mapping_matches_xorg"
+from = "../../testdata/xorg-xkb-set-modifier-mapping.txt"
+to = "../../../testdata/xorg-xkb-set-modifier-mapping.txt"
+
+[[path_edits]]
+item = "fn xmodmap_caps_as_control_reaches_key_cooking"
+from = "../../testdata/xorg-xkb-set-modifier-mapping.txt"
+to = "../../../testdata/xorg-xkb-set-modifier-mapping.txt"
+
+[[modules]]
+name = ""
+items = [
+  "use *",
+  "fn test_device_key",
+  "fn test_output_key",
+  "fn test_advertised_mode",
+  "fn push_test_device",
+  "mod get_image_planes",
+  "fn push_enabled_test_output",
+  "fn clear_test_outputs",
+  "fn test_cursor",
+  "fn xi2_events",
+  "fn kbd_map_drain_until",
+  "fn dynamic_test_device",
+  "fn process_dynamic_test_keyboard_grab",
+  "fn process_dynamic_test_keyboard_ungrab",
+  "fn seed_window",
+  "fn seed_bordered_window",
+  "fn rect",
+  "fn synth_host_xid",
+  "fn seed_state_window",
+  "fn dispatch_reparent_window",
+  "fn dispatch_configure_window",
+  "fn create_live_window",
+  "fn retain_direct_frame_from_source_test",
+  "fn dispatch_raw",
+  "fn r",
+  "fn install_client_for_render",
+  "fn push_test_output",
+  "fn install_direct_frame_for_target_test",
+  "fn kbd_map_client",
+  "fn kbd_map_client_id",
+  "fn kbd_map_drain",
+  "fn kbd_map_request",
+  "fn change_kbd_map_body",
+  "fn kbd_map_backend",
+  "struct XkbKeyRow",
+  "fn parse_xkb_key_row",
+  "fn xkb_client_request",
+  "enum SmmRequest",
+  "enum SmmResult",
+  "struct SmmStep",
+  "struct SmmCase",
+  "fn parse_xkb_smm_golden",
+  "fn get_modifier_mapping_reply",
+  "fn host_key",
+  "fn xi_xtest_grab_request",
+  "fn xi_xtest_ungrab_body",
+  "fn xi_xtest_grab_reply_status",
+  "type XiXtestRegistrySnapshot",
+  "type XiXtestPropertySnapshot",
+  "type XiXtestHeldSnapshot",
+  "fn xi_xtest_registry_snapshot",
+  "fn xi_xtest_property_snapshot",
+  "fn xi_xtest_held_snapshot",
+]
+
+[[modules]]
+name = "crossings"
+lines = ["use super::*;"]
+items = [
+  "fn tree_crossing_fixture",
+  "const TREE_A",
+  "const TREE_B",
+  "const TREE_C",
+  "fn tree_events",
+  "fn tree_request",
+  "fn pointer_enters_input_only_window_and_shows_its_cursor",
+  "fn input_only_window_keeps_its_freed_cursor_until_it_drops_it",
+  "fn map_under_a_still_pointer_crosses_within_the_request",
+  "fn unmap_under_a_still_pointer_enters_the_revealed_window",
+  "fn configure_under_a_still_pointer_crosses_after_configure_notify",
+  "fn release_overlay_under_a_still_pointer_leaves_before_destroy_notify",
+  "fn destroy_under_a_still_pointer_leaves_before_destroy_notify",
+  "fn bounding_shape_off_the_pointer_leaves_the_window",
+  "fn reparent_of_a_mapped_window_unmaps_and_maps_it_around_the_pointer",
+  "fn core_crossings_do_not_propagate_to_the_parent",
+  "fn crossings_under_a_grab_reach_only_the_grab_window",
+  "fn tree_xi2_crossings",
+  "fn drain_xi2_crossings",
+  "fn grab_and_tree_change_crossings_have_an_xi2_form_from_the_master",
+  "fn circulate_picks_the_overlapping_mapped_child",
+  "fn crossing_focus_flag_follows_the_focus_window",
+  "fn destroy_notifies_inferiors_topmost_first_without_unmap_notify",
+  "fn tree_change_crossings_do_not_count_as_activity",
+]
+
+[[modules]]
+name = "cursor"
+lines = ["use super::*;"]
+items = [
+  "fn cursor_paths_do_not_log_gaps",
+  "fn recolor_cursor_updates_monochrome_records_and_ignores_argb",
+  "fn define_cursor_records_per_window_and_root_sticky",
+  "fn insert_test_window",
+  "fn freed_cursor_lives_until_its_window_stops_using_it",
+  "fn freed_cursor_goes_with_the_window_that_used_it",
+  "fn unreferenced_cursor_is_destroyed_at_free_cursor",
+  "fn freed_grab_cursor_lives_until_the_grab_ends",
+  "fn freed_root_cursor_lives_until_the_root_cursor_changes",
+  "fn animated_cursor_keeps_its_freed_frames_alive",
+  "fn freed_cursor_releases_its_sprite_pixmap",
+  "fn idle_server_wakes_to_release_a_pixmap_freed_in_flight",
+  "fn grab_cursor_override_wins_and_reverts",
+  "fn cursor_test_window",
+  "fn effective_cursor_changes_are_reported_once_and_survive_hiding",
+  "fn replace_cursor_rewrites_every_reference",
+  "fn effective_cursor_walks_parent_chain",
+  "fn default_cursor_is_xorg_root_cursor",
+  "fn cursor_record_versions_monotonic",
+  "fn create_anim_cursor_snapshots_frames",
+  "fn effective_cursor_arms_and_clears_animation",
+  "fn anim_tick_advances_wraps_and_stays_monotonic",
+  "fn anim_deadline_gated_on_outputs_active",
+  "fn xfixes_cursor_image_follows_animation_frames",
+]
+
+[[modules]]
+name = "deadlines"
+lines = ["use super::*;"]
+items = [
+  "fn paint_stub_returns_ok_and_dedups_gap",
+  "fn pending_present_completion_sets_poll_deadline",
+  "fn presentation_damage_arms_scene_compose",
+  "fn next_wakeup_suppresses_scene_deadline_when_scanout_disallowed",
+  "fn assert_frame_timeout_serviced_while_dark",
+  "fn frame_timeout_closes_and_is_scheduled_with_dpms_off",
+  "fn frame_timeout_closes_and_is_scheduled_with_vt_away",
+  "fn present_poll_deadline_survives_outputs_off",
+  "fn display_hotplug_arms_rescan_deadline_and_next_wakeup",
+  "fn poll_deferred_input_clears_expired_rescan_deadline",
+]
+
+[[modules]]
+name = "dri3"
+lines = ["use super::*;"]
+items = [
+  "fn dri3_implicit_layout_import_is_safe_with_multiple_renderers",
+  "fn dri3_capabilities_unsupported_without_vk_returns_unsupported",
+  "fn dri3_open_errs_when_render_node_unavailable",
+  "fn dri3_export_pixmap_unknown_xid_errs",
+  "fn dri3_fd_from_fence_unknown_errs",
+  "fn dri3_signal_syncobj_unknown_errs",
+  "fn dri3_trigger_fence_unknown_is_ok",
+  "fn dri3_syncobj_follows_the_kernel_capability",
+  "fn dri3_imported_pixmap_exports_the_clients_own_description",
+  "fn dri3_import_pixmap_rejects_unsupported_depth_bpp",
+  "fn dri3_supported_modifiers_includes_linear_with_vk",
+  "fn dri3_fence_from_fd_xshmfence_path_triggers",
+  "fn dri3_shm_fence_state_is_the_shared_memory",
+  "fn each_resolver_sees_only_its_own_registry",
+  "fn dri3_import_syncobj_errs_without_a_usable_drm_handle",
+]
+
+[[modules]]
+name = "gc_draw"
+lines = ["use super::*;"]
+items = [
+  "fn poly_line_origin_mode_offsets_correctly",
+  "fn fill_poly_scanline_correctness",
+  "fn root_include_inferiors_xor_routes_to_overlay",
+  "fn client_disconnected_clears_overlay",
+  "fn client_disconnected_does_not_own_syncobj_lifetime",
+  "fn dri3_syncobj_owned_is_client_scoped",
+  "fn none_origin_reversible_root_draw_not_routed_to_overlay",
+  "fn poly_fill_rectangle_honours_gc_clip",
+  "fn gxcopy_planemask_diverts_to_logic_fill",
+  "fn set_clip_pixmap_stores_pixmap_clip",
+  "fn apply_clip_state_preserves_cached_pixmap_mask_after_free_and_origin_change",
+  "fn clip_cache_retained_across_clip_none_same_pixmap_no_reread",
+  "fn clip_cache_retained_after_source_pixmap_freed",
+  "fn clip_cache_invalidated_on_content_version_bump",
+  "fn clip_cache_free_realloc_same_xid_no_stale_hit",
+  "fn clip_cache_install_defers_cpu_readback_until_cpu_clip_use",
+  "fn set_gc_fill_tiled_stores_fill_state",
+  "fn depth1_gxcopy_fill_routes_to_gpu_not_cpu_readback",
+  "fn depth1_noncopy_fill_still_cpu_fallback",
+  "fn depth4_fill_still_cpu_fallback",
+  "fn clip_cache_invalidated_on_mask_depth1_gpu_fill",
+]
+
+[[modules]]
+name = "keyboard_source"
+lines = ["use super::*;"]
+items = [
+  "fn serialize_modifiers_zero_on_fresh_state",
+  "fn serialize_modifiers_encodes_locked_group",
+  "fn locked_group_is_clamped_to_keymap_group_count",
+  "fn cook_host_key_reports_pre_event_modifier_state",
+  "fn on_host_input_super_return_activates_mod4_passive_grab",
+  "fn duplicate_key_press_and_release_do_not_stick_modifier",
+  "fn xi_dynamic_keyboard_release_after_grab_clears_the_slave_hold",
+  "fn xi_dynamic_keyboard_removal_releases_a_held_key_before_unregister",
+  "fn xi_registry_unregister_drops_a_real_facets_held_key_bitmap",
+  "fn xi_dynamic_pointer_mapping_cleanup_releases_the_held_logical_button",
+  "fn xtest_key_input_to_a_floating_keyboard_does_not_change_master_state",
+  "fn record_contains_only_accepted_master_key_and_button_transitions",
+  "fn device_key_emits_raw_key_events_before_the_device_event",
+  "fn key_source_routing_kms_preserves_facets_and_drops_unknown_before_xkb",
+  "fn key_source_selection_keeps_slave_holds_independent_from_master_transitions",
+  "fn key_source_selection_tracks_xtest_targeted_keyboard_facets",
+  "fn key_source_selection_delivers_physical_key_under_exact_device_grab",
+  "fn key_source_selection_xi1_uses_the_physical_keyboard_facet",
+  "fn key_source_selection_drains_one_keyboard_and_keeps_other_holds",
+  "fn xi_source_removal_releases_source_holds_before_unregister_and_drops_stale_reuse_input",
+  "fn key_source_selection_guards_unpublished_physical_keyboard_holds",
+  "fn duplicate_guard_keeps_xorg_raw_key_events",
+  "fn key_repeat_emits_no_raw_key_events",
+  "fn record_sees_autorepeat_as_flagged_presses",
+  "fn grp_alt_shift_toggle_advances_xkb_layout",
+  "fn cook_host_key_grp_shortcut_syncs_locked_group_and_stamps_group_bits",
+  "fn caps_lock_toggle_drives_led_bits",
+  "fn caps_key",
+  "fn xdotool_names_resolve_after_xmodmap",
+  "fn caps_as_control",
+  "fn rmlvo_reload_resyncs_the_lock_leds",
+  "fn keymap_edit_resyncs_the_lock_leds",
+  "fn get_kbd_by_name_reloads_an_edited_keymap",
+  "fn set_keymap_rmlvo_reloads_an_edited_keymap",
+  "fn xi_dynamic_grabs_kms_slave_cleanup_does_not_freeze_paired_master",
+  "fn key_source_selection_repeat_after_another_keyboard_becomes_active",
+  "fn key_source_selection_repeat_stops_after_source_key_is_drained",
+  "fn key_source_selection_repeat_floating_keyboard_arms_slave_repeat",
+  "fn xi_dynamic_grabs_floating_keyboard",
+]
+
+[[modules]]
+name = "misc"
+lines = ["use super::*;"]
+items = [
+  "fn warn_throttle_logs_once_per_period_and_counts_the_rest",
+  "fn glx_vendor_names_are_nvidia_first_then_mesa_on_nvidia",
+  "fn glx_vendor_names_stay_mesa_on_every_other_driver",
+  "fn glx_vendor_names_falls_back_to_mesa_with_no_vk",
+  "fn skeleton_advertises_expected_capabilities",
+  "fn xid_map_is_reachable_via_backend_trait",
+  "fn list_fonts_proxy_returns_catalog_matches",
+  "fn list_fonts_with_info_proxy_emits_terminator",
+  "fn list_fonts_with_info_resolves_alias_to_xlfd_name",
+  "fn builtins_only_lfwi_reply_name_round_trips",
+  "fn telemetry_counter_sites_track_successful_ops",
+  "fn register_top_level_updates_xid_map",
+  "fn poly_text8_font_change_advances_current_font",
+  "fn xshmfence_handle_accessor_returns_arc_clone",
+  "fn frame_builder_renders_per_frame_telemetry_records_max",
+  "fn syncobj_handle_accessor_returns_arc_clone",
+]
+
+[[modules]]
+name = "paint_target"
+lines = ["use super::*;"]
+items = [
+  "fn cwa_on_redirected_window_does_not_clear_backing",
+  "fn cwa_on_non_redirected_window_does_not_clear_storage",
+  "fn cwa_on_descendant_routed_to_redirected_ancestor_does_not_clear",
+  "fn copy_area_clip_by_children_skips_manually_redirected_child",
+  "fn copy_area_clip_by_children_still_subtracts_automatic_child_in",
+  "fn copy_area_into_lower_sibling_excludes_higher_sibling_in_shared_backing",
+  "fn copy_area_excludes_higher_cousin_in_shared_redirect_backing",
+  "fn in_ancestor_backing",
+  "fn mem_accounting_tracks_drawable_storage_by_use",
+  "fn collect_fill_rects_for_inferiors_translates_root_to_top_level_child",
+  "fn resolve_paint_target_unknown_xid_returns_none",
+  "fn resolve_paint_target_pixmap_returns_identity",
+  "fn resolve_paint_target_unredirected_top_level_returns_identity",
+  "fn resolve_paint_target_redirected_window_routes_to_backing",
+  "fn resolve_paint_target_clips_a_child_to_its_parent_in_the_shared_backing",
+  "fn shared_backing_draw_clip_takes_out_higher_siblings_and_shapes",
+  "fn shared_backing_move_pieces_stay_inside_the_parent_at_both_ends",
+  "fn resolve_paint_target_descendant_accumulates_offset",
+  "fn resolve_paint_target_parent_root_falls_back_to_identity",
+  "fn resolve_paint_target_redirected_root_routes_descendants",
+  "fn resolve_paint_target_after_clear_falls_back_to_identity",
+  "fn resolve_paint_target_stops_at_nearest_redirected_ancestor",
+  "fn stroke_inferior_targets_dedup_redirected_ancestor",
+  "fn resolve_paint_target_detached_leaf_still_routes_to_redirected_ancestor",
+  "fn redirected_depth24_fill_into_depth32_backing_forces_opaque_alpha",
+  "fn window_absolute_rect_top_level",
+  "fn window_absolute_rect_descendant",
+  "fn window_absolute_rect_unknown_drawable_returns_none",
+  "fn window_absolute_rect_pixmap_returns_none",
+  "fn window_absolute_rect_dangling_parent_returns_none",
+  "fn set_window_scene_participation_false_clears_window_damage",
+  "fn set_window_scene_participation_fires_scene_structure_damage_rect",
+  "fn set_backing_scene_participation_flips_flag_no_damage",
+  "fn manual_redirect_path_marks_scene_structure_damage",
+  "fn unredirect_restores_participation_and_marks_damage",
+  "fn configure_subwindow_redirected_resize_skips_leaf_realloc",
+  "fn unredirect_reconciles_leaf_storage_after_deferred_redirected_resize",
+  "fn redirected_backing_reuse_requires_the_exact_storage_extent",
+  "fn seed_backing_drawable",
+  "fn plan_backing_inferiors_walks_subtree_in_stack_order",
+  "fn plan_backing_inferiors_prunes_independently_redirected_descendant",
+  "fn plan_backing_inferiors_skips_unmapped_subtree",
+  "fn cow_get_overlay_first_call_allocates_storage",
+  "fn note_present_pixmap_tracks_non_cow_stage_sources_for_drawable_dump",
+  "fn cow_final_release_drops_storage",
+  "fn cow_release_without_prior_get_is_noop",
+  "fn seed_redirected_backing",
+  "fn backing_drawable_id",
+  "fn resolve_paint_target_after_reparent_out_routes_to_new_redirected_ancestor",
+  "fn get_overlay_window_first_claim_materializes_full_backend_state",
+  "fn release_overlay_window_final_release_tears_down_full_backend_state",
+  "fn pointer_crossing_between_cow_and_a_sibling_is_nonlinear",
+]
+
+[[modules]]
+name = "pointer"
+lines = ["use super::*;"]
+items = [
+  "fn query_pointer_mask_includes_live_keyboard_modifiers",
+  "fn process_pointer_button_state_field_is_pre_press",
+  "fn pointer_source_routing_kms_preserves_origin_and_drops_unknown_before_cursor_motion",
+  "fn pointer_source_selection_kms_rejects_unknown_removed_and_suspended_button_sources",
+  "fn warp_pointer_root_moves_cursor_and_fans_out_motion",
+  "fn process_pointer_absolute_clamps_to_output",
+  "fn confined_motion_does_not_cross_into_window_below",
+  "fn process_pointer_absolute_uses_union_fb_extent_for_multi_output",
+  "fn process_pointer_absolute_skips_pointer_barriers_when_absolute",
+  "fn kms_pointer_authority_integrates_relative_motion_against_pointer_barriers",
+  "fn window_under_cursor_finds_topmost_mapped",
+  "fn window_under_cursor_descends_into_subwindow_tree",
+  "fn on_host_input_does_not_log_gap",
+  "fn kms_pointer_authority_integrates_physical_relative_motion_in_kms",
+]
+
+[[modules]]
+name = "present_scanout"
+lines = ["use super::*;"]
+items = [
+  "fn output_crtc_key",
+  "fn bind_test_randr_crtc",
+  "fn test_crtc_key",
+  "fn dispatch_test_sequence",
+  "fn armed_vblank_targets_starts_empty",
+  "fn clear_all_armed_vblank_targets_empties_map",
+  "fn prune_armed_targets_drops_stale_keeps_live",
+  "fn prune_armed_targets_drops_stale_absolute_entries_keeps_live",
+  "fn on_crtc_sequence_event_happy_path_records_msc_and_clears_arm",
+  "fn active_crtc_sequence_advances_general_clock_only",
+  "fn active_absolute_sequence_advances_completion_clock",
+  "fn completion_clock_prefers_pageflip_at_equal_msc_and_never_regresses",
+  "fn on_crtc_sequence_event_negative_time_clears_arm_and_drops",
+  "fn on_crtc_sequence_event_stale_crtc_clears_arm_and_drops",
+  "fn on_crtc_sequence_event_from_wrong_device_does_not_advance_clock",
+  "fn same_raw_crtc_on_two_devices_keeps_present_state_independent",
+  "fn present_get_ust_msc_keeps_output_domains_independent",
+  "fn present_randr_crtc_routes_equal_raw_handles_to_the_owning_device",
+  "fn present_clock_epoch_changes_on_route_removal_and_readd",
+  "fn off_randr_crtc_has_no_present_domain_or_direct_path",
+  "fn vblank_arms_skip_the_ioctl_while_outputs_are_off",
+  "fn arm_idle_vblanks_with_empty_targets_is_noop",
+  "fn arm_idle_vblanks_with_arms_primary_once_then_dedups",
+  "fn arm_idle_vblanks_skips_an_unsupported_selected_device",
+  "fn arm_idle_vblanks_transient_error_does_not_cross_domains",
+  "fn arm_idle_vblanks_with_scanout_disallowed_clears_and_returns_zero",
+  "fn absolute_vblank_targets_starts_empty",
+  "fn tagged_sequence_event_does_not_clear_relative_slot",
+  "fn untagged_sequence_event_does_not_retire_absolute_targets",
+  "fn tagged_sequence_event_retires_targets_at_or_before_sequence_keeps_later",
+  "fn absolute_seq_user_data_round_trips_through_on_crtc_sequence_event",
+  "fn clear_all_armed_vblank_targets_clears_absolute_targets_too",
+  "fn arm_present_absolute_vblank_with_dedups_same_target_one_kernel_call",
+  "fn arm_present_absolute_vblank_false_result_is_not_tracked_as_covered",
+  "fn destroy_subwindow_without_direct_frame_does_not_request_unflip",
+  "fn destroy_unrelated_subwindow_keeps_direct_scanout_active",
+  "fn destroy_subwindow_requests_pending_direct_unflip_without_releasing_pins",
+  "fn destroy_subwindow_retires_current_direct_idle_once_after_replacement",
+  "fn final_cow_release_defers_storage_until_direct_replacement",
+  "fn final_cow_release_materialization_failure_keeps_cow_and_pins",
+  "fn get_cow_during_deferred_release_reuses_backend_identity",
+  "fn unmap_subwindow_requests_direct_unflip_without_releasing_pins",
+  "fn unmap_unrelated_subwindow_keeps_direct_scanout_active",
+  "fn map_subwindow_requests_direct_unflip_without_releasing_pins",
+  "fn map_unrelated_subwindow_keeps_direct_scanout_active",
+  "fn configure_subwindow_requests_direct_unflip_without_releasing_pins",
+  "fn configure_unrelated_subwindow_keeps_direct_scanout_active",
+  "fn logical_resize_keeps_old_cow_pinned_until_direct_replacement",
+  "fn logical_resize_materialization_failure_preserves_old_dimensions_and_cow",
+  "fn direct_scanout_topology_requires_one_drm_device",
+  "fn grouped_direct_waits_all_outputs_and_uses_selected_reference_sample",
+  "fn async_fullscreen_direct_successors_coalesce_until_flip_retirement",
+  "fn direct_scanout_topology_rejects_heterogeneous_refresh",
+  "fn direct_scanout_topology_compares_precise_fractional_timings",
+  "fn direct_scanout_refresh_comparison_accounts_for_scan_multipliers",
+  "fn arm_present_absolute_vblank_with_arms_only_selected_crtc",
+  "fn arm_present_absolute_vblank_with_uses_selected_crtc_before_first_sample",
+  "fn phase_b_flip_visibility_includes_all_scanout_transactions",
+  "fn present_flip_in_flight_mirrors_scene_state",
+  "fn present_display_idle_false_when_scene_wants_compose_even_with_no_flips",
+  "fn present_scanout_blackout_true_when_kms_outputs_active_false_even_while_scanout_allowed",
+  "fn crtc_enable_from_zero_outputs_opens_kms_output_gate",
+  "fn crtc_disable_last_output_closes_kms_output_gate",
+  "fn headless_output_inventory_keeps_present_in_blackout",
+  "fn zero_device_backend_disables_dri3_and_vblank_arms",
+  "fn pin_present_source_survives_by_xid_invalidation",
+  "fn pin_present_source_unknown_xid_returns_none",
+  "fn scanout_m0_classifies_root_and_per_output_geometry",
+  "fn scanout_m0_rejects_geometry_or_source_extent_mismatch",
+  "fn scanout_m1_accepts_exact_dual_head_root_tiling",
+  "fn scanout_m1_rejects_gap_overlap_bounds_and_mode_mismatch",
+  "fn scanout_m1_redirected_game_and_region_present_never_reach_probe_cache",
+  "fn scanout_m1_probe_eligible_accepts_unredirected_fullscreen",
+  "fn scanout_m2_only_authoritative_root_present_invalidates_direct_frame",
+  "fn scanout_direct_eligible_accepts_fullscreen_game_candidate",
+  "fn seed_cow_stage",
+  "fn direct_shape_chain_requires_every_shape_to_cover_the_root",
+  "fn an_empty_cow_bounding_shape_unflips_the_direct_stage_frame",
+  "fn scanout_direct_eligible_rejects_bordered_candidate",
+  "fn scanout_m2_authoritative_root_accepts_unredirected_fullscreen",
+  "fn scanout_m2_requires_stable_eligible_root_stream_before_entry",
+  "fn scanout_m2_ineligible_root_resets_short_eligible_bursts",
+  "fn active_direct_scanout_unflips_on_cursor_output_fallback",
+  "fn active_direct_scanout_unflips_and_wakes_for_cursor_rollback_retry",
+  "fn scanout_m0_classifies_cow_descendant_and_unredirected_targets",
+  "fn scanout_m0_steady_candidate_keeps_one_shape_and_source_record",
+  "fn scanout_m0_shape_ignores_region_xid_identity_but_not_presence",
+]
+
+[[modules]]
+name = "randr"
+lines = ["use super::*;"]
+items = [
+  "fn test_render_device",
+  "struct TestCrtcConfigProbeState",
+  "struct TestCrtcConfigProbeExecutor",
+  "impl TestCrtcConfigProbeExecutor",
+  "impl CrtcConfigProbeExecutor for TestCrtcConfigProbeExecutor",
+  "fn clone_test_drm_output",
+  "fn async_crtc_config_test_backend",
+  "fn async_crtc_config_begin_keeps_old_topology_lit",
+  "fn pending_probe_invalidation_wakes_once_and_suppresses_late_success",
+  "fn vt_transition_promptly_interrupts_and_cancels_pending_probe",
+  "fn cancelling_invalidated_probe_removes_undrained_announcement",
+  "fn dpms_transition_promptly_invalidates_pending_probe_after_no_op_guard",
+  "fn async_crtc_config_completion_wakes_core_and_drains_token",
+  "fn topology_invalidation_overwrites_announced_result_without_duplicate_wake",
+  "fn async_crtc_config_finish_rejects_vt_stale_result_without_quiesce",
+  "fn randr_rebuild_preserves_primary_while_output_resource_exists",
+  "fn mode_timing_passes_kernel_timing_and_masks_drm_only_flags",
+  "fn kms_gamma_off_connector_seeds_identity_ramp_at_256",
+  "fn kms_gamma_off_connector_set_roundtrips_cached_values",
+  "fn kms_gamma_same_connector_name_on_two_devices_stays_independent",
+  "fn randr_ids_are_stable_across_drop",
+  "fn randr_ids_distinguish_equal_connector_names_on_different_devices",
+  "fn randr_provider_ids_are_stable_and_share_the_xid_namespace",
+  "fn randr_provider_projection_is_per_kms_device_and_includes_disconnected_connectors",
+  "fn provider_output_source_projection_is_endpoint_qualified_and_symmetric",
+  "fn automatic_inventoryless_sink_waits_for_connector_projection",
+  "fn startup_automatically_binds_asahi_first_and_only_kms_sink",
+  "fn coalesced_renderer_automatically_binds_inactive_secondary_sink",
+  "fn automatic_provider_policy_validates_live_route_endpoints_before_binding",
+  "fn stale_allocated_provider_id_is_not_a_current_endpoint",
+  "fn randr_rebuild_restores_the_stable_provider_projection",
+  "fn provider_output_source_attach_detach_persists_without_timestamp_changes",
+  "fn explicit_detach_survives_rebuild_disconnect_and_reconnect",
+  "fn active_split_sink_cannot_be_detached_while_dpms_dark",
+  "fn split_enable_gate_runs_before_idempotent_active_reassert",
+  "fn automatically_bound_live_split_route_passes_gate_before_idempotent_reassert",
+  "fn disabling_an_off_split_sink_does_not_require_attachment",
+  "fn conventional_renderer_coalesces_with_its_matching_kms_provider",
+  "fn unverified_renderer_coalesces_when_its_primary_matches_kms",
+  "fn headless_selected_renderer_is_the_only_provider",
+  "fn split_asahi_shape_exposes_distinct_display_and_render_providers",
+  "fn provider_order_is_deterministic_and_reserves_selected_renderer_first",
+  "fn unverified_selected_renderer_has_a_tagged_stable_provider",
+  "fn no_kms_and_no_selected_renderer_has_no_providers",
+  "fn randr_projection_retains_device_identity_for_equal_connector_names",
+  "fn active_test_output_carries_its_owning_device_key",
+  "fn connector_only_probe_reconciles_state_and_retains_disconnected_modes",
+  "fn relight_test_snapshot",
+  "fn rects_overlap",
+  "fn a_physical_disconnect_remembers_the_route_and_the_reconnect_relights_it",
+  "fn a_route_that_was_already_off_when_it_departed_is_never_relit",
+  "fn a_client_config_on_a_departed_output_releases_its_reservation",
+  "fn an_incompatible_mode_reconnect_leaves_the_output_off_and_does_not_re_reserve",
+  "fn a_reserved_slot_keeps_the_survivor_in_place_and_the_relight_cannot_overlap_it",
+  "fn a_client_set_logical_size_survives_a_rebuild_while_a_slot_is_reserved",
+  "fn dropping_a_never_enabled_output_reserves_nothing_and_survivors_compact",
+  "fn startup_inventory_reserves_xids_but_heavy_snapshot_owns_identity_and_state",
+  "fn lightweight_mode_change_invalidates_identity_until_heavy_refresh",
+  "fn lightweight_same_modes_cannot_detect_edid_only_replacement",
+  "fn connector_registry_detects_edid_only_replacement_and_keeps_xids",
+  "fn live_randr_projection_uses_heavy_registry_identity",
+  "fn connected_off_output_exposes_identity_and_disconnect_clears_it",
+  "fn lightweight_active_disconnect_retains_crtc_then_heavy_detach_publishes_off",
+  "fn light_mode_change_then_heavy_connected_route_retirement_is_not_a_second_config_delta",
+  "fn heavy_disconnect_projection_does_not_revive_stale_active_output",
+  "fn randr_mode_ids_dedup_exact_modes_but_distinguish_timings",
+  "fn same_signature_monitor_replacement_keeps_exact_timings_distinct",
+  "fn randr_output_mode_ids_have_no_duplicate_xids",
+  "fn not_live_output_reports_connected_off_vs_disconnected",
+]
+
+[[modules]]
+name = "render_clip"
+lines = ["use super::*;"]
+items = [
+  "fn trap_bbox_shrinks_to_the_clip_extents",
+  "fn clip_fill_rects_by_subwindow_mode_subtracts_mapped_child",
+  "fn clip_fill_rects_by_subwindow_mode_follows_a_moved_child",
+  "fn clip_fill_rects_by_subwindow_mode_include_inferiors_is_passthrough",
+  "fn as_set",
+  "fn render_dst_cliplist_subtracts_mapped_child",
+  "fn a_zero_area_composite_takes_no_source_snapshot",
+  "fn render_dst_cliplist_include_inferiors_keeps_children",
+  "fn render_dst_cliplist_skips_manually_redirected_child",
+  "fn render_dst_cliplist_intersects_picture_clip_and_op_bbox",
+  "fn render_dst_cliplist_clamps_op_bbox_to_extent",
+  "fn render_dst_cliplist_empty_picture_clip_paints_nothing",
+  "fn render_dst_cliplist_fully_covered_is_empty",
+  "fn dst_picture_clip_by_children_reads_picture_record",
+  "fn seed_render_dst_with_child",
+  "fn render_composite_returns_child_clipped_region",
+  "fn render_trapezoids_returns_child_clipped_region",
+  "fn render_triangles_returns_child_clipped_region",
+  "fn render_composite_glyphs_returns_child_clipped_region",
+  "fn glyph_and_trap_requests_share_upload_blocks_across_frames",
+  "fn copy_area_clip_by_children_excludes_mapped_child_rect",
+  "fn copy_area_clip_by_children_no_children_returns_input",
+  "fn compute_render_composite_clip_all_none_returns_none",
+  "fn compute_render_composite_clip_only_dst",
+  "fn compute_render_composite_clip_src_only_zero_translation",
+  "fn compute_render_composite_clip_translates_src_clip_to_dst_space",
+  "fn compute_render_composite_clip_dst_and_src_intersection",
+  "fn compute_render_composite_clip_disjoint_yields_empty",
+  "fn compute_render_composite_clip_three_way_intersection",
+  "fn compute_render_composite_clip_multi_rect_dst_with_single_src",
+  "fn intersect_rect_with_clip_single_overlapping_clip_returns_intersection",
+  "fn intersect_rect_with_clip_empty_clip_returns_empty",
+  "fn intersect_rect_with_clip_multi_rect_clip_produces_per_rect_intersections",
+  "fn copy_area_clip_by_children_disjoint_child_returns_input",
+]
+
+[[modules]]
+name = "render_picture"
+lines = ["use super::*;"]
+items = [
+  "fn picture_record_lifecycle_exercises_every_value_mask_bit",
+  "fn picture_record_drawable_refcount_blocks_free_pixmap",
+  "fn picture_before_backing_pins_backing_on_late_materialization",
+  "fn picture_freed_before_materialization_leaves_no_pending_ref",
+  "fn window_picture_holds_no_store_ref_and_follows_rebind",
+  "fn window_picture_follows_window_storage_and_clips_away_without_it",
+  "fn window_picture_rebinds_to_the_new_leaf_after_remap",
+  "fn drawing_to_an_unmapped_window_writes_nothing_even_under_a_redirected_parent",
+  "fn damage_boundary_submits_render_batches_and_queued_commands",
+  "fn root_and_cow_storage_never_go_through_the_lifecycle",
+  "fn window_remap_at_the_same_size_is_a_pool_hit",
+  "fn pixmap_pool_eviction_and_idle_trim_free_the_memory",
+  "fn render_create_solid_fill_stores_wire_color_as_is",
+  "fn render_create_linear_gradient_parses_endpoints_and_stops",
+  "fn linear_gradient_resolves_as_gradient_source",
+  "fn gradient_free_picture_drops_record",
+  "fn default_window_init_color_per_depth",
+  "fn set_picture_clip_rectangles_pre_shifts_by_origin",
+  "fn set_picture_clip_rectangles_empty_list_is_empty_clip_not_no_clip",
+  "fn change_picture_clip_origin_repositions_stored_rects",
+  "fn set_picture_drawable_origin_persists_on_record",
+  "fn set_picture_drawable_origin_no_op_on_solidfill",
+  "fn picture_client_clip_rects_returns_set_clip",
+  "fn picture_client_clip_rects_window_backed_picture_with_nonzero_origin",
+  "fn picture_client_clip_rects_returns_some_none_when_no_clip_set",
+  "fn picture_client_clip_rects_outer_none_on_solidfill",
+  "fn install_solidfill_and_glyphset",
+  "fn the_first_occurrence_of_a_one_shot_is_claimed_once",
+  "fn composite_glyphs_counts_every_unsupported_drop_not_just_the_first",
+  "fn composite_glyphs_unsupported_op_drops",
+  "fn composite_glyphs_standard_ops_reach_engine",
+  "fn composite_glyphs_gradient_source_collapses_to_solidfill",
+  "fn composite_glyphs_inline_glyphset_change_parsed",
+]
+
+[[modules]]
+name = "root_scanout"
+lines = ["use super::*;"]
+items = [
+  "fn dispatch_poly_fill_rectangle",
+  "fn configure_border_width_agrees_between_core_tree_and_backend_mirror",
+  "fn clear_area_ignores_leftover_client_draw_state",
+  "fn process_request_root_fill_include_inferiors_matches_top_level_after_move",
+  "fn root_get_image_reads_scanout_pixels_not_root_storage",
+  "fn root_read_during_direct_scanout_returns_the_flipped_source",
+  "fn root_overlay_xor_pass_reaches_scanout",
+  "fn named_pixmap_survives_unmap_and_remap_gets_new_backing",
+  "fn root_copy_area_include_inferiors_captures_window_into_pixmap",
+  "fn split_root_scanout_reads_single_output_whole_rect",
+  "fn split_root_scanout_reads_honors_src_origin",
+  "fn split_root_scanout_reads_spanning_two_outputs",
+  "fn split_root_scanout_reads_clips_partially_offscreen",
+  "fn split_root_scanout_reads_fully_offscreen_is_empty",
+  "fn assemble_root_scanout_spans_two_outputs",
+  "fn assemble_root_scanout_reads_uncovered_area_from_the_root_background",
+  "fn assemble_root_scanout_failed_read_is_zero_filled",
+  "fn split_root_scanout_reads_output_offset_shifts_dst_local",
+  "fn split_root_scanout_reads_carries_subrect_dst_offset",
+  "fn outputs_set",
+  "fn direct_frame_slot_is_composed_without_any_direct_frame",
+  "fn direct_frame_slot_current_covers_every_output",
+  "fn direct_frame_slot_pending_only_on_outputs_where_it_retired",
+  "fn direct_frame_slot_first_direct_frame_leaves_unretired_outputs_composed",
+  "fn direct_frame_slot_composed_unflip_retires_per_output",
+  "fn scanout_read_route_follows_the_direct_source",
+  "fn scanout_read_route_is_composed_once_the_direct_frame_is_gone",
+  "fn scanout_read_route_rejects_a_rect_outside_the_direct_source",
+  "fn scanout_read_route_rejects_a_vanished_direct_source",
+  "fn scanout_read_route_is_per_output_during_a_composed_unflip",
+  "fn scanout_read_origin_labels_name_the_buffer",
+  "fn a_hotplug_that_grew_the_extent_grows_root_backing_storage",
+  "fn a_hotplug_that_shrank_the_extent_leaves_root_storage_alone",
+  "fn a_grown_root_storage_is_filled_with_the_root_background",
+  "fn a_resized_root_keeps_its_background_pixmap",
+  "fn set_logical_screen_size_updates_fb_and_root_storage",
+]
+
+[[modules]]
+name = "stacking"
+lines = ["use super::*;"]
+items = [
+  "fn drift1_backend_empty_input_shape_is_click_through",
+  "fn drift2_topif_noop_keeps_backend_order_in_sync_with_core",
+  "fn drift2_raise_keeps_cow_on_top",
+  "fn sync_top_level_order_includes_unmapped_excludes_subwindows",
+  "fn sync_top_level_order_restack_requests_direct_unflip",
+  "fn sync_top_level_order_without_restack_keeps_direct_scanout_active",
+  "fn restack_under_direct_target_is_ignored",
+  "fn sync_top_level_order_restack_under_direct_cow_keeps_direct_scanout",
+  "fn sync_top_level_order_restack_under_direct_cow_descendant_keeps_direct_scanout",
+  "fn unredirected_direct_scanout_rejects_a_fullscreen_window_covered_by_a_raised_top_level",
+  "fn unredirected_direct_scanout_keeps_an_uncovered_depth32_fullscreen_window_eligible",
+  "fn core_target_host",
+  "fn crosslayer_overlapping_top_levels_agree_on_topmost",
+  "fn crosslayer_framed_client_both_layers_resolve_client",
+]
+
+[[modules]]
+name = "vt_session"
+lines = ["use super::*;"]
+items = [
+  "fn down_keys_maintained_on_key_press_and_release",
+  "fn vt_suspend_clears_physical_source_keys_and_buttons_via_guarded_cleanup",
+  "fn xi_dynamic_reset_retires_kms_input_and_replays_inventory_on_the_runner_boundary",
+  "fn make_vt_fixture_headless",
+  "fn set_dpms_power_is_skipped_while_suspended_and_failed_resume_stays_closed",
+  "fn vt_switch_disable_transitions_to_suspended_and_releases_held_input",
+  "fn vt_switch_enable_after_disable_returns_to_active",
+  "fn vt_switch_rapid_double_switch_never_passes_through_active",
+  "fn vt_switch_coalesced_enable_resumes_not_stranded_in_suspended",
+  "fn vt_switch_full_cycle_no_refcell_panic",
+  "fn xi_source_removal_vt_suspend_releases_physical_state_once_and_resumes_same_facets",
+  "fn xi_source_removal_vt_suspend_releases_unpublished_physical_source",
+]
+
+[[modules]]
+name = "window_border"
+lines = ["use super::*;"]
+items = [
+  "fn bordered_storage_extent_collapses_at_bw_zero",
+  "fn vkrect",
+  "fn border_ring_rects_tile_the_annulus_exactly_once",
+  "fn border_ring_rects_is_empty_at_bw_zero",
+  "fn border_ring_rects_offset_content_and_one_pixel_border",
+  "fn border_ring_thickness_follows_the_allocation_not_the_geometry",
+  "fn border_solid_pixel_applies_the_depth32_alpha_rule",
+  "fn resolve_paint_target_leaf_storage_offsets_by_own_border",
+  "fn resolve_paint_target_ancestor_backing_adds_both_borders",
+  "fn resolve_paint_target_root_redirection_adds_own_border_only",
+  "fn resolve_paint_target_nested_descendants_accumulate_every_level",
+  "fn resolve_paint_target_redirect_clip_ignores_the_redirect_mode",
+  "fn resize_reallocates_storage_at_the_bordered_extent",
+  "fn picture_source_domain_clip_is_identity_without_a_border",
+  "fn border_width_change_reallocates_and_records_the_new_layout",
+  "fn border_change_with_unchanged_outer_extent_relocates_without_realloc",
+  "fn pure_move_relocates_nothing_storage_local",
+  "fn bw_zero_configures_keep_the_pre_133_paths",
+  "fn migrated_content_copy_maps_content_origin_to_content_origin",
+  "fn bordered_fullscreen_window_reports_a_border_clip_to_the_scanout_gate",
+]
+
+[[modules]]
+name = "window_tree"
+lines = ["use super::*;"]
+items = [
+  "fn change_subwindow_attributes_stores_bg_state",
+  "fn change_subwindow_attributes_stores_border_state",
+  "fn create_subwindow_records_parent_and_bg_pixel",
+  "fn create_and_configure_subwindow_record_border_width",
+  "fn copy_from_parent_child_inherits_argb_parent_depth",
+  "fn depth_only_visual_preserves_argb_top_level_depth",
+  "fn reparent_into_container_removes_from_top_level_order",
+  "fn reparent_subwindow_panics_when_host_parent_missing",
+  "fn reparent_subwindow_to_root_via_window_id_does_not_panic",
+  "fn restack_subwindow_updates_sibling_order",
+  "fn reparent_to_root_clears_parent",
+]
+
+[[modules]]
+name = "xi_device_enabled"
+lines = ["use super::*;"]
+items = [
+  "fn device_enabled_xi_request",
+  "fn device_enabled_request_bytes",
+  "fn device_enabled_device_property_list_body",
+  "fn device_enabled_get_enabled_xi2",
+  "fn device_enabled_get_enabled_xi1",
+  "fn device_enabled_event_kinds",
+  "fn xi_device_enabled_is_listed_and_read_through_xi1_xi2",
+  "fn xi_device_enabled_transitions_notify_before_presence_and_hierarchy",
+  "fn device_enabled_write_body_xi2",
+  "fn device_enabled_write_body_xi1",
+  "fn select_device_enabled_transition_events",
+  "fn assert_device_enabled_write_cleanup",
+  "fn xi_client_disabled_facet_stays_disabled_across_vt_round_trip",
+  "fn xi_session_disable_client_disabled_facet_reenables_only_after_resume",
+  "fn xi1_button_shape_set_mapping_is_busy_while_changed_button_held",
+  "fn xi_device_enabled_write_disables_only_requested_facet_and_drops_its_input",
+  "fn xi_device_enabled_write_drains_held_pointer_button_before_disable",
+  "fn xi_device_enabled_write_validates_virtual_devices_format_and_delete",
+  "fn xi_device_enabled_write_while_session_disabled_stays_floating_until_enabled",
+  "fn xi_device_enabled_write_preserves_transition_order_outer_notification_and_value",
+]
+
+[[modules]]
+name = "xi_grabs_classes"
+lines = ["use super::*;"]
+items = [
+  "fn xi_dynamic_master_motion_only_grab_gets_input_thread_wheel_motion",
+  "fn xi_owner_events_scroll_fixture",
+  "fn xi_owner_events_select_body",
+  "fn xi_owner_events_grab_body",
+  "fn xi_owner_events_scroll_events",
+  "fn xi_owner_events_state_snapshot",
+  "fn xi_owner_events_scroll_motion_falls_back_by_its_own_type",
+  "fn xi_owner_events_scroll_motion_stays_on_naturally_selected_child",
+  "fn xi_dynamic_owner_events_grab_fallback_preserves_slave_button_and_motion_identity",
+  "fn xi_lockmods_default_caps_from_unlocked_survives_keyboard_grab",
+  "fn xi_lockmods_affect_lock_survives_floating_keyboard_release",
+  "fn xi_lockmods_held_group_lock_key_is_not_replayed_on_detach",
+  "fn xi_lockmods_default_caps_clears_saved_prepress_lock_after_keyboard_grab",
+  "fn record_keeps_pointer_events_enqueued_while_master_is_synchronously_frozen",
+  "fn xi_slave_switch_scroll_stop_next_motion_and_query_share_current_source_value",
+  "fn xi_slave_switch_kms_suspend_and_removal_clear_last_source",
+  "fn xi_master_classes_dispatch_request",
+  "struct XiMasterClassSummary",
+  "fn xi_master_class_summary",
+  "fn xi_master_changed_summaries",
+  "fn xi_master_classes_initial_pointer_uses_core_pointer_shape_and_own_sourceid",
+  "fn xi_master_classes_store_last_slave_shape_after_removal_then_xtest_switch",
+  "fn xi_slave_switch_kms_keyboard_precedes_raw_and_key_events",
+]
+
+[[modules]]
+name = "xi_hotplug_session"
+lines = ["use super::*;"]
+items = [
+  "fn kms_fake_input_button_ten_uses_btn_forward_not_btn_task",
+  "fn kms_button_diagnostic_ignores_xtest_hold_for_physical_wheel_pair",
+  "fn kms_button_diagnostic_warns_on_duplicate_physical_press",
+  "fn xi_hotplug_per_window_host_lifecycle_delivers_each_window_copy",
+  "fn xi2_dynamic_hotplug_publishes_atomic_hierarchy_steps",
+  "fn xi_dynamic_session_disable_floats_query_and_resume_reattaches_home_master",
+  "fn xi_dynamic_session_disable_clears_grab_detach_before_ungrab",
+  "fn xi1_xi2_dynamic_hotplug_presence_precedes_hierarchy_for_each_transition",
+  "fn xi1_dynamic_hotplug_notifies_selected_client_at_each_facet_transition",
+]
+
+[[modules]]
+name = "xi_xtest"
+lines = ["use super::*;"]
+items = [
+  "fn xi_xtest_grab_body",
+  "fn xi_xtest_query_attachment",
+  "fn xi_xtest_generic_event_types",
+  "fn xi_xtest_grab_select_hierarchy",
+  "fn xi_xtest_fake_motion",
+  "fn xi_xtest_fake_key",
+  "fn xtest_relative_motion_moves_by_the_delta",
+  "fn xi_xtest_grab_pointer_floats_routes_and_reattaches",
+  "fn xi_xtest_grab_keyboard_uses_floating_xkb_state",
+  "fn xi_xtest_grab_pointer_replacement_preserves_floating_position",
+  "fn xi_xtest_grab_pointer_disconnect_reattaches_without_leaks",
+  "fn xi_modifier_mapping_core_notify_only_for_the_master_keyboard",
+  "fn xi_set_device_modifier_mapping_edits_the_keymap",
+]
+
+[[modules]]
+name = "xkb"
+lines = ["use super::*;"]
+items = [
+  "fn xkb_use_extension_from_a_big_endian_client_is_refused_in_its_byte_order",
+  "fn xkb_proxy_routes_indicator_map_to_minor_13",
+  "fn xkb_proxy_get_map_respects_client_requested_parts",
+  "fn backend_set_keymap_rmlvo_reports_range",
+  "fn load_keymap_by_components_multigroup",
+  "fn load_keymap_by_components_preserves_level3_chooser_option",
+  "fn xkb_get_kbd_by_name_parses_capture_loads_and_notifies",
+  "struct KbdMapCase",
+  "type KbdMapEdge",
+  "fn parse_kbd_map_fixture",
+  "fn kbd_map_get",
+  "fn change_keyboard_mapping_round_trips_as_xorg",
+  "fn xi_change_device_key_mapping_converts_as_core",
+  "fn change_keyboard_mapping_errors_as_xorg",
+  "struct XkbCkmStep",
+  "struct XkbCkmCase",
+  "fn parse_xkb_ckm_golden",
+  "struct XkbMapView",
+  "fn xkb_map_view",
+  "fn cooking_gate",
+  "fn xkb_get_controls",
+  "fn per_key_repeat",
+  "fn xkb_view_of_change_keyboard_mapping_matches_xorg",
+  "fn xkb_send_recorded",
+  "fn xkb_testdata",
+  "fn intern_recorded_atoms",
+  "fn xkb_set_request_errors_match_xorg",
+  "struct XkbcompStep",
+  "fn parse_xkb_request_steps",
+  "fn xkb_state_through_core_loop",
+  "fn xkb_line_matches",
+  "struct XkbReplay",
+  "impl XkbReplay",
+  "fn replay_xkb_request_step",
+  "const XKBCOMP_STEPS_IMPLEMENTED",
+  "fn replay_xkbcomp_upload",
+  "fn xkbcomp_uploads_match_xorg_request_by_request",
+  "fn xkbcomp_compat_upload_reaches_leds_and_cooking",
+  "fn set_compat_and_indicator_maps_match_xorg",
+  "fn set_names_and_geometry_match_xorg",
+  "fn set_map_key_width_resizing_matches_xorg",
+  "fn xkbcomp_set_map_reaches_key_cooking",
+  "fn change_keyboard_mapping_reaches_key_cooking",
+  "fn xi_change_device_key_mapping_notifies_xkb_clients",
+  "fn xkb_view_of_set_modifier_mapping_matches_xorg",
+  "fn xmodmap_caps_as_control_reaches_key_cooking",
+]
