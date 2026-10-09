@@ -4011,7 +4011,7 @@ fn handle_randr_request(
             // — only the unrelated `RRNoticePropertyChange` driver hook is
             // gated on `is_pending`. The wire notify fires regardless of
             // whether this write landed in `.current` or `.pending`.
-            super::run::notify_randr_output_property_changed(
+            crate::core_loop::run::notify_randr_output_property_changed(
                 state,
                 req.output,
                 property,
@@ -4084,7 +4084,7 @@ fn handle_randr_request(
                 );
             }
             entries.remove(index);
-            super::run::notify_randr_output_property_changed(
+            crate::core_loop::run::notify_randr_output_property_changed(
                 state,
                 req.output,
                 property,
@@ -4209,7 +4209,7 @@ fn handle_randr_request(
             // (randr/rroutput.c). Both the old and new primary changed, so both
             // are announced; clients learn about this by notify, not polling.
             let changed: Vec<u32> = [previous, output].into_iter().filter(|o| *o != 0).collect();
-            super::run::notify_randr_layout_changed(state, &changed);
+            crate::core_loop::run::notify_randr_layout_changed(state, &changed);
             return Ok(RequestOutcome::Handled);
         }
         x11randr::RR_GET_OUTPUT_PRIMARY => {
@@ -4433,7 +4433,7 @@ fn handle_randr_request(
                 }
             };
             if changed {
-                super::run::notify_randr_provider_changed(state, req.provider);
+                crate::core_loop::run::notify_randr_provider_changed(state, req.provider);
             }
             return Ok(RequestOutcome::Handled);
         }
@@ -4921,7 +4921,7 @@ fn handle_randr_request(
             // only for a real (non-immutable) store entry, since the
             // immutable check above already rejected a synthetic property.
             if req.delete && bytes_after == 0 && real.is_some() {
-                super::run::notify_randr_output_property_changed(
+                crate::core_loop::run::notify_randr_output_property_changed(
                     state,
                     req.output,
                     property,
@@ -5138,7 +5138,7 @@ fn handle_randr_request(
             // (CRTC positions are unchanged). Pass an empty changed
             // list so only ScreenChangeNotify + root ConfigureNotify fire.
             if !unchanged {
-                super::run::apply_screen_size_side_effects(
+                crate::core_loop::run::apply_screen_size_side_effects(
                     state,
                     backend,
                     req.width,
@@ -5296,7 +5296,7 @@ fn handle_randr_request(
             } else {
                 req_timestamp
             };
-            let output_bbox_before = super::run::enabled_output_bbox(state);
+            let output_bbox_before = crate::core_loop::run::enabled_output_bbox(state);
             let completion = CrtcConfigCompletion {
                 output_id,
                 set_time,
@@ -5683,7 +5683,7 @@ fn set_screen_config(
                 .collect();
             backend.refresh_randr_state_set_time(state, time);
             backend.randr_layout_changed(state);
-            super::run::emit_randr_change_notifications(state, &changed);
+            crate::core_loop::run::emit_randr_change_notifications(state, &changed);
         }
         if let Err(e) = backend.set_logical_screen_size(width, height) {
             log::warn!("RRSetScreenConfig: backend resize failed: {e}");
@@ -5691,7 +5691,7 @@ fn set_screen_config(
         }
         let (mm_w, mm_h) = (state.randr.width_mm, state.randr.height_mm);
         state.randr.set_logical_size(width, height, mm_w, mm_h);
-        super::run::apply_screen_size_side_effects(state, backend, width, height, &[]);
+        crate::core_loop::run::apply_screen_size_side_effects(state, backend, width, height, &[]);
         backend.randr_layout_changed(state);
     }
     // RRCrtcSet(crtc, mode, 0, 0, rotation, 1, &output) with the pending
@@ -5712,7 +5712,7 @@ fn set_screen_config(
     let completion = CrtcConfigCompletion {
         output_id: target.output_id,
         set_time: time,
-        output_bbox_before: super::run::enabled_output_bbox(state),
+        output_bbox_before: crate::core_loop::run::enabled_output_bbox(state),
         byte_order,
         apply_transform: (!target
             .pending_transform
@@ -5826,8 +5826,8 @@ pub(crate) fn complete_crtc_config(
                 .map(|o| (o.output_id, o.crtc_id, o.mode_id))
                 .into_iter()
                 .collect();
-            super::run::emit_randr_change_notifications(state, &changed);
-            super::run::emit_screen_resize_window_notifications_if_outputs_caught_up(
+            crate::core_loop::run::emit_randr_change_notifications(state, &changed);
+            crate::core_loop::run::emit_screen_resize_window_notifications_if_outputs_caught_up(
                 state,
                 completion.output_bbox_before,
             );
@@ -26391,7 +26391,11 @@ fn handle_kill_client(
             .filter_map(|(&id, &mode)| (mode == 2).then_some(id))
             .collect();
         for zid in temp_zombies {
-            super::process_disconnect::destroy_zombie_resources(state, backend, ClientId(zid));
+            crate::core_loop::process_disconnect::destroy_zombie_resources(
+                state,
+                backend,
+                ClientId(zid),
+            );
             state.zombie_clients.remove(&zid);
         }
         return Ok(RequestOutcome::Handled);
@@ -26411,7 +26415,7 @@ fn handle_kill_client(
         return Ok(RequestOutcome::Handled);
     }
     if state.zombie_clients.contains_key(&owner.0) {
-        super::process_disconnect::destroy_zombie_resources(state, backend, owner);
+        crate::core_loop::process_disconnect::destroy_zombie_resources(state, backend, owner);
         state.zombie_clients.remove(&owner.0);
         return Ok(RequestOutcome::Handled);
     }
@@ -26426,7 +26430,7 @@ fn handle_kill_client(
         // honored: if they set RetainPermanent / RetainTemporary,
         // their resources survive (they become a zombie) instead of
         // being freed.
-        super::process_disconnect::process_disconnect(state, backend, owner);
+        crate::core_loop::process_disconnect::process_disconnect(state, backend, owner);
     }
     Ok(RequestOutcome::Handled)
 }
