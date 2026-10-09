@@ -57,13 +57,7 @@ impl Backend for KmsBackend {
     }
 
     fn current_xkb_mods(&self) -> (u8, u8, u8, u8) {
-        let s = &self.core.xkb_state.0;
-        (
-            s.serialize_mods(xkbcommon::xkb::STATE_MODS_EFFECTIVE) as u8,
-            s.serialize_mods(xkbcommon::xkb::STATE_MODS_DEPRESSED) as u8,
-            s.serialize_mods(xkbcommon::xkb::STATE_MODS_LATCHED) as u8,
-            s.serialize_mods(xkbcommon::xkb::STATE_MODS_LOCKED) as u8,
-        )
+        Self::backend_keyboard_current_xkb_mods(self)
     }
 
     fn composite_opcode(&self) -> Option<u8> {
@@ -1852,8 +1846,6 @@ impl Backend for KmsBackend {
         Self::backend_present_present_capabilities(self, _window)
     }
 
-    // ── Other extensions ────────────────────────────────────────
-
     fn xkb_proxy(
         &mut self,
         _origin: Option<OriginContext>,
@@ -1861,49 +1853,7 @@ impl Backend for KmsBackend {
         body: &[u8],
         intern_atom: &mut dyn FnMut(&str) -> u32,
     ) -> io::Result<Option<Vec<u8>>> {
-        // Mirror v1's xkb_proxy verbatim — pure protocol
-        // bookkeeping using the shared `KmsCore.xkb_keymap`.
-        // Without this, Xlib clients abort at the XKEYBOARD
-        // UseExtension handshake, so no real-app smoke is
-        // possible. The behaviour-level fix is identical to v1
-        // (reply minors get bodies, void minors return None).
-        use crate::kms::{xkb as xkb_replies, xkb_desc::reply};
-        let desc = &self.core.xkb_desc;
-        let major = self.xkb_opcode().unwrap_or(0);
-        let or_error = |r: Result<Vec<u8>, reply::XkbError>| {
-            r.unwrap_or_else(|e| reply::error_packet(e, major, minor))
-        };
-        let reply = match minor {
-            0 => Some(xkb_replies::reply_use_extension()),
-            4 => Some(xkb_replies::reply_get_state(
-                &self.core.xkb_state.0,
-                self.effective_locked_group(),
-            )),
-            6 => Some(reply::reply_get_controls(desc)),
-            8 => Some(or_error(reply::reply_get_map(desc, body))),
-            10 => Some(or_error(reply::reply_get_compat_map(desc, body))),
-            // minor 13 is GetIndicatorMap (clients send it 8×); minor 22 is
-            // ListComponents, which clients don't send — a minimal reply is
-            // safe there, an IndicatorMap-shaped reply is wrong.
-            13 => Some(reply::reply_get_indicator_map(desc, body)),
-            15 => Some(reply::reply_get_named_indicator(
-                desc,
-                desc.indicators_lit(&self.core.xkb_state.0),
-                body,
-                intern_atom,
-            )),
-            17 => Some(or_error(reply::reply_get_names(desc, body, intern_atom))),
-            21 => Some(xkb_replies::reply_per_client_flags(body)),
-            22 => Some(xkb_replies::reply_minimal(22)),
-            24 => Some(xkb_replies::reply_get_device_info()),
-            12 | 19 | 23 | 101 => Some(xkb_replies::reply_minimal(minor)),
-            1 | 3 | 5 | 7 | 9 | 11 | 14 | 16 | 18 | 20 | 25 => None,
-            _ => {
-                log::debug!("render xkb: unknown minor {minor}, no reply sent");
-                None
-            }
-        };
-        Ok(reply)
+        Self::backend_keyboard_xkb_proxy(self, _origin, minor, body, intern_atom)
     }
 
     fn xkb_set(
@@ -1913,14 +1863,7 @@ impl Backend for KmsBackend {
         client_is_ancient: bool,
         atom_name: &dyn Fn(u32) -> Option<String>,
     ) -> Option<yserver_core::backend::XkbSetOutcome> {
-        match minor {
-            9 => Some(self.xkb_set_map(body, client_is_ancient)),
-            11 => Some(self.xkb_set_compat_map(body)),
-            14 => Some(self.xkb_set_indicator_map(body)),
-            18 => Some(self.xkb_set_names(body, atom_name)),
-            20 => Some(self.xkb_set_geometry(body, atom_name)),
-            _ => None,
-        }
+        Self::backend_keyboard_xkb_set(self, minor, body, client_is_ancient, atom_name)
     }
 
     fn xkb_get_kbd_by_name(
@@ -1928,87 +1871,7 @@ impl Backend for KmsBackend {
         body: &[u8],
         intern_atom: &mut dyn FnMut(&str) -> u32,
     ) -> Option<(Vec<u8>, Option<yserver_core::backend::XkbNewKeyboardInfo>)> {
-        // xkbGetKbdByNameReq body (after the 4-byte XKB request header the core
-        // loop already stripped): deviceSpec(2) need(2) want(2) load(1) pad(1),
-        // then CARD8-length-prefixed component strings in the order
-        // keymap, keycodes, types, compat, symbols, geometry
-        // (xkb.c ProcXkbGetKbdByName, GetComponentSpec). We need `symbols`
-        // (index 4) plus the want/need masks and the load flag.
-        if body.len() < 8 {
-            return None;
-        }
-        let need = u16::from_le_bytes([body[2], body[3]]);
-        let want = u16::from_le_bytes([body[4], body[5]]);
-        let load = body[6] != 0;
-
-        // Walk the 6 length-prefixed component strings; capture #4 (symbols).
-        let mut off = 8usize;
-        let mut symbols: Option<&[u8]> = None;
-        for idx in 0..6 {
-            if off >= body.len() {
-                break;
-            }
-            let len = usize::from(body[off]);
-            off += 1;
-            let end = off.saturating_add(len);
-            if end > body.len() {
-                break;
-            }
-            if idx == 4 {
-                symbols = Some(&body[off..end]);
-            }
-            off = end;
-        }
-        let symbols = std::str::from_utf8(symbols.unwrap_or(&[])).ok()?;
-
-        // Capture the OLD keycode range before any load, for the NKN.
-        let (old_min, old_max) = (
-            self.core.xkb_desc.min_key_code,
-            self.core.xkb_desc.max_key_code,
-        );
-
-        // Load the requested multi-group keymap when the client asked
-        // (Cinnamon always sends load=1 for a runtime layout-add).
-        let load_result = if load {
-            self.load_keymap_by_components(symbols)
-        } else {
-            // No load: report against the current keymap as "located".
-            KeymapLoad::Loaded {
-                min_keycode: old_min,
-                max_keycode: old_max,
-                changed: false,
-            }
-        };
-        let loaded = matches!(load_result, KeymapLoad::Loaded { .. });
-
-        // Build the reply from the now-current keymap.
-        let reply = crate::kms::xkb::reply_get_kbd_by_name(
-            &self.core.xkb_desc,
-            want,
-            need,
-            loaded,
-            intern_atom,
-        );
-
-        // Broadcast a NewKeyboardNotify only when a load actually changed the
-        // map (a no-op reload shouldn't churn every client's keymap). The
-        // captured Xorg reply uses changed = Keycodes|Geometry (0x0003).
-        let notify = match load_result {
-            KeymapLoad::Loaded {
-                min_keycode,
-                max_keycode,
-                changed: true,
-            } => Some(yserver_core::backend::XkbNewKeyboardInfo {
-                min_keycode,
-                max_keycode,
-                old_min_keycode: old_min,
-                old_max_keycode: old_max,
-                changed: 0x0003, // XkbNKN_KeycodesMask | XkbNKN_GeometryMask
-            }),
-            _ => None,
-        };
-
-        Some((reply, notify))
+        Self::backend_keyboard_xkb_get_kbd_by_name(self, body, intern_atom)
     }
 
     fn set_keymap_rmlvo(
@@ -2019,27 +1882,11 @@ impl Backend for KmsBackend {
         variant: &str,
         options: Option<&str>,
     ) -> Option<(u8, u8)> {
-        let range = self.core.recompile_keymap(&crate::kms::core::XkbRmlvo {
-            rules: rules.to_string(),
-            model: model.to_string(),
-            layout: layout.to_string(),
-            variant: variant.to_string(),
-            options: options.map(str::to_string),
-        })?;
-        // The reload starts from a fresh state (locks released).
-        self.sync_keyboard_leds();
-        Some(range)
+        Self::backend_keyboard_set_keymap_rmlvo(self, rules, model, layout, variant, options)
     }
 
     fn current_xkb_rules_names(&self) -> Option<[String; 5]> {
-        let r = &self.core.xkb_rmlvo;
-        Some([
-            r.rules.clone(),
-            r.model.clone(),
-            r.layout.clone(),
-            r.variant.clone(),
-            r.options.clone().unwrap_or_default(),
-        ])
+        Self::backend_keyboard_current_xkb_rules_names(self)
     }
 
     fn get_active_cursor_image(&self) -> Option<yserver_core::backend::ActiveCursorImage> {
@@ -2047,50 +1894,7 @@ impl Backend for KmsBackend {
     }
 
     fn load_keymap_by_components(&mut self, symbols: &str) -> KeymapLoad {
-        let Some(parsed) = crate::kms::xkb::parse_symbols_layouts(symbols) else {
-            return KeymapLoad::Failed; // fail-closed: keep current keymap
-        };
-        let rmlvo = crate::kms::core::XkbRmlvo {
-            rules: "evdev".to_string(),
-            model: "pc105".to_string(),
-            layout: parsed.layouts,
-            variant: parsed.variants,
-            options: if parsed.options.is_empty() {
-                None
-            } else {
-                Some(parsed.options)
-            },
-        };
-        // Already active and not edited since? Still a successful load, but
-        // changed=false (Xorg reports loaded=TRUE even on an unchanged
-        // reload). An edited keymap reloads (Xorg always reloads).
-        if self.core.keymap_is_pristine(&rmlvo) {
-            let (min, max) = (
-                self.core.xkb_desc.min_key_code,
-                self.core.xkb_desc.max_key_code,
-            );
-            return KeymapLoad::Loaded {
-                min_keycode: min,
-                max_keycode: max,
-                changed: false,
-            };
-        }
-        match self.core.recompile_keymap(&rmlvo) {
-            Some((min, max)) => {
-                // New map -> group 0 active until the next LatchLockState.
-                self.core.locked_group = 0;
-                // Fresh state: locks released.
-                self.sync_keyboard_leds();
-                KeymapLoad::Loaded {
-                    min_keycode: min,
-                    max_keycode: max,
-                    changed: true,
-                }
-            }
-            // A pristine match was ruled out above, so None here means a
-            // compile failure -> keep the current keymap.
-            None => KeymapLoad::Failed,
-        }
+        Self::backend_keyboard_load_keymap_by_components(self, symbols)
     }
 
     fn replace_cursor(
@@ -2188,9 +1992,7 @@ impl Backend for KmsBackend {
         first_keycode: u8,
         count: u8,
     ) -> io::Result<(u8, Vec<u32>)> {
-        // Xorg's XkbGetCoreMap layout (one width for the whole map, §12.4 group order).
-        let map = self.core.xkb_desc.core_map();
-        Ok((map.width, map.rows(first_keycode, count)))
+        Self::backend_keyboard_get_keyboard_mapping(self, _origin, first_keycode, count)
     }
 
     fn change_keyboard_mapping(
