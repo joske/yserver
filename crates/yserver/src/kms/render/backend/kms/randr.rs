@@ -1941,3 +1941,933 @@ impl KmsBackend {
         }
     }
 }
+
+impl KmsBackend {
+    pub(in crate::kms::render::backend) fn backend_randr_crtc_gamma_size(&self, crtc: u32) -> u16 {
+        self.crtc_key_by_id
+            .get(&crtc)
+            .map_or(0, |output_key| self.nominal_gamma_size(output_key))
+    }
+
+    pub(in crate::kms::render::backend) fn backend_randr_set_crtc_gamma(
+        &mut self,
+        crtc: u32,
+        red: &[u16],
+        green: &[u16],
+        blue: &[u16],
+    ) -> io::Result<()> {
+        let output_key = self.crtc_key_by_id.get(&crtc).cloned().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("unknown RANDR CRTC 0x{crtc:x}"),
+            )
+        })?;
+        let expected = usize::from(self.crtc_gamma_size(crtc));
+        if red.len() != expected || green.len() != expected || blue.len() != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "CRTC 0x{crtc:x} ({output_key:?}): gamma length mismatch (expected {expected}, got {}/{}/{})",
+                    red.len(),
+                    green.len(),
+                    blue.len(),
+                ),
+            ));
+        }
+        self.gamma_luts.borrow_mut().insert(
+            output_key.clone(),
+            GammaLut {
+                red: red.to_vec(),
+                green: green.to_vec(),
+                blue: blue.to_vec(),
+            },
+        );
+        self.apply_gamma_to_live_output(&output_key)
+    }
+
+    pub(in crate::kms::render::backend) fn backend_randr_get_crtc_gamma(
+        &self,
+        crtc: u32,
+    ) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+        let Some(output_key) = self.crtc_key_by_id.get(&crtc) else {
+            return (Vec::new(), Vec::new(), Vec::new());
+        };
+        let lut = match self.live_crtc_and_gamma_size(output_key) {
+            Ok(Some((_, _, size))) => self.cached_gamma_for_current_size(output_key, size),
+            Ok(None) => self.cached_gamma(output_key),
+            Err(e) => {
+                log::warn!("kms gamma: {output_key:?} get gamma size failed: {e}");
+                self.cached_gamma(output_key)
+            }
+        };
+        (lut.red, lut.green, lut.blue)
+    }
+
+    pub(in crate::kms::render::backend) fn backend_randr_on_display_hotplug(
+        &mut self,
+        _state: &mut ServerState,
+    ) {
+        #[cfg(target_os = "linux")]
+        {
+            let saw_change = self
+                .platform
+                .hotplug_monitor
+                .as_mut()
+                .map(|monitor| monitor.drain())
+                .unwrap_or(false);
+            if saw_change {
+                self.hotplug_rescan_deadline =
+                    Some(std::time::Instant::now() + std::time::Duration::from_millis(150));
+                log::debug!("kms: display hotplug edge — rescan armed (+150ms)");
+            }
+        }
+    }
+
+    pub(in crate::kms::render::backend) fn backend_randr_reprobe_connectors(
+        &mut self,
+        state: &mut ServerState,
+    ) -> io::Result<()> {
+        // RANDR's forced resource refresh only needs connector presence and
+        // mode lists. Full `discover_outputs` also enumerates planes,
+        // properties and modifiers and computes hypothetical assignments;
+        // under Cinnamon/GPU load that unrelated work blocked dispatch for
+        // 90–113 ms every time the desktop polled GetScreenResources.
+        let probes = self.platform.probe_all_connectors()?;
+        let _ = self.publish_connector_probes(state, &probes);
+        Ok(())
+    }
+
+    pub(in crate::kms::render::backend) fn backend_randr_set_provider_output_source(
+        &mut self,
+        state: &mut ServerState,
+        provider: u32,
+        source_provider: Option<u32>,
+    ) -> io::Result<bool> {
+        let invalid = |message: String| io::Error::new(io::ErrorKind::InvalidInput, message);
+        let sink_endpoint = self
+            .current_provider_endpoint_for_id(provider)
+            .ok_or_else(|| invalid(format!("unknown or inactive RANDR provider id {provider}")))?;
+        let RandrProviderEndpoint::Kms(sink_key) = sink_endpoint else {
+            return Err(invalid(format!(
+                "RANDR provider {provider} ({sink_endpoint:?}) is not a KMS output sink",
+            )));
+        };
+        let sink_has_connector_inventory = self
+            .randr_id_alloc
+            .entries()
+            .any(|(key, _)| key.device_key == sink_key);
+        if !sink_has_connector_inventory {
+            return Err(invalid(format!(
+                "RANDR provider {provider} ({sink_endpoint:?}) has no connector inventory and is not an output sink",
+            )));
+        }
+
+        let selected_source = self.selected_render_provider_endpoint();
+        if selected_source == Some(sink_endpoint) {
+            return Err(invalid(format!(
+                "RANDR provider {provider} is the selected renderer's coalesced KMS endpoint; same-device scanout is implicit and it cannot be an output sink",
+            )));
+        }
+        let requested_source = source_provider
+            .map(|source_id| {
+                self.current_provider_endpoint_for_id(source_id)
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "unknown or inactive RANDR source provider id {source_id}",
+                        ))
+                    })
+            })
+            .transpose()?;
+        if let Some(source) = requested_source
+            && Some(source) != selected_source
+        {
+            return Err(invalid(format!(
+                "RANDR source provider {} ({source:?}) is not the selected operational renderer {:?}",
+                source_provider.expect("requested source has an XID"),
+                selected_source,
+            )));
+        }
+
+        let current_source = self.provider_output_sources.get(&sink_key).copied();
+        let source_changes = requested_source != current_source;
+        if !source_changes {
+            return Ok(false);
+        }
+
+        // `platform.outputs` is the authoritative lifetime inventory even
+        // while DPMS is off or the VT is suspended: those routes still own
+        // scanout pools and can be re-lit. Never revoke or replace their source
+        // policy in place.
+        if current_source.is_some() {
+            let active_connectors: Vec<_> = self
+                .platform
+                .outputs
+                .iter()
+                .filter(|output| output.key.device_key == sink_key)
+                .map(|output| format!("{} on {}", output.key.connector_name, output.key.device_key))
+                .collect();
+            if !active_connectors.is_empty() {
+                return Err(invalid(format!(
+                    "cannot change PRIME Output Source for active sink provider {provider}: {}",
+                    active_connectors.join(", "),
+                )));
+            }
+        }
+
+        match requested_source {
+            Some(source) => {
+                self.provider_output_sources.insert(sink_key, source);
+                log::info!(
+                    "PRIME Output Source: sink provider {provider} ({sink_endpoint:?}) -> source provider {} ({source:?})",
+                    source_provider.expect("attached source has an XID"),
+                );
+            }
+            None => {
+                // Startup auto-association is one-shot. Absence therefore
+                // records the client's explicit detach for the rest of this
+                // backend lifetime; registry rebuilds never repopulate it.
+                self.provider_output_sources.remove(&sink_key);
+                log::info!(
+                    "PRIME Output Source: detached sink provider {provider} ({sink_endpoint:?})"
+                );
+            }
+        }
+        self.bump_crtc_config_topology_epoch("PRIME provider output source changed");
+
+        // A provider relationship changes neither the CRTC configuration nor
+        // available connector/mode inventory. Rebuild only the projection and
+        // preserve both lastSetTime and configTimestamp.
+        self.rebuild_randr_state(state, None, false);
+        Ok(true)
+    }
+
+    pub(in crate::kms::render::backend) fn backend_randr_begin_crtc_config(
+        &mut self,
+        output_id: u32,
+        connector: &str,
+        mode: Option<yserver_core::backend::ModeSpec>,
+        x: i32,
+        y: i32,
+    ) -> io::Result<CrtcConfigApply> {
+        // Until a worker/helper transport is installed, preserve the existing
+        // synchronous backend behavior exactly. Disables and same-device
+        // changes also have no disposable PRIME qualification to move away
+        // from the core thread.
+        let Some(mode_spec) = mode else {
+            return self
+                .apply_crtc_config(output_id, connector, mode, x, y)
+                .map(CrtcConfigApply::Applied);
+        };
+        if self.crtc_config_probe_executor.is_none() {
+            return self
+                .apply_crtc_config(output_id, connector, mode, x, y)
+                .map(CrtcConfigApply::Applied);
+        }
+
+        let output_key = self
+            .output_key_by_id
+            .get(&output_id)
+            .cloned()
+            .ok_or_else(|| io::Error::other(format!("unknown RANDR output id {output_id}")))?;
+        if output_key.connector_name != connector {
+            return Err(io::Error::other(format!(
+                "RANDR output {output_id} name mismatch: registry has {}, request resolved {connector}",
+                output_key.connector_name
+            )));
+        }
+
+        // Match apply_crtc_config's policy ordering: an idempotent request may
+        // not silently reassert a split output after its provider association
+        // was detached while another client was active.
+        if !self.provider_output_source_allows(output_key.device_key) {
+            let sink_endpoint = RandrProviderEndpoint::Kms(output_key.device_key);
+            let sink_provider = self.randr_id_alloc.providers.get(&sink_endpoint).copied();
+            let selected_source = self.selected_render_provider_endpoint();
+            let source_provider = selected_source
+                .and_then(|endpoint| self.randr_id_alloc.providers.get(&endpoint).copied());
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "output {connector} belongs to KMS sink provider {} ({sink_endpoint:?}); attach it to selected source provider {} ({selected_source:?}) with RANDR SetProviderOutputSource before enabling it",
+                    sink_provider.map_or_else(|| "<unknown>".to_string(), |id| id.to_string()),
+                    source_provider.map_or_else(|| "<none>".to_string(), |id| id.to_string()),
+                ),
+            ));
+        }
+
+        let requested = ConnectorConfig::Enabled {
+            mode_w: mode_spec.width,
+            mode_h: mode_spec.height,
+            vrefresh: mode_spec.vrefresh,
+            x,
+            y,
+        };
+        let current = self
+            .platform
+            .outputs
+            .iter()
+            .find(|layout| layout.key == output_key)
+            .map_or(ConnectorConfig::Off, |layout| ConnectorConfig::Enabled {
+                mode_w: layout.width,
+                mode_h: layout.height,
+                vrefresh: layout.output.picked.vrefresh,
+                x: layout.x,
+                y: layout.y,
+            });
+        if current == requested {
+            return self
+                .apply_crtc_config(output_id, connector, mode, x, y)
+                .map(CrtcConfigApply::Applied);
+        }
+
+        if self
+            .platform
+            .vk
+            .as_ref()
+            .is_some_and(|vk| vk.is_software_rasterizer())
+            && std::env::var_os("YSERVER_ALLOW_SOFTWARE_VULKAN").is_none()
+        {
+            return Err(io::Error::other(format!(
+                "begin_crtc_config: refusing to enable {connector} with a software Vulkan \
+                 renderer; install a hardware Vulkan driver or set \
+                 YSERVER_ALLOW_SOFTWARE_VULKAN=1 for a deliberate software-scanout setup"
+            )));
+        }
+        if self.vt_state != crate::vt::state::VtState::Active {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                format!(
+                    "begin_crtc_config: cannot qualify {connector} while VT is {:?}",
+                    self.vt_state
+                ),
+            ));
+        }
+
+        let route = self.platform.scanout_route_for_kms(output_key.device_key)?;
+        if !self.crtc_enable_needs_async_qualification(&output_key, mode_spec, route) {
+            return self
+                .apply_crtc_config(output_id, connector, mode, x, y)
+                .map(CrtcConfigApply::Applied);
+        }
+
+        let output_device = Rc::clone(
+            &self
+                .platform
+                .device_for_output(&output_key)
+                .ok_or_else(|| {
+                    io::Error::other(format!(
+                        "RANDR output {output_id} belongs to unavailable DRM device {}",
+                        output_key.device_key
+                    ))
+                })?
+                .device,
+        );
+        // Discovery and advertised-mode validation are deliberately completed
+        // while the old topology is still lit. The live DRM output stays in
+        // the pending entry; the executor receives one owned KMS-fd duplicate
+        // plus a scalar route request.
+        let prepared_output =
+            self.discover_crtc_config_output(&output_key, &output_device, connector)?;
+        if prepared_output.connector_name != connector {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "begin_crtc_config: discovery returned connector {} for requested {connector}",
+                    prepared_output.connector_name
+                ),
+            ));
+        }
+        if !prepared_output.modes.iter().any(|candidate| {
+            candidate.width == mode_spec.width
+                && candidate.height == mode_spec.height
+                && candidate.vrefresh == mode_spec.vrefresh
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "connector {connector}: mode {}x{}@{} not in advertised list",
+                    mode_spec.width, mode_spec.height, mode_spec.vrefresh
+                ),
+            ));
+        }
+
+        let token = self.enqueue_prepared_crtc_config_probe(
+            output_id,
+            output_key,
+            connector.to_string(),
+            mode_spec,
+            x,
+            y,
+            prepared_output,
+            route,
+        )?;
+        Ok(CrtcConfigApply::Pending(token))
+    }
+
+    pub(in crate::kms::render::backend) fn backend_randr_drain_ready_crtc_configs(
+        &mut self,
+    ) -> Vec<CrtcConfigToken> {
+        let completions = self
+            .crtc_config_probe_executor
+            .as_mut()
+            .map(|executor| executor.drain_ready())
+            .unwrap_or_default();
+        for completion in completions {
+            if !self
+                .pending_crtc_config_probes
+                .contains_key(&completion.token)
+            {
+                // Cancellation may race worker completion. The result is
+                // resource-free, so dropping it is sufficient; still notify
+                // the executor so it can retire transport bookkeeping.
+                if let Some(executor) = self.crtc_config_probe_executor.as_mut() {
+                    executor.cancel(completion.token);
+                }
+                continue;
+            }
+            if self
+                .ready_crtc_config_results
+                .contains_key(&completion.token)
+            {
+                log::debug!(
+                    "asynchronous CRTC qualifier returned late/duplicate token {:?}; ignoring it",
+                    completion.token
+                );
+                continue;
+            }
+            self.ready_crtc_config_results
+                .insert(completion.token, completion.result);
+            self.ready_crtc_config_announcements
+                .push_back(completion.token);
+        }
+        self.ready_crtc_config_announcements.drain(..).collect()
+    }
+
+    pub(in crate::kms::render::backend) fn backend_randr_finish_crtc_config(
+        &mut self,
+        token: CrtcConfigToken,
+    ) -> io::Result<bool> {
+        self.remove_crtc_config_ready_announcement(token);
+        self.invalidated_crtc_config_probes.remove(&token);
+        let result = match self.ready_crtc_config_results.remove(&token) {
+            Some(result) => result,
+            None if self.pending_crtc_config_probes.contains_key(&token) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!("asynchronous CRTC configuration {token:?} is not ready"),
+                ));
+            }
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("unknown asynchronous CRTC configuration token {token:?}"),
+                ));
+            }
+        };
+        let Some(mut pending) = self.pending_crtc_config_probes.remove(&token) else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("orphaned asynchronous CRTC result for token {token:?}"),
+            ));
+        };
+        if let Some(executor) = self.crtc_config_probe_executor.as_mut() {
+            executor.cancel(token);
+        }
+
+        let stale_error = |stage: &str, reason: String| {
+            io::Error::new(
+                io::ErrorKind::Interrupted,
+                format!("asynchronous CRTC configuration {token:?} became stale {stage}: {reason}"),
+            )
+        };
+        if let Some(reason) = self.stale_crtc_config_probe_reason(&pending) {
+            return Err(stale_error("before exact-plan replay", reason));
+        }
+        // Worker failures are terminal for this request but have not touched
+        // the live topology. In particular, an indeterminate disposable probe
+        // never enters quiesce/recovery on the core thread.
+        let qualified = result?;
+        let prepared_output = pending
+            .prepared_output
+            .take()
+            .expect("pending CRTC qualification owns its discovered output");
+
+        // Exact live allocation and TEST_ONLY happen while the old topology
+        // is still scanning out. The returned object is opaque but owns all
+        // uncommitted live resources, so an error or stale result can drop it
+        // safely without a blackout or partial installation.
+        let prepared = self.platform.prepare_qualified_connector_plan(
+            &pending.output_key,
+            prepared_output,
+            pending.mode,
+            pending.x,
+            pending.y,
+            qualified,
+        )?;
+        if let Some(reason) = self.stale_crtc_config_probe_reason(&pending) {
+            return Err(stale_error("during exact-plan replay", reason));
+        }
+
+        let restore_old_on_failure = pending.was_active;
+        self.quiesce_before_topology_mutation("asynchronous RANDR CRTC configuration changed")?;
+        if let Err(error) = self.platform.install_prepared_connector_plan(prepared) {
+            log::error!(
+                "finish_crtc_config: installing qualified plan for {} failed: {error}",
+                pending.connector
+            );
+            return Err(self.recover_failed_crtc_config(restore_old_on_failure, error));
+        }
+
+        {
+            let entry = self.randr_id_alloc.entry_mut(&pending.output_key);
+            entry.config = ConnectorConfig::Enabled {
+                mode_w: pending.mode.width,
+                mode_h: pending.mode.height,
+                vrefresh: pending.mode.vrefresh,
+                x: pending.x,
+                y: pending.y,
+            };
+            entry.client_configured = true;
+            entry.connected = true;
+            // The client has placed this output itself; the remembered route
+            // and its reserved slot are released.
+            entry.last_enabled = None;
+        }
+        log::info!(
+            "finish_crtc_config: enabled {} {}x{}@{} at ({},{}) with qualified plan",
+            pending.connector,
+            pending.mode.width,
+            pending.mode.height,
+            pending.mode.vrefresh,
+            pending.x,
+            pending.y,
+        );
+
+        self.prune_armed_targets_to_live_outputs();
+        let desired_active = kms_outputs_active_after_crtc_config(
+            restore_old_on_failure,
+            true,
+            self.platform.outputs.len(),
+        );
+        if let Err(error) = self.scene.rebuild_outputs(&self.platform) {
+            log::error!(
+                "finish_crtc_config: scene rebuild failed after topology change: {error:?}"
+            );
+            let error = io::Error::other(format!(
+                "finish_crtc_config: scene rebuild failed: {error:?}"
+            ));
+            let relight = self.relight_after_direct_teardown(
+                desired_active,
+                "asynchronous RANDR CRTC scene-rebuild failure",
+            );
+            self.kms_outputs_active = false;
+            self.request_exit();
+            return Err(relight.err().unwrap_or(error));
+        }
+        self.relight_after_direct_teardown(
+            desired_active,
+            "asynchronous RANDR CRTC configuration",
+        )?;
+        self.kms_outputs_active = desired_active;
+        self.update_input_extent(self.platform.fb_w, self.platform.fb_h);
+        self.scene.wake_for_damage();
+        Ok(true)
+    }
+
+    pub(in crate::kms::render::backend) fn backend_randr_cancel_crtc_config(
+        &mut self,
+        token: CrtcConfigToken,
+    ) {
+        self.remove_crtc_config_ready_announcement(token);
+        self.invalidated_crtc_config_probes.remove(&token);
+        self.pending_crtc_config_probes.remove(&token);
+        self.ready_crtc_config_results.remove(&token);
+        if let Some(executor) = self.crtc_config_probe_executor.as_mut() {
+            executor.cancel(token);
+        }
+    }
+
+    pub(in crate::kms::render::backend) fn backend_randr_apply_crtc_config(
+        &mut self,
+        output_id: u32,
+        connector: &str,
+        mode: Option<yserver_core::backend::ModeSpec>,
+        x: i32,
+        y: i32,
+    ) -> io::Result<bool> {
+        let output_key = self
+            .output_key_by_id
+            .get(&output_id)
+            .cloned()
+            .ok_or_else(|| io::Error::other(format!("unknown RANDR output id {output_id}")))?;
+        if output_key.connector_name != connector {
+            return Err(io::Error::other(format!(
+                "RANDR output {output_id} name mismatch: registry has {}, request resolved {connector}",
+                output_key.connector_name
+            )));
+        }
+        let output_device = Rc::clone(
+            &self
+                .platform
+                .device_for_output(&output_key)
+                .ok_or_else(|| {
+                    io::Error::other(format!(
+                        "RANDR output {output_id} belongs to unavailable DRM device {}",
+                        output_key.device_key
+                    ))
+                })?
+                .device,
+        );
+
+        // Provider policy authorizes only the attempt. Exact real-operation
+        // DMA-BUF allocation/import/render/TEST_ONLY probing remains in
+        // `enable_connector`; capability metadata there is diagnostic only.
+        // Place this before the idempotency guard so an
+        // already-active split output can never be silently reasserted under a
+        // missing/stale policy. Production startup auto-associates every
+        // distinct sink, while an explicit later detach remains persistent.
+        if mode.is_some() && !self.provider_output_source_allows(output_key.device_key) {
+            let sink_endpoint = RandrProviderEndpoint::Kms(output_key.device_key);
+            let sink_provider = self.randr_id_alloc.providers.get(&sink_endpoint).copied();
+            let selected_source = self.selected_render_provider_endpoint();
+            let source_provider = selected_source
+                .and_then(|endpoint| self.randr_id_alloc.providers.get(&endpoint).copied());
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "output {connector} belongs to KMS sink provider {} ({sink_endpoint:?}); attach it to selected source provider {} ({selected_source:?}) with RANDR SetProviderOutputSource before enabling it",
+                    sink_provider.map_or_else(|| "<unknown>".to_string(), |id| id.to_string()),
+                    source_provider.map_or_else(|| "<none>".to_string(), |id| id.to_string()),
+                ),
+            ));
+        }
+
+        // ── Idempotency guard (CRITICAL) ──────────────────────────────────
+        //
+        // MATE / mate-settings-daemon re-assert the SAME SetCrtcConfig many
+        // times in a row (bursts of identical requests). Every call here used
+        // to run a full quiesce + modeset + scene rebuild + repaint, which on
+        // a steady-state desktop hammers the CRTC back-to-back → constant
+        // flicker/tearing (observed single-screen, immediate zap). Compare the
+        // request against the ACTUAL current scanout state (`platform.outputs`
+        // is the source of truth) and no-op when nothing changed, so only a
+        // genuine mode/position/on-off change pays the modeset cost.
+        let requested = match mode {
+            None => ConnectorConfig::Off,
+            Some(m) => ConnectorConfig::Enabled {
+                mode_w: m.width,
+                mode_h: m.height,
+                vrefresh: m.vrefresh,
+                x,
+                y,
+            },
+        };
+        let current = self
+            .platform
+            .outputs
+            .iter()
+            .find(|layout| layout.key == output_key)
+            .map_or(ConnectorConfig::Off, |l| ConnectorConfig::Enabled {
+                mode_w: l.width,
+                mode_h: l.height,
+                vrefresh: l.output.picked.vrefresh,
+                x: l.x,
+                y: l.y,
+            });
+        if current == requested {
+            log::debug!(
+                "apply_crtc_config: {connector} already at requested config ({requested:?}); no-op"
+            );
+            // Keep the registry's current-config view in sync (cheap) without
+            // touching the hardware. Return `false` = nothing changed, so the
+            // handler skips the change-notify (Xorg RRTellChanged only fires
+            // on a real change) — this is what breaks MATE's re-assert loop.
+            let entry = self.randr_id_alloc.entry_mut(&output_key);
+            entry.config = requested;
+            // A client asserting a config is an explicit statement of intent
+            // about this output, so it releases any remembered route (and
+            // with it the reserved slot). Never resurrect a route the client
+            // has spoken for.
+            entry.last_enabled = None;
+            return Ok(false);
+        }
+
+        // An opened card may have started with no connected outputs, in which
+        // case software Vulkan is valid for headless X rendering. Refuse the
+        // first later RANDR scanout enable unless the same explicit override
+        // accepted by startup is present; exporting a software-Vulkan BO to
+        // real KMS can hard-hang the machine.
+        if mode.is_some()
+            && self
+                .platform
+                .vk
+                .as_ref()
+                .is_some_and(|vk| vk.is_software_rasterizer())
+            && std::env::var_os("YSERVER_ALLOW_SOFTWARE_VULKAN").is_none()
+        {
+            return Err(io::Error::other(format!(
+                "apply_crtc_config: refusing to enable {connector} with a software Vulkan \
+                 renderer; install a hardware Vulkan driver or set \
+                 YSERVER_ALLOW_SOFTWARE_VULKAN=1 for a deliberate software-scanout setup"
+            )));
+        }
+
+        // Resolve the requested connector before taking the old CRTC set
+        // offline. A pure discovery failure must not blank a working desktop.
+        // Pool allocation and the actual modeset remain in `enable_connector`
+        // after quiescing, where failures can restore the old composed set.
+        let prepared_output = if mode.is_some() {
+            let reserved_routes: Vec<_> = self
+                .platform
+                .outputs
+                .iter()
+                .filter(|layout| {
+                    layout.key.device_key == output_key.device_key && layout.key != output_key
+                })
+                .map(|layout| {
+                    (
+                        layout.output.encoder,
+                        layout.output.crtc,
+                        layout.output.plane,
+                    )
+                })
+                .collect();
+            Some(
+                crate::platform::drm::discover_output_for_connector(
+                    &output_device,
+                    connector,
+                    &reserved_routes,
+                )
+                .map_err(|e| {
+                    log::error!("apply_crtc_config: target discovery for {connector} failed: {e}");
+                    e
+                })?,
+            )
+        } else {
+            None
+        };
+
+        // ── Flip-safety: quiesce the complete old topology ────────────────
+        //
+        // Both enable and disable modify `platform.outputs` (topology),
+        // so we need `drain_all` + `rebuild_outputs` — the same path
+        // `fire_randr_changes` uses for hotplug.  The sequence below:
+        //
+        //   all CRTCs off      — proves no survivor still references a BO
+        //                       whose userspace phase is about to be reset.
+        //   wait/drain/reset   — retires GPU work and clears both the scene
+        //                       ack ledger and matching platform BO phases.
+        //   platform mutate   — disable_connector / enable_connector
+        //   rebuild + relight — restores every surviving/new active CRTC.
+        //
+        // The `commit_modeset` / `disable_output` calls in the platform
+        // helpers are ALLOW_MODESET atomic commits (not page-flips), so
+        // they are always legal after drain_all.  After rebuild_outputs
+        // the scene's `pending_acks` is fresh-empty for every output, so
+        // the subsequent `wake_for_damage` tick is EBUSY-safe.
+        let restore_old_on_failure = self.kms_outputs_active;
+        self.quiesce_before_topology_mutation("RANDR CRTC configuration changed")?;
+
+        match mode {
+            None => {
+                // ── Disable path ─────────────────────────────────────────
+                if self.platform.remove_connector_after_all_off(&output_key) {
+                    log::info!("apply_crtc_config: disabled {connector}");
+                } else {
+                    // Already off — still update the registry.
+                    log::debug!("apply_crtc_config: {connector} was already off");
+                }
+                // Update registry: connector stays known, config → Off.
+                {
+                    let entry = self.randr_id_alloc.entry_mut(&output_key);
+                    entry.config = ConnectorConfig::Off;
+                    entry.crtc_associated = false;
+                    // client_configured is set to record that a client
+                    // explicitly disabled this output (not an auto-layout op).
+                    entry.client_configured = true;
+                    // An explicit disable must not be undone by a later
+                    // auto-relight (invariant 6): unplugging a deliberately
+                    // disabled monitor may not resurrect it.
+                    entry.last_enabled = None;
+                }
+            }
+            Some(mode_spec) => {
+                // ── Enable / mode-change path ────────────────────────────
+                let output = prepared_output.expect("enabled request prepared its connector");
+
+                // enable_connector handles: mode resolution, pool
+                // (re)alloc, commit_modeset, ActiveOutput update,
+                // fb extent recompute.
+                if let Err(e) = self
+                    .platform
+                    .enable_connector(&output_key, output, mode_spec, x, y)
+                {
+                    log::error!("apply_crtc_config: enable_connector({connector}) failed: {e}");
+                    if is_terminal_disposable_probe_error(&e) {
+                        // The old topology is already quiesced and dark. A
+                        // terminal probe failure deliberately retains GPU
+                        // owners; rebuilding the scene here would drop the old
+                        // composite rings and re-enter vkDeviceWaitIdle on the
+                        // same physical GPU. Re-commit only the unchanged old
+                        // KMS framebuffers, without rebuilding or dropping any
+                        // Vulkan owner, then return to the core loop so
+                        // input/VT handling remains responsive.
+                        if restore_old_on_failure {
+                            match self.platform.dpms_set_outputs_active(true) {
+                                Ok(()) => {
+                                    self.reapply_gamma_for_live_outputs();
+                                    self.kms_outputs_active = !self.platform.outputs.is_empty();
+                                    log::error!(
+                                        "apply_crtc_config: terminal disposable probe failure; \
+                                         restored the unchanged old KMS topology and skipped \
+                                         Vulkan teardown/recovery"
+                                    );
+                                }
+                                Err(relight_error) => {
+                                    self.kms_outputs_active = false;
+                                    log::error!(
+                                        "apply_crtc_config: terminal disposable probe failure; \
+                                         old KMS topology relight also failed: {relight_error}; \
+                                         skipped Vulkan teardown/recovery"
+                                    );
+                                }
+                            }
+                        } else {
+                            self.kms_outputs_active = false;
+                            log::error!(
+                                "apply_crtc_config: terminal disposable probe failure from a \
+                                 previously headless topology; skipped Vulkan teardown/recovery"
+                            );
+                        }
+                        return Err(e);
+                    }
+                    return Err(self.recover_failed_crtc_config(restore_old_on_failure, e));
+                }
+
+                // Update registry.
+                {
+                    let entry = self.randr_id_alloc.entry_mut(&output_key);
+                    entry.config = ConnectorConfig::Enabled {
+                        mode_w: mode_spec.width,
+                        mode_h: mode_spec.height,
+                        vrefresh: mode_spec.vrefresh,
+                        x,
+                        y,
+                    };
+                    entry.crtc_associated = true;
+                    entry.client_configured = true;
+                    entry.connected = true;
+                    // The client has placed this output itself; the
+                    // remembered route and its reserved slot are released.
+                    entry.last_enabled = None;
+                }
+
+                log::info!(
+                    "apply_crtc_config: enabled {connector} {}×{}@{} at ({x},{y})",
+                    mode_spec.width,
+                    mode_spec.height,
+                    mode_spec.vrefresh
+                );
+            }
+        }
+
+        self.prune_armed_targets_to_live_outputs();
+
+        // Decide whether the new topology should be lit. A first enable from
+        // headless opens the gate; disabling while the old topology was dark
+        // keeps surviving outputs dark.
+        let desired_active = kms_outputs_active_after_crtc_config(
+            restore_old_on_failure,
+            matches!(requested, ConnectorConfig::Enabled { .. }),
+            self.platform.outputs.len(),
+        );
+
+        // ── Scene + RANDR rebuild ─────────────────────────────────────────
+        if let Err(e) = self.scene.rebuild_outputs(&self.platform) {
+            log::error!("apply_crtc_config: scene rebuild failed after topology change: {e:?}");
+            let error = io::Error::other(format!("apply_crtc_config: scene rebuild failed: {e:?}"));
+            let relight = self
+                .relight_after_direct_teardown(desired_active, "RANDR CRTC scene-rebuild failure");
+            // Hardware/platform/registry state has already changed, but the
+            // core RANDR projection cannot be rebuilt consistently. Rollback
+            // would itself require another fallible modeset, so fail-stop
+            // instead of continuing with two contradictory topologies.
+            self.kms_outputs_active = false;
+            self.request_exit();
+            return Err(relight.err().unwrap_or(error));
+        }
+        self.relight_after_direct_teardown(desired_active, "RANDR CRTC configuration")?;
+        self.kms_outputs_active = desired_active;
+
+        // Update input extent (cursor clamp) to reflect new fb size.
+        let (new_fb_w, new_fb_h) = (self.platform.fb_w, self.platform.fb_h);
+        self.update_input_extent(new_fb_w, new_fb_h);
+
+        self.scene.wake_for_damage();
+        Ok(true)
+    }
+
+    pub(in crate::kms::render::backend) fn backend_randr_randr_layout_changed(
+        &mut self,
+        state: &mut ServerState,
+    ) {
+        // The root extent is the client's (spec D3, "Two extents"); a CRTC
+        // set recomputes `fb_w`/`fb_h` from the modes, which is neither the
+        // root nor any footprint.
+        let root = (
+            state.randr.screen_width.max(1),
+            state.randr.screen_height.max(1),
+        );
+        let root_changed = root != (self.platform.fb_w, self.platform.fb_h);
+        if root_changed {
+            (self.platform.fb_w, self.platform.fb_h) = root;
+            self.update_input_extent(root.0, root.1);
+        }
+        // Rotation and reflection combined with the client transform, as
+        // `RRTransformCompute`: one matrix for footprint, pass and readback.
+        let transforms: HashMap<OutputKey, yserver_core::randr::CrtcTransform> = state
+            .randr
+            .outputs
+            .iter()
+            .map(|o| (o, o.crtc_transform()))
+            .filter(|(_, t)| !t.is_identity())
+            .filter_map(|(o, t)| {
+                let key = self.output_key_by_id.get(&o.output_id)?.clone();
+                Some((key, t))
+            })
+            .collect();
+        let transforms_changed = transforms != self.platform.output_transforms;
+        if transforms_changed {
+            // No transformed CRTC is ever flipped directly (spec D5).
+            self.request_direct_unflip("crtc_transform_changed");
+            self.platform.output_transforms = transforms;
+            log::info!(
+                "kms: CRTC transforms now on {} output(s)",
+                self.platform.output_transforms.len()
+            );
+        }
+        if root_changed || transforms_changed {
+            if let Err(error) = self.scene.sync_output_layouts(&self.platform) {
+                log::error!("kms: scene could not follow the RANDR layout: {error}");
+            }
+            self.scene.wake_for_damage();
+        }
+        self.move_pointer_to_nearest_crtc(state);
+    }
+
+    pub(in crate::kms::render::backend) fn backend_randr_set_logical_screen_size(
+        &mut self,
+        w: u16,
+        h: u16,
+    ) -> io::Result<()> {
+        let w = w.max(1);
+        let h = h.max(1);
+        if (w, h) == (self.platform.fb_w, self.platform.fb_h) {
+            return Ok(());
+        }
+
+        self.apply_virtual_screen_extent(w, h)?;
+        log::info!("render set_logical_screen_size: resized virtual screen to {w}×{h}");
+        Ok(())
+    }
+}
