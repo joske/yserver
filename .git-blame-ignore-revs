@@ -32,3 +32,18 @@ b34bb685edbac5b0fa940985f5309eafdfb9f55a
 
 # refactor(protocol): move x11/mod.rs tests out of line (move)
 dd5ba5da6c7d0e29907d35dad8e95eca8415d60d
+
+# refactor(core): split process_request tests into topic modules (move)
+c16e8fb7d44c68acfea96420a935c77f3f60bae8
+
+# refactor(kms): split backend tests into topic modules (move)
+5a9b1ad6fc80e92b3fce1b7daa9b37518ae458e9
+
+# refactor(tests): split render_acceptance into one binary with topic modules (move)
+90c712ddffa3897dc30f94ec6adf8f72e9e967d0
+
+# refactor(kms): split scene tests into topic modules (move)
+5b041d1913d05c6df6b4906533a999121cc34663
+
+# refactor(kms): split engine tests into topic modules (move)
+c85d9b2fe615d725ae0763d96075576a08e2aefc
