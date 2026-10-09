@@ -1,8 +1,7 @@
 # Phase 2.6 proposal: split `process_request.rs` (production code)
 
 Step 2.6 of `2026-10-08-source-layout-cleanup.md`. Manifest:
-`tools/split/manifests/process_request_2.toml` (+ `.paths`). Status: dry run
-only, nothing moved yet.
+`tools/split/manifests/process_request_2.toml` (+ `.paths`). Dry run only.
 
 ## Structure today (35,796 lines, tests already out)
 
@@ -19,16 +18,13 @@ only, nothing moved yet.
 - **Shared helpers:** `emit_x11_error{,_with_minor}`, `write_to_client`,
   `send_reply_with_fd`, `drawable_lookup`/`validate_*`, `xid_out_of_client_range`,
   `drawable_exists`, `window_unviewable`, `zpixmap_expected_len`.
-- **State touched:** everything goes through `&mut ServerState` and
-  `&mut dyn Backend`. There is no other shared state.
+- **State:** only `&mut ServerState` and `&mut dyn Backend`.
 - **Macros:** two fn-local `macro_rules!`: `verify_pictures!`
   (`handle_render_request`, 13 uses) and `require_len!`
   (`handle_xinerama_request`, 6 uses). Their transcribers name only fn locals,
   absolute paths and root helpers. There are no other macro definitions.
-- **Logs:** 376 `debug!`, 64 `warn!`, 17 `trace!`, 7 `info!`, 1 `error!`.
-  41 calls use `target:`, and the rest use the default `module_path!()`
-  target. There is no `module_path!`, `line!`, `file!` or `#[track_caller]`,
-  and verify found no location-sensitive code.
+- **Logs:** 376 `debug!`, 64 `warn!`, 17 `trace!`, 7 `info!`, 1 `error!`
+  (41 with `target:`). No `module_path!`/`line!`/`file!`/`#[track_caller]`.
 - **Who uses it from outside:** `run.rs`, `process_disconnect.rs`,
   `key_fanout.rs`, `pointer_fanout.rs`, `sync_await.rs`, `composite_overlay.rs`
   and `record.rs` call ~45 `pub(crate)`/`pub(super)` items. The `yserver`
@@ -97,15 +93,10 @@ shadowed names.
     directly).
 - 1 item becomes `pub(in crate::core_loop::process_request)`:
   `handle_xi2_request`, which is a grandchild of the root.
-- No field visibility changes. No item is widened beyond what it already has.
-- **Re-exports** are manifest lines:
-  - The root uses `pub use` for `present_ext` and `randr_ext` (they hold `pub`
-    items), `pub(crate) use` for 10 children that hold `pub(crate)` items, and
-    plain `use` for the rest.
-  - `xi/mod.rs` has `pub(super) use dispatch::*`.
-  - Each level matches the widest item in that child. A broader glob warns
-    ("glob import doesn't reexport anything … public enough") and fails
-    `-D warnings`.
+- **Re-exports** (manifest lines): root `pub use` for `present_ext`/`randr_ext`,
+  `pub(crate) use` for 10 children with `pub(crate)` items, plain `use` for the
+  rest; `xi/mod.rs` has `pub(super) use dispatch::*`. Each level matches the
+  widest item in that child; a broader glob warns and fails `-D warnings`.
 
 **Refusals and how the dry run handled them:**
 1. **Relative paths (sound refusal).** There are 12 `super::run::` and 3
@@ -161,4 +152,4 @@ shadowed names.
 2. `refactor(core): split process_request into request-family modules (move)`:
    `split apply` + fmt, `split verify --manifest …` and the rule-4 test lists,
    then the full gate (rule 5).
-3. `chore: blame-ignore` for both commits.
+3. `chore: blame-ignore` for both.
