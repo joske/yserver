@@ -1,0 +1,45 @@
+# Phase 1a for platform.rs: its inline #[cfg(test)] module(s) go out
+# of line at the same logical paths; production items stay in place.
+source = "crates/yserver/src/kms/render/platform.rs"
+module = "kms::render::platform"
+dir = "crates/yserver/src/kms/render/platform"
+root_form = "file"
+table = "platform.paths"
+
+[[modules]]
+name = ""
+items = [
+  "const *",
+  "enum *",
+  "fn *",
+  "impl < 'a , O , F > InitialScanoutRollbackGuard < 'a , O , F > where O : RollbackScanoutOutput , F : FnMut (& drm :: Device , & crate :: platform :: drm :: Output) -> io :: Result < () >",
+  "impl ConnectorSnapshot",
+  "impl CopiedScanoutError",
+  "impl CopyFreeScanoutError",
+  "impl CrtcKey",
+  "impl CursorMoveOutcome",
+  "impl Drop for FencePool",
+  "impl Drop for FenceTicketInner",
+  "impl Drop for PlatformBackend",
+  "impl Drop for PresentCompletionSignal",
+  "impl DroppedRoute",
+  "impl FencePool",
+  "impl FencePoolInner",
+  "impl FenceTicket",
+  "impl KmsCursorState",
+  "impl < O , F > Drop for InitialScanoutRollbackGuard < '_ , O , F > where O : RollbackScanoutOutput , F : FnMut (& drm :: Device , & crate :: platform :: drm :: Output) -> io :: Result < () >",
+  "impl PlatformBackend",
+  "impl PresentCompletionSignal",
+  "impl RenderDevice",
+  "impl RollbackScanoutOutput for ActiveOutput",
+  "impl RollbackScanoutOutput for PlatformInitOutput",
+  "impl std :: fmt :: Debug for FenceTicketInner",
+  "struct *",
+  "trait *",
+  "type *",
+  "use *",
+]
+
+[[modules]]
+name = "tests"
+items = ["tests::*"]
