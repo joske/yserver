@@ -141,6 +141,8 @@ CI's step plus the local ICD pin:
 YSERVER_ALLOW_SOFTWARE_VULKAN=1 cargo test -p yserver --locked --features
 xdmcp --no-fail-fast -- --ignored`; rules 2–4. "lavapipe" below means this
 command.
+Gate runs keep their complete output (`… 2>&1 | tee target/gate-<step>.log`)
+so a failure's test name is never lost to a truncated tail.
 
 **6. Blame.** Move SHAs go into `.git-blame-ignore-revs` in a follow-up commit;
 cross-file moves still need `git blame -C -C` (one line in the file header).
