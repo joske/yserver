@@ -110,8 +110,33 @@ pub fn tok(t: &impl ToTokens) -> String {
 
 /// Drops the trailing commas rustfmt adds or removes with line width, only in
 /// syntax where they carry no meaning; 1-tuples, macro and attribute tokens
-/// are left alone.
+/// are left alone. A closure body `{ e }` (no statements, attributes, label,
+/// return type; `e` not a brace macro) compares as `e`.
 pub struct Commas;
+
+/// `e` of a plain block `{ e }`.
+fn tail_only(body: &syn::Expr) -> Option<syn::Expr> {
+    let syn::Expr::Block(b) = body else {
+        return None;
+    };
+    if !b.attrs.is_empty() || b.label.is_some() {
+        return None;
+    }
+    match b.block.stmts.as_slice() {
+        [syn::Stmt::Expr(e, None)] if !tok(e).starts_with('#') => Some(e.clone()),
+        [syn::Stmt::Macro(m)]
+            if m.attrs.is_empty()
+                && m.semi_token.is_none()
+                && !matches!(m.mac.delimiter, syn::MacroDelimiter::Brace(_)) =>
+        {
+            Some(syn::Expr::Macro(syn::ExprMacro {
+                attrs: Vec::new(),
+                mac: m.mac.clone(),
+            }))
+        }
+        _ => None,
+    }
+}
 
 fn trim<T, P>(p: &mut Punctuated<T, P>) {
     p.pop_punct();
@@ -147,7 +172,6 @@ impl VisitMut for Commas {
         visit_expr_array_mut(syn::ExprArray) trim elems;
         visit_expr_tuple_mut(syn::ExprTuple) trim_multi elems;
         visit_expr_struct_mut(syn::ExprStruct) trim fields;
-        visit_expr_closure_mut(syn::ExprClosure) trim inputs;
         visit_pat_tuple_mut(syn::PatTuple) trim_multi elems;
         visit_pat_tuple_struct_mut(syn::PatTupleStruct) trim elems;
         visit_pat_struct_mut(syn::PatStruct) trim fields;
@@ -168,6 +192,15 @@ impl VisitMut for Commas {
             trim(&mut i.inputs);
         }
         visit_mut::visit_type_bare_fn_mut(self, i);
+    }
+
+    fn visit_expr_closure_mut(&mut self, i: &mut syn::ExprClosure) {
+        trim(&mut i.inputs);
+        if let Some(e) = tail_only(&i.body).filter(|_| matches!(i.output, syn::ReturnType::Default))
+        {
+            *i.body = e;
+        }
+        visit_mut::visit_expr_closure_mut(self, i);
     }
 
     fn visit_arm_mut(&mut self, i: &mut syn::Arm) {

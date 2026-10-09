@@ -45,6 +45,7 @@ fn manifest(dir: &str, edits: Vec<PathEdit>) -> Manifest {
         source: "src/a.rs".into(),
         module: "a".into(),
         dir: "src/a".into(),
+        root_form: crate::apply::RootForm::Dir,
         table: "a.paths".into(),
         target: None,
         visibility: [("fn data".to_string(), "pub(super)".to_string())].into(),
@@ -275,6 +276,7 @@ fn split_with(
         table: "a.paths".into(),
         target: None,
         visibility: [("fn f".to_string(), "pub(super)".to_string())].into(),
+        root_form: crate::apply::RootForm::Dir,
         path_edits: vec![],
         exceptions: BTreeMap::new(),
         modules: vec![spec_of("", lines[0]), spec_of("inner", lines[1])],
@@ -683,6 +685,16 @@ fn apply_and_verify(
     modules: [(&[&str], &[&str]); 2],
     edits: Vec<PathEdit>,
 ) -> Result<(Vec<String>, std::path::PathBuf), String> {
+    apply_and_verify_as(tag, files, modules, edits, crate::apply::RootForm::Dir)
+}
+
+fn apply_and_verify_as(
+    tag: &str,
+    files: &[(&str, &str)],
+    modules: [(&[&str], &[&str]); 2],
+    edits: Vec<PathEdit>,
+    root_form: crate::apply::RootForm,
+) -> Result<(Vec<String>, std::path::PathBuf), String> {
     let repo = tmpdir(&format!("apply-{tag}"));
     let _ = std::fs::remove_dir_all(&repo);
     for (p, t) in files {
@@ -702,6 +714,7 @@ fn apply_and_verify(
         table: "a.paths".into(),
         target: None,
         visibility: [("fn f".to_string(), "pub(super)".to_string())].into(),
+        root_form,
         path_edits: edits,
         exceptions: BTreeMap::new(),
         modules: vec![
@@ -1039,4 +1052,138 @@ fn cast_target_is_a_free_name() {
         [&["pub use inner::*;"], &["use super::*;"]],
     );
     has(&errs, "name `Pick` resolves differently");
+}
+
+fn fn_body(body: &str) -> String {
+    format!("fn f(v: &[u8]) -> bool {{\n    {body}\n}}\n")
+}
+
+#[test]
+fn closure_block_of_one_tail_expression_is_not_significant() {
+    let before = fn_body("v.iter().any(|x| { *x == 1 && *x != 2 })");
+    let after = fn_body("v.iter().any(|x| *x == 1 && *x != 2)");
+    assert_eq!(same_file(&before, &after, false), Vec::<String>::new());
+    let before = fn_body("v.iter().any(move |x| { g![x] })");
+    let after = fn_body("v.iter().any(move |x| g![x])");
+    assert_eq!(same_file(&before, &after, false), Vec::<String>::new());
+}
+
+#[test]
+fn closure_block_of_another_shape_is_significant() {
+    for block in [
+        "|x| { let y = *x; y == 1 }",
+        "|x| { *x == 1; }",
+        "|x| unsafe { g(x) }",
+        "|x| 'a: { g(x) }",
+        "|x| #[allow(unused)] { g(x) }",
+        "|x| { #![allow(unused)] g(x) }",
+        "|x| { #[allow(unused)] g(x) }",
+        "|x| { g! { x } }",
+        "|x| async { g(x) }",
+        "|x| { { g(x) } }",
+    ] {
+        let before = fn_body(&format!("v.iter().any({block})"));
+        let after = fn_body("v.iter().any(|x| g(x))");
+        has(&same_file(&before, &after, false), "tokens changed");
+    }
+    let before = fn_body("v.iter().any(|x| -> bool { g(x) })");
+    has(
+        &same_file(&before, &fn_body("v.iter().any(|x| g(x))"), false),
+        "tokens changed",
+    );
+}
+
+#[test]
+fn std_macro_trailing_commas_are_not_significant() {
+    let before = fn_body(
+        "let w = vec![1, 2,]; assert_eq!(w, vec![1, 2,],); debug_assert!(w.len() == 2,); \
+         let _ = format!(\"{}\", w.len(),); println!(\"{w:?}\",); \
+         assert!(matches!(w[0], 1 | 2 if true,), \"{}\", 1,); matches!(w[1], Some(ref x),)",
+    );
+    let after = fn_body(
+        "let w = vec![1, 2]; assert_eq!(w, vec![1, 2]); debug_assert!(w.len() == 2); \
+         let _ = format!(\"{}\", w.len()); println!(\"{w:?}\"); \
+         assert!(matches!(w[0], 1 | 2 if true), \"{}\", 1); matches!(w[1], Some(ref x))",
+    );
+    assert_eq!(same_file(&before, &after, false), Vec::<String>::new());
+}
+
+#[test]
+fn trailing_comma_of_other_macros_is_significant() {
+    for (before, after) in [
+        ("m!(vec![1,])", "m!(vec![1])"),
+        ("std::vec![1,]", "std::vec![1]"),
+        (
+            "vec![1,]; macro_rules! vec { ($a:expr,) => {}; }",
+            "vec![1]; macro_rules! vec { ($a:expr,) => {}; }",
+        ),
+        ("my_assert!(true,)", "my_assert!(true)"),
+    ] {
+        has(
+            &same_file(&fn_body(before), &fn_body(after), false),
+            "tokens changed",
+        );
+    }
+    let shadow = "macro_rules! vec {\n    ($a:expr,) => {\n        1\n    };\n}\n\n";
+    has(
+        &same_file(
+            &format!("{shadow}{}", fn_body("vec![1,]")),
+            &format!("{shadow}{}", fn_body("vec![1]")),
+            false,
+        ),
+        "tokens changed",
+    );
+    let import = "use other::vec;\n\n";
+    has(
+        &same_file(
+            &format!("{import}{}", fn_body("vec![1,]")),
+            &format!("{import}{}", fn_body("vec![1]")),
+            false,
+        ),
+        "tokens changed",
+    );
+}
+
+#[test]
+fn committed_manifests_are_not_outside_the_tree() {
+    let spec = Spec {
+        manifest: None,
+        old_root: "src/k.rs".into(),
+        new_root: "src/k.rs".into(),
+        module: "k".into(),
+        delegate: false,
+    };
+    let src = mem(&[("src/k.rs", "fn f() {}\n")]);
+    let touched = |p: &str| check(&spec, &src, &src, &[p.to_string()]).unwrap().1;
+    assert_eq!(
+        touched("tools/split/manifests/k.toml"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        touched("tools/split/manifests/k.paths"),
+        Vec::<String>::new()
+    );
+    has(
+        &touched("tools/split/manifests/k.rs"),
+        "outside the moved tree",
+    );
+    has(&touched("src/other.rs"), "outside the moved tree");
+}
+
+#[test]
+fn apply_writes_a_file_form_root() {
+    let (errs, repo) = apply_and_verify_as(
+        "file-form",
+        &[("src/a.rs", WITH_CHILD), ("src/a/helpers.rs", HELPERS)],
+        [
+            (&["mod helpers"], &["pub use inner::*;"]),
+            (&["fn f"], &["use super::*;"]),
+        ],
+        vec![],
+        crate::apply::RootForm::File,
+    )
+    .unwrap();
+    assert_eq!(errs, Vec::<String>::new());
+    assert!(repo.join("src/a.rs").exists() && repo.join("src/a/inner.rs").exists());
+    assert!(!repo.join("src/a/mod.rs").exists());
 }

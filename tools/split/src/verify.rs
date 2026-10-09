@@ -14,6 +14,9 @@ use crate::{
     tree::{self, Leaf, Res, Source, Tree, dir_of, includes, join, tok},
 };
 
+/// Committed manifests and path tables; never part of a moved tree.
+const MANIFESTS: &str = "tools/split/manifests/";
+
 pub struct Spec<'a> {
     pub manifest: Option<&'a Manifest>,
     pub old_root: String,
@@ -163,7 +166,10 @@ pub fn check(
         .unwrap_or_default();
     known.extend(extra_files.iter().map(String::as_str));
     for t in touched {
-        if !known.contains(t.as_str()) {
+        let manifest = t.starts_with(MANIFESTS)
+            && (t.ends_with(".toml") || t.ends_with(".paths"))
+            && !t[MANIFESTS.len()..].contains('/');
+        if !known.contains(t.as_str()) && !manifest {
             errs.push(format!("touched file outside the moved tree: {t}"));
         }
     }
@@ -223,12 +229,17 @@ pub fn check(
     };
     let rx = Resolution::new(&before, &after, &map, &exceptions);
     let inc_macros = scope::including_macros(&before);
+    let btok: Vec<String> = before
+        .leaves
+        .iter()
+        .map(|l| rx.commas(0, l, &l.tokens))
+        .collect();
     let norm_tokens = |key: &str, l: &Leaf| {
         let mut t = l.tokens.clone();
         for (from, to) in edits.get(key).into_iter().flatten() {
             t = tree::edit_includes(&t, to, from).0;
         }
-        t
+        rx.commas(1, l, &t)
     };
     let (mut matched, mut vis_changes, mut incl, mut delegated) = (0, 0, 0, 0);
     let mut delegations: Vec<(&Leaf, String)> = Vec::new();
@@ -239,7 +250,7 @@ pub fn check(
         for ob in b {
             match a
                 .iter()
-                .position(|(l, t)| *t == ob.tokens && l.ctx == ob.ctx)
+                .position(|(l, t)| *t == btok[ob.idx] && l.ctx == ob.ctx)
             {
                 Some(i) => {
                     let (na, _) = a.remove(i);
@@ -300,7 +311,7 @@ pub fn check(
             }
         }
         for ob in unpaired {
-            if let Some(i) = a.iter().position(|(_, t)| *t == ob.tokens) {
+            if let Some(i) = a.iter().position(|(_, t)| *t == btok[ob.idx]) {
                 let (na, _) = a.remove(i);
                 errs.push(format!(
                     "{key}: effective cfg/attributes changed\n      before: {:?}\n      after:  {:?}",
@@ -323,7 +334,7 @@ pub fn check(
                         ob.line,
                         na.file,
                         na.line,
-                        first_diff(&ob.tokens, t)
+                        first_diff(&btok[ob.idx], t)
                     )),
                 }
                 a.clear();
@@ -694,6 +705,15 @@ impl<'a> Resolution<'a> {
             }
         }
         errs
+    }
+
+    /// `tokens` of leaf `l` (tree `side`) with std macros' trailing commas
+    /// dropped.
+    fn commas(&self, side: usize, l: &Leaf, tokens: &str) -> String {
+        scope::std_commas(
+            tokens,
+            &scope::std_macros(&l.tokens, &self.macros[side][l.idx]),
+        )
     }
 
     /// The delegated helper's impl names the old impl's self type.

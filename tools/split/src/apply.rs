@@ -18,8 +18,11 @@ pub struct Manifest {
     pub source: String,
     /// Crate-relative module path of `source`.
     pub module: String,
-    /// Repo-relative directory of the new tree (`<dir>/mod.rs` is the root).
+    /// Repo-relative directory of the new tree.
     pub dir: String,
+    /// Root file: `<dir>/mod.rs` (`dir`, the default) or `<dir>.rs` (`file`).
+    #[serde(default)]
+    pub root_form: RootForm,
     /// Old → new leaf path table written by `apply`, relative to the manifest.
     pub table: String,
     /// Test binary of `source` as `split test-list` names it (`name:lib`,
@@ -38,6 +41,14 @@ pub struct Manifest {
     pub modules: Vec<ModSpec>,
     #[serde(skip)]
     pub path: PathBuf,
+}
+
+#[derive(Deserialize, Default, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum RootForm {
+    #[default]
+    Dir,
+    File,
 }
 
 #[derive(Deserialize)]
@@ -80,7 +91,10 @@ impl Manifest {
     }
 
     pub fn new_root(&self) -> String {
-        format!("{}/mod.rs", self.dir)
+        match self.root_form {
+            RootForm::Dir => format!("{}/mod.rs", self.dir),
+            RootForm::File => format!("{}.rs", self.dir),
+        }
     }
 
     pub fn full(&self, rel: &str) -> String {
@@ -95,7 +109,7 @@ impl Manifest {
         let has_children = self.modules.iter().any(|m| parent(&m.name) == Some(name));
         let p = name.replace("::", "/");
         match (name.is_empty(), has_children) {
-            (true, _) => format!("{}/mod.rs", self.dir),
+            (true, _) => self.new_root(),
             (false, true) => format!("{}/{p}/mod.rs", self.dir),
             (false, false) => format!("{}/{p}.rs", self.dir),
         }

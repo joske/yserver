@@ -19,6 +19,12 @@
 //! imports of unknown kind and opaque globs as tokens); for delegations,
 //! that the self type resolves to one in-tree item.
 //!
+//! Normalized before comparing tokens: the trailing comma of the
+//! `STD_COMMA_MACROS` that resolve to nothing in the tree (std's) at every
+//! invocation in the leaf, when their arguments parse as the macro's
+//! grammar; other macros' input and attributes stay exact. Closure bodies
+//! `{ e }` compare as `e` (see `tree::Commas`).
+//!
 //! Refused: moving a leaf that invokes an in-tree `macro_rules!`, or defines
 //! and invokes its own, to another module, unless the manifest lists it under
 //! `exceptions` with a reason (the checks above still apply).
@@ -128,6 +134,118 @@ pub fn invocations(tokens: &str) -> Vec<String> {
     let mut out = Vec::new();
     walk(&tts(tokens), &mut out);
     out
+}
+
+/// std macros whose arguments are comma-separated expressions (format
+/// arguments included) or `matches!`'s, and whose optional trailing comma
+/// expands the same.
+pub const STD_COMMA_MACROS: [&str; 20] = [
+    "vec",
+    "format",
+    "format_args",
+    "print",
+    "println",
+    "eprint",
+    "eprintln",
+    "write",
+    "writeln",
+    "panic",
+    "assert",
+    "assert_eq",
+    "assert_ne",
+    "debug_assert",
+    "debug_assert_eq",
+    "debug_assert_ne",
+    "unreachable",
+    "todo",
+    "unimplemented",
+    "matches",
+];
+
+/// The `STD_COMMA_MACROS` a leaf invokes that bind nothing in the tree at
+/// every invocation (neither textually nor by path), per its macro site.
+pub fn std_macros(tokens: &str, site: &Site) -> BTreeSet<String> {
+    let (mut ok, mut not) = (BTreeSet::new(), BTreeSet::new());
+    for (n, t) in invocations(tokens).into_iter().zip(&site.text) {
+        if STD_COMMA_MACROS.contains(&n.as_str()) && *t == format!("{n} = path {{}}") {
+            ok.insert(n);
+        } else {
+            not.insert(n);
+        }
+    }
+    ok.difference(&not).cloned().collect()
+}
+
+/// The arguments of std macro `name` without their trailing comma, when they
+/// parse as its grammar.
+fn std_args(name: &str, ts: TokenStream) -> Option<TokenStream> {
+    use syn::{
+        Token,
+        parse::{ParseStream, Parser},
+    };
+    let parsed = if name == "matches" {
+        (|p: ParseStream| {
+            p.parse::<syn::Expr>()?;
+            p.parse::<Token![,]>()?;
+            syn::Pat::parse_multi_with_leading_vert(p)?;
+            if p.peek(Token![if]) {
+                p.parse::<Token![if]>()?;
+                p.parse::<syn::Expr>()?;
+            }
+            if !p.is_empty() {
+                p.parse::<Token![,]>()?;
+            }
+            Ok(())
+        })
+        .parse2(ts.clone())
+    } else {
+        syn::punctuated::Punctuated::<syn::Expr, Token![,]>::parse_terminated
+            .parse2(ts.clone())
+            .map(drop)
+    };
+    parsed.ok()?;
+    let mut v: Vec<TokenTree> = ts.into_iter().collect();
+    if is_punct(v.last(), ',') {
+        v.pop();
+    }
+    Some(v.into_iter().collect())
+}
+
+/// `tokens` with the trailing comma dropped from invocations of the `std`
+/// macros, outside attributes and other macros' input.
+pub fn std_commas(tokens: &str, std: &BTreeSet<String>) -> String {
+    fn walk(ts: TokenStream, std: &BTreeSet<String>) -> TokenStream {
+        let v: Vec<TokenTree> = ts.into_iter().collect();
+        let at = |i: usize, k: usize| i.checked_sub(k).and_then(|j| v.get(j));
+        let ident = |i: usize, k: usize| match at(i, k) {
+            Some(TokenTree::Ident(id)) => Some(id.to_string()),
+            _ => None,
+        };
+        v.iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let TokenTree::Group(g) = t else {
+                    return t.clone();
+                };
+                let called = ident(i, 2).filter(|n| is_punct(at(i, 1), '!') && !is_keyword(n));
+                let opaque = is_punct(at(i, 1), '#')
+                    || (is_punct(at(i, 1), '!') && is_punct(at(i, 2), '#'))
+                    || ident(i, 3).as_deref() == Some("macro_rules");
+                let stream = match called {
+                    Some(n) if std.contains(&n) && !is_punct(at(i, 3), ':') => {
+                        std_args(&n, g.stream()).map_or_else(|| g.stream(), |s| walk(s, std))
+                    }
+                    Some(_) => g.stream(),
+                    None if opaque => g.stream(),
+                    None => walk(g.stream(), std),
+                };
+                let mut ng = proc_macro2::Group::new(g.delimiter(), stream);
+                ng.set_span(g.span());
+                TokenTree::Group(ng)
+            })
+            .collect()
+    }
+    walk(tokens.parse().unwrap_or_default(), std).to_string()
 }
 
 /// `macro_rules!` definitions anywhere in `tokens`: name and transcribers.
