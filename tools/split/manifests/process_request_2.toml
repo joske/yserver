@@ -9,9 +9,11 @@
 # path, in this crate and in `yserver`, keeps resolving unchanged.
 # Needs the prep commit first: `super::run::` / `super::process_disconnect::`
 # (15 sites) qualified to `crate::core_loop::…` so they mean the same
-# module from a child. Visibility: 140 dispatch targets + ~37 sibling
-# helpers + ~43 helpers that only tests reach (all pub(super));
-# handle_xi2_request is pub(in crate::core_loop::process_request).
+# module from a child. Visibility: 140 dispatch targets + ~39 sibling
+# helpers + ~45 helpers that only tests reach (all pub(super));
+# handle_xi2_request is pub(in crate::core_loop::process_request); the XI
+# property items run.rs calls go from pub(super) in the root to
+# pub(in crate::core_loop) in props (same reach).
 source = "crates/yserver-core/src/core_loop/process_request.rs"
 module = "core_loop::process_request"
 dir = "crates/yserver-core/src/core_loop/process_request"
@@ -25,6 +27,8 @@ table = "process_request_2.paths"
 [visibility]
 "const XI1_ERROR_BAD_DEVICE" = "pub(super)"
 "enum ModmapChangeOutcome" = "pub(super)"
+"enum PropertyChangeOutcome" = "pub(in crate::core_loop)"
+"enum PropertyDispatchError" = "pub(in crate::core_loop)"
 "enum WarpSrcRule" = "pub(super)"
 "fn activate_redirect_backing_for" = "pub(super)"
 "fn active_monitors" = "pub(super)"
@@ -37,7 +41,10 @@ table = "process_request_2.paths"
 "fn apply_xi2_allow_events_for_slave" = "pub(super)"
 "fn arm_present_pixmap_synced_source_then_supersede" = "pub(super)"
 "fn arrival_execute_or_park_present_pixmap" = "pub(super)"
+"fn canonicalize_xi_property_data" = "pub(super)"
 "fn change_modifier_mapping" = "pub(super)"
+"fn commit_confirmed_xi_change" = "pub(in crate::core_loop)"
+"fn commit_validated_xi_change" = "pub(in crate::core_loop)"
 "fn completed_event_for_pending" = "pub(super)"
 "fn copy_area_effective_dst_rects" = "pub(super)"
 "fn copy_area_source_split" = "pub(super)"
@@ -56,6 +63,7 @@ table = "process_request_2.paths"
 "fn drop_selections_owned_by_windows" = "pub(super)"
 "fn effective_present_target_raw" = "pub(super)"
 "fn effective_redirect_mode_for_window" = "pub(super)"
+"fn emit_property_dispatch_error" = "pub(in crate::core_loop)"
 "fn emit_shape_notify" = "pub(super)"
 "fn execute_present_pixmap_copy" = "pub(super)"
 "fn execute_present_pixmap_copy_or_reroute" = "pub(super)"
@@ -208,11 +216,14 @@ table = "process_request_2.paths"
 "fn handle_xkb_request" = "pub(super)"
 "fn handle_xtest_request" = "pub(super)"
 "fn has_redirected_ancestor" = "pub(super)"
+"fn is_xtest_marker_property" = "pub(super)"
+"fn largest_free_xid_gap" = "pub(super)"
 "fn legacy_keyboard_mapping_notify" = "pub(super)"
 "fn map_subwindows_with_delta" = "pub(super)"
 "fn mark_randr_unsupported_warned" = "pub(super)"
 "fn mirror_shape_to_host_state" = "pub(super)"
 "fn normalize_region_rects" = "pub(super)"
+"fn patch_get_image_reply_header" = "pub(super)"
 "fn present_supersession_covers" = "pub(super)"
 "fn present_wire_clock" = "pub(super)"
 "fn realize_storage_for_delta" = "pub(super)"
@@ -233,6 +244,7 @@ table = "process_request_2.paths"
 "fn synthesise_glx_fb_configs" = "pub(super)"
 "fn synthesise_glx_visual_configs" = "pub(super)"
 "fn unmap_subwindows_with_delta" = "pub(super)"
+"fn validate_xi_change" = "pub(in crate::core_loop)"
 "fn vidmode_monitor_identity" = "pub(super)"
 "fn warp_pointer_bad_window" = "pub(super)"
 "fn warp_pointer_src_allows" = "pub(super)"
@@ -243,6 +255,7 @@ table = "process_request_2.paths"
 "fn xybitmap_to_target_zpixmap" = "pub(super)"
 "fn xybitmap_to_zpixmap" = "pub(super)"
 "fn zpixmap_row_stride" = "pub(super)"
+"struct ValidatedXiChange" = "pub(in crate::core_loop)"
 "struct WarpRequest" = "pub(super)"
 
 [[modules]]
@@ -325,20 +338,9 @@ items = [
   "fn window_unviewable",
   "fn zpixmap_expected_len",
   "fn motion_history_range",
-  "enum PropertyDispatchError",
-  "struct ValidatedXiChange",
-  "enum PropertyChangeOutcome",
-  "fn canonicalize_xi_property_data",
-  "fn validate_xi_change",
-  "fn commit_validated_xi_change",
-  "fn commit_confirmed_xi_change",
-  "fn is_xtest_marker_property",
-  "fn emit_property_dispatch_error",
   "struct CopyAreaSubRect",
   "struct CurrentVidModeOutput",
   "struct PresentDomainSelection",
-  "fn patch_get_image_reply_header",
-  "fn largest_free_xid_gap",
 ]
 
 [[modules]]
@@ -679,6 +681,7 @@ items = [
   "fn handle_grab_server",
   "fn handle_ungrab_server",
   "fn handle_get_motion_events",
+  "fn largest_free_xid_gap",
 ]
 
 [[modules]]
@@ -921,6 +924,7 @@ items = [
   "fn intersect_sub_rects",
   "fn subtract_sub_rect",
   "fn handle_copy_plane",
+  "fn patch_get_image_reply_header",
 ]
 
 [[modules]]
@@ -929,6 +933,15 @@ lines = [
   "use super::*;",
 ]
 items = [
+  "enum PropertyDispatchError",
+  "struct ValidatedXiChange",
+  "enum PropertyChangeOutcome",
+  "fn canonicalize_xi_property_data",
+  "fn validate_xi_change",
+  "fn commit_validated_xi_change",
+  "fn commit_confirmed_xi_change",
+  "fn is_xtest_marker_property",
+  "fn emit_property_dispatch_error",
   "fn dispatch_change_property",
   "fn dispatch_device_enabled_property_write",
   "fn apply_enabled_property_value",
