@@ -381,6 +381,7 @@ pub fn check(
                         na,
                         &inc_macros,
                         &mut incl,
+                        false,
                     ));
                 }
                 None => unpaired.push(*ob),
@@ -503,6 +504,7 @@ pub fn check(
                 n,
                 &inc_macros,
                 &mut incl,
+                true,
             ));
         } else {
             errs.push(format!(
@@ -637,7 +639,8 @@ pub fn check(
 /// Include paths of a moved leaf resolve to the same bytes; `include!`,
 /// non-literal paths and macros that include are refused once the leaf
 /// changes directory, module or file. Leaves of files other than the split
-/// root must still come from the same file.
+/// root must still come from the same file, except a delegated helper
+/// (`helper`), which may land in any file of the tree.
 #[allow(clippy::too_many_arguments)]
 fn includes_ok(
     spec: &Spec,
@@ -648,9 +651,10 @@ fn includes_ok(
     na: &Leaf,
     inc_macros: &BTreeSet<String>,
     incl: &mut usize,
+    helper: bool,
 ) -> Vec<String> {
     let mut errs = Vec::new();
-    if ob.file != spec.old_root && na.file != ob.file {
+    if !helper && ob.file != spec.old_root && na.file != ob.file {
         errs.push(format!("{key}: loaded from {} (was {})", na.file, ob.file));
     }
     let moved = dir_of(&ob.file) != dir_of(&na.file);

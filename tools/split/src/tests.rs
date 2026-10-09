@@ -1954,3 +1954,45 @@ fn import_of_a_moved_trait_through_the_root_glob_still_counts() {
     );
     has(&errs, "traits in scope");
 }
+
+/// A trait impl in a child file `t` delegating to a helper in sibling `h`.
+fn delegate_across(after_t: &str, after_h: &str) -> Vec<String> {
+    let spec = Spec {
+        manifest: None,
+        old_root: "src/k.rs".into(),
+        new_root: "src/k.rs".into(),
+        module: "k".into(),
+        delegate: Some(PREFIX.into()),
+    };
+    let root = "mod h;\nmod t;\n\npub struct K;\n";
+    let t_before = "use super::*;\n\nimpl Backend for K {\n    fn f(&mut self, a: u32, b: u32) -> u32 {\n        a + b\n    }\n}\n";
+    let h_before = "use super::*;\n\nfn g() -> u32 {\n    1\n}\n";
+    let base = mem(&[
+        ("src/k.rs", root),
+        ("src/k/t.rs", t_before),
+        ("src/k/h.rs", h_before),
+    ]);
+    let head = mem(&[
+        ("src/k.rs", root),
+        ("src/k/t.rs", after_t),
+        ("src/k/h.rs", after_h),
+    ]);
+    check(&spec, &base, &head, &[]).unwrap().1
+}
+
+const T_DELEGATED: &str = "use super::*;\n\nimpl Backend for K {\n    fn f(&mut self, a: u32, b: u32) -> u32 {\n        Self::backend_h_f(self, a, b)\n    }\n}\n";
+
+#[test]
+fn delegate_helper_in_a_sibling_file_passes() {
+    let h = "use super::*;\n\nfn g() -> u32 {\n    1\n}\n\nimpl K {\n    pub(super) fn backend_h_f(&mut self, a: u32, b: u32) -> u32 {\n        a + b\n    }\n}\n";
+    assert_eq!(delegate_across(T_DELEGATED, h), Vec::<String>::new());
+}
+
+#[test]
+fn plain_leaf_moving_to_a_sibling_module_still_fails() {
+    let t = "use super::*;\n\nimpl Backend for K {\n    fn f(&mut self, a: u32, b: u32) -> u32 {\n        Self::backend_h_f(self, a, b)\n    }\n}\n\nimpl K {\n    pub(super) fn backend_h_f(&mut self, a: u32, b: u32) -> u32 {\n        a + b\n    }\n}\n\nfn g() -> u32 {\n    1\n}\n";
+    has(
+        &delegate_across(t, "use super::*;\n"),
+        "k::h::fn g: missing after the move",
+    );
+}
