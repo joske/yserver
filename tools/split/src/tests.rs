@@ -1698,3 +1698,35 @@ fn split_root_declared_cfg_test_in_its_parent_file_is_test_code() {
         "fn f: production code with line!",
     );
 }
+
+#[test]
+fn integration_test_root_splits_into_a_main_rs_directory() {
+    let tmp = std::env::temp_dir().join(format!("split-test-{}-main-root", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(
+        tmp.join("it.paths"),
+        "fn helper => fn helper\nfn t => topic::fn t\n",
+    )
+    .unwrap();
+    let text = "source = \"tests/it.rs\"\nmodule = \"\"\ndir = \"tests/it\"\nroot_form = \"main\"\ntable = \"it.paths\"\n\n[[modules]]\nname = \"\"\nitems = [\"fn helper\"]\n\n[[modules]]\nname = \"topic\"\nlines = [\"use super::*;\"]\nitems = [\"fn t\"]\n";
+    std::fs::write(tmp.join("it.toml"), text).unwrap();
+    let m = Manifest::load(&tmp.join("it.toml")).unwrap();
+    assert_eq!(m.new_root(), "tests/it/main.rs");
+    let before =
+        "fn helper() -> u32 {\n    1\n}\n\n#[test]\nfn t() {\n    assert_eq!(helper(), 1);\n}\n";
+    let base = mem(&[("tests/it.rs", before)]);
+    let head = mem(&[
+        (
+            "tests/it/main.rs",
+            "mod topic;\n\nfn helper() -> u32 {\n    1\n}\n",
+        ),
+        (
+            "tests/it/topic.rs",
+            "use super::*;\n\n#[test]\nfn t() {\n    assert_eq!(helper(), 1);\n}\n",
+        ),
+    ]);
+    assert_eq!(
+        check(&spec_of(&m), &base, &head, &[]).unwrap().1,
+        Vec::<String>::new()
+    );
+}

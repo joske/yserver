@@ -20,7 +20,8 @@ pub struct Manifest {
     pub module: String,
     /// Repo-relative directory of the new tree.
     pub dir: String,
-    /// Root file: `<dir>/mod.rs` (`dir`, the default) or `<dir>.rs` (`file`).
+    /// Root file: `<dir>/mod.rs` (`dir`, the default), `<dir>.rs` (`file`) or,
+    /// for a crate root such as an integration test, `<dir>/main.rs` (`main`).
     #[serde(default)]
     pub root_form: RootForm,
     /// Old → new leaf path table written by `apply`, relative to the manifest.
@@ -59,6 +60,7 @@ pub enum RootForm {
     #[default]
     Dir,
     File,
+    Main,
 }
 
 #[derive(Deserialize)]
@@ -104,6 +106,7 @@ impl Manifest {
         match self.root_form {
             RootForm::Dir => format!("{}/mod.rs", self.dir),
             RootForm::File => format!("{}.rs", self.dir),
+            RootForm::Main => format!("{}/main.rs", self.dir),
         }
     }
 
