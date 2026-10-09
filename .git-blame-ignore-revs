@@ -107,3 +107,9 @@ d88bab96a1cdf17d62ac28dde4075c5849aab436
 
 # refactor(kms): delegate XKB and keymap trait methods to portable/keyboard helpers
 43e9ffe1d722efc6cba018d11bb4a61dbba14d54
+
+# refactor(kms): qualify engine super:: paths (prep)
+399b91f42e43e9c3d82b2fed1a8e365675d5ff86
+
+# refactor(kms): split engine into lifecycle/frame/op modules (move)
+3ae1f634d1b2f782d3d55d26fcd7c04b7c2b084b
