@@ -988,3 +988,11 @@ pub(in crate::kms::render::backend) fn do_dump_scanout(backend: &mut KmsBackend)
         Err(last_err.unwrap_or_else(|| io::Error::other("scanout dump failed")))
     }
 }
+
+impl KmsBackend {
+    pub(in crate::kms::render::backend) fn backend_readback_dump_scanout(&mut self) {
+        if let Err(e) = do_dump_scanout(self) {
+            log::warn!("render dump_scanout: {e}");
+        }
+    }
+}

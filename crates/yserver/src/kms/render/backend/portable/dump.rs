@@ -467,3 +467,29 @@ fn write_drawable_ppm(
     }
     Ok(())
 }
+
+impl KmsBackend {
+    pub(in crate::kms::render::backend) fn backend_dump_dump_drawables(&mut self) {
+        if let Err(e) = do_dump_drawables(self) {
+            log::warn!("render dump_drawables: {e}");
+        }
+        // Stage 4d shadow-hunt: COW vs scanout vs present-src must
+        // come from the same instant or the comparison is useless
+        // (the moment of interest is the first COW-targeted
+        // Present after caja paints, which moves on every frame).
+        // Pair the scanout dump with the drawable dump so a single
+        // Ctrl+Alt+F12 captures all three artifacts atomically.
+        if let Err(e) = do_dump_scanout(self) {
+            log::warn!("render dump_drawables: scanout side: {e}");
+        }
+        // Surface the COW + present-src ring state so the user can
+        // tell at-a-glance whether the dump captured the expected
+        // shape (cow_id set, recent sources non-empty) without
+        // having to grep for the per-target log lines.
+        log::info!(
+            "render dump_drawables: cow_id={:?} recent_present_pixmaps_len={}",
+            self.cow_id,
+            self.recent_present_pixmaps.len(),
+        );
+    }
+}
