@@ -1,0 +1,49 @@
+# Phase 1a for server.rs: its inline #[cfg(test)] module(s) go out
+# of line at the same logical paths; production items stay in place.
+source = "crates/yserver-core/src/server.rs"
+module = "server"
+dir = "crates/yserver-core/src/server"
+root_form = "file"
+table = "server.paths"
+
+[[modules]]
+name = ""
+items = [
+  "const *",
+  "enum *",
+  "fn *",
+  "impl AtomTable",
+  "impl ClientState",
+  "impl Default for CoreFocus",
+  "impl Default for IdAllocator",
+  "impl Default for KeyboardControlState",
+  "impl Default for PointerControlState",
+  "impl Default for PresentCrtcClock",
+  "impl Default for ScreenSaverState",
+  "impl Default for ServerState",
+  "impl Default for SyncAlarm",
+  "impl Default for Xi1DeviceFocus",
+  "impl DpmsState",
+  "impl Drop for MitShmSegment",
+  "impl Drop for SyncReplayGuard",
+  "impl IdAllocator",
+  "impl KeyboardControlState",
+  "impl MitShmSegment",
+  "impl PendingPresentRequest",
+  "impl PointerControlState",
+  "impl ScreenSaverState",
+  "impl ServerState#1",
+  "impl ServerState#2",
+  "impl ShapeWindowState",
+  "impl SyncAwaitCondition",
+  "impl SyncReplayGuard",
+  "impl Xi1Freeze",
+  "struct *",
+  "unsafe impl Send for MitShmSegment",
+  "unsafe impl Sync for MitShmSegment",
+  "use *",
+]
+
+[[modules]]
+name = "tests"
+items = ["tests::*"]
