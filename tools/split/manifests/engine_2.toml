@@ -1,8 +1,9 @@
 # Phase 2 (2.10) for kms/render/engine.rs: production items move into
 # descendant modules of kms::render::engine (log targets keep the old
 # prefix), grouped by lifecycle and responsibility: lifecycle (create,
-# retire, teardown), frame (frame builder open/close/submit, coalescing
-# stats, commit/rollback), staging (upload arena, staging buffers/pool),
+# retire, teardown), export (GLX-TFP promotion onto dma-buf-exportable
+# storage), frame (frame builder open/close/submit, coalescing stats,
+# commit/rollback), staging (upload arena, staging buffers/pool),
 # scratch (scratch images, clip snapshots), the op-recording files
 # (fill_copy, put_get, text, glyphs, composite, batch, gradients, traps),
 # emit (close-time replay of recorded ops into the command buffer), pixels
@@ -64,6 +65,7 @@ table = "engine_2.paths"
 "fn unpack_to_staging" = "pub(super)"
 "fn upload_copy_align" = "pub(super)"
 "impl RenderEngineInner::fn upload_to_frame" = "pub(super)"
+"impl RenderEngine::fn retire_image_after" = "pub(super)"
 
 [[modules]]
 name = ""
@@ -106,11 +108,17 @@ items = [
   "impl RenderEngine::fn notify_drawable_retired",
   "impl RenderEngine::fn active_resource_bytes",
   "impl RenderEngine::fn create_pixmap",
-  "impl RenderEngine::fn promote_drawable_exportable",
-  "impl RenderEngine::fn copy_image_blocking",
   "impl RenderEngineInner::fn adopt_retired_resource_for_gpu_retirement",
   "impl SubmittedOp::fn *",
   "impl Drop for RenderEngine",
+]
+
+[[modules]]
+name = "export"
+lines = ["use super::*;"]
+items = [
+  "impl RenderEngine::fn promote_drawable_exportable",
+  "impl RenderEngine::fn copy_image_blocking",
 ]
 
 [[modules]]
