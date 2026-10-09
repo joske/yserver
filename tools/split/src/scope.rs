@@ -63,6 +63,15 @@
 //! by macro expansion (where one may exist, std macro normalization is off;
 //! the expansion itself is not resolved).
 //!
+//! Delegate helpers (new inherent fns, which win over same-named trait
+//! methods) are refused unless named `<prefix><subsystem>_<method>` and
+//! absent as an identifier from every `.rs` file of the pre-change repo
+//! (`verify::helper_name`, `verify::prior_names`). Residual: names that
+//! exist only after expansion (proc macros, `paste!`-style concatenation,
+//! `include!`d or build-script output) and methods of external crates'
+//! traits that the repo never spells out (a dependency's extension trait in
+//! scope via a glob or prelude) are not seen.
+//!
 //! Outside the equivalence guarantee: diagnostic text std macros derive
 //! from their input (the stringified condition of `assert!(… |x| { x } …)`
 //! in a panic message differs once the input is normalized); panic

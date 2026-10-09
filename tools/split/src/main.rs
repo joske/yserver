@@ -19,10 +19,12 @@ const USAGE: &str = "usage:
   split apply <manifest.toml>
   split test-list <out-dir>
   split verify [--manifest <m.toml> | --root <file.rs> --module <path>]
-               [--delegate] [--tests <before-dir> <after-dir> [--target <bin:kind>]]
+               [--delegate <prefix>] [--tests <before-dir> <after-dir> [--target <bin:kind>]]
                [<rev>]
 verify compares <rev>^ with <rev>, or HEAD with the working tree; --tests
 also checks the test lists, snapshotted by test-list at those two trees.
+--delegate accepts trait bodies moved to inherent helpers named
+<prefix><subsystem>_<method>, a name absent from <rev>^ (or HEAD).
 --manifest (and its path table) is read from the working tree, not from
 <rev>: a manifest amended after its move commit (e.g. a new [locations]
 entry) applies when re-verifying that commit.";
@@ -141,7 +143,7 @@ fn run() -> Res<bool> {
         Some("test-list") => testlist::snapshot(&repo, arg(1)?.as_ref()).map(|()| true),
         Some("verify") => {
             let (mut manifest, mut root, mut module, mut delegate, mut tests, mut rev) =
-                (None, None, None, false, None, None);
+                (None, None, None, None, None, None);
             let mut target = None;
             let mut i = 1;
             while i < args.len() {
@@ -149,7 +151,7 @@ fn run() -> Res<bool> {
                     "--manifest" => (manifest, i) = (Some(arg(i + 1)?), i + 1),
                     "--root" => (root, i) = (Some(arg(i + 1)?), i + 1),
                     "--module" => (module, i) = (Some(arg(i + 1)?), i + 1),
-                    "--delegate" => delegate = true,
+                    "--delegate" => (delegate, i) = (Some(arg(i + 1)?), i + 1),
                     "--tests" => (tests, i) = (Some((arg(i + 1)?, arg(i + 2)?)), i + 2),
                     "--target" => (target, i) = (Some(arg(i + 1)?), i + 1),
                     s if !s.starts_with('-') && rev.is_none() => rev = Some(s.to_string()),

@@ -22,7 +22,9 @@ pub struct Spec<'a> {
     pub old_root: String,
     pub new_root: String,
     pub module: String,
-    pub delegate: bool,
+    /// `--delegate <prefix>`: trait bodies may move to new inherent helpers
+    /// named `<prefix><subsystem>_<method>` (see `helper_name`).
+    pub delegate: Option<String>,
 }
 
 /// Old leaf key → new leaf key, from the manifest's table or the identity.
@@ -108,6 +110,70 @@ fn delegate_callee(old: &ImplItemFn, new: &ImplItemFn) -> Option<String> {
         })
         .collect();
     (params == args && params.iter().all(|p| !p.is_empty())).then(|| callee.ident.to_string())
+}
+
+/// A delegate helper is a new inherent fn, and inherent methods win method
+/// resolution over trait methods: a name that pre-change code could reach
+/// (`k.name()` meaning a trait method) would silently change meaning.
+/// Method calls are not resolved, so the name is refused instead unless it is
+/// `<prefix><subsystem>_<method>` and absent from the pre-change repo
+/// (`prior_names`).
+fn helper_name(prefix: &str, method: &str, helper: &str) -> Result<(), String> {
+    let valid = prefix.ends_with('_')
+        && prefix.starts_with(|c: char| c.is_ascii_lowercase())
+        && prefix
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    if !valid {
+        return Err(format!(
+            "delegate prefix {prefix:?} must be a lowercase identifier ending in `_`"
+        ));
+    }
+    let subsystem = helper
+        .strip_prefix(prefix)
+        .and_then(|r| r.strip_suffix(method))
+        .and_then(|r| r.strip_suffix('_'));
+    match subsystem {
+        Some(s) if !s.is_empty() && !s.starts_with('_') => Ok(()),
+        _ => Err(format!(
+            "delegate helper `{helper}` must be named `{prefix}<subsystem>_{method}`"
+        )),
+    }
+}
+
+/// Every identifier in the pre-change repo's `.rs` files → the first file it
+/// occurs in: declarations, trait items, calls, method names, path segments
+/// and macro input alike (`r#` stripped). A file that does not tokenize
+/// contributes its words.
+fn prior_names(src: &dyn Source) -> BTreeMap<String, String> {
+    fn walk(ts: proc_macro2::TokenStream, f: &str, out: &mut BTreeMap<String, String>) {
+        for t in ts {
+            match t {
+                proc_macro2::TokenTree::Ident(i) => {
+                    let s = i.to_string();
+                    let s = s.strip_prefix("r#").map_or(s.clone(), str::to_string);
+                    out.entry(s).or_insert_with(|| f.to_string());
+                }
+                proc_macro2::TokenTree::Group(g) => walk(g.stream(), f, out),
+                _ => {}
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    for f in src.list("").iter().filter(|f| f.ends_with(".rs")) {
+        let text = String::from_utf8_lossy(&src.read(f).unwrap_or_default()).to_string();
+        match text.parse::<proc_macro2::TokenStream>() {
+            Ok(ts) => walk(ts, f, &mut out),
+            Err(_) => {
+                for w in text.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+                    if !w.is_empty() {
+                        out.entry(w.to_string()).or_insert_with(|| f.clone());
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Same attributes, qualifiers, generics, signature and body; only the name
@@ -328,14 +394,15 @@ pub fn check(
                     ob.ctx, na.ctx
                 ));
             } else if let [(na, t)] = a.as_slice() {
-                let callee = (spec.delegate && ob.owner.as_ref().is_some_and(|o| o.is_trait))
-                    .then(|| {
-                        ob.func
-                            .as_ref()
-                            .zip(na.func.as_ref())
-                            .and_then(|(o, n)| delegate_callee(o, n))
-                    })
-                    .flatten();
+                let callee = (spec.delegate.is_some()
+                    && ob.owner.as_ref().is_some_and(|o| o.is_trait))
+                .then(|| {
+                    ob.func
+                        .as_ref()
+                        .zip(na.func.as_ref())
+                        .and_then(|(o, n)| delegate_callee(o, n))
+                })
+                .flatten();
                 match callee {
                     Some(c) if na.ctx == ob.ctx => delegations.push((ob, c)),
                     _ => errs.push(format!(
@@ -364,9 +431,22 @@ pub fn check(
     // name on the type, in the trait impl's generic context and effective cfg,
     // equal to the old trait fn but for name and visibility.
     let mut news = extra;
+    let mut prior: Option<BTreeMap<String, String>> = None;
     for (old, callee) in delegations {
         let ofn = old.func.as_ref().expect("trait fn");
         let oo = old.owner.as_ref().expect("owner");
+        let prefix = spec.delegate.as_deref().unwrap_or_default();
+        if let Err(e) = helper_name(prefix, &old.name, &callee) {
+            errs.push(format!("{}: {e}", old.okey()));
+            continue;
+        }
+        if let Some(f) = prior.get_or_insert_with(|| prior_names(base)).get(&callee) {
+            errs.push(format!(
+                "{}: delegate helper `{callee}` already occurs before the change ({f}); a new inherent fn would win method resolution over any trait method of that name",
+                old.okey()
+            ));
+            continue;
+        }
         let named: Vec<usize> = news
             .iter()
             .enumerate()

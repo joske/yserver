@@ -90,7 +90,7 @@ fn run(m: &Manifest, inner: &str, mod_rs: &str, y: &str) -> Vec<String> {
         old_root: m.source.clone(),
         new_root: m.new_root(),
         module: m.module.clone(),
-        delegate: false,
+        delegate: None,
     };
     check(&spec, &base, &head, &[]).unwrap().1
 }
@@ -170,27 +170,124 @@ fn same_file(before: &str, after: &str, delegate: bool) -> Vec<String> {
         old_root: "src/k.rs".into(),
         new_root: "src/k.rs".into(),
         module: "k".into(),
-        delegate,
+        delegate: delegate.then(|| PREFIX.to_string()),
     };
     let base = mem(&[("src/k.rs", before)]);
     let head = mem(&[("src/k.rs", after)]);
     check(&spec, &base, &head, &[]).unwrap().1
 }
 
+/// The reserved delegate prefix the fixtures use.
+const PREFIX: &str = "backend_";
+
 fn delegate(after: &str) -> Vec<String> {
     same_file(TRAIT_BEFORE, after, true)
 }
 
-const DELEGATED: &str = "pub struct K;\n\nimpl Backend for K {\n    fn f(&mut self, a: u32, b: u32) -> u32 {\n        Self::draw_f(self, a, b)\n    }\n}\n\nimpl K {\n    pub(super) fn draw_f(&mut self, a: u32, b: u32) -> u32 {\n        a + b\n    }\n}\n";
+const DELEGATED: &str = "pub struct K;\n\nimpl Backend for K {\n    fn f(&mut self, a: u32, b: u32) -> u32 {\n        Self::backend_draw_f(self, a, b)\n    }\n}\n\nimpl K {\n    pub(super) fn backend_draw_f(&mut self, a: u32, b: u32) -> u32 {\n        a + b\n    }\n}\n";
 
 #[test]
 fn delegate_forwarding_passes() {
     assert_eq!(delegate(DELEGATED), Vec::<String>::new());
 }
 
+/// Codex's case: `k.draw_f(0, 0)` resolved to the trait method `draw_f`
+/// (9); a new inherent `K::draw_f` wins method resolution (0).
+const CALLER_BEFORE: &str = "pub struct K;\n\nimpl Backend for K {\n    fn f(&mut self, a: u32, b: u32) -> u32 {\n        a + b\n    }\n\n    fn draw_f(&mut self, a: u32, b: u32) -> u32 {\n        9\n    }\n}\n\nfn call(k: &mut K) -> u32 {\n    k.draw_f(0, 0)\n}\n";
+
+#[test]
+fn delegate_helper_shadowing_a_trait_method_fails() {
+    let after = "pub struct K;\n\nimpl Backend for K {\n    fn f(&mut self, a: u32, b: u32) -> u32 {\n        Self::draw_f(self, a, b)\n    }\n\n    fn draw_f(&mut self, a: u32, b: u32) -> u32 {\n        9\n    }\n}\n\nimpl K {\n    pub(super) fn draw_f(&mut self, a: u32, b: u32) -> u32 {\n        a + b\n    }\n}\n\nfn call(k: &mut K) -> u32 {\n    k.draw_f(0, 0)\n}\n";
+    let errs = same_file(CALLER_BEFORE, after, true);
+    has(&errs, "must be named `backend_<subsystem>_f`");
+}
+
+#[test]
+fn delegate_helper_named_before_the_change_fails() {
+    let before = CALLER_BEFORE.replace("draw_f", "backend_draw_f");
+    let after = DELEGATED.replace(
+        "\n}\n\nimpl K {",
+        "\n\n    fn backend_draw_f(&mut self, a: u32, b: u32) -> u32 {\n        9\n    }\n}\n\nimpl K {",
+    ) + "\nfn call(k: &mut K) -> u32 {\n    k.backend_draw_f(0, 0)\n}\n";
+    has(
+        &same_file(&before, &after, true),
+        "`backend_draw_f` already occurs before the change (src/k.rs)",
+    );
+}
+
+#[test]
+fn delegate_helper_without_prefix_shape_fails() {
+    for name in [
+        "backend_f",
+        "backend__f",
+        "backend_draw_g",
+        "draw_backend_f",
+    ] {
+        let errs = delegate(&DELEGATED.replace("backend_draw_f", name));
+        has(&errs, "must be named `backend_<subsystem>_f`");
+    }
+}
+
+#[test]
+fn delegate_prefix_must_be_an_identifier_prefix() {
+    for prefix in ["", "backend", "Backend_", "1_"] {
+        let spec = Spec {
+            manifest: None,
+            old_root: "src/k.rs".into(),
+            new_root: "src/k.rs".into(),
+            module: "k".into(),
+            delegate: Some(prefix.into()),
+        };
+        let base = mem(&[("src/k.rs", TRAIT_BEFORE)]);
+        let head = mem(&[("src/k.rs", DELEGATED)]);
+        has(
+            &check(&spec, &base, &head, &[]).unwrap().1,
+            "delegate prefix",
+        );
+    }
+}
+
+/// `DELEGATED`, with `other` (unchanged, outside the moved tree) in the repo.
+fn delegate_beside(other: &str) -> Vec<String> {
+    let spec = Spec {
+        manifest: None,
+        old_root: "src/k.rs".into(),
+        new_root: "src/k.rs".into(),
+        module: "k".into(),
+        delegate: Some(PREFIX.into()),
+    };
+    let base = mem(&[("src/k.rs", TRAIT_BEFORE), ("other/src/z.rs", other)]);
+    let head = mem(&[("src/k.rs", DELEGATED), ("other/src/z.rs", other)]);
+    check(&spec, &base, &head, &[]).unwrap().1
+}
+
+#[test]
+fn delegate_helper_named_anywhere_in_the_repo_fails() {
+    for other in [
+        "fn backend_draw_f() {}\n",
+        "trait T {\n    fn backend_draw_f(&self);\n}\n",
+        "fn z(k: &K) {\n    k.backend_draw_f();\n}\n",
+        "use x::backend_draw_f;\n",
+        "fn z() {\n    m!(a, { r#backend_draw_f });\n}\n",
+        "fn z() { \"unterminated backend_draw_f\n",
+    ] {
+        has(
+            &delegate_beside(other),
+            "`backend_draw_f` already occurs before the change (other/src/z.rs)",
+        );
+    }
+}
+
+#[test]
+fn delegate_helper_in_strings_and_comments_only_passes() {
+    let other = "// backend_draw_f\nconst S: &str = \"backend_draw_f\";\n";
+    assert_eq!(delegate_beside(other), Vec::<String>::new());
+}
+
 #[test]
 fn delegate_with_swapped_args_fails() {
-    let errs = delegate(&DELEGATED.replace("draw_f(self, a, b)", "draw_f(self, b, a)"));
+    let errs =
+        delegate(&DELEGATED.replace("backend_draw_f(self, a, b)", "backend_draw_f(self, b, a)"));
     assert!(!errs.is_empty());
 }
 
@@ -295,7 +392,7 @@ fn split_with(
         path: tmp.join("a.toml"),
     };
     let spec = Spec {
-        delegate,
+        delegate: delegate.then(|| PREFIX.to_string()),
         ..self::spec_of(&m)
     };
     let base = mem(&[("src/a.rs", before)]);
@@ -410,8 +507,8 @@ fn delegate_to_cfg_disabled_helper_fails() {
     let after = format!(
         "use crate::other::Other;\n\n{}",
         DELEGATED.replace(
-            "    pub(super) fn draw_f",
-            "    #[cfg(any())]\n    pub(super) fn draw_f"
+            "    pub(super) fn backend_draw_f",
+            "    #[cfg(any())]\n    pub(super) fn backend_draw_f"
         )
     );
     let errs = same_file(DELEGATE_VIA_TRAIT, &after, true);
@@ -422,7 +519,10 @@ fn delegate_to_cfg_disabled_helper_fails() {
 fn delegate_by_method_call_fails() {
     let after = format!(
         "use crate::other::Other;\n\n{}",
-        DELEGATED.replace("Self::draw_f(self, a, b)", "self.draw_f(a, b)")
+        DELEGATED.replace(
+            "Self::backend_draw_f(self, a, b)",
+            "self.backend_draw_f(a, b)"
+        )
     );
     let errs = same_file(DELEGATE_VIA_TRAIT, &after, true);
     has(&errs, "tokens changed");
@@ -430,7 +530,10 @@ fn delegate_by_method_call_fails() {
 
 #[test]
 fn delegate_to_unsafe_helper_fails() {
-    let errs = delegate(&DELEGATED.replace("pub(super) fn draw_f", "pub(super) unsafe fn draw_f"));
+    let errs = delegate(&DELEGATED.replace(
+        "pub(super) fn backend_draw_f",
+        "pub(super) unsafe fn backend_draw_f",
+    ));
     has(&errs, "no inherent fn carries the old body");
 }
 
@@ -470,7 +573,7 @@ fn spec_of(m: &Manifest) -> Spec<'_> {
         old_root: m.source.clone(),
         new_root: m.new_root(),
         module: m.module.clone(),
-        delegate: false,
+        delegate: None,
     }
 }
 
@@ -481,7 +584,7 @@ fn module_files(root: &str, extra: &[(&str, &str, &str)]) -> Vec<String> {
         old_root: "src/k.rs".into(),
         new_root: "src/k.rs".into(),
         module: "k".into(),
-        delegate: false,
+        delegate: None,
     };
     let mut b = vec![("src/k.rs", root)];
     let mut a = vec![("src/k.rs", root)];
@@ -890,7 +993,7 @@ fn trait_import_shadowed_in_destination_fails() {
 }
 
 const DELEGATE_SPLIT: &str = "use std::cmp::min as pick;\n\npub struct K;\n\nimpl Backend for K {\n    fn f(&mut self, a: u32, b: u32) -> u32 {\n        pick(a, b)\n    }\n}\n";
-const FORWARDER: &str = "impl Backend for K {\n    fn f(&mut self, a: u32, b: u32) -> u32 {\n        Self::draw_f(self, a, b)\n    }\n}\n";
+const FORWARDER: &str = "impl Backend for K {\n    fn f(&mut self, a: u32, b: u32) -> u32 {\n        Self::backend_draw_f(self, a, b)\n    }\n}\n";
 const FWD_TABLE: &str =
     "a::struct K => a::struct K\na::impl Backend for K::fn f => a::impl Backend for K::fn f\n";
 
@@ -899,7 +1002,7 @@ fn delegated_helper_under_another_import_fails() {
     let mod_rs = format!(
         "mod inner;\npub use inner::*;\n\nuse std::cmp::min as pick;\n\npub struct K;\n\n{FORWARDER}"
     );
-    let inner = "use super::*;\nuse std::cmp::max as pick;\n\nimpl K {\n    pub(super) fn draw_f(&mut self, a: u32, b: u32) -> u32 {\n        pick(a, b)\n    }\n}\n";
+    let inner = "use super::*;\nuse std::cmp::max as pick;\n\nimpl K {\n    pub(super) fn backend_draw_f(&mut self, a: u32, b: u32) -> u32 {\n        pick(a, b)\n    }\n}\n";
     let errs = split_with(
         "delegate-names",
         DELEGATE_SPLIT,
@@ -921,7 +1024,7 @@ fn delegated_helper_on_another_modules_type_fails() {
     let mod_rs = format!(
         "mod inner;\npub use inner::*;\n\n{other}\nuse std::cmp::min as pick;\n\npub struct K;\n\n{FORWARDER}"
     );
-    let inner = "use super::*;\nuse super::other::K;\n\nimpl K {\n    pub(super) fn draw_f(&mut self, a: u32, b: u32) -> u32 {\n        pick(a, b)\n    }\n}\n";
+    let inner = "use super::*;\nuse super::other::K;\n\nimpl K {\n    pub(super) fn backend_draw_f(&mut self, a: u32, b: u32) -> u32 {\n        pick(a, b)\n    }\n}\n";
     let errs = split_with(
         "delegate-type",
         &before,
@@ -1037,7 +1140,7 @@ fn relative_path_to_the_same_module_passes() {
         old_root: "src/k.rs".into(),
         new_root: "src/k.rs".into(),
         module: "k".into(),
-        delegate: false,
+        delegate: None,
     };
     let errs = check(
         &spec,
@@ -1194,7 +1297,7 @@ fn committed_manifests_are_not_outside_the_tree() {
         old_root: "src/k.rs".into(),
         new_root: "src/k.rs".into(),
         module: "k".into(),
-        delegate: false,
+        delegate: None,
     };
     let src = mem(&[("src/k.rs", "fn f() {}\n")]);
     let touched = |p: &str| check(&spec, &src, &src, &[p.to_string()]).unwrap().1;
@@ -1258,7 +1361,7 @@ fn same_file_in(crate_files: &[(&str, &str)], before: &str, after: &str) -> Vec<
         old_root: "src/k.rs".into(),
         new_root: "src/k.rs".into(),
         module: "k".into(),
-        delegate: false,
+        delegate: None,
     };
     let side = |k: &str| {
         let mut v = crate_files.to_vec();
@@ -1371,7 +1474,7 @@ fn same_file_info(before: &str, after: &str) -> (Vec<String>, Vec<String>) {
         old_root: "src/k.rs".into(),
         new_root: "src/k.rs".into(),
         module: "k".into(),
-        delegate: false,
+        delegate: None,
     };
     check(
         &spec,
@@ -1645,7 +1748,7 @@ fn track_caller_fns_are_found_crate_wide() {
         old_root: "k/src/k.rs".into(),
         new_root: "k/src/k.rs".into(),
         module: "k".into(),
-        delegate: false,
+        delegate: None,
     };
     let side = |k: &str| {
         let mut v = ws.to_vec();

@@ -61,7 +61,7 @@ phase 2; XI2/RANDR are split later (phase 2c, decided).
 **1. One file, one kind of change.** Subject says which: **move** (whole items
 only — fn, impl, struct/enum, mod, const, macro, with attributes and doc
 comments), **visibility** (`pub(super)`/`pub(in path)` and `use` lines only),
-**delegate** (trait body → `self.<subsystem>_<name>(..)`), or **seam** (a real
+**delegate** (trait body → `Self::backend_<subsystem>_<name>(self, ..)`), or **seam** (a real
 small logic change, own review, HW smoke).
 
 **2. No widened visibility in phases 1–2.** `foo.rs` becomes `foo/mod.rs` +
@@ -111,7 +111,10 @@ body or a line that ended up in the wrong fn. The proof is item-based:
     changed.
 - Delegate commits (2.11b) use `split verify --delegate`: every changed trait
   method must be one forwarding call with the same arguments in the same order,
-  and the moved body must hash-equal the old trait body.
+  and the moved body must hash-equal the old trait body. The helper must be
+  named `<prefix><subsystem>_<method>` (`--delegate backend_`) and must not
+  occur as an identifier anywhere in the pre-change repo: a new inherent fn
+  wins method resolution over a same-named trait method.
 - Then the gate (rule 5).
 
 **Residual risk:** name resolution can change without a token change (a glob
@@ -218,11 +221,11 @@ backend/
 - **2.11a (move):** inherent impl and free fns into the tree. The 9.9k
   `trait_impl.rs` is accepted temporarily (decision 1).
 - **2.11b (delegate), its own commits grouped by subsystem:** each trait body
-  moves to an inherent `<subsystem>_<name>` in its group file; inherent-side
-  renames for collisions (`fb_dimensions`, `randr_outputs_and_modes`,
+  moves to an inherent `backend_<subsystem>_<name>` in its group file;
+  inherent-side renames for collisions (`fb_dimensions`, `randr_outputs_and_modes`,
   `randr_providers`, `acquire/release_glx_pixmap_export`,
   `vt_switching_armed`, `promote_pixmap_exportable`, `present_get_ust_msc`).
-  Verified by `split verify --delegate`.
+  Verified by `split verify --delegate backend_`.
 - CI grep after 2.11: `backend/portable/**` has no `crate::drm`, `gbm`,
   `OwnedFd|RawFd`, `libc::`, `nix::`, `platform::`, `backend::kms::`.
 
