@@ -212,7 +212,7 @@ AllowEvents, two GLX chunks, XTEST/cursor) are regrouped by the move.
 ```
 backend.rs        imports, all types, helper-type impls, test mod decls
 backend/
-  trait_impl.rs   impl Backend for KmsBackend (9.9k after 2.11a; delegators after 2.11b)
+  trait_impl.rs   impl Backend for KmsBackend (9.9k after 2.11a; 2.0k delegators after 2.11b)
   portable/       windows, redirect, paint_target, render_ops, text, inferiors,
                   clip, draw, keyboard, devices, pointer, stats, dump
                   (no drm/gbm/fd/libc imports; pointer's cursor-plane calls: phase 3)
