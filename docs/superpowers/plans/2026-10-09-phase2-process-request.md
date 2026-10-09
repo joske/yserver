@@ -15,9 +15,8 @@ Step 2.6 of `2026-10-08-source-layout-cleanup.md`. Manifest:
   `handle_randr_request` 2,273, `handle_xfixes_request` 1,123,
   `handle_glx_request` 1,001, `handle_render_request` 945, `handle_present_request`
   840, `handle_dri3_request` 794.
-- **Shared helpers:** `emit_x11_error{,_with_minor}`, `write_to_client`,
-  `send_reply_with_fd`, `drawable_lookup`/`validate_*`, `xid_out_of_client_range`,
-  `drawable_exists`, `window_unviewable`, `zpixmap_expected_len`.
+- **Shared helpers:** `emit_x11_error*`, `write_to_client`, `send_reply_with_fd`,
+  `drawable_lookup`/`validate_*`, `xid_out_of_client_range`, `drawable_exists`.
 - **State:** only `&mut ServerState` and `&mut dyn Backend`.
 - **Macros:** two fn-local `macro_rules!`: `verify_pictures!`
   (`handle_render_request`, 13 uses) and `require_len!`
@@ -25,11 +24,8 @@ Step 2.6 of `2026-10-08-source-layout-cleanup.md`. Manifest:
   absolute paths and root helpers. There are no other macro definitions.
 - **Logs:** 376 `debug!`, 64 `warn!`, 17 `trace!`, 7 `info!`, 1 `error!`
   (41 with `target:`). No `module_path!`/`line!`/`file!`/`#[track_caller]`.
-- **Who uses it from outside:** `run.rs`, `process_disconnect.rs`,
-  `key_fanout.rs`, `pointer_fanout.rs`, `sync_await.rs`, `composite_overlay.rs`
-  and `record.rs` call ~45 `pub(crate)`/`pub(super)` items. The `yserver`
-  crate uses `fire_present_completion_events` and
-  `shutdown_drain_present_pending_exec` (`pub`).
+- **Outside users:** 7 `core_loop` siblings call ~45 `pub(crate)`/`pub(super)`
+  items; `yserver` calls two `pub` present fns.
 
 ## Target tree (lines after `cargo +nightly fmt`, dry run)
 
@@ -141,9 +137,8 @@ shadowed names.
 4. **Module names.** The `_ext` suffix only marks names already taken
    (`randr`, `present`, `sync`). The alternative is the bare names plus fixing
    the test globs.
-5. **Plan wording.** The plan's `core_loop/request/` should become
-   `core_loop/process_request/` (descendant rule, agreed with codex). Update the
-   plan when this is accepted.
+5. **Plan wording.** Change the plan's `core_loop/request/` to
+   `core_loop/process_request/` (descendant rule) once this is accepted.
 
 ## Commit sequence (when accepted)
 
