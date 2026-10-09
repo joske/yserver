@@ -1,0 +1,53 @@
+# Phase 1a for x11/mod.rs: its inline #[cfg(test)] module(s) go out
+# of line at the same logical paths; production items stay in place.
+source = "crates/yserver-protocol/src/x11/mod.rs"
+module = "x11"
+dir = "crates/yserver-protocol/src/x11"
+table = "x11.paths"
+
+[[modules]]
+name = ""
+items = [
+  "const *",
+  "enum *",
+  "fn *",
+  "impl FontMetrics",
+  "impl SequenceNumber",
+  "impl ValueList < '_ >",
+  "impl XkbMapNotify",
+  "mod atoms",
+  "mod colors",
+  "mod composite",
+  "mod damage",
+  "mod dpms",
+  "mod dri3",
+  "mod error",
+  "mod glx",
+  "mod keysyms",
+  "mod mit_shm",
+  "mod present",
+  "mod randr",
+  "mod record",
+  "mod request_lengths",
+  "mod request_swap",
+  "mod screensaver",
+  "mod shape",
+  "mod sync",
+  "mod wire",
+  "mod wire_swap",
+  "mod xf86vidmode",
+  "mod xfixes",
+  "mod xinerama",
+  "mod x_resource",
+  "mod xtest",
+  "struct *",
+  "use *",
+]
+
+[[modules]]
+name = "tests"
+items = ["tests::*"]
+
+[[modules]]
+name = "render_query_pict_formats_tests"
+items = ["render_query_pict_formats_tests::*"]
