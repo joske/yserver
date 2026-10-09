@@ -65,3 +65,9 @@ eca005eb64a454f0b36ec2ff1c6011e7a2898148
 
 # refactor(core): split process_request into request-family modules (move)
 8153b67438fc3b5ce431670a6ebab99d7b800734
+
+# refactor(kms): qualify backend super:: paths (prep)
+6b6e20a0e95f3b6d77e125cc3c59af78f7841ce7
+
+# refactor(kms): split backend into portable/kms/trait_impl modules (move)
+777758f4727f4bb88f0e580851b9bb1b8dd8a7f0
