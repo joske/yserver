@@ -1,0 +1,29 @@
+# Phase 1a for run.rs: its inline #[cfg(test)] module(s) go out
+# of line at the same logical paths; production items stay in place.
+source = "crates/yserver-core/src/core_loop/run.rs"
+module = "core_loop::run"
+dir = "crates/yserver-core/src/core_loop/run"
+root_form = "file"
+table = "run.paths"
+
+[[modules]]
+name = ""
+items = [
+  "const *",
+  "fn *",
+  "impl FairRequestQueue",
+  "impl ListenerReadiness",
+  "impl LoopTelemetry",
+  "impl PendingBackendRequests",
+  "impl XiConfigLane",
+  "struct *",
+  "use *",
+]
+
+[[modules]]
+name = "tests"
+items = ["tests::*"]
+
+[[modules]]
+name = "server_reset"
+items = ["server_reset::*"]
