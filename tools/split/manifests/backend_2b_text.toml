@@ -1,0 +1,15 @@
+# Phase 2.11b (text): trait bodies of `impl Backend for KmsBackend` move to
+# inherent `backend_<subsystem>_<method>` helpers; the trait methods forward.
+# Identity path table shared by all 2.11b commits.
+source = "crates/yserver/src/kms/render/backend.rs"
+module = "kms::render::backend"
+dir = "crates/yserver/src/kms/render/backend"
+root_form = "file"
+table = "backend_2b.paths"
+modules = []
+
+[locations]
+"trait_impl::impl Backend for KmsBackend::fn set_dpms_power" = "calls a #[track_caller] scene damage-audit helper (wake_for_damage) whose recorded caller line shifts inside backend/trait_impl.rs (bodies above it became delegators); only diagnostic source attribution changes (scene.rs overflow report and audit attribution), not damage computation"
+
+[log_targets]
+"portable::text::impl KmsBackend::fn backend_text_list_fonts_with_info_proxy" = "log macros without target: the delegated body moves from kms::render::backend::trait_impl (a module only since 2.11a) to kms::render::backend::portable::text; both stay under kms::render::backend, so backend-level RUST_LOG filters still match"

@@ -3184,3 +3184,156 @@ impl KmsBackend {
         Ok(())
     }
 }
+
+impl KmsBackend {
+    pub(in crate::kms::render::backend) fn backend_draw_poly_text8(
+        &mut self,
+        origin: Option<OriginContext>,
+        host_xid: u32,
+        foreground: u32,
+        body: &[u8],
+    ) -> io::Result<()> {
+        // Body: drawable(4) + gc(4) + x(2) + y(2) + LISTofTEXTITEM8.
+        // Each TEXTITEM8 is `len(u8) delta(i8) chars(len)` for len
+        // in 0..=254, or `255 font_id(u32 BE)` for a font change.
+        // No inter-item padding.
+        if body.len() < 12 {
+            return Ok(());
+        }
+        let x = i16::from_le_bytes([body[8], body[9]]) as i32;
+        let y = i16::from_le_bytes([body[10], body[11]]) as i32;
+        let mut items = &body[12..];
+        let mut cursor_x = x;
+        while items.len() >= 2 {
+            let len = items[0];
+            if len == 255 {
+                if items.len() < 5 {
+                    break;
+                }
+                let font_xid = u32::from_be_bytes([items[1], items[2], items[3], items[4]]);
+                self.core.current_font = Some(font_xid);
+                items = &items[5..];
+                continue;
+            }
+            let delta = items[1] as i8;
+            let len = len as usize;
+            if items.len() < 2 + len {
+                break;
+            }
+            let text = &items[2..2 + len];
+            cursor_x = cursor_x.saturating_add(i32::from(delta));
+            if !text.is_empty() {
+                let chars: Vec<char> = text.iter().map(|&b| b as char).collect();
+                self.render_text_chars(origin, host_xid, foreground, cursor_x, y, &chars)?;
+                if let Some(font_state) =
+                    self.core.current_font.and_then(|f| self.core.fonts.get(&f))
+                {
+                    cursor_x = cursor_x.saturating_add(text_advance(font_state, &chars));
+                }
+            }
+            items = &items[2 + len..];
+        }
+        Ok(())
+    }
+
+    pub(in crate::kms::render::backend) fn backend_draw_poly_text16(
+        &mut self,
+        origin: Option<OriginContext>,
+        host_xid: u32,
+        foreground: u32,
+        body: &[u8],
+    ) -> io::Result<()> {
+        // Body: drawable(4) + gc(4) + x(2) + y(2) + LISTofTEXTITEM16.
+        // Each TEXTITEM16 is `len(u8) delta(i8) chars(2*len)` (chars
+        // are CHAR2B, big-endian) for len in 0..=254, or `255
+        // font_id(u32 BE)` for a font change.
+        if body.len() < 12 {
+            return Ok(());
+        }
+        let x = i16::from_le_bytes([body[8], body[9]]) as i32;
+        let y = i16::from_le_bytes([body[10], body[11]]) as i32;
+        let mut cursor_x = x;
+        let mut items = &body[12..];
+        while items.len() >= 2 {
+            let len = items[0];
+            if len == 255 {
+                if items.len() < 5 {
+                    break;
+                }
+                let font_xid = u32::from_be_bytes([items[1], items[2], items[3], items[4]]);
+                self.core.current_font = Some(font_xid);
+                items = &items[5..];
+                continue;
+            }
+            let delta = items[1] as i8;
+            let len = len as usize;
+            let needed = 2 + 2 * len;
+            if items.len() < needed {
+                break;
+            }
+            cursor_x = cursor_x.saturating_add(i32::from(delta));
+            let mut chars = Vec::with_capacity(len);
+            for i in 0..len {
+                let codepoint = u16::from_be_bytes([items[2 + 2 * i], items[2 + 2 * i + 1]]) as u32;
+                chars.push(char::from_u32(codepoint).unwrap_or('\u{fffd}'));
+            }
+            if !chars.is_empty() {
+                self.render_text_chars(origin, host_xid, foreground, cursor_x, y, &chars)?;
+                if let Some(font_state) =
+                    self.core.current_font.and_then(|f| self.core.fonts.get(&f))
+                {
+                    cursor_x = cursor_x.saturating_add(text_advance(font_state, &chars));
+                }
+            }
+            items = &items[needed..];
+        }
+        Ok(())
+    }
+
+    pub(in crate::kms::render::backend) fn backend_draw_image_text8(
+        &mut self,
+        origin: Option<OriginContext>,
+        host_xid: u32,
+        foreground: u32,
+        background: u32,
+        text_len: u8,
+        body: &[u8],
+    ) -> io::Result<()> {
+        // Body: drawable(4) + gc(4) + x(2) + y(2) + string(text_len)
+        if body.len() < 12 {
+            return Ok(());
+        }
+        let x = i16::from_le_bytes([body[8], body[9]]) as i32;
+        let y = i16::from_le_bytes([body[10], body[11]]) as i32;
+        let end = (12usize + text_len as usize).min(body.len());
+        let chars: Vec<char> = body[12..end].iter().map(|&b| b as char).collect();
+        self.image_text_common(origin, host_xid, foreground, background, x, y, &chars)
+    }
+
+    pub(in crate::kms::render::backend) fn backend_draw_image_text16(
+        &mut self,
+        origin: Option<OriginContext>,
+        host_xid: u32,
+        foreground: u32,
+        background: u32,
+        text_len: u8,
+        body: &[u8],
+    ) -> io::Result<()> {
+        if body.len() < 12 {
+            return Ok(());
+        }
+        let x = i16::from_le_bytes([body[8], body[9]]) as i32;
+        let y = i16::from_le_bytes([body[10], body[11]]) as i32;
+        let mut chars = Vec::with_capacity(text_len as usize);
+        let mut pos = 12usize;
+        for _ in 0..text_len {
+            if pos + 2 > body.len() {
+                break;
+            }
+            let codepoint = u16::from_be_bytes([body[pos], body[pos + 1]]) as u32;
+            pos += 2;
+            chars.push(char::from_u32(codepoint).unwrap_or('\u{fffd}'));
+        }
+        self.image_text_common(origin, host_xid, foreground, background, x, y, &chars)
+    }
+}

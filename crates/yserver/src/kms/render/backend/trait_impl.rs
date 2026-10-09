@@ -3470,35 +3470,11 @@ impl Backend for KmsBackend {
         _origin: Option<OriginContext>,
         name: &str,
     ) -> io::Result<(FontHandle, FontMetrics)> {
-        // Same body as v1. `KmsCore` already owns `FontLoader` +
-        // `fonts` (it's protocol-bookkeeping per the v2 spec); the
-        // backend just wraps the resulting freetype handle in a
-        // `FontState` entry against a freshly-allocated xid.
-        use std::cell::RefCell;
-
-        use crate::kms::core::{FontState, FreetypeFace};
-        let (face, metrics, char_cache) = self.core.font_loader.open_font(name)?;
-        let host_xid = self.core.next_host_xid();
-        let handle = FontHandle::from_raw(host_xid)
-            .ok_or_else(|| io::Error::other("failed to create font handle"))?;
-        self.core.fonts.insert(
-            host_xid,
-            FontState {
-                handle: host_xid,
-                face: RefCell::new(FreetypeFace(face)),
-                metrics: metrics.clone(),
-                char_info_cache: char_cache,
-                glyph_span_cache: RefCell::new(HashMap::new()),
-            },
-        );
-        Ok((handle, metrics))
+        Self::backend_text_open_font(self, _origin, name)
     }
 
     fn close_font(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
-        self.core.fonts.remove(&host_xid);
-        // Core text keys its atlas entries by the font's host xid.
-        self.engine.forget_glyphs(host_xid, None);
-        Ok(())
+        Self::backend_text_close_font(self, _origin, host_xid)
     }
 
     fn set_font_path(
@@ -3506,10 +3482,7 @@ impl Backend for KmsBackend {
         _origin: Option<OriginContext>,
         paths: &[String],
     ) -> Result<(), usize> {
-        self.core
-            .font_loader
-            .set_font_path(paths)
-            .map_err(|bad| paths.iter().position(|p| *p == bad).unwrap_or(paths.len()))
+        Self::backend_text_set_font_path(self, _origin, paths)
     }
 
     fn font_path(&self) -> Vec<String> {
@@ -4128,47 +4101,7 @@ impl Backend for KmsBackend {
         foreground: u32,
         body: &[u8],
     ) -> io::Result<()> {
-        // Body: drawable(4) + gc(4) + x(2) + y(2) + LISTofTEXTITEM8.
-        // Each TEXTITEM8 is `len(u8) delta(i8) chars(len)` for len
-        // in 0..=254, or `255 font_id(u32 BE)` for a font change.
-        // No inter-item padding.
-        if body.len() < 12 {
-            return Ok(());
-        }
-        let x = i16::from_le_bytes([body[8], body[9]]) as i32;
-        let y = i16::from_le_bytes([body[10], body[11]]) as i32;
-        let mut items = &body[12..];
-        let mut cursor_x = x;
-        while items.len() >= 2 {
-            let len = items[0];
-            if len == 255 {
-                if items.len() < 5 {
-                    break;
-                }
-                let font_xid = u32::from_be_bytes([items[1], items[2], items[3], items[4]]);
-                self.core.current_font = Some(font_xid);
-                items = &items[5..];
-                continue;
-            }
-            let delta = items[1] as i8;
-            let len = len as usize;
-            if items.len() < 2 + len {
-                break;
-            }
-            let text = &items[2..2 + len];
-            cursor_x = cursor_x.saturating_add(i32::from(delta));
-            if !text.is_empty() {
-                let chars: Vec<char> = text.iter().map(|&b| b as char).collect();
-                self.render_text_chars(origin, host_xid, foreground, cursor_x, y, &chars)?;
-                if let Some(font_state) =
-                    self.core.current_font.and_then(|f| self.core.fonts.get(&f))
-                {
-                    cursor_x = cursor_x.saturating_add(text_advance(font_state, &chars));
-                }
-            }
-            items = &items[2 + len..];
-        }
-        Ok(())
+        Self::backend_draw_poly_text8(self, origin, host_xid, foreground, body)
     }
 
     fn poly_text16(
@@ -4178,51 +4111,7 @@ impl Backend for KmsBackend {
         foreground: u32,
         body: &[u8],
     ) -> io::Result<()> {
-        // Body: drawable(4) + gc(4) + x(2) + y(2) + LISTofTEXTITEM16.
-        // Each TEXTITEM16 is `len(u8) delta(i8) chars(2*len)` (chars
-        // are CHAR2B, big-endian) for len in 0..=254, or `255
-        // font_id(u32 BE)` for a font change.
-        if body.len() < 12 {
-            return Ok(());
-        }
-        let x = i16::from_le_bytes([body[8], body[9]]) as i32;
-        let y = i16::from_le_bytes([body[10], body[11]]) as i32;
-        let mut cursor_x = x;
-        let mut items = &body[12..];
-        while items.len() >= 2 {
-            let len = items[0];
-            if len == 255 {
-                if items.len() < 5 {
-                    break;
-                }
-                let font_xid = u32::from_be_bytes([items[1], items[2], items[3], items[4]]);
-                self.core.current_font = Some(font_xid);
-                items = &items[5..];
-                continue;
-            }
-            let delta = items[1] as i8;
-            let len = len as usize;
-            let needed = 2 + 2 * len;
-            if items.len() < needed {
-                break;
-            }
-            cursor_x = cursor_x.saturating_add(i32::from(delta));
-            let mut chars = Vec::with_capacity(len);
-            for i in 0..len {
-                let codepoint = u16::from_be_bytes([items[2 + 2 * i], items[2 + 2 * i + 1]]) as u32;
-                chars.push(char::from_u32(codepoint).unwrap_or('\u{fffd}'));
-            }
-            if !chars.is_empty() {
-                self.render_text_chars(origin, host_xid, foreground, cursor_x, y, &chars)?;
-                if let Some(font_state) =
-                    self.core.current_font.and_then(|f| self.core.fonts.get(&f))
-                {
-                    cursor_x = cursor_x.saturating_add(text_advance(font_state, &chars));
-                }
-            }
-            items = &items[needed..];
-        }
-        Ok(())
+        Self::backend_draw_poly_text16(self, origin, host_xid, foreground, body)
     }
 
     fn image_text8(
@@ -4234,15 +4123,9 @@ impl Backend for KmsBackend {
         text_len: u8,
         body: &[u8],
     ) -> io::Result<()> {
-        // Body: drawable(4) + gc(4) + x(2) + y(2) + string(text_len)
-        if body.len() < 12 {
-            return Ok(());
-        }
-        let x = i16::from_le_bytes([body[8], body[9]]) as i32;
-        let y = i16::from_le_bytes([body[10], body[11]]) as i32;
-        let end = (12usize + text_len as usize).min(body.len());
-        let chars: Vec<char> = body[12..end].iter().map(|&b| b as char).collect();
-        self.image_text_common(origin, host_xid, foreground, background, x, y, &chars)
+        Self::backend_draw_image_text8(
+            self, origin, host_xid, foreground, background, text_len, body,
+        )
     }
 
     fn image_text16(
@@ -4254,22 +4137,9 @@ impl Backend for KmsBackend {
         text_len: u8,
         body: &[u8],
     ) -> io::Result<()> {
-        if body.len() < 12 {
-            return Ok(());
-        }
-        let x = i16::from_le_bytes([body[8], body[9]]) as i32;
-        let y = i16::from_le_bytes([body[10], body[11]]) as i32;
-        let mut chars = Vec::with_capacity(text_len as usize);
-        let mut pos = 12usize;
-        for _ in 0..text_len {
-            if pos + 2 > body.len() {
-                break;
-            }
-            let codepoint = u16::from_be_bytes([body[pos], body[pos + 1]]) as u32;
-            pos += 2;
-            chars.push(char::from_u32(codepoint).unwrap_or('\u{fffd}'));
-        }
-        self.image_text_common(origin, host_xid, foreground, background, x, y, &chars)
+        Self::backend_draw_image_text16(
+            self, origin, host_xid, foreground, background, text_len, body,
+        )
     }
 
     fn render_create_picture(
@@ -5834,27 +5704,7 @@ impl Backend for KmsBackend {
         max_names: u16,
         pattern: &str,
     ) -> io::Result<Vec<u8>> {
-        let cap = usize::from(max_names);
-        // Font-path (fonts.dir/alias) names first, then the built-ins
-        // catalog — ONE global max_names budget across the ordered
-        // walk (Xorg traverses FPEs in path order with one count).
-        let names: Vec<String> = self.core.font_loader.list_font_names(pattern, cap);
-
-        let mut name_data: Vec<u8> = Vec::new();
-        for name in &names {
-            name_data.push(u8::try_from(name.len()).unwrap_or(u8::MAX));
-            name_data.extend_from_slice(name.as_bytes());
-        }
-        let pad = (4 - (name_data.len() % 4)) % 4;
-        name_data.resize(name_data.len() + pad, 0);
-
-        let extra_words = u32::try_from(name_data.len() / 4).unwrap_or(0);
-        let mut reply = vec![0u8; 32 + name_data.len()];
-        reply[0] = 1;
-        reply[4..8].copy_from_slice(&extra_words.to_le_bytes());
-        reply[8..10].copy_from_slice(&u16::try_from(names.len()).unwrap_or(u16::MAX).to_le_bytes());
-        reply[32..].copy_from_slice(&name_data);
-        Ok(reply)
+        Self::backend_text_list_fonts_proxy(self, _origin, max_names, pattern)
     }
 
     fn list_fonts_with_info_proxy(
@@ -5864,128 +5714,13 @@ impl Backend for KmsBackend {
         pattern: &str,
         intern_atom: &mut dyn FnMut(&str) -> u32,
     ) -> io::Result<Vec<Vec<u8>>> {
-        let cap = usize::from(max_names);
-        // Path fonts first, then built-ins — one global budget
-        // (mirrors list_fonts_proxy ordering so the two requests
-        // agree on the visible font set).
-        let listed = self.core.font_loader.list_fonts_with_info(pattern, cap);
-
-        let mut entries: Vec<(String, FontMetrics)> = Vec::with_capacity(listed.len());
-        for crate::kms::core::ListedFont {
-            reply_name: name,
-            open_name,
-            res,
-        } in listed
-        {
-            // The fonts.dir KEY a path font resolved to — not the bare
-            // matched alias, not the file-embedded FONT atom — is the
-            // round-trippable XA_FONT.
-            let path_entry_key = match &res {
-                crate::kms::core::FontResolution::File { entry_name, .. } => {
-                    Some(entry_name.clone())
-                }
-                _ => None,
-            };
-            match self.core.font_loader.font_info(&res, &open_name) {
-                Ok(info) => {
-                    let mut metrics = info.metrics_without_chars();
-                    // Reply NAME keeps Xorg FPE behavior: path / XLFD
-                    // names go out verbatim; a bare built-in alias
-                    // ("fixed"/"cursor"/"nil2") is rewritten to a full
-                    // XLFD so XCreateFontSet can parse a charset.
-                    let wire_name = if path_entry_key.is_some()
-                        || crate::kms::core::FontLoader::is_xlfd_pattern(&name)
-                    {
-                        name.clone()
-                    } else {
-                        crate::kms::core::FontLoader::alias_to_xlfd(&name, &metrics)
-                    };
-                    // XA_FONT must be a charset-bearing XLFD that
-                    // round-trips through open_font (libX11 OpenFonts it
-                    // verbatim — omGeneric.c get_prop_name). For a path
-                    // font that's the fonts.dir KEY resolve() matched;
-                    // the PCF's embedded FONT atom can diverge from the
-                    // key (point/dpi/avg-width fields — e.g. Debian
-                    // xfonts-* 19px misc-fixed) and then fail to reopen.
-                    let font_prop_name = match path_entry_key {
-                        Some(entry) => entry,
-                        None if crate::kms::core::FontLoader::is_xlfd_pattern(&name) => {
-                            name.clone()
-                        }
-                        None => crate::kms::core::FontLoader::alias_to_xlfd(&name, &metrics),
-                    };
-                    // Properties: file-embedded (BDF/PCF) ones when
-                    // present, interned here; always ensure FONT
-                    // (XA_FONT=18 → atom of the wire name) —
-                    // libX11's XCreateFontSet resolves non-XLFD base
-                    // names EXCLUSIVELY through this property
-                    // (omGeneric.c get_prop_name reads XA_FONT off the
-                    // first reply and GetAtomName's it); the reply
-                    // name alone is not consulted on that path.
-                    let named = std::mem::take(&mut metrics.named_properties);
-                    let mut props = Vec::with_capacity(named.len() * 8 + 8);
-                    for (pname, value) in &named {
-                        // XA_FONT (18) is re-emitted below as `wire_name`
-                        // — the name the server can actually re-open. A
-                        // PCF's file-embedded FONT atom can diverge from
-                        // its fonts.dir entry key (point/dpi/avg-width
-                        // fields); reporting the embedded one breaks the
-                        // XCreateFontSet round-trip (libX11 OpenFonts
-                        // XA_FONT verbatim, but `resolve()` only matches
-                        // fonts.dir keys) on font sets where they differ
-                        // — e.g. Debian xfonts-* 19px misc-fixed. Skip
-                        // the embedded FONT here.
-                        if pname == "FONT" {
-                            continue;
-                        }
-                        let name_atom = intern_atom(pname);
-                        let v: u32 = match value {
-                            yserver_protocol::x11::FontPropValue::Card(c) => *c,
-                            #[allow(clippy::cast_sign_loss)]
-                            yserver_protocol::x11::FontPropValue::Int(i) => *i as u32,
-                            yserver_protocol::x11::FontPropValue::Str(s) => intern_atom(s),
-                        };
-                        props.extend_from_slice(&name_atom.to_le_bytes());
-                        props.extend_from_slice(&v.to_le_bytes());
-                    }
-                    // Always emit XA_FONT (18) = the round-trippable name
-                    // (fonts.dir key for path fonts; the synthesized
-                    // charset-bearing XLFD for built-in aliases).
-                    let font_atom = intern_atom(&font_prop_name);
-                    props.extend_from_slice(&18u32.to_le_bytes());
-                    props.extend_from_slice(&font_atom.to_le_bytes());
-                    metrics.properties = props;
-                    entries.push((wire_name, metrics));
-                }
-                Err(err) => {
-                    log::debug!("render ListFontsWithInfo: skipping {name:?} — {err}");
-                }
-            }
-        }
-
-        let total = entries.len();
-        let mut replies: Vec<Vec<u8>> = Vec::with_capacity(total + 1);
-        for (idx, (name, metrics)) in entries.iter().enumerate() {
-            let remaining = u32::try_from(total - idx - 1).unwrap_or(0);
-            let mut buf = Vec::new();
-            yserver_protocol::x11::write_list_fonts_with_info_reply(
-                &mut buf,
-                yserver_protocol::x11::ClientByteOrder::LittleEndian,
-                yserver_protocol::x11::SequenceNumber(0),
-                metrics,
-                name,
-                remaining,
-            )?;
-            replies.push(buf);
-        }
-        let mut term = Vec::new();
-        yserver_protocol::x11::write_list_fonts_with_info_terminator(
-            &mut term,
-            yserver_protocol::x11::ClientByteOrder::LittleEndian,
-            yserver_protocol::x11::SequenceNumber(0),
-        )?;
-        replies.push(term);
-        Ok(replies)
+        Self::backend_text_list_fonts_with_info_proxy(
+            self,
+            _origin,
+            max_names,
+            pattern,
+            intern_atom,
+        )
     }
 
     fn get_atom_name(
