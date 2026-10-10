@@ -561,13 +561,13 @@ struct OutputSceneState {
     /// which forces the walk before this set is consulted again. A fresh state
     /// (startup, `rebuild_outputs`) starts empty, and a drawable in NO output's
     /// set is treated as unknown ⇒ every output walks — conservative.
-    last_pieces: std::collections::HashSet<super::store::DrawableId>,
+    last_pieces: std::collections::HashSet<crate::kms::render::store::DrawableId>,
     /// The presentation-damage epoch of every drawable this output's most
     /// recent submitted compose carried. Another output's compose of a
     /// drawable at a newer epoch hands this one the damage
     /// ([`fan_out_carried_damage`]), because that output's retire acks it in
     /// the store for everyone.
-    presented_epochs: std::collections::HashMap<super::store::DrawableId, u64>,
+    presented_epochs: std::collections::HashMap<crate::kms::render::store::DrawableId, u64>,
     /// The footprint-sized image a RANDR-transformed output composites into
     /// before the scale pass; `None` at identity (spec D4).
     intermediate: Option<TransformIntermediate>,
@@ -943,7 +943,7 @@ pub(crate) struct SceneCompositor {
     /// wireframes). Mutated only via the `root_overlay_*` helpers below,
     /// which also inject the scene-structure damage needed to force a
     /// compose.
-    pub(crate) root_overlay: super::root_overlay::RootOverlay,
+    pub(crate) root_overlay: crate::kms::render::root_overlay::RootOverlay,
     /// Stage 2d's coarse scene-structure dirty bit. Set by any
     /// map/unmap/configure/restack/redirect-state/cursor-pos
     /// change. Cleared at tick end. Stage 2e narrows to a
@@ -973,7 +973,7 @@ struct SceneCompositorInner {
     scale_pipeline: Option<ScalePassPipeline>,
     /// XOR-logic-op fill pipeline cache used to apply the retained
     /// root-`IncludeInferiors` overlay as a final pass into each
-    /// freshly-composited scanout BO (see [`super::root_overlay`]).
+    /// freshly-composited scanout BO (see [`crate::kms::render::root_overlay`]).
     /// Built for the scanout color format (`B8G8R8A8_UNORM`); the
     /// `(Xor, opaque_alpha = true)` variant is the only one used —
     /// its RGB-only write mask preserves the server-owned α byte on
@@ -1015,7 +1015,7 @@ struct RootReadback {
 /// same paths as any other drawable.
 #[derive(Debug, Clone)]
 pub(crate) struct CursorEntry {
-    pub(crate) id: super::store::DrawableId,
+    pub(crate) id: crate::kms::render::store::DrawableId,
     pub(crate) extent: vk::Extent2D,
     pub(crate) hot_x: i16,
     pub(crate) hot_y: i16,
@@ -1158,7 +1158,7 @@ impl WalkStats {
 /// to the other outputs as structure damage: [`fan_out_carried_damage`].
 #[derive(Clone, Debug)]
 struct CarriedDamage {
-    id: super::store::DrawableId,
+    id: crate::kms::render::store::DrawableId,
     epoch: u64,
     root: Vec<vk::Rect2D>,
 }
@@ -1179,12 +1179,12 @@ struct WalkSink<'a> {
     /// walk (the union of the other outputs' retained `last_pieces`). Decides
     /// `ContentDamage::OtherOutput` vs `OffOutput`. Empty when unknown (single
     /// output, first frame, tests), which degrades to the old force-and-ack.
-    elsewhere: &'a std::collections::HashSet<super::store::DrawableId>,
+    elsewhere: &'a std::collections::HashSet<crate::kms::render::store::DrawableId>,
     draws: Vec<CompositeDraw>,
     snapshots: Vec<DamageSnapshot>,
     /// The non-empty carried snapshots again, in root coordinates. Unordered.
     carried: Vec<CarriedDamage>,
-    sampled_ids: Vec<super::store::DrawableId>,
+    sampled_ids: Vec<crate::kms::render::store::DrawableId>,
     projected: RegionSet,
     participants: Vec<ScenePresence>,
     stats: WalkStats,
@@ -1205,19 +1205,19 @@ struct WalkSink<'a> {
     /// (`store::DormantReason`) and stops arming the scheduler; its damage is
     /// preserved, and either its next paint (`HiddenDamage`) or the mover's
     /// structural change (`NoPieces`) brings it back.
-    presented_ids: Vec<super::store::DrawableId>,
+    presented_ids: Vec<crate::kms::render::store::DrawableId>,
     /// The sampled sources that emitted at least one piece on this output.
     /// With `presented_ids` this decides the dormancy REASON: not presented
     /// and no pieces anywhere ⇒ `DormantReason::NoPieces`; not presented but
     /// pieces ⇒ `HiddenDamage`, which the next paint re-arms.
-    pieces_ids: Vec<super::store::DrawableId>,
+    pieces_ids: Vec<crate::kms::render::store::DrawableId>,
 }
 
 impl<'a> WalkSink<'a> {
     fn new(
         output_idx: usize,
         origin: (i32, i32),
-        elsewhere: &'a std::collections::HashSet<super::store::DrawableId>,
+        elsewhere: &'a std::collections::HashSet<crate::kms::render::store::DrawableId>,
     ) -> Self {
         Self {
             output_idx,
@@ -1252,7 +1252,7 @@ struct SceneBuild {
     snapshots: Vec<DamageSnapshot>,
     /// See [`WalkSink::carried`].
     carried: Vec<CarriedDamage>,
-    sampled_ids: Vec<super::store::DrawableId>,
+    sampled_ids: Vec<crate::kms::render::store::DrawableId>,
     projected_damage: RegionSet,
     /// Stage 5 Phase C — pure cursor strategy decision. The outer
     /// tick consumes this to derive the per-output transition
@@ -1278,9 +1278,9 @@ struct SceneBuild {
     /// Step 1 — what the walk did, for telemetry.
     stats: WalkStats,
     /// See [`WalkSink::presented_ids`]. Feeds the tick's `drawn` set.
-    presented_ids: Vec<super::store::DrawableId>,
+    presented_ids: Vec<crate::kms::render::store::DrawableId>,
     /// See [`WalkSink::pieces_ids`]. Feeds the tick's `had_pieces` set.
-    pieces_ids: Vec<super::store::DrawableId>,
+    pieces_ids: Vec<crate::kms::render::store::DrawableId>,
 }
 
 impl SceneBuild {
@@ -1373,7 +1373,7 @@ impl SceneCompositor {
         ensure_intermediates(&mut inner, platform)?;
         Ok(Self {
             inner: Some(inner),
-            root_overlay: super::root_overlay::RootOverlay::default(),
+            root_overlay: crate::kms::render::root_overlay::RootOverlay::default(),
             scene_structure_dirty: true,
             structure_generation: 0,
             #[cfg(test)]
@@ -1594,7 +1594,7 @@ impl SceneCompositor {
     pub(crate) fn stub() -> Self {
         Self {
             inner: None,
-            root_overlay: super::root_overlay::RootOverlay::default(),
+            root_overlay: crate::kms::render::root_overlay::RootOverlay::default(),
             scene_structure_dirty: false,
             structure_generation: 0,
             #[cfg(test)]
@@ -2106,7 +2106,7 @@ impl SceneCompositor {
         core: &KmsCore,
         store: &mut DrawableStore,
         platform: &mut PlatformBackend,
-        windows: &super::backend::WindowsMap,
+        windows: &crate::kms::render::backend::WindowsMap,
         telemetry: &mut Telemetry,
         cow_host_xid: Option<u32>,
     ) -> Result<Vec<usize>, SceneError> {
@@ -2138,9 +2138,9 @@ impl SceneCompositor {
         // across all outputs, and whether every output actually walked
         // `build_scene`. Only reconcile `offscreen_no_draw` when all
         // walked — see `TickOutcome::walked`.
-        let mut drawn: std::collections::HashSet<super::store::DrawableId> =
+        let mut drawn: std::collections::HashSet<crate::kms::render::store::DrawableId> =
             std::collections::HashSet::new();
-        let mut had_pieces: std::collections::HashSet<super::store::DrawableId> =
+        let mut had_pieces: std::collections::HashSet<crate::kms::render::store::DrawableId> =
             std::collections::HashSet::new();
         // Which outputs ran `build_scene` this tick. Dormancy is reconciled on
         // any tick where at least one did; outputs that did not walk
@@ -2170,7 +2170,7 @@ impl SceneCompositor {
         // front because the loop below borrows `inner` mutably.
         let pending_presentation_per_output: Vec<bool> = {
             let armed = store.armed_damaged_ids();
-            let all: Vec<&std::collections::HashSet<super::store::DrawableId>> =
+            let all: Vec<&std::collections::HashSet<crate::kms::render::store::DrawableId>> =
                 inner.outputs.iter().map(|o| &o.last_pieces).collect();
             inner
                 .outputs
@@ -2184,7 +2184,7 @@ impl SceneCompositor {
             // The union of the OTHER outputs' retained pieces, read now rather
             // than before the loop so an output walked earlier in this same
             // iteration contributes its fresh set.
-            let elsewhere: std::collections::HashSet<super::store::DrawableId> = inner
+            let elsewhere: std::collections::HashSet<crate::kms::render::store::DrawableId> = inner
                 .outputs
                 .iter()
                 .enumerate()
@@ -3378,7 +3378,7 @@ fn audit_overlay_pipeline(
 /// mismatch can name the drawable whose contents changed.
 fn audit_sampled_pairs(
     store: &DrawableStore,
-    sampled_ids: &[super::store::DrawableId],
+    sampled_ids: &[crate::kms::render::store::DrawableId],
 ) -> Vec<(u64, u32)> {
     if !damage_audit_enabled() {
         return Vec::new();
@@ -3405,7 +3405,7 @@ fn audit_reference_scene(
     production_has_sw_cursor: bool,
     core: &KmsCore,
     store: &mut DrawableStore,
-    windows: &super::backend::WindowsMap,
+    windows: &crate::kms::render::backend::WindowsMap,
     output_idx: usize,
     platform: &PlatformBackend,
     cursor: Option<CursorEntry>,
@@ -4184,10 +4184,10 @@ struct OutputWalkReport<'a> {
     /// `build_scene` ran for this output this tick.
     walked: bool,
     /// This walk's presented ids (empty when it did not walk).
-    presented: &'a std::collections::HashSet<super::store::DrawableId>,
+    presented: &'a std::collections::HashSet<crate::kms::render::store::DrawableId>,
     /// The output's retained `last_pieces` — refreshed by this walk if it
     /// walked, otherwise as of its most recent walk.
-    last_pieces: &'a std::collections::HashSet<super::store::DrawableId>,
+    last_pieces: &'a std::collections::HashSet<crate::kms::render::store::DrawableId>,
 }
 
 /// The two sets `DrawableStore::reconcile_offscreen_no_draw` needs, computed so
@@ -4207,8 +4207,8 @@ struct OutputWalkReport<'a> {
 fn dormancy_inputs(
     reports: &[OutputWalkReport<'_>],
 ) -> (
-    std::collections::HashSet<super::store::DrawableId>,
-    std::collections::HashSet<super::store::DrawableId>,
+    std::collections::HashSet<crate::kms::render::store::DrawableId>,
+    std::collections::HashSet<crate::kms::render::store::DrawableId>,
 ) {
     let mut keep_armed = std::collections::HashSet::new();
     let mut pieces_anywhere = std::collections::HashSet::new();
@@ -4247,9 +4247,9 @@ fn dormancy_inputs(
 /// pieces anywhere ⇒ in no set ⇒ every output walks, and today's
 /// off-output force-compose path is preserved.
 fn pending_presentation_for_output(
-    armed: &[super::store::DrawableId],
-    mine: &std::collections::HashSet<super::store::DrawableId>,
-    all: &[&std::collections::HashSet<super::store::DrawableId>],
+    armed: &[crate::kms::render::store::DrawableId],
+    mine: &std::collections::HashSet<crate::kms::render::store::DrawableId>,
+    all: &[&std::collections::HashSet<crate::kms::render::store::DrawableId>],
 ) -> bool {
     armed
         .iter()
@@ -4268,11 +4268,11 @@ fn tick_one_output(
     core: &KmsCore,
     store: &mut DrawableStore,
     platform: &mut PlatformBackend,
-    windows: &super::backend::WindowsMap,
+    windows: &crate::kms::render::backend::WindowsMap,
     telemetry: &mut Telemetry,
     hw_strategy_enabled: bool,
     cow_host_xid: Option<u32>,
-    root_overlay: &super::root_overlay::RootOverlay,
+    root_overlay: &crate::kms::render::root_overlay::RootOverlay,
     // Idle free-run fix (cut 2b): accumulator for the sampled-source
     // ids `build_scene` actually drew on this output, unioned across
     // outputs by `tick` to reconcile `offscreen_no_draw`. Only written
@@ -4281,11 +4281,11 @@ fn tick_one_output(
     // What the OTHER outputs showed at their last walk, for classifying an
     // off-output paint as theirs (`ContentDamage::OtherOutput`) rather than
     // stranded. See `WalkSink::elsewhere`.
-    elsewhere: &std::collections::HashSet<super::store::DrawableId>,
-    drawn: &mut std::collections::HashSet<super::store::DrawableId>,
+    elsewhere: &std::collections::HashSet<crate::kms::render::store::DrawableId>,
+    drawn: &mut std::collections::HashSet<crate::kms::render::store::DrawableId>,
     // Sampled sources that emitted at least one piece on this output — with
     // `drawn` this picks the dormancy reason (see `DormantReason`).
-    had_pieces: &mut std::collections::HashSet<super::store::DrawableId>,
+    had_pieces: &mut std::collections::HashSet<crate::kms::render::store::DrawableId>,
     // This output's carried content damage in root coordinates, replaced on a
     // compose (`Composed`) for `tick` to fan out to the other outputs.
     carried: &mut Vec<CarriedDamage>,
@@ -5606,7 +5606,7 @@ fn cursor_footprint_rect(
 fn build_scene(
     core: &KmsCore,
     store: &mut DrawableStore,
-    windows: &super::backend::WindowsMap,
+    windows: &crate::kms::render::backend::WindowsMap,
     output_idx: usize,
     platform: &PlatformBackend,
     cursor: Option<CursorEntry>,
@@ -5645,7 +5645,7 @@ fn build_scene(
 pub(crate) fn scene_draw_rects(
     core: &KmsCore,
     store: &mut DrawableStore,
-    windows: &super::backend::WindowsMap,
+    windows: &crate::kms::render::backend::WindowsMap,
     output_idx: usize,
     platform: &PlatformBackend,
 ) -> Vec<vk::Rect2D> {
@@ -5684,7 +5684,7 @@ pub(crate) fn scene_draw_rects(
 pub(crate) fn scene_participant_places(
     core: &KmsCore,
     store: &mut DrawableStore,
-    windows: &super::backend::WindowsMap,
+    windows: &crate::kms::render::backend::WindowsMap,
     output_idx: usize,
     platform: &PlatformBackend,
 ) -> Vec<(u32, Vec<vk::Rect2D>, Vec<vk::Rect2D>)> {
@@ -5715,7 +5715,7 @@ pub(crate) fn scene_participant_places(
 fn build_scene_with(
     core: &KmsCore,
     store: &mut DrawableStore,
-    windows: &super::backend::WindowsMap,
+    windows: &crate::kms::render::backend::WindowsMap,
     output_idx: usize,
     platform: &PlatformBackend,
     cursor: Option<CursorEntry>,
@@ -5741,7 +5741,7 @@ fn build_scene_with(
     // every node's full placement as before step 1 (`Off`). Production passes
     // `On`; the damage audit's reference and the tests use `Off`.
     mode: Visibility,
-    elsewhere: &std::collections::HashSet<super::store::DrawableId>,
+    elsewhere: &std::collections::HashSet<crate::kms::render::store::DrawableId>,
 ) -> SceneBuild {
     let bg = [0.0, 0.0, 0.0, 1.0];
     // A transformed output walks its whole footprint (spec D4).
@@ -6110,8 +6110,8 @@ fn build_scene_with(
 /// they leave. Emitted last in computation order (= first after the reversal),
 /// which is where the old emitter pushed it.
 struct RootNode {
-    id: super::store::DrawableId,
-    source_id: super::store::DrawableId,
+    id: crate::kms::render::store::DrawableId,
+    source_id: crate::kms::render::store::DrawableId,
     view: vk::ImageView,
     /// Output-local rect(s) the root occupies — under `On` clipped to the
     /// output, under `Off` the storage rect as the old emitter drew it.
@@ -6265,7 +6265,7 @@ fn emit_node(
     denom_h: i32,
     view: vk::ImageView,
     alpha_passthrough: bool,
-    source_id: super::store::DrawableId,
+    source_id: crate::kms::render::store::DrawableId,
     store: &DrawableStore,
     layout_w: u32,
     layout_h: u32,
@@ -6528,7 +6528,7 @@ fn intersect_rects(a: vk::Rect2D, b: vk::Rect2D) -> Option<vk::Rect2D> {
 /// built here first, changing nothing about what is emitted.
 type ChildrenIndex = HashMap<u32, Vec<u32>>;
 
-fn children_index(windows: &super::backend::WindowsMap) -> ChildrenIndex {
+fn children_index(windows: &crate::kms::render::backend::WindowsMap) -> ChildrenIndex {
     let mut by_parent: HashMap<u32, Vec<(u32, u64)>> = HashMap::new();
     for (xid, g) in windows {
         if let Some(parent) = g.parent {
@@ -6551,14 +6551,14 @@ fn children_index(windows: &super::backend::WindowsMap) -> ChildrenIndex {
 /// emission decision read the same snapshot.
 #[derive(Clone, Copy, Debug)]
 struct NodeStoreInfo {
-    d_id: super::store::DrawableId,
+    d_id: crate::kms::render::store::DrawableId,
     d_kind: DrawableKind,
     d_depth: u8,
     d_refcount: u32,
     d_part: bool,
     d_extent: vk::Extent2D,
     d_view_null: bool,
-    source_id: super::store::DrawableId,
+    source_id: crate::kms::render::store::DrawableId,
     source_view_null: bool,
     /// The sample-side view of the source (null when `source_view_null`).
     source_view: vk::ImageView,
@@ -6623,7 +6623,7 @@ struct NodeDecision {
     /// True when the window rect touches this output at all.
     intersects: bool,
     /// `store.lookup(host_xid)`; `None` reads as `no_store_lookup`.
-    lookup_id: Option<super::store::DrawableId>,
+    lookup_id: Option<crate::kms::render::store::DrawableId>,
     /// `store.get(lookup_id)` snapshot; `None` with `lookup_id == Some` reads as
     /// `store_get_returned_none`.
     store: Option<NodeStoreInfo>,
@@ -6742,7 +6742,7 @@ fn inner_place_rects(
 #[allow(clippy::too_many_arguments)]
 fn decide_node(
     host_xid: u32,
-    geom: &super::backend::WindowGeometry,
+    geom: &crate::kms::render::backend::WindowGeometry,
     parent_content_abs_x: i32,
     parent_content_abs_y: i32,
     store: &DrawableStore,
@@ -7152,7 +7152,7 @@ fn visit_window_subtree(
     parent_content_abs_x: i32,
     parent_content_abs_y: i32,
     store: &mut DrawableStore,
-    windows: &super::backend::WindowsMap,
+    windows: &crate::kms::render::backend::WindowsMap,
     children: &ChildrenIndex,
     // Per-window SHAPE bounding regions (`KmsCore::shape_bounding`).
     // When a host xid has an entry the window's scene draw is
@@ -7752,8 +7752,8 @@ fn fan_out_carried_damage(
 fn fan_out_to_output(
     origin: (i32, i32),
     extent: vk::Extent2D,
-    last_pieces: &std::collections::HashSet<super::store::DrawableId>,
-    presented_epochs: &std::collections::HashMap<super::store::DrawableId, u64>,
+    last_pieces: &std::collections::HashSet<crate::kms::render::store::DrawableId>,
+    presented_epochs: &std::collections::HashMap<crate::kms::render::store::DrawableId, u64>,
     damage: &mut RegionSet,
     carried: &[CarriedDamage],
 ) -> bool {
@@ -8026,7 +8026,7 @@ impl SceneCompositor {
         &mut self,
         core: &KmsCore,
         store: &mut DrawableStore,
-        windows: &super::backend::WindowsMap,
+        windows: &crate::kms::render::backend::WindowsMap,
         platform: &PlatformBackend,
         cow_host_xid: Option<u32>,
         output_idx: usize,
@@ -8190,7 +8190,7 @@ impl SceneCompositor {
         &mut self,
         core: &KmsCore,
         store: &mut DrawableStore,
-        windows: &super::backend::WindowsMap,
+        windows: &crate::kms::render::backend::WindowsMap,
         platform: &PlatformBackend,
         cow_host_xid: Option<u32>,
     ) -> Result<(), SceneError> {
@@ -8337,8 +8337,13 @@ impl ScalePass {
             descriptor_set: intermediate.descriptor_set,
             pipeline: pipeline.pipeline,
             layout: pipeline.pipeline_layout,
-            push: super::transform_intermediate::scale_push(transform, intermediate.extent),
-            composite_rect: super::transform_intermediate::composite_rect(footprint, root),
+            push: crate::kms::render::transform_intermediate::scale_push(
+                transform,
+                intermediate.extent,
+            ),
+            composite_rect: crate::kms::render::transform_intermediate::composite_rect(
+                footprint, root,
+            ),
             into_target: true,
         }
     }
@@ -9206,7 +9211,7 @@ impl SceneCompositor {
         &self,
         core: &KmsCore,
         store: &mut DrawableStore,
-        windows: &super::backend::WindowsMap,
+        windows: &crate::kms::render::backend::WindowsMap,
         platform: &PlatformBackend,
         output_idx: usize,
     ) -> CursorAssignment {
@@ -9252,7 +9257,7 @@ impl SceneCompositor {
         &mut self,
         core: &KmsCore,
         store: &mut DrawableStore,
-        windows: &super::backend::WindowsMap,
+        windows: &crate::kms::render::backend::WindowsMap,
         platform: &PlatformBackend,
         output_idx: usize,
     ) -> Vec<u8> {
@@ -9268,7 +9273,7 @@ impl SceneCompositor {
         &mut self,
         core: &KmsCore,
         store: &mut DrawableStore,
-        windows: &super::backend::WindowsMap,
+        windows: &crate::kms::render::backend::WindowsMap,
         platform: &PlatformBackend,
         output_idx: usize,
     ) -> (Vec<u8>, Vec<u8>) {
@@ -9293,7 +9298,7 @@ impl SceneCompositor {
         &mut self,
         core: &KmsCore,
         store: &mut DrawableStore,
-        windows: &super::backend::WindowsMap,
+        windows: &crate::kms::render::backend::WindowsMap,
         platform: &PlatformBackend,
         output_idx: usize,
     ) -> (Vec<u8>, vk::Image, vk::Extent2D) {
@@ -9383,7 +9388,8 @@ fn read_general_image_for_tests(
 ) -> Vec<u8> {
     let bytes = u64::from(extent.width) * u64::from(extent.height) * 4;
     let staging =
-        super::engine::StagingBuffer::new_for_readback(Arc::clone(vk), bytes).expect("staging");
+        crate::kms::render::engine::StagingBuffer::new_for_readback(Arc::clone(vk), bytes)
+            .expect("staging");
     let mut op = crate::kms::vk::ops::ReusableOneShot::new(
         Arc::clone(vk),
         platform.ops_command_pool_handle().expect("ops pool"),
