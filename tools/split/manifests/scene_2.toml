@@ -1,0 +1,385 @@
+# Phase 2 (2.9) for kms/render/scene.rs: production items move into
+# descendant modules of kms::render::scene (log targets keep the old
+# prefix), grouped by responsibility: lifecycle (create, output rebuild,
+# teardown), damage (scene-structure damage marking, wake, root overlay,
+# projection/fan-out onto outputs), cursor (cursor plane mode, transitions,
+# retire, software cursor save), tick (scheduling and the per-output tick),
+# flip (page-flip and render-completion retirement), damage_audit, repaint
+# (partial-compose planning), build (scene list assembly) and walk
+# (per-window visibility decisions), compose (ComposeRenderTarget for scanout
+# targets, record and submit), transform (transform intermediates, scale
+# pass), root_readback and for_tests. scene.rs keeps the imports, every type
+# and the ComposeRenderTarget trait (private fields stay readable from all
+# children), the SceneError From impls and the test module declaration.
+# Needs a prep commit first: the relative `super::` paths (store, backend,
+# root_overlay) qualified to `crate::kms::render::…` so they mean the same
+# module from a child.
+source = "crates/yserver/src/kms/render/scene.rs"
+module = "kms::render::scene"
+dir = "crates/yserver/src/kms/render/scene"
+root_form = "file"
+table = "scene_2.paths"
+
+[visibility]
+"fn add_projected_damage" = "pub(super)"
+"fn classify_cursor_mode_from_per_output" = "pub(super)"
+"fn copied_render_completion_matches" = "pub(super)"
+"fn cursor_output_needs_sprite_retry" = "pub(super)"
+"fn decide_node" = "pub(super)"
+"fn dispatch_clip_rects_to_outputs" = "pub(super)"
+"fn dormancy_inputs" = "pub(super)"
+"fn drain_deferred_scene_resources" = "pub(super)"
+"fn fan_out_to_output" = "pub(super)"
+"fn intersect_rects" = "pub(super)"
+"fn kms_retirement_matches" = "pub(super)"
+"fn ledger_candidates_for_tile" = "pub(super)"
+"fn pending_presentation_for_output" = "pub(super)"
+"fn resolve_cursor_hide_on_retire" = "pub(super)"
+"fn resolve_failed_cursor_upload" = "pub(super)"
+"fn skip_for_empty_damage" = "pub(super)"
+"fn snapshots_carry_damage" = "pub(super)"
+"fn walk_needed" = "pub(super)"
+"const CLIPPED_REPAINT_MAX_FRACTION" = "pub(super)"
+"impl BufferAgeRing::fn new" = "pub(super)"
+"impl BufferAgeRing::fn contains_all" = "pub(super)"
+"impl TickOutcome::fn clears_scene_structure_dirty" = "pub(super)"
+"impl TickOutcome::fn walked" = "pub(super)"
+"impl WalkStats::fn off_output_damage_forces_compose" = "pub(super)"
+"impl SceneBuild::fn omit_software_cursor_for_hide" = "pub(super)"
+"fn apply_cursor_transition_on_retire" = "pub(super)"
+"fn audit_has_unretired_event" = "pub(super)"
+"fn audit_idle_recompare_due" = "pub(super)"
+"fn audit_overlay_pipeline" = "pub(super)"
+"fn audit_reference_scene" = "pub(super)"
+"fn audit_sampled_pairs" = "pub(super)"
+"fn build_output_damage_audit" = "pub(super)"
+"fn build_scene" = "pub(super)"
+"fn build_scene_with" = "pub(super)"
+"fn children_index" = "pub(super)"
+"fn clip_rect_to_output_extent" = "pub(super)"
+"fn compose_submit_was_complete" = "pub(super)"
+"fn create_audit_descriptor_pool" = "pub(super)"
+"fn cull_scene_to_region" = "pub(super)"
+"fn cursor_damage_for_frame" = "pub(super)"
+"fn cursor_footprint_rect" = "pub(super)"
+"fn cursorless_hide_frame_required" = "pub(super)"
+"fn damage_audit_enabled" = "pub(super)"
+"fn derive_cursor_transition" = "pub(super)"
+"fn drain_pending_pool_releases" = "pub(super)"
+"fn draw_dst_rect_inward" = "pub(super)"
+"fn effective_cursor_prev_mode" = "pub(super)"
+"fn emit_damage_audit_heartbeat" = "pub(super)"
+"fn emit_node" = "pub(super)"
+"fn ensure_intermediates" = "pub(super)"
+"fn fan_out_carried_damage" = "pub(super)"
+"fn force_cursor_retry_repaint" = "pub(super)"
+"fn handle_scanout_render_completion_inner" = "pub(super)"
+"fn hw_cursor_allowed" = "pub(super)"
+"fn note_damage_audit_contributions" = "pub(super)"
+"fn opaque_cover_exists" = "pub(super)"
+"fn plan_repaint" = "pub(super)"
+"fn present_error_is_device_lost" = "pub(super)"
+"fn project_onto_output" = "pub(super)"
+"fn push_presence" = "pub(super)"
+"fn record_and_submit_render" = "pub(super)"
+"fn record_cursor_save" = "pub(super)"
+"fn record_scale_pass" = "pub(super)"
+"fn rects_intersect" = "pub(super)"
+"fn release_intermediate" = "pub(super)"
+"fn reset_cursor_mode_for_lifecycle" = "pub(super)"
+"fn reset_cursor_retry_for_lifecycle" = "pub(super)"
+"fn resolve_retired_cursor_state" = "pub(super)"
+"fn retire_failed_submit_bos" = "pub(super)"
+"fn run_damage_audit" = "pub(super)"
+"fn scene_walk_debug_enabled_for" = "pub(super)"
+"fn stage_submitted_frame" = "pub(super)"
+"fn submit_copied_scanout_render" = "pub(super)"
+"fn submit_shared_scanout_frame" = "pub(super)"
+"fn tick_skip_log_enabled" = "pub(super)"
+"fn update_force_show_retry_version" = "pub(super)"
+"fn visit_window_subtree" = "pub(super)"
+"fn vk_result_is_device_lost" = "pub(super)"
+"impl DamageAuditTarget::fn new" = "pub(super)"
+"impl ScalePass::fn new" = "pub(super)"
+"impl RepaintPlan::fn full" = "pub(super)"
+"impl WalkStats::fn collapses" = "pub(super)"
+"impl BufferAgeRing::fn push" = "pub(super)"
+"impl CopiedRenderSubmitError::fn into_present" = "pub(super)"
+"impl CopiedRenderSubmitError::fn requires_fail_stop" = "pub(super)"
+"impl SceneCompositor::fn damage_audit_active" = "pub(super)"
+"impl SceneCompositor::fn full_output_audit_area" = "pub(super)"
+"impl SceneCompositor::fn note_structure_change" = "pub(super)"
+"impl SceneCompositor::fn record_damage_audit_event" = "pub(super)"
+
+[locations]
+"impl SceneCompositor::fn root_overlay_on_disconnect" = "#[track_caller] damage-audit helpers record the caller file:line, which moves from scene.rs to scene/damage.rs; only diagnostic source attribution changes (read in log text at damage_audit.rs bound_damage_audit_ledger overflow warn and process_damage_audit_summary audit attribution), not damage computation"
+"impl SceneCompositor::fn root_overlay_clear" = "#[track_caller] damage-audit helpers record the caller file:line, which moves from scene.rs to scene/damage.rs; only diagnostic source attribution changes (read in log text at damage_audit.rs bound_damage_audit_ledger overflow warn and process_damage_audit_summary audit attribution), not damage computation"
+"impl SceneCompositor::fn root_overlay_toggle" = "#[track_caller] damage-audit helpers record the caller file:line, which moves from scene.rs to scene/damage.rs; only diagnostic source attribution changes (read in log text at damage_audit.rs bound_damage_audit_ledger overflow warn and process_damage_audit_summary audit attribution), not damage computation"
+
+[[modules]]
+name = ""
+lines = [
+  "use damage::*;",
+  "use cursor::*;",
+  "use tick::*;",
+  "use flip::*;",
+  "use damage_audit::*;",
+  "use repaint::*;",
+  "pub(crate) use build::*;",
+  "use walk::*;",
+  "use compose::*;",
+  "use transform::*;",
+  "#[cfg(test)]\nuse lifecycle::drain_deferred_scene_resources;",
+]
+items = [
+  "mod tests",
+  "use *",
+  "struct *",
+  "enum *",
+  "trait *",
+  "type *",
+  "impl From < PresentError > for SceneError",
+  "impl From < crate :: kms :: vk :: logic_fill_pipeline :: LogicFillError > for SceneError",
+]
+
+[[modules]]
+name = "lifecycle"
+lines = ["use super::*;"]
+items = [
+  "impl SceneCompositor::fn new",
+  "impl SceneCompositor::fn build_output_state",
+  "impl SceneCompositor::fn invalidate_all_scanout_damage",
+  "impl SceneCompositor::fn rebuild_outputs",
+  "impl SceneCompositor::fn sync_output_layouts",
+  "impl SceneCompositor::fn stub",
+  "impl SceneCompositor::fn is_live",
+  "impl SceneCompositor::fn drain_all",
+  "fn drain_deferred_scene_resources",
+  "impl BufferAgeRing::fn *",
+]
+
+[[modules]]
+name = "damage"
+lines = ["use super::*;"]
+items = [
+  "impl SceneCompositor::fn note_structure_change",
+  "impl SceneCompositor::fn wake_for_damage",
+  "impl SceneCompositor::fn mark_scene_structure_dirty",
+  "impl SceneCompositor::fn mark_scene_structure_damage_rect",
+  "impl SceneCompositor::fn mark_scene_structure_damage_rects",
+  "impl SceneCompositor::fn root_overlay_toggle",
+  "impl SceneCompositor::fn root_overlay_clear",
+  "impl SceneCompositor::fn root_overlay_on_disconnect",
+  "fn fan_out_carried_damage",
+  "fn fan_out_to_output",
+  "fn dispatch_clip_rects_to_outputs",
+  "fn clip_rect_to_output_extent",
+  "fn add_projected_damage",
+  "fn project_onto_output",
+]
+
+[[modules]]
+name = "cursor"
+lines = ["use super::*;"]
+items = [
+  "fn classify_cursor_mode_from_per_output",
+  "fn cursor_output_needs_sprite_retry",
+  "impl SceneCompositor::fn restore_under_cursor",
+  "impl SceneCompositor::fn register_cursor",
+  "impl SceneCompositor::fn clear_cursor",
+  "impl SceneCompositor::fn cursor_mode",
+  "impl SceneCompositor::fn queue_steady_state_cursor_upload",
+  "fn cursorless_hide_frame_required",
+  "fn effective_cursor_prev_mode",
+  "fn derive_cursor_transition",
+  "fn resolve_retired_cursor_state",
+  "fn update_force_show_retry_version",
+  "fn force_cursor_retry_repaint",
+  "fn reset_cursor_retry_for_lifecycle",
+  "fn reset_cursor_mode_for_lifecycle",
+  "fn resolve_failed_cursor_upload",
+  "fn resolve_cursor_hide_on_retire",
+  "fn apply_cursor_transition_on_retire",
+  "fn hw_cursor_allowed",
+  "fn cursor_damage_for_frame",
+  "fn cursor_footprint_rect",
+  "fn record_cursor_save",
+  "impl SceneBuild::fn *",
+]
+
+[[modules]]
+name = "tick"
+lines = ["use super::*;"]
+items = [
+  "impl SceneCompositor::fn tick",
+  "impl SceneCompositor::fn earliest_retry_deadline",
+  "impl SceneCompositor::fn has_output_ready_for_submit",
+  "impl SceneCompositor::fn owes_repaint",
+  "impl TickOutcome::fn *",
+  "fn tick_skip_log_enabled",
+  "fn record_tick_skip",
+  "fn record_tick_success",
+  "fn skip_for_empty_damage",
+  "fn walk_needed",
+  "fn dormancy_inputs",
+  "fn pending_presentation_for_output",
+  "fn snapshots_carry_damage",
+  "fn tick_one_output",
+]
+
+[[modules]]
+name = "flip"
+lines = ["use super::*;"]
+items = [
+  "impl InFlightStage::fn *",
+  "fn copied_render_completion_matches",
+  "fn kms_retirement_matches",
+  "impl SceneCompositor::fn has_pending_page_flips",
+  "impl SceneCompositor::fn has_pending_page_flip",
+  "impl SceneCompositor::fn handle_page_flip_complete",
+  "impl SceneCompositor::fn handle_scanout_render_completion",
+  "fn handle_scanout_render_completion_inner",
+  "fn retire_failed_submit_bos",
+  "fn drain_pending_pool_releases",
+]
+
+[[modules]]
+name = "damage_audit"
+lines = ["use super::*;"]
+items = [
+  "impl DamageAuditTarget::fn *",
+  "impl Drop for DamageAuditTarget",
+  "impl ComposeRenderTarget for DamageAuditTarget",
+  "fn build_output_damage_audit",
+  "impl SceneCompositor::fn full_output_audit_area",
+  "impl SceneCompositor::fn record_damage_audit_event",
+  "impl SceneCompositor::fn damage_audit_active",
+  "fn damage_audit_enabled",
+  "fn damage_audit_interval",
+  "fn damage_audit_idle_recompare_secs",
+  "fn damage_audit_seed_frame",
+  "fn audit_idle_recompare_due",
+  "fn mean_damage_fraction",
+  "fn mean_us",
+  "fn emit_damage_audit_heartbeat",
+  "fn note_damage_audit_contributions",
+  "fn bound_damage_audit_ledger",
+  "fn retire_damage_audit_ledger",
+  "fn audit_has_unretired_event",
+  "fn audit_overlay_pipeline",
+  "fn audit_sampled_pairs",
+  "fn audit_reference_scene",
+  "fn run_damage_audit",
+  "fn submit_audit_compose",
+  "fn create_audit_descriptor_pool",
+  "fn submit_damage_audit_compare",
+  "fn image_general_to_transfer_src_barrier",
+  "fn image_transfer_src_to_general_barrier",
+  "fn process_damage_audit_summary",
+  "fn ledger_candidates_for_tile",
+  "fn rects_intersect",
+  "fn tile_rect_for_id",
+  "fn partition_bounds",
+]
+
+[[modules]]
+name = "repaint"
+lines = ["use super::*;"]
+items = [
+  "const MULTI_RECT_MIN_GAIN",
+  "const MAX_SCISSOR_RECTS",
+  "const CLIPPED_REPAINT_MAX_FRACTION",
+  "fn draw_dst_rect_inward",
+  "fn opaque_cover_exists",
+  "impl RepaintPlan::fn *",
+  "fn plan_repaint",
+  "fn cull_scene_to_region",
+  "fn all_zero",
+]
+
+[[modules]]
+name = "build"
+lines = ["use super::*;"]
+items = [
+  "impl < 'a > WalkSink < 'a >::fn *",
+  "fn debug_scene_walk_xids",
+  "fn debug_scene_walk_all",
+  "fn scene_walk_debug_enabled_for",
+  "fn build_scene",
+  "fn scene_draw_rects",
+  "fn scene_participant_places",
+  "fn build_scene_with",
+  "fn root_node",
+  "fn piece_draw",
+  "fn union_bbox",
+  "fn emit_node",
+  "fn push_presence",
+  "fn intersect_rects",
+]
+
+[[modules]]
+name = "walk"
+lines = ["use super::*;"]
+items = [
+  "impl WalkStats::fn *",
+  "fn children_index",
+  "fn inner_place_rects",
+  "fn decide_node",
+  "fn visit_window_subtree",
+]
+
+[[modules]]
+name = "compose"
+lines = ["use super::*;"]
+items = [
+  "fn present_error_is_device_lost",
+  "fn vk_result_is_device_lost",
+  "impl CopiedRenderSubmitError::fn *",
+  "impl ComposeRenderTarget for ScanoutBo",
+  "impl ComposeRenderTarget for CopiedRenderSource",
+  "fn compose_submit_was_complete",
+  "fn stage_submitted_frame",
+  "fn submit_shared_scanout_frame",
+  "fn submit_copied_scanout_render",
+  "fn record_and_submit_render",
+  "fn record_command_buffer",
+]
+
+[[modules]]
+name = "transform"
+lines = ["use super::*;"]
+items = [
+  "impl SceneCompositor::fn transform_intermediate",
+  "impl SceneCompositor::fn has_unprimed_transform_intermediate",
+  "impl SceneCompositor::fn prime_transform_intermediates",
+  "fn ensure_intermediates",
+  "fn release_intermediate",
+  "impl IntermediatePrimeTarget::fn *",
+  "impl Drop for IntermediatePrimeTarget",
+  "impl ComposeRenderTarget for IntermediatePrimeTarget",
+  "impl ScalePass::fn *",
+  "fn record_scale_pass",
+]
+
+[[modules]]
+name = "root_readback"
+lines = ["use super::*;"]
+items = [
+  "impl SceneCompositor::fn root_readback",
+  "impl SceneCompositor::fn root_readback_is_current",
+  "fn root_readback_extent",
+  "fn root_readback_covers",
+]
+
+[[modules]]
+name = "for_tests"
+lines = ["use super::*;"]
+items = [
+  "impl SceneCompositor::fn test_set_flip_in_flight",
+  "impl SceneCompositor::fn cursor_assignment_for_tests",
+  "impl SceneCompositor::fn intermediate_for_tests",
+  "impl SceneCompositor::fn compose_transformed_for_tests",
+  "impl SceneCompositor::fn compose_identity_for_tests",
+  "impl SceneCompositor::fn compose_for_tests",
+  "fn read_general_image_for_tests",
+]
