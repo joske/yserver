@@ -1,11 +1,11 @@
-# Phase 2.9 proposal: split `kms/render/scene.rs` (production code)
+# Phase 2.9: split `kms/render/scene.rs` (production code)
 
 Step 2.9 of `2026-10-08-source-layout-cleanup.md`. Manifest:
-`tools/split/manifests/scene_2.toml` (+ `.paths`). Status: **proposal, dry
-run only**; nothing moved yet. Sizes below are the dry-run tree after
-`cargo +nightly fmt`.
+`tools/split/manifests/scene_2.toml` (+ `.paths`). Accepted by jos
+2026-10-10 and executed (decisions at the end); sizes below are the final
+tree (after `cargo +nightly fmt`).
 
-## Structure today (9,646 lines, tests already in `scene/tests/`)
+## Structure before (9,646 lines, tests already in `scene/tests/`)
 
 - **Types (lines 1–1334, ~350 later):** stage-2d `//!` doc, imports,
   `PendingAck`, cursor enums, `BufferAgeRing`, `OutputSceneState`,
@@ -28,7 +28,7 @@ run only**; nothing moved yet. Sizes below are the dry-run tree after
   (36 `store`, 16 `backend`, 5 `root_overlay`, 2 `transform_intermediate`,
   1 `engine`; one is a doc link).
 
-## Target tree (dry run, lines after fmt)
+## Final tree (lines after fmt)
 
 All under `kms/render/scene/`, depth 1 (`pub(super)` = old private reach).
 Names avoid every first path segment used in the file (`vk`, `store`,
@@ -75,6 +75,9 @@ for_tests.rs      251  the 6 test-only SceneCompositor methods,
 Total 9,717 (9,646 before). All ≤ 5k. Types stay in the root (as engine);
 inherent impls are spread per member.
 
+Root `//!` doc: the stale Stage-2d MVP text became a short ownership
+description plus this module map (its own commit, right after the move).
+
 Deviations from the 2.9 row (`cursor`, `damage_audit`, `tick_output`,
 `walk` 2.6k, `fan_out`, `targets`, `root_readback`): `tick` holds the whole
 tick, not just the per-output fn; `fan_out` merged into `damage` with the
@@ -83,17 +86,17 @@ marking it was extracted from; `targets` dissolved: each
 the audit one in `damage_audit`, the prime one in `transform`); `walk` split
 into `build` + `walk` (matches `tests/build_scene.rs` / `tests/walk.rs`).
 
-## Dry-run results
+## Results
 
-Prep (temporary commit, dropped): the 60 `super::` paths →
-`crate::kms::render::…` outside the root import (sed + fmt: +66/−60).
-Then `split apply`, fmt, `cargo build -p yserver` and `cargo clippy -p
-yserver --all-targets -- -D warnings` (default features) green;
-`split verify --manifest` → **OK**: 447/447 leaves identical, 89 manifest
-visibility changes, 0 audited exceptions, 3 location audits, 27 leaves with
-log calls moved to descendants. Scene unit tests: 162 passed, 1 ignored.
-Not run in the dry run: `verify --tests`, feature variants, lavapipe.
-Logs: `target/gate-scene-dry-*.log`.
+Prep commit: the 60 `super::` paths → `crate::kms::render::…` outside the
+root import (sed + fmt: +66/−60; scene tests 162 passed, 1 ignored). Then
+`split apply`, fmt, `split verify --manifest` → **OK**: 447/447 leaves
+identical, 89 manifest visibility changes, 0 audited exceptions, 3 audited
+locations, 27 leaves with log calls moved to descendants. `verify --tests`
+against fresh pre-move snapshots: 4008 / 4013 / 4121 tests mapped (default
+/ tcp-transport / xdmcp). Rule-5 gate green: fmt, clippy ×3, tests ×3
+(3693 / 3698 / 3806 passed), lavapipe 317 passed. Logs:
+`target/gate-scene-*.log`.
 
 **Visibility delta (89, all private → `pub(super)` = the old reach):**
 66 needed by the lib (53 free fns, 13 methods, e.g. `note_structure_change`,
@@ -121,26 +124,27 @@ method-only child). No glob for lifecycle, root_readback, for_tests.
    free fns are file-local in the lib) → dropped; one cfg(test) import.
 4. Log targets, macros, includes, delegations, exceptions: none.
 
-## Open questions
+## Decisions (jos, 2026-10-10)
 
-1. `build` + `walk` as two files, or one `walk` (2.1k) as the plan row says?
-   Recommend two: separate responsibilities, mirrors the test topics.
-2. Accept the renamed/regrouped modules above and update the 2.9 row?
-   Recommend yes.
-3. All types stay in `scene.rs` (engine decision 3)? Recommend yes; moving
-   e.g. `NodeDecision` to `walk` needs field visibility for little gain.
-4. 23 test-only visibility changes (same reach)? Recommend accept, as engine.
-5. Root `//!` doc: the Stage-2d MVP text is stale (full redraw, no HW
-   cursor). Recommend replacing it with an ownership line + module map in
-   its own commit, as engine.
-6. `tick_one_output` (952) stays one fn this step (codex: accept); its
-   split belongs with phase 3's output-seam decision (option a/b).
+1. `build` + `walk` as two files (separate responsibilities, mirrors the
+   test topics), not one 2.1k `walk`.
+2. The renamed/regrouped modules above are accepted; the 2.9 row is updated.
+3. All types stay in `scene.rs` (as engine decision 3).
+4. The 23 test-only visibility changes (same reach) are accepted.
+5. The stale Stage-2d root `//!` doc is replaced by an ownership line and
+   module map, in its own commit.
+6. `tick_one_output` (952) stays one fn this step; its split belongs with
+   phase 3's output-seam decision (option a/b).
+7. The 3 `root_overlay_*` `[locations]` entries are audited: diagnostic-only
+   damage-audit attribution, the recorded site moves scene.rs →
+   scene/damage.rs.
 
-## Commit sequence (on acceptance)
+## Commit sequence
 
-1. `refactor(kms): qualify scene super:: paths (prep)`.
+1. `refactor(kms): qualify scene super:: paths (prep)`: 60 sites + fmt.
 2. `refactor(kms): split scene into lifecycle/tick/compose/walk modules
-   (move)`: apply + fmt, `verify --manifest` and `--tests`, full gate.
+   (move)`: `split apply` + fmt, `split verify --manifest …` and `--tests`,
+   then the full gate (rule 5).
 3. `docs(kms): scene root doc is an ownership line and module map`.
 4. `chore: blame-ignore` for 1 and 2.
 5. This doc and the plan updated to the final tree.

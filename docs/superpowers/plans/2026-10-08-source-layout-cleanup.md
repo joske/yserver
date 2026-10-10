@@ -186,7 +186,7 @@ Least-contended files first.
 | 2.6 | `process_request.rs` → `core_loop/process_request/` | tree below |
 | 2.7 | `kms/vk/scanout.rs` | `bo`, `bo_pool`, `copied` 2.0k, `dmabuf_metadata`, `probe` 1.5k, `alloc_plan` 1.3k, `image_alloc` |
 | 2.8 | `kms/render/platform.rs` | `fence`, `cursor_plane` 1.8k, `qualify` 1.5k, `device`, `init`, `scanout`, `connectors`, `submit`, `page_flip` |
-| 2.9 | `kms/render/scene.rs` | `cursor`, `damage_audit` 2.0k, `tick_output` 1.8k, `walk` 2.6k, `fan_out`, `targets`, `root_readback` |
+| 2.9 | `kms/render/scene.rs` | done (`2026-10-10-phase2-scene.md`): types stay in the root; `lifecycle`, `damage`, `cursor`, `tick` 1.4k, `flip`, `damage_audit` 1.2k, `repaint`, `build`, `walk` 1.1k, `compose`, `transform`, `root_readback`, `for_tests` |
 | 2.10 | `kms/render/engine.rs` | done (`2026-10-09-phase2-engine.md`): types stay in the root; `lifecycle`, `export`, `frame`, `staging`, `scratch`, `fill_copy`, `put_get`, `pixels`, `text`, `glyphs`, `composite`, `batch`, `gradients`, `traps`, `emit` 2.2k, `for_tests` |
 | 2.11 | `kms/render/backend.rs` | tree below |
 
