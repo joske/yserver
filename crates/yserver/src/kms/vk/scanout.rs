@@ -763,7 +763,7 @@ impl CopiedRenderSource {
             plan,
         )
         .map_err(|result| scanout_vk_error("allocate exact copied source", result))?;
-        let exported = super::dri3::export_backing(&render_vk, &transport_on_renderer)
+        let exported = crate::kms::vk::dri3::export_backing(&render_vk, &transport_on_renderer)
             .map_err(|result| scanout_vk_error("export copied transport DMA-BUF", result))?;
         let imported_on_sink = DrawableImage::from_dmabuf_with_usage(
             Arc::clone(&sink_vk),
@@ -878,8 +878,10 @@ impl CopiedRenderSource {
             .semaphore(self.completion_semaphore)
             .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
         let raw = unsafe { self.render_vk.semaphore_fd_ext()?.get_semaphore_fd(&info)? };
-        let completion =
-            super::optional_sync_fd_from_vk(raw, "vkGetSemaphoreFdKHR(copied render SYNC_FD)")?;
+        let completion = crate::kms::vk::optional_sync_fd_from_vk(
+            raw,
+            "vkGetSemaphoreFdKHR(copied render SYNC_FD)",
+        )?;
         self.completion_semaphore_reuse.finish_successful_export();
         Ok(completion)
     }
@@ -921,7 +923,7 @@ impl CopiedRenderSource {
                     ));
                 }
                 if let Some(completion) = self.renderer_return_completion.take() {
-                    let wait = super::sync::import_optional_sync_file(
+                    let wait = crate::kms::vk::sync::import_optional_sync_file(
                         &self.render_vk,
                         completion.into_optional(),
                     )
@@ -1556,7 +1558,7 @@ impl CopiedScanoutPool {
         // still be imported and waited: the semaphore wait is the external
         // memory dependency paired with renderer A's ownership release.
         let wait_semaphore =
-            super::sync::import_optional_sync_file(&self.sink_vk, render_completion)
+            crate::kms::vk::sync::import_optional_sync_file(&self.sink_vk, render_completion)
                 .map_err(|result| scanout_vk_error("import renderer completion on sink", result))?;
         source.sink_wait_semaphore = Some(wait_semaphore);
 
@@ -2515,7 +2517,7 @@ fn combine_required_metadata(
 fn kms_linear_layout(kms_scanout_modifiers: &[u64]) -> KmsLinearLayout {
     if kms_scanout_modifiers.is_empty() {
         KmsLinearLayout::LegacyAddfb
-    } else if kms_scanout_modifiers.contains(&super::dri3::DRM_FORMAT_MOD_LINEAR) {
+    } else if kms_scanout_modifiers.contains(&crate::kms::vk::dri3::DRM_FORMAT_MOD_LINEAR) {
         KmsLinearLayout::ExplicitModifier
     } else {
         KmsLinearLayout::NotAdvertised
@@ -2811,7 +2813,7 @@ fn probe_dmabuf_scanout_metadata(
     let linear_layout = kms_linear_layout(kms_scanout_modifiers);
     let output_owned_linear = probe_scanout_modifier_single_plane_feature(
         vk,
-        super::dri3::DRM_FORMAT_MOD_LINEAR,
+        crate::kms::vk::dri3::DRM_FORMAT_MOD_LINEAR,
         vk::ExternalMemoryFeatureFlags::IMPORTABLE,
     );
     let renderer_owned_linear =
@@ -3404,7 +3406,8 @@ impl ScanoutBo {
             .semaphore(self.vk_semaphore)
             .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
         let raw_fd = unsafe { ext.get_semaphore_fd(&info)? };
-        let completion = super::optional_sync_fd_from_vk(raw_fd, "vkGetSemaphoreFdKHR(SYNC_FD)")?;
+        let completion =
+            crate::kms::vk::optional_sync_fd_from_vk(raw_fd, "vkGetSemaphoreFdKHR(SYNC_FD)")?;
         self.export_semaphore_reuse.finish_successful_export();
         Ok(completion)
     }
@@ -3588,7 +3591,7 @@ impl ScanoutBoPool {
     /// vng + Venus smoke for §5.5 hardware coverage.
     pub fn register_alien(
         &mut self,
-        _drawable: &super::target::DrawableImage,
+        _drawable: &crate::kms::vk::target::DrawableImage,
     ) -> io::Result<AlienBoHandle> {
         Err(io::Error::other(
             "ScanoutBoPool::register_alien: live KMS Flip integration not yet wired \
@@ -5403,16 +5406,16 @@ fn order_scanout_modifier_candidates(
 
     // When LINEAR is preferred (NVIDIA), add it first if both sides advertise it.
     if prefer_linear
-        && kms_scanout_modifiers.contains(&super::dri3::DRM_FORMAT_MOD_LINEAR)
-        && vulkan_supported.contains(&super::dri3::DRM_FORMAT_MOD_LINEAR)
-        && supports_direction(super::dri3::DRM_FORMAT_MOD_LINEAR)
+        && kms_scanout_modifiers.contains(&crate::kms::vk::dri3::DRM_FORMAT_MOD_LINEAR)
+        && vulkan_supported.contains(&crate::kms::vk::dri3::DRM_FORMAT_MOD_LINEAR)
+        && supports_direction(crate::kms::vk::dri3::DRM_FORMAT_MOD_LINEAR)
     {
-        candidates.push(super::dri3::DRM_FORMAT_MOD_LINEAR);
+        candidates.push(crate::kms::vk::dri3::DRM_FORMAT_MOD_LINEAR);
     }
 
     // Non-LINEAR modifiers in KMS-advertised order.
     for &modifier in kms_scanout_modifiers {
-        if modifier == super::dri3::DRM_FORMAT_MOD_LINEAR {
+        if modifier == crate::kms::vk::dri3::DRM_FORMAT_MOD_LINEAR {
             continue;
         }
         if vulkan_supported.contains(&modifier)
@@ -5425,12 +5428,12 @@ fn order_scanout_modifier_candidates(
 
     // When tiled is preferred (default), LINEAR comes last.
     if !prefer_linear
-        && kms_scanout_modifiers.contains(&super::dri3::DRM_FORMAT_MOD_LINEAR)
-        && vulkan_supported.contains(&super::dri3::DRM_FORMAT_MOD_LINEAR)
-        && supports_direction(super::dri3::DRM_FORMAT_MOD_LINEAR)
-        && !candidates.contains(&super::dri3::DRM_FORMAT_MOD_LINEAR)
+        && kms_scanout_modifiers.contains(&crate::kms::vk::dri3::DRM_FORMAT_MOD_LINEAR)
+        && vulkan_supported.contains(&crate::kms::vk::dri3::DRM_FORMAT_MOD_LINEAR)
+        && supports_direction(crate::kms::vk::dri3::DRM_FORMAT_MOD_LINEAR)
+        && !candidates.contains(&crate::kms::vk::dri3::DRM_FORMAT_MOD_LINEAR)
     {
-        candidates.push(super::dri3::DRM_FORMAT_MOD_LINEAR);
+        candidates.push(crate::kms::vk::dri3::DRM_FORMAT_MOD_LINEAR);
     }
 
     candidates
@@ -5489,7 +5492,7 @@ fn modifier_single_plane_supports_feature(
 
     let mut external_props = vk::ExternalImageFormatProperties::default();
     let mut props2 = vk::ImageFormatProperties2::default().push_next(&mut external_props);
-    if super::image_format_properties2(
+    if crate::kms::vk::image_format_properties2(
         vk,
         "scanout::modifier_single_plane_supports_feature",
         Some(modifier),
@@ -5560,7 +5563,7 @@ fn order_copied_source_plans(
     renderer_modifiers: &[u64],
     mut supports_pair: impl FnMut(u64) -> bool,
 ) -> Vec<CopiedSourcePlan> {
-    let linear = super::dri3::DRM_FORMAT_MOD_LINEAR;
+    let linear = crate::kms::vk::dri3::DRM_FORMAT_MOD_LINEAR;
     let mut plans: Vec<CopiedSourcePlan> = Vec::new();
 
     // Native modifiers retain renderer A's advertised order. Modifier 0 is
@@ -5691,7 +5694,7 @@ fn probe_scanout_modifier_single_plane_feature(
 
     let mut external_props = vk::ExternalImageFormatProperties::default();
     let mut props2 = vk::ImageFormatProperties2::default().push_next(&mut external_props);
-    if let Err(error) = super::image_format_properties2(
+    if let Err(error) = crate::kms::vk::image_format_properties2(
         vk,
         "scanout::probe_scanout_modifier_single_plane_feature",
         Some(modifier),
@@ -5746,7 +5749,7 @@ fn probe_scanout_linear_feature(
         .push_next(&mut external_info);
     let mut external_props = vk::ExternalImageFormatProperties::default();
     let mut props2 = vk::ImageFormatProperties2::default().push_next(&mut external_props);
-    if let Err(error) = super::image_format_properties2(
+    if let Err(error) = crate::kms::vk::image_format_properties2(
         vk,
         "scanout::probe_scanout_linear_feature",
         None,
@@ -5895,7 +5898,7 @@ fn allocate_vk_scanout_image(
 
     let mut external_info = vk::ExternalMemoryImageCreateInfo::default()
         .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-    let modifier_storage = [drm_modifier.unwrap_or(super::dri3::DRM_FORMAT_MOD_LINEAR)];
+    let modifier_storage = [drm_modifier.unwrap_or(crate::kms::vk::dri3::DRM_FORMAT_MOD_LINEAR)];
     let mut modifier_list = vk::ImageDrmFormatModifierListCreateInfoEXT::default()
         .drm_format_modifiers(if drm_modifier.is_some() {
             &modifier_storage
@@ -5912,7 +5915,7 @@ fn allocate_vk_scanout_image(
         depth_pitch: 0,
     }];
     let mut explicit_modifier_info = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
-        .drm_format_modifier(super::dri3::DRM_FORMAT_MOD_LINEAR)
+        .drm_format_modifier(crate::kms::vk::dri3::DRM_FORMAT_MOD_LINEAR)
         .plane_layouts(&explicit_plane_layouts);
 
     let tiling = match plan {
@@ -6035,9 +6038,9 @@ fn allocate_vk_scanout_image(
         }
         // Created with an explicit LINEAR modifier — no need to re-query it.
         ScanoutAllocationPlan::PaddedExplicitLinear { .. } => {
-            Some(super::dri3::DRM_FORMAT_MOD_LINEAR)
+            Some(crate::kms::vk::dri3::DRM_FORMAT_MOD_LINEAR)
         }
-        ScanoutAllocationPlan::ExplicitLinear => Some(super::dri3::DRM_FORMAT_MOD_LINEAR),
+        ScanoutAllocationPlan::ExplicitLinear => Some(crate::kms::vk::dri3::DRM_FORMAT_MOD_LINEAR),
         ScanoutAllocationPlan::LegacyLinear => None,
         ScanoutAllocationPlan::GbmModifier(_) => unreachable!(),
     };
@@ -6083,7 +6086,7 @@ fn allocate_vk_scanout_image(
             return Err(e);
         }
     };
-    let dmabuf = super::owned_fd_from_vk(raw_fd, "vkGetMemoryFdKHR(DMA_BUF)")?;
+    let dmabuf = crate::kms::vk::owned_fd_from_vk(raw_fd, "vkGetMemoryFdKHR(DMA_BUF)")?;
 
     let offset = u32::try_from(layout.offset).unwrap_or(0);
     Ok(VkScanoutImage {
