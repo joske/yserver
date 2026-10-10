@@ -1,0 +1,344 @@
+# Phase 2 (2.8) for kms/render/platform.rs: production items move into
+# descendant modules of kms::render::platform (log targets keep the old
+# prefix). GPU-only (Boundary A, future GpuCore): fence (FenceTicket,
+# FencePool, PresentCompletionSignal), storage_alloc (drawable image
+# allocation and views), submit (submit group, flush, paint submits). KMS:
+# init (open, from_platform_init, rollback guard, Drop), devices (device,
+# route and output-geometry accessors), qualify (scanout-route
+# qualification worker), cursor (cursor plane), flip_events (DRM events,
+# page flips, render completions, present clocks), scanout_bos (scanout BO
+# lifecycle), connectors (probe, enable/disable, snapshot, layout) and
+# power (idle wait, disable_output, DPMS). platform.rs keeps the imports,
+# every type and const (private fields stay readable from all children and
+# from platform/tests) and the test module declaration.
+# Needs a prep commit first: the two relative `super::submit_group` paths
+# qualified to `crate::kms::render::submit_group`.
+source = "crates/yserver/src/kms/render/platform.rs"
+module = "kms::render::platform"
+dir = "crates/yserver/src/kms/render/platform"
+root_form = "file"
+table = "platform_2.paths"
+
+[visibility]
+"fn advance_past_reservations" = "pub(super)"
+"fn allocate_copied_scanout_pool" = "pub(super)"
+"fn allocate_copy_free_scanout_pool" = "pub(super)"
+"fn apply_cursor_move_rollback_result" = "pub(super)"
+"fn apply_cursor_operation_result" = "pub(super)"
+"fn apply_cursor_show_failure_state" = "pub(super)"
+"fn check_scanout_liveness" = "pub(super)"
+"fn classify_copied_qualification_error" = "pub(super)"
+"fn classify_copy_free_qualification_error" = "pub(super)"
+"fn copy_free_candidate_error" = "pub(super)"
+"fn create_present_completion_signal" = "pub(super)"
+"fn cursor_dimensions_fit" = "pub(super)"
+"fn cursor_err_disables_hw" = "pub(super)"
+"fn cursor_footprint_intersects_output" = "pub(super)"
+"fn cursor_root_to_crtc_local" = "pub(super)"
+"fn initialize_cursor_plane_for_device" = "pub(super)"
+"fn install_cursor_plane_for_device" = "pub(super)"
+"fn mode_via_connector_handle" = "pub(super)"
+"fn qualify_scanout_candidates_in_order" = "pub(super)"
+"fn recompute_fb_extent_from" = "pub(super)"
+"fn require_copied_sink_explicit_dmabuf_layout_import" = "pub(super)"
+"fn resolve_copied_sink_renderer" = "pub(super)"
+"fn retain_initialized_scanout_pools" = "pub(super)"
+"fn retain_startup_gpu_owners" = "pub(super)"
+"fn route_requires_copy_free_probe" = "pub(super)"
+"fn scanout_pool_needs_reallocation" = "pub(super)"
+"fn validate_render_node_attachment" = "pub(super)"
+"impl < 'a , O , F > InitialScanoutRollbackGuard < 'a , O , F > where O : RollbackScanoutOutput , F : FnMut (& drm :: Device , & crate :: platform :: drm :: Output) -> io :: Result < () >::fn disarm" = "pub(super)"
+"impl < 'a , O , F > InitialScanoutRollbackGuard < 'a , O , F > where O : RollbackScanoutOutput , F : FnMut (& drm :: Device , & crate :: platform :: drm :: Output) -> io :: Result < () >::fn new_with" = "pub(super)"
+"impl CopiedScanoutError::fn into_io_error" = "pub(super)"
+"impl CopyFreeScanoutError::fn into_io_error" = "pub(super)"
+"impl CursorMoveOutcome::fn merge" = "pub(super)"
+"impl FenceTicket::fn retain_imported_wait_semaphores" = "pub(super)"
+"impl FenceTicket::fn retain_signal_semaphore" = "pub(super)"
+"impl KmsCursorState::fn new_with_nvidia_policy" = "pub(super)"
+"impl KmsCursorState::fn note_cursor_failure_pair" = "pub(super)"
+"impl KmsCursorState::fn note_einval" = "pub(super)"
+"impl KmsCursorState::fn note_initialization_failure" = "pub(super)"
+"impl KmsCursorState::fn should_initialize_headless_deferred" = "pub(super)"
+"impl KmsCursorState::fn should_retry_initialization" = "pub(super)"
+"impl PlatformBackend::fn copied_sink_context_for_kms" = "pub(super)"
+"impl PlatformBackend::fn cursor_output_route" = "pub(super)"
+"impl PlatformBackend::fn debug_assert_scanout_pool_route" = "pub(super)"
+"impl PlatformBackend::fn drain_scanout_pool_at" = "pub(super)"
+"impl PlatformBackend::fn drm_device_index_for_fd" = "pub(super)"
+"impl PlatformBackend::fn enable_connector_with_cursor_factory" = "pub(super)"
+"impl PlatformBackend::fn initialize_headless_cursor_for_device_with" = "pub(super)"
+"impl PlatformBackend::fn note_unbound_cursor_failure" = "pub(super)"
+"impl PlatformBackend::fn prune_present_clocks_to_live_outputs" = "pub(super)"
+"impl PlatformBackend::fn refresh_cursor_topology_for_devices" = "pub(super)"
+"impl PlatformBackend::fn refresh_cursor_topology_for_devices_with" = "pub(super)"
+"impl PlatformBackend::fn remove_connector_at" = "pub(super)"
+"impl PresentCompletionSignal::fn into_raw" = "pub(super)"
+
+[[modules]]
+name = ""
+lines = [
+  "use fence::*;",
+  "use init::*;",
+  "pub(crate) use qualify::*;",
+  "use cursor::*;",
+  "use scanout_bos::*;",
+  "#[cfg(test)]\nuse connectors::*;",
+]
+items = [
+  "mod tests",
+  "use *",
+  "struct *",
+  "enum *",
+  "trait *",
+  "type *",
+  "const *",
+]
+
+[[modules]]
+name = "fence"
+lines = ["use super::*;"]
+items = [
+  "impl std :: fmt :: Debug for FenceTicketInner",
+  "fn log_fence_status_error",
+  "impl FenceTicket::fn *",
+  "impl Drop for FenceTicketInner",
+  "impl PresentCompletionSignal::fn *",
+  "fn create_present_completion_signal",
+  "impl Drop for PresentCompletionSignal",
+  "impl FencePoolInner::fn *",
+  "impl FencePool::fn *",
+  "impl Drop for FencePool",
+  "impl PlatformBackend::fn acquire_fence_ticket",
+  "impl PlatformBackend::fn refresh_fence_pool_failure",
+  "impl PlatformBackend::fn acquire_present_completion_signal",
+]
+
+[[modules]]
+name = "storage_alloc"
+lines = ["use super::*;"]
+items = [
+  "impl PlatformBackend::fn sample_view_components",
+  "impl PlatformBackend::fn build_sample_view",
+  "impl PlatformBackend::fn build_attachment_view",
+  "impl PlatformBackend::fn format_for_depth",
+  "impl PlatformBackend::fn allocate_drawable_storage",
+  "impl PlatformBackend::fn allocate_drawable_storage_as",
+]
+
+[[modules]]
+name = "submit"
+lines = ["use super::*;"]
+items = [
+  "impl PlatformBackend::fn vk",
+  "impl PlatformBackend::fn ops_command_pool_handle",
+  "impl PlatformBackend::fn submit_paint_cb",
+  "impl PlatformBackend::fn submit_paint_cb_with_semaphore",
+  "impl PlatformBackend::fn submit_present_completion_signal",
+  "impl PlatformBackend::fn set_next_submit_cause",
+  "impl PlatformBackend::fn submit_group_size",
+  "impl PlatformBackend::fn submit_group_is_open",
+  "impl PlatformBackend::fn submit_group_max_size",
+  "impl PlatformBackend::fn submit_group_set_max_size_for_tests",
+  "impl PlatformBackend::fn submit_group_peek_entries_for_tests",
+  "impl PlatformBackend::fn force_next_submit_failure_for_integration_tests",
+  "impl PlatformBackend::fn force_next_frame_record_failure_for_integration_tests",
+  "impl PlatformBackend::fn take_forced_frame_record_failure",
+  "impl PlatformBackend::fn queue_submit_count",
+  "impl PlatformBackend::fn flush_submit_group",
+  "impl PlatformBackend::fn flush_submit_group_with_exports",
+  "impl PlatformBackend::fn publish_export_write_fences",
+  "impl PlatformBackend::fn abort_flush",
+  "impl PlatformBackend::fn submit_group_ticket_or_open",
+  "impl PlatformBackend::fn take_last_flush_outcome",
+]
+
+[[modules]]
+name = "init"
+lines = ["use super::*;"]
+items = [
+  "impl PlatformBackend::fn disarm_initial_scanout_rollback",
+  "impl PlatformBackend::fn open_with_commit",
+  "impl PlatformBackend::fn from_platform_init",
+  "impl PlatformBackend::fn for_tests",
+  "impl PlatformBackend::fn attach_test_vk_context",
+  "impl Drop for PlatformBackend",
+  "fn drm_device_is_nvidia",
+  "fn retain_live_vk_contexts_after_terminal_probe",
+  "fn retain_initialized_scanout_pools",
+  "fn retain_startup_gpu_owners",
+  "fn build_render_device_inventory",
+  "fn resolve_copied_sink_renderer",
+  "fn validate_render_node_attachment",
+  "fn rollback_initial_scanout_with",
+  "impl RollbackScanoutOutput for PlatformInitOutput",
+  "impl RollbackScanoutOutput for ActiveOutput",
+  "impl < 'a , O , F > InitialScanoutRollbackGuard < 'a , O , F > where O : RollbackScanoutOutput , F : FnMut (& drm :: Device , & crate :: platform :: drm :: Output) -> io :: Result < () >::fn *",
+  "impl < O , F > Drop for InitialScanoutRollbackGuard < '_ , O , F > where O : RollbackScanoutOutput , F : FnMut (& drm :: Device , & crate :: platform :: drm :: Output) -> io :: Result < () >",
+]
+
+[[modules]]
+name = "devices"
+lines = ["use super::*;"]
+items = [
+  "impl CrtcKey::fn *",
+  "impl RenderDevice::fn *",
+  "impl PlatformBackend::fn fb_dimensions",
+  "impl PlatformBackend::fn take_input_ctx",
+  "impl PlatformBackend::fn output_transform",
+  "impl PlatformBackend::fn any_output_transformed",
+  "impl PlatformBackend::fn output_root_rect",
+  "impl PlatformBackend::fn primary_device",
+  "impl PlatformBackend::fn selected_render_device",
+  "impl PlatformBackend::fn copied_sink_renderer_for_kms",
+  "impl PlatformBackend::fn scanout_qualification_devices_for_kms",
+  "impl PlatformBackend::fn copied_sink_context_for_kms",
+  "impl PlatformBackend::fn selected_render_device_mut",
+  "impl PlatformBackend::fn device_for_key",
+  "impl PlatformBackend::fn device_for_output",
+  "impl PlatformBackend::fn scanout_route_for_kms",
+  "impl PlatformBackend::fn output_index_for_crtc",
+  "impl PlatformBackend::fn drm_device_index_for_fd",
+]
+
+[[modules]]
+name = "qualify"
+lines = ["use super::*;"]
+items = [
+  "impl CopyFreeScanoutError::fn *",
+  "impl CopiedScanoutError::fn *",
+  "fn terminal_disposable_probe_io_error",
+  "fn is_terminal_disposable_probe_error",
+  "fn require_copied_sink_explicit_dmabuf_layout_import",
+  "fn route_requires_copy_free_probe",
+  "fn scanout_qualification_vk_init_error",
+  "fn classify_copy_free_qualification_error",
+  "fn classify_copied_qualification_error",
+  "fn new_disposable_compositor_for_selector",
+  "fn qualify_scanout_candidates_in_order",
+  "fn qualify_scanout_route_for_worker",
+  "fn test_scanout_pool",
+  "fn test_disposable_scanout_pool",
+  "fn copy_free_candidate_error",
+  "fn qualify_copy_free_scanout_plan",
+  "fn replay_copy_free_scanout_plan",
+  "fn allocate_copy_free_scanout_pool",
+  "fn qualify_copied_scanout_plan",
+  "fn replay_copied_scanout_plan",
+  "fn allocate_copied_scanout_pool",
+]
+
+[[modules]]
+name = "cursor"
+lines = ["use super::*;"]
+items = [
+  "fn cursor_err_disables_hw",
+  "fn cursor_error_is_transient_fallback",
+  "fn classify_cursor_failure_pair",
+  "fn cursor_dimensions_fit",
+  "impl KmsCursorState::fn *",
+  "impl CursorMoveOutcome::fn *",
+  "fn apply_cursor_move_rollback_result",
+  "fn apply_cursor_show_failure_state",
+  "fn apply_cursor_operation_result",
+  "fn install_cursor_plane_for_device",
+  "fn initialize_cursor_plane_for_device",
+  "impl PlatformBackend::fn cursor_plane_available",
+  "impl PlatformBackend::fn cursor_plane_available_for_output",
+  "impl PlatformBackend::fn cursor_plane_fits_for_output",
+  "impl PlatformBackend::fn cursor_output_route",
+  "impl PlatformBackend::fn note_unbound_cursor_failure",
+  "impl PlatformBackend::fn hw_cursor_disabled_for_device",
+  "impl PlatformBackend::fn cursor_plane_note_sprite_hotspot",
+  "impl PlatformBackend::fn cursor_plane_upload_image_for_output",
+  "impl PlatformBackend::fn cursor_plane_uploaded_version_for_output",
+  "impl PlatformBackend::fn cursor_plane_show_on_crtc",
+  "impl PlatformBackend::fn cursor_plane_move",
+  "impl PlatformBackend::fn cursor_plane_drain_pending_move_for_output",
+  "impl PlatformBackend::fn try_cursor_plane_move_for_device",
+  "impl PlatformBackend::fn cursor_crtc_membership_dirty",
+  "impl PlatformBackend::fn cursor_plane_hide_on_crtc",
+  "impl PlatformBackend::fn cursor_plane_visible_for_output",
+  "impl PlatformBackend::fn cursor_plane_note_composed_retirement",
+  "impl PlatformBackend::fn refresh_cursor_topology_for_devices",
+  "impl PlatformBackend::fn refresh_cursor_topology_for_devices_with",
+  "impl PlatformBackend::fn initialize_headless_cursor_for_device_with",
+  "impl PlatformBackend::fn refresh_cursor_topology",
+  "impl PlatformBackend::fn cursor_plane_hide_all",
+  "impl PlatformBackend::fn rearm_cursor",
+  "fn cursor_root_to_crtc_local",
+  "fn cursor_footprint_intersects_output",
+]
+
+[[modules]]
+name = "flip_events"
+lines = ["use super::*;"]
+items = [
+  "impl PlatformBackend::fn poll_fds",
+  "impl PlatformBackend::fn register_scanout_render_completion",
+  "impl PlatformBackend::fn drain_scanout_render_completions",
+  "impl PlatformBackend::fn cancel_scanout_render_completions_for_output",
+  "impl PlatformBackend::fn clear_scanout_render_completions",
+  "impl PlatformBackend::fn discard_old_drm_events_after_all_off",
+  "impl PlatformBackend::fn drain_page_flip_events",
+  "impl PlatformBackend::fn present_get_ust_msc",
+  "impl PlatformBackend::fn present_get_completion_clock",
+  "impl PlatformBackend::fn record_vblank_clock",
+  "impl PlatformBackend::fn record_completion_clock",
+  "impl PlatformBackend::fn prune_present_clocks_to_live_outputs",
+  "impl PlatformBackend::fn on_page_flip_complete",
+]
+
+[[modules]]
+name = "scanout_bos"
+lines = ["use super::*;"]
+items = [
+  "impl PlatformBackend::fn debug_assert_scanout_pool_route",
+  "impl PlatformBackend::fn acquire_scanout_bo",
+  "impl PlatformBackend::fn submit_copied_scanout",
+  "impl PlatformBackend::fn retained_composed_framebuffer",
+  "impl PlatformBackend::fn invalidate_bo",
+  "impl PlatformBackend::fn recycle_failed_submit_bo",
+  "impl PlatformBackend::fn cancel_scanout_bo_recording",
+  "impl PlatformBackend::fn reset_scanout_bos_for_suspend",
+  "impl PlatformBackend::fn drain_scanout_pool_at",
+  "impl PlatformBackend::fn record_present",
+  "impl PlatformBackend::fn commit_bo_present",
+  "fn check_scanout_liveness",
+]
+
+[[modules]]
+name = "connectors"
+lines = ["use super::*;"]
+items = [
+  "impl DroppedRoute::fn *",
+  "impl ConnectorSnapshot::fn *",
+  "fn scanout_pool_needs_reallocation",
+  "fn mode_via_connector_handle",
+  "fn advance_past_reservations",
+  "fn recompute_fb_extent_from",
+  "impl PlatformBackend::fn probe_all_connectors",
+  "impl PlatformBackend::fn probe_connector_snapshot",
+  "impl PlatformBackend::fn disable_connector",
+  "impl PlatformBackend::fn remove_connector_after_all_off",
+  "impl PlatformBackend::fn remove_connector_at",
+  "impl PlatformBackend::fn resolve_connector_enable",
+  "impl PlatformBackend::fn enable_connector",
+  "impl PlatformBackend::fn enable_connector_with_qualified_plan",
+  "impl PlatformBackend::fn prepare_qualified_connector_plan",
+  "impl PlatformBackend::fn install_prepared_connector_plan",
+  "impl PlatformBackend::fn enable_connector_with_cursor_factory",
+  "impl PlatformBackend::fn enable_connector_inner",
+  "impl PlatformBackend::fn recompact_horizontal_layout",
+  "impl PlatformBackend::fn recompute_fb_extent_with_reservations",
+  "impl PlatformBackend::fn apply_connector_snapshot",
+  "impl PlatformBackend::fn post_full_damage_all_outputs",
+]
+
+[[modules]]
+name = "power"
+lines = ["use super::*;"]
+items = [
+  "impl PlatformBackend::fn wait_idle_bounded",
+  "impl PlatformBackend::fn disable_output",
+  "impl PlatformBackend::fn dpms_set_outputs_active",
+]
