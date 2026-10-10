@@ -1,61 +1,26 @@
-//! `SceneCompositor` — composed output pass (Stage 2d MVP).
+//! `SceneCompositor`: composes the window scene onto each output's scanout
+//! buffer and drives the flip, cursor-plane and damage-audit lifecycles.
 //!
-//! Per rendering-model-v2 spec § "SceneCompositor" and Stage 2
-//! plan substage 2d. Owns the blit pipeline (reuses v1's
-//! `CompositorPipeline` — same shaders, same descriptor layout,
-//! same sampler), per-output descriptor-pool rings, the
-//! scene-structure dirty flag, and the per-output pending-ack
-//! queues that thread snapshot/ack through the I6b page-flip
-//! retirement path.
+//! It owns the compose pipeline, per-output state (scanout BOs, buffer-age
+//! ring, pending acks, cursor mode, transform intermediates), the
+//! scene-structure dirty flag and damage fan-out, and the retirement of
+//! what each submitted frame guards. This file holds the imports and every
+//! type (private fields stay visible to all children); the code lives in:
 //!
-//! Stage 2d MVP scope:
-//!
-//! - **Full-redraw every tick.** Buffer-age clipping is Stage 2e.
-//!   Stage 2d still records the damage snapshots so 2e is a
-//!   smaller diff, but the actual compose draws every scene
-//!   entry every frame.
-//! - **Single-output preferred.** The code loops over all
-//!   outputs, but only the single-output xfce-on-bee path is
-//!   exercised. Multi-output flip ordering is risk-listed in
-//!   the Stage 2 plan (Risk 20).
-//! - **No HW cursor plane.** Per I7 the cursor parks; Stage 5
-//!   reintroduces it as a SceneCompositor strategy choice. For
-//!   Stage 2d the cursor is skipped from the scene entirely —
-//!   cursor rendering needs a small cursor pixmap which Stage 3
-//!   will allocate alongside `create_cursor` wiring.
-//! - **Manual-redirected windows are skipped, their subtrees are
-//!   not.** Manual redirect flips the window to
-//!   `scene_participating = false` and the walk skips that node; the
-//!   compositor reintroduces its pixels by painting its output/COW
-//!   surface. The walk still recurses into the descendants, and a
-//!   descendant owning its own `redirected_target` (an Automatic
-//!   redirect under a Manual ancestor — GTK/marco CSD frames) emits
-//!   its own backing. Audit #3 (2026-05-19) removed the old
-//!   whole-subtree prune because it dropped those inner widgets.
-//! - **bg_pixel only.** Root background is the
-//!   `vkCmdBeginRendering` clear color; `bg_pixmap` (which
-//!   needs a sample-from-pixmap into root) waits for Stage 3.
-//!
-//! Compose flow (per [`SceneCompositor::tick`] call):
-//!
-//! 1. For each output, if `acquire_scanout_bo` returns `None`
-//!    (all BOs in flight), skip — next core-loop iteration retries.
-//! 2. Walk `core.top_level_order`, look up each window's
-//!    drawable in `store`, build a `CompositeDraw` list.
-//! 3. Peek presentation damage on each contributing drawable;
-//!    record the snapshot keyed by drawable id for later ack.
-//! 4. Call `kms::vk::compositor::record_and_present_composite`
-//!    — records the compose CB into the scanout BO's
-//!    pre-allocated `vk_transfer.command_buffer`, submits with
-//!    `signalSemaphore = bo.vk_semaphore`, exports the sync_file
-//!    fd, atomic-flips with explicit IN_FENCE_FD. v1's helper
-//!    handles all of this; v2 just builds the scene + reuses
-//!    the helper.
-//! 5. Push a `PendingAck` onto the output's queue, advance
-//!    `scene_structure_dirty = false`.
-//!
-//! [`SceneCompositor::handle_page_flip_complete`] then ack's
-//! the captured snapshots after KMS retires the matching BO.
+//! - `lifecycle`: create, output state rebuild and sync, drain, deferred
+//!   scene resources, `BufferAgeRing`.
+//! - `damage`: scene-structure damage marking, wake, root overlay, and
+//!   projection/fan-out of damage onto outputs.
+//! - `cursor`: cursor plane mode, transitions, retire, software cursor save.
+//! - `tick`: scheduling, repaint owed, dormancy and the per-output tick.
+//! - `flip`: page-flip and render-completion retirement.
+//! - `damage_audit`: the reference-compose damage audit.
+//! - `repaint`: partial-compose planning (`RepaintPlan`, scissor culling).
+//! - `build`, `walk`: scene list assembly; per-window visibility decisions.
+//! - `compose`: `ComposeRenderTarget` for scanout targets, record and submit.
+//! - `transform`: transform intermediates and the scale pass.
+//! - `root_readback`: root-window reads (composes into a private image).
+//! - `for_tests`: `*_for_tests` entry points; `tests`: unit tests.
 
 #![allow(
     dead_code,
