@@ -1,8 +1,26 @@
-//! Per-bo state machine + scanout-bo allocation (sub-phase 4.1.2).
+//! Scanout buffers: per-BO state machines, GBM/Vulkan scanout allocation,
+//! copied (cross-GPU) scanout pools and the disposable route probes.
 //!
-//! Spec: docs/superpowers/specs/2026-05-07-phase4-1-vulkan-compositor-design.md
-//! §"Per-buffer release fence" — table of transitions and fence-handle
-//! ownership rules.
+//! It owns `ScanoutBo` and `ScanoutBoPool` (per-output BOs and their
+//! release-fence ownership, spec
+//! docs/superpowers/specs/2026-05-07-phase4-1-vulkan-compositor-design.md
+//! §"Per-buffer release fence"), `CopiedRenderSource` /
+//! `CopiedScanoutPool` and the dma-buf metadata used to pick a route. This
+//! file holds the imports and every type (private fields stay visible to
+//! all children); the code lives in:
+//!
+//! - `bo_state`: BO state transitions, copied ownership/contents state.
+//! - `bo`: `ScanoutBo` allocate/probe/export/disarm, `Drop`, rollback.
+//! - `bo_pool`: `ScanoutBoPool`, `OutputScanout`, GBM device open.
+//! - `copied`: `CopiedRenderSource`, `CopiedScanoutPool` and its probe.
+//! - `dmabuf_metadata`: PRIME caps, directional modifiers, route verdicts.
+//! - `probe`: disposable-probe errors and fences, copied probe validation.
+//! - `errors`: Vulkan/io error helpers, device-lost classification.
+//! - `alloc_plan`: allocation plans, LINEAR preference, pitch.
+//! - `modifiers`: modifier candidates/override, format-feature queries.
+//! - `image_alloc`: Vulkan/GBM scanout image, `VkScanoutFb`, transfer
+//!   resources.
+//! - `tests`: unit tests.
 //!
 //! ## Allocation direction
 //!
