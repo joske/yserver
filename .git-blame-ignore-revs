@@ -119,3 +119,15 @@ d88bab96a1cdf17d62ac28dde4075c5849aab436
 
 # refactor(kms): split scene into lifecycle/tick/compose/walk modules (move)
 f18205508691f53edd12399564661e9932da1ad1
+
+# refactor(kms): qualify platform super:: paths (prep)
+525636c2eb914745b2c343502afb41f1ab9267e3
+
+# refactor(kms): split platform into fence/submit/init/connectors modules (move)
+13703cade2961301e591a1e4ea8e2e3fa08f92d4
+
+# refactor(kms): qualify scanout super:: paths (prep)
+edbf67665bd10b3eb0fdf8191a3e86dbbe33af76
+
+# refactor(kms): split scanout into bo/copied/probe/image_alloc modules (move)
+83693c2d565229ef216be8b918e57b5a4c295c2a
