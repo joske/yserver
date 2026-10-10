@@ -1,32 +1,29 @@
-//! `PlatformBackend` — hardware + OS surface for the v2 renderer.
+//! `PlatformBackend`: the hardware and OS surface of the v2 renderer.
 //!
-//! Per rendering-model-v2 spec § "PlatformBackend — hardware + OS
-//! surface" and Stage 2 plan
-//! (`docs/superpowers/plans/2026-05-16-stage-2.md`) substage 2a.
-//! Owns the DRM device, KMS outputs, libinput context, Vulkan
-//! device, command pool, recyclable fence pool, and per-output
-//! scanout BO pools (with v2's per-BO generation tracking for
-//! the buffer-age algorithm).
+//! It owns the DRM devices and KMS outputs, libinput, the Vulkan device,
+//! the ops command pool, the recyclable fence pool, the submit group and
+//! the per-output scanout BO pools. Sync is two objects: [`FenceTicket`]
+//! for CPU-side resource lifetime (I6a) and each `ScanoutBo`'s long-lived
+//! export semaphore for the KMS `IN_FENCE_FD` wait. This file holds the
+//! imports, every type and const (private fields stay visible to all
+//! children); the code lives in:
 //!
-//! Exposes the **two-sync-object** API the v2 model needs:
-//! [`FenceTicket`] for CPU-side resource lifetime (I6a), and the
-//! per-`ScanoutBo` long-lived `vk_semaphore` (consumed by KMS
-//! `IN_FENCE_FD`) for the page-flip kernel wait. The
-//! `KmsSyncSemaphore` wrapper from the Stage 2 plan turned out
-//! to be unnecessary — `ScanoutBoPool` already owns reusable
-//! per-BO export semaphores, so v2 reuses those directly.
-//! Stage 2a's commit message records this departure.
+//! GPU-only (plan Boundary A, the future `GpuCore`; phase 3 moves these
+//! three files wholesale):
+//! - `fence`: `FenceTicket`, `FencePool`, `PresentCompletionSignal`.
+//! - `storage_alloc`: drawable image allocation and views.
+//! - `submit`: paint and present submits, the submit group, flush.
 //!
-//! `KmsBackend` holds `platform: PlatformBackend` and
-//! delegates DRM / Vk / libinput access through it. Paint paths
-//! still log gaps in Stage 2a; the real `DrawableStore` /
-//! `RenderEngine` / `SceneCompositor` arrive in Stage 2b–2e.
-//!
-//! Several APIs introduced here (`FenceTicket`, `FencePool`,
-//! `ScanoutBoToken`, `PageFlipRetirement`, `invalidate_bo`,
-//! `record_present`, `commit_bo_present`) are dead-code in 2a —
-//! they're the surface 2b–2e consume. The dead-code allowances
-//! below get retired one at a time as later substages land.
+//! KMS:
+//! - `init`: open, `from_platform_init`, inventory, rollback guard, `Drop`.
+//! - `devices`: device, route and output-geometry accessors.
+//! - `qualify`: scanout-route qualification (startup worker, probe).
+//! - `cursor`: cursor-plane failure policy and `KmsCursorState`.
+//! - `flip_events`: DRM events, page flips, render completions.
+//! - `scanout_bos`: scanout BO lifecycle and copied submits.
+//! - `connectors`: probe, enable/disable/remove, snapshot, layout.
+//! - `power`: bounded idle wait, `disable_output`, DPMS.
+//! - `tests`: unit tests.
 
 #![allow(
     dead_code,
