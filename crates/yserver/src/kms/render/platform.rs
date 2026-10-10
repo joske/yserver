@@ -4949,7 +4949,9 @@ impl PlatformBackend {
     /// CBs land in the group in chronological submission order without
     /// requiring a flush that would destroy the snapshot.
     #[cfg(test)]
-    pub(crate) fn submit_group_peek_entries_for_tests(&self) -> &[super::submit_group::GroupEntry] {
+    pub(crate) fn submit_group_peek_entries_for_tests(
+        &self,
+    ) -> &[crate::kms::render::submit_group::GroupEntry] {
         self.submit_group.peek_entries()
     }
 
@@ -5218,7 +5220,7 @@ impl PlatformBackend {
     /// VUID-vkFreeCommandBuffers-pCommandBuffers-00047.
     fn abort_flush(
         &mut self,
-        entries: Vec<super::submit_group::GroupEntry>,
+        entries: Vec<crate::kms::render::submit_group::GroupEntry>,
         n: usize,
         reason: FlushReason,
         err: vk::Result,
