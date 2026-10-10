@@ -7,15 +7,11 @@ run only**; nothing moved yet. Sizes below are the dry-run tree after
 
 ## Structure today (9,646 lines, tests already in `scene/tests/`)
 
-- **Types (lines 1–1334, plus ~350 later):** stage-2d `//!` history doc,
-  imports, `InFlightStage`, `PendingAck`, cursor enums
-  (`CursorAssignment`/`Transition`/`OutputCursorMode`/`CursorPlaneMode`),
-  `BufferAgeRing`, `OutputSceneState` (126-line struct), damage-audit types,
-  `TickSkipReason`/`TickOutcome`, `SceneCompositor` + `SceneCompositorInner`,
-  walk types (`WalkStats`, `WalkSink`, `SceneBuild`, `ContentDamage`), later
-  `RepaintPlan`, `RootNode`, `NodeDecision`, `IntermediatePrimeTarget`,
-  `ScalePass`, the `ComposeRenderTarget` trait. Private fields read across
-  every responsibility.
+- **Types (lines 1–1334, ~350 later):** stage-2d `//!` doc, imports,
+  `PendingAck`, cursor enums, `BufferAgeRing`, `OutputSceneState`,
+  damage-audit types, `TickOutcome`, `SceneCompositor(Inner)`, walk types,
+  `RepaintPlan`, `NodeDecision`, `ComposeRenderTarget`. Private fields are
+  read across every responsibility.
 - **`impl SceneCompositor`** in three blocks (1,147 / 307 / 174 lines):
   lifecycle, damage marking, cursor, tick, flip completion, readback,
   transform priming, `*_for_tests`.
@@ -26,9 +22,8 @@ run only**; nothing moved yet. Sizes below are the dry-run tree after
   (`wake_for_damage`, `mark_scene_structure_dirty`,
   `mark_scene_structure_damage_rect(s)`) record `Location::caller()`; their
   only callers in this file are the three `root_overlay_*` methods.
-- **Macros:** none defined, no `module_path!`/`line!`/`file!`.
-- **Logs:** 72 log macros, none with `target:`; all children are
-  descendants, so `kms::render::scene` filters still match.
+- **Macros/logs:** none defined, no `module_path!`/`line!`/`file!`; 72 log
+  calls, none with `target:`; children are descendants, filters still match.
 - **Relative paths:** 60 `super::` paths outside the root `use super::{…}`
   (36 `store`, 16 `backend`, 5 `root_overlay`, 2 `transform_intermediate`,
   1 `engine`; one is a doc link).
@@ -43,26 +38,22 @@ Names avoid every first path segment used in the file (`vk`, `store`,
 scene.rs         1195  //! doc, imports, mod decls, re-exports, every type,
                        ComposeRenderTarget trait, SceneError From impls,
                        mod tests
-lifecycle.rs      430  new/stub/is_live, build_output_state, rebuild_outputs,
-                       sync_output_layouts, invalidate_all_scanout_damage,
-                       drain_all, drain_deferred_scene_resources, BufferAgeRing
+lifecycle.rs      430  new/stub, output state rebuild/sync, drain_all,
+                       deferred scene resources, BufferAgeRing
 damage.rs         340  note_structure_change, wake_for_damage,
                        mark_scene_structure_*, root_overlay_*, projection
                        and fan-out onto outputs (fan_out_*, dispatch/clip/
                        project/add_projected_damage)
-cursor.rs         687  cursor mode classification, transitions, retire
-                       resolution, retry/lifecycle resets, hw_cursor_allowed,
-                       cursor damage/footprint, record_cursor_save,
-                       register/clear/restore, steady-state upload
+cursor.rs         687  cursor mode, transitions, retire resolution, retry
+                       resets, cursor damage/footprint, record_cursor_save
 tick.rs          1412  tick, retry deadline, owes_repaint, TickOutcome,
                        tick-skip/success records, walk_needed, dormancy,
                        pending presentation, tick_one_output (952)
 flip.rs           436  page-flip and render-completion retirement,
                        InFlightStage matching, failed-submit BO retire,
                        pool release drain, has_pending_page_flip(s)
-damage_audit.rs  1197  DamageAuditTarget (+Drop, ComposeRenderTarget), audit
-                       state/env knobs, heartbeat, ledger, reference compose,
-                       compare submit, summary + tile attribution
+damage_audit.rs  1197  DamageAuditTarget (+Drop, ComposeRenderTarget),
+                       knobs, ledger, reference compose, compare, attribution
 repaint.rs        241  partial-compose planning: RepaintPlan, plan_repaint,
                        opaque cover, cull_scene_to_region, scissor consts
 build.rs          985  scene list assembly: build_scene(_with),
@@ -72,9 +63,8 @@ walk.rs          1104  per-window decisions: visit_window_subtree,
                        decide_node, inner_place_rects, children_index,
                        WalkStats
 compose.rs        788  ComposeRenderTarget for ScanoutBo/CopiedRenderSource,
-                       record_and_submit_render, record_command_buffer,
-                       shared/copied scanout submit, stage_submitted_frame,
-                       device-lost classification, CopiedRenderSubmitError
+                       record_(and_submit_render|command_buffer), scanout
+                       submits, device-lost classification
 transform.rs      441  transform intermediates: ensure/release/prime,
                        IntermediatePrimeTarget, ScalePass, record_scale_pass
 root_readback.rs  210  root_readback(+_is_current), extent/covers
@@ -82,9 +72,8 @@ for_tests.rs      251  the 6 test-only SceneCompositor methods,
                        read_general_image_for_tests
 ```
 
-Total 9,717 (9,646 before). All ≤ 5k; largest `tick.rs`. Types stay in
-the root (as engine): `SceneCompositorInner`/`OutputSceneState` fields are
-read from nearly every child. Inherent impls are spread per member.
+Total 9,717 (9,646 before). All ≤ 5k. Types stay in the root (as engine);
+inherent impls are spread per member.
 
 Deviations from the 2.9 row (`cursor`, `damage_audit`, `tick_output`,
 `walk` 2.6k, `fan_out`, `targets`, `root_readback`): `tick` holds the whole
@@ -107,18 +96,10 @@ Not run in the dry run: `verify --tests`, feature variants, lavapipe.
 Logs: `target/gate-scene-dry-*.log`.
 
 **Visibility delta (89, all private → `pub(super)` = the old reach):**
-66 needed by the lib (53 free fns, 13 methods: `note_structure_change`,
-`record_damage_audit_event`, `damage_audit_active`,
-`full_output_audit_area`, `DamageAuditTarget::new`, `ScalePass::new`,
-`RepaintPlan::full`, `WalkStats::{collapses,
-off_output_damage_forces_compose}`, `BufferAgeRing::push`,
-`CopiedRenderSubmitError::{into_present, requires_fail_stop}`,
-`SceneBuild::omit_software_cursor_for_hide`); 23 only by `scene/tests`
-(18 fns, e.g. `walk_needed`, `decide_node`, `fan_out_to_output`,
-`classify_cursor_mode_from_per_output`; `CLIPPED_REPAINT_MAX_FRACTION`;
-`BufferAgeRing::{new, contains_all}`,
-`TickOutcome::{clears_scene_structure_dirty, walked}`). Existing
-`pub(crate)` items unchanged.
+66 needed by the lib (53 free fns, 13 methods, e.g. `note_structure_change`,
+`record_damage_audit_event`, `RepaintPlan::full`); 23 only by `scene/tests`
+(18 fns, e.g. `walk_needed`, `decide_node`; 1 const; 4 methods of
+`BufferAgeRing`/`TickOutcome`). Existing `pub(crate)` items unchanged.
 
 **Re-exports (root `lines`):** `use` globs for damage, cursor, tick, flip,
 damage_audit, repaint, walk, compose, transform; `pub(crate) use build::*`
