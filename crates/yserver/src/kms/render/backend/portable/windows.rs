@@ -505,7 +505,7 @@ impl KmsBackend {
             crate::kms::vk::mem_accounting::MemCategory::WindowStorage,
         ) {
             Ok(storage) => storage,
-            Err(_e) if self.platform.vk.is_none() => {
+            Err(_e) if self.platform.gpu.vk.is_none() => {
                 crate::kms::render::store::Storage::for_tests_null(
                     ash::vk::Extent2D {
                         width: storage_w,
@@ -1609,7 +1609,7 @@ impl KmsBackend {
         ) {
             Ok(storage) => storage,
             Err(e)
-                if self.platform.vk.is_none()
+                if self.platform.gpu.vk.is_none()
                     && e == ash::vk::Result::ERROR_INITIALIZATION_FAILED =>
             {
                 // No Vk fixture (`for_tests`): track the geometry without storage.

@@ -169,7 +169,7 @@ impl PlatformBackend {
         {
             // The failing operation used a live renderer or sink transfer
             // device.  Neither uncertain image state may be reused.
-            self.renderer_failed = true;
+            self.gpu.renderer_failed = true;
         }
         result
     }
@@ -319,7 +319,7 @@ impl PlatformBackend {
     /// keeps uncertain resources quarantined and its Drop path leaks them
     /// instead of freeing memory that a GPU may still reference.
     pub(super) fn drain_scanout_pool_at(&mut self, output_idx: usize) -> io::Result<()> {
-        let Some(vk) = self.vk.clone() else {
+        let Some(vk) = self.gpu.vk.clone() else {
             return Ok(());
         };
         let result = self
@@ -328,7 +328,7 @@ impl PlatformBackend {
             .and_then(Option::as_mut)
             .map_or(Ok(()), |pool| pool.drain_all_pending(&vk));
         if result.is_err() {
-            self.renderer_failed = true;
+            self.gpu.renderer_failed = true;
         }
         result
     }

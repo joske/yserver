@@ -115,7 +115,7 @@ impl RenderEngine {
         gradient: crate::kms::vk::gradient::GradientPicture,
         pixels: &[u8],
     ) -> Result<(), RenderError> {
-        if platform.renderer_failed {
+        if platform.gpu.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
         let inner = self.inner.as_mut().ok_or(RenderError::NoVk)?;

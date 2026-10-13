@@ -488,7 +488,7 @@ impl PlatformBackend {
                 ),
             ));
         }
-        let vk = self.vk.as_ref().cloned().ok_or_else(|| {
+        let vk = self.gpu.vk.as_ref().cloned().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("prepare qualified connector {connector}: no live Vulkan renderer"),
@@ -517,7 +517,7 @@ impl PlatformBackend {
                         return Err(error.into_io_error());
                     }
                     Err(error @ CopyFreeScanoutError::LiveRendererLost(_)) => {
-                        self.renderer_failed = true;
+                        self.gpu.renderer_failed = true;
                         return Err(error.into_io_error());
                     }
                     Err(CopyFreeScanoutError::Candidates(error)) => return Err(error),
@@ -561,13 +561,13 @@ impl PlatformBackend {
                         return Err(error.into_io_error());
                     }
                     Err(error @ CopiedScanoutError::LiveDeviceLost { .. }) => {
-                        self.renderer_failed = true;
+                        self.gpu.renderer_failed = true;
                         return Err(error.into_io_error());
                     }
                     Err(CopiedScanoutError::Candidates(error))
                         if crate::kms::vk::scanout::scanout_error_is_device_lost(&error) =>
                     {
-                        self.renderer_failed = true;
+                        self.gpu.renderer_failed = true;
                         return Err(error);
                     }
                     Err(CopiedScanoutError::Candidates(error)) => return Err(error),
@@ -682,7 +682,7 @@ impl PlatformBackend {
                 // previous topology was still active. Keep this dark-window
                 // path to the KMS commit and ownership installation only.
                 Some(Some(pool))
-            } else if let Some(vk) = self.vk.as_ref().cloned() {
+            } else if let Some(vk) = self.gpu.vk.as_ref().cloned() {
                 let allocation: io::Result<OutputScanout> =
                     if route_requires_copy_free_probe(scanout_route) {
                         match allocate_copy_free_scanout_pool(
@@ -703,7 +703,7 @@ impl PlatformBackend {
                                 return Err(error.into_io_error());
                             }
                             Err(error @ CopyFreeScanoutError::LiveRendererLost(_)) => {
-                                self.renderer_failed = true;
+                                self.gpu.renderer_failed = true;
                                 return Err(error.into_io_error());
                             }
                             Err(CopyFreeScanoutError::Candidates(shared_error)) => {
@@ -738,7 +738,7 @@ impl PlatformBackend {
                                     return Err(error.into_io_error());
                                 }
                                 Err(error @ CopiedScanoutError::LiveDeviceLost { .. }) => {
-                                    self.renderer_failed = true;
+                                    self.gpu.renderer_failed = true;
                                     return Err(error.into_io_error());
                                 }
                                 Err(CopiedScanoutError::Candidates(copied_error))
@@ -746,7 +746,7 @@ impl PlatformBackend {
                                         &copied_error,
                                     ) =>
                                 {
-                                    self.renderer_failed = true;
+                                    self.gpu.renderer_failed = true;
                                     return Err(copied_error);
                                 }
                                 Err(CopiedScanoutError::Candidates(copied_error)) => {
@@ -955,7 +955,7 @@ impl PlatformBackend {
             fb_h
         );
         if let Some(error) = post_commit_ownership_error {
-            self.renderer_failed = true;
+            self.gpu.renderer_failed = true;
             // The KMS commit and platform installation already succeeded.
             // Report success so the caller's RANDR registry converges with
             // the live topology; `renderer_failed` drives the ordinary fatal

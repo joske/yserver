@@ -235,7 +235,7 @@ impl RenderEngine {
             Some(i) => i,
             None => return Err(RenderError::NoVk),
         };
-        if platform.renderer_failed {
+        if platform.gpu.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
         let (dst_extent, dst_format, dst_depth) = {

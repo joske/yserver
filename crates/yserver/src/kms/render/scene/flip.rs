@@ -180,7 +180,7 @@ impl SceneCompositor {
                                 "render scene: compose fence status failed at pageflip \
                                  retirement: {error:?}"
                             );
-                            platform.renderer_failed = true;
+                            platform.gpu.renderer_failed = true;
                             state.pending_pool_releases.push_back((slot, t.clone()));
                         }
                     },
@@ -272,7 +272,7 @@ pub(super) fn handle_scanout_render_completion_inner(
     completion: ReadyScanoutRenderCompletion,
     platform: &mut PlatformBackend,
 ) -> bool {
-    if platform.renderer_failed {
+    if platform.gpu.renderer_failed {
         return false;
     }
     let ReadyScanoutRenderCompletion {
@@ -306,7 +306,7 @@ pub(super) fn handle_scanout_render_completion_inner(
         // completed source can no longer be associated safely. Fail-stop
         // rather than guessing a pool slot or making either device's
         // allocation reusable while GPU ownership is uncertain.
-        platform.renderer_failed = true;
+        platform.gpu.renderer_failed = true;
         return false;
     }
 
@@ -346,7 +346,7 @@ pub(super) fn handle_scanout_render_completion_inner(
                                 "render copied scanout: renderer recovery failed for output \
                                      {output_idx} bo {bo_idx}: {recovery_error}"
                             );
-                            platform.renderer_failed = true;
+                            platform.gpu.renderer_failed = true;
                         }
                     },
                     Some(ticket) => {
@@ -367,7 +367,7 @@ pub(super) fn handle_scanout_render_completion_inner(
                     "render copied scanout: missing descriptor slot for failed output \
                          {output_idx} bo {bo_idx}"
                 );
-                platform.renderer_failed = true;
+                platform.gpu.renderer_failed = true;
             }
             state.next_submit_retry_at =
                 Some(std::time::Instant::now() + std::time::Duration::from_millis(100));
@@ -400,7 +400,7 @@ pub(super) fn retire_failed_submit_bos(
                          bo {}: {error}",
                         failed.bo_idx,
                     );
-                    platform.renderer_failed = true;
+                    platform.gpu.renderer_failed = true;
                     remaining.push_back(failed);
                 }
             },
@@ -411,7 +411,7 @@ pub(super) fn retire_failed_submit_bos(
                      bo {}: {error:?}",
                     failed.bo_idx,
                 );
-                platform.renderer_failed = true;
+                platform.gpu.renderer_failed = true;
                 remaining.push_back(failed);
             }
         }
@@ -440,7 +440,7 @@ pub(super) fn drain_pending_pool_releases(
             Ok(false) => remaining.push_back((slot, ticket)),
             Err(error) => {
                 log::error!("render scene: deferred pool fence status failed: {error:?}");
-                platform.renderer_failed = true;
+                platform.gpu.renderer_failed = true;
                 remaining.push_back((slot, ticket));
             }
         }

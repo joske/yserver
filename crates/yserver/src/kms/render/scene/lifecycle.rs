@@ -361,7 +361,7 @@ impl SceneCompositor {
                                 "render scene drain: output {output_idx} compose fence wait \
                                  failed: {error:?}; retaining resources for quarantine"
                             );
-                            platform.renderer_failed = true;
+                            platform.gpu.renderer_failed = true;
                             false
                         }
                     });
@@ -428,7 +428,7 @@ impl SceneCompositor {
                 },
             );
             if wait_failed || recovery_failed {
-                platform.renderer_failed = true;
+                platform.gpu.renderer_failed = true;
             }
             // Stage 5 Phase D' — global recovery: reset every
             // output's cursor mode to Hidden. The post-recovery

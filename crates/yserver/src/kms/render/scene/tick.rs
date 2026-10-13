@@ -143,7 +143,7 @@ impl SceneCompositor {
             return Err(SceneError::NoVk);
         };
         platform.refresh_fence_pool_failure();
-        if platform.renderer_failed {
+        if platform.gpu.renderer_failed {
             return Ok(Vec::new());
         }
         debug_assert_eq!(
@@ -289,13 +289,13 @@ impl SceneCompositor {
         // output installed its PendingAck; exact job/BO matching is then live
         // before the immediate B submission runs.
         for completion in platform.drain_scanout_render_completions() {
-            if platform.renderer_failed {
+            if platform.gpu.renderer_failed {
                 break;
             }
             if !handle_scanout_render_completion_inner(inner, completion, platform) {
                 telemetry.record_missed_pageflip();
             }
-            if platform.renderer_failed {
+            if platform.gpu.renderer_failed {
                 break;
             }
         }
@@ -1115,7 +1115,7 @@ fn tick_one_output(
         Err(error) => {
             inner.outputs[output_idx].pool_ring.release(slot);
             if vk_result_is_device_lost(error) {
-                platform.renderer_failed = true;
+                platform.gpu.renderer_failed = true;
             }
             return Err(SceneError::Present(PresentError::Vk(error)));
         }
@@ -1288,7 +1288,7 @@ fn tick_one_output(
         // A failed import therefore cannot be retried without fabricating the
         // external memory dependency; fail-stop before the source can be
         // reserved or reused again.
-        platform.renderer_failed = true;
+        platform.gpu.renderer_failed = true;
     }
     let compose_result = match render_result {
         Ok(Some(completion)) => platform
@@ -1397,7 +1397,7 @@ fn tick_one_output(
                 // Neither shared nor copied source resources are reusable
                 // after DEVICE_LOST; latch the same fatal renderer state used
                 // by the engine before any retry bookkeeping runs.
-                platform.renderer_failed = true;
+                platform.gpu.renderer_failed = true;
             }
             if gpu_submitted {
                 for id in &built.sampled_ids {

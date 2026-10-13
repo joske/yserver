@@ -398,7 +398,7 @@ impl Storage {
         // built by us against the borrowed image — we own it and
         // must destroy it explicitly before the inner Drop fires.
         if self.imported_drawable.is_some() {
-            if let Some(vk) = platform.vk.as_ref()
+            if let Some(vk) = platform.gpu.vk.as_ref()
                 && self.sample_view != vk::ImageView::null()
             {
                 unsafe { vk.device.destroy_image_view(self.sample_view, None) };
@@ -416,7 +416,7 @@ impl Storage {
             self.imported_drawable = None;
             return;
         }
-        let Some(vk) = platform.vk.as_ref() else {
+        let Some(vk) = platform.gpu.vk.as_ref() else {
             // No VkContext — happens only in malformed test
             // fixtures. Log + leak.
             log::error!(
@@ -445,7 +445,7 @@ impl Storage {
             && self.image != vk::Image::null()
             && self.image_view != vk::ImageView::null()
             && self.memory != vk::DeviceMemory::null()
-            && let Some(pool) = platform.pixmap_pool.as_ref()
+            && let Some(pool) = platform.gpu.pixmap_pool.as_ref()
         {
             let key = crate::kms::vk::pixmap_pool::PixmapPoolKey {
                 width: self.extent.width,
@@ -1116,7 +1116,7 @@ impl DrawableStore {
         drawable.refcount = 0;
         let ticket_ready = match drawable.last_render_ticket.as_ref() {
             None => true,
-            Some(t) => match platform.vk.as_ref() {
+            Some(t) => match platform.gpu.vk.as_ref() {
                 Some(vk) => t.poll_signaled(vk),
                 None => true, // no Vk (tests) — treat as signaled
             },
@@ -1463,7 +1463,7 @@ impl DrawableStore {
                 None => true, // already gone
                 Some(d) => match d.last_render_ticket.as_ref() {
                     None => true,
-                    Some(t) => match platform.vk.as_ref() {
+                    Some(t) => match platform.gpu.vk.as_ref() {
                         Some(vk) => t.poll_signaled(vk),
                         None => true,
                     },

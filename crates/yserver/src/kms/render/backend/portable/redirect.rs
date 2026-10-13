@@ -1137,7 +1137,7 @@ impl KmsBackend {
             }
             Err(vk_err)
                 if vk_err == ash::vk::Result::ERROR_INITIALIZATION_FAILED
-                    && self.platform.vk.is_none() =>
+                    && self.platform.gpu.vk.is_none() =>
             {
                 // Test fixture path — no Vk available.
                 self.log_render_gap("create_pixmap_no_vk");

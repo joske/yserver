@@ -182,7 +182,7 @@ impl RenderEngine {
         // Lazy-init RENDER assets (mirrors the unbatched path).
         self.ensure_render_assets(platform)?;
         let inner = self.inner.as_mut().ok_or(RenderError::NoVk)?;
-        if platform.renderer_failed {
+        if platform.gpu.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
 
@@ -511,7 +511,7 @@ impl RenderEngine {
         // A real flush: an open batch was present and is being closed.
         // Attribute it for the `vk renderpass flush src` telemetry.
         reason.record();
-        if platform.renderer_failed {
+        if platform.gpu.renderer_failed {
             log::debug!(
                 "render flush_render_batch: renderer_failed; dropping batch \
                  (coalesced {} composites)",

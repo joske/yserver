@@ -145,7 +145,7 @@ impl RenderEngine {
         }
 
         // (1) renderer_failed check.
-        if platform.renderer_failed {
+        if platform.gpu.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
 

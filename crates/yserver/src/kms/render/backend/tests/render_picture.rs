@@ -836,9 +836,9 @@ fn window_remap_at_the_same_size_is_a_pool_hit() {
         b.platform.wait_idle_bounded();
         b.poll_pending_retire_with_invalidate();
     }
-    let vk = std::sync::Arc::clone(b.platform.vk.as_ref().expect("vk"));
+    let vk = std::sync::Arc::clone(b.platform.gpu.vk.as_ref().expect("vk"));
     let pool = std::sync::Arc::new(crate::kms::vk::pixmap_pool::PixmapPool::new(vk));
-    b.platform.pixmap_pool = Some(std::sync::Arc::clone(&pool));
+    b.platform.gpu.pixmap_pool = Some(std::sync::Arc::clone(&pool));
     let memory_of = |b: &KmsBackend, xid: u32| {
         let id = b.store.lookup(xid).expect("leaf");
         b.store.get(id).expect("drawable").storage.memory
@@ -934,7 +934,7 @@ fn pixmap_pool_eviction_and_idle_trim_free_the_memory() {
     // Room for about two entries; the third return crosses the budget
     // and evicts down to one.
     let budget = 2 * entry_bytes(107, 73) * 2;
-    let vk = std::sync::Arc::clone(b.platform.vk.as_ref().expect("vk"));
+    let vk = std::sync::Arc::clone(b.platform.gpu.vk.as_ref().expect("vk"));
     let pool = std::sync::Arc::new(PixmapPool::with_limits(
         vk,
         PixmapPoolLimits {
@@ -943,7 +943,7 @@ fn pixmap_pool_eviction_and_idle_trim_free_the_memory() {
             ..PixmapPoolLimits::default()
         },
     ));
-    b.platform.pixmap_pool = Some(std::sync::Arc::clone(&pool));
+    b.platform.gpu.pixmap_pool = Some(std::sync::Arc::clone(&pool));
     let xids: Vec<u32> = sizes
         .iter()
         .map(|&(w, h)| b.create_pixmap(None, 32, w, h).expect("pixmap").as_raw())

@@ -252,7 +252,7 @@ impl KmsBackend {
         // First bind: promote. Requires Vulkan; if unavailable, report
         // not-exportable rather than erroring (bind still succeeds at the
         // protocol layer — see process_request's BindTexImageEXT TODO).
-        if self.platform.vk.is_none() {
+        if self.platform.gpu.vk.is_none() {
             return false;
         }
         // Real promotion (past the is_exportable no-op above) → 1 SyncBoundary
@@ -327,6 +327,7 @@ impl KmsBackend {
 
     pub(in crate::kms::render::backend) fn backend_export_glx_vendor_names(&self) -> &'static str {
         self.platform
+            .gpu
             .vk
             .as_ref()
             .map_or(yserver_protocol::x11::glx::VENDOR_NAMES, |vk| {
@@ -377,10 +378,15 @@ impl KmsBackend {
         let Some(renderer) = self.platform.selected_render_device() else {
             return Dri3Caps::unsupported();
         };
-        if renderer.render_node_device.is_none() || self.platform.vk.is_none() {
+        if renderer.render_node_device.is_none() || self.platform.gpu.vk.is_none() {
             return Dri3Caps::unsupported();
         }
-        let vk = self.platform.vk.as_ref().expect("vk Some by branch above");
+        let vk = self
+            .platform
+            .gpu
+            .vk
+            .as_ref()
+            .expect("vk Some by branch above");
         // PixmapFromBuffer carries a client-chosen stride. The implicit-linear
         // import path validates it against the exact Vulkan layout per buffer;
         // a second PRIME renderer is therefore not a reason to hide DRI3.
@@ -419,7 +425,7 @@ impl KmsBackend {
         // it as a v2 Storage, allocate a fresh Pixmap entry in
         // the store. Pixmap exists as a real X resource so clients
         // can CopyArea / ChangePicture against it.
-        let Some(vk) = self.platform.vk.clone() else {
+        let Some(vk) = self.platform.gpu.vk.clone() else {
             return Err(io::Error::other("DRI3 import: Vulkan unavailable"));
         };
         let format = match (depth, bpp) {
@@ -538,7 +544,7 @@ impl KmsBackend {
         depth: u8,
         bpp: u8,
     ) -> (Vec<u64>, Vec<u64>) {
-        let Some(vk) = self.platform.vk.as_ref() else {
+        let Some(vk) = self.platform.gpu.vk.as_ref() else {
             return (vec![0], vec![0]);
         };
         // Map (depth, bpp) to a vk::Format. Phase 4.2 RGB single-
@@ -626,7 +632,7 @@ impl KmsBackend {
         {
             // promote_drawable_exportable needs &mut self.engine/platform/store,
             // so we must not hold any shared borrow across this call.
-            if self.platform.vk.is_none() {
+            if self.platform.gpu.vk.is_none() {
                 return Err(io::Error::other("DRI3 export: Vulkan unavailable"));
             }
             self.engine
@@ -637,6 +643,7 @@ impl KmsBackend {
         // Re-fetch after promotion (storage has been swapped).
         let vk = self
             .platform
+            .gpu
             .vk
             .as_ref()
             .ok_or_else(|| io::Error::other("DRI3 export: Vulkan unavailable"))?;
@@ -734,7 +741,7 @@ impl KmsBackend {
             log::debug!("DRI3 FenceFromFD 0x{fence_xid:x}: imported as xshmfence");
             return Ok(());
         }
-        let Some(vk) = self.platform.vk.as_ref() else {
+        let Some(vk) = self.platform.gpu.vk.as_ref() else {
             return Err(io::Error::other(
                 "DRI3 FenceFromFD: fd isn't xshmfence and Vulkan is unavailable",
             ));
@@ -841,7 +848,7 @@ impl KmsBackend {
             .ok_or_else(|| {
                 io::Error::other(format!("DRI3 FDFromFence: unknown fence 0x{fence_xid:x}"))
             })?;
-        let Some(vk) = self.platform.vk.as_ref() else {
+        let Some(vk) = self.platform.gpu.vk.as_ref() else {
             return Err(io::Error::other("DRI3 FDFromFence: Vulkan unavailable"));
         };
         crate::kms::vk::sync::export_sync_file(vk, arc.semaphore())

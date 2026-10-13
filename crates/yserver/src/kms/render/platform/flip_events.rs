@@ -467,7 +467,7 @@ impl PlatformBackend {
             copied.release_completed_source(presented);
         }
         if copied_ownership_failed {
-            self.renderer_failed = true;
+            self.gpu.renderer_failed = true;
         }
 
         let logged_first = self

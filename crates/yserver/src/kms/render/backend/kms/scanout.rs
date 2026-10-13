@@ -1721,7 +1721,7 @@ impl KmsBackend {
             return;
         }
         for completion in completions {
-            if self.platform.renderer_failed {
+            if self.platform.gpu.renderer_failed {
                 break;
             }
             if !self
@@ -1730,7 +1730,7 @@ impl KmsBackend {
             {
                 self.telemetry.record_missed_pageflip();
             }
-            if self.platform.renderer_failed {
+            if self.platform.gpu.renderer_failed {
                 break;
             }
         }
@@ -1851,7 +1851,7 @@ impl KmsBackend {
         self.poll_pending_retire_with_invalidate();
         // #196: destroy pixmap-pool entries idle past the eviction age, so
         // a burst drains back down; `next_wakeup` wakes us for it.
-        if let Some(pool) = self.platform.pixmap_pool.as_ref() {
+        if let Some(pool) = self.platform.gpu.pixmap_pool.as_ref() {
             pool.trim_idle(std::time::Instant::now());
         }
         // Diagnostic: drive the 1Hz telemetry emit from here too,
@@ -1946,6 +1946,7 @@ impl KmsBackend {
             .chain(self.engine.open_frame_timeout_deadline())
             .chain(
                 self.platform
+                    .gpu
                     .pixmap_pool
                     .as_ref()
                     .and_then(|pool| pool.next_trim_deadline()),
@@ -1974,7 +1975,7 @@ impl KmsBackend {
         // gates below so we exit even while VT-away / DPMS-off. Sends
         // `Message::Shutdown`, which the core loop drains next iteration,
         // so this fires ~once rather than per-frame.
-        if self.platform.renderer_failed {
+        if self.platform.gpu.renderer_failed {
             log::error!(
                 "kms: renderer device lost (GPU reset) — requesting clean shutdown \
                  so the display manager can respawn on a fresh device"
@@ -2287,7 +2288,7 @@ impl KmsBackend {
             Dst::server_internal(id),
             rect,
             default_window_init_color(24),
-        ) && self.platform.vk.is_some()
+        ) && self.platform.gpu.vk.is_some()
         {
             log::warn!("render get_overlay_window: initial fill failed: {e:?}");
         }

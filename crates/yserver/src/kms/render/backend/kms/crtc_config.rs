@@ -579,6 +579,7 @@ impl KmsBackend {
 
         if self
             .platform
+            .gpu
             .vk
             .as_ref()
             .is_some_and(|vk| vk.is_software_rasterizer())
@@ -957,6 +958,7 @@ impl KmsBackend {
         if mode.is_some()
             && self
                 .platform
+                .gpu
                 .vk
                 .as_ref()
                 .is_some_and(|vk| vk.is_software_rasterizer())

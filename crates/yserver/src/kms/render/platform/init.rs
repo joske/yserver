@@ -7,7 +7,7 @@ use crate::{
         },
         render::{
             platform::{
-                BoGenerationEntry, CopiedScanoutError, CopyFreeScanoutError, FencePool,
+                BoGenerationEntry, CopiedScanoutError, CopyFreeScanoutError, FencePool, GpuCore,
                 InitialScanoutRollbackGuard, KmsCursorState, KmsDevice, PlatformBackend,
                 RenderDevice, RollbackScanoutOutput, SCANOUT_POOL_DEPTH, WAKEUP_EVENTFD_TOKEN,
                 cursor::initialize_cursor_plane_for_device,
@@ -737,25 +737,27 @@ impl PlatformBackend {
             scanout_render_completion_epfd,
             pending_scanout_render_completions: std::collections::VecDeque::new(),
             next_scanout_render_job_id: 1,
-            vk: Some(vk),
             scanout_readback_op: None,
-            ops_command_pool: Some(ops_command_pool),
-            fence_pool: Some(fence_pool),
+            gpu: GpuCore {
+                vk: Some(vk),
+                ops_command_pool: Some(ops_command_pool),
+                fence_pool: Some(fence_pool),
+                pixmap_pool,
+                renderer_failed: false,
+                submit_group,
+                last_flush_outcome: None,
+                force_next_submit_failure: false,
+                next_submit_cause: None,
+                force_next_frame_record_failure: false,
+                queue_submits: 0,
+            },
             scanout_readback: None,
-            pixmap_pool,
             copy_vk_contexts,
             scanout_pools,
             bo_generations,
             next_present_generation: 0,
             first_pageflip_logged,
-            renderer_failed: false,
             shutting_down: false,
-            submit_group,
-            last_flush_outcome: None,
-            force_next_submit_failure: false,
-            next_submit_cause: None,
-            force_next_frame_record_failure: false,
-            queue_submits: 0,
         })
     }
 
@@ -858,25 +860,27 @@ impl PlatformBackend {
             scanout_render_completion_epfd,
             pending_scanout_render_completions: std::collections::VecDeque::new(),
             next_scanout_render_job_id: 1,
-            vk: None,
             scanout_readback_op: None,
-            ops_command_pool: None,
-            fence_pool: None,
+            gpu: GpuCore {
+                vk: None,
+                ops_command_pool: None,
+                fence_pool: None,
+                pixmap_pool: None,
+                renderer_failed: false,
+                submit_group: SubmitGroup::new(),
+                last_flush_outcome: None,
+                force_next_submit_failure: false,
+                next_submit_cause: None,
+                force_next_frame_record_failure: false,
+                queue_submits: 0,
+            },
             scanout_readback: None,
-            pixmap_pool: None,
             copy_vk_contexts: HashMap::new(),
             scanout_pools: vec![None],
             bo_generations: vec![Vec::new()],
             next_present_generation: 0,
             first_pageflip_logged: vec![false],
-            renderer_failed: false,
             shutting_down: false,
-            submit_group: SubmitGroup::new(),
-            last_flush_outcome: None,
-            force_next_submit_failure: false,
-            next_submit_cause: None,
-            force_next_frame_record_failure: false,
-            queue_submits: 0,
         }
     }
 
@@ -898,6 +902,6 @@ impl PlatformBackend {
         for (output, route) in self.outputs.iter_mut().zip(routes) {
             output.scanout_route = route;
         }
-        self.vk = Some(vk);
+        self.gpu.vk = Some(vk);
     }
 }

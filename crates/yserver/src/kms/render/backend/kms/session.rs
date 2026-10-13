@@ -94,6 +94,7 @@ impl KmsBackend {
         let scene = SceneCompositor::new(&platform)
             .map_err(|e| io::Error::other(format!("render SceneCompositor::new failed: {e:?}")))?;
         let dmabuf_export_supported = platform
+            .gpu
             .vk
             .as_ref()
             .is_some_and(probe_dmabuf_export_support);

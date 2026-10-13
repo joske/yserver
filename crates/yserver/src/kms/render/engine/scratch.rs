@@ -167,7 +167,7 @@ impl RenderEngine {
         // ENTRY PRELUDE — same as copy_area/masked_copy_area: renderer guard +
         // flush_render_batch BEFORE any open-frame mutation, so the refresh op is
         // chronologically ordered after any pending render batch.
-        if platform.renderer_failed {
+        if platform.gpu.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
         self.flush_render_batch(store, platform, RenderFlushReason::Other)?;

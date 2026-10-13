@@ -75,7 +75,7 @@ impl RenderEngine {
             return Ok(());
         }
         // Phase B.3 (N9): renderer_failed check before any open-frame mutation.
-        if platform.renderer_failed {
+        if platform.gpu.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
         // Phase B.3 (N9): flush pending_render_batch at entry. May close an
@@ -180,7 +180,7 @@ impl RenderEngine {
         let Some(inner) = self.inner.as_mut() else {
             return Err(RenderError::NoVk);
         };
-        if platform.renderer_failed {
+        if platform.gpu.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
         if inner.logic_fill_caches.contains_key(&color_format) {
@@ -294,7 +294,7 @@ impl RenderEngine {
         if matches!(function, GcFunction::NoOp) {
             return Ok(());
         }
-        if platform.renderer_failed {
+        if platform.gpu.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
         self.flush_render_batch(store, platform, RenderFlushReason::Fill)?;
@@ -444,7 +444,7 @@ impl RenderEngine {
             return Ok(());
         }
         // Phase B.3 (N9): renderer_failed check before any open-frame mutation.
-        if platform.renderer_failed {
+        if platform.gpu.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
         // Phase B.3 (N9): flush pending_render_batch at entry. May close an
@@ -632,7 +632,7 @@ impl RenderEngine {
             return Ok(());
         }
         // renderer_failed check before any open-frame mutation.
-        if platform.renderer_failed {
+        if platform.gpu.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
         // Flush pending_render_batch at entry. May close an open frame
@@ -876,7 +876,7 @@ impl RenderEngine {
         if src_rect.extent.width == 0 || src_rect.extent.height == 0 {
             return Ok(());
         }
-        if platform.renderer_failed {
+        if platform.gpu.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
         // N9: flush pending_render_batch at entry.

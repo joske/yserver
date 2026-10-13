@@ -36,7 +36,7 @@ impl RenderEngine {
         let Some(inner) = self.inner.as_mut() else {
             return Err(RenderError::NoVk);
         };
-        if platform.renderer_failed {
+        if platform.gpu.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
         if inner.trap_pipeline.is_none() {
@@ -137,7 +137,7 @@ impl RenderEngine {
         // N9 order: renderer_failed check.
         {
             let _inner = self.inner.as_ref().ok_or(RenderError::NoVk)?;
-            if platform.renderer_failed {
+            if platform.gpu.renderer_failed {
                 return Err(RenderError::RendererFailed);
             }
         }

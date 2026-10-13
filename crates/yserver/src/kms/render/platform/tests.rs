@@ -1867,7 +1867,7 @@ fn for_tests_constructs() {
     let p = PlatformBackend::for_tests();
     assert_eq!(p.fb_dimensions(), (800, 600));
     assert_eq!(p.outputs.len(), 1);
-    assert!(p.vk.is_none()); // for_tests skips Vk
+    assert!(p.gpu.vk.is_none()); // for_tests skips Vk
     let fds = p.poll_fds();
     // No input_ctx, one DRM fd.
     assert!(fds.iter().any(|(_, k)| matches!(k, BackendFdKind::Drm)));
@@ -2069,7 +2069,7 @@ fn flush_submit_group_empty_is_noop() {
 #[cfg(test)]
 impl PlatformBackend {
     pub(crate) fn submit_group_max_size_for_tests(&self) -> usize {
-        self.submit_group.max_size()
+        self.gpu.submit_group.max_size()
     }
 
     pub(crate) fn queue_submit2_count_for_tests(&self) -> u64 {
@@ -2077,7 +2077,7 @@ impl PlatformBackend {
     }
 
     pub(crate) fn force_next_submit_failure_for_tests(&mut self) {
-        self.force_next_submit_failure = true;
+        self.gpu.force_next_submit_failure = true;
     }
 }
 

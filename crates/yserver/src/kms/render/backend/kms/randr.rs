@@ -1340,7 +1340,7 @@ impl KmsBackend {
                                     24,
                                     PlatformBackend::format_for_depth(24),
                                 ),
-                            ) && self.platform.vk.is_some()
+                            ) && self.platform.gpu.vk.is_some()
                             {
                                 log::warn!(
                                     "render apply_virtual_screen_extent: root fill failed: {e:?}"
@@ -1422,7 +1422,7 @@ impl KmsBackend {
                                 Dst::server_internal(new_cow_id),
                                 rect,
                                 default_window_init_color(24),
-                            ) && self.platform.vk.is_some()
+                            ) && self.platform.gpu.vk.is_some()
                             {
                                 log::warn!(
                                     "render apply_virtual_screen_extent: COW init fill failed: {e:?}"

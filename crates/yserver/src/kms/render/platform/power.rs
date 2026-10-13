@@ -22,7 +22,7 @@ impl PlatformBackend {
         // comment in the plan refers to the *practical* upper bound the
         // driver enforces on a wedged device; real quiescence is typically
         // sub-millisecond.
-        if let Some(vk) = self.vk.as_ref() {
+        if let Some(vk) = self.gpu.vk.as_ref() {
             let result = unsafe { vk.device.device_wait_idle() };
             if let Err(e) = result {
                 log::warn!("kms: wait_idle_bounded: device_wait_idle failed: {e:?}");
@@ -59,7 +59,7 @@ impl PlatformBackend {
         // image/memory/view triples don't leak through the
         // VkContext destruction path. Safe to drain here: every
         // in-flight CB has been waited on by device_wait_idle.
-        if let Some(pool) = self.pixmap_pool.as_ref() {
+        if let Some(pool) = self.gpu.pixmap_pool.as_ref() {
             pool.drain();
         }
 
@@ -183,7 +183,7 @@ impl PlatformBackend {
                             "dpms_set_outputs_active(true): copied ownership ledger failed for \
                              output {i} bo {bo_idx}: {error}"
                         );
-                        self.renderer_failed = true;
+                        self.gpu.renderer_failed = true;
                         if first_err.is_none() {
                             first_err = Some(error);
                         }

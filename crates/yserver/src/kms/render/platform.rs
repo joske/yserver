@@ -525,6 +525,60 @@ where
     armed: bool,
 }
 
+/// The GPU-only half of [`PlatformBackend`]: the Vulkan device, its
+/// command and fence pools, the pixmap pool and the submit group.
+pub(crate) struct GpuCore {
+    // Vulkan side. `Option` only to support test fixtures that
+    // skip Vk init (`for_tests`). Production `open_with_commit`
+    // always returns `Some`. v2 has no pixman fallback.
+    pub(crate) vk: Option<Arc<VkContext>>,
+    /// Wrapped in `Option` for the same reason. Drop order
+    /// matters: ops_command_pool BEFORE fence_pool BEFORE vk
+    /// (handled by struct field order — Rust drops fields in
+    /// declaration order).
+    pub(crate) ops_command_pool: Option<OpsCommandPool>,
+    pub(crate) fence_pool: Option<FencePool>,
+
+    /// Stage 3f.10: recycled `(image, view, memory)` triples for
+    /// CreatePixmap. Reuses v1's `PixmapPool` verbatim — its
+    /// `try_take` / `try_return` API + bucket-cap + size-cap
+    /// logic is backend-agnostic. Bypassed by the test fixture
+    /// (`for_tests`) and on `for_tests_with_vk` (the harness
+    /// constructs `RenderEngine` directly without going through
+    /// `open_with_commit`).
+    pub(crate) pixmap_pool: Option<Arc<crate::kms::vk::pixmap_pool::PixmapPool>>,
+
+    /// Latched on any submit-time / pool-time Vk error. Once
+    /// true, the renderer is in a stuck state and the next
+    /// composite tick should bail.
+    pub(crate) renderer_failed: bool,
+
+    /// Phase A: multi-CB accumulator. Populated by Task 3 callers;
+    /// flushed via `flush_submit_group`.
+    submit_group: SubmitGroup,
+
+    /// Phase A: last `FlushOutcome` produced by `flush_submit_group`.
+    /// Consumed exactly once by `take_last_flush_outcome`.
+    last_flush_outcome: Option<FlushOutcome>,
+
+    /// Test-only: when true, the next `flush_submit_group` call will
+    /// route through `abort_flush` instead of the real
+    /// `vkQueueSubmit2`. Reset to false after consumption.
+    /// Always compiled (not cfg(test)) so integration-test pub wrappers
+    /// on `KmsBackend` can reach it from the external test crate.
+    force_next_submit_failure: bool,
+    /// #214 telemetry: the cause the next group flush is counted under
+    /// (set by a frame close); `None` maps the `FlushReason`.
+    next_submit_cause: Option<crate::kms::vk::submit_stats::SubmitCause>,
+    /// Fault injection like `force_next_submit_failure`: the next frame
+    /// close fails while recording, before anything is submitted.
+    force_next_frame_record_failure: bool,
+    /// Real `vkQueueSubmit2` calls made through this platform's paint
+    /// group and Present signal paths (per instance, so parallel tests
+    /// can assert exact counts).
+    queue_submits: u64,
+}
+
 /// v2's real DRM/Vk/libinput owner. Replaces the flat field set
 /// that Stage 1b's `KmsBackend` carried.
 pub(crate) struct PlatformBackend {
@@ -599,32 +653,14 @@ pub(crate) struct PlatformBackend {
     pending_scanout_render_completions: std::collections::VecDeque<PendingScanoutRenderCompletion>,
     next_scanout_render_job_id: u64,
 
-    // Vulkan side. `Option` only to support test fixtures that
-    // skip Vk init (`for_tests`). Production `open_with_commit`
-    // always returns `Some`. v2 has no pixman fallback.
-    pub(crate) vk: Option<Arc<VkContext>>,
     /// Command buffer + fence reused by scanout reads; allocated from
     /// `ops_command_pool`, so declared before it to drop first.
     pub(crate) scanout_readback_op: Option<crate::kms::vk::ops::ReusableOneShot>,
-    /// Wrapped in `Option` for the same reason. Drop order
-    /// matters: ops_command_pool BEFORE fence_pool BEFORE vk
-    /// (handled by struct field order — Rust drops fields in
-    /// declaration order).
-    pub(crate) ops_command_pool: Option<OpsCommandPool>,
-    pub(crate) fence_pool: Option<FencePool>,
+    pub(crate) gpu: GpuCore,
     /// Reused `HOST_CACHED`-preferred destination for synchronous scanout
     /// reads (root GetImage / ShmGetImage). Idle between reads, which wait
     /// on their own fence; grown on demand. Holds its own `Arc<VkContext>`.
     pub(crate) scanout_readback: Option<crate::kms::render::engine::StagingBuffer>,
-
-    /// Stage 3f.10: recycled `(image, view, memory)` triples for
-    /// CreatePixmap. Reuses v1's `PixmapPool` verbatim — its
-    /// `try_take` / `try_return` API + bucket-cap + size-cap
-    /// logic is backend-agnostic. Bypassed by the test fixture
-    /// (`for_tests`) and on `for_tests_with_vk` (the harness
-    /// constructs `RenderEngine` directly without going through
-    /// `open_with_commit`).
-    pub(crate) pixmap_pool: Option<Arc<crate::kms::vk::pixmap_pool::PixmapPool>>,
 
     /// Minimal sink-side Vulkan transfer contexts, keyed by the exact renderer
     /// endpoint whose advertised primary identity matches a KMS device.
@@ -651,36 +687,7 @@ pub(crate) struct PlatformBackend {
     /// logged for this output? Mirrors v1's `first_pageflip_logged`.
     pub(crate) first_pageflip_logged: Vec<bool>,
 
-    /// Latched on any submit-time / pool-time Vk error. Once
-    /// true, the renderer is in a stuck state and the next
-    /// composite tick should bail.
-    pub(crate) renderer_failed: bool,
     pub(crate) shutting_down: bool,
-
-    /// Phase A: multi-CB accumulator. Populated by Task 3 callers;
-    /// flushed via `flush_submit_group`.
-    submit_group: SubmitGroup,
-
-    /// Phase A: last `FlushOutcome` produced by `flush_submit_group`.
-    /// Consumed exactly once by `take_last_flush_outcome`.
-    last_flush_outcome: Option<FlushOutcome>,
-
-    /// Test-only: when true, the next `flush_submit_group` call will
-    /// route through `abort_flush` instead of the real
-    /// `vkQueueSubmit2`. Reset to false after consumption.
-    /// Always compiled (not cfg(test)) so integration-test pub wrappers
-    /// on `KmsBackend` can reach it from the external test crate.
-    force_next_submit_failure: bool,
-    /// #214 telemetry: the cause the next group flush is counted under
-    /// (set by a frame close); `None` maps the `FlushReason`.
-    next_submit_cause: Option<crate::kms::vk::submit_stats::SubmitCause>,
-    /// Fault injection like `force_next_submit_failure`: the next frame
-    /// close fails while recording, before anything is submitted.
-    force_next_frame_record_failure: bool,
-    /// Real `vkQueueSubmit2` calls made through this platform's paint
-    /// group and Present signal paths (per instance, so parallel tests
-    /// can assert exact counts).
-    queue_submits: u64,
 }
 
 /// One live scanout route a connector snapshot removed, with the layout

@@ -639,7 +639,7 @@ fn read_scanout_region_named(
         }
     }
 
-    let Some(vk) = backend.platform.vk.as_ref().cloned() else {
+    let Some(vk) = backend.platform.gpu.vk.as_ref().cloned() else {
         return Err(io::Error::other("no vulkan context"));
     };
     let Some(pool_handle) = backend.platform.ops_command_pool_handle() else {
@@ -800,7 +800,7 @@ fn read_scanout_region_named(
             // executed work (including an ownership acquire) and is not
             // reused under an uncertain state. DEVICE_LOST is fatal on the
             // shared path too.
-            backend.platform.renderer_failed = true;
+            backend.platform.gpu.renderer_failed = true;
         }
         return Err(io::Error::other(format!("scanout copy submit: {e:?}")));
     }

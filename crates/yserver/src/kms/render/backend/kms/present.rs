@@ -227,7 +227,7 @@ impl KmsBackend {
             Err(e) => log::warn!("wakeup_eventfd read: {e}"),
         }
 
-        let renderer_failed = self.platform.renderer_failed;
+        let renderer_failed = self.platform.gpu.renderer_failed;
         if renderer_failed && !self.pending_present_batches.is_empty() {
             let pending_events: usize = self
                 .pending_present_batches
@@ -240,7 +240,7 @@ impl KmsBackend {
         // Clone the Arc<VkContext> so the loop body can borrow `self`
         // mutably (for `dri3_*_via_handle`) without a conflict with
         // `self.platform.vk`.
-        let vk = self.platform.vk.as_ref().cloned();
+        let vk = self.platform.gpu.vk.as_ref().cloned();
 
         let mut completed = Vec::new();
         while let Some(front) = self.pending_present_batches.front() {

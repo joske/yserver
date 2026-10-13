@@ -178,7 +178,7 @@ impl PlatformBackend {
         if let Some(renderer) = self.selected_render_device() {
             return Ok(renderer.scanout_route_to(kms));
         }
-        if self.vk.is_none() {
+        if self.gpu.vk.is_none() {
             return Ok(ScanoutRoute::new(
                 RenderDeviceId::UnverifiedFallback,
                 kms.key,

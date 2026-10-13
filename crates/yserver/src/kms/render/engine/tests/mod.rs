@@ -727,9 +727,9 @@ fn live_platform() -> Option<PlatformBackend> {
         Err(_) => return None,
     };
     let fence_pool = crate::kms::render::platform::FencePool::new(Arc::clone(&vk));
-    p.vk = Some(vk);
-    p.ops_command_pool = Some(ops_pool);
-    p.fence_pool = Some(fence_pool);
+    p.gpu.vk = Some(vk);
+    p.gpu.ops_command_pool = Some(ops_pool);
+    p.gpu.fence_pool = Some(fence_pool);
     Some(p)
 }
 

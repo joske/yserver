@@ -1143,9 +1143,9 @@ fn mem_accounting_tracks_drawable_storage_by_use() {
 
     // Pool round trip: a return parks the memory as PoolIdle, a hit
     // hands the same memory back as Pixmap.
-    let vk = std::sync::Arc::clone(b.platform.vk.as_ref().expect("vk"));
+    let vk = std::sync::Arc::clone(b.platform.gpu.vk.as_ref().expect("vk"));
     let pool = std::sync::Arc::new(crate::kms::vk::pixmap_pool::PixmapPool::new(vk));
-    b.platform.pixmap_pool = Some(std::sync::Arc::clone(&pool));
+    b.platform.gpu.pixmap_pool = Some(std::sync::Arc::clone(&pool));
     let small = b.create_pixmap(None, 32, 61, 59).expect("small").as_raw();
     let small_mem = memory_of(&b, small);
     assert_eq!(

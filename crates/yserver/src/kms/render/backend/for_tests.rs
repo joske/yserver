@@ -283,8 +283,8 @@ impl KmsBackend {
         })?;
         let fence_pool = crate::kms::render::platform::FencePool::new(Arc::clone(&vk));
         base.platform.attach_test_vk_context(vk);
-        base.platform.ops_command_pool = Some(ops_pool);
-        base.platform.fence_pool = Some(fence_pool);
+        base.platform.gpu.ops_command_pool = Some(ops_pool);
+        base.platform.gpu.fence_pool = Some(fence_pool);
         // Replace the stub engine with a live one now that Vk
         // is attached. Scene compositor stays stubbed (no
         // scanout pool on the test fixture).
@@ -352,8 +352,8 @@ impl KmsBackend {
                 n
             ]);
         }
-        base.platform.ops_command_pool = Some(ops_pool);
-        base.platform.fence_pool = Some(fence_pool);
+        base.platform.gpu.ops_command_pool = Some(ops_pool);
+        base.platform.gpu.fence_pool = Some(fence_pool);
         base.platform.scanout_pools = scanout_pools;
         base.platform.bo_generations = bo_generations;
         base.engine =
@@ -435,7 +435,7 @@ impl KmsBackend {
     /// (re-import + staging copy) against the same device.
     #[doc(hidden)]
     pub fn test_vk_arc(&self) -> Option<std::sync::Arc<crate::kms::vk::device::VkContext>> {
-        self.platform.vk.as_ref().map(std::sync::Arc::clone)
+        self.platform.gpu.vk.as_ref().map(std::sync::Arc::clone)
     }
 
     /// GLX-TFP (Task 1.2) test shim: promote a server-owned pixmap onto
@@ -456,6 +456,7 @@ impl KmsBackend {
             .map_err(|e| io::Error::other(format!("promote_drawable_exportable: {e:?}")))?;
         let vk = self
             .platform
+            .gpu
             .vk
             .as_ref()
             .ok_or_else(|| io::Error::other("promote: no VkContext"))?;
@@ -709,7 +710,7 @@ impl KmsBackend {
     /// test.
     #[doc(hidden)]
     pub fn set_renderer_failed_for_tests(&mut self, v: bool) {
-        self.platform.renderer_failed = v;
+        self.platform.gpu.renderer_failed = v;
     }
 
     /// Phase A T6: flush the engine's SubmitGroup with a
@@ -1170,6 +1171,7 @@ impl KmsBackend {
     ) -> Result<ash::vk::DescriptorSetLayout, ash::vk::Result> {
         let vk = self
             .platform
+            .gpu
             .vk
             .as_ref()
             .ok_or(ash::vk::Result::ERROR_INITIALIZATION_FAILED)?;
@@ -1191,7 +1193,7 @@ impl KmsBackend {
         &self,
         layout: ash::vk::DescriptorSetLayout,
     ) {
-        let Some(vk) = self.platform.vk.as_ref() else {
+        let Some(vk) = self.platform.gpu.vk.as_ref() else {
             return;
         };
         // SAFETY: layout was created by the corresponding
@@ -1282,7 +1284,7 @@ impl KmsBackend {
     /// `pub` so the `acceptance` integration test can assert the
     /// fatal-failure invariant without direct field access.
     pub fn platform_renderer_failed_for_tests(&self) -> bool {
-        self.platform.renderer_failed
+        self.platform.gpu.renderer_failed
     }
 
     /// Phase A T10: count of in-flight submits awaiting retirement.

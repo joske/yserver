@@ -359,6 +359,7 @@ impl PlatformBackend {
         &self,
     ) -> Result<PresentCompletionSignal, vk::Result> {
         let vk = self
+            .gpu
             .vk
             .as_ref()
             .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
@@ -377,6 +378,7 @@ impl PlatformBackend {
     /// fence creation fails.
     pub(crate) fn acquire_fence_ticket(&self) -> Result<FenceTicket, vk::Result> {
         let pool = self
+            .gpu
             .fence_pool
             .as_ref()
             .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
@@ -389,11 +391,12 @@ impl PlatformBackend {
     /// a failed-submit BO forever.
     pub(crate) fn refresh_fence_pool_failure(&mut self) {
         if self
+            .gpu
             .fence_pool
             .as_ref()
             .is_some_and(FencePool::renderer_failed)
         {
-            self.renderer_failed = true;
+            self.gpu.renderer_failed = true;
         }
     }
 }

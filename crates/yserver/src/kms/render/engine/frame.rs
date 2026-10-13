@@ -705,7 +705,7 @@ impl RenderEngine {
                 }
             }
             rollback_pre_submit(store, &mut open_frame);
-            platform.renderer_failed = true;
+            platform.gpu.renderer_failed = true;
             let inner_post = self.inner.as_mut().expect("inner");
             rollback_atlas(
                 inner_post,
@@ -780,7 +780,7 @@ impl RenderEngine {
                 }
             }
             rollback_pre_submit(store, &mut open_frame);
-            platform.renderer_failed = true;
+            platform.gpu.renderer_failed = true;
             let inner_post = self.inner.as_mut().expect("inner");
             rollback_atlas(
                 inner_post,

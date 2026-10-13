@@ -70,7 +70,7 @@ impl KmsBackend {
                 24,
                 PlatformBackend::format_for_depth(24),
             ),
-        ) && self.platform.vk.is_some()
+        ) && self.platform.gpu.vk.is_some()
         {
             log::warn!("render init_root_storage: initial root fill failed: {e:?}");
         }
