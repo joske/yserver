@@ -1,8 +1,8 @@
 use crate::kms::render::{
-    platform::{PlatformBackend, ReadyScanoutRenderCompletion},
+    platform::PlatformBackend,
     scene::{
         FailedSubmitBo, InFlightStage, OutputCursorMode, OutputSceneState, OutputSink,
-        SceneCompositor, SceneCompositorInner,
+        RenderCompletion, SceneCompositor, SceneCompositorInner,
         cursor::{
             apply_cursor_transition_on_retire, force_cursor_retry_repaint,
             resolve_retired_cursor_state, update_force_show_retry_version,
@@ -257,7 +257,7 @@ impl SceneCompositor {
     /// stale notification never retargets a rebuilt output vector.
     pub(crate) fn handle_scanout_render_completion(
         &mut self,
-        completion: ReadyScanoutRenderCompletion,
+        completion: RenderCompletion,
         platform: &mut PlatformBackend,
     ) -> bool {
         let Some(inner) = self.inner.as_mut() else {
@@ -269,28 +269,27 @@ impl SceneCompositor {
 
 pub(super) fn handle_scanout_render_completion_inner(
     inner: &mut SceneCompositorInner,
-    completion: ReadyScanoutRenderCompletion,
+    completion: RenderCompletion,
     platform: &mut PlatformBackend,
 ) -> bool {
     if platform.gpu().renderer_failed {
         return false;
     }
-    let ReadyScanoutRenderCompletion {
+    let RenderCompletion {
         job_id,
-        output_key,
+        output,
         bo_idx,
         fd,
     } = completion;
-    let Some(output_idx) = platform
-        .outputs
-        .iter()
-        .position(|output| output.key == output_key)
-    else {
-        log::debug!(
-            "render copied scanout: completion job {job_id} targeted removed output \
-                 {output_key:?}",
-        );
-        return false;
+    let output_idx = match output {
+        Ok(output_idx) => output_idx,
+        Err(output_key) => {
+            log::debug!(
+                "render copied scanout: completion job {job_id} targeted removed output \
+                     {output_key}",
+            );
+            return false;
+        }
     };
     let expected = inner
         .outputs
@@ -310,7 +309,7 @@ pub(super) fn handle_scanout_render_completion_inner(
         return false;
     }
 
-    match platform.submit_copied_scanout(output_idx, bo_idx, fd) {
+    match platform.submit_copied(output_idx, bo_idx, fd) {
         Ok(()) => {
             if let Some(ack) = inner.outputs[output_idx].pending_acks.front_mut() {
                 ack.stage = InFlightStage::KmsFlipPending;

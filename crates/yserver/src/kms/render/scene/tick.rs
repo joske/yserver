@@ -286,7 +286,7 @@ impl SceneCompositor {
         // Such a job has no pollable fd, so drain only after every composed
         // output installed its PendingAck; exact job/BO matching is then live
         // before the immediate B submission runs.
-        for completion in platform.drain_scanout_render_completions() {
+        for completion in platform.drain_render_completions() {
             if platform.gpu().renderer_failed {
                 break;
             }
@@ -1270,7 +1270,7 @@ fn tick_one_output(
     }
     let compose_result = match render_result {
         Ok(Some(completion)) => platform
-            .register_scanout_render_completion(output_key, token.bo_idx, completion)
+            .register_render_completion(output_idx, token.bo_idx, completion)
             .map(|job_id| InFlightStage::WaitingForRenderCompletion { job_id })
             .map_err(PresentError::Io),
         Ok(None) => Ok(InFlightStage::KmsFlipPending),

@@ -342,7 +342,7 @@ impl SceneCompositor {
         // fence ticket below still proves A's submitted command buffer is done
         // before descriptor slots are reset, and the platform subsequently
         // drains both devices before any copied pool is reset or dropped.
-        platform.clear_scanout_render_completions();
+        platform.clear_render_completions();
         let vk = inner.vk.clone();
         for (output_idx, o) in inner.outputs.iter_mut().enumerate() {
             // B.2-context fix (codex audit followup): wait for any

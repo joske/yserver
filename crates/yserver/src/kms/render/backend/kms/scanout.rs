@@ -1708,7 +1708,8 @@ impl KmsBackend {
         &mut self,
         _state: &mut ServerState,
     ) {
-        let completions = self.platform.drain_scanout_render_completions();
+        let completions =
+            crate::kms::render::scene::OutputSink::drain_render_completions(&mut self.platform);
         if !self.scanout_allowed() {
             // Draining avoids a readable aggregator spinning the core loop.
             // The suspend/topology lifecycle subsequently waits A, cancels
