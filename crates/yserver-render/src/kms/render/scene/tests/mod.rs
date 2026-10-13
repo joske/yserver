@@ -334,7 +334,7 @@ fn legacy_emit_window_subtree(
 ) {
     let debug_focus = scene_walk_debug_enabled_for(host_xid);
     // Stage 4 diagnostic: trace-level scene-walk decision per window.
-    // Enable with `RUST_LOG=yserver::kms::render::scene=trace`. The
+    // Enable with `RUST_LOG=yserver_render::kms::render::scene=trace`. The
     // top-level and descendant paths share this function so the
     // single trace site covers both. Format is greppable —
     // `render scene_walk xid=...: ...` — for `grep "render scene_walk"`
