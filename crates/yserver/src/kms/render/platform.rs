@@ -14,6 +14,7 @@
 //! - `cursor`: cursor-plane failure policy and `KmsCursorState`.
 //! - `flip_events`: DRM events, page flips, render completions.
 //! - `scanout_bos`: scanout BO lifecycle and copied submits.
+//! - `scene_sink`: the scene's `OutputSink` and `CursorPlaneSink`.
 //! - `connectors`: probe, enable/disable/remove, snapshot, layout.
 //! - `power`: bounded idle wait, `disable_output`, DPMS.
 //! - `tests`: unit tests.
@@ -31,6 +32,7 @@ mod init;
 mod power;
 mod qualify;
 mod scanout_bos;
+mod scene_sink;
 
 #[cfg(test)]
 use connectors::*;
@@ -71,7 +73,7 @@ pub(crate) use crate::kms::{
 };
 
 // ────────────────────────────────────────────────────────────────
-// BoGenerationEntry / ScanoutBoToken / PageFlipRetirement —
+// BoGenerationEntry —
 // I6b retirement signal infra augmenting ScanoutBoPool's BoState.
 // ────────────────────────────────────────────────────────────────
 
@@ -89,30 +91,6 @@ pub(crate) struct BoGenerationEntry {
     /// contents became indeterminate. Cleared on next
     /// successful present.
     pub(crate) content_invalidated: bool,
-}
-
-/// Handle returned by `acquire_scanout_bo`. Carries the
-/// information the SceneCompositor needs to drive the
-/// buffer-age algorithm without poking at `ScanoutBoPool`
-/// internals.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ScanoutBoToken {
-    pub(crate) output_idx: usize,
-    pub(crate) bo_idx: usize,
-    pub(crate) extent: vk::Extent2D,
-    pub(crate) last_present_generation: Option<u64>,
-    pub(crate) content_invalidated: bool,
-}
-
-/// Returned by `on_page_flip_complete`. Identifies the BO that
-/// just retired (releasable for reuse on next acquire) and the
-/// BO that just went on-screen (caller advances its
-/// `last_present_generation`).
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct PageFlipRetirement {
-    pub(crate) retired_bo_idx: Option<usize>,
-    pub(crate) presented_bo_idx: usize,
-    pub(crate) generation: u64,
 }
 
 // ────────────────────────────────────────────────────────────────

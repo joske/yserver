@@ -37,6 +37,7 @@ mod for_tests;
 mod lifecycle;
 mod repaint;
 mod root_readback;
+mod sink;
 mod tick;
 mod transform;
 mod walk;
@@ -56,6 +57,7 @@ use flip::*;
 use lifecycle::drain_deferred_scene_resources;
 #[cfg(test)]
 use repaint::*;
+pub(crate) use sink::*;
 #[cfg(test)]
 use tick::*;
 #[cfg(test)]
@@ -975,7 +977,7 @@ enum Repaint {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ComposeSubmit {
+pub(crate) struct ComposeSubmit {
     descriptor_count: usize,
 }
 
@@ -1161,7 +1163,7 @@ struct ScalePass {
     into_target: bool,
 }
 
-trait ComposeRenderTarget {
+pub(crate) trait ComposeRenderTarget {
     fn image(&self) -> vk::Image;
     fn image_view(&self) -> vk::ImageView;
     fn command_buffer(&self) -> vk::CommandBuffer;

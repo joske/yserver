@@ -1,8 +1,11 @@
 use crate::kms::{
     backend::OutputKey,
-    render::platform::{
-        CrtcKey, DrainedPageFlipEvents, PageFlipRetirement, PendingScanoutRenderCompletion,
-        PlatformBackend, ReadyScanoutRenderCompletion, SequenceCompletion,
+    render::{
+        platform::{
+            CrtcKey, DrainedPageFlipEvents, PendingScanoutRenderCompletion, PlatformBackend,
+            ReadyScanoutRenderCompletion, SequenceCompletion,
+        },
+        scene::FlipRetirement,
     },
     vk::scanout::BoPhase,
 };
@@ -401,10 +404,7 @@ impl PlatformBackend {
     /// The caller (SceneCompositor) then advances the matching
     /// `bo_generations[output_idx][bo_idx].last_present_generation`
     /// via [`Self::commit_bo_present`].
-    pub(crate) fn on_page_flip_complete(
-        &mut self,
-        output_idx: usize,
-    ) -> Option<PageFlipRetirement> {
+    pub(crate) fn on_page_flip_complete(&mut self, output_idx: usize) -> Option<FlipRetirement> {
         self.debug_assert_scanout_pool_route(output_idx);
         let scanout = self.scanout_pools.get_mut(output_idx)?.as_mut()?;
         // First pass: find any BO currently `Pending`. Walk only
@@ -480,7 +480,7 @@ impl PlatformBackend {
         } else {
             log::debug!("render: pageflip complete on output {output_idx} (bo {presented})",);
         }
-        Some(PageFlipRetirement {
+        Some(FlipRetirement {
             retired_bo_idx: retired,
             presented_bo_idx: presented,
             generation: 0, // assigned by record_present; this is informational

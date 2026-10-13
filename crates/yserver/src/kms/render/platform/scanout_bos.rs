@@ -1,5 +1,5 @@
 use crate::kms::{
-    render::platform::{PlatformBackend, ScanoutBoToken},
+    render::{platform::PlatformBackend, scene::SlotToken},
     vk::scanout::{BoPhase, BoState, OutputScanout},
 };
 use ash::vk;
@@ -31,14 +31,14 @@ impl PlatformBackend {
     /// The token carries `last_present_generation` and
     /// `content_invalidated` so the buffer-age algorithm in
     /// SceneCompositor doesn't need to reach into the pool.
-    pub(crate) fn acquire_scanout_bo(&mut self, output_idx: usize) -> Option<ScanoutBoToken> {
+    pub(crate) fn acquire_scanout_bo(&mut self, output_idx: usize) -> Option<SlotToken> {
         self.debug_assert_scanout_pool_route(output_idx);
         let scanout = self.scanout_pools.get_mut(output_idx)?.as_mut()?;
         let gens = self.bo_generations.get(output_idx)?;
         for (bo_idx, bo) in scanout.display_pool().bos.iter().enumerate() {
             if bo.state.phase == BoPhase::Free {
                 let entry = gens.get(bo_idx).copied().unwrap_or_default();
-                return Some(ScanoutBoToken {
+                return Some(SlotToken {
                     output_idx,
                     bo_idx,
                     extent: vk::Extent2D {
