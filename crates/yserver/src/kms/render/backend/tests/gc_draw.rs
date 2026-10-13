@@ -10,8 +10,7 @@ use super::*;
 #[test]
 fn poly_line_origin_mode_offsets_correctly() {
     use crate::kms::{
-        backend::{bresenham_segment, read_i16_pair},
-        cpu_types::Rectangle16,
+        backend::read_i16_pair, cpu_types::Rectangle16, render::geometry::bresenham_segment,
     };
 
     // Path: (10, 10) → (10, 13) → (13, 13) — an L shape.

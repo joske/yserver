@@ -8,11 +8,11 @@
 //! the on-pixels and (`LineStyle::DoubleDash` only) the off-pixels.
 //!
 //! Width=0 + LineStyle::Solid + CapStyle::Butt + JoinStyle::Miter
-//! takes the fast path through `crate::kms::backend::bresenham_segment`
+//! takes the fast path through `crate::kms::render::geometry::bresenham_segment`
 //! for bit-identical output to the pre-stroke rasterizer. Anything
 //! else routes through the slow path: per on-sub-segment, build the
 //! closed stroke polygon (quad + caps + joins) and feed it through
-//! `crate::kms::backend::scanline_fill_polygon`.
+//! `crate::kms::render::geometry::scanline_fill_polygon`.
 
 use yserver_protocol::x11::gc::{ArcMode, CapStyle, JoinStyle, LineStyle};
 
@@ -195,7 +195,7 @@ pub fn stroke_path(
                     // Axis-aligned: shorten the endpoint one pixel toward p0.
                     let sx = (p1.0 - p0.0).signum();
                     let sy = (p1.1 - p0.1).signum();
-                    crate::kms::backend::bresenham_segment(
+                    crate::kms::render::geometry::bresenham_segment(
                         p0.0,
                         p0.1,
                         p1.0 - sx,
@@ -204,7 +204,7 @@ pub fn stroke_path(
                     );
                 } else {
                     // Diagonal: still per-pixel; pop exactly the terminal pixel.
-                    crate::kms::backend::bresenham_segment(
+                    crate::kms::render::geometry::bresenham_segment(
                         p0.0,
                         p0.1,
                         p1.0,
@@ -214,7 +214,13 @@ pub fn stroke_path(
                     out.fg_rects.pop();
                 }
             } else {
-                crate::kms::backend::bresenham_segment(p0.0, p0.1, p1.0, p1.1, &mut out.fg_rects);
+                crate::kms::render::geometry::bresenham_segment(
+                    p0.0,
+                    p0.1,
+                    p1.0,
+                    p1.1,
+                    &mut out.fg_rects,
+                );
             }
         }
         return out;
@@ -377,7 +383,7 @@ fn emit_thick_quad(
             (f64::from(p1.1) - ny * half).round() as i32,
         ),
     ];
-    crate::kms::backend::scanline_fill_polygon(&corners, out);
+    crate::kms::render::geometry::scanline_fill_polygon(&corners, out);
 }
 
 /// Append the start cap geometry for a segment.
@@ -447,7 +453,7 @@ fn emit_extension(p: (i32, i32), dir_out: (f64, f64), width: f64, out: &mut Vec<
             (tip.1 - ny * half).round() as i32,
         ),
     ];
-    crate::kms::backend::scanline_fill_polygon(&corners, out);
+    crate::kms::render::geometry::scanline_fill_polygon(&corners, out);
 }
 
 /// Round cap: half-disc of radius `width/2` centred at `p`, axis
@@ -467,7 +473,7 @@ fn emit_round_cap(p: (i32, i32), dir_out: (f64, f64), width: f64, out: &mut Vec<
         let y = f64::from(p.1) + radius * theta.sin();
         pts.push((x.round() as i32, y.round() as i32));
     }
-    crate::kms::backend::scanline_fill_polygon(&pts, out);
+    crate::kms::render::geometry::scanline_fill_polygon(&pts, out);
 }
 
 /// Insert a join wedge between two adjacent segments meeting at `p`,
@@ -502,7 +508,7 @@ fn emit_join(
                 (f64::from(p.0) + out_n2.0 * half).round() as i32,
                 (f64::from(p.1) + out_n2.1 * half).round() as i32,
             );
-            crate::kms::backend::scanline_fill_polygon(&[p, a, b], out);
+            crate::kms::render::geometry::scanline_fill_polygon(&[p, a, b], out);
         }
         JoinStyle::Round => {
             let radius = half;
@@ -529,7 +535,7 @@ fn emit_join(
                 pts.push((x.round() as i32, y.round() as i32));
             }
             let _ = &mut a;
-            crate::kms::backend::scanline_fill_polygon(&pts, out);
+            crate::kms::render::geometry::scanline_fill_polygon(&pts, out);
         }
         JoinStyle::Miter => {
             // Miter intersection point of the two outer offset edges.
@@ -576,7 +582,7 @@ fn emit_join(
                 (f64::from(p.0) + out_n2.0 * half).round() as i32,
                 (f64::from(p.1) + out_n2.1 * half).round() as i32,
             );
-            crate::kms::backend::scanline_fill_polygon(&[p, a, intersection, b], out);
+            crate::kms::render::geometry::scanline_fill_polygon(&[p, a, intersection, b], out);
         }
     }
 }
@@ -772,17 +778,17 @@ mod tests {
         // rects (matches Xorg; keeps rectangle outlines cheap and under the
         // root-overlay rect cap). Diagonals stay per-pixel.
         let mut h = Vec::new();
-        crate::kms::backend::bresenham_segment(10, 5, 2000, 5, &mut h);
+        crate::kms::render::geometry::bresenham_segment(10, 5, 2000, 5, &mut h);
         assert_eq!(h.len(), 1, "horizontal line is a single span, got {h:?}");
         assert_eq!((h[0].x, h[0].y, h[0].width, h[0].height), (10, 5, 1991, 1));
 
         let mut v = Vec::new();
-        crate::kms::backend::bresenham_segment(7, 100, 7, 8, &mut v);
+        crate::kms::render::geometry::bresenham_segment(7, 100, 7, 8, &mut v);
         assert_eq!(v.len(), 1, "vertical line is a single span, got {v:?}");
         assert_eq!((v[0].x, v[0].y, v[0].width, v[0].height), (7, 8, 1, 93));
 
         let mut d = Vec::new();
-        crate::kms::backend::bresenham_segment(0, 0, 3, 3, &mut d);
+        crate::kms::render::geometry::bresenham_segment(0, 0, 3, 3, &mut d);
         assert!(d.len() > 1, "diagonal stays per-pixel, got {d:?}");
     }
 

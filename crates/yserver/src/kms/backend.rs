@@ -13,8 +13,8 @@
 //!   poly_* dispatch.
 //! - `clip_rects_to_image`, consumed by v2's poly_line / poly_segment /
 //!   poly_arc / fill_poly lowering. The other rasterisation and RENDER
-//!   affine helpers live in `kms::render::geometry` and are re-exported
-//!   here.
+//!   affine helpers live in `kms::render::geometry`; `scanline_fill_polygon`
+//!   is re-exported here.
 //! - SHAPE / clip-mask helpers (`ClipMaskCache`,
 //!   `rasterize_pixmap_mask_to_rects`) consumed by v2's GC clip path.
 //! - `parse_add_glyphs` — RENDER AddGlyphs wire decode, consumed by
@@ -31,10 +31,7 @@ use std::{
     rc::Rc,
 };
 
-pub(crate) use crate::kms::render::geometry::{
-    bresenham_segment, compose_affines, pixman_transform_to_affine, repeat_to_shader_const,
-    scanline_fill_polygon,
-};
+pub(crate) use crate::kms::render::geometry::scanline_fill_polygon;
 use crate::{
     drm,
     kms::{

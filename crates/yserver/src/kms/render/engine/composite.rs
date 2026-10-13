@@ -1312,26 +1312,29 @@ fn build_render_composite_attrs(
     let effective_src_repeat = if src_is_synthetic_1x1 {
         crate::kms::vk::render_pipeline::REPEAT_PAD
     } else {
-        crate::kms::backend::repeat_to_shader_const(src_repeat)
+        crate::kms::render::geometry::repeat_to_shader_const(src_repeat)
     };
     let effective_mask_repeat = if mask_is_synthetic_1x1 {
         crate::kms::vk::render_pipeline::REPEAT_PAD
     } else {
-        crate::kms::backend::repeat_to_shader_const(mask_repeat)
+        crate::kms::render::geometry::repeat_to_shader_const(mask_repeat)
     };
 
     // Compose gradient picture's intrinsic xform with the user's
     // RenderSetPictureTransform — matches v1's `compose_affines(
     // intrinsic, user)` shape.
-    let user_src_xform = crate::kms::backend::pixman_transform_to_affine(src_transform, src_extent);
+    let user_src_xform =
+        crate::kms::render::geometry::pixman_transform_to_affine(src_transform, src_extent);
     let user_mask_xform =
-        crate::kms::backend::pixman_transform_to_affine(mask_transform, mask_extent);
+        crate::kms::render::geometry::pixman_transform_to_affine(mask_transform, mask_extent);
     let combined_src_xform = match src_picture_xform {
-        Some(intrinsic) => crate::kms::backend::compose_affines(intrinsic, user_src_xform),
+        Some(intrinsic) => crate::kms::render::geometry::compose_affines(intrinsic, user_src_xform),
         None => user_src_xform,
     };
     let combined_mask_xform = match mask_picture_xform {
-        Some(intrinsic) => crate::kms::backend::compose_affines(intrinsic, user_mask_xform),
+        Some(intrinsic) => {
+            crate::kms::render::geometry::compose_affines(intrinsic, user_mask_xform)
+        }
         None => user_mask_xform,
     };
 
@@ -1375,7 +1378,7 @@ pub(super) fn sampler_config_for_repeat(r: Repeat) -> SamplerConfig {
 }
 
 /// Map the pre-resolved shader repeat constant (see
-/// `crate::kms::backend::repeat_to_shader_const`) back to the matching
+/// `crate::kms::render::geometry::repeat_to_shader_const`) back to the matching
 /// `SamplerConfig`. The deferred trap/tri emit stores the repeat as the
 /// shader constant in its payload, so the src view's Vk sampler must be
 /// derived from it — mirroring how every non-deferred composite path

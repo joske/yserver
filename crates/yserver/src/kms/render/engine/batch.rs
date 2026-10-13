@@ -277,13 +277,17 @@ impl RenderEngine {
         // Build CompositeAttrs (force_opaque + repeat + transforms).
         let src_force_opaque = resolve_force_opaque_pict_format(store, &src, src_pict_format);
         let mask_force_opaque = resolve_force_opaque_pict_format(store, &mask, mask_pict_format);
-        let user_src_xform =
-            crate::kms::backend::pixman_transform_to_affine(src_transform.as_ref(), src_extent);
-        let user_mask_xform =
-            crate::kms::backend::pixman_transform_to_affine(mask_transform.as_ref(), mask_extent);
-        let effective_src_repeat = crate::kms::backend::repeat_to_shader_const(src_repeat);
+        let user_src_xform = crate::kms::render::geometry::pixman_transform_to_affine(
+            src_transform.as_ref(),
+            src_extent,
+        );
+        let user_mask_xform = crate::kms::render::geometry::pixman_transform_to_affine(
+            mask_transform.as_ref(),
+            mask_extent,
+        );
+        let effective_src_repeat = crate::kms::render::geometry::repeat_to_shader_const(src_repeat);
         let effective_mask_repeat = if mask_id_opt.is_some() {
-            crate::kms::backend::repeat_to_shader_const(mask_repeat)
+            crate::kms::render::geometry::repeat_to_shader_const(mask_repeat)
         } else {
             crate::kms::vk::render_pipeline::REPEAT_PAD
         };

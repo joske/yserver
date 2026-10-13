@@ -359,14 +359,17 @@ impl RenderEngine {
         // from the helper's i32 return — the shader constants are 0..=3 and
         // always non-negative so the cast is lossless.
         #[allow(clippy::cast_sign_loss)]
-        let src_repeat_const = crate::kms::backend::repeat_to_shader_const(src_repeat) as u32;
+        let src_repeat_const =
+            crate::kms::render::geometry::repeat_to_shader_const(src_repeat) as u32;
 
         // src_force_opaque via pict_format-aware helper.
         let src_force_opaque = resolve_force_opaque_pict_format(store, &src, src_pict_format);
 
         // user_src_xform via pixman_transform_to_affine.
-        let user_src_xform =
-            crate::kms::backend::pixman_transform_to_affine(src_transform.as_ref(), src_extent);
+        let user_src_xform = crate::kms::render::geometry::pixman_transform_to_affine(
+            src_transform.as_ref(),
+            src_extent,
+        );
 
         // needs_full_dst byte-pattern test (engine.rs:7472).
         let needs_full_dst = matches!(op, 0 | 1 | 5 | 6 | 7 | 10 | 13 | 16..=27 | 32..=43);

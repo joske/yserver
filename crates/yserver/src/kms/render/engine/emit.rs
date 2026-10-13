@@ -1920,7 +1920,10 @@ fn emit_recorded_render_traps_or_tris_into_cb(
         crate::kms::render::frame_builder::RecordedTrapSrcKind::Gradient {
             intrinsic_axis_projection,
             ..
-        } => crate::kms::backend::compose_affines(*intrinsic_axis_projection, rt.user_src_xform),
+        } => crate::kms::render::geometry::compose_affines(
+            *intrinsic_axis_projection,
+            rt.user_src_xform,
+        ),
         _ => rt.user_src_xform,
     };
     // Effective src_repeat: PAD for synthetic 1×1, else recorded constant.
