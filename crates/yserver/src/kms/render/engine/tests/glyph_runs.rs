@@ -31,7 +31,7 @@ fn composite_glyphs_pin_ceiling_reserves_instance_buffer_pin() {
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&platform.gpu).expect("engine");
     let target = alloc_drawable_3a(&platform, &mut store, 0x1, 32, 32);
 
     {
@@ -65,7 +65,7 @@ fn composite_glyphs_pin_ceiling_reserves_instance_buffer_pin() {
     let stats = engine
         .composite_glyphs(
             &mut store,
-            &mut platform,
+            &mut platform.gpu,
             Dst::server_internal(target),
             3, // Over
             0, // pict_format unknown → depth heuristic
@@ -91,7 +91,7 @@ fn composite_glyphs_pin_ceiling_reserves_instance_buffer_pin() {
         stats.glyphs_dropped,
     );
 
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut platform.gpu);
 }
 
 /// `image_text`'s identical hole (`render/engine.rs:5954`'s
@@ -106,7 +106,7 @@ fn image_text_pin_ceiling_reserves_instance_buffer_pin() {
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&platform.gpu).expect("engine");
     let target = alloc_drawable_3a_with_kind(
         &platform,
         &mut store,
@@ -130,7 +130,7 @@ fn image_text_pin_ceiling_reserves_instance_buffer_pin() {
     let stats = engine
         .image_text(
             &mut store,
-            &mut platform,
+            &mut platform.gpu,
             Dst::server_internal(target),
             7,
             [1.0, 1.0, 1.0, 1.0],
@@ -154,7 +154,7 @@ fn image_text_pin_ceiling_reserves_instance_buffer_pin() {
         stats.glyphs_dropped,
     );
 
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut platform.gpu);
 }
 
 // ── #137 step 4a: `first_instance`, plumbed end to end ──────
@@ -285,7 +285,7 @@ fn a_glyph_run_upload_shows_in_churn_rates() {
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&platform.gpu).expect("engine");
     let target = alloc_drawable_3a(&platform, &mut store, 0x1, 32, 32);
     let full = vk::Rect2D {
         offset: vk::Offset2D::default(),
@@ -301,7 +301,7 @@ fn a_glyph_run_upload_shows_in_churn_rates() {
             engine
                 .composite_glyphs(
                     store,
-                    platform,
+                    &mut platform.gpu,
                     Dst::server_internal(target),
                     3,
                     0,
@@ -313,9 +313,15 @@ fn a_glyph_run_upload_shows_in_churn_rates() {
             // Closes the frame; `drain_all` then retires it and frees its
             // upload block.
             engine
-                .get_image(store, platform, Src::server_internal(target), full, 32)
+                .get_image(
+                    store,
+                    &mut platform.gpu,
+                    Src::server_internal(target),
+                    full,
+                    32,
+                )
                 .expect("get_image");
-            engine.drain_all(platform);
+            engine.drain_all(&mut platform.gpu);
         };
     // Warm-up interns the glyphs so the measured run allocates only
     // what every later run of the same text allocates.
@@ -373,7 +379,7 @@ fn a_glyph_run_split_into_two_ranges_renders_as_one_range() {
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&platform.gpu).expect("engine");
     let one_range = alloc_drawable_3a(&platform, &mut store, 0x1, 32, 32);
     let two_ranges = alloc_drawable_3a(&platform, &mut store, 0x2, 32, 32);
     let full = vk::Rect2D {
@@ -393,7 +399,7 @@ fn a_glyph_run_split_into_two_ranges_renders_as_one_range() {
         engine
             .fill_rect(
                 &mut store,
-                &mut platform,
+                &mut platform.gpu,
                 Dst::server_internal(id),
                 full,
                 black,
@@ -410,7 +416,7 @@ fn a_glyph_run_split_into_two_ranges_renders_as_one_range() {
     engine
         .composite_glyphs(
             &mut store,
-            &mut platform,
+            &mut platform.gpu,
             Dst::server_internal(one_range),
             RUN_SPLIT_OP,
             0, // pict_format unknown → depth heuristic
@@ -427,7 +433,7 @@ fn a_glyph_run_split_into_two_ranges_renders_as_one_range() {
     let out_one = engine
         .get_image(
             &mut store,
-            &mut platform,
+            &mut platform.gpu,
             Src::server_internal(one_range),
             full,
             32,
@@ -441,7 +447,7 @@ fn a_glyph_run_split_into_two_ranges_renders_as_one_range() {
     engine
         .fill_rect(
             &mut store,
-            &mut platform,
+            &mut platform.gpu,
             Dst::server_internal(two_ranges),
             full,
             black,
@@ -513,7 +519,7 @@ fn a_glyph_run_split_into_two_ranges_renders_as_one_range() {
     let out_two = engine
         .get_image(
             &mut store,
-            &mut platform,
+            &mut platform.gpu,
             Src::server_internal(two_ranges),
             full,
             32,
@@ -549,7 +555,7 @@ fn a_glyph_run_split_into_two_ranges_renders_as_one_range() {
              buffer must be pixel-identical to recording them as one range",
     );
 
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut platform.gpu);
 }
 
 /// `record_text_run_scissored` at a NONZERO `first_instance`, with
@@ -572,7 +578,7 @@ fn record_text_run_scissored_draws_only_the_requested_instance_range() {
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&platform.gpu).expect("engine");
     let target = alloc_drawable_3a(&platform, &mut store, 0x1, 32, 32);
     let full = vk::Rect2D {
         offset: vk::Offset2D::default(),
@@ -591,7 +597,7 @@ fn record_text_run_scissored_draws_only_the_requested_instance_range() {
     engine
         .fill_rect(
             &mut store,
-            &mut platform,
+            &mut platform.gpu,
             Dst::server_internal(target),
             full,
             [0.0, 0.0, 0.0, 1.0],
@@ -600,7 +606,7 @@ fn record_text_run_scissored_draws_only_the_requested_instance_range() {
     engine
         .composite_glyphs(
             &mut store,
-            &mut platform,
+            &mut platform.gpu,
             Dst::server_internal(target),
             3,
             0,
@@ -615,7 +621,7 @@ fn record_text_run_scissored_draws_only_the_requested_instance_range() {
     engine
         .get_image(
             &mut store,
-            &mut platform,
+            &mut platform.gpu,
             Src::server_internal(target),
             full,
             32,
@@ -629,7 +635,7 @@ fn record_text_run_scissored_draws_only_the_requested_instance_range() {
     engine
         .fill_rect(
             &mut store,
-            &mut platform,
+            &mut platform.gpu,
             Dst::server_internal(target),
             full,
             [0.0, 0.0, 0.0, 1.0],
@@ -638,7 +644,7 @@ fn record_text_run_scissored_draws_only_the_requested_instance_range() {
     engine
         .get_image(
             &mut store,
-            &mut platform,
+            &mut platform.gpu,
             Src::server_internal(target),
             full,
             32,
@@ -709,7 +715,7 @@ fn record_text_run_scissored_draws_only_the_requested_instance_range() {
     let out = engine
         .get_image(
             &mut store,
-            &mut platform,
+            &mut platform.gpu,
             Src::server_internal(target),
             full,
             32,
@@ -732,7 +738,7 @@ fn record_text_run_scissored_draws_only_the_requested_instance_range() {
              hardcoded firstInstance of 0 draws it",
     );
 
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut platform.gpu);
 }
 
 // ── #137 step 4b: the run splitter ────────────────────────────
@@ -995,7 +1001,7 @@ fn a_component_alpha_glyph_upload_records_the_packed_width() {
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&platform.gpu).expect("engine");
     let target = alloc_drawable_3a(&platform, &mut store, 0x1, 32, 32);
 
     // 2x2 ARGB32 wire, dense CARD32 rows: [B, G, R, A] per pixel.
@@ -1015,7 +1021,7 @@ fn a_component_alpha_glyph_upload_records_the_packed_width() {
     engine
         .composite_glyphs(
             &mut store,
-            &mut platform,
+            &mut platform.gpu,
             Dst::server_internal(target),
             3, // Over
             0,
@@ -1081,7 +1087,7 @@ fn a_component_alpha_glyph_upload_records_the_packed_width() {
         assert_eq!(packed_w, logical_w);
     }
 
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut platform.gpu);
 }
 
 /// #137 step 4b, carry-forward from 4a: the destination layout on
@@ -1109,7 +1115,7 @@ fn a_second_glyph_run_records_the_layout_the_first_run_left() {
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&platform.gpu).expect("engine");
     let warm = alloc_drawable_3a(&platform, &mut store, 0x1, 32, 32);
     // The split destination is never painted before the runs are
     // recorded, so its pre-op layout is the dangerous one.
@@ -1128,7 +1134,7 @@ fn a_second_glyph_run_records_the_layout_the_first_run_left() {
     engine
         .fill_rect(
             &mut store,
-            &mut platform,
+            &mut platform.gpu,
             Dst::server_internal(warm),
             full,
             [0.0, 0.0, 0.0, 1.0],
@@ -1139,7 +1145,7 @@ fn a_second_glyph_run_records_the_layout_the_first_run_left() {
     engine
         .composite_glyphs(
             &mut store,
-            &mut platform,
+            &mut platform.gpu,
             Dst::server_internal(warm),
             RUN_SPLIT_OP,
             0,
@@ -1152,7 +1158,7 @@ fn a_second_glyph_run_records_the_layout_the_first_run_left() {
     engine
         .get_image(
             &mut store,
-            &mut platform,
+            &mut platform.gpu,
             Src::server_internal(warm),
             full,
             32,
@@ -1164,7 +1170,7 @@ fn a_second_glyph_run_records_the_layout_the_first_run_left() {
     engine
         .fill_rect(
             &mut store,
-            &mut platform,
+            &mut platform.gpu,
             Dst::server_internal(warm),
             full,
             [0.0, 0.0, 0.0, 1.0],
@@ -1242,11 +1248,11 @@ fn a_second_glyph_run_records_the_layout_the_first_run_left() {
     engine
         .get_image(
             &mut store,
-            &mut platform,
+            &mut platform.gpu,
             Src::server_internal(split_dst),
             full,
             32,
         )
         .expect("get_image closes the two-run frame");
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut platform.gpu);
 }

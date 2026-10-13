@@ -16,7 +16,7 @@ fn image_text_run_records_damage_on_target() {
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&platform.gpu).expect("engine");
 
     // Window-kind + scene-participating so presentation damage
     // accumulates (per the I5 spec amendment, pixmaps no longer
@@ -39,7 +39,7 @@ fn image_text_run_records_damage_on_target() {
     let stats = engine
         .image_text(
             &mut store,
-            &mut platform,
+            &mut platform.gpu,
             Dst::server_internal(id),
             7,
             [1.0, 1.0, 1.0, 1.0],
@@ -69,7 +69,7 @@ fn image_text_run_records_damage_on_target() {
     assert!(max_x >= 22);
     assert!(max_y >= 17);
 
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut platform.gpu);
 }
 
 /// **Load-bearing per codex round 1**: two back-to-back glyph
@@ -85,14 +85,14 @@ fn atlas_back_to_back_upload_no_corruption() {
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&platform.gpu).expect("engine");
     let target = alloc_drawable_3a(&platform, &mut store, 0x1, 32, 32);
 
     // Pre-clear the target to black.
     engine
         .fill_rect(
             &mut store,
-            &mut platform,
+            &mut platform.gpu,
             Dst::server_internal(target),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -116,7 +116,7 @@ fn atlas_back_to_back_upload_no_corruption() {
     let stats = engine
         .image_text(
             &mut store,
-            &mut platform,
+            &mut platform.gpu,
             Dst::server_internal(target),
             42,
             [1.0, 1.0, 1.0, 1.0],
@@ -130,7 +130,7 @@ fn atlas_back_to_back_upload_no_corruption() {
     let out = engine
         .get_image(
             &mut store,
-            &mut platform,
+            &mut platform.gpu,
             Src::server_internal(target),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -176,7 +176,7 @@ fn atlas_back_to_back_upload_no_corruption() {
         "between-quad pixel (7,2) should be background black; got ({b:#x},{g:#x},{r:#x})"
     );
 
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut platform.gpu);
 }
 
 fn atlas_resets(engine: &RenderEngine) -> u64 {
@@ -234,7 +234,7 @@ fn atlas_full_resets_behind_the_recorded_draw() {
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&platform.gpu).expect("engine");
     let target = alloc_drawable_3a(&platform, &mut store, 0x1, 32, 8);
     let full = vk::Rect2D {
         offset: vk::Offset2D::default(),
@@ -246,7 +246,7 @@ fn atlas_full_resets_behind_the_recorded_draw() {
     engine
         .fill_rect(
             &mut store,
-            &mut platform,
+            &mut platform.gpu,
             Dst::server_internal(target),
             full,
             [0.0, 0.0, 0.0, 1.0],
@@ -259,7 +259,7 @@ fn atlas_full_resets_behind_the_recorded_draw() {
     let stats = engine
         .image_text(
             &mut store,
-            &mut platform,
+            &mut platform.gpu,
             Dst::server_internal(target),
             1,
             [1.0, 1.0, 1.0, 1.0],
@@ -280,7 +280,7 @@ fn atlas_full_resets_behind_the_recorded_draw() {
     let stats = engine
         .image_text(
             &mut store,
-            &mut platform,
+            &mut platform.gpu,
             Dst::server_internal(target),
             1,
             [1.0, 1.0, 1.0, 1.0],
@@ -309,7 +309,7 @@ fn atlas_full_resets_behind_the_recorded_draw() {
     let out = engine
         .get_image(
             &mut store,
-            &mut platform,
+            &mut platform.gpu,
             Src::server_internal(target),
             full,
             32,
@@ -324,7 +324,7 @@ fn atlas_full_resets_behind_the_recorded_draw() {
             assert_eq!(px, expect, "pixel ({x},{y})");
         }
     }
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut platform.gpu);
 }
 
 /// A glyph wider than the whole atlas can never be placed: it
@@ -337,14 +337,14 @@ fn glyph_larger_than_atlas_drops_without_reset() {
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&platform.gpu).expect("engine");
     let target = alloc_drawable_3a(&platform, &mut store, 0x1, 4, 4);
     let small = build_glyph(1, 0, 0, 4, 4);
     let huge = build_glyph(2, 0, 0, 4097, 1);
     let stats = engine
         .image_text(
             &mut store,
-            &mut platform,
+            &mut platform.gpu,
             Dst::server_internal(target),
             1,
             [1.0, 1.0, 1.0, 1.0],
@@ -356,12 +356,12 @@ fn glyph_larger_than_atlas_drops_without_reset() {
     engine
         .close_open_frame(
             &mut store,
-            &mut platform,
+            &mut platform.gpu,
             crate::kms::render::frame_builder::CloseReason::SyncWait,
         )
         .expect("close");
     assert!(atlas_has(&engine, 1, 1));
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut platform.gpu);
 }
 
 /// `forget_glyphs` drops committed entries AND inserts still
@@ -375,14 +375,14 @@ fn forget_glyphs_drops_committed_and_pending_entries() {
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&platform.gpu).expect("engine");
     let target = alloc_drawable_3a(&platform, &mut store, 0x1, 16, 4);
     let close =
         |engine: &mut RenderEngine, store: &mut DrawableStore, platform: &mut PlatformBackend| {
             engine
                 .close_open_frame(
                     store,
-                    platform,
+                    &mut platform.gpu,
                     crate::kms::render::frame_builder::CloseReason::SyncWait,
                 )
                 .expect("close");
@@ -395,7 +395,7 @@ fn forget_glyphs_drops_committed_and_pending_entries() {
         engine
             .image_text(
                 store,
-                platform,
+                &mut platform.gpu,
                 Dst::server_internal(target),
                 font,
                 [1.0, 1.0, 1.0, 1.0],
@@ -422,7 +422,7 @@ fn forget_glyphs_drops_committed_and_pending_entries() {
         !atlas_has(&engine, 11, 2),
         "a forgotten pending insert never commits"
     );
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut platform.gpu);
 }
 
 /// Step 2 proof (component-alpha glyphs plan,
@@ -453,7 +453,7 @@ fn atlas_entry_packed_vs_logical_width_feed_the_right_consumers() {
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&platform.gpu).expect("engine");
 
     let real_target = alloc_drawable_3a(&platform, &mut store, 0x1, 64, 32);
     // Window + scene-participating so presentation damage
@@ -473,7 +473,7 @@ fn atlas_entry_packed_vs_logical_width_feed_the_right_consumers() {
     engine
         .fill_rect(
             &mut store,
-            &mut platform,
+            &mut platform.gpu,
             Dst::server_internal(probe_target),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -508,7 +508,7 @@ fn atlas_entry_packed_vs_logical_width_feed_the_right_consumers() {
     let stats = engine
         .image_text(
             &mut store,
-            &mut platform,
+            &mut platform.gpu,
             Dst::server_internal(real_target),
             font_xid,
             [1.0, 1.0, 1.0, 1.0],
@@ -524,7 +524,7 @@ fn atlas_entry_packed_vs_logical_width_feed_the_right_consumers() {
     engine
         .close_open_frame(
             &mut store,
-            &mut platform,
+            &mut platform.gpu,
             crate::kms::render::frame_builder::CloseReason::SyncWait,
         )
         .expect("close frame after real upload");
@@ -564,7 +564,7 @@ fn atlas_entry_packed_vs_logical_width_feed_the_right_consumers() {
     let stats2 = engine
         .image_text(
             &mut store,
-            &mut platform,
+            &mut platform.gpu,
             Dst::server_internal(probe_target),
             font_xid,
             [1.0, 1.0, 1.0, 1.0],
@@ -600,11 +600,11 @@ fn atlas_entry_packed_vs_logical_width_feed_the_right_consumers() {
     // stretch across all 40 texels and its right half would land
     // on the transparent texels 20..40, producing a visibly mixed
     // opaque/transparent pattern instead of a solid one.
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut platform.gpu);
     let out = engine
         .get_image(
             &mut store,
-            &mut platform,
+            &mut platform.gpu,
             Src::server_internal(probe_target),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),

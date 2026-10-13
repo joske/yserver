@@ -82,7 +82,7 @@ use ash::vk;
 use super::{
     glyph_atlas::GlyphAtlas,
     glyph_pixels::GlyphPixels,
-    platform::FenceTicket,
+    gpu::FenceTicket,
     present_completion::PendingPresentBatch,
     store::{DrawableId, RetiredImage},
 };
@@ -780,7 +780,7 @@ struct RenderEngineInner {
     pending_group_ops: Vec<SubmittedOp>,
     /// Phase A: FlushOutcome records produced by flush_submit_group.
     /// Drained by the backend telemetry path (Task 3.5).
-    pending_flush_outcomes: Vec<crate::kms::render::platform::FlushOutcome>,
+    pending_flush_outcomes: Vec<crate::kms::render::gpu::FlushOutcome>,
     /// Phase B.1: in-flight frames awaiting retirement. Parallel to
     /// `submitted`; both gate on the same `FenceTicket`s when the
     /// frame builder is in play. Walked by `poll_retired` and

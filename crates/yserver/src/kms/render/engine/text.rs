@@ -6,7 +6,7 @@ use crate::kms::{
             staging::UPLOAD_VERTEX_ALIGN,
         },
         glyph_atlas::GlyphAtlas,
-        platform::{FenceTicket, PlatformBackend},
+        gpu::{FenceTicket, GpuCore},
         store::DrawableStore,
         target::Dst,
     },
@@ -126,7 +126,7 @@ impl RenderEngine {
     pub(crate) fn image_text(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut PlatformBackend,
+        platform: &mut GpuCore,
         dst: Dst,
         font_xid: u32,
         foreground_rgba: [f32; 4],
@@ -145,7 +145,7 @@ impl RenderEngine {
         }
 
         // (1) renderer_failed check.
-        if platform.gpu.renderer_failed {
+        if platform.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
 
@@ -223,7 +223,7 @@ impl RenderEngine {
         // (5) Open frame if not already open.
         if !inner.frame_builder.is_open() {
             let _ = inner;
-            let ticket = platform.gpu.submit_group_ticket_or_open()?;
+            let ticket = platform.submit_group_ticket_or_open()?;
             let inner = self.inner.as_mut().expect("inner");
             inner.acquire_generation = inner.acquire_generation.saturating_add(1);
             let frame_generation = inner.acquire_generation;

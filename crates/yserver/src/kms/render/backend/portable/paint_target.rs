@@ -60,7 +60,7 @@ impl KmsBackend {
         };
         if let Err(e) = self.engine.fill_rect(
             &mut self.store,
-            &mut self.platform,
+            &mut self.platform.gpu,
             Dst::server_internal(id),
             rect,
             decode_x11_pixel_for_storage(
@@ -115,7 +115,7 @@ impl KmsBackend {
             .collect();
         if let Err(e) = self.engine.stamp_opaque_alpha(
             &mut self.store,
-            &mut self.platform,
+            &mut self.platform.gpu,
             target.dst(),
             &rects16,
         ) {
@@ -603,7 +603,7 @@ impl KmsBackend {
             };
             if let Err(e) = self.engine.copy_area(
                 &mut self.store,
-                &mut self.platform,
+                &mut self.platform.gpu,
                 Src::server_internal(backing),
                 Dst::server_internal(backing),
                 src_rect,

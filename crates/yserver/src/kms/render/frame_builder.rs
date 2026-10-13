@@ -19,7 +19,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::platform::FenceTicket;
+use super::gpu::FenceTicket;
 
 /// Why a frame closed. Bumped into telemetry on every close so the
 /// rollout can see which trigger is dominating.
@@ -1959,7 +1959,7 @@ mod glyph_insert_tests {
 
 #[cfg(test)]
 mod open_frame_tests {
-    use super::{super::platform::FenceTicket, *};
+    use super::{super::gpu::FenceTicket, *};
 
     #[test]
     fn open_frame_aggregates_all_overlays() {

@@ -5,7 +5,7 @@ use crate::kms::render::{
         frame::{begin_op_cb, end_and_submit_op},
         pixels::{pack_from_storage, unpack_to_staging},
     },
-    platform::PlatformBackend,
+    gpu::GpuCore,
     store::DrawableStore,
     target::{Dst, Src},
 };
@@ -39,7 +39,7 @@ impl RenderEngine {
     pub(crate) fn put_image(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut PlatformBackend,
+        platform: &mut GpuCore,
         dst: Dst,
         dst_pos: vk::Offset2D,
         src_extent: vk::Extent2D,
@@ -53,7 +53,7 @@ impl RenderEngine {
             return Ok(());
         }
         // Phase B.3 (N9): renderer_failed check before any open-frame mutation.
-        if platform.gpu.renderer_failed {
+        if platform.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
         // Phase B.3 (N9): flush pending_render_batch at entry. May close an
@@ -144,7 +144,7 @@ impl RenderEngine {
         // composite_glyphs_via_frame_builder.)
         if !inner.frame_builder.is_open() {
             let _ = inner;
-            let ticket = platform.gpu.submit_group_ticket_or_open()?;
+            let ticket = platform.submit_group_ticket_or_open()?;
             let inner = self.inner.as_mut().expect("inner");
             inner.acquire_generation = inner.acquire_generation.saturating_add(1);
             let frame_generation = inner.acquire_generation;
@@ -215,7 +215,7 @@ impl RenderEngine {
     pub(crate) fn get_image(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut PlatformBackend,
+        platform: &mut GpuCore,
         src_handle: Src,
         rect: vk::Rect2D,
         out_depth: u8,
@@ -261,7 +261,7 @@ impl RenderEngine {
         let Some(inner) = self.inner.as_mut() else {
             return Err(RenderError::NoVk);
         };
-        if platform.gpu.renderer_failed {
+        if platform.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
         let Some(drawable) = store.get_mut(src) else {

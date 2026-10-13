@@ -227,7 +227,7 @@ pub(crate) struct GlyphAtlas {
     /// way `DrawableStore::poll_pending_retire` gates drawable
     /// destruction (engine drains `pending_frames` first; this field
     /// is the fallback for any path that bypasses the queue).
-    last_render_ticket: Option<super::platform::FenceTicket>,
+    last_render_ticket: Option<super::gpu::FenceTicket>,
 }
 
 // Intentionally `!Send + !Sync`: `last_render_ticket` is backed by
@@ -425,7 +425,7 @@ impl GlyphAtlas {
         self.packer.insert_entry(key, entry);
     }
 
-    pub(crate) fn set_last_render_ticket(&mut self, ticket: super::platform::FenceTicket) {
+    pub(crate) fn set_last_render_ticket(&mut self, ticket: super::gpu::FenceTicket) {
         self.last_render_ticket = Some(ticket);
     }
 
@@ -433,7 +433,7 @@ impl GlyphAtlas {
         self.last_render_ticket = None;
     }
 
-    pub(crate) fn last_render_ticket(&self) -> Option<&super::platform::FenceTicket> {
+    pub(crate) fn last_render_ticket(&self) -> Option<&super::gpu::FenceTicket> {
         self.last_render_ticket.as_ref()
     }
 

@@ -8,7 +8,7 @@ use crate::kms::render::{
             emit_session_open_and_draws,
         },
     },
-    platform::{FenceTicket, PlatformBackend, PresentCompletionSignal},
+    gpu::{FenceTicket, GpuCore, PresentCompletionSignal},
     present_completion::{PendingPresentBatch, PendingPresentEntry, PresentBatchWait},
     store::{DrawableId, DrawableStore},
 };
@@ -425,9 +425,9 @@ impl RenderEngine {
     pub(crate) fn flush_submit_group(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut PlatformBackend,
+        platform: &mut GpuCore,
         reason: crate::kms::render::submit_group::FlushReason,
-    ) -> Result<crate::kms::render::platform::FlushOutcome, vk::Result> {
+    ) -> Result<crate::kms::render::gpu::FlushOutcome, vk::Result> {
         // GLX-TFP (Task 2.3): drain the exported drawables written since
         // the last flush; the platform waits on / publishes their dma-buf
         // implicit-sync fences around this submit. `Arc<OwnedFd>` clones
@@ -440,7 +440,7 @@ impl RenderEngine {
         // recorded exported writes and the eventual real submit would skip
         // their wait/publish. Leaving them queued lets the next non-empty
         // flush pick them up.
-        let exported = if platform.gpu.submit_group_size() > 0 {
+        let exported = if platform.submit_group_size() > 0 {
             store.take_exported_writes()
         } else {
             Vec::new()
@@ -452,14 +452,12 @@ impl RenderEngine {
                 .map(|(f, prewaited)| (f.as_fd(), *prewaited))
                 .collect()
         };
-        let result = platform
-            .gpu
-            .flush_submit_group_with_exports(reason, &exported_borrows);
+        let result = platform.flush_submit_group_with_exports(reason, &exported_borrows);
         // Drain the platform's last_flush_outcome regardless of Ok/Err
         // — both branches in platform's flush_submit_group populate it
         // before returning. The engine queues it for backend telemetry
         // drain (Task 3.5 wires that side).
-        if let Some(outcome) = platform.gpu.take_last_flush_outcome()
+        if let Some(outcome) = platform.take_last_flush_outcome()
             && let Some(inner) = self.inner.as_mut()
         {
             inner.pending_flush_outcomes.push(outcome);
@@ -491,9 +489,9 @@ impl RenderEngine {
     pub(super) fn maybe_auto_flush_submit_group(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut PlatformBackend,
+        platform: &mut GpuCore,
     ) -> Result<(), RenderError> {
-        if platform.gpu.submit_group_size() >= platform.gpu.submit_group_max_size() {
+        if platform.submit_group_size() >= platform.submit_group_max_size() {
             self.flush_submit_group(
                 store,
                 platform,
@@ -527,7 +525,7 @@ impl RenderEngine {
     pub(crate) fn close_open_frame(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut PlatformBackend,
+        platform: &mut GpuCore,
         reason: crate::kms::render::frame_builder::CloseReason,
     ) -> Result<crate::kms::render::frame_builder::CloseOutcome, RenderError> {
         // Take the open frame from the FrameBuilder.
@@ -690,7 +688,7 @@ impl RenderEngine {
             acc
         };
 
-        let record_result = if platform.gpu.take_forced_frame_record_failure() {
+        let record_result = if platform.take_forced_frame_record_failure() {
             Err(RenderError::RendererFailed)
         } else {
             record_result
@@ -700,14 +698,14 @@ impl RenderEngine {
             {
                 let inner = self.inner.as_mut().expect("inner");
                 let device = &inner.vk.device;
-                if let Some(pool) = platform.gpu.ops_command_pool_handle() {
+                if let Some(pool) = platform.ops_command_pool_handle() {
                     // SAFETY: cb was allocated from `pool` and never
                     // submitted; safe to free in Recording state.
                     unsafe { device.free_command_buffers(pool, &[cb]) };
                 }
             }
             rollback_pre_submit(store, &mut open_frame);
-            platform.gpu.renderer_failed = true;
+            platform.renderer_failed = true;
             let inner_post = self.inner.as_mut().expect("inner");
             rollback_atlas(
                 inner_post,
@@ -747,7 +745,7 @@ impl RenderEngine {
             if pending_count == 0 {
                 None
             } else {
-                match platform.gpu.acquire_present_completion_signal() {
+                match platform.acquire_present_completion_signal() {
                     Ok(s) => Some(s),
                     Err(e) => {
                         // The frame still submits; its completions fall
@@ -777,12 +775,12 @@ impl RenderEngine {
             {
                 let inner = self.inner.as_mut().expect("inner");
                 let device = &inner.vk.device;
-                if let Some(pool) = platform.gpu.ops_command_pool_handle() {
+                if let Some(pool) = platform.ops_command_pool_handle() {
                     unsafe { device.free_command_buffers(pool, &[cb]) };
                 }
             }
             rollback_pre_submit(store, &mut open_frame);
-            platform.gpu.renderer_failed = true;
+            platform.renderer_failed = true;
             let inner_post = self.inner.as_mut().expect("inner");
             rollback_atlas(
                 inner_post,
@@ -869,7 +867,7 @@ impl RenderEngine {
         }
 
         // Drive the actual vkQueueSubmit2 via engine's flush_submit_group wrapper.
-        platform.gpu.set_next_submit_cause(reason.submit_cause());
+        platform.set_next_submit_cause(reason.submit_cause());
         let flush_outcome = self.flush_submit_group(
             store,
             platform,
@@ -1053,7 +1051,7 @@ impl RenderEngine {
     pub(super) fn close_open_frame_for_non_ported_op(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut PlatformBackend,
+        platform: &mut GpuCore,
     ) -> Result<(), RenderError> {
         let frame_open = self
             .inner
@@ -1080,7 +1078,7 @@ impl RenderEngine {
     pub(crate) fn close_open_frame_if_timed_out(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut PlatformBackend,
+        platform: &mut GpuCore,
     ) -> Result<(), RenderError> {
         let timed_out = self
             .inner
@@ -1223,9 +1221,7 @@ impl RenderEngine {
     /// Phase A Task 3.5: drain all queued `FlushOutcome` records
     /// accumulated since the last drain. Backend calls this once
     /// per `maybe_composite` tick to route outcomes to telemetry.
-    pub(crate) fn drain_flush_outcomes(
-        &mut self,
-    ) -> Vec<crate::kms::render::platform::FlushOutcome> {
+    pub(crate) fn drain_flush_outcomes(&mut self) -> Vec<crate::kms::render::gpu::FlushOutcome> {
         self.inner
             .as_mut()
             .map(|i| std::mem::take(&mut i.pending_flush_outcomes))
@@ -1281,10 +1277,9 @@ impl RenderEngine {
 /// `(cb, ticket)` ready to record into.
 pub(super) fn begin_op_cb(
     inner: &mut RenderEngineInner,
-    platform: &mut PlatformBackend,
+    platform: &mut GpuCore,
 ) -> Result<(vk::CommandBuffer, FenceTicket), RenderError> {
     let pool = platform
-        .gpu
         .ops_command_pool_handle()
         .ok_or(RenderError::NoVk)?;
     let device = &inner.vk.device;
@@ -1304,7 +1299,7 @@ pub(super) fn begin_op_cb(
     // Phase A: shared ticket comes from the open submit group. With
     // max_size = 1, the group auto-closes after one append; with
     // max_size > 1 (post-Task 4), N appends share the same ticket.
-    let ticket = match platform.gpu.submit_group_ticket_or_open() {
+    let ticket = match platform.submit_group_ticket_or_open() {
         Ok(t) => t,
         Err(e) => {
             // SAFETY: cb was begun but never submitted; safe to
@@ -1323,7 +1318,7 @@ pub(super) fn begin_op_cb(
 /// `vkQueueWaitIdle`.
 pub(super) fn end_and_submit_op(
     inner: &mut RenderEngineInner,
-    platform: &mut PlatformBackend,
+    platform: &mut GpuCore,
     cb: vk::CommandBuffer,
     ticket: &FenceTicket,
 ) -> Result<(), RenderError> {
@@ -1332,16 +1327,14 @@ pub(super) fn end_and_submit_op(
 
 fn end_and_submit_op_with_signal(
     inner: &mut RenderEngineInner,
-    platform: &mut PlatformBackend,
+    platform: &mut GpuCore,
     cb: vk::CommandBuffer,
     ticket: &FenceTicket,
     completion_signal: Option<vk::Semaphore>,
 ) -> Result<(), RenderError> {
     let device = &inner.vk.device;
     unsafe { device.end_command_buffer(cb)? };
-    platform
-        .gpu
-        .submit_paint_cb_with_semaphore(cb, ticket.fence(), completion_signal)?;
+    platform.submit_paint_cb_with_semaphore(cb, ticket.fence(), completion_signal)?;
     let _ = device;
     Ok(())
 }

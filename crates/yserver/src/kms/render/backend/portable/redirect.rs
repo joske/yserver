@@ -176,7 +176,7 @@ impl KmsBackend {
         // parent's backing in BACKING space (both handles privileged).
         if let Err(e) = self.engine.copy_area(
             &mut self.store,
-            &mut self.platform,
+            &mut self.platform.gpu,
             parent_target.server_backing_src(),
             Dst::server_internal(b_id),
             src_rect,
@@ -286,7 +286,7 @@ impl KmsBackend {
             }];
             match self.engine.render_composite(
                 &mut self.store,
-                &mut self.platform,
+                &mut self.platform.gpu,
                 OP_SRC,
                 // The planner already put this leaf's CONTENT origin
                 // into `src_x`/`src_y` (`push_inferior_rects`), so the
@@ -516,7 +516,7 @@ impl KmsBackend {
     ) -> crate::kms::render::store::RetireDecision {
         let engine = &mut self.engine;
         let scanout_m1 = &mut self.scanout_m1;
-        self.store.decref(&mut self.platform, id, |dropped| {
+        self.store.decref(&mut self.platform.gpu, id, |dropped| {
             engine.notify_drawable_retired(dropped);
             scanout_m1.remove(dropped);
         })
@@ -622,7 +622,7 @@ impl KmsBackend {
         let engine = &mut self.engine;
         let scanout_m1 = &mut self.scanout_m1;
         self.store
-            .poll_pending_retire(&mut self.platform, |dropped| {
+            .poll_pending_retire(&mut self.platform.gpu, |dropped| {
                 engine.notify_drawable_retired(dropped);
                 scanout_m1.remove(dropped);
             });
@@ -1124,7 +1124,7 @@ impl KmsBackend {
                         };
                         if let Err(e) = self.engine.fill_rect(
                             &mut self.store,
-                            &mut self.platform,
+                            &mut self.platform.gpu,
                             Dst::server_internal(id),
                             rect,
                             color,

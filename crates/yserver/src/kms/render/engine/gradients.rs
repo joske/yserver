@@ -1,6 +1,6 @@
 use crate::kms::render::{
     engine::{PicturePaintState, RenderEngine, RenderError},
-    platform::PlatformBackend,
+    gpu::GpuCore,
 };
 use ash::vk;
 
@@ -53,7 +53,7 @@ impl RenderEngine {
     /// view / memory or the upload staging allocation fails.
     pub(crate) fn build_and_insert_linear_gradient(
         &mut self,
-        platform: &mut PlatformBackend,
+        platform: &mut GpuCore,
         host_pic: u32,
         p1: (i32, i32),
         p2: (i32, i32),
@@ -77,7 +77,7 @@ impl RenderEngine {
     /// failure.
     pub(crate) fn build_and_insert_radial_gradient(
         &mut self,
-        platform: &mut PlatformBackend,
+        platform: &mut GpuCore,
         host_pic: u32,
         inner_circle: (i32, i32, i32),
         outer_circle: (i32, i32, i32),
@@ -110,17 +110,17 @@ impl RenderEngine {
     /// before (or without) any use cannot free the image under the copy.
     fn insert_gradient_with_deferred_upload(
         &mut self,
-        platform: &mut PlatformBackend,
+        platform: &mut GpuCore,
         host_pic: u32,
         gradient: crate::kms::vk::gradient::GradientPicture,
         pixels: &[u8],
     ) -> Result<(), RenderError> {
-        if platform.gpu.renderer_failed {
+        if platform.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
         let inner = self.inner.as_mut().ok_or(RenderError::NoVk)?;
         if !inner.frame_builder.is_open() {
-            let ticket = platform.gpu.submit_group_ticket_or_open()?;
+            let ticket = platform.submit_group_ticket_or_open()?;
             inner.acquire_generation = inner.acquire_generation.saturating_add(1);
             let frame_generation = inner.acquire_generation;
             inner.frame_builder.open_for_paint(ticket, frame_generation);

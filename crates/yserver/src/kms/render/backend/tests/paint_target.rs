@@ -1049,14 +1049,14 @@ fn mem_accounting_tracks_drawable_storage_by_use() {
         b.engine
             .close_open_frame(
                 &mut b.store,
-                &mut b.platform,
+                &mut b.platform.gpu,
                 crate::kms::render::frame_builder::CloseReason::SyncWait,
             )
             .expect("close frame");
         b.engine
             .flush_submit_group(
                 &mut b.store,
-                &mut b.platform,
+                &mut b.platform.gpu,
                 crate::kms::render::submit_group::FlushReason::SyncBoundary,
             )
             .expect("flush");
@@ -1805,7 +1805,7 @@ fn redirected_depth24_fill_into_depth32_backing_forces_opaque_alpha() {
         .engine
         .get_image(
             &mut b.store,
-            &mut b.platform,
+            &mut b.platform.gpu,
             crate::kms::render::target::Src::server_internal(target_id),
             ash::vk::Rect2D {
                 offset: ash::vk::Offset2D::default(),
@@ -1893,7 +1893,7 @@ fn window_absolute_rect_unknown_drawable_returns_none() {
     // Tear it back down so the DrawableId no longer resolves.
     // `decref` with no Vk treats the ticket as signaled and
     // calls `destroy_now`, removing the id from `entries`.
-    let _ = b.store.decref(&mut b.platform, w_id, |_| {});
+    let _ = b.store.decref(&mut b.platform.gpu, w_id, |_| {});
     // Also clear the windows entry — otherwise the helper
     // would early-return on the xid lookup, not the id lookup
     // we want to exercise.

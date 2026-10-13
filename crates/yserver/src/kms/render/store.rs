@@ -14,7 +14,7 @@
 //! the drawables they paint into.
 //!
 //! Storage allocation is **split** from the metadata layer:
-//! `PlatformBackend` creates the Vk handles ([`Storage`]) and
+//! `GpuCore` creates the Vk handles ([`Storage`]) and
 //! hands them to `DrawableStore::allocate`. This keeps the
 //! store's allocation path uniform across production (real
 //! VkContext) and tests (synthesised null handles) — both go
@@ -33,7 +33,7 @@ use std::{
 
 use ash::vk;
 
-use super::platform::{FenceTicket, PlatformBackend};
+use super::gpu::{FenceTicket, GpuCore};
 
 // ────────────────────────────────────────────────────────────────
 // Identity + classification
@@ -113,11 +113,11 @@ pub(crate) struct ImportedDmabufPlane {
 
 // ────────────────────────────────────────────────────────────────
 // Storage handles — the Vk side of a drawable.
-// PlatformBackend creates these; DrawableStore borrows them.
+// GpuCore creates these; DrawableStore borrows them.
 // ────────────────────────────────────────────────────────────────
 
 /// The Vk resources backing one drawable. Created via
-/// [`PlatformBackend::allocate_drawable_storage`] (production)
+/// [`GpuCore::allocate_drawable_storage`] (production)
 /// or [`Storage::for_tests_null`] (unit tests that exercise
 /// metadata bookkeeping without touching Vk).
 pub(crate) struct Storage {
@@ -204,7 +204,7 @@ pub(crate) struct RetiredImage {
 }
 
 impl Storage {
-    /// Production constructor — Vk handles owned by `PlatformBackend::
+    /// Production constructor — Vk handles owned by `GpuCore::
     /// allocate_drawable_storage`. Initial layout is `UNDEFINED`;
     /// transitions tracked thereafter via
     /// [`Drawable::record_layout_transition`].
@@ -388,7 +388,7 @@ impl Storage {
     /// entries (`PixmapPool::eligible(key)` — typically ≤128×128)
     /// are returned for recycle; ineligible or pool-full entries
     /// fall through to synchronous destroy.
-    fn destroy(&mut self, platform: &PlatformBackend) {
+    fn destroy(&mut self, platform: &GpuCore) {
         if self.is_test_stub {
             return;
         }
@@ -398,7 +398,7 @@ impl Storage {
         // built by us against the borrowed image — we own it and
         // must destroy it explicitly before the inner Drop fires.
         if self.imported_drawable.is_some() {
-            if let Some(vk) = platform.gpu.vk.as_ref()
+            if let Some(vk) = platform.vk.as_ref()
                 && self.sample_view != vk::ImageView::null()
             {
                 unsafe { vk.device.destroy_image_view(self.sample_view, None) };
@@ -416,7 +416,7 @@ impl Storage {
             self.imported_drawable = None;
             return;
         }
-        let Some(vk) = platform.gpu.vk.as_ref() else {
+        let Some(vk) = platform.vk.as_ref() else {
             // No VkContext — happens only in malformed test
             // fixtures. Log + leak.
             log::error!(
@@ -445,7 +445,7 @@ impl Storage {
             && self.image != vk::Image::null()
             && self.image_view != vk::ImageView::null()
             && self.memory != vk::DeviceMemory::null()
-            && let Some(pool) = platform.gpu.pixmap_pool.as_ref()
+            && let Some(pool) = platform.pixmap_pool.as_ref()
         {
             let key = crate::kms::vk::pixmap_pool::PixmapPoolKey {
                 width: self.extent.width,
@@ -945,7 +945,7 @@ impl DrawableStore {
     }
 
     /// Allocate a fresh drawable. The caller has already built
-    /// the `Storage` (via PlatformBackend in production, or
+    /// the `Storage` (via GpuCore in production, or
     /// `Storage::for_tests_null` in unit tests). Refcount
     /// starts at 1; layout is `UNDEFINED`; both damage lists
     /// empty.
@@ -1035,7 +1035,7 @@ impl DrawableStore {
     /// path is null-guarded throughout, so re-calling is safe.
     /// Caller is `KmsBackend::shutdown_destroy_drawables` from
     /// `lib.rs`'s explicit shutdown block.
-    pub(crate) fn shutdown_destroy_all(&mut self, platform: &PlatformBackend) {
+    pub(crate) fn shutdown_destroy_all(&mut self, platform: &GpuCore) {
         self.by_xid.clear();
         self.pending_retire.clear();
         for (_, mut drawable) in self.entries.drain() {
@@ -1099,7 +1099,7 @@ impl DrawableStore {
     /// before this point), so this only affects xid-based lookups.
     pub(crate) fn decref<F>(
         &mut self,
-        platform: &mut PlatformBackend,
+        platform: &mut GpuCore,
         id: DrawableId,
         on_destroyed: F,
     ) -> RetireDecision
@@ -1116,7 +1116,7 @@ impl DrawableStore {
         drawable.refcount = 0;
         let ticket_ready = match drawable.last_render_ticket.as_ref() {
             None => true,
-            Some(t) => match platform.gpu.vk.as_ref() {
+            Some(t) => match platform.vk.as_ref() {
                 Some(vk) => t.poll_signaled(vk),
                 None => true, // no Vk (tests) — treat as signaled
             },
@@ -1169,7 +1169,7 @@ impl DrawableStore {
     /// drawable's fence eventually signals and destroy_now runs,
     /// a blanket `by_xid.remove(xid)` would nuke the NEW
     /// drawable's lookup, "orphaning" the resized window.
-    fn destroy_now(&mut self, platform: &mut PlatformBackend, id: DrawableId) {
+    fn destroy_now(&mut self, platform: &mut GpuCore, id: DrawableId) {
         let Some(mut drawable) = self.entries.remove(&id) else {
             return;
         };
@@ -1449,11 +1449,8 @@ impl DrawableStore {
     /// (e.g. `RenderEngine::drawable_view_cache`) can drop their
     /// `VkImageView`s while the underlying `VkImage` is still
     /// alive.
-    pub(crate) fn poll_pending_retire<F>(
-        &mut self,
-        platform: &mut PlatformBackend,
-        mut on_destroyed: F,
-    ) where
+    pub(crate) fn poll_pending_retire<F>(&mut self, platform: &mut GpuCore, mut on_destroyed: F)
+    where
         F: FnMut(DrawableId),
     {
         let mut survivors = Vec::with_capacity(self.pending_retire.len());
@@ -1463,7 +1460,7 @@ impl DrawableStore {
                 None => true, // already gone
                 Some(d) => match d.last_render_ticket.as_ref() {
                     None => true,
-                    Some(t) => match platform.gpu.vk.as_ref() {
+                    Some(t) => match platform.vk.as_ref() {
                         Some(vk) => t.poll_signaled(vk),
                         None => true,
                     },
@@ -1515,6 +1512,7 @@ impl DrawableStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kms::render::platform::PlatformBackend;
 
     fn stub_storage() -> Storage {
         Storage::for_tests_null(
@@ -1651,7 +1649,7 @@ mod tests {
             .allocate(0x1, DrawableKind::Pixmap, 32, false, stub_storage())
             .unwrap();
         assert_eq!(
-            s.decref(&mut platform, id, |_| {}),
+            s.decref(&mut platform.gpu, id, |_| {}),
             RetireDecision::Destroyed
         );
         assert!(s.lookup(0x1).is_none());
@@ -1667,12 +1665,12 @@ mod tests {
             .unwrap();
         s.incref(id);
         assert_eq!(
-            s.decref(&mut platform, id, |_| {}),
+            s.decref(&mut platform.gpu, id, |_| {}),
             RetireDecision::StillReferenced
         );
         assert!(s.lookup(0x1).is_some());
         assert_eq!(
-            s.decref(&mut platform, id, |_| {}),
+            s.decref(&mut platform.gpu, id, |_| {}),
             RetireDecision::Destroyed
         );
         assert!(s.lookup(0x1).is_none());
@@ -1917,7 +1915,7 @@ mod tests {
         // we can't easily construct a FenceTicket in tests).
         s.entries.get_mut(&id).unwrap().refcount = 0;
         s.pending_retire.push(id);
-        s.poll_pending_retire(&mut platform, |_| {});
+        s.poll_pending_retire(&mut platform.gpu, |_| {});
         // No ticket attached → treated as signaled → destroyed.
         assert!(s.lookup(0x1).is_none());
         assert_eq!(s.pending_retire_count(), 0);
@@ -1955,7 +1953,7 @@ mod tests {
         );
         // Now retire the old drawable. No real ticket attached, so
         // poll_pending_retire treats it as signaled → destroy_now.
-        s.poll_pending_retire(&mut platform, |_| {});
+        s.poll_pending_retire(&mut platform.gpu, |_| {});
         // The new drawable's xid mapping MUST survive.
         assert_eq!(
             s.lookup(0x42),
@@ -1989,7 +1987,7 @@ mod tests {
         assert_eq!(s.get(id).unwrap().refcount, 2);
         // Simulate configure_subwindow resize sequence:
         s.detach_xid(0x42);
-        let r = s.decref(&mut platform, id, |_| {});
+        let r = s.decref(&mut platform.gpu, id, |_| {});
         assert_eq!(
             r,
             RetireDecision::StillReferenced,
@@ -2142,7 +2140,7 @@ mod tests {
     fn shutdown_destroy_all_on_empty_store_is_noop() {
         let mut s = DrawableStore::new();
         let platform = PlatformBackend::for_tests();
-        s.shutdown_destroy_all(&platform);
+        s.shutdown_destroy_all(&platform.gpu);
         assert!(s.entries.is_empty());
         assert!(s.by_xid.is_empty());
         assert!(s.pending_retire.is_empty());
@@ -2174,7 +2172,7 @@ mod tests {
         s.pending_retire.push(id1);
         s.pending_retire.push(id2);
 
-        s.shutdown_destroy_all(&platform);
+        s.shutdown_destroy_all(&platform.gpu);
 
         assert!(s.entries.is_empty(), "shutdown must drain entries");
         assert!(s.by_xid.is_empty(), "shutdown must clear xid lookup");
@@ -2201,7 +2199,7 @@ mod tests {
             .allocate(0x100_0001, DrawableKind::Pixmap, 32, false, stub_storage())
             .expect("allocate");
         let mut invalidated = Vec::new();
-        let decision = s.decref(&mut platform, id, |dropped| invalidated.push(dropped));
+        let decision = s.decref(&mut platform.gpu, id, |dropped| invalidated.push(dropped));
         assert_eq!(decision, RetireDecision::Destroyed);
         assert_eq!(
             invalidated,
@@ -2230,7 +2228,7 @@ mod tests {
             .expect("allocate");
         s.incref(id);
         let mut invalidated = Vec::new();
-        let decision = s.decref(&mut platform, id, |dropped| invalidated.push(dropped));
+        let decision = s.decref(&mut platform.gpu, id, |dropped| invalidated.push(dropped));
         assert_eq!(decision, RetireDecision::StillReferenced);
         assert!(
             invalidated.is_empty(),
@@ -2259,7 +2257,7 @@ mod tests {
         s.pending_retire.push(id_a);
         s.pending_retire.push(id_b);
         let mut invalidated = Vec::new();
-        s.poll_pending_retire(&mut platform, |dropped| invalidated.push(dropped));
+        s.poll_pending_retire(&mut platform.gpu, |dropped| invalidated.push(dropped));
         assert_eq!(invalidated.len(), 2);
         assert!(invalidated.contains(&id_a));
         assert!(invalidated.contains(&id_b));

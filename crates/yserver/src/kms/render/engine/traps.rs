@@ -12,7 +12,7 @@ use crate::kms::{
             fill_copy::clamp_rect_to,
             staging::UPLOAD_VERTEX_ALIGN,
         },
-        platform::PlatformBackend,
+        gpu::GpuCore,
         store::DrawableStore,
         target::Dst,
     },
@@ -31,12 +31,12 @@ impl RenderEngine {
     ///
     /// - `NoVk` on the stub engine.
     /// - `Vk(...)` for pipeline / scratch construction failure.
-    fn ensure_trap_assets(&mut self, platform: &PlatformBackend) -> Result<(), RenderError> {
+    fn ensure_trap_assets(&mut self, platform: &GpuCore) -> Result<(), RenderError> {
         use crate::kms::vk::{mask_scratch::MaskScratch, trap_pipeline::TrapPipeline};
         let Some(inner) = self.inner.as_mut() else {
             return Err(RenderError::NoVk);
         };
-        if platform.gpu.renderer_failed {
+        if platform.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
         if inner.trap_pipeline.is_none() {
@@ -93,7 +93,7 @@ impl RenderEngine {
     pub(crate) fn render_traps_or_tris(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut PlatformBackend,
+        platform: &mut GpuCore,
         op: u8,
         src: ResolvedSource,
         dst: Dst,
@@ -137,7 +137,7 @@ impl RenderEngine {
         // N9 order: renderer_failed check.
         {
             let _inner = self.inner.as_ref().ok_or(RenderError::NoVk)?;
-            if platform.gpu.renderer_failed {
+            if platform.renderer_failed {
                 return Err(RenderError::RendererFailed);
             }
         }
@@ -423,7 +423,7 @@ impl RenderEngine {
             let inner = self.inner.as_mut().expect("inner");
             if !inner.frame_builder.is_open() {
                 let _ = inner;
-                let ticket = platform.gpu.submit_group_ticket_or_open()?;
+                let ticket = platform.submit_group_ticket_or_open()?;
                 let inner = self.inner.as_mut().expect("inner");
                 inner.acquire_generation = inner.acquire_generation.saturating_add(1);
                 let frame_generation = inner.acquire_generation;

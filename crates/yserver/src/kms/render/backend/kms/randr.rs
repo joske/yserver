@@ -1331,7 +1331,7 @@ impl KmsBackend {
                             };
                             if let Err(e) = self.engine.fill_rect(
                                 &mut self.store,
-                                &mut self.platform,
+                                &mut self.platform.gpu,
                                 Dst::server_internal(new_id),
                                 rect,
                                 decode_x11_pixel_for_storage(
@@ -1419,7 +1419,7 @@ impl KmsBackend {
                             };
                             if let Err(e) = self.engine.fill_rect(
                                 &mut self.store,
-                                &mut self.platform,
+                                &mut self.platform.gpu,
                                 Dst::server_internal(new_cow_id),
                                 rect,
                                 default_window_init_color(24),

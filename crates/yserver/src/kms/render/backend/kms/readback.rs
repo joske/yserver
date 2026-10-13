@@ -99,7 +99,7 @@ impl KmsBackend {
                 };
                 match self.engine.put_image(
                     &mut self.store,
-                    &mut self.platform,
+                    &mut self.platform.gpu,
                     dst_id,
                     dst_pos,
                     piece.read.extent,
@@ -136,14 +136,14 @@ impl KmsBackend {
         {
             if let Err(e) = self.engine.close_open_frame(
                 &mut self.store,
-                &mut self.platform,
+                &mut self.platform.gpu,
                 crate::kms::render::frame_builder::CloseReason::LegacyRootRead,
             ) {
                 log::warn!("render root read: close_open_frame failed: {e:?}");
             }
             if let Err(e) = self.engine.flush_submit_group(
                 &mut self.store,
-                &mut self.platform,
+                &mut self.platform.gpu,
                 crate::kms::render::submit_group::FlushReason::SceneCompose,
             ) {
                 log::warn!("render root read: flush_submit_group failed: {e:?}");
@@ -179,14 +179,14 @@ impl KmsBackend {
         }
         if let Err(e) = self.engine.close_open_frame(
             &mut self.store,
-            &mut self.platform,
+            &mut self.platform.gpu,
             crate::kms::render::frame_builder::CloseReason::LegacyRootRead,
         ) {
             log::warn!("render root read: close_open_frame failed: {e:?}");
         }
         if let Err(e) = self.engine.flush_submit_group(
             &mut self.store,
-            &mut self.platform,
+            &mut self.platform.gpu,
             crate::kms::render::submit_group::FlushReason::SceneCompose,
         ) {
             log::warn!("render root read: flush_submit_group failed: {e:?}");
@@ -221,7 +221,7 @@ impl KmsBackend {
                     .engine
                     .get_image(
                         &mut self.store,
-                        &mut self.platform,
+                        &mut self.platform.gpu,
                         crate::kms::render::target::Src::server_internal(root_id),
                         rect,
                         32,
@@ -593,7 +593,7 @@ fn read_scanout_region_named(
                 .engine
                 .get_image(
                     &mut backend.store,
-                    &mut backend.platform,
+                    &mut backend.platform.gpu,
                     Src::server_internal(source_id),
                     source,
                     depth,

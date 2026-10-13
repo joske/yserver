@@ -261,7 +261,7 @@ impl KmsBackend {
         self.telemetry.record_promote_exportable_run();
         match self
             .engine
-            .promote_drawable_exportable(&mut self.platform, &mut self.store, id)
+            .promote_drawable_exportable(&mut self.platform.gpu, &mut self.store, id)
         {
             Ok(()) => self
                 .store
@@ -636,7 +636,7 @@ impl KmsBackend {
                 return Err(io::Error::other("DRI3 export: Vulkan unavailable"));
             }
             self.engine
-                .promote_drawable_exportable(&mut self.platform, &mut self.store, id)
+                .promote_drawable_exportable(&mut self.platform.gpu, &mut self.store, id)
                 .map_err(|e| io::Error::other(format!("DRI3 export promote: {e:?}")))?;
         }
 

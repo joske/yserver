@@ -517,7 +517,7 @@ fn clip_cache_retained_after_source_pixmap_freed() {
         bytes: vec![0xFF, 0, 0, 0, 0xFF, 0, 0, 0, 0xFF, 0, 0, 0, 0xFF, 0, 0, 0],
     });
     // Free the source pixmap (decref with no-op callback).
-    b.store.decref(&mut b.platform, did, |_| {});
+    b.store.decref(&mut b.platform.gpu, did, |_| {});
     // store.lookup(xid) is now None → clip_cache_reusable must return true.
     assert!(
         b.clip_cache_reusable(xid),
@@ -606,7 +606,7 @@ fn clip_cache_free_realloc_same_xid_no_stale_hit() {
         bytes: vec![0xAA, 0, 0, 0, 0xAA, 0, 0, 0, 0xAA, 0, 0, 0, 0xAA, 0, 0, 0],
     });
     // Free pixmap A.
-    b.store.decref(&mut b.platform, did_a, |_| {});
+    b.store.decref(&mut b.platform.gpu, did_a, |_| {});
     // Re-allocate at same XID → new DrawableId.
     let storage_b = Storage::for_tests_null(
         vk::Extent2D {

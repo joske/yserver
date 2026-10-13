@@ -72,10 +72,14 @@ fn transformed_pair(transform: CrtcTransform, root: (u16, u16)) -> Option<KmsBac
 fn compose_right(b: &mut KmsBackend) -> Vec<u8> {
     use crate::kms::render::{frame_builder::CloseReason, submit_group::FlushReason};
     b.engine
-        .close_open_frame(&mut b.store, &mut b.platform, CloseReason::LegacyScCompose)
+        .close_open_frame(
+            &mut b.store,
+            &mut b.platform.gpu,
+            CloseReason::LegacyScCompose,
+        )
         .expect("close frame");
     b.engine
-        .flush_submit_group(&mut b.store, &mut b.platform, FlushReason::SceneCompose)
+        .flush_submit_group(&mut b.store, &mut b.platform.gpu, FlushReason::SceneCompose)
         .expect("flush");
     b.scene
         .compose_transformed_for_tests(&b.core, &mut b.store, &b.windows, &b.platform, 1)

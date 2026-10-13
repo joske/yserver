@@ -707,7 +707,7 @@ fn damage_boundary_submits_render_batches_and_queued_commands() {
         b.engine
             .close_open_frame(
                 &mut b.store,
-                &mut b.platform,
+                &mut b.platform.gpu,
                 crate::kms::render::frame_builder::CloseReason::SyncWait,
             )
             .expect("submit initial clears");
@@ -718,7 +718,7 @@ fn damage_boundary_submits_render_batches_and_queued_commands() {
             .engine
             .try_append_render_batch(
                 &mut b.store,
-                &mut b.platform,
+                &mut b.platform.gpu,
                 1, // PictOpSrc
                 ResolvedSource::Drawable(SourceDrawable::whole(src_id)),
                 ResolvedSource::None,
@@ -747,7 +747,7 @@ fn damage_boundary_submits_render_batches_and_queued_commands() {
         assert!(appended.is_some(), "composite takes the batch path");
         if already_queued {
             b.engine
-                .flush_render_batch(&mut b.store, &mut b.platform, RenderFlushReason::Other)
+                .flush_render_batch(&mut b.store, &mut b.platform.gpu, RenderFlushReason::Other)
                 .expect("close batch without submitting");
             assert!(b.platform.gpu.submit_group_size() > 0);
         } else {
@@ -823,14 +823,14 @@ fn window_remap_at_the_same_size_is_a_pool_hit() {
         b.engine
             .close_open_frame(
                 &mut b.store,
-                &mut b.platform,
+                &mut b.platform.gpu,
                 crate::kms::render::frame_builder::CloseReason::SyncWait,
             )
             .expect("close frame");
         b.engine
             .flush_submit_group(
                 &mut b.store,
-                &mut b.platform,
+                &mut b.platform.gpu,
                 crate::kms::render::submit_group::FlushReason::SyncBoundary,
             )
             .expect("flush");
@@ -911,14 +911,14 @@ fn pixmap_pool_eviction_and_idle_trim_free_the_memory() {
         b.engine
             .close_open_frame(
                 &mut b.store,
-                &mut b.platform,
+                &mut b.platform.gpu,
                 crate::kms::render::frame_builder::CloseReason::SyncWait,
             )
             .expect("close frame");
         b.engine
             .flush_submit_group(
                 &mut b.store,
-                &mut b.platform,
+                &mut b.platform.gpu,
                 crate::kms::render::submit_group::FlushReason::SyncBoundary,
             )
             .expect("flush");

@@ -300,7 +300,7 @@ impl KmsBackend {
             };
             match self.engine.get_image(
                 &mut self.store,
-                &mut self.platform,
+                &mut self.platform.gpu,
                 piece.target.src_including_border(),
                 storage,
                 depth,

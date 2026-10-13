@@ -1,6 +1,6 @@
 use crate::kms::render::{
     engine::{MaskedCopyMask, RenderEngine, RenderError, SnapshotId},
-    platform::{FenceTicket, PlatformBackend},
+    gpu::{FenceTicket, GpuCore},
     store::{DrawableId, DrawableStore},
     target::{Dst, Src},
 };
@@ -35,7 +35,7 @@ impl RenderEngine {
     pub(crate) fn masked_copy_area_with_snapshot_for_tests(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut PlatformBackend,
+        platform: &mut GpuCore,
         src: DrawableId,
         dst: DrawableId,
         sid: SnapshotId,
@@ -166,7 +166,7 @@ impl RenderEngine {
     pub(crate) fn close_open_frame_for_timeout_for_tests(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut PlatformBackend,
+        platform: &mut GpuCore,
     ) -> Result<(), RenderError> {
         if !self
             .inner

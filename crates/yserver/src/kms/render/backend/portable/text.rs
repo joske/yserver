@@ -207,7 +207,7 @@ impl KmsBackend {
         ];
         match self.engine.image_text(
             &mut self.store,
-            &mut self.platform,
+            &mut self.platform.gpu,
             target.dst(),
             font_xid,
             foreground_rgba,
@@ -317,7 +317,7 @@ impl KmsBackend {
         };
         if let Err(e) = self.engine.fill_rect(
             &mut self.store,
-            &mut self.platform,
+            &mut self.platform.gpu,
             target.dst(),
             rect,
             color,
@@ -882,7 +882,7 @@ impl KmsBackend {
         let dst_pict_format = picture_pict_format(&self.core, host_dst);
         let stats = self.engine.composite_glyphs(
             &mut self.store,
-            &mut self.platform,
+            &mut self.platform.gpu,
             dst_target.dst(),
             op,
             dst_pict_format,

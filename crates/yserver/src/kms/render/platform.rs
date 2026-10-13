@@ -66,7 +66,7 @@ use crate::{
 };
 
 pub(crate) use crate::kms::{
-    render::gpu::{FencePool, FenceTicket, FlushOutcome, GpuCore, PresentCompletionSignal},
+    render::gpu::{FencePool, FenceTicket, GpuCore, PresentCompletionSignal},
     scanout_route::RenderDeviceId,
 };
 

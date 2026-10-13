@@ -12,7 +12,7 @@
 
 use ash::vk;
 
-use super::platform::FenceTicket;
+use super::gpu::FenceTicket;
 
 /// Reason a flush was triggered. Bumped into telemetry on every
 /// non-empty flush so we can tell what's driving the submit cadence.
@@ -120,7 +120,7 @@ impl SubmitGroup {
     }
 
     /// Take all buffered entries + the shared ticket, leaving the
-    /// group empty. Caller (PlatformBackend::flush_submit_group)
+    /// group empty. Caller (GpuCore::flush_submit_group)
     /// performs the `vkQueueSubmit2` against the returned data.
     pub(crate) fn take(&mut self) -> (Vec<GroupEntry>, Option<FenceTicket>) {
         (std::mem::take(&mut self.entries), self.ticket.take())

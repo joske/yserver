@@ -4,7 +4,7 @@ use crate::kms::{
             ClipSnapshot, RenderEngine, RenderError, RenderFlushReason, SampledScratchImage,
             ScratchImage, SnapshotId, frame::snapshot_first_touch,
         },
-        platform::PlatformBackend,
+        gpu::GpuCore,
         store::{DrawableId, DrawableStore},
     },
     vk::device::VkContext,
@@ -148,7 +148,7 @@ impl RenderEngine {
     pub(crate) fn refresh_clip_snapshot(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut PlatformBackend,
+        platform: &mut GpuCore,
         id: SnapshotId,
         live_mask_id: DrawableId,
         version: u64,
@@ -167,7 +167,7 @@ impl RenderEngine {
         // ENTRY PRELUDE — same as copy_area/masked_copy_area: renderer guard +
         // flush_render_batch BEFORE any open-frame mutation, so the refresh op is
         // chronologically ordered after any pending render batch.
-        if platform.gpu.renderer_failed {
+        if platform.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
         self.flush_render_batch(store, platform, RenderFlushReason::Other)?;
@@ -193,7 +193,7 @@ impl RenderEngine {
         // acquire_generation at open + capture on OpenFrame.
         if !inner.frame_builder.is_open() {
             let _ = inner;
-            let ticket = platform.gpu.submit_group_ticket_or_open()?;
+            let ticket = platform.submit_group_ticket_or_open()?;
             let inner = self.inner.as_mut().expect("inner");
             inner.acquire_generation = inner.acquire_generation.saturating_add(1);
             let frame_generation = inner.acquire_generation;
@@ -263,7 +263,7 @@ impl RenderEngine {
 /// `SubmittedOp.scratch` so it retires on the fence.
 pub(super) fn allocate_scratch_image(
     vk: &Arc<VkContext>,
-    _platform: &PlatformBackend,
+    _platform: &GpuCore,
     width: u32,
     height: u32,
     format: vk::Format,

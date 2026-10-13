@@ -197,7 +197,7 @@ impl KmsBackend {
             .engine
             .get_image(
                 &mut self.store,
-                &mut self.platform,
+                &mut self.platform.gpu,
                 Src::server_internal(id),
                 rect,
                 depth,
@@ -242,7 +242,7 @@ impl KmsBackend {
             .engine
             .get_image(
                 &mut self.store,
-                &mut self.platform,
+                &mut self.platform.gpu,
                 Src::server_internal(cache.drawable_id),
                 rect,
                 cache.depth,
@@ -384,7 +384,7 @@ impl KmsBackend {
         // before first use). No-ops when the version already matches.
         if let Err(e) = self.engine.refresh_clip_snapshot(
             &mut self.store,
-            &mut self.platform,
+            &mut self.platform.gpu,
             sid,
             did,
             live_version,

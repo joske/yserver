@@ -14,7 +14,7 @@ use crate::kms::{
             fill_copy::clamp_rect,
             frame::{begin_op_cb, end_and_submit_op},
         },
-        platform::PlatformBackend,
+        gpu::GpuCore,
         store::{DrawableId, DrawableStore},
         target::Dst,
     },
@@ -95,7 +95,7 @@ impl RenderEngine {
     pub(crate) fn try_append_render_batch(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut PlatformBackend,
+        platform: &mut GpuCore,
         op: u8,
         src: ResolvedSource,
         mask: ResolvedSource,
@@ -182,7 +182,7 @@ impl RenderEngine {
         // Lazy-init RENDER assets (mirrors the unbatched path).
         self.ensure_render_assets(platform)?;
         let inner = self.inner.as_mut().ok_or(RenderError::NoVk)?;
-        if platform.gpu.renderer_failed {
+        if platform.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
 
@@ -499,7 +499,7 @@ impl RenderEngine {
     pub(crate) fn flush_render_batch(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut PlatformBackend,
+        platform: &mut GpuCore,
         reason: RenderFlushReason,
     ) -> Result<Option<u32>, RenderError> {
         let Some(inner) = self.inner.as_mut() else {
@@ -511,7 +511,7 @@ impl RenderEngine {
         // A real flush: an open batch was present and is being closed.
         // Attribute it for the `vk renderpass flush src` telemetry.
         reason.record();
-        if platform.gpu.renderer_failed {
+        if platform.renderer_failed {
             log::debug!(
                 "render flush_render_batch: renderer_failed; dropping batch \
                  (coalesced {} composites)",

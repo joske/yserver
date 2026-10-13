@@ -9,7 +9,7 @@ use crate::kms::{
         },
         glyph_atlas::GlyphAtlas,
         glyph_pixels::GlyphSourceFormat,
-        platform::{FenceTicket, PlatformBackend},
+        gpu::{FenceTicket, GpuCore},
         store::DrawableStore,
         target::Dst,
     },
@@ -69,7 +69,7 @@ impl RenderEngine {
     pub(super) fn reset_glyph_atlas(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut PlatformBackend,
+        platform: &mut GpuCore,
     ) -> Result<(), RenderError> {
         self.close_open_frame(
             store,
@@ -155,7 +155,7 @@ impl RenderEngine {
     pub(crate) fn composite_glyphs(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut PlatformBackend,
+        platform: &mut GpuCore,
         dst: Dst,
         op: u8,
         dst_pict_format: u32,
@@ -206,7 +206,7 @@ impl RenderEngine {
     fn composite_glyphs_via_frame_builder(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut PlatformBackend,
+        platform: &mut GpuCore,
         dst: Dst,
         op: u8,
         dst_pict_format: u32,
@@ -235,7 +235,7 @@ impl RenderEngine {
             Some(i) => i,
             None => return Err(RenderError::NoVk),
         };
-        if platform.gpu.renderer_failed {
+        if platform.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
         let (dst_extent, dst_format, dst_depth) = {
@@ -333,7 +333,7 @@ impl RenderEngine {
             // Release the inner borrow before calling the platform
             // method which doesn't need it.
             let _ = inner;
-            let ticket = platform.gpu.submit_group_ticket_or_open()?;
+            let ticket = platform.submit_group_ticket_or_open()?;
             let inner = self.inner.as_mut().expect("inner");
             inner.acquire_generation = inner.acquire_generation.saturating_add(1);
             let frame_generation = inner.acquire_generation;
@@ -458,7 +458,7 @@ impl RenderEngine {
             // acquire_generation at open and capture the value on
             // the fresh OpenFrame (same shape as the initial open
             // above).
-            let new_ticket = platform.gpu.submit_group_ticket_or_open()?;
+            let new_ticket = platform.submit_group_ticket_or_open()?;
             let inner = self.inner.as_mut().expect("inner");
             inner.acquire_generation = inner.acquire_generation.saturating_add(1);
             let frame_generation = inner.acquire_generation;

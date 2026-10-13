@@ -302,14 +302,14 @@ fn freed_cursor_releases_its_sprite_pixmap() {
     b.engine
         .close_open_frame(
             &mut b.store,
-            &mut b.platform,
+            &mut b.platform.gpu,
             crate::kms::render::frame_builder::CloseReason::SyncWait,
         )
         .expect("close frame");
     b.engine
         .flush_submit_group(
             &mut b.store,
-            &mut b.platform,
+            &mut b.platform.gpu,
             crate::kms::render::submit_group::FlushReason::SyncBoundary,
         )
         .expect("flush");
@@ -340,14 +340,14 @@ fn idle_server_wakes_to_release_a_pixmap_freed_in_flight() {
     b.engine
         .close_open_frame(
             &mut b.store,
-            &mut b.platform,
+            &mut b.platform.gpu,
             crate::kms::render::frame_builder::CloseReason::SyncWait,
         )
         .expect("close frame");
     b.engine
         .flush_submit_group(
             &mut b.store,
-            &mut b.platform,
+            &mut b.platform.gpu,
             crate::kms::render::submit_group::FlushReason::SyncBoundary,
         )
         .expect("flush");

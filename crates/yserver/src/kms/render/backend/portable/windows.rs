@@ -304,7 +304,7 @@ impl KmsBackend {
             }];
             match self.engine.render_composite(
                 &mut self.store,
-                &mut self.platform,
+                &mut self.platform.gpu,
                 OP_SRC,
                 ResolvedSource::Drawable(SourceDrawable::whole(b_id)),
                 ResolvedSource::None,
@@ -568,7 +568,7 @@ impl KmsBackend {
                     );
                     if let Err(e) = self.engine.fill_rect(
                         &mut self.store,
-                        &mut self.platform,
+                        &mut self.platform.gpu,
                         Dst::server_internal(id),
                         rect,
                         color,
@@ -617,7 +617,7 @@ impl KmsBackend {
                 // the ring gets its real colour in step 4 (P5).
                 if let Err(e) = self.engine.fill_rect(
                     &mut self.store,
-                    &mut self.platform,
+                    &mut self.platform.gpu,
                     Dst::server_internal(id),
                     rect,
                     color,
@@ -707,7 +707,7 @@ impl KmsBackend {
         if let Some((src_rect, dst_pos)) = copy
             && let Err(e) = self.engine.copy_area(
                 &mut self.store,
-                &mut self.platform,
+                &mut self.platform.gpu,
                 Src::server_internal(id),
                 Dst::server_internal(id),
                 src_rect,
@@ -812,7 +812,7 @@ impl KmsBackend {
         };
         if let Err(e) = self.engine.copy_area(
             &mut self.store,
-            &mut self.platform,
+            &mut self.platform.gpu,
             Src::server_internal(old_id),
             Dst::server_internal(new_id),
             src_rect,
@@ -909,7 +909,7 @@ impl KmsBackend {
                 const OP_SRC: u8 = 1;
                 let composite_result = self.engine.render_composite(
                     &mut self.store,
-                    &mut self.platform,
+                    &mut self.platform.gpu,
                     OP_SRC,
                     ResolvedSource::Drawable(SourceDrawable::whole(src)),
                     ResolvedSource::None,
@@ -1127,7 +1127,7 @@ impl KmsBackend {
         let color = decode_x11_pixel_for_storage(pixel, depth, format);
         if let Err(e) = self.engine.fill_rect_batch(
             &mut self.store,
-            &mut self.platform,
+            &mut self.platform.gpu,
             target.server_backing_dst(),
             color,
             &rects,
@@ -1343,7 +1343,7 @@ impl KmsBackend {
         const OP_SRC: u8 = 1;
         let composite_result = self.engine.render_composite(
             &mut self.store,
-            &mut self.platform,
+            &mut self.platform.gpu,
             OP_SRC,
             // Border pixmaps are pixmaps by protocol — whole storage.
             ResolvedSource::Drawable(SourceDrawable::whole(tile_id)),
@@ -1503,7 +1503,7 @@ impl KmsBackend {
         const OP_SRC: u8 = 1;
         let composite_result = self.engine.render_composite(
             &mut self.store,
-            &mut self.platform,
+            &mut self.platform.gpu,
             OP_SRC,
             ResolvedSource::Drawable(SourceDrawable::whole(src)),
             ResolvedSource::None,
@@ -1660,7 +1660,7 @@ impl KmsBackend {
         // PRIVILEGED backing write: the initial clear covers the whole allocation, ring included.
         if let Err(e) = self.engine.fill_rect(
             &mut self.store,
-            &mut self.platform,
+            &mut self.platform.gpu,
             Dst::server_internal(id),
             rect,
             color,
@@ -2402,7 +2402,7 @@ impl KmsBackend {
                 .unwrap_or_else(|| GpuCore::format_for_depth(depth));
             if let Err(e) = self.engine.fill_rect(
                 &mut self.store,
-                &mut self.platform,
+                &mut self.platform.gpu,
                 target.dst(),
                 rect,
                 decode_x11_pixel_for_storage(pixel, depth, format),

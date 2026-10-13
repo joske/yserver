@@ -254,7 +254,7 @@ impl KmsBackend {
             .engine
             .get_image(
                 &mut self.store,
-                &mut self.platform,
+                &mut self.platform.gpu,
                 Src::server_internal(src.id()),
                 rect,
                 depth,
@@ -455,7 +455,7 @@ impl KmsBackend {
         let dst_pict_format = picture_pict_format(&self.core, host_dst);
         let stats = self.engine.render_composite(
             &mut self.store,
-            &mut self.platform,
+            &mut self.platform.gpu,
             op,
             src_resolved,
             mask_resolved,
@@ -648,7 +648,7 @@ impl KmsBackend {
             };
             if let Err(e) = b.engine.copy_area(
                 &mut b.store,
-                &mut b.platform,
+                &mut b.platform.gpu,
                 src.src_including_border(),
                 dst.server_backing_dst(),
                 src_rect,
@@ -1503,7 +1503,7 @@ impl KmsBackend {
 
         let stats = self.engine.render_fill_rectangles(
             &mut self.store,
-            &mut self.platform,
+            &mut self.platform.gpu,
             op,
             color_premul,
             dst_target.dst(),
@@ -1705,7 +1705,7 @@ impl KmsBackend {
             i32::from(src_y) - (i32::from(y_off) + dst_target.offset().1) - first_trap_left_p1_y;
         let stats = self.engine.render_traps_or_tris(
             &mut self.store,
-            &mut self.platform,
+            &mut self.platform.gpu,
             op,
             src_resolved,
             dst_target.dst(),
@@ -1925,7 +1925,7 @@ impl KmsBackend {
             i32::from(src_y) - (i32::from(y_off) + dst_target.offset().1) - first_tri_p1_y;
         let stats = self.engine.render_traps_or_tris(
             &mut self.store,
-            &mut self.platform,
+            &mut self.platform.gpu,
             op,
             src_resolved,
             dst_target.dst(),
@@ -2046,7 +2046,7 @@ impl KmsBackend {
             })
             .collect();
         if let Err(e) = self.engine.build_and_insert_linear_gradient(
-            &mut self.platform,
+            &mut self.platform.gpu,
             picture_xid,
             (p1x, p1y),
             (p2x, p2y),
@@ -2105,7 +2105,7 @@ impl KmsBackend {
             })
             .collect();
         if let Err(e) = self.engine.build_and_insert_radial_gradient(
-            &mut self.platform,
+            &mut self.platform.gpu,
             picture_xid,
             (icx, icy, ir),
             (ocx, ocy, or_),

@@ -1495,7 +1495,7 @@ fn a_grown_root_storage_is_filled_with_the_root_background() {
         .engine
         .get_image(
             &mut b.store,
-            &mut b.platform,
+            &mut b.platform.gpu,
             crate::kms::render::target::Src::server_internal(root_id),
             ash::vk::Rect2D {
                 offset: ash::vk::Offset2D {
@@ -1562,7 +1562,7 @@ fn a_resized_root_keeps_its_background_pixmap() {
         .engine
         .get_image(
             &mut b.store,
-            &mut b.platform,
+            &mut b.platform.gpu,
             crate::kms::render::target::Src::server_internal(root_id),
             ash::vk::Rect2D {
                 offset: ash::vk::Offset2D { x, y: 4 },

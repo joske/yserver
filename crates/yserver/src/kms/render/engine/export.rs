@@ -1,7 +1,6 @@
 use crate::kms::render::{
     engine::{RenderEngine, RenderError},
     gpu::GpuCore,
-    platform::PlatformBackend,
     store::{DrawableId, DrawableStore},
 };
 use ash::vk;
@@ -27,7 +26,7 @@ impl RenderEngine {
     /// `vk::Result` from allocation / view creation / the blocking copy.
     pub(crate) fn promote_drawable_exportable(
         &mut self,
-        platform: &mut PlatformBackend,
+        platform: &mut GpuCore,
         store: &mut DrawableStore,
         id: DrawableId,
     ) -> Result<(), RenderError> {
@@ -73,7 +72,7 @@ impl RenderEngine {
             (s.extent, s.format, s.depth, s.current_layout, s.image)
         };
 
-        let vk = platform.gpu.vk().ok_or(RenderError::NoVk)?.clone();
+        let vk = platform.vk().ok_or(RenderError::NoVk)?.clone();
 
         // (a) allocate exportable target.
         let exp =
@@ -149,7 +148,7 @@ impl RenderEngine {
     /// / fence wait.
     fn copy_image_blocking(
         &mut self,
-        platform: &PlatformBackend,
+        platform: &GpuCore,
         src: vk::Image,
         src_layout: vk::ImageLayout,
         dst: vk::Image,
@@ -158,7 +157,6 @@ impl RenderEngine {
         let inner = self.inner.as_ref().ok_or(RenderError::NoVk)?;
         let vk = Arc::clone(&inner.vk);
         let pool = platform
-            .gpu
             .ops_command_pool_handle()
             .ok_or(RenderError::NoVk)?;
 

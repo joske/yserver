@@ -43,7 +43,7 @@ impl KmsBackend {
     /// shutdown block, after PRESENT completions are drained
     /// and before `backend` drops.
     pub fn shutdown_destroy_drawables(&mut self) {
-        self.store.shutdown_destroy_all(&self.platform);
+        self.store.shutdown_destroy_all(&self.platform.gpu);
     }
 
     /// Signal (and release) every wake pin still retained after the last
@@ -1365,7 +1365,7 @@ impl KmsBackend {
         // Spec § "Phase A — concrete scope" trigger 2 (Codex pass-3 fix).
         if let Err(e) = self.engine.flush_render_batch(
             &mut self.store,
-            &mut self.platform,
+            &mut self.platform.gpu,
             crate::kms::render::engine::RenderFlushReason::Present,
         ) {
             log::warn!("render enqueue_present_completion: flush_render_batch failed: {e:?}");
@@ -1384,7 +1384,7 @@ impl KmsBackend {
                 Ok(()) => {
                     if let Err(e) = self.engine.close_open_frame(
                         &mut self.store,
-                        &mut self.platform,
+                        &mut self.platform.gpu,
                         crate::kms::render::frame_builder::CloseReason::PresentCompletionSignal,
                     ) {
                         log::warn!(
@@ -1404,7 +1404,7 @@ impl KmsBackend {
         // builder. Same hazard as Task 6.1 (VUID-VkFenceGetFdInfoKHR-handleType-01457).
         if let Err(e) = self.engine.close_open_frame(
             &mut self.store,
-            &mut self.platform,
+            &mut self.platform.gpu,
             crate::kms::render::frame_builder::CloseReason::PresentCompletionSignal,
         ) {
             log::warn!("render enqueue_present_completion: close_open_frame failed: {e:?}");
@@ -1413,7 +1413,7 @@ impl KmsBackend {
         self.drain_frame_builder_telemetry();
         if let Err(e) = self.engine.flush_submit_group(
             &mut self.store,
-            &mut self.platform,
+            &mut self.platform.gpu,
             crate::kms::render::submit_group::FlushReason::PresentCompletionSignal,
         ) {
             log::warn!("render enqueue_present_completion: flush_submit_group failed: {e:?}");

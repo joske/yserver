@@ -170,7 +170,7 @@ impl KmsBackend {
         };
         if let Err(e) = self.engine.put_image(
             &mut self.store,
-            &mut self.platform,
+            &mut self.platform.gpu,
             Dst::server_internal(id),
             ash::vk::Offset2D::default(),
             ash::vk::Extent2D {
@@ -219,7 +219,7 @@ impl KmsBackend {
             .record_get_image_site(crate::kms::render::telemetry::GetImageSite::CursorDepth1);
         match self.engine.get_image(
             &mut self.store,
-            &mut self.platform,
+            &mut self.platform.gpu,
             Src::server_internal(id),
             rect,
             1,
@@ -259,7 +259,7 @@ impl KmsBackend {
             .record_get_image_site(crate::kms::render::telemetry::GetImageSite::CursorBgra);
         match self.engine.get_image(
             &mut self.store,
-            &mut self.platform,
+            &mut self.platform.gpu,
             Src::server_internal(id),
             rect,
             32,
@@ -877,7 +877,7 @@ impl KmsBackend {
             self.engine
                 .put_image(
                     &mut self.store,
-                    &mut self.platform,
+                    &mut self.platform.gpu,
                     Dst::server_internal(pixmap_id),
                     ash::vk::Offset2D::default(),
                     ash::vk::Extent2D {

@@ -317,7 +317,7 @@ leaf_id={leaf_id:?} redirected_target={redirected_target:?} resolved={resolved:?
             .record_get_image_site(crate::kms::render::telemetry::GetImageSite::ImageText);
         let bytes = match backend.engine.get_image(
             &mut backend.store,
-            &mut backend.platform,
+            &mut backend.platform.gpu,
             Src::server_internal(t.id),
             rect,
             t.depth,

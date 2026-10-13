@@ -769,7 +769,7 @@ fn drive_render_composite_same_key_for_tests(
         engine
             .render_composite(
                 store,
-                platform,
+                &mut platform.gpu,
                 OP_OVER,
                 ResolvedSource::Drawable(SourceDrawable::whole(src)),
                 ResolvedSource::None,

@@ -12,7 +12,7 @@ use std::{mem::ManuallyDrop, sync::Arc};
 
 use ash::vk;
 
-use super::{engine::StagingBuffer, platform::FenceTicket};
+use super::{engine::StagingBuffer, gpu::FenceTicket};
 use crate::kms::vk::device::VkContext;
 
 /// Allocation granularity, so a cursor that grows by a few pixels reuses the
@@ -244,7 +244,7 @@ mod tests {
 
     /// A fence ticket whose (empty) submit has already been queued, as a
     /// compose that reached the GPU leaves it.
-    fn executed(vk: &Arc<VkContext>, pool: &super::super::platform::FencePool) -> FenceTicket {
+    fn executed(vk: &Arc<VkContext>, pool: &super::super::gpu::FencePool) -> FenceTicket {
         let ticket = pool.acquire().expect("fence");
         unsafe {
             vk.device
@@ -285,7 +285,7 @@ mod tests {
     #[ignore = "needs live Vulkan ICD"]
     fn a_save_changes_only_when_its_compose_reached_the_gpu() {
         let vk = VkContext::new().expect("vk");
-        let pool = super::super::platform::FencePool::new(Arc::clone(&vk));
+        let pool = super::super::gpu::FencePool::new(Arc::clone(&vk));
         let image = vk::Image::from_raw(0x1234);
         let mut saves = CursorSaves::default();
         let px = |bytes: &[u8], x: usize, y: usize| bytes[(y * 16 + x) * 4];

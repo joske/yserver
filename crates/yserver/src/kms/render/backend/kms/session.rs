@@ -89,7 +89,7 @@ impl KmsBackend {
             crate::kms::backend::primary_output_center(&platform.outputs, fb_w, fb_h);
         core.cursor_x = init_cx as f32;
         core.cursor_y = init_cy as f32;
-        let engine = RenderEngine::new(&platform)
+        let engine = RenderEngine::new(&platform.gpu)
             .map_err(|e| io::Error::other(format!("render RenderEngine::new failed: {e:?}")))?;
         let scene = SceneCompositor::new(&platform)
             .map_err(|e| io::Error::other(format!("render SceneCompositor::new failed: {e:?}")))?;
@@ -325,14 +325,14 @@ impl KmsBackend {
         // docs/superpowers/findings/2026-09-01-damage-completeness-audit.md.
         if let Err(e) = self.engine.close_open_frame(
             &mut self.store,
-            &mut self.platform,
+            &mut self.platform.gpu,
             crate::kms::render::frame_builder::CloseReason::LegacyScCompose,
         ) {
             log::warn!("render composite_and_flip: close_open_frame failed: {e:?}");
         }
         if let Err(e) = self.engine.flush_submit_group(
             &mut self.store,
-            &mut self.platform,
+            &mut self.platform.gpu,
             crate::kms::render::submit_group::FlushReason::SceneCompose,
         ) {
             log::warn!("render composite_and_flip: flush_submit_group failed: {e:?}");
@@ -370,7 +370,7 @@ impl KmsBackend {
         self.drain_engine_present_batches();
         if let Err(e) = self.engine.flush_render_batch(
             &mut self.store,
-            &mut self.platform,
+            &mut self.platform.gpu,
             crate::kms::render::engine::RenderFlushReason::Other,
         ) {
             log::warn!("render disable_output: flush_render_batch failed: {e:?}");
@@ -380,7 +380,8 @@ impl KmsBackend {
         // platform's `device_wait_idle` + pool destruction so
         // each subsystem's book-keeping reclaims its handles
         // against the still-live pool.
-        self.engine.shutdown(&mut self.store, &mut self.platform);
+        self.engine
+            .shutdown(&mut self.store, &mut self.platform.gpu);
         // Phase B.1 Task 21: drain close events emitted by shutdown.
         self.drain_frame_builder_telemetry();
         self.sync_descriptor_pool_telemetry();
