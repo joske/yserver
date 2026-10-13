@@ -141,7 +141,7 @@ pub struct ScenePresence {
     pub id: ParticipantId,
     /// Placement (unclipped by occlusion), output-local — the damage-side
     /// summary, under the 32-box cap (a superset is safe when it is *added*).
-    pub region: Region,
+    pub(crate) region: Region,
     /// The exact placement rects, in EMISSION order — the participant's
     /// **identity** for the diff. `region` cannot serve: past the cap it
     /// collapses towards its bounding box, so two shapes of more than 32
@@ -160,7 +160,7 @@ pub struct ScenePresence {
     /// What of `region` nothing above covers. Empty for a fully hidden
     /// participant, which is **still a participant**. Not read by the diff.
     pub visible: Region,
-    pub signature: PresenceSignature,
+    pub(crate) signature: PresenceSignature,
 }
 
 /// Build a presence from a participant's placement rects.

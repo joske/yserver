@@ -171,7 +171,7 @@ impl Region {
         self.boxes.clear();
     }
 
-    pub fn rect_count(&self) -> usize {
+    pub(crate) fn rect_count(&self) -> usize {
         self.boxes.len()
     }
 
@@ -212,7 +212,7 @@ impl Region {
         }
     }
 
-    pub fn union_with(&mut self, other: &Region) {
+    pub(crate) fn union_with(&mut self, other: &Region) {
         if other.is_empty() {
             return;
         }
@@ -332,7 +332,7 @@ impl Region {
     /// cover what was asked to be repainted. Painting less than the repaint
     /// region while recording it as painted is the mistake that leaves stale
     /// pixels and clears `missing` for them anyway.
-    pub fn contains(&self, other: &Region) -> bool {
+    pub(crate) fn contains(&self, other: &Region) -> bool {
         let mut remainder = other.clone();
         remainder.subtract(self);
         remainder.is_empty()
@@ -342,7 +342,7 @@ impl Region {
     ///
     /// This is the opaque-cover guard's primitive: a clipped repaint is only
     /// safe where the repaint region is fully covered by an opaque draw.
-    pub fn contains_rect(&self, rect: vk::Rect2D) -> bool {
+    pub(crate) fn contains_rect(&self, rect: vk::Rect2D) -> bool {
         let Some(q) = Box2D::from_rect(rect) else {
             return true;
         };

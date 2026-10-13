@@ -695,7 +695,7 @@ pub struct Drawable {
     /// forced full recompose draws it from storage and the ack drains
     /// it, clearing this flag. Reconciled only when every output walked
     /// this tick (see `SceneCompositor::tick`).
-    pub dormant: Option<DormantReason>,
+    pub(crate) dormant: Option<DormantReason>,
 
     /// Ungated monotonic content-write counter. Bumped (saturating) on EVERY
     /// write to this drawable's pixels — the eight engine paint entry points —

@@ -255,7 +255,7 @@ impl ScanoutDamage {
         !self.pending.is_empty()
     }
 
-    pub fn has_staged_frame(&self) -> bool {
+    pub(crate) fn has_staged_frame(&self) -> bool {
         self.in_flight.is_some()
     }
 
@@ -270,7 +270,7 @@ impl ScanoutDamage {
 
     /// Stale area of one BO, for telemetry and for the gate that asks whether a
     /// run actually exercised the per-BO model rather than only `pending`.
-    pub fn missing_area(&self, bo_idx: usize) -> u64 {
+    pub(crate) fn missing_area(&self, bo_idx: usize) -> u64 {
         self.missing.get(bo_idx).map_or(0, Region::area)
     }
 }
