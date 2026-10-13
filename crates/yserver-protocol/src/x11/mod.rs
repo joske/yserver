@@ -20,6 +20,7 @@ pub mod composite;
 pub mod damage;
 pub mod dpms;
 pub mod dri3;
+pub mod gc;
 pub mod glx;
 pub mod mit_shm;
 pub mod present;
