@@ -178,6 +178,18 @@ The cursor-plane calls scene makes (`fits`, `visible`, `uploaded_version`,
 separate `CursorPlaneSink`, a one-to-one pass-through of today's methods.
 Scene reaches it only through `sink.cursor_plane()`, so there is one sink
 borrow, never two trait objects over the same `PlatformBackend`.
+
+Of those methods only `show` returns a KMS type today:
+`cursor_plane_show_on_crtc` (`platform/cursor.rs:461`) returns
+`kms::cursor_plane::CursorShowError` (`Unbound` / `StillVisible`); the others
+return `io::Result`, `bool` or `Option<u64>`, which cross as they are. Scene
+uses exactly two things from the show error (`scene/cursor.rs:517–527`):
+`remains_visible()` to choose `VisibleNeedsShowRetry` over `Hidden`, and its
+`Display` for the warning. So render defines
+`CursorShowFailure { remains_visible: bool, error: Box<dyn std::error::Error + Send + Sync> }`
+with `Display` delegating to `error`, and the sink converts
+(`remains_visible: e.remains_visible(), error: Box::new(e)`). The log text is
+unchanged; `CursorShowError` stays in `yserver`.
 The NVIDIA cursor investigation (issue #241, from 2026-10-13 evening) is
 expected to change the cursor path. The legacy `MoveCursor` calls are outside
 scene (`pointer.rs:647, 673`, `scanout.rs:1789`) and untouched by 3b; if the
@@ -234,6 +246,11 @@ all of today's token fields; the copied post-compose preparation is stored in
 the target with validation still before command-buffer recording (2b); the
 borrow sequence is spelled out, `begin_frame` is dropped, and the cursor
 trait is reached through the single sink borrow (2a, 4).
+
+**Round 2 (codex, 2026-10-13):** round-1 fixes confirmed. One gap fixed in
+decision 4: the cursor show error crosses as a render-owned
+`CursorShowFailure` (`remains_visible` + boxed error), converted in the sink,
+so scene never names `CursorShowError`. No other blocker.
 
 ## Questions for the review
 
