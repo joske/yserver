@@ -1,7 +1,7 @@
 use super::*;
 use crate::kms::{
     core::KmsCore,
-    render::{platform::PlatformBackend, store::DrawableStore},
+    render::{gpu::GpuCore, platform::PlatformBackend, store::DrawableStore},
 };
 
 /// Stage 3f.6 — `build_scene` walks top-level → mapped
@@ -1337,7 +1337,7 @@ fn manual_redirected_top_level_skips_emit_unconditional() {
         let w_id = store.lookup(w).expect("w lookup");
         let mut backing = crate::kms::render::store::Storage::for_tests_null(
             extent(50, 50),
-            PlatformBackend::format_for_depth(24),
+            GpuCore::format_for_depth(24),
         );
         let view: vk::ImageView = ash::vk::Handle::from_raw(0xBEEF_0000);
         backing.image_view = view;
@@ -1540,7 +1540,7 @@ fn automatic_redirected_top_level_still_emits() {
     let w_id = store.lookup(w).expect("w lookup");
     let mut backing = crate::kms::render::store::Storage::for_tests_null(
         extent(50, 50),
-        PlatformBackend::format_for_depth(24),
+        GpuCore::format_for_depth(24),
     );
     let view: vk::ImageView = ash::vk::Handle::from_raw(0xBEEF_0001);
     backing.image_view = view;
@@ -1622,7 +1622,7 @@ fn compositor_stage_under_cow_emits_via_recursion_and_manual_siblings_skip() {
     let s_id = store.lookup(s).expect("s lookup");
     let mut s_backing = crate::kms::render::store::Storage::for_tests_null(
         extent(50, 50),
-        PlatformBackend::format_for_depth(24),
+        GpuCore::format_for_depth(24),
     );
     let s_view: vk::ImageView = ash::vk::Handle::from_raw(0xDEAD_0050);
     s_backing.image_view = s_view;

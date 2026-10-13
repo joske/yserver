@@ -1080,6 +1080,7 @@ impl KmsBackend {
         // don't paint still get a stable handle).
         match self
             .platform
+            .gpu
             .allocate_drawable_storage(width, height, depth)
         {
             Ok(storage) => {

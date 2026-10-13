@@ -1,7 +1,7 @@
-use crate::kms::render::{platform::PlatformBackend, store::Storage};
+use crate::kms::render::{gpu::GpuCore, store::Storage};
 use ash::vk;
 
-impl PlatformBackend {
+impl GpuCore {
     // ── Storage allocation (Stage 2c) ───────────────────────────
 
     /// Sample-side view swizzle for a (format, depth) pair. The
@@ -159,7 +159,6 @@ impl PlatformBackend {
         category: crate::kms::vk::mem_accounting::MemCategory,
     ) -> Result<Storage, vk::Result> {
         let vk = self
-            .gpu
             .vk
             .as_ref()
             .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
@@ -173,7 +172,7 @@ impl PlatformBackend {
         // a fresh Vk allocate. v1's pool keys on
         // (width, height, format); the usage flag set is constant
         // across all server-owned pixmaps (matches v1).
-        if let Some(pool) = self.gpu.pixmap_pool.as_ref() {
+        if let Some(pool) = self.pixmap_pool.as_ref() {
             let key = crate::kms::vk::pixmap_pool::PixmapPoolKey {
                 width: extent.width,
                 height: extent.height,

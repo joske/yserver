@@ -494,7 +494,7 @@ impl KmsBackend {
         // the attachment view; the sample-side view applies the
         // format/depth-aware swizzle the scene compositor relies on
         // (depth-24 BGRA8 → α=ONE).
-        let sample_view = crate::kms::render::platform::PlatformBackend::build_sample_view(
+        let sample_view = crate::kms::render::gpu::GpuCore::build_sample_view(
             &vk,
             drawable.vk_image,
             drawable.format,

@@ -14,7 +14,7 @@ use crate::kms::{
         },
         engine::decode_x11_pixel_for_storage,
         glyph_pixels::GlyphSourceFormat,
-        platform::PlatformBackend,
+        gpu::GpuCore,
         submit_trace::{Flags as SubmitFlags, Op as SubmitOp, SrcClass, SubmitEvent, SubmitKind},
         target::PaintTarget,
     },
@@ -303,7 +303,7 @@ impl KmsBackend {
             .store
             .get(target.backing_id())
             .map(|d| d.storage.format)
-            .unwrap_or_else(|| PlatformBackend::format_for_depth(depth));
+            .unwrap_or_else(|| GpuCore::format_for_depth(depth));
         let color = decode_x11_pixel_for_storage(background, depth, format);
         let rect = ash::vk::Rect2D {
             offset: ash::vk::Offset2D {

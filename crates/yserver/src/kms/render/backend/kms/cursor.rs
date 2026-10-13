@@ -138,20 +138,22 @@ impl KmsBackend {
         &mut self,
         record: &std::sync::Arc<crate::kms::render::cursor::CursorRecord>,
     ) -> Option<crate::kms::render::store::DrawableId> {
-        let storage = match self
-            .platform
-            .allocate_drawable_storage(record.width, record.height, 32)
-        {
-            Ok(s) => s,
-            Err(e) => {
-                log::debug!(
-                    "render cursor sprite alloc: storage failed ({}x{}, depth 32): {e:?}",
-                    record.width,
-                    record.height,
-                );
-                return None;
-            }
-        };
+        let storage =
+            match self
+                .platform
+                .gpu
+                .allocate_drawable_storage(record.width, record.height, 32)
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    log::debug!(
+                        "render cursor sprite alloc: storage failed ({}x{}, depth 32): {e:?}",
+                        record.width,
+                        record.height,
+                    );
+                    return None;
+                }
+            };
         let sprite_xid = self.core.next_host_xid();
         let id = match self.store_alloc(
             sprite_xid,

@@ -36,9 +36,9 @@ use crate::{
         backend::OutputKey,
         cpu_types::{Rectangle16, Repeat},
         render::{
+            gpu::GpuCore,
             platform::{
-                ConnectorSnapshot, CrtcKey, PlatformBackend, QualifiedScanoutPlan, RenderDevice,
-                RenderDeviceId,
+                ConnectorSnapshot, CrtcKey, QualifiedScanoutPlan, RenderDevice, RenderDeviceId,
             },
             store::Storage,
         },

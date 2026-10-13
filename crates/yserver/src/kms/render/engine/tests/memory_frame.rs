@@ -173,6 +173,7 @@ fn create_pixmap(
     depth: u8,
 ) -> Result<DrawableId, RenderError> {
     let storage = platform
+        .gpu
         .allocate_drawable_storage(w, h, depth)
         .map_err(RenderError::Vk)?;
     store
@@ -245,6 +246,7 @@ fn current_layout_for_drawable_reads_overlay_when_first_touched() {
     // in-frame layout to COLOR_ATTACHMENT_OPTIMAL — same shape a
     // ported `render_composite` will use at op-append time.
     let ticket = platform
+        .gpu
         .submit_group_ticket_or_open()
         .expect("submit_group_ticket_or_open");
     engine.open_frame_for_paint_for_tests(ticket);
@@ -336,6 +338,7 @@ fn commit_close_success_writes_overlay_into_storage() {
     // captures the post-op exit layout. (For `render_composite`,
     // that's SHADER_READ_ONLY_OPTIMAL per Pitfall 6.)
     let ticket = platform
+        .gpu
         .submit_group_ticket_or_open()
         .expect("submit_group_ticket_or_open");
     engine.open_frame_for_paint_for_tests(ticket);
@@ -560,7 +563,7 @@ fn upload_to_frame_suballocates_aligned_slices_and_falls_back_for_oversize() {
         return;
     };
     let mut engine = RenderEngine::new(&platform).expect("engine");
-    let ticket = platform.submit_group_ticket_or_open().expect("ticket");
+    let ticket = platform.gpu.submit_group_ticket_or_open().expect("ticket");
     let inner = engine.inner.as_mut().expect("inner");
     inner.frame_builder.open_for_paint(ticket, 1);
 

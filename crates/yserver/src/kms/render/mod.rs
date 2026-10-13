@@ -19,6 +19,7 @@ pub(crate) mod frame_builder;
 pub(crate) mod geometry;
 pub(crate) mod glyph_atlas;
 pub(crate) mod glyph_pixels;
+pub(crate) mod gpu;
 pub(crate) mod imported_syncobj;
 pub(crate) mod owned_semaphore;
 pub(crate) mod platform;

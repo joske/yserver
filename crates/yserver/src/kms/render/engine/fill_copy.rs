@@ -114,7 +114,7 @@ impl RenderEngine {
         // pattern at engine.rs:5278-5287).
         if !inner.frame_builder.is_open() {
             let _ = inner;
-            let ticket = platform.submit_group_ticket_or_open()?;
+            let ticket = platform.gpu.submit_group_ticket_or_open()?;
             let inner = self.inner.as_mut().expect("inner");
             inner.acquire_generation = inner.acquire_generation.saturating_add(1);
             let frame_generation = inner.acquire_generation;
@@ -363,7 +363,7 @@ impl RenderEngine {
         // Open frame if not already open (same pattern as fill_rect_batch).
         if !inner.frame_builder.is_open() {
             let _ = inner;
-            let ticket = platform.submit_group_ticket_or_open()?;
+            let ticket = platform.gpu.submit_group_ticket_or_open()?;
             let inner = self.inner.as_mut().expect("inner");
             inner.acquire_generation = inner.acquire_generation.saturating_add(1);
             let frame_generation = inner.acquire_generation;
@@ -513,7 +513,7 @@ impl RenderEngine {
             // Release the inner borrow before calling the platform method
             // (which doesn't need it). Same `let _ = inner` pattern as line 5318.
             let _ = inner;
-            let ticket = platform.submit_group_ticket_or_open()?;
+            let ticket = platform.gpu.submit_group_ticket_or_open()?;
             let inner = self.inner.as_mut().expect("inner");
             inner.acquire_generation = inner.acquire_generation.saturating_add(1);
             let frame_generation = inner.acquire_generation;
@@ -727,7 +727,7 @@ impl RenderEngine {
         // acquire_generation at open + capture on OpenFrame.
         if !inner.frame_builder.is_open() {
             let _ = inner;
-            let ticket = platform.submit_group_ticket_or_open()?;
+            let ticket = platform.gpu.submit_group_ticket_or_open()?;
             let inner = self.inner.as_mut().expect("inner");
             inner.acquire_generation = inner.acquire_generation.saturating_add(1);
             let frame_generation = inner.acquire_generation;

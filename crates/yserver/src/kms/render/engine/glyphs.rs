@@ -333,7 +333,7 @@ impl RenderEngine {
             // Release the inner borrow before calling the platform
             // method which doesn't need it.
             let _ = inner;
-            let ticket = platform.submit_group_ticket_or_open()?;
+            let ticket = platform.gpu.submit_group_ticket_or_open()?;
             let inner = self.inner.as_mut().expect("inner");
             inner.acquire_generation = inner.acquire_generation.saturating_add(1);
             let frame_generation = inner.acquire_generation;
@@ -458,7 +458,7 @@ impl RenderEngine {
             // acquire_generation at open and capture the value on
             // the fresh OpenFrame (same shape as the initial open
             // above).
-            let new_ticket = platform.submit_group_ticket_or_open()?;
+            let new_ticket = platform.gpu.submit_group_ticket_or_open()?;
             let inner = self.inner.as_mut().expect("inner");
             inner.acquire_generation = inner.acquire_generation.saturating_add(1);
             let frame_generation = inner.acquire_generation;

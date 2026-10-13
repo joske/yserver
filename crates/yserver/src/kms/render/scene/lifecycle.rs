@@ -111,7 +111,7 @@ impl SceneCompositor {
     /// `PipelineInit` on shader / pipeline build failure;
     /// `Vk(...)` on descriptor-pool init.
     pub(crate) fn new(platform: &PlatformBackend) -> Result<Self, SceneError> {
-        let vk = platform.vk().ok_or(SceneError::NoVk)?.clone();
+        let vk = platform.gpu.vk().ok_or(SceneError::NoVk)?.clone();
         let pipeline = CompositorPipeline::new(Arc::clone(&vk), vk::Format::B8G8R8A8_UNORM)
             .map_err(SceneError::PipelineInit)?;
         // Root-overlay XOR pass pipeline cache — built for the same

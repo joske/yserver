@@ -2235,7 +2235,7 @@ impl KmsBackend {
         }
         let fb_w = self.platform.fb_w.max(1);
         let fb_h = self.platform.fb_h.max(1);
-        let storage = match self.platform.allocate_drawable_storage_as(
+        let storage = match self.platform.gpu.allocate_drawable_storage_as(
             fb_w,
             fb_h,
             24,
@@ -2257,7 +2257,7 @@ impl KmsBackend {
                         width: u32::from(fb_w),
                         height: u32::from(fb_h),
                     },
-                    crate::kms::render::platform::PlatformBackend::format_for_depth(24),
+                    crate::kms::render::gpu::GpuCore::format_for_depth(24),
                 )
             }
         };

@@ -120,7 +120,7 @@ impl RenderEngine {
         }
         let inner = self.inner.as_mut().ok_or(RenderError::NoVk)?;
         if !inner.frame_builder.is_open() {
-            let ticket = platform.submit_group_ticket_or_open()?;
+            let ticket = platform.gpu.submit_group_ticket_or_open()?;
             inner.acquire_generation = inner.acquire_generation.saturating_add(1);
             let frame_generation = inner.acquire_generation;
             inner.frame_builder.open_for_paint(ticket, frame_generation);

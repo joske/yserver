@@ -160,7 +160,7 @@ impl RenderEngine {
     /// Returns `NoVk` if `platform` was built via `for_tests`
     /// (no Vk). Production paths always have Vk.
     pub(crate) fn new(platform: &PlatformBackend) -> Result<Self, RenderError> {
-        let vk = platform.vk().ok_or(RenderError::NoVk)?.clone();
+        let vk = platform.gpu.vk().ok_or(RenderError::NoVk)?.clone();
         // SAFETY: `physical_device` belongs to `instance`.
         let limits = unsafe {
             vk.instance
@@ -234,7 +234,7 @@ impl RenderEngine {
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
-        let Some(pool) = platform.ops_command_pool_handle() else {
+        let Some(pool) = platform.gpu.ops_command_pool_handle() else {
             return;
         };
         let device = &inner.vk.device;
@@ -441,9 +441,10 @@ impl RenderEngine {
         // re-publishing write fences here is pointless. The engine's
         // commit-of-parked-ops bookkeeping below is replicated from the
         // `flush_submit_group` wrapper.
-        let result =
-            platform.flush_submit_group(crate::kms::render::submit_group::FlushReason::Shutdown);
-        if let Some(outcome) = platform.take_last_flush_outcome()
+        let result = platform
+            .gpu
+            .flush_submit_group(crate::kms::render::submit_group::FlushReason::Shutdown);
+        if let Some(outcome) = platform.gpu.take_last_flush_outcome()
             && let Some(inner) = self.inner.as_mut()
         {
             inner.pending_flush_outcomes.push(outcome);
@@ -465,7 +466,7 @@ impl RenderEngine {
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
-        let Some(pool) = platform.ops_command_pool_handle() else {
+        let Some(pool) = platform.gpu.ops_command_pool_handle() else {
             return;
         };
         let device = &inner.vk.device;
@@ -600,6 +601,7 @@ impl RenderEngine {
         depth: u8,
     ) -> Result<DrawableId, RenderError> {
         let storage = platform
+            .gpu
             .allocate_drawable_storage(w, h, depth)
             .map_err(RenderError::Vk)?;
         store

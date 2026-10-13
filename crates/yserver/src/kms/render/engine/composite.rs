@@ -153,7 +153,7 @@ impl RenderEngine {
         // seeded its image to SHADER_READ_ONLY via a one-shot clear;
         // mirror that for solid_src/solid_mask. Cost: two extra
         // synchronous submits at engine init.
-        let pool_for_init_clears = platform.ops_command_pool_handle().ok_or_else(|| {
+        let pool_for_init_clears = platform.gpu.ops_command_pool_handle().ok_or_else(|| {
             log::error!(
                 "render ensure_render_assets: no ops_command_pool for solid-image init clears"
             );
@@ -597,7 +597,7 @@ impl RenderEngine {
             // Release the inner borrow before calling the platform
             // method which doesn't need it.
             let _ = inner;
-            let ticket = platform.submit_group_ticket_or_open()?;
+            let ticket = platform.gpu.submit_group_ticket_or_open()?;
             let inner = self.inner.as_mut().expect("inner");
             inner.acquire_generation = inner.acquire_generation.saturating_add(1);
             let frame_generation = inner.acquire_generation;

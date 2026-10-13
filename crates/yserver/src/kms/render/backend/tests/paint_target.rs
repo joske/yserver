@@ -2545,7 +2545,7 @@ fn note_present_pixmap_tracks_non_cow_stage_sources_for_drawable_dump() {
                     width: 800,
                     height: 600,
                 },
-                PlatformBackend::format_for_depth(32),
+                GpuCore::format_for_depth(32),
             ),
         )
         .expect("allocate stage");
@@ -2561,7 +2561,7 @@ fn note_present_pixmap_tracks_non_cow_stage_sources_for_drawable_dump() {
                     width: 800,
                     height: 600,
                 },
-                PlatformBackend::format_for_depth(32),
+                GpuCore::format_for_depth(32),
             ),
         )
         .expect("allocate src pixmap");

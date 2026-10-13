@@ -642,7 +642,7 @@ fn read_scanout_region_named(
     let Some(vk) = backend.platform.gpu.vk.as_ref().cloned() else {
         return Err(io::Error::other("no vulkan context"));
     };
-    let Some(pool_handle) = backend.platform.ops_command_pool_handle() else {
+    let Some(pool_handle) = backend.platform.gpu.ops_command_pool_handle() else {
         return Err(io::Error::other("no ops command pool"));
     };
 

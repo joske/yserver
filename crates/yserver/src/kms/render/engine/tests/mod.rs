@@ -821,6 +821,7 @@ fn alloc_drawable_3a_with_kind(
     scene_participating: bool,
 ) -> DrawableId {
     let storage = platform
+        .gpu
         .allocate_drawable_storage(w, h, 32)
         .expect("alloc storage");
     store

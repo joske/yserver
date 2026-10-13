@@ -1,5 +1,6 @@
 use crate::kms::render::{
     engine::{RenderEngine, RenderError},
+    gpu::GpuCore,
     platform::PlatformBackend,
     store::{DrawableId, DrawableStore},
 };
@@ -72,7 +73,7 @@ impl RenderEngine {
             (s.extent, s.format, s.depth, s.current_layout, s.image)
         };
 
-        let vk = platform.vk().ok_or(RenderError::NoVk)?.clone();
+        let vk = platform.gpu.vk().ok_or(RenderError::NoVk)?.clone();
 
         // (a) allocate exportable target.
         let exp =
@@ -83,8 +84,8 @@ impl RenderEngine {
         let new_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
 
         // (d) build new views (same depth-aware swizzle the store uses).
-        let sample_view = PlatformBackend::build_sample_view(&vk, exp.image, format, depth)?;
-        let image_view = match PlatformBackend::build_attachment_view(&vk, exp.image, format) {
+        let sample_view = GpuCore::build_sample_view(&vk, exp.image, format, depth)?;
+        let image_view = match GpuCore::build_attachment_view(&vk, exp.image, format) {
             Ok(v) => v,
             Err(e) => {
                 unsafe { vk.device.destroy_image_view(sample_view, None) };
@@ -157,6 +158,7 @@ impl RenderEngine {
         let inner = self.inner.as_ref().ok_or(RenderError::NoVk)?;
         let vk = Arc::clone(&inner.vk);
         let pool = platform
+            .gpu
             .ops_command_pool_handle()
             .ok_or(RenderError::NoVk)?;
 

@@ -440,7 +440,7 @@ impl RenderEngine {
         // recorded exported writes and the eventual real submit would skip
         // their wait/publish. Leaving them queued lets the next non-empty
         // flush pick them up.
-        let exported = if platform.submit_group_size() > 0 {
+        let exported = if platform.gpu.submit_group_size() > 0 {
             store.take_exported_writes()
         } else {
             Vec::new()
@@ -452,12 +452,14 @@ impl RenderEngine {
                 .map(|(f, prewaited)| (f.as_fd(), *prewaited))
                 .collect()
         };
-        let result = platform.flush_submit_group_with_exports(reason, &exported_borrows);
+        let result = platform
+            .gpu
+            .flush_submit_group_with_exports(reason, &exported_borrows);
         // Drain the platform's last_flush_outcome regardless of Ok/Err
         // — both branches in platform's flush_submit_group populate it
         // before returning. The engine queues it for backend telemetry
         // drain (Task 3.5 wires that side).
-        if let Some(outcome) = platform.take_last_flush_outcome()
+        if let Some(outcome) = platform.gpu.take_last_flush_outcome()
             && let Some(inner) = self.inner.as_mut()
         {
             inner.pending_flush_outcomes.push(outcome);
@@ -491,7 +493,7 @@ impl RenderEngine {
         store: &mut DrawableStore,
         platform: &mut PlatformBackend,
     ) -> Result<(), RenderError> {
-        if platform.submit_group_size() >= platform.submit_group_max_size() {
+        if platform.gpu.submit_group_size() >= platform.gpu.submit_group_max_size() {
             self.flush_submit_group(
                 store,
                 platform,
@@ -688,7 +690,7 @@ impl RenderEngine {
             acc
         };
 
-        let record_result = if platform.take_forced_frame_record_failure() {
+        let record_result = if platform.gpu.take_forced_frame_record_failure() {
             Err(RenderError::RendererFailed)
         } else {
             record_result
@@ -698,7 +700,7 @@ impl RenderEngine {
             {
                 let inner = self.inner.as_mut().expect("inner");
                 let device = &inner.vk.device;
-                if let Some(pool) = platform.ops_command_pool_handle() {
+                if let Some(pool) = platform.gpu.ops_command_pool_handle() {
                     // SAFETY: cb was allocated from `pool` and never
                     // submitted; safe to free in Recording state.
                     unsafe { device.free_command_buffers(pool, &[cb]) };
@@ -745,7 +747,7 @@ impl RenderEngine {
             if pending_count == 0 {
                 None
             } else {
-                match platform.acquire_present_completion_signal() {
+                match platform.gpu.acquire_present_completion_signal() {
                     Ok(s) => Some(s),
                     Err(e) => {
                         // The frame still submits; its completions fall
@@ -775,7 +777,7 @@ impl RenderEngine {
             {
                 let inner = self.inner.as_mut().expect("inner");
                 let device = &inner.vk.device;
-                if let Some(pool) = platform.ops_command_pool_handle() {
+                if let Some(pool) = platform.gpu.ops_command_pool_handle() {
                     unsafe { device.free_command_buffers(pool, &[cb]) };
                 }
             }
@@ -867,7 +869,7 @@ impl RenderEngine {
         }
 
         // Drive the actual vkQueueSubmit2 via engine's flush_submit_group wrapper.
-        platform.set_next_submit_cause(reason.submit_cause());
+        platform.gpu.set_next_submit_cause(reason.submit_cause());
         let flush_outcome = self.flush_submit_group(
             store,
             platform,
@@ -1282,6 +1284,7 @@ pub(super) fn begin_op_cb(
     platform: &mut PlatformBackend,
 ) -> Result<(vk::CommandBuffer, FenceTicket), RenderError> {
     let pool = platform
+        .gpu
         .ops_command_pool_handle()
         .ok_or(RenderError::NoVk)?;
     let device = &inner.vk.device;
@@ -1301,7 +1304,7 @@ pub(super) fn begin_op_cb(
     // Phase A: shared ticket comes from the open submit group. With
     // max_size = 1, the group auto-closes after one append; with
     // max_size > 1 (post-Task 4), N appends share the same ticket.
-    let ticket = match platform.submit_group_ticket_or_open() {
+    let ticket = match platform.gpu.submit_group_ticket_or_open() {
         Ok(t) => t,
         Err(e) => {
             // SAFETY: cb was begun but never submitted; safe to
@@ -1336,7 +1339,9 @@ fn end_and_submit_op_with_signal(
 ) -> Result<(), RenderError> {
     let device = &inner.vk.device;
     unsafe { device.end_command_buffer(cb)? };
-    platform.submit_paint_cb_with_semaphore(cb, ticket.fence(), completion_signal)?;
+    platform
+        .gpu
+        .submit_paint_cb_with_semaphore(cb, ticket.fence(), completion_signal)?;
     let _ = device;
     Ok(())
 }

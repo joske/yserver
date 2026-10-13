@@ -816,7 +816,10 @@ fn submit_audit_compose(
     xor_layout: vk::PipelineLayout,
 ) -> Result<bool, SceneError> {
     let descriptor_pool = create_audit_descriptor_pool(vk, scene.draws.len())?;
-    let ticket = platform.acquire_fence_ticket().map_err(SceneError::Vk)?;
+    let ticket = platform
+        .gpu
+        .acquire_fence_ticket()
+        .map_err(SceneError::Vk)?;
     let mut gpu_submitted = false;
     let result = record_and_submit_render(
         vk,
@@ -868,7 +871,10 @@ fn submit_damage_audit_compare(
     audit: &mut OutputDamageAudit,
 ) -> Result<(), SceneError> {
     let cb = audit.candidate.command_buffer;
-    let ticket = platform.acquire_fence_ticket().map_err(SceneError::Vk)?;
+    let ticket = platform
+        .gpu
+        .acquire_fence_ticket()
+        .map_err(SceneError::Vk)?;
     unsafe {
         vk.device
             .reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())

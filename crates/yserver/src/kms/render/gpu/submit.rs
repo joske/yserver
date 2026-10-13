@@ -1,7 +1,7 @@
 use crate::kms::{
     render::{
-        platform::{
-            FenceTicket, FlushOutcome, PlatformBackend, PresentCompletionSignal,
+        gpu::{
+            FenceTicket, FlushOutcome, GpuCore, PresentCompletionSignal,
             fence::create_present_completion_signal,
         },
         submit_group::FlushReason,
@@ -18,20 +18,17 @@ use std::{
     sync::Arc,
 };
 
-impl PlatformBackend {
+impl GpuCore {
     /// VkContext accessor for the engine. Returns `None` on the
     /// test fixture (`for_tests`) where Vk init is skipped.
     pub(crate) fn vk(&self) -> Option<&Arc<VkContext>> {
-        self.gpu.vk.as_ref()
+        self.vk.as_ref()
     }
 
     /// `OpsCommandPool` handle for the engine. `None` on the test
     /// fixture. Engine allocates per-op CBs from this pool.
     pub(crate) fn ops_command_pool_handle(&self) -> Option<vk::CommandPool> {
-        self.gpu
-            .ops_command_pool
-            .as_ref()
-            .map(OpsCommandPool::handle)
+        self.ops_command_pool.as_ref().map(OpsCommandPool::handle)
     }
 
     /// Phase A: append a paint CB to the open submit group. Returns
@@ -63,10 +60,10 @@ impl PlatformBackend {
         _signal_fence: vk::Fence,
         completion_signal: Option<vk::Semaphore>,
     ) -> Result<(), vk::Result> {
-        if self.gpu.vk.is_none() {
+        if self.vk.is_none() {
             return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
         }
-        self.gpu.submit_group.append(cb, completion_signal);
+        self.submit_group.append(cb, completion_signal);
         Ok(())
     }
 
@@ -81,7 +78,7 @@ impl PlatformBackend {
         completion_signal: &PresentCompletionSignal,
         signal_fence: vk::Fence,
     ) -> Result<(), vk::Result> {
-        let Some(vk) = self.gpu.vk.as_ref() else {
+        let Some(vk) = self.vk.as_ref() else {
             return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
         };
         let sig_info = [vk::SemaphoreSubmitInfo::default()
@@ -89,7 +86,7 @@ impl PlatformBackend {
             .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
         let submit = [vk::SubmitInfo2::default().signal_semaphore_infos(&sig_info)];
         crate::vk_count!(queue_submit2);
-        self.gpu.queue_submits += 1;
+        self.queue_submits += 1;
         match crate::kms::vk::submit_stats::timed(
             crate::kms::vk::submit_stats::SubmitCause::PresentSignal,
             0,
@@ -101,7 +98,7 @@ impl PlatformBackend {
         ) {
             Ok(()) => Ok(()),
             Err(e) => {
-                self.gpu.renderer_failed = true;
+                self.renderer_failed = true;
                 Err(e)
             }
         }
@@ -115,23 +112,23 @@ impl PlatformBackend {
         &mut self,
         cause: crate::kms::vk::submit_stats::SubmitCause,
     ) {
-        self.gpu.next_submit_cause = Some(cause);
+        self.next_submit_cause = Some(cause);
     }
 
     /// Phase A: count of CBs pending in the open submit group. Tests
     /// + telemetry consult this; 0 when the group is empty.
     pub(crate) fn submit_group_size(&self) -> usize {
-        self.gpu.submit_group.size()
+        self.submit_group.size()
     }
 
     /// Phase A: true if any CB has been appended since the last flush.
     pub(crate) fn submit_group_is_open(&self) -> bool {
-        self.gpu.submit_group.is_open()
+        self.submit_group.is_open()
     }
 
     /// Phase A: max capacity of the submit group before auto-flush.
     pub(crate) fn submit_group_max_size(&self) -> usize {
-        self.gpu.submit_group.max_size()
+        self.submit_group.max_size()
     }
 
     /// Phase A T8: override the SubmitGroup max-size cap.  Exposed as
@@ -139,7 +136,7 @@ impl PlatformBackend {
     /// tests (in `tests/`) can set the cap without needing
     /// `#[cfg(test)]`-gated visibility.
     pub(crate) fn submit_group_set_max_size_for_tests(&mut self, n: usize) {
-        self.gpu.submit_group.set_max_size(n);
+        self.submit_group.set_max_size(n);
     }
 
     /// Phase A T9: peek at the SubmitGroup's buffered entries in
@@ -150,7 +147,7 @@ impl PlatformBackend {
     pub(crate) fn submit_group_peek_entries_for_tests(
         &self,
     ) -> &[crate::kms::render::submit_group::GroupEntry] {
-        self.gpu.submit_group.peek_entries()
+        self.submit_group.peek_entries()
     }
 
     /// Phase A T10: arm the fault-injection latch so the next
@@ -159,24 +156,24 @@ impl PlatformBackend {
     /// `pub` wrapper on `KmsBackend` is reachable from the external
     /// `acceptance` integration-test crate.
     pub(crate) fn force_next_submit_failure_for_integration_tests(&mut self) {
-        self.gpu.force_next_submit_failure = true;
+        self.force_next_submit_failure = true;
     }
 
     /// Arm a recording failure in the next frame close (integration tests).
     pub(crate) fn force_next_frame_record_failure_for_integration_tests(&mut self) {
-        self.gpu.force_next_frame_record_failure = true;
+        self.force_next_frame_record_failure = true;
     }
 
     /// Consume the latch armed by
     /// [`Self::force_next_frame_record_failure_for_integration_tests`].
     pub(crate) fn take_forced_frame_record_failure(&mut self) -> bool {
-        std::mem::take(&mut self.gpu.force_next_frame_record_failure)
+        std::mem::take(&mut self.force_next_frame_record_failure)
     }
 
     /// Real `vkQueueSubmit2` calls this platform made for paint groups and
     /// Present signals.
     pub(crate) fn queue_submit_count(&self) -> u64 {
-        self.gpu.queue_submits
+        self.queue_submits
     }
 
     /// Phase A: explicit flush of any buffered submit group. Issues one
@@ -217,7 +214,7 @@ impl PlatformBackend {
         // entries empty).  Dropping the ticket here would force the
         // batch's eventual append to land in a ticket-less group,
         // tripping the "non-empty group has ticket" expect below.
-        let cause = self.gpu.next_submit_cause.take().unwrap_or(match reason {
+        let cause = self.next_submit_cause.take().unwrap_or(match reason {
             FlushReason::SyncBoundary => crate::kms::vk::submit_stats::SubmitCause::GroupSync,
             FlushReason::SceneCompose => crate::kms::vk::submit_stats::SubmitCause::GroupCompose,
             FlushReason::PresentCompletionSignal => {
@@ -228,26 +225,26 @@ impl PlatformBackend {
                 crate::kms::vk::submit_stats::SubmitCause::GroupOther
             }
         });
-        if self.gpu.submit_group.size() == 0 {
+        if self.submit_group.size() == 0 {
             let outcome = FlushOutcome {
                 flushed_entries: 0,
                 reason,
                 aborted: false,
             };
-            self.gpu.last_flush_outcome = Some(outcome);
+            self.last_flush_outcome = Some(outcome);
             return Ok(outcome);
         }
-        let (entries, ticket) = self.gpu.submit_group.take();
+        let (entries, ticket) = self.submit_group.take();
         let n = entries.len();
         // entries is guaranteed non-empty here (early-returned above).
-        let Some(vk) = self.gpu.vk.as_ref() else {
+        let Some(vk) = self.vk.as_ref() else {
             // Vk-less test fixture: drop entries + ticket on the floor.
             let outcome = FlushOutcome {
                 flushed_entries: n,
                 reason,
                 aborted: false,
             };
-            self.gpu.last_flush_outcome = Some(outcome);
+            self.last_flush_outcome = Some(outcome);
             return Ok(outcome);
         };
         let ticket = ticket.expect("non-empty group has ticket");
@@ -257,8 +254,8 @@ impl PlatformBackend {
         // `acceptance` integration-test crate. In production the
         // field is initialised `false` and never set, so this branch is
         // never taken.
-        if self.gpu.force_next_submit_failure {
-            self.gpu.force_next_submit_failure = false;
+        if self.force_next_submit_failure {
+            self.force_next_submit_failure = false;
             return self.abort_flush(entries, n, reason, vk::Result::ERROR_DEVICE_LOST, false);
         }
         // GLX-TFP read→write wait: snapshot every exported dma-buf's
@@ -340,7 +337,7 @@ impl PlatformBackend {
             }
         }];
         crate::vk_count!(queue_submit2);
-        self.gpu.queue_submits += 1;
+        self.queue_submits += 1;
         match crate::kms::vk::submit_stats::timed(cause, n, export_signal.is_some(), || unsafe {
             vk.device
                 .queue_submit2(vk.graphics_queue, &submit, ticket.fence())
@@ -364,7 +361,7 @@ impl PlatformBackend {
                     reason,
                     aborted: false,
                 };
-                self.gpu.last_flush_outcome = Some(outcome);
+                self.last_flush_outcome = Some(outcome);
                 Ok(outcome)
             }
             Err(e) => {
@@ -424,12 +421,10 @@ impl PlatformBackend {
         err: vk::Result,
         may_be_pending: bool,
     ) -> Result<FlushOutcome, vk::Result> {
-        self.gpu.renderer_failed = true;
+        self.renderer_failed = true;
         if may_be_pending {
             log::error!("flush_submit_group: submit failed ({err:?}); leaking {n} command buffers");
-        } else if let (Some(vk), Some(pool)) =
-            (self.gpu.vk.as_ref(), self.ops_command_pool_handle())
-        {
+        } else if let (Some(vk), Some(pool)) = (self.vk.as_ref(), self.ops_command_pool_handle()) {
             let cbs: Vec<vk::CommandBuffer> = entries.iter().map(|e| e.cb).collect();
             if !cbs.is_empty() {
                 unsafe { vk.device.free_command_buffers(pool, &cbs) };
@@ -440,7 +435,7 @@ impl PlatformBackend {
             reason,
             aborted: true,
         };
-        self.gpu.last_flush_outcome = Some(outcome);
+        self.last_flush_outcome = Some(outcome);
         Err(err)
     }
 
@@ -449,17 +444,17 @@ impl PlatformBackend {
     /// per-op ticket acquisition from today's `begin_op_cb` but the same
     /// ticket is handed back to every appender in the group.
     pub(crate) fn submit_group_ticket_or_open(&mut self) -> Result<FenceTicket, vk::Result> {
-        if let Some(t) = self.gpu.submit_group.ticket() {
+        if let Some(t) = self.submit_group.ticket() {
             return Ok(t.clone());
         }
         let fresh = self.acquire_fence_ticket()?;
-        Ok(self.gpu.submit_group.open_with(fresh))
+        Ok(self.submit_group.open_with(fresh))
     }
 
     /// Phase A: consume the last `FlushOutcome` stored by
     /// `flush_submit_group`. Returns `None` if no flush has occurred
     /// since the last call.
     pub(crate) fn take_last_flush_outcome(&mut self) -> Option<FlushOutcome> {
-        self.gpu.last_flush_outcome.take()
+        self.last_flush_outcome.take()
     }
 }

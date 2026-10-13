@@ -1,7 +1,6 @@
 use crate::kms::{
-    render::platform::{
-        FencePool, FencePoolInner, FenceTicket, FenceTicketInner, PlatformBackend,
-        PresentCompletionSignal,
+    render::gpu::{
+        FencePool, FencePoolInner, FenceTicket, FenceTicketInner, GpuCore, PresentCompletionSignal,
     },
     vk::device::VkContext,
 };
@@ -354,12 +353,11 @@ impl Drop for FencePool {
     }
 }
 
-impl PlatformBackend {
+impl GpuCore {
     pub(crate) fn acquire_present_completion_signal(
         &self,
     ) -> Result<PresentCompletionSignal, vk::Result> {
         let vk = self
-            .gpu
             .vk
             .as_ref()
             .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
@@ -378,7 +376,6 @@ impl PlatformBackend {
     /// fence creation fails.
     pub(crate) fn acquire_fence_ticket(&self) -> Result<FenceTicket, vk::Result> {
         let pool = self
-            .gpu
             .fence_pool
             .as_ref()
             .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
@@ -391,12 +388,11 @@ impl PlatformBackend {
     /// a failed-submit BO forever.
     pub(crate) fn refresh_fence_pool_failure(&mut self) {
         if self
-            .gpu
             .fence_pool
             .as_ref()
             .is_some_and(FencePool::renderer_failed)
         {
-            self.gpu.renderer_failed = true;
+            self.renderer_failed = true;
         }
     }
 }

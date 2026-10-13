@@ -5,19 +5,16 @@ use crate::{
             ActiveOutput, OutputKey, PlatformInit, PlatformInitOutput,
             platform_init as core_platform_init,
         },
-        render::{
-            platform::{
-                BoGenerationEntry, CopiedScanoutError, CopyFreeScanoutError, FencePool, GpuCore,
-                InitialScanoutRollbackGuard, KmsCursorState, KmsDevice, PlatformBackend,
-                RenderDevice, RollbackScanoutOutput, SCANOUT_POOL_DEPTH, WAKEUP_EVENTFD_TOKEN,
-                cursor::initialize_cursor_plane_for_device,
-                qualify::{
-                    allocate_copied_scanout_pool, allocate_copy_free_scanout_pool,
-                    route_requires_copy_free_probe,
-                },
-                scanout_bos::check_scanout_liveness,
+        render::platform::{
+            BoGenerationEntry, CopiedScanoutError, CopyFreeScanoutError, FencePool, GpuCore,
+            InitialScanoutRollbackGuard, KmsCursorState, KmsDevice, PlatformBackend, RenderDevice,
+            RollbackScanoutOutput, SCANOUT_POOL_DEPTH, WAKEUP_EVENTFD_TOKEN,
+            cursor::initialize_cursor_plane_for_device,
+            qualify::{
+                allocate_copied_scanout_pool, allocate_copy_free_scanout_pool,
+                route_requires_copy_free_probe,
             },
-            submit_group::SubmitGroup,
+            scanout_bos::check_scanout_liveness,
         },
         scanout_route::{RenderDeviceId, RenderKmsRelationship, ScanoutRoute},
         vk::{
@@ -674,7 +671,6 @@ impl PlatformBackend {
         let scanout_render_completion_epfd =
             crate::kms::render::completion_poller::CompletionPoller::new()?;
 
-        let submit_group = SubmitGroup::new();
         #[cfg(target_os = "linux")]
         let hotplug_monitor = match crate::kms::hotplug::DrmHotplugMonitor::new() {
             Ok(monitor) => monitor,
@@ -738,19 +734,7 @@ impl PlatformBackend {
             pending_scanout_render_completions: std::collections::VecDeque::new(),
             next_scanout_render_job_id: 1,
             scanout_readback_op: None,
-            gpu: GpuCore {
-                vk: Some(vk),
-                ops_command_pool: Some(ops_command_pool),
-                fence_pool: Some(fence_pool),
-                pixmap_pool,
-                renderer_failed: false,
-                submit_group,
-                last_flush_outcome: None,
-                force_next_submit_failure: false,
-                next_submit_cause: None,
-                force_next_frame_record_failure: false,
-                queue_submits: 0,
-            },
+            gpu: GpuCore::new(vk, ops_command_pool, fence_pool, pixmap_pool),
             scanout_readback: None,
             copy_vk_contexts,
             scanout_pools,
@@ -861,19 +845,7 @@ impl PlatformBackend {
             pending_scanout_render_completions: std::collections::VecDeque::new(),
             next_scanout_render_job_id: 1,
             scanout_readback_op: None,
-            gpu: GpuCore {
-                vk: None,
-                ops_command_pool: None,
-                fence_pool: None,
-                pixmap_pool: None,
-                renderer_failed: false,
-                submit_group: SubmitGroup::new(),
-                last_flush_outcome: None,
-                force_next_submit_failure: false,
-                next_submit_cause: None,
-                force_next_frame_record_failure: false,
-                queue_submits: 0,
-            },
+            gpu: GpuCore::for_tests(),
             scanout_readback: None,
             copy_vk_contexts: HashMap::new(),
             scanout_pools: vec![None],

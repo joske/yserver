@@ -142,7 +142,7 @@ impl SceneCompositor {
         let Some(inner) = inner.as_mut() else {
             return Err(SceneError::NoVk);
         };
-        platform.refresh_fence_pool_failure();
+        platform.gpu.refresh_fence_pool_failure();
         if platform.gpu.renderer_failed {
             return Ok(Vec::new());
         }
@@ -1110,7 +1110,7 @@ fn tick_one_output(
     let descriptor_pool = state.pool_ring.pool_at(slot);
 
     // 7. Record + submit + flip via the v2 clipped compose path.
-    let compose_ticket = match platform.acquire_fence_ticket() {
+    let compose_ticket = match platform.gpu.acquire_fence_ticket() {
         Ok(ticket) => ticket,
         Err(error) => {
             inner.outputs[output_idx].pool_ring.release(slot);

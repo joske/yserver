@@ -6,6 +6,7 @@ use crate::kms::{
             ScanoutM1ProbeCache, ScanoutM2State, ScenePlacement, TrackedWindows, WarnThrottle,
         },
         engine::{RenderEngine, decode_x11_pixel_for_storage},
+        gpu::GpuCore,
         platform::PlatformBackend,
         scene::SceneCompositor,
         store::DrawableStore,
@@ -224,8 +225,7 @@ impl KmsBackend {
         let Some(depth) = self.store.get(target.backing_id()).map(|d| d.depth) else {
             return false;
         };
-        let color =
-            decode_x11_pixel_for_storage(pixel, depth, PlatformBackend::format_for_depth(depth));
+        let color = decode_x11_pixel_for_storage(pixel, depth, GpuCore::format_for_depth(depth));
         let rect = ash::vk::Rect2D {
             offset: ash::vk::Offset2D { x, y },
             extent: ash::vk::Extent2D { width, height },
@@ -885,6 +885,7 @@ impl KmsBackend {
         let xid = self.core.next_host_xid();
         let storage = self
             .platform
+            .gpu
             .allocate_drawable_storage(width, height, 32)
             .ok()?;
         self.store_alloc(
@@ -1120,7 +1121,7 @@ impl KmsBackend {
     /// Returns `Err` if the platform's fence pool or Vk context is
     /// missing (test fixture built without Vk).
     pub fn engine_open_frame_for_paint_for_tests(&mut self) -> Result<(), ash::vk::Result> {
-        let ticket = self.platform.submit_group_ticket_or_open()?;
+        let ticket = self.platform.gpu.submit_group_ticket_or_open()?;
         self.engine.open_frame_for_paint_for_tests(ticket);
         Ok(())
     }
@@ -1234,12 +1235,13 @@ impl KmsBackend {
     /// #214: real `vkQueueSubmit2` calls made by this backend's platform
     /// for paint groups and Present signals (per instance: parallel-safe).
     pub fn platform_queue_submit_count_for_tests(&self) -> u64 {
-        self.platform.queue_submit_count()
+        self.platform.gpu.queue_submit_count()
     }
 
     /// #214: arm a recording failure in the next frame close.
     pub fn force_next_frame_record_failure_for_tests(&mut self) {
         self.platform
+            .gpu
             .force_next_frame_record_failure_for_integration_tests();
     }
 
@@ -1247,20 +1249,20 @@ impl KmsBackend {
     /// buffered and not yet submitted to the Vulkan queue).
     /// Exposed for acceptance regression tests.
     pub fn platform_submit_group_size_for_tests(&self) -> usize {
-        self.platform.submit_group_size()
+        self.platform.gpu.submit_group_size()
     }
 
     /// Phase A T6: true while the SubmitGroup is open (has at least
     /// one CB buffered). Exposed for acceptance regression tests.
     pub fn platform_submit_group_is_open_for_tests(&self) -> bool {
-        self.platform.submit_group_is_open()
+        self.platform.gpu.submit_group_is_open()
     }
 
     /// Phase A T8: override the SubmitGroup max-size cap so regression
     /// tests can exercise the auto-flush boundary at a specific count
     /// without depending on the production default.
     pub fn platform_submit_group_set_max_size_for_tests(&mut self, n: usize) {
-        self.platform.submit_group_set_max_size_for_tests(n);
+        self.platform.gpu.submit_group_set_max_size_for_tests(n);
     }
 
     /// Phase B.1 Task 10: read back the SubmitGroup max_size as
@@ -1268,7 +1270,7 @@ impl KmsBackend {
     /// `#[cfg(test)]`) so the external `acceptance` integration-test
     /// crate can assert Invariant M1 directly.
     pub fn platform_submit_group_max_size_for_tests(&self) -> usize {
-        self.platform.submit_group_max_size()
+        self.platform.gpu.submit_group_max_size()
     }
 
     /// Phase A T10: inject a `queue_submit2` failure on the next
@@ -1277,6 +1279,7 @@ impl KmsBackend {
     /// the external `acceptance` integration-test crate.
     pub fn platform_force_next_submit_failure_for_tests(&mut self) {
         self.platform
+            .gpu
             .force_next_submit_failure_for_integration_tests();
     }
 

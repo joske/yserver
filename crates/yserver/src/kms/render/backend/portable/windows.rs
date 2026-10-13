@@ -9,7 +9,7 @@ use crate::kms::{
             },
         },
         engine::decode_x11_pixel_for_storage,
-        platform::PlatformBackend,
+        gpu::GpuCore,
         store::{DrawableId, DrawableKind},
         submit_trace::{Flags as SubmitFlags, SrcClass, SubmitKind},
         target::{Dst, PaintTarget, Src},
@@ -498,7 +498,7 @@ impl KmsBackend {
             }
             LeafContent::Migrate => Some(old_id),
         };
-        let storage = match self.platform.allocate_drawable_storage_as(
+        let storage = match self.platform.gpu.allocate_drawable_storage_as(
             u16::try_from(storage_w).unwrap_or(u16::MAX),
             u16::try_from(storage_h).unwrap_or(u16::MAX),
             geom.depth,
@@ -511,7 +511,7 @@ impl KmsBackend {
                         width: storage_w,
                         height: storage_h,
                     },
-                    PlatformBackend::format_for_depth(geom.depth),
+                    GpuCore::format_for_depth(geom.depth),
                 )
             }
             Err(e) => {
@@ -562,7 +562,7 @@ impl KmsBackend {
                             decode_x11_pixel_for_storage(
                                 pixel,
                                 geom.depth,
-                                PlatformBackend::format_for_depth(geom.depth),
+                                GpuCore::format_for_depth(geom.depth),
                             )
                         },
                     );
@@ -599,7 +599,7 @@ impl KmsBackend {
                         decode_x11_pixel_for_storage(
                             pixel,
                             geom.depth,
-                            PlatformBackend::format_for_depth(geom.depth),
+                            GpuCore::format_for_depth(geom.depth),
                         )
                     },
                 );
@@ -1117,7 +1117,7 @@ impl KmsBackend {
         }
         let pixel = self.border_solid_pixel(geom, target.backing_id());
         let format = self.store.get(target.backing_id()).map_or_else(
-            || PlatformBackend::format_for_depth(geom.depth),
+            || GpuCore::format_for_depth(geom.depth),
             |d| d.storage.format,
         );
         let depth = self
@@ -1601,7 +1601,7 @@ impl KmsBackend {
         // #133 step 3: the bordered extent, as Xorg `compAllocPixmap` (`compalloc.c:610`).
         let (storage_w, storage_h) =
             bordered_storage_extent(geom.width.max(1), geom.height.max(1), geom.border_width);
-        let storage = match self.platform.allocate_drawable_storage_as(
+        let storage = match self.platform.gpu.allocate_drawable_storage_as(
             u16::try_from(storage_w).unwrap_or(u16::MAX),
             u16::try_from(storage_h).unwrap_or(u16::MAX),
             geom.depth,
@@ -1645,7 +1645,7 @@ impl KmsBackend {
             .set_content_offset(id, i32::from(geom.border_width));
         self.telemetry.record_storage_allocation();
         self.telemetry.record_image_view_create();
-        let format = PlatformBackend::format_for_depth(geom.depth);
+        let format = GpuCore::format_for_depth(geom.depth);
         let color = geom.bg_pixel.map_or_else(
             || default_window_init_color(geom.depth),
             |pixel| decode_x11_pixel_for_storage(pixel, geom.depth, format),
@@ -2399,7 +2399,7 @@ impl KmsBackend {
                 .store
                 .get(target.backing_id())
                 .map(|d| d.storage.format)
-                .unwrap_or_else(|| PlatformBackend::format_for_depth(depth));
+                .unwrap_or_else(|| GpuCore::format_for_depth(depth));
             if let Err(e) = self.engine.fill_rect(
                 &mut self.store,
                 &mut self.platform,

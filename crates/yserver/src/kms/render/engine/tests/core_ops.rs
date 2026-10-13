@@ -18,6 +18,7 @@ fn depth32_put_image_get_image_round_trip() {
     let mut engine = RenderEngine::new(&platform).expect("engine");
 
     let storage = platform
+        .gpu
         .allocate_drawable_storage(8, 8, 32)
         .expect("alloc storage");
     let id = store
@@ -86,7 +87,10 @@ fn fill_then_get_image_observes_clear_color() {
     let mut store = DrawableStore::new();
     let mut engine = RenderEngine::new(&platform).expect("engine");
 
-    let storage = platform.allocate_drawable_storage(4, 4, 32).expect("alloc");
+    let storage = platform
+        .gpu
+        .allocate_drawable_storage(4, 4, 32)
+        .expect("alloc");
     let id = store
         .allocate(
             0x1,
@@ -154,7 +158,10 @@ fn fill_depth8_observes_r8_source_byte() {
     let mut store = DrawableStore::new();
     let mut engine = RenderEngine::new(&platform).expect("engine");
 
-    let storage = platform.allocate_drawable_storage(4, 4, 8).expect("alloc");
+    let storage = platform
+        .gpu
+        .allocate_drawable_storage(4, 4, 8)
+        .expect("alloc");
     let id = store
         .allocate(
             0x1,
@@ -222,7 +229,10 @@ fn logic_fill_xor_applies_per_pixel() {
     let mut engine = RenderEngine::new(&platform).expect("engine");
 
     // 4x4 BGRA8 pixmap. Store BGRA wire bytes B, G, R, A.
-    let storage = platform.allocate_drawable_storage(4, 4, 24).expect("alloc");
+    let storage = platform
+        .gpu
+        .allocate_drawable_storage(4, 4, 24)
+        .expect("alloc");
     let id = store
         .allocate(
             0x1,
@@ -319,8 +329,8 @@ fn copy_area_disjoint_pixmaps_round_trip() {
     let mut store = DrawableStore::new();
     let mut engine = RenderEngine::new(&platform).expect("engine");
 
-    let storage_src = platform.allocate_drawable_storage(4, 4, 32).unwrap();
-    let storage_dst = platform.allocate_drawable_storage(8, 4, 32).unwrap();
+    let storage_src = platform.gpu.allocate_drawable_storage(4, 4, 32).unwrap();
+    let storage_dst = platform.gpu.allocate_drawable_storage(8, 4, 32).unwrap();
     let src = store
         .allocate(
             0x1,
@@ -438,6 +448,7 @@ fn logic_fill_depth32_preserves_wire_alpha_when_not_opaque() {
     let mut engine = RenderEngine::new(&platform).expect("engine");
 
     let storage = platform
+        .gpu
         .allocate_drawable_storage(2, 2, 32)
         .expect("storage");
     let id = store
@@ -519,6 +530,7 @@ fn logic_fill_r8_not_family_matches_x11_bytes() {
     let mut engine = RenderEngine::new(&platform).expect("engine");
 
     let storage = platform
+        .gpu
         .allocate_drawable_storage(2, 1, 8)
         .expect("storage");
     let id = store
@@ -647,8 +659,8 @@ fn copy_area_negative_offset_copies_trailing_strip() {
     let mut store = DrawableStore::new();
     let mut engine = RenderEngine::new(&platform).expect("engine");
 
-    let storage_src = platform.allocate_drawable_storage(8, 4, 32).unwrap();
-    let storage_dst = platform.allocate_drawable_storage(8, 4, 32).unwrap();
+    let storage_src = platform.gpu.allocate_drawable_storage(8, 4, 32).unwrap();
+    let storage_dst = platform.gpu.allocate_drawable_storage(8, 4, 32).unwrap();
     let src = store
         .allocate(
             0x1,
@@ -758,7 +770,7 @@ fn copy_area_self_overlap_scratch_path() {
     let mut store = DrawableStore::new();
     let mut engine = RenderEngine::new(&platform).expect("engine");
 
-    let storage = platform.allocate_drawable_storage(8, 1, 32).unwrap();
+    let storage = platform.gpu.allocate_drawable_storage(8, 1, 32).unwrap();
     let id = store
         .allocate(
             0x1,
@@ -859,7 +871,10 @@ fn put_image_then_fill_overwrites() {
     let mut store = DrawableStore::new();
     let mut engine = RenderEngine::new(&platform).expect("engine");
 
-    let storage = platform.allocate_drawable_storage(4, 4, 32).expect("alloc");
+    let storage = platform
+        .gpu
+        .allocate_drawable_storage(4, 4, 32)
+        .expect("alloc");
     let id = store
         .allocate(
             0x1,

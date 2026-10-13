@@ -8,7 +8,8 @@ use crate::{
                 portable::default_window_init_color,
             },
             engine::decode_x11_pixel_for_storage,
-            platform::{ConnectorSnapshot, PlatformBackend},
+            gpu::GpuCore,
+            platform::ConnectorSnapshot,
             store::{DrawableKind, Storage},
             target::Dst,
         },
@@ -1310,7 +1311,7 @@ impl KmsBackend {
         if let Some(old_id) = self.store.lookup(root_xid) {
             self.store.detach_xid(root_xid);
             self.store_decref_with_invalidate(old_id);
-            match self.platform.allocate_drawable_storage_as(
+            match self.platform.gpu.allocate_drawable_storage_as(
                 w,
                 h,
                 32,
@@ -1338,7 +1339,7 @@ impl KmsBackend {
                                         yserver_core::resources::ROOT_DEFAULT_BACKGROUND_PIXEL,
                                     ),
                                     24,
-                                    PlatformBackend::format_for_depth(24),
+                                    GpuCore::format_for_depth(24),
                                 ),
                             ) && self.platform.gpu.vk.is_some()
                             {
@@ -1365,7 +1366,7 @@ impl KmsBackend {
                             width: u32::from(w),
                             height: u32::from(h),
                         },
-                        PlatformBackend::format_for_depth(32),
+                        GpuCore::format_for_depth(32),
                     );
                     if let Err(e) =
                         self.store_alloc(root_xid, DrawableKind::Root, 32, true, storage)
@@ -1392,7 +1393,7 @@ impl KmsBackend {
             let cow_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
             self.store.detach_xid(cow_xid);
             self.store_decref_with_invalidate(old_cow_id);
-            match self.platform.allocate_drawable_storage_as(
+            match self.platform.gpu.allocate_drawable_storage_as(
                 w,
                 h,
                 24,
@@ -1454,7 +1455,7 @@ impl KmsBackend {
                             width: u32::from(w),
                             height: u32::from(h),
                         },
-                        PlatformBackend::format_for_depth(24),
+                        GpuCore::format_for_depth(24),
                     );
                     match self.store_alloc(cow_xid, DrawableKind::Window, 24, true, storage) {
                         Ok(new_cow_id) => {

@@ -1428,12 +1428,13 @@ impl KmsBackend {
 
         let mut batch_ticket = fallback_ticket;
         let (wait, signal) = match (
-            self.platform.acquire_present_completion_signal(),
-            self.platform.acquire_fence_ticket(),
+            self.platform.gpu.acquire_present_completion_signal(),
+            self.platform.gpu.acquire_fence_ticket(),
         ) {
             (Ok(signal), Ok(ticket)) => {
                 match self
                     .platform
+                    .gpu
                     .submit_present_completion_signal(&signal, ticket.fence())
                 {
                     Ok(()) => {

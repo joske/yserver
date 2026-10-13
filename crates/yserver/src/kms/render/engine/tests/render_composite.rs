@@ -33,6 +33,7 @@ fn alloc_filled_pixmap(
     color_bgra_premul: [f32; 4],
 ) -> DrawableId {
     let storage = platform
+        .gpu
         .allocate_drawable_storage(w, h, 32)
         .expect("alloc storage");
     let id = store
@@ -183,6 +184,7 @@ fn composite_glyphs_add_accumulates_into_r8_mask() {
 
     // Depth-8 pixmap → R8_UNORM storage (format_for_depth).
     let storage = platform
+        .gpu
         .allocate_drawable_storage(4, 4, 8)
         .expect("alloc a8 mask storage");
     let mask = store
@@ -299,6 +301,7 @@ fn composite_glyphs_add_mask_then_composite_src_renders_text() {
 
     // Pass 1: a8 mask with a full-coverage 2×2 glyph at (1,1).
     let storage = platform
+        .gpu
         .allocate_drawable_storage(4, 4, 8)
         .expect("alloc a8 mask storage");
     let mask = store
@@ -1198,7 +1201,10 @@ fn render_composite_self_alias() {
     let mut engine = RenderEngine::new(&platform).expect("engine");
 
     // Allocate + PutImage a distinct pattern (per-pixel unique).
-    let storage = platform.allocate_drawable_storage(8, 4, 32).expect("alloc");
+    let storage = platform
+        .gpu
+        .allocate_drawable_storage(8, 4, 32)
+        .expect("alloc");
     let dst = store
         .allocate(
             0x1,
@@ -1454,6 +1460,7 @@ fn fill_rect_batch_one_submit_for_n_rects() {
     let mut engine = RenderEngine::new(&platform).expect("engine");
 
     let storage = platform
+        .gpu
         .allocate_drawable_storage(16, 4, 32)
         .expect("alloc");
     let id = store

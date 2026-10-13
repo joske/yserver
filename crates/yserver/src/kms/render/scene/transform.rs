@@ -262,7 +262,10 @@ impl SceneCompositor {
             let cursor_save = state.cursor_saves.prepare(&vk, scale.image, cursor_rect);
             let draws = built.scene.draws.len();
             let pool = create_audit_descriptor_pool(&vk, draws)?;
-            let ticket = platform.acquire_fence_ticket().map_err(SceneError::Vk)?;
+            let ticket = platform
+                .gpu
+                .acquire_fence_ticket()
+                .map_err(SceneError::Vk)?;
             let mut submitted = false;
             let result = record_and_submit_render(
                 &vk,

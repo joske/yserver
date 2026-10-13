@@ -567,7 +567,7 @@ fn record_text_run_scissored_draws_only_the_requested_instance_range() {
         eprintln!("no Vk — skipping");
         return;
     };
-    let Some(pool) = platform.ops_command_pool_handle() else {
+    let Some(pool) = platform.gpu.ops_command_pool_handle() else {
         eprintln!("no ops command pool — skipping");
         return;
     };

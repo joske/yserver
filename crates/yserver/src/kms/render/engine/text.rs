@@ -223,7 +223,7 @@ impl RenderEngine {
         // (5) Open frame if not already open.
         if !inner.frame_builder.is_open() {
             let _ = inner;
-            let ticket = platform.submit_group_ticket_or_open()?;
+            let ticket = platform.gpu.submit_group_ticket_or_open()?;
             let inner = self.inner.as_mut().expect("inner");
             inner.acquire_generation = inner.acquire_generation.saturating_add(1);
             let frame_generation = inner.acquire_generation;

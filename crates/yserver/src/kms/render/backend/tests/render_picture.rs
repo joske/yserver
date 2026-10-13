@@ -474,6 +474,7 @@ fn window_picture_follows_window_storage_and_clips_away_without_it() {
     // New storage: the same Picture binds to it.
     let storage = b
         .platform
+        .gpu
         .allocate_drawable_storage_as(
             16,
             16,
@@ -710,7 +711,7 @@ fn damage_boundary_submits_render_batches_and_queued_commands() {
                 crate::kms::render::frame_builder::CloseReason::SyncWait,
             )
             .expect("submit initial clears");
-        b.platform.submit_group_set_max_size_for_tests(16);
+        b.platform.gpu.submit_group_set_max_size_for_tests(16);
         let src_id = b.store.lookup(src.as_raw()).expect("source storage");
         let dst_id = b.store.lookup(dst.as_raw()).expect("destination storage");
         let appended = b
@@ -748,7 +749,7 @@ fn damage_boundary_submits_render_batches_and_queued_commands() {
             b.engine
                 .flush_render_batch(&mut b.store, &mut b.platform, RenderFlushReason::Other)
                 .expect("close batch without submitting");
-            assert!(b.platform.submit_group_size() > 0);
+            assert!(b.platform.gpu.submit_group_size() > 0);
         } else {
             assert!(b.engine.has_pending_batches_for_tests());
         }
@@ -760,7 +761,7 @@ fn damage_boundary_submits_render_batches_and_queued_commands() {
             "damage boundary must close a pending render batch"
         );
         assert_eq!(
-            b.platform.submit_group_size(),
+            b.platform.gpu.submit_group_size(),
             0,
             "damage boundary must submit even without an open frame"
         );
