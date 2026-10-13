@@ -220,13 +220,17 @@ test edits beyond paths.
   GlyphSetFormat, StoredGlyph}`) into private engine functions
   (`RenderEngine::split_glyph_runs`, `effective_glyph_layout`,
   `frame_builder::RecordedTextGlyph`). Split at the seam:
-  - a parser test in `yserver` asserting the source-format sequence the
-    mixed-format fixture produces (`A8, A8, Argb32, A8, Argb32, Argb32`, the
-    first assertion today);
-  - render tests that start from that same literal sequence and assert the
+  - a parser test in `yserver` asserting, per parsed glyph, the full tuple
+    the renderer consumes today (`recorded_from_parsed`,
+    `glyph_runs.rs:827`): source format, `w`, `h`, `dst_x`, `dst_y`. Source
+    formats are `A8, A8, Argb32, A8, Argb32, Argb32`; the other values are
+    read from today's fixture output when the test is written, then checked
+    by hand against the fixture's glyph sizes and one-pixel pen advance;
+  - render tests that start from those same literal tuples and assert the
     splitter's ordered runs and the layout answers, as today.
-  The two halves pin the same vector, so the chain stays covered without
-  making the splitter public.
+  The two halves pin the same tuples, so a parser regression in format or
+  positioning fails the KMS half, and the chain stays covered without making
+  the splitter public.
 - **`engine/tests/memory_frame.rs:192`** builds a whole `KmsBackend` only to
   read two engine counters; it builds `RenderEngine` on the `GpuCore` fixture
   instead.
@@ -289,6 +293,12 @@ accepted. Four gaps fixed above: the present entry's return path (decision 4:
 7: split in prep commits, no test-only `pub`), the `scanout_readback_op` reset
 placed before `Drop`'s early return (decision 2), and the cross target install
 for the macOS CI check (acceptance).
+
+**Round 2 (codex, 2026-10-13):** round-1 fixes confirmed (codex compiled a
+probe of the `Box<dyn PresentCompletionEntry>` → `Box<dyn Any>` downcast on
+the current toolchain). One fix: the glyph parser half asserts the full
+per-glyph tuple (format, size, position), not only the format sequence
+(decision 7). No remaining plan blocker.
 
 ## Questions for the review
 
