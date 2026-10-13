@@ -295,6 +295,11 @@ eiger.
 
 ## Execution (3a)
 
+Squash-merged (jos, 2026-10-13): the hashes below are the branch commits
+before the squash, and do not exist on master. No blame-ignore entries: the
+squash commit mixes the seam with the moves, so ignoring it would hide real
+changes.
+
 Branch `refactor/phase3a-render-crate`, 2026-10-13.
 
 ### Commits by stage
@@ -314,7 +319,7 @@ Branch `refactor/phase3a-render-crate`, 2026-10-13.
   `51a41547` round-trip test.
 - Stage 4, the crate: `823585b6` protocol paths; `9a73ac27` geometry paths;
   `ccbfa14c` lint attributes; `e736f26b` the move; `582cc67e` Justfile;
-  `83104c0c` CI lavapipe step; `5cff7fd9` blame-ignore.
+  `83104c0c` CI lavapipe step.
 
 ### Deviations from the plan
 
