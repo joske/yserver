@@ -33,6 +33,23 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-10-13 phase 3a, `yserver-render` crate (branch
+  `refactor/phase3a-render-crate`):** `crates/yserver-render` holds the
+  renderer: `kms::vk` (device, pipelines, ops, dri3; not `scanout`) and
+  `kms::render::{engine, store, frame_builder, gpu, …}`, with the glslc
+  `build.rs`. It depends on ash/libc/log/thiserror/yserver-protocol only (no
+  drm/gbm/input/udev/core). `yserver` re-exports the modules at the old
+  `kms::{vk, render}` paths. Seams: `GpuCore` (the GPU half of
+  `PlatformBackend`, engine/store take `&mut GpuCore`), `Box<dyn
+  PresentCompletionEntry>` for Present completions, a `test-support` feature
+  for the fixtures `yserver`'s tests use. Timings on silence: release/32
+  −11%, dev/4 −11%, test/4 −4%, release/4 −2%. **Log targets of the moved
+  modules are now `yserver_render::kms::…`** (`RUST_LOG=yserver_render=debug`,
+  or `yserver_render::kms::render::telemetry=info`); explicit targets such as
+  `yserver::kms::render::store` are unchanged. Details:
+  `docs/superpowers/plans/2026-10-13-phase3-render-crate.md` ("Execution
+  (3a)").
+
 - **2026-10-13 server-reset test race:** `an_old_setup_completion_cannot_create_a_client_in_the_new_generation`
   wrote its GetInputFocus after sending the stale completion; when the core
   had already discarded it (dropping the socket) the write failed with EPIPE.
