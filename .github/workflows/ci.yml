@@ -148,7 +148,7 @@ jobs:
           prepare: |
             pkg install -y rustup-init just pkgconf shaderc fontconfig freetype2 libudev-devd libinput \
               libxkbcommon libxshmfence libdrm mesa-libs vulkan-loader scdoc \
-              dejavu xorg-fonts-miscbitmap xorg-fonts-75dpi xorg-fonts-100dpi
+              mkfontscale xorg-fonts
             rustup-init -y --profile minimal -c clippy
           run: |
             set -e
