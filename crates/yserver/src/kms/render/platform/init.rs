@@ -288,6 +288,9 @@ pub(super) fn validate_render_node_attachment(
 
 impl Drop for PlatformBackend {
     fn drop(&mut self) {
+        // Its command buffer belongs to `gpu.ops_command_pool`: release it
+        // before any field drops, on every path.
+        self.scanout_readback_op = None;
         if !self.initial_scanout_rollback_armed {
             return;
         }

@@ -1,7 +1,7 @@
 //! `GpuCore`: the GPU-only half of the renderer platform.
 //!
 //! It owns the Vulkan device handle, the ops command pool, the recyclable
-//! fence pool, the pixmap pool and the submit group; [`PlatformBackend`]
+//! fence pool, the pixmap pool and the submit group; `PlatformBackend`
 //! holds one as `gpu` next to the DRM/KMS state. This file holds the
 //! imports and every type (private fields stay visible to all children);
 //! the code lives in:
@@ -11,8 +11,6 @@
 //! - `storage_alloc`: drawable image allocation and views.
 //! - `submit`: paint and present submits, the submit group, flush.
 //! - `tests`: unit tests.
-//!
-//! [`PlatformBackend`]: crate::kms::render::platform::PlatformBackend
 
 #![allow(
     dead_code,
@@ -158,17 +156,34 @@ pub(crate) struct FlushOutcome {
     pub(crate) aborted: bool,
 }
 
-/// The GPU-only half of [`PlatformBackend`]: the Vulkan device, its
+/// The GPU-only half of `PlatformBackend`: the Vulkan device, its
 /// command and fence pools, the pixmap pool and the submit group.
+///
+/// Lifetimes follow these rules, not field order:
+/// - Every Vulkan owner holds its own `Arc<VkContext>` (`OpsCommandPool`,
+///   `FencePool`, `PixmapPool`, each `FenceTicket` and
+///   `PresentCompletionSignal`, the engine, the scanout and copy pools),
+///   and `VkContext::drop` idles and destroys the device at the last one,
+///   so where `vk` sits here does not matter.
+/// - Anything allocated from a pool here and held outside `GpuCore` is
+///   released before `GpuCore` drops. The one such owner today is
+///   `PlatformBackend::scanout_readback_op` (a command buffer from
+///   `ops_command_pool`): `PlatformBackend`'s `Drop` resets it as its first
+///   statement, and it is also declared before `gpu`.
+/// - `FenceTicket`s may outlive `fence_pool`: a ticket holds a `Weak` pool
+///   and a strong `vk`, and destroys its own fence once the pool is gone
+///   (`KmsBackend` drops `platform` before `store`, `engine` and `scene`).
+/// - `OpsCommandPool::drop` idles the queue, then destroys the pool, which
+///   frees the engine's command buffers with it.
+///
+/// `GpuCore` knows nothing about KMS.
 pub(crate) struct GpuCore {
     // Vulkan side. `Option` only to support test fixtures that
     // skip Vk init (`for_tests`). Production `open_with_commit`
     // always returns `Some`. v2 has no pixman fallback.
     pub(crate) vk: Option<Arc<VkContext>>,
-    /// Wrapped in `Option` for the same reason. Drop order
-    /// matters: ops_command_pool BEFORE fence_pool BEFORE vk
-    /// (handled by struct field order — Rust drops fields in
-    /// declaration order).
+    /// Wrapped in `Option` for the same reason. Lifetimes: see the
+    /// struct doc.
     pub(crate) ops_command_pool: Option<OpsCommandPool>,
     pub(crate) fence_pool: Option<FencePool>,
 

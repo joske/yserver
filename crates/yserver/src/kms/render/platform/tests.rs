@@ -181,6 +181,40 @@ fn terminal_startup_retains_existing_gpu_owners_without_drop() {
     assert_eq!(owner_drops.get(), 0);
 }
 
+/// `Drop` releases `scanout_readback_op`, whose command buffer comes from
+/// `gpu.ops_command_pool`, before that pool. Neither type has a drop hook,
+/// so the order itself is not observable here: this pins that a fully
+/// constructed backend (rollback disarmed, the `Drop` early-return path)
+/// holding the op drops cleanly and releases every `VkContext` reference.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn drop_releases_scanout_readback_op_and_gpu_pools() {
+    let vk = match VkContext::new() {
+        Ok(vk) => vk,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e:?}");
+            return;
+        }
+    };
+    let mut platform = PlatformBackend::for_tests();
+    assert!(!platform.initial_scanout_rollback_armed);
+    let ops_pool = crate::kms::vk::ops::OpsCommandPool::new(Arc::clone(&vk)).expect("ops pool");
+    let op = crate::kms::vk::ops::ReusableOneShot::new(Arc::clone(&vk), ops_pool.handle())
+        .expect("readback op");
+    platform.gpu.vk = Some(Arc::clone(&vk));
+    platform.gpu.ops_command_pool = Some(ops_pool);
+    platform.scanout_readback_op = Some(op);
+
+    drop(platform);
+
+    assert_eq!(
+        Arc::strong_count(&vk),
+        1,
+        "the platform released every VkContext reference it held"
+    );
+    unsafe { vk.device.device_wait_idle().expect("device still usable") };
+}
+
 fn drm_key(minor: u32) -> crate::platform::drm::DrmDeviceKey {
     crate::platform::drm::DrmDeviceKey { major: 226, minor }
 }

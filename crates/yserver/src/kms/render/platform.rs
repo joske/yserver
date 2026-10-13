@@ -465,9 +465,11 @@ pub(crate) struct PlatformBackend {
     pending_scanout_render_completions: std::collections::VecDeque<PendingScanoutRenderCompletion>,
     next_scanout_render_job_id: u64,
 
-    /// Command buffer + fence reused by scanout reads; allocated from
-    /// `ops_command_pool`, so declared before it to drop first.
+    /// Command buffer + fence reused by scanout reads, allocated from
+    /// `gpu.ops_command_pool`. `Drop` resets it first; it is also declared
+    /// before `gpu`.
     pub(crate) scanout_readback_op: Option<crate::kms::vk::ops::ReusableOneShot>,
+    /// The GPU-only state; lifetime rules on [`GpuCore`].
     pub(crate) gpu: GpuCore,
     /// Reused `HOST_CACHED`-preferred destination for synchronous scanout
     /// reads (root GetImage / ShmGetImage). Idle between reads, which wait
