@@ -50,4 +50,19 @@ impl GpuCore {
             queue_submits: 0,
         }
     }
+
+    /// [`Self::for_tests`] with a live Vulkan context, ops command pool and
+    /// fence pool (no pixmap pool). `None` when no Vulkan device is
+    /// available.
+    #[cfg(test)]
+    pub(crate) fn for_tests_with_vk() -> Option<Self> {
+        let vk = VkContext::new().ok()?;
+        let ops_command_pool = OpsCommandPool::new(Arc::clone(&vk)).ok()?;
+        let fence_pool = FencePool::new(Arc::clone(&vk));
+        let mut gpu = Self::for_tests();
+        gpu.vk = Some(vk);
+        gpu.ops_command_pool = Some(ops_command_pool);
+        gpu.fence_pool = Some(fence_pool);
+        Some(gpu)
+    }
 }

@@ -13,6 +13,38 @@ impl GpuCore {
     }
 }
 
+/// Fence acquire on a no-Vk fixture returns the
+/// "init failed" error (since fence_pool is None). This
+/// confirms the guard is wired; real fence allocation is
+/// covered by Stage 2c+ Vk-backed tests.
+#[test]
+fn for_tests_fence_acquire_errors_without_vk() {
+    let p = GpuCore::for_tests();
+    let result = p.acquire_fence_ticket();
+    assert!(matches!(
+        result,
+        Err(vk::Result::ERROR_INITIALIZATION_FAILED)
+    ));
+}
+
+#[test]
+fn platform_starts_with_empty_closed_submit_group() {
+    let p = GpuCore::for_tests();
+    assert!(!p.submit_group_is_open(), "fresh platform has closed group");
+    assert_eq!(p.submit_group_size(), 0);
+}
+
+#[test]
+fn flush_submit_group_empty_is_noop() {
+    let mut p = GpuCore::for_tests();
+    // Fixture has no Vk; should NOT attempt queue_submit2.
+    let outcome = p
+        .flush_submit_group(FlushReason::SceneCompose)
+        .expect("empty-group flush is always Ok");
+    assert_eq!(outcome.flushed_entries, 0);
+    assert!(!p.submit_group_is_open());
+}
+
 /// Mirrors `descriptor_pool_ring::tests::vk_or_skip` — needed
 /// because `VkContext::new()` requires a live Vulkan ICD which
 /// isn't always available in CI.

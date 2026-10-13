@@ -7,7 +7,7 @@ mod render_composite;
 use super::*;
 use crate::kms::{
     cpu_types::Repeat,
-    render::{platform::PlatformBackend, store::DrawableStore, target::Dst},
+    render::{gpu::GpuCore, store::DrawableStore, target::Dst},
 };
 
 // ── CopyArea joint src/dst clamp (negative-offset smear fix) ──
@@ -711,30 +711,14 @@ mod session {
 // The Stage 2 acceptance harness (Stage 2f) folds these into
 // the synthetic acceptance binary.
 
-fn live_platform() -> Option<PlatformBackend> {
-    // Can't reuse `PlatformBackend::open_with_commit` here —
-    // it tries to acquire a real DRM device. Tests need a
-    // VkContext-only fixture. We build one by hand:
-    // construct a `for_tests` fixture, then swap in a real
-    // VkContext + OpsCommandPool + FencePool.
-    let mut p = PlatformBackend::for_tests();
-    let vk = match VkContext::new() {
-        Ok(v) => v,
-        Err(_) => return None,
-    };
-    let ops_pool = match crate::kms::vk::ops::OpsCommandPool::new(Arc::clone(&vk)) {
-        Ok(o) => o,
-        Err(_) => return None,
-    };
-    let fence_pool = crate::kms::render::platform::FencePool::new(Arc::clone(&vk));
-    p.gpu.vk = Some(vk);
-    p.gpu.ops_command_pool = Some(ops_pool);
-    p.gpu.fence_pool = Some(fence_pool);
-    Some(p)
+fn live_platform() -> Option<GpuCore> {
+    // Tests need a VkContext-only fixture: no DRM device, so not
+    // `PlatformBackend::open_with_commit`.
+    GpuCore::for_tests_with_vk()
 }
 
 /// Alias of `live_platform` used by Task 3 tests.
-fn try_for_tests_with_vk() -> Option<PlatformBackend> {
+fn try_for_tests_with_vk() -> Option<GpuCore> {
     live_platform()
 }
 
@@ -749,7 +733,7 @@ fn try_for_tests_with_vk() -> Option<PlatformBackend> {
 fn drive_render_composite_same_key_for_tests(
     engine: &mut RenderEngine,
     store: &mut DrawableStore,
-    platform: &mut PlatformBackend,
+    platform: &mut GpuCore,
     dst: DrawableId,
     src: DrawableId,
     rects: &[(i32, i32, u32, u32)],
@@ -769,7 +753,7 @@ fn drive_render_composite_same_key_for_tests(
         engine
             .render_composite(
                 store,
-                &mut platform.gpu,
+                platform,
                 OP_OVER,
                 ResolvedSource::Drawable(SourceDrawable::whole(src)),
                 ResolvedSource::None,
@@ -794,7 +778,7 @@ fn drive_render_composite_same_key_for_tests(
 /// Helper: allocate a depth-32 storage and return a registered
 /// DrawableId. Mirrors the pattern Stage 2c tests use.
 fn alloc_drawable_3a(
-    platform: &PlatformBackend,
+    platform: &GpuCore,
     store: &mut DrawableStore,
     xid: u32,
     w: u16,
@@ -812,7 +796,7 @@ fn alloc_drawable_3a(
 }
 
 fn alloc_drawable_3a_with_kind(
-    platform: &PlatformBackend,
+    platform: &GpuCore,
     store: &mut DrawableStore,
     xid: u32,
     w: u16,
@@ -821,7 +805,6 @@ fn alloc_drawable_3a_with_kind(
     scene_participating: bool,
 ) -> DrawableId {
     let storage = platform
-        .gpu
         .allocate_drawable_storage(w, h, 32)
         .expect("alloc storage");
     store

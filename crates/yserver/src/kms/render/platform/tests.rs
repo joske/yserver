@@ -1,7 +1,7 @@
 use super::*;
 use crate::kms::{
-    backend::PlatformInitOutput, render::submit_group::FlushReason,
-    scanout_route::RenderKmsRelationship, vk::scanout::DisposableProbeError,
+    backend::PlatformInitOutput, scanout_route::RenderKmsRelationship,
+    vk::scanout::DisposableProbeError,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -1928,20 +1928,6 @@ fn recompute_fb_extent_2d_vertical_stack() {
     assert_eq!(super::recompute_fb_extent_from(layouts), (2560, 2880));
 }
 
-/// Fence acquire on a no-Vk fixture returns the
-/// "init failed" error (since fence_pool is None). This
-/// confirms the guard is wired; real fence allocation is
-/// covered by Stage 2c+ Vk-backed tests.
-#[test]
-fn for_tests_fence_acquire_errors_without_vk() {
-    let p = PlatformBackend::for_tests();
-    let result = p.gpu.acquire_fence_ticket();
-    assert!(matches!(
-        result,
-        Err(vk::Result::ERROR_INITIALIZATION_FAILED)
-    ));
-}
-
 /// BO acquire on a no-Vk fixture returns None (the single
 /// stub output has no pool).
 #[test]
@@ -2079,28 +2065,6 @@ fn commit_bo_present_is_safe_on_missing_entry() {
     let g = p.record_present(0, 0);
     p.commit_bo_present(0, 0, g); // bo_generations[0] is empty — no-op
     p.commit_bo_present(99, 99, g); // out-of-range — no-op
-}
-
-#[test]
-fn platform_starts_with_empty_closed_submit_group() {
-    let p = PlatformBackend::for_tests();
-    assert!(
-        !p.gpu.submit_group_is_open(),
-        "fresh platform has closed group"
-    );
-    assert_eq!(p.gpu.submit_group_size(), 0);
-}
-
-#[test]
-fn flush_submit_group_empty_is_noop() {
-    let mut p = PlatformBackend::for_tests();
-    // Fixture has no Vk; should NOT attempt queue_submit2.
-    let outcome = p
-        .gpu
-        .flush_submit_group(FlushReason::SceneCompose)
-        .expect("empty-group flush is always Ok");
-    assert_eq!(outcome.flushed_entries, 0);
-    assert!(!p.gpu.submit_group_is_open());
 }
 
 // ── Task 3 test helpers ──────────────────────────────────────

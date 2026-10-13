@@ -1,5 +1,5 @@
 use super::*;
-use crate::kms::render::{platform::PlatformBackend, store::DrawableStore, target::Dst};
+use crate::kms::render::{gpu::GpuCore, store::DrawableStore, target::Dst};
 
 /// Build a `PhysicalDeviceMemoryProperties` from a list of per-type
 /// property-flag sets (heap indices don't matter for type selection).
@@ -108,11 +108,11 @@ fn pick_memory_type_none_when_no_host_visible() {
 fn close_open_frame_with_no_open_frame_returns_already_closed() {
     let mut engine = RenderEngine::stub();
     let mut store = DrawableStore::stub();
-    let mut platform = PlatformBackend::for_tests();
+    let mut platform = GpuCore::for_tests();
     let out = engine
         .close_open_frame(
             &mut store,
-            &mut platform.gpu,
+            &mut platform,
             crate::kms::render::frame_builder::CloseReason::Shutdown,
         )
         .expect("close on a closed frame must Ok");
@@ -126,7 +126,7 @@ fn close_open_frame_with_no_open_frame_returns_already_closed() {
 fn stub_engine_declines_paint_ops() {
     let mut engine = RenderEngine::stub();
     let mut store = DrawableStore::new();
-    let mut platform = PlatformBackend::for_tests();
+    let mut platform = GpuCore::for_tests();
     let storage = crate::kms::render::store::Storage::for_tests_null(
         vk::Extent2D {
             width: 4,
@@ -146,7 +146,7 @@ fn stub_engine_declines_paint_ops() {
     let err = engine
         .fill_rect(
             &mut store,
-            &mut platform.gpu,
+            &mut platform,
             Dst::server_internal(id),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -166,14 +166,13 @@ fn stub_engine_declines_paint_ops() {
 /// storage. Returns the `DrawableId`. Used by Task 3 tests.
 fn create_pixmap(
     store: &mut DrawableStore,
-    platform: &mut PlatformBackend,
+    platform: &mut GpuCore,
     xid: u32,
     w: u16,
     h: u16,
     depth: u8,
 ) -> Result<DrawableId, RenderError> {
     let storage = platform
-        .gpu
         .allocate_drawable_storage(w, h, depth)
         .map_err(RenderError::Vk)?;
     store
@@ -190,15 +189,13 @@ fn create_pixmap(
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn engine_exposes_descriptor_pool_ring_lifetime_counters() {
-    let b = match crate::kms::render::backend::KmsBackend::for_tests_with_vk() {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("skipping: no Vk: {e}");
-            return;
-        }
+    let Some(platform) = live_platform() else {
+        eprintln!("skipping: no Vk");
+        return;
     };
-    assert_eq!(b.engine.descriptor_pool_creates_lifetime(), 0);
-    assert_eq!(b.engine.descriptor_pool_resets_lifetime(), 0);
+    let engine = RenderEngine::new(&platform).expect("engine");
+    assert_eq!(engine.descriptor_pool_creates_lifetime(), 0);
+    assert_eq!(engine.descriptor_pool_resets_lifetime(), 0);
 }
 
 // ── Task 3 Phase A regression tests ─────────────────────────
@@ -225,9 +222,9 @@ fn current_layout_for_drawable_reads_overlay_when_first_touched() {
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform.gpu).expect("engine");
+    let mut engine = RenderEngine::new(&platform).expect("engine");
     let id = engine
-        .create_pixmap(&mut store, &mut platform.gpu, 0x4f00_0001, 8, 8, 32)
+        .create_pixmap(&mut store, &mut platform, 0x4f00_0001, 8, 8, 32)
         .expect("create");
 
     // Storage seeded with UNDEFINED by `allocate_drawable_storage`.
@@ -246,7 +243,6 @@ fn current_layout_for_drawable_reads_overlay_when_first_touched() {
     // in-frame layout to COLOR_ATTACHMENT_OPTIMAL — same shape a
     // ported `render_composite` will use at op-append time.
     let ticket = platform
-        .gpu
         .submit_group_ticket_or_open()
         .expect("submit_group_ticket_or_open");
     engine.open_frame_for_paint_for_tests(ticket);
@@ -280,7 +276,7 @@ fn current_layout_for_drawable_reads_overlay_when_first_touched() {
     // Untouched second drawable in the same open frame falls
     // through to its storage layout.
     let id2 = engine
-        .create_pixmap(&mut store, &mut platform.gpu, 0x4f00_0002, 8, 8, 32)
+        .create_pixmap(&mut store, &mut platform, 0x4f00_0002, 8, 8, 32)
         .expect("create #2");
     {
         let inner = engine.inner.as_ref().expect("inner");
@@ -293,9 +289,9 @@ fn current_layout_for_drawable_reads_overlay_when_first_touched() {
 
     // Close the frame cleanly so drop-time invariants hold.
     engine
-        .close_open_frame_for_timeout_for_tests(&mut store, &mut platform.gpu)
+        .close_open_frame_for_timeout_for_tests(&mut store, &mut platform)
         .expect("close");
-    engine.drain_all(&mut platform.gpu);
+    engine.drain_all(&mut platform);
 }
 
 /// `commit_close_success` writes each touched drawable's
@@ -323,9 +319,9 @@ fn commit_close_success_writes_overlay_into_storage() {
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform.gpu).expect("engine");
+    let mut engine = RenderEngine::new(&platform).expect("engine");
     let id = engine
-        .create_pixmap(&mut store, &mut platform.gpu, 0x4f01_0001, 8, 8, 32)
+        .create_pixmap(&mut store, &mut platform, 0x4f01_0001, 8, 8, 32)
         .expect("create");
     // Storage starts UNDEFINED.
     assert_eq!(
@@ -338,7 +334,6 @@ fn commit_close_success_writes_overlay_into_storage() {
     // captures the post-op exit layout. (For `render_composite`,
     // that's SHADER_READ_ONLY_OPTIMAL per Pitfall 6.)
     let ticket = platform
-        .gpu
         .submit_group_ticket_or_open()
         .expect("submit_group_ticket_or_open");
     engine.open_frame_for_paint_for_tests(ticket);
@@ -360,7 +355,7 @@ fn commit_close_success_writes_overlay_into_storage() {
     // Close on success — frame has no recorded ops, so the
     // empty CB submits cleanly and `commit_close_success` runs.
     engine
-        .close_open_frame_for_timeout_for_tests(&mut store, &mut platform.gpu)
+        .close_open_frame_for_timeout_for_tests(&mut store, &mut platform)
         .expect("close");
 
     // Storage MUST have caught up to the overlay's in-frame value.
@@ -370,7 +365,7 @@ fn commit_close_success_writes_overlay_into_storage() {
         "commit_close_success wrote overlay → storage \
              (USER-codex U-R6.F1 LOAD-BEARING invariant)",
     );
-    engine.drain_all(&mut platform.gpu);
+    engine.drain_all(&mut platform);
 }
 
 #[test]
@@ -412,7 +407,7 @@ fn upload_blocks_are_not_reused_while_their_frame_is_in_flight() {
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform.gpu).expect("engine");
+    let mut engine = RenderEngine::new(&platform).expect("engine");
     let target = alloc_drawable_3a(&platform, &mut store, 0x1, 32, 32);
     let pixels = [0xFFu8; 4];
     let glyphs = [CompositeGlyphInput {
@@ -424,33 +419,35 @@ fn upload_blocks_are_not_reused_while_their_frame_is_in_flight() {
         dst_x: 1,
         dst_y: 1,
     }];
-    let draw =
-        |engine: &mut RenderEngine, store: &mut DrawableStore, platform: &mut PlatformBackend| {
-            engine
-                .composite_glyphs(
-                    store,
-                    &mut platform.gpu,
-                    Dst::server_internal(target),
-                    3, // Over
-                    0,
-                    [1.0, 1.0, 1.0, 1.0],
-                    &glyphs,
-                    None,
-                )
-                .expect("composite_glyphs");
-        };
-    let settle =
-        |engine: &mut RenderEngine, store: &mut DrawableStore, platform: &mut PlatformBackend| {
-            engine
-                .flush_submit_group(
-                    store,
-                    &mut platform.gpu,
-                    crate::kms::render::submit_group::FlushReason::SyncBoundary,
-                )
-                .expect("flush");
-            platform.wait_idle_bounded();
-            engine.poll_retired(&platform.gpu);
-        };
+    let draw = |engine: &mut RenderEngine, store: &mut DrawableStore, platform: &mut GpuCore| {
+        engine
+            .composite_glyphs(
+                store,
+                platform,
+                Dst::server_internal(target),
+                3, // Over
+                0,
+                [1.0, 1.0, 1.0, 1.0],
+                &glyphs,
+                None,
+            )
+            .expect("composite_glyphs");
+    };
+    let settle = |engine: &mut RenderEngine, store: &mut DrawableStore, platform: &mut GpuCore| {
+        engine
+            .flush_submit_group(
+                store,
+                platform,
+                crate::kms::render::submit_group::FlushReason::SyncBoundary,
+            )
+            .expect("flush");
+        // `PlatformBackend::wait_idle_bounded` on this fixture (no copied
+        // sinks): idle the one device, errors ignored.
+        if let Some(vk) = platform.vk() {
+            let _ = unsafe { vk.device.device_wait_idle() };
+        }
+        engine.poll_retired(platform);
+    };
     let idle = |engine: &RenderEngine| {
         engine
             .inner
@@ -478,7 +475,7 @@ fn upload_blocks_are_not_reused_while_their_frame_is_in_flight() {
     // the retire walk leaves on the idle list.
     draw(&mut engine, &mut store, &mut platform);
     engine
-        .close_open_frame_for_timeout_for_tests(&mut store, &mut platform.gpu)
+        .close_open_frame_for_timeout_for_tests(&mut store, &mut platform)
         .expect("close warm-up frame");
     settle(&mut engine, &mut store, &mut platform);
     assert_eq!(idle(&engine), 1);
@@ -506,7 +503,7 @@ fn upload_blocks_are_not_reused_while_their_frame_is_in_flight() {
     // block only goes back on the idle list through the retire walk, so
     // don't run one until frame B has taken its block.
     engine
-        .close_open_frame_for_timeout_for_tests(&mut store, &mut platform.gpu)
+        .close_open_frame_for_timeout_for_tests(&mut store, &mut platform)
         .expect("close frame A");
     assert_eq!(
         idle(&engine),
@@ -531,7 +528,7 @@ fn upload_blocks_are_not_reused_while_their_frame_is_in_flight() {
 
     // Both frames submitted and complete: both blocks go idle.
     engine
-        .close_open_frame_for_timeout_for_tests(&mut store, &mut platform.gpu)
+        .close_open_frame_for_timeout_for_tests(&mut store, &mut platform)
         .expect("close frame B");
     settle(&mut engine, &mut store, &mut platform);
     assert_eq!(idle(&engine), 2);
@@ -545,7 +542,7 @@ fn upload_blocks_are_not_reused_while_their_frame_is_in_flight() {
     assert_eq!(c[0].offset, 0);
     assert_eq!(idle(&engine), 1);
 
-    engine.drain_all(&mut platform.gpu);
+    engine.drain_all(&mut platform);
 }
 
 /// #177: requests in one frame are bump-allocated from one block at
@@ -562,8 +559,8 @@ fn upload_to_frame_suballocates_aligned_slices_and_falls_back_for_oversize() {
         eprintln!("no Vk — skipping");
         return;
     };
-    let mut engine = RenderEngine::new(&platform.gpu).expect("engine");
-    let ticket = platform.gpu.submit_group_ticket_or_open().expect("ticket");
+    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let ticket = platform.submit_group_ticket_or_open().expect("ticket");
     let inner = engine.inner.as_mut().expect("inner");
     inner.frame_builder.open_for_paint(ticket, 1);
 
@@ -643,7 +640,7 @@ fn upload_to_frame_suballocates_aligned_slices_and_falls_back_for_oversize() {
     assert_eq!(open.pins.len(), 5, "one pin per request");
 
     engine
-        .close_open_frame_for_timeout_for_tests(&mut DrawableStore::new(), &mut platform.gpu)
+        .close_open_frame_for_timeout_for_tests(&mut DrawableStore::new(), &mut platform)
         .expect("close");
-    engine.drain_all(&mut platform.gpu);
+    engine.drain_all(&mut platform);
 }
