@@ -2,7 +2,7 @@ pub(crate) mod backend;
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub mod console;
 pub(crate) mod core;
-pub mod cpu_types;
+pub use render::cpu_types;
 
 /// Cross-platform type alias for the optional console guard.
 /// On Linux/FreeBSD this is the real VT guard; elsewhere it's a unit placeholder.
