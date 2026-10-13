@@ -14,12 +14,12 @@ fn build_with_elsewhere(
     elsewhere: &std::collections::HashSet<crate::kms::render::store::DrawableId>,
 ) -> SceneBuild {
     let outputs = [layout_at(layout)];
-    let platform = PlatformBackend::for_tests();
+    let sink = TestSink::new();
     build_scene_with(
         &core.input(windows, &outputs),
         store,
         0,
-        &platform,
+        &sink,
         None,
         None,
         cow_host_xid,
@@ -993,13 +993,13 @@ fn walk_bench() {
     let (core, mut store, windows) = e16_like_fixture();
     let layout = (0, 0, 2560u32, 1440u32);
     let outputs = [layout_at(layout)];
-    let platform = PlatformBackend::for_tests();
+    let sink = TestSink::new();
     let run = |mode: Visibility, store: &mut DrawableStore| {
         build_scene(
             &core.input(&windows, &outputs),
             store,
             0,
-            &platform,
+            &sink,
             None,
             None,
             None,

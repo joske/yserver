@@ -7,11 +7,166 @@ mod tick;
 mod walk;
 use super::*;
 use crate::kms::render::{
-    platform::PlatformBackend,
+    gpu::GpuCore,
     scene_diff::{ParticipantId, SceneRole},
     store::DrawableStore,
 };
+use std::io;
 use yserver_protocol::x11::xfixes;
+
+/// An output sink with no frame slots, no cursor plane and no Vulkan: what
+/// the headless `PlatformBackend::for_tests` answers on a fresh instance.
+struct TestSink {
+    gpu: GpuCore,
+}
+
+impl TestSink {
+    fn new() -> Self {
+        Self {
+            gpu: GpuCore::for_tests(),
+        }
+    }
+}
+
+impl OutputSink for TestSink {
+    fn gpu(&self) -> &GpuCore {
+        &self.gpu
+    }
+
+    fn gpu_mut(&mut self) -> &mut GpuCore {
+        &mut self.gpu
+    }
+
+    fn cursor_plane(&self) -> &dyn CursorPlaneSink {
+        self
+    }
+
+    fn cursor_plane_mut(&mut self) -> &mut dyn CursorPlaneSink {
+        self
+    }
+
+    fn route(&self, _output_idx: usize) -> OutputRoute {
+        OutputRoute::None
+    }
+
+    fn slot_count(&self, _output_idx: usize) -> Option<usize> {
+        None
+    }
+
+    fn acquire_slot(&mut self, _output_idx: usize) -> Option<SlotToken> {
+        None
+    }
+
+    fn slot_image(&self, _output_idx: usize, _bo_idx: usize) -> Option<vk::Image> {
+        None
+    }
+
+    fn check_frame_target(&self, _output_idx: usize) -> Result<(), FrameTargetError> {
+        Err(FrameTargetError::NoSlot)
+    }
+
+    fn finish_frame(
+        &mut self,
+        _output_idx: usize,
+        _bo_idx: usize,
+        _record: &mut RecordFrame<'_>,
+    ) -> FinishOutcome {
+        FinishOutcome::Unavailable(FrameTargetError::NoSlot)
+    }
+
+    fn invalidate_slot(&mut self, _output_idx: usize, _bo_idx: usize) {}
+
+    fn cancel_slot(&mut self, _output_idx: usize, _bo_idx: usize) {}
+
+    fn recycle_failed_slot(&mut self, _output_idx: usize, _bo_idx: usize) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn on_page_flip_complete(&mut self, _output_idx: usize) -> Option<FlipRetirement> {
+        None
+    }
+
+    fn commit_slot_present(&mut self, _output_idx: usize, _bo_idx: usize, _generation: u64) {}
+
+    fn register_render_completion(
+        &mut self,
+        _output_idx: usize,
+        _bo_idx: usize,
+        _fd: Option<std::os::fd::OwnedFd>,
+    ) -> io::Result<u64> {
+        Ok(1)
+    }
+
+    fn drain_render_completions(&mut self) -> Vec<RenderCompletion> {
+        Vec::new()
+    }
+
+    fn clear_render_completions(&mut self) {}
+
+    fn submit_copied(
+        &mut self,
+        _output_idx: usize,
+        _bo_idx: usize,
+        _fd: Option<std::os::fd::OwnedFd>,
+    ) -> io::Result<()> {
+        Err(io::Error::other(
+            "render completion targeted a shared output",
+        ))
+    }
+}
+
+impl CursorPlaneSink for TestSink {
+    fn fits(&self, _output_idx: usize, _width: u32, _height: u32) -> bool {
+        false
+    }
+
+    fn visible(&self, _output_idx: usize) -> bool {
+        false
+    }
+
+    fn uploaded_version(&self, _output_idx: usize) -> Option<u64> {
+        None
+    }
+
+    fn upload(
+        &mut self,
+        _output_idx: usize,
+        _version: u64,
+        _width: u32,
+        _height: u32,
+        _bgra_bytes: &[u8],
+    ) -> io::Result<()> {
+        Err(io::Error::other("cursor plane unavailable for output"))
+    }
+
+    fn show(
+        &mut self,
+        _output_idx: usize,
+        _hot_x: u16,
+        _hot_y: u16,
+        _x: i32,
+        _y: i32,
+    ) -> Result<(), CursorShowFailure> {
+        Err(CursorShowFailure {
+            remains_visible: false,
+            error: Box::new(io::Error::other(
+                "cursor remains unbound: cursor plane unavailable for output",
+            )),
+        })
+    }
+
+    fn hide(&mut self, _output_idx: usize) -> io::Result<()> {
+        Err(io::Error::other("cursor plane unavailable"))
+    }
+
+    fn hide_all(&mut self) -> io::Result<()> {
+        Err(io::Error::other("cursor plane unavailable"))
+    }
+
+    fn note_composed_retirement(&mut self, _output_idx: usize) -> bool {
+        false
+    }
+}
 
 fn audit_rect(x: i32, y: i32, width: u32, height: u32) -> vk::Rect2D {
     vk::Rect2D {
@@ -775,7 +930,7 @@ impl TestCore {
     }
 
     /// The scene input over `windows` and `outputs` on an 800×600 screen
-    /// (`PlatformBackend::for_tests`).
+    /// (`default_outputs`).
     fn input<'a>(
         &'a self,
         windows: &'a crate::kms::render::backend::WindowsMap,
@@ -808,7 +963,7 @@ fn layout_at(layout: (i32, i32, u32, u32)) -> OutputLayout {
     }
 }
 
-/// `PlatformBackend::for_tests`' single output: 800×600 at the origin.
+/// One output, 800×600 at the origin.
 fn default_outputs() -> [OutputLayout; 1] {
     [layout_at((0, 0, 800, 600))]
 }
@@ -823,12 +978,12 @@ fn build_with(
     cow_host_xid: Option<u32>,
 ) -> SceneBuild {
     let outputs = [layout_at(layout)];
-    let platform = PlatformBackend::for_tests();
+    let sink = TestSink::new();
     build_scene(
         &core.input(windows, &outputs),
         store,
         0,
-        &platform,
+        &sink,
         None,
         None,
         cow_host_xid,
