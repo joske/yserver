@@ -2,7 +2,7 @@ use crate::kms::{
     render::{
         composite_pool_ring::CompositePoolRing,
         cursor_save::CursorSaves,
-        platform::{FenceTicket, PlatformBackend},
+        gpu::FenceTicket,
         scanout_damage::ScanoutDamage,
         scene::{
             BufferAgeRing, DeferredSceneRelease, FailedSubmitBo, OutputCursorMode, OutputLayout,
@@ -111,11 +111,8 @@ impl SceneCompositor {
     ///
     /// `PipelineInit` on shader / pipeline build failure;
     /// `Vk(...)` on descriptor-pool init.
-    pub(crate) fn new(
-        platform: &PlatformBackend,
-        layouts: &[OutputLayout],
-    ) -> Result<Self, SceneError> {
-        let vk = platform.gpu().vk().ok_or(SceneError::NoVk)?.clone();
+    pub(crate) fn new(sink: &dyn OutputSink, layouts: &[OutputLayout]) -> Result<Self, SceneError> {
+        let vk = sink.gpu().vk().ok_or(SceneError::NoVk)?.clone();
         let pipeline = CompositorPipeline::new(Arc::clone(&vk), vk::Format::B8G8R8A8_UNORM)
             .map_err(SceneError::PipelineInit)?;
         // Root-overlay XOR pass pipeline cache — built for the same
@@ -129,7 +126,7 @@ impl SceneCompositor {
         )?;
         let mut outputs = Vec::with_capacity(layouts.len());
         for i in 0..layouts.len() {
-            outputs.push(Self::build_output_state(&vk, platform, layouts, i)?);
+            outputs.push(Self::build_output_state(&vk, sink, layouts, i)?);
         }
         let mut inner = SceneCompositorInner {
             vk,
@@ -157,7 +154,7 @@ impl SceneCompositor {
 
     fn build_output_state(
         vk: &Arc<crate::kms::vk::device::VkContext>,
-        platform: &PlatformBackend,
+        sink: &dyn OutputSink,
         layouts: &[OutputLayout],
         i: usize,
     ) -> Result<OutputSceneState, SceneError> {
@@ -166,7 +163,7 @@ impl SceneCompositor {
         let (root_x, root_y, root_w, root_h) = layout.root_rect;
         let ring = CompositePoolRing::new(Arc::clone(vk), MAX_DESCRIPTOR_SETS_PER_FRAME)
             .map_err(SceneError::Vk)?;
-        let bo_depth = platform.slot_count(i).unwrap_or(3);
+        let bo_depth = sink.slot_count(i).unwrap_or(3);
         Ok(OutputSceneState {
             output_idx: i,
             damage_audit: build_output_damage_audit(
@@ -237,7 +234,7 @@ impl SceneCompositor {
 
     pub(crate) fn rebuild_outputs(
         &mut self,
-        platform: &PlatformBackend,
+        sink: &dyn OutputSink,
         layouts: &[OutputLayout],
     ) -> Result<(), SceneError> {
         let Some(inner) = self.inner.as_mut() else {
@@ -246,7 +243,7 @@ impl SceneCompositor {
         let vk = inner.vk.clone();
         let mut outputs = Vec::with_capacity(layouts.len());
         for i in 0..layouts.len() {
-            outputs.push(Self::build_output_state(&vk, platform, layouts, i)?);
+            outputs.push(Self::build_output_state(&vk, sink, layouts, i)?);
         }
         for old in &mut inner.outputs {
             release_intermediate(old, &vk);
@@ -333,7 +330,7 @@ impl SceneCompositor {
     /// — `device_wait_idle` is the safe fallback the platform
     /// uses anyway. Releases descriptor-pool slots so the
     /// pool-ring's Drop doesn't fire while slots are still in use.
-    pub(crate) fn drain_all(&mut self, platform: &mut PlatformBackend) {
+    pub(crate) fn drain_all(&mut self, sink: &mut dyn OutputSink) {
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
@@ -342,7 +339,7 @@ impl SceneCompositor {
         // fence ticket below still proves A's submitted command buffer is done
         // before descriptor slots are reset, and the platform subsequently
         // drains both devices before any copied pool is reset or dropped.
-        platform.clear_render_completions();
+        sink.clear_render_completions();
         let vk = inner.vk.clone();
         for (output_idx, o) in inner.outputs.iter_mut().enumerate() {
             // B.2-context fix (codex audit followup): wait for any
@@ -366,7 +363,7 @@ impl SceneCompositor {
                                 "render scene drain: output {output_idx} compose fence wait \
                                  failed: {error:?}; retaining resources for quarantine"
                             );
-                            platform.gpu_mut().renderer_failed = true;
+                            sink.gpu_mut().renderer_failed = true;
                             false
                         }
                     });
@@ -415,7 +412,7 @@ impl SceneCompositor {
                         true
                     }
                     DeferredSceneRelease::FailedSubmit { bo_idx, pool_slot } => {
-                        match platform.recycle_failed_slot(output_idx, bo_idx) {
+                        match sink.recycle_failed_slot(output_idx, bo_idx) {
                             Ok(()) => {
                                 pool_ring.release(pool_slot);
                                 true
@@ -433,7 +430,7 @@ impl SceneCompositor {
                 },
             );
             if wait_failed || recovery_failed {
-                platform.gpu_mut().renderer_failed = true;
+                sink.gpu_mut().renderer_failed = true;
             }
             // Stage 5 Phase D' — global recovery: reset every
             // output's cursor mode to Hidden. The post-recovery
@@ -448,6 +445,6 @@ impl SceneCompositor {
         }
         // Hide the plane everywhere + invalidate uploaded_version.
         // Best-effort; the platform hook logs per-CRTC failures.
-        let _ = platform.cursor_plane_mut().hide_all();
+        let _ = sink.cursor_plane_mut().hide_all();
     }
 }

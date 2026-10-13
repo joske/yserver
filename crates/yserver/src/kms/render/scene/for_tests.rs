@@ -1,6 +1,4 @@
 #[cfg(test)]
-use crate::kms::render::platform::PlatformBackend;
-#[cfg(test)]
 use crate::kms::render::scene::CursorAssignment;
 #[cfg(test)]
 use crate::kms::render::scene::DamageAuditTarget;
@@ -53,7 +51,7 @@ impl SceneCompositor {
         &self,
         input: &SceneInput,
         store: &mut DrawableStore,
-        platform: &PlatformBackend,
+        sink: &dyn OutputSink,
         output_idx: usize,
     ) -> CursorAssignment {
         let cursor = self.inner.as_ref().and_then(|inner| inner.cursor.clone());
@@ -61,7 +59,7 @@ impl SceneCompositor {
             input,
             store,
             output_idx,
-            platform,
+            sink,
             cursor,
             None,
             None,
@@ -97,10 +95,10 @@ impl SceneCompositor {
         &mut self,
         input: &SceneInput,
         store: &mut DrawableStore,
-        platform: &PlatformBackend,
+        sink: &dyn OutputSink,
         output_idx: usize,
     ) -> Vec<u8> {
-        self.compose_for_tests(input, store, platform, output_idx).0
+        self.compose_for_tests(input, store, sink, output_idx).0
     }
 
     /// Test-only: compose identity output `output_idx` as `tick_one_output`
@@ -111,10 +109,10 @@ impl SceneCompositor {
         &mut self,
         input: &SceneInput,
         store: &mut DrawableStore,
-        platform: &PlatformBackend,
+        sink: &dyn OutputSink,
         output_idx: usize,
     ) -> (Vec<u8>, Vec<u8>) {
-        let (bytes, image, extent) = self.compose_for_tests(input, store, platform, output_idx);
+        let (bytes, image, extent) = self.compose_for_tests(input, store, sink, output_idx);
         let mut read = bytes.clone();
         self.restore_under_cursor(
             image,
@@ -134,7 +132,7 @@ impl SceneCompositor {
         &mut self,
         input: &SceneInput,
         store: &mut DrawableStore,
-        platform: &PlatformBackend,
+        sink: &dyn OutputSink,
         output_idx: usize,
     ) -> (Vec<u8>, vk::Image, vk::Extent2D) {
         let inner = self.inner.as_mut().expect("live scene");
@@ -144,7 +142,7 @@ impl SceneCompositor {
             input,
             store,
             output_idx,
-            platform,
+            sink,
             cursor,
             None,
             None,
@@ -177,7 +175,7 @@ impl SceneCompositor {
         let vk = &inner.vk;
         let cursor_save = state.cursor_saves.prepare(vk, compose_image, cursor_rect);
         let pool = create_audit_descriptor_pool(vk, built.scene.draws.len()).expect("pool");
-        let ticket = platform.gpu().acquire_fence_ticket().expect("fence");
+        let ticket = sink.gpu().acquire_fence_ticket().expect("fence");
         let mut submitted = false;
         record_and_submit_render(
             vk,
@@ -205,7 +203,7 @@ impl SceneCompositor {
         }
         unsafe { vk.device.destroy_descriptor_pool(pool, None) };
         (
-            read_general_image_for_tests(vk, platform, target.image, mode),
+            read_general_image_for_tests(vk, sink, target.image, mode),
             target.image,
             mode,
         )
@@ -216,7 +214,7 @@ impl SceneCompositor {
 #[cfg(test)]
 fn read_general_image_for_tests(
     vk: &Arc<crate::kms::vk::device::VkContext>,
-    platform: &PlatformBackend,
+    sink: &dyn OutputSink,
     image: vk::Image,
     extent: vk::Extent2D,
 ) -> Vec<u8> {
@@ -226,7 +224,7 @@ fn read_general_image_for_tests(
             .expect("staging");
     let mut op = crate::kms::vk::ops::ReusableOneShot::new(
         Arc::clone(vk),
-        platform.gpu().ops_command_pool_handle().expect("ops pool"),
+        sink.gpu().ops_command_pool_handle().expect("ops pool"),
     )
     .expect("one-shot");
     let buffer = staging.buffer();

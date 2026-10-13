@@ -1,6 +1,5 @@
 use crate::kms::render::{
     cursor_save::CursorSaveTarget,
-    platform::PlatformBackend,
     scene::{
         CursorAssignment, CursorEntry, CursorPlaneMode, CursorRetireResolution, CursorTransition,
         CursorTransitionResult, OutputCursorMode, OutputLayout, OutputSceneState, OutputSink,
@@ -434,7 +433,7 @@ pub(super) fn resolve_cursor_hide_on_retire(
 pub(super) fn apply_cursor_transition_on_retire(
     inner: &mut SceneCompositorInner,
     output_idx: usize,
-    platform: &mut PlatformBackend,
+    sink: &mut dyn OutputSink,
     transition: Option<CursorTransition>,
 ) -> CursorTransitionResult {
     let Some(t) = transition else {
@@ -448,7 +447,7 @@ pub(super) fn apply_cursor_transition_on_retire(
             x,
             y,
         } => {
-            let prior_visible = platform.cursor_plane().visible(output_idx);
+            let prior_visible = sink.cursor_plane().visible(output_idx);
             // Upload if version doesn't match. `upload_image` is
             // already idempotent-deduplicated by value inside
             // `CursorPlane`, but skipping the FFI when we know the
@@ -457,14 +456,14 @@ pub(super) fn apply_cursor_transition_on_retire(
             // when its version matches the transition's. A mismatch never
             // binds stale pixels: the old binding must be hidden successfully
             // or remain authoritative with a version-qualified Show retry.
-            let upload_ready = if platform.cursor_plane().uploaded_version(output_idx)
+            let upload_ready = if sink.cursor_plane().uploaded_version(output_idx)
                 != Some(upload_version)
             {
                 if let Some(entry) = inner.cursor.as_ref()
                     && entry.record_version == upload_version
                     && let Some(bytes) = entry.bgra_bytes.as_ref()
                 {
-                    match platform.cursor_plane_mut().upload(
+                    match sink.cursor_plane_mut().upload(
                         output_idx,
                         upload_version,
                         entry.extent.width,
@@ -496,13 +495,10 @@ pub(super) fn apply_cursor_transition_on_retire(
                 // never-bound output has nothing to detach and resolves
                 // directly to Hidden without probing hide.
                 resolve_failed_cursor_upload(output_idx, prior_visible, || {
-                    platform.cursor_plane_mut().hide(output_idx)
+                    sink.cursor_plane_mut().hide(output_idx)
                 })
             } else {
-                match platform
-                    .cursor_plane_mut()
-                    .show(output_idx, hot_x, hot_y, x, y)
-                {
+                match sink.cursor_plane_mut().show(output_idx, hot_x, hot_y, x, y) {
                     Ok(()) => CursorTransitionResult::Applied,
                     Err(error) => {
                         let actual = if error.remains_visible {
@@ -519,9 +515,9 @@ pub(super) fn apply_cursor_transition_on_retire(
             }
         }
         CursorTransition::HideOnRetire { reveal_sw_after } => {
-            let currently_visible = platform.cursor_plane().visible(output_idx);
+            let currently_visible = sink.cursor_plane().visible(output_idx);
             resolve_cursor_hide_on_retire(output_idx, reveal_sw_after, currently_visible, || {
-                platform.cursor_plane_mut().hide(output_idx)
+                sink.cursor_plane_mut().hide(output_idx)
             })
         }
     }

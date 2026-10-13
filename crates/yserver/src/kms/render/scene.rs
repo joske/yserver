@@ -78,7 +78,7 @@ use ash::vk;
 
 use super::{
     cursor_save::CursorSaves,
-    platform::FenceTicket,
+    gpu::FenceTicket,
     region::Region,
     scanout_damage::ScanoutDamage,
     scene_diff::{PresenceSignature, ScenePresence},

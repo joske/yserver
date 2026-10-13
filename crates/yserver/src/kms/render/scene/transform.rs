@@ -1,6 +1,5 @@
 use crate::kms::{
     render::{
-        platform::PlatformBackend,
         scene::{
             ComposeRenderTarget, IntermediatePrimeTarget, OutputLayout, OutputSceneState,
             OutputSink, Repaint, ScalePass, SceneCompositor, SceneCompositorInner, SceneError,
@@ -201,7 +200,7 @@ impl SceneCompositor {
         &mut self,
         input: &SceneInput,
         store: &mut DrawableStore,
-        platform: &PlatformBackend,
+        sink: &dyn OutputSink,
         cow_host_xid: Option<u32>,
     ) -> Result<(), SceneError> {
         #[cfg(test)]
@@ -227,7 +226,7 @@ impl SceneCompositor {
                 input,
                 store,
                 output_idx,
-                platform,
+                sink,
                 inner.cursor.clone(),
                 None,
                 cow_host_xid,
@@ -258,10 +257,7 @@ impl SceneCompositor {
             let cursor_save = state.cursor_saves.prepare(&vk, scale.image, cursor_rect);
             let draws = built.scene.draws.len();
             let pool = create_audit_descriptor_pool(&vk, draws)?;
-            let ticket = platform
-                .gpu()
-                .acquire_fence_ticket()
-                .map_err(SceneError::Vk)?;
+            let ticket = sink.gpu().acquire_fence_ticket().map_err(SceneError::Vk)?;
             let mut submitted = false;
             let result = record_and_submit_render(
                 &vk,

@@ -1,6 +1,5 @@
 use crate::kms::{
     render::{
-        platform::PlatformBackend,
         scene::{
             ComposeRenderTarget, CursorEntry, DamageAuditEpisodeStart, DamageAuditLedgerEntry,
             DamageAuditTarget, OutputDamageAudit, OutputLayout, OutputRoute, OutputSink, Repaint,
@@ -539,7 +538,7 @@ pub(super) fn audit_reference_scene(
     input: &SceneInput,
     store: &mut DrawableStore,
     output_idx: usize,
-    platform: &PlatformBackend,
+    sink: &dyn OutputSink,
     cursor: Option<CursorEntry>,
     cursor_prev_pos: Option<(i32, i32)>,
     cow_host_xid: Option<u32>,
@@ -552,7 +551,7 @@ pub(super) fn audit_reference_scene(
         input,
         store,
         output_idx,
-        platform,
+        sink,
         cursor,
         cursor_prev_pos,
         cow_host_xid,
@@ -573,7 +572,7 @@ pub(super) fn run_damage_audit(
     inner: &mut SceneCompositorInner,
     output_idx: usize,
     outputs: &[OutputLayout],
-    platform: &mut PlatformBackend,
+    sink: &mut dyn OutputSink,
     scene: &CompositeScene,
     // Step 1 — the scene the REFERENCE composes: built with `Visibility::Off`,
     // i.e. every node's full placement. Candidate and reference used to render
@@ -599,7 +598,7 @@ pub(super) fn run_damage_audit(
         );
         return Ok(());
     }
-    if platform.route(output_idx) != OutputRoute::Shared {
+    if sink.route(output_idx) != OutputRoute::Shared {
         log::debug!("damage-audit: output {output_idx} skipped; copied scanout is out of scope");
         return Ok(());
     }
@@ -639,7 +638,7 @@ pub(super) fn run_damage_audit(
         let candidate_extent = audit.candidate.extent;
         let complete = submit_audit_compose(
             &inner.vk,
-            platform,
+            sink,
             &inner.pipeline,
             &mut audit.candidate,
             scene,
@@ -689,7 +688,7 @@ pub(super) fn run_damage_audit(
         };
         let complete = submit_audit_compose(
             &inner.vk,
-            platform,
+            sink,
             &inner.pipeline,
             &mut audit.candidate,
             scene,
@@ -720,7 +719,7 @@ pub(super) fn run_damage_audit(
     let reference_extent = audit.reference.extent;
     let complete = submit_audit_compose(
         &inner.vk,
-        platform,
+        sink,
         &inner.pipeline,
         &mut audit.reference,
         reference_scene,
@@ -774,7 +773,7 @@ pub(super) fn run_damage_audit(
         audit.gpu_samples = audit.gpu_samples.saturating_add(1);
     }
 
-    submit_damage_audit_compare(&inner.vk, platform, audit)?;
+    submit_damage_audit_compare(&inner.vk, sink, audit)?;
     audit.frame_draws = scene.draws.len();
     audit.frame_sampled = sampled.to_vec();
     audit.comparisons = audit.comparisons.saturating_add(1);
@@ -798,7 +797,7 @@ pub(super) fn run_damage_audit(
 #[allow(clippy::too_many_arguments)]
 fn submit_audit_compose(
     vk: &crate::kms::vk::device::VkContext,
-    platform: &PlatformBackend,
+    sink: &dyn OutputSink,
     pipeline: &CompositorPipeline,
     target: &mut DamageAuditTarget,
     scene: &CompositeScene,
@@ -808,10 +807,7 @@ fn submit_audit_compose(
     xor_layout: vk::PipelineLayout,
 ) -> Result<bool, SceneError> {
     let descriptor_pool = create_audit_descriptor_pool(vk, scene.draws.len())?;
-    let ticket = platform
-        .gpu()
-        .acquire_fence_ticket()
-        .map_err(SceneError::Vk)?;
+    let ticket = sink.gpu().acquire_fence_ticket().map_err(SceneError::Vk)?;
     let mut gpu_submitted = false;
     let result = record_and_submit_render(
         vk,
@@ -859,14 +855,11 @@ pub(super) fn create_audit_descriptor_pool(
 
 fn submit_damage_audit_compare(
     vk: &crate::kms::vk::device::VkContext,
-    platform: &PlatformBackend,
+    sink: &dyn OutputSink,
     audit: &mut OutputDamageAudit,
 ) -> Result<(), SceneError> {
     let cb = audit.candidate.command_buffer;
-    let ticket = platform
-        .gpu()
-        .acquire_fence_ticket()
-        .map_err(SceneError::Vk)?;
+    let ticket = sink.gpu().acquire_fence_ticket().map_err(SceneError::Vk)?;
     unsafe {
         vk.device
             .reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())

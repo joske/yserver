@@ -1,6 +1,5 @@
 use crate::kms::{
     render::{
-        platform::PlatformBackend,
         region::Region,
         scene::{
             CarriedDamage, ContentDamage, CursorAssignment, CursorEntry, Emitted, OutputSink,
@@ -122,7 +121,7 @@ pub(super) fn build_scene(
     input: &SceneInput,
     store: &mut DrawableStore,
     output_idx: usize,
-    platform: &PlatformBackend,
+    output_sink: &dyn OutputSink,
     cursor: Option<CursorEntry>,
     cursor_prev_pos: Option<(i32, i32)>,
     cow_host_xid: Option<u32>,
@@ -136,7 +135,7 @@ pub(super) fn build_scene(
         input,
         store,
         output_idx,
-        platform,
+        output_sink,
         cursor,
         cursor_prev_pos,
         cow_host_xid,
@@ -159,13 +158,13 @@ pub(crate) fn scene_draw_rects(
     input: &SceneInput,
     store: &mut DrawableStore,
     output_idx: usize,
-    platform: &PlatformBackend,
+    output_sink: &dyn OutputSink,
 ) -> Vec<vk::Rect2D> {
     let built = build_scene(
         input,
         store,
         output_idx,
-        platform,
+        output_sink,
         None,
         None,
         None,
@@ -196,13 +195,13 @@ pub(crate) fn scene_participant_places(
     input: &SceneInput,
     store: &mut DrawableStore,
     output_idx: usize,
-    platform: &PlatformBackend,
+    output_sink: &dyn OutputSink,
 ) -> Vec<(u32, Vec<vk::Rect2D>, Vec<vk::Rect2D>)> {
     let built = build_scene(
         input,
         store,
         output_idx,
-        platform,
+        output_sink,
         None,
         None,
         None,
@@ -226,7 +225,7 @@ pub(super) fn build_scene_with(
     store: &mut DrawableStore,
     output_idx: usize,
     // Only for the cursor-plane `fits` query.
-    platform: &PlatformBackend,
+    output_sink: &dyn OutputSink,
     cursor: Option<CursorEntry>,
     _cursor_prev_pos: Option<(i32, i32)>,
     // Phase 2.6 — host xid of the materialized Composite Overlay
@@ -550,7 +549,7 @@ pub(super) fn build_scene_with(
             // amdgpu beside 64px i915), so this must not be a global 64px
             // minimum.
             let hw_fits =
-                platform
+                output_sink
                     .cursor_plane()
                     .fits(output_idx, cur.extent.width, cur.extent.height);
             if hw_strategy_active && hw_fits {

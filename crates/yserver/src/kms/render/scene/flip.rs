@@ -1,5 +1,4 @@
 use crate::kms::render::{
-    platform::PlatformBackend,
     scene::{
         FailedSubmitBo, InFlightStage, OutputCursorMode, OutputSceneState, OutputSink,
         RenderCompletion, SceneCompositor, SceneCompositorInner,
@@ -79,7 +78,7 @@ impl SceneCompositor {
         &mut self,
         output_idx: usize,
         store: &mut DrawableStore,
-        platform: &mut PlatformBackend,
+        sink: &mut dyn OutputSink,
     ) -> bool {
         let Some(inner) = self.inner.as_mut() else {
             return false;
@@ -89,7 +88,7 @@ impl SceneCompositor {
             .get(output_idx)
             .and_then(|state| state.pending_acks.front())
             .map(|ack| (ack.stage, ack.bo_idx));
-        let Some(retire) = platform.on_page_flip_complete(output_idx) else {
+        let Some(retire) = sink.on_page_flip_complete(output_idx) else {
             return false;
         };
         let Some(state) = inner.outputs.get_mut(output_idx) else {
@@ -180,7 +179,7 @@ impl SceneCompositor {
                                 "render scene: compose fence status failed at pageflip \
                                  retirement: {error:?}"
                             );
-                            platform.gpu_mut().renderer_failed = true;
+                            sink.gpu_mut().renderer_failed = true;
                             state.pending_pool_releases.push_back((slot, t.clone()));
                         }
                     },
@@ -189,18 +188,14 @@ impl SceneCompositor {
             // Commit the BO's new last_present_generation in the
             // platform (the buffer-age pick uses this on next
             // acquire).
-            platform.commit_slot_present(output_idx, retire.presented_bo_idx, ack.generation);
+            sink.commit_slot_present(output_idx, retire.presented_bo_idx, ack.generation);
 
             // The KMS frame retired, but the cursor transition itself is a
             // second transaction. Record what actually happened: never claim
             // Hw after a rolled-back show and never claim Sw/Hidden while a
             // failed hide or rollback left the hardware sprite visible.
-            let cursor_result = apply_cursor_transition_on_retire(
-                inner,
-                output_idx,
-                platform,
-                ack.cursor_transition,
-            );
+            let cursor_result =
+                apply_cursor_transition_on_retire(inner, output_idx, sink, ack.cursor_transition);
             let state = inner
                 .outputs
                 .get_mut(output_idx)
@@ -235,10 +230,7 @@ impl SceneCompositor {
             }
             let actually_sw_composed =
                 matches!(ack.cursor_mode_after_retire, OutputCursorMode::Sw { .. });
-            if actually_sw_composed
-                && platform
-                    .cursor_plane_mut()
-                    .note_composed_retirement(output_idx)
+            if actually_sw_composed && sink.cursor_plane_mut().note_composed_retirement(output_idx)
             {
                 // Consume this output/device's own EINVAL backoff one
                 // composed retirement at a time. Damage keeps the sequence
@@ -262,21 +254,21 @@ impl SceneCompositor {
     pub(crate) fn handle_scanout_render_completion(
         &mut self,
         completion: RenderCompletion,
-        platform: &mut PlatformBackend,
+        sink: &mut dyn OutputSink,
     ) -> bool {
         let Some(inner) = self.inner.as_mut() else {
             return false;
         };
-        handle_scanout_render_completion_inner(inner, completion, platform)
+        handle_scanout_render_completion_inner(inner, completion, sink)
     }
 }
 
 pub(super) fn handle_scanout_render_completion_inner(
     inner: &mut SceneCompositorInner,
     completion: RenderCompletion,
-    platform: &mut PlatformBackend,
+    sink: &mut dyn OutputSink,
 ) -> bool {
-    if platform.gpu().renderer_failed {
+    if sink.gpu().renderer_failed {
         return false;
     }
     let RenderCompletion {
@@ -309,11 +301,11 @@ pub(super) fn handle_scanout_render_completion_inner(
         // completed source can no longer be associated safely. Fail-stop
         // rather than guessing a pool slot or making either device's
         // allocation reusable while GPU ownership is uncertain.
-        platform.gpu_mut().renderer_failed = true;
+        sink.gpu_mut().renderer_failed = true;
         return false;
     }
 
-    match platform.submit_copied(output_idx, bo_idx, fd) {
+    match sink.submit_copied(output_idx, bo_idx, fd) {
         Ok(()) => {
             if let Some(ack) = inner.outputs[output_idx].pending_acks.front_mut() {
                 ack.stage = InFlightStage::KmsFlipPending;
@@ -330,7 +322,7 @@ pub(super) fn handle_scanout_render_completion_inner(
             // The scene may retire only A-local descriptor resources, and
             // only behind A's compose fence; damage/cursor metadata remain
             // live for a later repaint because no frame reached the screen.
-            platform.invalidate_slot(output_idx, bo_idx);
+            sink.invalidate_slot(output_idx, bo_idx);
             let state = &mut inner.outputs[output_idx];
             let ack = state
                 .pending_acks
@@ -342,14 +334,14 @@ pub(super) fn handle_scanout_render_completion_inner(
             }
             if let Some(slot) = state.pool_slots.pop_front() {
                 match ack.ticket {
-                    None => match platform.recycle_failed_slot(output_idx, bo_idx) {
+                    None => match sink.recycle_failed_slot(output_idx, bo_idx) {
                         Ok(()) => state.pool_ring.release(slot),
                         Err(recovery_error) => {
                             log::error!(
                                 "render copied scanout: renderer recovery failed for output \
                                      {output_idx} bo {bo_idx}: {recovery_error}"
                             );
-                            platform.gpu_mut().renderer_failed = true;
+                            sink.gpu_mut().renderer_failed = true;
                         }
                     },
                     Some(ticket) => {
@@ -370,7 +362,7 @@ pub(super) fn handle_scanout_render_completion_inner(
                     "render copied scanout: missing descriptor slot for failed output \
                          {output_idx} bo {bo_idx}"
                 );
-                platform.gpu_mut().renderer_failed = true;
+                sink.gpu_mut().renderer_failed = true;
             }
             state.next_submit_retry_at =
                 Some(std::time::Instant::now() + std::time::Duration::from_millis(100));
@@ -382,13 +374,13 @@ pub(super) fn handle_scanout_render_completion_inner(
 pub(super) fn retire_failed_submit_bos(
     state: &mut OutputSceneState,
     output_idx: usize,
-    platform: &mut PlatformBackend,
+    sink: &mut dyn OutputSink,
     vk: &crate::kms::vk::device::VkContext,
 ) {
     let mut remaining = VecDeque::with_capacity(state.failed_submit_bos.len());
     while let Some(failed) = state.failed_submit_bos.pop_front() {
         match failed.ticket.poll_signaled_result(vk) {
-            Ok(true) => match platform.recycle_failed_slot(output_idx, failed.bo_idx) {
+            Ok(true) => match sink.recycle_failed_slot(output_idx, failed.bo_idx) {
                 Ok(()) => {
                     state.pool_ring.release(failed.pool_slot);
                     log::debug!(
@@ -403,7 +395,7 @@ pub(super) fn retire_failed_submit_bos(
                          bo {}: {error}",
                         failed.bo_idx,
                     );
-                    platform.gpu_mut().renderer_failed = true;
+                    sink.gpu_mut().renderer_failed = true;
                     remaining.push_back(failed);
                 }
             },
@@ -414,7 +406,7 @@ pub(super) fn retire_failed_submit_bos(
                      bo {}: {error:?}",
                     failed.bo_idx,
                 );
-                platform.gpu_mut().renderer_failed = true;
+                sink.gpu_mut().renderer_failed = true;
                 remaining.push_back(failed);
             }
         }
@@ -431,7 +423,7 @@ pub(super) fn retire_failed_submit_bos(
 pub(super) fn drain_pending_pool_releases(
     state: &mut OutputSceneState,
     vk: &crate::kms::vk::device::VkContext,
-    platform: &mut PlatformBackend,
+    sink: &mut dyn OutputSink,
 ) {
     if state.pending_pool_releases.is_empty() {
         return;
@@ -443,7 +435,7 @@ pub(super) fn drain_pending_pool_releases(
             Ok(false) => remaining.push_back((slot, ticket)),
             Err(error) => {
                 log::error!("render scene: deferred pool fence status failed: {error:?}");
-                platform.gpu_mut().renderer_failed = true;
+                sink.gpu_mut().renderer_failed = true;
                 remaining.push_back((slot, ticket));
             }
         }

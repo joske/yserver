@@ -1,5 +1,4 @@
 use crate::kms::render::{
-    platform::PlatformBackend,
     scene::{
         DamageAuditTarget, OutputLayout, OutputSink, Repaint, RootReadback, SceneCompositor,
         SceneError, SceneInput, Visibility, build::build_scene, compose::record_and_submit_render,
@@ -60,7 +59,7 @@ impl SceneCompositor {
         &mut self,
         input: &SceneInput,
         store: &mut DrawableStore,
-        platform: &PlatformBackend,
+        sink: &dyn OutputSink,
         cow_host_xid: Option<u32>,
         output_idx: usize,
         local: vk::Rect2D,
@@ -110,7 +109,7 @@ impl SceneCompositor {
             input,
             store,
             output_idx,
-            platform,
+            sink,
             None,
             None,
             cow_host_xid,
@@ -140,10 +139,7 @@ impl SceneCompositor {
             .expect("allocated above");
         let draws = built.scene.draws.len();
         let pool = create_audit_descriptor_pool(&vk, draws)?;
-        let ticket = platform
-            .gpu()
-            .acquire_fence_ticket()
-            .map_err(SceneError::Vk)?;
+        let ticket = sink.gpu().acquire_fence_ticket().map_err(SceneError::Vk)?;
         let mut submitted = false;
         let result = record_and_submit_render(
             &vk,

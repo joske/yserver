@@ -3,8 +3,8 @@
 //! It owns the DRM devices and KMS outputs, libinput and the per-output
 //! scanout BO pools, plus `gpu`: the [`GpuCore`] holding the Vulkan device,
 //! the ops command pool, the recyclable fence pool and the submit group.
-//! Sync is two objects: [`FenceTicket`] for CPU-side resource lifetime
-//! (I6a) and each `ScanoutBo`'s long-lived export semaphore for the KMS
+//! Sync is two objects: [`FenceTicket`](crate::kms::render::gpu::FenceTicket)
+//! for CPU-side resource lifetime (I6a) and each `ScanoutBo`'s long-lived export semaphore for the KMS
 //! `IN_FENCE_FD` wait. This file holds the imports, every type and const
 //! (private fields stay visible to all children); the code lives in:
 //!
@@ -68,7 +68,7 @@ use crate::{
 };
 
 pub(crate) use crate::kms::{
-    render::gpu::{FencePool, FenceTicket, GpuCore},
+    render::gpu::{FencePool, GpuCore},
     scanout_route::RenderDeviceId,
 };
 

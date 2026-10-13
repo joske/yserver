@@ -85,14 +85,11 @@ fn kms_retirement_requires_the_exact_paired_bo() {
 
 #[test]
 fn global_drain_waits_and_releases_every_deferred_scene_resource() {
-    let mut pending = VecDeque::from([(
-        3,
-        crate::kms::render::platform::FenceTicket::for_tests_stub(),
-    )]);
+    let mut pending = VecDeque::from([(3, crate::kms::render::gpu::FenceTicket::for_tests_stub())]);
     let mut failed = VecDeque::from([FailedSubmitBo {
         bo_idx: 7,
         pool_slot: 5,
-        ticket: crate::kms::render::platform::FenceTicket::for_tests_stub(),
+        ticket: crate::kms::render::gpu::FenceTicket::for_tests_stub(),
     }]);
     let mut waited = 0;
     let mut released = Vec::new();
@@ -127,14 +124,11 @@ fn global_drain_waits_and_releases_every_deferred_scene_resource() {
 
 #[test]
 fn global_drain_retains_every_resource_whose_fence_wait_fails() {
-    let mut pending = VecDeque::from([(
-        3,
-        crate::kms::render::platform::FenceTicket::for_tests_stub(),
-    )]);
+    let mut pending = VecDeque::from([(3, crate::kms::render::gpu::FenceTicket::for_tests_stub())]);
     let mut failed = VecDeque::from([FailedSubmitBo {
         bo_idx: 7,
         pool_slot: 5,
-        ticket: crate::kms::render::platform::FenceTicket::for_tests_stub(),
+        ticket: crate::kms::render::gpu::FenceTicket::for_tests_stub(),
     }]);
     let mut released = Vec::new();
 
