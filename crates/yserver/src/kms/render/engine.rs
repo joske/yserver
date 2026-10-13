@@ -83,7 +83,7 @@ use super::{
     glyph_atlas::GlyphAtlas,
     glyph_pixels::GlyphPixels,
     gpu::FenceTicket,
-    present_completion::PendingPresentBatch,
+    present_batch::PendingPresentBatch,
     store::{DrawableId, RetiredImage},
 };
 use crate::kms::vk::{

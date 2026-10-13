@@ -1916,7 +1916,7 @@ impl KmsBackend {
         let needs_present_poll = self.pending_present_batches.iter().any(|batch| {
             matches!(
                 batch.wait,
-                crate::kms::render::present_completion::PresentBatchWait::Poll
+                crate::kms::render::present_batch::PresentBatchWait::Poll
             )
         });
         let needs_source_wait_poll = self.pending_present_source_waits.values().any(|wait| {

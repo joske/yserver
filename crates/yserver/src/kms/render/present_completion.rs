@@ -14,7 +14,7 @@ use std::{
 
 use yserver_core::backend::{CompletedPresentEvent, SyncobjHandle, XshmfenceHandle};
 
-use crate::kms::render::platform::{FenceTicket, PresentCompletionSignal};
+use crate::kms::render::present_batch::PresentCompletionEntry;
 
 static RELEASE_FENCE_PUBLISHED_LOG: Once = Once::new();
 
@@ -31,7 +31,7 @@ pub(crate) struct PendingPresentEntry {
     pub(crate) event: CompletedPresentEvent,
 }
 
-impl PendingPresentEntry {
+impl PresentCompletionEntry for PendingPresentEntry {
     /// Publish this entry's GPU completion fence into a synced Present's
     /// release timeline. Returns `true` when a release point was published,
     /// `false` for legacy/no-wake entries.
@@ -39,7 +39,7 @@ impl PendingPresentEntry {
     /// State changes only after a successful import. On failure the original
     /// `PixmapSynced` wake remains intact, so completion falls back to the
     /// existing host-signal path rather than stranding the client buffer.
-    pub(crate) fn publish_release_fence(&mut self, fence: &OwnedFd) -> std::io::Result<bool> {
+    fn publish_release_fence(&mut self, fence: &OwnedFd) -> std::io::Result<bool> {
         let PinnedWake::PixmapSynced { handle, value } = &self.wake_pin else {
             return Ok(false);
         };
@@ -56,29 +56,18 @@ impl PendingPresentEntry {
     }
 }
 
-/// Readiness primitive for a submitted batch of PRESENT completions.
-pub(crate) enum PresentBatchWait {
-    /// Linux sync_file fd exported from a dedicated completion
-    /// semaphore. This is the hot path.
-    Fd(OwnedFd),
-    /// Export returned `-1`, meaning already signaled.
-    Ready,
-    /// Degraded path if fd export fails. Polls `ticket` through
-    /// `Backend::next_wakeup`, but should not occur on normal Linux
-    /// Vulkan stacks.
-    Poll,
-}
-
-/// Submitted-but-not-yet-emitted PRESENT completion batch.
-pub(crate) struct PendingPresentBatch {
-    pub(crate) wait: PresentBatchWait,
-    /// Optional internal fence for degraded polling only. The hot fd
-    /// path does not need this for readiness.
-    pub(crate) ticket: Option<FenceTicket>,
-    /// Keeps the dedicated export-only semaphore alive until the
-    /// exported sync_file has fired.
-    pub(crate) signal: Option<PresentCompletionSignal>,
-    pub(crate) events: Vec<PendingPresentEntry>,
+/// Recover the concrete entry from the renderer's opaque box.
+///
+/// # Panics
+///
+/// If `entry` is not a [`PendingPresentEntry`]. It is the only implementor,
+/// so a mismatch is a bug, never a payload to drop.
+pub(crate) fn into_pending_entry(entry: Box<dyn PresentCompletionEntry>) -> PendingPresentEntry {
+    let any: Box<dyn std::any::Any> = entry;
+    *any.downcast::<PendingPresentEntry>().expect(
+        "PresentCompletionEntry is implemented only by PendingPresentEntry; \
+         a different type reached the KMS present-completion drain",
+    )
 }
 
 /// Wake-target lifetime pin variants. The drain dispatches signal

@@ -24,6 +24,7 @@ pub(crate) mod imported_syncobj;
 pub(crate) mod owned_semaphore;
 pub(crate) mod platform;
 pub(crate) mod pointer_confine;
+pub(crate) mod present_batch;
 pub(crate) mod present_completion;
 pub(crate) mod present_source_wait;
 pub(crate) mod probe_executor;

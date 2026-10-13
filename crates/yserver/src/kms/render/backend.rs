@@ -1228,7 +1228,7 @@ pub struct KmsBackend {
     /// syncobj) so the underlying resource survives an intervening
     /// `XFixesDestroyFence` / `FreeSyncobj`.
     pub(crate) pending_present_batches:
-        std::collections::VecDeque<crate::kms::render::present_completion::PendingPresentBatch>,
+        std::collections::VecDeque<crate::kms::render::present_batch::PendingPresentBatch>,
 
     /// Pinned wakes drained to core but not yet signalled — held here so
     /// core can pace when the real xshmfence / syncobj fires. Keyed by

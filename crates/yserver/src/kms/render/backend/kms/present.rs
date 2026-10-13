@@ -60,7 +60,7 @@ impl KmsBackend {
 
     fn fire_pending_present_entry(
         &mut self,
-        entry: crate::kms::render::present_completion::PendingPresentEntry,
+        entry: Box<dyn crate::kms::render::present_batch::PresentCompletionEntry>,
     ) -> yserver_core::backend::CompletedPresentEvent {
         // Do NOT signal here. Retain the pin keyed by present_id so core can
         // release it at the target vblank (frame pacing). PinnedWake::None
@@ -68,8 +68,10 @@ impl KmsBackend {
         // Destructure so `wake_pin` is moved exactly once (PinnedWake is not
         // Copy — a `matches!(entry.wake_pin, ..)` guard would move it first and
         // fail to compile).
-        use crate::kms::render::present_completion::{PendingPresentEntry, PinnedWake};
-        let PendingPresentEntry { wake_pin, event } = entry;
+        use crate::kms::render::present_completion::{
+            PendingPresentEntry, PinnedWake, into_pending_entry,
+        };
+        let PendingPresentEntry { wake_pin, event } = into_pending_entry(entry);
         if !matches!(wake_pin, PinnedWake::None) {
             self.retained_present_wakes
                 .insert(event.present_id, wake_pin);
@@ -86,9 +88,9 @@ impl KmsBackend {
 
     fn register_pending_present_batch(
         &mut self,
-        mut batch: crate::kms::render::present_completion::PendingPresentBatch,
+        mut batch: crate::kms::render::present_batch::PendingPresentBatch,
     ) {
-        use crate::kms::render::present_completion::PresentBatchWait;
+        use crate::kms::render::present_batch::PresentBatchWait;
 
         if batch.events.is_empty() {
             return;
@@ -132,12 +134,12 @@ impl KmsBackend {
     }
 
     fn pending_present_batch_ready(
-        batch: &crate::kms::render::present_completion::PendingPresentBatch,
+        batch: &crate::kms::render::present_batch::PendingPresentBatch,
         vk: Option<&std::sync::Arc<crate::kms::vk::device::VkContext>>,
     ) -> bool {
         use std::os::fd::AsFd;
 
-        use crate::kms::render::present_completion::PresentBatchWait;
+        use crate::kms::render::present_batch::PresentBatchWait;
         use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
         // B.2-context fix (vkdebug VUID-vkDestroySemaphore-semaphore-05149):
@@ -182,9 +184,9 @@ impl KmsBackend {
 
     fn unregister_present_batch_fd(
         &mut self,
-        batch: &crate::kms::render::present_completion::PendingPresentBatch,
+        batch: &crate::kms::render::present_batch::PendingPresentBatch,
     ) {
-        use crate::kms::render::present_completion::PresentBatchWait;
+        use crate::kms::render::present_batch::PresentBatchWait;
 
         let _keep_export_semaphore_alive_until_batch_drop = batch.signal.as_ref();
         if let PresentBatchWait::Fd(fd) = &batch.wait {
@@ -1315,8 +1317,9 @@ impl KmsBackend {
     ) {
         use yserver_core::backend::PresentWake;
 
-        use crate::kms::render::present_completion::{
-            PendingPresentBatch, PendingPresentEntry, PinnedWake, PresentBatchWait,
+        use crate::kms::render::{
+            present_batch::{PendingPresentBatch, PresentBatchWait, PresentCompletionEntry},
+            present_completion::{PendingPresentEntry, PinnedWake},
         };
 
         let wake_pin = match &event.wake {
@@ -1337,7 +1340,8 @@ impl KmsBackend {
             _ => PinnedWake::None,
         };
 
-        let mut entry = PendingPresentEntry { wake_pin, event };
+        let mut entry: Box<dyn PresentCompletionEntry> =
+            Box::new(PendingPresentEntry { wake_pin, event });
 
         if let Some(cow_id) = self.cow_id
             && self.store.lookup(dst_host_xid) == Some(cow_id)

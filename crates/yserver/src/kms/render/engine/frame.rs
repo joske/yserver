@@ -9,7 +9,7 @@ use crate::kms::render::{
         },
     },
     gpu::{FenceTicket, GpuCore, PresentCompletionSignal},
-    present_completion::{PendingPresentBatch, PendingPresentEntry, PresentBatchWait},
+    present_batch::{PendingPresentBatch, PresentBatchWait, PresentCompletionEntry},
     store::{DrawableId, DrawableStore},
 };
 use ash::vk;
@@ -887,9 +887,8 @@ impl RenderEngine {
                     // alongside the exported sync_file fd from the signal
                     // we queued on the submit. The batch keeps the signal
                     // alive until the fd fires.
-                    let mut drained_completions: Vec<
-                        crate::kms::render::present_completion::PendingPresentEntry,
-                    > = std::mem::take(&mut open_frame.pending_present_completions);
+                    let mut drained_completions: Vec<Box<dyn PresentCompletionEntry>> =
+                        std::mem::take(&mut open_frame.pending_present_completions);
                     if !drained_completions.is_empty() {
                         let (wait, signal) = match completion_signal {
                             Some(signal) => match signal.export_sync_file_fd() {
@@ -996,9 +995,8 @@ impl RenderEngine {
                 // of submit success (Pitfall 8). The completion_signal drops with
                 // the local; the failed submit never queued a signal-op so the fd
                 // would never fire anyway.
-                let drained_completions: Vec<
-                    crate::kms::render::present_completion::PendingPresentEntry,
-                > = std::mem::take(&mut open_frame.pending_present_completions);
+                let drained_completions: Vec<Box<dyn PresentCompletionEntry>> =
+                    std::mem::take(&mut open_frame.pending_present_completions);
                 if !drained_completions.is_empty() {
                     inner.pending_present_batches.push(PendingPresentBatch {
                         wait: PresentBatchWait::Ready,
@@ -1236,14 +1234,12 @@ impl RenderEngine {
     /// `RecordedOp::dst_id() == Some(dst)`, NOT `touched` — touched includes
     /// sampled-only references that would attach completions to frames that
     /// never wrote it).
-    // This Result is an ownership hand-back, not a conventional error path;
-    // boxing the entry would add an allocation to every COW Present.
-    #[allow(clippy::result_large_err)]
+    // This Result is an ownership hand-back, not a conventional error path.
     pub(crate) fn attach_present_completion(
         &mut self,
         dst: DrawableId,
-        entry: PendingPresentEntry,
-    ) -> Result<(), PendingPresentEntry> {
+        entry: Box<dyn PresentCompletionEntry>,
+    ) -> Result<(), Box<dyn PresentCompletionEntry>> {
         let Some(inner) = self.inner.as_mut() else {
             return Err(entry);
         };

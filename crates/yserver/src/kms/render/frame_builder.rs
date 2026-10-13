@@ -398,7 +398,8 @@ pub(crate) struct OpenFrame {
                   drain; the slot lands in Task 1 so the OpenFrame shape is stable \
                   before Task 4's atomic cow_copy_area rewrite."
     )]
-    pub(crate) pending_present_completions: Vec<super::present_completion::PendingPresentEntry>,
+    pub(crate) pending_present_completions:
+        Vec<Box<dyn super::present_batch::PresentCompletionEntry>>,
     /// Phase 2 clip — snapshots touched this frame: id -> (pre_frame_layout,
     /// prior_ticket, prev_snapshotted_version). The third element is
     /// load-bearing for rollback (codex round-4): a failed close must restore

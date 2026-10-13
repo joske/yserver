@@ -1726,7 +1726,7 @@ impl KmsBackend {
         let Some(dst_id) = self.store.lookup(dst_xid) else {
             return false;
         };
-        let entry = PendingPresentEntry {
+        let entry = Box::new(PendingPresentEntry {
             wake_pin: PinnedWake::None,
             event: CompletedPresentEvent {
                 client_id: ClientId(0),
@@ -1744,7 +1744,7 @@ impl KmsBackend {
                 completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
                 emit_idle: true,
             },
-        };
+        });
         self.engine.attach_present_completion(dst_id, entry).is_ok()
     }
 
@@ -1942,7 +1942,7 @@ impl KmsBackend {
             Some(id) => id,
             None => return false,
         };
-        let entry = PendingPresentEntry {
+        let entry = Box::new(PendingPresentEntry {
             wake_pin: PinnedWake::None,
             event: CompletedPresentEvent {
                 client_id: ClientId(0),
@@ -1960,7 +1960,7 @@ impl KmsBackend {
                 completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
                 emit_idle: true,
             },
-        };
+        });
         self.engine.attach_present_completion(cow_id, entry).is_ok()
     }
 
