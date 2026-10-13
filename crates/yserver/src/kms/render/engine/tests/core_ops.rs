@@ -212,7 +212,7 @@ fn fill_depth8_observes_r8_source_byte() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn logic_fill_xor_applies_per_pixel() {
-    use yserver_core::backend::GcFunction;
+    use yserver_protocol::x11::gc::GcFunction;
 
     let Some(mut gpu) = live_gpu() else {
         eprintln!("no VkContext available — skipping");
@@ -428,7 +428,7 @@ fn copy_area_disjoint_pixmaps_round_trip() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn logic_fill_depth32_preserves_wire_alpha_when_not_opaque() {
-    use yserver_core::backend::GcFunction;
+    use yserver_protocol::x11::gc::GcFunction;
 
     let Some(mut gpu) = live_gpu() else {
         eprintln!("no VkContext available — skipping");
@@ -507,7 +507,7 @@ fn logic_fill_depth32_preserves_wire_alpha_when_not_opaque() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn logic_fill_r8_not_family_matches_x11_bytes() {
-    use yserver_core::backend::GcFunction;
+    use yserver_protocol::x11::gc::GcFunction;
 
     let Some(mut gpu) = live_gpu() else {
         eprintln!("no VkContext available — skipping");

@@ -223,10 +223,10 @@ pub(crate) fn composite_rect(
 /// last row is `0 0 1`. A missing filter samples nearest, as Xorg's default
 /// picture filter.
 pub(crate) fn scale_push(
-    transform: &yserver_core::randr::CrtcTransform,
+    transform: &yserver_protocol::x11::randr::transform::CrtcTransform,
     extent: vk::Extent2D,
 ) -> ScalePushConsts {
-    use yserver_core::randr::Filter;
+    use yserver_protocol::x11::randr::transform::Filter;
     let m = &transform.matrix;
     let f = &transform.forward;
     #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]

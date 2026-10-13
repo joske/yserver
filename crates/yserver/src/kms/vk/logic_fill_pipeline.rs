@@ -17,7 +17,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use ash::vk;
-use yserver_core::backend::GcFunction;
+use yserver_protocol::x11::gc::GcFunction;
 
 use super::device::VkContext;
 

@@ -166,11 +166,11 @@ fn intersect_to_local(r: vk::Rect2D, ox: i32, oy: i32, ow: u32, oh: u32) -> Opti
 /// per-pixel XOR value. GXinvert ignores fg (`dst = ~dst = dst ^ plane_mask`);
 /// GXxor uses `dst ^= fg`. Returns None for non-reversible functions.
 pub(crate) fn xor_value_for(
-    function: yserver_core::backend::GcFunction,
+    function: yserver_protocol::x11::gc::GcFunction,
     foreground: u32,
     plane_mask: u32,
 ) -> Option<u32> {
-    use yserver_core::backend::GcFunction;
+    use yserver_protocol::x11::gc::GcFunction;
     match function {
         GcFunction::Invert => Some(plane_mask),
         GcFunction::Xor => Some(foreground & plane_mask),
@@ -215,7 +215,7 @@ mod tests {
 
     #[test]
     fn xor_value_normalization() {
-        use yserver_core::backend::GcFunction;
+        use yserver_protocol::x11::gc::GcFunction;
         assert_eq!(
             xor_value_for(GcFunction::Invert, 0x123456, 0xffffff),
             Some(0xffffff)

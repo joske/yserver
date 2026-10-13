@@ -14,7 +14,7 @@
 //! closed stroke polygon (quad + caps + joins) and feed it through
 //! `crate::kms::backend::scanline_fill_polygon`.
 
-use yserver_core::backend::params::{ArcMode, CapStyle, JoinStyle, LineStyle};
+use yserver_protocol::x11::gc::{ArcMode, CapStyle, JoinStyle, LineStyle};
 
 use crate::kms::cpu_types::Rectangle16;
 

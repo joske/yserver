@@ -224,7 +224,7 @@ impl RenderEngine {
         store: &mut DrawableStore,
         gpu: &mut GpuCore,
         dst: Dst,
-        function: yserver_core::backend::GcFunction,
+        function: yserver_protocol::x11::gc::GcFunction,
         opaque_alpha: bool,
         fg: u32,
         rects: &[Rectangle16],
@@ -264,7 +264,7 @@ impl RenderEngine {
             store,
             gpu,
             dst,
-            yserver_core::backend::GcFunction::Set,
+            yserver_protocol::x11::gc::GcFunction::Set,
             crate::kms::vk::logic_fill_pipeline::LogicFillChannels::Alpha,
             0,
             rects,
@@ -277,12 +277,12 @@ impl RenderEngine {
         store: &mut DrawableStore,
         gpu: &mut GpuCore,
         dst: Dst,
-        function: yserver_core::backend::GcFunction,
+        function: yserver_protocol::x11::gc::GcFunction,
         channels: crate::kms::vk::logic_fill_pipeline::LogicFillChannels,
         fg: u32,
         rects: &[Rectangle16],
     ) -> Result<(), RenderError> {
-        use yserver_core::backend::GcFunction;
+        use yserver_protocol::x11::gc::GcFunction;
 
         let target = dst.id();
         // N9 order: empty-input fast-paths → renderer_failed →
