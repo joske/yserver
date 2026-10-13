@@ -744,79 +744,29 @@ fn record_text_run_scissored_draws_only_the_requested_instance_range() {
 // pipelines, and pipeline state is immutable. The request is
 // therefore recorded as several contiguous runs.
 //
-// Both tests below share one fixture: a real items stream over
-// two glyphsets of different formats, parsed by the production
-// parse (`parse_composite_glyph_items`). The first asserts the
-// splitter's ORDER; the second asserts that today it produces
-// exactly one run.
+// Both tests below share one glyph sequence: what the production
+// parse (`parse_composite_glyph_items`) makes of an items stream
+// over two glyphsets of different formats, pinned on the parser
+// side by `backend/tests/render_picture.rs`
+// (`the_mixed_format_items_fixture_parses_to_the_run_split_tuples`).
+// The first asserts the splitter's ORDER; the second asserts that
+// today it produces exactly one run.
 
-/// Two glyphsets — A8 and ARGB32 — and an items stream that
-/// alternates between them via the inline `count == 255`
-/// element. Returns `(glyphsets, initial_gs_xid, items)`.
-///
-/// The stream is deliberately not one-glyph-per-element:
-/// elements of 2, 1, 1 and 2 glyphs, so a run has to span an
-/// element boundary (glyphs 0-1) and two same-format glyphs
-/// inside one element must stay in one run (glyphs 4-5). Source
-/// formats come out as A8, A8, ARGB32, A8, ARGB32, ARGB32 and
-/// the pen advances one pixel per glyph, so `dst_x` doubles as
-/// each glyph's index in request order.
-fn mixed_format_items_fixture() -> (HashMap<u32, crate::kms::core::GlyphSetState>, u32, Vec<u8>) {
-    use crate::kms::core::{GlyphSetFormat, GlyphSetState, StoredGlyph};
-
-    const GS_A8: u32 = 0x4B01;
-    const GS_ARGB32: u32 = 0x4B02;
-
-    let mut glyphsets: HashMap<u32, GlyphSetState> = HashMap::new();
-    for (xid, format, bytes_per_pixel) in [
-        (GS_A8, GlyphSetFormat::A8, 1),
-        (GS_ARGB32, GlyphSetFormat::Argb32, 4),
-    ] {
-        let mut glyphs = HashMap::new();
-        // Ids 1..=6, so every glyph the stream names resolves in
-        // whichever glyphset is active at the time.
-        for glyph_id in 1..=6u32 {
-            glyphs.insert(
-                glyph_id,
-                StoredGlyph {
-                    width: 1,
-                    height: 1,
-                    x: 0,
-                    y: 0,
-                    x_off: 1,
-                    y_off: 0,
-                    pixels: vec![0x80; bytes_per_pixel],
-                    format,
-                },
-            );
-        }
-        glyphsets.insert(xid, GlyphSetState { format, glyphs });
-    }
-
-    // Element layout: count(u8) pad pad pad dx(i16) dy(i16), then
-    // `count` 1-byte ids padded to a 4-byte boundary (minor 23).
-    let mut items: Vec<u8> = Vec::new();
-    let element = |items: &mut Vec<u8>, ids: &[u8]| {
-        items.extend_from_slice(&[u8::try_from(ids.len()).expect("count"), 0, 0, 0, 0, 0, 0, 0]);
-        items.extend_from_slice(ids);
-        while !items.len().is_multiple_of(4) {
-            items.push(0);
-        }
-    };
-    let switch_to = |items: &mut Vec<u8>, xid: u32| {
-        items.extend_from_slice(&[255u8, 0, 0, 0]);
-        items.extend_from_slice(&xid.to_le_bytes());
-    };
-    element(&mut items, &[1, 2]); // glyphs 0,1 — A8 (initial gs)
-    switch_to(&mut items, GS_ARGB32);
-    element(&mut items, &[3]); // glyph 2 — ARGB32
-    switch_to(&mut items, GS_A8);
-    element(&mut items, &[4]); // glyph 3 — A8
-    switch_to(&mut items, GS_ARGB32);
-    element(&mut items, &[5, 6]); // glyphs 4,5 — ARGB32
-
-    (glyphsets, GS_A8, items)
-}
+/// The parsed mixed-format stream as `(source format, w, h, dst_x,
+/// dst_y)`, in request order — the same literal tuples the parser test
+/// asserts. Elements of 2, 1, 1 and 2 glyphs, so a run has to span an
+/// element boundary (glyphs 0-1) and two same-format glyphs inside one
+/// element must stay in one run (glyphs 4-5). The pen advances one
+/// pixel per glyph, so `dst_x` doubles as each glyph's index in request
+/// order.
+const MIXED_FORMAT_GLYPHS: [(GlyphSourceFormat, u32, u32, i32, i32); 6] = [
+    (GlyphSourceFormat::A8, 1, 1, 0, 0),
+    (GlyphSourceFormat::A8, 1, 1, 1, 0),
+    (GlyphSourceFormat::Argb32, 1, 1, 2, 0),
+    (GlyphSourceFormat::A8, 1, 1, 3, 0),
+    (GlyphSourceFormat::Argb32, 1, 1, 4, 0),
+    (GlyphSourceFormat::Argb32, 1, 1, 5, 0),
+];
 
 /// The parsed glyphs as the per-glyph walk would record them —
 /// one `RecordedTextGlyph` per parsed glyph, same order, each
@@ -824,23 +774,24 @@ fn mixed_format_items_fixture() -> (HashMap<u32, crate::kms::core::GlyphSetState
 /// `dualSrcBlend` gives it. The atlas coordinates are irrelevant
 /// to the splitter; `dst_x` carries the glyph's request-order
 /// index.
-fn recorded_from_parsed(
-    parsed: &[crate::kms::render::backend::ParsedGlyph],
+fn recorded_from_tuples(
     component_alpha_supported: bool,
 ) -> Vec<crate::kms::render::frame_builder::RecordedTextGlyph> {
-    parsed
+    MIXED_FORMAT_GLYPHS
         .iter()
-        .map(|p| crate::kms::render::frame_builder::RecordedTextGlyph {
-            atlas_x: 0,
-            atlas_y: 0,
-            logical_w: p.w,
-            h: p.h,
-            dst_x: p.dst_x,
-            dst_y: p.dst_y,
-            layout: RenderEngine::effective_glyph_layout(
-                p.source_format,
-                component_alpha_supported,
-            ),
+        .map(|&(source_format, w, h, dst_x, dst_y)| {
+            crate::kms::render::frame_builder::RecordedTextGlyph {
+                atlas_x: 0,
+                atlas_y: 0,
+                logical_w: w,
+                h,
+                dst_x,
+                dst_y,
+                layout: RenderEngine::effective_glyph_layout(
+                    source_format,
+                    component_alpha_supported,
+                ),
+            }
         })
         .collect()
 }
@@ -865,41 +816,9 @@ fn recorded_from_parsed(
 /// collapses to one run.
 #[test]
 fn a_mixed_format_items_stream_splits_into_ordered_homogeneous_runs() {
-    let (glyphsets, initial_gs, items) = mixed_format_items_fixture();
-    let parsed = crate::kms::render::backend::parse_composite_glyph_items(
-        &glyphsets, 23, initial_gs, 0, 0, &items,
-    );
-
-    // The tag follows the inline glyphset change, in request
-    // order. If the parse ignored the `count == 255` element this
-    // would be all-A8, and no splitter could recover.
-    assert_eq!(
-        parsed
-            .glyphs
-            .iter()
-            .map(|p| p.source_format)
-            .collect::<Vec<_>>(),
-        vec![
-            GlyphSourceFormat::A8,
-            GlyphSourceFormat::A8,
-            GlyphSourceFormat::Argb32,
-            GlyphSourceFormat::A8,
-            GlyphSourceFormat::Argb32,
-            GlyphSourceFormat::Argb32,
-        ],
-        "source-format tags must follow the inline glyphset change, in request order",
-    );
-
     // Layouts as a `dualSrcBlend` device gives them: ARGB32
     // interns as four packed planes, A8 as one.
-    let recorded = recorded_from_parsed(&parsed.glyphs, true);
-    // Request-order index, carried in dst_x by the fixture's
-    // one-pixel pen advance.
-    assert_eq!(
-        recorded.iter().map(|g| g.dst_x).collect::<Vec<_>>(),
-        vec![0, 1, 2, 3, 4, 5],
-        "the fixture's pen must advance one pixel per glyph",
-    );
+    let recorded = recorded_from_tuples(true);
 
     let layouts: Vec<GlyphLayout> = recorded.iter().map(|g| g.layout).collect();
     assert_eq!(
@@ -981,22 +900,16 @@ fn a_mixed_format_items_stream_splits_into_ordered_homogeneous_runs() {
 /// stream — is the sibling test above.
 #[test]
 fn the_run_split_is_inert_only_where_component_alpha_is_unsupported() {
-    let (glyphsets, initial_gs, items) = mixed_format_items_fixture();
-    let parsed = crate::kms::render::backend::parse_composite_glyph_items(
-        &glyphsets, 23, initial_gs, 0, 0, &items,
-    );
-    assert_eq!(parsed.glyphs.len(), 6, "fixture must parse six glyphs");
     assert!(
-        parsed
-            .glyphs
+        MIXED_FORMAT_GLYPHS
             .iter()
-            .any(|p| p.source_format == GlyphSourceFormat::Argb32),
+            .any(|&(format, ..)| format == GlyphSourceFormat::Argb32),
         "fixture must actually mix formats, or inertness is vacuous",
     );
 
     // No `dualSrcBlend`: the upload reduces ARGB32 to one
     // grayscale coverage plane, so every glyph is an A8 entry.
-    let recorded = recorded_from_parsed(&parsed.glyphs, false);
+    let recorded = recorded_from_tuples(false);
     let layouts: Vec<GlyphLayout> = recorded.iter().map(|g| g.layout).collect();
     assert!(
         layouts.iter().all(|l| *l == GlyphLayout::A8),
@@ -1015,7 +928,7 @@ fn the_run_split_is_inert_only_where_component_alpha_is_unsupported() {
     // And the same stream on a device that CAN blend four planes
     // does not collapse — so the assertion above is a statement
     // about the device, not a tautology about the fixture.
-    let with_ca = recorded_from_parsed(&parsed.glyphs, true);
+    let with_ca = recorded_from_tuples(true);
     assert_eq!(
         RenderEngine::split_glyph_runs(&with_ca).len(),
         4,

@@ -2033,3 +2033,110 @@ fn composite_glyphs_inline_glyphset_change_parsed() {
     );
     assert_eq!(parsed_ignored.missing, 1, "0x20 is not in gs_a");
 }
+
+/// Two glyphsets — A8 and ARGB32 — and an items stream that
+/// alternates between them via the inline `count == 255`
+/// element. Returns `(glyphsets, initial_gs_xid, items)`.
+///
+/// The stream is deliberately not one-glyph-per-element:
+/// elements of 2, 1, 1 and 2 glyphs, so a run has to span an
+/// element boundary (glyphs 0-1) and two same-format glyphs
+/// inside one element must stay in one run (glyphs 4-5). Source
+/// formats come out as A8, A8, ARGB32, A8, ARGB32, ARGB32 and
+/// the pen advances one pixel per glyph, so `dst_x` doubles as
+/// each glyph's index in request order.
+fn mixed_format_items_fixture() -> (HashMap<u32, crate::kms::core::GlyphSetState>, u32, Vec<u8>) {
+    use crate::kms::core::{GlyphSetFormat, GlyphSetState, StoredGlyph};
+
+    const GS_A8: u32 = 0x4B01;
+    const GS_ARGB32: u32 = 0x4B02;
+
+    let mut glyphsets: HashMap<u32, GlyphSetState> = HashMap::new();
+    for (xid, format, bytes_per_pixel) in [
+        (GS_A8, GlyphSetFormat::A8, 1),
+        (GS_ARGB32, GlyphSetFormat::Argb32, 4),
+    ] {
+        let mut glyphs = HashMap::new();
+        // Ids 1..=6, so every glyph the stream names resolves in
+        // whichever glyphset is active at the time.
+        for glyph_id in 1..=6u32 {
+            glyphs.insert(
+                glyph_id,
+                StoredGlyph {
+                    width: 1,
+                    height: 1,
+                    x: 0,
+                    y: 0,
+                    x_off: 1,
+                    y_off: 0,
+                    pixels: vec![0x80; bytes_per_pixel],
+                    format,
+                },
+            );
+        }
+        glyphsets.insert(xid, GlyphSetState { format, glyphs });
+    }
+
+    // Element layout: count(u8) pad pad pad dx(i16) dy(i16), then
+    // `count` 1-byte ids padded to a 4-byte boundary (minor 23).
+    let mut items: Vec<u8> = Vec::new();
+    let element = |items: &mut Vec<u8>, ids: &[u8]| {
+        items.extend_from_slice(&[u8::try_from(ids.len()).expect("count"), 0, 0, 0, 0, 0, 0, 0]);
+        items.extend_from_slice(ids);
+        while !items.len().is_multiple_of(4) {
+            items.push(0);
+        }
+    };
+    let switch_to = |items: &mut Vec<u8>, xid: u32| {
+        items.extend_from_slice(&[255u8, 0, 0, 0]);
+        items.extend_from_slice(&xid.to_le_bytes());
+    };
+    element(&mut items, &[1, 2]); // glyphs 0,1 — A8 (initial gs)
+    switch_to(&mut items, GS_ARGB32);
+    element(&mut items, &[3]); // glyph 2 — ARGB32
+    switch_to(&mut items, GS_A8);
+    element(&mut items, &[4]); // glyph 3 — A8
+    switch_to(&mut items, GS_ARGB32);
+    element(&mut items, &[5, 6]); // glyphs 4,5 — ARGB32
+
+    (glyphsets, GS_A8, items)
+}
+
+/// The parser half of the mixed-format run split: the fixture parses to
+/// the per-glyph tuples `engine/tests/glyph_runs.rs` starts from
+/// (`MIXED_FORMAT_GLYPHS`), in request order. Each glyph is 1×1 at
+/// origin (0, 0) and every element has dx = dy = 0, so `dst` is the pen,
+/// which the x_off of 1 advances one pixel per glyph.
+#[test]
+fn the_mixed_format_items_fixture_parses_to_the_run_split_tuples() {
+    use crate::kms::render::{
+        backend::parse_composite_glyph_items, glyph_pixels::GlyphSourceFormat,
+    };
+
+    let (glyphsets, initial_gs, items) = mixed_format_items_fixture();
+    let parsed = parse_composite_glyph_items(&glyphsets, 23, initial_gs, 0, 0, &items);
+
+    // (source format, w, h, dst_x, dst_y). If the parse ignored the
+    // `count == 255` element the formats would be all-A8.
+    assert_eq!(
+        parsed
+            .glyphs
+            .iter()
+            .map(|p| (p.source_format, p.w, p.h, p.dst_x, p.dst_y))
+            .collect::<Vec<_>>(),
+        vec![
+            (GlyphSourceFormat::A8, 1, 1, 0, 0),
+            (GlyphSourceFormat::A8, 1, 1, 1, 0),
+            (GlyphSourceFormat::Argb32, 1, 1, 2, 0),
+            (GlyphSourceFormat::A8, 1, 1, 3, 0),
+            (GlyphSourceFormat::Argb32, 1, 1, 4, 0),
+            (GlyphSourceFormat::Argb32, 1, 1, 5, 0),
+        ],
+        "source-format tags must follow the inline glyphset change, and the \
+             pen must advance one pixel per glyph, in request order",
+    );
+    assert_eq!(
+        parsed.missing, 0,
+        "every id resolves in its active glyphset"
+    );
+}
