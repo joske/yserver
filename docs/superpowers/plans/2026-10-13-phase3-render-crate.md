@@ -423,9 +423,13 @@ start+duration in s.
 - [x] Per-commit gates (fmt, clippy ×3 configs, workspace tests default +
   xdmcp; render alone); test mapping.
 - [ ] FreeBSD CI: runs on the PR (not pushed yet).
-- [ ] File-size ceilings: not re-checked (the move only changes visibility).
-- [x] Lavapipe after stage 3 and after the move (321 both).
-- [ ] HW smoke on bee and eiger for the seam: not recorded here.
+- [x] File-size ceilings: no non-test `.rs` over 5,000 lines, no test `.rs`
+  over 6,000 (re-checked at the branch head).
+- [x] Lavapipe at the seam (stage 2: 320 → 321, the new drop test), after
+  stage 3 and after the move (321 each).
+- [x] HW smoke of the seam (`851ccddd`), jos 2026-10-13: silence (RX 6800,
+  RADV) CDE and XFCE; eiger (Asahi) Plasma, a YouTube video, glmark2, logout.
+  silence's RADV covers the amdgpu case the plan gave to bee.
 - [x] Timings on silence; [ ] fuji (jos).
 
 ## Review log
