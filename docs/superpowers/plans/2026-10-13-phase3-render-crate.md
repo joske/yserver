@@ -293,6 +293,141 @@ render. Scanout BO types stay KMS-side, behind the sink. A second sink is
 without KMS would be the first real second implementor. HW smoke on bee and
 eiger.
 
+## Execution (3a)
+
+Branch `refactor/phase3a-render-crate`, 2026-10-13.
+
+### Commits by stage
+
+- Prep: `d2f15d8b` drop `gpu-allocator`; `c4d6c272` glyph-run test split at
+  the parser seam.
+- Stage 1, plain data down (moves): `3b591969` GC enums → `x11::gc`;
+  `e713b745` RANDR transform → `x11::randr::transform`; `a2ebdd45`
+  `DrmDeviceKey` → `vk::device`; `c740227e` `cpu_types` → `kms::render`;
+  `814e1363` geometry helpers → `render::geometry`; `82fd719d` `BoPhase` →
+  `vk::compositor`; `df91cea0` stub/doc cleanup.
+- Stage 2, `GpuCore`: `a6a38e35` field grouping; `ff47f488` move into
+  `render::gpu`; `18dd8ff5` engine/store take `&mut GpuCore` (seam);
+  `f4752211` `scanout_readback_op` reset first in `drop`; `8a077445` tests on
+  `GpuCore` fixtures; `851ccddd` `platform` → `gpu` bindings.
+- Stage 3, present edge: `0a71366d` `Box<dyn PresentCompletionEntry>`;
+  `51a41547` round-trip test.
+- Stage 4, the crate: `823585b6` protocol paths; `9a73ac27` geometry paths;
+  `ccbfa14c` lint attributes; `e736f26b` the move; `582cc67e` Justfile;
+  `83104c0c` CI lavapipe step; `5cff7fd9` blame-ignore.
+
+### Deviations from the plan
+
+- (a) `randr/transform.rs` moved whole: `CrtcTransform`/`Filter` need its
+  private helpers, and the rotation half has no core dependency either.
+- (b) `vk_count!` is re-exported at `yserver`'s root (`pub use
+  yserver_render::vk_count`), so the 41 outside `crate::vk_count!` calls stay
+  as they are instead of being rewritten (decision 6).
+- (c) A `test-support` feature (enabled only from `yserver`'s
+  `[dev-dependencies]`; not in `cargo tree -e features,normal -p yserver`)
+  exposes the `#[cfg(test)]` fixtures `yserver`'s tests use, as
+  `cfg(any(test, feature = "test-support"))` + `pub`:
+  `DrawableId::for_tests`, `VulkanDeviceSelector::for_tests`,
+  `FenceTicket::for_tests_stub`, `VkContext::new_disposable_for_test`,
+  `TransformIntermediate::memory`, `RenderEngine::picture_paint_len`,
+  `mem_accounting::thread_alloc_calls` (plus the `Weak` import and the
+  `THREAD_ALLOC_CALLS` counter they need).
+- (d) Lint-attribute pre-commit (`ccbfa14c`): as public items, `region.rs`'s
+  and `scene_diff.rs`'s `expect(dead_code)` would be unfulfilled (now
+  `allow`, redundant after the move), and `DrawableStore::new` trips
+  `new_without_default` (`allow`). Keeps the move commit visibility-only.
+- (e) 23 items became `pub` only for `yserver`'s tests (against decision 7;
+  accepted for now). Resolve in 3b (scene tests) or a follow-up (tests that
+  only test render behaviour move into render). Paths under
+  `yserver_render::kms`; users under `crates/yserver/src/kms/`:
+
+  | item | used by |
+  |---|---|
+  | `render::store::Drawable::dormant` | `render/scene/tests/{projection,tick}.rs` |
+  | `render::store::Drawable::{presentation_damage, presentation_damage_epoch}` | `render/backend/tests/paint_target.rs` |
+  | `render::store::DrawableStore::damage` | `render/backend/tests/{deadlines,paint_target}.rs`, `render/scene/tests/{projection,tick}.rs` |
+  | `render::store::DrawableStore::mark_contents_modified` | `render/backend/tests/gc_draw.rs` |
+  | `render::telemetry::Bucket::{frame_builder_close_reason_legacy_sc_compose, frame_builder_close_reason_timeout}` | `render/backend/tests/deadlines.rs` |
+  | `render::telemetry::Bucket::frame_builder_renders_per_frame_max_in_window` | `render/backend/tests/misc.rs` |
+  | `render::telemetry::Telemetry::frame_id` | `render/backend/tests/deadlines.rs` |
+  | `render::region::Region::contains` | `render/scene/tests/partial_compose.rs`, `render/scene/walk.rs` (cfg(test)) |
+  | `render::region::Region::contains_rect` | `render/scene/tests/{borders,projection}.rs` |
+  | `render::region::Region::rect_count` | `render/scene/tests/partial_compose.rs` |
+  | `render::region::Region::union_with` | `render/scene/tests/walk.rs` |
+  | `render::scene_diff::ScenePresence::{region, signature}` | `render/scene/tests/walk.rs` |
+  | `render::scanout_damage::ScanoutDamage::{has_staged_frame, missing_area}` | `render/scene/tests/walk.rs` |
+  | `render::engine::RenderEngine::try_append_render_batch` | `render/backend/tests/render_picture.rs` |
+  | `render::geometry::bresenham_segment` | `render/backend/tests/gc_draw.rs` |
+  | `render::cursor::color_roles_to_bgra` | `render/backend/tests/cursor.rs` |
+  | `render::glyph_pixels::reduce_argb32_glyph_to_a8_coverage` | `backend.rs` (cfg(test)) |
+  | `vk::target::{pick_export_memory_type, ExportMemoryPlacement}` | `vk/scanout/copied/two_gpu_tests.rs` |
+
+- (f) Log targets of moved modules (default `module_path!`) are now
+  `yserver_render::kms::…`: `yserver::kms::vk=…` / `yserver::kms::render::<moved>=…`
+  no longer match. `yserver_render=…` or `yserver_render::kms::…=…` do (and
+  a bare `yserver=…`, since env_logger matches by string prefix). Explicit
+  targets (`yserver::kms::render::store`, `…::fbtrace`, `yserver::format_query`)
+  are unchanged.
+- (g) The four Justfile telemetry recipes now filter on
+  `yserver_render::kms::render::telemetry`; CI's lavapipe step runs
+  `--workspace` (58 ignored tests moved crates).
+- (h) The present-entry downcast helper has one call site (stage 3), not two.
+
+### Numbers
+
+- Visibility (compiler-driven, `pub(crate)` → `pub` unless noted): 85
+  types/consts, 29 free fns (`owned_fd_from_vk` was private), 319
+  methods/assoc fns, 142 fields, 21 module decls (+4 vk modules, 3 engine
+  child-glob re-exports). Move diff: 44 of 91 files byte-identical; changed
+  lines are visibility 564, rustfmt reflow 46, test-support cfg 17, split 81
+  (`pub mod scanout;` and `build.rs`'s git-hash half stay in `yserver`).
+- Tests: 490 moved to `yserver_render` (58 ignored); per config (default,
+  xdmcp, tcp-transport; normal and `--ignored`) the union equals the
+  pre-move list with the crate prefix mapped.
+- Lavapipe (`--workspace --features xdmcp --ignored`): 321 = `yserver` lib 59
+  + `render_acceptance` 191 + `glx_tfp_export` 10 + `dri3_fd_leak` 1 +
+  `yserver_render` lib 58 + doctests 2.
+
+### Timings after 3a (`83104c0c`, silence)
+
+Same recipe, `-p yserver-render` added to the clean. Run 1 / run 2;
+start+duration in s.
+
+| profile | cpus | total | core | render | yserver | core lib(test) | render lib(test) | yserver lib(test) |
+|---|---|---|---|---|---|---|---|---|
+| release | 32 | 17.3 / 17.3 | 0.7+8.8 | 1.7+3.1 / 1.8+3.1 | 4.1+12.9 | – | – | – |
+| release | 4 | 35.1 / 35.8 | 0.6+23.4 / 0.7+23.4 | 2.0+5.3 / 2.0+5.2 | 6.9+27.8 / 7.0+27.8 | – | – | – |
+| dev | 4 | 8.9 / 8.9 | 0.5+4.9 | 1.6+1.8 / 1.7+1.8 | 3.2+5.5 / 3.2+5.4 | – | – | – |
+| test --no-run | 4 | 21.2 / 21.1 | 0.7+8.3 / 0.7+8.4 | 2.3+3.3 / 2.4+3.3 | 5.7+8.8 / 5.7+9.7 | 1.0+16.3 / 1.0+15.7 | 2.6+5.0 / 2.7+5.0 | 9.0+12.3 / 9.1+12.0 |
+
+| row | total before | after | change |
+|---|---|---|---|
+| release/32 | 19.5 | 17.3 | −11% |
+| release/4 | 36.2 | 35.4 | −2% |
+| dev/4 | 10.0 | 8.9 | −11% |
+| test/4 | 22.0 | 21.2 | −4% |
+
+- On 4 cpus core slows down while render compiles alongside it (21.1 → 23.4 s
+  release); the `yserver` unit stays the tail.
+- render's `build.rs` (glslc) delays render's lib start by ~1.5 s.
+- silence's 1-min load was 4.5–8 during the after-run (4-cpu rows are
+  `taskset`-pinned, less sensitive).
+- The parent's ≥ 20% fuji target is very likely missed (4-cpu proxy −2%);
+  fuji itself is not measured yet. jos (2026-10-13): maintainability is the
+  primary goal, compile time a bonus, so 3a proceeds.
+
+### Acceptance (3a)
+
+- [x] `cargo tree -p yserver-render` (also `-e normal`): no `drm`, `gbm`,
+  `input`, `udev`, `yserver-core`.
+- [x] Per-commit gates (fmt, clippy ×3 configs, workspace tests default +
+  xdmcp; render alone); test mapping.
+- [ ] FreeBSD CI: runs on the PR (not pushed yet).
+- [ ] File-size ceilings: not re-checked (the move only changes visibility).
+- [x] Lavapipe after stage 3 and after the move (321 both).
+- [ ] HW smoke on bee and eiger for the seam: not recorded here.
+- [x] Timings on silence; [ ] fuji (jos).
+
 ## Review log
 
 **Round 1 (codex, 2026-10-13):** 3a-then-3b and the whole-file `dri3.rs` move
