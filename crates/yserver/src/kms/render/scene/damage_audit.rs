@@ -500,7 +500,7 @@ pub(super) fn audit_overlay_pipeline(
         return Ok((vk::Pipeline::null(), vk::PipelineLayout::null()));
     }
     let pipeline = inner.overlay_xor_cache.get(
-        yserver_core::backend::GcFunction::Xor,
+        yserver_protocol::x11::gc::GcFunction::Xor,
         crate::kms::vk::logic_fill_pipeline::LogicFillChannels::Color,
     )?;
     Ok((pipeline, inner.overlay_xor_cache.pipeline_layout()))

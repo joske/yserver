@@ -1,6 +1,10 @@
 use super::*;
 use crate::kms::render::{gpu::GpuCore, store::DrawableStore};
 
+/// `yserver_core::resources::COMPOSITE_OVERLAY_WINDOW`; the scene sees it
+/// only as the `cow_host_xid` the backend passes in.
+const COMPOSITE_OVERLAY_WINDOW: u32 = 0x103;
+
 /// Stage 3f.6 — `build_scene` walks top-level → mapped
 /// descendants and produces draw entries in absolute coords.
 /// Top-level at (50, 60), child at (10, 20) relative → child
@@ -1169,7 +1173,7 @@ fn cow_subtree_draws_inherit_alpha_passthrough_true() {
     core.top_level_order.push(0xA1);
 
     // COW host xid @ (0, 0), 800×600 — matches `default_outputs`.
-    let cow_xid: u32 = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+    let cow_xid: u32 = COMPOSITE_OVERLAY_WINDOW;
     alloc_stub_window(
         &mut store,
         &mut windows,
@@ -1252,7 +1256,7 @@ fn build_scene_does_not_append_cow_after_top_level_walk() {
     let sink = TestSink::new();
     let mut windows = crate::kms::render::backend::WindowsMap::new();
 
-    let cow_xid: u32 = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+    let cow_xid: u32 = COMPOSITE_OVERLAY_WINDOW;
     alloc_stub_window(
         &mut store,
         &mut windows,
@@ -1616,7 +1620,7 @@ fn compositor_stage_under_cow_emits_via_recursion_and_manual_siblings_skip() {
     // `default_outputs` extent). This stands in for
     // GetOverlayWindow having created the windows entry +
     // top_level_order slot (Task 2.2).
-    let cow_xid: u32 = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+    let cow_xid: u32 = COMPOSITE_OVERLAY_WINDOW;
     alloc_stub_window(
         &mut store,
         &mut windows,

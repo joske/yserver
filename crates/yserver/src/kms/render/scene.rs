@@ -108,7 +108,7 @@ pub(crate) struct OutputLayout {
     /// The CRTC mode, i.e. the scanout BO extent.
     pub(crate) mode: (u16, u16),
     /// The current CRTC transform, `None` at identity.
-    pub(crate) transform: Option<yserver_core::randr::CrtcTransform>,
+    pub(crate) transform: Option<yserver_protocol::x11::randr::transform::CrtcTransform>,
 }
 
 /// The core state and output geometry one scene call reads, borrowed from
@@ -130,7 +130,7 @@ pub(crate) struct SceneInput<'a> {
 fn output_transform(
     outputs: &[OutputLayout],
     idx: usize,
-) -> Option<&yserver_core::randr::CrtcTransform> {
+) -> Option<&yserver_protocol::x11::randr::transform::CrtcTransform> {
     outputs.get(idx)?.transform.as_ref()
 }
 
@@ -424,7 +424,7 @@ struct OutputSceneState {
     intermediate: Option<TransformIntermediate>,
     /// The transform the scanout BOs were laid out for: a same-footprint
     /// rotation or reflection change keeps every extent but not the pixels.
-    transform: Option<yserver_core::randr::CrtcTransform>,
+    transform: Option<yserver_protocol::x11::randr::transform::CrtcTransform>,
     /// The pixels under the software cursor in each compose image, for root
     /// reads. Empty while the cursor is on the HW plane.
     cursor_saves: CursorSaves,

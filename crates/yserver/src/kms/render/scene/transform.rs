@@ -317,7 +317,7 @@ impl ScalePass {
     pub(super) fn new(
         intermediate: &TransformIntermediate,
         pipeline: &ScalePassPipeline,
-        transform: &yserver_core::randr::CrtcTransform,
+        transform: &yserver_protocol::x11::randr::transform::CrtcTransform,
         footprint: (i32, i32, u32, u32),
         root: (u32, u32),
     ) -> Self {

@@ -128,7 +128,7 @@ impl SceneCompositor {
             (vk::Pipeline::null(), vk::PipelineLayout::null())
         } else {
             let pl = inner.overlay_xor_cache.get(
-                yserver_core::backend::GcFunction::Xor,
+                yserver_protocol::x11::gc::GcFunction::Xor,
                 crate::kms::vk::logic_fill_pipeline::LogicFillChannels::Color,
             )?;
             (pl, inner.overlay_xor_cache.pipeline_layout())
