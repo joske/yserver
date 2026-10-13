@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/yserver", "crates/yserver-core", "crates/yserver-protocol"]
+members = [
+  "crates/yserver",
+  "crates/yserver-core",
+  "crates/yserver-protocol",
+  "crates/yserver-render",
+]
 
 [workspace.package]
 version = "1.7.1"
@@ -36,6 +41,7 @@ udev = "0.9"
 xkbcommon = "0.9"
 yserver-core = { path = "crates/yserver-core", default-features = false }
 yserver-protocol = { path = "crates/yserver-protocol", default-features = false }
+yserver-render = { path = "crates/yserver-render", default-features = false }
 
 [workspace.lints.clippy]
 # X11 protocol encoders and request handlers naturally take many

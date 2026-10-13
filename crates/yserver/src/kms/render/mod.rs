@@ -6,40 +6,20 @@
 //! constructs `KmsBackend` at startup.
 
 mod backend;
-pub(crate) mod batch_resource;
 pub(crate) mod completion_poller;
-pub(crate) mod composite_pool_ring;
-pub mod cpu_types;
-pub(crate) mod cursor;
-pub(crate) mod cursor_save;
-pub(crate) mod descriptor_pool_ring;
-pub(crate) mod engine;
 pub(crate) mod export_holders;
-pub(crate) mod frame_builder;
-pub(crate) mod geometry;
-pub(crate) mod glyph_atlas;
-pub(crate) mod glyph_pixels;
-pub(crate) mod gpu;
 pub(crate) mod imported_syncobj;
-pub(crate) mod owned_semaphore;
 pub(crate) mod platform;
 pub(crate) mod pointer_confine;
-pub(crate) mod present_batch;
 pub(crate) mod present_completion;
 pub(crate) mod present_source_wait;
 pub(crate) mod probe_executor;
-pub(crate) mod region;
-pub(crate) mod root_overlay;
-pub(crate) mod scanout_damage;
 pub(crate) mod scene;
-pub(crate) mod scene_diff;
-pub(crate) mod store;
-pub(crate) mod stroke;
-pub(crate) mod submit_group;
-pub(crate) mod submit_trace;
-pub(crate) mod target;
-pub(crate) mod telemetry;
-pub(crate) mod transform_intermediate;
-pub(crate) mod upload_arena;
 
 pub use backend::KmsBackend;
+pub use yserver_render::kms::render::cpu_types;
+pub(crate) use yserver_render::kms::render::{
+    composite_pool_ring, cursor, cursor_save, engine, frame_builder, geometry, glyph_pixels, gpu,
+    owned_semaphore, present_batch, region, root_overlay, scanout_damage, scene_diff, store,
+    stroke, submit_group, submit_trace, target, telemetry, transform_intermediate,
+};

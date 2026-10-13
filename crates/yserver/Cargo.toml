@@ -36,6 +36,10 @@ thiserror.workspace = true
 xkbcommon.workspace = true
 yserver-core.workspace = true
 yserver-protocol.workspace = true
+yserver-render.workspace = true
+
+[dev-dependencies]
+yserver-render = { workspace = true, features = ["test-support"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 udev.workspace = true

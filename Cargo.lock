@@ -1095,6 +1095,7 @@ dependencies = [
  "xkbcommon",
  "yserver-core",
  "yserver-protocol",
+ "yserver-render",
 ]
 
 [[package]]
@@ -1114,6 +1115,18 @@ name = "yserver-protocol"
 version = "1.7.1"
 dependencies = [
  "proptest",
+]
+
+[[package]]
+name = "yserver-render"
+version = "1.7.1"
+dependencies = [
+ "ash",
+ "libc",
+ "log",
+ "nix",
+ "thiserror",
+ "yserver-protocol",
 ]
 
 [[package]]

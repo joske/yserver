@@ -1,0 +1,25 @@
+[package]
+name = "yserver-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ash.workspace = true
+libc.workspace = true
+log.workspace = true
+thiserror.workspace = true
+yserver-protocol.workspace = true
+
+[dev-dependencies]
+nix.workspace = true
+
+[features]
+default = []
+# Exposes the `#[cfg(test)]` fixtures that `yserver`'s own tests build on.
+# Enabled only from `yserver`'s `[dev-dependencies]`, never in a release build.
+test-support = []
+
+[lints]
+workspace = true
