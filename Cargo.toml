@@ -15,10 +15,6 @@ drm = "0.15"
 env_logger = "0.11"
 freetype-rs = "0.38"
 gbm = { version = "0.18", default-features = false }
-gpu-allocator = { version = "0.28", default-features = false, features = [
-  "std",
-  "vulkan",
-] }
 input = "0.10"
 # 0.2.190 removed FreeBSD's NOTE_PCTRLMASK, still required by nix 0.31.3.
 libc = "=0.2.189"

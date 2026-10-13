@@ -27,7 +27,6 @@ flate2 = "1.1"
 fontconfig = "0.11"
 freetype-rs.workspace = true
 gbm.workspace = true
-gpu-allocator.workspace = true
 input.workspace = true
 libc.workspace = true
 log.workspace = true
