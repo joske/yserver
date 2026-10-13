@@ -89,7 +89,6 @@ use crate::kms::{
         damage_audit_compare::DamageAuditComparePipeline,
         pipeline::CompositorPipeline,
         scale_pipeline::{ScalePassPipeline, ScalePushConsts},
-        scanout::CopiedTransportPreparation,
     },
 };
 
@@ -1136,12 +1135,15 @@ trait ComposeRenderTarget {
     fn timestamps_written(&self) -> bool;
     fn mark_timestamps_written(&mut self);
     fn set_last_gpu_render_ns(&mut self, value: Option<u64>);
-    fn post_compose_preparation(&self) -> Result<PostComposePreparation, PresentError>;
+    /// Validate (and, for copied targets, store) the post-compose transport
+    /// state. Runs before the command buffer begins recording.
+    fn prepare_post_compose(&mut self) -> Result<(), PresentError>;
+    /// Record the post-compose barrier or transport copy prepared by
+    /// `prepare_post_compose` in the same compose.
     fn record_post_compose(
-        &self,
+        &mut self,
         vk: &crate::kms::vk::device::VkContext,
         command_buffer: vk::CommandBuffer,
-        preparation: PostComposePreparation,
     );
 
     fn renderer_wait_semaphore(&self) -> Option<vk::Semaphore> {
@@ -1149,10 +1151,4 @@ trait ComposeRenderTarget {
     }
 
     fn note_submit_succeeded(&mut self) {}
-}
-
-#[derive(Clone, Copy)]
-enum PostComposePreparation {
-    Shared,
-    Copied(CopiedTransportPreparation),
 }

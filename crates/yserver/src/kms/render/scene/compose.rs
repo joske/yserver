@@ -4,8 +4,8 @@ use crate::kms::{
         region::Region,
         scanout_damage::ScanoutDamage,
         scene::{
-            ComposeRenderTarget, ComposeSubmit, CopiedRenderSubmitError, PostComposePreparation,
-            Repaint, ScalePass, cursor::record_cursor_save, damage_audit::rects_intersect,
+            ComposeRenderTarget, ComposeSubmit, CopiedRenderSubmitError, Repaint, ScalePass,
+            cursor::record_cursor_save, damage_audit::rects_intersect,
             repaint::draw_dst_rect_inward, transform::record_scale_pass,
         },
     },
@@ -103,17 +103,15 @@ impl ComposeRenderTarget for ScanoutBo {
         self.last_gpu_render_ns = value;
     }
 
-    fn post_compose_preparation(&self) -> Result<PostComposePreparation, PresentError> {
-        Ok(PostComposePreparation::Shared)
+    fn prepare_post_compose(&mut self) -> Result<(), PresentError> {
+        Ok(())
     }
 
     fn record_post_compose(
-        &self,
+        &mut self,
         vk: &crate::kms::vk::device::VkContext,
         command_buffer: vk::CommandBuffer,
-        preparation: PostComposePreparation,
     ) {
-        debug_assert!(matches!(preparation, PostComposePreparation::Shared));
         let to_scanout = [vk::ImageMemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
             .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
@@ -179,10 +177,10 @@ impl ComposeRenderTarget for CopiedRenderSource {
         self.last_gpu_render_ns = value;
     }
 
-    fn post_compose_preparation(&self) -> Result<PostComposePreparation, PresentError> {
-        self.transport_preparation()
-            .map(PostComposePreparation::Copied)
-            .map_err(PresentError::Io)
+    fn prepare_post_compose(&mut self) -> Result<(), PresentError> {
+        let preparation = self.transport_preparation().map_err(PresentError::Io)?;
+        self.post_compose_preparation = Some(preparation);
+        Ok(())
     }
 
     fn renderer_wait_semaphore(&self) -> Option<vk::Semaphore> {
@@ -194,13 +192,12 @@ impl ComposeRenderTarget for CopiedRenderSource {
     }
 
     fn record_post_compose(
-        &self,
+        &mut self,
         _vk: &crate::kms::vk::device::VkContext,
         command_buffer: vk::CommandBuffer,
-        preparation: PostComposePreparation,
     ) {
-        let PostComposePreparation::Copied(preparation) = preparation else {
-            unreachable!("copied target received shared post-compose preparation")
+        let Some(preparation) = self.post_compose_preparation.take() else {
+            unreachable!("copied target recorded post-compose without a preparation")
         };
         self.record_transport_copy(command_buffer, preparation);
     }
@@ -479,7 +476,7 @@ pub(super) fn record_and_submit_render(
 #[allow(clippy::too_many_arguments)]
 fn record_command_buffer<T: ComposeRenderTarget + ?Sized>(
     vk: &crate::kms::vk::device::VkContext,
-    bo: &T,
+    bo: &mut T,
     pipeline: &CompositorPipeline,
     scene: &CompositeScene,
     descriptors: &[vk::DescriptorSet],
@@ -507,7 +504,7 @@ fn record_command_buffer<T: ComposeRenderTarget + ?Sized>(
     // Validate all copied transport state before beginning the command buffer.
     // The post-compose recorder is then infallible and cannot strand a live CB
     // in recording state on an ownership-ledger error.
-    let post_compose_preparation = bo.post_compose_preparation()?;
+    bo.prepare_post_compose()?;
     let (load_op, render_area, old_layout) = match repaint {
         Repaint::Full(extent) => (
             vk::AttachmentLoadOp::CLEAR,
@@ -790,7 +787,7 @@ fn record_command_buffer<T: ComposeRenderTarget + ?Sized>(
             );
         }
 
-        bo.record_post_compose(vk, cb, post_compose_preparation);
+        bo.record_post_compose(vk, cb);
 
         // GPU-render timer: stamp BOTTOM-of-pipe after all compose work.
         if ts_enabled {

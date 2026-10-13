@@ -155,6 +155,7 @@ impl CopiedRenderSource {
             renderer_return_completion: None,
             ownership: CopiedSourceOwnership::RendererFirstUse,
             render_target_contents: CopiedRenderTargetContents::Uninitialized,
+            post_compose_preparation: None,
             disarmed: false,
         })
     }

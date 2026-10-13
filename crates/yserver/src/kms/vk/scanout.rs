@@ -420,6 +420,9 @@ pub(crate) struct CopiedRenderSource {
     renderer_return_completion: Option<RetainedSyncFile>,
     ownership: CopiedSourceOwnership,
     render_target_contents: CopiedRenderTargetContents,
+    /// Validated before the compose command buffer begins; consumed when the
+    /// transport copy is recorded into it.
+    pub(crate) post_compose_preparation: Option<CopiedTransportPreparation>,
     disarmed: bool,
 }
 

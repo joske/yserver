@@ -4,8 +4,8 @@ use crate::kms::{
         platform::PlatformBackend,
         scene::{
             ComposeRenderTarget, CursorEntry, DamageAuditEpisodeStart, DamageAuditLedgerEntry,
-            DamageAuditTarget, OutputDamageAudit, PostComposePreparation, Repaint, SceneBuild,
-            SceneCompositor, SceneCompositorInner, SceneError, Visibility,
+            DamageAuditTarget, OutputDamageAudit, Repaint, SceneBuild, SceneCompositor,
+            SceneCompositorInner, SceneError, Visibility,
             build::build_scene,
             compose::{compose_submit_was_complete, record_and_submit_render},
         },
@@ -1192,17 +1192,15 @@ impl ComposeRenderTarget for DamageAuditTarget {
         }
     }
 
-    fn post_compose_preparation(&self) -> Result<PostComposePreparation, PresentError> {
-        Ok(PostComposePreparation::Shared)
+    fn prepare_post_compose(&mut self) -> Result<(), PresentError> {
+        Ok(())
     }
 
     fn record_post_compose(
-        &self,
+        &mut self,
         vk: &crate::kms::vk::device::VkContext,
         command_buffer: vk::CommandBuffer,
-        preparation: PostComposePreparation,
     ) {
-        debug_assert!(matches!(preparation, PostComposePreparation::Shared));
         let to_general = [vk::ImageMemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
             .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)

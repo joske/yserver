@@ -3,11 +3,10 @@ use crate::kms::{
     render::{
         platform::PlatformBackend,
         scene::{
-            ComposeRenderTarget, IntermediatePrimeTarget, OutputSceneState, PostComposePreparation,
-            Repaint, ScalePass, SceneCompositor, SceneCompositorInner, SceneError, Visibility,
-            build::build_scene, compose::record_and_submit_render,
-            damage::clip_rect_to_output_extent, damage_audit::create_audit_descriptor_pool,
-            repaint::draw_dst_rect_inward,
+            ComposeRenderTarget, IntermediatePrimeTarget, OutputSceneState, Repaint, ScalePass,
+            SceneCompositor, SceneCompositorInner, SceneError, Visibility, build::build_scene,
+            compose::record_and_submit_render, damage::clip_rect_to_output_extent,
+            damage_audit::create_audit_descriptor_pool, repaint::draw_dst_rect_inward,
         },
         store::DrawableStore,
         transform_intermediate::TransformIntermediate,
@@ -170,16 +169,15 @@ impl ComposeRenderTarget for IntermediatePrimeTarget {
 
     fn set_last_gpu_render_ns(&mut self, _value: Option<u64>) {}
 
-    fn post_compose_preparation(&self) -> Result<PostComposePreparation, PresentError> {
-        Ok(PostComposePreparation::Shared)
+    fn prepare_post_compose(&mut self) -> Result<(), PresentError> {
+        Ok(())
     }
 
     /// The scale pass step already left the intermediate in `GENERAL`.
     fn record_post_compose(
-        &self,
+        &mut self,
         _vk: &crate::kms::vk::device::VkContext,
         _command_buffer: vk::CommandBuffer,
-        _preparation: PostComposePreparation,
     ) {
     }
 }
