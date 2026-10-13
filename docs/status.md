@@ -33,6 +33,19 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-10-13 phase 3b, scene compositor in `yserver-render` (branch
+  `refactor/phase3b-scene-split`):** the scene (`kms::render::scene`, with
+  its tests) and `WindowGeometry`/`WindowsMap` (`kms::render::window_geometry`)
+  now live in `yserver-render`, and `yserver` re-exports them at the old
+  paths. The scene reads core state and output geometry from a borrowed
+  `SceneInput`, and drives outputs only through `&mut dyn OutputSink`
+  (frame slots, `finish_frame`, flip retirement, the copied route) and
+  `CursorPlaneSink`. Their KMS implementation, including the scanout
+  `ComposeRenderTarget` impls, is in `yserver`'s `platform/scene_sink.rs`.
+  **The scene's log target is now `yserver_render::kms::render::scene…`.**
+  Details: `docs/superpowers/plans/2026-10-13-phase3b-scene-split.md`
+  ("Execution").
+
 - **2026-10-13 phase 3a, `yserver-render` crate (branch
   `refactor/phase3a-render-crate`):** `crates/yserver-render` holds the
   renderer: `kms::vk` (device, pipelines, ops, dri3; not `scanout`) and
