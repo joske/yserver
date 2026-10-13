@@ -3,6 +3,8 @@ use super::{
     wire::{write_i16, write_u16, write_u32},
 };
 
+pub mod transform;
+
 /// Type-dispatched writer that picks `write_u16`/`write_u32`/`write_i16`
 /// based on the integer type. Lets the encoder body stay terse with a
 /// single `put(byte_order, &mut out, x)` form regardless of x's width.

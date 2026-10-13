@@ -4,9 +4,7 @@ use yserver_protocol::x11::randr as proto;
 
 use crate::properties::PropertyValue;
 
-mod transform;
-
-pub use transform::{
+pub use yserver_protocol::x11::randr::transform::{
     CrtcTransform, FIXED_ONE, Filter, IDENTITY_MATRIX, RR_REFLECT_X, RR_REFLECT_Y, RR_ROTATE_0,
     RR_ROTATE_90, RR_ROTATE_180, RR_ROTATE_270, SUPPORTED_ROTATIONS, crtc_matrix,
     rotation_swaps_axes,
