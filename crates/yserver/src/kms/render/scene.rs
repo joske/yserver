@@ -345,7 +345,7 @@ struct OutputSceneState {
     output_extent: vk::Extent2D,
     /// Layout origin of this output in root/screen coordinates, cached for the
     /// same reason as the extent: the damage-marking entry points are on
-    /// `SceneCompositor` and have no `PlatformBackend` in scope, so without this
+    /// `SceneCompositor` and have no `OutputLayout` in scope, so without this
     /// they cannot translate a screen-absolute rect into output-local space.
     output_origin: (i32, i32),
     /// Backoff after atomic-commit failures. Without this, a failed
@@ -527,7 +527,7 @@ enum TickSkipReason {
     RetryDeadline,
     /// `output_damage` is empty and this is not the first frame.
     EmptyDamage,
-    /// `platform.acquire_scanout_bo` returned None — BO pool exhausted.
+    /// `sink.acquire_slot` returned None — BO pool exhausted.
     NoBO,
     /// `pool_ring.acquire` returned None — descriptor-pool ring exhausted.
     NoPool,

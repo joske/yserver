@@ -102,7 +102,7 @@ impl SceneCompositor {
                  but the pending scene frame was {expected:?}",
                 retire.presented_bo_idx,
             );
-            // `platform.on_page_flip_complete` above already advanced the BO
+            // `sink.on_page_flip_complete` above already advanced the BO
             // phase machine (previous OnScreen -> Free, Pending -> OnScreen), and
             // we are about to return without popping the ack. Platform and scene
             // have diverged, so neither `missing` nor any staged frame can be

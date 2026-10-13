@@ -1371,8 +1371,8 @@ fn tick_one_output(
             // and descriptor-pool slot alive until the compose
             // fence signals: KMS rejected the flip, so no page-flip
             // event will retire those resources for us.
-            // Re-borrow `state` after the platform.invalidate_slot
-            // call (which took &mut platform).
+            // Re-borrow `state` after the sink.invalidate_slot
+            // call (which took &mut sink).
             let state = inner.outputs.get_mut(output_idx).expect("range");
             // TODO(stage-5 perf): the 100 ms commit-retry back-off is
             // hardcoded. Empirically picked to be wide enough that

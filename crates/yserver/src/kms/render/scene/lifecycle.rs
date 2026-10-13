@@ -260,7 +260,7 @@ impl SceneCompositor {
         Ok(())
     }
 
-    /// Follow the RANDR transforms in `platform` without a topology rebuild:
+    /// Follow the RANDR transforms in `layouts` without a topology rebuild:
     /// an output whose root rect changed gets its scene extent, BO damage and
     /// intermediate redone, one whose matrix alone changed its BO damage; an
     /// identity output keeps today's state untouched.
