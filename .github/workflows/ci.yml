@@ -145,9 +145,9 @@ jobs:
           cache-after-prepare: true
           # Package list from docs/setup.md; rustup tracks stable like the Linux legs.
           prepare: |
-            pkg install -y curl just pkgconf shaderc fontconfig freetype2 libudev-devd libinput \
+            pkg install -y rustup-init just pkgconf shaderc fontconfig freetype2 libudev-devd libinput \
               libxkbcommon libxshmfence libdrm mesa-libs vulkan-loader scdoc
-            curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal -c clippy
+            rustup-init -y --profile minimal -c clippy
           run: |
             set -e
             . "$HOME/.cargo/env"
