@@ -143,22 +143,7 @@ impl SceneCompositor {
     /// synchronously from the backend's `refresh_effective_cursor`.
     /// Marks each output that already has (or is retiring into) a HW
     /// binding for an output-local upload + full ShowOnRetire retry.
-    ///
-    /// `bytes` MUST be `width * height * 4` (BGRA8). `Arc` so the
-    /// deferred slot can hold the bytes without re-cloning the
-    /// `Vec<u8>` from `CursorRecord` per upload.
-    pub(crate) fn queue_steady_state_cursor_upload(
-        &mut self,
-        _platform: &mut PlatformBackend,
-        version: u64,
-        _width: u16,
-        _height: u16,
-        _bgra_bytes: std::sync::Arc<Vec<u8>>,
-        _hot_x: u16,
-        _hot_y: u16,
-        _cursor_x: i32,
-        _cursor_y: i32,
-    ) -> bool {
+    pub(crate) fn queue_steady_state_cursor_upload(&mut self, version: u64) -> bool {
         let Some(inner) = self.inner.as_mut() else {
             return false;
         };

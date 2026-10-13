@@ -677,22 +677,7 @@ impl KmsBackend {
             if self.scanout_m2.active() && self.refresh_direct_cursor_on_all_outputs(&record) {
                 return;
             }
-            let bytes = std::sync::Arc::new(record.bgra_bytes.clone());
-            #[allow(clippy::cast_possible_truncation)]
-            let cx = self.core.cursor_x as i32;
-            #[allow(clippy::cast_possible_truncation)]
-            let cy = self.core.cursor_y as i32;
-            let refreshes_hw_binding = self.scene.queue_steady_state_cursor_upload(
-                &mut self.platform,
-                record.version,
-                record.width,
-                record.height,
-                bytes,
-                record.hot_x,
-                record.hot_y,
-                cx,
-                cy,
-            );
+            let refreshes_hw_binding = self.scene.queue_steady_state_cursor_upload(record.version);
             if refreshes_hw_binding && self.scanout_m2.active() {
                 self.request_direct_unflip("direct_cursor_refresh_failed");
             }
