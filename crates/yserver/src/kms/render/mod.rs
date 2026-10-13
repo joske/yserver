@@ -15,6 +15,7 @@ pub(crate) mod present_completion;
 pub(crate) mod present_source_wait;
 pub(crate) mod probe_executor;
 pub(crate) mod scene;
+pub(crate) mod window_geometry;
 
 pub use backend::KmsBackend;
 pub use yserver_render::kms::render::cpu_types;

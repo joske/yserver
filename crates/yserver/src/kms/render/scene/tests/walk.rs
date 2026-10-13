@@ -322,7 +322,7 @@ fn a_partly_covered_window_emits_only_its_visible_pieces() {
 fn an_empty_parent_shape_suppresses_its_children() {
     let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
-    let mut windows = crate::kms::render::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::window_geometry::WindowsMap::new();
     alloc_root(&core, &mut store, 800, 600);
     alloc_stub_window(
         &mut store,
@@ -372,7 +372,7 @@ fn an_empty_parent_shape_suppresses_its_children() {
 fn a_partial_parent_shape_clips_its_children() {
     let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
-    let mut windows = crate::kms::render::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::window_geometry::WindowsMap::new();
     alloc_root(&core, &mut store, 800, 600);
     alloc_stub_window(
         &mut store,
@@ -436,7 +436,7 @@ fn a_partial_parent_shape_clips_its_children() {
 fn a_cow_subtree_claims_nothing() {
     let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
-    let mut windows = crate::kms::render::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::window_geometry::WindowsMap::new();
     alloc_root(&core, &mut store, 800, 600);
     alloc_stub_window(
         &mut store,
@@ -492,7 +492,7 @@ fn a_cow_subtree_claims_nothing() {
 fn an_opaque_automatic_child_claims_through_a_manual_parent() {
     let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
-    let mut windows = crate::kms::render::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::window_geometry::WindowsMap::new();
     alloc_root(&core, &mut store, 800, 600);
     alloc_stub_window(
         &mut store,
@@ -613,7 +613,7 @@ fn straddling_windows_and_layout_origins_sample_the_right_texels() {
 fn a_redirected_backing_larger_than_its_host_is_sampled_unstretched() {
     let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
-    let mut windows = crate::kms::render::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::window_geometry::WindowsMap::new();
     alloc_root(&core, &mut store, 800, 600);
     alloc_stub_window(
         &mut store,
@@ -667,7 +667,7 @@ fn a_redirected_backing_larger_than_its_host_is_sampled_unstretched() {
 fn a_collapsed_universe_over_emits_but_shows_the_same_pixels() {
     let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
-    let mut windows = crate::kms::render::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::window_geometry::WindowsMap::new();
     alloc_root(&core, &mut store, 800, 600);
     let mut rank = 1;
     for i in 0..7i16 {

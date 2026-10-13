@@ -334,7 +334,7 @@ fn stub_scene_is_not_live_and_declines_tick() {
     let mut store = DrawableStore::new();
     let mut sink = TestSink::new();
     let mut telemetry = Telemetry::new();
-    let windows = crate::kms::render::backend::WindowsMap::new();
+    let windows = crate::kms::render::window_geometry::WindowsMap::new();
     let err = scene
         .tick(
             &core.input(&windows, &default_outputs()),

@@ -120,7 +120,7 @@ pub(crate) struct SceneInput<'a> {
     pub(crate) shape_clip: &'a HashMap<u32, Vec<yserver_protocol::x11::xfixes::RegionRect>>,
     pub(crate) cursor_x: f32,
     pub(crate) cursor_y: f32,
-    pub(crate) windows: &'a crate::kms::render::backend::WindowsMap,
+    pub(crate) windows: &'a crate::kms::render::window_geometry::WindowsMap,
     pub(crate) outputs: &'a [OutputLayout],
     /// The logical screen size.
     pub(crate) fb_size: (u16, u16),

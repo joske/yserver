@@ -213,7 +213,7 @@ fn region_of(rects: &[vk::Rect2D]) -> Region {
 
 fn alloc_stub_window(
     store: &mut DrawableStore,
-    windows: &mut crate::kms::render::backend::WindowsMap,
+    windows: &mut crate::kms::render::window_geometry::WindowsMap,
     xid: u32,
     x: i16,
     y: i16,
@@ -245,7 +245,7 @@ fn alloc_stub_window(
         .expect("stub allocate");
     windows.insert(
         xid,
-        crate::kms::render::backend::WindowGeometry {
+        crate::kms::render::window_geometry::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -281,7 +281,7 @@ fn legacy_emit_window_subtree(
     parent_abs_x: i32,
     parent_abs_y: i32,
     store: &mut DrawableStore,
-    windows: &crate::kms::render::backend::WindowsMap,
+    windows: &crate::kms::render::window_geometry::WindowsMap,
     // Per-window SHAPE bounding regions (`KmsCore::shape_bounding`).
     // When a host xid has an entry the window's scene draw is
     // clipped to those rects — marco's rounded-corner frame masks
@@ -933,7 +933,7 @@ impl TestCore {
     /// (`default_outputs`).
     fn input<'a>(
         &'a self,
-        windows: &'a crate::kms::render::backend::WindowsMap,
+        windows: &'a crate::kms::render::window_geometry::WindowsMap,
         outputs: &'a [OutputLayout],
     ) -> SceneInput<'a> {
         SceneInput {
@@ -973,7 +973,7 @@ fn build_with(
     mode: Visibility,
     core: &TestCore,
     store: &mut DrawableStore,
-    windows: &crate::kms::render::backend::WindowsMap,
+    windows: &crate::kms::render::window_geometry::WindowsMap,
     layout: (i32, i32, u32, u32),
     cow_host_xid: Option<u32>,
 ) -> SceneBuild {
@@ -1014,7 +1014,7 @@ fn walk_with(
     legacy: bool,
     core: &TestCore,
     store: &mut DrawableStore,
-    windows: &crate::kms::render::backend::WindowsMap,
+    windows: &crate::kms::render::window_geometry::WindowsMap,
     layout: (i32, i32, u32, u32),
     cow_host_xid: Option<u32>,
 ) -> WalkOut {
@@ -1063,7 +1063,7 @@ fn walk_with(
     }
 }
 
-fn set_rank(windows: &mut crate::kms::render::backend::WindowsMap, xid: u32, rank: u64) {
+fn set_rank(windows: &mut crate::kms::render::window_geometry::WindowsMap, xid: u32, rank: u64) {
     windows.get_mut(&xid).expect("window present").stack_rank = rank;
 }
 
@@ -1090,14 +1090,14 @@ fn alloc_backing(
 fn differential_fixture() -> (
     TestCore,
     DrawableStore,
-    crate::kms::render::backend::WindowsMap,
+    crate::kms::render::window_geometry::WindowsMap,
 ) {
     let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
-    let mut windows = crate::kms::render::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::window_geometry::WindowsMap::new();
     let mut rank = 1u64;
     let mut add = |store: &mut DrawableStore,
-                   windows: &mut crate::kms::render::backend::WindowsMap,
+                   windows: &mut crate::kms::render::window_geometry::WindowsMap,
                    xid: u32,
                    x: i16,
                    y: i16,
@@ -1369,7 +1369,7 @@ fn differential_fixture() -> (
     // A window with geometry but no storage at all.
     windows.insert(
         0x900,
-        crate::kms::render::backend::WindowGeometry {
+        crate::kms::render::window_geometry::WindowGeometry {
             border_width: 0,
             border_pixel: None,
             border_pixmap: None,
@@ -1444,7 +1444,7 @@ fn stacks_equal(a: &PixelStack, b: &PixelStack) -> bool {
 fn assert_oracle(
     core: &TestCore,
     store: &mut DrawableStore,
-    windows: &crate::kms::render::backend::WindowsMap,
+    windows: &crate::kms::render::window_geometry::WindowsMap,
     layout: (i32, i32, u32, u32),
     cow: Option<u32>,
     label: &str,
@@ -1514,11 +1514,11 @@ fn two_windows(
 ) -> (
     TestCore,
     DrawableStore,
-    crate::kms::render::backend::WindowsMap,
+    crate::kms::render::window_geometry::WindowsMap,
 ) {
     let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
-    let mut windows = crate::kms::render::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::window_geometry::WindowsMap::new();
     alloc_root(&core, &mut store, 800, 600);
     alloc_stub_window(
         &mut store,

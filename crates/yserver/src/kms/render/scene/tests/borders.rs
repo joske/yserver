@@ -20,7 +20,7 @@ use yserver_protocol::x11::xfixes;
 #[allow(clippy::too_many_arguments)]
 fn alloc_stub_window_bordered(
     store: &mut DrawableStore,
-    windows: &mut crate::kms::render::backend::WindowsMap,
+    windows: &mut crate::kms::render::window_geometry::WindowsMap,
     xid: u32,
     x: i16,
     y: i16,
@@ -45,7 +45,7 @@ fn alloc_stub_window_bordered(
     store.set_content_offset(id, i32::from(bw));
     windows.insert(
         xid,
-        crate::kms::render::backend::WindowGeometry {
+        crate::kms::render::window_geometry::WindowGeometry {
             border_width: bw,
             border_pixel: None,
             border_pixmap: None,
@@ -82,7 +82,7 @@ fn dst_rects_of(built: &SceneBuild, xid: u32) -> Vec<vk::Rect2D> {
 fn a_bordered_node_samples_its_whole_outer_extent() {
     let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
-    let mut windows = crate::kms::render::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::window_geometry::WindowsMap::new();
     alloc_stub_window_bordered(
         &mut store,
         &mut windows,
@@ -131,7 +131,7 @@ fn a_bordered_node_samples_its_whole_outer_extent() {
 fn a_bordered_parents_child_is_placed_from_the_content_origin() {
     let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
-    let mut windows = crate::kms::render::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::window_geometry::WindowsMap::new();
     alloc_stub_window_bordered(
         &mut store,
         &mut windows,
@@ -184,7 +184,7 @@ fn a_bordered_parents_child_is_placed_from_the_content_origin() {
 fn a_child_cannot_overlap_its_parents_border() {
     let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
-    let mut windows = crate::kms::render::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::window_geometry::WindowsMap::new();
     alloc_root(&core, &mut store, 800, 600);
     alloc_stub_window_bordered(
         &mut store,
@@ -256,7 +256,7 @@ fn a_child_cannot_overlap_its_parents_border() {
 fn a_bordered_shaped_windows_mask_is_read_in_content_coordinates() {
     let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
-    let mut windows = crate::kms::render::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::window_geometry::WindowsMap::new();
     alloc_stub_window_bordered(
         &mut store,
         &mut windows,
@@ -304,7 +304,7 @@ fn a_bordered_shaped_windows_mask_is_read_in_content_coordinates() {
 fn a_clip_shape_narrows_the_child_clip_but_not_the_nodes_own_place() {
     let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
-    let mut windows = crate::kms::render::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::window_geometry::WindowsMap::new();
     alloc_root(&core, &mut store, 800, 600);
     alloc_stub_window(&mut store, &mut windows, 0x100, 0, 0, 100, 100, None, true);
     alloc_stub_window(
@@ -367,7 +367,7 @@ fn a_redirected_window_is_not_clipped_to_its_parent_and_neither_are_its_children
     for participating in [true, false] {
         let mut core = TestCore::for_tests();
         let mut store = DrawableStore::new();
-        let mut windows = crate::kms::render::backend::WindowsMap::new();
+        let mut windows = crate::kms::render::window_geometry::WindowsMap::new();
         // Parent 100x100 at (0,0); the redirected child starts at (60,0)
         // and is 100 wide, so 60 px of it stick out past the parent.
         alloc_stub_window(&mut store, &mut windows, 0x100, 0, 0, 100, 100, None, true);
@@ -450,7 +450,7 @@ fn a_bordered_child_under_a_redirected_ancestor_is_not_displaced() {
     for participating in [true, false] {
         let mut core = TestCore::for_tests();
         let mut store = DrawableStore::new();
-        let mut windows = crate::kms::render::backend::WindowsMap::new();
+        let mut windows = crate::kms::render::window_geometry::WindowsMap::new();
         alloc_stub_window(
             &mut store,
             &mut windows,
@@ -548,7 +548,7 @@ fn a_bordered_child_under_a_redirected_ancestor_is_not_displaced() {
 #[test]
 fn a_borderless_node_needs_no_separate_child_region() {
     let mut store = DrawableStore::new();
-    let mut windows = crate::kms::render::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::window_geometry::WindowsMap::new();
     let empty: HashMap<u32, Vec<xfixes::RegionRect>> = HashMap::new();
     let mut clip: HashMap<u32, Vec<xfixes::RegionRect>> = HashMap::new();
     alloc_stub_window(&mut store, &mut windows, 0x100, 10, 20, 100, 50, None, true);
@@ -566,7 +566,7 @@ fn a_borderless_node_needs_no_separate_child_region() {
     );
     let decide = |xid: u32,
                   store: &DrawableStore,
-                  windows: &crate::kms::render::backend::WindowsMap,
+                  windows: &crate::kms::render::window_geometry::WindowsMap,
                   shape_clip: &HashMap<u32, Vec<xfixes::RegionRect>>| {
         decide_node(
             xid,
@@ -654,7 +654,7 @@ fn the_awesome_two_tile_layout_rings_all_four_sides() {
     const OH: u32 = CH as u32 + 2 * BW as u32; // 1421
     let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
-    let mut windows = crate::kms::render::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::window_geometry::WindowsMap::new();
     alloc_root(&core, &mut store, 5120, 1440);
     for (i, (xid, child, x)) in [(0x100u32, 0x101u32, 0i16), (0x200, 0x201, 1276)]
         .into_iter()
@@ -771,7 +771,7 @@ fn the_awesome_two_tile_layout_rings_all_four_sides() {
 #[test]
 fn the_child_clip_bound_is_absolute_not_storage_local() {
     let mut store = DrawableStore::new();
-    let mut windows = crate::kms::render::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::window_geometry::WindowsMap::new();
     let empty: HashMap<u32, Vec<xfixes::RegionRect>> = HashMap::new();
     // awesome's frame, at the reporter's exact geometry.
     alloc_stub_window_bordered(
@@ -838,7 +838,7 @@ fn the_child_clip_bound_is_absolute_not_storage_local() {
 #[allow(clippy::too_many_arguments)]
 fn resize_stub_window_bordered(
     store: &mut DrawableStore,
-    windows: &mut crate::kms::render::backend::WindowsMap,
+    windows: &mut crate::kms::render::window_geometry::WindowsMap,
     xid: u32,
     w: u16,
     h: u16,
@@ -900,7 +900,7 @@ fn a_grow_damages_the_full_new_outer_rect() {
 
     let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
-    let mut windows = crate::kms::render::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::window_geometry::WindowsMap::new();
     alloc_root(&core, &mut store, 800, 600);
     // frame content = client height + titlebar (awesome's rule), so the
     // client exactly fills the remaining content: the tight fit.
@@ -1036,7 +1036,7 @@ fn the_bee_tree_with_a_higher_wibar_sibling_matches_the_unclipped_scene() {
     const TITLE: i16 = 17;
     let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
-    let mut windows = crate::kms::render::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::window_geometry::WindowsMap::new();
     alloc_root(&core, &mut store, 2560, 1440);
     // awesome's wibar: full width, 17 tall, at the very top.
     alloc_stub_window_bordered(

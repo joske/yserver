@@ -8,7 +8,7 @@ fn build_with_elsewhere(
     mode: Visibility,
     core: &TestCore,
     store: &mut DrawableStore,
-    windows: &crate::kms::render::backend::WindowsMap,
+    windows: &crate::kms::render::window_geometry::WindowsMap,
     layout: (i32, i32, u32, u32),
     cow_host_xid: Option<u32>,
     elsewhere: &std::collections::HashSet<crate::kms::render::store::DrawableId>,
@@ -883,11 +883,11 @@ fn intersect_rects_clips_and_rejects_disjoint() {
 fn e16_like_fixture() -> (
     TestCore,
     DrawableStore,
-    crate::kms::render::backend::WindowsMap,
+    crate::kms::render::window_geometry::WindowsMap,
 ) {
     let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
-    let mut windows = crate::kms::render::backend::WindowsMap::new();
+    let mut windows = crate::kms::render::window_geometry::WindowsMap::new();
     alloc_root(&core, &mut store, 2560, 1440);
     let mut rank = 1u64;
     for t in 0..10i16 {
