@@ -105,8 +105,13 @@ Lifetime rules (the parent's audit still holds, lines re-checked):
 - `scanout_readback_op` (a `ReusableOneShot` whose CB comes from
   `ops_command_pool`, freed into it at `vk/ops/mod.rs:363–369`) is reset
   explicitly before `gpu` drops. `PlatformBackend` now has a `Drop`
-  (`platform/init.rs:292`, modeset rollback only); the reset goes there, ahead
-  of the rollback. `GpuCore` itself has no knowledge of KMS.
+  (`platform/init.rs:292`) whose first statement is an early return for a
+  fully constructed backend (`!initial_scanout_rollback_armed`), so the reset
+  is the **first statement of `drop`, before that guard**, and runs on normal
+  shutdown and on construction failure alike. The rollback follows unchanged.
+  The deliberate `mem::forget` of the op on a failed readback
+  (`backend/kms/readback.rs:795`) stays as is. `GpuCore` itself has no
+  knowledge of KMS.
 - `FenceTicket`s may outlive `FencePool` (Weak pool + strong `vk`,
   `platform/fence.rs:168`); `KmsBackend` still drops `platform` before
   `store`/`engine`/`scene` (`backend.rs:965–986`). Unchanged.
@@ -140,12 +145,33 @@ Engine owns `pending_present_batches` (`engine.rs:771`), pushes at
 `engine/frame.rs:921, 1003, 1489`, drains at 1264, and publishes a release
 fence into each entry (`frame.rs:912` → `present_completion.rs:42`). The entry
 carries core's `CompletedPresentEvent`, syncobj and xshmfence handles, which
-must not enter render. Proposal: render owns `PresentBatchWait` and the batch
-container; the entry is `Box<dyn PresentCompletionEntry>` with exactly the
-calls engine makes on it (publish the release fence, plus whatever the drain
-needs, enumerated in the step). `present_completion.rs` stays in `yserver` and
-implements the trait. `Box<dyn>` over generics so engine is not monomorphised
-inside `yserver` (parent's reasoning).
+must not enter render.
+
+The entry also travels back. `attach_present_completion` hands it back on
+`Err`, and the KMS side then tries the next destination with the same entry
+(`backend/kms/present.rs:1345–1395`: COW batch, then the paint target, then a
+signal-only submit). The drain consumes the concrete `wake_pin` and `event`.
+So the payload must be recoverable as the concrete type without render
+knowing it.
+
+Proposal:
+- Render defines
+  `pub trait PresentCompletionEntry: Any + Debug { fn publish_release_fence(&mut self, fence: &OwnedFd) -> io::Result<bool>; }`,
+  the only call engine makes on an entry (`engine/frame.rs:912`).
+- Engine stores and returns `Box<dyn PresentCompletionEntry>`:
+  `attach_present_completion(id, entry) -> Result<(), Box<dyn PresentCompletionEntry>>`,
+  and the drained batches carry `Vec<Box<dyn PresentCompletionEntry>>`.
+- KMS recovers the concrete payload by trait upcasting to `Box<dyn Any>`
+  (stable since Rust 1.86) and `downcast::<PendingPresentEntry>()`, in one
+  helper used at both return points (failed attach, drain). There is one
+  implementor, so a failed downcast is a bug: `expect` with a message, not a
+  silent drop. A unit test pins the round trip: attach to a missing
+  destination, get the same entry back, downcast, fields intact.
+- Render owns `PresentBatchWait` and the batch container;
+  `present_completion.rs` (with `PinnedWake` and core's types) stays in
+  `yserver`.
+- `Box<dyn>` over generics so engine is not monomorphised inside `yserver`
+  (parent's reasoning).
 
 ### 5. Plain data moves down
 
@@ -181,11 +207,36 @@ inside `yserver` (parent's reasoning).
 
 ### 7. Tests
 
-Render-set tests that construct `PlatformBackend` fixtures (41 uses in (a))
-switch to a `GpuCore` fixture where they only use GPU state; tests that need
-KMS state stay in `yserver`. The parent's rule-4 mapping (every test before =
-one test after, same ignored status, per feature config) applies; crate-path
-changes are expected and listed.
+Rule: no item becomes `pub` only for a test. Tests that span the boundary
+are split or re-fixtured in **test-only prep commits before the crate move**,
+while everything is still one crate, so the move commit itself carries no
+test edits beyond paths.
+
+- **`PlatformBackend` fixtures** (41 uses in (a)): switch to a `GpuCore`
+  fixture where the test only uses GPU state; tests that need KMS state stay
+  in `yserver`.
+- **`engine/tests/glyph_runs.rs:749–1050`** chains the KMS glyph parser
+  (`parse_composite_glyph_items`, `ParsedGlyph`, `kms::core::{GlyphSetState,
+  GlyphSetFormat, StoredGlyph}`) into private engine functions
+  (`RenderEngine::split_glyph_runs`, `effective_glyph_layout`,
+  `frame_builder::RecordedTextGlyph`). Split at the seam:
+  - a parser test in `yserver` asserting the source-format sequence the
+    mixed-format fixture produces (`A8, A8, Argb32, A8, Argb32, Argb32`, the
+    first assertion today);
+  - render tests that start from that same literal sequence and assert the
+    splitter's ordered runs and the layout answers, as today.
+  The two halves pin the same vector, so the chain stays covered without
+  making the splitter public.
+- **`engine/tests/memory_frame.rs:192`** builds a whole `KmsBackend` only to
+  read two engine counters; it builds `RenderEngine` on the `GpuCore` fixture
+  instead.
+- The step starts by re-running the inventory's §1g scan (render-set test
+  code naming outside items) and lists every remaining case with its
+  resolution; the plan's three are the known ones.
+
+The parent's rule-4 mapping (every test before = one test after, same ignored
+status, per feature config) applies; splits and crate-path changes are listed
+explicitly in the mapping.
 
 ### 8. Small fixes, own commits before 3a
 
@@ -204,7 +255,10 @@ Found by the inventory, independent of the move:
 
 - `cargo tree -p yserver-render` has no `drm`, `gbm`, `input`, `udev`,
   `yserver-core`.
-- **macOS builds:** a CI step on the Linux runner,
+- **macOS builds:** a CI step on the Linux runner that installs the
+  `aarch64-apple-darwin` Rust target (the workflow installs toolchains but no
+  cross target today; `setup-rust-toolchain`'s `target:` input or
+  `rustup target add`) and runs
   `cargo check -p yserver-render --target aarch64-apple-darwin` (no linking,
   so no Apple SDK needed; unverified until the crate exists: render's deps are
   pure Rust plus `libc`, and `build.rs` runs glslc on the host); plus one
@@ -226,6 +280,15 @@ render. Scanout BO types stay KMS-side, behind the sink. A second sink is
 **not** built in 3b; an offscreen test sink that lets lavapipe tests compose
 without KMS would be the first real second implementor. HW smoke on bee and
 eiger.
+
+## Review log
+
+**Round 1 (codex, 2026-10-13):** 3a-then-3b and the whole-file `dri3.rs` move
+accepted. Four gaps fixed above: the present entry's return path (decision 4:
+`Any` upcast + downcast, round-trip test), the mixed-boundary tests (decision
+7: split in prep commits, no test-only `pub`), the `scanout_readback_op` reset
+placed before `Drop`'s early return (decision 2), and the cross target install
+for the macOS CI check (acceptance).
 
 ## Questions for the review
 
