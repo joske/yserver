@@ -81,37 +81,84 @@ render; `backend` re-exports them.
 ### 2. `OutputSink`: frame slots and flips, one `&mut dyn` borrow
 
 Scene takes `&mut dyn OutputSink` instead of `&mut PlatformBackend`.
-`PlatformBackend` implements it. First cut, from the actual uses:
+`PlatformBackend` implements it. Every method borrows the sink only for the
+duration of the call; scene never holds a reference obtained from the sink
+across another sink call. First cut, from the actual uses:
 
 | method | replaces |
 |---|---|
 | `gpu(&mut self) -> &mut GpuCore` | the 23 GPU accesses (decision 3) |
-| `acquire_slot(output) -> Option<(SlotToken, age)>` | route check + `acquire_scanout_bo` (step 4) |
-| `begin_frame(output, slot) -> &mut dyn ComposeRenderTarget` | step 6's simultaneous borrows |
-| `finish_frame(output, slot, …) -> FinishOutcome` | step 7's phase change, export, flip / copied registration; `FinishOutcome` carries `gpu_submitted` |
+| `cursor_plane(&mut self) -> &mut dyn CursorPlaneSink` | the 11 cursor-plane accesses (decision 4) |
+| `route(output) -> OutputRoute` (`Shared` / `Copied` / `None`) | the route check at `tick.rs:916`; called **before** acquisition, as today, because damage is recorded for shared outputs only (step 3b) |
+| `acquire_slot(output) -> Option<SlotToken>` | `acquire_scanout_bo` (`tick.rs:938`) |
+| `slot_image(output, slot) -> Option<vk::Image>` | step 6's compose-image lookup (shared BO image or copied source image), for `cursor_saves.prepare`; returns a handle, no borrow |
+| `finish_frame(output, slot, record) -> FinishOutcome` | step 7 (decision 2a) |
 | `invalidate_slot`, `cancel_slot`, `recycle_failed_slots` | step 9 error paths, step 1 |
 | `commit_slot_present`, `on_page_flip_complete` | flip retire bookkeeping |
 | `submit_copied`, `register_render_completion`, `drain_render_completions`, `clear_render_completions` | the copied two-GPU route |
 
-- **Record inside the output sequence (step 7):** `finish_frame` takes the
-  recording as a closure (`&mut dyn FnMut(&mut dyn ComposeRenderTarget) -> Result<…>`)
-  so the order phase change → record → export → flip is kept inside one
-  call, exactly as today. Alternative for review: split into
-  `prepare_flip` / `submit_flip` around the record.
-- **Types crossing the trait** are plain data defined in render: `SlotToken`
-  (today's `ScanoutBoToken`, an index), `OutputLayout`, `InFlight`,
-  `FlipRetirement`, `FinishOutcome`, `ComposeRenderTarget` (made `pub` in
-  render). `ScanoutBo`, `OutputScanout`, `CopiedRenderSource`, `BoState`,
-  `OutputKey`, DRM `Device`/`Output` and GBM stay behind the trait.
-- **Prerequisite:** `ComposeRenderTarget::post_compose_preparation` returns
-  `PostComposePreparation`, which names the KMS type
-  `CopiedTransportPreparation` (`scene.rs:1155`). It becomes private to the
-  KMS implementations first: the trait method returns an opaque value the
-  implementation itself consumes in `record_post_compose`.
+- **`SlotToken`** is today's `ScanoutBoToken` (`platform.rs:99`) moved into
+  render unchanged: `output_idx`, `bo_idx`, `extent`,
+  `last_present_generation`, `content_invalidated`. All plain data; repaint
+  planning keeps reading exactly these fields (`tick.rs:960–964`, and `extent` at 1254, 1354).
+- **Types crossing the trait** are plain data defined in render: `SlotToken`,
+  `OutputRoute`, `OutputLayout`, `InFlight`, `FlipRetirement`,
+  `FinishOutcome`, `ComposeRenderTarget` (made `pub` in render). `ScanoutBo`,
+  `OutputScanout`, `CopiedRenderSource`, `BoState`, `OutputKey`, DRM
+  `Device`/`Output` and GBM stay behind the trait.
 - **`dyn`, not generics**, so scene is not monomorphised inside `yserver`
   (same reasoning as 3a's present edge).
 - Exact signatures are settled in the steps; the review checks the shape and
   the ordering guarantees, not the parameter lists.
+
+#### 2a. `finish_frame`: the record runs inside the output sequence
+
+Today (`compose.rs:211–286`, shared; 288–336, copied) the order is: phase
+check → (copied: renderer acquire) → `transition_to_recording` → record and
+submit → export the completion fd → flip (shared) or export the render
+completion (copied) → phase transitions, with the fd ownership dance on
+reject. `finish_frame` keeps that order inside one call and takes the record
+step as `&mut dyn FnMut(&mut dyn ComposeRenderTarget) -> Result<ComposeSubmit, PresentError>`.
+
+Borrow sequence, explicitly:
+1. Scene asks `route`, `acquire_slot`, `slot_image` (each a short borrow;
+   only plain values come back).
+2. Scene prepares everything the record needs from its own state (pipeline,
+   descriptor pool, fence ticket, scale pass, overlay ops, cursor save) and
+   builds the closure over those, plus `&mut gpu_submitted` and
+   `&mut compose_complete`. The closure does not capture the sink.
+3. `sink.finish_frame(output, slot, &mut record)` borrows the sink once; the
+   sink looks up the BO / source and DRM handles itself (no more simultaneous
+   field borrows in scene), runs the sequence, and passes its own target to
+   the closure. The target borrow ends when the closure returns, inside
+   `finish_frame`.
+4. `FinishOutcome` returns what scene needs afterwards: `Ok(KmsFlipPending)`
+   / `Ok(RenderCompletion(fd))` / `Err`, the previous GPU render ns
+   (`bo.last_gpu_render_ns.take()`), and the copied fail-stop flag
+   (`copied_prepare_failed`). `gpu_submitted` stays scene-owned, set by the
+   closure as today.
+
+There is no separate `begin_frame`: nothing between acquisition and the
+record needs the target itself, only its image handle (`slot_image`).
+
+#### 2b. Post-compose preparation lives inside the target
+
+`ComposeRenderTarget::post_compose_preparation` returns
+`PostComposePreparation`, which names the KMS type
+`CopiedTransportPreparation` (`scene.rs:1155`). Today it is validated before
+the command buffer begins recording (`compose.rs:510` → `begin_command_buffer`
+at 566), so a failed preparation never leaves a command buffer in the
+recording state. The trait becomes:
+- `fn prepare_post_compose(&mut self) -> Result<(), PresentError>`, called
+  where `post_compose_preparation` is called today (before
+  `begin_command_buffer`); the copied target stores its
+  `CopiedTransportPreparation` in itself, the shared and damage-audit targets
+  do nothing;
+- `fn record_post_compose(&mut self, vk, command_buffer)`, which consumes the
+  stored preparation (copied) or records the shared barrier, as today.
+
+`PostComposePreparation` disappears; the validation-before-recording order is
+unchanged.
 
 ### 3. The GPU latch borrow
 
@@ -129,6 +176,8 @@ The cursor-plane calls scene makes (`fits`, `visible`, `uploaded_version`,
 `upload`, `show`, `hide`, `hide_all`, `note_composed_retirement`, and the
 `CursorShowError::remains_visible()` contract at `cursor.rs:520`) go behind a
 separate `CursorPlaneSink`, a one-to-one pass-through of today's methods.
+Scene reaches it only through `sink.cursor_plane()`, so there is one sink
+borrow, never two trait objects over the same `PlatformBackend`.
 The NVIDIA cursor investigation (issue #241, from 2026-10-13 evening) is
 expected to change the cursor path. The legacy `MoveCursor` calls are outside
 scene (`pointer.rs:647, 673`, `scanout.rs:1789`) and untouched by 3b; if the
@@ -138,7 +187,7 @@ NVIDIA work changes the retire-time show/hide/upload in `scene/cursor.rs`, the
 ### 5. Order of work
 
 1. **Prep commits in `yserver`** (scene still in place, each gated):
-   `CopiedTransportPreparation` made private to the KMS targets; the unused
+   the post-compose preparation moved into the targets (decision 2b); the unused
    `&mut PlatformBackend` and parameters of `queue_steady_state_cursor_upload`
    (`cursor.rs:150`) removed; `SceneInput` introduced and the geometry/core
    reads switched to it; tests switched from `platform_with_layout` to a
@@ -176,11 +225,21 @@ without KMS is the natural follow-up, not part of 3b.
   is out of scope.
 - Of 3a's 23 test-only widenings, the 9 scene-only ones are reverted.
 
+## Review log
+
+**Round 1 (codex, 2026-10-13):** direction accepted; 3a re-checked (clippy and
+workspace tests pass, no regression found). Three interface gaps fixed in
+decision 2: the route query comes before acquisition and `SlotToken` carries
+all of today's token fields; the copied post-compose preparation is stored in
+the target with validation still before command-buffer recording (2b); the
+borrow sequence is spelled out, `begin_frame` is dropped, and the cursor
+trait is reached through the single sink borrow (2a, 4).
+
 ## Questions for the review
 
 1. `SceneInput` as data plus `OutputSink` for slots/flips, rather than one
    trait carrying geometry too?
-2. `finish_frame` taking the record as a closure, or a `prepare_flip` /
+2. `finish_frame` taking the record as a closure (2a), or a `prepare_flip` /
    `submit_flip` pair?
 3. `sink.gpu()` for the GPU latch, rather than splitting `PlatformBackend`?
 4. Cursor plane as a separate pass-through trait, sequenced after the NVIDIA
