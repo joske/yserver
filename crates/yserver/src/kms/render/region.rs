@@ -52,15 +52,14 @@
 //! Step 3 is the first consumer — `scanout_damage.rs` and the tick's damage
 //! feed. The clipping and occlusion operations land with steps 4 and 1, so some
 //! items are still dead outside the tests.
-//! `expect` rather than `allow`, so this annotation itself starts warning the
-//! moment step 3 wires the module up and must be removed. Gated on `not(test)`
-//! because the tests below do exercise every item, so the lint fires only in a
-//! non-test build and an ungated `expect` would be unfulfilled under
-//! `--all-targets`.
+//! `allow`, not `expect`: once the module is public API of the
+//! `yserver-render` crate, rustc no longer reports its items as dead and an
+//! `expect` would be unfulfilled. Gated on `not(test)` because the tests below
+//! do exercise every item.
 
 #![cfg_attr(
     not(test),
-    expect(
+    allow(
         dead_code,
         reason = "the clipping and occlusion operations land with steps 4 and 1"
     )

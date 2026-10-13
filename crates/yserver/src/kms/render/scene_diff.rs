@@ -52,7 +52,7 @@
 
 #![cfg_attr(
     not(test),
-    expect(
+    allow(
         dead_code,
         reason = "the signature accessors land ahead of their consumers"
     )

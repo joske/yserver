@@ -859,6 +859,10 @@ pub(crate) struct DrawableStore {
 }
 
 impl DrawableStore {
+    #[allow(
+        clippy::new_without_default,
+        reason = "fires once the store is public API of yserver-render"
+    )]
     pub(crate) fn new() -> Self {
         Self {
             next_id: 1,
