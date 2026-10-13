@@ -5,6 +5,8 @@ use crate::kms::render::scene::CursorAssignment;
 #[cfg(test)]
 use crate::kms::render::scene::DamageAuditTarget;
 #[cfg(test)]
+use crate::kms::render::scene::OutputSink;
+#[cfg(test)]
 use crate::kms::render::scene::Repaint;
 #[cfg(test)]
 use crate::kms::render::scene::ScalePass;
@@ -175,7 +177,7 @@ impl SceneCompositor {
         let vk = &inner.vk;
         let cursor_save = state.cursor_saves.prepare(vk, compose_image, cursor_rect);
         let pool = create_audit_descriptor_pool(vk, built.scene.draws.len()).expect("pool");
-        let ticket = platform.gpu.acquire_fence_ticket().expect("fence");
+        let ticket = platform.gpu().acquire_fence_ticket().expect("fence");
         let mut submitted = false;
         record_and_submit_render(
             vk,
@@ -224,7 +226,7 @@ fn read_general_image_for_tests(
             .expect("staging");
     let mut op = crate::kms::vk::ops::ReusableOneShot::new(
         Arc::clone(vk),
-        platform.gpu.ops_command_pool_handle().expect("ops pool"),
+        platform.gpu().ops_command_pool_handle().expect("ops pool"),
     )
     .expect("one-shot");
     let buffer = staging.buffer();

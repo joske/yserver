@@ -4,9 +4,9 @@ use crate::kms::{
         region::Region,
         scene::{
             CarriedDamage, CopiedRenderSubmitError, CursorAssignment, CursorTransition,
-            FailedSubmitBo, FullReason, InFlightStage, OutputSceneState, OutputWalkReport,
-            PendingAck, Repaint, RepaintPlan, ScalePass, SceneCompositor, SceneCompositorInner,
-            SceneError, SceneInput, TickOutcome, TickSkipReason, Visibility,
+            FailedSubmitBo, FullReason, InFlightStage, OutputRoute, OutputSceneState, OutputSink,
+            OutputWalkReport, PendingAck, Repaint, RepaintPlan, ScalePass, SceneCompositor,
+            SceneCompositorInner, SceneError, SceneInput, TickOutcome, TickSkipReason, Visibility,
             build::build_scene_with,
             compose::{
                 compose_submit_was_complete, present_error_is_device_lost, stage_submitted_frame,
@@ -141,8 +141,8 @@ impl SceneCompositor {
         let Some(inner) = inner.as_mut() else {
             return Err(SceneError::NoVk);
         };
-        platform.gpu.refresh_fence_pool_failure();
-        if platform.gpu.renderer_failed {
+        platform.gpu_mut().refresh_fence_pool_failure();
+        if platform.gpu().renderer_failed {
             return Ok(Vec::new());
         }
         debug_assert_eq!(
@@ -287,13 +287,13 @@ impl SceneCompositor {
         // output installed its PendingAck; exact job/BO matching is then live
         // before the immediate B submission runs.
         for completion in platform.drain_scanout_render_completions() {
-            if platform.gpu.renderer_failed {
+            if platform.gpu().renderer_failed {
                 break;
             }
             if !handle_scanout_render_completion_inner(inner, completion, platform) {
                 telemetry.record_missed_pageflip();
             }
-            if platform.gpu.renderer_failed {
+            if platform.gpu().renderer_failed {
                 break;
             }
         }
@@ -908,13 +908,7 @@ fn tick_one_output(
     // Shared outputs only: a copied (reverse-PRIME) output renders
     // `Repaint::Full` unconditionally and never consults this state, so it must
     // not accumulate any either.
-    let shared_output = matches!(
-        platform
-            .scanout_pools
-            .get(output_idx)
-            .and_then(Option::as_ref),
-        Some(OutputScanout::Shared(_))
-    );
+    let shared_output = platform.route(output_idx) == OutputRoute::Shared;
     // A transformed frame repaints the whole BO, so its damage (in
     // intermediate pixels) never enters the per-BO model.
     if shared_output && transform.is_none() {
@@ -931,7 +925,7 @@ fn tick_one_output(
     }
 
     // 4. Acquire BO.
-    let token = match platform.acquire_scanout_bo(output_idx) {
+    let token = match platform.acquire_slot(output_idx) {
         Some(t) => t,
         None => {
             let s = inner.outputs.get_mut(output_idx).expect("range");
@@ -1106,12 +1100,12 @@ fn tick_one_output(
     let descriptor_pool = state.pool_ring.pool_at(slot);
 
     // 7. Record + submit + flip via the v2 clipped compose path.
-    let compose_ticket = match platform.gpu.acquire_fence_ticket() {
+    let compose_ticket = match platform.gpu().acquire_fence_ticket() {
         Ok(ticket) => ticket,
         Err(error) => {
             inner.outputs[output_idx].pool_ring.release(slot);
             if vk_result_is_device_lost(error) {
-                platform.gpu.renderer_failed = true;
+                platform.gpu_mut().renderer_failed = true;
             }
             return Err(SceneError::Present(PresentError::Vk(error)));
         }
@@ -1135,21 +1129,9 @@ fn tick_one_output(
     });
     // Root reads must not see a software cursor (`cursor_save`): the compose
     // saves the pixels under it in the image it writes.
-    let compose_image = match (
-        &scale_pass,
-        platform
-            .scanout_pools
-            .get(output_idx)
-            .and_then(|p| p.as_ref()),
-    ) {
-        (Some(sp), _) => Some(sp.image),
-        (None, Some(OutputScanout::Shared(pool))) => {
-            pool.bos.get(token.bo_idx).map(|bo| bo.vk_image)
-        }
-        (None, Some(OutputScanout::Copied(pool))) => {
-            pool.sources.get(token.bo_idx).map(|source| source.image())
-        }
-        (None, None) => None,
+    let compose_image = match &scale_pass {
+        Some(sp) => Some(sp.image),
+        None => platform.slot_image(output_idx, token.bo_idx),
     };
     let cursor_rect = built
         .software_cursor_tail
@@ -1284,7 +1266,7 @@ fn tick_one_output(
         // A failed import therefore cannot be retried without fabricating the
         // external memory dependency; fail-stop before the source can be
         // reserved or reused again.
-        platform.gpu.renderer_failed = true;
+        platform.gpu_mut().renderer_failed = true;
     }
     let compose_result = match render_result {
         Ok(Some(completion)) => platform
@@ -1393,7 +1375,7 @@ fn tick_one_output(
                 // Neither shared nor copied source resources are reusable
                 // after DEVICE_LOST; latch the same fatal renderer state used
                 // by the engine before any retry bookkeeping runs.
-                platform.gpu.renderer_failed = true;
+                platform.gpu_mut().renderer_failed = true;
             }
             if gpu_submitted {
                 for id in &built.sampled_ids {
@@ -1403,7 +1385,7 @@ fn tick_one_output(
                 // registration, or shared KMS commit failed. Keep the paired
                 // resources fenced until A is done and make buffer-age state
                 // conservative; no pageflip event will retire this frame.
-                platform.invalidate_bo(output_idx, token.bo_idx);
+                platform.invalidate_slot(output_idx, token.bo_idx);
                 telemetry.record_missed_pageflip();
                 log::warn!(
                     "render scene: post-render scanout handoff failed for output \
@@ -1423,7 +1405,7 @@ fn tick_one_output(
             // and descriptor-pool slot alive until the compose
             // fence signals: KMS rejected the flip, so no page-flip
             // event will retire those resources for us.
-            // Re-borrow `state` after the platform.invalidate_bo
+            // Re-borrow `state` after the platform.invalidate_slot
             // call (which took &mut platform).
             let state = inner.outputs.get_mut(output_idx).expect("range");
             // TODO(stage-5 perf): the 100 ms commit-retry back-off is
@@ -1446,7 +1428,7 @@ fn tick_one_output(
                 });
             } else {
                 state.pool_ring.release(slot);
-                platform.cancel_scanout_bo_recording(output_idx, token.bo_idx);
+                platform.cancel_slot(output_idx, token.bo_idx);
             }
             Err(SceneError::Present(e))
         }

@@ -2,9 +2,9 @@ use crate::kms::{
     render::{
         platform::PlatformBackend,
         scene::{
-            ComposeRenderTarget, IntermediatePrimeTarget, OutputLayout, OutputSceneState, Repaint,
-            ScalePass, SceneCompositor, SceneCompositorInner, SceneError, SceneInput, Visibility,
-            build::build_scene, compose::record_and_submit_render,
+            ComposeRenderTarget, IntermediatePrimeTarget, OutputLayout, OutputSceneState,
+            OutputSink, Repaint, ScalePass, SceneCompositor, SceneCompositorInner, SceneError,
+            SceneInput, Visibility, build::build_scene, compose::record_and_submit_render,
             damage::clip_rect_to_output_extent, damage_audit::create_audit_descriptor_pool,
             output_transform, repaint::draw_dst_rect_inward,
         },
@@ -259,7 +259,7 @@ impl SceneCompositor {
             let draws = built.scene.draws.len();
             let pool = create_audit_descriptor_pool(&vk, draws)?;
             let ticket = platform
-                .gpu
+                .gpu()
                 .acquire_fence_ticket()
                 .map_err(SceneError::Vk)?;
             let mut submitted = false;

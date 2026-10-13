@@ -6,7 +6,7 @@ use crate::kms::{
         scanout_damage::ScanoutDamage,
         scene::{
             BufferAgeRing, DeferredSceneRelease, FailedSubmitBo, OutputCursorMode, OutputLayout,
-            OutputSceneState, SceneCompositor, SceneCompositorInner, SceneError,
+            OutputSceneState, OutputSink, SceneCompositor, SceneCompositorInner, SceneError,
             cursor::{reset_cursor_mode_for_lifecycle, reset_cursor_retry_for_lifecycle},
             damage_audit::build_output_damage_audit,
             output_transform,
@@ -115,7 +115,7 @@ impl SceneCompositor {
         platform: &PlatformBackend,
         layouts: &[OutputLayout],
     ) -> Result<Self, SceneError> {
-        let vk = platform.gpu.vk().ok_or(SceneError::NoVk)?.clone();
+        let vk = platform.gpu().vk().ok_or(SceneError::NoVk)?.clone();
         let pipeline = CompositorPipeline::new(Arc::clone(&vk), vk::Format::B8G8R8A8_UNORM)
             .map_err(SceneError::PipelineInit)?;
         // Root-overlay XOR pass pipeline cache — built for the same
@@ -166,11 +166,7 @@ impl SceneCompositor {
         let (root_x, root_y, root_w, root_h) = layout.root_rect;
         let ring = CompositePoolRing::new(Arc::clone(vk), MAX_DESCRIPTOR_SETS_PER_FRAME)
             .map_err(SceneError::Vk)?;
-        let bo_depth = platform
-            .scanout_pools
-            .get(i)
-            .and_then(|p| p.as_ref().map(|pool| pool.display_pool().bos.len()))
-            .unwrap_or(3);
+        let bo_depth = platform.slot_count(i).unwrap_or(3);
         Ok(OutputSceneState {
             output_idx: i,
             damage_audit: build_output_damage_audit(
@@ -370,7 +366,7 @@ impl SceneCompositor {
                                 "render scene drain: output {output_idx} compose fence wait \
                                  failed: {error:?}; retaining resources for quarantine"
                             );
-                            platform.gpu.renderer_failed = true;
+                            platform.gpu_mut().renderer_failed = true;
                             false
                         }
                     });
@@ -419,7 +415,7 @@ impl SceneCompositor {
                         true
                     }
                     DeferredSceneRelease::FailedSubmit { bo_idx, pool_slot } => {
-                        match platform.recycle_failed_submit_bo(output_idx, bo_idx) {
+                        match platform.recycle_failed_slot(output_idx, bo_idx) {
                             Ok(()) => {
                                 pool_ring.release(pool_slot);
                                 true
@@ -437,7 +433,7 @@ impl SceneCompositor {
                 },
             );
             if wait_failed || recovery_failed {
-                platform.gpu.renderer_failed = true;
+                platform.gpu_mut().renderer_failed = true;
             }
             // Stage 5 Phase D' — global recovery: reset every
             // output's cursor mode to Hidden. The post-recovery

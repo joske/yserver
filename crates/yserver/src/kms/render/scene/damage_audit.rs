@@ -3,8 +3,8 @@ use crate::kms::{
         platform::PlatformBackend,
         scene::{
             ComposeRenderTarget, CursorEntry, DamageAuditEpisodeStart, DamageAuditLedgerEntry,
-            DamageAuditTarget, OutputDamageAudit, OutputLayout, Repaint, SceneBuild,
-            SceneCompositor, SceneCompositorInner, SceneError, SceneInput, Visibility,
+            DamageAuditTarget, OutputDamageAudit, OutputLayout, OutputRoute, OutputSink, Repaint,
+            SceneBuild, SceneCompositor, SceneCompositorInner, SceneError, SceneInput, Visibility,
             build::build_scene,
             compose::{compose_submit_was_complete, record_and_submit_render},
             output_transform,
@@ -15,7 +15,6 @@ use crate::kms::{
         compositor::{CompositeScene, PresentError},
         damage_audit_compare::{DamageAuditComparePipeline, DamageAuditTileSummary},
         pipeline::CompositorPipeline,
-        scanout::OutputScanout,
     },
 };
 use ash::vk;
@@ -600,13 +599,7 @@ pub(super) fn run_damage_audit(
         );
         return Ok(());
     }
-    if !matches!(
-        platform
-            .scanout_pools
-            .get(output_idx)
-            .and_then(Option::as_ref),
-        Some(OutputScanout::Shared(_))
-    ) {
+    if platform.route(output_idx) != OutputRoute::Shared {
         log::debug!("damage-audit: output {output_idx} skipped; copied scanout is out of scope");
         return Ok(());
     }
@@ -816,7 +809,7 @@ fn submit_audit_compose(
 ) -> Result<bool, SceneError> {
     let descriptor_pool = create_audit_descriptor_pool(vk, scene.draws.len())?;
     let ticket = platform
-        .gpu
+        .gpu()
         .acquire_fence_ticket()
         .map_err(SceneError::Vk)?;
     let mut gpu_submitted = false;
@@ -871,7 +864,7 @@ fn submit_damage_audit_compare(
 ) -> Result<(), SceneError> {
     let cb = audit.candidate.command_buffer;
     let ticket = platform
-        .gpu
+        .gpu()
         .acquire_fence_ticket()
         .map_err(SceneError::Vk)?;
     unsafe {
