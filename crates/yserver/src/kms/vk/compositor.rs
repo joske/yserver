@@ -10,8 +10,6 @@
 
 use ash::vk;
 
-use super::scanout::BoPhase;
-
 /// Backend switch for which scanout path is active. Phase 4.1.5
 /// retired the pixman alternatives — Vulkan composite is the sole
 /// path. Kept as an enum so the `kms_xts_tooling` crate's `Default`
@@ -25,6 +23,36 @@ pub enum VkScanoutMode {
     /// IN/OUT fences.
     #[default]
     VkComposite,
+}
+
+/// Per-bo phase. The lifecycle is roughly
+/// `Free → Recording → Submitted → Pending → OnScreen → Retiring → Free`.
+/// `Submitted` can also revert to `Recording` on atomic-EBUSY, or jump
+/// to `Free` on modeset preempt.
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
+pub enum BoPhase {
+    /// Not in flight; GPU may write into it. No fences attached.
+    #[default]
+    Free,
+    /// Composite CB being recorded for this bo.
+    Recording,
+    /// `vkQueueSubmit2` issued; we still own the `IN_FENCE_FD` until
+    /// the atomic commit either accepts (kernel consumes it) or
+    /// rejects (we close it).
+    Submitted,
+    /// `drmModeAtomicCommit` accepted; `IN_FENCE_FD` ownership
+    /// transferred to kernel; we now own the `OUT_FENCE_FD` (the
+    /// release fence).
+    Pending,
+    /// Pageflip-complete arrived. Bo is on-screen. The release fence
+    /// is signal-pending (KMS signals it when the next flip retires
+    /// this bo).
+    OnScreen,
+    /// A later flip's pageflip-complete arrived; this bo is no
+    /// longer on screen. Release fence is signalled. Returns to
+    /// `Free` once all GPU readers (e.g. damage-diff sources)
+    /// complete.
+    Retiring,
 }
 
 /// Errors from the compose + atomic-flip path
