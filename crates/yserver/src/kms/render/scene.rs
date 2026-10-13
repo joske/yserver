@@ -17,7 +17,9 @@
 //! - `damage_audit`: the reference-compose damage audit.
 //! - `repaint`: partial-compose planning (`RepaintPlan`, scissor culling).
 //! - `build`, `walk`: scene list assembly; per-window visibility decisions.
-//! - `compose`: `ComposeRenderTarget` for scanout targets, record and submit.
+//! - `compose`: record and submit into a `ComposeRenderTarget`.
+//! - `sink`: `OutputSink` and `CursorPlaneSink`, what the scene asks of the
+//!   outputs it draws.
 //! - `transform`: transform intermediates and the scale pass.
 //! - `root_readback`: root-window reads (composes into a private image).
 //! - `for_tests`: `*_for_tests` entry points; `tests`: unit tests.
@@ -68,7 +70,6 @@ mod tests;
 
 use std::{
     collections::{HashMap, VecDeque},
-    io,
     panic::Location,
     sync::Arc,
 };
@@ -143,11 +144,6 @@ fn output_transform(
 enum InFlightStage {
     WaitingForRenderCompletion { job_id: u64 },
     KmsFlipPending,
-}
-
-enum CopiedRenderSubmitError {
-    RendererAcquire(io::Error),
-    Present(PresentError),
 }
 
 struct PendingAck {

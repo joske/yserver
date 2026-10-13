@@ -1,4 +1,5 @@
 use super::*;
+use std::io;
 
 // Stage 5 Phase G — strategy decision unit tests. Verify the
 // pure `derive_cursor_transition` matrix without needing
@@ -128,19 +129,6 @@ fn live_source_device_lost_is_the_only_fatal_vulkan_present_error() {
     assert!(!present_error_is_device_lost(&PresentError::Vk(
         vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
     )));
-}
-
-#[test]
-fn copied_renderer_acquire_failure_is_fail_stop_before_submit() {
-    let acquire = CopiedRenderSubmitError::RendererAcquire(io::Error::other(
-        "retained B-to-A completion import failed",
-    ));
-    assert!(acquire.requires_fail_stop());
-    assert!(matches!(acquire.into_present(), PresentError::Io(_)));
-
-    let ordinary =
-        CopiedRenderSubmitError::Present(PresentError::Vk(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY));
-    assert!(!ordinary.requires_fail_stop());
 }
 
 #[test]

@@ -4,34 +4,20 @@ use crate::kms::{
         region::Region,
         scanout_damage::ScanoutDamage,
         scene::{
-            ComposeRenderTarget, ComposeSubmit, CopiedRenderSubmitError, Repaint, ScalePass,
-            cursor::record_cursor_save, damage_audit::rects_intersect,
-            repaint::draw_dst_rect_inward, transform::record_scale_pass,
+            ComposeRenderTarget, ComposeSubmit, Repaint, ScalePass, cursor::record_cursor_save,
+            damage_audit::rects_intersect, repaint::draw_dst_rect_inward,
+            transform::record_scale_pass,
         },
     },
     vk::{
         compositor::{CompositeScene, PresentError},
         pipeline::{CompositePushConsts, CompositorPipeline},
-        scanout::{BoPhase, BoState, CopiedRenderSource, ScanoutBo},
     },
 };
 use ash::vk;
 
 pub(super) fn present_error_is_device_lost(error: &PresentError) -> bool {
     matches!(error, PresentError::Vk(vk::Result::ERROR_DEVICE_LOST))
-}
-
-impl CopiedRenderSubmitError {
-    pub(super) fn requires_fail_stop(&self) -> bool {
-        matches!(self, Self::RendererAcquire(_))
-    }
-
-    pub(super) fn into_present(self) -> PresentError {
-        match self {
-            Self::RendererAcquire(error) => PresentError::Io(error),
-            Self::Present(error) => error,
-        }
-    }
 }
 
 pub(super) fn vk_result_is_device_lost(result: vk::Result) -> bool {
@@ -62,279 +48,10 @@ pub(super) fn stage_submitted_frame(
     }
 }
 
-impl ComposeRenderTarget for ScanoutBo {
-    fn image(&self) -> vk::Image {
-        self.vk_image
-    }
-
-    fn image_view(&self) -> vk::ImageView {
-        self.vk_image_view
-    }
-
-    fn command_buffer(&self) -> vk::CommandBuffer {
-        self.vk_transfer.command_buffer
-    }
-
-    fn completion_semaphore(&self) -> vk::Semaphore {
-        self.vk_semaphore
-    }
-
-    fn width(&self) -> u32 {
-        self.width
-    }
-
-    fn height(&self) -> u32 {
-        self.height
-    }
-
-    fn timestamp_pool(&self) -> vk::QueryPool {
-        self.vk_transfer.timestamp_pool
-    }
-
-    fn timestamps_written(&self) -> bool {
-        self.vk_transfer.timestamps_written
-    }
-
-    fn mark_timestamps_written(&mut self) {
-        self.vk_transfer.timestamps_written = true;
-    }
-
-    fn set_last_gpu_render_ns(&mut self, value: Option<u64>) {
-        self.last_gpu_render_ns = value;
-    }
-
-    fn prepare_post_compose(&mut self) -> Result<(), PresentError> {
-        Ok(())
-    }
-
-    fn record_post_compose(
-        &mut self,
-        vk: &crate::kms::vk::device::VkContext,
-        command_buffer: vk::CommandBuffer,
-    ) {
-        let to_scanout = [vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-            .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-            .dst_access_mask(vk::AccessFlags2::empty())
-            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .image(self.vk_image)
-            .subresource_range(
-                vk::ImageSubresourceRange::default()
-                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                    .level_count(1)
-                    .layer_count(1),
-            )];
-        crate::vk_count!(cmd_pipeline_barrier2);
-        unsafe {
-            vk.device.cmd_pipeline_barrier2(
-                command_buffer,
-                &vk::DependencyInfo::default().image_memory_barriers(&to_scanout),
-            );
-        }
-    }
-}
-
-impl ComposeRenderTarget for CopiedRenderSource {
-    fn image(&self) -> vk::Image {
-        self.image()
-    }
-
-    fn image_view(&self) -> vk::ImageView {
-        self.image_view()
-    }
-
-    fn command_buffer(&self) -> vk::CommandBuffer {
-        self.transfer.command_buffer
-    }
-
-    fn completion_semaphore(&self) -> vk::Semaphore {
-        self.completion_semaphore
-    }
-
-    fn width(&self) -> u32 {
-        self.width()
-    }
-
-    fn height(&self) -> u32 {
-        self.height()
-    }
-
-    fn timestamp_pool(&self) -> vk::QueryPool {
-        self.transfer.timestamp_pool
-    }
-
-    fn timestamps_written(&self) -> bool {
-        self.transfer.timestamps_written
-    }
-
-    fn mark_timestamps_written(&mut self) {
-        self.transfer.timestamps_written = true;
-    }
-
-    fn set_last_gpu_render_ns(&mut self, value: Option<u64>) {
-        self.last_gpu_render_ns = value;
-    }
-
-    fn prepare_post_compose(&mut self) -> Result<(), PresentError> {
-        let preparation = self.transport_preparation().map_err(PresentError::Io)?;
-        self.post_compose_preparation = Some(preparation);
-        Ok(())
-    }
-
-    fn renderer_wait_semaphore(&self) -> Option<vk::Semaphore> {
-        self.renderer_wait_semaphore()
-    }
-
-    fn note_submit_succeeded(&mut self) {
-        self.note_renderer_submit_succeeded();
-    }
-
-    fn record_post_compose(
-        &mut self,
-        _vk: &crate::kms::vk::device::VkContext,
-        command_buffer: vk::CommandBuffer,
-    ) {
-        let Some(preparation) = self.post_compose_preparation.take() else {
-            unreachable!("copied target recorded post-compose without a preparation")
-        };
-        self.record_transport_copy(command_buffer, preparation);
-    }
-}
-
-/// Render directly into the KMS framebuffer and immediately queue its flip.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn submit_shared_scanout_frame(
+pub(super) fn record_and_submit_render<T: ComposeRenderTarget + ?Sized>(
     vk: &crate::kms::vk::device::VkContext,
-    drm: &crate::drm::Device,
-    output: &crate::platform::drm::Output,
-    bo: &mut ScanoutBo,
-    pipeline: &CompositorPipeline,
-    descriptor_pool: vk::DescriptorPool,
-    scene: &CompositeScene,
-    repaint: Repaint,
-    scissors: &[vk::Rect2D],
-    signal_fence: vk::Fence,
-    gpu_submitted: &mut bool,
-    overlay_ops: &[(u32, vk::Rect2D)],
-    xor_pipeline: vk::Pipeline,
-    xor_layout: vk::PipelineLayout,
-    scale: Option<&ScalePass>,
-    cursor_save: Option<CursorSaveTarget>,
-) -> Result<ComposeSubmit, PresentError> {
-    use std::os::fd::{FromRawFd, IntoRawFd};
-
-    if bo.state.phase != BoPhase::Free {
-        return Err(PresentError::WrongPhase(bo.state.phase));
-    }
-    let fb_handle = bo.fb_handle.ok_or(PresentError::NoFb)?;
-    bo.state.transition_to_recording();
-    let submitted = record_and_submit_render(
-        vk,
-        bo,
-        pipeline,
-        descriptor_pool,
-        scene,
-        repaint,
-        scissors,
-        signal_fence,
-        gpu_submitted,
-        overlay_ops,
-        xor_pipeline,
-        xor_layout,
-        scale,
-        cursor_save,
-    )?;
-
-    let fd = bo
-        .export_signaled_fd()
-        .map_err(PresentError::Vk)?
-        .map_or(-1, IntoRawFd::into_raw_fd);
-    bo.state.transition_to_submitted(fd);
-
-    let mut out_fence: i32 = -1;
-    match crate::drm::page_flip::submit_flip_with_fences(drm, output, fb_handle, fd, &mut out_fence)
-    {
-        Ok(()) => {
-            if let Some(reclaimed) = bo.state.transition_to_pending(out_fence) {
-                // SAFETY: `reclaimed` was inserted by
-                // `transition_to_submitted` above.
-                drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(reclaimed) });
-            }
-            Ok(submitted)
-        }
-        Err(error) => {
-            if let Some(reclaimed) = bo.state.transition_to_recording_after_atomic_reject() {
-                // SAFETY: same fd we just inserted.
-                drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(reclaimed) });
-            }
-            if out_fence >= 0 {
-                // Defensive: OUT_FENCE_PTR should only be written on success.
-                drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(out_fence) });
-            }
-            Err(PresentError::Io(error))
-        }
-    }
-}
-
-/// Render into A's exportable source. The paired destination phase reserves
-/// the same BO index until readiness advances the frame to B's copy + KMS
-/// submission on the main-loop boundary.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn submit_copied_scanout_render(
-    vk: &crate::kms::vk::device::VkContext,
-    source: &mut CopiedRenderSource,
-    destination_state: &mut BoState,
-    pipeline: &CompositorPipeline,
-    descriptor_pool: vk::DescriptorPool,
-    scene: &CompositeScene,
-    repaint: Repaint,
-    scissors: &[vk::Rect2D],
-    signal_fence: vk::Fence,
-    gpu_submitted: &mut bool,
-    overlay_ops: &[(u32, vk::Rect2D)],
-    xor_pipeline: vk::Pipeline,
-    xor_layout: vk::PipelineLayout,
-    scale: Option<&ScalePass>,
-    cursor_save: Option<CursorSaveTarget>,
-) -> Result<Option<std::os::fd::OwnedFd>, CopiedRenderSubmitError> {
-    if destination_state.phase != BoPhase::Free {
-        return Err(CopiedRenderSubmitError::Present(PresentError::WrongPhase(
-            destination_state.phase,
-        )));
-    }
-    source
-        .prepare_renderer_acquire()
-        .map_err(CopiedRenderSubmitError::RendererAcquire)?;
-    destination_state.transition_to_recording();
-    record_and_submit_render(
-        vk,
-        source,
-        pipeline,
-        descriptor_pool,
-        scene,
-        repaint,
-        scissors,
-        signal_fence,
-        gpu_submitted,
-        overlay_ops,
-        xor_pipeline,
-        xor_layout,
-        scale,
-        cursor_save,
-    )
-    .map(|_| ())
-    .map_err(CopiedRenderSubmitError::Present)?;
-    source
-        .export_render_completion()
-        .map_err(|error| CopiedRenderSubmitError::Present(PresentError::Vk(error)))
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn record_and_submit_render(
-    vk: &crate::kms::vk::device::VkContext,
-    target: &mut impl ComposeRenderTarget,
+    target: &mut T,
     pipeline: &CompositorPipeline,
     descriptor_pool: vk::DescriptorPool,
     scene: &CompositeScene,

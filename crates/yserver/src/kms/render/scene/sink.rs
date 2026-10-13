@@ -14,7 +14,7 @@ use ash::vk;
 use crate::kms::{
     render::{
         gpu::GpuCore,
-        scene::{ComposeRenderTarget, ComposeSubmit},
+        scene::{ComposeRenderTarget, ComposeSubmit, SceneError},
     },
     vk::compositor::PresentError,
 };
@@ -89,6 +89,15 @@ pub(crate) enum FinishOutcome {
     },
 }
 
+impl From<FrameTargetError> for SceneError {
+    fn from(error: FrameTargetError) -> Self {
+        match error {
+            FrameTargetError::NoDevice(error) => Self::Present(PresentError::Io(error)),
+            FrameTargetError::NoSlot => Self::NoVk,
+        }
+    }
+}
+
 /// A copied-route render completion that became ready.
 pub(crate) struct RenderCompletion {
     pub(crate) job_id: u64,
@@ -118,6 +127,19 @@ pub(crate) trait OutputSink {
     fn acquire_slot(&mut self, output_idx: usize) -> Option<SlotToken>;
     /// The image the slot composes into.
     fn slot_image(&self, output_idx: usize, bo_idx: usize) -> Option<vk::Image>;
+    /// Whether a frame can start on the output at all.
+    ///
+    /// # Errors
+    ///
+    /// The output has no device or no frame slots.
+    fn check_frame_target(&self, output_idx: usize) -> Result<(), FrameTargetError>;
+    /// Run the frame sequence on the slot, with `record` composing into it.
+    fn finish_frame(
+        &mut self,
+        output_idx: usize,
+        bo_idx: usize,
+        record: &mut RecordFrame<'_>,
+    ) -> FinishOutcome;
     fn invalidate_slot(&mut self, output_idx: usize, bo_idx: usize);
     fn cancel_slot(&mut self, output_idx: usize, bo_idx: usize);
     /// Make a slot whose present failed after its GPU work finished usable.
