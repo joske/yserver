@@ -126,7 +126,7 @@ impl RenderEngine {
     pub(crate) fn image_text(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut GpuCore,
+        gpu: &mut GpuCore,
         dst: Dst,
         font_xid: u32,
         foreground_rgba: [f32; 4],
@@ -145,13 +145,13 @@ impl RenderEngine {
         }
 
         // (1) renderer_failed check.
-        if platform.renderer_failed {
+        if gpu.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
 
         // (2) Flush pre-existing render batch before opening the frame.
         // NO flush_cow_batch — that helper is deleted in Task 4.
-        self.flush_render_batch(store, platform, RenderFlushReason::Glyph)?;
+        self.flush_render_batch(store, gpu, RenderFlushReason::Glyph)?;
 
         // (3) Preflight: store lookup + TARGET-FORMAT GATE (N7 LOAD-BEARING).
         // Gate fires BEFORE any atlas first-touch / glyph upload / op append.
@@ -200,7 +200,7 @@ impl RenderEngine {
             )
         }));
         if !fits {
-            self.reset_glyph_atlas(store, platform)?;
+            self.reset_glyph_atlas(store, gpu)?;
         }
         let inner = self.inner.as_mut().expect("inner");
         // Core ImageText is always the Over+BGRA8 blend — the
@@ -223,7 +223,7 @@ impl RenderEngine {
         // (5) Open frame if not already open.
         if !inner.frame_builder.is_open() {
             let _ = inner;
-            let ticket = platform.submit_group_ticket_or_open()?;
+            let ticket = gpu.submit_group_ticket_or_open()?;
             let inner = self.inner.as_mut().expect("inner");
             inner.acquire_generation = inner.acquire_generation.saturating_add(1);
             let frame_generation = inner.acquire_generation;

@@ -31,12 +31,12 @@ impl RenderEngine {
     ///
     /// - `NoVk` on the stub engine.
     /// - `Vk(...)` for pipeline / scratch construction failure.
-    fn ensure_trap_assets(&mut self, platform: &GpuCore) -> Result<(), RenderError> {
+    fn ensure_trap_assets(&mut self, gpu: &GpuCore) -> Result<(), RenderError> {
         use crate::kms::vk::{mask_scratch::MaskScratch, trap_pipeline::TrapPipeline};
         let Some(inner) = self.inner.as_mut() else {
             return Err(RenderError::NoVk);
         };
-        if platform.renderer_failed {
+        if gpu.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
         if inner.trap_pipeline.is_none() {
@@ -87,13 +87,13 @@ impl RenderEngine {
     /// - `NoVk` on the stub engine.
     /// - `UnknownDrawable` if `dst_id` is missing.
     /// - `Vk(...)` for pipeline / scratch / CB failures.
-    /// - `RendererFailed` if `platform.renderer_failed`.
+    /// - `RendererFailed` if `gpu.renderer_failed`.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn render_traps_or_tris(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut GpuCore,
+        gpu: &mut GpuCore,
         op: u8,
         src: ResolvedSource,
         dst: Dst,
@@ -137,17 +137,17 @@ impl RenderEngine {
         // N9 order: renderer_failed check.
         {
             let _inner = self.inner.as_ref().ok_or(RenderError::NoVk)?;
-            if platform.renderer_failed {
+            if gpu.renderer_failed {
                 return Err(RenderError::RendererFailed);
             }
         }
 
         // N9 order: flush_render_batch before any state mutation.
-        self.flush_render_batch(store, platform, RenderFlushReason::Traps)?;
+        self.flush_render_batch(store, gpu, RenderFlushReason::Traps)?;
 
         // Lazy-init RENDER + TRAP assets (idempotent, preserves legacy).
-        self.ensure_render_assets(platform)?;
-        self.ensure_trap_assets(platform)?;
+        self.ensure_render_assets(gpu)?;
+        self.ensure_trap_assets(gpu)?;
 
         // Preflight: resolve dst metadata.
         let (dst_image, dst_view, dst_extent, dst_format, dst_depth) = {
@@ -209,7 +209,7 @@ impl RenderEngine {
         {
             self.close_open_frame(
                 store,
-                platform,
+                gpu,
                 crate::kms::render::frame_builder::CloseReason::ScratchGrow,
             )?;
         }
@@ -253,7 +253,7 @@ impl RenderEngine {
             {
                 self.close_open_frame(
                     store,
-                    platform,
+                    gpu,
                     crate::kms::render::frame_builder::CloseReason::ScratchGrow,
                 )?;
             }
@@ -423,7 +423,7 @@ impl RenderEngine {
             let inner = self.inner.as_mut().expect("inner");
             if !inner.frame_builder.is_open() {
                 let _ = inner;
-                let ticket = platform.submit_group_ticket_or_open()?;
+                let ticket = gpu.submit_group_ticket_or_open()?;
                 let inner = self.inner.as_mut().expect("inner");
                 inner.acquire_generation = inner.acquire_generation.saturating_add(1);
                 let frame_generation = inner.acquire_generation;

@@ -95,7 +95,7 @@ impl RenderEngine {
     pub(crate) fn try_append_render_batch(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut GpuCore,
+        gpu: &mut GpuCore,
         op: u8,
         src: ResolvedSource,
         mask: ResolvedSource,
@@ -176,13 +176,13 @@ impl RenderEngine {
                 }
             });
         if let Some(reason) = key_change_reason {
-            self.flush_render_batch(store, platform, reason)?;
+            self.flush_render_batch(store, gpu, reason)?;
         }
 
         // Lazy-init RENDER assets (mirrors the unbatched path).
-        self.ensure_render_assets(platform)?;
+        self.ensure_render_assets(gpu)?;
         let inner = self.inner.as_mut().ok_or(RenderError::NoVk)?;
-        if platform.renderer_failed {
+        if gpu.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
 
@@ -336,7 +336,7 @@ impl RenderEngine {
         // Branch A: open a fresh batch (no pending).
         let is_open = inner.pending_render_batch.is_some();
         if !is_open {
-            let (cb, ticket) = begin_op_cb(inner, platform)?;
+            let (cb, ticket) = begin_op_cb(inner, gpu)?;
             // Use an adapter so `record_render_composite_open` can
             // update the dst's tracked layout.
             let mut adapter = {
@@ -499,7 +499,7 @@ impl RenderEngine {
     pub(crate) fn flush_render_batch(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut GpuCore,
+        gpu: &mut GpuCore,
         reason: RenderFlushReason,
     ) -> Result<Option<u32>, RenderError> {
         let Some(inner) = self.inner.as_mut() else {
@@ -511,7 +511,7 @@ impl RenderEngine {
         // A real flush: an open batch was present and is being closed.
         // Attribute it for the `vk renderpass flush src` telemetry.
         reason.record();
-        if platform.renderer_failed {
+        if gpu.renderer_failed {
             log::debug!(
                 "render flush_render_batch: renderer_failed; dropping batch \
                  (coalesced {} composites)",
@@ -547,7 +547,7 @@ impl RenderEngine {
         }
 
         // End + submit (append to group).
-        end_and_submit_op(inner, platform, batch.cb, &batch.ticket)?;
+        end_and_submit_op(inner, gpu, batch.cb, &batch.ticket)?;
 
         // CPU bookkeeping.
         store.touch_render_fence(batch.key.dst, batch.ticket.clone());
@@ -577,7 +577,7 @@ impl RenderEngine {
             coalesced_count,
         });
         // `inner` borrow released. Auto-flush for render_batch (no semaphore path).
-        self.maybe_auto_flush_submit_group(store, platform)?;
+        self.maybe_auto_flush_submit_group(store, gpu)?;
         Ok(Some(coalesced_count))
     }
 

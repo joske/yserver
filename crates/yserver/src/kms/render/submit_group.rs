@@ -72,9 +72,9 @@ impl SubmitGroup {
         }
     }
 
-    /// Test helper: override the cap. Production-side cap is bumped
-    /// via `set_max_size` from `PlatformBackend::open_with_commit`
-    /// once Task 4 lands.
+    /// Test helper: override the cap. Only reached through
+    /// `GpuCore::submit_group_set_max_size_for_tests`; production keeps
+    /// the default.
     pub(crate) fn set_max_size(&mut self, n: usize) {
         self.max_size = n.max(1);
     }

@@ -26,7 +26,7 @@ impl RenderEngine {
     /// `vk::Result` from allocation / view creation / the blocking copy.
     pub(crate) fn promote_drawable_exportable(
         &mut self,
-        platform: &mut GpuCore,
+        gpu: &mut GpuCore,
         store: &mut DrawableStore,
         id: DrawableId,
     ) -> Result<(), RenderError> {
@@ -55,12 +55,12 @@ impl RenderEngine {
         // touched the drawable.
         self.close_open_frame(
             store,
-            platform,
+            gpu,
             crate::kms::render::frame_builder::CloseReason::SyncWait,
         )?;
         self.flush_submit_group(
             store,
-            platform,
+            gpu,
             crate::kms::render::submit_group::FlushReason::SyncBoundary,
         )?;
 
@@ -72,14 +72,14 @@ impl RenderEngine {
             (s.extent, s.format, s.depth, s.current_layout, s.image)
         };
 
-        let vk = platform.vk().ok_or(RenderError::NoVk)?.clone();
+        let vk = gpu.vk().ok_or(RenderError::NoVk)?.clone();
 
         // (a) allocate exportable target.
         let exp =
             crate::kms::vk::target::allocate_exportable(&vk, extent.width, extent.height, format)?;
 
         // (b)+(c) copy old content → new image, block until complete.
-        self.copy_image_blocking(platform, old_image, old_layout, exp.image, extent)?;
+        self.copy_image_blocking(gpu, old_image, old_layout, exp.image, extent)?;
         let new_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
 
         // (d) build new views (same depth-aware swizzle the store uses).
@@ -148,7 +148,7 @@ impl RenderEngine {
     /// / fence wait.
     fn copy_image_blocking(
         &mut self,
-        platform: &GpuCore,
+        gpu: &GpuCore,
         src: vk::Image,
         src_layout: vk::ImageLayout,
         dst: vk::Image,
@@ -156,9 +156,7 @@ impl RenderEngine {
     ) -> Result<(), RenderError> {
         let inner = self.inner.as_ref().ok_or(RenderError::NoVk)?;
         let vk = Arc::clone(&inner.vk);
-        let pool = platform
-            .ops_command_pool_handle()
-            .ok_or(RenderError::NoVk)?;
+        let pool = gpu.ops_command_pool_handle().ok_or(RenderError::NoVk)?;
 
         crate::kms::vk::ops::run_one_shot_op(&vk, pool, |vk, cb| {
             let full_range = vk::ImageSubresourceRange::default()

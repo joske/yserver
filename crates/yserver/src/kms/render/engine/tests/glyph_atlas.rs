@@ -11,19 +11,19 @@ use crate::kms::{
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn image_text_run_records_damage_on_target() {
-    let Some(mut platform) = live_platform() else {
+    let Some(mut gpu) = live_gpu() else {
         eprintln!("no VkContext available — skipping");
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&gpu).expect("engine");
 
     // Window-kind + scene-participating so presentation damage
     // accumulates (per the I5 spec amendment, pixmaps no longer
     // accumulate any damage in the store — protocol DamageNotify
     // fanout lives at the request layer).
     let id = alloc_drawable_3a_with_kind(
-        &platform,
+        &gpu,
         &mut store,
         0x1,
         64,
@@ -39,7 +39,7 @@ fn image_text_run_records_damage_on_target() {
     let stats = engine
         .image_text(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Dst::server_internal(id),
             7,
             [1.0, 1.0, 1.0, 1.0],
@@ -69,7 +69,7 @@ fn image_text_run_records_damage_on_target() {
     assert!(max_x >= 22);
     assert!(max_y >= 17);
 
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut gpu);
 }
 
 /// **Load-bearing per codex round 1**: two back-to-back glyph
@@ -80,19 +80,19 @@ fn image_text_run_records_damage_on_target() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn atlas_back_to_back_upload_no_corruption() {
-    let Some(mut platform) = live_platform() else {
+    let Some(mut gpu) = live_gpu() else {
         eprintln!("no VkContext available — skipping");
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
-    let target = alloc_drawable_3a(&platform, &mut store, 0x1, 32, 32);
+    let mut engine = RenderEngine::new(&gpu).expect("engine");
+    let target = alloc_drawable_3a(&gpu, &mut store, 0x1, 32, 32);
 
     // Pre-clear the target to black.
     engine
         .fill_rect(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Dst::server_internal(target),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -116,7 +116,7 @@ fn atlas_back_to_back_upload_no_corruption() {
     let stats = engine
         .image_text(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Dst::server_internal(target),
             42,
             [1.0, 1.0, 1.0, 1.0],
@@ -130,7 +130,7 @@ fn atlas_back_to_back_upload_no_corruption() {
     let out = engine
         .get_image(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Src::server_internal(target),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -176,7 +176,7 @@ fn atlas_back_to_back_upload_no_corruption() {
         "between-quad pixel (7,2) should be background black; got ({b:#x},{g:#x},{r:#x})"
     );
 
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut gpu);
 }
 
 fn atlas_resets(engine: &RenderEngine) -> u64 {
@@ -229,13 +229,13 @@ fn corner_glyph(
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn atlas_full_resets_behind_the_recorded_draw() {
-    let Some(mut platform) = live_platform() else {
+    let Some(mut gpu) = live_gpu() else {
         eprintln!("no VkContext available — skipping");
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
-    let target = alloc_drawable_3a(&platform, &mut store, 0x1, 32, 8);
+    let mut engine = RenderEngine::new(&gpu).expect("engine");
+    let target = alloc_drawable_3a(&gpu, &mut store, 0x1, 32, 8);
     let full = vk::Rect2D {
         offset: vk::Offset2D::default(),
         extent: vk::Extent2D {
@@ -246,7 +246,7 @@ fn atlas_full_resets_behind_the_recorded_draw() {
     engine
         .fill_rect(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Dst::server_internal(target),
             full,
             [0.0, 0.0, 0.0, 1.0],
@@ -259,7 +259,7 @@ fn atlas_full_resets_behind_the_recorded_draw() {
     let stats = engine
         .image_text(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Dst::server_internal(target),
             1,
             [1.0, 1.0, 1.0, 1.0],
@@ -280,7 +280,7 @@ fn atlas_full_resets_behind_the_recorded_draw() {
     let stats = engine
         .image_text(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Dst::server_internal(target),
             1,
             [1.0, 1.0, 1.0, 1.0],
@@ -307,13 +307,7 @@ fn atlas_full_resets_behind_the_recorded_draw() {
     );
 
     let out = engine
-        .get_image(
-            &mut store,
-            &mut platform,
-            Src::server_internal(target),
-            full,
-            32,
-        )
+        .get_image(&mut store, &mut gpu, Src::server_internal(target), full, 32)
         .expect("get_image");
     for y in 0..8 {
         for x in 0..32 {
@@ -324,7 +318,7 @@ fn atlas_full_resets_behind_the_recorded_draw() {
             assert_eq!(px, expect, "pixel ({x},{y})");
         }
     }
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut gpu);
 }
 
 /// A glyph wider than the whole atlas can never be placed: it
@@ -332,19 +326,19 @@ fn atlas_full_resets_behind_the_recorded_draw() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn glyph_larger_than_atlas_drops_without_reset() {
-    let Some(mut platform) = live_platform() else {
+    let Some(mut gpu) = live_gpu() else {
         eprintln!("no VkContext available — skipping");
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
-    let target = alloc_drawable_3a(&platform, &mut store, 0x1, 4, 4);
+    let mut engine = RenderEngine::new(&gpu).expect("engine");
+    let target = alloc_drawable_3a(&gpu, &mut store, 0x1, 4, 4);
     let small = build_glyph(1, 0, 0, 4, 4);
     let huge = build_glyph(2, 0, 0, 4097, 1);
     let stats = engine
         .image_text(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Dst::server_internal(target),
             1,
             [1.0, 1.0, 1.0, 1.0],
@@ -356,12 +350,12 @@ fn glyph_larger_than_atlas_drops_without_reset() {
     engine
         .close_open_frame(
             &mut store,
-            &mut platform,
+            &mut gpu,
             crate::kms::render::frame_builder::CloseReason::SyncWait,
         )
         .expect("close");
     assert!(atlas_has(&engine, 1, 1));
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut gpu);
 }
 
 /// `forget_glyphs` drops committed entries AND inserts still
@@ -370,41 +364,39 @@ fn glyph_larger_than_atlas_drops_without_reset() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn forget_glyphs_drops_committed_and_pending_entries() {
-    let Some(mut platform) = live_platform() else {
+    let Some(mut gpu) = live_gpu() else {
         eprintln!("no VkContext available — skipping");
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
-    let target = alloc_drawable_3a(&platform, &mut store, 0x1, 16, 4);
-    let close = |engine: &mut RenderEngine, store: &mut DrawableStore, platform: &mut GpuCore| {
+    let mut engine = RenderEngine::new(&gpu).expect("engine");
+    let target = alloc_drawable_3a(&gpu, &mut store, 0x1, 16, 4);
+    let close = |engine: &mut RenderEngine, store: &mut DrawableStore, gpu: &mut GpuCore| {
         engine
             .close_open_frame(
                 store,
-                platform,
+                gpu,
                 crate::kms::render::frame_builder::CloseReason::SyncWait,
             )
             .expect("close");
     };
-    let draw = |engine: &mut RenderEngine,
-                store: &mut DrawableStore,
-                platform: &mut GpuCore,
-                font: u32| {
-        let glyphs = [build_glyph(1, 0, 0, 2, 2), build_glyph(2, 4, 0, 2, 2)];
-        engine
-            .image_text(
-                store,
-                platform,
-                Dst::server_internal(target),
-                font,
-                [1.0, 1.0, 1.0, 1.0],
-                &glyphs,
-            )
-            .expect("image_text");
-    };
+    let draw =
+        |engine: &mut RenderEngine, store: &mut DrawableStore, gpu: &mut GpuCore, font: u32| {
+            let glyphs = [build_glyph(1, 0, 0, 2, 2), build_glyph(2, 4, 0, 2, 2)];
+            engine
+                .image_text(
+                    store,
+                    gpu,
+                    Dst::server_internal(target),
+                    font,
+                    [1.0, 1.0, 1.0, 1.0],
+                    &glyphs,
+                )
+                .expect("image_text");
+        };
     // Committed: font 10's glyphs land in the atlas, then go.
-    draw(&mut engine, &mut store, &mut platform, 10);
-    close(&mut engine, &mut store, &mut platform);
+    draw(&mut engine, &mut store, &mut gpu, 10);
+    close(&mut engine, &mut store, &mut gpu);
     assert!(atlas_has(&engine, 10, 1) && atlas_has(&engine, 10, 2));
     engine.forget_glyphs(10, Some(&[1]));
     assert!(!atlas_has(&engine, 10, 1));
@@ -413,15 +405,15 @@ fn forget_glyphs_drops_committed_and_pending_entries() {
     assert!(!atlas_has(&engine, 10, 2));
 
     // Pending: font 11's inserts are still in the open frame.
-    draw(&mut engine, &mut store, &mut platform, 11);
+    draw(&mut engine, &mut store, &mut gpu, 11);
     engine.forget_glyphs(11, Some(&[2]));
-    close(&mut engine, &mut store, &mut platform);
+    close(&mut engine, &mut store, &mut gpu);
     assert!(atlas_has(&engine, 11, 1));
     assert!(
         !atlas_has(&engine, 11, 2),
         "a forgotten pending insert never commits"
     );
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut gpu);
 }
 
 /// Step 2 proof (component-alpha glyphs plan,
@@ -447,18 +439,18 @@ fn forget_glyphs_drops_committed_and_pending_entries() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn atlas_entry_packed_vs_logical_width_feed_the_right_consumers() {
-    let Some(mut platform) = live_platform() else {
+    let Some(mut gpu) = live_gpu() else {
         eprintln!("no VkContext available — skipping");
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&gpu).expect("engine");
 
-    let real_target = alloc_drawable_3a(&platform, &mut store, 0x1, 64, 32);
+    let real_target = alloc_drawable_3a(&gpu, &mut store, 0x1, 64, 32);
     // Window + scene-participating so presentation damage
     // accumulates (mirrors `image_text_run_records_damage_on_target`).
     let probe_target = alloc_drawable_3a_with_kind(
-        &platform,
+        &gpu,
         &mut store,
         0x2,
         64,
@@ -472,7 +464,7 @@ fn atlas_entry_packed_vs_logical_width_feed_the_right_consumers() {
     engine
         .fill_rect(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Dst::server_internal(probe_target),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -507,7 +499,7 @@ fn atlas_entry_packed_vs_logical_width_feed_the_right_consumers() {
     let stats = engine
         .image_text(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Dst::server_internal(real_target),
             font_xid,
             [1.0, 1.0, 1.0, 1.0],
@@ -523,7 +515,7 @@ fn atlas_entry_packed_vs_logical_width_feed_the_right_consumers() {
     engine
         .close_open_frame(
             &mut store,
-            &mut platform,
+            &mut gpu,
             crate::kms::render::frame_builder::CloseReason::SyncWait,
         )
         .expect("close frame after real upload");
@@ -563,7 +555,7 @@ fn atlas_entry_packed_vs_logical_width_feed_the_right_consumers() {
     let stats2 = engine
         .image_text(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Dst::server_internal(probe_target),
             font_xid,
             [1.0, 1.0, 1.0, 1.0],
@@ -599,11 +591,11 @@ fn atlas_entry_packed_vs_logical_width_feed_the_right_consumers() {
     // stretch across all 40 texels and its right half would land
     // on the transparent texels 20..40, producing a visibly mixed
     // opaque/transparent pattern instead of a solid one.
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut gpu);
     let out = engine
         .get_image(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Src::server_internal(probe_target),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),

@@ -69,11 +69,11 @@ impl RenderEngine {
     pub(super) fn reset_glyph_atlas(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut GpuCore,
+        gpu: &mut GpuCore,
     ) -> Result<(), RenderError> {
         self.close_open_frame(
             store,
-            platform,
+            gpu,
             crate::kms::render::frame_builder::CloseReason::GlyphAtlasFull,
         )?;
         if let Some(atlas) = self.inner.as_mut().and_then(|i| i.glyph_atlas.as_mut()) {
@@ -151,11 +151,11 @@ impl RenderEngine {
     ///   failures drop the affected glyph and bump
     ///   `stats.glyphs_dropped`; only catastrophic failures (CB
     ///   alloc, draw-record) propagate.
-    /// - `RendererFailed` if `platform.renderer_failed`.
+    /// - `RendererFailed` if `gpu.renderer_failed`.
     pub(crate) fn composite_glyphs(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut GpuCore,
+        gpu: &mut GpuCore,
         dst: Dst,
         op: u8,
         dst_pict_format: u32,
@@ -170,7 +170,7 @@ impl RenderEngine {
         // anymore.
         self.composite_glyphs_via_frame_builder(
             store,
-            platform,
+            gpu,
             dst,
             op,
             dst_pict_format,
@@ -206,7 +206,7 @@ impl RenderEngine {
     fn composite_glyphs_via_frame_builder(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut GpuCore,
+        gpu: &mut GpuCore,
         dst: Dst,
         op: u8,
         dst_pict_format: u32,
@@ -228,14 +228,14 @@ impl RenderEngine {
         //     frame stays OPEN across composite_glyphs calls, so a
         //     sequence like `cow_copy_area → composite_glyphs` would
         //     see the cow batch pending; flush it here defensively.
-        self.flush_render_batch(store, platform, RenderFlushReason::Glyph)?;
+        self.flush_render_batch(store, gpu, RenderFlushReason::Glyph)?;
 
         // (1) Resolve dst format gating — identical to legacy.
         let inner = match self.inner.as_mut() {
             Some(i) => i,
             None => return Err(RenderError::NoVk),
         };
-        if platform.renderer_failed {
+        if gpu.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
         let (dst_extent, dst_format, dst_depth) = {
@@ -316,7 +316,7 @@ impl RenderEngine {
             )
         }));
         if !fits {
-            self.reset_glyph_atlas(store, platform)?;
+            self.reset_glyph_atlas(store, gpu)?;
         }
         let inner = self.inner.as_mut().expect("inner");
 
@@ -333,7 +333,7 @@ impl RenderEngine {
             // Release the inner borrow before calling the platform
             // method which doesn't need it.
             let _ = inner;
-            let ticket = platform.submit_group_ticket_or_open()?;
+            let ticket = gpu.submit_group_ticket_or_open()?;
             let inner = self.inner.as_mut().expect("inner");
             inner.acquire_generation = inner.acquire_generation.saturating_add(1);
             let frame_generation = inner.acquire_generation;
@@ -451,14 +451,14 @@ impl RenderEngine {
             let _ = inner;
             self.close_open_frame(
                 store,
-                platform,
+                gpu,
                 crate::kms::render::frame_builder::CloseReason::PinCeiling,
             )?;
             // Re-open a fresh frame. Phase B.2 Mechanism 2: bump
             // acquire_generation at open and capture the value on
             // the fresh OpenFrame (same shape as the initial open
             // above).
-            let new_ticket = platform.submit_group_ticket_or_open()?;
+            let new_ticket = gpu.submit_group_ticket_or_open()?;
             let inner = self.inner.as_mut().expect("inner");
             inner.acquire_generation = inner.acquire_generation.saturating_add(1);
             let frame_generation = inner.acquire_generation;

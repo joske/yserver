@@ -117,7 +117,7 @@ impl GpuCore {
             24 | 32 => vk::Format::B8G8R8A8_UNORM,
             other => {
                 log::warn!(
-                    "render PlatformBackend::format_for_depth: unhandled depth {other} → \
+                    "render GpuCore::format_for_depth: unhandled depth {other} → \
                      defaulting to B8G8R8A8_UNORM",
                 );
                 vk::Format::B8G8R8A8_UNORM

@@ -39,7 +39,7 @@ impl RenderEngine {
     pub(crate) fn put_image(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut GpuCore,
+        gpu: &mut GpuCore,
         dst: Dst,
         dst_pos: vk::Offset2D,
         src_extent: vk::Extent2D,
@@ -53,13 +53,13 @@ impl RenderEngine {
             return Ok(());
         }
         // Phase B.3 (N9): renderer_failed check before any open-frame mutation.
-        if platform.renderer_failed {
+        if gpu.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
         // Phase B.3 (N9): flush pending_render_batch at entry. May close an
         // open frame (chronological X11 ordering with pre-existing batches).
         // No flush_cow_batch — that helper is deleted in Task 4.
-        self.flush_render_batch(store, platform, RenderFlushReason::PutImage)?;
+        self.flush_render_batch(store, gpu, RenderFlushReason::PutImage)?;
 
         let Some(inner) = self.inner.as_mut() else {
             return Err(RenderError::NoVk);
@@ -144,7 +144,7 @@ impl RenderEngine {
         // composite_glyphs_via_frame_builder.)
         if !inner.frame_builder.is_open() {
             let _ = inner;
-            let ticket = platform.submit_group_ticket_or_open()?;
+            let ticket = gpu.submit_group_ticket_or_open()?;
             let inner = self.inner.as_mut().expect("inner");
             inner.acquire_generation = inner.acquire_generation.saturating_add(1);
             let frame_generation = inner.acquire_generation;
@@ -215,7 +215,7 @@ impl RenderEngine {
     pub(crate) fn get_image(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut GpuCore,
+        gpu: &mut GpuCore,
         src_handle: Src,
         rect: vk::Rect2D,
         out_depth: u8,
@@ -232,7 +232,7 @@ impl RenderEngine {
         // "blocked on the readback fence" (wait). Cheap: a few Instant reads
         // per GetImage; the log only fires on the slow tail.
         let t_start = std::time::Instant::now();
-        self.flush_render_batch(store, platform, RenderFlushReason::Readback)?;
+        self.flush_render_batch(store, gpu, RenderFlushReason::Readback)?;
         let t_after_batch = std::time::Instant::now();
         // Phase B.1 close trigger 2: close any open frame before the
         // readback's ticket.wait(). The frame's CB must submit before the
@@ -240,7 +240,7 @@ impl RenderEngine {
         // deferred frame.
         self.close_open_frame(
             store,
-            platform,
+            gpu,
             crate::kms::render::frame_builder::CloseReason::SyncWait,
         )?;
         let t_after_close = std::time::Instant::now();
@@ -253,7 +253,7 @@ impl RenderEngine {
         // readback CB itself.
         self.flush_submit_group(
             store,
-            platform,
+            gpu,
             crate::kms::render::submit_group::FlushReason::SyncBoundary,
         )
         .map_err(RenderError::Vk)?;
@@ -261,7 +261,7 @@ impl RenderEngine {
         let Some(inner) = self.inner.as_mut() else {
             return Err(RenderError::NoVk);
         };
-        if platform.renderer_failed {
+        if gpu.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
         let Some(drawable) = store.get_mut(src) else {
@@ -292,7 +292,7 @@ impl RenderEngine {
             staging_size.max(1),
         )?);
 
-        let (cb, ticket) = begin_op_cb(inner, platform)?;
+        let (cb, ticket) = begin_op_cb(inner, gpu)?;
         let device = &inner.vk.device;
 
         drawable.record_layout_transition(
@@ -346,7 +346,7 @@ impl RenderEngine {
             vk::AccessFlags2::SHADER_SAMPLED_READ,
         );
 
-        end_and_submit_op(inner, platform, cb, &ticket)?;
+        end_and_submit_op(inner, gpu, cb, &ticket)?;
         store.touch_render_fence(src, ticket.clone());
         // `inner` borrow released before flush so self.flush_submit_group
         // can take &mut self.
@@ -358,7 +358,7 @@ impl RenderEngine {
         // before we wait on it.
         self.flush_submit_group(
             store,
-            platform,
+            gpu,
             crate::kms::render::submit_group::FlushReason::SyncBoundary,
         )
         .map_err(RenderError::Vk)?;

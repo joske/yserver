@@ -31,7 +31,7 @@ impl RenderEngine {
     pub(crate) fn fill_rect(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut GpuCore,
+        gpu: &mut GpuCore,
         target: Dst,
         rect: vk::Rect2D,
         color: [f32; 4],
@@ -40,7 +40,7 @@ impl RenderEngine {
         // new frame-builder body. The old close_open_frame_for_non_ported_op
         // call is DELETED; fill_rect now extends the open frame instead of
         // closing it.
-        self.fill_rect_batch(store, platform, target, color, &[rect])
+        self.fill_rect_batch(store, gpu, target, color, &[rect])
     }
 
     /// Fill every rect in `rects` on `target` with `color`, accumulating
@@ -64,7 +64,7 @@ impl RenderEngine {
     pub(crate) fn fill_rect_batch(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut GpuCore,
+        gpu: &mut GpuCore,
         dst: Dst,
         color: [f32; 4],
         rects: &[vk::Rect2D],
@@ -75,13 +75,13 @@ impl RenderEngine {
             return Ok(());
         }
         // Phase B.3 (N9): renderer_failed check before any open-frame mutation.
-        if platform.renderer_failed {
+        if gpu.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
         // Phase B.3 (N9): flush pending_render_batch at entry. May close an
         // open frame (chronological X11 ordering with pre-existing batches).
         // NO flush_cow_batch — that helper is deleted in Task 4.
-        self.flush_render_batch(store, platform, RenderFlushReason::Fill)?;
+        self.flush_render_batch(store, gpu, RenderFlushReason::Fill)?;
 
         // Preflight: read target metadata WITHOUT mutating the frame.
         let Some(inner) = self.inner.as_mut() else {
@@ -114,7 +114,7 @@ impl RenderEngine {
         // pattern at engine.rs:5278-5287).
         if !inner.frame_builder.is_open() {
             let _ = inner;
-            let ticket = platform.submit_group_ticket_or_open()?;
+            let ticket = gpu.submit_group_ticket_or_open()?;
             let inner = self.inner.as_mut().expect("inner");
             inner.acquire_generation = inner.acquire_generation.saturating_add(1);
             let frame_generation = inner.acquire_generation;
@@ -173,14 +173,14 @@ impl RenderEngine {
     /// share one pipeline-layout.
     fn ensure_logic_fill_cache(
         &mut self,
-        platform: &GpuCore,
+        gpu: &GpuCore,
         color_format: vk::Format,
     ) -> Result<(), RenderError> {
         use crate::kms::vk::logic_fill_pipeline::LogicFillPipelineCache;
         let Some(inner) = self.inner.as_mut() else {
             return Err(RenderError::NoVk);
         };
-        if platform.renderer_failed {
+        if gpu.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
         if inner.logic_fill_caches.contains_key(&color_format) {
@@ -222,7 +222,7 @@ impl RenderEngine {
     pub(crate) fn logic_fill(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut GpuCore,
+        gpu: &mut GpuCore,
         dst: Dst,
         function: yserver_core::backend::GcFunction,
         opaque_alpha: bool,
@@ -231,7 +231,7 @@ impl RenderEngine {
     ) -> Result<(), RenderError> {
         self.logic_fill_channels(
             store,
-            platform,
+            gpu,
             dst,
             function,
             crate::kms::vk::logic_fill_pipeline::LogicFillChannels::from_opaque_alpha(opaque_alpha),
@@ -256,13 +256,13 @@ impl RenderEngine {
     pub(crate) fn stamp_opaque_alpha(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut GpuCore,
+        gpu: &mut GpuCore,
         dst: Dst,
         rects: &[Rectangle16],
     ) -> Result<(), RenderError> {
         self.logic_fill_channels(
             store,
-            platform,
+            gpu,
             dst,
             yserver_core::backend::GcFunction::Set,
             crate::kms::vk::logic_fill_pipeline::LogicFillChannels::Alpha,
@@ -275,7 +275,7 @@ impl RenderEngine {
     fn logic_fill_channels(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut GpuCore,
+        gpu: &mut GpuCore,
         dst: Dst,
         function: yserver_core::backend::GcFunction,
         channels: crate::kms::vk::logic_fill_pipeline::LogicFillChannels,
@@ -294,10 +294,10 @@ impl RenderEngine {
         if matches!(function, GcFunction::NoOp) {
             return Ok(());
         }
-        if platform.renderer_failed {
+        if gpu.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
-        self.flush_render_batch(store, platform, RenderFlushReason::Fill)?;
+        self.flush_render_batch(store, gpu, RenderFlushReason::Fill)?;
 
         // Preflight: read format via shared borrow; build pipeline cache
         // for the dst format if not already present (preserve the
@@ -308,7 +308,7 @@ impl RenderEngine {
                 .ok_or(RenderError::UnknownDrawable(target))?;
             d.storage.format
         };
-        self.ensure_logic_fill_cache(platform, format)?;
+        self.ensure_logic_fill_cache(gpu, format)?;
 
         let Some(inner) = self.inner.as_mut() else {
             return Err(RenderError::NoVk);
@@ -363,7 +363,7 @@ impl RenderEngine {
         // Open frame if not already open (same pattern as fill_rect_batch).
         if !inner.frame_builder.is_open() {
             let _ = inner;
-            let ticket = platform.submit_group_ticket_or_open()?;
+            let ticket = gpu.submit_group_ticket_or_open()?;
             let inner = self.inner.as_mut().expect("inner");
             inner.acquire_generation = inner.acquire_generation.saturating_add(1);
             let frame_generation = inner.acquire_generation;
@@ -431,7 +431,7 @@ impl RenderEngine {
     pub(crate) fn copy_area(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut GpuCore,
+        gpu: &mut GpuCore,
         src_handle: Src,
         dst_handle: Dst,
         src_rect: vk::Rect2D,
@@ -444,12 +444,12 @@ impl RenderEngine {
             return Ok(());
         }
         // Phase B.3 (N9): renderer_failed check before any open-frame mutation.
-        if platform.renderer_failed {
+        if gpu.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
         // Phase B.3 (N9): flush pending_render_batch at entry. May close an
         // open frame (chronological X11 ordering with pre-existing batches).
-        self.flush_render_batch(store, platform, RenderFlushReason::Copy)?;
+        self.flush_render_batch(store, gpu, RenderFlushReason::Copy)?;
 
         // Preflight: read src + dst metadata + format check WITHOUT mutating
         // anything in the open frame. inner borrow is scoped.
@@ -497,7 +497,7 @@ impl RenderEngine {
         let self_overlap_scratch: Option<ScratchImage> = if src == dst {
             Some(allocate_scratch_image(
                 &inner.vk.clone(),
-                platform,
+                gpu,
                 copy_w,
                 copy_h,
                 src_format,
@@ -513,7 +513,7 @@ impl RenderEngine {
             // Release the inner borrow before calling the platform method
             // (which doesn't need it). Same `let _ = inner` pattern as line 5318.
             let _ = inner;
-            let ticket = platform.submit_group_ticket_or_open()?;
+            let ticket = gpu.submit_group_ticket_or_open()?;
             let inner = self.inner.as_mut().expect("inner");
             inner.acquire_generation = inner.acquire_generation.saturating_add(1);
             let frame_generation = inner.acquire_generation;
@@ -616,7 +616,7 @@ impl RenderEngine {
     pub(crate) fn masked_copy_area(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut GpuCore,
+        gpu: &mut GpuCore,
         src_handle: Src,
         dst_handle: Dst,
         src_pos: vk::Offset2D,
@@ -632,19 +632,19 @@ impl RenderEngine {
             return Ok(());
         }
         // renderer_failed check before any open-frame mutation.
-        if platform.renderer_failed {
+        if gpu.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
         // Flush pending_render_batch at entry. May close an open frame
         // (chronological X11 ordering with pre-existing batches).
-        self.flush_render_batch(store, platform, RenderFlushReason::Copy)?;
+        self.flush_render_batch(store, gpu, RenderFlushReason::Copy)?;
 
         // Lazy-init RENDER assets — the deferred masked_blit replay
         // (`emit_recorded_masked_copyarea_into_cb`) needs `inner.masked_blit`
         // present at frame-close time. Mirrors the render-pass ops
         // (render_composite / traps) which call this before recording; the
         // masked-blit pipeline is built here on first use.
-        self.ensure_render_assets(platform)?;
+        self.ensure_render_assets(gpu)?;
 
         // Preflight: read src + dst metadata WITHOUT mutating the open frame.
         let Some(inner) = self.inner.as_mut() else {
@@ -727,7 +727,7 @@ impl RenderEngine {
         // acquire_generation at open + capture on OpenFrame.
         if !inner.frame_builder.is_open() {
             let _ = inner;
-            let ticket = platform.submit_group_ticket_or_open()?;
+            let ticket = gpu.submit_group_ticket_or_open()?;
             let inner = self.inner.as_mut().expect("inner");
             inner.acquire_generation = inner.acquire_generation.saturating_add(1);
             let frame_generation = inner.acquire_generation;
@@ -866,7 +866,7 @@ impl RenderEngine {
     pub(crate) fn cow_copy_area(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut GpuCore,
+        gpu: &mut GpuCore,
         cow_id: Dst,
         src: Src,
         src_rect: vk::Rect2D,
@@ -876,11 +876,11 @@ impl RenderEngine {
         if src_rect.extent.width == 0 || src_rect.extent.height == 0 {
             return Ok(());
         }
-        if platform.renderer_failed {
+        if gpu.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
         // N9: flush pending_render_batch at entry.
-        self.flush_render_batch(store, platform, RenderFlushReason::Copy)?;
+        self.flush_render_batch(store, gpu, RenderFlushReason::Copy)?;
 
         // Sanity: same-image overlap not handled on the cow path
         // (legacy invariant at engine.rs:3109-3111). The regular
@@ -892,7 +892,7 @@ impl RenderEngine {
 
         // Per N3: cow_id is a regular DrawableId — forward to copy_area.
         // The frame builder's per-frame collapse provides coalescing.
-        self.copy_area(store, platform, src, cow_id, src_rect, dst_pos)
+        self.copy_area(store, gpu, src, cow_id, src_rect, dst_pos)
     }
 }
 

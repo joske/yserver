@@ -24,7 +24,7 @@ use crate::kms::{
 /// `color` via the engine's fill_rect path. Returns the
 /// store DrawableId.
 fn alloc_filled_pixmap(
-    platform: &mut GpuCore,
+    gpu: &mut GpuCore,
     store: &mut DrawableStore,
     engine: &mut RenderEngine,
     xid: u32,
@@ -32,7 +32,7 @@ fn alloc_filled_pixmap(
     h: u16,
     color_bgra_premul: [f32; 4],
 ) -> DrawableId {
-    let storage = platform
+    let storage = gpu
         .allocate_drawable_storage(w, h, 32)
         .expect("alloc storage");
     let id = store
@@ -47,7 +47,7 @@ fn alloc_filled_pixmap(
     engine
         .fill_rect(
             store,
-            platform,
+            gpu,
             Dst::server_internal(id),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -84,15 +84,15 @@ fn render_composite_over_renders_alpha_blended() {
     //   out.g = 0 + 1 * 0.5 = 0.5 → 0x80
     //   out.r = 0.5 + 0 * 0.5 = 0.5 → 0x80
     //   out.a = 0.5 + 1 * 0.5 = 1.0 → 0xFF
-    let Some(mut platform) = live_platform() else {
+    let Some(mut gpu) = live_gpu() else {
         eprintln!("no Vk — skipping");
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&gpu).expect("engine");
 
     let dst = alloc_filled_pixmap(
-        &mut platform,
+        &mut gpu,
         &mut store,
         &mut engine,
         0x1,
@@ -104,7 +104,7 @@ fn render_composite_over_renders_alpha_blended() {
     let stats = engine
         .render_composite(
             &mut store,
-            &mut platform,
+            &mut gpu,
             3,                                           // Over
             ResolvedSource::Solid([0.5, 0.0, 0.0, 0.5]), // 50% red premul
             ResolvedSource::None,
@@ -128,7 +128,7 @@ fn render_composite_over_renders_alpha_blended() {
     let out = engine
         .get_image(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Src::server_internal(dst),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -160,7 +160,7 @@ fn render_composite_over_renders_alpha_blended() {
         out[off + 3]
     );
 
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut gpu);
 }
 
 /// The cairo/Pango component-alpha text path, pass 1: glyph
@@ -174,15 +174,15 @@ fn render_composite_over_renders_alpha_blended() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn composite_glyphs_add_accumulates_into_r8_mask() {
-    let Some(mut platform) = live_platform() else {
+    let Some(mut gpu) = live_gpu() else {
         eprintln!("no Vk — skipping");
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&gpu).expect("engine");
 
     // Depth-8 pixmap → R8_UNORM storage (format_for_depth).
-    let storage = platform
+    let storage = gpu
         .allocate_drawable_storage(4, 4, 8)
         .expect("alloc a8 mask storage");
     let mask = store
@@ -203,7 +203,7 @@ fn composite_glyphs_add_accumulates_into_r8_mask() {
     engine
         .fill_rect(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Dst::server_internal(mask),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -233,7 +233,7 @@ fn composite_glyphs_add_accumulates_into_r8_mask() {
         engine
             .composite_glyphs(
                 &mut store,
-                &mut platform,
+                &mut gpu,
                 Dst::server_internal(mask),
                 12, // Add — the cairo mask-accumulation op
                 0,  // pict_format unknown → depth heuristic (R8 ⇒ has-alpha)
@@ -249,7 +249,7 @@ fn composite_glyphs_add_accumulates_into_r8_mask() {
     let out = engine
         .get_image(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Src::server_internal(mask),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -278,7 +278,7 @@ fn composite_glyphs_add_accumulates_into_r8_mask() {
         at(0, 0)
     );
 
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut gpu);
 }
 
 /// The cairo/Pango component-alpha text path, end to end:
@@ -290,15 +290,15 @@ fn composite_glyphs_add_accumulates_into_r8_mask() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn composite_glyphs_add_mask_then_composite_src_renders_text() {
-    let Some(mut platform) = live_platform() else {
+    let Some(mut gpu) = live_gpu() else {
         eprintln!("no Vk — skipping");
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&gpu).expect("engine");
 
     // Pass 1: a8 mask with a full-coverage 2×2 glyph at (1,1).
-    let storage = platform
+    let storage = gpu
         .allocate_drawable_storage(4, 4, 8)
         .expect("alloc a8 mask storage");
     let mask = store
@@ -313,7 +313,7 @@ fn composite_glyphs_add_mask_then_composite_src_renders_text() {
     engine
         .fill_rect(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Dst::server_internal(mask),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -338,7 +338,7 @@ fn composite_glyphs_add_mask_then_composite_src_renders_text() {
     engine
         .composite_glyphs(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Dst::server_internal(mask),
             12, // Add
             0,
@@ -351,7 +351,7 @@ fn composite_glyphs_add_mask_then_composite_src_renders_text() {
     // Pass 2: opaque-blue BGRA dst; Composite Src (white solid
     // through the mask) — the wizard's mask-paint pass.
     let dst = alloc_filled_pixmap(
-        &mut platform,
+        &mut gpu,
         &mut store,
         &mut engine,
         0x2,
@@ -362,7 +362,7 @@ fn composite_glyphs_add_mask_then_composite_src_renders_text() {
     engine
         .render_composite(
             &mut store,
-            &mut platform,
+            &mut gpu,
             1,                                           // Src
             ResolvedSource::Solid([1.0, 1.0, 1.0, 1.0]), // opaque white
             ResolvedSource::Drawable(SourceDrawable::whole(mask)),
@@ -383,7 +383,7 @@ fn composite_glyphs_add_mask_then_composite_src_renders_text() {
     let out = engine
         .get_image(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Src::server_internal(dst),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -416,7 +416,7 @@ fn composite_glyphs_add_mask_then_composite_src_renders_text() {
         out[off00 + 2],
     );
 
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut gpu);
 }
 
 #[test]
@@ -426,15 +426,15 @@ fn render_composite_picture_clip_per_rect() {
     // composite covering the union bbox must paint inside both
     // rects AND leave the hole untouched. Exercises plan §4's
     // per-rect scissoring against v1's union-bbox shortcut.
-    let Some(mut platform) = live_platform() else {
+    let Some(mut gpu) = live_gpu() else {
         eprintln!("no Vk — skipping");
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&gpu).expect("engine");
 
     let dst = alloc_filled_pixmap(
-        &mut platform,
+        &mut gpu,
         &mut store,
         &mut engine,
         0x1,
@@ -460,7 +460,7 @@ fn render_composite_picture_clip_per_rect() {
     engine
         .render_composite(
             &mut store,
-            &mut platform,
+            &mut gpu,
             1,                                           // Src
             ResolvedSource::Solid([1.0, 0.0, 0.0, 1.0]), // RGBA: opaque red
             ResolvedSource::None,
@@ -484,7 +484,7 @@ fn render_composite_picture_clip_per_rect() {
     let out = engine
         .get_image(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Src::server_internal(dst),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -512,7 +512,7 @@ fn render_composite_picture_clip_per_rect() {
         }
     }
 
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut gpu);
 }
 
 #[test]
@@ -520,15 +520,15 @@ fn render_composite_picture_clip_per_rect() {
 fn render_composite_solid_fill_source_path() {
     // SolidFill source over (op=Src) an unrelated start colour —
     // every dst pixel must equal the source's premul colour.
-    let Some(mut platform) = live_platform() else {
+    let Some(mut gpu) = live_gpu() else {
         eprintln!("no Vk — skipping");
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&gpu).expect("engine");
 
     let dst = alloc_filled_pixmap(
-        &mut platform,
+        &mut gpu,
         &mut store,
         &mut engine,
         0x1,
@@ -539,7 +539,7 @@ fn render_composite_solid_fill_source_path() {
     engine
         .render_composite(
             &mut store,
-            &mut platform,
+            &mut gpu,
             1,                                             // Src
             ResolvedSource::Solid([0.25, 0.5, 0.75, 1.0]), // RGBA premul
             ResolvedSource::None,
@@ -559,7 +559,7 @@ fn render_composite_solid_fill_source_path() {
     let out = engine
         .get_image(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Src::server_internal(dst),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -580,7 +580,7 @@ fn render_composite_solid_fill_source_path() {
         assert!(near(px[2], 0x40), "R: {:#x}", px[2]);
         assert!(near(px[3], 0xFF), "A: {:#x}", px[3]);
     }
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut gpu);
 }
 
 #[test]
@@ -594,15 +594,15 @@ fn render_composite_linear_gradient_horizontal_two_stop() {
     // roughly (n, n, n, 0xFF) ± a couple of units (NEAREST
     // sampler + LUT rounding).
     use crate::kms::vk::gradient::Stop;
-    let Some(mut platform) = live_platform() else {
+    let Some(mut gpu) = live_gpu() else {
         eprintln!("no Vk — skipping");
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&gpu).expect("engine");
 
     let dst = alloc_filled_pixmap(
-        &mut platform,
+        &mut gpu,
         &mut store,
         &mut engine,
         0x1,
@@ -614,7 +614,7 @@ fn render_composite_linear_gradient_horizontal_two_stop() {
     let grad_xid = 0xABBA_FACE_u32;
     engine
         .build_and_insert_linear_gradient(
-            &mut platform,
+            &mut gpu,
             grad_xid,
             (0, 0),
             (256_i32 << 16, 0),
@@ -645,7 +645,7 @@ fn render_composite_linear_gradient_horizontal_two_stop() {
     let stats = engine
         .render_composite(
             &mut store,
-            &mut platform,
+            &mut gpu,
             1, // Src — copy source to dst, no blend
             ResolvedSource::Gradient(grad_xid),
             ResolvedSource::None,
@@ -667,7 +667,7 @@ fn render_composite_linear_gradient_horizontal_two_stop() {
     let out = engine
         .get_image(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Src::server_internal(dst),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -704,7 +704,7 @@ fn render_composite_linear_gradient_horizontal_two_stop() {
 
     // Cleanup so the gradient image is freed in this drain.
     engine.picture_paint_remove(grad_xid);
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut gpu);
 }
 
 #[test]
@@ -715,15 +715,15 @@ fn render_composite_radial_gradient_centred() {
     // dark (t near 0 = first stop = black); border pixel should
     // be near-white.
     use crate::kms::vk::gradient::Stop;
-    let Some(mut platform) = live_platform() else {
+    let Some(mut gpu) = live_gpu() else {
         eprintln!("no Vk — skipping");
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&gpu).expect("engine");
 
     let dst = alloc_filled_pixmap(
-        &mut platform,
+        &mut gpu,
         &mut store,
         &mut engine,
         0x1,
@@ -735,7 +735,7 @@ fn render_composite_radial_gradient_centred() {
     let grad_xid = 0xDEAD_BEEF_u32;
     engine
         .build_and_insert_radial_gradient(
-            &mut platform,
+            &mut gpu,
             grad_xid,
             (32_i32 << 16, 32_i32 << 16, 0),
             (32_i32 << 16, 32_i32 << 16, 32_i32 << 16),
@@ -763,7 +763,7 @@ fn render_composite_radial_gradient_centred() {
     let stats = engine
         .render_composite(
             &mut store,
-            &mut platform,
+            &mut gpu,
             1, // Src
             ResolvedSource::Gradient(grad_xid),
             ResolvedSource::None,
@@ -785,7 +785,7 @@ fn render_composite_radial_gradient_centred() {
     let out = engine
         .get_image(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Src::server_internal(dst),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -820,7 +820,7 @@ fn render_composite_radial_gradient_centred() {
     );
 
     engine.picture_paint_remove(grad_xid);
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut gpu);
 }
 
 /// #214: black → white two-stop ramp over x ∈ [0, 256).
@@ -850,14 +850,14 @@ fn bw_ramp_stops() -> [crate::kms::vk::gradient::Stop; 2] {
 fn composite_and_check_bw_ramp(
     engine: &mut RenderEngine,
     store: &mut DrawableStore,
-    platform: &mut GpuCore,
+    gpu: &mut GpuCore,
     dst: DrawableId,
     xid: u32,
 ) {
     let stats = engine
         .render_composite(
             store,
-            platform,
+            gpu,
             1, // Src
             ResolvedSource::Gradient(xid),
             ResolvedSource::None,
@@ -878,7 +878,7 @@ fn composite_and_check_bw_ramp(
     let out = engine
         .get_image(
             store,
-            platform,
+            gpu,
             Src::server_internal(dst),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -905,11 +905,11 @@ fn composite_and_check_bw_ramp(
     assert!((0..256).all(|x| px(x)[3] == 0xFF), "alpha must be opaque");
 }
 
-fn close_for_tests(engine: &mut RenderEngine, store: &mut DrawableStore, platform: &mut GpuCore) {
+fn close_for_tests(engine: &mut RenderEngine, store: &mut DrawableStore, gpu: &mut GpuCore) {
     engine
         .close_open_frame(
             store,
-            platform,
+            gpu,
             crate::kms::render::frame_builder::CloseReason::Timeout,
         )
         .expect("close frame");
@@ -921,16 +921,16 @@ fn close_for_tests(engine: &mut RenderEngine, store: &mut DrawableStore, platfor
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn gradient_create_then_free_before_use_defers_release_to_frame_retire() {
-    let Some(mut platform) = live_platform() else {
+    let Some(mut gpu) = live_gpu() else {
         eprintln!("no Vk — skipping");
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&gpu).expect("engine");
     let xid = 0x0214_0001_u32;
     engine
         .build_and_insert_linear_gradient(
-            &mut platform,
+            &mut gpu,
             xid,
             (0, 0),
             (256_i32 << 16, 0),
@@ -956,12 +956,12 @@ fn gradient_create_then_free_before_use_defers_release_to_frame_retire() {
         weak.upgrade().is_some(),
         "image freed while its upload is still unsubmitted"
     );
-    close_for_tests(&mut engine, &mut store, &mut platform);
+    close_for_tests(&mut engine, &mut store, &mut gpu);
     assert!(
         weak.upgrade().is_some(),
         "image freed while its upload may be in flight"
     );
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut gpu);
     assert!(
         weak.upgrade().is_none(),
         "gradient resources leaked past frame retirement"
@@ -973,14 +973,14 @@ fn gradient_create_then_free_before_use_defers_release_to_frame_retire() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn gradient_create_composite_free_in_one_frame_renders_and_releases() {
-    let Some(mut platform) = live_platform() else {
+    let Some(mut gpu) = live_gpu() else {
         eprintln!("no Vk — skipping");
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&gpu).expect("engine");
     let dst = alloc_filled_pixmap(
-        &mut platform,
+        &mut gpu,
         &mut store,
         &mut engine,
         0x1,
@@ -990,11 +990,11 @@ fn gradient_create_composite_free_in_one_frame_renders_and_releases() {
     );
     // The pixmap fill must not share the frame: prove the gradient
     // itself opens (or joins) a frame and is ordered inside it.
-    close_for_tests(&mut engine, &mut store, &mut platform);
+    close_for_tests(&mut engine, &mut store, &mut gpu);
     let xid = 0x0214_0002_u32;
     engine
         .build_and_insert_linear_gradient(
-            &mut platform,
+            &mut gpu,
             xid,
             (0, 0),
             (256_i32 << 16, 0),
@@ -1016,7 +1016,7 @@ fn gradient_create_composite_free_in_one_frame_renders_and_releases() {
     let stats = engine
         .render_composite(
             &mut store,
-            &mut platform,
+            &mut gpu,
             1,
             ResolvedSource::Gradient(xid),
             ResolvedSource::None,
@@ -1050,7 +1050,7 @@ fn gradient_create_composite_free_in_one_frame_renders_and_releases() {
     let out = engine
         .get_image(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Src::server_internal(dst),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -1074,7 +1074,7 @@ fn gradient_create_composite_free_in_one_frame_renders_and_releases() {
         "x=128 BGR={:?}",
         px(128)
     );
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut gpu);
     assert!(
         weak.upgrade().is_none(),
         "gradient resources leaked past frame retirement"
@@ -1087,14 +1087,14 @@ fn gradient_create_composite_free_in_one_frame_renders_and_releases() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn gradient_sampled_in_a_later_frame_sees_the_upload() {
-    let Some(mut platform) = live_platform() else {
+    let Some(mut gpu) = live_gpu() else {
         eprintln!("no Vk — skipping");
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&gpu).expect("engine");
     let dst = alloc_filled_pixmap(
-        &mut platform,
+        &mut gpu,
         &mut store,
         &mut engine,
         0x1,
@@ -1106,7 +1106,7 @@ fn gradient_sampled_in_a_later_frame_sees_the_upload() {
     for i in 0..32_u32 {
         engine
             .build_and_insert_linear_gradient(
-                &mut platform,
+                &mut gpu,
                 0x0214_0100 + i,
                 (0, 0),
                 (256_i32 << 16, 0),
@@ -1114,19 +1114,13 @@ fn gradient_sampled_in_a_later_frame_sees_the_upload() {
             )
             .expect("build gradient");
     }
-    close_for_tests(&mut engine, &mut store, &mut platform);
-    composite_and_check_bw_ramp(
-        &mut engine,
-        &mut store,
-        &mut platform,
-        dst,
-        0x0214_0100 + 17,
-    );
+    close_for_tests(&mut engine, &mut store, &mut gpu);
+    composite_and_check_bw_ramp(&mut engine, &mut store, &mut gpu, dst, 0x0214_0100 + 17);
     for i in 0..32_u32 {
         engine.picture_paint_remove(0x0214_0100 + i);
     }
     assert_eq!(engine.picture_paint_len(), 0);
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut gpu);
 }
 
 #[test]
@@ -1136,15 +1130,15 @@ fn render_composite_missing_gradient_picture_is_gap() {
     // xid that has no picture_paint entry (LUT build failed or
     // dropped early). Must return stats with recorded_draws=0,
     // log a debug gap, and NOT panic.
-    let Some(mut platform) = live_platform() else {
+    let Some(mut gpu) = live_gpu() else {
         eprintln!("no Vk — skipping");
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&gpu).expect("engine");
 
     let dst = alloc_filled_pixmap(
-        &mut platform,
+        &mut gpu,
         &mut store,
         &mut engine,
         0x1,
@@ -1156,7 +1150,7 @@ fn render_composite_missing_gradient_picture_is_gap() {
     let stats = engine
         .render_composite(
             &mut store,
-            &mut platform,
+            &mut gpu,
             1, // Src
             ResolvedSource::Gradient(0xC0FF_EE00),
             ResolvedSource::None,
@@ -1174,7 +1168,7 @@ fn render_composite_missing_gradient_picture_is_gap() {
         )
         .expect("render_composite Ok even on missing gradient");
     assert_eq!(stats.recorded_draws, 0);
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut gpu);
 }
 
 #[test]
@@ -1186,15 +1180,15 @@ fn render_composite_self_alias() {
     // src). Without the scratch path the GPU samples a region
     // as it writes it — undefined behaviour; with it, the
     // result must be bit-identical to the pre-fill.
-    let Some(mut platform) = live_platform() else {
+    let Some(mut gpu) = live_gpu() else {
         eprintln!("no Vk — skipping");
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&gpu).expect("engine");
 
     // Allocate + PutImage a distinct pattern (per-pixel unique).
-    let storage = platform.allocate_drawable_storage(8, 4, 32).expect("alloc");
+    let storage = gpu.allocate_drawable_storage(8, 4, 32).expect("alloc");
     let dst = store
         .allocate(
             0x1,
@@ -1217,7 +1211,7 @@ fn render_composite_self_alias() {
     engine
         .put_image(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Dst::server_internal(dst),
             vk::Offset2D::default(),
             vk::Extent2D {
@@ -1232,7 +1226,7 @@ fn render_composite_self_alias() {
     engine
         .render_composite(
             &mut store,
-            &mut platform,
+            &mut gpu,
             3, // Over
             ResolvedSource::Drawable(SourceDrawable::whole(dst)),
             ResolvedSource::None,
@@ -1258,7 +1252,7 @@ fn render_composite_self_alias() {
     let after = engine
         .get_image(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Src::server_internal(dst),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -1275,7 +1269,7 @@ fn render_composite_self_alias() {
         "Over(self, NoMask, self) must equal self bit-identical",
     );
 
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut gpu);
 }
 
 #[test]
@@ -1283,15 +1277,15 @@ fn render_composite_self_alias() {
 fn render_fill_rectangles_src_clears_to_color() {
     // render_fill_rectangles(op=Src, premul colour) — every
     // pixel in the rect must equal the premul colour.
-    let Some(mut platform) = live_platform() else {
+    let Some(mut gpu) = live_gpu() else {
         eprintln!("no Vk — skipping");
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&gpu).expect("engine");
 
     let dst = alloc_filled_pixmap(
-        &mut platform,
+        &mut gpu,
         &mut store,
         &mut engine,
         0x1,
@@ -1302,7 +1296,7 @@ fn render_fill_rectangles_src_clears_to_color() {
     let stats = engine
         .render_fill_rectangles(
             &mut store,
-            &mut platform,
+            &mut gpu,
             1,                    // Src
             [1.0, 0.0, 0.0, 1.0], // RGBA: opaque red premul
             Dst::server_internal(dst),
@@ -1314,7 +1308,7 @@ fn render_fill_rectangles_src_clears_to_color() {
     let out = engine
         .get_image(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Src::server_internal(dst),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -1330,7 +1324,7 @@ fn render_fill_rectangles_src_clears_to_color() {
     for px in out.chunks_exact(4) {
         assert_eq!(&px[..4], &[0x00, 0x00, 0xFF, 0xFF]);
     }
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut gpu);
 }
 
 // ── Stage 3e.2 decoder + degenerate-trap unit tests ─────────
@@ -1442,16 +1436,14 @@ fn triangle_to_trap_degenerate() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn fill_rect_batch_one_submit_for_n_rects() {
-    let Some(mut platform) = live_platform() else {
+    let Some(mut gpu) = live_gpu() else {
         eprintln!("no VkContext available — skipping");
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&gpu).expect("engine");
 
-    let storage = platform
-        .allocate_drawable_storage(16, 4, 32)
-        .expect("alloc");
+    let storage = gpu.allocate_drawable_storage(16, 4, 32).expect("alloc");
     let id = store
         .allocate(
             0x1,
@@ -1469,7 +1461,7 @@ fn fill_rect_batch_one_submit_for_n_rects() {
     engine
         .fill_rect(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Dst::server_internal(id),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -1487,12 +1479,12 @@ fn fill_rect_batch_one_submit_for_n_rects() {
     // fill_rect is followed by a different op that closes the frame.
     // After close + flush, the blue-prefill SubmittedOp is in submitted.
     engine
-        .close_open_frame_for_timeout_for_tests(&mut store, &mut platform)
+        .close_open_frame_for_timeout_for_tests(&mut store, &mut gpu)
         .expect("close blue-prefill frame");
     engine
         .flush_submit_group(
             &mut store,
-            &mut platform,
+            &mut gpu,
             crate::kms::render::submit_group::FlushReason::SyncBoundary,
         )
         .expect("setup flush");
@@ -1530,24 +1522,18 @@ fn fill_rect_batch_one_submit_for_n_rects() {
         },
     ];
     engine
-        .fill_rect_batch(
-            &mut store,
-            &mut platform,
-            Dst::server_internal(id),
-            red,
-            &rects,
-        )
+        .fill_rect_batch(&mut store, &mut gpu, Dst::server_internal(id), red, &rects)
         .expect("fill_rect_batch");
 
     // Phase B.3: close the open frame (red batch) before asserting
     // the SubmittedOp count — the op is now frame-resident until close.
     engine
-        .close_open_frame_for_timeout_for_tests(&mut store, &mut platform)
+        .close_open_frame_for_timeout_for_tests(&mut store, &mut gpu)
         .expect("close red-batch frame");
     engine
         .flush_submit_group(
             &mut store,
-            &mut platform,
+            &mut gpu,
             crate::kms::render::submit_group::FlushReason::SyncBoundary,
         )
         .expect("flush before count assertion");
@@ -1567,7 +1553,7 @@ fn fill_rect_batch_one_submit_for_n_rects() {
     let out = engine
         .get_image(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Src::server_internal(id),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -1606,7 +1592,7 @@ fn fill_rect_batch_one_submit_for_n_rects() {
         }
     }
 
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut gpu);
 }
 
 /// X11 Render PictFormat fix — resolver-level oracle.

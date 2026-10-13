@@ -10,14 +10,14 @@ use crate::kms::{
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn depth32_put_image_get_image_round_trip() {
-    let Some(mut platform) = live_platform() else {
+    let Some(mut gpu) = live_gpu() else {
         eprintln!("no VkContext available — skipping");
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&gpu).expect("engine");
 
-    let storage = platform
+    let storage = gpu
         .allocate_drawable_storage(8, 8, 32)
         .expect("alloc storage");
     let id = store
@@ -44,7 +44,7 @@ fn depth32_put_image_get_image_round_trip() {
     engine
         .put_image(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Dst::server_internal(id),
             vk::Offset2D { x: 0, y: 0 },
             vk::Extent2D {
@@ -59,7 +59,7 @@ fn depth32_put_image_get_image_round_trip() {
     let out = engine
         .get_image(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Src::server_internal(id),
             vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
@@ -73,20 +73,20 @@ fn depth32_put_image_get_image_round_trip() {
         .expect("get_image");
     assert_eq!(out, src, "depth-32 round-trip must be byte-identical");
 
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut gpu);
 }
 
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn fill_then_get_image_observes_clear_color() {
-    let Some(mut platform) = live_platform() else {
+    let Some(mut gpu) = live_gpu() else {
         eprintln!("no VkContext available — skipping");
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&gpu).expect("engine");
 
-    let storage = platform.allocate_drawable_storage(4, 4, 32).expect("alloc");
+    let storage = gpu.allocate_drawable_storage(4, 4, 32).expect("alloc");
     let id = store
         .allocate(
             0x1,
@@ -102,7 +102,7 @@ fn fill_then_get_image_observes_clear_color() {
     engine
         .fill_rect(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Dst::server_internal(id),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -118,7 +118,7 @@ fn fill_then_get_image_observes_clear_color() {
     let out = engine
         .get_image(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Src::server_internal(id),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -138,7 +138,7 @@ fn fill_then_get_image_observes_clear_color() {
         assert_eq!(px[3], 0xFF, "A");
     }
 
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut gpu);
 }
 
 /// `fill_rect` must write the source byte into `R8_UNORM`
@@ -147,14 +147,14 @@ fn fill_then_get_image_observes_clear_color() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn fill_depth8_observes_r8_source_byte() {
-    let Some(mut platform) = live_platform() else {
+    let Some(mut gpu) = live_gpu() else {
         eprintln!("no VkContext available — skipping");
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&gpu).expect("engine");
 
-    let storage = platform.allocate_drawable_storage(4, 4, 8).expect("alloc");
+    let storage = gpu.allocate_drawable_storage(4, 4, 8).expect("alloc");
     let id = store
         .allocate(
             0x1,
@@ -169,7 +169,7 @@ fn fill_depth8_observes_r8_source_byte() {
     engine
         .fill_rect(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Dst::server_internal(id),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -185,7 +185,7 @@ fn fill_depth8_observes_r8_source_byte() {
     let out = engine
         .get_image(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Src::server_internal(id),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -201,7 +201,7 @@ fn fill_depth8_observes_r8_source_byte() {
         assert_eq!(b, 0x01, "R8 fill must preserve the source byte");
     }
 
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut gpu);
 }
 
 /// Stage 3f.2: `engine.logic_fill` applies the per-`GcFunction`
@@ -214,15 +214,15 @@ fn fill_depth8_observes_r8_source_byte() {
 fn logic_fill_xor_applies_per_pixel() {
     use yserver_core::backend::GcFunction;
 
-    let Some(mut platform) = live_platform() else {
+    let Some(mut gpu) = live_gpu() else {
         eprintln!("no VkContext available — skipping");
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&gpu).expect("engine");
 
     // 4x4 BGRA8 pixmap. Store BGRA wire bytes B, G, R, A.
-    let storage = platform.allocate_drawable_storage(4, 4, 24).expect("alloc");
+    let storage = gpu.allocate_drawable_storage(4, 4, 24).expect("alloc");
     let id = store
         .allocate(
             0x1,
@@ -244,7 +244,7 @@ fn logic_fill_xor_applies_per_pixel() {
     engine
         .put_image(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Dst::server_internal(id),
             vk::Offset2D::default(),
             vk::Extent2D {
@@ -271,7 +271,7 @@ fn logic_fill_xor_applies_per_pixel() {
     engine
         .logic_fill(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Dst::server_internal(id),
             GcFunction::Xor,
             /* opaque_alpha */ true,
@@ -283,7 +283,7 @@ fn logic_fill_xor_applies_per_pixel() {
     let out = engine
         .get_image(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Src::server_internal(id),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -306,21 +306,21 @@ fn logic_fill_xor_applies_per_pixel() {
         assert_eq!(px[3], 0xFF, "A preserved by opaque_alpha mask");
     }
 
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut gpu);
 }
 
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn copy_area_disjoint_pixmaps_round_trip() {
-    let Some(mut platform) = live_platform() else {
+    let Some(mut gpu) = live_gpu() else {
         eprintln!("no VkContext available — skipping");
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&gpu).expect("engine");
 
-    let storage_src = platform.allocate_drawable_storage(4, 4, 32).unwrap();
-    let storage_dst = platform.allocate_drawable_storage(8, 4, 32).unwrap();
+    let storage_src = gpu.allocate_drawable_storage(4, 4, 32).unwrap();
+    let storage_dst = gpu.allocate_drawable_storage(8, 4, 32).unwrap();
     let src = store
         .allocate(
             0x1,
@@ -345,7 +345,7 @@ fn copy_area_disjoint_pixmaps_round_trip() {
     engine
         .fill_rect(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Dst::server_internal(src),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -362,7 +362,7 @@ fn copy_area_disjoint_pixmaps_round_trip() {
     engine
         .fill_rect(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Dst::server_internal(dst),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -378,7 +378,7 @@ fn copy_area_disjoint_pixmaps_round_trip() {
     engine
         .copy_area(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Src::server_internal(src),
             Dst::server_internal(dst),
             vk::Rect2D {
@@ -395,7 +395,7 @@ fn copy_area_disjoint_pixmaps_round_trip() {
     let out = engine
         .get_image(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Src::server_internal(dst),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -422,7 +422,7 @@ fn copy_area_disjoint_pixmaps_round_trip() {
         }
     }
 
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut gpu);
 }
 
 #[test]
@@ -430,16 +430,14 @@ fn copy_area_disjoint_pixmaps_round_trip() {
 fn logic_fill_depth32_preserves_wire_alpha_when_not_opaque() {
     use yserver_core::backend::GcFunction;
 
-    let Some(mut platform) = live_platform() else {
+    let Some(mut gpu) = live_gpu() else {
         eprintln!("no VkContext available — skipping");
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&gpu).expect("engine");
 
-    let storage = platform
-        .allocate_drawable_storage(2, 2, 32)
-        .expect("storage");
+    let storage = gpu.allocate_drawable_storage(2, 2, 32).expect("storage");
     let id = store
         .allocate(
             0x1,
@@ -453,7 +451,7 @@ fn logic_fill_depth32_preserves_wire_alpha_when_not_opaque() {
     engine
         .fill_rect(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Dst::server_internal(id),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -469,7 +467,7 @@ fn logic_fill_depth32_preserves_wire_alpha_when_not_opaque() {
     engine
         .logic_fill(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Dst::server_internal(id),
             GcFunction::Copy,
             /* opaque_alpha */ false,
@@ -486,7 +484,7 @@ fn logic_fill_depth32_preserves_wire_alpha_when_not_opaque() {
     let out = engine
         .get_image(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Src::server_internal(id),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -503,7 +501,7 @@ fn logic_fill_depth32_preserves_wire_alpha_when_not_opaque() {
         assert_eq!(px, &[0x01, 0x00, 0x00, 0x00]);
     }
 
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut gpu);
 }
 
 #[test]
@@ -511,16 +509,14 @@ fn logic_fill_depth32_preserves_wire_alpha_when_not_opaque() {
 fn logic_fill_r8_not_family_matches_x11_bytes() {
     use yserver_core::backend::GcFunction;
 
-    let Some(mut platform) = live_platform() else {
+    let Some(mut gpu) = live_gpu() else {
         eprintln!("no VkContext available — skipping");
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&gpu).expect("engine");
 
-    let storage = platform
-        .allocate_drawable_storage(2, 1, 8)
-        .expect("storage");
+    let storage = gpu.allocate_drawable_storage(2, 1, 8).expect("storage");
     let id = store
         .allocate(
             0x1,
@@ -536,7 +532,7 @@ fn logic_fill_r8_not_family_matches_x11_bytes() {
     engine
         .put_image(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Dst::server_internal(id),
             vk::Offset2D::default(),
             vk::Extent2D {
@@ -558,7 +554,7 @@ fn logic_fill_r8_not_family_matches_x11_bytes() {
     engine
         .logic_fill(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Dst::server_internal(id),
             GcFunction::Set,
             /* opaque_alpha */ true,
@@ -569,7 +565,7 @@ fn logic_fill_r8_not_family_matches_x11_bytes() {
     let out = engine
         .get_image(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Src::server_internal(id),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -586,7 +582,7 @@ fn logic_fill_r8_not_family_matches_x11_bytes() {
     engine
         .put_image(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Dst::server_internal(id),
             vk::Offset2D::default(),
             vk::Extent2D {
@@ -600,7 +596,7 @@ fn logic_fill_r8_not_family_matches_x11_bytes() {
     engine
         .logic_fill(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Dst::server_internal(id),
             GcFunction::Invert,
             /* opaque_alpha */ true,
@@ -611,7 +607,7 @@ fn logic_fill_r8_not_family_matches_x11_bytes() {
     let out = engine
         .get_image(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Src::server_internal(id),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -625,7 +621,7 @@ fn logic_fill_r8_not_family_matches_x11_bytes() {
         .expect("get_image invert");
     assert_eq!(&out[..2], &[0xff, 0xfc], "GXinvert must flip all 8 bits");
 
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut gpu);
 }
 
 // GPU-level regression for the MATE compositor slow-drag-left shadow
@@ -640,15 +636,15 @@ fn logic_fill_r8_not_family_matches_x11_bytes() {
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn copy_area_negative_offset_copies_trailing_strip() {
-    let Some(mut platform) = live_platform() else {
+    let Some(mut gpu) = live_gpu() else {
         eprintln!("no VkContext available — skipping");
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&gpu).expect("engine");
 
-    let storage_src = platform.allocate_drawable_storage(8, 4, 32).unwrap();
-    let storage_dst = platform.allocate_drawable_storage(8, 4, 32).unwrap();
+    let storage_src = gpu.allocate_drawable_storage(8, 4, 32).unwrap();
+    let storage_dst = gpu.allocate_drawable_storage(8, 4, 32).unwrap();
     let src = store
         .allocate(
             0x1,
@@ -680,7 +676,7 @@ fn copy_area_negative_offset_copies_trailing_strip() {
     engine
         .fill_rect(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Dst::server_internal(src),
             full8x4,
             red,
@@ -689,7 +685,7 @@ fn copy_area_negative_offset_copies_trailing_strip() {
     engine
         .fill_rect(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Dst::server_internal(dst),
             full8x4,
             blue,
@@ -701,7 +697,7 @@ fn copy_area_negative_offset_copies_trailing_strip() {
     engine
         .copy_area(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Src::server_internal(src),
             Dst::server_internal(dst),
             vk::Rect2D {
@@ -716,13 +712,7 @@ fn copy_area_negative_offset_copies_trailing_strip() {
         .unwrap();
 
     let out = engine
-        .get_image(
-            &mut store,
-            &mut platform,
-            Src::server_internal(dst),
-            full8x4,
-            32,
-        )
+        .get_image(&mut store, &mut gpu, Src::server_internal(dst), full8x4, 32)
         .unwrap();
     for y in 0..4 {
         for x in 0..8 {
@@ -745,20 +735,20 @@ fn copy_area_negative_offset_copies_trailing_strip() {
         }
     }
 
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut gpu);
 }
 
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn copy_area_self_overlap_scratch_path() {
-    let Some(mut platform) = live_platform() else {
+    let Some(mut gpu) = live_gpu() else {
         eprintln!("no VkContext available — skipping");
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&gpu).expect("engine");
 
-    let storage = platform.allocate_drawable_storage(8, 1, 32).unwrap();
+    let storage = gpu.allocate_drawable_storage(8, 1, 32).unwrap();
     let id = store
         .allocate(
             0x1,
@@ -782,7 +772,7 @@ fn copy_area_self_overlap_scratch_path() {
     engine
         .put_image(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Dst::server_internal(id),
             vk::Offset2D::default(),
             vk::Extent2D {
@@ -797,7 +787,7 @@ fn copy_area_self_overlap_scratch_path() {
     engine
         .copy_area(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Src::server_internal(id),
             Dst::server_internal(id),
             vk::Rect2D {
@@ -814,7 +804,7 @@ fn copy_area_self_overlap_scratch_path() {
     let out = engine
         .get_image(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Src::server_internal(id),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -846,20 +836,20 @@ fn copy_area_self_overlap_scratch_path() {
         );
     }
 
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut gpu);
 }
 
 #[test]
 #[ignore = "needs live Vulkan ICD"]
 fn put_image_then_fill_overwrites() {
-    let Some(mut platform) = live_platform() else {
+    let Some(mut gpu) = live_gpu() else {
         eprintln!("no VkContext available — skipping");
         return;
     };
     let mut store = DrawableStore::new();
-    let mut engine = RenderEngine::new(&platform).expect("engine");
+    let mut engine = RenderEngine::new(&gpu).expect("engine");
 
-    let storage = platform.allocate_drawable_storage(4, 4, 32).expect("alloc");
+    let storage = gpu.allocate_drawable_storage(4, 4, 32).expect("alloc");
     let id = store
         .allocate(
             0x1,
@@ -876,7 +866,7 @@ fn put_image_then_fill_overwrites() {
     engine
         .put_image(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Dst::server_internal(id),
             vk::Offset2D::default(),
             vk::Extent2D {
@@ -891,7 +881,7 @@ fn put_image_then_fill_overwrites() {
     engine
         .fill_rect(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Dst::server_internal(id),
             vk::Rect2D {
                 offset: vk::Offset2D { x: 1, y: 1 },
@@ -907,7 +897,7 @@ fn put_image_then_fill_overwrites() {
     let out = engine
         .get_image(
             &mut store,
-            &mut platform,
+            &mut gpu,
             Src::server_internal(id),
             vk::Rect2D {
                 offset: vk::Offset2D::default(),
@@ -928,7 +918,7 @@ fn put_image_then_fill_overwrites() {
     let off_3_3 = (3 * 4 + 3) * 4;
     assert_eq!(&out[off_3_3..off_3_3 + 4], &[0xFF, 0x00, 0x00, 0xFF]);
 
-    engine.drain_all(&mut platform);
+    engine.drain_all(&mut gpu);
 }
 
 #[test]

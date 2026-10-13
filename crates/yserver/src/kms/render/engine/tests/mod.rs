@@ -711,7 +711,7 @@ mod session {
 // The Stage 2 acceptance harness (Stage 2f) folds these into
 // the synthetic acceptance binary.
 
-fn live_platform() -> Option<GpuCore> {
+fn live_gpu() -> Option<GpuCore> {
     // Tests need a VkContext-only fixture: no DRM device, so not
     // `PlatformBackend::open_with_commit`.
     GpuCore::for_tests_with_vk()
@@ -719,7 +719,7 @@ fn live_platform() -> Option<GpuCore> {
 
 /// Alias of `live_platform` used by Task 3 tests.
 fn try_for_tests_with_vk() -> Option<GpuCore> {
-    live_platform()
+    live_gpu()
 }
 
 /// Task 4 test helper: drive N `render_composite` (OP_OVER,
@@ -733,7 +733,7 @@ fn try_for_tests_with_vk() -> Option<GpuCore> {
 fn drive_render_composite_same_key_for_tests(
     engine: &mut RenderEngine,
     store: &mut DrawableStore,
-    platform: &mut GpuCore,
+    gpu: &mut GpuCore,
     dst: DrawableId,
     src: DrawableId,
     rects: &[(i32, i32, u32, u32)],
@@ -753,7 +753,7 @@ fn drive_render_composite_same_key_for_tests(
         engine
             .render_composite(
                 store,
-                platform,
+                gpu,
                 OP_OVER,
                 ResolvedSource::Drawable(SourceDrawable::whole(src)),
                 ResolvedSource::None,
@@ -778,14 +778,14 @@ fn drive_render_composite_same_key_for_tests(
 /// Helper: allocate a depth-32 storage and return a registered
 /// DrawableId. Mirrors the pattern Stage 2c tests use.
 fn alloc_drawable_3a(
-    platform: &GpuCore,
+    gpu: &GpuCore,
     store: &mut DrawableStore,
     xid: u32,
     w: u16,
     h: u16,
 ) -> DrawableId {
     alloc_drawable_3a_with_kind(
-        platform,
+        gpu,
         store,
         xid,
         w,
@@ -796,7 +796,7 @@ fn alloc_drawable_3a(
 }
 
 fn alloc_drawable_3a_with_kind(
-    platform: &GpuCore,
+    gpu: &GpuCore,
     store: &mut DrawableStore,
     xid: u32,
     w: u16,
@@ -804,7 +804,7 @@ fn alloc_drawable_3a_with_kind(
     kind: crate::kms::render::store::DrawableKind,
     scene_participating: bool,
 ) -> DrawableId {
-    let storage = platform
+    let storage = gpu
         .allocate_drawable_storage(w, h, 32)
         .expect("alloc storage");
     store

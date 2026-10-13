@@ -111,13 +111,13 @@ impl RenderEngine {
     /// - `Vk(...)` for any underlying Vk failure during pipeline
     ///   cache / scratch image / readback construction or the
     ///   one-shot white-clear submit.
-    pub(super) fn ensure_render_assets(&mut self, platform: &GpuCore) -> Result<(), RenderError> {
+    pub(super) fn ensure_render_assets(&mut self, gpu: &GpuCore) -> Result<(), RenderError> {
         use crate::kms::vk::render_pipeline::record_solid_color_clear;
 
         let Some(inner) = self.inner.as_mut() else {
             return Err(RenderError::NoVk);
         };
-        if platform.renderer_failed {
+        if gpu.renderer_failed {
             return Err(RenderError::RendererFailed);
         }
 
@@ -150,7 +150,7 @@ impl RenderEngine {
         // seeded its image to SHADER_READ_ONLY via a one-shot clear;
         // mirror that for solid_src/solid_mask. Cost: two extra
         // synchronous submits at engine init.
-        let pool_for_init_clears = platform.ops_command_pool_handle().ok_or_else(|| {
+        let pool_for_init_clears = gpu.ops_command_pool_handle().ok_or_else(|| {
             log::error!(
                 "render ensure_render_assets: no ops_command_pool for solid-image init clears"
             );
@@ -293,7 +293,7 @@ impl RenderEngine {
     /// - `NoVk` on the stub engine.
     /// - `UnknownDrawable` if `dst_id` is missing from `store`.
     /// - `Vk(...)` for any underlying pipeline / submit failure.
-    /// - `RendererFailed` when `platform.renderer_failed`.
+    /// - `RendererFailed` when `gpu.renderer_failed`.
     ///
     /// Out-of-scope gating (unknown op, gradient source, mask
     /// self-alias, unsupported dst format) returns `Ok` with
@@ -303,7 +303,7 @@ impl RenderEngine {
     pub(crate) fn render_composite(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut GpuCore,
+        gpu: &mut GpuCore,
         op: u8,
         src: ResolvedSource,
         mask: ResolvedSource,
@@ -353,13 +353,13 @@ impl RenderEngine {
         if src_is_redirect_backing {
             self.close_open_frame(
                 store,
-                platform,
+                gpu,
                 crate::kms::render::frame_builder::CloseReason::RedirectSourceBoundary,
             )?;
         }
         let stats = self.render_composite_via_frame_builder(
             store,
-            platform,
+            gpu,
             op,
             src,
             mask,
@@ -378,7 +378,7 @@ impl RenderEngine {
         if src_is_redirect_backing {
             self.close_open_frame(
                 store,
-                platform,
+                gpu,
                 crate::kms::render::frame_builder::CloseReason::RedirectSourceBoundary,
             )?;
         }
@@ -413,7 +413,7 @@ impl RenderEngine {
     fn render_composite_via_frame_builder(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut GpuCore,
+        gpu: &mut GpuCore,
         op: u8,
         src: ResolvedSource,
         mask: ResolvedSource,
@@ -440,11 +440,11 @@ impl RenderEngine {
         // (0) Flush pre-existing cow/render batches so they submit
         //     under their own (per-op) ticket before this call opens a
         //     frame.
-        self.flush_render_batch(store, platform, RenderFlushReason::Other)?;
+        self.flush_render_batch(store, gpu, RenderFlushReason::Other)?;
 
         // (1) Lazy-init RENDER assets (pipelines, solid 1x1 images,
         //     scratch slots).
-        self.ensure_render_assets(platform)?;
+        self.ensure_render_assets(gpu)?;
 
         // (2) PHASE 9A — scratch peek + close-on-grow. NO state
         //     mutation yet (beyond the assets ensure above which is
@@ -454,7 +454,7 @@ impl RenderEngine {
         //     is released before any later `as_mut()` re-borrow.
         let (dst_image, dst_view, dst_extent, dst_format, dst_depth) = {
             let _inner = self.inner.as_ref().ok_or(RenderError::NoVk)?;
-            if platform.renderer_failed {
+            if gpu.renderer_failed {
                 return Err(RenderError::RendererFailed);
             }
             let d = store
@@ -532,7 +532,7 @@ impl RenderEngine {
         } {
             self.close_open_frame(
                 store,
-                platform,
+                gpu,
                 crate::kms::render::frame_builder::CloseReason::ScratchGrow,
             )?;
         }
@@ -594,7 +594,7 @@ impl RenderEngine {
             // Release the inner borrow before calling the platform
             // method which doesn't need it.
             let _ = inner;
-            let ticket = platform.submit_group_ticket_or_open()?;
+            let ticket = gpu.submit_group_ticket_or_open()?;
             let inner = self.inner.as_mut().expect("inner");
             inner.acquire_generation = inner.acquire_generation.saturating_add(1);
             let frame_generation = inner.acquire_generation;
@@ -1107,7 +1107,7 @@ impl RenderEngine {
     pub(crate) fn render_fill_rectangles(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut GpuCore,
+        gpu: &mut GpuCore,
         op: u8,
         color: [f32; 4],
         dst: Dst,
@@ -1122,7 +1122,7 @@ impl RenderEngine {
         // frame.
         self.render_composite(
             store,
-            platform,
+            gpu,
             op,
             ResolvedSource::Solid(color),
             ResolvedSource::None,

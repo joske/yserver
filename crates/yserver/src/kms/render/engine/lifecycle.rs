@@ -157,10 +157,10 @@ impl RenderEngine {
     ///
     /// # Errors
     ///
-    /// Returns `NoVk` if `platform` was built via `for_tests`
+    /// Returns `NoVk` if `gpu` was built via `for_tests`
     /// (no Vk). Production paths always have Vk.
-    pub(crate) fn new(platform: &GpuCore) -> Result<Self, RenderError> {
-        let vk = platform.vk().ok_or(RenderError::NoVk)?.clone();
+    pub(crate) fn new(gpu: &GpuCore) -> Result<Self, RenderError> {
+        let vk = gpu.vk().ok_or(RenderError::NoVk)?.clone();
         // SAFETY: `physical_device` belongs to `instance`.
         let limits = unsafe {
             vk.instance
@@ -230,11 +230,11 @@ impl RenderEngine {
     /// Walk `submitted`, dropping entries whose [`FenceTicket`]
     /// has signaled. Their CB is freed and any staging buffer
     /// destroyed.
-    pub(crate) fn poll_retired(&mut self, platform: &GpuCore) {
+    pub(crate) fn poll_retired(&mut self, gpu: &GpuCore) {
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
-        let Some(pool) = platform.ops_command_pool_handle() else {
+        let Some(pool) = gpu.ops_command_pool_handle() else {
             return;
         };
         let device = &inner.vk.device;
@@ -393,15 +393,15 @@ impl RenderEngine {
     ///
     /// Test call sites that construct a fresh engine/platform/store
     /// and never open a frame can keep using `drain_all` directly.
-    pub(crate) fn shutdown(&mut self, store: &mut DrawableStore, platform: &mut GpuCore) {
+    pub(crate) fn shutdown(&mut self, store: &mut DrawableStore, gpu: &mut GpuCore) {
         if let Err(e) = self.close_open_frame(
             store,
-            platform,
+            gpu,
             crate::kms::render::frame_builder::CloseReason::Shutdown,
         ) {
             log::warn!("render shutdown: close_open_frame failed: {e:?}");
         }
-        self.drain_all(platform);
+        self.drain_all(gpu);
     }
 
     /// Drain every in-flight submit, waiting on the deepest
@@ -415,7 +415,7 @@ impl RenderEngine {
     /// already satisfies this. Any open batch that reaches here is
     /// dropped with a warning to avoid a non-empty/no-ticket panic
     /// on `flush_submit_group(Shutdown)`.
-    pub(crate) fn drain_all(&mut self, platform: &mut GpuCore) {
+    pub(crate) fn drain_all(&mut self, gpu: &mut GpuCore) {
         // Drop any open render batch that reached us without being
         // flushed. This should never happen when called from the
         // production code path (disable_output closes batches first),
@@ -435,15 +435,15 @@ impl RenderEngine {
         // Flush any open SubmitGroup first; this commits parked ops
         // into `submitted` so the loop below sees the right set.
         //
-        // GLX-TFP: this shutdown flush drives `platform.flush_submit_group`
+        // GLX-TFP: this shutdown flush drives `gpu.flush_submit_group`
         // directly (no exported-write publish): at drain_all the engine
         // has no `store` borrow, and the GL consumer is going away, so
         // re-publishing write fences here is pointless. The engine's
         // commit-of-parked-ops bookkeeping below is replicated from the
         // `flush_submit_group` wrapper.
         let result =
-            platform.flush_submit_group(crate::kms::render::submit_group::FlushReason::Shutdown);
-        if let Some(outcome) = platform.take_last_flush_outcome()
+            gpu.flush_submit_group(crate::kms::render::submit_group::FlushReason::Shutdown);
+        if let Some(outcome) = gpu.take_last_flush_outcome()
             && let Some(inner) = self.inner.as_mut()
         {
             inner.pending_flush_outcomes.push(outcome);
@@ -465,7 +465,7 @@ impl RenderEngine {
         let Some(inner) = self.inner.as_mut() else {
             return;
         };
-        let Some(pool) = platform.ops_command_pool_handle() else {
+        let Some(pool) = gpu.ops_command_pool_handle() else {
             return;
         };
         let device = &inner.vk.device;
@@ -593,13 +593,13 @@ impl RenderEngine {
     pub(crate) fn create_pixmap(
         &self,
         store: &mut DrawableStore,
-        platform: &mut GpuCore,
+        gpu: &mut GpuCore,
         xid: u32,
         w: u16,
         h: u16,
         depth: u8,
     ) -> Result<DrawableId, RenderError> {
-        let storage = platform
+        let storage = gpu
             .allocate_drawable_storage(w, h, depth)
             .map_err(RenderError::Vk)?;
         store

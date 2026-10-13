@@ -35,7 +35,7 @@ impl RenderEngine {
     pub(crate) fn masked_copy_area_with_snapshot_for_tests(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut GpuCore,
+        gpu: &mut GpuCore,
         src: DrawableId,
         dst: DrawableId,
         sid: SnapshotId,
@@ -59,7 +59,7 @@ impl RenderEngine {
         };
         self.masked_copy_area(
             store,
-            platform,
+            gpu,
             Src::server_internal(src),
             Dst::server_internal(dst),
             src_pos,
@@ -166,7 +166,7 @@ impl RenderEngine {
     pub(crate) fn close_open_frame_for_timeout_for_tests(
         &mut self,
         store: &mut DrawableStore,
-        platform: &mut GpuCore,
+        gpu: &mut GpuCore,
     ) -> Result<(), RenderError> {
         if !self
             .inner
@@ -177,7 +177,7 @@ impl RenderEngine {
         }
         match self.close_open_frame(
             store,
-            platform,
+            gpu,
             crate::kms::render::frame_builder::CloseReason::Timeout,
         )? {
             crate::kms::render::frame_builder::CloseOutcome::Submitted { .. }

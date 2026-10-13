@@ -226,7 +226,7 @@ impl Drop for FenceTicketInner {
             } else {
                 log::error!(
                     "FenceTicket: leaked unsignaled fence {:?} on drop \
-                     — renderer_failed will be set on next platform access",
+                     — renderer_failed will be set on next gpu access",
                     self.fence,
                 );
             }
