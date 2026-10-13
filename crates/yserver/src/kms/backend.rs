@@ -11,14 +11,12 @@
 //!   delegates into.
 //! - Wire-byte helpers (`read_i16_pair`, `read_rect`) consumed by v2's
 //!   poly_* dispatch.
-//! - Rasterisation helpers (`bresenham_segment`,
-//!   `scanline_fill_polygon`, `clip_rects_to_image`) consumed by v2's
-//!   poly_line / poly_segment / poly_arc / fill_poly lowering.
+//! - `clip_rects_to_image`, consumed by v2's poly_line / poly_segment /
+//!   poly_arc / fill_poly lowering. The other rasterisation and RENDER
+//!   affine helpers live in `kms::render::geometry` and are re-exported
+//!   here.
 //! - SHAPE / clip-mask helpers (`ClipMaskCache`,
 //!   `rasterize_pixmap_mask_to_rects`) consumed by v2's GC clip path.
-//! - RENDER affine helpers (`compose_affines`,
-//!   `pixman_transform_to_affine`, `repeat_to_shader_const`) consumed
-//!   by v2's render_composite / render_traps_or_tris.
 //! - `parse_add_glyphs` — RENDER AddGlyphs wire decode, consumed by
 //!   v2's render_add_glyphs.
 //!

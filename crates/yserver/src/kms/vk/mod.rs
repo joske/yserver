@@ -21,7 +21,6 @@ pub mod logic_fill_pipeline;
 pub mod mask_scratch;
 pub(crate) mod masked_blit_pipeline;
 pub mod mem_accounting;
-pub mod memory;
 pub mod ops;
 pub mod pipeline;
 pub mod pixmap_pool;
