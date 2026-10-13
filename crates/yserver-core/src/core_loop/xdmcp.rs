@@ -734,6 +734,19 @@ mod tests {
         generations: GenerationCounter,
     }
 
+    /// Block until the service socket holds a datagram. A datagram just
+    /// sent over loopback is not readable at once on every OS (FreeBSD),
+    /// so reading straight away would race the test's own send.
+    fn await_datagram(service: &XdmcpService) {
+        let socket = &service.socket;
+        socket.set_nonblocking(false).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let _ = socket.peek_from(&mut [0_u8; 1]);
+        socket.set_nonblocking(true).unwrap();
+    }
+
     impl Harness {
         /// Bind, start, and consume the first query. The returned harness
         /// is in `CollectQuery` with the manager knowing where to reply.
@@ -758,6 +771,7 @@ mod tests {
         }
 
         fn pump(&mut self) {
+            await_datagram(&self.service);
             let generation = self.now();
             self.service.handle_readable(&self.auth, generation);
         }
@@ -1041,12 +1055,14 @@ mod tests {
                 status: b"no".to_vec(),
             },
         );
+        await_datagram(&service);
         service.handle_readable(&auth, Generation::default());
         assert_eq!(service.state(), XdmcpState::CollectBroadcastQuery);
         assert_eq!(service.take_outcome(), None);
 
         let willing_manager = FakeManager::new();
         willing_manager.send(display, &willing());
+        await_datagram(&service);
         service.handle_readable(&auth, Generation::default());
         assert_eq!(service.state(), XdmcpState::AwaitRequestResponse);
         let (request, _) = willing_manager.expect("Request");
