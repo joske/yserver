@@ -237,6 +237,129 @@ without KMS is the natural follow-up, not part of 3b.
   is out of scope.
 - Of 3a's 23 test-only widenings, the 9 scene-only ones are reverted.
 
+## Execution
+
+Squash-merged (planned, as 3a): the hashes below are branch commits and will
+not exist on master; no blame-ignore entries.
+
+Branch `refactor/phase3b-scene-split`, 2026-10-13.
+
+### Commits by stage
+
+- Stage 1, prep:
+  - `372de98d` copied post-compose preparation kept in the target (2b).
+  - `67b4a8f2` unused parameters of `queue_steady_state_cursor_upload` dropped.
+  - `96ec1e7b` core state and output geometry read from a `SceneInput`.
+- Stage 2, the seam:
+  - `a6b84904` `OutputSink` / `CursorPlaneSink` defined, `PlatformBackend` implements both.
+  - `343c7733` GPU, frame slots and flip retirement through the sink.
+  - `da18be67` copied-route render completions through the sink.
+  - `1a9e279e` cursor plane through the sink (`CursorShowFailure`).
+  - `eaf47374` frame sequence in the sink's `finish_frame`.
+  - `181a989a` scene takes `&mut dyn OutputSink`.
+  - `9cac04bb` scene tests on a test sink.
+  - `1ea91930` scene comments name the sink, not the platform.
+- Stage 3, the move:
+  - `c8701fb8` protocol paths instead of `yserver-core` re-exports.
+  - `72bae306` `WindowGeometry` / `WindowsMap` → `kms::render::window_geometry`.
+  - `41e5ee52` the move.
+  - `3934db42` nine scene-test-only widenings narrowed back.
+  - `9092ee16` log-target hints in scene comments.
+  - this docs commit.
+
+### Deviations from the plan
+
+- Stage 1:
+  - `IntermediatePrimeTarget` (transform priming) is a fourth
+    `ComposeRenderTarget` implementor; it gets the 2b split too.
+  - `queue_steady_state_cursor_upload` had 8 unused parameters (the platform
+    borrow plus 7), not 7.
+  - `SceneInput` geometry is copied per call
+    (`PlatformBackend::scene_output_layouts()` → `Vec<OutputLayout>`): the
+    platform is borrowed `&mut` as the sink during the same call, so the
+    geometry can't be borrowed from it.
+  - `build_scene` keeps the cursor-plane `fits` query as a sink call, so the
+    59 `build_scene` tests use a test sink. A snapshot of `fits` would change
+    the semantics mid-tick.
+- Stage 2, the sink as implemented vs the plan table:
+  - Accessors come in pairs: `gpu`/`gpu_mut`, `cursor_plane`/`cursor_plane_mut`.
+  - Added `slot_count`.
+  - Added `check_frame_target`, so the device and pool errors keep their
+    place before acquisition.
+  - `recycle_failed_slots` is per slot (`recycle_failed_slot`).
+  - `compose_complete` is derived from the `ComposeSubmit` in `FinishOutcome`
+    (`FrameHandoff::FlipPending`), not set by the closure.
+  - The sink resolves render completions to an output index at drain time.
+  - `CopiedRenderSubmitError` stays KMS-side in `platform/scene_sink.rs`.
+  - `TestSink`'s answers were checked against a fresh
+    `PlatformBackend::for_tests()`.
+- Stage 3:
+  - Scene reached `yserver-core`, which render must not depend on.
+    `CrtcTransform` and `GcFunction::Xor` now use their `yserver-protocol`
+    paths. The three COW tests use a test-local `COMPOSITE_OVERLAY_WINDOW = 0x103`
+    (the value of the core constant; scene sees it only as `cow_host_xid`).
+  - The `test-support` cfg also covers the readers of the scene's two test
+    fields (`flip.rs`, `transform.rs`, `root_readback.rs`), so those branches
+    are compiled into `yserver`'s dev builds. They are inert unless a test sets
+    the field (3a's `THREAD_ALLOC_CALLS` precedent).
+  - 142 scene tests moved, not 143: `eaf47374` moved
+    `copied_renderer_acquire_failure_is_fail_stop_before_submit` to
+    `platform/scene_sink.rs` along with `CopiedRenderSubmitError`.
+
+### Numbers
+
+- Visibility (compiler-driven, to `pub`): 22 types/traits, 2 free fns,
+  36 methods/assoc fns, 50 fields, 2 glob re-exports (`build::*`, `sink::*`).
+  `test-support`: the 5 `for_tests.rs` hooks `yserver`'s tests call (with
+  helpers and imports), the `test_flip_in_flight_override` /
+  `test_prime_descriptor_sets` fields, their initialisers and readers.
+- Move diff: 12 of 24 files are byte-identical. Changed lines: visibility 109,
+  test-support cfg 35, rustfmt reflow of widened signatures 14 → 3, other 0.
+- Tests: 142 (1 ignored, `walk_bench`) moved from the `yserver` lib to
+  `yserver_render`. For each config (default, xdmcp, tcp-transport), normal
+  and `--ignored`, the union of test names equals the pre-move list.
+- 3a's test-only widenings:
+  - 9 reverted to `pub(crate)`: `Drawable::dormant`,
+    `Region::{contains, contains_rect, rect_count, union_with}`,
+    `ScenePresence::{region, signature}`,
+    `ScanoutDamage::{has_staged_frame, missing_area}`.
+  - 14 kept, follow-up. All are under `crates/yserver/src/kms/`:
+    - `Drawable::{presentation_damage, presentation_damage_epoch}`:
+      `render/backend/tests/paint_target.rs`.
+    - `DrawableStore::damage`: `render/backend/tests/{deadlines,paint_target}.rs`.
+    - `DrawableStore::mark_contents_modified`: `render/backend/tests/gc_draw.rs`.
+    - `Bucket::{frame_builder_close_reason_legacy_sc_compose,
+      frame_builder_close_reason_timeout}`: `render/backend/tests/deadlines.rs`.
+    - `Bucket::frame_builder_renders_per_frame_max_in_window`:
+      `render/backend/tests/misc.rs`.
+    - `Telemetry::frame_id`: `render/backend/tests/deadlines.rs`.
+    - `RenderEngine::try_append_render_batch`:
+      `render/backend/tests/render_picture.rs`.
+    - `bresenham_segment`: `render/backend/tests/gc_draw.rs`.
+    - `color_roles_to_bgra`: `render/backend/tests/cursor.rs`.
+    - `reduce_argb32_glyph_to_a8_coverage`: `backend.rs` (cfg(test)).
+    - `vk::target::{pick_export_memory_type, ExportMemoryPlacement}`:
+      `vk/scanout/copied/two_gpu_tests.rs`.
+- Lavapipe (`--workspace --features xdmcp --ignored`): 321. `yserver` lib 58,
+  `render_acceptance` 191, `glx_tfp_export` 10, `dri3_fd_leak` 1,
+  `yserver_render` lib 59, doctests 2 (`walk_bench` moved crates).
+
+### Acceptance (3b)
+
+- [x] `cargo tree -p yserver-render` (also `-e normal`): no `drm`, `gbm`,
+  `input`, `udev`, `yserver-core`. Render code names no `PlatformBackend`,
+  `ScanoutBo` or `crate::drm`; comments only.
+- [x] Per-commit gates: fmt, clippy ×3 configs, workspace tests default +
+  xdmcp; render alone (clippy `--all-targets`, `cargo test -p yserver-render`).
+- [x] Test mapping (stage 1 and the move).
+- [x] File-size ceilings: no non-test `.rs` over 5,000 lines, no test `.rs`
+  over 6,000. No new `target_os` gates.
+- [x] Lavapipe after the seam and after the move: 321.
+- [x] HW smoke of the seam (`1ea91930`), jos 2026-10-13: silence (XFCE with
+  Warframe and mpv; CDE) and eiger (Plasma).
+- [ ] FreeBSD CI: runs on the PR (not pushed yet).
+- [x] The 9 scene-only widenings reverted.
+
 ## Review log
 
 **Round 1 (codex, 2026-10-13):** direction accepted; 3a re-checked (clippy and
