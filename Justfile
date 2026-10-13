@@ -464,7 +464,7 @@ yserver-mate-hw-release-trace log="warn":
 #
 # Also writes a per-vkQueueSubmit2 TSV to `yserver-${session}.submit.tsv`
 # (Stage 5 Task 3 paint-aggregation diagnostic, see
-# crates/yserver/src/kms/render/submit_trace.rs). One row per submit:
+# crates/yserver-render/src/kms/render/submit_trace.rs). One row per submit:
 #   frame_id ns_mono kind target_kind target_id batch_size op \
 #   src_class mask_class pipeline_id readback alias zero_draws upload
 # Quick analyses:
@@ -572,7 +572,7 @@ yserver-mate-hw-vkdebug log="trace":
 # Arguments are positional, as everywhere here:
 #     just yserver-mate-hw-workload ~/clip.mp4          # ~90s, measure
 #     just yserver-mate-hw-workload ~/clip.mp4 0.2      # ~20s, smoke
-yserver-mate-hw-workload clip scale="1" log="warn,yserver::startup=info,yserver::kms::render::telemetry=info":
+yserver-mate-hw-workload clip scale="1" log="warn,yserver::startup=info,yserver_render::kms::render::telemetry=info":
     RUSTFLAGS="-C debug-assertions=yes" cargo build --release --bin yserver
     bash -c '\
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
@@ -788,7 +788,7 @@ yserver-e16-xterm-hw-trace log="debug":
 # For numbers comparable to the awesome/MATE runs, use the phased
 # `yserver-e16-hw-workload` below instead — a hand-driven session's content
 # load dominates and is not reproducible.
-yserver-e16-hw-telemetry log="warn,yserver::startup=info,yserver::kms::render::telemetry=info":
+yserver-e16-hw-telemetry log="warn,yserver::startup=info,yserver_render::kms::render::telemetry=info":
     RUSTFLAGS="-C debug-assertions=yes" cargo build --release --bin yserver
     bash -c '\
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
@@ -837,7 +837,7 @@ yserver-e16-hw-telemetry log="warn,yserver::startup=info,yserver::kms::render::t
 # then compare with
 #     tools/damage-phases.py <before>-telemetry.log <before>-phases.log \
 #                            <after>-telemetry.log  <after>-phases.log
-yserver-e16-hw-workload clip scale="1" bin="" log="warn,yserver::startup=info,yserver::kms::render::telemetry=info":
+yserver-e16-hw-workload clip scale="1" bin="" log="warn,yserver::startup=info,yserver_render::kms::render::telemetry=info":
     #!/usr/bin/env bash
     set -euo pipefail
     server='{{ bin }}'
@@ -1208,7 +1208,7 @@ yserver-awesome-hw-telemetry log="info":
 #     just yserver-awesome-hw-workload ~/clip.mp4 0.2      # ~20s, smoke the recipe
 # `clip` must be a video file. `scale` multiplies every phase duration; keep it
 # identical between the two branches being compared.
-yserver-awesome-hw-workload clip scale="1" log="warn,yserver::startup=info,yserver::kms::render::telemetry=info":
+yserver-awesome-hw-workload clip scale="1" log="warn,yserver::startup=info,yserver_render::kms::render::telemetry=info":
     RUSTFLAGS="-C debug-assertions=yes" cargo build --release --bin yserver
     bash -c '\
         unset WAYLAND_DISPLAY WAYLAND_SOCKET;\
