@@ -16,6 +16,7 @@ pub(crate) mod descriptor_pool_ring;
 pub(crate) mod engine;
 pub(crate) mod export_holders;
 pub(crate) mod frame_builder;
+pub(crate) mod geometry;
 pub(crate) mod glyph_atlas;
 pub(crate) mod glyph_pixels;
 pub(crate) mod imported_syncobj;
