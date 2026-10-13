@@ -73,12 +73,7 @@ impl SceneBuild {
 impl SceneCompositor {
     /// Put the pixels a software cursor covers back into `bytes`, a tight
     /// BGRA8 read of `read` from compose image `image` (`cursor_save`).
-    pub(crate) fn restore_under_cursor(
-        &self,
-        image: vk::Image,
-        read: vk::Rect2D,
-        bytes: &mut [u8],
-    ) {
+    pub fn restore_under_cursor(&self, image: vk::Image, read: vk::Rect2D, bytes: &mut [u8]) {
         if let Some(inner) = self.inner.as_ref() {
             for o in &inner.outputs {
                 o.cursor_saves.restore(image, read, bytes);
@@ -90,7 +85,7 @@ impl SceneCompositor {
     /// backend has uploaded its pixel data. Idempotent — a later
     /// `define_cursor` flow (Stage 4) can swap the entry. Drops to
     /// a no-op on the stub fixture.
-    pub(crate) fn register_cursor(&mut self, entry: CursorEntry) {
+    pub fn register_cursor(&mut self, entry: CursorEntry) {
         if let Some(inner) = self.inner.as_mut() {
             inner.cursor = Some(entry);
             self.note_structure_change();
@@ -101,7 +96,7 @@ impl SceneCompositor {
     /// assigns `CursorAssignment::Hidden` on every output, so the next
     /// tick erases a SW sprite and detaches a bound HW plane on retire.
     /// `register_cursor` restores it.
-    pub(crate) fn clear_cursor(&mut self) {
+    pub fn clear_cursor(&mut self) {
         if let Some(inner) = self.inner.as_mut()
             && inner.cursor.take().is_some()
         {
@@ -116,7 +111,7 @@ impl SceneCompositor {
     /// (transition pending on any output, or a heterogeneous
     /// mix) returns `Mixed`; the fast path falls back to scene
     /// wake until the plane is fully consistent.
-    pub(crate) fn cursor_mode(&self) -> CursorPlaneMode {
+    pub fn cursor_mode(&self) -> CursorPlaneMode {
         let Some(inner) = self.inner.as_ref() else {
             return CursorPlaneMode::Sw;
         };
@@ -142,7 +137,7 @@ impl SceneCompositor {
     /// synchronously from the backend's `refresh_effective_cursor`.
     /// Marks each output that already has (or is retiring into) a HW
     /// binding for an output-local upload + full ShowOnRetire retry.
-    pub(crate) fn queue_steady_state_cursor_upload(&mut self, version: u64) -> bool {
+    pub fn queue_steady_state_cursor_upload(&mut self, version: u64) -> bool {
         let Some(inner) = self.inner.as_mut() else {
             return false;
         };

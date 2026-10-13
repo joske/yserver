@@ -43,8 +43,8 @@ impl SceneCompositor {
     /// True while any output has an atomic pageflip awaiting retirement.
     /// Present completion pacing uses this with pending compose damage to
     /// decide whether a standalone CRTC sequence is a genuine idle fallback.
-    pub(crate) fn has_pending_page_flips(&self) -> bool {
-        #[cfg(test)]
+    pub fn has_pending_page_flips(&self) -> bool {
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(v) = self.test_flip_in_flight_override {
             return v;
         }
@@ -57,8 +57,8 @@ impl SceneCompositor {
     /// retirement. Present scheduling is CRTC-domain-specific: activity on a
     /// different card/output must not change the selected output's immediate
     /// target rule.
-    pub(crate) fn has_pending_page_flip(&self, output_idx: usize) -> bool {
-        #[cfg(test)]
+    pub fn has_pending_page_flip(&self, output_idx: usize) -> bool {
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(v) = self.test_flip_in_flight_override {
             return v;
         }
@@ -74,7 +74,7 @@ impl SceneCompositor {
     /// then advances the platform's BO state machine via
     /// `on_page_flip_complete`. Engine retirement happens after
     /// (driven by the backend wrapper to keep the borrows clean).
-    pub(crate) fn handle_page_flip_complete(
+    pub fn handle_page_flip_complete(
         &mut self,
         output_idx: usize,
         store: &mut DrawableStore,
@@ -251,7 +251,7 @@ impl SceneCompositor {
     /// to the copy + KMS submission on sink renderer B. Stable output identity,
     /// monotonic job id, and the paired BO index must all match the ledger; a
     /// stale notification never retargets a rebuilt output vector.
-    pub(crate) fn handle_scanout_render_completion(
+    pub fn handle_scanout_render_completion(
         &mut self,
         completion: RenderCompletion,
         sink: &mut dyn OutputSink,

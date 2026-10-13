@@ -154,7 +154,7 @@ pub(super) fn build_scene(
 /// leaves the bbox intact, which is exactly the shape of a dropped tail.
 /// The draw list is the ground truth: a node that emits one unbroken
 /// piece contributes exactly one rect equal to its placement.
-pub(crate) fn scene_draw_rects(
+pub fn scene_draw_rects(
     input: &SceneInput,
     store: &mut DrawableStore,
     output_idx: usize,
@@ -191,7 +191,7 @@ pub(crate) fn scene_draw_rects(
 /// and an out-of-bounds sample is a driver-defined read. The invariant a
 /// test can state exactly is "placement never exceeds the storage being
 /// sampled", and that needs the placement.
-pub(crate) fn scene_participant_places(
+pub fn scene_participant_places(
     input: &SceneInput,
     store: &mut DrawableStore,
     output_idx: usize,

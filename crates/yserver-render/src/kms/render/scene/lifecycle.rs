@@ -111,7 +111,7 @@ impl SceneCompositor {
     ///
     /// `PipelineInit` on shader / pipeline build failure;
     /// `Vk(...)` on descriptor-pool init.
-    pub(crate) fn new(sink: &dyn OutputSink, layouts: &[OutputLayout]) -> Result<Self, SceneError> {
+    pub fn new(sink: &dyn OutputSink, layouts: &[OutputLayout]) -> Result<Self, SceneError> {
         let vk = sink.gpu().vk().ok_or(SceneError::NoVk)?.clone();
         let pipeline = CompositorPipeline::new(Arc::clone(&vk), vk::Format::B8G8R8A8_UNORM)
             .map_err(SceneError::PipelineInit)?;
@@ -145,9 +145,9 @@ impl SceneCompositor {
             root_overlay: crate::kms::render::root_overlay::RootOverlay::default(),
             scene_structure_dirty: true,
             structure_generation: 0,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             test_flip_in_flight_override: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             test_prime_descriptor_sets: None,
         })
     }
@@ -224,7 +224,7 @@ impl SceneCompositor {
     /// (which reallocates root/COW storage but deliberately avoids
     /// `drain_all` + `rebuild_outputs`) and the return from direct scanout
     /// (during which the composed BOs are not painted at all).
-    pub(crate) fn invalidate_all_scanout_damage(&mut self) {
+    pub fn invalidate_all_scanout_damage(&mut self) {
         if let Some(inner) = self.inner.as_mut() {
             for o in &mut inner.outputs {
                 o.damage.invalidate();
@@ -232,7 +232,7 @@ impl SceneCompositor {
         }
     }
 
-    pub(crate) fn rebuild_outputs(
+    pub fn rebuild_outputs(
         &mut self,
         sink: &dyn OutputSink,
         layouts: &[OutputLayout],
@@ -264,10 +264,7 @@ impl SceneCompositor {
     /// an output whose root rect changed gets its scene extent, BO damage and
     /// intermediate redone, one whose matrix alone changed its BO damage; an
     /// identity output keeps today's state untouched.
-    pub(crate) fn sync_output_layouts(
-        &mut self,
-        layouts: &[OutputLayout],
-    ) -> Result<(), SceneError> {
+    pub fn sync_output_layouts(&mut self, layouts: &[OutputLayout]) -> Result<(), SceneError> {
         let Some(inner) = self.inner.as_mut() else {
             return Ok(());
         };
@@ -307,22 +304,22 @@ impl SceneCompositor {
     /// Test fixture / Stage-1b-era stub. Construct via
     /// `SceneCompositor::stub()` so the `KmsBackend::for_tests`
     /// path doesn't need Vk.
-    pub(crate) fn stub() -> Self {
+    pub fn stub() -> Self {
         Self {
             inner: None,
             root_overlay: crate::kms::render::root_overlay::RootOverlay::default(),
             scene_structure_dirty: false,
             structure_generation: 0,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             test_flip_in_flight_override: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             test_prime_descriptor_sets: None,
         }
     }
 
     /// Whether the scene has a live blit pipeline. Tests use
     /// this to skip Vk-only assertions.
-    pub(crate) fn is_live(&self) -> bool {
+    pub fn is_live(&self) -> bool {
         self.inner.is_some()
     }
 
@@ -330,7 +327,7 @@ impl SceneCompositor {
     /// — `device_wait_idle` is the safe fallback the platform
     /// uses anyway. Releases descriptor-pool slots so the
     /// pool-ring's Drop doesn't fire while slots are still in use.
-    pub(crate) fn drain_all(&mut self, sink: &mut dyn OutputSink) {
+    pub fn drain_all(&mut self, sink: &mut dyn OutputSink) {
         let Some(inner) = self.inner.as_mut() else {
             return;
         };

@@ -22,30 +22,30 @@ use crate::kms::{
 /// A frame slot handed out by [`OutputSink::acquire_slot`], with what the
 /// buffer-age repaint planning needs to know about it.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct SlotToken {
-    pub(crate) output_idx: usize,
-    pub(crate) bo_idx: usize,
-    pub(crate) extent: vk::Extent2D,
+pub struct SlotToken {
+    pub output_idx: usize,
+    pub bo_idx: usize,
+    pub extent: vk::Extent2D,
     /// Generation of the last frame this slot presented; `None` when it never
     /// presented or was invalidated since.
-    pub(crate) last_present_generation: Option<u64>,
+    pub last_present_generation: Option<u64>,
     /// Set after a failed present left this slot's content indeterminate;
     /// cleared by the next successful present.
-    pub(crate) content_invalidated: bool,
+    pub content_invalidated: bool,
 }
 
 /// One retired page flip, from [`OutputSink::on_page_flip_complete`]: the slot
 /// that went on screen and the one it replaced.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct FlipRetirement {
-    pub(crate) retired_bo_idx: Option<usize>,
-    pub(crate) presented_bo_idx: usize,
-    pub(crate) generation: u64,
+pub struct FlipRetirement {
+    pub retired_bo_idx: Option<usize>,
+    pub presented_bo_idx: usize,
+    pub generation: u64,
 }
 
 /// How an output's frames reach the screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OutputRoute {
+pub enum OutputRoute {
     /// The scene composes straight into the scanout buffer.
     Shared,
     /// The scene composes into a source the sink copies to the scanout
@@ -57,7 +57,7 @@ pub(crate) enum OutputRoute {
 
 /// Why a frame cannot start on an output, before anything ran.
 #[derive(Debug)]
-pub(crate) enum FrameTargetError {
+pub enum FrameTargetError {
     /// No device drives the output.
     NoDevice(io::Error),
     /// The output has no frame slots, or not the requested one.
@@ -65,7 +65,7 @@ pub(crate) enum FrameTargetError {
 }
 
 /// How a finished frame leaves the sink.
-pub(crate) enum FrameHandoff {
+pub enum FrameHandoff {
     /// Composed and flipped; retirement comes as a page flip.
     FlipPending(ComposeSubmit),
     /// Composed into the copied route's source; the completion fd (`None` is
@@ -75,7 +75,7 @@ pub(crate) enum FrameHandoff {
 }
 
 /// The result of [`OutputSink::finish_frame`].
-pub(crate) enum FinishOutcome {
+pub enum FinishOutcome {
     /// The slot is gone; nothing ran.
     Unavailable(FrameTargetError),
     /// The frame sequence ran, successfully or not.
@@ -99,23 +99,23 @@ impl From<FrameTargetError> for SceneError {
 }
 
 /// A copied-route render completion that became ready.
-pub(crate) struct RenderCompletion {
-    pub(crate) job_id: u64,
+pub struct RenderCompletion {
+    pub job_id: u64,
     /// The output it belongs to, or the removed output's identity formatted
     /// for the log.
-    pub(crate) output: Result<usize, String>,
-    pub(crate) bo_idx: usize,
+    pub output: Result<usize, String>,
+    pub bo_idx: usize,
     /// `None` is the already-signalled payload.
-    pub(crate) fd: Option<OwnedFd>,
+    pub fd: Option<OwnedFd>,
 }
 
 /// The record step of [`OutputSink::finish_frame`]: compose and submit into
 /// the lent target.
-pub(crate) type RecordFrame<'a> =
+pub type RecordFrame<'a> =
     dyn FnMut(&mut dyn ComposeRenderTarget) -> Result<ComposeSubmit, PresentError> + 'a;
 
 /// Frame slots, presentation and retirement of the outputs the scene draws.
-pub(crate) trait OutputSink {
+pub trait OutputSink {
     fn gpu(&self) -> &GpuCore;
     fn gpu_mut(&mut self) -> &mut GpuCore;
     fn cursor_plane(&self) -> &dyn CursorPlaneSink;
@@ -180,9 +180,9 @@ pub(crate) trait OutputSink {
 
 /// A cursor show that failed, and whether the old sprite is still visible.
 #[derive(Debug)]
-pub(crate) struct CursorShowFailure {
-    pub(crate) remains_visible: bool,
-    pub(crate) error: Box<dyn std::error::Error + Send + Sync>,
+pub struct CursorShowFailure {
+    pub remains_visible: bool,
+    pub error: Box<dyn std::error::Error + Send + Sync>,
 }
 
 impl std::fmt::Display for CursorShowFailure {
@@ -192,7 +192,7 @@ impl std::fmt::Display for CursorShowFailure {
 }
 
 /// The hardware cursor plane of the outputs the scene draws.
-pub(crate) trait CursorPlaneSink {
+pub trait CursorPlaneSink {
     fn fits(&self, output_idx: usize, width: u32, height: u32) -> bool;
     fn visible(&self, output_idx: usize) -> bool;
     fn uploaded_version(&self, output_idx: usize) -> Option<u64>;

@@ -21,7 +21,7 @@ impl SceneCompositor {
     /// by per-drawable presentation damage, and cursor motion is
     /// projected by `build_scene`.
     #[track_caller]
-    pub(crate) fn wake_for_damage(&mut self) {
+    pub fn wake_for_damage(&mut self) {
         if self.damage_audit_active() {
             self.record_damage_audit_event(Location::caller(), self.full_output_audit_area());
         }
@@ -34,7 +34,7 @@ impl SceneCompositor {
     /// transitions where old/new visibility cannot yet be expressed
     /// as a narrower rect.
     #[track_caller]
-    pub(crate) fn mark_scene_structure_dirty(&mut self) {
+    pub fn mark_scene_structure_dirty(&mut self) {
         let event_id = if self.damage_audit_active() {
             self.record_damage_audit_event(Location::caller(), self.full_output_audit_area())
         } else {
@@ -91,7 +91,7 @@ impl SceneCompositor {
     /// this clip is just "drop the bits that fall off the right /
     /// bottom edge".
     #[track_caller]
-    pub(crate) fn mark_scene_structure_damage_rects(&mut self, rects: &[vk::Rect2D]) {
+    pub fn mark_scene_structure_damage_rects(&mut self, rects: &[vk::Rect2D]) {
         let event_id = if self.damage_audit_active() {
             self.record_damage_audit_event(Location::caller(), rects.to_vec())
         } else {
@@ -125,7 +125,7 @@ impl SceneCompositor {
     /// Toggle an overlay XOR op (root-absolute rects) and inject output damage
     /// so a compose actually runs (wake_for_damage alone leaves output_damage
     /// empty and the frame is EmptyDamage-skipped).
-    pub(crate) fn root_overlay_toggle(
+    pub fn root_overlay_toggle(
         &mut self,
         client: yserver_protocol::x11::ClientId,
         value: u32,
@@ -156,7 +156,7 @@ impl SceneCompositor {
     }
 
     /// Clear the overlay (RandR/topology change) and damage the vacated rects.
-    pub(crate) fn root_overlay_clear(&mut self) {
+    pub fn root_overlay_clear(&mut self) {
         if self.root_overlay.is_empty() {
             return;
         }
@@ -167,7 +167,7 @@ impl SceneCompositor {
     }
 
     /// Drop a disconnecting client's overlay contribution.
-    pub(crate) fn root_overlay_on_disconnect(&mut self, client: yserver_protocol::x11::ClientId) {
+    pub fn root_overlay_on_disconnect(&mut self, client: yserver_protocol::x11::ClientId) {
         let vacated = self.root_overlay.all_rects();
         if self.root_overlay.on_client_disconnect(client) {
             self.mark_scene_structure_damage_rects(&vacated);

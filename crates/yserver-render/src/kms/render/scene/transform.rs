@@ -18,10 +18,7 @@ use std::sync::Arc;
 impl SceneCompositor {
     /// The intermediate of transformed output `output_idx`, once a compose has
     /// filled it: `(image, footprint extent)`, in `GENERAL`.
-    pub(crate) fn transform_intermediate(
-        &self,
-        output_idx: usize,
-    ) -> Option<(vk::Image, vk::Extent2D)> {
+    pub fn transform_intermediate(&self, output_idx: usize) -> Option<(vk::Image, vk::Extent2D)> {
         let im = self
             .inner
             .as_ref()?
@@ -183,7 +180,7 @@ impl ComposeRenderTarget for IntermediatePrimeTarget {
 
 impl SceneCompositor {
     /// Whether a transformed output's intermediate is missing or uncomposed.
-    pub(crate) fn has_unprimed_transform_intermediate(&self, outputs: &[OutputLayout]) -> bool {
+    pub fn has_unprimed_transform_intermediate(&self, outputs: &[OutputLayout]) -> bool {
         let Some(inner) = self.inner.as_ref() else {
             return false;
         };
@@ -196,16 +193,16 @@ impl SceneCompositor {
     /// Compose every transformed output whose intermediate has never been
     /// composed, and wait, so a root read never sees an undefined one (D6).
     /// The caller has flushed pending paint, as before a scene tick.
-    pub(crate) fn prime_transform_intermediates(
+    pub fn prime_transform_intermediates(
         &mut self,
         input: &SceneInput,
         store: &mut DrawableStore,
         sink: &dyn OutputSink,
         cow_host_xid: Option<u32>,
     ) -> Result<(), SceneError> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let descriptor_limit = self.test_prime_descriptor_sets;
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-support")))]
         let descriptor_limit: Option<usize> = None;
         let Some(inner) = self.inner.as_mut() else {
             return Ok(());

@@ -44,7 +44,7 @@ mod tick;
 mod transform;
 mod walk;
 
-pub(crate) use build::*;
+pub use build::*;
 #[cfg(test)]
 use compose::*;
 #[cfg(test)]
@@ -59,7 +59,7 @@ use flip::*;
 use lifecycle::drain_deferred_scene_resources;
 #[cfg(test)]
 use repaint::*;
-pub(crate) use sink::*;
+pub use sink::*;
 #[cfg(test)]
 use tick::*;
 #[cfg(test)]
@@ -101,29 +101,29 @@ use crate::kms::{
 
 /// The geometry the scene reads of one live output, in platform order.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct OutputLayout {
+pub struct OutputLayout {
     /// The root rectangle the output shows: its mode at the CRTC origin, or
     /// the transformed footprint there (spec D3).
-    pub(crate) root_rect: (i32, i32, u32, u32),
+    pub root_rect: (i32, i32, u32, u32),
     /// The CRTC mode, i.e. the scanout BO extent.
-    pub(crate) mode: (u16, u16),
+    pub mode: (u16, u16),
     /// The current CRTC transform, `None` at identity.
-    pub(crate) transform: Option<yserver_protocol::x11::randr::transform::CrtcTransform>,
+    pub transform: Option<yserver_protocol::x11::randr::transform::CrtcTransform>,
 }
 
 /// The core state and output geometry one scene call reads, borrowed from
 /// the backend for the duration of the call.
-pub(crate) struct SceneInput<'a> {
-    pub(crate) window_id: u32,
-    pub(crate) top_level_order: &'a [u32],
-    pub(crate) shape_bounding: &'a HashMap<u32, Vec<yserver_protocol::x11::xfixes::RegionRect>>,
-    pub(crate) shape_clip: &'a HashMap<u32, Vec<yserver_protocol::x11::xfixes::RegionRect>>,
-    pub(crate) cursor_x: f32,
-    pub(crate) cursor_y: f32,
-    pub(crate) windows: &'a crate::kms::render::window_geometry::WindowsMap,
-    pub(crate) outputs: &'a [OutputLayout],
+pub struct SceneInput<'a> {
+    pub window_id: u32,
+    pub top_level_order: &'a [u32],
+    pub shape_bounding: &'a HashMap<u32, Vec<yserver_protocol::x11::xfixes::RegionRect>>,
+    pub shape_clip: &'a HashMap<u32, Vec<yserver_protocol::x11::xfixes::RegionRect>>,
+    pub cursor_x: f32,
+    pub cursor_y: f32,
+    pub windows: &'a crate::kms::render::window_geometry::WindowsMap,
+    pub outputs: &'a [OutputLayout],
     /// The logical screen size.
-    pub(crate) fb_size: (u16, u16),
+    pub fb_size: (u16, u16),
 }
 
 /// The transform of output `idx`, `None` at identity or past the end.
@@ -203,7 +203,7 @@ struct PendingAck {
 /// decision in `build_scene`. The compositor outer caller consumes
 /// this to drive Phase D's `PendingAck` transition state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CursorAssignment {
+pub enum CursorAssignment {
     /// HW plane should display the sprite at this position. The
     /// SW cursor draw is omitted from `scene.draws`. Damage is
     /// decided later in `tick_one_output` from the transactional
@@ -272,7 +272,7 @@ enum OutputCursorMode {
 /// transition to HW; mixed-state outputs return `Mixed`, which
 /// suppresses the fast path until every flip retires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CursorPlaneMode {
+pub enum CursorPlaneMode {
     /// Every active output is in HW mode + no transitions pending
     /// — pointer fast path may issue `cursor_plane_move` directly.
     Hw,
@@ -547,19 +547,19 @@ enum TickOutcome {
 // SceneCompositor
 // ────────────────────────────────────────────────────────────────
 
-pub(crate) struct SceneCompositor {
+pub struct SceneCompositor {
     inner: Option<SceneCompositorInner>,
     /// Retained front-buffer overlay for legacy root-window
     /// `IncludeInferiors` XOR/invert drawing (import rubber-band, WM
     /// wireframes). Mutated only via the `root_overlay_*` helpers below,
     /// which also inject the scene-structure damage needed to force a
     /// compose.
-    pub(crate) root_overlay: crate::kms::render::root_overlay::RootOverlay,
+    pub root_overlay: crate::kms::render::root_overlay::RootOverlay,
     /// Stage 2d's coarse scene-structure dirty bit. Set by any
     /// map/unmap/configure/restack/redirect-state/cursor-pos
     /// change. Cleared at tick end. Stage 2e narrows to a
     /// per-region scene_structure_damage `RegionSet`.
-    pub(crate) scene_structure_dirty: bool,
+    pub scene_structure_dirty: bool,
     /// Counts the changes that set `scene_structure_dirty`: with the
     /// store's [`DrawableStore::scene_damage_generation`], what a root
     /// readback was composed at ([`Self::root_readback`]).
@@ -569,12 +569,12 @@ pub(crate) struct SceneCompositor {
     /// so there is no live `PendingAck` queue to populate; this lets
     /// capability-surface tests (`present_flip_in_flight`) exercise both
     /// states without a live Vulkan device.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     test_flip_in_flight_override: Option<bool>,
     /// Test-only: the most draws a priming compose reports recorded, standing
     /// in for an exhausted descriptor pool.
-    #[cfg(test)]
-    pub(crate) test_prime_descriptor_sets: Option<usize>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub test_prime_descriptor_sets: Option<usize>,
 }
 
 struct SceneCompositorInner {
@@ -625,20 +625,20 @@ struct RootReadback {
 /// xid) so its lifetime + Vk-handle destruction flow through the
 /// same paths as any other drawable.
 #[derive(Debug, Clone)]
-pub(crate) struct CursorEntry {
-    pub(crate) id: crate::kms::render::store::DrawableId,
-    pub(crate) extent: vk::Extent2D,
-    pub(crate) hot_x: i16,
-    pub(crate) hot_y: i16,
+pub struct CursorEntry {
+    pub id: crate::kms::render::store::DrawableId,
+    pub extent: vk::Extent2D,
+    pub hot_x: i16,
+    pub hot_y: i16,
     /// Stage 5 Phase B — `Arc<CursorRecord>.version`. Compared by
     /// value in the Phase D upload-dedup path. Zero in unit-test
     /// constructions that pre-date Phase A.
-    pub(crate) record_version: u64,
+    pub record_version: u64,
     /// Stage 5 Phase D — straight-alpha BGRA8 bytes shared with
     /// the `CursorRecord` on the backend. `Arc` lets every output's
     /// retire-time upload reference the same allocation without copying.
     /// `None` in unit-test constructions that pre-date Phase A.
-    pub(crate) bgra_bytes: Option<std::sync::Arc<Vec<u8>>>,
+    pub bgra_bytes: Option<std::sync::Arc<Vec<u8>>>,
 }
 
 /// Whether the scene walk clips each node to what nothing above it covers.
@@ -845,7 +845,7 @@ struct SceneBuild {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum SceneError {
+pub enum SceneError {
     #[error("vk pipeline init: {0}")]
     PipelineInit(crate::kms::vk::pipeline::PipelineError),
     #[error("vk: {0:?}")]
@@ -973,7 +973,7 @@ enum Repaint {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ComposeSubmit {
+pub struct ComposeSubmit {
     descriptor_count: usize,
 }
 
@@ -1159,7 +1159,7 @@ struct ScalePass {
     into_target: bool,
 }
 
-pub(crate) trait ComposeRenderTarget {
+pub trait ComposeRenderTarget {
     fn image(&self) -> vk::Image;
     fn image_view(&self) -> vk::ImageView;
     fn command_buffer(&self) -> vk::CommandBuffer;

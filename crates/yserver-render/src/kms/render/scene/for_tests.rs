@@ -1,44 +1,44 @@
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use crate::kms::render::scene::CursorAssignment;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use crate::kms::render::scene::DamageAuditTarget;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use crate::kms::render::scene::OutputSink;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use crate::kms::render::scene::Repaint;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use crate::kms::render::scene::ScalePass;
 use crate::kms::render::scene::SceneCompositor;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use crate::kms::render::scene::SceneInput;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use crate::kms::render::scene::Visibility;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use crate::kms::render::scene::build::build_scene;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use crate::kms::render::scene::compose::record_and_submit_render;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use crate::kms::render::scene::cursor::hw_cursor_allowed;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use crate::kms::render::scene::damage::clip_rect_to_output_extent;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use crate::kms::render::scene::damage_audit::create_audit_descriptor_pool;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use crate::kms::render::scene::output_transform;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use crate::kms::render::scene::repaint::draw_dst_rect_inward;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use crate::kms::render::store::DrawableStore;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use ash::vk;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::Arc;
 
 impl SceneCompositor {
     /// Test-only: force [`has_pending_page_flips`](Self::has_pending_page_flips)
     /// without a live output/`PendingAck` queue.
-    #[cfg(test)]
-    pub(crate) fn test_set_flip_in_flight(&mut self, value: bool) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_set_flip_in_flight(&mut self, value: bool) {
         self.test_flip_in_flight_override = Some(value);
     }
 }
@@ -46,8 +46,8 @@ impl SceneCompositor {
 impl SceneCompositor {
     /// Test-only: the cursor assignment the production tick would make for
     /// `output_idx`.
-    #[cfg(test)]
-    pub(crate) fn cursor_assignment_for_tests(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn cursor_assignment_for_tests(
         &self,
         input: &SceneInput,
         store: &mut DrawableStore,
@@ -70,8 +70,8 @@ impl SceneCompositor {
     }
 
     /// Test-only: output `output_idx`'s intermediate memory and extent.
-    #[cfg(test)]
-    pub(crate) fn intermediate_for_tests(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn intermediate_for_tests(
         &self,
         output_idx: usize,
     ) -> Option<(vk::DeviceMemory, vk::Extent2D)> {
@@ -90,8 +90,8 @@ impl SceneCompositor {
     /// the scale pass — with a plain offscreen image standing in for the
     /// scanout BO (lavapipe cannot allocate one). Returns that image's BGRA
     /// bytes, mode-sized.
-    #[cfg(test)]
-    pub(crate) fn compose_transformed_for_tests(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn compose_transformed_for_tests(
         &mut self,
         input: &SceneInput,
         store: &mut DrawableStore,
@@ -104,8 +104,8 @@ impl SceneCompositor {
     /// Test-only: compose identity output `output_idx` as `tick_one_output`
     /// does, into an offscreen stand-in for its scanout BO. Returns the BO's
     /// bytes and the same bytes as a root read of the BO sees them.
-    #[cfg(test)]
-    pub(crate) fn compose_identity_for_tests(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn compose_identity_for_tests(
         &mut self,
         input: &SceneInput,
         store: &mut DrawableStore,
@@ -127,7 +127,7 @@ impl SceneCompositor {
 
     /// The shared body of the two helpers above: the compose target's bytes,
     /// the image the cursor save is keyed by, and the target extent.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn compose_for_tests(
         &mut self,
         input: &SceneInput,
@@ -211,7 +211,7 @@ impl SceneCompositor {
 }
 
 /// Test-only: the BGRA bytes of a `GENERAL`-layout colour image.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn read_general_image_for_tests(
     vk: &Arc<crate::kms::vk::device::VkContext>,
     sink: &dyn OutputSink,

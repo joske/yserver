@@ -70,7 +70,7 @@ impl TickOutcome {
 
 impl SceneCompositor {
     /// Earliest pending commit-retry deadline across outputs.
-    pub(crate) fn earliest_retry_deadline(&self) -> Option<std::time::Instant> {
+    pub fn earliest_retry_deadline(&self) -> Option<std::time::Instant> {
         self.inner
             .as_ref()?
             .outputs
@@ -86,7 +86,7 @@ impl SceneCompositor {
     /// commit-retry backoff, flushing paint would create GPU submit
     /// traffic that cannot be scanned out yet and would fragment COW
     /// batching under compositor drag workloads.
-    pub(crate) fn has_output_ready_for_submit(&self) -> bool {
+    pub fn has_output_ready_for_submit(&self) -> bool {
         let Some(inner) = self.inner.as_ref() else {
             return true;
         };
@@ -102,7 +102,7 @@ impl SceneCompositor {
     /// is reporting — after an `invalidate`, or a submitted frame that never
     /// reached the screen. The backend's compose-wanted predicate must include
     /// this, or an invalidated output waits for unrelated damage to be repaired.
-    pub(crate) fn owes_repaint(&self) -> bool {
+    pub fn owes_repaint(&self) -> bool {
         self.inner
             .as_ref()
             .is_some_and(|inner| inner.outputs.iter().any(|o| o.damage.owes_repaint()))
@@ -118,7 +118,7 @@ impl SceneCompositor {
     /// Per-output failures don't abort the loop; they're logged
     /// and the next output is attempted. Top-level Err means
     /// the platform was unusable (no Vk).
-    pub(crate) fn tick(
+    pub fn tick(
         &mut self,
         input: &SceneInput,
         store: &mut DrawableStore,

@@ -55,7 +55,7 @@ impl SceneCompositor {
     /// `Ok(None)` without a live scene. The caller has flushed pending
     /// paint when [`Self::root_readback_is_current`] said it was not.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn root_readback(
+    pub fn root_readback(
         &mut self,
         input: &SceneInput,
         store: &mut DrawableStore,
@@ -163,7 +163,7 @@ impl SceneCompositor {
         unsafe { vk.device.destroy_descriptor_pool(pool, None) };
         let recorded = result?.descriptor_count;
         // Drivers may over-allocate a pool, so the test caps the count.
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let recorded = self
             .test_prime_descriptor_sets
             .map_or(recorded, |n| recorded.min(n));
@@ -195,7 +195,7 @@ impl SceneCompositor {
 
     /// Whether [`Self::root_readback`] of `local` would read without
     /// composing, so the caller need not flush pending paint first.
-    pub(crate) fn root_readback_is_current(
+    pub fn root_readback_is_current(
         &self,
         store: &DrawableStore,
         outputs: &[OutputLayout],

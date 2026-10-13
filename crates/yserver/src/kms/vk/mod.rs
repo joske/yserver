@@ -10,8 +10,8 @@ pub use yserver_render::kms::vk::{
     submit_stats, sync, target, text_pipeline, trap_pipeline, vram,
 };
 pub(crate) use yserver_render::kms::vk::{
-    damage_audit_compare, image_format_properties2, optional_sync_fd_from_vk, owned_fd_from_vk,
-    probe_digest, probe_pattern, scale_pipeline,
+    image_format_properties2, optional_sync_fd_from_vk, owned_fd_from_vk, probe_digest,
+    probe_pattern,
 };
 
 pub mod scanout;

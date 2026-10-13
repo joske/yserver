@@ -14,13 +14,11 @@ pub(crate) mod pointer_confine;
 pub(crate) mod present_completion;
 pub(crate) mod present_source_wait;
 pub(crate) mod probe_executor;
-pub(crate) mod scene;
-pub(crate) mod window_geometry;
 
 pub use backend::KmsBackend;
 pub use yserver_render::kms::render::cpu_types;
 pub(crate) use yserver_render::kms::render::{
-    composite_pool_ring, cursor, cursor_save, engine, frame_builder, geometry, glyph_pixels, gpu,
-    owned_semaphore, present_batch, region, root_overlay, scanout_damage, scene_diff, store,
-    stroke, submit_group, submit_trace, target, telemetry, transform_intermediate,
+    cursor, engine, frame_builder, geometry, glyph_pixels, gpu, owned_semaphore, present_batch,
+    region, root_overlay, scene, store, stroke, submit_group, submit_trace, target, telemetry,
+    window_geometry,
 };
