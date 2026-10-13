@@ -155,6 +155,49 @@ mod tests {
         }
     }
 
+    /// A failed attach hands the boxed entry back, and the downcast helper
+    /// recovers the same concrete payload: event fields and wake pin intact.
+    #[test]
+    fn failed_attach_round_trips_entry_through_downcast() {
+        use crate::kms::render::{engine::RenderEngine, store::DrawableId};
+
+        let handle: Arc<dyn SyncobjHandle> = Arc::new(TestSyncobj {
+            imports: Mutex::new(Vec::new()),
+            fail_import: false,
+        });
+        let mut engine = RenderEngine::stub();
+        let entry: Box<dyn PresentCompletionEntry> = Box::new(synced_entry(handle.clone()));
+
+        let returned = engine
+            .attach_present_completion(DrawableId::for_tests(1), entry)
+            .expect_err("a stub engine has no open frame to attach to");
+        let entry = into_pending_entry(returned);
+
+        assert_eq!(entry.event.client_id, ClientId(7));
+        assert_eq!(entry.event.serial, 42);
+        assert_eq!(entry.event.host_xid, 0x100001);
+        assert_eq!(entry.event.dst_host_xid, 0xE00001);
+        assert_eq!(entry.event.present_id, 9);
+        assert!(matches!(
+            entry.event.wake,
+            PresentWake::PixmapSynced {
+                release_syncobj: 0x200001,
+                release_value: 17,
+                ..
+            }
+        ));
+        match entry.wake_pin {
+            PinnedWake::PixmapSynced {
+                handle: pinned,
+                value,
+            } => {
+                assert_eq!(value, 17);
+                assert!(Arc::ptr_eq(&pinned, &handle));
+            }
+            other => panic!("wake pin changed variant: {other:?}"),
+        }
+    }
+
     /// Smoke test that the types compile + can be constructed.
     /// Real semantics tested in `KmsBackend` integration tests.
     #[test]
