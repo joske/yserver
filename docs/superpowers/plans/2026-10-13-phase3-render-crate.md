@@ -242,18 +242,20 @@ The parent's rule-4 mapping (every test before = one test after, same ignored
 status, per feature config) applies; splits and crate-path changes are listed
 explicitly in the mapping.
 
-### 8. Small fixes, own commits before 3a
+### 8. Findings deferred to the macOS/Windows scoping
 
-Found by the inventory, independent of the move:
+Found by the inventory; both only matter on a driver without the Linux
+extensions, so they wait for the macOS/Windows work (jos, 2026-10-13):
 - `allocate_exportable`'s last fallback (`vk/target.rs:1449` → 1669–1677) and
   `bind_exportable_memory` (1774–1800) request dma-buf export without checking
-  `VK_EXT_external_memory_dma_buf`. Reached from GLX-TFP promotion
-  (`engine/export.rs:79`). Guard and return the existing error.
-- Required instance extensions are not filtered (`vk/instance.rs:8–14`):
-  `debug_utils` and the two `*_capabilities` are passed unconditionally.
-  The capabilities extensions are core since 1.1; `debug_utils` should be
-  optional.
-- `gpu-allocator` is a dependency of `yserver` and is used nowhere.
+  `VK_EXT_external_memory_dma_buf` (reached from GLX-TFP promotion,
+  `engine/export.rs:79`). Every Linux/FreeBSD driver we run on has the
+  extension.
+- Required instance extensions are not filtered (`vk/instance.rs:8–14`). The
+  loader implements `debug_utils` itself, so it is present wherever a loader is.
+
+`gpu-allocator` (a `yserver` dependency used nowhere) is removed in 3a's
+first prep commit.
 
 ## Acceptance (3a)
 
