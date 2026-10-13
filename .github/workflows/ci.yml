@@ -66,12 +66,17 @@ jobs:
         # tcp_tests module, cfg'd on `feature = "tcp-transport"`); without it
         # this leg would build the gated code but never execute it.
         run: cargo test --all-targets ${{ matrix.flags }} --locked
+      - name: Check the source layout rules
+        # File-size ceilings, the backend/portable seam and yserver-render's
+        # dependencies (tools/check-layout.sh). Feature-independent; run once.
+        if: matrix.name == 'unix-only'
+        run: sh tools/check-layout.sh
       - name: Lint the shell scripts
         # starty is installed on every supported platform, so it must work
         # beyond bash. No cargo involved, so feature-independent; run once.
         if: matrix.name == 'unix-only'
         run: |
-          shellcheck -s sh starty tools/install-smoke.sh
+          shellcheck -s sh starty tools/install-smoke.sh tools/check-layout.sh
           dash ./starty --help > /dev/null
       - name: Render man pages
         # scdoc only — feature-independent. Kept on the same leg as the two
