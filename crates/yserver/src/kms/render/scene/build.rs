@@ -3,8 +3,8 @@ use crate::kms::{
         platform::PlatformBackend,
         region::Region,
         scene::{
-            CarriedDamage, ContentDamage, CursorAssignment, CursorEntry, Emitted, RootNode,
-            SceneBuild, SceneInput, Visibility, WalkSink, WalkStats,
+            CarriedDamage, ContentDamage, CursorAssignment, CursorEntry, Emitted, OutputSink,
+            RootNode, SceneBuild, SceneInput, Visibility, WalkSink, WalkStats,
             cursor::cursor_footprint_rect,
             damage::{clip_rect_to_output_extent, project_onto_output},
             repaint::draw_dst_rect_inward,
@@ -549,11 +549,10 @@ pub(super) fn build_scene_with(
             // device plane. Cursor dimensions differ by card (e.g. 128px
             // amdgpu beside 64px i915), so this must not be a global 64px
             // minimum.
-            let hw_fits = platform.cursor_plane_fits_for_output(
-                output_idx,
-                cur.extent.width,
-                cur.extent.height,
-            );
+            let hw_fits =
+                platform
+                    .cursor_plane()
+                    .fits(output_idx, cur.extent.width, cur.extent.height);
             if hw_strategy_active && hw_fits {
                 (
                     CursorAssignment::Hw {

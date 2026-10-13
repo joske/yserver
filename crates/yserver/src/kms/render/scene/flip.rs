@@ -235,7 +235,11 @@ impl SceneCompositor {
             }
             let actually_sw_composed =
                 matches!(ack.cursor_mode_after_retire, OutputCursorMode::Sw { .. });
-            if actually_sw_composed && platform.cursor_plane_note_composed_retirement(output_idx) {
+            if actually_sw_composed
+                && platform
+                    .cursor_plane_mut()
+                    .note_composed_retirement(output_idx)
+            {
                 // Consume this output/device's own EINVAL backoff one
                 // composed retirement at a time. Damage keeps the sequence
                 // alive until the retry becomes eligible.

@@ -448,6 +448,6 @@ impl SceneCompositor {
         }
         // Hide the plane everywhere + invalidate uploaded_version.
         // Best-effort; the platform hook logs per-CRTC failures.
-        let _ = platform.cursor_plane_hide_all();
+        let _ = platform.cursor_plane_mut().hide_all();
     }
 }

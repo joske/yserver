@@ -657,7 +657,7 @@ fn tick_one_output(
     }
     let prev_mode = effective_cursor_prev_mode(
         scene_prev_mode,
-        platform.cursor_plane_visible_for_output(output_idx),
+        platform.cursor_plane().visible(output_idx),
         built.cursor_assignment,
     );
     if cursorless_hide_frame_required(prev_mode, built.cursor_assignment) {
