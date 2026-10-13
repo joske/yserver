@@ -259,14 +259,6 @@ Found by the inventory, independent of the move:
 
 - `cargo tree -p yserver-render` has no `drm`, `gbm`, `input`, `udev`,
   `yserver-core`.
-- **macOS builds:** a CI step on the Linux runner that installs the
-  `aarch64-apple-darwin` Rust target (the workflow installs toolchains but no
-  cross target today; `setup-rust-toolchain`'s `target:` input or
-  `rustup target add`) and runs
-  `cargo check -p yserver-render --target aarch64-apple-darwin` (no linking,
-  so no Apple SDK needed; unverified until the crate exists: render's deps are
-  pure Rust plus `libc`, and `build.rs` runs glslc on the host); plus one
-  native `cargo build -p yserver-render` on a Mac by jos.
 - The parent's gates per commit, all three feature configs, FreeBSD CI, test
   mapping, file-size ceilings.
 - Seam commit: lavapipe suite, HW smoke on bee (amdgpu) and eiger (Asahi).
@@ -300,6 +292,13 @@ the current toolchain). One fix: the glyph parser half asserts the full
 per-glyph tuple (format, size, position), not only the format sequence
 (decision 7). No remaining plan blocker.
 
+**jos, 2026-10-13: no macOS work in this pass.** The macOS acceptance check
+(cross `cargo check`, a macOS runner, a native build) is dropped from 3a: the
+crate would compile there but nothing would run, so it proves little. The
+`cargo tree` check guards the dependency side. macOS stays recorded as the
+second target (3b's `OutputSink` is designed with a swapchain in mind);
+macOS/Windows scoping, including its CI job, starts after the cleanup.
+
 ## Questions for the review
 
 1. Two steps (3a then 3b) rather than (a) or (b) alone?
@@ -309,4 +308,4 @@ per-glyph tuple (format, size, position), not only the format sequence
    `PlatformBackend::drop`: complete and correctly ordered?
 5. Moving the GC/line/arc enums and `CrtcTransform`/`Filter` into
    `yserver-protocol`: right home, or a small `yserver-types` crate?
-6. Cross-`cargo check` for `aarch64-apple-darwin` in CI as the macOS gate.
+6. ~~Cross-`cargo check` for `aarch64-apple-darwin` in CI as the macOS gate.~~ Dropped (jos).
