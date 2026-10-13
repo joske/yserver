@@ -143,10 +143,12 @@ jobs:
           release: "15"
           mem: 12288
           cache-after-prepare: true
-          # Package list from docs/setup.md; rustup tracks stable like the Linux legs.
+          # Package list from docs/setup.md plus fonts (the font tests need them, as on
+          # Linux); rustup tracks stable like the Linux legs.
           prepare: |
             pkg install -y rustup-init just pkgconf shaderc fontconfig freetype2 libudev-devd libinput \
-              libxkbcommon libxshmfence libdrm mesa-libs vulkan-loader scdoc
+              libxkbcommon libxshmfence libdrm mesa-libs vulkan-loader scdoc \
+              dejavu xorg-fonts-miscbitmap xorg-fonts-75dpi xorg-fonts-100dpi
             rustup-init -y --profile minimal -c clippy
           run: |
             set -e
