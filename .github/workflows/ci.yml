@@ -133,3 +133,25 @@ jobs:
         env:
           YSERVER_ALLOW_SOFTWARE_VULKAN: "1"
         run: cargo test -p yserver --locked --features xdmcp --no-fail-fast -- --ignored
+  freebsd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Clippy and tests on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "15"
+          mem: 12288
+          cache-after-prepare: true
+          # Package list from docs/setup.md; rustup tracks stable like the Linux legs.
+          prepare: |
+            pkg install -y curl just pkgconf shaderc fontconfig freetype2 libudev-devd libinput \
+              libxkbcommon libxshmfence libdrm mesa-libs vulkan-loader scdoc
+            curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal -c clippy
+          run: |
+            set -e
+            . "$HOME/.cargo/env"
+            rustup update stable
+            cargo clippy --all-targets -- -D warnings
+            cargo clippy --all-targets --features xdmcp -- -D warnings
+            cargo test --all-targets --features xdmcp --locked
