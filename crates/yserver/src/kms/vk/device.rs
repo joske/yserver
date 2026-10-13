@@ -7,6 +7,7 @@
 use ash::vk;
 use std::{
     ffi::{CStr, c_char, c_void},
+    fmt,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -14,7 +15,23 @@ use std::{
 };
 
 use super::api_level;
-use crate::platform::drm::DrmDeviceKey;
+
+/// Stable kernel identity of one DRM device node.
+///
+/// This is the node's `st_rdev` major/minor pair, matching the identity
+/// exported by `VK_EXT_physical_device_drm`; unlike `cardN`, it is suitable as
+/// a join key for later multi-device PRIME topology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct DrmDeviceKey {
+    pub(crate) major: u32,
+    pub(crate) minor: u32,
+}
+
+impl fmt::Display for DrmDeviceKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.major, self.minor)
+    }
+}
 
 /// DRM node identities advertised by one Vulkan physical device through
 /// `VK_EXT_physical_device_drm`.

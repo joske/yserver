@@ -7,7 +7,7 @@
 //! `crate::drm::modeset`.
 
 use std::{
-    fmt, fs,
+    fs,
     io::{self, ErrorKind},
     os::{
         fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
@@ -18,30 +18,17 @@ use std::{
 
 use ::drm::control::{Device as _, connector};
 
-pub(crate) use crate::drm::modeset::{
-    ConnectorProbe, ConnectorSnapshotProbe, Mode, ModeIdentity, Output, connector_is_non_desktop,
-    discover_output_for_connector, discover_outputs, probe_connector_snapshots, probe_connectors,
+pub(crate) use crate::{
+    drm::modeset::{
+        ConnectorProbe, ConnectorSnapshotProbe, Mode, ModeIdentity, Output,
+        connector_is_non_desktop, discover_output_for_connector, discover_outputs,
+        probe_connector_snapshots, probe_connectors,
+    },
+    kms::vk::device::DrmDeviceKey,
 };
 
 const DRM_DIR: &str = "/dev/dri";
 pub(crate) const RENDER_NODE_ENV: &str = "YSERVER_DRI_RENDER_NODE";
-
-/// Stable kernel identity of one DRM device node.
-///
-/// This is the node's `st_rdev` major/minor pair, matching the identity
-/// exported by `VK_EXT_physical_device_drm`; unlike `cardN`, it is suitable as
-/// a join key for later multi-device PRIME topology.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) struct DrmDeviceKey {
-    pub(crate) major: u32,
-    pub(crate) minor: u32,
-}
-
-impl fmt::Display for DrmDeviceKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.major, self.minor)
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DrmNodeKind {
