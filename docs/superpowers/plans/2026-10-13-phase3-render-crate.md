@@ -31,7 +31,21 @@ within 2%).
 | test --no-run | 4 | 22.0 | 0.6+6.3 | 3.7+11.9 | 0.9+15.1 | 6.9+15.1 |
 
 Unchanged from the pre-phase-1 baseline (18.9 s release/32): the `yserver`
-unit is still the critical path. fuji is still to be measured (jos).
+unit is still the critical path. fuji: jos measures before (`7ffee2f7`) and
+after (3a head) back to back in one session.
+
+Commands, per row, after a warm full build of that profile (`cargo clean`
+takes `--release` for the release rows):
+```
+export RUSTC_WRAPPER= CARGO_INCREMENTAL=0 CARGO_TARGET_DIR=$PWD/target/timing
+cargo clean -p yserver -p yserver-core -p yserver-protocol [--release]
+cargo build --release --config 'build.rustc-wrapper=""' --timings                     # release, all cpus
+taskset -c 0-3 cargo build -j4 --release --config 'build.rustc-wrapper=""' --timings  # release, 4
+taskset -c 0-3 cargo build -j4 --config 'build.rustc-wrapper=""' --timings            # dev, 4
+taskset -c 0-3 cargo test -j4 --workspace --all-targets --no-run \
+    --config 'build.rustc-wrapper=""' --timings                                       # test, 4
+```
+Read start + duration per unit from `target/timing/cargo-timings/cargo-timing.html`.
 
 ## Re-run inventory, summary
 
@@ -300,6 +314,8 @@ crate would compile there but nothing would run, so it proves little. The
 `cargo tree` check guards the dependency side. macOS stays recorded as the
 second target (3b's `OutputSink` is designed with a swapchain in mind);
 macOS/Windows scoping, including its CI job, starts after the cleanup.
+FreeBSD CI (#239) already builds the render code, so a Linux-only call or
+`cfg(target_os = "linux")` path entering the crate fails there.
 
 ## Questions for the review
 
