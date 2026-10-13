@@ -1124,7 +1124,11 @@ impl KmsBackend {
             self.scanout_m1.clear("output topology changed");
         }
 
-        if rebuild_scene && let Err(e) = self.scene.rebuild_outputs(&self.platform) {
+        if rebuild_scene
+            && let Err(e) = self
+                .scene
+                .rebuild_outputs(&self.platform, &self.platform.scene_output_layouts())
+        {
             log::error!("kms: scene rebuild after topology change failed: {e:?}; exiting");
             self.request_exit();
             return false;
@@ -2192,7 +2196,10 @@ impl KmsBackend {
             );
         }
         if root_changed || transforms_changed {
-            if let Err(error) = self.scene.sync_output_layouts(&self.platform) {
+            if let Err(error) = self
+                .scene
+                .sync_output_layouts(&self.platform.scene_output_layouts())
+            {
                 log::error!("kms: scene could not follow the RANDR layout: {error}");
             }
             self.scene.wake_for_damage();

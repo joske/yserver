@@ -1,8 +1,5 @@
 use super::*;
-use crate::kms::{
-    core::KmsCore,
-    render::{platform::PlatformBackend, store::DrawableStore, telemetry::Telemetry},
-};
+use crate::kms::render::{platform::PlatformBackend, store::DrawableStore, telemetry::Telemetry};
 
 #[test]
 fn damage_audit_attribution_filters_to_episode_event_range() {
@@ -339,17 +336,16 @@ fn empty_projection_force_compose_gates_on_real_captured_damage() {
 fn stub_scene_is_not_live_and_declines_tick() {
     let mut scene = SceneCompositor::stub();
     assert!(!scene.is_live());
-    let core = KmsCore::for_tests();
+    let core = TestCore::for_tests();
     let mut store = DrawableStore::new();
     let mut platform = PlatformBackend::for_tests();
     let mut telemetry = Telemetry::new();
     let windows = crate::kms::render::backend::WindowsMap::new();
     let err = scene
         .tick(
-            &core,
+            &core.input(&windows, &default_outputs()),
             &mut store,
             &mut platform,
-            &windows,
             &mut telemetry,
             None,
         )

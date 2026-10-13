@@ -94,10 +94,15 @@ impl KmsBackend {
     /// test can assert the walk never samples more than the storage
     /// holds — the wezterm white-block invariant.
     pub fn scene_participant_places_for_tests(&mut self) -> Vec<ScenePlacement> {
+        let outputs = self.platform.scene_output_layouts();
         crate::kms::render::scene::scene_participant_places(
-            &self.core,
+            &crate::kms::render::backend::scene_input(
+                &self.core,
+                &self.windows,
+                &outputs,
+                self.platform.fb_dimensions(),
+            ),
             &mut self.store,
-            &self.windows,
             0,
             &self.platform,
         )
@@ -119,10 +124,15 @@ impl KmsBackend {
     /// [`Self::scene_participant_places_for_tests`], whose `visible` is
     /// only a BOUNDING BOX and therefore blind to a gap inside it.
     pub fn scene_draw_rects_for_tests(&mut self) -> Vec<(i32, i32, u32, u32)> {
+        let outputs = self.platform.scene_output_layouts();
         crate::kms::render::scene::scene_draw_rects(
-            &self.core,
+            &crate::kms::render::backend::scene_input(
+                &self.core,
+                &self.windows,
+                &outputs,
+                self.platform.fb_dimensions(),
+            ),
             &mut self.store,
-            &self.windows,
             0,
             &self.platform,
         )
@@ -362,12 +372,15 @@ impl KmsBackend {
                     "render for_tests_with_vk_live_scene: RenderEngine: {e:?}"
                 ))
             })?;
-        base.scene =
-            crate::kms::render::scene::SceneCompositor::new(&base.platform).map_err(|e| {
-                io::Error::other(format!(
-                    "render for_tests_with_vk_live_scene: SceneCompositor: {e:?}"
-                ))
-            })?;
+        base.scene = crate::kms::render::scene::SceneCompositor::new(
+            &base.platform,
+            &base.platform.scene_output_layouts(),
+        )
+        .map_err(|e| {
+            io::Error::other(format!(
+                "render for_tests_with_vk_live_scene: SceneCompositor: {e:?}"
+            ))
+        })?;
         base.init_root_storage();
         Ok(base)
     }

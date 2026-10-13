@@ -93,6 +93,45 @@ use crate::kms::{
 };
 
 // ────────────────────────────────────────────────────────────────
+// Per-call input
+// ────────────────────────────────────────────────────────────────
+
+/// The geometry the scene reads of one live output, in platform order.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct OutputLayout {
+    /// The root rectangle the output shows: its mode at the CRTC origin, or
+    /// the transformed footprint there (spec D3).
+    pub(crate) root_rect: (i32, i32, u32, u32),
+    /// The CRTC mode, i.e. the scanout BO extent.
+    pub(crate) mode: (u16, u16),
+    /// The current CRTC transform, `None` at identity.
+    pub(crate) transform: Option<yserver_core::randr::CrtcTransform>,
+}
+
+/// The core state and output geometry one scene call reads, borrowed from
+/// the backend for the duration of the call.
+pub(crate) struct SceneInput<'a> {
+    pub(crate) window_id: u32,
+    pub(crate) top_level_order: &'a [u32],
+    pub(crate) shape_bounding: &'a HashMap<u32, Vec<yserver_protocol::x11::xfixes::RegionRect>>,
+    pub(crate) shape_clip: &'a HashMap<u32, Vec<yserver_protocol::x11::xfixes::RegionRect>>,
+    pub(crate) cursor_x: f32,
+    pub(crate) cursor_y: f32,
+    pub(crate) windows: &'a crate::kms::render::backend::WindowsMap,
+    pub(crate) outputs: &'a [OutputLayout],
+    /// The logical screen size.
+    pub(crate) fb_size: (u16, u16),
+}
+
+/// The transform of output `idx`, `None` at identity or past the end.
+fn output_transform(
+    outputs: &[OutputLayout],
+    idx: usize,
+) -> Option<&yserver_core::randr::CrtcTransform> {
+    outputs.get(idx)?.transform.as_ref()
+}
+
+// ────────────────────────────────────────────────────────────────
 // Per-output state
 // ────────────────────────────────────────────────────────────────
 

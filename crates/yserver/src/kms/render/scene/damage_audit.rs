@@ -1,13 +1,13 @@
 use crate::kms::{
-    core::KmsCore,
     render::{
         platform::PlatformBackend,
         scene::{
             ComposeRenderTarget, CursorEntry, DamageAuditEpisodeStart, DamageAuditLedgerEntry,
-            DamageAuditTarget, OutputDamageAudit, Repaint, SceneBuild, SceneCompositor,
-            SceneCompositorInner, SceneError, Visibility,
+            DamageAuditTarget, OutputDamageAudit, OutputLayout, Repaint, SceneBuild,
+            SceneCompositor, SceneCompositorInner, SceneError, SceneInput, Visibility,
             build::build_scene,
             compose::{compose_submit_was_complete, record_and_submit_render},
+            output_transform,
         },
         store::{DrawableStore, RegionSet},
     },
@@ -537,9 +537,8 @@ pub(super) fn audit_sampled_pairs(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn audit_reference_scene(
     production_has_sw_cursor: bool,
-    core: &KmsCore,
+    input: &SceneInput,
     store: &mut DrawableStore,
-    windows: &crate::kms::render::backend::WindowsMap,
     output_idx: usize,
     platform: &PlatformBackend,
     cursor: Option<CursorEntry>,
@@ -551,9 +550,8 @@ pub(super) fn audit_reference_scene(
         return None;
     }
     let mut reference = build_scene(
-        core,
+        input,
         store,
-        windows,
         output_idx,
         platform,
         cursor,
@@ -575,6 +573,7 @@ pub(super) fn audit_reference_scene(
 pub(super) fn run_damage_audit(
     inner: &mut SceneCompositorInner,
     output_idx: usize,
+    outputs: &[OutputLayout],
     platform: &mut PlatformBackend,
     scene: &CompositeScene,
     // Step 1 — the scene the REFERENCE composes: built with `Visibility::Off`,
@@ -595,7 +594,7 @@ pub(super) fn run_damage_audit(
     if !damage_audit_enabled() {
         return Ok(());
     }
-    if platform.output_transform(output_idx).is_some() {
+    if output_transform(outputs, output_idx).is_some() {
         log::debug!(
             "damage-audit: output {output_idx} skipped; transformed scanout is out of scope"
         );

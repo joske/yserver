@@ -1,5 +1,4 @@
 use crate::kms::{
-    core::KmsCore,
     render::{
         platform::PlatformBackend,
         region::Region,
@@ -7,7 +6,7 @@ use crate::kms::{
             CarriedDamage, CopiedRenderSubmitError, CursorAssignment, CursorTransition,
             FailedSubmitBo, FullReason, InFlightStage, OutputSceneState, OutputWalkReport,
             PendingAck, Repaint, RepaintPlan, ScalePass, SceneCompositor, SceneCompositorInner,
-            SceneError, TickOutcome, TickSkipReason, Visibility,
+            SceneError, SceneInput, TickOutcome, TickSkipReason, Visibility,
             build::build_scene_with,
             compose::{
                 compose_submit_was_complete, present_error_is_device_lost, stage_submitted_frame,
@@ -28,6 +27,7 @@ use crate::kms::{
                 drain_pending_pool_releases, handle_scanout_render_completion_inner,
                 retire_failed_submit_bos,
             },
+            output_transform,
             repaint::{
                 cull_scene_to_region, draw_dst_rect_inward, opaque_cover_exists, plan_repaint,
             },
@@ -122,10 +122,9 @@ impl SceneCompositor {
     /// the platform was unusable (no Vk).
     pub(crate) fn tick(
         &mut self,
-        core: &KmsCore,
+        input: &SceneInput,
         store: &mut DrawableStore,
         platform: &mut PlatformBackend,
-        windows: &crate::kms::render::backend::WindowsMap,
         telemetry: &mut Telemetry,
         cow_host_xid: Option<u32>,
     ) -> Result<Vec<usize>, SceneError> {
@@ -148,7 +147,7 @@ impl SceneCompositor {
         }
         debug_assert_eq!(
             inner.outputs.len(),
-            platform.outputs.len(),
+            input.outputs.len(),
             "scene/platform output vectors must stay in lockstep",
         );
         let mut composed = Vec::new();
@@ -171,10 +170,10 @@ impl SceneCompositor {
         // re-classified Hidden ~1000×/s (silence/MATE, 2026-09-04).
         let mut walked_outputs: Vec<bool> = vec![false; inner.outputs.len()];
         let mut carried = Vec::new();
-        if let Err(e) = ensure_intermediates(inner, platform) {
+        if let Err(e) = ensure_intermediates(inner, input.outputs) {
             log::warn!("render scene tick: transform intermediate allocation failed: {e}");
         }
-        let hw_cursor = hw_cursor_allowed(platform);
+        let hw_cursor = hw_cursor_allowed(input.outputs);
         if damage_audit_enabled() {
             emit_damage_audit_heartbeat(inner);
         }
@@ -213,10 +212,9 @@ impl SceneCompositor {
             match tick_one_output(
                 inner,
                 output_idx,
-                core,
+                input,
                 store,
                 platform,
-                windows,
                 telemetry,
                 hw_cursor,
                 cow_host_xid,
@@ -509,10 +507,9 @@ pub(super) fn snapshots_carry_damage(snaps: &[DamageSnapshot]) -> bool {
 fn tick_one_output(
     inner: &mut SceneCompositorInner,
     output_idx: usize,
-    core: &KmsCore,
+    input: &SceneInput,
     store: &mut DrawableStore,
     platform: &mut PlatformBackend,
-    windows: &crate::kms::render::backend::WindowsMap,
     telemetry: &mut Telemetry,
     hw_strategy_enabled: bool,
     cow_host_xid: Option<u32>,
@@ -597,7 +594,7 @@ fn tick_one_output(
 
     // A transformed output composites its footprint into the intermediate
     // and scales that into the BO (spec D4).
-    let transform = platform.output_transform(output_idx).cloned();
+    let transform = output_transform(input.outputs, output_idx).cloned();
     if transform.is_some() && inner.outputs[output_idx].intermediate.is_none() {
         return Err(SceneError::NoIntermediate(output_idx));
     }
@@ -636,9 +633,8 @@ fn tick_one_output(
     // window count. Timed on every tick that gets this far, composed or not.
     let build_scene_start = std::time::Instant::now();
     let mut built = build_scene_with(
-        core,
+        input,
         store,
-        windows,
         output_idx,
         platform,
         inner.cursor.clone(),
@@ -852,14 +848,13 @@ fn tick_one_output(
                 || audit_idle_recompare_due(inner, output_idx)
             {
                 let overlay_ops =
-                    root_overlay.apply_list_for_output(platform.output_root_rect(output_idx));
+                    root_overlay.apply_list_for_output(input.outputs[output_idx].root_rect);
                 let (xor_pipeline, xor_layout) =
                     audit_overlay_pipeline(inner, !overlay_ops.is_empty())?;
                 let reference = audit_reference_scene(
                     built.software_cursor_tail.is_some(),
-                    core,
+                    input,
                     store,
-                    windows,
                     output_idx,
                     platform,
                     inner.cursor.clone(),
@@ -870,6 +865,7 @@ fn tick_one_output(
                 run_damage_audit(
                     inner,
                     output_idx,
+                    input.outputs,
                     platform,
                     &built.scene,
                     reference.as_ref().map_or(&built.scene, |r| &r.scene),
@@ -980,7 +976,7 @@ fn tick_one_output(
     // frame whose scissor misses the overlay rects would XOR them a SECOND time
     // onto a pooled BO that already has them baked in from a prior compose,
     // cancelling them or leaving remnants — the #90 rubber-band residual.
-    for (_, rect) in root_overlay.apply_list_for_output(platform.output_root_rect(output_idx)) {
+    for (_, rect) in root_overlay.apply_list_for_output(input.outputs[output_idx].root_rect) {
         requested.add_rect(rect);
     }
 
@@ -1061,13 +1057,12 @@ fn tick_one_output(
     // Same denominator as `damage_fraction`: one output area per compose.
     telemetry.record_scene_draw_pixels(scene_draw_pixels);
 
-    let overlay_ops = root_overlay.apply_list_for_output(platform.output_root_rect(output_idx));
+    let overlay_ops = root_overlay.apply_list_for_output(input.outputs[output_idx].root_rect);
     let (xor_pipeline, xor_layout) = audit_overlay_pipeline(inner, !overlay_ops.is_empty())?;
     let reference = audit_reference_scene(
         built.software_cursor_tail.is_some(),
-        core,
+        input,
         store,
-        windows,
         output_idx,
         platform,
         inner.cursor.clone(),
@@ -1078,6 +1073,7 @@ fn tick_one_output(
     run_damage_audit(
         inner,
         output_idx,
+        input.outputs,
         platform,
         &built.scene,
         reference.as_ref().map_or(&built.scene, |r| &r.scene),
@@ -1133,8 +1129,8 @@ fn tick_one_output(
             intermediate,
             pipeline,
             t,
-            platform.output_root_rect(output_idx),
-            (u32::from(platform.fb_w), u32::from(platform.fb_h)),
+            input.outputs[output_idx].root_rect,
+            (u32::from(input.fb_size.0), u32::from(input.fb_size.1)),
         )
     });
     // Root reads must not see a software cursor (`cursor_save`): the compose

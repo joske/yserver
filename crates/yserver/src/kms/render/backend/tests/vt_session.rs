@@ -722,7 +722,7 @@ fn make_vt_fixture_headless(b: &mut KmsBackend) {
     b.platform.fb_h = 0;
     b.kms_outputs_active = false;
     b.scene
-        .rebuild_outputs(&b.platform)
+        .rebuild_outputs(&b.platform, &b.platform.scene_output_layouts())
         .expect("headless scene rebuild");
 }
 

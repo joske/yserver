@@ -130,10 +130,12 @@ impl KmsBackend {
         if !self.scene.is_live() {
             return None;
         }
-        if !self
-            .scene
-            .root_readback_is_current(&self.store, &self.platform, output_idx, local)
-        {
+        if !self.scene.root_readback_is_current(
+            &self.store,
+            &self.platform.scene_output_layouts(),
+            output_idx,
+            local,
+        ) {
             if let Err(e) = self.engine.close_open_frame(
                 &mut self.store,
                 &mut self.platform.gpu,
@@ -150,10 +152,16 @@ impl KmsBackend {
             }
         }
         let cow_host_xid = self.cow_host_xid();
-        match self.scene.root_readback(
+        let outputs = self.platform.scene_output_layouts();
+        let input = crate::kms::render::backend::scene_input(
             &self.core,
-            &mut self.store,
             &self.windows,
+            &outputs,
+            self.platform.fb_dimensions(),
+        );
+        match self.scene.root_readback(
+            &input,
+            &mut self.store,
             &self.platform,
             cow_host_xid,
             output_idx,
@@ -173,7 +181,7 @@ impl KmsBackend {
     fn prime_transformed_root_reads(&mut self) {
         if !self
             .scene
-            .has_unprimed_transform_intermediate(&self.platform)
+            .has_unprimed_transform_intermediate(&self.platform.scene_output_layouts())
         {
             return;
         }
@@ -192,10 +200,16 @@ impl KmsBackend {
             log::warn!("render root read: flush_submit_group failed: {e:?}");
         }
         let cow_host_xid = self.cow_host_xid();
-        if let Err(e) = self.scene.prime_transform_intermediates(
+        let outputs = self.platform.scene_output_layouts();
+        let input = crate::kms::render::backend::scene_input(
             &self.core,
-            &mut self.store,
             &self.windows,
+            &outputs,
+            self.platform.fb_dimensions(),
+        );
+        if let Err(e) = self.scene.prime_transform_intermediates(
+            &input,
+            &mut self.store,
             &self.platform,
             cow_host_xid,
         ) {

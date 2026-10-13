@@ -2138,11 +2138,17 @@ impl KmsBackend {
             Ok(())
         } else {
             let cow_host_xid = self.cow_host_xid();
-            match self.scene.tick(
+            let outputs = self.platform.scene_output_layouts();
+            let input = crate::kms::render::backend::scene_input(
                 &self.core,
+                &self.windows,
+                &outputs,
+                self.platform.fb_dimensions(),
+            );
+            match self.scene.tick(
+                &input,
                 &mut self.store,
                 &mut self.platform,
-                &self.windows,
                 &mut self.telemetry,
                 cow_host_xid,
             ) {

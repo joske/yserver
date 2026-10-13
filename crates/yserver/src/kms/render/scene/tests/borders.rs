@@ -1,8 +1,5 @@
 use super::*;
-use crate::kms::{
-    core::KmsCore,
-    render::{scene_diff::structural_damage, store::DrawableStore},
-};
+use crate::kms::render::{scene_diff::structural_damage, store::DrawableStore};
 use yserver_protocol::x11::xfixes;
 
 // ── #133 step 5 (P6) — the scene spaces and the coordinate recurrence ──
@@ -83,7 +80,7 @@ fn dst_rects_of(built: &SceneBuild, xid: u32) -> Vec<vk::Rect2D> {
 /// assertion below fails.
 #[test]
 fn a_bordered_node_samples_its_whole_outer_extent() {
-    let mut core = KmsCore::for_tests();
+    let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
     let mut windows = crate::kms::render::backend::WindowsMap::new();
     alloc_stub_window_bordered(
@@ -132,7 +129,7 @@ fn a_bordered_node_samples_its_whole_outer_extent() {
 /// showed.
 #[test]
 fn a_bordered_parents_child_is_placed_from_the_content_origin() {
-    let mut core = KmsCore::for_tests();
+    let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
     let mut windows = crate::kms::render::backend::WindowsMap::new();
     alloc_stub_window_bordered(
@@ -185,7 +182,7 @@ fn a_bordered_parents_child_is_placed_from_the_content_origin() {
 /// → the child's rect becomes (0,0,132,132) and it covers the ring.
 #[test]
 fn a_child_cannot_overlap_its_parents_border() {
-    let mut core = KmsCore::for_tests();
+    let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
     let mut windows = crate::kms::render::backend::WindowsMap::new();
     alloc_root(&core, &mut store, 800, 600);
@@ -257,7 +254,7 @@ fn a_child_cannot_overlap_its_parents_border() {
 /// the mask lands at (10, 10) instead of (18, 18), off by `bw`.
 #[test]
 fn a_bordered_shaped_windows_mask_is_read_in_content_coordinates() {
-    let mut core = KmsCore::for_tests();
+    let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
     let mut windows = crate::kms::render::backend::WindowsMap::new();
     alloc_stub_window_bordered(
@@ -305,7 +302,7 @@ fn a_bordered_shaped_windows_mask_is_read_in_content_coordinates() {
 /// `inner_place_rects` → the child keeps its full 100x100 rect.
 #[test]
 fn a_clip_shape_narrows_the_child_clip_but_not_the_nodes_own_place() {
-    let mut core = KmsCore::for_tests();
+    let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
     let mut windows = crate::kms::render::backend::WindowsMap::new();
     alloc_root(&core, &mut store, 800, 600);
@@ -368,7 +365,7 @@ fn a_clip_shape_narrows_the_child_clip_but_not_the_nodes_own_place() {
 #[test]
 fn a_redirected_window_is_not_clipped_to_its_parent_and_neither_are_its_children() {
     for participating in [true, false] {
-        let mut core = KmsCore::for_tests();
+        let mut core = TestCore::for_tests();
         let mut store = DrawableStore::new();
         let mut windows = crate::kms::render::backend::WindowsMap::new();
         // Parent 100x100 at (0,0); the redirected child starts at (60,0)
@@ -451,7 +448,7 @@ fn a_redirected_window_is_not_clipped_to_its_parent_and_neither_are_its_children
 #[test]
 fn a_bordered_child_under_a_redirected_ancestor_is_not_displaced() {
     for participating in [true, false] {
-        let mut core = KmsCore::for_tests();
+        let mut core = TestCore::for_tests();
         let mut store = DrawableStore::new();
         let mut windows = crate::kms::render::backend::WindowsMap::new();
         alloc_stub_window(
@@ -655,7 +652,7 @@ fn the_awesome_two_tile_layout_rings_all_four_sides() {
     const CH: u16 = 1389;
     const OW: u32 = CW as u32 + 2 * BW as u32; // 1276
     const OH: u32 = CH as u32 + 2 * BW as u32; // 1421
-    let mut core = KmsCore::for_tests();
+    let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
     let mut windows = crate::kms::render::backend::WindowsMap::new();
     alloc_root(&core, &mut store, 5120, 1440);
@@ -901,7 +898,7 @@ fn a_grow_damages_the_full_new_outer_rect() {
     let small = (200u16, 120u16);
     let big = (400u16, 260u16);
 
-    let mut core = KmsCore::for_tests();
+    let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
     let mut windows = crate::kms::render::backend::WindowsMap::new();
     alloc_root(&core, &mut store, 800, 600);
@@ -1037,7 +1034,7 @@ fn a_grow_damages_the_full_new_outer_rect() {
 fn the_bee_tree_with_a_higher_wibar_sibling_matches_the_unclipped_scene() {
     const BW: u16 = 32;
     const TITLE: i16 = 17;
-    let mut core = KmsCore::for_tests();
+    let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
     let mut windows = crate::kms::render::backend::WindowsMap::new();
     alloc_root(&core, &mut store, 2560, 1440);

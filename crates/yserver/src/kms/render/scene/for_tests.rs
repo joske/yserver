@@ -1,6 +1,4 @@
 #[cfg(test)]
-use crate::kms::core::KmsCore;
-#[cfg(test)]
 use crate::kms::render::platform::PlatformBackend;
 #[cfg(test)]
 use crate::kms::render::scene::CursorAssignment;
@@ -11,6 +9,8 @@ use crate::kms::render::scene::Repaint;
 #[cfg(test)]
 use crate::kms::render::scene::ScalePass;
 use crate::kms::render::scene::SceneCompositor;
+#[cfg(test)]
+use crate::kms::render::scene::SceneInput;
 #[cfg(test)]
 use crate::kms::render::scene::Visibility;
 #[cfg(test)]
@@ -23,6 +23,8 @@ use crate::kms::render::scene::cursor::hw_cursor_allowed;
 use crate::kms::render::scene::damage::clip_rect_to_output_extent;
 #[cfg(test)]
 use crate::kms::render::scene::damage_audit::create_audit_descriptor_pool;
+#[cfg(test)]
+use crate::kms::render::scene::output_transform;
 #[cfg(test)]
 use crate::kms::render::scene::repaint::draw_dst_rect_inward;
 #[cfg(test)]
@@ -47,23 +49,21 @@ impl SceneCompositor {
     #[cfg(test)]
     pub(crate) fn cursor_assignment_for_tests(
         &self,
-        core: &KmsCore,
+        input: &SceneInput,
         store: &mut DrawableStore,
-        windows: &crate::kms::render::backend::WindowsMap,
         platform: &PlatformBackend,
         output_idx: usize,
     ) -> CursorAssignment {
         let cursor = self.inner.as_ref().and_then(|inner| inner.cursor.clone());
         build_scene(
-            core,
+            input,
             store,
-            windows,
             output_idx,
             platform,
             cursor,
             None,
             None,
-            hw_cursor_allowed(platform),
+            hw_cursor_allowed(input.outputs),
             Visibility::On,
         )
         .cursor_assignment
@@ -93,14 +93,12 @@ impl SceneCompositor {
     #[cfg(test)]
     pub(crate) fn compose_transformed_for_tests(
         &mut self,
-        core: &KmsCore,
+        input: &SceneInput,
         store: &mut DrawableStore,
-        windows: &crate::kms::render::backend::WindowsMap,
         platform: &PlatformBackend,
         output_idx: usize,
     ) -> Vec<u8> {
-        self.compose_for_tests(core, store, windows, platform, output_idx)
-            .0
+        self.compose_for_tests(input, store, platform, output_idx).0
     }
 
     /// Test-only: compose identity output `output_idx` as `tick_one_output`
@@ -109,14 +107,12 @@ impl SceneCompositor {
     #[cfg(test)]
     pub(crate) fn compose_identity_for_tests(
         &mut self,
-        core: &KmsCore,
+        input: &SceneInput,
         store: &mut DrawableStore,
-        windows: &crate::kms::render::backend::WindowsMap,
         platform: &PlatformBackend,
         output_idx: usize,
     ) -> (Vec<u8>, Vec<u8>) {
-        let (bytes, image, extent) =
-            self.compose_for_tests(core, store, windows, platform, output_idx);
+        let (bytes, image, extent) = self.compose_for_tests(input, store, platform, output_idx);
         let mut read = bytes.clone();
         self.restore_under_cursor(
             image,
@@ -134,19 +130,17 @@ impl SceneCompositor {
     #[cfg(test)]
     fn compose_for_tests(
         &mut self,
-        core: &KmsCore,
+        input: &SceneInput,
         store: &mut DrawableStore,
-        windows: &crate::kms::render::backend::WindowsMap,
         platform: &PlatformBackend,
         output_idx: usize,
     ) -> (Vec<u8>, vk::Image, vk::Extent2D) {
         let inner = self.inner.as_mut().expect("live scene");
-        let transform = platform.output_transform(output_idx).cloned();
+        let transform = output_transform(input.outputs, output_idx).cloned();
         let cursor = inner.cursor.clone();
         let built = build_scene(
-            core,
+            input,
             store,
-            windows,
             output_idx,
             platform,
             cursor,
@@ -155,10 +149,10 @@ impl SceneCompositor {
             false,
             Visibility::On,
         );
-        let layout = &platform.outputs[output_idx];
+        let layout = &input.outputs[output_idx];
         let mode = vk::Extent2D {
-            width: u32::from(layout.width),
-            height: u32::from(layout.height),
+            width: u32::from(layout.mode.0),
+            height: u32::from(layout.mode.1),
         };
         let mut target = DamageAuditTarget::new(Arc::clone(&inner.vk), mode).expect("target");
         let state = &mut inner.outputs[output_idx];
@@ -167,8 +161,8 @@ impl SceneCompositor {
                 state.intermediate.as_ref().expect("intermediate"),
                 inner.scale_pipeline.as_ref().expect("scale pipeline"),
                 transform,
-                platform.output_root_rect(output_idx),
-                (u32::from(platform.fb_w), u32::from(platform.fb_h)),
+                layout.root_rect,
+                (u32::from(input.fb_size.0), u32::from(input.fb_size.1)),
             )
         });
         let (compose_image, compose_extent) =

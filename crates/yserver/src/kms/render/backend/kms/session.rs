@@ -91,7 +91,7 @@ impl KmsBackend {
         core.cursor_y = init_cy as f32;
         let engine = RenderEngine::new(&platform.gpu)
             .map_err(|e| io::Error::other(format!("render RenderEngine::new failed: {e:?}")))?;
-        let scene = SceneCompositor::new(&platform)
+        let scene = SceneCompositor::new(&platform, &platform.scene_output_layouts())
             .map_err(|e| io::Error::other(format!("render SceneCompositor::new failed: {e:?}")))?;
         let dmabuf_export_supported = platform
             .gpu
@@ -338,11 +338,17 @@ impl KmsBackend {
             log::warn!("render composite_and_flip: flush_submit_group failed: {e:?}");
         }
         let cow_host_xid = self.cow_host_xid();
-        match self.scene.tick(
+        let outputs = self.platform.scene_output_layouts();
+        let input = crate::kms::render::backend::scene_input(
             &self.core,
+            &self.windows,
+            &outputs,
+            self.platform.fb_dimensions(),
+        );
+        match self.scene.tick(
+            &input,
             &mut self.store,
             &mut self.platform,
-            &self.windows,
             &mut self.telemetry,
             cow_host_xid,
         ) {

@@ -6,13 +6,10 @@ mod projection;
 mod tick;
 mod walk;
 use super::*;
-use crate::kms::{
-    core::KmsCore,
-    render::{
-        platform::PlatformBackend,
-        scene_diff::{ParticipantId, SceneRole},
-        store::DrawableStore,
-    },
+use crate::kms::render::{
+    platform::PlatformBackend,
+    scene_diff::{ParticipantId, SceneRole},
+    store::DrawableStore,
 };
 use yserver_protocol::x11::xfixes;
 
@@ -754,31 +751,82 @@ fn legacy_presence_from_draws(
     })
 }
 
-fn platform_with_layout(layout: (i32, i32, u32, u32)) -> PlatformBackend {
-    let (lx, ly, lw, lh) = layout;
-    let mut platform = PlatformBackend::for_tests();
-    let out = &mut platform.outputs[0];
-    out.x = lx;
-    out.y = ly;
-    out.width = u16::try_from(lw).expect("test layout width");
-    out.height = u16::try_from(lh).expect("test layout height");
-    platform
+/// The `KmsCore` fields the scene reads, owned, at `KmsCore::for_tests`
+/// values.
+struct TestCore {
+    window_id: u32,
+    top_level_order: Vec<u32>,
+    shape_bounding: std::collections::HashMap<u32, Vec<xfixes::RegionRect>>,
+    shape_clip: std::collections::HashMap<u32, Vec<xfixes::RegionRect>>,
+    cursor_x: f32,
+    cursor_y: f32,
+}
+
+impl TestCore {
+    fn for_tests() -> Self {
+        Self {
+            window_id: 1,
+            top_level_order: Vec::new(),
+            shape_bounding: std::collections::HashMap::new(),
+            shape_clip: std::collections::HashMap::new(),
+            cursor_x: 400.0,
+            cursor_y: 300.0,
+        }
+    }
+
+    /// The scene input over `windows` and `outputs` on an 800×600 screen
+    /// (`PlatformBackend::for_tests`).
+    fn input<'a>(
+        &'a self,
+        windows: &'a crate::kms::render::backend::WindowsMap,
+        outputs: &'a [OutputLayout],
+    ) -> SceneInput<'a> {
+        SceneInput {
+            window_id: self.window_id,
+            top_level_order: &self.top_level_order,
+            shape_bounding: &self.shape_bounding,
+            shape_clip: &self.shape_clip,
+            cursor_x: self.cursor_x,
+            cursor_y: self.cursor_y,
+            windows,
+            outputs,
+            fb_size: (800, 600),
+        }
+    }
+}
+
+/// One untransformed output at `layout`.
+fn layout_at(layout: (i32, i32, u32, u32)) -> OutputLayout {
+    let (_, _, lw, lh) = layout;
+    OutputLayout {
+        root_rect: layout,
+        mode: (
+            u16::try_from(lw).expect("test layout width"),
+            u16::try_from(lh).expect("test layout height"),
+        ),
+        transform: None,
+    }
+}
+
+/// `PlatformBackend::for_tests`' single output: 800×600 at the origin.
+fn default_outputs() -> [OutputLayout; 1] {
+    [layout_at((0, 0, 800, 600))]
 }
 
 /// `build_scene` on a single output at `layout`, no cursor.
 fn build_with(
     mode: Visibility,
-    core: &KmsCore,
+    core: &TestCore,
     store: &mut DrawableStore,
     windows: &crate::kms::render::backend::WindowsMap,
     layout: (i32, i32, u32, u32),
     cow_host_xid: Option<u32>,
 ) -> SceneBuild {
-    let platform = platform_with_layout(layout);
+    let outputs = [layout_at(layout)];
+    let platform = PlatformBackend::for_tests();
     build_scene(
-        core,
+        &core.input(windows, &outputs),
         store,
-        windows,
         0,
         &platform,
         None,
@@ -809,7 +857,7 @@ fn walk_out_of(built: &SceneBuild) -> WalkOut {
 /// The fixture has no root drawable, so the two lists line up one to one.
 fn walk_with(
     legacy: bool,
-    core: &KmsCore,
+    core: &TestCore,
     store: &mut DrawableStore,
     windows: &crate::kms::render::backend::WindowsMap,
     layout: (i32, i32, u32, u32),
@@ -885,11 +933,11 @@ fn alloc_backing(
 /// The tree every differential case runs on. Ranks are all distinct so
 /// sibling order does not depend on `HashMap` iteration.
 fn differential_fixture() -> (
-    KmsCore,
+    TestCore,
     DrawableStore,
     crate::kms::render::backend::WindowsMap,
 ) {
-    let mut core = KmsCore::for_tests();
+    let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
     let mut windows = crate::kms::render::backend::WindowsMap::new();
     let mut rank = 1u64;
@@ -1239,7 +1287,7 @@ fn stacks_equal(a: &PixelStack, b: &PixelStack) -> bool {
 /// same fixture, on every pixel of the output. Returns the `On` build for
 /// further assertions.
 fn assert_oracle(
-    core: &KmsCore,
+    core: &TestCore,
     store: &mut DrawableStore,
     windows: &crate::kms::render::backend::WindowsMap,
     layout: (i32, i32, u32, u32),
@@ -1268,7 +1316,7 @@ fn assert_oracle(
 }
 
 /// Root drawable at the logical screen size, sampled through a sentinel view.
-fn alloc_root(core: &KmsCore, store: &mut DrawableStore, w: u32, h: u32) {
+fn alloc_root(core: &TestCore, store: &mut DrawableStore, w: u32, h: u32) {
     let mut storage = crate::kms::render::store::Storage::for_tests_null(
         extent(w, h),
         vk::Format::B8G8R8A8_UNORM,
@@ -1309,11 +1357,11 @@ fn two_windows(
     lower: (i16, i16, u16, u16),
     upper: (i16, i16, u16, u16),
 ) -> (
-    KmsCore,
+    TestCore,
     DrawableStore,
     crate::kms::render::backend::WindowsMap,
 ) {
-    let mut core = KmsCore::for_tests();
+    let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
     let mut windows = crate::kms::render::backend::WindowsMap::new();
     alloc_root(&core, &mut store, 800, 600);

@@ -5,10 +5,11 @@ use crate::kms::{
         platform::{FenceTicket, PlatformBackend},
         scanout_damage::ScanoutDamage,
         scene::{
-            BufferAgeRing, DeferredSceneRelease, FailedSubmitBo, OutputCursorMode,
+            BufferAgeRing, DeferredSceneRelease, FailedSubmitBo, OutputCursorMode, OutputLayout,
             OutputSceneState, SceneCompositor, SceneCompositorInner, SceneError,
             cursor::{reset_cursor_mode_for_lifecycle, reset_cursor_retry_for_lifecycle},
             damage_audit::build_output_damage_audit,
+            output_transform,
             transform::{ensure_intermediates, release_intermediate},
         },
         store::RegionSet,
@@ -110,7 +111,10 @@ impl SceneCompositor {
     ///
     /// `PipelineInit` on shader / pipeline build failure;
     /// `Vk(...)` on descriptor-pool init.
-    pub(crate) fn new(platform: &PlatformBackend) -> Result<Self, SceneError> {
+    pub(crate) fn new(
+        platform: &PlatformBackend,
+        layouts: &[OutputLayout],
+    ) -> Result<Self, SceneError> {
         let vk = platform.gpu.vk().ok_or(SceneError::NoVk)?.clone();
         let pipeline = CompositorPipeline::new(Arc::clone(&vk), vk::Format::B8G8R8A8_UNORM)
             .map_err(SceneError::PipelineInit)?;
@@ -123,9 +127,9 @@ impl SceneCompositor {
             Arc::clone(&vk),
             vk::Format::B8G8R8A8_UNORM,
         )?;
-        let mut outputs = Vec::with_capacity(platform.outputs.len());
-        for i in 0..platform.outputs.len() {
-            outputs.push(Self::build_output_state(&vk, platform, i)?);
+        let mut outputs = Vec::with_capacity(layouts.len());
+        for i in 0..layouts.len() {
+            outputs.push(Self::build_output_state(&vk, platform, layouts, i)?);
         }
         let mut inner = SceneCompositorInner {
             vk,
@@ -138,7 +142,7 @@ impl SceneCompositor {
             cursor: None,
             root_readbacks: Vec::new(),
         };
-        ensure_intermediates(&mut inner, platform)?;
+        ensure_intermediates(&mut inner, layouts)?;
         Ok(Self {
             inner: Some(inner),
             root_overlay: crate::kms::render::root_overlay::RootOverlay::default(),
@@ -154,11 +158,12 @@ impl SceneCompositor {
     fn build_output_state(
         vk: &Arc<crate::kms::vk::device::VkContext>,
         platform: &PlatformBackend,
+        layouts: &[OutputLayout],
         i: usize,
     ) -> Result<OutputSceneState, SceneError> {
-        let layout = &platform.outputs[i];
+        let layout = &layouts[i];
         // What the scene walk covers: the footprint of a transformed output.
-        let (root_x, root_y, root_w, root_h) = platform.output_root_rect(i);
+        let (root_x, root_y, root_w, root_h) = layout.root_rect;
         let ring = CompositePoolRing::new(Arc::clone(vk), MAX_DESCRIPTOR_SETS_PER_FRAME)
             .map_err(SceneError::Vk)?;
         let bo_depth = platform
@@ -204,14 +209,14 @@ impl SceneCompositor {
             last_pieces: std::collections::HashSet::new(),
             presented_epochs: std::collections::HashMap::new(),
             intermediate: None,
-            transform: platform.output_transform(i).cloned(),
+            transform: layout.transform.clone(),
             cursor_saves: CursorSaves::default(),
             // Per scanout BO, so in mode (BO) pixels even when transformed.
             damage: ScanoutDamage::new(
                 bo_depth,
                 vk::Extent2D {
-                    width: u32::from(layout.width),
-                    height: u32::from(layout.height),
+                    width: u32::from(layout.mode.0),
+                    height: u32::from(layout.mode.1),
                 },
             ),
         })
@@ -234,14 +239,18 @@ impl SceneCompositor {
         }
     }
 
-    pub(crate) fn rebuild_outputs(&mut self, platform: &PlatformBackend) -> Result<(), SceneError> {
+    pub(crate) fn rebuild_outputs(
+        &mut self,
+        platform: &PlatformBackend,
+        layouts: &[OutputLayout],
+    ) -> Result<(), SceneError> {
         let Some(inner) = self.inner.as_mut() else {
             return Ok(());
         };
         let vk = inner.vk.clone();
-        let mut outputs = Vec::with_capacity(platform.outputs.len());
-        for i in 0..platform.outputs.len() {
-            outputs.push(Self::build_output_state(&vk, platform, i)?);
+        let mut outputs = Vec::with_capacity(layouts.len());
+        for i in 0..layouts.len() {
+            outputs.push(Self::build_output_state(&vk, platform, layouts, i)?);
         }
         for old in &mut inner.outputs {
             release_intermediate(old, &vk);
@@ -264,16 +273,16 @@ impl SceneCompositor {
     /// identity output keeps today's state untouched.
     pub(crate) fn sync_output_layouts(
         &mut self,
-        platform: &PlatformBackend,
+        layouts: &[OutputLayout],
     ) -> Result<(), SceneError> {
         let Some(inner) = self.inner.as_mut() else {
             return Ok(());
         };
         let mut changed = false;
         for (i, o) in inner.outputs.iter_mut().enumerate() {
-            let (x, y, width, height) = platform.output_root_rect(i);
+            let (x, y, width, height) = layouts[i].root_rect;
             let extent = vk::Extent2D { width, height };
-            let transform = platform.output_transform(i);
+            let transform = output_transform(layouts, i);
             let wanted = transform.map(|_| extent);
             let held = o.intermediate.as_ref().map(|im| im.extent);
             let same_layout = o.output_origin == (x, y) && o.output_extent == extent;
@@ -295,7 +304,7 @@ impl SceneCompositor {
             o.prev_presented.clear();
             o.last_pieces.clear();
         }
-        ensure_intermediates(inner, platform)?;
+        ensure_intermediates(inner, layouts)?;
         if changed {
             self.note_structure_change();
         }

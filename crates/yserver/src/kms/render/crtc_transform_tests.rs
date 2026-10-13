@@ -12,7 +12,7 @@ use yserver_core::{
     server::ServerState,
 };
 
-use super::{KmsBackend, tests::push_test_output};
+use super::{KmsBackend, scene_input, tests::push_test_output};
 use crate::kms::render::scene::{CursorAssignment, CursorEntry, SceneCompositor};
 
 /// The mode of both test outputs: small enough for lavapipe, one pattern
@@ -57,7 +57,8 @@ fn transformed_pair(transform: CrtcTransform, root: (u16, u16)) -> Option<KmsBac
         .expect("root size");
     let key = b.platform.outputs[1].key.clone();
     b.platform.output_transforms.insert(key, transform);
-    b.scene = SceneCompositor::new(&b.platform).expect("live scene");
+    b.scene =
+        SceneCompositor::new(&b.platform, &b.platform.scene_output_layouts()).expect("live scene");
     let (w, h) = (u32::from(root.0), u32::from(root.1));
     let bytes: Vec<u8> = (0..h)
         .flat_map(|y| (0..w).flat_map(move |x| pattern(x, y)))
@@ -81,8 +82,10 @@ fn compose_right(b: &mut KmsBackend) -> Vec<u8> {
     b.engine
         .flush_submit_group(&mut b.store, &mut b.platform.gpu, FlushReason::SceneCompose)
         .expect("flush");
+    let outputs = b.platform.scene_output_layouts();
+    let input = scene_input(&b.core, &b.windows, &outputs, b.platform.fb_dimensions());
     b.scene
-        .compose_transformed_for_tests(&b.core, &mut b.store, &b.windows, &b.platform, 1)
+        .compose_transformed_for_tests(&input, &mut b.store, &b.platform, 1)
 }
 
 fn scanout_px(bytes: &[u8], x: u32, y: u32) -> [u8; 4] {
@@ -238,7 +241,9 @@ fn the_intermediate_follows_the_transform_lifecycle() {
     b.platform
         .output_transforms
         .insert(key.clone(), scale(0x8000, None));
-    b.scene.sync_output_layouts(&b.platform).unwrap();
+    b.scene
+        .sync_output_layouts(&b.platform.scene_output_layouts())
+        .unwrap();
     let (resized, extent) = b.scene.intermediate_for_tests(1).expect("reallocated");
     assert_eq!(
         (extent.width, extent.height),
@@ -248,7 +253,9 @@ fn the_intermediate_follows_the_transform_lifecycle() {
     assert_eq!(category_of(resized), Some(MemCategory::Transform));
 
     b.platform.output_transforms.remove(&key);
-    b.scene.sync_output_layouts(&b.platform).unwrap();
+    b.scene
+        .sync_output_layouts(&b.platform.scene_output_layouts())
+        .unwrap();
     assert!(
         b.scene.intermediate_for_tests(1).is_none(),
         "freed at identity"
@@ -273,7 +280,9 @@ fn a_same_footprint_rotation_change_repaints_the_output() {
     b.platform
         .output_transforms
         .insert(key, rotate(RR_ROTATE_270));
-    b.scene.sync_output_layouts(&b.platform).unwrap();
+    b.scene
+        .sync_output_layouts(&b.platform.scene_output_layouts())
+        .unwrap();
     assert_eq!(
         b.scene.intermediate_for_tests(1).map(|(m, _)| m),
         Some(memory),
@@ -384,13 +393,11 @@ fn the_cursor_is_software_on_every_output_and_scales_with_the_content() {
     register_test_cursor(&mut b);
     for (output_idx, at) in [(0, (10.0, 10.0)), (1, (72.0, 8.0))] {
         (b.core.cursor_x, b.core.cursor_y) = at;
-        let assignment = b.scene.cursor_assignment_for_tests(
-            &b.core,
-            &mut b.store,
-            &b.windows,
-            &b.platform,
-            output_idx,
-        );
+        let outputs = b.platform.scene_output_layouts();
+        let input = scene_input(&b.core, &b.windows, &outputs, b.platform.fb_dimensions());
+        let assignment =
+            b.scene
+                .cursor_assignment_for_tests(&input, &mut b.store, &b.platform, output_idx);
         assert!(
             matches!(assignment, CursorAssignment::Sw { .. }),
             "output {output_idx}: {assignment:?}"
@@ -447,9 +454,11 @@ fn root_reads_never_see_the_software_cursor() {
 
     // Identity: the BO shows it at (10, 10); a read of the BO does not.
     (b.core.cursor_x, b.core.cursor_y) = (10.0, 10.0);
-    let (bo, read) =
-        b.scene
-            .compose_identity_for_tests(&b.core, &mut b.store, &b.windows, &b.platform, 0);
+    let outputs = b.platform.scene_output_layouts();
+    let input = scene_input(&b.core, &b.windows, &outputs, b.platform.fb_dimensions());
+    let (bo, read) = b
+        .scene
+        .compose_identity_for_tests(&input, &mut b.store, &b.platform, 0);
     for y in 8..16u32 {
         for x in 8..16u32 {
             let under = (10..14).contains(&x) && (10..14).contains(&y);
@@ -636,7 +645,9 @@ fn a_root_read_right_after_a_transform_becomes_current_sees_the_root() {
     };
     // Start at identity: the transform arrives through the protocol.
     b.platform.output_transforms.clear();
-    b.scene.sync_output_layouts(&b.platform).unwrap();
+    b.scene
+        .sync_output_layouts(&b.platform.scene_output_layouts())
+        .unwrap();
     for output in &mut b.platform.outputs {
         output.output.picked.width = MODE.0;
         output.output.picked.height = MODE.1;
@@ -862,7 +873,9 @@ fn set_crtc_config_rotates_the_right_hand_output() {
         return;
     };
     b.platform.output_transforms.clear();
-    b.scene.sync_output_layouts(&b.platform).unwrap();
+    b.scene
+        .sync_output_layouts(&b.platform.scene_output_layouts())
+        .unwrap();
     for output in &mut b.platform.outputs {
         output.output.picked.width = MODE.0;
         output.output.picked.height = MODE.1;

@@ -185,6 +185,27 @@ impl std::ops::DerefMut for TrackedWindows {
     }
 }
 
+/// The scene's per-call input. A free function over disjoint `KmsBackend`
+/// fields, so it can be held across `&mut self.platform` / `&mut self.store`.
+pub(super) fn scene_input<'a>(
+    core: &'a crate::kms::core::KmsCore,
+    windows: &'a WindowsMap,
+    outputs: &'a [crate::kms::render::scene::OutputLayout],
+    fb_size: (u16, u16),
+) -> crate::kms::render::scene::SceneInput<'a> {
+    crate::kms::render::scene::SceneInput {
+        window_id: core.window_id,
+        top_level_order: &core.top_level_order,
+        shape_bounding: &core.shape_bounding,
+        shape_clip: &core.shape_clip,
+        cursor_x: core.cursor_x,
+        cursor_y: core.cursor_y,
+        windows,
+        outputs,
+        fb_size,
+    }
+}
+
 /// Test-only (#133): one scene participant's placement — its host xid and
 /// its output-local rects as `(x, y, w, h)`. Named so
 /// `KmsBackend::scene_participant_places_for_tests` has a simple signature.

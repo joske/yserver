@@ -1,10 +1,7 @@
 use super::*;
-use crate::kms::{
-    core::KmsCore,
-    render::{
-        scene_diff::{SceneRole, structural_damage},
-        store::DrawableStore,
-    },
+use crate::kms::render::{
+    scene_diff::{SceneRole, structural_damage},
+    store::DrawableStore,
 };
 use yserver_protocol::x11::xfixes;
 
@@ -323,7 +320,7 @@ fn a_partly_covered_window_emits_only_its_visible_pieces() {
 /// pre-step-1 emitter the child clip came from the parent's rect alone.
 #[test]
 fn an_empty_parent_shape_suppresses_its_children() {
-    let mut core = KmsCore::for_tests();
+    let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
     let mut windows = crate::kms::render::backend::WindowsMap::new();
     alloc_root(&core, &mut store, 800, 600);
@@ -373,7 +370,7 @@ fn an_empty_parent_shape_suppresses_its_children() {
 
 #[test]
 fn a_partial_parent_shape_clips_its_children() {
-    let mut core = KmsCore::for_tests();
+    let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
     let mut windows = crate::kms::render::backend::WindowsMap::new();
     alloc_root(&core, &mut store, 800, 600);
@@ -437,7 +434,7 @@ fn a_partial_parent_shape_clips_its_children() {
 /// below still emit in full, and the COW blends over them.
 #[test]
 fn a_cow_subtree_claims_nothing() {
-    let mut core = KmsCore::for_tests();
+    let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
     let mut windows = crate::kms::render::backend::WindowsMap::new();
     alloc_root(&core, &mut store, 800, 600);
@@ -493,7 +490,7 @@ fn a_cow_subtree_claims_nothing() {
 /// automatic child claims through it: the root loses the child's area.
 #[test]
 fn an_opaque_automatic_child_claims_through_a_manual_parent() {
-    let mut core = KmsCore::for_tests();
+    let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
     let mut windows = crate::kms::render::backend::WindowsMap::new();
     alloc_root(&core, &mut store, 800, 600);
@@ -614,7 +611,7 @@ fn straddling_windows_and_layout_origins_sample_the_right_texels() {
 /// asserted directly.
 #[test]
 fn a_redirected_backing_larger_than_its_host_is_sampled_unstretched() {
-    let mut core = KmsCore::for_tests();
+    let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
     let mut windows = crate::kms::render::backend::WindowsMap::new();
     alloc_root(&core, &mut store, 800, 600);
@@ -668,7 +665,7 @@ fn a_redirected_backing_larger_than_its_host_is_sampled_unstretched() {
 /// and the oracle still holds, because painter's order repaints the extra.
 #[test]
 fn a_collapsed_universe_over_emits_but_shows_the_same_pixels() {
-    let mut core = KmsCore::for_tests();
+    let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
     let mut windows = crate::kms::render::backend::WindowsMap::new();
     alloc_root(&core, &mut store, 800, 600);

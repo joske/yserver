@@ -76,6 +76,17 @@ impl PlatformBackend {
         (layout.x, layout.y, u32::from(w), u32::from(h))
     }
 
+    /// What the scene reads of every live output, in `outputs` order.
+    pub(crate) fn scene_output_layouts(&self) -> Vec<crate::kms::render::scene::OutputLayout> {
+        (0..self.outputs.len())
+            .map(|idx| crate::kms::render::scene::OutputLayout {
+                root_rect: self.output_root_rect(idx),
+                mode: (self.outputs[idx].width, self.outputs[idx].height),
+                transform: self.output_transform(idx).cloned(),
+            })
+            .collect()
+    }
+
     pub(crate) fn primary_device(&self) -> Option<&KmsDevice> {
         self.devices.first()
     }

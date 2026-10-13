@@ -1,26 +1,23 @@
 use super::*;
-use crate::kms::{
-    core::KmsCore,
-    render::{scene_diff::structural_damage, store::DrawableStore},
-};
+use crate::kms::render::{scene_diff::structural_damage, store::DrawableStore};
 use yserver_protocol::x11::xfixes;
 
 /// `build_with` for one output of a multi-output layout: `elsewhere` is
 /// what the OTHER output(s) showed at their last walk (their `pieces_ids`).
 fn build_with_elsewhere(
     mode: Visibility,
-    core: &KmsCore,
+    core: &TestCore,
     store: &mut DrawableStore,
     windows: &crate::kms::render::backend::WindowsMap,
     layout: (i32, i32, u32, u32),
     cow_host_xid: Option<u32>,
     elsewhere: &std::collections::HashSet<crate::kms::render::store::DrawableId>,
 ) -> SceneBuild {
-    let platform = platform_with_layout(layout);
+    let outputs = [layout_at(layout)];
+    let platform = PlatformBackend::for_tests();
     build_scene_with(
-        core,
+        &core.input(windows, &outputs),
         store,
-        windows,
         0,
         &platform,
         None,
@@ -884,11 +881,11 @@ fn intersect_rects_clips_and_rejects_disjoint() {
 /// with 6 shaped leaf children of 8 rects, plus one large opaque window
 /// covering half the screen, over a root.
 fn e16_like_fixture() -> (
-    KmsCore,
+    TestCore,
     DrawableStore,
     crate::kms::render::backend::WindowsMap,
 ) {
-    let mut core = KmsCore::for_tests();
+    let mut core = TestCore::for_tests();
     let mut store = DrawableStore::new();
     let mut windows = crate::kms::render::backend::WindowsMap::new();
     alloc_root(&core, &mut store, 2560, 1440);
@@ -995,10 +992,19 @@ fn e16_like_fixture() -> (
 fn walk_bench() {
     let (core, mut store, windows) = e16_like_fixture();
     let layout = (0, 0, 2560u32, 1440u32);
-    let platform = platform_with_layout(layout);
+    let outputs = [layout_at(layout)];
+    let platform = PlatformBackend::for_tests();
     let run = |mode: Visibility, store: &mut DrawableStore| {
         build_scene(
-            &core, store, &windows, 0, &platform, None, None, None, false, mode,
+            &core.input(&windows, &outputs),
+            store,
+            0,
+            &platform,
+            None,
+            None,
+            None,
+            false,
+            mode,
         )
     };
     let warm = run(Visibility::On, &mut store);

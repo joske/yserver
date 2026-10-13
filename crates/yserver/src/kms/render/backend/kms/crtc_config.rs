@@ -122,8 +122,9 @@ impl KmsBackend {
         restore_old_topology: bool,
         original: io::Error,
     ) -> io::Error {
-        let scene_recovery_failed = if let Err(scene_error) =
-            self.scene.rebuild_outputs(&self.platform)
+        let scene_recovery_failed = if let Err(scene_error) = self
+            .scene
+            .rebuild_outputs(&self.platform, &self.platform.scene_output_layouts())
         {
             log::error!(
                 "apply_crtc_config: scene recovery after failure also failed: {scene_error:?}; exiting"
@@ -807,7 +808,10 @@ impl KmsBackend {
             true,
             self.platform.outputs.len(),
         );
-        if let Err(error) = self.scene.rebuild_outputs(&self.platform) {
+        if let Err(error) = self
+            .scene
+            .rebuild_outputs(&self.platform, &self.platform.scene_output_layouts())
+        {
             log::error!(
                 "finish_crtc_config: scene rebuild failed after topology change: {error:?}"
             );
@@ -1142,7 +1146,10 @@ impl KmsBackend {
         );
 
         // ── Scene + RANDR rebuild ─────────────────────────────────────────
-        if let Err(e) = self.scene.rebuild_outputs(&self.platform) {
+        if let Err(e) = self
+            .scene
+            .rebuild_outputs(&self.platform, &self.platform.scene_output_layouts())
+        {
             log::error!("apply_crtc_config: scene rebuild failed after topology change: {e:?}");
             let error = io::Error::other(format!("apply_crtc_config: scene rebuild failed: {e:?}"));
             let relight = self

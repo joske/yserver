@@ -1,11 +1,10 @@
 use crate::kms::{
-    core::KmsCore,
     render::{
         platform::PlatformBackend,
         region::Region,
         scene::{
             CarriedDamage, ContentDamage, CursorAssignment, CursorEntry, Emitted, RootNode,
-            SceneBuild, Visibility, WalkSink, WalkStats,
+            SceneBuild, SceneInput, Visibility, WalkSink, WalkStats,
             cursor::cursor_footprint_rect,
             damage::{clip_rect_to_output_extent, project_onto_output},
             repaint::draw_dst_rect_inward,
@@ -120,9 +119,8 @@ pub(super) fn scene_walk_debug_enabled_for(host_xid: u32) -> bool {
 ///   `define_cursor` wiring stays Stage 4.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_scene(
-    core: &KmsCore,
+    input: &SceneInput,
     store: &mut DrawableStore,
-    windows: &crate::kms::render::backend::WindowsMap,
     output_idx: usize,
     platform: &PlatformBackend,
     cursor: Option<CursorEntry>,
@@ -135,9 +133,8 @@ pub(super) fn build_scene(
     // stranded (forced and acked here), which is the single-output rule.
     let nowhere = std::collections::HashSet::new();
     build_scene_with(
-        core,
+        input,
         store,
-        windows,
         output_idx,
         platform,
         cursor,
@@ -159,16 +156,14 @@ pub(super) fn build_scene(
 /// The draw list is the ground truth: a node that emits one unbroken
 /// piece contributes exactly one rect equal to its placement.
 pub(crate) fn scene_draw_rects(
-    core: &KmsCore,
+    input: &SceneInput,
     store: &mut DrawableStore,
-    windows: &crate::kms::render::backend::WindowsMap,
     output_idx: usize,
     platform: &PlatformBackend,
 ) -> Vec<vk::Rect2D> {
     let built = build_scene(
-        core,
+        input,
         store,
-        windows,
         output_idx,
         platform,
         None,
@@ -198,16 +193,14 @@ pub(crate) fn scene_draw_rects(
 /// test can state exactly is "placement never exceeds the storage being
 /// sampled", and that needs the placement.
 pub(crate) fn scene_participant_places(
-    core: &KmsCore,
+    input: &SceneInput,
     store: &mut DrawableStore,
-    windows: &crate::kms::render::backend::WindowsMap,
     output_idx: usize,
     platform: &PlatformBackend,
 ) -> Vec<(u32, Vec<vk::Rect2D>, Vec<vk::Rect2D>)> {
     let built = build_scene(
-        core,
+        input,
         store,
-        windows,
         output_idx,
         platform,
         None,
@@ -229,10 +222,10 @@ pub(crate) fn scene_participant_places(
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
 pub(super) fn build_scene_with(
-    core: &KmsCore,
+    input: &SceneInput,
     store: &mut DrawableStore,
-    windows: &crate::kms::render::backend::WindowsMap,
     output_idx: usize,
+    // Only for the cursor-plane `fits` query.
     platform: &PlatformBackend,
     cursor: Option<CursorEntry>,
     _cursor_prev_pos: Option<(i32, i32)>,
@@ -261,13 +254,13 @@ pub(super) fn build_scene_with(
 ) -> SceneBuild {
     let bg = [0.0, 0.0, 0.0, 1.0];
     // A transformed output walks its whole footprint (spec D4).
-    let (layout_x0, layout_y0, layout_w, layout_h) = platform.output_root_rect(output_idx);
+    let (layout_x0, layout_y0, layout_w, layout_h) = input.outputs[output_idx].root_rect;
 
     let mut sink = WalkSink::new(output_idx, (layout_x0, layout_y0), elsewhere);
     // Stage 4c.3 — the root samples through `redirected_target` like any other
     // node; geometry stays the host drawable's. Decided up front, emitted last
     // (see below).
-    let root = root_node(core, store, layout_x0, layout_y0, layout_w, layout_h, mode);
+    let root = root_node(input, store, layout_x0, layout_y0, layout_w, layout_h, mode);
     // Phase 2.7 — the COW emits via the normal top_level_order walk
     // like any other root child. After Phase 2.2/2.5, the COW is a
     // first-class entry in `windows` + `top_level_order`; the
@@ -279,8 +272,8 @@ pub(super) fn build_scene_with(
         "render scene_walk begin output={output_idx} top_levels={n} order={order:?} \
          cow_host_xid={cow_host_xid:?} \
          layout=({layout_x0},{layout_y0} {layout_w}x{layout_h}) mode={mode:?}",
-        n = core.top_level_order.len(),
-        order = core.top_level_order,
+        n = input.top_level_order.len(),
+        order = input.top_level_order,
     );
     // Fullscreen-unredirect / direct-scanout bypass. The COW is the always-on-
     // top compositor overlay carrying the composite of the REDIRECTED windows.
@@ -315,13 +308,14 @@ pub(super) fn build_scene_with(
     // an unredirected fullscreen window hidden under the compositor's
     // desktop composite (issue #98: fullscreen games/video render as the
     // wallpaper while audio keeps playing).
-    let topmost_on_output = core
+    let topmost_on_output = input
         .top_level_order
         .iter()
         .rev()
         .filter(|&&x| Some(x) != cow_host_xid)
         .find_map(|&x| {
-            windows
+            input
+                .windows
                 .get(&x)
                 .filter(|g| {
                     g.mapped
@@ -364,7 +358,7 @@ pub(super) fn build_scene_with(
             "cow_diag: output={output_idx} suppress_cow={suppress_cow} \
              cow_shape_rects={shape:?} picked={picked} order_top={top:?}",
             shape = cow_host_xid
-                .and_then(|c| core.shape_bounding.get(&c))
+                .and_then(|c| input.shape_bounding.get(&c))
                 .map(Vec::len),
             picked = topmost_on_output.map_or_else(
                 || "none".to_string(),
@@ -381,7 +375,7 @@ pub(super) fn build_scene_with(
                         .is_some_and(|d| d.scene_participating),
                 ),
             ),
-            top = core
+            top = input
                 .top_level_order
                 .iter()
                 .rev()
@@ -397,7 +391,7 @@ pub(super) fn build_scene_with(
             log::debug!("{msg}");
         }
     }
-    let children = children_index(windows);
+    let children = children_index(input.windows);
     // Step 1 — the universe for the root's children is the output: X11 clips
     // top-levels to the screen. Under `Off` the region is never read.
     let mut universe = match mode {
@@ -412,7 +406,7 @@ pub(super) fn build_scene_with(
     };
     // Computation order is top → bottom (`miComputeClips` visits the topmost
     // sibling first); the sink is reversed into painter's order below.
-    for &top_xid in core.top_level_order.iter().rev() {
+    for &top_xid in input.top_level_order.iter().rev() {
         if suppress_cow && Some(top_xid) == cow_host_xid {
             continue;
         }
@@ -421,10 +415,10 @@ pub(super) fn build_scene_with(
             0,
             0,
             store,
-            windows,
+            input.windows,
             &children,
-            &core.shape_bounding,
-            &core.shape_clip,
+            input.shape_bounding,
+            input.shape_clip,
             layout_x0,
             layout_y0,
             layout_w,
@@ -488,7 +482,7 @@ pub(super) fn build_scene_with(
             out,
             ParticipantId {
                 role: SceneRole::Root,
-                xid: core.window_id,
+                xid: input.window_id,
                 generation: root.id.as_u64(),
             },
         );
@@ -541,8 +535,8 @@ pub(super) fn build_scene_with(
         let ch = i32::try_from(cur.extent.height).unwrap_or(i32::MAX);
         let layout_w_i = i32::try_from(layout_w).unwrap_or(i32::MAX);
         let layout_h_i = i32::try_from(layout_h).unwrap_or(i32::MAX);
-        let dx = (core.cursor_x as i32) - i32::from(cur.hot_x) - layout_x0;
-        let dy = (core.cursor_y as i32) - i32::from(cur.hot_y) - layout_y0;
+        let dx = (input.cursor_x as i32) - i32::from(cur.hot_x) - layout_x0;
+        let dy = (input.cursor_y as i32) - i32::from(cur.hot_y) - layout_y0;
         let new_rect = cursor_footprint_rect(dx, dy, cw, ch, layout_w_i, layout_h_i);
         if new_rect.is_none() {
             // Off-output / fully-clipped — the cursor isn't on this
@@ -563,8 +557,8 @@ pub(super) fn build_scene_with(
             if hw_strategy_active && hw_fits {
                 (
                     CursorAssignment::Hw {
-                        x: core.cursor_x as i32,
-                        y: core.cursor_y as i32,
+                        x: input.cursor_x as i32,
+                        y: input.cursor_y as i32,
                         record_version: cur.record_version,
                         hot_x: u16::try_from(cur.hot_x.max(0)).unwrap_or(0),
                         hot_y: u16::try_from(cur.hot_y.max(0)).unwrap_or(0),
@@ -622,7 +616,7 @@ pub(super) fn build_scene_with(
 }
 
 fn root_node(
-    core: &KmsCore,
+    input: &SceneInput,
     store: &DrawableStore,
     layout_x0: i32,
     layout_y0: i32,
@@ -630,7 +624,7 @@ fn root_node(
     layout_h: u32,
     mode: Visibility,
 ) -> Option<RootNode> {
-    let id = store.lookup(core.window_id)?;
+    let id = store.lookup(input.window_id)?;
     let drawable = store.get(id)?;
     if !drawable.scene_participating || !matches!(drawable.kind, DrawableKind::Root) {
         return None;

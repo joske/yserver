@@ -3,8 +3,8 @@ use crate::kms::render::{
     platform::PlatformBackend,
     scene::{
         CursorAssignment, CursorEntry, CursorPlaneMode, CursorRetireResolution, CursorTransition,
-        CursorTransitionResult, OutputCursorMode, OutputSceneState, SceneBuild, SceneCompositor,
-        SceneCompositorInner,
+        CursorTransitionResult, OutputCursorMode, OutputLayout, OutputSceneState, SceneBuild,
+        SceneCompositor, SceneCompositorInner,
     },
     store::RegionSet,
 };
@@ -534,8 +534,8 @@ pub(super) fn apply_cursor_transition_on_retire(
 /// Xorg refuses the HW cursor while any CRTC is transformed
 /// (xf86Cursors.c:569): software on every output, so it scales with the
 /// content and never vanishes crossing to an identity output (spec D5).
-pub(super) fn hw_cursor_allowed(platform: &PlatformBackend) -> bool {
-    !platform.any_output_transformed()
+pub(super) fn hw_cursor_allowed(outputs: &[OutputLayout]) -> bool {
+    !outputs.iter().any(|output| output.transform.is_some())
 }
 
 pub(super) fn cursor_damage_for_frame(

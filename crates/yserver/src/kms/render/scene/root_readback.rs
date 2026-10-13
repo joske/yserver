@@ -1,14 +1,11 @@
-use crate::kms::{
-    core::KmsCore,
-    render::{
-        platform::PlatformBackend,
-        scene::{
-            DamageAuditTarget, Repaint, RootReadback, SceneCompositor, SceneError, Visibility,
-            build::build_scene, compose::record_and_submit_render,
-            damage_audit::create_audit_descriptor_pool,
-        },
-        store::DrawableStore,
+use crate::kms::render::{
+    platform::PlatformBackend,
+    scene::{
+        DamageAuditTarget, OutputLayout, Repaint, RootReadback, SceneCompositor, SceneError,
+        SceneInput, Visibility, build::build_scene, compose::record_and_submit_render,
+        damage_audit::create_audit_descriptor_pool, output_transform,
     },
+    store::DrawableStore,
 };
 use ash::vk;
 use std::sync::Arc;
@@ -17,20 +14,19 @@ use std::sync::Arc;
 /// its footprint's size (spec D4, Q5: only transformed outputs pay).
 /// The space a root read of `output_idx` uses: the root footprint of a
 /// transformed output (D6), else the mode.
-fn root_readback_extent(platform: &PlatformBackend, output_idx: usize) -> vk::Extent2D {
-    if platform.output_transform(output_idx).is_some() {
-        let (_, _, w, h) = platform.output_root_rect(output_idx);
+fn root_readback_extent(outputs: &[OutputLayout], output_idx: usize) -> vk::Extent2D {
+    if output_transform(outputs, output_idx).is_some() {
+        let (_, _, w, h) = outputs[output_idx].root_rect;
         return vk::Extent2D {
             width: w,
             height: h,
         };
     }
-    platform
-        .outputs
+    outputs
         .get(output_idx)
         .map_or(vk::Extent2D::default(), |layout| vk::Extent2D {
-            width: u32::from(layout.width),
-            height: u32::from(layout.height),
+            width: u32::from(layout.mode.0),
+            height: u32::from(layout.mode.1),
         })
 }
 
@@ -62,9 +58,8 @@ impl SceneCompositor {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn root_readback(
         &mut self,
-        core: &KmsCore,
+        input: &SceneInput,
         store: &mut DrawableStore,
-        windows: &crate::kms::render::backend::WindowsMap,
         platform: &PlatformBackend,
         cow_host_xid: Option<u32>,
         output_idx: usize,
@@ -73,11 +68,11 @@ impl SceneCompositor {
         let generation = (self.structure_generation, store.scene_damage_generation());
         let overlay_ops = self
             .root_overlay
-            .apply_list_for_output(platform.output_root_rect(output_idx));
+            .apply_list_for_output(input.outputs[output_idx].root_rect);
         let Some(inner) = self.inner.as_mut() else {
             return Ok(None);
         };
-        let extent = root_readback_extent(platform, output_idx);
+        let extent = root_readback_extent(input.outputs, output_idx);
         if extent.width == 0 || extent.height == 0 {
             return Ok(None);
         }
@@ -112,9 +107,8 @@ impl SceneCompositor {
             return Ok(Some(rb.target.image));
         }
         let built = build_scene(
-            core,
+            input,
             store,
-            windows,
             output_idx,
             platform,
             None,
@@ -208,7 +202,7 @@ impl SceneCompositor {
     pub(crate) fn root_readback_is_current(
         &self,
         store: &DrawableStore,
-        platform: &PlatformBackend,
+        outputs: &[OutputLayout],
         output_idx: usize,
         local: vk::Rect2D,
     ) -> bool {
@@ -219,7 +213,7 @@ impl SceneCompositor {
             .and_then(Option::as_ref)
             .is_some_and(|rb| {
                 rb.generation == generation
-                    && rb.target.extent == root_readback_extent(platform, output_idx)
+                    && rb.target.extent == root_readback_extent(outputs, output_idx)
                     && root_readback_covers(&rb.valid, local)
             })
     }
