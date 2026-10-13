@@ -170,10 +170,10 @@ without KMS is the natural follow-up, not part of 3b.
   ceilings.
 - Seam series: lavapipe suite; HW smoke on silence (RADV) and eiger (Asahi):
   desktop, video, a fullscreen game or `glmark2 --fullscreen` for direct
-  scanout, hotplug/output off-on, logout. The copied two-GPU route has the
-  thinnest coverage (on silence it is only exercised with i915 rendering,
-  which currently hangs on master when the RX DP sink is enabled); its smoke
-  is recorded as limited unless a working copied setup is found.
+  scanout, hotplug/output off-on, logout. The copied two-GPU route is gated
+  on behaving as master does, known bugs included (on silence, i915
+  rendering to the RX DP sink hangs on master too); fixing pre-existing bugs
+  is out of scope.
 - Of 3a's 23 test-only widenings, the 9 scene-only ones are reverted.
 
 ## Questions for the review
