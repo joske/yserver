@@ -3,6 +3,7 @@
 //! the surfaces; without one the server is headless.
 
 pub(crate) mod clock;
+pub(crate) mod input;
 pub(crate) mod link;
 mod platform;
 mod present;

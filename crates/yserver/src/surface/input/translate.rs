@@ -1,0 +1,453 @@
+//! Window-system key and button events to host input: the keys and buttons
+//! reported down, modifier state from device bits, Caps Lock toggles,
+//! dropped autorepeat and the releases on focus loss.
+
+use yserver_core::{core_loop::HostInputEvent, host_x11::HostKeyEvent};
+
+use super::{
+    devices::{keyboard_origin, pointer_origin},
+    keymap::{ev, kvk, x_keycode, x_keycode_of_evdev},
+};
+
+/// Device-dependent `modifierFlags` bits, IOKit `hidsystem/IOLLEvent.h`
+/// `NX_DEVICE*KEYMASK` (not cross-checked: await the SDK header).
+mod nx {
+    pub(super) const NX_DEVICELCTLKEYMASK: u64 = 0x0000_0001;
+    pub(super) const NX_DEVICELSHIFTKEYMASK: u64 = 0x0000_0002;
+    pub(super) const NX_DEVICERSHIFTKEYMASK: u64 = 0x0000_0004;
+    pub(super) const NX_DEVICELCMDKEYMASK: u64 = 0x0000_0008;
+    pub(super) const NX_DEVICERCMDKEYMASK: u64 = 0x0000_0010;
+    pub(super) const NX_DEVICELALTKEYMASK: u64 = 0x0000_0020;
+    pub(super) const NX_DEVICERALTKEYMASK: u64 = 0x0000_0040;
+    pub(super) const NX_DEVICERCTLKEYMASK: u64 = 0x0000_2000;
+}
+
+/// Device-independent `NSEventModifierFlags` (`NSEvent.h`; the Rust
+/// app-kit bindings 0.3.2, `generated/NSEvent.rs:389–397`).
+const FLAG_CAPS_LOCK: u64 = 1 << 16;
+const FLAG_SHIFT: u64 = 1 << 17;
+const FLAG_CONTROL: u64 = 1 << 18;
+const FLAG_OPTION: u64 = 1 << 19;
+const FLAG_COMMAND: u64 = 1 << 20;
+
+/// `(kVK, device bit, device-independent bit)` of each sided modifier.
+const MODIFIERS: [(u16, u64, u64); 8] = [
+    (kvk::kVK_Shift, nx::NX_DEVICELSHIFTKEYMASK, FLAG_SHIFT),
+    (kvk::kVK_RightShift, nx::NX_DEVICERSHIFTKEYMASK, FLAG_SHIFT),
+    (kvk::kVK_Control, nx::NX_DEVICELCTLKEYMASK, FLAG_CONTROL),
+    (
+        kvk::kVK_RightControl,
+        nx::NX_DEVICERCTLKEYMASK,
+        FLAG_CONTROL,
+    ),
+    (kvk::kVK_Option, nx::NX_DEVICELALTKEYMASK, FLAG_OPTION),
+    (kvk::kVK_RightOption, nx::NX_DEVICERALTKEYMASK, FLAG_OPTION),
+    (kvk::kVK_Command, nx::NX_DEVICELCMDKEYMASK, FLAG_COMMAND),
+    (
+        kvk::kVK_RightCommand,
+        nx::NX_DEVICERCMDKEYMASK,
+        FLAG_COMMAND,
+    ),
+];
+
+/// Linux `BTN_*` (`input-event-codes.h:357–361`).
+const BTN_LEFT: u16 = 0x110;
+const BTN_RIGHT: u16 = 0x111;
+const BTN_MIDDLE: u16 = 0x112;
+const BTN_SIDE: u16 = 0x113;
+const BTN_EXTRA: u16 = 0x114;
+
+/// What a key event reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyKind {
+    Down,
+    Up,
+    /// A modifier or Caps Lock changed; `flags` says to what.
+    FlagsChanged,
+}
+
+/// A window-system key event.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RawKey {
+    pub(crate) kvk: u16,
+    pub(crate) kind: KeyKind,
+    /// `modifierFlags` after the event.
+    pub(crate) flags: u64,
+    /// The window system's autorepeat.
+    pub(crate) is_repeat: bool,
+}
+
+/// The keys and buttons reported down, in press order.
+#[derive(Debug, Default)]
+pub(crate) struct Translator {
+    iso: bool,
+    keys: Vec<u8>,
+    buttons: Vec<u16>,
+}
+
+impl Translator {
+    /// `iso`: an ISO keyboard (see [`super::keymap::evdev_code`]).
+    pub(crate) fn new(iso: bool) -> Self {
+        Self {
+            iso,
+            ..Self::default()
+        }
+    }
+
+    /// Translate one key event.
+    pub(crate) fn key(&mut self, raw: RawKey, time: u32, out: &mut Vec<HostInputEvent>) {
+        match raw.kind {
+            // The core repeats held keys itself, at the XKB rate.
+            KeyKind::Down if raw.is_repeat => {}
+            KeyKind::Down => {
+                if let Some(keycode) = x_keycode(raw.kvk, self.iso) {
+                    self.press(keycode, time, out);
+                }
+            }
+            KeyKind::Up => {
+                if let Some(keycode) = x_keycode(raw.kvk, self.iso) {
+                    self.release(keycode, time, out);
+                }
+            }
+            KeyKind::FlagsChanged => self.flags_changed(raw, time, out),
+        }
+    }
+
+    fn flags_changed(&mut self, raw: RawKey, time: u32, out: &mut Vec<HostInputEvent>) {
+        if raw.kvk == kvk::kVK_CapsLock {
+            // One event per lock change, none on release: each toggles X once.
+            let caps = x_keycode_of_evdev(ev::KEY_CAPSLOCK);
+            out.push(key_event(caps, true, time));
+            out.push(key_event(caps, false, time));
+            return;
+        }
+        let Some(&(_, device_bit, group_bit)) =
+            MODIFIERS.iter().find(|&&(mac, _, _)| mac == raw.kvk)
+        else {
+            return;
+        };
+        let Some(keycode) = x_keycode(raw.kvk, self.iso) else {
+            return;
+        };
+        let down = raw.flags & group_bit != 0 && raw.flags & device_bit != 0;
+        if down {
+            self.press(keycode, time, out);
+        } else {
+            self.release(keycode, time, out);
+        }
+    }
+
+    fn press(&mut self, keycode: u8, time: u32, out: &mut Vec<HostInputEvent>) {
+        if !self.keys.contains(&keycode) {
+            self.keys.push(keycode);
+            out.push(key_event(keycode, true, time));
+        }
+    }
+
+    /// A release of a key not reported down (Cmd after Cmd-Tab back) is dropped.
+    fn release(&mut self, keycode: u8, time: u32, out: &mut Vec<HostInputEvent>) {
+        if let Some(at) = self.keys.iter().position(|&held| held == keycode) {
+            self.keys.remove(at);
+            out.push(key_event(keycode, false, time));
+        }
+    }
+
+    /// Translate a mouse button: `number` is the window system's 0-based
+    /// button number (0 left, 1 right, 2 middle, 3 back, 4 forward).
+    pub(crate) fn button(
+        &mut self,
+        number: i64,
+        pressed: bool,
+        time: u32,
+        out: &mut Vec<HostInputEvent>,
+    ) {
+        let button = match number {
+            0 => BTN_LEFT,
+            1 => BTN_RIGHT,
+            2 => BTN_MIDDLE,
+            3 => BTN_SIDE,
+            4 => BTN_EXTRA,
+            _ => return,
+        };
+        let held = self.buttons.iter().position(|&b| b == button);
+        match (pressed, held) {
+            (true, None) => self.buttons.push(button),
+            (false, Some(at)) => {
+                self.buttons.remove(at);
+            }
+            _ => return,
+        }
+        out.push(button_event(button, pressed, time));
+    }
+
+    /// The window lost the keyboard: release every held key, last pressed
+    /// first, then every held button.
+    pub(crate) fn release_all(&mut self, time: u32, out: &mut Vec<HostInputEvent>) {
+        while let Some(keycode) = self.keys.pop() {
+            out.push(key_event(keycode, false, time));
+        }
+        while let Some(button) = self.buttons.pop() {
+            out.push(button_event(button, false, time));
+        }
+    }
+}
+
+/// Whether `modifierFlags` has Caps Lock on.
+pub(crate) fn caps_locked(flags: u64) -> bool {
+    flags & FLAG_CAPS_LOCK != 0
+}
+
+/// The Caps Lock press+release that brings the X lock (`x_locked`) to the
+/// window system's (`host_locked`), or nothing when they agree.
+pub(crate) fn caps_lock_sync(x_locked: bool, host_locked: bool, time: u32) -> Vec<HostInputEvent> {
+    if x_locked == host_locked {
+        return Vec::new();
+    }
+    let caps = x_keycode_of_evdev(ev::KEY_CAPSLOCK);
+    vec![key_event(caps, true, time), key_event(caps, false, time)]
+}
+
+/// A key event from the keyboard source; the backend cooks the state.
+pub(crate) fn key_event(keycode: u8, pressed: bool, time: u32) -> HostInputEvent {
+    HostInputEvent::Key(HostKeyEvent {
+        origin: keyboard_origin(),
+        pressed,
+        keycode,
+        time,
+        root_x: 0,
+        root_y: 0,
+        event_x: 0,
+        event_y: 0,
+        state: 0,
+    })
+}
+
+fn button_event(button: u16, pressed: bool, time: u32) -> HostInputEvent {
+    HostInputEvent::PointerButton {
+        origin: pointer_origin(),
+        button,
+        pressed,
+        time,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use yserver_core::core_loop::HostInputEvent;
+
+    use super::{
+        FLAG_CAPS_LOCK, FLAG_COMMAND, FLAG_SHIFT, KeyKind, RawKey, Translator, caps_lock_sync,
+        caps_locked, nx,
+    };
+    use crate::surface::input::keymap::kvk;
+
+    /// `(keycode, pressed)` of key events, `(256 + button, pressed)` of buttons.
+    fn summary(events: &[HostInputEvent]) -> Vec<(u32, bool)> {
+        events
+            .iter()
+            .map(|ev| match ev {
+                HostInputEvent::Key(key) => (u32::from(key.keycode), key.pressed),
+                HostInputEvent::PointerButton {
+                    button, pressed, ..
+                } => (256 + u32::from(*button), *pressed),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect()
+    }
+
+    fn run(t: &mut Translator, keys: &[(u16, KeyKind, u64, bool)]) -> Vec<(u32, bool)> {
+        let mut out = Vec::new();
+        for &(kvk, kind, flags, is_repeat) in keys {
+            t.key(
+                RawKey {
+                    kvk,
+                    kind,
+                    flags,
+                    is_repeat,
+                },
+                0,
+                &mut out,
+            );
+        }
+        summary(&out)
+    }
+
+    const SHIFT_L: u64 = FLAG_SHIFT | nx::NX_DEVICELSHIFTKEYMASK;
+    const SHIFT_R: u64 = FLAG_SHIFT | nx::NX_DEVICERSHIFTKEYMASK;
+    const CMD_L: u64 = FLAG_COMMAND | nx::NX_DEVICELCMDKEYMASK;
+
+    #[test]
+    fn shift_sides_press_and_release_from_their_device_bits() {
+        use KeyKind::FlagsChanged as F;
+        let mut t = Translator::new(false);
+        let events = run(
+            &mut t,
+            &[
+                (kvk::kVK_Shift, F, SHIFT_L, false),
+                (kvk::kVK_RightShift, F, SHIFT_L | SHIFT_R, false),
+                (kvk::kVK_Shift, F, SHIFT_R, false),
+                (kvk::kVK_RightShift, F, 0, false),
+            ],
+        );
+        assert_eq!(events, [(50, true), (62, true), (50, false), (62, false)]);
+    }
+
+    #[test]
+    fn a_lost_modifier_event_cannot_invert_the_state() {
+        use KeyKind::FlagsChanged as F;
+        let mut t = Translator::new(false);
+        let events = run(
+            &mut t,
+            &[
+                (kvk::kVK_Shift, F, SHIFT_L, false),
+                (kvk::kVK_Shift, F, SHIFT_L, false),
+                (kvk::kVK_Shift, F, 0, false),
+                (kvk::kVK_Shift, F, 0, false),
+            ],
+        );
+        assert_eq!(events, [(50, true), (50, false)]);
+    }
+
+    #[test]
+    fn each_caps_lock_change_is_one_press_and_release() {
+        use KeyKind::FlagsChanged as F;
+        let mut t = Translator::new(false);
+        let events = run(
+            &mut t,
+            &[
+                (kvk::kVK_CapsLock, F, FLAG_CAPS_LOCK, false),
+                (kvk::kVK_CapsLock, F, 0, false),
+            ],
+        );
+        assert_eq!(events, [(66, true), (66, false), (66, true), (66, false)]);
+    }
+
+    #[test]
+    fn autorepeat_is_dropped() {
+        use KeyKind::{Down, Up};
+        let mut t = Translator::new(false);
+        let events = run(
+            &mut t,
+            &[
+                (kvk::kVK_ANSI_A, Down, 0, false),
+                (kvk::kVK_ANSI_A, Down, 0, true),
+                (kvk::kVK_ANSI_A, Down, 0, true),
+                (kvk::kVK_ANSI_A, Up, 0, false),
+            ],
+        );
+        assert_eq!(events, [(38, true), (38, false)]);
+    }
+
+    #[test]
+    fn autorepeat_after_a_focus_loss_does_not_press_again() {
+        use KeyKind::Down;
+        let mut t = Translator::new(false);
+        run(&mut t, &[(kvk::kVK_ANSI_A, Down, 0, false)]);
+        let mut out = Vec::new();
+        t.release_all(0, &mut out);
+        let events = run(&mut t, &[(kvk::kVK_ANSI_A, Down, 0, true)]);
+        assert!(events.is_empty(), "the held key stays released: {events:?}");
+    }
+
+    #[test]
+    fn a_release_of_a_key_never_pressed_is_dropped() {
+        let mut t = Translator::new(false);
+        let events = run(&mut t, &[(kvk::kVK_ANSI_A, KeyKind::Up, 0, false)]);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn focus_loss_releases_keys_last_first_then_buttons() {
+        use KeyKind::{Down, FlagsChanged as F};
+        let mut t = Translator::new(false);
+        run(
+            &mut t,
+            &[
+                (kvk::kVK_Shift, F, SHIFT_L, false),
+                (kvk::kVK_ANSI_A, Down, SHIFT_L, false),
+                (kvk::kVK_ANSI_S, Down, SHIFT_L, false),
+            ],
+        );
+        let mut out = Vec::new();
+        t.button(0, true, 0, &mut out);
+        t.button(1, true, 0, &mut out);
+        out.clear();
+        t.release_all(0, &mut out);
+        assert_eq!(
+            summary(&out),
+            [
+                (39, false),
+                (38, false),
+                (50, false),
+                (256 + 0x111, false),
+                (256 + 0x110, false)
+            ]
+        );
+        out.clear();
+        t.release_all(0, &mut out);
+        assert!(out.is_empty(), "nothing left held");
+    }
+
+    #[test]
+    fn cmd_tab_away_and_back_leaves_nothing_held() {
+        use KeyKind::{Down, FlagsChanged as F};
+        let mut t = Translator::new(false);
+        // Cmd down, Tab down; the window resigns key and gets no Tab/Cmd up.
+        let mut events = run(
+            &mut t,
+            &[
+                (kvk::kVK_Command, F, CMD_L, false),
+                (kvk::kVK_Tab, Down, CMD_L, false),
+            ],
+        );
+        let mut out = Vec::new();
+        t.release_all(0, &mut out);
+        events.extend(summary(&out));
+        // Back again: only Cmd's release arrives.
+        events.extend(run(&mut t, &[(kvk::kVK_Command, F, 0, false)]));
+        assert_eq!(events, [(133, true), (23, true), (23, false), (133, false)]);
+    }
+
+    #[test]
+    fn buttons_map_to_linux_codes_and_extra_buttons_are_dropped() {
+        let mut t = Translator::new(false);
+        let mut out = Vec::new();
+        for number in 0..=5 {
+            t.button(number, true, 0, &mut out);
+        }
+        assert_eq!(
+            summary(&out),
+            [
+                (256 + 0x110, true),
+                (256 + 0x111, true),
+                (256 + 0x112, true),
+                (256 + 0x113, true),
+                (256 + 0x114, true)
+            ]
+        );
+        out.clear();
+        t.button(0, true, 0, &mut out);
+        t.button(5, false, 0, &mut out);
+        assert!(out.is_empty(), "a held button and button 5 send nothing");
+    }
+
+    #[test]
+    fn caps_lock_is_read_from_the_device_independent_bit() {
+        assert!(caps_locked(FLAG_CAPS_LOCK | SHIFT_L));
+        assert!(!caps_locked(SHIFT_L));
+    }
+
+    #[test]
+    fn caps_sync_toggles_only_when_the_locks_differ() {
+        assert!(caps_lock_sync(true, true, 0).is_empty());
+        assert!(caps_lock_sync(false, false, 0).is_empty());
+        assert_eq!(
+            summary(&caps_lock_sync(false, true, 0)),
+            [(66, true), (66, false)]
+        );
+        assert_eq!(
+            summary(&caps_lock_sync(true, false, 0)),
+            [(66, true), (66, false)]
+        );
+    }
+}

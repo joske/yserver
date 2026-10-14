@@ -17,7 +17,7 @@
 //! Plan: `docs/superpowers/plans/2026-05-06-single-threaded-core.md` §E2.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     io,
     os::fd::{AsFd, AsRawFd},
     sync::Mutex,
@@ -30,10 +30,7 @@ use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTime
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 use nix::sys::eventfd::{EfdFlags, EventFd};
 use yserver_core::{
-    core_loop::{
-        CoreSender, HostInputEvent, InputOrigin, Message, SYNTH_SCROLL_DOWN, SYNTH_SCROLL_LEFT,
-        SYNTH_SCROLL_RIGHT, SYNTH_SCROLL_UP,
-    },
+    core_loop::{CoreSender, HostInputEvent, InputOrigin, Message},
     host_x11::HostKeyEvent,
     xinput::{
         InputSourceId,
@@ -43,9 +40,12 @@ use yserver_core::{
     },
 };
 
-use crate::input::{
-    InputEvent, SendContext,
-    hotkey::{Hotkey, HotkeyDetector},
+use crate::{
+    input::{
+        InputEvent, SendContext,
+        hotkey::{Hotkey, HotkeyDetector},
+    },
+    scroll_v120::ScrollV120,
 };
 
 /// Absolute pointer mapping position + framebuffer dimensions held on the
@@ -61,14 +61,8 @@ pub struct LibinputThreadState {
     /// remapped keymap could silently consume modifier presses —
     /// hotkeys need to fire even when X dispatch is wedged.
     hotkey: HotkeyDetector,
-    /// Sub-click scroll accumulators in v120 units. libinput's high-
-    /// resolution wheel and finger/continuous scroll arrive as small
-    /// v120 deltas that may not add up to a full 120-unit click in one
-    /// event. We bank the remainder here and emit a button-4/5/6/7
-    /// press+release pair each time the absolute accumulator crosses
-    /// 120. Sign convention matches libinput: positive Y = scroll down,
-    /// positive X = scroll right.
-    scroll_accum_by_source: HashMap<InputSourceId, (i32, i32)>,
+    /// Sub-click scroll remainders per source (see [`ScrollV120`]).
+    scroll: ScrollV120,
 }
 
 impl LibinputThreadState {
@@ -80,7 +74,7 @@ impl LibinputThreadState {
             fb_w,
             fb_h,
             hotkey: HotkeyDetector::new(),
-            scroll_accum_by_source: HashMap::new(),
+            scroll: ScrollV120::default(),
         }
     }
 
@@ -175,7 +169,7 @@ impl LibinputThreadState {
                 pressed,
                 time: time_ms,
             },
-            // PointerScroll is fanned out separately via `drain_scroll`
+            // PointerScroll is fanned out separately via `ScrollV120::drain`
             // because it can map to N (≥ 0) press+release pairs depending
             // on accumulated v120. Reaching here means a caller forgot
             // to route it; map to a no-op-ish placeholder.
@@ -198,47 +192,6 @@ impl LibinputThreadState {
             | InputEvent::DeviceRemoved { .. } => {
                 unreachable!("device events are forwarded before map(); must not reach map()")
             }
-        }
-    }
-
-    /// One v120 click step. libinput emits high-resolution wheel deltas
-    /// in 120ths of a logical click; we accumulate fractional deltas and
-    /// fire a button press+release each time |accum| crosses this.
-    const V120_PER_CLICK: i32 = 120;
-
-    /// Accumulate a scroll delta and emit press+release pairs for any
-    /// completed clicks. `dy_v120 > 0` → scroll-down (button 5);
-    /// `dy_v120 < 0` → scroll-up (button 4). Horizontal axis maps to
-    /// button 6 (left) / 7 (right). Mixed-axis events emit Y clicks
-    /// first then X clicks within a single call.
-    pub(crate) fn drain_scroll(
-        &mut self,
-        source_id: InputSourceId,
-        dx_v120: i32,
-        dy_v120: i32,
-        time_ms: u32,
-        out: &mut Vec<HostInputEvent>,
-    ) {
-        let (accum_x, accum_y) = self.scroll_accum_by_source.entry(source_id).or_default();
-        *accum_x = accum_x.saturating_add(dx_v120);
-        *accum_y = accum_y.saturating_add(dy_v120);
-
-        // Vertical first (more common; matches X11 button-4/5 priority).
-        while *accum_y >= Self::V120_PER_CLICK {
-            *accum_y -= Self::V120_PER_CLICK;
-            push_button_click(out, SYNTH_SCROLL_DOWN, time_ms, source_id);
-        }
-        while *accum_y <= -Self::V120_PER_CLICK {
-            *accum_y += Self::V120_PER_CLICK;
-            push_button_click(out, SYNTH_SCROLL_UP, time_ms, source_id);
-        }
-        while *accum_x >= Self::V120_PER_CLICK {
-            *accum_x -= Self::V120_PER_CLICK;
-            push_button_click(out, SYNTH_SCROLL_RIGHT, time_ms, source_id);
-        }
-        while *accum_x <= -Self::V120_PER_CLICK {
-            *accum_x += Self::V120_PER_CLICK;
-            push_button_click(out, SYNTH_SCROLL_LEFT, time_ms, source_id);
         }
     }
 }
@@ -408,26 +361,6 @@ impl InputThreadControl {
     }
 }
 
-fn push_button_click(
-    out: &mut Vec<HostInputEvent>,
-    button: u16,
-    time_ms: u32,
-    source_id: InputSourceId,
-) {
-    out.push(HostInputEvent::PointerButton {
-        origin: InputOrigin::Physical(source_id),
-        button,
-        pressed: true,
-        time: time_ms,
-    });
-    out.push(HostInputEvent::PointerButton {
-        origin: InputOrigin::Physical(source_id),
-        button,
-        pressed: false,
-        time: time_ms,
-    });
-}
-
 /// Process one batch of libinput events with motion coalescing.
 ///
 /// Across the batch (and the carry-over from a previous batch via
@@ -519,7 +452,7 @@ pub fn process_batch(
                 if let Some(m) = pending_motion.take() {
                     sender.send(Message::HostInput(m))?;
                 }
-                state.scroll_accum_by_source.remove(&source_id);
+                state.scroll.reset(source_id);
                 sender.send(Message::HostInput(HostInputEvent::DeviceSuspended {
                     source_id,
                 }))?;
@@ -529,7 +462,7 @@ pub fn process_batch(
                 if let Some(m) = pending_motion.take() {
                     sender.send(Message::HostInput(m))?;
                 }
-                state.scroll_accum_by_source.remove(&source_id);
+                state.scroll.reset(source_id);
                 sender.send(Message::HostInput(HostInputEvent::DeviceRemoved {
                     source_id,
                 }))?;
@@ -546,7 +479,9 @@ pub fn process_batch(
         } = raw
         {
             scroll_buf.clear();
-            state.drain_scroll(source_id, dx_v120, dy_v120, time_ms, &mut scroll_buf);
+            state
+                .scroll
+                .drain(source_id, dx_v120, dy_v120, time_ms, &mut scroll_buf);
             if !scroll_buf.is_empty() {
                 if let Some(m) = pending_motion.take() {
                     sender.send(Message::HostInput(m))?;
@@ -563,7 +498,7 @@ pub fn process_batch(
         // GDK reads that as `scroll.is_stop`, which commits a Firefox
         // history-swipe (bug 1539730).
         if let InputEvent::PointerScrollStop { source_id } = raw {
-            state.scroll_accum_by_source.remove(&source_id);
+            state.scroll.reset(source_id);
             if let Some(m) = pending_motion.take() {
                 sender.send(Message::HostInput(m))?;
             }
@@ -1068,7 +1003,10 @@ mod tests {
         LINUX_KEY_BACKSPACE, LINUX_KEY_ENTER, LINUX_KEY_F12, LINUX_KEY_LEFTALT, LINUX_KEY_LEFTCTRL,
         LINUX_KEY_RIGHTALT, LINUX_KEY_RIGHTCTRL,
     };
-    use yserver_core::{core_loop::channel, xinput::InputSourceId};
+    use yserver_core::{
+        core_loop::{SYNTH_SCROLL_DOWN, channel},
+        xinput::InputSourceId,
+    };
 
     const TEST_SOURCE_ID: InputSourceId = InputSourceId(1);
 
@@ -1773,7 +1711,7 @@ mod tests {
             [Message::HostInput(HostInputEvent::DeviceSuspended { source_id })]
                 if *source_id == TEST_SOURCE_ID
         ));
-        assert!(state.scroll_accum_by_source.is_empty());
+        assert!(state.scroll.is_empty());
         drop(poll);
     }
 
@@ -1930,99 +1868,6 @@ mod tests {
             "expected one scroll-down press+release pair, got {collected:?}"
         );
         drop(poll);
-    }
-
-    #[test]
-    fn scroll_accumulates_subclick_v120() {
-        let mut state = LibinputThreadState::new(800, 600);
-        let mut out = Vec::new();
-        // 60 + 30 + 40 = 130 → one click; remainder 10 banked.
-        state.drain_scroll(TEST_SOURCE_ID, 0, 60, 0, &mut out);
-        assert!(out.is_empty(), "60 < 120, no emission yet");
-        state.drain_scroll(TEST_SOURCE_ID, 0, 30, 0, &mut out);
-        assert!(out.is_empty(), "60 + 30 = 90 < 120");
-        state.drain_scroll(TEST_SOURCE_ID, 0, 40, 0, &mut out);
-        assert_eq!(
-            out.len(),
-            2,
-            "60 + 30 + 40 = 130 should emit one press+release pair"
-        );
-        assert!(matches!(
-            out[0],
-            HostInputEvent::PointerButton {
-                button: SYNTH_SCROLL_DOWN,
-                pressed: true,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn scroll_negative_v120_emits_scroll_up() {
-        let mut state = LibinputThreadState::new(800, 600);
-        let mut out = Vec::new();
-        state.drain_scroll(TEST_SOURCE_ID, 0, -120, 0, &mut out);
-        assert_eq!(out.len(), 2);
-        assert!(matches!(
-            out[0],
-            HostInputEvent::PointerButton {
-                button: SYNTH_SCROLL_UP,
-                pressed: true,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn scroll_multiple_clicks_in_one_event() {
-        let mut state = LibinputThreadState::new(800, 600);
-        let mut out = Vec::new();
-        // 480 v120 = exactly 4 clicks down.
-        state.drain_scroll(TEST_SOURCE_ID, 0, 480, 0, &mut out);
-        assert_eq!(out.len(), 8, "4 clicks × (press + release)");
-        for chunk in out.chunks_exact(2) {
-            assert!(matches!(
-                chunk[0],
-                HostInputEvent::PointerButton {
-                    button: SYNTH_SCROLL_DOWN,
-                    pressed: true,
-                    ..
-                }
-            ));
-            assert!(matches!(
-                chunk[1],
-                HostInputEvent::PointerButton {
-                    button: SYNTH_SCROLL_DOWN,
-                    pressed: false,
-                    ..
-                }
-            ));
-        }
-    }
-
-    #[test]
-    fn scroll_horizontal_emits_buttons_6_7() {
-        let mut state = LibinputThreadState::new(800, 600);
-        let mut out = Vec::new();
-        state.drain_scroll(TEST_SOURCE_ID, 120, 0, 0, &mut out);
-        assert!(matches!(
-            out[0],
-            HostInputEvent::PointerButton {
-                button: SYNTH_SCROLL_RIGHT,
-                pressed: true,
-                ..
-            }
-        ));
-        out.clear();
-        state.drain_scroll(TEST_SOURCE_ID, -120, 0, 0, &mut out);
-        assert!(matches!(
-            out[0],
-            HostInputEvent::PointerButton {
-                button: SYNTH_SCROLL_LEFT,
-                pressed: true,
-                ..
-            }
-        ));
     }
 
     /// A config-only push latches no pause/resume command, so `drain`

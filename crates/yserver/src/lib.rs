@@ -16,6 +16,7 @@ mod macos;
 pub(crate) mod platform;
 #[cfg(kms)]
 pub mod present;
+pub(crate) mod scroll_v120;
 #[cfg(any(not(kms), test))]
 // Only the macOS shell opens windows; elsewhere the window half is unused.
 #[cfg_attr(all(not(kms), not(target_os = "macos")), allow(dead_code))]

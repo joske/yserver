@@ -348,3 +348,25 @@ feature stubbed out before it counts.
    navigation keys until Clear is pressed; start with Num Lock locked on macOS instead?
 7. `acceptsFirstMouse: NO` (macOS convention: the first click only activates) vs `YES` (the click also reaches X,
    like XQuartz's click-through option)?
+
+## Implementation notes
+
+- **M2.1 keycode sources:** Apple's `Events.h` is not on the Linux build host and no crate in the registry carries the
+  `kVK_*` constants. Every value was cross-checked against pynput 1.8.2 (`_util/darwin_vks.py`, `keyboard/_darwin.py`)
+  and/or XQuartz `quartzKeyboard.c` (xorg-server 21.1.24). No second source for `ISO_Section` 0x0A,
+  `ANSI_KeypadClear` 0x47, `JIS_Yen` 0x5D, `JIS_Underscore` 0x5E, `JIS_KeypadComma` 0x5F, `JIS_Eisu` 0x66,
+  `JIS_Kana` 0x68, `Help` 0x72, `Function` 0x3F (marked `*` in `keymap.rs`), nor for the IOLLEvent.h
+  `NX_DEVICE*KEYMASK` bits: all await a check against the SDK on eiger. The pinned-entry test holds only
+  cross-checked kVK values, so `JIS_Yen` and `ISO_Section` from decision 4's table are not pinned. `KEY_*` values are
+  copied from `/usr/include/linux/input-event-codes.h` with their line numbers.
+- **M2.1 pairing additions:** `Help` → `KEY_INSERT` (the Apple key in the PC Insert position, HID Insert),
+  `ContextualMenu` 0x6E → `KEY_COMPOSE`; the Apple JIS keypad comma → `KEY_KPJPCOMMA` agrees with xkeyboard-config
+  (`macintosh_vndr/jp`: `<JPCM>`). Volume/mute kVKs are left out (macOS consumes those keys).
+- **M2.1 modifiers:** a sided modifier is down when both its device bit and its device-independent bit are set, so a
+  wrong device-bit constant shows as a dead modifier, never as a stuck one.
+- **M2.1 Num Lock:** locked by a `KEY_NUMLOCK` press+release that follows the two `DeviceAdded` in the shell's
+  announcements (`devices::announcements`), not by seeding the XKB state. A server reset rebuilds the XKB state
+  with Num Lock off.
+- **M2.1 scroll:** `Scroller` keeps the sub-v120 fraction per axis before the integer `ScrollV120` accumulator, so
+  small trackpad deltas are not lost to rounding. `ScrollV120` (`src/scroll_v120.rs`) is the moved
+  `drain_scroll` state; its four tests moved unchanged apart from the receiver.
