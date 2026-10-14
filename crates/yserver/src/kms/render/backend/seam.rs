@@ -184,6 +184,9 @@ pub trait Platform: OutputSink + Sized + 'static {
     /// Drain the platform's queue after it posted `Message::PlatformEvent`.
     fn on_platform_event(_b: &mut XBackend<Self>, _state: &mut ServerState) {}
 
+    /// The core's established-client count changed.
+    fn note_client_count(_b: &mut XBackend<Self>, _count: usize) {}
+
     fn dump_scanout(_b: &mut XBackend<Self>) {}
 
     fn report_export_holders(

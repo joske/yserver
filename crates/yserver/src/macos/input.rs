@@ -1,11 +1,12 @@
 //! NSEvent → plain values for the OS-neutral translator, sent to the core
-//! through the shell link. Every key the app receives goes to X.
+//! through the shell link. Every key the app receives goes to X,
+//! outside a modal alert.
 
 use std::{cell::RefCell, ptr::NonNull, rc::Rc, sync::Arc};
 
 use block2::RcBlock;
-use objc2::{rc::Retained, runtime::AnyObject};
-use objc2_app_kit::{NSEvent, NSEventMask, NSEventPhase, NSEventType, NSView};
+use objc2::{MainThreadMarker, rc::Retained, runtime::AnyObject};
+use objc2_app_kit::{NSApplication, NSEvent, NSEventMask, NSEventPhase, NSEventType, NSView};
 
 use crate::surface::{
     input::{
@@ -57,16 +58,26 @@ impl ShellInput {
         })
     }
 
-    /// Route every key event of the app to X; AppKit sees none of them.
-    pub(super) fn install_key_monitor(self: &Rc<Self>) -> Option<Retained<AnyObject>> {
+    /// Route every key event of the app to X; AppKit sees none of them,
+    /// except while a modal alert is up.
+    pub(super) fn install_key_monitor(
+        self: &Rc<Self>,
+        mtm: MainThreadMarker,
+    ) -> Option<Retained<AnyObject>> {
         let input = Rc::clone(self);
         let block = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
+            if NSApplication::sharedApplication(mtm)
+                .modalWindow()
+                .is_some()
+            {
+                return event.as_ptr();
+            }
             // SAFETY: AppKit hands the monitor a live event.
             input.key(unsafe { event.as_ref() });
             std::ptr::null_mut()
         });
         let mask = NSEventMask::KeyDown | NSEventMask::KeyUp | NSEventMask::FlagsChanged;
-        // SAFETY: the handler returns null, which drops the event.
+        // SAFETY: the handler returns the event or null, which drops it.
         unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(mask, &block) }
     }
 

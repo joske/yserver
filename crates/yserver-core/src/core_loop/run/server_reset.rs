@@ -56,6 +56,8 @@ struct Server {
     /// `ClientId` the next connection will be given. Monotonic, so a
     /// peek before `establish()` names that client exactly.
     client_ids: std::sync::Arc<ClientIdAllocator>,
+    /// The backend's `note_client_count`.
+    client_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     handle: Option<JoinHandle<std::io::Result<()>>>,
 }
 
@@ -74,9 +76,12 @@ impl Server {
         let sender_for_core = sender.clone_handle();
         let client_ids = std::sync::Arc::new(ClientIdAllocator::new());
         let client_ids_for_core = client_ids.clone();
+        let client_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let client_count_for_core = client_count.clone();
         let handle = std::thread::spawn(move || {
             let mut state = ServerState::new();
             let mut backend = RecordingBackend::new();
+            backend.client_count = client_count_for_core;
             run_core(
                 poll,
                 rx,
@@ -95,6 +100,7 @@ impl Server {
             sender,
             generations,
             client_ids,
+            client_count,
             handle: Some(handle),
         }
     }
@@ -124,6 +130,11 @@ impl Server {
     /// — the setup reply alone is written by the setup thread and
     /// says nothing about `state.clients`.
     fn establish(&self) -> UnixStream {
+        self.establish_with_base().0
+    }
+
+    /// [`Self::establish`], also returning the client's resource-id base.
+    fn establish_with_base(&self) -> (UnixStream, u32) {
         let mut peer = self.connect();
         peer.write_all(&[b'l', 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0])
             .expect("setup request");
@@ -131,10 +142,15 @@ impl Server {
         peer.read_exact(&mut header).expect("setup reply header");
         assert_eq!(header[0], 1, "setup must succeed");
         let len = usize::from(u16::from_le_bytes([header[6], header[7]])) * 4;
-        peer.read_exact(&mut vec![0; len])
-            .expect("setup reply body");
+        let mut body = vec![0; len];
+        peer.read_exact(&mut body).expect("setup reply body");
+        let base = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
         round_trip(&mut peer);
-        peer
+        (peer, base)
+    }
+
+    fn client_count(&self) -> usize {
+        self.client_count.load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn shutdown(mut self) -> std::io::Result<()> {
@@ -307,6 +323,68 @@ fn sighup_does_not_reset_under_noreset() {
     std::thread::sleep(QUIET);
     round_trip(&mut peer);
     assert_eq!(server.generation(), generation_after(0));
+    drop(peer);
+    server.shutdown().expect("clean shutdown");
+}
+
+// -- the client count the backend is told -------------------------
+
+#[test]
+fn the_backend_hears_the_established_client_count() {
+    let server = Server::with_policy(ResetPolicy::NoReset);
+    let connecting = server.connect();
+    std::thread::sleep(QUIET);
+    assert_eq!(server.client_count(), 0, "accept is not established");
+    drop(connecting);
+    let first = server.establish();
+    assert_eq!(server.client_count(), 1);
+    let second = server.establish();
+    assert_eq!(server.client_count(), 2);
+    drop(first);
+    wait_until("the count to drop to 1", || server.client_count() == 1);
+    drop(second);
+    wait_until("the count to drop to 0", || server.client_count() == 0);
+    server.shutdown().expect("clean shutdown");
+}
+
+#[test]
+fn the_backend_hears_a_kill_client_of_another_client() {
+    let server = Server::with_policy(ResetPolicy::NoReset);
+    let (mut victim, base) = server.establish_with_base();
+    let mut killer = server.establish();
+    // CreateGC(base, root, no values).
+    let mut create_gc = vec![55, 0, 4, 0];
+    create_gc.extend_from_slice(&base.to_le_bytes());
+    create_gc.extend_from_slice(&crate::resources::ROOT_WINDOW.0.to_le_bytes());
+    create_gc.extend_from_slice(&0_u32.to_le_bytes());
+    victim.write_all(&create_gc).expect("CreateGC");
+    round_trip(&mut victim);
+    assert_eq!(server.client_count(), 2);
+    // KillClient(base): removed inline, not via a disconnect message.
+    let mut kill = vec![113, 0, 2, 0];
+    kill.extend_from_slice(&base.to_le_bytes());
+    killer.write_all(&kill).expect("KillClient");
+    round_trip(&mut killer);
+    assert_eq!(server.client_count(), 1);
+    drop(victim);
+    drop(killer);
+    wait_until("the count to drop to 0", || server.client_count() == 0);
+    server.shutdown().expect("clean shutdown");
+}
+
+#[test]
+fn a_reset_with_clients_connected_reports_none() {
+    let server = Server::with_policy(ResetPolicy::Reset);
+    let peer = server.establish();
+    assert_eq!(server.client_count(), 1);
+    server
+        .sender
+        .send(Message::ResetRequested)
+        .expect("send SIGHUP request");
+    wait_until("SIGHUP to reset", || {
+        server.generation() == generation_after(1)
+    });
+    assert_eq!(server.client_count(), 0);
     drop(peer);
     server.shutdown().expect("clean shutdown");
 }

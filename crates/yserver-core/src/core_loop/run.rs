@@ -992,6 +992,7 @@ pub(super) fn disconnect_with_pending_cleanup(
     pending.unblock_xi_config(client);
     crate::core_loop::process_disconnect::process_disconnect(state, backend, client);
     reset_trigger.note_client_departed(state.clients.len());
+    backend.note_client_count(state.clients.len());
 }
 
 /// Disconnect every client a write failed on (`client_io` flags it; the
@@ -1734,6 +1735,7 @@ fn process_one_request(
     // trigger that silently never fires again.
     if state.clients.len() < clients_before {
         reset_trigger.note_client_departed(state.clients.len());
+        backend.note_client_count(state.clients.len());
     }
     if let Some(start) = req_start {
         telemetry.record_request(
@@ -2523,6 +2525,7 @@ fn run_core_with_inventory(
                                 } else {
                                     reset_trigger.note_client_established();
                                 }
+                                backend.note_client_count(state.clients.len());
                             }
                             Message::ClientDisconnected { id, reason: _ } => {
                                 disconnect_with_pending_cleanup(

@@ -7,7 +7,8 @@
 //! Shutdown: Quit, the close button and SIGTERM all end in the core loop
 //! returning; the core thread then drops every Vulkan object and asks the
 //! main thread to quit (`ShellUi::quit`), which answers a pending
-//! `applicationShouldTerminate:` or terminates.
+//! `applicationShouldTerminate:` or terminates. Quit and the close button
+//! ask first while X clients are connected; SIGTERM never asks.
 
 use std::{
     cell::{Cell, OnceCell},
@@ -15,7 +16,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
 };
@@ -28,9 +29,9 @@ use objc2::{
     sel,
 };
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
-    NSApplicationTerminateReply, NSMenu, NSMenuItem, NSWindow, NSWindowDelegate,
-    NSWindowOcclusionState,
+    NSAlert, NSAlertFirstButtonReturn, NSApplication, NSApplicationActivationPolicy,
+    NSApplicationDelegate, NSApplicationTerminateReply, NSMenu, NSMenuItem, NSWindow,
+    NSWindowDelegate, NSWindowOcclusionState,
 };
 use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSString, ns_string};
 use objc2_quartz_core::CAMetalLayer;
@@ -60,6 +61,11 @@ struct Ivars {
     opts: Cell<Option<LaunchOptions>>,
     link: Arc<ShellLink>,
     quit: Arc<QuitState>,
+    /// Established X clients, kept by the core.
+    clients: Arc<AtomicUsize>,
+    /// The user already confirmed quitting (close button, then the
+    /// terminate it triggers).
+    quit_confirmed: Cell<bool>,
     window: OnceCell<Retained<NSWindow>>,
     /// Retained until exit: the core thread's surface points at it.
     layer: OnceCell<Retained<CAMetalLayer>>,
@@ -116,6 +122,9 @@ define_class!(
             if ivars.quit.core_done.load(Ordering::Acquire) {
                 return NSApplicationTerminateReply::TerminateNow;
             }
+            if !self.confirm_quit() {
+                return NSApplicationTerminateReply::TerminateCancel;
+            }
             ivars.quit.terminate_later.store(true, Ordering::Release);
             ivars.link.request_shutdown();
             NSApplicationTerminateReply::TerminateLater
@@ -130,6 +139,12 @@ define_class!(
 
     // SAFETY: `NSWindowDelegate` has no safety requirements.
     unsafe impl NSWindowDelegate for YserverAppDelegate {
+        // SAFETY: the signature matches the protocol method.
+        #[unsafe(method(windowShouldClose:))]
+        fn window_should_close(&self, _sender: &NSWindow) -> bool {
+            self.confirm_quit()
+        }
+
         // SAFETY: the signature matches the protocol method.
         #[unsafe(method(windowDidChangeOcclusionState:))]
         fn occlusion_changed(&self, _notification: &NSNotification) {
@@ -165,6 +180,8 @@ impl YserverAppDelegate {
             opts: Cell::new(Some(opts)),
             link: Arc::new(ShellLink::default()),
             quit: Arc::new(QuitState::default()),
+            clients: Arc::default(),
+            quit_confirmed: Cell::new(false),
             window: OnceCell::new(),
             layer: OnceCell::new(),
             ticker: OnceCell::new(),
@@ -184,7 +201,7 @@ impl YserverAppDelegate {
         };
         let size = opts.geometry.unwrap_or(server::DEFAULT_SIZE);
         let input = ShellInput::new(Arc::clone(&ivars.link), size);
-        match input.install_key_monitor() {
+        match input.install_key_monitor(mtm) {
             Some(monitor) => {
                 let _ = ivars.key_monitor.set(monitor);
             }
@@ -216,6 +233,7 @@ impl YserverAppDelegate {
             ui: Arc::new(MainQueueUi {
                 quit: Arc::clone(&ivars.quit),
             }),
+            clients: Arc::clone(&ivars.clients),
         };
         let spawned = thread::Builder::new()
             .name("yserver-core".into())
@@ -225,6 +243,33 @@ impl YserverAppDelegate {
             std::process::exit(1);
         }
     }
+
+    /// Whether to quit: asks while X clients are connected, once per quit.
+    fn confirm_quit(&self) -> bool {
+        let ivars = self.ivars();
+        if ivars.quit_confirmed.get() {
+            return true;
+        }
+        let clients = ivars.clients.load(Ordering::Acquire);
+        if clients > 0 && !ask_quit(self.mtm(), clients) {
+            return false;
+        }
+        ivars.quit_confirmed.set(true);
+        true
+    }
+}
+
+/// Ask whether to quit with `clients` X clients connected.
+fn ask_quit(mtm: MainThreadMarker, clients: usize) -> bool {
+    let alert = NSAlert::new(mtm);
+    let noun = if clients == 1 { "client" } else { "clients" };
+    alert.setMessageText(&NSString::from_str(&format!(
+        "{clients} X {noun} connected"
+    )));
+    alert.setInformativeText(ns_string!("Quitting yserver disconnects them."));
+    alert.addButtonWithTitle(ns_string!("Quit"));
+    alert.addButtonWithTitle(ns_string!("Cancel"));
+    alert.runModal() == NSAlertFirstButtonReturn
 }
 
 /// `ShellUi` for the core thread: every command runs on the main queue.

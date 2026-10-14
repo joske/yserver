@@ -996,6 +996,10 @@ pub trait Backend {
     /// Default no-op for backends whose platform never posts one.
     fn on_platform_event(&mut self, _state: &mut ServerState) {}
 
+    /// `state.clients` gained or lost an established client; `count` is
+    /// its new size. Default no-op.
+    fn note_client_count(&mut self, _count: usize) {}
+
     /// Dump the current scanout buffer to a file in the process's
     /// cwd. Diagnostic-only — fired from `Message::DumpScanout`
     /// (Ctrl-Alt-Enter on KMS). Default no-op for backends that don't

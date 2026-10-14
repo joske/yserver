@@ -171,6 +171,10 @@ impl<P: Platform> Backend for XBackend<P> {
         P::on_platform_event(self, state);
     }
 
+    fn note_client_count(&mut self, count: usize) {
+        P::note_client_count(self, count);
+    }
+
     fn dump_scanout(&mut self) {
         P::dump_scanout(self)
     }

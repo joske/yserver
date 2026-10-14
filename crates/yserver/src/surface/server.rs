@@ -1,7 +1,11 @@
 //! The server on the surface platform: headless (no surface, nothing shown,
 //! only with an explicit `--headless`) or in a shell's window.
 
-use std::{fs, io, path::PathBuf, sync::Arc};
+use std::{
+    fs, io,
+    path::PathBuf,
+    sync::{Arc, atomic::AtomicUsize},
+};
 
 use yserver_core::{
     backend::{Backend as _, BackendTopology, install_backend_root_bindings},
@@ -27,12 +31,14 @@ use crate::{
 pub(crate) const DEFAULT_SIZE: (u16, u16) = (1600, 1000);
 
 /// A window shell's half of the server: its surface, the surface's frame
-/// clock (ticked by the shell), its link and its UI commands.
+/// clock (ticked by the shell), its link, its UI commands and the count of
+/// established X clients the core keeps for it.
 pub(crate) struct WindowSpec {
     pub(crate) surface: NativeSurface,
     pub(crate) clock: Arc<FrameClock>,
     pub(crate) link: Arc<ShellLink>,
     pub(crate) ui: Arc<dyn ShellUi>,
+    pub(crate) clients: Arc<AtomicUsize>,
 }
 
 /// Run the headless server, or refuse without `--headless`.
@@ -76,6 +82,7 @@ pub(crate) fn run_windowed(opts: launch::LaunchOptions, spec: WindowSpec) -> io:
         clock,
         link,
         ui,
+        clients,
     } = spec;
     let result = serve(
         &opts,
@@ -90,6 +97,7 @@ pub(crate) fn run_windowed(opts: launch::LaunchOptions, spec: WindowSpec) -> io:
             let mut backend = super::surface_backend(vk, size, opts.layout.clone(), vec![output])?;
             backend.pstate.link = Some(Arc::clone(&link));
             backend.pstate.ui = Some(Arc::clone(&ui));
+            backend.pstate.client_count = clients;
             Ok(backend)
         },
         Some(&link),

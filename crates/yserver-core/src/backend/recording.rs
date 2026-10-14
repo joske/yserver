@@ -545,6 +545,9 @@ pub struct RecordingBackend {
     pub vt_switching_armed: bool,
     /// `on_platform_event` calls seen.
     pub platform_events: usize,
+    /// The last `note_client_count`, shared so a test can watch a core
+    /// loop running on another thread.
+    pub client_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Returned by `glx_available`.
     pub glx_available: bool,
     /// Whether the test backend simulates queueing the input pause barrier.
@@ -667,6 +670,7 @@ impl RecordingBackend {
             device_config_start_results: VecDeque::new(),
             vt_switching_armed: false,
             platform_events: 0,
+            client_count: std::sync::Arc::default(),
             glx_available: true,
             vt_release_pause_queued: false,
             vt_release_finished: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -809,6 +813,11 @@ impl Backend for RecordingBackend {
 
     fn on_platform_event(&mut self, _state: &mut crate::server::ServerState) {
         self.platform_events += 1;
+    }
+
+    fn note_client_count(&mut self, count: usize) {
+        self.client_count
+            .store(count, std::sync::atomic::Ordering::Release);
     }
 
     fn begin_vt_release(&mut self) -> bool {

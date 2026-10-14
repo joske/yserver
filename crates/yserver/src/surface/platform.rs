@@ -2,7 +2,14 @@
 //! for window-system surfaces. Output `i` is surface `i`; with no surface the
 //! server is headless and composes over no outputs.
 
-use std::{io, os::fd::OwnedFd, sync::Arc};
+use std::{
+    io,
+    os::fd::OwnedFd,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use ash::vk;
 use yserver_core::{
@@ -75,6 +82,8 @@ pub(crate) struct SurfaceBackendState {
     pub(crate) link: Option<Arc<ShellLink>>,
     /// The window shell's UI commands.
     pub(crate) ui: Option<Arc<dyn ShellUi>>,
+    /// Established X clients, for the shell's quit confirmation.
+    pub(crate) client_count: Arc<AtomicUsize>,
     /// Host-visible staging for on-screen reads.
     readback: Option<OpsStaging>,
 }
@@ -587,6 +596,10 @@ impl Platform for SurfacePlatform {
             b.apply_shell_events(events);
         }
         b.service_surfaces();
+    }
+
+    fn note_client_count(b: &mut XBackend<Self>, count: usize) {
+        b.pstate.client_count.store(count, Ordering::Release);
     }
 
     fn randr_outputs_and_modes(

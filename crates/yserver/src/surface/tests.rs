@@ -126,6 +126,20 @@ fn headless_backend_advertises_no_glx_dpms_or_dri3() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD"]
+fn surface_publishes_the_client_count_to_the_shell() {
+    let Some(mut b) = headless_or_skip() else {
+        return;
+    };
+    let shell = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    b.pstate.client_count = Arc::clone(&shell);
+    b.note_client_count(2);
+    assert_eq!(shell.load(std::sync::atomic::Ordering::Acquire), 2);
+    b.note_client_count(0);
+    assert_eq!(shell.load(std::sync::atomic::Ordering::Acquire), 0);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
 fn headless_backend_fills_a_window_and_reads_it_back() {
     let Some(mut b) = headless_or_skip() else {
         return;
