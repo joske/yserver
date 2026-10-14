@@ -1,0 +1,23 @@
+# Xorg XKB repeat controls: fresh Xvfb -noreset, X.Org 21.1.24 (xorg-server-xvfb 21.1.24-1).
+# Probe: XkbGetControls(XkbAllControlsMask) + XGetKeyboardControl after each step; the probe
+# selected XkbControlsNotify with every detail on XkbUseCoreKbd. Lines:
+#   controls: <step> -> GetControls repeatDelay repeatInterval enabledCtrls
+#   notify: <step> -> the one ControlsNotify it sent: changedControls enabledControls
+#           enabledControlChanges requestMajor requestMinor ("xkb" = XKB major opcode)
+#   no-notify: <step> -> no ControlsNotify
+#   error: <request> -> error code, errorValue
+# `xset r rate D R` = XkbSetAutoRepeatRate(D, 1000/R): SetControls changeCtrls=RepeatKeys.
+# `xset r off|on` and `xset -r K|r K` are core ChangeKeyboardControl.
+controls: default 660 40 0x000013a1
+notify: xset r rate 200 20 0x00000001 0x000013a1 0x00000000 xkb 7
+controls: xset r rate 200 20 200 50 0x000013a1
+no-notify: xset r rate 200 20 (again)
+notify: xset r off 0x80000000 0x000013a0 0x00000001 0 0
+controls: xset r off 200 50 0x000013a0
+notify: xset r on 0x80000000 0x000013a1 0x00000001 0 0
+notify: xset -r 38 0x40000000 0x000013a1 0x00000000 0 0
+notify: xset r 38 0x40000000 0x000013a1 0x00000000 0 0
+notify: xset r rate 0x00000001 0x000013a1 0x00000000 xkb 7
+controls: xset r rate 660 40 0x000013a1
+error: XkbSetAutoRepeatRate(0, 40) BadValue 0x08000028
+error: XkbSetAutoRepeatRate(300, 0) BadValue 0x082c0000
