@@ -1454,7 +1454,7 @@ mod tests {
 
         use crate::{
             backend::recording::RecordingBackend,
-            core_loop::run::handle_host_container_resize,
+            core_loop::{host_screen_resized, run::handle_host_container_resize},
             host_x11::HostConfigureEvent,
             resources::ROOT_WINDOW,
             server::{ClientState, ServerState},
@@ -1548,6 +1548,39 @@ mod tests {
             let height = u16::from_le_bytes(buf[22..24].try_into().unwrap());
             assert_eq!(width, 1024);
             assert_eq!(height, 768);
+        }
+
+        #[test]
+        fn host_screen_resized_moves_the_output_and_ignores_no_ops() {
+            let (mut state, mut reader) = server_with_root_listener();
+            let mut backend = RecordingBackend::new();
+            reader.set_nonblocking(true).expect("set non-blocking");
+            let pending = |reader: &mut UnixStream| {
+                let mut buf = [0u8; 4096];
+                reader.read(&mut buf).map_or(0, |n| n / 32)
+            };
+
+            host_screen_resized(&mut state, &mut backend, 1024, 768);
+            assert_eq!(
+                (state.randr.screen_width, state.randr.screen_height),
+                (1024, 768)
+            );
+            let output = state.randr.outputs.first().expect("one output");
+            assert_eq!((output.width, output.height), (1024, 768));
+            let crtc = state
+                .randr
+                .crtc_info(output.crtc_id, 0)
+                .expect("the output's crtc");
+            assert_eq!((crtc.width, crtc.height), (1024, 768));
+            assert_eq!(pending(&mut reader), 1, "one root ConfigureNotify");
+
+            host_screen_resized(&mut state, &mut backend, 1024, 768);
+            host_screen_resized(&mut state, &mut backend, 0, 768);
+            assert_eq!(pending(&mut reader), 0, "same or zero size: no events");
+            assert_eq!(
+                (state.randr.screen_width, state.randr.screen_height),
+                (1024, 768)
+            );
         }
     }
 }

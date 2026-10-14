@@ -48,7 +48,7 @@ pub use message::{
     SYNTH_SCROLL_LEFT, SYNTH_SCROLL_RIGHT, SYNTH_SCROLL_UP, SetupAllocateResponse,
 };
 pub use reset::ResetPolicy;
-pub use run::{handle_host_input, run_core};
+pub use run::{handle_host_input, host_screen_resized, run_core};
 pub use sender::{BoundSender, CoreReceiver, CoreSender, NOTIFY_TOKEN, channel};
 pub use xdmcp::XdmcpService;
 #[cfg(feature = "xdmcp")]

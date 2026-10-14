@@ -3537,17 +3537,31 @@ pub(crate) fn handle_host_container_resize(
     backend: &mut dyn Backend,
     ev: crate::host_x11::HostConfigureEvent,
 ) {
-    if ev.width == 0
-        || ev.height == 0
-        || (state.randr.screen_width == ev.width && state.randr.screen_height == ev.height)
+    host_screen_resized(state, backend, ev.width, ev.height);
+}
+
+/// The host resized the window that shows the screen: the single output
+/// and the screen become `width`x`height`, and clients hear of it (root and
+/// COW ConfigureNotify, ScreenChange/CrtcChange/OutputChange notifies). The
+/// backend has already resized its storage. Zero or unchanged sizes are
+/// ignored.
+pub fn host_screen_resized(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    width: u16,
+    height: u16,
+) {
+    if width == 0
+        || height == 0
+        || (state.randr.screen_width == width && state.randr.screen_height == height)
     {
         return;
     }
     let timestamp = state.timestamp_now();
-    state.randr.resize(timestamp, ev.width, ev.height);
+    state.randr.resize(timestamp, width, height);
 
-    // The nested path resizes the single output, so it genuinely changes
-    // CRTC geometry — pass the output as changed so CrtcChangeNotify fires.
+    // The single output follows the host window, so its CRTC geometry
+    // genuinely changes — pass it as changed so CrtcChangeNotify fires.
     let changed: Vec<(u32, u32, u32)> = state
         .randr
         .outputs
@@ -3555,7 +3569,7 @@ pub(crate) fn handle_host_container_resize(
         .map(|o| (o.output_id, o.crtc_id, o.mode_id))
         .into_iter()
         .collect();
-    apply_screen_size_side_effects(state, backend, ev.width, ev.height, &changed);
+    apply_screen_size_side_effects(state, backend, width, height, &changed);
 }
 
 /// Tell RANDR subscribers the layout changed without the screen resizing.
