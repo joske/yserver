@@ -3,7 +3,10 @@ use crate::kms::{
     render::{
         backend::{
             SharedBackingMoveSource, WindowGeometry, XBackend, order_pieces_for_in_place_move,
-            portable::{clip::intersect_rect_with_clip, draw::compute_copy_area_dst_rects},
+            portable::{
+                clip::intersect_rect_with_clip, draw::compute_copy_area_dst_rects,
+                windows::default_window_init_color,
+            },
             seam::Platform,
             shared_backing_move_pieces,
         },
@@ -75,6 +78,227 @@ impl<P: Platform> XBackend<P> {
         {
             log::warn!("render init_root_storage: initial root fill failed: {e:?}");
         }
+    }
+
+    /// Reallocate the root (and, if materialised, the COW) backing storage
+    /// at `w`x`h`, refill it, and tell the scene the storage under every
+    /// output changed. The caller sets the platform extent first.
+    ///
+    /// The KMS virtual-extent path (`apply_virtual_screen_extent`) and the
+    /// surface's `resize_screen` share it.
+    pub(in crate::kms::render::backend) fn resize_root_storage(&mut self, w: u16, h: u16) {
+        // ── 1. Resize root backing storage ────────────────────────────────
+        // The root drawable is always allocated (init_root_storage runs at
+        // boot). Resize it with the same detach→decref→allocate→fill
+        // pattern used by configure_subwindow.
+        let root_xid = self.core.window_id;
+        if let Some(old_id) = self.store.lookup(root_xid) {
+            self.store.detach_xid(root_xid);
+            self.store_decref_with_invalidate(old_id);
+            match self.platform.gpu().allocate_drawable_storage_as(
+                w,
+                h,
+                32,
+                crate::kms::vk::mem_accounting::MemCategory::WindowStorage,
+            ) {
+                Ok(storage) => {
+                    self.telemetry.record_storage_allocation();
+                    self.telemetry.record_image_view_create();
+                    match self.store_alloc(root_xid, DrawableKind::Root, 32, true, storage) {
+                        Ok(new_id) => {
+                            let rect = ash::vk::Rect2D {
+                                offset: ash::vk::Offset2D::default(),
+                                extent: ash::vk::Extent2D {
+                                    width: u32::from(w),
+                                    height: u32::from(h),
+                                },
+                            };
+                            if let Err(e) = self.engine.fill_rect(
+                                &mut self.store,
+                                self.platform.gpu_mut(),
+                                Dst::server_internal(new_id),
+                                rect,
+                                decode_x11_pixel_for_storage(
+                                    self.core.bg_pixel.unwrap_or(
+                                        yserver_core::resources::ROOT_DEFAULT_BACKGROUND_PIXEL,
+                                    ),
+                                    24,
+                                    GpuCore::format_for_depth(24),
+                                ),
+                            ) && self.platform.gpu().vk.is_some()
+                            {
+                                log::warn!("render resize_root_storage: root fill failed: {e:?}");
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "render resize_root_storage: root store.allocate failed: {e:?}"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    // No Vk (test fixture): allocate a null-view stub so the
+                    // xid remains live and tests can continue.
+                    log::debug!("render resize_root_storage: no Vk, stub root storage: {e:?}");
+                    let storage = Storage::for_tests_null(
+                        ash::vk::Extent2D {
+                            width: u32::from(w),
+                            height: u32::from(h),
+                        },
+                        GpuCore::format_for_depth(32),
+                    );
+                    if let Err(e) =
+                        self.store_alloc(root_xid, DrawableKind::Root, 32, true, storage)
+                    {
+                        log::warn!("render resize_root_storage: root stub alloc failed: {e:?}");
+                    }
+                }
+            }
+        }
+
+        // The fill above is the pixel background; a background pixmap tiles
+        // over it, as Xorg repaints the whole resized root with its tile.
+        if let Some(bg_pixmap) = self.core.bg_pixmap {
+            self.tile_root_background_pixmap(bg_pixmap.as_raw());
+        }
+
+        // ── 2. Resize COW backing storage (if materialised) ──────────────
+        // The COW is lazily allocated on the first CompositeGetOverlayWindow
+        // call. If it hasn't been created yet, the caller already set the
+        // platform extent, so the first allocation will use the new dimensions.
+        if let Some(old_cow_id) = self.cow_id.take() {
+            let cow_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+            self.store.detach_xid(cow_xid);
+            self.store_decref_with_invalidate(old_cow_id);
+            match self.platform.gpu().allocate_drawable_storage_as(
+                w,
+                h,
+                24,
+                crate::kms::vk::mem_accounting::MemCategory::WindowStorage,
+            ) {
+                Ok(storage) => {
+                    self.telemetry.record_storage_allocation();
+                    self.telemetry.record_image_view_create();
+                    match self.store_alloc(cow_xid, DrawableKind::Window, 24, true, storage) {
+                        Ok(new_cow_id) => {
+                            // Fill so the compositor doesn't see
+                            // recycled GPU content on its next paint.
+                            // OPAQUE black, not transparent: the COW is
+                            // a depth-24 drawable, and on X11 depth-24
+                            // has no alpha channel — it is opaque by
+                            // definition. See `default_window_init_color`.
+                            let rect = ash::vk::Rect2D {
+                                offset: ash::vk::Offset2D::default(),
+                                extent: ash::vk::Extent2D {
+                                    width: u32::from(w),
+                                    height: u32::from(h),
+                                },
+                            };
+                            if let Err(e) = self.engine.fill_rect(
+                                &mut self.store,
+                                self.platform.gpu_mut(),
+                                Dst::server_internal(new_cow_id),
+                                rect,
+                                default_window_init_color(24),
+                            ) && self.platform.gpu().vk.is_some()
+                            {
+                                log::warn!(
+                                    "render resize_root_storage: COW init fill failed: {e:?}"
+                                );
+                            }
+                            self.cow_id = Some(new_cow_id);
+                            // Update the windows geometry so scene assembly
+                            // uses the new dimensions.
+                            if let Some(geom) = self.windows.get_mut(&cow_xid) {
+                                geom.width = w;
+                                geom.height = h;
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "render resize_root_storage: COW store.allocate failed: {e:?}"
+                            );
+                            // cow_id stays None (taken above); the COW will be
+                            // re-materialised on the next CompositeGetOverlayWindow.
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::debug!("render resize_root_storage: no Vk, stub COW storage: {e:?}");
+                    let storage = Storage::for_tests_null(
+                        ash::vk::Extent2D {
+                            width: u32::from(w),
+                            height: u32::from(h),
+                        },
+                        GpuCore::format_for_depth(24),
+                    );
+                    match self.store_alloc(cow_xid, DrawableKind::Window, 24, true, storage) {
+                        Ok(new_cow_id) => {
+                            self.cow_id = Some(new_cow_id);
+                            if let Some(geom) = self.windows.get_mut(&cow_xid) {
+                                geom.width = w;
+                                geom.height = h;
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("render resize_root_storage: COW stub alloc failed: {e:?}");
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── 3. Mark scene dirty — no drain/rebuild needed ─────────────────
+        // A logical resize (RRSetScreenSize) does NOT change per-output
+        // scanout pool geometry or output positions; only the root/COW
+        // *source* dimensions change.  The scene resolves root and COW
+        // storage by xid on every frame (see `build_scene` → `store.lookup(
+        // core.window_id)`), so the reallocated storage above will be picked
+        // up automatically on the next compose tick.
+        //
+        // Crucially, we must NOT call `drain_all` + `rebuild_outputs` here.
+        // Those paths clear the scene's `pending_acks` queue (the per-output
+        // "flip in flight" gate) but do NOT drain the kernel's DRM event
+        // queue.  If output N has a pending atomic flip when we call
+        // drain_all, the scene thinks the CRTC is free and immediately
+        // attempts a new commit on the next tick — but the kernel still has
+        // the old flip pending, returning EBUSY.  This is what caused the
+        // observed "output 1 freezes black after RRSetScreenSize" on a live
+        // 2-monitor session.
+        //
+        // The existing per-output flip-pending gate (`pending_acks.is_empty()`
+        // in `tick_one_output`) already prevents EBUSY: if a flip is in
+        // flight the tick skips that output until the page-flip-complete event
+        // arrives.  So the correct fix is simply to defer to that gate.
+        //
+        // Old storage (root/COW) is released safely: `store_decref_with_
+        // invalidate` parks the DrawableId in `pending_retire` if the GPU
+        // fence has not yet signaled, deferring the VkImage destroy until the
+        // compose CB finishes — no `wait_idle_bounded` needed.
+        //
+        // root-overlay is root-absolute + layout-dependent; drop it on
+        // topology change. `rebuild_outputs` isn't called here (see above),
+        // so this logical-resize path needs its own explicit clear.
+        P::request_direct_unflip(self, "virtual_screen_extent_complete");
+        self.scene.root_overlay_clear();
+        // Step 3 — the root/COW storage under every scanout BO just changed
+        // size, while the BOs themselves stay valid. Nothing else tells the
+        // per-BO damage model that: the `RRSetScreenSize` caller deliberately
+        // skips `drain_all` + `rebuild_outputs` (see above), and
+        // `wake_for_damage` adds no region.
+        //
+        // For the hotplug caller this is belt-and-braces rather than load
+        // bearing: `fire_randr_changes` grows the extent only on a topology
+        // change, which has already run `scene.rebuild_outputs`, and that
+        // replaces EVERY output's `ScanoutDamage` with a fresh one whose every
+        // BO starts wholly missing (`ScanoutDamage::new`) — the relit output
+        // and the survivors alike. It is kept unconditional because it is the
+        // storage reallocation, not the scene rebuild, that makes the per-BO
+        // history meaningless, and the cost is at most one full repaint that
+        // was already going to happen.
+        self.scene.invalidate_all_scanout_damage();
+        self.scene.wake_for_damage();
     }
 
     /// Stamp alpha = 0xFF over `rects` (storage coordinates) when `target`
