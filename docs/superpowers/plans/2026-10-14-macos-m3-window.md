@@ -318,3 +318,20 @@ As M2: nightly fmt; `cargo clippy --all-targets -- -D warnings` (+ `--features x
   size, N or mm changed (`ResizeCoalescer::post_now`, was `answered`). Display id for `CGDisplayScreenSize`:
   `deviceDescription()["NSScreenNumber"]`. Default geometry 1280x800 (`just macos-run` too). Not done: scroll
   deltas stay point-based; the mode list (`max_output`) is not recomputed when xpp or the screen changes.
+- **Task 5** (`1894f263` core, `470c67cc` bridge, `92dff8ae` macOS; the macOS file is not compiled here, eiger
+  pending): `Message::InternalClient(UnixStream)` runs the normal setup on a socketpair without authorization and
+  sets `ClientState::internal`; `ServerState::counted_clients` feeds `note_client_count` and the last-client
+  reset, and an internal client arms no reset and joins no XDMCP session. The bridge (`surface/clipboard/`) is a
+  hand-written client (`conn.rs`, no new dependency) on its own thread, reconnecting 1 s after KillClient or a
+  reset. Beyond decision 4, closer to ICCCM §2.6.2 / clipboard managers: it also answers `MULTIPLE` (failed pairs'
+  targets set to None; no INCR inside MULTIPLE); when the X owner goes away (owner None, window destroy, client
+  close) it re-owns CLIPBOARD with the host's text; when the host holds no text it releases CLIPBOARD; at startup
+  it owns CLIPBOARD only if no X client does. Conversions use the XFIXES event's selection timestamp; the owner's
+  SelectionNotify is matched on requestor/selection/target, not time. `TEXT` is answered as `STRING` when Latin-1
+  holds the text, else `UTF8_STRING`; `STRING` maps characters past U+00FF to `?`. INCR above
+  `max_request_bytes − 24` (65535 units, no BIG-REQUESTS), stalled transfers dropped after 10 s.
+  `GeneralPasteboard` calls NSPasteboard through `DispatchQueue::main().exec_sync` (not `ShellUi`, which is
+  fire-and-forget). Tests run the core loop on the hardware-free KMS test backend (not the Vulkan headless
+  surface), so they are Linux-only. The bridge window has no `WM_NAME`/`WM_COMMAND`, so `xlsclients` does not
+  list it. Open: whether the main queue drains while the quit alert is modal (the bridge waits, it cannot
+  deadlock); PRIMARY.
