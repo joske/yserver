@@ -310,6 +310,9 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     if opts.geometry.is_some() {
         log::warn!("yserver: --geometry is for platforms without KMS; ignored");
     }
+    if opts.scale != launch::ScaleOption::Auto {
+        log::warn!("yserver: --scale is for platforms without KMS; ignored");
+    }
     if opts.headless {
         log::warn!("yserver: --headless is for platforms without KMS; ignored");
     }

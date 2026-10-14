@@ -128,6 +128,30 @@ pub struct LaunchOptions {
     /// `--geometry WxH`: the screen size in pixels on a platform without
     /// KMS.
     pub geometry: Option<(u16, u16)>,
+    /// `--scale auto|1|2`: backing pixels per X pixel in a window.
+    pub scale: ScaleOption,
+}
+
+/// How many backing pixels of a window one X pixel covers per axis.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ScaleOption {
+    /// The window's backing scale, rounded: one X pixel per point.
+    #[default]
+    Auto,
+    /// A fixed factor, 1 or 2.
+    Factor(u32),
+}
+
+/// Parse `--scale`: `auto`, `1` or `2`.
+fn parse_scale(value: &str) -> Result<ScaleOption, String> {
+    match value {
+        "auto" => Ok(ScaleOption::Auto),
+        "1" => Ok(ScaleOption::Factor(1)),
+        "2" => Ok(ScaleOption::Factor(2)),
+        _ => Err(format!(
+            "invalid --scale argument: {value} (expected auto, 1 or 2)"
+        )),
+    }
 }
 
 /// Parse a `WxH` screen size; both sides must be non-zero.
@@ -225,6 +249,8 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchOption
             o.headless = true;
         } else if arg == "--geometry" {
             o.geometry = Some(parse_geometry(&next_value(&mut it, "--geometry")?)?);
+        } else if arg == "--scale" {
+            o.scale = parse_scale(&next_value(&mut it, "--scale")?)?;
         } else if matches!(arg.as_str(), "--version" | "-version") {
             // Print-and-exit; the binary acts on this before `run()`.
             // Keep scanning so it works regardless of position.
@@ -1178,6 +1204,27 @@ mod tests {
             assert!(parse(&["--geometry", bad]).is_err(), "{bad}");
         }
         assert!(parse(&["--geometry"]).is_err(), "missing value");
+    }
+
+    #[test]
+    fn scale_parses_and_rejects_other_values() {
+        assert_eq!(parse(&[":1"]).unwrap().scale, ScaleOption::Auto);
+        assert_eq!(
+            parse(&["--scale", "auto"]).unwrap().scale,
+            ScaleOption::Auto
+        );
+        assert_eq!(
+            parse(&["--scale", "1"]).unwrap().scale,
+            ScaleOption::Factor(1)
+        );
+        assert_eq!(
+            parse(&["--scale", "2"]).unwrap().scale,
+            ScaleOption::Factor(2)
+        );
+        for bad in ["0", "3", "1.5", "Auto", "", "-1"] {
+            assert!(parse(&["--scale", bad]).is_err(), "{bad:?}");
+        }
+        assert!(parse(&["--scale"]).is_err(), "missing value");
     }
 
     #[test]
