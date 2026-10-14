@@ -906,3 +906,383 @@ fn surface_animated_cursor_steps_versions() {
         "versions step: {versions:?}"
     );
 }
+
+/// A server over a backend, and one client (id 9) that selected
+/// StructureNotify on root and RRScreenChangeNotify, talking through the
+/// core's request dispatch.
+struct ScreenFixture {
+    b: XBackend<SurfacePlatform>,
+    state: ServerState,
+    peer: std::os::unix::net::UnixStream,
+    sequence: u16,
+}
+
+/// What the client read: replies (the bytes after the 32-byte header
+/// included), errors as `(code, major)` and events.
+#[derive(Debug, Default)]
+struct Received {
+    replies: Vec<Vec<u8>>,
+    errors: Vec<(u8, u8)>,
+    events: Vec<[u8; 32]>,
+}
+
+type Sizes = Vec<(u16, u16)>;
+
+const STRUCTURE_NOTIFY: u32 = 0x0002_0000;
+const CONFIGURE_NOTIFY: u8 = 22;
+const RR_SCREEN_CHANGE_NOTIFY: u8 = 89;
+const ROOT_BACKGROUND: [u8; 3] = [0x50, 0x50, 0x50];
+const GC: u32 = 0x0020_0001;
+
+fn screen_fixture(b: XBackend<SurfacePlatform>) -> ScreenFixture {
+    let mut b = b;
+    let mut state = BackendTopology::from_backend(&mut b).into_server_state();
+    yserver_core::backend::install_backend_root_bindings(&mut state, &b);
+    let peer = add_client(&mut state, 9, STRUCTURE_NOTIFY);
+    let mut f = ScreenFixture {
+        b,
+        state,
+        peer,
+        sequence: 0,
+    };
+    // RRSelectInput(root, ScreenChangeNotifyMask)
+    f.randr(4, &[root_le(), [1, 0, 0, 0]].concat());
+    // CreateGC(GC, root, no values); `fill` sets the foreground.
+    f.request(55, 0, &[GC.to_le_bytes(), root_le(), [0; 4]].concat());
+    assert!(f.received().errors.is_empty(), "setup raised an error");
+    f
+}
+
+fn root_le() -> [u8; 4] {
+    yserver_core::resources::ROOT_WINDOW.0.to_le_bytes()
+}
+
+impl ScreenFixture {
+    fn request(&mut self, opcode: u8, data: u8, body: &[u8]) {
+        use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
+        assert_eq!(body.len() % 4, 0, "padded body");
+        self.sequence += 1;
+        yserver_core::core_loop::process_request::process_request(
+            &mut self.state,
+            &mut self.b as &mut dyn Backend,
+            ClientId(9),
+            SequenceNumber(self.sequence),
+            RequestHeader {
+                opcode,
+                data,
+                length_units: u32::try_from(1 + body.len() / 4).expect("length"),
+            },
+            body,
+            None,
+        )
+        .expect("process_request");
+    }
+
+    fn randr(&mut self, minor: u8, body: &[u8]) {
+        self.request(128, minor, body);
+    }
+
+    /// RRSetScreenSize at 96 DPI-ish millimetres.
+    fn set_screen_size(&mut self, width: u16, height: u16) {
+        let body = [
+            root_le().as_slice(),
+            &width.to_le_bytes(),
+            &height.to_le_bytes(),
+            &u32::from(width / 4).to_le_bytes(),
+            &u32::from(height / 4).to_le_bytes(),
+        ]
+        .concat();
+        self.randr(7, &body);
+    }
+
+    /// GetImage (ZPixmap, all planes) of `drawable`.
+    fn get_image(&mut self, drawable: u32, rect: (i16, i16, u16, u16)) {
+        let body = [
+            drawable.to_le_bytes().as_slice(),
+            &rect.0.to_le_bytes(),
+            &rect.1.to_le_bytes(),
+            &rect.2.to_le_bytes(),
+            &rect.3.to_le_bytes(),
+            &u32::MAX.to_le_bytes(),
+        ]
+        .concat();
+        self.request(73, 2, &body);
+    }
+
+    /// `rect` of the root as ZPixmap rows of BGRX, or the error code.
+    fn root_image(&mut self, rect: (i16, i16, u16, u16)) -> Result<Vec<u8>, u8> {
+        self.get_image(yserver_core::resources::ROOT_WINDOW.0, rect);
+        let mut got = self.received();
+        match (got.replies.pop(), got.errors.pop()) {
+            (Some(reply), None) => Ok(reply[32..].to_vec()),
+            (None, Some((code, _))) => Err(code),
+            other => panic!("one reply or error: {other:?}"),
+        }
+    }
+
+    /// PolyFillRectangle `rect` of `drawable` with `pixel`.
+    fn fill(&mut self, drawable: u32, pixel: u32, rect: (i16, i16, u16, u16)) {
+        // ChangeGC(GC, GCForeground)
+        self.request(
+            56,
+            0,
+            &[GC.to_le_bytes(), 4u32.to_le_bytes(), pixel.to_le_bytes()].concat(),
+        );
+        let body = [
+            drawable.to_le_bytes().as_slice(),
+            &GC.to_le_bytes(),
+            &rect.0.to_le_bytes(),
+            &rect.1.to_le_bytes(),
+            &rect.2.to_le_bytes(),
+            &rect.3.to_le_bytes(),
+        ]
+        .concat();
+        self.request(70, 0, &body);
+    }
+
+    fn received(&mut self) -> Received {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        let mut buf = [0u8; 65536];
+        while let Ok(n) = self.peer.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buf[..n]);
+        }
+        let mut got = Received::default();
+        let mut rest = bytes.as_slice();
+        while rest.len() >= 32 {
+            let len = match rest[0] {
+                1 => 32 + 4 * u32::from_le_bytes(rest[4..8].try_into().unwrap()) as usize,
+                _ => 32,
+            };
+            let (message, tail) = rest.split_at(len);
+            match message[0] {
+                0 => got.errors.push((message[1], message[10])),
+                1 => got.replies.push(message.to_vec()),
+                _ => got.events.push(message.try_into().unwrap()),
+            }
+            rest = tail;
+        }
+        assert!(rest.is_empty(), "a whole number of messages");
+        got
+    }
+
+    /// The `(width, height)` of the root ConfigureNotify and of the
+    /// RRScreenChangeNotify among `events`.
+    fn resize_events(events: &[[u8; 32]]) -> (Sizes, Sizes) {
+        let size = |ev: &[u8; 32], at: usize| {
+            (
+                u16::from_le_bytes([ev[at], ev[at + 1]]),
+                u16::from_le_bytes([ev[at + 2], ev[at + 3]]),
+            )
+        };
+        let configure = events
+            .iter()
+            .filter(|ev| {
+                ev[0] & 0x7f == CONFIGURE_NOTIFY
+                    && ev[8..12] == yserver_core::resources::ROOT_WINDOW.0.to_le_bytes()
+            })
+            .map(|ev| size(ev, 20))
+            .collect();
+        let screen = events
+            .iter()
+            .filter(|ev| ev[0] & 0x7f == RR_SCREEN_CHANGE_NOTIFY)
+            .map(|ev| size(ev, 24))
+            .collect();
+        (configure, screen)
+    }
+
+    /// RRSetScreenSize, asserting it raised no error and that the client
+    /// heard of the new size once each way.
+    fn resize(&mut self, width: u16, height: u16) {
+        self.received();
+        self.set_screen_size(width, height);
+        let got = self.received();
+        assert!(got.errors.is_empty(), "RRSetScreenSize: {:?}", got.errors);
+        let (configure, screen) = Self::resize_events(&got.events);
+        assert_eq!(configure, [(width, height)], "root ConfigureNotify");
+        assert_eq!(screen, [(width, height)], "RRScreenChangeNotify");
+        let root = self
+            .state
+            .resources
+            .window(yserver_core::resources::ROOT_WINDOW)
+            .expect("root");
+        assert_eq!((root.width, root.height), (width, height));
+    }
+}
+
+/// Every pixel of a BGRX row block has the RGB `bgr`.
+fn all_pixels(image: &[u8], bgr: [u8; 3]) -> bool {
+    !image.is_empty() && image.chunks_exact(4).all(|px| px[..3] == bgr)
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn rr_set_screen_size_grows_the_root_with_its_background() {
+    let Some(b) = headless_or_skip() else {
+        return;
+    };
+    let mut f = screen_fixture(b);
+    assert!(
+        all_pixels(
+            &f.root_image((0, 0, 16, 16)).expect("root"),
+            ROOT_BACKGROUND
+        ),
+        "the headless root is the default background"
+    );
+    f.resize(400, 300);
+    for rect in [(380, 280, 20, 20), (64, 0, 16, 16), (0, 48, 16, 16)] {
+        let image = f.root_image(rect).expect("GetImage of the grown area");
+        assert!(
+            all_pixels(&image, ROOT_BACKGROUND),
+            "the grown area {rect:?} is the root background"
+        );
+    }
+    assert_eq!(f.b.fb_dimensions(), (400, 300));
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn rr_set_screen_size_grown_root_area_takes_drawing() {
+    let Some(b) = headless_or_skip() else {
+        return;
+    };
+    let mut f = screen_fixture(b);
+    f.resize(400, 300);
+    f.fill(
+        yserver_core::resources::ROOT_WINDOW.0,
+        0x00FF_0000,
+        (300, 200, 20, 20),
+    );
+    let image = f.root_image((300, 200, 20, 20)).expect("GetImage");
+    assert!(all_pixels(&image, [0x00, 0x00, 0xFF]), "red where drawn");
+    let image = f.root_image((320, 220, 16, 16)).expect("GetImage");
+    assert!(all_pixels(&image, ROOT_BACKGROUND), "background next to it");
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn rr_set_screen_size_shrinks_and_grows_again_keeping_clients() {
+    let Some(b) = headless_or_skip() else {
+        return;
+    };
+    let mut f = screen_fixture(b);
+    f.resize(400, 300);
+    // CreateWindow(0x0020_0002, root, 360, 240, 32x32, InputOutput,
+    // CWBackPixel green) + MapWindow
+    let window = 0x0020_0002u32;
+    let body = [
+        window.to_le_bytes().as_slice(),
+        &root_le(),
+        &360i16.to_le_bytes(),
+        &240i16.to_le_bytes(),
+        &32u16.to_le_bytes(),
+        &32u16.to_le_bytes(),
+        &0u16.to_le_bytes(),
+        &1u16.to_le_bytes(),
+        &0u32.to_le_bytes(),
+        &2u32.to_le_bytes(),
+        &0x0000_FF00u32.to_le_bytes(),
+    ]
+    .concat();
+    f.request(1, 0, &body);
+    f.request(8, 0, &window.to_le_bytes());
+    assert!(f.received().errors.is_empty(), "the window was created");
+
+    f.resize(320, 200);
+    let image = f.root_image((300, 180, 20, 20)).expect("GetImage");
+    assert!(all_pixels(&image, ROOT_BACKGROUND));
+    f.resize(480, 360);
+    let image = f
+        .root_image((440, 320, 40, 40))
+        .expect("GetImage of the regrown area");
+    assert!(all_pixels(&image, ROOT_BACKGROUND));
+
+    assert_eq!(f.b.fb_dimensions(), (480, 360));
+
+    // GetGeometry: the window outside the shrunk screen is still there.
+    f.received();
+    f.request(14, 0, &window.to_le_bytes());
+    let got = f.received();
+    assert!(got.errors.is_empty(), "{:?}", got.errors);
+    let reply = &got.replies[0];
+    let geometry = (
+        i16::from_le_bytes([reply[12], reply[13]]),
+        i16::from_le_bytes([reply[14], reply[15]]),
+        u16::from_le_bytes([reply[16], reply[17]]),
+        u16::from_le_bytes([reply[18], reply[19]]),
+    );
+    assert_eq!(geometry, (360, 240, 32, 32));
+    // GetWindowAttributes: still mapped and viewable.
+    f.request(3, 0, &window.to_le_bytes());
+    assert_eq!(f.received().replies[0][26], 2, "map state Viewable");
+    f.get_image(window, (0, 0, 32, 32));
+    let got = f.received();
+    assert!(
+        got.errors.is_empty(),
+        "GetImage of the window: {:?}",
+        got.errors
+    );
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn rr_set_screen_size_resizes_the_surface_slots_scene_and_swapchain() {
+    let Some(SurfaceFixture { b, clock, .. }) = surface_or_skip() else {
+        return;
+    };
+    let mut f = screen_fixture(b);
+    let mut ust = 0;
+    let mut frame = |f: &mut ScreenFixture| {
+        f.b.maybe_composite().expect("maybe_composite");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while f.b.platform.outputs[0].has_pending() {
+            assert!(Instant::now() < deadline, "the frame never retired");
+            std::thread::sleep(Duration::from_millis(1));
+            ust += 1000;
+            if clock.tick(ust) {
+                f.b.on_platform_event(&mut f.state);
+            }
+        }
+    };
+    frame(&mut f);
+    let size = |width, height| {
+        Some(vk::Extent2D {
+            width: u32::from(width),
+            height: u32::from(height),
+        })
+    };
+
+    for (width, height) in [(400u16, 300u16), (320, 200)] {
+        f.resize(width, height);
+        let (slots, _) = f.b.platform.outputs[0].extents();
+        assert_eq!(Some(slots), size(width, height), "slots follow the screen");
+        let layouts = f.b.platform.output_layouts();
+        let [layout] = layouts.as_slice() else {
+            panic!("one output");
+        };
+        assert_eq!(
+            layout.root_rect,
+            (0, 0, u32::from(width), u32::from(height))
+        );
+        frame(&mut f);
+        assert_eq!(
+            f.b.platform.outputs[0].extents().1,
+            size(width, height),
+            "the swapchain was rebuilt at the new size"
+        );
+        let corner = rect(i32::from(width) - 20, i32::from(height) - 20, 20, 20);
+        let shown = SurfacePlatform::read_on_screen_region(&mut f.b, corner).expect("read");
+        assert!(
+            all_pixels(&shown, ROOT_BACKGROUND),
+            "the far corner of the {width}x{height} screen shows the root"
+        );
+        let image = f.b.platform.outputs[0]
+            .on_screen_image()
+            .expect("a frame on screen");
+        let slot = f.b.read_image_region(image, corner).expect("slot read");
+        assert!(all_pixels(&slot, ROOT_BACKGROUND), "and so does the slot");
+    }
+}

@@ -86,7 +86,7 @@ impl<P: Platform> XBackend<P> {
     ///
     /// The KMS virtual-extent path (`apply_virtual_screen_extent`) and the
     /// surface's `resize_screen` share it.
-    pub(in crate::kms::render::backend) fn resize_root_storage(&mut self, w: u16, h: u16) {
+    pub(crate) fn resize_root_storage(&mut self, w: u16, h: u16) {
         // ── 1. Resize root backing storage ────────────────────────────────
         // The root drawable is always allocated (init_root_storage runs at
         // boot). Resize it with the same detach→decref→allocate→fill

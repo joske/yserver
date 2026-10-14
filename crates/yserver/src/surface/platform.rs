@@ -397,6 +397,38 @@ impl XBackend<SurfacePlatform> {
         self.flush_host_cursor();
     }
 
+    /// Resize the X screen to `w`x`h`: every surface's slots, the scene's
+    /// outputs and the root/COW storage. The caller tells the clients.
+    ///
+    /// # Errors
+    ///
+    /// A surface's slots could not be reallocated, or the scene could not
+    /// follow; the screen keeps its old size in the first case.
+    pub(crate) fn resize_screen(&mut self, w: u16, h: u16) -> io::Result<()> {
+        let (w, h) = (w.max(1), h.max(1));
+        if (w, h) == self.platform.fb_size {
+            return Ok(());
+        }
+        let extent = vk::Extent2D {
+            width: u32::from(w),
+            height: u32::from(h),
+        };
+        // The scene's in-flight frames retire before their slots go.
+        self.scene.drain_all(&mut self.platform);
+        for output in &mut self.platform.outputs {
+            output
+                .resize(extent)
+                .map_err(|e| io::Error::other(format!("surface slots at {w}x{h}: {e:?}")))?;
+        }
+        self.platform.fb_size = (w, h);
+        self.scene
+            .rebuild_outputs(&self.platform, &self.platform.output_layouts())
+            .map_err(|e| io::Error::other(format!("surface scene at {w}x{h}: {e:?}")))?;
+        self.resize_root_storage(w, h);
+        log::info!("surface: screen resized to {w}x{h}");
+        Ok(())
+    }
+
     /// Apply the shell's events.
     fn apply_shell_events(&mut self, events: Vec<ShellEvent>) {
         for event in events {
@@ -685,6 +717,10 @@ impl Platform for SurfacePlatform {
         _hot: (u16, u16),
         _size: (i32, i32),
     ) {
+    }
+
+    fn set_logical_screen_size(b: &mut XBackend<Self>, w: u16, h: u16) -> io::Result<()> {
+        b.resize_screen(w, h)
     }
 
     fn host_pointer_warped(b: &mut XBackend<Self>, x: i32, y: i32) {

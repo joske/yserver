@@ -505,6 +505,32 @@ impl SurfaceOutput {
         Ok(())
     }
 
+    /// The X screen is now `extent`: reallocate the slots at it, dropping
+    /// their frames (the next compose repaints in full), and rebuild the
+    /// swapchain before the next present.
+    ///
+    /// # Errors
+    ///
+    /// The queue could not idle or a slot could not be allocated; the old
+    /// slots are then kept.
+    pub(crate) fn resize(&mut self, extent: vk::Extent2D) -> Result<(), vk::Result> {
+        if extent == self.extent {
+            return Ok(());
+        }
+        // No compose or copy may still use the old slots.
+        unsafe { self.vk.device.queue_wait_idle(self.vk.graphics_queue) }?;
+        let mut targets = Vec::with_capacity(SLOT_COUNT);
+        for _ in 0..SLOT_COUNT {
+            targets.push(OffscreenTarget::new(Arc::clone(&self.vk), extent)?);
+        }
+        self.targets = targets;
+        self.extent = extent;
+        self.slots = SlotRing::new(SLOT_COUNT);
+        self.pending_sync = None;
+        self.needs_recreate = true;
+        Ok(())
+    }
+
     /// The swapchain no longer matches the surface: rebuild it before the
     /// next present. The slots keep their pixels (they are X-sized).
     pub(crate) fn note_out_of_date(&mut self) {
@@ -574,6 +600,12 @@ impl SurfaceOutput {
     #[cfg(test)]
     pub(crate) fn frames_presented(&self) -> u64 {
         self.frames_presented
+    }
+
+    /// The slot extent and the swapchain's (none while there is none).
+    #[cfg(test)]
+    pub(crate) fn extents(&self) -> (vk::Extent2D, Option<vk::Extent2D>) {
+        (self.extent, self.swapchain.as_ref().map(|s| s.extent))
     }
 
     /// The current swapchain handle (null while there is none).
