@@ -113,7 +113,7 @@ impl XiRegistry {
                     device.name.clone_from(&info.name);
                     device.is_touchpad =
                         device.facet == Some(XiFacetKind::PointerTouch) && info.is_touchpad;
-                    device.device_node = Some(info.device_node.clone());
+                    device.device_node = super::device_node_of(info);
                 }
             }
             // A source retained without facets at its first registration
@@ -171,7 +171,7 @@ impl XiRegistry {
                 device.name.clone_from(&info.name);
                 device.is_touchpad =
                     device.facet == Some(XiFacetKind::PointerTouch) && info.is_touchpad;
-                device.device_node = Some(info.device_node.clone());
+                device.device_node = super::device_node_of(info);
             }
         }
         let source_enabled = if ids.is_empty() {

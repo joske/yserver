@@ -370,3 +370,15 @@ feature stubbed out before it counts.
 - **M2.1 scroll:** `Scroller` keeps the sub-v120 fraction per axis before the integer `ScrollV120` accumulator, so
   small trackpad deltas are not lost to rounding. `ScrollV120` (`src/scroll_v120.rs`) is the moved
   `drain_scroll` state; its four tests moved unchanged apart from the receiver.
+- **M2.2 channel:** `ShellLink::send_input(build)` takes a closure: it is called with the server time only once the
+  core connected, under the sender lock, so nothing stamps `server_time_ms` before `clock::init` and a shell's
+  translator state is not touched by input that is dropped. `connect` sends `devices::announcements` first.
+- **M2.2 lock sync:** `ShellEvent::LockState` is applied in `on_platform_event`; the Caps press+release goes back
+  through the core channel (`Message::HostInput`, keyboard origin) rather than straight into `on_host_input`, so it
+  queues behind input already in flight.
+- **M2.2 tests:** the lavapipe tests check the registry (both slaves attached to masters 3/2, `device_node` `None`,
+  no "Device Node" property), core KeyPress/KeyRelease with Shift and Num Lock state to a root-selecting client,
+  wheel → ButtonPress 4, the core repeat armed by a held key and cleared by the focus-loss release, and the lock
+  sync. The XI2 smooth-scroll motion is the existing fanout path (`pointer_fanout`) and is not re-tested. Risk 7:
+  the announcements pass `dispatch_host_input`, so the process-lifetime inventory replays them after a reset
+  (`core_loop/reset.rs:420–423`); not exercised by a test here.

@@ -10,6 +10,7 @@ use std::{
 use ash::vk;
 use yserver_core::{
     backend::{Backend, BackendTopology, WindowHandle},
+    core_loop::{HostInputEvent, handle_host_input},
     host_x11::HostSubwindowVisual,
     server::ServerState,
 };
@@ -18,6 +19,12 @@ use super::{
     SurfacePlatform,
     clock::FrameClock,
     headless_backend,
+    input::{
+        devices::{announcements, keyboard_source, pointer_source},
+        keymap::kvk,
+        pointer::{RawScroll, ScrollPhase, Scroller},
+        translate::{KeyKind, RawKey, Translator},
+    },
     link::{ShellEvent, ShellLink},
     surface_backend,
     swapchain::{NativeSurface, SurfaceOutput},
@@ -402,4 +409,250 @@ fn surface_randr_reports_one_window_output_at_the_screen_size() {
         panic!("one mode: {modes:?}");
     };
     assert_eq!((mode.width, mode.height, mode.vrefresh), (64, 48, 120));
+}
+
+/// A headless backend whose state knows the shell's two input devices, and
+/// a client selecting `mask` (core events) on the root.
+struct InputFixture {
+    b: XBackend<SurfacePlatform>,
+    state: ServerState,
+    peer: std::os::unix::net::UnixStream,
+}
+
+fn input_or_skip(mask: u32) -> Option<InputFixture> {
+    let mut b = headless_or_skip()?;
+    let mut state = BackendTopology::from_backend(&mut b).into_server_state();
+    for event in announcements(0) {
+        handle_host_input(&mut state, &mut b, event);
+    }
+    let peer = add_client(&mut state, 9, mask);
+    Some(InputFixture { b, state, peer })
+}
+
+fn add_client(state: &mut ServerState, id: u32, mask: u32) -> std::os::unix::net::UnixStream {
+    use std::{
+        collections::{HashMap, HashSet, VecDeque},
+        os::unix::net::UnixStream,
+        sync::{Mutex, atomic::AtomicU16},
+    };
+    use yserver_core::{resources::ROOT_WINDOW, server::ClientState, transport::Transport};
+    let (peer, writer) = UnixStream::pair().expect("socket pair");
+    writer.set_nonblocking(true).expect("nonblocking");
+    peer.set_nonblocking(true).expect("nonblocking");
+    state.clients.insert(
+        id,
+        ClientState {
+            writer: Arc::new(Mutex::new(Transport::Unix(writer))),
+            byte_order: yserver_protocol::x11::ClientByteOrder::LittleEndian,
+            last_sequence: Arc::new(AtomicU16::new(0)),
+            resource_id_base: 0,
+            resource_id_mask: u32::MAX,
+            event_masks: HashMap::from([(ROOT_WINDOW, mask)]),
+            save_set: HashSet::new(),
+            big_requests_enabled: false,
+            xi2_masks: HashMap::new(),
+            xi1_event_classes: HashSet::new(),
+            xi1_window_event_classes: HashMap::new(),
+            outbound: VecDeque::new(),
+            watching_writable: false,
+            write_failed: false,
+            focused_window: ROOT_WINDOW,
+            reader_control: None,
+            is_local: true,
+            fd_passing: true,
+        },
+    );
+    peer
+}
+
+impl InputFixture {
+    fn send(&mut self, events: Vec<HostInputEvent>) {
+        for event in events {
+            handle_host_input(&mut self.state, &mut self.b, event);
+        }
+    }
+
+    /// `(type, detail, state)` of the core events the client received.
+    fn received(&mut self) -> Vec<(u8, u8, u16)> {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = self.peer.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buf[..n]);
+        }
+        bytes
+            .chunks_exact(32)
+            .map(|ev| (ev[0] & 0x7f, ev[1], u16::from_le_bytes([ev[28], ev[29]])))
+            .collect()
+    }
+}
+
+const KEY_PRESS: u8 = 2;
+const KEY_RELEASE: u8 = 3;
+const BUTTON_PRESS: u8 = 4;
+const KEY_MASKS: u32 = 0x1 | 0x2;
+
+fn key(kvk: u16, kind: KeyKind, flags: u64) -> RawKey {
+    RawKey {
+        kvk,
+        kind,
+        flags,
+        is_repeat: false,
+    }
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn shell_devices_are_slaves_of_the_core_devices_without_a_node() {
+    use yserver_core::xinput::XiFacetKind;
+    let Some(f) = input_or_skip(0) else {
+        return;
+    };
+    let keyboard = f
+        .state
+        .xi_devices
+        .facet(keyboard_source(), XiFacetKind::Keyboard)
+        .expect("keyboard slave");
+    let pointer = f
+        .state
+        .xi_devices
+        .facet(pointer_source(), XiFacetKind::PointerTouch)
+        .expect("pointer slave");
+    assert_eq!(f.state.xi_devices.attachment(keyboard), Some(3));
+    assert_eq!(f.state.xi_devices.attachment(pointer), Some(2));
+    for id in [keyboard, pointer] {
+        let device = f.state.xi_devices.device(id).expect("device");
+        assert_eq!(device.device_node, None);
+        assert!(
+            device
+                .properties
+                .keys()
+                .all(|&atom| f.state.atoms.name(atom) != Some("Device Node")),
+            "no Device Node property on {id}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn translated_keys_reach_a_client_with_their_modifiers() {
+    let Some(mut f) = input_or_skip(KEY_MASKS) else {
+        return;
+    };
+    let mut t = Translator::new(false);
+    let mut out = Vec::new();
+    t.key(key(kvk::kVK_ANSI_A, KeyKind::Down, 0), 1, &mut out);
+    t.key(key(kvk::kVK_ANSI_A, KeyKind::Up, 0), 2, &mut out);
+    let shift = (1 << 17) | 0x2;
+    t.key(
+        key(kvk::kVK_Shift, KeyKind::FlagsChanged, shift),
+        3,
+        &mut out,
+    );
+    t.key(key(kvk::kVK_ANSI_A, KeyKind::Down, shift), 4, &mut out);
+    f.send(out);
+    let events = f.received();
+    let num_lock = 0x10;
+    assert_eq!(
+        events,
+        [
+            (KEY_PRESS, 38, num_lock),
+            (KEY_RELEASE, 38, num_lock),
+            (KEY_PRESS, 50, num_lock),
+            (KEY_PRESS, 38, num_lock | 0x1),
+        ],
+        "a, then Shift+a with ShiftMask (Num Lock on: Mod2)"
+    );
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_wheel_click_reaches_a_client_as_button_4() {
+    let Some(mut f) = input_or_skip(0x4) else {
+        return;
+    };
+    let mut scroller = Scroller::default();
+    let mut out = Vec::new();
+    scroller.scroll(
+        RawScroll {
+            dx: 0.0,
+            dy: 1.0,
+            precise: false,
+            phase: ScrollPhase::None,
+            momentum: ScrollPhase::None,
+        },
+        1,
+        &mut out,
+    );
+    f.send(out);
+    let presses: Vec<u8> = f
+        .received()
+        .into_iter()
+        .filter(|&(kind, _, _)| kind == BUTTON_PRESS)
+        .map(|(_, detail, _)| detail)
+        .collect();
+    assert_eq!(presses, [4]);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_held_shell_key_arms_the_core_repeat_until_focus_loss_releases_it() {
+    let Some(mut f) = input_or_skip(0) else {
+        return;
+    };
+    let mut t = Translator::new(false);
+    let mut out = Vec::new();
+    t.key(key(kvk::kVK_ANSI_A, KeyKind::Down, 0), 1, &mut out);
+    f.send(out);
+    let origin = yserver_core::core_loop::InputOrigin::Physical(keyboard_source());
+    assert!(
+        f.state
+            .key_repeats
+            .get(&origin)
+            .is_some_and(|repeat| repeat.event.keycode == 38),
+        "the core repeats the held key"
+    );
+    let mut out = Vec::new();
+    t.release_all(2, &mut out);
+    f.send(out);
+    assert!(!f.state.key_repeats.contains_key(&origin), "released");
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn the_lock_sync_toggles_caps_lock_only_when_it_differs() {
+    let Some(mut f) = input_or_skip(0) else {
+        return;
+    };
+    let (_poll, sender, rx) = yserver_core::core_loop::channel().expect("channel");
+    f.b.set_input_sender(sender);
+    let link = Arc::new(ShellLink::default());
+    f.b.pstate.link = Some(Arc::clone(&link));
+    let sync = |f: &mut InputFixture, caps: bool| -> usize {
+        link.post(ShellEvent::LockState { caps });
+        f.b.on_platform_event(&mut f.state);
+        let events: Vec<HostInputEvent> = rx
+            .try_recv_all()
+            .filter_map(|m| match m {
+                yserver_core::core_loop::Message::HostInput(event) => Some(event),
+                _ => None,
+            })
+            .collect();
+        let count = events.len();
+        f.send(events);
+        count
+    };
+    assert_eq!(sync(&mut f, false), 0, "both off");
+    assert_eq!(sync(&mut f, true), 2, "one Caps press+release");
+    assert_eq!(
+        f.b.current_xkb_mods().3 & 0x2,
+        0x2,
+        "X Caps Lock now locked"
+    );
+    assert_eq!(sync(&mut f, true), 0, "both on");
+    assert_eq!(sync(&mut f, false), 2);
+    assert_eq!(f.b.current_xkb_mods().3 & 0x2, 0);
 }

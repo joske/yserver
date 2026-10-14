@@ -269,7 +269,7 @@ impl XiDevice {
                 XiFacetKind::PointerTouch => XiClassShape::PhysicalPointer,
             },
             is_touchpad: facet == XiFacetKind::PointerTouch && info.is_touchpad,
-            device_node: Some(info.device_node.clone()),
+            device_node: device_node_of(info),
             properties: BTreeMap::new(),
             buttons_down: 0,
             scroll_axis_values: [0; 2],
@@ -514,6 +514,12 @@ pub fn type_atom_for(val: libinput_props::XiValType, float_atom: AtomId) -> Atom
     }
 }
 
+/// A source's device node; `None` for a source without one (a window
+/// system's input, not an evdev device).
+pub(crate) fn device_node_of(info: &DeviceInfo) -> Option<String> {
+    (!info.device_node.is_empty()).then(|| info.device_node.clone())
+}
+
 /// Seed the source metadata and supported pointer properties on one physical facet.
 ///
 /// Every physical facet receives its own Device Node and Device Product ID.
@@ -532,19 +538,22 @@ pub fn seed_pointer_properties(
 
     device.name = info.name.clone();
     device.is_touchpad = device.facet == Some(XiFacetKind::PointerTouch) && info.is_touchpad;
-    device.device_node = Some(info.device_node.clone());
+    device.device_node = device_node_of(info);
 
-    // Fixed identity properties: Device Node + Device Product ID.
-    let node_atom = atoms.intern(PROP_DEVICE_NODE, false);
-    set_seeded_property(
-        device,
-        node_atom,
-        XA_STRING,
-        8,
-        info.device_node.as_bytes().to_vec(),
-        true,
-        false,
-    );
+    // Fixed identity properties: Device Node (sources without a node have
+    // none) + Device Product ID.
+    if device.device_node.is_some() {
+        let node_atom = atoms.intern(PROP_DEVICE_NODE, false);
+        set_seeded_property(
+            device,
+            node_atom,
+            XA_STRING,
+            8,
+            info.device_node.as_bytes().to_vec(),
+            true,
+            false,
+        );
+    }
     let pid_atom = atoms.intern(PROP_DEVICE_PRODUCT_ID, false);
     set_seeded_property(
         device,
@@ -1719,6 +1728,31 @@ mod tests {
                 d.id
             );
         }
+    }
+
+    #[test]
+    fn a_source_without_a_device_node_publishes_none() {
+        let mut atoms = AtomTable::new();
+        let float_atom = atoms.intern("FLOAT", false);
+        let mut info = mouse_info();
+        info.device_node = String::new();
+        let mut slave = XiDevice::physical(6, &info, XiFacetKind::PointerTouch);
+        assert_eq!(slave.device_node, None);
+        seed_pointer_properties(&mut slave, &mut atoms, float_atom, &info);
+        assert_eq!(slave.device_node, None);
+        let node_atom = atoms.intern(PROP_DEVICE_NODE, false);
+        assert!(!slave.properties.contains_key(&node_atom), "no Device Node");
+        let pid_atom = atoms.intern(PROP_DEVICE_PRODUCT_ID, false);
+        assert!(slave.properties.contains_key(&pid_atom), "Product ID stays");
+
+        let mut registry = XiRegistry::new();
+        let ids = registry.register(&info);
+        assert_eq!(ids.len(), 1);
+        assert_eq!(registry.device(ids[0]).unwrap().device_node, None);
+        registry.register(&info);
+        assert_eq!(registry.device(ids[0]).unwrap().device_node, None);
+        registry.refresh_source(&info);
+        assert_eq!(registry.device(ids[0]).unwrap().device_node, None);
     }
 
     #[test]

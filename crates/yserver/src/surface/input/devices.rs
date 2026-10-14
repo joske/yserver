@@ -22,6 +22,16 @@ pub(crate) fn pointer_origin() -> InputOrigin {
     InputOrigin::Physical(POINTER)
 }
 
+#[cfg(test)]
+pub(crate) fn keyboard_source() -> InputSourceId {
+    KEYBOARD
+}
+
+#[cfg(test)]
+pub(crate) fn pointer_source() -> InputSourceId {
+    POINTER
+}
+
 fn device(source_id: InputSourceId, name: &str, keyboard: bool) -> DeviceInfo {
     DeviceInfo {
         source_id,

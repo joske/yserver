@@ -6,11 +6,13 @@ use std::{io, os::fd::OwnedFd, sync::Arc};
 
 use ash::vk;
 use yserver_core::{
+    backend::Backend as _,
     core_loop::{CoreSender, Message},
     server::ServerState,
 };
 
 use super::{
+    input::translate::caps_lock_sync,
     link::{ShellEvent, ShellLink},
     swapchain::SurfaceOutput,
 };
@@ -347,7 +349,22 @@ impl XBackend<SurfacePlatform> {
                         self.scene.wake_for_damage();
                     }
                 }
+                ShellEvent::LockState { caps } => self.sync_caps_lock(caps),
             }
+        }
+    }
+
+    /// Toggle the X Caps Lock through the input channel when it differs
+    /// from the window system's `host_caps`.
+    fn sync_caps_lock(&mut self, host_caps: bool) {
+        const LOCK_MASK: u8 = 0x02;
+        let x_caps = self.current_xkb_mods().3 & LOCK_MASK != 0;
+        let Some(sender) = self.pstate.core_sender.as_ref() else {
+            return;
+        };
+        let time = crate::clock::server_time_ms();
+        for event in caps_lock_sync(x_caps, host_caps, time) {
+            let _ = sender.send(Message::HostInput(event));
         }
     }
 
