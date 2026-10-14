@@ -6,7 +6,8 @@ use crate::kms::{
         scanout_damage::ScanoutDamage,
         scene::{
             BufferAgeRing, DeferredSceneRelease, FailedSubmitBo, OutputCursorMode, OutputLayout,
-            OutputSceneState, OutputSink, SceneCompositor, SceneCompositorInner, SceneError,
+            OutputSceneState, OutputSink, PreparedOutputs, SceneCompositor, SceneCompositorInner,
+            SceneError,
             cursor::{reset_cursor_mode_for_lifecycle, reset_cursor_retry_for_lifecycle},
             damage_audit::build_output_damage_audit,
             output_transform,
@@ -237,14 +238,39 @@ impl SceneCompositor {
         sink: &dyn OutputSink,
         layouts: &[OutputLayout],
     ) -> Result<(), SceneError> {
-        let Some(inner) = self.inner.as_mut() else {
-            return Ok(());
+        let prepared = self.prepare_outputs(sink, layouts)?;
+        self.install_outputs(prepared);
+        Ok(())
+    }
+
+    /// Build the output state for `layouts` without touching the current
+    /// one: the fallible half of [`Self::rebuild_outputs`].
+    ///
+    /// # Errors
+    ///
+    /// An output's descriptor pools or damage audit could not be created.
+    pub fn prepare_outputs(
+        &self,
+        sink: &dyn OutputSink,
+        layouts: &[OutputLayout],
+    ) -> Result<PreparedOutputs, SceneError> {
+        let Some(inner) = self.inner.as_ref() else {
+            return Ok(PreparedOutputs(None));
         };
-        let vk = inner.vk.clone();
         let mut outputs = Vec::with_capacity(layouts.len());
         for i in 0..layouts.len() {
-            outputs.push(Self::build_output_state(&vk, sink, layouts, i)?);
+            outputs.push(Self::build_output_state(&inner.vk, sink, layouts, i)?);
         }
+        Ok(PreparedOutputs(Some(outputs)))
+    }
+
+    /// Replace the output state with `prepared`; cannot fail. The caller
+    /// drained the scene first.
+    pub fn install_outputs(&mut self, prepared: PreparedOutputs) {
+        let (Some(inner), Some(outputs)) = (self.inner.as_mut(), prepared.0) else {
+            return;
+        };
+        let vk = inner.vk.clone();
         for old in &mut inner.outputs {
             release_intermediate(old, &vk);
         }
@@ -257,7 +283,6 @@ impl SceneCompositor {
         // (`fire_randr_changes`) and per-CRTC reconfiguration
         // (`apply_crtc_config`) — the two callers of `rebuild_outputs`.
         self.root_overlay_clear();
-        Ok(())
     }
 
     /// Follow the RANDR transforms in `layouts` without a topology rebuild:

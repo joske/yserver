@@ -1281,8 +1281,10 @@ impl KmsBackend {
     /// The ordering inside is load-bearing and is the reason the hotplug
     /// path routes through here instead of reallocating storage itself:
     ///
+    /// 0. The new root/COW storage is allocated and filled under
+    ///    placeholder xids (`prepare_root_storage`), nothing published yet.
     /// 1. An active direct frame is snapshotted into its old COW and
-    ///    unflipped FIRST -- reallocating root/COW storage changes the
+    ///    unflipped -- publishing new root/COW storage changes the
     ///    fallback identity that frame holds.
     /// 2. Only then are `fb_w`/`fb_h`, the input extent and the root/COW
     ///    storage replaced.
@@ -1292,20 +1294,26 @@ impl KmsBackend {
     ///
     /// # Errors
     ///
-    /// Returns the direct-scanout materialisation error when an active
-    /// direct frame cannot be snapshotted. In that case the old extent and
-    /// every storage owner/pin are left untouched.
+    /// The new storage could not be allocated or filled, or an active
+    /// direct frame could not be snapshotted. The old extent and every
+    /// storage owner/pin are then left untouched.
     pub(in crate::kms::render::backend) fn apply_virtual_screen_extent(
         &mut self,
         w: u16,
         h: u16,
     ) -> io::Result<()> {
+        // Every fallible storage step first: on failure nothing changed.
+        let prepared = self.prepare_root_storage(w, h)?;
+
         // Reallocating root/COW storage changes the fallback identity held by
         // an active direct frame. Snapshot that frame into its old COW and
         // request the synchronized replacement first. On failure, leave the
         // old dimensions and every storage owner/pin untouched.
         if self.pstate.scanout_m2.active() {
-            self.materialize_direct_shadow_for_unflip()?;
+            if let Err(e) = self.materialize_direct_shadow_for_unflip() {
+                self.discard_root_storage(prepared);
+                return Err(e);
+            }
             self.request_direct_unflip("virtual_screen_extent_before_storage_reallocation");
         }
 
@@ -1319,7 +1327,7 @@ impl KmsBackend {
         self.update_input_extent(w, h);
 
         // ── 2. Root/COW storage and scene damage, shared with the surface ──
-        self.resize_root_storage(w, h);
+        self.commit_root_storage(prepared);
 
         Ok(())
     }

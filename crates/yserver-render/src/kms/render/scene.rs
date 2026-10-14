@@ -309,6 +309,10 @@ struct BufferAgeRing {
     depth: usize,
 }
 
+/// Output state built by [`SceneCompositor::prepare_outputs`], not yet
+/// installed; dropping it frees it.
+pub struct PreparedOutputs(Option<Vec<OutputSceneState>>);
+
 struct OutputSceneState {
     output_idx: usize,
     damage_audit: Option<OutputDamageAudit>,

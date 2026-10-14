@@ -608,3 +608,50 @@ pub(crate) fn single_output_randr(
     let modes = yserver_core::randr::RandrState::from_outputs(0, outputs.clone()).mode_table;
     (outputs, modes)
 }
+
+/// A prepare stage of a screen resize that a test makes fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResizeFault {
+    /// Allocating root, COW or slot images.
+    Alloc,
+    /// Filling or tiling the new root or COW.
+    Fill,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The stage a resize fails at, after passing it this many times.
+    static RESIZE_FAULT: std::cell::Cell<Option<(ResizeFault, u32)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Make the resize step at `stage` fail once on this thread, after `skip`
+/// passes of it (tests).
+#[cfg(test)]
+pub(crate) fn inject_resize_fault(stage: ResizeFault, skip: u32) {
+    RESIZE_FAULT.with(|fault| fault.set(Some((stage, skip))));
+}
+
+/// Whether a test asked this pass of `stage` to fail; the fault is consumed.
+#[must_use]
+pub(crate) fn resize_fault(stage: ResizeFault) -> bool {
+    #[cfg(test)]
+    {
+        RESIZE_FAULT.with(|fault| match fault.get() {
+            Some((at, 0)) if at == stage => {
+                fault.set(None);
+                true
+            }
+            Some((at, skip)) if at == stage => {
+                fault.set(Some((at, skip - 1)));
+                false
+            }
+            _ => false,
+        })
+    }
+    #[cfg(not(test))]
+    {
+        let _ = stage;
+        false
+    }
+}

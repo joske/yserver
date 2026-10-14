@@ -1438,28 +1438,57 @@ impl<P: Platform> XBackend<P> {
     }
 
     /// Tile `host_pixmap_xid` across the whole root extent from (0, 0): the
-    /// root's background pixmap, painted by `set_container_background_pixmap`
-    /// and again whenever the root storage is reallocated for a new screen
-    /// size (Xorg `SetRootClip` exposes the whole resized root and
-    /// `miPaintWindow` tiles its background there).
+    /// root's background pixmap, painted by `set_container_background_pixmap`.
+    /// A resize tiles the new root storage itself (`prepare_root_storage`;
+    /// Xorg `SetRootClip` exposes the whole resized root and `miPaintWindow`
+    /// tiles its background there).
     pub(in crate::kms::render::backend) fn tile_root_background_pixmap(
         &mut self,
         host_pixmap_xid: u32,
     ) {
-        use crate::kms::{
-            render::engine::{ResolvedSource, SourceDrawable},
-            vk::ops::render::CompositeRect,
-        };
         // Stage 4a — root paint resolves through redirect routing.
         let Some(dst_target) = self.resolve_paint_target(self.core.window_id) else {
             return;
         };
-        let dst = dst_target.backing_id();
+        let extent = ash::vk::Extent2D {
+            width: u32::from(self.platform.fb_size().0.max(1)),
+            height: u32::from(self.platform.fb_size().1.max(1)),
+        };
+        if let Err(e) = self.tile_background_pixmap_into(
+            dst_target.dst(),
+            dst_target.offset(),
+            extent,
+            host_pixmap_xid,
+        ) {
+            log::warn!(
+                "render set_container_background_pixmap: render_composite tile failed: {e:?}"
+            );
+        }
+    }
+
+    /// Tile `host_pixmap_xid` over `extent` of `dst` from `offset`; a
+    /// missing, aliased or non-BGRA8 source paints nothing.
+    ///
+    /// # Errors
+    ///
+    /// The composite could not be recorded.
+    pub(in crate::kms::render::backend) fn tile_background_pixmap_into(
+        &mut self,
+        dst_handle: Dst,
+        offset: (i32, i32),
+        dst_extent: ash::vk::Extent2D,
+        host_pixmap_xid: u32,
+    ) -> Result<(), crate::kms::render::engine::RenderError> {
+        use crate::kms::{
+            render::engine::{ResolvedSource, SourceDrawable},
+            vk::ops::render::CompositeRect,
+        };
+        let dst = dst_handle.id();
         let Some(src) = self.store.lookup(host_pixmap_xid) else {
             log::debug!(
                 "render set_container_background_pixmap: pixmap 0x{host_pixmap_xid:x} not in store"
             );
-            return;
+            return Ok(());
         };
         // Stage 3f.14: X11 bg_pixmap tiles across the drawable
         // extent. Pre-3f.14 v2 did a single copy_area at (0, 0)
@@ -1474,7 +1503,7 @@ impl<P: Platform> XBackend<P> {
             // is not a meaningful X11 op. v1's path treats it the
             // same (copy_area with src == dst is logged + skipped).
             log::debug!("render set_container_background_pixmap: src == root, skipping");
-            return;
+            return Ok(());
         }
         let src_format = self.store.get(src).map(|d| d.storage.format);
         if src_format != Some(ash::vk::Format::B8G8R8A8_UNORM) {
@@ -1485,19 +1514,15 @@ impl<P: Platform> XBackend<P> {
                 "render set_container_background_pixmap: pixmap 0x{host_pixmap_xid:x} format \
                  {src_format:?} not BGRA8, skipping tile"
             );
-            return;
+            return Ok(());
         }
-        let dst_extent = ash::vk::Extent2D {
-            width: u32::from(self.platform.fb_size().0.max(1)),
-            height: u32::from(self.platform.fb_size().1.max(1)),
-        };
         let rects = [CompositeRect {
             src_x: 0,
             src_y: 0,
             mask_x: 0,
             mask_y: 0,
-            dst_x: dst_target.offset().0,
-            dst_y: dst_target.offset().1,
+            dst_x: offset.0,
+            dst_y: offset.1,
             width: dst_extent.width,
             height: dst_extent.height,
         }];
@@ -1508,7 +1533,7 @@ impl<P: Platform> XBackend<P> {
             OP_SRC,
             ResolvedSource::Drawable(SourceDrawable::whole(src)),
             ResolvedSource::None,
-            dst_target.dst(),
+            dst_handle,
             &rects,
             None,
             Repeat::Normal,
@@ -1542,12 +1567,9 @@ impl<P: Platform> XBackend<P> {
                 );
             }
             Ok(_) => {}
-            Err(e) => {
-                log::warn!(
-                    "render set_container_background_pixmap: render_composite tile failed: {e:?}"
-                );
-            }
+            Err(e) => return Err(e),
         }
+        Ok(())
     }
 
     /// Record a window's geometry, parent and background, unviewable and without storage.

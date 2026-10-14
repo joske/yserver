@@ -1668,3 +1668,48 @@ fn set_logical_screen_size_updates_fb_and_root_storage() {
         "an idempotent logical-size request must not invalidate probes",
     );
 }
+
+/// A failed prepare (root or COW allocation, root or COW fill) leaves the
+/// old extent, the old root and COW drawables and no placeholder behind.
+#[test]
+fn a_failed_extent_prepare_keeps_the_old_extent_and_storage() {
+    use crate::kms::render::backend::seam::{ResizeFault, inject_resize_fault};
+
+    let mut b = KmsBackend::for_tests();
+    b.get_overlay_window(None).expect("get_overlay_window");
+    let cow_xid = yserver_core::resources::COMPOSITE_OVERLAY_WINDOW.0;
+    for (stage, skip) in [
+        (ResizeFault::Alloc, 0),
+        (ResizeFault::Alloc, 1),
+        (ResizeFault::Fill, 0),
+        (ResizeFault::Fill, 1),
+    ] {
+        let extent = b.platform.fb_dimensions();
+        let root = b.store.lookup(b.core.window_id);
+        let cow = b.store.lookup(cow_xid);
+        let entries = b.store.xid_entries().count();
+        inject_resize_fault(stage, skip);
+        assert!(
+            b.apply_virtual_screen_extent(extent.0 + 640, extent.1)
+                .is_err(),
+            "{stage:?} #{skip} fails the resize"
+        );
+        assert_eq!(b.platform.fb_dimensions(), extent, "{stage:?} #{skip}");
+        assert_eq!(b.store.lookup(b.core.window_id), root, "{stage:?} #{skip}");
+        assert_eq!(b.store.lookup(cow_xid), cow, "{stage:?} #{skip}");
+        assert_eq!(b.cow_id, cow, "{stage:?} #{skip}");
+        assert_eq!(b.store.xid_entries().count(), entries, "{stage:?} #{skip}");
+    }
+    let (w, h) = b.platform.fb_dimensions();
+    b.apply_virtual_screen_extent(w + 640, h)
+        .expect("an unfaulted resize succeeds");
+    assert_eq!(
+        b.root_storage_extent().map(|e| (e.width, e.height)),
+        Some((u32::from(w) + 640, u32::from(h)))
+    );
+    assert_ne!(
+        b.store.lookup(cow_xid),
+        None,
+        "the COW moved to its new storage"
+    );
+}

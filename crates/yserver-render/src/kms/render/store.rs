@@ -1086,6 +1086,29 @@ impl DrawableStore {
         self.topology_generation = self.topology_generation.wrapping_add(1);
     }
 
+    /// Move drawable `id` from its xid to the free `xid`: storage prepared
+    /// under a placeholder xid is published by a swap.
+    ///
+    /// # Errors
+    ///
+    /// `XidInUse` if `xid` maps to a drawable; nothing changes then (an
+    /// unknown `id` is ignored).
+    pub fn rebind_xid(&mut self, id: DrawableId, xid: u32) -> Result<(), AllocError> {
+        if self.by_xid.contains_key(&xid) {
+            return Err(AllocError::XidInUse);
+        }
+        let Some(drawable) = self.entries.get_mut(&id) else {
+            return Ok(());
+        };
+        if self.by_xid.get(&drawable.xid).copied() == Some(id) {
+            self.by_xid.remove(&drawable.xid);
+        }
+        drawable.xid = xid;
+        self.by_xid.insert(xid, id);
+        self.topology_generation = self.topology_generation.wrapping_add(1);
+        Ok(())
+    }
+
     /// Drop one reference. If refcount hits zero, decide
     /// retirement: synchronous-destroy if no fence is
     /// pending; otherwise park in `pending_retire`.

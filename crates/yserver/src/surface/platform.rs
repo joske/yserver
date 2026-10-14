@@ -413,18 +413,20 @@ impl XBackend<SurfacePlatform> {
             width: u32::from(w),
             height: u32::from(h),
         };
+        let prepared = self.prepare_root_storage(w, h)?;
         // The scene's in-flight frames retire before their slots go.
         self.scene.drain_all(&mut self.platform);
         for output in &mut self.platform.outputs {
-            output
-                .resize(extent)
-                .map_err(|e| io::Error::other(format!("surface slots at {w}x{h}: {e:?}")))?;
+            if let Err(e) = output.resize(extent) {
+                self.discard_root_storage(prepared);
+                return Err(io::Error::other(format!("surface slots at {w}x{h}: {e:?}")));
+            }
         }
         self.platform.fb_size = (w, h);
         self.scene
             .rebuild_outputs(&self.platform, &self.platform.output_layouts())
             .map_err(|e| io::Error::other(format!("surface scene at {w}x{h}: {e:?}")))?;
-        self.resize_root_storage(w, h);
+        self.commit_root_storage(prepared);
         log::info!("surface: screen resized to {w}x{h}");
         Ok(())
     }
