@@ -98,6 +98,7 @@ impl ShellInput {
     /// The pointer moved over (or dragged across) `view`.
     pub(super) fn motion(&self, view: &NSView, event: &NSEvent) {
         let raw = raw_pointer(view, event);
+        log::trace!("macos motion: {raw:?}");
         let fb = self.fb;
         self.link
             .send_input(|time, out| out.push(pointer::motion(&raw, fb, time)));
@@ -108,6 +109,7 @@ impl ShellInput {
         let raw = raw_pointer(view, event);
         let fb = self.fb;
         let number = event.buttonNumber() as i64;
+        log::debug!("macos button {number} pressed={pressed}: {raw:?}");
         let mut translator = self.translator.borrow_mut();
         self.link.send_input(|time, out| {
             out.push(pointer::motion(&raw, fb, time));
@@ -131,6 +133,7 @@ impl ShellInput {
 
     /// The window resigned key: release everything held.
     pub(super) fn focus_lost(&self) {
+        log::debug!("macos: window resigned key");
         let mut translator = self.translator.borrow_mut();
         self.link
             .send_input(|time, out| translator.release_all(time, out));
@@ -139,6 +142,7 @@ impl ShellInput {
     /// The window became key: let the core match the Caps Lock state.
     pub(super) fn focus_gained(&self) {
         let flags = NSEvent::modifierFlags_class().0 as u64;
+        log::debug!("macos: window became key, flags={flags:#x}");
         self.link.post(ShellEvent::LockState {
             caps: caps_locked(flags),
         });
