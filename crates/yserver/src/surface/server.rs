@@ -14,6 +14,7 @@ use yserver_core::{
 
 use super::{
     SurfacePlatform,
+    clipboard::{ClipboardBridge, Pasteboard},
     clock::FrameClock,
     link::ShellLink,
     swapchain::{NativeSurface, SurfaceOutput},
@@ -31,8 +32,8 @@ use crate::{
 pub(crate) const DEFAULT_SIZE: (u16, u16) = (1280, 800);
 
 /// A window shell's half of the server: its surface, the surface's frame
-/// clock (ticked by the shell), its link, its UI commands and the count of
-/// established X clients the core keeps for it.
+/// clock (ticked by the shell), its link, its UI commands, the count of
+/// established X clients the core keeps for it and the host pasteboard.
 pub(crate) struct WindowSpec {
     pub(crate) surface: NativeSurface,
     pub(crate) clock: Arc<FrameClock>,
@@ -43,6 +44,8 @@ pub(crate) struct WindowSpec {
     pub(crate) max_output: Option<(u16, u16)>,
     /// The window's physical size in millimetres; 0: unknown.
     pub(crate) output_mm: (u32, u32),
+    /// Bridged with CLIPBOARD.
+    pub(crate) pasteboard: Box<dyn Pasteboard>,
 }
 
 /// Run the headless server, or refuse without `--headless`.
@@ -69,6 +72,7 @@ pub(crate) fn run_headless(opts: launch::LaunchOptions) -> io::Result<()> {
             super::headless_backend(vk, size, opts.layout.clone())
         },
         None,
+        None,
         |_| {},
     )
 }
@@ -89,6 +93,7 @@ pub(crate) fn run_windowed(opts: launch::LaunchOptions, spec: WindowSpec) -> io:
         clients,
         max_output,
         output_mm,
+        pasteboard,
     } = spec;
     let result = serve(
         &opts,
@@ -111,6 +116,7 @@ pub(crate) fn run_windowed(opts: launch::LaunchOptions, spec: WindowSpec) -> io:
             Ok(backend)
         },
         Some(&link),
+        Some(pasteboard),
         |display| ui.set_title(&format!("yserver :{display}")),
     );
     link.disconnect();
@@ -126,6 +132,7 @@ fn serve(
     opts: &launch::LaunchOptions,
     build: impl FnOnce(&launch::LaunchOptions) -> io::Result<XBackend<SurfacePlatform>>,
     link: Option<&ShellLink>,
+    pasteboard: Option<Box<dyn Pasteboard>>,
     on_display: impl FnOnce(u16),
 ) -> io::Result<()> {
     log::info!(target: "yserver::startup", "yserver: startup — {}", crate::version::line());
@@ -183,6 +190,12 @@ fn serve(
         link.connect(sender.clone_handle());
     }
     launch::signal_ready(opts, display, sigusr1_was_ignored, parent_pid);
+    // After the listener, stopped first: an internal client, never counted.
+    let clipboard = pasteboard.and_then(|pasteboard| {
+        ClipboardBridge::start(sender.clone_handle(), pasteboard)
+            .inspect_err(|e| log::warn!("yserver: no clipboard bridge: {e}"))
+            .ok()
+    });
 
     log::info!("yserver: entering single-threaded core loop");
     let result = core_loop::run_core(
@@ -197,6 +210,9 @@ fn serve(
         opts.reset_policy,
         xdmcp,
     );
+    if let Some(clipboard) = clipboard {
+        clipboard.stop();
+    }
     if let Err(err) = &result {
         log::warn!("yserver: run_core returned error: {err}");
     }
