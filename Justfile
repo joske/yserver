@@ -170,6 +170,48 @@ macos-run display="1" geometry="1280x800" log="info" scale="auto":
     DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib RUST_LOG="{{log}}" \
     cargo run --release --bin yserver -- :{{display}} --geometry {{geometry}} --scale {{scale}} 2>&1 | tee yserver-mac.log
 
+# macOS: target/yserver.app; uses the Homebrew packages at run time (README.md), no signing beyond the linker's ad-hoc one.
+macos-bundle:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release --bin yserver
+    version=$(cargo pkgid -p yserver | sed 's/.*[#@]//')
+    app=target/yserver.app
+    rm -rf "$app"
+    mkdir -p "$app/Contents/MacOS"
+    cp "{{TARGETDIR}}/yserver" "$app/Contents/MacOS/yserver"
+    cat > "$app/Contents/Info.plist" <<EOF
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0">
+    <dict>
+        <key>CFBundleExecutable</key>
+        <string>yserver</string>
+        <key>CFBundleIdentifier</key>
+        <string>io.github.joske.yserver</string>
+        <key>CFBundleName</key>
+        <string>yserver</string>
+        <key>CFBundleDisplayName</key>
+        <string>yserver</string>
+        <key>CFBundlePackageType</key>
+        <string>APPL</string>
+        <key>CFBundleInfoDictionaryVersion</key>
+        <string>6.0</string>
+        <key>CFBundleShortVersionString</key>
+        <string>$version</string>
+        <key>CFBundleVersion</key>
+        <string>$version</string>
+        <key>LSMinimumSystemVersion</key>
+        <string>26.0</string>
+        <key>LSApplicationCategoryType</key>
+        <string>public.app-category.developer-tools</string>
+        <key>NSHighResolutionCapable</key>
+        <true/>
+    </dict>
+    </plist>
+    EOF
+    echo "macos-bundle: $app $version"
+
 # Local TCP transport smoke. Creates a temporary FamilyInternet Xauthority
 # record for 127.0.0.1:7, starts yserver with TCP explicitly enabled, then
 # proves a real TCP client can complete setup. Requires a real KMS-capable
