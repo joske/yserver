@@ -329,7 +329,10 @@ impl SurfaceOutput {
                 self.needs_recreate |= suboptimal;
                 image_idx
             }
-            Err(vk::Result::NOT_READY | vk::Result::TIMEOUT) => return Ok(false),
+            Err(e @ (vk::Result::NOT_READY | vk::Result::TIMEOUT)) => {
+                log::debug!(target: "yserver::macos::diag", "DIAG acquire {e:?}");
+                return Ok(false);
+            }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 self.note_out_of_date();
                 return Ok(false);
@@ -342,6 +345,14 @@ impl SurfaceOutput {
         let ready = swapchain.ready[image_idx as usize];
         let image_extent = swapchain.extent;
         let handle = swapchain.handle;
+        log::debug!(
+            target: "yserver::macos::diag",
+            "DIAG present slot={bo_idx} image={image_idx} extent={}x{} slot_extent={}x{}",
+            image_extent.width,
+            image_extent.height,
+            self.extent.width,
+            self.extent.height
+        );
         let cb = self.copy_command_buffers[bo_idx];
         self.record_copy(cb, self.targets[bo_idx].image(), image, image_extent)?;
 
@@ -381,7 +392,12 @@ impl SurfaceOutput {
             self.swapchain_fns
                 .queue_present(self.vk.graphics_queue, &present)
         } {
-            Ok(suboptimal) => self.needs_recreate |= suboptimal,
+            Ok(suboptimal) => {
+                if suboptimal {
+                    log::debug!(target: "yserver::macos::diag", "DIAG present suboptimal");
+                }
+                self.needs_recreate |= suboptimal;
+            }
             // The present's semaphore wait still executes.
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.note_out_of_date(),
             Err(e) => return Err(e),

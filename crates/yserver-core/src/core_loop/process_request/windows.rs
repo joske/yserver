@@ -1543,6 +1543,15 @@ pub(super) fn handle_configure_window(
             .sibling
             .map_or_else(|| "None".to_string(), |s| state.debug_window_label(s)),
     );
+    log::debug!(
+        target: "yserver::macos::diag",
+        "DIAG configure win={} x={:?} y={:?} w={:?} h={:?}",
+        state.debug_window_label(request.window),
+        request.x,
+        request.y,
+        request.width,
+        request.height,
+    );
     // X11 spec / Xorg `dix/window.c::ConfigureWindow`: ConfigureWindow
     // on the root window is accepted (no error) but has no visible
     // effect — root geometry is owned by the screen/RandR, not by the

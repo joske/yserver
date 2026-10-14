@@ -45,7 +45,7 @@ pub(super) fn create(
     // SAFETY: the shell owns the window outside a window controller.
     unsafe { window.setReleasedWhenClosed(false) };
     window.setTitle(&NSString::from_str("yserver"));
-    window.setBackgroundColor(Some(&*NSColor::blackColor()));
+    window.setBackgroundColor(Some(&*NSColor::redColor()));
     window.setContentMinSize(NSSize::new(
         f64::from(MIN_SCREEN.0) / scale,
         f64::from(MIN_SCREEN.1) / scale,

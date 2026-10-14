@@ -54,6 +54,11 @@ fn pointer_inside(window: &NSWindow, view: &NSView) -> bool {
 
 /// Show `image` (`None`: no cursor) over the view.
 pub(super) fn set(mtm: MainThreadMarker, image: Option<CursorImage>) {
+    log::debug!(
+        target: "yserver::macos::diag",
+        "DIAG cursor set {:?}",
+        image.as_ref().map(|i| (i.version, i.width, i.height, i.hot))
+    );
     let Some((window, view)) = window_and_view(mtm) else {
         return;
     };
@@ -83,6 +88,7 @@ pub(super) fn set(mtm: MainThreadMarker, image: Option<CursorImage>) {
 /// The view's `cursorUpdate:`: show the X cursor (the arrow until the core
 /// sent one).
 pub(super) fn apply_current() {
+    log::debug!(target: "yserver::macos::diag", "DIAG cursorUpdate");
     let current = CURSORS.with_borrow(|cursors| cursors.current.clone());
     current.unwrap_or_else(NSCursor::arrowCursor).set();
 }
@@ -151,6 +157,7 @@ pub(super) fn warp(mtm: MainThreadMarker, x: i32, y: i32) {
         return;
     };
     if !pointer_inside(&window, &view) {
+        log::debug!(target: "yserver::macos::diag", "DIAG warp x={x} y={y} skipped: outside");
         return;
     }
     let scale = window.backingScaleFactor();
@@ -163,6 +170,12 @@ pub(super) fn warp(mtm: MainThreadMarker, x: i32, y: i32) {
         return;
     };
     let global = NSPoint::new(on_screen.x, primary.frame().size.height - on_screen.y);
+    log::debug!(
+        target: "yserver::macos::diag",
+        "DIAG warp x={x} y={y} global=({}, {})",
+        global.x,
+        global.y
+    );
     // SAFETY: plain Quartz calls; re-associating avoids the post-warp freeze.
     unsafe {
         CGWarpMouseCursorPosition(global);

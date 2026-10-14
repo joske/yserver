@@ -120,7 +120,7 @@ impl ShellInput {
     /// The pointer moved over (or dragged across) `view`.
     pub(super) fn motion(&self, view: &NSView, event: &NSEvent) {
         let raw = raw_pointer(view, event);
-        log::trace!("macos motion: {raw:?}");
+        log::trace!("macos motion {:?}: {raw:?}", event.r#type());
         let fb = self.fb.get();
         self.link
             .send_input(|time, out| out.push(pointer::motion(&raw, fb, time)));
