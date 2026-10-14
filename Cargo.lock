@@ -1268,6 +1268,7 @@ name = "yserver"
 version = "1.7.1"
 dependencies = [
  "ash",
+ "block2",
  "crossbeam-channel",
  "dispatch2",
  "drm",

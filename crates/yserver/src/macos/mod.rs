@@ -3,7 +3,9 @@
 
 mod app;
 mod display_link;
+mod input;
 mod run;
+mod view;
 mod window;
 
 pub(crate) use run::run;

@@ -1,21 +1,26 @@
-//! The window: an `NSView` hosting a `CAMetalLayer` sized in X pixels, and
-//! the Vulkan surface on that layer.
+//! The window: a view hosting a `CAMetalLayer` sized in X pixels, and the
+//! Vulkan surface on that layer.
 
-use std::ffi::c_void;
+use std::{ffi::c_void, rc::Rc};
 
 use ash::vk;
 use objc2::{MainThreadMarker, MainThreadOnly, rc::Retained};
-use objc2_app_kit::{NSBackingStoreType, NSColor, NSScreen, NSView, NSWindow, NSWindowStyleMask};
+use objc2_app_kit::{
+    NSBackingStoreType, NSColor, NSResponder, NSScreen, NSView, NSWindow, NSWindowStyleMask,
+};
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 use objc2_quartz_core::{CALayer, CAMetalLayer};
 
+use super::{input::ShellInput, view::YserverView};
 use crate::surface::swapchain::NativeSurface;
 
 /// A titled, closable, minimisable window of `size` X pixels, i.e.
-/// `size / backingScaleFactor` points, whose content is a `CAMetalLayer`.
+/// `size / backingScaleFactor` points, whose content is a `CAMetalLayer`
+/// and whose view feeds `input`.
 pub(super) fn create(
     mtm: MainThreadMarker,
     size: (u16, u16),
+    input: Rc<ShellInput>,
 ) -> (Retained<NSWindow>, Retained<CAMetalLayer>) {
     let scale = NSScreen::mainScreen(mtm).map_or(1.0, |screen| screen.backingScaleFactor());
     let (width, height) = (f64::from(size.0), f64::from(size.1));
@@ -44,12 +49,17 @@ pub(super) fn create(
     layer.setContentsScale(scale);
     layer.setDrawableSize(NSSize::new(width, height));
     layer.setOpaque(true);
-    let view = NSView::initWithFrame(NSView::alloc(mtm), frame);
+    let view = YserverView::new(mtm, frame, input);
     // A layer set before `wantsLayer` makes the view layer-hosting.
     let host: &CALayer = &layer;
     view.setLayer(Some(host));
     view.setWantsLayer(true);
-    window.setContentView(Some(&*view));
+    let content: &NSView = &view;
+    window.setContentView(Some(content));
+    // Without it no `mouseMoved:` arrives, tracking area or not.
+    window.setAcceptsMouseMovedEvents(true);
+    let responder: &NSResponder = &view;
+    let _ = window.makeFirstResponder(Some(responder));
     window.center();
     (window, layer)
 }

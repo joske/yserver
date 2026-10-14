@@ -382,3 +382,12 @@ feature stubbed out before it counts.
   sync. The XI2 smooth-scroll motion is the existing fanout path (`pointer_fanout`) and is not re-tested. Risk 7:
   the announcements pass `dispatch_host_input`, so the process-lifetime inventory replays them after a reset
   (`core_loop/reset.rs:420–423`); not exercised by a test here.
+- **M2.3 glue:** `macos/input.rs` (`ShellInput`: NSEvent → `RawKey`/`RawPointer`/`RawScroll`, the key monitor, the
+  Carbon ISO query), `macos/view.rs` (`YserverView`, the layer-hosting content view with the motion tracking area).
+  The window delegate sends `focus_lost`/`focus_gained` on resign/become key. New macOS dependency `block2 =0.6.2`
+  (already in the lock through the app-kit bindings) for the monitor's block. `RUST_LOG=yserver::macos=debug` logs
+  every key event (kVK, kind, flags, repeat) — the event logger for the [A] checks; `trace` adds scroll phases.
+  Nothing in `src/macos/` was compiled on the Linux host (no Apple target installed).
+- **M2.3 pointer:** a button event first sends a motion to its own position, so a click after the pointer re-entered
+  without moving lands where it is. `acceptsFirstMouse:` is NO: the activating click is not sent; a release without
+  its press is dropped by the translator.

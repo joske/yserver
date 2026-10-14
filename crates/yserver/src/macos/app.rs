@@ -1,6 +1,9 @@
 //! The AppKit application: a Quit menu, one window, and the core loop on its
 //! own thread. The main thread never touches Vulkan.
 //!
+//! Every key goes to X, Cmd-Q included (as Super+Q); the menu's Quit has no
+//! key equivalent.
+//!
 //! Shutdown: Quit, the close button and SIGTERM all end in the core loop
 //! returning; the core thread then drops every Vulkan object and asks the
 //! main thread to quit (`ShellUi::quit`), which answers a pending
@@ -9,6 +12,7 @@
 use std::{
     cell::{Cell, OnceCell},
     io,
+    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -18,8 +22,10 @@ use std::{
 
 use dispatch2::DispatchQueue;
 use objc2::{
-    DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, rc::Retained,
-    runtime::ProtocolObject, sel,
+    DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
+    rc::Retained,
+    runtime::{AnyObject, ProtocolObject},
+    sel,
 };
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
@@ -29,7 +35,7 @@ use objc2_app_kit::{
 use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSString, ns_string};
 use objc2_quartz_core::CAMetalLayer;
 
-use super::display_link::DisplayLink;
+use super::{display_link::DisplayLink, input::ShellInput};
 use crate::{
     launch::LaunchOptions,
     surface::{
@@ -58,6 +64,10 @@ struct Ivars {
     layer: OnceCell<Retained<CAMetalLayer>>,
     /// Ticks the surface's frame clock.
     ticker: OnceCell<TickSource>,
+    /// The window's input; the key monitor holds it too.
+    input: OnceCell<Rc<ShellInput>>,
+    /// The local key monitor, kept for the app's lifetime.
+    key_monitor: OnceCell<Retained<AnyObject>>,
 }
 
 /// What ticks the frame clock: the display link, or a timer without one.
@@ -129,6 +139,22 @@ define_class!(
                 self.ivars().link.post(ShellEvent::Visible(visible));
             }
         }
+
+        // SAFETY: the signature matches the protocol method.
+        #[unsafe(method(windowDidBecomeKey:))]
+        fn did_become_key(&self, _notification: &NSNotification) {
+            if let Some(input) = self.ivars().input.get() {
+                input.focus_gained();
+            }
+        }
+
+        // SAFETY: the signature matches the protocol method.
+        #[unsafe(method(windowDidResignKey:))]
+        fn did_resign_key(&self, _notification: &NSNotification) {
+            if let Some(input) = self.ivars().input.get() {
+                input.focus_lost();
+            }
+        }
     }
 );
 
@@ -141,6 +167,8 @@ impl YserverAppDelegate {
             window: OnceCell::new(),
             layer: OnceCell::new(),
             ticker: OnceCell::new(),
+            input: OnceCell::new(),
+            key_monitor: OnceCell::new(),
         });
         // SAFETY: `NSObject`'s `init` has this signature.
         unsafe { msg_send![super(this), init] }
@@ -154,7 +182,15 @@ impl YserverAppDelegate {
             return;
         };
         let size = opts.geometry.unwrap_or(server::DEFAULT_SIZE);
-        let (window, layer) = super::window::create(mtm, size);
+        let input = ShellInput::new(Arc::clone(&ivars.link), size);
+        match input.install_key_monitor() {
+            Some(monitor) => {
+                let _ = ivars.key_monitor.set(monitor);
+            }
+            None => log::error!("macos: no key monitor; keys reach AppKit, not X"),
+        }
+        let _ = ivars.input.set(Rc::clone(&input));
+        let (window, layer) = super::window::create(mtm, size, input);
         let surface = super::window::metal_surface(&layer);
         let _ = ivars.layer.set(layer);
         window.setDelegate(Some(ProtocolObject::from_ref(self)));
@@ -226,7 +262,7 @@ impl ShellUi for MainQueueUi {
     }
 }
 
-/// A main menu with Quit (Cmd-Q).
+/// A main menu with Quit, without a key equivalent: Cmd-Q belongs to X.
 fn install_menu(app: &NSApplication, mtm: MainThreadMarker) {
     let quit = {
         // SAFETY: `terminate:` is an `NSApplication` action taking a sender.
@@ -235,7 +271,7 @@ fn install_menu(app: &NSApplication, mtm: MainThreadMarker) {
                 NSMenuItem::alloc(mtm),
                 ns_string!("Quit yserver"),
                 Some(sel!(terminate:)),
-                ns_string!("q"),
+                ns_string!(""),
             )
         }
     };

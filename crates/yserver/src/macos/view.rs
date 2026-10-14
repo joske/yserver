@@ -1,0 +1,142 @@
+//! The content view: hosts the `CAMetalLayer` and turns mouse, scroll and
+//! cursor events into input for the shell.
+
+use std::rc::Rc;
+
+use objc2::{
+    DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, rc::Retained,
+    runtime::AnyObject,
+};
+use objc2_app_kit::{NSEvent, NSResponder, NSTrackingArea, NSTrackingAreaOptions, NSView};
+use objc2_foundation::{NSObject, NSRect};
+
+use super::input::ShellInput;
+
+pub(super) struct ViewIvars {
+    input: Rc<ShellInput>,
+}
+
+define_class!(
+    // SAFETY: NSView has no subclassing requirements beyond the main thread,
+    // and the class has no `Drop`.
+    #[unsafe(super(NSView, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = ViewIvars]
+    pub(super) struct YserverView;
+
+    impl YserverView {
+        // SAFETY: the signature matches `-[NSResponder acceptsFirstResponder]`.
+        #[unsafe(method(acceptsFirstResponder))]
+        fn accepts_first_responder(&self) -> bool {
+            true
+        }
+
+        // SAFETY: the signature matches `-[NSView acceptsFirstMouse:]`.
+        #[unsafe(method(acceptsFirstMouse:))]
+        fn accepts_first_mouse(&self, _event: Option<&NSEvent>) -> bool {
+            false
+        }
+
+        // SAFETY: the signature matches `-[NSResponder mouseMoved:]`.
+        #[unsafe(method(mouseMoved:))]
+        fn mouse_moved(&self, event: &NSEvent) {
+            self.ivars().input.motion(self, event);
+        }
+
+        // SAFETY: the signature matches `-[NSResponder mouseDragged:]`.
+        #[unsafe(method(mouseDragged:))]
+        fn mouse_dragged(&self, event: &NSEvent) {
+            self.ivars().input.motion(self, event);
+        }
+
+        // SAFETY: the signature matches `-[NSResponder rightMouseDragged:]`.
+        #[unsafe(method(rightMouseDragged:))]
+        fn right_mouse_dragged(&self, event: &NSEvent) {
+            self.ivars().input.motion(self, event);
+        }
+
+        // SAFETY: the signature matches `-[NSResponder otherMouseDragged:]`.
+        #[unsafe(method(otherMouseDragged:))]
+        fn other_mouse_dragged(&self, event: &NSEvent) {
+            self.ivars().input.motion(self, event);
+        }
+
+        // SAFETY: the signature matches `-[NSResponder mouseDown:]`.
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, event: &NSEvent) {
+            self.ivars().input.button(self, event, true);
+        }
+
+        // SAFETY: the signature matches `-[NSResponder mouseUp:]`.
+        #[unsafe(method(mouseUp:))]
+        fn mouse_up(&self, event: &NSEvent) {
+            self.ivars().input.button(self, event, false);
+        }
+
+        // SAFETY: the signature matches `-[NSResponder rightMouseDown:]`.
+        #[unsafe(method(rightMouseDown:))]
+        fn right_mouse_down(&self, event: &NSEvent) {
+            self.ivars().input.button(self, event, true);
+        }
+
+        // SAFETY: the signature matches `-[NSResponder rightMouseUp:]`.
+        #[unsafe(method(rightMouseUp:))]
+        fn right_mouse_up(&self, event: &NSEvent) {
+            self.ivars().input.button(self, event, false);
+        }
+
+        // SAFETY: the signature matches `-[NSResponder otherMouseDown:]`.
+        #[unsafe(method(otherMouseDown:))]
+        fn other_mouse_down(&self, event: &NSEvent) {
+            self.ivars().input.button(self, event, true);
+        }
+
+        // SAFETY: the signature matches `-[NSResponder otherMouseUp:]`.
+        #[unsafe(method(otherMouseUp:))]
+        fn other_mouse_up(&self, event: &NSEvent) {
+            self.ivars().input.button(self, event, false);
+        }
+
+        // SAFETY: the signature matches `-[NSResponder scrollWheel:]`.
+        #[unsafe(method(scrollWheel:))]
+        fn scroll_wheel(&self, event: &NSEvent) {
+            self.ivars().input.scroll(event);
+        }
+    }
+);
+
+impl YserverView {
+    /// A view of `frame` points feeding `input`, tracking the pointer
+    /// whether or not the window is key.
+    pub(super) fn new(
+        mtm: MainThreadMarker,
+        frame: NSRect,
+        input: Rc<ShellInput>,
+    ) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(ViewIvars { input });
+        // SAFETY: `NSView`'s designated initialiser.
+        let view: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
+        let motion = NSTrackingAreaOptions::MouseMoved
+            | NSTrackingAreaOptions::MouseEnteredAndExited
+            | NSTrackingAreaOptions::ActiveAlways
+            | NSTrackingAreaOptions::InVisibleRect;
+        view.add_tracking_area(motion);
+        view
+    }
+
+    fn add_tracking_area(&self, options: NSTrackingAreaOptions) {
+        let owner: &AnyObject = self;
+        // SAFETY: `InVisibleRect` areas ignore the rect; the owner is this
+        // view, which outlives its tracking areas.
+        let area = unsafe {
+            NSTrackingArea::initWithRect_options_owner_userInfo(
+                NSTrackingArea::alloc(),
+                NSRect::ZERO,
+                options,
+                Some(owner),
+                None,
+            )
+        };
+        self.addTrackingArea(&area);
+    }
+}
