@@ -13,6 +13,7 @@ use super::{
     clock::FrameClock,
     link::ShellLink,
     swapchain::{NativeSurface, SurfaceOutput},
+    ui::ShellUi,
 };
 use crate::{
     kms::{
@@ -25,21 +26,13 @@ use crate::{
 /// The screen size without `--geometry`.
 pub(crate) const DEFAULT_SIZE: (u16, u16) = (1600, 1000);
 
-/// What the core thread asks of the window shell.
-pub(crate) trait ShellUi: Send {
-    /// Show `title` on the window.
-    fn set_title(&self, title: &str);
-    /// The core loop has ended and released every Vulkan object; quit.
-    fn quit(&self, failed: bool);
-}
-
 /// A window shell's half of the server: its surface, the surface's frame
 /// clock (ticked by the shell), its link and its UI commands.
 pub(crate) struct WindowSpec {
     pub(crate) surface: NativeSurface,
     pub(crate) clock: Arc<FrameClock>,
     pub(crate) link: Arc<ShellLink>,
-    pub(crate) ui: Box<dyn ShellUi>,
+    pub(crate) ui: Arc<dyn ShellUi>,
 }
 
 /// Run the headless server, or refuse without `--headless`.
@@ -96,6 +89,7 @@ pub(crate) fn run_windowed(opts: launch::LaunchOptions, spec: WindowSpec) -> io:
                 .map_err(|e| io::Error::other(format!("surface: {e:?}")))?;
             let mut backend = super::surface_backend(vk, size, opts.layout.clone(), vec![output])?;
             backend.pstate.link = Some(Arc::clone(&link));
+            backend.pstate.ui = Some(Arc::clone(&ui));
             Ok(backend)
         },
         Some(&link),

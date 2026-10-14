@@ -15,6 +15,7 @@ use super::{
     input::translate::caps_lock_sync,
     link::{ShellEvent, ShellLink},
     swapchain::SurfaceOutput,
+    ui::{CursorImage, ShellUi},
 };
 use crate::kms::{
     core::KmsCore,
@@ -40,6 +41,27 @@ pub(crate) struct SurfacePlatform {
     gpu: GpuCore,
     fb_size: (u16, u16),
     pub(crate) outputs: Vec<SurfaceOutput>,
+    cursor: HostCursor,
+}
+
+/// The X cursor as the window system shows it: the scene's cursor plane.
+#[derive(Default)]
+struct HostCursor {
+    /// The latest uploaded image, with the hotspot of the latest show.
+    image: Option<CursorImage>,
+    shown: bool,
+    /// What the shell was last told: `(version, hotspot)`, or hidden (and
+    /// at startup, where the shell shows its own cursor until the first).
+    sent: Option<(u64, (u16, u16))>,
+}
+
+impl HostCursor {
+    fn wanted(&self) -> Option<(u64, (u16, u16))> {
+        self.image
+            .as_ref()
+            .filter(|_| self.shown)
+            .map(|image| (image.version, image.hot))
+    }
 }
 
 /// Backend state the surface platform keeps next to the portable half.
@@ -51,6 +73,8 @@ pub(crate) struct SurfaceBackendState {
     shutdown_requested: bool,
     /// The window shell's channel, when a shell drives this server.
     pub(crate) link: Option<Arc<ShellLink>>,
+    /// The window shell's UI commands.
+    pub(crate) ui: Option<Arc<dyn ShellUi>>,
     /// Host-visible staging for on-screen reads.
     readback: Option<OpsStaging>,
 }
@@ -62,6 +86,7 @@ impl SurfacePlatform {
             gpu,
             fb_size,
             outputs,
+            cursor: HostCursor::default(),
         }
     }
 }
@@ -235,50 +260,66 @@ impl OutputSink for SurfacePlatform {
     }
 }
 
-/// No hardware cursor plane: the scene paints the cursor.
+/// The window system draws the cursor: the scene treats it as a cursor
+/// plane, and the backend hands the shown image to the shell.
 impl CursorPlaneSink for SurfacePlatform {
-    fn fits(&self, _output_idx: usize, _width: u32, _height: u32) -> bool {
-        false
+    fn fits(&self, output_idx: usize, _width: u32, _height: u32) -> bool {
+        output_idx < self.outputs.len()
     }
 
     fn visible(&self, _output_idx: usize) -> bool {
-        false
+        self.cursor.shown
     }
 
     fn uploaded_version(&self, _output_idx: usize) -> Option<u64> {
-        None
+        self.cursor.image.as_ref().map(|image| image.version)
     }
 
     fn upload(
         &mut self,
         _output_idx: usize,
-        _version: u64,
-        _width: u32,
-        _height: u32,
-        _bgra_bytes: &[u8],
+        version: u64,
+        width: u32,
+        height: u32,
+        bgra_bytes: &[u8],
     ) -> io::Result<()> {
-        Err(io::Error::from(io::ErrorKind::Unsupported))
+        let hot = self.cursor.image.as_ref().map_or((0, 0), |image| image.hot);
+        self.cursor.image = Some(CursorImage {
+            version,
+            width,
+            height,
+            hot,
+            bgra: Arc::from(bgra_bytes),
+        });
+        Ok(())
     }
 
     fn show(
         &mut self,
         _output_idx: usize,
-        _hot_x: u16,
-        _hot_y: u16,
+        hot_x: u16,
+        hot_y: u16,
         _x: i32,
         _y: i32,
     ) -> Result<(), CursorShowFailure> {
-        Err(CursorShowFailure {
-            remains_visible: false,
-            error: "no cursor plane".into(),
-        })
+        let Some(image) = self.cursor.image.as_mut() else {
+            return Err(CursorShowFailure {
+                remains_visible: self.cursor.shown,
+                error: "no cursor image uploaded".into(),
+            });
+        };
+        image.hot = (hot_x, hot_y);
+        self.cursor.shown = true;
+        Ok(())
     }
 
     fn hide(&mut self, _output_idx: usize) -> io::Result<()> {
+        self.cursor.shown = false;
         Ok(())
     }
 
     fn hide_all(&mut self) -> io::Result<()> {
+        self.cursor.shown = false;
         Ok(())
     }
 
@@ -288,6 +329,20 @@ impl CursorPlaneSink for SurfacePlatform {
 }
 
 impl XBackend<SurfacePlatform> {
+    /// Tell the shell when the cursor it shows changed.
+    fn flush_host_cursor(&mut self) {
+        let wanted = self.platform.cursor.wanted();
+        if self.platform.cursor.sent == wanted {
+            return;
+        }
+        let Some(ui) = self.pstate.ui.as_ref() else {
+            return;
+        };
+        self.platform.cursor.sent = wanted;
+        let image = wanted.and(self.platform.cursor.image.clone());
+        ui.set_cursor(image);
+    }
+
     /// Present composed frames that still wait for a swapchain image and
     /// retire the ones whose copy finished; re-arm the tick while any frame
     /// is pending.
@@ -330,6 +385,7 @@ impl XBackend<SurfacePlatform> {
                 log::warn!("surface: flush_submit_group failed: {e:?}");
             }
         }
+        self.flush_host_cursor();
     }
 
     /// Apply the shell's events.
@@ -514,7 +570,15 @@ impl Platform for SurfacePlatform {
                 }
             })
             .flatten();
-        b.gpu_work_deadline(now).into_iter().chain(scene).min()
+        let cursor_frame = b
+            .any_surface_visible()
+            .then(|| b.cursor_anim_deadline())
+            .flatten();
+        b.gpu_work_deadline(now)
+            .into_iter()
+            .chain(scene)
+            .chain(cursor_frame)
+            .min()
     }
 
     fn on_platform_event(b: &mut XBackend<Self>, _state: &mut ServerState) {
@@ -593,8 +657,26 @@ impl Platform for SurfacePlatform {
         {
             log::warn!("surface maybe_composite: timeout close failed: {e:?}");
         }
+        b.tick_cursor_animation();
         b.compose_tick();
         b.drain_paint_submit_telemetry();
+        b.flush_host_cursor();
         Ok(())
+    }
+
+    /// The window system moves its cursor itself: nothing to compose.
+    fn move_hw_cursor(
+        _b: &mut XBackend<Self>,
+        _mixed: bool,
+        _pos: (i32, i32),
+        _hot: (u16, u16),
+        _size: (i32, i32),
+    ) {
+    }
+
+    fn host_pointer_warped(b: &mut XBackend<Self>, x: i32, y: i32) {
+        if let Some(ui) = b.pstate.ui.as_ref() {
+            ui.warp_pointer(x, y);
+        }
     }
 }

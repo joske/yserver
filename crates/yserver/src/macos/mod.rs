@@ -2,6 +2,7 @@
 //! with the core loop on its own thread. `--headless` runs without it.
 
 mod app;
+mod cursor;
 mod display_link;
 mod input;
 mod run;

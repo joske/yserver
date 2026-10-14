@@ -13,5 +13,6 @@ mod slots;
 pub(crate) mod swapchain;
 #[cfg(test)]
 mod tests;
+pub(crate) mod ui;
 
 pub(crate) use platform::{SurfacePlatform, headless_backend, surface_backend};

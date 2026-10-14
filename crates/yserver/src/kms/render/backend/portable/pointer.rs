@@ -867,6 +867,9 @@ impl<P: Platform> XBackend<P> {
                 motion_delta: None,
             },
         );
+        #[allow(clippy::cast_possible_truncation)]
+        let (warped_x, warped_y) = (self.core.cursor_x as i32, self.core.cursor_y as i32);
+        P::host_pointer_warped(self, warped_x, warped_y);
     }
 
     pub(in crate::kms::render::backend) fn backend_pointer_query_pointer(

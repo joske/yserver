@@ -1,5 +1,5 @@
-//! The content view: hosts the `CAMetalLayer` and turns mouse, scroll and
-//! cursor events into input for the shell.
+//! The content view: hosts the `CAMetalLayer`, turns mouse and scroll
+//! events into input for the shell and shows the X cursor.
 
 use std::rc::Rc;
 
@@ -97,6 +97,12 @@ define_class!(
             self.ivars().input.button(self, event, false);
         }
 
+        // SAFETY: the signature matches `-[NSResponder cursorUpdate:]`.
+        #[unsafe(method(cursorUpdate:))]
+        fn cursor_update(&self, _event: &NSEvent) {
+            super::cursor::apply_current();
+        }
+
         // SAFETY: the signature matches `-[NSResponder scrollWheel:]`.
         #[unsafe(method(scrollWheel:))]
         fn scroll_wheel(&self, event: &NSEvent) {
@@ -121,6 +127,12 @@ impl YserverView {
             | NSTrackingAreaOptions::ActiveAlways
             | NSTrackingAreaOptions::InVisibleRect;
         view.add_tracking_area(motion);
+        // `cursorUpdate:` never comes from an `ActiveAlways` area.
+        view.add_tracking_area(
+            NSTrackingAreaOptions::CursorUpdate
+                | NSTrackingAreaOptions::ActiveInKeyWindow
+                | NSTrackingAreaOptions::InVisibleRect,
+        );
         view
     }
 

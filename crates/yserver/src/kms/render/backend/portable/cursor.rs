@@ -551,9 +551,7 @@ impl<P: Platform> XBackend<P> {
 
     /// Deadline for `next_wakeup`: the animation's next frame, only
     /// while it could actually be displayed (same gates as the tick).
-    pub(in crate::kms::render::backend) fn cursor_anim_deadline(
-        &self,
-    ) -> Option<std::time::Instant> {
+    pub(crate) fn cursor_anim_deadline(&self) -> Option<std::time::Instant> {
         if !self.kms_outputs_active || !P::scanout_allowed(self) {
             return None;
         }

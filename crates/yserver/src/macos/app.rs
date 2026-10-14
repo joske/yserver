@@ -41,7 +41,8 @@ use crate::{
     surface::{
         clock::{FrameClock, SoftwareTicker},
         link::{ShellEvent, ShellLink},
-        server::{self, ShellUi, WindowSpec},
+        server::{self, WindowSpec},
+        ui::{CursorImage, ShellUi},
     },
 };
 
@@ -212,7 +213,7 @@ impl YserverAppDelegate {
             surface,
             clock,
             link: Arc::clone(&ivars.link),
-            ui: Box::new(MainQueueUi {
+            ui: Arc::new(MainQueueUi {
                 quit: Arc::clone(&ivars.quit),
             }),
         };
@@ -258,6 +259,20 @@ impl ShellUi for MainQueueUi {
             } else {
                 app.terminate(None);
             }
+        });
+    }
+
+    fn set_cursor(&self, cursor: Option<CursorImage>) {
+        DispatchQueue::main().exec_async(move || {
+            let mtm = MainThreadMarker::new().expect("the main queue runs on the main thread");
+            super::cursor::set(mtm, cursor);
+        });
+    }
+
+    fn warp_pointer(&self, x: i32, y: i32) {
+        DispatchQueue::main().exec_async(move || {
+            let mtm = MainThreadMarker::new().expect("the main queue runs on the main thread");
+            super::cursor::warp(mtm, x, y);
         });
     }
 }

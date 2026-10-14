@@ -391,3 +391,29 @@ feature stubbed out before it counts.
 - **M2.3 pointer:** a button event first sends a motion to its own position, so a click after the pointer re-entered
   without moving lands where it is. `acceptsFirstMouse:` is NO: the activating click is not sent; a release without
   its press is dropped by the translator.
+- **M2.4 seam:** `ShellUi` moved from `surface/server.rs` (non-KMS only) to `surface/ui.rs`, so the platform and the
+  Linux tests see it; it is `Send + Sync` and shared as `Arc` (`WindowSpec.ui`, `SurfaceBackendState.ui`).
+  `CursorImage` carries the record version, size, hotspot and the premultiplied BGRA bytes; `rgba()` swizzles
+  for `NSBitmapImageRep` (default layout: RGBA, alpha last, premultiplied).
+- **M2.4 sink:** `SurfacePlatform` is a cursor plane on every surface (`fits` for any size). The sink only records
+  image/hotspot/visibility; `flush_host_cursor` (after `maybe_composite` and after retirement) sends
+  `ShellUi::set_cursor` when `(version, hotspot)` or visibility changed. Nothing is sent before the first shown
+  cursor, so the shell keeps its own arrow until then. `move_hw_cursor` is a no-op and
+  `Platform::host_pointer_warped` (default no-op; called at the end of `warp_pointer_root` with the clamped
+  position) sends `ShellUi::warp_pointer`.
+- **M2.4 animation:** the surface platform did not tick animated cursors (M0.6 listed it as KMS-only portable code).
+  `maybe_composite` now calls `tick_cursor_animation` and `next_wakeup` includes `cursor_anim_deadline` (made
+  `pub(crate)`) while a surface is visible.
+- **M2.4 tests (lavapipe, recording `ShellUi`):** startup sends the root cursor once and never re-sends it; a
+  DefineCursor on the root alone makes a frame due and sends one cursor with the new version and hotspot; XFixes
+  hide/show (`set_cursor_hidden`) sends `None` then the same version; 100 shell motions make no frame due, present
+  nothing and send nothing; a warp sends one clamped `warp_pointer`; an animated cursor sends a rising version per
+  frame. Each was seen failing with its feature removed.
+- **M2.4 shell:** `macos/cursor.rs` builds an `NSCursor` per `(version, hotspot)` (cache of 64) with an image of
+  `px / backingScaleFactor` points, keeps the current one in a main-thread `thread_local`, `set`s it when the
+  pointer is over the key window and from `cursorUpdate:` (second tracking area: `CursorUpdate | ActiveInKeyWindow
+  | InVisibleRect`); hidden = a 1×1 transparent cursor. The warp converts to Quartz global coordinates
+  (top-left of the primary screen) and is skipped unless the window is key and the pointer is over the view.
+- **Emulated non-KMS build (as M0.6):** clippy `--all-targets -D warnings` (default and `xdmcp`) clean and
+  `cargo test -p yserver --all-targets` green (222 passed); it caught `ScrollV120::is_empty` being test-only dead
+  code without KMS (fixed by a reset test).

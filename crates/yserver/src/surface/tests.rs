@@ -9,7 +9,7 @@ use std::{
 
 use ash::vk;
 use yserver_core::{
-    backend::{Backend, BackendTopology, WindowHandle},
+    backend::{Backend, BackendTopology, CursorHandle, WindowHandle},
     core_loop::{HostInputEvent, handle_host_input},
     host_x11::HostSubwindowVisual,
     server::ServerState,
@@ -22,12 +22,13 @@ use super::{
     input::{
         devices::{announcements, keyboard_source, pointer_source},
         keymap::kvk,
-        pointer::{RawScroll, ScrollPhase, Scroller},
+        pointer::{RawPointer, RawScroll, ScrollPhase, Scroller, motion},
         translate::{KeyKind, RawKey, Translator},
     },
     link::{ShellEvent, ShellLink},
     surface_backend,
     swapchain::{NativeSurface, SurfaceOutput},
+    ui::{CursorImage, ShellUi},
 };
 use crate::kms::{
     render::{
@@ -49,7 +50,10 @@ fn surface_sink_without_surfaces_has_no_slots_and_no_cursor_plane() {
         platform.check_frame_target(0),
         Err(FrameTargetError::NoSlot)
     ));
-    assert!(!platform.fits(0, 16, 16), "the scene paints the cursor");
+    assert!(
+        !platform.fits(0, 16, 16),
+        "no surface, no window-system cursor"
+    );
 }
 
 fn headless_or_skip() -> Option<XBackend<SurfacePlatform>> {
@@ -655,4 +659,236 @@ fn the_lock_sync_toggles_caps_lock_only_when_it_differs() {
     assert_eq!(sync(&mut f, true), 0, "both on");
     assert_eq!(sync(&mut f, false), 2);
     assert_eq!(f.b.current_xkb_mods().3 & 0x2, 0);
+}
+
+/// A shown cursor: `(version, hotspot, size)`.
+type Shown = (u64, (u16, u16), (u32, u32));
+
+/// A `ShellUi` call, as the cursor tests compare them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UiCall {
+    /// The shown cursor, or hidden.
+    Cursor(Option<Shown>),
+    Warp(i32, i32),
+}
+
+#[derive(Default)]
+struct RecordingUi(std::sync::Mutex<Vec<UiCall>>);
+
+impl RecordingUi {
+    fn take(&self) -> Vec<UiCall> {
+        std::mem::take(&mut *self.0.lock().expect("ui calls"))
+    }
+}
+
+impl ShellUi for RecordingUi {
+    fn set_title(&self, _title: &str) {}
+
+    fn quit(&self, _failed: bool) {}
+
+    fn set_cursor(&self, cursor: Option<CursorImage>) {
+        let call = cursor.map(|image| {
+            assert_eq!(
+                image.bgra.len(),
+                (image.width * image.height * 4) as usize,
+                "BGRA bytes for the whole image"
+            );
+            (image.version, image.hot, (image.width, image.height))
+        });
+        self.0.lock().expect("ui calls").push(UiCall::Cursor(call));
+    }
+
+    fn warp_pointer(&self, x: i32, y: i32) {
+        self.0.lock().expect("ui calls").push(UiCall::Warp(x, y));
+    }
+}
+
+/// A presenting surface with a recording UI, its first frame retired.
+fn cursor_or_skip() -> Option<(SurfaceFixture, Arc<RecordingUi>, u32)> {
+    let mut f = surface_or_skip()?;
+    let ui = Arc::new(RecordingUi::default());
+    f.b.pstate.ui = Some(Arc::clone(&ui) as Arc<dyn ShellUi>);
+    let xid = create_window(&mut f.b);
+    f.frame(xid, 0x00FF_0000);
+    f.retire();
+    Some((f, ui, xid))
+}
+
+impl SurfaceFixture {
+    /// Compose whatever the scene wants, and retire it.
+    fn tick(&mut self) {
+        self.b.maybe_composite().expect("maybe_composite");
+        self.retire();
+    }
+
+    /// Whether the core loop would compose now.
+    fn compose_due(&self) -> bool {
+        SurfacePlatform::next_wakeup(&self.b).is_some_and(|t| t <= Instant::now())
+    }
+
+    /// A 16x16 bitmap cursor with hotspot `hot`.
+    fn cursor(&mut self, hot: (u16, u16)) -> u32 {
+        let pixmap = self.b.create_pixmap(None, 1, 16, 16).expect("pixmap");
+        self.b
+            .create_cursor(None, pixmap, None, (0xFFFF, 0, 0), (0, 0, 0), hot.0, hot.1)
+            .expect("create_cursor")
+            .as_raw()
+    }
+
+    fn root(&self) -> u32 {
+        self.b.core.window_id
+    }
+}
+
+fn shown(calls: &[UiCall]) -> Vec<Shown> {
+    calls
+        .iter()
+        .map(|call| match call {
+            UiCall::Cursor(Some(cursor)) => *cursor,
+            other => panic!("expected a shown cursor, got {other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn surface_shows_the_root_cursor_once_at_startup() {
+    let Some((mut f, ui, xid)) = cursor_or_skip() else {
+        return;
+    };
+    let [(_, _, (width, height))] = shown(&ui.take())[..] else {
+        panic!("one set_cursor for the first frame");
+    };
+    assert!(width > 0 && height > 0);
+    f.frame(xid, 0x0000_FF00);
+    f.retire();
+    assert!(ui.take().is_empty(), "an unchanged cursor is not re-sent");
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn surface_define_cursor_sends_the_new_cursor_without_other_damage() {
+    let Some((mut f, ui, _)) = cursor_or_skip() else {
+        return;
+    };
+    let [(first, _, _)] = shown(&ui.take())[..] else {
+        panic!("the root cursor");
+    };
+    let cursor = f.cursor((3, 4));
+    let root = f.root();
+    f.b.define_cursor(None, root, cursor)
+        .expect("define_cursor");
+    assert!(f.compose_due(), "a cursor change alone asks for a frame");
+    f.tick();
+    let [(version, hot, size)] = shown(&ui.take())[..] else {
+        panic!("one set_cursor for the new cursor");
+    };
+    assert_ne!(version, first);
+    assert_eq!((hot, size), ((3, 4), (16, 16)));
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn surface_hide_cursor_hides_and_show_cursor_restores() {
+    let Some((mut f, ui, _)) = cursor_or_skip() else {
+        return;
+    };
+    let [(first, _, _)] = shown(&ui.take())[..] else {
+        panic!("the root cursor");
+    };
+    f.b.set_cursor_hidden(true);
+    assert!(f.compose_due(), "hiding asks for a frame");
+    f.tick();
+    assert_eq!(ui.take(), [UiCall::Cursor(None)]);
+    f.b.set_cursor_hidden(false);
+    assert!(f.compose_due(), "showing asks for a frame");
+    f.tick();
+    let [(version, _, _)] = shown(&ui.take())[..] else {
+        panic!("shown again");
+    };
+    assert_eq!(version, first, "the same cursor");
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn surface_pointer_motion_composes_nothing_and_sends_no_cursor() {
+    let Some((mut f, ui, _)) = cursor_or_skip() else {
+        return;
+    };
+    ui.take();
+    for event in announcements(0) {
+        handle_host_input(&mut f.state, &mut f.b, event);
+    }
+    let presented = f.output().frames_presented();
+    for step in 0..100 {
+        let raw = RawPointer {
+            x_pt: 30.0 + f64::from(step % 10),
+            y_pt: 10.0,
+            view_h_pt: 48.0,
+            scale: 1.0,
+            dx_pt: 1.0,
+            dy_pt: 0.0,
+        };
+        handle_host_input(&mut f.state, &mut f.b, motion(&raw, (64, 48), step));
+    }
+    assert!(
+        !f.compose_due(),
+        "motion alone does not wake the compositor"
+    );
+    f.b.maybe_composite().expect("maybe_composite");
+    assert_eq!(f.output().frames_presented(), presented, "no frame");
+    assert!(ui.take().is_empty(), "no cursor update");
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn surface_warp_pointer_moves_the_host_pointer() {
+    let Some((mut f, ui, _)) = cursor_or_skip() else {
+        return;
+    };
+    ui.take();
+    f.b.warp_pointer_root(&mut f.state, 10, 20);
+    assert_eq!(ui.take(), [UiCall::Warp(10, 20)]);
+    f.b.warp_pointer_root(&mut f.state, 500, -3);
+    assert_eq!(ui.take(), [UiCall::Warp(63, 0)], "clamped to the screen");
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn surface_animated_cursor_steps_versions() {
+    let Some((mut f, ui, _)) = cursor_or_skip() else {
+        return;
+    };
+    ui.take();
+    let frames = [
+        (CursorHandle::from_raw(f.cursor((1, 1))).expect("frame"), 1),
+        (CursorHandle::from_raw(f.cursor((2, 2))).expect("frame"), 1),
+    ];
+    let anim =
+        f.b.create_anim_cursor(None, &frames)
+            .expect("create_anim_cursor")
+            .expect("an animated cursor")
+            .as_raw();
+    let root = f.root();
+    f.b.define_cursor(None, root, anim).expect("define_cursor");
+    f.tick();
+    let mut versions = shown(&ui.take())
+        .into_iter()
+        .map(|(version, _, _)| version)
+        .collect::<Vec<_>>();
+    for _ in 0..2 {
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(f.compose_due(), "the next frame is due");
+        f.tick();
+        versions.extend(shown(&ui.take()).into_iter().map(|(v, _, _)| v));
+    }
+    assert_eq!(
+        versions.len(),
+        3,
+        "one cursor per animation frame: {versions:?}"
+    );
+    assert!(
+        versions.windows(2).all(|pair| pair[0] < pair[1]),
+        "versions step: {versions:?}"
+    );
 }
