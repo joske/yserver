@@ -1743,8 +1743,6 @@ fn pointer_event_fanout_to_state_inner(
                 time: event.time,
                 root_x: event.root_x,
                 root_y: event.root_y,
-                event_x: target_x,
-                event_y: target_y,
                 state_mask: event.state,
                 natural_target: target,
                 // Pointer devices have no focus class — always the
@@ -2996,6 +2994,22 @@ fn xi1_fan_device_event(
     // getValuatorEvents for a 2-axis motion.
     let is_motion =
         q.evcode == crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_MOTION_NOTIFY_OFFSET;
+    // Xorg FixUpEventFromWindow: coordinates relative to the event
+    // window's inside origin; child per FindChildForEvent from the
+    // sprite window (the pointer hit for pointer events, the deepest
+    // window under the pointer for key events).
+    let is_key = q.evcode
+        == crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_KEY_PRESS_OFFSET
+        || q.evcode == crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_KEY_RELEASE_OFFSET;
+    let sprite = if is_key {
+        crate::core_loop::key_fanout::deepest_window_at_pointer(state)
+    } else {
+        q.natural_target
+    };
+    let child = xi2_child_toward(state, event_window, sprite);
+    let (ox, oy) = state.resources.window_absolute_position(event_window);
+    let event_x = clamp_grab_coord(q.root_x, ox);
+    let event_y = clamp_grab_coord(q.root_y, oy);
     fanout_event_to_clients(state, targets, |buf, seq, order| {
         crate::xinput::encode_xi1_device_input_event(
             buf,
@@ -3006,11 +3020,11 @@ fn xi1_fan_device_event(
             q.time,
             ROOT_WINDOW.0,
             event_window.0,
-            0,
+            child.0,
             q.root_x,
             q.root_y,
-            q.event_x,
-            q.event_y,
+            event_x,
+            event_y,
             q.state_mask,
             if is_motion {
                 q.deviceid | u16::from(crate::xinput::XI1_MORE_EVENTS)
@@ -3876,7 +3890,7 @@ fn xi2_raw_evtype(kind: PointerEventKind) -> Option<u16> {
 /// (`ResourceId(0)` when `ancestor == descendant` or they are unrelated).
 /// Fills the XI2 `child` field when an event is reported on an ancestor of
 /// the hit window, matching Xorg's `DeliverDeviceEvents`.
-fn xi2_child_toward(
+pub(crate) fn xi2_child_toward(
     state: &ServerState,
     ancestor: ResourceId,
     descendant: ResourceId,

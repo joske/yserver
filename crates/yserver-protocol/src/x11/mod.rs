@@ -131,6 +131,7 @@ pub struct KeyEvent {
     pub time: u32,
     pub root: ResourceId,
     pub event: ResourceId,
+    pub child: ResourceId,
     pub root_x: i16,
     pub root_y: i16,
     pub event_x: i16,
@@ -1419,7 +1420,7 @@ pub fn encode_key_event(out: &mut Vec<u8>, order: ClientByteOrder, event: KeyEve
     write_u32(order, out, event.time);
     write_u32(order, out, event.root.0);
     write_u32(order, out, event.event.0);
-    write_u32(order, out, 0); // child
+    write_u32(order, out, event.child.0);
     write_i16(order, out, event.root_x);
     write_i16(order, out, event.root_y);
     write_i16(order, out, event.event_x);

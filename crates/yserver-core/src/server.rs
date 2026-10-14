@@ -569,8 +569,6 @@ pub struct Xi1QueuedEvent {
     pub time: u32,
     pub root_x: i16,
     pub root_y: i16,
-    pub event_x: i16,
-    pub event_y: i16,
     pub state_mask: u16,
     /// Natural (hit/focus) target the selection walk starts from.
     pub natural_target: ResourceId,

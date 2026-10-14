@@ -471,10 +471,7 @@ fn dispatch_fake_input_with_body(
                     chunk += 32;
                 }
                 let target = crate::core_loop::key_fanout::deepest_window_at_pointer(state);
-                let (ox, oy) = state.resources.window_absolute_position(target);
                 let (root_x, root_y) = state.pointer_root;
-                let event_x = i16::try_from(i32::from(root_x) - ox).unwrap_or(0);
-                let event_y = i16::try_from(i32::from(root_y) - oy).unwrap_or(0);
                 let _ = crate::core_loop::pointer_fanout::xi1_route_device_event(
                     state,
                     crate::server::Xi1QueuedEvent {
@@ -485,8 +482,6 @@ fn dispatch_fake_input_with_body(
                         time: fi.time,
                         root_x,
                         root_y,
-                        event_x,
-                        event_y,
                         state_mask: 0,
                         natural_target: target,
                         focus_route: crate::server::Xi1FocusRoute::Walk,

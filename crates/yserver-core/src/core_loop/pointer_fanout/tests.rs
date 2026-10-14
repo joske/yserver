@@ -53,8 +53,6 @@ fn xi1_sync_state_machine_pins() {
         time: 1,
         root_x: 0,
         root_y: 0,
-        event_x: 0,
-        event_y: 0,
         state_mask: 0,
         natural_target: crate::resources::ROOT_WINDOW,
         focus_route: crate::server::Xi1FocusRoute::Walk,

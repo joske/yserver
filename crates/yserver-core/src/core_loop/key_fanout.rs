@@ -696,6 +696,7 @@ fn deliver_key_to_window(
     } else {
         KEY_RELEASE_MASK
     };
+    let fields = key_window_fields(state, event, target_window);
 
     // Clients that selected XI2 for this key event on the window. Computed
     // first because XI2 *shadows* core per client: a client receiving the
@@ -733,7 +734,7 @@ fn deliver_key_to_window(
         Vec::new()
     } else {
         fanout_event_to_clients(state, &core_targets, |buf, seq, order| {
-            x11::encode_key_event(buf, order, key_event_wire(event, seq, target_window));
+            x11::encode_key_event(buf, order, key_event_wire(event, seq, fields));
         })
     };
 
@@ -750,7 +751,7 @@ fn deliver_key_to_window(
             continue;
         }
         let xi2_dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
-            encode_key_xi2_for_device(buf, order, seq, event, target_window, device_id, source_id);
+            encode_key_xi2_for_device(buf, order, seq, event, fields, device_id, source_id);
         });
         merge_dropped(&mut dropped, xi2_dropped);
     }
@@ -788,15 +789,16 @@ fn deliver_key_to_grab_owner(
     via_xi2: bool,
     device_id: u16,
 ) -> Vec<ClientId> {
+    let fields = key_window_fields(state, event, grab_window);
     if via_xi2 {
         let source_id =
             resolve_key_xi_source(state, event.origin).map_or(device_id, |source| source.sourceid);
         fanout_event_to_clients(state, &[owner], |buf, seq, order| {
-            encode_key_xi2_for_device(buf, order, seq, event, grab_window, device_id, source_id);
+            encode_key_xi2_for_device(buf, order, seq, event, fields, device_id, source_id);
         })
     } else {
         fanout_event_to_clients(state, &[owner], |buf, seq, order| {
-            x11::encode_key_event(buf, order, key_event_wire(event, seq, grab_window));
+            x11::encode_key_event(buf, order, key_event_wire(event, seq, fields));
         })
     }
 }
@@ -844,10 +846,49 @@ fn key_xi2_form_selected(
     xi2_mask_for_client(client, window, window, &devices[..device_count]) & (1 << evtype) != 0
 }
 
+/// The window-dependent fields of a key event reported on one window —
+/// Xorg `FixUpEventFromWindow` (dix/events.c).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KeyWindowFields {
+    window: ResourceId,
+    event_x: i16,
+    event_y: i16,
+    child: ResourceId,
+}
+
+/// Event coordinates are the root coordinates minus the window's inside
+/// origin (`pWin->drawable.x/y`). `child` is Xorg `FindChildForEvent`:
+/// the child of `window` on the path to the deepest window under the
+/// pointer, `None` when that window is `window` itself or is not inside
+/// it. During the focus walk that is the previous window on the path,
+/// which is what `DeliverDeviceEvents` passes.
+fn key_window_fields(
+    state: &ServerState,
+    event: &HostKeyEvent,
+    window: ResourceId,
+) -> KeyWindowFields {
+    let (ox, oy) = state.resources.window_absolute_position(window);
+    let relative = |root: i16, origin: i32| {
+        i16::try_from(
+            i32::from(root)
+                .saturating_sub(origin)
+                .clamp(i32::from(i16::MIN), i32::from(i16::MAX)),
+        )
+        .unwrap_or_default()
+    };
+    let sprite = deepest_window_at_pointer(state);
+    KeyWindowFields {
+        window,
+        event_x: relative(event.root_x, ox),
+        event_y: relative(event.root_y, oy),
+        child: crate::core_loop::pointer_fanout::xi2_child_toward(state, window, sprite),
+    }
+}
+
 fn key_event_wire(
     event: &HostKeyEvent,
     sequence: x11::SequenceNumber,
-    target_window: ResourceId,
+    fields: KeyWindowFields,
 ) -> x11::KeyEvent {
     x11::KeyEvent {
         pressed: event.pressed,
@@ -855,11 +896,12 @@ fn key_event_wire(
         sequence,
         time: event.time,
         root: ROOT_WINDOW,
-        event: target_window,
+        event: fields.window,
+        child: fields.child,
         root_x: event.root_x,
         root_y: event.root_y,
-        event_x: event.event_x,
-        event_y: event.event_y,
+        event_x: fields.event_x,
+        event_y: fields.event_y,
         state: event.state,
     }
 }
@@ -869,7 +911,7 @@ fn encode_key_xi2_for_device(
     order: x11::ClientByteOrder,
     seq: x11::SequenceNumber,
     event: &HostKeyEvent,
-    target_window: ResourceId,
+    fields: KeyWindowFields,
     device_id: u16,
     source_id: u16,
 ) {
@@ -882,12 +924,12 @@ fn encode_key_xi2_for_device(
         device_id,
         event.time,
         ROOT_WINDOW,
-        target_window,
-        ResourceId(0), // child=None; key events target the window directly
+        fields.window,
+        fields.child,
         event.root_x,
         event.root_y,
-        event.event_x,
-        event.event_y,
+        fields.event_x,
+        fields.event_y,
         event.state,
         u32::from(event.keycode),
         source_id,
@@ -1352,8 +1394,6 @@ fn deliver_xi1_focused_key(state: &mut ServerState, event: &HostKeyEvent) -> Vec
             time: event.time,
             root_x: event.root_x,
             root_y: event.root_y,
-            event_x: event.event_x,
-            event_y: event.event_y,
             state_mask: event.state,
             natural_target: natural,
             focus_route,
@@ -1560,7 +1600,7 @@ mod tests {
         const RAW_KEY_RELEASE: u32 = 1 << 14;
         const ROUTED_MASK: u32 = KEY_PRESS | KEY_RELEASE | RAW_KEY_PRESS | RAW_KEY_RELEASE;
 
-        fn keyboard_info(source_id: InputSourceId) -> DeviceInfo {
+        pub(super) fn keyboard_info(source_id: InputSourceId) -> DeviceInfo {
             DeviceInfo {
                 source_id,
                 enabled: true,
@@ -2976,6 +3016,283 @@ mod tests {
             let _ = replay_frozen_key_to_focus(&mut state, key_event(true, 38));
 
             assert!(raw_events(&mut m22).is_empty());
+        }
+    }
+
+    /// Event-window fields of key events — Xorg `FixUpEventFromWindow`,
+    /// `DeliverFocusedEvent`, `DeliverDeviceEvents`, `FindChildForEvent`
+    /// (dix/events.c). Tree (root coordinates of each INSIDE origin =
+    /// parent inside origin + x + border_width):
+    ///
+    /// - `FRAME` child of root at (100, 50), border 2 → inside (102, 52)
+    /// - `XEV` child of `FRAME` at (5, 20), border 1 → inside (108, 73)
+    /// - `INNER` child of `XEV` at (10, 10), border 4 → inside (122, 87);
+    ///   outer box in root coordinates x 118..176, y 83..141
+    ///
+    /// The pointer at root (130, 100) is inside `INNER`, so the sprite
+    /// window is `INNER`.
+    mod event_window_fields {
+        use super::*;
+        use yserver_protocol::x11::CreateWindowRequest;
+
+        const FRAME: ResourceId = ResourceId(0x0040_0001);
+        const XEV: ResourceId = ResourceId(0x0020_0001);
+        const INNER: ResourceId = ResourceId(0x0020_0002);
+        const IN_INNER: (i16, i16) = (130, 100);
+        /// Outside `FRAME` (outer x 100..404, y 50..354).
+        const OUTSIDE: (i16, i16) = (450, 380);
+        const XI2_KEY_PRESS_BIT: u64 = 1 << 2;
+
+        fn window(
+            state: &mut ServerState,
+            id: ResourceId,
+            parent: ResourceId,
+            geom: (i16, i16, u16, u16, u16),
+        ) {
+            let (x, y, width, height, border_width) = geom;
+            state.resources.create_window(
+                ClientId(1),
+                CreateWindowRequest {
+                    depth: 24,
+                    window: id,
+                    parent,
+                    x,
+                    y,
+                    width,
+                    height,
+                    border_width,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+            let _ = state.resources.map_window(id);
+        }
+
+        fn tree(pointer: (i16, i16)) -> ServerState {
+            let mut state = ServerState::new();
+            window(&mut state, FRAME, ROOT_WINDOW, (100, 50, 300, 300, 2));
+            window(&mut state, XEV, FRAME, (5, 20, 250, 250, 1));
+            window(&mut state, INNER, XEV, (10, 10, 50, 50, 4));
+            state.pointer_root = pointer;
+            state
+        }
+
+        fn press_at(pointer: (i16, i16)) -> HostKeyEvent {
+            HostKeyEvent {
+                root_x: pointer.0,
+                root_y: pointer.1,
+                // Producers fill these with garbage-in-practice; the
+                // fanout must not copy them.
+                event_x: pointer.0,
+                event_y: pointer.1,
+                ..key_event(true, 38)
+            }
+        }
+
+        fn deliver(state: &mut ServerState, pointer: (i16, i16)) {
+            let mut backend = crate::backend::recording::RecordingBackend::default();
+            let _ = key_event_fanout_to_state(state, &mut backend, press_at(pointer));
+        }
+
+        fn read_all(peer: &mut UnixStream) -> Vec<u8> {
+            read_all_available(peer)
+        }
+
+        /// (event, child, root_x, root_y, event_x, event_y) of the one core
+        /// KeyPress the peer received.
+        fn core_fields(peer: &mut UnixStream) -> (u32, u32, i16, i16, i16, i16) {
+            let b = read_all(peer);
+            assert_eq!(b.len(), 32, "exactly one core event: {b:?}");
+            assert_eq!(b[0], 2, "KeyPress");
+            let u32_at = |at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+            let i16_at = |at: usize| i16::from_le_bytes([b[at], b[at + 1]]);
+            (
+                u32_at(12),
+                u32_at(16),
+                i16_at(20),
+                i16_at(22),
+                i16_at(24),
+                i16_at(26),
+            )
+        }
+
+        /// Focus explicitly `XEV`, sprite in `INNER`: `XEV` is an ancestor of
+        /// the sprite, so the walk runs from `INNER` up to the focus.
+        /// event = (130 - 108, 100 - 73) = (22, 27), child = `INNER`.
+        #[test]
+        fn window_focus_propagates_from_sprite_in_child() {
+            let mut state = tree(IN_INNER);
+            let mut xev = install_kf(&mut state, 9, XEV, KEY_PRESS_MASK, 0);
+            state.core_focus.raw = XEV.0;
+            deliver(&mut state, IN_INNER);
+            assert_eq!(core_fields(&mut xev), (XEV.0, INNER.0, 130, 100, 22, 27));
+        }
+
+        /// Sprite outside the focus subtree: delivered to the focus itself,
+        /// `FixUpEventFromWindow(focus, None)`.
+        /// event = (450 - 108, 380 - 73) = (342, 307), child = None.
+        #[test]
+        fn sprite_outside_focus_reports_relative_to_focus_without_child() {
+            let mut state = tree(OUTSIDE);
+            let mut xev = install_kf(&mut state, 9, XEV, KEY_PRESS_MASK, 0);
+            state.core_focus.raw = XEV.0;
+            deliver(&mut state, OUTSIDE);
+            assert_eq!(core_fields(&mut xev), (XEV.0, 0, 450, 380, 342, 307));
+        }
+
+        /// Sprite window is the event window: child None, coordinates
+        /// relative to `INNER`'s inside origin: (130 - 122, 100 - 87) = (8, 13).
+        #[test]
+        fn sprite_window_itself_has_no_child() {
+            let mut state = tree(IN_INNER);
+            let mut inner = install_kf(&mut state, 9, INNER, KEY_PRESS_MASK, 0);
+            state.core_focus.raw = 1;
+            deliver(&mut state, IN_INNER);
+            assert_eq!(core_fields(&mut inner), (INNER.0, 0, 130, 100, 8, 13));
+        }
+
+        fn explicit_grab(
+            state: &mut ServerState,
+            owner: u32,
+            window: ResourceId,
+            owner_events: bool,
+        ) {
+            state.active_keyboard_grab = Some(ActiveKeyboardGrab {
+                owner: ClientId(owner),
+                grab_window: window,
+                source: ActiveKeyboardGrabSource::Explicit,
+                owner_events,
+                via_xi2: false,
+                xi2_mask: 0,
+            });
+        }
+
+        /// Grabbed delivery: `FixUpEventFromWindow(grab->window, None, TRUE)`
+        /// → child = `FindChildForEvent`: from `INNER` up, the window whose
+        /// parent is `FRAME` is `XEV`. event = (28, 48).
+        #[test]
+        fn grab_reports_relative_to_grab_window_with_found_child() {
+            let mut state = tree(IN_INNER);
+            let mut owner = install_kf(&mut state, 7, ROOT_WINDOW, 0, 0);
+            state.core_focus.raw = XEV.0;
+            explicit_grab(&mut state, 7, FRAME, false);
+            deliver(&mut state, IN_INNER);
+            assert_eq!(core_fields(&mut owner), (FRAME.0, XEV.0, 130, 100, 28, 48));
+        }
+
+        /// Grab on the root: event = root coordinates, child = `FRAME`.
+        #[test]
+        fn root_grab_child_is_top_level_on_sprite_path() {
+            let mut state = tree(IN_INNER);
+            let mut owner = install_kf(&mut state, 7, ROOT_WINDOW, 0, 0);
+            state.core_focus.raw = XEV.0;
+            explicit_grab(&mut state, 7, ROOT_WINDOW, false);
+            deliver(&mut state, IN_INNER);
+            assert_eq!(
+                core_fields(&mut owner),
+                (ROOT_WINDOW.0, FRAME.0, 130, 100, 130, 100)
+            );
+        }
+
+        /// Grab window not on the sprite path: `FindChildForEvent` walks to
+        /// the root without meeting it → child None.
+        /// event = (450 - 102, 380 - 52) = (348, 328).
+        #[test]
+        fn grab_window_off_sprite_path_has_no_child() {
+            let mut state = tree(OUTSIDE);
+            let mut owner = install_kf(&mut state, 7, ROOT_WINDOW, 0, 0);
+            state.core_focus.raw = XEV.0;
+            explicit_grab(&mut state, 7, FRAME, false);
+            deliver(&mut state, OUTSIDE);
+            assert_eq!(core_fields(&mut owner), (FRAME.0, 0, 450, 380, 348, 328));
+        }
+
+        /// owner_events grab whose owner selects on the focus: natural
+        /// delivery on `XEV` from the walk, child `INNER`, event (22, 27).
+        #[test]
+        fn owner_events_grab_natural_delivery_carries_walk_child() {
+            let mut state = tree(IN_INNER);
+            let mut owner = install_kf(&mut state, 7, XEV, KEY_PRESS_MASK, 0);
+            state.core_focus.raw = XEV.0;
+            explicit_grab(&mut state, 7, ROOT_WINDOW, true);
+            deliver(&mut state, IN_INNER);
+            assert_eq!(core_fields(&mut owner), (XEV.0, INNER.0, 130, 100, 22, 27));
+        }
+
+        /// XI2 `XI_KeyPress` on the focus `XEV`, sprite in `INNER`:
+        /// `FixUpXI2DeviceEventFromWindow` in FP16.16 — root (130, 100),
+        /// event (22, 27), child `INNER`.
+        #[test]
+        fn xi2_key_event_fields_are_window_relative() {
+            let mut state = tree(IN_INNER);
+            let mut xev = install_kf(&mut state, 9, XEV, KEY_PRESS_MASK, XI2_KEY_PRESS_BIT);
+            state.core_focus.raw = XEV.0;
+            deliver(&mut state, IN_INNER);
+            let b = read_all(&mut xev);
+            assert_eq!(b[0], 35, "GenericEvent (XI2 shadows core): {b:?}");
+            let u16_at = |at: usize| u16::from_le_bytes([b[at], b[at + 1]]);
+            let u32_at = |at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+            let i32_at = |at: usize| i32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+            assert_eq!(u16_at(8), XI2_KEYPRESS_EVTYPE);
+            assert_eq!(
+                (u32_at(20), u32_at(24), u32_at(28)),
+                (ROOT_WINDOW.0, XEV.0, INNER.0)
+            );
+            assert_eq!(
+                (i32_at(32), i32_at(36), i32_at(40), i32_at(44)),
+                (130 << 16, 100 << 16, 22 << 16, 27 << 16)
+            );
+        }
+
+        /// XI1 `DeviceKeyPress` from a physical keyboard slave, device focus
+        /// PointerRoot (the default), selected on `XEV`: the XI1 walk from
+        /// the sprite reaches `XEV`; `FixUpEventFromWindow` fills the same
+        /// fields as the core form — child `INNER`, event (22, 27).
+        #[test]
+        fn xi1_device_key_event_fields_are_window_relative() {
+            use crate::{core_loop::InputOrigin, xinput::InputSourceId};
+            let mut state = tree(IN_INNER);
+            let source = InputSourceId(0xA11);
+            let device =
+                state.xi_register_source(&super::key_source_routing::keyboard_info(source))[0];
+            let evcode = crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_KEY_PRESS_OFFSET;
+            let mut xev = install_kf(&mut state, 9, XEV, 0, 0);
+            state
+                .clients
+                .get_mut(&9)
+                .unwrap()
+                .xi1_window_event_classes
+                .insert(
+                    XEV,
+                    HashSet::from([(u32::from(device) << 8) | u32::from(evcode)]),
+                );
+            state.core_focus.raw = 1;
+            let mut backend = crate::backend::recording::RecordingBackend::default();
+            let event = HostKeyEvent {
+                origin: InputOrigin::Physical(source),
+                ..press_at(IN_INNER)
+            };
+            let _ = key_event_fanout_to_state(&mut state, &mut backend, event);
+            let b = read_all(&mut xev);
+            let ev = b
+                .chunks(32)
+                .find(|e| e[0] == evcode)
+                .unwrap_or_else(|| panic!("no DeviceKeyPress in {b:?}"));
+            let u32_at = |at: usize| u32::from_le_bytes(ev[at..at + 4].try_into().unwrap());
+            let i16_at = |at: usize| i16::from_le_bytes([ev[at], ev[at + 1]]);
+            assert_eq!(
+                (
+                    u32_at(12),
+                    u32_at(16),
+                    i16_at(20),
+                    i16_at(22),
+                    i16_at(24),
+                    i16_at(26)
+                ),
+                (XEV.0, INNER.0, 130, 100, 22, 27)
+            );
+            assert_eq!(ev[31], u8::try_from(device).unwrap());
         }
     }
 }
