@@ -36,7 +36,10 @@ use crate::kms::{
         gpu::GpuCore,
         scene::{CursorPlaneSink, FrameTargetError, OutputRoute, OutputSink},
     },
-    vk::device::{VkContext, VkContextOptions},
+    vk::{
+        copy_scratch::CopyScratch,
+        device::{VkContext, VkContextOptions},
+    },
 };
 
 #[test]
@@ -304,6 +307,48 @@ fn surface_on_screen_slot_holds_the_composed_pixels() {
     );
     let root = SurfacePlatform::read_on_screen_region(&mut f.b, window).expect("root read");
     assert_eq!(slot, root, "a root read equals the presented slot");
+}
+
+/// A 2x copy shows every slot pixel as 2x2 image pixels and clears what
+/// the scaled slot does not cover.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn surface_scaled_copy_doubles_every_slot_pixel() {
+    let Some(mut f) = surface_or_skip() else {
+        return;
+    };
+    let xid = create_window(&mut f.b);
+    f.frame(xid, 0x00FF_0000);
+    f.retire();
+    let slot = f.read_slot(rect(0, 0, 64, 48));
+    // 256x256, larger than the 128x96 the slot covers.
+    let scratch = CopyScratch::new(Arc::clone(f.output().vk())).expect("scratch image");
+    f.output()
+        .copy_on_screen_into(scratch.image(), scratch.extent(), 2)
+        .expect("scaled copy");
+    let (width, height) = (130, 98);
+    let scaled =
+        f.b.read_image_region(scratch.image(), rect(0, 0, width, height))
+            .expect("image read");
+    let px = |image: &[u8], stride: u32, x: u32, y: u32| {
+        let at = ((y * stride + x) * 4) as usize;
+        image[at..at + 4].to_vec()
+    };
+    assert_ne!(
+        px(&slot, 64, 0, 0),
+        px(&slot, 64, 5, 5),
+        "a window on the root"
+    );
+    for y in 0..height {
+        for x in 0..width {
+            let got = px(&scaled, width, x, y);
+            if x < 128 && y < 96 {
+                assert_eq!(got, px(&slot, 64, x / 2, y / 2), "({x}, {y})");
+            } else {
+                assert_eq!(got[..3], [0, 0, 0], "({x}, {y}) cleared");
+            }
+        }
+    }
 }
 
 #[test]
@@ -1382,12 +1427,27 @@ impl WindowFixture {
         }
     }
 
-    /// The shell reports the window at `size`; what the client heard.
+    /// The shell reports the window at `size`, scale 1, millimetres
+    /// unknown; what the client heard.
     fn host_resize(&mut self, size: (u16, u16), request: Option<u64>) -> Received {
+        self.host_event(size, 1, (0, 0), request)
+    }
+
+    /// The shell reports the window at `size`, `scale` and `mm`; what the
+    /// client heard.
+    fn host_event(
+        &mut self,
+        size: (u16, u16),
+        scale: u32,
+        mm: (u32, u32),
+        request: Option<u64>,
+    ) -> Received {
         self.f.received();
         self.link.post(ShellEvent::Resized {
             width: size.0,
             height: size.1,
+            scale,
+            mm,
             request,
         });
         self.f.b.on_platform_event(&mut self.f.state);
@@ -1635,6 +1695,67 @@ fn every_window_resize_event_rebuilds_the_swapchain() {
     );
 }
 
+/// A scale change alone keeps the X sizes and rebuilds the swapchain at
+/// the new scale (a headless surface takes the size the copy asks for).
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_scale_change_keeps_the_screen_and_scales_the_swapchain() {
+    let Some(mut w) = window_or_skip() else {
+        return;
+    };
+    w.frame();
+    let got = w.host_event((64, 48), 2, (0, 0), None);
+    assert!(got.events.is_empty(), "nothing changed for X");
+    w.frame();
+    let (slots, swapchain) = w.f.b.platform.outputs[0].extents();
+    assert_eq!((slots.width, slots.height), (64, 48));
+    let swapchain = swapchain.expect("a swapchain");
+    assert_eq!((swapchain.width, swapchain.height), (128, 96));
+    assert_eq!(w.f.sizes(), [(64, 48); 4]);
+
+    w.host_event((64, 48), 1, (0, 0), None);
+    w.frame();
+    let swapchain = w.f.b.platform.outputs[0].extents().1.expect("a swapchain");
+    assert_eq!((swapchain.width, swapchain.height), (64, 48));
+}
+
+/// The output reports the millimetres the shell measured; the screen keeps
+/// 96 DPI, as Xorg without a configured DisplaySize.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn the_window_output_reports_the_shells_millimetres() {
+    let Some(mut w) = window_or_skip() else {
+        return;
+    };
+    let output_mm = |w: &WindowFixture| {
+        let info = w.f.state.randr.output_info(1, 0).expect("WINDOW-0");
+        (info.width_mm, info.height_mm)
+    };
+    // 64x48 px at 96 DPI: (64*254 + 480) / 960 = 17, (48*254 + 480) / 960 = 13.
+    assert_eq!(output_mm(&w), (17, 13), "unknown: 96 DPI");
+
+    let got = w.host_event((64, 48), 1, (20, 15), None);
+    assert_eq!(output_mm(&w), (20, 15));
+    assert_eq!(
+        ScreenFixture::resize_events(&got.events).1,
+        [(64, 48)],
+        "ScreenChangeNotify, as Xorg's TellChanged"
+    );
+    let got = w.host_event((64, 48), 1, (20, 15), None);
+    assert!(got.events.is_empty(), "unchanged");
+
+    w.host_event((128, 96), 1, (40, 30), None);
+    assert_eq!(output_mm(&w), (40, 30));
+    assert_eq!(
+        (w.f.state.randr.width_mm, w.f.state.randr.height_mm),
+        (34, 25),
+        "the screen: (128*254 + 480) / 960, (96*254 + 480) / 960"
+    );
+
+    w.host_event((128, 96), 1, (0, 0), None);
+    assert_eq!(output_mm(&w), (34, 25), "unknown again: 96 DPI");
+}
+
 /// After `--fb 400x300` over the 64x48 output, a user resize to 400x300
 /// moves the output only: the screen already has the size (codex round 2).
 #[test]
@@ -1692,7 +1813,7 @@ fn a_clamped_window_request_moves_only_the_output() {
 
 #[test]
 fn window_modes_are_the_current_size_then_the_fixed_ones_that_fit() {
-    let (outputs, modes) = super::present::window_randr((1024, 768), (1440, 900), 60);
+    let (outputs, modes) = super::present::window_randr((1024, 768), (0, 0), (1440, 900), 60);
     let sizes: Vec<(u32, u16, u16)> = modes
         .iter()
         .map(|m| (m.mode_id, m.width, m.height))
@@ -1701,7 +1822,8 @@ fn window_modes_are_the_current_size_then_the_fixed_ones_that_fit() {
     let output = &outputs[0];
     assert_eq!((output.mode_id, output.num_preferred), (11, 1));
     assert_eq!(output.mode_ids, [11, 9, 10]);
-    let (outputs, modes) = super::present::window_randr((1000, 700), (8192, 8192), 60);
+    let (outputs, modes) = super::present::window_randr((1000, 700), (300, 210), (8192, 8192), 60);
     assert_eq!(outputs[0].mode_id, 3, "a size off the list");
+    assert_eq!((outputs[0].mm_width, outputs[0].mm_height), (300, 210));
     assert_eq!(modes.len(), 9);
 }

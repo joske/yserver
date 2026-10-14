@@ -27,8 +27,8 @@ use crate::{
     launch,
 };
 
-/// The screen size without `--geometry`.
-pub(crate) const DEFAULT_SIZE: (u16, u16) = (1600, 1000);
+/// The screen size without `--geometry`, in X pixels.
+pub(crate) const DEFAULT_SIZE: (u16, u16) = (1280, 800);
 
 /// A window shell's half of the server: its surface, the surface's frame
 /// clock (ticked by the shell), its link, its UI commands and the count of
@@ -41,6 +41,8 @@ pub(crate) struct WindowSpec {
     pub(crate) clients: Arc<AtomicUsize>,
     /// The largest window content the screen shows unclamped, in X pixels.
     pub(crate) max_output: Option<(u16, u16)>,
+    /// The window's physical size in millimetres; 0: unknown.
+    pub(crate) output_mm: (u32, u32),
 }
 
 /// Run the headless server, or refuse without `--headless`.
@@ -86,6 +88,7 @@ pub(crate) fn run_windowed(opts: launch::LaunchOptions, spec: WindowSpec) -> io:
         ui,
         clients,
         max_output,
+        output_mm,
     } = spec;
     let result = serve(
         &opts,
@@ -104,6 +107,7 @@ pub(crate) fn run_windowed(opts: launch::LaunchOptions, spec: WindowSpec) -> io:
             if let Some(max_output) = max_output {
                 backend.platform.set_max_output(max_output);
             }
+            backend.platform.output_mm = output_mm;
             Ok(backend)
         },
         Some(&link),

@@ -19,13 +19,16 @@ pub(crate) enum ShellEvent {
     Visible(bool),
     /// The window became key; `caps` is the window system's Caps Lock.
     LockState { caps: bool },
-    /// The window's content is now `width`x`height` X pixels: a user
-    /// resize (`request` none), or the completion of the core's
-    /// `ShellUi::set_content_size` with that token.
+    /// The window's content is now `width`x`height` X pixels, `scale`
+    /// backing pixels per X pixel, `mm` millimetres (0: unknown): a user
+    /// resize or scale change (`request` none), or the completion of the
+    /// core's `ShellUi::set_content_size` with that token.
     #[cfg_attr(all(kms, not(test)), allow(dead_code))] // Posted by a window shell.
     Resized {
         width: u16,
         height: u16,
+        scale: u32,
+        mm: (u32, u32),
         request: Option<u64>,
     },
 }

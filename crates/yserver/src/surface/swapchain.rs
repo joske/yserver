@@ -1,6 +1,8 @@
 //! One window-system surface: its Vulkan swapchain, the offscreen slots the
 //! scene composes into, and the copy of a composed slot into a swapchain
-//! image followed by `vkQueuePresentKHR`.
+//! image followed by `vkQueuePresentKHR`. The slots are X-sized; at a copy
+//! scale above 1 the copy is a nearest-filter blit to that many image
+//! pixels per slot pixel.
 //!
 //! The compose is submitted first; the copy is a second submit on the same
 //! queue, after a non-blocking acquire. A failed acquire (no image yet,
@@ -31,6 +33,8 @@ use crate::kms::{
 const SLOT_COUNT: usize = 2;
 /// Acquire semaphore + copy fence pairs in rotation.
 const SYNC_COUNT: usize = 3;
+/// The slots' format (`OffscreenTarget`).
+const SLOT_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
 
 /// Creates a window-system surface on a Vulkan instance.
 pub(crate) type SurfaceCreator =
@@ -124,6 +128,12 @@ pub(crate) struct SurfaceOutput {
     pending_sync: Option<usize>,
     needs_recreate: bool,
     hidden: bool,
+    /// Swapchain pixels per slot pixel per axis, as the shell asked.
+    copy_scale: u32,
+    /// The device blits slot → swapchain image; without it the copy stays
+    /// 1:1 whatever the scale.
+    blit: bool,
+    blit_warned: bool,
     clock: Arc<FrameClock>,
     #[cfg(test)]
     frames_presented: u64,
@@ -163,6 +173,9 @@ impl SurfaceOutput {
             pending_sync: None,
             needs_recreate: false,
             hidden: false,
+            copy_scale: 1,
+            blit: false,
+            blit_warned: false,
             clock,
             #[cfg(test)]
             frames_presented: 0,
@@ -343,7 +356,27 @@ impl SurfaceOutput {
         let image_extent = swapchain.extent;
         let handle = swapchain.handle;
         let cb = self.copy_command_buffers[bo_idx];
-        self.record_copy(cb, self.targets[bo_idx].image(), image, image_extent)?;
+        let region = copy_region(self.extent, image_extent, self.effective_scale());
+        let device = &self.vk.device;
+        // SAFETY: a command buffer of this device that no pending submit
+        // uses (its slot's previous copy fence signalled).
+        unsafe {
+            device.reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())?;
+            device.begin_command_buffer(
+                cb,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+            record_slot_copy(
+                device,
+                cb,
+                self.targets[bo_idx].image(),
+                image,
+                region,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+            );
+            device.end_command_buffer(cb)?;
+        }
 
         let device = &self.vk.device;
         unsafe { device.reset_fences(&[sync.copied]) }?;
@@ -394,117 +427,6 @@ impl SurfaceOutput {
         Ok(true)
     }
 
-    /// Record the slot → swapchain image copy and the hand-off to present.
-    fn record_copy(
-        &self,
-        cb: vk::CommandBuffer,
-        slot: vk::Image,
-        image: vk::Image,
-        image_extent: vk::Extent2D,
-    ) -> Result<(), vk::Result> {
-        let device = &self.vk.device;
-        let range = vk::ImageSubresourceRange::default()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .level_count(1)
-            .layer_count(1);
-        let copy_extent = vk::Extent3D {
-            width: self.extent.width.min(image_extent.width),
-            height: self.extent.height.min(image_extent.height),
-            depth: 1,
-        };
-        let partial =
-            copy_extent.width != image_extent.width || copy_extent.height != image_extent.height;
-        unsafe {
-            device.reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())?;
-            device.begin_command_buffer(
-                cb,
-                &vk::CommandBufferBeginInfo::default()
-                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-            )?;
-            // The compose left the slot GENERAL; the acquire wait covers the
-            // swapchain image's layout transition.
-            let before = [
-                vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-                    .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::COPY)
-                    .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
-                    .old_layout(vk::ImageLayout::GENERAL)
-                    .new_layout(vk::ImageLayout::GENERAL)
-                    .image(slot)
-                    .subresource_range(range),
-                vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-                    .src_access_mask(vk::AccessFlags2::empty())
-                    .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
-                    .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                    .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .image(image)
-                    .subresource_range(range),
-            ];
-            device.cmd_pipeline_barrier2(
-                cb,
-                &vk::DependencyInfo::default().image_memory_barriers(&before),
-            );
-            if partial {
-                // A swapchain larger than the screen shows black outside it.
-                device.cmd_clear_color_image(
-                    cb,
-                    image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &vk::ClearColorValue {
-                        float32: [0.0, 0.0, 0.0, 1.0],
-                    },
-                    &[range],
-                );
-                let cleared = [vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::CLEAR)
-                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::COPY)
-                    .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .image(image)
-                    .subresource_range(range)];
-                device.cmd_pipeline_barrier2(
-                    cb,
-                    &vk::DependencyInfo::default().image_memory_barriers(&cleared),
-                );
-            }
-            let layers = vk::ImageSubresourceLayers::default()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .layer_count(1);
-            let region = [vk::ImageCopy::default()
-                .src_subresource(layers)
-                .dst_subresource(layers)
-                .extent(copy_extent)];
-            device.cmd_copy_image(
-                cb,
-                slot,
-                vk::ImageLayout::GENERAL,
-                image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &region,
-            );
-            let to_present = [vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::COPY)
-                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::NONE)
-                .dst_access_mask(vk::AccessFlags2::empty())
-                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-                .image(image)
-                .subresource_range(range)];
-            device.cmd_pipeline_barrier2(
-                cb,
-                &vk::DependencyInfo::default().image_memory_barriers(&to_present),
-            );
-            device.end_command_buffer(cb)?;
-        }
-        Ok(())
-    }
-
     /// Slots of `extent` for [`Self::install_slots`]: the fallible half of
     /// an output resize. Dropping them frees them.
     ///
@@ -543,6 +465,21 @@ impl SurfaceOutput {
     /// next present. The slots keep their pixels (they are X-sized).
     pub(crate) fn note_out_of_date(&mut self) {
         self.needs_recreate = true;
+    }
+
+    /// Show each slot pixel as `scale`x`scale` swapchain pixels from the
+    /// next present on.
+    pub(crate) fn set_copy_scale(&mut self, scale: u32) {
+        let scale = scale.max(1);
+        if scale != self.copy_scale {
+            self.copy_scale = scale;
+            self.needs_recreate = true;
+        }
+    }
+
+    /// The copy scale the device can do.
+    fn effective_scale(&self) -> u32 {
+        if self.blit { self.copy_scale } else { 1 }
     }
 
     /// Whether the pending frame may retire: its copy finished, or it was
@@ -616,6 +553,39 @@ impl SurfaceOutput {
         (self.extent, self.swapchain.as_ref().map(|s| s.extent))
     }
 
+    #[cfg(test)]
+    pub(crate) fn vk(&self) -> &Arc<VkContext> {
+        &self.vk
+    }
+
+    /// Copy the on-screen slot into `image` (`image_extent`, left
+    /// `GENERAL`) as a present at `scale` would, and wait for it.
+    #[cfg(test)]
+    pub(crate) fn copy_on_screen_into(
+        &self,
+        image: vk::Image,
+        image_extent: vk::Extent2D,
+        scale: u32,
+    ) -> Result<(), vk::Result> {
+        let slot = self.on_screen_image().ok_or(vk::Result::ERROR_UNKNOWN)?;
+        let region = copy_region(self.extent, image_extent, scale);
+        crate::kms::vk::ops::run_one_shot_op(&self.vk, self.command_pool, |vk, cb| {
+            // SAFETY: a recording command buffer; both images are this
+            // device's and match `region`.
+            unsafe {
+                record_slot_copy(
+                    &vk.device,
+                    cb,
+                    slot,
+                    image,
+                    region,
+                    vk::ImageLayout::GENERAL,
+                );
+            }
+            Ok(())
+        })
+    }
+
     /// The current swapchain handle (null while there is none).
     #[cfg(test)]
     pub(crate) fn swapchain_handle(&self) -> vk::SwapchainKHR {
@@ -633,15 +603,31 @@ impl SurfaceOutput {
             self.surface_fns
                 .get_physical_device_surface_capabilities(pd, self.surface)
         }?;
+        let formats = unsafe {
+            self.surface_fns
+                .get_physical_device_surface_formats(pd, self.surface)
+        }?;
+        let format = pick_surface_format(&formats);
+        self.blit = format.is_some_and(|format| self.blits_to(format.format));
+        if self.copy_scale > 1 && !self.blit && !self.blit_warned {
+            self.blit_warned = true;
+            log::warn!(
+                "surface: no slot → swapchain blit on this device; scale {} shown 1:1",
+                self.copy_scale
+            );
+        }
+        let scale = self.effective_scale();
         let extent = if caps.current_extent.width == u32::MAX {
             vk::Extent2D {
                 width: self
                     .extent
                     .width
+                    .saturating_mul(scale)
                     .clamp(caps.min_image_extent.width, caps.max_image_extent.width),
                 height: self
                     .extent
                     .height
+                    .saturating_mul(scale)
                     .clamp(caps.min_image_extent.height, caps.max_image_extent.height),
             }
         } else {
@@ -662,11 +648,7 @@ impl SurfaceOutput {
             self.destroy_swapchain(old);
             return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
         }
-        let formats = unsafe {
-            self.surface_fns
-                .get_physical_device_surface_formats(pd, self.surface)
-        }?;
-        let Some(format) = pick_surface_format(&formats) else {
+        let Some(format) = format else {
             self.destroy_swapchain(old);
             return Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED);
         };
@@ -743,6 +725,21 @@ impl SurfaceOutput {
         Ok(())
     }
 
+    /// Whether a slot blits into an optimal-tiling `format` image.
+    fn blits_to(&self, format: vk::Format) -> bool {
+        let features = |format| {
+            // SAFETY: a physical device of this instance.
+            unsafe {
+                self.vk
+                    .instance
+                    .get_physical_device_format_properties(self.vk.physical_device, format)
+            }
+            .optimal_tiling_features
+        };
+        features(SLOT_FORMAT).contains(vk::FormatFeatureFlags::BLIT_SRC)
+            && features(format).contains(vk::FormatFeatureFlags::BLIT_DST)
+    }
+
     /// Destroy a swapchain whose presents and copies have completed.
     fn destroy_swapchain(&self, swapchain: Option<Swapchain>) {
         let Some(swapchain) = swapchain else {
@@ -754,6 +751,167 @@ impl SurfaceOutput {
             }
             self.swapchain_fns.destroy_swapchain(swapchain.handle, None);
         }
+    }
+}
+
+/// Where a slot lands in a swapchain image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct CopyRegion {
+    /// The slot's top-left part that is shown.
+    pub(super) src: vk::Extent2D,
+    /// The image's top-left part it covers, `src` times the scale.
+    pub(super) dst: vk::Extent2D,
+    pub(super) scale: u32,
+    /// The rest of the image is cleared.
+    pub(super) clear: bool,
+}
+
+/// A `slot`-sized slot in an `image`-sized image at `scale` image pixels
+/// per slot pixel: as much of the slot as fits whole.
+pub(super) fn copy_region(slot: vk::Extent2D, image: vk::Extent2D, scale: u32) -> CopyRegion {
+    let scale = scale.max(1);
+    let src = vk::Extent2D {
+        width: slot.width.min(image.width / scale),
+        height: slot.height.min(image.height / scale),
+    };
+    let dst = vk::Extent2D {
+        width: src.width * scale,
+        height: src.height * scale,
+    };
+    CopyRegion {
+        src,
+        dst,
+        scale,
+        clear: dst != image,
+    }
+}
+
+/// Record `region` of `slot` (`GENERAL`) into `image`, leaving `image` in
+/// `final_layout`; the acquire wait covers the image's previous use.
+///
+/// # Safety
+///
+/// `cb` is recording; both images belong to `device` and match `region`.
+pub(super) unsafe fn record_slot_copy(
+    device: &ash::Device,
+    cb: vk::CommandBuffer,
+    slot: vk::Image,
+    image: vk::Image,
+    region: CopyRegion,
+    final_layout: vk::ImageLayout,
+) {
+    let range = vk::ImageSubresourceRange::default()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .level_count(1)
+        .layer_count(1);
+    let transfer = vk::PipelineStageFlags2::ALL_TRANSFER;
+    let before = [
+        vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+            .dst_stage_mask(transfer)
+            .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
+            .old_layout(vk::ImageLayout::GENERAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .image(slot)
+            .subresource_range(range),
+        vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .src_access_mask(vk::AccessFlags2::empty())
+            .dst_stage_mask(transfer)
+            .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .image(image)
+            .subresource_range(range),
+    ];
+    let layers = vk::ImageSubresourceLayers::default()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .layer_count(1);
+    let corner = |extent: vk::Extent2D| vk::Offset3D {
+        x: i32::try_from(extent.width).unwrap_or(i32::MAX),
+        y: i32::try_from(extent.height).unwrap_or(i32::MAX),
+        z: 1,
+    };
+    // SAFETY: the caller's.
+    unsafe {
+        device.cmd_pipeline_barrier2(
+            cb,
+            &vk::DependencyInfo::default().image_memory_barriers(&before),
+        );
+        if region.clear {
+            // An image larger than the scaled slot shows black outside it.
+            device.cmd_clear_color_image(
+                cb,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &vk::ClearColorValue {
+                    float32: [0.0, 0.0, 0.0, 1.0],
+                },
+                &[range],
+            );
+            let cleared = [vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::CLEAR)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(transfer)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .image(image)
+                .subresource_range(range)];
+            device.cmd_pipeline_barrier2(
+                cb,
+                &vk::DependencyInfo::default().image_memory_barriers(&cleared),
+            );
+        }
+        if region.src.width == 0 || region.src.height == 0 {
+            // Nothing of the slot fits.
+        } else if region.scale == 1 {
+            let copy = [vk::ImageCopy::default()
+                .src_subresource(layers)
+                .dst_subresource(layers)
+                .extent(vk::Extent3D {
+                    width: region.src.width,
+                    height: region.src.height,
+                    depth: 1,
+                })];
+            device.cmd_copy_image(
+                cb,
+                slot,
+                vk::ImageLayout::GENERAL,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &copy,
+            );
+        } else {
+            let blit = [vk::ImageBlit::default()
+                .src_subresource(layers)
+                .src_offsets([vk::Offset3D::default(), corner(region.src)])
+                .dst_subresource(layers)
+                .dst_offsets([vk::Offset3D::default(), corner(region.dst)])];
+            device.cmd_blit_image(
+                cb,
+                slot,
+                vk::ImageLayout::GENERAL,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &blit,
+                vk::Filter::NEAREST,
+            );
+        }
+        let after = [vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(transfer)
+            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::NONE)
+            .dst_access_mask(vk::AccessFlags2::empty())
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(final_layout)
+            .image(image)
+            .subresource_range(range)];
+        device.cmd_pipeline_barrier2(
+            cb,
+            &vk::DependencyInfo::default().image_memory_barriers(&after),
+        );
     }
 }
 
@@ -794,7 +952,65 @@ impl Drop for SurfaceOutput {
 mod tests {
     use ash::vk;
 
-    use super::pick_surface_format;
+    use super::{CopyRegion, copy_region, pick_surface_format};
+
+    fn extent(width: u32, height: u32) -> vk::Extent2D {
+        vk::Extent2D { width, height }
+    }
+
+    #[test]
+    fn a_scaled_slot_covers_what_fits_whole_and_clears_the_rest() {
+        let slot = extent(64, 48);
+        let region = |image, scale| copy_region(slot, image, scale);
+        assert_eq!(
+            region(extent(128, 96), 2),
+            CopyRegion {
+                src: slot,
+                dst: extent(128, 96),
+                scale: 2,
+                clear: false
+            }
+        );
+        assert_eq!(
+            region(extent(130, 90), 2),
+            CopyRegion {
+                src: extent(64, 45),
+                dst: extent(128, 90),
+                scale: 2,
+                clear: true
+            },
+            "45 slot rows fit in 90; the 2 extra columns are cleared"
+        );
+        assert_eq!(
+            region(extent(64, 48), 1),
+            CopyRegion {
+                src: slot,
+                dst: slot,
+                scale: 1,
+                clear: false
+            }
+        );
+        assert_eq!(
+            region(extent(32, 100), 1),
+            CopyRegion {
+                src: extent(32, 48),
+                dst: extent(32, 48),
+                scale: 1,
+                clear: true
+            }
+        );
+        assert_eq!(
+            region(extent(1, 1), 2),
+            CopyRegion {
+                src: extent(0, 0),
+                dst: extent(0, 0),
+                scale: 2,
+                clear: true
+            },
+            "nothing fits"
+        );
+        assert_eq!(region(extent(64, 48), 0).scale, 1, "0 means 1");
+    }
 
     fn format(format: vk::Format, color_space: vk::ColorSpaceKHR) -> vk::SurfaceFormatKHR {
         vk::SurfaceFormatKHR {

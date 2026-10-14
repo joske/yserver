@@ -58,6 +58,8 @@ pub(crate) struct SurfacePlatform {
     /// The largest output the window system shows unclamped: the mode list
     /// offers only modes that fit.
     pub(crate) max_output: (u16, u16),
+    /// The window output's physical size in millimetres; 0: unknown.
+    pub(crate) output_mm: (u32, u32),
     /// The largest screen side the GPU takes (`RRGetScreenSizeRange`).
     max_screen: u16,
     pub(crate) outputs: Vec<SurfaceOutput>,
@@ -127,6 +129,7 @@ impl SurfacePlatform {
             fb_size,
             output_size: fb_size,
             max_output: (max_screen, max_screen),
+            output_mm: (0, 0),
             max_screen,
             outputs,
             cursor: HostCursor::default(),
@@ -668,19 +671,46 @@ impl XBackend<SurfacePlatform> {
                 ShellEvent::Resized {
                     width,
                     height,
+                    scale,
+                    mm,
                     request,
                 } => {
                     // The shell resized the drawable before posting: rebuild
                     // every swapchain even when the output keeps its size.
                     for output in &mut self.platform.outputs {
+                        output.set_copy_scale(scale);
                         output.note_out_of_date();
                     }
+                    self.platform.output_mm = mm;
                     self.window_resized(state, (width, height), request);
+                    self.publish_output_mm(state);
                     self.scene.invalidate_all_scanout_damage();
                     self.scene.wake_for_damage();
                 }
             }
         }
+    }
+
+    /// Tell clients the output's millimetres when a resize event changed
+    /// only those (a window moved to another display).
+    fn publish_output_mm(&mut self, state: &mut ServerState) {
+        let mm = self.platform.output_mm;
+        let Some(output) = state.randr.outputs.first() else {
+            return;
+        };
+        if (output.mm_width, output.mm_height) == mm {
+            return;
+        }
+        let now = state.timestamp_now();
+        self.surface_refresh_randr(state, now);
+        let changed: Vec<(u32, u32, u32)> = state
+            .randr
+            .outputs
+            .first()
+            .map(|o| (o.output_id, o.crtc_id, o.mode_id))
+            .into_iter()
+            .collect();
+        emit_randr_change_notifications(state, &changed);
     }
 
     /// Toggle the X Caps Lock through the input channel when it differs

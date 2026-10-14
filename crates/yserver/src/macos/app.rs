@@ -260,6 +260,7 @@ impl YserverAppDelegate {
             }),
             clients: Arc::clone(&ivars.clients),
             max_output: super::window::max_content_size(mtm),
+            output_mm: (0, 0),
         };
         let spawned = thread::Builder::new()
             .name("yserver-core".into())

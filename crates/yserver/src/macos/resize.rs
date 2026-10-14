@@ -46,6 +46,8 @@ impl Sizer {
         self.link.post(ShellEvent::Resized {
             width: size.0,
             height: size.1,
+            scale: 1,
+            mm: (0, 0),
             request,
         });
     }
@@ -160,7 +162,7 @@ pub(super) fn answer_request(window: &NSWindow) {
             return;
         };
         if token != 0 {
-            let size = sizer.coalescer.answered(size);
+            let size = sizer.coalescer.post_now(size);
             sizer.post(size, Some(token));
         }
     });

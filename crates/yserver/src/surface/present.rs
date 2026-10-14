@@ -66,7 +66,12 @@ impl XBackend<SurfacePlatform> {
             .map_or(super::clock::FALLBACK_REFRESH_HZ, |output| {
                 output.clock().refresh_hz()
             });
-        window_randr(self.platform.output_size, self.platform.max_output, refresh)
+        window_randr(
+            self.platform.output_size,
+            self.platform.output_mm,
+            self.platform.max_output,
+            refresh,
+        )
     }
 
     /// Rebuild `state.randr` from the window output, keeping the screen
@@ -111,11 +116,12 @@ impl XBackend<SurfacePlatform> {
 }
 
 /// RandR for the window: one output `WINDOW-0` on CRTC 2 at (0,0) showing
-/// `size`, which is its preferred mode, followed by the fixed modes that
-/// fit `max_output`.
+/// `size` over `mm` millimetres, which is its preferred mode, followed by
+/// the fixed modes that fit `max_output`.
 #[must_use]
 pub(crate) fn window_randr(
     size: (u16, u16),
+    mm: (u32, u32),
     max_output: (u16, u16),
     vrefresh: u32,
 ) -> (Vec<RandrOutput>, Vec<RandrMode>) {
@@ -156,9 +162,9 @@ pub(crate) fn window_randr(
         height: size.1,
         vrefresh,
         timing: None,
-        // No EDID: `RandrState::output_info` synthesises 96 DPI.
-        mm_width: 0,
-        mm_height: 0,
+        // 0: unknown; `RandrState::output_info` synthesises 96 DPI.
+        mm_width: mm.0,
+        mm_height: mm.1,
         mode_ids: modes.iter().map(|m| m.mode_id).collect(),
         num_preferred: 1,
         pending_transform: Default::default(),

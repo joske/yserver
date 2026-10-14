@@ -17,7 +17,7 @@ pub(crate) struct RawPointer {
     pub(crate) x_pt: f64,
     pub(crate) y_pt: f64,
     pub(crate) view_h_pt: f64,
-    /// Backing pixels per point.
+    /// X pixels per point.
     pub(crate) scale: f64,
     /// The event's motion delta in points, y down.
     pub(crate) dx_pt: f64,
@@ -158,6 +158,25 @@ mod tests {
             "outside clamps"
         );
         assert_eq!(x_position(&at(900.0, -40.0, 2.0), fb), (1599, 999));
+    }
+
+    #[test]
+    fn one_x_pixel_per_point_or_two_points_per_x_pixel() {
+        let fb = (1600, 1000);
+        // One X pixel per point (`--scale auto`).
+        assert_eq!(x_position(&at(10.75, 489.25, 1.0), fb), (10, 10), "floor");
+        assert_eq!(x_position(&at(1599.5, 0.0, 1.0), fb), (1599, 500));
+        assert_eq!(x_position(&at(1700.0, -600.0, 1.0), fb), (1599, 999));
+        // Two points per X pixel (`--scale 2` on a 1x screen).
+        assert_eq!(x_position(&at(10.0, 490.0, 0.5), fb), (5, 5));
+        assert_eq!(x_position(&at(11.0, 489.0, 0.5), fb), (5, 5), "floor");
+        assert_eq!(x_position(&at(0.0, 500.0, 0.5), fb), (0, 0), "top-left");
+        assert_eq!(x_position(&at(499.0, 0.0, 0.5), fb), (249, 250));
+        assert_eq!(
+            x_position(&at(-30.0, 600.0, 0.5), fb),
+            (0, 0),
+            "outside clamps"
+        );
     }
 
     #[test]
