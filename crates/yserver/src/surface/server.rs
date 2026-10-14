@@ -117,7 +117,7 @@ pub(crate) fn run_windowed(opts: launch::LaunchOptions, spec: WindowSpec) -> io:
         },
         Some(&link),
         Some(pasteboard),
-        |display| ui.set_title(&format!("yserver :{display}")),
+        |display| ui.set_title(&format!("yserver DISPLAY=:{display}")),
     );
     link.disconnect();
     if let Err(e) = &result {
@@ -176,6 +176,11 @@ fn serve(
         launch::Resolution::AutoPick => {
             let (display, listener, socket_path) = launch::autopick(&socket_dir)?;
             (display, listener, None, socket_path)
+        }
+        launch::Resolution::FirstFree { first } => {
+            let (display, guard, listener, socket_path) =
+                launch::autopick_locked(&PathBuf::from("/tmp"), &socket_dir, first)?;
+            (display, listener, Some(guard), socket_path)
         }
     };
     log::info!("yserver: listening on unix socket DISPLAY=:{display}");

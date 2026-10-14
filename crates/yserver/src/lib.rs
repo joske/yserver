@@ -780,6 +780,11 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
             let (display, listener, socket_path) = launch::autopick(&socket_dir)?;
             (display, listener, None, socket_path)
         }
+        launch::Resolution::FirstFree { first } => {
+            let (display, guard, listener, socket_path) =
+                launch::autopick_locked(&lock_dir, &socket_dir, first)?;
+            (display, listener, Some(guard), socket_path)
+        }
     };
     log::info!("yserver: listening on unix socket DISPLAY=:{display}");
     let listeners = bind_client_listeners(listener, display, &opts, &auth)?;

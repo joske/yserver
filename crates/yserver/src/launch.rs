@@ -23,6 +23,10 @@ use yserver_core::core_loop::ResetPolicy;
 /// convention).
 pub const DEFAULT_DISPLAY: u16 = 7;
 
+/// First display tried by [`LaunchOptions::pick_free_display`]: `:0` is left
+/// to XQuartz, whose launchd agent may own it.
+pub const FIRST_FREE_DISPLAY: u16 = 1;
+
 const TCP_PORT_BASE: u16 = 6_000;
 
 /// Default UDP port to the XDMCP manager (`XDM_UDP_PORT`,
@@ -130,6 +134,10 @@ pub struct LaunchOptions {
     pub geometry: Option<(u16, u16)>,
     /// `--scale auto|1|2`: backing pixels per X pixel in a window.
     pub scale: ScaleOption,
+    /// Not from argv: set for a launch that cannot be given a display (the
+    /// macOS app bundle). Without `:N` and `-displayfd`, the lowest free
+    /// display from [`FIRST_FREE_DISPLAY`] is locked and used.
+    pub pick_free_display: bool,
 }
 
 /// How many backing pixels of a window one X pixel covers per axis.
@@ -378,6 +386,9 @@ pub enum Resolution {
     Explicit { display: u16, lock: bool },
     /// Scan for the lowest free display (gdm-style `-displayfd`); no lock.
     AutoPick,
+    /// The lowest display from `first` whose lock and socket are free;
+    /// locked (see [`autopick_locked`]).
+    FirstFree { first: u16 },
 }
 
 /// The display-resolution table from the spec. Lock iff `-displayfd` is
@@ -394,6 +405,9 @@ pub fn resolve(opts: &LaunchOptions) -> Resolution {
             lock: false,
         },
         (None, Some(_)) => Resolution::AutoPick,
+        (None, None) if opts.pick_free_display => Resolution::FirstFree {
+            first: FIRST_FREE_DISPLAY,
+        },
         (None, None) => Resolution::Explicit {
             display: DEFAULT_DISPLAY,
             lock: true,
@@ -724,6 +738,33 @@ pub fn autopick(socket_dir: &Path) -> io::Result<(u16, UnixListener, PathBuf)> {
     Err(io::Error::new(
         ErrorKind::AddrInUse,
         "no free X display in 0..256",
+    ))
+}
+
+/// Lock and bind the lowest display in `first..256` whose lock is not held
+/// by a live server and whose socket is not live, skipping any display
+/// lost to a concurrent starter.
+pub fn autopick_locked(
+    lock_dir: &Path,
+    socket_dir: &Path,
+    first: u16,
+) -> io::Result<(u16, LockGuard, UnixListener, PathBuf)> {
+    for n in first..256 {
+        let guard = match acquire_lock(lock_dir, n) {
+            Ok(guard) => guard,
+            Err(e) if e.kind() == ErrorKind::AddrInUse => continue,
+            Err(e) => return Err(e),
+        };
+        match bind_explicit(socket_dir, n) {
+            Ok((listener, path)) => return Ok((n, guard, listener, path)),
+            // Dropping the guard releases the lock before the next display.
+            Err(e) if e.kind() == ErrorKind::AddrInUse => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        ErrorKind::AddrInUse,
+        format!("no free X display in {first}..256"),
     ))
 }
 
@@ -1298,6 +1339,52 @@ mod tests {
                 lock: true
             }
         );
+        let pick = |d: Option<u16>, fd: Option<RawFd>| LaunchOptions {
+            pick_free_display: true,
+            ..mk(d, fd)
+        };
+        assert_eq!(
+            resolve(&pick(None, None)),
+            Resolution::FirstFree {
+                first: FIRST_FREE_DISPLAY
+            }
+        );
+        assert_eq!(
+            resolve(&pick(Some(3), None)),
+            Resolution::Explicit {
+                display: 3,
+                lock: true
+            }
+        );
+        assert_eq!(resolve(&pick(None, Some(9))), Resolution::AutoPick);
+    }
+
+    #[test]
+    fn autopick_locked_takes_first_free_and_locks_it() {
+        let dir = unique_tmp_dir("autopick-locked");
+        let (n, guard, listener, path) = autopick_locked(&dir, &dir, 1).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(path, dir.join("X1"));
+        assert!(lock_path(&dir, 1).exists());
+        assert!(!dir.join("X0").exists());
+        drop(listener);
+        drop(guard);
+        assert!(!lock_path(&dir, 1).exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn autopick_locked_skips_held_lock_and_live_socket() {
+        let dir = unique_tmp_dir("autopick-locked-busy");
+        // :1 locked by a live server (us), :2 served by a lock-less server.
+        let held = acquire_lock(&dir, 1).unwrap();
+        let live = TestListener::bind(dir.join("X2")).unwrap();
+        let (n, guard, listener, _path) = autopick_locked(&dir, &dir, 1).unwrap();
+        assert_eq!(n, 3);
+        // The lock taken for :2 was released when its socket was live.
+        assert!(!lock_path(&dir, 2).exists());
+        drop((listener, guard, live, held));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
