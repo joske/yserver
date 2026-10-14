@@ -33,6 +33,18 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-10-14 macOS M2: input and cursor (branch `feat/macos-m0`, plan `plans/2026-10-14-macos-m2-input.md`):**
+  keyboard, mouse, scroll and the X cursor in the rooted window. A local key monitor sends every key to X (Cmd =
+  Super_L/R on Mod4, Option = Alt on Mod1, Cmd-Q = Super+Q; quit is the close button, the menu's Quit without a
+  shortcut, or SIGTERM). The OS-neutral translator (`src/surface/input/`: kVK→evdev table, sided modifiers from
+  device bits, Caps Lock toggles, dropped autorepeat, releases on focus loss, pointer/scroll front-end over the
+  shared `src/scroll_v120.rs`) feeds `Message::HostInput` from two XI slaves ("macOS keyboard"/"macOS pointer", no
+  Device Node). Key repeat is the core's (XKB controls); Num Lock starts locked; Caps Lock is re-synced when the
+  window becomes key. The cursor is an `NSCursor`: the surface platform is the scene's cursor plane and hands the
+  shown image to the shell; XWarpPointer warps the host pointer (`Platform::host_pointer_warped`). Linux tests the
+  translator (unit) and the backend side (lavapipe); `src/macos/` is compiled on macOS only. Unverified constants
+  (some kVK, the NX device masks) are listed in the plan's implementation notes.
+
 - **2026-10-14 macOS M1: rooted window (branch `feat/macos-m0`, plan
   `plans/2026-10-14-macos-m0-m1.md`):** the default macOS invocation opens one AppKit window
   (`--geometry WxH` X pixels, CAMetalLayer) and runs the core loop on a worker thread; `--headless` stays a test

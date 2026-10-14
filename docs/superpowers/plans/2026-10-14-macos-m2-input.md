@@ -417,3 +417,10 @@ feature stubbed out before it counts.
 - **Emulated non-KMS build (as M0.6):** clippy `--all-targets -D warnings` (default and `xdmcp`) clean and
   `cargo test -p yserver --all-targets` green (222 passed); it caught `ScrollV120::is_empty` being test-only dead
   code without KMS (fixed by a reset test).
+- **M2.5 numbers (silence, lavapipe, `cargo test --workspace --all-targets --features xdmcp --no-fail-fast --
+  --ignored`):** base `1862b339` 343 passed / 1 failed, branch 354 passed / 1 failed (+11: five input, six cursor
+  tests). The failure is the same on both: `render_picture::pixmap_pool_eviction_and_idle_trim_free_the_memory`
+  ("the most recent return survives eviction", `render_picture.rs:972`), unrelated to M2.
+- **M2.5 open for eiger:** compile `src/macos/` (`cargo clippy --workspace --all-targets -- -D warnings`), the [A]
+  checks of M2.3 with `RUST_LOG=yserver::macos=debug`, the unverified kVK/NX constants, the ISO swap direction, the
+  scroll sign and the 15-points-per-click trackpad factor, then the acceptance list above.
