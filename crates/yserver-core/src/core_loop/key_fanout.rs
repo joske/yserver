@@ -1408,11 +1408,17 @@ fn deliver_xi1_focused_key(state: &mut ServerState, event: &HostKeyEvent) -> Vec
 /// window P is the focus or a descendant of it, the event window is
 /// the first window from P upward (bounded at the focus, inclusive)
 /// where any client selected the event; otherwise the focus itself.
+/// Under PointerRoot the walk is bounded at the root, not at P.
 fn focused_walk_target(state: &ServerState, focus: ResourceId, event: &HostKeyEvent) -> ResourceId {
     let mask_bit = if event.pressed {
         KEY_PRESS_MASK
     } else {
         KEY_RELEASE_MASK
+    };
+    let focus = if state.core_focus.raw == 1 {
+        ROOT_WINDOW
+    } else {
+        focus
     };
     let p = deepest_window_at_pointer(state);
     let mut chain = vec![p];
@@ -1476,11 +1482,20 @@ fn key_grabbed_natural_target(
         cur = w.parent;
     }
     let start = if chain.contains(&focus) { p } else { focus };
+    // DeliverDeviceEvents stops at the focus; PointerRoot walks to the root.
+    let stop = if state.core_focus.raw == 1 {
+        ROOT_WINDOW
+    } else {
+        focus
+    };
     let mut cur = start;
     for _ in 0..256 {
         let subs = crate::core_loop::fanout::subscribers_by_id(state, cur, mask_bit);
         if !subs.is_empty() {
             return subs.contains(&owner).then_some(cur);
+        }
+        if cur == stop {
+            return None;
         }
         let w = state.resources.window(cur)?;
         if w.parent == cur {
@@ -3117,6 +3132,19 @@ mod tests {
             )
         }
 
+        /// Focus PointerRoot, sprite in the non-selecting `INNER`: the walk
+        /// propagates to `XEV` (`DeliverDeviceEvents` with no stopAt), and
+        /// the child is the previous window on the path.
+        /// event = (130 - 108, 100 - 73) = (22, 27), child = `INNER`.
+        #[test]
+        fn pointer_root_focus_propagates_to_selecting_ancestor() {
+            let mut state = tree(IN_INNER);
+            let mut xev = install_kf(&mut state, 9, XEV, KEY_PRESS_MASK, 0);
+            state.core_focus.raw = 1;
+            deliver(&mut state, IN_INNER);
+            assert_eq!(core_fields(&mut xev), (XEV.0, INNER.0, 130, 100, 22, 27));
+        }
+
         /// Focus explicitly `XEV`, sprite in `INNER`: `XEV` is an ancestor of
         /// the sprite, so the walk runs from `INNER` up to the focus.
         /// event = (130 - 108, 100 - 73) = (22, 27), child = `INNER`.
@@ -3127,6 +3155,17 @@ mod tests {
             state.core_focus.raw = XEV.0;
             deliver(&mut state, IN_INNER);
             assert_eq!(core_fields(&mut xev), (XEV.0, INNER.0, 130, 100, 22, 27));
+        }
+
+        /// The walk under PointerRoot reaches two levels up: only `FRAME`
+        /// selects. event = (130 - 102, 100 - 52) = (28, 48), child = `XEV`.
+        #[test]
+        fn pointer_root_focus_propagates_two_levels() {
+            let mut state = tree(IN_INNER);
+            let mut frame = install_kf(&mut state, 9, FRAME, KEY_PRESS_MASK, 0);
+            state.core_focus.raw = 1;
+            deliver(&mut state, IN_INNER);
+            assert_eq!(core_fields(&mut frame), (FRAME.0, XEV.0, 130, 100, 28, 48));
         }
 
         /// Sprite outside the focus subtree: delivered to the focus itself,
@@ -3206,6 +3245,24 @@ mod tests {
             explicit_grab(&mut state, 7, FRAME, false);
             deliver(&mut state, OUTSIDE);
             assert_eq!(core_fields(&mut owner), (FRAME.0, 0, 450, 380, 348, 328));
+        }
+
+        /// owner_events grab: `DeliverGrabbedEvent` runs
+        /// `DeliverDeviceEvents(sprite, stopAt = focus)`. Nobody selects on
+        /// `INNER` or the focus `XEV`, so the walk stops at `XEV` without
+        /// reaching the owner's selection on `FRAME`, and the event goes to
+        /// the grab window (root): event = (130, 100), child = `FRAME`.
+        #[test]
+        fn owner_events_grab_walk_stops_at_focus() {
+            let mut state = tree(IN_INNER);
+            let mut owner = install_kf(&mut state, 7, FRAME, KEY_PRESS_MASK, 0);
+            state.core_focus.raw = XEV.0;
+            explicit_grab(&mut state, 7, ROOT_WINDOW, true);
+            deliver(&mut state, IN_INNER);
+            assert_eq!(
+                core_fields(&mut owner),
+                (ROOT_WINDOW.0, FRAME.0, 130, 100, 130, 100)
+            );
         }
 
         /// owner_events grab whose owner selects on the focus: natural
