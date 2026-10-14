@@ -135,7 +135,21 @@ impl Server {
 
     /// [`Self::establish`], also returning the client's resource-id base.
     fn establish_with_base(&self) -> (UnixStream, u32) {
-        let mut peer = self.connect();
+        Self::finish_setup(self.connect())
+    }
+
+    /// Connect the server's own client over a socketpair, established.
+    fn establish_internal(&self) -> UnixStream {
+        let (core_side, peer) = UnixStream::pair().expect("socketpair");
+        peer.set_read_timeout(Some(TIMEOUT)).expect("read timeout");
+        self.sender
+            .send(Message::InternalClient(core_side))
+            .expect("send the internal connection");
+        Self::finish_setup(peer).0
+    }
+
+    /// Setup without authorization, then a round-trip.
+    fn finish_setup(mut peer: UnixStream) -> (UnixStream, u32) {
         peer.write_all(&[b'l', 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0])
             .expect("setup request");
         let mut header = [0_u8; 8];
@@ -389,6 +403,59 @@ fn a_reset_with_clients_connected_reports_none() {
     server.shutdown().expect("clean shutdown");
 }
 
+#[test]
+fn the_internal_client_is_not_counted_and_needs_no_authorization() {
+    let cookie = [0x5B_u8; 16];
+    let auth_path = write_xauth(&cookie);
+    let server = Server::start(
+        ResetPolicy::NoReset,
+        AuthState::new(Some(auth_path.clone())),
+    );
+    let internal = server.establish_internal();
+    assert_eq!(
+        server.client_count(),
+        0,
+        "the internal client is not counted"
+    );
+    let mut external = server.connect();
+    write_setup_with_cookie(&mut external, &cookie);
+    let mut header = [0_u8; 8];
+    external
+        .read_exact(&mut header)
+        .expect("setup reply header");
+    assert_eq!(header[0], 1);
+    let len = usize::from(u16::from_le_bytes([header[6], header[7]])) * 4;
+    external
+        .read_exact(&mut vec![0; len])
+        .expect("setup reply body");
+    round_trip(&mut external);
+    assert_eq!(server.client_count(), 1);
+    drop(external);
+    wait_until("the count to drop to 0", || server.client_count() == 0);
+    drop(internal);
+    server.shutdown().expect("clean shutdown");
+    let _ = std::fs::remove_file(&auth_path);
+}
+
+#[test]
+fn the_internal_client_neither_arms_nor_inhibits_the_last_client_reset() {
+    let server = Server::with_policy(ResetPolicy::Reset);
+    let internal = server.establish_internal();
+    std::thread::sleep(QUIET);
+    let peer = server.establish();
+    drop(peer);
+    wait_until("the last counted client's departure to reset", || {
+        server.generation() == generation_after(1)
+    });
+    drop(internal);
+    // The reset closed it; a fresh internal client alone arms nothing.
+    let internal = server.establish_internal();
+    drop(internal);
+    std::thread::sleep(QUIET);
+    assert_eq!(server.generation(), generation_after(1));
+    server.shutdown().expect("clean shutdown");
+}
+
 // -- the arming cases a happy-path suite misses --------------------
 
 #[test]
@@ -577,6 +644,7 @@ fn an_old_setup_completion_cannot_create_a_client_in_the_new_generation() {
             byte_order: ClientByteOrder::LittleEndian,
             is_local: true,
             fd_passing: true,
+            internal: false,
             setup_reply: Vec::new(),
         })
         .expect("send the stale completion");
@@ -734,7 +802,12 @@ fn write_xauth(cookie: &[u8]) -> PathBuf {
         );
         bytes.extend_from_slice(field);
     }
-    let path = std::env::temp_dir().join(format!("yserver-reset-auth-{}", std::process::id()));
+    // Per cookie: tests with different cookies run in parallel.
+    let path = std::env::temp_dir().join(format!(
+        "yserver-reset-auth-{}-{:02x}",
+        std::process::id(),
+        cookie[0]
+    ));
     std::fs::write(&path, bytes).expect("write xauthority");
     path
 }

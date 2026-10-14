@@ -134,6 +134,7 @@ fn install_client_with_transport(
             reader_control: None,
             is_local: true,
             fd_passing: true,
+            internal: false,
         },
     );
 }

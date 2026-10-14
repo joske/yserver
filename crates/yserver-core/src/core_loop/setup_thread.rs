@@ -66,6 +66,7 @@ pub fn make_registry() -> SetupRegistry {
 /// it happens to wake.
 ///
 /// [`CoreSender::bind`]: crate::core_loop::sender::CoreSender::bind
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     id: ClientId,
     stream: impl Into<Transport>,
@@ -74,6 +75,7 @@ pub fn spawn(
     auth: Arc<AuthState>,
     is_local: bool,
     fd_passing: bool,
+    internal: bool,
 ) -> io::Result<()> {
     let stream = stream.into();
     // BSD `accept` (macOS has no `accept4`) inherits the listener's O_NONBLOCK;
@@ -93,7 +95,8 @@ pub fn spawn(
                 id,
                 registry: registry_for_thread,
             };
-            if let Err(e) = run_setup(id, stream, &sender, &auth, is_local, fd_passing) {
+            if let Err(e) = run_setup(id, stream, &sender, &auth, (is_local, fd_passing, internal))
+            {
                 // ConnectionAborted/UnexpectedEof on shutdown is
                 // expected; anything else is worth a warn.
                 if !matches!(
@@ -143,8 +146,7 @@ fn run_setup(
     mut stream: Transport,
     sender: &BoundSender,
     auth: &AuthState,
-    is_local: bool,
-    fd_passing: bool,
+    (is_local, fd_passing, internal): (bool, bool, bool),
 ) -> io::Result<()> {
     stream.set_read_timeout(Some(SETUP_TIMEOUT))?;
     stream.set_write_timeout(Some(SETUP_TIMEOUT))?;
@@ -168,13 +170,17 @@ fn run_setup(
     // session credential is bound to the generation its `Accept` belonged to,
     // so a connection accepted in a destroyed session fails the comparison
     // even if it reaches this line long after the reset, and even though the
-    // new session has by then installed a credential of its own.
-    if let AuthVerdict::Reject(reason) = auth.check(
-        auth_transport,
-        sender.generation(),
-        &setup.auth_protocol_name,
-        &setup.auth_protocol_data,
-    ) {
+    // new session has by then installed a credential of its own. The
+    // server's own client is not authorized: it never came through a
+    // listener.
+    if !internal
+        && let AuthVerdict::Reject(reason) = auth.check(
+            auth_transport,
+            sender.generation(),
+            &setup.auth_protocol_name,
+            &setup.auth_protocol_data,
+        )
+    {
         warn!(
             "client {} auth rejected ({reason:?}); presented proto {:?}",
             id.0,
@@ -276,6 +282,7 @@ fn run_setup(
         byte_order: setup.byte_order,
         is_local,
         fd_passing,
+        internal,
         setup_reply,
     })?;
     Ok(())
@@ -307,6 +314,7 @@ mod tests {
             AuthState::new(None),
             true,
             true,
+            false,
         )
         .unwrap();
         std::thread::sleep(Duration::from_millis(100));
@@ -343,6 +351,7 @@ mod tests {
             sender.bind(),
             registry.clone(),
             AuthState::new(None),
+            false,
             false,
             false,
         )
@@ -420,6 +429,7 @@ mod tests {
             AuthState::new(None),
             true,
             true,
+            false,
         )
         .unwrap();
 
@@ -508,6 +518,7 @@ mod tests {
             AuthState::new(None),
             true,
             true,
+            false,
         )
         .unwrap();
         write_big_endian_setup(&mut client_side).unwrap();
@@ -574,6 +585,7 @@ mod tests {
             AuthState::new(None),
             true,
             true,
+            false,
         )
         .unwrap();
 
@@ -611,6 +623,7 @@ mod tests {
             AuthState::new(None),
             true,
             true,
+            false,
         )
         .unwrap();
         write_setup_request(&mut client_side).unwrap();
@@ -730,6 +743,7 @@ mod tests {
             AuthState::new(Some(path.clone())),
             true,
             true,
+            false,
         )
         .unwrap();
 
@@ -758,6 +772,7 @@ mod tests {
             AuthState::new(Some(path.clone())),
             true,
             true,
+            false,
         )
         .unwrap();
 

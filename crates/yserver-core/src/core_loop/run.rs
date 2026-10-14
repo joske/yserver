@@ -991,8 +991,8 @@ pub(super) fn disconnect_with_pending_cleanup(
     }
     pending.unblock_xi_config(client);
     crate::core_loop::process_disconnect::process_disconnect(state, backend, client);
-    reset_trigger.note_client_departed(state.clients.len());
-    backend.note_client_count(state.clients.len());
+    reset_trigger.note_client_departed(state.counted_clients());
+    backend.note_client_count(state.counted_clients());
 }
 
 /// Disconnect every client a write failed on (`client_io` flags it; the
@@ -1734,8 +1734,8 @@ fn process_one_request(
     // in the handler guarantees that, and an unreported departure is a
     // trigger that silently never fires again.
     if state.clients.len() < clients_before {
-        reset_trigger.note_client_departed(state.clients.len());
-        backend.note_client_count(state.clients.len());
+        reset_trigger.note_client_departed(state.counted_clients());
+        backend.note_client_count(state.counted_clients());
     }
     if let Some(start) = req_start {
         telemetry.record_request(
@@ -2447,6 +2447,24 @@ fn run_core_with_inventory(
                                 telemetry.record_deferred_push(req.id);
                                 deferred_requests.push_back(req);
                             }
+                            Message::InternalClient(stream) => {
+                                let id = client_id_allocator.allocate();
+                                if let Err(err) = setup_thread::spawn(
+                                    id,
+                                    stream,
+                                    sender.bind(),
+                                    setup_registry.clone(),
+                                    auth.clone(),
+                                    true,
+                                    true,
+                                    true,
+                                ) {
+                                    error!(
+                                        "setup thread spawn failed for internal client {}: {err}",
+                                        id.0
+                                    );
+                                }
+                            }
                             Message::SetupAllocate { id, response_tx } => {
                                 handle_setup_allocate(state, id, response_tx);
                             }
@@ -2459,6 +2477,7 @@ fn run_core_with_inventory(
                                 byte_order,
                                 is_local,
                                 fd_passing,
+                                internal,
                                 setup_reply,
                             } => {
                                 if let Err(err) = handle_client_setup_complete(
@@ -2472,8 +2491,7 @@ fn run_core_with_inventory(
                                     resource_id_base,
                                     resource_id_mask,
                                     byte_order,
-                                    is_local,
-                                    fd_passing,
+                                    (is_local, fd_passing, internal),
                                     &setup_reply,
                                 ) {
                                     error!("ClientSetupComplete for client {} failed: {err}", id.0);
@@ -2485,6 +2503,9 @@ fn run_core_with_inventory(
                                         &mut reset_trigger,
                                         id,
                                     );
+                                } else if internal {
+                                    // The server's own client: no XDMCP
+                                    // session, and it arms no reset.
                                 } else if let Some(service) = xdmcp.as_mut() {
                                     // `XdmcpOpenDisplay` (`xdmcp.c:632`),
                                     // called from `ClientAuthorized`
@@ -2525,7 +2546,7 @@ fn run_core_with_inventory(
                                 } else {
                                     reset_trigger.note_client_established();
                                 }
-                                backend.note_client_count(state.clients.len());
+                                backend.note_client_count(state.counted_clients());
                             }
                             Message::ClientDisconnected { id, reason: _ } => {
                                 disconnect_with_pending_cleanup(
@@ -4541,8 +4562,7 @@ fn handle_client_setup_complete(
     resource_id_base: u32,
     resource_id_mask: u32,
     byte_order: yserver_protocol::x11::ClientByteOrder,
-    is_local: bool,
-    fd_passing: bool,
+    (is_local, fd_passing, internal): (bool, bool, bool),
     setup_reply: &[u8],
 ) -> io::Result<()> {
     use std::sync::{Arc, Mutex, atomic::AtomicU16};
@@ -4573,6 +4593,7 @@ fn handle_client_setup_complete(
             reader_control: Some(reader_control_tx),
             is_local,
             fd_passing,
+            internal,
         },
     );
     setup_registry
@@ -4812,6 +4833,7 @@ fn accept_pending(
                     auth.clone(),
                     is_local,
                     fd_passing,
+                    false,
                 ) {
                     error!("setup thread spawn failed for client {}: {err}", id.0);
                 }

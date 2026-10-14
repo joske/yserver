@@ -2653,6 +2653,7 @@ fn lightweight_active_disconnect_retains_crtc_then_heavy_detach_publishes_off() 
             reader_control: None,
             is_local: true,
             fd_passing: true,
+            internal: false,
         },
     );
     state.randr_select_masks.insert(

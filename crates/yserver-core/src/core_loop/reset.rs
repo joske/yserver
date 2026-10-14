@@ -225,7 +225,7 @@ pub fn force_destroy_all_clients(state: &mut ServerState, backend: &mut dyn Back
         state.close_down_modes.remove(&id);
         process_disconnect_reporting(state, backend, ClientId(id), Some(&mut frees));
     }
-    backend.note_client_count(state.clients.len());
+    backend.note_client_count(state.counted_clients());
 
     // Zombies parked by *earlier* disconnects in this session. They have no
     // `state.clients` entry, so the loop above never reaches them; their
@@ -542,6 +542,7 @@ mod tests {
                 reader_control: None,
                 is_local: true,
                 fd_passing: true,
+                internal: false,
             },
         );
     }

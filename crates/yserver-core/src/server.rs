@@ -2332,6 +2332,13 @@ impl ServerState {
         }
     }
 
+    /// The connected clients that count as users of the server: all but
+    /// the internal ones.
+    #[must_use]
+    pub fn counted_clients(&self) -> usize {
+        self.clients.values().filter(|c| !c.internal).count()
+    }
+
     #[must_use]
     pub fn timestamp_now(&self) -> u32 {
         // X11 timestamps are 32-bit milliseconds; truncation is intentional.
@@ -2988,6 +2995,9 @@ pub struct ClientState {
     pub is_local: bool,
     /// Whether this connection can carry SCM_RIGHTS descriptors.
     pub fd_passing: bool,
+    /// The server's own client (a window shell's clipboard bridge): not
+    /// counted as connected for the shell or the last-client reset.
+    pub internal: bool,
     pub byte_order: ClientByteOrder,
     pub last_sequence: Arc<AtomicU16>,
     pub resource_id_base: u32,

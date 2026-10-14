@@ -714,6 +714,7 @@ mod tests {
             reader_control: None,
             is_local: true,
             fd_passing: true,
+            internal: false,
         }
     }
 

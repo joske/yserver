@@ -79,7 +79,8 @@ pub(crate) fn is_session_scoped(message: &Message) -> bool {
         | Message::SwitchVt(_)
         | Message::DumpScanout
         | Message::DumpDrawables
-        | Message::PlatformEvent => false,
+        | Message::PlatformEvent
+        | Message::InternalClient(_) => false,
     }
 }
 

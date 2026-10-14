@@ -42,6 +42,7 @@ fn xkb_use_extension_from_a_big_endian_client_is_refused_in_its_byte_order() {
             reader_control: None,
             is_local: true,
             fd_passing: true,
+            internal: false,
         },
     );
     let xkb_major = backend.xkb_opcode().expect("KMS advertises XKB");

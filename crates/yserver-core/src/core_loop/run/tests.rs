@@ -30,6 +30,7 @@ fn install_xi_config_test_client(
             reader_control: None,
             is_local: true,
             fd_passing: true,
+            internal: false,
         },
     );
     peer
@@ -65,6 +66,7 @@ fn unix_client(
         reader_control: None,
         is_local: true,
         fd_passing: true,
+        internal: false,
     }
 }
 
@@ -1482,6 +1484,7 @@ fn randr_change_fanout_orders_screen_then_all_crtcs_then_all_outputs() {
             reader_control: None,
             is_local: true,
             fd_passing: true,
+            internal: false,
         },
     );
     state.randr_select_masks.insert(
@@ -1889,6 +1892,7 @@ fn ready_crtc_completion_replies_unblocks_and_returns_reader_credit() {
             reader_control: Some(control_tx),
             is_local: true,
             fd_passing: true,
+            internal: false,
         },
     );
 
@@ -2055,6 +2059,7 @@ fn reconcile_writable_interest_tracks_outbound_state() {
             reader_control: None,
             is_local: true,
             fd_passing: true,
+            internal: false,
         },
     );
 
@@ -2569,6 +2574,7 @@ fn an_orphaned_xdmcp_client_does_not_reset_the_generation() {
             // the session credential the Refuse just revoked.
             is_local: false,
             fd_passing: false,
+            internal: false,
             setup_reply: Vec::new(),
         })
         .expect("send the racing completion");

@@ -1567,6 +1567,7 @@ mod tests {
                 reader_control: None,
                 is_local: true,
                 fd_passing: true,
+                internal: false,
             },
         );
         b
@@ -1658,6 +1659,7 @@ mod tests {
                     reader_control: None,
                     is_local: true,
                     fd_passing: true,
+                    internal: false,
                 },
             );
             peer
@@ -2083,6 +2085,7 @@ mod tests {
             reader_control: None,
             is_local: true,
             fd_passing: true,
+            internal: false,
         };
         state.clients.insert(id, client);
         peer
