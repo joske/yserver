@@ -4,8 +4,8 @@
 use std::rc::Rc;
 
 use objc2::{
-    DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, rc::Retained,
-    runtime::AnyObject,
+    AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
+    rc::Retained, runtime::AnyObject,
 };
 use objc2_app_kit::{NSEvent, NSResponder, NSTrackingArea, NSTrackingAreaOptions, NSView};
 use objc2_foundation::{NSObject, NSRect};

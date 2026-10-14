@@ -15,7 +15,7 @@ use crate::surface::{
     link::{ShellEvent, ShellLink},
 };
 
-/// Carbon's physical keyboard layout query (HIToolbox).
+// Carbon's physical keyboard layout query (HIToolbox).
 #[link(name = "Carbon", kind = "framework")]
 unsafe extern "C" {
     fn LMGetKbdType() -> u8;
