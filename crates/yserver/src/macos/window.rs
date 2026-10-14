@@ -1,0 +1,79 @@
+//! The window: an `NSView` hosting a `CAMetalLayer` sized in X pixels, and
+//! the Vulkan surface on that layer.
+
+use std::ffi::c_void;
+
+use ash::vk;
+use objc2::{MainThreadMarker, MainThreadOnly, rc::Retained};
+use objc2_app_kit::{NSBackingStoreType, NSColor, NSScreen, NSView, NSWindow, NSWindowStyleMask};
+use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+use objc2_quartz_core::{CALayer, CAMetalLayer};
+
+use crate::surface::swapchain::NativeSurface;
+
+/// A titled, closable, minimisable window of `size` X pixels, i.e.
+/// `size / backingScaleFactor` points, whose content is a `CAMetalLayer`.
+pub(super) fn create(
+    mtm: MainThreadMarker,
+    size: (u16, u16),
+) -> (Retained<NSWindow>, Retained<CAMetalLayer>) {
+    let scale = NSScreen::mainScreen(mtm).map_or(1.0, |screen| screen.backingScaleFactor());
+    let (width, height) = (f64::from(size.0), f64::from(size.1));
+    let frame = NSRect::new(
+        NSPoint::new(0.0, 0.0),
+        NSSize::new(width / scale, height / scale),
+    );
+    let style =
+        NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::Miniaturizable;
+    // SAFETY: a fresh allocation; released-when-closed is turned off below.
+    let window = unsafe {
+        NSWindow::initWithContentRect_styleMask_backing_defer(
+            NSWindow::alloc(mtm),
+            frame,
+            style,
+            NSBackingStoreType::Buffered,
+            false,
+        )
+    };
+    // SAFETY: the shell owns the window outside a window controller.
+    unsafe { window.setReleasedWhenClosed(false) };
+    window.setTitle(&NSString::from_str("yserver"));
+    window.setBackgroundColor(Some(&*NSColor::blackColor()));
+
+    let layer = CAMetalLayer::new();
+    layer.setContentsScale(scale);
+    layer.setDrawableSize(NSSize::new(width, height));
+    layer.setOpaque(true);
+    let view = NSView::initWithFrame(NSView::alloc(mtm), frame);
+    // A layer set before `wantsLayer` makes the view layer-hosting.
+    let host: &CALayer = &layer;
+    view.setLayer(Some(host));
+    view.setWantsLayer(true);
+    window.setContentView(Some(&*view));
+    window.center();
+    (window, layer)
+}
+
+/// The layer's address for `vkCreateMetalSurfaceEXT` on the core thread.
+struct LayerPtr(*const c_void);
+
+// SAFETY: only handed to `vkCreateMetalSurfaceEXT`; the main thread keeps the
+// layer retained until the process exits.
+unsafe impl Send for LayerPtr {}
+
+impl LayerPtr {
+    fn get(&self) -> *const c_void {
+        self.0
+    }
+}
+
+/// A `VK_EXT_metal_surface` surface on `layer`.
+pub(super) fn metal_surface(layer: &CAMetalLayer) -> NativeSurface {
+    let layer = LayerPtr(std::ptr::from_ref(layer).cast());
+    NativeSurface::new(ash::ext::metal_surface::NAME, move |entry, instance| {
+        let loader = ash::ext::metal_surface::Instance::new(entry, instance);
+        let info = vk::MetalSurfaceCreateInfoEXT::default().layer(layer.get());
+        // SAFETY: a live CAMetalLayer and an instance with the extension.
+        unsafe { loader.create_metal_surface(&info, None) }
+    })
+}

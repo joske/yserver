@@ -24,7 +24,10 @@ use std::{
 };
 
 impl DamageAuditTarget {
-    pub(super) fn new(
+    /// # Errors
+    ///
+    /// The image, its memory, view or command buffer could not be created.
+    pub fn new(
         vk: Arc<crate::kms::vk::device::VkContext>,
         extent: vk::Extent2D,
     ) -> Result<Self, vk::Result> {
@@ -155,6 +158,13 @@ impl DamageAuditTarget {
             timestamps_written: false,
             last_gpu_render_ns: None,
         })
+    }
+}
+
+impl DamageAuditTarget {
+    /// GPU time of the previous compose, if the target measured one.
+    pub fn take_last_gpu_render_ns(&mut self) -> Option<u64> {
+        self.last_gpu_render_ns.take()
     }
 }
 

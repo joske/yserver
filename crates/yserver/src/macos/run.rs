@@ -4,11 +4,14 @@ use std::io;
 
 use crate::launch::LaunchOptions;
 
-/// Run the server: headless only (`--headless`) until the window shell lands.
+/// Run the server in a window, or headless with `--headless`.
 ///
 /// # Errors
 ///
-/// See [`crate::surface::headless::run`].
+/// See [`crate::surface::server::run_headless`] and [`super::app::run`].
 pub(crate) fn run(opts: LaunchOptions) -> io::Result<()> {
-    crate::surface::headless::run(opts)
+    if opts.headless {
+        return crate::surface::server::run_headless(opts);
+    }
+    super::app::run(opts)
 }

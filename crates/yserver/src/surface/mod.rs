@@ -1,13 +1,16 @@
 //! A platform whose outputs are window-system surfaces, each presented
 //! through its own Vulkan swapchain. A shell (macOS: `crate::macos`) creates
-//! the surfaces; until one does, the server it drives is headless.
+//! the surfaces; without one the server is headless.
 
-#[cfg(not(kms))]
-pub(crate) mod headless;
+pub(crate) mod clock;
+pub(crate) mod link;
 mod platform;
+mod present;
+#[cfg(not(kms))]
+pub(crate) mod server;
+mod slots;
+pub(crate) mod swapchain;
 #[cfg(test)]
 mod tests;
 
-#[cfg(test)]
-pub(crate) use platform::SurfacePlatform;
-pub(crate) use platform::headless_backend;
+pub(crate) use platform::{SurfacePlatform, headless_backend, surface_backend};

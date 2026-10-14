@@ -132,7 +132,7 @@ pub trait Platform: OutputSink + Sized + 'static {
         Vec<yserver_core::randr::RandrOutput>,
         Vec<yserver_core::randr::RandrMode>,
     ) {
-        crate::kms::render::backend::seam::single_output_randr(b.platform.fb_size())
+        crate::kms::render::backend::seam::single_output_randr(b.platform.fb_size(), 60)
     }
 
     fn randr_providers(_b: &mut XBackend<Self>) -> Vec<yserver_core::randr::RandrProvider> {
@@ -573,6 +573,7 @@ pub trait Platform: OutputSink + Sized + 'static {
 #[must_use]
 pub(crate) fn single_output_randr(
     (width, height): (u16, u16),
+    vrefresh: u32,
 ) -> (
     Vec<yserver_core::randr::RandrOutput>,
     Vec<yserver_core::randr::RandrMode>,
@@ -587,7 +588,7 @@ pub(crate) fn single_output_randr(
         y: 0,
         width,
         height,
-        vrefresh: 60,
+        vrefresh,
         timing: None,
         // No EDID: `RandrState::output_info` synthesises 96 DPI.
         mm_width: 0,

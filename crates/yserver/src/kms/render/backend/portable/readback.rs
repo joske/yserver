@@ -126,7 +126,7 @@ impl<P: Platform> XBackend<P> {
     /// composed from the scene as every earlier request left it
     /// ([`SceneCompositor::root_readback`]); `None` without a live scene,
     /// leaving the read on the scanout.
-    pub(in crate::kms::render::backend) fn fresh_root_readback(
+    pub(crate) fn fresh_root_readback(
         &mut self,
         output_idx: usize,
         local: vk::Rect2D,

@@ -125,6 +125,21 @@ pub struct LaunchOptions {
     pub xdmcp: Option<XdmcpOptions>,
     /// `--headless`: on a platform without KMS, run without a window.
     pub headless: bool,
+    /// `--geometry WxH`: the screen size in pixels on a platform without
+    /// KMS.
+    pub geometry: Option<(u16, u16)>,
+}
+
+/// Parse a `WxH` screen size; both sides must be non-zero.
+fn parse_geometry(value: &str) -> Result<(u16, u16), String> {
+    let invalid = || format!("invalid --geometry argument: {value} (expected WxH)");
+    let (w, h) = value.split_once(['x', 'X']).ok_or_else(invalid)?;
+    let w = w.parse::<u16>().map_err(|_| invalid())?;
+    let h = h.parse::<u16>().map_err(|_| invalid())?;
+    if w == 0 || h == 0 {
+        return Err(invalid());
+    }
+    Ok((w, h))
 }
 
 fn next_value(it: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
@@ -208,6 +223,8 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchOption
             // Known no-arg no-op (lightdm passes it).
         } else if arg == "--headless" {
             o.headless = true;
+        } else if arg == "--geometry" {
+            o.geometry = Some(parse_geometry(&next_value(&mut it, "--geometry")?)?);
         } else if matches!(arg.as_str(), "--version" | "-version") {
             // Print-and-exit; the binary acts on this before `run()`.
             // Keep scanning so it works regardless of position.
@@ -1148,6 +1165,19 @@ mod tests {
         let o = parse(&[":1", "--headless"]).unwrap();
         assert!(o.headless);
         assert_eq!(o.display, Some(1));
+    }
+
+    #[test]
+    fn geometry_parses_and_rejects_malformed_values() {
+        assert_eq!(parse(&[":1"]).unwrap().geometry, None);
+        assert_eq!(
+            parse(&["--geometry", "1600x1000"]).unwrap().geometry,
+            Some((1600, 1000))
+        );
+        for bad in ["1600", "0x10", "10x", "x10", "70000x10", "axb"] {
+            assert!(parse(&["--geometry", bad]).is_err(), "{bad}");
+        }
+        assert!(parse(&["--geometry"]).is_err(), "missing value");
     }
 
     #[test]

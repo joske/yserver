@@ -19,7 +19,7 @@ impl<P: Platform> XBackend<P> {
     /// `next_wakeup` never wakes for, the paint would be stranded (the
     /// xfce submenu bug — a menu painted after its map-compose sat
     /// off-screen until an unrelated event poked the loop).
-    pub(in crate::kms::render::backend) fn scene_wants_scene(&self) -> bool {
+    pub(crate) fn scene_wants_scene(&self) -> bool {
         self.scene.scene_structure_dirty
             || self.store.has_pending_presentation_damage()
             // An invalidated or never-presented frame owes a repaint no producer

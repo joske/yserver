@@ -55,6 +55,34 @@ fn headless_present_context_can_present_from_its_graphics_queue() {
 
 #[test]
 #[ignore = "needs live Vulkan ICD"]
+fn surface_context_picks_a_device_presenting_to_the_probed_surface() {
+    let mut probes = 0;
+    let mut probe = |entry: &ash::Entry, instance: &ash::Instance| {
+        probes += 1;
+        let headless = ash::ext::headless_surface::Instance::new(entry, instance);
+        unsafe {
+            headless.create_headless_surface(&vk::HeadlessSurfaceCreateInfoEXT::default(), None)
+        }
+    };
+    let vk = match VkContext::new_with_surface(HEADLESS_PRESENT, &mut probe) {
+        Ok(vk) => vk,
+        Err(e) => {
+            eprintln!("skipping: no Vk: {e:?}");
+            return;
+        }
+    };
+    assert_eq!(probes, 1, "the device pick probed the surface once");
+    assert!(vk.swapchain);
+
+    let mut failing = |_: &ash::Entry, _: &ash::Instance| Err(vk::Result::ERROR_SURFACE_LOST_KHR);
+    assert!(
+        VkContext::new_with_surface(HEADLESS_PRESENT, &mut failing).is_err(),
+        "no surface, no presenting context"
+    );
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
 fn kms_context_keeps_dmabuf_export_and_no_swapchain() {
     let Some(vk) = vk_or_skip(VkContextOptions::KMS) else {
         return;

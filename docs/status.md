@@ -33,6 +33,17 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-10-14 macOS M1: rooted window (branch `feat/macos-m0`, plan
+  `plans/2026-10-14-macos-m0-m1.md`):** the default macOS invocation opens one AppKit window
+  (`--geometry WxH` X pixels, CAMetalLayer) and runs the core loop on a worker thread; `--headless` stays a test
+  mode. The surface platform (`src/surface/`, OS-neutral) presents through a per-surface Vulkan swapchain: the scene
+  composes into one of two offscreen slots, then a non-blocking acquire, a slot→image copy and `vkQueuePresentKHR`;
+  a frame retires on the first frame-clock tick after its copy fence. Present is Copy-only, paced by the clock
+  (CVDisplayLink on macOS), which wakes the core only for a pending frame or an armed MSC target. RandR shows one
+  `WINDOW-0` output. Linux covers all of it on lavapipe through `VK_EXT_headless_surface`
+  (`surface::tests`); the AppKit layer (`src/macos/`) is compiled and run on macOS only. No input yet (M2).
+  Recipe: `just macos-run [display] [geometry] [log]`.
+
 - **2026-10-13 hardware cursor in the wlroots model (branch `feat/atomic-cursor`):** on every device whose
   cursor planes expose `CRTC_X`/`CRTC_Y`, the cursor is driven through atomic commits. Each CRTC has one commit
   stream with at most one commit in flight:

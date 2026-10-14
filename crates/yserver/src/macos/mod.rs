@@ -1,6 +1,9 @@
-//! The macOS shell. Until it creates a window, the server only runs
-//! headless.
+//! The macOS shell: one AppKit window whose CAMetalLayer shows the X screen,
+//! with the core loop on its own thread. `--headless` runs without it.
 
+mod app;
+mod display_link;
 mod run;
+mod window;
 
 pub(crate) use run::run;

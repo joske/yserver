@@ -17,6 +17,8 @@ pub(crate) mod platform;
 #[cfg(kms)]
 pub mod present;
 #[cfg(any(not(kms), test))]
+// Only the macOS shell opens windows; elsewhere the window half is unused.
+#[cfg_attr(all(not(kms), not(target_os = "macos")), allow(dead_code))]
 pub(crate) mod surface;
 pub mod version;
 #[cfg(kms)]
@@ -298,12 +300,15 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
 /// Run the server on a platform with neither KMS nor a window shell.
 #[cfg(all(not(kms), not(target_os = "macos")))]
 pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
-    surface::headless::run(opts)
+    surface::server::run_headless(opts)
 }
 
 /// Run the server on the DRM/KMS platform.
 #[cfg(kms)]
 pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
+    if opts.geometry.is_some() {
+        log::warn!("yserver: --geometry is for platforms without KMS; ignored");
+    }
     if opts.headless {
         log::warn!("yserver: --headless is for platforms without KMS; ignored");
     }

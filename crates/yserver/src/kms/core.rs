@@ -743,6 +743,13 @@ impl FontLoader {
             "/usr/share/fonts/X11/100dpi",
             "/usr/share/fonts/75dpi",
             "/usr/share/fonts/X11/75dpi",
+            // XQuartz and Homebrew on macOS.
+            "/opt/X11/share/fonts/misc",
+            "/opt/X11/share/fonts/TTF",
+            "/opt/X11/share/fonts/Type1",
+            "/opt/X11/share/fonts/100dpi",
+            "/opt/X11/share/fonts/75dpi",
+            "/opt/homebrew/share/fonts",
         ];
         let mut path: Vec<String> = CANDIDATES
             .iter()

@@ -5,8 +5,8 @@
 //! B.3 close). Implements the `Backend` trait directly; `lib.rs`
 //! constructs `KmsBackend` at startup.
 
-// Until the surface platform presents, the KMS platform is the only caller
-// of parts of the portable backend.
+// The KMS platform is still the only caller of parts of the portable backend
+// (cursor animation, VT input release, pointer re-confinement).
 #[cfg_attr(not(kms), allow(dead_code))]
 mod backend;
 #[cfg(kms)]
@@ -28,7 +28,10 @@ pub(crate) mod probe_executor;
 #[cfg(kms)]
 pub use backend::KmsBackend;
 #[cfg(any(not(kms), test))]
-pub(crate) use backend::{XBackend, seam::Platform};
+pub(crate) use backend::{
+    XBackend,
+    seam::{Platform, single_output_randr},
+};
 pub use yserver_render::kms::render::cpu_types;
 pub(crate) use yserver_render::kms::render::{
     cursor, engine, frame_builder, geometry, glyph_pixels, gpu, present_batch, root_overlay, scene,

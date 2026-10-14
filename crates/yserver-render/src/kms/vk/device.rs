@@ -289,6 +289,23 @@ impl VkContext {
             DeviceProfile::Compositor,
             DropWaitPolicy::live(),
             options,
+            None,
+        )
+    }
+
+    /// Automatic selection of a device whose graphics queue presents to the
+    /// surface `probe` creates. The probe surface is destroyed again; the
+    /// caller creates its own from the returned context's instance.
+    pub fn new_with_surface(
+        options: VkContextOptions,
+        probe: &mut SurfaceProbe<'_>,
+    ) -> Result<Arc<Self>, VkInitError> {
+        Self::new_with_selection(
+            PhysicalDeviceSelection::Automatic,
+            DeviceProfile::Compositor,
+            DropWaitPolicy::live(),
+            options,
+            Some(probe),
         )
     }
 
@@ -309,6 +326,7 @@ impl VkContext {
             DeviceProfile::Compositor,
             DropWaitPolicy::live(),
             VkContextOptions::KMS,
+            None,
         )
     }
 
@@ -324,6 +342,7 @@ impl VkContext {
             DeviceProfile::Compositor,
             DropWaitPolicy::disposable_probe(),
             VkContextOptions::KMS,
+            None,
         )
     }
 
@@ -342,6 +361,7 @@ impl VkContext {
             DeviceProfile::Transfer,
             DropWaitPolicy::live(),
             VkContextOptions::KMS,
+            None,
         )
     }
 
@@ -356,6 +376,7 @@ impl VkContext {
             DeviceProfile::Transfer,
             DropWaitPolicy::disposable_probe(),
             VkContextOptions::KMS,
+            None,
         )
     }
 
@@ -370,6 +391,7 @@ impl VkContext {
             DeviceProfile::Compositor,
             DropWaitPolicy::disposable_probe(),
             VkContextOptions::KMS,
+            None,
         )
     }
 
@@ -384,6 +406,7 @@ impl VkContext {
         profile: DeviceProfile,
         drop_wait_policy: DropWaitPolicy,
         options: VkContextOptions,
+        surface_probe: Option<&mut SurfaceProbe<'_>>,
     ) -> Result<Arc<Self>, VkInitError> {
         let entry = load_entry()?;
         let api_version_cap =
@@ -493,7 +516,7 @@ impl VkContext {
             selected_device_selector,
             selected_drm_identity,
             drm_physical_devices,
-        } = match pick_physical_device(&instance, selection) {
+        } = match pick_physical_device_for_surface(&entry, &instance, selection, surface_probe) {
             Ok(t) => t,
             Err(e) => {
                 unsafe {
@@ -1226,13 +1249,36 @@ struct PickedPhysicalDevice {
     drm_physical_devices: Vec<VulkanDrmPhysicalDevice>,
 }
 
+/// Creates a platform surface on an instance, to probe present support.
+pub type SurfaceProbe<'a> =
+    dyn FnMut(&ash::Entry, &ash::Instance) -> Result<vk::SurfaceKHR, vk::Result> + 'a;
+
+/// [`pick_physical_device`], keeping only devices whose graphics queue
+/// presents to the surface `probe` creates (destroyed before returning).
+fn pick_physical_device_for_surface(
+    entry: &ash::Entry,
+    instance: &ash::Instance,
+    selection: PhysicalDeviceSelection,
+    probe: Option<&mut SurfaceProbe<'_>>,
+) -> Result<PickedPhysicalDevice, VkInitError> {
+    let Some(probe) = probe else {
+        return pick_physical_device(instance, selection, None);
+    };
+    let surface = probe(entry, instance)?;
+    let surface_fns = ash::khr::surface::Instance::new(entry, instance);
+    let picked = pick_physical_device(instance, selection, Some((&surface_fns, surface)));
+    unsafe { surface_fns.destroy_surface(surface, None) };
+    picked
+}
+
 fn pick_physical_device(
     instance: &ash::Instance,
     selection: PhysicalDeviceSelection,
+    surface: Option<(&ash::khr::surface::Instance, vk::SurfaceKHR)>,
 ) -> Result<PickedPhysicalDevice, VkInitError> {
     let devices = unsafe { instance.enumerate_physical_devices() }?;
 
-    let candidates: Vec<PhysicalDeviceCandidate> = devices
+    let mut candidates: Vec<PhysicalDeviceCandidate> = devices
         .into_iter()
         .map(|physical_device| {
             let props = unsafe { instance.get_physical_device_properties(physical_device) };
@@ -1251,6 +1297,28 @@ fn pick_physical_device(
             })
         })
         .collect::<Result<_, VkInitError>>()?;
+    if let Some((surface_fns, surface)) = surface {
+        for candidate in &mut candidates {
+            let Some(family) = candidate.graphics_queue_family else {
+                continue;
+            };
+            let presents = unsafe {
+                surface_fns.get_physical_device_surface_support(
+                    candidate.physical_device,
+                    family,
+                    surface,
+                )
+            }
+            .unwrap_or(false);
+            if !presents {
+                log::info!(
+                    "vulkan: {} cannot present to the surface; not selectable",
+                    format_device_selector(candidate.selector)
+                );
+                candidate.graphics_queue_family = None;
+            }
+        }
+    }
 
     validate_render_device_inventory(&candidates)?;
     let selected = match selection {

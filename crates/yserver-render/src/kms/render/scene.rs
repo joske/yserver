@@ -60,6 +60,9 @@ use lifecycle::drain_deferred_scene_resources;
 #[cfg(test)]
 use repaint::*;
 pub use sink::*;
+
+/// A frame slot a window-system sink composes into.
+pub use self::DamageAuditTarget as OffscreenTarget;
 #[cfg(test)]
 use tick::*;
 #[cfg(test)]
@@ -494,7 +497,10 @@ struct DamageAuditEpisodeStart {
     next_event_id: u64,
 }
 
-struct DamageAuditTarget {
+/// An offscreen B8G8R8A8 compose target with its own command buffer, left
+/// `GENERAL` after each compose: the damage audit's frames, the root
+/// readback, and a surface platform's frame slots.
+pub struct DamageAuditTarget {
     vk: Arc<crate::kms::vk::device::VkContext>,
     image: vk::Image,
     view: vk::ImageView,
