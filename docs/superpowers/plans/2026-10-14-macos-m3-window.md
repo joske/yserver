@@ -221,3 +221,12 @@ As M2: nightly fmt; `cargo clippy --all-targets -- -D warnings` (+ `--features x
    app. Bundling is bigger and touches signing; proposal: M4.
 5. **launchd `DISPLAY` activation** (start yserver on first X client, like XQuartz's `org.xquartz:0`): conflicts with
    XQuartz if both are installed. Proposal: M4, opt-in.
+
+## Implementation notes
+
+- **Task 1, review-independent part** (`50f6273f`, `f1a9b7a9`, `4e4009a8`): `pub host_screen_resized` in core
+  (nested backend calls it); `resize_root_storage` in `portable/paint_target.rs` (KMS keeps topology epoch, input
+  extent and `fb_w/fb_h` — more KMS-only lines than decision 2 listed); surface `resize_screen` +
+  `set_logical_screen_size`. `RRSetScreenSize` stays screen-only, as Xorg: the `WINDOW-0` CRTC keeps its mode, so a
+  later shrink below the mode is BadMatch until the mode list lands. `record_copy` already copied the smaller extent
+  per axis (decision 2 described it as new). Mode list, BadMatch, size range and all AppKit parts wait for review.
