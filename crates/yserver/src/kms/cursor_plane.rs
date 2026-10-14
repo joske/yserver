@@ -214,13 +214,14 @@ pub struct CursorPlane {
 /// Assign each CRTC at most one cursor plane and each plane to at most one
 /// CRTC, like wlroots: a plane whose `possible_crtcs` is exactly one CRTC goes
 /// to that CRTC (the kernel's legacy cursor plane on per-CRTC-cursor drivers),
-/// then remaining shared planes go greedily to unassigned CRTCs in device order.
+/// then the remaining planes are matched to the remaining CRTCs with augmenting
+/// paths (a maximum matching, so greedy order cannot strand a coverable CRTC).
 fn assign_cursor_planes(
     crtcs: &[crtc::Handle],
     planes: &[DiscoveredCursorPlane],
 ) -> HashMap<crtc::Handle, usize> {
     let mut assignment = HashMap::new();
-    let mut used = vec![false; planes.len()];
+    let mut exclusive = vec![false; planes.len()];
     for (index, plane) in planes.iter().enumerate() {
         if plane.crtcs.len() == 1
             && let Some(crtc) = plane.crtcs.iter().next()
@@ -228,21 +229,56 @@ fn assign_cursor_planes(
             && !assignment.contains_key(crtc)
         {
             assignment.insert(*crtc, index);
-            used[index] = true;
+            exclusive[index] = true;
         }
     }
-    for crtc in crtcs {
-        if assignment.contains_key(crtc) {
-            continue;
+    let mut owner: Vec<Option<usize>> = vec![None; planes.len()];
+    for (crtc_index, crtc) in crtcs.iter().enumerate() {
+        if !assignment.contains_key(crtc) {
+            let mut visited = vec![false; planes.len()];
+            augment_cursor_matching(
+                crtc_index,
+                crtcs,
+                planes,
+                &exclusive,
+                &mut owner,
+                &mut visited,
+            );
         }
-        if let Some(index) =
-            (0..planes.len()).find(|&index| !used[index] && planes[index].crtcs.contains(crtc))
-        {
-            assignment.insert(*crtc, index);
-            used[index] = true;
+    }
+    for (index, crtc_index) in owner.iter().enumerate() {
+        if let Some(crtc_index) = crtc_index {
+            assignment.insert(crtcs[*crtc_index], index);
         }
     }
     assignment
+}
+
+/// Kuhn's augmenting-path step: give `crtcs[crtc_index]` a plane, moving
+/// earlier non-exclusive owners to other planes when that frees one.
+fn augment_cursor_matching(
+    crtc_index: usize,
+    crtcs: &[crtc::Handle],
+    planes: &[DiscoveredCursorPlane],
+    exclusive: &[bool],
+    owner: &mut [Option<usize>],
+    visited: &mut [bool],
+) -> bool {
+    for index in 0..planes.len() {
+        if exclusive[index] || visited[index] || !planes[index].crtcs.contains(&crtcs[crtc_index]) {
+            continue;
+        }
+        visited[index] = true;
+        let free = match owner[index] {
+            None => true,
+            Some(other) => augment_cursor_matching(other, crtcs, planes, exclusive, owner, visited),
+        };
+        if free {
+            owner[index] = Some(crtc_index);
+            return true;
+        }
+    }
+    false
 }
 
 /// Explicit plane assignment and the atomic position properties of each
@@ -795,6 +831,48 @@ mod tests {
         assert_ne!(assigned_plane(&topology, a), assigned_plane(&topology, b));
         assert!(assigned_plane(&topology, b).is_some());
         assert_eq!(cursor_plane_topology(&[a, b], &[]).0, None);
+    }
+
+    fn assert_every_crtc_has_its_own_plane(crtcs: &[crtc::Handle], topology: &CursorPlaneTopology) {
+        let assigned: Vec<_> = crtcs
+            .iter()
+            .map(|&crtc| assigned_plane(topology, crtc).expect("every CRTC gets a cursor plane"))
+            .collect();
+        let distinct: HashSet<_> = assigned.iter().collect();
+        assert_eq!(distinct.len(), assigned.len(), "a plane serves two CRTCs");
+    }
+
+    #[test]
+    // Mutation: greedy first-fit gives a→21, b→none, c→22; a maximum matching
+    // reroutes a to 22 or 23 so that b can take 21.
+    fn cursor_plane_assignment_is_a_maximum_matching() {
+        let (a, b, c) = (test_crtc(11), test_crtc(12), test_crtc(13));
+        let planes = [
+            discovered(21, &[a, b], true),
+            discovered(22, &[a, c], true),
+            discovered(23, &[a, c], true),
+        ];
+        let topology = cursor_plane_topology(&[a, b, c], &planes);
+
+        assert_every_crtc_has_its_own_plane(&[a, b, c], &topology);
+    }
+
+    #[test]
+    // Mutation: let augmenting paths reassign exclusive planes. CRTC c's
+    // exclusive plane 23 must stay with c while a and b share the rest.
+    fn cursor_plane_matching_keeps_exclusive_planes() {
+        let (a, b, c) = (test_crtc(11), test_crtc(12), test_crtc(13));
+        let planes = [
+            discovered(21, &[a, b, c], true),
+            discovered(22, &[a, c], true),
+            discovered(23, &[c], true),
+        ];
+        let topology = cursor_plane_topology(&[a, b, c], &planes);
+
+        assert_every_crtc_has_its_own_plane(&[a, b, c], &topology);
+        assert_eq!(assigned_plane(&topology, c), Some(planes[2].handle));
+        assert_eq!(assigned_plane(&topology, a), Some(planes[1].handle));
+        assert_eq!(assigned_plane(&topology, b), Some(planes[0].handle));
     }
 
     #[test]
