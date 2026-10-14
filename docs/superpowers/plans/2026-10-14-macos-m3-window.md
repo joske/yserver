@@ -335,3 +335,20 @@ As M2: nightly fmt; `cargo clippy --all-targets -- -D warnings` (+ `--features x
   surface), so they are Linux-only. The bridge window has no `WM_NAME`/`WM_COMMAND`, so `xlsclients` does not
   list it. Open: whether the main queue drains while the quit alert is modal (the bridge waits, it cannot
   deadlock); PRIMARY.
+- **Task 7** (`app_bundle.rs` is compiled and tested on Linux; the `main` hookup is macOS-only, eiger pending):
+  `app_bundle::prepare` runs first in `main`, before any thread. A bundle launch is detected from the executable's
+  path (`*.app/Contents/MacOS/<bin>`), not from a missing tty: running the bundle's binary from Terminal then also
+  logs to the file, but a tty test would send a `just macos-run … | tee` run there too. Bundle launches `dup2` stdout
+  and stderr onto `~/Library/Logs/yserver.log` (truncated per launch), so Mesa's and the loader's messages land
+  there as well. With neither `VK_DRIVER_FILES` nor `VK_ICD_FILENAMES` set, it sets `VK_DRIVER_FILES` to the first
+  `share/vulkan/icd.d/kosmickrisp_mesa_icd.<arch>.json` under `brew --prefix` at build time (`build.rs`,
+  `YSERVER_HOMEBREW_PREFIX`), `/opt/homebrew`, `/usr/local`. An environment variable, not an explicit path: the loader
+  takes a manifest path only from the environment, and `VK_LUNARG_direct_driver_loading` takes a loaded driver
+  (we would re-implement `library_path` resolution). The loader itself was already found by `load_entry`.
+  Display: `LaunchOptions::pick_free_display` (set by a bundle launch, not argv) makes a launch without `:N` and
+  `-displayfd` take the lowest display from `:1` whose lock and socket are free (`launch::autopick_locked`, locked
+  unlike the `-displayfd` scan; `:0` left to XQuartz, as M1); an explicit `:N` still wins. The window title is
+  `yserver DISPLAY=:N`. `just macos-bundle` writes `target/yserver.app` with an `Info.plist` (identifier
+  `io.github.joske.yserver`, version from `cargo pkgid`, `LSMinimumSystemVersion` 26.0 as KosmicKrisp needs,
+  `NSHighResolutionCapable`); no icon (there is no artwork in the repo) and no `codesign` beyond the linker's ad-hoc
+  signature. README has a macOS section.

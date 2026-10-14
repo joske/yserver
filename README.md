@@ -196,6 +196,38 @@ sudo apk add --allow-untrusted ./yserver-*.apk   # signed with a per-build key
 
 See also `yserver(1)` and `starty(1)`.
 
+### macOS
+
+yserver runs in a window on macOS 26 or later on Apple Silicon, on Mesa's
+KosmicKrisp Vulkan driver. Dependencies from Homebrew:
+
+```sh
+brew install mesa vulkan-loader vulkan-tools shaderc libxkbcommon fontconfig freetype pkgconf
+```
+
+From a source checkout:
+
+```sh
+just macos-run                 # :1, 1280x800, log in yserver-mac.log
+just macos-run 2 1600x1000     # display, geometry (positional)
+just macos-bundle              # builds target/yserver.app
+```
+
+`target/yserver.app` uses the Homebrew libraries and the KosmicKrisp driver
+from the Homebrew prefix; nothing is bundled. Started from Finder it takes
+the lowest free display from `:1`, shows it in the window title
+(`yserver DISPLAY=:N`) and logs to `~/Library/Logs/yserver.log`.
+
+`--scale` sets how many screen pixels one X pixel covers: `auto` (the
+default; one X pixel per point, 2 on a Retina screen), `1` (full
+resolution) or `2`.
+
+Clients connect with the display number, e.g. with XQuartz's clients:
+
+```sh
+DISPLAY=:1 /opt/X11/bin/xterm
+```
+
 ## Regression coverage with xts5 and rendercheck
 
 We run the X.Org X Test Suite (xts5) against `yserver` to gauge protocol completeness.
