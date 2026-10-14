@@ -114,7 +114,8 @@ eiger before the task that depends on it merges.
 - **JIS:** `JIS_Yen` → `KEY_YEN`, `JIS_Underscore` → `KEY_RO`, `JIS_KeypadComma` → `KEY_KPJPCOMMA`,
   `JIS_Kana`/`JIS_Eisu` → `KEY_HANGEUL`/`KEY_HANJA` (HID LANG1/LANG2 in `hid-input.c`). A `jp` layout is the user's
   `-layout jp`.
-- `ANSI_KeypadClear` → `KEY_NUMLOCK` (HID Keypad NumLock&Clear). Num Lock starts off, as on Linux.
+- `ANSI_KeypadClear` → `KEY_NUMLOCK` (HID Keypad NumLock&Clear). Num Lock starts **locked on** on macOS, so the
+  keypad types digits as Mac users expect (Clear toggles it).
 
 ### 5. Modifiers and Caps Lock
 
@@ -139,9 +140,11 @@ Nothing re-presses on `becomeKey`; only the lock sync of decision 5 runs.
 
 ### 7. Pointer
 
-- A view subclass (`YserverView`, `acceptsFirstResponder = YES`, `acceptsFirstMouse: = NO`) with one
-  `NSTrackingArea`: `MouseMoved | MouseEnteredAndExited | CursorUpdate | ActiveAlways | InVisibleRect`, so `xeyes`
-  follows even when the window is not key.
+- A view subclass (`YserverView`, `acceptsFirstResponder = YES`, `acceptsFirstMouse: = NO`); the window sets
+  `acceptsMouseMovedEvents = YES` (it defaults to NO, and without it no `mouseMoved:` arrives).
+- Two `NSTrackingArea`s: motion `MouseMoved | MouseEnteredAndExited | ActiveAlways | InVisibleRect`, so `xeyes`
+  follows even when the window is not key; and a separate cursor area `CursorUpdate | ActiveInKeyWindow |
+  InVisibleRect`, because AppKit does not send `cursorUpdate:` for a `CursorUpdate` area with `ActiveAlways`.
 - Position: `convertPoint:fromView:nil` of `locationInWindow` → points, origin bottom-left. X pixel
   `x = floor(px * scale)`, `y = floor((view_height_pt - py) * scale)`, clamped to `0..w-1`, `0..h-1`.
   `scale` = the window's `backingScaleFactor`, read per event batch on the main thread (M1's HiDPI rule: X pixels =
@@ -322,6 +325,13 @@ feature stubbed out before it counts.
    Xvfb-measured testdata and the silence smoke; merged separately so it can be bisected.
 7. **Server reset (`-reset`)**: the inventory is process-lifetime and devices are re-published on a new generation
    [C to verify in M2.2: `core_loop/reset.rs`]; a test resets once and checks both slaves are back.
+
+## Review round 1 (codex) — resolved
+
+1. `acceptsMouseMovedEvents = YES` on the window; the tracking area alone does not deliver motion.
+2. Separate cursor-update tracking area (`ActiveInKeyWindow`); `CursorUpdate` + `ActiveAlways` gets no `cursorUpdate:`.
+3. Num Lock starts locked on macOS.
+4. Agreed: M2.0 (repeat fix) as its own PR to master; `NSCursor`; `pc105` + `us` with the ISO key swap.
 
 ## Open questions (maintainer / codex)
 
