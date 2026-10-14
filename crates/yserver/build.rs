@@ -22,6 +22,7 @@ fn main() {
     // Homebrew's lib dir is not on the macOS linker's default path.
     if target_os == "macos" {
         emit_pkg_config_link_search("xkbcommon");
+        emit_homebrew_prefix();
     }
 
     // Stamp the build with the git commit for `--version`. Best-effort:
@@ -46,6 +47,18 @@ fn emit_pkg_config_link_search(lib: &str) {
         println!("cargo::warning=pkg-config has no libdir for {lib}");
     } else {
         println!("cargo::rustc-link-search=native={libdir}");
+    }
+}
+
+/// Emit `YSERVER_HOMEBREW_PREFIX` (`brew --prefix`), where `app_bundle`
+/// looks for the Vulkan ICD first. Absent without `brew`.
+fn emit_homebrew_prefix() {
+    let Ok(output) = Command::new("brew").arg("--prefix").output() else {
+        return;
+    };
+    let prefix = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if output.status.success() && !prefix.is_empty() {
+        println!("cargo::rustc-env=YSERVER_HOMEBREW_PREFIX={prefix}");
     }
 }
 

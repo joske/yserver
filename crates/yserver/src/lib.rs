@@ -1,3 +1,5 @@
+#[cfg(any(target_os = "macos", test))]
+pub mod app_bundle;
 pub mod clock;
 #[cfg(kms)]
 pub mod drm;

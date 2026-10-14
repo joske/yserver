@@ -1,7 +1,12 @@
 use std::{env, process::ExitCode};
 
 fn main() -> ExitCode {
+    // First, before any thread: it may set the Vulkan driver variable.
+    #[cfg(target_os = "macos")]
+    let startup = yserver::app_bundle::prepare();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    #[cfg(target_os = "macos")]
+    startup.log();
 
     #[cfg(kms)]
     if let Some(result) = yserver::internal_probe::run_reexec_helper_if_requested() {
@@ -24,6 +29,13 @@ fn main() -> ExitCode {
             );
             return ExitCode::FAILURE;
         }
+    };
+
+    // Started from Finder, nobody can pass `:N`.
+    #[cfg(target_os = "macos")]
+    let opts = yserver::launch::LaunchOptions {
+        pick_free_display: startup.bundle.is_some(),
+        ..opts
     };
 
     if opts.show_version {
