@@ -129,6 +129,8 @@ fn build(image: &CursorImage, xpp: f64) -> Retained<NSCursor> {
     let size = NSSize::new(f64::from(width) / xpp, f64::from(height) / xpp);
     let ns_image = NSImage::initWithSize(NSImage::alloc(), size);
     if let Some(rep) = rep {
+        // Else the rep claims its pixel count in points.
+        rep.setSize(size);
         ns_image.addRepresentation(&rep);
     }
     let hot = NSPoint::new(f64::from(image.hot.0) / xpp, f64::from(image.hot.1) / xpp);
