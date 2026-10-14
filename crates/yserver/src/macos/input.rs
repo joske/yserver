@@ -2,7 +2,12 @@
 //! through the shell link. Every key the app receives goes to X,
 //! outside a modal alert.
 
-use std::{cell::RefCell, ptr::NonNull, rc::Rc, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    ptr::NonNull,
+    rc::Rc,
+    sync::Arc,
+};
 
 use block2::RcBlock;
 use objc2::{MainThreadMarker, rc::Retained, runtime::AnyObject};
@@ -37,8 +42,9 @@ fn iso_keyboard() -> bool {
 /// window delegate on the main thread.
 pub(super) struct ShellInput {
     link: Arc<ShellLink>,
-    /// The X screen in pixels.
-    fb: (u16, u16),
+    /// The output in X pixels, as last posted to the core; pointer
+    /// positions clamp to it.
+    fb: Cell<(u16, u16)>,
     translator: RefCell<Translator>,
     scroller: RefCell<Scroller>,
 }
@@ -52,10 +58,15 @@ impl ShellInput {
         );
         Rc::new(Self {
             link,
-            fb,
+            fb: Cell::new(fb),
             translator: RefCell::new(Translator::new(iso)),
             scroller: RefCell::new(Scroller::default()),
         })
+    }
+
+    /// The window now shows a `fb`-sized output.
+    pub(super) fn set_fb(&self, fb: (u16, u16)) {
+        self.fb.set(fb);
     }
 
     /// Route every key event of the app to X; AppKit sees none of them,
@@ -110,7 +121,7 @@ impl ShellInput {
     pub(super) fn motion(&self, view: &NSView, event: &NSEvent) {
         let raw = raw_pointer(view, event);
         log::trace!("macos motion: {raw:?}");
-        let fb = self.fb;
+        let fb = self.fb.get();
         self.link
             .send_input(|time, out| out.push(pointer::motion(&raw, fb, time)));
     }
@@ -118,7 +129,7 @@ impl ShellInput {
     /// A mouse button changed over `view`; the position goes first.
     pub(super) fn button(&self, view: &NSView, event: &NSEvent, pressed: bool) {
         let raw = raw_pointer(view, event);
-        let fb = self.fb;
+        let fb = self.fb.get();
         let number = event.buttonNumber() as i64;
         log::debug!("macos button {number} pressed={pressed}: {raw:?}");
         let mut translator = self.translator.borrow_mut();

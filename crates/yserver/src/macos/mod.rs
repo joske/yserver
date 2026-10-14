@@ -5,6 +5,7 @@ mod app;
 mod cursor;
 mod display_link;
 mod input;
+mod resize;
 mod run;
 mod view;
 mod window;

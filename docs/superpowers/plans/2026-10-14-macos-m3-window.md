@@ -292,3 +292,13 @@ As M2: nightly fmt; `cargo clippy --all-targets -- -D warnings` (+ `--features x
   background/tile on the unattached images; there was no old-content copy before and none is added. Fill failures
   are those `fill_rect`/`render_composite` report when recording; a failed later submit is renderer-fatal
   (`renderer_failed`), not a resize failure. `ShellEvent::Resized` has no `backing_scale` yet (task 3).
+- **Task 2** (macOS shell, not compiled here; eiger pending): the view's `setFrameSize:` (plus `windowDidResize:` as
+  a backstop, repeats dropped) reports `bounds × backingScaleFactor`, floored. `surface/resize.rs`
+  `ResizeCoalescer` decides what to post: every change outside a live resize; during one
+  (`viewWillStartLiveResize`/`viewDidEndLiveResize`) the first change, then at most one per frame-clock tick
+  (`FrameClock::set_tick_hook` → main queue, only while a size waits), and the final size at the end. A core request
+  is answered after `setContentSize:` returns (synchronous): the view holds back its own report meanwhile and the
+  window's size goes out under the token even when unchanged, so a no-op request still completes. Each post sets
+  `drawableSize` and `ShellInput`'s pointer clamp first; the layer frame follows the view on every change (actions
+  disabled) with `contentsGravity` top-left. The core rebuilds every swapchain on every `Resized`, even when the
+  output keeps its size, so the swapchain always ends at the last drawable size. Content min size 320x200 X pixels.

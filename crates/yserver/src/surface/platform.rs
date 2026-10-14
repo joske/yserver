@@ -22,6 +22,7 @@ use yserver_core::{
 use super::{
     input::translate::caps_lock_sync,
     link::{ShellEvent, ShellLink},
+    resize::MIN_SCREEN,
     swapchain::SurfaceOutput,
     ui::{CursorImage, ShellUi},
 };
@@ -157,7 +158,7 @@ impl SurfacePlatform {
         RandrLimits {
             rotations: RR_ROTATE_0,
             transforms: false,
-            min_size: (320, 200),
+            min_size: MIN_SCREEN,
             max_size: (self.max_screen, self.max_screen),
         }
     }
@@ -668,7 +669,16 @@ impl XBackend<SurfacePlatform> {
                     width,
                     height,
                     request,
-                } => self.window_resized(state, (width, height), request),
+                } => {
+                    // The shell resized the drawable before posting: rebuild
+                    // every swapchain even when the output keeps its size.
+                    for output in &mut self.platform.outputs {
+                        output.note_out_of_date();
+                    }
+                    self.window_resized(state, (width, height), request);
+                    self.scene.invalidate_all_scanout_damage();
+                    self.scene.wake_for_damage();
+                }
             }
         }
     }

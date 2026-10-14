@@ -4,7 +4,7 @@
 
 use std::{
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     thread,
@@ -30,6 +30,8 @@ pub(crate) struct FrameClock {
     /// Nominal refresh in millihertz; 0 = unknown.
     refresh_mhz: AtomicU32,
     link: Arc<ShellLink>,
+    /// The shell's per-tick work, on the tick source's thread.
+    tick_hook: OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl FrameClock {
@@ -40,6 +42,7 @@ impl FrameClock {
             target_msc: AtomicU64::new(NO_TARGET),
             refresh_mhz: AtomicU32::new(0),
             link,
+            tick_hook: OnceLock::new(),
         }
     }
 
@@ -68,7 +71,16 @@ impl FrameClock {
         if wake {
             self.link.wake();
         }
+        if let Some(hook) = self.tick_hook.get() {
+            hook();
+        }
         wake
+    }
+
+    /// Run `hook` on every tick; only the first hook set is kept.
+    #[cfg_attr(all(kms, not(test)), allow(dead_code))] // A window shell's.
+    pub(crate) fn set_tick_hook(&self, hook: impl Fn() + Send + Sync + 'static) {
+        let _ = self.tick_hook.set(Box::new(hook));
     }
 
     /// `(msc, ust_us)` of the latest tick.
@@ -231,6 +243,20 @@ mod tests {
         let stopped = clock.sample().0;
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert_eq!(clock.sample().0, stopped, "dropping the ticker stops it");
+    }
+
+    #[test]
+    fn the_tick_hook_runs_on_every_tick() {
+        let (clock, _link, rx) = clock();
+        let ticks = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counted = Arc::clone(&ticks);
+        clock.set_tick_hook(move || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        clock.tick(1);
+        clock.tick(2);
+        assert_eq!(ticks.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(wakes(&rx), 0, "the hook does not wake the core");
     }
 
     #[test]

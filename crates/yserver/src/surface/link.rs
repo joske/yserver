@@ -22,7 +22,7 @@ pub(crate) enum ShellEvent {
     /// The window's content is now `width`x`height` X pixels: a user
     /// resize (`request` none), or the completion of the core's
     /// `ShellUi::set_content_size` with that token.
-    #[cfg_attr(not(test), allow(dead_code))] // Posted by the macOS window (M3 task 2).
+    #[cfg_attr(all(kms, not(test)), allow(dead_code))] // Posted by a window shell.
     Resized {
         width: u16,
         height: u16,

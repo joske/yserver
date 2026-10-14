@@ -160,6 +160,15 @@ define_class!(
         }
 
         // SAFETY: the signature matches the protocol method.
+        #[unsafe(method(windowDidResize:))]
+        fn did_resize(&self, _notification: &NSNotification) {
+            // The view's `setFrameSize:` reports it too; repeats are dropped.
+            if let Some(view) = self.ivars().window.get().and_then(|w| w.contentView()) {
+                super::resize::view_resized(&view);
+            }
+        }
+
+        // SAFETY: the signature matches the protocol method.
         #[unsafe(method(windowDidBecomeKey:))]
         fn did_become_key(&self, _notification: &NSNotification) {
             if let Some(input) = self.ivars().input.get() {
@@ -212,15 +221,26 @@ impl YserverAppDelegate {
             None => log::error!("macos: no key monitor; keys reach AppKit, not X"),
         }
         let _ = ivars.input.set(Rc::clone(&input));
-        let (window, layer) = super::window::create(mtm, size, input);
+        let (window, layer) = super::window::create(mtm, size, Rc::clone(&input));
         let surface = super::window::metal_surface(&layer);
+        let clock = Arc::new(FrameClock::new(Arc::clone(&ivars.link)));
+        if let Some(view) = window.contentView() {
+            super::resize::install(
+                &view,
+                size,
+                Arc::clone(&ivars.link),
+                Arc::clone(&ivars.resize_request),
+                layer.clone(),
+                input,
+                &clock,
+            );
+        }
         let _ = ivars.layer.set(layer);
         window.setDelegate(Some(ProtocolObject::from_ref(self)));
         let window = ivars.window.get_or_init(|| window);
         window.makeKeyAndOrderFront(None);
         NSApplication::sharedApplication(mtm).activate();
 
-        let clock = Arc::new(FrameClock::new(Arc::clone(&ivars.link)));
         match TickSource::start(&clock) {
             Ok(ticker) => {
                 let _ = ivars.ticker.set(ticker);
@@ -338,13 +358,15 @@ impl ShellUi for MainQueueUi {
             else {
                 return;
             };
-            // Before the resize: its delegate callback reads the token.
+            // Before the resize: the view holds back its own report.
             request.store(token, Ordering::Release);
             let scale = window.backingScaleFactor();
             window.setContentSize(NSSize::new(
                 f64::from(width) / scale,
                 f64::from(height) / scale,
             ));
+            // Synchronous: the window has its final (maybe clamped) size.
+            super::resize::answer_request(&window);
         });
     }
 }

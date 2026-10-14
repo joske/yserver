@@ -8,7 +8,7 @@ use objc2::{
     rc::Retained, runtime::AnyObject,
 };
 use objc2_app_kit::{NSEvent, NSResponder, NSTrackingArea, NSTrackingAreaOptions, NSView};
-use objc2_foundation::{NSObject, NSRect};
+use objc2_foundation::{NSObject, NSRect, NSSize};
 
 use super::input::ShellInput;
 
@@ -107,6 +107,30 @@ define_class!(
         #[unsafe(method(scrollWheel:))]
         fn scroll_wheel(&self, event: &NSEvent) {
             self.ivars().input.scroll(event);
+        }
+
+        // SAFETY: the signature matches `-[NSView setFrameSize:]`.
+        #[unsafe(method(setFrameSize:))]
+        fn set_frame_size(&self, size: NSSize) {
+            // SAFETY: the superclass method of the same signature.
+            let () = unsafe { msg_send![super(self), setFrameSize: size] };
+            super::resize::view_resized(self);
+        }
+
+        // SAFETY: the signature matches `-[NSView viewWillStartLiveResize]`.
+        #[unsafe(method(viewWillStartLiveResize))]
+        fn view_will_start_live_resize(&self) {
+            // SAFETY: the superclass method of the same signature.
+            let () = unsafe { msg_send![super(self), viewWillStartLiveResize] };
+            super::resize::live_started();
+        }
+
+        // SAFETY: the signature matches `-[NSView viewDidEndLiveResize]`.
+        #[unsafe(method(viewDidEndLiveResize))]
+        fn view_did_end_live_resize(&self) {
+            // SAFETY: the superclass method of the same signature.
+            let () = unsafe { msg_send![super(self), viewDidEndLiveResize] };
+            super::resize::live_ended();
         }
     }
 );

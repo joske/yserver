@@ -9,12 +9,15 @@ use objc2_app_kit::{
     NSBackingStoreType, NSColor, NSResponder, NSScreen, NSView, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
-use objc2_quartz_core::{CALayer, CAMetalLayer};
+use objc2_quartz_core::{CALayer, CAMetalLayer, kCAGravityTopLeft};
 
 use super::{input::ShellInput, view::YserverView};
-use crate::surface::swapchain::NativeSurface;
+use crate::surface::{
+    resize::{MIN_SCREEN, to_px},
+    swapchain::NativeSurface,
+};
 
-/// A titled, closable, minimisable window of `size` X pixels, i.e.
+/// A titled, closable, minimisable, resizable window of `size` X pixels, i.e.
 /// `size / backingScaleFactor` points, whose content is a `CAMetalLayer`
 /// and whose view feeds `input`.
 pub(super) fn create(
@@ -43,11 +46,18 @@ pub(super) fn create(
     unsafe { window.setReleasedWhenClosed(false) };
     window.setTitle(&NSString::from_str("yserver"));
     window.setBackgroundColor(Some(&*NSColor::blackColor()));
+    window.setContentMinSize(NSSize::new(
+        f64::from(MIN_SCREEN.0) / scale,
+        f64::from(MIN_SCREEN.1) / scale,
+    ));
 
     let layer = CAMetalLayer::new();
     layer.setContentsScale(scale);
     layer.setDrawableSize(NSSize::new(width, height));
     layer.setOpaque(true);
+    // A drawable not yet at the new window size stays unstretched.
+    // SAFETY: an immutable CoreAnimation constant.
+    layer.setContentsGravity(unsafe { kCAGravityTopLeft });
     let view = YserverView::new(mtm, frame, input);
     // A layer set before `wantsLayer` makes the view layer-hosting.
     let host: &CALayer = &layer;
@@ -65,7 +75,10 @@ pub(super) fn create(
 
 /// The window's style.
 fn style() -> NSWindowStyleMask {
-    NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::Miniaturizable
+    NSWindowStyleMask::Titled
+        | NSWindowStyleMask::Closable
+        | NSWindowStyleMask::Miniaturizable
+        | NSWindowStyleMask::Resizable
 }
 
 /// The largest content the main screen shows without clamping the window,
@@ -78,12 +91,6 @@ pub(super) fn max_content_size(mtm: MainThreadMarker) -> Option<(u16, u16)> {
         to_px(content.size.width, scale),
         to_px(content.size.height, scale),
     ))
-}
-
-/// `points` in whole pixels at `scale`, within `1..=u16::MAX`.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Clamped and floored.
-fn to_px(points: f64, scale: f64) -> u16 {
-    (points * scale).floor().clamp(1.0, f64::from(u16::MAX)) as u16
 }
 
 /// The layer's address for `vkCreateMetalSurfaceEXT` on the core thread.

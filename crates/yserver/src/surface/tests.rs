@@ -1614,6 +1614,27 @@ fn a_user_window_resize_moves_root_and_output() {
     w.frame();
 }
 
+/// The shell resizes the drawable before posting, so every resize event
+/// rebuilds the swapchain, even one that leaves the output alone.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn every_window_resize_event_rebuilds_the_swapchain() {
+    let Some(mut w) = window_or_skip() else {
+        return;
+    };
+    w.frame();
+    let old = w.f.b.platform.outputs[0].swapchain_handle();
+    let output = w.f.b.platform.output_size;
+    let got = w.host_resize(output, None);
+    assert!(got.events.is_empty(), "the output keeps its size");
+    w.frame();
+    assert_ne!(
+        w.f.b.platform.outputs[0].swapchain_handle(),
+        old,
+        "a new swapchain"
+    );
+}
+
 /// After `--fb 400x300` over the 64x48 output, a user resize to 400x300
 /// moves the output only: the screen already has the size (codex round 2).
 #[test]
