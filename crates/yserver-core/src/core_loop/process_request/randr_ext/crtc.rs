@@ -71,7 +71,7 @@ pub(super) fn handle_randr_get_crtc_info(
             height: crtc_data.height,
             mode: crtc_data.mode_id,
             rotation: state.randr.crtc_rotation(req.crtc),
-            rotations: crate::randr::SUPPORTED_ROTATIONS,
+            rotations: state.randr.limits.rotations,
             outputs: &crtc_data.outputs,
             possible: &crtc_data.possible_outputs,
         },
@@ -92,9 +92,7 @@ pub(super) fn handle_randr_set_crtc_transform(
     minor: u8,
 ) -> io::Result<RequestOutcome> {
     // ProcRRSetCrtcTransform (rrcrtc.c:1755-1785) + RRCrtcTransformSet
-    // (rrcrtc.c:1091-1128), then the spec's D2 contract. Every yserver
-    // CRTC supports transforms, so Xorg's `!crtc->transforms`
-    // BadValue has no counterpart.
+    // (rrcrtc.c:1091-1128), then the spec's D2 contract.
     let error = |state: &mut ServerState, code: u8, value: u32| {
         emit_x11_error_with_minor(
             state,
@@ -121,6 +119,10 @@ pub(super) fn handle_randr_set_crtc_transform(
     let Some(spec) = req.filter else {
         return error(state, x11::error::BAD_LENGTH, 0);
     };
+    // `!crtc->transforms` (rrcrtc.c:1088).
+    if !state.randr.limits.transforms {
+        return error(state, x11::error::BAD_VALUE, 0);
+    }
     let filter = if spec.name.is_empty() {
         if !spec.params.is_empty() {
             return error(state, x11::error::BAD_MATCH, 0);
@@ -204,7 +206,7 @@ pub(super) fn handle_randr_get_crtc_transform(
     let buf = x11randr::encode_get_crtc_transform_reply(
         byte_order,
         sequence,
-        true,
+        state.randr.limits.transforms,
         part(&output.pending_transform),
         part(&output.current_transform),
     );
@@ -565,7 +567,7 @@ pub(super) fn handle_randr_set_crtc_config(
                 RANDR_MAJOR_OPCODE,
             );
         }
-        if !crate::randr::SUPPORTED_ROTATIONS & rotation != 0 {
+        if !state.randr.limits.rotations & rotation != 0 {
             // `(~crtc->rotations) & rotation` (rrcrtc.c:1403).
             return emit_x11_error_with_minor(
                 state,
@@ -577,9 +579,33 @@ pub(super) fn handle_randr_set_crtc_config(
                 RANDR_MAJOR_OPCODE,
             );
         }
-        // No screen-bounds check: Xorg skips it for a CRTC with
-        // transform support (rrcrtc.c:1436), and every yserver CRTC
-        // has it; a screen may crop a CRTC.
+        // The screen bounds bind only a CRTC without transform support
+        // (rrcrtc.c:1420-1457); with it, a screen may crop a CRTC.
+        if let Some(m) = resolved
+            && !state.randr.limits.transforms
+        {
+            let (width, height) = if crate::randr::rotation_swaps_axes(rotation) {
+                (m.height, m.width)
+            } else {
+                (m.width, m.height)
+            };
+            for (origin, size, screen) in [
+                (x, width, state.randr.screen_width),
+                (y, height, state.randr.screen_height),
+            ] {
+                if i32::from(origin) + i32::from(size) > i32::from(screen) {
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        x11::error::BAD_VALUE,
+                        i32::from(origin).cast_unsigned(),
+                        u16::from(header.data),
+                        RANDR_MAJOR_OPCODE,
+                    );
+                }
+            }
+        }
     }
 
     // Resolve connector name from crtc_id (validated above →

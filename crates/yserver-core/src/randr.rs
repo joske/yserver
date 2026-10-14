@@ -312,6 +312,38 @@ fn screen_extent(edges: impl Iterator<Item = i32>) -> u16 {
         .unwrap_or(0)
 }
 
+/// What every CRTC can do and the screen sizes `RRSetScreenSize` takes; the
+/// backend's, kept across `RandrState` rebuilds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RandrLimits {
+    /// `crtc->rotations`: the rotation and reflection bits a CRTC takes.
+    pub rotations: u16,
+    /// `crtc->transforms`: whether a CRTC takes a transform.
+    pub transforms: bool,
+    /// `RRGetScreenSizeRange` minimum.
+    pub min_size: (u16, u16),
+    /// `RRGetScreenSizeRange` maximum.
+    pub max_size: (u16, u16),
+}
+
+impl Default for RandrLimits {
+    /// Permissive static bounds matching Xorg/Xwayland convention.
+    ///
+    /// The lower bound matters: Xorg advertises 320x200, while a 1x1
+    /// minimum makes MATE's monitor-config path attempt a transient
+    /// `RRSetScreenSize(1x1, 0mm x 0mm)` after disabling all CRTCs.
+    /// That request is invalid and aborts the reconfigure, leaving the
+    /// desktop black with all scanout disabled.
+    fn default() -> Self {
+        Self {
+            rotations: SUPPORTED_ROTATIONS,
+            transforms: true,
+            min_size: (320, 200),
+            max_size: (16384, 16384),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct RandrState {
     pub timestamp: u32,
@@ -337,6 +369,8 @@ pub struct RandrState {
     /// Derived from screen dimensions at 96 DPI, clamped to at least 1 mm.
     pub width_mm: u32,
     pub height_mm: u32,
+    /// The backend's CRTC capabilities and screen size range.
+    pub limits: RandrLimits,
 }
 
 impl RandrState {
@@ -459,6 +493,7 @@ impl RandrState {
             screen_height,
             width_mm,
             height_mm,
+            limits: RandrLimits::default(),
         }
     }
 
@@ -616,22 +651,18 @@ impl RandrState {
     }
 
     /// Returns `(min_width, min_height, max_width, max_height)`.
-    ///
-    /// Permissive static bounds matching Xorg/Xwayland convention.
-    ///
-    /// The lower bound matters: Xorg advertises 320x200, while a 1x1
-    /// minimum makes MATE's monitor-config path attempt a transient
-    /// `RRSetScreenSize(1x1, 0mm x 0mm)` after disabling all CRTCs.
-    /// That request is invalid and aborts the reconfigure, leaving the
-    /// desktop black with all scanout disabled.
     #[must_use]
     pub fn screen_size_range(&self) -> (u16, u16, u16, u16) {
-        (320, 200, 16384, 16384)
+        let RandrLimits {
+            min_size, max_size, ..
+        } = self.limits;
+        (min_size.0, min_size.1, max_size.0, max_size.1)
     }
 
     /// Resize the (single) ynest output. Multi-output reconfigure is
     /// not supported here.
     pub fn resize(&mut self, timestamp: u32, width: u16, height: u16) {
+        let limits = self.limits;
         if let Some(out) = self.outputs.first().cloned() {
             let new_out = RandrOutput {
                 width,
@@ -642,6 +673,7 @@ impl RandrState {
         } else {
             *self = Self::nested(timestamp, width, height);
         }
+        self.limits = limits;
     }
 
     /// Would shrinking the logical screen to `w`×`h` crop any enabled

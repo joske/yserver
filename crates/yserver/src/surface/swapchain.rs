@@ -505,30 +505,38 @@ impl SurfaceOutput {
         Ok(())
     }
 
-    /// The X screen is now `extent`: reallocate the slots at it, dropping
-    /// their frames (the next compose repaints in full), and rebuild the
-    /// swapchain before the next present.
+    /// Slots of `extent` for [`Self::install_slots`]: the fallible half of
+    /// an output resize. Dropping them frees them.
     ///
     /// # Errors
     ///
-    /// The queue could not idle or a slot could not be allocated; the old
-    /// slots are then kept.
-    pub(crate) fn resize(&mut self, extent: vk::Extent2D) -> Result<(), vk::Result> {
-        if extent == self.extent {
-            return Ok(());
+    /// A slot could not be allocated.
+    pub(crate) fn prepare_slots(
+        &self,
+        extent: vk::Extent2D,
+    ) -> Result<Vec<OffscreenTarget>, vk::Result> {
+        if crate::kms::render::resize_fault(crate::kms::render::ResizeFault::Alloc) {
+            return Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY);
         }
+        (0..SLOT_COUNT)
+            .map(|_| OffscreenTarget::new(Arc::clone(&self.vk), extent))
+            .collect()
+    }
+
+    /// The output is now `extent`: replace the slots with `targets`,
+    /// dropping their frames (the next compose repaints in full), and
+    /// rebuild the swapchain before the next present. The caller drained
+    /// the scene.
+    pub(crate) fn install_slots(&mut self, targets: Vec<OffscreenTarget>, extent: vk::Extent2D) {
         // No compose or copy may still use the old slots.
-        unsafe { self.vk.device.queue_wait_idle(self.vk.graphics_queue) }?;
-        let mut targets = Vec::with_capacity(SLOT_COUNT);
-        for _ in 0..SLOT_COUNT {
-            targets.push(OffscreenTarget::new(Arc::clone(&self.vk), extent)?);
+        if let Err(e) = unsafe { self.vk.device.queue_wait_idle(self.vk.graphics_queue) } {
+            log::error!("surface: queue idle before a slot swap failed: {e:?}");
         }
         self.targets = targets;
         self.extent = extent;
         self.slots = SlotRing::new(SLOT_COUNT);
         self.pending_sync = None;
         self.needs_recreate = true;
-        Ok(())
     }
 
     /// The swapchain no longer matches the surface: rebuild it before the

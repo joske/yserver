@@ -377,6 +377,10 @@ impl<P: Platform> Backend for XBackend<P> {
         P::output_identity(self, output_id)
     }
 
+    fn randr_limits(&self) -> yserver_core::randr::RandrLimits {
+        P::randr_limits(self)
+    }
+
     fn set_logical_screen_size(&mut self, w: u16, h: u16) -> io::Result<()> {
         P::set_logical_screen_size(self, w, h)
     }

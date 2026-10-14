@@ -108,6 +108,7 @@ pub struct BackendTopology {
     pub modes: Vec<crate::randr::RandrMode>,
     pub providers: Vec<crate::randr::RandrProvider>,
     pub capabilities: BackendCapabilities,
+    pub limits: crate::randr::RandrLimits,
 }
 
 impl BackendTopology {
@@ -122,6 +123,7 @@ impl BackendTopology {
         let (outputs, modes) = backend.randr_outputs_and_modes();
         let providers = backend.randr_providers();
         let capabilities = BackendCapabilities::from_backend(backend);
+        let limits = backend.randr_limits();
         Self {
             width,
             height,
@@ -129,6 +131,7 @@ impl BackendTopology {
             modes,
             providers,
             capabilities,
+            limits,
         }
     }
 
@@ -145,6 +148,7 @@ impl BackendTopology {
             self.capabilities,
         );
         state.randr.set_providers(self.providers);
+        state.randr.limits = self.limits;
         state
     }
 }

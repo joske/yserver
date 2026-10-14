@@ -14,7 +14,8 @@ use std::{
 use ash::vk;
 use yserver_core::{
     backend::Backend as _,
-    core_loop::{CoreSender, Message},
+    core_loop::{CoreSender, Message, host_screen_resized, run::emit_randr_change_notifications},
+    randr::{RR_ROTATE_0, RandrLimits},
     server::ServerState,
 };
 
@@ -27,13 +28,14 @@ use super::{
 use crate::kms::{
     core::KmsCore,
     render::{
-        Platform, XBackend,
+        Platform, ResizeFault, XBackend,
         engine::RenderEngine,
         gpu::{FencePool, GpuCore},
+        resize_fault,
         scene::{
             CursorPlaneSink, CursorShowFailure, FinishOutcome, FlipRetirement, FrameTargetError,
-            OutputLayout, OutputRoute, OutputSink, RecordFrame, RenderCompletion, SceneCompositor,
-            SlotToken,
+            OffscreenTarget, OutputLayout, OutputRoute, OutputSink, PreparedOutputs, RecordFrame,
+            RenderCompletion, SceneCompositor, SlotToken,
         },
     },
     vk::{
@@ -43,10 +45,20 @@ use crate::kms::{
     },
 };
 
-/// The surface platform: the GPU, the logical screen size and the surfaces.
+/// The surface platform: the GPU, the root and output sizes and the
+/// surfaces.
 pub(crate) struct SurfacePlatform {
     gpu: GpuCore,
+    /// The root (X screen) size: root and COW storage.
     fb_size: (u16, u16),
+    /// The window output's size (its CRTC mode): the slots and swapchain.
+    /// The root's top-left part of this size is shown.
+    pub(crate) output_size: (u16, u16),
+    /// The largest output the window system shows unclamped: the mode list
+    /// offers only modes that fit.
+    pub(crate) max_output: (u16, u16),
+    /// The largest screen side the GPU takes (`RRGetScreenSizeRange`).
+    max_screen: u16,
     pub(crate) outputs: Vec<SurfaceOutput>,
     cursor: HostCursor,
 }
@@ -86,19 +98,73 @@ pub(crate) struct SurfaceBackendState {
     pub(crate) client_count: Arc<AtomicUsize>,
     /// Host-visible staging for on-screen reads.
     readback: Option<OpsStaging>,
+    /// The token of the window resize last asked of the shell, until the
+    /// shell reports it done.
+    window_request: Option<u64>,
+    next_window_request: u64,
 }
 
 impl SurfacePlatform {
     #[must_use]
     pub(crate) fn new(gpu: GpuCore, fb_size: (u16, u16), outputs: Vec<SurfaceOutput>) -> Self {
+        let max_screen = gpu.vk.as_ref().map_or(MAX_SCREEN_SIDE, |vk| {
+            // SAFETY: a physical device of this instance.
+            let limits = unsafe {
+                vk.instance
+                    .get_physical_device_properties(vk.physical_device)
+                    .limits
+            };
+            u16::try_from(
+                limits
+                    .max_image_dimension2_d
+                    .min(u32::from(MAX_SCREEN_SIDE)),
+            )
+            .unwrap_or(MAX_SCREEN_SIDE)
+        });
         Self {
             gpu,
             fb_size,
+            output_size: fb_size,
+            max_output: (max_screen, max_screen),
+            max_screen,
             outputs,
             cursor: HostCursor::default(),
         }
     }
+
+    /// The largest output the window system shows unclamped; the mode list
+    /// offers only modes that fit it.
+    #[cfg_attr(kms, allow(dead_code))] // Called by `server`, built without KMS.
+    pub(crate) fn set_max_output(&mut self, (width, height): (u16, u16)) {
+        self.max_output = (width.min(self.max_screen), height.min(self.max_screen));
+    }
+
+    /// One layout per surface, each showing the root's top-left `size`.
+    fn layouts_at(&self, (width, height): (u16, u16)) -> Vec<OutputLayout> {
+        self.outputs
+            .iter()
+            .map(|_| OutputLayout {
+                root_rect: (0, 0, u32::from(width), u32::from(height)),
+                mode: (width, height),
+                transform: None,
+            })
+            .collect()
+    }
+
+    /// The RandR limits: a CRTC without rotations or transforms, and
+    /// screens from 320x200 up to the GPU's image limit (at most 8192).
+    pub(crate) fn randr_limits(&self) -> RandrLimits {
+        RandrLimits {
+            rotations: RR_ROTATE_0,
+            transforms: false,
+            min_size: (320, 200),
+            max_size: (self.max_screen, self.max_screen),
+        }
+    }
 }
+
+/// The largest screen side offered, whatever the GPU takes.
+const MAX_SCREEN_SIDE: u16 = 8192;
 
 /// A backend over a surface platform with no surfaces: everything but
 /// presentation works, nothing is shown.
@@ -397,42 +463,191 @@ impl XBackend<SurfacePlatform> {
         self.flush_host_cursor();
     }
 
-    /// Resize the X screen to `w`x`h`: every surface's slots, the scene's
-    /// outputs and the root/COW storage. The caller tells the clients.
+    /// Resize the root to `root` and the output to `output`: every
+    /// fallible step (root/COW storage, slots, scene outputs) first, then
+    /// an infallible swap. The caller tells the clients.
     ///
     /// # Errors
     ///
-    /// A surface's slots could not be reallocated, or the scene could not
-    /// follow; the screen keeps its old size in the first case.
-    pub(crate) fn resize_screen(&mut self, w: u16, h: u16) -> io::Result<()> {
-        let (w, h) = (w.max(1), h.max(1));
-        if (w, h) == self.platform.fb_size {
-            return Ok(());
+    /// A prepare step failed; the old sizes and storage are kept.
+    pub(crate) fn resize_screen(&mut self, root: (u16, u16), output: (u16, u16)) -> io::Result<()> {
+        let root = (root.0.max(1), root.1.max(1));
+        let output = (output.0.max(1), output.1.max(1));
+        let root_prepared = if root == self.platform.fb_size {
+            None
+        } else {
+            Some(self.prepare_root_storage(root.0, root.1)?)
+        };
+        let output_prepared = if output == self.platform.output_size {
+            Ok(None)
+        } else {
+            self.prepare_output(output).map(Some)
+        };
+        let output_prepared = match output_prepared {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                if let Some(prepared) = root_prepared {
+                    self.discard_root_storage(prepared);
+                }
+                return Err(e);
+            }
+        };
+        // Nothing below can fail.
+        if let Some((slots, scene)) = output_prepared {
+            let extent = vk::Extent2D {
+                width: u32::from(output.0),
+                height: u32::from(output.1),
+            };
+            // The scene's in-flight frames retire before their slots go.
+            self.scene.drain_all(&mut self.platform);
+            for (surface, targets) in self.platform.outputs.iter_mut().zip(slots) {
+                surface.install_slots(targets, extent);
+            }
+            self.platform.output_size = output;
+            self.scene.install_outputs(scene);
+            self.scene.invalidate_all_scanout_damage();
+            self.scene.wake_for_damage();
         }
+        if let Some(prepared) = root_prepared {
+            self.platform.fb_size = root;
+            self.commit_root_storage(prepared);
+        }
+        log::info!(
+            "surface: root {}x{}, output {}x{}",
+            root.0,
+            root.1,
+            output.0,
+            output.1
+        );
+        Ok(())
+    }
+
+    /// New slots for every surface and the scene's output state at
+    /// `size`, nothing installed.
+    fn prepare_output(
+        &mut self,
+        size: (u16, u16),
+    ) -> io::Result<(Vec<Vec<OffscreenTarget>>, PreparedOutputs)> {
+        let (w, h) = size;
         let extent = vk::Extent2D {
             width: u32::from(w),
             height: u32::from(h),
         };
-        let prepared = self.prepare_root_storage(w, h)?;
-        // The scene's in-flight frames retire before their slots go.
-        self.scene.drain_all(&mut self.platform);
-        for output in &mut self.platform.outputs {
-            if let Err(e) = output.resize(extent) {
-                self.discard_root_storage(prepared);
-                return Err(io::Error::other(format!("surface slots at {w}x{h}: {e:?}")));
-            }
+        let slots = self
+            .platform
+            .outputs
+            .iter()
+            .map(|output| output.prepare_slots(extent))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| io::Error::other(format!("surface slots at {w}x{h}: {e:?}")))?;
+        if resize_fault(ResizeFault::Outputs) {
+            return Err(io::Error::other("injected scene output failure"));
         }
-        self.platform.fb_size = (w, h);
-        self.scene
-            .rebuild_outputs(&self.platform, &self.platform.output_layouts())
+        let scene = self
+            .scene
+            .prepare_outputs(&self.platform, &self.platform.layouts_at(size))
             .map_err(|e| io::Error::other(format!("surface scene at {w}x{h}: {e:?}")))?;
-        self.commit_root_storage(prepared);
-        log::info!("surface: screen resized to {w}x{h}");
-        Ok(())
+        Ok((slots, scene))
+    }
+
+    /// `RRSetCrtcConfig` on the window output: only a mode at (0,0) inside
+    /// the root. The output takes the mode and the shell is asked to size
+    /// the window to it. Anything else fails the request with
+    /// `RRSetConfigFailed`, as from a DDX whose `crtcSet` refuses
+    /// (rrcrtc.c:1462-1465).
+    fn apply_window_crtc_config(
+        &mut self,
+        mode: Option<yserver_core::backend::ModeSpec>,
+        x: i32,
+        y: i32,
+    ) -> io::Result<bool> {
+        let Some(mode) = mode else {
+            return Err(io::Error::other("the window output cannot be disabled"));
+        };
+        if (x, y) != (0, 0) {
+            return Err(io::Error::other("the window output sits at 0,0"));
+        }
+        let size = (mode.width, mode.height);
+        if size == self.platform.output_size {
+            return Ok(false);
+        }
+        let root = self.platform.fb_size;
+        if size.0 > root.0 || size.1 > root.1 {
+            return Err(io::Error::other("the mode does not fit the screen"));
+        }
+        self.resize_screen(root, size)?;
+        self.request_window_size(size);
+        Ok(true)
+    }
+
+    /// Ask the shell to size the window to `size` X pixels, under a fresh
+    /// token its resize event echoes.
+    fn request_window_size(&mut self, size: (u16, u16)) {
+        let Some(ui) = self.pstate.ui.as_ref() else {
+            return;
+        };
+        self.pstate.next_window_request += 1;
+        let token = self.pstate.next_window_request;
+        self.pstate.window_request = Some(token);
+        ui.set_content_size(size.0, size.1, token);
+    }
+
+    /// The window's content became `size` X pixels. The user's resize
+    /// (`request` none) takes the root and the output to it; the
+    /// completion of our request `token` moves only the output, within the
+    /// root. A host resize cannot be refused: a failure keeps the old sizes
+    /// and the window shows them cropped or cleared.
+    fn window_resized(&mut self, state: &mut ServerState, size: (u16, u16), request: Option<u64>) {
+        if size.0 == 0 || size.1 == 0 {
+            return;
+        }
+        let max = self.platform.max_screen;
+        let size = (size.0.min(max), size.1.min(max));
+        let Some(token) = request else {
+            if size == self.platform.output_size {
+                return;
+            }
+            if let Err(e) = self.resize_screen(size, size) {
+                log::warn!(
+                    "surface: root {:?} and output {:?} kept under a {size:?} window: {e}",
+                    self.platform.fb_size,
+                    self.platform.output_size,
+                );
+                return;
+            }
+            host_screen_resized(state, self, size.0, size.1);
+            return;
+        };
+        if self.pstate.window_request != Some(token) {
+            return;
+        }
+        self.pstate.window_request = None;
+        let root = self.platform.fb_size;
+        let size = (size.0.min(root.0), size.1.min(root.1));
+        if size == self.platform.output_size {
+            return;
+        }
+        if let Err(e) = self.resize_screen(root, size) {
+            log::warn!(
+                "surface: output {:?} kept in a {size:?} window: {e}",
+                self.platform.output_size,
+            );
+            return;
+        }
+        let now = state.timestamp_now();
+        self.surface_refresh_randr(state, now);
+        let changed: Vec<(u32, u32, u32)> = state
+            .randr
+            .outputs
+            .first()
+            .map(|o| (o.output_id, o.crtc_id, o.mode_id))
+            .into_iter()
+            .collect();
+        emit_randr_change_notifications(state, &changed);
     }
 
     /// Apply the shell's events.
-    fn apply_shell_events(&mut self, events: Vec<ShellEvent>) {
+    fn apply_shell_events(&mut self, state: &mut ServerState, events: Vec<ShellEvent>) {
         for event in events {
             match event {
                 ShellEvent::Visible(visible) => {
@@ -449,6 +664,11 @@ impl XBackend<SurfacePlatform> {
                     }
                 }
                 ShellEvent::LockState { caps } => self.sync_caps_lock(caps),
+                ShellEvent::Resized {
+                    width,
+                    height,
+                    request,
+                } => self.window_resized(state, (width, height), request),
             }
         }
     }
@@ -579,15 +799,7 @@ impl Platform for SurfacePlatform {
     }
 
     fn output_layouts(&self) -> Vec<OutputLayout> {
-        let (width, height) = self.fb_size;
-        self.outputs
-            .iter()
-            .map(|_| OutputLayout {
-                root_rect: (0, 0, u32::from(width), u32::from(height)),
-                mode: (width, height),
-                transform: None,
-            })
-            .collect()
+        self.layouts_at(self.output_size)
     }
 
     fn set_input_sender(b: &mut XBackend<Self>, sender: CoreSender) {
@@ -624,10 +836,10 @@ impl Platform for SurfacePlatform {
             .min()
     }
 
-    fn on_platform_event(b: &mut XBackend<Self>, _state: &mut ServerState) {
+    fn on_platform_event(b: &mut XBackend<Self>, state: &mut ServerState) {
         if let Some(link) = b.pstate.link.as_ref() {
             let events = link.drain();
-            b.apply_shell_events(events);
+            b.apply_shell_events(state, events);
         }
         b.service_surfaces();
     }
@@ -721,8 +933,34 @@ impl Platform for SurfacePlatform {
     ) {
     }
 
+    /// `RRSetScreenSize` resizes the root only; the output keeps its mode
+    /// (the core refuses a size that would crop it).
     fn set_logical_screen_size(b: &mut XBackend<Self>, w: u16, h: u16) -> io::Result<()> {
-        b.resize_screen(w, h)
+        let output = b.platform.output_size;
+        b.resize_screen((w, h), output)
+    }
+
+    fn apply_crtc_config(
+        b: &mut XBackend<Self>,
+        _output_id: u32,
+        _connector: &str,
+        mode: Option<yserver_core::backend::ModeSpec>,
+        x: i32,
+        y: i32,
+    ) -> io::Result<bool> {
+        b.apply_window_crtc_config(mode, x, y)
+    }
+
+    fn refresh_randr_state_set_time(
+        b: &mut XBackend<Self>,
+        state: &mut ServerState,
+        set_time: u32,
+    ) {
+        b.surface_refresh_randr(state, set_time);
+    }
+
+    fn randr_limits(b: &XBackend<Self>) -> RandrLimits {
+        b.platform.randr_limits()
     }
 
     fn host_pointer_warped(b: &mut XBackend<Self>, x: i32, y: i32) {

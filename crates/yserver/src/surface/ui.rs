@@ -37,6 +37,9 @@ pub(crate) trait ShellUi: Send + Sync {
     fn set_cursor(&self, cursor: Option<CursorImage>);
     /// Move the host pointer to X pixel `(x, y)` of the window.
     fn warp_pointer(&self, x: i32, y: i32);
+    /// Size the window's content to `width`x`height` X pixels; the resize
+    /// event that follows carries `token` (`ShellEvent::Resized`).
+    fn set_content_size(&self, width: u16, height: u16, token: u64);
 }
 
 #[cfg(test)]

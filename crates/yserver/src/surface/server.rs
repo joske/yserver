@@ -39,6 +39,8 @@ pub(crate) struct WindowSpec {
     pub(crate) link: Arc<ShellLink>,
     pub(crate) ui: Arc<dyn ShellUi>,
     pub(crate) clients: Arc<AtomicUsize>,
+    /// The largest window content the screen shows unclamped, in X pixels.
+    pub(crate) max_output: Option<(u16, u16)>,
 }
 
 /// Run the headless server, or refuse without `--headless`.
@@ -83,6 +85,7 @@ pub(crate) fn run_windowed(opts: launch::LaunchOptions, spec: WindowSpec) -> io:
         link,
         ui,
         clients,
+        max_output,
     } = spec;
     let result = serve(
         &opts,
@@ -98,6 +101,9 @@ pub(crate) fn run_windowed(opts: launch::LaunchOptions, spec: WindowSpec) -> io:
             backend.pstate.link = Some(Arc::clone(&link));
             backend.pstate.ui = Some(Arc::clone(&ui));
             backend.pstate.client_count = clients;
+            if let Some(max_output) = max_output {
+                backend.platform.set_max_output(max_output);
+            }
             Ok(backend)
         },
         Some(&link),

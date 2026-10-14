@@ -634,6 +634,10 @@ pub trait Backend {
     /// The live RandR provider set (`RRGetProviders`). Empty for
     /// backends that expose no provider topology.
     fn randr_providers(&mut self) -> Vec<crate::randr::RandrProvider>;
+    /// What the CRTCs can do and the screen size range.
+    fn randr_limits(&self) -> crate::randr::RandrLimits {
+        crate::randr::RandrLimits::default()
+    }
     fn render_opcode(&self) -> Option<u8>;
     fn xkb_opcode(&self) -> Option<u8>;
     fn xkb_info(&self) -> Option<(u8, u8, u8)>;
@@ -828,7 +832,8 @@ pub trait Backend {
     /// `lastSetTime` to the client's request timestamp (0/CurrentTime
     /// already resolved to `now` by the caller). A CRTC set bumps
     /// `lastSetTime` but NOT `lastConfigTime` (the available config did
-    /// not change). Default no-op for nested/recording backends.
+    /// not change). Also after a host resize (`host_screen_resized`), with
+    /// the resize's timestamp. Default no-op for nested/recording backends.
     fn refresh_randr_state_set_time(&mut self, _state: &mut ServerState, _set_time: u32) {}
 
     /// The RANDR layout changed (a CRTC set, a screen resize or a server

@@ -3541,24 +3541,38 @@ pub(crate) fn handle_host_container_resize(
 }
 
 /// The host resized the window that shows the screen: the single output
-/// and the screen become `width`x`height`, and clients hear of it (root and
-/// COW ConfigureNotify, ScreenChange/CrtcChange/OutputChange notifies). The
-/// backend has already resized its storage. Zero or unchanged sizes are
-/// ignored.
+/// and the screen become `width`x`height`, and clients hear of what
+/// changed: root and COW ConfigureNotify only for a new screen size,
+/// Crtc/OutputChangeNotify only for a new output mode, ScreenChangeNotify
+/// for either (Xorg `TellChanged`). The backend has already resized its
+/// storage and re-derives its RandR outputs through
+/// `refresh_randr_state_set_time`. Zero or unchanged sizes are ignored.
 pub fn host_screen_resized(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     width: u16,
     height: u16,
 ) {
-    if width == 0
-        || height == 0
-        || (state.randr.screen_width == width && state.randr.screen_height == height)
-    {
+    if width == 0 || height == 0 {
         return;
     }
+    let screen_changed = (state.randr.screen_width, state.randr.screen_height) != (width, height);
+    let output_changed = state
+        .randr
+        .outputs
+        .first()
+        .is_some_and(|o| (o.width, o.height) != (width, height));
+    if !screen_changed && !output_changed {
+        return;
+    }
+    let mm = (state.randr.width_mm, state.randr.height_mm);
     let timestamp = state.timestamp_now();
     state.randr.resize(timestamp, width, height);
+    if !screen_changed {
+        // A client's RRSetScreenSize millimetres stay with its size.
+        (state.randr.width_mm, state.randr.height_mm) = mm;
+    }
+    backend.refresh_randr_state_set_time(state, timestamp);
 
     // The single output follows the host window, so its CRTC geometry
     // genuinely changes — pass it as changed so CrtcChangeNotify fires.
@@ -3566,10 +3580,15 @@ pub fn host_screen_resized(
         .randr
         .outputs
         .first()
+        .filter(|_| output_changed)
         .map(|o| (o.output_id, o.crtc_id, o.mode_id))
         .into_iter()
         .collect();
-    apply_screen_size_side_effects(state, backend, width, height, &changed);
+    if screen_changed {
+        apply_screen_size_side_effects(state, backend, width, height, &changed);
+    } else {
+        emit_randr_change_notifications(state, &changed);
+    }
 }
 
 /// Tell RANDR subscribers the layout changed without the screen resizing.

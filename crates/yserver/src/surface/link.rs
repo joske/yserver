@@ -19,6 +19,15 @@ pub(crate) enum ShellEvent {
     Visible(bool),
     /// The window became key; `caps` is the window system's Caps Lock.
     LockState { caps: bool },
+    /// The window's content is now `width`x`height` X pixels: a user
+    /// resize (`request` none), or the completion of the core's
+    /// `ShellUi::set_content_size` with that token.
+    #[cfg_attr(not(test), allow(dead_code))] // Posted by the macOS window (M3 task 2).
+    Resized {
+        width: u16,
+        height: u16,
+        request: Option<u64>,
+    },
 }
 
 /// The shell's side of the core channel; shared by every shell thread.

@@ -27,10 +27,12 @@ pub(crate) mod probe_executor;
 
 #[cfg(kms)]
 pub use backend::KmsBackend;
+#[cfg(test)]
+pub(crate) use backend::seam::inject_resize_fault;
 #[cfg(any(not(kms), test))]
 pub(crate) use backend::{
     XBackend,
-    seam::{Platform, single_output_randr},
+    seam::{Platform, ResizeFault, resize_fault},
 };
 pub use yserver_render::kms::render::cpu_types;
 pub(crate) use yserver_render::kms::render::{

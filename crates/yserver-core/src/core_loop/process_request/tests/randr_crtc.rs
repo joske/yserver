@@ -2819,3 +2819,64 @@ fn screen_set_size_notifies_only_on_change() {
         "restored"
     );
 }
+
+/// A backend whose CRTCs take neither rotations nor transforms (the
+/// surface's window): Xorg's answers for a CRTC left at `RRCrtcCreate`'s
+/// defaults, `rotations = RR_Rotate_0` and `transforms = FALSE`
+/// (rrcrtc.c:84, calloc).
+#[test]
+fn randr_fixed_crtc_refuses_rotation_transform_and_overhang_as_xorg() {
+    use crate::randr::{RR_REFLECT_X, RR_ROTATE_0, RR_ROTATE_90, RandrLimits};
+    use yserver_protocol::x11::error::{BAD_MATCH, BAD_VALUE};
+    let mut state = ServerState::new();
+    state.randr.limits = RandrLimits {
+        rotations: RR_ROTATE_0,
+        transforms: false,
+        min_size: (320, 200),
+        max_size: (8192, 8192),
+    };
+    let output = state.randr.outputs[0].clone();
+    let (crtc, mode) = (output.crtc_id, output.mode_id);
+    let mut peer = install_client(&mut state, 1);
+    let mut backend = RecordingBackend::new();
+    let u16_at = |c: &[u8], o: usize| u16::from_le_bytes(c[o..o + 2].try_into().unwrap());
+    let u32_at = |c: &[u8], o: usize| u32::from_le_bytes(c[o..o + 4].try_into().unwrap());
+    // `(error code, error value)` of the one error SetCrtcConfig raised.
+    let mut set = |state: &mut ServerState, x: i16, y: i16, rotation: u16| {
+        let mut body = randr_crtc_config_body(crtc, x, y, mode, &[output.output_id]);
+        body[20..22].copy_from_slice(&rotation.to_le_bytes());
+        randr_set_crtc_config(state, &mut backend, &body).unwrap();
+        let wire = read_all_available(&mut peer);
+        let error = wire.chunks_exact(32).find(|c| c[0] == 0);
+        error.map(|c| (c[1], u32_at(c, 4)))
+    };
+
+    // `(~crtc->rotations) & rotation` (rrcrtc.c:1403-1410).
+    assert_eq!(
+        set(&mut state, 0, 0, RR_ROTATE_90),
+        Some((BAD_MATCH, u32::from(RR_ROTATE_90)))
+    );
+    assert_eq!(
+        set(&mut state, 0, 0, RR_ROTATE_0 | RR_REFLECT_X),
+        Some((BAD_MATCH, u32::from(RR_ROTATE_0 | RR_REFLECT_X)))
+    );
+    // The screen bounds of a CRTC without transforms (rrcrtc.c:1446-1457):
+    // BadValue carrying x, then y.
+    assert_eq!(set(&mut state, 8, 0, RR_ROTATE_0), Some((BAD_VALUE, 8)));
+    assert_eq!(set(&mut state, 0, -1, RR_ROTATE_0), None, "fits: no error");
+    assert_eq!(set(&mut state, 0, 4, RR_ROTATE_0), Some((BAD_VALUE, 4)));
+    state.randr.screen_width = output.width - 1;
+    assert_eq!(set(&mut state, 0, 0, RR_ROTATE_0), Some((BAD_VALUE, 0)));
+
+    // GetCrtcInfo `rotations` and GetCrtcTransform `hasTransforms`.
+    let reply = randr_get_crtc_info(&mut state, &mut peer, crtc);
+    assert_eq!(u16_at(&reply, 26), RR_ROTATE_0);
+    let reply = randr_get_crtc_transform(&mut state, &mut peer, crtc);
+    assert_eq!(reply[44], 0, "hasTransforms");
+    // RRCrtcTransformSet: `!crtc->transforms` is BadValue (rrcrtc.c:1088).
+    let body = randr_transform_body(crtc, rr_scale(131_072), b"");
+    assert_eq!(
+        randr_set_crtc_transform(&mut state, &mut peer, &body),
+        Some(BAD_VALUE)
+    );
+}

@@ -1550,6 +1550,49 @@ mod tests {
             assert_eq!(height, 768);
         }
 
+        /// After `--fb 1600x900` over a 1024x768 output, a host resize to
+        /// 1600x900 moves the output only: no root ConfigureNotify, one
+        /// ScreenChangeNotify, one CrtcChangeNotify (codex round 2).
+        #[test]
+        fn host_screen_resized_to_the_screen_size_moves_only_the_output() {
+            let (mut state, mut reader) = server_with_root_listener();
+            let mut backend = RecordingBackend::new();
+            reader.set_nonblocking(true).expect("set non-blocking");
+            let events = |reader: &mut UnixStream| {
+                let mut buf = [0u8; 4096];
+                let n = reader.read(&mut buf).unwrap_or(0);
+                buf[..n]
+                    .chunks_exact(32)
+                    .map(|ev| (ev[0] & 0x7f, ev[1]))
+                    .collect::<Vec<_>>()
+            };
+            host_screen_resized(&mut state, &mut backend, 1024, 768);
+            state.randr.set_logical_size(1600, 900, 423, 238);
+            if let Some(root) = state.resources.window_mut(ROOT_WINDOW) {
+                (root.width, root.height) = (1600, 900);
+            }
+            // RRSelectInput(root, ScreenChange | CrtcChange)
+            state.randr_select_masks.insert((1, ROOT_WINDOW), 0x3);
+            events(&mut reader);
+
+            host_screen_resized(&mut state, &mut backend, 1600, 900);
+            let output = state.randr.outputs.first().expect("one output");
+            assert_eq!((output.width, output.height), (1600, 900));
+            assert_eq!(
+                (
+                    state.randr.screen_width,
+                    state.randr.screen_height,
+                    state.randr.width_mm,
+                    state.randr.height_mm
+                ),
+                (1600, 900, 423, 238),
+                "the screen is untouched"
+            );
+            // (type, byte 1): ScreenChangeNotify (rotation Rotate_0),
+            // RRNotify subcode CrtcChange.
+            assert_eq!(events(&mut reader), [(89, 1), (90, 0)]);
+        }
+
         #[test]
         fn host_screen_resized_moves_the_output_and_ignores_no_ops() {
             let (mut state, mut reader) = server_with_root_listener();

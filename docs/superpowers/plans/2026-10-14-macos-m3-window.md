@@ -281,3 +281,14 @@ As M2: nightly fmt; `cargo clippy --all-targets -- -D warnings` (+ `--features x
 - **After review round 1:** `4e4009a8` resizes the slots and the output layout on `RRSetScreenSize`; decision 1
   makes that root-only, and decision 2 makes the storage swap atomic. Both are reworked in task 1 before anything
   builds on them.
+- **Task 1, after rounds 1–2** (`675e0376` prepare/commit, then the surface commit): where Xorg disagrees with the
+  decisions above, Xorg wins. The surface CRTC is a plain `RRCrtcCreate` CRTC (`rotations = RR_Rotate_0`,
+  `transforms = FALSE`, `RandrLimits` in core), so: rotation/reflection → BadMatch (`rrcrtc.c:1403`); a mode past
+  the root → **BadValue** with x/y as the value (`rrcrtc.c:1446-1457`), not BadMatch; SetCrtcTransform → BadValue
+  (`rrcrtc.c:1088`); position ≠ (0,0) inside the root, disabling the CRTC and a failed prepare of a mode switch →
+  status **RRSetConfigFailed** (`rrcrtc.c:1462-1465`, a DDX `crtcSet` failure), not BadMatch. A failed
+  `RRSetScreenSize` prepare is BadMatch. A CRTC-only host change still sends ScreenChangeNotify (Xorg `TellChanged`
+  sends it on any change); root ConfigureNotify only when the screen size changed. Root/COW are refilled with the
+  background/tile on the unattached images; there was no old-content copy before and none is added. Fill failures
+  are those `fill_rect`/`render_composite` report when recording; a failed later submit is renderer-fatal
+  (`renderer_failed`), not a resize failure. `ShellEvent::Resized` has no `backing_scale` yet (task 3).

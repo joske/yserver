@@ -422,11 +422,18 @@ fn surface_randr_reports_one_window_output_at_the_screen_size() {
     assert_eq!((output.x, output.y), (0, 0));
     assert_eq!((output.width, output.height), (64, 48));
     assert_eq!(output.vrefresh, 120);
-    assert_eq!(output.mode_ids.len(), 1);
-    let [mode] = modes.as_slice() else {
-        panic!("one mode: {modes:?}");
-    };
+    assert_eq!(output.mode_ids.len(), modes.len());
+    assert_eq!(
+        output.mode_ids[0], output.mode_id,
+        "the current size is preferred"
+    );
+    let mode = &modes[0];
     assert_eq!((mode.width, mode.height, mode.vrefresh), (64, 48, 120));
+    assert_eq!(
+        modes.len(),
+        9,
+        "and every fixed mode fits a headless output"
+    );
 }
 
 /// A headless backend whose state knows the shell's two input devices, and
@@ -684,6 +691,7 @@ enum UiCall {
     /// The shown cursor, or hidden.
     Cursor(Option<Shown>),
     Warp(i32, i32),
+    ContentSize(u16, u16, u64),
 }
 
 #[derive(Default)]
@@ -714,6 +722,13 @@ impl ShellUi for RecordingUi {
 
     fn warp_pointer(&self, x: i32, y: i32) {
         self.0.lock().expect("ui calls").push(UiCall::Warp(x, y));
+    }
+
+    fn set_content_size(&self, width: u16, height: u16, token: u64) {
+        self.0
+            .lock()
+            .expect("ui calls")
+            .push(UiCall::ContentSize(width, height, token));
     }
 }
 
@@ -915,6 +930,8 @@ struct ScreenFixture {
     state: ServerState,
     peer: std::os::unix::net::UnixStream,
     sequence: u16,
+    /// The events that came with the last `set_crtc_config` reply.
+    pending: Vec<[u8; 32]>,
 }
 
 /// What the client read: replies (the bytes after the 32-byte header
@@ -923,6 +940,8 @@ struct ScreenFixture {
 struct Received {
     replies: Vec<Vec<u8>>,
     errors: Vec<(u8, u8)>,
+    /// The error value of each of `errors`.
+    error_values: Vec<u32>,
     events: Vec<[u8; 32]>,
 }
 
@@ -944,9 +963,10 @@ fn screen_fixture(b: XBackend<SurfacePlatform>) -> ScreenFixture {
         state,
         peer,
         sequence: 0,
+        pending: Vec::new(),
     };
-    // RRSelectInput(root, ScreenChangeNotifyMask)
-    f.randr(4, &[root_le(), [1, 0, 0, 0]].concat());
+    // RRSelectInput(root, ScreenChangeNotifyMask | CrtcChangeNotifyMask)
+    f.randr(4, &[root_le(), [3, 0, 0, 0]].concat());
     // CreateGC(GC, root, no values); `fill` sets the foreground.
     f.request(55, 0, &[GC.to_le_bytes(), root_le(), [0; 4]].concat());
     assert!(f.received().errors.is_empty(), "setup raised an error");
@@ -1059,7 +1079,11 @@ impl ScreenFixture {
             };
             let (message, tail) = rest.split_at(len);
             match message[0] {
-                0 => got.errors.push((message[1], message[10])),
+                0 => {
+                    got.errors.push((message[1], message[10]));
+                    got.error_values
+                        .push(u32::from_le_bytes(message[4..8].try_into().unwrap()));
+                }
                 1 => got.replies.push(message.to_vec()),
                 _ => got.events.push(message.try_into().unwrap()),
             }
@@ -1227,62 +1251,436 @@ fn rr_set_screen_size_shrinks_and_grows_again_keeping_clients() {
     );
 }
 
-#[test]
-#[ignore = "needs live Vulkan ICD"]
-fn rr_set_screen_size_resizes_the_surface_slots_scene_and_swapchain() {
-    let Some(SurfaceFixture { b, clock, .. }) = surface_or_skip() else {
-        return;
-    };
-    let mut f = screen_fixture(b);
-    let mut ust = 0;
-    let mut frame = |f: &mut ScreenFixture| {
+const CRTC_CHANGE_NOTIFY: (u8, u8) = (90, 0);
+const BAD_MATCH: u8 = 8;
+const BAD_VALUE: u8 = 2;
+/// `RRSetConfigFailed`, the status of a CRTC set the DDX refused.
+const SET_CONFIG_FAILED: u8 = 3;
+
+/// A presenting window (64x48) with a recording UI, its link and clock,
+/// and the client of [`screen_fixture`].
+struct WindowFixture {
+    f: ScreenFixture,
+    link: Arc<ShellLink>,
+    clock: Arc<FrameClock>,
+    ui: Arc<RecordingUi>,
+}
+
+fn window_or_skip() -> Option<WindowFixture> {
+    let SurfaceFixture {
+        mut b, clock, link, ..
+    } = surface_or_skip()?;
+    let ui = Arc::new(RecordingUi::default());
+    b.pstate.ui = Some(Arc::clone(&ui) as Arc<dyn ShellUi>);
+    Some(WindowFixture {
+        f: screen_fixture(b),
+        link,
+        clock,
+        ui,
+    })
+}
+
+impl ScreenFixture {
+    /// RRSetCrtcConfig of the window's CRTC: the reply status, or the
+    /// error `(code, value)`.
+    fn set_crtc_config(
+        &mut self,
+        size: (u16, u16),
+        x: i16,
+        rotation: u16,
+    ) -> Result<u8, (u8, u32)> {
+        let output = self.state.randr.outputs[0].clone();
+        let mode = self
+            .state
+            .randr
+            .mode_table
+            .iter()
+            .find(|m| (m.width, m.height) == size)
+            .unwrap_or_else(|| panic!("a {size:?} mode"))
+            .mode_id;
+        let body = [
+            output.crtc_id.to_le_bytes().as_slice(),
+            &0u32.to_le_bytes(),
+            &0u32.to_le_bytes(),
+            &x.to_le_bytes(),
+            &0i16.to_le_bytes(),
+            &mode.to_le_bytes(),
+            &rotation.to_le_bytes(),
+            &[0, 0],
+            &output.output_id.to_le_bytes(),
+        ]
+        .concat();
+        self.received();
+        self.randr(21, &body);
+        let mut got = self.received();
+        if let (Some(error), Some(value)) = (got.errors.pop(), got.error_values.pop()) {
+            return Err((error.0, value));
+        }
+        let reply = got.replies.pop().expect("a SetCrtcConfig reply");
+        self.pending = got.events;
+        Ok(reply[1])
+    }
+
+    /// The error code of an RRSetScreenSize, if any.
+    fn screen_size_error(&mut self, width: u16, height: u16) -> Option<u8> {
+        self.received();
+        self.set_screen_size(width, height);
+        self.received().errors.pop().map(|(code, _)| code)
+    }
+
+    /// `(width, height)` of the CRTC mode, the slots, the scene layout's
+    /// root rect and the RandR screen.
+    fn sizes(&self) -> [(u32, u32); 4] {
+        let output = &self.state.randr.outputs[0];
+        let (slots, _) = self.b.platform.outputs[0].extents();
+        let layouts = self.b.platform.output_layouts();
+        let (_, _, lw, lh) = layouts[0].root_rect;
+        [
+            (u32::from(output.width), u32::from(output.height)),
+            (slots.width, slots.height),
+            (lw, lh),
+            (
+                u32::from(self.state.randr.screen_width),
+                u32::from(self.state.randr.screen_height),
+            ),
+        ]
+    }
+
+    fn crtc_notifies(events: &[[u8; 32]]) -> Vec<(u16, u16)> {
+        events
+            .iter()
+            .filter(|ev| (ev[0] & 0x7f, ev[1]) == CRTC_CHANGE_NOTIFY)
+            .map(|ev| {
+                (
+                    u16::from_le_bytes([ev[28], ev[29]]),
+                    u16::from_le_bytes([ev[30], ev[31]]),
+                )
+            })
+            .collect()
+    }
+}
+
+/// Wide `(w, h)` pairs as `u32`, for [`ScreenFixture::sizes`].
+fn wide(size: (u16, u16)) -> (u32, u32) {
+    (u32::from(size.0), u32::from(size.1))
+}
+
+impl WindowFixture {
+    /// Compose and present until the frame retired.
+    fn frame(&mut self) {
+        let f = &mut self.f;
         f.b.maybe_composite().expect("maybe_composite");
         let deadline = Instant::now() + Duration::from_secs(5);
+        let mut ust = 0;
         while f.b.platform.outputs[0].has_pending() {
             assert!(Instant::now() < deadline, "the frame never retired");
             std::thread::sleep(Duration::from_millis(1));
             ust += 1000;
-            if clock.tick(ust) {
+            if self.clock.tick(ust) {
                 f.b.on_platform_event(&mut f.state);
             }
         }
-    };
-    frame(&mut f);
-    let size = |width, height| {
-        Some(vk::Extent2D {
-            width: u32::from(width),
-            height: u32::from(height),
-        })
-    };
+    }
 
-    for (width, height) in [(400u16, 300u16), (320, 200)] {
-        f.resize(width, height);
-        let (slots, _) = f.b.platform.outputs[0].extents();
-        assert_eq!(Some(slots), size(width, height), "slots follow the screen");
-        let layouts = f.b.platform.output_layouts();
-        let [layout] = layouts.as_slice() else {
-            panic!("one output");
-        };
+    /// The shell reports the window at `size`; what the client heard.
+    fn host_resize(&mut self, size: (u16, u16), request: Option<u64>) -> Received {
+        self.f.received();
+        self.link.post(ShellEvent::Resized {
+            width: size.0,
+            height: size.1,
+            request,
+        });
+        self.f.b.on_platform_event(&mut self.f.state);
+        self.f.received()
+    }
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn rr_set_screen_size_resizes_the_root_only() {
+    let Some(mut w) = window_or_skip() else {
+        return;
+    };
+    w.frame();
+    let output = (64, 48);
+    for root in [(400u16, 300u16), (320, 200)] {
+        w.f.resize(root.0, root.1);
         assert_eq!(
-            layout.root_rect,
-            (0, 0, u32::from(width), u32::from(height))
+            w.f.sizes(),
+            [wide(output), wide(output), wide(output), wide(root)],
+            "CRTC mode, slots and layout keep the output size under a {root:?} root"
         );
-        frame(&mut f);
+        w.frame();
         assert_eq!(
-            f.b.platform.outputs[0].extents().1,
-            size(width, height),
-            "the swapchain was rebuilt at the new size"
+            w.f.b.platform.outputs[0].extents().1,
+            Some(vk::Extent2D {
+                width: 64,
+                height: 48
+            }),
+            "the swapchain keeps the output size"
         );
-        let corner = rect(i32::from(width) - 20, i32::from(height) - 20, 20, 20);
-        let shown = SurfacePlatform::read_on_screen_region(&mut f.b, corner).expect("read");
+        let corner = rect(44, 28, 20, 20);
+        let shown = SurfacePlatform::read_on_screen_region(&mut w.f.b, corner).expect("read");
         assert!(
             all_pixels(&shown, ROOT_BACKGROUND),
-            "the far corner of the {width}x{height} screen shows the root"
+            "the output's far corner shows the root"
         );
-        let image = f.b.platform.outputs[0]
-            .on_screen_image()
-            .expect("a frame on screen");
-        let slot = f.b.read_image_region(image, corner).expect("slot read");
-        assert!(all_pixels(&slot, ROOT_BACKGROUND), "and so does the slot");
+        let image =
+            w.f.root_image((i16::try_from(root.0).unwrap() - 16, 0, 16, 16))
+                .expect("GetImage of the root beyond the output");
+        assert!(all_pixels(&image, ROOT_BACKGROUND));
     }
+    assert!(
+        w.ui.take()
+            .iter()
+            .all(|call| !matches!(call, UiCall::ContentSize(..)))
+    );
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn rr_set_crtc_config_switches_the_window_mode() {
+    let Some(mut w) = window_or_skip() else {
+        return;
+    };
+    w.frame();
+    w.f.resize(1280, 800);
+    let modes: Vec<(u16, u16)> = w.f.state.randr.outputs[0]
+        .mode_ids
+        .iter()
+        .map(|id| {
+            let mode =
+                w.f.state
+                    .randr
+                    .mode_table
+                    .iter()
+                    .find(|m| m.mode_id == *id)
+                    .unwrap();
+            (mode.width, mode.height)
+        })
+        .collect();
+    assert_eq!(modes[0], (64, 48), "the current size is the preferred mode");
+    assert!(modes.contains(&(1024, 768)) && modes.contains(&(2560, 1600)));
+
+    assert_eq!(w.f.set_crtc_config((1024, 768), 0, 1), Ok(0));
+    let events = std::mem::take(&mut w.f.pending);
+    assert_eq!(ScreenFixture::crtc_notifies(&events), [(1024, 768)]);
+    assert_eq!(
+        ScreenFixture::resize_events(&events).0,
+        Vec::<(u16, u16)>::new(),
+        "no root ConfigureNotify"
+    );
+    assert_eq!(
+        w.f.sizes(),
+        [(1024, 768), (1024, 768), (1024, 768), (1280, 800)]
+    );
+    assert_eq!(w.ui.take().last(), Some(&UiCall::ContentSize(1024, 768, 1)));
+    w.frame();
+    assert_eq!(
+        w.f.b.platform.outputs[0].extents().1,
+        Some(vk::Extent2D {
+            width: 1024,
+            height: 768
+        })
+    );
+    // The preferred mode follows the output.
+    let output = &w.f.state.randr.outputs[0];
+    assert_eq!(output.mode_ids[0], output.mode_id);
+
+    // Xorg's answers for a CRTC without rotations or transforms:
+    // `(~crtc->rotations) & rotation` is BadMatch (rrcrtc.c:1403-1410); a
+    // mode past the screen is BadValue carrying x (rrcrtc.c:1446-1451); a
+    // position the DDX refuses is RRSetConfigFailed (rrcrtc.c:1462-1465).
+    assert_eq!(w.f.set_crtc_config((1024, 768), 0, 2), Err((BAD_MATCH, 2)));
+    assert_eq!(w.f.set_crtc_config((1440, 900), 0, 1), Err((BAD_VALUE, 0)));
+    assert_eq!(
+        w.f.set_crtc_config((1024, 768), 8, 1),
+        Ok(SET_CONFIG_FAILED)
+    );
+    // RRSetScreenSize below the output crops it: BadMatch (rrscreen.c:266-281).
+    assert_eq!(w.f.screen_size_error(800, 600), Some(BAD_MATCH));
+    assert_eq!(
+        w.f.sizes(),
+        [(1024, 768), (1024, 768), (1024, 768), (1280, 800)],
+        "nothing changed"
+    );
+    assert!(
+        w.ui.take()
+            .iter()
+            .all(|call| !matches!(call, UiCall::ContentSize(..))),
+        "no window request"
+    );
+
+    // RRGetScreenSizeRange: 320x200 up to the image limit, at most 8192.
+    w.f.received();
+    w.f.randr(6, &root_le());
+    let reply = w.f.received().replies.pop().expect("GetScreenSizeRange");
+    let at = |o: usize| u16::from_le_bytes([reply[o], reply[o + 1]]);
+    assert_eq!((at(8), at(10)), (320, 200));
+    assert!(at(12) <= 8192 && at(12) >= 4096 && at(12) == at(14));
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn failed_client_resizes_keep_the_old_state() {
+    use crate::kms::render::{ResizeFault, inject_resize_fault};
+    let Some(mut w) = window_or_skip() else {
+        return;
+    };
+    w.frame();
+    w.f.b.get_overlay_window(None).expect("materialise the COW");
+    w.f.resize(1280, 800);
+    let before = w.f.sizes();
+    let root = w.f.b.store.lookup(yserver_core::resources::ROOT_WINDOW.0);
+    // Root allocation, COW allocation, root fill, COW fill.
+    for (stage, skip) in [
+        (ResizeFault::Alloc, 0),
+        (ResizeFault::Alloc, 1),
+        (ResizeFault::Fill, 0),
+        (ResizeFault::Fill, 1),
+    ] {
+        inject_resize_fault(stage, skip);
+        assert_eq!(
+            w.f.screen_size_error(1600, 1000),
+            Some(BAD_MATCH),
+            "RRSetScreenSize with {stage:?} #{skip} failing (rrscreen.c:289-293)"
+        );
+        assert_eq!(w.f.sizes(), before, "{stage:?} #{skip}");
+        assert_eq!(w.f.b.fb_dimensions(), (1280, 800));
+        assert_eq!(
+            w.f.b.store.lookup(yserver_core::resources::ROOT_WINDOW.0),
+            root
+        );
+    }
+    // Slot allocation, scene outputs: the DDX refused the CRTC set.
+    for stage in [ResizeFault::Alloc, ResizeFault::Outputs] {
+        inject_resize_fault(stage, 0);
+        assert_eq!(
+            w.f.set_crtc_config((1024, 768), 0, 1),
+            Ok(SET_CONFIG_FAILED),
+            "RRSetCrtcConfig with {stage:?} failing (rrcrtc.c:1462-1465)"
+        );
+        assert!(ScreenFixture::crtc_notifies(&w.f.pending).is_empty());
+        assert_eq!(w.f.sizes(), before, "{stage:?}");
+    }
+    assert!(
+        w.ui.take()
+            .iter()
+            .all(|call| !matches!(call, UiCall::ContentSize(..)))
+    );
+    // Still whole: the root draws and reads back, and a frame presents.
+    let image = w.f.root_image((1200, 700, 16, 16)).expect("GetImage");
+    assert!(all_pixels(&image, ROOT_BACKGROUND));
+    w.frame();
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_user_window_resize_moves_root_and_output() {
+    use crate::kms::render::{ResizeFault, inject_resize_fault};
+    let Some(mut w) = window_or_skip() else {
+        return;
+    };
+    w.frame();
+    let got = w.host_resize((400, 300), None);
+    let (configure, screen) = ScreenFixture::resize_events(&got.events);
+    assert_eq!(configure, [(400, 300)], "root ConfigureNotify");
+    assert_eq!(screen, [(400, 300)], "RRScreenChangeNotify");
+    assert_eq!(ScreenFixture::crtc_notifies(&got.events), [(400, 300)]);
+    assert_eq!(w.f.sizes(), [(400, 300); 4]);
+    assert_eq!(w.f.b.fb_dimensions(), (400, 300));
+    let image = w.f.root_image((380, 280, 20, 20)).expect("GetImage");
+    assert!(all_pixels(&image, ROOT_BACKGROUND));
+    w.frame();
+
+    let got = w.host_resize((400, 300), None);
+    assert!(got.events.is_empty(), "the same size again: nothing");
+
+    for (stage, skip) in [
+        (ResizeFault::Alloc, 0),
+        (ResizeFault::Fill, 0),
+        (ResizeFault::Alloc, 1),
+        (ResizeFault::Outputs, 0),
+    ] {
+        inject_resize_fault(stage, skip);
+        let got = w.host_resize((500, 350), None);
+        assert!(got.events.is_empty(), "{stage:?} #{skip}: no events");
+        assert_eq!(w.f.sizes(), [(400, 300); 4], "{stage:?} #{skip}: old sizes");
+    }
+    // The next event retries.
+    let got = w.host_resize((500, 350), None);
+    assert_eq!(ScreenFixture::resize_events(&got.events).0, [(500, 350)]);
+    assert_eq!(w.f.sizes(), [(500, 350); 4]);
+    w.frame();
+}
+
+/// After `--fb 400x300` over the 64x48 output, a user resize to 400x300
+/// moves the output only: the screen already has the size (codex round 2).
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_user_resize_to_the_screen_size_moves_only_the_output() {
+    let Some(mut w) = window_or_skip() else {
+        return;
+    };
+    w.f.resize(400, 300);
+    let got = w.host_resize((400, 300), None);
+    let (configure, screen) = ScreenFixture::resize_events(&got.events);
+    assert!(configure.is_empty(), "no root ConfigureNotify");
+    assert_eq!(
+        screen,
+        [(400, 300)],
+        "ScreenChangeNotify, as Xorg's TellChanged"
+    );
+    assert_eq!(ScreenFixture::crtc_notifies(&got.events), [(400, 300)]);
+    assert_eq!(w.f.sizes(), [(400, 300); 4]);
+}
+
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_clamped_window_request_moves_only_the_output() {
+    let Some(mut w) = window_or_skip() else {
+        return;
+    };
+    w.frame();
+    w.f.resize(1280, 800);
+    assert_eq!(w.f.set_crtc_config((1024, 768), 0, 1), Ok(0));
+    assert_eq!(w.ui.take().last(), Some(&UiCall::ContentSize(1024, 768, 1)));
+
+    // The window system clamped the window to 1000x700.
+    let got = w.host_resize((1000, 700), Some(1));
+    assert!(ScreenFixture::resize_events(&got.events).0.is_empty());
+    assert_eq!(ScreenFixture::crtc_notifies(&got.events), [(1000, 700)]);
+    assert_eq!(
+        w.f.sizes(),
+        [(1000, 700), (1000, 700), (1000, 700), (1280, 800)],
+        "the output follows the window, the root stays"
+    );
+    assert_eq!(w.f.b.fb_dimensions(), (1280, 800));
+    w.frame();
+
+    // The request is done: its token again is stale.
+    let got = w.host_resize((900, 600), Some(1));
+    assert!(got.events.is_empty());
+    assert_eq!(w.f.sizes()[0], (1000, 700));
+    // A completion larger than the root stops at the root.
+    assert_eq!(w.f.set_crtc_config((1280, 800), 0, 1), Ok(0));
+    let got = w.host_resize((1400, 900), Some(2));
+    assert!(got.events.is_empty(), "the output already fills the root");
+    assert_eq!(w.f.sizes()[0], (1280, 800));
+}
+
+#[test]
+fn window_modes_are_the_current_size_then_the_fixed_ones_that_fit() {
+    let (outputs, modes) = super::present::window_randr((1024, 768), (1440, 900), 60);
+    let sizes: Vec<(u32, u16, u16)> = modes
+        .iter()
+        .map(|m| (m.mode_id, m.width, m.height))
+        .collect();
+    assert_eq!(sizes, [(11, 1024, 768), (9, 1440, 900), (10, 1280, 800)]);
+    let output = &outputs[0];
+    assert_eq!((output.mode_id, output.num_preferred), (11, 1));
+    assert_eq!(output.mode_ids, [11, 9, 10]);
+    let (outputs, modes) = super::present::window_randr((1000, 700), (8192, 8192), 60);
+    assert_eq!(outputs[0].mode_id, 3, "a size off the list");
+    assert_eq!(modes.len(), 9);
 }

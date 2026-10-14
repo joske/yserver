@@ -16,7 +16,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
 };
@@ -33,7 +33,7 @@ use objc2_app_kit::{
     NSApplicationDelegate, NSApplicationTerminateReply, NSMenu, NSMenuItem, NSWindow,
     NSWindowDelegate, NSWindowOcclusionState,
 };
-use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSString, ns_string};
+use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSSize, NSString, ns_string};
 use objc2_quartz_core::CAMetalLayer;
 
 use super::{display_link::DisplayLink, input::ShellInput};
@@ -63,6 +63,9 @@ struct Ivars {
     quit: Arc<QuitState>,
     /// Established X clients, kept by the core.
     clients: Arc<AtomicUsize>,
+    /// The token of the core's last window resize request (0: none), for
+    /// the resize event that answers it.
+    resize_request: Arc<AtomicU64>,
     /// The user already confirmed quitting (close button, then the
     /// terminate it triggers).
     quit_confirmed: Cell<bool>,
@@ -181,6 +184,7 @@ impl YserverAppDelegate {
             link: Arc::new(ShellLink::default()),
             quit: Arc::new(QuitState::default()),
             clients: Arc::default(),
+            resize_request: Arc::default(),
             quit_confirmed: Cell::new(false),
             window: OnceCell::new(),
             layer: OnceCell::new(),
@@ -232,8 +236,10 @@ impl YserverAppDelegate {
             link: Arc::clone(&ivars.link),
             ui: Arc::new(MainQueueUi {
                 quit: Arc::clone(&ivars.quit),
+                resize_request: Arc::clone(&ivars.resize_request),
             }),
             clients: Arc::clone(&ivars.clients),
+            max_output: super::window::max_content_size(mtm),
         };
         let spawned = thread::Builder::new()
             .name("yserver-core".into())
@@ -275,6 +281,7 @@ fn ask_quit(mtm: MainThreadMarker, clients: usize) -> bool {
 /// `ShellUi` for the core thread: every command runs on the main queue.
 struct MainQueueUi {
     quit: Arc<QuitState>,
+    resize_request: Arc<AtomicU64>,
 }
 
 impl ShellUi for MainQueueUi {
@@ -318,6 +325,26 @@ impl ShellUi for MainQueueUi {
         DispatchQueue::main().exec_async(move || {
             let mtm = MainThreadMarker::new().expect("the main queue runs on the main thread");
             super::cursor::warp(mtm, x, y);
+        });
+    }
+
+    fn set_content_size(&self, width: u16, height: u16, token: u64) {
+        let request = Arc::clone(&self.resize_request);
+        DispatchQueue::main().exec_async(move || {
+            let mtm = MainThreadMarker::new().expect("the main queue runs on the main thread");
+            let Some(window) = NSApplication::sharedApplication(mtm)
+                .windows()
+                .firstObject()
+            else {
+                return;
+            };
+            // Before the resize: its delegate callback reads the token.
+            request.store(token, Ordering::Release);
+            let scale = window.backingScaleFactor();
+            window.setContentSize(NSSize::new(
+                f64::from(width) / scale,
+                f64::from(height) / scale,
+            ));
         });
     }
 }

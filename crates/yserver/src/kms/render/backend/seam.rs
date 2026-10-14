@@ -357,6 +357,10 @@ pub trait Platform: OutputSink + Sized + 'static {
         Ok(())
     }
 
+    fn randr_limits(_b: &XBackend<Self>) -> yserver_core::randr::RandrLimits {
+        yserver_core::randr::RandrLimits::default()
+    }
+
     fn poll_deferred_input(_b: &mut XBackend<Self>, _state: &mut ServerState) {}
 
     fn start_device_config(
@@ -616,6 +620,9 @@ pub(crate) enum ResizeFault {
     Alloc,
     /// Filling or tiling the new root or COW.
     Fill,
+    /// Building the scene's new output state.
+    #[cfg_attr(all(kms, not(test)), allow(dead_code))] // The surface's.
+    Outputs,
 }
 
 #[cfg(test)]

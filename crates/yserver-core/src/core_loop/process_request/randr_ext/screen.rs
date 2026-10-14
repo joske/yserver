@@ -249,7 +249,7 @@ pub(super) fn handle_randr_get_screen_info(
             timestamp: state.randr.timestamp,
             config_timestamp: state.randr.config_timestamp,
             // setOfRotations is a CARD8.
-            rotations: crate::randr::SUPPORTED_ROTATIONS as u8,
+            rotations: state.randr.limits.rotations as u8,
             rotation: state.randr.first_output_rotation(),
             size_id: d.size_id,
             rate: d.rate,
@@ -472,7 +472,7 @@ pub(super) fn set_screen_config(
     if !matches!(rotation & 0xf, 1 | 2 | 4 | 8) {
         return error(state, x11::error::BAD_VALUE, u32::from(rotation));
     }
-    if !crate::randr::SUPPORTED_ROTATIONS & rotation != 0 {
+    if !state.randr.limits.rotations & rotation != 0 {
         return error(state, x11::error::BAD_MATCH, u32::from(rotation));
     }
     let mode_id = if rate == 0 {

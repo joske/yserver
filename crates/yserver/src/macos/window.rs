@@ -28,8 +28,7 @@ pub(super) fn create(
         NSPoint::new(0.0, 0.0),
         NSSize::new(width / scale, height / scale),
     );
-    let style =
-        NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::Miniaturizable;
+    let style = style();
     // SAFETY: a fresh allocation; released-when-closed is turned off below.
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -62,6 +61,29 @@ pub(super) fn create(
     let _ = window.makeFirstResponder(Some(responder));
     window.center();
     (window, layer)
+}
+
+/// The window's style.
+fn style() -> NSWindowStyleMask {
+    NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::Miniaturizable
+}
+
+/// The largest content the main screen shows without clamping the window,
+/// in X pixels (backing pixels).
+pub(super) fn max_content_size(mtm: MainThreadMarker) -> Option<(u16, u16)> {
+    let screen = NSScreen::mainScreen(mtm)?;
+    let content = NSWindow::contentRectForFrameRect_styleMask(screen.visibleFrame(), style(), mtm);
+    let scale = screen.backingScaleFactor();
+    Some((
+        to_px(content.size.width, scale),
+        to_px(content.size.height, scale),
+    ))
+}
+
+/// `points` in whole pixels at `scale`, within `1..=u16::MAX`.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Clamped and floored.
+fn to_px(points: f64, scale: f64) -> u16 {
+    (points * scale).floor().clamp(1.0, f64::from(u16::MAX)) as u16
 }
 
 /// The layer's address for `vkCreateMetalSurfaceEXT` on the core thread.
