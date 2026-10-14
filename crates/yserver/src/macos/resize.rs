@@ -104,7 +104,8 @@ pub(super) fn install(
 
 /// The view's content in X pixels.
 fn content_px(view: &NSView) -> Option<Size> {
-    let xpp = super::scale::xpp(&view.window()?);
+    let window = view.window()?;
+    let xpp = super::scale::xpp(&window);
     let size = view.bounds().size;
     Some((to_px(size.width, xpp), to_px(size.height, xpp)))
 }
