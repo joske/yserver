@@ -1,5 +1,5 @@
-//! The window: a view hosting a `CAMetalLayer` sized in X pixels, and the
-//! Vulkan surface on that layer.
+//! The window: a view hosting a `CAMetalLayer` that shows the X screen at
+//! the `--scale` copy factor, and the Vulkan surface on that layer.
 
 use std::{ffi::c_void, rc::Rc};
 
@@ -8,29 +8,25 @@ use objc2::{MainThreadMarker, MainThreadOnly, rc::Retained};
 use objc2_app_kit::{
     NSBackingStoreType, NSColor, NSResponder, NSScreen, NSView, NSWindow, NSWindowStyleMask,
 };
-use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSPoint, NSRect, NSString};
 use objc2_quartz_core::{CALayer, CAMetalLayer, kCAGravityTopLeft};
 
-use super::{input::ShellInput, view::YserverView};
+use super::{input::ShellInput, scale::Metrics, view::YserverView};
 use crate::surface::{
     resize::{MIN_SCREEN, to_px},
     swapchain::NativeSurface,
 };
 
-/// A titled, closable, minimisable, resizable window of `size` X pixels, i.e.
-/// `size / backingScaleFactor` points, whose content is a `CAMetalLayer`
-/// and whose view feeds `input`.
+/// A titled, closable, minimisable, resizable window of `size` X pixels
+/// (`size / xpp` points on the main screen), whose content is a
+/// `CAMetalLayer` and whose view feeds `input`.
 pub(super) fn create(
     mtm: MainThreadMarker,
     size: (u16, u16),
     input: Rc<ShellInput>,
 ) -> (Retained<NSWindow>, Retained<CAMetalLayer>) {
-    let scale = NSScreen::mainScreen(mtm).map_or(1.0, |screen| screen.backingScaleFactor());
-    let (width, height) = (f64::from(size.0), f64::from(size.1));
-    let frame = NSRect::new(
-        NSPoint::new(0.0, 0.0),
-        NSSize::new(width / scale, height / scale),
-    );
+    let metrics = Metrics::of_main_screen(mtm);
+    let frame = NSRect::new(NSPoint::new(0.0, 0.0), metrics.points(size));
     let style = style();
     // SAFETY: a fresh allocation; released-when-closed is turned off below.
     let window = unsafe {
@@ -46,14 +42,11 @@ pub(super) fn create(
     unsafe { window.setReleasedWhenClosed(false) };
     window.setTitle(&NSString::from_str("yserver"));
     window.setBackgroundColor(Some(&*NSColor::blackColor()));
-    window.setContentMinSize(NSSize::new(
-        f64::from(MIN_SCREEN.0) / scale,
-        f64::from(MIN_SCREEN.1) / scale,
-    ));
+    window.setContentMinSize(metrics.points(MIN_SCREEN));
 
     let layer = CAMetalLayer::new();
-    layer.setContentsScale(scale);
-    layer.setDrawableSize(NSSize::new(width, height));
+    layer.setContentsScale(metrics.backing);
+    layer.setDrawableSize(metrics.backing_px(size));
     layer.setOpaque(true);
     // A drawable not yet at the new window size stays unstretched.
     // SAFETY: an immutable CoreAnimation constant.
@@ -82,14 +75,14 @@ fn style() -> NSWindowStyleMask {
 }
 
 /// The largest content the main screen shows without clamping the window,
-/// in X pixels (backing pixels).
+/// in X pixels.
 pub(super) fn max_content_size(mtm: MainThreadMarker) -> Option<(u16, u16)> {
     let screen = NSScreen::mainScreen(mtm)?;
     let content = NSWindow::contentRectForFrameRect_styleMask(screen.visibleFrame(), style(), mtm);
-    let scale = screen.backingScaleFactor();
+    let xpp = Metrics::of_main_screen(mtm).xpp;
     Some((
-        to_px(content.size.width, scale),
-        to_px(content.size.height, scale),
+        to_px(content.size.width, xpp),
+        to_px(content.size.height, xpp),
     ))
 }
 

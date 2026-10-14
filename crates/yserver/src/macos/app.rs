@@ -33,10 +33,10 @@ use objc2_app_kit::{
     NSApplicationDelegate, NSApplicationTerminateReply, NSMenu, NSMenuItem, NSWindow,
     NSWindowDelegate, NSWindowOcclusionState,
 };
-use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSSize, NSString, ns_string};
+use objc2_foundation::{NSNotification, NSObject, NSObjectProtocol, NSString, ns_string};
 use objc2_quartz_core::CAMetalLayer;
 
-use super::{display_link::DisplayLink, input::ShellInput};
+use super::{display_link::DisplayLink, input::ShellInput, scale::Metrics};
 use crate::{
     launch::LaunchOptions,
     surface::{
@@ -169,6 +169,16 @@ define_class!(
         }
 
         // SAFETY: the signature matches the protocol method.
+        #[unsafe(method(windowDidChangeScreen:))]
+        fn did_change_screen(&self, _notification: &NSNotification) {
+            // Another screen may have other millimetres per point at the
+            // same backing scale.
+            if let Some(view) = self.ivars().window.get().and_then(|w| w.contentView()) {
+                super::resize::backing_changed(&view);
+            }
+        }
+
+        // SAFETY: the signature matches the protocol method.
         #[unsafe(method(windowDidBecomeKey:))]
         fn did_become_key(&self, _notification: &NSNotification) {
             if let Some(input) = self.ivars().input.get() {
@@ -213,6 +223,7 @@ impl YserverAppDelegate {
             return;
         };
         let size = opts.geometry.unwrap_or(server::DEFAULT_SIZE);
+        super::scale::set_option(opts.scale);
         let input = ShellInput::new(Arc::clone(&ivars.link), size);
         match input.install_key_monitor(mtm) {
             Some(monitor) => {
@@ -224,10 +235,12 @@ impl YserverAppDelegate {
         let (window, layer) = super::window::create(mtm, size, Rc::clone(&input));
         let surface = super::window::metal_surface(&layer);
         let clock = Arc::new(FrameClock::new(Arc::clone(&ivars.link)));
+        let metrics = Metrics::of_window(&window);
         if let Some(view) = window.contentView() {
             super::resize::install(
                 &view,
                 size,
+                metrics,
                 Arc::clone(&ivars.link),
                 Arc::clone(&ivars.resize_request),
                 layer.clone(),
@@ -260,7 +273,7 @@ impl YserverAppDelegate {
             }),
             clients: Arc::clone(&ivars.clients),
             max_output: super::window::max_content_size(mtm),
-            output_mm: (0, 0),
+            output_mm: metrics.mm(size),
         };
         let spawned = thread::Builder::new()
             .name("yserver-core".into())
@@ -361,11 +374,7 @@ impl ShellUi for MainQueueUi {
             };
             // Before the resize: the view holds back its own report.
             request.store(token, Ordering::Release);
-            let scale = window.backingScaleFactor();
-            window.setContentSize(NSSize::new(
-                f64::from(width) / scale,
-                f64::from(height) / scale,
-            ));
+            window.setContentSize(Metrics::of_window(&window).points((width, height)));
             // Synchronous: the window has its final (maybe clamped) size.
             super::resize::answer_request(&window);
         });

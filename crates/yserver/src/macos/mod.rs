@@ -7,6 +7,7 @@ mod display_link;
 mod input;
 mod resize;
 mod run;
+mod scale;
 mod view;
 mod window;
 

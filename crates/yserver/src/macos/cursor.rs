@@ -23,10 +23,31 @@ unsafe extern "C" {
 
 #[derive(Default)]
 struct Cursors {
+    /// At the current X pixels per point.
     by_image: HashMap<(u64, (u16, u16)), Retained<NSCursor>>,
     /// The cursor the view shows; `None` before the core sent one.
     current: Option<Retained<NSCursor>>,
+    /// The image of `current`; `None` when blank.
+    current_image: Option<CursorImage>,
     blank: Option<Retained<NSCursor>>,
+}
+
+impl Cursors {
+    /// The cursor of `image` at `xpp` X pixels per point (`None`: blank).
+    fn get(&mut self, image: Option<&CursorImage>, xpp: f64) -> Retained<NSCursor> {
+        match image {
+            Some(image) => {
+                if self.by_image.len() >= CACHE_LIMIT {
+                    self.by_image.clear();
+                }
+                self.by_image
+                    .entry((image.version, image.hot))
+                    .or_insert_with(|| build(image, xpp))
+                    .clone()
+            }
+            None => self.blank.get_or_insert_with(blank).clone(),
+        }
+    }
 }
 
 thread_local! {
@@ -57,25 +78,37 @@ pub(super) fn set(mtm: MainThreadMarker, image: Option<CursorImage>) {
     let Some((window, view)) = window_and_view(mtm) else {
         return;
     };
-    let scale = window.backingScaleFactor();
+    let xpp = super::scale::xpp(&window);
     let cursor = CURSORS.with_borrow_mut(|cursors| {
-        let cursor = match image {
-            Some(image) => {
-                if cursors.by_image.len() >= CACHE_LIMIT {
-                    cursors.by_image.clear();
-                }
-                cursors
-                    .by_image
-                    .entry((image.version, image.hot))
-                    .or_insert_with(|| build(&image, scale))
-                    .clone()
-            }
-            None => cursors.blank.get_or_insert_with(blank).clone(),
-        };
+        let cursor = cursors.get(image.as_ref(), xpp);
         cursors.current = Some(cursor.clone());
+        cursors.current_image = image;
         cursor
     });
     if pointer_inside(&window, &view) {
+        cursor.set();
+    }
+}
+
+/// The window's X pixels per point changed: rebuild the cursors at the new
+/// size, the one shown first.
+pub(super) fn rescale(mtm: MainThreadMarker) {
+    let Some((window, view)) = window_and_view(mtm) else {
+        return;
+    };
+    let xpp = super::scale::xpp(&window);
+    let cursor = CURSORS.with_borrow_mut(|cursors| {
+        cursors.by_image.clear();
+        // None shown yet: the view shows the arrow.
+        cursors.current.as_ref()?;
+        let image = cursors.current_image.clone();
+        let cursor = cursors.get(image.as_ref(), xpp);
+        cursors.current = Some(cursor.clone());
+        Some(cursor)
+    });
+    if let Some(cursor) = cursor
+        && pointer_inside(&window, &view)
+    {
         cursor.set();
     }
 }
@@ -87,21 +120,18 @@ pub(super) fn apply_current() {
     current.unwrap_or_else(NSCursor::arrowCursor).set();
 }
 
-/// An `NSCursor` of `image`, `scale` backing pixels per point, so one X
-/// pixel is one backing pixel.
-fn build(image: &CursorImage, scale: f64) -> Retained<NSCursor> {
+/// An `NSCursor` of `image` at `xpp` X pixels per point, so it covers as
+/// many points as the X screen gives it.
+fn build(image: &CursorImage, xpp: f64) -> Retained<NSCursor> {
     let rgba = image.rgba();
     let (width, height) = (image.width.max(1), image.height.max(1));
     let rep = bitmap(width, height, &rgba);
-    let size = NSSize::new(f64::from(width) / scale, f64::from(height) / scale);
+    let size = NSSize::new(f64::from(width) / xpp, f64::from(height) / xpp);
     let ns_image = NSImage::initWithSize(NSImage::alloc(), size);
     if let Some(rep) = rep {
         ns_image.addRepresentation(&rep);
     }
-    let hot = NSPoint::new(
-        f64::from(image.hot.0) / scale,
-        f64::from(image.hot.1) / scale,
-    );
+    let hot = NSPoint::new(f64::from(image.hot.0) / xpp, f64::from(image.hot.1) / xpp);
     NSCursor::initWithImage_hotSpot(NSCursor::alloc(), &ns_image, hot)
 }
 
@@ -153,9 +183,9 @@ pub(super) fn warp(mtm: MainThreadMarker, x: i32, y: i32) {
     if !pointer_inside(&window, &view) {
         return;
     }
-    let scale = window.backingScaleFactor();
+    let xpp = super::scale::xpp(&window);
     let height = view.bounds().size.height;
-    let in_view = NSPoint::new(f64::from(x) / scale, height - f64::from(y) / scale);
+    let in_view = NSPoint::new(f64::from(x) / xpp, height - f64::from(y) / xpp);
     let in_window = view.convertPoint_toView(in_view, None);
     let on_screen = window.convertPointToScreen(in_window);
     // Quartz global coordinates: top-left origin of the primary screen.

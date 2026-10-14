@@ -165,10 +165,10 @@ yserver-hw log="warn":
         wait $yserver_pid 2>/dev/null'
 
 # macOS (Apple Silicon, KosmicKrisp): yserver in an AppKit window, DISPLAY=:<display>; log in yserver-mac.log.
-macos-run display="1" geometry="1600x1000" log="info":
+macos-run display="1" geometry="1280x800" log="info" scale="auto":
     VK_ICD_FILENAMES=/opt/homebrew/share/vulkan/icd.d/kosmickrisp_mesa_icd.aarch64.json \
     DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib RUST_LOG="{{log}}" \
-    cargo run --release --bin yserver -- :{{display}} --geometry {{geometry}} 2>&1 | tee yserver-mac.log
+    cargo run --release --bin yserver -- :{{display}} --geometry {{geometry}} --scale {{scale}} 2>&1 | tee yserver-mac.log
 
 # Local TCP transport smoke. Creates a temporary FamilyInternet Xauthority
 # record for 127.0.0.1:7, starts yserver with TCP explicitly enabled, then

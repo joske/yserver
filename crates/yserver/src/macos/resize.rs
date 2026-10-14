@@ -1,6 +1,8 @@
 //! The window's size to the core: the view reports its size changes,
 //! `ResizeCoalescer` picks what to post, and the drawable and the pointer
-//! clamp follow what was posted. Main thread only.
+//! clamp follow what was posted. A backing scale or screen change posts at
+//! once when it changes the size, the copy factor or the millimetres.
+//! Main thread only.
 
 use std::{
     cell::RefCell,
@@ -12,16 +14,15 @@ use std::{
 };
 
 use dispatch2::DispatchQueue;
-use objc2::rc::Retained;
+use objc2::{MainThreadOnly, rc::Retained};
 use objc2_app_kit::{NSView, NSWindow};
-use objc2_foundation::NSSize;
 use objc2_quartz_core::{CAMetalLayer, CATransaction};
 
-use super::input::ShellInput;
+use super::{input::ShellInput, scale::Metrics};
 use crate::surface::{
     clock::FrameClock,
     link::{ShellEvent, ShellLink},
-    resize::{ResizeCoalescer, Size, to_px},
+    resize::{MIN_SCREEN, ResizeCoalescer, Size, to_px},
 };
 
 struct Sizer {
@@ -33,21 +34,33 @@ struct Sizer {
     layer: Retained<CAMetalLayer>,
     input: Rc<ShellInput>,
     coalescer: ResizeCoalescer,
+    /// The window's scale and screen, as last seen.
+    metrics: Metrics,
+    /// The copy factor and millimetres last posted.
+    posted: (u32, (u32, u32)),
 }
 
 impl Sizer {
-    fn post(&self, size: Size, request: Option<u64>) {
+    fn post(&mut self, size: Size, request: Option<u64>) {
+        let scale = self.metrics.factor;
+        let mm = self.metrics.mm(size);
         // Before the event: the swapchain the core rebuilds on it follows
         // the drawable.
-        self.layer
-            .setDrawableSize(NSSize::new(f64::from(size.0), f64::from(size.1)));
+        self.layer.setDrawableSize(self.metrics.backing_px(size));
         self.input.set_fb(size);
-        log::debug!("macos: window {}x{} (request {request:?})", size.0, size.1);
+        log::debug!(
+            "macos: window {}x{} scale {scale} {}x{} mm (request {request:?})",
+            size.0,
+            size.1,
+            mm.0,
+            mm.1
+        );
+        self.posted = (scale, mm);
         self.link.post(ShellEvent::Resized {
             width: size.0,
             height: size.1,
-            scale: 1,
-            mm: (0, 0),
+            scale,
+            mm,
             request,
         });
     }
@@ -57,10 +70,12 @@ thread_local! {
     static SIZER: RefCell<Option<Sizer>> = const { RefCell::new(None) };
 }
 
-/// Report `view`'s size from now on; the core starts at `start`.
+/// Report `view`'s size from now on; the core starts at `start` with
+/// `metrics`.
 pub(super) fn install(
     view: &NSView,
     start: Size,
+    metrics: Metrics,
     link: Arc<ShellLink>,
     request: Arc<AtomicU64>,
     layer: Retained<CAMetalLayer>,
@@ -81,15 +96,17 @@ pub(super) fn install(
         layer,
         input,
         coalescer: ResizeCoalescer::new(start),
+        metrics,
+        posted: (metrics.factor, metrics.mm(start)),
     }));
     view_resized(view);
 }
 
-/// The view's content in X pixels (backing pixels).
+/// The view's content in X pixels.
 fn content_px(view: &NSView) -> Option<Size> {
-    let scale = view.window()?.backingScaleFactor();
+    let xpp = super::scale::xpp(&view.window()?);
     let size = view.bounds().size;
-    Some((to_px(size.width, scale), to_px(size.height, scale)))
+    Some((to_px(size.width, xpp), to_px(size.height, xpp)))
 }
 
 /// The view's size changed: the layer follows now, the core when the
@@ -134,6 +151,38 @@ pub(super) fn live_ended() {
         if let Some(size) = sizer.coalescer.live_ended() {
             sizer.post(size, None);
         }
+    });
+}
+
+/// The window's backing scale or screen changed: the layer and the cursor
+/// take the new scale, and the core hears at once of a new size (an
+/// explicit `--scale` keeps the window's points), copy factor or
+/// millimetres, even mid live resize.
+pub(super) fn backing_changed(view: &NSView) {
+    let Some(window) = view.window() else {
+        return;
+    };
+    let Some(size) = content_px(view) else {
+        return;
+    };
+    let metrics = Metrics::of_window(&window);
+    window.setContentMinSize(metrics.points(MIN_SCREEN));
+    super::cursor::rescale(view.mtm());
+    SIZER.with_borrow_mut(|sizer| {
+        let Some(sizer) = sizer else {
+            return;
+        };
+        sizer.layer.setContentsScale(metrics.backing);
+        sizer.metrics = metrics;
+        if sizer.request.load(Ordering::Acquire) != 0 {
+            // `answer_request` posts with the new metrics.
+            return;
+        }
+        if size == sizer.coalescer.posted() && sizer.posted == (metrics.factor, metrics.mm(size)) {
+            return;
+        }
+        let size = sizer.coalescer.post_now(size);
+        sizer.post(size, None);
     });
 }
 

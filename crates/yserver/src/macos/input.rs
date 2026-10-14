@@ -175,7 +175,7 @@ fn raw_pointer(view: &NSView, event: &NSEvent) -> RawPointer {
     let at = view.convertPoint_fromView(event.locationInWindow(), None);
     let scale = view
         .window()
-        .map_or(1.0, |window| window.backingScaleFactor());
+        .map_or(1.0, |window| super::scale::xpp(&window));
     RawPointer {
         x_pt: at.x,
         y_pt: at.y,

@@ -117,6 +117,14 @@ define_class!(
             super::resize::view_resized(self);
         }
 
+        // SAFETY: the signature matches `-[NSView viewDidChangeBackingProperties]`.
+        #[unsafe(method(viewDidChangeBackingProperties))]
+        fn view_did_change_backing_properties(&self) {
+            // SAFETY: the superclass method of the same signature.
+            let () = unsafe { msg_send![super(self), viewDidChangeBackingProperties] };
+            super::resize::backing_changed(self);
+        }
+
         // SAFETY: the signature matches `-[NSView viewWillStartLiveResize]`.
         #[unsafe(method(viewWillStartLiveResize))]
         fn view_will_start_live_resize(&self) {
